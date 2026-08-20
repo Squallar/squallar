@@ -6,10 +6,7 @@ use nexrad_model::data::{
 const FIRST_GATE_M: u16 = 2125;
 const GATE_M: u16 = 250;
 
-/// The site handed to `prepare` for its memo key. Every fixture below is
-/// unclocked unless a test says otherwise, and the memo never touches an
-/// unclocked volume (see `derive_key`) — so these coordinates only need to
-/// exist, not to vary.
+/// The site handed to `prepare` for its memo key.
 const SITE: (f64, f64) = (35.33, -97.28);
 
 fn cut(angle_deg: f64) -> ElevationCut {
@@ -65,8 +62,6 @@ fn gate_slant_km(j: usize) -> f64 {
 /// Per-gate fields, m/s / dBZ / degrees / unitless, `None` = no data.
 type Fields<'f> = &'f dyn Fn(f64, f64) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>);
 
-/// One sweep carrying reflectivity, velocity, ΦDP and ρHV through their
-/// real codecs, over `fields(az, slant_km) -> (refl, vel, phi, rho)`.
 fn sweep_with(
     elevation_number: u8,
     elevation_deg: f32,
@@ -84,9 +79,7 @@ fn sweep_with(
     )
 }
 
-/// [`sweep_with`] with a clock on every radial, milliseconds since the Unix
-/// epoch. `0` is the decoder's own "no timestamp" value, which is what every
-/// fixture that does not care about time passes.
+/// [`sweep_with`] with a clock on every radial, milliseconds since the Unix epoch.
 fn sweep_with_clock(
     collected_ms: i64,
     elevation_number: u8,
@@ -159,8 +152,6 @@ fn scan_with(fields: Fields<'_>) -> Scan {
     )
 }
 
-/// Decode one gate of the given slot from a scan's sweep, m/s (or the
-/// slot's units), `None` for no data.
 fn decoded(scan: &Scan, sweep: usize, radial: usize, gate: usize, slot: MomentSlot) -> Option<f64> {
     use nexrad_model::data::MomentValue;
     let radial = &scan.sweeps()[sweep].radials()[radial];
@@ -171,8 +162,6 @@ fn decoded(scan: &Scan, sweep: usize, radial: usize, gate: usize, slot: MomentSl
     }
 }
 
-/// The volume-slot table: natives sample, the three derivations sample
-/// through their source slot, everything else refuses.
 #[test]
 fn the_volume_slot_admits_the_natives_and_the_three_derivations() {
     use RadarProduct::*;
@@ -216,8 +205,6 @@ fn the_volume_slot_admits_the_natives_and_the_three_derivations() {
         ],
         "a product with no per-tilt field must stay refused",
     );
-    // And none of the derived three may pass the raw-scan gate: that is
-    // the door `for_derived` exists to keep shut.
     for product in [
         StormRelativeVelocity,
         SpecificDifferentialPhase,
@@ -227,18 +214,8 @@ fn the_volume_slot_admits_the_natives_and_the_three_derivations() {
     }
 }
 
-/// SRV honours the user's storm motion vector, radial by radial: the
-/// derived field minus the raw field is exactly the subtracted motion
-/// component, which is `apply_storm_motion`'s contract carried through
-/// the whole prepare → synthesize → decode round trip.
-///
-/// The fixture wind is a smooth 25 m/s southerly flow (no folds, so the
-/// dealias pass is the identity) and the override is deliberately not the
-/// flow — a fixture whose override matched its wind would hide a sign
-/// error in the correction.
 #[test]
 fn srv_subtracts_the_override_motion_radial_by_radial() {
-    // Radial velocity of a uniform wind FROM 180° at 25 m/s.
     let flow = |az: f64| 25.0 * (az - 180.0).to_radians().cos();
     let scan = scan_with(&move |az, _| (Some(40.0), Some(flow(az)), None, Some(0.99)));
 
@@ -287,23 +264,6 @@ fn srv_subtracts_the_override_motion_radial_by_radial() {
     );
 }
 
-/// Each derived codec spans exactly the range its product declares —
-/// asserted against the span, not against the encoder that wrote it.
-///
-/// Every other test of a derived field in this module decodes through the
-/// same `codec()` that `synth_sweep` encoded with, so the pair is
-/// self-inverting: swapping NROT's codec for velocity's (2, 129) — a
-/// sixteen-fold coarsening, and a different zero — changes the raw bytes
-/// and the decode together and the whole workspace stays green. The field
-/// would then be quantised to 0.5 unitless per code, against a palette
-/// whose entire weak class is 0.75 wide.
-///
-/// This pin has no encoder in it. The codec is a claim about what raw
-/// codes 2 and 255 *mean*, and the claim is checked against the numbers
-/// the module doc and `voxel::data_levels_for` state independently. The
-/// second half of the loop — that the voxel ramp agrees with these spans
-/// — is `a_derived_voxel_grid_resamples_the_derived_field`'s `value_range`
-/// assertions.
 #[test]
 fn each_derived_codec_spans_exactly_the_range_its_product_declares() {
     for (product, lo, hi, why) in [
@@ -340,8 +300,6 @@ fn each_derived_codec_spans_exactly_the_range_its_product_declares() {
             product.code(),
             decode(255.0),
         );
-        // And the no-data code is outside the span in the direction the
-        // ramp puts it, so a zero byte can never decode to a value.
         assert!(
             decode(0.0) < lo,
             "{}: the no-data code 0 decodes to {}, inside the span",
@@ -351,25 +309,6 @@ fn each_derived_codec_spans_exactly_the_range_its_product_declares() {
     }
 }
 
-/// NROT's decoded levels **are** GR2Analyst's lattice, not merely near it.
-///
-/// **Non-circular by construction.** Every expectation here is the
-/// reference's own number, and the lattice under test is read back out of
-/// the decode rather than recomputed from `codec`'s constants — so widening
-/// or narrowing that span fails this on the reference's quantum. The sibling
-/// above cannot catch that: it checks a span against the same span.
-///
-/// The reference's numbers come from the `campaign-harness` NROT record.
-/// Its hovered readouts pool to **14 780** values, and a two-parameter fit
-/// over them admits exactly one lattice — spacing **10/253 = 0.0395257**,
-/// offset **half a step**, so zero is deliberately *not* a point on it —
-/// with the denominators 252 and 254 both infeasible against those same
-/// readings. Its ends are what GR2Analyst's own Product Details panel
-/// reports hovered on a KCRP cut: minimum **−5.00**, maximum **+5.00**.
-///
-/// The half-step is the part worth pinning. The record's prose quotes the
-/// lattice as `n·0.03950 + 0.0210`, and that offset breaks 6.6% of the
-/// readings it was drawn from; half a step breaks none of them.
 #[test]
 fn nrot_decodes_onto_the_reference_lattice() {
     /// GR2Analyst's quantum: 253 gaps across its own ±5.
@@ -386,7 +325,6 @@ fn nrot_decodes_onto_the_reference_lattice() {
         "254 codes carry a value; 0 is no-data and 1 is reserved",
     );
 
-    // Spacing, measured off the decode rather than assumed of it.
     let measured = (levels[253] - levels[0]) / 253.0;
     assert!(
         (measured - STEP).abs() < 1e-6,
@@ -401,8 +339,6 @@ fn nrot_decodes_onto_the_reference_lattice() {
         );
     }
 
-    // The offset. Zero is not a level, and the two straddling it sit half a
-    // step out — the half of the reference's lattice its own prose got wrong.
     let nearest = levels
         .iter()
         .copied()
@@ -435,12 +371,8 @@ fn nrot_decodes_onto_the_reference_lattice() {
     );
 }
 
-/// SRV with neither an override nor a usable wind fit refuses: base
-/// velocity under a storm-relative label is the failure the refusal
-/// exists to prevent.
 #[test]
 fn srv_with_no_motion_vector_refuses() {
-    // No velocity anywhere: no wind fit, and (no override) no vector.
     let scan = scan_with(&|_, _| (Some(40.0), None, None, Some(0.99)));
     assert!(
         prepare(
@@ -454,9 +386,6 @@ fn srv_with_no_motion_vector_refuses() {
     );
 }
 
-/// NROT is the rotation pipeline's output, not relabelled velocity: on a
-/// uniform 15 m/s field — every gate moving, zero shear — the derived
-/// field must read no-data or near-zero everywhere, never 15.
 #[test]
 fn nrot_is_rotation_not_relabelled_velocity() {
     let scan = scan_with(&|_, _| (Some(40.0), Some(15.0), None, Some(0.99)));
@@ -484,24 +413,15 @@ fn nrot_is_rotation_not_relabelled_velocity() {
             }
         }
     }
-    // `seen` may honestly be 0: the pipeline censors a zero-information
-    // field to no-data, which is also not-velocity. The assertion above
-    // is the pin; this is just the record of which way it went.
+    // `seen` may honestly be 0: the pipeline censors a zero-information field to no-
+    // data, which is also not-velocity.
     let _ = seen;
 }
 
-/// A cross-section of a derived product slices the derived field — the
-/// integrated pin over `xsect::render_section`'s derivation seam. An SRV
-/// section and a BV section of the same volume must differ wherever the
-/// motion component is non-zero; a seam that forgot to derive (sampled
-/// the raw scan under the SRV label) makes them equal, which is the
-/// "looks right, different field" failure the sampler's refusal exists
-/// to prevent.
 #[test]
 fn a_derived_section_slices_the_derived_field() {
     let flow = |az: f64| 25.0 * (az - 180.0).to_radians().cos();
     let scan = scan_with(&move |az, _| (Some(40.0), Some(flow(az)), None, Some(0.99)));
-    // KTLX; a west–east line through the site so azimuths span the flow.
     let site = (35.33306, -97.2775);
     let req = |product| crate::xsect::SectionRequest {
         start: (site.0, site.1 - 0.4),
@@ -542,10 +462,6 @@ fn a_derived_section_slices_the_derived_field() {
     );
 }
 
-/// A voxel grid of a derived product resamples the derived field — the
-/// same pin as the section one, over `voxel::build_voxels_with_motion`'s
-/// seam — and the derived grids carry their own value ranges, not their
-/// source slot's.
 #[test]
 fn a_derived_voxel_grid_resamples_the_derived_field() {
     use crate::voxel::{HalfExtentKm, VoxelRequest, VoxelShape, build_voxels_with_motion};
@@ -604,8 +520,6 @@ fn a_derived_voxel_grid_resamples_the_derived_field() {
              grid resampled the raw field under the SRV label",
     );
 
-    // The derived ranges: SRV shares velocity's, NROT and KDP carry
-    // their own — pinned here as the literals `derive`'s codecs match.
     let nrot = build_voxels_with_motion(
         &scan,
         &req(RadarProduct::NormalizedRotation),
@@ -625,17 +539,12 @@ fn a_derived_voxel_grid_resamples_the_derived_field() {
         "NROT's index 0 sits one step under −5",
     );
 
-    // And a derived grid survives its own wire form: the far end
-    // re-derives the range and the table from the product and must agree.
     let restored = crate::voxel::VoxelGrid::from_bytes(&srv.to_bytes())
         .expect("a derived grid round-trips the wire");
     assert_eq!(restored.value_range(), srv.value_range());
     assert_eq!(restored.lut(), srv.lut());
 }
 
-/// KDP is the phase derivative, not relabelled ΦDP: a linear 1 °/km ramp
-/// must derive to ~0.5 °/km (KDP = dΦ/2dr), never to the ~30–70° the raw
-/// phase reads.
 #[test]
 fn kdp_is_the_phase_derivative_not_relabelled_phase() {
     let scan = scan_with(&|_, slant| (Some(45.0), None, Some(10.0 + 1.0 * slant), Some(0.99)));
@@ -672,25 +581,9 @@ fn kdp_is_the_phase_derivative_not_relabelled_phase() {
     }
 }
 
-/// **A derivation keeps the tilt's clock.**
-///
-/// `synth_sweep` builds fresh radials for a tilt the radar already flew, and it
-/// used to stamp `0` on their collection timestamps because nothing read one.
-/// Now something does: a section pane reports how old the rung under the
-/// pointer is, and that age is read off these radials.
-///
-/// Left unfixed the failure would have been invisible in exactly the way this
-/// campaign keeps paying for — every *native* moment's section would date its
-/// rungs correctly while storm-relative velocity, NROT and KDP silently could
-/// not, with no error, no warning and nothing in the picture to point at.
-///
-/// The two tilts carry clocks a minute apart, so a derivation that stamped one
-/// constant across the volume fails as well as one that stamped zero.
 #[test]
 fn a_derived_sweep_keeps_the_clock_of_the_tilt_it_was_computed_from() {
     const T0: i64 = 1_760_000_000_000;
-    // A rotational couplet's worth of velocity, plus the phase and correlation
-    // KDP needs, so all three derivations have something to run on.
     let fields = &|az: f64, slant: f64| {
         (
             Some(30.0),
@@ -724,10 +617,6 @@ fn a_derived_sweep_keeps_the_clock_of_the_tilt_it_was_computed_from() {
         RadarProduct::NormalizedRotation,
         RadarProduct::SpecificDifferentialPhase,
     ] {
-        // A motion vector for SRV; the other two read none. The volume states
-        // no Nyquist limit, so the dealias each derivation runs estimates one
-        // — which is what this fixture had before the declaration crossed the
-        // boundary, and the clocks it checks do not depend on it.
         let prepared = prepare(
             (&scan).into(),
             product,
@@ -757,8 +646,6 @@ fn a_derived_sweep_keeps_the_clock_of_the_tilt_it_was_computed_from() {
     }
 }
 
-/// One velocity-carrying sweep of `n` radials `step_deg` apart from due north
-/// — a sector whenever `n · step_deg` stops short of the circle.
 fn arc_sweep(n: usize, step_deg: f32) -> Sweep {
     let radials = (0..n)
         .map(|i| {
@@ -798,9 +685,6 @@ fn arc_sweep(n: usize, step_deg: f32) -> Sweep {
     Sweep::new(1, radials)
 }
 
-/// A synthetic radial declares the arc its own grid row covers. On a rotation
-/// that is `360 / rows` to the bit — which is what every WSR-88D cut is — and
-/// on a 36° sector of 0.5° rows it is 0.5°, not the 5° `360 / 72` claims.
 #[test]
 fn a_derived_radial_declares_the_step_its_own_grid_sits_at() {
     for (n, step, expected) in [(360usize, 1.0f32, 1.0f32), (72, 0.5, 0.5)] {
@@ -824,14 +708,6 @@ fn a_derived_radial_declares_the_step_its_own_grid_sits_at() {
     }
 }
 
-/// A tilt whose leading radial lost its ΦDP is still derived.
-///
-/// The guard admitted a sweep on `radials.first().differential_phase()` while
-/// [`crate::kdp::compute_kdp`] — the estimator it then called — reads every
-/// radial. The two disagreed, so one blank leading radial refused a cut the
-/// estimator was perfectly willing to derive, and the tilt vanished from the
-/// KDP volume with no warning: the same guard-versus-extractor split
-/// `crate::velocity` closed for the wind fit.
 #[test]
 fn a_tilt_whose_leading_radial_lost_its_phase_is_still_derived() {
     let clean = scan_with(&|_, slant| (Some(45.0), None, Some(10.0 + slant), Some(0.99)));
@@ -905,8 +781,6 @@ fn a_tilt_whose_leading_radial_lost_its_phase_is_still_derived() {
 /// The memo tests' mutual exclusion. Only they take it.
 static MEMO_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// A clocked two-tilt volume over `fields` — the derivation memo only fires
-/// for a volume that can say when it was flown.
 fn clocked_scan_with(t0: i64, fields: Fields<'_>) -> Scan {
     Scan::new(
         vcp(&[0.5, 1.5]),
@@ -917,9 +791,6 @@ fn clocked_scan_with(t0: i64, fields: Fields<'_>) -> Scan {
     )
 }
 
-/// Every decodable value of `slot`, walked in one canonical order, plus the
-/// per-radial geometry — equality of two of these is byte-equality of the
-/// synthetic scans, because the fixed-point codec is deterministic.
 fn derived_fingerprint(scan: &Scan, slot: MomentSlot) -> Vec<(usize, usize, usize, Option<f64>)> {
     let mut out = Vec::new();
     for (s, sweep) in scan.sweeps().iter().enumerate() {
@@ -932,13 +803,9 @@ fn derived_fingerprint(scan: &Scan, slot: MomentSlot) -> Vec<(usize, usize, usiz
     out
 }
 
-/// **The determinism gate (WO-E4.8).** The second same-key derivation is a
-/// hit — the very allocation the first call computed — and the bytes it
-/// serves are the bytes a fresh compute (memo cleared) produces.
 #[test]
 fn a_memoized_derivation_is_the_bytes_a_fresh_one_computes() {
     let _serial = MEMO_TEST_LOCK.lock().unwrap();
-    // A rotational couplet, so NROT has structure worth comparing.
     let scan = clocked_scan_with(1_770_000_000_000, &|az, _| {
         (
             Some(30.0),
@@ -964,8 +831,6 @@ fn a_memoized_derivation_is_the_bytes_a_fresh_one_computes() {
     memo_clear();
     let first = run();
     let second = run();
-    // The hit proof: pointer identity is a per-key fact no parallel test can
-    // fake — only this key's insert can put this allocation in the memo.
     assert!(
         Arc::ptr_eq(&first, &second),
         "the second same-key derivation was recomputed — the memo missed \
@@ -973,7 +838,6 @@ fn a_memoized_derivation_is_the_bytes_a_fresh_one_computes() {
          never happened)",
     );
 
-    // The byte proof: what the memo serves == what a fresh compute builds.
     memo_clear();
     let fresh = run();
     assert!(
@@ -987,9 +851,6 @@ fn a_memoized_derivation_is_the_bytes_a_fresh_one_computes() {
     );
 }
 
-/// The native invalidation seam: `retain_volumes` drops a memo entry whose
-/// volume is gone and keeps one whose volume is still held — the contract
-/// `App::evict_unshown_scans` calls this under (WO-E4.8).
 #[test]
 fn evicting_a_volume_drops_its_memo_entry_and_keeps_the_live_ones() {
     let _serial = MEMO_TEST_LOCK.lock().unwrap();
@@ -1017,14 +878,12 @@ fn evicting_a_volume_drops_its_memo_entry_and_keeps_the_live_ones() {
 
     memo_clear();
     let first = run();
-    // The volume is still live: the entry survives and the next ask hits.
     retain_volumes([&scan]);
     let kept = run();
     assert!(
         Arc::ptr_eq(&first, &kept),
         "retain_volumes dropped an entry whose volume is still live",
     );
-    // The volume is gone: the entry dies and the next ask recomputes.
     retain_volumes([]);
     let recomputed = run();
     assert!(
@@ -1033,11 +892,6 @@ fn evicting_a_volume_drops_its_memo_entry_and_keeps_the_live_ones() {
     );
 }
 
-/// An unclocked volume is never memoized: `0` is the decoder's "no clock"
-/// sentinel, and a volume that cannot say when it was flown has no identity
-/// to cache under — two unclocked fixtures of one shape would otherwise
-/// serve each other's fields. (This is also what keeps every unclocked
-/// fixture in this crate's suites on the exact pre-memo compute path.)
 #[test]
 fn an_unclocked_volume_is_never_memoized() {
     let _serial = MEMO_TEST_LOCK.lock().unwrap();

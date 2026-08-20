@@ -1,55 +1,21 @@
 //! How large the pane mirror is drawn, and how often that is allowed to change.
 //!
 //! The mirror is a pane's own map render, copied into an offscreen texture the
-//! raymarch samples for the 3D view's map floor. Nothing about that copy forces
-//! it to be made at the *frame's* texel density: it is regenerated every frame
-//! from egui's tessellated primitives, so the density is a free parameter, and
-//! the only thing that ever wanted it pinned to the frame was that nobody had
-//! asked for anything else.
+//! raymarch samples for the 3D floor. It is regenerated every frame from egui's
+//! primitives, so its density is a free parameter: which rung it is drawn at,
+//! and when the rung may move.
 //!
-//! A 3D camera that is low and close magnifies the ground it samples. At the
-//! user's reported framing — a 460 km box, the eye near the deck, a city name
-//! filling a fifth of the pane — the floor is stretched several times over, and
-//! a fixed-density mirror has no more detail to give. This module is the two
-//! decisions that fixes: **which rung** the mirror is drawn at, and **when** the
-//! rung is allowed to move.
+//! `egui_wgpu::Renderer::render` hardcodes `set_viewport(0, 0, size_in_pixels)`,
+//! so the only lever is to move `size_in_pixels` and `pixels_per_point`
+//! **together** — egui's vertex shader divides by their quotient, so geometry is
+//! untouched and only the sampling rate moves. The floor's uniform lanes are the
+//! reciprocal of that same quotient (`volume_bridge::floor_lanes`), so scaling
+//! both leaves registration bit-identical at any rung. The attachment does grow,
+//! which makes `max_texture_dimension_2d` a real bound — see [`MirrorLimits`].
 //!
-//! # The lever, and that it works upwards
-//!
-//! `egui_wgpu::Renderer::render` hardcodes `set_viewport(0, 0, size_in_pixels)`
-//! and WebGPU validates the viewport against the attachment, so the mirror
-//! cannot be scaled onto a differently-sized target by touching the viewport.
-//! The one lever that works is to move `size_in_pixels` and `pixels_per_point`
-//! **together**: egui's vertex shader divides by `screen_size_in_points`, which
-//! is their quotient, so the geometry is untouched and only the sampling rate
-//! moves.
-//!
-//! That argument is a statement about a quotient and is therefore direction-free
-//! — it holds for a scale above 1 exactly as it does for the halving that
-//! already shipped. Two consequences are worth naming because they are what a
-//! reviewer should check rather than take on trust:
-//!
-//! * The floor's own uniform lanes are the reciprocal of that same quotient —
-//!   `1 / mirror_size_points` (`volume_bridge::floor_lanes`), and
-//!   [`MirrorPlan::size_in_points`] is what carries it. Scaling both leaves
-//!   every lane bit-identical, so **registration cannot move** — which is why
-//!   `floor_alignment` still reports best translation `(0, 0)` with this
-//!   landed, and would still do so at any rung.
-//! * The attachment grows, so the device's `max_texture_dimension_2d` becomes a
-//!   real bound rather than a formality. See [`MirrorLimits`].
-//!
-//! # What a rung buys, and what it does not
-//!
-//! A rung multiplies the texels the mirror has. It does **not** multiply the
-//! detail the mirror is given: the basemap, the roads and the place labels all
-//! arrive as raster tiles chosen for the 2D pane's own zoom, and drawing a
-//! 256-texel tile into twice as many mirror texels interpolates rather than
-//! reveals. So the rung is spent, and only spent, alongside a matching
-//! **tile zoom bias** on the pane drawing it — `log2` of the applied rung, fetched
-//! one slippy level deeper and drawn at half the point footprint. The rung is
-//! where the extra detail lands; the bias is where it comes from. Either alone
-//! is wasted, which is why [`MirrorRungs::tile_zoom_bias`] is derived from the
-//! rung that was *applied* rather than the one that was wanted.
+//! A rung multiplies the mirror's texels, not the detail it is given: tiles
+//! arrive at the 2D pane's own zoom, so a rung is only worth having alongside a
+//! matching tile zoom bias of `log2(applied rung)` on the pane drawing it.
 
 // The side cap is device-class policy and lives on the floor since WO-RD;
 // `MirrorLimits::for_device` here is what spends it.
@@ -58,119 +24,36 @@ use rustdar_device_profile::constants::MIRROR_MAX_SIDE;
 /// The highest rung the mirror is ever asked for, as a multiple of the frame's
 /// own texel density.
 ///
-/// Two independent things stop at 2, and they agree, which is the only reason
-/// to write a single number down:
+/// Two independent things stop at 2. The tile cache: bias `log2(rung)` is four
+/// times the tiles per level against one shared `TILE_CACHE_ENTRIES` LRU (256 on
+/// desktop) — a 900-point floor strip needs ~32 tiles at bias 0, 162 at 1, 594
+/// at 2. Memory: 4× the frame's texels is 16× its bytes, 126 MiB for a 1080p
+/// frame, which no arm of `VOLUME_MIRROR_BYTES_MAX` admits.
 ///
-/// * **The tile cache.** A rung is only worth having with a matching tile zoom
-///   bias, and the bias is `log2(rung)`. Each level is four times the tiles,
-///   against the single `tile_source::TILE_CACHE_ENTRIES` LRU every pane and
-///   every layer shares — 256 on desktop, and the smaller mobile and wasm
-///   arms only tighten this argument. A 900-point-square floor strip drawing a basemap
-///   and a label layer needs about 32 tiles at bias 0, 162 at bias 1 and 594 at
-///   bias 2 — so bias 2 cannot fit however the window is arranged, while bias 1
-///   fits some windows and not others.
-/// * **Memory.** 4x the frame's texels is 16x its bytes — 126 MiB for a 1080p
-///   frame — which no arm of [`rustdar_device_profile::constants::VOLUME_MIRROR_BYTES_MAX`]
-///   admits anyway.
-///
-/// So the byte budget would refuse rung 4 on its own; the cap is written down
-/// separately because the tile-cache argument is the one that would still hold
-/// on a target with memory to spare.
-///
-/// # What the off-screen floor strip costs, per target
-///
-/// A 3D pane draws its own map into a strip *below* the frame
-/// (`rustdar_egui::ui_map`'s `floor_strip_plan`), and the mirror has to reach
-/// it, so the mirror is the frame plus the strips rather than the frame. One
-/// uniform translation keeps the strips disjoint and keeps the total under
-/// **twice the frame**, and the translation is the smallest that clears the
-/// frame, so in practice it is twice the frame less the top bar — or 1.5x for a
-/// 3D pane in the lower half of a vertical split.
-///
-/// Twice the area is at most **one extra halving**, on every target, and that
-/// is a proof rather than a survey: the fit halves both axes at once, so one
-/// halving takes a doubled mirror to half the frame's own size, which fitted by
-/// assumption. [`the_strip_costs_at_most_one_rung_on_any_target`] is that
-/// statement as a test.
-///
-/// What it actually costs, worked through, at the worst case of 2x:
-///
-/// | target | frame | mirror | budget | verdict |
-/// |---|---|---|---|---|
-/// | desktop | 4K 3840x2160 | 3840x4320 = 63.3 MiB | 64 MiB, side 8192+ | fits; rung 1 as before |
-/// | desktop | 1080p at rung 2 | 3840x4320 = 63.3 MiB | 64 MiB | fits; **rung 2 survives** |
-/// | desktop | 1440p at rung 2 | 5120x5760 = 112.5 MiB | 64 MiB | **rung 2 lost**, falls to rung 1 (29 MiB) |
-/// | wasm | 1440x900 points | 1440x1760 = 9.7 MiB | 16 MiB, side 2048 | fits |
-/// | wasm | 1920x1080 px | 1920x2160 = 15.8 MiB | 16 MiB, **side 2048** | side refuses; **halved to 960x1080** |
-/// | mobile | 1080x2340 phone | 1080x4680 = 19.3 MiB | 16 MiB | budget refuses; **halved to 540x2340** |
-/// | mobile | 720x1600 phone | 720x3200 = 8.8 MiB | 16 MiB | fits |
-///
-/// So the strip costs a rung at 1440p on desktop, and half the floor's density
-/// on a wasm frame over ~1024 points tall or a phone frame over ~2000 pixels
-/// tall. **Neither budget constant is widened to buy those back**, and neither
-/// is [`MIRROR_MAX_SIDE`], for three reasons worth stating rather than leaving
-/// implicit:
-///
-/// * [`MIRROR_MAX_SIDE`] is not a policy to relax. It is
-///   `wgpu::Limits::downlevel_webgl2_defaults()`'s guarantee, and
-///   [`MirrorLimits::for_device`] already raises it to whatever the adapter
-///   reports — 8192 on any real WebGPU or Vulkan device. The row it binds on is
-///   the row where the device genuinely cannot do better.
-/// * The mobile budget sits beside a 5 MiB volume texture and a 5 MiB offscreen
-///   inside a 256 MiB texture budget. Doubling it to buy density on the devices
-///   least able to spare the memory is the wrong way round.
-/// * On the shape this whole change is *for*, the mobile comparison is not
-///   "sharp floor against soft floor" — it is "no floor against soft floor". A
-///   3D view on a Compact width class is the whole frame, `RegionDestination`
-///   converts the pane it was dragged on, and under the borrowed-source
-///   arrangement that pane had no map left to stand on. Every phone was in that
-///   case, always.
-///
-/// The desktop 1440p row is the one with no such consolation: that is a real
-/// loss of the top rung at one common resolution, taken deliberately rather
-/// than by widening a 64 MiB single allocation to 128 MiB.
-///
-/// **"Fits some windows and not others" is not left to a cap.** Whether bias 1
-/// actually fits is measured per frame against the real pane rects, by
-/// `Gui::tile_zoom_bias_for_pane` through `tiles::tiles_resident_for`, and the
-/// bias is dropped to 0 when it would not. This constant is the ceiling on what
-/// may ever be asked for; that check is what decides whether the ask is taken.
+/// The mirror covers the frame plus the off-screen floor strips, which one
+/// uniform translation keeps under twice the frame — at most one extra halving
+/// on any target, since the fit halves both axes at once
+/// ([`the_strip_costs_at_most_one_rung_on_any_target`]). In practice that costs
+/// the top rung at 1440p on desktop and half the floor's density on a wasm frame
+/// over ~1024 points or a phone frame over ~2000 px.
 pub const MIRROR_SCALE_MAX: f32 = 2.0;
 
 /// How far past a rung boundary the camera must fall before the rung above it is
 /// given up, as a multiple.
 ///
-/// Rungs are powers of two, so the bare rule "use the smallest rung at least as
-/// large as the magnification" has its switch points at exactly 1.0 and 2.0 —
-/// and a camera drifting across one of those would re-render the mirror at a new
-/// size, and re-fetch a whole tile pyramid at a new zoom, on alternate frames.
-///
-/// The band is measured against the boundary of the rung being dropped **to**,
-/// not against the rung in force: giving up rung 2 needs a magnification below
-/// `1.0 / 1.25 = 0.8`, because 1.0 is where rung 2 stops being necessary. Read
-/// the other way round — as a fraction of the rung in force — the same rule is a
-/// 40 % undershoot, and stating it against the boundary is what makes it one
-/// number rather than one per rung.
-///
-/// 1.25 because walkers' own scroll-zoom step is about 1.21x per wheel notch
-/// (`ui_map`'s note on the 0.55 frame-time change): a dead band wider than one
-/// notch means no single notch can cross a rung boundary, so moving a rung takes
-/// two deliberate notches in the same direction rather than one twitch back and
-/// forth over a threshold.
+/// Measured against the boundary of the rung being dropped **to**, not the rung
+/// in force: giving up rung 2 needs a magnification below `1.0 / 1.25 = 0.8`.
+/// 1.25 because walkers' scroll-zoom step is ~1.21× per wheel notch, so no
+/// single notch can cross a rung boundary.
 pub const MIRROR_RUNG_HYSTERESIS: f32 = 1.25;
 
 /// How many consecutive frames the camera must want a different rung before it
 /// gets one.
 ///
-/// 15 frames is a quarter-second at 60 Hz. The dead band above stops a rung
-/// oscillating at a fixed camera; this stops it *sweeping* — a continuous drag
-/// from far to near crosses a boundary once, and without a dwell it would issue
-/// a tile-zoom change on the frame it happened to cross, mid-gesture, while the
-/// user is still moving and the answer is still changing.
-///
-/// It applies in both directions on purpose. Deferring an upward change costs a
-/// quarter-second of the softness the user already had; taking it immediately
-/// costs a fetch storm at the exact moment the frame budget is most contended.
+/// 15 frames, a quarter-second at 60 Hz. The dead band stops a rung oscillating
+/// at a fixed camera; this stops it sweeping mid-gesture. Both directions on
+/// purpose: taking an upward change immediately costs a fetch storm at the
+/// moment the frame budget is most contended.
 pub const MIRROR_RUNG_DWELL_FRAMES: u32 = 15;
 
 /// What the device and the target's memory budget will let the mirror be.
@@ -186,16 +69,6 @@ pub struct MirrorLimits {
 
 impl MirrorLimits {
     /// The limits for a device reporting `max_texture_dimension_2d`.
-    ///
-    /// Floored at [`MIRROR_MAX_SIDE`] rather than trusted outright so that a
-    /// device — or a test double — reporting something absurdly small cannot
-    /// drive the fit loop down to a one-texel mirror.
-    ///
-    /// The two halves arrive from different places on purpose, and that is the
-    /// whole shape of this pair: the side is a **measurement** the adapter
-    /// makes, and the byte budget is a **decision** this build carries, which
-    /// is why it comes in as `Budgets::mirror_bytes` rather than being read
-    /// from a `cfg` constant here.
     pub fn for_device(max_texture_dimension_2d: u32, max_bytes: usize) -> Self {
         Self {
             max_side: max_texture_dimension_2d.max(MIRROR_MAX_SIDE),
@@ -213,18 +86,6 @@ pub struct MirrorPlan {
     /// [`Self::size_in_pixels`] and never without it — see the module doc.
     pub pixels_per_point: f32,
     /// How much of egui's own coordinate space the mirror covers, in points:
-    /// the quotient [`Self::size_in_pixels`] `/` [`Self::pixels_per_point`],
-    /// which the fit loop moves both halves of and therefore cannot change.
-    ///
-    /// This is the *request*, carried through untouched, and it is what the
-    /// floor's uniform lanes normalise against
-    /// (`volume_bridge::floor_lanes`). It has to be said out loud now that the
-    /// mirror is **taller than the frame**: a 3D pane draws its own map into an
-    /// off-screen strip below the frame, so the frame's own size is no longer
-    /// the answer to "how many points does this texture span". Reading it off
-    /// the frame's `ScreenDescriptor` instead — which is what the pre-strip
-    /// code did, correctly, while the two agreed — would stretch every floor
-    /// vertically by the ratio between them.
     pub size_in_points: [f32; 2],
     /// What [`Self::size_in_pixels`] is as a multiple of the frame's own pixel
     /// density. A power of two; below 1 means the request did not fit.
@@ -236,11 +97,6 @@ pub struct MirrorPlan {
 
 impl MirrorPlan {
     /// Whether this target could not afford the density the camera wanted.
-    ///
-    /// Not cosmetic: the tile zoom bias is taken from the *applied* scale, so a
-    /// degraded plan must not go on fetching a slippy level the mirror has no
-    /// texels to show. Exposed rather than left implicit so the degradation is
-    /// something the code says out loud.
     pub fn is_degraded(&self) -> bool {
         self.applied_scale < self.wanted_scale
     }
@@ -255,13 +111,6 @@ impl MirrorPlan {
 
 /// The rung the camera's magnification asks for: the smallest power of two that
 /// covers it, held between 1 and [`MIRROR_SCALE_MAX`].
-///
-/// Never below 1. A camera that is *minifying* the floor — zoomed far out, many
-/// mirror texels to the screen pixel — would in principle be served by a smaller
-/// mirror, but the mirror is one texture for the whole application and shrinking
-/// it would blur the 2D panes' own floors under any other 3D pane. Reductions
-/// below 1 exist only as the fit's answer to a frame that does not fit, which is
-/// a different question with a different answer.
 pub fn wanted_scale_for(magnification: f32) -> f32 {
     if !magnification.is_finite() || magnification <= 1.0 {
         return 1.0;
@@ -276,18 +125,6 @@ pub fn wanted_scale_for(magnification: f32) -> f32 {
 /// Plan the mirror for a region of egui's coordinate space `size_in_points`
 /// across, drawn at a frame density of `pixels_per_point`, asked for at
 /// `wanted_scale`.
-///
-/// **Points rather than pixels**, because the request is a region of egui's own
-/// space: `rustdar_egui::Gui::mirror_size_points` measures the frame plus
-/// however far below it the 3D panes' off-screen map strips reach, and that
-/// quantity has no pixel size of its own until this function picks one.
-///
-/// Scales up first, then halves until the result fits both the device's side
-/// limit and the target's byte budget — so the fit is the same loop that already
-/// shipped, and a region too large to mirror at all is still reduced rather than
-/// refused. Both axes and the scale move together at every step, which is the
-/// invariant the whole design rests on, and it is why
-/// [`MirrorPlan::size_in_points`] comes out of the loop as it went in.
 pub fn mirror_plan(
     size_in_points: [f32; 2],
     pixels_per_point: f32,
@@ -335,9 +172,6 @@ pub fn mirror_plan(
 /// The mirror's size and the scale to draw it at, for a region
 /// `size_in_points` across at `pixels_per_point`, with no camera asking for
 /// more.
-///
-/// The pre-adaptive behaviour, kept as its own name because it is what the
-/// budget prose is written against.
 pub fn mirror_size_for(size_in_points: [f32; 2], pixels_per_point: f32) -> ([u32; 2], f32) {
     let plan = mirror_plan(
         size_in_points,
@@ -353,10 +187,6 @@ pub fn mirror_size_for(size_in_points: [f32; 2], pixels_per_point: f32) -> ([u32
 
 /// The rung the mirror is currently drawn at, and how long the camera has
 /// disagreed with it.
-///
-/// One per application, because the mirror is one texture for the whole
-/// application. See [`MIRROR_RUNG_HYSTERESIS`] and [`MIRROR_RUNG_DWELL_FRAMES`]
-/// for the two rules this holds the state for.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MirrorRungs {
     scale: f32,
@@ -380,11 +210,6 @@ impl Default for MirrorRungs {
 
 impl MirrorRungs {
     /// Fold one frame's magnification demand into the rung, and plan the mirror.
-    ///
-    /// `magnification` is the largest any 3D pane on the frame reported (see
-    /// `rustdar_egui::volume_view::floor_magnification`), or `None` when no pane
-    /// wants a floor — which holds the rung where it is rather than resetting
-    /// it, so hiding a floor for a moment does not cost the tile pyramid.
     pub fn observe(
         &mut self,
         magnification: Option<f32>,
@@ -412,10 +237,6 @@ impl MirrorRungs {
     }
 
     /// The rung this magnification argues for, given the one in force.
-    ///
-    /// Upwards on the bare rule, downwards only once the magnification is a
-    /// clear [`MIRROR_RUNG_HYSTERESIS`] below the boundary it would be dropping
-    /// past — which is `bare` itself, the top of the rung being dropped to.
     fn want_for(&self, magnification: f32) -> f32 {
         let bare = wanted_scale_for(magnification);
         if bare >= self.scale {
@@ -430,11 +251,6 @@ impl MirrorRungs {
 
     /// How many slippy zoom levels deeper a pane drawing a floor should fetch on
     /// the next frame, from the last plan the mirror was actually sized to.
-    ///
-    /// Last frame's, necessarily: tiles are drawn while the egui pass is open
-    /// and the mirror is sized after it closes. A rung that has just moved
-    /// therefore reaches the tiles one frame later, which is invisible beside
-    /// the quarter-second dwell that let it move at all.
     pub fn tile_zoom_bias(&self) -> u8 {
         self.last.map_or(0, |plan| plan.tile_zoom_bias())
     }

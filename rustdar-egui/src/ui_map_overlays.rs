@@ -8,9 +8,6 @@ use walkers::{Tile, TileId, Tiles};
 
 // ---------------------------------------------------------------------------
 /// Shared context for overlay drawing operations.
-///
-/// Bundles the common parameters (UI handle, map projector, click detection
-/// state) that every overlay drawing function needs.
 pub(super) struct OverlayDrawContext<'a> {
     ui: &'a egui::Ui,
     projector: &'a walkers::Projector,
@@ -24,19 +21,6 @@ pub(super) struct OverlayDrawContext<'a> {
 /// Returns `true` when a screen-space position should be treated as "blocked"
 /// by a floating dialog or non-map UI element, meaning map interactions at
 /// that position must be suppressed.
-///
-/// Three conditions trigger blocking:
-/// 1. `pos` is outside the map pane rect (sidebar, status bar, etc.)
-/// 2. `pos` falls on an explicitly excluded rect — chrome painted over a pane
-///    with no layer of its own; none exists since the top bar replaced the
-///    hamburger, but the check stays for the next one
-/// 3. `pos` is on an egui layer with order > `Background` (open dialog or popup window)
-///
-/// **Convention for new handlers:** pass every candidate click/hover position
-/// through this function before acting on it. Do **not** read raw click events
-/// from `ctx.input()` for map-level interactions — use the pre-filtered
-/// `PaneRenderCtx::overlay_click_pos` for clicks, and guard hover positions
-/// with this function.
 pub(super) fn is_pos_blocked(
     ctx: &egui::Context,
     pos: egui::Pos2,
@@ -77,34 +61,16 @@ impl<'a> OverlayDrawContext<'a> {
     }
 
     /// Draw a single overlay layer: texture, labels, and click detection.
-    ///
-    /// This is fully generic — the caller provides the texture cache, the
-    /// layer's map labels, and a way to *ask for* its clickable features.
-    /// Returns `Arc<dyn OverlayItem>` for all items whose polygons contain the
-    /// click point.
-    ///
-    /// # Why `items` is a closure
-    ///
-    /// Because almost no frame needs it. Labels are wanted every frame; the
-    /// geometry is wanted only on a frame that carries a click, and then only
-    /// for a layer whose rasterizer left no hit buffer. Handing the list in
-    /// eagerly meant `OverlayRegistry::clickable_items` ran per layer per pane
-    /// per frame — which for NWS alerts is a `Vec` and an `Arc` per warning,
-    /// and used to be a deep clone of every zone polygon in the country — to
-    /// be dropped unread. The closure moves that cost behind the two branches
-    /// that actually reach it.
     pub fn draw_overlay<'i>(
         &self,
         texture: Option<&OverlayTextureCache>,
         labels: &[OverlayLabel],
         items: impl FnOnce() -> Vec<ClickableItem<'i>>,
     ) -> Vec<Arc<dyn OverlayItem>> {
-        // 1. Draw the pre-rasterized texture if available
         if let Some(tex) = texture.and_then(|c| c.current()) {
             draw_overlay_texture(self.ui.painter(), self.projector, tex, self.screen_rect);
         }
 
-        // 2. Draw map labels
         let painter = self.ui.painter();
         for label in labels {
             let screen_pos = self
@@ -124,7 +90,6 @@ impl<'a> OverlayDrawContext<'a> {
             }
         }
 
-        // 3. Click hit-testing
         if !self.pointer_available || self.click_on_ui {
             return Vec::new();
         }
@@ -166,63 +131,6 @@ impl<'a> OverlayDrawContext<'a> {
 }
 
 /// Draw one slippy-map tile layer through the pane's own projector.
-///
-/// Every raster tile layer the map pane has — the basemap and the labels —
-/// goes through here, at the same tile grid, so the two cannot drift apart and
-/// a zoom bias applied to one is applied to both. Only tiles that intersect the
-/// current viewport are fetched or drawn.
-///
-/// # Why this rather than walkers' own tile pass
-///
-/// `walkers::Map` draws a tile layer at `zoom.round()` and offers no way to ask
-/// for another level: the one lever that looks like it — `Tiles::tile_size` —
-/// can only ever *subtract* from the level (`mercator.rs:50` computes
-/// `(size/256).log2() as u8`, which saturates to 0 below 1), and lying about it
-/// would desynchronise the tile grid from `Projector::project`, which is
-/// hard-coded to 256. So the tile grid is drawn here, from the projector, where
-/// the level is a free parameter — which is what `zoom_bias` needs it to be.
-///
-/// This is the pass the label layer has always used, and its "aligns
-/// pixel-perfectly with the base map" was a statement about *this* arithmetic
-/// agreeing with walkers'. The basemap now goes through it too, so the claim is
-/// no longer something to keep true across two implementations.
-///
-/// # `zoom_bias`
-///
-/// How many slippy levels deeper than the pane's own zoom to fetch. `0` is what
-/// every pane draws that is not under a 3D floor; `1` is what a pane under a
-/// magnified floor draws, so the mirror has real detail to sample rather than
-/// an interpolation of the level the pane would have used. Each level is four
-/// times the tiles, which is why `egui_renderer::mirror::MIRROR_SCALE_MAX` caps
-/// the bias at 1 against `tile_source::TILE_CACHE_ENTRIES`.
-///
-/// A biased tile that has not arrived yet costs nothing visible:
-/// `HttpsTiles::at` interpolates from whatever coarser level it already holds,
-/// so the pane degrades to the detail it has rather than flashing empty while
-/// the fetches land.
-///
-/// # The tile grid does not wrap, and a pane across the antimeridian shows it
-///
-/// The index walk below runs `min_tx..=max_tx` on one grid, and
-/// [`rustdar_geo::lon_to_tile_x`] **clamps** a longitude past ±180 to the last
-/// column rather than wrapping it. Neither `walkers` nor this application
-/// bounds the map's centre longitude, so a pane can be panned onto the seam,
-/// and when it is, the far side gets no basemap: the tiles are there, at
-/// wrapped `x`, and nothing asks for them.
-///
-/// Measured on a 1920-point pane centred exactly on 180°, at every zoom from 3
-/// to 10: **4 of the 9 tile columns the viewport covers are drawn, and 5 are
-/// not — 1280 points of the 1920**. It is the same figure at every zoom because
-/// it is a property of the seam, not of the scale.
-///
-/// It is written down rather than fixed because fixing it is not a clamp — the
-/// walk has to iterate unwrapped `x` and index the tile at `x.rem_euclid(n)`
-/// while still projecting the corner at its unwrapped longitude, and the same
-/// question then applies to every other layer this pane draws. What makes it
-/// worth writing down is that only the *basemap* stops at the seam: the radar
-/// raster, the overlays and the vectors are placed by projection and keep
-/// drawing, so the pane reads as a data layer over a blank, which looks like a
-/// tile server that is down.
 pub(super) fn draw_tile_layer(
     ui: &egui::Ui,
     projector: &walkers::Projector,
@@ -240,7 +148,6 @@ pub(super) fn draw_tile_layer(
 
     let screen_rect = ui.max_rect();
 
-    // Determine the visible geographic bounds by unprojecting screen corners.
     let nw = projector.unproject(egui::vec2(screen_rect.left(), screen_rect.top()));
     let se = projector.unproject(egui::vec2(screen_rect.right(), screen_rect.bottom()));
 
@@ -264,7 +171,6 @@ pub(super) fn draw_tile_layer(
             };
 
             if let Some(twuv) = tiles.at(tile_id) {
-                // Tile geographic corners
                 let nw_lon = tile_to_lon(tx, tile_zoom);
                 let nw_lat = tile_to_lat(ty, tile_zoom);
                 let se_lon = tile_to_lon(tx + 1, tile_zoom);
@@ -296,10 +202,6 @@ mod tests {
 
     /// A real context with a real floating `Area` at `dialog`, run for two
     /// passes so the area is registered whichever visibility rule egui applies.
-    ///
-    /// A hand-built `LayerId` would not do: `layer_id_at` answers out of
-    /// `Areas`, which only `Area::show` writes to, so a fake would make the
-    /// layer disjunct untestable in exactly the way that lets it be deleted.
     fn ctx_with_dialog(dialog: Option<egui::Rect>) -> egui::Context {
         let ctx = egui::Context::default();
         for _ in 0..2 {
@@ -322,22 +224,6 @@ mod tests {
     }
 
     /// Each of the three conditions must block **on its own**.
-    ///
-    /// They mask each other in the app, which is why this is claimed here
-    /// rather than only through the UI: the excluded-rect arm has no producer
-    /// at all — the top bar replaced the hamburger, and M5's pills shipped as
-    /// egui `Area`s (§3.3) that block through the floating-layer check, not
-    /// through rects — so the chrome's list stays empty by design, kept for
-    /// any future chrome painted *into* a pane and for this probe's
-    /// continuity. A click on a dialog is likewise already stripped upstream
-    /// by `ui_input::filter_dialog_blocked` before this ever sees it. Each row
-    /// below satisfies exactly one condition, so it fails if and only if that
-    /// one stops doing its job.
-    ///
-    /// The two that *can* be reached end to end are also driven through the
-    /// real UI — see `input_harness`'s
-    /// `a_click_outside_the_pane_does_not_reach_a_site_icon_straddling_its_edge`
-    /// and `a_dialog_over_a_site_icon_suppresses_its_hover_readout`.
     #[test]
     fn each_condition_blocks_a_position_on_its_own() {
         let clear = egui::pos2(400.0, 300.0);

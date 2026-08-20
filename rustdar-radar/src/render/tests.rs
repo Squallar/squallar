@@ -11,10 +11,6 @@ const PRODUCT: types::RadarProduct = types::RadarProduct::Reflectivity;
 const N_RADIALS: usize = 360;
 const N_BINS: usize = 600;
 
-/// A spatially coherent reflectivity field — storm cores placed in (x, y)
-/// rather than a per-radial pattern, so neighbouring radials agree about
-/// as much as real ones do. `silence` drops one radial without renumbering
-/// the rest, which [`overlapping_radials_contend_for_pixels`] needs.
 fn packet(silence: Option<usize>) -> RadialPacket {
     let radials = (0..N_RADIALS)
         .map(|i| {
@@ -75,7 +71,6 @@ fn digest(image: &[u8], values: &[f32]) -> u64 {
     h.finish()
 }
 
-/// The fixture has to actually paint, or everything below passes vacuously.
 #[test]
 fn fixture_covers_a_realistic_share_of_the_image() {
     let (image, values) = render(&packet(None));
@@ -94,9 +89,6 @@ fn fixture_covers_a_realistic_share_of_the_image() {
     assert!(values.iter().any(|v| !v.is_nan()));
 }
 
-/// Every value has to survive the trip through the cell exactly. The key
-/// shares those 64 bits, so anything that lets it reach the low half shows
-/// up here as a value the packet could not have encoded.
 #[test]
 fn values_round_trip_through_the_cell_unaltered() {
     let (_, values) = render(&packet(None));
@@ -109,14 +101,7 @@ fn values_round_trip_through_the_cell_unaltered() {
     }
 }
 
-/// Pins the *direction* of the tie-break, not just its stability. Two
-/// adjacent radials, the earlier one deliberately carrying the **larger**
-/// value: wherever both reach a pixel the later radial must take it, purely
-/// because it is later. Ranking by anything else — value, gate index, a
-/// constant key — hands some of those pixels to radial 0 instead.
-///
-/// `both`, `only_first` and `only_second` are the value grids with both
-/// radials, with the second silenced, and with the first silenced.
+/// Pins the *direction* of the tie-break, not just its stability.
 fn assert_later_radial_wins(
     both: &[f32],
     only_first: &[f32],
@@ -148,7 +133,6 @@ fn assert_later_radial_wins(
 
 #[test]
 fn level3_later_radial_wins_a_contested_pixel() {
-    // Radial 0 carries the larger value on purpose.
     fn two_radials(first: u16, second: u16) -> RadialPacket {
         let run = |start: f32, gate: u16| RadialRun {
             start_angle: start,
@@ -176,11 +160,6 @@ fn level3_later_radial_wins_a_contested_pixel() {
     );
 }
 
-/// Guards the premise of the two determinism tests: radials really do land
-/// on each other's pixels, so a racy rasterizer would have something to
-/// race over. Silencing radial `k` hands every pixel it owned to whichever
-/// lower-keyed radial also wrote there, so a pixel painted both times but
-/// holding different values is one that two radials contended for.
 #[test]
 fn overlapping_radials_contend_for_pixels() {
     let (_, full) = render(&packet(None));
@@ -199,8 +178,6 @@ fn overlapping_radials_contend_for_pixels() {
     );
 }
 
-/// The property this module exists to pin: ten renders of one sweep across
-/// the whole rayon pool agree byte for byte.
 #[test]
 fn parallel_render_is_deterministic() {
     assert!(
@@ -218,8 +195,6 @@ fn parallel_render_is_deterministic() {
     }
 }
 
-/// Stability alone would let the parallel path settle on an answer of its
-/// own. It has to settle on the sequential one.
 #[test]
 fn parallel_matches_single_thread() {
     let p = packet(None);
@@ -238,8 +213,6 @@ fn parallel_matches_single_thread() {
     assert_eq!(parallel, sequential);
 }
 
-/// Colour and value come out of one cell, so they cannot come from
-/// different gates. Two separate buffers used to let them.
 #[test]
 fn colour_agrees_with_value_at_every_pixel() {
     let (image, values) = render(&packet(None));
@@ -258,22 +231,9 @@ fn colour_agrees_with_value_at_every_pixel() {
 }
 
 // ── Level II and NROT ────────────────────────────────────────────────────
-//
-// These paths build their own keys and hand their own product to
-// `RenderBuffers`, and none of the Level III tests above reach them.
 
 const L2_ELEVATION: f32 = 0.5;
 
-/// A one-sweep Level II scan of `gates.len()` radials sitting at `azimuths`,
-/// each declaring `declared_spacing` as its own azimuth resolution. A radial
-/// whose byte is 0 decodes as below-threshold and is skipped, which silences
-/// it without renumbering the rest.
-///
-/// Where a radial sits and how wide it says it is are separate arguments
-/// because the renderer now reads them separately, and every way they can
-/// disagree is a case: sparser than declared is the sweep with radials
-/// missing, denser is the lying declaration, and a `declared_spacing` of 0 is
-/// a sweep that declares nothing at all.
 fn l2_sweep(gates: &[u8], azimuths: &[f32], declared_spacing: f32, velocity: bool) -> Scan {
     use nexrad_model::data::{MomentData, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern};
     assert_eq!(gates.len(), azimuths.len(), "one gate byte per radial");
@@ -335,8 +295,6 @@ fn l2_sweep(gates: &[u8], azimuths: &[f32], declared_spacing: f32, velocity: boo
     )
 }
 
-/// [`l2_sweep`] with the shape the tie-break tests were written against: 1°
-/// apart from 90°, declaring the 1° they are apart by.
 fn l2_scan(gates: &[u8], velocity: bool) -> Scan {
     let azimuths: Vec<f32> = (0..gates.len()).map(|i| 90.0 + i as f32).collect();
     l2_sweep(gates, &azimuths, 1.0, velocity)
@@ -349,30 +307,6 @@ fn render_l2(gates: &[u8], product: types::RadarProduct) -> (Vec<u8>, Vec<f32>) 
     (image, values)
 }
 
-/// Which pixel a point `range_km` out at `az_deg` from the site lands in on a
-/// raster projected at `extent_km`, through the same [`MercatorProjection`]
-/// the renderer paints with.
-///
-/// Through `MercatorProjection::pixel_at`, the placement itself, rather than
-/// through a restatement of it: `render_gate` writes and this asks, but both
-/// have to be asking about the same pixel. The truncation is why a probe goes
-/// through the projection at all — a hand-computed pixel would be off by one
-/// somewhere, and the difference between "unpainted" and "off by one" is the
-/// whole point of these tests.
-///
-/// This *was* a duplicate, and the duplication is what let the placement stay
-/// wrong: it walked the same equirectangular offsets `render_gate` walked, so
-/// every probe in this file agreed with the renderer about a position neither
-/// of them shared with [`rustdar_geo::site_bearing_range_km`] — which is the
-/// function the hover readout, the cross-section and [`painted_ranges_km`] all
-/// ask the same question backwards with.
-///
-/// The extent and the side are both arguments because both are now properties
-/// of the render being probed rather than of the display: a fixture reaching
-/// 150 km is drawn on a 150 km frame at [`types::IMAGE_SIZE`], a TDWR-shaped
-/// one on a 417 km frame, and the same TDWR through a `_sized` entry on a
-/// 4096-pixel one. A probe that assumed any of those would be asking about the
-/// wrong picture. Callers pass what the render they are probing handed back.
 fn probe_at(extent_km: f64, side_px: usize, az_deg: f64, range_km: f64) -> usize {
     let bounds = types::ImageBounds::from_radar_site(LAT, LON, extent_km);
     let proj = MercatorProjection::from_bounds(LAT, &bounds, extent_km, side_px);
@@ -382,29 +316,15 @@ fn probe_at(extent_km: f64, side_px: usize, az_deg: f64, range_km: f64) -> usize
     py as usize * side_px + px as usize
 }
 
-/// Gates in [`l2_sweep`]'s moments, and the gate they are — the shape of a
-/// WSR-88D cut, and the geometry every probe in this file that does not say
-/// otherwise is answered against.
 const L2_GATES: usize = 600;
 /// See [`L2_GATES`]. 600 of these reach 150 km of beam.
 const L2_GATE_KM: f64 = 0.25;
 
-/// The ground [`l2_sweep`] covers, km, and so the extent every render of it is
-/// projected at.
-///
-/// Derived from the fixture's own gates rather than written down, because that
-/// is the property under test everywhere it is used: these renders are framed
-/// by what their data reaches, so a probe that assumed any other number would
-/// be asking about a different picture. It used to be `types::BASE_EXTENT_KM` —
-/// a 150 km fixture really was drawn on a 230 km frame — and that is exactly
-/// the substitution this file now has none of.
 fn l2_ground_reach_km() -> f64 {
     crate::beam::ground_range_km(L2_GATES as f64 * L2_GATE_KM, f64::from(L2_ELEVATION))
 }
 
-/// The raw gate codes Level II reserves below the data range. Every other
-/// fixture in this file writes a value byte; these two are the states the
-/// plan view has to tell apart from each other and from an unpainted pixel.
+/// The raw gate codes Level II reserves below the data range.
 const RAW_BELOW_THRESHOLD: u8 = 0;
 const RAW_RANGE_FOLDED: u8 = 1;
 
@@ -414,8 +334,6 @@ fn pixel_at(image: &[u8], idx: usize) -> (u8, u8, u8, u8) {
     (px[0], px[1], px[2], px[3])
 }
 
-/// Assert what the sweep painted at a list of `(azimuth, range)` probes, on
-/// the frame [`l2_sweep`]'s own reach gives it.
 fn assert_probes(values: &[f32], painted: bool, probes: &[(f64, f64)], why: &str) {
     for &(az, range) in probes {
         let v = values[probe_at(l2_ground_reach_km(), types::IMAGE_SIZE, az, range)];
@@ -456,20 +374,10 @@ fn level2_colour_agrees_with_value_at_every_pixel() {
     }
 }
 
-/// A velocity field with enough azimuthal shear to survive the LLSD fit,
-/// the range normalization, and the ±0.25 display threshold, so
-/// `render_nrot_to_image` actually paints.
 fn nrot_scan(n_radials: usize) -> Scan {
     nrot_sector(n_radials, 360.0 / n_radials as f32)
 }
 
-/// [`nrot_scan`] over an arc rather than the whole circle: `n_radials` spaced
-/// `step_deg` apart from 0°, so `n_radials · step_deg` of sky is covered and
-/// the rest of the circle is a hole.
-///
-/// The shear is a function of the radial *index*, not of the azimuth, so a
-/// sector carries the same shear per radial that the full circle does and the
-/// LLSD fit has the same fixture to work with either way.
 fn nrot_sector(n_radials: usize, step_deg: f32) -> Scan {
     use nexrad_model::data::{MomentData, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern};
     let radials = (0..n_radials)
@@ -526,9 +434,6 @@ fn nrot_sector(n_radials: usize, step_deg: f32) -> Scan {
     )
 }
 
-/// NROT hands `RenderBuffers` its own product literal, far from where
-/// `into_output` applies it. Rendering NROT through the reflectivity
-/// palette would look plausible and fail nothing else.
 #[test]
 fn nrot_colour_comes_from_the_nrot_palette() {
     let scan = nrot_scan(360);
@@ -557,16 +462,6 @@ fn nrot_colour_comes_from_the_nrot_palette() {
     }
 }
 
-/// The NROT grid is indexed (azimuth, gate) like the others, and its key
-/// has to agree.
-///
-/// Known gap: transposing this path's [`GateId`] survives the suite. The
-/// L2 and L3 equivalents die to their `later_radial_wins` tests, which need
-/// two adjacent radials carrying known, very different values — NROT has no
-/// such handle, since every value is an LLSD fit over its neighbours and
-/// the median filter deletes anything isolated enough to control. The
-/// named fields are the mitigation: a transposition there has to be
-/// written out in full rather than slipped in as argument order.
 #[test]
 fn nrot_render_is_deterministic() {
     let scan = nrot_scan(360);
@@ -598,21 +493,7 @@ fn nrot_render_is_deterministic() {
 }
 
 // ── How wide a radial is painted ─────────────────────────────────────────
-//
-// Every probe here sits at 50 km, comfortably inside the raster whatever
-// extent it is projected at, and every fixture is built so that the
-// difference between a radial's declared width and the distance to its
-// neighbour is the only thing under test.
 
-/// A sweep with radials missing leaves the sky between them **empty**. Four
-/// radials 90° apart declaring the 0.5° a super-res cut is: the sweep covers
-/// two degrees of sky in total and 358 degrees of nothing.
-///
-/// This is the shape TDWR arrives in when the decoder loses radials, and the
-/// failure it used to produce is not a subtle one: painting each survivor at
-/// the mean distance to the next drew four 90°-wide wedges, and a wedge is
-/// built from a chord rather than an arc, so the display filled with four
-/// enormous triangles meeting at the site.
 #[test]
 fn a_sparse_sweep_leaves_holes_not_chord_triangles() {
     let scan = l2_sweep(&[200; 4], &[0.0, 90.0, 180.0, 270.0], 0.5, false);
@@ -633,26 +514,9 @@ fn a_sparse_sweep_leaves_holes_not_chord_triangles() {
     );
 }
 
-/// Collection order is where the antenna happened to start and which way it
-/// happened to turn, and it is not data. A sweep handed over descending must
-/// paint the same sky as the same sweep handed over ascending.
-///
-/// The masks are compared and the values are not, deliberately. Where two
-/// wedges quantize onto one pixel the winner is the later *radial*, and
-/// reversing the order reverses which of the two that is — so the values
-/// legitimately differ at the seams while the painted region does not.
-///
-/// The old signed mean made this a hollowed-out display rather than a
-/// shifted one: descending 1° radials averaged −1° a radial, and
-/// `render_gate` derives its azimuth sample count from that width, so beyond
-/// the range where the count first goes negative — about 26 km at 2048² —
-/// the loop ran zero times and every radial stopped dead. 34 k pixels of the
-/// 1.4 M this sweep covers, silently, with nothing in the log.
 #[test]
 fn an_out_of_order_sweep_still_paints() {
     let azimuths: Vec<f32> = (0..360).map(|i| i as f32).collect();
-    // Varying bytes, so a pixel two radials contend for really does hold a
-    // different value depending on which of them won it.
     let gates: Vec<u8> = (0..360).map(|i| 2 + (i % 200) as u8).collect();
 
     let render = |ascending: bool| {
@@ -690,8 +554,6 @@ fn an_out_of_order_sweep_still_paints() {
         "{mask_differs} pixels are painted in one collection order and not the other",
     );
 
-    // And the reason the masks are what is compared: the values are not
-    // equal, and are not expected to be.
     let value_differs = up
         .iter()
         .zip(&down)
@@ -704,12 +566,6 @@ fn an_out_of_order_sweep_still_paints() {
     );
 }
 
-/// The width comes from what the radial declares, not from where the next
-/// radial is. Two sweeps of radials 2° apart, one declaring the 2° it is
-/// spaced by and one declaring 0.5°: the first tiles, the second leaves
-/// three quarters of the sky between its wedges unpainted — which is the
-/// honest answer, since 0.5° is all the sky the radar says each sample
-/// covers.
 #[test]
 fn declared_spacing_drives_the_wedge_width() {
     let azimuths: Vec<f32> = (0..180).map(|i| i as f32 * 2.0).collect();
@@ -735,13 +591,6 @@ fn declared_spacing_drives_the_wedge_width() {
     );
 }
 
-/// A declaration is believed, not obeyed. A 200° arc of radials really 0.5°
-/// apart, every one of them declaring 45°: the sweep's own median step is
-/// what says 45° cannot be true, and the width is held to
-/// [`crate::azimuth::MAX_ADJACENT_GAP_STEPS`] of it.
-///
-/// Without the clamp the arc would paint 22.5° past each end and the sweep
-/// would cover 245° of sky it never looked at.
 #[test]
 fn a_lying_declaration_is_clamped_to_the_sweeps_median() {
     let azimuths: Vec<f32> = (0..=400).map(|i| i as f32 * 0.5).collect();
@@ -763,12 +612,6 @@ fn a_lying_declaration_is_clamped_to_the_sweeps_median() {
     );
 }
 
-/// The absolute cap, which the per-sweep one cannot stand in for. Two
-/// radials 10° apart declaring nothing at all: their median circular gap is
-/// the *larger* of the two ways round, 350°, so both the fallback and the
-/// per-sweep ceiling derived from it are useless here.
-/// [`super::MAX_WEDGE_DEG`] is what keeps the pair from being drawn as two
-/// 350°-wide chord lenses covering the entire display.
 #[test]
 fn a_sweep_with_no_declaration_is_capped_at_a_sane_wedge() {
     let scan = l2_sweep(&[200, 200], &[0.0, 10.0], 0.0, false);
@@ -789,28 +632,11 @@ fn a_sweep_with_no_declaration_is_capped_at_a_sane_wedge() {
     );
 }
 
-/// Gates in a WSR-88D surveillance cut — the one sweep shape whose raster is
-/// *data-limited* rather than base-sized, which is what the two tests below
-/// need and what the 150 km fixtures above cannot produce.
 const SURVEILLANCE_BINS: usize = 1832;
 
 /// How much further apart than it declares this sweep's antenna ran, degrees.
-///
-/// 0.09° is inside what real antennas do: over the eight volumes
-/// [`super::l2_wedge_half_widths_deg`] cites, the worst gap measured on a 0.5°
-/// declaration was **+0.102°** and the ninetieth percentile +0.036°. So this is
-/// a sweep that could arrive tomorrow, not an adversarial one.
 const WOBBLE_DEG: f32 = 0.09;
 
-/// A surveillance-depth sweep of `azimuths`, drawn at the side its own gates
-/// justify rather than at the base one.
-///
-/// Both halves matter. The depth is what puts the raster on
-/// [`types::data_limited_side_px`]'s branch — 1832 gates of 0.25 km reach
-/// 458 km, past [`types::BASE_EXTENT_KM`] — and the side is what makes the
-/// defect visible: the crack between two wedges is a fixed *angle*, so it
-/// swallows a raster pixel only once it is wider than one, and how many pixels
-/// it spans is the raster's density.
 fn long_range_sweep(azimuths: &[f32], side_ceiling: usize) -> SweepRender {
     use nexrad_model::data::{MomentData, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern};
     let radials = azimuths
@@ -863,11 +689,9 @@ fn long_range_sweep(azimuths: &[f32], side_ceiling: usize) -> SweepRender {
         ),
         vec![Sweep::new(1, radials)],
     );
-    // `MotionInputs::default()` deliberately, not a supplied vector: `PRODUCT`
-    // here is reflectivity, and storm motion reaches a fill through exactly one
-    // arm of this function, storm-relative velocity. The bundle's third field,
-    // `fallback`, decides nothing on this path either — so the default drops no
-    // value that the pair of `None`s it replaces used to carry.
+    // `MotionInputs::default()` deliberately, not a supplied vector: `PRODUCT` here is
+    // reflectivity, and storm motion reaches a fill through exactly one arm of this
+    // function, storm-relative velocity.
     render_radar_to_image_full_sized(
         &scan,
         L2_ELEVATION,
@@ -883,43 +707,6 @@ fn long_range_sweep(azimuths: &[f32], side_ceiling: usize) -> SweepRender {
     .unwrap()
 }
 
-/// **The seams.** A sweep of solid echo whose radials sit a little further
-/// apart than they declare paints every pixel between them, because that sky
-/// was measured.
-///
-/// # What this reproduces
-///
-/// A real antenna does not land its radials exactly 0.5° apart, and painting
-/// each one 0.5° wide about its own azimuth leaves an open sliver wherever it
-/// ran wide — measured at 46.7% of adjacent pairs over eight volumes. The
-/// sliver is a fixed *angle*, so how much raster it occupies is the raster's
-/// density, and the 2D ceiling becoming device-derived is what made it
-/// visible: 0.09° at 450 km is 0.71 px at a 2048 side and **1.58 px** at the
-/// 4096 one this renders at, and a gap swallows a pixel only once it is wider
-/// than one. The picture then draws dotted black lines *along the beam*,
-/// through solid echo, which is the shape a viewer reported.
-///
-/// Measured on real volumes at the 7362 side a WSR-88D surveillance cut asks
-/// for — raster pixels unpainted inside solid echo, before this change and
-/// after, over six sites chosen apart in latitude, terrain and climate:
-///
-/// | site | before | after |
-/// |---|---:|---:|
-/// | KTLX (Oklahoma, 35.3°N)  | 14 114 | 508 |
-/// | KFTG (Denver, 39.8°N)    |  5 024 | 179 |
-/// | KAMX (Miami, 25.6°N)     |  1 905 |  40 |
-/// | KCRP (Corpus, 27.8°N)    |  1 440 | 390 |
-/// | KATX (Seattle, 48.2°N)   |    106 |  38 |
-/// | KPDT (Pendleton, 45.7°N) |     50 |  34 |
-/// | **total**                | **22 639** | **1 189** |
-///
-/// # Why the probe is every gap and not a sample of them
-///
-/// Because the defect is intermittent by construction. A 1.58 px gap swallows
-/// a whole pixel column only where it happens to straddle one, so some gaps
-/// draw and the rest do not, and a probe at one azimuth could pass on the
-/// baseline by luck. Every wide gap at one range, all 360 of them, is the
-/// sample size that makes the question decidable.
 #[test]
 fn wedges_meet_where_the_antenna_wobbled() {
     let azimuths: Vec<f32> = (0..720)
@@ -943,16 +730,6 @@ fn wedges_meet_where_the_antenna_wobbled() {
     );
 }
 
-/// And the sky between radials that are genuinely *missing* stays empty, which
-/// is the property the reach test in [`super::l2_wedge_half_widths_deg`] exists
-/// to keep.
-///
-/// The two cases are told apart by arithmetic rather than by a tuned
-/// threshold: the widest wobble measured is a gap of 1.20 declared widths and
-/// the narrowest hole a dropped radial can leave is 2.00, so
-/// [`crate::azimuth::MAX_ADJACENT_GAP_STEPS`] at 1.5 separates them with room
-/// on both sides. Here every fourth radial is gone, so its neighbours are 1.0°
-/// apart on a 0.5° declaration and neither reaches for the other.
 #[test]
 fn a_dropped_radial_still_leaves_its_gap() {
     let azimuths: Vec<f32> = (0..720)
@@ -974,32 +751,6 @@ fn a_dropped_radial_still_leaves_its_gap() {
     );
 }
 
-/// **The lattice.** Every pixel under a solid field receives a sample, on a
-/// geometry where the old sample counts could not promise one.
-///
-/// # The property, and why per-axis sub-pixel steps are not it
-///
-/// [`super::SAMPLE_STEP_PX`] carries the argument: what has to be under half a
-/// pixel is the sample lattice's *covering radius*, `hypot(s_r, s_t) / 2`, and
-/// the counts used to be chosen so that each step alone came out under a
-/// pixel, which is weaker. This geometry is one where the difference shows — a
-/// 1 km grid over 460 km at a 4096 side steps 0.636 px radially and 0.941 px
-/// tangentially at the rim, a covering radius of **0.568 px** — and it is not
-/// contrived: it is the shape of every volume product this crate derives
-/// ([`crate::volumetric::RANGE_BIN_KM`]) and of the 1 km Level III products it
-/// fetches.
-///
-/// Before this change the same render left **42 502** pixels of solid echo
-/// unpainted, every one an isolated single-pixel hole with all eight
-/// neighbours painted — the `##.##` shape recorded in
-/// [`the_polar_field_answers_what_the_value_grid_holds`].
-///
-/// # Why the count is exact and not a tolerance
-///
-/// Because the claim is a proof rather than a measurement. A lattice whose
-/// covering radius is under half a pixel cannot miss a unit square, so the
-/// honest assertion is zero, and a tolerance here would be somewhere for the
-/// next geometry to hide.
 #[test]
 fn a_solid_field_leaves_no_pixel_of_itself_unpainted() {
     const RADIALS: usize = 360;
@@ -1016,7 +767,6 @@ fn a_solid_field_leaves_no_pixel_of_itself_unpainted() {
         num_range_bins: BINS as u16,
         i_center: 0,
         j_center: 0,
-        // 1 km bins: `RadialPacket::gate_interval_km` is `1 / scale_factor`.
         scale_factor: 1.0,
         is_legacy: false,
         xdr_data_scale: None,
@@ -1059,8 +809,6 @@ fn a_solid_field_leaves_no_pixel_of_itself_unpainted() {
     );
 }
 
-/// The half-width arithmetic on its own, at the cases the fixtures above
-/// cannot reach.
 #[test]
 fn a_half_width_reaches_a_neighbour_only_as_far_as_its_own_sample_goes() {
     let h = |az: &[f64], declared: f64, median: f64| {
@@ -1088,8 +836,6 @@ fn a_half_width_reaches_a_neighbour_only_as_far_as_its_own_sample_goes() {
     // One radial has no neighbour, and must not read its own azimuth as a
     // 360° gap.
     assert_eq!(h(&[17.0], 0.5, 0.5), vec![0.25]);
-    // The circle closes, so a full ring has no seam at north and no radial is
-    // widened by the wrap.
     let ring: Vec<f64> = (0..720).map(|i| i as f64 * 0.5).collect();
     let got = h(&ring, 0.5, 0.5);
     assert_eq!(got[0], 0.25);
@@ -1097,41 +843,17 @@ fn a_half_width_reaches_a_neighbour_only_as_far_as_its_own_sample_goes() {
 }
 
 // ── How far a render reaches, and how wide it is drawn ───────────────────
-//
-// A raster used to be ±230 km whatever it held, and the gate loops stopped
-// there. It is now projected at `types::plan_view_extent_km` of the sweep's
-// own reach, so what a render reports is the half-width of the *picture* and
-// the pictures below are three different sizes.
 
 /// Gates in TPIT's long-range surveillance cut.
 const TDWR_GATES: usize = 1390;
 /// Its gate, km. 1390 of them reach 417.
 const TDWR_GATE_KM: f64 = 0.3;
-/// The ground the cut covers, km: its 417 km of beam laid down at the
-/// fixture's own 0.5°.
-///
-/// Not 417. A frame is sized by the ground its sweep covers, and at 0.5° that
-/// is 16 m short of the beam's length — a fortieth of a pixel, and the whole
-/// reason the correction is landable on the WSR-88D fleet. The tests below
-/// pin the ground figure rather than the round one so that a future change
-/// putting slant ranges back on the glass fails here instead of only at 60°.
 fn tdwr_ground_reach_km() -> f64 {
     crate::beam::ground_range_km(417.0, f64::from(L2_ELEVATION))
 }
 
-/// Gates either side of the beacon's own, so the ring is five gates thick —
-/// 1.5 km, three or four pixels at the 2.46 px/km a 417 km frame gives a
-/// 2048-pixel image, which is enough to survive azimuth quantization at every
-/// bearing rather than only at the four cardinals.
 const TDWR_BEACON_GATES: usize = 2;
 
-/// A TDWR long-range reflectivity cut, as TPIT actually flies it: 1390 gates
-/// of 300 m from the antenna, 360 radials at the 1.0° a TDWR declares.
-///
-/// Every gate is below threshold except a band `beacon_km` out, so the render
-/// is a thin ring at a known range rather than a filled disc — a filled one
-/// would put its outermost pixels at the reach whatever happened in between,
-/// and the point here is *where* a single far return lands.
 fn tdwr_long_range_sweep(beacon_km: f64) -> Scan {
     let beacon_gate = (beacon_km / TDWR_GATE_KM).round() as usize;
     tdwr_sweep_from_gates(
@@ -1147,21 +869,10 @@ fn tdwr_long_range_sweep(beacon_km: f64) -> Scan {
     )
 }
 
-/// The same cut with **every** gate above threshold, so the painted disc runs
-/// out to the frame's own edge at every bearing.
-///
-/// The band fixture above cannot ask where the edge is — it paints a ring at
-/// 400.2 km inside a 417 km frame, so 15.88 km of margin absorbs anything an
-/// edge test could catch, which is the same vacuity the 230 km floor used to
-/// give every fixture in this file. A disc is what
-/// `nothing_is_painted_outside_the_extent_a_render_declares` needs and the
-/// only thing it is used for.
 fn tdwr_filled_long_range_sweep() -> Scan {
     tdwr_sweep_from_gates(vec![200; TDWR_GATES])
 }
 
-/// The 360 radials both TDWR fixtures are made of, over whatever gates they
-/// hand in: 1390 gates of 300 m from the antenna at the 1.0° a TDWR declares.
 fn tdwr_sweep_from_gates(gates: Vec<u8>) -> Scan {
     use nexrad_model::data::{MomentData, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern};
 
@@ -1214,16 +925,6 @@ fn tdwr_sweep_from_gates(gates: Vec<u8>) -> Scan {
     )
 }
 
-/// Every painted pixel's ground range from the site, km, read back out of the
-/// bounds the render declares — the inverse of the trip `render_gate` makes,
-/// so it answers in the same kilometres the gates were indexed by.
-///
-/// `site_lat` because the trip is not latitude-independent and the caller that
-/// matters renders the same sweep at several: it is
-/// [`rustdar_geo::site_bearing_range_km`] on the way back and
-/// [`rustdar_geo::great_circle_destination`] on the way out, and reading a
-/// render taken at one latitude through bounds built at another measures the
-/// mismatch instead of the render.
 fn painted_ranges_km_at(values: &[f32], extent_km: f64, site_lat: f64) -> Vec<f64> {
     let bounds = types::ImageBounds::from_radar_site(site_lat, LON, extent_km);
     // Off the grid's own length, so this reads a 4096-pixel render as readily
@@ -1244,19 +945,10 @@ fn painted_ranges_km_at(values: &[f32], extent_km: f64, site_lat: f64) -> Vec<f6
         .collect()
 }
 
-/// [`painted_ranges_km_at`] at [`LAT`], the site every fixture here is flown by
-/// unless it says otherwise.
 fn painted_ranges_km(values: &[f32], extent_km: f64) -> Vec<f64> {
     painted_ranges_km_at(values, extent_km, LAT)
 }
 
-/// A TDWR's long-range reflectivity is drawn to the 417 km it reaches, and a
-/// return 400 km out lands where the render's own projection says it should.
-///
-/// 1390 gates of 300 m is the cut TPIT flies on its lowest tilt, and it is the
-/// case the fixed 230 km frame threw away outright: everything past gate 767
-/// fell out of the loop, so nearly half the sweep's range — the whole outer
-/// two thirds of its area — was decoded, held in memory and never drawn.
 #[test]
 fn a_tdwr_long_range_sweep_is_projected_at_its_own_reach() {
     const BEACON_KM: f64 = 400.2; // gate 1334's centre
@@ -1274,9 +966,6 @@ fn a_tdwr_long_range_sweep_is_projected_at_its_own_reach() {
         tdwr_ground_reach_km(),
     );
 
-    // The beacon, at four bearings, on the frame this render declared. Not on
-    // a 230 km frame: a probe there would be asking about a picture 1.81×
-    // smaller, and 400 km east of the site is not on it at all.
     for az in [0.0, 90.0, 180.0, 270.0] {
         let at = probe_at(extent_km, types::IMAGE_SIZE, az, BEACON_KM);
         assert!(
@@ -1286,11 +975,9 @@ fn a_tdwr_long_range_sweep_is_projected_at_its_own_reach() {
         );
     }
 
-    // And the picture really is wider than the wall was, measured off the
-    // pixels: the eastmost painted column stands at the beacon's outer edge,
-    // 170 km past where every gate used to stop. Due east the projection's
-    // `cos φ₀ / cos φ` factor is exactly 1, so a column is the range in pixels
-    // and nothing else.
+    // And the picture really is wider than the wall was, measured off the pixels: the
+    // eastmost painted column stands at the beacon's outer edge, 170 km past where
+    // every gate used to stop.
     let side = types::IMAGE_SIZE;
     let px_per_km = side as f64 / (2.0 * extent_km);
     let east = (0..side)
@@ -1304,10 +991,6 @@ fn a_tdwr_long_range_sweep_is_projected_at_its_own_reach() {
          inside the {} km wall this render is here to be past",
         types::BASE_EXTENT_KM,
     );
-    // The band's own far edge: its outermost gate's centre plus half a gate.
-    // Two pixels of tolerance for `render_gate`'s sample padding and the
-    // truncating cast that turns a position into a column — 0.81 km at this
-    // extent, which is under three of the 0.3 km gates being drawn.
     let band_edge_km =
         ((BEACON_KM / TDWR_GATE_KM).round() + TDWR_BEACON_GATES as f64 + 0.5) * TDWR_GATE_KM;
     assert!(
@@ -1318,23 +1001,10 @@ fn a_tdwr_long_range_sweep_is_projected_at_its_own_reach() {
 }
 
 /// Gates in a TDWR's Doppler moments, and the gate they are.
-///
-/// Measured, not chosen: 592 gates of 150 m from the antenna, reaching
-/// 88.800 km of beam, decoded from the lowest cut of the 2026-08-11 00Z volume
-/// at **TOKC, TDAL, TPIT and TATL** — four TDWR sites across four regions,
-/// identical on every one of them to the last bit. Beside them on the same
-/// volume sits [`TDWR_GATES`]' 1390-gate reflectivity reaching 417 km, which is
-/// 4.7 times as far.
 const TDWR_DOPPLER_GATES: usize = 592;
 /// See [`TDWR_DOPPLER_GATES`]. 592 of these reach 88.8 km of beam.
 const TDWR_DOPPLER_GATE_KM: f64 = 0.15;
 
-/// A TDWR volume as the four sites above actually fly it: one cut carrying a
-/// 1390-gate reflectivity **and** a 592-gate velocity, so the two moments of
-/// one sweep reach 417 km and 88.8 km respectively.
-///
-/// Both moments are filled rather than beaconed, because what these tests read
-/// off the picture is where each product's data *stops*.
 fn tdwr_doppler_volume() -> Scan {
     use nexrad_model::data::{MomentData, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern};
 
@@ -1395,25 +1065,6 @@ fn tdwr_doppler_volume() -> Scan {
     )
 }
 
-/// **The reported defect.** A TDWR velocity pane is framed at the 88.8 km its
-/// Doppler moment reaches, not at 230 km, and the reflectivity beside it on the
-/// same volume is framed at its own 417 km.
-///
-/// A pane's range ring is drawn at the render's `max_range_km`
-/// (`rustdar_egui::ui_map_pane`'s `render_radar_range_ring`), so this number
-/// *is* the ring. Drawn at 230 km around 88.8 km of data it claimed 6.7 times
-/// the coverage the radar had, and on a velocity pane — where the ring is read
-/// as the edge of the Doppler coverage — that is the reading it destroys.
-///
-/// The two products are asserted against each other and not only against their
-/// own numbers, because a per-product reach is exactly what a single volume-wide
-/// extent cannot express: one volume, one sweep, two moments, two frames.
-///
-/// Run at all four sites' real coordinates rather than one. The extent in
-/// kilometres is a property of the moment and must not move between them; where
-/// the site *is* changes the bounds those kilometres become, and asserting both
-/// halves at four latitudes from 26 °N to 40 °N is what separates
-/// "the extent is the data's" from "the extent happens to be right at one site".
 #[test]
 fn a_tdwr_doppler_sweep_is_projected_at_its_own_reach_not_the_base_extent() {
     let doppler_ground_km = crate::beam::ground_range_km(
@@ -1421,7 +1072,6 @@ fn a_tdwr_doppler_sweep_is_projected_at_its_own_reach_not_the_base_extent() {
         f64::from(L2_ELEVATION),
     );
 
-    // The four measured sites, with the coordinates the site table holds.
     for (name, lat, lon) in [
         ("TOKC", 35.2764, -97.5100),
         ("TDAL", 32.9264, -96.9683),
@@ -1436,7 +1086,6 @@ fn a_tdwr_doppler_sweep_is_projected_at_its_own_reach_not_the_base_extent() {
         let refl = render_radar_to_image(&scan, L2_ELEVATION, PRODUCT, lat, lon)
             .expect("the reflectivity moment is on the same sweep");
 
-        // The defect, stated as the assertion that would have failed.
         assert_ne!(
             vel.max_range_km,
             types::BASE_EXTENT_KM,
@@ -1449,7 +1098,6 @@ fn a_tdwr_doppler_sweep_is_projected_at_its_own_reach_not_the_base_extent() {
             vel.max_range_km,
         );
 
-        // Per-product reach on one volume: the same sweep, two frames.
         assert!(
             (refl.max_range_km - tdwr_ground_reach_km()).abs() < 1e-9,
             "{name}: the reflectivity beside it declares {}",
@@ -1463,8 +1111,6 @@ fn a_tdwr_doppler_sweep_is_projected_at_its_own_reach_not_the_base_extent() {
             vel.max_range_km,
         );
 
-        // What the ring the user sees is drawn at, at this site's latitude:
-        // the bounds the frontend hands back to `ImageBounds::from_radar_site`.
         let bounds = types::ImageBounds::from_radar_site(lat, lon, vel.max_range_km);
         let ring_km = (bounds.max_lat - lat) * rustdar_geo::KM_PER_DEGREE_LAT;
         assert!(
@@ -1473,9 +1119,6 @@ fn a_tdwr_doppler_sweep_is_projected_at_its_own_reach_not_the_base_extent() {
              {doppler_ground_km:.4} km of data",
         );
 
-        // And the echo fills that frame, so the ring bounds the picture rather
-        // than floating outside it. Due east the projection's cos correction
-        // is exactly 1.
         let side = types::IMAGE_SIZE;
         let east = (0..side)
             .rev()
@@ -1488,19 +1131,6 @@ fn a_tdwr_doppler_sweep_is_projected_at_its_own_reach_not_the_base_extent() {
     }
 }
 
-/// A sweep whose leading radial carries no moment is still found, and is still
-/// framed by its own reach.
-///
-/// `find_sweep_owner` asked `radials.first()` whether the sweep carried the
-/// product, so one blank radial spoke for all 360: the Doppler cut vanished
-/// from the search and a velocity request fell through to whatever else
-/// matched. On this volume that is the reflectivity half of the same cut, so
-/// the pane came back framed at 417 km — the range ring 328 km out around
-/// 88.8 km of velocity, which is the reported defect reappearing through a
-/// different door.
-///
-/// It is the same first-radial assumption the wind-profile fits carried, found
-/// on the extent path while tracing where the frame's reach comes from.
 #[test]
 fn a_sweep_whose_leading_radial_is_blank_is_still_found_and_still_framed_by_its_own_reach() {
     use nexrad_model::data::Sweep;
@@ -1508,8 +1138,6 @@ fn a_sweep_whose_leading_radial_is_blank_is_still_found_and_still_framed_by_its_
     let full = tdwr_doppler_volume();
     let sweep = &full.sweeps()[0];
 
-    // The same volume with the first radial's velocity stripped and every
-    // other radial untouched.
     let radials: Vec<Radial> = sweep
         .radials()
         .iter()
@@ -1557,25 +1185,7 @@ fn a_sweep_whose_leading_radial_is_blank_is_still_found_and_still_framed_by_its_
 }
 
 // ── Where a tilt's gates are drawn ───────────────────────────────────────
-//
-// A gate is measured out along the beam and belongs on the ground under it,
-// and those are the same number only at zero elevation. The renderer used to
-// paint the slant range: harmless on a WSR-88D, whose highest cut is 19.5°
-// and whose worst error is 5.7 %, and not harmless at all on a TDWR, whose
-// VCP 80 climbs to 60° where the slant range is *twice* the ground range.
-//
-// The fixtures below are single-tilt volumes carrying a cut table, because
-// the point of the first test is that the plan view and the 3D sampler put
-// the same echo in the same place — and the sampler builds its ladder by
-// indexing that table with each sweep's `elevation_number`.
 
-/// A single-tilt volume with one reflectivity band a known **slant** range
-/// out and every other gate below threshold.
-///
-/// A band rather than a filled disc for the same reason
-/// [`tdwr_long_range_sweep`] uses one: a disc paints its outermost pixels at
-/// the reach whatever happened inside it, and every question here is about
-/// *where* one return lands.
 fn tilted_beacon_sweep(
     elevation_deg: f32,
     gate_km: f64,
@@ -1671,8 +1281,6 @@ fn tilted_beacon_sweep(
     )
 }
 
-/// The inner and outer ground radii of a painted ring, km, and the range
-/// halfway between them.
 fn ring_bounds_km(values: &[f32], extent_km: f64) -> (f64, f64, f64) {
     let ranges = painted_ranges_km(values, extent_km);
     assert!(!ranges.is_empty(), "the fixture painted nothing at all");
@@ -1681,29 +1289,11 @@ fn ring_bounds_km(values: &[f32], extent_km: f64) -> (f64, f64, f64) {
     (near, far, (near + far) / 2.0)
 }
 
-/// **The plan view and the 3D sampler put the same gate over the same
-/// ground.** A 45° tilt's return at 20 km slant belongs at 14.142 km, and
-/// both renderers now say so.
-///
-/// This is the property the whole correction exists for, and the one the
-/// display could not previously have: the sampler has always applied `cos e`
-/// (`sampler::sample_rung` converts a ground range to a slant one before
-/// reading a gate), sections and voxels are drawn from it, and the plan view
-/// drew the same echo 5.86 km further out. A user comparing a section against
-/// the map above it was comparing two different geometries, and 45° is chosen
-/// because `cos 45° = 1/√2` makes the disagreement impossible to mistake for
-/// rounding.
-///
-/// Both sides are *measured*, not asserted against the same constant: the 2D
-/// ring is read back out of its own pixels through the bounds the render
-/// declared, and the 3D band is found by walking ground ranges past the
-/// sampler until it stops answering.
 #[test]
 fn a_45_degree_sweep_lands_at_the_same_ground_range_in_2d_and_3d() {
     const ELEV: f32 = 45.0;
     const SLANT_KM: f64 = 20.0;
     const GATE_KM: f64 = 0.25;
-    // 20 · cos 45° — the ground under the gate, and what both must agree on.
     let ground_km = crate::beam::ground_range_km(SLANT_KM, f64::from(ELEV));
 
     let scan = tilted_beacon_sweep(ELEV, GATE_KM, 600, SLANT_KM, 2);
@@ -1758,10 +1348,6 @@ fn a_45_degree_sweep_lands_at_the_same_ground_range_in_2d_and_3d() {
         }
     }
     let centre_3d = (lo + hi) / 2.0;
-    // One gate of tolerance. The two find the band's edges differently — the
-    // raster paints whole gate cells and the sampler interpolates between
-    // gate centres — so their outermost answers legitimately differ by up to
-    // a gate, while their centres cannot.
     assert!(
         (centre_2d - centre_3d).abs() < GATE_KM,
         "the plan view centres the band at {centre_2d:.3} km and the sampler \
@@ -1774,14 +1360,6 @@ fn a_45_degree_sweep_lands_at_the_same_ground_range_in_2d_and_3d() {
     );
 }
 
-/// A TDWR's steep tilts halve in radius, which is the headline: `cos 60°` is
-/// exactly 0.5, so a return 24 km out along a VCP 80 hazardous cut is drawn
-/// 12 km from the site.
-///
-/// 592 gates of 150 m is TPIT's Doppler geometry, and 60° is the top of its
-/// VCP 80 ladder. Before this, every one of those tilts painted its echoes at
-/// up to twice their true distance — a storm over the airport drawn out at
-/// the edge of the terminal area.
 #[test]
 fn a_tdwr_steep_tilt_renders_at_half_its_slant_range() {
     const ELEV: f32 = 60.0;
@@ -1801,8 +1379,6 @@ fn a_tdwr_steep_tilt_renders_at_half_its_slant_range() {
         "a 24 km gate on a 60° tilt belongs 12.0 km out; the ring measures \
          {near:.2}..{far:.2} km, centred at {centre:.2}",
     );
-    // The whole picture, not just the band's centre: nothing is drawn out at
-    // the slant range any more.
     assert!(
         far < SLANT_KM * 0.6,
         "the outermost painted pixel stands {far:.2} km out, which is most of \
@@ -1810,15 +1386,6 @@ fn a_tdwr_steep_tilt_renders_at_half_its_slant_range() {
     );
 }
 
-/// The reach a render reports is a **ground** reach, so a frame is sized by
-/// the ground it covers rather than by the beam's length.
-///
-/// TPIT's long-range surveillance cut is where this is largest: 1390 gates of
-/// 300 m reach 417 km, and at the 0.2637° that cut actually flies they cover
-/// 416.996 km of ground. Small on purpose — the point is that the number is
-/// the ground one, not that it is far off. It is visible at every extent now
-/// rather than only past 230 km, because no floor absorbs a short sweep's
-/// correction any more: the same cut's 88.8 km Doppler moment reports 88.797.
 #[test]
 fn a_frame_is_sized_by_the_ground_its_sweep_covers() {
     const ELEV: f32 = 0.2637;
@@ -1840,14 +1407,6 @@ fn a_frame_is_sized_by_the_ground_its_sweep_covers() {
     );
 }
 
-/// A 0.5° beacon at 200 km moves less than a pixel — the near-invariance
-/// that makes this landable on the WSR-88D fleet.
-///
-/// `1 − cos 0.5°` is 3.8e-5, so 200 km of range moves 7.6 m. At the 4.45 px/km
-/// a 230 km frame gives that is 0.034 of a pixel: every low tilt, which is nearly every
-/// tilt anyone looks at, is where it has always been. The shift only becomes
-/// visible where the geometry makes it real — 0.9 px at 2.4°, 18 px at 19.5°,
-/// and half the radius at a TDWR's 60°.
 #[test]
 fn a_low_tilt_beacon_moves_less_than_a_pixel() {
     const ELEV: f32 = 0.5;
@@ -1868,17 +1427,6 @@ fn a_low_tilt_beacon_moves_less_than_a_pixel() {
     );
 }
 
-/// A sweep whose data stops short is drawn at the range it reaches, and its
-/// echo fills the frame rather than sitting in the middle of one.
-///
-/// The reported defect at fixture scale. `l2_sweep`'s moments are 600 gates
-/// of 250 m — 150 km — and the picture used to come out 230 km wide with
-/// the echo filling 150 km of it and the outer 80 km permanently blank. The
-/// range ring was drawn around the 230, which is the lie: it claimed 53%
-/// more coverage than the sweep had. The radius is recovered from the pixels
-/// rather than assumed — the painted disc's outermost column is measured and
-/// converted back at the render's own px/km — so this fails if the frame and
-/// the picture inside it ever stop agreeing.
 #[test]
 fn a_sweep_inside_the_old_floor_is_drawn_at_its_own_reach() {
     let azimuths: Vec<f32> = (0..360).map(|i| i as f32).collect();
@@ -1919,10 +1467,6 @@ fn a_sweep_inside_the_old_floor_is_drawn_at_its_own_reach() {
          {radius_km:.2} km across columns {west}..{east} at {px_per_km:.4} px/km",
     );
 
-    // And it fills the frame: the disc's extreme columns are the raster's
-    // own, give or take the half-pixel the edge column is quantized to. On
-    // the old frame the echo stopped at column 1381 of 2048 and the 667
-    // columns past it were unpaintable.
     assert!(
         west <= 1 && east >= side - 2,
         "the echo runs columns {west}..{east} of {side}; a sweep drawn at its \
@@ -1930,54 +1474,6 @@ fn a_sweep_inside_the_old_floor_is_drawn_at_its_own_reach() {
     );
 }
 
-/// The number a render reports bounds the picture it hands over: nothing is
-/// painted further from the site than the extent, at any bearing, on two frame
-/// sizes and at three latitudes.
-///
-/// The property every consumer of `max_range_km` depends on and none of them
-/// can check. The frontend places the texture between the bounds this extent
-/// builds, and a hover divides a pointer position by them to pick a pixel
-/// back out — so a gate painted past the extent would be a return the display
-/// draws in one place and reads from another, with nothing anywhere to notice.
-///
-/// # The bound is one pixel, and it took two changes to get there
-///
-/// It was one pixel before either of them and it was **vacuous at both
-/// fixtures**: the frame used to be 230 km around 150 km of echo and 417 km
-/// around a beacon at 400.2, so 80 km and 17 km of empty margin absorbed
-/// anything this could have caught.
-///
-/// Projecting a raster at its sweep's own reach removed the margin, and what
-/// the assertion then measured was a disagreement between two models of the
-/// ground — `render_gate` placing a gate equirectangularly, `dy` km north read
-/// off as a latitude offset and `dx` km east as a longitude one, against
-/// [`painted_ranges_km_at`] reading the pixel back with
-/// [`rustdar_geo::site_bearing_range_km`], a great-circle distance. Those agree
-/// on the cardinals and diverge on the diagonals, always outward, growing with
-/// range and with latitude to 1.44 % of the extent at 47 °N over 417 km. The
-/// bound here was widened to that measured disagreement and said so.
-///
-/// It is not widened now. `render_gate` asks
-/// [`rustdar_geo::great_circle_destination`] where a gate is — the exact
-/// inverse of the function reading it back — so the two models are one model
-/// and the residual is the pixel grid alone. What is left over is a *negative*
-/// excess at every fixture and latitude below, i.e. the outermost painted pixel
-/// centre sits inside the extent, which is what a truncating cast onto a pixel
-/// grid does.
-///
-/// # Why three latitudes and why a filled disc
-///
-/// The error this replaced was **latitude-dependent** — 2.71 km at 26 °N
-/// against 6.01 km at 47 °N over the same 417 km — so a test at one site would
-/// have watched it shrink rather than go. The three below are the fixture's own
-/// site and the two highest latitudes the WSR-88D fleet reaches, KMSX (47.04 °N)
-/// and KATX (48.19 °N); a latitude-shaped regression cannot hide from the pair
-/// at the top.
-///
-/// Both fixtures are **filled discs**, because a disc's outermost painted
-/// pixels are at the reach whatever happened inside it. That is exactly the
-/// property [`tdwr_long_range_sweep`]'s band is built *not* to have, which is
-/// why the band is not used here and [`tdwr_filled_long_range_sweep`] exists.
 #[test]
 fn nothing_is_painted_outside_the_extent_a_render_declares() {
     let azimuths: Vec<f32> = (0..360).map(|i| i as f32).collect();
@@ -2001,8 +1497,6 @@ fn nothing_is_painted_outside_the_extent_a_render_declares() {
             );
 
             let furthest = ranges.iter().copied().fold(0.0f64, f64::max);
-            // One pixel: a pixel's *centre* is what is measured and a gate
-            // reaching exactly the extent claims the pixel it starts in.
             let slop = 1.0 / (types::IMAGE_SIZE as f64 / (2.0 * extent_km));
             assert!(
                 furthest <= extent_km + slop,
@@ -2011,8 +1505,6 @@ fn nothing_is_painted_outside_the_extent_a_render_declares() {
                  ({slop:.3} km) bound by {:.3} km",
                 furthest - extent_km - slop,
             );
-            // And the disc really does reach the edge, so the line above is
-            // measuring the frame and not an empty margin.
             assert!(
                 furthest > extent_km - 2.0 * slop,
                 "{why} at {site_lat}\u{b0}N stops {:.3} km short of its own \
@@ -2082,12 +1574,6 @@ fn nothing_is_painted_outside_the_extent_a_render_declares() {
     }
 }
 
-/// The same rule on the derived grids, which have no declaration to read: a
-/// 36° NROT sector must stop at its own edge.
-///
-/// NROT used to take its row width as `360 / rows`, which is the spacing
-/// only if the grid closes the circle — a 72-row sector came out at 5° a row
-/// and smeared 2.5° past both ends of the arc it was computed over.
 #[test]
 fn nrot_does_not_smear_past_its_sector() {
     let scan = nrot_sector(72, 0.5);
@@ -2107,9 +1593,6 @@ fn nrot_does_not_smear_past_its_sector() {
     let painted = values.iter().filter(|v| !v.is_nan()).count();
     assert!(painted > 1_000, "the NROT sector painted only {painted} px");
 
-    // On the grid's own frame. NROT is a derived product with its own reach,
-    // which is not `l2_sweep`'s, and a probe on the wrong frame would land in
-    // an arbitrary pixel and pass by being unpainted for the wrong reason.
     for range in [20.0, 30.0, 40.0, 50.0] {
         for az in [37.0, -1.5] {
             let v = values[probe_at(extent_km, types::IMAGE_SIZE, az, range)];
@@ -2122,10 +1605,6 @@ fn nrot_does_not_smear_past_its_sector() {
     }
 }
 
-/// How far a sweep reaches is the longest of its radials, not the first one
-/// to carry the moment. A truncated opening radial used to speak for the
-/// whole sweep — and the number it set is the extent the raster is projected
-/// at, so a short answer is real data cut off at the edge of the image.
 #[test]
 fn max_range_is_robust_to_a_truncated_first_radial() {
     let mut gates = vec![600u16; 8];
@@ -2199,9 +1678,6 @@ fn truncated_sweep(gate_counts: &[u16]) -> Scan {
     )
 }
 
-/// The width arithmetic on its own, at the boundaries the fixtures above
-/// cannot reach: a NaN declaration, a negative one, and the point where the
-/// two ceilings swap over.
 #[test]
 fn a_wedge_width_is_never_negative_absent_or_unbounded() {
     let w = super::l2_wedge_width_deg;
@@ -2224,10 +1700,6 @@ fn write_key_ranks_radial_major_and_never_reads_as_empty() {
     assert!(k(719, 1831) > k(718, 1831));
 }
 
-/// A minimal Level III message around one digital radial packet whose
-/// scale-factor halfword claims ~1 km gates — what product 163 really
-/// carries on the wire, where that halfword is the scan projection
-/// constant and not a gate size.
 fn message_with_lying_scale_factor(product_code: i16, bins: usize) -> Level3Message {
     use nexrad_level3::model::{DataLayer, MessageHeader, SymbologyBlock};
 
@@ -2236,7 +1708,6 @@ fn message_with_lying_scale_factor(product_code: i16, bins: usize) -> Level3Mess
         num_range_bins: bins as u16,
         i_center: 0,
         j_center: 0,
-        // ~1 km per gate if believed.
         scale_factor: 0.999,
         is_legacy: false,
         xdr_data_scale: Some(SCALE),
@@ -2297,19 +1768,6 @@ fn message_with_lying_scale_factor(product_code: i16, bins: usize) -> Level3Mess
     }
 }
 
-/// Product 163's packet says ~1 km per gate; the ICD says 0.25 km. The
-/// display path has to prefer the PDB's override the way the
-/// twin-comparison path does, or the on-screen KDP field draws 4× too
-/// far out. A product without an override keeps the packet's own value.
-///
-/// What a render reports is the extent it was projected at, which is now the
-/// reach itself, so each arm's right and wrong answers are four distinct
-/// numbers. 1200 gates at the ICD's 0.25 km is 300 km; believing the packet
-/// instead would ask for 1201 km and be held at [`types::MAX_EXTENT_KM`]. 460
-/// gates at the packet's own ~1.001 km is 460.5 km; a spurious override would
-/// collapse it to 115 km. The arms used to need enough gates to clear a 230 km
-/// floor before any of that was visible; they no longer do, and the gate counts
-/// are kept as they are because they are the real products' own.
 #[test]
 fn message_path_prefers_the_pdb_gate_spacing_over_the_packets() {
     const ICD_BINS: usize = 1200;
@@ -2351,16 +1809,6 @@ fn message_path_prefers_the_pdb_gate_spacing_over_the_packets() {
 
 // ── Which sweep a requested tilt reaches ─────────────────────────────────
 
-/// A sweep whose antenna is still settling when it opens: the first
-/// `SETTLING` radials ramp from `first` to `flown`, and the rest sit on
-/// `flown`. The median is therefore `flown` — the tilt the sweep actually
-/// flew — while the first radial reads `first`.
-///
-/// Every fixture in this crate before these tests gave a sweep one constant
-/// elevation, which makes the median and the first radial the same number
-/// and makes the difference between them invisible. That is why the switch
-/// to the median broke no test: there was no test of it. This builder is
-/// the one shape that can tell the two apart.
 fn settling_sweep(number: u8, first: f32, flown: f32, velocity: bool) -> nexrad_model::data::Sweep {
     const SETTLING: usize = 30;
     let radials = (0..N_RADIALS)
@@ -2406,10 +1854,6 @@ fn scan_of(sweeps: Vec<nexrad_model::data::Sweep>) -> Scan {
     Scan::new(crate::render_input::placeholder_coverage_pattern(0), sweeps)
 }
 
-/// The tilt a sweep is found by is the one it flew, not the one it happened
-/// to open on. The first radial here is 0.68° and the flown cut is 0.44°:
-/// asking for 0.4° must reach it, and asking for 0.7° — which is where the
-/// first radial sat — must not.
 #[test]
 fn find_sweep_matches_the_flown_tilt_not_the_opening_radial() {
     let scan = scan_of(vec![settling_sweep(1, 0.68, 0.44, false)]);
@@ -2423,10 +1867,6 @@ fn find_sweep_matches_the_flown_tilt_not_the_opening_radial() {
     );
 }
 
-/// The KDDC VCP 215 case, which is what this change is for. Two
-/// surveillance cuts — 0.44° and 0.84° — both opening well off their own
-/// angle, and overlapping under the old 0.3° window. Each label must reach
-/// its own cut, so neither cut is drawn twice and neither is lost.
 #[test]
 fn adjacent_cuts_are_reached_by_their_own_labels() {
     let low = settling_sweep(1, 0.676, 0.44, false);
@@ -2455,13 +1895,9 @@ fn adjacent_cuts_are_reached_by_their_own_labels() {
         (a - b).abs() > 0.3,
         "the two labels must draw different sweeps, both drew {a}",
     );
-    // The labels between them belong to neither cut and must draw nothing
-    // rather than silently reusing a neighbour.
     assert!(at(0.6).is_none(), "0.6° is not a tilt this volume flew");
 }
 
-/// Newest-wins is load-bearing for SAILS and is *not* what changed here:
-/// two sweeps of the same cut must still resolve to the later one.
 #[test]
 fn a_sails_repeat_still_resolves_to_the_newer_sweep() {
     let scan = scan_of(vec![
@@ -2481,8 +1917,6 @@ fn a_sails_repeat_still_resolves_to_the_newer_sweep() {
     );
 }
 
-/// The surveillance preference, unchanged: a non-Doppler product takes the
-/// velocity-free half of a split cut even though the Doppler half is newer.
 #[test]
 fn a_split_cut_still_gives_reflectivity_its_surveillance_half() {
     let scan = scan_of(vec![
@@ -2501,8 +1935,6 @@ fn a_split_cut_still_gives_reflectivity_its_surveillance_half() {
     );
 }
 
-/// The window is the other half of the change: on the median it is narrow
-/// enough that a neighbouring cut cannot answer for one that is missing.
 #[test]
 fn the_window_does_not_reach_the_next_cut_along() {
     let scan = scan_of(vec![settling_sweep(1, 0.20, 0.48, false)]);
@@ -2518,21 +1950,10 @@ fn the_window_does_not_reach_the_next_cut_along() {
     }
 }
 
-/// The contract the whole change exists to keep: **every label the picker
-/// offers reaches a sweep, and the sweep it reaches is the one the label
-/// names.**
-///
-/// Swept across every tilt on a 0.05° grid, so the cases where a cut sits
-/// exactly on the boundary of the picker's 0.1° rounding — the worst case
-/// for the match window, and the ones a hand-picked fixture always misses —
-/// are all covered. This is what says the window may not be narrowed to the
-/// rounding itself: at 0.05° a cut landing on a boundary is half a step from
-/// its own label and becomes unreachable.
 #[test]
 fn every_offered_label_reaches_the_cut_it_names() {
     for step in 0..=240u32 {
         let flown = step as f32 * 0.05;
-        // Opening a third of a degree off, the way a real one does.
         let scan = scan_of(vec![settling_sweep(1, flown + 0.31, flown, false)]);
         let label = (f64::from(flown) * 10.0).round() as f32 / 10.0;
 
@@ -2552,9 +1973,6 @@ fn every_offered_label_reaches_the_cut_it_names() {
     }
 }
 
-/// The loop's snap reads the same quantity the picker labels do, so a
-/// steady selection stays on one cut across frames instead of following
-/// the antenna's settling around.
 #[test]
 fn find_closest_elevation_snaps_to_the_flown_tilt() {
     let scan = scan_of(vec![
@@ -2565,19 +1983,9 @@ fn find_closest_elevation_snaps_to_the_flown_tilt() {
     assert_eq!(find_closest_elevation(&scan, PRODUCT, 0.8), Some(0.8));
 }
 
-/// The hail and HCA render paths anchor on the feedhorn, not the ground.
-///
-/// Both add their site height to a beam height, and `beam` measures those
-/// above the antenna, so the ground under the tower is the wrong datum by a
-/// whole tower — 62 ft at KTLX, 114 ft at the tallest. Neither render path
-/// has a test that would see that shift in its output, so this pins the
-/// lookup itself: written as the two numbers so that a switch back to
-/// `Datum::SiteBase` fails here rather than passing quietly.
 #[test]
 fn the_render_paths_site_height_is_the_feedhorn() {
-    // The radars this renders against; there are none until a test asks.
     crate::sites::fixture::install();
-    // KTLX: 1214 ft of ground under a 62 ft tower.
     const KTLX: (f64, f64) = (35.33306, -97.2775);
     assert_eq!(
         super::render_site_height_ft(KTLX.0, KTLX.1),
@@ -2591,9 +1999,6 @@ fn the_render_paths_site_height_is_the_feedhorn() {
     );
 }
 
-/// Gates per dual-pol radial in [`dual_pol_tilt`]: 400 × 250 m from 125 m
-/// reaches 100 km, far enough that a 0.5° beam climbs through either
-/// candidate melting layer.
 const D_GATES: usize = 400;
 
 fn dp_moment8(scale: f32, offset: f32, v: f64) -> nexrad_model::data::MomentData {
@@ -2630,10 +2035,6 @@ fn dp_moment16(
     )
 }
 
-/// One 360-radial dual-pol tilt of uniform light rain — 30 dBZ, 1 dB ZDR,
-/// 0.99 ρHV, a gently ramping ΦDP. Uniform on purpose: whatever class the
-/// classifier reaches, it reaches for the whole disc, so a change of class
-/// is unmistakably the environment's doing and not a gate-to-gate texture.
 fn dual_pol_tilt(number: u8, elev: f32) -> nexrad_model::data::Sweep {
     let radials = (0..360)
         .map(|k| {
@@ -2658,25 +2059,8 @@ fn dual_pol_tilt(number: u8, elev: f32) -> nexrad_model::data::Sweep {
     nexrad_model::data::Sweep::new(number, radials)
 }
 
-/// The premise every environmental-heights invalidation rests on: the hybrid
-/// classification's picture is a **function of** the sounding's pair, so a
-/// pane still holding one drawn against the old environment is showing the
-/// wrong classification rather than merely an old one.
-///
-/// Nothing asserted this before, and the gap it left was not theoretical:
-/// `RenderDispatcher::set_env_heights` dropped the hail pair's renders alone
-/// while the render parameters already carried the pair here too, so a landed
-/// sounding left every HCA pane on its default-melting-layer picture until the
-/// volume rolled. [`RadarProduct::reads_env_heights`] is now the one statement
-/// of that set; this is the measurement that puts HCA in it.
-///
-/// The two environments are the adaptation defaults (0 °C at 10.5 kft MSL) and
-/// a winter sounding with the freezing level down at 0.8 km MSL — under, not
-/// over, the beam. Uniform light rain fills the disc either way, so the class
-/// the classifier reaches is the whole answer.
 #[test]
 fn the_hybrid_classification_changes_with_the_environmental_heights() {
-    // The radars this renders against; there are none until a test asks.
     crate::sites::fixture::install();
     /// Dry snow: what the low freezing level puts the beam above.
     const DS: f32 = 40.0;
@@ -2726,24 +2110,9 @@ fn the_hybrid_classification_changes_with_the_environmental_heights() {
 
 // ── The adaptive raster size ─────────────────────────────────────────────────
 
-/// The side a static desktop or mobile pane offers, and the only 4096 in this
-/// file. Named rather than repeated so the rows below cannot drift apart.
+/// The side a static desktop or mobile pane offers, and the only 4096 in this file.
 const LONG_RANGE_SIDE: usize = 4096;
 
-/// A sweep stopping inside the floor is drawn **byte for byte** the same way
-/// whether or not a long-range raster was on offer.
-///
-/// This is the guarantee the whole size cascade rests on. Nearly every render
-/// this display makes stops inside 230 km — every Doppler cut, every derived
-/// 1° × 1 km grid, every Level III product fetched here — and a change to the
-/// raster's size that moved any of them would move the entire fleet of
-/// pictures that were correct yesterday. Bit-identical rather than
-/// approximately equal, because "close" is not the claim: the claim is that
-/// nothing already on screen changed at all.
-///
-/// Both buffers are compared, not just the image: a value grid that shifted
-/// while the colours did not would be a hover reading the wrong gate, which no
-/// visual check would ever show.
 #[test]
 fn a_render_inside_the_floor_ignores_the_long_range_ceiling_entirely() {
     let azimuths: Vec<f32> = (0..360).map(|i| i as f32).collect();
@@ -2799,13 +2168,6 @@ fn a_render_inside_the_floor_ignores_the_long_range_ceiling_entirely() {
     );
 }
 
-/// A TDWR's long-range cut takes the long-range raster, and a return 400 km
-/// out lands within a pixel of where the render's own projection puts it.
-///
-/// The size and the extent are separate decisions and this is where they meet:
-/// 1390 gates of 300 m reach 417 km, so the picture covers 1.81× the ground
-/// the floor does — and on 4096 px rather than 2048 it covers it at very
-/// nearly the same resolution, which is the whole point of the second number.
 #[test]
 fn a_tdwr_long_range_sweep_takes_the_long_range_raster() {
     const BEACON_KM: f64 = 400.2; // gate 1334's centre
@@ -2851,49 +2213,8 @@ fn a_tdwr_long_range_sweep_takes_the_long_range_raster() {
     }
 }
 
-/// What the second number buys, measured: a long-range raster is never
-/// meaningfully coarser than the floor, where a base-size one would be less
-/// than half as fine.
-///
-/// The floor is 2048 px over 460 km — 4.4522 px/km, or 1.11 pixels across a
-/// 250 m gate — and that figure is what every visual judgement this display
-/// has ever been checked against was made at. Stretching the *base* raster
-/// over a surveillance cut gives 2.2255 px/km, 0.56 pixels a gate, so gates
-/// start sharing pixels rather than owning them; 4096 px gives 4.4510 and
-/// 1.11, which is the floor's own scale to a third of a thousandth.
-///
-/// The ratio is not flat, and pretending it were would be the wrong claim: the
-/// side steps once at the floor while the extent is continuous, so a Doppler
-/// cut comes out **finer** than the floor at 6.82 px/km. Finer is free — the
-/// raster costs the same pixels wherever they land — and what matters is only
-/// that it is never much coarser.
-///
-/// The rows are the reaches a gate count really produces, first gate included,
-/// rather than the round numbers this table used to carry: a Doppler cut is
-/// 2.125 + 1192 × 0.25 = 300.125 and not 298, a surveillance cut 460.125 and
-/// not 458. The distinction is not cosmetic. At 458 the long-range raster
-/// scores 4.4716 px/km and clears the floor outright; at the 460.125 a radar
-/// actually flies it scores 4.4510 and sits **0.027% under** it, so the claim
-/// this test makes has to be "never meaningfully coarser" with a stated bar,
-/// and `>=` was only ever passing because the input was 2.125 km short.
-///
-/// | reach   | side | px/km  | vs floor | base raster would be |
-/// |---------|-----:|-------:|---------:|---------------------:|
-/// | 300.125 | 4096 | 6.8238 |  +53.3 % |               3.4119 |
-/// | 417     | 4096 | 4.9113 |  +10.3 % |               2.4556 |
-/// | 460.125 | 4096 | 4.4510 |   −0.0 % |               2.2255 |
-/// | 470     | 4096 | 4.3574 |   −2.1 % |               2.1787 |
-///
-/// The last row is [`types::MAX_EXTENT_KM`], which is a guard on arithmetic
-/// rather than a reach any radar has — the widest real sweep is the 460.125 km
-/// row — so it is where the picture is furthest under the floor, and it is
-/// stated rather than excluded.
 #[test]
 fn the_long_range_raster_keeps_the_floors_km_per_pixel() {
-    /// How far under the floor a long-range raster may land before "keeps the
-    /// floor's km per pixel" stops being an honest description. The widest
-    /// real sweep is 0.027% under; the arithmetic cap, which no radar reaches,
-    /// is 2.13% under and is asserted separately below.
     const TOLERANCE: f64 = 0.001;
 
     let floor = types::IMAGE_SIZE as f64 / (2.0 * types::BASE_EXTENT_KM);
@@ -2928,9 +2249,8 @@ fn the_long_range_raster_keeps_the_floors_km_per_pixel() {
         );
     }
 
-    // The widest real sweep, in the unit that decides whether a gate is drawn
-    // or shared: pixels across one 250 m super-resolution gate. The base
-    // raster gives it half a pixel; the long-range one gives it its own.
+    // The widest real sweep, in the unit that decides whether a gate is drawn or
+    // shared: pixels across one 250 m super-resolution gate.
     const SURVEILLANCE_KM: f64 = 460.125;
     const GATE_KM: f64 = 0.25;
     let px_per_gate = |side: usize| side as f64 / (2.0 * SURVEILLANCE_KM) * GATE_KM;
@@ -2958,24 +2278,12 @@ fn the_long_range_raster_keeps_the_floors_km_per_pixel() {
     );
 }
 
-/// The Doppler half of a WSR-88D split cut, at super-resolution: 1192 gates of
-/// 250 m from a first gate 2.125 km out.
-///
-/// The three numbers are the RDA's, not a guess at them, and they are what
-/// puts this sweep outside [`types::BASE_EXTENT_KM`]'s floor: 2.125 + 1192 ×
-/// 0.25 is 300.125 km. Measured identical on eight sites across three coverage
-/// patterns — KCBW, KESX, KICT, KMPX, KUDX, KCRP, KFTG, KDMX; VCP 35, 212 and
-/// 215 — where it is the geometry of every velocity tilt from the lowest up to
-/// about 3°, and the RDA states the intent itself: those elevation cuts carry
-/// `super_resolution_doppler_to_300km`.
 const DOPPLER_GATES: u16 = 1192;
 /// See [`DOPPLER_GATES`].
 const DOPPLER_GATE_M: u16 = 250;
 /// See [`DOPPLER_GATES`].
 const DOPPLER_FIRST_GATE_M: u16 = 2125;
 
-/// The ground a Doppler cut covers, km: its 300.125 km of beam laid down at
-/// the fixture's own elevation, for the reason [`tdwr_ground_reach_km`] gives.
 fn doppler_ground_reach_km() -> f64 {
     // Widened before multiplying: 1192 × 250 is 298 000, and the three
     // constants are the `u16` fields `MomentData` stores them in.
@@ -2986,10 +2294,6 @@ fn doppler_ground_reach_km() -> f64 {
 }
 
 /// A filled Doppler cut: every gate of every radial carries a velocity.
-///
-/// Filled rather than the thin ring [`tdwr_long_range_sweep`] paints, because
-/// what is read off this fixture is the scale of the whole picture rather than
-/// where one far return lands, and a filled disc puts a gate under every probe.
 fn wsr88d_doppler_sweep() -> Scan {
     use nexrad_model::data::{MomentData, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern};
 
@@ -3042,42 +2346,6 @@ fn wsr88d_doppler_sweep() -> Scan {
     )
 }
 
-/// A ceiling at the base size draws a Doppler cut's extra ground and pays for
-/// it in scale. This is where that costing is written down.
-///
-/// It is the case the floor's guarantee does *not* cover, and it is not a
-/// corner: a Doppler cut reaches 300.125 km, so every velocity tilt below about
-/// 3° is in it. A browser is always in it — its class pins the raster ceiling
-/// to the base size, whatever the browser reports — and so is a GLES 3.0
-/// handheld whose `AppState::raster_side_ceiling_px` comes back at the base
-/// size because that is all it said it could hold.
-///
-/// **The two ceilings declare the same extent**, and that is the first
-/// assertion because it is the decision the rest follows from: how much ground
-/// a picture shows is a fact about the data, and only how finely it is sampled
-/// is a fact about the device. A raster whose extent moved with the machine
-/// would put the same volume's echo in two places, and a loop frame — which
-/// takes a leaner ceiling on purpose — would crop the still frame it replaces
-/// rather than merely softening it.
-///
-/// **What it costs**: 3.4145 px/km against the long-range arm's 6.829, which is
-/// 23.4% under the floor's 4.4522, and 0.853 pixels across a 250 m gate where
-/// the floor gives 1.113.
-///
-/// **What it buys**, and why the trade goes this way rather than holding these
-/// devices at the floor's extent: over 192 Doppler sweeps of the eight sites
-/// [`DOPPLER_GATES`] names, the band from 230 km out to 300 km holds 448 690
-/// gates carrying a velocity — 1.68% of that band's own bins, the rest being
-/// below threshold, but 3.4% of all the velocity those sweeps hold. Sparse and
-/// real. Holding the floor would trade a picture that is uniformly softer for
-/// one missing its outer third.
-///
-/// **What keeps that affordable** is the last block: two pixels per kilometre
-/// is where a 250 m gate stops landing in a pixel at all
-/// (`a_quarter_kilometre_gate_still_gets_its_own_pixel_at_the_base_extent`), and the
-/// base-size arm clears it at every extent this display can be handed — down to
-/// 2.1787 px/km at [`types::MAX_EXTENT_KM`], which is 8.9% of margin and the
-/// reason that cap cannot quietly rise.
 #[test]
 fn a_base_size_ceiling_pays_for_the_extra_ground_in_scale() {
     let scan = wsr88d_doppler_sweep();
@@ -3122,11 +2390,10 @@ fn a_base_size_ceiling_pays_for_the_extra_ground_in_scale() {
     let floor = types::IMAGE_SIZE as f64 / (2.0 * types::BASE_EXTENT_KM);
     let px_per_km = |side: usize| side as f64 / (2.0 * extent_km);
     for (side, expected, what) in [
-        // 3.412 and 6.824 before the ground range became the spherical arc:
-        // the extent these divide is the sweep's ground reach, and the arc is
-        // shorter than the tangent plane's `r·cos e`, so the same pixels cover
-        // slightly less ground and the scale rises. Both moved by the same
-        // 0.07 %, because both divide the one extent.
+        // 3.412 and 6.824 before the ground range became the spherical arc: the extent
+        // these divide is the sweep's ground reach, and the arc is shorter than the
+        // tangent plane's `r·cos e`, so the same pixels cover slightly less ground and
+        // the scale rises.
         (types::IMAGE_SIZE, 3.4145, "a base-size ceiling"),
         (LONG_RANGE_SIDE, 6.8290, "a long-range ceiling"),
     ] {
@@ -3157,8 +2424,6 @@ fn a_base_size_ceiling_pays_for_the_extra_ground_in_scale() {
         );
     }
 
-    // The margin the trade runs on, at every extent a base-size ceiling can be
-    // handed: the widest sweep a radar flies, and the arithmetic guard past it.
     const RESOLUTION_LINE: f64 = 2.0;
     for (extent, expected, why) in [
         (extent_km, 3.4145, "this Doppler cut"),
@@ -3179,12 +2444,6 @@ fn a_base_size_ceiling_pays_for_the_extra_ground_in_scale() {
     }
 }
 
-/// A ceiling *under* the base size is honoured, which is how the browser's
-/// loop frames stay the size its texture budget was written for.
-///
-/// The same sweep at the same extent, drawn onto a quarter of the pixels: the
-/// picture is coarser and the geometry is not, so the extent it declares is
-/// the extent it would have declared at any size.
 #[test]
 fn a_ceiling_under_the_base_size_renders_a_leaner_picture_of_the_same_ground() {
     const LEAN: usize = 1024;
@@ -3223,19 +2482,6 @@ fn a_ceiling_under_the_base_size_renders_a_leaner_picture_of_the_same_ground() {
 
 // ── Range folding and the declared Nyquist ───────────────────────────────
 
-/// A range-folded gate is a reading, and the plan view says so.
-///
-/// The sweep is 360 radials of ordinary velocity with two of them replaced:
-/// one whose gates are all `RAW_RANGE_FOLDED` and its neighbour whose gates
-/// are all `RAW_BELOW_THRESHOLD`. Both used to leave the same hole. They are
-/// two different statements — one says the echo came from beyond the
-/// unambiguous range, the other says nothing came back at all — and the
-/// cross-section painter has always drawn the difference.
-///
-/// The purple is [`crate::palette::RANGE_FOLDED`] exactly, which is what a
-/// colour no product scale can produce is for:
-/// `the_range_folded_colour_is_unreachable_through_any_products_scale` pins
-/// that, so a pixel this colour can only have come from this arm.
 #[test]
 fn a_range_folded_gate_paints_the_dedicated_purple_and_below_threshold_does_not() {
     const FOLDED_AZ: usize = 90;
@@ -3294,8 +2540,6 @@ fn a_range_folded_gate_paints_the_dedicated_purple_and_below_threshold_does_not(
     );
 }
 
-/// The purple is confined to the gates that declared themselves folded: a
-/// sweep with none of them holds no pixel of that colour anywhere.
 #[test]
 fn a_sweep_with_nothing_folded_paints_no_range_folded_pixel() {
     let azimuths: Vec<f32> = (0..360).map(|i| i as f32).collect();
@@ -3311,13 +2555,6 @@ fn a_sweep_with_nothing_folded_paints_no_range_folded_pixel() {
     );
 }
 
-/// Two tilts, two PRFs, and the render reports the one belonging to the sweep
-/// it drew.
-///
-/// The lookup is by the RDA's `elevation_number` off the chosen `Sweep`, which
-/// is why this path resolves through `find_sweep_owner`: a table keyed by cut
-/// has to be read with the cut's own number, and asking the raster which tilt
-/// it drew is the only way to know which entry that is.
 #[test]
 fn the_render_reports_the_declared_nyquist_of_the_sweep_it_drew() {
     let declared: crate::nyquist::DeclaredNyquist =
@@ -3373,7 +2610,6 @@ fn the_render_reports_the_declared_nyquist_of_the_sweep_it_drew() {
         "an entry for another cut is not this cut's",
     );
 
-    // A volume product has no one sweep behind it to have declared anything.
     let volume = render_radar_to_image_full(
         &scan,
         0.5,
@@ -3389,9 +2625,6 @@ fn the_render_reports_the_declared_nyquist_of_the_sweep_it_drew() {
     assert_eq!(volume.nyquist_ms, None);
 }
 
-/// Two velocity tilts carrying the RDA's cut numbers 1 and 2 — the shape
-/// [`the_render_reports_the_declared_nyquist_of_the_sweep_it_drew`] needs and
-/// [`l2_sweep`]'s single sweep cannot be.
 fn two_tilt_velocity_scan() -> Scan {
     use nexrad_model::data::{MomentData, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern};
     let tilt = |elevation_number: u8, elevation_deg: f32| {
@@ -3456,34 +2689,12 @@ fn two_tilt_velocity_scan() -> Scan {
 
 // ── the output pool's two slots ──────────────────────────────────────────────
 
-/// What a *used* buffer looks like. Not zero, and not a byte any correct render
-/// could leave behind either, so one of them surviving into a checkout is
-/// unambiguous.
+/// What a *used* buffer looks like.
 const POISON: u8 = 0xA5;
 
-/// `checkout_image` hands out a buffer indistinguishable from a fresh
-/// allocation, at every length relative to the one the slot was holding.
-///
-/// # Why this is a unit test and not only an end-to-end one
-///
-/// `tests/render_output_pool.rs` renders through the public entry and *does*
-/// have teeth on the texture — [`RenderBuffers::into_output`]'s colouring pass
-/// has no `else` arm, so an unpainted pixel keeps whatever the buffer arrived
-/// holding, and a blank render following a painted one shows the difference.
-/// But it can only reach the lengths a raster side actually takes, and it says
-/// nothing at all about the value grid, which `extend` overwrites element for
-/// element and where an end-to-end assertion is therefore vacuous — the trap
-/// this campaign has been caught by three times. This poisons the slot directly
-/// at seven lengths around the one being asked for, which is the only way to
-/// fail a checkout that is right for the sides production happens to use and
-/// wrong for the arithmetic.
 #[test]
 fn a_checked_out_texture_is_zero_at_every_length() {
     let want = 4096;
-    // Shorter than, equal to and longer than the request, plus both degenerate
-    // ends. A buffer *longer* than the request is what a grow-only fit gets
-    // wrong; a shorter one is what a fit that trusts the slot's own length gets
-    // wrong.
     for held in [0, 1, want / 2, want - 1, want, want + 1, want * 3] {
         super::recycle_image(vec![POISON; held]);
         let image = super::checkout_image(want);
@@ -3499,25 +2710,12 @@ fn a_checked_out_texture_is_zero_at_every_length() {
             image.iter().filter(|&&b| b != 0).count()
         );
     }
-    // And with nothing in the slot, which is every render before the first one
-    // that gives a buffer back — and every render in a browser.
     let _ = super::image_pool().take();
     let image = super::checkout_image(want);
     assert_eq!(image.len(), want);
     assert!(image.iter().all(|&b| b == 0));
 }
 
-/// `checkout_values` hands out an **empty** grid whatever the slot was holding,
-/// so a longer grid from a previous render cannot survive past the end of this
-/// one's.
-///
-/// The grid is filled by `extend`, which writes every element it produces, so
-/// unlike the texture there is no seeded state here to leak. The failure this
-/// pins is the other one: a checkout that kept the slot's length would leave
-/// the render *appending* to it, and every grid after the first would come out
-/// longer than the raster it describes — which
-/// `crate::render_input::tests`'s shape assertions would then read as a
-/// different raster side.
 #[test]
 fn a_checked_out_value_grid_is_empty_at_every_length() {
     for held in [0usize, 1, 1024, 4096, 1 << 20] {
@@ -3532,37 +2730,10 @@ fn a_checked_out_value_grid_is_empty_at_every_length() {
     }
 }
 
-// What `recycle_image` and `recycle_values` do *to the slot* — keep the first
-// offer, drop the rest, decline a buffer with no capacity — is pinned in
-// `tests/render_output_slot.rs` and deliberately not here. A test of that shape
-// has to assert the slot's exact contents, and this binary's twenty-odd other
-// rendering tests take and fill both slots on other threads while it runs. It
-// was never observed failing — forty-five clean runs of the whole binary all
-// passed — and it fails anyway: with one thread checking out and recycling
-// beside it, the assertion read the wrong answer 2,017 times in 200,000, which
-// puts an ordinary run somewhere around one in a thousand. That is the flake
-// nobody sees for a year and then cannot reproduce. The two tests
-// above are the shape that survives here, and it is not an accident — both
-// assert only what a checkout must satisfy *whatever* the slot held, so no
-// interleaving can make them fail. See that file for how a separate process
-// gets the exact-contents claim back without the race.
+// What `recycle_image` and `recycle_values` do *to the slot* — keep the first offer,
+// drop the rest, decline a buffer with no capacity — is pinned in
+// `tests/render_output_slot.rs` and deliberately not here.
 
-/// The rasterizer's own placement is [`rustdar_geo::great_circle_destination`]
-/// carried into pixels — the same point, arrived at by two routes.
-///
-/// `MercatorProjection::pixel_at` does not *call* `great_circle_destination`:
-/// it inlines the arithmetic with the site's sine and cosine hoisted onto the
-/// projection and the destination's latitude left as a sine, because it runs
-/// tens of millions of times a frame and an `asin` there would be undone by a
-/// `tan` immediately afterwards. That is a performance spelling of a shared
-/// model, and this is what keeps it one: the gate's geography goes through
-/// `beam`, then through [`types::ImageBounds`] the way the frontend places the
-/// texture and the way `painted_ranges_km_at` reads a pixel back, and lands on
-/// the column and row the rasterizer computed.
-///
-/// Sub-thousandth-of-a-pixel, not sub-pixel: the point is that the two are the
-/// same arithmetic in a different order, so anything a rounding difference
-/// cannot explain is a second model.
 #[test]
 fn the_rasterizer_places_a_gate_where_the_beam_module_says_it_is() {
     let mut worst_px = 0.0f64;
@@ -3582,7 +2753,6 @@ fn the_rasterizer_places_a_gate_where_the_beam_module_says_it_is() {
                     let (sin_d, cos_d) = (range_km / rustdar_geo::EARTH_RADIUS_KM).sin_cos();
                     let (px, py) = proj.pixel_at(sin_az, cos_az, sin_d, cos_d);
 
-                    // The same gate, placed by `beam` and framed by the bounds.
                     let (lat, lon) =
                         rustdar_geo::great_circle_destination(site_lat, LON, az, range_km);
                     let want_px =
@@ -3607,16 +2777,6 @@ fn the_rasterizer_places_a_gate_where_the_beam_module_says_it_is() {
     );
 }
 
-/// A cut whose leading radial lost the product's moment is still offered to
-/// the loop's snap.
-///
-/// [`find_closest_elevation`] is what `rustdar_app`'s loop dispatch asks
-/// which elevation each historical scan actually holds. Asked of the leading
-/// radial alone, one blank radial took the whole cut out of that answer, so a
-/// steady selection snapped to a *neighbouring* tilt — or, on a volume with no
-/// neighbour, to nothing — while every other radial of the cut carried the
-/// moment. It is the same first-radial assumption
-/// [`find_sweep_owner`] and [`crate::velocity::tilts`] dropped.
 #[test]
 fn a_cut_whose_leading_radial_is_blank_is_still_offered_to_the_loop() {
     let intact = scan_of(vec![
@@ -3677,10 +2837,6 @@ fn a_cut_whose_leading_radial_is_blank_is_still_offered_to_the_loop() {
     assert_eq!(find_closest_elevation(&maimed, PRODUCT, 0.8), Some(0.8));
 }
 
-/// A split TDWR-shaped volume: a surveillance half carrying only reflectivity
-/// out to 417 km and a Doppler half carrying both out to 88.8 km, at one
-/// elevation, the Doppler half last. `stray` gives the surveillance half's
-/// *n*-th radial a velocity moment it has no business carrying.
 fn split_volume_with_stray_velocity(stray: Option<usize>) -> Scan {
     use nexrad_model::data::{MomentData, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern};
 
@@ -3754,19 +2910,6 @@ fn split_volume_with_stray_velocity(stray: Option<usize>) -> Scan {
     )
 }
 
-/// One stray velocity radial does not turn a surveillance cut into a Doppler
-/// one, and so does not reframe the reflectivity pane.
-///
-/// The surveillance preference asks whether a sweep is the split cut's Doppler
-/// half. Asked as `any`, one radial out of 360 answered yes for the
-/// surveillance half, the preference then found no surveillance cut at all, and
-/// the fallback handed reflectivity the newest sweep carrying it — the Doppler
-/// half, 88.8 km wide. That is the same 328 km reframing, in the same
-/// direction, as the blank-leading-radial defect the `any` was introduced to
-/// fix, so the question is the sweep's majority.
-///
-/// The blank radial is run at both ends: in front, where a first-radial test
-/// would have been fooled, and in the middle, where an `any` test is.
 #[test]
 fn one_stray_velocity_radial_does_not_reframe_the_reflectivity_pane() {
     let long_range_km =
@@ -3798,8 +2941,6 @@ fn one_stray_velocity_radial_does_not_reframe_the_reflectivity_pane() {
         );
     }
 
-    // And the Doppler half is still recognised as one: a velocity request
-    // reaches it, framed at its own much shorter reach.
     let scan = split_volume_with_stray_velocity(Some(200));
     let vel = render_radar_to_image(&scan, L2_ELEVATION, types::RadarProduct::Velocity, LAT, LON)
         .expect("the Doppler half carries velocity");
@@ -3812,62 +2953,6 @@ fn one_stray_velocity_radial_does_not_reframe_the_reflectivity_pane() {
 
 // ── The polar field against the raster it was painted beside ────────────────
 
-/// The readout's gate **is** the raster's gate, everywhere the raster is not
-/// quantizing — and where it is, the disagreement is one cell wide.
-///
-/// This is the test that keeps [`polar`]'s inverse and
-/// [`MercatorProjection::render_gate`]'s forward paint describing one picture.
-/// Nothing else can: the module's own tests run on geometry written down by
-/// hand, and a rule that had drifted half a gate out would still pass every one
-/// of them.
-///
-/// # Two claims, because there are two questions
-///
-/// **At a cell's centre the two agree exactly, with no tolerance.** A point at
-/// a wedge's own azimuth and a gate's own range sits deep inside that gate's
-/// footprint, so the pixel under it was claimed by that gate and no other, and
-/// the number the grid holds there is that gate's to the bit. A rule off by
-/// half a gate in range, or half a wedge in azimuth, moves the answer to a
-/// neighbour at *every one* of these probes; this is what would catch it.
-///
-/// **Away from the centres they disagree on 2.70% of points, and that is the
-/// raster's quantization rather than a second rule.** Measured over 263,683
-/// probes on a 1° × 0.25 km sweep drawn at 2048 px (6.83 px/km), stepping
-/// azimuth by 0.37° and range geometrically by 3%: 7,114 disagreements, and in
-/// 7,071 of them — **99.4%** — the number the grid holds is one of the eight
-/// gates immediately around the one the point is in. The differences are one
-/// data level: median 0.500 dBZ, p90 0.500, p99 2.000, worst 4.500.
-///
-/// That is exactly what a truncating rasterizer does. `render_gate` walks
-/// sample points and drops them onto a pixel grid nothing aligns them to, so a
-/// pixel straddling a cell boundary goes to whichever claimant `write_key`
-/// ranks highest rather than to whichever covers most of it. The reader cannot
-/// see which; the cursor's own gate is the honest answer, and it is the one
-/// this returns.
-///
-/// The bound is what makes the number an assertion rather than a note. A rule
-/// half a gate out disagrees on roughly half the probes, not a fortieth.
-///
-/// # A raster defect this found, and where it went
-///
-/// This test is what turned the defect up: cell centres where the raster was
-/// **unpainted under a gate that was painted** — 4 of 2 028 on the coarse
-/// render, single-pixel pinholes reading `##.##` across a 5 x 5 neighbourhood
-/// inside solid echo.
-///
-/// The cause was `render_gate`'s sample lattice. Its two step counts made each
-/// step under a pixel — 0.622 px radially and 0.910 px tangentially at
-/// (308.5°, 347 km) — but those axes are radial and tangential, not the
-/// raster's, and what has to be under half a pixel is the lattice's *covering
-/// radius*: `hypot(0.622, 0.910) / 2` is 0.551, over the 0.5 a unit square
-/// needs, and all four holes measured 0.549-0.560.
-///
-/// [`super::SAMPLE_STEP_PX`] is the fix and carries the argument;
-/// [`a_solid_field_leaves_no_pixel_of_itself_unpainted`] is the direct test of
-/// it, on this same 1 km geometry, where the count was 42 502 pixels and is now
-/// zero. So the tolerance below is zero as well — it is kept as an assertion
-/// rather than deleted because this is the probe that found the defect, and it
-/// is the one that would find the next one.
 #[test]
 fn the_polar_field_answers_what_the_value_grid_holds() {
     let out = render_level3_radial_to_image(
@@ -3887,15 +2972,6 @@ fn the_polar_field_answers_what_the_value_grid_holds() {
     assert_eq!(geom.gates(), N_BINS);
 
     // ── At the centres: exact, every time ──
-    //
-    // On a *second* render of the same field, at 1 km gates rather than
-    // 0.25 km. The fine render cannot answer this question at all: the raster
-    // is 2.0 texels per gate by construction ([`types::TEXELS_PER_SAMPLE`]), so
-    // a gate is two texels deep and its centre falls on the seam between them —
-    // the worst probe point there is, and one where the neighbouring gate's
-    // claim on the pixel is as good as this gate's. Widen the gate and the cell
-    // becomes 4.36 texels deep at the display's calibrated scale, with a
-    // genuine interior for a point to be inside of.
     let coarse = render_level3_radial_with_gate_km(
         &packet(None),
         1.0,
@@ -3914,8 +2990,6 @@ fn the_polar_field_answers_what_the_value_grid_holds() {
     let mut pinholes = 0u32;
     for radial in (0..cgeom.radials()).step_by(7) {
         let az = f64::from(cgeom.wedges()[radial].azimuth_deg);
-        // From 50 km out. Inside that a 1° wedge is under four texels wide and
-        // the same seam problem returns in the other axis.
         for gate in (50..cgeom.gates()).step_by(11) {
             // `gate_ground_km`, not `first + gate × interval`: the slant grid
             // is uniform and the ground grid it projects to is not, so the
@@ -4018,33 +3092,8 @@ fn neighbours(
     out
 }
 
-/// **Consecutive gates tile: the boundary between one gate and the next is a
-/// single number, so no seam and no overlap can open between them whatever the
-/// slant-to-ground conversion does to their spacing.**
-///
-/// This is the property [`gate_ground_edges`] exists for, and it is a property
-/// of *how* the edges are produced rather than of the conversion inside them.
-/// A caller that asked for a centre and split a constant depth either side
-/// would satisfy it only while the conversion is linear — which the tangent
-/// plane is and [`crate::beam::ground_range_km`]'s arc is not.
-///
-/// # What the second half measures, and why it is not alarming
-///
-/// The discriminating half rebuilds what a centre-plus-constant-depth painter
-/// would produce over the same gates and measures the worst mismatch: **1.90 m**
-/// at 19.5° over 400 gates. At the plan view's 4.4522 px/km that is 0.0085 of a
-/// cell, and the worst case anywhere on the tilt ladder is 0.026 of a cell. So
-/// this is not a seam anyone has been looking at — it is a guard that keeps one
-/// from opening, and the number is here so the next reader can see the size of
-/// what is being prevented rather than assume it was a visible artifact.
-///
-/// The reason to build it out rather than accept a sub-pixel mismatch is that
-/// exactness here is free: sharing the boundary costs one fewer evaluation per
-/// gate than computing both ends of every span.
 #[test]
 fn consecutive_gates_tile_with_no_seam() {
-    // The steepest cut the fleet flies, where the conversion is least linear
-    // and a per-gate spelling would drift fastest.
     const ELEV_DEG: f64 = 19.5;
     const FIRST_KM: f64 = 2.125;
     const INTERVAL_KM: f64 = 0.25;
@@ -4056,8 +3105,6 @@ fn consecutive_gates_tile_with_no_seam() {
     .collect();
     assert_eq!(spans.len(), GATES);
 
-    // The property: bit-for-bit, not nearly. A sub-ulp gap is still a gap, and
-    // one along every gate boundary of every radial is a systematic artifact.
     for (j, pair) in spans.windows(2).enumerate() {
         assert_eq!(
             pair[0].far_km.to_bits(),
@@ -4069,8 +3116,6 @@ fn consecutive_gates_tile_with_no_seam() {
             pair[1].near_km,
         );
     }
-    // Monotone and non-empty, so "tiles" means tiles outward and not that every
-    // span collapsed to a point.
     for (j, span) in spans.iter().enumerate() {
         assert!(
             span.far_km > span.near_km,
@@ -4078,9 +3123,6 @@ fn consecutive_gates_tile_with_no_seam() {
         );
     }
 
-    // The discriminating half. Rebuild the centre-plus-constant-depth form the
-    // old signature invited and show it does *not* tile under this conversion,
-    // so the assertion above is not true of any spelling.
     let ground = |slant_km: f64| crate::beam::ground_range_km(slant_km, ELEV_DEG);
     let flat_depth = INTERVAL_KM * ELEV_DEG.to_radians().cos();
     let worst = (0..GATES - 1)

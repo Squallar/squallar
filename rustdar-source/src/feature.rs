@@ -3,7 +3,6 @@
 
 use rustdar_geo::{GeoBounds, GeoPolygon};
 
-/// A map label to be drawn at a geographic position.
 #[derive(Debug, Clone)]
 pub struct OverlayLabel {
     pub lat: f64,
@@ -12,27 +11,20 @@ pub struct OverlayLabel {
     pub color: [u8; 4],
 }
 
-/// Hatching for SPC's significant-severe area.
-///
-/// The three levels are SPC's Conditional Intensity Groups, which NWS Service
-/// Change Notice 26-11 introduced on 2026-03-02 to replace the single `SIGN`
-/// area with three intensity distributions. Higher levels hatch over lower
-/// ones; see `rustdar_overlays`'s `render::hatch::draw_hatch_pass`.
+/// Hatching for SPC's significant-severe area. The three levels are SPC's
+/// Conditional Intensity Groups (NWS Service Change Notice 26-11, 2026-03-02).
+/// Higher levels hatch over lower ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HatchPattern {
     None,
-    /// Dotted, 45° (forward slash).
     Cig1,
-    /// Solid, 135° (backslash).
     Cig2,
-    /// Solid, both directions (cross-hatch).
     Cig3,
 }
 
-/// `PartialEq` because features ride inside
-/// `rustdar_worker::offload::JobRequest` (the described overlay jobs for the
-/// polygon kinds), whose wire round-trip tests compare whole requests; it is
-/// derived and carries [`GeoBounds`]'s own `f64` caveat that `NaN != NaN`.
+/// `PartialEq` because features ride inside a `JobRequest` whose wire
+/// round-trip tests compare whole requests; it carries [`GeoBounds`]'s own
+/// `f64` caveat that `NaN != NaN`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OverlayFeature {
     /// One or more polygons (from GeoJSON MultiPolygon).
@@ -48,9 +40,8 @@ pub struct OverlayFeature {
 }
 
 impl OverlayFeature {
-    /// Bounds are taken in geo-coordinates, so they survive projection: the
-    /// viewport cull compares them against a projected viewport's own
-    /// lat/lon box.
+    /// Geo-coordinates, so they survive projection: the viewport cull compares
+    /// them against a projected viewport's own lat/lon box.
     pub fn new(
         polygons: Vec<GeoPolygon>,
         fill_rgba: [u8; 4],

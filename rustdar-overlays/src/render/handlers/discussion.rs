@@ -17,16 +17,7 @@ use crate::types::OverlayLabel;
 use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
 
-/// `pub` for the reason `NwsAlertFetchResult` is: the frontend's described-job
-/// dispatch tests seed a live registry through `apply_fetch_result`, whose
-/// payload the handler downcasts to exactly this.
 pub struct SpcDiscussionFetchResult(pub Result<Vec<SpcDiscussion>, FetchError>);
-/// [`Whole`]: one GET of the SPC mesoscale-discussion RSS feed, parsed in one
-/// pass. Every discussion the layer draws came out of that single document, so
-/// there is no second request to lose and nothing a coverage report could hold
-/// that the `Err` arm does not already say.
-///
-/// [`Whole`]: crate::fetch_policy::Whole
 impl crate::fetch_policy::FetchRound for SpcDiscussionFetchResult {
     type Shape = crate::fetch_policy::Whole;
 }
@@ -98,11 +89,7 @@ impl OverlayItem for DiscussionItem {
 pub(crate) struct SpcDiscussionHandler {
     pub state: OverlayState<Vec<Arc<DiscussionItem>>, Whole>,
     pub enabled: bool,
-    /// The "MD 1234" map labels, rebuilt whenever `state.data` is — never per
-    /// frame. Each one used to be derived inside `clickable_items`: two full
-    /// `sum::<f64>()` passes over the first ring for a centroid plus a
-    /// `format!`, per MD, per pane, per frame, for text that only changes when
-    /// the discussion set does.
+    /// The "MD 1234" map labels, rebuilt whenever `state.data` is — never per frame.
     labels: Vec<OverlayLabel>,
 }
 
@@ -115,14 +102,6 @@ impl SpcDiscussionHandler {
         }
     }
 
-    /// What the rasterizer reads, captured once — the **one** builder
-    /// `prepare_job` answers from, kept a private helper so a second dispatch
-    /// path could not quietly capture different state.
-    ///
-    /// [`rasterize::DiscussionPaint`] rows, not whole [`SpcDiscussion`]s: the
-    /// type and the rings are everything the raster reads, and the described
-    /// job serialises this struct onto a message port — the discussion text is
-    /// popup prose it never draws.
     fn paint_input(&self, ctx: &RasterizeContext) -> Option<rasterize::DiscussionsInput> {
         if self.state.data.is_empty() {
             return None;
@@ -195,15 +174,6 @@ impl OverlayHandler for SpcDiscussionHandler {
         self.state.data_generation
     }
 
-    /// What this handler would draw, not what it fetched: an order-free fold
-    /// over the numbers of the MDs that would paint — those with a polygon,
-    /// the same filter [`clickable_items`] applies — and `0` while the
-    /// toggle is off. SPC discussions poll every two minutes and mostly
-    /// return the same set, and a floor recomposed on every poll is a floor
-    /// recomposed for nothing; the signature moves exactly when an MD
-    /// issues, expires, or the checkbox flips.
-    ///
-    /// [`clickable_items`]: SpcDiscussionHandler::clickable_items
     fn content_signature(&self) -> u64 {
         use std::hash::{DefaultHasher, Hash, Hasher};
         if !self.enabled {
@@ -282,9 +252,6 @@ impl OverlayHandler for SpcDiscussionHandler {
         match fetch.0 {
             Ok(discussions) => {
                 log::info!("Received {} SPC Mesoscale Discussions", discussions.len());
-                // The labels are derived here and nowhere else, so they cannot
-                // fall out of step with the discussions they name — the same
-                // ring filter `clickable_items` applies.
                 self.labels = discussions
                     .iter()
                     .filter(|md| !md.polygon.is_empty())
@@ -297,9 +264,6 @@ impl OverlayHandler for SpcDiscussionHandler {
                 self.state.set_data(items);
             }
             Err(e) => {
-                // Logged once per *attempt*, and attempts are now on the
-                // ladder in `crate::fetch_policy` — this line is the one that
-                // appeared 3089 times in 105 s.
                 log::error!("SPC MD fetch failed: {e}");
                 self.state.record_failure(&e);
             }
@@ -363,11 +327,6 @@ impl OverlayHandler for SpcDiscussionHandler {
             enabled: self.enabled,
         }];
 
-        // Ungated on enabled (the every-option rule, M9.1): a hidden
-        // layer's options stay visible and editable - edits take effect
-        // when the eye shows it again - Refresh still fetches (nothing
-        // on the fetch path reads enabled), and the status lines keep
-        // reporting.
         items.push(ControlItem::ButtonRow {
             buttons: vec![ControlButton {
                 id: "refresh",
@@ -381,10 +340,6 @@ impl OverlayHandler for SpcDiscussionHandler {
                 text: "Fetching...".into(),
             });
         }
-        // The fetch-health note this handler used to push here is prepended by
-        // `OverlayRegistry::controls` now, for every layer. This was the only
-        // one of the six that remembered, which is precisely why it stopped
-        // being a handler's job to remember — see that method.
         if let Some(t) = self.state.fetch_time {
             let secs = t.elapsed().as_secs();
             let text = if secs < 60 {
@@ -436,7 +391,6 @@ mod tests {
     use crate::spc::discussion::MdType;
     use crate::types::HatchPattern;
 
-    /// A minimal convective MD with a polygon, identified by `number`.
     fn md(number: u32) -> SpcDiscussion {
         let md_type = MdType::Convective;
         let polygon = vec![vec![(35.0, -97.0), (35.5, -97.0), (35.5, -96.5)]];
@@ -466,11 +420,6 @@ mod tests {
         handler
     }
 
-    /// The signature names the **set**, not the fetch: MDs poll every two
-    /// minutes, and a refetch returning the same discussions must keep the
-    /// signature — which `data_generation`, bumped on every `set_data`,
-    /// cannot do. Swap the body for `self.data_generation()` and this test
-    /// fails on the second fetch.
     #[test]
     fn a_refetch_of_the_same_discussion_set_keeps_the_signature() {
         let mut handler = handler_with(vec![md(101), md(102)]);
@@ -491,9 +440,6 @@ mod tests {
         );
     }
 
-    /// Every change to what would draw moves the signature: an MD issuing,
-    /// one expiring, and the checkbox flipping off (the floor follows the
-    /// handler's global toggle, and `clickable_items` does not read it).
     #[test]
     fn every_change_to_the_drawn_set_moves_the_signature() {
         let mut handler = handler_with(vec![md(101)]);
@@ -521,15 +467,6 @@ mod tests {
         );
     }
 
-    /// The labels are derived from the discussions and follow them exactly:
-    /// one per MD that has a ring, none for an MD without one, and the set is
-    /// **replaced** on a refetch rather than appended to.
-    ///
-    /// They used to be rebuilt inside `clickable_items` on every frame, where
-    /// staleness was impossible by construction and paid for at frame rate.
-    /// Precomputing them buys a second copy of the truth, so this is the test
-    /// that the copy tracks: an MD that expired out of the feed must take its
-    /// label with it.
     #[test]
     fn the_map_labels_follow_the_discussion_set() {
         let mut no_ring = md(103);
@@ -547,8 +484,6 @@ mod tests {
             "an MD with no ring has nowhere to put a label, so it gets none",
         );
 
-        // The label sits on the first ring's centroid — the only geometry
-        // claim it makes.
         let ring = &md(101).polygon[0];
         let n = ring.len() as f64;
         let label = &handler.map_labels()[0];
@@ -575,8 +510,6 @@ mod tests {
         );
     }
 
-    /// A set fold, not a sequence fold: the fetch order of the same MDs is
-    /// not a picture change.
     #[test]
     fn the_signature_is_a_set_signature_not_a_sequence_signature() {
         let forward = handler_with(vec![md(101), md(102), md(103)]);

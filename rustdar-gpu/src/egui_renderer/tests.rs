@@ -3,11 +3,6 @@ use super::submission_order;
 use super::{PreparedFrame, Renderer, ScreenDescriptor, TextureFormat, wgpu};
 
 /// A named function's body, read out of a source file this crate ships.
-///
-/// `end_pass_and_upload` and `present_frame` both need a real `Window`, a
-/// wgpu device and a swapchain, so no host test can run either. Reading the
-/// source is the only handle there is — the same technique the `begin_frame`
-/// assertions below already rely on.
 fn body_of(source: &'static str, signature: &str) -> &'static str {
     source
         .split_once(signature)
@@ -17,18 +12,6 @@ fn body_of(source: &'static str, signature: &str) -> &'static str {
 }
 
 /// **`ctx.request_repaint()` from a background thread has to reach winit.**
-///
-/// egui's request is a flag the next `begin_pass` reads; on a loop parked in
-/// `ControlFlow::Wait` there is no next `begin_pass`, and the callback
-/// installed here is the only channel out. Two callers already depended on it
-/// — the tile fetcher and the map — and neither was reached, because nothing
-/// in the workspace had ever called `set_request_repaint_callback`. It did not
-/// show, because the frame loop was re-arming a redraw unconditionally; the
-/// moment that stopped, a fetched map tile would sit in its channel until the
-/// user happened to move the mouse.
-///
-/// Driven from another thread, which is where the tile fetcher calls from and
-/// what the `Send + Sync` bound on the callback is for.
 #[test]
 fn an_off_frame_repaint_request_reaches_the_event_loop() {
     let ctx = egui::Context::default();
@@ -52,13 +35,6 @@ fn an_off_frame_repaint_request_reaches_the_event_loop() {
 }
 
 /// …and a *timed* request must not, or every dwell becomes a busy loop.
-///
-/// `request_repaint_after` is already carried out of the frame by
-/// `FullOutput`'s `repaint_delay` and scheduled by `repaint_action`. Waking
-/// immediately here as well would draw at once, and egui re-asks on every
-/// pass — so a tooltip's half-second dwell would become a frame per frame for
-/// as long as the pointer rests, which is the exact failure the auto-poll
-/// re-arm was just cured of.
 #[test]
 fn a_timed_repaint_request_is_left_to_the_frames_own_schedule() {
     let ctx = egui::Context::default();
@@ -80,14 +56,6 @@ fn a_timed_repaint_request_is_left_to_the_frames_own_schedule() {
 
 /// The wiring itself: the one place a `Context` is built has to install it,
 /// and what it installs has to be the caller's injected wake — nothing else.
-///
-/// A source probe because `EguiRenderer::new` needs a real `Window` — the
-/// same reason `attachment_config_is_built_from_new_s_own_parameters` is one.
-/// The behavioural tests above drive `install_repaint_wake` directly and stay
-/// green with nothing calling it. The old assertion's other half — that the
-/// wake ends in a redraw request — travelled to the app side with the closure
-/// at WO-RG: rustdar-app's `egui_frame_pin_tests` pins that the wake
-/// `AppState::new` builds calls its `notify_redraw`.
 #[test]
 fn the_renderer_installs_that_wake_on_the_context_it_builds() {
     let body = body_of(include_str!("../egui_renderer.rs"), "    pub fn new(");
@@ -106,12 +74,6 @@ fn the_renderer_installs_that_wake_on_the_context_it_builds() {
 }
 
 /// The callbacks' command buffers must precede egui's own.
-///
-/// A callback's `prepare` records the work its `paint` then reads inside
-/// egui's render pass. Submitting egui's buffer first would paint against
-/// whatever the callback's target held on the previous frame — plausible
-/// output, one frame stale, and no error anywhere. `chain` is a one-token
-/// edit away from being reversed, so pin the order itself.
 #[test]
 fn the_callbacks_command_buffers_are_submitted_before_eguis() {
     assert_eq!(
@@ -121,26 +83,12 @@ fn the_callbacks_command_buffers_are_submitted_before_eguis() {
 }
 
 /// With no callbacks, egui's buffer is still submitted, and alone.
-///
-/// This is every frame rustdar draws today, so it is the case that must not
-/// regress while the volume view is being built.
 #[test]
 fn a_frame_with_no_callbacks_still_submits_eguis_own_buffer() {
     assert_eq!(submission_order(Vec::new(), "egui"), vec!["egui"]);
 }
 
 /// `update_buffers`' return must be bound and carried, not dropped.
-///
-/// This is a real defect that shipped: `egui_wgpu::Renderer::update_buffers`
-/// returns the `Vec<wgpu::CommandBuffer>` it gathered from every
-/// `CallbackTrait::prepare` and `finish_prepare`, the return is not
-/// `#[must_use]`, and this function discarded it. Nothing warned, and nothing
-/// could fail — until a callback exists, at which point its work is silently
-/// never submitted and it renders nothing.
-///
-/// There is no callback in the crate yet, so no behavioural test can see the
-/// regression; the assertion is that the value is bound and reaches the
-/// returned frame.
 #[test]
 fn end_pass_and_upload_carries_the_callback_command_buffers() {
     let body = body_of(
@@ -179,14 +127,6 @@ fn end_pass_and_upload_carries_the_callback_command_buffers() {
 // `app_render/egui_frame_pin_tests.rs`, beside the file it scrapes.
 
 /// `attachment_config` must report the pass, not a guess at it.
-///
-/// `EguiRenderer::new` needs a real `Window`, so no host test can call the
-/// accessor. What it can catch is the mutation that matters: each field
-/// hard-coded to what `AppState` happens to pass today rather than taken from
-/// the parameter. That compiles, reads plausibly, and reports a pass layout
-/// that is right until the first caller passes something else — at which
-/// point a consumer builds a pipeline for the wrong pass and
-/// `create_render_pipeline` has no `Result` to say so in.
 #[test]
 fn attachment_config_is_built_from_new_s_own_parameters() {
     let body = body_of(include_str!("../egui_renderer.rs"), "    pub fn new(");
@@ -214,31 +154,6 @@ fn attachment_config_is_built_from_new_s_own_parameters() {
 // `app_render/egui_frame_pin_tests.rs`, where the same-crate half lives.
 
 /// A callback's own command buffer reaches the queue, on a real device.
-///
-/// The end-to-end version of the defect above, and the only test that can
-/// distinguish "recorded" from "executed": the callback's `prepare` copies a
-/// sentinel between two buffers using a command buffer of its own, and the
-/// sentinel is only readable back if that buffer was submitted. Before the
-/// fix, `update_buffers`' return was dropped and this read zeroes.
-///
-/// Deliberately does *not* cover the wiring inside `end_pass_and_upload` and
-/// `present_frame` — both need a real `Window` and a swapchain. That half is
-/// what `end_pass_and_upload_carries_the_callback_command_buffers` and
-/// `the_frame_path_submits_only_through_prepared_frame` pin.
-///
-/// Needs a real adapter, so it is ignored by default — but CI opts in, and the
-/// `gpu` job in `test.yaml` names this test explicitly. Renaming it means
-/// editing that job; the step asserts its own test count, so a stale name fails
-/// the row rather than silently running nothing.
-///
-/// Passes on Mesa's lavapipe, which is what lets that row exist on a runner
-/// with no graphics hardware. Locally:
-///
-/// ```text
-/// cargo test -p rustdar-gpu --lib \
-///     egui_renderer::tests::a_paint_callbacks_own_command_buffer_reaches_the_queue \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 #[cfg(not(target_arch = "wasm32"))]
@@ -379,21 +294,11 @@ fn a_paint_callbacks_own_command_buffer_reaches_the_queue() {
 }
 
 /// `begin_frame`'s body, read out of this file's own source.
-///
-/// `begin_frame` needs a real `Window` and a wgpu device, so no unit test
-/// can run it; the input harness models what the rewrites do but cannot
-/// observe that this function calls them. Reading the source is the only
-/// handle there is.
 fn begin_frame_body() -> &'static str {
     body_of(include_str!("../egui_renderer.rs"), "pub fn begin_frame(")
 }
 
 /// Both input rewrites must precede `begin_pass`, and only this file says so.
-///
-/// Moving either call below `begin_pass` broke nothing in the suite while
-/// breaking pinch and wheel zoom in the browser — egui folds the events in
-/// during `begin_pass`, so a later rewrite is a frame too late and never
-/// reaches that frame's gestures.
 #[test]
 fn the_input_rewrites_run_before_begin_pass() {
     let body = begin_frame_body();
@@ -414,15 +319,6 @@ fn the_input_rewrites_run_before_begin_pass() {
 }
 
 /// The wheel rewrite must be *reachable*, and reachable on the web only.
-///
-/// Order is not the only way to switch a call off, and the assertion above
-/// sees none of the others: pointing the `cfg` at another arch makes the
-/// rewrite dead on every target — the fix silently reverted, Firefox back to
-/// a 2.5x slow wheel — while deleting the attribute runs it natively, where
-/// winit already reports one line per notch and 20px a line against egui's
-/// native `line_scroll_speed` of 40.0 nearly halves the desktop wheel. Both
-/// leave the call exactly where it is, before `begin_pass`. So pin the
-/// guard, not just the position.
 #[test]
 fn the_wheel_rewrite_is_gated_on_wasm32_and_nothing_else() {
     let body = begin_frame_body();
@@ -448,14 +344,6 @@ fn the_wheel_rewrite_is_gated_on_wasm32_and_nothing_else() {
 }
 
 /// Both theme paths turn label text-selection off, and keep it off.
-///
-/// A map drag whose release lands over the chrome left labels highlighted as
-/// though selected (the M8 first-run finding). The rule is applied at the one
-/// site that applies visuals, through `all_styles_mut`, so it must hold under
-/// either palette and survive a theme flip — which is exactly what is driven
-/// here, against a bare context, since labels in this app are never meant to
-/// be text-selected. `TextEdit` selection is egui-internal and unaffected by
-/// the flag.
 #[test]
 fn both_theme_paths_turn_label_text_selection_off() {
     for order in [[true, false], [false, true]] {
@@ -481,14 +369,6 @@ fn both_theme_paths_turn_label_text_selection_off() {
 
 /// A primitive is dropped from the mirror by *clamping* its clip rect, and
 /// clamped to the source pane it belongs to when it belongs to one.
-///
-/// The whole filtering mechanism, and the reason it can be this cheap:
-/// `egui_wgpu::Renderer::render` advances its index and vertex slice iterators
-/// even when it skips a zero-size scissor (`renderer.rs:516-527`), so a
-/// primitive can be excluded without removing it from the list — no mesh is
-/// cloned and no list is rebuilt. A filter that instead dropped entries would
-/// desynchronise those iterators from the buffers `update_buffers` staged, and
-/// every primitive after the first drop would draw another one's geometry.
 #[test]
 fn the_mirror_filter_clamps_rather_than_removes() {
     use super::clamp_to_sources;
@@ -522,25 +402,6 @@ fn the_mirror_filter_clamps_rather_than_removes() {
 }
 
 /// The mirror pass keeps the ordering that makes it correct at all.
-///
-/// Three things, none of which fails loudly when it is wrong:
-///
-///  * a **`queue.submit` between the two `update_buffers` calls**. Staging
-///    writes land at the next submit, so without one the second call overwrites
-///    the belt before the mirror pass runs and the mirror draws the wrong
-///    meshes through correct-looking geometry — a plausible picture and no
-///    validation error.
-///  * the mirror pass **before** `end_pass_and_upload`'s own `update_buffers`,
-///    because that call is what dispatches the volume callback's `prepare`, and
-///    that is what samples the mirror. After it, the floor would be one frame
-///    stale on every pan.
-///  * **callbacks swapped out** for the staging call. `render` already ignores
-///    `Primitive::Callback`, but `update_buffers` does not — leaving them in
-///    runs every `prepare` twice, and the raymarch is the most expensive thing
-///    in the frame.
-///
-/// A source probe because `render_mirror` needs a `Window`, a device and a
-/// swapchain, so no host test can call it.
 #[test]
 fn the_mirror_pass_submits_between_the_two_uploads_and_runs_before_prepare() {
     let source = include_str!("../egui_renderer.rs");

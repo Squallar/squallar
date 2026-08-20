@@ -1,47 +1,8 @@
 //! The fold-straddle guard, scored against labelled truth on a fixture.
-//!
-//! # Why this exists next to a corpus sweep
-//!
-//! [`SEAM_PROXIMITY_ACROSS_GATES`] and [`SEAM_PROXIMITY_ACROSS_TILTS`] were
-//! arbitrated on archive volumes, and the sweep that did it needs a corpus on
-//! disk — hundreds of volumes nobody has by default. That makes it the right
-//! instrument and the wrong guard: a number justified only by a run nobody
-//! repeats is a number that can drift without anything noticing.
-//!
-//! So the measurement is carried at two levels of effort. The corpus sweep on
-//! `campaign-harness` answers *what the constants cost on real weather*. This
-//! module answers *whether the guard still behaves the way that argument
-//! assumed*, on a fixture built in code, in milliseconds, on every build.
-//!
-//! # Why a fixture can carry any of it
-//!
-//! Because the expensive part of the corpus is realism, and none of the
-//! properties below need it. What the corpus supplies is a population of
-//! corner tuples drawn from real weather; what the guard is, is a decision
-//! about a tuple. Feed it tuples from an analytic field instead and every
-//! *structural* claim the constants rest on is still testable — the direction
-//! the fractions trade in, the way the break-even moves with the fold base
-//! rate, and the condition under which the rule's own premise fails. What a
-//! fixture cannot supply is the *value* of the trade on real weather, which is
-//! why those percentages live on the harness branch and not here.
-//!
-//! # Why this is not circular
-//!
-//! The generator draws **true** speeds and folds them with [`wrap`]. The label
-//! is [`fold_index`] on those true speeds — arithmetic on numbers that existed
-//! before the fold. The decision is [`super::straddles_fold`], the shipped
-//! function, reading only the **folded** values, exactly what the sampler sees.
-//! Nothing that produces the label is consulted by the thing being scored, and
-//! a bug in `straddles_fold` cannot reach the label to hide itself.
 
 use super::*;
 
 /// The fold seam the fixture folds at, m/s.
-///
-/// A real VCP 31 Nyquist velocity: 11.17–12.50 is that pattern's whole
-/// operational range and this is the middle of it. The corpus sweep uses the
-/// same number, so a reader comparing the two tables is comparing like with
-/// like.
 const FIXTURE_SEAM_MS: f64 = 11.5;
 
 /// The fractions swept, spanning both shipped constants.
@@ -50,30 +11,16 @@ const SWEPT: [f64; 14] = [
 ];
 
 /// The RDA's wrap: the true speed `v` reported inside `[−l, l)`.
-///
-/// Phase is periodic on `2π` and the velocity that maps onto is periodic on
-/// `2·l`, so the reported number is the true one shifted by whole multiples of
-/// `2·l` until it lands in the reporting interval. `rem_euclid` is that
-/// sentence.
 fn wrap(v: f64, l: f64) -> f64 {
     (v + l).rem_euclid(2.0 * l) - l
 }
 
 /// Which Nyquist interval a true speed falls in — **this is the label**.
-///
-/// Two samples sharing an index were shifted by the same multiple of `2·l`, so
-/// the wrap left the step between them as it found it and no fold separates
-/// them. Different indices were shifted differently, so a fold does. No field,
-/// no context and no tolerance enters.
 fn fold_index(v: f64, l: f64) -> i64 {
     ((v + l) / (2.0 * l)).floor() as i64
 }
 
 /// A deterministic stream, so the fixture is a fixture and not a sample.
-///
-/// xorshift64*, written out rather than pulled in: the numbers below are pinned
-/// to three decimal places, and that is only honest if the stream cannot move
-/// under a dependency bump.
 struct Stream(u64);
 
 impl Stream {
@@ -134,25 +81,6 @@ impl Tally {
 }
 
 /// Draw a labelled population and score the shipped guard over it.
-///
-/// `corners` is 4 for the bilinear path and 2 for the vertical lerp,
-/// `field_scale` is how fast the air gets in m/s, and `spread` is the scale of
-/// the tuple's own **true** change — the quantity the rule's premise is about.
-///
-/// **The two knobs are not interchangeable and that is the point.**
-/// `field_scale` sets the fold base rate, because folding is what happens when
-/// the air outruns the Nyquist interval: a field confined inside `±l` never
-/// wraps however rough it is, and one roaming many periods wraps constantly.
-/// `spread` sets whether a fold, once present, arrives in the shape the rule
-/// can recognise. Sweeping the first says how the break-even moves with base
-/// rate; sweeping the second says where the rule's premise fails.
-///
-/// The decision is [`straddles_at`], not [`super::straddles_fold`] directly,
-/// because the shipped function takes its fraction from the [`Seam`] variant
-/// and a sweep has to vary that fraction. The two are pinned equal at both
-/// shipped fractions by
-/// [`tests::the_swept_rule_is_the_shipped_rule_at_the_shipped_fractions`],
-/// which is what makes this a measurement of the shipped guard.
 fn score(corners: usize, field_scale: f64, spread: f64, seed: u64) -> Tally {
     let l = FIXTURE_SEAM_MS;
     let mut rng = Stream::new(seed);
@@ -209,13 +137,6 @@ fn score(corners: usize, field_scale: f64, spread: f64, seed: u64) -> Tally {
 }
 
 /// The guard's own fraction, threaded through a [`Seam`] the fixture picks.
-///
-/// [`straddles_fold`] takes the fraction from the `Seam` variant and not from
-/// an argument — deliberately, so a call site cannot silently swap the two
-/// constants — which means a sweep has to reach the fraction some other way.
-/// Rather than widen the shipped signature for a test, this scores the rule's
-/// algebra directly at an arbitrary fraction and separately pins that the two
-/// shipped variants agree with it at their own constants.
 fn straddles_at(corners: &[Sample], fraction: f64, limit: f64) -> bool {
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
     for corner in corners {
@@ -232,13 +153,6 @@ mod tests {
 
     /// The sweep's re-implementation of the rule agrees with the shipped one at
     /// both shipped fractions.
-    ///
-    /// **This is the join that makes the rest of this module about the shipped
-    /// guard.** Everything below sweeps [`straddles_at`] so it can vary the
-    /// fraction; that is only meaningful if, at the two fractions that actually
-    /// ship, it is the same decision [`straddles_fold`] makes. Swept over a
-    /// grid that crosses both seams from every direction, including the exact
-    /// boundary values where a `<` and a `<=` would part company.
     #[test]
     fn the_swept_rule_is_the_shipped_rule_at_the_shipped_fractions() {
         let limit = FIXTURE_SEAM_MS;
@@ -274,12 +188,6 @@ mod tests {
     }
 
     /// Raising the fraction gives up folds and saves shear, never the reverse.
-    ///
-    /// The whole argument on both constants is that the fraction buys one
-    /// against the other, so which direction each moves in is load-bearing.
-    /// It is also the cheapest possible regression on the rule's shape: an
-    /// inverted comparison, a sign slip, or a fraction applied to the wrong
-    /// side of the seam breaks monotonicity long before it breaks a percentage.
     #[test]
     fn the_fraction_trades_recall_against_false_fires_in_one_direction() {
         for (corners, name) in [(4usize, "quad"), (2usize, "rung pair")] {
@@ -312,22 +220,6 @@ mod tests {
     }
 
     /// The break-even moves **up** as the fold base rate falls.
-    ///
-    /// # The finding this pins
-    ///
-    /// Both constants' docs record a puzzle: scored against labelled truth, the
-    /// marginal bands cross 1:1 far below where either constant sits, which
-    /// read as an argument for moving them a long way down. The corpus campaign
-    /// resolved it — the crossing is not a property of the guard but of how
-    /// fold-rich the population scoring it happens to be, and every labelled
-    /// corpus that produced a low crossing was fold-rich. Across five
-    /// populations spanning 11 %–69 % the relationship is monotone.
-    ///
-    /// That is a claim about arithmetic, not about weather, so it is checkable
-    /// here: the same generator at two spreads produces a fold-rich and a
-    /// fold-poor population, and the fold-poor one must cross later. If this
-    /// ever fails, the reasoning that left both constants where they are has
-    /// lost its foundation and the corpus sweep needs re-running.
     #[test]
     fn the_break_even_moves_up_as_folds_get_rarer() {
         let rich = score(2, 4.0 * FIXTURE_SEAM_MS, 3.0, 20_250_402);
@@ -353,26 +245,6 @@ mod tests {
 
     /// Recall collapses once the tuple's own true change reaches the guard's
     /// line — the rule's premise failing, on demand.
-    ///
-    /// # What this makes checkable
-    ///
-    /// [`straddles_fold`]'s argument is that one wrap of a smooth field leaves
-    /// *both* sides near `±limit`, which holds only while the tuple's own true
-    /// change is small next to the Nyquist interval. Where that fails a real
-    /// fold arrives with one end deep inside the range and the rule reads it as
-    /// shear.
-    ///
-    /// On real volumes that failure is organised by **beam height**: measured
-    /// in strata, vertical recall runs 80 % at 2–4 km down to 27 % above 11 km,
-    /// and the mean true change between adjacent tilts climbs from 1.5 m/s to
-    /// 7.9 m/s over the same strata — reaching the guard's own line, 5.75 m/s
-    /// at `f = 0.50` against this seam, in the 6–8 km stratum where recall
-    /// halves. Height is the organising axis and slant range is not.
-    ///
-    /// The mechanism is arithmetic and belongs here; the altitudes are weather
-    /// and belong on the harness branch. This asserts the mechanism: hold
-    /// everything else fixed, sweep only the true change, and recall must fall
-    /// away as it approaches `f · limit`.
     #[test]
     fn recall_falls_away_as_the_true_change_reaches_the_guards_own_line() {
         let line = SEAM_PROXIMITY_ACROSS_TILTS * FIXTURE_SEAM_MS;
@@ -400,21 +272,6 @@ mod tests {
     }
 
     /// Both shipped fractions, on one fixture, with their costs printed.
-    ///
-    /// # Why a pinned number and not only a property
-    ///
-    /// The tests above would all still pass if someone changed either constant,
-    /// because they are about shape. This one moves the moment a constant does:
-    /// it scores the fixture at the two values that ship and pins what they
-    /// produce. The bands are wide enough that a compiler or platform
-    /// difference cannot trip them and narrow enough that a grid step cannot
-    /// hide inside one — the neighbouring fraction on each path lands outside
-    /// its own band, which the assertions check rather than assume.
-    ///
-    /// These percentages are **the fixture's, not the archive's**. Real recall
-    /// and false-fire figures depend on the fold base rate and the height
-    /// distribution of the population, and live with the corpus sweep on
-    /// `campaign-harness`. Nothing here should be quoted as a cost on weather.
     #[test]
     fn the_shipped_fractions_land_where_this_fixture_says_they_do() {
         let quads = score(4, 4.0 * FIXTURE_SEAM_MS, 8.0, 20_250_407);

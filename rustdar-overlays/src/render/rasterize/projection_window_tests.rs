@@ -4,10 +4,6 @@ use super::lambert_fixture::{
 };
 use super::*;
 
-/// The rasterizer over a grid by reference. Every comparison in this module is
-/// between *whole* grids — the window under test is the internal one — so the
-/// described input's `Whole` carry is built at the call; shadows the crate
-/// function so fourteen call sites stay written against the grid.
 fn rasterize_model_data(
     grid: &HrrrGridData,
     bounds: &GeoBounds,
@@ -22,9 +18,6 @@ fn rasterize_model_data(
     )
 }
 
-/// [`projection_window`] over a grid's own fields, as the whole-grid arm
-/// resolves it — the shim that keeps this module's window probes written
-/// against the grid.
 fn projection_window(
     grid: &HrrrGridData,
     bounds: &GeoBounds,
@@ -74,11 +67,6 @@ fn box_over(g: &GeoBounds, fx: f64, fy: f64, w: f64, h: f64) -> GeoBounds {
 /// bytes, because the coordinates are the same coordinates and skipping a
 /// point that could paint — or whose spacing sizes a point that paints — is
 /// a defect, not a trade-off.
-///
-/// The reference grid is the *materialised* twin, which is both the shape
-/// the rasterizer had before the grid went lazy and the arm
-/// [`projection_window`] declines to narrow, so it really does project all
-/// of them.
 #[test]
 fn the_window_paints_exactly_what_projecting_every_point_paints() {
     let lambert = lambert_grid(97, 61, 0b0100_0000);
@@ -159,9 +147,6 @@ fn a_scan_order_the_neighbour_walk_does_not_match_is_not_narrowed() {
     }
 }
 
-/// A window that never narrows would pass every test above. This is the
-/// control: the point of the change is that a small viewport projects a
-/// small fraction of the grid.
 #[test]
 fn a_small_viewport_narrows_the_window_sharply() {
     let grid = lambert_grid(1799, 1059, 0b0100_0000);
@@ -257,9 +242,6 @@ fn the_window_survives_a_randomised_sweep_of_viewports() {
 /// A margin stated as a fraction of the box cannot reach 0.55 of a cell once
 /// the box is smaller than a cell, and the overlay goes mostly blank —
 /// 5.5 M of 6.3 M pixels wrong at zoom 19, worsening upward.
-///
-/// Sized in cells so the regime, not the grid, is what varies. Corners are
-/// included because the one-sided neighbour branches live there.
 #[test]
 fn the_window_survives_a_viewport_smaller_than_one_grid_cell() {
     let lambert = lambert_grid(97, 61, 0b0100_0000);
@@ -286,15 +268,6 @@ fn the_window_survives_a_viewport_smaller_than_one_grid_cell() {
 /// neither wraps nor clamps it, so panning west at low zoom produces a
 /// texture running past -180. Grid longitudes are normalised to -180..180,
 /// so such a box is not the interval it looks like.
-///
-/// The numbers are the reviewer's: -277 is where `lon0 - 180 = -277.5` plus
-/// the growth crosses the cone's seam, and -290..-110 is a viewport of
-/// -230..-170 expanded by an overdraw of 1.0 — what `OVERDRAW_FRACTION` held
-/// when these boxes were chosen. They are *fixtures* and stay as they are now
-/// that the constant is a quarter: what is under test is that a texture box
-/// running past the antimeridian narrows correctly, which is a property of this
-/// function rather than of how wide the cache plans today. A smaller overdraw
-/// only means the app reaches such a box by panning further.
 #[test]
 fn the_window_survives_a_texture_running_past_the_antimeridian() {
     let lambert = lambert_grid(97, 61, 0b0100_0000);
@@ -462,8 +435,6 @@ fn a_grid_sitting_across_the_projection_seam_is_not_narrowed() {
     }
 }
 
-/// At real HRRR scale, once per regime. The small grids above vary the
-/// geometry; this pins that 1,905,141 points behave like 5,917.
 #[test]
 fn the_window_is_invisible_at_full_hrrr_scale() {
     let lambert = lambert_grid(1799, 1059, 0b0100_0000);

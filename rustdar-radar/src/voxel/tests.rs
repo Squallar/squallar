@@ -7,50 +7,19 @@ use nexrad_model::data::{
 };
 
 // ── Fixtures ────────────────────────────────────────────────────────────
-//
-// Built to *fail* a wrong implementation, per the sampler's own
-// experience: its first mutation pass left 13 survivors and every one was
-// a fixture too tidy to discriminate. So nothing here is symmetric or
-// tidy —
-//
-//  * sweeps arrive high cut first, so a builder trusting collection order
-//    gets the ladder upside down;
-//  * azimuths start away from 0 and wrap through it in collection order;
-//  * the two tilts carry different radial counts (720 super-res below,
-//    360 above), so a test that only ever reads the low tilt proves
-//    nothing about the high one;
-//  * the upper tilt's gates stop short, so range truncation is reachable;
-//  * fields vary along **both** azimuth and range, because a field
-//    constant along range cannot tell a half-cell offset from a correct
-//    one;
-//  * and the boundary fixtures plant a **sharp echo edge** — below
-//    threshold on one side, 65 dBZ on the other — because a fixture where
-//    every voxel has data cannot test the behaviour that motivates the
-//    whole encoding decision. The tests that need one assert that it is
-//    there before relying on it.
 
 const REFL_SCALE: f32 = 2.0;
 const REFL_OFFSET: f32 = 66.0;
-/// Operational super-resolution first-gate *centre*. Nonzero on purpose: a
-/// builder that forgot it is 2 km inward everywhere and still passes any
-/// fixture whose gates start at the origin.
 const FIRST_GATE_M: u16 = 2125;
 const GATE_M: u16 = 250;
 
-/// KTLX, whose feedhorn `eet`'s own test pins at 1275 ft.
 const SITE: (f64, f64) = (35.33306, -97.2775);
-/// The **feedhorn**, 1213 ft of ground plus a 62 ft tower — the datum the
-/// grid subtracts, because the beam heights it places are measured above the
-/// antenna. Written as the sum so that switching the builder back to
-/// `Datum::SiteBase` fails here rather than passing quietly.
 const SITE_ELEV_FT: f64 = 1214.0 + 62.0;
 
 fn encode_refl(dbz: f64) -> u8 {
     ((dbz * f64::from(REFL_SCALE) + f64::from(REFL_OFFSET)).round() as i64).clamp(2, 255) as u8
 }
 
-/// What `encode_refl` round-trips to, so a 0.5 dB quantisation step is not
-/// mistaken for a builder error.
 fn round_trip_refl(dbz: f64) -> f32 {
     (f32::from(encode_refl(dbz)) - REFL_OFFSET) / REFL_SCALE
 }
@@ -59,12 +28,8 @@ fn gate_slant_km(j: usize) -> f64 {
     f64::from(FIRST_GATE_M) / 1000.0 + j as f64 * f64::from(GATE_M) / 1000.0
 }
 
-/// dBZ at an azimuth and slant range, or `None` for below threshold — the
-/// no-data half of every edge in this module.
 type Field<'f> = &'f dyn Fn(f64, f64) -> Option<f64>;
 
-/// One reflectivity sweep, azimuths given explicitly in **collection**
-/// order.
 fn refl_sweep(
     elevation_number: u8,
     elevation_deg: f32,
@@ -112,8 +77,6 @@ fn refl_sweep(
     Sweep::new(elevation_number, radials)
 }
 
-/// One velocity sweep over `field`, m/s through the (2, 129) codec —
-/// the fixture for the fold-guard test, shaped like [`refl_sweep`].
 fn vel_sweep(
     elevation_number: u8,
     elevation_deg: f32,
@@ -164,8 +127,6 @@ fn vel_sweep(
     Sweep::new(elevation_number, radials)
 }
 
-/// Azimuths in collection order: `n` of them, starting at `start` and
-/// wrapping through 0.
 fn wrapped_azimuths(n: usize, start: f64) -> Vec<f32> {
     let step = 360.0 / n as f64;
     (0..n)
@@ -219,14 +180,11 @@ fn vcp(cut_angles: &[f64]) -> VolumeCoveragePattern {
     )
 }
 
-/// The two elevations every fixture below flies, and the numbers the tests
-/// compute expected heights from.
 const LOW_DEG: f32 = 0.53;
 const HIGH_DEG: f32 = 4.47;
 const LOW_GATES: usize = 600; // to 151.9 km slant
 const HIGH_GATES: usize = 200; // stops at 51.9 km — range truncation
 
-/// A two-tilt volume over `field`.
 fn scan_of(field: Field<'_>) -> Scan {
     Scan::new(
         vcp(&[0.5, 4.5]),
@@ -243,16 +201,8 @@ fn scan_of(field: Field<'_>) -> Scan {
     )
 }
 
-/// A two-tilt volume carrying **all six** moments, so the per-product
-/// tests build real populated grids rather than tables in isolation.
-///
-/// Every moment gets its own raw byte per gate through its **own** scale
-/// and offset, which is how a real radial is laid out and is why a builder
-/// that reached for the wrong moment slot reads a plausible number in the
-/// wrong units rather than nothing at all.
 fn six_moment_scan() -> Scan {
-    // (scale, offset) per moment, from the ICD; the same pairs
-    // `no_measurement_encodes_as_the_no_data_index` restates.
+    // (scale, offset) per moment, from the ICD.
     const CODECS: [(f32, f32); 6] = [
         (2.0, 66.0),    // reflectivity
         (2.0, 129.0),   // velocity
@@ -268,41 +218,10 @@ fn six_moment_scan() -> Scan {
             .iter()
             .enumerate()
             .map(|(i, &az)| {
-                // Not constant along range, and a different code in every
-                // moment: a wrong slot is then a wrong number rather than
-                // a lucky match.
                 let moment = |slot: usize| {
                     let (scale, offset) = CODECS[slot];
-                    // The lowest raw code each moment's encoding actually
-                    // carries. Spectrum width shares velocity's (2, 129)
-                    // codec but is non-negative, so the RDA never emits a
-                    // code under 129 for it; a fixture that did would be
-                    // testing the out-of-span clamp rather than the
-                    // builder, and the clamp has its own test.
                     let floor = usize::from(if slot == 2 { 129u8 } else { 2 });
                     let bytes: Vec<u8> = if slot == 1 {
-                        // Velocity is the one slot that cannot be an arbitrary
-                        // byte pattern, because a real consumer *fits* it: the
-                        // SRV and NROT products both seed from
-                        // `velocity::volume_wind_profile`, and
-                        // `nrot::PROFILE_MAX_RMS_MS` now refuses a layer whose
-                        // samples do not describe a wind. The ramp below spans
-                        // ±63 m/s in a sawtooth along the beam — an RMS
-                        // residual of tens of m/s against any VAD — so with it
-                        // in this slot the profile is (correctly) refused, and
-                        // every product that needs one stops building.
-                        //
-                        // So velocity carries an actual VAD field: a uniform
-                        // 21.1 m/s wind, `vr = (u·sin az + v·cos az)·cos el`.
-                        // The wrong-slot trap this fixture exists for is
-                        // untouched — a builder reaching for the velocity slot
-                        // while meaning another moment still reads a number
-                        // that is nothing like the sawtooth its own slot
-                        // carries, and the other five slots keep both their
-                        // per-moment code and their variation along the beam.
-                        // What is given up is only velocity's *range*
-                        // variation, and only because a VAD wind at one
-                        // elevation does not have any.
                         let r = f64::from(az).to_radians();
                         let cos_el = f64::from(elevation_deg).to_radians().cos();
                         let vr = (18.0 * r.sin() + -11.0 * r.cos()) * cos_el;
@@ -353,37 +272,11 @@ fn six_moment_scan() -> Scan {
     )
 }
 
-/// [`six_moment_scan`]'s upper tilt runs to 320 gates — 81.9 km slant, which
-/// at 4.47° the beam puts at **6.78 km** — where [`scan_of`]'s stops at
-/// [`HIGH_GATES`].
-///
-/// Not a free choice, and not the same question [`HIGH_GATES`] answers.
-/// `scan_of` truncates deliberately, at 51.9 km, because range truncation is
-/// one of the things its tests are about. `six_moment_scan` exists so every
-/// product builds a *real* grid, and SRV is a product whose grid does not
-/// exist below a certain height: `srv::bunkers_right_mover_uv` reads its shear
-/// from the 5.5–6.0 km band, and refuses outright when that band is empty.
-///
-/// At [`HIGH_GATES`] this volume reached 4.20 km and that band was empty. It
-/// nevertheless answered, because `WindProfileBuilder::finish` filled every
-/// unfitted layer from the nearest fitted one at any distance — so the shear
-/// was computed between the 4.05 km wind and itself, and SRV built on it.
-/// `nrot::PROFILE_FILL_MAX_LAYERS` stops that, `BUNKERS_MIN_MEAN_LAYERS` and
-/// the empty-band refusal became reachable, and the fixture had to start
-/// sampling the air it was claiming to describe.
 const SIX_MOMENT_HIGH_GATES: usize = 320;
 
-/// Three rungs that all reach 100 km, with reflectivity above threshold on
-/// **exactly one** of them (or none).
-///
-/// The other two carry the moment and report below threshold, so the
-/// ladder still has three rungs — which is the whole point: the question
-/// is what a *measured* layer on one rung does to its neighbours, not what
-/// a one-rung ladder does.
 fn one_rung_carries_data(carrier: Option<usize>) -> Scan {
     let full: Field<'_> = &|_, _| Some(45.0);
     let empty: Field<'_> = &|_, _| None;
-    // Medians deliberately off their nominal cuts, as real ones are.
     let medians = [0.53f32, 2.47, 4.51];
     let sweeps = (0..3)
         .map(|i| {
@@ -399,8 +292,6 @@ fn one_rung_carries_data(carrier: Option<usize>) -> Scan {
     Scan::new(vcp(&[0.5, 2.5, 4.5]), sweeps)
 }
 
-/// A scan whose coverage pattern has no cuts — what a scan reconstructed
-/// from a `RenderInput` looks like.
 fn placeholder_scan() -> Scan {
     Scan::new(
         vcp(&[]),
@@ -426,15 +317,12 @@ fn request(shape: VoxelShape) -> VoxelRequest {
     }
 }
 
-/// A shape with three **different** axes, so a transposed index cannot
-/// pass by accident.
 const ODD: VoxelShape = VoxelShape {
     nx: 11,
     ny: 13,
     nz: 7,
 };
 
-/// Every moment a grid can be built for.
 const SLOTS: [MomentSlot; 6] = [
     MomentSlot::Reflectivity,
     MomentSlot::Velocity,
@@ -444,12 +332,6 @@ const SLOTS: [MomentSlot; 6] = [
     MomentSlot::CorrelationCoefficient,
 ];
 
-/// The products those moments belong to, in the same order.
-///
-/// Use this **only** where the loop is about a Level II *moment* — an
-/// encoding, a slot, a wire codec. Anything that is about a *product* —
-/// a table, a profile, an isosurface, a round trip — must loop over
-/// [`VOLUME_PRODUCTS`], which is three entries longer.
 const SAMPLABLE: [RadarProduct; 6] = [
     RadarProduct::Reflectivity,
     RadarProduct::Velocity,
@@ -459,25 +341,12 @@ const SAMPLABLE: [RadarProduct; 6] = [
     RadarProduct::CorrelationCoefficient,
 ];
 
-/// The three products the vertical views **derive** rather than sample.
 const DERIVED: [RadarProduct; 3] = [
     RadarProduct::StormRelativeVelocity,
     RadarProduct::NormalizedRotation,
     RadarProduct::SpecificDifferentialPhase,
 ];
 
-/// Every product a voxel grid can be built for: the six native moments
-/// then the three derivations.
-///
-/// This constant exists because of the exact defect it now closes. The
-/// commit that admitted SRV, NROT and KDP to every 3D surface — LUT
-/// profile, isosurface shape, isosurface default, cache keys, UI gates —
-/// left every product loop in this module at the six natives, so three
-/// products shipped with no table coverage, no profile coverage and no
-/// isosurface coverage whatsoever. NROT then shipped rendering 8 033 of
-/// 8 039 painted voxels at alpha 2–4 of 180, and nothing went red.
-/// [`the_product_loops_cover_every_product_the_vertical_views_admit`]
-/// makes the next such admission fail here before it can ship.
 const VOLUME_PRODUCTS: [RadarProduct; 9] = [
     RadarProduct::Reflectivity,
     RadarProduct::Velocity,
@@ -490,28 +359,10 @@ const VOLUME_PRODUCTS: [RadarProduct; 9] = [
     RadarProduct::SpecificDifferentialPhase,
 ];
 
-/// The ramp a product's colour table is built over, keyed by **product**
-/// — which is what [`build_voxels`] itself does.
-///
-/// The old spelling, `value_range_for(samplable(product).unwrap())`, could
-/// not answer for a derivation at all: it panics on all three, and two of
-/// them carry their own spans ([`data_levels_for`]) rather than their
-/// source slot's. NROT borrows the velocity slot and spans ±4 unitless
-/// where velocity spans ±63.5 m/s; a test that reached for the slot's
-/// range would be measuring a table nothing builds.
 fn ramp_of(product: RadarProduct) -> (f32, f32) {
     value_range_for_product(product, crate::derive::volume_slot(product).unwrap())
 }
 
-/// The product loops in this module cover **everything** the vertical
-/// views admit — the guard that makes widening the product set impossible
-/// to do quietly.
-///
-/// `derive::volume_slot` is the single predicate every vertical view gates
-/// on (the 3D pane, the section pane, the volume-alpha editor, the grid
-/// builder itself). If a product joins that set without joining
-/// [`VOLUME_PRODUCTS`], it renders in the app and is exercised by nothing
-/// here, which is precisely the state SRV, NROT and KDP shipped in.
 #[test]
 fn the_product_loops_cover_every_product_the_vertical_views_admit() {
     let admitted: Vec<RadarProduct> = RadarProduct::all()
@@ -529,8 +380,6 @@ fn the_product_loops_cover_every_product_the_vertical_views_admit() {
              product that renders in a vertical view is covered by no product \
              loop in this module",
     );
-    // And the two halves really are a partition, so `SAMPLABLE` cannot be
-    // quietly re-pointed at the whole set and the distinction lost.
     for product in SAMPLABLE {
         assert!(samplable(product).is_some(), "{}", product.name());
     }
@@ -566,25 +415,15 @@ fn every_named_shape_fits_the_texture_budget() {
     }
 }
 
-/// The module doc's memory table, as arithmetic rather than as prose.
 #[test]
 fn the_named_shapes_cost_what_the_module_doc_says() {
     const MIB: usize = 1024 * 1024;
     assert_eq!(WASM_SHAPE.cells(), MIB, "wasm: 1 MiB of indices");
     assert_eq!(MOBILE_SHAPE.cells(), 3_538_944, "mobile: 3.375 MiB");
     assert_eq!(DESKTOP_SHAPE.cells(), 8 * MIB, "desktop: 8 MiB");
-    // The value plane is four times the index plane, which is what makes
-    // the desktop grid 40 MiB rather than 8.
     assert_eq!(DESKTOP_SHAPE.cells() * 4, 32 * MIB);
 }
 
-/// wasm gets the small budget, everything else the large one, and the
-/// **mobile** tier is deliberately unreachable from here — see the module
-/// doc.
-///
-/// Asked at the WebGL2 guarantee, where [`shape_for_budget`] answers the
-/// shape the tier shipped, so this stays a test about the `cfg` cascade
-/// rather than about the rebalance.
 #[test]
 fn default_shape_is_the_targets() {
     const GUARANTEE: usize = 256;
@@ -604,26 +443,14 @@ fn default_shape_is_the_targets() {
 }
 
 // ── The rebalance ───────────────────────────────────────────────────────
-//
-// The adapter limits every sweep below runs: the WebGL2 guarantee, the two
-// powers of two either side of it, the 704 an unaligned reading of the
-// desktop budget lands on, and a modern desktop's real report.
 const REPORTED_LIMITS: [usize; 5] = [256, 512, 704, 1024, 2048];
 
-/// Every tier, and the shipped shape that is both its budget and its
-/// baseline.
 const TIERS: [(&str, VoxelShape); 3] = [
     ("wasm", WASM_SHAPE),
     ("mobile", MOBILE_SHAPE),
     ("desktop", DESKTOP_SHAPE),
 ];
 
-/// The table in [`shape_for_budget`]'s doc, as arithmetic.
-///
-/// A generous adapter, so what is pinned is the rule rather than a clamp.
-/// The kilometre figures are over the 920.25 km box a WSR-88D's
-/// reflectivity reach earns, which is the box a 3D pane frames by default,
-/// and they are the whole point of the change: they are what a reader sees.
 #[test]
 fn the_rebalanced_shapes_are_the_ones_the_rule_documents() {
     const RING_KM: f64 = 920.25;
@@ -683,17 +510,6 @@ fn the_rebalanced_shapes_are_the_ones_the_rule_documents() {
     }
 }
 
-/// **The invariant the whole change rests on**: rearranging the cells is
-/// free because there are never more of them.
-///
-/// Stated over every tier and every adapter limit rather than over the
-/// three shipped answers, because the shape is a runtime value now and the
-/// three are only the rows a particular machine lands on. This is what
-/// makes the rebalance safe with no memory query anywhere: a shape that
-/// spent more than its tier's budget would be the Android overrun again,
-/// and the frontend's own re-expression of this
-/// (`the_requested_shape_never_outgrows_the_budget_it_was_computed_against`)
-/// is what ties it to the allocations that budget actually pays for.
 #[test]
 fn a_rebalanced_shape_never_outgrows_the_budget_it_came_from() {
     for (name, shipped) in TIERS {
@@ -711,14 +527,6 @@ fn a_rebalanced_shape_never_outgrows_the_budget_it_came_from() {
     }
 }
 
-/// A device is never handed an axis it did not say it could hold.
-///
-/// The runtime half of what `constants.rs`'s const assert used to do for
-/// every shape at compile time. That assert survives on the floor shape,
-/// which is still a compile-time constant; this is the guard for
-/// everything above it, and it is the reason [`MAX_AXIS`] could be widened
-/// off the GLES 3.0 guarantee without any device being asked for more than
-/// it reports.
 #[test]
 fn every_axis_stays_within_the_limit_the_device_reported() {
     for (name, shipped) in TIERS {
@@ -733,19 +541,10 @@ fn every_axis_stays_within_the_limit_the_device_reported() {
             }
         }
     }
-    // And the arithmetic bound still binds when the device claims more
-    // than the grid codec can represent.
     let huge = shape_for_budget(DESKTOP_SHAPE, usize::MAX);
     assert!(huge.is_supported(), "{huge:?}");
 }
 
-/// The horizontal lands on the copy alignment, so the staging ring pads
-/// nothing.
-///
-/// The frontend owns the derivation of the 64 — see
-/// `the_horizontal_axis_multiple_is_the_copy_alignment_in_cells`, which is
-/// the only place `wgpu` is in scope to state it — and this is the half
-/// that says the rule actually obeys it.
 #[test]
 fn the_horizontal_axis_is_a_multiple_of_the_copy_alignment() {
     for (name, shipped) in TIERS {
@@ -762,20 +561,10 @@ fn the_horizontal_axis_is_a_multiple_of_the_copy_alignment() {
             assert_eq!(got.nx, got.ny, "{name} at a {limit} limit");
         }
     }
-    // A device below one whole step of alignment takes what it can hold
-    // rather than nothing at all: `PlaneLayout` pads the rows.
     assert_eq!(shape_for_budget(DESKTOP_SHAPE, 32).nx, 32);
     assert_eq!(shape_for_budget(DESKTOP_SHAPE, 0).nx, 1);
 }
 
-/// Nothing regresses on a device that reports exactly the guarantee — and
-/// it falls out of the rule rather than being special-cased.
-///
-/// The desktop tier at 256 is the shape that shipped, axis for axis. Both
-/// arms of the two-step rule agree there, which is why the no-regression
-/// fallback cannot break this: at the guarantee the horizontal is pinned
-/// by the device rather than by the vertical, so there is nothing for the
-/// second step to change.
 #[test]
 fn a_conservative_adapter_gets_the_shape_that_shipped() {
     assert_eq!(shape_for_budget(DESKTOP_SHAPE, 256), DESKTOP_SHAPE);
@@ -787,10 +576,6 @@ fn a_conservative_adapter_gets_the_shape_that_shipped() {
             nz: 128
         },
     );
-    // The wasm tier's own conservative answer, which is what a browser
-    // reporting the bare guarantee gets. Not the shipped 128×128×64: the
-    // budget buys a 256 axis at `NZ_MIN` and the guarantee is exactly 256,
-    // so the web gains here rather than merely holding.
     assert_eq!(
         shape_for_budget(WASM_SHAPE, 256),
         VoxelShape {
@@ -799,18 +584,9 @@ fn a_conservative_adapter_gets_the_shape_that_shipped() {
             nz: 16
         },
     );
-    // A browser below the guarantee — non-conformant, but the grid must
-    // still be one it can hold — degrades to exactly what it shipped.
     assert_eq!(shape_for_budget(WASM_SHAPE, 128), WASM_SHAPE);
 }
 
-/// The deeper vertical is taken only where it *buys* horizontal.
-///
-/// Both halves matter. The two large tiers gain on both axes at once and
-/// take [`NZ_PREFERRED`]. The web cannot: 32 layers cap its horizontal at
-/// 181 cells, which rounds to the 128 it already had — and the box that
-/// axis must now cover has grown by √2, so the tie in cells is a
-/// coarsening in kilometres. It falls back to [`NZ_MIN`] and reaches 256.
 #[test]
 fn the_deeper_vertical_is_taken_only_where_it_buys_horizontal() {
     for (name, shipped) in [("mobile", MOBILE_SHAPE), ("desktop", DESKTOP_SHAPE)] {
@@ -833,8 +609,6 @@ fn the_deeper_vertical_is_taken_only_where_it_buys_horizontal() {
         web.nx > WASM_SHAPE.nx,
         "the fallback has to be the arm that gains: {web:?}",
     );
-    // Why it falls back, rather than merely that it does: the preferred
-    // arm ties on the horizontal, and a tie is not a gain.
     let free = (WASM_SHAPE.cells() / NZ_PREFERRED).isqrt();
     assert_eq!(free, 181, "32 layers leave the web 181 cells across");
     assert_eq!(
@@ -844,25 +618,14 @@ fn the_deeper_vertical_is_taken_only_where_it_buys_horizontal() {
     );
 }
 
-/// [`NZ_MIN`] and [`NZ_PREFERRED`] are the rungs the beam picks out, not
-/// two numbers that looked about right.
-///
-/// The measure is the share of the 460.125 km ring's **area** over which a
-/// vertical cell is still finer than the 0.95° beam is deep. Below 16 the
-/// loss accelerates — that is the floor. Above 32 it has stopped paying —
-/// that is the preference. Every figure in [`NZ_PREFERRED`]'s table.
 #[test]
 fn the_vertical_rungs_are_the_ones_the_beam_justifies() {
-    /// One-degree-ish: the 0.95° beamwidth in radians, which is the depth
-    /// of the beam per kilometre of range.
     const BEAM: f64 = 0.95_f64 * std::f64::consts::PI / 180.0;
     const REACH_KM: f64 = 460.125;
     const SPAN_KM: f64 = DEFAULT_TOP_KM_MSL - DEFAULT_BASE_KM_MSL;
 
     let honest_share = |nz: usize| {
         let cell_km = SPAN_KM / nz as f64;
-        // Beyond this range the beam is deeper than the cell, so the grid
-        // is no longer claiming more than the radar measured.
         let from_km = cell_km / BEAM;
         1.0 - (from_km / REACH_KM).powi(2)
     };
@@ -881,10 +644,6 @@ fn the_vertical_rungs_are_the_ones_the_beam_justifies() {
         );
     }
 
-    // Every halving costs exactly four times the one above it — the lost
-    // area goes as the square of the honest radius, which goes as the cell
-    // — so the ratio cannot be what picks a rung out. What picks the floor
-    // out is where four times becomes a tenth of the picture.
     let below = 1.0 - honest_share(8);
     let at = 1.0 - honest_share(NZ_MIN);
     assert!(
@@ -897,9 +656,6 @@ fn the_vertical_rungs_are_the_ones_the_beam_justifies() {
          it loses a tenth of the region ({below}) where it loses a \
          fortieth ({at})",
     );
-    // And the preference is where the returns stop: doubling again costs
-    // the same √2 of horizontal everywhere and buys under half a point of
-    // area.
     let beyond = honest_share(64) - honest_share(NZ_PREFERRED);
     assert!(
         beyond < 0.005,
@@ -908,13 +664,6 @@ fn the_vertical_rungs_are_the_ones_the_beam_justifies() {
     );
 }
 
-/// Both arms of the `cfg` cascade, from a host that compiles only one of
-/// them.
-///
-/// The test above can only ever check the arm it was built for, so the
-/// wasm arm's *content* would otherwise be checked by nothing that runs —
-/// mutation testing found precisely that hole. See
-/// [`default_shape_for`]'s doc.
 #[test]
 fn both_target_classes_get_their_own_default_shape() {
     assert_eq!(default_shape_for(true), WASM_SHAPE);
@@ -922,22 +671,9 @@ fn both_target_classes_get_their_own_default_shape() {
     assert_ne!(default_shape_for(true), default_shape_for(false));
 }
 
-/// The bound this crate owns is the **wire and the arithmetic** one, and
-/// this is where it is tested.
-///
-/// It used to assert 257 was refused, because [`MAX_AXIS`] was the GLES 3.0
-/// guarantee and this crate was the keeper of it. That was two bounds
-/// wearing one name. The device guarantee moved to the frontend, where the
-/// adapter that reports it lives — see
-/// `a_shape_derived_for_a_device_at_the_guarantee_stays_within_it` — and
-/// what is left here is the only bound `rustdar-radar` can actually check:
-/// the largest axis whose cube cannot overflow a 32-bit `usize`. Neither
-/// test was dropped; each went where its subject went.
 #[test]
 fn an_axis_outside_the_arithmetic_bound_is_refused() {
     let scan = scan_of(&|_, _| Some(40.0));
-    // Each axis independently, in both directions, so a guard that checks
-    // only one of the three survives none of these.
     for bad in [
         VoxelShape { nx: 0, ..ODD },
         VoxelShape { ny: 0, ..ODD },
@@ -977,11 +713,6 @@ fn an_axis_outside_the_arithmetic_bound_is_refused() {
     );
 }
 
-/// [`MAX_AXIS`] is the search it says it is, and the search is right.
-///
-/// Both sides, because a bound that is merely *safe* would pass a check
-/// against overflow alone: 1625 has to fit and 1626 has to not. In `u128`,
-/// so the test cannot overflow the thing it is testing on a 32-bit host.
 #[test]
 fn the_arithmetic_bound_is_the_largest_cubable_axis() {
     assert_eq!(MAX_AXIS, 1625);
@@ -996,21 +727,11 @@ fn the_arithmetic_bound_is_the_largest_cubable_axis() {
         "{}³ fits too, so the bound is not the largest",
         MAX_AXIS + 1,
     );
-    // The wire that carries a *request* is a `u16` per axis
-    // (`rustdar_worker::offload::encode_voxel_request`), so the bound has
-    // to fit one or the encoder would truncate a shape this crate accepts.
     assert!(u16::try_from(MAX_AXIS).is_ok());
 }
 
 // ── Refusals ────────────────────────────────────────────────────────────
 
-/// Two refusal kinds, distinguished on purpose. The integrals and the
-/// classification have **no per-tilt field at all** — `derive::volume_slot`
-/// refuses them on any volume. The derived products (SRV, NROT, KDP) have
-/// one, but this fixture is reflectivity-only, so their derivation finds
-/// no source moment and refuses **this volume** — the same products build
-/// real grids on a velocity/ΦDP-carrying volume, which
-/// `derive::tests::a_derived_voxel_grid_resamples_the_derived_field` pins.
 #[test]
 fn a_product_with_no_native_moment_is_refused() {
     let scan = scan_of(&|_, _| Some(40.0));
@@ -1049,9 +770,6 @@ fn a_product_with_no_native_moment_is_refused() {
     }
 }
 
-/// The refusal that keeps a render worker from silently building a
-/// different ladder from the main thread's. Until WP-D carries the cut
-/// angles on the wire, this is the only thing standing between the two.
 #[test]
 fn a_placeholder_coverage_pattern_is_refused() {
     let scan = placeholder_scan();
@@ -1063,8 +781,6 @@ fn a_non_finite_number_anywhere_is_refused() {
     let scan = scan_of(&|_, _| Some(40.0));
     let base = request(ODD);
     for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-        // Every scalar independently: a guard covering six of the seven
-        // survives whichever one it missed.
         let cases = [
             VoxelRequest {
                 half_extent_km: Some(HalfExtentKm::square(bad)),
@@ -1118,24 +834,11 @@ fn a_top_at_or_below_the_base_is_refused() {
     assert!(build_voxels(&scan, &req, SITE.0, SITE.1).is_some());
 }
 
-/// A zoom control that runs out of travel should stop, not fail — so the
-/// half-extent clamps where everything else refuses.
-///
-/// The rectangular rows carry the part a square one cannot see: the upper stop
-/// is on the box's **corner**, and it is taken by scaling both axes by one
-/// factor. Clamping each axis on its own would answer a 450 × 200 km ask with
-/// 332 × 200 — a box of a different aspect ratio from the viewport that framed
-/// it, which is a silently wrong picture rather than a stopped zoom.
 #[test]
 fn the_half_width_is_clamped_rather_than_refused() {
     let scan = scan_of(&|_, _| Some(40.0));
-    // `MAX_HALF_DIAGONAL_KM / hypot(600, 300)` — the one factor both axes of
-    // the last row take, written out so the row is a number rather than the
-    // rule restated. The rule itself is asserted as a property below the loop.
-    //
-    // The row moved from 450 × 200 when the box became circumscribed: that
-    // corner is 492.4 km, which cleared the old 470 km bound and clears the new
-    // 664.68 km one by more, so it stopped exercising the scaling at all.
+    // `MAX_HALF_DIAGONAL_KM / hypot(600, 300)` — the factor both axes of the
+    // last row take. The rule itself is asserted as a property below the loop.
     const SCALE: f64 = 0.9908470001860922;
     for (asked, want) in [
         (
@@ -1155,7 +858,6 @@ fn the_half_width_is_clamped_rather_than_refused() {
             HalfExtentKm::square(10_000.0),
             HalfExtentKm::square(MAX_HALF_WIDTH_KM),
         ),
-        // Well inside the corner bound: honoured as asked, on both axes.
         (
             HalfExtentKm {
                 east_km: 200.0,
@@ -1166,8 +868,6 @@ fn the_half_width_is_clamped_rather_than_refused() {
                 north_km: 80.0,
             },
         ),
-        // One axis under the floor. The other is not touched, so the floor is
-        // per axis and not a squaring in disguise.
         (
             HalfExtentKm {
                 east_km: 4.0,
@@ -1178,10 +878,6 @@ fn the_half_width_is_clamped_rather_than_refused() {
                 north_km: 100.0,
             },
         ),
-        // The corner — 670.8 km — is over the bound while *neither* side is:
-        // 600 is under MAX_HALF_WIDTH_KM's 470 and 300 is nowhere near it. Both
-        // axes come back scaled by the same factor, so the 2:1 shape survives
-        // the stop.
         (
             HalfExtentKm {
                 east_km: 600.0,
@@ -1210,8 +906,6 @@ fn the_half_width_is_clamped_rather_than_refused() {
         );
     }
 
-    // And what the last row's numbers *are*: the corner lands exactly on the
-    // bound, and the shape it landed with is the shape that was asked for.
     let over = HalfExtentKm {
         east_km: 600.0,
         north_km: 300.0,
@@ -1230,20 +924,6 @@ fn the_half_width_is_clamped_rather_than_refused() {
     );
 }
 
-/// The cap circumscribes the widest ring the plan view will draw, and is
-/// **not** `MAX_EXTENT_KM` itself.
-///
-/// The equality it used to assert — `MAX_HALF_DIAGONAL_KM == MAX_EXTENT_KM` —
-/// was the *inscribed* box's coupling: hold the corner inside the reach the
-/// raster projects, and the raster can always be laid under the box. The box is
-/// circumscribed now, so it reaches past the ring at the corners on purpose, and
-/// that equality would squash a 920.25 km ask to 664.68 km — the caption reading
-/// `665 × 665 km box` for a 920 km region, on the first frame.
-///
-/// Restoring the old equality therefore means deleting this reasoning, which is
-/// why the reasoning is asserted rather than the number: the two constants are
-/// still bound in *definition* so they cannot drift, and decoupled in *value* so
-/// the plan view's own cap is not dragged along behind the volume's.
 #[test]
 fn the_cap_circumscribes_the_widest_ring_rather_than_fitting_inside_it() {
     assert!(
@@ -1260,13 +940,10 @@ fn the_cap_circumscribes_the_widest_ring_rather_than_fitting_inside_it() {
          squashes the very box it exists to admit, and drift-proof because it \
          is still derived from it",
     );
-    // Which lands the square cap exactly on the plan view's, because a
-    // circumscribed box's half-width *is* its reach.
     assert!(
         (MAX_HALF_WIDTH_KM - crate::types::MAX_EXTENT_KM).abs() < 1e-9,
         "the square cap must be 470.00 km, got {MAX_HALF_WIDTH_KM}",
     );
-    // The widest honest reach clears it by the 9.9 km `MAX_EXTENT_KM` cites.
     assert!(
         (MAX_HALF_WIDTH_KM - 460.125 - 9.875).abs() < 1e-9,
         "the margin over the widest real surveillance cut moved",
@@ -1282,15 +959,6 @@ fn the_cap_circumscribes_the_widest_ring_rather_than_fitting_inside_it() {
 
 // ── The box's own extent ────────────────────────────────────────────────
 
-/// Two cuts of 1832 super-resolution gates — a WSR-88D surveillance sweep's
-/// own 460.125 km — over `field`.
-///
-/// Both cuts are low (0.53° and 1.51°) and both reach the full range, which is
-/// what a split-cut VCP's surveillance halves do and what a column past 230 km
-/// needs to be *sampled* rather than merely inside the box: the sampler
-/// interpolates between bracketing rungs and extrapolates past neither, so a
-/// fixture whose upper cut left the 18 km box before the range under test
-/// would prove nothing about the box's width.
 const SURVEILLANCE_GATES: usize = 1832;
 
 fn long_range_scan(field: Field<'_>) -> Scan {
@@ -1315,20 +983,6 @@ fn long_range_scan(field: Field<'_>) -> Scan {
     )
 }
 
-/// The box is the smallest square that holds the whole of the data's own range
-/// circle, floored and capped.
-///
-/// The circumscribed rule is the whole policy, so it is pinned as the geometric
-/// property rather than as the constant it works out to: a half-width equal to
-/// the reach is exactly the one whose **sides** are tangent to the data circle.
-/// One kilometre narrower and the ring's north, south, east and west extremes
-/// are cut off the picture — which is the crop the user rejected outright, in
-/// those words:
-///
-/// > That region (the selector OR the radar's ring) must never change.
-///
-/// The corners it buys are 21.5% permanently empty, and that is the stated
-/// price rather than an oversight.
 #[test]
 fn the_box_is_the_smallest_square_holding_the_datas_range_circle() {
     for reach in [120.0f64, 300.0, 460.125] {
@@ -1347,15 +1001,6 @@ fn the_box_is_the_smallest_square_holding_the_datas_range_circle() {
     );
 }
 
-/// The two ends of the rule, and the one input that has no honest answer.
-///
-/// The cap is the plan view's own arithmetic guard read through this
-/// geometry, so a mis-framed radial claiming sixty thousand gates widens the
-/// box no further than it zooms the raster out. The floor is the resampler's
-/// narrowest box. A reach that is `NaN` or non-positive is not a reach at all
-/// and answers the box that has always been drawn, because `clamp` propagates
-/// `NaN` and a `NaN` half-width would make every cell of the grid unplaceable
-/// with nothing to report it.
 #[test]
 fn the_box_stops_at_both_ends_and_refuses_to_guess_from_no_reach() {
     assert_eq!(box_half_width_km(60_000.0), MAX_HALF_WIDTH_KM);
@@ -1376,21 +1021,9 @@ fn the_box_stops_at_both_ends_and_refuses_to_guess_from_no_reach() {
     }
 }
 
-/// The reach is the **volume's** longest cut, over the ground, not the first
-/// sweep's and not a slant range.
-///
-/// Both halves matter and both are silent. A maximum over one sweep would
-/// size the box to whichever cut the decoder happened to hand over first — on
-/// a real split cut that is a 300 km Doppler half beside a 460 km
-/// surveillance one, and the box would crop the taller sweep it is also
-/// resampling. A slant range would size the box by a ruler the sampler does
-/// not use: its columns are asked for ground ranges, so a steep cut's reach
-/// has to be shortened by the same `cos e` its gates are.
 #[test]
 fn the_reach_is_the_volumes_longest_cut_measured_over_the_ground() {
     let field = &|_: f64, _: f64| Some(30.0);
-    // The long cut is the *second* sweep in collection order, so a reach
-    // taken from the first is 51.9 km rather than 151.9.
     let scan = scan_of(field);
     let reach = volume_reach_km(&scan, RadarProduct::Reflectivity);
     let low_slant = gate_slant_km(LOW_GATES);
@@ -1404,8 +1037,6 @@ fn the_reach_is_the_volumes_longest_cut_measured_over_the_ground() {
          {reach} against {low_slant}",
     );
 
-    // A product the volume does not carry reaches nowhere, which is what
-    // sends the box to its fallback rather than to a 20 km box.
     assert_eq!(volume_reach_km(&scan, RadarProduct::Velocity), 0.0);
     assert_eq!(
         box_half_width_km(volume_reach_km(&scan, RadarProduct::Velocity)),
@@ -1413,16 +1044,6 @@ fn the_reach_is_the_volumes_longest_cut_measured_over_the_ground() {
     );
 }
 
-/// **A long-range volume's box holds echo the fixed 230 km box cut off.**
-///
-/// The user-facing half of the whole change, and the assertion is on the
-/// echo rather than on the width: a beacon 280 km north of the site — inside
-/// a surveillance cut's 460 km reach, on the plan view beside the pane, and
-/// 50 km outside the box this resampler used to build — is resampled into
-/// cells that carry its dBZ.
-///
-/// The old box is the control, in the same test and on the same volume, so
-/// the pin cannot pass by the beacon being somewhere both boxes reach.
 #[test]
 fn a_long_range_volumes_box_holds_the_echo_the_fixed_box_cut_off() {
     const BEACON_KM: (f64, f64) = (0.0, 280.0);
@@ -1448,7 +1069,6 @@ fn a_long_range_volumes_box_holds_the_echo_the_fixed_box_cut_off() {
          is meant to be inside ({y0} .. {y1} km)",
     );
 
-    // Cells carrying the beacon's own 55 dBZ, and where their centres are.
     let cut = grid.value_to_index(50.0).max(1);
     let shape = grid.shape();
     let mut lit = 0usize;
@@ -1471,7 +1091,6 @@ fn a_long_range_volumes_box_holds_the_echo_the_fixed_box_cut_off() {
          farthest at {farthest:.1} km",
     );
 
-    // The control: the box this resampler used to build, on the same volume.
     let fixed = VoxelRequest {
         half_extent_km: Some(HalfExtentKm::square(BASE_HALF_WIDTH_KM)),
         ..following
@@ -1490,16 +1109,6 @@ fn a_long_range_volumes_box_holds_the_echo_the_fixed_box_cut_off() {
     );
 }
 
-/// **A short-range volume's box tightens onto its data instead of padding
-/// it.**
-///
-/// The other direction of the same rule, and the reason it is worth
-/// following per volume rather than pinning at a constant. A Doppler-only
-/// volume reaching 88.9 km used to be resampled into the same 460 km box as a
-/// continent-wide surveillance cut, with four fifths of every axis holding
-/// nothing. Following the reach spends the same cells over the ground the
-/// radar actually looked at — and the cells get *finer*, which is the
-/// opposite of what widening the reflectivity box costs.
 #[test]
 fn a_short_range_volumes_box_tightens_onto_its_data() {
     const GATES: usize = 347; // 2.125 + 86.75 = 88.875 km of slant range
@@ -1542,11 +1151,8 @@ fn a_short_range_volumes_box_tightens_onto_its_data() {
 
 // ── Orientation and cell centres ────────────────────────────────────────
 
-/// x east, y north, z up — pinned with a quadrant field, on a shape whose
-/// three axes are all different so a transposed index cannot pass.
 #[test]
 fn the_grid_is_indexed_x_east_y_north_z_up() {
-    // 60 dBZ strictly inside the north-east quadrant, 15 elsewhere.
     let scan = scan_of(&|az, _| {
         Some(if (0.0..90.0).contains(&az) {
             60.0
@@ -1559,10 +1165,6 @@ fn the_grid_is_indexed_x_east_y_north_z_up() {
         ny: 23,
         nz: 5,
     };
-    // The corner columns below sit at 43.7 km ground range, where the two
-    // rungs bracket 0.517 … 3.529 km above the antenna. Rows are 1 km
-    // apart from 1.0 km MSL, so row 1 (1.63 km over the antenna) is inside
-    // the bracket and row 4 (4.63 km) is over the top of it.
     let req = VoxelRequest {
         half_extent_km: Some(HalfExtentKm::square(40.0)),
         base_km_msl: 0.5,
@@ -1571,8 +1173,6 @@ fn the_grid_is_indexed_x_east_y_north_z_up() {
     };
     let grid = build_voxels(&scan, &req, SITE.0, SITE.1).unwrap();
 
-    // Corner columns, well away from the quadrant boundaries: their
-    // azimuths are 44.2°, 135.8°, 224.2° and 315.8°.
     let iz = 1;
     let (west, east) = (2, shape.nx - 3);
     let (south, north) = (2, shape.ny - 3);
@@ -1593,19 +1193,12 @@ fn the_grid_is_indexed_x_east_y_north_z_up() {
         );
     }
 
-    // And z is up: the top row of the box is above the 4.47° beam at these
-    // ranges, so nothing may be extrapolated into it.
     assert_eq!(
         grid.index_at(east, north, shape.nz - 1),
         Some(NO_DATA_INDEX),
     );
 
     // ── and on a box that is not square ──────────────────────────────
-    //
-    // Everything above passes with the two half-extents exchanged, because a
-    // quadrant field is a function of sign alone and the box was symmetric.
-    // 60 km east against 25 km north is the case that separates them: the
-    // ranges have to be the extents they were given, each on its own axis.
     let rect = HalfExtentKm {
         east_km: 60.0,
         north_km: 25.0,
@@ -1618,9 +1211,6 @@ fn the_grid_is_indexed_x_east_y_north_z_up() {
     assert_eq!(grid.x_range_km(), (-60.0, 60.0));
     assert_eq!(grid.y_range_km(), (-25.0, 25.0));
 
-    // The same four corner columns, now at 49.7 km ground range and azimuths
-    // 66.8°, 293.2°, 113.2° and 246.8° — still one per quadrant, and still
-    // bracketed by the two rungs at row 1.
     let strong = grid.value_at(east, north, iz).unwrap();
     assert!(
         (strong - round_trip_refl(60.0)).abs() < 0.05,
@@ -1641,21 +1231,14 @@ fn the_grid_is_indexed_x_east_y_north_z_up() {
     }
 }
 
-/// Cell centres at the half-step, proved by a field that **varies along
-/// range**: a builder sampling the cell's edge reads a different dBZ, and
-/// a builder sampling a constant field could not tell.
 #[test]
 fn cell_centres_sit_at_the_half_step() {
-    // dBZ that names the ground range it was read at.
     let scan = scan_of(&|_, slant| Some(20.0 + beam::ground_range_km(slant, f64::from(LOW_DEG))));
     let shape = VoxelShape {
         nx: 2,
         ny: 1,
         nz: 3,
     };
-    // At 20 km ground range the two rungs bracket 0.209 … 1.587 km over
-    // the antenna, so rows at 0.7 / 1.1 / 1.5 km MSL — 0.33 / 0.73 /
-    // 1.13 km over it — all sit inside.
     let req = VoxelRequest {
         half_extent_km: Some(HalfExtentKm::square(40.0)),
         base_km_msl: 0.5,
@@ -1664,8 +1247,6 @@ fn cell_centres_sit_at_the_half_step() {
     };
     let grid = build_voxels(&scan, &req, SITE.0, SITE.1).unwrap();
 
-    // Two columns over an 80 km span: centres at −20 and +20 km east, both
-    // on the y = 0 line. Ground range 20 km, not 0 and not 40.
     assert_eq!(
         grid.cell_centre_km(0, 0, 0).map(|c| (c.0, c.1)),
         Some((-20.0, 0.0)),
@@ -1688,13 +1269,6 @@ fn cell_centres_sit_at_the_half_step() {
     }
 
     // ── and on a box that is not square ──────────────────────────────
-    //
-    // The half-step above is the same number on both axes, so it cannot see
-    // which extent each axis took. 40 km east against 10 km north makes them
-    // different: the four columns sit at ±20 east and ±5 north, and an extent
-    // read off the wrong axis puts them at ±5 east and ±20 north instead —
-    // 20.6 km of ground range either way, so the *values* agree and only the
-    // centres disagree.
     let shape = VoxelShape {
         nx: 2,
         ny: 2,
@@ -1719,9 +1293,6 @@ fn cell_centres_sit_at_the_half_step() {
         Some((20.0, 5.0)),
     );
 
-    // 20.6155 km of ground range at every one of the four columns, and the
-    // rungs bracket 0.216 … 1.637 km over the antenna there, so all three
-    // rows are still inside.
     let want = round_trip_refl(20.0 + 20.0f64.hypot(5.0));
     for ix in 0..2 {
         for iy in 0..2 {
@@ -1737,16 +1308,8 @@ fn cell_centres_sit_at_the_half_step() {
     }
 }
 
-/// The vertical axis is MSL and the site's own elevation is subtracted
-/// exactly once.
-///
-/// KTLX's feedhorn stands at 1275 ft — 0.3886 km — which is 7 rows of this
-/// grid. A
-/// builder that skipped the subtraction, or applied it with the wrong
-/// sign, moves the lowest row with data by 7 or 14 rows.
 #[test]
 fn the_height_axis_is_msl_above_the_sites_own_elevation() {
-    // The radars this renders against; there are none until a test asks.
     crate::sites::fixture::install();
     let scan = scan_of(&|_, _| Some(35.0));
     let nz = 240;
@@ -1784,13 +1347,9 @@ fn the_height_axis_is_msl_above_the_sites_own_elevation() {
     );
 }
 
-/// The box may be centred away from the radar, and the ranges it reports
-/// stay measured **from the site** — which is what lets a renderer place
-/// the box knowing only `site`.
 #[test]
 fn the_centre_may_sit_away_from_the_site() {
     let scan = scan_of(&|_, _| Some(30.0));
-    // ~50 km due east of KTLX, on the crate's own degree.
     let east_lon = SITE.1 + 50.0 / (rustdar_geo::KM_PER_DEGREE_LAT * SITE.0.to_radians().cos());
     let req = VoxelRequest {
         centre: (SITE.0, east_lon),
@@ -1811,23 +1370,11 @@ fn the_centre_may_sit_away_from_the_site() {
     );
     assert_eq!(grid.site(), SITE);
 
-    // A box centred on the site itself lands exactly on zero, with no
-    // rounding drift out of the polar round trip.
     let centred = build_voxels(&scan, &request(ODD), SITE.0, SITE.1).unwrap();
     assert_eq!(centred.x_range_km(), (-60.0, 60.0));
     assert_eq!(centred.y_range_km(), (-60.0, 60.0));
 }
 
-/// Every number a renderer builds its model matrix from, asserted
-/// together.
-///
-/// The six range bounds plus the site are the whole contract of the
-/// output: a renderer reading them is not allowed to look anything else
-/// up, so an accessor quietly returning the wrong pair would put the
-/// volume somewhere else on screen with nothing else disagreeing.
-/// Mutation testing found `z_range_km_msl` and the height half of
-/// `cell_centre_km` unasserted for exactly that reason — the horizontal
-/// axes were covered and the vertical one was not.
 #[test]
 fn the_output_carries_everything_a_model_matrix_needs() {
     let scan = scan_of(&|_, _| Some(35.0));
@@ -1851,9 +1398,6 @@ fn the_output_carries_everything_a_model_matrix_needs() {
              under the bottom of them",
     );
 
-    // Cell centres on all three axes at once, at the half-step, at both
-    // ends — a fencepost error moves the corner cells and leaves the
-    // middle alone.
     let (dx, dy, dz) = (75.0 / 11.0, 75.0 / 13.0, 14.5 / 7.0);
     let close = |got: Option<(f64, f64, f64)>, want: (f64, f64, f64)| {
         let g = got.expect("inside the grid");
@@ -1872,8 +1416,6 @@ fn the_output_carries_everything_a_model_matrix_needs() {
         grid.cell_centre_km(10, 12, 6),
         (37.5 - dx / 2.0, 37.5 - dy / 2.0, 15.25 - dz / 2.0),
     );
-    // And each axis's bound independently, so a guard covering two of the
-    // three survives neither.
     assert_eq!(grid.cell_centre_km(11, 0, 0), None);
     assert_eq!(grid.cell_centre_km(0, 13, 0), None);
     assert_eq!(grid.cell_centre_km(0, 0, 7), None);
@@ -1881,8 +1423,6 @@ fn the_output_carries_everything_a_model_matrix_needs() {
     assert_eq!(grid.value_at(0, 0, 7), None);
 }
 
-/// The ladder the grid was resampled from travels with it, because the
-/// sampler does not cross the worker boundary and the grid does.
 #[test]
 fn the_grid_reports_the_ladder_it_was_built_from() {
     let scan = scan_of(&|_, _| Some(35.0));
@@ -1893,25 +1433,13 @@ fn the_grid_reports_the_ladder_it_was_built_from() {
         "0.53° and 4.47° are 3.94° apart; reported {}",
         grid.widest_tilt_gap_deg(),
     );
-    // Which is a wide enough gap to be worth warning about: at 60 km a
-    // 3.94° step is over 4 km of unmeasured height.
     assert!(grid.widest_tilt_gap_deg() > 3.0);
 
-    // And it is the sampler's own answer, not a recount.
     let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
     assert_eq!(grid.tilt_count(), sampler.tilt_count());
     assert_eq!(grid.widest_tilt_gap_deg(), sampler.widest_tilt_gap_deg());
 }
 
-/// A one-rung ladder is the degenerate case, and it fabricates **nothing**.
-///
-/// A single beam has no vertical extent to interpolate over, so
-/// `Column::at_height_km` answers only at exactly that beam's height —
-/// which no cell centre lands on — and the grid comes back empty. That is
-/// the right answer and the opposite of the plan's risk 2: the danger with
-/// a short ladder is a smooth layer that is not there, and one rung cannot
-/// draw one. The grid still builds, and says why through
-/// [`VoxelGrid::tilt_count`].
 #[test]
 fn a_single_tilt_volume_fills_nothing_rather_than_smearing_one_beam() {
     let scan = Scan::new(
@@ -1931,34 +1459,18 @@ fn a_single_tilt_volume_fills_nothing_rather_than_smearing_one_beam() {
         grid.indices().iter().all(|&i| i == NO_DATA_INDEX),
         "one rung has no vertical extent, so nothing may be filled in",
     );
-    // The same volume with a second cut *does* fill, so the emptiness
-    // above is the ladder's doing and not a broken fixture.
     let two = scan_of(&|_, _| Some(50.0));
     let filled = build_voxels(&two, &request(ODD), SITE.0, SITE.1).unwrap();
     assert!(filled.indices().iter().any(|&i| i != NO_DATA_INDEX));
 }
 
-/// **Vertical detail belongs to the tilt ladder, not to `nz`.**
-///
-/// WP-B measured this on a cross-section; a voxel grid inherits it exactly,
-/// because both go through `Column::at_height_km`, whose `blend` returns
-/// the **nearest** rung the moment its bracket partner has no value. So a
-/// measured layer on one rung is painted out to the half-weight midpoint on
-/// each side, and a layer that falls between rungs is painted nowhere.
-///
-/// Both are pinned here in the grid's own units, on a 200-row box whose
-/// rows are 60 m apart — a resolution 58× finer than the band the ladder
-/// actually resolves, which is the point.
 #[test]
 fn a_layer_is_quantised_to_the_ladder_rather_than_to_nz() {
-    // The radars this renders against; there are none until a test asks.
     crate::sites::fixture::install();
     let nz = 200;
     let (base_km_msl, top_km_msl) = (0.0, 12.0);
     let dz = (top_km_msl - base_km_msl) / nz as f64;
     let shape = VoxelShape { nx: 2, ny: 1, nz };
-    // Half-width 200 km with two columns puts their centres at ±100 km
-    // east on the y = 0 line — WP-B's own range.
     let req = VoxelRequest {
         half_extent_km: Some(HalfExtentKm::square(200.0)),
         base_km_msl,
@@ -1997,7 +1509,6 @@ fn a_layer_is_quantised_to_the_ladder_rather_than_to_nz() {
              km); got {last}",
     );
 
-    // The fabricated thickness, as a number. One tilt, 3.48 km of band.
     assert!(
         ((last - first) - 3.48).abs() < 0.1,
         "one rung paints a {} km band at 100 km on this ladder",
@@ -2022,14 +1533,8 @@ fn a_layer_is_quantised_to_the_ladder_rather_than_to_nz() {
 
 // ── The builder adds no geometry of its own ─────────────────────────────
 
-/// Every cell is the sampler's own answer at that cell's coordinates.
-///
-/// The guard against this module quietly growing a second copy of the beam
-/// geometry: the coordinates below are written out longhand rather than
-/// through `axis_centre`, so the two spellings have to agree.
 #[test]
 fn every_cell_is_the_samplers_own_answer() {
-    // The radars this renders against; there are none until a test asks.
     crate::sites::fixture::install();
     let scan = scan_of(&|az, slant| (az < 200.0).then_some(10.0 + (slant % 37.0) + az / 12.0));
     let shape = VoxelShape {
@@ -2075,8 +1580,6 @@ fn every_cell_is_the_samplers_own_answer() {
             }
         }
     }
-    // Both halves of the comparison have to be exercised, or the loop
-    // above proves only that empty grids match empty grids.
     assert!(
         with_data > 0 && with_data < shape.cells(),
         "precondition: the fixture must produce both data and no-data \
@@ -2085,8 +1588,6 @@ fn every_cell_is_the_samplers_own_answer() {
     );
 }
 
-/// Nothing is filled in above the highest tilt, below the lowest, or past
-/// the last gate — the volume's shell is no-data, not extrapolated.
 #[test]
 fn nothing_is_extrapolated_outside_the_ladder() {
     let scan = scan_of(&|_, _| Some(45.0));
@@ -2095,8 +1596,6 @@ fn nothing_is_extrapolated_outside_the_ladder() {
         ny: 3,
         nz: 40,
     };
-    // A box reaching well past the low tilt's last gate (151.9 km slant)
-    // and well above the high tilt's beam.
     let req = VoxelRequest {
         half_extent_km: Some(HalfExtentKm::square(220.0)),
         base_km_msl: 0.0,
@@ -2105,22 +1604,17 @@ fn nothing_is_extrapolated_outside_the_ladder() {
     };
     let grid = build_voxels(&scan, &req, SITE.0, SITE.1).unwrap();
 
-    // Over the site every beam centre is at zero height, so the whole
-    // column above the ground is above the volume — the cone of silence,
-    // reported rather than invented.
     let centre = (shape.nx / 2, shape.ny / 2);
     assert!(
         (0..shape.nz).all(|iz| grid.index_at(centre.0, centre.1, iz) == Some(NO_DATA_INDEX)),
         "the cone of silence must stay empty",
     );
 
-    // The corner column sits at 220·√2 = 311 km, past every gate.
     assert!(
         (0..shape.nz).all(|iz| grid.index_at(0, 0, iz) == Some(NO_DATA_INDEX)),
         "311 km is past the last gate of both tilts",
     );
 
-    // The top of the box is over the 4.47° beam everywhere in it.
     let top = shape.nz - 1;
     assert!(
         (0..shape.nx)
@@ -2128,7 +1622,6 @@ fn nothing_is_extrapolated_outside_the_ladder() {
         "25 km MSL is above the highest tilt at every range in this box",
     );
 
-    // And the fixture is not simply empty.
     assert!(
         grid.indices().iter().any(|&i| i != NO_DATA_INDEX),
         "precondition: something in this grid must have data, or the \
@@ -2153,13 +1646,9 @@ fn the_value_plane_is_absent_unless_asked_for() {
     let full = build_voxels(&scan, &request(ODD), SITE.0, SITE.1).unwrap();
     assert_eq!(full.values().map(<[f32]>::len), Some(ODD.cells()));
     assert_eq!(full.memory_bytes(), ODD.cells() * 5 + LUT_LEN);
-    // Same indices either way: the value plane is a copy, not a different
-    // resample.
     assert_eq!(lean.indices(), full.indices());
 }
 
-/// The two planes say the same thing about every cell: `NaN` exactly where
-/// the index is [`NO_DATA_INDEX`], and never one without the other.
 #[test]
 fn the_two_planes_agree_cell_for_cell() {
     let scan = scan_of(&|az, slant| (az < 140.0 && slant < 80.0).then_some(52.0));
@@ -2185,9 +1674,6 @@ fn the_two_planes_agree_cell_for_cell() {
 
 // ── Equality and Debug ──────────────────────────────────────────────────
 
-/// The reason `PartialEq` is hand-written: the value plane is mostly
-/// `NaN`, and a derived one would make a grid unequal to a byte-identical
-/// copy of itself.
 #[test]
 fn two_identical_grids_compare_equal_through_the_nan_value_plane() {
     let scan = scan_of(&|az, _| (az < 90.0).then_some(48.0));
@@ -2201,7 +1687,6 @@ fn two_identical_grids_compare_equal_through_the_nan_value_plane() {
     );
     assert_eq!(a, b);
     assert_eq!(a, a.clone());
-    // The derive's behaviour, shown rather than described.
     assert!(
         !a.values()
             .unwrap()
@@ -2212,7 +1697,6 @@ fn two_identical_grids_compare_equal_through_the_nan_value_plane() {
              exactly what `#[derive(PartialEq)]` would have used",
     );
 
-    // And it still discriminates: a different box is a different grid.
     let moved = VoxelRequest {
         half_extent_km: Some(HalfExtentKm::square(61.0)),
         ..request(ODD)
@@ -2225,14 +1709,6 @@ fn two_identical_grids_compare_equal_through_the_nan_value_plane() {
     assert_ne!(a, build_voxels(&scan, &lean, SITE.0, SITE.1).unwrap());
 }
 
-/// A grid built by hand, so the equality tests can vary **one** field.
-///
-/// Every field before the value plane in `eq`'s `&&` chain short-circuits,
-/// and the index plane is a quantisation of the value plane — so a pair
-/// built from two different scans differs on `indices` and never reaches
-/// the value comparison at all. Mutation testing found all three of
-/// `same_values`' arms unreachable from `build_voxels` alone for exactly
-/// that reason.
 fn hand_built(values: Option<Vec<f32>>) -> VoxelGrid {
     let value_range = value_range_for(MomentSlot::Reflectivity);
     VoxelGrid {
@@ -2255,16 +1731,12 @@ fn hand_built(values: Option<Vec<f32>>) -> VoxelGrid {
     }
 }
 
-/// The value plane is compared **bitwise**, its length counts, and having
-/// no plane at all is a state of its own.
 #[test]
 fn the_value_plane_is_compared_bit_for_bit_and_its_absence_is_a_state() {
     let nan = f32::NAN;
     let a = hand_built(Some(vec![nan, -20.0, 45.0, 62.5]));
     assert_eq!(a, hand_built(Some(vec![nan, -20.0, 45.0, 62.5])));
 
-    // Same index plane, different values — the pair `build_voxels` cannot
-    // produce.
     let different = hand_built(Some(vec![nan, -20.0, 45.25, 62.5]));
     assert_eq!(
         a.indices(),
@@ -2274,11 +1746,8 @@ fn the_value_plane_is_compared_bit_for_bit_and_its_absence_is_a_state() {
     );
     assert_ne!(a, different, "a different value plane is a different grid");
 
-    // A shorter plane is a different payload, not a prefix match.
     assert_ne!(a, hand_built(Some(vec![nan, -20.0, 45.0])));
 
-    // Bitwise: two NaNs with different payloads are two different
-    // payloads, even though neither equals itself as a float.
     let other_nan = hand_built(Some(vec![
         f32::from_bits(nan.to_bits() ^ 1),
         -20.0,
@@ -2288,15 +1757,11 @@ fn the_value_plane_is_compared_bit_for_bit_and_its_absence_is_a_state() {
     assert!(other_nan.values().unwrap()[0].is_nan());
     assert_ne!(a, other_nan);
 
-    // No plane at all: equal to another grid with none, unequal to one
-    // with a plane, in both directions.
     assert_eq!(hand_built(None), hand_built(None));
     assert_ne!(a, hand_built(None));
     assert_ne!(hand_built(None), a);
 }
 
-/// `Debug` is a summary, for the reason the sampler's is: `assert_eq!`
-/// reaches for it on failure, and the derive would print 8 MiB.
 #[test]
 fn debug_is_a_summary_rather_than_the_grid() {
     let scan = scan_of(&|az, _| (az < 90.0).then_some(48.0));
@@ -2307,9 +1772,6 @@ fn debug_is_a_summary_rather_than_the_grid() {
     assert!(text.contains("ref"), "{text}");
     assert!(text.contains("11x13x7"), "{text}");
 
-    // The fill count is what two grids most often differ by, so it is the
-    // one number in the summary worth checking rather than merely
-    // formatting. Counted here rather than trusted.
     let filled = grid
         .indices()
         .iter()
@@ -2336,8 +1798,6 @@ fn debug_is_a_summary_rather_than_the_grid() {
 
 // ── The ramp ────────────────────────────────────────────────────────────
 
-/// Affine, and exact both ways for all 255 data indices of all six
-/// moments.
 #[test]
 fn the_ramp_is_affine_and_round_trips_every_data_index() {
     for slot in SLOTS {
@@ -2351,9 +1811,6 @@ fn the_ramp_is_affine_and_round_trips_every_data_index() {
                 "{slot:?} index {index} -> {value} -> {}",
                 ramp_index(range, value),
             );
-            // Affine: the gap to the entry below is one step everywhere,
-            // including across index 1 — which is what makes filtering
-            // within data exactly linear interpolation of the value.
             let below = ramp_value(range, index - 1);
             assert!(
                 (f64::from(value - below) - step).abs() < step * 1e-4,
@@ -2365,17 +1822,6 @@ fn the_ramp_is_affine_and_round_trips_every_data_index() {
     }
 }
 
-/// Index 0 is **below** the moment's lowest data level, not on it — so a
-/// real measurement can never read as an absence.
-///
-/// Index 1 is compared to within a ten-thousandth of a step rather than
-/// exactly, because `value_range` is `f32` and reconstructing
-/// `(lo − step) + step` cancels: ΦDP's bottom level comes back as 1.2e−7
-/// instead of 0. That is four decimal orders below the 1.4° step and eight
-/// below the span, and the round trip through
-/// [`ramp_index`] is still exact — which
-/// `the_ramp_is_affine_and_round_trips_every_data_index` pins separately,
-/// so nothing here is being waved through.
 #[test]
 fn index_zero_is_one_step_below_the_bottom_data_level() {
     for slot in SLOTS {
@@ -2398,8 +1844,6 @@ fn index_zero_is_one_step_below_the_bottom_data_level() {
                  ({lo})",
             range.0,
         );
-        // And by a whole step, not by a rounding crumb — that is what
-        // keeps a real measurement off the no-data index.
         assert!(
             (f64::from(lo) - f64::from(range.0) - step).abs() < step * 1e-4,
             "{slot:?}: index 0 must sit one full step ({step}) below {lo}, \
@@ -2409,12 +1853,6 @@ fn index_zero_is_one_step_below_the_bottom_data_level() {
     }
 }
 
-/// Every raw code of every moment's Level II encoding lands on a data
-/// index, inside the declared span.
-///
-/// The encodings are written out here rather than read from a fixture:
-/// they are the ICD's, they are what `data_levels` was derived from, and
-/// restating them is the only way this test can disagree with the table.
 #[test]
 fn no_measurement_encodes_as_the_no_data_index() {
     // (slot, scale, offset) for the 8-bit moments; ΦDP is 16-bit and is
@@ -2431,8 +1869,6 @@ fn no_measurement_encodes_as_the_no_data_index() {
         let (lo, hi) = data_levels(slot);
         for code in 2..=255u32 {
             let value = ((code as f32) - offset) / scale;
-            // Spectrum width shares velocity's encoding but is
-            // non-negative; its negative half is not a measurement.
             if slot == MomentSlot::SpectrumWidth && value < 0.0 {
                 continue;
             }
@@ -2448,15 +1884,11 @@ fn no_measurement_encodes_as_the_no_data_index() {
             );
         }
     }
-    // ΦDP over its whole turn, at a resolution finer than its 16-bit
-    // encoding's 1/2.8361 of a degree.
     let range = value_range_for(MomentSlot::DifferentialPhase);
     for step in 0..=3600 {
         let value = step as f32 / 10.0;
         assert_ne!(ramp_index(range, value), NO_DATA_INDEX, "PhiDP {value}");
     }
-    // And the clamp has teeth: something off either end still lands on a
-    // data index rather than being silently reclassified as absent.
     let refl = value_range_for(MomentSlot::Reflectivity);
     assert_eq!(ramp_index(refl, -1000.0), 1);
     assert_eq!(ramp_index(refl, 1000.0), 255);
@@ -2465,26 +1897,10 @@ fn no_measurement_encodes_as_the_no_data_index() {
     }
 }
 
-/// A value outside the declared span clamps to the nearest **data** level
-/// — never to the no-data index — and the value plane keeps the number the
-/// radar actually reported.
-///
-/// Found by a fixture that wrote spectrum-width raw codes under 129. The
-/// RDA does not emit those: spectrum width shares velocity's `(2, 129)`
-/// codec, so codes 2…128 decode to a *negative* width, which is not a
-/// measurement, and the ICD's defined range for the moment is 0…63 m/s.
-/// So the case is unreachable from valid Level II — but it is reachable
-/// from a malformed file, and the two planes then say different things
-/// about the same cell **on purpose**: the index plane must land on the
-/// ramp, and the value plane must not launder a bad number into a
-/// plausible one. The one visible consequence is that such a cell paints
-/// the palette's 0 m/s grey where the plan view paints it transparent,
-/// which is one index out of 256 on data that should not exist.
 #[test]
 fn a_value_outside_the_declared_span_clamps_to_the_nearest_data_level() {
     let range = value_range_for(MomentSlot::SpectrumWidth);
     let (lo, hi) = data_levels(MomentSlot::SpectrumWidth);
-    // A raw code of 5 through spectrum width's codec.
     let impossible = (5.0 - 129.0) / 2.0;
     assert!(impossible < lo, "precondition: {impossible} is under {lo}");
     assert_eq!(
@@ -2493,8 +1909,6 @@ fn a_value_outside_the_declared_span_clamps_to_the_nearest_data_level() {
         "an under-range value takes the bottom data level, not no-data",
     );
     assert_eq!(ramp_index(range, hi + 100.0), 255);
-    // And the same on the other five moments, so the clamp is not a
-    // spectrum-width special case.
     for slot in SLOTS {
         let range = value_range_for(slot);
         let (lo, hi) = data_levels(slot);
@@ -2503,8 +1917,6 @@ fn a_value_outside_the_declared_span_clamps_to_the_nearest_data_level() {
     }
 }
 
-/// Four of the six steps land exactly on the moment's own quantum, and the
-/// two that do not are recorded rather than rounded away.
 #[test]
 fn the_declared_steps_are_measured() {
     let step = |slot| {
@@ -2519,21 +1931,12 @@ fn the_declared_steps_are_measured() {
         0.0625,
         "1/16 dB"
     );
-    // Marginally coarser than their encodings, and far finer than a viewer
-    // can distinguish. Pinned so a change to either span is noticed.
     assert!((step(MomentSlot::DifferentialPhase) - 1.417_32).abs() < 1e-5);
     assert!((step(MomentSlot::CorrelationCoefficient) - 0.003_385_8).abs() < 1e-7);
 }
 
 // ── The colour table ────────────────────────────────────────────────────
 
-/// All nine products build, all nine carry a full table, and all nine
-/// come back with data in them — the end-to-end check the single-moment
-/// fixtures cannot make.
-///
-/// Nine, not six: the three derivations run through `derive::prepare`
-/// inside `build_voxels`, so a derivation that stopped producing a field
-/// would surface here as an empty grid rather than in the app.
 #[test]
 fn every_volume_product_builds_a_populated_grid_and_a_full_table() {
     assert_eq!(LUT_LEN, 1024);
@@ -2560,8 +1963,6 @@ fn every_volume_product_builds_a_populated_grid_and_a_full_table() {
                  would be vacuous",
             product.name(),
         );
-        // Every value sits inside the declared span, which is what makes
-        // the quantisation declared rather than hoped for.
         let (lo, hi) = grid.value_range();
         for value in grid.values().unwrap().iter().filter(|v| v.is_finite()) {
             assert!(
@@ -2573,10 +1974,6 @@ fn every_volume_product_builds_a_populated_grid_and_a_full_table() {
     }
 }
 
-/// The no-data entry is fully transparent for **every** product — forced,
-/// not inherited, because four of the six palettes hand back an opaque
-/// colour at the bottom of their ramp and an opaque no-data index paints
-/// the entire outside of the volume.
 #[test]
 fn the_no_data_entry_is_transparent_for_every_product() {
     for product in VOLUME_PRODUCTS {
@@ -2589,8 +1986,6 @@ fn the_no_data_entry_is_transparent_for_every_product() {
             product.name(),
         );
     }
-    // The precondition that makes the forcing necessary rather than
-    // decorative: these four palettes are opaque at the ramp's bottom.
     for product in [
         RadarProduct::Velocity,
         RadarProduct::DifferentialReflectivity,
@@ -2609,13 +2004,8 @@ fn the_no_data_entry_is_transparent_for_every_product() {
     }
 }
 
-/// The table comes from `get_color_for_value`, not from
-/// `LegendScale::thresholds`. Four things that would break, each shown.
 #[test]
 fn the_table_is_the_palette_function_not_its_stops() {
-    // 1. `extract_scale` filters non-finite stops, so ZDR's NEG_INFINITY
-    //    floor — the stop colouring everything under −2 dB — is absent
-    //    from `thresholds` entirely.
     let zdr = get_legend_scale(RadarProduct::DifferentialReflectivity);
     assert!(
         zdr.thresholds.iter().all(|(v, _)| *v >= -2.0),
@@ -2624,11 +2014,8 @@ fn the_table_is_the_palette_function_not_its_stops() {
     );
     let range = value_range_for(MomentSlot::DifferentialReflectivity);
     let lut = colormap_lut(RadarProduct::DifferentialReflectivity, range);
-    // Index 1 is −7.875 dB, well under the lowest surviving stop.
     assert_eq!(&lut[4..8], &[66, 66, 66, 180], "ZDR's floor colour");
 
-    // 2. The per-product transparency floor lives only in the function:
-    //    reflectivity under 0 dBZ is transparent, and no stop says so.
     let refl_range = value_range_for(MomentSlot::Reflectivity);
     let refl = colormap_lut(RadarProduct::Reflectivity, refl_range);
     let below_zero = ramp_index(refl_range, -0.5);
@@ -2643,8 +2030,6 @@ fn the_table_is_the_palette_function_not_its_stops() {
              table built from them would paint everything under it opaque",
     );
 
-    // 3. Velocity's stops are in mph in two separate tables; the function
-    //    is the only thing that knows the input is m/s.
     let vel_range = value_range_for(MomentSlot::Velocity);
     let vel = colormap_lut(RadarProduct::Velocity, vel_range);
     let inbound = usize::from(ramp_index(vel_range, -30.0)) * 4;
@@ -2656,10 +2041,6 @@ fn the_table_is_the_palette_function_not_its_stops() {
         &vel[outbound..outbound + 4],
     );
 
-    // 4. Every entry is exactly the function's answer: the colour
-    //    verbatim, the alpha scaled by the product's own 3D transparency
-    //    profile — and by nothing else, so the profile can only ever make
-    //    an entry *more* transparent than its plan-view colour.
     for product in VOLUME_PRODUCTS {
         let range = ramp_of(product);
         let lut = colormap_lut(product, range);
@@ -2684,8 +2065,6 @@ fn the_table_is_the_palette_function_not_its_stops() {
     }
 }
 
-/// A non-gradient scale's table must be consumed `NEAREST`, or a blend
-/// names a step the scale does not define.
 #[test]
 fn the_table_filter_is_nearest_only_for_a_non_gradient_scale() {
     let scan = six_moment_scan();
@@ -2707,9 +2086,6 @@ fn the_table_filter_is_nearest_only_for_a_non_gradient_scale() {
             "the filter is derived from the scale, never stored",
         );
     }
-    // The rule exists for the categorical case, which the sampler refuses
-    // — stated here so the reason survives if spectrum width's scale ever
-    // becomes a gradient.
     assert_eq!(
         samplable(RadarProduct::HydrometeorClassification),
         None,
@@ -2721,9 +2097,6 @@ fn the_table_filter_is_nearest_only_for_a_non_gradient_scale() {
 
 // ── The boundary, which is the whole point of the encoding ──────────────
 
-/// What a `Linear` fetch of an `R8Unorm` texture returns between two
-/// texels: the hardware normalises each to [0, 1], interpolates, and hands
-/// back a float, which the shader scales by 255 to index the table.
 fn fetched_index(a: u8, b: u8, t: f64) -> f64 {
     f64::from(a) * (1.0 - t) + f64::from(b) * t
 }
@@ -2736,18 +2109,8 @@ fn alpha_at(lut: &[u8], index: f64) -> u8 {
     lut[(index.round() as usize).min(255) * 4 + 3]
 }
 
-/// **The test the encoding decision exists for.** A sharp echo edge, and
-/// the filtered result across it — fading out rather than jumping to an
-/// opaque middle.
-///
-/// The comparison is against the *rejected* encoding, computed here rather
-/// than described, because "bottom-of-ramp is better" is only a claim
-/// until both are evaluated over the same edge.
 #[test]
 fn an_echo_edge_fades_instead_of_fabricating_a_mid_value() {
-    // A 65 dBZ core with a hard azimuthal and radial edge: outside it the
-    // radar looked and saw nothing (raw code 0, below threshold), which is
-    // no-data, not a low value.
     let scan = scan_of(&|az, slant| {
         ((40.0..80.0).contains(&az) && (20.0..50.0).contains(&slant)).then_some(65.0)
     });
@@ -2765,9 +2128,6 @@ fn an_echo_edge_fades_instead_of_fabricating_a_mid_value() {
     let grid = build_voxels(&scan, &req, SITE.0, SITE.1).unwrap();
     let range = grid.value_range();
 
-    // Find a real edge in the built grid: two x-adjacent cells, one with
-    // data and one without. A fixture where every voxel has data cannot
-    // test this at all, which is why the field above has an edge in it.
     let mut edge = None;
     for iz in 0..shape.nz {
         for iy in 0..shape.ny {
@@ -2782,8 +2142,7 @@ fn an_echo_edge_fades_instead_of_fabricating_a_mid_value() {
     }
     let (data, empty) = edge.expect("the fixture must contain a strong echo edge");
     assert_eq!(empty, NO_DATA_INDEX);
-    // Measured, so the numbers below are numbers and not a description:
-    // the 65 dBZ core resamples to index 195 exactly, which is
+    // The 65 dBZ core resamples to index 195 exactly, which is
     // −32.5 + 195 × 0.5.
     assert_eq!((data, grid.index_to_value(data)), (195, 65.0));
 
@@ -2821,15 +2180,9 @@ fn an_echo_edge_fades_instead_of_fabricating_a_mid_value() {
         "the fade should be a real fraction of the edge, not a rounding \
              artefact; reached transparency only at t={faded_at}",
     );
-    // Measured: index 195 × (1 − t) drops to 64 — the top of the
-    // transparent band, −0.5 dBZ — at t = 43/64, so the last third of the
-    // way to the empty neighbour is already invisible.
     assert_eq!(faded_at, 43.0 / 64.0);
 
     // ── the rejected encoding: index 0 out of band ──
-    //
-    // Data indices 1..=255 span the palette's own 0..95 dBZ and 0 means
-    // "no data", off the ramp. Same edge, same filter.
     let (oob_lo, oob_hi) = (0.0f64, 95.0f64);
     let oob_value = |index: f64| oob_lo + (index - 1.0) / 254.0 * (oob_hi - oob_lo);
     let oob_data = (1.0 + (data_value - oob_lo) / (oob_hi - oob_lo) * 254.0).round();
@@ -2840,7 +2193,6 @@ fn an_echo_edge_fades_instead_of_fabricating_a_mid_value() {
         "the rejected encoding is supposed to fabricate a mid-dBZ shell; \
              halfway across the edge it reads {fabricated} dBZ",
     );
-    // Fully opaque, because that index is an ordinary data index.
     assert_ne!(
         get_color_for_value(RadarProduct::Reflectivity, fabricated as f32).3,
         0,
@@ -2848,7 +2200,6 @@ fn an_echo_edge_fades_instead_of_fabricating_a_mid_value() {
              fetched index, and {fabricated} dBZ is a perfectly ordinary echo",
     );
 
-    // Ours, at the same place on the same edge.
     let ours_half = ramp_value_at(range, fetched_index(data, empty, 0.5));
     assert!(
         ours_half < fabricated - 10.0,
@@ -2857,8 +2208,6 @@ fn an_echo_edge_fades_instead_of_fabricating_a_mid_value() {
              {fabricated} dBZ",
     );
 
-    // The whole comparison as three numbers, so a change to any of them
-    // is a change to the decision rather than to a wording.
     assert_eq!(
         (
             (data_value * 100.0).round(),
@@ -2873,41 +2222,12 @@ fn an_echo_edge_fades_instead_of_fabricating_a_mid_value() {
     );
 }
 
-/// **What the shipped encoding actually costs the five non-fading
-/// moments, measured rather than argued.**
-///
-/// The module doc used to claim bottom-of-ramp was "strictly better" than
-/// an out-of-band index for every moment, on the reasoning that an opaque
-/// *end-of-ramp* colour beats an opaque *mid-ramp* one. **That reasoning
-/// is wrong for a bidirectional or centred palette**, and this test is why
-/// the claim was corrected: for velocity and ZDR the out-of-band ramp's
-/// midpoint *is* the palette's neutral, while our ramp's bottom is its
-/// saturated extreme — so the shipped encoding paints the **more**
-/// alarming halo, not the less.
-///
-/// Each row is a half-edge fetch: a plausible echo value adjacent to
-/// nothing, filtered at `t = 0.5`, decoded under both encodings.
-///
-/// The out-of-band ramp is data indices 1..=255 over the **palette's own**
-/// range, with 0 reserved off it. Spanning the palette rather than the
-/// moment's physical range is what an out-of-band design would actually
-/// do, and the distinction is the whole comparison: widening below the
-/// palette floor is *our* construction's requirement — index 0 has to be a
-/// value — and an encoding that reserves 0 has no such need. Over the same
-/// span the two are the identical mapping for every `i >= 1`, so comparing
-/// them there would measure nothing.
-///
-/// Shipping bottom-of-ramp is still right — the out-of-band ramp cannot
-/// represent the moment's floor at all, so it clamps real measurements
-/// outside the palette range — but the honest summary is "no worse, and a
-/// wash or slightly worse per moment", not "strictly better".
 #[test]
 fn the_half_edge_costs_of_both_encodings_are_measured_per_moment() {
     let rows: Vec<(&str, f64, f64)> = SLOTS
         .iter()
         .zip(SAMPLABLE)
         .map(|(&slot, product)| {
-            // A plausible echo for the moment, at a hard edge.
             let echo: f32 = match slot {
                 MomentSlot::Reflectivity => 65.0,
                 MomentSlot::Velocity => 30.0,
@@ -2922,7 +2242,6 @@ fn the_half_edge_costs_of_both_encodings_are_measured_per_moment() {
                 fetched_index(ramp_index(range, echo), NO_DATA_INDEX, 0.5),
             );
 
-            // The rejected encoding, over the palette's own range.
             let legend = get_legend_scale(product);
             let (lo, hi) = (f64::from(legend.min_value), f64::from(legend.max_value));
             let oob_index = (1.0 + (f64::from(echo) - lo) / (hi - lo) * 254.0).round();
@@ -2937,35 +2256,16 @@ fn the_half_edge_costs_of_both_encodings_are_measured_per_moment() {
     assert_eq!(
         rows,
         vec![
-            // Reflectivity: unambiguously better, and the only moment with
-            // a transparent band to fade into.
             ("ref", 16.25, 32.352),
-            // Velocity: ours is a −17 m/s *inbound* shell around every
-            // outbound couplet edge; the out-of-band ramp's midpoint is
-            // near zero, which the palette paints dark.
             ("vel", -17.0, -3.119),
-            // Spectrum width and ΦDP: a wash, sub-metre and sub-degree.
             ("sw", 1.875, 1.985),
-            // ZDR: ours saturates the negative extreme, theirs sits near
-            // the neutral 0 dB.
             ("zdr", -3.219, -0.258),
             ("phi", 29.055, 29.203),
-            // ρHV: ours paints a 0.588 shell — squarely in the
-            // debris/non-meteorological band — around every echo edge and
-            // around the whole volume boundary.
             ("rho", 0.588, 0.714),
         ],
         "half-edge fetch, shipped vs out-of-band, per moment",
     );
 
-    // When this table was first measured, all five non-reflectivity
-    // moments were fully opaque at every data entry — the half-edge fetch
-    // painted at full strength, and the measurement's conclusion was that
-    // WP-I had to supply the fade itself. It now has: every moment's table
-    // carries either a transparent band (shaped to its own physics by
-    // `volume_alpha_scale`) or a flat translucency (ΦDP), so the wrong
-    // colours tabulated above land at reduced or zero alpha wherever the
-    // profile says the value is background.
     for (slot, product) in SLOTS.iter().zip(SAMPLABLE) {
         if product == RadarProduct::Reflectivity {
             continue;
@@ -2986,17 +2286,6 @@ fn the_half_edge_costs_of_both_encodings_are_measured_per_moment() {
     }
 }
 
-/// How wide the **bottom** fade is, per product — the number that anchors
-/// the march's skip threshold.
-///
-/// **Recorded, not asserted to be large**, because since the per-product
-/// transparency profiles landed this is no longer the number that decides
-/// drawability — [`VoxelGrid::clear_indices`] is. A diverging moment's
-/// see-through band sits mid-ramp, so its bottom band is honestly 0: the
-/// ramp's bottom is its saturated extreme and must stay opaque. Only the
-/// two moments whose *floor* is background — reflectivity (palette's own
-/// quarter-ramp fade) and spectrum width (the profile's laminar-flow
-/// fade) — have one.
 #[test]
 fn the_fade_band_is_measured_per_product() {
     let scan = six_moment_scan();
@@ -3012,34 +2301,19 @@ fn the_fade_band_is_measured_per_product() {
     assert_eq!(
         measured,
         vec![
-            // −32.5 … −0.5 dBZ is transparent: a quarter of the ramp.
             ("ref", 64),
-            // The ramp's bottom is −64 m/s, the strongest inbound air —
-            // velocity's see-through band is mid-ramp, measured by
-            // `the_default_transparency_profile_is_measured_per_product`.
             ("vel", 0),
-            // 0 … 2 m/s: the profile's laminar-flow floor.
             ("sw", 9),
-            // Bottom = −7.9 dB, a saturated hail extreme: opaque.
             ("zdr", 0),
-            // Flat translucency, no transparent band at all.
             ("phi", 0),
-            // Bottom = lowest ρHV, the most non-meteorological: opaque.
             ("rho", 0),
-            // Bottom = −63.5 m/s of storm-relative inbound: opaque, for
-            // velocity's reason.
             ("srv", 0),
-            // Bottom = −4, an extreme anticyclonic couplet: opaque.
             ("nrot", 0),
-            // 0 … 0.25 °/km, under the estimator's own significance —
-            // KDP's span starts below zero, so the band covers the
-            // negative half of the display clamp as well.
             ("kdp", 50),
         ],
         "the fade band per product",
     );
 
-    // What that means for reflectivity, in the units that matter.
     let grid = build_voxels(&scan, &request(ODD), SITE.0, SITE.1).unwrap();
     assert_eq!(
         grid.index_to_value(grid.fade_band()),
@@ -3051,9 +2325,6 @@ fn the_fade_band_is_measured_per_product() {
         "a quarter of the whole ramp",
     );
 
-    // The two ends of the measurement, which no product's palette reaches
-    // and only a hand-built table can: a table opaque from index 1 has no
-    // band, and one transparent throughout fades over the whole ramp.
     let mut opaque = hand_built(None);
     opaque.lut = vec![255; LUT_LEN];
     opaque.lut[3] = 0;
@@ -3063,13 +2334,6 @@ fn the_fade_band_is_measured_per_product() {
     assert_eq!(clear.fade_band(), u8::MAX);
 }
 
-/// The per-product 3D transparency profile, pinned at physical landmarks.
-///
-/// Each row is a rationale made testable: the value named is *why* the
-/// profile has its shape, so a change to any constant in
-/// `volume_alpha_profile` fails here with the physics in the message
-/// rather than as an index diff. The last block is the drawability
-/// measurement the renderer's solid-block gate reads.
 #[test]
 fn the_default_transparency_profile_is_measured_per_product() {
     let alpha = |product: RadarProduct, value: f32| {
@@ -3077,9 +2341,6 @@ fn the_default_transparency_profile_is_measured_per_product() {
         let lut = colormap_lut(product, range);
         lut[usize::from(ramp_index(range, value)) * 4 + 3]
     };
-    // "Solid" means the palette's own plan-view alpha, verbatim — several
-    // 2D palettes are themselves translucent in places, and the profile
-    // may only scale them down, never up.
     let palette_alpha = |product: RadarProduct, value: f32| {
         let range = ramp_of(product);
         get_color_for_value(product, ramp_value(range, ramp_index(range, value))).3
@@ -3093,7 +2354,6 @@ fn the_default_transparency_profile_is_measured_per_product() {
         assert!(alpha(product, value) > 0, "{what}: visible at all");
     };
 
-    // Velocity: calm air is invisible, cores are solid — in both signs.
     assert_eq!(alpha(RadarProduct::Velocity, 0.0), 0, "calm air");
     assert_eq!(alpha(RadarProduct::Velocity, 3.5), 0, "ambient drift");
     assert_eq!(
@@ -3109,14 +2369,9 @@ fn the_default_transparency_profile_is_measured_per_product() {
         "the fade between drift and core is a fade, not a step: {mid}",
     );
 
-    // Spectrum width: laminar flow is invisible, turbulence is solid.
     assert_eq!(alpha(RadarProduct::SpectrumWidth, 1.0), 0, "laminar flow");
     solid(RadarProduct::SpectrumWidth, 10.0, "turbulence");
 
-    // ZDR: the quiet band is the interval the crate's own HCA leaves for
-    // ordinary rain, and it does not contain zero. This block is the
-    // regression: a profile that put a clear band on 0 dB rendered the
-    // canonical tumbling-hail signature as a hole.
     let zdr = RadarProduct::DifferentialReflectivity;
     use volume_alpha_profile as p;
     assert_eq!(
@@ -3131,13 +2386,6 @@ fn the_default_transparency_profile_is_measured_per_product() {
     ] {
         assert_eq!(alpha(zdr, value), 0, "{what} is the volume's filler");
     }
-    // The finding, as a number, and it is asserted through the table
-    // rather than through the constants so that it is a statement about
-    // what renders. Tumbling hail sits at ZDR ~ 0 under high Z —
-    // `hca::HSDA_MAX_ZDR` is 2.0 and high ZDR is never large hail — so 0 dB
-    // must be plainly visible, not a hole and not a whisper. A bound of
-    // zero would be subsumed by this one; a third of the palette's alpha is
-    // the claim worth making.
     let hail = alpha(zdr, p::ZDR_TUMBLING_DB);
     assert!(
         hail >= palette_alpha(zdr, p::ZDR_TUMBLING_DB) / 3,
@@ -3146,22 +2394,14 @@ fn the_default_transparency_profile_is_measured_per_product() {
         palette_alpha(zdr, p::ZDR_TUMBLING_DB),
         crate::hca::HSDA_MAX_ZDR,
     );
-    // …and a plateau, not a ramp to full. Measured over four volumes,
-    // ZDR in [−0.5, +0.5] is 68 % of every data voxel in the box: a low
-    // side that reached full opacity drew 91 % of the volume at a mean
-    // alpha of 110 of 180, which is a wall, and a wall is the other way
-    // of telling the user nothing.
+    // Measured over four volumes: ZDR in [−0.5, +0.5] is 68 % of every data
+    // voxel in the box, so the low side plateaus rather than ramping to full.
     assert_eq!(
         p::ZDR_TUMBLING_ALPHA,
         p::PHI_ALPHA,
         "the plateau is the translucency this module already argues for a \
              moment with no honest background band",
     );
-    // Strict, and the strictness is the whole point of the assertion. The
-    // rejected ramped profile — `1 - smoothstep(-RAIN_LO, RAIN_LO, value)`
-    // on the low side — lands on exactly half the palette's alpha at 0 dB,
-    // 90 of 180, so `<=` admits the very shape this bound exists to
-    // refuse. Half is the wall, not the last value under it.
     let ceiling = palette_alpha(zdr, p::ZDR_TUMBLING_DB) / 2;
     assert!(
         hail < ceiling,
@@ -3177,9 +2417,6 @@ fn the_default_transparency_profile_is_measured_per_product() {
     solid(zdr, -3.5, "a three-body spike");
     solid(zdr, p::ZDR_COLUMN_DB, "a ZDR column");
     solid(zdr, 4.0, "a big-drop core");
-    // Monotone away from the rain band in both directions, so "further
-    // from rain is more visible" holds and no interior notch hides a
-    // value between two landmarks.
     for pair in [
         [0.4f32, 0.2],
         [0.2, 0.0],
@@ -3198,9 +2435,6 @@ fn the_default_transparency_profile_is_measured_per_product() {
         );
     }
 
-    // ρHV: uniform precipitation is invisible — the profile inverts,
-    // because this moment's background is the TOP of its scale. Debris
-    // reads solid at the palette's own (translucent) strength.
     assert_eq!(
         alpha(RadarProduct::CorrelationCoefficient, 1.0),
         0,
@@ -3220,8 +2454,6 @@ fn the_default_transparency_profile_is_measured_per_product() {
         "alpha must rise as ρHV falls away from rain",
     );
 
-    // ΦDP: flat translucency — a cumulative, site-offset moment has no
-    // honest background band, so no value is favoured over another.
     let phi_alphas: Vec<u8> = {
         let range = value_range_for(MomentSlot::DifferentialPhase);
         colormap_lut(RadarProduct::DifferentialPhase, range)
@@ -3241,12 +2473,7 @@ fn the_default_transparency_profile_is_measured_per_product() {
     );
 
     // ── The three derived products ──────────────────────────────────
-    //
-    // Not one of these had a row here when they were admitted to every 3D
-    // surface, and all three defects below shipped in that gap.
 
-    // SRV: velocity's numbers under SRV's own names, so a change to
-    // velocity's band cannot drag SRV along silently.
     let srv = RadarProduct::StormRelativeVelocity;
     assert_eq!(
         (p::SRV_CLEAR_MS, p::SRV_OPAQUE_MS),
@@ -3257,11 +2484,6 @@ fn the_default_transparency_profile_is_measured_per_product() {
     assert_eq!(alpha(srv, 0.0), 0, "air travelling with the storm");
     solid(srv, 30.0, "an outbound storm-relative core");
     solid(srv, -30.0, "an inbound storm-relative core");
-    // The premise the entry corrects, as arithmetic. In still air SRV is
-    // a cosine of amplitude equal to the storm speed, so the near-zero
-    // band is a ridge perpendicular to the motion, not a background. A
-    // 40 kt storm puts still air 45° off the motion axis here — kept
-    // visible on purpose: subtracting it back out would be base velocity.
     let still_air_45 =
         (40.0 * crate::srv::KT_TO_MS * f64::from(std::f32::consts::FRAC_1_SQRT_2)) as f32;
     assert!(
@@ -3275,10 +2497,6 @@ fn the_default_transparency_profile_is_measured_per_product() {
              profile entry states",
     );
 
-    // NROT: the finding. The clear point is the algorithm's own
-    // significance floor, not a number chosen here — NROT's palette is
-    // class-structured, so a higher clear point relocates the
-    // nothing→weak class boundary instead of softening a gradient.
     let nrot = RadarProduct::NormalizedRotation;
     assert_eq!(
         p::NROT_CLEAR,
@@ -3288,14 +2506,8 @@ fn the_default_transparency_profile_is_measured_per_product() {
     );
     assert_eq!(alpha(nrot, 0.0), 0, "no rotation");
     assert_eq!(alpha(nrot, 0.2), 0, "under the significance floor");
-    // The contract, stated exactly: the volume goes visible on precisely
-    // the ramp entries the plan view paints, and on no others. This is
-    // the assertion the shipped profile failed — 8 033 of the 8 039
-    // voxels a real tornado-warned volume painted came back at alpha 2–4
-    // of 180, six of them visible — and it is stronger than the constant
-    // it pins, because a smoothstep starting at 0 rounds the first
-    // several entries of the weak class back to invisible even with the
-    // clear point correct.
+    // Measured: 8 033 of the 8 039 voxels a real tornado-warned volume
+    // painted came back at alpha 2–4 of 180, six of them visible.
     {
         let range = ramp_of(nrot);
         let lut = colormap_lut(nrot, range);
@@ -3329,8 +2541,6 @@ fn the_default_transparency_profile_is_measured_per_product() {
     solid(nrot, -1.0, "an anticyclonic couplet");
     solid(nrot, 2.5, "an extreme couplet");
 
-    // KDP: sequential like reflectivity, clear under the estimator's own
-    // significance and opaque in the heavy-rain shafts.
     let kdp = RadarProduct::SpecificDifferentialPhase;
     assert_eq!(alpha(kdp, 0.0), 0, "no differential phase gradient");
     assert_eq!(alpha(kdp, 0.2), 0, "drizzle and noise");
@@ -3342,8 +2552,6 @@ fn the_default_transparency_profile_is_measured_per_product() {
         "moderate KDP fades rather than steps: {kdp_mid}",
     );
 
-    // Reflectivity: bit-exact identity with the palette — the reference
-    // look every other profile is measured against.
     {
         let range = value_range_for(MomentSlot::Reflectivity);
         let lut = colormap_lut(RadarProduct::Reflectivity, range);
@@ -3358,13 +2566,9 @@ fn the_default_transparency_profile_is_measured_per_product() {
         }
     }
 
-    // The drawability number the solid-block gate reads, per product, and
-    // the tables' alpha ceiling for context. Every palette's plan-view
-    // maximum is 180 — the radar layer's own translucency convention — so
-    // 180 is also the ceiling here; ΦDP's 63 is that ceiling times its
-    // flat 0.35, which puts its whole 255-entry ramp under the
-    // see-through bar: translucent everywhere is the other honest way not
-    // to be a wall.
+    // Every palette's plan-view maximum alpha is 180 — the radar layer's own
+    // translucency convention — and ΦDP's 63 is that ceiling times its flat
+    // 0.35, which puts its whole 255-entry ramp under the see-through bar.
     let scan = six_moment_scan();
     let mut measured = Vec::new();
     for product in VOLUME_PRODUCTS {
@@ -3388,28 +2592,10 @@ fn the_default_transparency_profile_is_measured_per_product() {
             ("ref", 64, 180),
             ("vel", 41, 180),
             ("sw", 18, 180),
-            // Was 53 on the profile that put a clear band across 0 dB.
-            // The band moved off zero and narrowed to the HCA's own rain
-            // interval, so 11 fewer entries are see-through — and the 11
-            // are the ones around the hail value. The rest of the low
-            // side is a plateau at ΦDP's translucency, which is over the
-            // see-through bar without being a wall.
             ("zdr", 42, 180),
             ("phi", 255, 63),
             ("rho", 35, 180),
-            // Velocity's own count, which is what sharing its band means.
             ("srv", 41, 180),
-            // Only the unpainted core of the ramp: |NROT| under the
-            // algorithm's significance floor, on a ±5 span. Everything
-            // outside it starts at the weak class's quarter alpha, which
-            // is over the see-through ceiling, so the count is the
-            // unpainted band and nothing else.
-            //
-            // Was 27 on the ±4 span. The floor did not move — the ramp
-            // did: a quarter more value per index over the same 254 of
-            // them puts a fifth fewer inside a band the palette fixes in
-            // unitless rotation. `derive::codec` carries why the span
-            // widened.
             ("nrot", 21, 180),
             ("kdp", 60, 180),
         ],
@@ -3417,10 +2603,6 @@ fn the_default_transparency_profile_is_measured_per_product() {
     );
 }
 
-/// The isosurface parameters translate the user's product-unit threshold
-/// through each shape — sequential, diverging, at-or-below — against the
-/// grid's own ramp, and a non-finite threshold falls back to the argued
-/// default instead of poisoning the uniform.
 #[test]
 fn the_isosurface_params_translate_the_user_threshold_per_shape() {
     let scan = six_moment_scan();
@@ -3432,8 +2614,6 @@ fn the_isosurface_params_translate_the_user_threshold_per_shape() {
         build_voxels(&scan, &req, SITE.0, SITE.1).unwrap()
     };
 
-    // Sequential: reflectivity at 18 dBZ — no centre, the threshold is
-    // the value's own index.
     let refl = grid(RadarProduct::Reflectivity);
     let (centre, threshold) = refl.iso_uniform_params(18.0);
     assert!(centre < 0.0, "a sequential product has no diverging centre");
@@ -3443,8 +2623,6 @@ fn the_isosurface_params_translate_the_user_threshold_per_shape() {
         "the surface sits exactly where the ramp puts 18 dBZ",
     );
 
-    // Diverging: velocity at ±20 m/s — centre at 0 m/s, threshold the
-    // index distance to +20, so both lobes render.
     let vel = grid(RadarProduct::Velocity);
     let (centre, threshold) = vel.iso_uniform_params(20.0);
     let c = vel.value_to_index(0.0);
@@ -3454,11 +2632,8 @@ fn the_isosurface_params_translate_the_user_threshold_per_shape() {
         f32::from(vel.value_to_index(20.0) - c) / 255.0,
         "the crossing distance is 20 m/s of ramp",
     );
-    // A negative deviation is the same surface: the shape is |v|.
     assert_eq!(vel.iso_uniform_params(-20.0), (centre, threshold));
 
-    // At-or-below: ρHV at 0.90 — centre at the ramp top, so "at or
-    // under the bound" is the same diverging test.
     let rho = grid(RadarProduct::CorrelationCoefficient);
     let (centre, threshold) = rho.iso_uniform_params(0.90);
     assert_eq!(centre, 1.0, "centred on the ramp top");
@@ -3468,12 +2643,6 @@ fn the_isosurface_params_translate_the_user_threshold_per_shape() {
         "the crossing distance reaches down to the bound",
     );
 
-    // Diverging about a centre that is NOT zero — the case velocity
-    // cannot test, because dropping the `centre +` term from the
-    // translation passes every assertion above. ZDR is the only product
-    // with a non-zero diverging centre, so this is the whole coverage of
-    // that term: at +0.25 dB the slider would otherwise sit a quarter of
-    // a decibel off the surface it draws.
     let zdr = grid(RadarProduct::DifferentialReflectivity);
     let centre_db = volume_alpha_profile::ZDR_CENTRE_DB;
     assert_ne!(centre_db, 0.0, "precondition: ZDR's centre is off zero");
@@ -3495,25 +2664,14 @@ fn the_isosurface_params_translate_the_user_threshold_per_shape() {
         f32::from(zdr.value_to_index(centre_db + 2.75) - c) / 255.0,
         "the crossing distance is 2.75 dB of ramp FROM the declared centre",
     );
-    // Which is to say the default surface is the +3 dB column and the
-    // −2.5 dB tail, not the hail value at 0 — the profile shows that one.
     let default_db = default_iso_threshold(RadarProduct::DifferentialReflectivity);
     assert_eq!(default_db, volume_alpha_profile::ZDR_COLUMN_DB - centre_db);
-    // The two lobes as the numbers a user sees, so that moving the centre
-    // is a change to this pair and not a silent one. The centre is a
-    // display choice, argued as such where it is declared; this is what
-    // holding it at 0.25 dB draws.
     assert_eq!(
         (centre_db + default_db, centre_db - default_db),
         (3.0, -2.5),
         "the default ZDR surface's positive and negative lobes",
     );
 
-    // The derived products carry their own ramps, so their thresholds
-    // must be read through those and not through the source moment's.
-    // NROT spans ±5 unitless where the velocity slot it borrows spans
-    // ±63.5 m/s: a translation that reached for the slot would put the
-    // meso surface nearly thirteen times too low on the ramp.
     let nrot = grid(RadarProduct::NormalizedRotation);
     let (centre, threshold) = nrot.iso_uniform_params(1.0);
     let c = nrot.value_to_index(0.0);
@@ -3527,17 +2685,11 @@ fn the_isosurface_params_translate_the_user_threshold_per_shape() {
         nrot.value_range(),
         value_range_for_product(RadarProduct::NormalizedRotation, MomentSlot::Velocity,)
     );
-    // A tenth of the ±5 ramp, to within an index. Two-sided on purpose:
-    // the lower bound is the ±63.5 misroute this paragraph names (which
-    // would read 1/127), and the upper one catches the span drifting back
-    // under NROT's own clamp without this pin noticing.
     assert!(
         (threshold - 0.1).abs() < 2.0 / 255.0,
         "|NROT| = 1 is a tenth of a ±5 ramp; {threshold} says the \
              surface was translated through velocity's ±63.5 span",
     );
-    // SRV keeps velocity's ramp and velocity's centre; KDP is sequential
-    // on its own display clamp.
     let srv = grid(RadarProduct::StormRelativeVelocity);
     assert_eq!(srv.value_range(), vel.value_range());
     assert_eq!(srv.iso_uniform_params(20.0), vel.iso_uniform_params(20.0));
@@ -3546,8 +2698,6 @@ fn the_isosurface_params_translate_the_user_threshold_per_shape() {
     assert!(centre < 0.0, "KDP is sequential");
     assert_eq!(threshold, f32::from(kdp.value_to_index(1.5)) / 255.0);
 
-    // Every product's shape and default agree with the grid the builder
-    // actually produced — the loop the derived three were never in.
     for product in VOLUME_PRODUCTS {
         let g = grid(product);
         let default = default_iso_threshold(product);
@@ -3567,7 +2717,6 @@ fn the_isosurface_params_translate_the_user_threshold_per_shape() {
             ),
             IsoShape::AtOrBelow => assert_eq!(centre, 1.0, "{}", product.name()),
         }
-        // Non-finite input takes the argued default, for every product.
         assert_eq!(
             g.iso_uniform_params(f32::NAN),
             (centre, threshold),
@@ -3576,7 +2725,6 @@ fn the_isosurface_params_translate_the_user_threshold_per_shape() {
         );
     }
 
-    // Non-finite input: the argued default, not a NaN in a uniform lane.
     let (_, fallback) = refl.iso_uniform_params(f32::NAN);
     assert_eq!(
         fallback,
@@ -3584,17 +2732,6 @@ fn the_isosurface_params_translate_the_user_threshold_per_shape() {
     );
 }
 
-/// The sampler's velocity fold guard rides into the voxel grid unchanged.
-///
-/// A field folding at ±24.5 m/s with a hard seam: without the guard,
-/// blends across the seam invent every speed between the endpoints —
-/// including calm air — and the voxel grid stores the inventions. The
-/// guard (armed per rung by `Blend::folds_at_measured_limit`, applied
-/// across gates and across tilts) answers with one endpoint or the other,
-/// so **every** valued cell must read exactly ±24.5. The grid samples
-/// through `Column::at_height_km` with no fold logic of its own, which is
-/// what this pins: nobody may give the voxel path its own sampling that
-/// forgets the guard.
 #[test]
 fn the_velocity_fold_guard_rides_into_the_voxel_grid() {
     let seam_km = 10.0;
@@ -3652,9 +2789,6 @@ fn the_velocity_fold_guard_rides_into_the_voxel_grid() {
     );
 }
 
-/// Differential phase is circular, so the two ends of its ramp are the
-/// same measurement and a linear filter across the seam returns the
-/// opposite phase. Named, measured, and left alone.
 #[test]
 fn the_wrapping_moment_is_named_and_its_seam_error_is_measured() {
     let scan = six_moment_scan();
@@ -3672,9 +2806,8 @@ fn the_wrapping_moment_is_named_and_its_seam_error_is_measured() {
         );
     }
 
-    // The seam: 1° and 359° are 2° apart on the circle. Filtered halfway
-    // between their indices the fetch reads 180°, the opposite phase — an
-    // error of 180°, the worst there is.
+    // The seam: 1° and 359° are 2° apart on the circle, so a fetch filtered
+    // halfway between their indices reads 180°, the worst error there is.
     let range = value_range_for(MomentSlot::DifferentialPhase);
     let (a, b) = (ramp_index(range, 1.0), ramp_index(range, 359.0));
     let middle = ramp_value_at(range, fetched_index(a, b, 0.5));
@@ -3687,10 +2820,6 @@ fn the_wrapping_moment_is_named_and_its_seam_error_is_measured() {
 
 // ── The status the grid drops, stated ───────────────────────────────────
 
-/// Every non-`Value` status collapses to one index. The grid carries no
-/// status plane — a raymarcher has no use for one — so "below the lowest
-/// beam" and "range folded" are the same byte here, and a hover readout
-/// that needs the distinction must ask the sampler, not the grid.
 #[test]
 fn every_reason_for_no_value_collapses_to_the_one_index() {
     let range = value_range_for(MomentSlot::Reflectivity);
@@ -3710,16 +2839,7 @@ fn every_reason_for_no_value_collapses_to_the_one_index() {
 
 // ── The wire codec ──────────────────────────────────────────────────────
 
-/// Where the three trailing planes' length prefixes sit in an encoded
-/// grid: after the 104-byte header, then after each preceding plane.
-///
-/// Written out here rather than taken from the encoder, so a layout change
-/// that moved a field has to be made in both places — the mutations these
-/// offsets support are the whole point of the tests below, and an offset
-/// derived from the code under test would follow it wherever it went.
-/// `the_length_prefixes_are_where_the_tests_think_they_are` checks them.
 const HEADER_BYTES: usize = 4 + 2 + 2 + 3 * 4 + 3 * 16 + 16 + 8 + 4 + 8;
-/// The first axis of the shape, so a test can plant an unsupported one.
 const SHAPE_AT: usize = 4 + 2 + 2;
 const LUT_LEN_AT: usize = HEADER_BYTES;
 const INDEX_LEN_AT: usize = LUT_LEN_AT + 4 + LUT_LEN;
@@ -3732,20 +2852,11 @@ fn prefix_at(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"))
 }
 
-/// A grid with a real echo edge in it, on the deliberately-asymmetric
-/// [`ODD`] shape, and with the value plane present.
 fn wire_fixture() -> VoxelGrid {
     let scan = scan_of(&|az, slant| (az < 120.0 && slant < 90.0).then_some(48.0));
     build_voxels(&scan, &request(ODD), SITE.0, SITE.1).expect("the fixture grid builds")
 }
 
-/// The "no value plane" encoding is unambiguous only because a supported
-/// shape has at least one cell — otherwise `0` would mean both "absent"
-/// and "as many values as this grid has cells".
-///
-/// A claim about [`VoxelShape::is_supported`] rather than about the codec,
-/// which is why it is asserted over the boundary and the named shapes
-/// rather than over one fixture.
 #[test]
 fn a_supported_shape_always_has_a_cell_so_an_absent_plane_is_unambiguous() {
     let smallest = VoxelShape {
@@ -3761,8 +2872,6 @@ fn a_supported_shape_always_has_a_cell_so_an_absent_plane_is_unambiguous() {
                  plane and a full one encode to the same four bytes",
         );
     }
-    // And the reason it holds: a zero axis is not supported in the first
-    // place, on any of the three.
     for zeroed in [
         VoxelShape { nx: 0, ..smallest },
         VoxelShape { ny: 0, ..smallest },
@@ -3773,13 +2882,6 @@ fn a_supported_shape_always_has_a_cell_so_an_absent_plane_is_unambiguous() {
     }
 }
 
-/// The three offsets the mutation tests below index by are the three the
-/// encoder actually wrote.
-///
-/// Every refusal test plants a value at one of them, so an offset that had
-/// drifted would leave those tests corrupting a byte of some other field
-/// and passing for the wrong reason — the classic way a suite of negative
-/// assertions goes green while testing nothing.
 #[test]
 fn the_length_prefixes_are_where_the_tests_think_they_are() {
     let grid = wire_fixture();
@@ -3794,70 +2896,6 @@ fn the_length_prefixes_are_where_the_tests_think_they_are() {
     assert_eq!(bytes.len(), value_len_at(cells) + 4 + cells * 4);
 }
 
-/// The version this layout ships is **1**, and it sits where a decoder
-/// from another build reads it — as does the magic, `RDVX` by literal.
-///
-/// `a_malformed_grid_payload_is_refused_rather_than_misread` plants
-/// `0xFF 0xFF` in the version and watches the decode refuse, which pins
-/// that *a* version check exists — not *which* version ships. Both ends of
-/// this codec move together, so every other test here round-trips through
-/// one build and passes whatever the constant says; the constant is only
-/// load-bearing *between* builds.
-///
-/// Between builds is where it is the only defence — **in a dev build**.
-/// `rustdar-web`'s page/worker handshake compares `build_token`: in a
-/// deployed build it carries `GITHUB_SHA`, the SHA differs across the deploy
-/// boundary, the tokens disagree, and `worker_port::handle_message` terminates
-/// the worker at the HELLO handshake — before any payload is exchanged, so
-/// this constant is never reached. Locally there is no SHA and the token
-/// folds the wire's pinned framing rows (`rustdar_worker::wire_identity`),
-/// deliberately not this nested payload — so a stale worker differing only
-/// here still shares a token with a fresh page. `RDVX` has
-/// never been bumped, so the exposure is the *first* bump being forgotten:
-/// a layout change that reorders two same-width fields — the three `f64`
-/// axis ranges, or `site` against them — round-trips perfectly through its
-/// own build's codec, so the stale worker would decode a fresh payload
-/// into the new field order and raymarch a volume with its axes swapped.
-///
-/// The magic is here for the same reason at lower stakes. The relabel loop
-/// in that test pins `RDVX` only against `RDRI` and `RDXS`, its two
-/// port-mates; any *unused* four bytes would have stayed green, and the
-/// far end of the port has no matching constant to move with it. A changed
-/// magic is at least a clean refusal rather than a misparse.
-///
-/// Byte 4 is where the version starts because [`to_bytes`](VoxelGrid::to_bytes)
-/// writes [`MAGIC`] and then it — the same reading [`SHAPE_AT`] is built
-/// on. Mirrors `render_input`'s and `xsect`'s tests of the same name.
-///
-/// # Why the coverage-premultiplied texture did NOT bump it
-///
-/// `rustdar-volumetric` now uploads the grid as `Rg16Float` with
-/// `R = coverage x index` and `G = coverage`, and quadrupling a texture is the
-/// shape of change that usually earns a bump. This one does not, because
-/// **not one byte of this payload changed, in layout or in meaning**:
-/// coverage is exactly `index != NO_DATA_INDEX` (pinned by
-/// `coverage_is_exactly_whether_the_index_is_the_no_data_one`), so the
-/// second channel is a function of the first, and it is synthesised at
-/// upload time by `volume::raymarch::coverage_premultiplied_into` rather than
-/// carried. Putting it on the wire would double the worker transfer and the
-/// host residency — 8 MiB to 16 MiB at [`DESKTOP_SHAPE`] — to move no
-/// information.
-///
-/// So old and new payloads are not merely unconfusable, they are
-/// *identical*, and both decode correctly under both renderers. A bump here
-/// would be a pure cost, and the cost is a **dev-build** one: the build-token
-/// handshake degrades to `…/dev` outside CI, so there a stale worker does
-/// share a token with a fresh page and reaches this decode, and a gratuitous
-/// bump would make that pair drop every reply — a pane stuck on "Building
-/// the … volume…" until the developer reloads — in exchange for refusing
-/// payloads that are correct. (In a deployed build the SHA differs and the
-/// mismatched worker is already terminated at HELLO, so a bump would cost
-/// nothing there and buy nothing either.)
-///
-/// The bump obligation is unchanged for anything that touches the bytes:
-/// if coverage ever stops being derivable from the index (a non-binary
-/// coverage from sub-cell occupancy, say, which would have to be carried),
-/// that is a layout change and it bumps.
 #[test]
 fn the_format_version_is_the_one_this_layout_ships() {
     assert_eq!(FORMAT_VERSION, 1);
@@ -3868,9 +2906,6 @@ fn the_format_version_is_the_one_this_layout_ships() {
         1,
         "the version is not where a decoder from another build looks for it",
     );
-    // The claim above, executed: the payload's index plane is one byte per
-    // cell, so a build that started carrying a coverage plane would grow it
-    // and would have to bump.
     let grid = wire_fixture();
     assert_eq!(
         grid.indices().len(),
@@ -3880,33 +2915,6 @@ fn the_format_version_is_the_one_this_layout_ships() {
     );
 }
 
-/// A grid assembled by hand, for
-/// [`the_wire_layout_is_the_one_this_version_ships`].
-///
-/// Every number here is a literal and exactly representable, so the encoding
-/// is the same bytes on every target: nothing in this fixture is computed, so
-/// nothing in it can move with a libm. [`wire_fixture`] cannot serve — it goes
-/// through beam geometry, so its box-tightened axis ranges and its whole index
-/// plane are whatever the platform's `sin`/`cos`/`atan2` said, and a digest of
-/// it would be a digest of the libm that ran it.
-///
-/// The colour table is a synthetic ramp rather than [`colormap_lut`]'s, on
-/// purpose. A palette edit is not a wire-layout change, and a digest taken
-/// over the real table would turn every palette edit into a spurious demand to
-/// bump [`FORMAT_VERSION`] — a guard that cries wolf is one people delete. The
-/// table's *length prefix and position* are still covered, which is the part
-/// of it that is layout.
-///
-/// Written as a struct literal with no `..`, also on purpose, though the
-/// credit for that is small and worth stating exactly. A new field on
-/// [`VoxelGrid`] makes this fail to compile — measured: adding a
-/// `coverage_fraction: f32` to the struct produced four `E0063`s, of which
-/// this fixture was one. The other three are the literals `build_voxels` and
-/// the derivation path already use, so today the type is *already* closed
-/// against a silently-added field and this line adds nothing to that. What it
-/// adds is that the property cannot be lost: if production ever moves to a
-/// builder or a `..Default::default()`, the other three stop failing and this
-/// one does not.
 fn layout_fixture() -> VoxelGrid {
     VoxelGrid {
         indices: vec![0, 1, 128, NO_DATA_INDEX, 255, 7],
@@ -3928,46 +2936,6 @@ fn layout_fixture() -> VoxelGrid {
     }
 }
 
-/// The bytes this version ships are **these** bytes.
-///
-/// [`the_format_version_is_the_one_this_layout_ships`] asserts
-/// `FORMAT_VERSION == 1` and that a `1` is written at byte 4. Both are our
-/// value compared against our value, so both fail for exactly one person: the
-/// one who *raises* the number. They are silent for the one who changes the
-/// layout and does not — and that is the person the number exists to catch,
-/// because raising it is the safe act and forgetting to is what ships a page
-/// and a worker that misread each other.
-///
-/// Measured rather than argued. With `FORMAT_VERSION` left at `1`, against
-/// this module's 68 pre-existing tests:
-///
-/// * swapping `x_range_km` and `y_range_km` on the wire, encoder and decoder
-///   in step — the same-width reorder the version test's own doc names as the
-///   danger — left `the_format_version_is_the_one_this_layout_ships` green,
-///   and 67 of those 68 with it. The one that failed was
-///   `a_grid_header_that_cannot_describe_its_own_product_is_refused`, which
-///   caught it only incidentally, by asserting that offset 20 is `x_range.0`,
-///   and reported it as "the finiteness assertions above are corrupting some
-///   other field" — a message that reads as a broken test rather than as a
-///   missing bump;
-/// * appending an `f64` with `from_bytes` and `encoded_len` updated in step
-///   left the version test green again, 66 of 68 passing;
-/// * and the same swap done to `render_input` — `radar_lat` against
-///   `radar_lon`, which draws every site at the wrong coordinates — left
-///   **all 890** of `rustdar-radar`'s library tests passing (864 run, 26
-///   ignored, 0 failed), its own version test included.
-///
-/// This one fails on all three, because it is not a claim about the constant.
-/// It is the encoder's own output, over a fixture nothing computes, compared
-/// with the bytes recorded when the version was last set. Any change to what
-/// `to_bytes` writes — a field added, removed, reordered, retyped, or written
-/// in a different width or endianness — moves the length or the digest, and
-/// the only way past it is to write the new numbers down, which is where the
-/// bump obligation is met.
-///
-/// A digest is opaque about *what* moved, deliberately: the three assertions
-/// are one tuple so the failure names the version alongside them, and what to
-/// do about it does not depend on which field it was.
 #[test]
 fn the_wire_layout_is_the_one_this_version_ships() {
     let bytes = layout_fixture().to_bytes();
@@ -3991,14 +2959,6 @@ fn the_wire_layout_is_the_one_this_version_ships() {
     );
 }
 
-/// A real grid survives the wire, for every product — derivations
-/// included — with and without the value plane.
-///
-/// This is what [`VoxelGrid`]'s hand-written `PartialEq` was written for:
-/// the value plane is `NaN` wherever the radar did not reach, which on a
-/// cube over a cone is most of it, and under derived semantics
-/// `assert_eq!` here would fail on a byte-identical payload with nothing
-/// in the message saying why.
 #[test]
 fn a_grid_round_trips_through_its_wire_form() {
     let scan = six_moment_scan();
@@ -4014,9 +2974,6 @@ fn a_grid_round_trips_through_its_wire_form() {
             let what = format!("{} values={values_wanted}", product.name());
 
             if values_wanted {
-                // precondition: without a NaN in the plane the round trip
-                // would pass under a derived `PartialEq` too, and the
-                // claim about the codec would be weaker than it looks.
                 assert!(
                     grid.values().unwrap().iter().any(|v| v.is_nan()),
                     "{what}: the value plane has no NaN in it",
@@ -4030,10 +2987,6 @@ fn a_grid_round_trips_through_its_wire_form() {
             let decoded = VoxelGrid::from_bytes(&grid.to_bytes())
                 .unwrap_or_else(|| panic!("{what} did not decode"));
             assert_eq!(grid, decoded, "{what} changed in transit");
-            // The absent plane is a state of its own and has to survive as
-            // one: `Some(vec![NaN; cells])` compares unequal to `None`, so
-            // this is not implied by the assertion above, but stating it
-            // says which way round the failure would be.
             assert_eq!(
                 decoded.values().is_some(),
                 values_wanted,
@@ -4043,16 +2996,10 @@ fn a_grid_round_trips_through_its_wire_form() {
             assert_eq!(decoded.shape(), ODD, "{what}");
             assert_eq!(decoded.lut(), grid.lut(), "{what}");
             assert_eq!(decoded.tilt_count(), grid.tilt_count(), "{what}");
-            // And re-encoding is byte-identical, which says more than
-            // equality does: `PartialEq` compares the value plane bitwise,
-            // but an encoder that reordered two fields of equal width
-            // would still satisfy it.
             assert_eq!(grid.to_bytes(), decoded.to_bytes(), "{what}");
         }
     }
 
-    // The comparison is not vacuous: two grids that differ decode to two
-    // grids that differ, in the plane, in the shape and in the box.
     let a = build_voxels(&scan, &request(ODD), SITE.0, SITE.1).unwrap();
     let elsewhere = build_voxels(
         &scan,
@@ -4083,14 +3030,9 @@ fn a_grid_round_trips_through_its_wire_form() {
     }
 }
 
-/// `to_bytes` reserves exactly what it writes. A grid is up to 40 MiB, so
-/// a wrong estimate is a copy of all of it.
 #[test]
 fn the_encoded_length_of_a_grid_is_exact() {
     let scan = six_moment_scan();
-    // Both plane states and two shapes, so the estimate is pinned against
-    // more than one total — the optional plane is the term most likely to
-    // be dropped from it.
     for shape in [
         ODD,
         VoxelShape {
@@ -4115,18 +3057,6 @@ fn the_encoded_length_of_a_grid_is_exact() {
     }
 }
 
-/// The header's geometry numbers must all be finite, and the two fields
-/// that are **functions of the product** must agree with the product.
-///
-/// `CrossSection::from_parts` already refuses a non-finite axis; this is
-/// the same hole one level over, plus the pair a grid states twice. None of
-/// these fails downstream — that is the point. A `NaN` extent divides into
-/// a `NaN` cell size and every `cell_centre_km` answers `NaN`; an infinite
-/// one collapses the cell size to zero and stacks every cell centre in one
-/// place; a mismatched ramp reads the indices off a scale they were not
-/// quantised against; a mismatched table paints another product's colours
-/// over this product's numbers. Each renders, and each is wrong in a way
-/// that looks like weather.
 #[test]
 fn a_grid_header_that_cannot_describe_its_own_product_is_refused() {
     let good = wire_fixture().to_bytes();
@@ -4157,8 +3087,6 @@ fn a_grid_header_that_cannot_describe_its_own_product_is_refused() {
             );
         }
     }
-    // precondition: those offsets really name the header fields, rather
-    // than landing in the padding of a layout that has since moved.
     let mut moved = good.clone();
     moved[20..28].copy_from_slice(&(-999.0f64).to_le_bytes());
     assert!(
@@ -4167,16 +3095,6 @@ fn a_grid_header_that_cannot_describe_its_own_product_is_refused() {
              corrupting some other field into invalidity",
     );
 
-    // The ramp is `value_range_for(slot)` and nothing else, so any other
-    // pair is a payload whose indices mean something this build cannot
-    // reproduce.
-    //
-    // Planted **with the colour table that matches it**, which is the whole
-    // point: a bare range edit is also caught by the table check below,
-    // because that recomputes the table from the decoded range — so it
-    // leaves the range check itself untested. Only a self-consistent
-    // wrong-ramp payload — which is exactly what a build with a different
-    // quantisation would send — isolates it.
     let mut ramp = good.clone();
     let bogus = (0.0f32, 60.0f32);
     assert_ne!(
@@ -4195,9 +3113,6 @@ fn a_grid_header_that_cannot_describe_its_own_product_is_refused() {
              would have read every index off the wrong scale",
     );
 
-    // A length-correct table built for a different product. The fixture is
-    // reflectivity; velocity's ramp colours the same 256 indices
-    // completely differently.
     let alien = colormap_lut(
         RadarProduct::Velocity,
         value_range_for(MomentSlot::Velocity),
@@ -4218,8 +3133,6 @@ fn a_grid_header_that_cannot_describe_its_own_product_is_refused() {
     );
 }
 
-/// The bytes arrive off a message port. Every malformed shape has to be a
-/// clean `None` — the two ends of that port can be different builds.
 #[test]
 fn a_malformed_grid_payload_is_refused_rather_than_misread() {
     let grid = wire_fixture();
@@ -4230,12 +3143,6 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
     assert!(VoxelGrid::from_bytes(&[]).is_none(), "empty");
     assert!(VoxelGrid::from_bytes(b"nope").is_none(), "wrong magic");
 
-    // A **whole** payload relabelled, including with the two magics that
-    // share this port. Mutation testing is why: a four-byte buffer cannot
-    // pin the magic test, because it fails on the version read instead —
-    // deleting the magic comparison outright left every short-buffer
-    // assertion here green, and a section frame would then have been
-    // decoded as a grid.
     for wrong in [*b"nope", *b"RDRI", *b"RDXS"] {
         let mut relabelled = good.clone();
         relabelled[..4].copy_from_slice(&wrong);
@@ -4254,10 +3161,6 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
         "an unknown version decoded",
     );
 
-    // A product code this build does not have, and one it has but cannot
-    // resample. The second is the interesting half: `RadarProduct` knows
-    // what VIL is, so only the `samplable` refusal stops a payload whose
-    // `value_range` came from no moment's ramp.
     let mut unknown_product = good.clone();
     unknown_product[6..8].copy_from_slice(&0xFFFEu16.to_le_bytes());
     assert!(
@@ -4280,7 +3183,6 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
         "a product with no native moment decoded",
     );
 
-    // An axis outside `1..=MAX_AXIS`, on each of the three, at both ends.
     for axis in 0..3 {
         for bad in [0u32, (MAX_AXIS + 1) as u32, u32::MAX] {
             let mut broken = good.clone();
@@ -4292,9 +3194,6 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
             );
         }
     }
-    // A *supported* shape that is not the one the planes are sized for is
-    // refused too, and by the plane checks rather than by `is_supported` —
-    // this is the cross-build case, since the three named shapes differ.
     let mut reshaped = good.clone();
     reshaped[SHAPE_AT..SHAPE_AT + 4].copy_from_slice(&((ODD.nx + 1) as u32).to_le_bytes());
     assert!(
@@ -4303,21 +3202,9 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
              every accessor indexes that plane with an offset from the shape",
     );
 
-    // An unsupported shape whose planes **agree** with it, so nothing but
-    // `is_supported` can object. Mutation testing needs these two: every
-    // bad-axis assertion above is caught downstream by the index-plane
-    // length instead, and deleting `is_supported` from `from_bytes`
-    // altogether left all of them green.
-    //
-    // Zero is the dangerous half, and it is why `is_supported` refuses a
-    // zero axis rather than yielding an empty grid: without the guard this
-    // frame decodes into a grid of no cells, whose extents a renderer
-    // divides by a zero dimension to get an infinity, and which is
-    // indistinguishable from a volume with nothing in it.
     for axis in 0..3 {
         let mut empty = good[..INDEX_LEN_AT].to_vec();
         empty[SHAPE_AT + axis * 4..SHAPE_AT + axis * 4 + 4].copy_from_slice(&0u32.to_le_bytes());
-        // Both planes sized to match `cells() == 0`: none, and absent.
         empty.extend_from_slice(&0u32.to_le_bytes());
         empty.extend_from_slice(&0u32.to_le_bytes());
         assert!(
@@ -4326,9 +3213,6 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
         );
     }
 
-    // And the other end, past `MAX_AXIS`, again with planes to match: one
-    // axis at the GLES 3.0 guarantee, bumped one over it, and both planes
-    // grown by the one cell that implies.
     let tall = VoxelShape {
         nx: MAX_AXIS,
         ny: 1,
@@ -4341,7 +3225,6 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
     over[SHAPE_AT..SHAPE_AT + 4].copy_from_slice(&((MAX_AXIS + 1) as u32).to_le_bytes());
     over[INDEX_LEN_AT..INDEX_LEN_AT + 4].copy_from_slice(&((tall_cells + 1) as u32).to_le_bytes());
     over.insert(INDEX_LEN_AT + 4 + tall_cells, NO_DATA_INDEX);
-    // The insert above pushed the value prefix along by that one byte.
     let moved = value_len_at(tall_cells) + 1;
     over[moved..moved + 4].copy_from_slice(&((tall_cells + 1) as u32).to_le_bytes());
     over.extend_from_slice(&f32::NAN.to_le_bytes());
@@ -4378,10 +3261,6 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
         "trailing bytes mean the layouts disagree",
     );
 
-    // A length that cannot fit in what remains, on each of the three
-    // planes. The value plane is the one that matters: four bytes an
-    // element, so a believed `u32::MAX` reserves 16 GiB before the read
-    // fails.
     for (name, at) in [
         ("table", LUT_LEN_AT),
         ("index", INDEX_LEN_AT),
@@ -4395,9 +3274,6 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
         );
     }
 
-    // Each plane one element short of what the shape declares, with its
-    // prefix moved to match, so the frame is well-formed right through to
-    // `at_end` and only the plane check can object.
     for (name, at, element) in [
         ("table", LUT_LEN_AT, 1usize),
         ("index", INDEX_LEN_AT, 1),
@@ -4414,9 +3290,6 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
         );
     }
 
-    // A value plane that is neither absent nor the size of the grid. One
-    // element is the shape a sender that meant "no plane" but wrote a
-    // sentinel would produce, and it must not be read as either.
     let mut one_value = good.clone();
     one_value.truncate(values_prefix_at + 4 + 4);
     one_value[values_prefix_at..values_prefix_at + 4].copy_from_slice(&1u32.to_le_bytes());
@@ -4425,8 +3298,6 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
         "a one-element value plane decoded",
     );
 
-    // Absent, on the other hand, is a state: zero and nothing after it is
-    // the encoding `values_wanted: false` produces, and it decodes.
     let mut absent = good.clone();
     absent.truncate(values_prefix_at + 4);
     absent[values_prefix_at..values_prefix_at + 4].copy_from_slice(&0u32.to_le_bytes());
@@ -4435,9 +3306,6 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
     assert_eq!(decoded.values(), None);
     assert_eq!(decoded.indices(), grid.indices());
 
-    // precondition: the fixture the mutations were made against decodes,
-    // so every refusal above is the mutation's doing and not the
-    // fixture's.
     assert_eq!(
         VoxelGrid::from_bytes(&good).expect("the unmutated payload decodes"),
         grid,
@@ -4449,17 +3317,6 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
     );
 }
 
-/// The capacity guard, tested directly, because nothing end to end can
-/// see it.
-///
-/// [`Reader::bounded`] does not change *what* [`VoxelGrid::from_bytes`]
-/// answers. `take` bounds every read, so a believed length fails on the
-/// read either way and the payload is refused with or without it. What it
-/// changes is whether four billion elements are reserved **first** — a
-/// 16 GiB allocation on the way to a `None`, on a worker thread, in a
-/// browser tab. Mutation testing confirms the gap rather than assuming it:
-/// deleting the call from `from_bytes` leaves the whole suite green, which
-/// is why the helper is named and pinned here instead.
 #[test]
 fn the_capacity_guard_refuses_a_length_the_buffer_cannot_hold() {
     let bytes = [0u8; 16];
@@ -4469,35 +3326,14 @@ fn the_capacity_guard_refuses_a_length_the_buffer_cannot_hold() {
     assert_eq!(r.bounded(5, 4), None, "20 bytes claimed from 16");
     assert_eq!(r.bounded(u32::MAX, 4), None, "16 GiB claimed from 16 bytes");
 
-    // It measures against what is *left*, not against the whole buffer —
-    // otherwise a length prefix late in a frame would be judged against
-    // bytes already consumed.
     let mut part_way = Reader::new(&bytes);
     part_way.take(8).expect("half the buffer");
     assert_eq!(part_way.bounded(2, 4), Some(2));
     assert_eq!(part_way.bounded(3, 4), None);
 
-    // And the multiply cannot overflow into a pass.
     assert_eq!(Reader::new(&bytes).bounded(u32::MAX, usize::MAX), None);
 }
 
-/// Coverage is **exactly** `index != NO_DATA_INDEX`, for every product — the
-/// premise the renderer's coverage-premultiplied texture rests on.
-///
-/// `rustdar-volumetric` uploads this grid as `Rg16Float` with `R = coverage x
-/// index` and `G = coverage`, and it synthesises that second channel at upload
-/// time from the index plane alone rather than carrying it on the wire. That is
-/// only lossless if no measurement can encode as index 0 and no absence can
-/// encode as anything else — which is exactly what
-/// `no_measurement_encodes_as_the_no_data_index` and the `NaN` arm of
-/// `ramp_index` say, read here from the renderer's side of the contract.
-///
-/// This replaces `only_the_bottom_transparent_sequential_ramps_may_blend_into_no_data`,
-/// which pinned the per-product blend-or-march-nearest census that
-/// `no_data_blends_at_ramp_bottom` held. That table is gone: with coverage in
-/// the texture a filtered sample beside empty air lands inside the convex hull
-/// of the stored indices around it, for every product, so there is no longer a
-/// per-product decision to pin.
 #[test]
 fn coverage_is_exactly_whether_the_index_is_the_no_data_one() {
     for product in RadarProduct::all() {
@@ -4505,7 +3341,6 @@ fn coverage_is_exactly_whether_the_index_is_the_no_data_one() {
             continue;
         };
         let range = value_range_for_product(*product, slot);
-        // An absence is index 0 and nothing else is.
         for absent in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             assert_eq!(
                 ramp_index(range, absent),
@@ -4515,8 +3350,6 @@ fn coverage_is_exactly_whether_the_index_is_the_no_data_one() {
                 product.code(),
             );
         }
-        // And no finite measurement anywhere on or beyond the ramp does, so
-        // coverage 1 never lands on a cell the grid says is empty.
         let (lo, hi) = range;
         let span = f64::from(hi) - f64::from(lo);
         for step in 0..=512 {
@@ -4532,15 +3365,6 @@ fn coverage_is_exactly_whether_the_index_is_the_no_data_one() {
     }
 }
 
-/// The grid [`build_voxels`] used to build: **one** `Column` buffer for the
-/// whole box, y outermost and z innermost, one cell written at a time.
-///
-/// Restated here rather than called, because it is the thing that is gone.
-/// `build_voxels` now cuts the output into y rows and fills them at once, each
-/// row with a `Column` of its own, and the only way to say "that changed
-/// nothing" is to still have the loop it replaced. Native products only — the
-/// derivation seam is not what this is about, and `Prepared::Native` is a
-/// borrow of the scan the sampler would have taken anyway.
 #[cfg(not(target_arch = "wasm32"))]
 fn serial_reference_grid(
     scan: &Scan,
@@ -4602,26 +3426,9 @@ fn serial_reference_grid(
     (indices, values)
 }
 
-/// **The property the row split has to keep**: the grid the rows build across
-/// the pool is the grid the one-buffer serial loop built, cell for cell.
-///
-/// [`build_voxels`] hands each y row its own slices of the output and its own
-/// [`Column`] — the buffer the loop used to share, which is what forced it
-/// serial. Two things can go wrong there and neither is visible anywhere else
-/// in this module: a row could write outside its own slices, and a row could
-/// come out differently for having started from a fresh buffer instead of the
-/// previous row's. So the check is against [`serial_reference_grid`], which
-/// still shares one buffer over the whole box — a 1-thread rayon pool would
-/// **not** do: it runs this same row-split code, so it can see a data race and
-/// nothing about the restructure.
-///
-/// Both shapes have three different axes, so a task that indexed a transposed
-/// row cannot pass by accident, and both products are checked because the value
-/// plane is compared bit for bit and only a signed one exercises its sign.
-// Named rather than gating the whole module the way `render.rs` does: this is
-// the only test in `voxel` that reaches for `rayon` by name, and a module-wide
-// gate would stop type-checking the other ~600 against wasm32, which is the arm
-// that compiles `par.rs`'s sequential stand-ins.
+// Named rather than gating the whole module: a module-wide gate would stop
+// type-checking the other ~600 tests against wasm32, the arm that compiles
+// `par.rs`'s sequential stand-ins.
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
 fn the_rows_build_the_grid_the_one_buffer_serial_loop_built() {
@@ -4654,8 +3461,6 @@ fn the_rows_build_the_grid_the_one_buffer_serial_loop_built() {
             let build = || build_voxels(&scan, &req, SITE.0, SITE.1).expect("a grid");
             let grid = build();
 
-            // A grid of nothing agrees with itself trivially, so the rows have
-            // to be carrying work before any of this means anything.
             let filled = grid
                 .indices()
                 .iter()
@@ -4668,9 +3473,6 @@ fn the_rows_build_the_grid_the_one_buffer_serial_loop_built() {
                 shape.cells(),
             );
 
-            // Cell by cell rather than slice against slice: a whole-plane
-            // `assert_eq!` prints 34 891 numbers twice and says nothing about
-            // which one moved.
             let (indices, values) = serial_reference_grid(&scan, &req, SITE.0, SITE.1);
             for (cell, (&got, &want)) in grid.indices().iter().zip(&indices).enumerate() {
                 assert_eq!(
@@ -4687,8 +3489,6 @@ fn the_rows_build_the_grid_the_one_buffer_serial_loop_built() {
                 );
             }
 
-            // Stability on top of agreement: settling on the right answer once
-            // could still be a race that usually lands the right way.
             for run in 1..4 {
                 assert_eq!(build(), grid, "{at}: run {run} differs from run 0");
             }

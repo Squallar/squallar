@@ -1,19 +1,10 @@
-//! The crate's charter, held as tests: the parser's dependency ceiling and
-//! the graph position it exists to hold — a parser/transport that does NOT
-//! know the app's fix model. WO-RL-3 flipped the RL-1 edge: rustdar-location
-//! (the facade) now depends on this crate behind its `serial` feature, and
-//! this crate names no rustdar-* package at all.
+//! The crate's charter, held as tests: the parser's dependency ceiling and the
+//! graph position it exists to hold — a parser/transport that does NOT know
+//! the app's fix model, and names no rustdar-* package at all.
 //!
-//! Both helpers read `cargo metadata --no-deps --format-version 1` from the
-//! workspace root. `packages[].dependencies` there are *declared*
-//! dependencies — feature-independent and resolution-independent — so no
-//! feature selection (default, `--all-features`, CI's llvm-cov arm) can mask
-//! or fake what these assert. Dep-name mechanics, recorded at M0 and relied
-//! on here: a workspace-internal dep appears with `"req": "*"` and a `path`;
-//! `kind` is `null` for normal deps (normalised to "normal" below); one name
-//! may legitimately appear once per kind, so entries are judged per
-//! `(kind, name)`. Assertions key on dependency *names*, never on feature
-//! emptiness — a later feature on either crate must not disturb them.
+//! Both helpers read `cargo metadata --no-deps --format-version 1`, whose
+//! `packages[].dependencies` are *declared* dependencies, so no feature
+//! selection can mask them. Entries are judged per `(kind, name)`.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeSet;
@@ -43,9 +34,7 @@ fn metadata() -> serde_json::Value {
 }
 
 /// `(kind, name)` for every dependency `package` declares. `kind: null` is a
-/// normal dependency; target-gated entries carry their kind like any other and
-/// are included — a gated dependency is still a dependency (`serialport` is
-/// optional behind the `serial` feature and is judged here all the same).
+/// normal dependency; target-gated and optional entries are included.
 fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, String)> {
     let packages = meta["packages"]
         .as_array()
@@ -70,9 +59,7 @@ fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, S
 }
 
 /// The parser's allowance: the NMEA grammar, the serial transport (optional,
-/// behind `serial`), time, logging and serde. No rustdar-* name of any kind —
-/// a parser that could name the fix model would let the RL-1 edge grow back,
-/// and a transport that could name UI or radar would stop being a leaf.
+/// behind `serial`), time, logging and serde. No rustdar-* name of any kind.
 #[test]
 fn the_dependency_ceiling_holds() {
     const NORMAL_CEILING: &[&str] = &["chrono", "log", "nmea", "serde", "serialport"];
@@ -100,8 +87,7 @@ fn the_dependency_ceiling_holds() {
         );
     }
 
-    // Falsifiability floor: the crate really declares its named deps, so a
-    // broken parse or a renamed package cannot pass as an empty set.
+    // Falsifiability floor: the crate really declares its named deps.
     assert!(
         deps.iter().any(|(k, n)| k == "normal" && n == "nmea"),
         "rustdar-nmea-serial no longer declares nmea (normal) — either the \

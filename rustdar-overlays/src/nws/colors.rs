@@ -1,6 +1,5 @@
 use crate::types::{NWS_FILL_ALPHA, STROKE_ALPHA};
 
-/// All keywords must match; first matching entry wins.
 struct AlertColorEntry {
     keywords: &'static [&'static str],
     r: u8,
@@ -19,7 +18,6 @@ impl AlertColorEntry {
 /// precede less specific ones ("warning"). Every entry must match a real name
 /// in `event_types.txt` — see `every_live_entry_matches_a_real_event`.
 static ALERT_COLORS: &[AlertColorEntry] = &[
-    // ── Warnings (most severe first) ──
     AlertColorEntry {
         keywords: &["tornado", "warning"],
         r: 255,
@@ -63,10 +61,7 @@ static ALERT_COLORS: &[AlertColorEntry] = &[
         b: 139,
     }, // Dark magenta
     // Blue, and **not** the retired Wind Chill Warning's LightSteelBlue: the
-    // 2022 hazard simplification was not symmetric. NWS carried the old
-    // *watch* colour onto Extreme Cold Watch and the old *advisory* colour
-    // onto the new Cold Weather Advisory, but Extreme Cold Warning already
-    // existed as its own Alaska product in Blue and kept it. See
+    // 2022 hazard simplification was not symmetric. See
     // `the_renamed_cold_and_heat_products_match_the_nws_published_colours`.
     AlertColorEntry {
         keywords: &["extreme cold", "warning"],
@@ -116,7 +111,6 @@ static ALERT_COLORS: &[AlertColorEntry] = &[
         g: 112,
         b: 214,
     }, // Orchid
-    // ── Watches ──
     AlertColorEntry {
         keywords: &["tornado", "watch"],
         r: 255,
@@ -165,7 +159,6 @@ static ALERT_COLORS: &[AlertColorEntry] = &[
         g: 222,
         b: 173,
     }, // NavajoWhite
-    // ── Advisories / Statements ──
     AlertColorEntry {
         keywords: &["wind advisory"],
         r: 210,
@@ -252,8 +245,7 @@ static ALERT_COLORS: &[AlertColorEntry] = &[
 /// third-party mirrors still carry them.
 ///
 /// Consulted after `ALERT_COLORS` and before the fallbacks, so a retired name
-/// can never shadow a live product. Each must match *no* current event name;
-/// see `retired_entries_are_actually_retired`.
+/// can never shadow a live product.
 static RETIRED_ALERT_COLORS: &[AlertColorEntry] = &[
     AlertColorEntry {
         keywords: &["excessive heat", "warning"],
@@ -317,7 +309,6 @@ static FALLBACK_COLORS: &[AlertColorEntry] = &[
     }, // Wheat
 ];
 
-/// Reserved for "no styling at all"; no table entry may use it.
 const UNKNOWN_EVENT: (u8, u8, u8) = (200, 200, 200);
 
 /// Returns `(fill_rgba, stroke_rgba)`. Tries `ALERT_COLORS`, then the retired
@@ -349,8 +340,6 @@ mod tests {
     /// instructions are in the file's own header.
     const EVENT_TYPES_FIXTURE: &str = include_str!("event_types.txt");
 
-    /// Reserved: nothing else may render as these. Pure red must mean a tornado
-    /// is on the ground.
     const TORNADO_WARNING_RED: (u8, u8, u8) = (255, 0, 0);
     const TORNADO_WATCH_YELLOW: (u8, u8, u8) = (255, 255, 0);
 
@@ -369,8 +358,6 @@ mod tests {
 
     #[test]
     fn fixture_is_populated() {
-        // An empty or mis-parsed fixture makes every "for each real event"
-        // assertion below pass vacuously.
         let events = sample_events();
         assert!(
             events.len() > 100,
@@ -394,12 +381,9 @@ mod tests {
         assert_eq!(fill, [200, 200, 200, NWS_FILL_ALPHA]);
     }
 
-    // ── The bug this module was fixed for ──────────────────────────────────
 
     #[test]
     fn extreme_heat_is_not_tornado_coloured() {
-        // Keyed off the retired "Excessive Heat" name, these fell through to
-        // the suffix rows and painted byte-identically to tornado red/yellow.
         assert_eq!(rgb_of("Extreme Heat Warning"), (199, 21, 133));
         assert_eq!(rgb_of("Extreme Heat Watch"), (128, 0, 0));
         assert_ne!(rgb_of("Extreme Heat Warning"), TORNADO_WARNING_RED);
@@ -408,7 +392,6 @@ mod tests {
 
     #[test]
     fn extreme_cold_is_not_tornado_coloured() {
-        // Same failure mode via the "Wind Chill" rename.
         assert_eq!(rgb_of("Extreme Cold Warning"), (0, 0, 255));
         assert_eq!(rgb_of("Extreme Cold Watch"), (95, 158, 160));
         assert_eq!(rgb_of("Cold Weather Advisory"), (175, 238, 238));
@@ -422,9 +405,7 @@ mod tests {
     /// **These values are NWS's, not ours.** Transcribed from the
     /// "Watch/Warning/Advisory Color Table" at <https://www.weather.gov/help-map>
     /// (fetched 2026-08-13; 111 rows, one per `api.weather.gov/alerts/types`
-    /// entry), columns *Event / Priority / Color Name / RGB / Hex*. The
-    /// priority column is quoted alongside so a future reader can find the row
-    /// again in a table sorted by it.
+    /// entry), columns *Event / Priority / Color Name / RGB / Hex*.
     const NWS_PUBLISHED_COLD_AND_HEAT: &[PublishedColor] = &[
         PublishedColor::new(
             "Extreme Heat Warning",
@@ -444,14 +425,11 @@ mod tests {
         PublishedColor::new("Extreme Cold Watch", 94, (95, 158, 160), "CadetBlue"),
     ];
 
-    /// One row of NWS's table, in NWS's own columns.
     struct PublishedColor {
         event: &'static str,
-        /// NWS's stacking priority, 1 = drawn over everything. Quoted only so
-        /// a reader can find the row again; we do not model it.
+        /// NWS's stacking priority, 1 = drawn over everything. Not modelled.
         priority: u8,
         rgb: (u8, u8, u8),
-        /// NWS's colour name for that RGB.
         name: &'static str,
     }
 
@@ -475,19 +453,11 @@ mod tests {
     /// `Extreme Cold Warning` in the retired Wind Chill Warning's
     /// LightSteelBlue `B0C4DE` instead of its own Blue `0000FF`.
     ///
-    /// When NWS retired the Wind Chill family in 2022 it carried the old
-    /// *watch* colour onto `Extreme Cold Watch` and the old *advisory* colour
-    /// onto the new `Cold Weather Advisory` — but not the *warning*'s, because
-    /// `Extreme Cold Warning` already existed as an Alaska product in Blue and
-    /// kept it. Four of the five renamed products were right; exactly one was
-    /// not, and nothing in the module compared any of them to the authority.
-    ///
-    /// Checking against [`NWS_PUBLISHED_COLD_AND_HEAT`] rather than against
-    /// `ALERT_COLORS` is the point: a test that reads our own table can only
-    /// ever agree with itself, which is precisely how a self-consistent wrong
-    /// colour survived — `retired_names_still_render_like_their_replacements`
-    /// pinned Wind Chill Warning to Extreme Cold Warning and both were wrong
-    /// together.
+    /// When NWS retired the Wind Chill family in 2022 it carried the old *watch*
+    /// colour onto `Extreme Cold Watch` and the old *advisory* colour onto the
+    /// new `Cold Weather Advisory` — but not the *warning*'s. Checking against
+    /// [`NWS_PUBLISHED_COLD_AND_HEAT`] rather than against `ALERT_COLORS` is the
+    /// point: a test that reads our own table can only agree with itself.
     #[test]
     fn the_renamed_cold_and_heat_products_match_the_nws_published_colours() {
         for row in NWS_PUBLISHED_COLD_AND_HEAT {
@@ -531,7 +501,6 @@ mod tests {
         );
     }
 
-    // ── Collision guards ───────────────────────────────────────────────────
 
     #[test]
     fn only_tornado_warning_is_pure_red() {
@@ -561,8 +530,6 @@ mod tests {
 
     #[test]
     fn semantically_distinct_hazards_have_distinct_colours() {
-        // One representative per styled hazard/severity class. Same family and
-        // tier (Flood Warning vs Coastal Flood Warning) may share a colour.
         const DISTINCT: &[&str] = &[
             "Tornado Warning",
             "Tornado Watch",
@@ -600,7 +567,6 @@ mod tests {
             "Beach Hazards Statement",
             "Air Quality Alert",
             "Special Weather Statement",
-            // Generic-fallback representatives, one per suffix tier.
             "Avalanche Warning",
             "Avalanche Watch",
             "Ashfall Advisory",
@@ -633,13 +599,11 @@ mod tests {
         }
     }
 
-    // ── Rename detection ───────────────────────────────────────────────────
 
     #[test]
     fn every_live_entry_matches_a_real_event() {
         // Turns the next upstream rename into a test failure. Otherwise the
-        // keywords stop matching, the alerts fall through to a generic colour,
-        // nothing panics, and the map quietly starts lying.
+        // alerts fall through to a generic colour and the map quietly lies.
         let events = sample_events();
         for entry in ALERT_COLORS.iter().chain(FALLBACK_COLORS) {
             let matched = events.iter().any(|e| entry.matches(&e.to_lowercase()));
@@ -657,8 +621,6 @@ mod tests {
 
     #[test]
     fn every_live_entry_is_reachable() {
-        // A row can also die by being fully shadowed by an earlier row, which
-        // the match-a-real-event check above does not catch.
         let events = sample_events();
         for (i, entry) in ALERT_COLORS.iter().enumerate() {
             let wins = events.iter().any(|e| {
@@ -675,8 +637,6 @@ mod tests {
 
     #[test]
     fn retired_entries_are_actually_retired() {
-        // A retired alias that starts matching a live name can shadow a real
-        // entry, and means the product was un-retired.
         let events = sample_events();
         for entry in RETIRED_ALERT_COLORS {
             let live: Vec<&&str> = events
@@ -695,7 +655,6 @@ mod tests {
 
     #[test]
     fn no_real_event_is_left_unstyled_by_severity() {
-        // Severity must stay legible even for products styled only by suffix.
         for event in sample_events() {
             let lower = event.to_lowercase();
             let has_suffix = ["warning", "watch", "advisory", "statement"]

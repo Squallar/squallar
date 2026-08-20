@@ -1,12 +1,8 @@
 //! A measurement harness: one real Level II volume, rendered offscreen through
-//! the production raymarch at a camera measured somewhere else.
-//!
-//! This file adds **no** assertion about how rustdar should look. It exists so
-//! that a projection matrix lifted from another application can be pointed at
-//! rustdar's own pipeline and the two silhouettes compared pixel for pixel. The
-//! test is `#[ignore]`d and reads every parameter from the environment, because
-//! its inputs are a file on someone's disk and a camera nothing in this repo
-//! can derive.
+//! the production raymarch at a camera measured somewhere else. It asserts
+//! nothing about how rustdar should look; it exists so a projection matrix
+//! lifted from another application can be pointed at rustdar's own pipeline and
+//! the silhouettes compared pixel for pixel. `#[ignore]`d and env-driven.
 //!
 //! ```text
 //! VOL=/path/to/KDMX20250314_175512_V06 \
@@ -15,117 +11,25 @@
 //! cargo test -p rustdar-gpu --test volume_real_mask -- --ignored --nocapture
 //! ```
 //!
-//! # The environment contract
+//! Required: `VOL`, `CENTRE_LAT`, `CENTRE_LON`, `THRESH` (the mask's cut, in
+//! the moment's own units), `OUT` (path prefix). Optional: `SITE` (position
+//! always comes from the volume), `HALF_KM`/`HALF_E_KM`/`HALF_N_KM` (80),
+//! `BASE_KM` (0) / `TOP_KM` (18), `PRODUCT` (`BR`; also `BV`, `SW`, `ZDR`,
+//! `PHI`, `RHO`, `SRV`, `NROT`, `KDP`), `MOTION` (`speed_kt,dir_from_deg`, for
+//! `SRV`), `CAM`, `YAW`/`PITCH`/`DIST`/`EXAG`, `SIZE` (`1200x900`),
+//! `EXTINCTION` (800/km), `MASK_LOD` (0), `MASK_STEP` (1 cell).
 //!
-//! | variable | required | default | meaning |
-//! |---|---|---|---|
-//! | `VOL` | yes | — | Path to an uncompressed NEXRAD Level II archive file (`AR2V…`). |
-//! | `SITE` | no | the identifier the volume's own radials carry | ICAO the radar is filed under. Its **position** always comes from the volume. |
-//! | `CENTRE_LAT` | yes | — | Region centre latitude, degrees. |
-//! | `CENTRE_LON` | yes | — | Region centre longitude, degrees. |
-//! | `HALF_KM` | no | `80.0` | Region half-extent, km, on **both** axes. |
-//! | `HALF_E_KM` | no | `HALF_KM` | Region half-extent east–west, km, overriding `HALF_KM` on that axis alone. |
-//! | `HALF_N_KM` | no | `HALF_KM` | Region half-extent north–south, km. `HalfExtentKm::clamped` floors each axis at 10 km and holds the corner inside 470. |
-//! | `BASE_KM` | no | `0.0` | Box base, km MSL. |
-//! | `TOP_KM` | no | `18.0` | Box top, km MSL. |
-//! | `PRODUCT` | no | `BR` | Product: the six moments `BR`/`REF`, `BV`/`VEL`, `SW`, `ZDR`, `PHI`, `RHO`/`CC`, or the three derivations `SRV`, `NROT`, `KDP`. |
-//! | `MOTION` | no | — | Storm motion override for `SRV`, as `speed_kt,direction_from_deg`. Without it SRV uses the volume's own Bunkers fit, and refuses if there is none. |
-//! | `THRESH` | yes | — | The mask's cut, in the moment's own units (dBZ for `BR`). |
-//! | `CAM` | no | — | Path to a text file of 19 whitespace-separated `f32`s. |
-//! | `YAW` | no | `OrbitCamera::default()` | Fallback camera yaw, degrees — used only without `CAM`. |
-//! | `PITCH` | no | `OrbitCamera::default()` | Fallback camera pitch, degrees. |
-//! | `DIST` | no | `OrbitCamera::default()` | Fallback eye distance, in `volume_view::framing_radius_km`. |
-//! | `EXAG` | no | `OrbitCamera::default()` | Fallback vertical exaggeration. |
-//! | `SIZE` | no | `1200x900` | Output size, `WxH` pixels. |
-//! | `EXTINCTION` | no | `800.0` | Extinction per km for the **mask** render. |
-//! | `MASK_LOD` | no | `0.0` | Reconstruction level for the **mask** render — 0 is the raw-field instrument; the cloud rung's level turns the mask into a class-coverage measurement of the reconstruction. |
-//! | `MASK_STEP` | no | `1.0` | March step for the **mask** render, in cells. |
-//! | `OUT` | yes | — | Output path prefix; the three files below are written under it. |
+//! `.gz` volumes are refused rather than mis-decoded: `rustdar-radar` reaches
+//! Level II through `nexrad_data::volume::File`, which understands only the
+//! bzip2-per-LDM-record framing. `gunzip` first.
 //!
-//! `.gz` volumes are **not** supported and are refused with a message rather
-//! than mis-decoded: `rustdar-radar` reaches Level II through
-//! `nexrad_data::volume::File`, which understands the bzip2-per-LDM-record
-//! framing and nothing else, and no whole-file gunzip exists anywhere in this
-//! crate's dependency set. `gunzip` the file first.
-//!
-//! # `CAM`, and its exact layout
-//!
-//! Nineteen `f32`s, whitespace-separated, in one file:
-//!
-//! * the first **sixteen** are `box_from_clip` in **column-major** order —
-//!   `m[0][0] m[0][1] m[0][2] m[0][3] m[1][0] … m[3][3]`, column 0 first. That
-//!   is `VolumeUniform::box_from_clip`'s own `[[f32; 4]; 4]` layout (`m[column][row]`)
-//!   and WGSL's `mat4x4`, so the numbers go in with no transpose;
-//! * the next **three** are `eye_in_box`, the perspective eye in the box's own
-//!   `0..1` coordinates.
-//!
-//! Box space is the unit cube: `(0,0,0)` is the box's west/south/bottom corner
-//! and `(1,1,1)` its east/north/top one, with the axes in the grid's own order
-//! (x east, y north, z up). `box_size_km` is passed to the uniform separately
-//! and is the **true, unexaggerated** extent, exactly as
-//! `volume_bridge::box_size_km` computes it — so a caller that wants a
-//! vertically exaggerated picture must bake the stretch into its own matrix,
-//! not into this number.
-//!
-//! Without `CAM` the camera is built by `rustdar_egui::volume_view::view_for`
-//! from `YAW`/`PITCH`/`DIST`/`EXAG`, which is what the application itself does,
-//! so the harness is usable with no external measurement at all.
-//!
-//! # What is written
-//!
-//! * `<OUT>_mask.pgm` — binary P5, the alpha channel of the **hard-LUT** render.
-//! * `<OUT>_colour.ppm` — binary P6, the **production-LUT** render
-//!   un-premultiplied and composited over **black**.
-//! * `<OUT>_floor.ppm` — binary P6, the same render again with the **map
-//!   floor** under it: the 2D rasterizer's own picture planted in a real
-//!   `PaneMirror` and reprojected onto the box's bottom face by the shader,
-//!   exactly as the frame path does it with the 2D pane's mirror. Written only
-//!   when the volume has a reflectivity tilt for the rasterizer to draw.
-//! * `<OUT>_meta.txt` — the numbers behind them, also printed to stdout.
-//!
-//! # Why the hard LUT makes the alpha channel a mask
-//!
-//! The palette handed to the mask render is built from the grid's own
-//! `index_to_value`: every index whose decoded value is below `THRESH` gets
-//! alpha 0, every index at or above it gets opaque white. The shader's
-//! `absorbed = 1 - exp(-entry.a · extinction · segment_km)` is therefore
-//! **exactly zero** below the cut, and at `EXTINCTION` = 800/km a single
-//! kilometre above it saturates — so the returned alpha is coverage, not
-//! opacity, and the early-out on transmittance stops the march at the first
-//! hit. Gradient shading is off for the same render: it multiplies colour, not
-//! alpha, but it costs six extra fetches to change nothing.
-//!
-//! Two things keep this from being the mathematically exact projection of
-//! `{value >= THRESH}`, and both are the production pipeline's own behaviour
-//! rather than this harness's:
-//!
-//! * the grid texture's sampler is `Linear` over a coverage-premultiplied
-//!   `Rg16Float` grid, so a fetch straddling an echo edge returns a real
-//!   neighbouring **index** — never one the field does not hold — at a
-//!   *coverage* below 1, and the march scales its optical depth by that
-//!   coverage. At the production extinction that is a soft edge one voxel
-//!   wide; at this harness's saturating `EXTINCTION` both ends of the ramp
-//!   saturate, so the silhouette instead runs out to the first air texel's
-//!   centre — **dilated** by up to half a voxel rather than eroded by up to
-//!   half a voxel as the pre-coverage `R8Unorm` path was. The total optical
-//!   depth is the hard field's either way (the tent is a partition of unity);
-//!   what the saturating instrument sees is where that depth was spread to;
-//! * the march steps `RAYMARCH_STEP_CELLS` cells along the ray with a
-//!   deterministic per-pixel jitter of the comb's phase, so a chord shorter
-//!   than one step — a silhouette tangent — is hit or missed by the pixel's
-//!   own hash. That is a one-pixel ring of noise on the mask's boundary, not
-//!   the whole-feature loss the fixed 96-step march it replaced could show.
-//!
-//! Neither is corrected here. A harness that silently rendered something other
-//! than what ships would measure the wrong thing.
-//!
-//! # Why this drives `VolumePipelines` directly
-//!
-//! `BridgeVolumePainter` refuses a palette whose `fade_band()` is short and
-//! refuses a single-tilt volume, and a hard LUT has a fade band of zero by
-//! construction — the whole point of it is that there is no ramp. Going through
-//! the bridge would return `VolumePaint::Empty` and measure nothing, so this
-//! goes to `VolumePipelines` the way `tests/volume_gpu.rs` does.
+//! `CAM` is nineteen whitespace-separated `f32`s: sixteen for `box_from_clip`
+//! in **column-major** order (`VolumeUniform::box_from_clip`'s own
+//! `m[column][row]` layout and WGSL's `mat4x4`, so no transpose), then three for
+//! `eye_in_box`. Box space is the unit cube — `(0,0,0)` west/south/bottom,
+//! `(1,1,1)` east/north/top, axes x east, y north, z up. `box_size_km` is passed
+//! separately and is the **true, unexaggerated** extent, so a caller wanting
+//! vertical exaggeration bakes the stretch into its own matrix.
 #![cfg(not(target_arch = "wasm32"))]
 
 use egui_wgpu::wgpu;
@@ -149,8 +53,6 @@ use live_volume::{scan_from_archive, site_of};
 
 /// Build a real volume, render it twice, and write a mask, a picture and the
 /// numbers behind both.
-///
-/// See the module doc for the invocation and for every environment variable.
 #[test]
 #[ignore = "needs a real wgpu adapter and a Level II file on disk; see the module doc"]
 fn render_a_real_volume_mask() {
@@ -213,12 +115,6 @@ fn render_a_real_volume_mask() {
 
     // The mask. Opaque-or-nothing palette, extinction high enough that one
     // kilometre saturates, and no shading — see the module doc.
-    //
-    // `MASK_LOD` and `MASK_STEP` (defaults 0 and 1: the instrument
-    // configuration) march the mask at another reconstruction level and step
-    // — the knobs the coarse-grid class-count measurement turns: the same
-    // hard cut rendered at LOD 0 and at the cloud rung's level is exactly
-    // "how much of the ≥THRESH region does the reconstruction still paint".
     let mut uniform = VolumeUniform::new(box_size_km, grid_dims);
     uniform.box_from_clip = box_from_clip;
     uniform.eye_in_box = eye_in_box;
@@ -277,14 +173,6 @@ fn render_a_real_volume_mask() {
     // real `PaneMirror`, and the raymarch reprojecting the volume's footprint
     // into it through the same two uniform lanes the bridge fills — written as
     // a third frame beside the mask and the colour render.
-    //
-    // The floor is no longer an image resampled onto the box's footprint. It is
-    // the 2D pane's own render, copied: a **Web Mercator** picture of the whole
-    // frame that `floor_colour` reprojects into per pixel, at each pixel's own
-    // latitude. Nothing is lost by having no pane here, because the rasterizer's
-    // output already *is* a Web Mercator picture on `ImageBounds`' grid — so it
-    // stands in for a mirror exactly, and the lanes below are read off that
-    // grid's own arithmetic rather than guessed at.
     let floor_pixels = rustdar_radar::render::find_closest_elevation(
         &scan,
         rustdar_radar::types::RadarProduct::Reflectivity,
@@ -312,10 +200,6 @@ fn render_a_real_volume_mask() {
             // have to describe that box and no other. On a real super-res volume
             // the extent is 458 km, not the 230 the raster was fixed at when this
             // harness was written.
-            //
-            // The side comes off the buffer rather than from a constant, because
-            // this render went through the unsized entry and a later one might
-            // not: what the lanes below need is the side of *this* picture.
             let bounds =
                 rustdar_radar::types::ImageBounds::from_radar_site(site_lat, site_lon, extent_km);
             let side = (image.len() / 4).isqrt() as u32;
@@ -355,8 +239,6 @@ fn render_a_real_volume_mask() {
             // longitude about half the side, and y is
             // `(mercator_y_max - mercator_y) / span` measured down from the top —
             // hence a negative v rate, v running down while Mercator y runs north.
-            // v at the site is *not* 0.5: the bounds are symmetric in latitude and
-            // Mercator's y is not.
             let merc_span = bounds.mercator_y_max - bounds.mercator_y_min;
             let site_merc = (std::f64::consts::FRAC_PI_4 + site_lat.to_radians() / 2.0)
                 .tan()
@@ -499,76 +381,6 @@ fn render_a_real_volume_mask() {
 
 /// Two numbers about the reconstruction, on a real volume: how much of what it
 /// paints is **fabricated**, and how **blocky** what it paints is.
-///
-/// Both are rendered through the production raymarch at a camera the
-/// environment names, so the comparison between two builds is a comparison of
-/// reconstructions and of nothing else. Run it on this build and on the build
-/// before it with the same environment; the difference is the answer.
-///
-/// # Honest: the sub-data band census
-///
-/// The fabrication mechanism the coverage channel exists to remove is
-/// specific: a plain `R8Unorm` `Linear` fetch at a data/air boundary blends a
-/// real index `x` against the no-data index 0, so it returns indices in
-/// `(0, x)` — palette bands **below** everything the field actually holds. For
-/// a sequential ramp whose bottom is transparent that fades out; for a
-/// diverging, inverted or flat one it paints, and paints a class the data
-/// never occupied (the KLOT 2026-08-10 NROT arcs).
-///
-/// So the census is: find the band at the bottom of the ramp that the data
-/// essentially does not occupy, and count the pixels the render paints in it.
-///
-/// * `q` is the largest index such that at most `BAND_FRACTION` of the grid's
-///   measured cells sit at or below it. Sized from the data rather than
-///   written down, so it means the same thing for every product and every
-///   volume.
-/// * The census render uses a hard LUT — opaque white on `1..=q`, transparent
-///   everywhere else — at `EXTINCTION` per km, so one sample in the band
-///   saturates a pixel and the alpha channel is a **coverage of the band**,
-///   not an opacity.
-/// * `band_px` is therefore "pixels showing a class at most `BAND_FRACTION` of
-///   the data occupies". The honest floor is not zero — some cells really are
-///   down there — which is why the complementary `data_px` is printed beside
-///   it and why the comparison is against another build, not against a
-///   constant.
-///
-/// A coverage-premultiplied reconstruction cannot exceed the honest floor at
-/// all: `R̄ / Ḡ` is a weighted mean of the stored indices around the sample, so
-/// it lies in their convex hull and no boundary sample can reach below the
-/// smallest index near it.
-///
-/// # Smooth: two metrics, both on the production colour render
-///
-/// * **Step density.** Among 4-adjacent pixel pairs that are both painted, the
-///   fraction whose 8-bit luminance differs by at least `STEP_LEVELS`. A
-///   nearest-neighbour march reconstructs a piecewise-constant field, so its
-///   render is plateaus separated by cell-face cliffs and this number is high;
-///   a filtered reconstruction varies gradually and it is low. This is the
-///   metric that sees *interior* blockiness, which is most of what "blocky"
-///   means here.
-/// * **Silhouette roughness.** `perimeter / sqrt(area)` of the painted mask,
-///   with perimeter counted as 4-adjacent painted/unpainted pairs. Scale-free,
-///   and a staircased outline has a longer perimeter than a smooth one round
-///   the same area, so lower is smoother. It sees the *outline* rather than
-///   the interior, which is the half the step density cannot.
-///
-/// Neither is a threshold anything asserts — this is an instrument, like the
-/// file it lives in. It prints, and a human or a diff compares.
-///
-/// ```text
-/// VOL=… CENTRE_LAT=… CENTRE_LON=… THRESH=20 OUT=/tmp/rd PRODUCT=NROT \
-/// cargo test -p rustdar-gpu --test volume_real_mask -- --ignored \
-///     measure_boundary_honesty_and_smoothness --nocapture
-/// ```
-///
-/// Extra environment beyond the module doc's:
-///
-/// | variable | default | meaning |
-/// |---|---|---|
-/// | `BAND_FRACTION` | `0.001` | Fraction of measured cells the sub-data band may contain. |
-/// | `STEP_LEVELS` | `8` | Luminance difference counted as a visible step. |
-/// | `CENSUS_LOD` | `0.0` | Reconstruction level for the census render. |
-/// | `COLOUR_LOD` | bridge taper | Reconstruction level for the smoothness render. Set `-1` on a build that still has the nearest sentinel to measure the shipped blocky path. |
 #[test]
 #[ignore = "needs a real wgpu adapter and a Level II file on disk; see the doc comment"]
 fn measure_boundary_honesty_and_smoothness() {
@@ -813,10 +625,6 @@ fn box_size_km(grid: &VoxelGrid) -> [f32; 3] {
 
 /// A palette that is opaque at or above `threshold` and absent below it, plus
 /// the index the cut landed on.
-///
-/// Index 0 is `[0, 0, 0, 0]` whatever the threshold: it is both the bottom of
-/// the affine ramp and the no-data value, so painting it would paint every cell
-/// the radar never looked at.
 fn hard_lut(grid: &VoxelGrid, threshold: f32) -> (Vec<u8>, u8) {
     let mut lut = vec![0u8; VOLUME_LUT_BYTES];
     let mut cut = None;
@@ -839,11 +647,6 @@ fn hard_lut(grid: &VoxelGrid, threshold: f32) -> (Vec<u8>, u8) {
 
 /// `box_from_clip`, `eye_in_box` and the vertical exaggeration, from `CAM` or
 /// from the orbit camera.
-///
-/// The `CAM` path reports exaggeration 1.0: the file holds a finished matrix
-/// with the stretch already baked in, and there is no way to recover the knob
-/// from it. The shading is then lit against the true geometry, which is what
-/// 1.0 means.
 fn camera(box_size_km: [f32; 3], size: [u32; 2]) -> (String, [[f32; 4]; 4], [f32; 3], f32) {
     if let Ok(path) = std::env::var("CAM") {
         let text =
@@ -913,19 +716,6 @@ fn camera(box_size_km: [f32; 3], size: [u32; 2]) -> (String, [[f32; 4]; 4], [f32
 
 /// The grid shape this machine's adapter actually builds, asked the way the
 /// application asks it.
-///
-/// **Not `DESKTOP_SHAPE`.** That constant is the *budget* — the cell count a
-/// desktop may spend — and since `shape_for_budget` landed it stopped being the
-/// shape a desktop builds. On an adapter reporting 512 or more,
-/// [`default_shape`] answers 512 × 512 × 32, so a harness naming the constant
-/// rendered **half the horizontal resolution and four times the vertical** of
-/// what ships, silently, from the moment the two meanings diverged.
-///
-/// The instrument whose job is showing what the application draws has to ask
-/// the question the application asks. Restating the answer is what went stale;
-/// the same fault has now been found three times in this directory — a
-/// hard-coded camera the app never opens with, a `km_per_texel` taken from one
-/// axis and applied to both, and this.
 fn production_shape() -> rustdar_radar::voxel::VoxelShape {
     let instance =
         wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
@@ -1005,10 +795,6 @@ fn raymarch_once(
 }
 
 /// Read an RGBA8 texture back as one `[u8; 4]` per texel, row-major.
-///
-/// `copy_texture_to_buffer` wants rows padded to
-/// `COPY_BYTES_PER_ROW_ALIGNMENT`, so the padding is added on the way out and
-/// stripped on the way back.
 fn read_back(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -1076,12 +862,6 @@ fn write_pgm(path: &str, size: [u32; 2], grey: &[u8]) {
 }
 
 /// The offscreen's colour, binary P6.
-///
-/// The shader's output is gamma-encoded and **premultiplied**. Compositing over
-/// black is `rgb·a + 0·(1 − a)`, which is the premultiplied value itself — so
-/// the bytes go out unchanged and the un-premultiply cancels rather than being
-/// skipped. Over any other background it would not, which is why the background
-/// is named here and in the meta block.
 fn write_ppm(path: &str, size: [u32; 2], pixels: &[[u8; 4]]) {
     assert_eq!(pixels.len(), (size[0] * size[1]) as usize);
     let mut out = format!("P6\n{} {}\n255\n", size[0], size[1]).into_bytes();
@@ -1111,12 +891,6 @@ where
 }
 
 /// The region's half-extent from the environment.
-///
-/// `HALF_KM` sets both axes; `HALF_E_KM` and `HALF_N_KM` override one each. A
-/// pane's box is the rectangle of ground its viewport shows, so a harness that
-/// could only ask for a square could not render what the application renders —
-/// and the anisotropy that shape costs is exactly the thing worth measuring
-/// here.
 fn half_extent_from_env() -> HalfExtentKm {
     let both = parsed_or("HALF_KM", 80.0);
     HalfExtentKm {
@@ -1142,26 +916,11 @@ where
 
 /// `PRODUCT`, restricted to what `rustdar_radar::derive::volume_slot` accepts
 /// — anything else makes `build_voxels` return `None` with no explanation here.
-///
-/// `volume_slot`, not `samplable`. The narrower predicate is what this parser
-/// used to enforce, and it refused exactly the three products the no-data
-/// reconstruction fix was built for: the measurement that fix rests on —
-/// "NROT's LUT is opaque green over indices ~64-90 and every boundary between
-/// sub-threshold data and empty air interpolates through it" — could not be
-/// re-run through this harness at all, because it panicked on `PRODUCT=NROT`.
-/// A harness that cannot be pointed at the case it exists for is not an
-/// instrument.
 fn product_from_env() -> RadarProduct {
     product_from_name(&std::env::var("PRODUCT").unwrap_or_else(|_| "BR".to_owned()))
 }
 
 /// [`product_from_env`]'s parse, without the environment.
-///
-/// Split out so the accepted set has a test. It did not: every spelling here
-/// was reachable only by running the `#[ignore]`d harness with a real archive,
-/// so the three products that were *missing* were missing silently — the whole
-/// point of a parser being that the failure is a panic at the door rather than
-/// a `None` three frames later.
 fn product_from_name(raw: &str) -> RadarProduct {
     let product = match raw.trim().to_ascii_uppercase().as_str() {
         "BR" | "REF" | "REFLECTIVITY" => RadarProduct::Reflectivity,
@@ -1193,15 +952,6 @@ fn product_from_name(raw: &str) -> RadarProduct {
 
 /// The harness can be pointed at every product the vertical views render —
 /// which for the three derived ones it could not be at all.
-///
-/// `product_from_name` panicked on anything but BR/BV/SW/ZDR/PHI/CC, so the
-/// two products the no-data reconstruction fix was *built for* were
-/// unreachable from the instrument that measured it. The measurement that fix
-/// rests on — NROT's opaque green over indices ~64-90, painted by
-/// interpolation across the no-data boundary — could not be re-run.
-///
-/// Not `#[ignore]`d: it needs no archive and no GPU, and an ignored test is
-/// how the gap survived.
 #[test]
 fn the_harness_accepts_every_product_the_vertical_views_render() {
     for (name, want) in [
@@ -1236,10 +986,6 @@ fn the_harness_accepts_every_product_the_vertical_views_render() {
 
 /// `MOTION`, the storm motion override SRV derives with, as
 /// `speed_kt,direction_from_deg`.
-///
-/// `None` for every other product, and for SRV without the variable — which
-/// leaves the derivation on the volume's own Bunkers fit, exactly as the app
-/// does with the override switch off.
 fn motion_from_env(product: RadarProduct) -> rustdar_radar::srv::MotionInputs {
     let none = rustdar_radar::srv::MotionInputs::default();
     if product != RadarProduct::StormRelativeVelocity {

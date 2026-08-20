@@ -1,41 +1,20 @@
 use super::*;
 use rustdar_source::id::{LayerId, known};
 
-/// The two durations that bracket the idle backstop, deliberately **not**
-/// derived from `POINTER_IDLE_TIMEOUT_S`.
-///
-/// A probe that sizes its own loop off the constant under test cannot
-/// notice that constant changing — it just moves with it, and both a 32s
-/// and a 600s backstop pass. These are absolute claims about the behaviour
-/// instead: a still hold must survive the first, and a pointer that has
-/// gone silent must not survive the second.
-///
-/// They also have to be *close enough together to say something*. At 90s
-/// the upper claim admitted any backstop up to a minute and a half, so
-/// stretching the shipped minute to 75s left the suite green while the map
-/// stayed hostage to a dead integration a quarter longer. The band below is
-/// 45–70s around a shipped 60: comfortably clear of the longest hold a user
-/// plausibly performs while reading a value, and short enough that "the map
-/// comes back after about a minute" is a claim rather than a gesture.
+/// The two durations that bracket the idle backstop, deliberately **not** derived
+/// from `POINTER_IDLE_TIMEOUT_S`.
 const HOLD_MUST_SURVIVE_S: f64 = 45.0;
 const SILENCE_MUST_EXPIRE_S: f64 = 70.0;
 
-/// Long enough for a deferred single tap to be confirmed
-/// (`DOUBLE_TAP_TIMEOUT_S` is 0.4s).
+/// Long enough for a deferred single tap to be confirmed (`DOUBLE_TAP_TIMEOUT_S` is
+/// 0.4s).
 const AFTER_DOUBLE_TAP_TIMEOUT: f64 = 0.5;
 
 /// How long a "the gesture really ended" assertion must keep watching.
-///
-/// It has to clear `LONG_PRESS_DURATION_S` (0.8s) by a wide margin — that
-/// is how long a detector that re-arms itself off a stale pointer takes to
-/// come back — and it also has to be long enough that a pointer which is
-/// *supposed* to stay dead is watched over a realistic span rather than a
-/// couple of seconds. Half a minute of frame-by-frame checking is cheap
-/// here (the whole suite runs headless in well under a second).
 const WATCH_PAST_LONG_PRESS: f64 = 30.0;
 
-/// 1. A single mouse click reports a click position at the clicked point
-///    and never suppresses panning.
+/// 1. A single mouse click reports a click position at the clicked point and never
+/// suppresses panning.
 #[test]
 fn mouse_single_click_reports_click_pos() {
     let mut h = InputHarness::new();
@@ -47,13 +26,12 @@ fn mouse_single_click_reports_click_pos() {
     assert!(!outcome.mouse.suppress_pan);
     assert_eq!(outcome.mouse.long_press_pos, None);
 
-    // The click is a single-frame event: the next frame is clean again.
     let next = h.frame_after(FRAME_DT);
     assert_eq!(next.mouse.overlay_click_pos, None);
 }
 
-/// 2. A mouse double click reports a click on each release, and the touch
-///    pipeline defers instead of firing two overlay taps.
+/// 2. A mouse double click reports a click on each release, and the touch pipeline
+/// defers instead of firing two overlay taps.
 #[test]
 fn mouse_double_click_reports_each_click() {
     let mut h = InputHarness::new();
@@ -62,20 +40,16 @@ fn mouse_double_click_reports_each_click() {
     let first = h.mouse_click(pos);
     assert_eq!(first.mouse.overlay_click_pos, Some(pos));
 
-    // Second click inside egui's double-click window.
     let second = h.mouse_click(pos);
     assert_eq!(second.mouse.overlay_click_pos, Some(pos));
     assert!(!second.mouse.suppress_pan);
 
-    // The touch pipeline treats the same input as a double-tap: no overlay
-    // tap is emitted while the second press is pending.
     assert_eq!(first.touch.overlay_click_pos, None);
     assert_eq!(second.touch.overlay_click_pos, None);
 }
 
-/// 3. Pressing and holding for ~1s without moving is a long press: it
-///    reports the held position and suppresses map panning, and it is not
-///    a click.
+/// 3. Pressing and holding for ~1s without moving is a long press: it reports the
+/// held position and suppresses map panning, and it is not a click.
 #[test]
 fn press_and_hold_becomes_long_press() {
     let mut h = InputHarness::new();
@@ -89,7 +63,6 @@ fn press_and_hold_becomes_long_press() {
     );
     assert!(!pressed.touch.suppress_pan);
 
-    // Hold for ~1s (LONG_PRESS_DURATION_S is 0.8s) without moving.
     let held = h.frames_for(10, 0.1);
     assert_eq!(held.touch.long_press_pos, Some(pos));
     assert!(held.touch.suppress_pan, "long press owns the pointer");
@@ -98,7 +71,6 @@ fn press_and_hold_becomes_long_press() {
         "a press with no release is not a click"
     );
 
-    // Releasing ends the long press; the slow release is not a tap either.
     h.mouse_release(pos);
     let released = h.frame_after(FRAME_DT);
     assert_eq!(released.touch.long_press_pos, None);
@@ -112,19 +84,12 @@ fn press_and_hold_becomes_long_press() {
 }
 
 /// 3b. The long press must not fire **early**.
-///
-///     Test 3 only pins the late direction — that a 1s hold does raise the
-///     tooltip — so shortening `LONG_PRESS_DURATION_S` to a hundredth of a
-///     second passes it. Early is the direction that hurts: the tooltip
-///     appearing under an ordinary tap, or the moment a pan begins, taking
-///     the drag away from the map.
 #[test]
 fn a_long_press_does_not_fire_before_its_threshold() {
     let mut h = InputHarness::new();
     let pos = h.map_center();
 
     h.touch_start(pos);
-    // 0.7s of held, motionless finger: still short of LONG_PRESS_DURATION_S.
     h.assert_every_frame_for(0.7, 0.05, |frame, outcome| {
         assert_eq!(
             outcome.touch.long_press_pos, None,
@@ -136,21 +101,12 @@ fn a_long_press_does_not_fire_before_its_threshold() {
         );
     });
 
-    // Past it, it does fire — so the assertion above is about *when*, not
-    // about the detector having been switched off.
     let held = h.frames_for(4, 0.05);
     assert_eq!(held.touch.long_press_pos, Some(pos));
 }
 
-/// 3c. A finger that keeps moving never becomes a long press, however long
-///     it goes on.
-///
-///     The cancel-on-movement branch is what separates a hold from a pan,
-///     and nothing pinned it: widening `LONG_PRESS_MAX_MOVE_PX` to 2000, or
-///     dropping the branch entirely, raises a tooltip mid-drag and
-///     suppresses the pan under it. The finger zigzags rather than running
-///     off in one direction so the distance per frame, not the distance from
-///     the start, is what the detector has to be reading.
+/// 3c. A finger that keeps moving never becomes a long press, however long it goes
+/// on.
 #[test]
 fn a_moving_finger_never_becomes_a_long_press() {
     let mut h = InputHarness::new();
@@ -158,7 +114,6 @@ fn a_moving_finger_never_becomes_a_long_press() {
 
     h.touch_start(pos);
     h.frame_after(FRAME_DT);
-    // 1.2s — comfortably past LONG_PRESS_DURATION_S — of 30px steps.
     for step in 0..12 {
         let jitter = if step % 2 == 0 { 30.0 } else { 0.0 };
         h.touch_move(pos + egui::vec2(0.0, jitter));
@@ -174,8 +129,8 @@ fn a_moving_finger_never_becomes_a_long_press() {
     }
 }
 
-/// 4. A touch tap is deferred until the double-tap window closes, then
-///    reported once at the tapped position.
+/// 4. A touch tap is deferred until the double-tap window closes, then reported
+/// once at the tapped position.
 #[test]
 fn touch_tap_is_deferred_then_confirmed() {
     let mut h = InputHarness::new();
@@ -192,23 +147,20 @@ fn touch_tap_is_deferred_then_confirmed() {
     assert_eq!(confirmed.touch.overlay_click_pos, Some(pos));
     assert!(!confirmed.touch.suppress_pan);
 
-    // Consumed exactly once.
     let next = h.frame_after(FRAME_DT);
     assert_eq!(next.touch.overlay_click_pos, None);
 }
 
-/// 5. Tap, then press again and drag down: the map zooms, panning is
-///    suppressed for the whole drag, and no overlay tap is emitted.
+/// 5. Tap, then press again and drag down: the map zooms, panning is suppressed for
+/// the whole drag, and no overlay tap is emitted.
 #[test]
 fn touch_double_tap_drag_zooms_and_suppresses_pan() {
     let mut h = InputHarness::new();
     let start = h.map_center();
     let zoom_before = h.zoom();
 
-    // First tap.
     h.touch_tap(start);
 
-    // Second press within the double-tap window enters the zoom drag.
     h.touch_start(start);
     let dragging = h.frame_after(0.05);
     assert!(
@@ -218,7 +170,6 @@ fn touch_double_tap_drag_zooms_and_suppresses_pan() {
     assert_eq!(dragging.touch.overlay_click_pos, None);
     assert_eq!(dragging.touch.long_press_pos, None);
 
-    // Drag downward: ZOOM_DRAG_SENSITIVITY is 150px per zoom level.
     for step in 1..=3 {
         h.touch_move(start + egui::vec2(0.0, 50.0 * step as f32));
         let frame = h.frame_after(FRAME_DT);
@@ -232,7 +183,6 @@ fn touch_double_tap_drag_zooms_and_suppresses_pan() {
         dragged.zoom
     );
 
-    // Lifting ends the gesture and does not emit an overlay tap.
     h.touch_end(start + egui::vec2(0.0, 150.0));
     let lifted = h.frame_after(FRAME_DT);
     assert!(!lifted.touch.suppress_pan, "pan must be restored on lift");
@@ -245,11 +195,6 @@ fn touch_double_tap_drag_zooms_and_suppresses_pan() {
 }
 
 /// 5b. A second tap somewhere else is a separate tap, not a double tap.
-///
-///     `DOUBLE_TAP_DISTANCE_PX` is the only thing keeping two unrelated taps
-///     in quick succession — which is what walking a finger across the map
-///     looks like — out of a zoom drag. Test 5 taps twice at the same point,
-///     so it holds neither this bound nor the `&&` joining it to the timeout.
 #[test]
 fn a_second_tap_far_away_does_not_enter_a_zoom_drag() {
     let mut h = InputHarness::new();
@@ -258,7 +203,6 @@ fn a_second_tap_far_away_does_not_enter_a_zoom_drag() {
     let zoom_before = h.zoom();
 
     h.touch_tap(near);
-    // Well inside DOUBLE_TAP_TIMEOUT_S, well outside DOUBLE_TAP_DISTANCE_PX.
     h.touch_start(far);
     let pressed = h.frame_after(0.05);
     assert!(
@@ -280,11 +224,6 @@ fn a_second_tap_far_away_does_not_enter_a_zoom_drag() {
 }
 
 /// 5c. …but the second tap does not have to be pixel-exact.
-///
-///     The other direction of the same bound, and the one that decides
-///     whether the gesture is usable at all: a finger never lands twice on
-///     the same pixel, so a `DOUBLE_TAP_DISTANCE_PX` tightened towards zero
-///     leaves double-tap-zoom looking simply broken.
 #[test]
 fn a_double_tap_tolerates_the_jitter_between_two_real_taps() {
     let mut h = InputHarness::new();
@@ -300,31 +239,14 @@ fn a_double_tap_tolerates_the_jitter_between_two_real_taps() {
 }
 
 /// 5c-ii. …and it closes. **The other conjunct of the same classifier.**
-///
-///     `handle_press` enters a zoom drag on `dt < DOUBLE_TAP_TIMEOUT_S &&
-///     dist < DOUBLE_TAP_DISTANCE_PX`. 5b fails only the distance conjunct
-///     and 5c satisfies both, so nothing failed *only* the timeout: widened
-///     to 0.5s the whole suite stayed green while a tap and an unrelated
-///     second tap half a second later silently became a zoom drag —
-///     the map jumping under a finger that was pointing at something.
-///
-///     Both taps land on the same pixel here, so the distance conjunct is
-///     satisfied throughout and only the timeout can decide. The pair
-///     straddles the bound, which is what pins it from both sides: a
-///     timeout shortened towards zero fails the first assertion, because
-///     two taps a third of a second apart are one ordinary double tap.
 #[test]
 fn the_double_tap_window_closes_between_two_unrelated_taps() {
     /// Tap, sit still for `gap` seconds, then press again and hold.
-    /// Reports whether that second press entered a zoom drag.
     fn a_second_press_after(gap: f64) -> bool {
         let mut h = InputHarness::new();
         let pos = h.map_center();
 
         h.touch_tap(pos);
-        // One frame `gap` after the release, so the promotion inside
-        // `DoubleTapDragDetector::update` gets a frame to run on, exactly
-        // as an idle app does.
         h.frame_after(gap);
         h.touch_start(pos);
         h.frame_after(FRAME_DT).touch.suppress_pan
@@ -343,11 +265,6 @@ fn the_double_tap_window_closes_between_two_unrelated_taps() {
 }
 
 /// 5d. A zoom drag held still is still a zoom drag.
-///
-///     The long press is polled only when no zoom drag is running, and
-///     nothing pinned that exclusion. A user who double-taps and then holds
-///     before dragging is doing something completely ordinary, and without
-///     the gate they get the radar-value tooltip on top of the zoom.
 #[test]
 fn a_stationary_zoom_drag_does_not_become_a_long_press() {
     let mut h = InputHarness::new();
@@ -370,10 +287,6 @@ fn a_stationary_zoom_drag_does_not_become_a_long_press() {
 }
 
 /// 5e. The zoom drag moves one level per `ZOOM_DRAG_SENSITIVITY` pixels.
-///
-///     Test 5 pins only the sign — that dragging down zooms in — so a
-///     tenfold sensitivity passes it while slamming the map from one zoom
-///     stop to the other on the smallest drag. This pins the rate.
 #[test]
 fn the_zoom_drag_moves_one_level_per_sensitivity_of_travel() {
     let mut h = InputHarness::new();
@@ -383,7 +296,6 @@ fn the_zoom_drag_moves_one_level_per_sensitivity_of_travel() {
     h.touch_tap(pos);
     h.touch_start(pos);
     h.frame_after(0.05);
-    // Exactly ZOOM_DRAG_SENSITIVITY pixels of travel: one zoom level.
     h.touch_move(pos + egui::vec2(0.0, 150.0));
     let dragged = h.frame_after(FRAME_DT);
 
@@ -394,10 +306,7 @@ fn the_zoom_drag_moves_one_level_per_sensitivity_of_travel() {
     );
 }
 
-/// 6. **PROBE B — regression test for the stranded zoom drag.** The OS cancels the
-///    touch mid-drag: only `PointerGone` arrives, no release, and egui keeps
-///    reporting `pointer.down == true` forever. The gesture must still end,
-///    or the map stays un-pannable until the app restarts.
+/// 6. **PROBE B — regression test for the stranded zoom drag.**
 #[test]
 fn touch_cancelled_mid_drag_releases_the_map() {
     let mut h = InputHarness::new();
@@ -414,7 +323,6 @@ fn touch_cancelled_mid_drag_releases_the_map() {
     h.touch_move(start + egui::vec2(0.0, 60.0));
     assert!(h.frame_after(FRAME_DT).touch.suppress_pan);
 
-    // System edge gesture / incoming call / browser `touchcancel`.
     h.touch_cancel(start + egui::vec2(0.0, 60.0));
     let cancelled = h.frame_after(FRAME_DT);
     assert!(
@@ -423,12 +331,6 @@ fn touch_cancelled_mid_drag_releases_the_map() {
     );
     assert_eq!(cancelled.touch.long_press_pos, None);
 
-    // …and it must stay released, frame after frame, even though egui still
-    // reports the primary button as down. This has to run well past
-    // LONG_PRESS_DURATION_S (0.8s): the phantom finger is still "down", so a
-    // detector that re-arms on `down` takes exactly that long to claim it
-    // back — as a long press pinned at Pos2::ZERO, because `PointerGone`
-    // cleared egui's pointer position.
     h.assert_every_frame_for(WATCH_PAST_LONG_PRESS, 0.1, |frame, outcome| {
         assert!(
             !outcome.touch.suppress_pan,
@@ -442,8 +344,8 @@ fn touch_cancelled_mid_drag_releases_the_map() {
     });
 }
 
-/// 6b. **PROBE A** — the same cancellation, but during a long press: the
-///     tooltip position must not stick, and must not come back either.
+/// 6b. **PROBE A** — the same cancellation, but during a long press: the tooltip
+/// position must not stick, and must not come back either.
 #[test]
 fn touch_cancelled_during_long_press_clears_it() {
     let mut h = InputHarness::new();
@@ -463,8 +365,6 @@ fn touch_cancelled_during_long_press_clears_it() {
     assert_eq!(cancelled.touch.long_press_pos, None);
     assert!(!cancelled.touch.suppress_pan);
 
-    // Watch past LONG_PRESS_DURATION_S: clearing the state once is not
-    // enough if the detector is allowed to re-arm off egui's latched `down`.
     h.assert_every_frame_for(WATCH_PAST_LONG_PRESS, 0.1, |frame, outcome| {
         assert_eq!(
             outcome.touch.long_press_pos, None,
@@ -474,10 +374,8 @@ fn touch_cancelled_during_long_press_clears_it() {
     });
 }
 
-/// 6c. A *secondary* finger being cancelled must not kill the primary
-///     finger's live gesture. `Event::Touch { phase: Cancel }` carries a
-///     `TouchId` that cannot be matched against the emulated pointer, so the
-///     tracker keys on `PointerGone` alone.
+/// 6c. A *secondary* finger being cancelled must not kill the primary finger's live
+/// gesture.
 #[test]
 fn secondary_touch_cancel_does_not_end_the_drag() {
     let mut h = InputHarness::new();
@@ -497,7 +395,6 @@ fn secondary_touch_cancel_does_not_end_the_drag() {
         "another finger's cancellation must not end the primary gesture"
     );
 
-    // The drag still zooms.
     let zoom_before = after.zoom;
     h.touch_move(start + egui::vec2(0.0, 120.0));
     let dragged = h.frame_after(FRAME_DT);
@@ -505,10 +402,8 @@ fn secondary_touch_cancel_does_not_end_the_drag() {
     assert!(dragged.zoom > zoom_before, "the drag must still be live");
 }
 
-/// 6d. **PROBE C** — a zoom drag that keeps moving must never be cut off,
-///     however long it runs — a user framing a view can easily hold one for
-///     many seconds. (The pointer backstop is keyed on inactivity, not on
-///     gesture age, so this runs well past `POINTER_IDLE_TIMEOUT_S`.)
+/// 6d. **PROBE C** — a zoom drag that keeps moving must never be cut off, however
+/// long it runs — a user framing a view can easily hold one for many seconds.
 #[test]
 fn long_active_zoom_drag_is_never_cut_off() {
     let mut h = InputHarness::new();
@@ -518,7 +413,6 @@ fn long_active_zoom_drag_is_never_cut_off() {
     h.touch_start(start);
     assert!(h.frame_after(0.05).touch.suppress_pan);
 
-    // 40 seconds of continuous dragging, well past any plausible backstop.
     let mut offset = 0.0_f32;
     for step in 0..80 {
         offset = if step % 2 == 0 { 40.0 } else { -40.0 };
@@ -534,17 +428,15 @@ fn long_active_zoom_drag_is_never_cut_off() {
         );
     }
 
-    // Still responding to movement at the end.
     let zoom_before = h.zoom();
     h.touch_move(start + egui::vec2(0.0, offset + 100.0));
     let dragged = h.frame_after(FRAME_DT);
     assert_ne!(dragged.zoom, zoom_before, "the drag must still zoom");
 }
 
-/// 6e. If pointer input simply stops arriving mid-gesture (the integration
-///     went away without ever sending a release or a cancel), the stale
-///     "finger is down" belief expires — and does not get handed to the long
-///     press on the way out.
+/// 6e. If pointer input simply stops arriving mid-gesture (the integration went
+/// away without ever sending a release or a cancel), the stale "finger is down"
+/// belief expires — and does not get handed to the long press on the way out.
 #[test]
 fn silent_pointer_expires_and_stays_expired() {
     let mut h = InputHarness::new();
@@ -556,7 +448,6 @@ fn silent_pointer_expires_and_stays_expired() {
     h.touch_move(start + egui::vec2(0.0, 40.0));
     assert!(h.frame_after(FRAME_DT).touch.suppress_pan);
 
-    // No events at all from here on, for longer than the backstop allows.
     let expired = h.frames_for((SILENCE_MUST_EXPIRE_S / 0.5) as usize, 0.5);
     assert!(
         !expired.touch.suppress_pan,
@@ -572,16 +463,7 @@ fn silent_pointer_expires_and_stays_expired() {
     });
 }
 
-/// 6f. **PROBE D** — the desktop excursion. The button is held, the cursor
-///     leaves the window and comes back still held, and everything that
-///     arrives in between is a `PointerMoved`: no press, ever.
-///
-///     `egui-winit` maps `CursorLeft` to a bare `PointerGone` and forgets
-///     the pointer position, which also makes it drop a mouse release that
-///     happens outside the window — so egui's `primary_down()` stays
-///     latched right through the excursion. A latch that only a *press*
-///     could clear therefore stranded the pointer here exactly as a
-///     cancelled touch used to strand it: dead until the user clicked.
+/// 6f. **PROBE D** — the desktop excursion.
 #[test]
 fn pointer_returning_to_the_window_recovers_without_a_click() {
     let mut h = InputHarness::new();
@@ -595,8 +477,6 @@ fn pointer_returning_to_the_window_recovers_without_a_click() {
         "precondition: the pointer is live and held"
     );
 
-    // The cursor leaves. Nothing says whether the button survived the trip,
-    // so the pointer must be distrusted for as long as it stays silent.
     h.cursor_left();
     let gone = h.frame_after(FRAME_DT);
     assert_eq!(
@@ -605,7 +485,6 @@ fn pointer_returning_to_the_window_recovers_without_a_click() {
     );
     assert!(!gone.touch.suppress_pan);
 
-    // It comes back, still dragging: five move events, no press among them.
     let mut back = inside;
     for step in 1..=5 {
         back = inside + egui::vec2(12.0 * step as f32, 7.0 * step as f32);
@@ -613,11 +492,6 @@ fn pointer_returning_to_the_window_recovers_without_a_click() {
         h.frame_after(FRAME_DT);
     }
 
-    // Coming back with nothing but motion is not enough to reopen: the
-    // release that may have happened out of sight was discarded by the
-    // integration (`lib.rs:796`), so this stream is indistinguishable from
-    // a bare hover. A tooltip here would suppress panning until the user
-    // clicked — see `ui_input::tests::an_excursion_is_terminal_until_a_press`.
     let hovering = h.frames_for(20, 0.1);
     assert_eq!(
         hovering.touch.long_press_pos, None,
@@ -625,24 +499,14 @@ fn pointer_returning_to_the_window_recovers_without_a_click() {
     );
     assert!(!hovering.touch.suppress_pan);
 
-    // And it is not wedged either: one real press restores everything.
     h.mouse_press(back);
     let pressed = h.frames_for(10, 0.1);
     assert_eq!(pressed.touch.long_press_pos, Some(back));
     assert!(pressed.touch.suppress_pan);
 }
 
-/// 6f-R1. **PROBE R1** — a cancelled touch must not be resurrected by a
-///        bare `PointerMoved`.
-///
-///        After a cancel, egui's `primary_down()` is latched `true` with
-///        nothing left that will ever clear it, so the tracker's distrust
-///        is the only thing standing between that and a phantom gesture.
-///        Motion keeps arriving regardless — `egui-winit` clears
-///        `pointer_touch_id` on cancel (`lib.rs:922`) and then admits the
-///        *next* finger's moves as `PointerMoved` with no press
-///        (`lib.rs:894`, `lib.rs:906`) — so "a cancel is followed by
-///        silence" is true of that finger, not of the pointer stream.
+/// 6f-R1. **PROBE R1** — a cancelled touch must not be resurrected by a bare
+/// `PointerMoved`.
 #[test]
 fn motion_after_a_cancel_does_not_resurrect_the_pointer() {
     let mut h = InputHarness::new();
@@ -658,7 +522,6 @@ fn motion_after_a_cancel_does_not_resurrect_the_pointer() {
     h.touch_cancel(pos);
     assert_eq!(h.frame_after(FRAME_DT).touch.long_press_pos, None);
 
-    // A second finger, still on the glass, moves.
     h.mouse_move(pos + egui::vec2(90.0, 60.0));
     h.frame_after(FRAME_DT);
 
@@ -671,10 +534,8 @@ fn motion_after_a_cancel_does_not_resurrect_the_pointer() {
     });
 }
 
-/// 6f-R2. **PROBE R2** — the same, for `MouseMoved`: a delta with no
-///        coordinates at all. This is the worst resurrection vector,
-///        because the phantom would land at `last_pos` — exactly where the
-///        OS took the touch away.
+/// 6f-R2. **PROBE R2** — the same, for `MouseMoved`: a delta with no coordinates at
+/// all.
 #[test]
 fn positionless_motion_after_a_cancel_does_not_resurrect_the_pointer() {
     let mut h = InputHarness::new();
@@ -698,8 +559,8 @@ fn positionless_motion_after_a_cancel_does_not_resurrect_the_pointer() {
     });
 }
 
-/// 6f-R3. **PROBE R3** — and for a cancelled *zoom drag*: motion must not
-///        hand the map back to a gesture the OS took away.
+/// 6f-R3. **PROBE R3** — and for a cancelled *zoom drag*: motion must not hand the
+/// map back to a gesture the OS took away.
 #[test]
 fn motion_after_a_cancelled_zoom_drag_does_not_restore_it() {
     let mut h = InputHarness::new();
@@ -728,15 +589,7 @@ fn motion_after_a_cancelled_zoom_drag_does_not_restore_it() {
 }
 
 /// 6f-R4. **PROBE R4** — a cancellation on the web, which arrives as a bare
-///        `Touch{Cancel}`.
-///
-///        eframe 0.34.1's `install_touchcancel` pushes `push_touches(Cancel)`
-///        and nothing else (`eframe/src/web/events.rs:788`): no release, no
-///        `PointerGone`. Keying cancellation on `PointerGone` alone never
-///        fired here at all — the map stayed un-pannable behind a stuck
-///        tooltip until the idle backstop, a minute later. Browsers fire
-///        `touchcancel` routinely (scroll takeover, page hide, too many
-///        contact points).
+/// `Touch{Cancel}`.
 #[test]
 fn web_touch_cancel_releases_the_map() {
     let mut h = InputHarness::new();
@@ -744,9 +597,6 @@ fn web_touch_cancel_releases_the_map() {
 
     h.web_touch_start(pos);
     h.frame_after(FRAME_DT);
-    // A little jitter, as a real finger produces — and as a browser
-    // delivers it, so the cancellation below is not reached through an
-    // artificially silent stream.
     h.web_touch_move(pos + egui::vec2(2.0, 1.0));
     assert_eq!(
         h.frames_for(10, 0.1).touch.long_press_pos,
@@ -762,8 +612,6 @@ fn web_touch_cancel_releases_the_map() {
     );
     assert!(!cancelled.touch.suppress_pan);
 
-    // `mousemove` on the canvas is a bare `PointerMoved` and does not care
-    // that a touch was involved — it must not undo the cancellation.
     h.web_mouse_move(pos + egui::vec2(70.0, 40.0));
     h.frame_after(FRAME_DT);
 
@@ -774,12 +622,6 @@ fn web_touch_cancel_releases_the_map() {
 }
 
 /// 6f-R5. **PROBE R5** — the button was released *outside* the window.
-///
-///        `egui-winit` drops a mouse release while the cursor is out of the
-///        window (`lib.rs:796` needs a position it no longer has), so egui
-///        reports the button as down forever afterwards. Coming back is
-///        then indistinguishable from coming back still holding it, which
-///        is why no hold may arm on the strength of motion alone.
 #[test]
 fn a_release_outside_the_window_does_not_return_as_a_hold() {
     let mut h = InputHarness::new();
@@ -788,11 +630,9 @@ fn a_release_outside_the_window_does_not_return_as_a_hold() {
     h.mouse_press(inside);
     h.frame_after(FRAME_DT);
 
-    // Out of the window; the release that happens out there never arrives.
     h.cursor_left();
     h.frame_after(FRAME_DT);
 
-    // Back in, hovering, nothing held.
     h.mouse_move(inside + egui::vec2(30.0, 20.0));
     h.frame_after(FRAME_DT);
 
@@ -808,11 +648,7 @@ fn a_release_outside_the_window_does_not_return_as_a_hold() {
     });
 }
 
-/// 6g. **PROBE G** — recovery after the idle backstop fires. The finger was
-///     resting, the backstop stopped believing in it, and then it moves.
-///     Expiry latches (so the long press cannot pick a phantom finger back
-///     up), but the latch has to be undoable by the finger itself —
-///     otherwise a resumed drag needs a lift and a fresh press.
+/// 6g. **PROBE G** — recovery after the idle backstop fires.
 #[test]
 fn pointer_recovers_from_idle_expiry_without_a_lift() {
     let mut h = InputHarness::new();
@@ -821,7 +657,6 @@ fn pointer_recovers_from_idle_expiry_without_a_lift() {
     h.touch_start(start);
     assert!(h.frame_after(FRAME_DT).touch.long_press_pos.is_none());
 
-    // Total silence, past the backstop.
     let expired = h.frames_for((SILENCE_MUST_EXPIRE_S / 0.5) as usize, 0.5);
     assert_eq!(
         expired.touch.long_press_pos, None,
@@ -829,7 +664,6 @@ fn pointer_recovers_from_idle_expiry_without_a_lift() {
     );
     assert!(!expired.touch.suppress_pan);
 
-    // The finger was there all along, and starts moving again.
     let resumed = start + egui::vec2(0.0, 60.0);
     h.touch_move(resumed);
     h.frame_after(FRAME_DT);
@@ -844,10 +678,6 @@ fn pointer_recovers_from_idle_expiry_without_a_lift() {
 }
 
 /// 6h. **PROBE H** — a deliberately still hold keeps its tooltip.
-///
-///     This is the case the idle backstop has to be sized against: reading
-///     a radar value means holding a finger in one place and emitting
-///     nothing at all, and half a minute of that is an ordinary thing to do.
 #[test]
 fn a_deliberately_still_hold_keeps_its_tooltip() {
     let mut h = InputHarness::new();
@@ -861,7 +691,6 @@ fn a_deliberately_still_hold_keeps_its_tooltip() {
         "precondition: long press"
     );
 
-    // Not one event for thirty seconds; the finger has not moved a pixel.
     h.assert_every_frame_for(HOLD_MUST_SURVIVE_S, 0.25, |frame, outcome| {
         assert_eq!(
             outcome.touch.long_press_pos,
@@ -873,16 +702,10 @@ fn a_deliberately_still_hold_keeps_its_tooltip() {
 }
 
 /// 7. **PROBE I — the root cause, pinned against egui itself.**
-///
-///    egui buckets touches by `TouchDeviceId` and only builds a gesture from
-///    two touches on one device. winit's web backend fabricates a device id
-///    per finger, so each finger landed in its own bucket holding one touch
-///    and `zoom_delta()` never moved off 1.0. Same fingers, same positions —
-///    only the device ids differ.
 #[test]
 fn a_pinch_only_forms_when_both_fingers_share_a_touch_device() {
-    /// Spread two fingers from 100px apart to 200px apart, and report what
-    /// egui made of it. `devices` is the device id each finger arrives on.
+    /// Spread two fingers from 100px apart to 200px apart, and report what egui
+    /// made of it.
     fn spread(devices: [u64; 2]) -> (f32, bool) {
         let ctx = egui::Context::default();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 768.0));
@@ -901,10 +724,6 @@ fn a_pinch_only_forms_when_both_fingers_share_a_touch_device() {
                 time: Some(time),
                 events: vec![
                     touch(devices[0], 1, phase, first),
-                    // egui refuses to *start* a gesture without a pointer
-                    // position (`touch_state.rs:229`). `egui-winit` emulates
-                    // one from the first finger, so a bare two-finger event
-                    // stream would be unrepresentative without it.
                     egui::Event::PointerMoved(first),
                     touch(devices[1], 2, phase, centre + egui::vec2(half, 0.0)),
                 ],
@@ -912,11 +731,6 @@ fn a_pinch_only_forms_when_both_fingers_share_a_touch_device() {
             }
         };
 
-        // Three frames, not two. egui hands `TouchState` the *previous*
-        // frame's `interact_pos` (`input_state/mod.rs:390`) and refuses to
-        // start a gesture without one, so the gesture only begins on the
-        // second frame — and begins with no `previous`, i.e. a zoom of 1.0.
-        // The third frame is the first that can report a ratio at all.
         ctx.begin_pass(pass(1.0, 50.0, egui::TouchPhase::Start));
         let _ = ctx.end_pass();
         ctx.begin_pass(pass(1.0 + FRAME_DT, 50.0, egui::TouchPhase::Move));
@@ -947,10 +761,6 @@ fn a_pinch_only_forms_when_both_fingers_share_a_touch_device() {
 }
 
 /// 7b. The fix in isolation: fingers keep their identities, devices merge.
-///
-///     Collapsing the `TouchId`s too would leave egui with one finger and no
-///     gesture at all, which looks identical from the outside until you
-///     notice nothing zooms.
 #[test]
 fn normalizing_merges_devices_and_leaves_the_fingers_alone() {
     let mut input = egui::RawInput {
@@ -990,9 +800,6 @@ fn normalizing_merges_devices_and_leaves_the_fingers_alone() {
 }
 
 /// 7c. **End to end: pinching out zooms the real map in.**
-///
-///     Driven through `Gui::ui`, so this is walkers' own `zoom_delta()` path
-///     acting on the shipped pane — the thing that was dead in the browser.
 #[test]
 fn a_web_pinch_out_zooms_the_map_in() {
     let mut h = InputHarness::new();
@@ -1013,8 +820,7 @@ fn a_web_pinch_out_zooms_the_map_in() {
     );
 }
 
-/// 7d. …and pinching in zooms out. Direction, pinned separately, because a
-///     sign error passes 7c whenever the gap happens to grow.
+/// 7d. …and pinching in zooms out.
 #[test]
 fn a_web_pinch_in_zooms_the_map_out() {
     let mut h = InputHarness::new();
@@ -1030,8 +836,7 @@ fn a_web_pinch_in_zooms_the_map_out() {
     );
 }
 
-/// 7e. A pinch is not a tap and not a long press. Two fingers resting while
-///     the gesture runs must not open an overlay popup or raise a tooltip.
+/// 7e. A pinch is not a tap and not a long press.
 #[test]
 fn a_pinch_is_not_a_tap() {
     let mut h = InputHarness::new();
@@ -1045,10 +850,6 @@ fn a_pinch_is_not_a_tap() {
 
     h.web_second_finger_up(centre + egui::vec2(160.0, 0.0));
     h.web_first_finger_up(centre - egui::vec2(160.0, 0.0));
-    // Frame by frame, not just the last one: a confirmed tap surfaces
-    // exactly [`DOUBLE_TAP_TIMEOUT_S`] after the release and
-    // `take_confirmed_tap` consumes it on that one frame, so a run that only
-    // reads the final outcome is looking 0.6s after the evidence went away.
     h.assert_every_frame_for(1.0, 0.2, |frame, outcome| {
         assert_eq!(
             outcome.resolved.overlay_click_pos, None,
@@ -1059,14 +860,6 @@ fn a_pinch_is_not_a_tap() {
 }
 
 /// 7e-i. A quick flick is not a tap — **distance alone**.
-///
-///     The classifier is `duration < A && distance < B`, and the pinch above
-///     breaks both conjuncts at once, so it holds neither one in place: with
-///     `TAP_DISTANCE_MAX_PX` widened to 2000 the pinch is still too slow to
-///     be a tap and 7e passes regardless. This flick is comfortably inside
-///     the duration bound and only outside the distance one, so it fails if
-///     and only if the distance bound stops doing its job — which is a drag
-///     of the map opening an overlay popup under the finger.
 #[test]
 fn a_quick_flick_is_not_a_tap() {
     let mut h = InputHarness::new();
@@ -1078,8 +871,6 @@ fn a_quick_flick_is_not_a_tap() {
         h.touch_move(pos + egui::vec2(30.0 * step as f32, 0.0));
         h.frame_after(FRAME_DT);
     }
-    // ~0.08s and 120px: well under TAP_DURATION_MAX_S, well over
-    // TAP_DISTANCE_MAX_PX.
     h.touch_end(pos + egui::vec2(120.0, 0.0));
 
     h.assert_every_frame_for(1.0, 0.1, |frame, outcome| {
@@ -1091,13 +882,6 @@ fn a_quick_flick_is_not_a_tap() {
 }
 
 /// 7e-ii. A slow stationary press is not a tap — **duration alone**.
-///
-///     The mirror of 7e-i, and what pins `TAP_DURATION_MAX_S`: the finger
-///     never moves, so the distance bound is satisfied throughout and only
-///     the duration bound can reject it. Half a second is past
-///     `TAP_DURATION_MAX_S` and short of `LONG_PRESS_DURATION_S`, so this is
-///     the deliberate-but-not-yet-a-long-press hold, which must resolve to
-///     nothing at all.
 #[test]
 fn a_slow_stationary_press_is_not_a_tap() {
     let mut h = InputHarness::new();
@@ -1122,12 +906,6 @@ fn a_slow_stationary_press_is_not_a_tap() {
 }
 
 /// 7f. **A pinch that ends one finger at a time must not strand the map.**
-///
-///     The dangerous order is the *first* finger going up while the second
-///     stays down: that is the one backing the emulated pointer, so
-///     `egui-winit` fires a release and a `PointerGone` while a finger is
-///     still on the glass. The second finger's later events must not put the
-///     map back into a suppressed state.
 #[test]
 fn a_pinch_ending_one_finger_at_a_time_leaves_the_map_pannable() {
     let mut h = InputHarness::new();
@@ -1135,7 +913,6 @@ fn a_pinch_ending_one_finger_at_a_time_leaves_the_map_pannable() {
 
     h.web_pinch(centre, 80.0, 320.0, 8);
 
-    // The emulated-pointer finger leaves first; the other is still down.
     let left = centre - egui::vec2(160.0, 0.0);
     let right = centre + egui::vec2(160.0, 0.0);
     h.web_first_finger_up(left);
@@ -1145,7 +922,6 @@ fn a_pinch_ending_one_finger_at_a_time_leaves_the_map_pannable() {
         "the map must be released the moment the primary finger goes"
     );
 
-    // The survivor keeps moving, then lifts.
     for step in 1..=4 {
         h.events.push(web_touch(
             WEB_FINGER_B,
@@ -1160,7 +936,6 @@ fn a_pinch_ending_one_finger_at_a_time_leaves_the_map_pannable() {
     }
     h.web_second_finger_up(right + egui::vec2(0.0, 40.0));
 
-    // And it must stay that way well past the long-press threshold.
     h.assert_every_frame_for(WATCH_PAST_LONG_PRESS, 0.1, |frame, outcome| {
         assert!(
             !outcome.resolved.suppress_pan,
@@ -1174,22 +949,6 @@ fn a_pinch_ending_one_finger_at_a_time_leaves_the_map_pannable() {
 }
 
 /// 7g. **A wheel notch must zoom the same however the browser spelled it.**
-///
-///     One detent of the same wheel: Chromium reports `deltaY: 120` in
-///     `DOM_DELTA_PIXEL`, Firefox `deltaY: 6` in `DOM_DELTA_LINE`. Those two
-///     numbers come from two different browsers, which is what makes this
-///     test independent of [`PX_PER_WHEEL_LINE`] — anchoring the line side on
-///     the pixel number the *same* browser would have sent only restates the
-///     constant. Without the rewrite egui scales the line form by
-///     `line_scroll_speed`, 8.0 on web, so Firefox's notch lands as 48
-///     against Chromium's 120 and the map zooms 2.5x slower. Nothing errors;
-///     the wheel just feels wrong in one browser, which is why this is pinned
-///     on the ratio rather than on any absolute step.
-///
-///     The band is 2% because the ratio at the shipped constant is exactly
-///     1.0 — `6 × 20` *is* 120, so the two runs see identical events. A 5%
-///     error in `PX_PER_WHEEL_LINE` moves it 5%, so anything looser stops
-///     being a calibration and starts being a smoke test.
 #[test]
 fn a_wheel_notch_zooms_the_same_in_either_wheel_unit() {
     /// Four notches over the pane centre, and the zoom they moved.
@@ -1200,15 +959,11 @@ fn a_wheel_notch_zooms_the_same_in_either_wheel_unit() {
         let mut last = before;
         for _ in 0..4 {
             h.wheel_notch(centre, unit, delta_y);
-            // egui bleeds a wheel impulse out over several frames, so the
-            // step is only whole once the smoothing has drained.
             last = h.frames_for(12, FRAME_DT).resolved_zoom;
         }
         last - before
     }
 
-    // Negative delta is a scroll *down*, which walkers zooms out on; take
-    // the magnitude so the two are compared on the same axis.
     let chromium = notches(egui::MouseWheelUnit::Point, 120.0);
     let firefox = notches(egui::MouseWheelUnit::Line, 6.0);
 
@@ -1260,8 +1015,6 @@ fn normalizing_wheel_units_converts_only_the_line_events() {
         seen.iter().all(|(u, ..)| *u == egui::MouseWheelUnit::Point),
         "every wheel event must leave in point units, got {seen:?}"
     );
-    // 6 lines is the notch Firefox reports; 20 px a line makes it the 120 px
-    // Chromium reports for the same detent.
     assert_eq!(seen[0].1, egui::vec2(40.0, 120.0), "line delta must scale");
     assert_eq!(
         seen[1].1,
@@ -1281,11 +1034,6 @@ fn normalizing_wheel_units_converts_only_the_line_events() {
 }
 
 /// 7i. The app's UI scale must not change the wheel step in one unit only.
-///
-///     `egui-winit` divides pixel deltas by `pixels_per_point`, which folds
-///     in the zoom factor; line deltas never went through it. Left alone,
-///     turning up the UI scale would slow the wheel in one browser and not
-///     the other.
 #[test]
 fn the_wheel_rewrite_divides_by_the_zoom_factor() {
     let mut input = egui::RawInput {
@@ -1310,24 +1058,8 @@ fn the_wheel_rewrite_divides_by_the_zoom_factor() {
 }
 
 /// 8. **The panel decides which edge, and that decision reaches the paint.**
-///
-///    A portrait phone split into three panes (`[2, 1]`) is the case no
-///    per-pane threshold can get right: the two top panes come out clearly
-///    portrait and the bottom one clearly landscape, so keying on each
-///    pane's own rect paints two bottom bars and one right-hand bar on the
-///    same screen.
-///
-///    This asserts on the *painted strips*, not on the resolved value,
-///    because the resolved value was never the part at risk: what needed
-///    pinning was that `render_panes` resolves from the panel, that the
-///    answer is threaded through `PaneRenderCtx`, and that neither renderer
-///    quietly recomputes it from the pane it happens to be drawing.
 #[test]
 fn every_pane_draws_its_color_scale_on_the_same_edge() {
-    // Sized so the full-bleed map keeps the same shape the docked chrome
-    // used to leave — portrait top panes over a landscape bottom one —
-    // while staying Expanded, where the open layers panel keeps layer
-    // sync seeding the panes the split adds.
     let mut h = InputHarness::with_screen(egui::vec2(1010.0, 1450.0));
     h.set_pane_count(3);
     h.frame();
@@ -1335,8 +1067,6 @@ fn every_pane_draws_its_color_scale_on_the_same_edge() {
     let panes = h.pane_rects();
     assert_eq!(panes.len(), 3, "precondition: a [2, 1] grid");
 
-    // Preconditions, so this fails loudly rather than silently stopping
-    // being a test if the layout maths ever changes.
     let ratio = |r: egui::Rect| r.height() / r.width();
     assert!(
         ratio(panes[0]) > 1.35,
@@ -1365,17 +1095,6 @@ fn every_pane_draws_its_color_scale_on_the_same_edge() {
 }
 
 /// 8b. **The panel is the key, not the active pane.**
-///
-///     The `[2, 1]` test above cannot see the difference: in that grid
-///     pane 0 is `panel_w/2 × panel_h/2`, which has the *same* aspect ratio
-///     as the panel, so keying on the panel and keying on the active pane
-///     agree by construction and its precondition is simultaneously a
-///     statement about both.
-///
-///     A 2-pane grid separates them: each pane is `panel_w/2 × panel_h`, so
-///     its ratio is exactly twice the panel's. At 1180×1000 the panel comes
-///     out landscape while both panes are emphatically portrait, and the
-///     two candidate keys give opposite answers.
 #[test]
 fn the_color_scale_axis_comes_from_the_panel_not_a_pane() {
     let mut h = InputHarness::with_screen(egui::vec2(1180.0, 1000.0));
@@ -1415,15 +1134,6 @@ fn the_color_scale_axis_comes_from_the_panel_not_a_pane() {
 }
 
 /// 8c. **The hail-size preference reaches the MEHS colour bar on the glass.**
-///
-///     `format_legend_value` and `RadarProduct::unit_label` are pinned
-///     directly in `ui_map_pane.rs`; this is the other end of the same wire.
-///     What it adds is that the preference the settings dialog writes is the
-///     one `render_color_scale` is handed — it travels the whole way through
-///     `Gui::ui` and `PaneRenderCtx` — and that a unit change relabels every
-///     tick, not just the title above them. A bar reading `in` over
-///     millimetre numbers, or millimetre ticks under an inch title, is the
-///     half-converted state this rules out.
 #[test]
 fn the_mehs_colour_bar_paints_the_users_hail_size_unit() {
     use rustdar_radar::types::RadarProduct;
@@ -1440,7 +1150,6 @@ fn the_mehs_colour_bar_paints_the_users_hail_size_unit() {
     h.select_product(0, RadarProduct::MaxExpectedHailSize);
     let pane = h.pane_rects()[0];
 
-    // The default nobody has to choose.
     let painted = h.painted_text_strings_in(pane);
     assert!(
         painted.iter().any(|t| t == "in"),
@@ -1480,41 +1189,21 @@ fn the_mehs_colour_bar_paints_the_users_hail_size_unit() {
     }
 }
 
-/// KTLX's 0.5° Doppler cut's own declaration, m/s — 2026-08-11 at 10:09, and
-/// the narrowest of the ten WSR-88D volumes `rustdar_radar::nyquist` measured.
-///
-/// A real number off a real waveform, and a **WSR-88D** one on purpose. This
-/// constant used to be 22.14 m/s and to call itself a TPIT declaration; no TPIT
-/// cut declares 22.14, and no TDWR cut declares anything at all. Across 22 TDWR
-/// volumes from 10 sites, every cut declares `nyquist_velocity = 0`, which
-/// `DeclaredNyquist::declare` refuses — so a TDWR reaches this annotation with
-/// nothing, and a fixture labelled as one was describing a path that does not
-/// exist. 23.84 wraps at two thirds of the ±36.01 m/s the fixed ramp spans,
-/// which is the geometry these tests are about.
+/// KTLX's 0.5° Doppler cut's own declaration, m/s — 2026-08-11 at 10:09, and the
+/// narrowest of the ten WSR-88D volumes `rustdar_radar::nyquist` measured.
 const DECLARED_NYQUIST_MS: f64 = 23.84;
 
 /// A declaration past the end of the ramp, m/s.
-///
-/// Wider than the 62.94 m/s of KFFC's cut 12, which is the fastest
-/// `rustdar_radar::nyquist` has measured, and inside what Message 31's
-/// hundredths-of-a-metre field carries. It is the widest speed the velocity
-/// moment itself encodes, ±63.5 m/s in half-metre steps — 0.56 m/s of headroom
-/// over the real maximum, so "past the bar" is barely a fixture and mostly a
-/// measurement.
 const PAST_THE_BAR_MS: f64 = 63.5;
 
 /// A landscape pane on `site` showing a finished velocity render that declares
 /// `nyquist_ms`, radar layer on.
-///
-/// Landscape, so the panel-wide orientation puts the bar on the right edge —
-/// the desktop arrangement, and the one whose title block the annotation is
-/// stacked into.
 fn velocity_pane(site: &str, nyquist_ms: Option<f64>) -> InputHarness {
     velocity_pane_on(egui::vec2(1400.0, 900.0), site, nyquist_ms)
 }
 
-/// The same, on a screen of the caller's choosing — the portrait case puts the
-/// bar along the bottom, where the annotation is laid out differently.
+/// The same, on a screen of the caller's choosing — the portrait case puts the bar
+/// along the bottom, where the annotation is laid out differently.
 fn velocity_pane_on(screen: egui::Vec2, site: &str, nyquist_ms: Option<f64>) -> InputHarness {
     use rustdar_radar::types::RadarProduct;
 
@@ -1538,14 +1227,9 @@ fn fold_line_painted(h: &InputHarness) -> Option<String> {
         .find(|t| t.starts_with("folds"))
 }
 
-/// The fold markers painted over the bar: rects as long as the 20-point bar
-/// plus its 3-point overhang on each face, which is a shape nothing else on the
-/// legend has.
-///
-/// Written out rather than read off `pane_render`'s constants for the reason
-/// `color_scale_bars` writes out its own 20: a probe sized from the code under
-/// test moves with it, and would go on passing over a marker drawn to the bar's
-/// own width — the one width the bar classifier cannot tell from ramp.
+/// The fold markers painted over the bar: rects as long as the 20-point bar plus
+/// its 3-point overhang on each face, which is a shape nothing else on the legend
+/// has.
 fn fold_markers_painted(h: &InputHarness) -> Vec<egui::Rect> {
     const MARKER_LENGTH: f32 = 26.0;
     let pane = h.pane_rects()[0];
@@ -1559,22 +1243,8 @@ fn fold_markers_painted(h: &InputHarness) -> Vec<egui::Rect> {
         .collect()
 }
 
-/// 8d. **The velocity bar says where the picture on it folds, in the reader's
-///     own speed unit.**
-///
-///     KTLX's 0.5° cut folds at ±23.84 m/s against a ramp that spans ±36.01,
-///     so a third of the bar on either end is colour that sweep cannot produce
-///     except by aliasing — an inbound 25 m/s gate comes back painted as
-///     outbound 19. The number is the pane's own, off the texture metadata
-///     `apply_render_to_pane` stamped from the render, and it is converted
-///     through `rustdar-units` like every other user-facing number: switching
-///     the speed preference must relabel it in the same frame it relabels the
-///     ticks.
-///
-///     The marker positions are asserted alongside, because the whole claim is
-///     that the two agree: a converted title over markers that had moved with
-///     the unit would mean the ramp had been rescaled, which is exactly what
-///     this design refused.
+/// 8d. **The velocity bar says where the picture on it folds, in the reader's own
+/// speed unit.**
 #[test]
 fn the_velocity_bar_says_where_its_own_sweep_folds_in_every_speed_unit() {
     use rustdar_units::SpeedUnit;
@@ -1582,8 +1252,6 @@ fn the_velocity_bar_says_where_its_own_sweep_folds_in_every_speed_unit() {
     let mut h = velocity_pane("KTLX", Some(DECLARED_NYQUIST_MS));
     let pane = h.pane_rects()[0];
 
-    // 23.84 m/s in each unit, rounded as the annotation rounds: 53.33 mph,
-    // 85.82 km/h, 46.34 kt.
     let expected = [
         (SpeedUnit::Mph, "folds \u{b1}53"),
         (SpeedUnit::MetersPerSec, "folds \u{b1}24"),
@@ -1601,9 +1269,6 @@ fn the_velocity_bar_says_where_its_own_sweep_folds_in_every_speed_unit() {
              the unit the reader asked for; painted: {:?}",
             h.painted_text_strings_in(pane),
         );
-        // Both ends of the fold are marked, and they are marked in the same
-        // place whatever the labels say — the ramp is a pure function of
-        // (product, value) and the preference is a relabelling.
         let markers = fold_markers_painted(&h);
         assert_eq!(
             markers.len(),
@@ -1620,7 +1285,6 @@ fn the_velocity_bar_says_where_its_own_sweep_folds_in_every_speed_unit() {
         }
     }
 
-    // And the unit title is still over them, unconverted numbers and all.
     h.gui_mut().preferences.speed = SpeedUnit::MetersPerSec;
     h.warm_up();
     let painted = h.painted_text_strings_in(pane);
@@ -1632,22 +1296,12 @@ fn the_velocity_bar_says_where_its_own_sweep_folds_in_every_speed_unit() {
 }
 
 /// 8e. **A fold the bar cannot reach is named and not marked.**
-///
-///     The ramp stops at 36.01 m/s and a declaration can be wider — the
-///     archive states the number in hundredths of a metre per second, and the
-///     probe volumes' own fastest cut already sits within half a metre a
-///     second of the end. A marker clamped to the end of the bar would put the
-///     fold at the one speed the picture certainly does not fold at, so
-///     nothing is drawn — while the title line still states the limit, which
-///     is the honest half: every colour on this bar is then inside that
-///     radar's unambiguous velocity.
 #[test]
 fn a_nyquist_past_the_end_of_the_bar_is_named_but_not_marked() {
     let h = velocity_pane("KTLX", Some(PAST_THE_BAR_MS));
 
     assert_eq!(
         fold_line_painted(&h).as_deref(),
-        // 63.5 m/s is 142.05 mph, the default unit.
         Some("folds \u{b1}142"),
         "the off-scale limit is not stated; painted: {:?}",
         h.painted_text_strings_in(h.pane_rects()[0]),
@@ -1659,10 +1313,6 @@ fn a_nyquist_past_the_end_of_the_bar_is_named_but_not_marked() {
         fold_markers_painted(&h),
     );
 
-    // The widest this line ever gets: three digits, in the unit that produces
-    // them. 63.5 m/s is 228.6 km/h, and `folds ±229` lays out 52 points wide
-    // over a 20-point bar standing 16 points off the pane's edge — so a line
-    // centred on the bar would have handed its last digit to the clip rect.
     let mut h = h;
     h.gui_mut().preferences.speed = rustdar_units::SpeedUnit::KilometersPerHour;
     h.warm_up();
@@ -1686,16 +1336,6 @@ fn a_nyquist_past_the_end_of_the_bar_is_named_but_not_marked() {
 }
 
 /// 8f. **An undeclared sweep leaves the bar exactly as it was.**
-///
-///     Most volumes declare a Nyquist and some do not, and the ones that do not
-///     must get the legend the app drew before any of this existed: no marker,
-///     no second title line, and the unit title on its own baseline rather than
-///     pushed up to make room for an annotation that is not there.
-///
-///     The baseline is taken from a *reflectivity* pane of the same geometry,
-///     which shares the title's anchor and knows nothing about folding — so
-///     "unmoved" is asserted against a bar this change cannot have touched
-///     rather than against a number written down here.
 #[test]
 fn a_sweep_that_declared_no_nyquist_gets_the_bar_unchanged() {
     use rustdar_radar::types::RadarProduct;
@@ -1738,25 +1378,8 @@ fn a_sweep_that_declared_no_nyquist_gets_the_bar_unchanged() {
     );
 }
 
-/// 8f(ii). **A fold limit of zero is no fold limit, and the bar says nothing
-///          rather than `folds ±0`.**
-///
-///          The bug this pins shipped. Every TDWR declares
-///          `nyquist_velocity = 0` on every cut — 22 volumes, 10 sites, three
-///          days, no exceptions — and the zero travelled the whole chain
-///          intact: stored by `DeclaredNyquist::declare`, handed out by
-///          `render`, stamped into the frame metadata, returned by
-///          `displayed_nyquist_ms`, and formatted by `fold_title_line`, which
-///          floored nothing. `fold_marker_positions` *did* refuse it, so what
-///          reached the glass was a caption reading `folds ±0` over a bar with
-///          no markers on it: the two halves of one annotation disagreeing in
-///          front of the user.
-///
-///          `declare` now refuses the zero at the archive, which is why no
-///          TDWR can reach here carrying one. This drives the pane directly to
-///          pin the other half — the legend's own refusal to caption a speed it
-///          will not mark — so the property survives any future producer that
-///          stamps a zero into a frame by some other route.
+/// 8f(ii). **A fold limit of zero is no fold limit, and the bar says nothing rather
+/// than `folds ±0`.**
 #[test]
 fn a_pane_with_no_usable_fold_limit_captions_nothing() {
     for absurd in [0.0, -1.0, f64::NAN] {
@@ -1780,21 +1403,11 @@ fn a_pane_with_no_usable_fold_limit_captions_nothing() {
         );
     }
 
-    // And the honest number still gets its caption, so the guard above is a
-    // filter rather than a switch that turned the annotation off.
     let good = velocity_pane("KTLX", Some(DECLARED_NYQUIST_MS));
     assert_eq!(fold_line_painted(&good).as_deref(), Some("folds \u{b1}53"));
 }
 
 /// 8g. **The annotation describes the pixels, not the selection.**
-///
-///     A product switch holds the previous image while the new render runs, and
-///     the sweeps either side of that switch declare different limits — KFFC's
-///     ladder runs 25.65 m/s on its low cuts to 62.94 on cut 12, inside one
-///     volume. A pane that annotated its *selection* would draw the incoming
-///     sweep's fold across the outgoing sweep's colours — a marker in the wrong
-///     place on a picture that is still perfectly real. The same gate the
-///     pending-render notice reads answers this one.
 #[test]
 fn a_pane_annotates_no_fold_while_its_image_lags_the_selection() {
     use rustdar_radar::types::RadarProduct;
@@ -1805,7 +1418,6 @@ fn a_pane_annotates_no_fold_while_its_image_lags_the_selection() {
         "precondition: the pane must be annotating its own render",
     );
 
-    // Reflectivity is selected; the velocity image is still on the glass.
     h.select_product(0, RadarProduct::Reflectivity);
     assert_eq!(
         fold_line_painted(&h),
@@ -1813,9 +1425,6 @@ fn a_pane_annotates_no_fold_while_its_image_lags_the_selection() {
         "the reflectivity bar carries a velocity sweep's fold limit",
     );
 
-    // Back to velocity, but the render that lands is the 2.4° sweep while the
-    // pane has snapped to 0.5° — a different cut, and a different PRF. Nothing
-    // is claimed until the pane's own sweep is on the glass.
     h.select_product(0, RadarProduct::Velocity);
     h.place_radar_image(
         0,
@@ -1844,20 +1453,8 @@ fn a_pane_annotates_no_fold_while_its_image_lags_the_selection() {
     );
 }
 
-/// 8h. **The annotation is drawn where nothing else is, and does not change
-///     what the bar is made of.**
-///
-///     Two claims that are one claim in practice. `color_scale_bars`
-///     classifies the legend by shape — 20 points across the bar, more than 40
-///     along it — and a test that read it would be counting fold markers as
-///     ramp if they were drawn to the bar's own width. `FOLD_TICK_OVERHANG`
-///     takes them to 26 points instead, out of that classifier's reach, and the
-///     whole annotation stays inside the pane it belongs to.
-///
-///     The markers are `rect_filled` and the ramp is now one `painter.image`,
-///     so the two live in different lists entirely — which makes the "does not
-///     change what the bar is made of" half weaker than it was, and it is left
-///     in place because the shape reasoning is what it was always resting on.
+/// 8h. **The annotation is drawn where nothing else is, and does not change what
+/// the bar is made of.**
 #[test]
 fn the_fold_annotation_leaves_the_bar_and_the_pane_alone() {
     let plain = velocity_pane("KTLX", None);
@@ -1875,8 +1472,6 @@ fn the_fold_annotation_leaves_the_bar_and_the_pane_alone() {
         "the fold markers or the range-folded swatch are being counted as ramp",
     );
 
-    // Nothing the annotation adds hangs off the pane: the painter is clipped to
-    // it, so anything that did would simply be cut in half on the glass.
     for (rect, text) in annotated.painted_text_rects() {
         if text.starts_with("folds") || text == "RF" {
             assert!(
@@ -1893,16 +1488,8 @@ fn the_fold_annotation_leaves_the_bar_and_the_pane_alone() {
     }
 }
 
-/// 8h(ii). **…on the bottom-edge bar too, which lays the annotation out
-///         somewhere else entirely.**
-///
-///         A portrait panel puts the bar along the bottom with its unit title
-///         squeezed into the 12 points between the pane's edge and the bar's
-///         start, so the annotation goes under the *bar* instead — the 16-point
-///         margin below it is the only clear glass on that edge. The painter is
-///         clipped to the pane, so a line laid out on the title's own anchor
-///         would simply be cut off at the screen edge rather than looking
-///         wrong.
+/// 8h(ii). **…on the bottom-edge bar too, which lays the annotation out somewhere
+/// else entirely.**
 #[test]
 fn a_bottom_edge_bar_annotates_under_itself_rather_than_off_the_pane() {
     let portrait = egui::vec2(900.0, 1400.0);
@@ -1942,25 +1529,8 @@ fn a_bottom_edge_bar_annotates_under_itself_rather_than_off_the_pane() {
     }
 }
 
-/// 8h(iv). **On a phone the whole legend clears the bottom bar, rather than
-///          being painted under it.**
-///
-///          What a real 432×936 portrait window drew: the velocity picture,
-///          and no colour bar, no unit title, no `folds ±N` line and no RF
-///          swatch anywhere on it. Nothing was wrong with the legend — it was
-///          laid out and submitted correctly and then covered. The map is
-///          full-bleed to the window's bottom edge by design, the legend is
-///          painted into the map's own `Background` layer during the pane
-///          loop, and Compact then draws an opaque full-bleed bottom bar on
-///          `Order::Middle` over it. The legend's block is the bottom 36
-///          points of the pane; the bar is about 52.
-///
-///          Every horizontal-orientation test before this one drove a screen
-///          at least 900 points wide — portrait, so a bottom-edge bar, but far
-///          too wide to be Compact, so no phone bar was ever drawn over it.
-///          That is the whole reason a legend invisible on every actual phone
-///          passed every test that looked at it, and it is why this one asserts
-///          the width class rather than assuming it.
+/// 8h(iv). **On a phone the whole legend clears the bottom bar, rather than being
+/// painted under it.**
 #[test]
 fn a_phones_colour_scale_clears_the_bottom_bar_that_was_hiding_it() {
     let phone = egui::vec2(432.0, 936.0);
@@ -1980,9 +1550,6 @@ fn a_phones_colour_scale_clears_the_bottom_bar_that_was_hiding_it() {
          {bars:?}",
     );
 
-    // The ramp itself: one textured quad 20 points across and longer than 40,
-    // the shape `color_scale_bars` counts by. It was a run of 2x20 strips until
-    // the ramp was baked into a texture, and this looked at those.
     let ramp: Vec<egui::Rect> = h
         .painted_images_in(pane)
         .into_iter()
@@ -1999,9 +1566,6 @@ fn a_phones_colour_scale_clears_the_bottom_bar_that_was_hiding_it() {
         );
     }
 
-    // And the captions and the key, which hang in the margin *below* the bar
-    // and were the furthest under it: the unit title, the fold line, the RF
-    // swatch's label and the value ticks.
     let legend_text: Vec<(egui::Rect, String)> = h
         .painted_text_rects()
         .into_iter()
@@ -2037,19 +1601,6 @@ fn a_phones_colour_scale_clears_the_bottom_bar_that_was_hiding_it() {
 }
 
 /// 8h(iii). **Every unit title is drawn inside the pane it labels.**
-///
-///          The painter is clipped to the pane, so a title that does not fit
-///          is silently cut in half rather than overlapping something — which
-///          is what a bottom-edge bar did to every one of them: the title was
-///          right-anchored 12 points from the pane's edge, and the shortest
-///          unit label in the app is 22 points wide, so a phone in portrait
-///          was reading `ph` under its velocity bar and `Bz` under its
-///          reflectivity one.
-///
-///          Asserted over every product, in the unit preferences that change a
-///          label, and in both orientations — the vertical bar centres its
-///          title over a bar that stands 16 points off the edge, which is its
-///          own way of running out of room.
 #[test]
 fn every_products_unit_title_fits_inside_its_pane() {
     use rustdar_radar::types::RadarProduct;
@@ -2101,15 +1652,7 @@ fn every_products_unit_title_fits_inside_its_pane() {
     }
 }
 
-/// 8i. **The purple on the map has a key, on the two products that can paint
-///     it.**
-///
-///     `render.rs` paints a range-folded gate in a colour no product's scale
-///     can produce, which is what makes it readable as "the radar saw this and
-///     cannot say how far away it was" — but only if the legend says so. The
-///     Doppler cut carries velocity and spectrum width, so those are the two
-///     bars that get the swatch; reflectivity is measured on the surveillance
-///     cut, whose long PRT puts its unambiguous range past anything on screen.
+/// 8i. **The purple on the map has a key, on the two products that can paint it.**
 #[test]
 fn the_range_folded_purple_is_keyed_on_the_bars_that_can_paint_it() {
     use rustdar_radar::types::RadarProduct;
@@ -2140,8 +1683,6 @@ fn the_range_folded_purple_is_keyed_on_the_bars_that_can_paint_it() {
          them; painted: {:?}",
         h.painted_text_strings_in(pane),
     );
-    // …and the fold annotation is velocity's alone: a spectrum width is a
-    // spread, not a Doppler shift, and folds at no speed.
     assert_eq!(fold_line_painted(&h), None);
 
     h.select_product(0, RadarProduct::Reflectivity);
@@ -2154,16 +1695,8 @@ fn the_range_folded_purple_is_keyed_on_the_bars_that_can_paint_it() {
     );
 }
 
-/// 8j. **The annotation is render-derived, so it comes back with the picture
-///     and nothing has to persist it.**
-///
-///     Nothing in `PaneConfig` describes a fold limit, and nothing should: the
-///     number belongs to a sweep, not to a pane's settings, and a stored copy
-///     would come back beside whatever volume the next session downloads. What
-///     makes that safe is that the annotation is a function of the texture
-///     metadata alone — drop the texture, as a surface loss does, and the pane
-///     goes quiet; put the same render back, as `restore_cached_render` does,
-///     and the annotation returns unchanged.
+/// 8j. **The annotation is render-derived, so it comes back with the picture and
+/// nothing has to persist it.**
 #[test]
 fn the_fold_annotation_returns_with_the_picture_rather_than_from_a_config() {
     use rustdar_radar::types::RadarProduct;
@@ -2171,7 +1704,6 @@ fn the_fold_annotation_returns_with_the_picture_rather_than_from_a_config() {
     let mut h = velocity_pane("KTLX", Some(DECLARED_NYQUIST_MS));
     let before = fold_line_painted(&h).expect("precondition: an annotated pane");
 
-    // A surface loss: the overlay entry goes, the pane's own state does not.
     h.gui_mut()
         .pane_mut(0)
         .unwrap()
@@ -2185,7 +1717,6 @@ fn the_fold_annotation_returns_with_the_picture_rather_than_from_a_config() {
          picture folded",
     );
 
-    // …and the restore, which re-uploads the kept copy with the same metadata.
     h.place_radar_image(
         0,
         RadarProduct::Velocity,
@@ -2201,9 +1732,8 @@ fn the_fold_annotation_returns_with_the_picture_rather_than_from_a_config() {
     );
 }
 
-/// 53. A tap that lands on a floating dialog is filtered out by the
-///     dialog-blocking gate — for both the mouse and the touch path.
-///     (Renumbered from a colliding 7 — the gesture suite owns that block.)
+/// 53. A tap that lands on a floating dialog is filtered out by the dialog-blocking
+/// gate — for both the mouse and the touch path.
 #[test]
 fn tap_on_floating_dialog_is_filtered_out() {
     let mut h = InputHarness::new();
@@ -2221,22 +1751,15 @@ fn tap_on_floating_dialog_is_filtered_out() {
              dialog gate can filter this click"
     );
 
-    // Mouse path: egui reports the click, the gate drops it.
     let clicked = h.mouse_click(pos);
     assert_eq!(clicked.mouse.overlay_click_pos, None);
     assert!(!clicked.mouse.suppress_pan);
 
-    // Touch path: the deferred tap is dropped as well, and nothing is
-    // emitted once the double-tap window closes. (Note this half is caught
-    // earlier, by the on-floating-UI check inside DoubleTapDragDetector —
-    // `tap_confirmed_under_a_dialog_is_filtered_out` covers the gate
-    // itself.)
     let tapped = h.touch_tap(pos);
     assert_eq!(tapped.touch.overlay_click_pos, None);
     let settled = h.frames_for(3, 0.3);
     assert_eq!(settled.touch.overlay_click_pos, None);
 
-    // Sanity: with the dialog closed, the same position is clickable again.
     h.gui_mut().set_time_dialog_open_for_test(false);
     h.warm_up();
     assert!(!h.is_floating_layer_at(pos));
@@ -2245,21 +1768,19 @@ fn tap_on_floating_dialog_is_filtered_out() {
 }
 
 /// 53b. A touch tap is deferred by 0.4s, so a dialog can open *during* the
-///     deferral. The tap was legitimately on the map when it happened, so
-///     the detector's own on-release check passes it through, and only
-///     `filter_dialog_blocked` can stop it from punching through the dialog
-///     that is now covering it.
+/// deferral. The tap was legitimately on the map when it happened, so the
+/// detector's own on-release check passes it through, and only
+/// `filter_dialog_blocked` can stop it from punching through the dialog that is now
+/// covering it.
 #[test]
 fn tap_confirmed_under_a_dialog_is_filtered_out() {
     let mut h = InputHarness::new();
     let pos = h.map_center();
 
-    // Tap on the bare map: nothing is floating there yet.
     assert!(!h.is_floating_layer_at(pos));
     let tapped = h.touch_tap(pos);
     assert_eq!(tapped.touch.overlay_click_pos, None, "still deferred");
 
-    // A dialog opens over the tap position before the window closes.
     h.gui_mut().set_time_dialog_open_for_test(true);
     h.frame_after(FRAME_DT);
     assert!(
@@ -2275,9 +1796,6 @@ fn tap_confirmed_under_a_dialog_is_filtered_out() {
     let settled = h.frames_for(3, 0.3);
     assert_eq!(settled.touch.overlay_click_pos, None);
 
-    // Sanity: the identical sequence without the dialog does deliver the
-    // tap, so the assertion above is about the gate and not about the tap
-    // being swallowed somewhere else.
     h.gui_mut().set_time_dialog_open_for_test(false);
     h.warm_up();
     h.touch_tap(pos);
@@ -2285,23 +1803,7 @@ fn tap_confirmed_under_a_dialog_is_filtered_out() {
     assert_eq!(confirmed.touch.overlay_click_pos, Some(pos));
 }
 
-// ── The modality gate ────────────────────────────────────────────────
-//
-// These are the only tests that read `FrameOutcome::resolved`. The `mouse`
-// and `touch` fields deliberately bypass the gate, so asserting on them
-// here would prove nothing about it.
-
 /// 9. **A slow mouse press is not a long press.**
-///
-///    `LongPressDetector` keys purely on "primary down for 0.8s", so under
-///    a mouse it fires on an ordinary slow click — and because a long press
-///    raises `suppress_pan`, it takes the drag away from the map. Every map
-///    pan starts with the button going down and staying down, so an ungated
-///    detector breaks mouse panning outright.
-///
-///    The `touch` assertion is the contrast that stops this being vacuous:
-///    the identical input *does* drive the detector when it is not gated,
-///    so what the test observes is the gate and not a dead detector.
 #[test]
 fn a_slow_mouse_press_never_becomes_a_long_press() {
     let mut h = InputHarness::new();
@@ -2336,10 +1838,6 @@ fn a_slow_mouse_press_never_becomes_a_long_press() {
 }
 
 /// 10. **A mouse click is not deferred.**
-///
-///     The touch path withholds every tap for `DOUBLE_TAP_TIMEOUT_S` so a
-///     double-tap can claim it. Under a mouse that is 400ms of latency on
-///     every overlay click, for a gesture a mouse cannot even perform.
 #[test]
 fn a_mouse_click_reports_immediately_rather_than_after_the_tap_window() {
     let mut h = InputHarness::new();
@@ -2359,8 +1857,8 @@ fn a_mouse_click_reports_immediately_rather_than_after_the_tap_window() {
     );
 }
 
-/// 10b. The touch path keeps its deferral, so the test above is a statement
-///      about the modality and not about the deferral having been deleted.
+/// 10b. The touch path keeps its deferral, so the test above is a statement about
+/// the modality and not about the deferral having been deleted.
 #[test]
 fn a_real_touch_tap_is_still_deferred_through_the_gate() {
     let mut h = InputHarness::new();
@@ -2379,10 +1877,6 @@ fn a_real_touch_tap_is_still_deferred_through_the_gate() {
 }
 
 /// 11. **A mouse double-click does not enter a zoom drag.**
-///
-///     Double-clicking is an ordinary thing to do with a mouse.
-///     `DoubleTapDragDetector` would read it as the opening of a
-///     double-tap-drag and start scrubbing the zoom with vertical motion.
 #[test]
 fn a_mouse_double_click_does_not_start_a_zoom_drag() {
     let mut h = InputHarness::new();
@@ -2390,8 +1884,6 @@ fn a_mouse_double_click_does_not_start_a_zoom_drag() {
 
     let before = h.frame_after(FRAME_DT).resolved_zoom;
 
-    // Two clicks well inside the double-tap window, then drag downwards
-    // while still held — the exact shape of the touch zoom gesture.
     h.mouse_click(pos);
     h.mouse_press(pos);
     h.frame_after(0.05);
@@ -2409,8 +1901,8 @@ fn a_mouse_double_click_does_not_start_a_zoom_drag() {
     );
 }
 
-/// 11b. The same gesture on the ungated touch path *does* zoom, so the test
-///      above is not simply asserting that the gesture never works.
+/// 11b. The same gesture on the ungated touch path *does* zoom, so the test above
+/// is not simply asserting that the gesture never works.
 #[test]
 fn the_same_drag_does_zoom_when_it_really_is_a_touch() {
     let mut h = InputHarness::new();
@@ -2436,18 +1928,7 @@ fn the_same_drag_does_zoom_when_it_really_is_a_touch() {
 }
 
 /// 12. **A gesture interrupted by a modality change is abandoned, and stays
-///     abandoned when the modality comes back.**
-///
-///     A tap waiting for its double-tap partner is state held *inside* the
-///     detector. Merely switching to a mouse hides it, because the mouse
-///     branch never polls the detector at all — so the interesting case is
-///     the round trip. Without an explicit reset the pending tap is still
-///     sitting there when touch resumes, its 0.4s window long since
-///     elapsed, and the very next touch frame promotes it: an overlay click
-///     fires at a stale position the user last touched minutes ago.
-///
-///     Asserting only on the mouse leg would be satisfied by the branch
-///     structure alone and would prove nothing about the reset.
+/// abandoned when the modality comes back.**
 #[test]
 fn a_touch_gesture_interrupted_by_a_mouse_does_not_resume_when_touch_returns() {
     let mut h = InputHarness::new();
@@ -2460,7 +1941,6 @@ fn a_touch_gesture_interrupted_by_a_mouse_does_not_resume_when_touch_returns() {
         "precondition: the tap is pending, not yet confirmed"
     );
 
-    // The user picks up a mouse, somewhere else entirely.
     let elsewhere = stale + egui::vec2(200.0, 0.0);
     h.mouse_move(elsewhere);
     let switched = h.frame_after(FRAME_DT);
@@ -2470,11 +1950,8 @@ fn a_touch_gesture_interrupted_by_a_mouse_does_not_resume_when_touch_returns() {
         "nothing should fire while the mouse is in charge"
     );
 
-    // Well past the double-tap window, so a surviving pending tap is now
-    // eligible for promotion the moment the detector is polled again.
     h.frames_for(5, 0.2);
 
-    // The finger comes back. This is the frame that would resurrect it.
     h.touch_start(elsewhere);
     let resumed = h.frame_after(FRAME_DT);
     assert_eq!(
@@ -2495,22 +1972,10 @@ fn a_touch_gesture_interrupted_by_a_mouse_does_not_resume_when_touch_returns() {
 }
 
 /// 13. **Only the active pane sees a touch; every pane sees the mouse.**
-///
-///     The touch pipeline is single-pointer and stateful, so running it for
-///     more than one pane would mean several detectors racing over one
-///     finger. The mouse carries no such state, and resolving it for every
-///     pane is what lets a click land on an overlay in a pane that is not
-///     yet the active one — behaviour the desktop build always had.
-///
-///     Split into two real panes, because an inactive pane is not a thing
-///     that exists in a one-pane layout: `render_panes` would resolve exactly
-///     one pane and there would be nothing to compare it against.
 #[test]
 fn a_touch_reaches_only_the_active_pane_but_a_click_reaches_them_all() {
     let mut h = InputHarness::new();
     h.set_pane_count(2);
-    // Pane 0's centre sits under the floating layers panel on Expanded;
-    // a click there belongs to the panel, so take it off screen first.
     h.close_layers();
     let pos = h.pane_rects()[0].center();
     assert!(
@@ -2535,11 +2000,6 @@ fn a_touch_reaches_only_the_active_pane_but_a_click_reaches_them_all() {
     h.set_pane_count(2);
     h.close_layers();
 
-    // The release frame is the one that separates the two branches: a
-    // touch release carries the synthetic `PointerButton{up}` that makes
-    // egui report a click, so the mouse path *would* return a position
-    // here. A later, event-free frame would let both branches agree on
-    // `None` and prove nothing.
     let tapped = h.touch_tap(pos);
     assert_eq!(tapped.modality, PointerModality::Touch);
     assert_eq!(
@@ -2554,7 +2014,6 @@ fn a_touch_reaches_only_the_active_pane_but_a_click_reaches_them_all() {
         "an inactive pane takes no part in a touch gesture"
     );
 
-    // ...and the active pane still gets it, once the deferral elapses.
     let confirmed = h.frame_after(AFTER_DOUBLE_TAP_TIMEOUT);
     assert_eq!(
         confirmed.resolved.overlay_click_pos,
@@ -2564,13 +2023,6 @@ fn a_touch_reaches_only_the_active_pane_but_a_click_reaches_them_all() {
 }
 
 /// A click can only hand the active-pane slot to a pane that exists.
-///
-/// `Gui::active_pane` resolves the slot as `self.panes[self.active_pane]`, so
-/// an index the layout drew a cell for but the vector never grew to reach is
-/// not a pane that quietly goes unpainted — it is a panic waiting for the next
-/// reader, and the shell's stack+inspector `mem::take` is one of them. The skew is
-/// built by hand because no production writer can produce it: both grow the
-/// vector before assigning the layout. See `Gui::claim_pane_count_for_test`.
 #[test]
 fn a_click_on_a_cell_no_pane_occupies_leaves_the_active_pane_alone() {
     let mut h = InputHarness::new();
@@ -2578,8 +2030,6 @@ fn a_click_on_a_cell_no_pane_occupies_leaves_the_active_pane_alone() {
     h.claim_pane_count(4);
     let panel = h.map_panel_rect();
 
-    // The 2×2 grid's bottom-right cell: a rect for pane 3, which no
-    // `PaneState` occupies.
     let ghost = crate::pane::PaneLayout::for_count(4)
         .pane_rect(3, panel)
         .center();
@@ -2598,30 +2048,11 @@ fn a_click_on_a_cell_no_pane_occupies_leaves_the_active_pane_alone() {
     );
 }
 
-// ── Responsive layout ────────────────────────────────────────────────
-
 /// 14. **Crossing a breakpoint must not move any widget's egui `Id`.**
-///
-///     egui keys widget memory — combo open state, scroll offsets, panel
-///     sizes — on `Id`. An `Id` derived from anything layout-dependent
-///     therefore looks like a *different widget* on the other side of a
-///     resize, and every one of those becomes a silent reset: the user
-///     drags a window edge and their scroll position jumps to the top.
-///
-///     This compares the `Id`s the panel actually resolved on two runs
-///     rather than restating the constants that produced them, so it fails
-///     for a layout-keyed `Id` however that keying was introduced.
 #[test]
 fn crossing_a_breakpoint_does_not_move_any_widget_id() {
-    // Short enough that the stack's rows genuinely overflow their scroll
-    // area — on a taller window there is no offset to lose.
     let mut h = InputHarness::with_screen(egui::vec2(1200.0, 500.0));
-    // The drawer is what shows the panel below the sidebar breakpoint;
-    // opening it up front means the panel is on screen for both runs.
     h.set_drawer_open(true);
-    // The inspector too, so its ids join the compared set (M3 review) —
-    // `insp_open` is session state, so it stays open across every resize
-    // below.
     h.gui_mut().open_settings();
     h.warm_up();
 
@@ -2642,10 +2073,6 @@ fn crossing_a_breakpoint_does_not_move_any_widget_id() {
              comparison really covers the inspector's ids too"
     );
 
-    // Every probed id must be one egui actually knows. Without this a
-    // probe reporting a constant — or an id rebuilt from a format string
-    // the widget itself no longer uses — would compare equal to itself on
-    // both sides of the resize and prove nothing at all.
     let combo_id = expanded
         .iter()
         .find(|(name, _)| *name == "time_step_sel")
@@ -2657,10 +2084,6 @@ fn crossing_a_breakpoint_does_not_move_any_widget_id() {
              it is a reconstruction rather than the combo box's own"
     );
 
-    // Put real egui state behind one of those ids, so the comparison below
-    // is backed by something that would visibly be lost. Reading it through
-    // the probed id also pins that the panel really does key its scroll
-    // area on that id rather than on a positional auto-id.
     let scroll_id = expanded
         .iter()
         .find(|(name, _)| *name == "layers_scroll")
@@ -2695,12 +2118,6 @@ fn crossing_a_breakpoint_does_not_move_any_widget_id() {
         "the scroll position must survive the resize"
     );
 
-    // ...and across the 600pt breakpoint too, so all three widths resolve
-    // the same ids. This is the hardest case: below 600pt the panels are
-    // sheet pages, one at a time — the settings page is on top, so the
-    // stack's ids are off screen until it is closed — but every id that IS
-    // on screen must be the id the wider hosts used, or the host switch
-    // silently orphans the state egui keyed on it.
     h.set_screen(egui::vec2(500.0, 500.0));
     h.set_drawer_open(true);
     assert_eq!(
@@ -2724,8 +2141,6 @@ fn crossing_a_breakpoint_does_not_move_any_widget_id() {
         );
     }
 
-    // Close the settings page; the Layers page beneath comes to the top,
-    // under the same scroll id, with the offset stored behind it intact.
     h.close_inspector();
     let restored = h
         .widget_id_probes()
@@ -2745,25 +2160,8 @@ fn crossing_a_breakpoint_does_not_move_any_widget_id() {
     );
 }
 
-// 15 retired (synthesis-m1): the hamburger is gone and the chrome excludes
-// no rects; M5's pill contract replaces rect exclusion with layer-based
-// blocking.
-
-/// 16b. **The map is full-bleed: the content rect minus the top bar,
-///      exactly, at every breakpoint — and every floating surface sits
-///      inside it.**
-///
-///      The Synthesis full-bleed rule: the top bar is the one docked
-///      chrome, and everything else floats *over* the map. The map's rect
-///      feeds pane hit-testing, `excluded_rects` and overlay texture
-///      sizing, so both failure directions are silent everywhere rather
-///      than obviously broken in one place: chrome that claims panel
-///      space again shrinks it back, and a floating surface positioned
-///      outside it is chrome floating over nothing.
-///
-///      Exact equality, not bounds: "the remainder after the top bar" is
-///      the whole contract, and a stray one-point margin is how a second
-///      docked panel starts.
+/// 16b. **The map is full-bleed: the content rect minus the top bar, exactly, at
+/// every breakpoint — and every floating surface sits inside it.**
 #[test]
 fn the_map_is_full_bleed_under_the_top_bar() {
     for (size, expected) in [
@@ -2787,8 +2185,6 @@ fn the_map_is_full_bleed_under_the_top_bar() {
             "precondition: {size:?} should be {expected:?}"
         );
 
-        // With and without insets: the content rect is what the map must
-        // fill, not the raw viewport.
         for insets in [(0.0, 0.0, 0.0, 0.0), (24.0, 16.0, 6.0, 6.0)] {
             let (top, bottom, left, right) = insets;
             h.set_safe_area_insets(top, bottom, left, right);
@@ -2811,9 +2207,6 @@ fn the_map_is_full_bleed_under_the_top_bar() {
                      map is not exactly the content rect minus the top bar"
                 );
 
-                // Every floating surface floats *inside* the map. The phone
-                // shell swaps the status bar for the bottom bar (and the
-                // sheet, while the drawer flag has a page open).
                 let mut floating = vec![("timeline", h.timeline().rect)];
                 if expected == crate::ui_layout::WidthClass::Compact {
                     assert_eq!(
@@ -2835,7 +2228,6 @@ fn the_map_is_full_bleed_under_the_top_bar() {
                          the {name} at {rect:?} is not inside the map {panel:?}"
                     );
                 }
-                // The inline transport sits above the bottom bar, not on it.
                 if expected == crate::ui_layout::WidthClass::Compact {
                     assert!(
                         h.timeline().rect.bottom() <= h.bottom_bar().rect.top(),
@@ -2859,8 +2251,6 @@ fn the_map_is_full_bleed_under_the_top_bar() {
                 }
             }
 
-            // Opening and closing the layers panel no longer resizes the
-            // map — the panel floats over it.
             h.set_drawer_open(false);
             let closed = h.map_panel_rect();
             h.set_drawer_open(true);
@@ -2874,15 +2264,10 @@ fn the_map_is_full_bleed_under_the_top_bar() {
     }
 }
 
-// ── The menu, through the top bar's ☰ dropdown ───────────────────────
-
-/// A compact harness with the menu open — the sheet's Menu page since the
-/// phone shell: `open_menu` routes through the bottom bar's Menu item down
-/// here, and the leaves come off `render_menu_drawer` over the same model
-/// the ☰ dropdown renders on the wide widths. Compact is still the
-/// interesting fixture: it is the width with the least room and the one the
-/// old drawer-hosted menu served, so anything a presentation strands is
-/// stranded here first.
+/// A compact harness with the menu open — the sheet's Menu page since the phone
+/// shell: `open_menu` routes through the bottom bar's Menu item down here, and the
+/// leaves come off `render_menu_drawer` over the same model the ☰ dropdown renders
+/// on the wide widths.
 fn compact_with_menu() -> InputHarness {
     let mut h = InputHarness::with_screen(egui::vec2(420.0, 1200.0));
     assert_eq!(
@@ -2894,14 +2279,8 @@ fn compact_with_menu() -> InputHarness {
     h
 }
 
-/// A compact harness with the layers drawer open — the narrow form of the
-/// layers panel, for tests about the controls it hosts.
-///
-/// Tall rather than phone-shaped on purpose: the controls sit inside a
-/// `ScrollArea`, so on an 800pt screen the lower ones lay out past the
-/// bottom edge and a synthetic click at their rect would land on nothing
-/// at all — passing every "nothing changed" assertion for the wrong
-/// reason. Only the *width* decides the presentation.
+/// A compact harness with the layers drawer open — the narrow form of the layers
+/// panel, for tests about the controls it hosts.
 fn compact_with_layers_drawer() -> InputHarness {
     let mut h = InputHarness::with_screen(egui::vec2(420.0, 1200.0));
     assert_eq!(
@@ -2913,8 +2292,8 @@ fn compact_with_layers_drawer() -> InputHarness {
     h
 }
 
-/// The rect of a drawn menu leaf, checked to be somewhere a click can
-/// actually reach it.
+/// The rect of a drawn menu leaf, checked to be somewhere a click can actually
+/// reach it.
 fn clickable_leaf(h: &InputHarness, label: &str) -> egui::Rect {
     let leaf = h
         .menu_leaf(label)
@@ -2930,14 +2309,6 @@ fn clickable_leaf(h: &InputHarness, label: &str) -> egui::Rect {
 }
 
 /// 17. **The dropdown's checkboxes show the live pane's state.**
-///
-///     Building the model inside a `mem::take` window hands every overlay
-///     toggle the taken pane's empty `enabled_overlays`, so the box
-///     renders unchecked and each click emits `Toggled(kind, true)` — the
-///     drawer-hosted menu had exactly that bug once. The top bar builds
-///     the model before any pane is taken; this holds it to that.
-///     Auto-poll escapes either way by living on `self`, which is why the
-///     model's own unit tests could never catch it.
 #[test]
 fn the_dropdown_checkboxes_show_the_live_pane_not_a_default_one() {
     let mut h = compact_with_menu();
@@ -2960,8 +2331,6 @@ fn the_dropdown_checkboxes_show_the_live_pane_not_a_default_one() {
          one: it renders unchecked and every click turns the overlay *on*",
     );
 
-    // Auto-poll is the control that never broke — asserting it alone would
-    // have passed throughout, so it is the contrast, not the claim.
     assert_eq!(
         h.menu_leaf("Auto-poll").map(|l| l.value),
         Some(Some(true)),
@@ -2970,16 +2339,7 @@ fn the_dropdown_checkboxes_show_the_live_pane_not_a_default_one() {
     );
 }
 
-/// 18. **A checkbox in the dropdown turns the overlay off, and it stays
-///     off.**
-///
-///     The watched frames are the point: `apply_menu_event` used to write
-///     `enabled_overlays` only, and the layers panel reloaded the config
-///     over it on the next frame. Asserting straight after the click
-///     passes; the user, who sees the frame after, never got the change.
-///     Also pins that `render_menu_popup`'s events reach the dispatcher,
-///     and that a click inside the popup does not close it — the close
-///     behavior is click-outside, so flipping two toggles is one open.
+/// 18. **A checkbox in the dropdown turns the overlay off, and it stays off.**
 #[test]
 fn clicking_a_dropdown_checkbox_toggles_the_overlay_both_ways() {
     let mut h = compact_with_menu();
@@ -2994,10 +2354,6 @@ fn clicking_a_dropdown_checkbox_toggles_the_overlay_both_ways() {
              an overlay on but never off"
     );
 
-    // On the click frame itself the probe must report the state the
-    // checkbox was *handed*, not the one the click produced. Recording
-    // egui's post-click `current` instead would make a checkbox that
-    // renders stale look correct on exactly the frame that matters.
     assert_eq!(
         h.menu_leaf("Show radar sites").map(|l| l.value),
         Some(Some(true)),
@@ -3015,8 +2371,6 @@ fn clicking_a_dropdown_checkbox_toggles_the_overlay_both_ways() {
         );
     }
 
-    // ...and back on, so this cannot pass by the click being read as an
-    // unconditional "off".
     h.mouse_click(clickable_leaf(&h, "Show radar sites").center());
     h.frames_for(5, FRAME_DT);
     assert!(
@@ -3024,8 +2378,6 @@ fn clicking_a_dropdown_checkbox_toggles_the_overlay_both_ways() {
         "the toggle did not come back on"
     );
 
-    // The checkbox on screen now agrees with the pane again — the two
-    // halves of the round trip, not just the state behind it.
     assert_eq!(
         h.menu_leaf("Show radar sites").map(|l| l.value),
         Some(Some(true)),
@@ -3033,14 +2385,12 @@ fn clicking_a_dropdown_checkbox_toggles_the_overlay_both_ways() {
     );
 }
 
-/// A compact dropdown harness split into two panes, with pane 1 made
-/// active the way a user does it — by tapping that pane on the map.
+/// A compact dropdown harness split into two panes, with pane 1 made active the way
+/// a user does it — by tapping that pane on the map.
 fn compact_menu_with_pane_1_active() -> InputHarness {
     let mut h = InputHarness::with_screen(egui::vec2(420.0, 1200.0));
     h.set_pane_count(2);
 
-    // Tap pane 1 before opening the menu, so the popup cannot be what the
-    // tap lands on and the two pane rects are unambiguous.
     let target = h.pane_rects()[1].center();
     h.mouse_click(target);
     h.warm_up();
@@ -3056,25 +2406,11 @@ fn compact_menu_with_pane_1_active() -> InputHarness {
 }
 
 /// 27. **"The live active pane" means the active one, not pane 0.**
-///
-///     With `active_pane` stuck at 0 in every fixture, both `menu_model`
-///     reading `&self.panes[0]` and `set_active_pane_overlay` writing it
-///     survived. In the app: pane 1 active, tap a toggle in the drawer, the
-///     overlay lands on pane 0. Sync is off so the panes can disagree —
-///     with it on it copies the write back and hides the bug.
 #[test]
 fn the_menu_reads_and_writes_the_active_pane_not_pane_zero() {
     let mut h = compact_menu_with_pane_1_active();
     h.set_layer_links(false);
 
-    // The panes must disagree about **two** kinds, not one.
-    //
-    // `RadarSites` is the kind being toggled, and `set_enabled` overwrites
-    // it whichever config was loaded — so on its own it cannot show the
-    // *read* going to the wrong pane. `CityLabels` is the witness:
-    // `serialize_state` carries `enabled`, so loading pane 0's configs
-    // imports pane 0's on/off state for every kind except the one being
-    // set, and pane 1's city labels would silently go out.
     h.set_overlay_on_pane(0, &known::RADAR_SITES, false);
     h.set_overlay_on_pane(0, &known::CITY_LABELS, false);
     h.set_overlay_on_pane(1, &known::RADAR_SITES, true);
@@ -3088,14 +2424,12 @@ fn the_menu_reads_and_writes_the_active_pane_not_pane_zero() {
         "precondition: the panes must disagree about both kinds"
     );
 
-    // The checkbox must show pane 1's state, not pane 0's.
     assert_eq!(
         h.menu_leaf("Show radar sites").map(|l| l.value),
         Some(Some(true)),
         "the drawer drew pane 0's state while pane 1 is active"
     );
 
-    // ...and clicking it must write to pane 1, leaving pane 0 alone.
     h.mouse_click(clickable_leaf(&h, "Show radar sites").center());
     h.frames_for(5, FRAME_DT);
     assert!(
@@ -3107,8 +2441,6 @@ fn the_menu_reads_and_writes_the_active_pane_not_pane_zero() {
         "the toggle wrote to pane 0, which is not the active pane"
     );
 
-    // The untouched kind must be untouched — on the active pane, and on
-    // the one that was not being edited.
     assert!(
         h.overlay_enabled_on(1, &known::CITY_LABELS),
         "toggling radar sites on pane 1 also turned its city labels off: \
@@ -3121,22 +2453,6 @@ fn the_menu_reads_and_writes_the_active_pane_not_pane_zero() {
 }
 
 /// 29. **A menu toggle saves the active pane's *own* overlay config.**
-///
-///     `render_pane_map_content` loads each pane's config as it draws it,
-///     so mid-frame the handlers hold the last-drawn pane's settings.
-///     `set_active_pane_overlay` then snapshots the handlers onto the
-///     active pane — and `serialize_state` carries `enabled`, so a
-///     snapshot taken against the wrong pane's config silently rewrites
-///     every *other* overlay kind's on/off flag on the active pane.
-///
-///     Two separate things keep the handlers correct at that moment: the
-///     reload at the end of `Gui::ui`, and the load at the top of
-///     `set_active_pane_overlay`. Either alone is sufficient, so **neither
-///     is individually killable** — removing just one is an equivalent
-///     mutant. Removing both fails here, and only here.
-///
-///     Medium with the drawer shut: anywhere the layers panel is on screen
-///     it reloads the active pane's config every frame and hides this.
 #[test]
 fn a_menu_toggle_loads_the_active_panes_config_before_saving_it() {
     let mut h = InputHarness::with_screen(egui::vec2(800.0, 900.0));
@@ -3175,12 +2491,6 @@ fn a_menu_toggle_loads_the_active_panes_config_before_saving_it() {
 }
 
 /// 28. **A menu toggle propagates to the other panes when sync is on.**
-///
-///     Driven on Medium with the drawer shut — the menu is always on
-///     screen behind ☰, and this is a width where the layers panel is not.
-///     With the panel up, the shell's stack+inspector pass calls
-///     `propagate_layer_sync` itself every frame and masks the arm: a
-///     panel-open version of this test passes with the call deleted.
 #[test]
 fn a_menu_toggle_propagates_to_the_other_panes_when_sync_is_on() {
     let mut h = InputHarness::with_screen(egui::vec2(800.0, 900.0));
@@ -3208,7 +2518,6 @@ fn a_menu_toggle_propagates_to_the_other_panes_when_sync_is_on() {
     h.set_overlay_on_pane(1, &known::RADAR_SITES, false);
     h.warm_up();
 
-    // Through the dropdown: open ☰, then tick the box.
     h.open_menu();
     h.mouse_click(clickable_leaf(&h, "Show radar sites").center());
     h.frames_for(5, FRAME_DT);
@@ -3224,19 +2533,8 @@ fn a_menu_toggle_propagates_to_the_other_panes_when_sync_is_on() {
     );
 }
 
-// 19 retired (synthesis-m1): the drawer no longer hosts the menu; contract
-// 76 below holds the ☰ dropdown to carrying the whole menu at every width.
-
-/// 76. **The menu carries the whole model at every width — the ☰ dropdown
-///     on the wide widths, the sheet's Menu page on the phone.**
-///
-///     One route to Settings, Time, Exit, Refresh and every toggle per
-///     shell: the top bar's dropdown at ≥600pt, the bottom bar's Menu item
-///     below it. The wanted labels are the model's own
-///     (`menu_model_leaf_labels`), so a new entry joins this audit by
-///     construction and a renderer that drops one fails it — naming the
-///     label and the width, since "reachable on a desktop" and "reachable
-///     on a phone" are separate claims.
+/// 76. **The menu carries the whole model at every width — the ☰ dropdown on the
+/// wide widths, the sheet's Menu page on the phone.**
 #[test]
 fn the_app_menu_dropdown_carries_the_whole_menu_at_every_width() {
     for (size, expected) in [
@@ -3263,8 +2561,6 @@ fn the_app_menu_dropdown_carries_the_whole_menu_at_every_width() {
 
         h.open_menu();
         if expected == crate::ui_layout::WidthClass::Compact {
-            // The phone half of the contract: the whole menu is the sheet's
-            // Menu page, not a popup squeezed onto a phone.
             assert_eq!(
                 h.sheet().page,
                 Some(crate::ui::SheetPage::Menu),
@@ -3291,11 +2587,6 @@ fn the_app_menu_dropdown_carries_the_whole_menu_at_every_width() {
 }
 
 /// 20. **Invoking a command from the dropdown really dispatches it.**
-///
-///     A click on "Exit" has to become a `GuiAction::Exit`. `Exit` and
-///     `RefreshRadar` dispatch to a one-line arm, so a test that only walks
-///     the model and calls `apply_menu_event` proves nothing about them:
-///     an exhaustive `match` already guarantees the arm exists.
 #[test]
 fn a_command_invoked_from_the_dropdown_reaches_the_dispatcher() {
     let mut h = compact_with_menu();
@@ -3312,12 +2603,6 @@ fn a_command_invoked_from_the_dropdown_reaches_the_dispatcher() {
 }
 
 /// 21. **The dropdown's events reach the dispatcher on a desktop too.**
-///
-///     The widest width, driven the way a user drives it: click ☰ to open
-///     the dropdown, then click the checkbox inside it. Nothing here
-///     reaches into egui's popup memory — and the layers sidebar is open
-///     at this width, so this is also the width where a half-written
-///     toggle would be reverted by the panel's per-frame reload.
 #[test]
 fn a_toggle_flipped_in_the_dropdown_reaches_the_dispatcher() {
     let mut h = InputHarness::with_screen(egui::vec2(1200.0, 800.0));
@@ -3347,16 +2632,6 @@ fn a_toggle_flipped_in_the_dropdown_reaches_the_dispatcher() {
 }
 
 /// 22. **The pane picker narrows on a phone; the config clamp does not.**
-///
-///     The two limits differ deliberately and each has to be read by the
-///     right code. The values were pinned as constants, but nothing checked
-///     the picker consulted the width class at all. The other half — a wide
-///     layout surviving a load on a phone — is pinned in `ui_config.rs`.
-///
-///     The top bar draws the full row of buttons at every width and
-///     disables the ones past the offer, so "narrows" is now a claim about
-///     the enabled subset — and about a disabled button really refusing
-///     the click.
 #[test]
 fn the_pane_picker_offers_fewer_panes_on_a_phone_than_on_a_desktop() {
     use rustdar_device_profile::budget::{MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
@@ -3375,8 +2650,6 @@ fn the_pane_picker_offers_fewer_panes_on_a_phone_than_on_a_desktop() {
         crate::ui_layout::WidthClass::Compact,
         "precondition"
     );
-    // The phone top bar has no segments (plan §1.2): the sheet's Layers
-    // page header carries them, so the picker is read with that page open.
     assert!(
         compact.pane_option_counts().is_empty(),
         "the phone top bar drew pane segments it should not carry"
@@ -3406,20 +2679,12 @@ fn the_pane_picker_offers_fewer_panes_on_a_phone_than_on_a_desktop() {
         "the picker narrowed a desktop to the phone range"
     );
 
-    // Compared as *rendered* ranges rather than as the two constants, which
-    // clippy would fold to `true` — and a precondition that is true by
-    // construction is not one.
     assert!(
         enabled_counts(&compact).len() < enabled_counts(&expanded).len(),
         "precondition: the two ranges must differ, or both assertions above \
              are satisfied by one constant"
     );
 
-    // The probe's own statement of the offer must be the enabled subset
-    // the bar really drew — the counts are contiguous from 1, so the
-    // subset's size *is* its ceiling. This is what M6's phone sheet header
-    // will read, and a probe that merely restated the constant would let
-    // the two drift apart unseen.
     assert_eq!(
         compact.top_bar().pane_count_max,
         enabled_counts(&compact).len(),
@@ -3433,8 +2698,6 @@ fn the_pane_picker_offers_fewer_panes_on_a_phone_than_on_a_desktop() {
          buttons on screen"
     );
 
-    // A disabled button is drawn but refuses the click — the difference
-    // between "disabled" and "decorative".
     let six = compact
         .pane_options()
         .iter()
@@ -3448,9 +2711,6 @@ fn the_pane_picker_offers_fewer_panes_on_a_phone_than_on_a_desktop() {
         "clicking a disabled pane-count button split the layout anyway"
     );
 
-    // The buttons must be real: exactly one reads as selected, and it is
-    // the count actually in force. A probe rebuilt from `max_panes` would
-    // agree with the range above while the loop drew nothing.
     let selected: Vec<usize> = expanded
         .pane_options()
         .iter()
@@ -3463,8 +2723,6 @@ fn the_pane_picker_offers_fewer_panes_on_a_phone_than_on_a_desktop() {
         "the picker's selected button must be the live pane count"
     );
 
-    // ...and clicking one takes effect, which is the half no probe of the
-    // *offered range* can reach.
     let three = expanded
         .pane_options()
         .iter()
@@ -3486,21 +2744,10 @@ fn the_pane_picker_offers_fewer_panes_on_a_phone_than_on_a_desktop() {
     );
 }
 
-// ── The top bar's own controls ───────────────────────────────────────
-
-/// 77. **The Layers toggle hides and restores the Expanded sidebar with
-///     its state intact.**
-///
-///     The `stack_open` contract, driven the user's way: a click on the
-///     really-drawn toggle, never the setter. The restore half is the one
-///     that carries weight — the panel must come back under the same
-///     `layers_scroll` id with the same offset stored behind it, because
-///     a toggle that rebuilt the panel under a fresh id would look
-///     identical and silently cost the user their place in the list.
+/// 77. **The Layers toggle hides and restores the Expanded sidebar with its state
+/// intact.**
 #[test]
 fn the_layers_toggle_hides_and_restores_the_expanded_sidebar_with_its_state() {
-    // Short enough that the stack's rows genuinely overflow their
-    // scroll area — on a taller window there is no offset to preserve.
     let mut h = InputHarness::with_screen(egui::vec2(1200.0, 500.0));
     assert_eq!(
         h.width_class(),
@@ -3512,7 +2759,6 @@ fn the_layers_toggle_hides_and_restores_the_expanded_sidebar_with_its_state() {
         "precondition: the sidebar is the shell default on Expanded"
     );
 
-    // Real state behind a real id, so "intact" is a claim about something.
     let scroll_id = h
         .widget_id_probes()
         .iter()
@@ -3572,15 +2818,8 @@ fn the_layers_toggle_hides_and_restores_the_expanded_sidebar_with_its_state() {
     );
 }
 
-/// 78. **An explicit sidebar choice neither leaks into the drawer nor
-///     expires at the breakpoint.**
-///
-///     `stack_open` and `drawer_open` answer at different widths and
-///     remember independently — that is the whole reason they are two
-///     fields. Closing the Expanded sidebar, crossing to Medium, working
-///     the drawer there and coming back must find the explicit
-///     `Some(false)` still standing; a widened `drawer_open` would fail
-///     one direction or the other.
+/// 78. **An explicit sidebar choice neither leaks into the drawer nor expires at
+/// the breakpoint.**
 #[test]
 fn an_explicit_sidebar_choice_survives_the_breakpoint_without_leaking() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -3590,13 +2829,10 @@ fn an_explicit_sidebar_choice_survives_the_breakpoint_without_leaking() {
         "precondition: the shell default"
     );
 
-    // The explicit choice: close the sidebar.
     h.mouse_click(h.top_bar().layers_toggle.0.center());
     h.warm_up();
     assert!(!h.layers_panel_on_screen(), "precondition: closed by hand");
 
-    // Below the breakpoint the drawer governs, and it starts closed —
-    // not because the sidebar was closed, but because it always does.
     h.set_screen(egui::vec2(800.0, 900.0));
     assert_eq!(
         h.width_class(),
@@ -3608,8 +2844,6 @@ fn an_explicit_sidebar_choice_survives_the_breakpoint_without_leaking() {
         "the drawer must start closed on Medium"
     );
 
-    // The same toggle opens and closes the drawer, unencumbered by the
-    // sidebar's `Some(false)`.
     h.mouse_click(h.top_bar().layers_toggle.0.center());
     h.warm_up();
     assert!(
@@ -3624,8 +2858,6 @@ fn an_explicit_sidebar_choice_survives_the_breakpoint_without_leaking() {
         "the drawer did not close again"
     );
 
-    // Back on Expanded, the explicit choice is still in force — working
-    // the drawer must not have expired it.
     h.set_screen(egui::vec2(1400.0, 900.0));
     assert_eq!(h.width_class(), crate::ui_layout::WidthClass::Expanded);
     assert!(
@@ -3634,7 +2866,6 @@ fn an_explicit_sidebar_choice_survives_the_breakpoint_without_leaking() {
          explicitly closed"
     );
 
-    // ...and it is a choice, not a latch: the toggle still reopens it.
     h.mouse_click(h.top_bar().layers_toggle.0.center());
     h.warm_up();
     assert!(
@@ -3643,14 +2874,7 @@ fn an_explicit_sidebar_choice_survives_the_breakpoint_without_leaking() {
     );
 }
 
-/// 79. **A fresh session opens the layers panel only where it is
-///     persistent.**
-///
-///     The `None` default of `stack_open`, observed at every width: the
-///     sidebar up on Expanded with nothing having asked for it, and the
-///     drawer down on Medium and Compact — with the toggle's drawn state
-///     agreeing, since a toggle that read open over a closed drawer would
-///     invert its first click.
+/// 79. **A fresh session opens the layers panel only where it is persistent.**
 #[test]
 fn a_fresh_session_opens_the_sidebar_only_where_it_is_persistent() {
     for (size, expected, open) in [
@@ -3678,9 +2902,6 @@ fn a_fresh_session_opens_the_sidebar_only_where_it_is_persistent() {
             "{expected:?}: fresh state must show the panel only where the \
              sidebar is persistent"
         );
-        // The control that answers for the panel differs by shell: the top
-        // bar's toggle on the wide widths, the bottom bar's Layers item on
-        // the phone.
         let toggle_open = if expected == crate::ui_layout::WidthClass::Compact {
             assert!(
                 h.bottom_bar().layers.0.is_positive(),
@@ -3699,16 +2920,6 @@ fn a_fresh_session_opens_the_sidebar_only_where_it_is_persistent() {
 }
 
 /// 80. **The bar's arm toggle arms and disarms through real clicks.**
-///
-///     The end-to-end route the probe fields exist for: a click on the
-///     drawn X-sec toggle arms the draw and the next frame's probe shows
-///     it on; a second click on the armed toggle disarms.
-///
-///     It asserts the *swap* too: the bar carries both armed toggles, and
-///     clicking either un-arms the other, because one press on one map pane
-///     cannot be both a line and a box. The two share one gesture detector,
-///     so a bar that let both light at once would hand one press to two
-///     interpreters — and the bar is where a user would see it happen.
 #[test]
 fn the_bars_arm_toggle_arms_and_disarms_through_real_clicks() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -3726,7 +2937,6 @@ fn the_bars_arm_toggle_arms_and_disarms_through_real_clicks() {
         "the draw is armed but the toggle does not show it"
     );
 
-    // And off again, from the bar.
     h.mouse_click(h.top_bar().section_arm.0.center());
     h.warm_up();
     assert!(
@@ -3738,7 +2948,6 @@ fn the_bars_arm_toggle_arms_and_disarms_through_real_clicks() {
         "the draw is disarmed but the toggle still shows it armed"
     );
 
-    // The Region toggle, the same way round.
     let region = h.top_bar().region_arm;
     assert!(!region.1, "precondition: the region pick is not armed");
     h.mouse_click(region.0.center());
@@ -3752,9 +2961,6 @@ fn the_bars_arm_toggle_arms_and_disarms_through_real_clicks() {
         "the pick is armed but the toggle does not show it"
     );
 
-    // The swap. Arming X-sec from the bar must take the Region arm down with
-    // it, and the bar must say so on the very next frame — a lit toggle for a
-    // mode that is off is the state a user would act on.
     h.mouse_click(h.top_bar().section_arm.0.center());
     h.warm_up();
     assert!(
@@ -3768,7 +2974,6 @@ fn the_bars_arm_toggle_arms_and_disarms_through_real_clicks() {
         (h.top_bar().section_arm.1, h.top_bar().region_arm.1),
     );
 
-    // And back the other way, so neither toggle is the privileged one.
     h.mouse_click(h.top_bar().region_arm.0.center());
     h.warm_up();
     assert!(
@@ -3783,18 +2988,6 @@ fn the_bars_arm_toggle_arms_and_disarms_through_real_clicks() {
 }
 
 /// The phone bar carries **both** arm icons, and each one works.
-///
-/// Below the Compact breakpoint the top bar is stripped to the wordmark, the
-/// scan chip and the two arms — everything else the wide bar carries moves to
-/// the bottom bar and the sheet. The arms stay because their whole point is
-/// being visible while armed: a mode the user has forgotten they are in is the
-/// classic failure of a modal drag, and on a phone there is no menu on screen
-/// to notice it in.
-///
-/// Both are exercised, and the swap between them, because the phone bar is a
-/// second rendering of the same two toggles — a route that armed nothing, or
-/// that let both light at once, would be invisible to every test of the wide
-/// bar.
 #[test]
 fn the_phone_bar_carries_both_arms_and_they_still_exclude_each_other() {
     let mut h = InputHarness::with_screen(egui::vec2(420.0, 1200.0));
@@ -3821,7 +3014,6 @@ fn the_phone_bar_carries_both_arms_and_they_still_exclude_each_other() {
         "the pick is armed but the phone bar's icon does not show it",
     );
 
-    // The exclusion, on this bar's own two icons.
     h.mouse_click(h.top_bar().section_arm.0.center());
     h.warm_up();
     assert!(
@@ -3834,7 +3026,6 @@ fn the_phone_bar_carries_both_arms_and_they_still_exclude_each_other() {
         "the phone bar still lights the Region arm for a mode that is off",
     );
 
-    // And off again, so neither icon is one-way.
     h.mouse_click(h.top_bar().section_arm.0.center());
     h.warm_up();
     assert!(
@@ -3844,12 +3035,6 @@ fn the_phone_bar_carries_both_arms_and_they_still_exclude_each_other() {
 }
 
 /// 81. **Arming from the bar closes the open ☰ dropdown.**
-///
-///     The bar-click sibling of the in-menu rule (`render_top_bar`'s
-///     `close_kind`): the next thing the user does is a drag on the map,
-///     and an open menu is in its way. The bar's toggle is outside the
-///     popup, so this is the `CloseOnClickOutside` half — the click both
-///     arms and closes, and neither eats the other.
 #[test]
 fn arming_from_the_bar_closes_the_open_dropdown() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -3879,14 +3064,6 @@ fn arming_from_the_bar_closes_the_open_dropdown() {
 }
 
 /// 82. **The bar never overlaps itself at Medium's narrowest width.**
-///
-///     600pt with six panes is the worst case the docked bar must simply
-///     absorb: the roomy run would overrun the width, and before the arms
-///     claimed the right edge first the right-to-left toggles were laid
-///     out in whatever sliver was left — overlapping the segments, or
-///     degenerate. Asserted on the drawn rects: everything inside the
-///     bar's own rect, no segment under an arm, no painted label under an
-///     arm, and the arms still taking clicks.
 #[test]
 fn the_bar_never_overlaps_at_mediums_narrowest_width() {
     let mut h = InputHarness::with_screen(egui::vec2(600.0, 900.0));
@@ -3902,12 +3079,6 @@ fn the_bar_never_overlaps_at_mediums_narrowest_width() {
         "precondition: the widest segment row the bar can be asked for"
     );
 
-    // The squeeze swaps the roomy captions for the compact ones — never
-    // for nothing: the tight form used to drop them whole, leaving two
-    // unlabeled number runs nobody could tell apart (the second user test,
-    // M9-19). The roomy spelling's absence is how a test sees the tight
-    // form really engaged; the compact spelling's presence is the label
-    // guarantee itself.
     assert!(
         h.painted_text_strings()
             .iter()
@@ -3920,8 +3091,6 @@ fn the_bar_never_overlaps_at_mediums_narrowest_width() {
         "the tight bar dropped its compact captions - two unlabeled number \
          runs are the second user test's exact finding"
     );
-    // ...and the contrast that keeps that from passing vacuously: a roomy
-    // desktop draws the full spellings.
     let wide = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     assert!(
         wide.painted_text_strings().iter().any(|t| t == "Panes:"),
@@ -3962,9 +3131,6 @@ fn the_bar_never_overlaps_at_mediums_narrowest_width() {
         }
     }
 
-    // Every text the bar painted — which reaches the probe-less widgets,
-    // the active-pane selector above all — must stay clear of the arms
-    // too. The arms' own labels are exempted by their centre.
     for (rect, text) in h.painted_text_rects() {
         if !probe.rect.intersects(rect) || arms.iter().any(|a| a.contains(rect.center())) {
             continue;
@@ -3978,7 +3144,6 @@ fn the_bar_never_overlaps_at_mediums_narrowest_width() {
         }
     }
 
-    // Squeezed, not sacrificed: the toggle still takes its clicks, both ways.
     h.mouse_click(probe.section_arm.0.center());
     h.warm_up();
     assert!(
@@ -3994,13 +3159,6 @@ fn the_bar_never_overlaps_at_mediums_narrowest_width() {
 }
 
 /// 83. **A dismiss with the ☰ dropdown open closes it, and only it.**
-///
-///     Escape's real shape: egui's `Popup` closes itself on the Escape
-///     *it* sees, and the frontend independently resolves the same press
-///     through `dismiss_top_layer` — so without the popup at the chain's
-///     head, one press closed the popup *and* the layer beneath it. Both
-///     halves are driven here exactly as they ship: the dismiss first,
-///     the key event in the following frame's input.
 #[test]
 fn a_dismiss_with_the_dropdown_open_closes_it_and_only_it() {
     let mut h = InputHarness::with_screen(egui::vec2(800.0, 1200.0));
@@ -4032,7 +3190,6 @@ fn a_dismiss_with_the_dropdown_open_closes_it_and_only_it() {
          close and the consumed dismiss are not converging on one layer"
     );
 
-    // The second press is the drawer's.
     assert!(h.gui_mut().dismiss_top_layer(), "the drawer was still open");
     h.warm_up();
     assert!(
@@ -4042,13 +3199,6 @@ fn a_dismiss_with_the_dropdown_open_closes_it_and_only_it() {
 }
 
 /// 83b. **Android's back closes the menu with no key event at all.**
-///
-///      The other route: a logical back press never enters egui's queue.
-///      On the wide widths the popup's own Escape handling cannot see it
-///      and the request flag is what closes the dropdown; on the phone the
-///      menu is the sheet's Menu page and the chain's `menu_open` arm is
-///      the whole mechanism — this fixture is the phone, so it pins that
-///      arm.
 #[test]
 fn an_android_back_press_closes_the_dropdown_without_a_key_event() {
     let mut h = compact_with_menu();
@@ -4067,23 +3217,18 @@ fn an_android_back_press_closes_the_dropdown_without_a_key_event() {
         "the popup stayed open behind a back press egui never saw"
     );
 
-    // Only the popup was open, so the next press must fall through to
-    // the exit path — one layer per press, counted exactly.
     assert!(
         !h.gui_mut().dismiss_top_layer(),
         "the popup press left something else consumed as well"
     );
 }
 
-// ── The layer stack and the inspector ────────────────────────────────
-
-/// A two-pane Expanded harness with pane 1 made active the user's way — a
-/// click on that pane — so the stack and inspector demonstrably describe
-/// the pane the user is working in, not pane 0.
+/// A two-pane Expanded harness with pane 1 made active the user's way — a click on
+/// that pane — so the stack and inspector demonstrably describe the pane the user
+/// is working in, not pane 0.
 fn expanded_with_pane_1_active() -> InputHarness {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.set_pane_count(2);
-    // Clear of the stack on the left and the chrome bands.
     let target = h.pane_rects()[1].center();
     h.mouse_click(target);
     h.warm_up();
@@ -4097,15 +3242,6 @@ fn expanded_with_pane_1_active() -> InputHarness {
 }
 
 /// 84. **The stack's rows read and write the live active pane, not pane 0.**
-///
-///     Contract 27's claim, ported to the new pass: the stack renders from
-///     the pane the shell `mem::take`s, so a stack that read the placeholder
-///     — or indexed `panes[0]` — would draw every eye from the wrong pane
-///     and write every click to it. Sync is off so the panes can disagree;
-///     `CityLabels` is the witness kind for the write half, exactly as in
-///     contract 27: `serialize_state` carries `enabled`, so a snapshot taken
-///     against the wrong pane's config silently rewrites every *other*
-///     kind's flag.
 #[test]
 fn the_stacks_rows_read_and_write_the_active_pane_not_pane_zero() {
     let mut h = expanded_with_pane_1_active();
@@ -4116,7 +3252,6 @@ fn the_stacks_rows_read_and_write_the_active_pane_not_pane_zero() {
     h.set_overlay_on_pane(1, &known::CITY_LABELS, true);
     h.warm_up();
 
-    // The read half: the eye shows pane 1's state.
     let row = h
         .stack_row(&known::RADAR_SITES)
         .expect("the stack must draw a RadarSites row");
@@ -4125,7 +3260,6 @@ fn the_stacks_rows_read_and_write_the_active_pane_not_pane_zero() {
         "the eye drew pane 0's state while pane 1 is active"
     );
 
-    // The write half: clicking it writes pane 1, and only the toggled kind.
     h.mouse_click(row.eye.center());
     h.frames_for(5, FRAME_DT);
     assert!(
@@ -4148,13 +3282,6 @@ fn the_stacks_rows_read_and_write_the_active_pane_not_pane_zero() {
 }
 
 /// 85. **The eye turns a layer off, and it stays off — and back on.**
-///
-///     Contract 18's watched-frames claim, ported to the eye: a toggle that
-///     reached `enabled_overlays` but not `overlay_configs` is undone the
-///     next time the handlers reload from the config, so asserting straight
-///     after the click passes while the user's change evaporates. Both
-///     directions, so this cannot pass by the click being read as an
-///     unconditional "off".
 #[test]
 fn the_eye_toggles_a_layer_both_ways_and_it_sticks() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -4189,15 +3316,7 @@ fn the_eye_toggles_a_layer_both_ways_and_it_sticks() {
 }
 
 /// 86. **The layer body carries no master toggle: the stack row's eye owns
-///     visibility.**
-///
-///     The second user test's de-dup: the body's "Show <layer>" checkbox
-///     duplicated the eye in the same context and is gone — contract 85
-///     holds the eye to the job, and this holds the body to not growing the
-///     duplicate back. Asserted off the painted text, since no probe field
-///     exists to have recorded a control that must not draw. The Radar body
-///     — the one whose handler owns nothing but the master — states its
-///     picture and points at Pane properties instead of standing empty.
+/// visibility.**
 #[test]
 fn the_layer_body_carries_no_master_toggle() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -4215,8 +3334,6 @@ fn the_layer_body_carries_no_master_toggle() {
         );
     }
 
-    // The Radar body's non-empty replacement: the route to where product
-    // and tilt actually live.
     let rect = h.inspector_rect().expect("the Radar body is open");
     assert!(
         h.text_painted_in(rect, "Pane properties..."),
@@ -4238,17 +3355,6 @@ fn the_layer_body_carries_no_master_toggle() {
 }
 
 /// 87. **An eye toggle saves the active pane's *own* overlay config.**
-///
-///     Contract 29's claim, ported to the eye. `render_pane_map_content`
-///     loads each pane's config as it draws it, so at the end of a frame
-///     the handlers hold the *last-drawn* pane's settings — and
-///     `serialize_state` carries `enabled`, so a snapshot taken against the
-///     wrong pane's config silently rewrites every other kind's flag on the
-///     active pane. Three separate things keep the handlers correct at the
-///     moment of the write: the frame-end reload in `Gui::ui`, the shell's
-///     pre-take load, and the load inside `write_pane_overlay` itself. Any
-///     alone is sufficient — so no single one is killable — but removing
-///     all three fails here, and this is the test that names the failure.
 #[test]
 fn an_eye_toggle_loads_the_active_panes_config_before_saving_it() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -4281,16 +3387,9 @@ fn an_eye_toggle_loads_the_active_panes_config_before_saving_it() {
     );
 }
 
-/// 88. **An eye toggle propagates over the layer-link fan-out mask — linked
-///     source to linked targets; an unlinked target is untouched; an
-///     unlinked source stays local.** (M11: `PaneState::layer_link` replaced
-///     the `sync_layers` global on both ends of `propagate_layer_sync`.)
-///
-///     Contract 28's claim, ported to the eye and to the per-pane model:
-///     the shell's pass ends with `propagate_layer_sync` after the pane goes
-///     back, and the mask is what decides who that reaches. All three arms
-///     are driven through the same real eye clicks so a gate deleted on
-///     either end fails here by name.
+/// 88. **An eye toggle propagates over the layer-link fan-out mask — linked source
+/// to linked targets; an unlinked target is untouched; an unlinked source stays
+/// local.**
 #[test]
 fn an_eye_toggle_propagates_over_the_layer_link_mask() {
     let mut h = expanded_with_pane_1_active();
@@ -4302,7 +3401,6 @@ fn an_eye_toggle_propagates_over_the_layer_link_mask() {
     h.set_overlay_on_pane(1, &known::RADAR_SITES, false);
     h.warm_up();
 
-    // Linked source, linked target: the default, and the propagation.
     let row = h.stack_row(&known::RADAR_SITES).expect("row drawn");
     h.mouse_click(row.eye.center());
     h.frames_for(5, FRAME_DT);
@@ -4316,7 +3414,6 @@ fn an_eye_toggle_propagates_over_the_layer_link_mask() {
              are linked"
     );
 
-    // Unlinked target: the group's edits leave it alone.
     h.gui_mut().pane_mut(0).expect("pane 0").layer_link = false;
     h.warm_up();
     let row = h.stack_row(&known::RADAR_SITES).expect("row drawn");
@@ -4331,11 +3428,6 @@ fn an_eye_toggle_propagates_over_the_layer_link_mask() {
         "the toggle reached a layer-unlinked target pane"
     );
 
-    // Unlinked source: the active pane's edits stay its own. Pane 0 is
-    // relinked so there is a linked target to observably not reach, and the
-    // panes disagree about a *second* kind — the witness: an unlinked-source
-    // propagation would copy the whole enabled map, flipping pane 0's city
-    // labels to pane 1's, whatever it did about the kind being toggled.
     {
         let gui = h.gui_mut();
         gui.pane_mut(0).expect("pane 0").layer_link = true;
@@ -4366,14 +3458,6 @@ fn an_eye_toggle_propagates_over_the_layer_link_mask() {
 }
 
 /// 94. **Turning a dataless layer on fetches it.**
-///
-///     SPC outlooks are the layer that makes this a contract rather than a
-///     nicety: the handler never auto-polls, so an enable that emitted no
-///     `FetchOverlay` would leave an enabled layer that stays blank forever.
-///     The layer's own sub-toggles ask for the fetch through their
-///     `ControlEffect`; the eye — the master route since the Show toggle's
-///     de-dup (contract 86) — bypasses them, so it carries the rule itself.
-///     The catalog tile route shares the same helper and its own pin.
 #[test]
 fn enabling_a_dataless_layer_fetches_it() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -4402,8 +3486,6 @@ fn drag_stack_row(h: &mut InputHarness, kind: &LayerId, to: egui::Pos2) {
     let from = handle.center();
     h.mouse_press(from);
     h.frame_after(FRAME_DT);
-    // Two moves, so the gesture has an in-flight frame with the lift and
-    // the insertion marker up before the release lands the row.
     h.mouse_move(egui::pos2(from.x, (from.y + to.y) / 2.0));
     h.frame_after(FRAME_DT);
     h.mouse_move(to);
@@ -4413,9 +3495,9 @@ fn drag_stack_row(h: &mut InputHarness, kind: &LayerId, to: egui::Pos2) {
 }
 
 /// [`drag_stack_row`] by touch: the same grip, through the egui-winit touch
-/// sequence — whose *release* frame batches `PointerButton{up}` with
-/// `PointerGone` (the harness's event-fidelity table), the pair that clears
-/// egui's `latest_pos` before the drag resolver runs.
+/// sequence — whose *release* frame batches `PointerButton{up}` with `PointerGone`
+/// (the harness's event-fidelity table), the pair that clears egui's `latest_pos`
+/// before the drag resolver runs.
 fn touch_drag_stack_row(h: &mut InputHarness, kind: &LayerId, to: egui::Pos2) {
     let handle = h
         .stack_row(kind)
@@ -4434,16 +3516,6 @@ fn touch_drag_stack_row(h: &mut InputHarness, kind: &LayerId, to: egui::Pos2) {
 }
 
 /// 68c. **The same grip drag lands by touch.**
-///
-///     The release is where touch differs from the mouse and the mouse leg
-///     cannot cover it: egui-winit ends a touch with `PointerButton{up}`
-///     **and** `PointerGone` in one frame's batch, and `PointerGone` clears
-///     egui's `latest_pos` — so a drag resolver reading `latest_pos` sees
-///     `None` on the landing frame, cancels, and the row springs back with
-///     nothing written (the M9 review's finding; the resolver reads
-///     `interact_pos`, which survives the frame it went gone on). Driven
-///     through the full touch sequence; the permutation assertion is the
-///     mouse leg's.
 #[test]
 fn a_touch_drag_on_the_grip_lands_the_reorder() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -4465,7 +3537,6 @@ fn a_touch_drag_on_the_grip_lands_the_reorder() {
          latest_pos loses the landing position to the release batch's \
          PointerGone and springs the row back"
     );
-    // And the rows really re-render in the landed order.
     assert_eq!(
         h.stack().rows[0].kind,
         second,
@@ -4473,19 +3544,8 @@ fn a_touch_drag_on_the_grip_lands_the_reorder() {
     );
 }
 
-/// 68. **Dragging a row by its grip really reorders the draw order —
-///     permuted, persisted, redrawn.**
-///
-///     `PaneState::draw_order` has been persisted per pane since multi-pane
-///     landed; the grip drag is the UI that changes it (the ⏶⏷ buttons it
-///     replaces were too small on a desktop and unusable on touch — the
-///     second user test). Each claim has its own silent failure: a drop that
-///     lands on the wrong neighbour (the display list is the draw order
-///     *reversed*, so the slot arithmetic is exactly the thing to pin), a
-///     reorder that evaporates on restart because it never reached the
-///     config, and rows that keep their old positions because the renderer
-///     iterated a copy. Driven through real press-move-release sequences,
-///     never a state poke.
+/// 68. **Dragging a row by its grip really reorders the draw order — permuted,
+/// persisted, redrawn.**
 #[test]
 fn dragging_a_row_by_its_grip_permutes_the_draw_order_and_it_persists() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -4495,8 +3555,6 @@ fn dragging_a_row_by_its_grip_permutes_the_draw_order_and_it_persists() {
     let rows = h.stack().rows;
     assert_eq!(rows.len(), n, "one row per layer");
 
-    // Drag the second row above the first: drawn later, i.e. towards the
-    // *end* of `draw_order` — the top row is the last-drawn layer.
     let second = rows[1].kind.clone();
     let above_top = egui::pos2(rows[0].rect.center().x, rows[0].rect.top() - 4.0);
     drag_stack_row(&mut h, &second, above_top);
@@ -4509,15 +3567,12 @@ fn dragging_a_row_by_its_grip_permutes_the_draw_order_and_it_persists() {
          order's last two entries"
     );
 
-    // The rows re-render in the new order, from the mutated field.
     let rows = h.stack().rows;
     assert_eq!(
         rows[0].kind, second,
         "the promoted layer's row did not move to the top"
     );
 
-    // Dragging it back down one slot undoes it, so the drop arithmetic is
-    // symmetric.
     let below_second = egui::pos2(rows[1].rect.center().x, rows[1].rect.bottom() - 2.0);
     drag_stack_row(&mut h, &second, below_second);
     assert_eq!(
@@ -4526,7 +3581,6 @@ fn dragging_a_row_by_its_grip_permutes_the_draw_order_and_it_persists() {
         "dragging the promoted row back down must put the order back"
     );
 
-    // A drop past the bottom lands the row last-in-display — first-drawn.
     let top = h.stack().rows[0].kind.clone();
     let below_last = {
         let rows = h.stack().rows;
@@ -4539,8 +3593,6 @@ fn dragging_a_row_by_its_grip_permutes_the_draw_order_and_it_persists() {
         "a drop below the last row must make the layer the first drawn"
     );
 
-    // And the change survives the config round trip: save, and load into a
-    // fresh session.
     let reordered = h.gui_mut().pane(0).expect("pane 0").draw_order.clone();
     assert_ne!(reordered, before, "precondition: a real reorder to persist");
     let store = rustdar_kv::MemoryKvStore::default();
@@ -4554,13 +3606,8 @@ fn dragging_a_row_by_its_grip_permutes_the_draw_order_and_it_persists() {
     );
 }
 
-/// 68b. **The user's exact case: City Labels dragged above the Color Scale
-///     changes what paints over what.**
-///
-///     The end-to-end of contracts 68 and 95 together: the drag permutes
-///     `draw_order`, and the pane's paint sequence — the one the paint-order
-///     probe records off the real dispatch — moves with it. On the old fixed
-///     pass this was exactly the reorder that changed nothing on the glass.
+/// 68b. **The user's exact case: City Labels dragged above the Color Scale changes
+/// what paints over what.**
 #[test]
 fn city_labels_dragged_above_the_color_scale_paint_after_it() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -4574,7 +3621,6 @@ fn city_labels_dragged_above_the_color_scale_paint_after_it() {
             .position(|(k, _)| k == kind)
             .unwrap_or_else(|| panic!("{kind:?} was not dispatched"))
     };
-    // The default order paints City Labels before the Color Scale.
     let labels_before = paint_pos(&h, &known::CITY_LABELS);
     let scale_before = paint_pos(&h, &known::COLOR_SCALE);
     assert!(
@@ -4582,7 +3628,6 @@ fn city_labels_dragged_above_the_color_scale_paint_after_it() {
         "precondition: the default draw order paints the scale over the labels"
     );
 
-    // Drag the City Labels row above the Color Scale row.
     let scale_row = h
         .stack_row(&known::COLOR_SCALE)
         .expect("the Color Scale row is drawn");
@@ -4598,22 +3643,8 @@ fn city_labels_dragged_above_the_color_scale_paint_after_it() {
     );
 }
 
-/// 95. **The pane paints every enabled kind at its `draw_order` position, on
-///     one paint list.**
-///
-///     The second user test's meaty finding: moving City Labels above the
-///     Color Scale changed nothing, because the scale painted on a dedicated
-///     sub-layer — and same-`Order` non-area layers composite in
-///     `GraphicLayers::drain`'s hash-order safety net, not in submission
-///     order. Two claims, each with its own silent failure: the dispatched
-///     sequence equals the pane's enabled `draw_order` (a fixed-pass renderer
-///     restores itself here), and every *arm* paints into the same egui
-///     layer — recorded from the arm's own painter, so an arm-level
-///     sub-layer switch (the exact old bug, which this half verified-failed
-///     on) passes the sequence half while egui stacks it wherever the hash
-///     lands, and fails here. Exactly that much: a sub-layer built deep
-///     inside a paint *helper* is beyond the probe's sight and stays on the
-///     helpers' honour — see `PaneRenderCtx::paint_order`.
+/// 95. **The pane paints every enabled kind at its `draw_order` position, on one
+/// paint list.**
 #[test]
 fn the_pane_paints_every_enabled_kind_in_draw_order_on_one_paint_list() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -4654,14 +3685,7 @@ fn the_pane_paints_every_enabled_kind_in_draw_order_on_one_paint_list() {
 }
 
 /// 89. **A stack row click selects that layer in the inspector, which opens
-///     itself.**
-///
-///     The row is the route to a layer's options (plan §3.8): the click
-///     must auto-open a closed inspector and land on *that* layer's body —
-///     asserted through the probe's `mode`, which the body arm writes as a
-///     literal, so a mis-wired dispatch cannot fake it. The crumb is the
-///     user-visible half of the same claim, and `✕` deselect is the way
-///     back to App › Settings.
+/// itself.**
 #[test]
 fn a_stack_row_click_opens_that_layers_options_in_the_inspector() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -4692,7 +3716,6 @@ fn a_stack_row_click_opens_that_layers_options_in_the_inspector() {
         "the selected layer's row must draw selected"
     );
 
-    // ✕ returns to App › Settings without closing the panel.
     h.mouse_click(inspector.deselect.center());
     h.warm_up();
     let inspector = h.inspector();
@@ -4704,13 +3727,8 @@ fn a_stack_row_click_opens_that_layers_options_in_the_inspector() {
     );
 }
 
-/// 90. **The ⚙ toggle and the menu's Settings… entry both reach the
-///     settings body.**
-///
-///     The toggle mirrors the Layers toggle for the right-hand panel; the
-///     menu entry lands on App › Settings specifically. Both asserted
-///     through the body-arm probe, and the panel itself must float inside
-///     the map like every other surface.
+/// 90. **The ⚙ toggle and the menu's Settings… entry both reach the settings
+/// body.**
 #[test]
 fn the_inspector_toggle_and_the_settings_entry_reach_the_settings_body() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -4749,7 +3767,6 @@ fn the_inspector_toggle_and_the_settings_entry_reach_the_settings_body() {
         "a second \u{2699} click did not close the inspector"
     );
 
-    // The menu route: Settings… opens the same body.
     h.open_settings();
     assert_eq!(
         h.inspector().mode,
@@ -4763,11 +3780,6 @@ fn the_inspector_toggle_and_the_settings_entry_reach_the_settings_body() {
 }
 
 /// 91. **The double-render counter really counts.**
-///
-///     The harness holds `control_render_passes` to at most one after every
-///     frame, which is vacuous if nothing increments it — this is the
-///     canary: a frame with a layer body on screen counts exactly one pass,
-///     and a frame without one counts none.
 #[test]
 fn the_control_pass_counter_counts_the_layer_body() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -4792,13 +3804,8 @@ fn the_control_pass_counter_counts_the_layer_body() {
     );
 }
 
-/// 92. **The auto-poll chip's off state reads `⏸ Auto-poll off`, and its
-///     hover names the way back.** (Plan §5.9's carried pin.)
-///
-///     The chip replaced the checkbox at the full-bleed flip, so the off
-///     position — which the checkbox used to show by itself — has to stay
-///     readable off the chip, and the hover has to say where the toggle
-///     went, or the user who turned polling off has nothing to find it by.
+/// 92. **The auto-poll chip's off state reads `⏸ Auto-poll off`, and its hover
+/// names the way back.**
 #[test]
 fn the_auto_poll_chip_pins_its_off_text_and_hover() {
     let mut h = InputHarness::new();
@@ -4816,7 +3823,6 @@ fn the_auto_poll_chip_pins_its_off_text_and_hover() {
         "the chip's off state must say so"
     );
 
-    // The hover: where the toggle went.
     h.mouse_move(chip.center());
     h.frames_for(12, 0.1);
     assert!(
@@ -4828,15 +3834,7 @@ fn the_auto_poll_chip_pins_its_off_text_and_hover() {
     );
 }
 
-/// 93. **A shrunk window does not cap the stack forever.** (Plan §5.9's
-///     carried finding.)
-///
-///     `Area::default_size` applies only while the stored `AreaState` size
-///     is `None`, so after frame 1 the committed size becomes the sizing
-///     ceiling — and a `ScrollArea` fills what it is offered, so the old
-///     panel came back from a shrink stuck at its smallest-ever height.
-///     The stack sizes its body from the map every frame instead; this
-///     drives the shrink-then-grow and requires the height back.
+/// 93. **A shrunk window does not cap the stack forever.**
 #[test]
 fn the_stack_regains_its_height_after_a_shrink_and_regrow() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -4846,7 +3844,6 @@ fn the_stack_regains_its_height_after_a_shrink_and_regrow() {
         "precondition: the full-height stack must be tall, got {before}"
     );
 
-    // Shrink far enough that the body's per-frame ceiling clamps it…
     h.set_screen(egui::vec2(1400.0, 300.0));
     let shrunk = h.stack().rect.height();
     assert!(
@@ -4854,7 +3851,6 @@ fn the_stack_regains_its_height_after_a_shrink_and_regrow() {
         "precondition: the shrink must really clamp the stack, got {shrunk}"
     );
 
-    // …and back. The old panel stayed at `shrunk` forever.
     h.set_screen(egui::vec2(1400.0, 900.0));
     let regrown = h.stack().rect.height();
     assert!(
@@ -4866,11 +3862,6 @@ fn the_stack_regains_its_height_after_a_shrink_and_regrow() {
 }
 
 /// 23. **Host safe-area insets reach the chrome.**
-///
-///     the insets fact -> `LayoutCtx::resolve` -> the root `Ui`'s
-///     rect, which is what insets every nested `Panel`. That last hop was
-///     untested: dropping `.max_rect(..)` leaves the chrome under the
-///     status bar, and nothing in the suite ever set an inset.
 #[test]
 fn host_safe_area_insets_inset_the_chrome() {
     const TOP: f32 = 60.0;
@@ -4884,8 +3875,6 @@ fn host_safe_area_insets_inset_the_chrome() {
     h.set_safe_area_insets(TOP, BOTTOM, LEFT, RIGHT);
     let inset = h.map_panel_rect();
 
-    // The map is what is left after the panels claim their space, so it
-    // moves by exactly what the insets took off each edge.
     assert_eq!(inset.left() - bare.left(), LEFT, "left inset ignored");
     assert_eq!(bare.right() - inset.right(), RIGHT, "right inset ignored");
     assert_eq!(inset.top() - bare.top(), TOP, "top inset ignored");
@@ -4895,8 +3884,6 @@ fn host_safe_area_insets_inset_the_chrome() {
         "bottom inset ignored"
     );
 
-    // The top bar is laid out inside `content_rect` too, so on a phone it
-    // must sit below the notch rather than under the system bars.
     let mut h = InputHarness::with_screen(egui::vec2(420.0, 1000.0));
     assert_eq!(
         h.width_class(),
@@ -4914,9 +3901,6 @@ fn host_safe_area_insets_inset_the_chrome() {
 }
 
 /// 24. **Insets move the breakpoint, not just the padding.**
-///
-///     Through `Gui::ui` rather than only on `shrink_to_content`, which is
-///     what proves `Gui::safe_area_insets` is threaded into the resolve.
 #[test]
 fn host_insets_move_the_breakpoint_through_the_real_ui() {
     let mut h = InputHarness::with_screen(egui::vec2(610.0, 900.0));
@@ -4934,20 +3918,10 @@ fn host_insets_move_the_breakpoint_through_the_real_ui() {
     );
 }
 
-/// 25. **The hover readout follows the pointer, not the window width — and
-///     Compact has none at all (M9-17's revision).**
-///
-///     Keying the *existence* of a hover readout on `WidthClass` gets both
-///     wide ends wrong: a touch tablet would get an empty readout, a mouse
-///     desktop would lose one it can use. The Compact half changed in the
-///     second user test: the phone top bar's truncating copy was useless,
-///     so Compact hosts **no** bar readout for any modality — the value
-///     readout there is the press-and-hold popup (M9-17's own pin), which
-///     mouse and touch both reach.
+/// 25. **The hover readout follows the pointer, not the window width — and Compact
+/// has none at all (M9-17's revision).**
 #[test]
 fn the_hover_readout_follows_the_modality_not_the_width() {
-    // A narrow *desktop* window: the bar readout is gone (the popup is the
-    // route), and nothing truncated is left on the bar.
     let mut narrow = InputHarness::with_screen(egui::vec2(500.0, 800.0));
     narrow.mouse_click(narrow.map_center());
     assert_eq!(narrow.width_class(), crate::ui_layout::WidthClass::Compact);
@@ -4956,7 +3930,6 @@ fn the_hover_readout_follows_the_modality_not_the_width() {
         "the Compact top bar still hosts the truncating readout M9-17 removed"
     );
 
-    // A wide *mouse* window keeps the live status-bar readout.
     let mut wide = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     wide.mouse_click(wide.map_center());
     assert!(
@@ -4964,7 +3937,6 @@ fn the_hover_readout_follows_the_modality_not_the_width() {
         "a wide mouse window lost its status-bar readout"
     );
 
-    // A wide *touch* device: roomy, but nothing can hover.
     let mut tablet = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     tablet.touch_tap(tablet.map_center());
     assert_eq!(tablet.width_class(), crate::ui_layout::WidthClass::Expanded);
@@ -4973,7 +3945,6 @@ fn the_hover_readout_follows_the_modality_not_the_width() {
         "a touch device was given a hover readout that can never fill in"
     );
 
-    // ...and a *touch* phone gets none either.
     let mut touch_phone = InputHarness::with_screen(egui::vec2(420.0, 900.0));
     touch_phone.touch_tap(touch_phone.map_center());
     assert_eq!(
@@ -4987,18 +3958,6 @@ fn the_hover_readout_follows_the_modality_not_the_width() {
 }
 
 /// M9-17. **On Compact a mouse press-and-hold raises the value popup.**
-///
-///     The Compact bar readout is gone (contract 25's revision), so the
-///     long-press tooltip — the touch pipeline's value popup — must be
-///     reachable with a mouse there: a held primary button is the mouse's
-///     spelling of the hold. Driven with real held frames; the wide widths
-///     deliberately keep the pure mouse path (the long-press detector
-///     steals the pan from a resting mouse — and from a pan *paused* ≥0.8 s
-///     mid-drag, button held, since the movement cancel re-arms under a
-///     still-held button — and they have a live readout). The paused-pan
-///     steal is Compact's on purpose too: touch parity, a finger that pans
-///     then rests gets the value popup the same way (`resolve_active`'s
-///     caveat).
 #[test]
 fn a_compact_mouse_press_and_hold_raises_the_value_popup() {
     let mut h = InputHarness::with_screen(egui::vec2(420.0, 900.0));
@@ -5036,8 +3995,6 @@ fn a_compact_mouse_press_and_hold_raises_the_value_popup() {
     h.mouse_release(spot);
     h.warm_up();
 
-    // The wide widths keep the pure mouse path: the same hold resolves no
-    // long press at 1400pt.
     let mut wide = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     wide.load_scan("KTLX");
     let spot = wide.pane_rects()[0].center();
@@ -5050,20 +4007,9 @@ fn a_compact_mouse_press_and_hold_raises_the_value_popup() {
     wide.mouse_release(spot);
 }
 
-/// 26. **The phone top bar carries the short scan text; the long form stays
-///     on the desktop status bar — and the Auto-poll toggle stays reachable
-///     through the menu everywhere.**
-///
-///     The compact status bar's successor claim: the phone shell draws no
-///     status bar at all, so the short scan summary the compact bar used to
-///     carry lives in the phone top bar's chip — site, time, posture glyph —
-///     while the long form (date, product count, poll chip) stays where the
-///     room is. Asserted on the text drawn, not the flag.
-///
-///     Since the full-bleed flip the auto-poll *checkbox* is a display
-///     chip; the toggle itself lives in the menu. The menu assertion is
-///     what keeps that a move rather than a removal — through the sheet's
-///     Menu page on the phone, the ☰ dropdown on the desktop.
+/// 26. **The phone top bar carries the short scan text; the long form stays on the
+/// desktop status bar — and the Auto-poll toggle stays reachable through the menu
+/// everywhere.**
 #[test]
 fn a_compact_status_bar_drops_the_long_summary_and_the_auto_poll_box() {
     let mut phone = InputHarness::with_screen(egui::vec2(420.0, 900.0));
@@ -5089,8 +4035,6 @@ fn a_compact_status_bar_drops_the_long_summary_and_the_auto_poll_box() {
         "the chip must name the state it shows, got {chip_text:?}"
     );
 
-    // The chip is display-only; the toggle lives in the menu — reachable at
-    // every width, so the phone shell dropping the bar strands nothing.
     for h in [&mut phone, &mut desk] {
         h.open_menu();
         assert_eq!(
@@ -5101,8 +4045,6 @@ fn a_compact_status_bar_drops_the_long_summary_and_the_auto_poll_box() {
         h.close_menu();
     }
 
-    // Both forms name the site, so the difference is the *detail*: only the
-    // long form carries the date and the product count.
     let scan_chip = phone.top_bar().scan_text;
     assert!(
         scan_chip.contains("KABR") && roomy_bar.scan_text.contains("KABR"),
@@ -5130,31 +4072,11 @@ fn a_compact_status_bar_drops_the_long_summary_and_the_auto_poll_box() {
 }
 
 /// Data collected `ago` before now.
-///
-/// Offset by half a minute so the whole-minute truncation in
-/// `format_product_age` cannot land on a boundary and read one lower while
-/// the test runs.
 fn written_ago(minutes: i64) -> chrono::NaiveDateTime {
     chrono::Utc::now().naive_utc() - chrono::Duration::seconds(minutes * 60 + 30)
 }
 
 /// 26b. **Every product says how old the data behind it is, the same way.**
-///
-///      The scan line beside this is the *volume* time and answers a
-///      different question. For a product fetched from the Level III bucket
-///      the two can be days apart — `level3::latest_key` falls back to the
-///      previous UTC day, so a site that went down yesterday paints a field
-///      up to ~48h old under a scan line that looks perfectly current.
-///
-///      The line used to read `Level III:` and be drawn *only* for the
-///      bucket-fetched products, which made the datasource readable off the
-///      status bar and made its absence informative too. It is now one
-///      uniform line: same label, same format, drawn whenever the pane knows
-///      when its data was collected, whatever produced it.
-///
-///      Asserted on the text egui laid out inside the bar's own rect, not
-///      just on the probe: a probe records what the renderer was handed,
-///      and the thing that matters is what reached the glass.
 #[test]
 fn every_products_data_age_is_drawn_the_same_way_in_the_status_bar() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -5191,18 +4113,11 @@ fn every_products_data_age_is_drawn_the_same_way_in_the_status_bar() {
 }
 
 /// 26d. **A looping pane dates the frame it is playing, not the still it
-///      replaced.**
-///
-///      The bar used to draw nothing at all while a loop ran, because
-///      `data_time` describes the static render the animation stands in
-///      for — captioning someone else's picture. The frame's own volume time
-///      is the right answer, and it is the same answer whichever datasource
-///      the loop reads, since a loop frame *is* a volume.
+/// replaced.**
 #[test]
 fn a_looping_pane_reports_its_current_frames_time() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.load_scan("KTLX");
-    // A time the static render would never report, so the two are telling.
     h.set_data_time(0, Some(written_ago(90)));
 
     let frame_time = written_ago(7);
@@ -5237,15 +4152,8 @@ fn a_looping_pane_reports_its_current_frames_time() {
     );
 }
 
-// ── The floating timeline transport ──────────────────────────────────
-
-/// 66. **Collapsing the transport leaves a restore chip at the map's
-///     bottom-right, and the chip restores it.**
-///
-///     Collapse that merely hid the widgets would leave their rects
-///     recorded and their clicks landing; collapse that left no chip
-///     would be a transport with no way back. Both halves are driven the
-///     user's way, through the drawn rects.
+/// 66. **Collapsing the transport leaves a restore chip at the map's bottom-right,
+/// and the chip restores it.**
 #[test]
 fn collapsing_the_transport_leaves_a_chip_that_restores_it() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -5261,7 +4169,6 @@ fn collapsing_the_transport_leaves_a_chip_that_restores_it() {
     let collapsed = h.timeline();
     assert!(collapsed.collapsed, "the \u{25be} button did not collapse");
 
-    // The chip: inside the map, hugging its bottom-right corner.
     let map = h.map_panel_rect();
     assert!(
         map.contains_rect(collapsed.chip),
@@ -5274,7 +4181,6 @@ fn collapsing_the_transport_leaves_a_chip_that_restores_it() {
         collapsed.chip
     );
 
-    // Row 1 is really gone — no rects to click, no text on the glass.
     assert!(
         !collapsed.live.0.is_positive()
             && !collapsed.scrubber.is_positive()
@@ -5288,7 +4194,6 @@ fn collapsing_the_transport_leaves_a_chip_that_restores_it() {
         "the Live button was still painted while collapsed"
     );
 
-    // And the chip is the way back.
     h.mouse_click(collapsed.chip.center());
     h.warm_up();
     let restored = h.timeline();
@@ -5298,8 +4203,8 @@ fn collapsing_the_transport_leaves_a_chip_that_restores_it() {
     );
 }
 
-/// 66b. **The status bar's ◧ collapses it to a restore button, left-
-///      anchored, and the same button brings it back.**
+/// 66b. **The status bar's ◧ collapses it to a restore button, left- anchored, and
+/// the same button brings it back.**
 #[test]
 fn collapsing_the_status_bar_leaves_only_its_restore_button() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -5338,20 +4243,8 @@ fn collapsing_the_status_bar_leaves_only_its_restore_button() {
     );
 }
 
-/// **A countdown on screen buys itself a frame a second, and nothing else
-/// buys one at all.**
-///
-/// The `archive {n}s` chip is the only thing in the app that changes with no
-/// input behind it, so it is the only thing an idle app owes a frame to. The
-/// app used to draw at the display's refresh rate to keep it moving — 60 to
-/// 144 frames for each of the 60 numbers it prints — because the re-arm that
-/// kept it moving was `is_auto_poll_active()`, an unconditional yes.
-///
-/// Both halves are asserted off the same state, one frame apart in
-/// configuration only: the bar drawn, and the bar collapsed to its restore
-/// button. The poll timer is identical across the two, so a tick derived from
-/// the timer rather than from what was *drawn* passes the first and fails the
-/// second.
+/// **A countdown on screen buys itself a frame a second, and nothing else buys one
+/// at all.**
 #[test]
 fn the_status_bar_countdown_pays_for_its_own_frames_and_nothing_else_does() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -5377,8 +4270,6 @@ fn the_status_bar_countdown_pays_for_its_own_frames_and_nothing_else_does() {
              moves, and anything shorter is the repaint loop back again"
     );
 
-    // Collapsed, the countdown is not on screen — and nothing is owed for it,
-    // though the timer behind it is still running.
     let collapse = h.status_bar().collapse;
     h.mouse_click(collapse.center());
     h.warm_up();
@@ -5394,9 +4285,9 @@ fn the_status_bar_countdown_pays_for_its_own_frames_and_nothing_else_does() {
     );
 }
 
-/// The phone shell draws no status bar at all (plan §1.6), so it owes no
-/// frames to a chip it never drew — the same claim as above, reached by the
-/// other route into the absence.
+/// The phone shell draws no status bar at all (plan §1.6), so it owes no frames to
+/// a chip it never drew — the same claim as above, reached by the other route into
+/// the absence.
 #[test]
 fn a_phone_owes_no_frames_to_a_status_bar_it_never_draws() {
     let mut h = InputHarness::with_screen(egui::vec2(400.0, 800.0));
@@ -5409,9 +4300,8 @@ fn a_phone_owes_no_frames_to_a_status_bar_it_never_draws() {
     assert_eq!(h.gui_mut().status_tick_delay(), None);
 }
 
-/// **The timestamp chip opens the Set Time dialog** — the timeline's own
-/// route to it; the menu's Time... entry is the other, and the dialog
-/// itself is unchanged.
+/// **The timestamp chip opens the Set Time dialog** — the timeline's own route to
+/// it; the menu's Time...
 #[test]
 fn the_timestamp_chip_opens_the_time_dialog() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -5429,9 +4319,9 @@ fn the_timestamp_chip_opens_the_time_dialog() {
     );
 }
 
-/// **Back steps into the archive; forward is dead while live** — the
-/// navigation semantics that moved from the layers panel, driven through
-/// the timeline's drawn rects for the first time.
+/// **Back steps into the archive; forward is dead while live** — the navigation
+/// semantics that moved from the layers panel, driven through the timeline's drawn
+/// rects for the first time.
 #[test]
 fn back_steps_into_the_archive_and_forward_is_dead_while_live() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -5455,7 +4345,6 @@ fn back_steps_into_the_archive_and_forward_is_dead_while_live() {
         "a disabled forward button still navigated"
     );
 
-    // Back: one default step (10 min) into the archive, dropping live.
     h.mouse_click(h.timeline().back.center());
     assert!(
         h.last_actions().iter().any(|a| matches!(
@@ -5481,20 +4370,6 @@ fn back_steps_into_the_archive_and_forward_is_dead_while_live() {
 }
 
 /// 74. **A wheel over the floating chrome zooms nothing underneath it.**
-///
-///     Pane rects run under the timeline and the status bar since the
-///     full-bleed flip, so "the pointer is over this pane" no longer
-///     implies "the pointer is over the map". Two readers could fall for
-///     it: walkers' own gate for the 2D map, and the 3D pane's globally
-///     read `zoom_delta` — the second is the one
-///     `ui_region::pointer_on_map_layer` exists for. Each half has a
-///     control scroll on open map first, so a pass cannot come from
-///     zooming being broken altogether.
-///
-///     The two halves read different things, because a scroll means
-///     different things: a plan view's aims the geography, and a 3D pane's
-///     dollies the eye. That a 3D pane's *box* does not move either way is
-///     the subject of its own test.
 #[test]
 fn a_wheel_over_the_floating_chrome_zooms_nothing_underneath() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -5506,7 +4381,6 @@ fn a_wheel_over_the_floating_chrome_zooms_nothing_underneath() {
     let timeline = h.timeline().rect;
     let status_bar = h.status_bar().rect;
     let panes = h.pane_rects();
-    // What a 3D pane's wheel moves: the eye's standoff, in framing radii.
     let ground = |h: &mut InputHarness| {
         h.gui_mut()
             .pane(1)
@@ -5517,7 +4391,6 @@ fn a_wheel_over_the_floating_chrome_zooms_nothing_underneath() {
             .eye_distance()
     };
 
-    // Control: a scroll on the open volume pane brings its eye in.
     let clear_volume = egui::pos2(panes[1].center().x, panes[1].center().y);
     assert!(
         !h.is_floating_layer_at(clear_volume),
@@ -5531,7 +4404,6 @@ fn a_wheel_over_the_floating_chrome_zooms_nothing_underneath() {
         "control: a scroll on the open volume pane must zoom it"
     );
 
-    // Over the timeline, above the same volume pane: nothing.
     let covered = egui::pos2(
         (panes[1].left() + 40.0).max(timeline.left() + 8.0),
         timeline.center().y,
@@ -5549,7 +4421,6 @@ fn a_wheel_over_the_floating_chrome_zooms_nothing_underneath() {
         "a wheel over the timeline dollied the 3D pane under it"
     );
 
-    // Control: a scroll on the open map pane zooms the map.
     let clear_map = egui::pos2(panes[0].center().x + 80.0, panes[0].center().y);
     assert!(
         !h.is_floating_layer_at(clear_map),
@@ -5563,7 +4434,6 @@ fn a_wheel_over_the_floating_chrome_zooms_nothing_underneath() {
         "control: a scroll on the open map pane must zoom it"
     );
 
-    // Over the status bar, above the same map pane: nothing.
     let covered = egui::pos2(panes[0].center().x + 80.0, status_bar.center().y);
     assert!(
         status_bar.contains(covered) && panes[0].contains(covered),
@@ -5576,7 +4446,6 @@ fn a_wheel_over_the_floating_chrome_zooms_nothing_underneath() {
         after, before,
         "a wheel over the status bar zoomed the map under it"
     );
-    // ...and over the timeline too.
     let covered = egui::pos2(panes[0].right() - 80.0, timeline.center().y);
     assert!(
         timeline.contains(covered) && panes[0].contains(covered),
@@ -5592,12 +4461,6 @@ fn a_wheel_over_the_floating_chrome_zooms_nothing_underneath() {
 }
 
 /// **Scrubbing drops out of live, on release** (plan §3.7).
-///
-///     With no loop running, the scrubber spans the lookback window and
-///     commits once, on `drag_stopped`: a release inside the rail emits
-///     `NavigateTime` to the released moment and clears `viewing_live`.
-///     Nothing may fire mid-drag — every intermediate position would be a
-///     volume fetch nobody asked to wait for.
 #[test]
 fn scrubbing_the_archive_commits_once_on_release_and_drops_live() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -5652,7 +4515,6 @@ fn scrubbing_the_archive_commits_once_on_release_and_drops_live() {
 fn scrubbing_to_the_right_end_restores_live() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.load_scan("KTLX");
-    // Park the pane in the archive first, so JumpToLive has something to do.
     h.gui_mut().pane_mut(0).expect("pane 0").viewing_live = false;
     h.warm_up();
 
@@ -5680,22 +4542,12 @@ fn scrubbing_to_the_right_end_restores_live() {
 }
 
 /// 26e. **A product whose tilts have not arrived keeps its tilt picker.**
-///
-///      Only Level III products can be in this state: `ScanInfo::from_scan`
-///      lists them the moment a volume loads and fills their angle in when the
-///      fetch lands, and every archive poll rebuilds `ScanInfo` from the volume
-///      alone, so the window reopens on every poll. Skipping the combo box
-///      while the list was empty made the control *vanish* and the layers panel
-///      reflow around it — visible on first selection and then flickering once
-///      a minute, which is exactly the kind of thing that tells a user this
-///      product is not like the others.
 #[test]
 fn a_product_whose_tilts_have_not_arrived_keeps_its_tilt_picker() {
     use rustdar_radar::types::RadarProduct;
 
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.load_scan("KTLX");
-    // The pickers live in the inspector's Pane-properties body now.
     h.open_pane_props();
     {
         let pane = h.gui_mut().pane_mut(0).unwrap();
@@ -5703,7 +4555,6 @@ fn a_product_whose_tilts_have_not_arrived_keeps_its_tilt_picker() {
         let info = pane.scan_info.as_mut().expect("a scan was loaded");
         info.product_elevations
             .insert(RadarProduct::Reflectivity, vec![0.5, 1.5]);
-        // As `from_scan` lists a Level III product: available, no angles yet.
         info.available_products.push(RadarProduct::EchoTops);
         info.product_elevations
             .insert(RadarProduct::EchoTops, Vec::new());
@@ -5718,16 +4569,11 @@ fn a_product_whose_tilts_have_not_arrived_keeps_its_tilt_picker() {
              painted: {:?}",
         h.painted_text_strings(),
     );
-    // And the render path agrees: the selection stands, so a render is
-    // dispatched rather than the previous product's image being held.
     assert_eq!(
         h.gui_mut().pane(0).unwrap().get_rendering_params(),
         Some((RadarProduct::EchoTops, 0.0)),
     );
 
-    // The populated case still lists its angles, so the assertion above is
-    // about a *present but empty* picker rather than about a combo box that
-    // never shows anything.
     h.gui_mut().pane_mut(0).unwrap().selected_product = RadarProduct::Reflectivity;
     h.warm_up();
     assert!(
@@ -5737,12 +4583,8 @@ fn a_product_whose_tilts_have_not_arrived_keeps_its_tilt_picker() {
     );
 }
 
-/// A harness with one pane on KTLX offering a Level II and a Level III
-/// product at 0.5°, radar layer on, showing a finished `showing` image.
-///
-/// Both products at the same angle deliberately: it makes the product the only
-/// thing that differs between the two selections, so a notice that appeared
-/// would be about the product switch and nothing else.
+/// A harness with one pane on KTLX offering a Level II and a Level III product at
+/// 0.5°, radar layer on, showing a finished `showing` image.
 fn pane_showing(showing: rustdar_radar::types::RadarProduct) -> InputHarness {
     use rustdar_radar::types::RadarProduct;
 
@@ -5760,11 +4602,6 @@ fn pane_showing(showing: rustdar_radar::types::RadarProduct) -> InputHarness {
 }
 
 /// The pending-render notice for `product`, as the pane paints it.
-///
-/// Read out of the *painted* text rather than from `stale_image_on_screen`, so
-/// what is asserted is what a user would be looking at. Matched on the product
-/// name the notice names — the one on screen — because that is the whole
-/// message.
 fn notice_painted(h: &InputHarness, product: rustdar_radar::types::RadarProduct) -> bool {
     h.painted_text_strings()
         .iter()
@@ -5779,17 +4616,6 @@ fn any_notice_painted(h: &InputHarness) -> bool {
 }
 
 /// 26f. **A pane says when its image is not the product it is labelled with.**
-///
-///      Switching product holds the previous product's image until the new
-///      render lands, while the color scale, the tilt picker and the status
-///      bar's data line have all already moved to the new selection. That is a
-///      label claiming something the pixels do not show — a small correctness
-///      problem, not a cosmetic one — and it lasts as long as a render, longer
-///      for a Level III product whose object has not landed.
-///
-///      The notice names what is *on screen*, since everything else on the
-///      pane already names the selection. The imagery stays up and undimmed
-///      behind it: one product's echoes are better than none.
 #[test]
 fn a_pane_says_when_its_image_is_not_the_selected_product() {
     use rustdar_radar::types::RadarProduct;
@@ -5801,7 +4627,6 @@ fn a_pane_says_when_its_image_is_not_the_selected_product() {
         h.painted_text_strings(),
     );
 
-    // The switch, with no render landed yet.
     h.select_product(0, RadarProduct::EchoTops);
     assert!(
         notice_painted(&h, RadarProduct::Reflectivity),
@@ -5809,16 +4634,12 @@ fn a_pane_says_when_its_image_is_not_the_selected_product() {
              nothing; painted: {:?}",
         h.painted_text_strings(),
     );
-    // Over the pane it is about, not somewhere in the chrome: in a split
-    // layout each pane answers for its own image.
     let pane_rect = h.pane_rects()[0];
     assert!(
         h.text_painted_in(pane_rect, "showing Reflectivity"),
         "the notice was painted outside the pane it describes; painted: {:?}",
         h.painted_text_strings(),
     );
-    // …and the picture is still there. The notice is drawn over the imagery,
-    // never instead of it.
     assert!(
         h.gui_mut()
             .pane(0)
@@ -5829,7 +4650,6 @@ fn a_pane_says_when_its_image_is_not_the_selected_product() {
         "the pane was cleared rather than annotated",
     );
 
-    // The render lands and the notice goes.
     h.place_radar_image(0, RadarProduct::EchoTops, 0.5, None, None, None);
     assert!(
         !any_notice_painted(&h),
@@ -5839,19 +4659,11 @@ fn a_pane_says_when_its_image_is_not_the_selected_product() {
 }
 
 /// 26g. **…and it does not flash on a routine refresh.**
-///
-///      A new volume for the site drops every pane's `last_rendered` and
-///      re-renders it, several times a scan under the real-time feed. The image
-///      on screen still depicts the selected product throughout, so there is
-///      nothing to disown — which is why the notice is derived from the
-///      *image's* own metadata rather than from "is a render in flight".
 #[test]
 fn a_same_selection_re_render_draws_no_notice() {
     use rustdar_radar::types::RadarProduct;
 
     let mut h = pane_showing(RadarProduct::Reflectivity);
-    // Two more volumes' worth of the same selection re-rendered, as an
-    // auto-poll or the chunk feed produces.
     for _ in 0..2 {
         h.place_radar_image(0, RadarProduct::Reflectivity, 0.5, None, None, None);
         assert!(
@@ -5862,8 +4674,6 @@ fn a_same_selection_re_render_draws_no_notice() {
         );
     }
 
-    // Nor does a selection the scan snaps back onto the sweep already drawn:
-    // 0.6° snaps to the 0.5° sweep, which is the image on screen.
     h.gui_mut().pane_mut(0).unwrap().selected_elevation = 0.6;
     h.warm_up();
     assert_eq!(
@@ -5879,18 +4689,10 @@ fn a_same_selection_re_render_draws_no_notice() {
 }
 
 /// 26h. **The notice is the same for a Level II and a Level III product.**
-///
-///      The point of the parity work is that a user cannot tell the two
-///      datasources apart, so a notice that appeared for only one of them — or
-///      worded itself differently — would be a way to read the datasource off
-///      the screen, exactly the tell the uniform data line removed. Driven both
-///      ways round through the real UI so the claim is about what is painted
-///      rather than about a shared code path.
 #[test]
 fn the_pending_notice_is_identical_for_both_datasources() {
     use rustdar_radar::types::RadarProduct;
 
-    // A Level III selection over a Level II image, and the reverse.
     let (l2, l3) = (RadarProduct::Reflectivity, RadarProduct::EchoTops);
     assert!(!l2.is_level3() && l3.is_level3(), "one of each datasource");
 
@@ -5920,8 +4722,6 @@ fn the_pending_notice_is_identical_for_both_datasources() {
         "\u{27f3} showing Echo Tops 0.5\u{b0}"
     );
 
-    // The wording is one format string with the product substituted, so the
-    // two differ in the product name and nowhere else.
     let strip = |t: &str, name: &str| t.replace(name, "<product>");
     assert_eq!(
         strip(&notice_of(&awaiting_l3), l2.name()),
@@ -5930,7 +4730,6 @@ fn the_pending_notice_is_identical_for_both_datasources() {
              to tell them apart",
     );
 
-    // And each one clears on its own render landing, the same way.
     awaiting_l3.place_radar_image(0, l3, 0.5, None, None, None);
     awaiting_l2.place_radar_image(0, l2, 0.5, None, None, None);
     assert!(!any_notice_painted(&awaiting_l3));
@@ -5938,18 +4737,10 @@ fn the_pending_notice_is_identical_for_both_datasources() {
 }
 
 /// 26i. **A pane with no image says nothing, and neither does a looping one.**
-///
-///      Two states with nothing to report, for opposite reasons. An empty pane
-///      makes no claim its pixels contradict — there are none, and the site
-///      spinner already covers a first load. A looping pane never *holds* a
-///      stale frame: `retarget_renders` drops every frame texture the instant
-///      the selection moves, so the animation is blank rather than wrong, and
-///      the loop's own phase chrome covers the wait.
 #[test]
 fn nothing_is_said_where_there_is_no_stale_image() {
     use rustdar_radar::types::RadarProduct;
 
-    // No image at all, on a selection nothing has rendered.
     let mut bare = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     bare.load_scan("KTLX");
     bare.gui_mut()
@@ -5964,8 +4755,6 @@ fn nothing_is_said_where_there_is_no_stale_image() {
         bare.painted_text_strings(),
     );
 
-    // A looping pane, mid-switch. The static image's metadata still describes
-    // the old product, and must not be reported: it is not what is on screen.
     let mut looping = pane_showing(RadarProduct::Reflectivity);
     let site = rustdar_radar::sites::get_radar_site("KTLX").expect("a real radar");
     {
@@ -5989,12 +4778,6 @@ fn nothing_is_said_where_there_is_no_stale_image() {
 }
 
 /// 26c. **…and day-old data reads as hours, not as 1,560 minutes.**
-///
-///      This is the case the line exists for. `level3::latest_key` falls
-///      back to the previous UTC day when today's prefix is empty, so the
-///      product a downed site serves is not a few minutes stale, it is
-///      most of a day — and a bar that only ever counted minutes would say
-///      so in a unit nobody reads at a glance.
 #[test]
 fn day_old_data_reads_in_hours() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -6016,12 +4799,6 @@ fn day_old_data_reads_in_hours() {
         h.painted_text_strings()
     );
 
-    // The phone has no status bar to carry the line, and the narrow
-    // transport dropped the age chip outright (M9-10 — the demo's narrow
-    // behaviour, at the user's direction). What the phone still states is
-    // the posture: the timestamp button says the moment on screen and calls
-    // it archive, so a downed site's day-old field is at least not claimed
-    // live. The hour-scale age itself is a wide-width statement now.
     let mut phone = InputHarness::with_screen(egui::vec2(420.0, 900.0));
     phone.load_scan("KTLX");
     phone.set_data_time(0, Some(written_ago(26 * 60 + 5)));
@@ -6041,14 +4818,6 @@ fn day_old_data_reads_in_hours() {
     );
 }
 
-// 16 retired (synthesis-m1): `excluded_rects` is unconditionally empty
-// since the hamburger went, so "a wide screen excludes nothing" held for
-// every screen and pinned nothing. M5's pill-row contract (73) replaced
-// rect exclusion with layer-based assertions — see
-// `a_pill_click_never_reaches_the_map_and_its_popover_anchors`.
-
-// ── Overlay texture budget ───────────────────────────────────────────
-
 use crate::actions::GuiAction;
 
 /// The texture plans the last frame asked for.
@@ -6063,8 +4832,7 @@ fn requested_plans(h: &InputHarness) -> Vec<crate::overlay_cache::OverlayTexture
 }
 
 /// A harness with a texture overlay switched on, so the map pane emits
-/// `RenderOverlay`. `RadarSites` is the one overlay whose `has_data` is
-/// unconditionally true, so it needs no fetch to reach the render path.
+/// `RenderOverlay`.
 fn harness_requesting_overlays() -> InputHarness {
     let mut h = InputHarness::new();
     h.gui_mut().enable_overlay_for_test(&known::RADAR_SITES);
@@ -6072,35 +4840,12 @@ fn harness_requesting_overlays() -> InputHarness {
     h
 }
 
-/// A 2D overlay is planned in **physical pixels**, so a display at two of them
-/// per point gets twice the texels per axis and not the same texture stretched
-/// over twice the pixels.
-///
-/// **Run at 2x deliberately, and the fixture is checked at 1x first.** At the
-/// harness's default scale points and pixels are the same number, so an
-/// assertion about pixels passes whether the production code multiplies or not
-/// — the same trap `the_painter_is_told_the_pane_size_in_physical_pixels`
-/// records for the 3D arm, and the reason `InputHarness::set_pixels_per_point`
-/// exists. Two sites in this workspace multiplied by `pixels_per_point` before
-/// allocating and both were 3D; the 2D path sized itself from `ui.max_rect()`
-/// in points and consulted no display density anywhere.
-///
-/// The consequence was measured on a real second device rather than argued: a
-/// Chrome window on an AMD 890M at `devicePixelRatio` 2, whose 1376x755 CSS
-/// canvas has a 2752x1510 backing store. The framebuffer the overlay is
-/// composited into was HiDPI and the overlay was not, so every overlay texel
-/// covered a 2x2 block of physical pixels.
-///
-/// Both directions are pinned. Asserting only that 2x is larger would pass a
-/// build that multiplied twice, which would ask a phone browser for four times
-/// the texels it can afford and cost it the whole overdraw band.
+/// A 2D overlay is planned in **physical pixels**, so a display at two of them per
+/// point gets twice the texels per axis and not the same texture stretched over
+/// twice the pixels.
 #[test]
 fn a_hidpi_pane_plans_its_overlay_in_physical_pixels_not_points() {
     let mut h = harness_requesting_overlays();
-    // A limit neither run can reach, so what this test measures is the density
-    // and not the clamp. Left at the harness's own 2048 the 2x run spends the
-    // whole limit on the viewport, gives up its overdraw to do it, and lands on
-    // 2048 — which is correct behaviour and says nothing about the doubling.
     h.set_max_texture_side(16384);
     let at_1x = requested_plans(&h);
     assert!(
@@ -6130,10 +4875,6 @@ fn a_hidpi_pane_plans_its_overlay_in_physical_pixels_not_points() {
             "the plan must carry the density it was sized at, or the rasterizer \
              draws every marker at half size",
         );
-        // The pane occupies the same *points* at either scale, so the texel
-        // counts stand in exactly 2:1. Compared with a one-texel slack because
-        // both sides are a truncating `as u32` of a float, not because the
-        // relationship is approximate.
         for (axis, a, b) in [
             ("width", one.width, two.width),
             ("height", one.height, two.height),
@@ -6149,13 +4890,9 @@ fn a_hidpi_pane_plans_its_overlay_in_physical_pixels_not_points() {
 
 /// The whole point of the change, exercised through the real UI: the number the
 /// adapter reports reaches `plan_overlay_texture` via `RawInput` and bounds what
-/// the pane asks for. Forcing the limit is how a WebGL2-class device is tested
-/// without a wasm target.
+/// the pane asks for.
 #[test]
 fn a_small_adapter_limit_bounds_what_the_pane_requests() {
-    // The smallest limit egui itself tolerates: `TextureAtlas::new` asserts
-    // `size[0] >= 1024`, so a WebGL2 2048 cannot be halved further here. Still
-    // well under what this pane asks for unclamped.
     const LIMIT: u32 = 1024;
 
     let mut h = harness_requesting_overlays();
@@ -6197,10 +4934,6 @@ fn a_small_adapter_limit_bounds_what_the_pane_requests() {
 #[test]
 fn a_desktop_class_limit_leaves_the_request_alone() {
     let mut h = harness_requesting_overlays();
-    // A limit this pane genuinely exceeds, named rather than inherited. It used
-    // to be egui's own 2048 default, which stopped clamping the harness pane the
-    // moment `OVERDRAW_FRACTION` became a quarter — leaving the comparison below
-    // true of two identical plans and saying nothing about the limit being read.
     h.set_max_texture_side(1024);
     let small_limit = requested_plans(&h);
     assert!(!small_limit.is_empty());
@@ -6222,11 +4955,7 @@ fn a_desktop_class_limit_leaves_the_request_alone() {
     );
 }
 
-// ── Radar site icons: from the click to the action ───────────────────
-
-/// Off-centre, but well inside a 24pt icon. A click at the exact centre
-/// still lands inside a zero-sized `Rect`, so a hit-test collapsed to
-/// nothing would pass there.
+/// Off-centre, but well inside a 24pt icon.
 const INSIDE_THE_ICON: egui::Vec2 = egui::vec2(5.0, 5.0);
 
 /// The site switches the last frame asked the app for.
@@ -6240,12 +4969,8 @@ fn site_switches(h: &InputHarness) -> Vec<(String, usize)> {
         .collect()
 }
 
-/// A harness showing `site`, with the radar-site overlay on, plus the
-/// screen position that site's icon is drawn at.
-///
-/// `render_panes` centres a pane on its own scan's site, so the icon lands on
-/// the pane centre. That comes from the layout, not from the hit-testing
-/// under test, so shrinking or inflating the icon cannot move it.
+/// A harness showing `site`, with the radar-site overlay on, plus the screen
+/// position that site's icon is drawn at.
 fn harness_showing_site(site: &str) -> (InputHarness, egui::Pos2) {
     let mut h = InputHarness::new();
     h.load_scan(site);
@@ -6265,23 +4990,11 @@ fn harness_showing_site(site: &str) -> (InputHarness, egui::Pos2) {
 }
 
 /// 30. **Clicking a radar site icon switches to that radar.**
-///
-///     The click resolves — that is what the whole pointer suite pins — but
-///     nothing checked that the action it is supposed to produce ever
-///     reached the app. Two things were eating it, and either alone is
-///     enough to make every site unselectable on every platform:
-///     `handle_radar_site_interactions` was handed the excluded rects with
-///     *the site icons already in them*, and the readout it opens on hover
-///     was an interactable layer sitting over the pointer, which the dialog
-///     gate then read as a click on a floating window.
 #[test]
 fn clicking_a_radar_site_icon_switches_to_that_site() {
     let (mut h, icon) = harness_showing_site("KTLX");
     let target = icon + INSIDE_THE_ICON;
 
-    // Rest on the icon first, as a mouse user does. That opens the site
-    // readout, and a readout that takes part in layer hit-testing then eats
-    // the click it was opened by — the pointer is inside it.
     h.mouse_move(target);
     h.frames_for(3, FRAME_DT);
     assert!(
@@ -6300,10 +5013,6 @@ fn clicking_a_radar_site_icon_switches_to_that_site() {
 }
 
 /// 31. **Tapping one switches too.**
-///
-///     The same handler under the other modality, which reaches it by a
-///     different route: the touch pipeline confirms the tap only after
-///     `DOUBLE_TAP_TIMEOUT_S`, a frame on which nothing is pressed at all.
 #[test]
 fn tapping_a_radar_site_icon_switches_to_that_site() {
     let (mut h, icon) = harness_showing_site("KTLX");
@@ -6319,11 +5028,6 @@ fn tapping_a_radar_site_icon_switches_to_that_site() {
 }
 
 /// 32. **...and clicking beside one does not.**
-///
-///     The complement: without it an icon stretched over the pane satisfies
-///     the two above while turning every map click into a site switch.
-///     40pt out is comfortably clear of a 24pt icon and still far nearer
-///     than the next radar, which at this zoom is hundreds of points away.
 #[test]
 fn clicking_beside_a_radar_site_icon_switches_nothing() {
     let (mut h, icon) = harness_showing_site("KTLX");
@@ -6343,39 +5047,16 @@ fn clicking_beside_a_radar_site_icon_switches_nothing() {
 }
 
 /// 32b. **The pane rect is what keeps a click off the map off the map.**
-///
-///      `is_pos_blocked`'s three conditions mask each other everywhere they
-///      normally meet, so each has to be reached alone. This is the
-///      pane-rect one: a site icon straddling the pane's **top** edge, and
-///      two clicks 10pt apart — one on the map, one in the top bar. The
-///      icon's own hit-test cannot tell them apart, and neither can the
-///      other two conditions (nothing is excluded on a wide screen, and a
-///      panel is a background layer), so only the pane rect stands between
-///      a click on the chrome and a radar site change. The top edge
-///      because the top bar is the one docked chrome left: since the
-///      full-bleed flip the pane's other three edges are the screen's, and
-///      the chrome along the bottom is a floating layer — which would
-///      reach the *layer* condition, not this one.
-///
-///      `screen_rect.expand(100.0)` in `render_pane_map_content` is what
-///      makes this reachable at all: sites just off the pane are still
-///      drawn and still hit-tested, so "off the pane" is not implied by
-///      "not drawn".
 #[test]
 fn a_click_outside_the_pane_does_not_reach_a_site_icon_straddling_its_edge() {
     let mut h = InputHarness::new();
     h.gui_mut().enable_overlay_for_test(&known::RADAR_SITES);
     h.warm_up();
 
-    // Off the pane's centre-line, so the blocked click lands on the top
-    // bar's empty stretch rather than on one of its widgets — a click
-    // that *did* something would fail this test for an unrelated reason.
     let pane = h.pane_rects()[0];
     let edge = egui::pos2(pane.center().x + 150.0, pane.top());
     h.place_site_at(0, "KTLX", edge);
 
-    // 5pt either side of the edge: both well inside an 18pt icon, so the
-    // icon hit-test says yes to both.
     let on_map = edge + egui::vec2(0.0, 5.0);
     let off_pane = edge - egui::vec2(0.0, 5.0);
     let pane = h.pane_rects()[0];
@@ -6401,9 +5082,6 @@ fn a_click_outside_the_pane_does_not_reach_a_site_icon_straddling_its_edge() {
     );
 
     h.mouse_click(on_map);
-    // `contains`, not equality: at this zoom the three Oklahoma City
-    // radars sit inside one icon of each other, and which of them also
-    // answers says nothing about the condition under test.
     assert!(
         site_switches(&h).contains(&("KTLX".to_owned(), 0)),
         "control: the icon really is under both clicks — if this fails the \
@@ -6421,24 +5099,11 @@ fn a_click_outside_the_pane_does_not_reach_a_site_icon_straddling_its_edge() {
 }
 
 /// 32c. **A dialog over a site icon takes its hover readout away.**
-///
-///      The layer condition, reached alone — and reachable only through
-///      *hover*: a click is already stripped upstream by
-///      `ui_input::filter_dialog_blocked`, so with the layer check deleted
-///      from `is_pos_blocked` every click test still passes. Hover has no
-///      such pre-filter; `pointer_hover_pos()` is read raw.
-///
-///      Asserted on the readout that was painted, not on a flag: the site
-///      readout is the thing a user sees follow the cursor through a
-///      dialog, and it is the same `Area` that once claimed `layer_id_at`
-///      and ate the click behind it.
 #[test]
 fn a_dialog_over_a_site_icon_suppresses_its_hover_readout() {
     let mut h = InputHarness::new();
     h.gui_mut().enable_overlay_for_test(&known::RADAR_SITES);
     h.warm_up();
-    // Put the icon where a modal dialog lands, so one hover position
-    // serves both halves.
     let target = h.screen_center();
     h.place_site_at(0, "KTLX", target);
     assert!(
@@ -6481,28 +5146,13 @@ fn a_dialog_over_a_site_icon_suppresses_its_hover_readout() {
 }
 
 /// 33. **A dropdown's collapsed box says what its open list says.**
-///
-///     `ControlItem::Dropdown` carries `(value, display_label)` pairs. The
-///     open list has always shown the label; `selected_text` showed the raw
-///     *value*, so Model Data's Parameter box read `sbcin` and GLM's
-///     Satellite box read `both` until you opened them.
-///
-///     Asserted against the label the handler itself offers for the
-///     selected value, not against a string this test spells out: a
-///     renderer that started formatting labels its own way would still have
-///     to agree with the list beside it. The painted-text check is the
-///     other end — it is the text egui actually laid out inside the combo's
-///     rect, so a probe reporting a value the widget never received fails.
 #[test]
 fn a_dropdown_shows_its_option_label_not_the_raw_value() {
-    // Per handler, through the inspector's layer body — the one place a
-    // handler's dropdowns render since the stack/inspector split.
     for host in [known::MODEL_DATA, known::LIGHTNING] {
         let mut h = compact_with_layers_drawer();
         h.set_overlay_on_pane(0, &host, true);
         h.open_layer_in_inspector(&host);
 
-        // Every dropdown on screen — the layer body's, by construction.
         let drawn = h.dropdowns();
         assert!(
             !drawn.is_empty(),
@@ -6540,10 +5190,6 @@ fn a_dropdown_shows_its_option_label_not_the_raw_value() {
             );
         }
 
-        // …and the list the box opens is the other half of the claim. Assert
-        // on the labels it *paints*, so that "both halves use one formatter"
-        // is checked against two rendered results rather than one rendered
-        // result and one reading of the model.
         for dropdown in &drawn {
             let mut h = compact_with_layers_drawer();
             h.set_overlay_on_pane(0, &host, true);
@@ -6567,8 +5213,6 @@ fn a_dropdown_shows_its_option_label_not_the_raw_value() {
             h.warm_up();
 
             let painted = h.painted_text_strings();
-            // The list scrolls, so only the options that fit are laid out —
-            // hence "the ones on screen are labels", not "all of them are".
             let labels_shown = options
                 .iter()
                 .filter(|(_, display)| painted.contains(display))
@@ -6593,26 +5237,8 @@ fn a_dropdown_shows_its_option_label_not_the_raw_value() {
 }
 
 /// 34. **The scan arriving must not re-key a widget.**
-///
-///     egui compares each pass's widget rects against the last and warns
-///     when the same rect comes back under a different `Id` — the same
-///     hazard [`crossing_a_breakpoint_does_not_move_any_widget_id`] guards
-///     across a resize, caught by egui itself rather than by a probe list.
-///
-///     The status bar used to allocate its right-aligned error slot every
-///     frame whether or not there was an error. Empty, that scope is a
-///     zero-area rect welded to the row's right edge, while its id moves
-///     with the widget count before it — and the auto-poll block draws
-///     three widgets mid-fetch and one after. So the frame the first scan
-///     landed re-keyed a widget, twice per launch.
-///
-///     This reads the verdict off egui's per-pass widget bookkeeping, so
-///     it fires for any widget that acquires the same hazard, not just
-///     this one.
 #[test]
 fn a_scan_arriving_moves_no_widget_id() {
-    // Roughly a Fold 7 inner screen: wide enough for the long status bar,
-    // too narrow for the sidebar, which is where this was seen.
     let mut h = InputHarness::with_screen(egui::vec2(750.0, 900.0));
     h.gui_mut()
         .apply(crate::shell_api::GuiEvent::Fetching(true));
@@ -6640,29 +5266,10 @@ fn a_scan_arriving_moves_no_widget_id() {
 }
 
 /// 34b. **Crossing a breakpoint re-keys nothing.**
-///
-///      The strengthening the top bar bought. The menu-bar panel used to
-///      appear and vanish at 600pt, advancing the root `Ui`'s auto-id
-///      counter one step more or less before the status bar — and
-///      `Ui::new_child` folds that counter into every child scope's
-///      `unique_id`, `id_salt` moving only the *stable* id, so the whole
-///      status bar came back under new ids on the far side. The old form
-///      of this test could only hold the *extent* of that shift. With the
-///      top bar drawn at every width nothing above the status bar is
-///      conditional, so the claim is now total: egui's own per-pass widget
-///      bookkeeping must see no rect come back under a different id.
 #[test]
 fn crossing_a_breakpoint_re_keys_nothing() {
-    // Either side of 600pt, and narrow enough to have no sidebar on
-    // either, so the layers panel is the drawer both times. Short on
-    // purpose: the drawer's body must overflow its slot, or the scrolled
-    // offset this test carries across the breakpoint would be zero and the
-    // claim empty (the M8 full-row rework left the rows tighter than the
-    // old two-button stack, so a 600pt-tall drawer no longer scrolls).
     let mut h = InputHarness::with_screen(egui::vec2(750.0, 480.0));
     h.set_drawer_open(true);
-    // The inspector joins the crossing too (M3 review): its ids are part of
-    // "nothing", and egui's bookkeeping only sees what is on screen.
     h.gui_mut().open_settings();
     h.load_scan("KTLX");
     assert_eq!(
@@ -6671,8 +5278,6 @@ fn crossing_a_breakpoint_re_keys_nothing() {
         "precondition: start above the 600pt breakpoint"
     );
 
-    // Real stored state behind a real widget id, so "nothing was lost" is
-    // a claim about something rather than about an empty set.
     let probes = h.widget_id_probes();
     let scroll_id = probes
         .iter()
@@ -6704,9 +5309,6 @@ fn crossing_a_breakpoint_re_keys_nothing() {
          discarded on every resize past 600pt"
     );
 
-    // ...and the ids that key stored state are the same ids. Below 600pt
-    // the panels are sheet pages, one at a time — the settings page is on
-    // top — so the comparison is per id on screen rather than list-equal.
     let compact_probes = h.widget_id_probes();
     assert!(
         compact_probes
@@ -6721,7 +5323,6 @@ fn crossing_a_breakpoint_re_keys_nothing() {
             probe.0
         );
     }
-    // The stack's page beneath keeps its id and the state stored under it.
     h.close_inspector();
     assert_eq!(
         h.widget_id_probes()
@@ -6740,23 +5341,11 @@ fn crossing_a_breakpoint_re_keys_nothing() {
 }
 
 /// 34c. **An error on screen keeps its id while the row moves around it.**
-///
-///      [`a_scan_arriving_moves_no_widget_id`] fixed and pinned the *empty*
-///      half of this hazard — a slot allocated with nothing in it. The
-///      occupied half survived, and nothing in the suite ever put an error
-///      on screen to see it: the slot is right-aligned, so when there
-///      really is an error its rect is welded to the row's edge while
-///      everything to its left comes and goes, and the slot plus all three
-///      widgets inside it come back under new ids. Two things move it — the
-///      auto-poll block when a scan lands, and the data age line when a
-///      render does — so both are driven here.
 #[test]
 fn an_error_on_screen_keeps_its_id_while_the_row_changes_around_it() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.gui_mut()
         .apply(crate::shell_api::GuiEvent::Error("boom".to_owned()));
-    // `set_error` ends the fetch, so put it back: the transition under test
-    // is the auto-poll spinner (three widgets) becoming the chip (one).
     h.gui_mut()
         .apply(crate::shell_api::GuiEvent::Fetching(true));
     h.warm_up();
@@ -6789,7 +5378,6 @@ fn an_error_on_screen_keeps_its_id_while_the_row_changes_around_it() {
              row's right edge while its id follows the widget count to its left"
     );
 
-    // …and the same slot, moved by the other neighbour.
     h.clear_id_changes();
     h.set_data_time(0, Some(written_ago(5)));
     assert!(
@@ -6804,14 +5392,6 @@ fn an_error_on_screen_keeps_its_id_while_the_row_changes_around_it() {
 }
 
 /// 35. **...and the probe that says so can see a real one.**
-///
-///     [`a_scan_arriving_moves_no_widget_id`] asserts on an empty list, so
-///     a reader that matched nothing would pass it forever — which is
-///     exactly what happened when the reader was egui's painted debug
-///     marker: that marker is compiled out of release builds, and only
-///     this test noticed. This drives egui with a deliberately unstable id
-///     at a fixed rect and requires the same reader the harness uses to
-///     report it, in whichever profile is running.
 #[test]
 fn the_id_change_probe_reports_a_real_id_change() {
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0));
@@ -6831,7 +5411,6 @@ fn the_id_change_probe_reports_a_real_id_change() {
                 .max_rect(screen),
         );
         let rect = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(50.0, 20.0));
-        // Same rect, new id, same parent: exactly what egui warns about.
         root.interact(rect, egui::Id::new(("canary", pass)), egui::Sense::click());
         let _ = ctx.end_pass();
         let widgets = pass_widgets(&ctx);
@@ -6846,12 +5425,6 @@ fn the_id_change_probe_reports_a_real_id_change() {
 }
 
 /// 36. **A pane born from the pane-count picker inherits the layer state.**
-///
-///     `PaneState::with_site` starts with empty overlay maps, and
-///     `is_overlay_enabled` reads a missing entry as *off* — so a pane the
-///     picker adds would draw no overlays at all, Radar included. Layer
-///     sync masks this by copying the active pane over the newcomer every
-///     frame the layers panel is up, so it runs with sync off.
 #[test]
 fn a_pane_added_by_the_picker_still_shows_radar_with_layer_sync_off() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -6902,13 +5475,6 @@ fn fetched_site(actions: &[crate::actions::GuiAction]) -> Option<String> {
 }
 
 /// 37. **Refresh fetches the site the active pane is viewing.**
-///
-///     `radar.config.site` is a *global* last-switched site — the
-///     frontend's `SwitchRadarSite` writes it whichever pane switched,
-///     sync on or off — so with per-pane sites a Refresh that clones the
-///     config verbatim can fetch a site the active pane never showed.
-///     Both entry points, driven the way a user reaches them: the status
-///     bar's button and the ☰ dropdown's item.
 #[test]
 fn refresh_fetches_the_active_panes_site_not_the_global_one() {
     let mut h = InputHarness::with_screen(egui::vec2(800.0, 900.0));
@@ -6919,8 +5485,6 @@ fn refresh_fetches_the_active_panes_site_not_the_global_one() {
          of them"
     );
 
-    // Some other pane switched sites last: the global config points away
-    // from what the active pane is viewing.
     let mut config = h.gui_mut().get_radar_config().clone();
     config.site = "KDMX".to_owned();
     h.gui_mut()
@@ -6949,13 +5513,6 @@ fn refresh_fetches_the_active_panes_site_not_the_global_one() {
 }
 
 /// 38. **A hover readout dies with the radar that produced it.**
-///
-///     `pane.hover_value` is written only by the radar arm of
-///     `render_pane_map_content` and read by the status bar. Two ways the
-///     writer stops running while the reader keeps going: the pane stops
-///     drawing radar under the pointer, or the pane is hidden by splitting
-///     back down and is not rendered at all. Neither may freeze the last
-///     readout on the glass.
 #[test]
 fn a_hover_readout_does_not_outlive_its_pane_or_its_radar() {
     let mut h = InputHarness::with_screen(egui::vec2(800.0, 900.0));
@@ -6966,8 +5523,6 @@ fn a_hover_readout_does_not_outlive_its_pane_or_its_radar() {
         "precondition: mouse modality, or there is no readout to go stale"
     );
 
-    // A readout on a visible pane reaches the glass — the channel every
-    // staleness assertion below depends on.
     h.gui_mut().pane_mut(0).unwrap().hover_value = Some("LIVE READOUT".to_owned());
     h.frame();
     assert!(
@@ -6975,16 +5530,12 @@ fn a_hover_readout_does_not_outlive_its_pane_or_its_radar() {
         "precondition: a visible pane's readout must reach the status bar"
     );
 
-    // ...for exactly as long as the radar arm re-sets it: with no radar
-    // image under the pointer, the pane's next render clears it.
     h.frame();
     assert!(
         !h.painted_text_strings().iter().any(|t| t == "LIVE READOUT"),
         "a readout with no radar left behind it froze in the status bar"
     );
 
-    // A pane hidden by splitting back down is never rendered, so nothing
-    // can clear it — the status bar must not be reading it at all.
     h.set_pane_count(4);
     h.gui_mut().pane_mut(3).unwrap().hover_value = Some("HIDDEN PANE READOUT".to_owned());
     h.set_pane_count(2);
@@ -6997,11 +5548,7 @@ fn a_hover_readout_does_not_outlive_its_pane_or_its_radar() {
     );
 }
 
-// ── Pane kinds ───────────────────────────────────────────────────────
-
-/// Two points either side of a storm near KTLX, as the ends of a drawn
-/// line. Any finite pair with two distinct ends would do; these are
-/// plausible so a failure message reads like a section someone asked for.
+/// Two points either side of a storm near KTLX, as the ends of a drawn line.
 fn section_ends() -> (GeoPoint, GeoPoint) {
     (
         GeoPoint {
@@ -7015,15 +5562,8 @@ fn section_ends() -> (GeoPoint, GeoPoint) {
     )
 }
 
-/// KTLX's reflectivity ladder on VCP 212, as the sampler resolves it — the
-/// chosen sweeps' **median** elevations, not the cut table's round numbers.
-///
-/// Real-shaped on purpose. A synthetic ladder of round degrees would draw
-/// perfectly well against a build whose rungs came from the wrong list; the
-/// production failure this pins was measured on exactly these angles, where
-/// `ScanInfo`'s 0.1°-rounded, deduped view of the same volume reports 16
-/// entries for the sampler's 14 rungs (0.4394 → 0.4 and 0.4779 → 0.5 for
-/// one 0.4834° cut; 0.8350 → 0.8 and 0.9229 → 0.9 for one 0.8789° cut).
+/// KTLX's reflectivity ladder on VCP 212, as the sampler resolves it — the chosen
+/// sweeps' **median** elevations, not the cut table's round numbers.
 fn vcp_212_rungs() -> Vec<f64> {
     vec![
         0.4834, 0.8789, 1.3184, 1.8018, 2.4170, 3.1201, 4.0430, 5.0977, 6.4160, 8.0273, 10.0195,
@@ -7031,8 +5571,8 @@ fn vcp_212_rungs() -> Vec<f64> {
     ]
 }
 
-/// The axes of a complete VCP 212 reflectivity section 100 km long, whose
-/// ladder is [`vcp_212_rungs`].
+/// The axes of a complete VCP 212 reflectivity section 100 km long, whose ladder is
+/// [`vcp_212_rungs`].
 fn vcp_212_axes() -> rustdar_radar::xsect::SectionAxes {
     rustdar_radar::xsect::SectionAxes {
         length_km: 100.0,
@@ -7050,14 +5590,6 @@ fn vcp_212_axes() -> rustdar_radar::xsect::SectionAxes {
 }
 
 /// 39. **Every pane reports a pointer frame, whatever kind it is.**
-///
-///     The pointer probe is pushed in `render_panes`' shared preamble,
-///     above the kind branch, and it has to stay there. `InputHarness::frame`
-///     reads the *active* pane's probe out of that vector and panics when it
-///     finds none, so a kind whose arm skipped the push would take down the
-///     whole pointer suite — several thousand lines of it — with a message
-///     about the pointer pipeline never running, pointing at nothing that
-///     changed.
 #[test]
 fn every_pane_reports_a_pointer_frame_whatever_its_kind() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -7084,9 +5616,6 @@ fn every_pane_reports_a_pointer_frame_whatever_its_kind() {
         "a pane resolved no pointer state for the frame"
     );
 
-    // The active half, and it needs a *non-map* active pane: the active
-    // probe is the one `frame()` demands, so a section pane that skipped
-    // the push would only be caught while it is the one being driven.
     let rects = h.pane_rects();
     h.mouse_click(rects[2].center());
     h.frames_for(2, FRAME_DT);
@@ -7107,15 +5636,6 @@ fn every_pane_reports_a_pointer_frame_whatever_its_kind() {
 }
 
 /// 40. **Converting a pane keeps what it was looking at.**
-///
-///     Site, scan, product, elevation, live-or-parked and viewport are flat
-///     fields on `PaneState` precisely so that converting a pane cannot
-///     touch them. A user who panned to a storm and picked a tilt has said
-///     something; asking for a section of it is not a reason to forget it.
-///
-///     Run on a single pane deliberately: both `propagate_layer_sync` and
-///     `sync_viewports` return early below two panes, so every field below
-///     is observed changing (or not) for exactly one reason.
 #[test]
 fn a_converted_pane_keeps_its_site_and_viewport() {
     let mut h = InputHarness::new();
@@ -7178,8 +5698,6 @@ fn a_converted_pane_keeps_its_site_and_viewport() {
         "converting the pane changed what it is looking at"
     );
 
-    // ...and the line it was aimed with is still the line, several frames
-    // later. Geographic ends, so nothing in the UI pass can move them.
     assert_eq!(
         h.gui_mut()
             .pane(0)
@@ -7192,22 +5710,10 @@ fn a_converted_pane_keeps_its_site_and_viewport() {
 }
 
 /// 41. **A non-map pane paints its empty state, in its own rect.**
-///
-///     What each arm *recorded* rather than what the branch was handed:
-///     `panes[i].kind()` is the branch's input, so a test reading it back
-///     agrees with an arm that ignored it, and with an arm that read the
-///     kind off the `mem::take`n slot (where every pane is a map). Each arm
-///     writes its own kind as a literal, and this compares that against the
-///     copy that actually reached the glass and the rect it reached it in.
 #[test]
 fn a_non_map_pane_paints_its_empty_state() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.set_pane_count(3);
-    // Unaimed, because `CROSS_SECTION_EMPTY_STATE` is what a section pane
-    // says while it has *no line*. A pane that has been aimed and is
-    // waiting for its cut says something else, and this test is about the
-    // arm painting into its own rect rather than about which of the two
-    // states it is in.
     h.make_pane_unaimed_cross_section(1);
     h.make_pane_volume(2);
 
@@ -7244,20 +5750,6 @@ fn a_non_map_pane_paints_its_empty_state() {
 }
 
 /// 43. **Converting the active pane from the dropdown really converts it.**
-///
-///     The end-to-end version of
-///     `a_pane_kind_request_survives_the_pane_being_held_out_of_the_vector`,
-///     driven by a real click through the real presentation. The dispatcher
-///     records the conversion rather than writing it, and the deferred
-///     applier runs after the pane loop's own `mem::take` window — the
-///     obvious `self.panes[self.active_pane].set_kind(..)` shape has been
-///     silently discarded from inside such a window before, and this is
-///     what keeps the checkbox sticking whatever hosts the menu.
-///
-///     Asserted all the way to the glass: the pane's kind, the arm that
-///     actually drew it, the copy on screen, and the checkbox reading back the
-///     new state on the following frame. The last of those is what a user sees
-///     first, and it is the one a half-wired conversion would fail.
 #[test]
 fn converting_the_active_pane_from_the_dropdown_makes_it_a_volume_pane() {
     let mut h = compact_with_menu();
@@ -7302,8 +5794,6 @@ fn converting_the_active_pane_from_the_dropdown_makes_it_a_volume_pane() {
              user as though the click did nothing"
     );
 
-    // …and back, from the same box. This is the only route out of a non-map
-    // pane, so a one-way toggle would be a trap.
     h.mouse_click(clickable_leaf(&h, crate::ui::VOLUME_PANE_LABEL).center());
     h.frames_for(3, FRAME_DT);
     assert_eq!(
@@ -7312,55 +5802,7 @@ fn converting_the_active_pane_from_the_dropdown_makes_it_a_volume_pane() {
     );
 }
 
-/// 44. **A non-map pane keeps the controls that apply to it and drops the
-///     rest.**
-///
-///     Four claims, each with its own failure:
-///
-///     * **A product picker.** It used to be gated on the Radar *overlay*
-///       toggle, which asks whether the map should draw the radar image over
-///       its tiles — a question a pane with no tiles does not have. Left
-///       gated, a pane converted while that toggle happened to be off would
-///       have no product control at all, absent rather than disabled, for a
-///       reason nothing on screen explains.
-///     * **Time navigation**, because a section of last hour's volume is a
-///       perfectly good thing to ask for. Since the full-bleed flip it
-///       lives on the floating timeline, which stays up for every pane
-///       kind — asserted through the timeline's own probe.
-///     * **No tilt picker.** Both non-map kinds read the whole ladder, which
-///       is what `PaneKind::consumes_whole_volume` means, so every entry in
-///       the combo would select the same picture.
-///     * **A loop for the section, none for the volume, and no overlay tree
-///       for either.** A cross-section can be animated — its picture is a
-///       raster of one line through one volume, which is exactly the kind of
-///       thing a loop frame is — so its toggle arms a loop like a map's. A
-///       3D volume cannot: its picture is raymarched live from the eye, so a
-///       cached frame would be camera-specific and orbiting would invalidate
-///       the whole loop at once. `PaneKind::can_loop` is where that split
-///       lives, and it is pinned here by clicking the toggle and requiring
-///       the loop action out of one kind and not the other — the failure a
-///       user would actually hit.
-///     * **The overlay tree for the 3D pane and not for the section.** Every
-///       entry in it is a layer drawn through a projector, and the two kinds
-///       differ on whether they have one: a 3D pane draws the ground kinds onto
-///       its floor and the colour scale onto its glass, each gated on its own
-///       `is_overlay_enabled`, while a cross-section has no projector anywhere
-///       in its frame. `PaneState::draws_map_layers` is where that split lives.
-///
-///     The section's missing rows are also what makes this the test that
-///     notices the stack reading `self.panes[active]` instead of the pane it
-///     was handed. That slot holds a `mem::take` placeholder for the whole of
-///     the shell's pass and therefore reads as a *map* — so a body drawn from
-///     it would keep the rows for a converted pane, and the visible difference
-///     is the rows being drawn. The tilt picker would *not* reveal it: that
-///     is decided inside `render_radar_controls` from the pane passed down.
-///     (The timeline cannot have this bug: it runs outside every take
-///     window, which is why it may read the slot directly.)
-///
-///     The combos are read off the ids the body actually resolved rather than
-///     off the model, for the same reason `time_step_sel` is: a test rebuilding
-///     the expected id from the same format string could agree with a body
-///     that drew neither control.
+/// 44. **A non-map pane keeps the controls that apply to it and drops the rest.**
 #[test]
 fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
     /// Which of the radar combos the last frame resolved an id for — the
@@ -7387,9 +5829,6 @@ fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
             "precondition: a map pane with a tilt on offer draws both, so the \
                  absence below is the pane's kind and not a missing scan"
         );
-        // The loop toggle answers for a map pane: clicking it emits the
-        // enable fan-out. (The harness has no App, so nothing consumes
-        // the action and the pane's own state is unchanged.)
         h.mouse_click(h.timeline().loop_toggle.0.center());
         assert!(
             h.last_actions()
@@ -7397,8 +5836,6 @@ fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
                 .any(|a| matches!(a, crate::actions::GuiAction::EnableLoop { .. })),
             "precondition: a map pane's loop toggle must enable the loop"
         );
-        // A row from the middle of the stack, so the check is not satisfied
-        // by the first one alone.
         assert!(
             h.stack_row(&known::NWS_ALERTS).is_some(),
             "precondition: a map pane's stack draws the layer rows"
@@ -7439,11 +5876,6 @@ fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
                     | crate::actions::GuiAction::DisableLoop { .. }
             )
         });
-        // Every kind is a loop participant, and each one's frame is its own
-        // shape: a section's is the raster of the line it is aimed along, a 3D
-        // pane's is the resident grid the march samples. What the toggle must
-        // never do is arm a loop nothing fills — see `PaneKind::can_loop` — and
-        // for these two kinds something does.
         assert!(
             armed,
             "{kind:?}: the loop toggle did nothing, so this pane cannot be \
@@ -7469,37 +5901,8 @@ fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
     }
 }
 
-/// 45. **A pane with no ground does not keep the label-tile pyramid
-///     downloading — and a 3D pane's floor is ground.**
-///
-///     City labels are raster tiles drawn *over* the base map, so a pane with
-///     no tiles has nowhere to put one — yet its `enabled_overlays` is
-///     inherited across the conversion and still says the layer is on, which is
-///     what kept `ensure_label_tiles` fetching. Mild in itself; it is here
-///     because it is the same shape as the overlay auto-poll gate, which is
-///     not mild, and because the two must agree.
-///
-///     # The 3D arm used to be on the wrong side of this
-///
-///     It read `is_map`, which is a question about the *picture*, and it was
-///     written when a 3D view was a pane kind with no map of its own. A 3D pane
-///     now stands its volume on its own map: `draw_floor_strip` runs the same
-///     `Map::show` and the same `render_pane_map_content` a plan view does, and
-///     the `CityLabels` arm in there draws whatever `label_tiles` it is handed.
-///     Handed `None`, it draws nothing — so a **lone** 3D pane with the layer on
-///     had a floor with no city names on it, while the Map floor checkbox's
-///     hover text promises them in as many words. Beside a plan-view map pane
-///     that also wanted labels it worked, which is what kept it hidden.
-///
-///     Three arms, so this is a filter and not a constant: a floor draws them, a
-///     floor switched off does not, and a cross-section pane — which has no
-///     projector anywhere in its frame — does not either.
-///
-///     `clear_graphics_state` in the middle of each arm, because
-///     `ensure_label_tiles` only ever *creates* the source — a harness that
-///     had already made them would keep them and prove nothing. That is not a
-///     contrivance either: dropping the tile sources and letting the next
-///     frame re-make them is exactly what a suspend or a surface loss does.
+/// 45. **A pane with no ground does not keep the label-tile pyramid downloading —
+/// and a 3D pane's floor is ground.**
 #[test]
 fn only_a_pane_with_ground_keeps_the_label_tiles_downloading() {
     fn tiles_remade_after_a_reset(h: &mut InputHarness) -> bool {
@@ -7524,7 +5927,6 @@ fn only_a_pane_with_ground_keeps_the_label_tiles_downloading() {
         "precondition: a map pane with city labels on must fetch label tiles"
     );
 
-    // A 3D pane, alone on screen, with a floor to draw them on.
     let mut on_a_floor = lone_pane_wanting_labels();
     on_a_floor.make_pane_volume(0);
     assert!(
@@ -7545,8 +5947,6 @@ fn only_a_pane_with_ground_keeps_the_label_tiles_downloading() {
              None`, so the floor came up with no city names on it",
     );
 
-    // The same pane with its floor switched off: nothing on screen to put them
-    // on, so nothing is fetched.
     let mut floor_hidden = lone_pane_wanting_labels();
     floor_hidden.make_pane_volume(0);
     floor_hidden
@@ -7566,8 +5966,6 @@ fn only_a_pane_with_ground_keeps_the_label_tiles_downloading() {
              downloading for a surface that is not drawn",
     );
 
-    // And a pane with no projector anywhere in its frame, which is the half of
-    // the original filter that was always right.
     let mut section = lone_pane_wanting_labels();
     section.make_pane_unaimed_cross_section(0);
     assert!(
@@ -7578,18 +5976,10 @@ fn only_a_pane_with_ground_keeps_the_label_tiles_downloading() {
 }
 
 /// 46. **A non-map pane's product picker survives the Radar layer being off.**
-///
-///     The picker used to be gated on the radar layer's `is_overlay_enabled`,
-///     which asks whether the *map* should draw the radar image over its tiles.
-///     A pane with no tiles has no such layer, so a pane converted while that
-///     toggle happened to be off would have had no product control at all —
-///     absent, not disabled, for a reason nothing on screen explains. A map
-///     pane must still honour the toggle, which is the second half here.
 #[test]
 fn a_non_map_panes_product_picker_ignores_the_radar_layer_toggle() {
     let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
     h.load_scan("KTLX");
-    // The picker lives in the inspector's Pane-properties body now.
     h.open_pane_props();
     h.set_overlay_on_pane(0, &known::RADAR, false);
     h.frames_for(2, FRAME_DT);
@@ -7615,9 +6005,9 @@ fn a_non_map_panes_product_picker_ignores_the_radar_layer_toggle() {
     );
 }
 
-/// The stack's screen rect — the floating area's own rect, from egui's area
-/// state rather than a reconstruction of the panel's position constants, so
-/// it keeps meaning "the layer stack" if the insets ever change.
+/// The stack's screen rect — the floating area's own rect, from egui's area state
+/// rather than a reconstruction of the panel's position constants, so it keeps
+/// meaning "the layer stack" if the insets ever change.
 fn sidebar_rect(h: &InputHarness) -> egui::Rect {
     h.layers_panel_rect()
         .expect("the layer stack must be on screen")
@@ -7629,31 +6019,12 @@ fn inspector_rect(h: &InputHarness) -> egui::Rect {
 }
 
 /// 49. **Every pane kind's Pane-properties body opens with the same identity
-///     line.**
-///
-///     Site code, then kind. A map pane's properties body is full of content
-///     that describes itself; a converted pane's loses most of that bulk,
-///     and without one shared line saying what the pane *is*, the shorter
-///     body reads as a different thing altogether rather than as the same
-///     body showing a pane with fewer controls — the presentation bug this
-///     whole contract exists to fix, carried from the old sidebar into the
-///     inspector. The assertion is on the full rendered string, so three
-///     per-kind headers that drifted apart in format could not keep it
-///     green.
-///
-///     The fixture site is KDMX, deliberately **not** the default KTLX:
-///     for the whole shell pass the active slot in `self.panes` holds a
-///     `mem::take` placeholder whose site *is* the default, so on a
-///     default-site fixture an identity line that read its site through
-///     the placeholder would paint the right string for the wrong reason.
+/// line.**
 #[test]
 fn every_pane_kinds_sidebar_opens_with_the_same_identity_line() {
     let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
     h.load_scan("KDMX");
     h.open_pane_props();
-    // The crumb itself, asserted as the string a user reads (M3 review) —
-    // `open_pane_props` already pinned the mode probe, which is the arm and
-    // not the text.
     assert_eq!(
         h.inspector().crumb,
         "Pane 1 \u{203a} Properties",
@@ -7687,24 +6058,8 @@ fn every_pane_kinds_sidebar_opens_with_the_same_identity_line() {
     );
 }
 
-/// 50. **The missing layer list is explained, in one line, for the one kind
-///     that is missing it — and for no other.**
-///
-///     The panel is titled "Layers", and for a cross-section pane the layer
-///     tree is omitted because every entry in it is a layer drawn through a
-///     projector and that pane has none anywhere in its frame (test 44 pins
-///     the omission). Omitted *silently*, the void where most of the panel
-///     used to be is what made the sidebar read as broken, so the convention
-///     is omission plus one explanatory line.
-///
-///     The other two kinds must not carry it, for the same reason and by two
-///     different routes: a map pane draws the list, so the note would be a
-///     false claim about a list that is right there — and **so does a 3D
-///     pane**, whose floor draws the ground kinds and whose glass draws the
-///     colour scale, each gated on the pane's own `is_overlay_enabled`. The
-///     note used to say "Map layers apply to map panes" and to appear on a 3D
-///     pane, which was two untruths at once: the layers did apply to it, and
-///     the panel's silence was the only reason its set could not be reached.
+/// 50. **The missing layer list is explained, in one line, for the one kind that is
+/// missing it — and for no other.**
 #[test]
 fn the_missing_layer_list_is_explained_for_the_kind_that_is_missing_it() {
     let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
@@ -7737,24 +6092,8 @@ fn the_missing_layer_list_is_explained_for_the_kind_that_is_missing_it() {
     );
 }
 
-/// 50a. **A 3D pane's layer rows are the layers a 3D pane draws — all of
-///      them, on both of its surfaces — and a cross-section still has none.**
-///
-///      The defect this closes: the floor has always gated every layer on
-///      *that pane's* own `is_overlay_enabled`, and the glass gates the colour
-///      scale the same way, while the Layers panel showed a 3D pane no rows at
-///      all. So a set toggled before the conversion went on being honoured
-///      with no way left to change it — a picture on screen answering to a
-///      control the user could not reach.
-///
-///      Both halves, and the second is the one that keeps this test honest: a
-///      cross-section's rows must still be absent, or "every pane has rows"
-///      would pass. The row **set** is the third claim and it is why
-///      the handler-declared `Surface` is the right authority rather than "the floor's kinds":
-///      the ground kinds go on the floor and the colour scale goes on the
-///      glass, so a 3D pane draws — and must be able to switch off — every one
-///      of them. Dropping the colour-scale row would move the same defect one
-///      layer along.
+/// 50a. **A 3D pane's layer rows are the layers a 3D pane draws — all of them, on
+/// both of its surfaces — and a cross-section still has none.**
 #[test]
 fn a_3d_panes_layer_rows_are_the_layers_a_3d_pane_draws() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -7768,8 +6107,6 @@ fn a_3d_panes_layer_rows_are_the_layers_a_3d_pane_draws() {
          {on_a_map:?}"
     );
 
-    // A set the user made *before* the conversion — the state that used to
-    // become unreachable the moment the pane went 3D.
     h.set_overlay_on_pane(0, &known::CITY_LABELS, false);
     h.make_pane_volume(0);
     h.open_layers();
@@ -7793,7 +6130,6 @@ fn a_3d_panes_layer_rows_are_the_layers_a_3d_pane_draws() {
         "a 3D pane has a map to add a layer to — its floor"
     );
 
-    // The pre-conversion set survived *and* is now on screen to be read…
     let labels = h
         .stack_row(&known::CITY_LABELS)
         .expect("the city-labels row is in the list asserted above");
@@ -7803,7 +6139,6 @@ fn a_3d_panes_layer_rows_are_the_layers_a_3d_pane_draws() {
          is the one the user set before the conversion"
     );
 
-    // …and to be changed, through the real eye rather than the field.
     h.mouse_click(labels.eye.center());
     h.warm_up();
     assert!(
@@ -7814,7 +6149,6 @@ fn a_3d_panes_layer_rows_are_the_layers_a_3d_pane_draws() {
         "the eye on a 3D pane's row did not reach the pane's own layer state"
     );
 
-    // The other half: a cross-section draws no layers and lists none.
     h.make_pane_map(0);
     h.make_pane_unaimed_cross_section(0);
     h.open_layers();
@@ -7832,43 +6166,12 @@ fn a_3d_panes_layer_rows_are_the_layers_a_3d_pane_draws() {
     );
 }
 
-/// 51. **A converted pane's own controls sit inside the Pane-properties
-///     body's shared structure, in its order.**
-///
-///     The contract, top to bottom, for either non-map kind: identity
-///     line, product picker, then the kind's own block under its own
-///     header. (The explained absence of the layer list moved with the
-///     list itself — it is the stack's, pinned by test 50; time navigation
-///     left for the floating timeline at the full-bleed flip.) The
-///     assertion is on the *positions* the body painted, not merely on
-///     the strings existing: a kind block rendered above the shared
-///     controls would paint every one of these strings and still read as
-///     a bolted-on foreign block.
-///
-///     The headers are named through the constants the body itself
-///     renders, so renaming a header moves the test with it, while
-///     *removing* one — or demoting the section block back to nothing —
-///     fails on a missing anchor.
-///
-///     The volume block's needles name **every row it owns** — Vertical,
-///     Mode, Map floor, Reset view — not just enough of them to prove an
-///     order. The list originally sampled the block (header, Mode, Reset),
-///     which meant a re-host could drop the Vertical slider or the Map
-///     floor checkbox and this contract would stay green — exactly the
-///     silent loss a user then has to report. A row that leaves this body
-///     on purpose must leave this list in the same commit, visibly.
-///
-///     KDMX rather than the default KTLX for the reason test 49 gives:
-///     the `mem::take` placeholder in the active slot carries the default
-///     site, and only a non-default fixture makes the identity line's
-///     site half observable. The section anchor pins the painted length
-///     too: [`section_ends`]'s line is 105.46 km by the same haversine
-///     the readout quotes, `{:.0}` in the default kilometres, so a
-///     readout scaled or converted wrongly misses the anchor.
+/// 51. **A converted pane's own controls sit inside the Pane-properties body's
+/// shared structure, in its order.**
 #[test]
 fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
-    /// The y-centre of the topmost painted run containing `needle`, inside
-    /// the sidebar.
+    /// The y-centre of the topmost painted run containing `needle`, inside the
+    /// sidebar.
     fn y_of(h: &InputHarness, sidebar: egui::Rect, needle: &str) -> f32 {
         h.painted_text_rects()
             .iter()
@@ -7903,9 +6206,6 @@ fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
 
     h.make_pane_volume(0);
     h.frames_for(2, FRAME_DT);
-    // `inspector_rect` is re-read after every conversion: the panel
-    // shrink-wraps to its body, so the previous kind's rect can be shorter
-    // than the next kind's content.
     assert_descending_order(
         &h,
         inspector_rect(&h),
@@ -7914,17 +6214,12 @@ fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
             "Reflectivity",
             crate::ui::VOLUME_SIDEBAR_HEADER,
             "Vertical:",
-            // "Lit volume" and "Isosurface" share this row; the label
-            // anchors it (the order test wants one needle per row).
             "Mode:",
             "Map floor",
             "Reset view",
         ],
     );
 
-    // Isosurface mode reveals its threshold slider — labelled with the
-    // product's own comparison — and, with an alpha curve drawn, the
-    // honest word that the surface reads the data rather than the curve.
     h.gui_mut()
         .pane_mut(0)
         .expect("pane 0 exists")
@@ -7950,7 +6245,6 @@ fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
         ],
     );
 
-    // The section pane, aimed, reports its line inside the same structure…
     let (a, b) = section_ends();
     h.make_pane_cross_section(0, a, b);
     h.frames_for(2, FRAME_DT);
@@ -7965,10 +6259,6 @@ fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
         ],
     );
 
-    // …and unaimed it says so in the same place, rather than dropping the
-    // block and going back to reading as a stub. Through Map first:
-    // `set_kind` to the kind the pane already is keeps its content, which
-    // here would keep the line and test the aimed state twice.
     h.gui_mut()
         .pane_mut(0)
         .expect("pane 0 exists")
@@ -7981,26 +6271,14 @@ fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
         &[crate::ui::SECTION_SIDEBAR_HEADER, "No line drawn yet"],
     );
 
-    // The explained absence of the layer list is the *stack's* — beside
-    // this body, not inside it: the rows it explains are the stack's rows.
     assert!(
         h.text_painted_in(sidebar_rect(&h), crate::ui::NON_MAP_LAYERS_NOTE),
         "the stack must carry the layer-list note for a converted pane"
     );
 }
 
-/// The Map floor checkbox **acts**: a click on the drawn row flips the
-/// pane's `hide_floor`, both ways, and the flipped state survives a
-/// restart.
-///
-/// The sidebar-order contract above proves the row *paints*; this is the
-/// other half of the claim, driven through the real chrome rather than by
-/// writing the field — the m10 lesson (the time controls painted perfectly
-/// while acting on nothing) is that the two halves fail independently.
-/// The restart leg reuses the config round trip
-/// `a_hidden_map_floor_survives_a_save_and_load` pins at the field level,
-/// but starts it from the click, so a checkbox rewired to a copy of the
-/// pane would fail here even with the field-level test green.
+/// The Map floor checkbox **acts**: a click on the drawn row flips the pane's
+/// `hide_floor`, both ways, and the flipped state survives a restart.
 #[test]
 fn the_map_floor_click_flips_the_pane_and_survives_a_restart() {
     use rustdar_kv::MemoryKvStore;
@@ -8026,8 +6304,6 @@ fn the_map_floor_click_flips_the_pane_and_survives_a_restart() {
         "clicking Map floor must hide the floor"
     );
 
-    // The restart, from the click's own result: save, load into a fresh
-    // Gui, and the floor is still off.
     let store = MemoryKvStore::default();
     h.gui_mut().save_ui_config(&store);
     let mut restored = crate::Gui::new();
@@ -8037,7 +6313,6 @@ fn the_map_floor_click_flips_the_pane_and_survives_a_restart() {
         "the clicked-off floor must come back off after a restart"
     );
 
-    // And back: the same click is the way home.
     h.mouse_click(floor_row(&h).center());
     h.frames_for(2, FRAME_DT);
     assert!(
@@ -8046,15 +6321,8 @@ fn the_map_floor_click_flips_the_pane_and_survives_a_restart() {
     );
 }
 
-/// The Vertical slider **acts**: dragging it moves the pane's vertical
-/// exaggeration in the direction of the drag, and the dragged value
-/// survives a restart.
-///
-/// Same shape as the Map floor test above and for the same reason — the
-/// row's presence is the order contract's claim, this is the wiring's.
-/// The assertions are relative (right of a rail point is a larger value
-/// than left of it) rather than absolute, so the test says "the drag
-/// steers the camera" without restating the rail's geometry.
+/// The Vertical slider **acts**: dragging it moves the pane's vertical exaggeration
+/// in the direction of the drag, and the dragged value survives a restart.
 #[test]
 fn the_vertical_slider_drag_stretches_the_box_and_survives_a_restart() {
     use rustdar_kv::MemoryKvStore;
@@ -8099,7 +6367,6 @@ fn the_vertical_slider_drag_stretches_the_box_and_survives_a_restart() {
          shipped {shipped}; it is still {stretched}"
     );
 
-    // Back the other way: a release further left is a smaller value.
     drag(&mut h, 40.0, -20.0);
     let eased = exaggeration(&mut h);
     assert!(
@@ -8108,7 +6375,6 @@ fn the_vertical_slider_drag_stretches_the_box_and_survives_a_restart() {
          {stretched}"
     );
 
-    // The restart: the eased value, not the default, is what comes back.
     let store = MemoryKvStore::default();
     h.gui_mut().save_ui_config(&store);
     let mut restored = crate::Gui::new();
@@ -8128,18 +6394,6 @@ fn the_vertical_slider_drag_stretches_the_box_and_survives_a_restart() {
 }
 
 /// 52. **Converting the active pane keeps the panels' own widget ids.**
-///
-///     Test 48 pins that converting a *non-active* pane moves nothing, but
-///     there the panels' content never changes. Converting the **active**
-///     pane rebuilds the inspector's kind block and swaps the stack's rows
-///     for the note, and the hazard is the panels' own: the shared controls
-///     key their stored state — combo state, both scroll offsets — on ids
-///     derived from each panel's scope, so a scope re-keyed by the
-///     conversion (salting it with the kind is the natural mistake) turns
-///     "the user made this pane 3D" into "egui forgot the panel's state".
-///     Compared per name, through the ids the panels actually resolved, for
-///     the reason test 14 gives: rebuilding the expected ids from the same
-///     format strings would prove nothing.
 #[test]
 fn converting_the_active_pane_keeps_the_sidebars_widget_ids() {
     fn shared_ids(h: &InputHarness) -> Vec<(&'static str, egui::Id)> {
@@ -8156,7 +6410,6 @@ fn converting_the_active_pane_keeps_the_sidebars_widget_ids() {
 
     let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
     h.load_scan("KTLX");
-    // The product combo lives in the inspector's Pane-properties body.
     h.open_pane_props();
     let before = shared_ids(&h);
     assert_eq!(
@@ -8183,59 +6436,13 @@ fn converting_the_active_pane_keeps_the_sidebars_widget_ids() {
     );
 }
 
-// 47 retired (synthesis-m1): the drawer no longer appends the menu, so
-// there is nothing below the kind block for a conversion to re-key — the
-// menu lives in the top bar's popup, above every take window. Tests 48 and
-// 52 hold what remains of the claim; the kind-scope's rationale is on
-// `render_pane_props_body`.
-
 /// 48. **Converting a pane must not move any widget's egui `Id`.**
-///
-///     The `"pane_map"` id salt is a key, not a description: every widget
-///     inside a pane derives its `Id` from it, so egui's memory of what the
-///     pane remembers hangs off it. Re-keying it — by renaming it to
-///     something kind-neutral, or by folding the kind into it — would turn
-///     "the user made pane 2 a section" into "egui forgot everything pane 2
-///     remembered".
-///
-///     [`crossing_a_breakpoint_does_not_move_any_widget_id`] will not catch
-///     this: it compares the layers panel's own probed ids across a resize,
-///     and a pane's ids are not in that list. This reads egui's per-pass
-///     widget bookkeeping instead, so it fires for the kind-specific work
-///     later work packages add inside each arm as much as for a renamed
-///     salt.
-///
-///     The mechanism it is a net for: `Ui::new_child` folds the parent's
-///     auto-id counter into every child's unique id — an `id_salt` moves only
-///     the *stable* id, as `ui_shell.rs`'s module note on the breakpoint
-///     records — so an arm that stopped building the shared child `Ui`, or
-///     built an extra one, re-keys every pane the loop reaches **after** it
-///     while leaving their rects exactly where they were.
-///
-///     Hence the **middle** of three, which is what makes the assertion bite
-///     today, verified by mutation both ways round: with an arm building a
-///     spare child `Ui`, converting the middle pane fails this test and
-///     converting the *last* one does not. The reason is that the only
-///     auto-id'd widget inside a pane right now is the map's own, so a
-///     later map pane is the only thing whose id can be seen to move. It is
-///     specifically *not* the divider layer downstream of the loop: that
-///     child `Ui`'s own id does shift, but `PaneLayout::handle_dividers`
-///     gives every divider an explicit `Id::new(("h_div", …))`, and an
-///     explicit id does not read the parent's counter.
-///
-///     A one- or two-pane version of this assertion is still worth writing
-///     once an arm registers widgets of its own — from then on a converted
-///     pane re-keys *itself* and needs no later pane to reveal it.
 #[test]
 fn converting_a_pane_moves_no_widget_id() {
-    // Short enough that the stack's rows overflow and there is a real
-    // scroll offset to lose — the row list fits anything much taller.
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 500.0));
     h.set_pane_count(3);
     h.load_scan("KTLX");
 
-    // Real stored state behind a real widget id, so "nothing was lost" is a
-    // claim about something rather than about an empty set.
     let probes = h.widget_id_probes();
     let scroll_id = probes
         .iter()
@@ -8285,13 +6492,7 @@ fn converting_a_pane_moves_no_widget_id() {
     );
 }
 
-/// 54. **The menu checkbox arms the draw, and a drag on a map becomes a
-///     section.** (Renumbered from a colliding 44.)
-///
-///     Through the dropdown's own checkbox, which is where the mode is
-///     armed and — just as importantly — where it is turned off again: a
-///     mode whose state is invisible is a map that has mysteriously
-///     stopped panning.
+/// 54. **The menu checkbox arms the draw, and a drag on a map becomes a section.**
 #[test]
 fn the_menus_checkbox_arms_the_cross_section_draw() {
     let mut h = compact_with_menu();
@@ -8308,16 +6509,12 @@ fn the_menus_checkbox_arms_the_cross_section_draw() {
     h.frames_for(3, FRAME_DT);
 
     assert!(h.section_draw_armed(), "the checkbox did not arm the draw");
-    // Arming closes the dropdown, and must: the next thing the user does
-    // is a drag on the map, and an open menu is in its way.
     assert_eq!(
         h.menu_leaf(crate::ui::DRAW_CROSS_SECTION_LABEL),
         None,
         "the dropdown stayed open over the map the line has to be drawn on"
     );
 
-    // Re-opened, the checkbox shows the mode it turned on — which is what a
-    // user who armed it by accident needs in order to un-tick it.
     h.open_menu();
     assert_eq!(
         h.menu_leaf(crate::ui::DRAW_CROSS_SECTION_LABEL)
@@ -8326,7 +6523,6 @@ fn the_menus_checkbox_arms_the_cross_section_draw() {
         "the checkbox does not show the mode it just turned on"
     );
 
-    // And un-ticking it disarms, so the mode is never a trap.
     h.mouse_click(clickable_leaf(&h, crate::ui::DRAW_CROSS_SECTION_LABEL).center());
     h.frames_for(3, FRAME_DT);
     assert!(
@@ -8335,15 +6531,9 @@ fn the_menus_checkbox_arms_the_cross_section_draw() {
     );
 }
 
-/// The dropdown's other arm entry, on the same terms: it arms the 3D region
-/// pick, closes itself over the map the box has to be dragged on, shows the
-/// mode it turned on when reopened, and turns it off again.
-///
-/// A separate test rather than a parameterised one, because the two entries are
-/// not interchangeable — their labels differ, their dispatch arms differ, and
-/// the failure this catches is an entry that renders and dispatches nothing.
-/// The exclusion between them is asserted where a user would see it, on the top
-/// bar's two toggles.
+/// The dropdown's other arm entry, on the same terms: it arms the 3D region pick,
+/// closes itself over the map the box has to be dragged on, shows the mode it
+/// turned on when reopened, and turns it off again.
 #[test]
 fn the_menus_checkbox_arms_the_3d_region_pick() {
     let mut h = compact_with_menu();
@@ -8378,16 +6568,6 @@ fn the_menus_checkbox_arms_the_3d_region_pick() {
 }
 
 /// 55. **An armed drag on a map becomes a section aimed where it was drawn.**
-///     (Renumbered from a colliding 45.)
-///
-///     Through the real pointer pipeline, `render_panes`' resolution and the
-///     deferred apply.
-///
-///     Two claims beyond "a pane appeared", and both are about what the
-///     drag did *not* do. The map must not have panned — the drag belongs to
-///     the line, and a section drawn while the ground slid under it is of
-///     nowhere in particular. And the mode must have disarmed itself, or the
-///     user's next pan is a second section.
 #[test]
 fn an_armed_drag_on_a_map_becomes_a_cross_section_aimed_where_it_was_drawn() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -8399,10 +6579,6 @@ fn an_armed_drag_on_a_map_becomes_a_cross_section_aimed_where_it_was_drawn() {
     let from = pane.center() - egui::vec2(120.0, 60.0);
     let to = pane.center() + egui::vec2(120.0, 60.0);
     let centre_before = h.pane_center(0);
-    // Taken **before** the drag, and it has to be: applying the line grows
-    // the layout, which halves pane 0's rect and therefore changes what
-    // every pixel in it names. Recomputing afterwards would compare the line
-    // against a projector that never drew it.
     let want_a = h.ground_at(0, from);
     let want_b = h.ground_at(0, to);
 
@@ -8436,12 +6612,6 @@ fn an_armed_drag_on_a_map_becomes_a_cross_section_aimed_where_it_was_drawn() {
     let line = h
         .section_line(target)
         .expect("the section pane has no line");
-    // A thousandth of a degree — about 90 m, or a third of a pixel at this
-    // zoom. Loose enough to absorb walkers still settling its zoom
-    // animation across the warm-up frames, and three orders of magnitude
-    // tighter than the failure it is written against: an endpoint mapped
-    // through the wrong rect, or through no projector at all, lands
-    // kilometres away or in Kansas.
     assert!(
         (line.a().lat - want_a.y()).abs() < 1e-3 && (line.a().lon - want_a.x()).abs() < 1e-3,
         "the line starts at {:?}, not under the press at {want_a:?}",
@@ -8459,22 +6629,8 @@ fn an_armed_drag_on_a_map_becomes_a_cross_section_aimed_where_it_was_drawn() {
     );
 }
 
-/// 56. **A rendered section's caption is calm by default, and the honesty
-///     detail is one click away — reachable, in the user's words, and
-///     closable again.** (Renumbered from a colliding 46.)
-///
-///     The redesign's whole contract, end to end. The old caption painted
-///     the ladder warning and the registration caveat on every ordinary
-///     section, the warning in error styling — and watched with real users
-///     it read as something broken, something they had broken. The drawn
-///     rungs and the `NEAREST` upload stay as the standing honesty devices;
-///     the words move behind the ⓘ.
-///
-///     Asserted through the ladder's *own* numbers on both sides of the
-///     toggle, because a detail saying the same thing whatever the volume
-///     was would be boilerplate a reader learns to skip. 14 rungs 0.5°
-///     apart and 5 rungs 5° apart are the same sentence with entirely
-///     different consequences.
+/// 56. **A rendered section's caption is calm by default, and the honesty detail is
+/// one click away — reachable, in the user's words, and closable again.**
 #[test]
 fn a_rendered_sections_caption_is_calm_and_its_detail_is_one_click_away() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -8483,9 +6639,6 @@ fn a_rendered_sections_caption_is_calm_and_its_detail_is_one_click_away() {
     h.make_pane_cross_section(0, a, b);
     h.place_section(0, vcp_212_axes(), &vcp_212_rungs());
 
-    // The caption sits along the pane's top-left, which the floating
-    // layers panel now covers; close it — the user's own remedy — so the
-    // detail-toggle click reaches the caption rather than the chrome.
     h.close_layers();
 
     let pane = h.pane_rects()[0];
@@ -8494,8 +6647,6 @@ fn a_rendered_sections_caption_is_calm_and_its_detail_is_one_click_away() {
         "precondition: the pane must be drawing a picture, not its empty state"
     );
 
-    // The default: the ladder's own headline numbers, and none of the
-    // long-form copy that read as an error state.
     assert!(
         h.text_painted_in(pane, "14 tilts"),
         "the default caption lost the ladder's own count; it painted {:?}",
@@ -8510,7 +6661,6 @@ fn a_rendered_sections_caption_is_calm_and_its_detail_is_one_click_away() {
         );
     }
 
-    // The ⓘ is on the pane, and clicking it opens the detail.
     let glyph = h
         .painted_text_rects()
         .into_iter()
@@ -8521,12 +6671,8 @@ fn a_rendered_sections_caption_is_calm_and_its_detail_is_one_click_away() {
     h.frame();
 
     for phrase in [
-        // The ladder's widest step: a measurement of *this* volume.
         "4.9",
-        // What the reader must not do with the picture.
         "not measured",
-        // And how this view stands against the map above it, in words about
-        // what the user sees rather than about which renderer is right.
         "Echoes sit at",
     ] {
         assert!(
@@ -8535,16 +6681,11 @@ fn a_rendered_sections_caption_is_calm_and_its_detail_is_one_click_away() {
             h.painted_text_strings_in(pane)
         );
     }
-    // The developer-voice sentence is gone for good, open or closed: "the
-    // section is right" is the app arguing with itself in front of the
-    // user.
     assert!(
         !h.text_painted_in(pane, "The section is right"),
         "the detail still argues with the map in front of the user"
     );
 
-    // And the detail closes again: an explanation that cannot be dismissed
-    // is the old wall of text with an extra click in front of it.
     h.mouse_click(glyph.center());
     h.frame();
     assert!(
@@ -8557,50 +6698,15 @@ fn a_rendered_sections_caption_is_calm_and_its_detail_is_one_click_away() {
     );
 }
 
-/// 46b. **A rendered section is drawn the right way up, over the caption
-///      that describes it, with its ladder on it and its readout live.**
-///
-///      Test 46 above is the only other thing that drives
-///      `render_cross_section` end to end, and it reads back **painted text
-///      only**. Every mutation inside the function body that does not change
-///      a word therefore survived it: the tilt ladder gated off entirely,
-///      `caption_height` reverted to a counted `len * 13.0`, the image's uv
-///      flipped so the section is drawn upside down, `hover_value` never
-///      written, and the transient status line never pushed into the
-///      caption. Five mutants, one test, no failures — because nothing here
-///      asserted a shape.
-///
-///      Two of the five are pointed:
-///
-///      * **The flip.** `y_of_height` is pinned in the module's own tests
-///        and it is only half of the mapping; the image's uv rect is the
-///        half that actually turns the picture over, and it was pinned
-///        nowhere. The section module's doc calls this "the single most
-///        likely mistake in the module and the least likely to be noticed —
-///        a flipped section of a mature storm still looks like a storm".
-///      * **`caption_height`.** It is the whole of F8's fix. The module's
-///        own test computes the height itself and hands it to
-///        `SectionLayout::new`, so reverting the production line to a count
-///        passes it; only a test that goes through the real wiring, on a
-///        pane narrow enough to make the caption *wrap*, can tell.
+/// 46b. **A rendered section is drawn the right way up, over the caption that
+/// describes it, with its ladder on it and its readout live.**
 #[test]
 fn a_rendered_section_is_the_right_way_up_and_carries_its_ladder() {
-    // Narrow and tall on purpose, and the shape is load-bearing twice. The
-    // width makes the caption *wrap* to half a dozen rows, which is the only
-    // condition under which a measured caption height differs from a counted
-    // one by more than a point or two — at 760 points both sentences fit on
-    // one row each, `len * 13.0` lands within two points of the truth, and
-    // the mutant passes. The height keeps it clear of
-    // `TWO_LINE_CAPTION_MIN_HEIGHT` and of `CAPTION_MAX_HEIGHT_FRACTION`, so
-    // the registration caveat is really there to be wrapped.
     let mut h = InputHarness::with_screen(egui::vec2(480.0, 900.0));
     h.load_scan("KTLX");
     let (a, b) = section_ends();
     h.make_pane_cross_section(0, a, b);
     h.place_section(0, vcp_212_axes(), &vcp_212_rungs());
-    // With the ⓘ detail open — the caption's longest shape, and the only
-    // one whose lines wrap enough rows for a counted height to be wrong by
-    // more than a point or two.
     h.gui_mut()
         .pane_mut(0)
         .expect("pane 0 exists")
@@ -8610,10 +6716,6 @@ fn a_rendered_section_is_the_right_way_up_and_carries_its_ladder() {
     h.warm_up();
 
     let pane = h.pane_rects()[0];
-    // The colour bar is a textured quad too since its ramp was baked
-    // (`crate::legend_ramp`), so the raster is the one that is *not* a bar.
-    // Split by the classifier the bar tests use rather than by "the biggest",
-    // so this says which quad it is looking at rather than hoping.
     let (bars_h, bars_v) = h.color_scale_bars(pane);
     let images: Vec<_> = h
         .painted_images_in(pane)
@@ -8642,11 +6744,6 @@ fn a_rendered_section_is_the_right_way_up_and_carries_its_ladder() {
         raster.rect
     );
 
-    // **The right way up.** egui's uv origin is the texture's top left and
-    // the section's row 0 is the top of the height axis, so the quad's
-    // top-left corner must sample the texture's top-left corner. Swapping
-    // the uv rect's corners flips the picture with no error and no layout
-    // change.
     assert_eq!(
         (raster.uv_at_top_left.x, raster.uv_at_top_left.y),
         (0.0, 0.0),
@@ -8662,13 +6759,6 @@ fn a_rendered_section_is_the_right_way_up_and_carries_its_ladder() {
         raster.uv_at_bottom_right
     );
 
-    // **The caption is paid for.** Every row of it is above the picture, not
-    // over it — which is only true if the layout used the caption's
-    // *measured* wrapped height rather than a count of its lines.
-    // Both sentences, not just the first. A galley's rect spans every row it
-    // wrapped to, and it is the *caveat* — the last line of the block — that
-    // a short measurement pushes onto the picture; the ladder warning is
-    // first and sits above the plot however wrong the height is.
     let caption_rows: Vec<(egui::Rect, String)> = h
         .painted_text_rects()
         .into_iter()
@@ -8705,24 +6795,13 @@ fn a_rendered_section_is_the_right_way_up_and_carries_its_ladder() {
         );
     }
 
-    // **The ladder is on it.** The rungs are the section's first honesty
-    // device; without them the picture is a smooth field with nothing saying
-    // which parts of it were measured.
     let color = crate::ui::map::section_render::tilt_rung_color();
-    // Over everything rather than over the picture: the upper rungs leave
-    // the top of the height axis part way along the line — a 19.5° beam is
-    // 33 km up at 90 km — and are *clipped* when painted rather than
-    // shortened, so filtering on the plot rect would read a real rung as a
-    // missing one.
     let rungs = h.painted_segments_in(egui::Rect::EVERYTHING, color);
     assert!(
         !rungs.is_empty(),
         "no tilt rungs were drawn over the section, so nothing in the \
              picture says where the data actually is"
     );
-    // One polyline per rung: every curve is sampled from the `A` end, so
-    // each contributes exactly one segment starting at the plot's left
-    // edge, and counting those counts the rungs.
     let left = rungs.iter().map(|(p, _)| p.x).fold(f32::INFINITY, f32::min);
     let starts = rungs
         .iter()
@@ -8733,8 +6812,6 @@ fn a_rendered_section_is_the_right_way_up_and_carries_its_ladder() {
         vcp_212_rungs().len(),
         "the ladder drew {starts} curves for a 14-rung section",
     );
-    // Each curve is traced rather than dashed once, and all of them the
-    // same length.
     assert_eq!(
         rungs.len() % starts,
         0,
@@ -8747,7 +6824,6 @@ fn a_rendered_section_is_the_right_way_up_and_carries_its_ladder() {
              is not a traced beam centre",
         rungs.len(),
     );
-    // And they are on the *picture*, not merely somewhere on the pane.
     let over_the_picture = h.painted_segments_in(raster.rect, color).len();
     assert!(
         over_the_picture * 3 >= rungs.len(),
@@ -8756,10 +6832,6 @@ fn a_rendered_section_is_the_right_way_up_and_carries_its_ladder() {
         rungs.len(),
     );
 
-    // **The readout is live.** Most of the value of the status plane is the
-    // hover: it is the first place in the codebase that can say *why* a
-    // pixel is blank, and it is written by this function after everything
-    // above it has drawn.
     h.mouse_move(raster.rect.center());
     h.frame();
     let readout = h
@@ -8775,9 +6847,6 @@ fn a_rendered_section_is_the_right_way_up_and_carries_its_ladder() {
              {readout}"
     );
 
-    // **A transient state reaches the caption.** It is pushed last, under
-    // the standing warning, so it can never push that off the pane — and a
-    // build that never pushed it at all looks identical.
     h.gui_mut()
         .pane_mut(0)
         .expect("pane 0")
@@ -8800,23 +6869,6 @@ fn a_rendered_section_is_the_right_way_up_and_carries_its_ladder() {
 }
 
 /// 47. **A wheel-zoom part-way through a drag does not move the anchor.**
-///
-///     The reason the anchor is stored as *ground* and converted inside
-///     `Map::show` on the press frame. An armed draw suppresses panning but
-///     not zooming — walkers reads the wheel itself — so with a pixel anchor
-///     a mid-drag notch would silently re-aim the line's near end while the
-///     far end tracked the finger, and the section would be a convincing
-///     picture of ground nobody pointed at.
-///
-///     Compared against the *same drag without the wheel* rather than
-///     against a recomputed projection, so the claim is exact and needs no
-///     tolerance: two identical presses on two identically warmed harnesses
-///     must produce the same anchor, whatever happened afterwards.
-///
-///     And the release end must **differ**, which is the calibration: it
-///     proves the zoom really landed and really changed what a pixel means,
-///     so the anchor's stability is a property of the anchor rather than of
-///     a wheel event that went nowhere.
 #[test]
 fn a_wheel_zoom_mid_drag_leaves_the_anchor_on_the_ground_it_was_put_on() {
     fn drag(zoom_mid_drag: bool) -> (SectionLine, f64) {
@@ -8880,20 +6932,12 @@ fn a_wheel_zoom_mid_drag_leaves_the_anchor_on_the_ground_it_was_put_on() {
     );
 }
 
-/// A map on pane 0 feeding a rendered section on pane 1, exactly as the
-/// armed draw leaves the layout — the fixture every endpoint-drag test
-/// starts from.
-///
-/// Returns the line's two ends as **ground**, not pixels: the warm-up
-/// frames let walkers settle its zoom, so a test aims at a handle by
-/// projecting the ground through [`InputHarness::screen_of`] at use time
-/// rather than trusting a pixel recorded before the settling.
+/// A map on pane 0 feeding a rendered section on pane 1, exactly as the armed draw
+/// leaves the layout — the fixture every endpoint-drag test starts from.
 fn harness_with_committed_section() -> (InputHarness, GeoPoint, GeoPoint) {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.set_pane_count(2);
     h.load_scan("KTLX");
-    // The A end of the line sits under the floating layers panel on
-    // Expanded, and a press there belongs to the panel.
     h.close_layers();
     h.warm_up();
     h.warm_up();
@@ -8915,23 +6959,9 @@ fn harness_with_committed_section() -> (InputHarness, GeoPoint, GeoPoint) {
     (h, a, b)
 }
 
-/// 45c. **Dragging an endpoint previews live and re-aims the section only
-///      on the drop** — the pointer's whole journey changes nothing the
-///      cut dispatch can see, and the release changes exactly the line.
-///
-///      The stored line *is* the drag's contribution to the section
-///      staleness key (`SectionTarget.line`), and the frontend dispatcher
-///      re-cuts precisely when that key moves — so "the line holds still
-///      until the drop" is this crate's half of "a drag in progress never
-///      triggers an extraction". A re-cut is a multi-MB walk of the merged
-///      volume's gate bytes; per drag frame it would be the most expensive
-///      thing in the app.
-///
-///      Also pinned here because they are the same gesture: the map does
-///      not pan while a handle is held (from the press frame, via the
-///      recorded handle spots), and the drop does not blank the pane —
-///      walking a line through a storm must not strobe the picture on
-///      every drop.
+/// 45c. **Dragging an endpoint previews live and re-aims the section only on the
+/// drop** — the pointer's whole journey changes nothing the cut dispatch can see,
+/// and the release changes exactly the line.
 #[test]
 fn dragging_an_endpoint_re_aims_the_section_on_drop_and_never_mid_drag() {
     let (mut h, a, b) = harness_with_committed_section();
@@ -8940,8 +6970,6 @@ fn dragging_an_endpoint_re_aims_the_section_on_drop_and_never_mid_drag() {
 
     let b_px = h.screen_of(0, b);
     let target_px = b_px + egui::vec2(-70.0, 45.0);
-    // The ground the drop should land on, computed before the drag: the
-    // map must not move under the gesture, so the answer must not either.
     let want = h.ground_at(0, target_px);
 
     h.mouse_move(b_px);
@@ -8980,14 +7008,10 @@ fn dragging_an_endpoint_re_aims_the_section_on_drop_and_never_mid_drag() {
         "B landed at {:?}, not under the drop at {want:?}",
         line.b()
     );
-    // A is still where the fixture put it on the ground, so the whole
-    // gesture read the projector rather than shifting pixels.
     assert!(
         (line.a().lat - a.lat).abs() < 1e-9,
         "A drifted from the ground the fixture named"
     );
-    // The old picture stands until the re-cut lands: blanking here would
-    // strobe the pane on every drop of a walk through a storm.
     assert!(
         h.gui_mut()
             .pane(1)
@@ -8998,18 +7022,6 @@ fn dragging_an_endpoint_re_aims_the_section_on_drop_and_never_mid_drag() {
 }
 
 /// 45d. **A mid-drag zoom keeps the grabbed endpoint's ground.**
-///
-///      The drag suppresses panning but not zooming — walkers reads the
-///      wheel itself — so a wheel notch mid-drag is ordinary. The preview
-///      is geographic and the pointer is folded in only on frames it
-///      moved, so a zoom-only frame must change nothing: re-unprojecting a
-///      stationary pointer would slide the endpoint to whatever ground its
-///      pixel names after the zoom.
-///
-///      Same construction as the armed-draw anchor test above: two
-///      identical drags, one with a wheel notch before the release, must
-///      commit the same line — and the zooms must really differ, or the
-///      equality proves nothing.
 #[test]
 fn a_mid_drag_zoom_keeps_the_grabbed_endpoints_ground() {
     fn drag(zoom_mid_drag: bool) -> (SectionLine, f64) {
@@ -9025,9 +7037,6 @@ fn a_mid_drag_zoom_keeps_the_grabbed_endpoints_ground() {
         h.frame();
 
         if zoom_mid_drag {
-            // At the pointer's own position, as a user zooming in on the
-            // endpoint they are placing does — so the pointer does not
-            // move, and only the ground under it changes.
             h.wheel_notch(target_px, egui::MouseWheelUnit::Line, -3.0);
         }
         h.frames_for(6, FRAME_DT);
@@ -9057,19 +7066,11 @@ fn a_mid_drag_zoom_keeps_the_grabbed_endpoints_ground() {
 }
 
 /// 45e. **A press beyond the grab radius is still a pan.**
-///
-///      The handles are unarmed, so their radius is the entire contract
-///      with the map's primary gesture: inside it a press edits, outside
-///      it the map pans exactly as it did before handles existed. A radius
-///      that swallowed nearby presses would make every pan near a section
-///      line a coin flip — the exact failure the armed modes exist to
-///      avoid.
 #[test]
 fn a_press_beside_the_handles_still_pans_the_map() {
     let (mut h, a, b) = harness_with_committed_section();
     let a_px = h.screen_of(0, a);
     let b_px = h.screen_of(0, b);
-    // Well off both handles and off the line's body alike.
     let mid = a_px + (b_px - a_px) * 0.5;
     let start = mid + egui::vec2(0.0, -120.0);
     assert!(
@@ -9106,14 +7107,9 @@ fn a_press_beside_the_handles_still_pans_the_map() {
     );
 }
 
-/// 45f. **While the draw mode is armed, the handles go inert** — the same
-///      press that would grab B draws a fresh line instead, exactly as it
-///      did before handles existed.
-///
-///      One drag on one map pane cannot be two gestures. The armed mode
-///      was asked for last (from the menu), so it wins; the two setters
-///      also drop any edit drag in flight, which keeps the exclusion true
-///      from both directions.
+/// 45f. **While the draw mode is armed, the handles go inert** — the same press
+/// that would grab B draws a fresh line instead, exactly as it did before handles
+/// existed.
 #[test]
 fn an_armed_draw_wins_the_press_over_a_handle() {
     let (mut h, a, b) = harness_with_committed_section();
@@ -9134,8 +7130,6 @@ fn an_armed_draw_wins_the_press_over_a_handle() {
     h.frames_for(2, FRAME_DT);
 
     let line = h.section_line(1).expect("the armed draw re-aims pane 1");
-    // The armed draw's signature: the press became the *A end of a new
-    // line*. An endpoint edit would have kept A where the fixture put it.
     assert!(
         (line.a().lat - want_from.y()).abs() < 1e-3 && (line.a().lon - want_from.x()).abs() < 1e-3,
         "the press on a handle did not start a fresh armed line: A is at \
@@ -9153,9 +7147,9 @@ fn an_armed_draw_wins_the_press_over_a_handle() {
     );
 }
 
-/// 45g. **Escape mid-drag cancels the edit and keeps the line** — the
-///      same layer the armed drags sit on, because a drag in flight is the
-///      most immediate thing a "back out" gesture can be aimed at.
+/// 45g. **Escape mid-drag cancels the edit and keeps the line** — the same layer
+/// the armed drags sit on, because a drag in flight is the most immediate thing a
+/// "back out" gesture can be aimed at.
 #[test]
 fn escape_mid_drag_cancels_the_edit_and_keeps_the_line() {
     let (mut h, _, b) = harness_with_committed_section();
@@ -9184,15 +7178,9 @@ fn escape_mid_drag_cancels_the_edit_and_keeps_the_line() {
     );
 }
 
-/// 45h. **Dragging the line's body slides it rigidly** — length and
-///      bearing kept — **previewing live and re-cutting only on the
-///      drop**, exactly like an endpoint drag.
-///
-///      This is the "walk the section through the storm" motion (GR's
-///      Position slider, as a direct gesture), so the mid-drag stillness
-///      matters twice over: it is one re-cut per walk step instead of one
-///      per frame, and the body is the *likeliest* thing to be dragged
-///      repeatedly.
+/// 45h. **Dragging the line's body slides it rigidly** — length and bearing kept —
+/// **previewing live and re-cutting only on the drop**, exactly like an endpoint
+/// drag.
 #[test]
 fn a_body_drag_slides_the_line_rigidly_and_re_cuts_on_drop() {
     let (mut h, _, _) = harness_with_committed_section();
@@ -9238,24 +7226,17 @@ fn a_body_drag_slides_the_line_rigidly_and_re_cuts_on_drop() {
         (bearing_after - bearing_before).abs() < 0.5,
         "a body drag turned the line: {bearing_before}\u{b0} -> {bearing_after}\u{b0}"
     );
-    // And it really moved: both ends, together.
     assert_ne!(line.a(), line_before.a());
     assert_ne!(line.b(), line_before.b());
 }
 
-/// 45i. **A shift-drag on the body sweeps the line about its midpoint** —
-///      midpoint and length kept, bearing following the pointer.
-///
-///      The rotate affordance of issue #10. Shift is latched at the press,
-///      so the verb cannot change mid-gesture; the fine-step spelling for
-///      pointers with no modifier lives on the section pane's chips.
+/// 45i. **A shift-drag on the body sweeps the line about its midpoint** — midpoint
+/// and length kept, bearing following the pointer.
 #[test]
 fn a_shift_body_drag_sweeps_about_the_midpoint() {
     let (mut h, a, b) = harness_with_committed_section();
     let line_before = h.section_line(1).expect("the fixture committed a line");
     let mid_before = crate::ui_section_edit::midpoint(line_before);
-    // Press three quarters of the way along, where a bearing about the
-    // midpoint is well defined.
     let (press_lat, press_lon) =
         rustdar_geo::great_circle_point((a.lat, a.lon), (b.lat, b.lon), 0.75);
     let press_px = h.screen_of(
@@ -9265,11 +7246,6 @@ fn a_shift_body_drag_sweeps_about_the_midpoint() {
             lon: press_lon,
         },
     );
-    // Where the pointer will end, unprojected now — the drag suppresses
-    // panning, so the ground under that pixel must not move either. The
-    // sweep's signed contract: the grabbed point sits on the pivot→B
-    // side, so the committed line's bearing must land where the *pointer*
-    // is about the pivot — not merely differ from the old bearing.
     let release_ground = h.ground_at(0, press_px + egui::vec2(-40.0, -48.0));
     let (want_bearing, _) = rustdar_geo::site_bearing_range_km(
         mid_before.lat,
@@ -9286,7 +7262,6 @@ fn a_shift_body_drag_sweeps_about_the_midpoint() {
     h.frame();
     h.mouse_press(press_px);
     h.frame();
-    // Pull the grabbed point across the line's run — a turn, not a slide.
     for step in 1..=4 {
         h.mouse_move(press_px + egui::vec2(-10.0, -12.0) * step as f32);
         h.frame();
@@ -9316,11 +7291,6 @@ fn a_shift_body_drag_sweeps_about_the_midpoint() {
             > 2.0,
         "a drag across the line's run turned it by nothing"
     );
-    // And it turned the right way: the grabbed point followed the pointer
-    // about the pivot, so the line's bearing landed on the pointer's. A
-    // negated sweep delta turns the line *away* from the pointer by the
-    // same magnitude — every assertion above still passes, and this one
-    // misses by roughly twice the swing (~100° here).
     let got = crate::ui_section_edit::bearing_deg(line).rem_euclid(360.0);
     let off = (got - want_bearing.rem_euclid(360.0)).rem_euclid(360.0);
     assert!(
@@ -9331,9 +7301,8 @@ fn a_shift_body_drag_sweeps_about_the_midpoint() {
     );
 }
 
-/// A single section pane with a rendered cut, for the step-control tests —
-/// the layout a phone gets, where the chips are the only pan/sweep there
-/// is.
+/// A single section pane with a rendered cut, for the step-control tests — the
+/// layout a phone gets, where the chips are the only pan/sweep there is.
 fn harness_with_section_pane() -> (InputHarness, SectionLine) {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.load_scan("KTLX");
@@ -9358,23 +7327,14 @@ fn chip_rect(h: &InputHarness, pane: egui::Rect, glyph: &str) -> egui::Rect {
         })
 }
 
-/// 45j. **The section pane's pan chips slide the line perpendicular to
-///      itself, one step per click, keeping the picture** — and the pane
-///      says which way the line faces while you do it.
-///
-///      A chip click is one deliberate action, so unlike the map drags it
-///      commits immediately: one click, one re-cut, which is what makes
-///      stepping feel like a control. The picture stands until the new cut
-///      lands — strobing to "Cutting…" on every step is the exact failure
-///      the walk-through-the-storm flow cannot have.
+/// 45j. **The section pane's pan chips slide the line perpendicular to itself, one
+/// step per click, keeping the picture** — and the pane says which way the line
+/// faces while you do it.
 #[test]
 fn a_pan_step_on_the_section_pane_slides_the_line_and_keeps_the_picture() {
     let (mut h, line_before) = harness_with_section_pane();
     let pane = h.pane_rects()[0];
 
-    // The orientation readout: bearing (three digits wrapped to 0–359,
-    // so north is 000° and never "360°") and length, in the user's units
-    // — sweeping blind is the alternative.
     let expected_readout = format!(
         "{:03}\u{b0} - {:.0}{}",
         (crate::ui_section_edit::bearing_deg(line_before)
@@ -9411,7 +7371,6 @@ fn a_pan_step_on_the_section_pane_slides_the_line_and_keeps_the_picture() {
             < 0.1,
         "a pan step turned the line"
     );
-    // Perpendicular, to the left of A→B, by exactly one step.
     let mid_before = crate::ui_section_edit::midpoint(line_before);
     let mid_after = crate::ui_section_edit::midpoint(line);
     let (moved_bearing, moved_km) = rustdar_geo::site_bearing_range_km(
@@ -9432,7 +7391,6 @@ fn a_pan_step_on_the_section_pane_slides_the_line_and_keeps_the_picture() {
         "the ◀ chip moved the line on bearing {moved_bearing}\u{b0}, not \
              perpendicular-left at {want_bearing}\u{b0}"
     );
-    // The picture stands until the re-cut lands.
     assert!(
         h.gui_mut()
             .pane(0)
@@ -9442,9 +7400,9 @@ fn a_pan_step_on_the_section_pane_slides_the_line_and_keeps_the_picture() {
     );
 }
 
-/// 45k. **The sweep chips rotate the line about its midpoint by one step**
-///      — the fine-grained spelling of the sweep, and the only one a
-///      touch screen with no modifier keys gets.
+/// 45k. **The sweep chips rotate the line about its midpoint by one step** — the
+/// fine-grained spelling of the sweep, and the only one a touch screen with no
+/// modifier keys gets.
 #[test]
 fn a_sweep_step_on_the_section_pane_rotates_about_the_midpoint() {
     let (mut h, line_before) = harness_with_section_pane();
@@ -9478,26 +7436,13 @@ fn a_sweep_step_on_the_section_pane_rotates_about_the_midpoint() {
     );
 }
 
-/// 45l. **The grab radii in absolute points: a press 30 points off a cap
-///      and 20 points off the body still pans.**
-///
-///      45e proves *a* pan survives, but its press sits ~107 points from
-///      the body and ~236 from the caps — beyond any plausible radius —
-///      and the unit probes compute their presses *from* the constants, so
-///      they follow a mutated radius wherever it goes. This press is
-///      absolute: close enough to the line that a radius grown to a few
-///      dozen points would swallow it, far enough that the shipped radii
-///      (14 and 8) must not. The module doc calls the radius "the whole
-///      contract with panning"; this is that contract observed at the
-///      numbers it is set at.
+/// 45l. **The grab radii in absolute points: a press 30 points off a cap and 20
+/// points off the body still pans.**
 #[test]
 fn a_press_thirty_points_off_a_cap_and_twenty_off_the_body_still_pans() {
     let (mut h, a, b) = harness_with_committed_section();
     let a_px = h.screen_of(0, a);
     let b_px = h.screen_of(0, b);
-    // 20 points perpendicular off the track, at the along-track distance
-    // that puts the press exactly 30 points from the A cap:
-    // sqrt(30² − 20²) ≈ 22.4 points toward B.
     let along = (b_px - a_px).normalized();
     let across = egui::vec2(along.y, -along.x);
     let start = a_px + along * (30.0f32.powi(2) - 20.0f32.powi(2)).sqrt() + across * 20.0;
@@ -9539,11 +7484,8 @@ fn a_press_thirty_points_off_a_cap_and_twenty_off_the_body_still_pans() {
     );
 }
 
-/// 45n. **Arming the section draw mid-flight kills the handle drag too**
-///      — the other armed setter, making the same claim, pinned the same
-///      way. 45f proves the handles go *inert* while the draw is armed;
-///      this pins the half the setters' docs add: the drag that already
-///      existed is gone the instant the mode goes on, and never commits.
+/// 45n. **Arming the section draw mid-flight kills the handle drag too** — the
+/// other armed setter, making the same claim, pinned the same way.
 #[test]
 fn arming_the_section_draw_clears_a_handle_drag_in_flight() {
     let (mut h, a, b) = harness_with_committed_section();
@@ -9580,13 +7522,6 @@ fn arming_the_section_draw_clears_a_handle_drag_in_flight() {
 }
 
 /// 57. **A tap while armed is discarded, and the mode stays armed.**
-///     (Renumbered from a colliding 46.)
-///
-///     A stray tap is the single most likely thing to happen right after
-///     arming — it is how a user checks which pane they are on. Turning it
-///     into a zero-ish-length section is wrong; *silently disarming* is
-///     worse, because the intent the user just expressed is gone with
-///     nothing on screen to say so.
 #[test]
 fn a_tap_while_armed_draws_nothing_and_leaves_the_mode_armed() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -9600,8 +7535,6 @@ fn a_tap_while_armed_draws_nothing_and_leaves_the_mode_armed() {
     h.frame();
     h.mouse_press(at);
     h.frame();
-    // Under `MIN_SECTION_DRAG_PT` (24), and deliberately not zero: a
-    // threshold mutated to `> 0.0` would pass a test that never moved.
     h.mouse_move(at + egui::vec2(9.0, 6.0));
     h.frame();
     h.mouse_release(at + egui::vec2(9.0, 6.0));
@@ -9618,8 +7551,6 @@ fn a_tap_while_armed_draws_nothing_and_leaves_the_mode_armed() {
         "a discarded drag disarmed the mode, throwing away the intent"
     );
 
-    // And a real drag straight afterwards still works, so "stays armed"
-    // means armed rather than merely not-disarmed.
     let to = at + egui::vec2(150.0, 90.0);
     h.mouse_press(at);
     h.frame();
@@ -9634,14 +7565,8 @@ fn a_tap_while_armed_draws_nothing_and_leaves_the_mode_armed() {
     );
 }
 
-/// 58. **While armed, a press on a map fires no overlay click and the map
-///     does not pan** — for every pane the frame resolves, not just the one
-///     the line is on. (Renumbered from a colliding 47.)
-///
-///     `ArmedDragFrame` makes both properties of the returned value
-///     rather than rules each caller remembers, and this reads them back out
-///     of the probe `render_panes` records from the very locals that feed
-///     `PaneRenderCtx` and `drag_pan_buttons`.
+/// 58. **While armed, a press on a map fires no overlay click and the map does not
+/// pan** — for every pane the frame resolves, not just the one the line is on.
 #[test]
 fn an_armed_press_suppresses_panning_and_fires_no_overlay_click() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -9651,8 +7576,6 @@ fn an_armed_press_suppresses_panning_and_fires_no_overlay_click() {
     let pane = h.pane_rects()[0];
     let at = pane.center();
 
-    // Unarmed first, so the assertion below is about being armed rather
-    // than about a click that never happens.
     let unarmed = h.mouse_click(at);
     assert!(
         unarmed.resolved.overlay_click_pos.is_some(),
@@ -9682,14 +7605,6 @@ fn an_armed_press_suppresses_panning_and_fires_no_overlay_click() {
 }
 
 /// 59. **A pane that is not a map ignores the armed mode entirely.**
-///     (Renumbered from a colliding 48.)
-///
-///     A line is aimed with a projector and a section pane has none, so
-///     arming the mode with one active leaves it exactly as it was — and in
-///     particular does not suppress that pane's pointer or swallow its
-///     clicks. The press that picks a map out of the layout is the same
-///     press that starts the line, because `detect_active_pane_click` runs
-///     at the top of the frame.
 #[test]
 fn arming_the_draw_changes_nothing_for_a_pane_with_no_map() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -9718,22 +7633,7 @@ fn arming_the_draw_changes_nothing_for_a_pane_with_no_map() {
     assert!(h.section_draw_armed(), "the mode should still be waiting");
 }
 
-// --- The two armed modal drags, together --------------------------------
-//
-// Neither feature's author could have written these: the cross-section draw
-// and the 3D region drag were built on the same base, in parallel, and this
-// is the first branch on which both exist. Everything below is about the
-// pair rather than about either one.
-
 /// **A back press cancels the armed modal drag.**
-///
-/// Its own layer, below every painted one — see `Gui::dismiss_top_layer`. On
-/// Android a back press with a mode on would otherwise exit the app, which is
-/// the reading of it least likely to be what was meant.
-///
-/// It used to say "whichever" and drive two modes: the 3D region drag sat on
-/// the same layer, mutually exclusive with this one. The region drag is gone,
-/// so there is one mode on the layer and the claim is the narrower one.
 #[test]
 fn a_back_press_cancels_the_armed_modal_drag() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -9749,17 +7649,8 @@ fn a_back_press_cancels_the_armed_modal_drag() {
     );
 }
 
-// ── The Location control ─────────────────────────────────────────────
-//
-// Asserted against painted text rather than against `Gui` state, because
-// the claim is about what the user is *offered*. A control that reads the
-// right permission and renders the wrong button is exactly the failure this
-// section exists to catch, and no state assertion can see it.
-
-/// A refusal is a decision only the user can reverse, wherever their
-/// platform keeps it. Offering a button here would be offering a dialog the
-/// platform will not show — and on the design that mapped Windows'
-/// `NotDeclaredByApp` to `Denied`, it would have bricked that arm outright.
+/// A refusal is a decision only the user can reverse, wherever their platform keeps
+/// it.
 #[test]
 fn settings_offers_no_way_to_ask_once_the_os_has_refused() {
     let mut h = InputHarness::new();
@@ -9784,11 +7675,6 @@ fn settings_offers_no_way_to_ask_once_the_os_has_refused() {
         "the OS has refused and the pane still offers to ask it again. \
              Painted: {painted:?}"
     );
-    // The constant rather than a phrase: where a refusal is undone differs
-    // by platform — Windows has a Settings page, Linux has a GSettings key
-    // and no page at all — so a literal here would only ever pin whichever
-    // one CI happened to run. What must hold everywhere is that the arm
-    // renders the explanation beside the word.
     assert!(
         painted.iter().any(|t| t == crate::ui::LOCATION_DENIED_NOTE),
         "a denial with no button and no explanation is the state this \
@@ -9797,11 +7683,6 @@ fn settings_offers_no_way_to_ask_once_the_os_has_refused() {
 }
 
 /// The control is a window onto the OS, not a switch with a memory.
-///
-/// The tempting implementation keeps a local "the user turned it on" bool
-/// and renders from that, which goes on reading `On.` after the permission
-/// has been revoked underneath it — the exact reason `location_active()`
-/// is a method on the bridge rather than a field in the gate.
 #[test]
 fn the_location_control_follows_the_os_rather_than_a_remembered_toggle() {
     let mut h = InputHarness::new();
@@ -9814,8 +7695,6 @@ fn the_location_control_follows_the_os_rather_than_a_remembered_toggle() {
         "a live location stream offers no way to stop it. Painted: {painted:?}"
     );
 
-    // Revoked in system settings. Nothing in this crate was told to change
-    // its mind; the cached state simply moved underneath it.
     h.set_location_state(rustdar_location::LocationPermission::Denied, false);
     h.warm_up();
 
@@ -9831,8 +7710,8 @@ fn the_location_control_follows_the_os_rather_than_a_remembered_toggle() {
     );
 }
 
-/// A platform with no location service must not be told to go and enable
-/// one: the advice leads nowhere and the button would do nothing.
+/// A platform with no location service must not be told to go and enable one: the
+/// advice leads nowhere and the button would do nothing.
 #[test]
 fn a_platform_without_location_is_told_so_and_offered_nothing() {
     let mut h = InputHarness::new();
@@ -9854,15 +7733,8 @@ fn a_platform_without_location_is_told_so_and_offered_nothing() {
     }
 }
 
-/// The one thing worth offering after a refusal — and only where there is
-/// somewhere to send the user.
-///
-/// Both halves are failures with no symptom. A button on a platform with no
-/// settings page reads as "click here to fix this" and opens nothing; the
-/// same button beside a *granted* permission invites the user into Settings
-/// to solve a problem they do not have. It is Windows that has the page —
-/// `ms-settings:privacy-location` — and the browser that has nothing of the
-/// kind.
+/// The one thing worth offering after a refusal — and only where there is somewhere
+/// to send the user.
 #[test]
 fn a_denial_offers_the_system_settings_page_only_where_there_is_one() {
     const BUTTON: &str = "Open location settings";
@@ -9889,7 +7761,6 @@ fn a_denial_offers_the_system_settings_page_only_where_there_is_one() {
              does not offer it. Painted: {painted:?}"
     );
 
-    // Every other state has something better on offer, or nothing to fix.
     for state in [
         rustdar_location::LocationPermission::Granted,
         rustdar_location::LocationPermission::Prompt,
@@ -9907,17 +7778,11 @@ fn a_denial_offers_the_system_settings_page_only_where_there_is_one() {
     }
 }
 
-/// A refusal has to say something a user can act on, and on Linux the
-/// generic sentence cannot: the switch that refused is
-/// xdg-desktop-portal's `disable-location`, `xdg-desktop-portal-gtk`
-/// answers it from `org.gnome.system.location enabled`, that key defaults
-/// to **false**, and no desktop except GNOME has a page for it. So the one
-/// arm with no settings button is also the one arm that must name the
-/// command — otherwise the default state of a stock KDE machine reads
-/// "Denied. …check your system settings" and there is nothing there.
-///
-/// `cfg`'d rather than asserted both ways, because the copy is `cfg`'d: on
-/// every other platform "your system settings" is a real place.
+/// A refusal has to say something a user can act on, and on Linux the generic
+/// sentence cannot: the switch that refused is xdg-desktop-portal's
+/// `disable-location`, `xdg-desktop-portal-gtk` answers it from
+/// `org.gnome.system.location enabled`, that key defaults to **false**, and no
+/// desktop except GNOME has a page for it.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_linux_refusal_names_the_setting_that_would_undo_it() {
@@ -9937,11 +7802,7 @@ fn a_linux_refusal_names_the_setting_that_would_undo_it() {
     );
 }
 
-/// The gap the ungated line closes. `Fix:`/`No GPS fix` lives inside
-/// `#[cfg(feature = "gps-serial")]`, so on web, Android, iOS and every
-/// build without a serial port the section would read `On.` beside an empty
-/// map and explain nothing — which is the likely Linux outcome too, where
-/// the portal can take a while or answer with nothing at all.
+/// The gap the ungated line closes.
 #[test]
 fn a_granted_permission_with_no_fix_yet_says_so() {
     let mut h = InputHarness::new();
@@ -9971,27 +7832,14 @@ fn a_granted_permission_with_no_fix_yet_says_so() {
     );
 }
 
-// ── M4: site search, time links, the catalog and presets ────────────────
-
-/// 69. **The site search narrows the list, highlights the current site, and
-///     a row click switches the pane's site.**
-///
-///     The inspector's Pane-properties body is the first *list* route to a
-///     site — the map's clickable icons were the only picker before — and a
-///     row click must mean exactly what an icon click means: the same
-///     `SwitchRadarSite`, aimed at the active pane. The count caption is
-///     computed from the compiled-in table, so it is asserted against the
-///     table too rather than as a literal.
+/// 69. **The site search narrows the list, highlights the current site, and a row
+/// click switches the pane's site.**
 #[test]
 fn the_site_search_narrows_the_list_and_a_row_click_switches_the_site() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.open_pane_props();
 
     let inspector = h.inspector();
-    // Both inventories: the radars this process can place, and the ones it
-    // knows of and cannot. A list that offered only the first would drop
-    // `KCRI` and `TPBI`, which have Level II data and no published position —
-    // and while the network was compiled in, the table placed them anyway.
     let placed = rustdar_radar::sites::radars().len();
     let unplaced = rustdar_radar::sites::unplaced();
     let total = placed + unplaced.len();
@@ -10027,7 +7875,6 @@ fn the_site_search_narrows_the_list_and_a_row_click_switches_the_site() {
         "exactly the pane's current site is highlighted"
     );
 
-    // Type a query — lowercase on purpose; the codes are uppercase.
     h.mouse_click(inspector.site_search.center());
     h.type_text("kmkx");
     h.warm_up();
@@ -10047,7 +7894,6 @@ fn the_site_search_narrows_the_list_and_a_row_click_switches_the_site() {
         inspector.site_caption
     );
 
-    // The click emits the map-icon path's own action.
     h.mouse_click(inspector.site_rows[0].1.center());
     assert!(
         h.last_actions().iter().any(|a| matches!(
@@ -10059,23 +7905,11 @@ fn the_site_search_narrows_the_list_and_a_row_click_switches_the_site() {
 }
 
 /// **A site list that is not the network yet does not state a total.**
-///
-/// The honesty half of the returning-user regression. A user whose catalogue
-/// had not been applied saw `2 shown - 2 sites (2 NEXRAD + 0 TDWR)`: a total,
-/// a split and a confidence indistinguishable from a two-radar network. The
-/// list cannot work this out — two rows learned off two volumes look exactly
-/// like a two-radar network from the table alone — so the caption is told, and
-/// while it is pending it counts only what it is showing.
-///
-/// The complaint this answers was "only KLOT appears", which the app had no
-/// way of contradicting and every appearance of confirming.
 #[test]
 fn a_site_list_still_short_of_the_network_states_no_total() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.open_pane_props();
 
-    // The ordinary state first, so the difference is the flag and not the
-    // fixture: a settled list names its total and splits it by kind.
     let settled = h.inspector().site_caption;
     let total = rustdar_radar::sites::radars().len() + rustdar_radar::sites::unplaced().len();
     assert!(
@@ -10100,25 +7934,15 @@ fn a_site_list_still_short_of_the_network_states_no_total() {
     );
 }
 
-/// 70. **An unlinked pane is excluded from shared time — the loop fan-out
-///     and the sync pass's time pair — and the Pane-properties sync section
-///     mirrors the popover: the same five rows, its time checkbox reflecting
-///     and toggling.**
-///
-///     The section is `pills::sync_section_ui`, the one implementation both
-///     routes render (M11's parity pattern), writing the *taken* pane; the
-///     fan-out reads `time_sync_targets`, so the loop actions name exactly
-///     the linked map panes; and `propagate_layer_sync` leaves an unlinked
-///     pane's `viewing_live` and `time_step_secs` alone while still
-///     converging everything else.
+/// 70. **An unlinked pane is excluded from shared time — the loop fan-out and the
+/// sync pass's time pair — and the Pane-properties sync section mirrors the
+/// popover: the same five rows, its time checkbox reflecting and toggling.**
 #[test]
 fn an_unlinked_pane_is_excluded_from_shared_nav_and_loop_fan_out() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.set_pane_count(3);
     h.load_scan("KTLX");
 
-    // The inspector route is the popover's mirror: one row set, from the
-    // one shared section — the parity walk for the PaneProps route.
     h.open_pane_props();
     assert_eq!(
         h.inspector()
@@ -10136,7 +7960,6 @@ fn an_unlinked_pane_is_excluded_from_shared_nav_and_loop_fan_out() {
         "the Pane-properties sync section must carry the popover's five rows"
     );
 
-    // The time checkbox reflects the stored state and toggles it.
     let time_row = |h: &mut InputHarness| {
         h.inspector()
             .sync_rows
@@ -10162,11 +7985,9 @@ fn an_unlinked_pane_is_excluded_from_shared_nav_and_loop_fan_out() {
         "a second click must relink it"
     );
 
-    // Unlink pane 1; panes 0 and 2 stay linked.
     h.gui_mut().pane_mut(1).expect("pane 1").time_link = false;
     h.warm_up();
 
-    // The loop fan-out skips it.
     h.mouse_click(h.timeline().loop_toggle.0.center());
     let targets: Vec<usize> = h
         .last_actions()
@@ -10182,8 +8003,6 @@ fn an_unlinked_pane_is_excluded_from_shared_nav_and_loop_fan_out() {
         "the loop must fan out over the linked panes and only them"
     );
 
-    // The sync pass leaves the frozen pane's time posture alone while the
-    // linked pane converges. Everything else still syncs — the site here.
     {
         let gui = h.gui_mut();
         gui.pane_mut(1).expect("pane 1").viewing_live = false;
@@ -10212,19 +8031,13 @@ fn an_unlinked_pane_is_excluded_from_shared_nav_and_loop_fan_out() {
     );
 }
 
-/// **A keyboard nudge on the archive scrubber commits** (§5.9 carried
-/// finding: `changed()` without a drag used to store the position and wait
-/// for a release that never comes).
-///
-/// egui's slider reads its arrow keys only while focused, and only a
-/// `TextEdit` takes focus from a click — so focus is granted through the
-/// id the renderer reported, as tabbing to the slider would.
+/// **A keyboard nudge on the archive scrubber commits** (§5.9 carried finding:
+/// `changed()` without a drag used to store the position and wait for a release
+/// that never comes).
 #[test]
 fn a_keyboard_nudge_on_the_archive_scrubber_commits() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.load_scan("KTLX");
-    // Parked in the archive, so a nudge is an archive step rather than a
-    // jump back to live from the rail's right end.
     h.gui_mut().pane_mut(0).expect("pane 0").viewing_live = false;
     h.warm_up();
 
@@ -10236,8 +8049,6 @@ fn a_keyboard_nudge_on_the_archive_scrubber_commits() {
         .1;
     h.focus_widget(scrubber_id);
 
-    // Several presses in one frame: each is one rail point, and the commit
-    // threshold near the right end must be cleanly crossed.
     for _ in 0..20 {
         h.key_press(egui::Key::ArrowLeft);
     }
@@ -10253,13 +8064,8 @@ fn a_keyboard_nudge_on_the_archive_scrubber_commits() {
     );
 }
 
-/// 67a. **The catalog's search filters every group, and a product tile aims
-///      the active pane.**
-///
-///      A product tile means "show me this picture": it sets the pane's
-///      product (resetting the tilt, as the combo does), turns the Radar
-///      layer on, selects the Radar layer in the inspector, and closes the
-///      catalog.
+/// 67a. **The catalog's search filters every group, and a product tile aims the
+/// active pane.**
 #[test]
 fn the_catalog_search_filters_and_a_product_tile_aims_the_active_pane() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -10323,12 +8129,8 @@ fn the_catalog_search_filters_and_a_product_tile_aims_the_active_pane() {
     );
 }
 
-/// 67b. **An overlay tile enables the layer — with the shared enable-fetch
-///      rule — selects it, and closes the catalog.**
-///
-///      SPC outlooks are the layer that makes the fetch half a contract: off
-///      by default and never auto-polled, so without the queued fetch the
-///      tile would enable a layer that never draws anything.
+/// 67b. **An overlay tile enables the layer — with the shared enable-fetch rule —
+/// selects it, and closes the catalog.**
 #[test]
 fn an_overlay_tile_enables_the_layer_and_selects_it() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -10364,8 +8166,8 @@ fn an_overlay_tile_enables_the_layer_and_selects_it() {
     );
 }
 
-/// 67c. **An HRRR tile enables the model layer and sets the parameter
-///      through the handler's own control route.**
+/// 67c. **An HRRR tile enables the model layer and sets the parameter through the
+/// handler's own control route.**
 #[test]
 fn an_hrrr_tile_enables_the_model_layer_and_sets_the_parameter() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -10395,8 +8197,6 @@ fn an_hrrr_tile_enables_the_model_layer_and_sets_the_parameter() {
         Some(crate::ui::InspectorSelection::Layer(known::MODEL_DATA)),
         "the model layer's options must be selected"
     );
-    // The parameter landed in the handler the inspector now shows: the
-    // dropdown's own model says so.
     let (_, selected) = h
         .dropdown_model("Parameter")
         .expect("the model layer's body offers the parameter dropdown");
@@ -10406,24 +8206,20 @@ fn an_hrrr_tile_enables_the_model_layer_and_sets_the_parameter() {
     );
 }
 
-/// **Presets: saving captures the view, the tile appears, applying
-/// reproduces the capture, deleting removes it** (§3.11).
+/// **Presets: saving captures the view, the tile appears, applying reproduces the
+/// capture, deleting removes it** (§3.11).
 #[test]
 fn a_saved_preset_appears_applies_and_deletes() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.load_scan("KTLX");
-    // Sync off, so what apply writes per pane is what this test observes —
-    // not what the sync pass copied a frame later.
     h.set_layer_links(false);
 
-    // A distinctive view: two panes, velocity on the first, storm reports on.
     h.set_pane_count(2);
     h.gui_mut().pane_mut(0).expect("pane 0").selected_product =
         rustdar_radar::types::RadarProduct::Velocity;
     h.set_overlay_on_pane(0, &known::STORM_REPORTS, true);
     h.warm_up();
 
-    // Save it under a name.
     h.open_catalog();
     h.mouse_click(h.catalog().save_tile.center());
     h.warm_up();
@@ -10450,7 +8246,6 @@ fn a_saved_preset_appears_applies_and_deletes() {
         "a built-in tile must offer no delete"
     );
 
-    // Wreck the view, then apply: the capture must come back.
     h.set_pane_count(1);
     h.gui_mut().pane_mut(0).expect("pane 0").selected_product =
         rustdar_radar::types::RadarProduct::Reflectivity;
@@ -10478,7 +8273,6 @@ fn a_saved_preset_appears_applies_and_deletes() {
         "the preset's overlay set must land on every pane"
     );
 
-    // Delete removes the tile and the stored preset.
     h.open_catalog();
     let tile = h
         .catalog_tile(crate::ui::CatalogGroup::Presets, "Chase day")
@@ -10496,8 +8290,8 @@ fn a_saved_preset_appears_applies_and_deletes() {
     );
 }
 
-/// **Escape closes the catalog before anything beneath it** — the §3.4 slot,
-/// as amended: after the ☰ dropdown, before the feature and time dialogs.
+/// **Escape closes the catalog before anything beneath it** — the §3.4 slot, as
+/// amended: after the ☰ dropdown, before the feature and time dialogs.
 #[test]
 fn a_back_press_closes_the_catalog_first() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -10514,19 +8308,14 @@ fn a_back_press_closes_the_catalog_first() {
 
     assert!(h.gui_mut().dismiss_top_layer(), "the dialog is still open");
     h.warm_up();
-    // The second dismissal reached the layer beneath — the time dialog.
     assert!(
         !h.text_painted_in(h.screen_rect(), "Select Time"),
         "the second dismissal must take the time dialog"
     );
 }
 
-/// **The Data & live rows and the ☰ menu toggles read one field** — flipping
-/// either side moves the other, because there is only one thing to move.
-///
-/// The state is observed through `ui_config_json`, which serialises the flag
-/// itself — `auto_poll_delay` cannot see it, because an enabled layer's own
-/// refresh keeps that answer non-`None` regardless.
+/// **The Data & live rows and the ☰ menu toggles read one field** — flipping either
+/// side moves the other, because there is only one thing to move.
 #[test]
 fn the_data_and_live_rows_share_state_with_the_menu_toggles() {
     fn radar_auto_poll(h: &mut InputHarness) -> bool {
@@ -10539,18 +8328,12 @@ fn the_data_and_live_rows_share_state_with_the_menu_toggles() {
     h.open_settings();
     assert!(radar_auto_poll(&mut h), "precondition: auto-poll starts on");
 
-    // The row sits far down the settings body: scroll it on screen the way a
-    // user does, let the smooth-scroll animation settle, then click the
-    // checkbox by its own painted label.
     let scroll_pos = h.inspector_rect().expect("the inspector is open").center();
     let found = h.scroll_until(scroll_pos, egui::vec2(0.0, -160.0), 120, |h| {
         h.settings_row("data.auto_poll")
             .is_some_and(|row| h.screen_rect().contains(row.rect.center()))
     });
     assert!(found, "the auto-poll row never scrolled on screen");
-    // The row's probe rect is recorded even while the scroll clip still
-    // hides the widget, so drain the smooth-scroll animation with real time
-    // and nudge until the checkbox itself is painted before clicking it.
     h.frames_for(10, 0.05);
     let found = h.scroll_until(scroll_pos, egui::vec2(0.0, -40.0), 40, |h| {
         h.painted_text_rects()
@@ -10572,7 +8355,6 @@ fn the_data_and_live_rows_share_state_with_the_menu_toggles() {
         "the settings checkbox must write the flag the menu reads"
     );
 
-    // The menu's toggle shows the same state — one field, two routes...
     h.open_menu();
     let leaf = h.menu_leaf("Auto-poll").expect("the menu still offers it");
     assert_eq!(
@@ -10581,8 +8363,6 @@ fn the_data_and_live_rows_share_state_with_the_menu_toggles() {
         "the menu's checkbox must reflect the settings row's write"
     );
 
-    // ...and writes it too: flipping it back through the menu is what the
-    // settings row reads next frame.
     h.mouse_click(leaf.rect.center());
     h.warm_up();
     assert!(
@@ -10591,14 +8371,12 @@ fn the_data_and_live_rows_share_state_with_the_menu_toggles() {
     );
 }
 
-/// **Row 2's closing caption states this platform's frame budget and the
-/// unlink hint** (§5.9 carried into M4) — the number is the frontend's push
+/// **Row 2's closing caption states this platform's frame budget and the unlink
+/// hint** (§5.9 carried into M4) — the number is the frontend's push
 /// (`set_loop_frame_budget`), never a guess from the width.
 #[test]
 fn the_timeline_row2_caption_states_the_pushed_frame_budget() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    // A deliberately non-default budget, so a caption printing the default
-    // could not pass by coincidence.
     h.set_loop_frame_budget(12);
     h.mouse_click(h.timeline().expander.center());
     h.warm_up();
@@ -10623,15 +8401,8 @@ fn the_timeline_row2_caption_states_the_pushed_frame_budget() {
 }
 
 /// **The caption states the running loop's own time span, ahead of the standing
-/// budget** — the whole point being that a frame count says nothing about how
-/// much weather a user is actually looking at.
-///
-/// End to end through the real transport, because the clause is gated on the
-/// active pane's loop being *active*: single-frame mode keeps the current
-/// picture in `frames` too, and no unit test can catch an ungated caption
-/// having a static pane announce "This loop is 1 frame".
-///
-/// The frames are an hour of WSR-88D precip at the measured 259 s cadence.
+/// budget** — the whole point being that a frame count says nothing about how much
+/// weather a user is actually looking at.
 #[test]
 fn the_timeline_row2_caption_states_the_running_loops_span_and_fidelity() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -10643,10 +8414,6 @@ fn the_timeline_row2_caption_states_the_running_loops_span_and_fidelity() {
             rustdar_radar::types::RenderView::PlanView,
         );
         pane.loop_state.phase = crate::pane::LoopPhase::Playing;
-        // What `accept_scan_listing` records for a listing that fitted the cap
-        // whole: the site's own cadence, and the sampler's answer that it threw
-        // nothing away. The fidelity claim is made from the second — the first
-        // only supplies the figure the sampled phrasing quotes.
         pane.loop_state.listing_sampled = Some(false);
         pane.loop_state.scan_step_secs = Some(259);
         let base = written_ago(60);
@@ -10677,13 +8444,10 @@ fn the_timeline_row2_caption_states_the_running_loops_span_and_fidelity() {
     );
 }
 
-// ── M5: pane pills, popovers and the armed hint ─────────────────────────
-
 use crate::ui::PillKind;
 
-/// A wide two-pane harness with the layers panel closed, so pane 0's pill
-/// row is not under the floating stack — the state every pill test drives
-/// from.
+/// A wide two-pane harness with the layers panel closed, so pane 0's pill row is
+/// not under the floating stack — the state every pill test drives from.
 fn pill_harness() -> InputHarness {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.set_pane_count(2);
@@ -10691,23 +8455,14 @@ fn pill_harness() -> InputHarness {
     h
 }
 
-/// 73a. **A click on a pill is never a map click — and its popover opens
-///      anchored to the pill.**
-///
-///      Layer-based, per plan §3.3's resolution: the pills are egui `Area`s
-///      above `Order::Background`, so the click gate every map resolver runs
-///      (`filter_dialog_blocked` / `is_pos_blocked`) drops the position with
-///      no excluded-rect plumbing. Staged with a radar-site icon placed
-///      exactly under the site pill: without the layer the click would
-///      switch the site, and with it the only thing that may happen is the
-///      pill's own activate plus its popover.
+/// 73a. **A click on a pill is never a map click — and its popover opens anchored
+/// to the pill.**
 #[test]
 fn a_pill_click_never_reaches_the_map_and_its_popover_anchors() {
     let mut h = pill_harness();
     h.gui_mut().enable_overlay_for_test(&known::RADAR_SITES);
     h.warm_up();
 
-    // Pane 1 active, so the pill's own activate is observable.
     h.mouse_click(h.pane_rects()[1].center());
     assert_eq!(h.active_pane_index(), 1, "precondition: pane 1 is active");
 
@@ -10743,7 +8498,6 @@ fn a_pill_click_never_reaches_the_map_and_its_popover_anchors() {
 
     let popover = h.pill_popover().expect("the site pill's popover opened");
     assert_eq!((popover.pane_idx, popover.pill), (0, PillKind::Site));
-    // Anchored to its pill: directly under it, horizontally overlapping.
     assert!(
         (popover.rect.top() - pill.bottom()).abs() < 24.0
             && popover.rect.left() < pill.right()
@@ -10758,19 +8512,12 @@ fn a_pill_click_never_reaches_the_map_and_its_popover_anchors() {
 }
 
 /// 73b. **A dim row still hit-tests: on touch the first tap reveals and is
-///      swallowed, the second acts — and a confirmed map tap elsewhere puts
-///      the row back to sleep.**
-///
-///      Opacity is `Ui::set_opacity`, painting only — that is what makes a
-///      dim row reachable at all. The swallowed tap must have *no* pill
-///      effect: no popover, no activation. The reveal is per pane and ends
-///      with the gesture that means "I am working the map again".
+/// swallowed, the second acts — and a confirmed map tap elsewhere puts the row back
+/// to sleep.**
 #[test]
 fn a_dim_rows_first_touch_tap_reveals_and_swallows() {
     let mut h = pill_harness();
 
-    // Latch touch modality with a tap on the map of pane 1 — which also
-    // makes pane 1 active, so pane 0's row has an activation to swallow.
     h.touch_tap(h.pane_rects()[1].center());
     h.frames_for(10, 0.05);
     assert_eq!(h.active_pane_index(), 1, "precondition: pane 1 is active");
@@ -10799,7 +8546,6 @@ fn a_dim_rows_first_touch_tap_reveals_and_swallows() {
         "the revealing tap is swallowed: it must not activate the pane either"
     );
 
-    // The second tap acts: popover open, pane active.
     let (_, pill) = h.pill(0, PillKind::Site).expect("still drawn");
     h.touch_tap(pill.center());
     h.frames_for(2, 0.05);
@@ -10807,8 +8553,6 @@ fn a_dim_rows_first_touch_tap_reveals_and_swallows() {
     let popover = h.pill_popover().expect("the second tap opens the popover");
     assert_eq!((popover.pane_idx, popover.pill), (0, PillKind::Site));
 
-    // Close the popover with a tap on pane 0's own map, far from the row —
-    // a confirmed map tap, which also ends the reveal.
     let map_spot = h.pane_rects()[0].center();
     h.touch_tap(map_spot);
     h.frames_for(12, 0.05);
@@ -10822,20 +8566,13 @@ fn a_dim_rows_first_touch_tap_reveals_and_swallows() {
     );
 }
 
-/// 73c. **"Pin pane controls" forces the rows to full opacity — through the
-///      real settings row, and persisted.**
-///
-///      Driven the user's way: the Interface section's checkbox in the
-///      inspector's App › Settings body. The parity walk covers the row's
-///      presence; this pins what it does and that `ui_config_json` carries
-///      it.
+/// 73c. **"Pin pane controls" forces the rows to full opacity — through the real
+/// settings row, and persisted.**
 #[test]
 fn pin_pane_controls_forces_full_opacity_and_persists() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.close_layers();
 
-    // Control: pointer parked on the top bar — outside every pane — leaves
-    // the row dim.
     h.mouse_move(egui::pos2(700.0, 12.0));
     h.frames_for(2, FRAME_DT);
     assert!(
@@ -10852,9 +8589,6 @@ fn pin_pane_controls_forces_full_opacity_and_persists() {
             .is_some_and(|row| h.screen_rect().contains(row.rect.center()))
     });
     assert!(found, "the Interface row never scrolled on screen");
-    // Drain the smooth-scroll animation with real time and require the
-    // painted checkbox itself — the row's probe rect is recorded even while
-    // the scroll clip still hides the widget.
     h.frames_for(10, 0.05);
     let found = h.scroll_until(scroll_pos, egui::vec2(0.0, -40.0), 40, |h| {
         h.painted_text_rects()
@@ -10879,7 +8613,6 @@ fn pin_pane_controls_forces_full_opacity_and_persists() {
         "pinned, the row must draw at full opacity with no hover at all"
     );
 
-    // Persisted, so the preference survives the session.
     let json = h.gui_mut().ui_config_json().expect("serialises");
     let value: serde_json::Value = serde_json::from_str(&json).expect("parses");
     assert_eq!(
@@ -10889,17 +8622,14 @@ fn pin_pane_controls_forces_full_opacity_and_persists() {
     );
 }
 
-/// 73d. **The site pill's popover searches the one site list and a pick
-///      emits the map icon's own `SwitchRadarSite`.**
+/// 73d. **The site pill's popover searches the one site list and a pick emits the
+/// map icon's own `SwitchRadarSite`.**
 #[test]
 fn the_site_pill_popover_searches_and_switches() {
     let mut h = pill_harness();
 
     let (_, pill) = h.pill(0, PillKind::Site).expect("the site pill is drawn");
     h.mouse_click(pill.center());
-    // The popup's debut frame only registers it; its widgets are clickable
-    // from the next frame — the same "areas need a frame" rule the whole
-    // harness warms up for.
     h.frame();
     let popover = h.pill_popover().expect("the popover opened");
     let search = popover.search.expect("with its search field");
@@ -10934,8 +8664,8 @@ fn the_site_pill_popover_searches_and_switches() {
     assert!(h.pill_popover().is_none(), "a pick closes the popover");
 }
 
-/// 73e. **The product and tilt popovers offer the combos' own lists, and a
-///      pick writes the pane — with the product pick resetting the tilt.**
+/// 73e. **The product and tilt popovers offer the combos' own lists, and a pick
+/// writes the pane — with the product pick resetting the tilt.**
 #[test]
 fn the_product_and_tilt_pill_popovers_write_the_pane() {
     let mut h = pill_harness();
@@ -10944,7 +8674,6 @@ fn the_product_and_tilt_pill_popovers_write_the_pane() {
     h.offer_product(0, rustdar_radar::types::RadarProduct::Reflectivity, 1.5);
     h.close_layers();
 
-    // -- product --
     let (code, pill) = h.pill(0, PillKind::Product).expect("a product pill");
     assert_eq!(code, "REF", "the pill shows the product code");
     h.gui_mut().pane_mut(0).expect("pane 0").selected_elevation = 1.5;
@@ -10976,7 +8705,6 @@ fn the_product_and_tilt_pill_popovers_write_the_pane() {
         );
     }
 
-    // -- tilt, back on reflectivity where two angles are offered --
     h.select_product(0, rustdar_radar::types::RadarProduct::Reflectivity);
     let (_, pill) = h
         .pill(0, PillKind::Tilt)
@@ -11002,16 +8730,9 @@ fn the_product_and_tilt_pill_popovers_write_the_pane() {
     );
 }
 
-/// 73f. **The Sync pill's popover is the per-pane five-row section: the
-///      three link checkboxes flip this pane's own fields, the two action
-///      rows ride under them, and the honest unlink sentence is on screen.**
-///
-///      M11's model: "Sync viewport" is this pane's `viewport_link`, "Sync
-///      layers" its `layer_link`, "Sync time" its `time_link` — no globals
-///      left to flip — with `UNLINK_NOTE` on screen. Each flip is asserted
-///      against the real per-pane field, from the popover, through real
-///      clicks, on a pane whose *siblings'* links must not move; the pill's
-///      own text marks any unlinked dimension distinctly, whichever it is.
+/// 73f. **The Sync pill's popover is the per-pane five-row section: the three link
+/// checkboxes flip this pane's own fields, the two action rows ride under them, and
+/// the honest unlink sentence is on screen.**
 #[test]
 fn the_sync_pill_popover_flips_all_three_per_pane_links() {
     let mut h = pill_harness();
@@ -11040,8 +8761,6 @@ fn the_sync_pill_popover_flips_all_three_per_pane_links() {
         ],
         "the five-row per-pane section's honest labels"
     );
-    // The shared honesty sentence — `ui_pills::UNLINK_NOTE`, rendered by the
-    // one `sync_section_ui` both routes share — is on screen with the choice.
     assert!(
         h.painted_text_strings()
             .iter()
@@ -11049,8 +8768,6 @@ fn the_sync_pill_popover_flips_all_three_per_pane_links() {
         "the popover must carry the honest unlink caption"
     );
 
-    // Sync viewport: this pane's own link, popover stays up. The `⊗`
-    // marks the pill for *any* unlinked dimension, not just time.
     h.mouse_click(popover.rows[0].1.center());
     h.frame();
     {
@@ -11070,7 +8787,6 @@ fn the_sync_pill_popover_flips_all_three_per_pane_links() {
         "the pill must mark an unlinked viewport distinctly"
     );
 
-    // Sync layers: this pane's own link.
     let popover = h.pill_popover().expect("the popover stays up for toggles");
     h.mouse_click(popover.rows[1].1.center());
     h.frame();
@@ -11086,7 +8802,6 @@ fn the_sync_pill_popover_flips_all_three_per_pane_links() {
         );
     }
 
-    // Sync time: this pane's own link.
     let popover = h.pill_popover().expect("still up");
     h.mouse_click(popover.rows[2].1.center());
     h.warm_up();
@@ -11108,36 +8823,12 @@ fn the_sync_pill_popover_flips_all_three_per_pane_links() {
     );
 }
 
-/// 73i. **A pane in the 3D view is offered no viewport link, at either route
-///      — and a plan-view pane still is.**
-///
-///      `sync_viewports` has always skipped a pane with no plan view at both
-///      ends, so the *behaviour* was right; what was wrong was that the sync
-///      section went on drawing the pane a "Sync viewport" checkbox, which
-///      could be ticked and did nothing. `PaneState::shares_viewport` is the
-///      decision now, with its reasons written down: as a link target a 3D
-///      pane would resample its whole box every time a neighbour's wheel
-///      turned, and a plan view zoomed to street level would drive the box
-///      through the floor.
-///
-///      Both halves are asserted here, because the absent half alone passes on
-///      a section that offers nobody anything: the row is **present** on a
-///      plan-view pane and **absent** on a 3D one, with the other two links
-///      still on offer there — the pane sits out one dimension, it does not
-///      leave the group.
-///
-///      Both routes, too. They are one function (`pills::sync_section_ui`), so
-///      this would be belt and braces if the popover and the inspector could
-///      not drift — the whole point of the shared function is that they
-///      cannot, and the way to keep it that way is to ask both.
-///
-///      The last leg is the persistence rule: an unlinked pane switched to 3D
-///      and back finds its link exactly as it left it. The setting is kept and
-///      inert, never cleared, so a reopen is the screen the user left.
+/// 73i. **A pane in the 3D view is offered no viewport link, at either route — and
+/// a plan-view pane still is.**
 #[test]
 fn a_3d_pane_is_offered_no_viewport_link_at_either_route() {
-    /// The sync section's rows as the inspector's Pane-properties body drew
-    /// them, labels only.
+    /// The sync section's rows as the inspector's Pane-properties body drew them,
+    /// labels only.
     fn inspector_rows(h: &mut InputHarness) -> Vec<String> {
         h.open_pane_props();
         h.inspector()
@@ -11147,9 +8838,7 @@ fn a_3d_pane_is_offered_no_viewport_link_at_either_route() {
             .collect()
     }
 
-    /// The same section as the Sync pill's popover drew it. The panels come
-    /// down first: both of them sit over the map's top-left corner, which is
-    /// where pane 0's pill row is, and a click through them reaches the panel.
+    /// The same section as the Sync pill's popover drew it.
     fn popover_rows(h: &mut InputHarness) -> Vec<String> {
         h.close_inspector();
         h.close_layers();
@@ -11168,13 +8857,10 @@ fn a_3d_pane_is_offered_no_viewport_link_at_either_route() {
         rows
     }
 
-    // The section's own inventory, in draw order — the same constant the
-    // parity walk drives, so a renamed label cannot make this test vacuous.
     let [viewport, layers, time, _, _] = crate::ui::SYNC_SECTION_LABELS.map(ToOwned::to_owned);
 
     let mut h = pill_harness();
 
-    // -- a plan-view pane is offered it, at both routes --
     assert!(
         popover_rows(&mut h).contains(&viewport),
         "precondition: a map pane's Sync popover offers the viewport link, \
@@ -11185,11 +8871,9 @@ fn a_3d_pane_is_offered_no_viewport_link_at_either_route() {
         "precondition: a map pane's inspector offers the viewport link"
     );
 
-    // Unlinked before the conversion, so the last leg has something to lose.
     h.gui_mut().pane_mut(0).expect("pane 0").viewport_link = false;
     h.warm_up();
 
-    // -- a 3D pane is not, at either route, and keeps the other two --
     h.make_pane_volume(0);
     for (route, rows) in [
         ("the Sync pill's popover", popover_rows(&mut h)),
@@ -11210,8 +8894,6 @@ fn a_3d_pane_is_offered_no_viewport_link_at_either_route() {
     h.close_layers();
     h.warm_up();
 
-    // The pill stops wearing the ⊗ for a dimension its own popover does not
-    // offer: the pane is fully linked as far as anything it can join goes.
     let (label, _) = h.pill(0, PillKind::Link).expect("still drawn");
     assert_eq!(
         label, "Sync",
@@ -11219,7 +8901,6 @@ fn a_3d_pane_is_offered_no_viewport_link_at_either_route() {
          offered and does not take part in"
     );
 
-    // -- and the stored setting is kept, not cleared --
     assert!(
         !h.gui_mut().pane(0).expect("pane 0").viewport_link,
         "the conversion cleared the stored link instead of leaving it inert"
@@ -11236,21 +8917,14 @@ fn a_3d_pane_is_offered_no_viewport_link_at_either_route() {
     );
 }
 
-/// 73h. **The popover's two action rows do exactly what they say: match-all
-///      copies this pane's viewport to every map pane and leaves the links
-///      alone; re-link-all makes that copy and turns all three links back on
-///      for every visible pane.**
-///
-///      Driven from pane 1's popover with pane 0 deliberately unlinked and
-///      parked at a different zoom, so both halves are observable: the copy
-///      reaching an *unlinked* pane (it is a one-shot override, not a group
-///      write), and the links either staying put or coming back on.
+/// 73h. **The popover's two action rows do exactly what they say: match-all copies
+/// this pane's viewport to every map pane and leaves the links alone; re-link-all
+/// makes that copy and turns all three links back on for every visible pane.**
 #[test]
 fn the_sync_popover_action_rows_match_and_relink_the_grid() {
     let moved_to = 7.0;
     let mut h = pill_harness();
 
-    // Pane 0: everything unlinked, viewport somewhere else.
     {
         let gui = h.gui_mut();
         let pane = gui.pane_mut(0).expect("pane 0");
@@ -11260,8 +8934,6 @@ fn the_sync_popover_action_rows_match_and_relink_the_grid() {
     }
     h.warm_up();
 
-    // Pane 1's viewport is the one to match. Set after the warm-up so no
-    // frame's own sync pass is what converged anything.
     {
         let gui = h.gui_mut();
         gui.pane_mut(1)
@@ -11276,7 +8948,6 @@ fn the_sync_popover_action_rows_match_and_relink_the_grid() {
         );
     }
 
-    // Match all panes to this view, from pane 1's popover.
     let (_, pill) = h.pill(1, PillKind::Link).expect("pane 1's Sync pill");
     h.mouse_click(pill.center());
     h.frame(); // the popup's debut frame only registers it
@@ -11299,8 +8970,6 @@ fn the_sync_popover_action_rows_match_and_relink_the_grid() {
         );
     }
 
-    // Park pane 0 elsewhere again — with its viewport unlinked, nothing
-    // holds it — then Re-link all here from pane 1.
     h.warm_up();
     h.gui_mut()
         .pane_mut(0)
@@ -11340,9 +9009,9 @@ fn the_sync_popover_action_rows_match_and_relink_the_grid() {
     );
 }
 
-/// 73g. **The kind pill's popover converts through the deferred applier —
-///      pending on the pick frame, converted the next — and choosing an
-///      unaimed cross-section arms the draw, matching the inspector.**
+/// 73g. **The kind pill's popover converts through the deferred applier — pending
+/// on the pick frame, converted the next — and choosing an unaimed cross-section
+/// arms the draw, matching the inspector.**
 #[test]
 fn the_kind_pill_popover_converts_next_frame_and_arms_the_unaimed_section() {
     let mut h = pill_harness();
@@ -11362,7 +9031,6 @@ fn the_kind_pill_popover_converts_next_frame_and_arms_the_unaimed_section() {
         "the popover offers the inspector's own three kinds"
     );
 
-    // 3D Volume: recorded as pending on the pick frame, applied the next.
     h.mouse_click(popover.rows[1].1.center());
     assert_eq!(
         h.gui_mut().pending_pane_view_for_test(),
@@ -11387,8 +9055,6 @@ fn the_kind_pill_popover_converts_next_frame_and_arms_the_unaimed_section() {
         "a non-map pane offers no tilt pill"
     );
 
-    // Cross-section with no line: the pick arms the draw, as the
-    // inspector's segmented row does.
     assert!(
         !h.section_draw_armed(),
         "precondition: the draw starts unarmed"
@@ -11410,17 +9076,11 @@ fn the_kind_pill_popover_converts_next_frame_and_arms_the_unaimed_section() {
 }
 
 /// **The armed-tool hint chip sits on the active map pane, and only there.**
-///
-/// While X-sec is armed, the active map pane paints the centred dashed chip
-/// naming the drag — painter only, so it is asserted through the painted
-/// text. It follows the active pane and vanishes with the arm — and a non-map
-/// active pane gets none, because the drag it explains only exists on a map.
 #[test]
 fn the_armed_hint_chip_follows_the_active_map_pane() {
     let mut h = pill_harness();
     let panes = h.pane_rects();
 
-    // Arm the section draw the user's way: the top bar toggle.
     let (section_toggle, armed) = h.top_bar().section_arm;
     assert!(!armed, "precondition: the section draw starts unarmed");
     h.mouse_click(section_toggle.center());
@@ -11437,13 +9097,11 @@ fn the_armed_hint_chip_follows_the_active_map_pane() {
         "an inactive pane must not paint the chip"
     );
 
-    // The chip follows the active pane.
     h.mouse_click(panes[1].center());
     h.warm_up();
     assert!(!h.text_painted_in(panes[0], &hint));
     assert!(h.text_painted_in(panes[1], &hint));
 
-    // Disarming takes the chip with it.
     let (section_toggle, _) = h.top_bar().section_arm;
     h.mouse_click(section_toggle.center());
     h.warm_up();
@@ -11452,8 +9110,6 @@ fn the_armed_hint_chip_follows_the_active_map_pane() {
         "the chip must vanish when the arm does"
     );
 
-    // A non-map active pane paints none: the drag the chip explains needs a
-    // projector, and the pane has none.
     h.make_pane_volume(1);
     h.mouse_click(h.top_bar().section_arm.0.center());
     h.warm_up();
@@ -11463,12 +9119,8 @@ fn the_armed_hint_chip_follows_the_active_map_pane() {
     );
 }
 
-/// **The `click_consumed` probe: a feature that answers a map click sets it;
-/// a click on bare map does not.**
-///
-/// The consumption half of the fade trigger (`ui_fade.rs`), plumbed so
-/// every consumer inherits the convention — asserted through the radar-site icon, the
-/// consumer a test can stage without overlay data.
+/// **The `click_consumed` probe: a feature that answers a map click sets it; a
+/// click on bare map does not.**
 #[test]
 fn a_consumed_map_click_reports_itself_and_a_bare_one_does_not() {
     let mut h = InputHarness::new();
@@ -11499,11 +9151,8 @@ fn a_consumed_map_click_reports_itself_and_a_bare_one_does_not() {
     );
 }
 
-/// **Saving a user preset under a built-in's name is refused, with the
-/// reason inline** (§5.9 carried from the M4 review).
-///
-/// A user "Severe Wx" would put two identical tiles on screen with only one
-/// deletable. The refusal disables Save and says why; nothing is stored.
+/// **Saving a user preset under a built-in's name is refused, with the reason
+/// inline** (§5.9 carried from the M4 review).
 #[test]
 fn a_user_preset_cannot_shadow_a_builtin_name() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -11543,10 +9192,9 @@ fn a_user_preset_cannot_shadow_a_builtin_name() {
     );
 }
 
-/// **The save tile hides while the search is filtering** (§5.9 pinned rule):
-/// the search is for finding tiles, and a save offer matching the query
-/// would be the one tile that is not a result. The open name editor hides
-/// with it.
+/// **The save tile hides while the search is filtering** (§5.9 pinned rule): the
+/// search is for finding tiles, and a save offer matching the query would be the
+/// one tile that is not a result.
 #[test]
 fn the_save_tile_hides_while_searching() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -11578,9 +9226,9 @@ fn the_save_tile_hides_while_searching() {
     );
 }
 
-/// **Applying a preset queues at most one fetch per overlay kind** (§5.9
-/// pinned rule): the handlers are global, so one fetch serves every pane
-/// the preset enabled a layer on — four panes must not mean four downloads.
+/// **Applying a preset queues at most one fetch per overlay kind** (§5.9 pinned
+/// rule): the handlers are global, so one fetch serves every pane the preset
+/// enabled a layer on — four panes must not mean four downloads.
 #[test]
 fn a_preset_apply_queues_one_fetch_per_kind() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -11609,16 +9257,6 @@ fn a_preset_apply_queues_one_fetch_per_kind() {
 }
 
 /// **A mid-session pane growth leaves the open stack above every pill row.**
-///
-/// egui auto-tops every area on its debut frame (`!visible_last_frame`), so
-/// the rows a pane-count growth debuts — the top bar's Panes segment here;
-/// a preset apply and a drawn section line grow the grid the same way —
-/// would land above the open panels if the pills pass' raise were a spent
-/// one-shot, and stay there until the user happened to click the panel. The
-/// pass re-arms its deferred raise on every debut instead (`ui_pills.rs`'s
-/// stacking note). Asserted through `layer_id_at` — the authority every
-/// click resolver consults — at points where the stack and a row really
-/// overlap.
 #[test]
 fn a_pane_growth_keeps_the_open_stack_above_the_pill_rows() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -11638,7 +9276,6 @@ fn a_pane_growth_keeps_the_open_stack_above_the_pill_rows() {
         "control: the startup raise already holds the stack above row 0"
     );
 
-    // Grow the grid under the open stack, the user's way.
     let four = h
         .pane_options()
         .iter()
@@ -11649,8 +9286,6 @@ fn a_pane_growth_keeps_the_open_stack_above_the_pill_rows() {
     h.warm_up();
     assert_eq!(h.pane_count(), 4, "precondition: the grid really grew");
 
-    // Re-read rather than reused: the growth reflows nothing about the
-    // stack today, but the claim is about where it stands *now*.
     let stack = h.layers_panel_rect().expect("the stack is still open");
     for row in h.pill_rows() {
         let overlap = stack.intersect(row.rect);
@@ -11664,8 +9299,6 @@ fn a_pane_growth_keeps_the_open_stack_above_the_pill_rows() {
             row.pane_idx
         );
     }
-    // The loop must not have passed vacuously: the debuting bottom-left
-    // pane's row lands under the stack's lower half in this layout.
     let row2 = h.pill_row(2).expect("pane 2 draws a pill row").rect;
     assert!(
         stack.intersect(row2).is_positive(),
@@ -11675,10 +9308,6 @@ fn a_pane_growth_keeps_the_open_stack_above_the_pill_rows() {
 }
 
 /// **The same growth leaves the open inspector above the debuting row.**
-///
-/// The stack test's twin for the other panel the debut would sink: at
-/// 1020pt — barely Expanded — the inspector's left edge reaches past the
-/// map's midline, so the second pane's debuting row lands under it.
 #[test]
 fn a_pane_growth_keeps_the_open_inspector_above_the_pill_rows() {
     let mut h = InputHarness::with_screen(egui::vec2(1020.0, 900.0));
@@ -11711,10 +9340,9 @@ fn a_pane_growth_keeps_the_open_inspector_above_the_pill_rows() {
     );
 }
 
-/// **Saving under an existing user preset's name replaces it, whatever the
-/// casing** — the same case-insensitivity the built-in refusal keeps, and
-/// for the same reason: "storm" and "Storm" would be two tiles a glance
-/// cannot tell apart. The replacement takes the newly typed casing.
+/// **Saving under an existing user preset's name replaces it, whatever the casing**
+/// — the same case-insensitivity the built-in refusal keeps, and for the same
+/// reason: "storm" and "Storm" would be two tiles a glance cannot tell apart.
 #[test]
 fn saving_a_preset_under_an_existing_name_replaces_it_case_insensitively() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -11765,11 +9393,7 @@ fn saving_a_preset_under_an_existing_name_replaces_it_case_insensitively() {
     assert_eq!(tiles.len(), 1, "exactly one tile carries the name");
 }
 
-// ── The phone shell: bottom bar and sheet ────────────────────────────
-
-/// A phone-sized harness: the Compact shell with the bottom bar and the
-/// sheet. Tall, like the drawer fixture, so sheet pages have room to lay
-/// their content out on screen.
+/// A phone-sized harness: the Compact shell with the bottom bar and the sheet.
 fn phone() -> InputHarness {
     let h = InputHarness::with_screen(egui::vec2(420.0, 1400.0));
     assert_eq!(
@@ -11781,8 +9405,7 @@ fn phone() -> InputHarness {
 }
 
 /// An overlay item whose details page is a fixed stub — how a test opens the
-/// sheet's Feature page without staging a real alert under a map click. The
-/// concrete items are `pub(crate)` to `rustdar-overlays`; the trait is not.
+/// sheet's Feature page without staging a real alert under a map click.
 #[derive(Debug)]
 struct SheetStubFeature;
 
@@ -11812,24 +9435,13 @@ impl rustdar_overlays::render::overlay_state::OverlayItem for SheetStubFeature {
     }
 }
 
-/// 64. **A bar item tap switches to its page; the shown page's item closes
-///     the sheet whole.**
-///
-///     Revised by the second user test, whose report is authoritative: the
-///     old projection-pop semantics stacked the bar's pages, so Layers →
-///     Pane → Pane-again *revealed Layers* — a basic element behaving
-///     wrongly. The bar never stacks its own four pages now: a switch
-///     clears every other bar page's flag, and the shown page's item
-///     closes the sheet entirely. Pane and App are both the Inspector page
-///     and differ only in the selection they assert, so switching between
-///     them changes the body without closing the sheet — and "same item"
-///     for them means "same body".
+/// 64. **A bar item tap switches to its page; the shown page's item closes the
+/// sheet whole.**
 #[test]
 fn a_bar_item_switches_pages_and_the_shown_pages_item_closes_the_sheet() {
     let mut h = phone();
     assert_eq!(h.sheet().page, None, "a fresh session's sheet is closed");
 
-    // Layers opens its page, highlighted.
     h.mouse_click(h.bottom_bar().layers.0.center());
     h.warm_up();
     assert_eq!(h.sheet().page, Some(crate::ui::SheetPage::Layers));
@@ -11838,7 +9450,6 @@ fn a_bar_item_switches_pages_and_the_shown_pages_item_closes_the_sheet() {
         "the open page's item must highlight"
     );
 
-    // A different item switches pages — exclusively, no stacking.
     h.mouse_click(h.bottom_bar().pane.0.center());
     h.warm_up();
     assert_eq!(h.sheet().page, Some(crate::ui::SheetPage::Inspector));
@@ -11852,8 +9463,6 @@ fn a_bar_item_switches_pages_and_the_shown_pages_item_closes_the_sheet() {
         "the highlight must follow the page on top"
     );
 
-    // The user's exact sequence: the Pane item again closes the SHEET —
-    // never the stale Layers page the old stacking fell through to.
     h.mouse_click(h.bottom_bar().pane.0.center());
     h.warm_up();
     assert_eq!(
@@ -11863,8 +9472,6 @@ fn a_bar_item_switches_pages_and_the_shown_pages_item_closes_the_sheet() {
          to the Layers page is the second user test's exact bug"
     );
 
-    // App is the same page as Pane under a different selection: the body
-    // switches, the sheet stays.
     h.mouse_click(h.bottom_bar().pane.0.center());
     h.warm_up();
     h.mouse_click(h.bottom_bar().app.0.center());
@@ -11880,12 +9487,10 @@ fn a_bar_item_switches_pages_and_the_shown_pages_item_closes_the_sheet() {
         "same page, but the highlight follows the selection"
     );
 
-    // And the App item again closes the sheet, straight to the map.
     h.mouse_click(h.bottom_bar().app.0.center());
     h.warm_up();
     assert_eq!(h.sheet().page, None, "the App item's second tap closes it");
 
-    // The Menu item follows the same contract.
     h.mouse_click(h.bottom_bar().menu.0.center());
     h.warm_up();
     assert_eq!(h.sheet().page, Some(crate::ui::SheetPage::Menu));
@@ -11907,10 +9512,6 @@ fn a_bar_item_switches_pages_and_the_shown_pages_item_closes_the_sheet() {
 }
 
 /// M9-9. **Bar items stack their icon above their label.**
-///
-///     The demo's vertical stack, per the second user test: each of the four
-///     items paints its glyph on top and its name under it, both centred in
-///     the one click target — a side-by-side layout passes none of these.
 #[test]
 fn bar_items_stack_icon_above_label() {
     let mut h = phone();
@@ -11928,7 +9529,6 @@ fn bar_items_stack_icon_above_label() {
             "{which}'s label and icon are not stacked on one centre line"
         );
     }
-    // The stacks live inside their own item's click target.
     for (which, (item, (icon, label))) in ["Menu", "Layers", "Pane", "App"].iter().zip(
         [bar.menu, bar.layers, bar.pane, bar.app]
             .into_iter()
@@ -11942,9 +9542,6 @@ fn bar_items_stack_icon_above_label() {
 }
 
 /// M9-12. **The inline transport sits flush on the bar, full width.**
-///
-///     The 8pt gap between the transport and the bottom bar died with the
-///     bar's insets (the second user test: "no gap above the bar").
 #[test]
 fn the_inline_transport_sits_flush_on_the_bar() {
     let mut h = phone();
@@ -11969,12 +9566,6 @@ fn the_inline_transport_sits_flush_on_the_bar() {
 }
 
 /// M9-15. **The Layers page's segments header survives the smallest sheet.**
-///
-///     The phone top bar carries no pane segments; the Layers page's header
-///     is where they live (plan §1.3) — and the second user test found a
-///     small sheet cutting them off. The page's height floor now covers its
-///     header, so mid-drag at the floor every segment button still lies
-///     inside the sheet.
 #[test]
 fn the_sheet_keeps_the_layers_page_segments_at_its_smallest() {
     let mut h = phone();
@@ -11984,8 +9575,6 @@ fn the_sheet_keeps_the_layers_page_segments_at_its_smallest() {
     let map = h.map_panel_rect();
     let near_bottom = egui::pos2(handle.center().x, map.bottom() - 10.0);
 
-    // Drag the handle to the very bottom and hold: the sheet is clamped at
-    // its floor, mid-drag, which is where the cut-off used to happen.
     h.mouse_press(handle.center());
     h.frame_after(FRAME_DT);
     h.mouse_move(egui::pos2(handle.center().x, handle.center().y + 60.0));
@@ -12012,14 +9601,8 @@ fn the_sheet_keeps_the_layers_page_segments_at_its_smallest() {
     h.warm_up();
 }
 
-/// M9-10. **The narrow transport never overlaps itself: essentials on row
-///     one, the scrubber on its own full-width row, the age chip dropped.**
-///
-///     The second user test's screenshot shows the 420pt row mangled into
-///     "1 10 min 00∞ liv" — every element drawn over its neighbour. The
-///     narrow form is pinned by geometry: all drawn row-1 controls pairwise
-///     disjoint, the scrubber strictly below every one of them and nearly
-///     the transport's full width, and the age chip absent.
+/// M9-10. **The narrow transport never overlaps itself: essentials on row one, the
+/// scrubber on its own full-width row, the age chip dropped.**
 #[test]
 fn the_narrow_transport_puts_the_scrubber_on_its_own_row_and_nothing_overlaps() {
     let mut h = phone();
@@ -12049,7 +9632,6 @@ fn the_narrow_transport_puts_the_scrubber_on_its_own_row_and_nothing_overlaps() 
         }
     }
 
-    // The scrubber: its own row, below everything, nearly full width.
     let scrubber = t.scrubber;
     let row1_bottom = row1
         .iter()
@@ -12065,14 +9647,12 @@ fn the_narrow_transport_puts_the_scrubber_on_its_own_row_and_nothing_overlaps() 
         "the scrubber's own row should hand it nearly the transport's width"
     );
 
-    // The age chip is dropped at narrow widths (the demo behaviour).
     assert!(
         t.age_text.is_empty(),
         "the narrow transport still draws the age chip: {:?}",
         t.age_text
     );
 
-    // The wide form keeps the age chip.
     let mut wide = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     wide.load_scan("KMKX");
     wide.set_data_time(0, Some(written_ago(5)));
@@ -12084,25 +9664,16 @@ fn the_narrow_transport_puts_the_scrubber_on_its_own_row_and_nothing_overlaps() 
 }
 
 /// M9-16. **The Live/timestamp chip never intersects the bar's items.**
-///
-///     The second user test's screenshot: the chip bled across the Pane and
-///     App buttons at narrow widths. The chip now takes only the space the
-///     items left — and hides when even that is not enough — so at every
-///     width it is either absent or disjoint from all four items. Driven at
-///     the standard phone width and at a very narrow one, and in the archive
-///     posture, whose timestamp text is the chip's widest form.
 #[test]
 fn the_live_chip_never_intersects_the_bar_items() {
     for width in [420.0, 330.0] {
         let mut h = InputHarness::with_screen(egui::vec2(width, 900.0));
-        // Archive posture: the chip carries a full timestamp.
         h.load_scan("KMKX");
         h.gui_mut().active_pane_mut().viewing_live = false;
         h.warm_up();
         let bar = h.bottom_bar();
         let (chip, _) = bar.live_chip;
         if chip == egui::Rect::NOTHING {
-            // Hidden for lack of room — the allowed narrow answer.
             continue;
         }
         for (which, item) in ["Menu", "Layers", "Pane", "App"]
@@ -12119,19 +9690,10 @@ fn the_live_chip_never_intersects_the_bar_items() {
     }
 }
 
-/// 71. **Dialogs are modals at ≥600pt and sheet pages below it — the phone
-///     never draws a modal.**
-///
-///     One flag, two presentations (plan §1.9): `catalog_open` is an
-///     `egui::Modal` on the desktop and the sheet's full-height Catalog
-///     page on the phone; `time_dialog.show` is a window there and the Time
-///     page here; a selected feature is the pager window there and the
-///     Feature page here. The modal-absence half is read off egui's own
-///     area bookkeeping: a fresh phone session that never drew the modal
-///     has no state under its id to have drawn it with.
+/// 71. **Dialogs are modals at ≥600pt and sheet pages below it — the phone never
+/// draws a modal.**
 #[test]
 fn dialogs_are_modals_on_wide_screens_and_sheet_pages_on_the_phone() {
-    // Desktop: the catalog is a modal, and no sheet exists to host it.
     let mut desk = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     desk.open_catalog();
     assert_eq!(desk.sheet().page, None, "no sheet on a desktop");
@@ -12139,7 +9701,6 @@ fn dialogs_are_modals_on_wide_screens_and_sheet_pages_on_the_phone() {
         desk.area_rect(egui::Id::new("add_layer_catalog")).is_some(),
         "the desktop catalog must be the egui Modal"
     );
-    // Backdrop click closes — the modal's own contract.
     desk.mouse_click(egui::pos2(40.0, 400.0));
     desk.warm_up();
     assert!(
@@ -12147,8 +9708,6 @@ fn dialogs_are_modals_on_wide_screens_and_sheet_pages_on_the_phone() {
         "the modal's backdrop click must close it"
     );
 
-    // Phone: the same flag presents as the sheet's Catalog page, at forced
-    // Full extent, and the Modal is never created.
     let mut h = phone();
     h.open_catalog();
     let sheet = h.sheet();
@@ -12170,8 +9729,6 @@ fn dialogs_are_modals_on_wide_screens_and_sheet_pages_on_the_phone() {
          {sheet_rect:?}"
     );
 
-    // The scrim is the backdrop: a click above the sheet closes the top
-    // page, revealing the Layers page the catalog was opened from.
     let above = egui::pos2(sheet_rect.center().x, sheet_rect.top() - 12.0);
     assert!(
         above.y > h.top_bar().rect.bottom(),
@@ -12186,8 +9743,6 @@ fn dialogs_are_modals_on_wide_screens_and_sheet_pages_on_the_phone() {
         "closing the catalog must reveal the page beneath"
     );
 
-    // The Time dialog: the timeline's timestamp opens the Time page, and
-    // the phone never draws the Set Time window.
     h.close_layers();
     let (stamp, _) = h.timeline().timestamp;
     h.mouse_click(stamp.center());
@@ -12204,7 +9759,6 @@ fn dialogs_are_modals_on_wide_screens_and_sheet_pages_on_the_phone() {
     assert!(h.gui_mut().dismiss_top_layer(), "close the time page again");
     h.warm_up();
 
-    // A selected feature: the Feature page, never the pager window.
     h.gui_mut().overlays.selected_overlays = vec![std::sync::Arc::new(SheetStubFeature)];
     h.warm_up();
     let sheet = h.sheet();
@@ -12223,13 +9777,8 @@ fn dialogs_are_modals_on_wide_screens_and_sheet_pages_on_the_phone() {
     );
 }
 
-/// 75. **The phone top bar shares the status bar's collapse state:
-///     collapsed, only the wordmark and the restore button remain.**
-///
-///     One field (`statusbar_collapsed`), two bars by width — §1.6's rule:
-///     the phone has no status bar, so the collapse the ◧ means lives on
-///     the bar that carries the scan text. Crossing the breakpoint carries
-///     the state across, in both directions, because it is the same state.
+/// 75. **The phone top bar shares the status bar's collapse state: collapsed, only
+/// the wordmark and the restore button remain.**
 #[test]
 fn the_phone_top_bar_shares_the_status_collapse_state() {
     let mut h = phone();
@@ -12260,8 +9809,6 @@ fn the_phone_top_bar_shares_the_status_collapse_state() {
         "the scan text was still painted while collapsed"
     );
 
-    // The state is the status bar's: widen past the breakpoint and the
-    // status bar comes back collapsed.
     h.set_screen(egui::vec2(1400.0, 900.0));
     assert!(
         h.status_bar().collapsed,
@@ -12269,7 +9816,6 @@ fn the_phone_top_bar_shares_the_status_collapse_state() {
          state with"
     );
 
-    // ...and the restore crosses back the other way.
     h.mouse_click(h.status_bar().collapse.center());
     h.warm_up();
     assert!(!h.status_bar().collapsed, "precondition: restored");
@@ -12280,10 +9826,10 @@ fn the_phone_top_bar_shares_the_status_collapse_state() {
     );
 }
 
-/// **The sheet's handle snaps Half ↔ Full, and a deep drag-down dismisses**
-/// (plan §1.13): the release decides what the drag meant — past the midpoint
-/// towards Full snaps Full, back below it snaps Half, and a release more
-/// than a quarter below the Half height clears every page flag.
+/// **The sheet's handle snaps Half ↔ Full, and a deep drag-down dismisses** (plan
+/// §1.13): the release decides what the drag meant — past the midpoint towards Full
+/// snaps Full, back below it snaps Half, and a release more than a quarter below
+/// the Half height clears every page flag.
 #[test]
 fn the_sheet_handle_snaps_between_half_full_and_dismissal() {
     let mut h = phone();
@@ -12291,7 +9837,6 @@ fn the_sheet_handle_snaps_between_half_full_and_dismissal() {
     assert_eq!(h.sheet().extent, crate::ui::SheetExtent::Half);
     let half_height = h.sheet_rect().expect("open").height();
 
-    // Up, well past the midpoint: Full.
     let start = h.sheet().handle.center();
     h.mouse_press(start);
     h.frame_after(FRAME_DT);
@@ -12312,7 +9857,6 @@ fn the_sheet_handle_snaps_between_half_full_and_dismissal() {
         "Full must actually be taller: {half_height} -> {full_height}"
     );
 
-    // Down, back below the midpoint but above the dismiss band: Half.
     let start = h.sheet().handle.center();
     h.mouse_press(start);
     h.frame_after(FRAME_DT);
@@ -12328,7 +9872,6 @@ fn the_sheet_handle_snaps_between_half_full_and_dismissal() {
         "a release back below the midpoint must snap to Half"
     );
 
-    // Down again, deep into the dismiss band: the sheet goes, flags and all.
     let start = h.sheet().handle.center();
     h.mouse_press(start);
     h.frame_after(FRAME_DT);
@@ -12349,17 +9892,10 @@ fn the_sheet_handle_snaps_between_half_full_and_dismissal() {
     );
 }
 
-/// **A back press walks the phone sheet pages top-down, one visible pop per
-/// press** (plan §3.4; scope item 7): Feature → Time → Menu → Inspector →
-/// Layers → the armed drag — the projection order, driven through the same
-/// `dismiss_top_layer` entry every width shares. Below the breakpoint the
-/// dismissal *is* the projection: it pops whichever page the sheet shows on
-/// top, whatever order the flags were stacked in. The second leg builds the
-/// stack a fixed chain would mis-order — a Feature page over an open
-/// Catalog, through a real route: flags set on a wider width and carried
-/// under 600 pt by a resize (a feature tap through the scrim's map slivers
-/// builds the same state without leaving the phone) — and requires the
-/// visible page to pop first, the invisible flag to stay.
+/// **A back press walks the phone sheet pages top-down, one visible pop per press**
+/// (plan §3.4; scope item 7): Feature → Time → Menu → Inspector → Layers → the
+/// armed drag — the projection order, driven through the same `dismiss_top_layer`
+/// entry every width shares.
 #[test]
 fn a_back_press_walks_the_phone_sheet_pages_top_down() {
     let mut h = phone();
@@ -12385,9 +9921,7 @@ fn a_back_press_walks_the_phone_sheet_pages_top_down() {
     walk(&mut h, Some(crate::ui::SheetPage::Menu));
     walk(&mut h, Some(crate::ui::SheetPage::Inspector));
     walk(&mut h, Some(crate::ui::SheetPage::Layers));
-    // Closing the last page closes the sheet...
     walk(&mut h, None);
-    // ...and only then does the press reach the armed drag, then the exit.
     assert!(h.gui_mut().dismiss_top_layer(), "the armed drag is below");
     assert!(
         !h.section_draw_armed(),
@@ -12398,9 +9932,6 @@ fn a_back_press_walks_the_phone_sheet_pages_top_down() {
         "nothing is left; the next press belongs to the exit path"
     );
 
-    // The stacked state a fixed chain would mis-order: a Feature page over
-    // an open Catalog, built on the desktop — a feature window up, the
-    // stack's + Add layer — and carried under the breakpoint by a resize.
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.gui_mut().overlays.selected_overlays = vec![std::sync::Arc::new(SheetStubFeature)];
     h.open_catalog();
@@ -12426,7 +9957,6 @@ fn a_back_press_walks_the_phone_sheet_pages_top_down() {
         "nothing invisible was left behind the two visible pops"
     );
 
-    // The Catalog page's own pop, from the state the phone's routes produce.
     let mut h = phone();
     h.open_catalog();
     assert_eq!(h.sheet().page, Some(crate::ui::SheetPage::Catalog));
@@ -12439,10 +9969,10 @@ fn a_back_press_walks_the_phone_sheet_pages_top_down() {
     );
 }
 
-/// **Stack rows carry a trailing › on the drawer and sheet hosts, and none
-/// on the desktop sidebar** (plan §1.3): where a row click pushes the
-/// inspector *over* the list, the chevron says so; where the inspector opens
-/// beside it, there is nothing to push.
+/// **Stack rows carry a trailing › on the drawer and sheet hosts, and none on the
+/// desktop sidebar** (plan §1.3): where a row click pushes the inspector *over* the
+/// list, the chevron says so; where the inspector opens beside it, there is nothing
+/// to push.
 #[test]
 fn stack_rows_carry_a_chevron_only_in_the_drawer_and_sheet_hosts() {
     let desk = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -12476,16 +10006,9 @@ fn stack_rows_carry_a_chevron_only_in_the_drawer_and_sheet_hosts() {
     );
 }
 
-// `the_phone_hover_readout_never_paints_over_the_arm_toggles` retired
-// (synthesis-m9): the phone bar's hover readout is gone — M9-17 removed the
-// truncating copy and made the press-and-hold popup the Compact value
-// readout (its own pin, plus contract 25's revision). The overlap it
-// guarded cannot recur without the readout, and contract 82's
-// painted-text-under-arm sweep still covers the bar's other strings.
-
-/// **The phone error toast sits under the top bar, clear of the arm
-/// toggles, and its ✕ dismisses** — the status bar's error contract, moved
-/// to the one chrome strip the phone keeps at the top.
+/// **The phone error toast sits under the top bar, clear of the arm toggles, and
+/// its ✕ dismisses** — the status bar's error contract, moved to the one chrome
+/// strip the phone keeps at the top.
 #[test]
 fn the_phone_error_toast_sits_under_the_top_bar_and_its_cross_dismisses() {
     let mut h = phone();
@@ -12519,11 +10042,8 @@ fn the_phone_error_toast_sits_under_the_top_bar_and_its_cross_dismisses() {
     );
 }
 
-/// **The phone error toast stays visible and dismissible while a sheet page
-/// is up.** The scrim and sheet are `Order::Foreground`; the toast rides
-/// `Order::Tooltip` above them (see `render_phone_error_toast` for why that
-/// device) — an error surface a page could bury would go unseen exactly
-/// when the user is busiest.
+/// **The phone error toast stays visible and dismissible while a sheet page is
+/// up.**
 #[test]
 fn the_phone_error_toast_stays_visible_and_dismissible_over_an_open_sheet() {
     let mut h = phone();
@@ -12564,10 +10084,7 @@ fn the_phone_error_toast_stays_visible_and_dismissible_over_an_open_sheet() {
     );
 }
 
-/// **A release on the forced-Full Catalog page keeps the stored snap.** The
-/// page draws at Full whatever the snap says (plan §1.10), so a settle drag
-/// there decides nothing — writing Full over the user's Half would change
-/// how every later page opens. Dismiss-by-drag still works from it.
+/// **A release on the forced-Full Catalog page keeps the stored snap.**
 #[test]
 fn a_release_on_the_forced_full_catalog_page_keeps_the_stored_snap() {
     let mut h = phone();
@@ -12584,8 +10101,6 @@ fn a_release_on_the_forced_full_catalog_page_keeps_the_stored_snap() {
         "precondition: the Catalog page forces Full"
     );
 
-    // A small settle drag, released well above the dismiss band — where a
-    // snap write would have recorded the forced Full.
     let start = h.sheet().handle.center();
     h.mouse_press(start);
     h.frame_after(FRAME_DT);
@@ -12601,8 +10116,6 @@ fn a_release_on_the_forced_full_catalog_page_keeps_the_stored_snap() {
         "precondition: the release was a settle, not a dismissal"
     );
 
-    // Pop the catalog: the Layers page beneath comes back at the snap the
-    // user chose, not at the Full the forced page drew at.
     assert!(h.gui_mut().dismiss_top_layer());
     h.warm_up();
     assert_eq!(h.sheet().page, Some(crate::ui::SheetPage::Layers));
@@ -12613,10 +10126,9 @@ fn a_release_on_the_forced_full_catalog_page_keeps_the_stored_snap() {
     );
 }
 
-/// **Arming ╱ from the phone top bar closes the open sheet** — the Menu
-/// page's own rule for its arm entry, applied to the bar's route: the next
-/// thing the user does is a drag on the map the sheet is covering. Disarming
-/// closes nothing, as the dropdown's reasoning goes.
+/// **Arming ╱ from the phone top bar closes the open sheet** — the Menu page's own
+/// rule for its arm entry, applied to the bar's route: the next thing the user does
+/// is a drag on the map the sheet is covering.
 #[test]
 fn arming_from_the_phone_top_bar_closes_the_open_sheet() {
     let mut h = phone();
@@ -12634,7 +10146,6 @@ fn arming_from_the_phone_top_bar_closes_the_open_sheet() {
         "arming needs the map: the sheet must close with it"
     );
 
-    // Disarming keeps whatever is up.
     h.open_layers();
     let (section, armed) = h.top_bar().section_arm;
     assert!(armed, "precondition: still armed across the reopen");
@@ -12648,12 +10159,9 @@ fn arming_from_the_phone_top_bar_closes_the_open_sheet() {
     );
 }
 
-// ── The UI fade and the finalized Esc chain (M7) ─────────────────────
-
-/// Whether the floating chrome is on the glass, read off the probes the
-/// renderers write — the timeline and the status bar on the wide widths, the
-/// timeline and the bottom bar on the phone. One reader for every fade
-/// contract, so "faded" and "restored" are the same claim throughout.
+/// Whether the floating chrome is on the glass, read off the probes the renderers
+/// write — the timeline and the status bar on the wide widths, the timeline and the
+/// bottom bar on the phone.
 fn chrome_on_screen(h: &InputHarness) -> bool {
     let timeline = h.timeline();
     let timeline_drawn = timeline.rect != egui::Rect::NOTHING || timeline.collapsed;
@@ -12664,13 +10172,8 @@ fn chrome_on_screen(h: &InputHarness) -> bool {
     }
 }
 
-/// 60. **A qualifying tap fades all the floating chrome; the second restores
-///     it; a drag, a consumed click and an armed tool do not fade.**
-///
-///     The trigger sentence of §1.8, condition by condition, on the width
-///     with the most chrome to lose. The qualifying click is a confirmed
-///     click (not a drag) on the already-active pane's bare map — no feature
-///     or site under it, no armed drag owning the gesture.
+/// 60. **A qualifying tap fades all the floating chrome; the second restores it; a
+/// drag, a consumed click and an armed tool do not fade.**
 #[test]
 fn a_qualifying_tap_fades_the_chrome_and_the_second_restores_it() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -12680,8 +10183,6 @@ fn a_qualifying_tap_fades_the_chrome_and_the_second_restores_it() {
         "precondition: the chrome is up"
     );
 
-    // A drag does not fade: ≥ the click threshold of movement makes the
-    // gesture a pan, and a pan is map work.
     h.mouse_press(spot);
     for i in 1..=4 {
         h.mouse_move(spot + egui::vec2(8.0 * i as f32, 0.0));
@@ -12691,8 +10192,6 @@ fn a_qualifying_tap_fades_the_chrome_and_the_second_restores_it() {
     h.warm_up();
     assert!(!h.faded() && chrome_on_screen(&h), "a drag must not fade");
 
-    // An armed tool does not fade: the click is the tool's (a discarded
-    // too-short gesture), whichever tool is armed.
     h.set_section_draw_armed(true);
     h.mouse_click(spot);
     h.warm_up();
@@ -12710,7 +10209,6 @@ fn a_qualifying_tap_fades_the_chrome_and_the_second_restores_it() {
     );
     h.set_region_pick_armed(false);
 
-    // A consumed click does not fade: the site icon answered it.
     h.close_layers();
     h.gui_mut().enable_overlay_for_test(&known::RADAR_SITES);
     h.warm_up();
@@ -12724,8 +10222,6 @@ fn a_qualifying_tap_fades_the_chrome_and_the_second_restores_it() {
         "a consumed click must not fade"
     );
 
-    // The qualifying tap fades everything floating; the docked top bar
-    // stays (contract 63 pins its half).
     h.mouse_click(spot);
     h.warm_up();
     assert!(h.faded(), "the bare-map click must fade");
@@ -12748,7 +10244,6 @@ fn a_qualifying_tap_fades_the_chrome_and_the_second_restores_it() {
         "the docked top bar never fades"
     );
 
-    // The second qualifying tap restores.
     h.mouse_click(spot);
     h.warm_up();
     assert!(!h.faded(), "the second tap must restore");
@@ -12758,8 +10253,8 @@ fn a_qualifying_tap_fades_the_chrome_and_the_second_restores_it() {
     );
 }
 
-/// 60b. **The same trigger on the phone: the bottom cluster fades and the
-///      second tap restores it — and an armed tool still does not fade.**
+/// 60b. **The same trigger on the phone: the bottom cluster fades and the second
+/// tap restores it — and an armed tool still does not fade.**
 #[test]
 fn a_qualifying_tap_fades_the_phone_cluster_and_the_second_restores_it() {
     let mut h = phone();
@@ -12798,12 +10293,8 @@ fn a_qualifying_tap_fades_the_phone_cluster_and_the_second_restores_it() {
     );
 }
 
-/// 61. **Fading closes the panels and the sheet for real — state, not
-///     paint — and unfading reopens nothing.**
-///
-///     The state half is read through `dismiss_top_layer`: while faded the
-///     only consumable layer is the fade itself, and after it nothing is
-///     left — an invisible open panel would answer the second press.
+/// 61. **Fading closes the panels and the sheet for real — state, not paint — and
+/// unfading reopens nothing.**
 #[test]
 fn fading_closes_the_panels_for_real_and_unfading_reopens_nothing() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -12821,8 +10312,6 @@ fn fading_closes_the_panels_for_real_and_unfading_reopens_nothing() {
         !h.layers_panel_on_screen() && !h.inspector().open,
         "the fade must close both panels"
     );
-    // State, not paint: the fade is the one consumable layer, and nothing
-    // hides beneath it.
     assert!(h.gui_mut().dismiss_top_layer(), "the fade itself");
     assert!(
         !h.gui_mut().dismiss_top_layer(),
@@ -12830,7 +10319,6 @@ fn fading_closes_the_panels_for_real_and_unfading_reopens_nothing() {
     );
     h.warm_up();
 
-    // Unfading reopens nothing: the panels stay closed until asked for.
     assert!(
         !h.layers_panel_on_screen() && !h.inspector().open,
         "unfading must not reopen the panels"
@@ -12838,17 +10326,9 @@ fn fading_closes_the_panels_for_real_and_unfading_reopens_nothing() {
     assert!(chrome_on_screen(&h), "the unconditional chrome is back");
 }
 
-/// 61b. **The phone bottom cluster is edge-flush and seals the map while a
-///      page is open** — the full-bleed direction of the second user test,
-///      which retired the sliver band this contract used to fade through.
-///
-///      Three geometric claims, each its own regression: the bar spans the
-///      full width and touches the bottom edge (no side or bottom insets),
-///      the open sheet sits flush on the bar's top (the 8pt gap died), and
-///      the scrim covers what the sheet leaves above — so no bare-map
-///      sliver exists below the scrim for a tap to slip through while a
-///      page is up. (The fade-closes-everything claims live in 61 and the
-///      invariants suite; the sliver route to them died with the sliver.)
+/// 61b. **The phone bottom cluster is edge-flush and seals the map while a page is
+/// open** — the full-bleed direction of the second user test, which retired the
+/// sliver band this contract used to fade through.
 #[test]
 fn the_phone_bottom_cluster_is_edge_flush_and_seals_the_map() {
     let mut h = phone();
@@ -12872,8 +10352,6 @@ fn the_phone_bottom_cluster_is_edge_flush_and_seals_the_map() {
         bar.top()
     );
 
-    // The scrim seals everything above the sheet: any point between the map
-    // top and the sheet's top edge is a floating layer, never bare map.
     let above = egui::pos2(map.left() + 3.0, (map.top() + sheet.top()) / 2.0);
     assert!(
         h.is_floating_layer_at(above),
@@ -12881,16 +10359,15 @@ fn the_phone_bottom_cluster_is_edge_flush_and_seals_the_map() {
     );
 }
 
-/// 61c. **The fade closes the Volume Alpha editor for real — per-pane
-///      floating chrome, on the same terms as the panels (§1.8) — and
-///      unfading does not reopen it.**
+/// 61c. **The fade closes the Volume Alpha editor for real — per-pane floating
+/// chrome, on the same terms as the panels (§1.8) — and unfading does not reopen
+/// it.**
 #[test]
 fn the_fade_closes_the_volume_alpha_editor_for_real() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.set_pane_count(2);
     h.make_pane_volume(1);
 
-    // Open the editor through its own corner button on the 3D pane.
     let button = h
         .painted_text_rects()
         .into_iter()
@@ -12909,8 +10386,6 @@ fn the_fade_closes_the_volume_alpha_editor_for_real() {
     };
     assert!(editor_open(&mut h), "precondition: the editor is open");
 
-    // The qualifying fade tap on the active map pane: the first click on
-    // pane 0 only activates it (§1.8), the second fades.
     let spot = h.pane_rects()[0].center();
     h.mouse_click(spot);
     h.warm_up();
@@ -12926,18 +10401,16 @@ fn the_fade_closes_the_volume_alpha_editor_for_real() {
         "no editor window survives on the glass"
     );
 
-    // Unfading reopens nothing, the editor included.
     h.mouse_click(spot);
     h.warm_up();
     assert!(!h.faded(), "the second tap restores");
     assert!(!editor_open(&mut h), "unfading must not reopen the editor");
 }
 
-/// 62. **A top-bar interaction while faded unfades first, then performs —
-///     nothing opens invisibly.**
+/// 62. **A top-bar interaction while faded unfades first, then performs — nothing
+/// opens invisibly.**
 #[test]
 fn a_top_bar_interaction_while_faded_unfades_and_performs() {
-    // Wide: the ☰ opens the menu into a restored UI.
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.mouse_click(h.map_center());
     h.warm_up();
@@ -12952,7 +10425,6 @@ fn a_top_bar_interaction_while_faded_unfades_and_performs() {
     );
     assert!(chrome_on_screen(&h), "the chrome returns with it");
 
-    // Phone: the ◧ collapse unfades and collapses.
     let mut h = phone();
     h.mouse_click(h.pane_rects()[0].center());
     h.warm_up();
@@ -12972,15 +10444,8 @@ fn a_top_bar_interaction_while_faded_unfades_and_performs() {
     );
 }
 
-/// 62b. **A keyboard activation while faded unfades too — one frame later,
-///      through the invariant's repair, and the surface it opened stays.**
-///
-///      egui's Tab-focus plus Enter activates a bar control with no pointer
-///      event, so the spatial unfade guard never sees it (`ui_fade.rs`). The
-///      frame-top invariant catches the opened surface and repairs by
-///      unfading — the §3.6 answer, one frame late — rather than re-closing,
-///      which would make the toggle read as dead to exactly the user who
-///      cannot aim a pointer at it.
+/// 62b. **A keyboard activation while faded unfades too — one frame later, through
+/// the invariant's repair, and the surface it opened stays.**
 #[test]
 fn a_keyboard_activation_while_faded_unfades_and_the_surface_stays() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -12992,8 +10457,6 @@ fn a_keyboard_activation_while_faded_unfades_and_the_surface_stays() {
         "precondition: the stack is closed"
     );
 
-    // Focus the Layers toggle under the id the bar itself keyed, then press
-    // Enter: an activation with no pointer event anywhere near the bar.
     let toggle = h
         .widget_id_probes()
         .iter()
@@ -13019,10 +10482,9 @@ fn a_keyboard_activation_while_faded_unfades_and_the_surface_stays() {
 }
 
 /// 63. **The top bar stays present and interactive while faded — the docked
-///     exception to §1.8's "fade all chrome".**
+/// exception to §1.8's "fade all chrome".**
 #[test]
 fn the_top_bar_stays_present_and_interactive_while_faded() {
-    // Wide: a pane-count segment still takes its click.
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.mouse_click(h.map_center());
     h.warm_up();
@@ -13039,7 +10501,6 @@ fn the_top_bar_stays_present_and_interactive_while_faded() {
     assert_eq!(h.pane_count(), 2, "the segment performed");
     assert!(!h.faded(), "and the press cleared the fade first");
 
-    // Phone: the ╱ arm still takes its tap.
     let mut h = phone();
     h.mouse_click(h.pane_rects()[0].center());
     h.warm_up();
@@ -13052,22 +10513,13 @@ fn the_top_bar_stays_present_and_interactive_while_faded() {
     assert!(!h.faded(), "and the press cleared the fade first");
 }
 
-/// 65. **The full Esc/back order, fade included: fade → catalog → feature →
-///     time → inspector → drawer → armed drag, one layer per press.**
-///
-///     The ☰ dropdown's place at the chain's head is contract 83's own
-///     claim (its route cannot be stacked under the catalog's modal
-///     backdrop); the in-flight handle drag above everything is the section
-///     suite's. This walks everything between, on the width whose stack
-///     form (the drawer) is an Esc target, with the fade at its head — and
-///     the fade leg runs first, because fading *closes* the very layers the
-///     walk stacks.
+/// 65. **The full Esc/back order, fade included: fade → catalog → feature → time →
+/// inspector → drawer → armed drag, one layer per press.**
 #[test]
 fn a_back_press_walks_the_full_wide_chain_in_order() {
     let mut h = InputHarness::with_screen(egui::vec2(800.0, 1200.0));
     assert_eq!(h.width_class(), crate::ui_layout::WidthClass::Medium);
 
-    // The fade head: Esc while faded restores the UI and consumes the press.
     h.mouse_click(h.map_center());
     h.warm_up();
     assert!(h.faded(), "precondition: faded");
@@ -13076,7 +10528,6 @@ fn a_back_press_walks_the_full_wide_chain_in_order() {
     h.warm_up();
     assert!(chrome_on_screen(&h), "Esc means restore my UI");
 
-    // The stack under the fade, deepest first.
     h.set_section_draw_armed(true);
     h.set_drawer_open(true);
     h.gui_mut().open_settings();
@@ -13120,10 +10571,10 @@ fn a_back_press_walks_the_full_wide_chain_in_order() {
     );
 }
 
-/// 65b. **The Compact chain keeps its projection-first order with the fade
-///      at its head** — the fade leg, then the sheet walk of
-///      `a_back_press_walks_the_phone_sheet_pages_top_down`, abbreviated to
-///      the seam this contract adds.
+/// 65b. **The Compact chain keeps its projection-first order with the fade at its
+/// head** — the fade leg, then the sheet walk of
+/// `a_back_press_walks_the_phone_sheet_pages_top_down`, abbreviated to the seam
+/// this contract adds.
 #[test]
 fn a_back_press_on_the_phone_unfades_then_walks_the_projection() {
     let mut h = phone();
@@ -13135,7 +10586,6 @@ fn a_back_press_on_the_phone_unfades_then_walks_the_projection() {
     h.warm_up();
     assert!(chrome_on_screen(&h), "back means restore my UI");
 
-    // The projection resumes beneath: pages pop top-down as ever.
     h.set_drawer_open(true);
     h.gui_mut().open_settings();
     h.warm_up();
@@ -13149,10 +10599,9 @@ fn a_back_press_on_the_phone_unfades_then_walks_the_projection() {
     assert!(!h.gui_mut().dismiss_top_layer(), "nothing is left");
 }
 
-/// **A click that dismisses an open popover does not fade** — the popup was
-/// what the click was aimed at (egui closes it on the click outside), and
-/// the evidence is recorded at press time because the popup is gone by the
-/// confirm frame.
+/// **A click that dismisses an open popover does not fade** — the popup was what
+/// the click was aimed at (egui closes it on the click outside), and the evidence
+/// is recorded at press time because the popup is gone by the confirm frame.
 #[test]
 fn a_click_that_dismisses_a_popover_does_not_fade() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -13175,14 +10624,13 @@ fn a_click_that_dismisses_a_popover_does_not_fade() {
         "and that is all it does: the dismissal is not a fade gesture"
     );
 
-    // The next bare click, with nothing open, does fade.
     h.mouse_click(h.map_center());
     h.warm_up();
     assert!(h.faded(), "the follow-up click is the fade gesture");
 }
 
-/// **A first click on an inactive pane only activates — the fade needs a
-/// click on the *already*-active pane** (§1.8).
+/// **A first click on an inactive pane only activates — the fade needs a click on
+/// the *already*-active pane** (§1.8).
 #[test]
 fn a_click_that_activates_a_pane_does_not_fade() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -13199,7 +10647,6 @@ fn a_click_that_activates_a_pane_does_not_fade() {
         "activation must be all it did"
     );
 
-    // The same spot again — now the already-active pane — fades.
     h.mouse_click(panes[1].center());
     h.warm_up();
     assert!(h.faded(), "the second click on the now-active pane fades");
@@ -13214,9 +10661,6 @@ fn a_consumed_click_while_faded_unfades() {
     h.gui_mut().enable_overlay_for_test(&known::RADAR_SITES);
     h.warm_up();
     let spot = h.map_center();
-    // Park the icon away from the centre first — the default view has the
-    // pane's own site under the centre, and the fading click below must be
-    // a bare-map click.
     let site_spot = egui::pos2(spot.x - 150.0, spot.y);
     h.place_site_at(0, "KTLX", site_spot);
     h.mouse_click(spot);
@@ -13234,16 +10678,10 @@ fn a_consumed_click_while_faded_unfades() {
 
 /// **A touch long-press starting on floating chrome does not raise the map
 /// tooltip** (§5.9: `long_press_pos` is chrome-filtered like the click).
-///
-/// Driven through the shipped `TouchGestures::update`, whose output the
-/// harness's parallel touch probe is. The control half holds the same press
-/// on bare map, so the filter — not a dead detector — is what the assertion
-/// sees.
 #[test]
 fn a_long_press_on_floating_chrome_raises_no_map_tooltip() {
     let mut h = InputHarness::new();
 
-    // Control: a still hold on bare map is a long press.
     let map_spot = h.map_center();
     h.mouse_press(map_spot);
     let held = h.frames_for(10, 0.1);
@@ -13255,7 +10693,6 @@ fn a_long_press_on_floating_chrome_raises_no_map_tooltip() {
     h.mouse_release(map_spot);
     h.frames_for(3, 0.3);
 
-    // The same hold on the floating timeline is a hold on the timeline.
     let chrome_spot = h.timeline().rect.center();
     assert!(
         h.is_floating_layer_at(chrome_spot),
@@ -13271,9 +10708,9 @@ fn a_long_press_on_floating_chrome_raises_no_map_tooltip() {
 }
 
 /// **The loop and archive scrubbers resolve distinct widget ids** (§5.9's
-/// same-auto-id-slot corner): the two forms share one row slot, so without
-/// distinct ids a loop landing mid-drag would hand an archive drag to the
-/// frame-seek slider — same id, new meaning.
+/// same-auto-id-slot corner): the two forms share one row slot, so without distinct
+/// ids a loop landing mid-drag would hand an archive drag to the frame-seek slider
+/// — same id, new meaning.
 #[test]
 fn the_loop_and_archive_scrubbers_resolve_distinct_ids() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -13314,13 +10751,11 @@ fn the_loop_and_archive_scrubbers_resolve_distinct_ids() {
     );
 }
 
-/// **The transport's stated width is its outer width** (§1.5's
-/// `min(880, full − 24)`, the §5.9 bookkeeping fix): the surface on the
-/// glass, frame included, lands on the formula — not the formula plus the
-/// frame's margins.
+/// **The transport's stated width is its outer width** (§1.5's `min(880, full −
+/// 24)`, the §5.9 bookkeeping fix): the surface on the glass, frame included, lands
+/// on the formula — not the formula plus the frame's margins.
 #[test]
 fn the_transport_outer_width_is_the_stated_formula() {
-    // Narrow enough that `full − 24` is the binding arm.
     let h = InputHarness::with_screen(egui::vec2(800.0, 1200.0));
     let map = h.map_panel_rect();
     let expected = (map.width() - 24.0).min(880.0);
@@ -13330,7 +10765,6 @@ fn the_transport_outer_width_is_the_stated_formula() {
         "the transport drew {drawn} pt wide; §1.5 states {expected} pt"
     );
 
-    // ...and wide enough that 880 binds.
     let h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     let drawn = h.timeline().rect.width();
     assert!(
@@ -13339,11 +10773,10 @@ fn the_transport_outer_width_is_the_stated_formula() {
     );
 }
 
-/// **The sheet host draws no duplicate headers** (M7's sheet-header polish):
-/// the sheet's title row is the single header — the stack's own header row
-/// and ⟨ do not render there, the inspector's crumb keeps its ✕-deselect
-/// (selection, not navigation) but drops its ⟩ — while the wider hosts keep
-/// all of it.
+/// **The sheet host draws no duplicate headers** (M7's sheet-header polish): the
+/// sheet's title row is the single header — the stack's own header row and ⟨ do not
+/// render there, the inspector's crumb keeps its ✕-deselect (selection, not
+/// navigation) but drops its ⟩ — while the wider hosts keep all of it.
 #[test]
 fn the_sheet_host_draws_no_duplicate_headers() {
     let mut h = phone();
@@ -13368,7 +10801,6 @@ fn the_sheet_host_draws_no_duplicate_headers() {
         "the Layers page must carry the §1.3 helper caption"
     );
 
-    // The inspector page: crumb yes, ⟩ no, ✕-deselect yes.
     h.open_layer_in_inspector(&known::NWS_ALERTS);
     let insp = h.inspector();
     assert_eq!(
@@ -13382,7 +10814,6 @@ fn the_sheet_host_draws_no_duplicate_headers() {
         "the crumb's ✕-deselect stays: it is selection, not navigation"
     );
 
-    // The wider hosts keep both header rows whole.
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.gui_mut().open_settings();
     h.warm_up();
@@ -13396,13 +10827,10 @@ fn the_sheet_host_draws_no_duplicate_headers() {
 }
 
 /// **The error surface outranks the fade** — the deliberate §1.8 refinement
-/// recorded in `ui_fade.rs`: an error one accidental tap could hide is an
-/// error unseen. On the wide widths the error normally rides in the status
-/// bar, which fades — so while faded the toast presentation carries it; on
-/// the phone the toast simply stays.
+/// recorded in `ui_fade.rs`: an error one accidental tap could hide is an error
+/// unseen.
 #[test]
 fn the_error_surface_stays_visible_while_faded() {
-    // Wide: the status bar goes, the toast carries the error.
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.gui_mut().apply(crate::shell_api::GuiEvent::Error(
         "the feed went away".to_owned(),
@@ -13426,7 +10854,6 @@ fn the_error_surface_stays_visible_while_faded() {
         "the toast's \u{2715} must dismiss the error while faded"
     );
 
-    // Phone: the toast stays up through the fade.
     let mut h = phone();
     h.gui_mut().apply(crate::shell_api::GuiEvent::Error(
         "the feed went away".to_owned(),
@@ -13442,17 +10869,7 @@ fn the_error_surface_stays_visible_while_faded() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// M8: the first-run fixes, each pinned headlessly. The glyph inventory and
-// the UI-string allowlist live in `ui_glyphs.rs`; the selectable-labels rule
-// is pinned at its frontend site. Everything else is here.
-// ---------------------------------------------------------------------------
-
-/// M8-3. **The top bar has breathing room at every width.** The floor is the
-/// bar's own stated one — the vertical margins plus one interact row — so
-/// dropping either constant back to the cramped strip fails by name here.
-/// The full-bleed contract test above already holds the map to whatever
-/// height the bar really claims.
+/// M8-3. **The top bar has breathing room at every width.**
 #[test]
 fn the_top_bar_has_breathing_room_at_every_width() {
     for size in [
@@ -13472,14 +10889,7 @@ fn the_top_bar_has_breathing_room_at_every_width() {
 }
 
 /// M8-6. **A layer-less pane's stack body is the explained absence plus the one
-/// action that applies.** No layer rows and no Add-layer buttons (correct —
-/// a cross-section has no projector to draw one against), but the body must
-/// offer the caption and a `Pane properties...` button that opens the inspector
-/// where the pane's real controls live — not read as a broken panel.
-///
-/// A cross-section is the only kind this is about now. A 3D pane draws the
-/// layers and gets the rows (`PaneState::draws_map_layers`, test 50); driving
-/// this through one would be asserting the empty body on a pane that has one.
+/// action that applies.**
 #[test]
 fn a_layerless_stack_body_offers_the_caption_and_pane_properties() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -13521,10 +10931,7 @@ fn a_layerless_stack_body_offers_the_caption_and_pane_properties() {
 }
 
 /// M8-7. **The time chip and timestamp fall back to a real time on a non-map
-/// pane.** The active pane's on-screen time, else its own static
-/// `data_time`, else the freshest visible map pane's — with the live/archive
-/// annotation following whichever pane supplied the time. `--:--:--` only
-/// when genuinely nothing is loaded.
+/// pane.**
 #[test]
 fn the_time_chip_falls_back_to_a_map_panes_time_on_a_non_map_pane() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -13535,8 +10942,6 @@ fn the_time_chip_falls_back_to_a_map_panes_time_on_a_non_map_pane() {
 
     h.set_pane_count(2);
     h.make_pane_volume(1);
-    // Pane 0 (a map) has data on screen, parked in the archive; pane 1 (3D)
-    // has none of its own.
     let t = chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
         .unwrap()
         .and_hms_opt(11, 11, 18)
@@ -13546,7 +10951,6 @@ fn the_time_chip_falls_back_to_a_map_panes_time_on_a_non_map_pane() {
         pane0.data_time = Some(t);
         pane0.viewing_live = false;
     }
-    // Make the 3D pane the active one, the user's way.
     h.mouse_click(h.pane_rects()[1].center());
     h.warm_up();
     assert_eq!(h.active_pane_index(), 1, "precondition: pane 1 is active");
@@ -13567,7 +10971,6 @@ fn the_time_chip_falls_back_to_a_map_panes_time_on_a_non_map_pane() {
          map pane), got {stamp:?}"
     );
 
-    // The collapsed chip prints the same fallback.
     h.mouse_click(h.timeline().collapse.center());
     h.warm_up();
     let chip = h.timeline().chip;
@@ -13581,16 +10984,10 @@ fn the_time_chip_falls_back_to_a_map_panes_time_on_a_non_map_pane() {
     );
 }
 
-/// M8-8/9. **The collapsed chip sits above the bottom-edge bars and lays out
-/// on one line.** Anchored off the bars' real rects — the floating status
-/// bar on the wide widths, the bottom bar on the phone — and sized to its
-/// text, so the time can never fold into a vertical column. The lift is
-/// earned, not reflexive: a status bar collapsed to its restore button
-/// leaves the corner open map, and the chip drops back to the map's bottom
-/// edge (M8.1).
+/// M8-8/9. **The collapsed chip sits above the bottom-edge bars and lays out on one
+/// line.**
 #[test]
 fn the_collapsed_chip_clears_the_bars_and_never_wraps() {
-    // Wide: above the floating status bar.
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.mouse_click(h.timeline().collapse.center());
     h.warm_up();
@@ -13608,9 +11005,6 @@ fn the_collapsed_chip_clears_the_bars_and_never_wraps() {
     );
     assert_single_line_chip(&h, chip);
 
-    // Wide, the status bar collapsed to its left-anchored restore button:
-    // the chip still keeps clear of it, but from the map's own bottom edge —
-    // not floated a button-height above open map (the M8.1 finding).
     h.mouse_click(h.status_bar().collapse.center());
     h.warm_up();
     let chip = h.timeline().chip;
@@ -13631,7 +11025,6 @@ fn the_collapsed_chip_clears_the_bars_and_never_wraps() {
     );
     assert_single_line_chip(&h, chip);
 
-    // Phone: above the bottom bar.
     let mut h = InputHarness::with_screen(egui::vec2(420.0, 800.0));
     h.mouse_click(h.timeline().collapse.center());
     h.warm_up();
@@ -13650,8 +11043,8 @@ fn the_collapsed_chip_clears_the_bars_and_never_wraps() {
     assert_single_line_chip(&h, chip);
 }
 
-/// The chip's one-line claim, asserted on the glass: wider than tall, and
-/// its whole label painted as a single text row.
+/// The chip's one-line claim, asserted on the glass: wider than tall, and its whole
+/// label painted as a single text row.
 fn assert_single_line_chip(h: &InputHarness, chip: egui::Rect) {
     assert!(
         chip.width() > chip.height(),
@@ -13671,9 +11064,6 @@ fn assert_single_line_chip(h: &InputHarness, chip: egui::Rect) {
 }
 
 /// M8-10. **A layer row is a full-width, comfortably tall click target.**
-/// Every row spans the panel's inner width at 28pt or more, and a click far
-/// from the label text — the row's right end, where only empty row used to
-/// be — selects the layer.
 #[test]
 fn layer_rows_are_full_width_click_targets() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -13710,8 +11100,6 @@ fn layer_rows_are_full_width_click_targets() {
         "a click at the row's right end must select the layer"
     );
 
-    // The buttons layered on the row keep their own precedence: the eye
-    // click toggles visibility rather than re-selecting.
     let row = h.stack_row(&known::CITY_LABELS).expect("row drawn");
     let was_on = row.eye_on;
     h.mouse_click(row.eye.center());
@@ -13729,15 +11117,6 @@ fn layer_rows_are_full_width_click_targets() {
 }
 
 /// M9-18. **In-pane text stays inside its pane and clear of the pill row.**
-///
-///     The second user test's pane-6 screenshots: the armed-region hint
-///     clipped mid-word at the pane edge, and the section caption collided
-///     with a pill row that had wrapped to two lines (the fixed one-row
-///     clearance assumed it never would). Driven on a six-pane grid whose
-///     panes are narrow enough to matter: the hint chip's text must lie
-///     inside its pane, and every painted text is either fully inside a
-///     pill row's rect (it is a pill) or fully disjoint from it — a partial
-///     overlap is exactly the collision.
 #[test]
 fn in_pane_text_stays_inside_its_pane_and_clear_of_the_pill_rows() {
     let mut h = InputHarness::with_screen(egui::vec2(1000.0, 900.0));
@@ -13754,13 +11133,10 @@ fn in_pane_text_stays_inside_its_pane_and_clear_of_the_pill_rows() {
             lon: -97.0,
         },
     );
-    // The stack floats over pane 0's corner by design; close it so the only
-    // things over the pill rows are the rows themselves.
     h.close_layers();
     h.set_section_draw_armed(true);
     h.warm_up();
 
-    // The armed hint chip wraps to its pane rather than clipping mid-word.
     let panes = h.pane_rects();
     let hints: Vec<(egui::Rect, String)> = h
         .painted_text_rects()
@@ -13778,8 +11154,6 @@ fn in_pane_text_stays_inside_its_pane_and_clear_of_the_pill_rows() {
         );
     }
 
-    // Nothing partially overlaps a pill row: fully inside (a pill's own
-    // label) or fully clear (a caption that kept its measured clearance).
     for row in h.pill_rows() {
         for (rect, text) in h.painted_text_rects() {
             if rect.intersects(row.rect) && !row.rect.expand(1.0).contains_rect(rect) {
@@ -13794,14 +11168,6 @@ fn in_pane_text_stays_inside_its_pane_and_clear_of_the_pill_rows() {
 }
 
 /// M9-13. **A mouse click-drag on a panel body scrolls it.**
-///
-///     egui 0.35's `DragScroll::OnTouch` default made content drags
-///     touch-only, so on a desktop, click-dragging inside a panel scrolled
-///     nothing (the second user test). The panels opt into `Always`; driven
-///     here with a real mouse press-move-release on a stack row's *body* —
-///     which senses clicks, not drags, so the scroll area receives the
-///     gesture — against a window short enough that the list overflows.
-///     The reorder grip keeps its own drag (contract 68 pins that side).
 #[test]
 fn a_mouse_drag_on_a_panel_body_scrolls_it() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 420.0));
@@ -13814,7 +11180,6 @@ fn a_mouse_drag_on_a_panel_body_scrolls_it() {
         .1;
     let before = h.scroll_offset(scroll_id).unwrap_or_default().y;
 
-    // Drag upward on a row's text block — body, not grip, not eye.
     let row = h.stack().rows[1].clone();
     let start = row.name.center();
     h.mouse_press(start);
@@ -13832,7 +11197,6 @@ fn a_mouse_drag_on_a_panel_body_scrolls_it() {
     h.mouse_release(start - egui::vec2(0.0, 90.0));
     h.warm_up();
 
-    // The aborted click did not select the row.
     assert_ne!(
         h.inspector().mode,
         Some(crate::ui::InspectorSelection::Layer(row.kind)),
@@ -13841,13 +11205,6 @@ fn a_mouse_drag_on_a_panel_body_scrolls_it() {
 }
 
 /// M9-1. **A row's text block sits vertically centred in its row.**
-///
-///     The ≥28pt full-row target left the name and status anchored to the
-///     row's top — a nested top-down child flows from the top whatever the
-///     parent's cross-align says — and the second user test read it as
-///     mis-set type. The block now centres itself; this holds it there, for
-///     the status-carrying rows and the name-only ones alike (the two have
-///     different block heights, so one passing does not imply the other).
 #[test]
 fn stack_row_text_is_vertically_centred() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -13870,9 +11227,7 @@ fn stack_row_text_is_vertically_centred() {
     }
 }
 
-/// M8-11. **The fade hides the 3D pane's Volume Alpha corner button.** It is
-/// floating chrome over the picture: hidden for real while faded — not
-/// drawn, so input-transparent — and back after (the contract-61 family).
+/// M8-11. **The fade hides the 3D pane's Volume Alpha corner button.**
 #[test]
 fn the_fade_hides_the_volume_alpha_button_and_restores_it() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -13908,26 +11263,8 @@ fn the_fade_hides_the_volume_alpha_button_and_restores_it() {
     );
 }
 
-/// M8-11b. **A click on the Volume Alpha button is the button's click, and a
-/// click on a 3D pane is never the fade gesture.**
-///
-/// The regression the 3D-as-a-render-mode collapse landed: the fade gate asked
-/// `matches!(pane.kind(), PaneKind::Map)`, and a 3D pane's *kind* is `Map` now —
-/// only its [`RenderView`] differs. So every click on an already-active 3D pane
-/// qualified as the bare-map fade gesture, the corner button's included. The
-/// button did win the pointer and did toggle the editor open; the fade verdict
-/// is resolved after the pane loop, and `fade_close_all` shut the editor again
-/// in the same frame. What the user saw was a dead button that hid the UI —
-/// "clicking volume alpha no longer works, it fades the ui like I clicked the
-/// map".
-///
-/// **Both halves are asserted, and both are load-bearing.** The editor being
-/// open is the evidence the click reached the *button*; the UI not being faded
-/// is the evidence it did not also reach the *pane*. Either alone passes for
-/// the wrong reason — the fade half alone passes with no button drawn at all,
-/// and the editor half alone passes while the chrome vanishes underneath it.
-/// The bare-map leg at the end holds the gate open the other way, so the fix
-/// cannot be "nothing fades any more".
+/// M8-11b. **A click on the Volume Alpha button is the button's click, and a click
+/// on a 3D pane is never the fade gesture.**
 #[test]
 fn the_volume_alpha_button_takes_the_click_the_pane_would_have_faded_on() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -13943,11 +11280,6 @@ fn the_volume_alpha_button_takes_the_click_the_pane_would_have_faded_on() {
             .alpha_editor_open
     };
 
-    // The 3D pane has to be the *already-active* one before the button is
-    // pressed. A press that switches panes is excluded from the fade gesture by
-    // `press_switched_pane`, so a test that clicks the button on an inactive
-    // pane is shielded from this bug by an unrelated rule — which is exactly
-    // why the two tests above stayed green through it.
     h.mouse_click(h.pane_rects()[1].center());
     h.warm_up();
     assert_eq!(
@@ -13961,7 +11293,6 @@ fn the_volume_alpha_button_takes_the_click_the_pane_would_have_faded_on() {
     );
     assert!(!editor_open(&mut h), "precondition: the editor starts shut");
 
-    // The corner button, on that already-active pane — the user's own gesture.
     let button = h
         .alpha_buttons()
         .into_iter()
@@ -13979,10 +11310,6 @@ fn the_volume_alpha_button_takes_the_click_the_pane_would_have_faded_on() {
         "the click also reached the pane underneath: it hid the UI like a bare-map tap"
     );
 
-    // And the pane's bare surface, which is the same gesture with no button
-    // under it: the position that *would* be the fade tap on a map pane. A 3D
-    // pane's click is that pane's own business — it orbits — so it must not
-    // hide the chrome either.
     h.gui_mut()
         .pane_mut(1)
         .expect("pane 1 exists")
@@ -13996,9 +11323,6 @@ fn the_volume_alpha_button_takes_the_click_the_pane_would_have_faded_on() {
         "a click on a 3D pane is the pane's own gesture, not the map fade"
     );
 
-    // The gate is still open where it belongs: the same double click on the
-    // plan-view pane beside it still fades, so this is a 3D pane's exemption
-    // and not the fade gesture being switched off.
     let map_spot = h.pane_rects()[0].center();
     h.mouse_click(map_spot);
     h.warm_up();
@@ -14010,11 +11334,7 @@ fn the_volume_alpha_button_takes_the_click_the_pane_would_have_faded_on() {
     );
 }
 
-/// M8-12. **The active-pane border shows all four edges at every grid
-/// position.** The stroke paints inside the pane rect, inside the map's
-/// content rect — with the outside stroke it shipped with, the outer edges
-/// were clipped away entirely (the top-left pane showed no border at all)
-/// and only inter-pane edges survived.
+/// M8-12. **The active-pane border shows all four edges at every grid position.**
 #[test]
 fn every_pane_border_lies_inside_its_pane_at_every_position() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -14024,8 +11344,6 @@ fn every_pane_border_lies_inside_its_pane_at_every_position() {
 
     for target in 0..6 {
         if h.active_pane_index() != target {
-            // The user's route: the first click on an inactive pane
-            // activates it (and never fades).
             h.mouse_click(h.pane_rects()[target].center());
             h.warm_up();
         }
@@ -14051,12 +11369,8 @@ fn every_pane_border_lies_inside_its_pane_at_every_position() {
     }
 }
 
-/// M8-13. **The release frame of a handle drag paints the dropped line,
-/// never the stale pre-drag one.** The drop records a pending edit that the
-/// applier consumes after the pane loop, so without the bridge the release
-/// frame painted the old committed geometry - a visible pop-back. (The gap
-/// predates the Synthesis rebuild; the drag machinery always committed
-/// through the deferred applier.)
+/// M8-13. **The release frame of a handle drag paints the dropped line, never the
+/// stale pre-drag one.**
 #[test]
 fn the_release_frame_paints_the_dropped_section_line() {
     let (mut h, _a, b) = harness_with_committed_section();
@@ -14078,7 +11392,6 @@ fn the_release_frame_paints_the_dropped_section_line() {
             .iter()
             .find(|&&(map_pane, section_pane, ..)| map_pane == 0 && section_pane == 1)
             .expect("the map pane paints its section track");
-        // The moved end is whichever cap sits nearer the grab.
         if (a_end - target_px).length() < (b_end - target_px).length() {
             a_end
         } else {
@@ -14107,21 +11420,13 @@ fn the_release_frame_paints_the_dropped_section_line() {
     );
 }
 
-// ── The transport's exact emission table (M10) ───────────────────────
-
-/// **Every transport control emits the exact payload the frontend acts
-/// on.** The M10 "time controls are inert" report taught that "some
-/// action was emitted" is too weak a pin: the break lived past emission,
-/// and the first thing its diagnosis needed was the exact variant and
-/// payload per control per state — so that table is now the contract.
-/// One realistic live fixture, every control clicked, every payload
-/// matched in full: pane index, sign, magnitude, variant selection.
+/// **Every transport control emits the exact payload the frontend acts on.**
 #[test]
 fn the_transport_controls_emit_the_exact_payloads_the_frontend_acts_on() {
     use crate::actions::GuiAction;
 
-    /// The frame's navigation-shaped actions, so the assertions cannot be
-    /// satisfied by the overlay fetches that share the vector.
+    /// The frame's navigation-shaped actions, so the assertions cannot be satisfied
+    /// by the overlay fetches that share the vector.
     fn nav(h: &InputHarness) -> Vec<String> {
         h.last_actions()
             .iter()
@@ -14142,7 +11447,6 @@ fn the_transport_controls_emit_the_exact_payloads_the_frontend_acts_on() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.load_scan("KTLX");
 
-    // Live while live: a no-op by design — nothing to jump to.
     h.mouse_click(h.timeline().live.0.center());
     assert_eq!(
         nav(&h),
@@ -14150,8 +11454,6 @@ fn the_transport_controls_emit_the_exact_payloads_the_frontend_acts_on() {
         "Live while already live must emit nothing"
     );
 
-    // Back at the default 10-minute step: NavigateTime, exactly -600,
-    // exactly pane 0 — and the pane drops out of live the same frame.
     h.mouse_click(h.timeline().back.center());
     assert_eq!(
         nav(&h),
@@ -14164,7 +11466,6 @@ fn the_transport_controls_emit_the_exact_payloads_the_frontend_acts_on() {
     );
     h.warm_up();
 
-    // Forward from the archive: the same step, positive.
     h.mouse_click(h.timeline().fwd.0.center());
     assert_eq!(
         nav(&h),
@@ -14173,7 +11474,6 @@ fn the_transport_controls_emit_the_exact_payloads_the_frontend_acts_on() {
     );
     h.warm_up();
 
-    // Live from the archive: JumpToLive for the active pane.
     h.mouse_click(h.timeline().live.0.center());
     assert_eq!(
         nav(&h),
@@ -14182,8 +11482,6 @@ fn the_transport_controls_emit_the_exact_payloads_the_frontend_acts_on() {
     );
     h.warm_up();
 
-    // The step picker rules the variant: "1 scan" flips both buttons from
-    // NavigateTime to NavigateOneScan. Picked through the real combo.
     h.mouse_click(h.timeline().step_dropdown.center());
     h.frame_after(FRAME_DT);
     let entry = h
@@ -14213,16 +11511,12 @@ fn the_transport_controls_emit_the_exact_payloads_the_frontend_acts_on() {
     );
     h.warm_up();
 
-    // The loop toggle: EnableLoop with the shared lookback, single pane
-    // meaning a single target.
     h.mouse_click(h.timeline().loop_toggle.0.center());
     assert_eq!(
         nav(&h),
         vec!["Enable loop for pane 0 (3600s lookback)"],
         "the loop toggle must enable with the shared lookback"
     );
-    // And with the loop running, the same toggle disables it — staged the
-    // way the frontend stages it, through the pane's own loop state.
     let site = rustdar_radar::sites::get_radar_site("KTLX").expect("known site");
     h.gui_mut().pane_mut(0).expect("pane 0").loop_state =
         crate::pane::LoopPlaybackState::new_for_loop(
@@ -14241,12 +11535,8 @@ fn the_transport_controls_emit_the_exact_payloads_the_frontend_acts_on() {
     );
 }
 
-/// **The scrubber's release payload names the released moment** — not
-/// merely "some NavigateTime". The step is relative to the pane's scan
-/// time because that is what `handle_navigate_time` adds it to; this
-/// derives the expected step from the same inputs (scan time, lookback,
-/// released fraction) and holds the emission to it within the tolerance
-/// a 500-something-point rail quantises to.
+/// **The scrubber's release payload names the released moment** — not merely "some
+/// NavigateTime".
 #[test]
 fn the_scrubbers_release_payload_names_the_released_moment() {
     use crate::actions::GuiAction;
@@ -14291,9 +11581,6 @@ fn the_scrubbers_release_payload_names_the_released_moment() {
             _ => None,
         })
         .expect("releasing the scrub mid-rail must emit NavigateTime for pane 0");
-    // The slider quantises the fraction to the rail's pixels; a generous
-    // ±60 s window still rules out every sign error, every off-by-a-
-    // lookback and every absolute-vs-relative confusion.
     let low = expected(before, frac) - 60;
     let high = expected(after, frac) + 60;
     assert!(
@@ -14303,23 +11590,12 @@ fn the_scrubbers_release_payload_names_the_released_moment() {
     );
 }
 
-// ── The loop toggle's button treatment (M10, second user test) ───────
-
-/// **The loop toggle is a real button at the bar's interact size, and its
-/// on-state is painted in the selection colour.** The second user test
-/// called the old form "super small and hard to tap": `Button::selectable`
-/// drops the frame while unselected, which left a bare text-width glyph
-/// between two framed neighbours. Pinned off the glass on both counts —
-/// the interact rect against `Spacing::interact_size`, and the painted
-/// fill against the style's `selection.bg_fill` in the on state (and
-/// against its absence in the off state).
+/// **The loop toggle is a real button at the bar's interact size, and its on-state
+/// is painted in the selection colour.**
 #[test]
 fn the_loop_toggle_is_a_real_button_with_a_visible_on_state() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.load_scan("KTLX");
-    // Fill assertions read the glass, and egui fades a fresh `Area` in over
-    // the style's animation time — `warm_up` alone never advances the clock,
-    // so the paint would stay opacity-multiplied forever. Real time first.
     h.frames_for(5, 0.1);
 
     let interact = h.interact_size();
@@ -14342,8 +11618,6 @@ fn the_loop_toggle_is_a_real_button_with_a_visible_on_state() {
         "the off-state toggle is painted in the selection colour"
     );
 
-    // Turn the loop on the way the frontend does and require the painted
-    // on-state.
     let site = rustdar_radar::sites::get_radar_site("KTLX").expect("known site");
     h.gui_mut().pane_mut(0).expect("pane 0").loop_state =
         crate::pane::LoopPlaybackState::new_for_loop(
@@ -14362,20 +11636,8 @@ fn the_loop_toggle_is_a_real_button_with_a_visible_on_state() {
     );
 }
 
-// ── The overlay draw path's click / label split ──────────────────────────
-//
-// `OverlayDrawContext::draw_overlay` used to be handed a fully built
-// `ClickableItem` list on every frame, and it wanted that list for two
-// unrelated things: the map labels it paints always, and the polygon
-// containment test it runs only for a click. The list now arrives as two
-// separate asks — a borrowed label slice, and a closure for the geometry that
-// only a click reaches. The three tests below hold both halves to what they
-// did before: a click inside a warning still opens it, a click outside still
-// opens nothing, and an MD still writes its number on the map on a frame with
-// no pointer activity at all.
-
-/// A square (lat, lon) ring of `half_deg` about a point, closed as GeoJSON
-/// rings arrive.
+/// A square (lat, lon) ring of `half_deg` about a point, closed as GeoJSON rings
+/// arrive.
 fn ring_about(lat: f64, lon: f64, half_deg: f64) -> Vec<(f64, f64)> {
     vec![
         (lat - half_deg, lon - half_deg),
@@ -14387,8 +11649,8 @@ fn ring_about(lat: f64, lon: f64, half_deg: f64) -> Vec<(f64, f64)> {
 }
 
 /// One NWS alert covering a square about (`lat`, `lon`), shaped like the
-/// zone-resolved alerts `nws::zones` builds: geometry in `features`, one
-/// feature per affected area.
+/// zone-resolved alerts `nws::zones` builds: geometry in `features`, one feature
+/// per affected area.
 fn alert_over(id: &str, event: &str, lat: f64, lon: f64) -> rustdar_overlays::nws::alert::NwsAlert {
     use rustdar_overlays::nws::alert::{AlertCategory, NwsAlert};
     let (fill, stroke) = rustdar_overlays::nws::colors::alert_color(event);
@@ -14421,9 +11683,9 @@ fn alert_over(id: &str, event: &str, lat: f64, lon: f64) -> rustdar_overlays::nw
 }
 
 /// A **zone-based** NWS alert, shaped as `nws::alert` admits one and
-/// `nws::zones::resolve_zone_geometry` then fills it: `affectedZones` listed,
-/// no `geometry` of its own, and `zones_resolved` features — one per zone whose
-/// fetch succeeded on this poll, which is `0` when they all failed.
+/// `nws::zones::resolve_zone_geometry` then fills it: `affectedZones` listed, no
+/// `geometry` of its own, and `zones_resolved` features — one per zone whose fetch
+/// succeeded on this poll, which is `0` when they all failed.
 fn zone_alert_over(
     id: &str,
     event: &str,
@@ -14453,8 +11715,8 @@ fn zone_alert_over(
     alert
 }
 
-/// Feed `alerts` in through the production ingest path, exactly as the
-/// national fetch delivers them.
+/// Feed `alerts` in through the production ingest path, exactly as the national
+/// fetch delivers them.
 fn ingest_alerts(h: &mut InputHarness, alerts: Vec<rustdar_overlays::nws::alert::NwsAlert>) {
     use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
     h.gui_mut().overlays.apply_fetch_result(OverlayFetchResult {
@@ -14464,11 +11726,6 @@ fn ingest_alerts(h: &mut InputHarness, alerts: Vec<rustdar_overlays::nws::alert:
 }
 
 /// A click inside a warning's polygon still selects that warning.
-///
-/// The claim the closure gating has to keep: the geometry is no longer built
-/// on every frame, so the frame that *does* carry a click is the only one that
-/// can still answer — if the ask were skipped there too, this is what would go
-/// quiet, and nothing else in the suite would notice.
 #[test]
 fn a_click_inside_an_alert_polygon_still_selects_it() {
     let mut h = InputHarness::new();
@@ -14500,8 +11757,8 @@ fn a_click_inside_an_alert_polygon_still_selects_it() {
     );
 }
 
-/// …and a click well outside every polygon still selects nothing, so the
-/// test above cannot pass by selecting everything the handler holds.
+/// …and a click well outside every polygon still selects nothing, so the test above
+/// cannot pass by selecting everything the handler holds.
 #[test]
 fn a_click_outside_every_alert_polygon_still_selects_nothing() {
     let mut h = InputHarness::new();
@@ -14510,8 +11767,6 @@ fn a_click_outside_every_alert_polygon_still_selects_nothing() {
 
     let pane = h.pane_rects()[0];
     let elsewhere = h.ground_at(0, pane.center());
-    // Ten degrees away: nowhere near the quarter-degree square, and off the
-    // pane's geography entirely at the default zoom.
     ingest_alerts(
         &mut h,
         vec![alert_over(
@@ -14531,15 +11786,7 @@ fn a_click_outside_every_alert_polygon_still_selects_nothing() {
     );
 }
 
-/// An MD writes its number on the map on an ordinary frame — no click, no
-/// pointer.
-///
-/// The label used to be carried on the same per-frame `ClickableItem` list the
-/// hit test read, which is exactly why gating that list on a click would have
-/// been wrong. Labels now come from `OverlayHandler::map_labels`, and this is
-/// the claim that they still arrive: delete the `map_labels` call from the
-/// draw loop and the map loses every MD number while every click test stays
-/// green.
+/// An MD writes its number on the map on an ordinary frame — no click, no pointer.
 #[test]
 fn an_md_still_labels_itself_on_a_frame_with_no_click() {
     use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
@@ -14584,9 +11831,9 @@ fn an_md_still_labels_itself_on_a_frame_with_no_click() {
     );
 }
 
-/// The cache token the last frame asked `kind`'s raster to be keyed by — the
-/// value `OverlayTextureCache::needs_rerender` compares the cached texture
-/// against, so two frames agreeing on it means no re-rasterize.
+/// The cache token the last frame asked `kind`'s raster to be keyed by — the value
+/// `OverlayTextureCache::needs_rerender` compares the cached texture against, so
+/// two frames agreeing on it means no re-rasterize.
 fn requested_cache_token(h: &InputHarness, kind: &LayerId) -> u64 {
     let tokens: Vec<u64> = h
         .last_actions()
@@ -14607,8 +11854,7 @@ fn requested_cache_token(h: &InputHarness, kind: &LayerId) -> u64 {
     tokens[0]
 }
 
-/// How many rasterizes the last frame asked for, for `kind`. Zero is the
-/// interesting number: it means the pane looked at its cache and was satisfied.
+/// How many rasterizes the last frame asked for, for `kind`.
 fn rasterizes_requested(h: &InputHarness, kind: &LayerId) -> usize {
     h.last_actions()
         .iter()
@@ -14618,14 +11864,8 @@ fn rasterizes_requested(h: &InputHarness, kind: &LayerId) -> usize {
         .count()
 }
 
-/// Stand every asking pane's cache up as a landed render would leave it:
-/// stamped with exactly the bounds, zoom and token the last frame requested.
-///
-/// Without this the harness can only be asked what a render was *keyed* by,
-/// because `current` is `None` until a result lands and a cache with no texture
-/// re-asks on every frame by definition. With it, a `RenderOverlay` afterwards
-/// is a real re-rasterize — a worker pass plus the frame-thread `ColorImage`
-/// conversion — which is the thing these tests are actually about.
+/// Stand every asking pane's cache up as a landed render would leave it: stamped
+/// with exactly the bounds, zoom and token the last frame requested.
 fn settle_overlay_cache(h: &mut InputHarness, kind: &LayerId) {
     let requests: Vec<_> = h
         .last_actions()
@@ -14659,13 +11899,6 @@ fn settle_overlay_cache(h: &mut InputHarness, kind: &LayerId) {
             .overlay_cache_mut(kind)
             .show(crate::overlay_cache::OverlayTextureData {
                 texture,
-                // What `spawn_overlay_render` stores, which is the plan's own
-                // coverage and *not* the viewport the request named. Storing the
-                // viewport gave the cache a zero-width overdraw band, so
-                // `pan_exceeds_coverage` was answering about a texture no render
-                // ever produced — and the one question it exists to answer, whether
-                // a freshly landed texture covers the pane that asked for it, could
-                // not be reached from here at all.
                 placed: rustdar_geo::PlacedRaster::of(plan.coverage(&geo_bounds)),
                 data_generation: token,
                 render_zoom: zoom,
@@ -14679,18 +11912,6 @@ fn settle_overlay_cache(h: &mut InputHarness, kind: &LayerId) {
 
 /// A poll that returns the same warning set must not re-rasterize the alert
 /// overlay, and the map pane is where that is decided.
-///
-/// `OverlayHandler::content_signature` was written for exactly this and had no
-/// consumer: the pane keyed its raster on `data_generation`, which `set_data`
-/// bumps on *every* successful poll. NWS alerts are default-on, `RenderMode::
-/// Texture`, and poll every 120 s, so each poll bought a worker rasterize plus
-/// a frame-thread `ColorImage` conversion — ~47 ms at 5760×3240 — for a
-/// byte-identical texture.
-///
-/// Asserted on the **rasterizes the pane asks for**, not on the token it would
-/// have keyed them by, so what this pins is the saving itself: ten identical
-/// polls dispatched ten rasterizes before the fix and zero after. The last
-/// stanza is what keeps that from being the trivially-satisfied kind of zero.
 #[test]
 fn an_unchanged_warning_set_does_not_re_rasterize_the_alert_overlay() {
     let mut h = InputHarness::new();
@@ -14711,7 +11932,6 @@ fn an_unchanged_warning_set_does_not_re_rasterize_the_alert_overlay() {
          zero below would say nothing about the fix",
     );
 
-    // Ten polls, two minutes apart, each returning the warning still out.
     for poll in 1..=10 {
         let generation_before = h.gui_mut().overlays.data_generation(&known::NWS_ALERTS);
         ingest_alerts(&mut h, warning_set());
@@ -14731,8 +11951,6 @@ fn an_unchanged_warning_set_does_not_re_rasterize_the_alert_overlay() {
         );
     }
 
-    // And the cache is not simply stuck saying yes: a warning that issues does
-    // buy a rasterize.
     ingest_alerts(
         &mut h,
         vec![
@@ -14757,14 +11975,6 @@ fn an_unchanged_warning_set_does_not_re_rasterize_the_alert_overlay() {
 
 /// …and the other half, or the pane would sit on a stale warning for ever: a
 /// warning **issuing** or **expiring** must move the token.
-///
-/// Those two, and not "or moving": a polygon that moves under a stable id is
-/// not a case the feed produces. `id` is the NWS per-message URN and an updated
-/// warning arrives as a new message under a new id, so it reaches this code as
-/// an expiry plus an issue — which is what the two halves below already are.
-/// The case that *is* real, and that this test does not cover, is a zone-based
-/// warning whose geometry arrives on a later poll under the same id; see
-/// [`a_warning_that_gains_its_polygons_re_rasterizes_the_alert_overlay`].
 #[test]
 fn a_changed_warning_set_moves_the_alert_overlays_cache_token() {
     let mut h = InputHarness::new();
@@ -14779,7 +11989,6 @@ fn a_changed_warning_set_moves_the_alert_overlays_cache_token() {
     h.warm_up();
     let one_warning = requested_cache_token(&h, &known::NWS_ALERTS);
 
-    // A second warning issues.
     ingest_alerts(
         &mut h,
         vec![
@@ -14799,7 +12008,6 @@ fn a_changed_warning_set_moves_the_alert_overlays_cache_token() {
         "a newly issued warning left the pane on its old raster",
     );
 
-    // The first expires out of the feed.
     ingest_alerts(
         &mut h,
         vec![alert_over(
@@ -14819,18 +12027,6 @@ fn a_changed_warning_set_moves_the_alert_overlays_cache_token() {
 
 /// The same warning, on a later poll, with the counties it draws — through the
 /// whole pane, because the consequence is a warning that is not on the map.
-///
-/// `nws::alert` admits an alert that lists `affectedZones` and carries no
-/// `geometry` and therefore **no features**; `nws::zones::resolve_zone_geometry`
-/// fills them in per poll and silently drops any zone whose fetch failed, with
-/// no retry. So this sequence — one alert id, zero features, then the same id
-/// with three — is an ordinary Tuesday, not a contrived one. It is one drawn
-/// alert on both polls, so nothing about the *set* moved; only the picture did.
-///
-/// Keying the pane's raster on a token that could not see that is what made
-/// this a blocker rather than a missed optimisation: the pane keeps its
-/// texture, nothing re-rasterizes, and the warning is absent until the user
-/// happens to pan or zoom.
 #[test]
 fn a_warning_that_gains_its_polygons_re_rasterizes_the_alert_overlay() {
     let mut h = InputHarness::new();
@@ -14848,8 +12044,6 @@ fn a_warning_that_gains_its_polygons_re_rasterizes_the_alert_overlay() {
         )]
     };
 
-    // Poll N: every zone fetch failed, so the warning draws nothing. Let that
-    // raster land, so the pane is holding a picture with no warning in it.
     ingest_alerts(&mut h, zone_warning(0));
     h.warm_up();
     settle_overlay_cache(&mut h, &known::NWS_ALERTS);
@@ -14861,7 +12055,6 @@ fn a_warning_that_gains_its_polygons_re_rasterizes_the_alert_overlay() {
          is just the cache still filling",
     );
 
-    // Poll N+1: the same warning, same id, now with its three counties.
     ingest_alerts(&mut h, zone_warning(3));
     h.warm_up();
     assert_eq!(
@@ -14873,15 +12066,8 @@ fn a_warning_that_gains_its_polygons_re_rasterizes_the_alert_overlay() {
     );
 }
 
-// ── The zoom key: a band in motion, an exact render at rest ──────────────
-
 /// Put the pane's map at `zoom`, which is all a wheel or pinch gesture leaves
 /// behind once it has been resolved.
-///
-/// Driven this way rather than through synthetic scroll events on purpose: what
-/// is under test is the *cache's* reaction to a moving zoom, and a gesture
-/// pipeline in between would make every assertion below also a claim about
-/// walkers' drag sensitivity.
 fn set_pane_zoom(h: &mut InputHarness, zoom: f64) {
     h.gui_mut().panes_mut()[0]
         .map_memory
@@ -14902,13 +12088,8 @@ fn requested_render_zoom(h: &InputHarness, kind: &LayerId) -> i32 {
         .expect("no RenderOverlay was emitted for this kind")
 }
 
-/// One alert overlay, rasterised and landed, with the map at `zoom`, and the
-/// frame loop *idle* — nothing else on the pane still asking to be redrawn.
-///
-/// The idling matters for one test only ([`a_stale_zoom_asks_for_the_frame_its_
-/// settle_needs`]) and costs the others nothing. egui's own fades and the map's
-/// first tiles keep asking for frames for a beat after startup, and while
-/// anything else is asking, "the overlay asked" is unobservable.
+/// One alert overlay, rasterised and landed, with the map at `zoom`, and the frame
+/// loop *idle* — nothing else on the pane still asking to be redrawn.
 fn settled_alert_pane(zoom: f64) -> InputHarness {
     let mut h = InputHarness::new();
     h.gui_mut().enable_overlay_for_test(&known::NWS_ALERTS);
@@ -14921,17 +12102,6 @@ fn settled_alert_pane(zoom: f64) -> InputHarness {
     set_pane_zoom(&mut h, zoom);
     h.warm_up();
     settle_overlay_cache(&mut h, &known::NWS_ALERTS);
-    // Frames until the loop actually goes idle, rather than a fixed count of
-    // them. `frame_after` advances the clock, which `warm_up` does not, so
-    // egui's startup fades do finish on a schedule — but they are not the only
-    // thing asking. `tile_source`'s fetch loop calls `request_repaint()` from a
-    // *task*, whenever a tile lands, and that is on the wall clock rather than
-    // on this one. Twelve frames was enough on an idle box and not always
-    // enough on a loaded one, which is a flake and not a fixture.
-    //
-    // The bound is a guard against spinning for ever, not the thing being
-    // waited for; overshooting it leaves `repaint_delay` non-idle, which the
-    // one test that cares asserts on directly and by name.
     for _ in 0..60 {
         if h.repaint_delay() == std::time::Duration::MAX {
             break;
@@ -14946,14 +12116,8 @@ fn settled_alert_pane(zoom: f64) -> InputHarness {
     h
 }
 
-/// Land every raster the pane asks for, up to `budget` of them, and report how
-/// many it took to go quiet. `budget` means "did not converge".
-///
-/// The closed loop this stands in for is the real one: a landed render sends an
-/// `OverlayRenderResponse`, `poll_overlay_render_results` stores it and
-/// `notify_redraw` asks for the frame that reads it back. So a cache that is
-/// never satisfied is not a slow cache — it is a raster running at the frame
-/// rate, for ever, on no input at all.
+/// Land every raster the pane asks for, up to `budget` of them, and report how many
+/// it took to go quiet.
 fn renders_until_quiet(h: &mut InputHarness, kind: &LayerId, budget: usize) -> usize {
     for landed in 0..budget {
         h.frame();
@@ -14965,26 +12129,9 @@ fn renders_until_quiet(h: &mut InputHarness, kind: &LayerId, budget: usize) -> u
     budget
 }
 
-/// **The raster that never stops.** Whatever the map is showing, a render that
-/// lands has to satisfy the pane that asked for it.
-///
-/// It did not, and the failure had no decay and no input: measured in Chromium
-/// on the wasm build at ~12 rasters a second — one full-size fill and upload
-/// per enabled texture layer per frame — held for a three-minute probe with the
-/// pointer still. See `pan_exceeds_coverage`; the short version is that walkers
-/// does not clamp the map to the world, so a pane taller than the world
-/// unprojects past the Mercator limit, while the texture's own bounds are
-/// clamped to it. The viewport then names ground no texture can ever contain.
-///
-/// Zoom is the axis because zooming out is what makes the pane taller than the
-/// world; the zoom band next door does not bound it, because this is the pan
-/// check and it is asked on every frame regardless.
+/// **The raster that never stops.**
 #[test]
 fn every_zoom_the_map_offers_reaches_a_cache_that_is_satisfied() {
-    // Walkers' own range is 0..=26. Below 3 the harness pane is already taller
-    // than the world; above 12 the whole viewport is inside one tile. Both ends
-    // matter — the loop was only ever reachable at the wide end, which is
-    // exactly why nothing caught it.
     for z in [0.0f64, 1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 14.0, 20.0, 26.0] {
         let mut h = settled_alert_pane(7.0);
         set_pane_zoom(&mut h, z);
@@ -15001,12 +12148,6 @@ fn every_zoom_the_map_offers_reaches_a_cache_that_is_satisfied() {
 
 /// Walk the zoom by `step` for `frames` frames, one 120 Hz frame per step, and
 /// return how many rasterizes were asked for along the way.
-///
-/// One frame per step, with the clock moving at gesture rate: the cache
-/// decides a gesture has *settled* by the zoom having been still for
-/// `SETTLE_REPAINT_DELAY` of `InputState::time`, so a helper that paused the
-/// zoom for longer than that between steps would be measuring the settle, not
-/// the gesture.
 fn zoom_gesture(h: &mut InputHarness, from: f64, step: f64, frames: usize) -> usize {
     let mut asked = 0;
     for i in 1..=frames {
@@ -15019,28 +12160,11 @@ fn zoom_gesture(h: &mut InputHarness, from: f64, step: f64, frames: usize) -> us
 
 /// The win. A zoom gesture that stays inside `ZOOM_REBUILD_BAND` costs **no**
 /// rasterizes at all while it is moving.
-///
-/// The key was an equality on the quantised zoom, and one step of that is 0.031
-/// zoom units — about 4.7 px of finger travel — against a gesture that moves
-/// `zoom` continuously as an `f64`. So it missed on nearly every frame, and each
-/// miss was a fresh 2880×1620 raster and a `write_texture` on the frame thread.
-///
-/// Measured on the **zoom-in** arm at the quarter overdraw, over a real
-/// 2-zoom-unit drag lasting 2 s: 31 renders over the gesture — 15.5 a second —
-/// and 204 ms of frame thread per second of zooming, against 2 renders plus one
-/// settle and 20 ms/s after. `OverlayTextureCache::needs_rerender` tabulates
-/// both arms and both overdraw fractions; the counts and the rates are kept
-/// apart there for the same reason they are here.
-///
-/// Counted over the frames of the gesture rather than at the end of it, so a
-/// key that merely *delayed* the storm rather than avoiding it would still fail.
 #[test]
 fn a_zoom_inside_the_band_asks_for_nothing_while_it_moves() {
     const Z0: f64 = 7.0;
     let mut h = settled_alert_pane(Z0);
 
-    // Twelve frames of 0.05, i.e. 0.6 of a zoom unit — comfortably inside the
-    // band and 19 quantisation steps past what the old key tolerated.
     let asked = zoom_gesture(&mut h, Z0, 0.05, 12);
     assert_eq!(
         asked, 0,
@@ -15050,8 +12174,8 @@ fn a_zoom_inside_the_band_asks_for_nothing_while_it_moves() {
     );
 }
 
-/// …and the other half: past the band, it does re-rasterize, so the zero above
-/// is a tolerance and not a cache that has stopped listening.
+/// …and the other half: past the band, it does re-rasterize, so the zero above is a
+/// tolerance and not a cache that has stopped listening.
 #[test]
 fn a_zoom_past_the_band_re_rasterizes_while_it_moves() {
     const Z0: f64 = 7.0;
@@ -15060,7 +12184,6 @@ fn a_zoom_past_the_band_re_rasterizes_while_it_moves() {
     let inside = zoom_gesture(&mut h, Z0, 0.05, 12);
     assert_eq!(inside, 0, "fixture: the first 0.6 must be free");
 
-    // One more frame, this time a step that carries the total past the band.
     set_pane_zoom(&mut h, Z0 + crate::overlay_cache::ZOOM_REBUILD_BAND + 0.01);
     h.frame();
     assert_eq!(
@@ -15071,16 +12194,8 @@ fn a_zoom_past_the_band_re_rasterizes_while_it_moves() {
     );
 }
 
-/// **The settle.** A gesture that ends inside the band buys exactly one
-/// rasterize when the map stops, at the zoom it stopped at — and then stops
-/// asking.
-///
-/// This is the half whose failure is silent, and the reason the band above is a
-/// tolerance rather than a downgrade. Mid-gesture the overlay is magnified or
-/// minified by up to 2× and its strokes do not rescale; that is accepted,
-/// because it lasts as long as the fingers are moving. A settle that never
-/// fired would make it permanent, with nothing on screen to say the picture is
-/// not the one this zoom would draw.
+/// **The settle.** A gesture that ends inside the band buys exactly one rasterize
+/// when the map stops, at the zoom it stopped at — and then stops asking.
 #[test]
 fn a_zoom_that_stops_inside_the_band_settles_exactly_once() {
     const Z0: f64 = 7.0;
@@ -15090,11 +12205,6 @@ fn a_zoom_that_stops_inside_the_band_settles_exactly_once() {
     assert_eq!(asked, 0, "fixture: the gesture itself must be free");
     let stopped_at = Z0 + 0.6;
 
-    // The map is now still, but the fingers only just stopped: the next few
-    // frames arrive inside SETTLE_REPAINT_DELAY and are not yet a settle.
-    // (Two frames at the same zoom *used* to be one — see
-    // `a_zoom_pause_shorter_than_the_settle_delay_is_not_a_settle` for what
-    // that misread on a phone.)
     h.frame_after(1.0 / 120.0);
     assert_eq!(
         rasterizes_requested(&h, &known::NWS_ALERTS),
@@ -15103,7 +12213,6 @@ fn a_zoom_that_stops_inside_the_band_settles_exactly_once() {
          touch stream that fires in the middle of the gesture"
     );
 
-    // A settle delay later, the exact render is asked for.
     h.frame_after(crate::overlay_cache::SETTLE_REPAINT_DELAY.as_secs_f64());
     assert_eq!(
         rasterizes_requested(&h, &known::NWS_ALERTS),
@@ -15117,7 +12226,6 @@ fn a_zoom_that_stops_inside_the_band_settles_exactly_once() {
         "the settle render was keyed at a zoom the map is not at"
     );
 
-    // Land it, and the asking stops — one settle, not a loop.
     settle_overlay_cache(&mut h, &known::NWS_ALERTS);
     for frame in 0..4 {
         h.frame_after(1.0 / 120.0);
@@ -15137,31 +12245,12 @@ fn a_zoom_that_stops_inside_the_band_settles_exactly_once() {
     );
 }
 
-/// **The misfire that hid the alert layer on a phone.** A pause shorter than
-/// [`SETTLE_REPAINT_DELAY`] — including the bit-identical zoom a coalesced
-/// touch stream produces on consecutive frames mid-gesture — is not a settle,
-/// and dispatches nothing.
-///
-/// The settle used to be "the same zoom on two frames running". A 120 Hz
-/// display outdraws the digitizer's sampling, and a frame lengthened by an
-/// inline raster coalesces the events behind it, so mid-gesture frames read
-/// equal zoom routinely — and each equality dispatched a full-size raster
-/// whose upload replaced the on-screen texture with a transparent stand-in.
-/// The producer and the cost compounded: every misfire lengthened frames,
-/// longer frames coalesced more, more coalescing manufactured the next
-/// misfire.
-///
-/// The last stanza is the positive control: after the pauses this test insists
-/// are free, a real stop still settles — so the zeros above are the delay's
-/// doing and not a cache that has stopped listening.
+/// **The misfire that hid the alert layer on a phone.**
 #[test]
 fn a_zoom_pause_shorter_than_the_settle_delay_is_not_a_settle() {
     const Z0: f64 = 7.0;
     let mut h = settled_alert_pane(Z0);
 
-    // The gesture moves, then the event stream under-samples: four frames at
-    // 120 Hz reading exactly the same zoom, then the gesture moves on. Under
-    // the two-frame equality, every still frame after the first dispatched.
     set_pane_zoom(&mut h, Z0 + 0.2);
     h.frame_after(1.0 / 120.0);
     assert_eq!(
@@ -15186,7 +12275,6 @@ fn a_zoom_pause_shorter_than_the_settle_delay_is_not_a_settle() {
         "the gesture resumed and the resume frame itself dispatched",
     );
 
-    // Control: an actual stop, held for the delay, settles once.
     h.frame_after(crate::overlay_cache::SETTLE_REPAINT_DELAY.as_secs_f64());
     assert_eq!(
         rasterizes_requested(&h, &known::NWS_ALERTS),
@@ -15196,15 +12284,7 @@ fn a_zoom_pause_shorter_than_the_settle_delay_is_not_a_settle() {
     );
 }
 
-/// The settle is level-triggered, so a frame it cannot act on does not consume
-/// it.
-///
-/// The edge-triggered version of this test passes: "zoom changed, then did not"
-/// is an event, and it is tempting to fire on the event. But the frame where
-/// the map stops can easily be a frame with a render already in flight — a
-/// gesture that crossed the band a moment earlier is exactly that case — and an
-/// event consumed then is an event gone. The cache asks "is the zoom still, and
-/// is my texture at another one", which stays true until it is answered.
+/// The settle is level-triggered, so a frame it cannot act on does not consume it.
 #[test]
 fn a_settle_frame_lost_to_an_in_flight_render_is_not_a_settle_lost() {
     const Z0: f64 = 7.0;
@@ -15213,9 +12293,6 @@ fn a_settle_frame_lost_to_an_in_flight_render_is_not_a_settle_lost() {
     let asked = zoom_gesture(&mut h, Z0, 0.05, 12);
     assert_eq!(asked, 0, "fixture: the gesture itself must be free");
 
-    // A render is in flight over the frame the gesture ends on — and over the
-    // frame the settle delay elapses on, which is the frame that would have
-    // dispatched.
     h.gui_mut().panes_mut()[0]
         .overlay_cache_mut(&known::NWS_ALERTS)
         .render_in_flight = true;
@@ -15227,7 +12304,6 @@ fn a_settle_frame_lost_to_an_in_flight_render_is_not_a_settle_lost() {
          is not about what it says"
     );
 
-    // It lands. The settle is still owed and still asked for.
     h.gui_mut().panes_mut()[0]
         .overlay_cache_mut(&known::NWS_ALERTS)
         .render_in_flight = false;
@@ -15241,12 +12317,6 @@ fn a_settle_frame_lost_to_an_in_flight_render_is_not_a_settle_lost() {
 }
 
 /// And the frame the settle needs is *asked for*, rather than left to arrive.
-///
-/// egui is reactive: it draws when something requests a draw. The last frame of
-/// a real gesture is the one its own input event produced, and if nothing asks
-/// for another, none comes — so the cache never gets the second look that tells
-/// it the map has stopped, and every test above would still pass while the app
-/// stayed blurry. `ui_map_pane` asks, for as long as `zoom_is_stale`.
 #[test]
 fn a_stale_zoom_asks_for_the_frame_its_settle_needs() {
     const Z0: f64 = 7.0;
@@ -15260,8 +12330,6 @@ fn a_stale_zoom_asks_for_the_frame_its_settle_needs() {
          other than the overlay is asking for frames without stopping"
     );
 
-    // One frame of gesture, ending inside the band: the texture is now at
-    // another zoom and a settle is owed.
     set_pane_zoom(&mut h, Z0 + 0.05);
     h.frame();
     assert!(
@@ -15273,12 +12341,8 @@ fn a_stale_zoom_asks_for_the_frame_its_settle_needs() {
     );
 }
 
-/// A harness with one pane on KTLX showing a finished hybrid-classification
-/// image that stood on `source`.
-///
-/// [`pane_showing`]'s sibling for the melting-layer notice, and built the same
-/// way — through the real UI, with the image *placed* rather than the accessor
-/// stubbed — so what is asserted is what a viewer would be looking at.
+/// A harness with one pane on KTLX showing a finished hybrid-classification image
+/// that stood on `source`.
 fn classification_showing(source: Option<rustdar_radar::hca::MeltingLayerSource>) -> InputHarness {
     use rustdar_radar::types::RadarProduct;
 
@@ -15302,10 +12366,6 @@ fn classification_showing(source: Option<rustdar_radar::hca::MeltingLayerSource>
 }
 
 /// The melting-layer notice a pane painted, if any.
-///
-/// Matched on the caption itself rather than on a leading icon: the notice
-/// deliberately carries none (see `ui_map_pane::melting_layer_notice`), and
-/// the caption *is* the whole message.
 fn melting_layer_notice_painted(h: &InputHarness) -> Option<String> {
     use rustdar_radar::hca::MeltingLayerSource;
     let captions = [
@@ -15320,26 +12380,12 @@ fn melting_layer_notice_painted(h: &InputHarness) -> Option<String> {
         .cloned()
 }
 
-/// **A viewer can tell a classification from a guess — and is not nagged about
-/// the ordinary case.**
-///
-/// Both halves matter and the second is the harder one. The same classifier
-/// scored against ten RPG `N0H` products gets 82.8–95.9 % exact standing on the
-/// RPG's own melting layer and 16.0–19.8 % standing on the fleet default, so a
-/// pane that drew the two identically would be drawing a measurement and a
-/// guess with the same authority.
-///
-/// But a caveat that fires on the measured case as well is worse than none: the
-/// section pane's module header records what that cost — a warning styled as a
-/// fault, shown on nearly every volume, read as something the user had broken
-/// and became an alarm people learn to skip. So the measured sources say
-/// **nothing at all**, and the unmeasured ones say it in the pane's ordinary
-/// quiet plate rather than in red.
+/// **A viewer can tell a classification from a guess — and is not nagged about the
+/// ordinary case.**
 #[test]
 fn a_classification_says_when_its_melting_layer_was_never_measured() {
     use rustdar_radar::hca::MeltingLayerSource;
 
-    // The two measured sources: the pane is silent.
     for measured in [MeltingLayerSource::Rpg, MeltingLayerSource::RadarDetected] {
         let h = classification_showing(Some(measured));
         assert!(
@@ -15354,8 +12400,6 @@ fn a_classification_says_when_its_melting_layer_was_never_measured() {
         );
     }
 
-    // The fleet default: the pane says so, in the source's own words, which
-    // quote the measured cost rather than hedging.
     let h = classification_showing(Some(MeltingLayerSource::FleetDefault));
     let notice = melting_layer_notice_painted(&h).unwrap_or_else(|| {
         panic!(
@@ -15367,8 +12411,6 @@ fn a_classification_says_when_its_melting_layer_was_never_measured() {
         notice.contains(MeltingLayerSource::FleetDefault.caption()),
         "the notice does not carry the source's own caption: {notice:?}",
     );
-    // Over the pane it is about, not somewhere in the chrome: in a split
-    // layout each pane answers for its own image.
     let pane_rect = h.pane_rects()[0];
     assert!(
         h.text_painted_in(pane_rect, MeltingLayerSource::FleetDefault.caption()),
@@ -15376,9 +12418,6 @@ fn a_classification_says_when_its_melting_layer_was_never_measured() {
         h.painted_text_strings(),
     );
 
-    // The sounding is the other unmeasured rung and is treated the same way —
-    // right height, no azimuthal structure, and only as contemporaneous as the
-    // sounding is.
     let sounding = classification_showing(Some(MeltingLayerSource::Sounding));
     assert!(
         melting_layer_notice_painted(&sounding)
@@ -15387,39 +12426,20 @@ fn a_classification_says_when_its_melting_layer_was_never_measured() {
         sounding.painted_text_strings(),
     );
 
-    // And a render that states no source at all — every product that
-    // classifies nothing — says nothing either.
     assert_eq!(
         melting_layer_notice_painted(&classification_showing(None)),
         None
     );
 }
 
-/// **No two top-of-pane notices are ever on screen together — and there are
-/// three of them now.**
-///
-/// They occupy the same spot by design (one plate, one voice), and *two
-/// different arrangements* keep the three apart. Both are asserted here,
-/// because generalising the plate without generalising this test is how the
-/// third one comes to stack on the second.
-///
-/// 1. **Against the pending notice: the `stale_image_on_screen` gate.** Both
-///    `PaneState::displayed_melting_layer_source` and
-///    `PaneState::displayed_storm_motion` return `None` while the pane
-///    is showing somebody else's product, because the render input they
-///    describe is not the one behind the picture on the glass.
-/// 2. **Against each other: the product.** One is gated on
-///    `HydrometeorClassification` and the other on `StormRelativeVelocity`,
-///    and a pane has one selected product — so this is not draw-order
-///    arithmetic and not an ordering convention, it is arithmetic that cannot
-///    come out any other way.
+/// **No two top-of-pane notices are ever on screen together — and there are three
+/// of them now.**
 #[test]
 fn the_top_of_pane_notices_never_stack() {
     use rustdar_radar::hca::MeltingLayerSource;
     use rustdar_radar::srv::StormMotionSource;
     use rustdar_radar::types::RadarProduct;
 
-    // 1. The melting-layer caveat against the pending notice.
     let mut h = classification_showing(Some(MeltingLayerSource::FleetDefault));
     assert!(
         melting_layer_notice_painted(&h).is_some() && !any_notice_painted(&h),
@@ -15433,9 +12453,6 @@ fn the_top_of_pane_notices_never_stack() {
         h.painted_text_strings(),
     );
 
-    // Switch product with no render landed: the pixels are now somebody
-    // else's, so the pending notice takes the plate and the melting-layer one
-    // goes quiet rather than sharing it.
     h.offer_product(0, RadarProduct::Reflectivity, 0.5);
     h.select_product(0, RadarProduct::Reflectivity);
     assert!(
@@ -15451,11 +12468,6 @@ fn the_top_of_pane_notices_never_stack() {
         h.painted_text_strings(),
     );
 
-    // 2. **There is no third notice any more.** The storm-motion plate was
-    //    removed rather than reworded: its vector moved into the legend, where
-    //    it is drawn on every rung and cannot contend for this position at all.
-    //    An SRV pane is asserted to leave the plate free, which is the
-    //    property a future rung with a caption "for symmetry" would break.
     let mut srv = storm_relative_showing(Some(srm_vector(StormMotionSource::BunkersRightMover)));
     assert!(
         srm_legend_line_painted(&srv).is_some() && !any_notice_painted(&srv),
@@ -15469,9 +12481,6 @@ fn the_top_of_pane_notices_never_stack() {
         srv.painted_text_strings(),
     );
 
-    // And the legend line is held to the same `stale_image_on_screen` gate the
-    // plate was: a pane showing somebody else's pixels says nothing about what
-    // shifted them, because it did not shift them.
     srv.offer_product(0, RadarProduct::Reflectivity, 0.5);
     srv.select_product(0, RadarProduct::Reflectivity);
     assert!(
@@ -15488,12 +12497,8 @@ fn the_top_of_pane_notices_never_stack() {
     );
 }
 
-/// A harness with one pane on KTLX showing a finished storm-relative velocity
-/// image that was shifted by `source`.
-///
-/// [`classification_showing`]'s sibling, built the same way — through the real
-/// UI, with the image *placed* rather than the accessor stubbed — so what is
-/// asserted is what a viewer would be looking at.
+/// A harness with one pane on KTLX showing a finished storm-relative velocity image
+/// that was shifted by `source`.
 fn storm_relative_showing(source: Option<rustdar_radar::srv::SrvMotion>) -> InputHarness {
     use rustdar_radar::types::RadarProduct;
 
@@ -15517,13 +12522,6 @@ fn storm_relative_showing(source: Option<rustdar_radar::srv::SrvMotion>) -> Inpu
 }
 
 /// The storm-motion line a pane painted into its legend, if any.
-///
-/// Matched on the `SRM ` prefix rather than on a table of expected strings,
-/// because the whole point of the line is that it carries *numbers* — a probe
-/// that listed the strings it expected could only ever confirm the tag.
-///
-/// This replaced a probe that matched whole caption sentences off
-/// `StormMotionSource::caption`. That method is gone with the plate it fed.
 fn srm_legend_line_painted(h: &InputHarness) -> Option<String> {
     h.painted_text_strings()
         .iter()
@@ -15531,8 +12529,8 @@ fn srm_legend_line_painted(h: &InputHarness) -> Option<String> {
         .cloned()
 }
 
-/// A vector on `source`'s rung, with numbers distinct enough per rung that a
-/// test which mixed two rungs up would also mix two readings up.
+/// A vector on `source`'s rung, with numbers distinct enough per rung that a test
+/// which mixed two rungs up would also mix two readings up.
 fn srm_vector(source: rustdar_radar::srv::StormMotionSource) -> rustdar_radar::srv::SrvMotion {
     use rustdar_radar::srv::StormMotionSource as S;
     let (speed_kt, direction_deg) = match source {
@@ -15549,20 +12547,6 @@ fn srm_vector(source: rustdar_radar::srv::StormMotionSource) -> rustdar_radar::s
 }
 
 /// **A viewer reads the vector their picture was shifted by, not an apology.**
-///
-/// Every gate on an SRV pane is a velocity with `speed \u{b7} cos(direction \u{2212}
-/// azimuth)` already added — a solid-body shift of the whole field. The number
-/// that did that is the one fact about the picture nothing on screen can
-/// recover, and it belongs in the legend on **every** rung.
-///
-/// This test replaced one that asserted the opposite shape. The pane used to
-/// draw a wrapped two-line plate over the radar on the two derived rungs and
-/// **nothing at all** on the ordinary one — so the reader who most often wanted
-/// to know what shifted their field was told nothing, and the reader on a
-/// fallback was told only that it might be badly wrong, in this codebase's own
-/// vocabulary, with no number and no recourse. The rungs the plate stayed quiet
-/// for are asserted here to speak, which is the half that would silently
-/// regress.
 #[test]
 fn a_storm_relative_field_shows_the_vector_it_was_shifted_by() {
     use rustdar_radar::srv::StormMotionSource;
@@ -15575,10 +12559,6 @@ fn a_storm_relative_field_shows_the_vector_it_was_shifted_by() {
     ] {
         let motion = srm_vector(rung);
         let mut h = storm_relative_showing(Some(motion));
-        // In the reader's own unit, so the expected number is converted here
-        // rather than written out — a literal would pin the *default* unit and
-        // say nothing about the conversion. `the_storm_motion_vector_is_drawn_
-        // in_the_readers_speed_unit` is the one that walks all four.
         h.gui_mut().preferences.speed = rustdar_units::SpeedUnit::Knots;
         h.warm_up();
         let line = srm_legend_line_painted(&h).unwrap_or_else(|| {
@@ -15588,7 +12568,6 @@ fn a_storm_relative_field_shows_the_vector_it_was_shifted_by() {
             )
         });
 
-        // The quantity: speed, direction, and one short word for the source.
         assert!(
             line.contains(&format!("{:.0} kt", motion.speed_kt)),
             "{rung:?}'s line names no speed: {line:?}",
@@ -15602,9 +12581,6 @@ fn a_storm_relative_field_shows_the_vector_it_was_shifted_by() {
             "{rung:?}'s line does not say where the vector came from: {line:?}",
         );
 
-        // In the legend, on the pane it describes — and **not** as a plate over
-        // the product. One line, and short: the plate this replaced wrapped to
-        // two lines across the middle of the radar.
         let pane_rect = h.pane_rects()[0];
         assert!(
             h.text_painted_in(pane_rect, &line),
@@ -15618,24 +12594,15 @@ fn a_storm_relative_field_shows_the_vector_it_was_shifted_by() {
         );
     }
 
-    // A render that states no vector at all — every product that shifts
-    // nothing — draws no line.
     assert_eq!(srm_legend_line_painted(&storm_relative_showing(None)), None);
 }
 
 /// **The vector relabels with the reader's speed unit, in the same frame.**
-///
-/// The one rule every user-facing number in this app is held to, applied to the
-/// number that replaced a paragraph. The direction is a compass bearing and
-/// stays in degrees in every unit system, which is asserted alongside — a
-/// conversion applied to it would be a silent, plausible-looking error.
 #[test]
 fn the_storm_motion_vector_is_drawn_in_the_readers_speed_unit() {
     use rustdar_radar::srv::{SrvMotion, StormMotionSource};
     use rustdar_units::SpeedUnit;
 
-    // 30.0 kt in each unit, rounded as the line rounds: 34.5 mph, 15.4 m/s,
-    // 55.6 km/h.
     let motion = SrvMotion {
         speed_kt: 30.0,
         direction_deg: 240.0,
@@ -15664,12 +12631,6 @@ fn the_storm_motion_vector_is_drawn_in_the_readers_speed_unit() {
 }
 
 /// **The pane never apologises for the rung it is on.**
-///
-/// The old plate's wording is pinned as absent, phrase by phrase, because that
-/// is the thing that would come back: a future rung added to the chain, given a
-/// caption "for symmetry", and drawn over the radar again. A rung within ~10\u{b0}
-/// of what the NWS publishes does not warrant a warning, and the two rungs that
-/// are further off are both reached only because a reader asked for them.
 #[test]
 fn no_storm_motion_rung_apologises_over_the_radar() {
     use rustdar_radar::srv::StormMotionSource;

@@ -33,10 +33,6 @@ fn target(site: &str, minute: u32, product: RadarProduct, ladder: u64) -> Sectio
 
 /// The payload cache reuses on the four things the payload actually depends
 /// on, and the **line is not one of them**.
-///
-/// That asymmetry is the cache's whole reason to exist: moving the line is
-/// the commonest way to want another cut, and it is the one case that must
-/// *not* pay for a 15.6 MB re-extraction.
 #[test]
 fn a_payload_is_reused_for_another_line_through_the_same_volume() {
     let base = target("KTLX", 30, RadarProduct::Reflectivity, 9);
@@ -97,17 +93,6 @@ fn a_payload_is_not_reused_across_volume_site_moment_or_ladder() {
 
 /// The storm motion vector is part of a storm-relative payload's identity,
 /// and of nothing else's.
-///
-/// An SRV section is not a slice of a measured moment: the derivation runs
-/// on the payload, so two vectors are two payloads. Without this the reuse
-/// test passed, `extract()` never ran, and the job shipped the previous
-/// vector's field — a *silent wrong field*, which is the failure mode this
-/// whole struct exists to make impossible.
-///
-/// The other half is as load-bearing as the first: the eight products that
-/// do not read a vector must keep their payload across an edit, or every
-/// nudge of a vector nobody is looking through costs a 15.6 MB re-walk of
-/// the volume.
 #[test]
 fn the_storm_motion_vector_is_part_of_a_storm_relative_payloads_identity() {
     let srv = target("KTLX", 30, RadarProduct::StormRelativeVelocity, 9);
@@ -139,9 +124,6 @@ fn the_storm_motion_vector_is_part_of_a_storm_relative_payloads_identity() {
              every frame",
     );
 
-    // Reflexive on a NaN vector: unequal-to-itself would not draw the
-    // wrong picture, it would re-extract 15.6 MB every frame the section
-    // stood.
     let nan = SectionInputKey::of(
         &srv,
         Some((f32::NAN, f32::NAN)),
@@ -156,8 +138,6 @@ fn the_storm_motion_vector_is_part_of_a_storm_relative_payloads_identity() {
         )
     );
 
-    // And the products that do not read a vector are not keyed on one —
-    // which is why this belongs in the key and not in an eviction.
     let refl = target("KTLX", 30, RadarProduct::Reflectivity, 9);
     assert_eq!(
         SectionInputKey::of(&refl, None, rustdar_radar::srv::SrvFallback::default()),

@@ -2,48 +2,32 @@ use super::*;
 use crate::FixQuality;
 use std::sync::{Arc, Mutex, PoisonError};
 
-// Every test here runs with no session bus, no portal and no geoclue. That
-// is not incidental: CI has none of those, and the parts of this file worth
-// testing — what a sentinel means, what a refusal means, what a timestamp
-// is — are exactly the parts that never touch the wire.
+// Every test here runs with no session bus, no portal and no geoclue.
 
-/// Speed and heading share one sentinel in the payload geoclue hands the
-/// portal, documented on both properties.
-///
-/// Test-only, because `ashpd` strips it — [`Location::speed`] and
-/// [`Location::heading`] return `None` for `-1.0` — and the rules this file
-/// does apply reject it anyway. Both of those are claims worth checking,
-/// because "absent" and "reversing at one metre per second" are the same
-/// wire value and only one of them is a reading.
+/// Speed and heading share one sentinel in the payload geoclue hands the portal.
+/// Test-only, because `ashpd` strips it.
 const SPEED_HEADING_UNKNOWN: f64 = -1.0;
 
 /// The application id: the basename of the shipped `.desktop` file, the iOS
 /// bundle id and the Android `applicationId`, which are one string.
 const APP_ID: &str = "dev.mcswain.rustdar";
 
-// ── Sentinels ───────────────────────────────────────────────────────
-
 /// The sentinel is spelled `f64::MIN` here, `-f64::MAX` inside `ashpd` and
-/// `-1.7976931348623157e+308` in the interface XML. If those ever stop
-/// being the same number, every altitude the portal reports becomes garbage
-/// rather than absent.
+/// `-1.7976931348623157e+308` in the interface XML.
 #[test]
 fn the_altitude_sentinel_is_the_number_the_interface_documents() {
     assert_eq!(ALTITUDE_UNKNOWN, -1.797_693_134_862_315_7e308);
     assert_eq!(ALTITUDE_UNKNOWN, -f64::MAX);
 }
 
-/// `ashpd` strips this one, so reaching [`decode_altitude`] with it means
-/// `ashpd` changed its mind — and the answer must still be "absent" rather
-/// than "3.4 × 10³⁰⁸ metres below sea level".
+/// Reaching [`decode_altitude`] with it means `ashpd` changed its mind — and the
+/// answer must still be "absent".
 #[test]
 fn an_unknown_altitude_is_absent_rather_than_enormous() {
     assert_eq!(decode_altitude(ALTITUDE_UNKNOWN), None);
 }
 
-/// The regression this function exists for. Altitude is the one field whose
-/// sentinel is *not* a sign test, and reusing the speed rule here would
-/// discard every valid reading below sea level.
+/// Altitude is the one field whose sentinel is *not* a sign test.
 #[test]
 fn an_altitude_below_sea_level_is_a_reading_and_not_a_sentinel() {
     assert_eq!(decode_altitude(-430.0), Some(-430.0));
@@ -54,9 +38,7 @@ fn an_ordinary_altitude_survives() {
     assert_eq!(decode_altitude(357.0), Some(357.0));
 }
 
-/// Spelled out rather than compared against itself: `ashpd` decides what
-/// this value means before this file sees it, and a sign flip on either
-/// side would turn "1 m/s" into "unknown" on every fix.
+/// A sign flip on either side would turn "1 m/s" into "unknown" on every fix.
 #[test]
 fn the_speed_and_heading_sentinel_is_the_number_the_interface_documents() {
     assert_eq!(SPEED_HEADING_UNKNOWN, -1.0);
@@ -69,10 +51,8 @@ fn a_reversing_speed_is_not_a_speed() {
     assert_eq!(decode_speed(-0.5), None);
 }
 
-/// A stationary receiver says nothing about a bearing, and
-/// `HeadingSource::Auto` reads exactly this field to decide whether to
-/// trust one. `Some(0.0)` and `None` are the same statement, and only one
-/// of them stays true after a unit conversion or a comparison.
+/// `HeadingSource::Auto` reads exactly this field to decide whether to trust a
+/// bearing.
 #[test]
 fn a_stationary_reading_is_no_speed_rather_than_a_speed_of_zero() {
     assert_eq!(decode_speed(0.0), None);
@@ -83,8 +63,8 @@ fn a_real_speed_survives() {
     assert_eq!(decode_speed(3.5), Some(3.5));
 }
 
-/// Due north is 0 degrees and shares no digits with the sentinel, so a
-/// truthiness test here would delete the one bearing users notice.
+/// Due north is 0 degrees, so a truthiness test would delete the one bearing
+/// users notice.
 #[test]
 fn a_heading_of_due_north_is_kept() {
     assert_eq!(decode_heading(0.0), Some(0.0));
@@ -100,9 +80,7 @@ fn a_negative_accuracy_radius_is_not_a_radius() {
     assert_eq!(decode_accuracy(-1.0), None);
 }
 
-/// The measured value on the development machine, which must pass: the
-/// site-upgrade gate rejects only the absurd, and 25 km beats the timezone
-/// guess it replaces by an order of magnitude.
+/// The measured value on the development machine, which must pass.
 #[test]
 fn the_twenty_five_kilometre_fix_this_machine_reports_is_kept() {
     assert_eq!(decode_accuracy(25_000.0), Some(25_000.0));
@@ -113,15 +91,12 @@ fn an_infinite_accuracy_radius_is_rejected() {
     assert_eq!(decode_accuracy(f64::INFINITY), None);
 }
 
-// ── Timestamps ──────────────────────────────────────────────────────
-
 #[test]
 fn the_epoch_converts_to_the_epoch() {
     let t = timestamp_from_epoch(0).expect("the epoch is representable");
     assert_eq!(t.and_utc().timestamp(), 0);
 }
 
-/// The stamp on the fix this machine actually reported, live.
 #[test]
 fn a_real_portal_timestamp_survives_the_conversion() {
     let t = timestamp_from_epoch(1_786_203_902).expect("representable");
@@ -134,11 +109,8 @@ fn a_timestamp_beyond_the_representable_range_is_absent_rather_than_wrapped() {
     assert_eq!(timestamp_from_epoch(u64::MAX), None);
 }
 
-// ── The whole reading ───────────────────────────────────────────────
-
-/// The reading this machine actually answers with, measured through the
-/// portal: a real position, a 25 km circle, and a sentinel in every other
-/// numeric field.
+/// The reading this machine actually answers with, measured through the portal:
+/// a real position, a 25 km circle, and a sentinel everywhere else.
 fn measured() -> Reading {
     Reading {
         latitude: 35.4689,
@@ -168,11 +140,8 @@ fn the_reading_this_machine_sends_becomes_a_device_fix_with_its_accuracy() {
     );
 }
 
-/// The honesty rule, pinned on the real path because it is the one somebody
-/// will be tempted to "improve": accuracy says how tight the circle is and
-/// says nothing at all about whether a satellite was involved. The variant
-/// also has to be one the site upgrade acts on, or the whole arm draws a
-/// dot and never refines anything.
+/// Accuracy says how tight the circle is and nothing about whether a satellite
+/// was involved. The variant also has to be one the site upgrade acts on.
 #[test]
 fn even_a_five_metre_fix_is_reported_as_a_device_fix_and_not_as_gps() {
     let fix = fix_from_reading(&Reading {
@@ -184,8 +153,7 @@ fn even_a_five_metre_fix_is_reported_as_a_device_fix_and_not_as_gps() {
     assert!(fix.fix_quality.can_relocate());
 }
 
-/// Real backends do report movement, and a fix that dropped it would lose
-/// the only heading source a desktop has.
+/// A fix that dropped movement would lose a desktop's only heading source.
 #[test]
 fn a_moving_fix_keeps_its_speed_and_heading() {
     let fix = fix_from_reading(&Reading {
@@ -202,10 +170,8 @@ fn a_moving_fix_keeps_its_speed_and_heading() {
     assert_eq!(fix.heading_deg, Some(271.0));
 }
 
-/// Latitude and longitude are the only required fields, and a payload that
-/// carries neither is not a location. The portal's dictionary always has
-/// both keys, so the shape that reaches here is a NaN rather than a
-/// missing entry — and a NaN drawn on a map is a dot at nowhere.
+/// The portal's dictionary always has both keys, so the shape that reaches here
+/// is a NaN rather than a missing entry — and a NaN on a map is a dot at nowhere.
 #[test]
 fn a_reading_with_no_real_coordinates_is_not_a_fix() {
     assert!(
@@ -224,17 +190,9 @@ fn a_reading_with_no_real_coordinates_is_not_a_fix() {
     );
 }
 
-// ── The wire ────────────────────────────────────────────────────────
-
-/// A `LocationUpdated` body, built and encoded the way the portal sends
-/// one, then decoded by `ashpd` exactly as the session thread would decode
-/// it.
-///
-/// This is the only test that touches D-Bus types, and it earns its keep
-/// twice: it pins the seven-field mapping in [`Reading::from`], where a
-/// latitude/longitude swap would otherwise be invisible until a dot landed
-/// in the wrong hemisphere, and it pins `ashpd`'s own sentinel handling,
-/// which this file has stopped doing itself.
+/// A `LocationUpdated` body, built and encoded the way the portal sends one,
+/// then decoded by `ashpd`. The only test that touches D-Bus types: it pins the
+/// seven-field mapping in [`Reading::from`] and `ashpd`'s sentinel handling.
 fn decode_wire(latitude: f64, longitude: f64, altitude: f64, speed: f64, heading: f64) -> Location {
     use ashpd::zvariant::{self, Endian, ObjectPath, OwnedValue, Value};
 
@@ -296,9 +254,8 @@ fn the_payload_the_portal_sends_decodes_into_the_fix_this_machine_reported() {
     assert_eq!(fix.fix_quality, FixQuality::Device);
 }
 
-/// Latitude and longitude are two doubles of the same shape in the same
-/// dictionary, and reading them the wrong way round produces a position
-/// that is perfectly well-formed and on the other side of the planet.
+/// Reading them the wrong way round produces a position that is well-formed and
+/// on the other side of the planet.
 #[test]
 fn latitude_and_longitude_are_not_read_the_wrong_way_round() {
     let location = decode_wire(1.0, 2.0, ALTITUDE_UNKNOWN, -1.0, -1.0);
@@ -306,8 +263,7 @@ fn latitude_and_longitude_are_not_read_the_wrong_way_round() {
     assert_eq!(Reading::from(&location).longitude, 2.0);
 }
 
-/// `ashpd` owns the three sentinels now, so this is the test that notices
-/// if it stops.
+/// `ashpd` owns the three sentinels now, so this notices if it stops.
 #[test]
 fn ashpd_still_strips_the_sentinels_this_file_no_longer_checks() {
     let location = decode_wire(
@@ -327,8 +283,6 @@ fn ashpd_still_strips_the_sentinels_this_file_no_longer_checks() {
     assert_eq!(moving.heading(), Some(271.0));
 }
 
-// ── Error classification ────────────────────────────────────────────
-
 /// The refusal this machine gives by default, verbatim from the wire:
 /// `org.freedesktop.portal.Error.NotAllowed: Location services disabled`.
 fn lockdown() -> ashpd::Error {
@@ -337,19 +291,15 @@ fn lockdown() -> ashpd::Error {
     ))
 }
 
-/// The lockdown switch is a preference somebody set, so it is a decision,
-/// so it is `Denied` and not `Unavailable`. `Unavailable` would render as
-/// "Not available on this platform", which is false — the platform has a
-/// location service and is running it for other applications — and it would
-/// hide the one sentence that fixes the problem.
+/// A preference somebody set, so `Denied` and not `Unavailable`, which would
+/// hide the sentence that fixes the problem.
 #[test]
 fn the_lockdown_switch_reads_as_a_denial_and_not_as_a_missing_service() {
     assert_eq!(classify(&lockdown()), LocationPermission::Denied);
 }
 
-/// The advice has to be actionable on a desktop that has no page for this,
-/// which is every desktop except GNOME — and the default state of the key
-/// means this is the *first* thing a KDE user sees.
+/// The advice has to be actionable on a desktop with no page for this, which is
+/// every desktop except GNOME.
 #[test]
 fn the_lockdown_message_names_the_setting_that_would_turn_it_on() {
     let message = explain(&lockdown());
@@ -360,8 +310,7 @@ fn the_lockdown_message_names_the_setting_that_would_turn_it_on() {
     assert!(message.contains("gsettings set"), "{message}");
 }
 
-/// Response code 1: a human answered the portal's dialog with "Deny", or
-/// the permission store still holds the last time they did.
+/// Response code 1: the portal's dialog answered "Deny", or a stored refusal.
 #[test]
 fn a_refused_request_reads_as_a_denial() {
     assert_eq!(
@@ -370,11 +319,9 @@ fn a_refused_request_reads_as_a_denial() {
     );
 }
 
-/// Response code 2, which is what this machine returns when the portal's
-/// own GeoClue client will not start. `Denied` and `Unavailable` are both
-/// terminal for the gate, so classifying this as either would end location
-/// for the session over something a retry fixes — and a portal restart
-/// really does fix it.
+/// Response code 2, what this machine returns when the portal's own GeoClue
+/// client will not start. `Denied` and `Unavailable` are both terminal, so
+/// either would end location over something a retry fixes.
 #[test]
 fn a_portal_that_could_not_carry_the_request_out_leaves_the_user_able_to_retry() {
     assert_eq!(
@@ -384,8 +331,7 @@ fn a_portal_that_could_not_carry_the_request_out_leaves_the_user_able_to_retry()
     assert!(explain(&ashpd::Error::Response(ResponseError::Other)).contains("again"));
 }
 
-/// A machine with no portals frontend has no switch to turn on, and telling
-/// its user to look for one is the advice `Unavailable` exists to avoid.
+/// A machine with no portals frontend has no switch to turn on.
 #[test]
 fn a_missing_portal_reads_as_unavailable_and_not_as_a_denial() {
     let missing = ashpd::Error::PortalNotFound(
@@ -407,10 +353,9 @@ fn method_error(name: &str) -> ashpd::Error {
     ))
 }
 
-/// `ashpd` reports "nobody owns `org.freedesktop.portal.Desktop`" as an
-/// ordinary method error rather than as `PortalNotFound`, so this arm is
-/// the one that stands between a machine with no portal installed and a
-/// settings pane offering a button that can never work.
+/// `ashpd` reports "nobody owns `org.freedesktop.portal.Desktop`" as an ordinary
+/// method error rather than as `PortalNotFound`, so this arm stands between a
+/// machine with no portal and a settings pane offering a dead button.
 #[test]
 fn a_bus_with_no_portal_on_it_reads_as_unavailable() {
     assert_eq!(
@@ -431,7 +376,6 @@ fn a_bus_policy_refusal_reads_as_a_denial() {
     );
 }
 
-/// Anything else is a hiccup, not a verdict.
 #[test]
 fn an_unrecognised_fault_leaves_the_user_able_to_try_again() {
     assert_eq!(
@@ -444,12 +388,8 @@ fn an_unrecognised_fault_leaves_the_user_able_to_try_again() {
     );
 }
 
-// ── Endings ─────────────────────────────────────────────────────────
-
-/// The push half of the permission story, and the reason the session
-/// watches `Closed` at all: the gate stops asking once the answer is
-/// `Granted` and delivery is live, so with the settings window shut this is
-/// the only thing that can say delivery has ended.
+/// The push half: the gate stops asking once the answer is `Granted` and
+/// delivery is live.
 #[test]
 fn a_session_the_portal_closed_is_reported_and_stays_retryable() {
     assert_eq!(
@@ -461,31 +401,21 @@ fn a_session_the_portal_closed_is_reported_and_stays_retryable() {
     );
 }
 
-/// A stop the bridge asked for must report nothing at all. The gate answers
-/// `Denied` by calling `stop_location`, so a stop that reported anything
-/// would overwrite the very state that caused it.
+/// The gate answers `Denied` by calling `stop_location`, so a report here would
+/// overwrite the state that caused it.
 #[test]
 fn a_deliberate_stop_reports_nothing() {
     assert_eq!(Ending::Stopped.report(), None);
     assert_eq!(Ending::ConsumerGone.report(), None);
 }
 
-// ── The contract's first phase ──────────────────────────────────────
-
 /// Bringing the provider up calls nothing, delivers nothing, and reports
 /// [`LocationPermission::Prompt`] before it returns.
 ///
-/// `Prompt` and not `Unknown`, and the difference is the whole reason the
-/// contract asks for an initial report at all: `Unknown` means "the
-/// platform has not answered yet, look again shortly", and this provider
-/// does not answer until it is started — the first portal call is the first
-/// answer and it can sit on an access dialog. Reporting `Unknown` would
-/// leave the settings pane on "Checking…" for the life of the process with
-/// nothing ever prompting.
-///
-/// Synchronously, on the caller's thread: a report made from a spawned
-/// thread would race the first frame, and the first frame is what decides
-/// whether the pane offers a button.
+/// `Prompt` and not `Unknown`: this provider does not answer until it is
+/// started, so `Unknown` would leave the pane on "Checking…" for the life of the
+/// process. Synchronously, because the first frame decides whether the pane
+/// offers a button.
 #[test]
 fn bringing_the_provider_up_says_prompt_and_starts_no_session() {
     let (fixes, _receiver) = std::sync::mpsc::channel();
@@ -514,22 +444,16 @@ fn bringing_the_provider_up_says_prompt_and_starts_no_session() {
     );
 }
 
-/// Linux offers no settings button, and that has to stay a deliberate
-/// `false` rather than a value somebody flips because Windows has one: the
-/// only page that exists is GNOME's, the desktop whose default causes the
-/// refusal is KDE, and a button that opens nothing is worse than a sentence
-/// that says what to type.
+/// Linux offers no settings button, and that stays a deliberate `false`: the
+/// only page that exists is GNOME's and the desktop whose default causes the
+/// refusal is KDE.
 #[test]
 fn linux_offers_no_location_settings_page() {
     assert!(!OsLocationReader::settings_available());
 }
 
-/// A session whose thread has exited must not leave the provider claiming
-/// to be live — otherwise `request` would see `active` and refuse to start
-/// a second one, and the button would be dead for the life of the process.
-/// Through the provider's own `active`, on a reader holding a session whose
-/// receiver end has been dropped — which is exactly what a thread that
-/// returned leaves behind.
+/// A session whose thread has exited must not leave the provider claiming to be
+/// live — `request` would see `active` and refuse to start a second one.
 #[test]
 fn a_session_whose_thread_has_gone_is_no_longer_active() {
     let (fixes, _receiver) = std::sync::mpsc::channel();
@@ -556,16 +480,9 @@ fn a_session_whose_thread_has_gone_is_no_longer_active() {
     );
 }
 
-// ── Identity ────────────────────────────────────────────────────────
-
-/// The entry the packaging installs, named by the path this file compiles
-/// it in from — which is what pins the **basename**, and the basename is
-/// the application id.
-///
-/// No longer part of asking for a location, and kept because it is still
-/// the app's identity: the launcher entry, the icon lookup, the window
-/// grouping and a future Flatpak's id. `include_str!` is the check —
-/// renaming or deleting the file fails this build.
+/// The entry the packaging installs, named by the path this file compiles it in
+/// from, which pins the **basename** — the application id. `include_str!` is the
+/// check.
 const DESKTOP_ENTRY: &str = include_str!("../../../../packaging/linux/dev.mcswain.rustdar.desktop");
 
 #[test]
@@ -577,12 +494,11 @@ fn the_packaged_entry_is_named_for_the_application_id() {
     assert_eq!(APP_ID, "dev.mcswain.rustdar");
 }
 
-/// The launcher shows the user this name and this icon.
 #[test]
 fn the_desktop_entry_carries_the_name_and_icon_a_launcher_will_show() {
     assert!(DESKTOP_ENTRY.contains("\nName=Rustdar"), "{DESKTOP_ENTRY}");
-    // A bare identifier, not a path: the icon theme spec resolves this
-    // against the installed hicolor sizes, and a path would pin one.
+    // A bare identifier, not a path: the icon theme spec resolves this against
+    // the installed hicolor sizes.
     assert!(
         DESKTOP_ENTRY.contains(&format!("\nIcon={APP_ID}\n")),
         "{DESKTOP_ENTRY}"

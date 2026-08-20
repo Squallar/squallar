@@ -1,39 +1,5 @@
 //! The every-option parity walk: on every width class, every option the models
 //! offer must be reachable and *drawn* through the real chrome.
-//!
-//! This is the migration's fixed star. The inventories are derived from the
-//! models — [`Gui::menu_model_leaf_labels`], each
-//! [`OVERLAY_CONTROL_ORDER`] handler's [`ControlItem`] tree,
-//! [`SETTINGS_ROWS`] — never written out here, so a newly added option joins
-//! the audit by construction and a dropped one fails it. The drawn half comes
-//! from the probes the renderers write ([`DrawnControlItem`],
-//! [`crate::ui::DrawnMenuLeaf`], [`crate::ui::DrawnSettingsRow`]); the walk
-//! never reconstructs what "should" have been painted.
-//!
-//! Each width class is walked through the chrome a user of that width gets:
-//! the top bar's Layers toggle opens the layer stack — sidebar on Expanded,
-//! drawer elsewhere — each stack row opens its layer's options in the
-//! inspector, the ☰ button opens the one menu dropdown every width shares,
-//! its Settings… entry opens the inspector's App › Settings body, and the
-//! stack's `+ Add layer` opens the catalog — the modal above 600 pt, the
-//! sheet's Catalog page below it — whose every tile the walk scrolls on
-//! screen. The 3D pane's hand-written rows are the one literal inventory —
-//! see [`walk_volume_body`] for why they cannot be derived.
-//! `ScrollArea`s lay content out beyond the viewport, so an item is only
-//! counted once its probe's rect centre is inside the screen —
-//! [`InputHarness::scroll_until`] does the scrolling a user would.
-//!
-//! A handler's heading and its master `enabled` toggle are excluded from the
-//! control inventory through [`is_master_control`] — the renderer's own
-//! predicate — because the inspector expresses them as the crumb and the
-//! "Show <layer>" toggle; the walk asserts that toggle drew instead.
-//!
-//! Assertion failures name the missing label *and* the width class, because
-//! "reachable on desktop" and "reachable on a phone" are separate claims and
-//! the whole point here is which one broke.
-//!
-//! [`Gui::menu_model_leaf_labels`]: crate::Gui
-//! [`ControlItem`]: rustdar_overlays::render::controls::ControlItem
 
 use crate::input_harness::InputHarness;
 use crate::ui::{
@@ -51,12 +17,9 @@ use rustdar_source::id::{LayerId, known};
 const SCROLL_STEP: egui::Vec2 = egui::vec2(0.0, -160.0);
 
 /// How many scroll steps the walk spends looking for one item before calling
-/// it unreachable. Generous: the drawer's full content is a few thousand
-/// points tall at most.
+/// it unreachable.
 const MAX_SCROLL_STEPS: usize = 120;
 
-/// Where the walk points the wheel to scroll the inspector: inside its own
-/// area, from egui's authority on where that is.
 fn inspector_scroll_pos(h: &InputHarness) -> egui::Pos2 {
     h.inspector_rect()
         .expect("the inspector must be on screen to be scrolled")
@@ -118,8 +81,6 @@ fn assert_control_reachable(
     );
 }
 
-/// The drawn shape each model item must appear as. `None` for a separator,
-/// which draws nothing nameable.
 fn drawn_kind(item: &ControlItem) -> Option<DrawnControlKind> {
     Some(match item {
         ControlItem::Toggle { .. } => DrawnControlKind::Checkbox,
@@ -133,10 +94,6 @@ fn drawn_kind(item: &ControlItem) -> Option<DrawnControlKind> {
 }
 
 /// Walk one handler's item list, depth first, asserting each drawable item.
-///
-/// A collapsed section's children record no probe at all, so when a section
-/// header is on screen but its first child was never recorded, the walk opens
-/// it the way a user does — a click on the header — before descending.
 fn assert_control_tree(
     h: &mut InputHarness,
     width: WidthClass,
@@ -168,8 +125,6 @@ fn assert_control_tree(
                 if let Some((kind, child_label)) = first_child
                     && !control_recorded(h, handler, kind, child_label)
                 {
-                    // Collapsed: open it as a user would and let the children
-                    // record themselves.
                     let header = h
                         .control_items()
                         .into_iter()
@@ -190,7 +145,6 @@ fn assert_control_tree(
     }
 }
 
-/// The label a non-container item is asserted under.
 fn control_label(item: &ControlItem) -> &str {
     match item {
         ControlItem::Toggle { label, .. }
@@ -204,11 +158,9 @@ fn control_label(item: &ControlItem) -> &str {
 
 /// The representative handler the walk runs with its layer **hidden**: the
 /// richest gated-history tree (dropdown, slider, level toggles, refresh),
-/// so its leg proves reachability does not depend on visibility — the eye
-/// hides pixels, never options (the M9.1 user report). Explicitly disabled
-/// rather than trusting the handler's default, so a default flip cannot
-/// silently retire the coverage; the overlays crate's controls-parity test
-/// pins the model half of the same rule for all twelve kinds.
+/// so its leg proves reachability does not depend on visibility. Explicitly
+/// disabled rather than trusting the handler's default, so a default flip
+/// cannot silently retire the coverage.
 const HIDDEN_WALK_HANDLER: LayerId = known::LIGHTNING;
 
 /// Every handler's every control, reachable through its stack row and the
@@ -231,15 +183,11 @@ fn walk_layer_controls(h: &mut InputHarness, width: WidthClass) {
         );
         // The user's route: the stack row. Handles the drawer, the scroll to
         // the row, and asserts the layer body's own arm drew. The master
-        // controls the tree filter excludes render as the crumb and the
-        // stack row's 👁 eye — the layer's one on/off since the Show
-        // toggle's de-dup (contract 86) — and the helper asserts the eye on
-        // the very row it clicks, so excluding them from the inventory
-        // cannot quietly orphan a layer's on/off.
+        // controls the tree filter excludes render as the crumb and the stack
+        // row's 👁 eye, and the helper asserts the eye on the very row it clicks.
         h.open_layer_in_inspector(handler);
         assert_control_tree(h, width, handler, &model);
     }
-    // Leave nothing open over the next phase's clicks.
     h.close_inspector();
 }
 
@@ -283,7 +231,6 @@ fn walk_menu(h: &mut InputHarness, width: WidthClass) {
             h.screen_rect()
         );
     }
-    // Closed again so the next phase's clicks cannot land on the popup.
     h.close_menu();
 }
 
@@ -304,8 +251,6 @@ fn walk_time_dialog(h: &mut InputHarness, width: WidthClass) {
         );
     }
 
-    // Close it the user's way, so the next phase's menu clicks cannot land on
-    // the dialog instead.
     let cancel = h
         .painted_text_rects()
         .into_iter()
@@ -344,18 +289,6 @@ fn walk_settings(h: &mut InputHarness, width: WidthClass) {
 
 /// Every catalog entry, drawn and reachable through each shell's own route —
 /// the modal above 600 pt, the sheet's Catalog page below it (M7's leg).
-///
-/// The inventories are the models the renderer itself draws from: the
-/// compiled-in presets table, the registry's own handler ids under its
-/// display names, `RadarProduct::all()` and `ModelParameter::all()` — never a
-/// restated name list, so a new product or parameter joins the audit by
-/// construction. User presets are deliberately absent: a fresh session has
-/// none, and their tiles share the built-ins' code path. The user-preset
-/// tiles and the Save tile are instead covered by the dedicated preset suite
-/// (`a_saved_preset_appears_applies_and_deletes` and its neighbours), once
-/// rather than per width — they render inside the same host this walk just
-/// scrolled end to end, so a second per-width pass would re-walk the same
-/// code for no new claim.
 fn walk_catalog(h: &mut InputHarness, width: WidthClass) {
     let mut inventory: Vec<(CatalogGroup, String)> = Vec::new();
     for preset in builtin_presets() {
@@ -374,14 +307,11 @@ fn walk_catalog(h: &mut InputHarness, width: WidthClass) {
         inventory.push((CatalogGroup::Hrrr, param.display_name().to_owned()));
     }
 
-    // Anti-shrink floor on the one inventory leg that is *derived* (WO-M9).
-    // `default_draw_order` reads the composed registry — this crate's
-    // `sources::all`, which chains `rustdar-overlays`' eleven with
-    // `rustdar-radar`'s one — so a composition that quietly lost a source
-    // crate would hand this walk a shorter list and the walk would pass by
-    // checking fewer tiles. Cross-checked against `OVERLAY_CONTROL_ORDER`,
-    // which is a hand-kept literal maintained on the other side of the same
-    // question: the two spellings cannot shrink together by accident.
+    // Anti-shrink floor on the one inventory leg that is *derived*.
+    // `default_draw_order` reads the composed registry, so a composition that
+    // quietly lost a source crate would hand this walk a shorter list.
+    // Cross-checked against `OVERLAY_CONTROL_ORDER`, a hand-kept literal: the
+    // two spellings cannot shrink together by accident.
     let layers_in_inventory = inventory
         .iter()
         .filter(|(group, _)| *group == CatalogGroup::Overlays)
@@ -396,8 +326,6 @@ fn walk_catalog(h: &mut InputHarness, width: WidthClass) {
     );
 
     h.open_catalog();
-    // Where the wheel points: the sheet on the phone, the modal elsewhere —
-    // each host's own scrolling surface.
     let scroll_pos = if width == WidthClass::Compact {
         h.sheet_rect()
             .expect("the Catalog page is open, so the sheet has a rect")
@@ -416,7 +344,6 @@ fn walk_catalog(h: &mut InputHarness, width: WidthClass) {
              {width:?} — the model offers it but the catalog never showed it"
         );
     }
-    // Closed again so the next phase's clicks cannot land on the host.
     assert!(
         h.gui_mut().dismiss_top_layer(),
         "the catalog was open, so a back press must close it"
@@ -426,18 +353,6 @@ fn walk_catalog(h: &mut InputHarness, width: WidthClass) {
 
 /// The 3D pane's own rows in the Pane-properties body, reachable at every
 /// width through that width's own route to the body.
-///
-/// Unlike the layer legs, this inventory is a literal list: the volume rows
-/// are hand-written in `render_volume_controls` rather than offered by a
-/// model, so there is nothing to derive them from. The restatement is the
-/// point — the sidebar-order contract
-/// (`kind_specific_blocks_sit_inside_the_shared_sidebar_structure`) pins
-/// these rows on one Expanded screen only, and the block is the body's
-/// *last*: on the Compact sheet its tail (the Map floor checkbox, the Reset
-/// view button) lays out below the fold, where only the scroll this leg
-/// performs proves a phone user can reach it at all. A row added to the
-/// volume body joins this list by review rather than by construction; a row
-/// dropped from the body fails it by name, on the width that lost it.
 fn walk_volume_body(h: &mut InputHarness, width: WidthClass) {
     h.make_pane_volume(0);
     if width == WidthClass::Compact {
@@ -478,8 +393,7 @@ fn walk_volume_body(h: &mut InputHarness, width: WidthClass) {
 
 /// Every visible pane carries its pill row (M5): presence, at every width.
 /// Deliberately not a per-option leg — every option behind the pills is the
-/// inspector's own inventory through the shared pickers (`ui_pills.rs`'s
-/// module note), so the walk's existing inspector legs already audit them;
+/// inspector's own inventory through the shared pickers, already audited;
 /// what only the pills can lose is the rows themselves.
 fn walk_pills(h: &mut InputHarness, width: WidthClass) {
     let panes = h.pane_rects();
@@ -504,16 +418,11 @@ fn walk_pills(h: &mut InputHarness, width: WidthClass) {
 /// The Pane-properties sync section (M11): on a split layout, the five
 /// per-pane rows — three links, two actions — reachable through the
 /// inspector route at every width, against the one inventory
-/// `pills::sync_section_ui` renders ([`crate::ui::SYNC_SECTION_LABELS`],
-/// the model half; the drawn half is the `InspectorProbe`'s `sync_rows`,
-/// written by the renderer). The popover route shows the same function over
-/// the same labels — contracts 73f/73h drive the per-row behaviour; what
-/// the walk owes is that the rows are *on screen* per width.
+/// `pills::sync_section_ui` renders ([`crate::ui::SYNC_SECTION_LABELS`]).
+/// What the walk owes is that the rows are *on screen* per width.
 fn walk_sync_section(h: &mut InputHarness, width: WidthClass) {
     h.set_pane_count(2);
     if width == WidthClass::Compact {
-        // The phone's route: the bottom bar's Pane item hosts the body as
-        // the sheet's Inspector page.
         let item = h.bottom_bar().pane.0;
         h.mouse_click(item.center());
         h.warm_up();

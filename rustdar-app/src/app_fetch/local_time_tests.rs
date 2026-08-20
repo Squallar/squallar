@@ -1,12 +1,6 @@
 use super::*;
 use chrono::{FixedOffset, LocalResult, NaiveDate};
 
-/// US Central in 2024: -6 in winter, -5 in summer, springing forward at
-/// 2024-03-10 02:00 local and back at 2024-11-03 02:00 local.
-///
-/// Hand-rolled because `Local` is whatever the machine running the tests is
-/// set to: on a zone without DST every assertion below passes vacuously, and
-/// on one with it the dates would have to track that zone's rules.
 #[derive(Clone, Copy, Debug)]
 struct UsCentral2024;
 
@@ -39,12 +33,10 @@ impl chrono::TimeZone for UsCentral2024 {
         if *local < at(3, 10, 2, 0) {
             LocalResult::Single(fixed(CST))
         } else if *local < at(3, 10, 3, 0) {
-            // The skipped hour: no instant carries this wall-clock time.
             LocalResult::None
         } else if *local < at(11, 3, 1, 0) {
             LocalResult::Single(fixed(CDT))
         } else if *local < at(11, 3, 2, 0) {
-            // Named twice, an hour apart.
             LocalResult::Ambiguous(fixed(CDT), fixed(CST))
         } else {
             LocalResult::Single(fixed(CST))
@@ -78,10 +70,6 @@ fn an_ordinary_local_time_converts_by_the_offset_in_force() {
     );
 }
 
-/// The defect. 02:30 does not exist on the spring-forward day, and the time
-/// picker and every relative navigation step can land there. Falling back to
-/// `now()` answered a question nobody asked: a request for a scan from the
-/// small hours fetched the current one and the pane jumped to live.
 #[test]
 fn a_time_the_clocks_skipped_lands_next_to_itself_not_at_now() {
     let asked = at(3, 10, 2, 30);
@@ -101,8 +89,6 @@ fn a_time_the_clocks_skipped_lands_next_to_itself_not_at_now() {
     );
 }
 
-/// The whole skipped hour, not just its middle, and the edges either side of
-/// it are untouched.
 #[test]
 fn the_whole_skipped_hour_resolves_within_an_hour_of_itself() {
     for minute in [0, 1, 30, 59] {
@@ -126,9 +112,6 @@ fn the_whole_skipped_hour_resolves_within_an_hour_of_itself() {
     );
 }
 
-/// An hour named twice resolves to the later of the two instants — the one
-/// nearer to now, which is where a user stepping back through scans has just
-/// come from.
 #[test]
 fn an_hour_the_clocks_repeated_resolves_to_the_second_pass() {
     assert_eq!(

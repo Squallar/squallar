@@ -1,25 +1,5 @@
-//! The model-grid overlay dispatch is a **described job**, end to end — the
-//! last kind through the wire, and the one that used to be the documented
-//! reason `spawn_overlay_render` kept an opaque closure arm at all.
-//!
-//! These pin the replacement from the dispatch side: the handler answers its
-//! `prepare_job` (the grid by `Arc`, so describing costs a refcount), the
-//! dispatch builds a `JobRequest::Overlay` carrying the described
-//! `ModelDataInput`, and the funnel posts it — so a browser with
-//! a worker attached rasterizes the grid across the port instead of paying
-//! the raster inline on a gesture-settle frame. What the sink serialises is
-//! the projection-window **cut** of that grid, and executing the recorded
-//! request directly and through its own bytes must paint identical pixels;
-//! the codec-level twin of that claim (with its floors and controls) is
-//! `offload::tests::the_model_render_is_byte_identical_direct_and_via_the_wire`.
-//!
-//! Reverting the dispatch to a closure fails
-//! [`the_model_dispatch_is_a_described_job_of_the_whole_grid`] by shape —
-//! the port records nothing, because a closure is executed rather than
-//! posted — and the un-wedge half by silence, since no failure response can
-//! exist for a job that was never described. The described set as a whole is
-//! pinned from the other side by `rustdar-overlays`'
-//! `every_texture_kind_rasterizes_as_a_described_job`.
+//! The model-grid overlay dispatch is a **described job**, end to end — the last kind
+//! through the wire.
 
 use rustdar_egui::overlay_cache::OverlayTexturePlan;
 use rustdar_geo::GeoBounds;
@@ -28,8 +8,7 @@ use rustdar_source::id::known;
 use std::sync::{Arc, Mutex};
 
 /// A sink that records what the funnel hands it and takes every job —
-/// `polygon_wire_tests`' port, restated because each test file owns its
-/// double.
+/// `polygon_wire_tests`' port.
 struct RecordingPort {
     taken: Arc<Mutex<Vec<(u64, rustdar_worker::offload::JobRequest)>>>,
 }
@@ -64,10 +43,8 @@ fn a_render_request() -> super::OverlayRenderRequest {
     }
 }
 
-/// A 6×5 CIN grid over the viewport — the handler's default parameter, so no
-/// control has to be driven — with values alternating between a painting
-/// −300 J/kg and a sub-threshold 0, so the raster genuinely paints and the
-/// parity below is not over a blank buffer.
+/// A 6×5 CIN grid over the viewport — the handler's default parameter, so no control
+/// has to be driven.
 fn a_seedable_grid() -> rustdar_overlays::hrrr::HrrrGridData {
     use rustdar_overlays::hrrr::{GridCoords, HrrrGridData, ModelParameter};
     let parameter = ModelParameter::SurfaceBasedCin;
@@ -107,9 +84,8 @@ fn a_seedable_grid() -> rustdar_overlays::hrrr::HrrrGridData {
     }
 }
 
-/// Seed the registry through `apply_fetch_result` — the same door a live
-/// fetch uses — and keep the pane's stored per-layer config in step, the way
-/// `polygon_wire_tests::seed` explains.
+/// Seed the registry through `apply_fetch_result` — the same door a live fetch uses —
+/// and keep the pane's stored per-layer config in step.
 fn seed(app: &mut crate::app::App) {
     let data: rustdar_overlays::render::overlay_state::FetchPayload = Box::new(
         rustdar_overlays::hrrr::HrrrFetchResult(Ok(a_seedable_grid())),
@@ -132,10 +108,8 @@ fn in_flight(app: &mut crate::app::App) -> bool {
         .render_in_flight
 }
 
-/// The dispatch posts **one described job** carrying the model input — the
-/// grid whole, by `Arc`, so the native transport moves a refcount and the
-/// window cut happens only where bytes are built — and what it posts
-/// rasterizes byte-identically directly and through its own wire form.
+/// The dispatch posts **one described job** carrying the model input — the grid whole,
+/// by `Arc`.
 #[test]
 fn the_model_dispatch_is_a_described_job_of_the_whole_grid() {
     let taken = Arc::new(Mutex::new(Vec::new()));
@@ -156,8 +130,6 @@ fn the_model_dispatch_is_a_described_job_of_the_whole_grid() {
          gesture-end rasterization S5d removed",
     );
     let (_, request) = &posted[0];
-    // The envelope destructure is irrefutable since WO-M7.2; the typed
-    // downcast below is what proves the dispatch posted this kind.
     let rustdar_worker::offload::JobRequest { geometry, job } = request;
     assert_eq!(
         (geometry.width, geometry.height),
@@ -177,11 +149,6 @@ fn the_model_dispatch_is_a_described_job_of_the_whole_grid() {
          carry exists so the memcpy happens only where bytes must be built",
     );
 
-    // The browser's sink serialises exactly this value on its way out. The
-    // whole-grid carry canonicalises to its window there, so the round trip
-    // is asserted on the *pixels*: direct execution of the recorded request
-    // and execution of its own bytes must paint the same picture — with a
-    // painted floor, or the equality would hold over a blank buffer.
     let direct = rustdar_worker::offload::execute(request)
         .and_then(|out| out.take::<rustdar_overlays::render::rasterize::RasterizeOutput>())
         .expect("the posted model job rasterizes")
@@ -207,9 +174,8 @@ fn the_model_dispatch_is_a_described_job_of_the_whole_grid() {
     );
 }
 
-/// The failure path closes the loop: the worker dies with the model job
-/// outstanding, the funnel fails it, and the image-less response — the only
-/// thing that clears the named panes' in-flight marks — reaches the channel.
+/// The failure path closes the loop: the worker dies with the model job outstanding,
+/// the funnel fails it, and the image-less response.
 #[test]
 fn a_dead_worker_unwedges_a_model_pane() {
     let taken = Arc::new(Mutex::new(Vec::new()));

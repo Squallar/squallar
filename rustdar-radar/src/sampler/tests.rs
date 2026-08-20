@@ -5,12 +5,9 @@ use nexrad_model::data::{
 };
 
 // ── Fixtures ────────────────────────────────────────────────────────────
-//
-// Every fixture uses a **nonzero** first gate (2.125 km, the operational
-// super-resolution value) rather than 0, because `first_gate_range_km` is
-// a gate *centre* and a sampler that forgot it would be ~2 km — eight
-// gates — inward on every read while still passing any test that started
-// its gates at the origin.
+// Every fixture uses a nonzero first gate (2.125 km, the operational
+// super-resolution value): `first_gate_range_km` is a gate *centre*, and a
+// sampler that forgot it would be eight gates inward on every read.
 
 const REFL_SCALE: f32 = 2.0;
 const REFL_OFFSET: f32 = 66.0;
@@ -19,15 +16,10 @@ const VEL_OFFSET: f32 = 129.0;
 const FIRST_GATE_M: u16 = 2125;
 const GATE_M: u16 = 250;
 
-/// dBZ through the reflectivity encoding. Clamped at 2 because 0 and 1 are
-/// the below-threshold and range-folded status codes.
 fn encode_refl(dbz: f64) -> u8 {
     ((dbz * f64::from(REFL_SCALE) + f64::from(REFL_OFFSET)).round() as i64).clamp(2, 255) as u8
 }
 
-/// What `encode_refl` round-trips to. Assertions compare against this
-/// rather than against the dBZ that went in, so a 0.5 dB quantisation step
-/// is not mistaken for a sampler error.
 fn round_trip_refl(dbz: f64) -> f64 {
     f64::from((f32::from(encode_refl(dbz)) - REFL_OFFSET) / REFL_SCALE)
 }
@@ -40,7 +32,6 @@ fn round_trip_vel(ms: f64) -> f64 {
     f64::from((f32::from(encode_vel(ms)) - VEL_OFFSET) / VEL_SCALE)
 }
 
-/// The slant range, km, of gate `j` in every fixture below.
 fn gate_slant_km(j: usize) -> f64 {
     f64::from(FIRST_GATE_M) / 1000.0 + j as f64 * f64::from(GATE_M) / 1000.0
 }
@@ -57,14 +48,8 @@ fn moment_from(bytes: Vec<u8>, scale: f32, offset: f32) -> MomentData {
     )
 }
 
-/// A field to plant: dBZ (or m/s) at an azimuth and slant range, or `None`
-/// for below threshold.
 type Field<'f> = &'f dyn Fn(f64, f64) -> Option<f64>;
 
-/// One sweep, carrying whichever of the two moments is asked for.
-///
-/// Azimuths are `i · 360/n`, so a 720-radial sweep sits on exact halves of
-/// a degree and a query at a radial centre lands on it bit-exactly.
 fn make_sweep(
     elevation_number: u8,
     elevation_deg: f32,
@@ -84,14 +69,6 @@ fn make_sweep(
     )
 }
 
-/// [`make_sweep`] with a clock on every radial.
-///
-/// `collected_ms` is milliseconds since the Unix epoch, and `0` is the
-/// decoder's own "no timestamp" value — which is what every fixture that does
-/// not care about time passes, through [`make_sweep`]. A fixture that *does*
-/// care needs distinct clocks per sweep, because "when was this rung flown" is
-/// answered off these radials on both sides of the worker port and a volume of
-/// identical zeros cannot tell a preserved clock from a dropped one.
 #[allow(clippy::too_many_arguments)]
 fn make_sweep_at(
     collected_ms: i64,
@@ -136,7 +113,6 @@ fn make_sweep_at(
     Sweep::new(elevation_number, radials)
 }
 
-/// A reflectivity-only sweep of a constant field.
 fn flat_refl_sweep(
     elevation_number: u8,
     elevation_deg: f32,
@@ -154,12 +130,6 @@ fn flat_refl_sweep(
     )
 }
 
-/// A reflectivity sweep with **explicit azimuths in collection order**.
-///
-/// Collection order is not azimuth order: a real sweep starts wherever the
-/// antenna was and wraps through 0°, which is what makes the by-azimuth
-/// index a real index rather than a copy of the radial list. Azimuths that
-/// are evenly spaced and start at 0 hide every ordering bug there is.
 fn refl_sweep_at(
     elevation_number: u8,
     elevation_deg: f32,
@@ -194,8 +164,6 @@ fn refl_sweep_at(
     Sweep::new(elevation_number, radials)
 }
 
-/// A velocity-only sweep of a constant field — the Doppler half of a split
-/// cut, and the shape a SAILS repeat of a Doppler cut takes.
 fn flat_velocity_sweep(elevation_number: u8, elevation_deg: f32, ms: f64) -> Sweep {
     make_sweep(
         elevation_number,
@@ -255,17 +223,6 @@ fn vcp(cut_angles: &[f64]) -> VolumeCoveragePattern {
 
 // ── The tilt ladder ─────────────────────────────────────────────────────
 
-/// The rule the whole campaign settled on, in the one geometry that proves
-/// no angular threshold can substitute for it.
-///
-/// KBMX under VCP 212 with the adaptive base tilt declares genuine cuts at
-/// **0.40° and 0.48° — 0.09° apart** — while the spread of first-radial
-/// angles *within* the 0.48° cut is 0.088° and the gap to the 0.40° cut is
-/// also 0.088°. The windows touch exactly. Reproduced here with medians
-/// 0.09° apart, which is what the fixture asserts as a precondition: any
-/// threshold wide enough to close a cut's own spread also swallows a whole
-/// genuine cut, and at 0.2° the failure is not a merged pair but a
-/// *vanished* rung inside a plausible monotone ladder.
 #[test]
 fn the_ladder_separates_cuts_no_angular_threshold_can() {
     let scan = Scan::new(
@@ -278,9 +235,6 @@ fn the_ladder_separates_cuts_no_angular_threshold_can() {
     );
 
     let separation = 0.53 - 0.44;
-    // precondition: the two cuts really are inside every threshold the
-    // campaign measured (0.10 / 0.15 / 0.20 / 0.30), so a rule that split
-    // them cannot have done it by angle.
     assert!(
         separation < 0.10,
         "precondition: the fixture's cuts are {separation:.3}° apart, \
@@ -300,8 +254,6 @@ fn the_ladder_separates_cuts_no_angular_threshold_can() {
     let nominal: Vec<f64> = sampler.nominal_elevations_deg().collect();
     assert_eq!(nominal, vec![0.40, 0.48, 0.90]);
 
-    // And each rung really carries its own sweep's data, which is what
-    // "the 0.48° cut vanished" would have destroyed.
     let column = sampler.column(45.0, 8.0);
     let values: Vec<f64> = column
         .rungs()
@@ -318,9 +270,6 @@ fn the_ladder_separates_cuts_no_angular_threshold_can() {
     );
 }
 
-/// The nominal cut angle is the grouping key and nothing else: the
-/// geometry is the chosen sweep's median radial elevation, which measured
-/// volumes put up to 0.044° off nominal.
 #[test]
 fn a_rungs_geometry_is_its_sweeps_median_not_the_nominal_cut() {
     let scan = Scan::new(
@@ -345,9 +294,6 @@ fn a_rungs_geometry_is_its_sweeps_median_not_the_nominal_cut() {
         );
     }
 
-    // The consequence, in metres: at 100 km the 0.032° offset on the 4.0°
-    // cut moves the beam centre far enough to matter, and exactly the kind
-    // of error that reads as plausible.
     let with_median = beam::height_at_ground_km(100.0, geometry[1]);
     let with_nominal = beam::height_at_ground_km(100.0, nominal[1]);
     assert!(
@@ -358,10 +304,6 @@ fn a_rungs_geometry_is_its_sweeps_median_not_the_nominal_cut() {
     );
 }
 
-/// A split cut is two VCP cuts at one angle: a surveillance half reaching
-/// 460 km with no velocity, and a Doppler half reaching 300 km with it.
-/// Reflectivity belongs to the surveillance half; velocity has no choice
-/// but the Doppler one.
 #[test]
 fn a_non_doppler_moment_takes_the_surveillance_half_of_a_split_cut() {
     // 1832 gates from 2.125 km at 250 m reaches 460 km; 1200 reaches 302.
@@ -390,18 +332,12 @@ fn a_non_doppler_moment_takes_the_surveillance_half_of_a_split_cut() {
         "reflectivity came from the Doppler half of the split cut",
     );
 
-    // The reason it matters: only the surveillance half reaches past
-    // 300 km, and the Doppler half would have reported nothing there.
     let far = refl.column(45.0, 400.0).rungs()[0].sample;
     assert_eq!(
         f64::from(far.value().expect("460 km of surveillance gates")),
         round_trip_refl(20.0),
     );
 
-    // The preference is a *preference*: an upper cut is a single merged
-    // sweep carrying everything, so there is no velocity-free half to
-    // prefer and reflectivity falls back to the newest sweep that has it.
-    // Two merged cuts at one angle is what MRLE produces.
     let merged = Scan::new(
         vcp(&[4.0, 4.0]),
         vec![
@@ -437,7 +373,6 @@ fn a_non_doppler_moment_takes_the_surveillance_half_of_a_split_cut() {
              back to the newest sweep",
     );
 
-    // Velocity has one candidate and takes it.
     let vel = VolumeSampler::new(&scan, RadarProduct::Velocity).unwrap();
     assert_eq!(
         vel.tilt_count(),
@@ -452,8 +387,6 @@ fn a_non_doppler_moment_takes_the_surveillance_half_of_a_split_cut() {
     );
 }
 
-/// SAILS repeats the low cuts minutes apart. The newest is what the
-/// reference display shows and what a section must show.
 #[test]
 fn the_newest_sweep_of_a_repeated_cut_wins_its_rung() {
     let scan = Scan::new(
@@ -472,9 +405,6 @@ fn the_newest_sweep_of_a_repeated_cut_wins_its_rung() {
         "the rung kept the first 0.5° cut rather than the SAILS repeat",
     );
 
-    // The Doppler arm takes the same preference and is reached by a
-    // different branch, so it needs its own volume: SAILS repeats the
-    // Doppler cuts too.
     let scan = Scan::new(
         vcp(&[0.5, 0.9, 0.5]),
         vec![
@@ -497,19 +427,11 @@ fn the_newest_sweep_of_a_repeated_cut_wins_its_rung() {
     );
 }
 
-/// A volume joined mid-flight starts partway up the ladder and wraps into
-/// the next one, so its sweeps do not arrive in cut order. The ladder has
-/// to be ascending anyway — a section reads its rows off it, and a
-/// descending pair inverts every bracket in the column.
-///
-/// One of the 19 mid-flight-join variants the ladder rule was scored on.
 #[test]
 fn a_volume_joined_mid_flight_still_yields_an_ascending_ladder() {
     let scan = Scan::new(
         vcp(&[0.5, 0.9, 1.3]),
         vec![
-            // Joined at the 0.9° cut, then 1.3°, then the next volume's
-            // 0.5°.
             flat_refl_sweep(2, 0.9, 360, 200, 30.0),
             flat_refl_sweep(3, 1.3, 360, 200, 40.0),
             flat_refl_sweep(1, 0.5, 360, 200, 20.0),
@@ -539,9 +461,6 @@ fn a_volume_joined_mid_flight_still_yields_an_ascending_ladder() {
     );
 }
 
-/// A cut angle that is not a number would fail every grouping comparison
-/// and scatter one cut across as many rungs as it has sweeps, with a
-/// ladder that still looks the right length.
 #[test]
 fn a_non_finite_cut_angle_is_refused() {
     for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -561,9 +480,6 @@ fn a_non_finite_cut_angle_is_refused() {
     }
 }
 
-/// The cut table stores a below-horizon angle as a two's-complement value
-/// this decoder hands back unsigned, so −0.3° arrives as 359.7°. Left
-/// uncorrected it sorts above 19.5° and inverts the whole ladder.
 #[test]
 fn a_cut_angle_past_180_degrees_wraps_to_a_negative_elevation() {
     let scan = Scan::new(
@@ -585,31 +501,12 @@ fn a_cut_angle_past_180_degrees_wraps_to_a_negative_elevation() {
         nominal.windows(2).all(|w| w[0] < w[1]),
         "the ladder is not ascending: {nominal:?}",
     );
-    // Without the correction the 359.7° cut sorts to the top, so the
-    // highest rung would be 359.7° rather than 4.0°.
     assert!(
         nominal[2] < 180.0,
         "an unwrapped cut angle is still in the ladder: {nominal:?}",
     );
 }
 
-/// The *declared* ceiling needs the same wrap correction the ladder's keys
-/// get, and nothing else in the suite notices when it is missing.
-///
-/// The cut table is read twice — once per sweep to key a rung, once over
-/// the whole table for [`VolumeSampler::top_declared_cut_deg`] — and only
-/// the first read is covered by
-/// `a_cut_angle_past_180_degrees_wraps_to_a_negative_elevation`. Drop the
-/// correction from the second and the ladder is still perfect; what breaks
-/// is the comparison a caller makes against it.
-///
-/// The cuts here are KMSX's, which declares its base tilt at **359.82°** —
-/// a real below-horizon cut at a real site, not a constructed one. Left
-/// unwrapped it is the table's largest number, so `top_declared_cut_deg`
-/// reports 359.8° for a volume that flew its pattern to the top, every
-/// section caption reads "topping out at 19.5° of the 359.8°", and
-/// `describe_missing` calls the cone of silence unflown air — for **every**
-/// volume at every site whose base tilt is below the horizon.
 #[test]
 fn a_below_horizon_declared_cut_does_not_become_the_declared_ceiling() {
     let scan = Scan::new(
@@ -629,9 +526,6 @@ fn a_below_horizon_declared_cut_does_not_become_the_declared_ceiling() {
         "the pattern's declared ceiling is a below-horizon cut read \
              unsigned: the ladder is {sampler:?}",
     );
-    // The two are compared for equality by every consumer of a short
-    // ladder, so the point of the assertion above is that they agree here:
-    // this volume flew its pattern to the top and must read as complete.
     assert_eq!(
         sampler.top_tilt_deg(),
         sampler.top_declared_cut_deg(),
@@ -639,28 +533,6 @@ fn a_below_horizon_declared_cut_does_not_become_the_declared_ceiling() {
     );
 }
 
-/// A volume shaped like a real SAILS one, with the cut table that separates
-/// its two base tilts.
-///
-/// Six sweeps over six declared cuts, carrying every hazard the ladder rule
-/// exists for:
-///
-/// * a below-horizon 359.7° cut that only the wrap correction reads as
-///   −0.3°;
-/// * **two genuine base tilts declared 0.09° apart** (0.40° and 0.48°), the
-///   KBMX adaptive-base-tilt geometry no angular threshold can separate;
-/// * a **split 0.48° cut** — a long-range surveillance half carrying no
-///   velocity, and a short-range Doppler half carrying it — plus a SAILS
-///   Doppler repeat of the same cut that is *newer* than both.
-///
-/// The split cut is shaped the way a real one is, which is the part that
-/// matters: all three 0.48° members share the cut angle **and the median**
-/// (0.53°, exactly as KMPX's three 0.4834° members all measure 0.4834°), so
-/// the only thing that distinguishes the surveillance half is its range —
-/// [`LONG_GATES`] against [`SHORT_GATES`], standing in for 1832 gates
-/// (460 km) against 1192 (300 km). A ladder that took the wrong half is
-/// therefore invisible in the angles and visible only in the gate count,
-/// which is why [`VolumeSampler::describe`] prints one.
 const LONG_GATES: usize = 120;
 const SHORT_GATES: usize = 40;
 
@@ -678,11 +550,7 @@ fn sails_volume() -> Scan {
                 Some(&|_, _| Some(7.0)),
             ),
             make_sweep(2, 0.44, 360, LONG_GATES, Some(&refl(20.0)), None),
-            // The surveillance half of the split cut: no velocity, and the
-            // only member that reaches past 300 km. It must win the rung.
             make_sweep(3, 0.53, 360, LONG_GATES, Some(&refl(25.0)), None),
-            // Its Doppler half: the same angle, the same median, a short
-            // copy of the reflectivity, and velocity.
             make_sweep(
                 4,
                 0.53,
@@ -699,9 +567,6 @@ fn sails_volume() -> Scan {
                 Some(&refl(30.0)),
                 Some(&|_, _| Some(11.0)),
             ),
-            // A SAILS Doppler repeat, newest of the three 0.48° members —
-            // so "newest wins" and "surveillance wins" disagree here, and
-            // the surveillance preference is what has to break the tie.
             make_sweep(
                 6,
                 0.53,
@@ -714,30 +579,12 @@ fn sails_volume() -> Scan {
     )
 }
 
-/// What [`sails_volume`]'s cuts declare their Nyquist velocities to be,
-/// keyed the way the archive keys them: by elevation number.
-///
-/// Every value is deliberately **far from what `estimate_fold_limit` would
-/// read off the same sweep** — the fixture's velocity sweeps are constant
-/// fields at 7, 9, 11 and 13 m/s — so a rung that fell back to the estimate
-/// prints a different number rather than a coincidentally equal one. Real
-/// volumes are not so kind: a sweep that folded at all gives an estimate
-/// equal to its Nyquist velocity, which is exactly why the ladder line
-/// carries the provenance letter as well as the number.
 fn sails_declared_nyquist() -> crate::nyquist::DeclaredNyquist {
     [(1, 11.94), (4, 26.42), (5, 31.05), (6, 26.42)]
         .into_iter()
         .collect()
 }
 
-/// The declared number wins where it exists, and the ladder line says so.
-///
-/// The pin for the one thing
-/// `a_reconstructed_render_input_scan_builds_the_identical_ladder` cannot
-/// see: a guard that ignored the declared table entirely would estimate on
-/// *both* sides of the port and the two lines would still match. This
-/// asserts the limits are the declared ones and not the fixture's own
-/// speeds.
 #[test]
 fn a_declared_nyquist_replaces_the_estimated_fold_limit() {
     let scan = sails_volume();
@@ -750,9 +597,6 @@ fn a_declared_nyquist_replaces_the_estimated_fold_limit() {
 
     let estimated_line = format!("{estimated:?}");
     let stated_line = format!("{stated:?}");
-    // precondition: without a table the guard reads the fixture's own
-    // speeds, and the calm below-horizon rung is under the floor, so its
-    // guard is off entirely.
     assert!(
         estimated_line.contains("\u{b1}13.00e") && estimated_line.contains("\u{b1}11.00e"),
         "precondition: the estimator is not reading the fixture's speeds: {estimated_line}"
@@ -769,28 +613,15 @@ fn a_declared_nyquist_replaces_the_estimated_fold_limit() {
             && stated_line.contains("\u{b1}11.94d"),
         "the declared Nyquist velocity did not reach the guard: {stated_line}"
     );
-    // No rung took the estimator: a provenance letter is the last character
-    // of a rung's entry, so an estimated one shows as `e,` or `e]`.
     assert!(
         !stated_line.contains("e,") && !stated_line.contains("e]"),
         "a rung the table names still estimated: {stated_line}"
     );
 }
 
-/// A cut the table does not name still estimates, and a cut it names with a
-/// number this module cannot believe estimates too.
-///
-/// The two absences the fallback exists for. The first is an all-Message-1
-/// volume, or any scan that reached the sampler without a table; the second
-/// is a declared value under [`FOLD_LIMIT_FLOOR_MS`], which is a corrupt
-/// field rather than a slow waveform — no operational NEXRAD VCP flies one
-/// — and must not be trusted further than a measurement this module would
-/// refuse.
 #[test]
 fn an_undeclared_or_unbelievable_cut_falls_back_to_the_estimate() {
     let scan = sails_volume();
-    // Cut 5 declared believably; cut 6 declared at 3 m/s, which no waveform
-    // flies; cut 1 not named at all.
     let partial: crate::nyquist::DeclaredNyquist = [(5, 31.05), (6, 3.0)].into_iter().collect();
 
     let sampler = VolumeSampler::new(Volume::new(&scan, &partial), RadarProduct::Velocity)
@@ -805,9 +636,6 @@ fn an_undeclared_or_unbelievable_cut_falls_back_to_the_estimate() {
         "the 3 m/s declaration was believed rather than dropped for the \
          estimate: {line}"
     );
-    // The undeclared cut is the fixture's calm 7 m/s sweep, whose estimate
-    // is itself under the floor \u{2014} so the honest answer for that rung is no
-    // limit at all, and the ladder line says nothing about it.
     assert!(
         !line.contains("-0.2800 360x40 \u{b1}"),
         "an undeclared cut whose estimate is under the floor came back with \
@@ -815,22 +643,6 @@ fn an_undeclared_or_unbelievable_cut_falls_back_to_the_estimate() {
     );
 }
 
-/// The ladder a worker builds from a reconstructed payload is the ladder
-/// the main thread built — **identically**, not approximately.
-///
-/// This is the property `render_input`'s version 6 exists for, and it used
-/// to be impossible: the reconstruction carried an empty cut table and a
-/// 0-based payload index where the elevation number belongs, so the sampler
-/// refused the scan outright rather than silently keying it wrong. The
-/// refusal was a placeholder for this test.
-///
-/// Compared over the sampler's own `Debug` line, which is the whole ladder
-/// — product, rung count, each rung's geometric elevation *in cut order*,
-/// and each rung's wrap-corrected nominal key. Comparing rung counts alone
-/// would pass on a ladder that had kept the right number of rungs and
-/// chosen the wrong sweep for every one of them, which is exactly the
-/// silent failure the split cuts and the SAILS repeat above are here to
-/// produce.
 #[test]
 fn a_reconstructed_render_input_scan_builds_the_identical_ladder() {
     let scan = sails_volume();
@@ -842,16 +654,9 @@ fn a_reconstructed_render_input_scan_builds_the_identical_ladder() {
         let input = crate::render_input::RenderInput::extract_volume(&scan, product, 35.33, -97.27)
             .expect("the fixture carries the moment")
             .with_declared_nyquist(&declared);
-        // Through the bytes, not just through `to_scan`: the cut angles, the
-        // elevation numbers and the declared Nyquist velocities all have to
-        // survive the wire, and a worker holds bytes rather than a
-        // `RenderInput`.
         let decoded = crate::render_input::RenderInput::from_bytes(&input.to_bytes())
             .expect("the payload round-trips");
         let reconstructed = decoded.to_scan();
-        // Exactly what `offload::execute` does on the far side: the scan and
-        // the table are lifted out separately, because the model type the
-        // scan is made of is what dropped the table in the first place.
         let ported_declared = decoded.declared_nyquist();
 
         let ported = VolumeSampler::new(Volume::new(&reconstructed, &ported_declared), product)
@@ -862,18 +667,12 @@ fn a_reconstructed_render_input_scan_builds_the_identical_ladder() {
             format!("{original:?}"),
             "{product:?}: the worker's ladder is not the main thread's",
         );
-        // precondition: for velocity the line under comparison actually
-        // *says* something about the fold limit, and says it came from the
-        // declaration. Without this the assertion above would go on passing
-        // if the guard quietly stopped reading the declared table on both
-        // sides at once.
         if product == RadarProduct::Velocity {
             assert!(
                 format!("{original:?}").contains("±26.42d"),
                 "precondition: the declared fold limit is not in the ladder                  line, so this comparison cannot see it diverge: {original:?}",
             );
         }
-        // precondition: the fixture is not so simple that any rule agrees.
         assert!(
             original.tilt_count() >= 3,
             "precondition: a {}-rung ladder is too short to distinguish \
@@ -888,23 +687,6 @@ fn a_reconstructed_render_input_scan_builds_the_identical_ladder() {
     }
 }
 
-/// The two near-angle base tilts stay apart across the port — the thing no
-/// angular threshold can do — and the SAILS repeat still fuses into its own
-/// cut and still wins it on recency. Asserted on the *reconstructed* scan
-/// rather than only on the original.
-///
-/// The fixture's cuts are declared 0.40° and 0.48° — 0.09° apart — while
-/// its medians (0.44 and 0.53) sit inside every merge threshold the
-/// campaign measured. A reconstruction that lost the cut table would have
-/// to key by angle and would fuse the two into one rung, deleting a genuine
-/// tilt; one that kept the table but wrote payload indices where the
-/// elevation numbers go would key the sweeps 0..5 and read every one of
-/// them off the wrong cut. Both produce a plausible monotone ladder and
-/// neither errors.
-///
-/// The split cut's winner is the third thing, and the one the angles cannot
-/// see: all three 0.48° members share a median, so which of them won is
-/// legible only in the gate count.
 #[test]
 fn the_ported_ladder_still_separates_the_near_angle_cuts() {
     let scan = sails_volume();
@@ -948,23 +730,9 @@ fn the_ported_ladder_still_separates_the_near_angle_cuts() {
     );
 }
 
-/// **The `Debug` line can tell two ladders apart when only the chosen
-/// sweep differs.** Everything else here compares one ladder's string
-/// against another's, and a comparison of two strings cannot pin what is
-/// *in* them: drop a term from `describe` and both sides lose it together,
-/// so every identity assertion in this module goes on passing while
-/// becoming blind. That is precisely how the split-cut regression reached
-/// review — the line printed only angles, and on a real split cut the
-/// angles are identical whichever half won.
-///
-/// So this asserts the discriminating power directly: two volumes whose
-/// ladders agree in every angle and differ only in which sweep took the
-/// 0.48° rung must not describe themselves the same way.
 #[test]
 fn the_ladder_description_distinguishes_two_sweeps_of_one_cut() {
     let full = sails_volume();
-    // The same volume with the surveillance half of the split cut removed,
-    // so its Doppler half wins that rung instead. Nothing else moves.
     let without_surveillance = Scan::new(
         full.coverage_pattern().clone(),
         full.sweeps()
@@ -977,9 +745,6 @@ fn the_ladder_description_distinguishes_two_sweeps_of_one_cut() {
     let a = VolumeSampler::new(&full, RadarProduct::Reflectivity).expect("builds");
     let b = VolumeSampler::new(&without_surveillance, RadarProduct::Reflectivity).expect("builds");
 
-    // precondition: the two ladders really are indistinguishable by angle,
-    // which is what makes this test about the description rather than about
-    // the ladders.
     assert_eq!(
         a.nominal_elevations_deg().collect::<Vec<_>>(),
         b.nominal_elevations_deg().collect::<Vec<_>>(),
@@ -999,9 +764,6 @@ fn the_ladder_description_distinguishes_two_sweeps_of_one_cut() {
              this module is blind to the difference that matters most",
     );
 
-    // The other half of the same claim: a sweep with an **abandoned tail**
-    // covers less azimuth at the same range, and that is equally invisible
-    // in the angles. Same cut, same median, same gate count, fewer radials.
     let truncated = Scan::new(
         full.coverage_pattern().clone(),
         full.sweeps()
@@ -1030,24 +792,6 @@ fn the_ladder_description_distinguishes_two_sweeps_of_one_cut() {
     );
 }
 
-/// **The surveillance half of a split cut still wins its rung after the
-/// port** — which is a fact about *range*, and the one the angles cannot
-/// express.
-///
-/// The rule is `sampler`'s, at the `carries(&i) && …velocity().is_none()`
-/// in `build`: reflectivity belongs to the surveillance half, which reaches
-/// 460 km against the Doppler half's 300. It discriminates on a field that
-/// a **reflectivity** payload does not carry — `extract_volume` ships the
-/// product's own moment and nothing else — so unless the payload says which
-/// sweeps had velocity, every reconstructed sweep looks like a surveillance
-/// half and `.rev().find(…)` takes the *newest* member instead: the Doppler
-/// one.
-///
-/// Nothing about that fails. The section simply stops at ~300 km where the
-/// main thread's own sampler reaches 460, and takes the low tilt's geometry
-/// from the wrong antenna pass. On a real volume the two halves share a cut
-/// angle *and* a median, so the ladder's angles are byte-identical either
-/// way; only the gate count moves.
 #[test]
 fn the_ported_ladder_takes_the_surveillance_half_of_a_split_cut() {
     let scan = sails_volume();
@@ -1060,8 +804,6 @@ fn the_ported_ladder_takes_the_surveillance_half_of_a_split_cut() {
     .expect("the fixture carries reflectivity");
     let reconstructed = input.to_scan();
 
-    // precondition: the three members of the 0.48° cut are indistinguishable
-    // by angle, so what is asserted below cannot be read off the medians.
     let split: Vec<f64> = reconstructed
         .sweeps()
         .iter()
@@ -1096,15 +838,6 @@ fn the_ported_ladder_takes_the_surveillance_half_of_a_split_cut() {
     }
 }
 
-/// The refusal is still reachable, and still pinned against the **real**
-/// `RenderInput` round trip: a volume joined mid-flight has no cut table
-/// yet (`crate::chunks`' own placeholder), so there is nothing for the
-/// payload to carry and the reconstruction rebuilds the same empty table.
-///
-/// Faithful includes faithfully unusable. The alternative — inventing cut
-/// angles from the sweeps' own medians — would build a ladder in the worker
-/// that the main thread would have refused to build, which is the silent
-/// divergence this whole error exists to stop.
 #[test]
 fn a_payload_from_a_volume_with_no_cut_table_is_still_refused() {
     let scan = Scan::new(
@@ -1114,8 +847,6 @@ fn a_payload_from_a_volume_with_no_cut_table_is_still_refused() {
             flat_refl_sweep(2, 0.9, 360, 40, 30.0),
         ],
     );
-    // precondition: the original is refused for exactly this reason, so
-    // what is asserted below is that the port preserved it.
     assert!(matches!(
         VolumeSampler::new(&scan, RadarProduct::Reflectivity),
         Err(SamplerError::EmptyCoveragePattern { .. }),
@@ -1131,8 +862,6 @@ fn a_payload_from_a_volume_with_no_cut_table_is_still_refused() {
         None,
     )
     .expect("the fixture carries reflectivity at 0.5°");
-    // precondition: the reconstruction really did keep a renderable sweep,
-    // so what fails below is the ladder and not the payload.
     assert!(
         crate::render::render_from(&input).is_some(),
         "precondition: the reconstructed input no longer renders, so this \
@@ -1148,7 +877,6 @@ fn a_payload_from_a_volume_with_no_cut_table_is_still_refused() {
         matches!(err, SamplerError::EmptyCoveragePattern { vcp: 212 }),
         "expected the empty-cut-table refusal naming the real VCP, got {err:?}",
     );
-    // The message has to say enough for whoever hits it to know why.
     let text = err.to_string();
     assert!(
         text.contains("elevation cuts") && text.contains("RenderInput"),
@@ -1156,9 +884,6 @@ fn a_payload_from_a_volume_with_no_cut_table_is_still_refused() {
     );
 }
 
-/// The second half of the same guard: a cut table that exists but does not
-/// cover a sweep's elevation number. Measured to happen on 0 of 203 real
-/// volumes, so it means the sweep-to-VCP pairing has broken.
 #[test]
 fn an_elevation_number_outside_the_cut_table_is_refused() {
     for elevation_number in [0u8, 3, 255] {
@@ -1177,8 +902,6 @@ fn an_elevation_number_outside_the_cut_table_is_refused() {
                  {elevation_number}, got {err:?}",
         );
     }
-    // And the in-range numbers still work, so the guard is a boundary
-    // rather than a refusal of everything.
     for elevation_number in [1u8, 2] {
         let scan = Scan::new(
             vcp(&[0.5, 0.9]),
@@ -1188,9 +911,6 @@ fn an_elevation_number_outside_the_cut_table_is_refused() {
     }
 }
 
-/// A volume with no sweep carrying the moment is a refusal too, rather
-/// than an empty ladder that answers `NoCoverage` at every point and looks
-/// like a blank section.
 #[test]
 fn a_volume_with_no_sweep_carrying_the_moment_is_refused() {
     let scan = Scan::new(vcp(&[0.5]), vec![flat_refl_sweep(1, 0.5, 360, 40, 20.0)]);
@@ -1201,12 +921,6 @@ fn a_volume_with_no_sweep_carrying_the_moment_is_refused() {
 
 // ── Geometry ────────────────────────────────────────────────────────────
 
-/// A field that depends only on beam height reads back at the height it
-/// was planted at.
-///
-/// The slab is 4–5 km; at 30 km ground range the fixture's half-degree
-/// ladder puts rungs ~0.26 km apart, so the slab is four rungs thick and
-/// its edges are resolvable.
 #[test]
 fn a_planted_horizontal_slab_reads_at_its_planted_height() {
     let angles: Vec<f64> = (1..=40).map(|i| f64::from(i) * 0.5).collect();
@@ -1231,8 +945,6 @@ fn a_planted_horizontal_slab_reads_at_its_planted_height() {
 
     let column = sampler.column(37.0, 30.0);
     let (lowest, highest) = column.height_span_km().unwrap();
-    // precondition: the ladder brackets the slab at this ground range, so
-    // every assertion below is an interpolation rather than a refusal.
     assert!(
         lowest < 3.0 && highest > 6.0,
         "precondition: at 30 km the ladder spans {lowest:.2}–{highest:.2} \
@@ -1256,8 +968,6 @@ fn a_planted_horizontal_slab_reads_at_its_planted_height() {
         at(6.5)
     );
 
-    // The edges land where they were planted, to within the rung spacing
-    // that resolves them — ~0.26 km at this ground range.
     let midpoint = 0.5 * (round_trip_refl(20.0) + round_trip_refl(50.0));
     let crossing = |from: f64, to: f64| {
         let steps = 4000;
@@ -1278,9 +988,6 @@ fn a_planted_horizontal_slab_reads_at_its_planted_height() {
     );
 }
 
-/// The `cos e` test. A wall planted at a **ground** range reads at that
-/// ground range on every tilt; without the correction the 10° tilt puts it
-/// 1.5 km out.
 #[test]
 fn a_planted_vertical_wall_reads_at_its_planted_ground_range() {
     const WALL_KM: f64 = 100.0;
@@ -1317,8 +1024,6 @@ fn a_planted_vertical_wall_reads_at_its_planted_ground_range() {
             "rung {k} at {}° missed the wall at {WALL_KM} km ground",
             rung.elevation_deg,
         );
-        // The rung's height is measured over the **ground** range too, not
-        // along the slant range that shares the number.
         assert_eq!(
             rung.height_km,
             beam::height_at_ground_km(WALL_KM, rung.elevation_deg),
@@ -1326,11 +1031,6 @@ fn a_planted_vertical_wall_reads_at_its_planted_ground_range() {
             rung.elevation_deg,
         );
     }
-    // precondition: the two height forms really do differ at the steep
-    // tilt, so the assertion above discriminates. 326 m at 10° / 100 km,
-    // where it was 286 m while the ground range was the tangent plane —
-    // the arc's inverse reaches further for the same ground distance, so
-    // the ground arm stands higher and the two part by more.
     let height_gap =
         (beam::height_at_ground_km(WALL_KM, 10.0) - beam::height_km(WALL_KM, 10.0)).abs();
     assert!(
@@ -1339,12 +1039,9 @@ fn a_planted_vertical_wall_reads_at_its_planted_ground_range() {
              documented as 0.3263",
     );
 
-    // The discriminating half. A sampler that fed the ground range to the
-    // gate index as if it were a slant range reads the 10° tilt's wall at
-    // 98.28 km — 1.72 km, seven gates, inward. That position must be clear
-    // air. It was 98.48 km and 1.52 km, six gates, while the ground range
-    // was the tangent-plane `100 · cos 10°`; the arc shortens further, so
-    // the discrimination this test rests on got wider rather than narrower.
+    // A sampler that fed the ground range to the gate index as if it were a
+    // slant range reads the 10° tilt's wall at 98.28 km — 1.72 km, seven
+    // gates, inward. That position must be clear air.
     let uncorrected = beam::ground_range_km(WALL_KM, 10.0);
     let error_km = WALL_KM - uncorrected;
     assert!(
@@ -1364,12 +1061,9 @@ fn a_planted_vertical_wall_reads_at_its_planted_ground_range() {
         "the 10° rung found the wall at {uncorrected:.3} km ground, which \
              is where an uncorrected slant range would have put it",
     );
-    // At 0.5° the same mistake is 0.019 km at this range — a thirteenth of
-    // a 250 m gate, against the 10° tilt's seven whole gates — which is why
-    // the low tilts cannot be the test. It was 0.004 km under the tangent
-    // plane, and the bound moves 0.01 → 0.03 km with it; the ratio between
-    // the two tilts is what this precondition is really about, and it went
-    // from 380× to 92×, still two orders.
+    // At 0.5° the same mistake is 0.019 km at this range — a thirteenth of a
+    // 250 m gate, against the 10° tilt's seven — which is why the low tilts
+    // cannot be the test.
     let shallow_error = WALL_KM - beam::ground_range_km(WALL_KM, 0.5);
     assert!(
         shallow_error < 0.03,
@@ -1378,8 +1072,6 @@ fn a_planted_vertical_wall_reads_at_its_planted_ground_range() {
              tilt is not doing the work",
     );
 
-    // And the point query agrees with the column, at a height inside the
-    // ladder.
     let h = on_wall.rungs()[1].height_km;
     assert_eq!(
         sampler.sample(120.0, WALL_KM, h),
@@ -1388,33 +1080,8 @@ fn a_planted_vertical_wall_reads_at_its_planted_ground_range() {
     );
 }
 
-/// What the slant-to-ground correction is **worth**, shipped as a measurement
-/// rather than as a comment.
-///
-/// These are how far every echo on those tilts moved when the plan view
-/// started applying the correction at all, which is the number a reader
-/// comparing this display against an older screenshot needs.
-///
-/// **The two renderers no longer apply the same one, and these figures are
-/// `beam`'s.** This module converts a ground range to a slant one through
-/// `beam::slant_range_for_ground_km`, which is the spherical arc's inverse;
-/// the plan view's four per-tilt rasterizers still hoist `cos e` of the
-/// sweep's median elevation, which is the tangent plane. The gap between the
-/// two is the table in `beam`'s "What still spells the tangent plane" — 666 m
-/// at 460 km on 0.5°, about three plan-view cells — and it is a real
-/// registration difference between a section and the map above it until those
-/// hoists are converted. It is recorded there rather than here because it is
-/// the hoists' to close.
-///
-/// The pixel figures are the same on both targets now that `IMAGE_SIZE` is
-/// 2048 everywhere, but they are still derived from the constant and still
-/// pinned per arm: the two arms are separate decisions that happen to agree
-/// (see `types::IMAGE_SIZE`), and a change to either has to come past here.
 #[test]
 fn the_cos_e_correction_is_worth_a_measured_number_of_pixels() {
-    // 0.2017 and 4.0151 km before the arc replaced the tangent plane —
-    // those were `r·(1 − cos e)`, which is the chord's shortening with the
-    // earth's curvature left out.
     let cases = [(230.0f64, 2.4f64, 0.5178f64), (70.0, 19.5, 4.1974)];
     for (slant, elev, expected_km) in cases {
         let gap_km = slant - beam::ground_range_km(slant, elev);
@@ -1425,13 +1092,9 @@ fn the_cos_e_correction_is_worth_a_measured_number_of_pixels() {
         );
     }
 
-    // Both probes are inside 230 km, so the plan view they are compared
-    // against is one drawn at the floor — `plan_view_extent_km` of any reach
-    // that puts a gate here.
     let px_per_km = crate::types::IMAGE_SIZE as f64 / (2.0 * crate::types::BASE_EXTENT_KM);
     let px = |slant: f64, elev: f64| (slant - beam::ground_range_km(slant, elev)) * px_per_km;
     // 2048 px over 460 km is 4.4522 px/km.
-    // 0.898 and 17.876 px under the tangent plane.
     #[cfg(not(target_arch = "wasm32"))]
     let (expected_low, expected_high) = (2.305, 18.688);
     #[cfg(target_arch = "wasm32")]
@@ -1455,16 +1118,6 @@ fn the_cos_e_correction_is_worth_a_measured_number_of_pixels() {
              {}-pixel image, documented as {expected_high}",
         crate::types::IMAGE_SIZE,
     );
-    // The low tilts, where this used to assert near-invariance at under
-    // 0.2 px — and where that was an artifact of the probe range rather
-    // than a property of the tilt. Both figures below are 0.5°; they differ
-    // only in how far out they are asked, so name the range with every one.
-    //
-    // At 230 km the correction is 0.531 px (0.039 under the tangent plane).
-    // At 460.125 km — the 0.5° surveillance cut's *actual* reach, not the
-    // 230 km ring — it is 3.043 px, which is not invisible at all. The old
-    // claim survived because it was only ever evaluated half way along the
-    // cut.
     assert!(
         (px(230.0, 0.5) - 0.531).abs() < 0.01,
         "the 0.5° correction at 230 km moved: {:.3} px, documented as 0.531",
@@ -1480,13 +1133,6 @@ fn the_cos_e_correction_is_worth_a_measured_number_of_pixels() {
 
 // ── Interpolation ───────────────────────────────────────────────────────
 
-/// Reflectivity averages in linear Z. 10 and 50 dBZ meet at **46.99**, not
-/// at 30 — a 17 dB error, which is four palette bands.
-///
-/// Also the super-resolution half of the acceptance: 720 alternating
-/// radials each return their own value. **This covers the low tilts
-/// only** — azimuth resolution drops 720 → 360 partway up every real
-/// ladder, which the fixture reproduces and the assertion below states.
 #[test]
 fn reflectivity_blends_in_linear_z_and_every_super_res_radial_survives() {
     let alternating = |az: f64, _slant: f64| {
@@ -1505,7 +1151,6 @@ fn reflectivity_blends_in_linear_z_and_every_super_res_radial_survives() {
     );
     let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
 
-    // Every one of the 720 radials returns its own planted value.
     let mut seen_low = 0usize;
     let mut seen_high = 0usize;
     for i in 0..720u32 {
@@ -1524,7 +1169,6 @@ fn reflectivity_blends_in_linear_z_and_every_super_res_radial_survives() {
     }
     assert_eq!((seen_low, seen_high), (360, 360));
 
-    // Halfway between two radials: linear Z, not dB.
     let mid = f64::from(
         sampler.column(0.25, 20.0).rungs()[0]
             .sample
@@ -1543,9 +1187,6 @@ fn reflectivity_blends_in_linear_z_and_every_super_res_radial_survives() {
     );
     assert!((mid - 30.0).abs() > 16.0);
 
-    // The coverage caveat, asserted rather than left in prose: the upper
-    // rung of this ladder has 360 radials, so an "all 720" test says
-    // nothing about it.
     assert_eq!(sampler.column(0.25, 20.0).rungs().len(), 2);
     assert_eq!(scan.sweeps()[0].radials().len(), 720);
     assert_eq!(
@@ -1557,13 +1198,6 @@ fn reflectivity_blends_in_linear_z_and_every_super_res_radial_survives() {
     );
 }
 
-/// The range axis interpolates between gate **centres**, so a point half a
-/// gate along reads the mean of the two gates around it rather than the
-/// nearer one repeated.
-///
-/// The azimuth test above cannot catch this — its field is constant along
-/// range — and `round` in place of `floor` produces a *negative* far-corner
-/// weight, which in linear Z is the logarithm of a negative number.
 #[test]
 fn gates_interpolate_between_their_centres_rather_than_snapping() {
     let alternating = |_az: f64, slant: f64| {
@@ -1576,8 +1210,6 @@ fn gates_interpolate_between_their_centres_rather_than_snapping() {
         vec![make_sweep(1, 0.5, 360, 200, Some(&alternating), None)],
     );
     let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
-    // Sampling on a radial centre so azimuth contributes no blend of its
-    // own; the ground range is the gate's slant range through `cos e`.
     let at = |slant: f64| {
         let ground = beam::ground_range_km(slant, 0.5);
         f64::from(
@@ -1597,15 +1229,14 @@ fn gates_interpolate_between_their_centres_rather_than_snapping() {
         );
     }
 
-    // Half a gate along: the linear-Z mean of 10 and 50, the same 46.99 the
-    // azimuth axis produces.
+    // Half a gate along: the linear-Z mean of 10 and 50.
     let half = at(gate_slant_km(40) + f64::from(GATE_M) / 2000.0);
     assert!(
         (half - 46.9897).abs() < 0.01,
         "half a gate past gate 40 read {half:.4} dBZ, expected 46.9897",
     );
-    // A quarter along leans towards the nearer gate but is still a blend,
-    // which "snap to nearest" is not: 10log10(0.75·10 + 0.25·10⁵) = 43.98.
+    // A quarter along leans towards the nearer gate but is still a blend:
+    // 10log10(0.75·10 + 0.25·10⁵) = 43.98.
     let quarter = at(gate_slant_km(40) + f64::from(GATE_M) / 4000.0);
     assert!(
         (quarter - 43.9800).abs() < 0.01,
@@ -1614,23 +1245,13 @@ fn gates_interpolate_between_their_centres_rather_than_snapping() {
     );
 }
 
-/// Everything that is not reflectivity averages arithmetically, and
-/// differential phase averages on the circle so the 360°→0° fold does not
-/// become a half turn.
 #[test]
 fn velocity_averages_arithmetically_and_phase_averages_on_the_circle() {
-    // **±9 rather than ±20, and gate 0 held at 25.** A ±20 checkerboard in
-    // a sweep whose fastest gate is 20 m/s is, to anything reading only
-    // the data, a textbook Nyquist fold: adjacent radials spanning the
-    // whole observed range and changing sign. `straddles_fold` fires on it
-    // and is right to — no atmosphere produces that field — so the fixture
-    // is given an amplitude a real sweep can hold instead.
-    //
-    // The 25 m/s at gate 0 is what keeps this test honest: it arms the
-    // fold guard at 25 m/s, so the arithmetic mean asserted below is the
-    // guard *declining* on an 18 m/s step rather than the guard being
-    // switched off by `FOLD_LIMIT_FLOOR_MS`. The seam itself is pinned by
-    // `a_velocity_pair_across_the_nyquist_seam_takes_the_nearer_gate`.
+    // ±9 rather than ±20, and gate 0 held at 25. A ±20 checkerboard in a
+    // sweep whose fastest gate is 20 m/s reads as a textbook Nyquist fold and
+    // `straddles_fold` fires on it. The 25 m/s at gate 0 arms the fold guard,
+    // so the mean asserted below is the guard declining rather than the guard
+    // switched off by `FOLD_LIMIT_FLOOR_MS`.
     let alternating = |az: f64, slant: f64| {
         Some(if slant < gate_slant_km(1) {
             25.0
@@ -1661,9 +1282,8 @@ fn velocity_averages_arithmetically_and_phase_averages_on_the_circle() {
         round_trip_vel(9.0),
     );
 
-    // Differential phase: 359° and 1° meet at 0°, not at 180°. Encoded
-    // 16-bit at 1/100°, which keeps both ends clear of the 0/1 status
-    // codes.
+    // Differential phase: 359° and 1° meet at 0°, not at 180°. Encoded 16-bit
+    // at 1/100°, which keeps both ends clear of the 0/1 status codes.
     let radials: Vec<Radial> = (0..360)
         .map(|i| {
             let v = if i % 2 == 0 { 359.0f64 } else { 1.0 };
@@ -1697,7 +1317,6 @@ fn velocity_averages_arithmetically_and_phase_averages_on_the_circle() {
         .collect();
     let scan = Scan::new(vcp(&[0.5]), vec![Sweep::new(1, radials)]);
     let sampler = VolumeSampler::new(&scan, RadarProduct::DifferentialPhase).unwrap();
-    // 8 km ground: gate 24 of 40, comfortably inside this moment's span.
     let seam = f64::from(sampler.column(0.5, 8.0).rungs()[0].sample.value().unwrap());
     let off_zero = seam.min(360.0 - seam).abs();
     assert!(
@@ -1711,12 +1330,8 @@ fn velocity_averages_arithmetically_and_phase_averages_on_the_circle() {
     );
 }
 
-/// The gap `MomentValue::RangeFolded` never crossed: five different
-/// reasons for having no number, all distinguishable, none of them `NaN`
-/// alone.
 #[test]
 fn a_range_folded_gate_is_distinguishable_from_a_missing_one() {
-    // Gate 0 below threshold, gate 1 range folded, gates 2.. ordinary.
     let mut bytes = vec![0u8, 1];
     bytes.extend((2..40).map(|_| encode_vel(15.0)));
     let radials: Vec<Radial> = (0..360)
@@ -1730,7 +1345,6 @@ fn a_range_folded_gate_is_distinguishable_from_a_missing_one() {
                 1,
                 0.5,
                 None,
-                // Radial 200 carries no velocity at all.
                 (i != 200).then(|| moment_from(bytes.clone(), VEL_SCALE, VEL_OFFSET)),
                 None,
                 None,
@@ -1743,8 +1357,6 @@ fn a_range_folded_gate_is_distinguishable_from_a_missing_one() {
     let scan = Scan::new(vcp(&[0.5]), vec![Sweep::new(1, radials)]);
     let sampler = VolumeSampler::new(&scan, RadarProduct::Velocity).unwrap();
 
-    // Gate centres at a radial centre, so the heaviest corner is
-    // unambiguous. Ground range and slant range agree to 4 cm at 0.5°.
     let status_at = |az: f64, ground: f64| sampler.column(az, ground).rungs()[0].sample.status();
     let statuses = [
         status_at(10.0, gate_slant_km(0)),
@@ -1768,14 +1380,11 @@ fn a_range_folded_gate_is_distinguishable_from_a_missing_one() {
         "a radial with no moment",
     );
 
-    // All five are distinct, which is the property that makes a hover
-    // readout worth writing.
     for (i, a) in statuses.iter().enumerate() {
         for b in &statuses[i + 1..] {
             assert_ne!(a, b, "two conditions collapsed to {a:?}");
         }
     }
-    // And a value is a value: the range-folded gate has none.
     assert!(
         sampler.column(10.0, gate_slant_km(1)).rungs()[0]
             .sample
@@ -1790,18 +1399,6 @@ fn a_range_folded_gate_is_distinguishable_from_a_missing_one() {
     );
 }
 
-/// The duplication guard on `gate_sample`, against the model's own
-/// decoder, element for element.
-///
-/// **Includes a `scale == 0.0` moment**, because that case disables the
-/// 0/1 status codes entirely and is the one a reimplementation gets wrong.
-///
-/// A 16-bit moment with an *odd* byte count would exercise `gate_sample`'s
-/// `get(k..k + 2)` against the model's `chunks_exact`, and it is not
-/// tested here because it cannot be built: `MomentDataBlock::from_fixed_point`
-/// carries a `debug_assert!` refusing it, so the fixture would pass in
-/// release and panic in debug. The bounds are covered by the last-gate
-/// assertions below instead.
 #[test]
 fn raw_gate_decoding_matches_the_model_element_for_element() {
     let eight_bit: Vec<u8> = (0..=255u8).collect();
@@ -1835,12 +1432,6 @@ fn raw_gate_decoding_matches_the_model_element_for_element() {
             "8-bit, gate_count overruns the bytes",
             MomentData::from_fixed_point(400, FIRST_GATE_M, GATE_M, 8, 2.0, 66.0, short_bytes),
         ),
-        // Appended rather than grouped with the other zero-scale moment, because
-        // the assertions after the loop reach `cases[3]` by index. Both word
-        // sizes at a zero scale, not just the 8-bit one: this now guards a
-        // function derived from `render::moment_value_at` rather than a copy of
-        // the model, and a primitive taking the wrong branch for wide words
-        // would otherwise be caught only from the readout's side.
         (
             "16-bit, scale 0 (status codes disabled)",
             MomentData::from_fixed_point(
@@ -1904,10 +1495,6 @@ fn raw_gate_decoding_matches_the_model_element_for_element() {
             checked += 1;
         }
     }
-    // preconditions: the sweep actually reached each of the three decode
-    // paths, so an implementation that got one of them wrong could not
-    // have passed by never being asked.
-    // 256 + 256 + 600 + 50 + 600 gates, plus three past the end of each.
     assert_eq!(checked, 1777, "the comparison grid changed size");
     assert!(saw_below, "no below-threshold gate was exercised");
     assert!(saw_folded, "no range-folded gate was exercised");
@@ -1917,7 +1504,6 @@ fn raw_gate_decoding_matches_the_model_element_for_element() {
              is the case this test exists for",
     );
     // `raw_values().len()` and not `gate_count()` decides where the gates
-    // stop: this moment declares 400 and has 50.
     let short = &cases[3].1;
     assert_eq!(short.gate_count(), 400);
     assert_eq!(short.raw_values().len(), 50);
@@ -1929,8 +1515,6 @@ fn raw_gate_decoding_matches_the_model_element_for_element() {
         "the declared gate count was trusted over the bytes",
     );
 
-    // And the 16-bit moment's own last gate, so the two-byte stride's
-    // bound is pinned too.
     let wide = &cases[2].1;
     assert_eq!(gate_sample(wide, 599).status(), SampleStatus::Value);
     assert_eq!(gate_sample(wide, 600).status(), SampleStatus::BeyondRange);
@@ -1938,8 +1522,6 @@ fn raw_gate_decoding_matches_the_model_element_for_element() {
 
 // ── The edges of the volume ─────────────────────────────────────────────
 
-/// Nothing is filled in outside the ladder, in either direction, and the
-/// cone of silence reports itself.
 #[test]
 fn nothing_is_extrapolated_above_or_below_the_ladder() {
     let angles = [0.5f64, 4.0, 10.0];
@@ -1961,18 +1543,13 @@ fn nothing_is_extrapolated_above_or_below_the_ladder() {
         column.at_height_km(high + 0.001).status(),
         SampleStatus::AboveVolume,
     );
-    // The boundaries themselves are inside.
     assert_eq!(column.at_height_km(low).status(), SampleStatus::Value);
     assert_eq!(column.at_height_km(high).status(), SampleStatus::Value);
-    // Ground level under a 0.5° beam at 50 km is 0.6 km down and is not
-    // invented.
     assert_eq!(
         column.at_height_km(0.0).status(),
         SampleStatus::BelowLowestBeam,
     );
 
-    // The cone of silence: over the site every beam centre is at zero
-    // height, so anything above the antenna is above the volume.
     let overhead = sampler.column(90.0, 0.0);
     assert_eq!(
         overhead.height_span_km(),
@@ -1985,7 +1562,6 @@ fn nothing_is_extrapolated_above_or_below_the_ladder() {
         "the cone of silence was filled in rather than reported",
     );
 
-    // An empty column answers the same way everywhere.
     let empty = Column::new();
     assert_eq!(empty.at_height_km(3.0).status(), SampleStatus::NoCoverage);
     assert_eq!(empty.height_span_km(), None);
@@ -1995,10 +1571,6 @@ fn nothing_is_extrapolated_above_or_below_the_ladder() {
     );
 }
 
-/// The ordinary case the plan calls out: **every** volume has a bracketing
-/// rung with no data at 230 km and 300 km, because the upper cuts stop
-/// short. It is beam geometry, not a ladder defect, and it must surface as
-/// a status rather than be filled from the rung below.
 #[test]
 fn a_bracketing_rung_that_stops_short_reports_rather_than_being_filled() {
     // The 0.5° surveillance cut reaches 460 km; the 4.0° cut stops at
@@ -2022,8 +1594,6 @@ fn a_bracketing_rung_that_stops_short_reports_rather_than_being_filled() {
     );
 
     let (low, high) = short_of.height_span_km().unwrap();
-    // Under halfway the surveillance rung carries it; over halfway the
-    // absent rung does, and nothing is invented in between.
     let just_above = low + 0.1 * (high - low);
     let just_below = low + 0.9 * (high - low);
     assert_eq!(
@@ -2037,15 +1607,10 @@ fn a_bracketing_rung_that_stops_short_reports_rather_than_being_filled() {
              below",
     );
 
-    // precondition: the same column inside 150 km has both rungs, so the
-    // status above is about range and not about the fixture.
     let inside = sampler.column(45.0, 100.0);
     assert!(inside.rungs().iter().all(|r| r.sample.value().is_some()));
 }
 
-/// An abandoned tail leaves a hole in azimuth. Painting the nearest
-/// surviving radial across it would draw data where the radar never
-/// looked; the plan view leaves the same hole, and so does this.
 #[test]
 fn an_azimuth_hole_is_reported_rather_than_painted_across() {
     let full_gate = |_: usize| encode_refl(35.0);
@@ -2098,8 +1663,6 @@ fn an_azimuth_hole_is_reported_rather_than_painted_across() {
         SampleStatus::NoCoverage,
         "half a degree short of the first radial, still in the hole",
     );
-    // The footprint reaches backwards across 0° as well as forwards, which
-    // is the wrap case: 359.9° is 0.1° from the 0.0° radial's centre.
     assert_eq!(
         status_at(359.9),
         SampleStatus::Value,
@@ -2111,7 +1674,6 @@ fn an_azimuth_hole_is_reported_rather_than_painted_across() {
         "the first radial's footprint",
     );
 
-    // One dropped radial leaves a gap of the same shape, one step wide.
     let mut radials: Vec<Radial> = (0..720)
         .map(|i| radial_at(i, f32::from(i) * 0.5, 0.5))
         .collect();
@@ -2132,7 +1694,6 @@ fn an_azimuth_hole_is_reported_rather_than_painted_across() {
         "inside the surviving 89.5° radial's footprint",
     );
 
-    // A full sweep interpolates across every seam, including 359.5 → 0.
     let full = Scan::new(vcp(&[0.5]), vec![flat_refl_sweep(1, 0.5, 720, 40, 35.0)]);
     let full = VolumeSampler::new(&full, RadarProduct::Reflectivity).unwrap();
     for az in [0.0, 0.25, 90.0, 180.3, 359.75, 359.99] {
@@ -2144,25 +1705,16 @@ fn an_azimuth_hole_is_reported_rather_than_painted_across() {
     }
 }
 
-/// A sweep arrives in **collection** order, starting wherever the antenna
-/// was and wrapping through 0°, and its lowest azimuth is not 0.
-///
-/// Three things fail on such a sweep and on no other: an index that trusts
-/// the radial order, a bracket that handles only the top of the wrap, and
-/// a query below the sweep's lowest azimuth (which is the *lower* wrap
-/// case, and reaches the last radial through 360°).
 #[test]
 fn a_sweep_that_starts_off_north_is_indexed_and_wraps_at_both_ends() {
     // 250.5°, 251.5° … 359.5°, 0.5° … 249.5°, in that order.
     let azimuths: Vec<f32> = (0..360).map(|i| ((250 + i) % 360) as f32 + 0.5).collect();
-    // precondition: this really is out of order and really does miss 0°.
     assert!(
         azimuths.windows(2).any(|w| w[1] < w[0]),
         "precondition: the fixture's azimuths are already ascending",
     );
     assert!(azimuths.iter().all(|&a| a > 0.4));
 
-    // Two hot radials: one in the middle of the sweep, one at the seam.
     let hot = |az: f64| {
         if (az - 100.5).abs() < 0.01 || (az - 359.5).abs() < 0.01 {
             55.0
@@ -2192,9 +1744,9 @@ fn a_sweep_that_starts_off_north_is_indexed_and_wraps_at_both_ends() {
         "the first radial collected"
     );
 
-    // Below the sweep's lowest azimuth: the bracket is the *last* radial
-    // (359.5°, hot) and the first (0.5°, cold), reached across 360°.
-    // 0.2° sits 0.7 of the way from 359.5 to 0.5, so linear Z gives
+    // Below the sweep's lowest azimuth the bracket is the *last* radial
+    // (359.5°, hot) and the first (0.5°, cold), reached across 360°. 0.2°
+    // sits 0.7 of the way, so linear Z gives
     // 10log10(0.3·10^5.5 + 0.7·10) = 49.77 dBZ.
     let below = at(0.2);
     assert!(
@@ -2202,7 +1754,6 @@ fn a_sweep_that_starts_off_north_is_indexed_and_wraps_at_both_ends() {
         "0.2° read {below:.4} dBZ; expected 49.7715, the linear-Z blend of \
              the 359.5° and 0.5° radials across the seam",
     );
-    // And just the other side of the seam, 0.4 of the way instead of 0.7.
     let above = at(359.9);
     assert!(
         (above - 52.7816).abs() < 0.01,
@@ -2210,20 +1761,12 @@ fn a_sweep_that_starts_off_north_is_indexed_and_wraps_at_both_ends() {
     );
 }
 
-/// A real sweep's azimuths jitter a few hundredths of a degree, so the
-/// adjacency threshold cannot be one step exactly.
-///
-/// This is the lower bracket on [`MAX_ADJACENT_GAP_STEPS`]; the dropped
-/// radial in `an_azimuth_hole_is_reported_rather_than_painted_across` is
-/// the upper one, because that gap is two steps and must *not* be bridged.
 #[test]
 fn azimuth_jitter_does_not_open_a_hole() {
     // ±0.04°, deterministic, well inside half a step so the order holds.
     let jitter = |i: usize| ((i * 7) % 17) as f32 * 0.005 - 0.04;
     let azimuths: Vec<f32> = (0..720).map(|i| i as f32 * 0.5 + jitter(i)).collect();
 
-    // precondition: the jitter really does push a gap past one step, so a
-    // 1.0-step threshold would open a hole here.
     let gap = |i: usize| {
         let a = f64::from(azimuths[i]);
         let b = f64::from(azimuths[(i + 1) % 720]);
@@ -2243,9 +1786,6 @@ fn azimuth_jitter_does_not_open_a_hole() {
     );
     let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
 
-    // The middle of the widest gap, named rather than swept for: a
-    // 1.0-step threshold refuses only the sliver of that one gap outside
-    // the two radials' footprints, which a coarse sweep steps over.
     let mid = (f64::from(azimuths[widest_at]) + widest / 2.0).rem_euclid(360.0);
     assert_eq!(
         sampler.column(mid, 20.0).rungs()[0].sample.status(),
@@ -2264,13 +1804,6 @@ fn azimuth_jitter_does_not_open_a_hole() {
     }
 }
 
-/// A badly truncated sweep must not widen its own radials' footprints.
-///
-/// The azimuth step is the **median** gap and not the mean for exactly
-/// this volume: 100 radials covering 50° have a mean gap of 3.6° and a
-/// median of 0.5°. On the mean, each surviving radial would claim 1.8° of
-/// ground either side and paint 3.6° of fabricated data around the edge of
-/// the hole.
 #[test]
 fn a_badly_truncated_sweep_keeps_its_radials_half_step_footprint() {
     let azimuths: Vec<f32> = (0..100).map(|i| i as f32 * 0.5).collect();
@@ -2308,37 +1841,20 @@ fn a_badly_truncated_sweep_keeps_its_radials_half_step_footprint() {
     );
 }
 
-/// A ladder whose chosen sweeps' medians invert its cut order still
-/// brackets by height.
-///
-/// Measured never to happen — medians did not invert the VCP's cut order
-/// in 4 756 ordered pairs — which is why the column sorts rather than
-/// assumes. Without the sort `partition_point` is asking an unsorted
-/// sequence a sorted question, and the answer is `BelowLowestBeam`
-/// everywhere: silent, total, and shaped exactly like a volume with no
-/// data in it.
 #[test]
 fn a_ladder_whose_medians_invert_still_brackets_by_height() {
     let scan = Scan::new(
         vcp(&[0.5, 0.9]),
         vec![
-            // The 0.5° cut ran high and the 0.9° cut ran low.
             flat_refl_sweep(1, 1.05, 360, 200, 20.0),
             flat_refl_sweep(2, 0.55, 360, 200, 40.0),
         ],
     );
     let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
-    // The ladder is in cut order, which is what the rule says — so the
-    // geometric elevations come out descending, and `elevations_deg` says
-    // "in cut order" rather than "ascending" for exactly this reason.
     assert_eq!(
         sampler.elevations_deg().collect::<Vec<_>>(),
         vec![f64::from(1.05f32), f64::from(0.55f32)],
     );
-    // And the gap is still a gap. Folding signed steps down the cut order
-    // would give `0.0` here — the number that exists to warn "this section
-    // is interpolating across nothing" reading *no gap* in one of the few
-    // cases it is there for.
     let gap = sampler.widest_tilt_gap_deg();
     assert!(
         (gap - (f64::from(1.05f32) - f64::from(0.55f32))).abs() < 1e-9,
@@ -2347,14 +1863,12 @@ fn a_ladder_whose_medians_invert_still_brackets_by_height() {
     );
     assert!(gap > 0.0);
 
-    // 30 km: inside these sweeps' 51.9 km of gates on both rungs.
     let column = sampler.column(45.0, 30.0);
     let heights: Vec<f64> = column.rungs().iter().map(|r| r.height_km).collect();
     assert!(
         heights.windows(2).all(|w| w[0] < w[1]),
         "the column is not ascending by height: {heights:?}",
     );
-    // The low rung is the 0.55° one, so it carries the 40 dBZ.
     assert_eq!(
         f64::from(column.rungs()[0].sample.value().unwrap()),
         round_trip_refl(40.0),
@@ -2379,8 +1893,6 @@ fn a_ladder_whose_medians_invert_still_brackets_by_height() {
 
 // ── The product gate and the wire ───────────────────────────────────────
 
-/// Only the six native moments. The hybrid classification is not a moment
-/// and the integrals have no vertical axis left to cut.
 #[test]
 fn samplable_admits_the_six_native_moments_and_nothing_else() {
     let native = [
@@ -2428,8 +1940,6 @@ fn samplable_admits_the_six_native_moments_and_nothing_else() {
             "{product:?} was refused without a reason: {text}",
         );
     }
-    // precondition: every variant is covered, so a new product cannot be
-    // added without a decision about it.
     assert_eq!(
         native.len() + refused.len(),
         17,
@@ -2437,17 +1947,12 @@ fn samplable_admits_the_six_native_moments_and_nothing_else() {
              samplable rather than letting it fall through",
     );
 
-    // The HHC refusal in particular names what it is, because "not a
-    // moment" is the part that surprises people.
     let hhc = VolumeSampler::new(&scan, RadarProduct::HydrometeorClassification)
         .unwrap_err()
         .to_string();
     assert!(hhc.contains("hybrid-scan"), "{hhc}");
 }
 
-/// The wire codes are stable, total and injective — a section crossing a
-/// message port keeps its statuses instead of arriving as a field of
-/// `NaN`.
 #[test]
 fn every_sample_status_survives_the_wire() {
     let all = [
@@ -2465,8 +1970,6 @@ fn every_sample_status_survives_the_wire() {
     }
     assert_eq!(SampleStatus::from_wire_code(7), None);
     assert_eq!(SampleStatus::from_wire_code(255), None);
-    // precondition: the list above is the whole enum, so a new variant
-    // fails here rather than travelling as an unknown byte.
     assert_eq!(
         all.len(),
         7,
@@ -2474,7 +1977,6 @@ fn every_sample_status_survives_the_wire() {
     );
 }
 
-/// A `Sample` cannot carry a number it does not have, or hide one it does.
 #[test]
 fn a_sample_pairs_its_number_with_its_reason() {
     let found = Sample::found(35.5);
@@ -2488,8 +1990,6 @@ fn a_sample_pairs_its_number_with_its_reason() {
     assert!(missing.value_or_nan().is_nan());
 }
 
-/// `sample` is `column().at_height_km()`, over a grid that crosses every
-/// boundary the two share.
 #[test]
 fn the_point_query_is_exactly_the_column_query() {
     let angles = [0.5f64, 1.5, 4.0, 10.0];
@@ -2525,8 +2025,6 @@ fn the_point_query_is_exactly_the_column_query() {
         }
     }
     assert_eq!(checked, 4 * 5 * 6);
-    // precondition: the grid really did cross the boundaries, rather than
-    // agreeing trivially on one status everywhere.
     assert!(
         statuses.len() >= 4,
         "the grid only produced {statuses:?}, so the agreement is not \
@@ -2534,8 +2032,6 @@ fn the_point_query_is_exactly_the_column_query() {
     );
 }
 
-/// A negative or non-finite query is answered, not panicked on: a UI can
-/// hand this whatever the pointer was over.
 #[test]
 fn a_nonsensical_query_answers_no_coverage() {
     let scan = Scan::new(vcp(&[0.5]), vec![flat_refl_sweep(1, 0.5, 360, 40, 20.0)]);
@@ -2551,10 +2047,6 @@ fn a_nonsensical_query_answers_no_coverage() {
         assert!(column.rungs().is_empty(), "az {az}, ground {ground}");
         assert_eq!(column.at_height_km(1.0).status(), SampleStatus::NoCoverage);
     }
-    // An azimuth outside 0..360 is wrapped rather than refused, because a
-    // bearing arrives from arithmetic that can overshoot either way. The
-    // field has to *vary* with azimuth for this to say anything — on the
-    // flat fixture above, every wrong answer is also the right one.
     let hot = |az: f64| {
         if (az - 5.0).abs() < 0.01 || (az - 355.0).abs() < 0.01 {
             55.0
@@ -2569,8 +2061,6 @@ fn a_nonsensical_query_answers_no_coverage() {
     );
     let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
     let at = |az: f64| sampler.column(az, 20.0).rungs()[0].sample;
-    // precondition: the two azimuths under test are the hot ones, so a
-    // wrap that landed anywhere else reads 10 rather than 55.
     assert_eq!(f64::from(at(5.0).value().unwrap()), round_trip_refl(55.0));
     assert_eq!(f64::from(at(355.0).value().unwrap()), round_trip_refl(55.0));
     assert_eq!(f64::from(at(9.0).value().unwrap()), round_trip_refl(10.0));
@@ -2580,7 +2070,6 @@ fn a_nonsensical_query_answers_no_coverage() {
     assert_eq!(at(725.0), at(5.0), "two turns past 360° did not wrap");
 }
 
-/// The ladder's shape accessors, which the section's axes are built from.
 #[test]
 fn the_ladder_reports_its_own_shape() {
     let angles = [0.5f64, 0.9, 7.0, 19.5];
@@ -2605,21 +2094,16 @@ fn the_ladder_reports_its_own_shape() {
     assert_eq!(single.tilt_count(), 1);
 }
 
-/// Both interpolation stages refuse to invent a number when a corner did
-/// not measure one, and the heaviest corner decides instead.
 #[test]
 fn a_corner_with_no_value_takes_the_cell_rather_than_being_averaged_in() {
     let v = Sample::found;
     let folded = Sample::missing(SampleStatus::RangeFolded);
     let below = Sample::missing(SampleStatus::BelowThreshold);
 
-    // All values: a true weighted mean.
     assert_eq!(
         blend(Blend::Arithmetic, &[v(10.0), v(20.0)], &[0.25, 0.75], None).value(),
         Some(17.5),
     );
-    // One corner missing: the heavier corner wins outright, with its own
-    // value or its own status.
     assert_eq!(
         blend(Blend::Arithmetic, &[v(10.0), folded], &[0.75, 0.25], None),
         v(10.0),
@@ -2628,8 +2112,6 @@ fn a_corner_with_no_value_takes_the_cell_rather_than_being_averaged_in() {
         blend(Blend::Arithmetic, &[v(10.0), folded], &[0.25, 0.75], None),
         folded,
     );
-    // Ties go to the earliest corner, so the answer does not depend on
-    // iteration order.
     assert_eq!(
         blend(Blend::Arithmetic, &[v(10.0), folded], &[0.5, 0.5], None),
         v(10.0),
@@ -2638,7 +2120,6 @@ fn a_corner_with_no_value_takes_the_cell_rather_than_being_averaged_in() {
         blend(Blend::Arithmetic, &[folded, v(10.0)], &[0.5, 0.5], None),
         folded,
     );
-    // Two different reasons stay different rather than merging.
     assert_eq!(
         blend(Blend::Arithmetic, &[below, folded], &[0.4, 0.6], None),
         folded,
@@ -2647,12 +2128,10 @@ fn a_corner_with_no_value_takes_the_cell_rather_than_being_averaged_in() {
         blend(Blend::Arithmetic, &[below, folded], &[0.6, 0.4], None),
         below,
     );
-    // Zero total weight cannot divide, and falls through to the same rule.
     assert_eq!(
         blend(Blend::Arithmetic, &[v(10.0), v(20.0)], &[0.0, 0.0], None),
         v(10.0),
     );
-    // Degenerate input answers rather than panicking.
     assert_eq!(
         blend(Blend::Arithmetic, &[], &[], None).status(),
         SampleStatus::NoCoverage,
@@ -2661,21 +2140,11 @@ fn a_corner_with_no_value_takes_the_cell_rather_than_being_averaged_in() {
 
 // ── The Nyquist seam ────────────────────────────────────────────────────
 
-/// **The measurement that started this: +24.50 and −24.50 m/s averaged to
-/// exactly 0.000.**
-///
-/// Nothing about that number is a rounding artefact to be waved away. It
-/// is the display's word for calm air, written over the one place the
-/// radar reported flow as fast as it can report — and it is stated here as
-/// an exact equality on the old behaviour so that a future change which
-/// merely makes the fabrication *small* cannot pass.
 #[test]
 fn a_velocity_pair_across_the_nyquist_seam_takes_the_nearer_gate() {
     let (out, back) = (Sample::found(24.5), Sample::found(-24.5));
     let limit = 24.5;
 
-    // precondition: without a limit — which is every other moment, and
-    // this moment before the fix — the answer is the fabricated calm.
     assert_eq!(
         blend(Blend::Arithmetic, &[out, back], &[0.5, 0.5], None).value(),
         Some(0.0),
@@ -2683,8 +2152,6 @@ fn a_velocity_pair_across_the_nyquist_seam_takes_the_nearer_gate() {
              test is no longer standing on the defect it was written for",
     );
 
-    // With the seam known, the nearer gate answers verbatim. These
-    // corners are gate neighbours, so the guard is armed across gates.
     let seam = Some(Seam::AcrossGates(limit));
     assert_eq!(
         blend(Blend::Arithmetic, &[out, back], &[0.5, 0.5], seam).value(),
@@ -2701,12 +2168,9 @@ fn a_velocity_pair_across_the_nyquist_seam_takes_the_nearer_gate() {
         Some(-24.5),
     );
 
-    // **Heaviest is the nearest sample, not the fastest one.** With the
-    // near corner at +18 and the far one at −24.5, a "largest magnitude"
-    // reading of the rule would answer −24.5 and turn every fold edge into
-    // a peak-hold. Both corners sit outside `SEAM_PROXIMITY_ACROSS_GATES
-    // · 24.5`, so the guard really does fire and the answer really is a
-    // choice.
+    // Heaviest is the nearest sample, not the fastest one: with the near
+    // corner at +18 and the far one at −24.5, a "largest magnitude" reading
+    // would answer −24.5 and turn every fold edge into a peak-hold.
     let near_side = [Sample::found(18.0), Sample::found(-24.5)];
     assert!(
         straddles_fold(&near_side, Seam::AcrossGates(limit)),
@@ -2719,8 +2183,6 @@ fn a_velocity_pair_across_the_nyquist_seam_takes_the_nearer_gate() {
         "the heaviest corner is the nearest one, not the fastest one",
     );
 
-    // The four-corner bilinear is the same rule: one straddling pair among
-    // the corners is enough, wherever in the quad it sits.
     assert_eq!(
         blend(
             Blend::Arithmetic,
@@ -2733,16 +2195,6 @@ fn a_velocity_pair_across_the_nyquist_seam_takes_the_nearer_gate() {
     );
 }
 
-/// The straddle test asks where each extreme sits, not how far apart the
-/// two are — so it is a box around the seam and not a band on the spread,
-/// and the difference between those two shapes is the whole point.
-///
-/// Every claim in the first half is a claim about the rule's *shape*, so
-/// each is asserted across both adjacencies; the second half is where
-/// each adjacency's own line sits, at the finest resolution a `Sample`
-/// can carry. The lines are pinned by value in
-/// [`each_guard_draws_its_line_at_its_own_fraction`] and through the
-/// integrated paths by the two `holds_its_line` tests beside it.
 #[test]
 fn the_straddle_test_needs_both_extremes_near_the_seam() {
     for seam in [Seam::AcrossGates as fn(f64) -> Seam, Seam::AcrossTilts] {
@@ -2753,24 +2205,18 @@ fn the_straddle_test_needs_both_extremes_near_the_seam() {
             )
         };
 
-        // Same sign is a ramp, never a fold — however wide.
         assert!(!s(2.0, 40.0, 20.0), "a same-sign ramp is not a fold");
         assert!(!s(-2.0, -40.0, 20.0));
 
-        // Opposite signs but nowhere near the seam: an ordinary zero
-        // crossing, which is the zero isodop and must keep interpolating
-        // smoothly.
         assert!(
             !s(2.0, -2.0, 20.0),
             "an ordinary zero crossing is not a fold"
         );
         assert!(!s(9.0, -9.0, 20.0));
 
-        // **The pair that the old spread-only rule got wrong.** −5 and
-        // +25 against a 20 m/s limit spread by 30, which clears a whole
-        // fold period, and change sign — so the old rule called it a
-        // fold. It cannot be one: a single wrap of a smooth field leaves
-        // *both* sides near ±20, and −5 is a quarter of the way in.
+        // −5 and +25 against a 20 m/s limit spread by 30 and change sign, so
+        // the old rule called it a fold. It cannot be one: a single wrap of a
+        // smooth field leaves *both* sides near ±20.
         assert!(
             !s(25.0, -5.0, 20.0),
             "a wide straddle with one end deep inside the range is shear, \
@@ -2778,17 +2224,10 @@ fn the_straddle_test_needs_both_extremes_near_the_seam() {
         );
         assert!(!s(5.0, -25.0, 20.0), "and the same the other way round");
 
-        // A real fold: piled against the ±limit seam.
         assert!(s(19.5, -19.5, 20.0));
 
-        // A corner of exactly zero is on no side of the seam.
         assert!(!s(0.0, -24.5, 12.0), "zero is not the far side of a seam");
 
-        // Strictly stronger than the rule it replaces: everything that
-        // fires here would have fired under sign-change-plus-spread, and
-        // the converse fails, which the `25.0, -5.0` case above is. This
-        // holds for any fraction at or above ½, so it holds on both
-        // paths.
         for a in -60..=60 {
             for b in -60..=60 {
                 let (a, b) = (f64::from(a) * 0.5, f64::from(b) * 0.5);
@@ -2804,17 +2243,9 @@ fn the_straddle_test_needs_both_extremes_near_the_seam() {
         }
     }
 
-    // Each extreme is tested on its own side of its own adjacency's
-    // line, and one end past it is not enough. The gate bound survives
-    // every conversion — `0.60 · 20` is exactly 12.0 in f64 and in a
-    // `Sample`'s f32 alike — so the strictness of the rule's own `<` is
-    // pinned exactly on the bound as well as either side of it. Since the
-    // tilt fraction moved to `0.50` its bound is `10.0` and survives the
-    // trip as well, so the same three on-bound cases are pinned on both
-    // paths; at `0.67` the tilt bound was `13.4`, representable in
-    // neither, and only the nearest half-m/s readings either side could
-    // stand in. (An earlier note here retired the exact-on-bound pin
-    // claiming neither shipped bound survived the trip; both do now.)
+    // `0.60 · 20` is exactly 12.0 in f64 and in a `Sample`'s f32 alike, and
+    // the tilt fraction's `0.50 · 20` is exactly 10.0, so the strictness of
+    // the rule's own `<` is pinned exactly on both bounds.
     let g = |a: f64, b: f64| {
         straddles_fold(
             &[Sample::found(a as f32), Sample::found(b as f32)],
@@ -2842,10 +2273,6 @@ fn the_straddle_test_needs_both_extremes_near_the_seam() {
     assert!(!t(10.5, -9.5), "one end past the tilt line is not enough");
     assert!(!t(9.5, -10.5), "nor is the other end alone");
     assert!(t(10.5, -10.5), "52.5% is past the tilt line on both ends");
-    // The tilt bound now survives the trip too: `0.50 · 20` is exactly 10.0
-    // in f64 and in a `Sample`'s f32 alike, so the strictness of the rule's
-    // own `<` is pinnable exactly on the tilt bound as well — which it was
-    // not at `0.67`, where `13.4` is representable in neither.
     assert!(
         !t(10.0, -10.0),
         "exactly on the tilt bound is not past it — the rule is strict",
@@ -2854,29 +2281,6 @@ fn the_straddle_test_needs_both_extremes_near_the_seam() {
     assert!(!t(10.0, -10.5), "and on the bound at the high end too");
 }
 
-/// The two fractions, by value, and that they are two.
-///
-/// Each number is the output of the corpus arbitration recorded on its
-/// constant, so a drift in either is a re-decision and must read as one
-/// here. The inequality is pinned separately because it is a separate
-/// claim: an edit landing both paths on one number — either number —
-/// undoes the split while leaving one of the value pins green.
-///
-/// **The direction pin is inverted from what it was, and that is the
-/// re-decision, not a re-baseline.** It used to read
-/// `TILTS > GATES`, on the argument that across tilts a real fold's ends
-/// stray further from the seam so the vertical guard must be the more
-/// reluctant one. The first half of that is measured and still true; the
-/// conclusion does not follow from it. A path whose real folds arrive with
-/// one end deep inside the range catches *fewer* of them at any bound, and
-/// the remedy is a nearer bound, not a further one. What actually put
-/// `0.67` above `0.60` was the oracle those bands were counted against,
-/// which books a fifth to a quarter of real vertical folds into the
-/// "confirmed shear refused" column — two to three times its quad error
-/// rate, and in the column that sets the crossing. Scored against labelled
-/// truth on two site-disjoint corpora the vertical bands cross far lower,
-/// so the vertical fraction is now the *smaller* of the two and the pin
-/// says so. The evidence is on [`SEAM_PROXIMITY_ACROSS_TILTS`].
 #[test]
 fn each_guard_draws_its_line_at_its_own_fraction() {
     assert_eq!(
@@ -2892,10 +2296,8 @@ fn each_guard_draws_its_line_at_its_own_fraction() {
         "the two adjacencies measured different break-evens; one number \
              serving both paths is the exact collapse the corpus ruled out",
     );
-    // Compile-time on purpose — clippy points out the operands are
-    // constants, and taking the hint makes this pin the hardest kind to
-    // silence: reordering the two fractions does not fail a test run, it
-    // refuses to build one.
+    // Compile-time on purpose: reordering the two fractions refuses to build
+    // rather than failing a test run.
     const {
         assert!(
             SEAM_PROXIMITY_ACROSS_TILTS < SEAM_PROXIMITY_ACROSS_GATES,
@@ -2903,11 +2305,6 @@ fn each_guard_draws_its_line_at_its_own_fraction() {
              so the vertical guard must reach nearer the middle than the \
              bilinear, not further out",
         );
-        // The floor the whole `0.50` argument rests on: under a half the
-        // rule stops implying the sign-change-and-spread rule it replaced.
-        // `the_straddle_test_needs_both_extremes_near_the_seam` pins the
-        // implication, but only at the fractions its fixtures happen to
-        // reach; this refuses to build at all.
         assert!(
             SEAM_PROXIMITY_ACROSS_TILTS >= 0.5,
             "below a half the seam rule is no longer strictly stronger \
@@ -2915,12 +2312,9 @@ fn each_guard_draws_its_line_at_its_own_fraction() {
         );
     }
 
-    // One pair, read across each adjacency: what fires between two tilts
-    // need not fire between two gates. This is the observable the two
-    // constants exist to create, and no single fraction — whichever
-    // value it took — could answer it both ways. The pair sits in the
-    // band between the two lines, which since the tilt fraction moved
-    // below the gate fraction is `[0.50·20, 0.60·20) = [10, 12)`.
+    // One pair, read across each adjacency: what fires between two tilts need
+    // not fire between two gates. The pair sits in the band between the two
+    // lines, `[0.50·20, 0.60·20) = [10, 12)`.
     let pair = [Sample::found(11.0), Sample::found(-11.0)];
     assert!(
         straddles_fold(&pair, Seam::AcrossTilts(20.0)),
@@ -2932,20 +2326,9 @@ fn each_guard_draws_its_line_at_its_own_fraction() {
     );
 }
 
-/// **The gate guard's line, held from both sides through the real
-/// bilinear.** A range seam between ±11 on a sweep whose limit is 20
-/// puts both extremes at 55% of the limit — inside the 60% line — and
-/// must interpolate; a seam between ±13 puts them at 65% — past it — and
-/// must snap to a measured speed. The second fixture is half of the swap
-/// detector: under the tilt fraction 65% is *inside* the line, so these
-/// fixtures fail if the gate guard regresses to the old 0.5, moves off
-/// its break-even, or trades fractions with the tilt guard.
 #[test]
 fn the_gate_guard_holds_its_line_from_both_sides() {
-    // ── 55%: inside the line. Crossing the seam must visit speeds
-    // between the sides, which a snapped read never produces. The
-    // 20 m/s planted at the first gate arms the guard at 20, so the
-    // ratio under test is set by the seam values, not by the pair.
+    // ── 55%: inside the line ──
     let scan = Scan::new(
         vcp(&[0.5]),
         vec![make_sweep(
@@ -3063,25 +2446,10 @@ fn the_gate_guard_holds_its_line_from_both_sides() {
     );
 }
 
-/// **The tilt guard's line, held from both sides through the real
-/// lerp.** Two tilts at ±9.5 under a limit of 20 put the pair at 47.5% —
-/// short of the tilt line at 50% — so the lerp must keep interpolating:
-/// the midpoint is the plain mean, 0.0. Two tilts at ±11 are at 55%,
-/// past the line, and must snap to a measured speed.
-///
-/// **The ±11 fixture is the swap detector, and it changed sides when the
-/// tilt fraction went below the gate fraction.** 55% sits in the band
-/// between the two lines — past the tilt line at 50%, short of the gate
-/// line at 60% — so it fires across tilts and not across gates. If the
-/// tilt guard ever took the gate guard's fraction, or drifted up off its
-/// labelled operating point, this pair would stop firing and the midpoint
-/// would go back to reading a plain mean. While the tilt fraction was the
-/// *higher* of the two the detector had to be the lower-side fixture
-/// instead, because the in-between band was on the other side.
 #[test]
 fn the_tilt_guard_holds_its_line_from_both_sides() {
-    // The midpoint of the lerp between tilts at `±speed`, with both
-    // rungs' guards armed at 20 m/s by a planted first gate.
+    // The midpoint of the lerp between tilts at `±speed`, with both rungs'
+    // guards armed at 20 m/s by a planted first gate.
     let lerped_mid = |speed: f32| {
         let scan = Scan::new(
             vcp(&[0.5, 4.5]),
@@ -3148,8 +2516,7 @@ fn the_tilt_guard_holds_its_line_from_both_sides() {
              corner — the tilt guard is drawing a line below its own",
     );
 
-    // ── 55%: past the tilt line, short of the gate line. The midpoint
-    //    is a measured speed, and this is the swap detector. ──
+    // ── 55%: past the tilt line, short of the gate line — the swap detector ──
     let pair = [Sample::found(11.0), Sample::found(-11.0)];
     assert!(
         straddles_fold(&pair, Seam::AcrossTilts(20.0)),
@@ -3169,30 +2536,10 @@ fn the_tilt_guard_holds_its_line_from_both_sides() {
     );
 }
 
-/// **The tilt line's lower side, at quarter-quantum resolution.** Against
-/// a 20 m/s limit the tilt fraction `0.50` draws its line at 10.0 and the
-/// next band down, `0.45`, at 9.0. Super-res velocity is quantised at
-/// 0.25 m/s, and ±9.75 — 48.75% of the limit — sits inside the band where
-/// the two disagree: short of the shipped line, past the band below it.
-/// This drives that pair through the real vertical path at the real
-/// super-res encoding and pins that it still lerps.
-///
-/// **Why this survived the move to `0.50` when its original reason did
-/// not.** It was written because the legacy 0.5 m/s grid steps from 13.0
-/// straight to 13.5, jumping the whole interval between `0.65 · 20 = 13.0`
-/// and `0.67 · 20 = 13.4`, so no half-quantum fixture anywhere in this file
-/// could see the tilt fraction slipping `0.67 → 0.65` and only the literal
-/// value pin would have noticed. At `0.50` that blind spot is gone — 9.5
-/// is on the legacy grid and separates `0.45` from `0.50` perfectly well.
-/// The test is kept anyway, retargeted, because the finest encoding the
-/// moment actually takes is the one worth pinning the line at, and because
-/// a fixture that only works at one value of the constant is a fixture
-/// that quietly dies the next time the constant moves.
 #[test]
 fn the_tilt_line_holds_its_lower_side_at_quarter_quantum() {
-    // The super-res encoding: 0.25 m/s per raw step. ±20 planted at the
-    // first gate arms both rungs at 20; ±9.75 everywhere else is the
-    // pair under test, and both survive the encoding exactly.
+    // The super-res encoding: 0.25 m/s per raw step. ±20 planted at the first
+    // gate arms both rungs at 20; ±9.75 elsewhere is the pair under test.
     const SUPER_RES_VEL_SCALE: f32 = 4.0;
     let sweep = |elevation_number: u8, elevation_deg: f32, sign: f64| {
         let radials = (0..360u16)
@@ -3237,7 +2584,6 @@ fn the_tilt_line_holds_its_lower_side_at_quarter_quantum() {
         );
     }
 
-    // The rule itself, on the pair the fixture carries.
     assert!(
         !straddles_fold(
             &[Sample::found(9.75), Sample::found(-9.75)],
@@ -3247,7 +2593,6 @@ fn the_tilt_line_holds_its_lower_side_at_quarter_quantum() {
              not fire — a tilt fraction of 0.45 would fire here",
     );
 
-    // And through the real lerp: the midpoint is the plain mean, 0.0.
     let column = sampler.column(90.0, 30.0);
     let rungs = column.rungs();
     assert_eq!(
@@ -3267,19 +2612,6 @@ fn the_tilt_line_holds_its_lower_side_at_quarter_quantum() {
     );
 }
 
-/// **The vertical lerp is the total case: a two-corner blend at `t = 0.5`
-/// of `±v` is identically zero, so every fold-straddling rung pair halfway
-/// up fabricates.**
-///
-/// Measured over fourteen volumes, 12,903 of the 12,918 rung pairs an
-/// independent continuity oracle confirms as folds — 99.9% — average to
-/// less than a quarter of the sweep's Nyquist velocity. The horizontal fix
-/// alone *raises* the vertical count, because unsmeared fold structure
-/// then survives to reach this stage.
-///
-/// (An earlier version of this note claimed 94.9% at KLWX-2018 against 97%
-/// of straddling gate pairs. Neither number reproduces; see
-/// [`Column::at_height_km`] for the withdrawal.)
 #[test]
 fn the_vertical_lerp_does_not_average_two_tilts_across_the_seam() {
     let scan = Scan::new(
@@ -3302,7 +2634,6 @@ fn the_vertical_lerp_does_not_average_two_tilts_across_the_seam() {
              is armed rather than silently absent",
     );
 
-    // Exactly halfway: `t = 0.5`, where the mean of ±24.5 is zero.
     let mid = 0.5 * (rungs[0].height_km + rungs[1].height_km);
     let sample = column.at_height_km(mid);
     let value = sample.value().expect("both rungs measured");
@@ -3312,8 +2643,6 @@ fn the_vertical_lerp_does_not_average_two_tilts_across_the_seam() {
              {value}, which is a speed neither tilt measured",
     );
 
-    // And the whole span between the rungs stays on measured speeds
-    // rather than sweeping through calm air on its way over.
     for step in 0..=100 {
         let t = f64::from(step) / 100.0;
         let h = rungs[0].height_km + t * (rungs[1].height_km - rungs[0].height_km);
@@ -3326,13 +2655,6 @@ fn the_vertical_lerp_does_not_average_two_tilts_across_the_seam() {
     }
 }
 
-/// The end-to-end horizontal path: a fold seam in range, sampled through
-/// the real bilinear rather than through [`blend`] alone.
-///
-/// This is the test that pins the *plumbing* — that velocity actually
-/// reaches [`blend`] with a limit. A fix living entirely inside `blend`
-/// with nothing wired to it would pass every unit test above and change
-/// nothing a caller can see.
 #[test]
 fn a_fold_seam_in_range_never_reads_as_calm_air() {
     // +24.5 out to 10 km, −24.5 beyond: the seam sits between two gates.
@@ -3353,8 +2675,6 @@ fn a_fold_seam_in_range_never_reads_as_calm_air() {
     let mut crossed = false;
     let mut previous = None;
     for step in 0..4000 {
-        // Fine enough to land inside the one gate interval the seam
-        // occupies, from both sides.
         let ground_km = 5.0 + f64::from(step) * 0.0025;
         let sample = sampler.column(90.0, ground_km).rungs()[0].sample;
         let Some(value) = sample.value() else {
@@ -3377,19 +2697,6 @@ fn a_fold_seam_in_range_never_reads_as_calm_air() {
     );
 }
 
-/// **The band where the answer actually changed: a spread of 1.0–1.5 fold
-/// limits.** Between 40% and 60% of the guard's real fires land here, and
-/// before this test nothing exercised it through the integrated path at
-/// all — the fixtures either straddled at `±limit` (ratio 2.0, unambiguous
-/// fold) or crossed gently (ratio 0.04–0.72, unambiguous shear).
-///
-/// +25.0 m/s inbound of 10 km and −5.0 m/s beyond it, on a sweep that
-/// folds at 25.0. The spread is 30.0 — **1.2 fold limits**, so it changes
-/// sign and clears a whole period, and the rule this replaces called it a
-/// fold and answered with one endpoint or the other. It cannot be one: a
-/// single wrap of a smooth field leaves both sides within the pair's own
-/// true change of ±25, and −5.0 is a fifth of the way in. It is an echo
-/// boundary with strong shear across it, and it must interpolate.
 #[test]
 fn a_wide_zero_crossing_in_the_disputed_band_still_interpolates() {
     let (fast, slow, seam_km) = (25.0f32, -5.0f32, 10.0);
@@ -3416,10 +2723,6 @@ fn a_wide_zero_crossing_in_the_disputed_band_still_interpolates() {
         .expect("precondition: the sweep claimed no seam, so nothing below could misfire");
     assert_eq!(limit, 25.0);
 
-    // precondition: this pair really is in the disputed band, and the rule
-    // being replaced really did fire on it. Without both, a pass below
-    // says nothing — the test would be standing on a case no detector
-    // ever disagreed about.
     let pair = [Sample::found(fast), Sample::found(slow)];
     let (lo, hi) = (f64::from(slow), f64::from(fast));
     let ratio = (hi - lo) / limit;
@@ -3433,21 +2736,12 @@ fn a_wide_zero_crossing_in_the_disputed_band_still_interpolates() {
         "precondition: the sign-change-and-spread rule does not fire here, \
              so this test cannot observe its removal",
     );
-    // (The corners span gates, and the gate line has since moved outward
-    // from the 0.5 this test was written against to its corpus
-    // break-even at 0.60 — which *widens* the disputed band and leaves
-    // this pair, at 20% of the limit, still deep inside the population
-    // the two rules disagree about. The preconditions above are what
-    // hold that claim in place.)
     assert!(
         !straddles_fold(&pair, Seam::AcrossGates(limit)),
         "a straddle with one end a fifth of the way into the range was \
              read as a fold",
     );
 
-    // And through the real bilinear: crossing the boundary must visit
-    // speeds between the two sides rather than stepping from one to the
-    // other.
     let mut between = 0;
     let mut saw_fast = false;
     let mut saw_slow = false;
@@ -3480,39 +2774,11 @@ fn a_wide_zero_crossing_in_the_disputed_band_still_interpolates() {
     );
 }
 
-/// **A gentle zero crossing is resampled by nobody: it is interpolated,
-/// gate by gate, across the whole ramp.** The zero isodop is where the
-/// flow is perpendicular to the beam and the field genuinely passes
-/// through zero, and it is the most-read feature of a velocity display.
-///
-/// # What this test can and cannot catch — read before trusting the name
-///
-/// The ramp below steps 1 m/s per quad against a measured limit of
-/// 24.5 m/s, a spread ratio of **0.041**. So it refuses a detector keyed
-/// on sign alone, and it refuses any threshold below about 4% of the fold
-/// limit, and that is the whole of its reach — it does not appear in the
-/// kill list of any mutation that moves the threshold within the range a
-/// threshold could plausibly take. An earlier version of this comment
-/// claimed it refused "any threshold small enough to catch a gentle
-/// crossing", which is not a claim its fixture supports.
-///
-/// The tests that do resolve the detector's boundary are
-/// [`the_straddle_test_needs_both_extremes_near_the_seam`] on the rule
-/// itself, [`each_guard_draws_its_line_at_its_own_fraction`] on the two
-/// fractions by value, and the two `holds_its_line` tests beside them,
-/// which hold each adjacency's own line from both sides through the
-/// integrated paths. A smooth ramp cannot be one of them: to
-/// put the pair bracketing zero at the rule's own bound the ramp would
-/// have to step a whole fold limit per gate, which is not a ramp.
 #[test]
 fn a_gentle_zero_crossing_interpolates_gate_by_gate() {
-    // −24.5 m/s inbound at the first gate ramping to +24.5 outbound at
-    // gate 49: 4 m/s per km, which is **1 m/s per gate — two quantisation
-    // steps** — so consecutive gates really do differ, and the pair either
-    // side of zero reads −0.5 and +0.5 rather than 0 and 0. That slope is
-    // 0.004 s⁻¹, an entirely ordinary shear, and the sweep's measured
-    // limit is 24.5 m/s: the guard is armed, well clear of the floor, and
-    // genuinely has the chance to misfire on every gate of the ramp.
+    // −24.5 m/s inbound at the first gate ramping to +24.5 at gate 49:
+    // 4 m/s per km, 1 m/s per gate — two quantisation steps — a slope of
+    // 0.004 s⁻¹, and the sweep's measured limit is 24.5 m/s.
     let ramp = |slant: f64| -24.5 + (slant - gate_slant_km(0)) * 4.0;
     let scan = Scan::new(
         vcp(&[0.5]),
@@ -3527,8 +2793,6 @@ fn a_gentle_zero_crossing_interpolates_gate_by_gate() {
     );
     let sampler = VolumeSampler::new(&scan, RadarProduct::Velocity).unwrap();
 
-    // precondition: the guard is armed, so a pass here is the detector
-    // declining to fire rather than the detector being switched off.
     assert_eq!(
         sampler.rungs[0].fold_limit_ms,
         Some(24.5),
@@ -3536,9 +2800,6 @@ fn a_gentle_zero_crossing_interpolates_gate_by_gate() {
              below could have misfired anyway",
     );
 
-    // Halfway between the two gates that bracket zero, the answer is their
-    // arithmetic mean and *not* either endpoint — which is exactly what a
-    // detector firing here would destroy.
     let decode = |j: usize| {
         f64::from((f32::from(encode_vel(ramp(gate_slant_km(j)))) - VEL_OFFSET) / VEL_SCALE)
     };
@@ -3560,8 +2821,6 @@ fn a_gentle_zero_crossing_interpolates_gate_by_gate() {
         "a gentle zero crossing was taken for a fold and went blocky",
     );
 
-    // And across the whole ramp the sampled profile stays monotone and
-    // visits values between the gate centres, which a blocky read cannot.
     let mut seen_between = 0;
     let mut previous = f32::NEG_INFINITY;
     for step in 0..2000 {
@@ -3573,8 +2832,6 @@ fn a_gentle_zero_crossing_interpolates_gate_by_gate() {
             value >= previous - 1e-4,
             "the ramp reversed at {ground_km} km: {previous} then {value}",
         );
-        // A value strictly between two encoded gate centres — the 0.5 m/s
-        // quantum — can only come from interpolating.
         if (f64::from(value) * 2.0).fract().abs() > 1e-6 {
             seen_between += 1;
         }
@@ -3587,10 +2844,6 @@ fn a_gentle_zero_crossing_interpolates_gate_by_gate() {
     );
 }
 
-/// Below [`FOLD_LIMIT_FLOOR_MS`] the guard is off, because a sweep that
-/// saw nothing fast has no measured seam to trust — and the lerp over such
-/// a sweep really does come back with the plain mean, which this computes
-/// rather than implies.
 #[test]
 fn a_sweep_too_slow_to_have_folded_keeps_its_plain_mean() {
     let quiet = make_sweep(1, 0.5, 360, 200, None, Some(&|_, _| Some(3.0)));
@@ -3602,13 +2855,9 @@ fn a_sweep_too_slow_to_have_folded_keeps_its_plain_mean() {
              should have been claimed for this sweep",
     );
 
-    // **The mean the name promises.** Two tilts at ±7.5 m/s — the fastest
-    // pair that still leaves both sweeps under the floor — lerp to 0.0 at
-    // the midpoint. That number is the one the whole change exists to
-    // refuse *when there is a seam*, and here there is not, so it must
-    // survive: with the floor at 7.0 instead of 8.0 both sweeps would arm
-    // at 7.5, `±7.5` clears `SEAM_PROXIMITY_ACROSS_TILTS · 7.5` at both
-    // ends, and this would read ±7.5 rather than nothing.
+    // Two tilts at ±7.5 m/s — the fastest pair that still leaves both sweeps
+    // under the floor — lerp to 0.0 at the midpoint. With the floor at 7.0
+    // instead of 8.0 both would arm at 7.5 and this would read ±7.5.
     let scan = Scan::new(
         vcp(&[0.5, 4.5]),
         vec![
@@ -3632,45 +2881,17 @@ fn a_sweep_too_slow_to_have_folded_keeps_its_plain_mean() {
              which is a corner rather than a mean",
     );
 
-    // The same sweep one step over the floor does arm the guard, so the
-    // floor is a threshold rather than a switch that is always off.
     let fast = make_sweep(1, 0.5, 360, 200, None, Some(&|_, _| Some(8.0)));
     let scan = Scan::new(vcp(&[0.5]), vec![fast]);
     let sampler = VolumeSampler::new(&scan, RadarProduct::Velocity).unwrap();
     assert_eq!(sampler.rungs[0].fold_limit_ms, Some(8.0));
 
-    // And the two numbers mean the same thing in both modules.
     assert_eq!(
         FOLD_LIMIT_FLOOR_MS, 8.0,
         "the floor moved away from the one `nrot` abandons dealiasing at",
     );
 }
 
-/// **One rung with a measured seam and one without still guards the lerp.**
-///
-/// [`Column::at_height_km`] takes the tighter of the two limits when both
-/// rungs have one and falls back to whichever exists when only one does.
-/// That fallback arm — `(a, b) => a.or(b)` — is reachable and was
-/// unpinned: replacing it with `None` left every other velocity test
-/// passing, because every other fixture arms both rungs.
-///
-/// The shape is real rather than contrived. A clear-air coverage pattern
-/// measures a fold limit around 11 m/s; a higher cut of the same volume
-/// looking at slow air can report nothing over [`FOLD_LIMIT_FLOOR_MS`]
-/// and so claims no seam at all, while the cut below it folds.
-///
-/// (The armed sweep read 12.5 when the vertical fraction was 0.5, then
-/// 11.0 when it was 0.67. This pair must beat
-/// `SEAM_PROXIMITY_ACROSS_TILTS` of the one measured limit on both ends
-/// while its slow side stays under the 8.0 floor that keeps that sweep
-/// unarmed — which caps the armed limit below `8.0 / fraction`: `≈11.9`
-/// at `0.67`, and `16.0` now the fraction is back at `0.50`. The 12.5
-/// fixture went silently dead when the fraction rose to `0.67`, because
-/// at 12.5 the pair then sat at 60% and the tilt guard rightly declined
-/// it, so the one-sided arm this test exists to pin was never reached.
-/// 11.0 is kept rather than restored to 12.5 — it is inside the window at
-/// every fraction this constant has taken — and the straddle precondition
-/// below is what makes a repeat of that failure loud instead of silent.)
 #[test]
 fn a_lerp_between_one_measured_seam_and_one_unmeasured_still_guards() {
     for (low, high, expect_lo, expect_hi) in
@@ -3684,8 +2905,6 @@ fn a_lerp_between_one_measured_seam_and_one_unmeasured_still_guards() {
             ],
         );
         let sampler = VolumeSampler::new(&scan, RadarProduct::Velocity).unwrap();
-        // precondition: exactly one rung claims a seam, so this really is
-        // the one-sided arm and not the `min` of two.
         let claimed: Vec<_> = sampler
             .rungs
             .iter()
@@ -3699,10 +2918,6 @@ fn a_lerp_between_one_measured_seam_and_one_unmeasured_still_guards() {
                  does not exercise the one-sided arm",
             claimed.len(),
         );
-        // precondition: the pair still straddles at the tilt fraction of
-        // the one measured limit — without this, a fraction change can
-        // park the fixture below the line and the assert at the bottom
-        // stops observing the arm it names.
         let limit = claimed[0].expect("one rung claimed a seam");
         assert!(
             straddles_fold(
@@ -3731,7 +2946,6 @@ fn a_lerp_between_one_measured_seam_and_one_unmeasured_still_guards() {
     }
 }
 
-/// Which moments have a seam at all, stated once and exhaustively.
 #[test]
 fn velocity_is_the_only_moment_with_an_unstated_fold_limit() {
     for &product in RadarProduct::all() {
@@ -3742,13 +2956,10 @@ fn velocity_is_the_only_moment_with_an_unstated_fold_limit() {
             "{product:?}",
         );
     }
-    // Spectrum width is the near miss: it is a Doppler moment off the same
-    // sweep, so it looks like velocity — but it is a non-negative spread,
-    // so no two of its gates can sit on opposite sides of a seam and
-    // `straddles_fold` could never fire on it even if it were armed.
+    // Spectrum width is a non-negative spread, so no two of its gates can sit
+    // on opposite sides of a seam. Differential phase does wrap, and is
+    // handled by a blend arm instead.
     assert!(!Blend::folds_at_measured_limit(RadarProduct::SpectrumWidth));
-    // Differential phase does wrap, and is handled by a blend arm instead,
-    // because 360° is a constant the format does not have to carry.
     assert!(!Blend::folds_at_measured_limit(
         RadarProduct::DifferentialPhase
     ));
@@ -3756,24 +2967,13 @@ fn velocity_is_the_only_moment_with_an_unstated_fold_limit() {
         Blend::for_moment(RadarProduct::DifferentialPhase),
         Blend::Angular360,
     );
-    // Nothing but velocity pays for the measuring pass.
     let scan = Scan::new(vcp(&[0.5]), vec![flat_refl_sweep(1, 0.5, 360, 40, 20.0)]);
     let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
     assert_eq!(sampler.rungs[0].fold_limit_ms, None);
 }
 
-/// The limit is read per rung, because the Nyquist velocity follows the
-/// cut's PRF and genuinely differs inside one volume.
 #[test]
 fn each_rung_measures_its_own_seam_and_the_lerp_takes_the_tighter_one() {
-    // **The two sweeps must differ in their limits *and* read something
-    // other than those limits where they are sampled**, or `min` and `max`
-    // cannot be told apart. Two flat sweeps can never separate them: a
-    // flat sweep's limit is the speed it reads, so an opposite-sign pair
-    // always differs by `l0 + l1`, which clears the larger limit too. So
-    // the high tilt reads −11 where it is sampled while folding at 30
-    // somewhere else — which is exactly the real shape, a cut whose PRF
-    // sets a seam far above anything in this particular column.
     let low = make_sweep(1, 0.5, 360, 200, None, Some(&|_, _| Some(11.5)));
     let high = make_sweep(
         2,
@@ -3795,9 +2995,7 @@ fn each_rung_measures_its_own_seam_and_the_lerp_takes_the_tighter_one() {
     assert_eq!(sampler.rungs[1].fold_limit_ms, Some(30.0));
 
     // +11.5 and −11.0 differ by 22.5, which clears the *smaller* limit and
-    // not the larger. Testing against the larger would miss this straddle
-    // entirely, so this pins the `min` and not merely that some limit was
-    // reaching the lerp.
+    // not the larger, so this pins the `min`.
     let pair = [Sample::found(11.5), Sample::found(-11.0)];
     assert!(
         straddles_fold(&pair, Seam::AcrossTilts(11.5)),
@@ -3822,12 +3020,8 @@ fn each_rung_measures_its_own_seam_and_the_lerp_takes_the_tighter_one() {
     );
 }
 
-/// The estimator reads the same numbers [`gate_sample`] does, off the same
-/// bytes, including the encodings that make a reimplementation wrong.
 #[test]
 fn the_fold_limit_is_the_fastest_speed_the_sweep_actually_reports() {
-    // A field whose extreme is planted at one known gate, so a scan that
-    // stopped early or skipped the status codes reads differently.
     let field = |_: f64, slant: f64| {
         Some(if (slant - gate_slant_km(150)).abs() < 1e-9 {
             -31.5
@@ -3846,8 +3040,6 @@ fn the_fold_limit_is_the_fastest_speed_the_sweep_actually_reports() {
              it has and wherever in the radial it sits",
     );
 
-    // Brute force over every gate, as the definition rather than the
-    // implementation: the affine shortcut must agree with it exactly.
     let mut brute = 0.0f64;
     for radial in radials {
         let moment = MomentSlot::Velocity.read(radial).unwrap();
@@ -3860,13 +3052,9 @@ fn the_fold_limit_is_the_fastest_speed_the_sweep_actually_reports() {
     }
     assert_eq!(brute, 31.5);
 
-    // **The status codes, planted as raw bytes.** Every fixture above
-    // encodes through `encode_vel`, which clamps to 2..=255 and so can
-    // never produce a 0 or a 1 — meaning no fixture above can catch an
-    // estimator that reads the status codes as speeds. Raw 0 decodes to
-    // −64.5 m/s and raw 1 to −64.0 under this encoding, so an estimator
-    // that admitted either would claim a seam nearly three times the real
-    // one and switch the guard off in practice.
+    // The status codes, planted as raw bytes: every other fixture encodes
+    // through `encode_vel`, which clamps to 2..=255. Raw 0 decodes to
+    // −64.5 m/s and raw 1 to −64.0 under this encoding.
     let coded = Radial::new(
         0,
         0,
@@ -3897,14 +3085,10 @@ fn the_fold_limit_is_the_fastest_speed_the_sweep_actually_reports() {
         SampleStatus::RangeFolded,
         "precondition: raw 1 is not the range-folded code here",
     );
-    // **Raw 2 is the boundary the filter is actually written at, and it is
-    // an admitted value, not a code.** Planting 0 and 1 alone only shows
-    // that the filter is at least as strict as `>= 2`; a filter one step
-    // stricter still passes. Raw 2 decodes to −63.5 m/s here — larger than
-    // anything else in the radial — so admitting it and skipping it give
-    // different answers, and the estimate below distinguishes all three
-    // neighbouring filters at once: `>= 3` reads 24.5, `>= 2` reads 63.5,
-    // `>= 1` reads 64.0 and `>= 0` reads 64.5.
+    // Raw 2 is the boundary the filter is written at, and it is an admitted
+    // value, not a code. It decodes to −63.5 m/s here, so the estimate below
+    // separates all four neighbouring filters: `>= 3` reads 24.5, `>= 2`
+    // 63.5, `>= 1` 64.0 and `>= 0` 64.5.
     assert_eq!(
         gate_sample(MomentSlot::Velocity.read(&coded).unwrap(), 2),
         Sample::found(-63.5),
@@ -3917,14 +3101,11 @@ fn the_fold_limit_is_the_fastest_speed_the_sweep_actually_reports() {
         "the estimate does not run from the first admitted code to the last",
     );
 
-    // A sweep of nothing but below-threshold gates claims no seam at all
-    // rather than a seam of zero.
     let empty = make_sweep(1, 0.5, 360, 200, None, Some(&|_, _| None));
     assert_eq!(
         estimate_fold_limit(empty.radials(), MomentSlot::Velocity),
         None,
     );
-    // And a sweep with no velocity moment at all does the same.
     let refl = flat_refl_sweep(1, 0.5, 360, 40, 20.0);
     assert_eq!(
         estimate_fold_limit(refl.radials(), MomentSlot::Velocity),
@@ -3932,7 +3113,6 @@ fn the_fold_limit_is_the_fastest_speed_the_sweep_actually_reports() {
     );
 }
 
-/// The linear-Z question has one answer in this crate, not two.
 #[test]
 fn the_blend_table_agrees_with_the_echo_top_cubes() {
     for product in [
@@ -3950,8 +3130,6 @@ fn the_blend_table_agrees_with_the_echo_top_cubes() {
                  it averages in linear Z",
         );
     }
-    // Differential phase is the one arm `CellStat` does not have, and it
-    // must not fall through to the arithmetic mean.
     assert_eq!(
         Blend::for_moment(RadarProduct::DifferentialPhase),
         Blend::Angular360,
@@ -3964,15 +3142,8 @@ fn the_blend_table_agrees_with_the_echo_top_cubes() {
     );
 }
 
-/// Milliseconds since the epoch the clocked fixture below starts at.
 const LADDER_T0: i64 = 1_760_000_000_000;
 
-/// [`sails_volume`] with a real clock on each sweep, sixty seconds apart in
-/// elevation-number order — the order the RDA flies them in.
-///
-/// The three members of the 0.48° cut therefore carry *different* clocks, which
-/// is what makes the ladder's answer a statement about **which sweep won the
-/// rung** rather than about the volume as a whole.
 fn clocked_sails_volume() -> Scan {
     let refl = |dbz: f64| move |_: f64, _: f64| Some(dbz);
     let at = |n: u8| LADDER_T0 + i64::from(n) * 60_000;
@@ -4021,26 +3192,6 @@ fn clocked_sails_volume() -> Scan {
     )
 }
 
-/// **Each rung's clock survives the worker port**, so a section cut in a worker
-/// can say how old the tilt under the pointer is.
-///
-/// # Why this is the load-bearing test of the whole per-rung-age feature
-///
-/// Every cross-section in the app is cut from a **reconstructed** scan:
-/// `dispatch_section_renders` extracts a `RenderInput`, and the job handler
-/// rebuilds a `Scan` from it. `RenderInput::to_scan` used to stamp `0` on every
-/// radial's collection timestamp, because until now no render path read one.
-///
-/// So a rung age read off the sampler was correct in this crate's own tests —
-/// which sample real fixtures — and identically zero in the product. That is
-/// precisely the shape of test that cannot fail: the feature is exercised
-/// everywhere except where it runs. This test is the one that goes through the
-/// bytes, and it is the one that fails if the clock stops crossing.
-///
-/// The three 0.48° members carry different clocks, so the assertion is also a
-/// statement about **which** sweep won the rung: a ladder that took the SAILS
-/// Doppler repeat instead of the surveillance half reports a clock two minutes
-/// out, not merely a different number of gates.
 #[test]
 fn a_reconstructed_render_input_scan_keeps_each_sweeps_clock() {
     let scan = clocked_sails_volume();
@@ -4050,9 +3201,6 @@ fn a_reconstructed_render_input_scan_keeps_each_sweeps_clock() {
             .expect("the fixture's own ladder builds");
         let here: Vec<i64> = original.collection_times_ms().collect();
 
-        // precondition: the fixture actually dates its rungs, and does not
-        // date them all alike — a ladder of equal clocks would pass this
-        // comparison against a reconstruction that invented one constant.
         assert!(
             here.iter().all(|&ms| ms > 0),
             "{product:?}: precondition — a rung carries no clock: {here:?}",
@@ -4067,9 +3215,6 @@ fn a_reconstructed_render_input_scan_keeps_each_sweeps_clock() {
         let input = crate::render_input::RenderInput::extract_volume(&scan, product, 35.33, -97.27)
             .expect("the fixture carries the moment")
             .with_declared_nyquist(&declared);
-        // Through the bytes, because a worker holds bytes rather than a
-        // `RenderInput`, and the clock has to be in the layout as well as in
-        // the struct.
         let decoded = crate::render_input::RenderInput::from_bytes(&input.to_bytes())
             .expect("the payload round-trips");
         let reconstructed = decoded.to_scan();
@@ -4085,9 +3230,6 @@ fn a_reconstructed_render_input_scan_keeps_each_sweeps_clock() {
              invention",
         );
 
-        // And the ladder itself is still the same ladder, so this is a claim
-        // about the clocks rather than about a reconstruction that happened to
-        // pick different sweeps with matching times.
         assert_eq!(
             ported.elevations_deg().collect::<Vec<_>>(),
             original.elevations_deg().collect::<Vec<_>>(),
@@ -4096,14 +3238,6 @@ fn a_reconstructed_render_input_scan_keeps_each_sweeps_clock() {
     }
 }
 
-/// The rung clocks are read from the same radials [`ladder_fingerprint`] hashes,
-/// so a rung's age describes the sweep the picture was cut from.
-///
-/// The fixture's split cut is what makes this say something: three sweeps share
-/// the 0.48° cut and carry clocks a minute apart, and reflectivity takes the
-/// **surveillance** half while velocity takes the newest Doppler one. If the
-/// clock were read off "the volume" or off the first sweep of the cut, the two
-/// products would report the same time for that rung. They must not.
 #[test]
 fn a_rungs_clock_is_the_clock_of_the_sweep_that_won_it() {
     let scan = clocked_sails_volume();
@@ -4114,9 +3248,6 @@ fn a_rungs_clock_is_the_clock_of_the_sweep_that_won_it() {
     let vel = VolumeSampler::new(Volume::new(&scan, &declared), RadarProduct::Velocity)
         .expect("the velocity ladder builds");
 
-    // The 0.48° rung, found by its nominal key rather than by position, so a
-    // reordering of the ladder cannot quietly move this assertion to another
-    // cut.
     let at_cut = |sampler: &VolumeSampler<'_>| -> i64 {
         let idx = sampler
             .nominal_elevations_deg()

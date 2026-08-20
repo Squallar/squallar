@@ -1,18 +1,6 @@
-//! The arrival-time extraction cache (WO-E4.9): `RenderInput::extract` moves
-//! to volume arrival, and the dispatch serves the walk from the cache instead
-//! of paying it on the frame thread.
-//!
-//! The frame-thread-payment observable is
-//! `RenderDispatcher::plan_view_extractions` — the plan-view sibling of
-//! `App::volume_extractions`, counting exactly the dispatch-time inline
-//! walks. A hit performs **zero**; a miss exactly **one**, and the miss IS
-//! today's path (the fallback every entry-less dispatch takes).
-//!
-//! The byte pin is the trap the order body names: stamps must NOT be baked
-//! into the cached payload — `with_*` consume `self`, so the dispatch clones
-//! then stamps, and the job a hit posts must be byte-identical to the job a
-//! fresh extraction posts. A pre-stamped cache would differ the moment the
-//! melting layer or the RPG vector landed.
+//! The arrival-time extraction cache (WO-E4.9): `RenderInput::extract` moves to volume
+//! arrival, and the dispatch serves the walk from the cache instead of paying it on the
+//! frame thread.
 
 use rustdar_radar::types::RadarProduct;
 use rustdar_worker::offload::{JobRequest, JobSink};
@@ -23,10 +11,6 @@ const OTHER_SITE: &str = "KMPX";
 const TILT: f32 = 0.5;
 const OTHER_TILT: f32 = 1.5;
 
-/// A worker port that keeps what it was handed instead of running it — the
-/// same recorder `one_render_per_sweep_tests` installs, for the same reason:
-/// with a port in place `offload_job` posts and returns, so the job count and
-/// bytes are read at the moment of dispatch, not raced against workers.
 struct Recorder(Arc<Mutex<Vec<Vec<u8>>>>);
 
 impl JobSink for Recorder {
@@ -70,8 +54,8 @@ fn volume_time() -> chrono::NaiveDateTime {
         .unwrap()
 }
 
-/// A two-cut volume carrying reflectivity and velocity at `fill` everywhere,
-/// so two fills are two byte-distinct volumes of one shape.
+/// A two-cut volume carrying reflectivity and velocity at `fill` everywhere, so two fills
+/// are two byte-distinct volumes of one shape.
 fn sample_scan(fill: u8) -> Arc<nexrad_model::data::Scan> {
     use nexrad_model::data::{
         ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan,
@@ -149,8 +133,8 @@ fn sample_scan(fill: u8) -> Arc<nexrad_model::data::Scan> {
     ))
 }
 
-/// A declared-Nyquist table with real rows, so the dispatch-time
-/// `with_declared_nyquist` stamp is a stamp of substance in the byte pin.
+/// A declared-Nyquist table with real rows, so the dispatch-time `with_declared_nyquist`
+/// stamp is a stamp of substance in the byte pin.
 fn declared() -> Arc<rustdar_radar::nyquist::DeclaredNyquist> {
     let mut table = rustdar_radar::nyquist::DeclaredNyquist::empty();
     table.declare(1, 26.0);
@@ -158,8 +142,8 @@ fn declared() -> Arc<rustdar_radar::nyquist::DeclaredNyquist> {
     Arc::new(table)
 }
 
-/// Aim pane `idx` at `site` showing `product` at `elevation`, far enough
-/// along that the dispatcher and the arrival hook both act on it.
+/// Aim pane `idx` at `site` showing `product` at `elevation`, far enough along that the
+/// dispatcher and the arrival hook both act on it.
 fn point_at(
     app: &mut crate::app::App,
     idx: usize,
@@ -197,10 +181,8 @@ fn point_at(
         .insert(site.to_string(), (sample_scan(fill), declared()));
 }
 
-/// Drain the (native, asynchronous) arrival-time extraction until `want`
-/// payloads are resident — the pump row's job, done by hand because a test
-/// has no frame loop. Bounded, so a populate that never homes is a failure
-/// with a message rather than a hang.
+/// Drain the (native, asynchronous) arrival-time extraction until `want` payloads are
+/// resident — the pump row's job, done by hand because a test has no frame loop.
 fn wait_for_extracts(app: &mut crate::app::App, want: usize) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
@@ -216,9 +198,8 @@ fn wait_for_extracts(app: &mut crate::app::App, want: usize) {
     }
 }
 
-/// **The hit half of the frame-thread-payment pin.** After an arrival with
-/// one pane showing the site, the following dispatch performs ZERO
-/// frame-thread extractions — and still posts the render job.
+/// one pane showing the site, the following dispatch performs ZERO frame-thread extractions
+/// — and still posts the render job.
 #[test]
 fn an_arrival_populated_cache_makes_the_dispatch_extraction_free() {
     let (recorded, _worker) = recorder();
@@ -244,7 +225,6 @@ fn an_arrival_populated_cache_makes_the_dispatch_extraction_free() {
     );
 }
 
-/// **The miss half.** With no entry, the dispatch performs exactly one
 /// frame-thread extraction — today's path, pinned as the fallback.
 #[test]
 fn a_cold_cache_pays_exactly_one_dispatch_extraction() {
@@ -263,13 +243,6 @@ fn a_cold_cache_pays_exactly_one_dispatch_extraction() {
     assert_eq!(posted_inputs(&recorded).len(), 1);
 }
 
-/// The arrival hook populates for the arrival site's shown panes ONLY (AF2's
-/// observable half): a pane on another site contributes nothing — not a
-/// tuple of its own (the other pane's product differs, so a hook that
-/// iterated the wrong panes files a second, non-colliding entry and the
-/// count catches it deterministically), and **not its bytes under the
-/// arrival site's key** — the byte assertion below is what catches a
-/// foreign extraction filed under this site's key.
 #[test]
 fn an_arrival_populates_only_the_sites_shown_panes() {
     let (recorded, _worker) = recorder();
@@ -296,9 +269,9 @@ fn an_arrival_populates_only_the_sites_shown_panes() {
          is keying something other than the arrival site",
     );
 
-    // And the payload under the site's key is the SITE's extraction: the
-    // pane 0 dispatch must post KTLX's gates (fill 200), byte for byte —
-    // never the other pane's volume filed under this key.
+    // And the payload under the site's key is the SITE's extraction: the pane 0 dispatch
+    // must post KTLX's gates (fill 200), byte for byte — never the other pane's volume
+    // filed under this key.
     app.render.plan_view_extractions.set(0);
     app.dispatch_pane_renders(&ctx);
     assert_eq!(
@@ -331,12 +304,8 @@ fn an_arrival_populates_only_the_sites_shown_panes() {
     );
 }
 
-/// **The byte pin.** The job a cache hit posts is byte-identical to the job
-/// a fresh dispatch-time extraction posts — cached-then-stamped ==
-/// freshly-extracted-then-stamped, `RenderInput::to_bytes` compared whole.
-/// Fails if the populate bakes any of the four stamps into the cached
-/// payload, or if the hit path stamps a different clone than the miss path
-/// extracts.
+/// a fresh dispatch-time extraction posts — cached-then-stamped == freshly-extracted-then-
+/// stamped, `RenderInput::to_bytes` compared whole.
 #[test]
 fn a_cached_then_stamped_payload_is_the_fresh_then_stamped_bytes() {
     // Velocity, so the declared-Nyquist stamp is substance, not a no-op.
@@ -371,11 +340,6 @@ fn a_cached_then_stamped_payload_is_the_fresh_then_stamped_bytes() {
     );
 }
 
-/// **The stale-first invalidation.** A second arrival for the site drops the
-/// previous snapshot's payload before the rebuild is even dispatched — a live
-/// volume keeps its `volume_start` while sweeps seal, so without the drop the
-/// old entry would be served under the new snapshot's key and the newly
-/// sealed data would be silently under-drawn.
 #[test]
 fn a_second_arrival_never_serves_the_previous_snapshots_payload() {
     let (recorded, _worker) = recorder();

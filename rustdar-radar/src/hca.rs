@@ -1,417 +1,42 @@
 //! Hydrometeor Classification (the RPG's per-tilt product 165, AWIPS `N0H`)
 //! computed locally from the Level II dual-pol moments of one tilt.
 //!
-//! # What is implemented, and from which documents
-//!
-//! The WSR-88D **Hydrometeor Classification Algorithm** is fully public:
-//! task `cpc023/tsk001` (`hca`) ships complete C source in the CODE
-//! distribution, together with its two feeder tasks — the dual-pol
-//! preprocessor `cpc004/tsk011` (`dpprep`, already transcribed for
-//! [`crate::kdp`] and shared through [`crate::dpprep`]) and the **Quality
-//! Index Algorithm** `cpc023/tsk002` (`qia`) — and the **Melting Layer
-//! Detection Algorithm** `cpc023/tsk003` (`mlda`). Everything below was
-//! first transcribed from the Build 16 mirror (github `likev/CodeOrpgPub`),
-//! then cross-checked against and **updated to the CODE Build 21.0r1.7
-//! public source** (the fleet runs ≥ B21 semantics; the delta list is
-//! below), with the fleet-default adaptation values from
-//! `cpc104/lib006/{hca,qia,mlda,dpprep,hail}.alg`. The algorithm lineage is
-//! Park, Ryzhkov, Zrnić, Kim 2009, "The Hydrometeor Classification
+//! Transcribed from the ORPG CODE Build 21.0r1.7 public source: task
+//! `cpc023/tsk001` (`hca`), its feeders `cpc023/tsk002` (`qia`) and
+//! `cpc004/tsk011` (`dpprep`, shared through [`crate::dpprep`]), and the
+//! Melting Layer Detection Algorithm `cpc023/tsk003` (`mlda`); fleet-default
+//! adaptation values from `cpc104/lib006/{hca,qia,mlda,dpprep,hail}.alg`.
+//! Lineage: Park, Ryzhkov, Zrnić, Kim 2009, "The Hydrometeor Classification
 //! Algorithm for the Polarimetric WSR-88D" (Weather and Forecasting 24,
-//! 730–748) for HCA and Giangrande, Krause, Ryzhkov 2008 (JAMC 47,
-//! 1354–1364) for the MLDA; **where the released source and the paper
-//! differ, the source wins** (the divergence list below).
+//! 730–748) for HCA and Giangrande, Krause, Ryzhkov 2008 (JAMC 47, 1354–1364)
+//! for the MLDA. Where the released source and the paper differ, the source
+//! wins.
 //!
-//! # Build 21 deltas applied over the Build 16 transcription
+//! Chain (`cpc104/lib003/task_attr_table`): super-res base data → `recomb` →
+//! `dpprep` → `qia` → `hca` → `dualpol8bit` (product 165). Each dpprep field
+//! crosses a task boundary as a quantized moment, so the 8-bit fields are
+//! rounded to their transport resolution and a gate whose raw input was
+//! missing stays missing downstream.
 //!
-//! Diffed file-for-file against `rpg_b21_0r1_7_pub_src` (all fleet
-//! defaults; each item names its CCR where the source records one):
+//! Output uses the product's external codes (`dualpol8bit.c`'s
+//! `Class_external`, class × 10): RA 60, HR 70, RH 100 (LH 110 / GH 120 for
+//! the large/giant-hail subclasses), BD 80, BI 10, GC 20, DS 40, WS 50, IC 30,
+//! GR 90, UK 140; NE encodes level 0 and decodes as undefined.
 //!
-//! * **memDS** (`hca.alg`): ZDR row (−0.3, 0, **0.9, 1.1**) — B16 had
-//!   (−0.3, 0, 1.3, 1.6) — and ρ row (**0.98, 0.99**, 1.0, 1.01) — B16
-//!   (0.95, 0.98, 1.0, 1.01).
-//! * **memWS** (`hca.alg`): Z row (**15, 25**, 40, 50) — B16 (25, 30, 40,
-//!   50); the ZDR row became **two-dimensional**, (0.5, 1.0, f2, f2+0.3)
-//!   via `memFlagWS` = (none, none, f2, f2); ρ row (**0.84, 0.88, 0.97**,
-//!   0.985) — B16 (0.88, 0.92, 0.95, 0.985).
-//! * **WS hard threshold** (CCR NA15-00181): the `Z < min_Z_WS` leg is
-//!   commented out of `hca_allowedHydroClass.c`; only `ZDR < 0` kills WS.
-//! * **Melting-layer zones** (`hca_allowedHydroClass.c`): the upper
-//!   transition regained **BI** and the above-layer zone regained **GC and
-//!   BI** (B16: `GC DS WS IC GR BD RH` / `DS IC GR RH`).
-//! * **Tie-break** (CCR NA14-00181): an aggregation margin under
-//!   `min_Dif_Agg` no longer reads UK — `Break_tie` picks between winner
-//!   and runner-up by the AEL Table 4 priority of the gate's zone, with the
-//!   source's "tuned" upper lists (BI/GC prepended).
-//! * **Hail Size Discrimination** (CCR NA14-00275, `enable_size = Yes`):
-//!   `HailSize_v3` subclasses RH gates into small/large/giant against six
-//!   height regimes around the wet-bulb 0 °C/−25 °C heights (`hail.alg`
-//!   operator values; here [`HsdaHeights`], sounding-fed), with
-//!   `min_data_size = 2` despeckling and a ZDR ≥ 2 hard stop; product 165
-//!   emits **LH 110 / GH 120** for the large/giant subclasses
-//!   (`dualpol8bit.c`'s `EXT_LH`/`EXT_GH`). `hca_setMembershipPoints.c`
-//!   additionally re-derives RH's F1-flagged ZDR points from the gate
-//!   height in the two regimes below the wet-bulb zero (hardcoded
-//!   polynomials — the `.alg`'s unused `h1` coefficients are *not* what
-//!   the code evaluates).
-//! * **Met-signal preprocessing** (CCR NA14-00100, `metsignal_processing =
-//!   ON`): the dpprep meteorological flag, unfold filter and the CAPPI
-//!   rescue — see [`crate::dpprep`]'s module doc; the QIA is unchanged
-//!   except for a blockage term (`Nc`) that is zero without the blockage
-//!   store, and `melting_layer.c`'s constants are unchanged (its B21
-//!   model-merge refactor is operational state, same gap as before).
-//! * `dpprep`'s new `DPRA`/`DPIN` output phases and `findBragg` feed DP QPE
-//!   / CDA / monitoring, not this chain.
+//! [`resolve_melting_layer`] is the melting-layer chain: the RPG's own product
+//! 166 for this volume, else this volume's MLDA ([`detect_melting_layer`]),
+//! else a sounding freezing level, else the `hail.alg` 10.5 kft flat default.
+//! The last rung is a guess and scores 16–20% exact class agreement against
+//! `N0H` in winter/stratiform regimes where 84–99% is achievable from rung 1,
+//! which is why [`MeltingLayer`] carries a [`MeltingLayerSource`].
 //!
-//! **Chain** (`cpc104/lib003/task_attr_table`): super-res base data →
-//! `recomb` → `dpprep` → `qia` → `hca` → `dualpol8bit` (product 165). Per
-//! recombined 1° × 0.25 km radial, dpprep hands HCA these fields, all of
-//! which [`compute_hca`] reproduces through [`crate::dpprep`]:
-//!
-//! * `DSMZ` — 3-gate smoothed, attenuation-corrected Z (`z_prcd`);
-//! * `DZDR` — 5-gate smoothed, attenuation-corrected ZDR (`zdr_prcd`, the
-//!   recombined ZDR being `10·log10(phc/pvc)` of the pair's averaged
-//!   powers);
-//! * `DRHO` — 5-gate smoothed ρhv (`rho_prcd`; the noise correction is
-//!   compiled out of the released build);
-//! * `DKDP` — the 9/25-gate merged KDP, censored on smoothed ρ < 0.9;
-//! * `DPHI` — the **25-gate smoothed, interpolated** ΦDP (`phi_long_gate`),
-//!   not the raw phase: it feeds the quality indices and the RA hard
-//!   threshold;
-//! * `DSNR` — SNR from the 3-gate smoothed Z and the radial header's
-//!   `dBZ0`/atmos;
-//! * `DSMV` — 5-gate smoothed velocity;
-//! * `DSDZ` — texture SD(Z): the 5-gate non-biased std of `Z − Z̄₅`,
-//!   differences beyond ±50 dB excluded (`DPPT_std_filter`);
-//! * `DSDP` — texture SD(ΦDP): the 9-gate std of `φ_unfolded − φ̄₉`,
-//!   differences beyond ±100° excluded.
-//!
-//! Each field crosses task boundaries as a quantized moment
-//! (`Add_moment`/`RPGCS_radar_data_conversion`), so the primary pipeline
-//! rounds the 8-bit fields to their transport resolution — Z and SNR to
-//! 0.5 dB, ZDR to 1/16 dB, SD(Z) to 1/8.33, SD(ΦDP) to 0.4°, velocity to
-//! 0.5 m/s, the quality indices to 0.01 — and a moment gate whose **raw**
-//! input was missing is missing downstream regardless of what the smoothing
-//! window filled in (`Add_moment` keys the level on `inp`). The 16-bit
-//! fields (ρ, φ, KDP) travel at sub-physical resolution and are not
-//! re-quantized here.
-//!
-//! **QIA** (`qia_process.c`, the released "simple" version): per gate, six
-//! quality indices `q = exp(−0.69·Σ c²)` with components `φ/600` (Z),
-//! `φ/300` (ZDR), `φ/100` (ρ, KDP), `(1−ρ)/0.5` (zeroed when ρ < 0.8 and
-//! Z < 25 dBZ — attenuation, `z_atten_thresh`), `snr_thresh/snr` in linear
-//! power (0 dB for Z/KDP/SDZ/SDP, 5 dB for ZDR), and the beam-blockage term
-//! (zero here — see the gap list). Non-finite indices become 0.
-//!
-//! **HCA proper** (`hca_process_radial.c` and friends): per gate,
-//! * SNR < 5 dB (`min_snr`) → no echo (NE);
-//! * range-folded ZDR/ρ/φ → unknown (UK) — unreachable from Archive II
-//!   dual-pol moments, whose decode maps RF to missing;
-//! * hard thresholds (`hca_allowedHydroClass.c`, `hca.alg` values)
-//!   invalidate classes: |V| > 1 kills GC; Z > 50 kills RA (plus ρ < 0.94
-//!   with φ < 100°); Z < 30 kills RH and HR (HR also ZDR < 1); Z > 40 kills
-//!   IC; Z outside [10, 60] or ZDR > 2 kills GR; Z < 15 or ZDR < 0.5 kills
-//!   BD; ZDR < 0 kills WS (the Z leg is gone in B21); ZDR > 2 kills DS;
-//!   ρ > 0.97 or Z > 35 kills BI (`atten_control = Off` applies both
-//!   everywhere);
-//! * the melting layer gates the allowed set by the gate's position against
-//!   the four beam/ML intersection ranges (`hca_beamMLIntersection.c`,
-//!   effective radius 7708.91 km, 1° beam): below — GC BI BD RA HR RH;
-//!   entering — + WS GR; within — GC BI DS WS GR BD RH; upper — GC BI DS
-//!   WS IC GR BD RH; above — GC BI DS IC GR RH;
-//! * for each surviving class, six trapezoidal memberships
-//!   (`hca_setMembershipPoints.c` + `hca_degreeMembership.c`; the ZDR and
-//!   LKDP breakpoints of the rain family shift with Z through
-//!   `f1/f2/f3/g1/g2`, and RH's ZDR points additionally with gate height
-//!   below the wet-bulb zero — the HSDA modification), each weighted by
-//!   the class×variable weight **and** the gate's quality index, aggregate
-//!   `Σ WQF/(Σ WQ + 0.01)`;
-//! * the largest aggregation wins; a maximum under 0.4 (`min_Agg`) yields
-//!   UK, and a margin under 0.001 (`min_Dif_Agg`) goes to the zone's AEL
-//!   Table 4 priority (`Break_tie`). LKdp is `10·log10(KDP)`, floored at
-//!   −40 for KDP < 0.001 (`MINI_LKTP`);
-//! * RH gates then pass through `HailSize_v3` (see the B21 delta list).
-//!
-//! The output uses the product's external codes (`dualpol8bit.c`'s
-//! `Class_external`, class × 10): RA 60, HR 70, RH 100 (LH 110 and GH 120
-//! for the large/giant-hail subclasses), BD 80, BI 10, GC 20, DS 40, WS 50,
-//! IC 30, GR 90, UK 140; NE encodes level 0 and decodes as undefined,
-//! exactly as the Level III twin's codec treats it.
-//!
-//! # Melting layer and environmental data
-//!
-//! **Where the melting layer comes from, in one place.**
-//! [`resolve_melting_layer`] is the chain and the only place it is written
-//! down; this is what each rung is worth, measured.
-//!
-//! 1. **The RPG's own melting layer for this volume** — its published
-//!    Melting Layer product (Level III 166, AWIPS `N0M`), inverted by
-//!    [`MeltingLayer::from_melting_layer_product`]. Per azimuth, paired to
-//!    the volume by its own PDB, and therefore right for a replay as well as
-//!    for a live scan.
-//! 2. **This volume's own MLDA** ([`detect_melting_layer`]) — per azimuth,
-//!    but from one volume where the RPG accumulates three, so in practice it
-//!    concludes almost never (0 of 18 measurements in the July survey below,
-//!    0 of 10 on the twin roster).
-//! 3. **A sounding's freezing level**, flat ([`crate::sounding`]).
-//! 4. **The `hail.alg` fleet adaptation default**, flat at 10.5 kft MSL.
-//!    A guess.
-//!
-//! ## What the guess costs — measured 2026-08-13, ten volumes, ten sites
-//!
-//! The same classifier, the same ten Level II volumes, the same ten RPG
-//! products, with only the melting layer different. Scored as exact class
-//! agreement against the RPG's own `N0H`, oracle decoded independently
-//! (MetPy), on four VCPs, six weather regimes and two holdouts:
-//!
-//! ```text
-//! site  regime                     compared   rung 4   rung 1   delta
-//! KFTG  deep convection               43190    80.55    96.78  +16.24
-//! KDMX  convective line               26937    91.61    95.65   +4.04
-//! KMSX  mountain convection           56573    82.33    95.30  +12.97
-//! KOKX  coastal winter storm          57075    19.80    98.59  +78.79
-//! KMLB  subtropical convection        17092    90.24    95.10   +4.87
-//! KATX  Pacific stratiform            24239    15.95    91.69  +75.74
-//! KBUF  lake-effect snow              24644    16.09    96.88  +80.80
-//! KARX  clear air (control)            5619    83.48    87.38   +3.90
-//! KUDX  HOLDOUT Black Hills           36063    87.61    93.16   +5.56
-//! KABX  HOLDOUT winter SW             12949    80.43    84.21   +3.78
-//! ```
-//!
-//! **On the fleet default the classification disagrees with the RPG four
-//! times in five in a winter or stratiform regime** — 16.0–19.8 % exact at
-//! the three sites where that default sits 2.9–3.1 km from the real layer —
-//! and it does so while drawing a full, plausible-looking picture. On the
-//! RPG's own layer the same code scores 84.2–98.6 %, eight of ten sites over
-//! 91 %, both holdouts included. The hybrid product ([`crate::hhc`]) tells
-//! the same story: 16.0–27.3 % against 93.8–100 % at those three sites.
-//!
-//! That is why [`MeltingLayer`] carries a [`MeltingLayerSource`] and why
-//! [`crate::render::SweepRender::melting_layer_source`] carries it out to
-//! the viewer: a 16 % answer and a 96 % answer are the same picture with the
-//! same colours, and nothing else distinguishes them.
-//!
-//! (The rung-4 column reproduces the twin campaign's own measurement of the
-//! shipped fallback to the second decimal at all ten sites, and the rung-1
-//! column reproduces its independently-derived Python inversion of the same
-//! ten product-166 objects — 82.77–95.85 % before the `weight_RHOhv`
-//! correction below, which is the state the campaign measured.)
-//!
-//! What the operational chain actually does with the model 0 °C height
-//! (`hca_buffer_control.c`, `melting_layer.c`):
-//!
-//! * On the first volume, and whenever the MLDA produces nothing, HCA uses
-//!   a **flat** layer: top = the `height_0` adaptation value (the
-//!   operator/model 0 °C height, kft MSL) converted to km above radar
-//!   level, bottom = top − 0.5 km, both floored at ground.
-//!   [`MeltingLayer::from_zero_c_height`] mirrors this with the WP-S
-//!   sounding's [`crate::sounding::EnvHeights::h0c_km_msl`] standing in for
-//!   `height_0`.
-//! * The radar-based MLDA ([`detect_melting_layer`], Giangrande 2008 per
-//!   `melting_layer.c`) accumulates "wet snow" detections from the 4°–10°
-//!   tilts — gates whose HCA class is not GC/BI/UK/NE, SNR > 5, Z in
-//!   (15, 47), ρ in (0.90, 0.97), whose 0.5-km-above window's Z maximum is
-//!   in (30, 47) and ZDR maximum in (0.8, 2.2), both at ρ > 0.85 — into an
-//!   azimuth × 100-m-height histogram weighted by elevation
-//!   (`(0.36·e − 0.56)·(e/10)` above 1), sums it over ±10° of azimuth,
-//!   clips to ±1 km of the previous top, and reads the top and bottom as
-//!   the 80th and 20th percentiles (+0.05 km). An azimuth needs a summed
-//!   weight above 1500 (`min_wet_snow_sum`); gaps interpolate between the
-//!   valid neighbours around the circle, and no valid azimuth at all falls
-//!   back to the flat default.
-//! * Operationally the RPG accumulates those histograms across **3 volumes**
-//!   (6 in clear air), applies the previous volume's result, and — with the
-//!   fleet default `Melting_Layer_Source = Model_Enhanced` — merges in the
-//!   RUC/RAP **freezing-height grid**, per-azimuth, when fewer than 320
-//!   azimuths are radar-valid. Both are operational state a single archived
-//!   volume cannot reproduce (the model grid is not in the archive at all) —
-//!   **but the RPG publishes its conclusion**, and product 166 is that
-//!   publication. Reading it back is why rung 1 above exists and why the
-//!   three-volume accumulation and the model merge are no longer a gap: they
-//!   are inside the number the RPG drew.
-//!
-//! ## Why the sounding cannot stand in for it on a replay
-//!
-//! [`crate::sounding`] fetches Open-Meteo's `/v1/forecast` for **now**, which
-//! is right for a live volume and wrong for an archived one — a January
-//! volume replayed in August is handed August's freezing level. The archive
-//! endpoint does not close the gap: `archive-api.open-meteo.com/v1/archive`
-//! answers `freezing_level_height` and every pressure-level temperature with
-//! `null` (ERA5 there carries surface fields only, checked 2026-08-13), and
-//! the forecast endpoint's `past_days` window reaches back about 92 days,
-//! which is not an archive. So for a replay the sounding is rung 3 in name
-//! only, and product 166 is the only source that is contemporaneous with the
-//! volume by construction.
-//!
-//! # Where the released source diverges from Park et al. (2009)
-//!
-//! The source's constant tables win throughout; the paper values are noted
-//! so nobody "fixes" them back:
-//!
-//! * **DS's ρhv weight is 1.0**, `hca.alg:305`'s ninth `weight_RHOhv`
-//!   entry — the paper's Table 3 says 0.6, and 0.6 is what this module
-//!   carried until 2026-08-13. It is the only value in the whole
-//!   transcription that followed the paper over the source, and the test
-//!   that should have caught it restated our own array in our own layout;
-//!   `hca::tests::weights_match_the_alg_arrays` now derives the matrix from
-//!   the `.alg` lines instead. Measured on the ten-volume roster **with the
-//!   RPG's own melting layer in place**, the correction moves `N0H` exact
-//!   agreement **up at ten sites of ten** — +0.30 (KMLB) to +5.25 (KBUF),
-//!   +3.45 KMSX, +2.92 KOKX, +4.57 KATX — taking the range from
-//!   82.77–95.85 % to 84.21–98.59 % and the count of sites over 91 % from
-//!   seven to eight. On the hybrid product it is a wash: four sites up by
-//!   ≤ 0.13, five down by ≤ 0.58, KARX unchanged at 100 %. Reported both
-//!   ways because the second result is the honest one.
-//! * BD's Z membership is (10, 15, 45, 50) in `hca.alg`, (20, 25, 45, 50)
-//!   in the paper — with the BD hard threshold rewritten from
-//!   `ZDR < f2(Z) − 0.3` to fixed `Z < 15 || ZDR < 0.5`;
-//! * BI's ZDR x2 is 0 (paper 2) and its ρ row is (0.30, 0.50, 0.85, 0.90)
-//!   (paper x3/x4 0.80/0.83); the source adds the `max_Z_BI = 35` kill;
-//! * DS's ZDR row is (−0.3, 0, 0.9, 1.1) in B21 (paper (−0.3, 0, 0.3,
-//!   0.6); B16 shipped (−0.3, 0, 1.3, 1.6));
-//! * RH's minimum-Z hard threshold is 30 dBZ (paper 40);
-//! * LKdp floors at −40 for KDP < 0.001 (paper −30 for ≤ 0.001);
-//! * the aggregation denominator carries `+ 0.01`;
-//! * the quality indices are the QIA's released "simple" version, not the
-//!   paper's confidence vector (Eqs. 14–19: no NBF gradients, no ΔZDR, no
-//!   blockage estimate);
-//! * the paper's convective/stratiform separation and despeckling do not
-//!   exist in the released HCA task (the only despeckle is the HSDA's
-//!   hail-size one);
-//! * MLDA's ZDR-maximum profile ceiling is 2.2 dB (`mlda.alg`; the paper
-//!   text says 2.5).
-//!
-//! # Documented gaps against the RPG
-//!
-//! * **Beam blockage** (`read_Blockage`, the FShield Z adjustment and the
-//!   QIA blockage term) needs the per-site blockage store, which the
-//!   archive stream does not carry; this derivation runs unblocked
-//!   (blockage 0 ≤ `Min_blockage` 5%), so terrain-blocked sectors at
-//!   mountain sites will diverge.
-//! * **Velocity** on split-cut surveillance tilts: the RPG's HCA input has
-//!   the Doppler cut's velocity recombined in; the archive's surveillance
-//!   sweep carries none, so the GC velocity kill is inert there (a missing
-//!   V skips the test, per the source's own NO_DATA guard).
-//! * The RPG computes in `float`; this module computes in `f64` — orders of
-//!   magnitude below the transport quantization it reproduces.
-//! * The RF → UK branch is unreachable (see above).
-//!
-//! # Validation status — read before trusting the twin harness to pass
-//!
-//! **The live twin harness, its `validation_policy` (compatible pairs,
-//! quarantine table) and the offline policy pins now live on branch
-//! `campaign-harness`.** The figures below are the last measured before
-//! the move; re-measuring means that branch.
-//!
-//! The live harness scores the derivation against the RPG's own N0H for the
-//! same volume and cut (paired like the KDP twin, elevation-angle fallback
-//! included), as classes: exact agreement plus a compatible-pair band
-//! (WS↔GR, BD↔RA, HR↔RA — see `validation_policy`) and the full confusion
-//! matrix per site. Verifying the encoding against live PDBs found product
-//! 165's packet scale factor carrying the projection constant, like its
-//! sibling 163 — every roster site declared PDB scale 1 / offset 0 (levels
-//! ARE the class codes) and ~1.0 km/gate for a 0.25 km product, fixed in
-//! `ProductDescriptionBlock::range_gate_km`.
-//!
-//! A full-roster survey on 2026-07-29 (~00:50 UTC volumes, every site in
-//! nocturnal clear-air biology — no precipitation anywhere on the roster,
-//! so the melting-layer machinery and the WS/GR/BD/HR compatible band went
-//! unexercised): all 22 sites were measured, **exact agreement 88.7–98.5%,
-//! every site over the 85% exact bar** (KTLX 98.53, KMVX 98.38, KMLB 97.80,
-//! …, KSFX 88.74, KMTX 88.76); presence disagreement 5.8–19.3%, the
-//! derivation defining slightly *more* than the twin, with the cells only
-//! the twin defines sitting at the `min_snr` margin (the diagnostic's
-//! `low-SNR` cause; `no-Z` and `uncovered` were 0 everywhere). Twelve sites
-//! also met the 95% compatible bar; ten missed it (88.8–94.4%) because in
-//! a biology field the compatible pairs add almost nothing — the residual
-//! confusion is BI↔GC (0.5–2% each way), BI↔UK, and at the cold high-plains
-//! sites DS↔WS/IC (KMTX, KBIS, KUEX), deliberately outside the pair list.
-//!
-//! The bounded A/B (documented conventions only) was flat on this survey:
-//! radar-MLDA vs the flat 0 °C layer tied at every site (no wet snow
-//! anywhere, so the detection correctly fell back to the sounding default);
-//! `isdp-applied` tied everywhere but KMRX/KSFX, where the primary RDA
-//! value won by 0.03–0.07; the physical-units variant lost to the
-//! documented 8-bit transport on the tuning set (KTLX −0.46 its largest
-//! move) and on the holdout (4 of 5 sites), so the transport stays primary.
-//! The remaining residual carries operational-state fingerprints, per the
-//! campaign's early-stop rule: BI↔GC hinges on the per-site **blockage
-//! store** (FShield and the QIA blockage term run unblocked here) and on
-//! the Doppler cut's velocity being sampled ~30 s apart from the
-//! surveillance cut it is grafted onto; BI↔UK flips on `min_Dif_Agg`
-//! margins of 0.001 in the aggregation, inside one 8-bit transport step of
-//! the inputs; and the DS↔WS/IC band at the cold sites is where the twin's
-//! melting layer is the previous volume's **model-enhanced MLDA** (the
-//! RUC/RAP freezing grid plus 3-volume accumulation — state the archive
-//! does not carry). None of these is reachable from a single archived
-//! volume; nothing undocumented was chased.
-//!
-//! # Precipitation re-survey — 2026-07-29, after the B21 upgrade
-//!
-//! The clear-air survey never exercised the rain/hail classes, the
-//! melting-layer ring or the compatible band, so the campaign re-surveyed
-//! on **precipitating site-hours** picked by protocol: the roster scanned
-//! at candidate hours over the previous day (`live_hca_precip_site_scan`,
-//! lowest-cut gates ≥ 35 dBZ as the cheap check), twelve site-hours
-//! selected for climatology — the 2026-07-29 06–08 UTC plains nocturnal
-//! MCS (KUEX 15.8k hot gates, KDDC 7.0k, KAMA 5.3k, KOAX 5.2k, KEAX 2.2k,
-//! KFSD 0.8k, KSGF 0.8k), the 2026-07-28 20–22 UTC afternoon convection
-//! southeast and gulf (KMRX 15.9k, KMLB 9.1k Florida, KMOB 2.3k) and
-//! mountain west (KSFX 3.9k, KMTX 3.4k). No cold-sector stratiform exists
-//! anywhere in late July; that regime remains unexercised.
-//!
-//! **Verdict: pass.** Eighteen measurements (twelve site-hours plus
-//! second/third volumes at the leads): every one cleared the 85% exact
-//! bar (90.9–98.8%); eight of twelve sites cleared the 95% compatible bar
-//! too — KUEX 96.36/96.43, KOAX 95.45/95.56, KDDC 97.76/97.82, KEAX
-//! 95.74/95.75, KSGF 97.80/97.80, KAMA 97.53/97.53, KMLB 96.02/96.22,
-//! KMOB 98.77/98.84 (exact/compatible) — 330k compared gates pooled over
-//! the asserted eight, conclusive under `validation_policy`. The
-//! confusion matrix finally carries the precipitation classes, with
-//! per-site producer accuracies at the asserted sites: RA 74–99% over
-//! ~27k twin gates, HR 97–100% (KUEX n=448, KMLB n=143), BD 82–95%
-//! (~5.9k), GR 72–93% (~1.6k), DS 56–98%, WS 39–75% (user 56–93% — the
-//! shortfall lands in GR/DS, the paper's own overlap), RH 40–100% on
-//! small populations. **HSDA validated live**: the twins do emit LH
-//! 110/GH 120, and the single-gate LH/GH cells matched exactly at
-//! KDDC/KAMA/KSGF (7 of 8 across the survey) — wrong before this upgrade,
-//! when those cells could only read RH.
-//!
-//! Four sites are **quarantined** with two-run, multi-volume evidence
-//! (see `validation_policy::QUARANTINED`): KFSD (biology-dominated
-//! field, compatible adds nothing, residual = the documented BI↔GC/UK
-//! state fingerprints), KMRX and KSFX (terrain blockage-store residual),
-//! and KMTX (the 07-28 episode's twin ran a model-enhanced melting layer
-//! below our sounding flat — RA→DS 0.8–1.3% — while the same site
-//! **passed both bars** on 2026-07-29 07:57, 96.04/96.16, pinning the
-//! miss on ML state, not transcription). Every quarantined site still
-//! clears the exact bar on every volume.
-//!
-//! **Melting-layer ring**: [`detect_melting_layer`] concluded from wet
-//! snow at none of the eighteen measurements (0/360 azimuths everywhere) —
-//! a single volume's 4°–10° histogram never reaches `min_wet_snow_sum`
-//! = 1500 in July convection, where the operational MLDA accumulates
-//! three volumes and merges the model grid. Every survey ran on the
-//! sounding flat layer, and the radar-vs-flat A/B rows were identical at
-//! all eighteen; the only place the twin's transition band disagreed with
-//! the sounding was the quarantined KMTX episode above. WS populations at
-//! the asserted plains sites (n=36–325 per site, producer 39–75%,
-//! compatible with GR) sat inside the sounding band.
-//!
-//! **A/B in precipitation** (decided on the precipitating tuning set
-//! KUEX/KMLB/KMTX/KMRX/KDDC, confirmed on the holdout
-//! KOAX/KAMA/KMOB/KSFX/KEAX/KSGF/KFSD, which played no part):
-//!
-//! * **B21 met-signal flag vs the legacy ρ/SNR flag**: met signal won 4
-//!   of 5 tuning sites (+0.07…+0.24 exact, one KMTX tie at −0.01) and 7
-//!   of 7 holdouts (+0.06…+0.89, KFSD tie) — the fleet-default
-//!   `metsignal_processing = ON` stays primary, now with survey evidence.
-//! * **Volume-built CAPPI vs cold start**: identical on every measurement
-//!   — every paired N0H tilt sits under 1.0°, where `apply_CAPPI` never
-//!   fires. The warm build stays primary as the closer operational
-//!   approximation for the ≥ 1° consumers.
-//! * **radar-MLDA vs flat**: tied everywhere (no detection).
-//! * **isdp-applied** and **physical-units**: ties to small losses; the
-//!   documented defaults stay.
+//! Documented gaps against the RPG: beam blockage (`read_Blockage`, the
+//! FShield Z adjustment and the QIA blockage term) needs a per-site blockage
+//! store the archive stream does not carry, so this runs unblocked and
+//! terrain-blocked sectors at mountain sites diverge; on split-cut
+//! surveillance tilts the archive carries no velocity, so the GC velocity kill
+//! is inert there; the RPG computes in `float` and this in `f64`; the
+//! RF → UK branch is unreachable from Archive II moments.
 
 use crate::dpprep::{
     CORR_THRESH, DBZ_THRESH, DBZ_WINDOW, DpCombined, DpInput, LONG_GATE, MET_SIG_THRESHOLD,
@@ -444,16 +69,13 @@ pub(crate) const GR: usize = 11;
 pub(crate) const UK: usize = 12;
 pub(crate) const NE: usize = 13;
 
-/// `dualpol8bit.c`'s `Class_external`: internal class index → the product's
-/// data level (class codes scaled by 10). U0/U1/NE map to 0, which the
-/// Level III codec decodes as undefined.
+/// `dualpol8bit.c`'s `Class_external`: internal class index → the product's data level
+/// (class codes scaled by 10).
 pub const CLASS_EXTERNAL: [f32; NUM_CLASSES] = [
     0.0, 0.0, 60.0, 70.0, 100.0, 80.0, 10.0, 20.0, 40.0, 50.0, 30.0, 90.0, 140.0, 0.0,
 ];
 
-/// The C sentinel for a missing value (`HCA_NO_DATA`). The classification
-/// arithmetic runs in this sentinel domain, exactly as the source does —
-/// a missing ZDR *is* −10⁵ dB against every threshold and membership edge.
+/// The C sentinel for a missing value (`HCA_NO_DATA`).
 pub(crate) const NO_DATA: f64 = -1.0e5;
 
 /// `MINI_LKTP`: LKdp for KDP below 0.001 °/km.
@@ -475,24 +97,18 @@ const MIN_RHO_RA: f64 = 0.94;
 const MIN_PHIDP_RA: f64 = 100.0;
 const MIN_Z_RH: f64 = 30.0;
 const MIN_Z_HR: f64 = 30.0;
-/// Heavy rain is refused under this ZDR.
 pub(crate) const MIN_ZDR_HR: f64 = 1.0;
 const MAX_Z_IC: f64 = 40.0;
 const MIN_Z_GR: f64 = 10.0;
 const MAX_Z_GR: f64 = 60.0;
-/// Graupel is refused over this ZDR.
 pub(crate) const MAX_ZDR_GR: f64 = 2.0;
 const MIN_Z_BD: f64 = 15.0;
-/// Big drops are refused under this ZDR.
 pub(crate) const MIN_ZDR_BD: f64 = 0.5;
-// B21: `min_Z_WS` is "no longer used per CCR NA15-00181" — the Z leg of the
-// WS kill is commented out of `hca_allowedHydroClass.c`; only ZDR remains.
-/// Wet snow is refused under this ZDR — the last liquid-bearing class to go
-/// as ZDR falls through zero.
+// CCR NA15-00181: the Z leg of the WS kill is commented out of
+// `hca_allowedHydroClass.c`; only ZDR remains.
 pub(crate) const MIN_ZDR_WS: f64 = 0.0;
 const MAX_RHOHV_BI: f64 = 0.97;
 const MAX_Z_BI: f64 = 35.0;
-/// Dry snow is refused over this ZDR.
 pub(crate) const MAX_ZDR_DS: f64 = 2.0;
 const MIN_AGG: f64 = 0.4;
 const MIN_DIF_AGG: f64 = 0.001;
@@ -538,8 +154,7 @@ pub(crate) struct MemTable {
     pub(crate) flags: [[MemFlag; 4]; NUM_FL_INPUTS],
 }
 
-/// `hca.alg`'s `memRA`/`memFlagRA`. Row order is the fuzzy-logic input
-/// order: SMZ, ZDR, LKDP, RHO, SD(Z), SD(ΦDP).
+/// `hca.alg`'s `memRA`/`memFlagRA`.
 pub(crate) const MEM_RA: MemTable = MemTable {
     points: [
         [5.00, 10.00, 45.00, 50.00],
@@ -599,8 +214,7 @@ pub(crate) const MEM_RH: MemTable = MemTable {
     ],
 };
 
-/// `hca.alg`'s `memBD`/`memFlagBD` (big drops). The Z row is the source's
-/// (10, 15, 45, 50) — the paper prints (20, 25, 45, 50).
+/// `hca.alg`'s `memBD`/`memFlagBD` (big drops).
 pub(crate) const MEM_BD: MemTable = MemTable {
     points: [
         [10.00, 15.00, 45.00, 50.00],
@@ -620,8 +234,7 @@ pub(crate) const MEM_BD: MemTable = MemTable {
     ],
 };
 
-/// `hca.alg`'s `memBI`/`memFlagBI` (biological). ZDR x2 is the source's 0
-/// (paper 2); the ρ row tops at 0.85/0.90 (paper 0.80/0.83).
+/// `hca.alg`'s `memBI`/`memFlagBI` (biological).
 pub(crate) const MEM_BI: MemTable = MemTable {
     points: [
         [5.00, 10.00, 20.00, 30.00],
@@ -654,10 +267,7 @@ pub(crate) const MEM_GC: MemTable = MemTable {
     flags: [[MF; 4]; 6],
 };
 
-/// `hca.alg`'s `memDS`/`memFlagDS` (dry snow). B21 tightened the row pair
-/// B16 shipped: ZDR (−0.3, 0, **0.9, 1.1**) — B16 (−0.3, 0, 1.3, 1.6), the
-/// paper (−0.3, 0, 0.3, 0.6) — and ρ (**0.98, 0.99**, 1.00, 1.01) — B16
-/// (0.95, 0.98, 1.00, 1.01).
+/// `hca.alg`'s `memDS`/`memFlagDS` (dry snow).
 pub(crate) const MEM_DS: MemTable = MemTable {
     points: [
         [5.00, 10.00, 35.00, 40.00],
@@ -670,11 +280,7 @@ pub(crate) const MEM_DS: MemTable = MemTable {
     flags: [[MF; 4]; 6],
 };
 
-/// `hca.alg`'s `memWS`/`memFlagWS` (wet snow), reworked wholesale in B21:
-/// Z (**15, 25**, 40, 50) — B16 (25, 30, 40, 50); the ZDR row became
-/// two-dimensional, (0.5, 1.0, f2+0, f2+0.3) via `memFlagWS`'s new
-/// (none, none, f2, f2); ρ widened to (**0.84, 0.88, 0.97**, 0.985) — B16
-/// (0.88, 0.92, 0.95, 0.985).
+/// `hca.alg`'s `memWS`/`memFlagWS` (wet snow).
 pub(crate) const MEM_WS: MemTable = MemTable {
     points: [
         [15.00, 25.00, 40.00, 50.00],
@@ -732,18 +338,7 @@ pub(crate) const MEM: [&MemTable; 10] = [
     &MEM_RA, &MEM_HR, &MEM_RH, &MEM_BD, &MEM_BI, &MEM_GC, &MEM_DS, &MEM_WS, &MEM_IC, &MEM_GR,
 ];
 
-/// `hca.alg`'s weight arrays, transposed to `[class − RA][input]`. The
-/// class columns of `weight_Z`…`weight_SDPHIdp` in order RA HR RH BD BI GC
-/// DS WS IC GR (U0/U1/UK/NE all carry 0 and never score).
-///
-/// **DS's ρhv weight is 1.0, and was 0.6 until 2026-08-13.** 0.6 is Park et
-/// al. (2009) Table 3; `hca.alg:305`'s `weight_RHOhv` array reads
-/// `0, 0, 0.6, 0.6, 0.6, 0.6, 1.0, 1.0, 1.0, 1.0, 0.4, 0.4, 0, 0` and its
-/// ninth entry — DS — is 1.0, alongside BI, GC and WS. The module's rule is
-/// that the released source wins over the paper, so following the paper here
-/// was a transcription slip, not a divergence; `weights_match_the_alg_arrays`
-/// now derives the whole matrix from the `.alg` text rather than restating
-/// this array, which is what let the slip survive its own test.
+/// `hca.alg`'s weight arrays, transposed to `[class − RA][input]`.
 pub(crate) const WEIGHT: [[f64; NUM_FL_INPUTS]; 10] = [
     // SMZ  ZDR  LKDP RHO  SDZ  SDP
     [1.0, 0.8, 0.0, 0.6, 0.2, 0.2], // RA
@@ -825,11 +420,7 @@ const EXT_GH: f32 = 120.0;
 /// fleet defaults stand in when no environmental value is available.
 pub const DEFAULT_HEIGHT_TW0_KM_MSL: f64 = 10.0 * 0.3048;
 pub const DEFAULT_HEIGHT_TW_M25_KM_MSL: f64 = 22.0 * 0.3048;
-/// `HailSize.cpp`'s hard bounds. `HSDA_MAX_ZDR` is `pub(crate)` for the same
-/// reason the ZDR class kills above are: it is the hard ceiling that makes
-/// "hail is a near-zero ZDR signature" a statement of this crate's own
-/// algorithm rather than of received wisdom, and `voxel` is the only thing
-/// outside this module that needs to say so.
+/// `HailSize.cpp`'s hard bounds.
 pub(crate) const HSDA_MAX_ZDR: f64 = 2.0;
 const HSDA_MIN_ZDR: f64 = -7.75;
 const HSDA_MIN_RHO: f64 = 0.0;
@@ -839,13 +430,8 @@ const HSDA_MIN_PV: f64 = 0.2;
 const HSDA_MIN_AGG: f64 = 0.6;
 
 /// The wet-bulb heights the HSDA regimes and the RH ZDR-membership
-/// modification read, km **above radar level** — `Hca_process_radial`'s
-/// `Hca_0_Tw_height`/`Hca_minus_25_Tw_height` after its MSL → ARL
-/// conversion. Operationally these are the `hail.alg` operator values;
-/// [`from_env_heights`](Self::from_env_heights) stands the WP-S sounding's
-/// dry-bulb heights in for them (wet-bulb sits within a few hundred metres
-/// below dry-bulb in moist columns — inside the operator values' own
-/// update cadence), extrapolating −25 °C from the 0/−20 °C lapse.
+/// modification read, km above radar level — `Hca_process_radial`'s
+/// `Hca_0_Tw_height`/`Hca_minus_25_Tw_height` after its MSL → ARL conversion.
 #[derive(Debug, Clone, Copy)]
 pub struct HsdaHeights {
     pub tw0_km_arl: f64,
@@ -853,8 +439,7 @@ pub struct HsdaHeights {
 }
 
 impl HsdaHeights {
-    /// From MSL heights, as `Hca_process_radial` converts them. The source
-    /// does not floor these at ground.
+    /// From MSL heights, as `Hca_process_radial` converts them.
     pub fn from_msl(tw0_km_msl: f64, twm25_km_msl: f64, radar_km_msl: f64) -> Self {
         Self {
             tw0_km_arl: tw0_km_msl - radar_km_msl,
@@ -873,36 +458,6 @@ impl HsdaHeights {
 
     /// From the sounding's dry-bulb 0 °C / −20 °C heights (km MSL):
     /// −25 °C extrapolated by a quarter of the 0 → −20 °C depth.
-    ///
-    /// **Original — invented here, with no external counterpart.** The RPG
-    /// reads operator-maintained *wet-bulb* heights at this seam and has no
-    /// −20 °C level at all, so there is no published rule either half of this
-    /// can be checked against, and no twin whose disagreement would isolate
-    /// it: a wrong height here moves the HSDA size classes, which are the
-    /// product being scored.
-    ///
-    /// What each half was calibrated against, plainly:
-    ///
-    /// * **Dry-bulb standing in for wet-bulb — nothing.** The "within a few
-    ///   hundred metres in moist columns" on [`HsdaHeights`] is a stated
-    ///   expectation about moist thermodynamics, not a measurement: no survey
-    ///   over real columns is recorded here, and none is held on
-    ///   `campaign-harness` either. Its direction is at least known — wet-bulb
-    ///   never sits above dry-bulb — so the substitution biases the regime
-    ///   boundaries one way, upward.
-    /// * **The 0.25 — arithmetic, not a tuned number.** −25 °C is 5 °C past
-    ///   −20 °C and the sounding spans 20 °C, so 5/20 of that depth is the
-    ///   constant-lapse continuation of the layer the sounding measured. It
-    ///   needs no citation because it is not a fitted value; what it *does*
-    ///   assume, and cannot check, is that the lapse rate holds for another
-    ///   5 °C above the top of the interpolated span.
-    ///
-    /// So: an invention that keeps a product running where the RPG has an
-    /// operator, honest about which of its two steps is a guess (the first)
-    /// and which is a derivation (the second). Replacing it with something
-    /// checkable means a real wet-bulb profile from the same model column —
-    /// a standard computation with independent implementations (MetPy) — not
-    /// a better constant.
     pub fn from_env_heights(h0c_km_msl: f64, hm20c_km_msl: f64, radar_km_msl: f64) -> Self {
         let hm25 = hm20c_km_msl + 0.25 * (hm20c_km_msl - h0c_km_msl);
         Self::from_msl(h0c_km_msl, hm25, radar_km_msl)
@@ -924,50 +479,27 @@ const MAX_DIFF_PHIDP: f64 = 100.0;
 
 // ── Melting layer ────────────────────────────────────────────────────────────
 
-/// Where a [`MeltingLayer`] came from, and therefore how much a
-/// classification standing on it is worth.
-///
-/// This is not decoration. The campaign numbers in the module header are the
-/// **same classifier** scored against the same ten RPG products with only
-/// this value different: `Rpg` scores 82.8–95.9 % exact on `N0H` at ten
-/// sites, `FleetDefault` collapses to 16.0–19.8 % at the three sites where
-/// that default is 2.9–3.1 km wrong. A consumer that cannot tell the two
-/// apart cannot tell a classification from a guess, so every constructor
-/// records which it is and nothing constructs a layer without saying.
-///
-/// Ordered best-first; [`Ord`] is the fallback chain's own order, so
-/// `a < b` reads "a is the better source".
+/// Where a [`MeltingLayer`] came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MeltingLayerSource {
-    /// The RPG's own melting layer **for this volume**, inverted from its
-    /// published Melting Layer product (Level III 166, AWIPS `N0M`) by
-    /// [`MeltingLayer::from_melting_layer_product`]. Per-azimuth, and the
-    /// same number the RPG's own `N0H` was classified on.
+    /// The RPG's own melting layer for this volume, inverted from product
+    /// 166 (AWIPS `N0M`). Per-azimuth.
     Rpg,
-    /// This volume's own 4°–10° tilts through the MLDA
-    /// ([`detect_melting_layer`]). Per-azimuth, one volume of accumulation
-    /// where the RPG uses three.
+    /// This volume's own 4°–10° tilts through the MLDA.
     RadarDetected,
-    /// Flat, at the environmental 0 °C height a sounding gave
-    /// ([`crate::sounding::EnvHeights`]). Right height, no azimuthal
-    /// structure — and only as contemporaneous as the sounding is.
+    /// Flat, at the environmental 0 °C height a sounding gave.
     Sounding,
-    /// Flat, at the `hail.alg` fleet adaptation default (10.5 kft MSL).
-    /// **A guess**, and the one measured to be up to 3.1 km wrong.
+    /// Flat, at the `hail.alg` fleet adaptation default (10.5 kft MSL) —
+    /// a guess, measured to be up to 3.1 km wrong.
     FleetDefault,
 }
 
 impl MeltingLayerSource {
     /// Whether this layer was measured for this volume rather than assumed.
-    ///
-    /// The two `false` arms are not equally bad and the wording downstream
-    /// says so; what they share is that neither observed *this* volume's
-    /// melting layer, which is the distinction a viewer needs.
     pub fn is_measured(self) -> bool {
         matches!(self, Self::Rpg | Self::RadarDetected)
     }
 
-    /// A short phrase naming the source, for a caption or a log line.
     pub fn label(self) -> &'static str {
         match self {
             Self::Rpg => "RPG melting layer",
@@ -977,12 +509,6 @@ impl MeltingLayerSource {
         }
     }
 
-    /// One sentence a viewer can act on: what the classification is standing
-    /// on, and what it costs when that is a guess.
-    ///
-    /// The costed arms quote the measured figures rather than hedging,
-    /// because "may be less accurate" is the kind of warning people learn to
-    /// skip and "four times in five" is not.
     pub fn caption(self) -> &'static str {
         match self {
             Self::Rpg => "melting layer from the RPG's own product for this volume",
@@ -996,25 +522,19 @@ impl MeltingLayerSource {
     }
 }
 
-/// Per-azimuth melting-layer top and bottom, km **above radar level** — the
-/// exact form `Hca_buffer_control` holds (`ML_top`/`ML_bottom`) — with the
-/// provenance that says how much it is worth.
+/// Per-azimuth melting-layer top and bottom, km above radar level — the form
+/// `Hca_buffer_control` holds (`ML_top`/`ML_bottom`).
 #[derive(Debug, Clone)]
 pub struct MeltingLayer {
     pub top_km_arl: [f64; 360],
     pub bottom_km_arl: [f64; 360],
-    /// Where these heights came from. See [`MeltingLayerSource`] — it is the
-    /// difference between a 95 % classification and a 16 % one.
+    /// Where these heights came from.
     pub source: MeltingLayerSource,
 }
 
 impl MeltingLayer {
     /// A flat layer: top at `top_km_arl`, bottom 0.5 km below, both floored
     /// at ground — the source's default construction (`HALF_KM`).
-    ///
-    /// `source` is a parameter and not a default because a flat layer is
-    /// built from three different things (the fleet constant, a sounding, and
-    /// the MLDA's own seed) and only the caller knows which.
     pub fn flat_from(top_km_arl: f64, source: MeltingLayerSource) -> Self {
         let top = top_km_arl.max(0.0);
         let bottom = (top - ML_DEPTH_KM).max(0.0);
@@ -1025,62 +545,19 @@ impl MeltingLayer {
         }
     }
 
-    /// [`flat_from`](Self::flat_from) at the fleet adaptation default's
-    /// provenance — the guess.
+    /// [`flat_from`](Self::flat_from) at the fleet adaptation default.
     pub fn flat(top_km_arl: f64) -> Self {
         Self::flat_from(top_km_arl, MeltingLayerSource::FleetDefault)
     }
 
-    /// The operational default: the environmental 0 °C height (km MSL —
-    /// [`crate::sounding::EnvHeights::h0c_km_msl`] standing in for the
-    /// `height_0` adaptation value) converted to above-radar-level, bottom
-    /// 0.5 km below.
+    /// The environmental 0 °C height (km MSL) converted to above-radar-level,
+    /// bottom 0.5 km below.
     pub fn from_zero_c_height(h0c_km_msl: f64, radar_km_msl: f64) -> Self {
         Self::flat_from(h0c_km_msl - radar_km_msl, MeltingLayerSource::Sounding)
     }
 
     /// The RPG's own melting layer for one volume, recovered from its
     /// published **Melting Layer product** (Level III 166, AWIPS `N0M`).
-    ///
-    /// # Why this is the primary source
-    ///
-    /// It is not a proxy for the RPG's melting layer; it *is* the RPG's
-    /// melting layer, published per volume — three-volume accumulation,
-    /// RUC/RAP model merge and all, none of which a single archived volume
-    /// can reconstruct (see this module's "Melting layer and environmental
-    /// data"). It is also correct for a replay: the object is paired to the
-    /// volume by [`crate::level3::fetch_product_for_volume`], so an archived
-    /// January volume gets January's layer and not today's.
-    ///
-    /// # How the inversion works
-    ///
-    /// The product is drawn, not tabulated: four linked contours at the
-    /// product's own elevation, marking where the beam's lower edge and then
-    /// its centre cross the layer **top**, and where the centre and then the
-    /// upper edge cross the layer **bottom**. Height rises with range at a
-    /// fixed elevation, and the top sits above the bottom, so ranking the
-    /// four rings by radius identifies them: widest is the top seen by the
-    /// lowest ray, narrowest is the bottom seen by the highest.
-    ///
-    /// Only the two **beam-centre** rings supply the answer, inverted through
-    /// `melting_layer.c`'s own `IR·RE` beam-height model
-    /// (`ml_height_from_range`). That is deliberate: a centre ring needs no
-    /// beamwidth, so the recovery does not inherit the 0.95°-vs-1.0°
-    /// ambiguity between the real half-power beamwidth and the 1° this
-    /// module's `hca_beamMLIntersection.c` transcription uses. The two edge
-    /// rings are spent on [`MeltingLayerRecovery::consistency_km`] instead,
-    /// which is a check the caller can read rather than an input it must
-    /// trust.
-    ///
-    /// A ring of zero radius is not a failure: it is the RPG saying the layer
-    /// does not intersect the beam at that azimuth because it is at or below
-    /// the radar. Those azimuths come back as 0 km ARL, which is what the
-    /// three winter sites in the campaign roster read.
-    ///
-    /// `None` when the product carries fewer than four contours, or when its
-    /// elevation is unusable — never a partial layer, because a layer that is
-    /// right on some azimuths and 3 km wrong on the rest is the exact failure
-    /// this whole path exists to remove.
     pub fn from_melting_layer_product(
         message: &nexrad_level3::model::Level3Message,
     ) -> Option<MeltingLayerRecovery> {
@@ -1110,8 +587,7 @@ impl MeltingLayer {
             return None;
         }
 
-        // Widest first. `total_cmp` because a ring of all-zeros is ordinary
-        // here and a NaN would otherwise decide the order silently.
+        // Widest first.
         let mut ranked: Vec<(f64, usize)> = rings
             .iter()
             .enumerate()
@@ -1156,59 +632,23 @@ impl MeltingLayer {
     }
 }
 
-/// A melting layer recovered from product 166, with the two numbers that say
-/// whether the recovery worked.
-///
-/// Both are reported rather than asserted. The inversion has no oracle to
-/// check itself against, so the honest thing is to hand the caller the
-/// self-consistency evidence and let it decide — and to log it, which is what
-/// [`Self::looks_sound`] exists to phrase.
+/// A melting layer recovered from product 166, with two self-check numbers.
 #[derive(Debug, Clone)]
 pub struct MeltingLayerRecovery {
     pub layer: MeltingLayer,
-    /// Mean top − mean bottom, km. The MLDA draws a 0.5 km layer
-    /// (`ML_DEPTH_KM`), so a recovery that comes out near 0.5 has inverted
-    /// the right rings through the right model.
+    /// Mean top − mean bottom, km.
     pub depth_km: f64,
-    /// The largest disagreement, over all azimuths, between a height read off
-    /// the beam-centre ring and the same height read off the corresponding
-    /// beam-edge ring at `elev ∓ bw/2`. Two independent routes to one number;
-    /// this is how far apart they came out.
+    /// Largest disagreement over all azimuths between a height read off the
+    /// beam-centre ring and off the beam-edge ring at `elev ∓ bw/2`.
     pub consistency_km: f64,
 }
 
 impl MeltingLayerRecovery {
     /// Whether the two self-checks agree with what the algorithm draws.
-    ///
-    /// The depth band is generous (a quarter of the nominal 0.5 km either
-    /// way) because the rings are quantised to the product's 1/4 km screen
-    /// units, and the consistency bound is a beamwidth's worth of height at
-    /// the far edge of the domain. A recovery that fails either is not
-    /// silently corrected — it is refused, and the chain falls to the next
-    /// source.
-    ///
-    /// # The depth check does not apply to a layer sitting on the ground
-    ///
-    /// [`MeltingLayer::flat_from`] floors both surfaces at ground and so does
-    /// the RPG, so a layer whose **bottom** is underground comes back with
-    /// its bottom clamped to 0 and a depth that is the top's height rather
-    /// than the layer's thickness. That is not a failed recovery — it is the
-    /// winter answer, and the three volumes it applies to on the campaign
-    /// roster (KOKX 0.017 km, KATX 0.010 km, KBUF 0.000 km of apparent depth)
-    /// are exactly the ones where the fleet default was 2.9–3.1 km wrong and
-    /// where refusing the recovery would throw away the entire fix. So the
-    /// depth is only asked about when there is a layer above ground to have a
-    /// depth.
-    ///
-    /// The consistency check is not conditional: it compares two independent
-    /// routes to the same number and is meaningful whatever the layer's
-    /// height.
     pub fn looks_sound(&self) -> bool {
-        // A layer whose bottom is above its top is not a layer at all —
-        // `Hca_beamMLintersection` would hand the classifier zone bounds in
-        // the wrong order and every gate would land in the wrong zone. Only
-        // reachable if two rings rank equal by median radius and sort the
-        // wrong way, which is why it is a check and not an assumption.
+        // A bottom above its top would hand `Hca_beamMLintersection` zone
+        // bounds in the wrong order; reachable only if two rings rank equal
+        // by median radius and sort the wrong way.
         if (0..360).any(|az| self.layer.bottom_km_arl[az] > self.layer.top_km_arl[az]) {
             return false;
         }
@@ -1228,23 +668,9 @@ impl MeltingLayerRecovery {
 
 /// How far apart the beam-centre and beam-edge routes to one height may land
 /// before [`MeltingLayerRecovery::looks_sound`] gives up on the recovery.
-///
-/// Half a beamwidth of elevation moves the crossing range, and the crossing
-/// range moves the height; at the ~1.5–2.5 km layer heights this product
-/// draws at, that is a couple of hundred metres. Measured across the
-/// ten-volume roster the worst azimuth of the worst site came to 0.15 km
-/// (KMLB; eight of ten sites stay under 0.045), so this is not a tuned bound
-/// — it is a bound the real data sits well inside.
 const MAX_ML_INCONSISTENCY_KM: f64 = 0.5;
 
 /// Per whole degree of azimuth, the radius of one contour, km.
-///
-/// The contour is a chain of points, not a function of azimuth, so each
-/// degree takes the radius of the point nearest it in azimuth — the same
-/// nearest-neighbour read the RPG's own consumer makes of a drawn ring. A
-/// point at the origin carries no azimuth; those are dropped, and an azimuth
-/// with no point at all reads 0, which the caller renders as "layer at
-/// ground".
 fn ring_radii_km(contour: &nexrad_level3::model::LinkedContourPacket) -> [f64; 360] {
     let mut best = [(f64::INFINITY, 0.0f64); 360];
     for (east_km, north_km) in contour.points_km() {
@@ -1313,12 +739,8 @@ pub(crate) fn beam_ml_intersection(
 
 // ── Membership machinery ─────────────────────────────────────────────────────
 
-/// `Hca_setMembershipPoints`: the class×input row's four points, the 2-D
-/// rows adjusted by `f1/f2/f3/g1/g2` of the (FShield-adjusted) reflectivity.
-/// With HSDA enabled (B21, CCR NA14-00275), the RH class's F1-flagged ZDR
-/// points are re-derived from the gate height against the wet-bulb 0 °C
-/// height in the two regimes below it — the hardcoded polynomials of
-/// `hca_setMembershipPoints.c`, not the `.alg`'s `h1` coefficients.
+/// `Hca_setMembershipPoints`: the class×input row's four points, the 2-D rows adjusted
+/// by `f1/f2/f3/g1/g2` of the (FShield-adjusted) reflectivity.
 fn set_membership_points(
     class: usize,
     fl_input: usize,
@@ -1441,9 +863,6 @@ fn allowed_hydro_class(
         agg[RA] = INVALID;
     }
 
-    // B21 widened the two upper zones: the upper transition regained BI and
-    // the above-layer zone regained GC and BI (B16: GC DS WS IC GR BD RH and
-    // DS IC GR RH respectively).
     let allowed: &[usize] = if bin < ml.bb {
         &[GC, BI, BD, RA, HR, RH]
     } else if bin < ml.b {
@@ -1462,11 +881,9 @@ fn allowed_hydro_class(
     }
 }
 
-/// `Break_tie` (CCR NA14-00181, B21's `hca_process_radial.c`): when the top
-/// two aggregations sit within `min_Dif_Agg`, the class is chosen by the
-/// AEL Table 4 priority order of the gate's melting-layer zone — B16 read
-/// UK here. The upper-transition and above-layer lists carry the source's
-/// "tuned" orders (BI/GC prepended to the original AEL lists).
+/// `Break_tie` (CCR NA14-00181): when the top two aggregations sit within
+/// `min_Dif_Agg`, the class is chosen by the AEL Table 4 priority order of
+/// the gate's melting-layer zone, with the source's "tuned" upper lists.
 fn break_tie(bin: i64, ml: MlBins, h_class: usize, runner_up: usize) -> usize {
     let priority: &[usize] = if bin < ml.bb {
         &[GC, BI, BD, RA, HR, RH]
@@ -1540,11 +957,7 @@ fn sentinel(v: f64) -> f64 {
     if v.is_finite() { v } else { NO_DATA }
 }
 
-/// The full dpprep + QIA chain for one recombined radial. With
-/// `metsignal` (the B21 fleet default) the meteorological flag and the
-/// unfold filter come from the cleaned met signal — plus the CAPPI rescue
-/// on ≥ 1° radials when a volume CAPPI is supplied; without it, the legacy
-/// (metsignal-OFF) construction [`crate::kdp`] validated.
+/// The full dpprep + QIA chain for one recombined radial.
 pub(crate) fn radial_fields(
     c: &DpCombined,
     init_fdp: f64,
@@ -1558,8 +971,7 @@ pub(crate) fn radial_fields(
     let n = r.phi.len();
     let nz = r.z.len();
 
-    // SNR precedes the met signal (Compute_snr's first call, from the
-    // 3-gate smoothed Z).
+    // SNR precedes the met signal (Compute_snr's first call).
     let ref_smd3 = average_filter(&r.z, DBZ_WINDOW);
     let snr_z: Vec<f64> = (0..nz)
         .map(|iz| match dbz0 {
@@ -1597,9 +1009,7 @@ pub(crate) fn radial_fields(
         None => unfold_phidp(&mut phi, &r.rho, UNFOLD_MIN_RHO, init_fdp),
     }
 
-    // Textures about their own smoothing windows (dpp_process.c order:
-    // SD(Z) about the 5-gate mean, before ref_smd is overwritten by the
-    // 3-gate one).
+    // Textures about their own smoothing windows (dpp_process.c order).
     let ref_smd5 = average_filter(&r.z, WINDOW);
     let sd_zh = std_filter(&r.z, &ref_smd5, WINDOW, MAX_DIFF_DBZ);
     let phi_smd9 = average_filter(&phi, SHORT_GATE);
@@ -1611,9 +1021,8 @@ pub(crate) fn radial_fields(
 
     let hatt = is_high_attenuation_radial(&r.z, &r.vel, &r.spw, &r.rho);
 
-    // Meteorological flag: the cleaned met signal above threshold (strictly
-    // — dpp_process.c zeroes `<=`), or the legacy construction the KDP
-    // chain pins.
+    // Meteorological flag: cleaned met signal above threshold (strictly —
+    // dpp_process.c zeroes `<=`), or the legacy construction.
     let mut flag = vec![false; n];
     match &met {
         Some(met) => {
@@ -1706,9 +1115,7 @@ pub(crate) fn radial_fields(
         })
         .collect();
 
-    // Moment transport: sample the z-gate fields at each DP gate, key
-    // presence on the raw input (Add_moment's `inp`), quantize the 8-bit
-    // fields, and land in the sentinel domain.
+    // Moment transport: presence keys on the raw input (Add_moment's `inp`).
     let q8 = |v: f64, s: (f64, f64)| if quantize { transport8(v, s) } else { v };
     let mut fields = Fields {
         az: r.az,
@@ -1725,8 +1132,7 @@ pub(crate) fn radial_fields(
         phi: Vec::with_capacity(n),
         sdp: Vec::with_capacity(n),
         smv: Vec::with_capacity(n),
-        // The DMET moment (8-bit, scale 2 / offset 50) — what qperate's
-        // usability check reads downstream; NaN when the legacy flag ran.
+        // The DMET moment (8-bit, scale 2 / offset 50).
         met: match &met {
             Some(m) => m
                 .iter()
@@ -1812,10 +1218,8 @@ pub(crate) fn radial_fields(
     fields
 }
 
-/// `Qia_process_radial`'s six indices for one gate, in fuzzy-logic input
-/// order (SMZ, ZDR, LKDP, RHO, SDZ, SDP). Inputs are the transported
-/// fields, sentinel domain; the arithmetic runs exactly as the C does —
-/// a `NO_DATA` φ of −10⁵ squares into an index of exactly 0.
+/// `Qia_process_radial`'s six indices for one gate, in fuzzy-logic input order (SMZ,
+/// ZDR, LKDP, RHO, SDZ, SDP).
 fn quality_indices(phi: f64, rho: f64, smz: f64, snr: f64, quantize: bool) -> [f64; 6] {
     let linear_snr = 10f64.powf(0.1 * snr);
     let ac = phi / PHI_DP_Z_THRESH;
@@ -1847,9 +1251,8 @@ fn quality_indices(phi: f64, rho: f64, smz: f64, snr: f64, quantize: bool) -> [f
     q
 }
 
-/// One gate through `Hca_process_radial`'s classification: returns the
-/// internal class index. `tw0_km_arl` feeds the HSDA modification of RH's
-/// ZDR membership.
+/// One gate through `Hca_process_radial`'s classification: returns the internal class
+/// index.
 fn classify_gate(f: &Fields, bin: usize, ml: MlBins, tw0_km_arl: f64) -> usize {
     if f.snr[bin] < MIN_SNR {
         return NE;
@@ -1930,7 +1333,6 @@ fn classify_gate(f: &Fields, bin: usize, ml: MlBins, tw0_km_arl: f64) -> usize {
     max_cal
 }
 
-/// One radial's classes.
 pub(crate) fn classify_radial(f: &Fields, ml: &MeltingLayer, tw0_km_arl: f64) -> Vec<usize> {
     let az = (f.az.rem_euclid(360.0)) as usize % 360;
     let bins = beam_ml_intersection(f.elev, az, f.dg, ml);
@@ -1941,8 +1343,7 @@ pub(crate) fn classify_radial(f: &Fields, ml: &MeltingLayer, tw0_km_arl: f64) ->
 
 // ── Hail size discrimination (HailSize.cpp v3) ───────────────────────────────
 
-/// The RH subclassification (`data.sub`): `Current` is an RH gate the HSDA
-/// left at rain-and-hail.
+/// The RH subclassification (`data.sub`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HailSize {
     NotHail,
@@ -1955,10 +1356,9 @@ enum HailSize {
 /// One height regime's three (Z, ZDR, ρ) trapezoids, small/large/giant.
 type HsdaTraps = [[[f64; 4]; 3]; 3];
 
-/// `HailSize_v3`'s inline trapezoids for one gate: the six height regimes
-/// against the wet-bulb heights, the ZDR rows of the lower regimes built
-/// from the hail-size `f`/`g` polynomials at the gate's Z (all carrying
-/// `DeltaZdr = −0.5`). Returns the regime's (weights, trapezoids).
+/// `HailSize_v3`'s inline trapezoids for one gate: the six height regimes against the
+/// wet-bulb heights, the ZDR rows of the lower regimes built from the hail-size `f`/`g`
+/// polynomials at the gate's Z (all carrying `DeltaZdr = −0.5`).
 fn hsda_regime(height_km: f64, hs: &HsdaHeights, z: f64) -> ([f64; 3], HsdaTraps) {
     let dz = HSDA_DELTA_ZDR;
     let f1 = -0.5 + 2.5e-3 * z + 7.5e-4 * z * z + dz;
@@ -2100,10 +1500,6 @@ fn hsda_regime(height_km: f64, hs: &HsdaHeights, z: f64) -> ([f64; 3], HsdaTraps
 }
 
 /// `HailSize_v3` over one radial: subclassify the RH gates by hail size.
-/// Inputs are the classified radial's fields (sentinel domain — a missing
-/// ZDR at −10⁵ falls off every trapezoid, exactly as the C's `no_data`
-/// does) and the QIA indices for Z, ZDR and ρ. The despeckle demotes
-/// giant→large then large→small runs shorter than `min_data_size`.
 fn hail_size_radial(f: &Fields, classes: &[usize], hs: &HsdaHeights) -> Vec<HailSize> {
     use crate::dpprep::trap4;
     let mut sub: Vec<HailSize> = classes
@@ -2175,9 +1571,8 @@ fn hail_size_radial(f: &Fields, classes: &[usize], hs: &HsdaHeights) -> Vec<Hail
     sub
 }
 
-/// One gate's product code: `dualpol8bit.c`'s `Class_external` with the RH
-/// subclass split (`EXT_LH`/`EXT_GH`; small hail and unsized RH keep RH's
-/// 100). Codes of 0 (U0/U1/NE) are undefined.
+/// One gate's product code: `dualpol8bit.c`'s `Class_external` with the RH subclass
+/// split (`EXT_LH`/`EXT_GH`; small hail and unsized RH keep RH's 100).
 fn external_code(class: usize, size: HailSize) -> f32 {
     let code = if class == RH {
         match size {
@@ -2191,9 +1586,7 @@ fn external_code(class: usize, size: HailSize) -> f32 {
     if code == 0.0 { f32::NAN } else { code }
 }
 
-/// One despeckle pass: runs of `from` shorter than `min_data_size` become
-/// `to`. The trailing run is flushed by the loop's else-arm never firing —
-/// the C leaves it standing, and so does this.
+/// One despeckle pass: runs of `from` shorter than `min_data_size` become `to`.
 fn despeckle_hail(sub: &mut [HailSize], from: HailSize, to: HailSize) {
     let mut short_runs: Vec<(usize, usize)> = Vec::new();
     let mut beg: Option<usize> = None;
@@ -2226,16 +1619,12 @@ fn despeckle_hail(sub: &mut [HailSize], from: HailSize, to: HailSize) {
 /// The conventions [`compute_hca`] pins; the harness varies them.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HcaOptions {
-    /// Seed the pipeline from the volume estimate before the RDA header
-    /// value — the `isdp_apply = YES` reading (see [`crate::kdp`]'s ISDP
-    /// finding). Off is the documented default.
+    /// `isdp_apply = YES`: seed from the volume estimate before the RDA header value.
     pub(crate) isdp_estimated: bool,
     /// Reproduce the 8-bit moment transport between tasks (the primary).
-    /// Off is the naive physical-units reading.
     pub(crate) quantize_transport: bool,
-    /// The B21 met-signal meteorological flag (`metsignal_processing = ON`,
-    /// the fleet default and the primary). Off is the legacy (pre-B17)
-    /// ρ/SNR flag the KDP chain's survey record was measured with.
+    /// The met-signal meteorological flag (`metsignal_processing = ON`, the
+    /// fleet default). Off is the legacy pre-B17 ρ/SNR flag.
     pub(crate) metsignal: bool,
 }
 
@@ -2255,14 +1644,10 @@ pub struct DerivedHca {
     /// `[radial][gate]`, the product's external class codes (10–140);
     /// `NaN` where the gate is no-echo/undefined (external code 0).
     pub values: Vec<Vec<f32>>,
-    /// Centre azimuth per radial, degrees.
     pub azimuths_deg: Vec<f64>,
-    /// Range to the centre of gate 0, km.
     pub first_gate_km: f64,
     pub gate_interval_km: f64,
-    /// Angular width of one radial, degrees.
     pub radial_width_deg: f64,
-    /// The initial system phase actually used, for the record.
     pub init_fdp_deg: f64,
 }
 
@@ -2316,18 +1701,9 @@ pub(crate) fn resolve_init_fdp(
     }
 }
 
-/// Compute the tilt's hydrometeor classification per the rules in the
-/// module doc: recombine the sweep to 1°, run the dpprep (met-signal) and
-/// QIA chains, classify every gate against the melting layer, subclass RH
-/// by hail size, and emit the product's external class codes. `None` when
-/// no radial carries the differential phase moment.
-///
-/// `params` carries the radial-header values ([`KdpParams::from_archive`]);
-/// without `dbz0` the SNR gate cannot run and every gate reads no-echo,
-/// exactly as the operational chain would with no calibration constant.
-/// `hsda` carries the wet-bulb heights; `cappi` the volume's reflectivity
-/// CAPPI ([`build_refl_cappi`]) — `None` is the cold-start state, which
-/// only differs on ≥ 1° tilts.
+/// Compute the tilt's hydrometeor classification: recombine the sweep to 1°, run the
+/// dpprep and QIA chains, classify every gate against the melting layer, subclass RH by
+/// hail size, emit external class codes.
 pub fn compute_hca(
     radials: &[Radial],
     params: &KdpParams,
@@ -2338,10 +1714,7 @@ pub fn compute_hca(
     compute_hca_impl(radials, params, ml, hsda, cappi, HcaOptions::primary())
 }
 
-/// Build the volume's reflectivity CAPPI from its ≥ 1° dual-pol sweeps —
-/// the state [`compute_hca`]'s met-signal chain consults (see the
-/// [`crate::dpprep`] module doc's CAPPI notes). Sweeps must be given in
-/// scan order, as the RPG fills the grid.
+/// Build the volume's reflectivity CAPPI from its ≥ 1° dual-pol sweeps.
 pub fn build_refl_cappi(sweeps: &[&[Radial]]) -> ReflCappi {
     let mut cappi = ReflCappi::new();
     for &radials in sweeps {
@@ -2384,13 +1757,8 @@ fn compute_hca_impl(
     let dbz0 = params.dbz0.map(f64::from);
     let atmos = params.atmos_db_per_km.map(f64::from);
 
-    // One radial at a time, all at once. `radial_fields`, `classify_radial` and
-    // `hail_size_radial` read this radial and the volume state around it and
-    // write nothing else; the output is one row per radial, in `combined`'s
-    // order, which rayon's `map`/`collect` keeps exactly as `into_iter` did.
-    // Nothing is summed across radials, so no float is reassociated and the
-    // product is the serial one gate for gate —
-    // [`tests::the_pool_classifies_a_volume_the_way_one_thread_does`].
+    // Per-radial and pure: nothing is summed across radials, so no float is
+    // reassociated and the parallel product is the serial one gate for gate.
     let (values, azimuths): (Vec<Vec<f32>>, Vec<f64>) = combined
         .par_iter()
         .map(|c| {
@@ -2430,15 +1798,9 @@ fn compute_hca_impl(
     })
 }
 
-/// Rebuild a split cut the way the RPG's **combined base data** stream
-/// feeds dpprep/HCA: the surveillance cut's Z and dual-pol moments with the
-/// Doppler cut's velocity and spectrum width grafted in, radial by radial
-/// (nearest azimuth). The archive keeps the two half-cuts as separate
-/// sweeps; the operational chain classifies the combination — without it
-/// the GC velocity kill (`min_V_GC`) is inert on the surveillance tilt.
-///
-/// Surveillance radials that already carry velocity pass through unchanged;
-/// a Doppler radial farther than half a spacing away contributes nothing.
+/// Rebuild a split cut the way the RPG's combined base data stream feeds
+/// dpprep/HCA: the surveillance cut's Z and dual-pol moments with the
+/// Doppler cut's velocity and spectrum width grafted in by nearest azimuth.
 pub fn merge_split_cut_doppler(surveillance: &[Radial], doppler: &[Radial]) -> Vec<Radial> {
     let dop: Vec<(f64, &Radial)> = doppler
         .iter()
@@ -2510,15 +1872,8 @@ fn ml_elev_weight(elev_deg: f64) -> f64 {
     gate_ratio * acc_ratio
 }
 
-/// Detect the melting layer from one volume's 4°–10° tilts per
-/// `melting_layer.c` (Giangrande, Krause, Ryzhkov 2008), classifying those
-/// tilts with the flat default layer first — the operational chain's own
-/// first-volume state. Azimuths whose accumulated wet-snow weight misses
-/// `min_wet_snow_sum` interpolate between valid neighbours; with no valid
-/// azimuth (or a single one) the default flat layer is returned.
-///
-/// The operational deltas — 3-volume accumulation and the RUC/RAP model
-/// merge — are catalogued in the module doc.
+/// Detect the melting layer from one volume's 4°–10° tilts per `melting_layer.c`
+/// (Giangrande, Krause, Ryzhkov 2008).
 pub fn detect_melting_layer(
     sweeps: &[&[Radial]],
     params: &KdpParams,
@@ -2555,18 +1910,9 @@ fn detect_melting_layer_impl(
         let init_fdp = resolve_init_fdp(params, &combined, opts.isdp_estimated);
         let elev_weight = ml_elev_weight(sweep_elev);
 
-        // **Which heights each radial votes for, found in parallel; the votes
-        // themselves cast in order.**
-        //
-        // Finding them is per-radial and pure — the classification, the wet-snow
-        // window and the 0.5 km Z/ZDR search read one radial and the flat
-        // default layer. Casting them is not: `weight` is a float accumulator,
-        // several radials of a sweep round to the same whole degree, and `+=`
-        // over floats is not associative, so a thread order would decide the
-        // last bit of a sum. The map therefore hands back each radial's height
-        // indices in gate order, and the serial loop below adds them in
-        // `combined`'s order — the order the fused loop added them in — so the
-        // accumulation is not merely equivalent but identical.
+        // Which heights each radial votes for is found in parallel; the votes
+        // are cast in order, because `weight` is a float accumulator and
+        // several radials round to the same whole degree.
         let votes: Vec<(usize, Vec<usize>)> = combined
             .par_iter()
             .map(|c| {
@@ -2734,31 +2080,6 @@ fn calculate_melting_layer(
 
 /// Resolve one volume's melting layer, best source first, and say which one
 /// answered.
-///
-/// # The chain, and why it is in this order
-///
-/// 1. **The RPG's own layer** for this volume (`rpg_melting_layer`, Level III
-///    166). Nothing else can be as right: it is the number the RPG's own
-///    `N0H` was classified on, per azimuth, with the three-volume
-///    accumulation and model merge a single archived volume cannot rebuild.
-///    Scored **82.8–95.9 % exact against `N0H` at ten sites**.
-/// 2. **This volume's own MLDA** ([`detect_melting_layer`]). Also per
-///    azimuth, also measured, but from one volume's worth of wet snow where
-///    the RPG accumulates three — so it concludes rarely, and when it does
-///    not it declines rather than inventing a layer.
-/// 3. **The sounding's freezing level**, flat. The right height with no
-///    azimuthal structure. Only reached when the two measured sources are
-///    unavailable, and only honest to the extent the sounding is
-///    contemporaneous with the volume — which for a live volume it is and for
-///    a replayed one it is not, since [`crate::sounding`] fetches a forecast
-///    for *now*. `sounding_h0c_km_msl` is therefore `None` on a replay, and
-///    the caller — not this function — is what knows which it is looking at.
-/// 4. **The fleet adaptation default**, flat at 10.5 kft MSL. A guess, and
-///    the measured cost of the guess is in [`MeltingLayerSource::caption`].
-///
-/// The MLDA is seeded with whichever of 3 or 4 is available, because its
-/// `Calculate_melting_layer` clips detections to ±2 layer depths of the
-/// previous top and a seed 3 km out would clip the right answer away.
 pub fn resolve_melting_layer(
     rpg_melting_layer: Option<&nexrad_level3::model::Level3Message>,
     ml_sweeps: &[&[Radial]],

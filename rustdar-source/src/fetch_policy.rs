@@ -1,206 +1,50 @@
 //! When a failing overlay fetch is allowed to try again.
 //!
-//! # The storm this exists for
+//! The ladder climbs from [`FIRST_RETRY_SECS`] to the handler's own
+//! [`auto_poll_interval`] and stops: a retry faster than that interval cannot
+//! deliver anything the next ordinary poll would not. Failure kinds differ —
+//! see [`FetchFailure`]. Coverage (whether what is drawn is all of what
+//! arrived) is a separate axis from staleness — see [`DataCompleteness`].
 //!
-//! Every auto-polling overlay decided "is a fetch due?" from
-//! [`OverlayState::fetch_time`] alone, and that stamp is written **only on
-//! success** ([`OverlayState::set_data`]). A failed fetch logged, cleared
-//! `fetching`, and left the stamp untouched — so the next frame found the layer
-//! due again and started another fetch, and the frame after that, forever.
-//!
-//! Measured in headless Chromium driving the real web build against a failing
-//! SPC Mesoscale Discussion feed: **3089 `SPC MD fetch failed` lines in 105 s**
-//! — 29.4 requests a second, one per animation frame, from every open tab, for
-//! as long as the app stayed open. Native floors the same loop at 1 Hz through
-//! `MIN_WAKE` in `App::auto_poll_delay`, which is why it read as a slow leak
-//! there and only became a storm on web.
-//!
-//! Under the policy below the same 105 s window costs **6 attempts**.
-//!
-//! # The ceiling is the layer's own poll interval, not a constant
-//!
-//! A layer's [`auto_poll_interval`] is already the cadence at which fresh data
-//! is worth having: 120 s for SPC discussions, a product SPC issues tens of
-//! minutes apart. A retry *faster* than that interval cannot deliver anything
-//! the next ordinary poll would not — succeeding at t+4 s instead of t+120 s
-//! buys data published at most four seconds earlier, which against a ~30-minute
-//! issue cadence is nothing at all. Retrying a failure faster than we poll a
-//! success is the failure path being more aggressive than the healthy path,
-//! which is backwards.
-//!
-//! So the ladder climbs to the handler's own interval and stops. At the ceiling
-//! a failing layer costs exactly what a healthy one costs, which is the right
-//! steady state and needs no per-handler tuning — a new overlay inherits a
-//! correct ceiling from the interval it already had to declare.
-//!
-//! The floor is [`FIRST_RETRY_SECS`]: one dropped packet or a wifi handover
-//! should recover before the user notices, and two seconds is under the time it
-//! takes to look at the layer stack and wonder.
-//!
-//! # Failure kinds are not all worth retrying
-//!
-//! See [`FetchFailure`]. The short version: a 404 for a product that is simply
-//! not published right now is a *normal answer* and is not a failure at all; a
-//! network error is worth waiting out; and a request the origin refuses over and
-//! over will not start working because we ask once more at the same cadence, so
-//! it is recorded as broken and dropped to a much slower one.
-//!
-//! # No single answer condemns a layer, and nothing is condemned for ever
-//!
-//! Two rules, both about the same failure: **a weather warning layer that goes
-//! on painting a frozen alert set with nothing on screen to say so.**
-//!
-//! One 4xx used to be terminal. [`FetchError::from_status`] returned
-//! [`Permanent`](FetchFailure::Permanent) on the first 403,
-//! [`record_failure`](FetchRetry::record_failure) wrote
-//! [`Broken`](FetchHealth::Broken), and `auto_fetch_delay` then returned `None`
-//! for the rest of the session. That state was **absorbing by construction** —
-//! no automatic fetch could run, so no success could ever clear it — and the
-//! only thing that cleared it was a user action on a layer giving no sign it
-//! needed one. One CDN hiccup on `api.weather.gov` was enough to freeze NWS
-//! alerts at whatever they last said, with the options panel counting up
-//! "Updated 47m ago" underneath.
-//!
-//! So a refusal must repeat [`REFUSALS_BEFORE_BROKEN`] times **in a row** before
-//! it is believed, and even then the layer keeps a [`BROKEN_RETRY_SECS`]
-//! heartbeat rather than stopping. Being wrong in this direction costs two
-//! requests an hour against a genuinely dead endpoint — *less* than the ceiling
-//! a healthy layer already spends. Being wrong in the other direction costs a
-//! stale tornado warning on screen, indefinitely. The asymmetry is the whole
-//! argument.
-//!
-//! # A round that half succeeded is neither, and it used to read as green
-//!
-//! Everything above is about **time**: whether what is drawn is current. It has
-//! nothing to say about **coverage** — whether what is drawn is all of what
-//! arrived — and a layer can fail at that while passing every check here.
-//!
-//! Two shipped layers did. NWS alerts mostly carry UGC zone codes instead of
-//! geometry, and the zone-boundary fetch that turns those into polygons returned
-//! `()`: every zone it could not obtain was skipped, and an alert whose zones all
-//! failed drew nothing at all. GLM lists two satellites' buckets, and one dead
-//! listing leaves the other's flashes to drain out of the cache window over half
-//! an hour. Both round trips end in `Ok`, both go through
-//! [`OverlayState::set_data`] to [`FetchRetry::record_success`], both stamp a
-//! fresh clock, and both then report [`Ok`](FetchHealth::Ok) with `Updated 0s
-//! ago` under a map that is missing most of its warnings or half of its
-//! lightning. Observed on the alerts layer: **212 of 297 warnings absent, status
-//! line fully green.**
-//!
-//! So there are three states and not two — healthy, stale, and *incomplete* —
-//! and the third is orthogonal to the second rather than a rung below it. It
-//! lives in [`DataCompleteness`], on this same ledger but beside `health`, so
-//! that a layer can be both at once and say both. It has to sit **beside** the
-//! data rather than replace it: the half of the round that did arrive is real,
-//! has to be drawn, and has to stamp a real fetch time.
-//!
-//! [`OverlayState::set_data`]: crate::handler::OverlayState::set_data
-//!
-//! # A user action never waits out a backoff
-//!
-//! The ladder governs the **automatic** poll and nothing else. Every
-//! user-driven fetch — the Refresh button, switching a layer on, changing an
-//! outlook day or a model parameter — goes through `push_user_overlay_fetch`,
-//! which calls [`FetchRetry::clear`] before queueing. That makes "a user action
-//! is never made to wait" true by construction rather than by remembering to
-//! clear the ledger at four call sites; the auto-poll gate is the only caller
-//! that consults it.
-//!
-//! [`OverlayState::fetch_time`]: crate::handler::OverlayState::fetch_time
-//! [`OverlayState::set_data`]: crate::handler::OverlayState::set_data
 //! [`auto_poll_interval`]: crate::handler::SourceHandler::auto_poll_interval
 
 use std::time::Duration;
 
-/// The first retry after a transient failure. Doubles from here, clamped to the
-/// layer's own poll interval — see the module docs for why that is the ceiling.
+/// The first retry after a transient failure. Doubles from here, clamped to the layer's poll interval.
 pub const FIRST_RETRY_SECS: u64 = 2;
 
-/// Caps the doubling before it can overflow the shift. Any real interval
-/// clamps the result long before this bites: at `FIRST_RETRY_SECS` = 2 the
-/// 32nd step is already ~272 years.
+/// Caps the doubling before it can overflow the shift.
 const MAX_LADDER_STEPS: u32 = 32;
 
 /// How many **consecutive** refusals it takes before a layer is called
 /// [`Broken`](FetchHealth::Broken).
-///
-/// Two, because one is not evidence of anything. A refusal is the origin
-/// saying it understood us and said no, but the origins here are public
-/// unauthenticated services behind CDNs, and a single 4xx from one of those is
-/// far more often a WAF rule, a rate limiter or a bad edge node than a real
-/// change in what is published. Asking a second time separates the two at a
-/// cost of exactly one extra request.
-///
-/// Counted separately from [`FetchRetry::failures`]: a transient failure in
-/// among the refusals resets it, because "the origin refuses us" is a claim
-/// about a *run* of refusals and a timeout in the middle of that run means we
-/// do not have one.
 pub const REFUSALS_BEFORE_BROKEN: u32 = 2;
 
 /// What a [`Broken`](FetchHealth::Broken) layer waits before trying once more.
 ///
-/// Not `None`. A broken layer used to be off the automatic poll entirely, which
-/// made the state absorbing — the only thing that could clear it was a success,
-/// and no fetch that could produce one would ever run. Half an hour is long
-/// enough that a truly dead endpoint costs two requests an hour, and short
-/// enough that a layer condemned by a transient WAF rule comes back on its own
-/// while the storm it was drawing is still on the ground.
-///
-/// Floored at the layer's own interval by [`FetchRetry::backoff`], so this can
-/// never make a broken layer poll *faster* than a healthy one.
+/// Floored at the layer's own interval by [`FetchRetry::backoff`], so a broken layer never polls faster than a healthy one.
 pub const BROKEN_RETRY_SECS: u64 = 1800;
 
 /// What a failed fetch tells us about whether trying again could work.
-///
-/// Never merged into one "it failed": the three call for opposite schedules,
-/// and collapsing them is how a product that is merely out of season ends up
-/// hammered at the same rate as one that is down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchFailure {
-    /// The origin answered, and the answer was that the product is not there
-    /// right now (404/410 from an endpoint that is published on a schedule).
-    ///
-    /// **Not a failure.** SPC does not keep a Day 4-8 probabilistic outlook up
-    /// at every hour of the day, and asking again in four seconds will get the
-    /// same 404. Treated as a good answer that happens to carry no data: the
-    /// ladder resets and the layer goes back to its ordinary interval, and the
-    /// UI says "not published right now" rather than reporting a fault.
+    /// The origin answered: the product is not there right now (404/410 from an
+    /// endpoint published on a schedule).
     Absent,
-    /// The request did not complete, or the origin failed to serve it: a
-    /// timeout, a connection error, a 5xx, a 429, a body that would not read.
-    /// Worth waiting out, on the ladder.
-    ///
-    /// A body that arrives and will not parse also lands here, deliberately.
-    /// A truncated response and a changed product schema are indistinguishable
-    /// from one sample, so claiming permanence would be claiming more than the
-    /// code can prove — and at the ceiling a retried parse failure costs
-    /// exactly what a healthy poll costs.
+    /// The request did not complete, or the origin failed to serve it: a timeout,
+    /// a connection error, a 5xx, a 429, a body that would not read.
     Transient,
     /// Repetition is unlikely to help: the origin understood the request and
-    /// refused it (a 4xx that is not 404/408/429 and not 401/403), or the
-    /// request could not be built at all — a client that will not construct, or
-    /// a handler that cannot produce a fetch task.
-    ///
-    /// **One of these is a suspicion, not a verdict.** It takes
-    /// [`REFUSALS_BEFORE_BROKEN`] in a row for
-    /// [`record_failure`](FetchRetry::record_failure) to write
-    /// [`Broken`](FetchHealth::Broken); until then the layer climbs the ordinary
-    /// ladder like any other failure. And [`Broken`](FetchHealth::Broken) is
-    /// still not "never again" — see [`BROKEN_RETRY_SECS`].
+    /// refused it (a 4xx that is not 404/408/429 and not 401/403), or the request
+    /// could not be built at all.
     Permanent,
 }
 
 impl FetchFailure {
-    /// The verdict for a round made of several requests — GLM's two satellites,
-    /// METAR's per-state networks, HRRR's two candidate model runs.
+    /// The verdict for a round made of several requests.
     ///
     /// A round is refused only when **every** part of it was refused, and absent
-    /// only when every part was absent. Anything mixed is transient: one part
-    /// that could still work next time makes the round worth trying again, and
-    /// condemning a layer on the strength of its weakest component is how a
-    /// single dead state network takes every METAR in the country off the map.
-    ///
-    /// An empty round is `Transient` — no evidence is not evidence of refusal.
+    /// only when every part was absent. Anything mixed is transient.
     pub fn of_round(parts: impl IntoIterator<Item = Self>) -> Self {
         let mut all_permanent = true;
         let mut all_absent = true;
@@ -219,10 +63,6 @@ impl FetchFailure {
 }
 
 /// What a 404 means *for a particular endpoint*, which is not a global fact.
-///
-/// SPC removes an outlook when it expires, so a 404 there is routine. The MD
-/// RSS feed is supposed to exist at all times — a 404 from it means the path
-/// moved, which no amount of retrying fixes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotFound {
     /// This product is published on a schedule and is simply not up right now.
@@ -231,11 +71,7 @@ pub enum NotFound {
     IsBroken,
 }
 
-/// A fetch failure with the verdict attached, so the scheduler does not have to
-/// guess it back out of a message string.
-///
-/// `Display`s as the bare message, so existing `format!("{e}")` log sites read
-/// exactly as they did before this type existed.
+/// A fetch failure with the verdict attached.
 #[derive(Debug, Clone)]
 pub struct FetchError {
     pub failure: FetchFailure,
@@ -270,21 +106,8 @@ impl FetchError {
         }
     }
 
-    /// One error for a round of several requests that **all** failed: the
-    /// merged verdict from [`FetchFailure::of_round`], with every part's own
-    /// words kept behind `context`.
-    ///
-    /// Four layers issue rounds — GLM's satellites, METAR's per-state networks,
-    /// HRRR's two candidate runs, storm reports' three CSVs — and each had
-    /// grown its own version of this. Storm reports' was `failures.remove(0)`,
-    /// which is not a merge at all: `failures[0]` is always the tornado CSV, so
-    /// one 400 there condemned the layer while hail and wind had merely timed
-    /// out. One helper and one rule, so a caller cannot quietly pick a stricter
-    /// one.
-    ///
-    /// Every part's message is kept rather than a representative one: the panel
-    /// line is what a user reads back when reporting a fault, and "which ones
-    /// failed, and how" is the whole content of a round failure.
+    /// One error for a round of several requests that **all** failed: the merged
+    /// verdict, with every part's own words kept behind `context`.
     pub fn of_round(parts: &[FetchError], context: impl Into<String>) -> Self {
         let context = context.into();
         Self {
@@ -302,25 +125,10 @@ impl FetchError {
 
     /// The verdict for a status the origin actually returned.
     ///
-    /// 408 (timeout) and 429 (rate limited) are 4xx that explicitly invite a
-    /// later retry, so they are transient despite the class.
-    ///
-    /// **401 and 403 join them**, which is not what the class means and is
-    /// deliberate. Every origin this app talks to — `api.weather.gov`, SPC,
-    /// IEM, the public NOAA S3 buckets — is public and unauthenticated, so
-    /// there is no credential for a 401 to be about and no permission for a 403
-    /// to be withholding. What actually produces them is the layer in front:
-    /// a WAF rule that dislikes a header, an over-eager rate limiter answering
-    /// 403 instead of 429, an edge node with a stale config. All three clear on
-    /// their own, and all three used to take an alerts layer off the poll for
-    /// the rest of the session on a single sample. Retrying them costs the
-    /// ceiling — one request per poll interval, what a healthy layer costs.
-    ///
-    /// What is left as a refusal is the 4xx that is a property of the *request*
-    /// rather than of the moment: 400 (we built it wrong), 451 (it is blocked
-    /// where the user is), 405/414/422 and the like. Asking again cannot change
-    /// any of those, because nothing about the next request differs. Even so it
-    /// takes [`REFUSALS_BEFORE_BROKEN`] of them in a row to be believed.
+    /// 408 and 429 are 4xx that explicitly invite a later retry. **401 and 403 join
+    /// them**: every origin here is public and unauthenticated, so those are a WAF
+    /// rule or a rate limiter. What is left as a refusal is the 4xx that is a
+    /// property of the *request*: 400, 451, 405/414/422 and the like.
     pub fn from_status(
         status: reqwest::StatusCode,
         not_found: NotFound,
@@ -342,29 +150,18 @@ impl FetchError {
         } else if status.is_client_error() {
             FetchFailure::Permanent
         } else {
-            // A 1xx/3xx that reached an `is_success` check and failed it: not a
-            // refusal, so do not condemn the layer over it.
+            // A 1xx/3xx that reached an `is_success` check and failed it: not a refusal.
             FetchFailure::Transient
         };
         Self { failure, message }
     }
 
-    /// The verdict for a `reqwest` error — a request that never produced a
-    /// status.
-    ///
-    /// **Honest limitation on web**: a CORS rejection and a dead network are
-    /// the same opaque `TypeError: Failed to fetch` by the browser's deliberate
-    /// design, and no amount of inspection here recovers the difference. A CORS
-    /// failure is therefore retried as transient rather than condemned. It costs
-    /// the ceiling rate — one request per poll interval, the same as a healthy
-    /// layer — so mistaking one for the other is bounded. The CORS failure this
-    /// codebase actually had (a `User-Agent` turning SPC's `GET` into a
-    /// preflight) is prevented at the client, not diagnosed here; see
-    /// `rustdar_overlays::spc::fetch`.
+    /// The verdict for a `reqwest` error — a request that never produced a status.
+    /// On web a CORS rejection and a dead network are the same opaque
+    /// `TypeError: Failed to fetch`, so a CORS failure is retried as transient.
     pub fn from_transport(err: &reqwest::Error, message: impl Into<String>) -> Self {
         let message = message.into();
         if let Some(status) = err.status() {
-            // `error_for_status()` funnels here; a status is a status.
             return Self::from_status(status, NotFound::IsBroken, message);
         }
         if err.is_builder() {
@@ -375,12 +172,6 @@ impl FetchError {
 }
 
 /// What the last fetch said, in the terms the options panel needs.
-///
-/// Distinguishing [`Absent`](FetchHealth::Absent) from
-/// [`Failing`](FetchHealth::Failing) is the whole point: "no discussion right
-/// now" and "we cannot reach the SPC" produce the same empty map, and a user
-/// who cannot tell them apart cannot tell whether the quiet is the weather or
-/// the app.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum FetchHealth {
     /// Nothing has failed since the last good answer.
@@ -390,112 +181,50 @@ pub enum FetchHealth {
     Absent,
     /// Failing, but a retry could still work.
     Failing { message: String, attempts: u32 },
-    /// The origin has refused us [`REFUSALS_BEFORE_BROKEN`] times running, so
-    /// the ordinary ladder is not worth spending. Dropped to a
-    /// [`BROKEN_RETRY_SECS`] heartbeat rather than stopped — see
-    /// [`FetchRetry::backoff`].
+    /// The origin has refused us [`REFUSALS_BEFORE_BROKEN`] times running; dropped
+    /// to a [`BROKEN_RETRY_SECS`] heartbeat rather than stopped.
     Broken { message: String },
 }
 
 impl FetchHealth {
-    /// Whether what this layer is holding is older than it looks: the last
-    /// fetch did not land and nothing has succeeded since.
-    ///
-    /// [`Absent`](FetchHealth::Absent) is **not** unhealthy — the origin
-    /// answered, and "not published right now" is an answer. That distinction
-    /// is why this is a method here rather than a `!= Ok` at each call site.
+    /// Whether what this layer is holding is older than it looks.
     pub fn is_unhealthy(&self) -> bool {
         matches!(self, Self::Failing { .. } | Self::Broken { .. })
     }
 }
 
-/// What a layer is drawing, against what its own last answer said it should
-/// draw.
-///
-/// The **coverage** half of "is what I am looking at what I think it is";
-/// [`FetchHealth`] is the **time** half. They are different faults and they
-/// want different things from a user, which is why they are two reports and not
-/// one verdict: a stale layer is drawing an old answer in full and the response
-/// is to wait or press Refresh, an incomplete one is drawing part of the
-/// current answer and the response is to find out which part is absent. A
-/// single "something is wrong" would collapse them, and the collapse is what
-/// makes a mark unactionable.
-///
-/// # The silence this exists for
-///
-/// NWS alerts mostly reference UGC zone codes rather than carrying geometry,
-/// and `rustdar_overlays::nws::zones::resolve_zone_geometries` fetches one boundary per zone — a thousand
-/// or more requests on a busy day, each of which can fail on its own.
-/// That function returned `()`. A zone whose fetch failed was skipped, an alert
-/// whose zones all failed kept an empty feature list and drew nothing, and the
-/// only thing on screen was `Updated 0s ago` — which was *true*, because the
-/// alert fetch had genuinely succeeded. Observed: **212 of 297 warnings absent
-/// from the map under a green status line.**
-///
-/// An alert that resolved *some* of its zones is the worse case and the reason
-/// [`partial`](Self::partial) is counted apart from [`missing`](Self::missing):
-/// it draws a real shape that is the wrong shape, and nothing about a
-/// three-county outline says the warning covers five.
-///
+/// What a layer is drawing, against what its last answer said it should draw.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DataCompleteness {
-    /// How many things the answer said belong on the map.
     pub expected: usize,
-    /// ...that are drawing only some of their area. A wrong shape, not an
-    /// absent one.
+    /// ...that are drawing only some of their area, not an absent one.
     pub partial: usize,
     /// ...that have nothing at all to draw.
     pub missing: usize,
-    /// The pieces those things are assembled from — how many distinct ones were
-    /// needed, and how many were obtained.
+    /// The pieces those things are assembled from, needed and obtained.
     pub parts_requested: usize,
     pub parts_resolved: usize,
     /// Plural noun for what [`expected`](Self::expected) counts: `"alerts"`.
     pub unit: &'static str,
     /// Plural noun for what the parts are: `"zone boundaries"`.
     pub part_unit: &'static str,
-    /// Why the parts that are missing are missing, commonest first —
-    /// `("HTTP 503", 198)`. Empty is allowed and means nobody wrote a cause
-    /// down, not that there was none.
+    /// Why the missing parts are missing, commonest first — `("HTTP 503", 198)`.
     pub reasons: Vec<(String, usize)>,
 }
 
 impl DataCompleteness {
-    /// Everything the answer named is on the map, whole. The default state, and
-    /// the state of every layer that assembles nothing.
+    /// Everything the answer named is on the map, whole.
     pub fn is_complete(&self) -> bool {
         self.partial == 0 && self.missing == 0
     }
 
     /// The always-visible half: one word for the layer stack's row, beside
-    /// `not updating`.
-    ///
-    /// A verdict rather than a count, deliberately. The row is one line next to
-    /// a name, the numbers are one click away in
-    /// [`status_note`](Self::status_note), and the handler's own status line is
-    /// already standing right beside this saying how many of its items drew —
-    /// `"85 of 297 shown"`. Free to call: no allocation, no format, which
-    /// matters because the stack asks every layer this on every frame.
+    /// `not updating`. Free to call — asked of every layer on every frame.
     pub fn status_mark(&self) -> Option<&'static str> {
         (!self.is_complete()).then_some("incomplete")
     }
 
-    /// The full sentence for the layer's options panel, or `None` while
-    /// everything drew.
-    ///
-    /// Says three things, in this order: how much of the layer is not on the
-    /// map, what could not be obtained and why, and — last, because it is the
-    /// distinction a user is most likely to get wrong — that this is **not** the
-    /// same fault as stale data.
-    ///
-    /// Both notes can be on screen at once (a layer that under-drew and has
-    /// since stopped fetching is both), so this one never claims the layer is
-    /// current. It says only that the two are separate faults and that a
-    /// refresh retries what is missing, which is the part a user can act on.
-    ///
-    /// Phrased without a verb over the counts — "missing 1 of 2" rather than
-    /// "1 of 2 is missing" — so one layer's wording does not have to know
-    /// whether its own numbers are singular.
+    /// The full sentence for the layer's options panel.
     pub fn status_note(&self) -> Option<String> {
         if self.is_complete() {
             return None;
@@ -545,94 +274,16 @@ impl DataCompleteness {
     }
 }
 
-/// Whether a layer's fetch round is **one answer or several**, and so whether
-/// it can come back `Ok` with pieces of itself missing.
-///
-/// A distinction in the type system rather than a field, because what it has to
-/// control is *which method exists*. [`DataCompleteness`] made "fresh but
-/// under-drawn" **expressible**; it did not make declaring it **unavoidable**,
-/// and five handlers proved that the gap between those two is the entire
-/// defect. `OverlayState::set_data` is one call, it declares the answer whole,
-/// and it is what anybody writing a handler reaches for. Every one of the five
-/// silences was written by reaching for it, and every one of the five fixes was
-/// a reviewer noticing afterwards.
-///
-/// So a layer whose round is [`Assembled`] has no `set_data` to reach for. Not
-/// a lint and not a review note: the method is not in scope for that type, and
-/// what put it out of scope is the round type the layer takes delivery of — see
-/// [`FetchRound`].
-///
-/// # What this does and does not guarantee
-///
-/// It guarantees a layer **cannot install data without declaring coverage**. It
-/// does not, and cannot, guarantee that the declaration is *true*: writing
-/// [`Whole`] on a round type that holds a `Vec` of failures is a step a person
-/// can still take, and [`FetchRetry::record_coverage`] will still accept a
-/// whole report from a round that under-delivered. What changed is that both of
-/// those are now something written on purpose, in a file that has the failures
-/// on screen — where before, saying nothing at all was the ergonomic default
-/// and said "whole".
-///
-/// Sealed. The two shapes below are the whole question, the same way
-/// `rustdar_overlays::nws::zones::ZoneFailure` has no fall-through: a third shape would
-/// be a place for a round to be neither, which is where a silence would live.
+/// Whether a layer's fetch round is one answer or several.
 pub trait RoundShape: sealed::Sealed {}
 
 /// One request, one answer: it arrived or it did not, and there is no third
 /// outcome to declare.
-///
-/// The shape of most layers, and the reason this is not a tax on all of them. A
-/// `Whole` layer writes `set_data(items)` exactly as it always did and says
-/// nothing at all about coverage, because it has nothing to say.
-///
-/// **HRRR is the instructive one.** Its round asks two model runs an hour
-/// apart and keeps whichever answers, so it looks multi-request — and it is not
-/// assembled, because either run alone is the same product and a whole answer
-/// to the question asked. A round that fell back to the older run has not
-/// under-delivered; it has answered. The line this axis draws is **can a piece
-/// of this round have failed on its own**, never *how many requests did it
-/// take*, and a design that made HRRR declare coverage would be a design HRRR
-/// was worked around.
-///
-/// That line is drawn at the **request**, deliberately, and there is a second
-/// question it does not answer: a parser that skips a malformed element inside
-/// one document has also delivered less than arrived. `parse_md_rss` keeps a
-/// discussion whose polygon would not parse, `spc::outlook::parse_geojson`
-/// skips a degenerate feature, `nws::alert::parse_alerts` skips an alert it
-/// cannot read. No layer reports any of those today, on either axis, and none
-/// of them is what [`Assembled`] means. Naming it here so the next person can
-/// tell an unanswered question from an overlooked one.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Whole;
 
 /// Several requests, each of which can fail on its own — so the round can end
 /// in `Ok`, stamp a fresh clock, read green, and leave part of the map blank.
-///
-/// The shape of every silence this module exists for. What was absent, under
-/// `Updated 0s ago` and no mark of any kind:
-///
-/// - **NWS alerts** — 212 of 297 warnings, whose UGC zone boundaries are one
-///   request each.
-/// - **GLM lightning**, twice — two satellite listings and a granule per
-///   object. Driven over a socket with both listings 200 and every granule
-///   503: **0 flashes, `is_complete()` true, no mark.**
-/// - **SPC storm reports** — three CSVs, one per kind. The tornado CSV 503s
-///   and every tornado report in the country leaves the map, indistinguishable
-///   from a quiet day on every user-visible surface.
-/// - **METAR** — one request per state network. One state refuses, that state
-///   blanks.
-///
-/// A layer that declares this shape gets `set_data_with_coverage` and nothing
-/// else, so the report is not something it can forget: there is no other way to
-/// put data on its map.
-///
-/// **A shape is not a fault rate.** The alerts entry above has since had both
-/// of its real causes closed — they were the parser's and the simplifier's, not
-/// the origin's, and the transport failure count across the whole zone corpus
-/// measured zero — and the layer stays assembled, because what this axis asks
-/// is whether a part *can* fail on its own and not whether one did last
-/// Tuesday. The argument in full is on `NwsAlertFetchResult`, at the
-/// declaration a reader would be about to delete.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Assembled;
 
@@ -646,62 +297,24 @@ mod sealed {
 }
 
 /// What a layer's fetch hands back, and the shape of the round it belongs to.
-///
-/// **This is where the declaration is made, and it is made once.** The impl
-/// sits beside the round type, which is where the failure lists are in view —
-/// `MetarRound::failed_networks`, `StormReportRound::failed_kinds`,
-/// `GlmFetchOutcome::dead_feeds`, `ZoneResolution::failures`. Writing a `Vec`
-/// of failures into a round and then writing [`Whole`] under it is the one
-/// thing left that a person could still do; every other step is the compiler's.
-///
-/// From here the shape propagates on its own.
-/// `OverlayState::downcast_round` is how a handler takes delivery of its round,
-/// and it unifies `Self::Shape` with the state's own — so a state that says
-/// [`Whole`] cannot accept an [`Assembled`] round, and a state that says
-/// `Assembled` has no `set_data`. One declaration, two compile errors between
-/// it and a map that under-draws in silence.
 pub trait FetchRound: 'static {
     /// [`Whole`] or [`Assembled`]; see each for which a round is.
     type Shape: RoundShape;
 }
 
 /// The per-layer record of what the last fetch did and what the next automatic
-/// one is allowed to do.
-///
-/// Holds **facts** — how many consecutive failures, when the last one landed —
-/// and not the schedule derived from them. The ladder is applied at read time
-/// by [`backoff_remaining`](FetchRetry::backoff_remaining), where the caller's
-/// poll interval (the ceiling) is in scope. That keeps one copy of the policy
-/// and means a handler recording a failure does not have to know its own
-/// interval to do it.
+/// one may do.
 #[derive(Debug, Clone, Default)]
 pub struct FetchRetry {
     /// Consecutive failures since the last good answer.
     failures: u32,
-    /// Consecutive *refusals* since the last good answer or last non-refusal —
-    /// the counter [`REFUSALS_BEFORE_BROKEN`] is measured against. Separate
-    /// from `failures` on purpose; see that constant.
+    /// Consecutive *refusals*, the counter [`REFUSALS_BEFORE_BROKEN`] is measured
+    /// against.
     refusals: u32,
     /// When the most recent failure landed.
     last_failure: Option<web_time::Instant>,
     health: FetchHealth,
     /// How much of the **last answer that arrived** made it onto the map.
-    ///
-    /// A second axis, not another rung of the ladder: a round that half
-    /// succeeded is `Ok` on this ledger's terms and must stay that way, because
-    /// the half that arrived is real data that has to be drawn and has to stamp
-    /// a real fetch time. Kept here rather than in the handler so the registry
-    /// can render it for every layer that keeps a ledger, exactly as it renders
-    /// [`status_note`](FetchRetry::status_note) — the same reason four of six
-    /// handlers used to say nothing at all about being stale.
-    ///
-    /// Moved only by a **new answer** ([`record_coverage`](Self::record_coverage),
-    /// which `OverlayState::set_data` and its coverage-carrying sibling drive).
-    /// A failure leaves it alone — what is drawn did not change, so what is
-    /// missing from it did not either — and so does
-    /// [`clear`](FetchRetry::clear): a user pressing Refresh has not yet been
-    /// given the zones that failed, and marking the layer whole before the
-    /// answer lands would be the same silence in a shorter window.
     coverage: DataCompleteness,
 }
 
@@ -714,34 +327,22 @@ impl FetchRetry {
         &self.health
     }
 
-    /// How much of the last answer that arrived is on the map. See
-    /// [`coverage`](FetchRetry::coverage) — the field, for why it is here and
-    /// not on the handler.
+    /// How much of the last answer that arrived is on the map.
     pub fn coverage(&self) -> &DataCompleteness {
         &self.coverage
     }
 
     /// Record what a **new answer** covered.
-    ///
-    /// Called with a complete report by every ordinary `set_data`, so a layer
-    /// that recovers stops being marked without its handler remembering to say
-    /// so; called with a real one by the handlers whose round can half succeed.
     pub fn record_coverage(&mut self, coverage: DataCompleteness) {
         self.coverage = coverage;
     }
 
-    /// Whether the layer is holding less than it was told to draw — the
-    /// coverage counterpart of [`is_unhealthy`](FetchRetry::is_unhealthy), and
-    /// the state no health mechanism in this crate could express before it:
-    /// a round that succeeded, stamped a fresh clock, read `Ok`, and under-drew.
+    /// Whether the layer is holding less than it was told to draw.
     pub fn is_incomplete(&self) -> bool {
         !self.coverage.is_complete()
     }
 
-    /// Consecutive failures since the last good answer. Test seam and panel
-    /// copy; the schedule reads it through [`backoff_remaining`].
-    ///
-    /// [`backoff_remaining`]: FetchRetry::backoff_remaining
+    /// Consecutive failures since the last good answer.
     pub fn failures(&self) -> u32 {
         self.failures
     }
@@ -752,22 +353,12 @@ impl FetchRetry {
         matches!(self.health, FetchHealth::Broken { .. })
     }
 
-    /// Whether what the layer is holding is older than it looks — see
-    /// [`FetchHealth::is_unhealthy`]. What the enable-fetch rule reads to
-    /// decide that switching a layer back on should re-ask rather than trust
-    /// what is already drawn.
+    /// Whether what the layer is holding is older than it looks.
     pub fn is_unhealthy(&self) -> bool {
         self.health.is_unhealthy()
     }
 
     /// A good answer: the ladder resets and the layer returns to its interval.
-    ///
-    /// Deliberately silent about **coverage**: a round can be a good answer and
-    /// still have under-drawn, and clearing that here would erase the report
-    /// belonging to the very data being kept. [`record_coverage`] is the other
-    /// axis, and every route that replaces data calls it.
-    ///
-    /// [`record_coverage`]: FetchRetry::record_coverage
     pub fn record_success(&mut self) {
         self.failures = 0;
         self.refusals = 0;
@@ -775,24 +366,14 @@ impl FetchRetry {
         self.health = FetchHealth::Ok;
     }
 
-    /// Wipe the ledger for a fetch the **user** asked for, so no user action is
-    /// ever made to wait out a backoff — including a layer already recorded as
-    /// [`Broken`](FetchHealth::Broken). A user pressing Refresh, or switching a
-    /// stale layer off and on, may know something we do not (they fixed their
-    /// network; the product came back), and one request per press is bounded by
-    /// the human pressing it.
+    /// Wipe the ledger for a fetch the **user** asked for, so no user action waits
+    /// out a backoff — including a layer already recorded as `Broken`.
     pub fn clear(&mut self) {
         self.record_success();
     }
 
     /// File a failure against the ladder. `Absent` resets it instead: the
     /// origin answered, and "not published right now" is an answer.
-    ///
-    /// A [`Permanent`](FetchFailure::Permanent) verdict climbs the same ladder
-    /// as a transient one until it has repeated [`REFUSALS_BEFORE_BROKEN`]
-    /// times in a row. One refusal reads as `Failing`, which is exactly what it
-    /// is: something is wrong, we do not yet know that repetition cannot fix
-    /// it, and we are still asking.
     pub fn record_failure(&mut self, error: &FetchError) {
         match error.failure {
             FetchFailure::Absent => {
@@ -803,8 +384,7 @@ impl FetchRetry {
             }
             FetchFailure::Transient => {
                 self.failures = self.failures.saturating_add(1);
-                // A timeout in the middle of a run of refusals means we do not
-                // have a run of refusals.
+                // A timeout in the middle of a run of refusals means we do not have one.
                 self.refusals = 0;
                 self.last_failure = Some(web_time::Instant::now());
                 self.health = FetchHealth::Failing {
@@ -832,17 +412,6 @@ impl FetchRetry {
 
     /// The gap the ladder demands after `failures` consecutive failures:
     /// [`FIRST_RETRY_SECS`] doubling, clamped to `interval`.
-    ///
-    /// `Duration::ZERO` with no failures on record, so a healthy layer is
-    /// governed purely by its poll clock.
-    ///
-    /// A [`broken`](FetchRetry::is_broken) layer leaves the ladder for a single
-    /// long rung, [`BROKEN_RETRY_SECS`], floored at `interval` so it can never
-    /// poll faster than a healthy layer would. That is one expression of the
-    /// whole schedule: `auto_fetch_delay` used to special-case broken with a
-    /// `None` of its own, and a `None` there is a state nothing can leave,
-    /// because the only thing that clears it is a success and no fetch that
-    /// could produce one ever runs.
     pub fn backoff(&self, interval: Duration) -> Duration {
         if self.is_broken() {
             return Duration::from_secs(BROKEN_RETRY_SECS).max(interval);
@@ -855,8 +424,7 @@ impl FetchRetry {
         Duration::from_secs(secs).min(interval)
     }
 
-    /// How much of the backoff is still outstanding, given the layer's own poll
-    /// interval as the ceiling.
+    /// How much of the backoff is still outstanding, given `interval` as ceiling.
     pub fn backoff_remaining(&self, interval: Duration) -> Duration {
         match self.last_failure {
             None => Duration::ZERO,
@@ -865,13 +433,6 @@ impl FetchRetry {
     }
 
     /// Age the ledger, as though `by` had passed since the last failure.
-    ///
-    /// A test seam. `FetchRetry` is written against `web_time::Instant` and has
-    /// no injectable now — the same shape as `AutoPollState` next door, whose
-    /// tests reach for `Instant::now() - ago` directly. Climbing a ladder whose
-    /// upper rungs are minutes apart is not something a test can sit through,
-    /// and asserting the arithmetic alone would leave the frame-level claim
-    /// untested.
     #[doc(hidden)]
     pub fn rewind(&mut self, by: Duration) {
         if let Some(at) = self.last_failure {
@@ -880,16 +441,6 @@ impl FetchRetry {
     }
 
     /// One line for the layer's options panel, or `None` while all is well.
-    ///
-    /// Phrased so the three cases cannot be confused for each other by someone
-    /// glancing at a blank map — and, for the two failing ones, so that the
-    /// "Updated 47m ago" line beneath cannot be read as the whole story. That
-    /// pairing is the point: a stale alert set and a fresh one look identical
-    /// on the map, and this is the only thing that tells them apart.
-    ///
-    /// Rendered for **every** layer by `OverlayRegistry::controls`, not by each
-    /// handler; four of six used to forget, and the four that forgot included
-    /// NWS alerts.
     pub fn status_note(&self) -> Option<String> {
         match &self.health {
             FetchHealth::Ok => None,
@@ -915,9 +466,7 @@ mod tests {
 
     const INTERVAL: Duration = Duration::from_secs(120);
 
-    /// The ladder itself: 2 s doubling, clamped to the layer's interval and
-    /// never past it. The clamp is the claim — a constant ceiling would keep
-    /// climbing past 120 s here, and a missing one would climb forever.
+    /// The ladder itself: 2 s doubling, clamped to the layer's interval.
     #[test]
     fn the_ladder_doubles_from_two_seconds_and_stops_at_the_poll_interval() {
         let mut retry = FetchRetry::new();
@@ -939,12 +488,7 @@ mod tests {
         }
     }
 
-    /// The number this whole module exists to move. 3089 attempts in 105 s
-    /// measured; the ladder spends 6 in the same window.
-    ///
-    /// Counted by walking the schedule rather than by driving frames — the
-    /// frame-level proof lives in `rustdar-egui`'s `overlay_retry_tests`, which
-    /// drives the real poll gate. This one pins the arithmetic that gate reads.
+    /// 3089 attempts in 105 s measured; the ladder spends 6 in the same window.
     #[test]
     fn the_measured_storm_window_costs_six_attempts() {
         let mut retry = FetchRetry::new();
@@ -967,8 +511,7 @@ mod tests {
         );
     }
 
-    /// A 404 from a product that is published on a schedule is an answer, not a
-    /// fault: no ladder, and a state the panel can distinguish from a failure.
+    /// A 404 from a product published on a schedule is an answer, not a fault.
     #[test]
     fn an_absent_product_is_an_answer_rather_than_a_failure() {
         let mut retry = FetchRetry::new();
@@ -991,12 +534,7 @@ mod tests {
         );
     }
 
-    /// **The stale-warning test.** One refusal is a suspicion, not a verdict:
-    /// the layer stays on the ordinary ladder and keeps asking.
-    ///
-    /// The bug: a single 403 wrote `Broken`, `auto_fetch_delay` then returned
-    /// `None` for the session, and the alerts layer went on painting whatever
-    /// warnings it last held. Set `REFUSALS_BEFORE_BROKEN` to 1 and this fails.
+    /// One refusal is a suspicion, not a verdict: the layer stays on the ladder.
     #[test]
     fn one_refusal_does_not_condemn_a_layer() {
         let mut retry = FetchRetry::new();
@@ -1017,8 +555,7 @@ mod tests {
         );
     }
 
-    /// Refusals have to be *consecutive*: a transient in among them means we do
-    /// not have a run, and the count starts over.
+    /// Refusals have to be *consecutive*; a transient among them starts the count over.
     #[test]
     fn a_transient_between_refusals_resets_the_refusal_count() {
         let mut retry = FetchRetry::new();
@@ -1033,8 +570,7 @@ mod tests {
         assert!(retry.is_broken(), "two in a row must still be believed");
     }
 
-    /// `REFUSALS_BEFORE_BROKEN` in a row is the evidence bar, and clearing it
-    /// says so in the state.
+    /// `REFUSALS_BEFORE_BROKEN` in a row is the evidence bar.
     #[test]
     fn a_run_of_refusals_is_believed_and_said_out_loud() {
         let mut retry = FetchRetry::new();
@@ -1057,9 +593,7 @@ mod tests {
         );
     }
 
-    /// Broken is a slower poll, never a stopped one. The old `None` was
-    /// absorbing by construction: nothing automatic ran, so nothing could
-    /// succeed, so nothing could ever clear it.
+    /// Broken is a slower poll, never a stopped one.
     #[test]
     fn a_broken_layer_still_gets_a_heartbeat() {
         let mut retry = FetchRetry::new();
@@ -1087,8 +621,7 @@ mod tests {
         );
     }
 
-    /// The heartbeat is floored at the layer's own interval, so a layer that
-    /// polls *more* slowly than the heartbeat is not sped up by breaking.
+    /// The heartbeat is floored at the layer's own interval.
     #[test]
     fn the_broken_heartbeat_never_outpaces_a_slow_layer() {
         let slow = Duration::from_secs(BROKEN_RETRY_SECS * 3);
@@ -1099,8 +632,7 @@ mod tests {
         assert_eq!(retry.backoff(slow), slow);
     }
 
-    /// A user action never waits: Refresh clears the ladder even when the layer
-    /// had been given up on entirely.
+    /// A user action never waits: Refresh clears the ladder even for a broken layer.
     #[test]
     fn a_user_refresh_clears_even_a_permanent_verdict() {
         let mut retry = FetchRetry::new();
@@ -1117,9 +649,7 @@ mod tests {
         assert_eq!(retry.status_note(), None);
     }
 
-    /// A success after a run of refusals clears the refusal count too, not just
-    /// the failure count — otherwise one more refusal months later would break
-    /// a layer that had been healthy in between.
+    /// A success after a run of refusals clears the refusal count too.
     #[test]
     fn a_success_clears_the_refusal_count_as_well() {
         let mut retry = FetchRetry::new();
@@ -1134,8 +664,7 @@ mod tests {
         );
     }
 
-    /// Only [`FetchHealth::Failing`] and [`FetchHealth::Broken`] mean "what is
-    /// drawn may be stale". `Absent` is an answer and must not read as a fault.
+    /// Only `Failing` and `Broken` mean "what is drawn may be stale".
     #[test]
     fn absent_is_not_unhealthy() {
         let mut retry = FetchRetry::new();
@@ -1150,11 +679,6 @@ mod tests {
     }
 
     /// The round *error* keeps every part's words, not a representative one.
-    ///
-    /// Storm reports used to take `failures[0]` — always the tornado CSV — so
-    /// the layer's whole verdict turned on one of the three, and a 400 there
-    /// condemned it while hail and wind had merely timed out. All four
-    /// round-issuing layers go through this now.
     #[test]
     fn a_round_error_carries_every_part_and_the_merged_verdict() {
         let parts = [
@@ -1183,9 +707,7 @@ mod tests {
         );
     }
 
-    /// A round of several requests is refused only when every part of it was.
-    /// One dead state network must not take every METAR in the country off the
-    /// map.
+    /// A round is refused only when every part of it was.
     #[test]
     fn a_round_is_only_refused_when_every_part_of_it_was() {
         use FetchFailure::{Absent, Permanent, Transient};
@@ -1220,9 +742,7 @@ mod tests {
         assert_eq!(retry.status_note(), None);
     }
 
-    /// A layer left failing for a very long time must stay at its ceiling, not
-    /// wrap to zero. `2u64 << 63` is 0, so a `checked_shl` ladder would put a
-    /// week-old failure straight back into a per-frame retry.
+    /// A layer left failing must stay at its ceiling, not wrap to zero.
     #[test]
     fn a_long_outage_stays_at_the_ceiling_rather_than_wrapping_to_zero() {
         let mut retry = FetchRetry::new();
@@ -1236,8 +756,7 @@ mod tests {
         );
     }
 
-    /// Status classification, endpoint by endpoint. The 404 rows are the point:
-    /// the same status is routine for one path and broken for another.
+    /// Status classification: the same 404 is routine for one path, broken for another.
     #[test]
     fn statuses_are_classified_by_what_a_retry_could_do() {
         use reqwest::StatusCode;
@@ -1253,10 +772,7 @@ mod tests {
                 NotFound::IsBroken,
                 FetchFailure::Permanent,
             ),
-            // The two that changed sides, and the reason this table has a
-            // comment: these origins are public and unauthenticated, so a 401
-            // or a 403 from one is a WAF rule or a rate limiter wearing the
-            // wrong status, not a refusal that will still be there tomorrow.
+            // These origins are public and unauthenticated: a 401/403 is a WAF rule.
             (
                 StatusCode::FORBIDDEN,
                 NotFound::IsBroken,
@@ -1267,8 +783,7 @@ mod tests {
                 NotFound::IsBroken,
                 FetchFailure::Transient,
             ),
-            // A property of the request, not of the moment: the next one is
-            // identical, so it gets the identical answer.
+            // A property of the request, not of the moment.
             (
                 StatusCode::BAD_REQUEST,
                 NotFound::IsBroken,
@@ -1319,14 +834,7 @@ mod tests {
         }
     }
 
-    // ── Coverage: the other axis ──────────────────────────────────────
-
     /// The three shapes of incomplete read as three different sentences.
-    ///
-    /// "Missing" and "drawing part of itself" are not the same news: one is an
-    /// absence someone can look for, the other is a shape on the map that is
-    /// wrong in a way nothing about it shows. A note that said "incomplete" and
-    /// stopped would leave a user unable to tell which they had.
     #[test]
     fn the_completeness_note_tells_the_three_shapes_of_incomplete_apart() {
         let base = DataCompleteness {
@@ -1391,9 +899,7 @@ mod tests {
         );
     }
 
-    /// A round with no second denominator says so by omission rather than by
-    /// printing `0 of 0` — GLM's unit *is* the satellite, so a parts sentence
-    /// would be the same two numbers twice.
+    /// A round with no second denominator omits the parts sentence.
     #[test]
     fn a_layer_whose_unit_has_no_parts_omits_the_parts_sentence() {
         let note = DataCompleteness {
@@ -1416,14 +922,7 @@ mod tests {
         );
     }
 
-    /// **Coverage and health are separate axes, and nothing on the ladder may
-    /// move coverage.**
-    ///
-    /// The two ways this could quietly break are opposite: a failure that
-    /// cleared the coverage report would un-mark a layer for getting *worse*,
-    /// and a `clear()` that cleared it would mark the layer whole the moment a
-    /// user pressed Refresh — before the answer that would make it whole had
-    /// landed. Only a new answer moves it.
+    /// Coverage and health are separate axes; nothing on the ladder moves coverage.
     #[test]
     fn only_a_new_answer_moves_what_the_layer_is_missing() {
         let under_drew = DataCompleteness {
@@ -1463,8 +962,7 @@ mod tests {
         assert!(!retry.is_incomplete(), "a whole answer clears it");
     }
 
-    /// The message survives classification, so the log line a user reports is
-    /// still the origin's own words.
+    /// The message survives classification.
     #[test]
     fn the_message_reads_as_it_did_before_the_verdict_was_attached() {
         let e = FetchError::from_status(

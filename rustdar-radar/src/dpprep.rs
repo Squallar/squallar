@@ -1,83 +1,16 @@
 //! The WSR-88D dual-polarization preprocessor chain, factored out of
 //! [`crate::kdp`] for shared consumers (KDP, HCA).
-//!
-//! Everything here is a function-for-function transcription of the released
-//! ORPG source: the azimuth recombination task `cpc004/tsk009` (`recomb`),
-//! the dual-pol preprocessor `cpc004/tsk011` (`dpprep`) and its
-//! `calc_system_PhiDP.c` estimator, with the fleet-default adaptation values
-//! from `cpc104/lib006/dpprep.alg`. Originally transcribed from the Build 16
-//! mirror (github likev/CodeOrpgPub) and cross-checked against the CODE
-//! **Build 21.0r1.7** public source; the full provenance, validation history
-//! and documented gaps live in [`crate::kdp`]'s module documentation — this
-//! module only holds the shared machinery, moved here verbatim so the
-//! hydrometeor classification chain can consume the same preprocessor
-//! without duplicating it.
-//!
-//! # Build 21 delta: Met Signal processing (CCR NA14-00100, fleet ON)
-//!
-//! Build 17 added, and B21's `dpprep.alg` defaults to,
-//! `metsignal_processing = ON`: the meteorological gate flag no longer comes
-//! from `rho_smd ≥ corr_thresh` (or SNR on high-attenuation radials) but from
-//! a fuzzy **met-signal** per gate (`findMetSignal.cpp`): six trapezoidal
-//! votes — Z (weight 2, trap 10..30), ρ (1, trap 0.75..0.9), an inverted |V|
-//! trap (1, −1.5..1.5), and the 9-gate textures of raw φ (2, 0/0/10/20), raw
-//! ZDR (2, 0/0/1/2) and raw ρ (1, 0/0/0.02/0.04) — averaged over the weights
-//! of the present inputs (≥ 4 required), scaled to 0–100, zeroed when
-//! SNR < 0 dB or when ≥ threshold but ρ < 0.65 / ZDR outside ±4.5
-//! ([`find_met_signal`]). `cleanMetSignal.cpp` then dilates the ≥ 80 signal
-//! by one gate, trims it back at run edges, and despeckles runs spanning
-//! < 2 bins to 78.5 ([`clean_met_signal`]). The flag is `met > 80`
-//! (`dpp_process.c`'s strict `<=` → 0), and `Unfold_PhiDP` filters on
-//! `met ≥ 80` instead of ρ ≥ 0.85 — [`unfold_phidp`] is parameterized
-//! accordingly, with the legacy ρ/0.85 pair for `metsignal_processing = OFF`.
-//!
-//! The companion **reflectivity CAPPI** (`ReflCAPPI.cpp`): a persistent
-//! 360° × 1 km grid of raw Z near 3 km ARL, updated from every radial with
-//! elevation ≥ 1° outside 30 km, that rescues weak met-signal gates
-//! (0 < met < 80 → 99.5) below 3 km where the stored CAPPI exceeds 11 dBZ.
-//! Both `update_CAPPI` and `apply_CAPPI` return early for elevations under
-//! 1.0°, so the CAPPI **never touches the lowest split cuts** — it matters
-//! to the melting-layer tilts' inner ranges and to the hybrid-scan tiers.
-//! Operationally the CAPPI persists across volumes (15-minute freshness);
-//! [`ReflCappi`] rebuilds it from the current volume's own ≥ 1° sweeps —
-//! the nearest state a single archived volume can reproduce, one volume
-//! fresher than the operational grid, with the cold-start (no CAPPI) as the
-//! bounded A/B alternative.
-//!
-//! `findBragg` (ZDR-calibration monitoring) and the B21-new `DPRA`/`DPIN`
-//! output phases (DP QPE / CDA consumers) alter no field this chain reads
-//! and are not transcribed.
 
 use nexrad_model::data::{DataMoment, MomentValue, Radial};
 
 // ── decibel ↔ linear, on the binary exponential ──────────────────────────────
 //
 // `10^(x/10)` is `2^(x·log₂10/10)` and `10·log₁₀(y)` is `log₂(y)·10/log₂10`,
-// exactly — the same functions, in the base the hardware and libm are built
-// around. `powf` with a runtime base has no fast path: it takes libm's generic
-// `exp(y·ln x)` route, and this chain calls it five times per gate of every
-// recombined radial. Measured on this machine, single-threaded, best of 7 over
-// 10⁶ evaluations: `10f64.powf(0.1·x)` 6.385 ms against `exp2` 2.212 ms (2.9×),
-// `10·log₁₀(y)` 4.187 ms against `log2` 2.231 ms (1.9×).
-//
-// **The results move in the last bits, and here is how far.** Over 2×10⁷
-// samples spanning −40..+100 dB the linear conversion's largest relative
-// deviation is 8.6×10⁻¹⁵, and the decibel conversion's largest absolute
-// deviation is 2.8×10⁻¹⁴ dB. The fields these serve arrive quantized at
-// 0.5 dB (reflectivity) and 1/16 dB (ZDR), so the deviation is under 10⁻¹²
-// of one code of the *input* — five orders of magnitude below f32, which is
-// what every consumer of this module stores its answer in.
-//
-// End to end over five archived volumes (KDMX 2022-03-05, KFTG 2023-06-22,
-// KCRP 2017-08-26, KMSX 2022-06-04, KLWX 2018-03-02): the hybrid
-// classification is **byte-identical**, field and 2048² raster both, and KDP
-// moves in 0.07–0.25 % of its bins by at most **3.7×10⁻⁹ °/km** — 8×10⁻⁸ of
-// the 0.048 °/km step its own 254-code display encoding has.
-//
-// `volumetric::sweep_to_grid`'s pair of the same conversions is deliberately
-// **not** rewritten: it feeds `compute_echo_tops`, whose grid is pinned by an
-// exact digest in five tests, and last-bit agreement there cannot be proved,
-// only observed.
+// exactly. `powf` with a runtime base takes libm's generic `exp(y·ln x)` route
+// and this chain calls it five times per gate; `exp2`/`log2` are 1.9–2.9×
+// faster and deviate by under 10⁻¹² of one code of the quantized input.
+// `volumetric::sweep_to_grid`'s pair is deliberately not rewritten: its grid is
+// pinned by an exact digest.
 
 /// `log₂10 / 10`: the exponent that turns decibels into a power of two.
 const DB_TO_EXP2: f64 = std::f64::consts::LOG2_10 / 10.0;
@@ -99,8 +32,7 @@ fn to_db(ratio: f64) -> f64 {
 
 // ── dpprep.alg fleet defaults ────────────────────────────────────────────────
 
-/// `corr_thresh`: RhoHV (5-gate smoothed) below this censors KDP and marks a
-/// gate non-meteorological.
+/// `corr_thresh`: RhoHV below this censors KDP and marks a gate non-met.
 pub(crate) const CORR_THRESH: f64 = 0.9;
 /// `dbz_thresh`: minimum smoothed reflectivity for the short-gate KDP.
 pub(crate) const DBZ_THRESH: f64 = 40.0;
@@ -145,17 +77,15 @@ pub(crate) const ISDP_Z_MIN: f64 = 0.0;
 pub(crate) const ISDP_Z_REJECT: f64 = 40.0;
 /// The 11-gate run must start at or past this gate (25 km).
 pub(crate) const ISDP_TOO_CLOSE: usize = 100;
-/// Sorted-queue crossover handling: spread > 200° means the values straddle
-/// 360, and entries under 270° get lifted a fold before re-sorting.
+/// Crossover: a spread over 200° means the values straddle 360, so entries
+/// under 270° get lifted a fold before re-sorting.
 pub(crate) const ISDP_CROSSOVER: f64 = 200.0;
 pub(crate) const ISDP_ADJUST: f64 = 270.0;
 
 // ── Input extraction ─────────────────────────────────────────────────────────
 
-/// One input radial's fields in physical units, `NaN` for below-threshold
-/// and range-folded gates (`Icd_to_intern` maps both outside the valid
-/// range; the RF distinction only matters to the product's flag levels,
-/// which decode as undefined either way).
+/// One input radial's fields in physical units, `NaN` for below-threshold and
+/// range-folded gates (`Icd_to_intern`).
 pub(crate) struct DpInput {
     pub(crate) az: f64,
     pub(crate) phi: Vec<f64>,
@@ -174,17 +104,11 @@ pub(crate) struct DpInput {
     pub(crate) spacing: f64,
     /// Half-degree radial (super-res), the recombination precondition.
     pub(crate) half_degree: bool,
-    /// The radial's elevation angle, degrees (`bh->elevation`) — the HCA
-    /// chain's melting-layer beam intersection reads it; the KDP chain does
-    /// not.
+    /// The radial's elevation angle, degrees (`bh->elevation`).
     pub(crate) elev: f64,
 }
 
 /// One moment's gates as `f64`, with every non-value gate a `NaN`.
-///
-/// `iter`, not `values`: the latter is `iter().collect()`, so going through it
-/// would build an intermediate `Vec<MomentValue>` — eight bytes per gate — only
-/// to walk it once and drop it. This runs six times per radial.
 pub(crate) fn decode_moment(moment: &nexrad_model::data::MomentData) -> Vec<f64> {
     moment
         .iter()
@@ -268,8 +192,7 @@ impl CombinedRadial {
         }
     }
 
-    /// The single-radial recombination: fields pass through, the azimuth
-    /// snaps to the half-degree index (`Get_recombined_azi`).
+    /// The single-radial recombination (`Get_recombined_azi`).
     pub(crate) fn single(input: &DpInput) -> Self {
         let mut out = Self::passthrough(input);
         if input.half_degree {
@@ -280,9 +203,7 @@ impl CombinedRadial {
 }
 
 /// Pair consecutive half-degree radials per `combine_radials.c`: the saved
-/// radial must sit in the first half of its degree (`Index_angle` 0.5), the
-/// next radial within (0, 0.75]° of it. Unpairable radials go through the
-/// single-radial path.
+/// radial in the first half of its degree, the next within (0, 0.75]° of it.
 pub(crate) fn combine_sweep(inputs: &[DpInput], coherent: bool) -> Vec<CombinedRadial> {
     let mut out = Vec::with_capacity(inputs.len() / 2 + 1);
     let mut saved: Option<&DpInput> = None;
@@ -319,9 +240,6 @@ pub(crate) fn combine_sweep(inputs: &[DpInput], coherent: bool) -> Vec<CombinedR
 }
 
 /// Linear reflectivity power at the Z gate covering DP gate `i`, or `NaN`.
-/// The calibration and range-correction factors of the source's `Get_p`
-/// cancel between the two radials (same gate), so plain `10^(Z/10)` carries
-/// exactly the relative weight that survives into the average.
 pub(crate) fn dp_gate_power(input: &DpInput, i: usize) -> f64 {
     let d = input.dr0 + i as f64 * input.dg;
     match index_into(d, input.zr0, input.zg, input.z.len()) {
@@ -333,8 +251,7 @@ pub(crate) fn dp_gate_power(input: &DpInput, i: usize) -> f64 {
     }
 }
 
-/// `Create_a_index`'s gate mapping: the output gate whose span covers range
-/// `d`, `None` out of range.
+/// `Create_a_index`'s gate mapping: the output gate whose span covers `d`.
 pub(crate) fn index_into(d: f64, or0: f64, og: f64, n: usize) -> Option<usize> {
     if og <= 0.0 {
         return None;
@@ -350,9 +267,7 @@ pub(crate) fn index_into(d: f64, or0: f64, og: f64, n: usize) -> Option<usize> {
     }
 }
 
-/// φ and ρ of one gate combined coherently per `Recomb_dp_data`. Inputs are
-/// per-radial (φ, ρ, horizontal power, vertical power); the fallbacks for a
-/// missing side are the source's.
+/// φ and ρ of one gate combined coherently per `Recomb_dp_data`.
 pub(crate) fn coherent_phi_rho(
     phi: (f64, f64),
     rho: (f64, f64),
@@ -459,7 +374,7 @@ pub(crate) fn combine_pair(a: &DpInput, b: &DpInput, coherent: bool) -> Combined
         z.push(v);
     }
 
-    // Doppler fields: plain pair mean (see the module doc's gap list).
+    // Doppler fields: plain pair mean.
     let mean_vec = |x: &[f64], y: &[f64]| -> Vec<f64> {
         (0..x.len().max(y.len()))
             .map(|i| {
@@ -500,12 +415,8 @@ pub(crate) fn combine_pair(a: &DpInput, b: &DpInput, coherent: bool) -> Combined
 
 // ── The preprocessor proper (cpc004/tsk011) ──────────────────────────────────
 
-/// `Unfold_PhiDP`, transcribed: the historical median of the previous 30
-/// qualifying gates decides whether φ folded, past gate 240 with enough
-/// valid data accumulated. B21 parameterizes the qualifying test
-/// (`filtering_data`/`filtering_data_threshold`): the legacy pair is
-/// (ρ, [`UNFOLD_MIN_RHO`]), the `metsignal_processing = ON` pair is the
-/// cleaned met signal with [`MET_SIG_THRESHOLD`].
+/// `Unfold_PhiDP`: the historical median of the previous 30 qualifying gates
+/// decides whether φ folded, past gate 240 with enough valid data.
 pub(crate) fn unfold_phidp(phi: &mut [f64], filter: &[f64], thresh: f64, init_fdp: f64) {
     let n = phi.len();
     let mut unfolded = vec![f64::NAN; n];
@@ -574,8 +485,7 @@ pub(crate) fn sample_stddev(data: &[f64]) -> f64 {
     var.max(0.0).sqrt()
 }
 
-/// The upper median (`(low + high + 1) / 2`), what `DPPT_med_filter`
-/// selects. Sorts its scratch input.
+/// The upper median (`(low + high + 1) / 2`), what `DPPT_med_filter` selects.
 pub(crate) fn upper_median(values: &mut [f64]) -> f64 {
     if values.is_empty() {
         return 0.0;
@@ -584,8 +494,7 @@ pub(crate) fn upper_median(values: &mut [f64]) -> f64 {
     values[values.len() / 2]
 }
 
-/// `DPPT_average_filter`: centred running mean over `w` gates, missing
-/// gates skipped, windows truncated at the radial ends.
+/// `DPPT_average_filter`: centred running mean over `w` gates.
 pub(crate) fn average_filter(input: &[f64], w: usize) -> Vec<f64> {
     let n = input.len();
     let hw = (w / 2) as isize;
@@ -628,9 +537,8 @@ pub(crate) fn median_filter(input: &[f64], w: usize) -> Vec<f64> {
         .collect()
 }
 
-/// `Is_high_atten_radial`: strong-signal gates past bin 180 that look like
-/// attenuation (moving, decorrelated, wide) — more than 10 of them flags
-/// the radial.
+/// `Is_high_atten_radial`: >10 strong-signal gates past bin 180 that look like
+/// attenuation (moving, decorrelated, wide) flag the radial.
 pub(crate) fn is_high_attenuation_radial(z: &[f64], vel: &[f64], spw: &[f64], rho: &[f64]) -> bool {
     let n = z.len().min(vel.len()).min(spw.len()).min(rho.len());
     let mut count = 0usize;
@@ -669,11 +577,8 @@ pub(crate) fn meteo_groups(flag: &[bool]) -> Vec<(usize, usize)> {
     groups
 }
 
-/// `Interpolate`: bridge the gaps between valid meteorological groups
-/// (size ≥ `w`) linearly, ramp the leading stretch from `init_fdp`, hold
-/// the trailing stretch constant. The output has no missing gates unless
-/// there is no valid group at all, in which case it is `init_fdp`
-/// everywhere.
+/// `Interpolate`: bridge gaps between valid meteorological groups (size ≥ `w`)
+/// linearly, ramp the leading stretch from `init_fdp`, hold the trailing flat.
 pub(crate) fn interpolate(
     input: &[f64],
     w: usize,
@@ -731,11 +636,8 @@ pub(crate) fn interpolate(
     out
 }
 
-/// Half the least-squares slope of φ over the `w`-gate window centred on
-/// each gate (shrunk at the radial ends): `Calculate_kdp`'s
-/// `6/(g·m(m²−1))·Σ jφ` closed form, which the general
-/// `Calculate_lls_kdp` reduces to — the slope does not depend on where the
-/// window is centred, only on the gate spacing.
+/// Half the least-squares slope of φ over the `w`-gate window centred on each
+/// gate (shrunk at the radial ends): `Calculate_kdp`'s `6/(g·m(m²−1))·Σ jφ`.
 pub(crate) fn kdp_from_phi(phi: &[f64], w: usize, g_km: f64) -> Vec<f64> {
     let n = phi.len();
     let hw = (w / 2) as isize;
@@ -763,8 +665,7 @@ pub(crate) fn kdp_from_phi(phi: &[f64], w: usize, g_km: f64) -> Vec<f64> {
 
 // ── Initial system PhiDP estimator (calc_system_PhiDP.c) ─────────────────────
 
-/// Sort φ values 360°-aware (`qsort_360`): if the sorted spread exceeds
-/// 200°, values under 270° are lifted a fold and the array re-sorted.
+/// Sort φ values 360°-aware (`qsort_360`).
 pub(crate) fn sort_360(values: &mut [f64]) {
     values.sort_by(f64::total_cmp);
     if let (Some(first), Some(last)) = (values.first(), values.last())
@@ -779,9 +680,8 @@ pub(crate) fn sort_360(values: &mut [f64]) {
     }
 }
 
-/// One radial's system-phase sample: the 360°-aware median of the first run
-/// of 11 consecutive high-quality gates, `None` when the run starts inside
-/// 25 km, contains suspect gates, or never happens.
+/// One radial's system-phase sample: the 360°-aware median of the first run of
+/// 11 consecutive high-quality gates.
 pub(crate) fn radial_system_phi(phi: &[f64], rho: &[f64], z: &[f64]) -> Option<f64> {
     let mut run: Vec<f64> = Vec::with_capacity(ISDP_MIN_ECHO);
     for (i, &phi_i) in phi.iter().enumerate() {
@@ -814,10 +714,8 @@ pub(crate) fn radial_system_phi(phi: &[f64], rho: &[f64], z: &[f64]) -> Option<f
     None
 }
 
-/// The estimator's closing step: with at least 40 queued radial phases,
-/// the sorted (360°-aware) queue's `round(n/20)`-th entry — the
-/// low-percentile reading that stands clear of precipitation-accumulated
-/// phase.
+/// The estimator's closing step: with at least 40 queued radial phases, the
+/// sorted (360°-aware) queue's `round(n/20)`-th entry.
 pub(crate) fn isdp_from_queue(mut queue: Vec<f64>) -> Option<f64> {
     if queue.len() < ISDP_MIN_SAMPLES {
         return None;
@@ -831,8 +729,8 @@ pub(crate) fn isdp_from_queue(mut queue: Vec<f64>) -> Option<f64> {
     Some(v)
 }
 
-/// The documented estimator over one sweep's recombined radials: queue
-/// per-radial phases (capped at 200) and take the percentile.
+/// The estimator over one sweep: queue per-radial phases (capped at 200) and
+/// take the percentile.
 pub(crate) fn estimate_isdp(radials: &[CombinedRadial]) -> Option<f64> {
     let mut queue: Vec<f64> = Vec::new();
     for radial in radials {
@@ -848,28 +746,21 @@ pub(crate) fn estimate_isdp(radials: &[CombinedRadial]) -> Option<f64> {
 
 // ── Extensions for the HCA chain ─────────────────────────────────────────────
 //
-// Everything below is consumed by [`crate::hca`] only. The KDP chain above is
-// untouched: `combine_sweep` keeps returning the lean [`CombinedRadial`] the
-// KDP pipeline was validated with, and the HCA chain gets the same
-// recombination plus the pieces dpprep computes that KDP never reads — the
-// recombined ZDR (`Recomb_dp_data`'s `Zdrc = 10·log10(phc/pvc)`), the radial
-// elevation, and the texture filter (`DPPT_std_filter`).
+// Consumed by [`crate::hca`] only: the recombined ZDR
+// (`Recomb_dp_data`'s `Zdrc = 10·log10(phc/pvc)`), the radial elevation, and
+// the texture filter (`DPPT_std_filter`).
 
-/// One recombined radial with the fields the HCA chain needs on top of the
-/// KDP chain's [`CombinedRadial`].
+/// [`CombinedRadial`] plus the fields the HCA chain needs.
 pub(crate) struct DpCombined {
     pub(crate) base: CombinedRadial,
     /// Recombined differential reflectivity at the DP gates, dB.
     pub(crate) zdr: Vec<f64>,
-    /// Elevation angle, degrees (the first pair member's, as the RPG keeps
-    /// the saved radial's header).
+    /// Elevation angle, degrees (the first pair member's).
     pub(crate) elev: f64,
 }
 
-/// The ZDR of one recombined pair per `Recomb_dp_data`: the power ratio of
-/// the (fallback-aware) averaged horizontal and vertical powers,
-/// `10·log10(phc/pvc)` — `ZDR_CAL` is 0 ("already applied at the RDA").
-/// The plain-mean A/B variant averages the two ZDRs directly.
+/// The ZDR of one recombined pair per `Recomb_dp_data`: `10·log10(phc/pvc)` of
+/// the averaged powers. `ZDR_CAL` is 0 ("already applied at the RDA").
 fn combine_pair_zdr(a: &DpInput, b: &DpInput, coherent: bool) -> Vec<f64> {
     let n = a.phi.len().min(b.phi.len());
     (0..n)
@@ -902,9 +793,7 @@ fn combine_pair_zdr(a: &DpInput, b: &DpInput, coherent: bool) -> Vec<f64> {
         .collect()
 }
 
-/// [`combine_sweep`] with the HCA extras: the same pairing decisions
-/// (`combine_radials.c`), the same recombination, plus the recombined ZDR
-/// and the radial elevation.
+/// [`combine_sweep`] plus the recombined ZDR and the radial elevation.
 pub(crate) fn combine_sweep_dp(inputs: &[DpInput], coherent: bool) -> Vec<DpCombined> {
     let single = |input: &DpInput| DpCombined {
         base: CombinedRadial::single(input),
@@ -955,9 +844,7 @@ pub(crate) fn combine_sweep_dp(inputs: &[DpInput], coherent: bool) -> Vec<DpComb
 }
 
 /// `DPPT_std_filter`: the windowed non-biased standard deviation of
-/// `input − smoothed` — the texture fields SD(Z) (window 5, differences
-/// beyond ±50 dB excluded) and SD(ΦDP) (window 9, ±100°). Gates whose
-/// window collects fewer than `w/2` (or 2) qualifying pairs are undefined.
+/// `input − smoothed` — SD(Z) (window 5, ±50 dB) and SD(ΦDP) (window 9, ±100°).
 pub(crate) fn std_filter(input: &[f64], smoothed: &[f64], w: usize, max_diff: f64) -> Vec<f64> {
     let n = input.len();
     let hw = (w / 2) as isize;
@@ -1000,8 +887,6 @@ const MET_SIG_DESPECKLE_SPAN: f64 = 2.0;
 const MET_SIG_DILATE: usize = 1;
 
 /// `trap4point`: the plateau-inclusive trapezoid with the degenerate guard.
-/// Shared with the HCA chain's HSDA (`HailSize.cpp` links the same
-/// `trapazoid.cpp`).
 pub(crate) fn trap4(input: f64, x1: f64, x2: f64, x3: f64, x4: f64) -> f64 {
     if x2 - x1 < 0.0 || x3 - x2 < 0.0 || x4 - x3 < 0.0 {
         return 0.0;
@@ -1028,12 +913,7 @@ fn nint(v: f64) -> i64 {
     }
 }
 
-/// `findMetSignal`: the fuzzy met-signal per gate, 0–100. All inputs are at
-/// the DP gates in the NaN domain — `z` and `snr` sampled there by the
-/// caller (the C indexes its Z-gate arrays directly, the geometries being
-/// identical) — with `phi` the **raw** phase (pre-unfold) and `zdr`/`rho`
-/// raw, exactly as `Dpp_process_radial` calls it. `snr` is from the 3-gate
-/// smoothed Z.
+/// `findMetSignal`: the fuzzy met-signal per gate, 0–100.
 pub(crate) fn find_met_signal(
     z: &[f64],
     vel: &[f64],
@@ -1057,7 +937,7 @@ pub(crate) fn find_met_signal(
     let mut met = vec![0.0f64; n];
     for i in 0..n {
         let snr_i = snr.get(i).copied().unwrap_or(f64::NAN);
-        // SNR below 0 dB (or missing — the sentinel is negative) is not met.
+        // SNR below 0 dB (or missing) is not met.
         if snr_i.is_nan() || snr_i < 0.0 {
             continue;
         }
@@ -1102,8 +982,7 @@ pub(crate) fn find_met_signal(
             continue; // met stays 0
         }
         met[i] = nint(sv / weight * 100.0) as f64;
-        // Hard limits: a qualifying signal with depressed ρ or extreme ZDR
-        // (either missing — the C sentinel fails these tests too) is not met.
+        // Hard limits: depressed ρ or extreme ZDR is not met.
         let zdr_i = zdr.get(i).copied().unwrap_or(f64::NAN);
         let rho_fails = rho_i.is_nan() || rho_i < 0.65;
         let zdr_fails = zdr_i.is_nan() || !(-4.5..=4.5).contains(&zdr_i);
@@ -1114,9 +993,8 @@ pub(crate) fn find_met_signal(
     met
 }
 
-/// `cleanMetSignal`: dilate the ≥ threshold signal by one gate, trim it back
-/// at run edges, then despeckle runs spanning fewer than 2 bins down to
-/// `threshold − 1.5`.
+/// `cleanMetSignal`: dilate the ≥ threshold signal by one gate, trim back at
+/// run edges, despeckle runs under 2 bins to `threshold − 1.5`.
 pub(crate) fn clean_met_signal(met: &mut [f64], threshold: f64) {
     let n = met.len();
     if n <= 2 * MET_SIG_DILATE {
@@ -1201,20 +1079,14 @@ const CAPPI_AZ_OFFSET: f64 = 0.25;
 const CAPPI_UNSET_HEIGHT: f64 = 9999.0;
 
 /// `computeHeight_b5`: beam height above the radar, km, on the B5 spec's
-/// `1.21·6371 km` effective Earth — the same model `RPGCS_height` and the
-/// MLDA use.
+/// `1.21·6371 km` effective Earth.
 pub(crate) fn height_b5_km(elev_deg: f64, range_km: f64) -> f64 {
     let s = elev_deg.to_radians().sin();
     range_km * s + range_km * range_km / (2.0 * 1.21 * 6371.0)
 }
 
-/// The persistent reflectivity CAPPI the met-signal chain consults
-/// (`ReflCAPPI.cpp`): raw Z near 3 km ARL on a 360° × 1 km grid.
-///
-/// Operationally this survives across volumes with a 15-minute freshness
-/// window; here it is rebuilt from one volume's own ≥ 1° sweeps (every
-/// radial inside a volume is within that window), which stands one volume
-/// fresher than the grid the RPG consulted for the same cut.
+/// The reflectivity CAPPI the met-signal chain consults (`ReflCAPPI.cpp`): raw
+/// Z near 3 km ARL on a 360° × 1 km grid.
 pub struct ReflCappi {
     /// `[az][1-km range]`, raw dBZ, `NaN` empty.
     z: Vec<[f64; CAPPI_NUM_GATES]>,
@@ -1244,7 +1116,7 @@ impl ReflCappi {
     }
 
     /// `update_CAPPI`: store this radial's raw Z into the columns whose beam
-    /// height sits nearest the CAPPI height. Radials under 1.0° never update.
+    /// height sits nearest the CAPPI height. Under 1.0° never updates.
     pub(crate) fn update_radial(
         &mut self,
         elev_deg: f64,
@@ -1293,9 +1165,8 @@ impl ReflCappi {
         }
     }
 
-    /// `apply_CAPPI`: rescue weak met-signal gates (0 < met < threshold)
-    /// below the CAPPI height where the stored Z exceeds 11 dBZ. Radials
-    /// under 1.0° are never touched — the lowest split cuts see no CAPPI.
+    /// `apply_CAPPI`: rescue weak met-signal gates (0 < met < threshold) below
+    /// the CAPPI height where the stored Z exceeds 11 dBZ.
     pub(crate) fn apply_radial(
         &self,
         elev_deg: f64,
@@ -1330,12 +1201,10 @@ impl ReflCappi {
     }
 }
 
-/// Resample a derived field onto the 360° × 230 km comparison grid, cell for
-/// cell the way [`crate::twin::compare::tally_packet`] resamples the Level
-/// III twin: the radial nearest the cell centre `az + 0.5°` (bounded by the
-/// radial's own angular claim), and per 1-km cell the gate whose centre falls
-/// nearest the cell centre, earlier gate winning ties. Shared by the derived
-/// products' `to_polar_grid` implementations.
+/// Resample a derived field onto the 360° × 230 km comparison grid the way
+/// [`crate::twin::compare::tally_packet`] resamples the Level III twin: the
+/// radial nearest the cell centre `az + 0.5°`, and per 1-km cell the gate whose
+/// centre falls nearest it, earlier gate winning ties.
 pub(crate) fn resample_to_polar_grid(
     values: &[Vec<f32>],
     azimuths_deg: &[f64],
@@ -1400,11 +1269,6 @@ pub(crate) fn resample_to_polar_grid(
 mod tests {
     use super::*;
 
-    // ── trap4point ───────────────────────────────────────────────────────────
-
-    /// The trapezoid the met signal and the HSDA share: plateau inclusive,
-    /// linear shoulders, zero at and beyond the outer points, degenerate
-    /// rows and NaN inputs read 0.
     #[test]
     fn trap4_matches_trapazoid_cpp() {
         assert_eq!(trap4(2.0, 0.0, 1.0, 3.0, 5.0), 1.0);
@@ -1414,8 +1278,6 @@ mod tests {
         assert_eq!(trap4(4.0, 0.0, 1.0, 3.0, 5.0), 0.5);
         assert_eq!(trap4(0.0, 0.0, 1.0, 3.0, 5.0), 0.0);
         assert_eq!(trap4(5.0, 0.0, 1.0, 3.0, 5.0), 0.0);
-        // The half-open trapezoids the met signal uses: x1 == x2 reads 1
-        // at the shared point, and an infinite top never falls off.
         assert_eq!(trap4(0.0, 0.0, 0.0, 10.0, 20.0), 1.0);
         assert_eq!(trap4(1e12, 10.0, 30.0, f64::INFINITY, f64::INFINITY), 1.0);
         assert_eq!(trap4(1.0, 3.0, 1.0, 4.0, 5.0), 0.0, "degenerate row");
@@ -1426,14 +1288,10 @@ mod tests {
         );
     }
 
-    // ── findMetSignal ────────────────────────────────────────────────────────
-
     fn uniform(n: usize, v: f64) -> Vec<f64> {
         vec![v; n]
     }
 
-    /// A clean rain radial (strong Z, high ρ, smooth φ/ZDR/ρ, no velocity)
-    /// scores 100; SNR under 0 dB scores 0 outright.
     #[test]
     fn find_met_signal_scores_clean_rain_at_100() {
         let n = 40;
@@ -1458,14 +1316,9 @@ mod tests {
         assert!(met.iter().all(|&m| m == 0.0), "SNR < 0 is never met");
     }
 
-    /// The hard limits: a gate whose vote clears the threshold but whose ρ
-    /// sits under 0.65 (or ZDR outside ±4.5) zeroes — biology cannot ride
-    /// smooth textures in.
     #[test]
     fn find_met_signal_hard_limits_zero_qualifying_gates() {
         let n = 40;
-        // ρ = 0.5: the ρ trapezoid contributes 0 but the five other votes
-        // give 7/8 = 88 ≥ 80 — the hard limit must kill it.
         let met = find_met_signal(
             &uniform(n, 40.0),
             &[],
@@ -1475,8 +1328,6 @@ mod tests {
             &uniform(n, 30.0),
         );
         assert!(met.iter().all(|&m| m == 0.0), "got {:?}", &met[..5]);
-        // Same construction with ρ = 0.70: above the hard floor, below the
-        // trapezoid's 0.75 foot — the vote stands at 88.
         let met = find_met_signal(
             &uniform(n, 40.0),
             &[],
@@ -1486,7 +1337,6 @@ mod tests {
             &uniform(n, 30.0),
         );
         assert!(met.iter().all(|&m| m == 88.0), "got {:?}", &met[..5]);
-        // Extreme ZDR trips the other limb.
         let met = find_met_signal(
             &uniform(n, 40.0),
             &[],
@@ -1498,12 +1348,9 @@ mod tests {
         assert!(met.iter().all(|&m| m == 0.0), "ZDR 5 dB is out of bounds");
     }
 
-    /// Fewer than four present inputs scores 0 (the divide-by-zero guard).
     #[test]
     fn find_met_signal_needs_four_inputs() {
         let n = 40;
-        // Only Z and SNR present: the textures of missing fields are
-        // missing, ρ/ZDR missing → 1 vote < 4.
         let met = find_met_signal(
             &uniform(n, 40.0),
             &[],
@@ -1515,86 +1362,60 @@ mod tests {
         assert!(met.iter().all(|&m| m == 0.0));
     }
 
-    // ── cleanMetSignal ───────────────────────────────────────────────────────
-
-    /// Runs spanning fewer than 2 bins despeckle to threshold − 1.5; a
-    /// trailing run survives (the C never flushes it).
     #[test]
     fn clean_met_signal_despeckles_isolated_runs() {
         let t = MET_SIG_THRESHOLD;
-        // An isolated single-gate signal: dilate spreads it to the two
-        // neighbours, trim pulls both back, despeckle removes the residue.
         let mut met = vec![0.0, 0.0, 0.0, 95.0, 0.0, 0.0, 0.0];
         clean_met_signal(&mut met, t);
         assert!(met.iter().all(|&m| m < t), "got {met:?}");
 
-        // A broad run survives intact in its interior.
         let mut met = vec![0.0, 0.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 0.0, 0.0];
         clean_met_signal(&mut met, t);
         assert!(met[3..8].iter().all(|&m| m >= t), "got {met:?}");
 
-        // A trailing run at the array end is never despeckled.
         let mut met = vec![0.0; 8];
         met[7] = 95.0;
         clean_met_signal(&mut met, t);
         assert_eq!(met[7], 95.0, "the C never flushes the trailing run");
     }
 
-    // ── ReflCAPPI ────────────────────────────────────────────────────────────
-
-    /// `height_b5`: the B5 spec's 1.21·6371 km model, hand-computed at
-    /// 3.0° / 50 km: 50·sin(3°) + 2500/15417.82 = 2.778948 km.
     #[test]
     fn height_b5_matches_the_hand_computation() {
         assert!((height_b5_km(3.0, 50.0) - 2.778_948).abs() < 1e-4);
         assert_eq!(height_b5_km(0.0, 0.0), 0.0);
     }
 
-    /// update/apply honour the guards: nothing under 1.0° elevation,
-    /// no update inside 30 km, apply stops at the CAPPI height, and the
-    /// rescue only lifts weak-but-nonzero signals over stored Z > 11 dBZ.
     #[test]
     fn refl_cappi_updates_and_rescues_per_the_source() {
         let mut cappi = ReflCappi::new();
         let n = 1200usize; // 0.25 km gates to 300 km
         let z: Vec<f64> = vec![20.0; n];
 
-        // A 0.5° radial never updates.
         cappi.update_radial(0.5, 100.25, 0.125, 0.25, &z);
         assert!(cappi.z[100].iter().all(|v| v.is_nan()));
 
-        // A 3.0° radial fills its azimuth's columns past 30 km.
         cappi.update_radial(3.0, 100.25, 0.125, 0.25, &z);
         let az = ReflCappi::az_index(100.25);
         assert_eq!(az, 100);
         assert!(cappi.z[100][29].is_nan(), "no update inside 30 km");
         assert_eq!(cappi.z[100][50], 20.0);
 
-        // Apply on a 1.5° radial: weak-but-nonzero gates over stored
-        // Z > 11 dBZ lift to 99.5, zero-signal gates stay zero, gates
-        // inside 30 km see empty columns, and the loop stops at 3 km.
         let mut met = vec![50.0; n];
         met[200] = 0.0;
         cappi.apply_radial(1.5, 100.25, 0.125, 0.25, &mut met);
         assert_eq!(met[100], 50.0, "range 25 km: column never filled");
         assert_eq!(met[240], 99.5, "range 60 km: rescued");
         assert_eq!(met[200], 0.0, "a zero signal is never rescued");
-        // Beyond the height cut (h ≥ 3 km at 1.5° is ~103 km) nothing moves.
         assert_eq!(met[500], 50.0, "range 125 km: beam above the CAPPI");
 
-        // A 0.5° radial is never rescued at all.
         let mut met_low = vec![50.0; n];
         cappi.apply_radial(0.5, 100.25, 0.125, 0.25, &mut met_low);
         assert!(met_low.iter().all(|&m| m == 50.0));
 
-        // A strong signal is never overridden.
         let mut met_hi = vec![90.0; n];
         cappi.apply_radial(1.5, 100.25, 0.125, 0.25, &mut met_hi);
         assert!(met_hi.iter().all(|&m| m == 90.0));
 
-        // The tolerance rule: a later radial whose beam sits farther from
-        // 3 km than the stored height (plus 0.2 km) does not overwrite —
-        // at 50 km the 3.0° beam (2.78 km) beats the 8.0° one (7.28 km).
         let z25: Vec<f64> = vec![25.0; n];
         cappi.update_radial(8.0, 100.25, 0.125, 0.25, &z25);
         assert_eq!(
@@ -1603,7 +1424,6 @@ mod tests {
         );
     }
 
-    /// The double-nint azimuth indexing with the 0.25° offset.
     #[test]
     fn refl_cappi_azimuth_indexing_wraps_the_offset() {
         assert_eq!(

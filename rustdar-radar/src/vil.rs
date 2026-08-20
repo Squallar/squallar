@@ -6,19 +6,12 @@
 //! **The governing document is FMH-11 Part C § 3.2.6**, "Digital High
 //! Resolution Vertically Integrated Liquid Water" (Federal Meteorological
 //! Handbook No. 11, *WSR-88D Products and Algorithms*, FCM-H11C-2017, OFCM,
-//! October 2017, pp. 3-13 – 3-14). It is the specification this module was
-//! missing for a long time, and finding it closed the multiplicative deficit
-//! recorded below. Every convention here is now quoted from it rather than
-//! inferred from the legacy task or arbitrated from twins.
+//! October 2017, pp. 3-13 – 3-14).
 //!
 //! **Flow** — ORPG man pages `hrvil(1)` and `hrvil(4)` (task `cpc014/tsk010`,
 //! High Resolution VIL): per 1° × 1 km polar gate, a *partial VIL* is
 //! computed for each elevation and summed as the volume completes; the total
-//! is the product. The HRVIL task's own source is in no public CODE
-//! distribution and will not be — see "Why the source is unobtainable" below
-//! — so the arithmetic is FMH-11's, cross-checked against the legacy VIL/Echo
-//! Tops task (`cpc013/tsk001`), whose source *is* public and which FMH-11
-//! says DVL's partial VIL matches except in two named respects.
+//! is the product.
 //!
 //! **Cell statistic** — the largest sub-gate, [`CellStat::Max`]. FMH-11
 //! § 3.2.6, verbatim:
@@ -66,25 +59,11 @@
 //! The legacy task reads the `A313B1` look-up table (`a313.inc`) instead —
 //! verified here entry for entry to be this formula **floored at hundredths
 //! of g/m³** and saturated at 5.40 from data level 178 (56.0 dBZ) up. That
-//! floor and that saturation are the *legacy 16-level product's*, and the twin
-//! survey independently reached FMH-11's answer before FMH-11 was found:
-//! product 134's linear region steps by 0.011 kg/m², the table's floor biases
-//! every weak-echo column a level or more low, and switching to floating point
-//! moved within-±1 by 30–40 points at half the surveyed sites. The floored
-//! table stays as the harness's `TableFloor` A/B variant, which is now
-//! precisely what it should be: a model of the *legacy* product.
+//! floor and that saturation are the *legacy 16-level product's*.
 //!
 //! **Threshold** — none in the primary. The legacy task gates every sample
 //! on `min_refl` 18.3 dBZ (`vil_echo_tops.alg`; `IREFMIN = NINT(2·18.3 +
-//! 66) = 103` in `a313a1.ftn`, i.e. ≥ 18.5 dBZ on half-dB data), but live
-//! product-134 twins refuse that reading twice over: they carry tens of
-//! thousands of bins at levels 2–19 (0 – 0.2 kg/m², much of it below
-//! anything an 18.3 dBZ column could produce), and they define **every**
-//! bin their input carries valid reflectivity for — level 2 is a defined
-//! 0.0 kg/m², not background. The primary therefore integrates every valid
-//! gate and defines every data-carrying column (0.0 where nothing
-//! contributes); the legacy gate survives as the `18.3`/`echo-only` A/B
-//! variants.
+//! 66) = 103` in `a313a1.ftn`, i.e. ≥ 18.5 dBZ on half-dB data).
 //!
 //! **Layer depths** — `A313T1__COMPUTE_DEPTH` (`a313t1.ftn`), reproduced
 //! case for case with `RH = RS·cos φ` and `RS` the bin's **outer edge** in
@@ -115,597 +94,16 @@
 //!
 //! **Units** — kg/m² (g/m³ · km), summed in f64 per column. The legacy
 //! task's per-elevation `NINT` to whole kg/m² (`a313d1.ftn`) is a
-//! 16-level-product encoding artifact and is *not* applied: HRVIL encodes
-//! once, at the end, into product 134's hybrid linear/log levels
-//! ([`crate::l3_values::build_vil_lut`] decodes them, and the harness below
-//! compares in them). The site-adaptable `max_vil` display cap (80 kg/m²
-//! fleet default, up to 200 at KICT) is likewise an encoding-side clamp —
-//! the twin's own LUT top enforces it in comparison, and the derived field
-//! keeps the physical value.
+//! 16-level-product encoding artifact and is *not* applied.
 //!
 //! # Documented gaps against the RPG
 //!
 //! * **Input** is raw Level II reflectivity, not the DQA-edited buffer
-//!   (`dqa(1)`, product 297) HRVIL consumes — the same closed preprocessing
-//!   WP1 identified as EET's residual. Because DQA *removes* clutter, AP
-//!   and other artifacts, the raw derivation defines more bins than the
-//!   twin, and carries returns in them the RPG deleted; the harness's
-//!   presence-disagreement gate is what measures that.
+//!   (`dqa(1)`, product 297) HRVIL consumes.
 //! * **Elevation angles**: the RPG builds its depth table from the VCP's
 //!   nominal angles in tenths of degrees; here each sweep's measured median
 //!   elevation is used (the antenna's real ladder, within a few hundredths
 //!   of a degree of nominal).
-//!
-//! # The `LinearZMean` error, and why it looked so well-founded
-//!
-//! This module shipped [`CellStat::LinearZMean`] as its primary for months,
-//! with a paragraph asserting that [`CellStat::Max`] "must not be adopted
-//! here even though an A/B will favour it". That paragraph was wrong, and the
-//! way it was wrong is worth keeping, because the reasoning was sound and the
-//! premise was not.
-//!
-//! The argument ran: `combine_radials.c` (`cpc004/tsk009`, the `recomb` task)
-//! recombines super-resolution reflectivity to 1° × 1 km by a **linear-Z
-//! mean** in both axes — `Combine_range` accumulates `Get_z` over four 0.25 km
-//! gates, `Combine_azi` writes `(Get_z(z1) + Get_z(z2)) · .5` over the two
-//! 0.5° radials — and `product_attr_table` gives COMBBASE (96) `gen_task
-//! recomb`, which is `dqa(1)`'s input and therefore HRVIL's. Therefore the
-//! RPG's own statistic is a linear-Z mean, and `Max`'s ~2 dB is "2 dB the RPG
-//! does not have".
-//!
-//! Every clause of that is true and the conclusion still does not follow. It
-//! conflates two different stages:
-//!
-//! * how the **base data** is recombined from super-resolution — a linear-Z
-//!   mean, `combine_radials.c`, correctly read; and
-//! * how the **VIL algorithm** picks which sample volume in its cell
-//!   contributes — the largest, `a313g1.ftn` and FMH-11 § 3.2.6.
-//!
-//! The second is applied *on top of* the first, and it is the one this
-//! module's `stat` knob models. Reading the recombination rule as the answer
-//! to the cell-statistic question is the whole of the mistake. A linear-Z mean
-//! appears nowhere in the VIL algorithm family; a max appears in both the
-//! specification and the legacy source.
-//!
-//! [`crate::eet`] was on the correct side throughout, and the "cross-cutting
-//! inconsistency" this module used to record against it was this module's own.
-//! FMH-11 gives EET (§ 3.2.3) and DVL (§ 3.2.6) a word-for-word identical DQA
-//! preamble and the same column model, and EET's rule — any sample volume in
-//! the column meeting the threshold sets the top — is max semantics too.
-//!
-//! Two independent measurements agree with the specification. [`crate::eet`]'s
-//! own survey against the RPG's product 135 (186,102 bins, seven sites) scores
-//! `Max` at **70.6%** within 1 kft against **59.3%** for a linear-Z mean on the
-//! range axis and **60.0%** on both axes; and its values-blind footprint is
-//! blunter still — under the mean the RPG defines **5,309 bins at KFTG that the
-//! derivation does not**, against 68 the other way. The RPG has echo where a
-//! 1 km × 1° linear-Z mean has none, which is what selecting the largest
-//! sub-gate does and what averaging it away cannot. That survey also found
-//! `Combine_azi` is **never called**, so the "linear-Z mean in *both* axes"
-//! half of the old premise described a routine that does not run.
-//!
-//! # Validation status — read before trusting the twin harness to pass
-//!
-//! **The live harnesses and both policy modules (`validation_policy`,
-//! `vild_validation_policy`) now live on branch `campaign-harness`.**
-//! The figures below are the last measured before the move; re-measuring
-//! means that branch.
-//!
-//! Three surveys over live volumes on 2026-07-28 arbitrated the
-//! conventions, and the final one (21 sites asserted, 815,797 bins pooled)
-//! does **not** meet the campaign bar (99% within one data level and ≤ 2%
-//! presence disagreement, per site): within-±1 runs 43.2–98.75% (median
-//! ~93; best KMPX 98.75, KFSD 98.36, KOAX 98.08) and presence disagreement
-//! 8.3–24.1% at *every* site. Zero sites pass. What the surveys
-//! established:
-//!
-//! * **Presence** — the twin defines every data-carrying bin (level 2 is a
-//!   defined 0.0; 1,400–17,300 such bins per volume), and the *derived*
-//!   side defines 8–24% more bins than the twin: the DQA deletes clutter,
-//!   AP and artifact bins that raw Level II carries. The excess is the
-//!   DQA's editing, unreachable from raw data — `dqa(1)`'s task is in the
-//!   same closed `cpc014` family WP1 hit for EET.
-//! * **Level agreement** tracks storm-core (log-region) mass: quiet sites
-//!   sit at 97–99% within-±1, while sites whose twins carry 10–20k
-//!   log-region bins (KMRX 45.1%, KMLB 43.2%, KSGF 55.7%) fall off a
-//!   cliff. This module used to read that as reflectivity editing and
-//!   smoothing inherited from the DQA. **That attribution was wrong** —
-//!   see "The deficit is multiplicative" below, which measured the
-//!   physical field rather than the data levels and found a scale error,
-//!   not an editing difference.
-//! * The bounded A/B matrix (cell statistic × LW mapping × participation
-//!   gate × depth datum, eight rows) arbitrated three conventions, each on
-//!   the **whole 21-site roster** — plains, southeast/coastal,
-//!   mountain-west and Appalachian sites alike, never a single site — and
-//!   each was then re-confirmed on a second run in which 16 of 20 shared
-//!   sites had moved on to *fresh volumes* that played no part in the
-//!   choice. Unfloored LW: wins 20/21 in the decision run (margins +2 to
-//!   +46 points of within-±1, every region; sole exception KSHV, −0.75)
-//!   and 20/21 on the confirmation run. No participation gate: 21/21 and
-//!   21/21. Data-columns presence is arbitrated by the product itself —
-//!   all 21 twins carry defined-zero (level 2) mass, 1,405–17,281 bins
-//!   each. The rest is noise on both runs: `Max` against `LinearZMean`
-//!   splits 15/21 *for* `Max` but with median margin under one point and
-//!   mixed sign (its only big wins are the two deepest-convection sites,
-//!   which sit at 43–52% either way), so the documented recombination
-//!   average is retained; edge/centre moves under two points everywhere.
-//!   No documented convention closes the residual, and per the campaign's
-//!   early-stop rule nothing undocumented was chased.
-//!
-//! Product 134 therefore **stays a Level III fetch**, and this module ships
-//! with that provenance documented: as the twin harness's derived side, as
-//! the hail SHI column's liquid-water machinery, and as the retired VIL
-//! density input recorded below.
-//!
-//! # The deficit is multiplicative, and it is not the DQA — measured 2026-08-13
-//!
-//! An independent survey (ten volumes, ten sites, four VCPs, six weather
-//! regimes, two untouched holdouts; Level III decoded by **MetPy**, so no
-//! shared-decoder bug can cancel) put a number on the residual, and a
-//! follow-up run against the **ORPG Build 21.0r1.7 source** established what
-//! it is not. Both are recorded here because the shape of the error is the
-//! whole finding.
-//!
-//! **The measurement.** Pooled over **78,051** columns at nine sites, the
-//! median ratio of this module to the RPG's product 134 is **0.751**, and it
-//! is flat against every property a geometry or input error would bend:
-//!
-//! ```text
-//! range km        0-30  30-60  60-90  90-120 120-150 150-180 180-230
-//!                 0.739  0.761  0.747  0.767  0.769   0.756   0.723
-//! column depth km  0-2    2-4    4-6    6-8   8-12    12-16   16-24
-//!                 0.838  0.742  0.692  0.727  0.764   0.751   0.709
-//! max dBZ         20-30  30-35  35-40  40-45  45-50   50-55   55-60
-//!                 0.768  0.762  0.748  0.734  0.748   0.764   0.736
-//! VIL-weighted mean beam height km ARL   0-1    1-2   2-3  3-4  4-5  5-7
-//!                                       0.818  0.742 0.749 .744 .749 .766
-//! fraction of the column's VIL from the lowest tilt  <0.2 ... 0.8-0.95
-//!                                                   0.754 ...  0.741
-//! ```
-//!
-//! Per site it runs 0.563 (KMLB) to 1.012 (KMSX), so it is not one universal
-//! constant either — but within a volume it is a scalar. **A DQA-input gap
-//! cannot produce this.** Editing moves presence and edges; presence
-//! disagreement is 2.4–8.1% at the deep sites, bin-for-bin registration is
-//! exactly zero on a values-blind footprint test, and the clear-air control
-//! scores 98.9% exact. The bins are the same bins; the values in them are
-//! about a third short.
-//!
-//! **The liquid water the RPG implies.** In columns whose VIL this module
-//! puts ≥ 85% into one layer, `RPG ÷ Δh` *is* the RPG's own liquid water at
-//! that gate's reflectivity, read off the data with no assumed functional
-//! form (n = 2089, six sites):
-//!
-//! ```text
-//! dBZ      15-20  20-25  25-30  30-35  35-40  40-45  45-50  50-55
-//! RPG/G&C  1.364  1.516  1.428  1.360  1.309  1.377  1.502  1.315
-//! ```
-//!
-//! Flat at ~1.4 over four decades of Z. A free fit gives `Z^0.543` against
-//! Greene–Clark's `Z^0.5714`. **The exponent is right and the scale is not**
-//! — so the error is a constant on the integrand, not a mis-shaped mapping.
-//!
-//! **What the ORPG source rules out.** Every hypothesis that could supply a
-//! constant was checked against the Build 21.0r1.7 public source drop, and
-//! each is either verbatim-correct here or points the wrong way:
-//!
-//! * **Layer depths** — `a313t1.ftn` was re-read line for line and
-//!   `layer_depths_km` transcribes it exactly, hardcoded `BW = .017` rad
-//!   included (that constant is the `.alg`'s declared 1.00° beamwidth
-//!   expressed in radians, 0.974°, so it is fidelity and *not* the unit slip
-//!   it looks like — do not "fix" it). Independently, the resulting
-//!   thicknesses equal the true 4/3-earth geometric layer thicknesses and
-//!   tile the column from the ground to a quarter-beamwidth above the top
-//!   cut with no gap and no overlap. There is no room for 1.4× of depth
-//!   short of extrapolating outside the beam coverage. Split cuts telescope:
-//!   `a313t1` builds its table over the VCP's full cut list, and the two
-//!   halves' depths sum to the single deduped layer's, so
-//!   [`DedupPolicy::FirstOfVolume`] loses nothing.
-//! * **Units and bounds** — `a313j1.ftn`'s `PTLVIL = LIQWAT · BEAM_DEPTH` is
-//!   hundredths of g/m³ × km and `a313h1.ftn` scales by `HUNDRETH`, i.e.
-//!   g/m³ · km = kg/m², which is what this module sums. Nothing integrates
-//!   in dBZ anywhere; the sum is linear-Z throughout.
-//! * **The liquid-water mapping** — Greene & Clark (1972) eq. (7)–(8) give
-//!   `M = 3.44e-3 · Z^(4/7)` g/m³ and `M* = 3.44e-6 ∫ Z^(4/7) dh'` with `h'`
-//!   in metres, kg/m²: the coefficient, the exponent and the unit chain here
-//!   are the canonical ones. The RPG's own `A313B1` table is that formula
-//!   **floored** and saturated at 5.40 g/m³ — strictly ≤ the unfloored form
-//!   used here, so the RPG's documented mapping can only make a derivation
-//!   *smaller*, never 1.4× larger.
-//! * **The reflectivity cap** — this bullet used to read "capping is the
-//!   RPG's behaviour, so it cannot be the cause", citing `viletalg.doc`'s
-//!   truncation above 55 dBZ and `A313B1`'s saturation from data level 178.
-//!   Both citations are to the **legacy** task. FMH-11 § 3.2.6 says DVL
-//!   converts reflectivity "above the greater dBZ (i.e., all reflectivity
-//!   used)", so the cap was never product 134's and has been removed. It was
-//!   worth ~0.15 of ratio in hail cores on its own (KFTG 0.572 capped against
-//!   0.722 uncapped) and nothing at all below 56 dBZ, which is why it could
-//!   never have explained a deficit that is flat in max dBZ.
-//! * **The codec** — MetPy's product-134 LUT reproduces the ORPG's own
-//!   `decode_VIL` (`cpc013/tsk007/ptype_read_VIL.c`: `(s−2)/90.66` below
-//!   level 20, `exp((s−83.9028)/38.8763)` above) to **0.08%** across the
-//!   whole range, so the oracle's values are real, including its 79.5 kg/m²
-//!   maxima against this module's 68.9. This one still stands.
-//!
-//! # What it was: the cell statistic, and the arithmetic that confirms it
-//!
-//! The ~1.33× was [`CellStat::LinearZMean`]. FMH-11 § 3.2.6 specifies the
-//! largest sub-gate, `a313g1.ftn` implements the largest sub-gate, and the
-//! magnitude checks out to better than a twentieth of a dB:
-//!
-//! Measured 2026-08-13 at KFTG against the RPG's own published N0B, this
-//! module's `LinearZMean` grid sat **−0.66 dB** from it and [`CellStat::Max`]
-//! **+1.39 dB** above it — a **2.05 dB** separation between the two statistics.
-//! Greene–Clark turns dB into liquid water as `10^(ΔdB · 4/70)`, so:
-//!
-//! ```text
-//! predicted  10^(2.05 · 4/70) = 1.310
-//! required   1 / 0.751         = 1.331     (0.03 dB apart)
-//! ```
-//!
-//! A mechanism that lands within 0.03 dB of a deficit measured over 78,051
-//! columns is not a coincidence, and three further things fall out of it that
-//! a bare coefficient could never have explained:
-//!
-//! * **Flatness.** The max-minus-mean gap is a property of sub-cell
-//!   reflectivity *texture*. It has no reason to vary with range, column
-//!   depth, max dBZ, beam height or the share of VIL in the lowest tilt — and
-//!   the survey found it varying with none of them. A geometry or units error
-//!   would have bent against at least one.
-//! * ~~**The per-site spread.**~~ This bullet used to claim the mechanism
-//!   explained the 0.563–1.012 per-site range as well, deep convection worst.
-//!   **The re-measurement below refutes that**, and the claim is retracted
-//!   rather than edited: `Max` turns out to apply a near-uniform ×1.34 at
-//!   every site (1.19–1.42, CV 4.3%), so it moves the level without touching
-//!   the spread, which survives at the same relative width. The spread is a
-//!   second, still-unexplained defect.
-//! * **The A/B that kept favouring `Max`.** The bounded matrix split 15/21 for
-//!   `Max` with its only large wins at the two deepest-convection sites. That
-//!   was read as noise plus two outliers. It was the effect, concentrated
-//!   where the mechanism predicts it is largest.
-//!
-//! # The re-measurement — 14 volumes, 2026-08-13
-//!
-//! The table above was owed a fresh run and has had one. **Fourteen volumes,
-//! fourteen sites, five VCPs, seven weather regimes, the original roster's two
-//! untouched holdouts plus four volumes that played no part in any tuning**
-//! (KAMA panhandle supercell, KHGX Gulf-coast convection, KLIX Hurricane Ida
-//! landfall, KMLB 2023). The oracle is the RPG's own product 134 decoded by
-//! **MetPy**, never by `nexrad-level3`, so no shared decode bug can cancel.
-//! Registration was established **values-blind** on the defined/undefined
-//! footprint — the metric that correctly refused the false +1 km offset a
-//! value-driven search sold on echo tops — and prefers `(0, 0)` at 13 of 14
-//! sites, KATX being indifferent by 0.03 points.
-//!
-//! Both arithmetic changes were measured **separately**, since FMH-11 licenses
-//! them independently: `Max`-with-cap and `LinearZMean`-uncapped were run as
-//! their own arms. The `Max`-uncapped arm was checked bit-for-bit against
-//! [`compute_vil`] at all fourteen sites.
-//!
-//! **The old measurement reproduces.** Pooling the original nine at their own
-//! mask (the RPG ≥ 0.3 kg/m²) gives **n = 78,647, median 0.750** against the
-//! recorded 78,051 and 0.751 — so the before arm is the code that was
-//! measured, and this scoring path is the one that measured it.
-//!
-//! ```text
-//!                       before    stat only   cap only   after        n
-//! pooled, original 9     0.750       0.981      0.752    0.987     78,647
-//! pooled, all 14         0.748       0.976      0.750    0.981    153,661
-//! RPG band  2-15         0.723       0.944      0.724    0.947     42,921
-//! RPG band 15-40         0.699       0.871      0.721    0.930      5,170
-//! RPG band   >40         0.627       0.719      0.748    0.955      1,155
-//! ```
-//!
-//! **The level is confirmed: 0.751 → 0.987, and it stays flat.** Median ratio
-//! after the fix, against every axis the deficit was flat in before (RPG ≥ 0.3,
-//! all 14 pooled):
-//!
-//! ```text
-//! range km        0-30  30-60  60-90 90-120 120-150 150-180 180-230
-//!                1.022  0.994  0.974  0.981   0.979   0.976   0.936
-//! column depth     0-2    2-4    4-6    6-8    8-12   12-16   16-24
-//!                1.137  1.032  0.926  0.952   0.996   0.975   0.953
-//! max dBZ        20-30  30-35  35-40  40-45   45-50   50-55   55-60
-//!                0.963  0.981  1.006  1.021   0.990   0.995   1.019
-//! VIL-wtd beam ht  0-1    1-2    2-3    3-4     4-5     5-7
-//!                1.115  1.014  0.993  0.994   0.964   0.950
-//! ```
-//!
-//! Max dBZ is the axis that matters most and it is the flattest: 0.963–1.021
-//! across four decades of Z, which is what a sub-cell texture correction
-//! should look like and what a mis-shaped `Z` mapping could not. Nothing
-//! overshoots: no axis bin and no band sits above 1.04.
-//!
-//! **The cap is not what moved it.** Alone it is worth **0.002** of pooled
-//! ratio (0.750 → 0.752) and nothing at all below 56 dBZ, exactly as predicted;
-//! its whole contribution is in the hail cores, where it carries the > 40
-//! kg/m² band from 0.627 to 0.748 on its own and 0.719 → 0.955 alongside `Max`.
-//! **The cell statistic is what moved it**, everywhere else. Two separable
-//! claims, both from FMH-11, and each is right about a different part of the
-//! field.
-//!
-//! **What the re-measurement refutes.** The per-site spread does **not**
-//! collapse, and the mechanism cannot make it:
-//!
-//! ```text
-//! site   KMLB  KMLB2  KABX  KDMX  KHGX  KAMA  KFTG  KLIX  KUDX  KATX  KOKX  KBUF  KMSX
-//! before 0.516 0.540 0.562 0.726 0.727 0.738 0.761 0.761 0.762 0.707 0.830 0.870 1.012
-//! after  0.707 0.765 0.790 0.972 0.933 0.944 0.997 1.008 0.995 0.973 0.991 1.175 1.365
-//! x      1.370 1.417 1.406 1.339 1.283 1.279 1.310 1.325 1.306 1.376 1.194 1.351 1.349
-//! ```
-//!
-//! The multiplier is **near-uniform — 1.194 to 1.417, median 1.339, CV 4.3%**,
-//! against the 1.310 the 2.05 dB gap predicted. That is a strong confirmation
-//! of the *magnitude* argument and a flat refutation of the *spread* argument:
-//! a uniform factor cannot close a spread, and it did not. Relative spread
-//! across sites goes 17.9% → 16.8%, i.e. unchanged; the correlation between a
-//! site's old deficit and its multiplier is only −0.48, far too weak to matter.
-//! KMLB needed ×1.94 and got ×1.37.
-//!
-//! So the field is no longer uniformly low — it is centred on 1.00 with the
-//! **same** per-site scatter, now visible on both sides: smooth regimes
-//! overshoot (KMSX 1.365, KBUF 1.175) and deep tropical convection still
-//! undershoots (KMLB 0.707, KMLB2 0.765, KABX 0.790). **A second defect,
-//! independent of the cell statistic, sets a per-volume scale.** It is the
-//! open question this module now carries, and it is not the one the fix
-//! closed. Note its sign is the *opposite* of the retracted bullet's story:
-//! the sites needing most help are the ones the mechanism helps least.
-//!
-//! **Presence is untouched, exactly.** Defined-bin disagreement is
-//! **bit-identical before and after at all fourteen sites** (Δ = 0.00; 2.4% at
-//! KFTG to 41.4% at the clear-air control). This is correct by construction and
-//! worth stating because it is easy to expect otherwise: the fix changed the
-//! cell statistic and the LWC cap, neither of which can define or undefine a
-//! bin. The participation gate was **already** `min_refl: None` before the fix
-//! — admitting sub-18 dBZ reflectivity was shipped earlier and is not part of
-//! this change. The DQA-editing presence gap is therefore exactly as it was.
-//!
-//! **One caveat at the very top.** Product 134 saturates at its 79.5 kg/m²
-//! encoding ceiling, so no ratio is meaningful there (203 bins over 14
-//! volumes). Uncapped Greene–Clark reads 81–97 kg/m² median in those columns
-//! and up to 171 at KFTG, on gates above 70 dBZ that are likely three-body
-//! scatter. Nothing in the comparison depends on them; flagged so the maxima
-//! in the table below are not read as a regression.
-//!
-//! # Why the source is unobtainable, stated once so nobody looks again
-//!
-//! `hiresvil` is `cpc014/tsk010` and the public Build 21.0r1.7 CODE drop ships
-//! `tsk001`–`tsk017` **without** it. This is not an oversight in one release:
-//! `cpc014/tsk012` (`hireseet`, product 135's task) is absent from the same
-//! drop, and the high-resolution product family is MIT Lincoln Laboratory work
-//! that is stripped from every public CODE edition as a matter of policy. No
-//! build, mirror or archive carries it, and none will. `hrvil_compute_vil.c`
-//! is not a file that can be found; FMH-11 Part C is the substitute, and for
-//! this algorithm it turned out to be a sufficient one.
-//!
-//! # VIL density — measured 2026-07-29, and the local derivation retired
-//!
-//! **Outcome first**: VIL density is no longer computed here. It is now
-//! [`crate::vild`] — the RPG's own two published products divided,
-//! `1000 · DVL / ((EET_published + 0.5) · 304.8)` — because the survey below
-//! measured the local `compute_vil / compute_eet` quotient against exactly
-//! that expression and found it **effectively mute at the thresholds the
-//! product is read for**. The residual is [`compute_vil`]'s — and it is the
-//! multiplicative deficit characterised below, *not* the DQA gap this
-//! paragraph used to name; VILD inherits VIL's low bias whatever its
-//! cause, so the conclusion the survey drew is unaffected. Rather
-//! than ship a hail discriminator that does not discriminate, the product was
-//! rebuilt as the reference itself: both inputs are already fetched and drawn
-//! by the app, so the change costs no new datasource and the shipped field is
-//! now as accurate as the RPG's own products allow.
-//!
-//! Its remaining error is the reference's own **quantization noise floor**,
-//! which is therefore now the product's stated accuracy limit: product 135
-//! publishes whole kilofeet, so ±0.5 kft of echo top is ±0.057 g/m³ at a
-//! 30 kft top and VILD 3.5 (±0.113 at 15 kft, ±0.035 at 50), and ~±0.1 g/m³
-//! once product 134's log-region step is included. See
-//! [`crate::vild::quantization_halfwidth_g_m3`]. That floor is why the bars
-//! below are decision bars rather than value-agreement bars, and why nothing
-//! anywhere claims this field to better than about a tenth of a g/m³.
-//!
-//! **The survey's construction is the shipped product.** The harness does not
-//! rebuild the quotient: `vild_validation_policy` re-exports
-//! [`crate::vild`]'s own constructors, and
-//! `vild::tests::the_shipped_path_is_the_surveys_reference_construction` pins
-//! that [`crate::vild::compute_vild`] composes them in exactly the order the
-//! harness does. So the survey below now scores the field the app draws by
-//! construction, and its PRIMARY row is expected to be perfect; what the run
-//! still measures is the two **attribution** rows, which are the record of how
-//! far the retired local inputs sat from the RPG's.
-//!
-//! **Survey**: 41 precipitating site-hours over 2026-07-28 21 UTC →
-//! 2026-07-29 18 UTC, every site-hour the shared reconnaissance scan
-//! (`live_hca_precip_site_scan`, lowest-cut gates ≥ 35 dBZ) reported at three
-//! candidate hours — southern and central plains (KDDC 19,966 hot gates,
-//! KAMA 10,858, KUEX, KEAX, KABR, KOAX, KFSD, KMVX, KBIS), Appalachian
-//! (KMRX 15,896), Florida and gulf (KMLB 9,098, KTLH 7,538, KMOB, KPAH),
-//! mid-south (KLZK, KSHV, KSGF, KTLX) and mountain west (KSFX 3,915, KMTX
-//! 3,435). 310,215 domain cells.
-//!
-//! **Verdict on the local derivation: the survey does not conclude, and every
-//! direction it does resolve is a miss.** This is what retired it.
-//!
-//! * **The pinned per-site legs all pass, and passing them means nothing
-//!   here.** Threshold agreement runs 99.45–100% at both breaks (bar 95%) and
-//!   the false-high rate 0.00–0.03% (bar 3%), at all 41 site-hours. They pass
-//!   because only **154** of 310,215 cells cross 3.5 g/m³ on the reference at
-//!   all: a metric whose denominator is the whole field cannot fail on a
-//!   decision that is never taken. This is exactly the triviality
-//!   `vild_validation_policy::FLAG_FAR_MAX_PCT`'s doc warns about, and why
-//!   the run is gated on
-//!   `vild_validation_policy::flag_sample_is_conclusive` as well.
-//! * **The decision metric is INCONCLUSIVE and pointing the wrong way.**
-//!   Pooled at 3.5 g/m³ the reference flags 154 cells, we flag 24, 21 of them
-//!   shared: **POD 13.64%**, FAR 12.50%, CSI 13.38%. At 4.0 the reference
-//!   flags 105 and we flag 2: **POD 1.90%**. Both reference populations sit
-//!   under the 200-cell conclusiveness gate, so no site is credited with a
-//!   pass — but the shortfall is not marginal, it is five to fifty times the
-//!   bar. Widening the sample from 13 site-hours to 41 (28 of them playing no
-//!   part in any choice) moved POD from 12.95% to 13.64% and FAR from 14.29%
-//!   to 12.50%: the figure is stable, the sample is not the problem.
-//! * **The predicted HIGH bias does not appear. A LOW bias does.** The signed
-//!   mean (ours − reference) is negative at 36 of 41 site-hours (−0.2278 …
-//!   +0.0080 g/m³; every positive one is a site with no decision-region cells
-//!   at all, at ≤ +0.008). At all 14 site-hours carrying decision-region mass
-//!   (reference ≥ 3.0 g/m³) it is negative, **−1.23 … −4.78 g/m³**. Our field
-//!   simply cannot reach the reference's values: maxima 3.98 against 12.14
-//!   (KABR), 2.49/5.98 (KMOB), 1.72/5.02 (KUEX), 2.37/4.11 (KAMA),
-//!   4.60/6.21 (KMRX).
-//! * **Distribution agreement**: MAE 0.008–0.243 g/m³, within ±0.5 g/m³
-//!   84.2–100%, but within ±15% only **8.0–40.2%** (median ~26%). The field
-//!   is close in absolute terms because it is mostly small; it is *not* close
-//!   in relative terms anywhere.
-//! * **Input attribution — VIL, not the echo top, and it is not close.**
-//!   Swapping one input at a time against the same reference: our VIL over
-//!   the RPG's published top scores **POD 8.44%** (worse than the primary —
-//!   it reproduces the entire miss), while the RPG's DVL over *our* echo top
-//!   scores **POD 88.31%, CSI 65.38%**. In the decision region the VIL term
-//!   is −1.32 … −4.92 g/m³ and negative at every site; the echo-top term is
-//!   −0.55 … +0.74 g/m³ with mixed sign. Whole-field ±15% is 55–92% for the
-//!   echo-top-only row against 8–36% for the VIL-only row.
-//!
-//!   So the two documented errors **partially cancel** — [`crate::eet`]'s low
-//!   storm-core bias does push VILD up, visibly (that row's FAR reaches
-//!   28.4%, over the 25% ceiling, and its decision-region mean runs to +0.74
-//!   g/m³ at KABR) — but it is a fifth to a twentieth of VIL's term and of
-//!   the opposite sign. VILD inherits VIL's low bias, and VIL's residual is
-//!   the DQA gap recorded above. **Fixing the echo top would not move this
-//!   product.**
-//! * **Reference-datum A/B**: the bin centre is pinned from the ICD's
-//!   encoding (`level = ⌊kft⌋ + 2`) before any run, not tuned; dividing by
-//!   the published floor instead moves pooled POD 13.64% → 12.00% and changes
-//!   no verdict at any of the 41 site-hours. Roughly a fifth of the
-//!   reference's own flagged cells (30 of 154 at 3.5, 24 of 105 at 4.0) sit
-//!   inside their own quantization halfwidth of the break — enough to blur
-//!   the edge of the count, nowhere near enough to explain a 13% POD.
-//!
-//! Nothing was tuned to this result and no bar was moved to accommodate it.
-//! Two legs were *added* after the first 13-site-hour run, both making the
-//! survey stricter and both because a FAR-only skill bar is passed by
-//! silence: `vild_validation_policy::FLAG_POD_MIN_PCT` and the
-//! reference-flagged conclusiveness gate. The 28 later site-hours played no
-//! part in either and reproduced every figure.
-//!
-//! What this did **not** say: that the local quotient's arithmetic was wrong
-//! (the offline pins hand-computed it), or its wiring. What it said is that the
-//! one thing VIL density is *read* for — Amburn & Wolf's severe-hail break —
-//! was where it failed, that it failed by under-warning rather than the
-//! suspected over-warning, and that the cause was [`compute_vil`]'s residual,
-//! not [`crate::eet::compute_eet`]'s: **fixing the echo top would not have
-//! moved the product**. The campaign's decision was the third option the
-//! attribution left open — take the reference as the product. See
-//! [`crate::vild`].
-//!
-//! ## Re-run against the shipped Level III product, 2026-07-29
-//!
-//! Eight precipitating site-hours (KUEX, KOAX, KEAX, KSGF, KLZK, KDDC at 12
-//! UTC, KTLH and KMLB at 18 UTC — 1,700 to 55,800 lowest-cut gates ≥ 35 dBZ
-//! each), 83,098 domain cells pooled. The result is what the construction
-//! forces, and confirming it is the point of the run:
-//!
-//! * **PRIMARY (the shipped [`crate::vild::compute_vild`], entry point and
-//!   all)**: threshold agreement **100.00%** at both breaks at every
-//!   site-hour, false-high 0, MAE **0.0000** g/m³, within ±0.5 and within ±15%
-//!   both 100.00%, pooled **POD 100.00% / FAR 0.00% / CSI 100.00%** over the
-//!   33 cells the reference flags at 3.5 and the 25 it flags at 4.0. Not
-//!   "close": bit-identical, which is the anti-drift pin passing on live data.
-//! * **The retired local quotient**, scored on the same volumes: POD **3.03%**
-//!   at 3.5, **0.00%** at 4.0, FAR 66.67%, and −5.55 … −7.92 g/m³ of signed
-//!   bias at the site-hours with decision-region mass. Attribution reproduces
-//!   too — our-VIL/RPG-top POD 3.03%, RPG-DVL/our-top POD 96.97%.
-//! * **The datum A/B** still costs a decision: dividing by the published floor
-//!   instead of the bin centre moves POD 100% → 97.06% at 3.5 (one cell of 34).
-//! * The pooled **conclusiveness gate still reads INCONCLUSIVE** — 33
-//!   reference-flagged cells against
-//!   `vild_validation_policy::MIN_FLAGGED_CELLS`'s 200 — for exactly the
-//!   reason it did over 41 site-hours (154 cells): real volumes carry tens of
-//!   cells above 3.5 g/m³, not hundreds. That gate is now a statement about
-//!   the *weather sample*, and it has deliberately **not** been relaxed: the
-//!   failure mode it guards against (a mute derivation shrinking its own
-//!   sample out of judgement) is impossible for a product that is its own
-//!   reference, but it will still catch the next derivation that is not.
-//!
-//! Rendered fields for the record. KUEX 12:00:54, a stratiform-dominant MCS:
-//! 39,004 defined cells, mostly 0.3–1.5 g/m³ with discrete 2–3.5 g/m³ cores
-//! sitting on the same NNE-through-SE arc the 0.5° reflectivity carries its
-//! 50+ dBZ cells on, and nothing crossing 3.5 — correctly, for that storm
-//! mode. KDDC 12:01:01, a hail day: 65 cells ≥ 1 g/m³, 21 ≥ 3.5, 19 ≥ 4.0,
-//! maximum **12.06** g/m³ in one compact cluster. That maximum is well past
-//! Amburn & Wolf's scale and it is the **RPG's own** — a large `DVL` over a low
-//! published `EET`, reproduced cell for cell on both sides of the comparison —
-//! so it is the reference's behaviour to read, not a defect here.
-//!
-//! ## What the live harness asserts, after the 2026-07-29 restructure
-//!
-//! That re-run measured perfect figures it could not certify: every leg it
-//! asserted passed, and the one verdict that would have meant something was
-//! withheld, because 33 reference-flagged cells is not a sample and no amount of
-//! re-running fixes weather. So `live_vild_validation` is now built around
-//! what a live pair actually proves:
-//!
-//! * **Identity, asserted on every run** — the shipped
-//!   [`crate::vild::compute_vild`] against the reference built from the same two
-//!   messages, bit for bit over every defined cell, with a coverage floor
-//!   (`vild_validation_policy::MIN_IDENTITY_CELLS`) so an empty grid cannot
-//!   pass quietly. The constructors are shared, so this is *not* the
-//!   arithmetic: it is codec selection off the real PDBs (134's hybrid LUT,
-//!   135's mask/scale/offset and topped flag), resampling across both products'
-//!   real gate spacings and range extents, the composition order and the `+0.5`
-//!   bin-centre datum — the whole pipeline, on a sample any volume supplies
-//!   (tens of thousands of cells; KUEX alone carried 39,004) with no hail
-//!   needed. This is the primary evidence now, and a drifted shipped path fails
-//!   here on the first volume rather than waiting for a hail day.
-//! * **The pipeline's invariants, asserted on every run** — both PDBs naming one
-//!   volume scan inside [`crate::vild::VOLUME_PAIRING_TOLERANCE_SECS`], defined
-//!   cells finite and non-negative, nothing past
-//!   `vild_validation_policy::PLAUSIBLE_MAX_G_M3`, which is set at roughly
-//!   four times the largest value the RPG has been recorded producing (KDDC's
-//!   12.06 g/m³, KEAX's 12.80) rather than at what we expect of it.
-//! * **The threshold and skill figures, reported on every run and asserted only
-//!   where the sample is conclusive** — at the breaks whose reference-flagged
-//!   population clears `vild_validation_policy::MIN_FLAGGED_CELLS`. Elsewhere
-//!   the run prints them under an explicit "INCONCLUSIVE SAMPLE — SKILL NOT
-//!   ASSERTED" line and stands on the two legs above. The gate was not lowered
-//!   and the POD/FAR legs were not touched: they are the trap for the next
-//!   implementation that only *approximates* the reference, and lowering a
-//!   sample floor is how a mute product gets certified by silence.
-//!
-//! The conclusive skill measurement therefore lives on an archived
-//! severe-weather day instead of on today's sky:
-//! `live_vild_validation::live_derived_vild_on_the_2022_05_04_outbreak`, the
-//! 2022-05-04 Oklahoma outbreak at 21:30Z and 23:30Z over KTLX, KINX, KVNX and
-//! KSRX — the same site-hours the hail campaign reached 102 hail cells on. That
-//! run **asserts** the 200-cell gate rather than reporting it.
-//!
-//! ## The conclusive run: 2022-05-04 outbreak, measured 2026-07-30
-//!
-//! Eight archived site-hours, 163,301 domain cells pooled, **306**
-//! reference-flagged cells at 3.5 g/m³ and **211** at 4.0. The first VILD run to
-//! clear `vild_validation_policy::MIN_FLAGGED_CELLS` at either break, and it
-//! clears both:
-//!
-//! * **PRIMARY (the shipped [`crate::vild::compute_vild`])**: pooled POD
-//!   **100.00%**, FAR **0.00%**, CSI **100.00%** at both breaks; threshold
-//!   agreement 100.00%, MAE **0.0000** g/m³ and ±15% 100.00% at every site-hour;
-//!   identity **163,301 of 163,301** cells bit-identical with no presence
-//!   disagreement; no invariant violation anywhere (per-site maxima 1.95–7.36
-//!   g/m³, all non-negative and finite, PDB volume skew 0 s at all eight).
-//! * The decision mass is almost entirely in the 23:30Z hour — KTLX 120 cells
-//!   ≥ 3.5 g/m³ (field maximum 6.61), KINX 97 (7.36), KSRX 48 (5.98), KVNX 39
-//!   (5.07) — against **2** across all four sites at 21:30Z, two hours earlier
-//!   in the same outbreak, where the storms were already precipitating heavily
-//!   (2,968–32,217 lowest-cut gates ≥ 35 dBZ) but topped out at 1.95–3.68 g/m³.
-//!   "Precipitating site-hour" and "hail site-hour" are not the same sample, and
-//!   this is the measurement that says so.
-//! * **The retired local quotient on these same volumes**: POD **4.90%** at 3.5
-//!   and **1.90%** at 4.0, over a sample that is now conclusive — the muteness
-//!   the July survey could only measure inconclusively, reproduced on an
-//!   outbreak day. Attribution reproduces too: our-VIL/RPG-top POD 3.59%,
-//!   RPG-DVL/our-top POD 95.75% at FAR 15.32%. The residual is still
-//!   [`compute_vil`]'s.
-//! * **The datum A/B** costs decisions at this scale: dividing by the published
-//!   floor instead of the bin centre moves pooled POD 100% → **95.92%** at 3.5
-//!   (13 cells of 319) and → 94.62% at 4.0.
 
 use crate::types::RadarProduct;
 use crate::volumetric::{
@@ -715,9 +113,7 @@ use nexrad_model::data::Scan;
 
 /// The legacy VIL task's reflectivity gate, dBZ: the `alg.vil_echo_tops
 /// min_refl` fleet default, applied by `a313f1.ftn` as `IREFMIN`. The
-/// primary derivation does **not** apply it — live product-134 twins carry
-/// mass at levels the gate would forbid (see the module doc) — but the
-/// legacy reading stays in the harness's A/B matrix under this constant.
+/// primary derivation does **not** apply it.
 pub const VIL_MIN_REFL_DBZ: f32 = 18.3;
 
 /// Greene & Clark's coefficient: `LW = 3.44e-3 · Z^(4/7)` g/m³.
@@ -744,19 +140,14 @@ const FOUR_THIRDS: f64 = 4.0 / 3.0;
 enum LwMapping {
     /// The `A313B1` table's exact semantics: floored at hundredths of g/m³
     /// (zero below 8.5 dBZ), saturated at 5.40. The legacy 16-level
-    /// product's quantization, kept as an A/B variant — only the harness
-    /// and the offline tests construct it, so the lib build sees it dead.
+/// product's quantization, kept as an A/B variant.
     #[cfg_attr(not(test), allow(dead_code))]
     TableFloor,
     /// Greene–Clark in floating point over the **whole** dBZ range — no
     /// floor and no 56 dBZ hail cap. The primary, and both halves of that
     /// are specified: FMH-11 Part C § 3.2.6 has DVL using "non-quantized
     /// reflectivity factor data" and converting reflectivity "below 18 dBZ
-    /// threshold and above the greater dBZ (i.e., all reflectivity used)".
-    /// The floor and the cap are the *legacy* 16-level product's, and live
-    /// twins agree: the floored table reads a systematic level low across
-    /// the LUT's 0.011 kg/m² linear region, 30–40 points of within-±1 at
-    /// some sites.
+/// threshold and above the greater dBZ (i.e., all reflectivity used)".
     Analytic,
 }
 
@@ -772,23 +163,19 @@ struct VilOptions {
     depth_at_centre: bool,
     /// A participation gate on each dBZ sample: `Some(18.3)` is the legacy
     /// task's `IREFMIN` (`a313f1.ftn`); `None` lets every valid gate through
-    /// to the LWC table, whose own floor zeroes everything below 8.5 dBZ —
-    /// what a live DVL twin's value distribution shows HRVIL doing.
+/// to the LWC table, whose own floor zeroes everything below 8.5 dBZ.
     min_refl: Option<f32>,
     /// `true`: a column with no participating gate is undefined — the
     /// legacy 4×4 km product's background. `false`: any column carrying
     /// valid reflectivity is defined, at 0.0 if nothing contributes — the
-    /// convention product 134 encodes (its level 2 is a defined 0.0 kg/m²,
-    /// and live twins carry tens of thousands of bins at it).
+/// convention product 134 encodes (its level 2 is a defined 0.0 kg/m²).
     echo_only: bool,
 }
 
 impl VilOptions {
     /// The primary: the largest sub-gate in the cell, floating-point
     /// Greene–Clark, depths at the outer bin edge, no participation gate,
-    /// every data-carrying column defined. Every one of these is now the
-    /// **specified** convention — FMH-11 Part C § 3.2.6, quoted in the
-    /// module doc — rather than a twin arbitration.
+/// every data-carrying column defined.
     const fn primary() -> Self {
         Self {
             stat: CellStat::Max,
@@ -800,8 +187,7 @@ impl VilOptions {
     }
 
     /// The legacy `cpc013` reading: the floored LWC table, `IREFMIN`-gated,
-    /// background undefined. Constructed only by the harness's A/B matrix
-    /// and the offline tests.
+/// background undefined.
     #[cfg_attr(not(test), allow(dead_code))]
     const fn legacy_threshold() -> Self {
         Self {
@@ -1330,13 +716,6 @@ mod tests {
 
     /// Every convention of the primary is the one FMH-11 Part C § 3.2.6
     /// specifies, and this is the pin that fails if one drifts back.
-    ///
-    /// Each was previously arbitrated from live twins and each is now
-    /// quoted: the cell statistic from "selecting the range gate sample
-    /// volume with the largest reflectivity factor"; the other three from
-    /// "DVL uses non-quantized reflectivity factor data and includes the
-    /// conversion to VIL of reflectivity factor below 18 dBZ threshold and
-    /// above the greater dBZ (i.e., all reflectivity used)".
     #[test]
     fn the_primary_conventions_are_the_ones_fmh11_specifies() {
         let p = VilOptions::primary();
@@ -1374,8 +753,7 @@ mod tests {
     ///
     /// This is what the 0.751 was. The sub-gates here are 20/20/20/50 dBZ,
     /// a single hot gate in an otherwise weak cell — the sharp-gradient case
-    /// that deep convection supplies and a smooth stratiform volume does
-    /// not, which is why the deficit ran 0.563 at KMLB and 1.012 at KMSX.
+/// that deep convection supplies and a smooth stratiform volume does not.
     #[test]
     fn a_textured_cell_reads_its_largest_sub_gate() {
         const SUB: usize = 4;

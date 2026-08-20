@@ -17,17 +17,7 @@ fn at(minute: u32) -> NaiveDateTime {
 }
 
 /// What a WSR-88D pane holds once its volume has loaded.
-///
-/// The Level III half comes from `ScanInfo::from_scan`, so those five entries
-/// are the ones the real path lists rather than a hand-written guess. The
-/// dual-pol half is added here because they are listed off a radial's moments
-/// and the cheap test volume has no radials — a real `KPBZ` volume carries
-/// them, and they are exactly the entries `discover_product_elevations`
-/// withholds at a single-pol site.
 fn wsr88d_scan_info() -> ScanInfo {
-    // No learned position: the fixture volume states none either, so the row
-    // this resolves through is the table's, which is what these tests are
-    // about — which *site* a pane is on, not where that site is.
     let mut info = ScanInfo::from_scan(&empty_scan(), WSR88D, at(0), None);
     for product in [
         RadarProduct::DifferentialReflectivity,
@@ -45,15 +35,11 @@ fn wsr88d_scan_info() -> ScanInfo {
 
 /// A partial volume's worth of `TPIT`: the cuts a live feed has sealed so far.
 fn tdwr_chunk_scan_info(products: &[(RadarProduct, &[f32])], minute: u32) -> ScanInfo {
-    // Nothing is compiled in, so the row this reads has to be placed first.
     crate::test_sites::install();
     ScanInfo {
         site: rustdar_radar::sites::get_radar_site(TDWR)
             .expect("TPIT is in the resolved site table")
             .clone(),
-        // The row, unmodified: a chunk-fed `ScanInfo` is assembled without a
-        // volume to state a position and nothing has been learned for `TPIT`
-        // in these tests.
         site_source: rustdar_radar::site_position::SitePositionSource::Table,
         site_position: None,
         timestamp: at(minute),
@@ -69,10 +55,6 @@ fn tdwr_chunk_scan_info(products: &[(RadarProduct, &[f32])], minute: u32) -> Sca
 
 /// A section pane on `WSR88D` with a line, a cut on screen, and the key saying
 /// which radar's volume that cut came from.
-///
-/// The cut is all-`NoCoverage` because none of these tests read a pixel: what
-/// they are about is whether the three planes are *there*, and a full-size one
-/// is the only kind `CrossSection::from_parts` will build.
 fn section_pane_showing_the_wsr88ds_cut(app: &mut crate::app::App) {
     use rustdar_radar::sampler::SampleStatus;
     use rustdar_radar::xsect::{CrossSection, SECTION_HEIGHT, SECTION_WIDTH, SectionAxes};
@@ -154,14 +136,6 @@ fn switch_to(app: &mut crate::app::App, site: &str) {
 }
 
 /// The staleness this closes: a pane keeps offering the radar it just left.
-///
-/// `ScanInfo` is the product picker, and it is a claim about one site.
-/// Switching from a WSR-88D to a TDWR left the previous site's claim standing
-/// until a completed volume replaced it wholesale, so for up to a volume period
-/// the picker offered six products `TPIT` can never draw — the five Level III
-/// entries, which come from an RPG the TDWR network does not have, and the
-/// hybrid classification, which needs ΦDP and ρHV a single-pol instrument does
-/// not measure — plus the dual-pol moments themselves.
 #[test]
 fn switching_to_a_tdwr_stops_offering_the_wsr88ds_products() {
     let mut app = headless(TestBridge::desktop());
@@ -202,11 +176,8 @@ fn switching_to_a_tdwr_stops_offering_the_wsr88ds_products() {
     }
 }
 
-/// The tilt picker travels with the product list, and for the same reason: the
-/// angles in a `ScanInfo` are the previous site's VCP. `TPIT` flies neither the
-/// number of cuts nor the angles `KPBZ` does, and `get_rendering_params` snaps
-/// the selection to the nearest *listed* angle — so a leftover ladder aims the
-/// pane at a tilt the new radar never flew.
+/// The tilt picker travels with the product list, and for the same reason: the angles
+/// in a `ScanInfo` are the previous site's VCP.
 #[test]
 fn switching_sites_drops_the_previous_vcps_tilts() {
     let mut app = headless(TestBridge::desktop());
@@ -228,12 +199,6 @@ fn switching_sites_drops_the_previous_vcps_tilts() {
 }
 
 /// What the status bar says about a pane with nothing on it.
-///
-/// `data_time` is when the data behind the image *on screen* was collected, and
-/// the image goes when the `ScanInfo` does — `dispatch_pane_renders` tears the
-/// radar texture down for a pane that resolves no rendering params and holds no
-/// scan. Left behind, it ages the radar the user just left against a pane that
-/// is showing nothing at all.
 #[test]
 fn switching_sites_stops_dating_the_previous_sites_volume() {
     let mut app = headless(TestBridge::desktop());
@@ -250,21 +215,6 @@ fn switching_sites_stops_dating_the_previous_sites_volume() {
 }
 
 /// A section pane stops showing the radar it just left, and keeps its line.
-///
-/// The one pane kind the plan view's own clear does not reach. Dropping
-/// `scan_info` makes `section_target_for_pane` return `None` — it reads the
-/// volume time off the scan — so no `SectionTarget` is built and the site term
-/// it carries is never compared against anything. What runs instead is
-/// `mark_section_unavailable`, which by design leaves the picture up: right for
-/// the previous *volume*, which is the same radar's older data and is captioned
-/// with its own time, and wrong for the previous *site*, which is another radar
-/// entirely. Left alone the pane holds `KPBZ`'s cut, and answers a hover with
-/// `KPBZ`'s values, under pills that say `TPIT`, until the new site's first
-/// volume lands.
-///
-/// The line stays: it is two geographic points, so it names the same ground
-/// under the new radar, and re-cutting it there is the whole point of keeping
-/// it.
 #[test]
 fn switching_sites_stops_showing_the_previous_radars_cut() {
     let mut app = headless(TestBridge::desktop());
@@ -313,18 +263,6 @@ fn switching_sites_stops_showing_the_previous_radars_cut() {
 }
 
 /// The clear covers every pane the switch moves, not the clicked one alone.
-///
-/// `SwitchRadarSite` writes `layer_sync_targets(pane_idx)` — the whole
-/// layer-linked group when the source is linked — so on a split of two linked
-/// panes a pill click moves both. A clear written for the source alone would
-/// leave the sibling named `TPIT` and still offering `KPBZ`'s menu: the
-/// original staleness, on the pane the user was not looking at when they
-/// clicked, and the pane most likely to be left on it.
-///
-/// The two-site case is covered by [`re_picking_the_site_a_pane_is_on_keeps_its_scan`]'s
-/// rule rather than repeated here — `moving` is filtered pane by pane on
-/// `pane.site != site`, so a linked sibling already on the destination is the
-/// no-op pick with an extra pane in front of it.
 #[test]
 fn the_clear_reaches_every_pane_the_switch_moves() {
     let mut app = two_pane_app(WSR88D, WSR88D);
@@ -360,13 +298,6 @@ fn the_clear_reaches_every_pane_the_switch_moves() {
 }
 
 /// Picking the site a pane is already on is not a switch.
-///
-/// Every entry point that raises `SwitchRadarSite` — the site pill, the
-/// inspector's list, a map icon — will happily emit the current site, and
-/// `layer_sync_targets` hands the handler the whole linked group, which may
-/// include a pane already there. Clearing on those would blank a pane whose
-/// menu, tilts and image are all correct, and a fetch that returns "already
-/// latest" sends no response at all, so nothing would put them back.
 #[test]
 fn re_picking_the_site_a_pane_is_on_keeps_its_scan() {
     let mut app = headless(TestBridge::desktop());
@@ -388,27 +319,6 @@ fn re_picking_the_site_a_pane_is_on_keeps_its_scan() {
 }
 
 /// **A pane that did not change radar keeps its loop.**
-///
-/// The teardown was written for the pane that moved and applied to every pane
-/// there was. `LoopDownloadManager::clear_all` emptied the *shared* volume
-/// cache, the *shared* Level III cache, every pane's download queue and every
-/// frame plan, and it ran whenever any pane left a radar — so a second pane
-/// looping a different site kept a `LoopPlaybackState` whose frames named
-/// volumes that had just been dropped and whose plan was gone. That is the loop
-/// this file's re-pick test already calls dead: it plays blank, has nothing
-/// queued to fill itself, and raises neither of the two actions that rebuild one
-/// (`handle_enable_loop`, `reinit_active_loops`). Silent, and on the pane the
-/// user was not looking at when they clicked.
-///
-/// Every holder `clear_all` reached is asserted, because a fix that covered the
-/// volume cache and left the Level III half wholesale would look closed here
-/// while leaving the same defect on the other datasource. The Level III fixture
-/// is a cached **gap** rather than an object: a `None` is a real entry — its key
-/// is what the pairing gate reads — and it needs no decoded product to build.
-///
-/// Both directions are asserted from one fixture. The switching pane's own
-/// queues and plan must still go, or this passes just as well against a handler
-/// that stopped tearing anything down at all.
 #[test]
 fn a_pane_that_did_not_change_radar_keeps_its_loop() {
     use rustdar_radar::archive::Identifier;
@@ -418,9 +328,6 @@ fn a_pane_that_did_not_change_radar_keeps_its_loop() {
     const BYSTANDER: &str = "KTLX";
 
     let mut app = two_pane_app(WSR88D, BYSTANDER);
-    // Panes are layer-linked by default and a linked group moves together,
-    // which would make pane 1 a pane the switch genuinely does move. Unlinking
-    // it is what makes it a bystander.
     app.gui
         .pane_mut(1)
         .expect("the fixture built two panes")
@@ -436,8 +343,6 @@ fn a_pane_that_did_not_change_radar_keeps_its_loop() {
         .expect("the fixture built two panes")
         .scan_info = Some(wsr88d_scan_info());
 
-    // Pane 1's loop, built the way `begin_loop_for_pane` leaves one and then
-    // filled by the poll path.
     let bystander_site = rustdar_radar::sites::get_radar_site(BYSTANDER)
         .expect("KTLX is in the resolved site table")
         .clone();
@@ -467,9 +372,6 @@ fn a_pane_that_did_not_change_radar_keeps_its_loop() {
         "precondition: the bystander has frames"
     );
 
-    // Everything the bystander's loop holds inside the manager: a volume it has
-    // already downloaded, a Level III answer it has already paired, and the
-    // plan its remaining frames are owed through.
     app.loop_mgr
         .cache_scan(BYSTANDER, at(0), (empty_scan().into(), Default::default()));
     app.loop_mgr.cache_l3_product(BYSTANDER, "EET", at(4), None);
@@ -493,8 +395,6 @@ fn a_pane_that_did_not_change_radar_keeps_its_loop() {
             .plan_downloads_for(1, RadarProduct::Reflectivity),
         "precondition: the plan really does derive a download queue",
     );
-    // And the switching pane's own, so the teardown that must still happen is
-    // observable rather than assumed.
     app.loop_mgr.set_plan(
         0,
         rustdar_radar::loop_downloads::FramePlan::new(
@@ -514,7 +414,6 @@ fn a_pane_that_did_not_change_radar_keeps_its_loop() {
 
     switch_to(&mut app, TDWR);
 
-    // The bystander, whole.
     let loop_state = &app
         .gui
         .pane(1)
@@ -555,7 +454,6 @@ fn a_pane_that_did_not_change_radar_keeps_its_loop() {
          remaining frames have nothing queued to fill them",
     );
 
-    // And the pane that really left a radar owes nothing on either datasource.
     assert!(
         app.loop_mgr.is_pane_done(0),
         "the pane that left a radar kept its queue, so the shared download \
@@ -571,20 +469,6 @@ fn a_pane_that_did_not_change_radar_keeps_its_loop() {
 
 /// The same no-op pick, on the pane's **loop** — the half the rule above did
 /// not reach.
-///
-/// The scan, the section and the `data_time` all moved behind the
-/// `pane.site != site` guard when the site-switch release landed; the loop
-/// reset and the manager's wholesale clear were left in front of it. So the
-/// two halves of one handler disagreed about what a re-pick is, and this is the
-/// half that costs the most: a re-pick threw away a listing, every downloaded
-/// volume and every rendered frame of a loop that was correct — and raises
-/// neither of the two actions that rebuild one (`handle_enable_loop`,
-/// `reinit_active_loops`), so the pane fell back to its static image for the
-/// rest of the session with the transport still showing the loop on.
-///
-/// Both halves are asserted because either alone leaves the loop dead. A
-/// surviving `loop_state` whose scans and frame plan were cleared underneath it
-/// is a loop that plays blank frames and has nothing queued to fill them.
 #[test]
 fn re_picking_the_site_a_pane_is_on_keeps_its_loop() {
     use rustdar_radar::archive::Identifier;
@@ -617,8 +501,6 @@ fn re_picking_the_site_a_pane_is_on_keeps_its_loop() {
         .collect();
     assert_eq!(frames_before.len(), 3, "precondition: the loop has frames");
 
-    // The two halves of the loop's download state: a volume already in hand for
-    // the oldest frame, and the queue the rest are still owed through.
     app.loop_mgr
         .cache_scan(WSR88D, at(0), (empty_scan().into(), Default::default()));
     app.loop_mgr.insert_pending(
@@ -673,13 +555,6 @@ fn re_picking_the_site_a_pane_is_on_keeps_its_loop() {
 }
 
 /// The switch ends the accumulation; it does not weaken it.
-///
-/// The `ChunkScanInfo` event unions a partial volume's products and tilts into
-/// what the pane holds and never removes one, so the picker does not shrink and
-/// regrow every few seconds as a live volume fills. That union is right
-/// *within* one site and only within one — this walks both halves in order: the
-/// switch clears, the new site's first sealed cut lands on an empty pane, and
-/// its second cut adds to the first without resurrecting anything of `KPBZ`'s.
 #[test]
 fn the_new_sites_chunks_accumulate_from_nothing_rather_than_onto_the_old_site() {
     let mut app = headless(TestBridge::desktop());
@@ -687,7 +562,6 @@ fn the_new_sites_chunks_accumulate_from_nothing_rather_than_onto_the_old_site() 
 
     switch_to(&mut app, TDWR);
 
-    // The surveillance cut, then the first Doppler cut of the same volume.
     app.gui
         .apply(rustdar_egui::shell_api::GuiEvent::ChunkScanInfo {
             site: (TDWR).to_owned(),
@@ -729,22 +603,6 @@ fn the_new_sites_chunks_accumulate_from_nothing_rather_than_onto_the_old_site() 
     );
 }
 
-// ---------------------------------------------------------------------------
-// The 3D pane's voxel grid, and the moment it stops describing anything.
-//
-// The three above are about what a pane *says* after a switch. These are about
-// what it still *holds*: a resolved `VoxelGrid` is 8.00 MiB of host bytes and
-// 36.6 MiB of GPU texture at the desktop cell budget (built through
-// `rustdar_radar::voxel::build_voxels` at `voxel::DESKTOP_SHAPE`, which is the
-// budget triple rather than the shape a discrete desktop respends it into),
-// and the pane went on holding the radar it had just left.
-//
-// Every assertion here is in **bytes off a real `VoxelGrid`**, for the reason
-// the hidden-pane suite gives: a store of `Refused` stubs satisfies an
-// entry-count assertion while giving nothing back, so counting entries would
-// pass on a fix that freed nothing.
-// ---------------------------------------------------------------------------
-
 use crate::volume_fixture::ready_grid;
 use rustdar_egui::pane::{VolumeStamp, VolumeTarget};
 use rustdar_volumetric::bridge::{Hold, VolumeEntry};
@@ -761,9 +619,8 @@ fn volume_target(site: &str, minute: u32) -> VolumeTarget {
     }
 }
 
-/// GPU texture bytes one [`ready_grid`] costs the store — what the assertions
-/// below are denominated in, so that a fix which drops the entry without
-/// freeing the grid cannot pass.
+/// GPU texture bytes one [`ready_grid`] costs the store — what the assertions below are
+/// denominated in.
 fn one_grid_bytes() -> usize {
     let VolumeEntry::Ready(grid) = ready_grid() else {
         unreachable!("ready_grid is Ready")
@@ -777,9 +634,8 @@ fn one_grid_bytes() -> usize {
     .expect("a fixture grid cannot overflow")
 }
 
-/// Make `pane_idx` a 3D pane on `WSR88D`, already served — `rendered_for` set
-/// is what stops `PrepareVolume` firing again, and so what a release has to
-/// clear.
+/// Make `pane_idx` a 3D pane on `WSR88D`, already served — `rendered_for` set is what
+/// stops `PrepareVolume` firing again.
 fn volume_pane_on_the_wsr88d(app: &mut crate::app::App, pane_idx: usize, t: &VolumeTarget) {
     let pane = app.gui.pane_mut(pane_idx).expect("the pane exists");
     pane.site = WSR88D.to_owned();
@@ -800,13 +656,6 @@ fn make_resident(app: &crate::app::App, pane_idx: usize, t: &VolumeTarget, hold:
 
 /// **The switch gives the previous radar's grid back, and does not wait for the
 /// new one to arrive to do it.**
-///
-/// This is the case the defect was actually about. Nothing is ever fetched for
-/// `TPIT` here — no scan, no stamp, no `PrepareVolume` — which is exactly the
-/// state a pane sits in while a fetch is in flight, and the state it sits in
-/// *for ever* when that fetch fails or the site has no data. Before the fix the
-/// store still read one whole grid at this point, because every path that would
-/// have shed it runs off a target the pane cannot yet form.
 #[test]
 fn switching_radar_releases_the_previous_sites_3d_grid_without_waiting_for_the_new_one() {
     let one = one_grid_bytes();
@@ -862,12 +711,6 @@ fn switching_radar_releases_the_previous_sites_3d_grid_without_waiting_for_the_n
 
 /// **A build dispatched for the radar being left is dropped rather than
 /// admitted.**
-///
-/// The half that is easy to miss: releasing only what is *resolved* would let
-/// the in-flight resample land afterwards and put a fresh grid for the
-/// abandoned radar into the store, where nothing would ask for it again.
-/// Detaching the pane prunes the `Building` entry, and that absence is what
-/// `VolumeStore::complete` reads as "nothing is waiting for this".
 #[test]
 fn a_resample_dispatched_for_the_radar_being_left_lands_on_a_store_that_dropped_it() {
     let mut app = headless(TestBridge::desktop());
@@ -891,13 +734,6 @@ fn a_resample_dispatched_for_the_radar_being_left_lands_on_a_store_that_dropped_
 
 /// **A 3D loop's whole resident set goes on the switch itself, not a frame
 /// later.**
-///
-/// `dispatch_loop_renders` does reclaim a torn-down loop's set — the switch
-/// resets `loop_state`, and the next frame's `retire_queues` pass calls
-/// `release_set`. That left the set resident for the frame in between, which
-/// on the desktop shape is fourteen grids. The release is now edge-triggered on
-/// the switch, so no frame is drawn with it still held, and the set holder is
-/// unmarked with it.
 #[test]
 fn switching_radar_releases_a_3d_loops_whole_resident_set_on_the_switch_frame() {
     let mut app = headless(TestBridge::desktop());
@@ -928,11 +764,6 @@ fn switching_radar_releases_a_3d_loops_whole_resident_set_on_the_switch_frame() 
 }
 
 /// **A pane that did not change radar keeps what it holds.**
-///
-/// The over-release direction, and the one a blanket "drop everything on a
-/// switch" would fail. `layer_sync_targets` moves the linked group alone, so an
-/// unlinked second pane stays where it is — and the store refcounts by pane, so
-/// the entry the two share must survive the first pane letting go of it.
 #[test]
 fn a_pane_that_did_not_change_radar_keeps_its_3d_grid() {
     let one = one_grid_bytes();
@@ -940,10 +771,6 @@ fn a_pane_that_did_not_change_radar_keeps_its_3d_grid() {
     let shared = volume_target(WSR88D, 0);
     volume_pane_on_the_wsr88d(&mut app, 0, &shared);
     volume_pane_on_the_wsr88d(&mut app, 1, &shared);
-    // Panes are layer-linked by default (`PaneState::layer_link`), and a linked
-    // group moves together — which would make this the *same* transition as the
-    // test above rather than its complement. Unlinking the second pane is what
-    // leaves it a pane the switch genuinely does not move.
     app.gui.pane_mut(1).expect("the pane exists").layer_link = false;
     make_resident(&app, 0, &shared, Hold::Single);
     assert!(
@@ -956,8 +783,6 @@ fn a_pane_that_did_not_change_radar_keeps_its_3d_grid() {
         "precondition: two panes on one volume share one grid",
     );
 
-    // Pane 0 alone. `two_pane_app`'s panes are not layer-linked, so
-    // `layer_sync_targets` names only the pane that was clicked.
     switch_to(&mut app, TDWR);
 
     assert_eq!(

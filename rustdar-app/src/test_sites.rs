@@ -1,60 +1,13 @@
 //! The radars this crate's tests run against.
-//!
-//! # Why a test has to place them at all
-//!
-//! `rustdar-radar` carries no list of the network — see
-//! [`SiteTable`](rustdar_radar::sites::SiteTable). A process learns which
-//! radars exist from a volume it decoded or from the catalogue it fetched, and
-//! a headless `App` over a `MemoryKvStore` with no network does neither. So
-//! without this every test here runs against an empty table: `get_radar_site`
-//! answers `None`, a pane names a site nothing can place, a timezone resolves
-//! to no radar and a cross-section is anchored at sea level.
-//!
-//! This stands in for what a returning user's install has already cached, and
-//! it is what the application itself resolves in `App::with_instance` before
-//! its first frame.
-//!
-//! # Why it is one list and not one per test module
-//!
-//! [`rustdar_radar::sites::resolve`] sets a **process-wide** table, and every
-//! test in this crate's library binary shares it. Two modules installing two
-//! different fixtures would therefore install their union, and an assertion
-//! about which radar is nearest a coordinate would depend on which module's
-//! rows happened to be there — which is a test whose outcome is a scheduling
-//! accident.
-//!
-//! It caught one: with `KOUN` in one fixture and not the other, the nearest
-//! operational WSR-88D to downtown Oklahoma City was `KOUN` or `KTLX`
-//! depending on test order.
-//!
-//! # What is deliberately absent
-//!
-//! `KMBX`, which `a_run_with_no_kv_still_applies_the_volumes_own_position`
-//! places itself so that no sibling can move it.
 
 use rustdar_radar::site_position::SitePosition;
 use rustdar_radar::sites::SiteFix;
 
 /// `(ICAO, latitude, longitude, site_height_m, tower_height_m)`.
-///
-/// Real sites at their own positions to 5 dp, in the whole metres a Volume
-/// Data Block reports, and spread across the country so that a nearest-search
-/// has something to be wrong about — a fixture with one radar in it answers
-/// every question with that radar.
-///
-/// The three around Oklahoma City are the case that exercises both filters
-/// `nearest_wsr88d_site` applies: `TOKC` is a TDWR with no Level II data and
-/// is nearest, `KCRI` is the ROC test bed and is nearer than `KTLX`, and
-/// `KTLX` is the answer an automatic pick should reach.
-///
-/// `TOKC` states one height twice, which is how a TDWR reports itself.
 const SITES: [(&str, i32, i32, i32, i32); 17] = [
     ("KTLX", 35_333_060, -97_277_500, 370, 19),
     ("TOKC", 35_276_000, -97_510_000, 386, 386),
-    // Pittsburgh's WSR-88D and the TDWR that shares its metro, which
-    // `only_a_site_with_an_rpg_behind_it_fetches_level3_objects` needs as a
-    // pair: the gate must answer differently for two rows a naive prefix rule
-    // would treat alike.
+    // Pittsburgh's WSR-88D and the TDWR that shares its metro.
     ("KPBZ", 40_531_670, -80_218_060, 361, 30),
     ("TPIT", 40_501_000, -80_486_000, 366, 366),
     ("KCRI", 35_238_330, -97_460_280, 383, 19),
@@ -73,15 +26,6 @@ const SITES: [(&str, i32, i32, i32, i32); 17] = [
 ];
 
 /// Place the fixture network, once per process.
-///
-/// Idempotent anyway — `resolve` builds nothing when the fixes reproduce the
-/// rows already there — but tests run in parallel and the [`Once`] is the
-/// cheaper way to say so.
-///
-/// Tests that must see a genuinely **empty** table do not call this and must
-/// not read the process table at all: they go through
-/// [`build_table`](rustdar_radar::sites::build_table), which never consults
-/// what this resolved.
 pub(crate) fn install() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {

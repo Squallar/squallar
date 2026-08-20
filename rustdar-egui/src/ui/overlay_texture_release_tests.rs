@@ -1,30 +1,4 @@
-//! What a layer switched **off** costs the GPU, which used to be everything it
-//! cost while it was on.
-//!
-//! The defect: turning an overlay off wrote a `bool` and nothing else.
-//! `OverlayHandler::set_enabled`'s default body is empty, so most handlers do
-//! not even see the change, and a pane's `overlay_textures` map was released
-//! only by `Gui::clear_graphics_state` — a lost GPU context.
-//!
-//! A pane that was on screen and drawing a map recovered on its own even then,
-//! because the viewport loop in `ui_map_pane` clears a disabled kind's cache on
-//! the next frame it paints. **A pane that loop never reaches did not**, and
-//! that pane is the whole reason this release exists — so it is the case these
-//! tests have to actually build rather than describe. `render_pane_map_content`
-//! runs over `0..visible_pane_count()`, so a pane past that bound is one such
-//! pane, and [`skewed_gui`] constructs exactly that skew through
-//! `claim_pane_count_for_test`, which exists for it.
-//!
-//! One RGBA8 texture is `width * height * 4` bytes, and the pixel counts are
-//! `plan_overlay_texture`'s — the pane's rect in **physical** pixels, times
-//! `1 + 2 * OVERDRAW_FRACTION`, capped at the adapter's `max_texture_side`.
-//! That is the arithmetic; this file makes no claim about what it comes to on
-//! any particular display, because nothing here has measured one.
-//!
-//! Two directions to fail in, and both are covered below: releasing too little
-//! is the leak, and releasing too much is a pane that blanks — which is why the
-//! radar raster is excluded, why a third still-on layer is parked beside it, and
-//! why both are asserted rather than commented.
+//! What a layer switched **off** costs the GPU.
 
 use super::*;
 use crate::UI_CONFIG_KEY;
@@ -119,12 +93,6 @@ fn has_texture(pane: &PaneState, kind: &rustdar_source::id::LayerId) -> bool {
 
 /// Switch [`KIND`], `Radar` and `CityLabels` on for `pane` and park a texture
 /// for each.
-///
-/// The two extra kinds are the controls for over-release, and neither is
-/// decoration. `Radar` is the one kind that must survive because nothing would
-/// re-render it; `CityLabels` is an ordinary layer that must survive merely
-/// because it is still switched on. A fixture parking only the alerts texture
-/// could not tell "released the right one" from "released everything".
 fn park_three(ctx: &egui::Context, pane: &mut PaneState) {
     for kind in [
         KIND,
@@ -145,20 +113,6 @@ fn gui_with_parked_textures(ctx: &egui::Context) -> Gui {
 
 /// A `Gui` with **three** panes in the vector and a layout claiming only
 /// **two**, so that `visible_pane_count()` is 2 and pane 2 is past it.
-///
-/// That skew is the point and not a shortcut. Pane 2 is a pane
-/// `render_pane_map_content` never runs for, which makes it the one pane where
-/// `ui_map_pane`'s own per-frame `!enabled` clear cannot be what empties the
-/// cache — so it is the only fixture in which this release is observably load
-/// bearing rather than merely first. `claim_pane_count_for_test` exists to build
-/// exactly this and no production writer can reach it.
-///
-/// Pane 1 is kept visible on purpose, so the same pass is asserted on both sides
-/// of the bound.
-///
-/// The fan-out is still reached: `propagate_layer_sync` returns early only on
-/// `pane_layout.pane_count <= 1`, which is 2 here, and its loop walks the whole
-/// `panes` vector rather than the visible slice.
 fn skewed_gui(ctx: &egui::Context) -> Gui {
     let mut gui = gui_with_parked_textures(ctx);
     gui.set_pane_count_for_test(3);
@@ -185,10 +139,6 @@ fn toggle(gui: &mut Gui, on: bool) {
 
 /// **The leak test.** A layer switched off lets its texture go, and takes
 /// neither the radar raster nor a layer that is still on with it.
-///
-/// The pre-toggle assertions are the point of the fixture. Without them this
-/// passes against a pane whose caches were never filled — an assertion about an
-/// empty starting state, satisfied by construction and unable to fail.
 #[test]
 fn switching_a_layer_off_releases_its_texture_and_not_the_others() {
     let ctx = egui::Context::default();
@@ -231,17 +181,6 @@ fn switching_a_layer_off_releases_its_texture_and_not_the_others() {
 
 /// The in-flight mark is **not** cleared by the release, and that is a decision
 /// rather than an omission.
-///
-/// The dispatch gate is `stale && !cache.render_in_flight`. Clearing the mark on
-/// the way off opens it, so a layer switched off and straight back on before its
-/// render lands would dispatch a *second* render of the same content and upload
-/// both. Left standing, the gate stays shut, the render already in flight
-/// arrives, and the poller stores it because the layer is on again.
-///
-/// Nothing is stranded by leaving it: `spawn_overlay_render` owns the mark, its
-/// non-`offload` exits undo it through `clear_overlay_render_marks`, and the
-/// `offload` arm's result clears it in `poll_overlay_render_results` for every
-/// pane it names, dropped or kept.
 #[test]
 fn the_release_leaves_a_render_already_in_flight_marked() {
     let ctx = egui::Context::default();
@@ -268,11 +207,6 @@ fn the_release_leaves_a_render_already_in_flight_marked() {
 
 /// **Re-enabling regenerates**, asked of the gate that actually decides it
 /// rather than of the emptiness of the cache.
-///
-/// Both sides are checked, and the first is what makes the second mean
-/// anything: with the texture parked, `needs_rerender` answers `false` for
-/// these exact arguments, so the `true` after the off/on cycle is the toggle's
-/// doing and not the fixture's.
 #[test]
 fn re_enabling_asks_for_a_fresh_render() {
     let ctx = egui::Context::default();
@@ -280,10 +214,6 @@ fn re_enabling_asks_for_a_fresh_render() {
 
     {
         let cache = gui.pane_mut(0).expect("pane 0").overlay_cache_mut(&KIND);
-        // Twice, a settle apart: `needs_rerender` records the zoom it was
-        // asked about and calls the gesture settled once it has been still
-        // for `SETTLE_REPAINT_DELAY`, so the second answer is the settled one
-        // — the stricter of the two.
         cache.needs_rerender(TOKEN, ZOOM, 100.0, &viewport(), &plan());
         assert!(
             !cache.needs_rerender(TOKEN, ZOOM, 100.5, &viewport(), &plan()),
@@ -305,13 +235,6 @@ fn re_enabling_asks_for_a_fresh_render() {
 
 /// **The motivating case.** The sync fan-out releases a linked pane's texture,
 /// including the pane past `visible_pane_count` that no frame will ever paint.
-///
-/// The fan-out is the second wholesale writer of a pane's enabled map and it
-/// does not go through `write_pane_overlay` at all — it assigns the map. A
-/// release living only in the toggle path would have a hole exactly the shape of
-/// a split, and on pane 2 that hole is permanent: `render_pane_map_content` is
-/// not run for it, so `ui_map_pane`'s own `!enabled` clear never gets a frame in
-/// which to notice.
 #[test]
 fn the_layer_sync_fan_out_releases_a_hidden_linked_panes_texture() {
     let ctx = egui::Context::default();
@@ -324,7 +247,6 @@ fn the_layer_sync_fan_out_releases_a_hidden_linked_panes_texture() {
         );
     }
 
-    // The source's decision, made the ordinary way.
     toggle(&mut gui, false);
 
     for idx in [1, 2] {
@@ -364,18 +286,6 @@ fn the_layer_sync_fan_out_releases_a_hidden_linked_panes_texture() {
 
 /// The **third** wholesale writer, and the one that does not look like a toggle
 /// at all: a stored config landing mid-session.
-///
-/// `Gui::load_ui_config` assigns `enabled_overlays` from the blob. On web and
-/// Android the store is unreadable when `App::new` runs, so
-/// `App::set_config_dir`'s reload reaches it after frames have been drawn and
-/// textures cached — a restore that turns a layer off has to release it like a
-/// toggle would.
-///
-/// The radar assertion at the end is this test's non-triviality guard and not a
-/// second exclusion check. A restore only *grows* the pane vector and mutates
-/// panes in place, but if it wiped `overlay_textures` wholesale for some
-/// unrelated reason then the alerts assertion would pass with nothing having
-/// been released. It cannot pass alongside a surviving radar raster.
 #[test]
 fn a_config_restored_mid_session_releases_what_it_switches_off() {
     let ctx = egui::Context::default();

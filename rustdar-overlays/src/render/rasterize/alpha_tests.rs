@@ -1,18 +1,10 @@
 //! Which alpha convention each rasterizer writes, checked against the bytes
 //! rather than against the field.
 //!
-//! [`AlphaMode`] exists because this module produces both, and the consumer
-//! (`rustdar_worker::offload::execute`'s convert-inside-the-job seam)
-//! cannot tell them apart by looking: the two conventions are identical bags
-//! of bytes and neither conversion can fail. A wrong declaration is therefore
-//! silent all the way to the screen, where it shows up as every translucent
-//! pixel being the wrong colour — which is a thing nobody diffs.
-//!
-//! So each test below asserts an invariant of the *bytes* that only one
-//! convention can satisfy, and that is what makes the declaration checkable.
-//! Premultiplied RGB is `round(c · a / 255)`, so no channel can exceed alpha;
-//! straight RGB is the colour table's own value, so a bright translucent entry
-//! has channels far above it. One buffer cannot satisfy both.
+//! Each test below asserts an invariant of the *bytes* that only one convention
+//! can satisfy: premultiplied RGB is `round(c · a / 255)`, so no channel can
+//! exceed alpha; straight RGB is the colour table's own value, so a bright
+//! translucent entry has channels far above it. One buffer cannot satisfy both.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -67,12 +59,10 @@ fn alert_fixture() -> AlertPaint {
 
 /// tiny-skia's own layout, unconverted: no channel above alpha.
 ///
-/// Before this, `rasterize_nws_alerts` divided the whole buffer back out to
-/// straight alpha and `ColorImage::from_rgba_unmultiplied` multiplied it
-/// straight back in on the very next statement — 22.3 ms a render at 5760×3240
-/// on the measurement box, plus one lossy `u8` round trip, to arrive where it
-/// started. The buffer is handed over as drawn now, and this is the shape of
-/// "as drawn".
+/// The buffer is handed over as drawn: un-premultiplying it and letting
+/// `ColorImage::from_rgba_unmultiplied` multiply it straight back cost 22.3 ms a
+/// render at 5760×3240, plus one lossy `u8` round trip, to arrive where it
+/// started.
 #[test]
 fn the_polygon_rasterizers_hand_over_premultiplied_pixels() {
     let out = rasterize_nws_alerts(
@@ -117,11 +107,8 @@ fn the_polygon_rasterizers_hand_over_premultiplied_pixels() {
 
 /// **The trap.** `rasterize_model_data` never went through tiny-skia and never
 /// called the un-premultiply, so it was already writing straight alpha while
-/// every neighbour wrote premultiplied-then-converted. It reaches
-/// `offload::execute`'s convert-inside-the-job seam through the same described
-/// arm as the polygon overlays, so one global choice of egui constructor is
-/// wrong about one of them whichever way it is made — and HRRR is the half
-/// that would go wrong silently, because nobody has a reference picture of it.
+/// every neighbour wrote premultiplied. One global choice of egui constructor is
+/// wrong about one of them whichever way it is made.
 ///
 /// The assertion is that the bytes are the palette's own, unscaled: a colour
 /// channel *above* alpha, which premultiplied RGBA cannot represent.
@@ -165,7 +152,6 @@ fn cape_grid() -> HrrrGridData {
     let mut lons = Vec::with_capacity(ni * nj);
     for j in 0..nj {
         for i in 0..ni {
-            // Row 0 is the northern edge, matching the fixture grids next door.
             lats.push(BOUNDS.max_lat - (BOUNDS.max_lat - BOUNDS.min_lat) * (j as f64 / 3.0));
             lons.push(BOUNDS.min_lon + (BOUNDS.max_lon - BOUNDS.min_lon) * (i as f64 / 3.0));
         }

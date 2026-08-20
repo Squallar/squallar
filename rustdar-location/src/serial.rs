@@ -1,21 +1,14 @@
-//! The serial GPS provider, adapted to the fix model: NMEA parsing and the
-//! port transport live in `rustdar-nmea-serial`, which deliberately does not
-//! know this crate's [`Fix`] — this module is where its parsed sentences
-//! become fixes (WO-RL-3 flipped the RL-1 edge; the facade stands on the
-//! provider, never the reverse).
+//! The serial GPS provider, adapted to the fix model: NMEA parsing and the port
+//! transport live in `rustdar-nmea-serial`, which does not know this crate's
+//! [`Fix`] — this module is where parsed sentences become fixes.
 
 use crate::{Fix, FixQuality};
 use rustdar_nmea_serial::{ParsedFix, ParsedQuality, SerialConfig, SerialGpsReader};
 use std::sync::mpsc;
 
-/// What the parser said, as the app's fix model.
-///
-/// The position rides through [`Fix::from_lat_lon`]; the quality named in the
-/// literal overrides the `Gps` that constructor stamps. `accuracy_m` is `None`
-/// because NMEA has no accuracy field — GGA and GSA give HDOP, which is a
-/// geometry factor and not metres, and turning one into the other needs the
-/// receiver's UERE, which it does not report. `None` is the honest answer and
-/// every reader treats it as passing.
+/// What the parser said, as the app's fix model. `accuracy_m` is `None` because
+/// NMEA has no accuracy field: GGA and GSA give HDOP, a geometry factor rather
+/// than metres, and converting needs a UERE the receiver does not report.
 fn fix_from(parsed: ParsedFix) -> Fix {
     Fix {
         altitude_m: parsed.altitude_m,
@@ -31,8 +24,7 @@ fn fix_from(parsed: ParsedFix) -> Fix {
 }
 
 /// The nine GGA quality codes, one to one. Never [`FixQuality::Device`] — that
-/// variant exists for platform location services precisely because no NMEA
-/// receiver can produce it.
+/// variant exists for platform location services, which no NMEA receiver is.
 fn quality_from(quality: ParsedQuality) -> FixQuality {
     match quality {
         ParsedQuality::None => FixQuality::None,
@@ -47,14 +39,10 @@ fn quality_from(quality: ParsedQuality) -> FixQuality {
     }
 }
 
-/// Hand one translated fix to the consumer, and say whether the reader may
-/// keep going.
-///
-/// Split out of the reader callback so the pairing can be tested without a
-/// serial port: the send and the wake are one step, and a wake that gets
-/// separated from its send is a fix that sits in the channel until something
-/// else draws a frame — the exact failure the `wake` parameter exists for.
-/// `false` means the consumer is gone and the reader thread should stop.
+/// Hand one translated fix to the consumer, and say whether the reader may keep
+/// going. Split out so the pairing can be tested without a serial port: the send
+/// and the wake are one step, and a wake separated from its send is a fix
+/// sitting in the channel until something else draws a frame.
 fn deliver(fix: Fix, fix_sender: &mpsc::Sender<Fix>, wake: &impl Fn()) -> bool {
     if fix_sender.send(fix).is_err() {
         return false;
@@ -70,22 +58,13 @@ pub struct SerialFixReader {
 }
 
 impl SerialFixReader {
-    /// Start the serial transport and deliver every parsed sentence as a
-    /// [`Fix`] on `fix_sender`. `None` when no reader could be started.
+    /// Start the serial transport and deliver every parsed sentence as a [`Fix`]
+    /// on `fix_sender`. `None` when no reader could be started.
     ///
-    /// # `wake`
-    ///
-    /// Called after every fix that reaches `fix_sender`, and it is what makes
-    /// the fix *visible*. The frontend runs its event loop on
-    /// `ControlFlow::Wait` and drains this channel only while rendering a
-    /// frame, so a fix pushed from the reader thread while the app is idle
-    /// waits for some unrelated event to produce one — with auto-refresh off,
-    /// that can be the next mouse move, or never.
-    ///
-    /// A bare `impl Fn()` rather than the frontend's `RedrawWaker`: this crate
-    /// is a *dependency* of the frontend and cannot name its types. The
-    /// desktop bridge passes one through; the shape matches
-    /// `ChunkNotifier::sync_sites`, which takes a `wake` for the same reason.
+    /// `wake` is called after every fix that reaches `fix_sender`, and is what
+    /// makes the fix *visible*: the frontend runs on `ControlFlow::Wait` and
+    /// drains this channel only while rendering. A bare `impl Fn()` rather than
+    /// the frontend's `RedrawWaker`, which this crate cannot name.
     pub fn start(
         config: &SerialConfig,
         fix_sender: mpsc::Sender<Fix>,
@@ -102,7 +81,6 @@ impl SerialFixReader {
 mod tests {
     use super::*;
 
-    /// A counting wake, and the count.
     fn counted() -> (
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
         impl Fn() + Send,
@@ -118,10 +96,8 @@ mod tests {
         count.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// The bug this parameter exists for. The consumer drains this channel only
-    /// while drawing a frame, and its loop runs on `ControlFlow::Wait`: a fix
-    /// that lands with nothing else happening sits there until some unrelated
-    /// event draws one.
+    /// The bug this parameter exists for: the consumer drains this channel only
+    /// while drawing a frame, and its loop runs on `ControlFlow::Wait`.
     #[test]
     fn a_fix_arriving_while_the_app_is_idle_asks_for_the_frame_that_shows_it() {
         let (tx, rx) = mpsc::channel();
@@ -153,9 +129,7 @@ mod tests {
         assert_eq!(woke(&woken), 0, "woke the loop for a fix nothing received");
     }
 
-    /// Every field the parser reports survives the translation, and the two
-    /// this module *adds* say what they must: `accuracy_m` is `None` (NMEA has
-    /// no accuracy field) and the position rides `from_lat_lon`.
+    /// `accuracy_m` is `None` because NMEA has no accuracy field.
     #[test]
     fn the_translation_carries_every_parsed_field() {
         let parsed = ParsedFix {
@@ -189,9 +163,8 @@ mod tests {
         assert_eq!(fix.timestamp, expected_timestamp);
     }
 
-    /// The quality mapping is one to one onto the nine GGA codes and never
-    /// invents `Device` — a serial receiver that could claim the platform-
-    /// service variant would sidestep `can_relocate`'s reasoning about it.
+    /// One to one onto the nine GGA codes and never `Device` — a serial receiver
+    /// claiming the platform-service variant would sidestep `can_relocate`.
     #[test]
     fn the_quality_mapping_is_the_gga_table_and_never_device() {
         let all = [

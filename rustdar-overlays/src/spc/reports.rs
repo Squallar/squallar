@@ -53,19 +53,6 @@ pub(crate) fn report_url(
 }
 
 /// What one round of the three CSVs delivered.
-///
-/// The failures used to be dropped on the floor here. `fetch_storm_reports`
-/// refuses the round only when **all three** CSVs failed, which is right — a day
-/// with tornado and hail reports but a wind CSV that would not load is still
-/// worth drawing — but one or two failing then returned a bare `Ok(reports)`,
-/// went through `set_data`, and declared the answer whole. Measured over a
-/// socket: the tornado CSV refused 503, hail and wind fine, and the layer was
-/// indistinguishable from a complete round on every surface a user can see —
-/// health `Ok`, no mark, `Updated 0s ago` — with every tornado report in the
-/// country absent from the map.
-///
-/// Nothing about that is *stale*, so no rung of the health ladder could express
-/// it. It is the coverage axis, and this is what carries it.
 #[derive(Debug)]
 pub struct StormReportRound {
     pub reports: Vec<StormReport>,
@@ -75,22 +62,6 @@ pub struct StormReportRound {
 
 impl StormReportRound {
     /// The layer-agnostic report the UI renders.
-    ///
-    /// A kind is the unit: the three CSVs are three disjoint products, and a
-    /// missing one takes every report of that kind off the map. There is no
-    /// part-drawn case — a CSV either parsed or it did not — and no second
-    /// denominator, because a kind *is* the part.
-    ///
-    /// **A routine 404 is not missing data.** `today_*.csv` is rebuilt each
-    /// convective day and a kind with nothing in it yet simply is not there,
-    /// which [`fetch_csv`] already classifies [`Absent`] — the same "the origin
-    /// answered, and *not published right now* is an answer" that keeps
-    /// [`FetchHealth::Absent`] out of `is_unhealthy`. Counting it here would put
-    /// a fault on the row on every quiet day, and a mark that is on when nothing
-    /// is wrong is a mark nobody reads on the day something is.
-    ///
-    /// [`Absent`]: crate::fetch_policy::FetchFailure::Absent
-    /// [`FetchHealth::Absent`]: crate::fetch_policy::FetchHealth::Absent
     pub fn completeness(&self) -> crate::fetch_policy::DataCompleteness {
         let absent: Vec<&(StormReportKind, FetchError)> = self
             .failed_kinds
@@ -114,14 +85,6 @@ impl StormReportRound {
 }
 
 /// `client` must be the preflight-safe [`crate::spc::fetch::spc_client`].
-///
-/// Three CSVs, and a partial result is a real result — a day with tornado and
-/// hail reports but a wind CSV that would not load is still worth drawing. But
-/// **all three failing is not `Ok(vec![])`**: that is indistinguishable from a
-/// quiet day, and it used to be reported as one, which both hid the outage from
-/// the user and stamped the poll clock as though the fetch had succeeded.
-///
-/// A partial round now says which kind is absent — see [`StormReportRound`].
 pub async fn fetch_storm_reports(
     client: &reqwest::Client,
     sources: &rustdar_source::origins::DataSources,
@@ -164,11 +127,6 @@ pub async fn fetch_storm_reports(
     }
 
     if failed_kinds.len() == 3 {
-        // Every CSV failed. The round's verdict is the merge of all three, not
-        // whichever happened to be listed first: `failures[0]` is always the
-        // tornado CSV, so one 400 there condemned the layer even when hail and
-        // wind had merely timed out. Merged, the round is refused only if all
-        // three were — the rule every other multi-request round here follows.
         let failures: Vec<FetchError> = failed_kinds.into_iter().map(|(_, e)| e).collect();
         return Err(FetchError::of_round(
             &failures,

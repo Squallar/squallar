@@ -10,10 +10,8 @@ pub mod lambert;
 
 use rustdar_geo::GeoBounds;
 
-/// A selectable model parameter to fetch and display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ModelParameter {
-    // --- Instability / Thermodynamics ---
     /// Surface-Based CIN (J/kg, ≤ 0).
     SurfaceBasedCin,
     /// Mixed-Layer CIN (180-0 mb AGL, J/kg, ≤ 0).
@@ -27,7 +25,6 @@ pub enum ModelParameter {
     /// Best Lifted Index (500-1000 mb, K → °C).
     LiftedIndex,
 
-    // --- Helicity / Rotation ---
     /// 0-1 km Storm-Relative Helicity (m²/s²).
     Srh1km,
     /// 0-3 km Storm-Relative Helicity (m²/s²).
@@ -37,30 +34,24 @@ pub enum ModelParameter {
     /// Max Updraft Helicity 0-2 km AGL (m²/s²).
     MaxUH0to2km,
 
-    // --- Wind ---
     /// 0-6 km Bulk Wind Shear magnitude (GRIB U+V m/s → display kt).
-    /// Composite: two records merged into one grid.
     BulkShear6km,
     /// Surface Wind Gust (GRIB m/s → display kt).
     SurfaceWindGust,
 
-    // --- Moisture ---
     /// Precipitable Water (GRIB kg/m² → display in).
     PrecipitableWater,
 
-    // --- Surface ---
     /// 2 m Temperature (GRIB K → display °F).
     Temperature2m,
     /// 2 m Dewpoint (GRIB K → display °F).
     Dewpoint2m,
 
-    // --- Visibility ---
     /// Surface Visibility (GRIB m → display mi).
     Visibility,
 }
 
 impl ModelParameter {
-    /// All available parameters.
     pub const fn all() -> &'static [ModelParameter] {
         &[
             ModelParameter::SurfaceBasedCin,
@@ -84,16 +75,11 @@ impl ModelParameter {
 
     /// Which forecast hour of the run to fetch this parameter from. f00, the
     /// analysis, for every instantaneous field.
-    ///
-    /// **`MXUPHL` at f00 is identically 0.0 everywhere.** It is a maximum over
-    /// the forecast period, and at f00 that period has zero length: the `.idx`
-    /// entry reads `0-0 day max fcst` and the record is 212 bytes of GRIB2 whose
-    /// Section 5 carries `nbits=0, R=0.0, E=0, D=0` — a constant field at all
-    /// 1,905,141 points. It decodes cleanly and renders as nothing, forever.
-    ///
-    /// f01 is the first hour with a real window (`0-1 hour max fcst`). That
-    /// costs an hour of latency, which is why [`HrrrGridData::forecast_hour`]
-    /// reaches the UI: a 0-1 h maximum must not be presented as the analysis.
+    /// **`MXUPHL` at f00 is identically 0.0 everywhere**: it is a maximum over
+    /// the forecast period, and at f00 that period has zero length. f01 is the
+    /// first hour with a real window (`0-1 hour max fcst`), which is why
+    /// [`HrrrGridData::forecast_hour`] reaches the UI: a 0-1 h maximum must not
+    /// be presented as the analysis.
     pub fn forecast_hour(&self) -> u8 {
         match self {
             ModelParameter::MaxUH2to5km | ModelParameter::MaxUH0to2km => 1,
@@ -101,8 +87,6 @@ impl ModelParameter {
         }
     }
 
-    /// Accumulation/maximum rather than instantaneous. Only meaningful from a
-    /// forecast hour with a nonzero window — see [`Self::forecast_hour`].
     pub fn is_windowed(&self) -> bool {
         matches!(
             self,
@@ -110,15 +94,12 @@ impl ModelParameter {
         )
     }
 
-    /// Whether this parameter requires multiple fetches that are
-    /// merged into a single grid (e.g. U+V shear components → magnitude).
     pub fn is_composite(&self) -> bool {
         matches!(self, ModelParameter::BulkShear6km)
     }
 
-    /// For composite parameters, returns the (var, level) pairs to fetch.
-    /// Each pair selects one GRIB2 record; values are merged in
-    /// `fetch::fetch_composite_hrrr_data()`.
+    /// For composite parameters, the (var, level) pairs to fetch; values are
+    /// merged in `fetch::fetch_composite_hrrr_data()`.
     pub fn composite_parts(&self) -> Option<Vec<(&'static str, &'static str)>> {
         match self {
             ModelParameter::BulkShear6km => Some(vec![
@@ -129,10 +110,8 @@ impl ModelParameter {
         }
     }
 
-    /// The GRIB2 variable abbreviation, exactly as the `.idx` spells it — these
-    /// are matched literally by [`crate::hrrr::fetch::byte_range`], not
-    /// normalised. Panics for composite parameters; use
-    /// [`Self::composite_parts`].
+    /// The GRIB2 variable abbreviation, exactly as the `.idx` spells it — matched
+    /// literally, not normalised. Panics for composite parameters.
     pub fn grib_var(&self) -> &'static str {
         match self {
             ModelParameter::SurfaceBasedCin | ModelParameter::MixedLayerCin => "CIN",
@@ -153,9 +132,6 @@ impl ModelParameter {
         }
     }
 
-    /// The GRIB2 level description, exactly as the `.idx` spells it.
-    ///
-    /// Panics for composite parameters.
     pub fn grib_level(&self) -> &'static str {
         match self {
             ModelParameter::SurfaceBasedCin
@@ -170,11 +146,9 @@ impl ModelParameter {
             ModelParameter::Srh1km => "1000-0 m above ground",
             ModelParameter::Srh3km => "3000-0 m above ground",
             // MXUPHL layers are top-bound-first in the `.idx`. Do not
-            // "normalise" them to match the ascending layers elsewhere in this
-            // match: HRRR is not self-consistent about bound order
-            // (`VUCSH:0-6000` and `CAPE:0-3000 m` are bottom-first, `HLCY:3000-0`
-            // and these are top-first) and the index is matched literally, so an
-            // ascending spelling selects no record at all.
+            // "normalise" them to match the ascending layers elsewhere: HRRR is
+            // not self-consistent about bound order and the index is matched
+            // literally, so an ascending spelling selects no record at all.
             ModelParameter::MaxUH2to5km => "5000-2000 m above ground",
             ModelParameter::MaxUH0to2km => "2000-0 m above ground",
             ModelParameter::PrecipitableWater => "entire atmosphere (considered as a single layer)",
@@ -185,7 +159,6 @@ impl ModelParameter {
         }
     }
 
-    /// Human-readable display name.
     pub fn display_name(&self) -> &'static str {
         match self {
             ModelParameter::SurfaceBasedCin => "Surface-Based CIN",
@@ -207,7 +180,6 @@ impl ModelParameter {
         }
     }
 
-    /// Short label for the parameter.
     pub fn short_name(&self) -> &'static str {
         match self {
             ModelParameter::SurfaceBasedCin => "SBCIN",
@@ -229,7 +201,6 @@ impl ModelParameter {
         }
     }
 
-    /// Unit label for display (after conversion).
     pub fn unit_label(&self) -> &'static str {
         match self {
             ModelParameter::SurfaceBasedCin
@@ -249,16 +220,11 @@ impl ModelParameter {
         }
     }
 
-    /// Convert a raw GRIB2 value to display units.
-    ///
-    /// CIN/CAPE/SRH/UH are identity (already in display units).
-    /// Wind: m/s → knots. Temperature: K → °F. PWAT: kg/m² → inches.
-    /// Visibility: m → statute miles.
-    /// Lifted Index: K → °C (GRIB2 LFTX is a temperature differential stored in K;
-    /// the numeric value is already equivalent to °C since it's a delta).
+    /// Convert a raw GRIB2 value to display units: identity for CIN/CAPE/SRH/UH,
+    /// m/s → kt, K → °F, kg/m² → in, m → mi, and K → °C for LFTX (a temperature
+    /// differential, so the number is already °C).
     pub fn convert_for_display(&self, value: f32) -> f32 {
         match self {
-            // Identity — already in display units.
             ModelParameter::SurfaceBasedCin
             | ModelParameter::MixedLayerCin
             | ModelParameter::SurfaceBasedCape
@@ -270,23 +236,17 @@ impl ModelParameter {
             | ModelParameter::MaxUH0to2km => value,
             // LFTX is a temperature *difference* so K ≡ °C.
             ModelParameter::LiftedIndex => value,
-            // m/s → knots.
             ModelParameter::BulkShear6km | ModelParameter::SurfaceWindGust => value * 1.94384,
-            // kg/m² (≈ mm) → inches.
             ModelParameter::PrecipitableWater => value / 25.4,
-            // K → °F.
             ModelParameter::Temperature2m | ModelParameter::Dewpoint2m => {
                 value * 9.0 / 5.0 - 459.67
             }
-            // m → statute miles.
             ModelParameter::Visibility => value / 1609.344,
         }
     }
 
-    /// Format a grid value (in raw GRIB2 units) for hover tooltip display.
-    ///
-    /// Returns an empty string for a non-finite value: a missing grid point
-    /// has no reading to report.
+    /// Format a grid value (raw GRIB2 units) for hover tooltip display. Empty
+    /// for a non-finite value: a missing grid point has no reading to report.
     pub fn format_value(&self, value: f32) -> String {
         if !value.is_finite() {
             return String::new();
@@ -294,13 +254,11 @@ impl ModelParameter {
         format!("{}: {}", self.short_name(), self.format_magnitude(value))
     }
 
-    /// Format a grid value (raw GRIB2 units) as a bare magnitude with units,
-    /// e.g. `"0 m²/s²"` — no parameter name. Used where the parameter is
+    /// A bare magnitude with units, e.g. `"0 m²/s²"`, where the parameter is
     /// already named by surrounding text.
     pub fn format_magnitude(&self, value: f32) -> String {
         let display = self.convert_for_display(value);
         match self {
-            // 0 decimal places for most.
             ModelParameter::SurfaceBasedCin
             | ModelParameter::MixedLayerCin
             | ModelParameter::SurfaceBasedCape
@@ -316,11 +274,9 @@ impl ModelParameter {
             | ModelParameter::Dewpoint2m => {
                 format!("{:.0} {}", display, self.unit_label())
             }
-            // 1 decimal for LI.
             ModelParameter::LiftedIndex => {
                 format!("{:.1} {}", display, self.unit_label())
             }
-            // 2 decimal places for PWAT / visibility.
             ModelParameter::PrecipitableWater | ModelParameter::Visibility => {
                 format!("{:.2} {}", display, self.unit_label())
             }
@@ -329,15 +285,9 @@ impl ModelParameter {
 
     /// Map a raw GRIB2 value to an RGBA color for rendering.
     ///
-    /// Converts to display units first so all color thresholds are in
-    /// human-readable units.
-    ///
-    /// The NaN guard is load-bearing. Every ramp below is a descending `if`
-    /// chain ending in an unguarded `else`, NaN fails every comparison, and
-    /// `((NaN - 200.0) / 300.0).min(1.0)` is `1.0` because `f32::min` returns the
-    /// non-NaN operand — so a missing point would paint the *most extreme*
-    /// colour on the scale (opaque dark purple for CIN, >110 °F red for
-    /// temperature) under a tooltip `format_value` leaves blank.
+    /// The NaN guard is load-bearing: every ramp below is a descending `if`
+    /// chain ending in an unguarded `else` and NaN fails every comparison, so a
+    /// missing point would paint the *most extreme* colour on the scale.
     pub fn color_for_value(&self, value: f32) -> [u8; 4] {
         if !value.is_finite() {
             return [0, 0, 0, 0];
@@ -362,7 +312,6 @@ impl ModelParameter {
         }
     }
 
-    /// Serialization key for config persistence.
     pub fn as_str(&self) -> &'static str {
         match self {
             ModelParameter::SurfaceBasedCin => "sbcin",
@@ -384,8 +333,6 @@ impl ModelParameter {
         }
     }
 
-    /// Color thresholds for the legend scale (in display units).
-    /// Returns `(value, [r, g, b])` pairs in ascending order.
     pub fn legend_thresholds(&self) -> Vec<(f32, [u8; 3])> {
         match self {
             ModelParameter::SurfaceBasedCin | ModelParameter::MixedLayerCin => {
@@ -410,7 +357,6 @@ impl ModelParameter {
                 ]
             }
             ModelParameter::LiftedIndex => {
-                // More negative = more unstable.
                 vec![
                     (-10.0, [180, 0, 200]),
                     (-6.0, [220, 50, 50]),
@@ -508,8 +454,7 @@ impl std::str::FromStr for ModelParameter {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
             // Explicit even though the fallback yields the same value: relying
-            // on the coincidence made the `as_str()` round-trip look total when
-            // it was not, and hid every unrecognised key behind a silent SBCIN.
+            // on the coincidence hid every unrecognised key behind a silent SBCIN.
             "sbcin" => ModelParameter::SurfaceBasedCin,
             "mlcin" => ModelParameter::MixedLayerCin,
             "sbcape" => ModelParameter::SurfaceBasedCape,
@@ -526,8 +471,7 @@ impl std::str::FromStr for ModelParameter {
             "t2m" => ModelParameter::Temperature2m,
             "td2m" => ModelParameter::Dewpoint2m,
             "vis" => ModelParameter::Visibility,
-            // Deliberately infallible — this parses persisted UI config, where
-            // refusing to start over one bad key is worse — but audible.
+            // Deliberately infallible — this parses persisted UI config — but audible.
             other => {
                 log::warn!(
                     "Unknown HRRR model parameter {other:?} in saved config; \
@@ -542,35 +486,25 @@ impl std::str::FromStr for ModelParameter {
 
 /// Color scale for CIN (Convective Inhibition).
 ///
-/// CIN values are ≤ 0 J/kg. More negative = stronger cap (more inhibition).
-/// - 0 to −25: transparent (negligible)
-/// - −25 to −50: light green (weak cap)
-/// - −50 to −100: yellow (moderate cap)
-/// - −100 to −200: orange (strong cap)
-/// - −200 to −500+: red/dark red (extreme cap)
+/// CIN values are ≤ 0 J/kg; more negative = stronger cap. Transparent to −25,
+/// light green to −50, yellow to −100, orange to −200, red/dark purple beyond.
 fn cin_color(value: f32) -> [u8; 4] {
     const ALPHA: u8 = 160;
 
-    // CIN is ≤ 0; we work with the magnitude for thresholding.
     let mag = -value;
 
     if mag < 25.0 {
-        // Negligible CIN — transparent.
         [0, 0, 0, 0]
     } else if mag < 50.0 {
-        // Weak cap: light green.
         let t = (mag - 25.0) / 25.0;
         lerp_color([144, 238, 144, ALPHA], [255, 255, 100, ALPHA], t)
     } else if mag < 100.0 {
-        // Moderate cap: yellow → orange.
         let t = (mag - 50.0) / 50.0;
         lerp_color([255, 255, 100, ALPHA], [255, 165, 0, ALPHA], t)
     } else if mag < 200.0 {
-        // Strong cap: orange → red.
         let t = (mag - 100.0) / 100.0;
         lerp_color([255, 165, 0, ALPHA], [220, 50, 50, ALPHA], t)
     } else {
-        // Extreme cap: red → dark purple.
         let t = ((mag - 200.0) / 300.0).min(1.0);
         lerp_color([220, 50, 50, ALPHA], [128, 0, 128, ALPHA], t)
     }
@@ -896,7 +830,6 @@ fn visibility_color(mi: f32) -> [u8; 4] {
     }
 }
 
-/// Linear interpolation between two RGBA colors.
 fn lerp_color(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
     let t = t.clamp(0.0, 1.0);
     [
@@ -912,30 +845,17 @@ fn lerp_color(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
 /// HRRR is 1,905,141 points, so a materialised `lats`/`lons` pair is 30.5 MB
 /// *per cached parameter*, on targets with a 4 GiB address space (wasm32) or a
 /// hard per-app cap (Android). The Lambert case rebuilds any point from the
-/// projection constants instead, which is every point HRRR has ever returned;
-/// see [`lambert::LambertGrid`].
-///
-/// [`crate::render::handlers`] used to cache one grid per parameter with **no
-/// eviction**, which made that 30.5 MB a per-parameter leak; it is bounded now
-/// by `MODEL_GRID_CACHE_ENTRIES`, sized to the pane count. The figure above is
-/// still what one resident grid costs on this arm — it is the multiplier that
-/// stopped being unbounded, not the cost.
+/// projection constants instead; see [`lambert::LambertGrid`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum GridCoords {
-    /// GRIB2 template 3.30 — computed on demand from section 3.
     Lambert(lambert::LambertGrid),
-    /// Any other template, where the coordinates come out of grib itself and
-    /// there is no closed form here to recompute them from.
     Explicit {
-        /// Latitude of each grid point.
         lats: Vec<f64>,
-        /// Longitude of each grid point.
         lons: Vec<f64>,
     },
 }
 
 impl GridCoords {
-    /// Number of grid points.
     pub fn len(&self) -> usize {
         match self {
             GridCoords::Lambert(g) => g.len(),
@@ -943,12 +863,10 @@ impl GridCoords {
         }
     }
 
-    /// Whether the grid carries no points at all.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Lat/lon of the `index`-th decoded value, or `None` past the end.
     pub fn at(&self, index: usize) -> Option<(f64, f64)> {
         match self {
             GridCoords::Lambert(g) => g.latlon_at(index),
@@ -956,18 +874,10 @@ impl GridCoords {
         }
     }
 
-    /// Fractional `(i_min, i_max, j_min, j_max)` bounding every grid point
-    /// inside `bounds`, or `None` when there is no cheaper answer than "all of
-    /// them".
-    ///
-    /// Only the Lambert case answers: [`GridCoords::at`] is a slice index for
-    /// the explicit case, so there is nothing to save, and the closed form
-    /// [`lambert::LambertGrid::index_bounds`] uses does not exist for a grid
-    /// whose coordinates arrived as two arrays.
-    ///
-    /// `ni`/`nj` are the *caller's* grid shape: the result is stated in the
-    /// caller's `j * ni + i` terms, so a scan order or shape that does not
-    /// match that is refused rather than answered wrongly.
+    /// Fractional `(i_min, i_max, j_min, j_max)` bounding every grid point inside
+    /// `bounds`, or `None` when there is no cheaper answer than all. Only the
+    /// Lambert case answers, and `ni`/`nj` are the *caller's* grid shape, so a
+    /// shape that does not match is refused rather than answered wrongly.
     pub fn index_bounds(
         &self,
         bounds: &GeoBounds,
@@ -985,8 +895,7 @@ impl GridCoords {
         }
     }
 
-    /// Upper bound on how many degrees one grid cell spans near `lat`, or
-    /// `None` when the grid cannot say — see
+    /// Upper bound on how many degrees one grid cell spans near `lat` — see
     /// [`lambert::LambertGrid::cell_span_degrees`].
     pub fn cell_span_degrees(&self, lat: f64) -> Option<f64> {
         match self {
@@ -996,8 +905,7 @@ impl GridCoords {
     }
 
     /// Whether adjacent grid points can jump most of a turn in longitude — see
-    /// [`lambert::LambertGrid::wraps_longitude`]. Always `false` for the
-    /// explicit case, which is never narrowed anyway.
+    /// [`lambert::LambertGrid::wraps_longitude`]. Always `false` for `Explicit`.
     pub fn wraps_longitude(&self) -> bool {
         match self {
             GridCoords::Lambert(g) => g.wraps_longitude(),
@@ -1005,11 +913,9 @@ impl GridCoords {
         }
     }
 
-    /// Index of the grid point nearest `(lat, lon)`, or `None` when the grid
-    /// does not cover it.
-    ///
-    /// O(1) for a Lambert grid — the flat scan it replaces ran over all
-    /// 1.9 M points on every hover frame.
+    /// Index of the grid point nearest `(lat, lon)`, or `None` when the grid does
+    /// not cover it. O(1) for a Lambert grid — the flat scan it replaces ran over
+    /// all 1.9 M points on every hover frame.
     pub fn nearest(&self, lat: f64, lon: f64) -> Option<usize> {
         match self {
             GridCoords::Lambert(g) => g.nearest(lat, lon),
@@ -1030,53 +936,35 @@ impl GridCoords {
     }
 }
 
-/// Parsed HRRR grid data for a single model parameter.
-///
-/// `PartialEq` is for the described-overlay wire tests, which compare whole
-/// requests; it is derived and carries the usual `f64`/`f32` caveat that
-/// `NaN != NaN`.
+/// `PartialEq` is derived for the described-overlay wire tests and carries the
+/// usual `NaN != NaN` caveat.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HrrrGridData {
-    /// Which parameter this grid represents.
     pub parameter: ModelParameter,
-    /// Grid point values in row-major order (nj rows × ni columns).
-    /// NaN for missing/undefined points.
     pub values: Vec<f32>,
-    /// How to get the lat/lon of grid point `i`.
     pub coords: GridCoords,
-    /// Number of columns in the grid.
     pub ni: usize,
-    /// Number of rows in the grid.
     pub nj: usize,
-    /// Geographic bounds enclosing all grid points.
     pub bounds: GeoBounds,
-    /// Model reference time (UTC) — the run time, not the valid time.
     pub ref_time: chrono::NaiveDateTime,
     /// Forecast hour this grid came from. 0 is the analysis; see
     /// [`ModelParameter::forecast_hour`] for why UH is not 0.
     pub forecast_hour: u8,
-    /// How many grid points map to a non-transparent colour, i.e. how many
-    /// will actually be painted. Computed once at parse time by
-    /// [`summarize_values`]; see [`HrrrGridData::blank_notice`].
+    /// How many grid points map to a non-transparent colour; computed once at
+    /// parse time. See [`HrrrGridData::blank_notice`].
     pub visible_points: usize,
-    /// `(min, max)` over the finite values, or `None` if none are finite.
     pub value_range: Option<(f32, f32)>,
 }
 
 impl HrrrGridData {
-    /// Valid time of this grid: the run time plus the forecast hour.
     pub fn valid_time(&self) -> chrono::NaiveDateTime {
         self.ref_time + chrono::Duration::hours(self.forecast_hour as i64)
     }
 
-    /// Explain why this grid will render as nothing, when it will. `None` when
-    /// at least one point is visible.
-    ///
-    /// A field that decodes perfectly but paints zero pixels is
-    /// indistinguishable on screen from a fetch that never happened, which is
-    /// how a dead feed survives unnoticed. Distinguishes a genuinely uniform
-    /// field from one that never crosses the lowest colour threshold — those
-    /// mean different things to a forecaster.
+    /// Explain why this grid will render as nothing, when it will. A field that
+    /// decodes perfectly but paints zero pixels is indistinguishable on screen
+    /// from a fetch that never happened; this also separates a genuinely uniform
+    /// field from one that never crosses the lowest colour threshold.
     pub fn blank_notice(&self) -> Option<String> {
         if self.visible_points > 0 {
             return None;
@@ -1098,9 +986,8 @@ impl HrrrGridData {
     }
 }
 
-/// One pass for the render-coverage summary on [`HrrrGridData`]: how many
-/// points will be painted, and the range of the finite values. Non-finite points
-/// are missing data, not readings — excluded from both.
+/// One pass for the render-coverage summary on [`HrrrGridData`]. Non-finite
+/// points are missing data, not readings — excluded from both figures.
 pub fn summarize_values(values: &[f32], param: ModelParameter) -> (usize, Option<(f32, f32)>) {
     let mut visible = 0usize;
     let mut range: Option<(f32, f32)> = None;
@@ -1119,24 +1006,11 @@ pub fn summarize_values(values: &[f32], param: ModelParameter) -> (usize, Option
     (visible, range)
 }
 
-/// Type-erased fetch result wrapper for the overlay handler.
-///
-/// The error carries its own verdict — see [`crate::fetch_policy`]. It was a
-/// `String`, which left the handler nothing to classify by, so every HRRR
-/// failure was recorded as `Transient` and the layer could never come off the
-/// poll however permanently NOMADS had moved.
 pub struct HrrrFetchResult(pub Result<HrrrGridData, crate::fetch_policy::FetchError>);
 
-/// **[`Whole`], and the counter-example worth stating.**
-///
-/// This round asks NOMADS for two candidate model runs an hour apart and keeps
-/// whichever answers — so it is several requests, and it is still not
-/// assembled. Either run alone is the same product and a complete answer to the
-/// question the layer asked; a round that fell back to the older one has not
-/// left anything off the map, it has answered with an hour-old forecast and
-/// says so in its own valid time. Nothing is missing from what it drew, so
-/// there is nothing for a coverage report to hold, and a design that made this
-/// layer file one would be a design this layer got worked around.
+/// **[`Whole`], not assembled.** The round asks NOMADS for two candidate runs an
+/// hour apart and keeps whichever answers, but either alone is the same product
+/// and a complete answer to the question the layer asked.
 ///
 /// [`Whole`]: crate::fetch_policy::Whole
 impl crate::fetch_policy::FetchRound for HrrrFetchResult {
@@ -1147,8 +1021,6 @@ impl crate::fetch_policy::FetchRound for HrrrFetchResult {
 mod tests {
     use super::*;
 
-    /// Build a 2×2 grid of `values` for `param`, summarised the same way the
-    /// fetch path summarises a real one.
     fn grid(param: ModelParameter, values: Vec<f32>) -> HrrrGridData {
         let n = values.len();
         let (visible_points, value_range) = summarize_values(&values, param);
@@ -1177,9 +1049,8 @@ mod tests {
         }
     }
 
-    /// The f00 failure mode, reproduced: `MXUPHL` at f00 decodes to exactly
-    /// 0.0 at every point. It must announce itself rather than rendering an
-    /// empty map with no explanation.
+    /// The f00 failure mode: `MXUPHL` at f00 decodes to exactly 0.0 at every
+    /// point, and must announce itself rather than rendering an empty map.
     #[test]
     fn a_uniformly_zero_field_says_so_instead_of_rendering_nothing() {
         let g = grid(ModelParameter::MaxUH2to5km, vec![0.0; 4]);
@@ -1190,12 +1061,8 @@ mod tests {
         assert!(notice.contains("0 m\u{b2}/s\u{b2}"), "{notice}");
     }
 
-    /// A varying field that never crosses the lowest colour threshold is also
-    /// blank, but means something different — and must not be reported as
-    /// uniform.
     #[test]
     fn a_below_threshold_field_reports_its_range_not_uniformity() {
-        // uh_color is transparent below 25 m²/s².
         let g = grid(ModelParameter::MaxUH2to5km, vec![1.0, 5.0, 9.0, 24.0]);
         assert_eq!(g.visible_points, 0);
         let notice = g.blank_notice().expect("blank grid must explain itself");
@@ -1205,7 +1072,6 @@ mod tests {
         assert!(!notice.contains("uniformly"), "{notice}");
     }
 
-    /// A grid with anything visible is not blank and must stay quiet.
     #[test]
     fn a_field_with_visible_points_produces_no_notice() {
         let g = grid(ModelParameter::MaxUH2to5km, vec![0.0, 0.0, 0.0, 120.0]);
@@ -1213,7 +1079,6 @@ mod tests {
         assert_eq!(g.blank_notice(), None);
     }
 
-    /// An all-missing grid has no range to report and must not claim one.
     #[test]
     fn an_all_nan_field_reports_no_usable_values() {
         let g = grid(ModelParameter::MaxUH2to5km, vec![f32::NAN; 4]);
@@ -1247,8 +1112,6 @@ mod tests {
         );
     }
 
-    /// `format_value` keeps its tooltip prefix; `format_magnitude` is the bare
-    /// reading the blank notice embeds mid-sentence.
     #[test]
     fn format_magnitude_omits_the_name_that_format_value_prepends() {
         let p = ModelParameter::MaxUH2to5km;
@@ -1260,11 +1123,6 @@ mod tests {
         );
     }
 
-    /// Every parameter must survive the config round-trip on its own merits.
-    ///
-    /// This passed before only because the unmatched-key fallback happened to
-    /// be SBCIN, the one key with no arm — so the coverage was accidental and
-    /// would have broken the moment the fallback changed.
     #[test]
     fn every_parameter_round_trips_through_its_config_key() {
         for param in ModelParameter::all() {
@@ -1278,7 +1136,6 @@ mod tests {
         }
     }
 
-    /// Config keys must be distinct, or a round-trip silently retargets.
     #[test]
     fn config_keys_are_unique() {
         let mut keys: Vec<&str> = ModelParameter::all().iter().map(|p| p.as_str()).collect();
@@ -1288,7 +1145,6 @@ mod tests {
         assert_eq!(keys.len(), total, "duplicate config key among {keys:?}");
     }
 
-    // ── GridCoords ────────────────────────────────────────────────────────
 
     fn explicit() -> GridCoords {
         GridCoords::Explicit {
@@ -1307,8 +1163,7 @@ mod tests {
         assert_eq!(c.at(4), None, "one past the end must not wrap");
     }
 
-    /// A ragged pair — one array shorter than the other — must report the
-    /// shorter length rather than hand out an index only one side has.
+    /// A ragged pair must report the shorter length, not an index one side lacks.
     #[test]
     fn explicit_coords_are_bounded_by_the_shorter_array() {
         let c = GridCoords::Explicit {
@@ -1330,8 +1185,6 @@ mod tests {
         assert_eq!(c.nearest(35.0, -97.0), None);
     }
 
-    /// The scan must return the *closest* point, not the first one it sees —
-    /// the probe below sits nearest the last of the four.
     #[test]
     fn explicit_nearest_picks_the_closest_point_not_the_first() {
         let c = explicit();
@@ -1341,7 +1194,6 @@ mod tests {
         assert_eq!(c.nearest(35.099, -97.099), Some(2));
     }
 
-    /// A missing point has no reading to report.
     #[test]
     fn format_value_is_empty_for_non_finite_readings() {
         for p in ModelParameter::all() {

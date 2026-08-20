@@ -1,28 +1,13 @@
 //! A native-geometry volume sampler: point queries against the sweeps a
 //! `Scan` already holds, with no resampling grid in between.
 //!
-//! Everything this crate draws today rasterizes *from* the radials outward —
-//! walk the gates, paint where each one lands. A cross-section and a voxel
-//! grid need the opposite direction: given a place, what did the radar measure
-//! there. [`VolumeSampler`] is that direction, and it borrows the [`Scan`]
-//! rather than gridding it, because a 15-tilt volume is ~10 M gates and the
-//! answer to any one query touches six of them.
-//!
-//! # What a query costs, and why [`VolumeSampler::column`] exists
+//! It borrows the [`Scan`] rather than gridding it, because a 15-tilt volume
+//! is ~10 M gates and the answer to any one query touches six of them.
 //!
 //! One rung costs four gate reads — a bilinear in azimuth × slant range — and
-//! a whole column is one of those per rung, `4·N`, ~64 on a 16-rung VCP 212
-//! ladder. Every height after the first is then free: it is a two-point lerp
-//! between rungs already sampled, and reads no gates at all.
-//!
-//! [`VolumeSampler::sample`] answers one point by building the column and
-//! asking it, so a `W × H` section evaluated per pixel is `W·H·4·N` gate reads
-//! against `W·4·N` for one column per output column — an **`H`-fold** saving,
-//! 1024× on a 1024-row section. (The plan's "~8×" compares against a
-//! per-pixel path that computed only the bracketing pair; this one does not,
-//! deliberately — see [`VolumeSampler::sample`].) Both consumers on the way,
-//! the cross-section rasterizer and the voxel builder, are column-shaped, so
-//! the primitive is here rather than duplicated in each.
+//! a whole column is `4·N`, ~64 on a 16-rung VCP 212 ladder. Every height
+//! after the first is a two-point lerp between rungs already sampled and
+//! reads no gates, so a `W × H` section costs `W·4·N` rather than `W·H·4·N`.
 //!
 //! # The tilt ladder
 //!
@@ -37,122 +22,44 @@
 //! Group by **exact** `key`; one rung per group, ascending. Within a rung, per
 //! moment, newest-first in volume order: a non-Doppler moment prefers a sweep
 //! whose radials carry **no** velocity (falling back to any), a Doppler moment
-//! (velocity, spectrum width) takes any. The rung's *geometric* elevation is
+//! takes any. The rung's *geometric* elevation is
 //! [`crate::volumetric::sweep_elevation_deg`] of the chosen sweep — the
 //! nominal cut angle is the **grouping key only**, since measured medians sit
-//! up to 0.044° off it.
+//! up to 0.044° off it. Scored against the VCP's own cut table this is 0
+//! violations on all 203 volumes and on a frozen-rule 30-site holdout.
 //!
-//! Scored against the VCP's own cut table this is **0 violations on all 203
-//! volumes**, on all 19 mid-flight-join and 19 abandoned-tail variants, and on
-//! a frozen-rule holdout of 30 untouched sites on a different day.
-//! `elevation_number()` indexes the cut table on 203/203 sweeps: the RDA
-//! already says which cut a sweep belongs to, so no angular inference is
-//! needed.
+//! **No angular threshold can work.** KBMX (VCP 212, adaptive base tilt)
+//! declares genuine cuts at 0.40° and 0.48° — 0.09° apart — while the spread
+//! of first-radial angles *within* the 0.48° cut is 0.088° and the gap *to*
+//! the 0.40° cut is also 0.088°. At a 0.2° merge threshold the whole 0.48°
+//! cut **vanishes**. Thresholds of 0.10/0.15/0.20/0.30 failed 1/2/2/3 of 19
+//! detailed volumes and 12 of 124 in the survey.
 //!
-//! **No angular threshold can work, and this is why it is not a matter of
-//! taste.** KBMX (VCP 212, adaptive base tilt) declares genuine cuts at 0.40°
-//! and 0.48° — 0.09° apart — while the spread of first-radial angles *within*
-//! the 0.48° cut is 0.088° and the gap *to* the 0.40° cut is also 0.088°. The
-//! windows touch exactly. At a 0.2° merge threshold the rule does not fuse two
-//! rungs, it makes the whole 0.48° cut **vanish**, leaving a plausible
-//! 14-rung monotone ladder with reflectivity on every rung and one genuine cut
-//! silently deleted. Thresholds of 0.10/0.15/0.20/0.30 failed 1/2/2/3 of 19
-//! detailed volumes and 12 of 124 in the survey, reproduced independently on
-//! the holdout at KDGX. `the_ladder_separates_cuts_no_angular_threshold_can`
-//! reproduces the KBMX geometry and pins both halves.
-//!
-//! **[`crate::volumetric::VolumeCube`]'s rule must not be copied.** It keys
-//! rungs on the median radial angle rounded to 0.1°, which violates the cut
-//! table on **all 203** volumes — 398 short-half reflectivity, 24 split-cut,
-//! 20 rung-count. That is not a live bug for echo tops and VIL, whose grid
-//! stops at 230 km while the Doppler half reaches 300 km, so the short half is
-//! never the half that matters there. A sampler reaching past 300 km has no
-//! such protection.
-//!
-//! # This module reads the VCP, and that is why it fails loudly
-//!
-//! An earlier draft of this work said the coverage pattern was *deliberately*
-//! not read, so that the reconstructed scan a render worker rebuilds from
-//! [`crate::render_input::RenderInput`] would sample identically to the main
-//! thread's. The ladder measurement reversed that: the cut table is the only
-//! thing that separates KBMX's two base tilts, so the VCP has to be read and
-//! therefore has to cross the worker boundary.
-//!
-//! It crosses it now. `RenderInput` has carried the cut angles since format
-//! version 6 — the payload is on 9 — and `coverage_pattern` rebuilds the real
-//! table from them, falling back to `placeholder_coverage_pattern` only when a
-//! sweep is missing an angle, because a table with a hole in it would key some
-//! sweeps and mis-key the rest.
-//! `a_reconstructed_render_input_scan_builds_the_identical_ladder` pins that
-//! over the sampler's whole `Debug` ladder — product, rung count, each rung's
-//! geometric elevation in cut order, each rung's wrap-corrected nominal key —
-//! and does it through the bytes rather than through `to_scan`.
-//!
-//! The refusal that stood in for that test survives for the case that is
-//! genuinely empty: a volume joined mid-flight has no cut table yet, so there
-//! is nothing for the payload to carry. [`VolumeSampler::new`] **refuses** an
-//! empty cut table and an `elevation_number` that does not index it, returns a
-//! [`SamplerError`] saying which, and logs it — faithfully unusable in the
-//! worker rather than quietly wrong, which is the silent-divergence class this
-//! whole feature exists to avoid, and which
-//! `a_payload_from_a_volume_with_no_cut_table_is_still_refused` pins.
-//!
-//! # Two more deliberate omissions
+//! **[`crate::volumetric::VolumeCube`]'s rule must not be copied.** Keying
+//! rungs on the median radial angle rounded to 0.1° violates the cut table on
+//! all 203 volumes; it is harmless there only because that grid stops at
+//! 230 km, and a sampler reaching past 300 km has no such protection.
 //!
 //! [`crate::hca::merge_split_cut_doppler`] is **not** used to fill a
-//! surveillance rung's missing velocity. It clones every radial it merges — a
-//! second full copy of the volume — which is affordable for the HHC's one
-//! 230 km composite and is not affordable per rung. A Doppler moment gets its
-//! own rung from its own cut instead, which is what the ladder rule already
-//! produces.
-//!
-//! [`nexrad_model`]'s `SweepField` is not used either. Its elevation key is
+//! surveillance rung's missing velocity: it clones every radial it merges.
+//! [`nexrad_model`]'s `SweepField` is not used either — its elevation key is
 //! the *first* radial's angle, its `value_at_polar` is nearest-azimuth with a
-//! **floor**ed gate index (a fixed 125 m inward bias), and building one eagerly
-//! decodes ~100 MB.
+//! **floor**ed gate index (a fixed 125 m inward bias), and building one
+//! eagerly decodes ~100 MB.
 //!
-//! # Geometry
+//! Geometry all comes from [`crate::beam`] — 4/3 earth, quadratic height, and
+//! for the horizontal the spherical arc and its closed-form inverse. A query
+//! names a **ground** range and [`beam::slant_range_for_ground_km`] converts
+//! it to the slant range a gate was measured at, the same conversion the plan
+//! view uses.
 //!
-//! All of it comes from [`crate::beam`] — 4/3 earth, quadratic height, and for
-//! the horizontal the spherical arc and its closed-form inverse. A query here
-//! names a **ground** range and [`beam::slant_range_for_ground_km`] converts it
-//! to the slant range a gate was measured at. Before the plan view corrected at
-//! all it drew a 19.5° / 70 km gate 4.1974 km — 18.688 px — further out than a
-//! section drawn from here, and
-//! `the_cos_e_correction_is_worth_a_measured_number_of_pixels` keeps that and
-//! the 2.4° / 230 km figure beside it.
-//!
-//! **This module and the plan view use the same conversion**, which for two
-//! commits they did not: this one inverted the arc while the rasterizers still
-//! hoisted `cos e`, and they registered only to within the difference — 666 m
-//! at 460 km on a 0.5° cut, about three plan-view cells. Both walk the arc per
-//! gate now (`render::gate_ground_edges`), and
-//! `render::polar::PolarGeometry::pick` inverts it to answer a hover, so a
-//! section, the map above it and the readout over both agree by construction
-//! rather than by each being wrong the same way.
-//!
-//! # Status, rather than `NaN`
-//!
-//! [`SampleStatus`] carries the six reasons a sample has no number, so a hover
-//! readout can say "below the lowest beam" instead of nothing.
-//! `MomentValue::RangeFolded` was matched **nowhere else** in this crate when
-//! that type was written — six consumers, every one of them `Value`-only — and
-//! closing that gap is half the point of it. The plan-view rasterizer has since
-//! grown its own arm (`crate::render`'s `RANGE_FOLDED_BITS`) and paints the
-//! same purple, but it has no status to hand back with the number, so this is
-//! still the only place a *readout* can say the word.
-//!
-//! There is **no downward or upward extrapolation**. Under the lowest rung's
-//! beam the answer is [`SampleStatus::BelowLowestBeam`]; over the highest it is
+//! [`SampleStatus`] carries the six reasons a sample has no number. There is
+//! **no downward or upward extrapolation**: under the lowest rung's beam the
+//! answer is [`SampleStatus::BelowLowestBeam`], over the highest
 //! [`SampleStatus::AboveVolume`], which is also how the cone of silence
-//! reports itself (over the site every rung's beam is at zero height, so every
-//! height above the ground is above the volume). Neither is filled in.
-//!
-//! Expect, and treat as ordinary, a bracketing rung with **no data**: every
-//! volume has one at 230 km and 300 km, and 8 of 19 measured volumes have one
-//! at 150 km, because the upper cuts stop short of the surveillance half.
-//! That is beam geometry, not a defect in the ladder, and it surfaces as
-//! [`SampleStatus::BeyondRange`] on that rung rather than as an error.
+//! reports itself. Expect a bracketing rung with **no data** — every volume
+//! has one at 230 km and 300 km, and 8 of 19 measured volumes at 150 km,
+//! because the upper cuts stop short of the surveillance half.
 
 use nexrad_model::data::{DataMoment, ElevationCut, MomentData, MomentValue, Radial, Sweep};
 
@@ -166,28 +73,25 @@ use crate::volumetric::{CellStat, sweep_elevation_deg};
 /// one.
 ///
 /// The first two mirror `nexrad_model::data::MomentValue`'s own non-numeric
-/// arms; the rest are this module's, and describe where the *query* fell
-/// rather than what a gate said.
+/// arms; the rest describe where the *query* fell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SampleStatus {
     /// A measured value.
     Value,
-    /// The gate was below the moment's signal threshold (raw code 0). The
-    /// radar looked and saw nothing above threshold — distinct from having no
-    /// gate there at all.
+    /// The gate was below the moment's signal threshold (raw code 0) —
+    /// distinct from having no gate there at all.
     BelowThreshold,
     /// The gate was range folded (raw code 1): its true range is ambiguous
     /// past the unambiguous range of the cut's PRF.
     RangeFolded,
     /// The query height is under the lowest rung's beam centre over that
-    /// ground range. The radar never illuminated it; nothing is filled in.
+    /// ground range. Nothing is filled in.
     BelowLowestBeam,
     /// The query height is over the highest rung's beam centre over that
     /// ground range. Over the site this is the whole cone of silence.
     AboveVolume,
-    /// The bracketing rung's gates stop short of that ground range. Ordinary,
-    /// not exceptional: upper cuts are range-truncated, so every volume has a
-    /// bracketing rung with no data at 230 km and at 300 km.
+    /// The bracketing rung's gates stop short of that ground range. Ordinary:
+    /// upper cuts are range-truncated.
     BeyondRange,
     /// Nothing serves the query: the ladder is empty for this moment, no
     /// radial of the rung is within half a beam of the azimuth, the radial
@@ -200,10 +104,8 @@ impl SampleStatus {
     /// A stable byte for the wire, so a section rendered in a worker arrives
     /// with its statuses intact rather than as a field of `NaN`.
     ///
-    /// Deliberately **not** the Level II raw gate codes (where 0 is below
-    /// threshold and 1 is range folded): four of these seven have no raw code
-    /// at all, so borrowing two of them would suggest a correspondence that
-    /// does not exist. New variants append; existing codes never move.
+    /// Deliberately **not** the Level II raw gate codes: four of these seven
+    /// have no raw code at all. New variants append; existing codes never move.
     pub fn wire_code(self) -> u8 {
         match self {
             SampleStatus::Value => 0,
@@ -217,8 +119,7 @@ impl SampleStatus {
     }
 
     /// The inverse of [`wire_code`](Self::wire_code). `None` for a byte this
-    /// build does not know, which is what a payload from a newer sender looks
-    /// like.
+    /// build does not know.
     pub fn from_wire_code(code: u8) -> Option<Self> {
         Some(match code {
             0 => SampleStatus::Value,
@@ -234,11 +135,8 @@ impl SampleStatus {
 }
 
 /// One query's answer: a status, and a number when the status is
-/// [`SampleStatus::Value`].
-///
-/// The fields are private so the pairing cannot come apart — a `Value` with no
-/// number and a `BelowThreshold` carrying one are both nonsense, and both are
-/// easy to construct by hand.
+/// [`SampleStatus::Value`]. The fields are private so the pairing cannot come
+/// apart.
 #[derive(Debug, Clone, Copy)]
 pub struct Sample {
     value: f32,
@@ -248,14 +146,8 @@ pub struct Sample {
 /// Equality that ignores the number when there is no number to compare.
 ///
 /// **A derived `PartialEq` makes every non-`Value` sample unequal to itself**,
-/// because `missing` stores `f32::NAN` as its placeholder and `NaN != NaN`.
-/// That is not a theoretical nuisance: WP-D's worker reply asserts
-/// `assert_eq!(execute(&…), None)` on a `JobOutput` that transitively contains
-/// these, and a whole cross-section of "below the lowest beam" would compare
-/// unequal to a byte-identical copy of itself with nothing in the failure
-/// message saying why. Values still compare as `f32`, so `found(NAN)` remains
-/// unequal to itself — which is what a caller who put a `NaN` in a `Value`
-/// asked for.
+/// because `missing` stores `f32::NAN` and `NaN != NaN`. Values still compare
+/// as `f32`, so `found(NAN)` remains unequal to itself.
 impl PartialEq for Sample {
     fn eq(&self, other: &Self) -> bool {
         self.status == other.status
@@ -316,8 +208,7 @@ pub enum SamplerError {
 
     /// The scan's coverage pattern carries no elevation cuts, so no sweep can
     /// be keyed. This is what a scan reconstructed from a
-    /// [`crate::render_input::RenderInput`] looks like, and refusing it is the
-    /// whole reason this error exists.
+    /// [`crate::render_input::RenderInput`] looks like.
     #[error(
         "the scan's coverage pattern (VCP {vcp}) has no elevation cuts, so no \
          tilt ladder can be built; a scan reconstructed from a RenderInput \
@@ -339,10 +230,8 @@ pub enum SamplerError {
         cut_count: usize,
     },
 
-    /// A cut angle that is not a number. Cut angles are decoded from a fixed
-    /// point field and cannot be non-finite in valid data; a `NaN` key would
-    /// silently fail every grouping comparison and scatter one cut across
-    /// several rungs.
+    /// A cut angle that is not a number. A `NaN` key would silently fail every
+    /// grouping comparison and scatter one cut across several rungs.
     #[error("elevation cut {cut_index} has a non-finite angle ({angle})")]
     NonFiniteCutAngle { cut_index: usize, angle: f64 },
 
@@ -353,26 +242,15 @@ pub enum SamplerError {
 
 /// The moment a product samples, or `None` if a section of it is meaningless.
 ///
-/// The six native Level II moments are the whole list. Two families are
-/// refused on purpose:
+/// The six native Level II moments are the whole list. The hybrid hydrometeor
+/// classification is a hybrid-*scan* composite with no vertical extent to cut
+/// through, and echo tops, VIL, VIL density, POSH and MEHS are column
+/// integrals that already collapsed the vertical axis.
 ///
-/// * **The hybrid hydrometeor classification is not a moment.** It is a
-///   360 × 920 × 0.25 km hybrid-*scan* composite ([`crate::hhc`]) — one
-///   surface, assembled from whichever tilt clears the terrain at each range.
-///   It has no vertical extent to cut through, and the UI must not offer it.
-/// * **The column integrals already collapsed the vertical axis.** Echo tops,
-///   VIL, VIL density, POSH and MEHS are functions of a whole column; a
-///   vertical section of one would draw the same number at every height and
-///   look like a measurement.
-///
-/// The *derivations* (NROT, SRV, KDP) are refused **here** for a third
-/// reason: they are computed per sweep, so sampling them means deriving them
-/// first — refused rather than quietly served from raw velocity, which would
-/// look right and be a different field. That derivation now exists:
-/// [`crate::derive::prepare`] computes them into synthetic scans, and
-/// [`crate::derive::volume_slot`] is the predicate the vertical views gate
-/// on. This function stays the **raw-scan** gate, which is exactly why the
-/// derived products stay out of it.
+/// The derivations (NROT, SRV, KDP) are refused here because they are computed
+/// per sweep; [`crate::derive::prepare`] computes them into synthetic scans
+/// and [`crate::derive::volume_slot`] is the predicate the vertical views
+/// gate on.
 pub fn samplable(product: RadarProduct) -> Option<MomentSlot> {
     match product {
         RadarProduct::Reflectivity => Some(MomentSlot::Reflectivity),
@@ -421,9 +299,6 @@ fn refusal_reason(product: RadarProduct) -> &'static str {
 /// How two measurements of a moment average.
 ///
 /// `Default` is the plain mean, which is what an empty [`Column`] carries.
-/// Nothing reads it there — an empty column has no corners to combine — but a
-/// `Default` that silently meant "reflectivity" would be a trap for whoever
-/// adds the next constructor.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum Blend {
     /// Mean in linear `Z = 10^(dBZ/10)`, read back in dBZ. Averaging
@@ -434,9 +309,7 @@ enum Blend {
     #[default]
     Arithmetic,
     /// Weighted mean of the unit vectors, so the 360°→0° seam does not average
-    /// to 180°. Differential phase folds at 360° and this crate's own
-    /// unfolder ([`crate::kdp`]) exists because of it; a sampler that lerped
-    /// across the seam would invent a half-turn of phase.
+    /// to 180°. Differential phase folds at 360°.
     Angular360,
 }
 
@@ -444,10 +317,7 @@ impl Blend {
     /// The blend a moment's physics wants.
     ///
     /// Reads [`CellStat::for_moment`] for the linear-Z question rather than
-    /// restating it, so the sampler and the echo-tops cube cannot come to
-    /// disagree about which moments average in dB. The angular arm is this
-    /// module's own — `CellStat` has no need of one, because nothing that
-    /// consumes it grids differential phase.
+    /// restating it. The angular arm is this module's own.
     fn for_moment(product: RadarProduct) -> Self {
         match product {
             RadarProduct::DifferentialPhase => Blend::Angular360,
@@ -460,35 +330,22 @@ impl Blend {
     /// rather than of the quantity — so the limit has to be carried per rung
     /// instead of living in a [`Blend`] variant.
     ///
-    /// **Two moments in Level II wrap, and only one of them wraps at a
-    /// constant.** Differential phase wraps at 360°, which is a property of
-    /// the quantity itself, so [`Blend::Angular360`] can be a blend *arm*:
-    /// everything it needs is in the variant. Doppler velocity wraps at the
-    /// Nyquist velocity, which is a property of the *sweep's* PRF and differs
-    /// from tilt to tilt inside one volume, so it cannot be an arm.
+    /// **Two moments in Level II wrap, and only one at a constant.**
+    /// Differential phase wraps at 360°, a property of the quantity, so
+    /// [`Blend::Angular360`] can be a blend *arm*. Doppler velocity wraps at
+    /// the Nyquist velocity, a property of the *sweep's* PRF that differs from
+    /// tilt to tilt inside one volume, so it cannot be an arm.
     ///
-    /// **The archive carries that number, and it now reaches here.** Message
-    /// 31's Radial Data Block has `nyquist_velocity`, `nexrad-decode` decodes
-    /// it, and [`crate::scan`] reads it out of a raw
-    /// `nexrad_data::volume::File` on the same walk that builds the `Scan` —
-    /// the way [`crate::kdp::KdpParams::from_archive`] reads the other
-    /// radial-header parameters, except folded in rather than paid for twice.
-    /// What used to drop it was the boundary this sampler sits
-    /// behind — `nexrad_model::data::Radial` does not carry it, and the
-    /// worker's reconstructed `RenderInput` is built from model types alone —
-    /// so the number was *measured off the data* instead. It is now carried:
-    /// [`crate::nyquist::Volume`] pairs the declared table with the scan, the
-    /// payload carries it per sweep, and [`estimate_fold_limit`] is the
-    /// fallback for a volume that declared nothing (all Message 1, or a scan
-    /// that reached here without a table). Both land in
-    /// [`Rung::fold_limit_ms`], and which one did is in
+    /// Message 31's Radial Data Block carries that number and [`crate::scan`]
+    /// reads it on the same walk that builds the `Scan`.
+    /// [`crate::nyquist::Volume`] pairs the declared table with the scan, and
+    /// [`estimate_fold_limit`] is the fallback for a volume that declared
+    /// nothing. Both land in [`Rung::fold_limit_ms`], and which one did is in
     /// [`Rung::fold_limit_declared`].
     ///
-    /// Every other moment this sampler serves is monotone over its encoding:
-    /// reflectivity, spectrum width, differential reflectivity and correlation
-    /// coefficient have no wraparound topology at all — spectrum width in
-    /// particular is a non-negative spread, so no two of its gates can sit on
-    /// opposite sides of a seam — and their blends are unaffected.
+    /// Every other moment this sampler serves is monotone over its encoding —
+    /// spectrum width in particular is a non-negative spread, so no two of its
+    /// gates can sit on opposite sides of a seam.
     fn folds_at_measured_limit(product: RadarProduct) -> bool {
         matches!(product, RadarProduct::Velocity)
     }
@@ -498,86 +355,23 @@ impl Blend {
 ///
 /// [`estimate_fold_limit`] reads the largest speed a sweep observed, which is
 /// the Nyquist velocity *when the sweep folded at all* and an underestimate
-/// when it did not. An underestimate is mostly harmless — see that function —
-/// but a sweep that saw nothing faster than a few m/s gives a limit so small
-/// that ordinary noise clears it, and then the straddle test fires on air that
-/// is merely calm. No waveform that carries a velocity moment has a Nyquist
-/// velocity this low, so below it the guard is switched off rather than
-/// trusted.
+/// when it did not. A sweep that saw nothing faster than a few m/s gives a
+/// limit so small that ordinary noise clears it, so below this the guard is
+/// switched off. It bounds the **declared** limit too: a velocity-bearing cut
+/// declaring under 8 m/s is a mis-decoded field.
 ///
-/// It bounds the **declared** limit too, wherever one exists, on the other
-/// half of the same reasoning: a velocity-bearing cut declaring under 8 m/s is
-/// a mis-decoded field rather than a very slow radar, and the estimate is the
-/// better of two poor answers.
+/// **The margin is thinner than the number looks.** The surveillance half of
+/// a WSR-88D split cut declares 8.27–9.68 m/s, because the long PRT that buys
+/// it 460 km of unambiguous range costs it exactly that — and over a
+/// 208-volume, 17-site corpus *every one* of the 712 sweeps carrying no
+/// velocity moment declares inside `[8.32, 9.68]`, against a minimum of
+/// 12.37 m/s on every velocity-bearing sweep. Route one of those to a rung
+/// and a 16.64 m/s fold interval is laid over a field that never wraps.
 ///
-/// # "No operational waveform folds below 8 m/s" is not what the archive says
-///
-/// It very nearly is, and the margin is thinner than the number looks. The
-/// surveillance half of a WSR-88D split cut declares **8.27–9.68 m/s** across
-/// the ten-volume control — KTLX's 8.27 is 0.27 above this floor — because the
-/// long PRT that buys it 460 km of unambiguous range costs it exactly that. So
-/// the floor is not clear of real declarations; it is clear of real
-/// declarations *on cuts anybody asks it about*. Those cuts carry no velocity
-/// moment at all, and [`Blend::folds_at_measured_limit`] is what keeps the
-/// lookup to velocity, so no rung is ever served one.
-///
-/// Which is to say the floor rests on that gate rather than on a comfortable
-/// gap in the physics. Widen the lookup to another moment, or key a rung by
-/// anything other than the sweep that actually carries the moment, and 8.27
-/// m/s is admissible — a fold interval of 16.5 m/s laid over a field that does
-/// not fold. Raising the floor is the wrong repair (it would start refusing
-/// honest Doppler declarations well before it cleared 9.68); keeping the gate
-/// is the right one, which is why it is named here and not only there.
-///
-/// `pub(crate)` because `crate::nrot::fold_limit_ms` chooses the same way for
-/// the pass that *removes* folds, and this guard is the one that refuses to
-/// interpolate across them. One floor: two copies could drift, and the drift
-/// would show up as a section and a plan view taking different views of the
-/// same pair of gates, with nothing anywhere reporting a disagreement.
-///
-/// # The margin, measured on 208 volumes rather than ten
-///
-/// The paragraph above rests on a ten-volume control. The corpus sweep on
-/// branch `campaign-harness` re-reads it over the 208-volume, 17-site corpus
-/// registered for `SEAM_PROXIMITY_ACROSS_TILTS`. **That measurement is not in
-/// this tree and cannot be** — it needs the archive volumes on disk — so the
-/// figures below are the record of a run rather than a standing guard, and the
-/// apparatus is named so the run can be repeated rather than trusted. It
-/// sorts
-/// every sweep's declared Nyquist by whether that sweep carries a velocity
-/// moment at all. It replicates, and it is worse than "thin":
-///
-/// | | sweeps | min | median | max | under 8.00 |
-/// |---|---|---|---|---|---|
-/// | velocity-bearing (arb / holdout) | 1102 / 951 | **12.37** / **12.37** | 26.38 / 26.24 | 35.55 / 35.55 | 0 / 0 |
-/// | no velocity moment | 372 / 340 | **8.33** / **8.32** | 8.90 / 8.90 | 9.68 / 9.68 | 0 / 0 |
-///
-/// Two facts, and they pull in opposite directions.
-///
-/// **The floor is comfortable where it is asked.** The slowest declaration on
-/// any velocity-bearing sweep in the corpus is 12.37 m/s — 4.37 m/s of
-/// headroom, not the 0.27 the surveillance figures suggest — and nothing
-/// anywhere declared under 8.00. Every rung this constant actually bounds sits
-/// well clear of it, at all 17 sites.
-///
-/// **The exposed band is not an edge case; it is a census.** *Every one* of
-/// the 712 non-velocity sweeps — 372 of 372 and 340 of 340, at all 17 sites,
-/// on every date — declares inside `[8.32, 9.68]`. There is no site where the
-/// surveillance half declares safely, and no volume without one. The worst
-/// single readings are KRLX cut #1 at 0.48° declaring **8.32 m/s** and KABX
-/// cut #1 at 0.48° declaring **8.33** — a **16.64 m/s fold interval laid over
-/// a field that never wraps**, if either were ever routed to a rung.
-///
-/// So the shape of the risk is now exact. This is not a constant that would be
-/// wrong for a few unlucky volumes under a routing change; it is one that
-/// would be wrong for **the lowest cut of essentially every WSR-88D volume in
-/// the archive**, and the 0.32 m/s between the floor and the nearest real
-/// declaration means raising the floor cannot fix it either. The whole defence
-/// is [`Blend::folds_at_measured_limit`]'s restriction to velocity and the
-/// per-sweep keying in [`Rung::fold_limit_ms`]. Those two are load-bearing
-/// safety properties, not conveniences, and **`crate::nrot::fold_limit_ms`
-/// inherits exactly the same exposure through the same shared floor** — a
-/// change on either side of that `pub(crate)` arms both paths at once.
+/// The whole defence is [`Blend::folds_at_measured_limit`]'s restriction to
+/// velocity and the per-sweep keying in [`Rung::fold_limit_ms`].
+/// `pub(crate)` because `crate::nrot::fold_limit_ms` inherits the same
+/// exposure through the same shared floor.
 pub(crate) const FOLD_LIMIT_FLOOR_MS: f64 = 8.0;
 
 /// One rung of the tilt ladder: the sweep that won its cut, indexed for random
@@ -589,81 +383,44 @@ struct Rung<'a> {
     /// The chosen sweep's median radial elevation: the angle every height in
     /// this rung is computed from.
     elevation_deg: f64,
-    /// The chosen sweep's radials, borrowed from the `Scan`.
     radials: &'a [Radial],
     /// `(azimuth, index into radials)`, ascending by azimuth. Built rather
-    /// than assumed: a sweep's radials are in *collection* order, which starts
-    /// wherever the antenna was.
+    /// than assumed: a sweep's radials are in *collection* order.
     by_azimuth: Vec<(f32, u32)>,
     /// Median gap between adjacent azimuths, degrees — the scale
     /// [`MAX_ADJACENT_GAP_STEPS`] is measured in.
-    ///
-    /// [`median_azimuth_step_deg`], not a local reading of the sweep: the
-    /// median rather than the mean, and the crate's one measurement rather
-    /// than this rung's own, for the reasons kept beside the constant.
     az_step_deg: f64,
     /// The speed this rung's sweep folds at, m/s, or `None` when this moment
     /// has no fold seam, the volume declared nothing *and* the sweep never got
-    /// near one, or the number that was found sits under
-    /// [`FOLD_LIMIT_FLOOR_MS`]. Resolved once here rather than per sample
-    /// because it is a property of the sweep, and a sample must not pay a pass
-    /// over the whole sweep.
+    /// near one, or the number found sits under [`FOLD_LIMIT_FLOOR_MS`].
     ///
-    /// Per rung, not per volume: the Nyquist velocity follows the cut's PRF,
-    /// and it genuinely differs inside one volume — measured across ten WSR-88D
-    /// volumes, the Doppler cuts declare 23.84–62.94 m/s, and the spread is
-    /// within a volume as much as between sites: KFFC's low Doppler cuts
-    /// declare 25.65 while its cut 12 declares 62.94.
+    /// Per rung, not per volume: the Nyquist velocity follows the cut's PRF —
+    /// over ten WSR-88D volumes the Doppler cuts declare 23.84–62.94 m/s,
+    /// KFFC's low cuts at 25.65 against its cut 12 at 62.94.
     fold_limit_ms: Option<f64>,
     /// Where [`Self::fold_limit_ms`] came from: `true` for the archive's own
-    /// declaration (Message 31's Radial Data Block, carried here by
-    /// [`crate::nyquist::DeclaredNyquist`]), `false` for
-    /// [`estimate_fold_limit`]'s reading of the data.
-    ///
-    /// **Nothing in the guard reads this** — the two numbers mean the same
-    /// thing and are used identically. It exists so
-    /// [`VolumeSampler::describe`] can print the provenance, which is what
-    /// makes `a_reconstructed_render_input_scan_builds_the_identical_ladder`
-    /// able to see the failure this whole path exists to prevent: the main
-    /// thread holding the declared number, the worker's reconstructed scan not
-    /// holding it, and the two guarding differently at limits that are close
-    /// enough to leave no other symptom.
-    ///
-    /// `false` when there is no limit at all, which `describe` never prints.
+    /// declaration, `false` for [`estimate_fold_limit`]'s reading of the data.
+    /// **Nothing in the guard reads this**; it exists so
+    /// [`VolumeSampler::describe`] can print the provenance.
     fold_limit_declared: bool,
     /// When the chosen sweep was flown — the earliest collection timestamp on
     /// its radials, milliseconds since the Unix epoch, `0` when it carries
-    /// none.
-    ///
-    /// # Why a rung has a clock of its own
-    ///
-    /// A volume is flown one tilt at a time over four to ten minutes, so the
-    /// bottom and the top of a single cross-section are minutes apart, and a
-    /// SAILS repeat can leave one rung in the middle newer than both its
-    /// neighbours. The ladder is the only thing that knows, because it is the
-    /// only thing that knows **which sweep won each cut** — the same question
-    /// [`ladder_fingerprint`] asks, of the same radials, through the same
-    /// [`resolve_ladder`]. Read here rather than beside the ladder so a
-    /// reported age describes the rung the picture was actually sampled from
-    /// and not one rediscovered by a second rule.
+    /// none. A volume is flown one tilt at a time over four to ten minutes, so
+    /// the bottom and top of one cross-section are minutes apart, and a SAILS
+    /// repeat can leave one rung newer than both its neighbours.
     collected_ms: i64,
 }
 
 /// The tilt ladder over one ground point: every rung's beam height there and
 /// what it measured, ascending by height.
 ///
-/// Built once per column by [`VolumeSampler::column`] and then asked for as
-/// many heights as the caller wants. A rung with no data at this ground range
-/// stays in the ladder carrying its status — dropping it would silently widen
-/// the bracket and interpolate straight across a tilt that measured nothing,
-/// which is the fabrication this type exists to make impossible.
+/// A rung with no data at this ground range stays in the ladder carrying its
+/// status — dropping it would silently widen the bracket and interpolate
+/// straight across a tilt that measured nothing.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Column {
     azimuth_deg: f64,
     ground_range_km: f64,
-    /// Carried from the sampler that filled this column, so
-    /// [`Column::at_height_km`] blends reflectivity in linear Z without
-    /// needing the sampler back.
     blend: Blend,
     rungs: Vec<ColumnRung>,
 }
@@ -674,26 +431,18 @@ pub struct ColumnRung {
     /// Beam-centre height above the antenna, km, over this column's ground
     /// range.
     pub height_km: f64,
-    /// The rung's geometric elevation, degrees.
     pub elevation_deg: f64,
-    /// What this rung measured at this column's azimuth and ground range.
     pub sample: Sample,
     /// This rung's fold limit, carried from [`Rung::fold_limit_ms`] so
-    /// [`Column::at_height_km`] can refuse to lerp across a Nyquist seam
-    /// without needing the sampler back — the same reason [`Column::blend`]
-    /// is carried.
-    ///
-    /// Private, unlike its neighbours, because it is a property of the *sweep*
-    /// that a reader of one rung's sample has no use for, and publishing it
-    /// would invite a caller to compare two rungs' limits and conclude
-    /// something about the air.
+    /// [`Column::at_height_km`] can refuse to lerp across a Nyquist seam.
+    /// Private, unlike its neighbours, because publishing it would invite a
+    /// caller to compare two rungs' limits and conclude something about the air.
     fold_limit_ms: Option<f64>,
 }
 
 impl Column {
     /// An empty column, which answers [`SampleStatus::NoCoverage`] at every
-    /// height. `Default` yields this, which is what
-    /// [`VolumeSampler::column_into`] wants as a reusable buffer.
+    /// height.
     pub fn new() -> Self {
         Self::default()
     }
@@ -715,10 +464,6 @@ impl Column {
 
     /// The heights of the lowest and highest rung's beam centres over this
     /// column, km above the antenna. `None` for an empty column.
-    ///
-    /// A caller drawing a height axis wants this to know where its rows stop
-    /// being answerable — the lower bound is the cone of silence's floor at
-    /// this range, the upper its ceiling.
     pub fn height_span_km(&self) -> Option<(f64, f64)> {
         Some((self.rungs.first()?.height_km, self.rungs.last()?.height_km))
     }
@@ -726,9 +471,7 @@ impl Column {
     /// What the volume holds at `height_km` above the antenna in this column.
     ///
     /// Interpolates between the two rungs that bracket the height. Outside the
-    /// ladder nothing is filled in: under the lowest beam the answer is
-    /// [`SampleStatus::BelowLowestBeam`], over the highest
-    /// [`SampleStatus::AboveVolume`].
+    /// ladder nothing is filled in.
     pub fn at_height_km(&self, height_km: f64) -> Sample {
         if !height_km.is_finite() {
             return Sample::missing(SampleStatus::NoCoverage);
@@ -754,70 +497,32 @@ impl Column {
         let lo = &self.rungs[above - 1];
         let hi = &self.rungs[above];
         let span = hi.height_km - lo.height_km;
-        // **This branch is unreachable given finite rung heights, and is kept
-        // anyway.** `partition_point` over the ascending sort guarantees
-        // `lo.height ≤ h < hi.height`, so the span is strictly positive; two
-        // rungs *can* share a height (every beam centre is at zero over the
-        // site, and two cuts can share a median), but then they are both at or
-        // below `h` or both above it and neither becomes a bracket.
-        //
-        // The qualifier is load-bearing. A `NaN` rung height sorts last under
-        // `total_cmp` and leaves the partition intact, so it *can* become the
-        // upper bracket — and then the span is `NaN`, `span > 0.0` is false,
-        // and this arm degrades to weighting the lower rung fully. Reaching it
-        // takes a `NaN` radial elevation, which fixed-point decoding cannot
-        // produce, which is why no test pins it. It stays a branch rather than
-        // an `unreachable!()` precisely because that path exists: a panic
-        // would turn a benign degradation into a dead frame.
+        // **Unreachable given finite rung heights, and kept anyway.** A `NaN`
+        // rung height sorts last under `total_cmp`, so it *can* become the
+        // upper bracket; a panic would turn a benign degradation into a dead
+        // frame.
         let t = if span > 0.0 {
             ((height_km - lo.height_km) / span).clamp(0.0, 1.0)
         } else {
             0.0
         };
-        // **The seam between two rungs is where a fold does the most damage,
-        // not the least.** A two-corner lerp at `t = 0.5` of `+v` and `−v` is
-        // identically zero, so *every* fold-straddling rung pair halfway up
-        // fabricates, where the four-corner bilinear at least needs its other
-        // two corners to agree. Measured over fourteen volumes: of 12,918 rung
-        // pairs an independent continuity oracle confirms as folds, 12,903 —
-        // 99.9% — average to less than a quarter of the sweep's Nyquist
-        // velocity, which is the display's word for near-calm air. The
-        // corresponding figure for four-corner quads is 28,814 of 28,981, so
-        // the two are close here; what makes the vertical case worse is not a
-        // higher rate but that `t` is so often near 0.5.
+        // **The seam between two rungs is where a fold does the most damage.**
+        // A two-corner lerp at `t = 0.5` of `+v` and `−v` is identically zero,
+        // where the four-corner bilinear at least needs its other two corners
+        // to agree. Measured over fourteen volumes: of 12,918 rung pairs an
+        // independent continuity oracle confirms as folds, 12,903 — 99.9% —
+        // average to less than a quarter of the sweep's Nyquist velocity.
         //
-        // (An earlier note here claimed 94.9% of straddling *rung pairs at
-        // KLWX* fabricated, against 97% of straddling gate pairs. Neither
-        // number reproduces under any population this module can name, and
-        // both are withdrawn; the figures above replace them. The residual those
-        // numbers left unexplained was not rounding: it was the straddles
-        // whose smaller corner sits well inside the range, which is exactly
-        // the false-positive population [`straddles_fold`] now refuses.)
-        //
-        // The smaller of the two limits governs. The pair is folded if
-        // *either* end folded, each end folds at its own cut's Nyquist, and a
-        // reading wrapped at the lower limit is the one whose seam is easier
-        // to cross unnoticed — so testing against the larger limit would miss
-        // exactly the straddles the mixed-PRF ladder creates.
-        //
-        // This pair spans *tilts*, and the guard's line sits at
-        // `SEAM_PROXIMITY_ACROSS_TILTS` — *lower* than the bilinear's,
-        // because across hundreds of metres of depth a real fold's ends
-        // stray further from the seam, so a line drawn far out misses them
-        // and this path has to reach nearer the middle before it will
-        // refuse to interpolate. The constant's doc carries the labelled
-        // corpora that set it, including what the guard here still misses:
-        // at no fraction has it ever kept every real fold, so its number is
-        // a measured operating point, not a construction.
+        // This pair spans *tilts*, so the guard's line sits at
+        // `SEAM_PROXIMITY_ACROSS_TILTS` — lower than the bilinear's, because
+        // across hundreds of metres of depth a real fold's ends stray further
+        // from the seam.
         let fold_limit = match (lo.fold_limit_ms, hi.fold_limit_ms) {
             (Some(a), Some(b)) => Some(a.min(b)),
             // This one-sided arm can fire only for armed limits in
             // [8.0, 16.0): the pair must clear `SEAM_PROXIMITY_ACROSS_TILTS`
             // of the measured limit on both ends while the unarmed rung's
-            // speeds stay under the 8.0 m/s floor, which caps the armed limit
-            // below `8.0 / 0.50`. The window was `[8.0, ≈11.94)` while the
-            // fraction was `0.67`, dead at a 12.5 m/s cut; at `0.50` it
-            // covers every cut VCP 31 flies and the mid-Nyquist ones above.
+            // speeds stay under the 8.0 m/s floor.
             (a, b) => a.or(b),
         };
         blend(
@@ -836,7 +541,6 @@ impl std::fmt::Debug for VolumeSampler<'_> {
 }
 
 /// Point queries against a borrowed volume, for one moment.
-///
 /// One resolved rung: the wrap-corrected cut key and the index — into the sweep
 /// list handed to [`resolve_ladder`] — of the sweep this moment takes for it.
 pub(crate) struct LadderChoice {
@@ -847,25 +551,20 @@ pub(crate) struct LadderChoice {
 /// Steps 1–3 of the tilt ladder: key every sweep on its VCP cut, group by exact
 /// key, choose one sweep per group for `slot`.
 ///
-/// Factored out of [`VolumeSampler::build`] so that [`ladder_fingerprint`] — the
-/// re-cut key a live pane compares frame to frame — runs the *same* choice the
-/// sampler will make, rather than a restatement of it. This campaign has paid
-/// twice for a second copy of a sampler rule drifting from the first; the
-/// factoring is the fix that cannot drift.
+/// Factored out of [`VolumeSampler::build`] so that [`ladder_fingerprint`] runs
+/// the *same* choice the sampler will make rather than a restatement of it.
 ///
-/// Takes `&[&Sweep]` rather than `&Scan` because the sweep list is no longer
-/// always a scan's own: the current merged volume ([`crate::current`]) composes
-/// sweeps from two volumes, and this function must key them identically either
-/// way. Group order is discovery order (the caller sorts); member order inside a
-/// group is input order, which is what "newest" means below.
+/// Takes `&[&Sweep]` rather than `&Scan` because the current merged volume
+/// ([`crate::current`]) composes sweeps from two volumes. Group order is
+/// discovery order; member order inside a group is input order, which is what
+/// "newest" means below.
 pub(crate) fn resolve_ladder(
     cuts: &[ElevationCut],
     sweeps: &[&Sweep],
     slot: MomentSlot,
 ) -> Result<Vec<LadderChoice>, SamplerError> {
     // Step 1 and 2: key every sweep on its cut, then group by exact key,
-    // preserving input order inside each group so "newest" below means what it
-    // says.
+    // preserving input order inside each group.
     let mut groups: Vec<(f64, Vec<usize>)> = Vec::new();
     for (sweep_index, sweep) in sweeps.iter().enumerate() {
         let elevation_number = sweep.elevation_number();
@@ -907,16 +606,13 @@ pub(crate) fn resolve_ladder(
                 .first()
                 .is_some_and(|r| slot.read(r).is_some())
         };
-        // Newest-first: the last cut of a SAILS repeat is the current one,
-        // and the reference display shows it too.
+        // Newest-first: the last cut of a SAILS repeat is the current one.
         let chosen = if doppler {
             members.iter().rev().find(|i| carries(i))
         } else {
             // A split cut's Doppler half repeats a short-range copy of the
-            // surveillance moments; reflectivity belongs to the
-            // surveillance half, which reaches 460 km against the Doppler
-            // half's 300. Load-bearing past ~300 km, and the same
-            // preference `render::find_sweep` already applies.
+            // surveillance moments; reflectivity belongs to the surveillance
+            // half, which reaches 460 km against the Doppler half's 300.
             members
                 .iter()
                 .rev()
@@ -935,35 +631,26 @@ pub(crate) fn resolve_ladder(
     Ok(choices)
 }
 
-/// The identity of the sweeps the ladder would choose for `product` — the
-/// re-cut key for anything that draws from a whole volume.
-///
-/// Two volumes fingerprint equal exactly when, for this moment, every rung
-/// would be cut from the same measured data under the same declared pattern —
-/// in which case the picture is byte-identical and a re-cut is pure waste.
-/// The previous key was a count of sweeps *carrying* the moment, and it moved
-/// on seals that change nothing: a split cut's Doppler half carries a
-/// short-range reflectivity copy, so its seal incremented the reflectivity
-/// count while the surveillance preference kept the chosen rung exactly where
-/// it was — measured at ~6 of the 18–23 re-cuts per VCP-212 volume.
-///
-/// What is hashed, and why each part:
-/// * the **declared cut table** — the pattern's angles set the rung keys and
-///   the ladder's declared ceiling, which the section caption draws;
-/// * per chosen sweep: the **rung key**, the sweep's **elevation number**, its
-///   **radial count**, its first and last radials' **collection timestamps**,
-///   and the first radial's **gate count** for this moment. A sealed sweep is
-///   immutable, so this tuple names one sweep's data uniquely: two sweeps of
-///   the same cut collected at different times differ in their timestamps,
-///   and the same sweep re-delivered through a new snapshot hashes the same.
-///
-/// The hash is [`std::hash::DefaultHasher`]: stable within a process, which is
-/// the only place the key is ever compared. It must never be persisted.
-///
-/// `None` when no ladder can be built at all — the moment is not samplable,
-/// the pattern declares no cuts, a sweep cannot be keyed, or no rung carries
-/// the moment. The caller treats `None` as its own value of the key: "nothing
-/// to cut" is a state a pane can be aimed at.
+        // `partition_point` counts the rungs at or below the query, so 0 means
+        // the query is under the lowest beam and `len` means it is at or over
+        // the highest.
+        //
+        // The `span > 0.0` arm below is unreachable given finite rung heights
+        // and kept anyway: a `NaN` rung height sorts last under `total_cmp`,
+        // so it *can* become the upper bracket, and a panic would turn a
+        // benign degradation into a dead frame.
+        //
+        // **The seam between two rungs is where a fold does the most damage.**
+        // A two-corner lerp at `t = 0.5` of `+v` and `−v` is identically zero,
+        // where the four-corner bilinear at least needs its other two corners
+        // to agree. Measured over fourteen volumes: of 12,918 rung pairs an
+        // independent continuity oracle confirms as folds, 12,903 average to
+        // less than a quarter of the sweep's Nyquist velocity.
+        //
+        // The smaller of the two limits governs, and the guard's line sits at
+        // `SEAM_PROXIMITY_ACROSS_TILTS` — lower than the bilinear's, because
+        // across hundreds of metres of depth a real fold's ends stray further
+        // from the seam.
 pub fn ladder_fingerprint(
     pattern: &nexrad_model::data::VolumeCoveragePattern,
     sweeps: &[&Sweep],
@@ -971,11 +658,6 @@ pub fn ladder_fingerprint(
 ) -> Option<u64> {
     use std::hash::{Hash, Hasher};
 
-    // `volume_slot`, not `samplable`: a derived product's ladder is its
-    // source moment's ladder (SRV and NROT climb the velocity cuts, KDP the
-    // ΦDP cuts), and the re-cut key has to see the same ladder the worker's
-    // derived sampler resolves or a section would never re-cut — or always
-    // re-cut — on a derived product.
     let slot = crate::derive::volume_slot(product)?;
     let cuts = pattern.elevation_cuts();
     if cuts.is_empty() {
@@ -985,11 +667,6 @@ pub fn ladder_fingerprint(
     if choices.is_empty() {
         return None;
     }
-    // The ladder, not the discovery: `resolve_ladder` returns rungs in the
-    // order their first member appeared, and that order shifts when a
-    // superseded base sweep leaves the merged list even though every rung's
-    // *choice* stands. The sampler sorts its rungs by key; the fingerprint
-    // hashes the same sorted ladder, or an unchanged picture would re-cut.
     choices.sort_by(|a, b| a.key.total_cmp(&b.key));
 
     let mut hasher = std::hash::DefaultHasher::new();
@@ -1025,24 +702,20 @@ pub struct VolumeSampler<'a> {
     blend: Blend,
     rungs: Vec<Rung<'a>>,
     /// The highest cut angle the coverage pattern *declares*, wrap-corrected —
-    /// which is not the highest rung the ladder *has*. See
-    /// [`top_declared_cut_deg`](Self::top_declared_cut_deg).
+    /// which is not the highest rung the ladder *has*.
     top_declared_cut_deg: f64,
 }
 
 impl<'a> VolumeSampler<'a> {
     /// Resolve `volume`'s tilt ladder for `product`.
     ///
-    /// Fails rather than degrades — see the module doc's section on the VCP.
-    /// Every error is also logged, so a caller that discards the `Result` with
-    /// `.ok()` still leaves the reason somewhere.
+    /// Fails rather than degrades. Every error is also logged, so a caller
+    /// that discards the `Result` with `.ok()` still leaves the reason
+    /// somewhere.
     ///
     /// `volume` is a [`crate::nyquist::Volume`], which a bare `&Scan` converts
-    /// into: the conversion declares no Nyquist velocities, so a velocity
+    /// into: that conversion declares no Nyquist velocities, so a velocity
     /// ladder built from one estimates every rung's fold limit off the data.
-    /// A caller that holds the archive's own declarations — the whole
-    /// production path does — passes [`crate::nyquist::Volume::new`] and gets
-    /// the declared numbers instead. See [`Rung::fold_limit_ms`].
     pub fn new(volume: impl Into<Volume<'a>>, product: RadarProduct) -> Result<Self, SamplerError> {
         Self::build(volume.into(), product).inspect_err(|e| {
             log::warn!("volume sampler unavailable for {}: {e}", product.code());
@@ -1053,11 +726,7 @@ impl<'a> VolumeSampler<'a> {
     ///
     /// The bypass [`crate::derive`] needs and nothing else may use:
     /// [`samplable`] refuses the derived products precisely so a raw volume
-    /// can never be sampled under a derived label — this constructor exists
-    /// for a scan whose `slot` moment [`crate::derive::prepare`] has already
-    /// rewritten with the derived field. `pub(crate)` because the derivation
-    /// layer is the only legitimate caller; going through [`Self::new`] with
-    /// a derived product is a refusal by design, not a missing feature.
+    /// can never be sampled under a derived label.
     pub(crate) fn for_derived(
         volume: impl Into<Volume<'a>>,
         product: RadarProduct,
@@ -1097,11 +766,8 @@ impl<'a> VolumeSampler<'a> {
 
         // The ceiling the *pattern* declares, before a word about what flew.
         // Read off the same table the rungs are keyed through and corrected the
-        // same way, so a comparison against a rung's own key is exact rather
-        // than a tolerance. Non-finite entries are skipped rather than refused:
-        // this is a summary of cuts that may never be referenced by a sweep,
-        // and a garbage angle in one of those is not a reason to refuse a
-        // volume the ladder can be built from perfectly well.
+        // same way. Non-finite entries are skipped rather than refused: they
+        // may never be referenced by a sweep.
         let top_declared_cut_deg = cuts
             .iter()
             .map(|cut| {
@@ -1125,30 +791,12 @@ impl<'a> VolumeSampler<'a> {
                 continue;
             };
             let (by_azimuth, az_step_deg) = index_azimuths(radials);
-            // The declared number first, the reading of the data second.
-            //
-            // Declared wins outright rather than being reconciled: it is the
-            // RDA's statement of the waveform it flew, while the estimate is
-            // exact only for a sweep that actually folded and an
-            // **under**estimate for one that did not — and this sampler uses
-            // the number as a classification boundary, where an underestimate
-            // widens the fold hypothesis and manufactures false positives.
-            //
-            // `FOLD_LIMIT_FLOOR_MS` applies to whichever answer is used. It
-            // was written for the estimator's failure mode — a calm sweep
-            // giving a limit that ordinary noise clears — which a declaration
-            // cannot have; but no operational NEXRAD waveform has a Nyquist
-            // velocity that low either, so a declared value under the floor is
-            // a corrupt field rather than a slow one. It is dropped, and the
-            // rung falls through to the estimator, which applies the same
-            // floor and may well switch the guard off entirely. A declaration
-            // this module cannot believe must not be *more* trusted than a
-            // measurement it cannot believe.
-            //
-            // `folds_at_measured_limit` gates the estimator's pass over the
-            // sweep so no moment without a seam pays for it; the lookup is
-            // free either way, and is still behind the gate so a reflectivity
-            // rung cannot pick up a velocity cut's limit.
+            // Declared wins outright: it is the RDA's statement of the waveform
+            // it flew, while the estimate is exact only for a sweep that
+            // actually folded and an **under**estimate for one that did not.
+            // `FOLD_LIMIT_FLOOR_MS` applies to whichever answer is used: a
+            // declared value under the floor is a corrupt field, so it is
+            // dropped and the rung falls through to the estimator.
             let (fold_limit_ms, fold_limit_declared) = if Blend::folds_at_measured_limit(product) {
                 match declared
                     .get(sweep.elevation_number())
@@ -1170,8 +818,7 @@ impl<'a> VolumeSampler<'a> {
                 fold_limit_declared,
                 // The same reading of the same radials `RenderInput` makes
                 // when it flattens a sweep for the port, shared rather than
-                // restated: a second spelling is how the worker's ages and
-                // the frame thread's come to differ by a sweep.
+                // restated.
                 collected_ms: crate::render_input::sweep_collected_ms(radials),
             });
         }
@@ -1182,11 +829,8 @@ impl<'a> VolumeSampler<'a> {
         rungs.sort_by(|a, b| a.nominal_deg.total_cmp(&b.nominal_deg));
 
         // Every rung came from a cut whose angle was checked finite above, so a
-        // ladder with rungs always has a finite top. The fold's seed only
-        // survives a table of nothing but non-finite angles, and then the
-        // ladder's own top is the honest answer: it says "as far as anything
-        // here knows, the volume delivered its whole pattern", which
-        // under-warns rather than crying wolf about a table nobody can read.
+        // ladder with rungs always has a finite top; the fold's seed survives
+        // only a table of nothing but non-finite angles.
         let top_declared_cut_deg = if top_declared_cut_deg.is_finite() {
             top_declared_cut_deg
         } else {
@@ -1207,48 +851,17 @@ impl<'a> VolumeSampler<'a> {
         self.product
     }
 
-    /// The ladder, as one line: per rung, `nominal->median radials×gates`.
-    ///
-    /// Hand-written rather than derived because a derived `Debug` would walk
-    /// the borrowed radials and print the whole ~10 M-gate volume — which is
-    /// what `assert_eq!` and `unwrap` reach for on failure, so the derive
-    /// would turn a one-line test failure into an unreadable one.
-    ///
-    /// # The radial and gate counts are the load-bearing part
-    ///
-    /// They say **which sweep won each rung**, and nothing else here does. An
-    /// earlier version printed only the angles, and that made this line
-    /// structurally incapable of seeing the failure it is most often reached
-    /// for: on a real split cut the two halves share a cut angle *and* a
-    /// median — 0.4834° for both on a measured KMPX VCP 212 volume — so a
-    /// ladder that took the Doppler half where it should have taken the
-    /// surveillance half printed byte-identically to a correct one. What
-    /// separates them is range: 1832 reflectivity gates on the surveillance
-    /// half against 1192 on the Doppler half, which is 460 km against 300.
-    ///
-    /// So a comparison over this string is a comparison of the ladder, not of
-    /// its labels. `a_reconstructed_render_input_scan_builds_the_identical_ladder`
-    /// and the live harness both rest on that.
-    ///
-    /// # The fold limit and its provenance are printed for the same reason
-    ///
-    /// A rung that guards velocity appends `±<limit>d` or `±<limit>e` — `d`
-    /// for the archive's declaration, `e` for [`estimate_fold_limit`]'s
-    /// reading of the data. Both halves are load-bearing, and neither is
-    /// cosmetic:
-    ///
-    /// * the **limit** because two ladders that chose the same sweeps can
-    ///   still blend differently, and a fold limit is the only per-rung input
-    ///   to that decision the rest of this line does not name;
-    /// * the **letter** because a declared limit and an estimated one are
-    ///   usually within a few m/s of each other — the estimate *is* the
-    ///   Nyquist velocity whenever the sweep folded — so a worker that lost
-    ///   the declared table would print a nearly identical number and a string
-    ///   comparison would pass. The provenance is what makes the divergence
-    ///   visible before the numbers happen to differ.
-    ///
-    /// Nothing is appended for a rung with no limit, so every moment without a
-    /// fold seam prints exactly what it printed before.
+/// The identity of the sweeps the ladder would choose for `product` — the
+/// re-cut key for anything that draws from a whole volume.
+///
+/// Two volumes fingerprint equal exactly when, for this moment, every rung
+/// would be cut from the same measured data under the same declared pattern.
+/// Hashed: the **declared cut table**, and per chosen sweep the **rung key**,
+/// **elevation number**, **radial count**, first and last radials'
+/// **collection timestamps**, and the first radial's **gate count**. A sealed
+/// sweep is immutable, so this tuple names one sweep's data uniquely.
+/// [`std::hash::DefaultHasher`] is stable within a process, which is the only
+/// place the key is compared; it must never be persisted.
     fn describe(&self) -> String {
         let rungs: Vec<String> = self
             .rungs
@@ -1280,95 +893,54 @@ impl<'a> VolumeSampler<'a> {
     }
 
     /// How many rungs the ladder has for this moment.
-    ///
-    /// A section drawn on a short ladder interpolates across whatever gap the
-    /// ladder leaves and draws a smooth layer that is not there, so a caller
-    /// that means to warn about it needs this and
-    /// [`widest_tilt_gap_deg`](Self::widest_tilt_gap_deg).
     pub fn tilt_count(&self) -> usize {
         self.rungs.len()
     }
 
     /// Each rung's geometric elevation, **in cut order** — which is ascending
-    /// by the nominal key, not by this number.
-    ///
-    /// The distinction is not pedantry: the ladder is ordered by the VCP's cut
-    /// angles, and a chosen sweep's median can in principle sit outside its
-    /// cut's place in that order. Measured never to, in 4 756 ordered pairs,
-    /// but `a_ladder_whose_medians_invert_still_brackets_by_height` builds one
-    /// that does and this iterator reports `[1.05, 0.55]` for it. A caller who
-    /// wants heights sorted wants [`Column::rungs`], which is.
+    /// by the nominal key, not by this number. A chosen sweep's median can in
+    /// principle sit outside its cut's place in that order; measured never to,
+    /// in 4 756 ordered pairs. A caller who wants heights sorted wants
+    /// [`Column::rungs`].
     pub fn elevations_deg(&self) -> impl Iterator<Item = f64> + '_ {
         self.rungs.iter().map(|r| r.elevation_deg)
     }
 
     /// Each rung's VCP cut angle, ascending — the grouping key, not geometry.
-    /// Exposed so a caller can show which declared cuts a volume actually
-    /// delivered.
+    /// Exposed so a caller can show which declared cuts a volume delivered.
     pub fn nominal_elevations_deg(&self) -> impl Iterator<Item = f64> + '_ {
         self.rungs.iter().map(|r| r.nominal_deg)
     }
 
     /// When each rung's chosen sweep was flown, milliseconds since the Unix
     /// epoch, **in the same cut order** [`elevations_deg`](Self::elevations_deg)
-    /// reports — so the two zip into `(where, when)` per rung. `0` for a rung
-    /// whose sweep carried no clock at all.
-    ///
-    /// This is the ladder's spread, and the spread is the fact: a section is
-    /// one picture of a volume flown over minutes, and nothing else in the
-    /// pipeline can say that the rung under the pointer is four minutes older
-    /// than the one above it. See [`Rung::collected_ms`].
+    /// reports. `0` for a rung whose sweep carried no clock at all.
     pub fn collection_times_ms(&self) -> impl Iterator<Item = i64> + '_ {
         self.rungs.iter().map(|r| r.collected_ms)
     }
 
     /// The highest cut angle **this ladder has**, degrees — the top rung's
-    /// grouping key, or `0.0` for a ladder with no rungs (which
-    /// [`new`](Self::new) refuses to build, so only a caller holding one by
-    /// other means can see it).
-    ///
-    /// The key rather than the median, so it can be compared against
-    /// [`top_declared_cut_deg`](Self::top_declared_cut_deg) exactly. The two
-    /// come off the same cut table.
+    /// grouping key, or `0.0` for a ladder with no rungs.
     pub fn top_tilt_deg(&self) -> f64 {
         self.rungs.last().map_or(0.0, |rung| rung.nominal_deg)
     }
 
     /// The highest cut angle the coverage pattern **declares**, degrees.
     ///
-    /// # Why this travels with a section
-    ///
     /// Read against [`top_tilt_deg`](Self::top_tilt_deg) it answers the one
     /// question a consumer of a short ladder cannot otherwise ask: *did the
-    /// volume stop early, or is this all there is?* They are different pictures
-    /// with the same pixels. A complete VCP 35 delivering five cuts to 4.5° has
-    /// a ceiling because that is the pattern; a VCP 212 four rungs into its
-    /// flight has a ceiling because the antenna has not got there yet, and
-    /// everything above 1.8° in that picture is unscanned air rather than the
-    /// cone of silence. Naming the second as the first hands the user a
-    /// confident meteorological explanation for a blank region and it is the
-    /// wrong one.
-    ///
-    /// The count is deliberately *not* the comparison. A pattern declares more
-    /// cut-table entries than it has distinct angles — a split cut is two
-    /// entries at one angle — and the surveillance-only entries at the bottom
-    /// of a precipitation VCP carry no Doppler moment at all, so counting would
-    /// report a complete volume's velocity ladder as short for ever. Every
-    /// operational pattern's *highest* cut carries every moment, so the top is
-    /// the comparison that holds across moments.
+    /// volume stop early, or is this all there is?* The count is deliberately
+    /// *not* the comparison — a pattern declares more cut-table entries than
+    /// distinct angles, and the surveillance-only entries carry no Doppler
+    /// moment — but every operational pattern's highest cut carries every one.
     pub fn top_declared_cut_deg(&self) -> f64 {
         self.top_declared_cut_deg
     }
 
     /// The largest angular step between adjacent rungs, degrees. `0.0` for a
-    /// single-rung ladder.
-    ///
-    /// Measured over the elevations **sorted**, not over the ladder's cut
-    /// order. Folding signed differences down the cut order instead would
-    /// report `0.0` for a ladder whose medians invert — every difference
-    /// negative, `f64::max` from `0.0` keeping the seed — so the one number
-    /// that exists to warn "this section is interpolating across a gap" would
-    /// read *no gap at all* in one of the few cases it is there for.
+    /// single-rung ladder. Measured over the elevations **sorted**: folding
+    /// signed differences down cut order would report `0.0` for a ladder whose
+    /// medians invert.
     pub fn widest_tilt_gap_deg(&self) -> f64 {
         let mut sorted: Vec<f64> = self.elevations_deg().collect();
         sorted.sort_by(f64::total_cmp);
@@ -1379,10 +951,8 @@ impl<'a> VolumeSampler<'a> {
     }
 
     /// The tilt ladder over one ground point, allocating a fresh [`Column`].
-    ///
-    /// `azimuth_deg` is clockwise from true north; `ground_range_km` is a
-    /// **ground** range, so a caller holding a slant range wants
-    /// [`beam::ground_range_km`] first.
+    /// `ground_range_km` is a **ground** range, so a caller holding a slant
+    /// range wants [`beam::ground_range_km`] first.
     pub fn column(&self, azimuth_deg: f64, ground_range_km: f64) -> Column {
         let mut out = Column::new();
         self.column_into(azimuth_deg, ground_range_km, &mut out);
@@ -1408,26 +978,21 @@ impl<'a> VolumeSampler<'a> {
                 fold_limit_ms: rung.fold_limit_ms,
             });
         }
-        // Ascending by height. The rungs are already ascending by cut angle,
-        // and `height_at_ground_km` is strictly increasing in elevation, so
-        // this reorders nothing unless a chosen sweep's median inverted its
-        // cut's order — measured never to happen in 4 756 ordered pairs, which
-        // is a reason to sort defensively rather than to assume.
+        // Ascending by height. The rungs are already ascending by cut angle and
+        // `height_at_ground_km` is strictly increasing in elevation, so this
+        // reorders nothing unless a chosen sweep's median inverted its cut's
+        // order — measured never to happen in 4 756 ordered pairs.
         out.rungs
             .sort_by(|a, b| a.height_km.total_cmp(&b.height_km));
     }
 
     /// What the volume holds at one point, in radar-relative coordinates.
     ///
-    /// For a hover readout and anything else that asks once. It builds the
-    /// whole column and asks it, so it costs the whole ladder — `4·N` gate
-    /// reads — rather than the eight a bracketing pair would need. That is a
-    /// deliberate trade of a cost nobody pays (a hover query happens once a
-    /// frame) for **one** interpolation path: sampling only the bracketing
-    /// pair means finding the bracket a second way, and two ways of choosing a
-    /// bracket is precisely the split-key hazard this module's ladder rule
-    /// exists to close. `the_point_query_is_exactly_the_column_query` pins the
-    /// equivalence, and would keep pinning it if this were ever specialised.
+    /// Builds the whole column and asks it, so it costs `4·N` gate reads rather
+    /// than the eight a bracketing pair would need. That buys **one**
+    /// interpolation path: sampling only the bracketing pair means finding the
+    /// bracket a second way, and two ways of choosing a bracket is the
+    /// split-key hazard this module's ladder rule exists to close.
     ///
     /// Anything asking for more than one height of the same column wants
     /// [`column`](Self::column), which is `H` times cheaper over `H` heights.
@@ -1442,7 +1007,7 @@ impl<'a> VolumeSampler<'a> {
             return Sample::missing(SampleStatus::NoCoverage);
         };
         // The same arc the plan view paints with, run backwards: a caller
-        // names ground, a gate is indexed by beam. See the module doc.
+        // names ground, a gate is indexed by beam.
         let slant_km = beam::slant_range_for_ground_km(ground_range_km, rung.elevation_deg);
 
         let mut corners = [Sample::missing(SampleStatus::NoCoverage); 4];
@@ -1462,9 +1027,8 @@ impl<'a> VolumeSampler<'a> {
             weights[side * 2] = wa * (1.0 - fr);
             weights[side * 2 + 1] = wa * fr;
         }
-        // These corners span *gates* (and radials) of one sweep, so the
-        // guard's line sits at `SEAM_PROXIMITY_ACROSS_GATES` — see the
-        // constant for the corpus that set it apart from the tilt path's.
+        // These corners span *gates* (and radials) of one sweep, so the guard's
+        // line sits at `SEAM_PROXIMITY_ACROSS_GATES`.
         blend(
             self.blend,
             &corners,
@@ -1490,12 +1054,11 @@ fn index_azimuths(radials: &[Radial]) -> (Vec<(f32, u32)>, f64) {
     by_azimuth.sort_by(|a, b| a.0.total_cmp(&b.0));
 
     // The declared angles again, not `by_azimuth`'s wrapped copies: the helper
-    // performs the same wrap itself, and feeding it values that have already
-    // been through the `f32` round-trip would run the quantization twice.
+    // performs the same wrap itself, and feeding it values already through the
+    // `f32` round-trip would run the quantization twice.
     //
     // A sweep with no two distinct azimuths has no observable step. One degree
-    // is the coarsest spacing a WSR-88D produces, so it is the least
-    // presumptuous stand-in: it makes the footprint rule serve half a degree
+    // is the coarsest spacing a WSR-88D produces, so it serves half a degree
     // either side and no more.
     let az_step_deg =
         median_azimuth_step_deg(radials.iter().map(|r| f64::from(r.azimuth_angle_degrees())))
@@ -1530,8 +1093,8 @@ fn azimuth_bracket(rung: &Rung<'_>, azimuth: f64) -> Option<(usize, usize, f64)>
     let half_footprint = rung.az_step_deg / 2.0;
     let gap = (az_hi - az_lo).rem_euclid(360.0);
     if gap <= 0.0 {
-        // One radial, or a duplicated azimuth. Either way there is nothing to
-        // interpolate with, so it serves its own footprint alone.
+        // One radial, or a duplicated azimuth: nothing to interpolate with, so
+        // it serves its own footprint alone.
         let d = (azimuth - az_lo).rem_euclid(360.0);
         return (d.min(360.0 - d) <= half_footprint).then_some((i_lo, i_hi, 0.0));
     }
@@ -1554,15 +1117,11 @@ fn azimuth_bracket(rung: &Rung<'_>, azimuth: f64) -> Option<(usize, usize, f64)>
 /// their centres.
 ///
 /// `first_gate_range_km` is the **centre** of gate 0, so interpolating between
-/// centres is `(slant − first) / interval` with no half-gate subtracted — the
-/// half gate matters to "which gate contains this range", which is a different
-/// question this function is not asking.
+/// centres is `(slant − first) / interval` with no half-gate subtracted.
 fn gate_bracket(moment: &MomentData, slant_km: f64) -> (Sample, Sample, f64) {
     // A zero gate interval is not guarded separately: `gate_interval_km` is a
     // `u16` of metres so it cannot be negative, and dividing by zero lands on
-    // an infinity or a `NaN` that the finiteness test already refuses.
-    // A second guard would be an unreachable branch, and an unreachable branch
-    // is one nothing can pin.
+    // an infinity or a `NaN` the finiteness test already refuses.
     let x = (slant_km - moment.first_gate_range_km()) / moment.gate_interval_km();
     if !x.is_finite() || x < 0.0 {
         // Inside the first gate's centre: the radar has no gate there at all.
@@ -1586,38 +1145,19 @@ fn gate_bracket(moment: &MomentData, slant_km: f64) -> (Sample, Sample, f64) {
     )
 }
 
-/// Decode one gate, by index, without allocating and without walking the
-/// radial — this module's `Sample`, from
-/// [`crate::render::moment_value_at`]'s `MomentValue`.
-///
-/// **The decode used to live here, and now it does not.** These six lines were
-/// the model's `MomentData::iter` spelt a second time, deliberately, for O(1)
-/// random access rather than for allocation — `iter()` is already
-/// allocation-free, and one bilinear sample touches four radials at arbitrary
-/// gate indices, which an iterator cannot serve at any price. That reasoning
-/// was right and still is; what changed is that the readout came to need the
-/// same primitive, and a *third* spelling was the one thing worse than the
-/// second. So the arithmetic moved to `render::moment_value_at` and this is the
-/// translation onto this module's vocabulary.
-///
-/// The mapping is total and loses nothing, which is why it is safe to express
-/// one through the other: `None` is a gate the bytes do not reach and so
-/// [`SampleStatus::BeyondRange`], `Value` is [`Sample::found`], and the two
-/// status variants are their namesakes. In particular a `scale == 0.0` moment —
-/// where the raw words *are* the values and the 0-and-1 status codes are
-/// disabled entirely — arrives as `MomentValue::Value` carrying the raw number,
-/// which is exactly the `Sample::found(raw as f32)` this used to produce.
-///
-/// `raw_gate_decoding_matches_the_model_element_for_element` still guards this,
-/// now over a derived function rather than a duplicate one, and still against
-/// the model's own iterator.
+    /// The ladder, as one line: per rung, `nominal->median radials×gates`.
+    ///
+    /// Hand-written rather than derived because a derived `Debug` would walk
+    /// the borrowed radials and print the whole ~10 M-gate volume.
+    ///
+    /// **The radial and gate counts are the load-bearing part**: on a real
+    /// split cut the two halves share a cut angle *and* a median — 0.4834° for
+    /// both on a measured KMPX VCP 212 volume — so only range separates them,
+    /// 1832 reflectivity gates against 1192. A rung guarding velocity appends
+    /// `±<limit>d` or `±<limit>e` for declared or estimated; the letter is
+    /// what makes a lost declared table visible before the numbers differ.
 fn gate_sample(moment: &MomentData, gate: usize) -> Sample {
     let Some(value) = crate::render::moment_value_at(moment, gate) else {
-        // `raw_values().len()` is authoritative for how many gates there are,
-        // not `gate_count()`: the model's own `raw_gate_values` iterates
-        // `chunks_exact(word)` over the bytes, so a moment whose declared count
-        // overruns its bytes has the gates its bytes have, and the primitive
-        // bounds itself the same way.
         return Sample::missing(SampleStatus::BeyondRange);
     };
     match value {
@@ -1629,54 +1169,25 @@ fn gate_sample(moment: &MomentData, gate: usize) -> Sample {
 
 /// The speed one sweep folds at, m/s, read off the sweep itself.
 ///
-/// # Why this is the Nyquist velocity, and why it is sound when it is not
-///
-/// A folded field always contains gates *at* the fold limit — that is what
-/// folding does to the values it wraps — so when a sweep aliased at all, the
-/// largest speed it reports **is** its Nyquist velocity.
-///
-/// **That is measured, not assumed.** Scored against the archive's own
-/// `nyquist_velocity` (Message 31's Radial Data Block, which `nexrad-decode`
-/// exposes and this crate's render path cannot reach — see
-/// [`Blend::folds_at_measured_limit`]) over 140 rungs of fourteen volumes at
-/// six sites, the ratio of this estimate to the declared number runs
-/// 0.889–1.016, with 133 of the 140 inside 0.96–1.016 and a median of 0.992.
-/// The predicted failure — a weak-flow sweep that never reaches Nyquist and
-/// so reports a limit far below it — did not appear: every operational sweep
-/// examined folded somewhere. Note the ratios above 1: the reported extreme
-/// can exceed the declared Nyquist by one encoding step, and an over-estimate
-/// makes the guard *less* eager, which is the harmless direction.
-///
-/// When a sweep did *not* alias, this is an underestimate — the true Nyquist
-/// is higher than anything the sweep saw. [`FOLD_LIMIT_FLOOR_MS`] closes the
-/// case where that stops meaning anything at all; between the floor and the
-/// truth, an underestimate makes [`straddles_fold`] fire more readily than it
-/// should, which is why the size of the error above is worth having measured.
+/// A folded field always contains gates *at* the fold limit, so when a sweep
+/// aliased at all the largest speed it reports **is** its Nyquist velocity.
+/// Scored against the archive's own `nyquist_velocity` over 140 rungs of
+/// fourteen volumes at six sites, the ratio of this estimate to the declared
+/// number runs 0.889–1.016, median 0.992. When a sweep did *not* alias this is
+/// an underestimate, which makes [`straddles_fold`] fire more readily than it
+/// should; [`FOLD_LIMIT_FLOOR_MS`] closes the case where it stops meaning
+/// anything.
 ///
 /// `crate::nrot`'s `estimate_nyquist` is the same measurement on the same
-/// reasoning, and this module could not call it: that one takes an
-/// already-gridded, already-median-filtered `Vec<Vec<f64>>` built by the NROT
-/// pipeline, which the sampler neither has nor wants to build. **The two uses
-/// have opposite sensitivity to the same error, and the shared reasoning
-/// should not be read as a shared safety argument.** `nrot` scales a threshold
-/// by its estimate, so a low estimate lowers the threshold and is
-/// conservative. This sampler uses it as an exact classification boundary, so
-/// a low estimate widens the fold hypothesis and manufactures false
-/// positives — the same number, the opposite direction of harm.
+/// reasoning, but **the two uses have opposite sensitivity to the same
+/// error**: `nrot` scales a threshold by its estimate, so a low estimate is
+/// conservative there, while this sampler uses it as an exact classification
+/// boundary, where a low estimate manufactures false positives.
 ///
-/// # The arithmetic deliberately mirrors [`gate_sample`]
-///
-/// Only the extreme raw words are converted, not every gate, because the
-/// encoding is affine: `(raw − offset) / scale` is monotone in `raw`, so the
-/// largest `|value|` is reached at the smallest or the largest raw word and
-/// nowhere between. Both ends are converted because a negative `scale` swaps
-/// which is which. The `raw >= 2` filter is [`gate_sample`]'s status codes,
-/// and the `scale == 0.0` skip is its "the raw words *are* the values" arm:
-/// those values are unsigned, so no two can straddle a seam and no limit is
-/// wanted from them.
-///
-/// `None` when nothing here reached [`FOLD_LIMIT_FLOOR_MS`], which switches
-/// the guard off for this sweep entirely.
+/// Only the extreme raw words are converted, because the encoding is affine.
+/// Both ends are converted because a negative `scale` swaps which is which.
+/// The `raw >= 2` filter is [`gate_sample`]'s status codes, and the
+/// `scale == 0.0` skip is its "the raw words *are* the values" arm.
 fn estimate_fold_limit(radials: &[Radial], slot: MomentSlot) -> Option<f64> {
     let mut limit = 0.0f64;
     for radial in radials {
@@ -1722,218 +1233,44 @@ fn estimate_fold_limit(radials: &[Radial], slot: MomentSlot) -> Option<f64> {
 /// adjacent *gates* — the corners of one rung's bilinear — is read as a fold,
 /// as a fraction of the fold limit.
 ///
-/// **This is a fraction, and saying so is the point.** An earlier rule tested
-/// only that the extremes changed sign and spread by more than `limit`, and
-/// argued that `1.0·limit` needed no shading because it is the break-even
-/// point of the two explanations — below it the pair is closer together across
-/// the middle, above it through the seam. That argument is sound about
-/// *likelihood* and wrong about *posterior*: break-even likelihood is
-/// break-even belief only if a fold and a non-fold were equally likely before
-/// either was measured, and they are not. On every population measured the
-/// sign-changing pairs near a spread ratio of 1.0 outnumber the folded ones
-/// by one to two orders of magnitude, so a rule that splits the likelihood
-/// evenly hands almost all of the disputed band to the wrong answer.
+/// The criterion is marginal: each step up stops the guard firing on one band
+/// of pairs holding both confirmed folds (given up) and confirmed shear
+/// (won), and the fraction stops earning where that ratio crosses 1. Over an
+/// arbitration corpus of 56 VCP 31 volumes at 22 sites — VCP 31 being the
+/// only operational pattern that puts the seam at 11–12.5 m/s — the quad
+/// bands cross between 0.55 and 0.65, so `0.60`.
 ///
-/// # Where the number comes from
-///
-/// The criterion is marginal, not global. Each step up in the fraction stops
-/// the guard firing on one band of pairs, and that band holds both
-/// oracle-confirmed folds (now averaged across the seam — given up) and
-/// oracle-confirmed shear (no longer refused — won). The fraction stops
-/// earning at the step where the band's confirmed shear stops outnumbering
-/// its confirmed folds — where that ratio crosses 1. Swept by the corpus
-/// apparatus on branch `campaign-harness` over its arbitration corpus — 56 VCP 31 volumes over 22 sites and eight
-/// dates, VCP 31 being the only operational pattern that puts the seam at
-/// 11–12.5 m/s — the quad bands cross between 0.55 and 0.65, so `0.60`. The
-/// KILN holdout, a site the arbitration never saw, measured once and
-/// afterwards, reproduces the crossing to within one band; the seven-volume
-/// storm control and the VCP 32/35 mid-Nyquist control are recorded with the
-/// corpus on that branch.
-///
-/// # What the shipped point costs
-///
-/// A break-even keeps a trade, and the kept side is recorded here rather
-/// than left to a re-run. Measured on the KILN holdout — clear-air VCP 31,
-/// once: at the then-shipped `0.60`/`0.67` the guard still passes **2,925
-/// fabricating quads and 2,199 fabricating rung pairs**, oracle-confirmed
-/// folds it now declines that average to near-calm. (On KILN the quad rows
-/// at `0.65` and `0.67` are identical: legacy-resolution velocity is
-/// quantised at 0.5 m/s, and at that site's ~12.5 m/s estimated limits no
-/// half-m/s reading falls between the two bounds.) The seven-volume storm
-/// control fabricated nothing at the shipped fractions on its original
-/// measuring run — a claim scoped to that run, whose corpus hours were
-/// never recorded, not a property of storm volumes in general.
-///
-/// # Why the labelled corpus left this number alone and moved the other
-///
-/// The oracle those bands were counted against abstains where the decision
-/// is hard and, worse, is *wrong* in a direction that depends on the path.
-/// `seam_truth` — the corpus instrument on branch `campaign-harness`, not in
-/// this tree — re-scores both paths against labelled ground truth: it sweeps
-/// the declared Nyquist says never wrapped, re-folded at a real VCP 31 seam
-/// with the RDA's own arithmetic, so every pair's answer is known. Of the
-/// oracle's `Smooth` verdicts on **quads**, 7.4% (arbitration) and 12.1%
-/// (holdout) are really folds; on **rung pairs** it is 20.6% and 27.8%.
-/// The miscount is two to three times worse vertically, and it lands
-/// entirely in the "confirmed shear" column that placed each break-even.
-///
-/// So the horizontal band count was near enough right and this number
-/// stays, while the vertical one was not — see
-/// [`SEAM_PROXIMITY_ACROSS_TILTS`], which moved.
-///
-/// **What is left open here, deliberately.** Against the label the quad
-/// bands cross 1:1 between `0.25` and `0.30` on both labelled corpora, not
-/// between `0.55` and `0.65`, so a purely marginal criterion would move
-/// this number a long way down too. It is not moved, for three reasons that
-/// are about evidence rather than inertia. The quad false-fire rate at
-/// `0.60` has already collapsed — 0.20% (arbitration) and 0.54% (holdout)
-/// of labelled-smooth candidates — so there is little left to buy. Quad
-/// recall at `0.60` is already 86–90%, against 92–95% at `0.50`, so there
-/// is little left to win. And both labelled corpora are *high*-base-rate
-/// populations (64% and 69% of quad candidates are folds); the only
-/// low-base-rate corpus ever measured, KILN at 12%, put the quad error
-/// minimum at `0.45–0.50` rather than at the bottom of the grid, and no
-/// low-base-rate quad holdout has been built since. Moving both fractions
-/// in one pass would also confound the two paths' evidence, which is the
-/// mistake the split exists to prevent. A low-base-rate labelled quad
-/// holdout is what would settle it.
-///
-/// # The low-base-rate quad holdout now exists, and it moves this number up
-///
-/// The fresh corpus described on [`SEAM_PROXIMITY_ACROSS_TILTS`] — 18 sites
-/// and four dates disjoint from every corpus above, registered before
-/// fetching — carries quad base rates of **54.5%** and **26.7%**, against the
-/// 64% and 69% here. That is the missing stratum, and it confirms the
-/// suspicion this text records rather than overturning it: the 1:1 crossing is
-/// a **function of the base rate**, not of the guard.
-///
-/// | corpus | quad base rate | 1:1 crossing | err argmin |
-/// |---|---|---|---|
-/// | shipped arbitration | 64% | 0.25–0.30 | — |
-/// | shipped holdout | 69% | 0.25–0.30 | — |
-/// | fresh arbitration | 54.5% | 0.40–0.45 | 0.40 |
-/// | fresh holdout | 26.7% | 0.45–0.50 | 0.45 |
-/// | KILN (oracle-era) | 12% | — | 0.45–0.50 |
-///
-/// Five populations, monotone — and the relationship is pinned in this tree by
-/// `the_break_even_moves_up_as_folds_get_rarer`, which needs no corpus because
-/// the effect is arithmetic. So "the labelled bands cross between 0.25 and
-/// 0.30" was never a statement about where this line belongs; it was a
-/// statement about how fold-rich those two corpora were. **The reason given
-/// above for not moving this number was the right reason, and the evidence
-/// that would have moved it does not exist.**
-///
-/// It does not, however, reach `0.60`. Even at a 12–27% base rate the labelled
-/// break-even sits near `0.45–0.50`, so this constant remains roughly one to
-/// three grid steps above where the labelled evidence puts it. What that costs
-/// is small and is now measured on a disjoint corpus: at `0.60` quad recall is
-/// **90.6%** (fresh arbitration) and **78.4%** (fresh holdout) against 93.5%
-/// and 85.1% at `0.50`, for a false-fire rate of **0.544%** and **0.863%**
-/// against 1.085% and 1.811%. The 86–90% recall quoted above replicates on a
-/// fold-rich half and **does not** on a fold-poor one, which is the same
-/// lesson the vertical table teaches: these percentages are corpus
-/// properties. The trade at the shipped point is still a defensible one and
-/// the number is left where it is, now with a reason that survives its own
-/// evidence.
+/// Against *labelled* truth the crossing moves with the fold base rate (64%
+/// of quad candidates → 0.25–0.30; 26.7% → 0.45–0.50; 12% → 0.45–0.50), which
+/// is arithmetic rather than weather and is pinned in this tree by
+/// `the_break_even_moves_up_as_folds_get_rarer`. So `0.60` sits one to three
+/// grid steps above the labelled evidence, costing 90.6% / 78.4% quad recall
+/// against 93.5% / 85.1% at `0.50`, for a false-fire rate of 0.544% / 0.863%
+/// against 1.085% / 1.811%. These percentages are corpus properties.
 const SEAM_PROXIMITY_ACROSS_GATES: f64 = 0.60;
 
 /// How near the seam both rungs must sit before a straddle between adjacent
 /// *tilts* — the pair [`Column::at_height_km`] lerps between — is read as a
 /// fold, as a fraction of the fold limit.
 ///
-/// # Why this is not [`SEAM_PROXIMITY_ACROSS_GATES`], and why it is *below*
+/// **Why this is below [`SEAM_PROXIMITY_ACROSS_GATES`].** [`straddles_fold`]'s
+/// argument — one wrap of a smooth field leaves *both* sides near `±limit` —
+/// assumes the pair's own true change is small next to the Nyquist interval.
+/// Between adjacent gates of one sweep that holds. Between adjacent tilts the
+/// rungs sit hundreds of metres apart, so a genuine fold often presents with
+/// one end deep inside the range, which the rule reads as shear.
 ///
-/// [`straddles_fold`]'s argument — one wrap of a smooth field leaves *both*
-/// sides of the discontinuity near `±limit` — assumes the pair's own true
-/// change is small next to the Nyquist interval. Between adjacent gates of
-/// one sweep that holds. Between adjacent tilts it fails: the two rungs sit
-/// hundreds of metres apart, and against a 12.3 m/s Nyquist the real veer
-/// across that depth moves a reading well away from the seam before it
-/// wraps, so a genuine fold across tilts often presents with one end deep
-/// inside the range — the shape the rule reads as shear.
+/// **`0.50` is a floor, not an argmin.** Mean error falls monotonically as the
+/// fraction falls, which would argue for `0.25`, but the error curve moves
+/// with the fold base rate and so cannot arbitrate; and below `½` the rule
+/// stops being strictly stronger than the one it replaced —
+/// [`straddles_fold`] fires on `hi − lo > 2f·limit`, which at `f ≥ ½` clears
+/// half a Nyquist period, and the `const` assertion in
+/// `each_guard_draws_its_line_at_its_own_fraction` refuses to *build* a
+/// fraction under `½`.
 ///
-/// **That physics says this fraction must be the lower of the two, and for
-/// two years it shipped as the higher.** If a real vertical fold arrives
-/// with one end deep inside the range, then a bound placed far out catches
-/// fewer of them, and the way to catch more is to bring the bound *in*. The
-/// observation the old text reasoned from is the same one — quad recall
-/// exceeds rung-pair recall at every fraction, by 2.4–13.0 points at `0.50`
-/// and 14.4–51.6 at `0.75` — but a vertical path that is already losing
-/// folds faster is a path that should spend *less* of its fraction, not
-/// more. What sent the old number the other way was not the physics; it was
-/// the oracle. See below.
-///
-/// One constant serving both paths would still put both numbers wrong, and
-/// whoever tuned it would be trading quad false fires against rung-pair
-/// recall without either trade being visible. The split stands; only the
-/// direction of the gap changed.
-///
-/// # Where `0.67` came from, and why it fell
-///
-/// `0.67` was the crossing of the *oracle's* rung-pair marginal bands —
-/// confirmed folds given up against confirmed shear refused, crossing 1:1
-/// between 0.65 and 0.70. That oracle infers from the surrounding field
-/// rather than knowing, and `seam_truth` measured how often it is wrong:
-/// **20.6% of its rung-pair `Smooth` verdicts on the arbitration corpus,
-/// and 27.8% on the holdout, are labelled folds**, against 7.4% and 12.1%
-/// on quads. Every one of those is a real fold booked into the "confirmed
-/// shear refused" column — the column whose growth pushed the vertical
-/// crossing upward. The vertical break-even was high because the vertical
-/// path is exactly where the oracle was weakest.
-///
-/// Against the label the same marginal criterion crosses 1:1 between `0.25`
-/// and `0.30` on the arbitration corpus and below `0.25` on the holdout.
-/// Every band from `0.30` up gives away more real folds than it saves real
-/// shear, on both corpora.
-///
-/// # Where `0.50` comes from — a floor, not an argmin
-///
-/// **The measured optimum is not the shipped number and must not be.**
-/// Mean error in the reported speed falls monotonically as the fraction
-/// falls, all the way to the bottom of the swept grid, on both corpora, in
-/// three weightings (pooled, pooled minus the largest single volume, and
-/// one vote per site), at three synthetic seams, and whether or not the
-/// source volumes are restricted to clear-air patterns. Taken literally
-/// that argues for a fraction near `0.25`, and two things forbid it:
-///
-/// * **The error curve moves with the fold base rate, so it cannot
-///   arbitrate.** Both labelled corpora here are fold-rich — 47.9% and
-///   63.8% of rung candidates — and a fold-rich population always pulls the
-///   minimum down, because a missed fold costs up to a whole Nyquist
-///   interval while a false fire costs about one vertical step. The old
-///   KILN holdout at 12% put its minimum four grid steps higher. What
-///   transfers between populations is the operating point, not the argmin.
-/// * **Below `½` the rule stops being strictly stronger than the rule it
-///   replaced.** [`straddles_fold`] fires on `hi − lo > 2f·limit`; at
-///   `f ≥ ½` that clears half a Nyquist period and so implies the old
-///   sign-change-and-spread test, and below `½` it does not. That is not a
-///   preference: `the_straddle_test_needs_both_extremes_near_the_seam`
-///   sweeps a ±30 m/s grid against the old rule on both paths and pins the
-///   implication at the fraction that ships, and the `const` assertion in
-///   `each_guard_draws_its_line_at_its_own_fraction` refuses to *build* a
-///   fraction under `½` at all.
-///
-/// `0.50` is the lowest fraction that keeps that property. It is also where
-/// a decision-maker who charges three false fires per missed fold lands
-/// independently on *both* corpora — the labelled bands fall through 3:1
-/// between `0.45` and `0.50` on each — and it is an interior point of the
-/// swept grid rather than its edge. It is not a new number: `0.5` is what
-/// both paths shipped before the split, and the corpus that split them was
-/// scored by the oracle now known to be weakest here.
-///
-/// # The corpora
-///
-/// Both scored by `seam_truth` against labelled truth at a 11.50 m/s
-/// synthetic seam, and site-disjoint from each other:
-///
-/// * **Arbitration** — 113 volumes, 13 sites, three dates; 56 contribute.
-///   15 692 rung candidates, 7 520 labelled folds (47.9%).
-/// * **Holdout** — 497 volumes, 23 sites, four dates, none shared with the
-///   arbitration set; 102 contribute and **30 volumes over 10 sites carry
-///   at least one labelled vertical fold**. 19 592 rung candidates, 12 505
-///   labelled folds (63.8%). Built specifically because the previous
-///   labelled holdout contained **no vertical folds at all**, which left
-///   the whole vertical case resting on one corpus.
+/// Scored by `seam_truth` against labelled truth at a 11.50 m/s synthetic
+/// seam over two site-disjoint corpora (47.9% and 63.8% fold base rates):
 ///
 /// | f | arb recall | arb false-fire | holdout recall | holdout false-fire |
 /// |---|---|---|---|---|
@@ -1942,209 +1279,37 @@ const SEAM_PROXIMITY_ACROSS_GATES: f64 = 0.60;
 /// | 0.60 | 56.0% | 2.75% | 65.6% | 5.67% |
 /// | 0.67 | 49.8% | 1.60% | 61.8% | 4.52% |
 ///
-/// Mean error in the reported speed, m/s: `3.37` at `0.50` against `4.02`
-/// at `0.67` on the arbitration corpus, and `3.46` against `3.91` on the
-/// holdout. The path's guard-off error is 6.46 and 8.03 m/s against a
-/// guard-on error of 3.07 and 3.12 — missing a vertical fold costs roughly
-/// twice what firing on one costs, which is the asymmetry the move buys.
+/// Missing a vertical fold costs roughly twice what firing on one costs.
+/// **65.0–70.2% is a property of a corpus, not of this constant**: a third,
+/// site- and date-disjoint corpus replicates substantially but not exactly,
+/// and its 10.9%-base-rate half puts the break-even on the shipped fraction.
 ///
-/// The source sweeps are *rougher* than the population this guard governs
-/// (mean adjacent-gate step 0.92 against 0.59 m/s on the arbitration
-/// corpus, 1.23 against 0.85 on the holdout), so the false-fire rates above
-/// are conservative and the recalls pessimistic.
+/// **Where this guard fails.** Recall by mid-beam height runs 37.2 / 62.9 /
+/// 80.0 / 73.5 / 46.8 / 39.9 / 27.3% across 0–1, 1–2, 2–4, 4–6, 6–8, 8–11 and
+/// 11+ km, while by slant range it is a 19-point spread with no trend:
+/// **height is the organising axis; range is not**. At `f = 0.50` against an
+/// 11.50 m/s seam the line sits at 5.75 m/s, and the mean *true* change
+/// between adjacent rungs reaches 5.39 m/s in the 6–8 km stratum — the
+/// premise failing, which
+/// `recall_falls_away_as_the_true_change_reaches_the_guards_own_line` pins.
+/// Bringing the line in catches the real shear with it.
 ///
-/// # What the pre-corpus text here claimed, corrected
-///
-/// The first version of this guard shipped `0.5` for both paths, argued from
-/// one clear-air volume and a fourteen-volume mixed corpus, and its doc made
-/// two claims the VCP 31 corpus overturned. It said neither the old rule nor
-/// this one ever fires on a pair the oracle can confirm is smooth shear:
-/// pooled over the arbitration corpus at `0.5`, the guard fires on 4,774
-/// confirmed-shear quads and 9,034 confirmed-shear rung pairs. And it read
-/// as if the box rule kept every real fold by construction, which the
-/// vertical path never did: at `0.5` the rung-pair guard already misses 6.6%
-/// of oracle-confirmed folds (93.4% recall pooled), and at `0.75` it would
-/// miss 30.8% (69.2%). The by-construction argument is a good approximation
-/// exactly where [`SEAM_PROXIMITY_ACROSS_GATES`] applies; here it is only a
-/// tendency, which is why this number is a measured break-even and not a
-/// theorem.
-///
-/// # What the shipped point costs
-///
-/// It still misses folds, and the number is here rather than left to a
-/// re-run: at `0.50` the vertical guard keeps **65.0%** of labelled rung
-/// folds on the arbitration corpus and **70.2%** on the holdout, so between
-/// a third and three-tenths of real vertical folds are still averaged
-/// across the seam. It also fires on smooth shear more often than the old
-/// number did — 5.26% and 7.70% of labelled-smooth candidates against 1.60%
-/// and 4.52% — and those are fabricated discontinuities in a real field.
-/// Both costs are paid knowingly: the mean error in the number the sampler
-/// reports falls on every stratum measured, which is the quantity that puts
-/// the two costs on one scale.
-///
-/// The older KILN-holdout figure this replaces — rung recall 63.06% at
-/// `0.67` — was scored against the oracle, not against a label, and is kept
-/// out of the table above for that reason.
-///
-/// # Where the evidence for this number lives, at two levels of effort
-///
-/// * **In this tree, on every build** — `sampler::seam_fixture` scores the
-///   shipped rule against labelled truth on a generated population. It runs in
-///   milliseconds, is not `#[ignore]`d, and pins the *structure* the argument
-///   below depends on: that the fraction trades recall against false fires in
-///   one direction, that the break-even moves up as folds get rarer, that
-///   recall collapses once the pair's own true change reaches the guard's
-///   line, and what both shipped fractions produce on that fixture. Moving
-///   either constant one grid step fails it.
-/// * **On branch `campaign-harness`** — the corpus apparatus: the fetch, the
-///   labelling machinery, and the 208-volume sweep that produced every
-///   percentage below. That is where the cost *on real weather* is measured,
-///   and it needs a corpus on disk.
-///
-/// The fixture cannot say what the guard costs on weather and the sweep cannot
-/// run in CI, so neither is redundant. What follows is the sweep's.
-///
-/// # Replicated on a fresh corpus, and what the replication changed
-///
-/// The corpora above are not reproducible from this tree. A third was built to
-/// be **site-disjoint and date-disjoint from both** — 18 sites and four 2025
-/// dates registered in writing before the first volume was fetched, 208
-/// volumes held, 97 contributing — and run through the same `seam_truth`
-/// labelling with nothing re-tuned. It splits into a fold-rich half and, for
-/// the first time, **the low-base-rate labelled corpus the text above says
-/// would settle this and had never been built**.
-///
-/// | corpus | rung base rate | recall @ 0.50 | false-fire @ 0.50 |
-/// |---|---|---|---|
-/// | shipped arbitration | 47.9% | 65.0% | 5.26% |
-/// | shipped holdout | 63.8% | 70.2% | 7.70% |
-/// | **fresh arbitration** | **48.1%** | **58.9%** | **2.98%** |
-/// | **fresh holdout** | **10.9%** | **27.9%** | **0.92%** |
-///
-/// At a base rate matched to the shipped arbitration corpus almost exactly —
-/// 48.1% against 47.9% — recall lands 6.1 points low and false-fire 2.28
-/// points low, both about one corpus-to-corpus spread from the figures above.
-/// The table is **substantially replicated and not exactly reproduced**, and
-/// the residual has a visible cause: recall on this path is strongly
-/// height-dependent (below) and the two corpora do not share a height
-/// distribution. **The honest reading is that 65.0–70.2% is not a property of
-/// this constant. It is a property of a corpus, and it should be read as an
-/// order of magnitude rather than as a figure.**
-///
-/// **And the residual has a known sign.** Source sweeps are rougher than the
-/// population this guard governs — mean adjacent-gate step 1.069 m/s against
-/// the governed 0.479 on the fresh arbitration half, 1.479 against 0.851 on
-/// the holdout — so `SEAM_MAX_STEP` was used to walk the source population
-/// towards the governed one:
-///
-/// | roughness ceiling | volumes | rung base rate | recall @ 0.50 |
-/// |---|---|---|---|
-/// | unbounded (mean 1.069) | 43 | 48.1% | 58.9% |
-/// | 0.90 m/s | 5 | 57.3% | 64.6% |
-/// | 0.70 m/s | 2 | 60.8% | 80.5% |
-/// | 0.479 m/s (the governed mean) | **0** | — | — |
-///
-/// Recall rises monotonically as the sources approach the field this guard
-/// actually runs on, and the matched stratum is **empty** — no source sweep in
-/// 208 is as smooth as the governed population's mean, which is the same wall
-/// the module doc records for the VCP 31 stratum. So the "recalls are
-/// pessimistic" claim above is confirmed with a direction and a slope, on two
-/// to five volumes rather than none: the operational recall of this guard is
-/// **higher than any figure in either table**, and 58.9% is a floor rather
-/// than an estimate. The confound is bounded, not removed.
-///
-/// What the fresh corpus does settle is the number itself. Scoring the
-/// marginal bands the way the text above does, the 1:1 crossing moves
-/// monotonically with the fold base rate, on both paths:
-///
-/// | corpus | path | base rate | 1:1 crossing | err argmin |
-/// |---|---|---|---|---|
-/// | fresh arbitration | rungs | 48.1% | 0.30–0.35 | 0.25 (grid floor) |
-/// | **fresh holdout** | **rungs** | **10.9%** | **0.50–0.55** | **0.40** |
-/// | fresh arbitration | quads | 54.5% | 0.40–0.45 | 0.40 |
-/// | fresh holdout | quads | 26.7% | 0.45–0.50 | 0.45 |
-///
-/// So the argument above — that a fold-rich population pulls the error minimum
-/// down and therefore cannot arbitrate — is no longer only plausible, it is
-/// measured: at a 10.9% base rate the argmin lifts off the grid floor to an
-/// interior `0.40`, and the vertical break-even lands **on the shipped
-/// fraction**. `0.50` was kept as a floor taken from the rule's own algebra
-/// rather than from a fold-rich argmin, and a corpus with an operational base
-/// rate independently puts the break-even there. **The constant is right, and
-/// now for a second and unrelated reason.** The base-rate relationship itself
-/// is arithmetic rather than weather, so it is pinned in this tree too, by
-/// `the_break_even_moves_up_as_folds_get_rarer`.
-///
-/// # Where this guard fails, and what it shares with the dealiaser
-///
-/// Scored in strata of the pair's mid-beam height on the fresh arbitration
-/// half — the axis the dealiaser's own recovery failure organises on:
-///
-/// | mid-beam height | candidates | recall @ 0.50 | mean true \|Δv\| |
-/// |---|---|---|---|
-/// | 0–1 km | 13 297 | 37.2% | 1.47 m/s |
-/// | 1–2 km | 9 390 | 62.9% | 1.67 |
-/// | 2–4 km | 8 819 | 80.0% | 1.89 |
-/// | 4–6 km | 9 716 | 73.5% | 2.78 |
-/// | **6–8 km** | 7 290 | **46.8%** | **5.39** |
-/// | 8–11 km | 7 379 | 39.9% | 5.79 |
-/// | 11+ km | 1 301 | 27.3% | 7.95 |
-///
-/// Binned by **slant range** instead, over the same candidates, recall reads
-/// 55.3 / 66.9 / 54.4 / 52.8 / 52.0 / 56.7 / 48.0% across 0–20 … 125+ km — a
-/// 19-point spread with no trend, against a 53-point spread that falls
-/// monotonically from 4 km up. **Height is the organising axis; range is
-/// not**, and the control is what makes that a finding rather than a
-/// coincidence of two correlated variables.
-///
-/// The mechanism is the last column, and it is this constant's own premise
-/// failing. [`straddles_fold`] assumes the pair's true change is small next to
-/// the Nyquist interval. At `f = 0.50` against the corpus's 11.50 m/s seam the
-/// guard's line sits at 5.75 m/s, and the mean *true* change between adjacent
-/// rungs reaches **5.39 m/s in the 6–8 km stratum** — 47% of the interval,
-/// which is the line itself. Recall collapses exactly where the premise does,
-/// and `recall_falls_away_as_the_true_change_reaches_the_guards_own_line` pins
-/// that mechanism in this tree without needing a volume.
-/// Moving the fraction cannot repair it: bringing the line in far enough to
-/// catch those folds catches the real shear with them, which is what that
-/// stratum's false-fire rate — 7.14%, the corpus maximum — already shows.
-///
-/// **This is why this guard and the dealiaser fail together without either
-/// feeding the other.** That the two are disconnected is checkable rather than
-/// asserted, in three steps that between them close the path:
-///
-/// 1. `crate::nrot::dealias` takes `&mut [Vec<f64>]` — a bare velocity grid —
-///    and returns no [`Scan`]. Its output cannot become a sweep, so it cannot
-///    reach a [`VolumeSampler`] by that route at all.
-/// 2. The only scans in the crate carrying post-dealias content are
-///    `crate::derive`'s synthetic ones, and `synth_sweep` tags every one of
-///    them `NormalizedRotation`, `StormRelativeVelocity` or
-///    `SpecificDifferentialPhase`. **`RadarProduct::Velocity` is never a
-///    derived product** — the string does not appear in that module.
-/// 3. [`Blend::folds_at_measured_limit`] arms this guard for
-///    `RadarProduct::Velocity` and nothing else.
-///
-/// So the field this guard runs on is the archive's own folded velocity
-/// moment, every time, and a dealiaser fix cannot reach it. The shared failure
-/// is
-/// therefore not a dependency but a shared cause — above 6–8 km the real
-/// velocity change between adjacent measurement heights becomes comparable to
-/// the Nyquist interval, and every method that resolves the ambiguity by
-/// assuming vertical continuity loses its footing at the same place. The
-/// relationship is **independent code paths, one common cause**, on the same
-/// axis with the same knee. A repair to one will not move the other.
+/// **This guard and the dealiaser fail together without either feeding the
+/// other**: `crate::nrot::dealias` takes a bare velocity grid and returns no
+/// [`Scan`], the only scans carrying post-dealias content are
+/// `crate::derive`'s synthetic ones and none is `RadarProduct::Velocity`, and
+/// [`Blend::folds_at_measured_limit`] arms this guard for
+/// `RadarProduct::Velocity` alone. Above 6–8 km the real velocity change
+/// between adjacent measurement heights becomes comparable to the Nyquist
+/// interval, and every method assuming vertical continuity loses its footing.
 const SEAM_PROXIMITY_ACROSS_TILTS: f64 = 0.50;
 
 /// Which adjacency a velocity blend spans, carrying the fold limit its guard
 /// tests against.
 ///
-/// This is how the two seam-proximity constants stay with their own paths:
-/// the fraction cannot be passed at all. A call site says which adjacency its
-/// corners span, and the number follows from that inside [`straddles_fold`] —
-/// so putting [`SEAM_PROXIMITY_ACROSS_TILTS`] on the bilinear takes a call
-/// site claiming in words that gate neighbours are tilt neighbours, where a
-/// bare fraction parameter would have compiled with the two values swapped
-/// and said nothing.
+/// This is how the two seam-proximity constants stay with their own paths: the
+/// fraction cannot be passed at all. A bare fraction parameter would have
+/// compiled with the two values swapped and said nothing.
 #[derive(Clone, Copy)]
 enum Seam {
     /// The corners of one rung's bilinear — adjacent gates and adjacent
@@ -2159,67 +1324,28 @@ enum Seam {
 
 /// Whether these corners sit on opposite sides of the fold seam they span.
 ///
-/// **What a fold does is wrap a continuous field across `±limit`, so both
-/// sides of the discontinuity it leaves behind are *near* `±limit`.** Take a
-/// field passing smoothly through the seam between two samples: the true
-/// speeds are `limit − a` and `limit + b` for small `a`, `b`, and what gets
-/// reported is `limit − a` and `−(limit − b)`. Both readings are within the
-/// pair's own true change of the seam. So a straddle whose *smaller* extreme
-/// sits well inside the range cannot be one fold of a smooth field — it is
-/// real shear, and this refuses it.
+/// **A fold wraps a continuous field across `±limit`, so both sides of the
+/// discontinuity it leaves are *near* `±limit`.** For a field passing smoothly
+/// through the seam the true speeds are `limit − a` and `limit + b` for small
+/// `a`, `b`, and what gets reported is `limit − a` and `−(limit − b)`. So a
+/// straddle whose *smaller* extreme sits well inside the range cannot be one
+/// fold of a smooth field — it is real shear.
 ///
-/// That is the whole rule: `lo < −f·limit && hi > f·limit`, where `seam`
-/// says what the corners are adjacent across and `f` follows from that —
-/// [`SEAM_PROXIMITY_ACROSS_GATES`] or [`SEAM_PROXIMITY_ACROSS_TILTS`], which
-/// is where the two numbers and the corpus that set them are argued. Two
-/// things the rule used to say separately fall out of it and are not tested
-/// again. Opposite signs: `lo` is below a negative bound and `hi` above a
-/// positive one. More than half a period of spread: `hi − lo > 2f·limit`,
-/// which at any `f ≥ ½` — and both shipped fractions are — clears a whole
-/// period, so on either path this is *strictly stronger* than the
-/// sign-change-and-spread rule it replaced and can only fire where that
-/// fired.
+/// The rule is `lo < −f·limit && hi > f·limit`, where `seam` says what the
+/// corners are adjacent across and `f` follows from that. Opposite signs and
+/// `hi − lo > 2f·limit` both fall out of it, and at `f ≥ ½` that clears a
+/// whole period — so this is strictly stronger than the
+/// sign-change-and-spread rule it replaced.
 ///
-/// Only the extreme pair is tested. That is exhaustive rather than a shortcut:
-/// if any pair among the corners straddles, the widest pair's ends are at
-/// least as far either side of zero, so the extremes straddle too.
+/// Only the extreme pair is tested, which is exhaustive rather than a
+/// shortcut: if any pair among the corners straddles, the widest pair's ends
+/// are at least as far either side of zero.
 ///
-/// # What the fractions buy, and what they do not
-///
-/// The recall, false-fire and per-band numbers live with the constants, and
-/// two instruments measured them: `sampler::seam_fixture` in this tree, which
-/// scores this function against labelled truth on every build, and the corpus
-/// apparatus on branch `campaign-harness`, which does it on archive volumes.
-/// An earlier version of
-/// this comment carried a was→now fire table over a fourteen-volume mixed
-/// corpus and two claims measured at the first shipped fraction — `0.5` on
-/// both paths: that neither the old rule nor this one ever fires on a pair
-/// the oracle can confirm is smooth shear, and, riding the construction
-/// argument above, that every real fold is kept. The VCP 31 corpus
-/// overturned both — the correction, with numbers, is on
-/// [`SEAM_PROXIMITY_ACROSS_TILTS`] — and the table went with them because
-/// its "now" column described `0.5`, which no longer ships on either path.
-///
-/// What the fractions do not do survives every corpus and is recorded so
-/// nobody re-derives it: they do not empty the disputed population. On a
-/// low-Nyquist clear-air volume ordinary boundary-layer shear is comparable
-/// to the seam itself, no test on two numbers can separate the two, and
-/// raising either fraction only moves through that population — which is why
-/// both stop at their measured break-even rather than pressing on towards
-/// certainty.
-///
-/// # The shape of the spread statistic, stated where it holds
-///
-/// On volumes that fold hard the spread is sharply bimodal — ordinary
-/// zero-crossings below `0.4·limit`, folds piled against `2·limit`, a valley
-/// around `1.2–1.6·limit` (KCRP 2017-08-26, quad spreads: 1961 counts in the
-/// lowest tenth, 27 in the `1.5` bin, 7913 in the `2.0` bin). That is *not*
-/// general. On the clear-air volume the histogram is broad and flat with no
-/// valley at all (155/182/244/206/209/170/185/169/176/173 across the first ten
-/// bins), and on the quiet KCRP 2021-08-01 volume it decays monotonically with
-/// no second mode. A threshold cannot be placed "in the valley" on a
-/// distribution that has none, which is the other half of why the argument
-/// here is about what folding *does* rather than about where the counts fall.
+/// The fractions do **not** empty the disputed population: on a low-Nyquist
+/// clear-air volume ordinary boundary-layer shear is comparable to the seam
+/// itself. The spread statistic is sharply bimodal only on volumes that fold
+/// hard; on a clear-air volume the histogram is broad and flat with no valley
+/// at all, so a threshold cannot be placed "in the valley".
 fn straddles_fold(corners: &[Sample], seam: Seam) -> bool {
     let (fraction, limit) = match seam {
         Seam::AcrossGates(limit) => (SEAM_PROXIMITY_ACROSS_GATES, limit),
@@ -2237,44 +1363,23 @@ fn straddles_fold(corners: &[Sample], seam: Seam) -> bool {
 /// Combine weighted corner samples.
 ///
 /// **Interpolation needs every corner to have measured something.** If any one
-/// of them did not, the answer is the corner carrying the most weight,
-/// verbatim — value and status both. That is deliberate and it is the whole
-/// treatment of edges:
+/// did not, the answer is the corner carrying the most weight, verbatim —
+/// value and status both. At an echo edge, blending a number towards "below
+/// threshold" would require inventing a number for it; taking the heaviest
+/// corner puts the boundary at the half-weight point. A range-folded gate
+/// stays range folded over its own half of the interval instead of being
+/// averaged out of existence.
 ///
-/// * Inside solid echo all corners are values, so the result is a true
-///   bilinear (and a true vertical lerp), which is what makes a section look
-///   like a section rather than like a stack of tiles.
-/// * At an echo edge one corner is below threshold, and blending a number
-///   towards "below threshold" would require inventing a number for it. Taking
-///   the heaviest corner instead puts the boundary at the half-weight point —
-///   the same place a linear ramp would have crossed the middle — and
-///   fabricates nothing.
-/// * A range-folded gate stays range folded over its own half of the interval
-///   instead of being averaged out of existence, which is the reporting
-///   `MomentValue::RangeFolded` never got from this crate before.
-///
-/// `seam` extends that last idea to corners that all *did* measure
-/// something. **A velocity pair straddling the Nyquist seam averages to a
-/// number neither gate saw, and the number it averages to reads as calm air:
-/// +24.50 and −24.50 m/s average to exactly 0.000, which is the display's word
-/// for "no motion" written over the display's word for "as fast as this radar
-/// can report".** Averaging cannot be rescued there — the seam is a
-/// discontinuity, and no weighted mean of two points on opposite sides of one
-/// lands near either. So a straddle falls through to the same heaviest-corner
-/// answer an echo edge gets, for the same stated reason: it fabricates
-/// nothing. See [`straddles_fold`] for how a straddle is recognised, and the
-/// [`Seam`] variants for why the recognition draws its line differently
-/// across gates than across tilts; `None` means this moment has no seam to
-/// straddle and restores the previous behaviour exactly.
+/// `seam` extends that to corners that all *did* measure something: +24.50 and
+/// −24.50 m/s average to exactly 0.000, the display's word for "no motion"
+/// written over its word for "as fast as this radar can report". No weighted
+/// mean of two points on opposite sides of a discontinuity lands near either,
+/// so a straddle falls through to the same heaviest-corner answer.
 ///
 /// **Heaviest means the largest bilinear weight — the *nearest* sample — not
 /// the largest magnitude.** Picking the fastest corner would bias every fold
-/// edge outward and turn this from an interpolation into a peak-hold; picking
-/// the nearest is ordinary nearest-neighbour resampling, which is what
-/// interpolation degrades to when interpolation is not defined.
-///
-/// Ties go to the earliest corner, so the result does not depend on iteration
-/// order.
+/// edge outward and turn this into a peak-hold. Ties go to the earliest
+/// corner, so the result does not depend on iteration order.
 fn blend(kind: Blend, corners: &[Sample], weights: &[f64], seam: Option<Seam>) -> Sample {
     debug_assert_eq!(
         corners.len(),

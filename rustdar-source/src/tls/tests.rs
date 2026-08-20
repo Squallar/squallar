@@ -1,6 +1,6 @@
-/// Names the backend rather than asserting "a provider is installed", so
-/// that a dependency re-enabling `reqwest/rustls` — which brings back
-/// `aws-lc-rs` and the silent fallback — fails here.
+/// Names the backend rather than asserting "a provider is installed", so that a
+/// dependency re-enabling `reqwest/rustls` — which brings back `aws-lc-rs` —
+/// fails here.
 #[test]
 fn init_installs_ring() {
     super::init();
@@ -17,9 +17,6 @@ fn init_is_idempotent() {
     assert!(super::default_is_ring());
 }
 
-// No test that `default_is_ring` is a real comparison: the subprocess probes
-// below already pin it from both sides (`!default_is_ring()` on entry,
-// `default_is_ring()` after), so a constant in either direction fails one.
 
 /// Poll to completion *only if* the future never yields. `None` means it
 /// waited on something, which for reqwest means it opened a socket.
@@ -35,13 +32,9 @@ fn poll_ready<F: Future>(fut: F) -> Option<F::Output> {
 
 /// Did this request get rejected by the `https_only` scheme check?
 ///
-/// reqwest signals it as a `Builder`-kind error returned before any IO.
-/// Polling past the check reaches hyper's connector, which panics without a
-/// tokio reactor; that panic is caught and reported as "not rejected".
-///
-/// `is_builder()` is not falsifiable here — with no reactor, the scheme check
-/// is the only way to get `Ready(Err)` — but it records which rejection is
-/// meant.
+/// reqwest signals it as a `Builder`-kind error returned before any IO. Polling
+/// past the check reaches hyper's connector, which panics without a tokio
+/// reactor; that panic is caught and reported as "not rejected".
 fn rejected_by_scheme_check(client: &reqwest::Client, url: &str) -> bool {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
@@ -58,8 +51,7 @@ fn rejected_by_scheme_check(client: &reqwest::Client, url: &str) -> bool {
 }
 
 /// Fails if `.https_only(true)` is removed from [`super::client`]. Observed
-/// behaviourally because `ClientBuilder` exposes no getter, and offline-safe
-/// because the rejection happens before any socket is opened.
+/// behaviourally, and offline-safe: the rejection precedes any socket.
 #[test]
 fn client_rejects_cleartext_urls() {
     let client = super::client("probe", std::time::Duration::from_secs(1))
@@ -71,8 +63,7 @@ fn client_rejects_cleartext_urls() {
     );
 }
 
-/// Without this, a permanently broken builder — or a
-/// `rejected_by_scheme_check` that always returned `true` — would satisfy
+/// Without this, a permanently broken builder would satisfy
 /// `client_rejects_cleartext_urls`.
 #[test]
 fn client_accepts_https_urls() {
@@ -86,11 +77,10 @@ fn client_accepts_https_urls() {
     );
 }
 
-// ── The preflight rule ────────────────────────────────────────────────
+// ── The preflight rule ──
 //
-// These three run as a set. `sends_user_agent` scrapes a `Debug` string and
-// could be a constant either way, so the first two pin it from both sides
-// before the third asserts `client_for` routes correctly.
+// These three run as a set: `sends_user_agent` scrapes a `Debug` string and
+// could be a constant either way, so the first two pin it from both sides.
 
 /// [`super::client`] does attach the User-Agent it is given.
 #[test]
@@ -105,9 +95,8 @@ fn the_ordinary_client_sends_a_user_agent() {
     );
 }
 
-/// [`super::simple_client`] does not: IEM answers `OPTIONS` with `405` and
-/// SPC with `403`, so a `User-Agent` turns the `GET` into a preflight the
-/// browser never gets past.
+/// [`super::simple_client`] does not: IEM answers `OPTIONS` with `405` and SPC
+/// with `403`, so a `User-Agent` turns the `GET` into a preflight.
 #[test]
 fn the_simple_client_sends_no_user_agent() {
     let c = super::simple_client(std::time::Duration::from_secs(1))
@@ -139,36 +128,19 @@ fn client_for_routes_on_the_preflight_rule() {
 
 /// The source of one `#[cfg]`-gated function in this file, body included.
 ///
-/// Scraped rather than called because the wasm32 arms are not compiled by
-/// any build this workspace tests: `cargo test` runs on the host, and the
-/// wasm rows of the gauntlet are `cargo check`, which compiles the arms but
-/// runs nothing. Adding a `.user_agent(…)` to either browser constructor
-/// therefore compiles, checks and tests clean while silently killing METAR,
-/// SPC and every basemap tile in Firefox — see
-/// [`the_browser_clients_attach_no_user_agent`].
-///
-/// Byte-scraping is the weaker tool and it is deliberate here: pinning the
-/// property properly needs a `wasm-bindgen-test` runner, which would make
-/// `wasm-pack` a prerequisite of `cargo test` for the whole workspace. That
-/// is a decision to take on purpose, not a side effect of this test.
+/// Scraped rather than called because the wasm32 arms are not compiled by any
+/// build this workspace tests. Pinning the property properly needs a
+/// `wasm-bindgen-test` runner, which would make `wasm-pack` a prerequisite of
+/// `cargo test` for the whole workspace.
 fn cfg_gated_source(cfg: &str, signature: &str) -> String {
     let source = include_str!("../tls.rs");
-    // The shipped half only. The signatures below are line-continued string
-    // literals, so today they do not appear in this module's own source —
-    // but that is an accident of formatting, not a property, and `cargo fmt`
-    // could end it without a word.
-    //
-    // Cut on the `#[cfg]` rather than the `mod tests {` it guards: the
-    // attribute is what survives the test body moving to its own file,
-    // where the `mod tests {` line does not. `cfg(all(test` appears exactly
-    // once in this file, so the cut lands in the same place either way.
+    // The shipped half only. Cut on the `#[cfg]`, which survives the test body
+    // moving to its own file.
     let (code, _) = source
         .split_once("\n#[cfg(all(test")
         .expect("tls.rs no longer has a test module");
     let needle = format!("{cfg}\n{signature}");
-    // Exactly one definition, checked before it is read: two would mean the
-    // scrape is reading whichever came first, and a decoy in a doc comment
-    // or a string would be one.
+    // Exactly one definition, checked before it is read.
     let occurrences = code.matches(&needle).count();
     assert_eq!(
         occurrences, 1,
@@ -221,38 +193,8 @@ fn method_calls(body: &str) -> Vec<String> {
     found
 }
 
-/// **Exactly which builder calls each of the four constructors makes.**
-///
-/// `User-Agent` is a forbidden header name in a browser. Chromium strips it
-/// silently, so the request stays simple and works; Firefox forwards it,
-/// which makes the request non-simple and forces a preflight `OPTIONS` that
-/// `mesonet.agron.iastate.edu` answers with `405`, `www.spc.noaa.gov` with
-/// `403`, and a plain tile CDN with no CORS headers at all. Every METAR,
-/// every SPC outlook and every basemap tile then fails in one browser and
-/// not the other, with nothing wrong on native.
-///
-/// [`the_simple_client_sends_no_user_agent`] above looks like it covers
-/// this and does not: it builds a `reqwest::Client` and so tests the arm the
-/// test runner was compiled for, which is always the native one. The wasm
-/// arms have never been executed by anything.
-///
-/// # Why an allowlist and not "contains `.user_agent(`"
-///
-/// Because `.user_agent(` is not the only way to set the header, and the
-/// other way was reachable. reqwest 0.13.4's **wasm** `ClientBuilder`
-/// exposes `default_headers` (`src/wasm/client.rs:329`); a review set
-/// `USER_AGENT` through a `HeaderMap` on the wasm client and the substring
-/// check passed with `cargo check --target wasm32-unknown-unknown` at 0 —
-/// the exact Firefox outage described above, shipped. Enumerating forbidden
-/// spellings only moves the goalposts, so this enumerates the *permitted*
-/// calls instead: every builder method is a `.method(`, so an exact set is
-/// the whole configuration surface. Adding any call to any of the four
-/// fails here until it is written down.
-///
-/// The native arms are checked the same way, and not as a courtesy: they
-/// are the control that keeps this from passing vacuously. A scrape that
-/// matched the wrong text, or nothing, would report an empty call set for
-/// all four.
+/// Every `.method(` called in a block of source, sorted and deduplicated.
+/// `::` paths are skipped, so `reqwest::Client::builder()` does not appear.
 #[test]
 fn the_browser_clients_attach_no_user_agent() {
     const WASM: &str = r#"#[cfg(target_arch = "wasm32")]"#;
@@ -263,8 +205,8 @@ fn the_browser_clients_attach_no_user_agent() {
             WASM,
             "pub fn client(_user_agent: &str, _timeout: std::time::Duration) \
                  -> reqwest::ClientBuilder {",
-            // Nothing at all: the browser owns the timeout, the scheme and
-            // every forbidden header, so there is nothing left to configure.
+            // Nothing at all: the browser owns the timeout, the scheme and every
+            // forbidden header.
             &[][..],
         ),
         (
@@ -276,8 +218,7 @@ fn the_browser_clients_attach_no_user_agent() {
             NATIVE,
             "pub fn client(user_agent: &str, timeout: std::time::Duration) \
                  -> reqwest::ClientBuilder {",
-            // `to_owned` is the argument to `user_agent`, not a builder
-            // call; it is listed because this reads the whole body.
+            // `to_owned` is the argument to `user_agent`, not a builder call.
             &["https_only", "timeout", "to_owned", "user_agent"][..],
         ),
         (
@@ -307,11 +248,9 @@ fn the_browser_clients_attach_no_user_agent() {
 
 /// End-to-end proof that the platform verifier actually verifies.
 ///
-/// `api.weather.gov` is deliberately the endpoint: its certificate is the
-/// shape rustls-platform-verifier issue #221 trips over — Let's Encrypt R13,
-/// no OCSP responder, cleartext `http://` CRL distribution point.
-///
-/// `cargo test -p rustdar-source --lib -- --ignored --nocapture live_`
+/// `api.weather.gov` is deliberately the endpoint: its certificate is the shape
+/// rustls-platform-verifier issue #221 trips over — Let's Encrypt R13, no OCSP
+/// responder, cleartext `http://` CRL distribution point.
 #[ignore = "hits the live api.weather.gov endpoint"]
 #[tokio::test]
 async fn live_https_fetch_against_weather_gov() {
@@ -340,9 +279,8 @@ async fn live_https_fetch_against_weather_gov() {
     assert!(!body.is_empty(), "empty body");
 }
 
-/// The probes below assert on process-global state, which the first test to
-/// touch it in a shared binary would poison. Each runs in a freshly spawned
-/// copy of this binary.
+/// The probes below assert on process-global state, so each runs in a freshly
+/// spawned copy of this binary.
 fn run_probe(name: &str) {
     let exe = std::env::current_exe().expect("current_exe");
     let out = std::process::Command::new(&exe)
@@ -369,12 +307,6 @@ fn client_installs_provider_in_a_fresh_process() {
     run_probe("tls::tests::probe_client_installs_ring");
 }
 
-// The three fresh-process pins on `rustdar-radar`'s own network entry points —
-// `scan::list_files`, `archive::list_files` and `ChunkPoller::poll` — live in
-// that crate's `tls_pins` module, not here: they call radar modules, and
-// moving them down with the rest of this file would recreate the exact
-// reverse dependency this crate exists to kill. A spawned probe must live in
-// the same test binary as its spawner, so the pair travels together.
 
 /// Fails if the `init()` call is removed from [`super::client`].
 #[test]

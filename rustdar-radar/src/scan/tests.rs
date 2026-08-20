@@ -1,12 +1,7 @@
 use super::*;
 
-/// A volume that is still gzip-wrapped has no readable records, and the
-/// one-pass decode must say so with the same error `volume::File::scan()`
-/// raised — not a scan with no sweeps, and not a different variant.
-///
-/// The magic bytes are the whole test: `File::compressed` reads the first two,
-/// and `records()` refuses before anything is parsed, so eight bytes are enough
-/// to reach the branch.
+/// The magic bytes are the whole test: `File::compressed` reads the first two
+/// and `records()` refuses before anything is parsed, so eight bytes reach it.
 #[test]
 fn a_gzip_wrapped_volume_is_refused_exactly_as_upstream_refuses_it() {
     let file = nexrad_data::volume::File::new(vec![0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0]);
@@ -26,15 +21,10 @@ fn a_gzip_wrapped_volume_is_refused_exactly_as_upstream_refuses_it() {
     );
 }
 
-/// A volume carrying no message 5 is an error, not a `Scan` with an invented
-/// coverage pattern — every reader of a `Scan` assumes the pattern is the one
-/// the radar flew.
-///
 /// Twenty-four zero bytes of volume header followed by one zeroed 2432-byte
 /// frame is the cheapest thing that reaches the check: the all-zero prefix
-/// picks the legacy CTM path, which hands the frame over whole, and a zeroed
-/// frame decodes to a message the walk ignores. So the walk completes, finds no
-/// pattern, and has to fail — exactly as `scan()` does on the same bytes.
+/// picks the legacy CTM path, and a zeroed frame decodes to a message the walk
+/// ignores.
 #[test]
 fn a_volume_with_no_coverage_pattern_fails_rather_than_inventing_one() {
     let file = nexrad_data::volume::File::new(vec![0u8; 24 + 2432]);
@@ -57,29 +47,12 @@ fn a_volume_with_no_coverage_pattern_fails_rather_than_inventing_one() {
     );
 }
 
-/// **The premise every claim below rests on, and the one thing here that is
-/// not this crate's own code**: `crate::par`'s
+/// The premise every claim below rests on: `crate::par`'s
 /// `into_par_iter().map(…).collect::<Vec<_>>()` returns results in **input**
-/// order, whatever order the workers happen to finish in.
-///
-/// [`super::fold_contributions`] decides "first wins" by walking its `Vec`, so
-/// if that `Vec` were ever in completion order every rule it states would
-/// silently become "whichever worker won the race" — the exact failure the fold
-/// exists to prevent, and one no fixture driving the fold directly can see.
-///
-/// So the map is given work shaped to scramble completion order and to punish
-/// index 0 specifically: a decreasing gradient across the rest, and an item 0
-/// slow enough to outlast every other worker's whole share. Instrumenting the
-/// same closure with a completion counter measured item 0 finishing at rank
-/// **1020 of 1024**, 680 of the 1024 items completing in the opposite half of
-/// the ordering, and the four error items completing at ranks 1020, 41, 4 and
-/// 219 — so a collect that honoured completion order would report index **512**
-/// as its first error, on nearly every run rather than rarely. The assertion
-/// below says 0.
-///
-/// On wasm32 the fallback is a plain `into_iter` and this is trivially true;
-/// it compiles and runs there anyway, because "trivially true on one arm" is
-/// how the two arms are kept saying the same thing.
+/// order, whatever order the workers finish in. Instrumenting the same closure
+/// with a completion counter measured item 0 finishing at rank 1020 of 1024,
+/// and the four error items at ranks 1020, 41, 4 and 219 — so a collect that
+/// honoured completion order would report index 512 as its first error.
 #[test]
 fn the_map_collects_in_input_order_however_the_workers_finish() {
     use crate::par::*;
@@ -90,8 +63,6 @@ fn the_map_collects_in_input_order_however_the_workers_finish() {
         .collect::<Vec<_>>()
         .into_par_iter()
         .map(|i| {
-            // Item 0 outlasts any other worker's entire share, so it finishes
-            // last; the gradient scrambles the rest.
             let iterations = if i == 0 { 2_000_000 } else { (N - i) * 16 };
             let mut spin = 0u64;
             for k in 0..iterations {
@@ -119,15 +90,7 @@ fn the_map_collects_in_input_order_however_the_workers_finish() {
 }
 
 // -- the record-order fold ----------------------------------------------
-//
-// [`super::decoded`] decodes the LDM records apart and puts the answer back
-// together with [`super::fold_contributions`]. Everything that used to be
-// decided by "the walk got here first" is now decided by that fold, so these
-// drive it directly: they hand it contributions in a known order and check that
-// the order — not the arrival, not the value — is what picks the winner.
 
-/// A contribution that carries nothing but a coverage pattern, so a fold can
-/// reach its end without failing on `MissingCoveragePattern`.
 fn a_pattern_and_nothing_else(vcp_number: u16) -> RecordContribution {
     RecordContribution {
         declared_nyquist: crate::nyquist::DeclaredNyquist::empty(),
@@ -152,8 +115,6 @@ fn a_pattern_and_nothing_else(vcp_number: u16) -> RecordContribution {
     }
 }
 
-/// A radial identified only by its azimuth number, all on one cut so that
-/// `Sweep::from_radials` keeps them in one sweep and in the order given.
 fn radial_numbered(azimuth_number: u16) -> nexrad_model::data::Radial {
     nexrad_model::data::Radial::new(
         0,
@@ -173,16 +134,6 @@ fn radial_numbered(azimuth_number: u16) -> nexrad_model::data::Radial {
     )
 }
 
-/// **The failure mode `rustdar-radar/Cargo.toml` warns about**, held shut: the
-/// error a caller sees is the first one in *record order*, not whichever
-/// worker tripped first.
-///
-/// Two different variants in two different orders is the whole test. rayon's
-/// `Result` collect would keep either one depending on which thread lost, so a
-/// volume with two malformed records would report a variant that changed run to
-/// run — and the serial walk this replaced always reported the earlier record's.
-/// Note that the later error is not merely deprioritised, it is discarded: a
-/// fold that returned both, or the last, would fail this too.
 #[test]
 fn the_reported_error_is_the_first_in_record_order() {
     let file = nexrad_data::volume::File::new(Vec::new());
@@ -224,13 +175,6 @@ fn the_reported_error_is_the_first_in_record_order() {
     );
 }
 
-/// `DeclaredNyquist::declare` is first-writer-wins *within* a table, and
-/// replaying the per-record tables in record order is what extends that rule
-/// across the whole volume — which is what makes the folded table the one the
-/// single serial walk produced.
-///
-/// Both orders again, because a fold that simply kept the smaller number, or
-/// the first table wholesale, would pass one of them.
 #[test]
 fn an_earlier_records_declared_nyquist_survives_a_later_records() {
     let file = nexrad_data::volume::File::new(Vec::new());
@@ -264,12 +208,6 @@ fn an_earlier_records_declared_nyquist_survives_a_later_records() {
     );
 }
 
-/// The radials come back in record order, and the site and the coverage
-/// pattern come from the earliest record that states one.
-///
-/// `Sweep::from_radials` walks its `Vec` in order and splits on a change of
-/// elevation number, so radial order *is* the `Vec`'s order — the reason the
-/// per-record radials are `extend`ed rather than merged.
 #[test]
 fn radials_the_site_and_the_pattern_all_come_from_the_earliest_record_that_has_them() {
     // An ICAO for the site to be named with; the location itself comes off the
@@ -327,19 +265,11 @@ fn radials_the_site_and_the_pattern_all_come_from_the_earliest_record_that_has_t
     );
 }
 
-/// The same "first record wins" through the real decode, records and all:
-/// two records each carrying a message 5, decoded under [`crate::par`].
-///
-/// # What the bytes are
-///
-/// A 24-byte volume header followed by two size-prefixed LDM records. Real
-/// records are bzip2-compressed, and `Record::compressed` decides that on two
-/// magic bytes — so a record whose payload does not carry them is handed
-/// straight to the message decoder, which is what lets a multi-record volume be
-/// written out here without a compressor. Each record is one 2432-byte message
-/// frame with its leading four bytes overwritten by the LDM size prefix, which
-/// lands inside the message header's `rpg_unknown` padding and so changes
-/// nothing the decoder reads.
+/// A 24-byte volume header followed by two size-prefixed LDM records. Each is
+/// one 2432-byte message frame with its leading four bytes overwritten by the
+/// LDM size prefix, which lands inside the message header's `rpg_unknown`
+/// padding and so changes nothing the decoder reads. `Record::compressed`
+/// decides on two magic bytes, so a payload without them needs no compressor.
 #[test]
 fn the_first_records_coverage_pattern_wins_through_the_parallel_decode() {
     const FRAME: usize = 2432;
@@ -415,24 +345,6 @@ fn the_first_records_coverage_pattern_wins_through_the_parallel_decode() {
 // Run with:
 //   cargo test -p rustdar-radar --release --lib -- --ignored --nocapture scan::tests::live_
 
-/// **The claim [`super::decoded`] rests on**: folding the declared-Nyquist read
-/// into the walk that builds the `Scan` changed neither half of the answer.
-///
-/// Both halves are checked against the code the fold replaced, on a real
-/// archived volume:
-///
-/// * the `Scan` against `nexrad_data::volume::File::scan()`, which is what this
-///   crate called until the fold and is still the definition of a correctly
-///   decoded volume — radials, their order, the sweep split, the site and the
-///   coverage pattern all compare;
-/// * the table against [`crate::nyquist::DeclaredNyquist::from_archive`], whose
-///   separate walk exists for exactly this. It reads the same field off the
-///   same bytes without building anything else, so agreement is evidence rather
-///   than a restatement.
-///
-/// A fixed historical volume rather than the latest one: the two comparisons
-/// are exact equality, and the point is a decode this crate can rerun against
-/// the same bytes years from now.
 #[cfg(not(target_arch = "wasm32"))]
 #[ignore = "hits the live unidata-nexrad-level2 S3 bucket"]
 #[tokio::test]
@@ -456,8 +368,6 @@ async fn live_one_pass_decode_matches_the_two_pass_decode() {
         independent
     );
 
-    // Not a tautology worth skipping: an empty table would make the second
-    // assertion below pass on a volume that declared nothing.
     assert!(
         !independent.is_empty(),
         "a Message 31 volume must declare a Nyquist velocity somewhere"
@@ -472,36 +382,15 @@ async fn live_one_pass_decode_matches_the_two_pass_decode() {
     );
 }
 
-/// A pre-2010 `AR2V0001` volume produces a `Scan` with **no site**, so
-/// everything downstream of it falls back to the table.
-///
-/// # Why this is a distinct case and not the chunk feed again
-///
-/// Both arrive at `ScanInfo::from_scan` as a site-less `Scan`, but they get
-/// there for unrelated reasons and only one of them is a *decode* property.
-/// The chunk feed never had a site to lose — `chunks::VolumeAssembler` builds
-/// through `Scan::new`. A legacy volume is Message 1 throughout, and Message 1
-/// has no Volume Data Block at all: the latitude, longitude and heights the
-/// modern format states on every Message 31 simply are not in the file. So the
-/// walk below has to complete, find nothing to read, and take the `Scan::new`
-/// arm — rather than, say, unwrapping a site it assumes is there.
-///
-/// # What the bytes are
-///
 /// The smallest legacy volume that decodes: a 24-byte `AR2V0001` header, then
 /// one 2432-byte CTM frame carrying a Message 5 with zero elevation cuts. The
-/// all-zero `rpg_unknown` prefix is what selects the CTM path in
-/// `split_compressed_records`, and the coverage pattern is what stops the walk
-/// failing with `MissingCoveragePattern` before it can reach the site at all —
-/// which is exactly what `a_volume_with_no_coverage_pattern_fails_rather_than_
-/// inventing_one` above uses the *absence* of a message 5 to check.
+/// all-zero `rpg_unknown` prefix selects the CTM path, and the coverage
+/// pattern stops the walk failing with `MissingCoveragePattern` first.
 ///
-/// No Message 1 is synthesized. Adding one would change nothing this asserts:
-/// `decoded` matches `DigitalRadarData` only, exactly as upstream's `scan()`
-/// does, so a legacy radial message is skipped without being looked at.
+/// Message 1 has no Volume Data Block at all, so the site simply is not in the
+/// file and the walk takes the `Scan::new` arm.
 #[test]
 fn a_pre_2010_volume_states_no_site_and_falls_back_to_the_table() {
-    // The radars this renders against; there are none until a test asks.
     crate::sites::fixture::install();
     const FRAME: usize = 2432;
     const MESSAGE_HEADER: usize = 28;
@@ -554,7 +443,6 @@ fn a_pre_2010_volume_states_no_site_and_falls_back_to_the_table() {
         "a legacy volume has no Volume Data Block, so there is no site to read",
     );
 
-    // And the fallback the absence exists to reach.
     let info = crate::types::ScanInfo::from_scan(
         &decoded.scan,
         "KTLX",
@@ -578,23 +466,15 @@ fn a_pre_2010_volume_states_no_site_and_falls_back_to_the_table() {
 //
 // The volume behind these numbers is `KCRP20260717_211257_V06`, whose 0.5°
 // Doppler cut renders with a 60° wedge missing. Its radial inventory was
-// established **independently of this crate**, by two decoders that share no
-// code with it: MetPy's `Level2File`, and a raw walk of the LDM framing and
-// Message 31 headers written from the ICD. Both report the same 8280 radials,
-// the same per-cut counts and the same gaps, radial for radial.
-//
-// So the table below is an observation, not an expectation borrowed from our
-// own assembler: it says which 120-radial LDM records the *file* contains, and
-// these tests ask whether our assembly reproduces that and whether the
-// measurement names the holes. Asserting our decode against our decode would
-// have passed on the day the wedge went missing.
+// established independently of this crate, by MetPy's `Level2File` and a raw
+// walk of the LDM framing and Message 31 headers written from the ICD. Both
+// report the same 8280 radials, the same per-cut counts and the same gaps.
 
-/// Which 120-radial records each cut of `KCRP20260717_211257_V06` carries.
-///
+/// Which 120-radial records each cut of `KCRP20260717_211257_V06` carries:
 /// `(elevation number, azimuth spacing, records present)`, where record `k`
-/// holds azimuth numbers `(k - 1) * 120 + 1 ..= k * 120`. A 0.5° cut has six,
-/// a 1.0° cut three. Nine records are absent across the volume, which is the
-/// 1080 radials between its 8280 and the 9360 a complete VCP 215 would hold.
+/// holds azimuth numbers `(k - 1) * 120 + 1 ..= k * 120`. Nine records are
+/// absent across the volume — the 1080 radials between its 8280 and the 9360
+/// a complete VCP 215 would hold.
 const KCRP_2026_07_17T21_12_57: &[(u8, f32, &[u8])] = &[
     (1, 0.5, &[1, 2, 5, 6]),
     (2, 0.5, &[1, 2, 3, 4, 5, 6]),
@@ -615,9 +495,9 @@ const KCRP_2026_07_17T21_12_57: &[(u8, f32, &[u8])] = &[
 ];
 
 /// The cuts the independent decode found short, and the widest gap each one
-/// measures in the real file. The synthetic radials below sit on exact
-/// multiples of their spacing, so they measure the whole number the real
-/// jittered antenna misses by a few hundredths — 60.480 against 60.5 on cut 4.
+/// measures. The synthetic radials sit on exact multiples of their spacing, so
+/// they measure the whole number the jittered antenna misses by a few
+/// hundredths — 60.480 against 60.5 on cut 4.
 const KCRP_SHORT_CUTS: &[(u8, usize, f64)] = &[
     (1, 480, 120.5),
     (3, 480, 60.5),
@@ -628,7 +508,6 @@ const KCRP_SHORT_CUTS: &[(u8, usize, f64)] = &[
     (13, 240, 121.0),
 ];
 
-/// One radial of a cut, at the azimuth its azimuth number implies.
 fn radial_at(
     elevation_number: u8,
     azimuth_number: u16,
@@ -652,7 +531,6 @@ fn radial_at(
     )
 }
 
-/// The volume as the file holds it, cut by cut, record by record.
 fn kcrp_radials() -> Vec<nexrad_model::data::Radial> {
     let mut radials = Vec::new();
     for (elevation_number, spacing, records) in KCRP_2026_07_17T21_12_57 {
@@ -666,18 +544,6 @@ fn kcrp_radials() -> Vec<nexrad_model::data::Radial> {
     radials
 }
 
-/// **The wedge that went missing, and the silence around it.**
-///
-/// Assembly first: fed the file's own radial inventory, the fold must produce
-/// each cut at exactly the count the independent decoders found — nothing
-/// dropped by us, nothing invented. In particular cut 4, the one
-/// `render::find_sweep` hands the 0.5° storm-relative velocity pane, holds 600
-/// radials and not 720.
-///
-/// Then the part that was missing: each short cut must *say* it is short. The
-/// gap is what carries it, because the count alone cannot — cut 13 holds a
-/// dense 1..240 with no interior seam at all, and only the 121° hole where the
-/// circle closes distinguishes it from a sector the antenna really swept.
 #[test]
 fn a_volume_missing_whole_chunks_assembles_short_and_says_so() {
     let file = nexrad_data::volume::File::new(Vec::new());
@@ -728,11 +594,6 @@ fn a_volume_missing_whole_chunks_assembles_short_and_says_so() {
     assert_eq!(doppler.arc_degrees(), 299.5, "300° of azimuth, not 360°");
 }
 
-/// The complement, and the half that stops the measurement being a rubber
-/// stamp: the nine cuts the file carries whole are reported whole, arc 360°.
-///
-/// Without this a measurement that called *everything* sectored would pass the
-/// test above.
 #[test]
 fn the_cuts_the_file_carries_whole_are_not_called_short() {
     let file = nexrad_data::volume::File::new(Vec::new());
@@ -761,21 +622,10 @@ fn the_cuts_the_file_carries_whole_are_not_called_short() {
 
 // ── Volume identity across the two ways a start is stated ─────────────────
 
-/// The two timestamps built exactly as the two production routes build them:
-/// `(from the first radial, from the archive key)`.
-///
-/// Neither side is hand-written as a literal, because the whole defect lived
-/// in the difference between the two constructions — a test that spelled both
-/// out by hand would be asserting against its own arithmetic rather than
-/// against the code's.
 fn the_two_routes(hms: &str, millis_into_the_second: i64) -> (NaiveDateTime, NaiveDateTime) {
     let date = chrono::NaiveDate::from_ymd_opt(2026, 3, 2).expect("a real date");
     let key_time = NaiveTime::parse_from_str(hms, "%H%M%S").expect("a real archive key tail");
-    // The archive key's route: `list_scans_for_range`, verbatim.
     let from_key = date.and_time(key_time);
-    // The volume's route: `types::ScanInfo::from_scan`, verbatim — a radial's
-    // `collection_timestamp()` in epoch milliseconds, through
-    // `from_timestamp_millis`.
     let collection_timestamp = from_key.and_utc().timestamp_millis() + millis_into_the_second;
     let from_radial = chrono::DateTime::from_timestamp_millis(collection_timestamp)
         .expect("a real collection timestamp")
@@ -783,14 +633,10 @@ fn the_two_routes(hms: &str, millis_into_the_second: i64) -> (NaiveDateTime, Nai
     (from_radial, from_key)
 }
 
-/// **The regression.** A loop frame is stamped from the S3 key and the object
-/// cached for it is stamped from the volume's first radial, and those two
-/// name one volume.
-///
-/// The measured spread is 1 ms to 993 ms with a median of 517 ms, over 108 of
-/// 108 archive volumes, so the endpoints and the median are all exercised
-/// here — 0 ms is included as the case that never occurs in the archive but is
-/// the still frame's every time, since there both sides come off the radial.
+/// The measured spread is 1 ms to 993 ms with a median of 517 ms over 108 of
+/// 108 archive volumes, so the endpoints and the median are all exercised —
+/// 0 ms included as the still frame's case, where both sides come off the
+/// radial.
 #[test]
 fn a_loop_frames_archive_key_names_the_volumes_first_radial() {
     for millis in [0, 1, 517, 993, 999] {
@@ -811,7 +657,6 @@ fn a_loop_frames_archive_key_names_the_volumes_first_radial() {
             names_same_volume(from_radial, from_key),
             "a frame keyed {from_key} was refused the object stamped {from_radial}",
         );
-        // Symmetric, because the two call sites read it in both orders.
         assert!(
             names_same_volume(from_key, from_radial),
             "the pairing must not depend on which side is named first",
@@ -819,11 +664,6 @@ fn a_loop_frames_archive_key_names_the_volumes_first_radial() {
     }
 }
 
-/// Exact equality still pairs — the still-frame path, where both sides are
-/// `ScanInfo::timestamp` and the milliseconds are identical.
-///
-/// Widening a comparison is only safe if it is a widening: this is the case
-/// the old `==` got right, and it has to keep working.
 #[test]
 fn a_volume_start_stated_identically_twice_still_names_one_volume() {
     let (from_radial, _) = the_two_routes("120347", 517);
@@ -833,13 +673,9 @@ fn a_volume_start_stated_identically_twice_still_names_one_volume() {
     assert!(names_same_volume(whole_second, from_key));
 }
 
-/// A neighbouring volume never pairs, however either start was stated.
-///
-/// One scan cycle is the collision this has to be impossible for. The shortest
-/// WSR-88D cadence in the tree is a measured 198 s (`constants/tests.rs:468`),
-/// so that is the gap tested rather than the 259 s nominal — and the second
-/// either side of it, because "under a second apart" is the whole rule and the
-/// boundary is where a rule of that shape fails.
+/// The shortest WSR-88D cadence in the tree is a measured 198 s
+/// (`constants/tests.rs:468`), so that is the gap tested rather than the 259 s
+/// nominal — and the second either side of it.
 #[test]
 fn a_neighbouring_volume_never_pairs_however_its_start_was_stated() {
     let (from_radial, from_key) = the_two_routes("120347", 517);
@@ -863,9 +699,6 @@ fn a_neighbouring_volume_never_pairs_however_its_start_was_stated() {
         }
     }
 
-    // And the boundary, 198 s inside the nearest real collision: one second is
-    // one volume, and the next second is never the same volume however small
-    // the step across the boundary is.
     let (next_second, _) = the_two_routes("120348", 0);
     assert!(
         !names_same_volume(from_radial, next_second),
@@ -876,10 +709,6 @@ fn a_neighbouring_volume_never_pairs_however_its_start_was_stated() {
         !names_same_volume(from_key, next_second),
         "two archive keys one second apart are two volumes",
     );
-    // The boundary is a boundary and not a rounding: the last instant of a
-    // volume's second still names that volume, and does not also name the one
-    // after. A rule that rounded rather than truncated would answer the
-    // opposite to both of these.
     let last_instant = next_second - Duration::milliseconds(1);
     assert!(
         names_same_volume(from_key, last_instant),

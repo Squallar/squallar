@@ -1,66 +1,31 @@
 //! Process-wide TLS setup.
 //!
-//! **rustdar does not own the trust decision, and must not start owning it.**
-//! `reqwest` is pinned workspace-wide to `rustls-no-provider` —
-//! `rustls-platform-verifier` with no crypto provider compiled in — so the *OS*
-//! evaluates the chain at handshake time: Android `TrustManager`, Windows
-//! CryptoAPI, Apple `SecTrustEvaluateWithError`, system cert dirs elsewhere.
+//! **rustdar does not own the trust decision.** `reqwest` is pinned
+//! workspace-wide to `rustls-no-provider` — `rustls-platform-verifier` with no
+//! crypto provider compiled in — so the *OS* evaluates the chain at handshake
+//! time.
 //!
-//! Two different alternatives get re-proposed, and they are wrong for two
-//! different reasons. Do not accept either.
-//!
-//! * `rustls-native-certs` (and reqwest's pre-0.13 `rustls-tls-native-roots`,
-//!   which the 0.13.4 pin no longer has) bundles nothing, but it collects
-//!   certificates at startup and hands rustls a flat root list, so **rustls**
-//!   does the verifying and the platform verifier is out of the loop. That is
-//!   the objection: on Android `rustls-platform-verifier` goes through JNI to
-//!   `CertificateVerifier.verifyCertificateChain`, i.e. the system TrustManager,
-//!   which is what applies Network Security Config, user and enterprise CAs and
-//!   distrust lists — and its arm that would call `load_native_certs()` is
-//!   `not(target_os = "android")`.
-//!
-//!   On Android it is not even a subtly different answer. `rustls-native-certs`
-//!   defers to `openssl-probe`, whose only Android locations are the Termux
-//!   bundle and an `/etc/ssl/certs` fallback; neither is Android's trust store,
-//!   so it returns whatever happens to sit at those two paths rather than the
-//!   platform's roots.
-//! * `webpki-roots` is the actual compiled-in snapshot, and that one gives the
-//!   binary an expiration date.
+//! Do not swap it for `rustls-native-certs`: it hands rustls a flat root list,
+//! so on Android the system TrustManager — which applies Network Security
+//! Config, user and enterprise CAs and distrust lists — is bypassed.
 //!
 //! Because no provider is compiled in, one has to be installed at runtime —
-//! [`init`]. Two ways to get that wrong:
-//!
-//! * `reqwest::ClientBuilder::build` reads `CryptoProvider::get_default()` and
-//!   `panic!("No provider set")` if it is absent. The panic lands wherever the
-//!   *first* client is built, which for `rustdar_radar::archive` is inside a
-//!   `OnceLock` on the first S3 request. Any test that does not open a socket
-//!   passes.
-//! * Installing late is as bad as not installing: the first installer wins and
-//!   every later client silently keeps that provider.
-//!
-//! So every path that can reach a client construction calls it first. [`client`]
-//! is the only constructor the application uses, and `rustdar_radar::scan` also
-//! calls [`init`] at the top of its two network wrappers.
-//!
-//! This only became load-bearing when the archive moved off `nexrad-data`'s
-//! `aws` feature: that feature compiled `aws-lc-rs` in, so a client built without
-//! [`init`] silently used it instead of panicking.
+//! [`init`] — before the first client is built. Every path that can reach a
+//! client construction calls it first.
 
 /// `api.weather.gov` rejects requests without a contact-bearing User-Agent.
 pub const USER_AGENT: &str = "rustdar/1.0 (https://github.com/USA-RedDragon/rustdar)";
 
 /// Install *ring* as the process-wide default rustls [`CryptoProvider`].
 ///
-/// Idempotent and thread-safe. No-op on wasm32: reqwest routes through the
-/// browser's `fetch()`.
+/// Idempotent and thread-safe. No-op on wasm32.
 ///
 /// [`CryptoProvider`]: rustls::crypto::CryptoProvider
 #[cfg(not(target_arch = "wasm32"))]
 pub fn init() {
     static INSTALL: std::sync::Once = std::sync::Once::new();
     INSTALL.call_once(|| {
-        // `Err` only means a provider is already installed; the first installer
-        // wins by design and `default_is_ring` asserts which one it was.
+        // `Err` only means a provider is already installed; the first installer wins.
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
 }
@@ -72,9 +37,8 @@ pub fn init() {}
 /// The only `reqwest::Client` constructor the application uses.
 ///
 /// `https_only` is set here, not per call site: on Android it removes cleartext
-/// as a downgrade target for the plain-HTTP CRL and OCSP URLs embedded in the
-/// certificates we talk to (see
-/// `packaging/android/app/src/main/res/xml/network_security_config.xml`).
+/// as a downgrade target for the plain-HTTP CRL and OCSP URLs in the
+/// certificates we talk to.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn client(user_agent: &str, timeout: std::time::Duration) -> reqwest::ClientBuilder {
     init();
@@ -90,12 +54,9 @@ pub fn client(user_agent: &str, timeout: std::time::Duration) -> reqwest::Client
 /// browser owns both.
 ///
 /// `User-Agent` is dropped because setting it is actively harmful: it is a
-/// forbidden header name, Chromium strips it silently (request stays simple, so
-/// it works), Firefox forwards it, which makes the request non-simple and forces
-/// a preflight `OPTIONS` that a plain tile CDN does not answer — every basemap
-/// tile then fails with "Access-Control-Allow-Origin missing" in one browser and
-/// not the other. The tile provider's terms are satisfied by the `Referer` the
-/// browser attaches.
+/// forbidden header name, Chromium strips it silently while Firefox forwards
+/// it, which makes the request non-simple and forces a preflight `OPTIONS` a
+/// plain tile CDN does not answer.
 #[cfg(target_arch = "wasm32")]
 pub fn client(_user_agent: &str, _timeout: std::time::Duration) -> reqwest::ClientBuilder {
     init();
@@ -106,13 +67,9 @@ pub fn client(_user_agent: &str, _timeout: std::time::Duration) -> reqwest::Clie
 /// preflight fails.
 ///
 /// `mesonet.agron.iastate.edu` answers `OPTIONS` with `405` and
-/// `www.spc.noaa.gov` with `403` and no CORS headers — both while answering the
-/// plain `GET` with `Access-Control-Allow-Origin: *`. Any non-safelisted request
-/// header (`User-Agent` is one) makes the request non-simple and triggers that
-/// preflight, so those feeds break silently, on wasm only.
-///
-/// Prefer [`client_for`]; the per-origin rule lives in
-/// [`crate::origins::DataSources`].
+/// `www.spc.noaa.gov` with `403` and no CORS headers, both while answering the
+/// plain `GET` with `ACAO: *`. Prefer [`client_for`]; the per-origin rule lives
+/// in [`crate::origins::DataSources`].
 #[cfg(not(target_arch = "wasm32"))]
 pub fn simple_client(timeout: std::time::Duration) -> reqwest::ClientBuilder {
     init();
@@ -127,19 +84,9 @@ pub fn simple_client(_timeout: std::time::Duration) -> reqwest::ClientBuilder {
 }
 
 /// Pick between [`client`] and [`simple_client`] from an origin's preflight
-/// rule. The only place that choice is made; the boolean comes from
-/// [`crate::origins::DataSources`].
-///
-/// The wasm builds of the two are currently byte-identical — a page cannot set
-/// `User-Agent` either way — so picking wrong breaks nothing *today*. That is a
-/// property of one `#[cfg]` arm, not of the CORS problem: restore a `User-Agent`
-/// to the wasm client and METAR and SPC go dark in the browser with no error on
-/// native.
-///
-/// [`sends_user_agent`] pins the routing here, but only over the arm the test
-/// runner compiled — always the native one. The wasm arms are held to the
-/// no-`User-Agent` property by `the_browser_clients_attach_no_user_agent`,
-/// which reads them as source because nothing in this workspace executes them.
+/// rule. The wasm builds of the two are currently byte-identical — a page cannot
+/// set `User-Agent` either way — so picking wrong breaks nothing *today*, and
+/// [`sends_user_agent`] only ever pins the native arm.
 pub fn client_for(sends_user_agent: bool, timeout: std::time::Duration) -> reqwest::ClientBuilder {
     if sends_user_agent {
         client(USER_AGENT, timeout)
@@ -151,11 +98,7 @@ pub fn client_for(sends_user_agent: bool, timeout: std::time::Duration) -> reqwe
 /// Whether this client attaches a `User-Agent` to every request it issues.
 ///
 /// `reqwest::Client` exposes no getter for its default headers, so this scrapes
-/// the `Debug` representation, which prints `default_headers` unconditionally.
-/// A request cannot be used instead: both constructors set `https_only(true)`,
-/// so a loopback `http://` server is rejected before any header is written.
-///
-/// Always `false` on wasm32, correctly — the browser supplies its own.
+/// the `Debug` representation. Always `false` on wasm32, correctly.
 pub fn sends_user_agent(client: &reqwest::Client) -> bool {
     format!("{client:?}").contains("\"user-agent\"")
 }

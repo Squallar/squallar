@@ -1,66 +1,31 @@
 //! Every network origin rustdar reads from, declared in one place.
 //!
-//! The web build issues every request through `fetch()`, so the server decides
-//! whether the response is readable. An origin that answers `200` to `curl` but
-//! omits `Access-Control-Allow-Origin` is unusable from the browser; the only
-//! fixes are a proxy (rejected — the web build must not require a server) or a
-//! different origin. Everything declared below answers `ACAO: *`.
+//! The web build issues every request through `fetch()`: an origin that omits
+//! `Access-Control-Allow-Origin` is unusable from the browser.
 //!
 //! Per-origin evidence, verified 2026-07-25 by `curl -H 'Origin: …'` including
 //! preflight. **Not re-derivable by reading code; re-probe before changing.**
 //!
 //! Unreachable, replaced:
-//!
 //! ```text
 //! tgftp.nws.noaa.gov     no ACAO (403 with an Origin: header)  -> level3_bucket
 //! nomads.ncep.noaa.gov   no ACAO                               -> hrrr_bucket
 //! aviationweather.gov    no ACAO                               -> iem_base
 //! ```
 //!
-//! Preflight-tolerant:
-//!
-//! ```text
-//! unidata-nexrad-level3  OPTIONS -> 200, Allow-Methods: GET, HEAD, Allow-Headers: user-agent
-//! noaa-hrrr-bdp-pds      OPTIONS -> 200, Allow-Methods: GET,       Allow-Headers: user-agent
-//! api.weather.gov        OPTIONS -> 200, Allow-Methods: GET,       Allow-Headers: API-Key, User-Agent
-//! api.open-meteo.com     OPTIONS -> 200, Allow-Methods: GET, POST, OPTIONS, Allow-Headers: …, user-agent, …
-//! ```
-//!
-//! Open-Meteo verified 2026-07-28 against the exact `/v1/forecast` query
-//! [`DataSources::sounding_url`] builds: plain `GET` 200, `GET` with an `Origin:`
-//! header 200 with `access-control-allow-origin: *` and
-//! `access-control-max-age: 600`, `OPTIONS` preflight 200 with the same. So a
-//! `User-Agent` *would* survive — but nothing there requires one (unlike
-//! `api.weather.gov`), and staying simple skips the preflight round-trip, so
-//! the sounding fetch uses `tls::simple_client` and carries no
-//! `sends_user_agent` flag: the flags exist to keep preflight-hostile origins
-//! reachable, not to record every origin's choice.
-//!
 //! Preflight-**hostile** — plain `GET` carries `ACAO: *`, so curl and every
-//! native build are happy while no browser ever issues the real request:
-//!
+//! native build are happy while no browser issues the real request:
 //! ```text
 //! mesonet.agron.iastate.edu  GET -> 200 ACAO: *   OPTIONS -> 405, Allow: GET, no ACA-Methods
 //! www.spc.noaa.gov           GET -> 200 ACAO: *   OPTIONS -> 403 (CloudFront), no CORS headers
 //! ```
 //!
-//! The SPC result holds for every path rustdar reads (`/products/spcmdrss.xml`,
-//! `/products/outlook/*.lyr.geojson`, `/climo/reports/today_*.csv`), and was
-//! confirmed in headless Chromium rather than only inferred: each URL was
-//! `fetch()`ed plain (200, readable) and again with a non-safelisted header
-//! (BLOCKED), with `unidata-nexrad-level3.s3` as the control that a preflighted
-//! cross-origin request *can* succeed from that page.
-//!
 //! So METAR and SPC requests must stay **simple**: no `User-Agent`, no custom
-//! headers. [`DataSources::metar_sends_user_agent`] and
-//! [`DataSources::spc_sends_user_agent`] record that per origin;
-//! [`DataSources::metar_client`] and [`DataSources::spc_client`] read it. A new
-//! origin belongs in both tables above or in neither.
+//! headers; [`DataSources`] records that per origin.
 
 use std::borrow::Cow;
 
-/// `Cow` rather than `&'static str` so a test can point one field at a local
-/// mock server without allocating the rest.
+/// `Cow` so a test can point one field at a local mock server.
 pub type Source = Cow<'static, str>;
 
 /// The set of network origins rustdar reads from. Construct with
@@ -69,24 +34,14 @@ pub type Source = Cow<'static, str>;
 pub struct DataSources {
     /// NEXRAD Level II archive volumes. Keys are `YYYY/MM/DD/SITE/NAME`.
     pub level2_bucket: Source,
-    /// NEXRAD Level II real-time chunks. Keys are `SITE/VOLUME/NAME`, a live
-    /// rotation rather than a dated archive.
-    ///
-    /// `rustdar_radar::chunks` reads it: `list_volume_indices` and `list_chunks`
-    /// walk the rotation and `download_chunk` fetches a piece, all taking the
-    /// bucket from this field rather than naming it, so the derived
-    /// validations (the Android network-security-config, the web
-    /// service-worker never-cache list) describe the origin traffic actually
-    /// goes to.
+    /// NEXRAD Level II real-time chunks. Keys are `SITE/VOLUME/NAME`.
     pub level2_chunks_bucket: Source,
     /// NEXRAD Level III products. Keys are **flat**: `SSS_PPP_YYYY_MM_DD_HH_MM_SS`.
     pub level3_bucket: Source,
     /// HRRR GRIB2 output, mirrored from NCEP by the Big Data Program.
     pub hrrr_bucket: Source,
-    /// GOES-East granules, for GLM lightning. Names the orbital *slot*, whose
-    /// current occupant is GOES-19: `noaa-goes16` has no GLM data after 2025
-    /// day 097, and the fetch rendering nothing for a year afterwards is why
-    /// the bucket lives in this table rather than beside the fetch.
+    /// GOES-East granules, for GLM lightning. Names the orbital *slot*, currently
+    /// GOES-19: `noaa-goes16` has no GLM data after 2025 day 097.
     pub goes_east_bucket: Source,
     /// GOES-West (currently GOES-18) granules, for GLM lightning.
     pub goes_west_bucket: Source,
@@ -96,28 +51,11 @@ pub struct DataSources {
     pub spc_base: Source,
     /// Iowa Environmental Mesonet: current ASOS/METAR observations.
     pub iem_base: Source,
-    /// Where the six bucket fields above are addressed — the one definition of
-    /// the S3 URL shape, with `{bucket}` substituted by
-    /// [`Self::s3_bucket_url`].
-    ///
-    /// A **template** rather than a plain base because S3 is addressed
-    /// virtual-host style: the bucket is a subdomain, not a path segment, and
-    /// that is the shape every CORS result in this module's header was measured
-    /// against. Path-style addressing would need no placeholder and would also
-    /// be a different origin from the one that was probed.
-    ///
-    /// It exists so the S3 origins are injectable like every other origin here.
-    /// `nws_api_base`, `spc_base`, `iem_base` and `sounding_base` have always
-    /// been full bases a test can point at a local listener; the buckets were
-    /// bare names with the origin built literally at each call site, and that
-    /// one difference is the whole reason the GLM poll — the loop that decides
-    /// whether one dead satellite blanks the other — had no test that ran it.
-    /// See `one_dead_satellite_does_not_blank_the_others_flashes`.
+    /// Where the six bucket fields above are addressed — the one definition of the
+    /// S3 URL shape, with `{bucket}` substituted by [`Self::s3_bucket_url`].
     pub s3_base: Source,
     /// Open-Meteo forecast API: environmental sounding heights (0 °C and
-    /// −20 °C levels) per radar site, for the products
-    /// `rustdar_radar::types::RadarProduct::reads_env_heights` names. See
-    /// `rustdar_radar::sounding`.
+    /// −20 °C levels) per radar site. See `rustdar_radar::sounding`.
     pub sounding_base: Source,
     /// `false` in production: IEM answers `OPTIONS` with `405`, so a
     /// `User-Agent` makes the request preflighted and it never happens.
@@ -154,34 +92,26 @@ impl DataSources {
         }
     }
 
-    /// Every METAR fetch goes through here, so the rule recorded on the origin
-    /// is the rule the request obeys.
+    /// Every METAR fetch goes through here, so the origin's recorded rule is the
+    /// rule the request obeys.
     pub fn metar_client(&self, timeout: std::time::Duration) -> reqwest::ClientBuilder {
         crate::tls::client_for(self.metar_sends_user_agent, timeout)
     }
 
-    /// For SPC outlooks, mesoscale discussions and storm reports. These three
-    /// used to share the ordinary `User-Agent`-bearing client.
+    /// For SPC outlooks, mesoscale discussions and storm reports.
     pub fn spc_client(&self, timeout: std::time::Duration) -> reqwest::ClientBuilder {
         crate::tls::client_for(self.spc_sends_user_agent, timeout)
     }
 
-    /// Where one bucket lives: `https://{bucket}.s3.amazonaws.com` in
-    /// production, from [`s3_base`](Self::s3_base).
-    ///
-    /// The root of both halves of every S3 conversation — the `?list-type=2`
-    /// listing queries and the object GETs — so pointing this at a local
-    /// listener points a whole fetch at it, which is what
-    /// `one_dead_satellite_does_not_blank_the_others_flashes` needs.
+    /// Where one bucket lives, from [`s3_base`](Self::s3_base).
     pub fn s3_bucket_url(&self, bucket: &str) -> String {
         self.s3_base.replace("{bucket}", bucket)
     }
 
     /// `https://{bucket}.s3.amazonaws.com/{key}`.
     ///
-    /// The key is interpolated, not encoded: every key rustdar builds is drawn
-    /// from `[A-Za-z0-9_./-]`, and encoding would have to leave the `/`
-    /// separators intact anyway.
+    /// The key is interpolated, not encoded: every key rustdar builds is drawn from
+    /// `[A-Za-z0-9_./-]`.
     pub fn s3_object_url(&self, bucket: &str, key: &str) -> String {
         format!("{}/{key}", self.s3_bucket_url(bucket))
     }
@@ -194,9 +124,8 @@ impl DataSources {
     /// The flat key prefix for one site/product/day in the Level III bucket.
     ///
     /// The bucket has **no directory structure and no `sn.last`**: keys are
-    /// `TLX_N0S_2026_07_25_01_20_27`, so "the latest product" is the last key of
-    /// a prefix listing. `site3` is the **three**-letter code — `TLX`, not
-    /// `KTLX`. See `rustdar_radar::level3::site_code`.
+    /// `TLX_N0S_2026_07_25_01_20_27`, so "the latest product" is the last key of a
+    /// prefix listing. `site3` is the **three**-letter code — `TLX`, not `KTLX`.
     pub fn level3_day_prefix(site3: &str, product: &str, date: &chrono::NaiveDate) -> String {
         format!("{site3}_{product}_{}", date.format("%Y_%m_%d"))
     }
@@ -223,8 +152,7 @@ impl DataSources {
     }
 
     /// The `.idx` sidecar listing that GRIB2 file's records and byte offsets.
-    /// ~9 KB, then a `Range:` request for the one record wanted — which is what
-    /// makes the S3 path cheaper than the NOMADS filter CGI it replaces.
+    /// ~9 KB, then a `Range:` request for the one record wanted.
     pub fn hrrr_idx_url(
         &self,
         date: &chrono::NaiveDate,
@@ -236,8 +164,8 @@ impl DataSources {
 
     /// Current ASOS observations for one US state, as JSON.
     ///
-    /// Scoped to a state (~72 KB) rather than the whole network: the
-    /// `?networkclass=ASOS` form is one request but **54 MB, ungzipped**.
+    /// Scoped to a state (~72 KB): the `?networkclass=ASOS` form is one request but
+    /// **54 MB, ungzipped**.
     pub fn metar_state_url(&self, state: &str) -> String {
         format!("{}/api/1/currents.json?network={state}_ASOS", self.iem_base,)
     }
@@ -255,11 +183,8 @@ impl DataSources {
     /// height from — that span brackets the −20 °C surface in every ordinary
     /// atmosphere (~−13 °C climatological mean at 600 hPa, ~−45 °C at 300).
     ///
-    /// `forecast_hours=2` keeps the response at two hourly rows: the current
-    /// hour plus one spare in case the model has a null at the first.
-    ///
-    /// Coordinates are truncated to three decimals (~110 m) — far inside the
-    /// forecast model's grid spacing, and it keeps the URL stable per site.
+    /// `forecast_hours=2` keeps the response at two hourly rows. Coordinates are
+    /// truncated to three decimals (~110 m), far inside the model's grid spacing.
     pub fn sounding_url(&self, lat: f64, lon: f64) -> String {
         format!(
             "{}/v1/forecast?latitude={lat:.3}&longitude={lon:.3}\
@@ -273,9 +198,8 @@ impl DataSources {
         )
     }
 
-    /// For Open-Meteo soundings: preflight-tolerant origin, but no `User-Agent`
-    /// is required there, so the request stays simple and skips the preflight
-    /// round-trip. See the module header's Open-Meteo entry.
+    /// For Open-Meteo soundings: no `User-Agent` is required, so the request stays
+    /// simple and skips the preflight.
     pub fn sounding_client(&self, timeout: std::time::Duration) -> reqwest::ClientBuilder {
         crate::tls::simple_client(timeout)
     }
@@ -290,9 +214,7 @@ mod tests {
         NaiveDate::from_ymd_opt(2026, 7, 25).unwrap()
     }
 
-    /// The three no-ACAO origins must not reappear in a production URL. Each
-    /// answers `curl` fine, so the only symptom of a regression is the web build
-    /// silently losing a layer.
+    /// The three no-ACAO origins must not reappear in a production URL.
     #[test]
     fn no_production_origin_is_one_the_browser_cannot_reach() {
         let s = DataSources::production();
@@ -324,16 +246,7 @@ mod tests {
         }
     }
 
-    /// The S3 origins are injectable like every other origin in this table, and
-    /// the production shape is unchanged by making them so.
-    ///
-    /// Both halves are the point. The first is what
-    /// `one_dead_satellite_does_not_blank_the_others_flashes` needed and could
-    /// not have: the GLM listing built `https://{bucket}.s3.amazonaws.com`
-    /// inline, so no test could put a socket where S3 was. The second is why the
-    /// field is a template with a placeholder rather than a plain base — S3 is
-    /// addressed virtual-host style, and every CORS result in this module's
-    /// header was measured against that exact shape.
+    /// The S3 origins are injectable like every other origin in this table.
     #[test]
     fn the_s3_origin_is_injectable_and_production_still_addresses_the_bucket_host() {
         let s = DataSources::production();
@@ -364,21 +277,10 @@ mod tests {
         );
     }
 
-    /// The network site catalogue reaches for two hosts, and **both are
-    /// already here**.
-    ///
-    /// That is the whole reason the catalogue costs nothing beyond its own
-    /// code. A genuinely new origin has to be added in four more places before
-    /// it works everywhere — the service worker's `NEVER_CACHE_HOSTS`, Android's
-    /// `network_security_config.xml`, `rustdar-web`'s `pwa_assets` list, and the
-    /// staging loop — and the tests over those files fail if one appears
-    /// without them. Nothing fails today, which is a fact worth asserting
-    /// rather than a fact worth assuming: a future rewrite of the catalogue
-    /// onto, say, `noaa-nexrad-level2` would compile, would pass its own tests,
-    /// and would be unreachable from the web build and from Android.
-    ///
-    /// `catalogue::fetch` builds its two URLs from exactly these two fields;
-    /// this pins which fields those are.
+    /// The network site catalogue reaches for two hosts, and **both are already
+    /// here**. A genuinely new origin has to be added in four more places (service
+    /// worker `NEVER_CACHE_HOSTS`, `network_security_config.xml`, `pwa_assets`,
+    /// staging loop).
     #[test]
     fn no_new_origin_is_needed_for_the_catalogue() {
         let s = DataSources::production();
@@ -391,11 +293,8 @@ mod tests {
             "the catalogue's position half GETs {}/radar/stations",
             s.nws_api_base,
         );
-        // The two rejected hosts are refused for what they serve, not for
-        // their CORS headers: `noaa-nexrad-level2` grants neither listing nor
-        // public GET, and the Google mirror runs ~3.5 weeks behind with
-        // `.tar`-bundled volumes. Either would compile and pass every other
-        // test in this file, which is why the host is pinned here by name.
+        // `noaa-nexrad-level2` grants neither listing nor public GET, and the Google
+        // mirror runs ~3.5 weeks behind with `.tar`-bundled volumes.
         for url in [
             s.s3_object_url(&s.level2_chunks_bucket, "KTLX/"),
             format!("{}/radar/stations", s.nws_api_base),
@@ -410,9 +309,7 @@ mod tests {
         }
     }
 
-    /// Level III keys are flat with no `sn.last`, so the prefix is the whole
-    /// addressing scheme. Expected string is a live key
-    /// (`TLX_N0S_2026_07_25_17_23_22`) truncated at the day.
+    /// Level III keys are flat with no `sn.last`.
     #[test]
     fn a_level3_prefix_is_site_product_and_an_underscored_date() {
         assert_eq!(
@@ -427,24 +324,21 @@ mod tests {
         );
     }
 
-    /// The HRRR key layout, transcribed from a live listing of
-    /// `noaa-hrrr-bdp-pds`.
+    /// The HRRR key layout, transcribed from a live listing.
     #[test]
     fn the_hrrr_key_names_a_run_and_a_forecast_hour() {
         assert_eq!(
             DataSources::hrrr_key(&date(), 3, 0),
             "hrrr.20260725/conus/hrrr.t03z.wrfsfcf00.grib2",
         );
-        // f01 is where the UH accumulation window is nonzero, and 14z exercises
-        // a two-digit run hour.
+        // f01 is where the UH accumulation window is nonzero; 14z is a two-digit run hour.
         assert_eq!(
             DataSources::hrrr_key(&date(), 14, 1),
             "hrrr.20260725/conus/hrrr.t14z.wrfsfcf01.grib2",
         );
     }
 
-    /// The index URL must be the GRIB URL plus `.idx` — a separate object, not
-    /// a query parameter.
+    /// The index URL must be the GRIB URL plus `.idx` — a separate object.
     #[test]
     fn the_idx_url_is_the_grib_url_with_a_suffix() {
         let s = DataSources::production();
@@ -458,8 +352,7 @@ mod tests {
         );
     }
 
-    /// `network=<ST>_ASOS`, never `networkclass=ASOS`: 72 KB vs 54 MB measured,
-    /// and the wrong one still returns valid JSON.
+    /// `network=<ST>_ASOS`, never `networkclass=ASOS`: 72 KB vs 54 MB measured.
     #[test]
     fn metar_is_scoped_to_one_state_not_the_whole_network() {
         let url = DataSources::production().metar_state_url("OK");
@@ -473,10 +366,7 @@ mod tests {
         );
     }
 
-    /// The sounding query, pinned verbatim: this exact URL is what the CORS
-    /// probes in the module header were run against (2026-07-28), so a drifted
-    /// query is one the probe evidence no longer covers. KOAX's coordinates,
-    /// matching the `testdata/openmeteo_koax.json` fixture.
+    /// The sounding query, pinned verbatim: the CORS probes were run against it.
     #[test]
     fn the_sounding_url_is_the_probed_query_shape() {
         let url = DataSources::production().sounding_url(41.320, -96.367);
@@ -492,9 +382,7 @@ mod tests {
         );
     }
 
-    /// Simple request, no `User-Agent`: Open-Meteo tolerates a preflight (see
-    /// the module header) but requires no UA, so staying simple saves the
-    /// `OPTIONS` round-trip rather than avoiding a breakage.
+    /// Simple request, no `User-Agent`: Open-Meteo requires none.
     #[test]
     fn the_sounding_client_sends_no_user_agent() {
         let s = DataSources::production();
@@ -522,12 +410,7 @@ mod tests {
         );
     }
 
-    /// The rule must reach the client, not just sit in a field: it was once read
-    /// only by the test asserting it was `false`.
-    ///
-    /// Both fetches would work today even with the wrong client, because the
-    /// wasm `tls::client` drops the `User-Agent` anyway — a coincidence of one
-    /// `#[cfg]` arm, not a property of CORS.
+    /// The rule must reach the client, not just sit in a field.
     #[test]
     fn the_preflight_hostile_origins_get_a_client_with_no_user_agent() {
         let s = DataSources::production();
@@ -542,8 +425,7 @@ mod tests {
         );
     }
 
-    /// Counterweight to the test above: without it, a `metar_client` that
-    /// ignored its field and always returned `simple_client` would pass.
+    /// Counterweight: a `metar_client` that ignored its field would otherwise pass.
     #[test]
     fn flipping_the_preflight_rule_changes_the_client() {
         let t = std::time::Duration::from_secs(1);
@@ -565,8 +447,7 @@ mod tests {
         );
     }
 
-    /// Overriding one field must not disturb the others — this is what lets a
-    /// test point at a mock server.
+    /// Overriding one field must not disturb the others.
     #[test]
     fn one_origin_can_be_overridden_in_isolation() {
         let s = DataSources {

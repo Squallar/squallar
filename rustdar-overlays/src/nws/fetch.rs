@@ -9,11 +9,9 @@ use crate::fetch_policy::{FetchError, NotFound};
 /// One round of the alerts endpoint: the alerts, and how much of their geometry
 /// was actually obtained.
 ///
-/// The second field is the whole point of this type existing. The round is two
-/// stages — one request for the alert list, then one per referenced zone — and
-/// only the first was ever reported on. A `Vec<NwsAlert>` has nowhere to put
-/// "and 212 of these have no shape", so the handler had nothing to say and the
-/// layer read as healthy while most of it was missing from the map.
+/// The round is two stages — one request for the alert list, then one per
+/// referenced zone — and a `Vec<NwsAlert>` has nowhere to put "and 212 of these
+/// have no shape", so the layer read as healthy while most of it was missing.
 pub struct ActiveAlerts {
     pub alerts: Vec<NwsAlert>,
     pub zones: ZoneResolution,
@@ -75,9 +73,8 @@ pub async fn fetch_active_alerts(
     let mut alerts = parse_alerts(&json);
 
     // Many alerts carry zone references instead of geometry. A zone that will
-    // not resolve is **not** an error for the round: the alerts that did get
-    // their outlines are real and have to be drawn. It is carried back beside
-    // them instead, which is what lets the layer draw what it has and still say
+    // not resolve is **not** an error for the round; it is carried back beside
+    // the alerts, which is what lets the layer draw what it has and still say
     // what it is missing.
     let zones = resolve_zone_geometries(client, &mut alerts, zone_cache_dir).await;
 

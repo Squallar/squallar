@@ -1,16 +1,10 @@
-//! The crate's charter, held as tests: the dependency ceiling of the 3D
-//! volume stack and the graph position the crate exists to hold.
+//! The crate's charter, held as tests: the dependency ceiling of the 3D volume
+//! stack and the graph position the crate exists to hold.
 //!
-//! Both read `cargo metadata --no-deps --format-version 1` from the workspace
-//! root. `packages[].dependencies` there are *declared* dependencies —
-//! feature-independent and resolution-independent — so no feature selection
-//! (default, `--all-features`, CI's llvm-cov arm) can mask or fake what these
-//! assert. Dep-name mechanics, recorded at M0 and relied on here: a
-//! workspace-internal dep appears with `"req": "*"` and a `path`; `kind` is
-//! `null` for normal deps (normalised to "normal" below); one name may
-//! legitimately appear once per kind, so entries are judged per
-//! `(kind, name)`. Target-gated entries carry their kind like any other and
-//! are included — a gated dependency is still a dependency.
+//! Both read `cargo metadata --no-deps --format-version 1`, whose
+//! `packages[].dependencies` are *declared* deps — feature- and
+//! resolution-independent. `kind` is `null` for normal deps (normalised to
+//! "normal" below); entries are judged per `(kind, name)`.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeSet;
@@ -39,9 +33,8 @@ fn metadata() -> serde_json::Value {
     serde_json::from_slice(&out.stdout).expect("cargo metadata emits valid JSON")
 }
 
-/// `(kind, name)` for every dependency `package` declares. `kind: null` is a
-/// normal dependency; target-gated entries carry their kind like any other and
-/// are included — a gated dependency is still a dependency.
+/// `(kind, name)` for every dependency `package` declares; target-gated
+/// entries are included.
 fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, String)> {
     let packages = meta["packages"]
         .as_array()
@@ -66,21 +59,8 @@ fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, S
 }
 
 /// The 3D stack's ceiling: the render substrate it marches through and the
-/// vocabularies it draws, nothing more.
-///
-/// The fences, spelled out because each one is load-bearing:
-/// * CPU rasterizers never move here — tiny-skia lives in rustdar-overlays and
-///   the radar polar render in rustdar-radar, beside their sources, by
-///   architecture.
-/// * volumetric -> gpu is a NORMAL dependency; gpu -> volumetric exists only
-///   as a dev-dep (WO-RV land 3, the hardware quarantine) — legal because
-///   dev-deps never enter the normal graph.
-/// * There is NO direct `wgpu` entry: every `wgpu::` value rides
-///   `egui_wgpu::wgpu`, rustdar-gpu is the one feature-chooser, and the
-///   single-copy guard at the boundary depends on this crate never resolving
-///   `::wgpu` itself.
-/// * `cargo test -p rustdar-volumetric` needs no adapter — adapter-needing
-///   tests are `#[ignore]`d and CI runs them from the gpu job.
+/// vocabularies it draws. No direct `wgpu` entry: every `wgpu::` value rides
+/// `egui_wgpu::wgpu`, and the single-copy guard depends on that.
 #[test]
 fn the_dependency_ceiling_holds() {
     let meta = metadata();
@@ -88,11 +68,9 @@ fn the_dependency_ceiling_holds() {
 
     for (kind, name) in &deps {
         let allowed: bool = match kind.as_str() {
-            // serde_json parses `cargo metadata` in this very file; pollster
-            // blocks on the adapter/device requests in the `#[ignore]`d unit
-            // tests; nexrad-model + chrono build and stamp the synthetic scan
-            // the bridge tests feed the voxel builder; rustdar-geo feeds the
-            // uniform/bridge differential fixtures.
+            // pollster blocks on the adapter/device requests in the
+            // `#[ignore]`d unit tests; nexrad-model + chrono stamp the
+            // synthetic scan the bridge tests feed the voxel builder.
             "dev" => matches!(
                 name.as_str(),
                 "serde_json" | "pollster" | "nexrad-model" | "chrono" | "rustdar-geo"
@@ -126,9 +104,7 @@ fn the_dependency_ceiling_holds() {
         );
     }
 
-    // Falsifiability floor: the crate really declares its dev dependencies and
-    // the rustdar crates it imports, so a broken parse or a renamed package
-    // cannot pass as an empty set.
+    // Falsifiability floor: an empty set cannot pass.
     for (kind, name) in [
         ("dev", "serde_json"),
         ("normal", "rustdar-gpu"),
@@ -145,12 +121,8 @@ fn the_dependency_ceiling_holds() {
     }
 }
 
-/// The graph shape WO-RV created stays: rustdar-app stands on
-/// rustdar-volumetric, so the app side reaches the probe, the raymarch, the
-/// staging path and the bridge through this crate rather than by owning them.
-///
-/// Presence, not absence, so it doubles as this file's second falsifiability
-/// floor: a renamed package or a broken parse cannot pass it.
+/// rustdar-app stands on rustdar-volumetric. Presence, not absence, so it
+/// doubles as a falsifiability floor.
 #[test]
 fn the_stack_sits_under_the_app() {
     let meta = metadata();

@@ -1,52 +1,15 @@
-//! What every dispatch path says about where the sweep it asked for folds.
-//!
-//! The observable is the **job that goes on the wire**, read back through the
-//! same `JobRequest::from_bytes` a browser worker uses. That is the only place
-//! the question has one answer: the fold limit is applied on whatever thread
-//! ends up rasterizing, so by the time a picture comes back there is nothing
-//! left to distinguish a payload that carried the RDA's declaration from one
-//! that let the dealiaser estimate — the two differ in a band of borderline
-//! gates and in nothing else.
-//!
-//! The band matters wherever the estimate can be wrong, which is any cut whose
-//! calmest sector reports well under its real limit. It is the **WSR-88D** that
-//! puts a number on the wire for this to carry: its Doppler cuts declare
-//! 23.84–62.94 m/s across the ten volumes `rustdar_radar::nyquist` measured.
-//!
-//! Not the TDWR, which is worth stating because the case for declared-over-
-//! estimated was originally argued on it. Its short PRT does make folding
-//! routine, but it never says where: across 22 volumes from 10 TDWR sites,
-//! every cut declares `nyquist_velocity = 0`, which
-//! `DeclaredNyquist::declare` refuses as the absence it is. A TDWR therefore
-//! posts jobs carrying `None` here and is dealiased against the estimate, the
-//! same as it was before any of this existed.
-
 use crate::platform_double::TestBridge;
 use rustdar_radar::types::RadarProduct;
 use rustdar_worker::offload::{JobRequest, JobSink};
 use std::sync::{Arc, Mutex};
 
 const SITE: &str = "KTLX";
-/// The 0.5° cut's own statement — KTLX's real declaration on 2026-08-11 at
-/// 10:09, and a value no default anywhere produces, so a payload that reached
-/// the assertions carrying it can only have been stamped.
-///
-/// It reads `KTLX` above and it is a WSR-88D number, which it was not before:
-/// this constant was 22.14 and called itself "a real TDWR Doppler figure",
-/// and no TDWR declares anything at all.
 const DECLARED_MS: f64 = 23.84;
-/// A second cut, declaring something else, so a stamp that copied one cut's
-/// number onto every sweep would be visible.
 const OTHER_CUT_MS: f64 = 31.35;
 
-/// A worker port that keeps what it was handed instead of posting it.
 struct Recorder(Arc<Mutex<Vec<Vec<u8>>>>);
 
 impl JobSink for Recorder {
-    /// Serialises here, as the browser's own sink does, so what these tests
-    /// read back has been through `to_bytes`/`from_bytes` exactly as a job
-    /// crossing a real worker boundary has. The funnel stopped doing it on
-    /// every sink's behalf; a recorder standing in for the browser still must.
     fn send(&self, _id: u64, request: JobRequest) -> Result<(), JobRequest> {
         self.0.lock().unwrap().push(request.to_bytes());
         Ok(())
@@ -60,7 +23,6 @@ fn volume_time() -> chrono::NaiveDateTime {
         .unwrap()
 }
 
-/// What the two cuts below declared.
 fn declared() -> Arc<rustdar_radar::nyquist::DeclaredNyquist> {
     Arc::new(
         [(1, DECLARED_MS), (2, OTHER_CUT_MS)]
@@ -69,8 +31,6 @@ fn declared() -> Arc<rustdar_radar::nyquist::DeclaredNyquist> {
     )
 }
 
-/// A two-cut volume carrying velocity, so the extraction reaches a sweep and
-/// the elevation numbers the table is keyed by are real.
 fn sample_scan() -> Arc<nexrad_model::data::Scan> {
     use nexrad_model::data::{
         ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan,
@@ -148,8 +108,6 @@ fn sample_scan() -> Arc<nexrad_model::data::Scan> {
     ))
 }
 
-/// An app with one map pane on [`SITE`], its volume in the plan view's own
-/// holder and in the loop cache, and the declarations with it in both.
 fn app_showing_site() -> crate::app::App {
     let mut app = crate::app::tests::headless(TestBridge::desktop());
     let site = rustdar_radar::sites::get_radar_site(SITE)
@@ -187,12 +145,6 @@ fn app_showing_site() -> crate::app::App {
     app
 }
 
-/// The declared table a posted job carries, whatever kind of job it is.
-///
-/// Both kinds carry more than one entry here, and for the same reason: NROT and
-/// SRV seed their dealiasers from a wind profile fitted over the *volume's*
-/// velocity tilts, so even a single-tilt payload for one of them reaches the
-/// worker with every velocity sweep in it.
 fn declaration_on_the_wire(job: &JobRequest) -> Vec<(u8, f64)> {
     let input = job
         .job
@@ -207,8 +159,6 @@ fn declaration_on_the_wire(job: &JobRequest) -> Vec<(u8, f64)> {
     input.declared_nyquist().iter().collect()
 }
 
-/// What a payload says about the cut this fixture's panes are drawing, out of
-/// whatever else it carries.
 fn the_drawn_cut(declared: &[(u8, f64)]) -> Vec<(u8, f64)> {
     declared
         .iter()
@@ -226,15 +176,6 @@ fn posted_jobs(recorded: &Mutex<Vec<Vec<u8>>>) -> Vec<JobRequest> {
         .collect()
 }
 
-/// **The pin this task exists for.** One sweep, two views, one fold limit.
-///
-/// The plan view rasterizes NROT on the worker and the section derives NROT on
-/// the worker, and each unfolds velocity before it computes shear. Between them
-/// they used to disagree: the section payload was stamped with the volume's
-/// declarations and the plan view's was not, so a section of a Doppler cut
-/// unfolded around the RDA's own number while the map under it unfolded around
-/// whatever its calmest sector happened to observe. Nothing errored, nothing
-/// warned, and the two pictures of one cut simply differed.
 #[test]
 fn a_plan_view_and_a_section_of_one_sweep_fold_at_the_same_speed() {
     let posted = Arc::new(Mutex::new(Vec::new()));
@@ -242,16 +183,8 @@ fn a_plan_view_and_a_section_of_one_sweep_fold_at_the_same_speed() {
 
     let mut app = app_showing_site();
     let ctx = egui::Context::default();
-    // The map pane's own dispatch, through the pass that reads `scan_data` —
-    // not `spawn_level2_render` called by hand, because the store carrying the
-    // table and the dispatcher reading it are two separate things to get wrong.
     app.dispatch_pane_renders(&ctx);
 
-    // And a section of the same volume, aimed and cut. The in-flight mark goes
-    // first: `dispatch_section_renders` refuses a pane that already has a
-    // render out, and the mark is cleared on receipt of a `RenderResponse` —
-    // which this fixture, holding the job rather than answering it, never
-    // sends.
     app.render.pane_render[0].render_finished();
     {
         let pane = app.gui.pane_mut(0).unwrap();
@@ -309,14 +242,6 @@ fn a_plan_view_and_a_section_of_one_sweep_fold_at_the_same_speed() {
     );
 }
 
-/// The same statement, one datasource further out: a loop frame of a sweep and
-/// the still frame of that sweep fold at the same speed.
-///
-/// The loop download path used to drop the table outright, on the reasoning
-/// that a loop frame is a plan-view raster and nothing on that path
-/// interpolates across a fold seam. That was true of the *sampler's* guard and
-/// never of the dealiaser: NROT and SRV unfold before they compute anything,
-/// on every path that draws them.
 #[test]
 fn a_loop_frame_and_the_still_frame_beside_it_fold_at_the_same_speed() {
     let posted = Arc::new(Mutex::new(Vec::new()));

@@ -23,69 +23,6 @@ use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
 
 /// What a poll's listings covered, in the layer-agnostic terms the UI renders.
-///
-/// GLM's round is one S3 listing per selected satellite and a dead one does not
-/// fail the round — the survivor's flashes are real and cover most of CONUS. But
-/// nothing said so: the round returned `Ok`, stamped a fresh clock and read
-/// health `Ok`, while GOES-East's contribution drained out of the cache window
-/// over the next half hour. This is that half of the round, written down.
-///
-/// # A listing is one of six ways this round under-delivers
-///
-/// The first draft of this counted [`listing_failures`] alone, and the others
-/// each end a poll with flashes missing from the map and the ledger reading
-/// whole:
-///
-/// - a [`DeadFeed`] — the listing answered `200` with **zero objects**, which
-///   for a product that publishes a granule every twenty seconds is the feed
-///   being gone rather than a quiet sky. It is in `queried`, so counting only
-///   `listing_failures` counted it as a feed that delivered;
-/// - a [`WindowGap`] — the listing answered `200` with objects, none of which
-///   is a granule covering the window. The opposite listing to a dead feed and
-///   the same result on screen: that satellite contributes nothing. Measured
-///   over 24 hour-prefixes on both live buckets the granule cadence is 20.0 s
-///   and never gapped past 40.0 s, against a 60 s minimum window, so a healthy
-///   feed cannot produce this;
-/// - [`transport_failures`](GlmFetchOutcome::transport_failures) — the granules
-///   were listed and would not download. Its own log line already said what
-///   this costs: *"the map is blank despite a healthy S3 listing"*;
-/// - [`parse_failures`](GlmFetchOutcome::parse_failures) — they downloaded and
-///   would not parse;
-/// - [`level_failures`](GlmFetchOutcome::level_failures) — one hierarchy level
-///   stopped parsing inside granules that otherwise did, so that layer alone is
-///   empty;
-/// - [`record_drops`](GlmFetchOutcome::record_drops) — the granules parsed and
-///   individual records inside them were thrown away for a fill value or a
-///   coordinate off the globe. The finest grain of the four, and the only one
-///   whose denominator is **records** rather than granules or feeds.
-///
-/// Each was reported to the log and nowhere else. Measured over a socket with
-/// both listings healthy and every granule refused: two feeds queried, zero
-/// flashes, `is_complete()` = `true`.
-///
-/// # What a quiet sky looks like, and why it is not any of these
-///
-/// GLM has genuinely quiet periods and reporting one as incomplete would be a
-/// false alarm that teaches people to ignore the mark. It cannot happen here,
-/// because none of the six conditions is reachable by an absence of lightning:
-/// a quiet sky lists its granules like any other (they are published on a
-/// 20 s clock, not on activity), downloads them, parses them, and yields zero
-/// flashes with `considered` records all kept. Every branch below needs a
-/// *granule or a record* to have gone missing, which no weather can cause.
-///
-/// # Which bucket each falls in
-///
-/// A feed is [`missing`](DataCompleteness::missing) when nothing of it reached
-/// the map and [`partial`](DataCompleteness::partial) when some of its window
-/// did — the same rule the zone resolver uses per alert. A listing failure and
-/// a dead feed are missing outright. Granule failures are counted against the
-/// feeds that *did* list: total means those feeds delivered nothing, so they
-/// are missing too; anything short of total leaves them drawing part of their
-/// window.
-///
-/// `parts` are **granules**, the piece a feed is assembled from, which is the
-/// denominator the granule failures are already measured against. The listing
-/// half has no second denominator — a satellite *is* the unit there.
 fn round_coverage(outcome: &GlmFetchOutcome) -> crate::fetch_policy::DataCompleteness {
     let GlmFetchOutcome {
         queried,
@@ -99,8 +36,6 @@ fn round_coverage(outcome: &GlmFetchOutcome) -> crate::fetch_policy::DataComplet
         ..
     } = outcome;
 
-    // Transport and parse partition the same granules — a file that failed to
-    // download was never parsed — so their counts add and share `in_window`.
     let in_window = transport_failures
         .as_ref()
         .or(parse_failures.as_ref())
@@ -108,10 +43,6 @@ fn round_coverage(outcome: &GlmFetchOutcome) -> crate::fetch_policy::DataComplet
     let granules_failed = transport_failures.as_ref().map_or(0, |f| f.failed)
         + parse_failures.as_ref().map_or(0, |f| f.failed);
 
-    // Feeds that put granules in the window. A dead feed listed no objects and
-    // a window gap listed no *granules*, so both are already accounted for as
-    // missing and neither can be charged again for the granule failures — they
-    // contributed nothing to `in_window` to fail.
     let live = queried
         .len()
         .saturating_sub(dead_feeds.len())
@@ -123,10 +54,6 @@ fn round_coverage(outcome: &GlmFetchOutcome) -> crate::fetch_policy::DataComplet
     } else {
         (live, 0)
     };
-    // A level that stopped parsing empties that layer and leaves the others,
-    // and a dropped record leaves a hole in a layer that is otherwise drawing:
-    // either way a live feed is showing part of its window — unless it is
-    // already counted as having delivered nothing, which is the stronger claim.
     let under_delivering = !level_failures.is_empty() || record_drops.dropped() > 0;
     let granule_partial = if granule_partial == 0 && granule_missing == 0 && under_delivering {
         live
@@ -147,10 +74,6 @@ fn round_coverage(outcome: &GlmFetchOutcome) -> crate::fetch_policy::DataComplet
             1,
         ));
     }
-    // Deliberately says the listing was *healthy*: the whole point of splitting
-    // this from `dead_feeds` is that the operator's next move differs. An empty
-    // bucket means look at the bucket name; a full bucket with nothing in the
-    // window means look at the publisher or at our filename parsing.
     for gap in window_gaps {
         reasons.push((
             format!(
@@ -183,13 +106,6 @@ fn round_coverage(outcome: &GlmFetchOutcome) -> crate::fetch_policy::DataComplet
             1,
         ));
     }
-    // Count 1 with the whole phrase in the string, like the listing reasons
-    // above and unlike the granule ones: `status_note` renders a reason as
-    // "{count} {why}", so the record denominator has to travel inside `why` or
-    // it would be read against `parts_requested`, which counts granules. The
-    // two causes stay apart because they indict different things - a fill value
-    // is the product declining to place a record, an off-globe coordinate is
-    // the product and this reader disagreeing about what the numbers mean.
     if record_drops.fill_values > 0 {
         reasons.push((
             format!(
@@ -344,9 +260,6 @@ pub(crate) struct GlmHandler {
     /// Cached S3 file data for incremental fetching.
     pub cache: Arc<std::sync::Mutex<GlmCache>>,
     /// Satellites whose last listing returned no objects at all.
-    ///
-    /// Kept across polls so the log fires on the transition rather than every
-    /// poll, and so the panel can show the condition.
     dead_feeds: Vec<DeadFeed>,
     /// Per-kind failure state — see [`GlmHandler::report_failures`].
     parse: FailureState,
@@ -358,20 +271,10 @@ pub(crate) struct GlmHandler {
     /// window. Kept across polls for the same reason as `dead_feeds`.
     window_gaps: Vec<WindowGap>,
     /// Records the last poll that actually parsed a granule threw away.
-    ///
-    /// Carried rather than read from each round because a poll that downloads
-    /// nothing new parses nothing and so counts nothing — routine, with a 20 s
-    /// poll interval racing a ~20 s granule cadence. Taking the round's value
-    /// unconditionally would blank this notice on every other poll. The gate is
-    /// `considered > 0`, which is the same "did we look at anything" question
-    /// `evaluated_levels` answers for the level failures.
     record_drops: RecordDrops,
 }
 
 /// What a batch of failures means, reduced to the states worth *announcing*.
-///
-/// Carries no counts: edge-triggering on raw counts flaps (7 files then 9 is
-/// not a change a user needs told twice).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum FailureHealth {
     #[default]
@@ -437,23 +340,6 @@ impl GlmHandler {
         }
     }
 
-    /// What the rasterizer reads, captured once — the **one** builder
-    /// `prepare_job` answers from, kept a private helper so a second dispatch
-    /// path could not quietly capture different state.
-    ///
-    /// The rows are [`rasterize::FlashPaint`], not whole [`GlmFlash`]es: the
-    /// coordinates, the timestamp and the energy are everything the raster
-    /// reads — the satellite and level stay page-side with the popup.
-    ///
-    /// `now` is **`ctx.now`**, the dispatch's own clock capture, not a read of
-    /// this handler's — see
-    /// [`rasterize::GlmStrikesInput::now`] for why re-reading it anywhere
-    /// downstream of the dispatch is the bug the parity gate exists to catch.
-    ///
-    /// **Row `i` is `state.data[i]`'s flash**, which is the same indexing
-    /// [`Self::hit_items`] answers — one iteration order, stated in both
-    /// places, because a hit-map id is a position in this list and the item it
-    /// resolves to is the same position in that one.
     fn paint_input(&self, ctx: &RasterizeContext) -> Option<rasterize::GlmStrikesInput> {
         if self.state.data.is_empty() {
             return None;
@@ -479,17 +365,6 @@ impl GlmHandler {
     }
 
     /// Log window-gap *changes* only, and keep the current set for the panel.
-    ///
-    /// Same shape as [`report_feed_changes`](Self::report_feed_changes) and for
-    /// the same reasons: the condition is steady while it lasts, a 20 s poll
-    /// interval would otherwise emit ~180 identical lines an hour per
-    /// satellite, and `queried` is what entitles the recovery notice — a
-    /// deselected satellite must not read as having come back.
-    ///
-    /// Not folded into `report_feed_changes` despite the shape: a dead feed and
-    /// a window gap are opposite listings (`0` objects against `objects_seen`
-    /// of them) and want opposite investigations, and merging the two states
-    /// would let one condition clear the other's notice.
     fn report_window_gaps(&mut self, queried: &[GlmSatellite], current: Vec<WindowGap>) {
         for gap in &current {
             if !self
@@ -529,10 +404,6 @@ impl GlmHandler {
     }
 
     /// Keep the newest drop tally that came from a poll which actually looked.
-    ///
-    /// A poll that parsed no granule has `considered == 0` and knows nothing —
-    /// it must not clear a standing notice, exactly as an unevaluated level
-    /// must not read as recovered.
     fn report_record_drops(&mut self, drops: RecordDrops) {
         if drops.considered == 0 {
             return;
@@ -556,15 +427,6 @@ impl GlmHandler {
     }
 
     /// Log level-parse *changes* only, and keep the current set for the panel.
-    ///
-    /// Edge-triggered: a schema change is permanent, so an unconditional
-    /// warning emits ~180 identical lines an hour and buries itself.
-    ///
-    /// `evaluated` is what entitles us to say "recovered", on both axes this
-    /// failure is keyed on. Deselecting a satellite or a level means nothing
-    /// asks about it any more; and a poll that downloads no new granules
-    /// evaluates nothing at all — routine, with a 20 s poll interval racing a
-    /// ~20 s granule cadence.
     fn report_level_failures(
         &mut self,
         evaluated: &[(GlmSatellite, GlmDataLevel)],
@@ -587,8 +449,6 @@ impl GlmHandler {
             }
         }
 
-        // Carry forward anything we did not look at, so it neither reads as
-        // recovered now nor re-fires the "stopped parsing" warning later.
         let mut next: Vec<LevelFailure> = Vec::new();
         for previous in std::mem::take(&mut self.level_failures) {
             let still_failing = current
@@ -614,12 +474,6 @@ impl GlmHandler {
         self.level_failures = next;
     }
 
-    /// Log feed-liveness *changes* only: one warning when a feed goes dark, one
-    /// recovery notice when it comes back. At a 20 s poll interval an
-    /// unconditional warning is ~180 identical lines an hour per satellite.
-    ///
-    /// `queried` is what entitles us to say "recovered": absence from `current`
-    /// means "alive" only for a satellite that was actually asked.
     fn report_feed_changes(&mut self, queried: &[GlmSatellite], current: Vec<DeadFeed>) {
         for feed in &current {
             if !self
@@ -638,9 +492,6 @@ impl GlmHandler {
             }
         }
 
-        // Carry forward any satellite we did not ask about. This keeps a
-        // deselected-while-dead feed from reading as recovered, and keeps
-        // re-selecting it from re-firing the "is dead" warning.
         let mut next: Vec<DeadFeed> = Vec::new();
         for previous in std::mem::take(&mut self.dead_feeds) {
             let still_dead = current.iter().any(|d| d.satellite == previous.satellite);
@@ -663,11 +514,6 @@ impl GlmHandler {
 
     /// Announce failure *transitions* for one kind, and keep the detail for the
     /// panel.
-    ///
-    /// A granule that downloads but will not parse blanks the map exactly like
-    /// one that was never published, but its S3 listing is healthy so
-    /// `dead_feeds` says nothing about it — without this the user sees
-    /// "Updated 0s ago" over an empty map.
     fn report_failures(&mut self, kind: FailureKind, failures: Option<FetchFailures>) {
         let health = match &failures {
             None => FailureHealth::Ok,
@@ -772,20 +618,6 @@ impl OverlayHandler for GlmHandler {
 
     /// E.g. `"312 flashes · 10 min"`: what the layer is holding, and how wide
     /// its window is.
-    ///
-    /// It is **not** the number of bolts on screen, and this comment used to
-    /// say it was. Three culls run after this count is taken, inside
-    /// `rasterize_glm_strikes`: the viewport bounding box, a second age test
-    /// against a clock sampled later than the fetch's, and a pixel-window test
-    /// after projection. For a full-disk product on a regional view the first
-    /// of those alone removes most of what this number counts, so reading it
-    /// as a drawn count let an under-drawing map read as a complete one.
-    ///
-    /// Kept as the held count rather than swapped for a drawn one: the held
-    /// count is a property of the data and answers "is the feed alive", which
-    /// is what a status line is for, while a drawn count changes on every pan
-    /// and would need a `RasterizeOutput` field every other overlay would then
-    /// have to carry. The claim was wrong, not the number.
     fn status_line(&self) -> Option<String> {
         if !self.enabled {
             return None;
@@ -846,9 +678,6 @@ impl OverlayHandler for GlmHandler {
         match fetch.0 {
             Ok(outcome) => {
                 log::info!("Received {} GLM lightning flashes", outcome.flashes.len());
-                // Before the reports below, which take the outcome's failure
-                // lists by value: every one of them is a way this round
-                // under-delivered, and the coverage report needs all four.
                 let coverage = round_coverage(&outcome);
                 self.report_feed_changes(&outcome.queried, outcome.dead_feeds);
                 self.report_window_gaps(&outcome.queried, outcome.window_gaps);
@@ -862,23 +691,12 @@ impl OverlayHandler for GlmHandler {
                     .enumerate()
                     .map(|(i, flash)| Arc::new(GlmFlashItem { flash, index: i }))
                     .collect();
-                // The satellite that answered gives real flashes on a fresh
-                // clock; the one that did not is recorded beside them rather
-                // than instead of them.
                 self.state.set_data_with_coverage(items, coverage);
             }
             Err(e) => {
                 // A failed fetch says nothing about feed liveness, so leave the
                 // previous verdict standing rather than reporting a recovery.
                 log::error!("GLM fetch failed: {e}");
-                // The verdict travels with the error now. It used to be
-                // hardcoded `transient` here, reasoned as "the outer error
-                // means the round did not complete, which is transient by
-                // construction" — and that was wrong in the direction that
-                // costs something. At a 20 s interval, a GLM bucket renamed a
-                // year ago is 180 requests an hour for ever, and no rung of the
-                // ladder can slow a `Transient` past the ceiling. The S3
-                // listing classifies its own statuses; see `glm::fetch`.
                 self.state.record_failure(&e);
             }
         }
@@ -950,7 +768,6 @@ impl OverlayHandler for GlmHandler {
                     &mut local_cache,
                 )
                 .await;
-                // Write the updated cache back
                 {
                     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
                     *guard = local_cache;
@@ -974,11 +791,6 @@ impl OverlayHandler for GlmHandler {
             enabled: self.enabled,
         }];
 
-        // Ungated on enabled (the every-option rule, M9.1): a hidden
-        // layer's options stay visible and editable - edits take effect
-        // when the eye shows it again - Refresh still fetches (nothing
-        // on the fetch path reads enabled), and the status lines keep
-        // reporting.
         items.push(ControlItem::Dropdown {
             id: "satellite",
             label: "Satellite".into(),
@@ -1043,20 +855,7 @@ impl OverlayHandler for GlmHandler {
             items.push(ControlItem::InfoText { text });
         }
 
-        // An empty map with no explanation has five causes that look
-        // identical on screen. Logs alone did not get one of them noticed
-        // for a year, so each is stated where the toggle lives.
-        //
-        // A sixth thing an empty map can mean is that nothing flashed, and
-        // that one deliberately shows nothing at all: every notice below
-        // needs a granule or a record to have gone missing, and no quiet
-        // sky can produce one. A mark that fired on a calm night is a mark
-        // people stop reading.
 
-        // Cause 1: the files were never published. Only satellites the
-        // current selection queries — `dead_feeds` remembers deselected
-        // ones so they do not read as recovered, but showing those is
-        // stale.
         let selected = self.satellite.to_satellites();
         for feed in self
             .dead_feeds
@@ -1072,10 +871,6 @@ impl OverlayHandler for GlmHandler {
             });
         }
 
-        // Cause 2: the bucket is full and none of it covers the window.
-        // The opposite listing to cause 1 and the same empty map, so it gets
-        // its own line rather than sharing one: "bucket is empty" would send
-        // the reader to the bucket name, which is the one thing that is fine.
         for gap in self
             .window_gaps
             .iter()
@@ -1089,13 +884,6 @@ impl OverlayHandler for GlmHandler {
             });
         }
 
-        // Cause 3: the files were published but would not download or would
-        // not parse. The S3 listing is healthy in both cases, and the two
-        // are reported separately because they indict different things.
-        //
-        // Both can show at once, but two *totals* cannot: each file yields
-        // exactly one FileError, so the counts partition the failures and
-        // at most one can equal `in_window`.
         for (kind, state) in [
             (FailureKind::Parse, &self.parse),
             (FailureKind::Transport, &self.transport),
@@ -1114,14 +902,6 @@ impl OverlayHandler for GlmHandler {
             items.push(ControlItem::InfoText { text });
         }
 
-        // Cause 4: the files are fine and one *layer* inside them is not.
-        // The granule parsed, so it is not a failed file, and the listing
-        // is healthy, so it is not a dead feed.
-        //
-        // Filtered on *both* selection dimensions: `level_failures`
-        // remembers verdicts it could not re-examine, and `clear_cache()`
-        // on a level toggle guarantees a deselected layer is never
-        // re-evaluated, so nothing else would ever take the notice down.
         let selected = self.satellite.to_satellites();
         let levels = self.active_levels();
         for failure in self
@@ -1138,15 +918,6 @@ impl OverlayHandler for GlmHandler {
             });
         }
 
-        // Cause 5: the granules parsed and individual records inside them did
-        // not survive. The finest grain, and the only notice here whose
-        // denominator is records — stated inline so it is never read against
-        // the file counts standing above it.
-        //
-        // Not filtered by satellite or level, unlike causes 1, 2 and 4: the
-        // tally is summed across whatever the last parsing poll was asked for,
-        // and inventing a per-bird split it does not have would be a figure
-        // with no denominator behind it.
         if self.record_drops.dropped() > 0 {
             items.push(ControlItem::InfoText {
                 text: format!(
@@ -1184,14 +955,6 @@ impl OverlayHandler for GlmHandler {
                     if new_sat != self.satellite {
                         self.satellite = new_sat;
                         self.state.data_generation = self.state.data_generation.wrapping_add(1);
-                        // Deliberately no `clear_cache()`, unlike the level
-                        // toggles below: cached records carry their satellite
-                        // and `glm::fetch::flashes_in_window` filters by the
-                        // current selection, so a deselected bird stops
-                        // rendering on the very next poll and re-selecting it
-                        // restores instantly from cache. Levels must clear
-                        // because a deselected level was never parsed into the
-                        // cache at all.
                         return ControlEffect::Fetch;
                     }
                 }

@@ -15,18 +15,10 @@ pub(crate) mod section_render;
 pub(crate) mod volume_alpha_editor;
 
 /// What a cross-section pane says while it has nothing to show.
-///
-/// Deliberately an instruction rather than an apology: a section pane with no
-/// line is the ordinary state between converting a pane and aiming it, and the
-/// line is drawn somewhere else (on a map pane), which is not guessable.
 pub(crate) const CROSS_SECTION_EMPTY_STATE: &str =
     "Draw a line on a map pane to cut a cross-section";
 
 /// What a 3D pane says while it has nothing to show.
-///
-/// Says unavailable, not "loading": whether a device can raymarch a volume at
-/// all is decided by a capability check, and a pane that promises a picture it
-/// cannot produce is worse than one that says so.
 pub(crate) const VOLUME_EMPTY_STATE: &str = "3D volume view unavailable";
 
 /// The header over the 3D pane's sidebar block. Icon, two spaces, name — the
@@ -35,45 +27,20 @@ pub(crate) const VOLUME_EMPTY_STATE: &str = "3D volume view unavailable";
 pub(crate) const VOLUME_SIDEBAR_HEADER: &str = "\u{26f6}  3D view";
 
 /// The Map floor checkbox's label.
-///
-/// Named here so the row, the note that appears beneath it and the tests that
-/// pin both read the same string — a renamed checkbox with a note still
-/// pointing at the old wording is exactly the drift a literal would allow.
 pub(crate) const MAP_FLOOR_LABEL: &str = "Map floor";
 
 /// What the sidebar says when the Map floor checkbox cannot produce anything.
-/// The pane's own reason for drawing nothing follows it.
-///
-/// The floor is not a layer drawn beside the volume; it is drawn *by* the
-/// raymarch, inside the paint callback a 3D pane pushes only when it has a
-/// picture. So a pane that is explaining itself instead of drawing has no floor
-/// whatever this checkbox says — and a checkbox that silently does nothing is
-/// the quietest kind of broken control there is.
 pub(crate) const MAP_FLOOR_INERT_NOTE: &str =
     "No floor yet - nothing is being drawn to stand it under:";
 
 /// The headline of a pane's empty-state reason: everything up to the first
 /// line break, trimmed.
-///
-/// The reasons are paragraphs — a headline and then the detail, separated by a
-/// blank line, laid out across the pane. The sidebar is a narrow column beside
-/// that pane and is quoting the reason to *identify* it, not to re-explain it:
-/// the whole paragraph is already on screen a few hundred points away.
 fn reason_headline(reason: &str) -> &str {
     reason.lines().next().unwrap_or(reason).trim()
 }
 
 impl super::Gui {
     /// Draw every visible pane, whatever kind each one is.
-    ///
-    /// Named for panes rather than for maps because the pane loop below is
-    /// shared by all three [`PaneKind`](crate::pane::PaneKind)s and only one of
-    /// them is a map. Everything except the single `match` on the pane's kind —
-    /// the rect, taking the pane, resolving the centre, taking `map_memory`,
-    /// resolving the pointer, building the child `Ui`, putting it all back and
-    /// drawing the border — is deliberately *not* per-kind: a section pane has a
-    /// site, a viewport and a pointer just as a map pane does, and duplicating
-    /// the frame around each arm is how those quietly drift apart.
     pub(super) fn render_panes(
         &mut self,
         ui: &mut egui::Ui,
@@ -84,36 +51,14 @@ impl super::Gui {
         let mut actions = Vec::new();
         let ctx = ui.ctx().clone();
 
-        // What the map was *handed*, so a test can check the chrome's rects
-        // actually arrive here. They reach every click handler from
-        // `PaneRenderCtx::excluded_rects` below.
         #[cfg(test)]
         {
             self.probes.last_map_excluded_rects = excluded_rects.to_vec();
         }
 
-        // Detect current theme from egui context
         let is_dark_theme = ctx.global_style().visuals.dark_mode;
 
-        // Initialize tiles via MapTileState
         self.map_tiles.ensure_base_tiles(is_dark_theme, &ctx);
-        // Visible panes that draw ground, only. `Gui::panes` because a pane
-        // remembered from a wider split must not keep label-tile fetching alive;
-        // `draws_ground` because a pane with no tiles has nowhere to put a
-        // label, so a converted pane would go on fetching a tile pyramid nothing
-        // draws. Its `enabled_overlays` is left as it is, so converting back
-        // restores the layer: see `Gui::any_pane_has_overlay_enabled`.
-        //
-        // **Not `is_map`.** That asks whether the pane draws the flat picture,
-        // and a 3D pane answers no while drawing this very layer onto its floor:
-        // `draw_floor_strip` runs the same `Map::show` and the same
-        // `render_pane_map_content` a plan view does, and the `CityLabels` arm
-        // in there draws through the `label_tiles` this decides. So a lone 3D
-        // pane with the layer on had a floor with no city labels on it, and
-        // `Gui::floor_tile_working_set` — which already budgets a label pyramid
-        // for exactly this pane — was budgeting for tiles nothing fetched.
-        //
-        // Read before the pane loop's `mem::take`, so the view is the real one.
         let any_city_labels = self
             .panes()
             .iter()
@@ -122,7 +67,6 @@ impl super::Gui {
             self.map_tiles.ensure_label_tiles(is_dark_theme, &ctx);
         }
 
-        // Take tiles out of self so they can be reborrowed per-pane in the loop.
         let mut tiles_owned = self.map_tiles.take_base_tiles();
         let mut label_tiles = if any_city_labels {
             self.map_tiles.take_label_tiles()
@@ -130,16 +74,8 @@ impl super::Gui {
             None
         };
 
-        // The visible slice's bound, not the layout's raw count: the loop below
-        // indexes `self.panes[pane_idx]` directly, and `Gui::panes` documents
-        // why slicing at `pane_layout.pane_count` alone could outrun the vector.
         let pane_count = self.visible_pane_count();
-        // Resolved once for the frame, before the pane loop: every pane must
-        // agree about what is pointing at the screen.
         let modality = self.layout.modality;
-        // Per-pane, before the loop's `mem::take`, for the reason the render
-        // branch gives: inside the take a pane's slot is a default map pane, and
-        // the bias is decided by which *other* pane is standing on this one.
         let tile_zoom_biases: Vec<u8> = (0..pane_count)
             .map(|idx| self.tile_zoom_bias_for_pane(idx))
             .collect();
@@ -153,31 +89,12 @@ impl super::Gui {
                     self.probes.last_map_panel_rect = panel_rect;
                 }
 
-                // One color-scale orientation for the whole grid, resolved from
-                // the panel (not from each pane's rect) so every pane on screen
-                // agrees and dragging a divider cannot flip the bars. See
-                // `ColorScaleOrientation`.
                 let horizontal_color_scale = self.color_scale_orientation.resolve(panel_rect);
 
-                // And one floor for the whole grid, on the same footing: the
-                // phone shell's bottom bar is a single full-bleed strip across
-                // the bottom of this panel, so how much of the bottom edge is
-                // unavailable to a legend is a property of the panel, not of a
-                // pane. `Gui::phone_bar_height` is last frame's measurement and
-                // zero on every width class that draws no bar — see the field
-                // for why a frame late is the only order available and why it
-                // does not show. `pane_render::clear_of_bottom_chrome` turns
-                // this into each pane's answer.
                 let color_scale_floor = panel_rect.bottom() - self.phone_bar_height;
 
                 self.detect_active_pane_click(ui.ctx(), panel_rect);
 
-                // Snapshot viewport state before rendering for sync
-                // detection. Taken whenever a group could exist — the links
-                // are per pane now, and `sync_viewports` itself sorts a
-                // linked mover (drives the group) from an unlinked one
-                // (moves alone); without the snapshot it could not tell who
-                // moved at all.
                 let (pre_zooms, pre_positions): (Vec<f64>, Vec<Option<Position>>) =
                     if pane_count > 1 {
                         self.panes
@@ -191,49 +108,9 @@ impl super::Gui {
 
                 let pointer_available = self.dismiss_overlay_popups(ui.ctx());
 
-                // Whether some feature consumed this frame's confirmed map
-                // click — an overlay polygon hit, a radar-site icon. One flag
-                // for the whole pane loop, threaded through `PaneRenderCtx`:
-                // the fade trigger is "an unconsumed click on the
-                // already-active pane", and this is the consumption half of
-                // it (`ui_fade.rs`).
                 let mut click_consumed = false;
-                // ...and the rest of the fade sentence, recorded pane by pane
-                // below: a confirmed click on the already-active *map* pane
-                // that no dialog outranks. Folded with the consumption
-                // verdict after the loop — consumption is decided by the
-                // handlers that run after the candidate is spotted.
                 let mut fade_candidate = false;
 
-                // Rects of chrome painted over the map with no layer of its
-                // own. Clicks there must not become overlay polygon hit-tests.
-                // The list is empty since the top bar replaced the hamburger,
-                // but the plumbing stays warm for the next painted-in-pane
-                // chrome — see `ShellOutput::excluded_rects`.
-                //
-                // Supplied by the chrome that drew them rather than rebuilt
-                // here from a second copy of its position constants — the two
-                // copies could disagree silently, leaving a dead zone at the
-                // old position and a live one under the widget.
-
-                // A pane that is no longer showing a floor must not leave one
-                // registered. Three ways that happens, and none is exotic:
-                //
-                //  * the layout sheds panes — indices are reused, so a stale
-                //    entry would not read as absent, it would read as *some
-                //    other pane's* map;
-                //  * a 3D pane becomes a map or a cross-section, from the
-                //    pane-kind menu or automatically;
-                //  * the user hides the floor, which must give the mirror's
-                //    texels back rather than go on drawing a strip nothing
-                //    samples.
-                //
-                // Done here rather than in the arms below because here is the
-                // one point in the frame where every pane is intact and its
-                // kind is the live one — inside the loop the pane being drawn
-                // is held out by `mem::take`. It is also *before* any pane
-                // draws, so `Gui::mirror_source_rects` sees an already-filtered
-                // map whenever the frontend asks. See `Gui::map_pane_geo`.
                 let floors: Vec<bool> = self.panes[..pane_count]
                     .iter()
                     .map(|pane| pane.volume().is_some_and(|volume| !volume.hide_floor))
@@ -241,21 +118,8 @@ impl super::Gui {
                 self.map_pane_geo
                     .retain(|&idx, _| floors.get(idx).copied().unwrap_or(false));
 
-                // The per-frame record of what each 3D arm drew, emptied here
-                // for the same reason and at the same point: this is the last
-                // moment in the frame at which the sidebar's read (the shell
-                // pass, which has already run) is of the *completed* previous
-                // frame. Emptied rather than pruned, because the entries are
-                // this frame's arms and every one of them is about to run.
                 self.volume_empty_states.clear();
 
-                // Where each of those panes draws its own map, and how far
-                // below the frame the mirror therefore has to reach. Resolved
-                // before the loop because the mirror is **one** texture for the
-                // whole application: the first 3D pane's floor is normalised
-                // against a size the last 3D pane's strip helps decide, and the
-                // pane rects are all knowable from the layout without drawing
-                // any of them. See `floor_strip_plan`.
                 let (floor_strips, mirror_size_points) = floor_strip_plan(
                     ui.ctx().viewport_rect(),
                     &(0..pane_count)
@@ -270,21 +134,6 @@ impl super::Gui {
 
                     let mut pane = std::mem::take(&mut self.panes[pane_idx]);
 
-                    // Determine the map center.
-                    //
-                    // The loaded scan is the best answer, but it is not available
-                    // for the whole window between asking for a site and its
-                    // volume arriving — and on a slow link, or a site whose fetch
-                    // fails, that window is the entire experience. Falling
-                    // straight to the geographic centre of the contiguous US
-                    // there means the user watches the map sit in Kansas while
-                    // the picker names the radar they asked for.
-                    //
-                    // The site's own coordinates are known from the moment it is
-                    // named, so they bridge the gap: the map goes where it is
-                    // going immediately and the scan simply confirms it. The US
-                    // centre stays for the genuinely unplaceable case — a pane
-                    // naming a site the table does not have.
                     let center = if let Some(scan_info) = &pane.scan_info {
                         Position::new(scan_info.site.lon, scan_info.site.lat)
                     } else if let Some(site) = rustdar_radar::sites::get_radar_site(&pane.site) {
@@ -293,7 +142,6 @@ impl super::Gui {
                         Position::new(-98.5795, 39.8283) // Geographic center of contiguous USA
                     };
 
-                    // Clone user location and heading for use in closure
                     let user_location = self.user_fix.as_ref().map(|f| (f.point.lat, f.point.lon));
                     let user_heading = self.heading_source.effective_heading(
                         self.user_heading,
@@ -302,67 +150,8 @@ impl super::Gui {
                     );
                     let user_fix = self.user_fix.clone();
 
-                    // Take map_memory out so Map::new borrows it independently
-                    // of the pane fields used in the render closure.
                     let mut map_memory = std::mem::take(&mut pane.map_memory);
 
-                    // Resolve this pane's pointer state for the frame. Which
-                    // pipeline runs is a *runtime* decision, taken once per
-                    // frame by `LayoutCtx` and enforced by `InteractionState`:
-                    // - Mouse: egui's built-in click detection (instant)
-                    // - Touch: the gesture pipeline for the active pane
-                    //   (deferred single-tap so double-tap-to-zoom doesn't open
-                    //   popups, plus zoom-drag and long-press)
-                    //
-                    // Both paths run the click position through the canonical
-                    // dialog-blocking gate (`ui_input::filter_dialog_blocked`),
-                    // which discards clicks landing on a floating dialog or
-                    // popup window. All handlers that receive overlay_click_pos
-                    // from PaneRenderCtx automatically inherit this protection.
-                    //
-                    // CONVENTION: New map click handlers MUST use overlay_click_pos from
-                    // PaneRenderCtx — never read raw click events via ctx.input() for
-                    // map-level interactions, as that bypasses dialog blocking.
-                    // And every handler that ACTS on overlay_click_pos MUST set
-                    // `*ctx.click_consumed = true` when it does, so the fade
-                    // (`ui_fade.rs`) can tell a click a feature answered from one
-                    // that fell through to the bare map. Current consumers: the overlay feature
-                    // hit-testing (where `selected_overlays` is pushed) and the
-                    // radar-site icon clicks, both in `ui_map_pane.rs`.
-                    //
-                    // While either modal drag is armed — the cross-section draw
-                    // or the 3D region pick — the active *map* pane resolves
-                    // through the armed-drag detector instead: a third
-                    // resolver, not a filter over the other two. The two touch
-                    // gestures are spelled with exactly the press-and-move a
-                    // section line and a region box are spelled with, so
-                    // running them alongside would make every line or box drawn
-                    // on a phone also a zoom or a value tooltip.
-                    //
-                    // One flag for both, because the two modes cannot both be
-                    // armed — `Gui::set_section_draw_armed` and
-                    // `Gui::set_region_pick_armed` each disarm the other — and
-                    // because what they need from the resolver is identical:
-                    // no pan, no overlay click, no long press. Which of them a
-                    // gesture *means* is decided where it is consumed, not
-                    // here.
-                    //
-                    // Only a **plan view**: both are aimed with a projector,
-                    // and the projector only exists inside the `Map::show` the
-                    // plan-view arm below runs on the pane's own rect. Arming
-                    // a mode with a section or a 3D pane active therefore
-                    // leaves it exactly as it was, and the press that picks a
-                    // plan-view pane out of the layout is the same press that
-                    // starts the gesture — `detect_active_pane_click` runs at
-                    // the top of this frame.
-                    //
-                    // [`PaneState::is_map`], not the pane's *kind*: a 3D pane's
-                    // kind is `Map` — the 3D view is a render mode of a map
-                    // pane, and only its `RenderView` differs. Asking the kind
-                    // here handed the armed resolver a pane with no projector,
-                    // which suppresses its pan and eats its click for a line
-                    // that can never be drawn. See the fade gate below, which
-                    // is the same question and was the same defect.
                     let armed_draw = (self.section_draw_armed() || self.region_pick_armed())
                         && is_active
                         && pane.is_map();
@@ -384,39 +173,10 @@ impl super::Gui {
                         (self.interaction.resolve_inactive(&ctx, modality), None)
                     };
 
-                    // Nothing more is gated here for either armed mode:
-                    // `ArmedDragFrame` above has already suppressed the pan and
-                    // cleared the click, unconditionally and by construction,
-                    // which is the whole reason it is a type rather than three
-                    // fields each caller has to remember to clear.
                     let overlay_click_pos = pointer.overlay_click_pos;
-                    // A confirmed map tap puts a touch-revealed pill row
-                    // back to sleep: the reveal was granted for a glance at
-                    // this pane's controls, and a tap that reached the map
-                    // is the user working the map again. A tap on the row
-                    // itself never gets here — the pills are an egui layer,
-                    // and the click gate above already dropped it.
                     if overlay_click_pos.is_some() {
                         self.pill_revealed = None;
                     }
-                    // The third reason a map pane's pan is suppressed, and the
-                    // only unarmed one: a drag on a section handle. Two halves,
-                    // because the decision is needed *now* and the authoritative
-                    // hit-test lives inside `Map::show` where the projector is:
-                    //
-                    // * a drag already in flight on this pane owns the pointer
-                    //   until it ends, wherever the pointer wanders;
-                    // * a press landing on a handle **this frame** is caught
-                    //   against last frame's recorded handle positions
-                    //   (`Gui::section_handles`), because by the time the
-                    //   projector can confirm it, walkers has already read the
-                    //   press with panning enabled — and a press frame that
-                    //   pans is a map that slides out from under the grab.
-                    //
-                    // Deliberately not gated on `is_active`: the handles belong
-                    // to the pane, not to the focus, and the press that grabs
-                    // one is the same press `detect_active_pane_click` used to
-                    // focus the pane at the top of this frame.
                     let section_editing = self
                         .section_edit_drag
                         .as_ref()
@@ -426,34 +186,6 @@ impl super::Gui {
                         && self.section_handle_pressed(&ctx, pane_idx);
                     let suppress_pan = pointer.suppress_pan || section_editing || handle_press;
 
-                    // The fade gesture (plan §1.8, `ui_fade.rs`): a confirmed
-                    // click on the already-active map pane's own rect. The
-                    // resolvers upstream have already made it a *click* (drags
-                    // discarded) off every floating layer, and the armed
-                    // armed draw never delivers one (its resolver never
-                    // reports a click) — the
-                    // remaining conditions are spelled here: the pane is
-                    // active and was active before this press
-                    // (`fade_gesture_allowed` checks the press record), the
-                    // click is inside this pane, no section-handle gesture
-                    // owns it, no feature popup was up to be dismissed by it
-                    // (`pointer_available`), and no dialog outranks it.
-                    //
-                    // **Plan views only**, and asked through
-                    // [`PaneState::is_map`] rather than through the pane's
-                    // *kind*: the fade is a gesture on the flat map (§1.8's
-                    // wording), and a click on a 3D or section pane is that
-                    // pane's own business. A 3D pane's kind is `Map` — 3D is a
-                    // render mode of a map pane, and only its `RenderView`
-                    // differs — so `matches!(pane.kind(), PaneKind::Map)` here
-                    // handed the fade every click on a 3D pane, the Volume
-                    // Alpha corner button's included. The button won the
-                    // pointer and opened the editor exactly as it should; the
-                    // fade is resolved after the pane loop, and
-                    // `Gui::fade_close_all` shut the editor again in the same
-                    // frame, so the control read as dead while the chrome
-                    // vanished. `is_map` is the question about the *picture*,
-                    // which is the thing that actually differs.
                     if is_active
                         && pointer_available
                         && pane.is_map()
@@ -465,18 +197,6 @@ impl super::Gui {
                         fade_candidate = true;
                     }
 
-                    // From the same locals that feed `PaneRenderCtx` and
-                    // `drag_pan_buttons` below: after the gate, after
-                    // `overlay_click_pos` is read out. See `PanePointerProbe`.
-                    //
-                    // Deliberately above the kind branch, so **every** pane
-                    // reports a frame whatever it is. The whole `input_harness`
-                    // suite reads the active pane's probe out of this vector,
-                    // and `InputHarness::frame` panics when it finds none — so a
-                    // kind whose arm forgot to push would take down ~4600 lines
-                    // of pointer tests with a message about the pointer pipeline
-                    // never running. Pinned by
-                    // `every_pane_reports_a_pointer_frame_whatever_its_kind`.
                     #[cfg(test)]
                     self.probes
                         .last_pane_pointers
@@ -491,17 +211,6 @@ impl super::Gui {
                             },
                         });
 
-                    // Create a child UI constrained to this pane's rect.
-                    //
-                    // `"pane_map"` is a **key, not a description**: it is the
-                    // salt every widget inside this pane derives its egui `Id`
-                    // from, so egui's memory of what the pane remembers —
-                    // combo boxes it has open, scroll offsets, resized panels —
-                    // hangs off it. Renaming it to something kind-neutral would
-                    // re-key every one of those, turning "the user made pane 2 a
-                    // 3D view" into "egui forgot everything pane 2 remembered",
-                    // and would report the conversion as a widget-id change for
-                    // no reason. It stays as it is, for all three kinds.
                     let mut child_ui = ui.new_child(
                         egui::UiBuilder::new()
                             .max_rect(pane_rect)
@@ -509,64 +218,15 @@ impl super::Gui {
                     );
                     child_ui.set_clip_rect(pane_rect);
 
-                    // The single point in the UI that branches on pane kind.
-                    //
-                    // On `pane.kind()`, not `self.panes[pane_idx].kind()`: the
-                    // pane was `mem::take`n above, so its slot holds a default
-                    // `PaneState` — a *map* pane, whatever this one is — for the
-                    // whole of this block. That is the same hazard `menu_model`
-                    // has in `ui_shell.rs`'s pass, and it has the same fix: read the
-                    // value you took, never the slot you took it from. It fails
-                    // silently in the direction that looks like it works, which
-                    // is why `last_pane_content` records what each arm actually
-                    // drew rather than what the branch was handed.
                     match pane.render_view() {
                         RenderView::PlanView => {
                             self.record_pane_content(pane_idx, RenderView::PlanView, pane_rect);
                             let tile_zoom_bias =
                                 tile_zoom_biases.get(pane_idx).copied().unwrap_or(0);
                             if let Some(tiles) = tiles_owned.as_mut() {
-                                // The basemap is **not** handed to walkers as a
-                                // layer. `walkers::Map` draws a layer at
-                                // `zoom.round()` and has no lever for another
-                                // level, so the basemap is drawn inside the
-                                // closure through `draw_tile_layer` — the same
-                                // projector-driven pass the label layer has
-                                // always used, where the level is a parameter.
-                                // See that function for why `Tiles::tile_size`
-                                // is not that lever.
-                                //
-                                // The map goes *inside* `steady_wheel` because
-                                // walkers' raw-scroll zoom multiplies the
-                                // scroll by the frame time, which made one
-                                // wheel notch worth 0.5 zoom levels on a quick
-                                // frame and 2.0 on a slow one. The closure is
-                                // the scope, so there is no guard to forget to
-                                // hold. `panning(false)` below is load-bearing
-                                // for it — see `ui_region::steady_wheel`.
-                                //
-                                // The context is cloned out first because the
-                                // closure needs `child_ui` mutably.
                                 let ctx = child_ui.ctx().clone();
                                 crate::ui_region::steady_wheel(&ctx, || {
                                     Map::new(None, &mut map_memory, center)
-                                        // `zoom_with_ctrl(false)` is what puts us on walkers'
-                                        // raw-scroll zoom path, whose frame-time multiplier is
-                                        // `stable_dt.clamp(predicted_dt * 0.5, predicted_dt * 2.0)`.
-                                        // walkers 0.55 tightened that from an unbounded
-                                        // `stable_dt.max(predicted_dt * 1.5)`, which **capped** the
-                                        // coupling without removing it: the clamp still spans 4x,
-                                        // and `predicted_dt` is a constant 60Hz here, so a notch
-                                        // was worth 0.5 zoom levels above 120fps and 2.0 at 30fps
-                                        // and below. `steady_wheel` above divides that multiplier
-                                        // back out, which is what makes a notch one level at any
-                                        // frame rate.
-                                        //
-                                        // `Map::zoom_speed` (default 2.0) is not the lever for
-                                        // this: it scales the combined zoom delta, so pinch and
-                                        // double-click zoom move with it, and it is a constant
-                                        // where the error is a function of the frame time. Left at
-                                        // the default deliberately.
                                         .zoom_with_ctrl(false)
                                         .panning(false)
                                         .drag_pan_buttons(if suppress_pan {
@@ -577,11 +237,6 @@ impl super::Gui {
                                         .show(&mut child_ui, |ui, _response, projector, memory| {
                                             let zoom = memory.zoom();
 
-                                            // The basemap, first thing in the
-                                            // closure so everything below still
-                                            // draws over it — the place in the
-                                            // layer order walkers' own tile pass
-                                            // occupied.
                                             draw_tile_layer(
                                                 ui,
                                                 projector,
@@ -590,21 +245,6 @@ impl super::Gui {
                                                 tile_zoom_bias,
                                             );
 
-                                            // Inside `Map::show`, because this is
-                                            // the only place a projector exists —
-                                            // and on the frame the gesture happens,
-                                            // because a pixel names different ground
-                                            // one wheel notch later. See
-                                            // `SectionAnchor` and `RegionDrag`.
-                                            //
-                                            // One gesture, and the armed mode says
-                                            // what it means. `if` rather than
-                                            // `else if` on the second arm would be
-                                            // a frame in which one press was both a
-                                            // line and a box; the setters make that
-                                            // unreachable, and this reads the flags
-                                            // in the same exclusive way so that a
-                                            // future third mode has to choose too.
                                             if let Some(gesture) = gesture {
                                                 if self.section_draw_armed() {
                                                     self.track_section_draw(
@@ -628,9 +268,6 @@ impl super::Gui {
                                                 tile_zoom_bias,
                                                 actions: &mut actions,
                                                 pane_rect,
-                                                // A plan view's ground *is* its
-                                                // glass: one rect carries the map
-                                                // and the chrome over it.
                                                 surfaces: pane_render::PaneSurfaces::GroundAndGlass,
                                                 horizontal_color_scale,
                                                 color_scale_floor,
@@ -651,25 +288,12 @@ impl super::Gui {
                                                 &mut render_ctx,
                                             );
 
-                                            // The pane's paint-order record, for
-                                            // the draw-order pin — taken after the
-                                            // content pass so it reports what this
-                                            // frame really dispatched.
                                             #[cfg(test)]
                                             self.probes.last_paint_order.push((
                                                 pane_idx,
                                                 std::mem::take(&mut render_ctx.paint_order),
                                             ));
 
-                                            // Before the tracks are drawn, so the
-                                            // preview this frame paints is the one
-                                            // this frame's pointer produced. Inside
-                                            // `Map::show` for the same reason the
-                                            // armed draw is: the projector is the
-                                            // only thing that can turn a pointer
-                                            // into ground, and the handles' screen
-                                            // positions are recorded here for the
-                                            // next frame's pan-suppression call.
                                             self.track_section_edit(
                                                 ui,
                                                 projector,
@@ -678,31 +302,15 @@ impl super::Gui {
                                                 excluded_rects,
                                             );
 
-                                            // Last, over the radar image and every
-                                            // overlay: a section line the user is
-                                            // dragging that disappeared under a
-                                            // storm would be undrawable exactly
-                                            // where it matters.
                                             self.draw_section_tracks(
                                                 ui, projector, pane_idx, pane_rect,
                                             );
 
-                                            // Last of all, for the reason above
-                                            // applied one step further: a region
-                                            // box the user is dragging is the
-                                            // thing they are aiming, and a box
-                                            // lost under a section track or a
-                                            // storm core is a box they cannot aim.
                                             self.draw_region_boxes(ui, projector, pane_idx);
                                         });
                                 });
                             }
                         }
-                        // The two kinds that exist as a shape and nothing more:
-                        // each paints its empty state and stops. There is no
-                        // sampler behind either one yet, and a pane that draws
-                        // *something* while there is nothing to draw is how a
-                        // fabricated picture ships.
                         RenderView::CrossSection => {
                             self.record_pane_content(pane_idx, RenderView::CrossSection, pane_rect);
                             let top_clearance =
@@ -715,10 +323,6 @@ impl super::Gui {
                                 horizontal_color_scale,
                                 &self.preferences,
                             );
-                            // The plan view's own colour bar, reused verbatim:
-                            // a section and a map of the same moment are the
-                            // same scale, and two spellings of one legend is
-                            // how they come to disagree.
                             pane_render::render_color_scale(
                                 child_ui.painter(),
                                 pane_render::clear_of_bottom_chrome(pane_rect, color_scale_floor),
@@ -729,56 +333,11 @@ impl super::Gui {
                         }
                         RenderView::Volume => {
                             self.record_pane_content(pane_idx, RenderView::Volume, pane_rect);
-                            // The pane's one interaction, taken before the floor
-                            // strip below so a single hit test answers for this
-                            // rect before anything else draws into it. Orbit,
-                            // pan and zoom are one gesture surface, so they
-                            // share one id, one hit test and one answer to "is
-                            // the pointer on this pane" — which is the gate that
-                            // keeps a pinch over one pane out of every other 3D
-                            // pane on screen.
-                            //
-                            // **The zoom is no longer spent here.** It moves the
-                            // eye rather than the viewport, so it is folded in
-                            // beside the orbit and the pan where the rest of the
-                            // camera delta is assembled — see `ui_region` and
-                            // `volume_pane_outcome`. Nothing on this path writes
-                            // `map_memory` any more: it belongs to the pane's
-                            // plan view, and writing it here is what made
-                            // flipping a pane to 3D, scrolling, and flipping
-                            // back move the map the user had aimed.
                             let volume_response = child_ui.interact(
                                 pane_rect,
                                 child_ui.id().with(("volume_orbit", pane_idx)),
                                 egui::Sense::click_and_drag(),
                             );
-                            // The pane's own map, drawn where only the mirror
-                            // can see it. This is the floor: not a second map,
-                            // not a synthetic projector and not a borrowed
-                            // pane's render, but this pane's own `Map::show`
-                            // with exactly the layers, tile requests and draw
-                            // order the map arm above gives it — moved below
-                            // the frame so the volume, which occupies the
-                            // pane's rect on the glass, is what the user sees
-                            // there. See `floor_strip_plan`.
-                            //
-                            // Before the volume rather than after, so the
-                            // affine the floor is reprojected through is
-                            // **this** frame's: the pane writes and reads its
-                            // own registration inside one arm, which is what
-                            // retired the one-frame staleness the borrowed
-                            // source had, and the `request_repaint` that used
-                            // to paper over its discontinuities.
-                            //
-                            // Cloned rather than borrowed: `record_pane_content`
-                            // above and the probe below both want `&mut self`,
-                            // and an `Arc` clone is a refcount bump against a
-                            // borrow that would otherwise have to span the whole
-                            // arm. Read here rather than after the strip because
-                            // the strip's framing needs it — a pane with no
-                            // picked region resamples the volume's own reach,
-                            // and the grid is the only thing that knows how wide
-                            // that came out.
                             let painter = self.volume_painter().cloned();
                             let floor_frame = floor_frame_for(
                                 &pane,
@@ -810,31 +369,8 @@ impl super::Gui {
                                     actions: &mut actions,
                                 },
                             );
-                            // Read beside the painter above, and for the same
-                            // reason: both want `&self` across a body that also
-                            // wants `&mut self`, and both are cheap to copy out.
                             let current_stamp = self.current_volume_for(&pane.site);
-                            // The fade factor, read once for the pane-borne
-                            // chrome inside: the Volume Alpha corner button
-                            // is floating chrome over the picture and fades
-                            // with the rest of it (§1.8 — the M8 addition).
                             let chrome = self.chrome_fade();
-                            // Where the pane's floating chrome may stand: the
-                            // pane's rect less whatever edge the colour scale
-                            // is on. The legend is painted rather than
-                            // allocated, so it senses nothing and cannot yield
-                            // — the Volume Alpha button is what moves out of
-                            // its way. Resolved from the same panel-wide
-                            // orientation `draw_volume_glass` paints the legend
-                            // with a few lines below, so the two cannot
-                            // disagree about which edge that is.
-                            //
-                            // The painter is passed for its fonts, not to paint
-                            // with: how far in the legend reaches is how wide
-                            // its ticks and its title lay out, which is a
-                            // question only the font can answer. It is this
-                            // pane's own painter, so the layout is the one the
-                            // legend is about to be drawn with.
                             let chrome_rect = pane_render::color_scale_free_rect(
                                 child_ui.painter(),
                                 pane_render::clear_of_bottom_chrome(pane_rect, color_scale_floor),
@@ -862,11 +398,6 @@ impl super::Gui {
                                 #[cfg(test)]
                                 &mut self.probes.last_alpha_buttons,
                             );
-                            // What this pane actually drew, for the sidebar that
-                            // has to explain it — see `Gui::volume_empty_states`.
-                            // An arm that painted a picture leaves no entry, and
-                            // the map was emptied before the loop, so absence is
-                            // the positive answer rather than a stale one.
                             if let Some(why) = outcome.clone() {
                                 self.volume_empty_states.insert(pane_idx, why);
                             }
@@ -877,12 +408,6 @@ impl super::Gui {
                             #[cfg(not(test))]
                             let _ = outcome;
 
-                            // The pane's glass, in ordinary screen space on
-                            // the pane's own rect — the half of its content
-                            // the floor strip above deliberately did not
-                            // draw. **After** the volume, because the volume
-                            // occupies that same rect and a legend under it
-                            // is a legend nobody can read.
                             self.draw_volume_glass(
                                 &child_ui,
                                 pane_idx,
@@ -893,20 +418,7 @@ impl super::Gui {
                         }
                     }
 
-                    // The armed-tool hint chip (plan §1.7): while a modal
-                    // drag is armed, the active map pane says what the drag
-                    // will do — centred, painted, non-interactive, in the
-                    // armed mode's own colours. Only the active map pane: it
-                    // is the pane the arm's gesture is aimed at, and a chip
-                    // on every pane would read as five armed modes. Painted
-                    // on its own sub-layer, like the pending-render notice,
-                    // so nothing drawn later in the pane can cover it.
                     if is_active && pane.is_map() {
-                        // Whichever mode is armed, in that mode's own colour.
-                        // Never both — the setters hold them exclusive — so
-                        // this reads as one chip or none, and the colour is how
-                        // a user who armed the wrong toggle finds out before
-                        // they drag.
                         let armed = if self.section_draw_armed() {
                             Some((SECTION_ARM_HINT, SECTION_TRACK_COLOR))
                         } else if self.region_pick_armed() {
@@ -919,7 +431,6 @@ impl super::Gui {
                         }
                     }
 
-                    // Restore map_memory and pane
                     pane.map_memory = map_memory;
                     self.panes[pane_idx] = pane;
 
@@ -934,15 +445,9 @@ impl super::Gui {
                     }
                 } // end pane loop
 
-                // What the loop's consumers decided, folded into the fade
-                // verdict: a click a feature answered is not a fade gesture,
-                // and the consumption flag itself is what a consumed click
-                // *while* faded unfades on (`Gui::apply_fade_toggle`).
                 self.click_consumed_frame = click_consumed;
                 self.fade_candidate = fade_candidate && !click_consumed;
 
-                // Handle divider dragging on a foreground layer so they
-                // take priority over map panning in the overlap zone.
                 if pane_count > 1 {
                     let divider_layer =
                         egui::LayerId::new(egui::Order::Foreground, egui::Id::new("pane_dividers"));
@@ -955,11 +460,9 @@ impl super::Gui {
                         .handle_dividers(&mut divider_ui, panel_rect);
                 }
 
-                // Sync viewports: propagate the interacted pane's viewport to all others
                 self.sync_viewports(&pre_zooms, &pre_positions);
             });
 
-        // Restore tiles and label tiles
         self.map_tiles.restore_base_tiles(tiles_owned);
         if any_city_labels {
             self.map_tiles.restore_label_tiles(label_tiles);
@@ -969,15 +472,6 @@ impl super::Gui {
     }
 
     /// Advance the armed cross-section draw by one frame's gesture.
-    ///
-    /// Called from inside `Map::show`, which is the only place a
-    /// `walkers::Projector` exists — and therefore the only place a pointer
-    /// position can be turned into ground. Both conversions happen on the frame
-    /// their gesture happened, for the reason [`SectionAnchor`] gives at length:
-    /// the draw suppresses panning but not zooming, so a pixel held across a
-    /// wheel notch names somewhere else.
-    ///
-    /// [`SectionAnchor`]: super::SectionAnchor
     fn track_section_draw(
         &mut self,
         pane_idx: usize,
@@ -987,9 +481,6 @@ impl super::Gui {
         use crate::ui_input::{ArmedDragGesture, MIN_SECTION_DRAG_PT};
 
         let ground = |pos: egui::Pos2| {
-            // `walkers::Position` is a `geo_types::Point`, so latitude is `y`
-            // and longitude is `x` — the same reading `render_pane_map_content`
-            // takes off `unproject`.
             let position = projector.unproject(egui::vec2(pos.x, pos.y));
             rustdar_geo::GeoPoint {
                 lat: position.y(),
@@ -1021,29 +512,14 @@ impl super::Gui {
                 if anchor.pane_idx != pane_idx {
                     return;
                 }
-                // The length test is on the *gesture*, in points, so it means
-                // the same thing at every zoom and on every display density.
                 if (pos - anchor.screen).length() < MIN_SECTION_DRAG_PT {
-                    // Discarded, and **the mode stays armed**. A stray tap is
-                    // the likeliest thing to happen right after arming — it is
-                    // how a user checks which pane they are on — and disarming
-                    // there would silently throw away an intent they had just
-                    // expressed, leaving them to work out from nothing that the
-                    // checkbox had un-ticked itself.
                     return;
                 }
                 let Some(line) = crate::pane::SectionLine::new(anchor.ground, ground(pos)) else {
-                    // Only reachable from a projector answering outside the
-                    // world, which `walkers` does not do — but the constructor
-                    // is the one gate on a line that cannot be cut, so the
-                    // refusal is honoured rather than unwrapped. The mode stays
-                    // armed, as for any other discarded drag.
                     log::warn!("a drawn section line was not a line; discarding it");
                     return;
                 };
                 self.pending_section_line = Some((pane_idx, line));
-                // Disarmed by drawing: the mode's job is done, and leaving it on
-                // would turn the user's next pan into a second section.
                 self.set_section_draw_armed(false);
             }
             ArmedDragGesture::Cancelled => {
@@ -1059,25 +535,6 @@ impl super::Gui {
     }
 
     /// Advance the armed 3D region pick by one frame's gesture.
-    ///
-    /// [`Self::track_section_draw`]'s counterpart, called from the same place
-    /// inside `Map::show` and for the same reason: the projector is the only
-    /// thing that can turn a pointer position into ground, and the conversion
-    /// has to happen on the frame the gesture happened. The pick suppresses
-    /// panning but not zooming, so a pixel held across a wheel notch names
-    /// somewhere else — which is why [`crate::ui_region::RegionDrag`] stores a
-    /// geographic centre and re-measures a geographic corner rather than
-    /// keeping either as a pixel.
-    ///
-    /// # Why the drag survives the pointer leaving the pane
-    ///
-    /// Only the *press* is gated on this pane. Once a drag has begun,
-    /// [`crate::ui_region::RegionDrag::extend_to`] takes whatever ground the
-    /// pointer is over, including ground in the pane next door: dragging past
-    /// the edge of a pane to make a big box is ordinary, and stopping the box
-    /// growing at the boundary would read as the gesture having been dropped.
-    /// The drag still belongs to the pane it started on — `pane_idx` is checked
-    /// on every frame — so the box is drawn there and commits from there.
     fn track_region_pick(
         &mut self,
         pane_idx: usize,
@@ -1087,9 +544,6 @@ impl super::Gui {
         use crate::ui_input::ArmedDragGesture;
 
         let ground = |pos: egui::Pos2| {
-            // `walkers::Position` is a `geo_types::Point`, so latitude is `y`
-            // and longitude is `x` — the same reading `track_section_draw`
-            // takes off `unproject`.
             let position = projector.unproject(egui::vec2(pos.x, pos.y));
             rustdar_geo::GeoPoint {
                 lat: position.y(),
@@ -1100,10 +554,6 @@ impl super::Gui {
         match gesture {
             ArmedDragGesture::Idle => {}
             ArmedDragGesture::Anchored(pos) => {
-                // `begin` refuses a press the projector could not place on
-                // Earth, which leaves `region_drag` as `None` and the mode
-                // armed — a press on a pane a divider collapsed to nothing
-                // costs the user nothing.
                 self.region_drag = crate::ui_region::RegionDrag::begin(pane_idx, ground(pos));
             }
             ArmedDragGesture::Dragging(pos) => {
@@ -1122,26 +572,12 @@ impl super::Gui {
                 if drag.pane_idx() != pane_idx {
                     return;
                 }
-                // The release position is folded in before committing: a quick
-                // drag can produce a press frame and a release frame with no
-                // `Dragging` between them, and without this the box would
-                // commit at the half-width it had before the pointer moved,
-                // which is zero.
                 drag.extend_to(ground(pos));
                 match drag.commit() {
                     Some(region) => {
                         self.pending_region = Some((pane_idx, region));
-                        // Disarmed by picking: the mode's job is done, and
-                        // leaving it on would turn the user's next pan into a
-                        // second box. `track_section_draw`'s rule exactly.
                         self.set_region_pick_armed(false);
                     }
-                    // Below `MIN_HALF_WIDTH_KM`, so `build_voxels` would clamp
-                    // it up and resample a box the user did not draw.
-                    // Discarded, and **the mode stays armed** — a stray tap is
-                    // the likeliest thing to happen right after arming (it is
-                    // how a user checks which pane they are on), and disarming
-                    // there would throw away an intent just expressed.
                     None => log::debug!(
                         "3D region drag was {:.1} km across, below the resampler's \
                          {:.0} km minimum; discarded",
@@ -1163,20 +599,6 @@ impl super::Gui {
 
     /// Cells along a voxel grid's horizontal axes on **this device**, or `None`
     /// if no 3D pane has built one yet.
-    ///
-    /// The grid's shape is derived at runtime from the adapter's own
-    /// `max_texture_dimension_3d` against the tier's cell budget
-    /// (`rustdar_radar::voxel::shape_for_budget`), so no constant this crate
-    /// could name is guaranteed to be the count a grid actually has — the
-    /// caption learned that and reads it off the grid, and the region drag's
-    /// hint has to divide by the same number or the two would print different
-    /// km-per-cell for the same box.
-    ///
-    /// **Any painting pane's answer is every pane's answer**: the budget is a
-    /// property of the device, not of a pane or a box, so the first grid found
-    /// settles it. Asking a *particular* pane is not possible here anyway — the
-    /// drag has not chosen a destination yet, and will not until it is
-    /// released.
     fn volume_cells_across(&self) -> Option<usize> {
         let painter = self.volume_painter()?;
         (0..self.visible_pane_count()).find_map(|idx| {
@@ -1188,12 +610,6 @@ impl super::Gui {
     /// Whether this frame's press landed on a section handle recorded last
     /// frame — the press-frame half of the pan-suppression rule; see the call
     /// site in `render_panes`.
-    ///
-    /// Against **last** frame's positions because the projector that could
-    /// confirm them does not exist yet this frame. One frame of staleness is
-    /// harmless for a press (a pointer about to press is not flinging the
-    /// viewport), and the worst case of a miss is one frame of pan under a
-    /// grab that the in-flight arm then suppresses.
     fn section_handle_pressed(&self, ctx: &egui::Context, pane_idx: usize) -> bool {
         let Some(pos) = ctx.input(|i| {
             if i.pointer.primary_pressed() {
@@ -1211,39 +627,6 @@ impl super::Gui {
 
     /// Advance the unarmed endpoint drag on this pane by one frame, and record
     /// where this pane's handles are for the next frame's press test.
-    ///
-    /// # Why the pointer is read raw here
-    ///
-    /// The click convention is
-    /// about *clicks*, and a drag is a press frame, a stream of moved frames
-    /// and a release frame, none of which a confirmed-tap position can
-    /// express. The dialog gate the convention enforces is applied explicitly
-    /// on the press, via [`is_pos_blocked`].
-    ///
-    /// # What each frame kind does
-    ///
-    /// * **Press** on a handle (inside this pane, not over a dialog, no drag
-    ///   already in flight) begins a drag carrying the line as it stands.
-    /// * **Moved** frames re-anchor the grabbed end to the ground under the
-    ///   pointer — and only moved frames: a zoom-only frame must not slide
-    ///   the endpoint to whatever ground its pixel names now
-    ///   ([`SectionEditDrag::pointer_moved`]).
-    /// * **Release** commits through [`SectionEditDrag::commit`] — which
-    ///   refuses an unchanged or under-length line — into
-    ///   `pending_section_edit`, applied after the pane loop. The pane's
-    ///   stored line is untouched until then, which is the whole re-cut-on-
-    ///   drop contract: the staleness key carries the line, so nothing is
-    ///   extracted while the drag is in flight.
-    /// * **A pointer that vanishes** (touch cancel, cursor leaving the
-    ///   window) drops the drag and the preview with it.
-    ///
-    /// While either armed modal drag is on, this records nothing and advances
-    /// nothing: the armed mode owns the pane's gestures, and it was asked for
-    /// last (both setters also clear any drag in flight).
-    ///
-    /// [`SectionEditDrag::commit`]: crate::ui_section_edit::SectionEditDrag::commit
-    /// [`SectionEditDrag::pointer_moved`]: crate::ui_section_edit::SectionEditDrag::pointer_moved
-    /// [`is_pos_blocked`]: super::map_overlays::is_pos_blocked
     fn track_section_edit(
         &mut self,
         ui: &egui::Ui,
@@ -1254,9 +637,6 @@ impl super::Gui {
     ) {
         use crate::ui_section_edit::{SectionEditDrag, SectionGrabZone};
 
-        // Re-recorded every frame, armed or not: zones left over from before a
-        // mode change would go on suppressing pans near handles that are no
-        // longer live.
         self.section_handles.retain(|z| z.map_pane != pane_idx);
         if self.section_draw_armed {
             return;
@@ -1264,11 +644,6 @@ impl super::Gui {
 
         let project =
             |p: rustdar_geo::GeoPoint| projector.project(walkers::lat_lon(p.lat, p.lon)).to_pos2();
-        // Every committed line this map owns, with its projected geometry —
-        // the same polyline the track is drawn from, so what is grabbable is
-        // exactly what is visible. Reading `self.panes` mid-loop is safe here
-        // for the reason `draw_section_tracks` gives: the taken slot reads as
-        // a default map pane, which has no cross-section to offer.
         let lines: Vec<(usize, crate::pane::SectionLine)> = self
             .panes()
             .iter()
@@ -1317,11 +692,6 @@ impl super::Gui {
             }
         };
 
-        // The press frame. Gated on this pane's own rect and on the dialog
-        // layer. Shift at the press
-        // picks the body drag's verb — sweep about the midpoint instead of
-        // translate — and is latched into the drag: see
-        // `SectionEditDrag::begin`.
         if pressed
             && self.section_edit_drag.is_none()
             && let Some(pos) = pos
@@ -1344,10 +714,6 @@ impl super::Gui {
             }
         }
 
-        // Everything below belongs to *this* pane's drag only, and — like the
-        // drag — it is not gated on the pane's rect: dragging an
-        // endpoint past a pane edge is ordinary, and stopping there would read
-        // as the gesture being dropped.
         let Some(drag) = self
             .section_edit_drag
             .as_mut()
@@ -1372,70 +738,12 @@ impl super::Gui {
                 self.pending_section_edit = Some((drag.section_pane, line));
             }
         } else if !down {
-            // The pointer went away without releasing — a cancelled touch, or
-            // the cursor leaving the window. The preview dies with the drag;
-            // the pane's line was never touched.
             self.section_edit_drag = None;
         }
     }
 
     /// Draw the rubber band of an in-flight draw and the ground track of every
     /// section cut from this map.
-    ///
-    /// # The track ends exactly on the range ring
-    ///
-    /// It used to end ~258 m inside it. `render_radar_range_ring` placed its
-    /// circle with `230 / 111.32` degrees of latitude, and 111.32 km per degree
-    /// is a sphere of 6378.1 km — the WGS84 equatorial radius — while the
-    /// section's geometry, and this track with it, walks
-    /// [`rustdar_geo::EARTH_RADIUS_KM`], which is 6371. A track drawn
-    /// all the way to the edge of coverage therefore landed
-    /// `230 × (1 − 6371/6378.1)` ≈ 0.26 km inside the ring, 1.15 px at the zoom
-    /// where the whole ring fits a 2048-pixel pane.
-    ///
-    /// The ring now divides by [`rustdar_geo::KM_PER_DEGREE_LAT`],
-    /// which *is* `EARTH_RADIUS_KM · π/180`, so the two are on one sphere and
-    /// the gap is gone; `rustdar_radar`'s
-    /// `the_ground_track_and_the_range_ring_are_the_same_sphere` measures the
-    /// residual at the millimetre.
-    ///
-    /// The ring's radius is the render's own `extent_km` rather than a constant
-    /// now, and that does not reopen anything: the agreement is a ratio of the
-    /// two radii, so it holds at a TDWR's 417 km frame exactly as at 230.
-    ///
-    /// # The track is a polyline, because the cut is a great circle
-    ///
-    /// A straight segment between the two projected endpoints is a **rhumb
-    /// line**: straight in Web Mercator is constant bearing, not shortest path.
-    /// The section is cut along a great circle
-    /// ([`rustdar_geo::great_circle_point`], the same walk
-    /// `tilt_curves` samples), and the two part company in the middle. Measured
-    /// on a 229 km line at 41 °N — a full-range line at the latitude of the
-    /// northern-tier sites — the peak separation is **894 m** running east-west
-    /// and 907 m running north-east, about 2.9 px at a zoom filling the pane.
-    /// Unifying the two spheres did nothing to this: it is a projection error,
-    /// not a radius disagreement, and it would be the same on any sphere. It is
-    /// also the one error a user is placed to notice, because the track is drawn
-    /// over the echo the section was aimed at.
-    ///
-    /// So the track is subdivided rather than documented. At
-    /// [`SECTION_TRACK_SAMPLES`] segments the residual falls as the square of
-    /// the count — under a metre, three orders of magnitude below the error it
-    /// is correcting — and it costs 32 projections per track per frame.
-    ///
-    /// The **rubber band is deliberately still a straight segment.** It is a
-    /// preview of a gesture in progress and its endpoints are pixels on purpose
-    /// (see `Gui::section_rubber_band`), so it tracks the finger exactly even on
-    /// a frame where a wheel-zoom moved the map. The line only becomes a claim
-    /// about ground when it is committed, and that is the one this curves.
-    ///
-    /// # Reading `self.panes` from inside the pane loop is safe *here*
-    ///
-    /// The loop has `mem::take`n the pane being drawn, so its slot reads as a
-    /// default map pane — the module's standing hazard. It costs nothing here
-    /// because only [`PaneState::cross_section`] is read and the taken pane is a
-    /// map pane by construction: this runs inside `Map::show`, which only the map
-    /// arm reaches. A section pane can never be the one held out.
     fn draw_section_tracks(
         &mut self,
         ui: &egui::Ui,
@@ -1450,7 +758,6 @@ impl super::Gui {
         #[cfg(test)]
         let mut painted: Vec<(usize, usize, egui::Pos2, egui::Pos2)> = Vec::new();
 
-        // Committed sections first, so a band being dragged over one is on top.
         for (idx, other) in self.panes().iter().enumerate() {
             let Some(section) = other.cross_section() else {
                 continue;
@@ -1461,18 +768,6 @@ impl super::Gui {
             let Some(committed) = section.line else {
                 continue;
             };
-            // An endpoint drag in flight replaces this track with its live
-            // preview — geographic, like the committed line, so a mid-drag
-            // zoom moves both together. The pane's stored line is untouched
-            // until the drop, which is what keeps the cut off this path.
-            //
-            // On the release frame neither exists yet: the drag was taken
-            // and committed into `pending_section_edit`, and the applier
-            // that writes it to the pane runs after this loop (`Gui::ui`).
-            // Painting the pending line bridges that frame — without it the
-            // release frame painted the stale pre-drag `committed`, a
-            // visible pop-back before the applier's write landed (the M8
-            // first-run finding; the gap predates the Synthesis rebuild).
             let editing = self
                 .section_edit_drag
                 .filter(|d| d.map_pane == pane_idx && d.section_pane == idx);
@@ -1490,9 +785,6 @@ impl super::Gui {
             if let (Some(&a), Some(&b)) = (track.first(), track.last()) {
                 painted.push((pane_idx, idx, a, b));
             }
-            // The ends are handles now, and drawn like it: a cap that looks
-            // identical to every other map decoration is an affordance nobody
-            // finds.
             paint_section_handles(painter, &track, pane_rect, editing.map(|d| d.grab));
         }
 
@@ -1506,29 +798,6 @@ impl super::Gui {
 
     /// Draw the region boxes that belong to pane `pane_idx`: every committed
     /// one picked on this map, and the one being dragged on it right now.
-    ///
-    /// # Why committed boxes are drawn at all, and always
-    ///
-    /// A 3D pane resamples a patch of ground that is invisible from the map it
-    /// was picked on, and "where is that volume from" is otherwise unanswerable
-    /// — the 3D view's own caption gives a size, not a place. So the box is
-    /// drawn on its source map for as long as the pane holds it, armed or not.
-    /// Unarmed is the common case, which makes this the only work most frames
-    /// do here.
-    ///
-    /// In a **different colour** from the drag: a committed box is a record and
-    /// the drag is a gesture, and painting them alike would make an old box
-    /// under the cursor look like the one being pulled out.
-    ///
-    /// # Reading `self.panes` from inside the pane loop is safe *here*
-    ///
-    /// `draw_section_tracks`' argument, unchanged and with one more step. The
-    /// loop has `mem::take`n the pane being drawn, so its slot reads as a
-    /// default map pane. That default's `render` is the plan view, so
-    /// [`PaneState::volume`](crate::pane::PaneState::volume) answers `None` for
-    /// it and the taken slot contributes nothing — which is right, because a
-    /// pane cannot be the map its own box was drawn on and be drawing the
-    /// volume at the same time.
     fn draw_region_boxes(
         &mut self,
         ui: &egui::Ui,
@@ -1536,8 +805,6 @@ impl super::Gui {
         pane_idx: usize,
     ) {
         let painter = ui.painter();
-        // Asked once, before the borrow of `self.panes()` below, and only for
-        // the hint — see `region_hint_text`.
         let cells_across = self.volume_cells_across();
 
         #[cfg(test)]
@@ -1553,11 +820,6 @@ impl super::Gui {
             let Some(region) = volume.region else {
                 continue;
             };
-            // The committed box is a rectangle in general — a config may carry
-            // one, and `HalfExtentKm::clamped` scales both axes — so it is
-            // drawn from its own two half-extents rather than through the
-            // square-only `corners_for`. A box the drag produced has equal
-            // axes and the two agree exactly.
             let Some(rect) =
                 region_screen_rect(projector, region.centre(), region.half_extent_km())
             else {
@@ -1570,8 +832,6 @@ impl super::Gui {
             let _ = idx;
         }
 
-        // The drag last, over any committed box it overlaps: the one under the
-        // pointer is the one the user is working.
         if let Some((centre, half_width_km)) = self.region_preview(pane_idx)
             && let Some(rect) = region_screen_rect(
                 projector,
@@ -1588,23 +848,6 @@ impl super::Gui {
     }
 
     /// Detect which pane was clicked and make it the active pane.
-    ///
-    /// Bounded by [`Gui::visible_pane_count`], not by the layout's raw count, for
-    /// the reason [`Gui::panes`] gives — and here the consequence is one step
-    /// worse than a skipped update. This writes `active_pane`, and
-    /// [`Gui::active_pane`] resolves it as `self.panes[self.active_pane]`: a rect
-    /// the layout draws for a pane the vector does not hold would hand the index
-    /// of a `PaneState` that does not exist to every reader downstream, and the
-    /// first one to dereference it panics rather than doing nothing.
-    ///
-    /// Defensive rather than a live fix: no production writer can produce the
-    /// skew today. Both of them (`load_ui_config` and the pane picker) grow
-    /// `panes` to the requested count *before* assigning the layout, `panes` is
-    /// never shortened anywhere, and `PaneLayout::for_count` clamps its count
-    /// down — so the vector is if anything longer than the layout claims. The
-    /// bound is here because that is a property of two call sites rather than of
-    /// this type, and because a click is the one path that turns the skew from a
-    /// pane nobody updates into a crash.
     fn detect_active_pane_click(&mut self, ctx: &egui::Context, panel_rect: egui::Rect) {
         let Some(pos) = ctx.input(|i| {
             if i.pointer.primary_pressed() {
@@ -1615,16 +858,8 @@ impl super::Gui {
         }) else {
             return;
         };
-        // A fresh press starts a fresh record: whether *this* press is the
-        // one that activates its pane, and whether it landed with a popup
-        // open, are what the fade trigger asks later, when the press has
-        // become a click (`ui_fade.rs` — the first click on an inactive pane
-        // only activates, and a click that dismissed a popover dismissed).
-        // The popup state must be read *now*: egui closes the popup on this
-        // very click, so by the confirm frame the evidence is gone.
         self.press_switched_pane = false;
         self.press_popup_open = egui::Popup::is_any_open(ctx);
-        // Don't switch panes when the click lands on a floating dialog or popup.
         if ctx
             .layer_id_at(pos)
             .is_some_and(|l| l.order > egui::Order::Background)
@@ -1640,9 +875,6 @@ impl super::Gui {
             if rect.contains(pos) && idx != self.active_pane {
                 self.active_pane = idx;
                 self.press_switched_pane = true;
-                // A pane switch ends a touch reveal: the revealed row
-                // belonged to the pane the user has just left for
-                // another.
                 self.pill_revealed = None;
                 break;
             }
@@ -1650,7 +882,6 @@ impl super::Gui {
     }
 
     /// Dismiss overlay popups when clicking outside them.
-    /// Returns `true` when no popup is open (pointer is available for map interaction).
     fn dismiss_overlay_popups(&mut self, ctx: &egui::Context) -> bool {
         let pointer_available = self.overlays.selected_overlays.is_empty();
         if !pointer_available {
@@ -1676,46 +907,6 @@ impl super::Gui {
 
     /// Draw one 3D pane's own map into its off-screen strip, and answer with
     /// the affine it drew through.
-    ///
-    /// `None` when the pane wants no floor, when the layout gave it no strip,
-    /// or when there is no tile source to draw a basemap from — the three ways
-    /// a floor legitimately does not exist, all of which the renderer must
-    /// treat as "draw no floor" rather than as "draw one through zeroed lanes".
-    ///
-    /// # What goes down here, and what does not
-    ///
-    /// The **ground** half of the pane's content and no more —
-    /// [`PaneSurfaces::GroundOnly`](pane_render::PaneSurfaces::GroundOnly).
-    /// Everything in the strip is copied onto the floor by the raymarcher, so
-    /// the test is whether it is still true lying flat on the world: tiles,
-    /// rasters, polygons and points are, and a legend pinned to the pane's
-    /// edge is not — down here it would be painted into the ground in
-    /// perspective, shrinking with distance and swinging round with the
-    /// camera. The pane's glass is drawn on its own rect instead, by
-    /// [`Gui::draw_volume_glass`]. The handler-declared
-    /// `rustdar_overlays::render::overlay_state::Surface` is where the rule
-    /// lives; `OverlayHandler::surface` classifies every layer against it.
-    ///
-    /// # Why a bare `Ui` rather than an `egui::Area`
-    ///
-    /// An `Area` spends its first frame invisible working out its own size, and
-    /// a floor is entered *by a mode change* — so an `Area` would blank the
-    /// floor for one frame on every entry into 3D, on every machine, and would
-    /// look like a slow load on the ones where the frame is long.
-    /// `the_strip_is_tessellated_on_its_very_first_frame` in
-    /// `rustdar-gpu/tests/floor_offscreen_strip.rs` asserts on frame **0**
-    /// for exactly that reason, and it fails against an `Area`.
-    ///
-    /// # Why the interaction is emptied rather than suppressed
-    ///
-    /// The strip is not in the frame and the pointer is in frame coordinates,
-    /// so `hovered()` and `dragged()` are already false down there — a hidden
-    /// map cannot swallow the drag the orbit camera wants, structurally rather
-    /// than by a flag someone has to remember to set. What is passed as empty
-    /// here is the state a *second* live map would otherwise share with the
-    /// first: a click to consume, a long-press.
-    /// Sharing those would let an off-screen map answer a gesture aimed at
-    /// something on screen.
     #[allow(clippy::too_many_lines)]
     fn draw_floor_strip(
         &mut self,
@@ -1741,16 +932,9 @@ impl super::Gui {
         use walkers::Map;
 
         let (strip, tiles) = (strip?, tiles?);
-        // `Map::new` wants `&mut`, and this is the only thing that will ever
-        // hold one: the framing is recomputed from the box every frame, so
-        // whatever the map writes back into it is discarded here.
         let mut map_memory = map_memory;
         let map_memory = &mut map_memory;
 
-        // Its own layer, at `Background` order, keyed by pane: the strip has
-        // to be a sibling of the pane's chrome rather than a child of it,
-        // because a child would inherit the pane's clip rect and be clipped
-        // away before it ever reached the tessellator.
         let layer = egui::LayerId::new(
             egui::Order::Background,
             egui::Id::new(("volume_floor_strip", pane_idx)),
@@ -1762,31 +946,16 @@ impl super::Gui {
         );
         strip_ui.set_clip_rect(strip);
 
-        // The one piece of pointer state a live map pane owns, given to this
-        // one as a fresh local so the strip cannot reach the real one: a click
-        // to consume. Sharing it would let an off-screen map answer a gesture
-        // aimed at something on screen.
         let mut strip_click_consumed = false;
 
         Map::new(None, map_memory, center)
-            // Every input lever walkers has, off. See the doc comment: the
-            // strip cannot be hovered, so this is belt and braces — but a
-            // future walkers that reads the pointer without a hover gate would
-            // otherwise pan this map under the user's orbit drag.
             .zoom_with_ctrl(false)
             .panning(false)
             .drag_pan_buttons(egui::DragPanButtons::empty())
             .show(&mut strip_ui, |ui, _response, projector, memory| {
                 let zoom = memory.zoom();
-                // The basemap first, so everything below draws over it — the
-                // same order the map arm gives it.
                 draw_tile_layer(ui, projector, zoom, tiles, tile_zoom_bias);
 
-                // The registration, recorded here because this is the only
-                // place a projector exists, and keyed to the **strip** rather
-                // than to the pane: the affine's job is to say where a
-                // latitude and longitude landed in the geometry the mirror
-                // copied, and the mirror copied the strip.
                 self.map_pane_geo
                     .insert(pane_idx, map_pane_geo_from(projector, strip));
 
@@ -1801,10 +970,6 @@ impl super::Gui {
                     tile_zoom_bias,
                     actions,
                     pane_rect: strip,
-                    // Geography only. Everything down here is copied onto the
-                    // floor, and chrome on a floor is chrome lying in the
-                    // grass — see the handler-declared `Surface`. The pane's glass is painted
-                    // by `draw_volume_glass`, on the pane's own rect.
                     surfaces: pane_render::PaneSurfaces::GroundOnly,
                     horizontal_color_scale,
                     color_scale_floor,
@@ -1825,44 +990,6 @@ impl super::Gui {
 
     /// Draw a 3D pane's **glass**: the half of its map content that is chrome
     /// rather than geography, in ordinary 2D on the pane's own rect.
-    ///
-    /// The other half of [`Gui::draw_floor_strip`], and the reason that
-    /// function's pass is
-    /// [`GroundOnly`](pane_render::PaneSurfaces::GroundOnly). A 3D pane draws
-    /// the same content a plan view does; it just draws it onto two surfaces
-    /// instead of one, because only one of them is a floor. What belongs on
-    /// which is the handler-declared `Surface`, and this is the
-    /// list of everything on the glass side of it.
-    ///
-    /// Same helpers, same rects, same panel-wide orientation as a plan view —
-    /// `pane_rect` here is the pane, exactly as it is for a map pane, so the
-    /// bars land on the same edge at the same margin and the 3D pane's legend
-    /// lines up with its neighbour's in a split.
-    ///
-    /// # Why nothing here is a widget
-    ///
-    /// Every call below paints through a `Painter` and allocates nothing, so
-    /// none of it senses the pointer. That is load-bearing on a 3D pane in a
-    /// way it is not on a map: the pane-wide `ui.interact` that drives the
-    /// orbit camera covers the whole rect, and a legend that took a drag would
-    /// leave a dead strip along the edge where the camera stops turning. It is
-    /// also why the fade factor is not applied — the legend is map content
-    /// that happens to be drawn in screen space, not floating chrome like the
-    /// Volume Alpha button, and the plan view does not fade its legend either.
-    ///
-    /// # Why the layer gates are repeated here
-    ///
-    /// Each piece is gated on the same `is_overlay_enabled` its arm in
-    /// `render_pane_map_content` is gated on. A pane keeps its layer state
-    /// across a conversion, so a user who switched the Color Scale off on a
-    /// map pane and then made it 3D would otherwise find the legend back,
-    /// switched on by the conversion.
-    ///
-    /// This gate is also why a 3D pane's Layers panel lists the colour scale
-    /// alongside the ground kinds rather than the floor's kinds alone: the
-    /// legend here is drawn *and* honoured, so a panel that offered no row for
-    /// it would leave the toggle reachable only by converting the pane back —
-    /// the state this pane was in until `PaneState::draws_map_layers`.
     fn draw_volume_glass(
         &self,
         ui: &egui::Ui,
@@ -1882,14 +1009,6 @@ impl super::Gui {
                 &self.preferences,
             );
         }
-        // The stale-image notice: same plate, same top-of-pane placement, same
-        // measured pill-row clearance a map pane gives it. A 3D pane's floor
-        // goes stale exactly as a plan view's raster does — it is drawn from
-        // the same texture cache — so the pane that says which product is on
-        // screen has to be the one the user is looking at. Gated on the Radar
-        // layer for the same reason a map pane's is: the notice is produced
-        // inside the Radar arm, and a pane with the radar switched off has no
-        // image on screen to disown.
         if pane.is_overlay_enabled(&known::RADAR)
             && let Some((on_screen, elevation)) = pane.stale_image_on_screen()
         {
@@ -1906,21 +1025,9 @@ impl super::Gui {
 
 /// Everything [`Gui::draw_floor_strip`] needs from the pane loop that is not
 /// already on the `Gui`.
-///
-/// A struct rather than a dozen parameters because every one of them is a
-/// borrow the pane loop is already holding — `pane` and `map_memory` are held
-/// out of `self.panes` by `mem::take`, and the rest are the frame's shared
-/// resources. Naming them at the call site is what makes it visible that the
-/// strip is handed the *same* pane state the volume is about to be drawn from.
 struct FloorStripCtx<'a> {
     pane: &'a mut crate::pane::PaneState,
     /// The viewport the strip is drawn through, **owned**.
-    ///
-    /// Not the pane's own `MapMemory`. The strip's job is to be the ground under
-    /// the box, so it is framed on the box ([`floor_frame_for`]); the pane's
-    /// memory belongs to its plan view and is the user's to aim. Owned rather
-    /// than borrowed so that "the strip cannot write the pane's viewport" is
-    /// structural instead of a rule somebody has to keep.
     map_memory: walkers::MapMemory,
     /// What the strip is centred on: the box's centre, which is the region's for
     /// a picked one and the **site** otherwise — the point `build_voxels`
@@ -1944,50 +1051,12 @@ struct FloorStripCtx<'a> {
 
 /// Paint a pane's empty state: one line of centred, muted text and nothing
 /// else.
-///
-/// Centred on the pane's own rect rather than on the `Ui`'s cursor, so the
-/// message sits in the middle of the pane whatever shape the pane is.
-///
-/// Painted straight through `Painter` rather than laid out as a widget: an empty
-/// state is not interactive, and a widget would consume one of the pane's
-/// auto-ids — so every widget the real content adds later would be keyed one
-/// step along from where it will finally sit, and the empty state going away
-/// would re-key all of them.
-/// Where a 3D pane's floor strip is centred and how far it is zoomed out.
 struct FloorFrame {
     centre: walkers::Position,
     memory: walkers::MapMemory,
 }
 
 /// Frame the floor strip on the box the pane resamples.
-///
-/// The floor is a real map drawn off screen and sampled by the raymarch as the
-/// ground under the box, and the shader clips it twice: `floor_hit` to the box's
-/// own bottom face, `floor_colour` to the mirror's `0..1` — **transparent**
-/// outside rather than clamped, because off the mirror is ground the strip is
-/// not showing and has no colour to report. Those two rectangles must be the
-/// same one, or the volume stands on nothing past whichever is smaller.
-///
-/// They used to be the same by construction, because the box was derived from
-/// this very viewport. The region is stored now, so the implication runs the
-/// other way and this is where it is applied.
-///
-/// # Where the box comes from, and why the grid is asked
-///
-/// A picked region states its own centre and extent. An unpicked one — the
-/// ordinary case — is the volume's *reach*, which is a fact about a scan that
-/// this crate never sees: `build_voxels` resolves it through
-/// `rustdar_radar::voxel::box_half_width_km` and centres it on the site. So the
-/// grid is asked, through the same `VolumePainter::box_size_km` the pan and the
-/// caption already read, keyed on `rendered_for` because it is the box the
-/// picture on screen was actually built over.
-///
-/// # What happens before the first grid
-///
-/// The pane's own map memory, unchanged — which is exactly what the strip was
-/// always drawn through. There is no picture to stand on it yet: such a pane is
-/// painting its empty state, and inventing a width for it would mean choosing
-/// between a stand-in that is wrong and a floor that is missing.
 fn floor_frame_for(
     pane: &crate::pane::PaneState,
     pane_idx: usize,
@@ -2008,8 +1077,6 @@ fn floor_frame_for(
             walkers::Position::new(region.centre().lon, region.centre().lat),
             region.half_extent_km(),
         ),
-        // No pick: the volume's own reach, centred on the site, and only the
-        // grid can say how wide that came out.
         None => {
             let Some(built) = volume
                 .rendered_for
@@ -2036,10 +1103,6 @@ fn floor_frame_for(
 }
 
 /// Degrees of yaw per point of horizontal drag.
-///
-/// Sized so that a drag across a 900-point pane turns the box most of the way
-/// round — enough to inspect a storm from every side in one gesture, short of
-/// the full turn that would make the end of a drag ambiguous.
 const ORBIT_YAW_DEG_PER_POINT: f32 = 0.4;
 /// Degrees of pitch per point of vertical drag. Shallower than the yaw rate
 /// because the usable pitch range is 178° against yaw's unbounded turn, so the
@@ -2047,24 +1110,9 @@ const ORBIT_YAW_DEG_PER_POINT: f32 = 0.4;
 const ORBIT_PITCH_DEG_PER_POINT: f32 = 0.25;
 
 /// Fingers a touch drag must have to pan a 3D pane.
-///
-/// Two, alongside the pinch that is already read from the same gesture: one
-/// finger orbits, and it has to, because that is the gesture with no modifier
-/// available on a touch screen and orbiting is the pane's primary verb. Two
-/// fingers is what every 3D viewer on a touch device uses for the same reason,
-/// and `MultiTouchInfo` reports the pinch and the translation from one gesture —
-/// so a two-finger drag that also spreads does both: it slides the box and zooms
-/// the geography under it, which is what a user expects and what they will do
-/// without noticing.
 const TOUCH_PAN_FINGERS: usize = 2;
 
 /// What the 3D arm did with one pane on one frame.
-///
-/// `None` means it pushed a paint callback; `Some(reason)` means it painted the
-/// empty state with that reason. Recorded because the two are indistinguishable
-/// from outside — a callback whose payload nothing can draw paints exactly as
-/// much as an empty state does — so a test that only looked at the screen could
-/// not tell a working pane from a broken one.
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct VolumeArmProbe {
@@ -2074,32 +1122,10 @@ pub(crate) struct VolumeArmProbe {
 
 /// Draw one 3D pane: take its gesture, ask for its grid, and either push a
 /// paint callback or say why there is not one.
-///
-/// Returns the empty-state reason, or `None` if a callback was pushed.
-///
-/// # Why the callback is built here and not before the frame
-///
-/// `painter.paint` is called with the camera **after** this frame's drag has
-/// been folded in. Building the payload before `Gui::ui` ran would be tidier and
-/// would leave the orbit one frame behind the pointer — which does not look like
-/// a bug, it looks like input lag, and it gets "fixed" by turning the drag
-/// sensitivity up rather than by fixing the order.
-///
-/// # Where the zoom goes
-///
-/// Into the camera, beside the orbit and the pan, through
-/// [`crate::ui_region::zoom_camera`]. It used to aim the pane's *viewport*
-/// instead, which is why it had to run before the floor was drawn and why the
-/// caller took the interaction; the caller still takes it, because orbit, pan
-/// and zoom are one gesture surface and must share one hit test, but nothing
-/// about the ordering is load-bearing any more. The region this pane resamples
-/// is stored on the pane and no gesture writes it.
 #[allow(clippy::too_many_arguments)]
 fn render_volume_pane(
     ui: &mut egui::Ui,
     pane_rect: egui::Rect,
-    // The part of `pane_rect` the colour scale has not claimed, for the pane's
-    // floating chrome — see `pane_render::color_scale_free_rect`.
     chrome_rect: egui::Rect,
     pane_idx: usize,
     pane: &mut crate::pane::PaneState,
@@ -2133,11 +1159,6 @@ fn render_volume_pane(
     if let Some(why) = outcome.empty.as_deref() {
         paint_pane_empty_state(ui, pane_rect, why);
     }
-    // The Volume Alpha editor, after the pane's own painting so its button and
-    // window sit over the picture. It needs the target the arm just resolved —
-    // the palette it shows is the grid's own, looked up by that target — and
-    // the product, which the curves are keyed by. `chrome` is the frame's
-    // fade: the button is floating chrome and hides with the rest (§1.8).
     volume_alpha_editor::editor_ui(
         ui,
         pane_rect,
@@ -2195,40 +1216,12 @@ fn volume_pane_outcome(
     use crate::pane::{OrbitDelta, VolumeStamp, VolumeTarget};
     use crate::volume_view::{VolumeFrameState, VolumePaint};
 
-    // The camera and the box as they stand *before* this frame's gesture, which
-    // is what the pan has to be scaled against: the world distance a screen point
-    // spans depends on where the eye is, and folding the drag in first would
-    // measure it against a camera the user has not seen yet.
-    //
-    // Answered rather than unwrapped for the reason the `volume_mut` below gives.
-    //
-    // The region is read off the pane rather than passed in, because it is a
-    // stored choice rather than a measurement of this frame: nothing in the
-    // render arm produces it and nothing here may write it. `None` — the
-    // ordinary case, and the one a pane opens in — means the volume's own data
-    // reach, which only the resampler can resolve; see `VolumePane::region`.
     let Some((camera_before, view_mode, region)) =
         pane.volume().map(|v| (v.camera, v.view_mode, v.region))
     else {
         return VolumeOutcome::empty_state(VOLUME_EMPTY_STATE.to_owned());
     };
     let mut box_size_km = crate::pane::box_size_km(region);
-    // The box the picture on screen was actually *built* over, for the pan to
-    // be scaled against. A measured viewport states its own width and
-    // `build_voxels` honours it, so for those the line above is already exact
-    // and this changes nothing. What it answers is the unmeasured case: an
-    // unstated width is resolved from the volume's own reach
-    // (`rustdar_radar::voxel::box_half_width_km`), which the pane cannot
-    // derive because it holds no volume — so the grid answers, and the pane's
-    // own derivation above stands in only until there is a grid.
-    //
-    // Keyed on `rendered_for` rather than on the target this function resolves
-    // further down, because that target is not known yet and the pan is folded
-    // in before anything that could refuse. The two name the same box wherever
-    // it matters: they differ only on the frame a rebuild is first noticed,
-    // and a rebuild that changes the *width* changes it only when the volume's
-    // reach changed — a pane's own site, moment and region are what the width
-    // otherwise follows, and none of them moved.
     if let Some(built) = pane
         .volume()
         .and_then(|v| v.rendered_for.as_ref())
@@ -2238,62 +1231,17 @@ fn volume_pane_outcome(
         box_size_km = built;
     }
 
-    // The gesture first, and unconditionally: the camera is the pane's own
-    // state, it survives every reason there is nothing to draw, and a user who
-    // orbits an empty box while a volume downloads should find it where they
-    // left it when the volume lands.
-    //
-    // The `response` is the caller's — one interaction on this rect, taken
-    // before the floor was drawn so that the zoom it also carries could reach
-    // the viewport in time. See `render_volume_pane`.
     let mut delta = OrbitDelta::default();
-    // Primary drag orbits; secondary drag pans. Read as two separate questions
-    // rather than as an if/else on one drag, because `dragged_by` is per-button
-    // and a user with both buttons down means both.
-    //
-    // Both are off while `suppress_drag` — the same flag a plan view hands to
-    // `Map::drag_pan_buttons`, meaning "another gesture owns this pointer".
-    // It is the 3D pane's answer to a gesture inventory written for a flat map:
-    // on a touch device a **double-tap-drag zooms**, and it spells that zoom
-    // with a held finger travelling up the screen, which `normalize_touch_devices`
-    // turns into a synthesised *primary* drag. Ungated, every double-tap zoom on
-    // a phone also spun the box — the ground zoomed and the camera turned, from
-    // one gesture, and the pane looked like it had a mind of its own. A long
-    // press is the same shape for the same reason: it raises the value tooltip,
-    // and a tooltip is not an orbit.
-    //
-    // Only the *drag* verbs. The zoom the caller already applied is not
-    // drag-derived — a pinch or a wheel is unambiguous whatever else is in
-    // flight — so suppressing it here would make a pinch during a hold do
-    // nothing, which is not what the hold claimed.
     if !suppress_drag && response.dragged_by(egui::PointerButton::Primary) {
         let drag = response.drag_delta();
-        // Grab-and-turn, in both axes: a point on the box's surface follows the
-        // pointer. Dragging right swings the eye's bearing east, which brings
-        // the box's eastern face round to face the viewer and carries every
-        // surface point rightwards with the cursor; dragging down raises the
-        // eye, which tips the top face towards the viewer and carries its far
-        // edge down. Both signs are convention rather than arithmetic, so both
-        // are pinned by a test — a sign error here still orbits perfectly well
-        // and merely feels wrong, which is the kind of defect that survives
-        // review.
         delta.yaw_deg = drag.x * ORBIT_YAW_DEG_PER_POINT;
         delta.pitch_deg = drag.y * ORBIT_PITCH_DEG_PER_POINT;
     }
 
-    // The pan drag, in screen points, from whichever device produced one.
-    //
-    // Touch is checked first and wins, because `normalize_touch_devices` makes
-    // egui synthesise a *primary* drag from a one-finger touch: a two-finger
-    // gesture would otherwise be read as an orbit as well as a pan, and the box
-    // would spin while it slid. `multi_touch()` is `Some` only while more than
-    // one finger is down, so the one-finger orbit above is unaffected.
     let touch = ui.ctx().multi_touch();
     let pan_drag = match touch {
         _ if suppress_drag => None,
         Some(touch) if touch.num_touches >= TOUCH_PAN_FINGERS => {
-            // Cancel the orbit this frame: the same fingers produced the
-            // synthesised primary drag that the branch above already folded in.
             delta.yaw_deg = 0.0;
             delta.pitch_deg = 0.0;
             Some([touch.translation_delta.x, touch.translation_delta.y])
@@ -2305,10 +1253,6 @@ fn volume_pane_outcome(
         _ => None,
     };
     if let Some(drag) = pan_drag
-        // `None` for a pane with no height or a degenerate box — both transient,
-        // and neither may put a NaN in the camera. The default is "did not pan",
-        // which is what the frame should do while a divider drag has the pane
-        // collapsed to nothing.
         && let Some(pan) = crate::volume_view::pan_for_drag(
             camera_before,
             box_size_km,
@@ -2319,73 +1263,15 @@ fn volume_pane_outcome(
         delta.pan = pan;
     }
 
-    // The zoom, on the same response as the orbit and the pan, because it is
-    // the same gesture surface. It divides the eye's standoff and touches
-    // nothing else: the box, the grid inside it and the floor under it all
-    // stand still, and the ground the pane is *looking* at is what halves.
-    //
-    // This is the fix for the defect the user reported three times. The arm
-    // used to be absent because the zoom aimed the *viewport*, and the box was
-    // derived from the viewport — so scrolling in re-cut the data, and the
-    // caption's own figure fell from `802 x 490 km box` to `668 x 408 km` while
-    // the user watched. The eye no longer "follows for free", because there is
-    // no longer anything for it to follow: the box does not move.
-    //
-    // Not gated on `suppress_drag`, for the reason the orbit arm states — a
-    // pinch or a wheel is unambiguous whatever else is in flight, so
-    // suppressing it during a hold would make a pinch do nothing the hold never
-    // claimed. Nothing here may reframe, ease or fit: the user is the only
-    // thing that moves this camera, and the standoff is also theirs to set
-    // absolutely on the pane's own control (`render_volume_controls`).
     delta.zoom_factor = crate::ui_region::zoom_camera(ui.ctx(), response);
 
-    // Read before `volume_mut` borrows the pane: `site`, `scan_info` and
-    // `selected_product` are flat fields beside `content`, and taking them first
-    // is what keeps this one borrow deep rather than a clone of the pane.
     let site_code = pane.site.clone();
     let product = pane.selected_product;
-    // The playing loop frame's resident grid, read here for the same borrow
-    // reason as the fields above. `Some` only while a 3D loop is animating
-    // *and* the playhead's frame has landed; the loop's own dispatcher owns
-    // filling it, and until it has, everything below runs exactly as it does
-    // with no loop at all — which is what makes a loop that is still building
-    // show the live volume rather than an empty pane.
     let loop_grid = pane.active_volume_frame().cloned();
-    // The volume this pane has been **navigated** to, or `None` while it is
-    // following live. See the stamp below, which is what it displaces.
     let navigated = (!pane.viewing_live)
         .then(|| pane.scan_info.as_ref().map(|info| info.timestamp))
         .flatten();
-    // While the pane follows live: the published current-volume stamp, **not**
-    // `scan_info`. `scan_info` names whatever the plan view is drawing and
-    // freezes for a whole volume; the stamp is the newest data time of the
-    // site's merged volume and advances on every sealed sweep — it is what
-    // makes the 3D pane rebuild in step with the map beside it, and what a
-    // build is deduplicated by.
-    //
-    // Once the pane has been taken off live, its own displayed volume wins,
-    // exactly as a cross-section pane's `SectionTarget` is stamped with
-    // `scan_info.timestamp` while the live stamp goes on advancing beside it.
-    // The published stamp is per **site** and per **frame**: it says what the
-    // App holds *now*, so it cannot express "this pane is looking at 18:05"
-    // at all. Reading it unconditionally is what made the timeline inert over
-    // a 3D pane — the scrub moved the plan view and the section beside it, the
-    // 3D target never changed, and no rebuild was ever asked for. It also made
-    // a live 3D pane and a scrubbed one on the same site two names for one
-    // picture.
-    //
-    // Still gated on there being a published stamp at all. That gate is the
-    // App's statement that it holds a volume worth building, and a pane with a
-    // plan view and no stamp must wait rather than build from the plan view's
-    // scan — see `a_pane_with_no_published_stamp_does_not_build_from_the_plan_views_scan`.
-    //
-    // The site comes from `pane.site` rather than from `scan_info.site`,
-    // because a pane that has switched site should ask for the new site's
-    // volume, not go on naming the old one until a plan view catches up.
     let stamp = current_stamp.map(|stamp| match navigated {
-        // A navigated volume is a complete archive volume, so the moment it
-        // began and the moment it is named by are the same one — there are no
-        // un-refreshed tilts under it from an earlier flight.
         Some(collected) => (
             VolumeStamp {
                 site: site_code.clone(),
@@ -2402,10 +1288,6 @@ fn volume_pane_outcome(
         ),
     });
 
-    // Unreachable from the kind branch, which only enters here for a `Volume`
-    // pane, and answered rather than unwrapped: this function takes a whole
-    // `PaneState` and is the sort of thing a future caller invokes from
-    // somewhere else.
     let Some(volume) = pane.volume_mut() else {
         return VolumeOutcome::empty_state(VOLUME_EMPTY_STATE.to_owned());
     };
@@ -2414,25 +1296,15 @@ fn volume_pane_outcome(
     let floor = !volume.hide_floor;
     let already_rendered = volume.rendered_for.clone();
 
-    // Everything below is a reason there is no picture, in the order the user
-    // can act on them.
     let Some(painter) = painter else {
         return VolumeOutcome::empty_state(VOLUME_EMPTY_STATE.to_owned());
     };
     let Some((volume_stamp, base_started)) = stamp else {
-        // No volume at all yet — the cold-start window between choosing a site
-        // and its first data landing. The download is already in flight (a
-        // site switch fires the archive fetch immediately), so this is the one
-        // state where waiting is the truth.
         return VolumeOutcome::empty_state(format!(
             "Downloading the first {site_code} volume...\n\nThe 3D view builds the moment it \
              lands, then updates tilt by tilt as new sweeps arrive.",
         ));
     };
-    // `volume_slot`, not `samplable`: the derived products (SRV, NROT, KDP)
-    // render through the worker-side derivation layer, so only the products
-    // with no per-tilt field at all are refused here — and the message says
-    // which kind of field the pane needs.
     if rustdar_radar::derive::volume_slot(product).is_none() {
         return VolumeOutcome::empty_state(format!(
             "{} has no vertical structure to render in 3D - pick a moment the radar measures \
@@ -2446,27 +1318,12 @@ fn volume_pane_outcome(
         product,
         region,
     };
-    // The one substitution a 3D loop makes: the pane marches the playhead
-    // frame's grid instead of the live one. Everything else about the pane —
-    // camera, floor, alpha curve, isosurface, the caption's geometry — is
-    // unchanged, because a loop frame differs from the live volume only in
-    // *which* grid is sampled.
-    //
-    // While a frame is playing the pane does **not** ask for the live volume.
-    // That is what makes the resident set the loop's frame list and nothing
-    // else: asking would attach the pane to a fifteenth grid on desktop, over
-    // the budget by one, for a picture nothing is showing. It is also why the
-    // live grid is *subsumed* rather than added — the playhead's frame is the
-    // volume this pane is displaying.
     let (target, from_loop) = match loop_grid {
         Some(grid) => (grid.target, true),
         None => (live_target, false),
     };
     let collected = target.volume.collected;
     if !from_loop && already_rendered.as_ref() != Some(&target) {
-        // Level-triggered on purpose. See `GuiAction::PrepareVolume`: the
-        // alternative is remembering an edge across a site switch, a volume
-        // roll and a surface loss, which is three places to forget.
         actions.push(GuiAction::PrepareVolume {
             pane_idx,
             target: target.clone(),
@@ -2488,35 +1345,16 @@ fn volume_pane_outcome(
         floor,
         source: source_geo,
         mirror_size_points: [mirror_size_points.x, mirror_size_points.y],
-        // The user's Volume Alpha curve for this product, or `None` for an
-        // untouched editor — which the painter is obliged to render
-        // bit-exactly through the palette's own alpha.
         alpha: alpha_curves.get(product),
         view_mode,
         iso_threshold: iso_thresholds.get(product),
     }) {
         VolumePaint::Callback { payload, showing } => {
-            // Hand-constructed, because `egui_wgpu::Callback` has a private
-            // field and its only constructor wants the rect up front — so a
-            // crate that cannot name `egui_wgpu` cannot make one. Both of
-            // `PaintCallback`'s fields are public, which is the whole reason
-            // this seam is an `Arc<dyn Any>` rather than a typed payload.
             ui.painter()
                 .add(egui::Shape::Callback(egui::epaint::PaintCallback {
                     rect: pane_rect,
                     callback: payload,
                 }));
-            // Over the callback, and only when there is a picture to caption: an
-            // empty state already says everything, and a caption under it would
-            // be two explanations of the same pane.
-            //
-            // The box is looked up again here, on `target` — the same key
-            // `paint` just answered on, so the caption's "651 km box - 2.54
-            // km/cell" is measured off the very grid the callback above is
-            // about to march. The pan's copy at the top of this function is
-            // keyed on `rendered_for` because it has to exist before a target
-            // does; this one has no such excuse, and a caption is exactly
-            // where a box size nobody resampled would go unnoticed.
             let drawn_box_km = painter
                 .box_size_km(pane_idx, &target)
                 .unwrap_or(box_size_km);
@@ -2550,41 +1388,6 @@ fn volume_pane_outcome(
 
 /// The 3D pane's own controls: how far the vertical is stretched, and a way back
 /// to the view it started at.
-///
-/// # Why the exaggeration is a slider and not a preset list
-///
-/// It is a continuous judgement about one picture. A forecaster reading a
-/// supercell wants a different stretch from one reading a squall line's
-/// cross-section, and the useful move is nudging it until the structure reads —
-/// which is a drag, not a choice between three named values.
-///
-/// The range is `[1, 12]` and it starts at 3. 1 is true proportions, and it is
-/// reachable on purpose: the flat picture is the honest one, and a view that
-/// could not be turned back to it would be a view that had made exaggeration
-/// compulsory.
-///
-/// # Why the reset returns four things
-///
-/// A pane that is lost — panned off the box, spun to a strange angle, tightened
-/// onto a region that turned out to be empty — is one the user has no other way
-/// back from. So this returns the *whole* view: angle, zoom, pivot **and**
-/// region. Leaving the pivot out is the easy mistake, and the symptom is a reset
-/// that visibly does something and still leaves the box off screen.
-///
-/// A free function rather than a `Gui` method because it touches nothing but the
-/// pane it is handed — and the pane it is handed is the one the caller
-/// `mem::take`n, which is the only correct thing to read during the UI pass.
-///
-/// # Why it is told the pane drew nothing
-///
-/// `drawing_nothing` is the arm's own empty-state reason for this pane, or
-/// `None` for a pane that painted a volume — [`super::Gui::volume_empty_states`].
-/// The floor is drawn *by the raymarch*, inside the callback an empty state
-/// means was never pushed, so in every one of those states the Map floor
-/// checkbox is a control that produces nothing. It stays tickable — the
-/// preference is real and persisted, and a user waiting for the first volume
-/// may legitimately set it now — and it says so, which is the half that was
-/// missing.
 pub(crate) fn render_volume_controls(
     ui: &mut egui::Ui,
     pane: &mut crate::pane::PaneState,
@@ -2600,11 +1403,6 @@ pub(crate) fn render_volume_controls(
     ui.separator();
     ui.label(VOLUME_SIDEBAR_HEADER);
 
-    // Header-then-indent, like the loop transport and the section block: the
-    // 3D knobs are one more block of the one panel, not a panel of their own.
-    // The slider sits behind a "Vertical:" label the way "Lookback:" and
-    // "Speed:" do, rather than carrying its own trailing text into a column
-    // too narrow for both.
     ui.indent("volume_controls", |ui| {
         let mut exaggeration = volume.camera.vertical_exaggeration();
         ui.horizontal(|ui| {
@@ -2618,9 +1416,6 @@ pub(crate) fn render_volume_controls(
                 .fixed_decimals(1),
             );
             if response.changed() {
-                // Through the setter, which is the only writer and the only
-                // place the clamp and the non-finite refusal live. Writing the
-                // field would work here and would be a second copy of both.
                 volume.camera.set_vertical_exaggeration(exaggeration);
             }
             response.on_hover_text(
@@ -2629,17 +1424,6 @@ pub(crate) fn render_volume_controls(
             );
         });
 
-        // The framing, which the scroll wheel used to carry and no longer does:
-        // scroll and pinch aim the geography now, in both render modes, so the
-        // standoff needs a home of its own. A control rather than a modifier
-        // key, because a modifier is a desktop-only gesture and this pane has
-        // to work under a finger and in a browser.
-        //
-        // Held in multiples of the box's framing radius, which is why the number
-        // means the same thing at every box size — and why tightening the box
-        // does not disturb it. Below 1 the eye is inside the box, which is a
-        // supported camera and the close inspection GR2Analyst allows; see
-        // `MIN_EYE_DISTANCE`.
         let mut standoff = volume.camera.eye_distance();
         ui.horizontal(|ui| {
             ui.label("Distance:");
@@ -2653,8 +1437,6 @@ pub(crate) fn render_volume_controls(
                 .fixed_decimals(2),
             );
             if response.changed() {
-                // Through the setter, for the reason the exaggeration above
-                // goes through its own: one writer, one clamp, one refusal.
                 volume.camera.set_eye_distance(standoff);
             }
             response.on_hover_text(
@@ -2664,10 +1446,6 @@ pub(crate) fn render_volume_controls(
             );
         });
 
-        // The view mode: GR2Analyst's own pair, as a two-way radio. The mode
-        // is per pane (a posture of this picture, persisted with the pane);
-        // the threshold is per product (a judgement about a moment's scale,
-        // shared by every pane showing it — the alpha curves' arrangement).
         ui.horizontal(|ui| {
             ui.label("Mode:");
             ui.radio_value(
@@ -2706,8 +1484,6 @@ pub(crate) fn render_volume_controls(
                     product.name(),
                 ));
             });
-            // The honest word about the other control: the surface reads the
-            // data, so a drawn curve changes nothing in this mode.
             if alpha_curves.is_edited(product) {
                 ui.label(
                     egui::RichText::new(
@@ -2720,8 +1496,6 @@ pub(crate) fn render_volume_controls(
             }
         }
 
-        // Positive in the UI, inverted in storage — see `VolumePane::hide_floor`
-        // for why the stored form is the negation.
         let mut show_floor = !volume.hide_floor;
         if ui
             .checkbox(&mut show_floor, MAP_FLOOR_LABEL)
@@ -2738,14 +1512,6 @@ pub(crate) fn render_volume_controls(
         {
             volume.hide_floor = !show_floor;
         }
-        // The honest word about a control that is currently producing nothing.
-        // The floor rides the raymarch callback, so a pane explaining itself
-        // instead of drawing has no floor either, whatever this box says — and
-        // silently doing nothing is how a checkbox comes to read as broken. It
-        // stays tickable because the preference is durable and takes effect the
-        // moment the picture arrives; the pane's own reason is quoted rather
-        // than paraphrased, so the sidebar and the pane cannot say two
-        // different things.
         if let Some(why) = drawing_nothing {
             ui.label(
                 egui::RichText::new(format!("{MAP_FLOOR_INERT_NOTE} {}", reason_headline(why)))
@@ -2754,17 +1520,6 @@ pub(crate) fn render_volume_controls(
             );
         }
 
-        // The picked region, and the way out of it. Shown only when there is
-        // one: a pane on the whole ring has nothing to clear, and a permanently
-        // greyed button would be one more control to read past.
-        //
-        // A control of its own rather than leaving this to Reset view, which
-        // also clears it. The two are for different situations and only one of
-        // them is cheap: a user who tightened onto a storm that turned out to
-        // be nothing wants the ring back and wants to keep the angle they spent
-        // a minute finding, and Reset view costs them that angle. A selection
-        // you can only undo by discarding the rest of your work is still most
-        // of a trap.
         if let Some(region) = volume.region {
             ui.horizontal(|ui| {
                 ui.label(format!(
@@ -2787,10 +1542,6 @@ pub(crate) fn render_volume_controls(
                     )
                     .clicked()
                 {
-                    // The source pane goes with it, for `reset_volume_view`'s
-                    // reason: a pane that is no longer aimed is not aimed from
-                    // anywhere, and a stale index would keep drawing a box on a
-                    // map for a region this pane no longer holds.
                     volume.region = None;
                     volume.source_pane = None;
                 }
@@ -2808,101 +1559,21 @@ pub(crate) fn render_volume_controls(
 }
 
 /// The label on the control that drops a picked region.
-///
-/// Names the **destination** rather than the act: "Clear region" says what
-/// stops, and the useful thing to know is what the pane will be showing
-/// afterwards. A constant because a test names it, and a test carrying its own
-/// copy of the string would go on passing after the button was renamed out from
-/// under it.
 pub(crate) const WHOLE_RING_LABEL: &str = "Whole ring";
 
 /// Put a 3D pane back to the view it opened at.
-///
-/// A named function rather than four lines inside the button, so that what the
-/// button does is reachable from a test. The alternative is a test that restates
-/// the assignments, which passes whatever the button actually does — and this is
-/// exactly the kind of function that grows a field it forgets to clear.
-///
-/// **It returns the region as well as the camera**, and the pivot as well as the
-/// angles. Both are easy to leave out and both fail the same way: a reset that
-/// visibly changes something and leaves the pane still looking at the wrong
-/// place, which reads as a control that half-works.
-///
-/// # The region is the reason this button matters
-///
-/// It is also **the only way back to the whole ring**. A picked region is
-/// deliberately immovable — no zoom, pan, divider drag or resize touches it,
-/// which is the entire point of storing it — so nothing else in the pane can
-/// widen a box again. Without this, picking a 20 km region would be a
-/// one-way door: the pane would be stuck on that ground for the rest of its
-/// life, and a user who tightened onto a storm that turned out to be nothing
-/// would have to delete the pane to escape. That is the trap a selection you
-/// cannot undo always is, and clearing to `None` is the way out.
-///
-/// `None` rather than a wide *number*, because `None` is a different rule
-/// rather than a bigger box: the volume's own data reach, circumscribed,
-/// resolved by the resampler from the scan in hand. A pane reset while looking
-/// at a TDWR gets the TDWR's ring, which no stored figure could have known.
-///
-/// The source pane goes with it. It records which map aimed this one, and a
-/// pane that is no longer aimed is not aimed *from* anywhere — leaving the
-/// index would keep the cleared pane the preferred target of the next drag on
-/// that map, and would keep drawing a box on it that this pane no longer holds.
 pub(crate) fn reset_volume_view(volume: &mut crate::pane::VolumePane) {
     volume.camera = crate::pane::OrbitCamera::default();
     volume.region = None;
     volume.source_pane = None;
-    // `view_mode` stays, deliberately: the reset is for a pane that is *lost*
-    // — angle, zoom, centre — and the view mode is not a way to be lost, it is
-    // a choice of picture. A reset that also flipped an isosurface pane back to
-    // the lit volume would un-choose something the user chose on purpose.
 }
 
 /// Where each 3D pane draws its own map so that **only the mirror can see it**,
 /// and how much of egui's coordinate space the mirror must therefore cover.
-///
-/// # The mechanism
-///
-/// A 3D view is an alternative rendering of a map pane, so the map it stands on
-/// is its *own* — but the pane's rect is occupied by the volume, and a map drawn
-/// there would cover it. The map is therefore drawn into a **strip**: the pane's
-/// rect, translated below the frame. The two render passes then disagree about
-/// it purely through their attachment size:
-///
-/// * the **screen** pass's attachment is the frame, so the strip's scissor is
-///   clamped to zero height and `egui_wgpu::Renderer::render` skips it — while
-///   still advancing its mesh iterators, which is the same property the mirror's
-///   own primitive filter is built on;
-/// * the **mirror** pass's attachment is the frame *plus* the strips, so it has
-///   texels down there and draws it.
-///
-/// `tests/floor_offscreen_strip.rs` in `rustdar-gpu` asserts all of that
-/// against real tessellator output, including that egui does not cull the strip
-/// and that a pointer over the pane cannot reach the map in it.
-///
-/// # Why one translation for every pane
-///
-/// The strips could be packed, and packing would be smaller. It would also make
-/// two 3D panes able to collide — the failure being a floor showing the *other*
-/// pane's map, which looks like a plausible picture — and the saving is bounded:
-/// however many 3D panes there are, one uniform translation keeps every strip
-/// disjoint (the pane rects already are) and keeps the mirror under twice the
-/// frame.
-///
-/// The translation is the smallest one that clears the frame: the topmost strip
-/// starts exactly at the frame's bottom edge. That is not free elegance, it is
-/// the difference between fitting a target's mirror budget and halving its
-/// floor. A 3D pane in the lower half of a vertical split asks for 1.5x the
-/// frame this way and 2x under a fixed full-frame offset; a single pane under a
-/// top bar asks for 2x minus the bar. See `Gui::mirror_size_points`.
-///
-/// Returns the strips, indexed as `wanted` was, and the mirror's size in points.
 fn floor_strip_plan(
     screen: egui::Rect,
     wanted: &[Option<egui::Rect>],
 ) -> (Vec<Option<egui::Rect>>, egui::Vec2) {
-    // egui's screen rect starts at the origin and the mirror's attachment does
-    // too, so the frame's *far corner* is the size the mirror starts from.
     let frame = screen.max.to_vec2();
     let Some(top) = wanted
         .iter()
@@ -2912,8 +1583,6 @@ fn floor_strip_plan(
     else {
         return (vec![None; wanted.len()], frame);
     };
-    // Never negative: a strip lifted *into* the frame would be drawn on the
-    // glass, over the volume it is the floor for.
     let offset = egui::vec2(0.0, (screen.max.y - top).max(0.0));
     let strips: Vec<Option<egui::Rect>> = wanted
         .iter()
@@ -2927,21 +1596,6 @@ fn floor_strip_plan(
 
 /// Reduce a live `walkers::Projector` to the four numbers a 3D pane's map
 /// floor is reprojected through. See [`crate::volume_view::MapPaneGeo`].
-///
-/// # Why finite differences are exact here rather than approximate
-///
-/// Web Mercator's screen `x` is *linear* in longitude and its screen `y` is
-/// *linear* in Mercator `y`. So a secant taken over a whole degree is the
-/// tangent, everywhere on the pane — this is not a local linearisation that
-/// degrades toward the corners, it is the projection's closed form recovered
-/// through two evaluations of the thing that actually draws the map. Asking
-/// the projector rather than restating `256 · 2^zoom / 360` is the point: a
-/// tile size or zoom convention that changes in `walkers` changes both the map
-/// and this affine together, and cannot leave the floor registered to a
-/// convention the map no longer uses.
-///
-/// A whole degree rather than an epsilon deliberately: the projector answers in
-/// `f32`, and a small step would divide two nearly equal `f32`s.
 fn map_pane_geo_from(
     projector: &walkers::Projector,
     rect: egui::Rect,
@@ -2954,10 +1608,6 @@ fn map_pane_geo_from(
         .project(walkers::lat_lon(anchor_lat, anchor_lon))
         .to_pos2();
 
-    // Stepped *away* from the nearer edge of each range, so neither probe
-    // crosses the antimeridian or leaves Mercator's valid latitude band —
-    // either of which would fold the secant back on itself and yield a scale
-    // that is wrong by a factor of two with no other symptom.
     let lon_step: f64 = if anchor_lon > 0.0 { -1.0 } else { 1.0 };
     let lat_step: f64 = if anchor_lat > 0.0 { -1.0 } else { 1.0 };
 
@@ -2975,8 +1625,6 @@ fn map_pane_geo_from(
         anchor_lon,
         anchor,
         points_per_degree_lon: f64::from(east.x - anchor.x) / lon_step,
-        // `d_merc` cannot be zero: `lat_step` is ±1 and `mercator_y_of_lat` is
-        // strictly increasing, so the guard would be dead code.
         points_per_mercator_y: f64::from(north.y - anchor.y) / d_merc,
     }
 }
@@ -2987,75 +1635,6 @@ fn map_pane_geo_from(
 const KFT_PER_KM: f64 = 3.280_84;
 
 /// What the pane says about the picture it is showing, one line per fact.
-///
-/// # Every number here is a real one
-///
-/// This is the counterweight to the vertical exaggeration, and it is the reason
-/// the exaggeration is defensible at all. The height line is the box's true
-/// extent in kft MSL, read from the same two constants the resample was given and
-/// **never** multiplied by the stretch; the stretch is stated beside it as a
-/// drawing convention, with its number, so that a reader can see both facts at
-/// once and cannot mistake one for the other.
-///
-/// The same applies to the volume time, which for a merged volume is **two**
-/// truthful claims that must not be fused. "Newest data" is when the radar
-/// last looked anywhere in the volume — it advances on every sealed sweep, and
-/// stating it alone would let the whole volume borrow that freshness. "Base
-/// volume" is the complete volume the un-refreshed tilts still come from. The
-/// two lines together let a reader see the span of what is on screen; while a
-/// site's first volume is still filling there is no base at all, and the
-/// caption says that instead — the earlier wording ("archived volume", plus a
-/// warning naming the app's other volume) described the archive-only design
-/// this superseded, in which built and current genuinely differed.
-///
-/// # Why the resolution is here rather than inferred
-///
-/// The grid has a fixed cell count, so a tighter region buys detail instead of
-/// saving memory. That is the main reason to pick a region at all, and it is
-/// invisible unless it is written down: 2.54 km per cell over a WSR-88D's
-/// whole reflectivity volume against 0.16 at a 20 km region is the difference
-/// between a smear and a storm.
-///
-/// # Why the box arrives as an extent rather than as a region
-///
-/// It has to be the box the grid was **built** over, and for a pane with no
-/// picked region that is no longer derivable from anything this function could
-/// be handed instead: the extent follows the volume's own reach
-/// (`rustdar_radar::voxel::box_half_width_km`), so it is 651 km for a
-/// reflectivity volume and 424 for the same site's velocity. The caller reads
-/// it off the grid through `VolumePainter::box_size_km`, and passing the
-/// resolved extent is what keeps this caption from being the one place that
-/// says a box size nothing resampled.
-///
-/// A [`rustdar_radar::voxel::HalfExtentKm`] rather than two `f64`s, for the
-/// reason that type exists: the two are adjacent, same-typed and name different
-/// axes, so a swap here would print a box's height as its width and read as
-/// nothing worse than a surprising pane.
-///
-/// # Why the resolution line is told what is on screen
-///
-/// The box the pane names is the box it is drawing, always: a zoom retargets
-/// the viewport and the renderer frames the new box on that very frame. The
-/// **resolution** is a different claim. For as long as a rebuild is pending,
-/// what is on screen is the grid the pane already had, drawn into the new box — so
-/// the picture is the right ground at the wrong sharpness, and possibly not
-/// reaching the box's edges if the zoom was outwards. Reading the cell size off
-/// the requested region alone would claim a sharpness that is not there, and
-/// the whole licence for painting a held grid at all is that the caption stays
-/// honest about it. [`crate::volume_view::Showing`] is that report.
-///
-/// A pure function of seven values so that what the pane claims can be tested
-/// without a GPU, a projector or a frame.
-///
-/// `cells` is the grid's own horizontal cell count, passed in rather than read
-/// off a constant: the shape is derived at runtime from the device's
-/// `max_texture_dimension_3d` (`rustdar_radar::voxel::shape_for_budget`), so
-/// there is no compile-time triple this could consult that is guaranteed to be
-/// the grid on screen. It used to read `default_shape().nx`, which would now be
-/// a caption confidently dividing by the wrong number on any device not
-/// reporting exactly the guarantee. `None` — a pane with no grid to ask — states
-/// the box and omits the resolution, which is the honest answer rather than a
-/// division by an assumed number.
 fn volume_caption(
     site: &str,
     newest: chrono::NaiveDateTime,
@@ -3072,8 +1651,6 @@ fn volume_caption(
 
     match base_started {
         Some(base) => lines.push(format!("base volume {}Z", base.format("%H:%M"))),
-        // No complete volume yet: the ladder is only what the current flight
-        // has sealed, and the picture must not read as a full atmosphere.
         None => lines.push("no complete volume yet - showing the tilts flown so far".to_owned()),
     }
 
@@ -3092,12 +1669,6 @@ fn volume_caption(
                 .zip(crate::pane::resolution_km(half.north_km, cells))
         }),
     ) {
-        // Standing in: the cell size on screen is the held grid's, not the one
-        // this box would buy, and the line says which and that a sharper one is
-        // coming. `partial` is the zoom-*out* case, where the held grid does not
-        // reach the new box's edges — the picture is real data in the middle and
-        // nothing outside it, and a caption that did not say so would be read as
-        // "the storm ends there".
         (Some((shown_e, shown_n)), _) if showing.partial => lines.push(format!(
             "{across} km box - {} km/cell over the middle, filling in",
             axes(shown_e.into(), shown_n.into(), 2),
@@ -3115,8 +1686,6 @@ fn volume_caption(
             "{across} km box - {} km/cell",
             axes(east, north, 2)
         )),
-        // A zero cell count is impossible for every named shape, and a caption is
-        // not the place to fail over it.
         (None, None) => lines.push(format!("{across} km box")),
     }
     lines
@@ -3124,15 +1693,6 @@ fn volume_caption(
 
 /// `east` alone when the two axes print the same at `decimals`, `east × north`
 /// otherwise.
-///
-/// The caption has two numbers for every horizontal quantity now, and a pane
-/// whose box really is square would read as though its two axes agreeing were a
-/// coincidence worth reporting. Comparing the **formatted** strings rather than
-/// the `f64`s is the whole trick: what matters is whether the reader would see
-/// two different numbers, and a 460.0001 × 460.0000 km box prints one.
-///
-/// East first, matching [`rustdar_radar::voxel::HalfExtentKm`]'s own field
-/// order and the box's `x` before its `y`.
 fn axes(east: f64, north: f64, decimals: usize) -> String {
     let (east, north) = (format!("{east:.decimals$}"), format!("{north:.decimals$}"));
     if east == north {
@@ -3146,12 +1706,6 @@ fn axes(east: f64, north: f64, decimals: usize) -> String {
 const CAPTION_MARGIN: f32 = 8.0;
 
 /// Draw the caption in the pane's top-left corner, over the volume.
-///
-/// Behind a translucent plate rather than straight onto the render, because the
-/// volume beneath it is an arbitrary colour: white text over a stratiform sheet
-/// is unreadable, and a drop shadow only halves the problem. Painted rather than
-/// laid out as widgets for the reason `paint_pane_empty_state` gives — a caption
-/// is not interactive, and widgets here would consume the pane's auto-ids.
 fn paint_volume_caption(
     ui: &egui::Ui,
     pane_rect: egui::Rect,
@@ -3167,11 +1721,6 @@ fn paint_volume_caption(
         egui::Color32::from_rgb(235, 235, 235),
         pane_rect.width() - 2.0 * CAPTION_MARGIN,
     );
-    // Below the pane's pill row, not at the very corner — the row is an
-    // egui layer over the pane and would cover the caption. The clearance
-    // is the row's *measured* height (`ui_pills::pill_row_clearance`): a
-    // narrow pane wraps the row, and a fixed one-row offset put this
-    // caption under the second line (the second user test's pane-6 find).
     let origin = pane_rect.left_top() + egui::vec2(CAPTION_MARGIN, top_clearance);
     ui.painter().rect_filled(
         egui::Rect::from_min_size(origin, galley.size()).expand(4.0),
@@ -3183,23 +1732,9 @@ fn paint_volume_caption(
 }
 
 /// Fraction of a pane's width an empty-state message is laid out across.
-///
-/// Not the whole width: a paragraph running edge to edge in a wide pane is
-/// unreadable, and the margin is also what keeps the text clear of the pane
-/// border a multi-pane layout draws.
 const EMPTY_STATE_WIDTH_FRACTION: f32 = 0.8;
 
 /// Paint a centred, **wrapped** explanation in the middle of a pane.
-///
-/// Wrapped, and it has to be: `Painter::text` lays a string out on one line
-/// whatever its length, centred — so a sentence wider than the pane runs off
-/// *both* edges with its middle showing. That is not a hypothetical. The 3D
-/// pane's palette refusal is a paragraph, and the first version of it rendered
-/// as a strip of words with the beginning and end of every line cut away, which
-/// reads as a rendering bug rather than as an explanation.
-///
-/// Newlines in the message survive, so a message can separate a headline from
-/// its detail with a blank line.
 fn paint_pane_empty_state(ui: &mut egui::Ui, pane_rect: egui::Rect, text: &str) {
     let galley = ui.painter().layout(
         text.to_owned(),
@@ -3214,62 +1749,25 @@ fn paint_pane_empty_state(ui: &mut egui::Ui, pane_rect: egui::Rect, text: &str) 
 }
 
 /// The colour a section's ground track and its end caps are drawn in.
-///
-/// Warm, and nothing else on the map is: every overlay in the registry is a
-/// hazard colour or a muted grey, and the radar image underneath spans the whole
-/// spectrum. A track has to stay findable over a 70 dBZ core.
 const SECTION_TRACK_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 214, 10);
 
 /// What the armed cross-section draw's hint chip says.
 pub(crate) const SECTION_ARM_HINT: &str = "Drag A-B to draw cross-section";
 
 /// What the armed 3D region pick's hint chip says.
-///
-/// Names the **verb and the shape**, not the feature: "drag a square" is what
-/// the user does next, and it is the one thing that is not obvious from a
-/// toggle that has just been ticked. The word "3D" is what says where the
-/// square goes.
 pub(crate) const REGION_ARM_HINT: &str = "Drag a square to pick the 3D region";
 
 /// The colour a **committed** region box is drawn in on its source map.
-///
-/// Cool, where [`crate::ui_region::REGION_ARM_COLOR`] and
-/// [`SECTION_TRACK_COLOR`] are both warm, and that is the whole choice: a
-/// committed box is a *record* of a decision already made, and the two armed
-/// gestures are things happening now. A user with a box on screen and the pick
-/// armed sees two rectangles, and the colour is what says which one the pointer
-/// is pulling.
 const REGION_COMMITTED_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 200, 255);
 
 /// Stroke width of a region box, points.
-///
-/// Thinner than the section track's 2.0: a box is four edges enclosing the
-/// picture the user is judging, and a heavy outline hides the ground just
-/// inside it — which is exactly the ground the box is being drawn around.
 const REGION_STROKE: f32 = 1.5;
 
 /// How much of the armed box's fill shows through, as a multiple of its
 /// colour's alpha.
-///
-/// Low enough that the radar image inside the box is still read at full
-/// contrast — the box is drawn *around* a storm the user is judging, so a wash
-/// that shifted its colours would defeat the gesture — and high enough that the
-/// enclosed area is unambiguous where the stroke runs over a bright core. Only
-/// the drag is filled; a committed box is stroke alone, because a permanent
-/// wash over the map would be a permanent cost.
 const REGION_FILL_ALPHA: f32 = 0.12;
 
 /// One region box's screen rect, or `None` for a box with no rectangle to draw.
-///
-/// The corners are projected rather than the centre offset by a pixel radius, so
-/// the box stays over the same ground at every zoom — through
-/// `overlay_cache::geo_corner_rect`, which is the one place that projection is
-/// written, shared with the overlay textures, the radar frame and the basemap
-/// tiles.
-///
-/// A degenerate box — a zero extent before the pointer has moved, or a polar
-/// centre — answers `None` rather than a dot, because a dot under the cursor at
-/// the start of every drag reads as a stray click artefact.
 fn region_screen_rect(
     projector: &walkers::Projector,
     centre: rustdar_geo::GeoPoint,
@@ -3301,12 +1799,6 @@ fn paint_region_box(painter: &egui::Painter, rect: egui::Rect, color: egui::Colo
 
 /// The width and per-cell resolution of the box being dragged, over its top
 /// edge.
-///
-/// The resolution is the whole reason to pick a region — the grid's cell count
-/// is fixed, so a tighter box spends the same cells over less ground — and it is
-/// invisible unless it is said. Shown *during* the drag rather than after, so
-/// the choice is made against the number rather than discovered once the
-/// rebuild lands.
 fn paint_region_hint(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -3332,36 +1824,12 @@ fn paint_region_hint(
 
 /// The hint's text for a drag standing at `half_width_km`, or `None` for a box
 /// that cannot be described.
-///
-/// **Through [`VolumeRegion`](crate::pane::VolumeRegion)**, so the figures shown
-/// are the ones that will be resampled: its constructor clamps the extent to the
-/// range `build_voxels` honours, and a hint reading 4 km over a box that would
-/// become 10 km is a hint that lies. `RegionDrag::extend_to` caps the drag at
-/// the same ceiling and `RegionDrag::commit` refuses below the floor, so today
-/// the three agree before this runs — but the hint's honesty is this routing,
-/// not those two, which is why the clamp is re-entered here rather than assumed.
-///
-/// The centre is the equator rather than the drag's own: nothing in the printed
-/// figures depends on where the box is, and asking for a real centre would make
-/// this refuse for a polar drag whose *size* is perfectly describable.
-///
-/// `cells` is this device's real grid width — [`Gui::volume_cells_across`],
-/// which is the same number the caption divides by. `None` before any grid has
-/// been built, and then the hint states the **box alone**: a km-per-cell out of
-/// a compile-time shape would be a confident figure about a device that may not
-/// have it, and the box size is the half of the hint that is knowable either
-/// way.
-///
-/// [`Gui::volume_cells_across`]: super::Gui::volume_cells_across
 fn region_hint_text(half_width_km: f64, cells: Option<usize>) -> Option<String> {
     let region = crate::pane::VolumeRegion::new(
         rustdar_geo::GeoPoint { lat: 0.0, lon: 0.0 },
         rustdar_radar::voxel::HalfExtentKm::square(half_width_km),
     )?;
     let across = 2.0 * region.half_east_km();
-    // A square box has one resolution, so the east lane is the whole answer
-    // rather than a chosen axis — which is why this prints one figure where the
-    // caption prints `axes()`.
     match cells.and_then(|cells| region.resolution_km(cells)) {
         Some((km, _)) => Some(format!("{across:.0} km - {km:.2} km/cell")),
         None => Some(format!("{across:.0} km")),
@@ -3377,23 +1845,6 @@ const ARMED_HINT_GAP: f32 = 4.0;
 
 /// Paint the armed-tool hint chip: a centred, non-interactive dashed-border
 /// chip naming the drag the armed mode is waiting for.
-///
-/// Painter only — no widget: the chip explains a gesture, and a widget here
-/// would both consume one of the pane's auto-ids and sit in the very spot
-/// the drag it describes starts in. The colours are the armed modes' own —
-/// the region drag's box yellow or [`SECTION_TRACK_COLOR`] — over the same
-/// translucent black the section track's halo uses, so the chip reads over
-/// any radar core without adding a colour the map does not already have.
-///
-/// On its own `Order::Background` sub-layer, clipped to the pane, so a
-/// pane's later drawing cannot cover it and it cannot leak into the pane
-/// next door. The "over the pane" half is deterministic, not hash luck:
-/// egui registers the background layer as an *area* every frame, and
-/// `GraphicLayers::drain` renders registered layers first within an order —
-/// a same-order layer nobody registered, like this one, drains in the
-/// safety-net pass after them. Hash order decides only *among* safety-net
-/// layers, and the per-pane ids here paint disjoint rects, so that order
-/// can never show.
 fn paint_armed_hint_chip(
     ctx: &egui::Context,
     pane_idx: usize,
@@ -3406,9 +1857,6 @@ fn paint_armed_hint_chip(
         egui::Id::new(("armed_hint_chip", pane_idx)),
     );
     let painter = ctx.layer_painter(layer).with_clip_rect(pane_rect);
-    // Wrapped to the pane, never clipped mid-word: a six-way split's pane is
-    // narrower than the region hint's one-line form, and a hint truncated to
-    // "box 20-460 km (d..." tells the user nothing (the second user test).
     let wrap_width = (pane_rect.width() - 2.0 * ARMED_HINT_PADDING.x - 2.0 * 16.0).max(40.0);
     let galley = painter.layout(
         text.to_owned(),
@@ -3418,7 +1866,6 @@ fn paint_armed_hint_chip(
     );
     let rect =
         egui::Rect::from_center_size(pane_rect.center(), galley.size() + 2.0 * ARMED_HINT_PADDING);
-    // The section-track halo's translucent black, as a fill.
     painter.rect_filled(
         rect,
         4.0,
@@ -3446,19 +1893,9 @@ fn paint_armed_hint_chip(
 }
 
 /// Segments a committed ground track is drawn with.
-///
-/// The chord error of a subdivided great circle falls as the square of the
-/// count, so 32 turns the 894 m peak measured in `draw_section_tracks` into
-/// under a metre — three orders of magnitude below the error it is correcting,
-/// and far under the ~230 m one screen pixel is worth at a zoom that fits a
-/// whole 230 km track in a 1000-point pane.
 const SECTION_TRACK_SAMPLES: usize = 32;
 
 /// The screen polyline of the great circle a section is cut along.
-///
-/// Split out from the painting for the same reason `tilt_curves` is: the
-/// geometry is the part that can be wrong, and a wrongness that only shows up as
-/// "the line looked slightly off" is one nothing can fail on.
 fn great_circle_track(
     line: crate::pane::SectionLine,
     project: impl Fn(rustdar_geo::GeoPoint) -> egui::Pos2,
@@ -3475,21 +1912,11 @@ fn great_circle_track(
 }
 
 /// Paint one section ground track: a polyline with a cap at each end.
-///
-/// Clipped to the pane rather than to the whole panel, so a track belonging to a
-/// map in one pane cannot be drawn across the pane beside it — the projector is
-/// per-pane and happily projects to coordinates outside its own map.
-///
-/// The end caps are what make the track readable as a *section* rather than as
-/// one more line on a busy map: they mark which end is the left-hand column of
-/// the picture, which is otherwise unguessable.
 fn paint_section_track(painter: &egui::Painter, points: &[egui::Pos2], pane_rect: egui::Rect) {
     let (Some(&from), Some(&to)) = (points.first(), points.last()) else {
         return;
     };
     let painter = painter.with_clip_rect(pane_rect);
-    // A dark halo under the line, so it reads over both a light basemap and a
-    // dark radar core without the line itself having to be thick.
     painter.add(egui::Shape::line(
         points.to_vec(),
         egui::Stroke::new(4.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140)),
@@ -3512,17 +1939,6 @@ fn paint_section_track(painter: &egui::Painter, points: &[egui::Pos2], pane_rect
 }
 
 /// Paint the two grab handles over a track's end caps.
-///
-/// A ring around the cap rather than a bigger cap: the ring reads as "this is
-/// a control" the way a plain dot never does, and it leaves the A/B labels and
-/// the cap [`paint_section_track`] drew exactly where they were. `active` is
-/// the grabbed end of an in-flight drag, drawn heavier so the user can see
-/// which end they are holding through a busy storm.
-///
-/// The ring's radius is **visual**, deliberately smaller than
-/// [`ENDPOINT_GRAB_RADIUS_PT`](crate::ui_section_edit::ENDPOINT_GRAB_RADIUS_PT):
-/// the hit target forgives half a finger of aim, and drawing the forgiveness
-/// would bury the map under two thumbprint-sized discs.
 fn paint_section_handles(
     painter: &egui::Painter,
     points: &[egui::Pos2],
@@ -3537,8 +1953,6 @@ fn paint_section_handles(
     for (pos, grab) in [(a, SectionGrab::A), (b, SectionGrab::B)] {
         let grabbed = active == Some(grab);
         let ring = if grabbed { 9.0 } else { 7.0 };
-        // The same halo-under-bright trick every line on this map uses, so the
-        // ring survives both a light basemap and a 70 dBZ core.
         painter.circle_stroke(
             pos,
             ring,
@@ -3554,15 +1968,6 @@ fn paint_section_handles(
 
 /// Draw a border around a pane rect, highlighted when active. Returns the
 /// painted stroke's bounds, for the M8 containment pin.
-///
-/// `StrokeKind::Inside`, deliberately: the pane rects tile the map content
-/// rect edge to edge since the full-bleed flip, so an outside stroke lay
-/// entirely in the neighbouring pane or beyond the content rect — clipped
-/// away on every outer edge, overpainted by later panes on the inner ones,
-/// which left the active highlight visible only where an adjacent pane's gap
-/// happened to show it (the first-run finding: the top-left pane showed no
-/// border at all). Inside the rect, every pane shows all four edges at every
-/// grid position, painted after the pane's own content so nothing covers it.
 fn draw_pane_border(ui: &mut egui::Ui, pane_rect: egui::Rect, is_active: bool) -> egui::Rect {
     let border_color = if is_active {
         egui::Color32::from_rgb(60, 140, 255)
@@ -3577,8 +1982,6 @@ fn draw_pane_border(ui: &mut egui::Ui, pane_rect: egui::Rect, is_active: bool) -
         egui::Stroke::new(stroke_width, border_color),
         kind,
     );
-    // The painted bounds follow from the kind the stroke was really drawn
-    // with, so the probe cannot claim containment the paint call breaks.
     match kind {
         egui::StrokeKind::Inside => pane_rect,
         egui::StrokeKind::Middle => pane_rect.expand(stroke_width / 2.0),
@@ -3588,13 +1991,6 @@ fn draw_pane_border(ui: &mut egui::Ui, pane_rect: egui::Rect, is_active: bool) -
 
 /// What a hover needs to know about where it is, in the world rather than on
 /// the glass.
-///
-/// It used to carry the pointer's screen position and the rectangle the raster
-/// was drawn into as well, so that the readout could divide one by the other
-/// and index a pixel. It reads a gate now, and a gate is found by where a point
-/// *is* — so those two fields went with the grid, and with them the class of
-/// bug where the readout picked its pixel out of a rectangle that had been
-/// computed from a different extent from the one the picture was drawn at.
 pub(super) struct HoverInput {
     pub site_lat: f64,
     pub site_lon: f64,
@@ -3604,38 +2000,9 @@ pub(super) struct HoverInput {
 
 /// What the readout says where the picture has numbers behind it that this
 /// process is not holding.
-///
-/// A loop frame keeps no values of its own — 5.03 MiB apiece against a loop of
-/// up to 36 — and reads them back out of the volume it was rendered from
-/// instead. That works for the six products the RDA puts on the wire and cannot
-/// work for the eleven computed from them, so a looping pane showing normalized
-/// rotation has a picture and no numbers.
-///
-/// **It says so rather than going blank.** A blank readout already means
-/// something — the radar looked here and found nothing — and letting a missing
-/// buffer wear that meaning shows the reader a hole in the weather that is
-/// really a hole in the application. This is the whole of
-/// [`rustdar_radar::hover::Reading::NotResident`]'s reason for existing as a
-/// third state.
 const NOT_RESIDENT: &str = "| no value held for this frame";
 
 /// Compute hover info string from the picture's own gates and site coordinates.
-///
-/// The radar-relative half of the readout comes from
-/// [`rustdar_geo::site_bearing_range_km`], the workspace's one spelling of "where is this
-/// point, from the radar" — it used to be a second copy of that haversine and
-/// forward azimuth inline here. Both spellings measure on
-/// [`rustdar_geo::EARTH_RADIUS_KM`], and
-/// `the_hover_readouts_polar_coordinates_are_bit_identical_to_the_deleted_copy`
-/// pins that the readout's digits did not move.
-///
-/// That same pair is now the *whole* input to the value half too. An azimuth
-/// and a ground range is exactly a polar lookup key, so
-/// [`rustdar_radar::hover::HoverSource::read`] takes it directly and answers
-/// with the gate `render_gate` painted the point from — the same gate the
-/// colour under the cursor came from, by construction rather than by agreement.
-/// `the_hover_readouts_digits_do_not_move` pins that this replaced a `side²`
-/// raster grid of the same numbers without moving one of them.
 pub(super) fn compute_hover_info_raw(
     hover: &HoverSource,
     input: &HoverInput,

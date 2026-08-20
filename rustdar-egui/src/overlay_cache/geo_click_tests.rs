@@ -44,9 +44,6 @@ fn a_point_in_a_polygons_hole_is_outside_the_feature() {
         !geo_point_in_feature(35.0, -95.0, &f),
         "the hole's centre was reported inside — interior rings are being ignored"
     );
-    // The counterweight, either side of the hole boundary: the ring
-    // between exterior and hole is still inside, so this cannot pass by
-    // rejecting the exterior wholesale.
     assert!(
         geo_point_in_feature(31.0, -95.0, &f),
         "the solid ring south of the hole"
@@ -74,34 +71,21 @@ fn a_hole_in_one_polygon_does_not_mask_another_polygon_of_the_feature() {
     );
 }
 
-// ── Renderer / hit-test agreement ────────────────────────────────────────
-
 /// The two halves of "is this point in this feature" — the pixels the
 /// rasterizer paints and the answer `geo_point_in_feature` gives — must agree.
-///
-/// They did not. `draw_feature` filled only `polygon.first()`, so every hole
-/// in this file's fixtures painted solid while the tests above called it
-/// empty: a donut you could see but not click. This walks a grid over the
-/// whole feature and fails on the first point where paint and hit test
-/// disagree, so neither side can drift without the other.
 #[test]
 fn every_painted_pixel_agrees_with_the_hit_test() {
-    // A donut with an island in its hole: exterior fill, hole, and a second
-    // polygon inside the hole, so the sampler crosses all three answers.
     let island = vec![square(34.0, 36.0, -96.0, -94.0)];
     let f = feature(vec![donut(), island]);
 
     const W: u32 = 400;
     const H: u32 = 400;
-    // Padded past the rings so nothing is decided by the texture edge.
     let bounds = GeoBounds {
         min_lat: 29.0,
         max_lat: 41.0,
         min_lon: -101.0,
         max_lon: -89.0,
     };
-    // Opaque fill, no stroke: a painted pixel is then unambiguous, and no
-    // outline can bleed a hole's rim into the count.
     let rendered = rustdar_overlays::render::rasterize::rasterize_spc_outlooks(
         &rustdar_overlays::render::rasterize::OutlooksInput {
             features: vec![OverlayFeature::new(
@@ -121,8 +105,6 @@ fn every_painted_pixel_agrees_with_the_hit_test() {
     )
     .rgba;
 
-    // The projection `MercatorBounds` applies, restated: lon is linear, lat is
-    // linear in Mercator Y, and the texture's y axis runs north to south.
     let merc_min = lat_rad_to_mercator_y(bounds.min_lat.to_radians());
     let merc_max = lat_rad_to_mercator_y(bounds.max_lat.to_radians());
     let project = |lat: f64, lon: f64| -> (f64, f64) {
@@ -132,10 +114,6 @@ fn every_painted_pixel_agrees_with_the_hit_test() {
         (x, y)
     };
 
-    // Anti-aliasing and the pixel grid make the answer genuinely ambiguous
-    // within a pixel or so of any ring, and the hit test's own boundary
-    // behaviour is documented as unspecified. Sample only where neither side
-    // has an excuse.
     let clearance_px = |lat: f64, lon: f64| -> f64 {
         let (px, py) = project(lat, lon);
         let mut best = f64::MAX;
@@ -176,8 +154,6 @@ fn every_painted_pixel_agrees_with_the_hit_test() {
                  rasterizer and the hit test disagree about the shape"
             );
             checked += 1;
-            // Inside the donut's hole but outside the island: the region the
-            // whole disagreement was about.
             if (33.0..37.0).contains(&lat)
                 && (-97.0..-93.0).contains(&lon)
                 && !((34.0..36.0).contains(&lat) && (-96.0..-94.0).contains(&lon))
@@ -202,29 +178,16 @@ fn every_painted_pixel_agrees_with_the_hit_test() {
     );
 }
 
-// ── The dateline ─────────────────────────────────────────────────────────
-//
-// `Projector::unproject` is linear in pixel x and folds nothing, so a click
-// east of the antimeridian arrives as e.g. 185 while the zone it lands in is
-// stored at -175. These pin the hit test to the same frame the rasterizer
-// draws in — a Pacific zone that draws but cannot be clicked is the failure.
-
 /// A click written past +180 lands in the zone stored just west of it.
 #[test]
 fn a_click_east_of_the_dateline_hits_a_zone_stored_west_of_it() {
-    // Atka and Adak's real extent, squared off: -175.30..-174.01.
     let f = feature(vec![vec![square(52.0, 52.5, -175.3, -174.0)]]);
 
-    // The same ground named the way an eastward pan names it: -174.5 + 360.
     assert!(
         geo_point_in_feature(52.2, 185.5, &f),
         "a click at 185.5 is 5.5 deg past the seam and inside a zone stored at -174.5"
     );
-    // And the control: the unshifted spelling still works, so this did not
-    // trade one frame for the other.
     assert!(geo_point_in_feature(52.2, -174.5, &f));
-    // Non-triviality: a click that is genuinely outside stays outside in both
-    // spellings, so the shift is not simply reporting "inside" for everything.
     assert!(!geo_point_in_feature(52.2, 170.0, &f));
     assert!(!geo_point_in_feature(52.2, -160.0, &f));
     assert!(
@@ -236,7 +199,6 @@ fn a_click_east_of_the_dateline_hits_a_zone_stored_west_of_it() {
 /// The mirror: a click written below -180 lands in a zone stored east of it.
 #[test]
 fn a_click_west_of_the_dateline_hits_a_zone_stored_east_of_it() {
-    // Shemya and Attu's real extent, squared off: 178.62..179.46.
     let f = feature(vec![vec![square(51.3, 51.7, 178.62, 179.46)]]);
 
     assert!(
@@ -248,24 +210,17 @@ fn a_click_west_of_the_dateline_hits_a_zone_stored_east_of_it() {
 }
 
 /// A hole keeps cutting its ring after the shift.
-///
-/// The point is moved once, from the exterior's frame, and the holes are
-/// tested against that same moved point. Shifting each ring to its own frame
-/// instead would let a click fall inside an exterior and outside the hole that
-/// cuts it, opening a popup over a gap.
 #[test]
 fn a_hole_still_cuts_its_ring_when_the_click_is_shifted() {
     let f = feature(vec![vec![
         square(52.0, 53.0, -176.0, -174.0),
         square(52.3, 52.7, -175.4, -174.6),
     ]]);
-    // Inside the exterior, inside the hole: outside the feature, both spellings.
     assert!(!geo_point_in_feature(52.5, -175.0, &f));
     assert!(
         !geo_point_in_feature(52.5, 185.0, &f),
         "the hole must survive the shift"
     );
-    // Inside the exterior, outside the hole: inside the feature, both spellings.
     assert!(geo_point_in_feature(52.1, -175.0, &f));
     assert!(geo_point_in_feature(52.1, 185.0, &f));
 }

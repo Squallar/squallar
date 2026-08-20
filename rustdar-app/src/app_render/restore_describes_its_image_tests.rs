@@ -28,8 +28,6 @@ fn a_restored_image_still_says_what_it_depicts() {
                  so; `stale_image_on_screen` reads this metadata and nothing else",
         );
     }
-    // The values come from the *cached render*, not from the pane's live
-    // selection — which is the whole distinction the notice rests on.
     for source in [
         "let product = cached.product;",
         "let elevation = cached.elevation;",

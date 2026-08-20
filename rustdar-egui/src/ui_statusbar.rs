@@ -1,31 +1,5 @@
-//! The floating status bar: one surface spanning the map's bottom inset, on
-//! the two wide widths.
-//!
-//! The docked `Panel::bottom` went with the full-bleed flip — the map now
-//! reaches the bottom of the content rect and this bar floats over it, an
-//! `egui::Area` under one constant id on both widths that draw it. Compact
-//! draws no status bar at all (plan §1.6): the phone top bar carries the
-//! short scan summary and the hover readout and shares the collapse state,
-//! and the bottom edge belongs to the timeline and the bottom bar. The
-//! content here is the docked bar's, moved whole: refresh, the auto-poll
-//! state, the scan summary, the data age, the hover readout and the
-//! right-aligned error. Two things changed with the float:
-//!
-//! * A `⏴` collapse button leads the row. Collapsed, the bar shrinks to just
-//!   a `⏵` restore button, left-anchored, so the map's bottom edge is clear.
-//! * The auto-poll **checkbox** became a display **chip**. A floating bar
-//!   reads more than it is worked, and the toggle itself still lives where
-//!   every other toggle lives — the ☰ menu's Auto-poll entry — so nothing
-//!   became unreachable; the chip gained a `⏸ Auto-poll off` state to keep
-//!   the off position readable now that no checkbox shows it.
-//!
-//! # Ids do not depend on the breakpoint
-//!
-//! The same discipline as everywhere else in the chrome (see `ui_shell.rs`):
-//! one area id at every width, `roomy` gating only which *form* of the text
-//! draws, and the error slot pinned to the row's right edge under an explicit
-//! [`egui::UiBuilder::id`] — the full reasoning for that device is on the
-//! scope itself.
+//! The floating status bar: one surface spanning the map's bottom inset, on the two
+//! wide widths.
 
 use crate::actions::GuiAction;
 use crate::ui_layout::{PointerModality, WidthClass};
@@ -38,54 +12,28 @@ use super::{PaneState, fade};
 const BAR_INSET: f32 = 8.0;
 
 /// The collapse button's glyph: the bar shrinks leftward to just a button.
-/// `⏴`/`⏵` rather than the demo's `◧`, which egui's bundled fonts do not
-/// carry (see `ui_glyphs.rs`). `pub(super)` because the phone top bar shares
-/// both the state and the button that flips it (contract 75).
 pub(super) const COLLAPSE_LABEL: &str = "\u{23f4}";
 /// The restore button's glyph — the collapse's mirror, on the same terms.
 pub(super) const RESTORE_LABEL: &str = "\u{23f5}";
 
 impl super::Gui {
-    /// The status bar along the bottom, floating over the map — on the two
-    /// wide widths only. The phone shell has no status bar (plan §1.6): the
-    /// short scan summary lives in the phone top bar, which also hosts the
-    /// hover readout and shares the collapse state, and errors get their own
-    /// toast (`ui_sheet.rs`).
-    ///
-    /// The hover readout keys on the *modality*. There is no hover without a
-    /// pointing device, so a touchscreen has nothing to show however wide it
-    /// is, and a narrow desktop window has a mouse and should keep it — in
-    /// the top bar, since this bar is not there (contract 25's adaptation).
+    /// The status bar along the bottom, floating over the map — on the two wide
+    /// widths only.
     pub(super) fn render_status_bar(
         &mut self,
         ctx: &egui::Context,
         map_rect: egui::Rect,
         actions: &mut Vec<GuiAction>,
     ) {
-        // Written for the absences below too: the collapsed time chip anchors
-        // above this rect (`ui_timeline.rs`), and a stale rect from a wider
-        // or unfaded frame would hold the chip up over open map.
         self.statusbar_rect = None;
-        // Same discipline, for the same kind of reason: a tick left behind by
-        // a frame that drew the countdown would keep an app with no status bar
-        // on screen repainting once a second forever
-        // (`Gui::status_tick_delay`). Set again below only where the chip
-        // really draws a number that moves.
         self.status_bar_tick = None;
         if self.layout.width == WidthClass::Compact {
-            // The probe is written even for the absence: a stale report from
-            // a wider frame would claim a bar that is not on screen.
             #[cfg(test)]
             {
                 self.probes.last_status_bar = super::StatusBarProbe::default();
             }
             return;
         }
-        // The fade (§1.8): a fully faded bar does not render at all — that
-        // absence is what makes it input-transparent — and a transitioning
-        // one draws dimmed and dead (`fade::dim`). The error display inside
-        // it goes with it; while fully faded the toast presentation carries
-        // the error instead (see `Gui::ui`).
         let Some(fade) = self.chrome_fade() else {
             #[cfg(test)]
             {
@@ -93,19 +41,11 @@ impl super::Gui {
             }
             return;
         };
-        // The collapse animates as a cross-form fade (§3.3): the full row
-        // dims out over the restore button rather than vanishing between two
-        // frames. Zero-time under test — see `ui_fade::anim_time`.
         let expanded_factor = ctx.animate_bool_with_time(
             egui::Id::new("statusbar_expanded"),
             !self.statusbar_collapsed,
             super::fade::anim_time(),
         );
-        // The restore chip's incoming half — the timeline's two-factor shape,
-        // run in sequence rather than in parallel because one frame hosts
-        // both forms here: seeded at zero while the full row (or its remnant)
-        // is up, so the chip fades in from the frame the remnant clears
-        // instead of popping. Instant under test, like every factor.
         let restore_factor = ctx.animate_bool_with_time(
             egui::Id::new("statusbar_restore"),
             expanded_factor <= 0.0,
@@ -131,10 +71,6 @@ impl super::Gui {
                 frame.show(ui, |ui| {
                     fade::dim(ui, fade);
                     if expanded_factor <= 0.0 {
-                        // The restore button alone, left-anchored: the whole
-                        // point of collapsing is that the rest of the bottom
-                        // edge is map. Dimmed (and dead) while its own fade-in
-                        // is still in flight.
                         fade::dim(ui, restore_factor);
                         let restore = ui
                             .button(RESTORE_LABEL)
@@ -149,8 +85,6 @@ impl super::Gui {
                         return;
                     }
                     if self.statusbar_collapsed {
-                        // The closing remnant: the full row, dimming out and
-                        // already dead — the collapse has happened in state.
                         fade::dim(ui, expanded_factor.min(0.99));
                     }
 
@@ -178,8 +112,6 @@ impl super::Gui {
                             probe.refresh = refresh_button.rect;
                         }
                         if refresh_button.clicked() {
-                            // The active pane's site, not `radar.config`'s global
-                            // one — see `active_pane_fetch_config`.
                             actions
                                 .push(GuiAction::FetchRadarScan(self.active_pane_fetch_config()));
                         }
@@ -216,10 +148,6 @@ impl super::Gui {
                         #[cfg(not(test))]
                         let _ = scan_text;
 
-                        // How old what is on screen is, for every product alike.
-                        // The scan summary above answers a different question —
-                        // which volume is loaded — and for a product fetched from
-                        // the Level III bucket it can be a day out.
                         let age_text = render_product_age(
                             ui,
                             self.panes.get(self.active_pane),
@@ -241,29 +169,6 @@ impl super::Gui {
                             }
                         }
 
-                        // Flexible space pushes the error to the right — but only
-                        // when there is an error to push.
-                        //
-                        // Allocated unconditionally this scope is empty most of the
-                        // time, and an empty child `Ui` is a zero-area widget rect
-                        // pinned to the row's right edge: a rect that never moves,
-                        // under an id that does. `Ui::new_child` folds the parent's
-                        // auto-id counter into every child scope's registered id —
-                        // `id_salt` stabilises only the state id, not that one — so
-                        // the auto-poll block above (three widgets mid-fetch, one
-                        // otherwise) re-keyed this slot on the frame a scan landed,
-                        // which egui reports as `changed id between passes`.
-                        //
-                        // Skipping the allocation fixes the *empty* case only. When
-                        // there really is an error the same slot is still welded to
-                        // the right edge while everything to its left comes and
-                        // goes — the auto-poll block, and now the Level III age —
-                        // so its rect stays put while its id moves, and its three
-                        // widgets go with it (their auto-ids run off this scope's
-                        // `unique_id`). `UiBuilder::id` is the one form that takes
-                        // `IdSource::Explicit`, which makes `unique_id ==
-                        // stable_id` and takes the parent's counter out of it
-                        // entirely. Salting cannot do this.
                         if self.radar.error_message.is_some() {
                             ui.scope_builder(
                                 egui::UiBuilder::new()
@@ -278,10 +183,6 @@ impl super::Gui {
                 });
             });
 
-        // The bar's real rect this frame, for the collapsed time chip to
-        // anchor above when it would otherwise land on it (`ui_timeline.rs`
-        // — the chip must never overlay this bar). The chip draws later the
-        // same frame, so the rect is current.
         self.statusbar_rect = Some(area.response.rect);
 
         #[cfg(test)]
@@ -296,10 +197,6 @@ impl super::Gui {
 }
 
 /// How stale a tilt is, in words a status bar has room for.
-///
-/// Seconds while the number is small enough to mean "just now", then minutes —
-/// which is also where the archive path permanently lives, so the two transports
-/// read on the same scale.
 fn describe_age(secs: u64) -> String {
     match secs {
         0..=9 => "just now".to_owned(),
@@ -309,16 +206,6 @@ fn describe_age(secs: u64) -> String {
 }
 
 /// How often [`describe_age`] would print something new at this age.
-///
-/// The unit it is about to switch to, in other words — a second while it
-/// counts seconds, a minute once it counts minutes. The event loop sleeps on
-/// this (`Gui::status_tick_delay`), so getting it wrong either freezes the
-/// readout or repaints sixty times per number.
-///
-/// "just now" covers the first ten seconds and does not change within them,
-/// but it is asked for a second anyway: the phase of the underlying clock is
-/// not knowable from a whole-second age, so nine repaints once per tilt is the
-/// price of never being a second late with the first real number.
 fn age_tick(secs: u64) -> std::time::Duration {
     if secs < 90 {
         std::time::Duration::from_secs(1)
@@ -328,30 +215,7 @@ fn age_tick(secs: u64) -> std::time::Duration {
 }
 
 /// The auto-poll chip: what the polling machinery is doing, in one glanceable
-/// state. Returns the chip's rect, its text, and how long until that text
-/// would read differently — while a fetch is running there is a spinner
-/// instead and nothing is returned at all.
-///
-/// That third value is what makes the chip the status bar's one moving part
-/// with no input behind it, and so the one thing that can oblige an idle app
-/// to draw again — see
-/// [`Gui::status_tick_delay`](super::Gui::status_tick_delay). It is decided
-/// here, beside the string it describes, because only this function knows
-/// which of the four labels below it wrote: an archive countdown ticking
-/// towards a poll, a tilt age climbing away from one, or a fixed phrase that
-/// will read the same in an hour.
-///
-/// A display chip rather than the checkbox it used to be: the toggle lives in
-/// the ☰ menu (`Auto-poll`), beside every other toggle, and a floating bar is
-/// read far more than it is clicked. The `⏸` state exists because the off
-/// position used to be readable off the checkbox itself and must stay
-/// readable off the chip.
-///
-/// The live states are three-valued because the two transports differ by two
-/// orders of magnitude in latency and the user cannot otherwise tell which one
-/// they are on. A feed that has silently retired takes a site from seconds
-/// behind the radar to minutes behind it, which is exactly the kind of
-/// downgrade a severe weather display should say out loud rather than absorb.
+/// state.
 fn render_auto_poll_status(
     ui: &mut egui::Ui,
     fetching: bool,
@@ -365,10 +229,6 @@ fn render_auto_poll_status(
         return None;
     }
 
-    // The tick travels with the string. `countdown_tick_delay` is the archive
-    // fragment's own — phase-locked to the poll timer, and `None` once the
-    // count has bottomed out at zero and stopped moving — and each branch
-    // below either takes that fragment or replaces the tick with its own.
     let (archive, archive_tick) = match auto_poll.time_until_next() {
         Some(remaining) if auto_poll.enabled => (
             format!("archive {remaining}s"),
@@ -379,18 +239,8 @@ fn render_auto_poll_status(
     let mut tick = archive_tick;
 
     let label = if chunks.feeding {
-        // About the tilt on screen, not the feed's progress through the volume.
-        // A cut count answers the wrong question — a volume can be nearly
-        // assembled while the user's own tilt is still minutes old — and it is
-        // operator jargon besides. The archive countdown is left out because
-        // that poll is suppressed while a feed runs, so showing it would be a
-        // countdown to something that will not fire. `⏺` is the timeline's own
-        // live glyph (the demo's `⚡` has no glyph in the bundled fonts), and
-        // the retired state leads with a plain `!` on the same grounds.
         match chunks.tilt {
             Some(tilt) => {
-                // The archive countdown is gone from this label, and the age
-                // that replaced it moves on its own clock.
                 tick = Some(age_tick(tilt.data_age_secs));
                 format!(
                     "\u{23fa} Live - {:.1}\u{b0} {}",
@@ -435,9 +285,8 @@ fn render_auto_poll_status(
     Some((response.rect, label, tick))
 }
 
-/// The scan summary — the long form: this bar only exists on the widths with
-/// room for it, and the phone top bar's chip is the short form's successor.
-/// Returns the text it drew.
+/// The scan summary — the long form: this bar only exists on the widths with room
+/// for it, and the phone top bar's chip is the short form's successor.
 fn render_scan_info(
     ui: &mut egui::Ui,
     scan_info: Option<&ScanInfo>,
@@ -459,15 +308,6 @@ fn render_scan_info(
 }
 
 /// How old the data behind a pane's image is, in words.
-///
-/// Whole minutes below an hour and `Nh Mm` above it — a volume takes four to
-/// six minutes, so minutes are the unit that tells "this volume" from "the one
-/// before", and hours are the unit that tells a live field from the previous
-/// UTC day's that `level3::latest_key` falls back to.
-///
-/// A time in the future is not clamped to zero: `ProductStamp::age` deliberately
-/// keeps the sign so "impossible" stays distinguishable from "fresh", and a bar
-/// that rounded it away would report a clock skew as current data.
 pub(super) fn format_product_age(age: chrono::Duration) -> String {
     if age < chrono::Duration::zero() {
         return "stamped ahead".to_owned();
@@ -481,23 +321,7 @@ pub(super) fn format_product_age(age: chrono::Duration) -> String {
 }
 
 /// The data line: when the data behind the pane's radar image was collected, and
-/// how long ago that was. Returns the text it drew, or `None` when there was
-/// nothing to draw.
-///
-/// **One line for every product.** It used to say `Level III:` and appear only for
-/// a product fetched from the bucket, which made the datasource a thing the user
-/// could read off the bar — and made its *absence* informative too, since a
-/// Level II pane silently had no age at all. The age itself is worth keeping: a
-/// site down since yesterday paints a field up to ~48 h old, and the scan summary
-/// beside this describes the Level II volume, so it looks perfectly current.
-///
-/// Under an active loop this reports the playing frame's own time rather than
-/// being suppressed — see [`PaneState::data_time_on_screen`].
-///
-/// The scan summary's time and this one coincide for a product read off the
-/// volume, and that redundancy is deliberate: the two answer different questions
-/// (which volume is loaded, versus how old what you are looking at is), and making
-/// the second conditional on the first disagreeing is what produced the tell.
+/// how long ago that was.
 fn render_product_age(
     ui: &mut egui::Ui,
     pane: Option<&PaneState>,
@@ -517,13 +341,6 @@ fn render_product_age(
 }
 
 /// The pointer readout: the first pane with a hover value.
-///
-/// Handed `Gui::panes()` — the visible slice — never the raw vector. A hidden
-/// pane is not rendered, so nothing ever clears its `hover_value` again, and
-/// scanning the full vector would surface that stale readout forever.
-///
-/// `pub(super)` because the phone top bar hosts the same readout on Compact
-/// (contract 25: the readout follows the modality, not the width).
 pub(super) fn render_hover_info(ui: &mut egui::Ui, panes: &[PaneState]) {
     let hover_info = panes.iter().find_map(|p| p.hover_value.as_ref());
     let overlay_hover = panes.iter().find_map(|p| p.overlay_hover_value.as_ref());
@@ -540,9 +357,8 @@ pub(super) fn render_hover_info(ui: &mut egui::Ui, panes: &[PaneState]) {
     }
 }
 
-/// `pub(super)` because the phone shell's error toast (`ui_sheet.rs`) hosts
-/// the same dismissable body — the phone has no status bar row to carry it.
-/// Returns the ×'s rect while an error is up, for the toast's probe.
+/// `pub(super)` because the phone shell's error toast (`ui_sheet.rs`) hosts the
+/// same dismissable body — the phone has no status bar row to carry it.
 pub(super) fn render_error_display(
     ui: &mut egui::Ui,
     error_message: &mut Option<String>,
@@ -568,8 +384,6 @@ mod age_format {
     use super::format_product_age;
     use chrono::Duration;
 
-    // The negative branch is only reachable through a clock skew, so no UI test
-    // arrives at it. Without this, "-5 min old" renders and reads as fresh.
     #[test]
     fn a_stamp_from_the_future_is_not_reported_as_an_age() {
         assert_eq!(format_product_age(Duration::minutes(-5)), "stamped ahead");
@@ -589,9 +403,8 @@ mod age_format {
 mod age_wording_tests {
     use super::describe_age;
 
-    /// Very fresh data reads as "just now" rather than as a jittering
-    /// single-digit counter — the poll is every 5s, so the number would never
-    /// settle.
+    /// Very fresh data reads as "just now" rather than as a jittering single-digit
+    /// counter — the poll is every 5s, so the number would never settle.
     #[test]
     fn seconds_old_data_reads_as_just_now() {
         assert_eq!(describe_age(0), "just now");
@@ -599,17 +412,17 @@ mod age_wording_tests {
         assert_eq!(describe_age(9), "just now");
     }
 
-    /// Through the middle range the exact second is useful: it is how a user
-    /// sees the beam coming back round.
+    /// Through the middle range the exact second is useful: it is how a user sees
+    /// the beam coming back round.
     #[test]
     fn the_middle_range_reads_in_seconds() {
         assert_eq!(describe_age(10), "10s old");
         assert_eq!(describe_age(89), "89s old");
     }
 
-    /// Past ninety seconds it switches to minutes, which is the scale the
-    /// archive path permanently lives on — so the two transports read on one
-    /// scale and the difference between them is obvious.
+    /// Past ninety seconds it switches to minutes, which is the scale the archive
+    /// path permanently lives on — so the two transports read on one scale and the
+    /// difference between them is obvious.
     #[test]
     fn older_data_reads_in_rounded_minutes() {
         assert_eq!(describe_age(90), "2m old");

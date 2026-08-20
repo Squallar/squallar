@@ -1,39 +1,17 @@
 //! What the event loop is allowed to sleep through.
-//!
-//! The bug these exist for: the frontend used to re-arm an unconditional
-//! redraw at the end of every frame while `is_auto_poll_active()` answered
-//! yes, and that answer was `enabled && initial_fetch_done` — true from frame
-//! one of the default configuration and never false again. So the app drew at
-//! the display's refresh rate, forever, with no user input and nothing in
-//! flight, to service a poll that fires once a minute.
-//!
-//! Every test here is about the replacement being a *duration*, and about that
-//! duration being long. The two failure directions are opposite and both
-//! serious: too short is the busy loop back again, and too long is a poll that
-//! never fires or a countdown that freezes on screen.
 
 use super::*;
 
-/// A whole second's worth of tolerance for the tests that name a deadline.
-/// These read the real clock — `AutoPollState` is written against
-/// `web_time::Instant` and has no injectable now — so the assertions are
-/// bounds rather than equalities.
+/// A whole second's tolerance: these read the real clock, so the assertions
+/// are bounds rather than equalities.
 const SLACK: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// A poller that last fetched `ago` ago, as a frame that polled would leave
-/// it.
 fn polled(gui: &mut Gui, ago: std::time::Duration) {
     gui.auto_poll.last_fetch_time = Some(web_time::Instant::now() - ago);
 }
 
-/// The default poll interval `AutoPollState::on_success` resets to.
 const INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Every layer off, so the radar poll is the only term left in the answer.
-///
-/// A fresh `Gui` opens with layers that refresh on timers of their own, and
-/// one that has never been fetched is due *now* — a true answer, and the one
-/// the overlay test below is about, but not the one these are.
 fn only_the_radar_poll(gui: &mut Gui) {
     for kind in crate::sources::default_draw_order() {
         gui.pane_mut(0)
@@ -63,10 +41,6 @@ fn an_idle_poller_sleeps_out_the_rest_of_its_interval() {
 
 /// The scheduling half and the firing half must agree, or a wake is spent on
 /// a frame that polls nothing — which is the busy loop with extra steps.
-///
-/// Checked either side of the boundary rather than at one point, because the
-/// two are written in different units: `should_poll` compares whole seconds
-/// and this compares durations.
 #[test]
 fn the_wake_lands_exactly_when_the_poll_would_fire() {
     for (ago, due) in [
@@ -96,11 +70,6 @@ fn the_wake_lands_exactly_when_the_poll_would_fire() {
 
 /// A poll that cannot fire must not be scheduled for, however overdue its
 /// timer reads.
-///
-/// `time_until_next` saturates at zero, so a pane taken off live leaves the
-/// timer permanently expired. Scheduling on it would be a zero-length sleep
-/// re-armed on every iteration — the worst version of the bug, not a fix for
-/// it.
 #[test]
 fn a_poll_no_pane_can_use_is_not_scheduled_for() {
     let mut gui = Gui::new();
@@ -140,8 +109,7 @@ fn auto_poll_switched_off_asks_for_nothing() {
 }
 
 /// A fetch in flight suppresses the poll (`check_auto_polls` refuses while
-/// `radar.fetching`), so it must suppress the wake too. What ends the wait is
-/// the fetch landing, and that asks for its own frame.
+/// `radar.fetching`), so it must suppress the wake too.
 #[test]
 fn a_fetch_in_flight_yields_the_wake_to_whatever_ends_it() {
     let mut gui = Gui::new();
@@ -163,9 +131,6 @@ fn an_overlay_is_scheduled_for_only_while_a_pane_can_draw_it() {
         .auto_poll_interval(&kind)
         .expect("NWS alerts auto-poll; this test needs a layer that does");
 
-    // Nothing enables it, so nothing is owed — the old predicate answered
-    // "yes, forever" for any layer with an interval, whether or not one was
-    // on screen.
     gui.pane_mut(0)
         .unwrap()
         .enabled_overlays
@@ -182,8 +147,6 @@ fn an_overlay_is_scheduled_for_only_while_a_pane_can_draw_it() {
         "a layer that has never been fetched is due now"
     );
 
-    // Fed through the production ingest path rather than a test setter, so
-    // the timer this reads is the one a real fetch would leave behind.
     gui.overlays.apply_fetch_result(
         rustdar_overlays::render::overlay_state::OverlayFetchResult {
             kind: kind.clone(),
@@ -231,9 +194,8 @@ fn the_countdown_wake_lands_on_the_second_the_number_moves() {
 }
 
 /// …and stops asking once the number has stopped moving. `time_until_next`
-/// saturates at zero, so a poll that cannot fire leaves `archive 0s` on
-/// screen: a string that will read the same forever, which is exactly what
-/// must not be repainted once a second for the life of the process.
+/// saturates at zero, so a poll that cannot fire leaves a string that would
+/// otherwise be repainted once a second for ever.
 #[test]
 fn a_countdown_that_has_bottomed_out_asks_for_no_more_frames() {
     let mut gui = Gui::new();
@@ -248,9 +210,7 @@ fn a_countdown_that_has_bottomed_out_asks_for_no_more_frames() {
 }
 
 /// The tick is never zero, whatever the phase of the clock. A zero-length
-/// sleep re-armed every iteration is the spin this whole path exists to
-/// avoid, and this term is the one the caller's floor deliberately does not
-/// cover.
+/// sleep re-armed every iteration is the spin this path exists to avoid.
 #[test]
 fn the_countdown_tick_is_never_a_zero_length_sleep() {
     for millis in [0, 1, 999, 1_000, 1_001, 30_000, 59_999] {
@@ -268,8 +228,7 @@ fn the_countdown_tick_is_never_a_zero_length_sleep() {
 }
 
 /// A status bar nobody is looking at costs nothing. The tick is what the bar
-/// itself recorded while drawing, so an app that has drawn no bar — a phone
-/// shell, a faded-out chrome, a collapsed bar — is owed no frame for it.
+/// itself recorded while drawing, so an app that has drawn no bar is owed none.
 #[test]
 fn a_status_bar_that_never_drew_asks_for_no_frames() {
     let mut gui = Gui::new();

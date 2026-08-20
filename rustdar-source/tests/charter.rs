@@ -1,17 +1,10 @@
 //! The crate's charter, held as tests: a dependency ceiling and the graph
 //! shape it exists to create.
 //!
-//! Both read `cargo metadata --no-deps --format-version 1` from the workspace
-//! root. `packages[].dependencies` there are *declared* dependencies —
-//! feature-independent and resolution-independent — so no feature selection
-//! (default, `--all-features`, CI's llvm-cov arm) can mask or fake what these
-//! assert. Dep-name mechanics, recorded at M0 and relied on here: a
-//! workspace-internal dep appears with `"req": "*"` and a `path`; `kind` is
-//! `null` for normal deps (normalised to "normal" below); one name may
-//! legitimately appear once per kind (tokio is normal *and* dev for some
-//! members), so entries are judged per `(kind, name)`. Assertions key on
-//! dependency *names*, never on feature emptiness — a later feature on either
-//! crate must not disturb them.
+//! Both read `cargo metadata --no-deps --format-version 1`, whose
+//! `packages[].dependencies` are *declared* dependencies, so no feature
+//! selection can mask what these assert. One name may appear once per kind,
+//! so entries are judged per `(kind, name)`.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeSet;
@@ -41,8 +34,7 @@ fn metadata() -> serde_json::Value {
 }
 
 /// `(kind, name)` for every dependency `package` declares. `kind: null` is a
-/// normal dependency; target-gated entries carry their kind like any other and
-/// are included — a gated dependency is still a dependency.
+/// normal dependency; target-gated entries are included.
 fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, String)> {
     let packages = meta["packages"]
         .as_array()
@@ -69,37 +61,11 @@ fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, S
 /// The substrate stays a substrate: its dependency set may not grow past the
 /// charter. `[dependencies]` ⊆ {rustdar-geo, rustdar-units, chrono, serde,
 /// serde_json, web-time, reqwest, rustls, log}; dev additionally {tokio}; no
-/// build deps.
+/// build deps. `serde_json` is a normal dependency, the `SourceHandler`
+/// config-persistence hooks being typed on `serde_json::Value`.
 ///
-/// `rustdar-geo` entered the ceiling at WO-G1 (the Phase 2G rustdar-geo
-/// insertion, campaign plan amendment of 2026-08-18) — the written amendment
-/// the failure message below demands: the horizontal geodesy this crate's
-/// `geo` module used to define moved down to the workspace's geometry floor,
-/// and the module re-exports it wholesale so every path above keeps
-/// resolving.
-///
-/// **`serde_json` crossed from `dev` to `normal` at WO-M9**, and this
-/// paragraph is that step's written amendment. The `SourceHandler` trait moved
-/// into this crate with its four config-persistence hooks
-/// (`serialize_state`/`deserialize_state`/`serialize_pane_state`/
-/// `deserialize_pane_state`), every one of them typed on `serde_json::Value`
-/// — the shape a layer's saved state has taken in every user's config file
-/// since long before this crate existed. It is vocabulary the contract is
-/// *made of*, not machinery the contract reaches for, which is the line this
-/// ceiling draws; and the package was already declared here, as the dev
-/// dependency `cargo metadata` parsing above uses. The three other names the
-/// move needed — `rustdar-units`, `web-time`, `serde` — were already on the
-/// ceiling and required no amendment. **No third-party package new to this
-/// crate entered the graph at WO-M9.**
-///
-/// `serde_json` stays out of `DEV_EXTRA` on purpose: it is now a normal
-/// dependency, so `NORMAL_CEILING` already permits it for both kinds and a
-/// second entry would be a second place to keep in step.
-///
-/// A ⊆ ceiling and not equality on purpose: the charter *allows* the unlisted
-/// members (serde arrives with later steps) without requiring them. The floor
-/// assertion at the bottom is what keeps this test falsifiable — an empty
-/// parse cannot pass it.
+/// ⊆ and not equality on purpose. The floor assertion at the bottom is what
+/// keeps this test falsifiable — an empty parse cannot pass it.
 #[test]
 fn the_dependency_ceiling_holds() {
     const NORMAL_CEILING: &[&str] = &[
@@ -136,8 +102,7 @@ fn the_dependency_ceiling_holds() {
         );
     }
 
-    // Falsifiability floor: the crate really declares dependencies, so a
-    // broken parse or a renamed package cannot pass as an empty set.
+    // Falsifiability floor: the crate really declares dependencies.
     assert!(
         deps.iter().any(|(k, n)| k == "normal" && n == "reqwest"),
         "rustdar-source no longer declares reqwest — either the crate changed \
@@ -145,12 +110,8 @@ fn the_dependency_ceiling_holds() {
     );
 }
 
-/// The edge WO-M3 cut stays cut: rustdar-overlays declares NO dependency on
-/// rustdar-radar, of any kind, while both crates stand on rustdar-source.
-///
-/// The second half is the presence control that keeps the first falsifiable:
-/// a test that only asserted absence would pass just as green against a
-/// renamed package or a broken parse.
+/// rustdar-overlays declares NO dependency on rustdar-radar, of any kind. The
+/// second half is the presence control that keeps the first falsifiable.
 #[test]
 fn the_overlays_to_radar_edge_stays_cut() {
     let meta = metadata();

@@ -1,46 +1,23 @@
-//! The frame pump: the one table that orders how a frame drains, applies,
-//! advances and dispatches its background results (WO-E3).
-//!
-//! The order used to live in two hand-ordered call lists — the body of
-//! `poll_data_channels` and the middle of `setup_egui_frame` — where nothing
-//! held the two halves to the `ChannelHub` they drain. The table is now
-//! where the order lives, so the arguments for the order live here too, row
-//! by row, and the tests in `frame_pump/tests.rs` hold it to the hub:
-//! every receiver field is drained by exactly one row, and the hub's
-//! channel list only ever shrinks.
-//!
-//! Why `Ingest` exists beside the planned `Apply|Advance|Dispatch` set
-//! (deviation stated, orchestrator-accepted — the plan's seam ruling 1):
-//! the plan pinned three phases AND required all 18 receivers in exactly
-//! one row, but four receivers (scan, chunk, voxel, overlay_fetch) drain at
-//! `poll_data_channels`' earlier position in `handle_redraw`, with
-//! side-effectful steps between the two moments (`evict_unshown_scans`,
-//! `offload::drain_deferred_drops`, `autosave_config`, and the minimized /
-//! zero-area early returns). Moving them would change drain timing, which
-//! is forbidden; omitting them breaks 18-receiver exhaustiveness. `Ingest`
-//! is the minimal resolution: one table, both run moments, order inside
-//! each preserved exactly.
+//! The frame pump: the one table that orders how a frame drains, applies, advances and
+//! dispatches its background results (WO-E3).
 
 use super::App;
 
 /// When in the frame a `FRAME_PUMP` row runs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum PumpPhase {
-    /// Runs at `poll_data_channels`' position in `handle_redraw`, BEFORE
-    /// the renderer-state early-return — must not need a context. A
-    /// minimized or still-sizing window still drains, so a chunk feed keeps
-    /// moving during window creation.
+    /// Runs at `poll_data_channels`' position in `handle_redraw`, BEFORE the renderer-state
+    /// early-return — must not need a context.
     Ingest,
-    /// Results-apply. Inside `setup_egui_frame`, before playback advance.
+    /// Results-apply.
     Apply,
-    /// Playback advance. After every result of the frame is applied.
+    /// Playback advance.
     Advance,
-    /// Dispatch. After advance, so the budget dispatchers measure is real.
+    /// Dispatch.
     Dispatch,
 }
 
-/// One row of the pump: a named step, the phase it runs in, and the
-/// receivers it owns.
+/// One row of the pump: a named step, the phase it runs in, and the receivers it owns.
 pub(super) struct DrainEntry {
     /// The `App` method this row runs, by name — what the order pin in
     /// `frame_pump/tests.rs` reads.
@@ -48,25 +25,16 @@ pub(super) struct DrainEntry {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) name: &'static str,
     pub(super) phase: PumpPhase,
-    /// ChannelHub receiver FIELD NAMES this row drains — the exhaustiveness
-    /// inventory. Empty for order-riding non-drains (drive_chunk_feeds,
-    /// publish_base_volumes).
+    /// ChannelHub receiver FIELD NAMES this row drains — the exhaustiveness inventory.
     // Read by the pump tests only; production walks `phase` and `run`.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) drains: &'static [&'static str],
-    /// ctx is Some only for phases run from `setup_egui_frame`; Ingest rows
-    /// always get None.
+    /// ctx is Some only for phases run from `setup_egui_frame`; Ingest rows always get
+    /// None.
     pub(super) run: fn(&mut App, Option<&egui::Context>),
 }
 
 /// Every drain and dispatch step of a frame, in execution order.
-///
-/// [`App::run_frame_pump`] walks one phase at a time, so within a phase the
-/// row order IS the execution order, and the phases themselves run in
-/// declaration order across the frame: `Ingest` from `poll_data_channels`,
-/// then `Apply`, `Advance` and `Dispatch` from `setup_egui_frame`. A row
-/// whose position matters says why, right here, where the next edit will
-/// read it.
 pub(super) const FRAME_PUMP: &[DrainEntry] = &[
     DrainEntry {
         name: "poll_scan_results",
@@ -74,10 +42,6 @@ pub(super) const FRAME_PUMP: &[DrainEntry] = &[
         drains: &["scan_receiver"],
         run: pump_poll_scan_results,
     },
-    // Real-time chunks, drained beside the scan results and for the same
-    // reason: this is where a new volume becomes the one the panes draw
-    // from, and it has to happen before `evict_unshown_scans` and before the
-    // frame is laid out.
     DrainEntry {
         name: "poll_chunk_results",
         phase: PumpPhase::Ingest,
@@ -90,18 +54,14 @@ pub(super) const FRAME_PUMP: &[DrainEntry] = &[
         drains: &[],
         run: pump_drive_chunk_feeds,
     },
-    // Finished voxel builds land before the stamps are published, so a
-    // build and its announcement cannot straddle a frame.
+    // Finished voxel builds land before the stamps are published, so a build and its
+    // announcement cannot straddle a frame.
     DrainEntry {
         name: "poll_voxel_results",
         phase: PumpPhase::Ingest,
         drains: &["voxel_receiver"],
         run: pump_poll_voxel_results,
     },
-    // After both drains, so the UI is told about a volume on the frame it
-    // arrived rather than the frame after. A 3D pane reads this to decide
-    // which volume to ask for, so a frame's delay here is a frame's delay on
-    // every build.
     DrainEntry {
         name: "publish_base_volumes",
         phase: PumpPhase::Ingest,
@@ -126,9 +86,6 @@ pub(super) const FRAME_PUMP: &[DrainEntry] = &[
         drains: &["section_receiver"],
         run: super::render::pump_poll_section_results,
     },
-    // One poller, four receivers — today's real shape, kept: the Level III
-    // family lands as one apply step, and `drains` exists so a row can own
-    // several channels without splitting the method for symmetry.
     DrainEntry {
         name: "poll_level3_results",
         phase: PumpPhase::Apply,
@@ -188,28 +145,22 @@ pub(super) const FRAME_PUMP: &[DrainEntry] = &[
         drains: &["loop_section_receiver"],
         run: super::render::pump_poll_loop_section_results,
     },
-    // The arrival-time extraction results (WO-E4.9). `drains: []` by
-    // amendment C3: the channel is a RenderDispatcher-local mpsc, not a
-    // ChannelHub pair — an order-riding non-hub drain like drive_chunk_feeds
-    // and publish_base_volumes. Last of the Apply rows and before every
-    // Dispatch row, so an extraction that homed between frames is in the
-    // cache before this frame's dispatch asks for it.
     DrainEntry {
         name: "poll_extract_results",
         phase: PumpPhase::Apply,
         drains: &[],
         run: super::render::pump_poll_extract_results,
     },
-    // Results-apply before advance: a frame's last result is IN the frame
-    // that advances onto it.
+    // Results-apply before advance: a frame's last result is IN the frame that advances
+    // onto it.
     DrainEntry {
         name: "advance_loop_playback",
         phase: PumpPhase::Advance,
         drains: &[],
         run: super::render::pump_advance_loop_playback,
     },
-    // Advance before dispatch: the dispatchers measure a budget that is not
-    // being spent on stale panes.
+    // Advance before dispatch: the dispatchers measure a budget that is not being spent on
+    // stale panes.
     DrainEntry {
         name: "dispatch_pane_renders",
         phase: PumpPhase::Dispatch,
@@ -230,13 +181,6 @@ pub(super) const FRAME_PUMP: &[DrainEntry] = &[
     },
 ];
 
-// The `Ingest` rows' targets live on `App` itself (app.rs and the chunk
-// module), so their thin wrappers live beside the table. The Apply, Advance
-// and Dispatch targets are private to the `render` module, so their
-// wrappers live there — see the FRAME_PUMP block at the end of
-// app_render.rs. Wrappers are the whole indirection: the methods stay
-// methods, with their names, signatures and visibility unchanged, and the
-// frame test suites keep calling them directly.
 
 fn pump_poll_scan_results(app: &mut App, _ctx: Option<&egui::Context>) {
     app.poll_scan_results();

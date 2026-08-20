@@ -49,14 +49,6 @@ impl OutlookDay {
                 OutlookProduct::Wind,
                 OutlookProduct::Hail,
             ],
-            // Day 3's significant-severe area is a *separate endpoint*, unlike
-            // Days 1-2 where the CIG features ride inline in the hazard
-            // products. It is listed here — in the fetch and ledger scope —
-            // rather than folded into `Probabilistic`, so that it keeps its own
-            // fetch task, its own `per_product_error` slot and its own place in
-            // the `outstanding` count. It is hidden from the product toggles by
-            // [`OutlookProduct::implied_by`]; see there for why the two facts
-            // are not in tension.
             OutlookDay::Day3 => &[
                 OutlookProduct::Categorical,
                 OutlookProduct::Probabilistic,
@@ -113,8 +105,6 @@ pub enum OutlookProduct {
     /// significant area separately — a hole that predates SCN 26-11, not a
     /// regression the notice caused.
     ///
-    /// # Why not `day3otlk_sigprob`
-    ///
     /// The obvious sibling, `day3otlk_sigprob`, still answers `200` with a real
     /// `SIGN` MultiPolygon — and has not been re-issued since **2026-03-03
     /// 08:30Z**, the day after SCN 26-11 took effect, while `_cat`, `_prob` and
@@ -129,20 +119,6 @@ pub enum OutlookProduct {
 impl OutlookProduct {
     /// The product whose toggle also governs this one, if this product is not
     /// independently selectable.
-    ///
-    /// [`ConditionalIntensity`](Self::ConditionalIntensity) is the significant
-    /// -severe overlay on Day 3's probabilistic field, and on Days 1-2 the same
-    /// features arrive inside the hazard product with no toggle of their own.
-    /// Giving Day 3 a toggle the other days do not have would be an asymmetry
-    /// in the one place the user looks; so the fetch layer keeps it as a first
-    /// class product — its own task, its own error slot, its own share of
-    /// `outstanding` — while the control list hides it and its selection
-    /// follows its parent's.
-    ///
-    /// Keeping it a separate *key* is the point. Putting two requests behind
-    /// one product key is how a partial round comes to read as a complete one,
-    /// which this handler has been bitten by twice; see
-    /// `SpcOutlookHandler::round_verdict`.
     pub fn implied_by(self) -> Option<OutlookProduct> {
         match self {
             OutlookProduct::ConditionalIntensity => Some(OutlookProduct::Probabilistic),
@@ -183,8 +159,6 @@ pub struct SpcOutlook {
 /// [`DataSources::spc_base`](rustdar_source::origins::DataSources::spc_base),
 /// never a literal, or SPC escapes the origin table's browser-reachability check.
 ///
-/// # Why `.lyr.geojson`, and what it costs
-///
 /// SPC publishes each outlook twice. The `.lyr` ("layered") form gives every
 /// risk category as a whole nested region — MRGL ⊃ SLGT ⊃ ENH ⊃ MDT — so each
 /// higher category is drawn again underneath every lower one, and under a
@@ -192,13 +166,6 @@ pub struct SpcOutlook {
 /// many times as there are categories above it. The `.nolyr` form gives the
 /// same areas as disjoint bands, each a donut with the next category up cut out
 /// as an interior ring, painting every pixel once.
-///
-/// This is the layered one, hardcoded, and that is a choice worth revisiting
-/// rather than an obviously right one. It is left alone here because switching
-/// products changes what every downstream consumer sees — hit testing, labels,
-/// the legend — and because until `draw_feature` learned to honour interior
-/// rings, `.nolyr`'s donuts would have rendered as solid overlapping blobs
-/// anyway. That blocker is gone now; the tradeoff is not.
 pub fn outlook_url(
     sources: &rustdar_source::origins::DataSources,
     day: OutlookDay,
@@ -232,8 +199,6 @@ pub fn outlook_url(
         (OutlookDay::Day1 | OutlookDay::Day2, OutlookProduct::Hail) => "_hail",
         // Day 3's significant-severe area, which `_prob` does not carry. Only
         // `OutlookDay::Day3` lists this product, so no other day reaches here.
-        // `_sigprob` is the dead sibling — see
-        // [`OutlookProduct::ConditionalIntensity`].
         (_, OutlookProduct::ConditionalIntensity) => "_cigprob",
         // Day 3 serves every hazard from the one combined `_prob` endpoint.
         (_, OutlookProduct::Tornado)
@@ -266,11 +231,7 @@ pub fn parse_geojson(
         .ok_or_else(|| "Missing 'features' array in GeoJSON".to_string())?;
 
     // Two tiers, concatenated at the end. `features` is drawn in list order
-    // (`rasterize::rasterize_spc_outlooks`), so this is the paint order, and
-    // deriving it from the classified layer is what keeps a feature's position
-    // in SPC's array from deciding whether it covers the forecast: the
-    // significant-severe area is on top because it is an overlay, not because
-    // SPC happens to emit it last.
+    // (`rasterize::rasterize_spc_outlooks`), so this is the paint order.
     let mut risk = Vec::new();
     let mut overlays = Vec::new();
     let mut valid: Option<NaiveDateTime> = None;
@@ -280,8 +241,6 @@ pub fn parse_geojson(
         // One malformed feature must not blank the whole product: SPC has
         // shipped single degenerate polygons (every ring under 3 points), and
         // propagating the error here turned one of them into an empty outlook.
-        // Skip-and-warn, mirroring `nws::alert::parse_alerts`; `Err` is
-        // reserved for an unusable envelope (bad JSON, no `features` array).
         let ParsedOutlookFeature {
             feature,
             layer,
@@ -340,28 +299,6 @@ const SIGNIFICANT_SEVERE_FILL: &str = "#888888";
 
 /// What SPC's `LABEL` says a feature is: part of the risk stack, or the
 /// significant-severe area laid over it.
-///
-/// # Why this is not just a `HatchPattern`
-///
-/// It used to be. The hatch came from a `match` on the label whose `_` arm
-/// returned [`HatchPattern::None`], and the fill alpha was then chosen by
-/// asking whether that lookup had *failed*:
-///
-/// ```ignore
-/// let hatch = match label.as_str() { "CIG1" => ..., _ => HatchPattern::None };
-/// let fill_alpha = if hatch != HatchPattern::None { CIG_FILL_ALPHA } else { REGULAR_FILL_ALPHA };
-/// ```
-///
-/// One silently-failing lookup decided three separate things. A
-/// significant-severe area whose label we did not recognise was not merely
-/// unhatched: it was promoted to 2.5× the opacity, and — being last in SPC's
-/// own feature array, which is also the draw order — painted as a near-opaque
-/// grey blob over every probability contour beneath it. The failure was worst
-/// exactly on the days such an area exists at all.
-///
-/// The label is now classified once, and the hatch, the alpha and the draw
-/// tier are each read off the classification. A miss in the hatch vocabulary
-/// costs the hatching and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutlookLayer {
     /// A risk category (`TSTM`, `MRGL` … `HIGH`) or probability contour
@@ -548,8 +485,6 @@ fn parse_polygon(geometry: &serde_json::Value) -> Result<GeoPolygon, String> {
 mod tests {
     use super::*;
 
-    /// A feature in the feed's own shape (see [`parse_geojson`]), with the
-    /// given label and MultiPolygon rings.
     fn feature(label: &str, rings: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
             "properties": {
@@ -564,13 +499,8 @@ mod tests {
         })
     }
 
-    /// One degenerate polygon in SPC's feed must not blank the whole product.
-    /// The degenerate feature comes *first*, so a propagating `?` would abort
-    /// before ever reaching the good one.
     #[test]
     fn a_degenerate_feature_is_skipped_and_the_good_ones_survive() {
-        // Every ring under 3 points: `parse_polygon_coords` rejects it and
-        // `parse_multi_polygon` turns that into an error.
         let degenerate = feature(
             "MRGL",
             serde_json::json!([[[[-100.0, 30.0], [-99.0, 30.0]]]]),
@@ -596,7 +526,6 @@ mod tests {
             "the good feature survives, the bad one is dropped"
         );
         assert_eq!(outlook.features[0].label, "SLGT");
-        // VALID/EXPIRE still come from the surviving feature.
         assert!(outlook.valid.is_some() && outlook.expire.is_some());
     }
 
@@ -607,14 +536,6 @@ mod tests {
     //
     //   spc.noaa.gov/products/outlook/archive/2026/day1otlk_20260425_1300_hail.lyr.geojson
     //   spc.noaa.gov/products/outlook/archive/2024/day1otlk_20240506_1300_torn.lyr.geojson
-    //
-    // The first is after NWS Service Change Notice 26-11, which on 2026-03-02
-    // introduced the Conditional Intensity Groups "labeled 'CIG1', 'CIG2',
-    // and 'CIG3' replacing the current 'SIGN' label"; it carries CIG1 and
-    // CIG2 over the 5/15/30/45% hail ladder. The second is from before it and
-    // carries SIGN over the 2/5/10/15/30% tornado ladder. Both labels are
-    // therefore real, and a build that reads only one of them is wrong for
-    // half the archive.
 
     /// SPC's hail outlook for 2026-04-25 13Z, verbatim.
     const CIG_PRODUCT: &str =
@@ -635,11 +556,6 @@ mod tests {
         outlook.features.iter().map(|f| f.label.as_str()).collect()
     }
 
-    /// **The current vocabulary, on a real product that uses it.**
-    ///
-    /// CIG1 and CIG2 must hatch, must be drawn at the overlay alpha, and must
-    /// come after the whole probability ladder — the three things the old
-    /// single lookup decided together.
     #[test]
     fn the_conditional_intensity_groups_hatch_over_the_probability_ladder() {
         let outlook = parse(CIG_PRODUCT, OutlookProduct::Hail);
@@ -672,13 +588,6 @@ mod tests {
         assert_eq!(outlook.features[5].hatch, HatchPattern::Cig2);
     }
 
-    /// **SPC's retired `SIGN` is the same area under the earlier name.**
-    ///
-    /// It was unhandled, so it fell through to `HatchPattern::None` — and
-    /// because the alpha was chosen by asking whether that lookup had failed,
-    /// it was painted at 2.5× opacity, last, over the 15% and 30% tornado
-    /// contours it sits on. SPC published it on every significant-severe day
-    /// from 2020 until 2026-03-02, and the archive still serves it.
     #[test]
     fn the_retired_sign_label_is_still_the_significant_severe_area() {
         let outlook = parse(SIGN_PRODUCT, OutlookProduct::Tornado);
@@ -702,18 +611,6 @@ mod tests {
         );
     }
 
-    /// **A label this build has never seen must not be promoted.**
-    ///
-    /// The guarantee the [`OutlookLayer`] split exists for: identifying the
-    /// significant-severe layer no longer rests on the label vocabulary
-    /// alone, so the next time SPC renames it — it has renamed it once
-    /// already — the area loses its hatching and nothing else. It does not
-    /// gain 2.5× the opacity, and it does not move to the top of the stack by
-    /// being last in the array.
-    ///
-    /// The fixture is SPC's real product with the label of its significant
-    /// area swapped for one that does not exist, and the feature moved to the
-    /// *front* so that array position cannot be what puts it on top.
     #[test]
     fn an_unrecognised_significant_severe_label_is_not_painted_over_the_forecast() {
         let mut json: serde_json::Value =
@@ -752,22 +649,6 @@ mod tests {
         );
     }
 
-    /// **A probability contour that arrives with no `fill` stays in the risk
-    /// stack.**
-    ///
-    /// The default for a missing `fill` used to be `"#888888"` — byte-identical
-    /// to [`SIGNIFICANT_SEVERE_FILL`], the sentinel [`OutlookLayer::of`] reads
-    /// as "this is the significant-severe layer". The fallback colour and the
-    /// classifier's sentinel were the same constant, so one missing property
-    /// moved a probability band out of the ladder and drew it last, over every
-    /// contour beneath it, at the overlay alpha — the same shape of failure the
-    /// [`OutlookLayer`] type was introduced to break, arriving through the
-    /// other door.
-    ///
-    /// Not reachable on anything SPC has published: the key is present on every
-    /// feature of the 1023-product Day 1 archive checked for this
-    /// (`campaign-harness`, `campaigns/spc-scn26-11/`). It is a defence against
-    /// the feed, not a repair of it.
     #[test]
     fn a_probability_contour_with_no_fill_property_is_not_promoted_to_an_overlay() {
         let mut json: serde_json::Value =
@@ -804,9 +685,6 @@ mod tests {
         );
     }
 
-    /// The counterpart: a risk area is *not* an overlay. Without this, "treat
-    /// the unknown as an overlay" could be satisfied by treating everything as
-    /// one, which would paint the whole outlook at 40 alpha.
     #[test]
     fn the_probability_contours_keep_the_regular_fill_and_the_feeds_order() {
         let outlook = parse(CIG_PRODUCT, OutlookProduct::Hail);
@@ -825,8 +703,6 @@ mod tests {
         }
     }
 
-    /// The counterpart: `Err` stays reserved for an unusable envelope. A feed
-    /// with no `features` array has nothing salvageable to skip past.
     #[test]
     fn a_missing_features_array_is_still_a_hard_error() {
         let json = serde_json::json!({ "type": "FeatureCollection" });

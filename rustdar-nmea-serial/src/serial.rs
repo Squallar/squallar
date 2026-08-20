@@ -18,7 +18,6 @@ const GPS_VID_PIDS: &[(u16, Option<u16>)] = &[
     (0x4292, Some(0x0603)), // SiRF (USB-attached receivers)
 ];
 
-/// Common baud rates for GPS devices, ordered by likelihood.
 const COMMON_BAUDS: &[u32] = &[9600, 4800, 38400, 115200];
 
 #[derive(Debug, Clone)]
@@ -27,7 +26,6 @@ pub struct GpsPortInfo {
     pub description: String,
 }
 
-/// Ports matching a known GPS VID/PID first, then every other serial port.
 pub fn detect_gps_ports() -> Vec<GpsPortInfo> {
     let Ok(ports) = serialport::available_ports() else {
         return Vec::new();
@@ -81,10 +79,9 @@ pub fn detect_gps_ports() -> Vec<GpsPortInfo> {
     gps_ports
 }
 
-/// Probe each rate in [`COMMON_BAUDS`] for a line starting with `$`. Worst
-/// case is tens of seconds of blocking reads, so it runs on the reader thread
-/// and checks the stop signal between reads; `None` on stop is fine — the
-/// caller falls back to a default and [`gps_read_loop`] re-checks immediately.
+/// Probe each rate in [`COMMON_BAUDS`] for a line starting with `$`. Worst case
+/// is tens of seconds of blocking reads, so it runs on the reader thread and
+/// checks the stop signal between reads.
 fn detect_baud(port_name: &str, stop_rx: &mpsc::Receiver<()>) -> Option<u32> {
     for &baud in COMMON_BAUDS {
         let port = serialport::new(port_name, baud)
@@ -108,37 +105,19 @@ fn detect_baud(port_name: &str, stop_rx: &mpsc::Receiver<()>) -> Option<u32> {
     None
 }
 
-/// Owns the reader thread; reconnects on its own after a disconnect.
 pub struct SerialGpsReader {
-    /// Dropping the sender signals the reader thread to stop.
     _stop_signal: mpsc::Sender<()>,
 }
 
 impl SerialGpsReader {
-    /// Spawns the reader thread and returns it immediately — always `Some`
-    /// today. Port and baud auto-detection (where `config` leaves them unset)
-    /// happens on that thread, not here — probing can block for tens of
-    /// seconds and the caller is the GUI thread — so the reader is returned
-    /// before any port is confirmed; if none ever turns up, the thread keeps
-    /// retrying detection until the reader is dropped.
+    /// Spawns the reader thread and returns it immediately; port and baud
+    /// auto-detection happens on that thread, because probing can block for
+    /// tens of seconds and the caller is the GUI thread.
     ///
-    /// # `on_fix`
-    ///
-    /// Called on the reader thread with every parsed position-bearing
-    /// sentence. Returning `false` means the consumer is gone and stops the
-    /// thread — which holds the port open exclusively, so a consumer that
-    /// vanishes without stopping the reader would pin the device forever.
-    ///
-    /// A callback rather than a channel of this crate's own, because what a
-    /// consumer does with a parsed fix — translate it into an app fix model,
-    /// send it somewhere, wake an event loop so the send is *seen* — is the
-    /// consumer's business, and since WO-RL-3 that consumer is
-    /// `rustdar_location`'s `serial` module, which this crate deliberately
-    /// knows nothing about.
-    ///
-    /// `Send` and not `Sync`, because the closure is moved into one thread and
-    /// shared with none. `FnMut`, because a translating consumer may keep
-    /// state.
+    /// `on_fix` is called on the reader thread with every parsed
+    /// position-bearing sentence. Returning `false` stops the thread — which
+    /// holds the port open exclusively, so a consumer that vanishes without
+    /// stopping the reader would pin the device forever.
     pub fn start(
         config: &SerialConfig,
         on_fix: impl FnMut(ParsedFix) -> bool + Send + 'static,
@@ -173,8 +152,7 @@ impl SerialGpsReader {
 }
 
 /// The configured port when set, otherwise the first detected port — retrying
-/// every 5s so a receiver plugged in after enabling GPS is still picked up.
-/// `None` only when stopped while waiting.
+/// every 5s so a receiver plugged in later is still picked up.
 fn resolve_port(configured: Option<String>, stop_rx: &mpsc::Receiver<()>) -> Option<String> {
     if let Some(path) = configured {
         return Some(path);
@@ -184,7 +162,6 @@ fn resolve_port(configured: Option<String>, stop_rx: &mpsc::Receiver<()>) -> Opt
             return Some(port.port_name.clone());
         }
         log::warn!("No GPS port found. Retrying detection in 5s");
-        // 5s retry, sliced so the stop signal is still seen promptly.
         for _ in 0..50 {
             if should_stop(stop_rx) {
                 return None;
@@ -195,8 +172,7 @@ fn resolve_port(configured: Option<String>, stop_rx: &mpsc::Receiver<()>) -> Opt
 }
 
 /// Whether the reader thread must exit: an explicit stop `()` arrived, or the
-/// [`SerialGpsReader`] holding the sender was dropped (`Disconnected`). Only
-/// an empty-but-connected channel means keep running — a bare
+/// [`SerialGpsReader`] holding the sender was dropped. A bare
 /// `try_recv().is_ok()` would read the drop as "keep going" and leak the
 /// thread, which holds the port open exclusively.
 fn should_stop(stop_rx: &mpsc::Receiver<()>) -> bool {
@@ -230,7 +206,6 @@ fn gps_read_loop(
                     port_name,
                     e
                 );
-                // 5s retry, sliced so the stop signal is still seen promptly.
                 for _ in 0..50 {
                     if should_stop(stop_rx) {
                         return;
@@ -277,7 +252,6 @@ fn gps_read_loop(
             }
         }
 
-        // 5s reconnect delay, sliced the same way.
         for _ in 0..50 {
             if should_stop(stop_rx) {
                 return;
@@ -305,8 +279,7 @@ mod tests {
     }
 
     /// Dropping [`SerialGpsReader`] drops the sender without ever sending, so
-    /// the thread must read `Disconnected` as stop — a bare `is_ok()` check
-    /// here leaked the thread and kept the port open exclusively forever.
+    /// the thread must read `Disconnected` as stop.
     #[test]
     fn should_stop_fires_when_the_sender_is_dropped_without_sending() {
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
@@ -314,8 +287,4 @@ mod tests {
         assert!(should_stop(&stop_rx));
     }
 
-    // The send-plus-wake delivery pairing and its two tests moved to
-    // `rustdar_location::serial` at WO-RL-3 with the `deliver` fn they test:
-    // sending an app fix and waking an event loop are the *consumer's* step,
-    // and the consumer of this transport is the facade's serial module.
 }

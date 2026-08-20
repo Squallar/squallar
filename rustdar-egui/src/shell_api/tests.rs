@@ -1,4 +1,4 @@
-//! WO-E2 contract test 1 of 3: **sentinel expression**. Every field of
+//! Contract test: **sentinel expression**. Every field of
 //! [`FrameInputs`] applied through `Gui::apply_frame_inputs` surfaces through
 //! the `Gui`'s own read side, and *persists* across frames with no
 //! re-application — the seam stores facts, it does not merely borrow them for

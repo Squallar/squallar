@@ -1,12 +1,5 @@
 //! Whole-file fixtures: real configs from real eras of this app, loaded
 //! byte-for-byte as a user's disk would supply them.
-//!
-//! The unit tests beside these build their inputs by saving and mutating; a
-//! fixture instead freezes what an *old build actually wrote*, so a change
-//! that quietly stops reading some era of file fails here even when every
-//! synthetic round trip still passes. The files live under `fixtures/` and
-//! are compiled in with `include_str!` — a fixture that could drift from the
-//! test reading it would pin nothing.
 
 use crate::Gui;
 use crate::UI_CONFIG_KEY;
@@ -26,13 +19,6 @@ fn store_with(fixture: &str) -> MemoryKvStore {
 /// The config a pre-M11, pre-`overlay_states` build wrote: sync was two
 /// globals, the Radar toggle lived in a per-pane `layers` map, and no
 /// `config_version` key existed because no version field did.
-///
-/// This file must keep loading forever. It pins three migrations at once:
-/// the M11 fold (`viewport_sync`/`sync_layers` off seeds every restored
-/// pane's links off), the legacy Radar-toggle capture (the first pane's
-/// `layers["Radar"]` drives the global handler when no `overlay_states`
-/// map exists), and the absence of a version key reading as the oldest
-/// version rather than as an error.
 #[test]
 fn a_legacy_v0_config_loads_with_links_folded_off_and_its_radar_toggle_migrated() {
     let store = store_with(include_str!("fixtures/legacy_v0.json"));
@@ -74,9 +60,6 @@ fn a_legacy_v0_config_loads_with_links_folded_off_and_its_radar_toggle_migrated(
 /// equal save₂**. This is the reopen-1:1 rule as a test — a load followed by
 /// a save is a fixpoint, so reopening the app cannot drift the file, and the
 /// autosave's has-anything-changed string comparison cannot oscillate.
-///
-/// Compared as parsed JSON values, which is exactly the equality the rule
-/// needs: key order is a serializer artifact, content is the contract.
 #[test]
 fn a_current_config_reaches_its_save_fixpoint_in_one_round_trip() {
     let store = store_with(include_str!("fixtures/current_full.json"));
@@ -109,11 +92,6 @@ fn a_current_config_reaches_its_save_fixpoint_in_one_round_trip() {
 /// A file written by a **newer build** — greater version, an overlay kind,
 /// a product, pane fields and top-level fields this build has never heard
 /// of — loads what it can and, on save, hands back every unknown byte.
-///
-/// The assertions are on the **saved JSON**, because that is where the
-/// guarantee lives: preserving unknowns in memory and dropping them on the
-/// way out would still strand the user's newer config after one session
-/// under this build.
 #[test]
 fn a_future_builds_config_survives_a_session_with_every_unknown_intact() {
     let store = store_with(include_str!("fixtures/future_build.json"));
@@ -266,7 +244,7 @@ fn a_truncated_file_is_the_one_remaining_whole_file_refusal() {
     );
 }
 
-/// The v1 → v2 `gps_config` split (WO-RL-1), proven on a file a v1 build
+/// The v1 → v2 `gps_config` split, proven on a file a v1 build
 /// actually could have written: port and baud land under `serial_config`,
 /// `heading_source` becomes its own top-level key, and a member inside the
 /// old container that this build cannot name rides the rename **verbatim** —
@@ -334,15 +312,6 @@ fn a_v1_gps_config_splits_into_serial_config_and_a_root_heading() {
 /// **The M8b unknown-id pin, both directions.** A `draw_order` naming a layer
 /// no handler serves — "MysteryLayer" — survives load→save→reload **in
 /// place**, and is skipped at draw rather than resolved.
-///
-/// This is a DELIBERATE behavior change (M8b b2): the pre-M8b reconcile
-/// *dropped* unknown names from the pane's live list and a sidecar re-appended
-/// them after the known order on save, so a newer build's layer lost its
-/// position through a session under this build. With open [`LayerId`]s the
-/// unknown id is an ordinary entry: it keeps its saved position among the
-/// names it was saved between, the draw loop's `handler_by_id` gate skips it
-/// (retained-in-list, skipped-at-draw), and the second session reads back
-/// exactly what the first wrote — the fixpoint half.
 #[test]
 fn an_unknown_draw_order_id_survives_in_place_and_is_skipped_at_draw() {
     let store = store_with(
@@ -424,12 +393,6 @@ fn an_unknown_draw_order_id_survives_in_place_and_is_skipped_at_draw() {
 /// The swap half of the unknown-id doctrine: an unregistered id's saved
 /// `enabled_overlays`/`overlay_configs` entries survive the registry-state
 /// overwrite every layer toggle performs (`PaneState::adopt_handler_state`).
-///
-/// Before M8b those entries rode a baggage sidecar the swap could not touch;
-/// with the sidecar gone the pane maps are the ONLY carrier, so a wholesale
-/// `save_pane_configs()` assignment would silently drop a newer build's
-/// layer state on the first eye click — and the next autosave would make the
-/// loss permanent. This is the test that fails instead.
 #[test]
 fn an_unknown_ids_saved_state_survives_a_layer_toggle() {
     let store = store_with(

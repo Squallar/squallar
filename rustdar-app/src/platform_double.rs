@@ -1,48 +1,4 @@
 //! A [`PlatformBridge`] for tests, shaped after the four real ones.
-//!
-//! # What it is for
-//!
-//! `App` reaches the OS only through this trait, so a double is the only way to
-//! drive an `App` at all on a host: everything from "does this platform let the
-//! app quit" to "where does config go" arrives through it. The three
-//! constructors below are named after the bridges they imitate, and their
-//! answers are taken from those bridges rather than invented — see
-//! the `rustdar` crate's `platform.rs` and `rustdar-web`'s `bridge.rs`.
-//!
-//! # Why it records in fields rather than in a call log
-//!
-//! Every setter here keeps what it was handed, exactly as the real bridges do,
-//! and the getters answer from it. That is deliberate: a log of "the app called
-//! `set_insets_querier`" can only be asserted against the querier the test
-//! itself supplied, which proves nothing about what the app did with it. Asking
-//! instead what `query_insets` *now answers*, and then what the UI *now shows*,
-//! puts production code between the fixture and the assertion. Every probe in
-//! the suite is written that way; where a call really has no downstream
-//! observable — the provider's `start_serial` is the only one — the argument
-//! is kept behind a handle the test shares, and that is stated at the field.
-//!
-//! # Where it stops short of the real bridges
-//!
-//! Nothing here starts a thread. `AndroidPlatform::set_theme_detector` spawns a
-//! two-second poller alongside the assignment, because NativeActivity emits no
-//! `ThemeChanged`; this refuses a second detector the way that one does but
-//! spawns nothing, and `theme_channel` is the test's stand-in for the poller.
-//! That is why the refusal is keyed on the detector rather than on the receiver
-//! the real one would have created.
-//!
-//! Nothing here is `Send`: `App` never requires it of a bridge, and `Rc` keeps
-//! the shared handles cheap.
-//!
-//! # The location half (WO-RL-4)
-//!
-//! The bridge lost its location verbs when `App` started holding a
-//! [`rustdar_location::LocationFacade`] directly, so the double split the same
-//! way the production wiring did: [`TestBridge`] keeps the platform surface
-//! (kv included — where blobs persist is a platform question), and
-//! [`TestLocationProvider`] — sharing the same [`LocationRecord`] cells —
-//! implements the facade's arm seam. `headless()` wires one facade over the
-//! provider the bridge mints, so a test still configures everything on the
-//! bridge and reads everything back through the same records.
 
 use crate::platform::{PlatformBridge, RedrawWaker, drain_latest};
 use rustdar_kv::{KvStore, MemoryKvStore};
@@ -56,9 +12,6 @@ use std::sync::mpsc::Receiver;
 pub(crate) type Insets = (f32, f32, f32, f32);
 
 /// A [`KvStore`] over a [`MemoryKvStore`] the test still holds.
-///
-/// `kv` hands out a fresh `Box` per call, so the backing store has to
-/// outlive the box for a test to read back what the app persisted through it.
 pub(crate) struct SharedStore {
     inner: Rc<MemoryKvStore>,
     writes: Rc<std::cell::Cell<usize>>,
@@ -70,17 +23,13 @@ impl KvStore for SharedStore {
     }
 
     fn store(&self, key: &str, value: &str) -> Result<(), String> {
-        // Counted, not just recorded. The autosave runs on a timer for the life
-        // of the process, so "does an unchanged config still write?" is a
-        // question about cost that reading the stored value cannot answer.
+        // Counted, not just recorded.
         self.writes.set(self.writes.get() + 1);
         self.inner.store(key, value)
     }
 
-    /// Spelled out rather than left to the trait's default, which would forward
-    /// to `store` and count — correct today only by coincidence. A decorator
-    /// that forwards one method and forgets the other silently turns a caller's
-    /// durable write into a deferred one, and this is a decorator.
+    /// Spelled out rather than left to the trait's default, which would forward to
+    /// `store` and count — correct today only by coincidence.
     fn store_now(&self, key: &str, value: &str) -> Result<(), String> {
         self.writes.set(self.writes.get() + 1);
         self.inner.store_now(key, value)
@@ -89,52 +38,25 @@ impl KvStore for SharedStore {
 
 /// The serial config the provider was last started with, or `None` when
 /// stopped.
-///
-/// The one thing here with no downstream observable: `start_serial` opens a
-/// serial port and nothing about the app changes. Shared so a test can see
-/// *which* config reached it — passing the wrong one is the failure that
-/// matters, and `serial_active` alone cannot tell.
 pub(crate) type GpsRecord = Rc<RefCell<Option<rustdar_nmea_serial::SerialConfig>>>;
 
 /// The [`RedrawWaker`] the app handed this bridge, or a fresh empty one if it
 /// never did.
-///
-/// The second thing here kept behind a shared handle rather than read back
-/// through a getter, and for the same reason as [`GpsRecord`]: the real bridges
-/// spend a waker on threads (the facade arms' serial reader,
-/// `AndroidPlatform::set_theme_detector`) that this double deliberately does not
-/// start, so there is no downstream observable to ask. Waking through it and
-/// watching what the *app* installed fire is what puts production code between
-/// the fixture and the assertion.
 pub(crate) type WakerRecord = Rc<RefCell<RedrawWaker>>;
 
 /// When [`TestBridge::kv`] answers with a store.
-///
-/// Three real cases, not two: the third is the one the location memo cares
-/// about, and it used to be unreachable through this double.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StoreAvailability {
     /// Only once a config directory has been set. Desktop and iOS derive one in
     /// their constructors; Android is told during `android_main`.
     WhenToldADirectory,
-    /// Always. `localStorage` needs no path and is there from the first frame,
-    /// which is why the web bridge never returns `None` for "not told where
-    /// yet".
+    /// Always.
     Always,
-    /// Never. A browser with site data blocked, or a desktop process with no
-    /// `XDG_CONFIG_HOME`, `HOME` or `LOCALAPPDATA` — a container, a systemd
-    /// unit. Both are documented in the bridges they come from, and on both the
-    /// location permission itself works fine.
+    /// Never.
     Never,
 }
 
 /// The location state a test shares with the bridge after `App` has taken it.
-///
-/// Every field is behind an `Rc<Cell<_>>` because that is the only way a test
-/// can still touch them: `App` owns the bridge by value from `headless` on, and
-/// the interesting moments — the user tapping Allow, revoking in system
-/// settings, the OS quietly stopping delivery on a background transition — all
-/// happen *after* that point.
 #[derive(Clone)]
 pub(crate) struct LocationRecord {
     /// What `location_permission` answers.
@@ -142,9 +64,6 @@ pub(crate) struct LocationRecord {
     /// Whether the bridge is delivering.
     pub(crate) active: Rc<Cell<bool>>,
     /// How many times `request_location` has been called.
-    ///
-    /// A counter, not a bool: "asked twice" is the failure mode with a dialog
-    /// in it, and a bool records it as a success.
     pub(crate) requests: Rc<Cell<usize>>,
     /// How many times `location_permission` has been read. On Android that is a
     /// JNI call, so the poll cadence is a cost worth asserting on.
@@ -179,14 +98,9 @@ pub(crate) struct TestBridge {
     config_dir: Option<PathBuf>,
     zone_cache_dir: Option<PathBuf>,
     store: Rc<MemoryKvStore>,
-    /// Installed by `set_back_handler`. Android installs one at startup and the
-    /// others never do, which is the whole of why back minimises there and
-    /// quits everywhere else.
+    /// Installed by `set_back_handler`.
     back_handler: Option<fn()>,
-    /// Injected, as Android injects it. Only that platform has a second way to
-    /// deliver back — `OnBackInvokedDispatcher`, which bypasses the input
-    /// queue — so on the other two this stays `None` and `poll_back_press`
-    /// answers `false` forever.
+    /// Injected, as Android injects it.
     back_press_taker: Option<fn() -> bool>,
     /// Injected, as Android injects it: the read is a JNI call.
     insets_querier: Option<fn() -> Insets>,
@@ -194,8 +108,6 @@ pub(crate) struct TestBridge {
     theme_detector: Option<fn() -> bool>,
     /// Whether the platform has a synchronous theme read of its own: desktop
     /// (`dark_light::detect`) and iOS (hard-coded light) do, Android does not.
-    /// Both of those answer light here — a host-dependent desktop answer is
-    /// exactly the kind of invention this double avoids, and nothing reads it.
     reads_theme_itself: bool,
     theme_receiver: Option<Receiver<bool>>,
     gps_fix_receiver: Option<Receiver<rustdar_location::Fix>>,
@@ -206,9 +118,7 @@ pub(crate) struct TestBridge {
     writes: Rc<Cell<usize>>,
     /// See [`StoreAvailability`].
     store_availability: StoreAvailability,
-    /// What `iana_timezone` answers. `None` stands for the platforms and
-    /// environments that cannot say — a container with no zone configured, or a
-    /// browser too old for `Intl` — where the app must keep its own default.
+    /// What `iana_timezone` answers.
     timezone: Option<String>,
     /// See [`LocationRecord`].
     location: LocationRecord,
@@ -250,8 +160,7 @@ impl TestBridge {
     }
 
     /// `AndroidPlatform`: theme, insets, GPS and compass all arrive through
-    /// injected callbacks and channels, config has no home until `android_main`
-    /// supplies one, and exit has to go through `process::exit`.
+    /// injected callbacks and channels; config has no home until `android_main`.
     pub(crate) fn android() -> Self {
         Self {
             needs_process_exit: true,
@@ -260,9 +169,8 @@ impl TestBridge {
         }
     }
 
-    /// `IosPlatform`: every poll answers `None`, the theme is hard-coded light,
-    /// egui-winit supplies the insets so the bridge has none, and quitting is
-    /// not something the platform permits.
+    /// `IosPlatform`: every poll answers `None`, the theme is hard-coded light, egui-
+    /// winit supplies the insets so the bridge has none.
     pub(crate) fn ios() -> Self {
         Self {
             supports_exit: false,
@@ -272,15 +180,8 @@ impl TestBridge {
         }
     }
 
-    /// `WebPlatform`: `localStorage` from the first frame with no directory
-    /// involved, no filesystem for the zone cache, no back handler, and an
-    /// "exit" that is only the event loop stopping.
-    ///
-    /// Unused since the gate suite moved to `rustdar-location` (WO-RL-2) with
-    /// a double of its own, but the constructor set mirrors the four real
-    /// bridges on purpose — an app-level web-shaped test is a one-word reach,
-    /// and deleting the shape would also gut [`StoreAvailability::Always`]'s
-    /// "three real cases" story.
+    /// `WebPlatform`: `localStorage` from the first frame with no directory involved,
+    /// no filesystem for the zone cache, no back handler.
     #[allow(dead_code)]
     pub(crate) fn web() -> Self {
         Self {
@@ -295,18 +196,14 @@ impl TestBridge {
         Rc::clone(&self.store)
     }
 
-    /// Persist into `store` rather than into a fresh one, so a test can close
-    /// an app and open another over the same blobs — which is the only way to
-    /// exercise anything the app is supposed to remember across restarts.
+    /// Persist into `store` rather than into a fresh one, so a test can close an app
+    /// and open another over the same blobs.
     pub(crate) fn with_store(mut self, store: Rc<MemoryKvStore>) -> Self {
         self.store = store;
         self
     }
 
     /// Answer `kv` with `None`, permanently.
-    ///
-    /// See [`StoreAvailability::Never`] for the two shipping configurations
-    /// this stands for.
     pub(crate) fn without_kv(mut self) -> Self {
         self.store_availability = StoreAvailability::Never;
         self
@@ -345,19 +242,15 @@ impl TestBridge {
         self
     }
 
-    /// Feed the provider's `poll_fix`, standing in for the browser's
-    /// geolocation watch and Android's location poll. Handed over to the
-    /// [`TestLocationProvider`] when [`location_provider`](Self::location_provider)
-    /// mints it.
+    /// Feed the provider's `poll_fix`, standing in for the browser's geolocation watch
+    /// and Android's location poll.
     pub(crate) fn gps_channel(&mut self) -> std::sync::mpsc::Sender<rustdar_location::Fix> {
         let (tx, rx) = std::sync::mpsc::channel();
         self.gps_fix_receiver = Some(rx);
         tx
     }
 
-    /// Mint the facade arm this bridge's records back. Called by `headless()`
-    /// after the test has configured the bridge; takes the fix channel with it
-    /// (the bridge lost `poll_gps_fix` to the facade at WO-RL-4).
+    /// Mint the facade arm this bridge's records back.
     pub(crate) fn location_provider(&mut self) -> TestLocationProvider {
         TestLocationProvider {
             record: self.location.clone(),
@@ -408,9 +301,7 @@ impl PlatformBridge for TestBridge {
         match self.theme_detector {
             Some(detect) => detect(),
             None => {
-                // Android's only theme source is the injected detector, so a
-                // missing one is a wiring bug rather than an answer;
-                // `AndroidPlatform::detect_dark_theme` fails the same way.
+                // Android's only theme source is the injected detector.
                 debug_assert!(
                     self.reads_theme_itself,
                     "TestBridge::android detect_dark_theme with no detector injected",
@@ -462,9 +353,7 @@ impl PlatformBridge for TestBridge {
         self.insets_querier = Some(querier);
     }
 
-    /// A second detector is refused, as `AndroidPlatform` refuses one: there,
-    /// accepting would leave the running poll thread on the old detector while
-    /// the synchronous path used the new one.
+    /// A second detector is refused, as `AndroidPlatform` refuses one.
     fn set_theme_detector(&mut self, detector: fn() -> bool) {
         if self.theme_detector.is_some() {
             return;
@@ -472,10 +361,8 @@ impl PlatformBridge for TestBridge {
         self.theme_detector = Some(detector);
     }
 
-    /// `None` until this platform has been told where config lives, which is
-    /// what makes `App::set_config_dir` observable: before it, there is no
-    /// store to load from. See [`StoreAvailability`] for the two bridges that
-    /// do not work that way.
+    /// `None` until this platform has been told where config lives, which is what
+    /// makes `App::set_config_dir` observable.
     fn kv(&self) -> Option<Box<dyn KvStore>> {
         let available = match self.store_availability {
             StoreAvailability::WhenToldADirectory => self.config_dir.is_some(),
@@ -491,10 +378,7 @@ impl PlatformBridge for TestBridge {
     }
 }
 
-/// The facade's arm, for tests: the location half of the old `TestBridge`,
-/// answering from the same [`LocationRecord`] cells the bridge minted it with
-/// — so a test keeps one set of handles whichever side of the WO-RL-4 split
-/// it is asserting on.
+/// The facade's arm, for tests: the location half of the old `TestBridge`.
 pub(crate) struct TestLocationProvider {
     record: LocationRecord,
     /// See [`GpsRecord`].
@@ -512,10 +396,6 @@ impl rustdar_location::LocationProvider for TestLocationProvider {
 
     /// Starts delivery, as every real arm does — the web's `watchPosition`
     /// is literally the same call as the prompt.
-    ///
-    /// Deliberately starts even from `Prompt`: on a platform where the ask and
-    /// the subscription are one call there is no other order available, and a
-    /// double that refused would hide the case the gate has to handle.
     fn request(&mut self) -> bool {
         self.record.requests.set(self.record.requests.get() + 1);
         let reached = self.record.reaches_the_os.get();

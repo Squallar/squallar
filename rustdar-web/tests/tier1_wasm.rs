@@ -1,14 +1,11 @@
 //! Tier-1 browser gate: the first wasm tests in this repository's history.
 //!
 //! Run inside a real browser by `wasm-pack test --headless --firefox` and
-//! `--chrome` (`.github/workflows/web.yaml`, `tier1` job). Headless is fine
-//! here -- none of these needs WebGL.
+//! `--chrome` (`.github/workflows/web.yaml`, `tier1` job).
 //!
-//! Scope is deliberately exactly these four tests. The wasm-bindgen-test
-//! harness never serves `worker.js` + `pkg/`, so the real rasterization
-//! worker cannot spawn here; the real spawn/HELLO handshake and the
-//! doctored-token respawn are Tier 2's assertions
-//! (`.github/browser-rig/run_tier2.sh` against the full served PWA).
+//! Scope is deliberately exactly these four tests: the wasm-bindgen-test
+//! harness never serves `worker.js` + `pkg/`, so the real spawn/HELLO handshake
+//! and the doctored-token respawn are Tier 2's (`.github/browser-rig/run_tier2.sh`).
 
 #![cfg(target_arch = "wasm32")]
 
@@ -17,9 +14,7 @@ use wasm_bindgen_test::*;
 wasm_bindgen_test_configure!(run_in_browser);
 
 /// Frame 1 always uploads the font atlas, so a non-empty `textures_delta.set`
-/// is a concrete a-frame-really-ran witness -- a completion without it would
-/// prove only that nothing panicked. (Mirrors the host-side precedent in
-/// `rustdar-egui/src/ui_map/tests.rs`.) The second frame proves the first
+/// is a concrete a-frame-really-ran witness. The second frame proves the first
 /// left the `Gui` in a state that can run again.
 #[wasm_bindgen_test]
 fn the_first_egui_frame_ever_executed_on_wasm() {
@@ -38,24 +33,17 @@ fn the_first_egui_frame_ever_executed_on_wasm() {
 }
 
 /// `JobRequest` bytes survive the browser's REAL structured-clone +
-/// ArrayBuffer-transfer machinery -- a `MessageChannel`, not a mock: encode,
-/// post with the buffer in the transfer list, receive on the far port,
-/// decode, compare.
-///
-/// The mid-flight assertion is that the sender's buffer is detached
-/// (`byteLength == 0`) after the post: the transfer MOVED the bytes, the
-/// zero-copy contract the worker wire depends on.
+/// ArrayBuffer-transfer machinery — a `MessageChannel`, not a mock. The
+/// mid-flight assertion is that the sender's buffer is detached
+/// (`byteLength == 0`) after the post: the transfer MOVED the bytes.
 #[wasm_bindgen_test]
 async fn job_request_bytes_survive_a_real_message_channel_transfer() {
     use rustdar_worker::offload::JobRequest;
     use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 
     let archive: Vec<u8> = (0..=255u8).cycle().take(1024).collect();
-    // Constructed the way every dispatch site constructs one (WO-M7.2
-    // dissolved the old `JobRequest::Decode` enum variant this test was born
-    // against): a typed input described under an envelope. A decode carries no
-    // raster geometry, so the envelope is all zeroes — the same shape the
-    // production dispatch site sends.
+    // Constructed the way every dispatch site constructs one: a typed input under
+    // an envelope. A decode carries no raster geometry, so the envelope is zeroes.
     let request = JobRequest::describe(
         rustdar_radar::jobs::DecodeJob {
             archive: std::sync::Arc::new(archive.clone()),
@@ -108,31 +96,21 @@ async fn job_request_bytes_survive_a_real_message_channel_transfer() {
     let mut back = vec![0u8; received.length() as usize];
     received.copy_to(&mut back[..]);
 
-    // `from_bytes` returning `None` is the clean-refusal contract for bytes
-    // from ANOTHER build; for bytes this build just encoded it is a failed
-    // test, never a refusal to tolerate.
+    // `from_bytes` returning `None` is the clean-refusal contract for bytes from
+    // ANOTHER build; here it is a failed test.
     let decoded = JobRequest::from_bytes(&back)
         .expect("this build's own bytes must decode; None here is a broken codec");
-    // `JobRequest` equality is value equality down through the type-erased
-    // input (`JobInput::eq_dyn`): same kind, same archive bytes, same
-    // envelope — the whole request survived the transfer, not just a prefix.
+    // `JobRequest` equality is value equality down through the type-erased input,
+    // so the whole request survived, not just a prefix.
     assert_eq!(
         decoded, request,
         "the decoded request must equal the one encoded before the transfer"
     );
 }
 
-/// The build-token compare reads REAL JS values: a token written onto a
-/// `js_sys::Object` with `set_field` reads back verbatim through
-/// `string_field` (the exact helpers `worker_port::handle_message` reads a
-/// HELLO with), and a doctored token compares unequal -- the `theirs != ours`
-/// branch that terminates and respawns the worker.
-///
-/// Both shapes `build_token` can yield ride the same path: CI-shaped
-/// (`version/sha`) and dev-shaped (`version/wire-<digest>`),
-/// equal-compares-equal and ANY single-character doctoring compares unequal.
-/// (The real `build_token()` above already exercises whichever shape this
-/// run was built under; the two literals are the deterministic pair.)
+/// The build-token compare reads REAL JS values through the exact helpers
+/// `worker_port::handle_message` reads a HELLO with, and a doctored token
+/// compares unequal. Both shapes `build_token` can yield ride the same path.
 #[wasm_bindgen_test]
 fn the_token_compare_reads_real_js_values() {
     use rustdar_web::worker_protocol::{TOKEN, build_token, set_field, string_field};
@@ -179,10 +157,9 @@ fn the_token_compare_reads_real_js_values() {
     }
 }
 
-/// A config value stored through [`LocalStorageKvStore`] lands under the
-/// raw browser key exactly `rustdar.ui` -- read back through
-/// `window.localStorage` directly, which pins `storage_key`'s prefix mapping
-/// against the real `Storage` object rather than against itself.
+/// A config value stored through [`LocalStorageKvStore`] lands under the raw
+/// browser key exactly `rustdar.ui`, read back through `window.localStorage`
+/// directly.
 ///
 /// [`LocalStorageKvStore`]: rustdar_web::kv::LocalStorageKvStore
 #[wasm_bindgen_test]

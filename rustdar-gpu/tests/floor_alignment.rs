@@ -1,281 +1,35 @@
 //! The floor↔volume alignment instrument.
 //!
-//! The 3D view's floor is no longer a picture built for it. It is the 2D map
-//! pane's own already-rendered egui output — the **pane mirror** — and the
-//! raymarch reaches into it per pixel: `volume.wgsl`'s `floor_colour` carries
-//! the ray's landing point on the box's bottom face out to geography and back
-//! into the mirror's texture coordinates. That single conversion is the whole
-//! registration, and it is three lines of shader nobody can step through.
+//! The 3D view's floor is the 2D pane's own rendered output — the pane mirror —
+//! and `volume.wgsl`'s `floor_colour` carries the ray's landing point on the
+//! box's bottom face out to geography and back into the mirror's texture
+//! coordinates. This file is a CPU model of those three lines ([`mirror_uv`]),
+//! scored against `build_voxels`' grid on a common lattice over the box
+//! footprint. The transform that best maps one mask onto the other is the
+//! diagnosis: translation ≈ (0, 0) with identity beating every flip →
+//! registered; a flip winning → a row-direction disagreement; a half-box offset
+//! → an origin/sign disagreement; shapes aligned but IoU ≈ 0 → the two paths
+//! read different data. Every deliberate break in [`Mapping`] is scored
+//! alongside the true one, so a break that costs no IoU is a hole in the
+//! instrument.
 //!
-//! This file is a **CPU model of those three lines**, run against the same
-//! raster the mirror is made of, so the conversion can be scored without a
-//! headless GPU:
+//! The raster's grid convention, from `MercatorProjection::render_gate`:
+//! columns are linear in longitude (`centre + Δλ · EARTH_RADIUS_KM · cos φ₀ ·
+//! px_per_km`, `min_lon` at column 0), rows are linear in Web Mercator y
+//! (`py = (mercator_y_max − mercator_y(φ)) · IMAGE_SIZE / (mercator_y_max −
+//! mercator_y_min)`, row 0 at `max_lat`) — not in latitude, which is why
+//! [`Mapping::LinearLatitudeV`] is a perturbation and not a simplification.
 //!
-//!   * `rustdar_radar::voxel::build_voxels`, the grid the raymarch draws, and
-//!   * `render_from`'s raster read through the shader's mapping, the ground
-//!     that grid stands on —
-//!
-//! measured against one another on a common lattice over the box footprint.
-//! The echo footprint of the grid's columns and the sampled mirror must sit on
-//! top of one another; the transform that best maps one onto the other **is
-//! the diagnosis**:
-//!
-//!   * best translation ≈ (0, 0) and identity beating every flip → registered;
-//!   * a flip winning → a row-direction disagreement;
-//!   * a half-box offset → an origin/sign disagreement;
-//!   * shapes aligned but IoU near zero → the two paths read different data.
-//!
-//! # Why the mapping is modelled rather than called
-//!
-//! `floor_colour` is WGSL. The lanes it reads (`floor_uv`, `floor_geo`) are
-//! built on the CPU, but the arithmetic between them and a texture coordinate
-//! only exists in the shader, and running the shader means a device, a
-//! swapchain-format decision and a readback — none of which a `cargo test` row
-//! has. So [`mirror_uv`] restates `floor_colour`'s conversion in Rust, and the
-//! restatement is made honest by the perturbations: every deliberate break of
-//! the mapping listed in [`Mapping`] is scored alongside the true one, and a
-//! break that does not cost IoU is a hole in the instrument, not a harmless
-//! variant. See [`Mapping`] and [`Region`].
-//!
-//! # Why the raster stands in for the mirror
-//!
-//! The shipped mirror is the whole 2D pane: tiles, the radar raster, alerts,
-//! labels, the lot, drawn a second time into an offscreen target. Everything
-//! in it except the radar raster is egui geometry that only exists inside a
-//! running frame, so a test cannot have it. What a test *can* have is the one
-//! layer whose geography is a pure function of the site — the raster
-//! `render_from` produces — and that layer is enough, because the mapping
-//! being scored does not know or care which layers painted the pixel it lands
-//! on.
-//!
-//! The raster's own grid convention, read out of `rustdar_radar::render`'s
-//! `MercatorProjection::render_gate` (and matching `ui_map_pane`, which places
-//! the texture at `ImageBounds`' north-west and south-east corners on the
-//! walkers map):
-//!
-//!   * **columns are linear in longitude**, `min_lon` at column 0 and
-//!     `max_lon` at the right edge — `render_gate` writes
-//!     `centre + Δλ · EARTH_RADIUS_KM · cos φ₀ · px_per_km`, which is a column
-//!     per radian of longitude and nothing else;
-//!   * **rows are linear in Web Mercator y**, not in latitude —
-//!     `py = (mercator_y_max − mercator_y(φ)) · IMAGE_SIZE / (mercator_y_max −
-//!     mercator_y_min)`, row 0 at `max_lat`.
-//!
-//! Which is why `floor_colour`'s v axis runs with Mercator y and its u axis
-//! with longitude, and why [`Mapping::LinearLatitudeV`] is a perturbation and
-//! not a simplification.
-//!
-//! The instrument test is `#[ignore]`d because it reads a volume from disk:
+//! `#[ignore]`d because it reads a volume from disk:
 //!
 //! ```text
 //! VOL=/path/to/KDMX20250314_175512_V06 [THRESH=15] [OUT=/tmp/prefix] \
 //! cargo test -p rustdar-gpu --release --test floor_alignment -- --ignored --nocapture
 //! ```
 //!
-//! | variable | required | default | meaning |
-//! |---|---|---|---|
-//! | `VOL` | yes | — | Uncompressed NEXRAD Level II archive file. |
-//! | `SITE` | no | the identifier the volume's own radials carry | Radar ICAO. |
-//! | `HALF_KM` | no | the app's default box | Box half-extent, km, on **both** axes. |
-//! | `HALF_E_KM` | no | `HALF_KM` | Box half-extent east–west, km, overriding `HALF_KM` on that axis alone. |
-//! | `HALF_N_KM` | no | `HALF_KM` | Box half-extent north–south, km. Give both axes, or `HALF_KM`, or neither. |
-//! | `THRESH` | no | `15.0` | dBZ cut for the grid's echo mask. |
-//! | `OUT` | no | — | Prefix; writes `_floor.ppm`, `_grid.pgm`, `_overlay.ppm`. |
-//!
-//! # The standing measurement
-//!
-//! `KDMX20250314_175512_V06`, default box, `THRESH=15`:
-//!
-//! | path | raster | IoU identity | best translation |
-//! |---|---|---|---|
-//! | the deleted `resample_floor` floor | ±230 km, 2048 px | 0.5815 | (0, 0) texels |
-//! | the mirror read through `floor_colour` | ±230 km, 2048 px | 0.5777 | (0, 0) texels |
-//! | the same, per-radial wedge widths | ±230 km, 2048 px | 0.5776 | (0, 0) texels |
-//! | the same, extent from the sweep | ±458 km, 2048 px | 0.6789 | (−1, +2) texels |
-//! | the same, side from the extent | ±458 km, 4096 px | 0.6883 | (−1, +2) texels |
-//! | the same, gates on the ground | ±458 km, 4096 px | 0.6882 | (−1, +1) texels |
-//! | the same, box square inside the reach | ±458 km, 4096 px | 0.6601 | (−1, +1) texels |
-//! | the same, box circumscribing the ring | **±458 km, 4096 px** | **0.6572** | (0, +1) texels |
-//!
-//! The first two are the same measurement to within the mask criterion — the
-//! old one asked "does this texel differ from the ground colour", this one asks
-//! "did the mirror paint here". The third is the same picture again after each
-//! radial started being painted at the width it declares rather than at the
-//! distance to its neighbour: one part in six thousand, scattered wedge-edge
-//! pixels, exactly as that change predicted.
-//!
-//! **The fourth is a different picture.** The raster is now projected at the
-//! extent its own sweep reaches, and KDMX's 0.5° surveillance cut is 1832 gates
-//! of 0.25 km — so the mirror covers ±458 km where it used to cover ±230, and
-//! the box being scored occupies a quarter of it instead of all of it. Two
-//! things follow, and they pull in opposite directions:
-//!
-//!   * **Coverage completes, and that is most of the gain.** The box's corners
-//!     stand 325 km from the site. The grid samples the volume out there and
-//!     found echo; the old raster stopped at 230 km and had nothing to show, so
-//!     every corner texel was a miss the mapping could do nothing about. The
-//!     far south-west square — where this day's storms were — goes 0.5009 →
-//!     0.8635 on that alone.
-//!   * **The mirror was half as fine, and the echo dilated.** 2.24 px/km
-//!     instead of 4.45, so `render_gate`'s two extra samples per axis padded a
-//!     gate's footprint by ~0.45 km rather than ~0.22 km: 38 208 texels painted
-//!     against 29 263. The best translation drifts off zero by one and two
-//!     texels (−0.90, +1.80 km) and buys 0.0041 of IoU, which is the dilation
-//!     finding its own centre rather than a registration error — a
-//!     mis-registration of that size would show as a centroid shift and does
-//!     not (the centroid delta *shrank*, +24.8/−17.6 → +9.3/−13.3 texels).
-//!
-//! The fifth row restores the resolution: the raster's side now follows its
-//! extent, so ±458 km is drawn on 4096 px at 4.45 px/km — the floor's own
-//! scale. The dilation goes back with it (36 450 texels painted against
-//! 38 208), the centroid delta closes a little further (+7.9/−11.0 texels) and
-//! the identity IoU rises to 0.6883.
-//!
-//! **The sixth row is the two sides finally measuring the same geometry, and
-//! it moves almost nothing.** The plan view now paints a gate at the ground
-//! range under it, which is the `cos e` the grid has always sampled with — so
-//! the asymmetry named in the residual paragraph below is gone. What it bought
-//! on this volume: identity 0.6883 → 0.6882, painted 36 450 → 36 461, centroid
-//! delta +7.9/−11.0 → +8.0/−11.0. The best translation is the one thing that
-//! did move, (−1, +2) → (−1, +1) texels, i.e. the floor mask sits 0.9 km
-//! closer to where the grid puts the same echo. That is the right direction
-//! and it is *one texel*, so read it as consistent rather than as evidence.
-//!
-//! **The seventh row is the same picture measured through a coarser probe, and
-//! it is not a registration change.** `box_half_width_km` now returns the
-//! largest square that fits inside the volume's reach, so this volume's default
-//! box is ±325.3 km where the six rows above were taken at ±230 km. The probe
-//! lattice is a fixed [`PROBE_TEXELS`]² over whatever the box footprint is, so
-//! a box 1.41× wider is sampled at 1.27 km/texel instead of 0.90, and both
-//! masks lose about half their texels to it (floor 36 461 → 19 973, grid
-//! 29 252 → 15 284). A mask's boundary is one texel wide either way, so a
-//! coarser texel puts proportionally more of each mask on its own boundary and
-//! IoU falls: 0.6882 → 0.6601. What did *not* move is the registration — the
-//! best translation is (−1, +1) texels in both, the flips still fail by two
-//! orders of magnitude (0.1296 / 0.0004 / 0.0004 against 0.6601) and the
-//! centroid delta closes to +8.5/−4.6 texels. Read this row as the instrument
-//! reporting on a wider box, not as the mapping having drifted.
-//!
-//! It is also the first row taken since the compiled-in site table was deleted,
-//! and the six above it were the last measurement anyone could take: the run
-//! panicked on `get_radar_site("KDMX")` from the moment the table went, so the
-//! box-sizing change landed with nothing able to measure it. The site now comes
-//! out of the volume — see `live_volume::site_of` — which is what makes a row
-//! like this one reachable again for any radar.
-//!
-//! The reason it is so small is that this instrument is dominated by tilts
-//! where `cos e` is nothing. KDMX's mask is mostly its 0.5° surveillance cut,
-//! where the correction is 0.08 px; the tilts where it is worth 18 px paint a
-//! small fraction of the texels. **A TDWR volume is where this row would
-//! move**, and there is no TDWR in this instrument's corpus.
-//!
-//! **The eighth row is the box widening once more, and it is the seventh row's
-//! arithmetic run a second time.** `box_half_width_km` returns the reach
-//! itself now — the box circumscribes the data ring instead of standing
-//! inscribed in it — so this volume's default box is ±460.1 km where the
-//! seventh row was taken at ±325.3, the same √2 again. The probe pitch
-//! coarsens 1.27 → 1.80 km/texel, both masks halve again (floor 19 973 →
-//! 9 964, grid 15 284 → 7 680) and identity IoU falls 0.6601 → 0.6572.
-//!
-//! **What did not move is the registration, and the centroid says so in
-//! kilometres.** +8.5/−4.6 texels at 1.27 km/texel is +10.80/−5.85 km; this
-//! row's +5.8/−2.9 at 1.80 km/texel is +10.42/−5.21 km. The same offset to
-//! within 0.4 and 0.6 km, which is a third of a texel on either probe. The
-//! best translation reading (0, +1) texels where the seventh read (−1, +1) is
-//! that same statement in the coarser unit: the east lane's −1.27 km is now
-//! under half of a 1.80 km texel and rounds to zero, and the north lane's does
-//! not. The flips still fail, by 5× for x and by three orders of magnitude for
-//! the two that mirror v (0.1299 / 0.0006 / 0.0005 against 0.6572).
-//!
-//! **The corner columns say nothing at this box**, and that is a property of
-//! the box rather than of the day. [`Region::far_corner`] is the outer quarter
-//! of each axis, which now begins 230 km out, and this day's mass sits inside
-//! that on every side: all four corners hold zero grid texels where the
-//! ±325.3 km box put 380 of them in the south-west. Read the eighth row's
-//! whole-box and centre columns only.
-//!
-//! **A fixed box re-read, and a residual this file cannot yet account for.**
-//! `HALF_KM=230` on the same binary gives identity 0.6905 where the sixth row
-//! recorded 0.6882, with the grid mask *identical* — 29 252 texels, the same
-//! number — and the floor's up 13, 36 461 → 36 474. So the grid is the sixth
-//! row's exactly and the mirror is not. Two candidates, neither confirmed
-//! here: the site anchor (the sixth row was placed from the compiled-in table
-//! and every row since is placed where the volume says, which moves the
-//! raster's Mercator bounds while leaving a mask taken in box coordinates
-//! alone), and the render's own rework since. The grid staying put under it is
-//! consistent with either, because a 1.80 km cell and a 0.90 km probe texel
-//! are both far coarser than a 0.22 km raster pixel. It is 0.0023 of IoU, it
-//! is written down rather than explained, and nothing in the commit that
-//! recorded it touched either side.
-//!
-//! **The mapping table still does not discriminate on this volume, and neither
-//! the resolution nor the `cos e` asymmetry was why.** Whole-box on the ±325.3
-//! km box: honest 0.6601, trapezoid 0.6649, linear-v 0.6603 — the two
-//! deliberate perturbations score *above* the exact mapping, by +0.0048 and
-//! +0.0002. They did the same at ±230 km on both raster sides: 0.6882 /
-//! 0.6901 / 0.6933 at 4096 px, and +0.0008 / +0.0049 at 2048 px. Three
-//! resolutions and two box sizes moved those margins by under 0.006 without
-//! changing their sign, which disposes of the explanation the 2048 row
-//! carried (that halving the uv rate sank two second-order errors under the
-//! mask noise).
-//!
-//! **At the ±460.1 km box the sign finally turns over, and the turn is not the
-//! finding.** Honest 0.6572 against trapezoid 0.6567 and linear-v 0.6548 — the
-//! exact mapping leads, by 0.0005 and 0.0024. Three box sizes and two raster
-//! sides have now put every one of these margins inside ±0.005 of zero in both
-//! directions, which is what "the table does not discriminate here" looks like
-//! when it is measured rather than assumed: a margin that changes sign under a
-//! box change is a margin that was never carrying a signal. The rows that *do*
-//! carry one are unmoved — `no cos(lat)` reads 0.3755 against 0.6572 on this
-//! box, and the discrimination this file actually asserts is against the
-//! synthetic fixture, not against this table. Measured directly on that
-//! fixture — the same tree, the same field, only the side changed —
-//! resolution barely moves this instrument at all: the corner falls are
-//! 0.2366 / 0.1610 at 2048 px against 0.2406 / 0.1648 at 4096.
-//!
-//! What is left is the volume. This day's echo is one broad mass in the
-//! south-west — 380 of the box's 15 284 grid texels are in that one eighth at
-//! this probe pitch, and the other three corners hold 0, 0 and 4 — and the
-//! honest mapping already carries a residual against it that has nothing to do
-//! with the mapping: the grid's mask is a **column max** through the whole box
-//! while the raster's is one tilt's plan view, so the two masks differ in area
-//! by a third (19 973 against 15 284; 36 461 against 29 252 at ±230 km). That
-//! was previously attributed in part to the raster omitting `cos e`; it applies
-//! it now and the areas did not move, so the difference is the column max and
-//! nothing else. A second-order perturbation of a few kilometres inside a
-//! contiguous echo mass costs almost no overlap, and one that happens to nudge
-//! the floor mask along that residual *buys* some. Only `no cos(lat)` — first
-//! order, 1.34× at this latitude — still falls clear (0.3738, and 0.4634 at
-//! ±230 km).
-//!
-//! So this table reports registration and coverage on a real volume, and the
-//! discrimination that is *asserted* rather than reported lives in
-//! [`a_broken_mapping_costs_iou_in_the_corner_even_where_the_centre_cannot_tell`],
-//! whose field has structure at the perturbations' own scale everywhere in the
-//! box. That is the fixture to change if the shader's mapping is ever
-//! reworked; this one is for coverage and gross misregistration.
-//!
-//! # What this file inherited from the deleted `volume_floor/tests.rs`
-//!
-//! The CPU floor compositor and its unit tests went with the old design. Two
-//! of the geometry contracts they pinned survive the move and are re-pinned
-//! here against the mirror path:
-//!
-//!   * **site-centred mapping** — the box's own site position must land on the
-//!     pixel the raster drew the site's own echo at
-//!     ([`the_boxs_site_position_lands_on_the_mirrors_site_pixel`]);
-//!   * **gate/pixel coincidence** — a gate at a known range and azimuth must
-//!     land on the mirror pixel that renders it
-//!     ([`a_gate_lands_on_the_mirror_pixel_that_renders_it`]).
-//!
-//! One did not survive, and is deliberately not faked: **layer stack order**.
-//! `compose_floor` used to paint ground, basemap, radar and labels itself, in
-//! that order, and a test could check that a label tile covered an echo. The
-//! mirror has no compositor — the stacking is egui's own painting order inside
-//! the source pane, established by the 2D pane's draw calls and reproduced by
-//! replaying that pane's geometry. There is nothing in this crate left to
-//! assert it against, and a test that rebuilt a stack here would be checking
-//! its own fixture. It belongs to `rustdar-egui`'s pane, or to nothing.
+//! `VOL` is required. `SITE` defaults to the volume's own identifier, `HALF_KM`
+//! (or `HALF_E_KM`/`HALF_N_KM`) to the app's box, `THRESH` to 15 dBZ; `OUT` is a
+//! prefix for `_floor.ppm`, `_grid.pgm`, `_overlay.ppm`.
 #![cfg(not(target_arch = "wasm32"))]
 
 use rustdar_radar::types::{ImageBounds, RadarProduct};
@@ -299,23 +53,9 @@ use live_volume::{scan_from_archive, site_of};
 use rustdar_geo::KM_PER_DEGREE_LAT;
 
 /// Side of the lattice both masks are expressed on, in texels.
-///
-/// Nothing in the shipped path has a floor lattice any more — the mirror is
-/// frame-sized and the march samples it per pixel. 512 is the deleted
-/// `volume_floor.rs`'s `FLOOR_TEXELS`, kept so this instrument's numbers stay
-/// comparable with the ones the old path was measured at.
 const PROBE_TEXELS: usize = 512;
 
 /// The 3D texture limit these fixtures build their grids against.
-///
-/// The grid's shape is a runtime answer now — `voxel::shape_for_budget` spends
-/// the tier's cell budget over the axes a device says it can hold — so a test
-/// that wants a grid has to name a device. This one names the least capable
-/// conforming device, the WebGL2 guarantee, for two reasons: what is being
-/// measured here is a **mapping**, which is a property of the box rather than
-/// of the cell count, and a fixture that moved with the adapter would be an IoU
-/// threshold nobody could reproduce. It is also the cheapest, which matters for
-/// a test that resamples a synthetic volume in the gate.
 const GRID_DEVICE_AXIS: usize = 256;
 
 /// The background the PPM dump draws unpainted probe texels on: the deleted
@@ -346,12 +86,6 @@ fn mercator_y(lat_rad: f64) -> f64 {
 struct Mirror {
     side: usize,
     /// Kilometres of ground across one texel: `2 · extent / side`.
-    ///
-    /// Here because a budget written in *pixels* is a budget that changes
-    /// meaning when the raster's size does, and it does now — the same 237 km
-    /// fixture is 2048 texels on a device that cannot take the long-range
-    /// raster and 4096 on one that can. What the mapping can be wrong by is a
-    /// distance on the ground, so that is the unit the pins below state.
     km_per_px: f64,
     rgba: Vec<u8>,
     site_lat_deg: f64,
@@ -371,17 +105,6 @@ impl Mirror {
     /// `MercatorProjection::from_bounds(lat, &ImageBounds::from_radar_site(..))`
     /// and `ui_map_pane` places the finished texture between the same bounds'
     /// north-west and south-east corners.
-    ///
-    /// u is linear in longitude and v in Mercator y, both anchored at the site
-    /// the way the uniform anchors them. `v_per_mercator_y` is **negative**:
-    /// Mercator y grows north and rows grow south.
-    ///
-    /// `extent_km` is the **render's own second return value**, not a
-    /// constant. A raster is projected at `plan_view_extent_km` of its sweep's
-    /// reach, so the fixtures here span three different amounts of ground —
-    /// 230 km where the tilt stops inside the floor, 237 km where it does not,
-    /// 458 km on a real super-res volume — and a mirror built at any other
-    /// number would score a correct mapping as broken.
     fn from_pane_raster(
         rgba: Vec<u8>,
         side: usize,
@@ -437,9 +160,6 @@ impl Mirror {
 }
 
 /// The box's bottom face in the terms `floor_geo` and `box_size_km` carry it:
-/// its west and south edges as kilometres east and north **of the site**, and
-/// its extent. Position and extent are separate because the uniform keeps them
-/// separate.
 #[derive(Clone, Copy)]
 struct BoxGeo {
     west_km: f64,
@@ -472,13 +192,6 @@ impl BoxGeo {
 }
 
 /// Which arithmetic [`mirror_uv`] runs.
-///
-/// [`Mapping::Honest`] is `floor_colour`, line for line. The rest are the
-/// mistakes that mapping is one edit away from, kept as first-class variants so
-/// the instrument can be shown to *fail* — a scoring rig nobody has watched go
-/// red is a number, not a check. Each is scored beside the honest one, and
-/// each one's damage is concentrated somewhere different, which is the reason
-/// [`Region`] exists.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mapping {
     /// The shader's own conversion.
@@ -488,13 +201,7 @@ enum Mapping {
     /// east-west by `1 / cos φ` about the site's meridian — nothing at
     /// `x = 0`, tens of kilometres at the box's east and west edges.
     NoCosLat,
-    /// The **equirectangular** mapping this reprojection used to run:
-    /// `φ = φ₀ + y/K`, `Δλ = x/(K·cos φ)`. Not an invented mistake — it is
-    /// what shipped, and it registered only because `render_gate` placed the
-    /// raster's gates by the same approximation. Zero on the cardinals through
-    /// the site and outward on the diagonals, growing with range and with
-    /// latitude: ~15 km at the default box's corners at 41.7 °N, which is twice
-    /// the trapezoid error this reprojection was introduced to remove.
+    /// The **equirectangular** mapping: `φ = φ₀ + y/K`, `Δλ = x/(K·cos φ)`.
     Equirectangular,
     /// Run v linear in latitude instead of in Mercator y, at the slope that
     /// makes the two agree at the site. Zero at the site, growing as the
@@ -522,23 +229,6 @@ impl Mapping {
 }
 
 /// `volume.wgsl`'s `floor_colour`, in Rust, up to the texture fetch.
-///
-/// ```text
-/// x_km  = floor_geo.y + hit.x · box_size_km.x
-/// y_km  = floor_geo.z + hit.y · box_size_km.y
-/// δ     = hypot(x_km, y_km) / EARTH_RADIUS_KM      ← the box is polar…
-/// sin φ = sin φ₀·cos δ + cos φ₀·sin δ·cos az       ← …so this is spherical
-/// Δλ    = atan2(sin az·sin δ·cos φ₀, cos δ − sin φ₀·sin φ)
-/// u     = floor_uv.x + Δλ° · floor_uv.z
-/// v     = floor_uv.y + (mercᵧ(φ) − mercᵧ(φ₀)) · floor_uv.w
-/// ```
-///
-/// `(sin az, cos az)` is `(x_km, y_km)/range`, which is what makes the box's
-/// own coordinates the bearing and the range with no trigonometry in between —
-/// see `rustdar_radar::voxel`'s "Geometry" section.
-///
-/// `None` where the shader returns transparent: off the mirror, and within a
-/// millionth of a pole.
 fn mirror_uv(
     mirror: &Mirror,
     geo: &BoxGeo,
@@ -653,14 +343,6 @@ impl Mask {
 }
 
 /// A rectangle of the probe lattice to score inside.
-///
-/// The instrument's predecessor scored one centred box and nothing else, and
-/// that is precisely where the projection errors it was built to catch are
-/// smallest: `cos φ` is symmetric about the site's parallel and its error
-/// vanishes on the box's own centre lines, so a centred-only score is blind to
-/// the trapezoid. Scoring a corner as well is the fix, and the *contrast*
-/// between the two — reported side by side for every [`Mapping`] — is what
-/// makes the number mean something.
 #[derive(Clone, Copy)]
 struct Region {
     label: &'static str,
@@ -700,12 +382,6 @@ impl Region {
     /// the radar reaches all of it depends on the volume: a corner stands
     /// 325 km from the site, so a sweep that stops at 230 km cuts this square
     /// on the diagonal while a 458 km surveillance cut fills it.
-    ///
-    /// All four are worth scoring on a real volume, because a real volume's
-    /// echo is wherever the weather was: the 2025-03-14 KDMX case this
-    /// instrument was calibrated on has its storms in the **south-west**, and a
-    /// north-east-only corner probe would have scored an empty square and
-    /// reported a confident zero.
     fn far_corner(side: usize, east: bool, north: bool) -> Self {
         let (col0, col1) = if east {
             (side * 3 / 4, side)
@@ -810,10 +486,6 @@ fn best_translation(a: &Mask, b: &Mask, reach: i64, step: i64) -> ((i64, i64), f
 
 /// The floor as the march would draw it: the mirror sampled through `mapping`
 /// at the centre of every probe texel, with row 0 the footprint's north edge.
-///
-/// `hit.y` runs **north** — `floor_colour` adds it to the box's *south* edge —
-/// so the row-to-`hit.y` line is where a v flip would live, and it is written
-/// once, here.
 struct FloorSample {
     mask: Mask,
     /// The sampled colours, for the `OUT` dump. Unpainted texels get
@@ -956,21 +628,6 @@ fn print_mapping_table(mirror: &Mirror, geo: &BoxGeo, grid_mask: &Mask, regions:
 
 /// The box's half-extent from the environment, or `None` for the box
 /// `build_voxels` sizes from the volume's own reach.
-///
-/// `None` is what a pane with no picked region sends, and it stays the default
-/// so the standing measurement is still one `VOL=` away.
-///
-/// **Two axes rather than one**, because a 3D pane's box is the rectangle of
-/// ground its viewport shows and no longer the square inscribed in it. An
-/// instrument that could only ask for a square could not score the shape the
-/// application actually renders — and the floor covering the box is precisely
-/// the invariant the inscribed square used to protect for free, so a rectangle
-/// is the case now worth measuring.
-///
-/// One axis alone is refused rather than paired with an invented number: the
-/// other axis's honest partner is the default box, which is not known until
-/// `build_voxels` has seen the scan, and quietly substituting a stand-in would
-/// report a shape nobody asked for.
 fn half_extent_from_env() -> Option<rustdar_radar::voxel::HalfExtentKm> {
     let parsed = |name: &str| -> Option<f64> {
         std::env::var(name).ok().map(|raw| {
@@ -1053,8 +710,6 @@ fn measure_floor_against_grid_on_a_real_volume() {
     // **Per axis.** The probe lattice is a fixed `PROBE_TEXELS`² over whatever
     // the box footprint is, so on a rectangular box a texel is not square on
     // the ground and one number cannot convert both lanes of a translation.
-    // Reading the east rate onto the north lane is how a rectangle would report
-    // a registration error it does not have.
     let km_per_texel_x = (x1 - x0) / side as f64;
     let km_per_texel_y = (y1 - y0) / side as f64;
     println!("volume: {}", vol.display());
@@ -1122,24 +777,6 @@ fn measure_floor_against_grid_on_a_real_volume() {
     // day's weather actually stood in, because that is where the errors they
     // introduce live. Corners with no grid texels in them score zero for every
     // mapping and mean nothing — the count row above is how to tell.
-    //
-    // Read the corner columns with care on a real volume. IoU inside a
-    // sub-region is only a fair comparison when both masks fill it comparably:
-    // where the grid's echo saturates a corner and the floor's does not,
-    // `no cos(lat)` — which stretches the sampled ground outward by `1/cos φ`,
-    // 1.34× at KDMX — drags *more* echo into the square and can score **above**
-    // the honest mapping there while losing badly over the whole box. Measured
-    // on KDMX 2025-03-14 at the ±230 km box: whole box 0.5777 honest against
-    // 0.4989 broken, far SW corner 0.5009 honest against 0.6326 broken. It does
-    // not reproduce at the ±325.3 km box the same volume gets now — 0.7204
-    // honest against 0.1683 there, because the wider square no longer saturates
-    // — which is the point: whether the corner column is fair depends on the
-    // volume and the box, so it is never the thing to conclude from. That is a
-    // property of scoring
-    // a lopsided sub-region, not a defect in the mapping, and it is why the
-    // discrimination is *asserted* against the synthetic fixture in
-    // `a_broken_mapping_costs_iou_in_the_corner_even_where_the_centre_cannot_tell`,
-    // whose field fills the box evenly, and only *reported* here.
     println!();
     print_mapping_table(
         &mirror,
@@ -1308,17 +945,6 @@ fn mirror_from_field(
 
 /// The raster a **static desktop pane** would produce for `input`, its side and
 /// its extent — the picture the shipped mirror is made of.
-///
-/// `render_from_sized` at this build's own long-range ceiling, not
-/// `render_from`: a pane render is dispatched at the ceiling its device
-/// reported, so a sweep reaching past the 230 km floor is drawn onto at least
-/// 4096 px rather than 2048, and
-/// an instrument that modelled the mirror at the base size would be scoring a
-/// picture no pane ever shows.
-///
-/// The side is read back off the buffer for the reason every consumer in the
-/// app reads it back off the buffer: it is a function of how far the sweep
-/// reached, which is a property of the volume on disk and not of this file.
 fn pane_raster(input: &rustdar_radar::render_input::RenderInput) -> Option<(Vec<u8>, usize, f64)> {
     let rustdar_radar::render::SweepRender {
         image,
@@ -1339,31 +965,6 @@ fn pane_raster(input: &rustdar_radar::render_input::RenderInput) -> Option<(Vec<
 
 /// The two radars **the fixture tests** in this file measure against, placed
 /// once.
-///
-/// `rustdar-radar` carries no list of the network — see
-/// [`SiteTable`](rustdar_radar::sites::SiteTable) — so a test binary that
-/// decodes no volume and fetches no catalogue has an empty table, and
-/// `get_radar_site` answers `None` for every identifier. The application
-/// resolves its own table before its first frame; this is the same step, for a
-/// process that has no application in it.
-///
-/// Its own copy rather than the library's `crate::test_sites`, because an
-/// integration test is a separate crate and cannot reach a `#[cfg(test)]`
-/// module inside the one it is testing.
-///
-/// **Not what places the site for
-/// [`measure_floor_against_grid_on_a_real_volume`]** — which is `#[ignore]`d,
-/// since it wants both an adapter and a volume on disk. That one holds a volume,
-/// and a volume says where its own radar is — so it learns `VOL`'s site rather
-/// than looking it up here, and works on any radar's volume instead of on the
-/// two written down below. See `live_volume::site_of`. A fixture test has no
-/// volume to learn from and a synthetic grid it builds itself, which is what
-/// this list is for.
-///
-/// The positions are load-bearing here in a way they are not elsewhere: the
-/// point of `the_boxs_site_position_lands_on_the_mirrors_site_pixel` is that
-/// the Mercator offset grows with latitude, so `KMPX` has to actually be at
-/// 44.8°N for the offset it pins to be the ~18 px the note describes.
 fn install_radars() {
     use rustdar_radar::site_position::SitePosition;
     use rustdar_radar::sites::SiteFix;
@@ -1394,15 +995,6 @@ fn install_radars() {
 }
 
 /// A fixed `±230 km` box about the site, as a [`BoxGeo`].
-///
-/// A **fixture size**, deliberately, and no longer "what the app requests":
-/// the box a sourceless pane gets now follows its volume's own reach
-/// (`rustdar_radar::voxel::box_half_width_km`), and the two tests below are
-/// about the *shape* of the box→mirror mapping rather than about which box it
-/// is handed. Pinning it here keeps their probes — one of them 190 km west of
-/// the site — inside the box whatever the extent policy does next, and the two
-/// tests that do care about the shipped geometry read it off a real grid
-/// (`BoxGeo::from_grid`) instead.
 fn default_box() -> BoxGeo {
     let half = rustdar_radar::voxel::BASE_HALF_WIDTH_KM;
     BoxGeo {
@@ -1457,21 +1049,6 @@ fn beacon_pixel(site_lat: f64, site_lon: f64, dx_km: f64, dy_km: f64) -> (f64, f
 /// **Site-centred mapping**, re-pinned from the deleted
 /// `volume_floor/tests.rs`'s `the_sites_pixel_lands_in_the_middle_of_a_site_
 /// centred_floor`.
-///
-/// The old contract was that the site's echo landed at the *centre texel* of a
-/// site-centred floor. There is no floor texture any more, so the contract
-/// moves with the mapping: the box's own site position — `hit` = (0.5, 0.5) on
-/// a `±half` box — must map to the mirror pixel the raster drew the site's own
-/// echo at.
-///
-/// That pixel is **not** the raster's centre, and saying so is the point. The
-/// raster's columns are linear in longitude and symmetric, so the site is on
-/// the middle column; its rows are linear in Mercator y between `min_lat` and
-/// `max_lat`, and Mercator is not linear in latitude, so the site sits a few
-/// pixels **below** the middle row. A mapping that assumed the site was at
-/// v = 0.5 would pass a centre-of-image check and fail this one. KMPX at
-/// 44.8°N is the site because that offset grows with latitude — about 18 px of
-/// 2048 there — and this pin wants it plainly non-zero.
 #[test]
 fn the_boxs_site_position_lands_on_the_mirrors_site_pixel() {
     install_radars();
@@ -1504,8 +1081,6 @@ fn the_boxs_site_position_lands_on_the_mirrors_site_pixel() {
 
     // And the asymmetry the mapping is carrying: the site's row is off the
     // raster's middle by Mercator's own curvature over the frame's half-width.
-    // If this ever reads zero the raster has stopped being a Mercator picture
-    // and the v axis of the mapping is no longer the right shape for it.
     let middle = mirror.side as f64 / 2.0;
     assert!(
         (mapped.0 - middle).abs() < 1.0,
@@ -1523,51 +1098,6 @@ fn the_boxs_site_position_lands_on_the_mirrors_site_pixel() {
 /// **Gate/pixel coincidence**, re-pinned from the deleted
 /// `volume_floor/tests.rs`'s `a_tile_pixel_and_a_radar_gate_at_the_same_ground_
 /// land_on_the_same_texel`.
-///
-/// The old contract had two independent forward routes to the same ground — a
-/// radar gate and a slippy tile — and asserted they met on one floor texel.
-/// The tile route is gone with the compositor; what remains, and is the thing
-/// the shader can actually get wrong, is the **inverse**: a gate planted at a
-/// known range and azimuth must be found again by running the mapping from the
-/// box position that names the same ground. The rasterizer is the oracle and
-/// the mapping is under test, which is the right way round.
-///
-/// Three probes, because the plausible wrong answers die at *different* ones
-/// and each leaves the others green — the same reason the deleted test carried
-/// a corner probe:
-///
-///   * `(150, 160)` — well east and well north, where taking `cos φ` at the
-///     site instead of at the point costs 3.67 km and a latitude-linear v axis
-///     2.47;
-///   * `(60, 215)` — nearly due north, where the `cos` errors nearly vanish
-///     (1.93 km) and the v axis is at its worst (4.05 km);
-///   * `(-190, -100)` — the opposite quadrant, which catches a sign as well as
-///     a scale, and where the v error is down to 0.65 km.
-///
-/// Probes at KMPX, 44.8°N, for the reason
-/// [`a_broken_mapping_costs_iou_in_the_corner_even_where_the_centre_cannot_tell`]
-/// gives: both second-order errors scale with `tan φ₀`, and this pin wants them
-/// clear of the honest mapping's own budget rather than merely above it.
-///
-/// **The figures are kilometres of ground, not texels**, and that is the
-/// change the adaptive raster forced: this fixture reaches 237 km, so it is
-/// drawn on 2048 texels where the device cannot take a long-range raster and
-/// on 4096 where it can, and every texel figure would double between the two
-/// while nothing about the mapping moved. What a mapping can be wrong by is a
-/// distance.
-///
-/// The honest budget is 0.9 km. When it was set, most of it was one known
-/// disagreement — `render_gate` walked north on `EARTH_RADIUS_KM` (6371 km)
-/// and `floor_colour` on a `KM_PER_DEGREE_LAT` of 111.32 (a 6378 km sphere),
-/// 0.12 % apart, about 0.24 km at 200 km — with a measured worst probe of
-/// 0.48 km against it. The two spheres are one sphere now, so what is left is
-/// the blob's own discretisation and the worst probe can only have come down.
-///
-/// The budget is deliberately *not* tightened to the smaller residual: it is a
-/// ceiling separating an honest mapping from the broken ones at `MUST_MISS_KM`,
-/// and those still miss by more than twice it for reasons — an
-/// equirectangular reprojection, a latitude-linear v axis — that no
-/// unification touches.
 #[test]
 fn a_gate_lands_on_the_mirror_pixel_that_renders_it() {
     const HONEST_BUDGET_KM: f64 = 0.9;
@@ -1624,28 +1154,6 @@ fn a_gate_lands_on_the_mirror_pixel_that_renders_it() {
 
 /// **A box whose two horizontal extents differ**, and the two mistakes that
 /// are invisible until one does.
-///
-/// [`default_box`] is square, and on a square box `BoxGeo`'s two sizes are
-/// interchangeable — so is `floor_colour`'s pair of reprojection lines, which
-/// this module restates. A box built with the east extent on both axes, or
-/// with the two exchanged, maps every `hit` exactly where the honest one does.
-///
-/// So this pin runs the mapping **forward from a box position** rather than
-/// from a place on the ground. `mirror_pixel_for_km` cannot see any of this:
-/// it goes km → `hit` → km through [`BoxGeo::hit_at_km`] and back through
-/// [`mirror_uv`], and those two cancel exactly whatever the extents are. What
-/// the shader actually does is start from `hit` — the ray's crossing of the
-/// box's bottom face, in the box's own `0..1` coordinates — and the box is the
-/// only thing that says what ground that is.
-///
-/// 460 × 230 km, centred on the site: the 2:1 footprint a wide 3D pane frames,
-/// with both halves inside the fixture's 237 km raster.
-///
-/// `MUST_MISS_KM` is 50 rather than the 2.3 the mapping pins use, and
-/// deliberately so: these two are not projection subtleties competing with the
-/// honest mapping's own budget. They read a box coordinate against the wrong
-/// axis's extent, which at these probes is 60 to 105 km of ground. A bound
-/// that made them look marginal would be describing them wrongly.
 #[test]
 fn a_rectangular_boxs_two_extents_each_stay_on_their_own_axis() {
     const HONEST_BUDGET_KM: f64 = 0.9;
@@ -1662,8 +1170,6 @@ fn a_rectangular_boxs_two_extents_each_stay_on_their_own_axis() {
         size_y_km: 230.0,
     };
     // The box the pane used to send, and the box a transposition would build.
-    // Both centred on the site, like the honest one, so the only thing wrong
-    // with either is which extent went on which axis.
     let squared = BoxGeo {
         south_km: -230.0,
         size_y_km: 460.0,
@@ -1731,46 +1237,12 @@ fn a_rectangular_boxs_two_extents_each_stay_on_their_own_axis() {
 }
 
 // ── The pin: a synthetic storm, both production paths, no file, no GPU ───────
-//
-// The instrument above needs a volume on disk; this is the same comparison as
-// a test the gauntlet runs every time. A 55 dBZ disc is planted at a known
-// offset from the site and pushed through **both** production paths — the
-// voxel build the raymarch draws, and the real 2D rasterizer read through the
-// shader's mapping. Neither expectation restates a projection formula: the
-// oracle is the planted disc's own position, and the assertion is that the two
-// paths put it in the same place.
-//
-// What it closes:
-//
-//  * coordinated drift between `floor_colour` and `MercatorProjection` — the
-//    raster here comes from the real renderer, not from a restated formula, so
-//    a change to how the rasterizer projects moves this whether or not the
-//    mapping moved with it;
-//  * axis flips, which mirror the off-centre, off-diagonal disc across the box
-//    and miss by more than a hundred kilometres;
-//  * the historical 2026-08-09 2× floor zoom: the raster's *data reach* fed to
-//    the old resampler as its half-extent. The reach and the extent are once
-//    again two different numbers — a raster is projected at
-//    `plan_view_extent_km` of the reach, which holds it at 230 km until the
-//    data passes that — so the fixture's short low tilt (700 gates, 177 km
-//    against a 230 km frame) is not a historical curiosity but the live
-//    discriminator: a mirror built from 177 would be 1.3× zoomed and this pin
-//    would fail. The **box** is now a third number again — ±125.2 km, the
-//    reach over √2 (`voxel::box_half_width_km`) — so reach, frame and box are
-//    three distinct scales here and a mapping that confused any two of them
-//    cannot pass.
 
 #[test]
 fn a_planted_storm_lands_on_the_floor_exactly_under_its_own_voxels() {
     // A 55 dBZ disc, radius 20 km, centred 60 km east / 85 km north of the
     // site — off-centre on both axes and off the diagonal, so every flip and
     // the site-centred control disagree with it, by 120 km or more.
-    //
-    // Inside the box on every side with room to spare, which is now a fixture
-    // constraint rather than a free choice: the box this volume earns is
-    // ±125.2 km (177.1 km of reach over √2), and a disc clipped by the box
-    // edge would move the grid's centroid without moving the floor's and fail
-    // the alignment pin for a reason that is not a misalignment.
     const DISC_KM: (f64, f64) = (60.0, 85.0);
     const DISC_RADIUS_KM: f64 = 20.0;
     let field = |az_deg: f64, slant_km: f64| -> Option<f64> {
@@ -1887,14 +1359,6 @@ fn a_planted_storm_lands_on_the_floor_exactly_under_its_own_voxels() {
 // ── The pin that makes the instrument's numbers mean something ───────────────
 
 /// Kilometres across one block of the perturbation fixture's field.
-///
-/// 8 km is a compromise with two hard edges: the voxel grid's own cells are
-/// 460/256 ≈ 1.8 km, so a block has to be several cells across to survive the
-/// build at all; and every block edge is where a misregistered mapping shows
-/// up, so bigger blocks mean a blunter instrument. Eight is about four and a
-/// half cells and nine probe texels — measured, it roughly doubles what the
-/// smallest perturbation costs against a 16 km block while leaving the honest
-/// mapping's own score comfortably above the bounds below.
 const BLOCK_KM: f64 = 8.0;
 
 /// Whether the block at `(ix, iy)` is lit. A hash rather than a checkerboard,
@@ -1917,35 +1381,6 @@ fn block_is_lit(ix: i64, iy: i64) -> bool {
 
 /// The acceptance bar: **a broken mapping must cost IoU, and the errors a
 /// centred score cannot see must cost it in the corner.**
-///
-/// The predecessor of this file scored one centred box and nothing else. Its
-/// author left the warning verbatim: *"the instrument as it stands scores a
-/// single centred box where the `cos φ` term is near-symmetric, so it would NOT
-/// have caught the trapezoid error. A centred-only probe is the fixture-
-/// blindness failure this codebase keeps finding."*
-///
-/// So this test takes a field with structure everywhere, runs it through both
-/// production paths, and scores every [`Mapping`] three times — whole box,
-/// centre eighth, far north-east corner. What the measurements say:
-///
-///   * [`Mapping::NoCosLat`] is **first order** in `x_km`: it stretches the
-///     sampled ground by `1/cos φ` about the site's meridian, which is tens of
-///     kilometres at the box edge and several at the centre eighth's own edge.
-///     It is fatal everywhere, corner included, and needs no corner to catch.
-///     It also *saturates* — IoU has a floor — so its corner and centre falls
-///     are of similar size and this test does not ask them to be ordered.
-///   * [`Mapping::Equirectangular`] (the mapping this reprojection used to run)
-///     and [`Mapping::LinearLatitudeV`] are **second order**: both are exactly
-///     right at the site and grow with the square of the distance from it.
-///     These are the errors the warning is about, and the first of them is not
-///     hypothetical — it is what shipped, invisible because the raster it was
-///     scored against carried the same approximation. A centred-only
-///     instrument would have called both of them clean.
-///
-/// The site is **KMPX**, at 44.8°N, and not the KTLX the other fixtures fly:
-/// both second-order errors scale with `tan φ₀`, so a northern site is where
-/// this fixture has the most to say. The mapping is not site-specific and
-/// nothing here depends on which site it is beyond that.
 #[test]
 fn a_broken_mapping_costs_iou_in_the_corner_even_where_the_centre_cannot_tell() {
     install_radars();

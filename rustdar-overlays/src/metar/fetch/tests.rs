@@ -33,7 +33,6 @@ fn a_fahrenheit_temperature_is_converted_not_relabelled() {
     assert_eq!(okc.dewp_c.unwrap().round(), 22.0);
 }
 
-/// Hand-worked arithmetic, independent of any fixture.
 #[test]
 fn the_fahrenheit_conversion_is_the_real_formula() {
     assert_eq!(Fahrenheit(32.0).to_celsius(), 0.0);
@@ -139,7 +138,6 @@ fn unusable_cells_are_counted_and_nulls_are_not() {
     assert_eq!(rejected, 1, "a string in a numeric cell is one rejection");
     let okc = broken_obs.iter().find(|o| o.station_id == "KOKC").unwrap();
     assert_eq!(okc.wind_speed_kt, None);
-    // The rest of the record survives — that is why the field is `Value`.
     assert!(
         okc.temp_c.is_some(),
         "one bad cell must not drop the station"
@@ -148,8 +146,6 @@ fn unusable_cells_are_counted_and_nulls_are_not() {
 
 // ── Identity ──────────────────────────────────────────────────────────
 
-/// Fails if the station id comes from IEM's local 3-letter `station` field
-/// instead of the ICAO callsign at the head of the raw report.
 #[test]
 fn the_station_id_is_the_icao_from_the_raw_report() {
     assert_eq!(icao_from_raw("KOKC 251652Z 20014G20KT"), Some("KOKC"));
@@ -157,14 +153,12 @@ fn the_station_id_is_the_icao_from_the_raw_report() {
     assert_eq!(icao_from_raw("SPECI KLAW 251700Z"), Some("KLAW"));
     assert_eq!(icao_from_raw(""), None);
     assert_eq!(icao_from_raw("251652Z 20014G20KT"), None, "not a callsign");
-    // End to end: the fixture's `station` field is "OKC".
     assert!(SAMPLE.contains("\"station\": \"OKC\""));
     assert_eq!(station("KOKC").station_id, "KOKC");
 }
 
 // ── Visibility ────────────────────────────────────────────────────────
 
-/// Fails if `10SM`/`9999`/`P6SM` collapse to a bare measured number.
 #[test]
 fn an_unrestricted_visibility_is_recovered_from_the_raw_report() {
     assert!(raw_visibility_is_a_bound(
@@ -204,7 +198,6 @@ fn a_nonsensical_visibility_is_rejected() {
 
 // ── Ceiling and flight category ───────────────────────────────────────
 
-/// Fails if FEW/SCT count as a ceiling, which calls a clear day IFR.
 #[test]
 fn only_broken_or_worse_layers_form_a_ceiling() {
     let few_only = vec![CloudLayer {
@@ -250,7 +243,6 @@ fn only_broken_or_worse_layers_form_a_ceiling() {
     assert_eq!(ceiling_ft(&obscured), Some(200), "VV is a ceiling");
 }
 
-/// KOKC's fixture record is `10SM FEW250`: no ceiling, good visibility.
 #[test]
 fn a_clear_report_with_good_visibility_is_vfr() {
     let okc = station("KOKC");
@@ -286,7 +278,6 @@ fn flight_category_thresholds_match_the_faa_definitions() {
     assert_eq!(vis_only(5.1), Some(FlightCategory::VFR));
 }
 
-/// Fails if the *better* of ceiling and visibility wins, or only one is read.
 #[test]
 fn the_worse_of_ceiling_and_visibility_decides_the_category() {
     let vis10 = Some(Visibility {
@@ -307,7 +298,6 @@ fn the_worse_of_ceiling_and_visibility_decides_the_category() {
         Some(FlightCategory::LIFR),
         "half a mile is LIFR regardless of ceiling",
     );
-    // Mixed: MVFR ceiling, IFR visibility -> IFR.
     let vis2 = Some(Visibility {
         miles: 2.0,
         or_greater: false,
@@ -342,7 +332,6 @@ fn calm_and_variable_are_told_apart() {
     );
 }
 
-/// Fails if the wind scan reads past `RMK`.
 #[test]
 fn a_vrb_in_the_remarks_does_not_make_the_station_variable() {
     let raw = "GCGM 251650Z 00000KT RMK R09/VRB07G21KT";
@@ -368,12 +357,6 @@ fn wind_tokens_are_recognised_by_shape_not_by_substring() {
 }
 
 /// A wind group whose direction field is multi-byte is rejected, not split.
-///
-/// `body` is a whitespace token of the raw METAR text IEM serves, and the
-/// length gate this replaced counted bytes: `"éééKT"` leaves a six-byte body,
-/// which cleared `len() < 5`, and `split_at(3)` then cut the second `é` in
-/// half. The ASCII-digit test that would have rejected the token ran *after*
-/// the split, so it never got the chance.
 #[test]
 fn a_multibyte_wind_group_is_rejected_rather_than_split_mid_character() {
     for bad in ["éééKT", "1é2KT", "éé0KT", "ééééKT", "🌀🌀KT"] {
@@ -385,7 +368,6 @@ fn a_multibyte_wind_group_is_rejected_rather_than_split_mid_character() {
     }
 }
 
-/// Fails if `000` with a speed is drawn as due north; `000` means calm.
 #[test]
 fn a_zero_bearing_with_speed_is_not_treated_as_north() {
     assert_eq!(classify_wind(Some(0), 25), WindDir::Variable);
@@ -410,8 +392,6 @@ fn every_fixture_station_parses_and_keeps_its_raw_report() {
     }
 }
 
-/// Fails if a malformed body yields an empty result: that renders as "no
-/// observations" and hides an API change.
 #[test]
 fn a_malformed_body_is_an_error() {
     assert!(parse_currents("not json").is_err());
@@ -482,8 +462,6 @@ async fn live_metar_fetch_carries_every_mapped_field() {
     }
 }
 
-/// Fails if a network is added or removed upstream, which otherwise shows
-/// up only as a state quietly missing from the map.
 #[ignore = "hits the live mesonet.agron.iastate.edu API"]
 #[tokio::test]
 async fn live_networks_table_matches_iems_own_extents() {

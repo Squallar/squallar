@@ -1,46 +1,12 @@
 //! One menu model, its renderers, one dispatcher.
-//!
-//! The menu used to exist twice: as a real `MenuBar` in `ui_desktop.rs`, and
-//! hand-rolled again as a "Controls" block of buttons inside `ui_mobile.rs`'s
-//! layers panel. The two drifted — the mobile copy had Refresh and Auto-poll,
-//! the desktop one had the overlay toggles — and every new entry had to be
-//! added in both places, in the right one of two files, or it silently existed
-//! on only one platform.
-//!
-//! So the menu is described once as data ([`MenuNode`]), rendered by whichever
-//! presentation is hosting it — the top bar's ☰ dropdown
-//! ([`render_menu_popup`]) on the two wide widths, the phone sheet's Menu
-//! page ([`render_menu_drawer`]) below the Compact breakpoint — and the
-//! resulting [`MenuEvent`]s are applied in exactly one place. A new entry is
-//! one line in [`super::Gui::menu_model`] and one arm in
-//! [`super::Gui::apply_menu_event`], and it appears in every presentation by
-//! construction.
 
 use crate::actions::GuiAction;
 use rustdar_source::id::{LayerId, known};
 
-/// The label on the 3D-pane toggle.
-///
-/// A constant because two tests name it — the drawer-coverage list and the
-/// end-to-end conversion — and a test that carried its own copy of the string
-/// would go on passing after the entry was renamed out from under it.
 pub(crate) const VOLUME_PANE_LABEL: &str = "3D volume view";
 
-/// The label on the cross-section arming toggle.
-///
-/// Phrased as the gesture it arms rather than as the pane it produces, because
-/// the pane is not what the user does next: they draw a line. A constant for the
-/// reason [`VOLUME_PANE_LABEL`] is one.
 pub(crate) const DRAW_CROSS_SECTION_LABEL: &str = "Draw cross-section";
 
-/// The label on the 3D region arming toggle.
-///
-/// Phrased as the gesture it arms and the thing that gesture buys, for
-/// [`DRAW_CROSS_SECTION_LABEL`]'s reason plus one of its own: "pick a region"
-/// alone reads as a crop, and a crop is not what this does. The grid's cell
-/// count is fixed, so a tighter region spends the same cells over less ground —
-/// it is the only resolution control there is — and the parenthetical is where
-/// a menu has room to say so and a top bar does not.
 pub(crate) const PICK_REGION_LABEL: &str = "Pick 3D region (drag a square on a map)";
 
 /// A command the user can invoke from the menu.
@@ -55,9 +21,7 @@ pub(super) enum MenuAction {
 /// A boolean the menu can flip.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum MenuToggle {
-    /// Show/hide a map overlay on the active pane.
     Overlay(LayerId),
-    /// Automatic polling for new scans.
     AutoPoll,
     /// Feed live panes from the real-time chunk bucket rather than polling the
     /// archive for completed volumes.
@@ -66,58 +30,15 @@ pub(super) enum MenuToggle {
     /// moment it exists rather than on the next poll.
     ChunkNotifications,
     /// Draw the active pane's ground in 3D, or go back to the plan view.
-    ///
-    /// A checkbox rather than a command, and per pane rather than global,
-    /// because that is what it is: the pane either is drawing its volume or it
-    /// is not, and the state has to be visible or a user who switched a pane by
-    /// accident has nothing to un-tick. Unticking it returns the pane to its
-    /// plan view — the *same* pane, keeping its site, its viewport and the
-    /// camera it will come back to — which is also the only route out of a
-    /// section pane restored from a config.
-    ///
-    /// The companion entry, [`MenuToggle::DrawCrossSection`], is deliberately
-    /// *not* the same shape: it arms a gesture rather than converting the pane
-    /// under the cursor, because which pane a section lands in is decided by
-    /// where the line is drawn.
     VolumePane,
     /// Arm the cross-section draw: the next drag on a map pane becomes a
     /// vertical slice instead of a pan.
-    ///
-    /// A checkbox rather than a command, and for a reason the volume toggle does
-    /// not have. This one arms a **mode**, and the classic failure of a mode is
-    /// that the user forgets they are in it and then cannot work out why the map
-    /// will not pan. A checkbox makes the state visible and puts the way out in
-    /// the place the way in was, which is the only affordance that helps someone
-    /// who does not know what happened.
-    ///
-    /// Not a modifier-drag. A shift-drag is the obvious desktop spelling and has
-    /// no touch equivalent whatsoever, and one wasm binary serves phones and
-    /// desktop browsers alike.
-    ///
-    /// Global rather than per-pane, unlike [`VolumePane`](Self::VolumePane),
-    /// because the pane it applies to is not knowable when it is ticked: the
-    /// user arms the mode and *then* chooses a map to draw on, and choosing it is
-    /// the same press that starts the line.
     DrawCrossSection,
     /// Arm the 3D region pick: the next drag on a map pane draws the square of
     /// ground a 3D view resamples, instead of panning.
-    ///
-    /// [`DrawCrossSection`](Self::DrawCrossSection)'s sibling in every respect
-    /// — a checkbox because it arms a **mode** and the classic failure of a
-    /// mode is the user forgetting they are in it; not a modifier-drag because
-    /// a shift-drag has no touch equivalent and one wasm binary serves phones;
-    /// global rather than per-pane because the pane it applies to is chosen by
-    /// the same press that starts the gesture.
-    ///
-    /// Ticking it un-ticks `DrawCrossSection`, and vice versa: one press on one
-    /// map pane cannot be two gestures. That exclusion lives in the two setters
-    /// on `Gui` rather than here, so it holds for every route into them — the
-    /// top bar's toggles, the ☰ dropdown, the phone sheet — rather than only
-    /// for the one the rule was written beside.
     PickRegion,
 }
 
-/// One entry in the menu.
 pub(super) enum MenuNode {
     /// A named group. The menu bar renders it as a drop-down; the drawer
     /// renders it as a heading with its children beneath.
@@ -147,9 +68,6 @@ pub(super) enum MenuEvent {
 
 /// One leaf a presentation actually put on screen: the bool `ui.checkbox` was
 /// really handed, and where the widget landed so a test can click it for real.
-///
-/// Reported by the renderer, not rebuilt by a test from the model — for the
-/// same reason `ShellOutput::excluded_rects` is an output of the chrome.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct DrawnMenuLeaf {
@@ -157,16 +75,6 @@ pub(crate) struct DrawnMenuLeaf {
     /// `Some(state)` for a toggle, `None` for a command or a submenu header.
     pub value: Option<bool>,
     pub rect: egui::Rect,
-    /// The egui `Id` the widget was really registered under.
-    ///
-    /// Reported so a test can see this menu being *re-keyed* rather than only
-    /// being moved. Every leaf here is an auto-id'd widget, so its id runs off the
-    /// enclosing `Ui`'s `next_auto_id_salt` — which means anything drawn above it
-    /// that allocates a varying number of widgets shifts every id in this list
-    /// while the labels, the values and (once the layout settles) even the rects
-    /// stay recognisable. The harness's own id-change probe cannot see it: that
-    /// one matches widgets *by rect*, so a shift which also moves the rects looks
-    /// like new widgets rather than re-keyed ones.
     pub id: egui::Id,
 }
 
@@ -174,7 +82,6 @@ pub(crate) struct DrawnMenuLeaf {
 #[derive(Default)]
 pub(super) struct MenuFrame {
     pub events: Vec<MenuEvent>,
-    /// Every leaf drawn, in render order. See [`DrawnMenuLeaf`].
     #[cfg(test)]
     pub drawn: Vec<DrawnMenuLeaf>,
 }
@@ -194,10 +101,6 @@ impl MenuFrame {
 }
 
 /// Render the model as one flat dropdown list, for the top bar's ☰ popup.
-///
-/// The whole menu at every width, in one column: each submenu becomes a run of
-/// its leaves, with a separator between runs rather than a heading over each —
-/// the popup is small enough that the grouping reads off the rules alone.
 pub(super) fn render_menu_popup(ui: &mut egui::Ui, nodes: &[MenuNode]) -> MenuFrame {
     let mut out = MenuFrame::default();
     for (i, node) in nodes.iter().enumerate() {
@@ -209,8 +112,7 @@ pub(super) fn render_menu_popup(ui: &mut egui::Ui, nodes: &[MenuNode]) -> MenuFr
                 render_menu_items(ui, children, &mut out, true);
             }
             // A top-level leaf is unusual but has to render *somewhere*, or
-            // adding one would silently drop it from this presentation only
-            // — which is the failure this module exists to remove.
+            // adding one would silently drop it from this presentation only.
             _ => render_menu_items(ui, std::slice::from_ref(node), &mut out, true),
         }
     }
@@ -303,12 +205,9 @@ impl super::Gui {
                 label: "View",
                 children: vec![
                     // First, because it decides what the entries under it even
-                    // apply to. `pane` is `self.active_pane()`, which is why
-                    // every host builds this model *outside* the frame's
-                    // `mem::take` windows — `render_top_bar` runs before any
-                    // pane is taken. Inside such a window the slot holds a
-                    // default `PaneState`, so this would read `Map` for a
-                    // volume pane and draw the box unchecked.
+                    // apply to. `pane` is `self.active_pane()`, so every host must
+                    // build this model *outside* the frame's `mem::take` windows:
+                    // inside one the slot holds a default `PaneState`.
                     MenuNode::Toggle {
                         label: VOLUME_PANE_LABEL,
                         toggle: MenuToggle::VolumePane,
@@ -323,9 +222,8 @@ impl super::Gui {
                         value: self.section_draw_armed(),
                     },
                     // The two armed drags are adjacent on purpose: they are
-                    // mutually exclusive, so ticking either un-ticks the other,
-                    // and a user only reads that off a menu if the two entries
-                    // are next to each other. Global, for the reason above.
+                    // mutually exclusive, so ticking either un-ticks the other.
+                    // Global, for the reason above.
                     MenuNode::Toggle {
                         label: PICK_REGION_LABEL,
                         toggle: MenuToggle::PickRegion,
@@ -383,16 +281,12 @@ impl super::Gui {
             }
             MenuEvent::Invoked(MenuAction::OpenTimeDialog) => {
                 self.time_dialog.show = true;
-                // Close the layers drawer so the dialog is not hidden behind
-                // it. A no-op when the drawer is closed or not this width's
-                // presentation.
+                // Close the layers drawer so the dialog is not hidden behind it.
                 self.drawer_open = false;
             }
             MenuEvent::Invoked(MenuAction::OpenSettings) => {
-                // The inspector's App › Settings body — there is no settings
-                // window any more. The drawer still yields: on a narrow width
-                // it covers most of the screen the user just asked to look
-                // elsewhere on.
+                // The inspector's App › Settings body. The drawer yields: on a
+                // narrow width it covers most of the screen.
                 self.open_settings();
                 self.drawer_open = false;
             }
@@ -405,20 +299,6 @@ impl super::Gui {
             MenuEvent::Toggled(MenuToggle::ChunkNotifications, on) => self.chunk_notifications = on,
             MenuEvent::Toggled(MenuToggle::VolumePane, on) => {
                 // Recorded rather than written, through the one route the UI has.
-                //
-                // Not because this dispatcher is inside a `mem::take` window — it
-                // is not. `render_top_bar` takes no pane at all, so a direct
-                // `self.panes[self.active_pane].set_view(..)` here would work
-                // today. It goes through `request_pane_view` so that every writer
-                // of what a pane draws obeys one rule, including the ones inside
-                // `render_panes`' per-pane take, where the same direct write is
-                // silently discarded. See the `pending_pane_view` field on `Gui`
-                // for both halves and for the one-frame cost.
-                //
-                // Unticking asks for the **plan view**, which is the same pane
-                // rather than a different one: a 3D view is a render mode now, so
-                // turning it off keeps the site, the viewport and the camera it
-                // will come back to.
                 self.request_pane_view(
                     self.active_pane,
                     if on {
@@ -431,23 +311,18 @@ impl super::Gui {
             MenuEvent::Toggled(MenuToggle::DrawCrossSection, on) => {
                 // A direct write, and it may be one: the flag is on `Gui` rather
                 // than on a pane, so no `mem::take` window can swallow it. The
-                // setter exists because *disarming* has to drop a half-drawn
-                // anchor, which a bare assignment would leave behind.
+                // setter exists because *disarming* drops a half-drawn anchor.
                 self.set_section_draw_armed(on);
                 // Closing the layers drawer is the point, not a courtesy: on a
-                // narrow width it covers the map the line has to be drawn on,
-                // so arming the mode and leaving it open would arm a gesture
-                // the user cannot make. The ☰ dropdown closes itself on arm
-                // for the same reason; see `render_top_bar`.
+                // narrow width it covers the map the line has to be drawn on. The
+                // ☰ dropdown closes itself on arm for the same reason.
                 if on {
                     self.drawer_open = false;
                 }
             }
             MenuEvent::Toggled(MenuToggle::PickRegion, on) => {
-                // The arm above, with the box in place of the line. Same direct
-                // write for the same reason, same setter because disarming has
-                // to drop a half-dragged box, and same drawer close because the
-                // drag needs the map the drawer is covering.
+                // The arm above, with the box in place of the line — same direct
+                // write, same setter, same drawer close.
                 self.set_region_pick_armed(on);
                 if on {
                     self.drawer_open = false;
@@ -473,8 +348,7 @@ fn collect_leaf_labels(nodes: &[MenuNode], out: &mut Vec<&'static str>) {
 impl super::Gui {
     /// Every leaf label the menu model currently offers, submenus flattened —
     /// the inventory the parity walk asserts against the drawn
-    /// [`DrawnMenuLeaf`]s, derived from the model so a new entry joins the
-    /// audit by construction.
+    /// [`DrawnMenuLeaf`]s.
     pub(crate) fn menu_model_leaf_labels(&self) -> Vec<&'static str> {
         let mut out = Vec::new();
         collect_leaf_labels(&self.menu_model(), &mut out);
@@ -483,9 +357,7 @@ impl super::Gui {
 
     /// The model's top-level groups: each submenu header with the leaf labels
     /// under it, in model order — how the menu-bar presentation has to be
-    /// walked, one drop-down at a time. A top-level leaf outside any submenu
-    /// would not appear here; the parity walk cross-checks this flattening
-    /// against [`Self::menu_model_leaf_labels`] so one could not slip past it.
+    /// walked, one drop-down at a time.
     pub(crate) fn menu_model_groups(&self) -> Vec<(&'static str, Vec<&'static str>)> {
         self.menu_model()
             .iter()
@@ -544,29 +416,18 @@ mod tests {
             gui.chunk_notifications,
             gui.active_pane().render_view(),
             // Both halves, because a pane view change is deliberately a two-step
-            // operation. Recording the request is the whole of what the
-            // dispatcher's arm does — applying it is a separate step, deferred to
-            // after the pane loop for reasons set out on the `pending_pane_view`
-            // field — so a fingerprint holding only the *applied* view would report
-            // the arm as a no-op and `every_menu_entry_has_a_dispatcher_arm` would
-            // fail for a toggle that works. That the request survives being
-            // recorded while a pane is held out of the vector is its own test, in
-            // `ui.rs`.
+            // operation: recording the request is the whole of what the dispatcher's
+            // arm does, so a fingerprint holding only the *applied* view would
+            // report the arm as a no-op.
             gui.pending_pane_view_for_test(),
             // The armed draw is a mode with no other observable — it converts
             // nothing until a gesture completes — so without it the toggle's arm
-            // would read as a no-op and `every_menu_entry_has_a_dispatcher_arm`
-            // would fail for an entry that works.
+            // would read as a no-op.
             gui.section_draw_armed(),
         )
     }
 
     /// Every command the model offers actually *does* something.
-    ///
-    /// The claim is about the effect, not the arm: `match` on [`MenuEvent`] is
-    /// exhaustive, so an arm always exists and merely calling
-    /// `apply_menu_event` can only catch a panic — `Exit => {}` sails through.
-    /// Each entry must emit a [`GuiAction`] or move observable state.
     #[test]
     fn every_menu_entry_has_a_dispatcher_arm() {
         let mut gui = Gui::new();
@@ -649,11 +510,6 @@ mod tests {
     }
 
     /// The 3D toggle reads the *active pane's* kind, not a global flag.
-    ///
-    /// With several panes on screen the entry describes one of them, and a
-    /// version keyed on "is any pane a volume view" would show checked for the
-    /// map the user is actually working in — then convert *that* one when they
-    /// unticked it to make the box match what they were looking at.
     #[test]
     fn the_volume_toggle_describes_the_active_pane_and_no_other() {
         let mut gui = Gui::new();
@@ -677,11 +533,6 @@ mod tests {
     }
 
     /// Unticking the 3D toggle asks for a map back, rather than doing nothing.
-    ///
-    /// The `on` argument is the checkbox's *new* value, so an arm that ignored it
-    /// and always asked for `Volume` would leave the box stuck ticked with no way
-    /// out of the pane — and `every_menu_entry_has_a_dispatcher_arm` would not
-    /// notice, because the first tick moves the fingerprint on its own.
     #[test]
     fn the_volume_toggle_converts_in_both_directions() {
         let mut gui = Gui::new();
@@ -714,8 +565,7 @@ mod tests {
     }
 
     /// Opening a dialog closes the drawer. On a compact screen the drawer
-    /// covers most of the width, so leaving it open hides the dialog the user
-    /// just asked for.
+    /// covers most of the width, so leaving it open hides the dialog.
     #[test]
     fn opening_a_dialog_from_the_drawer_closes_it() {
         for (event, opened) in [
@@ -767,16 +617,6 @@ mod tests {
     }
 
     /// Escape and back close what is open, one layer per press, and say so.
-    ///
-    /// Only when nothing is open is the press a request to leave: with the
-    /// drawer open, back used to go straight to minimise, which on the phone
-    /// widths this app actually runs at throws away the only route to the
-    /// whole menu on a single misplaced tap.
-    ///
-    /// Driven top down through all four layers, so it also pins the *order*: a
-    /// press must take the topmost, not whichever the function tests for first.
-    /// The overlay pager sits above everything — it is what a map tap opens —
-    /// and each press below it must leave the ones under it alone.
     #[test]
     fn a_back_press_closes_one_open_layer_at_a_time() {
         let mut gui = Gui::new();

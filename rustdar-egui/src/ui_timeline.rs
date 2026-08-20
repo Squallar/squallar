@@ -1,39 +1,5 @@
 //! The floating timeline transport: time navigation and the radar loop, in
 //! one surface floating over the map's bottom edge.
-//!
-//! This is where the layers panel's time-navigation and loop-control blocks
-//! went. The semantics moved whole — the same actions, the same fan-out over
-//! [`Gui::loop_sync_targets`](super::Gui), the same red not-live styling — but
-//! the host changed twice over: the controls float over a full-bleed map
-//! instead of docking beside it, and they act on the **active pane read live
-//! out of `self.panes`** instead of on a pane a panel pass held out with
-//! `mem::take`. The second half is why [`Gui::ui`](super::Gui::ui) calls
-//! [`Gui::render_timeline`](super::Gui) after `render_panes` and the pending
-//! appliers: every take window in the frame has closed, so
-//! `self.panes[self.active_pane]` is the real pane and direct writes stick.
-//!
-//! Row 1 is always on while the transport is expanded: Live · back / forward ·
-//! step picker · loop toggle · scrubber · timestamp (opens the Set Time
-//! dialog) · age chip · `...` (row 2) · `⏷` (collapse). Row 2 adds the loop
-//! tuning: lookback, speed, the frame transport, the seek slider, the render
-//! progress, and a closing caption stating this platform's frame budget and
-//! the per-pane unlink hint. Collapsed, the whole transport becomes a small
-//! ⏱ chip at the map's bottom-right corner; clicking it restores.
-//!
-//! # Ids do not depend on the width — or on the data
-//!
-//! The transport is one `egui::Area` under one constant id at every
-//! [`WidthClass`](crate::ui_layout::WidthClass), so nothing about it re-keys
-//! at a breakpoint. Two further rules keep the ids still while the *content*
-//! moves. The trailing chips (timestamp, age) are drawn unconditionally —
-//! placeholder text rather than absence — so a scan or a render landing
-//! cannot change the row's widget count. And the left-hand run sits in a
-//! scope with an explicit [`egui::UiBuilder::id`], which takes the trailing
-//! run's auto-id counter out of every id inside it — the same device, for the
-//! same reason, as the status bar's `status_error` scope. The step combo keeps
-//! the `layers_time_step_sel` salt it had in the layers panel: moving hosts
-//! re-keyed it once, but the salt keeps it independent of everything that
-//! renders around it.
 
 use crate::actions::GuiAction;
 use crate::pane::LoopFrame;
@@ -77,67 +43,16 @@ const TUNING_SLIDER_WIDTH: f32 = 120.0;
 /// How much longer one interval must be than another before the caption calls
 /// the difference out — as a ratio, and as an absolute floor in seconds. Both
 /// must be cleared.
-///
-/// The ratio keeps ordinary jitter quiet. A WSR-88D volume is nominally 259 s
-/// but really runs 193–356 s at one site over a day (KPBZ, 2026-08-11, 342
-/// volumes) as SAILS and AVSET lengthen and shorten it, and a loop of those is
-/// evenly spaced in every sense the user cares about. 1.5 sits above that
-/// jitter and below the two steps that matter: a dropped scan doubles a gap,
-/// and a VCP change from precip to clear air takes 259 s to 517 s.
-///
-/// The floor keeps the ratio from firing on intervals so short that a 50%
-/// difference is a rounding artifact. It is one minute because the caption
-/// speaks in whole minutes: `format_span` rounds to nearest, so a difference
-/// under 60 s can print the same number twice, and "4 to 4 min apart" is worse
-/// than saying nothing. Clearing this floor guarantees the two ends differ by
-/// at least one printed minute.
-///
-/// **Original: there is no convention here to be faithful to.** Nobody
-/// publishes a rule for when a radar loop's spacing becomes worth mentioning;
-/// this is a product decision about a sentence, and the only thing it can be
-/// wrong against is a reader's judgement. Both halves were tuned on **one
-/// site-day** — KPBZ, 2026-08-11, 342 volumes — which is one site, one
-/// climate and essentially one VCP regime. That record survives in the
-/// paragraphs above, which is better than most tunings manage, and it is
-/// still a single site: no holdout, no second regime, nothing measured at a
-/// site whose SAILS cadence differs.
-///
-/// The reason to say so rather than leave it implied: this caption is one the
-/// user cannot check. The gaps it describes are not on screen, so a wrong
-/// threshold does not look wrong — it produces a confident sentence about the
-/// loop's spacing and no tell that it is the wrong sentence.
 const NOTICEABLE_RATIO: f64 = 1.5;
 /// The absolute half of [`NOTICEABLE_RATIO`]'s rule, in seconds.
 const NOTICEABLE_FLOOR_SECS: i64 = 60;
 
 /// Whether `longer` is enough longer than `shorter` for the caption to say so.
-///
-/// One rule, used for two questions that are the same question: whether a
-/// loop's frames are evenly spaced, and whether a loop is showing every scan or
-/// a sample of them (frame spacing against the site's own cadence). Both are
-/// "is this interval a different animal from that one", and answering them by
-/// different rules would let a loop read as evenly spaced and decimated at
-/// once, or the reverse.
-///
-/// Always compared against the **median** gap, never the shortest one. A real
-/// WSR-88D wanders far more than its nominal volume suggests — the widest
-/// 29-gap window KPBZ produced on 2026-08-11 runs 210 s to 356 s, a ratio of
-/// 1.7 — so a shortest-against-longest test would call an ordinary precip loop
-/// unevenly spaced every time. Against the median that same window is 356 s
-/// versus 269 s and stays quiet, while the two steps that matter still fire.
 fn markedly_longer(longer: i64, shorter: i64) -> bool {
     longer - shorter >= NOTICEABLE_FLOOR_SECS && longer as f64 > shorter as f64 * NOTICEABLE_RATIO
 }
 
 /// A duration in words, for the loop caption: `"45 s"`, `"6 min"`, `"2h 54m"`.
-///
-/// Rounds to nearest, where [`statusbar::format_product_age`](super::statusbar)
-/// truncates, and the difference is not cosmetic. Truncation is right for an
-/// age — data collected 359 s ago really is "5 min old". It is wrong for a
-/// *cadence*: a TDWR volume arrives every 360 s but the gaps measure 359 s about
-/// as often, and a caption that truncated would report a six-minute radar as
-/// five-minute — an error of one whole volume, in the one number the user is
-/// reading the caption to learn.
 fn format_span(secs: i64) -> String {
     if secs < 60 {
         return format!("{secs} s");
@@ -151,70 +66,6 @@ fn format_span(secs: i64) -> String {
 }
 
 /// The loop's own extent, in words, for the head of the row-2 caption.
-///
-/// `None` when there is nothing to say — no frames, which is every pane that is
-/// not looping and a loop still fetching its listing.
-///
-/// # What this has to make visible, and why a span alone would not
-///
-/// The frame cap does not shorten a loop's window. `accept_scan_listing` samples
-/// a listing that overruns the cap instead of truncating it, so the loop always
-/// covers the whole lookback and what the cap costs is *resolution*. A caption
-/// that reported only "spans 23h 58m" would therefore be true and still mislead:
-/// at that lookback a desktop loop is showing 60 of ~333 WSR-88D volumes, four
-/// scans in five dropped, and the span is exactly the number that hides it.
-///
-/// So the spacing is reported beside the span, and the fidelity beside both.
-///
-/// # Fidelity is the sampler's own answer, never a statistic over the frames
-///
-/// `listing_sampled` is what [`crate::pane::listing_sample_indices`] decided:
-/// the loop was given so many scans, it kept so many, and whether it dropped
-/// any is a fact recorded at that moment. `scan_step_secs` is the site's cadence
-/// caught before the sampling, and supplies the "~4 min" the sampled phrasing
-/// quotes — but it decides nothing.
-///
-/// It used to decide everything, and could not. The rule was
-/// `markedly_longer(median frame gap, scan_step_secs)`: two medians over the
-/// same timestamps, so the listing's own jitter cancels and the frame median
-/// sits at exactly one listing step until two-step gaps are the **majority**.
-/// That resolves 2x decimation and nothing gentler. Measured on the shipped
-/// caps: a browser loop holding 14 of a 20-scan listing announced "every scan"
-/// with **30.0% of the scans dropped**, and a desktop loop holding 60 of 89
-/// announced it with **32.6% dropped**. Both are the ordinary case — a lookback
-/// slightly past what the cap covers — not an extreme.
-///
-/// # The awkward cases
-///
-/// - **Still filling.** `settled` is the loop's own readiness. While it is false
-///   the counts can still move, so every clause takes "so far" rather than being
-///   suppressed — a caption that appeared only once the loop was complete would
-///   be missing exactly when the user is watching it fill.
-/// - **A single frame**, and the degenerate case of several frames sharing one
-///   timestamp, take the same sentence: there is a frame count but no span, and
-///   printing "spans 0 s" invites the reader to believe the loop is broken.
-/// - **A gap in the frames**, from a scan that never landed.
-/// - **A VCP change mid-loop**, which is not a corner case: on 2026-08-11 every
-///   measured site but TDFW alternated VCPs during the day, and a TDWR switching
-///   VCP 80 to 90 or a WSR-88D switching VCP 212 to 35 moves its cadence by up to
-///   2x mid-window.
-/// - **The sampler's own uneven spacing.** `i * (total - 1) / (held - 1)` leaves
-///   gaps of alternating width, so a decimated loop is unevenly spaced *by
-///   construction*.
-///
-/// The first two are deliberately **not** distinguished from each other: from
-/// timestamps alone they are the same evidence, one gap of roughly twice the
-/// cadence, and nothing in the frame list says which. So the caption reports the
-/// honest range it can defend and never guesses at a cause.
-///
-/// The third is why the fidelity clause has to come **first** and has to be
-/// right. On a sampled loop the range is the sampler's arithmetic showing
-/// through, and a caption that read "every scan, 4 min to 9 min apart" — which
-/// is what a 20-into-14 browser loop printed — offered the user only one
-/// explanation for that spread, an RDA outage or a VCP change at the radar. It
-/// was neither. Saying "sampled from ~4 min scans" first attributes the spread
-/// where it belongs before the numbers that would otherwise be read as the
-/// radar's behaviour.
 fn loop_span_phrase(
     frames: &[LoopFrame],
     listing_sampled: Option<bool>,
@@ -243,12 +94,6 @@ fn loop_span_phrase(
     let longest = gaps[gaps.len() - 1];
     let typical = gaps[gaps.len() / 2];
 
-    // Both directions, each against the median. Which side stands out depends
-    // on which cadence held for most of the window: a site that spends the last
-    // third of a loop in clear air pushes the *longest* gap out, and one that
-    // spends the last third back in precip pushes the *shortest* one out
-    // instead. Testing only the long side would call that second loop evenly
-    // spaced while a run of its frames sat at half the spacing of the rest.
     let uneven = markedly_longer(longest, typical) || markedly_longer(typical, shortest);
     let spacing = if uneven {
         format!(
@@ -264,11 +109,6 @@ fn loop_span_phrase(
         (Some(true), Some(step)) => {
             format!("sampled from ~{} scans, ", format_span(i64::from(step)))
         }
-        // A listing short enough to have no measurable gap is also short enough
-        // to fit any cap, so this pairing is not reachable from
-        // `accept_scan_listing`. It is written out rather than folded into the
-        // arm above because the two halves are independent facts and a match
-        // that assumed otherwise would print "sampled from ~0 min scans".
         (Some(true), None) => "sampled, ".to_owned(),
         (Some(false), _) => "every scan, ".to_owned(),
         (None, _) => String::new(),
@@ -379,17 +219,6 @@ impl Default for TimelineRow2Probe {
 
 impl super::Gui {
     /// Draw the timeline transport (or its collapsed chip) over the map.
-    ///
-    /// Runs from [`Gui::ui`](super::Gui::ui) **after** the pane loop and the
-    /// pending appliers, so no `mem::take` window is open and the active pane
-    /// read out of `self.panes` is the real one — the module note explains why
-    /// that ordering is the whole design.
-    ///
-    /// `phone_bar_top` is `Some` on Compact: the top edge of the bottom bar
-    /// the phone shell drew this frame. The transport then presents inline —
-    /// full inset width, sitting directly above the bar (plan §1.5) — and the
-    /// collapsed chip right-aligns above the bar instead of hugging the map's
-    /// corner. Same `Area` id either way: only the geometry is the phone's.
     pub(super) fn render_timeline(
         &mut self,
         ctx: &egui::Context,
@@ -402,16 +231,10 @@ impl super::Gui {
             self.probes.last_timeline = TimelineProbe::default();
         }
 
-        // The fade (§1.8): fully faded, neither form renders — the absence is
-        // the input transparency — and a transition renders dimmed and dead.
         let Some(chrome) = self.chrome_fade() else {
             return;
         };
 
-        // The collapse animates as a cross-fade between the two forms
-        // (§3.3): each has its own factor, and during the swap both render —
-        // the incoming one live, the outgoing one as a dead remnant. Under
-        // test the time is zero and exactly one form draws per frame.
         let expanded_factor = ctx.animate_bool_with_time(
             egui::Id::new("timeline_expanded"),
             !self.timeline_collapsed,
@@ -441,14 +264,6 @@ impl super::Gui {
         };
 
         let frame = super::shell::chrome_frame(&ctx.global_style());
-        // `min(880, full − 24)` is the **outer** width (§1.5); the phone's
-        // inline form spans the full inset width on the same terms as the
-        // bottom bar below it. Either way the frame's margins come out
-        // before the content is sized, so the surface lands exactly on the
-        // stated width — the status bar's own margin math.
-        // The phone's inline form sits flush on the bottom bar, full width —
-        // the 8pt gap and side insets died with the bar's own (the second
-        // user test's direction; the bar is full-bleed now).
         let (anchor_bottom, outer_width) = match phone_bar_top {
             Some(bar_top) => (bar_top, map_rect.width()),
             None => (
@@ -456,8 +271,6 @@ impl super::Gui {
                 (map_rect.width() - SIDE_INSET).min(MAX_OUTER_WIDTH),
             ),
         };
-        // Margins *and* the stroke, which egui 0.35 lays outside the inner
-        // margin — the sheet's own containment math (`ui_sheet.rs`).
         let inner_width = outer_width - frame.inner_margin.sum().x - 2.0 * frame.stroke.width;
         let area = egui::Area::new(egui::Id::new("timeline"))
             .order(egui::Order::Middle)
@@ -489,13 +302,6 @@ impl super::Gui {
     /// the map's corner sat on top of them (the first-run finding). The
     /// offsets come from the bars' real rects this frame, never a guessed
     /// constant.
-    ///
-    /// Bottom-**right** while the transport itself is bottom-centred, so the
-    /// chip does not sit where the middle of the map's bottom edge is most
-    /// likely to be looked at — the whole point of collapsing. One line,
-    /// always: the area is sized to the text (`TextWrapMode::Extend`), so a
-    /// stale narrow area rect cannot fold the time into a column (the other
-    /// first-run finding).
     fn render_timeline_chip(
         &mut self,
         ctx: &egui::Context,
@@ -503,17 +309,6 @@ impl super::Gui {
         phone_bar_top: Option<f32>,
         opacity: f32,
     ) {
-        // The bar above which the chip sits: the phone's bottom bar, or the
-        // wide widths' floating status bar (its top edge as drawn earlier
-        // this same frame — `Gui::statusbar_rect`) — the status bar only
-        // when the chip would actually land on it: collapsed, that bar is a
-        // small left-anchored restore button, and lifting the right-hugging
-        // chip a button-height above open map floated it for nothing (the
-        // M8.1 finding). The would-be rect comes from the chip area's own
-        // last-frame size — never a guessed constant — and a first frame
-        // with no size yet assumes the overlap, which costs it only the
-        // lift. With neither bar on screen the map's own bottom edge is the
-        // anchor.
         let would_land_on = |bar: egui::Rect| {
             let Some(size) = ctx
                 .memory(|m| m.area_rect(egui::Id::new("timeline_chip")))
@@ -573,18 +368,11 @@ impl super::Gui {
     /// kind, else the freshest visible pane's on-screen time. The
     /// live/archive flag travels with whichever pane supplied the time, so
     /// the annotation describes the time actually shown.
-    ///
-    /// `(None, ..)` only when genuinely nothing is loaded anywhere.
     pub(super) fn chip_time_source(&self) -> (Option<chrono::NaiveDateTime>, bool) {
         let active = &self.panes[self.active_pane];
         if let Some(t) = active.data_time_on_screen().or(active.data_time) {
             return (Some(t), active.viewing_live);
         }
-        // Every kind, not only maps. `data_time_on_screen` answers for all of
-        // them — the playing frame's own volume time under an active loop, the
-        // static `data_time` otherwise — and since a cross-section pane can
-        // animate, a layout of nothing but section panes had no time source at
-        // all and printed `--:--:--` over a running loop.
         self.panes()
             .iter()
             .filter_map(|pane| pane.data_time_on_screen().map(|t| (t, pane.viewing_live)))
@@ -603,28 +391,7 @@ impl super::Gui {
     }
 
     /// Row 1: the always-on transport.
-    ///
-    /// Laid out like the top bar: the trailing chips claim the right edge in a
-    /// right-to-left run first, then the navigation cluster takes what is left
-    /// and hands every spare point to the scrubber. The left-hand run's scope
-    /// carries an explicit id — see the module note on why.
-    ///
-    /// # The narrow form
-    ///
-    /// At phone widths the single row cannot hold everything — the second
-    /// user test's screenshot shows the run mangled into overlap — so when
-    /// the measured essentials do not fit ([`Self::timeline_row1_fits`]) the
-    /// row keeps the essentials only: the age chip is dropped (the demo's
-    /// narrow behaviour; the collapsed chip and status surfaces still age
-    /// the data) and the scrubber moves to its **own full-width row** below.
-    /// The scrubber renders under one explicit host id either way
-    /// ([`Self::render_timeline_scrubber_scope`]), so which row hosts it
-    /// never re-keys a drag in flight or the breakpoint id contract.
     fn render_timeline_row1(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
-        // The trailing chips' texts, computed before layout so the narrow
-        // decision can measure the real galleys. Both read the shared time
-        // source, fallback included, so a non-map active pane ages and
-        // stamps the time actually shown.
         let (source_time, source_live) = self.chip_time_source();
         let age_text = source_time
             .map(|collected| {
@@ -641,9 +408,6 @@ impl super::Gui {
 
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // First added is rightmost: ⏷ at the edge, then ..., the age
-                // chip and the timestamp, reading left-to-right as
-                // timestamp · age · ... · ⏷.
                 let collapse = ui.button("\u{23f7}").on_hover_text("Collapse the timeline");
                 #[cfg(test)]
                 {
@@ -664,11 +428,6 @@ impl super::Gui {
                     self.timeline_row2 = !self.timeline_row2;
                 }
 
-                // The age chip is drawn even when there is nothing to say —
-                // placeholder text, not absence — so data arriving cannot
-                // change this run's widget count and re-key everything drawn
-                // after it (see the module note). The narrow form drops it
-                // whole: an element the row cannot afford, not a data state.
                 if !narrow {
                     ui.label(egui::RichText::new(age_text.as_str()).small().weak());
                 }
@@ -688,13 +447,9 @@ impl super::Gui {
                     self.probes.last_timeline.timestamp = (stamp.rect, stamp_text);
                 }
                 if stamp.clicked() {
-                    // The same flag the menu's Time... entry raises; the
-                    // dialog itself is unchanged.
                     self.time_dialog.show = true;
                 }
 
-                // The navigation cluster, reading left-to-right again, under
-                // an explicit id so the chips above cannot re-key it.
                 let nav_scope = egui::UiBuilder::new()
                     .id(ui.id().with("timeline_nav"))
                     .layout(egui::Layout::left_to_right(egui::Align::Center));
@@ -704,8 +459,6 @@ impl super::Gui {
             });
         });
 
-        // The narrow form's own scrubber row: every spare point of the
-        // transport's width, under the same host id as the inline placement.
         if narrow {
             ui.horizontal(|ui| {
                 self.render_timeline_scrubber_scope(ui, actions);
@@ -734,8 +487,6 @@ impl super::Gui {
             text(&button_font, "\u{23f4}") + pad,
             text(&button_font, "\u{23f5}") + pad,
             70.0 + pad, // the step combo's fixed width
-            // The loop toggle's floor is the bar's interact size, so the
-            // measure must take the max exactly as the button does.
             (text(&button_font, "\u{221e}") + pad).max(ui.spacing().interact_size.x),
             60.0, // the scrubber's minimum useful rail
             text(&button_font, stamp_text) + pad,
@@ -772,8 +523,6 @@ impl super::Gui {
         let pane_idx = self.active_pane;
         let viewing_live = self.panes[pane_idx].viewing_live;
 
-        // Live button — highlighted red when NOT live to indicate "click to
-        // return", exactly the styling the layers panel used.
         let live_button = if viewing_live {
             egui::Button::new("\u{23fa} Live")
         } else {
@@ -789,8 +538,6 @@ impl super::Gui {
             actions.push(GuiAction::JumpToLive { pane_idx });
         }
 
-        // Back: drop out of live and step backwards by the step picker's
-        // choice — one scan, or a fixed span.
         let step_secs = self.panes[pane_idx].time_step_secs;
         let back = ui.button("\u{23f4}").on_hover_text("Back one step");
         #[cfg(test)]
@@ -812,7 +559,6 @@ impl super::Gui {
             }
         }
 
-        // Forward — disabled while live, since there is nothing ahead of now.
         let fwd = ui
             .add_enabled(!viewing_live, egui::Button::new("\u{23f5}"))
             .on_hover_text("Forward one step");
@@ -834,9 +580,6 @@ impl super::Gui {
             }
         }
 
-        // The step picker. The salt is the one it had in the layers panel —
-        // `layers_time_step_sel` — kept so the stored combo state survived the
-        // move once and stays put hereafter; see the module note.
         let step_label = TIME_STEP_OPTIONS
             .iter()
             .find(|(s, _)| *s == step_secs)
@@ -851,10 +594,6 @@ impl super::Gui {
                     ui.selectable_value(&mut new_step, secs, label);
                 }
             });
-        // Report the id the combo box really resolved, rather than building a
-        // second one from the same salt: the two could disagree silently, and
-        // a test comparing reconstructions either side of a resize would then
-        // prove nothing about the state egui actually keyed on.
         #[cfg(test)]
         {
             self.probes
@@ -868,22 +607,6 @@ impl super::Gui {
             self.panes[pane_idx].time_step_secs = new_step;
         }
 
-        // The loop toggle. Enabled for the kinds that have a picture a loop can
-        // hold — map and cross-section panes — and disabled for the 3D volume,
-        // whose picture is raymarched live from the eye and so cannot be cached
-        // per frame. See `PaneKind::can_loop`; `Gui::loop_sync_targets` applies
-        // the same rule to the fan-out, and the two have to agree or a pane is
-        // enabled here and dropped there. Read off the real pane, which this
-        // renderer can do and the old layers panel could not: no take window is
-        // open here.
-        //
-        // A framed `Button` at the bar's minimum interact size, not
-        // `Button::selectable` — that constructor drops the frame while
-        // unselected, which left a bare text-width glyph (~15 pt) between two
-        // framed neighbours: visibly not a button, and the second user test
-        // called it too small to hit. `interact_size` as the floor gives it a
-        // real target on both mouse and touch, and `.selected` keeps the
-        // on-state painted in the style's selection colour.
         let can_loop = self.panes[pane_idx].can_loop();
         let loop_active = self.panes[pane_idx].loop_state.is_active();
         let loop_toggle = ui
@@ -919,24 +642,9 @@ impl super::Gui {
     }
 
     /// The scrubber (plan §3.7) — one slider, two meanings.
-    ///
-    /// **While a loop is active** it is a live frame-seek: dragging emits
-    /// [`GuiAction::SeekLoopFrame`] per change, mirroring row 2's seek slider,
-    /// because the frames are already fetched and seeking is free.
-    ///
-    /// **With no loop** it spans the archive window `[now − lookback, now]`
-    /// and commits **only on release** (`drag_stopped`): a release inside the
-    /// rail drops out of live and emits [`GuiAction::NavigateTime`] to the
-    /// released moment; a release at the right end ([`SCRUB_LIVE_THRESHOLD`])
-    /// emits [`GuiAction::JumpToLive`] instead. That honours the design's
-    /// scrub-drops-live / scrub-to-end-restores-live without fetching a volume
-    /// per drag frame — every intermediate position is a fetch nobody asked
-    /// to wait for.
     fn render_timeline_scrubber(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
         let pane_idx = self.active_pane;
 
-        // Everything to the left has been laid out; the scrubber takes the
-        // rest of the row.
         ui.spacing_mut().slider_width =
             (ui.available_width() - ui.spacing().item_spacing.x).max(60.0);
 
@@ -947,12 +655,6 @@ impl super::Gui {
             .filter(|&total| total > 0);
 
         if let Some(total) = loop_frames {
-            // Loop form: seek frames live. Under its own id scope, distinct
-            // from the archive form's below (§5.9): the two forms share this
-            // auto-id slot, so without the salts a loop landing mid-drag
-            // would hand the archive drag to the seek slider — same id, new
-            // meaning — and the release would commit a frame index as an
-            // archive moment.
             let seek = ui
                 .push_id("scrub_loop", |ui| {
                     let mut frame_idx = self.panes[pane_idx].loop_state.current_frame;
@@ -971,8 +673,6 @@ impl super::Gui {
                 .inner;
             #[cfg(test)]
             {
-                // Reported beside the archive form's, so the distinct-id
-                // claim is a comparison of the ids egui really used.
                 self.probes
                     .widget_id_probes
                     .push(("timeline_scrubber_loop", seek.id));
@@ -983,12 +683,6 @@ impl super::Gui {
             return;
         }
 
-        // Archive form. The resting position restates where the pane is
-        // looking: pinned right while live, else the on-screen data time's
-        // place in the lookback window. While a drag is in flight the
-        // position is the drag's own, remembered across frames in
-        // `timeline_scrub` so the handle follows the pointer instead of
-        // snapping home every frame.
         let lookback_secs = self.loop_lookback_secs.max(1) as f32;
         let resting = if self.panes[pane_idx].viewing_live {
             1.0
@@ -1002,8 +696,6 @@ impl super::Gui {
             }
         };
         let mut frac = self.timeline_scrub.unwrap_or(resting);
-        // The archive form's own id scope — the pair of the loop form's
-        // above, so a mid-drag form flip can never carry a drag across.
         let scrub = ui
             .push_id("scrub_archive", |ui| {
                 ui.add(egui::Slider::new(&mut frac, 0.0..=1.0).show_value(false))
@@ -1011,35 +703,20 @@ impl super::Gui {
             .inner;
         #[cfg(test)]
         {
-            // Reported like `time_step_sel`, so the keyboard test can put
-            // real focus behind the id egui actually keyed the slider on.
             self.probes
                 .widget_id_probes
                 .push(("timeline_scrubber", scrub.id));
             self.probes.last_timeline.scrubber = scrub.rect;
         }
         if scrub.drag_stopped() {
-            // A release commits once — checked first, because the release
-            // frame can report `changed` too and must not commit twice.
             self.timeline_scrub = None;
             self.commit_archive_scrub(frac, lookback_secs, actions);
         } else if scrub.dragged() {
             self.timeline_scrub = Some(frac);
         } else if scrub.changed() {
-            // Changed with no drag in flight: a keyboard nudge on the
-            // focused slider (§5.9 carried finding — this used to store the
-            // position and wait for a release that never comes). There is
-            // nothing to wait out, so it commits now, exactly as the loop
-            // form's seek does.
             self.timeline_scrub = None;
             self.commit_archive_scrub(frac, lookback_secs, actions);
         } else {
-            // No drag this frame and no release to commit: whatever position
-            // was remembered belongs to a gesture that ended without a
-            // release — a cancelled touch reports no `drag_stopped`, ever —
-            // and holding it would pin the handle to a drag that no longer
-            // exists. Dropping it uncommitted is the cancel behaving like a
-            // cancel.
             self.timeline_scrub = None;
         }
     }
@@ -1062,8 +739,6 @@ impl super::Gui {
             .as_ref()
             .map(|info| info.timestamp)
         {
-            // `NavigateTime` steps relative to the pane's scan time, so
-            // the committed absolute moment becomes a step from there.
             let now = chrono::Utc::now().naive_utc();
             let target = now - chrono::Duration::seconds((lookback_secs * (1.0 - frac)) as i64);
             let step_secs = (target - scan_time).num_seconds();
@@ -1076,11 +751,6 @@ impl super::Gui {
     }
 
     /// Row 2: the loop tuning, shown behind `⋯`.
-    ///
-    /// The tuning sliders draw unconditionally; the frame transport, the seek
-    /// slider and the progress read exist only for a loop that exists —
-    /// the same states, spinner for spinner, that the layers panel's block
-    /// drew.
     fn render_timeline_row2(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
         let pane_idx = self.active_pane;
         let loop_active = self.panes[pane_idx].loop_state.is_active();
@@ -1091,8 +761,6 @@ impl super::Gui {
         ui.horizontal(|ui| {
             ui.spacing_mut().slider_width = TUNING_SLIDER_WIDTH;
 
-            // Lookback duration slider. Committed on release, not per drag
-            // frame: each commit re-fetches the loop's whole scan list.
             let mut lookback_mins = (self.loop_lookback_secs as f32 / 60.0).round();
             ui.label("Lookback:");
             let lookback = ui.add(
@@ -1109,8 +777,6 @@ impl super::Gui {
                 let new_secs = (lookback_mins * 60.0) as u64;
                 if new_secs != self.loop_lookback_secs {
                     self.loop_lookback_secs = new_secs;
-                    // Re-issue the loop at the new depth — only where a loop
-                    // is already running; tuning the dial must not start one.
                     if loop_active {
                         for pane_idx in self.loop_sync_targets() {
                             actions.push(GuiAction::EnableLoop {
@@ -1122,7 +788,6 @@ impl super::Gui {
                 }
             }
 
-            // Speed slider.
             ui.label("Speed:");
             let speed = ui.add(
                 egui::Slider::new(&mut self.loop_speed_fps, 1.0..=30.0)
@@ -1156,7 +821,6 @@ impl super::Gui {
                 ui.label("No frames found");
             } else {
                 ui.horizontal(|ui| {
-                    // Step backward
                     let prev = ui.button("\u{23ee}").on_hover_text("Previous frame");
                     #[cfg(test)]
                     {
@@ -1171,7 +835,6 @@ impl super::Gui {
                         }
                     }
 
-                    // Play/pause
                     let play_label = if playing { "\u{23f8}" } else { "\u{23f5}" };
                     let play_hover = if playing {
                         "Pause".to_owned()
@@ -1193,7 +856,6 @@ impl super::Gui {
                         }
                     }
 
-                    // Step forward
                     let next = ui.button("\u{23ed}").on_hover_text("Next frame");
                     #[cfg(test)]
                     {
@@ -1208,8 +870,6 @@ impl super::Gui {
                         }
                     }
 
-                    // Frame seek slider — the row-1 scrubber mirrors this
-                    // while the loop runs.
                     ui.spacing_mut().slider_width = (ui.available_width() * 0.5).clamp(60.0, 240.0);
                     let mut frame_idx = current_frame;
                     let seek = ui
@@ -1227,7 +887,6 @@ impl super::Gui {
                         }
                     }
 
-                    // Current frame timestamp
                     if let Some(timestamp) = frame_time {
                         let text = self
                             .preferences
@@ -1243,7 +902,6 @@ impl super::Gui {
                     }
                 });
 
-                // Progress bar while rendering, plain text when done.
                 if rendering {
                     let text = format!("Rendering {rendered}/{total}...");
                     ui.horizontal(|ui| {
@@ -1272,20 +930,6 @@ impl super::Gui {
             }
         }
 
-        // The closing caption (plan §1.5): what this loop actually holds, what
-        // this platform's loops can hold, and the escape hatch from shared
-        // time. The budget is the running build's own, pushed in by the
-        // frontend (`FrameInputs::loop_frame_budget`) — not a guess from the width,
-        // which a 1400 pt Android tablet would get wrong. "Sits out", not
-        // "stays frozen": scan delivery is site-keyed and ignores the link, so
-        // a live unlinked pane still follows new scans — the checkbox's own
-        // hover (`ui_pills::UNLINK_NOTE`) spells the full claim out.
-        //
-        // The span leads because it is the live fact and the budget behind it
-        // is the standing one. It is gated on `loop_active`, not merely on the
-        // frame list being non-empty: single-frame mode keeps the current
-        // picture in `frames` too, and an ungated clause would have a static
-        // pane announce "This loop is 1 frame".
         let span = if loop_active {
             let ls = &self.panes[pane_idx].loop_state;
             loop_span_phrase(

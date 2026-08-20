@@ -1,6 +1,5 @@
-// Whole-file gate rather than per-item: everything here names winit's
-// `AndroidApp`, which only exists on the android target -- the host
-// `jni-typecheck` builds compile every sibling module but not this one.
+// Whole-file gate: everything here names winit's `AndroidApp`, which only
+// exists on the android target.
 #![cfg(target_os = "android")]
 
 //! `android_main`: the entry point NativeActivity dlsym()s out of
@@ -15,16 +14,11 @@ use super::theme::detect_dark_theme;
 use super::{JavaContext, register_java_helper, set_java_context};
 use winit::platform::android::activity::AndroidApp;
 
-/// Android main entry point
-///
-/// This function is called by the Android runtime when the app starts.
-/// It initializes logging and starts the main application loop.
 #[unsafe(no_mangle)]
 #[allow(unsafe_code, reason = "the C ABI symbol NativeActivity dlsym()s")]
 fn android_main(app: AndroidApp) {
     use winit::platform::android::EventLoopBuilderExtAndroid;
 
-    // Initialize Android logging
     android_logger::init_once(
         android_logger::Config::default()
             .with_max_level(log::LevelFilter::Info)
@@ -34,24 +28,12 @@ fn android_main(app: AndroidApp) {
     log::info!("Starting Rustdar Platform (Android)");
 
     // Install the rustls crypto provider before anything can open a socket.
-    // Belt-and-braces -- every client constructor calls this too (see
-    // `rustdar_radar::tls`) -- but doing it first here keeps the choice of
-    // provider at a predictable point rather than leaving it to whichever
-    // background thread fetches first.
+    // Redundant, but it keeps the choice at a predictable point.
     rustdar_app::tls::init();
 
-    // Initialize rustls-platform-verifier for TLS certificate verification.
-    // reqwest uses it to reach Android's TrustManager over JNI; without this,
-    // every HTTPS connection fails.
-    //
-    // `init_with_env` derives the class loader itself, from
-    // `Context.getClassLoader()`. Under the old cargo-apk build that loader was
-    // useless: cargo-apk emitted a purely native APK with no classes.dex, so the
-    // app loader had never heard of the verifier's Kotlin classes, and this
-    // function had to hand-roll a `PathClassLoader` over the APK's own sourceDir
-    // and hand it to `init_with_refs`. The Gradle build packages a real DEX
-    // (`android:hasCode="true"`), so the app loader is now the correct one and
-    // that whole workaround is gone.
+    // rustls-platform-verifier reaches Android's TrustManager over JNI; without
+    // this, every HTTPS connection fails. `init_with_env` derives the class
+    // loader from `Context.getClassLoader()`.
     #[allow(
         unsafe_code,
         reason = "wrapping the raw JavaVM/Activity pointers android-activity hands us"
@@ -62,53 +44,33 @@ fn android_main(app: AndroidApp) {
         use jni::{jni_sig, jni_str};
 
         // jni 0.22: `from_raw` is infallible and registers the process-wide
-        // `JavaVM` singleton; the environment is only handed out as a `&mut Env`
-        // borrowed for the body of the attachment closure.
+        // `JavaVM` singleton.
         let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr() as *mut jni::sys::JavaVM) };
         let activity_ptr = app.activity_as_ptr() as jni::sys::jobject;
 
         vm.attach_current_thread(|env| -> jni::errors::Result<()> {
-            // Two handles onto the same jobject. `JObject::from_raw` only wraps
-            // the pointer -- it takes no ownership and deletes no local reference
-            // when dropped -- and `init_with_env` consumes the handle it is
-            // passed, so the second is what the helper registrations below use to
-            // reach the Activity.
+            // Two handles onto the same jobject: `JObject::from_raw` wraps the
+            // pointer without taking ownership, and `init_with_env` consumes one.
             let context = unsafe { JObject::from_raw(env, activity_ptr) };
             let activity = unsafe { JObject::from_raw(env, activity_ptr) };
 
-            // Stash the Activity for the JNI helpers above, *before* anything
-            // that can fail: this is the only point in this `android_main`
-            // where the real Activity is available. `ndk_context` cannot substitute for
-            // it -- android-activity 0.6 registers `Activity.getApplication()`
-            // there, and `getWindow` / `moveTaskToBack` / `requestPermissions`
-            // do not exist on `Application`. See [`JAVA`].
-            // Two global refs, one per context: a `Global` is an owned JNI
-            // reference (not `Clone` — dropping it deletes the ref), and the
-            // shell's helpers and the facade's arm release theirs
-            // independently at teardown.
+            // Stash the Activity for the JNI helpers, *before* anything that can
+            // fail: this is the only point where it is available. See [`JAVA`].
+            // Two global refs, one per context; a `Global` is owned, not `Clone`.
             match (env.new_global_ref(&activity), env.new_global_ref(&activity)) {
                 (Ok(global), Ok(location_global)) => {
-                    // `JavaVM` is a handle onto a process-wide singleton, so the
-                    // clone is the same VM this closure is attached through.
-                    //
-                    // An *overwrite*, not a first write, for the same reason as
-                    // `set_event_loop_proxy` below: one `android_main` per
-                    // Activity instance, and the context a previous instance
-                    // left behind both points every helper at a destroyed
-                    // Activity and pins that Activity in memory. See [`JAVA`].
+                    // An *overwrite*, not a first write: one `android_main` per
+                    // Activity, and a stale context points every helper at a
+                    // destroyed Activity and pins it. See [`JAVA`].
                     set_java_context(Some(JavaContext {
                         vm: vm.clone(),
                         activity: global,
                     }));
-                    // The facade's JNI arm keeps its own context and registers
-                    // com.rustdar.LocationHelper itself (WO-RL-4: the facade
-                    // owns its env-attach helper and the classloader
-                    // registration; `deinit` below mirrors the teardown).
+                    // The facade's JNI arm registers com.rustdar.LocationHelper.
                     rustdar_location::android::init(vm.clone(), location_global);
                 }
-                // Not fatal on its own -- TLS and the event loop still work --
-                // but insets, back-to-minimise and the location permission
-                // prompt are all gone, so say which.
+                // Not fatal on its own, but insets, back-to-minimise and the
+                // location prompt are all gone.
                 (Err(e), _) | (_, Err(e)) => log::error!(
                     "Could not take a global ref to the Activity ({e:?}); \
                      window insets, back-to-minimise and the GPS permission \
@@ -132,12 +94,9 @@ fn android_main(app: AndroidApp) {
 
             // Predictive back. Once the app opts in, back bypasses the native
             // input queue and goes through OnBackInvokedDispatcher; unhandled,
-            // NativeActivity calls finish() and the process dies. The helper
-            // registers a callback that hands the press to
-            // `Java_com_rustdar_BackHandler_nativeBackPressed` instead of
-            // deciding anything itself. Registered here, before the event loop
-            // exists, so presses in that window take the callback's own
-            // minimise — see `post_back_press`.
+            // NativeActivity calls finish() and the process dies. Registered
+            // before the event loop exists, so presses in that window take the
+            // callback's own minimise.
             register_java_helper(env, &loader, &activity, "com.rustdar.BackHandler");
 
             if let Some(cls) =
@@ -146,26 +105,19 @@ fn android_main(app: AndroidApp) {
                 let _ = COMPASS_CLASS.set(cls);
             }
 
-            // com.rustdar.LocationHelper is registered by
-            // `rustdar_location::android::init` above — the facade owns the
-            // location half of this JNI setup since WO-RL-4.
             Ok(())
         })
         .expect("Failed to attach JNI thread");
     }
 
-    // Derive the Android cache directory for zone geometry caching.
-    // internal_data_path() returns .../files; its parent is the app root,
-    // so parent/cache gives us getCacheDir() which shows as clearable
-    // "Cache" in Android app settings.
+    // internal_data_path() returns .../files; its parent is the app root, so
+    // parent/cache gives getCacheDir(), which shows as clearable "Cache".
     let android_zone_cache = app
         .internal_data_path()
         .and_then(|p| p.parent().map(|root| root.join("cache").join("zones")));
 
-    // Derive the config directory before `app` is moved into the event loop.
     let android_config_dir = app.internal_data_path().map(|p| p.join("config"));
 
-    // Create event loop with Android app
     let event_loop = winit::event_loop::EventLoop::builder()
         .with_android_app(app)
         .build()
@@ -173,42 +125,30 @@ fn android_main(app: AndroidApp) {
 
     // The predictive-back callback runs on the UI thread and cannot touch the
     // App; this is how it reaches the loop that can. Installed before
-    // `run_app` — until it is, `post_back_press` reports `false` and the Java
-    // side minimises for itself.
-    //
-    // An *overwrite*, not a first write: this function runs once per Activity
-    // instance, not once per process, and the proxy left behind by a previous
-    // instance is attached to an `EventLoop` that `run_app` has already
-    // consumed. See [`EVENT_LOOP_PROXY`].
+    // `run_app` — until it is, `post_back_press` reports `false`. An
+    // *overwrite*: a previous proxy is attached to a consumed `EventLoop`.
     set_event_loop_proxy(Some(event_loop.create_proxy()));
 
-    // Create and run the platform app. The location facade's arm is the JNI
-    // one `rustdar_location::android::init` above prepared.
     let mut platform_app = rustdar_app::app::App::new(
         Box::new(crate::platform::create_platform()),
         crate::platform::create_location(),
     );
 
-    // Wire up Android back button to minimize instead of exit
     platform_app.set_back_handler(move_task_to_back);
 
-    // ...and the other half of it: where a press that came in through
-    // OnBackInvokedDispatcher rather than the input queue is collected.
+    // ...and where a press from OnBackInvokedDispatcher is collected.
     platform_app.set_back_press_taker(take_back_press);
 
-    // Set zone geometry cache directory for persistent caching
     if let Some(cache_path) = android_zone_cache {
         platform_app.set_zone_cache_dir(cache_path);
     }
 
-    // Set config directory for UI config persistence on Android.
     if let Some(config_path) = android_config_dir {
         platform_app.set_config_dir(config_path);
     }
 
-    // Set up a callback to query system bar insets when the window is ready.
-    // getRootWindowInsets() can return null before the first layout, so we
-    // defer the query to the first resumed() call via a callback.
+    // getRootWindowInsets() can return null before the first layout, so the
+    // query is deferred to the first resumed() call via a callback.
     platform_app.set_insets_querier(|| {
         let (top, bottom, left, right) = get_system_insets();
         let density = get_display_density();
@@ -229,24 +169,13 @@ fn android_main(app: AndroidApp) {
         result
     });
 
-    // Hand the bridge the JNI theme read. NativeActivity never emits
-    // WindowEvent::ThemeChanged, so the bridge polls this to notice a
-    // light/dark switch; it also answers the initial query on the first frame.
+    // NativeActivity never emits WindowEvent::ThemeChanged, so the bridge polls.
     platform_app.set_theme_detector(detect_dark_theme);
 
-    // The location calls left this file at WO-RL-4: the facade's JNI arm
-    // (`rustdar_location::android`, initialised above) makes them directly,
-    // and its poll thread starts when the app installs its wake. The
-    // fn-pointer inversion below still governs insets, theme and back -- the
-    // rule, in full, is in this module tree's doc (`android/mod.rs`).
 
-    // The compass thread asks for the frame its value will be read on through
-    // a handle that is *empty right now* -- the window does not exist until the
-    // first `resumed()`, which is inside `run_app`. That is the whole reason it
-    // is a slot rather than a window handle it takes a copy of;
-    // see `rustdar_app::platform::RedrawWaker`.
+    // The compass thread asks for the frame its value will be read on through a
+    // handle that is *empty right now* — no window until the first `resumed()`.
 
-    // Start compass heading thread and wire it to the app
     let (heading_sender, heading_receiver) = std::sync::mpsc::channel();
     let heading_waker = platform_app.redraw_waker();
     start_compass_thread(heading_sender, move || heading_waker.wake());
@@ -256,19 +185,13 @@ fn android_main(app: AndroidApp) {
         log::error!("Application error: {}", e);
     }
 
-    // `run_app` consumed the loop, so the proxy above is now a corpse whose
-    // `send_event` can only fail. Dropping it means a back press between here
-    // and the next `android_main` reports "no loop installed" and minimises,
-    // rather than looking like a delivery failure. Usually unreachable —
-    // `needs_process_exit` takes Android out through `process::exit` — but this
-    // is where a plain Activity teardown arrives.
+    // `run_app` consumed the loop, so the proxy above is a corpse. Dropping it
+    // means a back press before the next `android_main` minimises rather than
+    // looking like a delivery failure.
     set_event_loop_proxy(None);
 
-    // Same for the Activity context: from here until the next `android_main`
-    // the object behind [`JAVA`] is a destroyed Activity, so let the global
-    // ref go and let the helpers degrade to their documented defaults instead
-    // of calling into the corpse. The facade's own context (WO-RL-4) is
-    // released the same way, for the same reason.
+    // Same for the Activity context: the object behind [`JAVA`] is a destroyed
+    // Activity from here, so let the global ref go and let the helpers degrade.
     set_java_context(None);
     rustdar_location::android::deinit();
 }

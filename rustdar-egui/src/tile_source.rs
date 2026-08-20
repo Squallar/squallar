@@ -1,87 +1,30 @@
 //! rustdar's own basemap tile source.
 //!
-//! # Why this exists
+//! Every other HTTPS call rustdar makes goes through [`rustdar_radar::tls::client`]
+//! (`rustls-platform-verifier` + *ring*), so the OS decides trust at handshake
+//! time and nothing in the binary carries an expiry date. Basemap tiles were the
+//! one path that bypassed it: [`walkers::HttpTiles`] builds its own `reqwest`
+//! client internally (`walkers-0.56.0/src/io/http.rs`, `bare_client`) with
+//! `features = ["rustls-tls"]`, which in reqwest 0.12 resolves to `webpki-roots`
+//! — the Mozilla root store compiled into the binary.
 //!
-//! Every other HTTPS call rustdar makes goes through [`rustdar_radar::tls::client`],
-//! which is `rustls-platform-verifier` + *ring*: the operating system decides
-//! trust at handshake time, so nothing in the binary carries an expiry date and
-//! OS distrust lists, enterprise CAs and user CAs all apply.
+//! [`HttpsTiles`] replaces `HttpTiles`, implementing [`walkers::Tiles`], so the
+//! rest of the walkers integration is untouched. It reproduces async fetching,
+//! bounded concurrency at [`MAX_PARALLEL_DOWNLOADS`], decode and upload via
+//! [`walkers::Tile::new`], a bounded LRU of [`TILE_CACHE_ENTRIES`] tiles,
+//! in-flight de-duplication, lower-zoom interpolation, `max_zoom` clamping,
+//! grid-bounds checking, repaint-on-arrival and attribution.
 //!
-//! Basemap tiles were the one path that bypassed it. [`walkers::HttpTiles`]
-//! builds its own `reqwest` client internally (`walkers-0.56.0/src/io/http.rs`,
-//! `bare_client`) and exposes no way to supply one, and walkers' manifest
-//! declares
+//! Deliberate differences: our client with a [`REQUEST_TIMEOUT`] (walkers sets
+//! none); rustdar's `User-Agent`; a closed request channel logs instead of
+//! panicking (walkers' `TilesIo::make_sure_is_fetched` calls `panic!`); no HTTP
+//! disk cache, which neither has.
 //!
-//! ```toml
-//! reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
-//! ```
-//!
-//! unconditionally — not `optional`, gated behind no feature. In reqwest 0.12
-//! `rustls-tls` resolves to `webpki-roots`: a copy of the Mozilla root store
-//! compiled into the binary, frozen at whatever was current when that crate
-//! version was published. That is an expiration date on the shipped artifact,
-//! which is exactly what the platform-verifier migration existed to remove.
-//!
-//! [`HttpsTiles`] replaces `HttpTiles`. It implements [`walkers::Tiles`] — the
-//! only thing [`walkers::Map`] actually requires of a tile source — so the rest
-//! of the walkers integration (projection, `MapMemory`, the flood-fill tile
-//! draw, `TilePiece`/`Tile`) is untouched and unduplicated.
-//!
-//! # Behaviour parity with `HttpTiles`
-//!
-//! This is not a shim; `HttpTiles` does real work and all of it is reproduced:
-//!
-//! * **Async fetching** off the UI thread, on a dedicated IO runtime.
-//! * **Bounded concurrency** at [`MAX_PARALLEL_DOWNLOADS`], matching walkers'
-//!   `MaxParallelDownloads::default()`. Tile providers rate-limit; this is a
-//!   politeness obligation, not a tuning knob.
-//! * **Decode and texture upload** via [`walkers::Tile::new`], which is the same
-//!   public entry point walkers' own `EguiTileFactory` calls. Reusing it rather
-//!   than re-implementing the `image` → [`egui::ColorImage`] → texture path means
-//!   the pixels cannot drift from what `HttpTiles` produced.
-//! * **A bounded in-memory cache** of [`TILE_CACHE_ENTRIES`] tiles with LRU
-//!   eviction — walkers' size on desktop, halved on mobile and halved again
-//!   on wasm32, where the texture budget the tiles come out of is smaller.
-//! * **In-flight de-duplication**: a tile already requested is not requested
-//!   again while it is pending. See [`HttpsTiles::request_once`] — as in walkers,
-//!   the cache's `None` entry *is* the in-flight marker.
-//! * **Lower-zoom interpolation**: a missing tile is drawn as a stretched piece
-//!   of the nearest cached ancestor, which is what stops the map flashing blank
-//!   while panning or zooming.
-//! * **`max_zoom` clamping**, **tile-grid bounds checking**, and
-//!   **[`egui::Context::request_repaint`] on arrival** (without which a fetched
-//!   tile would not appear until some unrelated input woke the UI).
-//! * **Attribution**, carried through unchanged from the source.
-//!
-//! # Deliberate differences
-//!
-//! * **The client.** Ours comes from [`rustdar_radar::tls::client`]: platform
-//!   verifier, *ring*, `https_only(true)`, and a [`REQUEST_TIMEOUT`]. walkers
-//!   sets no timeout, so a black-holed connection there occupies a concurrency
-//!   slot indefinitely.
-//! * **The `User-Agent`** is rustdar's rather than `walkers/0.56.0`. Tile
-//!   providers require a UA that identifies the client; ours does, and it is the
-//!   same one the rest of the application sends.
-//! * **A closed request channel logs instead of panicking.** walkers'
-//!   `TilesIo::make_sure_is_fetched` calls `panic!` there; taking down the UI
-//!   thread because the IO task exited is a worse outcome than a map that stops
-//!   fetching.
-//! * **No HTTP disk cache.** Neither has one: `HttpTiles::new` uses
-//!   `HttpOptions::default()`, whose `cache` field is `None`, and rustdar never
-//!   called `with_options`. walkers' `http-cache-reqwest` middleware is only
-//!   installed when that field is `Some`, so there is nothing to preserve.
-//!
-//! # wasm32
-//!
-//! The IO runtime is split per target exactly as walkers splits it: a thread
-//! with a current-thread tokio runtime on native, `spawn_local` on wasm, where
-//! `reqwest` becomes a `fetch()` call and the browser owns the trust store.
-//!
-//! `spawn_local` means the "IO task" shares the page thread with the frame
-//! loop, so on wasm a completed fetch hands over its **compressed bytes**
-//! rather than a decoded tile, and the decode + texture upload runs in the
-//! frame pump under [`WASM_TILE_DECODES_PER_PUMP`] — see [`FetchPayload`].
-
+//! The IO runtime splits per target as walkers splits it: a thread with a
+//! current-thread tokio runtime on native, `spawn_local` on wasm. On wasm the
+//! IO task shares the page thread, so a completed fetch hands over **compressed
+//! bytes** and the decode + upload runs in the frame pump under
+//! [`WASM_TILE_DECODES_PER_PUMP`] — see [`FetchPayload`].
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
@@ -93,11 +36,9 @@ use lru::LruCache;
 use walkers::sources::{Attribution, TileSource};
 use walkers::{Style, Tile, TileId, TilePiece, Tiles};
 
-/// Maximum number of tile downloads in flight at once.
-///
-/// walkers' default, which follows what browsers allow per host. Tile providers
-/// throttle or ban clients that exceed their limits, so this is a term of use
-/// rather than a performance dial.
+/// Maximum number of tile downloads in flight at once — walkers' default.
+/// Tile providers throttle or ban clients that exceed their limits, so this is
+/// a term of use rather than a performance dial.
 pub const MAX_PARALLEL_DOWNLOADS: usize = 6;
 
 /// Tiles retained in one source's in-memory cache before LRU eviction starts.
@@ -111,30 +52,16 @@ pub const MAX_PARALLEL_DOWNLOADS: usize = 6;
 /// | mobile  |     128 |                        ~32 MiB |
 /// | wasm32  |      64 |                        ~16 MiB |
 ///
-/// The desktop arm is walkers' own figure, unchanged. "Per source" is the
-/// multiplier that makes the small arms worth having: each map source owns one
-/// of these caches — base and labels, light and dark, four at most with two
-/// live per theme — so the desktop figure carried onto wasm32 could put
-/// 256 MiB of basemap texture against the 288 MiB
-/// `rustdar-device-profile`'s `constants::WASM_APP_TEXTURE_BUDGET_BYTES`
-/// allows the whole application.
+/// The desktop arm is walkers' own figure. "Per source" is the multiplier: each
+/// map source owns one of these caches — base and labels, light and dark — so
+/// the desktop figure on wasm32 could put 256 MiB of basemap texture against the
+/// 288 MiB `rustdar-device-profile`'s `constants::WASM_APP_TEXTURE_BUDGET_BYTES`
+/// allows the whole application. The tiers follow that crate's budget cascade,
+/// spelled rather than imported.
 ///
-/// The tiers follow that crate's budget cascade (`APP_TEXTURE_BUDGET_BYTES`'s
-/// wasm32/mobile/desktop arms, with mobile the `target_os` rule of
-/// `rustdar-device-profile/src/mobile_cfg.rs`: `"android" | "ios"`), **spelled
-/// rather than imported** — copied when the cascade lived above this crate
-/// (rustdar-app → rustdar-egui, no back-edge) and kept spelled as a written
-/// decision here; `MODEL_GRID_CACHE_ENTRIES` in rustdar-overlays states the
-/// same posture, where the no-back-edge boundary still forces it.
-///
-/// What the wasm arm accepts, quantified: the working set at native zoom is
-/// the window's own tile count (`tiles::tiles_resident_for`), so a
-/// 1920x1080-point canvas keeps ~54 tiles per source and fits, while a
-/// 2560x1440-point one keeps ~77 and overruns — beyond that the fetcher stops
-/// settling for the overrun source, the churn `tiles.rs` describes. The
-/// deeper-zoom floor bias never adds to this on its own: `Gui`'s
-/// `tile_zoom_bias_for_pane` measures its working set against whichever arm
-/// of this constant is in force before taking the bias.
+/// What the wasm arm accepts: the working set at native zoom is the window's own
+/// tile count (`tiles::tiles_resident_for`), so a 1920x1080-point canvas keeps
+/// ~54 tiles per source and fits, while 2560x1440 keeps ~77 and overruns.
 #[cfg(target_arch = "wasm32")]
 pub const TILE_CACHE_ENTRIES: NonZeroUsize = WASM_TILE_CACHE_ENTRIES;
 /// See the wasm32 arm above.
@@ -150,12 +77,9 @@ pub const TILE_CACHE_ENTRIES: NonZeroUsize = MOBILE_TILE_CACHE_ENTRIES;
 ))]
 pub const TILE_CACHE_ENTRIES: NonZeroUsize = DESKTOP_TILE_CACHE_ENTRIES;
 
-/// The wasm32 arm of [`TILE_CACHE_ENTRIES`].
-///
-/// All three arms are named outside the cascade, the shape
-/// `rustdar-device-profile`'s `constants::WASM_VOLUME_GRID_CELLS` documents and for
-/// the reason it gives: this workspace runs `cargo test` on one arm, so the
-/// other two are only reachable from a test if they have names.
+/// The wasm32 arm of [`TILE_CACHE_ENTRIES`]. All three arms are named outside
+/// the cascade because this workspace runs `cargo test` on one arm, so the other
+/// two are only reachable from a test if they have names.
 pub const WASM_TILE_CACHE_ENTRIES: NonZeroUsize = NonZeroUsize::new(64).expect("64 is not zero");
 /// The mobile arm. See [`WASM_TILE_CACHE_ENTRIES`].
 pub const MOBILE_TILE_CACHE_ENTRIES: NonZeroUsize =
@@ -173,49 +97,32 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// Tile decodes the frame side performs per **source** per **pass**, wasm32
 /// only.
 ///
-/// On native this plays no part: the IO thread decodes and uploads off the
-/// frame thread, and the frame side only moves finished tiles into the cache.
-/// On wasm there is no other thread — `spawn_local` runs the fetch loop on the
-/// page itself — so before this bound existed every completed fetch decoded
-/// its PNG and uploaded its texture the moment it landed, and a pan that
-/// exposed a fresh row of tiles paid for up to [`MAX_PARALLEL_DOWNLOADS`]
-/// decode+upload rounds *per live source* in one stretch of the very thread
-/// the gesture runs on.
+/// On native the IO thread decodes and uploads off the frame thread. On wasm
+/// `spawn_local` runs the fetch loop on the page itself, so before this bound a
+/// pan exposing a fresh row of tiles paid up to [`MAX_PARALLEL_DOWNLOADS`]
+/// decode+upload rounds *per live source* on the very thread the gesture runs on.
 ///
-/// # The denominator
+/// Every [`HttpsTiles`] owns its own [`DecodeBudget`] and the standard
+/// configuration drives two live sources a pass, so a typical frame gets **4**
+/// rounds, not 2; a second pass doubles it again, since the budget keys on
+/// `Context::cumulative_pass_nr`. Against the pre-fix 12 across base + labels
+/// that is still a 3× cut, and it keeps each source filling at ~120 tiles a
+/// second at 60 fps. The pump requests a repaint whenever it uses its whole
+/// allowance, so a backlog drains over idle frames.
 ///
-/// Every [`HttpsTiles`] owns its own [`DecodeBudget`], and the standard
-/// configuration drives two live sources a pass (base + labels), so the
-/// constraint a typical frame actually gets is **4** decode+upload rounds,
-/// not 2. A frame that runs a second pass (`egui::Context::request_discard`,
-/// up to `max_passes`) doubles its allowance again: the budget keys on
-/// `Context::cumulative_pass_nr`, which advances on discarded passes too.
-/// Against the pre-fix burst — up to 6 rounds per source, 12 across base +
-/// labels, in one stretch — every one of those figures is still a cut of 3×.
-///
-/// Two per source per pass keeps each source filling at ~120 tiles a second
-/// at 60 fps — that source's six in-flight downloads would each have to
-/// finish in under 50 ms to outpace it — while capping what one pass pays
-/// per source at two 256x256 decodes and uploads. The pump requests a
-/// repaint whenever it uses its whole allowance, so a backlog drains over
-/// idle frames rather than waiting for the next input.
-///
-/// Deliberately **capped inline, not offloaded**: tile PNGs behind the
-/// overlay worker's job round-trip would trade a bounded per-pass cost for
-/// seconds of blank basemap, and held-but-undrawn data is the one thing the
-/// map never shows.
+/// Deliberately **capped inline, not offloaded**: tile PNGs behind the overlay
+/// worker's job round-trip would trade a bounded per-pass cost for seconds of
+/// blank basemap.
 pub const WASM_TILE_DECODES_PER_PUMP: usize = 2;
 
 // ---------------------------------------------------------------------------
 // Target-dependent bounds
 // ---------------------------------------------------------------------------
 
-/// A [`TileSource`] that can be moved into the IO task.
-///
-/// The bound differs by target and this alias is where that difference lives, so
-/// [`HttpsTiles::new`] has one signature and one body. On native the task runs on
-/// another thread and everything it captures must be `Send + Sync`; on wasm it
-/// runs on the same thread as the UI, where `reqwest`'s types are neither.
+/// A [`TileSource`] that can be moved into the IO task. The bound differs by
+/// target and this alias is where that difference lives: on native the task runs
+/// on another thread and everything it captures must be `Send + Sync`; on wasm
+/// it runs on the UI thread, where `reqwest`'s types are neither.
 #[cfg(not(target_arch = "wasm32"))]
 pub trait AsyncTileSource: TileSource + Send + Sync + 'static {}
 #[cfg(not(target_arch = "wasm32"))]
@@ -229,12 +136,8 @@ impl<T: TileSource + 'static> AsyncTileSource for T {}
 /// What one completed fetch hands the frame side.
 ///
 /// Native: the decoded [`Tile`] — [`fetch_one`] decodes and uploads on the IO
-/// thread, off the frame thread, which is also where walkers does it.
-///
-/// wasm32: the compressed PNG bytes. `spawn_local` puts the fetch loop on the
-/// page thread, so decoding at completion time was frame-thread work at
-/// whatever burst size the network delivered; instead the frame pump decodes,
-/// at most [`WASM_TILE_DECODES_PER_PUMP`] per source per pass — see
+/// thread. wasm32: the compressed PNG bytes, decoded by the frame pump at most
+/// [`WASM_TILE_DECODES_PER_PUMP`] per source per pass — see
 /// [`HttpsTiles::receive_fetched_tiles`].
 #[cfg(not(target_arch = "wasm32"))]
 type FetchPayload = Tile;
@@ -253,13 +156,10 @@ mod runtime {
 
         /// Run `future` on a private current-thread runtime on its own thread.
         ///
-        /// The future is `spawn`ed rather than `block_on`'d, and the thread parks
-        /// on a quit channel instead. That is what makes shutdown immediate:
-        /// dropping the runtime cancels an in-flight request outright, whereas
-        /// blocking on the future itself would make [`Runtime::drop`] wait out
-        /// whatever HTTP request happened to be in progress — up to
-        /// [`super::super::REQUEST_TIMEOUT`], on the UI thread, every time the map
-        /// tiles are torn down.
+        /// `spawn`ed rather than `block_on`'d, with the thread parked on a quit
+        /// channel: dropping the runtime cancels an in-flight request outright,
+        /// whereas blocking on the future would make [`Runtime::drop`] wait out
+        /// the request on the UI thread.
         pub(crate) fn spawn<F>(future: F) -> Runtime
         where
             F: Future<Output = ()> + Send + 'static,
@@ -302,10 +202,7 @@ mod runtime {
     #[cfg(target_arch = "wasm32")]
     mod web {
         /// There is no thread to own: the task runs on the browser's event loop.
-        ///
-        /// It still stops when [`super::super::HttpsTiles`] is dropped — the fetch
-        /// loop exits as soon as its request channel reports that the sender is
-        /// gone.
+        /// It still stops when [`super::super::HttpsTiles`] is dropped.
         pub(crate) struct Runtime;
 
         pub(crate) fn spawn<F>(future: F) -> Runtime
@@ -330,10 +227,7 @@ mod runtime {
 /// Number of tiles along one axis at `zoom`, or `None` if `zoom` is absurd.
 ///
 /// walkers' `mercator::total_tiles` is `pub(crate)` and computes `2u32.pow(zoom)`,
-/// which overflows for `zoom >= 32` — a panic in debug, a silent `0` in release.
-/// `TileId::zoom` is a `u8`, so nothing in the type system rules that out. The
-/// checked form is a strict improvement: no reachable zoom level behaves
-/// differently, and the unreachable ones stop being undefined.
+/// which overflows for `zoom >= 32`. `TileId::zoom` is a `u8`.
 fn total_tiles(zoom: u8) -> Option<u32> {
     2u32.checked_pow(zoom as u32)
 }
@@ -352,18 +246,15 @@ fn tile_id_is_valid(tile_id: TileId) -> bool {
 /// Locate `tile_id` inside its ancestor at `available_zoom`.
 ///
 /// Returns the ancestor and the sub-rectangle of it that `tile_id` covers, in
-/// texture (`uv`) coordinates. Drawing that ancestor through the returned `uv` is
-/// how a zoomed-in view stays populated with blurry tiles instead of holes while
-/// the sharp ones download.
-///
-/// Reproduces walkers' `tiles::interpolate_from_lower_zoom`, also `pub(crate)`.
+/// texture (`uv`) coordinates — how a zoomed-in view stays populated with blurry
+/// tiles instead of holes. Reproduces walkers'
+/// `tiles::interpolate_from_lower_zoom`, which is `pub(crate)`.
 ///
 /// # Panics
 ///
-/// Debug-asserts `available_zoom <= tile_id.zoom`. Every call site here either
-/// walks `zoom` downwards or clamps to `max_zoom`, and all of them run after
-/// [`tile_id_is_valid`] has rejected `zoom >= 32`, so the shift below cannot
-/// overflow.
+/// Debug-asserts `available_zoom <= tile_id.zoom`. Every call site walks `zoom`
+/// downwards or clamps to `max_zoom`, after [`tile_id_is_valid`] has rejected
+/// `zoom >= 32`, so the shift cannot overflow.
 fn interpolate_from_lower_zoom(tile_id: TileId, available_zoom: u8) -> (TileId, egui::Rect) {
     debug_assert!(
         tile_id.zoom >= available_zoom,
@@ -394,10 +285,8 @@ fn interpolate_from_lower_zoom(tile_id: TileId, available_zoom: u8) -> (TileId, 
 // The client
 // ---------------------------------------------------------------------------
 
-/// The HTTP client every basemap tile is fetched with.
-///
-/// The whole point of this module is that this function is
-/// [`rustdar_radar::tls::client`] and nothing else: platform verifier, *ring*,
+/// The HTTP client every basemap tile is fetched with:
+/// [`rustdar_radar::tls::client`] and nothing else — platform verifier, *ring*,
 /// `https_only`. There is deliberately no way to inject a different client from
 /// outside the crate.
 fn tile_client() -> reqwest::Client {
@@ -448,18 +337,12 @@ pub struct HttpsTiles {
 
 /// One source's per-pass decode allowance, wasm32 only.
 ///
-/// [`Tiles::at`] runs once per visible tile per pass, and the pump runs at the
-/// top of every call — so a per-*call* bound of two would let one pass's many
-/// calls drain the whole backlog two at a time, which is no bound on the pass
-/// at all. The pass number is what turns the bound per-pass: the first call
-/// of a new pass restores the full allowance, every later call in the same
-/// pass gets only what is left. Per *source* because each [`HttpsTiles`]
-/// owns one of these — the frame-level constraint that adds up to is stated
-/// on [`WASM_TILE_DECODES_PER_PUMP`], denominator and all.
+/// [`Tiles::at`] runs once per visible tile per pass and the pump runs at the
+/// top of every call, so a per-*call* bound would be no bound on the pass. The
+/// pass number is what turns it per-pass: the first call of a new pass restores
+/// the full allowance. Per *source* because each [`HttpsTiles`] owns one.
 ///
-/// Compiled on native for the tests (the wasm pump itself never compiles
-/// there; there is no web behavioural gate in this workspace), which is why
-/// the cfg is `any(test, target_arch = "wasm32")`.
+/// Compiled on native for the tests (`any(test, target_arch = "wasm32")`).
 #[cfg(any(test, target_arch = "wasm32"))]
 struct DecodeBudget {
     /// The pass [`Self::spent`] counts within.
@@ -494,16 +377,10 @@ impl DecodeBudget {
 }
 
 /// Move at most `budget` completed fetches out of `rx`, handing each to `take`.
-///
-/// Returns how many were taken — counted here, where the work happens, which
-/// is what the budget test pins. Stops early when the channel is empty; a
-/// closed channel is the IO task gone, logged exactly as
-/// [`HttpsTiles::receive_one_fetched_tile`] logs it, because both mean the
-/// same thing.
-///
-/// Compiled on native for the tests, like [`DecodeBudget`]; the native frame
-/// path keeps its own one-per-call [`HttpsTiles::receive_one_fetched_tile`]
-/// untouched.
+/// Returns how many were taken. Stops early when the channel is empty; a closed
+/// channel is the IO task gone, logged as
+/// [`HttpsTiles::receive_one_fetched_tile`] logs it. Compiled on native for the
+/// tests, like [`DecodeBudget`].
 #[cfg(any(test, target_arch = "wasm32"))]
 fn drain_up_to<T>(rx: &mut Receiver<T>, budget: usize, mut take: impl FnMut(T)) -> usize {
     let mut taken = 0;
@@ -529,11 +406,9 @@ impl HttpsTiles {
         Self::with_client(source, egui_ctx, tile_client())
     }
 
-    /// [`Self::new`], with the HTTP client supplied.
-    ///
-    /// Crate-private and exists for the tests, which need to talk cleartext to a
-    /// loopback server — [`tile_client`] refuses `http://` by design, and that
-    /// refusal is itself under test in `the_tile_client_refuses_cleartext`.
+    /// [`Self::new`], with the HTTP client supplied. Crate-private, for the
+    /// tests, which need to talk cleartext to a loopback server — [`tile_client`]
+    /// refuses `http://` by design.
     fn with_client<S: AsyncTileSource>(
         source: S,
         egui_ctx: Context,
@@ -542,13 +417,9 @@ impl HttpsTiles {
         Self::with_client_and_cache(source, egui_ctx, client, TILE_CACHE_ENTRIES)
     }
 
-    /// [`Self::with_client`], with the cache bound supplied.
-    ///
-    /// Crate-private and exists for the tests, like the client injection above:
-    /// [`TILE_CACHE_ENTRIES`] is cfg-selected, one arm per compiled target, and
-    /// this workspace runs `cargo test` on the desktop arm only — so eviction
-    /// at the mobile and wasm bounds is only exercisable if the bound can be
-    /// handed in.
+    /// [`Self::with_client`], with the cache bound supplied. Crate-private, for
+    /// the tests: [`TILE_CACHE_ENTRIES`] is cfg-selected and this workspace runs
+    /// `cargo test` on the desktop arm only.
     fn with_client_and_cache<S: AsyncTileSource>(
         source: S,
         egui_ctx: Context,
@@ -560,8 +431,7 @@ impl HttpsTiles {
         let max_zoom = source.max_zoom();
 
         // Sized to the concurrency limit, as walkers sizes them: a full request
-        // channel is the backpressure signal that makes `request_once` retry on a
-        // later frame rather than queue without bound.
+        // channel is the backpressure that makes `request_once` retry later.
         let (request_tx, request_rx) = channel(MAX_PARALLEL_DOWNLOADS);
         let (tile_tx, tile_rx) = channel(MAX_PARALLEL_DOWNLOADS);
 
@@ -609,15 +479,10 @@ impl HttpsTiles {
     /// fetched tiles. The wasm32 counterpart of
     /// [`Self::receive_one_fetched_tile`].
     ///
-    /// The bytes waited in the channel; this is the only place they become a
-    /// texture, and [`DecodeBudget`] is what keeps a burst of completed
-    /// fetches from billing one pass for this source's whole backlog at once
-    /// — the pan lag [`WASM_TILE_DECODES_PER_PUMP`] describes, denominator
-    /// included. The put is unconditional,
-    /// exactly as a native tile arriving is: an entry whose pending marker was
-    /// evicted while the bytes waited is re-admitted as the freshest entry,
-    /// and a decode failure leaves the `None` marker meaning what it always
-    /// means — failed, do not ask again.
+    /// [`DecodeBudget`] keeps a burst of completed fetches from billing one pass
+    /// for this source's whole backlog. The put is unconditional, exactly as a
+    /// native tile arriving is: a `None` marker still means failed, do not ask
+    /// again.
     #[cfg(target_arch = "wasm32")]
     fn receive_fetched_tiles(&mut self) {
         let Self {
@@ -646,8 +511,7 @@ impl HttpsTiles {
 
         if budget > 0 && taken == budget {
             // The whole allowance went, so more completions may be waiting.
-            // Ask for a frame: this is what drains a backlog while the user
-            // is idle instead of leaving tiles hostage to the next input.
+            // Ask for a frame so a backlog drains while the user is idle.
             egui_ctx.request_repaint();
         }
     }
@@ -655,14 +519,10 @@ impl HttpsTiles {
     /// Ask for `tile_id` unless it has already been asked for.
     ///
     /// The de-duplication and the cache are the same structure: inserting `None`
-    /// under the tile's id both records "a request is out for this" and reserves
-    /// the slot the tile will land in. `try_get_or_insert` runs the closure only
-    /// when the key is absent, so a tile that is pending, cached or permanently
-    /// failed is never requested twice.
-    ///
+    /// under the tile's id records "a request is out" and reserves the slot.
     /// When the request channel is full the closure fails, *nothing is inserted*,
-    /// and the tile is retried on a later frame. That is deliberate: dropping the
-    /// request while marking the tile as requested would strand it forever.
+    /// and the tile is retried on a later frame — dropping the request while
+    /// marking the tile as requested would strand it forever.
     fn request_once(&mut self, tile_id: TileId) {
         // Split borrow: the closure needs the sender while the cache is borrowed.
         let Self {
@@ -714,22 +574,16 @@ impl HttpsTiles {
         self.max_zoom
     }
 
-    /// Tiles currently held, including pending and failed markers.
-    ///
-    /// Exposed for the eviction test; the map has no use for it. Gated off
-    /// wasm32 with `mod tests`, its only caller, or it would be dead there.
+    /// Tiles currently held, including pending and failed markers. Exposed for
+    /// the eviction test; gated off wasm32 with `mod tests`, its only caller.
     #[cfg(all(test, not(target_arch = "wasm32")))]
     fn cached_entries(&self) -> usize {
         self.cache.len()
     }
 
     /// Whether `tile_id` currently occupies a slot, pending and failed markers
-    /// included.
-    ///
-    /// A peek, not a use: `LruCache::contains` leaves the recency order alone,
-    /// which is what lets the eviction tests read membership back without the
-    /// reading itself protecting the entry. Test-gated like
-    /// [`Self::cached_entries`], its only caller.
+    /// included. A peek, not a use: `LruCache::contains` leaves the recency
+    /// order alone. Test-gated like [`Self::cached_entries`].
     #[cfg(all(test, not(target_arch = "wasm32")))]
     fn tile_is_cached(&self, tile_id: TileId) -> bool {
         self.cache.contains(&tile_id)
@@ -778,16 +632,13 @@ impl Tiles for HttpsTiles {
 
 /// Download one tile — and on native, decode and upload it too.
 ///
-/// On native, decoding happens here, on the IO runtime, rather than on the UI
-/// thread — which is also where walkers does it. [`Tile::new`] performs the PNG
-/// decode and the [`egui::Context::load_texture`] call; `Context` is
-/// `Send + Sync` and locks internally, so uploading from this thread is sound.
-/// On wasm32 the IO "runtime" *is* the UI thread, so the bytes are handed over
-/// undecoded — [`FetchPayload`] tells that story.
+/// On native, decoding happens here on the IO runtime, as walkers does it:
+/// [`Tile::new`] performs the PNG decode and the
+/// [`egui::Context::load_texture`] call, and `Context` is `Send + Sync` and
+/// locks internally. On wasm32 the IO "runtime" *is* the UI thread, so the bytes
+/// are handed over undecoded — see [`FetchPayload`].
 ///
-/// The error is a `String` because the decode error type, walkers' `TileError`,
-/// is not exported from walkers and so cannot be named here. Nothing acts on
-/// these errors — walkers logs and drops them too — so flattening loses nothing.
+/// The error is a `String` because walkers' `TileError` is not exported.
 async fn fetch_one<S: TileSource>(
     source: &S,
     client: &reqwest::Client,
@@ -818,10 +669,8 @@ async fn fetch_one<S: TileSource>(
         .map_err(|error| format!("reading '{url}': {error}"))?;
 
     // `Style::default()` rather than clippy's suggested `&Style`: walkers only
-    // defines `Style` as a unit struct when its `mvt` feature is off. With `mvt`
-    // on it is a real struct with fields, `&Style` stops compiling, and
-    // `default()` keeps working. Writing the unit literal would make this file
-    // silently depend on a feature of a dependency staying disabled.
+    // defines `Style` as a unit struct when its `mvt` feature is off, and with
+    // `mvt` on `&Style` stops compiling.
     #[cfg(not(target_arch = "wasm32"))]
     #[allow(
         clippy::default_constructed_unit_structs,

@@ -1,76 +1,38 @@
 //! Per-site real-time chunk feeds, and the rules for retiring one.
-//!
-//! Modelled on [`crate::loop_downloads::LoopDownloadManager`] (folded into
-//! this crate at WO-RF2, as this module was at WO-RF1): a plain state
-//! container owned by the app crate's `App`, with no network of its own.
-//! `App` drives the rounds; this decides which sites still want one and when
-//! to give up on a feed and let the archive path take over.
 
 use std::collections::HashMap;
 
 use crate::chunks::{ChunkPoller, PollOutcome, VolumeIndex};
 
 /// Consecutive failed rounds before a site falls back to the archive.
-///
-/// An *empty* round is not a failure — no new chunk is the ordinary state
-/// between cuts and across the gap between volumes, and counting it would
-/// retire a feed that is working perfectly.
 pub const MAX_CONSECUTIVE_ERRORS: u32 = 3;
 
 /// How long a feed may make no progress at all before it is retired.
-///
-/// Longer than any inter-cut or inter-volume gap in any VCP — the slowest
-/// clear-air patterns take about ten minutes for a whole volume and still
-/// deliver a chunk every few tens of seconds — so two minutes of complete
-/// silence means the site or the feed is down rather than merely quiet.
 pub const STALL: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// How long a retired site waits before chunks are tried again. A CORS blip or
-/// a brief outage should not cost the rest of the session.
+/// How long a retired site waits before chunks are tried again.
 pub const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// How fresh the tilt on screen is.
-///
-/// Defined here, beside the feed that produces it, since WO-RF1. This is the
-/// one published path (rustdar-egui's temporary re-export died at WO-RA).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct TiltFreshness {
-    /// The elevation the active pane is actually rendering — the snapped angle,
-    /// not the one the user selected.
+    /// The elevation the active pane is rendering — the snapped angle.
     pub elevation: f32,
     /// Seconds since the radar collected the newest radial in that sweep.
-    ///
-    /// Counts up between cuts and drops back when the beam returns, so it reads
-    /// as the real cadence of the tilt rather than as a countdown to a poll.
-    /// This is the number the feature exists to make small.
     pub data_age_secs: u64,
 }
 
 /// What the real-time chunk feed is doing for the pane on screen.
-///
-/// Deliberately about *the tilt being shown* rather than about the feed's
-/// progress through the volume. A count of completed cuts is operator jargon and
-/// answers the wrong question: what a user needs to know is whether the image in
-/// front of them is current, and a volume can be most of the way assembled while
-/// their own tilt is still minutes old.
-///
-/// Defined here, beside the feed that produces it, since WO-RF1. This is the
-/// one published path (rustdar-egui's temporary re-export died at WO-RA).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ChunkFeedStatus {
     /// Some live site is being fed from the real-time bucket.
     pub feeding: bool,
-    /// A live site had its feed retired and fell back to the archive. Worth
-    /// saying out loud: it is a silent drop from seconds of latency to minutes.
+    /// A live site had its feed retired and fell back to the archive.
     pub retired: bool,
     /// The feed's own poll cadence, in seconds.
     pub interval_secs: u64,
     /// A push-notification socket is open, so chunks are fetched on arrival
     /// rather than on the next tick.
-    ///
-    /// Set by the app-side wiring, which is what can see the notifier: the
-    /// producer of the rest of this struct ([`ChunkFeedManager::status`])
-    /// deliberately does not.
     pub pushed: bool,
     /// The active pane's tilt, once the feed has delivered it at least once.
     pub tilt: Option<TiltFreshness>,
@@ -87,12 +49,6 @@ pub enum Retirement {
 
 /// The in-flight volume as a consumer sees it: the sealed sweeps, and what
 /// their cuts declared their Nyquist velocities to be.
-///
-/// The two travel together because `nexrad_model::data::Scan` cannot hold the
-/// second — see [`crate::nyquist`] — and every consumer that resolves
-/// the merged current volume needs both or guards differently from the thread
-/// that extracted its payload. `Arc` on each half because the assembler hands
-/// its snapshot out by refcount and the bridge below clones per frame.
 #[derive(Clone)]
 pub struct LiveVolume {
     pub scan: std::sync::Arc<nexrad_model::data::Scan>,
@@ -101,28 +57,11 @@ pub struct LiveVolume {
 
 /// One site's feed.
 pub struct SiteFeed {
-    /// `None` only while a round is in flight — the poller travels with the
-    /// request and comes back on the response, because it owns the assembled
-    /// volume and a detached task cannot borrow it out of `App`.
+    /// `None` only while a round is in flight: the poller travels with the
+    /// request and comes back on the response.
     poller: Option<Box<ChunkPoller>>,
     /// The last snapshot the poller handed out, bridging the window the
     /// poller is away on a round.
-    ///
-    /// Without it, [`ChunkFeedManager::snapshot`] answered `None` for the
-    /// ~0.1–1 s of every ~5 s round — and everything resolved through
-    /// `current::resolve` flapped between the merged volume and the base
-    /// alone at the poll cadence. Measured live before the fix: 65 voxel
-    /// rebuilds in 5.5 minutes against ~20 sealed sweeps, every extra one a
-    /// full worker resample of a picture that had not changed, and the
-    /// section re-cut key moving per *round* rather than per rung change —
-    /// exactly the waste its fingerprint exists to prevent. An `Arc` clone
-    /// of the assembler's own cached snapshot, so the bridge costs a
-    /// refcount, not a copy.
-    /// Paired with the declared Nyquist table the `Scan` cannot carry, because
-    /// the bridge has to serve the *same* pair the poller would: a bridged
-    /// frame that dropped the table would put the section worker on estimated
-    /// fold limits for the ~0.1–1 s of every round, and back on declared ones
-    /// after — a guard that changes its mind at the poll cadence.
     last_snapshot: Option<LiveVolume>,
     in_flight: bool,
     consecutive_errors: u32,
@@ -153,11 +92,6 @@ impl SiteFeed {
     }
 
     /// Whether this site should dispatch a round now.
-    ///
-    /// One round per site at a time, deliberately **not** interlocked on the
-    /// global `RadarState::fetching`. That flag drives the status-bar spinner and
-    /// gates the archive poll; a five-second cadence on it would strobe the bar
-    /// and suppress the very fallback this feed may need.
     fn should_poll(&self, now: web_time::Instant) -> bool {
         if self.in_flight || self.retired.is_some() || self.poller.is_none() {
             return false;
@@ -173,17 +107,6 @@ impl SiteFeed {
 
     /// How long until this feed next wants a frame, or `None` when it does not
     /// want one at all.
-    ///
-    /// The scheduling half of [`Self::should_poll`], and it has to agree with
-    /// it: the event loop sleeps on this answer, so a round it does not
-    /// account for is a round that never happens. The two disagree in exactly
-    /// one place, and deliberately — a retired feed never polls, but
-    /// [`ChunkFeedManager::ensure`] rebuilds it once [`RETRY_AFTER`] is up, so
-    /// the wake belongs to the retirement rather than to the poll.
-    ///
-    /// A round in flight wants nothing: it is holding the loop awake through
-    /// [`ChunkFeedManager::any_in_flight`], and its completion asks for a
-    /// frame of its own.
     fn next_round_delay(&self, now: web_time::Instant) -> Option<std::time::Duration> {
         if self.in_flight {
             return None;
@@ -210,11 +133,6 @@ fn elevation_tenths(elevation: f32) -> i32 {
 }
 
 /// When a tilt was last delivered, and how old its data was at that moment.
-///
-/// Recorded on apply rather than recomputed each frame: the age now is that
-/// number plus the wall clock since, which is exact and O(1). Rescanning the
-/// sweep's radials for their newest timestamp every frame would be hundreds of
-/// iterations per frame for a value that only changes when a cut lands.
 #[derive(Debug, Clone, Copy)]
 struct Delivered {
     age_at_apply: std::time::Duration,
@@ -242,16 +160,6 @@ impl ChunkFeedManager {
 
     /// How long until some feed next wants a round, or `None` when none of
     /// them will without something else happening first.
-    ///
-    /// Rounds are dispatched from the app crate's `App::drive_chunk_feeds`,
-    /// which only runs on a frame, so this is what gets the frame there. It
-    /// used to come free: the frame loop re-armed unconditionally while
-    /// auto-poll was on, which it always was, so a five-second cadence rode on
-    /// a sixty-per-second one.
-    ///
-    /// No live-site or enabled gate needed, because the map already carries
-    /// both — `drive_chunk_feeds` calls `retain_live` every frame, with an
-    /// empty list when the setting is off.
     pub fn next_round_delay(&self) -> Option<std::time::Duration> {
         let now = web_time::Instant::now();
         self.feeds
@@ -260,17 +168,14 @@ impl ChunkFeedManager {
             .min()
     }
 
-    /// Whether this site is currently fed by chunks — the test
-    /// `check_auto_polls` uses to decide between a chunk round and the 60 s
-    /// archive check.
+    /// Whether this site is currently fed by chunks.
     pub fn is_feeding(&self, site: &str) -> bool {
         self.feeds
             .get(site)
             .is_some_and(|f| f.retired.is_none() && f.poller.is_some())
     }
 
-    /// Start a feed for a site, or clear a retirement whose retry window has
-    /// passed. Idempotent.
+    /// Start a feed for a site, or clear a retirement whose retry window has passed.
     pub fn ensure(&mut self, site: &str) {
         let now = web_time::Instant::now();
         match self.feeds.get_mut(site) {
@@ -290,14 +195,6 @@ impl ChunkFeedManager {
     }
 
     /// Make a site due for a round immediately, skipping the interval.
-    ///
-    /// What a push notification does: the chunk exists *now*, so waiting out the
-    /// remainder of the poll interval is latency for nothing. Everything else
-    /// about the round is unchanged, which is why a notifier that goes away costs
-    /// nothing — the timer is still there underneath.
-    ///
-    /// Does not disturb a round already in flight; `should_poll` still refuses
-    /// while the poller is out.
     pub fn mark_due(&mut self, site: &str) {
         if let Some(feed) = self.feeds.get_mut(site) {
             feed.last_poll = None;
@@ -305,10 +202,6 @@ impl ChunkFeedManager {
     }
 
     /// Tell a site's feed which cuts to download.
-    ///
-    /// Applied to the poller, so it survives a volume roll. Ignored while a
-    /// round is in flight — the poller is out — and picked up on the next one,
-    /// which is a frame's delay at worst.
     pub fn set_selection(&mut self, site: &str, selection: crate::chunks::CutSelection) {
         if let Some(feed) = self.feeds.get_mut(site)
             && let Some(poller) = feed.poller.as_mut()
@@ -319,11 +212,6 @@ impl ChunkFeedManager {
 
     /// Take the poller regardless of the interval, for a notification-driven
     /// fetch.
-    ///
-    /// Still refuses while a round is in flight — that is the part that matters,
-    /// since a burst of notifications for one volume would otherwise start a
-    /// fetch per message. The interval is skipped because a notification means
-    /// the object exists *now*, which is the whole point.
     pub fn take_now(&mut self, site: &str) -> Option<Box<ChunkPoller>> {
         let feed = self.feeds.get_mut(site)?;
         if feed.in_flight || feed.retired.is_some() {
@@ -335,9 +223,6 @@ impl ChunkFeedManager {
     }
 
     /// Take the poller for a round, if this site wants one now.
-    ///
-    /// Hands ownership out; [`Self::finish_round`] must put it back or the site
-    /// stops feeding.
     pub fn take_for_round(&mut self, site: &str) -> Option<Box<ChunkPoller>> {
         let now = web_time::Instant::now();
         let feed = self.feeds.get_mut(site)?;
@@ -350,9 +235,6 @@ impl ChunkFeedManager {
     }
 
     /// Put the poller back and fold in what the round did.
-    ///
-    /// Returns a retirement when this round exhausted the site's patience, so
-    /// the caller can hand the site back to the archive path.
     pub fn finish_round(
         &mut self,
         site: &str,
@@ -389,10 +271,7 @@ impl ChunkFeedManager {
         if let Some(reason) = retirement {
             log::warn!("{site}: retiring the chunk feed ({reason:?}); falling back to the archive");
             feed.retired = Some((reason, now));
-            // The bridge copy dies with the flight. [`Self::snapshot`]
-            // already answers `None` for a retired feed; this is the other
-            // half, so the kept-snapshot bridge cannot serve the frozen
-            // volume across the retirement from any path either.
+            // The bridge copy dies with the flight.
             feed.last_snapshot = None;
         }
         retirement
@@ -400,10 +279,6 @@ impl ChunkFeedManager {
 
     /// A one-line summary of what the feed is doing across the sites on screen,
     /// for the status bar.
-    ///
-    /// `retired` is reported only for a site that *was* being fed and is not
-    /// any more, so a site that never had a feed reads as plain auto-poll rather
-    /// than as a failure.
     pub fn status(
         &self,
         live_sites: &[String],
@@ -448,10 +323,6 @@ impl ChunkFeedManager {
     }
 
     /// Stamp each freshly delivered cut with the age of its newest radial.
-    ///
-    /// Taken from the sweep rather than from the wall clock at arrival: what a
-    /// user wants to know is how long ago the *radar* looked, and a chunk can
-    /// sit in the bucket or in a retry before it gets here.
     pub fn record_tilt_freshness(
         &mut self,
         site: &str,
@@ -495,14 +366,6 @@ impl ChunkFeedManager {
     }
 
     /// The volume so far for a site, complete sweeps only.
-    ///
-    /// `None` once the feed is retired, whatever the assembler still holds.
-    /// The flight is dead and the archive path owns the site — but the kept
-    /// poller keeps its assembler, and the partial volume it froze on must
-    /// not go on standing over a base the archive polls keep rolling
-    /// forward: overlay sweeps supersede base cuts by list order, not by
-    /// time, so a dead flight's low tilts would be served under a caption
-    /// whose newest time reads the newer base.
     pub fn snapshot(&mut self, site: &str) -> Option<LiveVolume> {
         let feed = self.feeds.get_mut(site)?;
         if feed.retired.is_some() {
@@ -510,73 +373,30 @@ impl ChunkFeedManager {
         }
         match feed.poller.as_mut() {
             Some(poller) => {
-                // The table is read before `snapshot` takes the poller
-                // mutably, and both describe the same assembler state.
                 let declared = poller
                     .declared_nyquist()
                     .cloned()
                     .map(std::sync::Arc::new)
                     .unwrap_or_default();
                 let snapshot = poller.snapshot().map(|scan| LiveVolume { scan, declared });
-                // Refreshed here — the one place the poller's answer passes —
-                // so the bridge below can only ever serve what some frame
-                // already saw.
+                // Refreshed here, the one place the poller's answer passes.
                 feed.last_snapshot.clone_from(&snapshot);
                 snapshot
             }
-            // The poller is away on a round. Serve the volume as it stood
-            // when the round left: a round only adds, so this is the same
-            // data the previous frame resolved — see
-            // [`SiteFeed::last_snapshot`] for what answering `None` here did
-            // to every consumer of the merged volume.
+            // The poller is away on a round.
             None => feed.last_snapshot.clone(),
         }
     }
 
     /// Drop the feeds of sites nothing is watching live.
-    ///
-    /// Narrower than `evict_unshown_scans` on purpose. That pass retains the
-    /// union of `pane.site` and `pane.scan_info.site.name`, keeping a volume
-    /// alive under the name a switching pane's `scan_info` still carries because
-    /// `dispatch_pane_renders` looks it up there. A *feed* has no such reader:
-    /// the moment no pane is live on the site, nothing wants another chunk and
-    /// the tens of megabytes of accumulated volume it holds are dead. The
-    /// retained set is exactly the set `check_auto_polls` will ask for a round
-    /// for.
-    ///
-    /// A round in flight for a dropped site is not a leak — the poller travels
-    /// on the response and is dropped by [`Self::finish_round`] when it finds no
-    /// feed to put it back into.
-    /// # The feed is handed back, not dropped here
-    ///
-    /// A `SiteFeed` owns the poller, which owns the assembler, which owns every
-    /// sealed cut — and that is a **second** full copy of the volume, not the
-    /// one the panes hold: [`crate::chunks::VolumeAssembler::snapshot`] builds
-    /// the published `Arc<Scan>` by cloning each sealed sweep, so a live site
-    /// carries the assembler's cuts *and* the snapshot. `evict_unshown_scans`
-    /// hands the snapshot over one call later; without this the assembler's
-    /// copy — uniquely held, so its free is the real one — was still walked in
-    /// place, on the frame thread, in the same frame.
-    ///
-    /// The evicted feeds are **returned owned** rather than freed in place:
-    /// this runs from the app crate's `poll_data_channels`, on the frame
-    /// thread, and the caller there hands them to the worker's
-    /// `offload::discard_each` so the frees land off the frame. This crate
-    /// cannot make that call itself — rustdar-worker sits above it — so the
-    /// hand-over is the seam, exactly like the returned poller above.
     pub fn retain_live(&mut self, live_sites: &[String]) -> Vec<SiteFeed> {
         let unshown = |site: &String| !live_sites.iter().any(|s| s == site);
-        // `extract_if` is `retain`'s inverse: one pass, and the doomed values
-        // come back owned instead of dying on this thread. The app crate keeps
-        // its own copy of this move for `evict_unshown_scans` — a three-line
-        // helper does not cross a crate boundary.
+        // `extract_if` is `retain`'s inverse: the doomed values come back owned.
         let evicted: Vec<SiteFeed> = self
             .feeds
             .extract_if(|site, _| unshown(site))
             .map(|(_, feed)| feed)
             .collect();
-        // Not handed back: an entry is a fingerprint and an elevation, and the
-        // whole map is smaller than one radial of what the feeds above hold.
         self.delivered
             .retain(|(site, _), _| live_sites.iter().any(|s| s == site));
         evicted
@@ -604,9 +424,7 @@ impl ChunkFeedManager {
         }
     }
 
-    /// Also compiled under the `test-support` feature: the app crate's
-    /// drain-precedence suites retire a feed without waiting out the clock,
-    /// and a `#[cfg(test)]` in this crate is invisible to a dependent's tests.
+    /// Also compiled under the `test-support` feature, for a dependent's tests.
     #[cfg(any(test, feature = "test-support"))]
     pub fn force_retire_at(&mut self, site: &str, ago: std::time::Duration) {
         if let Some(feed) = self.feeds.get_mut(site) {
@@ -614,12 +432,7 @@ impl ChunkFeedManager {
         }
     }
 
-    /// Put a feed mid-round with `scan` in hand: the poller away and the
-    /// bridge serving — the shape every frame of a live round sees. For tests
-    /// that need a serving overlay without a network to assemble one.
-    ///
-    /// Also compiled under the `test-support` feature, for the app crate's
-    /// drain-precedence suites — see [`Self::force_retire_at`].
+    /// Put a feed mid-round with `scan` in hand: the poller away, bridge serving.
     #[cfg(any(test, feature = "test-support"))]
     pub fn force_serving(&mut self, site: &str, scan: std::sync::Arc<nexrad_model::data::Scan>) {
         if let Some(feed) = self.feeds.get_mut(site) {
@@ -634,38 +447,6 @@ impl ChunkFeedManager {
 }
 
 /// What a site's feed needs to download: **everything, always.**
-///
-/// This used to narrow the feed to the tilts on screen, with `All` forced
-/// by whole-volume products, whole-volume pane kinds, and active loops —
-/// three exceptions whose omission each produced a plausible, wrong
-/// picture with no error to notice. The narrowing is superseded by the
-/// current merged volume: a live site's whole point is now that the app
-/// *always* holds a full and current copy of its data, so that a
-/// cross-section or a 3D pane opened at any moment cuts instantly from
-/// `base_scans` plus every sealed sweep, and so that each closed volume is
-/// `whole_volume_complete` and rolls the base forward without another
-/// archive download. A narrowed feed breaks both halves of that promise:
-/// the overlay would carry only the shown tilts, and no closed volume
-/// would ever be whole, so the base would age from the moment the first
-/// archive fetch landed — `CheckForNewScans` is skipped for any chunk-fed
-/// site, so nothing else would refresh it.
-///
-/// The cost this buys back is one full volume per volume period —
-/// measured against KTLX, chunks for a complete super-resolution volume
-/// run 10–25 MB per 4–7 minutes — which is the price of the product
-/// working the way the reference display does.
-///
-/// What the narrowing protected is still protected, one layer down:
-/// the app crate's `App::apply_chunk_outcome` refuses to cache or base a
-/// volume that is not whole. That guard is now the belt for a rule this
-/// function makes true by construction, exactly as before — it must never
-/// be the thing that fires.
-///
-/// [`CutSelection::Tilts`](crate::chunks::CutSelection::Tilts)
-/// itself stays in `crate::chunks`, tested and working: the decision
-/// retired here was the *app's*, and a future caller with a genuine
-/// bandwidth ceiling (a metered mobile build, say) has the mechanism and
-/// this history to weigh against it.
 pub fn cut_selection_for(_site: &str) -> crate::chunks::CutSelection {
     crate::chunks::CutSelection::All
 }

@@ -1,25 +1,10 @@
 use super::*;
-// Used only by the gated-render instrument and the tests built on it, which
-// are native-only with `Job::Opaque`; see `gated_render`.
+// Used only by the gated-render instrument and the tests built on it, which are native-only
+// with `Job::Opaque`; see `gated_render`.
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc;
 
 /// A render that does not finish until the test releases it.
-///
-/// The gate is the whole point: a reset only has something to act on while a
-/// render is *running*, and a render of nothing would routinely finish before
-/// the reset landed, so the test would pass on timing rather than on the
-/// abandonment.
-///
-/// Deliberately a `Job::Opaque`: it has to *block*, and a described job is
-/// executed by the funnel with no handle to hold it open. What is under
-/// test is the abandonment protocol around a running render, which is the
-/// same for both job shapes — `deliver` carries the flag either way.
-///
-/// `Opaque` is the native-only test instrument now (the variant does not
-/// exist on wasm32, by design — see its own doc), so this fixture and every
-/// test built on it are native-only with it. The protocol they pin is
-/// target-independent; the instrument is not.
 #[cfg(not(target_arch = "wasm32"))]
 fn gated_render() -> (mpsc::Sender<()>, rustdar_worker::offload::Job) {
     let (release, held) = mpsc::channel::<()>();
@@ -41,9 +26,9 @@ fn gated_render() -> (mpsc::Sender<()>, rustdar_worker::offload::Job) {
     )
 }
 
-/// [`gated_render`] for a render that answers nothing — what
-/// `Job::renders_nothing` produces when no sweep carries the product, held
-/// open so the abandonment protocol can be exercised around it.
+/// [`gated_render`] for a render that answers nothing — what `Job::renders_nothing`
+/// produces when no sweep carries the product, held open so the abandonment protocol can be
+/// exercised around it.
 #[cfg(not(target_arch = "wasm32"))]
 fn gated_nothing() -> (mpsc::Sender<()>, rustdar_worker::offload::Job) {
     let (release, held) = mpsc::channel::<()>();
@@ -63,10 +48,9 @@ fn gui_showing(site: &str) -> rustdar_egui::Gui {
     gui
 }
 
-/// The environmental heights route into the hail render parameters from
-/// the same map the sounding drain writes, and a moved pair drops exactly
-/// that site's hail renders — the per-site sibling of
-/// `changing_the_override_invalidates_the_storm_relative_renders`.
+/// The environmental heights route into the hail render parameters from the same map the
+/// sounding drain writes, and a moved pair drops exactly that site's hail renders — the
+/// per-site sibling of `changing_the_override_invalidates_the_storm_relative_renders`.
 #[test]
 fn a_landed_sounding_routes_into_hail_renders_and_a_moved_pair_drops_them() {
     let heights = |h0: f64, hm20: f64| rustdar_radar::sounding::EnvHeights {
@@ -165,30 +149,8 @@ fn a_landed_sounding_routes_into_hail_renders_and_a_moved_pair_drops_them() {
     );
 }
 
-/// The defect: `set_env_heights` invalidated the hail pair and nothing else,
-/// while `env_heights_km_msl_for` had already grown a third consumer. The
-/// hybrid classification selects `HsdaHeights::from_env_heights` over
-/// `operational_defaults` and feeds either into its melting-layer detection
-/// (`rustdar_radar::render::render_hhc_to_image`), so an HCA pane went on
-/// showing a **default-melting-layer** classification after a sounding landed
-/// — rain where the sounding said snow, as
-/// `the_hybrid_classification_changes_with_the_environmental_heights`
-/// measures — and did so until the volume rolled and reset the pane for
-/// other reasons.
-///
-/// Written as a sweep over every product against
-/// [`RadarProduct::reads_env_heights`] rather than as three named cases,
-/// because the defect was precisely a hand-kept list falling behind the set
-/// that consumes the pair. A fourth consumer added to the predicate and to no
-/// invalidation now fails here instead of shipping a wrong picture.
-///
-/// Both halves of the agreement are asserted, because only one of them was
-/// load-bearing and a mutation proved it: reverting
-/// `env_heights_km_msl_for` to its own hail-only list passed the whole
-/// workspace suite. That drift is *worse* than the bug this branch fixes —
-/// an HCA pane would be invalidated correctly on a landed sounding and then
-/// redrawn with `None`, pinned on the adaptation defaults permanently rather
-/// than until the volume rolls.
+/// The defect: `set_env_heights` invalidated the hail pair and nothing else, while
+/// `env_heights_km_msl_for` had already grown a third consumer.
 #[test]
 fn a_moved_sounding_drops_every_render_that_read_the_old_environment() {
     let heights = |h0: f64, hm20: f64| rustdar_radar::sounding::EnvHeights {
@@ -203,8 +165,8 @@ fn a_moved_sounding_drops_every_render_that_read_the_old_environment() {
 
         let mut d = RenderDispatcher::new();
         d.ensure_pane_count(1);
-        // A pane already showing this product, and a cached frame for it,
-        // both drawn against the first pair.
+        // A pane already showing this product, and a cached frame for it, both drawn
+        // against the first pair.
         d.set_env_heights("KTLX", heights(4.2, 7.1), &gui);
         d.pane_render[0].last_rendered = Some((product, 0.5));
         d.cache_render(
@@ -215,12 +177,8 @@ fn a_moved_sounding_drops_every_render_that_read_the_old_environment() {
             cached(1.0),
         );
 
-        // The other half of the agreement, and the one a mutation survived:
-        // invalidating a pane is worth nothing if the redraw is then handed
-        // `None`. A product dropped from *this* set but kept in the
-        // invalidation set would be refreshed on every landed sounding and
-        // redrawn on the adaptation defaults every time — pinned there
-        // permanently, and not even corrected by a volume roll.
+        // The other half of the agreement, and the one a mutation survived: invalidating a
+        // pane is worth nothing if the redraw is then handed `None`.
         assert_eq!(
             d.env_heights_km_msl_for(product, "KTLX").is_some(),
             consumes,
@@ -274,18 +232,13 @@ fn dispatch(
     release
 }
 
-/// How many renders were not abandoned. Ends when the last worker drops its
-/// sender, so nothing here waits on a timeout.
+/// How many renders were not abandoned.
 #[cfg(not(target_arch = "wasm32"))]
 fn arrivals(results: mpsc::Sender<RenderResponse>, rx: mpsc::Receiver<RenderResponse>) -> usize {
     drop(results);
     rx.iter().count()
 }
 
-/// The defect: a scan arriving for one site bumped a single global generation,
-/// so every pane on every *other* site had its in-flight render discarded at
-/// the receiver and respawned — a 2048² image and value grid redone per pane
-/// per poll, recurring every interval in any multi-site layout.
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
 fn a_scan_for_one_site_leaves_another_sites_render_alone() {
@@ -311,9 +264,9 @@ fn a_scan_for_one_site_leaves_another_sites_render_alone() {
     );
 }
 
-/// The other half: a scan for the pane's own site does invalidate it, or the
-/// pane paints the previous volume over the new one and then stops, since
-/// `last_rendered` records that render as the one it is showing.
+/// The other half: a scan for the pane's own site does invalidate it, or the pane paints
+/// the previous volume over the new one and then stops, since `last_rendered` records that
+/// render as the one it is showing.
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
 fn a_scan_for_the_panes_own_site_abandons_its_render() {
@@ -333,10 +286,8 @@ fn a_scan_for_the_panes_own_site_abandons_its_render() {
     assert_eq!(arrivals(results, rx), 0);
 }
 
-/// A pane can have more than one render running: the reset above clears
-/// `render_in_flight` while the first is still going, so the next dispatch
-/// starts a second. Abandoning only the newest would leave the older free to
-/// arrive last and paint the scan the reset was meant to replace.
+/// A pane can have more than one render running: the reset above clears `render_in_flight`
+/// while the first is still going, so the next dispatch starts a second.
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
 fn every_render_a_pane_has_running_is_abandoned_at_once() {
@@ -353,8 +304,8 @@ fn every_render_a_pane_has_running_is_abandoned_at_once() {
     assert_eq!(arrivals(results, rx), 0);
 }
 
-/// A full reset is site-blind by design — surface loss, a layout change — and
-/// keeps discarding everything.
+/// A full reset is site-blind by design — surface loss, a layout change — and keeps
+/// discarding everything.
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
 fn a_full_reset_abandons_every_panes_render() {
@@ -374,15 +325,7 @@ fn a_full_reset_abandons_every_panes_render() {
     assert_eq!(arrivals(results, rx), 0);
 }
 
-/// The lock-out this closes: a render that finds no sweep used to send
-/// nothing at all. `render_in_flight` is cleared by the receiver or by a
-/// reset and nowhere else, and `dispatch_pane_renders` refuses to dispatch
-/// while it is set — so the pane went quiet until something unrelated reset
-/// it, and a user changing product saw nothing happen.
-///
-/// Rare against an archive volume, which carries every cut it will ever
-/// have. Routine against a volume still being assembled from the real-time
-/// chunk feed, where an upper tilt has simply not been scanned yet.
+/// The lock-out this closes: a render that finds no sweep used to send nothing at all.
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
 fn a_render_that_finds_nothing_still_reports_back() {
@@ -414,10 +357,8 @@ fn a_render_that_finds_nothing_still_reports_back() {
     );
 }
 
-/// The counterweight, and the reason the report is gated on `results_wanted`
-/// rather than sent unconditionally: an abandoned render must stay silent.
-/// Reporting would clear `render_in_flight` for the render that *superseded*
-/// it, and the pane would dispatch a third while the second was still going.
+/// The counterweight, and the reason the report is gated on `results_wanted` rather than
+/// sent unconditionally: an abandoned render must stay silent.
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
 fn an_abandoned_render_that_finds_nothing_reports_nothing() {
@@ -441,14 +382,8 @@ fn an_abandoned_render_that_finds_nothing_reports_nothing() {
     assert_eq!(arrivals(results, rx), 0);
 }
 
-/// One pane on `site` showing `product`, with `available` as the tilt list
-/// its selection snaps within.
-///
-/// One pane rather than several because `Gui::set_pane_count_for_test` is
-/// `#[cfg(test)]` inside `rustdar-egui` and so does not exist for this
-/// crate's tests. The property under test — that a reset picks panes by
-/// their snapped tilt — is the same either way, and the pair of tests below
-/// covers both answers.
+/// One pane on `site` showing `product`, with `available` as the tilt list its selection
+/// snaps within.
 fn gui_on_tilt(
     site: &str,
     product: RadarProduct,
@@ -496,10 +431,8 @@ fn cached(range: f64) -> CachedRenderOutput {
     }
 }
 
-/// The defect this avoids: a cut completing in the real-time feed changes one
-/// sweep, not the volume, so a pane on another tilt is still showing a
-/// correct image. Resetting it dispatches a render whose `extract` answers
-/// `None` — a wasted slot in the render budget, on every cut of every volume.
+/// The defect this avoids: a cut completing in the real-time feed changes one sweep, not
+/// the volume, so a pane on another tilt is still showing a correct image.
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
 fn a_finished_tilt_leaves_a_pane_on_another_tilt_alone() {
@@ -524,8 +457,8 @@ fn a_finished_tilt_leaves_a_pane_on_another_tilt_alone() {
     );
 }
 
-/// The counterweight: the pane whose tilt it was must be invalidated, or the
-/// new sweep never reaches the screen.
+/// The counterweight: the pane whose tilt it was must be invalidated, or the new sweep
+/// never reaches the screen.
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
 fn a_finished_tilt_invalidates_the_pane_showing_it() {
@@ -544,9 +477,9 @@ fn a_finished_tilt_invalidates_the_pane_showing_it() {
     assert_eq!(arrivals(results, rx), 0);
 }
 
-/// Echo tops integrates every reflectivity tilt and clamps each column to the
-/// topmost one present, so a partial volume gives a plausible, low, wrong
-/// number with no error and no NaN. It must wait for the volume to close.
+/// Echo tops integrates every reflectivity tilt and clamps each column to the topmost one
+/// present, so a partial volume gives a plausible, low, wrong number with no error and no
+/// NaN.
 #[test]
 fn a_finished_tilt_leaves_the_volumetric_pane_for_the_closing_volume() {
     let gui = gui_on_tilt("KOUN", RadarProduct::EchoTopsInterpolated, 0.5, &[0.5]);
@@ -560,9 +493,8 @@ fn a_finished_tilt_leaves_the_volumetric_pane_for_the_closing_volume() {
     );
 }
 
-/// NROT fits its wind profile from every velocity tilt — the only wind
-/// source since the NVW fetch left — so it is volume-wide too, and only
-/// the closing volume refreshes it.
+/// NROT fits its wind profile from every velocity tilt — the only wind source since the NVW
+/// fetch left — so it is volume-wide too, and only the closing volume refreshes it.
 #[test]
 fn nrot_waits_for_the_volume() {
     let gui = gui_on_tilt("KOUN", RadarProduct::NormalizedRotation, 0.5, &[0.5]);
@@ -577,14 +509,8 @@ fn nrot_waits_for_the_volume() {
     );
 }
 
-/// SRV reads the same profile, for its dealias seed and for its default
-/// Bunkers vector, so it belongs on the same side of the split. The copy of
-/// the predicate that used to live in this module left it off, so an SRV pane
-/// was invalidated by every completed cut and re-rendered mid-volume, fitting
-/// its hodograph from however many velocity tilts had landed so far. It was
-/// still put right when the volume closed — that path is
-/// `reset_panes_for_site`, which does not consult this predicate — so the
-/// cost was wrong pixels in the meantime, plus a render slot per cut.
+/// SRV reads the same profile, for its dealias seed and for its default Bunkers vector, so
+/// it belongs on the same side of the split.
 #[test]
 fn srv_waits_for_the_volume() {
     let gui = gui_on_tilt("KOUN", RadarProduct::StormRelativeVelocity, 0.5, &[0.5]);
@@ -599,9 +525,8 @@ fn srv_waits_for_the_volume() {
     );
 }
 
-/// A Level III pane's pixels come from `level3_data`; a Level II cut
-/// completing says nothing about them, and its tilts are refetched only when
-/// the volume closes.
+/// A Level III pane's pixels come from `level3_data`; a Level II cut completing says
+/// nothing about them, and its tilts are refetched only when the volume closes.
 #[test]
 fn a_finished_tilt_does_not_touch_a_level3_pane() {
     let gui = gui_on_tilt(
@@ -615,16 +540,8 @@ fn a_finished_tilt_does_not_touch_a_level3_pane() {
     assert_eq!(d.reset_panes_for_tilts("KOUN", &gui, &[0.5]), 0);
 }
 
-/// The other side of every skip above: what the tilt reset passes over, the
-/// site reset takes.
-///
-/// Stated once, over every product, rather than as a second assertion inside
-/// each of the four tests above. `reset_panes_for_site` does not consult the
-/// product at all, so per-product repetitions of this would have been the same
-/// claim four times — which is what the deleted `reset_panes_for_volume` was
-/// doing there. What is worth pinning is that the skips are not a hole: a
-/// product the tilt reset declines *and* a site reset declined would never be
-/// refreshed at all while a site is live.
+/// The other side of every skip above: what the tilt reset passes over, the site reset
+/// takes.
 #[test]
 fn every_product_a_tilt_reset_skips_is_taken_by_a_site_reset() {
     let mut skipped = 0;
@@ -640,11 +557,6 @@ fn every_product_a_tilt_reset_skips_is_taken_by_a_site_reset() {
         }
         skipped += 1;
         d.pane_render[0].last_rendered = Some((product, 0.5));
-        // Cached *after* the tilt reset, not before: that reset's own
-        // `render_cache.retain` is product-blind — it drops every entry for
-        // the site at the angles it was given, whatever the pane is showing —
-        // so an entry seeded earlier would already be gone and the assertion
-        // below would pass without the site reset doing anything.
         d.cache_render(
             "KOUN",
             product,
@@ -672,10 +584,7 @@ fn every_product_a_tilt_reset_skips_is_taken_by_a_site_reset() {
                  re-renders straight back into it",
         );
     }
-    // precondition: both arms ran. A count of *how many* land on each side
-    // would be a hand-maintained census of the product roster, which is the
-    // defect this module already removed once — but with everything on one
-    // side the loop body above proves nothing, so that much is asserted.
+    // precondition: both arms ran.
     assert!(
         skipped > 0 && taken_by_tilts > 0,
         "the tilt reset put every product on one side: {skipped} skipped, \
@@ -683,8 +592,8 @@ fn every_product_a_tilt_reset_skips_is_taken_by_a_site_reset() {
     );
 }
 
-/// A whole-site `render_cache.retain` would throw away the images the panes
-/// this reset deliberately left alone are still sharing.
+/// A whole-site `render_cache.retain` would throw away the images the panes this reset
+/// deliberately left alone are still sharing.
 #[test]
 fn a_tilt_reset_keeps_the_other_tilts_cached_renders() {
     let gui = gui_on_tilt("KOUN", RadarProduct::Reflectivity, 0.5, &[0.5, 4.0]);
@@ -728,23 +637,13 @@ fn a_tilt_reset_keeps_the_other_tilts_cached_renders() {
     );
 }
 
-/// A tilt-independent plan view has no tilt for a tilt reset to name, so a
-/// completed 0.0° sweep does not evict it.
-///
-/// **The angle is 0.0° on purpose.** Before WO-E5c the elevation part was an
-/// `i32` whose "no elevation" value was `NO_ELEVATION_SLOT = 0`, and this
-/// reset compared it against `elevation_key(angle)` — where `0` is also the
-/// bucket a genuine 0.0° render lands in. So a completed sweep at 0.0° evicted
-/// every tilt-independent entry for the site, for no reason anyone stated:
-/// those four products draw the same picture at every tilt, the pane half of
-/// this reset already skips them, and the invalidation that genuinely owns
-/// them is the whole-site one. The typed key's `Option` cannot collide, and
-/// this pins that it does not.
+/// A tilt-independent plan view has no tilt for a tilt reset to name, so a completed 0.0°
+/// sweep does not evict it.
 #[test]
 fn a_tilt_reset_keeps_a_tilt_independent_plan_views_cached_render() {
     use rustdar_radar::types::RenderView;
-    // Found rather than named, so the pin cannot rot into testing the ordinary
-    // path if the set is re-cut.
+    // Found rather than named, so the pin cannot rot into testing the ordinary path if the
+    // set is re-cut.
     let tilt_blind = *RadarProduct::all()
         .iter()
         .find(|p| p.tilt_independent_plan_view())
@@ -761,8 +660,8 @@ fn a_tilt_reset_keeps_a_tilt_independent_plan_views_cached_render() {
     let mut d = RenderDispatcher::new();
     d.ensure_pane_count(1);
     d.cache_render("KOUN", tilt_blind, RenderView::PlanView, 3.0, cached(1.0));
-    // The control, and the reason this test cannot pass on a reset that evicts
-    // nothing: a tilt-dependent entry in the 0.0° bucket must still go.
+    // The control, and the reason this test cannot pass on a reset that evicts nothing: a
+    // tilt-dependent entry in the 0.0° bucket must still go.
     d.cache_render(
         "KOUN",
         RadarProduct::Reflectivity,
@@ -792,22 +691,8 @@ fn a_tilt_reset_keeps_a_tilt_independent_plan_views_cached_render() {
     );
 }
 
-/// The flag list is bounded by what is still stoppable, not by how many renders
-/// a session has dispatched.
-///
-/// This used to read `len() <= 2` — the render just added, plus a grace slot for
-/// "a worker that had not quite dropped its flag". That bound was a guess at a
-/// thread-teardown race and nothing enforced it: a render released its flag when
-/// its thread finished unwinding, which is *after* the send, so a result in hand
-/// said nothing about the flag behind it. Under CPU contention several workers
-/// sat in that window at once and the list reached 3 and 4 — measured at 5% of
-/// runs with six copies of this test sharing two cores, and seen on a quiet box
-/// too.
-///
-/// The flag is now released at the cancellation check, before the send, so a
-/// result off the channel *is* proof the flag is prunable and the bound is
-/// exact rather than probabilistic. Asserted as `== 1` for that reason: a grace
-/// slot would only hide the race coming back.
+/// The flag list is bounded by what is still stoppable, not by how many renders a session
+/// has dispatched.
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
 fn finished_renders_stop_being_tracked() {
@@ -816,12 +701,12 @@ fn finished_renders_stop_being_tracked() {
     for _ in 0..5 {
         let release = dispatch(&mut d, 0, &results);
         release.send(()).expect("the render is still running");
-        // Taking the result is what proves the render released its flag: it let
-        // go of it before sending, so this `recv` is ordered after that release.
+        // Taking the result is what proves the render released its flag: it let go of it
+        // before sending, so this `recv` is ordered after that release.
         rx.recv().expect("an unabandoned render arrives");
     }
-    // Each dispatch prunes before pushing, and every render but the last has
-    // answered, so exactly the one just added is held.
+    // Each dispatch prunes before pushing, and every render but the last has answered, so
+    // exactly the one just added is held.
     assert_eq!(
         d.pane_render[0].results_wanted.len(),
         1,
@@ -829,20 +714,7 @@ fn finished_renders_stop_being_tracked() {
     );
 }
 
-/// **A melting-layer object is never applied to a volume it does not name.**
-///
-/// The defect this closes is not "the classification is slightly off". The
-/// same classifier scored against ten RPG `N0H` products gets 82.8–95.9 %
-/// exact on the RPG's own melting layer and 16.0–19.8 % on the fleet default
-/// at the three sites where that default is ~3 km wrong. An object from the
-/// *previous* volume is a third state, and it is the worst of the three: the
-/// layer it places is a real measurement of a real atmosphere, so nothing
-/// about the picture looks wrong, and the render would report itself as
-/// `Rpg` — measured, for this volume — while being neither.
-///
-/// So the cache holds the volume start beside the bytes and the accessor
-/// compares before it hands anything out. "The latest object" is not a
-/// fallback here and must never become one.
+/// The defect this closes is not "the classification is slightly off".
 #[test]
 fn a_melting_layer_object_is_only_ever_applied_to_the_volume_it_names() {
     let volume = |minute: u32| {
@@ -877,9 +749,7 @@ fn a_melting_layer_object_is_only_ever_applied_to_the_volume_it_names() {
         "the object for this very volume must reach the render",
     );
 
-    // The volume rolls. The cached object is still perfectly good data — it is
-    // simply not this picture's — so it is withheld, and withheld for every
-    // neighbouring volume rather than only for distant ones.
+    // The volume rolls.
     for other in [volume(6), volume(12), volume(1)] {
         assert!(
             d.melting_layer_product_for(hca, "KTLX", other).is_none(),
@@ -888,8 +758,8 @@ fn a_melting_layer_object_is_only_ever_applied_to_the_volume_it_names() {
         );
     }
 
-    // Per site, on the same terms: KOUN's volume happens to start at the same
-    // instant and still gets nothing, because it has no object of its own.
+    // Per site, on the same terms: KOUN's volume happens to start at the same instant and
+    // still gets nothing, because it has no object of its own.
     assert!(
         d.melting_layer_product_for(hca, "KOUN", volume(0))
             .is_none(),
@@ -910,13 +780,8 @@ fn a_melting_layer_object_is_only_ever_applied_to_the_volume_it_names() {
     }
 }
 
-/// A landed object drops exactly the classification renders that were drawn
-/// without it — the per-volume sibling of the sounding invalidation above.
-///
-/// Without this, a pane that rendered on the fleet default a second before the
-/// object landed would keep that picture, uncorrected and captioned as a guess,
-/// until the volume rolled — which is four to six minutes of showing the wrong
-/// answer while the right one sits in the cache.
+/// A landed object drops exactly the classification renders that were drawn without it —
+/// the per-volume sibling of the sounding invalidation above.
 #[test]
 fn a_landed_melting_layer_drops_the_classification_renders_that_missed_it() {
     let volume = |minute: u32| {
@@ -976,8 +841,8 @@ fn a_landed_melting_layer_drops_the_classification_renders_that_missed_it() {
         "reflectivity classifies nothing and must not be redrawn",
     );
 
-    // A refetch of the same volume's object changes nothing and drops nothing:
-    // the answer for that volume is already on screen.
+    // A refetch of the same volume's object changes nothing and drops nothing: the answer
+    // for that volume is already on screen.
     d.pane_render[0].last_rendered = Some((RadarProduct::HydrometeorClassification, 0.5));
     assert!(
         !d.set_melting_layer("KTLX", object(volume(0)), &gui),
@@ -998,24 +863,8 @@ fn a_landed_melting_layer_drops_the_classification_renders_that_missed_it() {
     );
 }
 
-/// **A storm motion vector is never applied to a volume it does not name.**
-///
-/// [`a_melting_layer_object_is_only_ever_applied_to_the_volume_it_names`]'s
-/// sibling, and the defect it closes has the same shape with a sharper edge. A
-/// storm motion error is not a local one: the correction is
-/// `speed · cos(direction − azimuth)` at every gate, so the previous volume's
-/// vector is a solid-body shift of the entire field. The RPG re-fits the SCIT
-/// average every volume and adjacent volumes differed by up to 4.7 kt in the
-/// sample the derivation was validated against — which is several display
-/// levels across a couplet.
-///
-/// And, exactly as with the melting layer, the neighbouring volume's vector is
-/// the *worst* of the three states rather than a middling one: it is a real
-/// average of real tracked cells, so nothing about the shifted field looks
-/// wrong, and the render reports itself as `RpgScitAverage` — the RPG's own,
-/// for this volume — while being neither. So the cache holds the volume start
-/// beside the pair and the accessor compares before it hands anything out.
-/// "The latest vector" is not a fallback here and must never become one.
+/// [`a_melting_layer_object_is_only_ever_applied_to_the_volume_it_names`]'s sibling, and
+/// the defect it closes has the same shape with a sharper edge.
 #[test]
 fn a_storm_motion_vector_is_only_ever_applied_to_the_volume_it_names() {
     let volume = |minute: u32| {
@@ -1050,9 +899,7 @@ fn a_storm_motion_vector_is_only_ever_applied_to_the_volume_it_names() {
         "the vector for this very volume must reach the render",
     );
 
-    // The volume rolls. The cached vector is still perfectly good data — it is
-    // simply not this picture's — so it is withheld, and withheld for every
-    // neighbouring volume rather than only for distant ones.
+    // The volume rolls.
     for other in [volume(6), volume(12), volume(1)] {
         assert_eq!(
             d.rpg_storm_motion_for(srv, "KTLX", other),
@@ -1062,8 +909,8 @@ fn a_storm_motion_vector_is_only_ever_applied_to_the_volume_it_names() {
         );
     }
 
-    // Per site, on the same terms: KOUN's volume happens to start at the same
-    // instant and still gets nothing, because it has no vector of its own.
+    // Per site, on the same terms: KOUN's volume happens to start at the same instant and
+    // still gets nothing, because it has no vector of its own.
     assert_eq!(
         d.rpg_storm_motion_for(srv, "KOUN", volume(0)),
         None,
@@ -1083,8 +930,8 @@ fn a_storm_motion_vector_is_only_ever_applied_to_the_volume_it_names() {
         );
     }
 
-    // The replacement discipline, as the melting layer's: the same volume is
-    // not a change, the next one is, and the previous vector does not survive.
+    // The replacement discipline, as the melting layer's: the same volume is not a change,
+    // the next one is, and the previous vector does not survive.
     assert!(
         !d.set_storm_motion("KTLX", object(volume(0)), &gui),
         "a vector for the volume already in hand is not a change",
@@ -1098,26 +945,9 @@ fn a_storm_motion_vector_is_only_ever_applied_to_the_volume_it_names() {
     );
 }
 
-/// **A zero vector is carried, not dropped.**
-///
-/// This one has no melting-layer analogue, and it is the trap this path is
-/// most likely to fall into: `0.0 kt from 0.0°` looks exactly like an
-/// uninitialised pair, and every instinct in a codebase full of
-/// `Option`-shaped absences says to treat it as one.
-///
-/// It is a **reading**. The RPG's SCIT algorithm tracked no cells this volume
-/// — no storm met the cell-identification thresholds, which is the ordinary
-/// state of a quiet or purely stratiform scan — and the RPG then painted an
-/// unshifted storm-relative field. That is the vector the reference product
-/// was built with, so a path that dropped it would not "fall back safely": it
-/// would substitute a *derived* rung, shift every gate by a Bunkers prediction
-/// of a storm the RPG did not think was moving, and the pane would go on
-/// captioning the result as a prediction while the reference beside it is
-/// unshifted — a disagreement with the RPG manufactured out of a zero.
-///
-/// So `(0.0, 0.0)` travels the whole path: cached, volume-checked, handed to
-/// the render, and still refused for the volume it does not name. The identity
-/// this cache turns on is the *volume's*, never the vector's.
+/// This one has no melting-layer analogue, and it is the trap this path is most likely to
+/// fall into: `0.0 kt from 0.0°` looks exactly like an uninitialised pair, and every
+/// instinct in a codebase full of `Option`-shaped absences says to treat it as one.
 #[test]
 fn a_zero_storm_motion_vector_is_a_reading_and_is_carried_like_any_other() {
     let volume = |minute: u32| {
@@ -1155,16 +985,15 @@ fn a_zero_storm_motion_vector_is_a_reading_and_is_carried_like_any_other() {
          field by a derived rung the RPG never applied",
     );
 
-    // And the volume gate still holds over it. A zero is a reading *of one
-    // volume*: the next volume's storm may well be moving.
+    // And the volume gate still holds over it.
     assert_eq!(
         d.rpg_storm_motion_for(srv, "KTLX", volume(6)),
         None,
         "an unshifted volume's zero was handed to a volume that never claimed it",
     );
 
-    // Replacing a zero with a real vector is a change; the comparison is on
-    // the volume, so this cannot be reached by comparing the pairs.
+    // Replacing a zero with a real vector is a change; the comparison is on the volume, so
+    // this cannot be reached by comparing the pairs.
     assert!(d.set_storm_motion(
         "KTLX",
         StormMotionObject {
@@ -1181,19 +1010,8 @@ fn a_zero_storm_motion_vector_is_a_reading_and_is_carried_like_any_other() {
 
 // ── A loop frame is keyed by the archive, the cache by the first radial ────
 
-/// The two timestamps for one volume, built exactly as the two production
-/// routes build them: `(cached-side, loop-frame-side)`.
-///
-/// * The **cache** side is `latest_scan_time_for_site` → `ScanInfo::timestamp`
-///   → `types::ScanInfo::from_scan`, which reads the first radial of the first
-///   sweep through `DateTime::from_timestamp_millis` and keeps the
-///   milliseconds.
-/// * The **loop frame** side is `scan::list_scans_for_range`, which parses
-///   `%H%M%S` out of the S3 archive key and so has no sub-second field.
-///
-/// Neither is written as a literal: the defect *was* the difference between
-/// the two constructions, so a test that spelled both out by hand would be
-/// asserting against its own arithmetic instead of against the code's.
+/// The two timestamps for one volume, built exactly as the two production routes build
+/// them: `(cached-side, loop-frame-side)`.
 fn the_two_statements_of_one_volume(
     hms: &str,
     millis_into_the_second: i64,
@@ -1210,24 +1028,7 @@ fn the_two_statements_of_one_volume(
     (from_radial, from_key)
 }
 
-/// **The regression.** A classification loop frame reaches the `N0M` object
 /// cached for the very volume it draws.
-///
-/// The two sides are built by different code and were compared with `==`, so
-/// they never matched: the cache holds `ScanInfo::timestamp`, which keeps the
-/// first radial's milliseconds, and a loop frame carries the archive key's
-/// time, which is that instant truncated to the whole second. Measured over
-/// 108 archive volumes the key trails the first radial by 1–993 ms (median
-/// 517 ms) and is never equal — so **every** frame of every classification
-/// loop silently dropped to a lower melting-layer rung, including the newest
-/// frame, which is the one volume the app actually fetched an object for.
-///
-/// The same volume then classified one way as a still frame and another way
-/// inside a loop, with nothing on screen to say which had happened.
-///
-/// `scan::names_same_volume` carries the argument for why this cannot pair a
-/// neighbouring volume; `a_neighbouring_volume_never_pairs_however_its_start_was_stated`
-/// pins it, and the loop's own restatement is below.
 #[test]
 fn a_loop_frame_keyed_by_the_archive_reaches_this_volumes_melting_layer() {
     let hca = RadarProduct::HydrometeorClassification;
@@ -1264,13 +1065,8 @@ fn a_loop_frame_keyed_by_the_archive_reaches_this_volumes_melting_layer() {
     }
 }
 
-/// [`a_loop_frame_keyed_by_the_archive_reaches_this_volumes_melting_layer`]'s
-/// sibling, in SRV's terms: a loop frame reaches the `N0S` vector fetched for
-/// the volume it draws.
-///
-/// The failure this closes is the sharper of the two — a storm motion error is
-/// a solid-body shift of every gate in the field — and it fired on exactly the
-/// same frames, the newest one included.
+/// [`a_loop_frame_keyed_by_the_archive_reaches_this_volumes_melting_layer`]'s sibling, in
+/// SRV's terms: a loop frame reaches the `N0S` vector fetched for the volume it draws.
 #[test]
 fn a_loop_frame_keyed_by_the_archive_reaches_this_volumes_storm_motion() {
     let srv = RadarProduct::StormRelativeVelocity;
@@ -1304,15 +1100,8 @@ fn a_loop_frame_keyed_by_the_archive_reaches_this_volumes_storm_motion() {
     }
 }
 
-/// The widening stops at the volume boundary: a frame one scan cycle away gets
-/// nothing, whichever way either start was stated.
-///
-/// The shortest WSR-88D cadence measured anywhere in this tree is 198 s
-/// (`rustdar-device-profile/src/constants/tests.rs:264`), against the under-1 s
-/// spread the pairing admits — a margin of 198×. This is the frontend's
-/// restatement of that bound through the two accessors, so the guarantee the
-/// two tests above rely on is pinned where it is read and not only where it is
-/// defined.
+/// The widening stops at the volume boundary: a frame one scan cycle away gets nothing,
+/// whichever way either start was stated.
 #[test]
 fn a_frame_one_scan_cycle_away_reaches_neither_the_melting_layer_nor_the_motion() {
     let hca = RadarProduct::HydrometeorClassification;
@@ -1340,9 +1129,9 @@ fn a_frame_one_scan_cycle_away_reaches_neither_the_melting_layer_nor_the_motion(
         &gui,
     ));
 
-    // The shortest measured WSR-88D volume interval, then the nominal precip,
-    // TDWR and clear-air figures — and one second, the finest step the archive
-    // key can express, which is already a different volume.
+    // The shortest measured WSR-88D volume interval, then the nominal precip, TDWR and
+    // clear-air figures — and one second, the finest step the archive key can express,
+    // which is already a different volume.
     for gap in [1, 198, 259, 360, 517] {
         for neighbour in [
             from_radial + chrono::Duration::seconds(gap),

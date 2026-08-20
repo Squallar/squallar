@@ -11,9 +11,6 @@ use winit::window::{Window, WindowId};
 use crate::WindowRef;
 use crate::app_state;
 use crate::channels::ChannelHub;
-// Only the default window size is used here, and only by the native arm of
-// `create_window` — the web build takes its size from the canvas. A glob import
-// would go unused on wasm32 and warn.
 use crate::input::InputHandler;
 use crate::platform::{PlatformBridge, RedrawWaker};
 use crate::render_dispatch::RenderDispatcher;
@@ -39,19 +36,10 @@ mod chunks;
 #[path = "frame_pump.rs"]
 mod frame_pump;
 
-/// Whether this build is the browser build. See `rustdar_gpu::device`'s `WEB`, which is the
-/// same value for the same reason: a `cfg!` forks a function both of whose arms
-/// still compile, so a host `cargo test` can call either one.
+/// Whether this build is the browser build.
 const WEB: bool = cfg!(target_arch = "wasm32");
 
 /// Which wgpu backends this build will consider.
-///
-/// Native keeps reading `WGPU_BACKEND` from the environment. The browser has no
-/// environment to read, and the choice there is not open: this build targets
-/// WebGL2, so WebGPU has to be *excluded* rather than merely deprioritised.
-/// Left in, wgpu would select it wherever it exists — which is Chrome but not
-/// Firefox — and the two browsers would then run different, separately-broken
-/// rendering paths off the same binary.
 fn instance_descriptor() -> wgpu::InstanceDescriptor {
     backends_for(
         WEB,
@@ -60,23 +48,6 @@ fn instance_descriptor() -> wgpu::InstanceDescriptor {
 }
 
 /// The backend choice itself, parameterised so both arms run from one binary.
-///
-/// The `const _` below asserts the GL *feature* is compiled in. It does not
-/// assert that this function asks for it, and the difference is not academic:
-/// delete the `backends` line and that assertion still passes, the wasm
-/// `cargo check` still exits 0, and every browser silently reverts to
-/// `Backends::all()` — which is the Chrome-on-WebGPU / Firefox-on-WebGL2 split
-/// the doc above says this exists to prevent.
-/// `the_browser_build_asks_for_webgl2_and_refuses_webgpu` asserts the ask.
-///
-/// `base` is a parameter and not `new_without_display_handle_from_env()` read
-/// inline, for a reason measured rather than assumed: with the environment as
-/// the only possible base, "the browser arm restricts something" could only be
-/// asserted against whatever `WGPU_BACKEND` happened to say. A developer or CI
-/// runner with `WGPU_BACKEND=gl` exported could then delete the `backends` line
-/// and watch the gate stay green, because `Backends::GL` is what the default
-/// already was. Taking the base in lets the test supply one that is *not* GL,
-/// so the restriction is checked rather than coincided with.
 fn backends_for(web: bool, base: wgpu::InstanceDescriptor) -> wgpu::InstanceDescriptor {
     if web {
         wgpu::InstanceDescriptor {
@@ -88,19 +59,11 @@ fn backends_for(web: bool, base: wgpu::InstanceDescriptor) -> wgpu::InstanceDesc
     }
 }
 
-// The single-copy wgpu guard and the backend-features guard moved to
-// rustdar-gpu (WO-RV land 3) with the manifest's wgpu feature-chooser: this
-// crate no longer declares a direct `wgpu` dependency at all, so the bare
-// crate-rooted spelling cannot even resolve here — the manifest IS the guard
-// for this crate.
 
 /// Request a redraw if a window handle is available.
-/// Used by async tasks and event handlers that hold an `Option<WindowRef>`.
 pub(crate) fn notify_redraw(window: &Option<WindowRef>) {
     if let Some(w) = window {
         // Background threads may outlive the event loop on exit.
-        // request_redraw() panics on X11 when the loop is closed,
-        // so we catch and ignore that.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             w.request_redraw();
         }));
@@ -110,7 +73,7 @@ pub(crate) fn notify_redraw(window: &Option<WindowRef>) {
 /// What one press of Escape or the back button resolved to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackPress {
-    /// A layer closed. The app stays, and nothing else about it changes.
+    /// A layer closed.
     Dismissed,
     /// Nothing was open and the platform took the press — Android minimises.
     PlatformHandled,
@@ -118,361 +81,53 @@ enum BackPress {
     Exit,
 }
 
-/// # WO-RC — App destination census (Phase 3F opener, 2026-08-19, tree fd288166)
-///
-/// ## Recount
-///
-/// `struct App` has **49 fields**: 46 unconditional + 3 cfg-gated
-/// (`tokio_runtime` under `cfg(not(target_arch = "wasm32"))`, `pending_state`
-/// under `cfg(target_arch = "wasm32")`, `volume_extractions` under
-/// `cfg(test)`). The pre-reshape count at 8586e755 was ALSO 49, with a
-/// byte-identical field-NAME set: the 3R landings re-typed a third of the
-/// struct (spellings now come from rustdar-device-profile, rustdar-gpu,
-/// rustdar-volumetric, rustdar-location, rustdar-geo, and `egui_wgpu::wgpu`)
-/// but removed no field. This recount governs.
-///
-/// ## The three destinations (binding vocabulary, WO-RC)
-///
-/// * **root** — rustdar-app root wiring: App/pump/wake/channels/platform
-///   seam/render_dispatch/app_render/app_fetch residue. Stays here through
-///   WO-RA (the crate rename).
-/// * **radar** — fold-into-radar: chunk/live-feed/loop state. WO-RF1/WO-RF2
-///   move the backing MACHINERY into rustdar-radar; a field tagged `radar`
-///   stays on `App` as thin wiring, re-typed/re-pointed at the fold. RF1/RF2's
-///   file lists derive from these rows (listed under "RF1/RF2 file lists").
-/// * **later** — later-phase, named and never moved now: render orchestration
-///   regroups post-E5/E9e (in this crate's `render_dispatch` orbit — the
-///   reshape path map reads "RenderOrchestrator" as that module); the
-///   timeline engine forms post-E7 WITHIN rustdar-radar over the RF2-folded
-///   loop state (WO-RF2's M12 re-read; narrowed to the download machinery by
-///   seam ruling 5 — `loop_pool`, the app's texture-budget allocator, stays
-///   app-side and is TimelineEngine-adjacent), and so holds no App field
-///   today.
-///
-/// ## Field census (49 rows, declaration order)
-///
-/// | field | dest | note |
-/// |---|---|---|
-/// | `instance` | root | shell; wgpu spelled via `egui_wgpu::wgpu` since RV-l3 |
-/// | `state` | root | `AppState` struct stays app-side (RG ruling: fn-split only) |
-/// | `window` | root | shell |
-/// | `gui` | root | the Gui seam |
-/// | `supports_exit` | root | frame-input fact (E2); platform seam |
-/// | `loop_frame_budget` | root | frame-input fact; a READ from rustdar-device-profile (`budgets.loop_frames_held`) |
-/// | `location_settings_available` | root | frame-input fact; platform seam |
-/// | `safe_area_insets` | root | frame-input fact; platform seam |
-/// | `user_gps` | root | frame-input fact; `rustdar_location::Fix` since RL-1 |
-/// | `user_heading` | root | frame-input fact; platform seam |
-/// | `chunk_feed_status` | root | frame-input fact published to `Gui`; its PRODUCER folds at RF1 (d4) |
-/// | `current_volume_stamps` | root | frame-input fact |
-/// | `volume_painter` | later | render orchestration post-E5/E9e; rustdar-volumetric type since RV |
-/// | `mirror_rungs` | later | render orchestration post-E5/E9e; rustdar-gpu type since RG |
-/// | `budgets` | root | a READ from rustdar-device-profile since RD; its App-not-AppState survival comment is load-bearing and stays with this root field (de-fused from `loop_pool`'s at RF2n — d5, executed) |
-/// | `device_profile` | root | a READ from rustdar-device-profile since RD |
-/// | `loop_pool` | root | NARROWED at RF2n (seam ruling 5): moving `crate::loop_pool` radar-ward closes a Cargo normal-dep cycle with rustdar-device-profile, so it STAYS app-side; its survival comment now sits on its own field (d5, executed) |
-/// | `loop_pool_state` | root | with `loop_pool` (seam ruling 5) |
-/// | `loop_pool_sized` | root | a plain bool whose sole consumer is app-side `install_volume_bridge` (d3); rides `loop_pool`'s ruling |
-/// | `scan_data` | root | old VolumeInventory (E4.2) superseded; retention comment load-bearing, stays |
-/// | `base_scans` | root | old VolumeInventory superseded; completeness comment load-bearing, stays |
-/// | `input` | root | |
-/// | `channels` | root | `ChannelHub` — the pump drains it |
-/// | `render` | root | `RenderDispatcher`; the root list names render_dispatch, and E4.9/E4.10 land there |
-/// | `platform` | root | platform seam |
-/// | `texture_counter` | later | render orchestration post-E5/E9e |
-/// | `cached_dark_theme` | later | render orchestration post-E5/E9e (platform-seam flavored; THEME made is_dark a cache-token term) |
-/// | `exit_requested` | root | shell/wake |
-/// | `tokio_runtime` | root | cfg(not(wasm32)); executor seam |
-/// | `pending_state` | root | cfg(wasm32); shell |
-/// | `http_client` | root | app_fetch residue |
-/// | `loop_mgr` | radar | EXECUTED at RF2n: loop_downloads.rs folded into rustdar-radar; field re-typed to `rustdar_radar::loop_downloads::LoopDownloadManager` |
-/// | `chunk_feeds` | radar | EXECUTED at RF1: machinery in `rustdar_radar::chunk_feed`; field re-typed thin wiring |
-/// | `chunk_notify` | radar | EXECUTED at RF1: machinery in `rustdar_radar::chunk_notify`; field re-typed thin wiring |
-/// | `latest_cached_scans` | root | old VolumeInventory superseded |
-/// | `manual_nav_pending` | root | app_fetch residue; timeline-engine candidate post-E7 (named only) |
-/// | `last_viewport` | root | app_fetch residue |
-/// | `autosave` | root | old ConfigAutosave (E4.1) superseded; persists via `platform.kv()` since RK |
-/// | `egui_repaint_at` | root | wake |
-/// | `auto_poll_at` | root | wake |
-/// | `site_is_provisional` | root | site/source wiring |
-/// | `catalogue_pending` | root | site/source wiring |
-/// | `site_hint_pending` | root | site/source wiring |
-/// | `volume_store` | root | old VolumeInventory superseded; deliberately off AppState, survives surface loss |
-/// | `volume_extractions` | root | cfg(test) probe |
-/// | `redraw_waker` | root | wake |
-/// | `location` | root | platform seam; `LocationGate` re-homed to rustdar-location at RL-2 |
-/// | `site_positions` | root | site/source wiring |
-/// | `site_catalogue` | root | site/source wiring |
-///
-/// Tally: root 42, radar 3, later 4 (loop_pool/loop_pool_state/loop_pool_sized
-/// re-tallied root at RF2n, seam ruling 5). Fields that became READS from
-/// rustdar-device-profile: `budgets`, `device_profile`, `loop_frame_budget`
-/// (and `crate::loop_pool` reads `constants::VOLUME_GRID_CELLS` at module
-/// level).
-///
-/// ## Module census (every remaining module of this crate — rustdar-app
-/// since WO-RA renamed it from the old frontend name)
-///
-/// | module (LOC) | dest | note |
-/// |---|---|---|
-/// | lib.rs | root | crate root; keeps the `rustdar_radar::tls` re-export |
-/// | app.rs (3,707) + app/ suites | root | mounts app_fetch/app_render/app_chunks/frame_pump via `#[path]` |
-/// | app_state.rs | root | RG ruling: struct stays, fn-split only |
-/// | app_fetch.rs (2,748) + app_fetch/ (11 suites) | root | residue |
-/// | app_render.rs (5,191) + app_render/ (25 suites) | root | residue; later-phase orchestration is named, not moved |
-/// | app_chunks.rs + app_chunks/ (3 suites) | radar (halves, EXECUTED at RF1) | drains + `apply_chunk_outcome` stay root, two policy bodies folded — see RF1 list |
-/// | frame_pump.rs (264) + frame_pump/tests.rs | root | the pump |
-/// | budget_arms.rs | root | pub(crate) fixtures for the upward-bridging budget agreement tests |
-/// | budget_memo.rs | root | kv-persisted ladder position; its own doc plans a WRITTEN re-home to rustdar-device-profile (d7) |
-/// | channels.rs (733) | root | ChannelHub |
-/// | chunk_feed.rs + chunk_feed/ (4 suites) | radar | EXECUTED at RF1: moved whole (suites unedited) |
-/// | chunk_notify.rs (inline tests) | radar | EXECUTED at RF1: moved whole |
-/// | input.rs (272) | root | |
-/// | location_hint.rs | root | app-side residue post-RL-2 (site_for_timezone; anchors live in rustdar-location) |
-/// | loop_downloads.rs | radar | FOLDED at RF2n -> rustdar-radar/src/loop_downloads.rs (inline tests moved with it) |
-/// | loop_pool.rs (707) + loop_pool/tests.rs (1,067) | root | STAYS app-side (RF2 narrowed, seam ruling 5): its vocabulary is rustdar-device-profile's, and device-profile -> radar is a charter-fenced normal dep — the move would close a Cargo cycle |
-/// | platform.rs (910) | root | platform seam |
-/// | platform_double.rs (521) | root | test double |
-/// | render_dispatch.rs (2,409) + render_dispatch/ (6 suites) | root | later-phase orchestration operates here post-E5/E9e |
-/// | site_catalogue.rs (161) + tests | root | |
-/// | site_positions.rs (230) + tests | root | |
-/// | test_sites.rs (102), volume_fixture.rs (113) | root | cfg(test) support |
-/// | tests/arch_ratchets.rs | root | the standing ratchet suite |
-///
-/// No build.rs exists in this crate (WO-RD moved the mobile-cfg mechanism to
-/// rustdar-device-profile/build.rs — d6).
-///
-/// ## RF1/RF2 file lists (bound by this census)
-///
-/// **WO-RF1 (live-chunk fold) — EXECUTED 2026-08-19**: chunk_feed.rs +
-/// chunk_feed/{tests, due_tests, freshness_tests, status_tests} (App-free, 24
-/// tests) and chunk_notify.rs (15 inline tests) moved whole into rustdar-radar,
-/// assertions unedited. Of app_chunks.rs's three census-named policy bodies,
-/// TWO folded: `cut_selection_for`'s body + policy history ->
-/// `rustdar_radar::chunk_feed::cut_selection_for` (App keeps a thin delegate
-/// of the same name); `record_tilt_freshness`'s body ->
-/// `ChunkFeedManager::record_tilt_freshness` (App method deleted, call sites
-/// re-pointed). **`apply_chunk_outcome` STAYED root** — executor deviation
-/// from the census's fold list, surfaced at the land: it writes three
-/// census-ROOT stores (`scan_data`/`base_scans`/`latest_cached_scans`),
-/// drives the `Gui`, resets the `RenderDispatcher`, spawns Level III fetches
-/// and calls the stays-root drain `any_pane_live_for_site`; folding it needs
-/// the post-campaign RadarSource seam the M-H reconciliation defers, or a
-/// non-verbatim redesign. The drains (`drive_chunk_feeds`,
-/// `poll_chunk_results`, `drive_chunk_notifications`, `check_archive_for`,
-/// `fetch_notified_chunk`, `fall_back_to_archive`, `any_pane_live_for_site`,
-/// `chunks_are_feeding`) stay root as bound; app_chunks/ suites all stay
-/// (tests.rs is a source probe over app.rs; the other two drive
-/// App+TestBridge). Forced seam adaptations, each cycle-driven:
-/// `ChunkFeedStatus`/`TiltFreshness` definitions moved rustdar-egui -> radar
-/// chunk_feed (radar cannot dep egui); RF1's temporary egui re-exports at the
-/// old published paths were KILLED at WO-RA — one name, one path:
-/// `rustdar_radar::chunk_feed::{ChunkFeedStatus, TiltFreshness}`;
-/// `retain_live` returns the evicted `SiteFeed`s and the app drain
-/// hands them to `offload::discard_each` (radar cannot dep rustdar-worker;
-/// same shape as RF2's parameterization precedent); radar feature
-/// `test-support` compiles the three cross-crate test hooks
-/// (`force_retire_at`/`force_serving`/`backdate_handshake`) for the
-/// frontend's new dev-dependency edge. The ewebsock dep moved to radar's
-/// manifest exactly as it was — a PLAIN dep; the census's "target-gated as
-/// today" overstated it (it was never target-gated). d9 EXECUTED as ruled:
-/// app/chunk_feed_precedence_tests.rs stayed root and passes through the
-/// re-typed wiring unedited.
-///
-/// **WO-RF2 (loop fold) — EXECUTED NARROWED as RF2n (seam ruling 5, 2026-08-19)**:
-/// loop_downloads.rs 1,683 (tests inline at `mod tests`) folded into
-/// rustdar-radar; loop_pool.rs 707 + loop_pool/tests.rs 1,067 STAY app-side —
-/// the original fold was STOPPED on a proven Cargo normal-dep cycle
-/// (loop_pool's public API and body are woven through rustdar-device-profile's
-/// vocabulary, and device-profile -> radar is a charter-fenced normal dep), so
-/// the `resident_grid_bytes` parameterization never executed (moot: no move);
-/// field re-typed: `loop_mgr` only; the ten E7 loop-pin suites live app-side
-/// (app_render/loop_*, app_fetch/loop_*, pane_kind_render_filter) and took
-/// mechanical re-points ONLY; RF2n also de-fused the loop_pool survival
-/// comment (d5, executed).
-///
-/// **Stale old-crate-name prose in radar/overlays/source/geo** (doc mentions
-/// spelling items through the pre-rename crate root): the census counted 55
-/// occurrences / 24 files (radar 36/15, overlays 16/6,
-/// source 2/2, geo 1/1) — 45 naming the worker-moved offload/wire_identity
-/// family, 5 volumetric-moved modules, 3 device-profile-moved constants, 1
-/// chunk_feed (REPAIRED at RF1), 1 render_dispatch (overlays
-/// handlers/model.rs). SWEPT at WO-RA: every mention workspace-wide now
-/// spells the named item's true home (rustdar_worker / rustdar_volumetric /
-/// rustdar_device_profile / rustdar_gpu / rustdar_app).
-///
-/// ## Discrepancies vs the plan's expectations
-///
-/// * d1 — the order expected the splits to have "removed several" fields:
-///   they removed NONE (49 -> 49, identical name set); the extractions moved
-///   modules and types below the app, and every App field was already wiring.
-/// * d2 — the old E4.0 seven-subsystem table (HISTORICAL input) maps onto the
-///   three destinations as: LiveFeeds -> radar (RF1); TimelineEngine's loop
-///   state -> radar (RF2 moves the machinery; the post-E7 engine then forms
-///   WITHIN radar, so `later`/timeline holds zero App fields today);
-///   RenderOrchestrator -> `later` for its four loose fields, EXCEPT `render`
-///   itself which is root (the order's root list names render_dispatch);
-///   ConfigAutosave, VolumeInventory, SourceOrchestrator, Shell -> root
-///   (superseded as extractions; their fields are root wiring).
-/// * d3 — `loop_pool_sized` rides the radar tag as loop state though it is a
-///   plain bool with an app-side-only consumer; RF2 moves no code for it.
-/// * d4 — `chunk_feed_status` is feed-derived but stays root: it is an E2
-///   frame-input fact published to `Gui`; only its producer folds.
-/// * d5 — `loop_pool`'s App-not-AppState survival comment sat FUSED atop
-///   `budgets`' doc block while `loop_pool` itself was bare — pre-existing
-///   verbatim at 8586e755, not reshape drift. Both survival comments answer
-///   for ROOT-field placement and stay in this file; EXECUTED at RF2n: the
-///   first paragraph pair moved onto `loop_pool`, `budgets` keeps its own.
-/// * d6 — WO-RA's "the mobile cfg build.rs carries over" is stale: this crate
-///   has NO build.rs (WO-RD moved the mechanism down); RA carries nothing.
-/// * d7 — budget_memo.rs's planned re-home (rustdar-device-profile, per its
-///   own module doc) is a destination OUTSIDE this census's three; it is
-///   root until that written kv-lane step.
-/// * d8 — the stale-mention count is 55/24, not ~45: RW's figure counted only
-///   the worker family; RD/RV accreted 8 more and 2 are not stale yet.
-/// * d9 — RF1's trap "chunk suites (incl. chunk_feed_precedence_tests) move
-///   with the code" cannot apply verbatim to that one suite (App-mounted,
-///   app-double-coupled — see the RF1 list); the chunk_feed/chunk_notify
-///   module suites move unedited as the trap intends. EXECUTED at RF1 as the
-///   orchestrator ruled: the precedence suite stayed root, unedited.
 pub struct App {
     instance: wgpu::Instance,
     state: Option<app_state::AppState>,
     window: Option<WindowRef>,
     gui: Gui,
-    // ── Frame-input facts (WO-E2) ───────────────────────────────────
-    //
-    // The snapshot-shaped state the `Gui` renders from but the App owns.
-    // Each field is written where the fact arrives; all of them reach the
-    // `Gui` together, once per frame, through `push_frame_inputs` — the one
-    // compose site, immediately before `Gui::ui`.
     /// Whether this platform can quit, answered once at startup —
     /// `PlatformBridge::supports_exit` is a property of the build.
     supports_exit: bool,
-    /// This build's loop frame cap (`budgets.loop_frames_held`), so the
-    /// timeline's caption states the platform's real budget — the budget
-    /// lives in this crate and the UI crate cannot see it.
+    /// This build's loop frame cap (`budgets.loop_frames_held`), so the timeline's caption
+    /// states the platform's real budget — the budget lives in this crate and the UI crate
+    /// cannot see it.
     loop_frame_budget: usize,
-    /// Whether this platform has a location settings page to offer, answered
-    /// once at startup: the permission changes, the platform does not.
+    /// Whether this platform has a location settings page to offer, answered once at
+    /// startup: the permission changes, the platform does not.
     location_settings_available: bool,
     /// Safe-area insets in logical pixels, from the last successful
-    /// [`PlatformBridge::query_insets`] — see `refresh_safe_area_insets` for
-    /// when that is allowed to be asked.
+    /// [`PlatformBridge::query_insets`] — see `refresh_safe_area_insets` for when that is
+    /// allowed to be asked.
     safe_area_insets: (f32, f32, f32, f32),
-    /// The user's GPS fix and when this app heard it. The instant is stamped
-    /// once, at arrival, and travels with the fix from then on — `Gui`'s
-    /// `user_fix_at` answers "when did we last hear anything", and a per-frame
-    /// re-stamp would hold that staleness question at zero forever. `None`
-    /// when consent went away or nothing has been delivered.
+    /// The user's GPS fix and when this app heard it.
     user_gps: Option<(rustdar_location::Fix, web_time::Instant)>,
     /// Compass heading in degrees, once a platform has delivered one.
     user_heading: Option<f32>,
-    /// What the real-time chunk feed is doing, restated by `drive_chunk_feeds`
-    /// every frame so the status bar never shows a stale claim.
+    /// What the real-time chunk feed is doing, restated by `drive_chunk_feeds` every frame
+    /// so the status bar never shows a stale claim.
     chunk_feed_status: rustdar_radar::chunk_feed::ChunkFeedStatus,
-    /// Each site's current-volume stamp, rebuilt by `publish_base_volumes`
-    /// every frame. The decoded `Scan`s stay here; the UI holds only names.
+    /// Each site's current-volume stamp, rebuilt by `publish_base_volumes` every frame.
     current_volume_stamps: HashMap<String, rustdar_egui::CurrentVolumeStamp>,
-    /// The same painter [`Gui`] was handed, kept so the frame path can take its
-    /// floor-magnification demand.
-    ///
-    /// `Gui` holds it as an `Arc<dyn VolumePainter>` and the demand is not on
-    /// that trait — deliberately, because it is a *renderer* concern that the
-    /// headless UI crate has no business knowing about. A second `Arc` to the
-    /// concrete painter is the cheapest way to keep the seam narrow: one
-    /// pointer, no downcast, and nothing added to the trait every test double
-    /// would then have to implement.
-    ///
-    /// `None` until the renderer is built, and replaced wholesale whenever it
-    /// is rebuilt, so it can never point at a painter `Gui` is no longer using.
+    /// The same painter [`Gui`] was handed, kept so the frame path can take its floor-
+    /// magnification demand.
     volume_painter: Option<Arc<rustdar_volumetric::bridge::BridgeVolumePainter>>,
-    /// The rung the pane mirror is drawn at, and the hysteresis that governs
-    /// when it may move. One per application, because the mirror is one texture
-    /// for the whole application. See `egui_renderer::mirror`.
+    /// The rung the pane mirror is drawn at, and the hysteresis that governs when it may
+    /// move.
     mirror_rungs: rustdar_gpu::egui_renderer::MirrorRungs,
     /// Every per-target number this build spends, resolved once from a
     /// [`rustdar_device_profile::budget::DeviceProfile`] and threaded from here.
-    ///
-    /// On `App` rather than on `AppState` for the reason
-    /// [`Self::loop_pool`] is: a lost surface sets `self.state = None`, and a
-    /// budget set destroyed by that event would have to be re-resolved on a
-    /// path that also handles a device the app has just been refused by.
-    ///
-    /// It starts as `DeviceProfile::for_target()`'s — every runtime field at
-    /// its most conservative reading, which is exactly what the `cfg` constants
-    /// said — and is re-resolved once, in [`Self::install_volume_bridge`], from
-    /// the adapter that has just appeared. See [`Self::device_profile`].
     budgets: rustdar_device_profile::budget::Budgets,
-    /// Everything known about the machine, and the only input [`Self::budgets`]
-    /// has.
-    ///
-    /// Held rather than dropped after the resolve, because the budgets have to
-    /// be re-resolvable: a back-off is a change to one field of this
-    /// (`BudgetMemo::steps_back`) followed by the same pure function over the
-    /// same profile, which is what keeps *one* statement of how a machine's
-    /// budgets are decided rather than one for the first resolve and another
-    /// for every subsequent one.
+    /// Everything known about the machine, and the only input [`Self::budgets`] has.
     device_profile: rustdar_device_profile::budget::DeviceProfile,
-    /// The application's whole loop allowance, and the hysteresis that governs
-    /// how it is divided. One per application, because the pool is one
-    /// allowance for the whole application. See `crate::loop_pool`.
-    ///
-    /// On `App` rather than on `AppState`, and that is load-bearing for exactly
-    /// the reason `rustdar_volumetric::degrade`'s counters are module statics: a lost
-    /// surface sets `self.state = None`, and a pool that backed off *because* of
-    /// a lost surface would be destroyed by the event it just learned from.
+    /// The application's whole loop allowance, and the hysteresis that governs how it is
+    /// divided.
     loop_pool: crate::loop_pool::LoopPool,
     /// See [`Self::loop_pool`].
     loop_pool_state: crate::loop_pool::LoopPoolState,
     /// Whether [`Self::loop_pool`] is already the answer for this machine.
-    ///
-    /// True when a previous session remembered one, and set again the first
-    /// time an adapter is classified. Without it, `install_volume_bridge` —
-    /// which runs on resume and on recovery from a lost surface as well as at
-    /// first start — would re-raise a pool that had just backed off *because*
-    /// the surface was lost, and the app would oscillate between the two sizes
-    /// for as long as the device kept refusing.
     loop_pool_sized: bool,
     /// The decoded Level II volume each pane's static render draws from, by site.
-    ///
-    /// # Retention
-    ///
-    /// One entry is a whole decoded volume — tens of megabytes — so this is held
-    /// to the sites that are on screen: [`evict_unshown_scans`] runs once a frame
-    /// and drops every site no pane names. Nothing else ever removes an entry, so
-    /// without that pass a session's every visited radar stayed resident for the
-    /// life of the process, which on a handheld is an OOM rather than a leak.
-    ///
-    /// A site counts as named by a pane's live `site` *or* by the site of the
-    /// `scan_info` it is currently drawing, and both are needed: a switch moves
-    /// `pane.site` at once, while `dispatch_pane_renders` goes on looking the
-    /// volume up under `scan_info.site.name` until the new one lands. Evicting on
-    /// the live site alone pulls the scan out from under a pane still rendering
-    /// from it.
-    ///
-    /// Loop frames are not in here. They have their own cache and their own
-    /// bound — `LoopDownloadManager`, swept by
-    /// [`evict_unneeded_loop_scans`](Self::evict_unneeded_loop_scans) against
-    /// the frames the live loops name, which `MAX_LOOP_FRAMES` caps.
-    ///
-    /// # Why the table rides beside the volume
-    ///
-    /// `(volume, what its cuts declared)`, for the reason
-    /// [`base_scans`](Self::base_scans) holds the same pair:
-    /// `nexrad_model::data::Radial` has no field for the Nyquist velocity its
-    /// Message 31 stated, so a `Scan` alone cannot answer where a cut's
-    /// velocity folds ([`rustdar_radar::nyquist`]).
-    ///
-    /// This is the store the **plan view** renders from, and it is a velocity
-    /// consumer: NROT and SRV dealias, and the limit they fold around is the
-    /// one the cut declared. `base_scans` already carried the table for the
-    /// section and the 3D resample, so a table here is what stops one pane
-    /// unfolding a sweep around the RDA's own number while the pane beside it
-    /// unfolds the same sweep around whatever its calmest sector estimated —
-    /// a disagreement with no error, no warning and no visible symptom beyond
-    /// two pictures of one cut.
-    ///
-    /// [`evict_unshown_scans`]: Self::evict_unshown_scans
     scan_data: std::collections::HashMap<
         String,
         (
@@ -480,52 +135,10 @@ pub struct App {
             Arc<rustdar_radar::nyquist::DeclaredNyquist>,
         ),
     >,
-    /// The most recent **complete** volume for each site, with the time its
-    /// first radial was collected — the base of the current merged volume
-    /// ([`rustdar_radar::current::resolve`]) that sections, the 3D view and
-    /// every other whole-volume reader stand on.
-    ///
-    /// # Why this is separate from `scan_data`
-    ///
-    /// `scan_data` holds whichever volume the plan view is drawing, and
-    /// mid-volume that is the live snapshot: sealed sweeps only, one rung tall
-    /// after every roll. The property this map holds is **completeness** — a
-    /// volume that carries every cut its flight sealed, so a ladder built over
-    /// it reaches the top of what was flown. Two writers satisfy it:
-    ///
-    /// * the archive path, whose volumes are published only once every cut is
-    ///   finished — all three of its branches write here, because the two that
-    ///   decline to *display* a volume still received a real, complete one;
-    /// * `app_chunks`' completed branch, exactly when the closed volume is
-    ///   `whole_volume_complete` — the live feed's own statement of the same
-    ///   property, and what keeps the base rolling forward without another
-    ///   archive download for as long as the feed runs.
-    ///
-    /// This used to be `archive_scans`, archive-written only, and the one
-    /// thing a 3D pane could build from — a rule made when completeness seemed
-    /// to require the archive's provenance. It does not: a closed chunk volume
-    /// that sealed every cut is the same volume the archive will publish
-    /// minutes later, and holding the 3D view to the slower copy held it a
-    /// full volume behind the pane beside it. What the rule protected against
-    /// — building from a *partial* volume — is still protected, by the
-    /// `whole_volume_complete` gate on the live writer.
-    ///
-    /// This follows *arrival*, not maximum timestamp, and that is deliberate:
-    /// scrubbing the plan view back through archive time carries the
-    /// whole-volume panes with it. While a site is viewed live its feed's
-    /// closed volumes land here too; while it is viewed historic they divert
-    /// to `latest_cached_scans`, so a scrubbed base stays scrubbed.
-    ///
-    /// Bounded by the same `evict_unshown_scans` pass as `scan_data`, and
-    /// often sharing an allocation with it: at a volume boundary both maps
-    /// hold the same `Arc` until the next sweep seals.
-    /// `(volume, what its cuts declared, when its first radial was collected)`.
-    ///
-    /// The declared Nyquist table rides here rather than inside the `Scan`
-    /// because `nexrad_model::data::Radial` has no field for it — see
-    /// [`rustdar_radar::nyquist`]. It is what the section and 3D payloads are
-    /// stamped with, and without it the worker would guard the velocity fold
-    /// seam on an estimate while this thread had the archive's own number.
+    /// The most recent **complete** volume for each site, with the time its first radial
+    /// was collected — the base of the current merged volume
+    /// ([`rustdar_radar::current::resolve`]) that sections, the 3D view and every other
+    /// whole-volume reader stand on.
     base_scans: HashMap<
         String,
         (
@@ -538,43 +151,22 @@ pub struct App {
     channels: ChannelHub,
     render: RenderDispatcher,
     platform: Box<dyn PlatformBridge>,
-    // Counter to generate unique texture names
     texture_counter: u32,
-    // Cache the detected theme to avoid calling detection every frame
     cached_dark_theme: Option<bool>,
-    // Flag for deferred exit when event_loop isn't available during redraw
     exit_requested: bool,
-    // Shared Tokio runtime for all async network requests
-    /// Native only. The browser supplies its own executor, so the web build
-    /// spawns via `wasm_bindgen_futures` instead — see `App::spawn_detached`.
+    /// Native only.
     #[cfg(not(target_arch = "wasm32"))]
     tokio_runtime: tokio::runtime::Runtime,
-    /// Web only. Set while the async adapter/device request is in flight.
-    ///
-    /// Native resolves that request inside `ensure_rendering_state` and never
-    /// needs to remember anything across frames; the browser forbids blocking,
-    /// so the renderer arrives on a later frame and something has to hold the
-    /// receiver until it does.
+    /// Web only.
     #[cfg(target_arch = "wasm32")]
     pending_state: Option<std::sync::mpsc::Receiver<app_state::AppState>>,
-    // Shared HTTP client for overlay data fetches (SPC, etc.)
     http_client: reqwest::Client,
-    // Grouped loop download state: scan cache, in-flight tracking, and pending queues.
     loop_mgr: LoopDownloadManager,
-    /// Per-site real-time chunk feeds. Empty until a live site starts one.
-    /// The machinery lives in [`rustdar_radar::chunk_feed`] since WO-RF1; this
-    /// field is the wiring that owns it.
+    /// Per-site real-time chunk feeds.
     chunk_feeds: rustdar_radar::chunk_feed::ChunkFeedManager,
-    /// Push notification of new chunks. Purely an early wake-up for the feeds
-    /// above; see [`rustdar_radar::chunk_notify`] (moved there at WO-RF1).
+    /// Push notification of new chunks.
     chunk_notify: rustdar_radar::chunk_notify::ChunkNotifier,
-    // Cached latest scan per site from auto-poll while panes on that site view historic data.
-    /// `(volume, what its cuts declared, its product inventory, when it was
-    /// collected)`. The declared table travels because `handle_jump_to_live`
-    /// moves this entry straight into [`scan_data`](Self::scan_data), and a
-    /// volume that arrived here with its declarations and left without them
-    /// would put a jumped-to pane's velocity products back on estimated fold
-    /// limits — for exactly the volumes a user pressed Live to see.
+    /// `(volume, what its cuts declared, its product inventory, when it was collected)`.
     latest_cached_scans: HashMap<
         String,
         (
@@ -584,217 +176,55 @@ pub struct App {
             chrono::NaiveDateTime,
         ),
     >,
-    // Set when a manual time navigation fetch is pending; triggers loop reinit after scan loads.
     manual_nav_pending: bool,
     /// The map extent most recently asked for on screen.
-    ///
-    /// Fed to `FetchConfig::viewport` so overlays that fetch per-region data
-    /// can scope their requests. `None` until the first frame that draws an
-    /// overlay; `metar::networks::DEFAULT_VIEWPORT` covers that window.
     last_viewport: Option<rustdar_geo::GeoBounds>,
     autosave: AutosaveState,
-    /// When egui next wants a frame, from a timed repaint request
-    /// (`request_repaint_after` — a cursor blink, a tooltip delay). `None`
-    /// while nothing is scheduled. Written by [`App::handle_redraw`] from the
-    /// frame's own `repaint_delay` ([`repaint_action`]), spent in
-    /// [`App::about_to_wait`], which also folds the remaining wait into the
-    /// loop's control flow so a parked loop actually wakes for it. Zero-delay
-    /// requests — animations — never land here: they ask for the redraw on
-    /// the spot.
+    /// When egui next wants a frame, from a timed repaint request (`request_repaint_after`
+    /// — a cursor blink, a tooltip delay).
     egui_repaint_at: Option<web_time::Instant>,
-    /// When an auto-poll timer next needs a frame, or `None` while none of
-    /// them do.
-    ///
-    /// The same arrangement as [`Self::egui_repaint_at`] and for the same
-    /// reason: written by [`App::handle_redraw`] from
-    /// [`auto_poll_delay`](Self::auto_poll_delay) — which folds the radar
-    /// poll, the overlay refreshes, the status bar's countdown and the chunk
-    /// feed's next round — then folded into the loop's control flow so it
-    /// actually wakes for it, and spent in [`App::about_to_wait`] as a redraw
-    /// request. Every one of those is checked inside the egui pass, so unlike
-    /// the autosave none of it can be serviced off a bare iteration.
-    ///
-    /// This field is the whole fix. The end-of-frame re-arm used to include
-    /// `gui.is_auto_poll_active()`, which goes true on frame one of the
-    /// default configuration and never goes false again — so the app asked for
-    /// a redraw at the end of every frame, forever, at whatever rate the
-    /// display could deliver, to service a poll that fires once a minute.
+    /// When an auto-poll timer next needs a frame, or `None` while none of them do.
     auto_poll_at: Option<web_time::Instant>,
     /// Whether the current site was guessed from the timezone rather than chosen.
-    ///
-    /// A guessed site is the one thing a location fix is allowed to overwrite.
-    /// It is cleared the moment the guess is replaced — by a fix or by the user —
-    /// so a site the user has actually settled on is never moved out from under
-    /// them, however far they later travel.
     site_is_provisional: bool,
-    /// Whether the live table has never had a network catalogue in it, and is
-    /// still waiting for the fetch that would put one there.
-    ///
-    /// True whenever the cached catalogue was empty at startup — which is a
-    /// question about *this install's knowledge of the network*, not about
-    /// whether the user is new. It is what lets [`App::poll_site_catalogue`]
-    /// apply that first catalogue **in this session** rather than on the next
-    /// launch.
-    ///
-    /// # Why it is not "this is a fresh install"
-    ///
-    /// It used to be `!restored && table.rows().is_empty()`, and both halves
-    /// were wrong for the same population. A returning user has a stored
-    /// config, so `restored` is true; and if they have ever opened a radar, the
-    /// position learned from that volume places one row, so the table is not
-    /// empty. Neither conjunct holds, the catalogue was filed for next launch,
-    /// and the session ran with the two radars its learned positions could
-    /// place while 203 sat in the cache. Measured in headless Chromium: `site
-    /// catalogue cached: 203 radars` with no in-session apply, and the full
-    /// list one reload later.
-    ///
-    /// Since every browser session that has ever run this app is exactly that
-    /// state after an upgrade from a build with no catalogue, "is the install
-    /// new" was never the question. "Can the table answer yet" is.
-    ///
-    /// # Applying it mid-session still cannot move anything
-    ///
-    /// That is what the next-launch rule protects, and it survives: the rows
-    /// present before the first catalogue lands are the ones learned positions
-    /// placed, and [`rustdar_radar::sites::SiteFix::Learned`] outranks
-    /// `Network`, so `extended` never applies a fetched position to a row a
-    /// learned one claims. The first catalogue can therefore only *add* rows —
-    /// there is no marker it can move and no height datum it can change.
-    ///
-    /// Once this is spent it is never set again, so every later catalogue takes
-    /// the ordinary next-launch path.
+    /// Whether the live table has never had a network catalogue in it, and is still waiting
+    /// for the fetch that would put one there.
     catalogue_pending: bool,
-    /// Whether this launch had no site of its own to open on, and is still
-    /// waiting for a catalogue to run the timezone hint against.
-    ///
-    /// The other half of what [`App::catalogue_pending`] used to be, kept
-    /// separate because it answers a different question: not "can the table
-    /// answer yet" but "did the user bring a site with them". A returning user
-    /// has one and must never be moved off it; a first-run user has none, and
-    /// at startup there was nothing for the hint to resolve against.
-    ///
-    /// Fusing the two is what let a returning user's saved site suppress the
-    /// catalogue, and — the mirror image, on Android, where `App::new` runs
-    /// before there is a store to read — would have let a catalogue landing
-    /// mid-session move a returning user off the site they had chosen.
+    /// Whether this launch had no site of its own to open on, and is still waiting for a
+    /// catalogue to run the timezone hint against.
     site_hint_pending: bool,
-    /// The voxel grids 3D panes are holding, refcounted by the volume they were
-    /// built from.
-    ///
-    /// Deliberately **not** in `AppState`: a surface loss destroys that struct,
-    /// and rebuilding an 8 MiB grid that took 100 ms to resample — from a scan
-    /// that is still in hand and has not changed — is work with nothing to show
-    /// for it. What does die with the device is the *upload*, which lives in
-    /// egui's callback resources instead.
-    ///
-    /// `Arc` because the painter handed to the `Gui` reads it during the UI
-    /// pass, while this side writes it from the action handler.
+    /// The voxel grids 3D panes are holding, refcounted by the volume they were built from.
     volume_store: std::sync::Arc<rustdar_volumetric::bridge::VolumeStore>,
-    /// How many times [`extract_current_volume`] has run — the call-count
-    /// seam for the tests that pin *when* the frame thread pays for the
-    /// merged-volume walk, the same property the section path carries in its
-    /// extraction closure.
-    ///
-    /// [`extract_current_volume`]: App::extract_current_volume
     #[cfg(test)]
     pub(crate) volume_extractions: std::cell::Cell<u32>,
     /// How a thread that is not this one asks for a frame.
-    ///
-    /// Filled in [`create_window`](Self::create_window) and emptied in
-    /// [`suspended`](App::suspended), so it tracks [`window`](Self::window)
-    /// exactly — see [`RedrawWaker`] for why a slot rather than a snapshot, and
-    /// why the emptying is the load-bearing half.
     redraw_waker: RedrawWaker,
-    /// Everything between "where am I" and the operating system, as one value
-    /// (WO-RL-4): the permission gate composed with this platform's provider
-    /// arm. The only thing in this application that can raise a location
-    /// permission prompt. See [`rustdar_location::LocationFacade`].
     location: LocationFacade,
     /// Where earlier volumes said their radars are.
-    ///
-    /// Loaded once, in [`App::new`], because a learned position may only be
-    /// applied before a pane's first paint; written the moment a volume
-    /// teaches something new, in
-    /// [`scan_info_learning_position`](Self::scan_info_learning_position).
-    /// See [`crate::site_positions`].
     site_positions: crate::site_positions::SitePositions,
-    /// The network catalogue this install last cached: which radars exist, and
-    /// where the published record puts them.
-    ///
-    /// Loaded once, in [`App::new`], and — like the positions above — only ever
-    /// *applied* there, before the first frame. Kept on the app afterwards for
-    /// one purpose: when the detached refresh lands,
-    /// [`poll_site_catalogue`](Self::poll_site_catalogue) compares it against
-    /// this to decide whether the ~15 KB blob is worth rewriting. The live
-    /// table is deliberately **not** re-resolved from it. See
-    /// [`crate::site_catalogue`].
+    /// The network catalogue this install last cached: which radars exist, and where the
+    /// published record puts them.
     site_catalogue: rustdar_radar::catalogue::SiteCatalogue,
 }
 
 /// Bookkeeping for the periodic config write.
-///
-/// # Why this exists
-///
-/// Configuration used to be written from exactly two places: [`request_exit`]
-/// and [`suspended`]. Both are real save points on a desktop or a phone, and
-/// neither one happens in a browser. Closing a tab, navigating away, or having
-/// the tab discarded under memory pressure runs no Rust at all — so the web
-/// build persisted nothing unless the user went out of their way to pick Exit
-/// from the menu, and a session's site, layout and viewport died with the tab.
-///
-/// A `beforeunload` handler would be the obvious browser-shaped fix, and it is
-/// the wrong one: it is not delivered for a discarded tab or a killed process,
-/// it needs a path from a JS callback back into `App`'s state, and it is a
-/// mechanism only one of the three platforms has. Writing periodically instead
-/// costs one serialization every few seconds and is correct under every way a
-/// session can end, including the ones that run no shutdown code — a killed
-/// process, an OOM, a crash. The existing exit and suspend saves stay: they make
-/// the *last* few seconds durable on the platforms that do get notice.
-///
-/// [`request_exit`]: App::request_exit
-/// [`suspended`]: App::suspended
 struct AutosaveState {
     /// When the config was last examined for changes.
     last_check: Option<web_time::Instant>,
-    /// The JSON most recently written, so an unchanged config costs a
-    /// serialization and a string compare rather than a storage write.
-    ///
-    /// Comparing serialized output is what lets this work without a dirty flag
-    /// threaded through every mutation in the UI. A flag would be cheaper and
-    /// would be wrong the first time someone adds a setting and forgets to set
-    /// it; this cannot drift out of sync with what is actually persisted.
+    /// The JSON most recently written, so an unchanged config costs a serialization and a
+    /// string compare rather than a storage write.
     last_written: Option<String>,
     /// Whether any event has arrived that could have changed the config.
-    ///
-    /// Deliberately coarse — it is set by *any* window event, most of which
-    /// change nothing. Its only job is to distinguish "this session has seen
-    /// activity" from "this tab has been sitting untouched", so that
-    /// [`schedule_wakeup`] does not keep an idle app awake. A false
-    /// positive costs one serialization; the string compare then finds nothing
-    /// to write.
-    ///
-    /// [`schedule_wakeup`]: App::schedule_wakeup
     touched: bool,
 }
 
 /// How often the config is examined for changes.
-///
-/// The cost of a check is one `serde_json` serialization of a small struct. The
-/// cost of setting this too high is losing that many seconds of work when a tab
-/// is closed. Three seconds keeps a pan-and-zoom durable at human timescales
-/// while staying far below the rate at which anything here is edited.
 const AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The shortest sleep [`App::auto_poll_delay`] will ask for.
-///
-/// Only ever reached by a timer that has saturated to zero, which means the
-/// frame that just ran did not consume the poll it was due. One second is the
-/// rate the status bar's countdown already ticks at, so a retry on this floor
-/// costs at most what an app with its status bar up already spends.
 const MIN_WAKE: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// What a frame's egui repaint request means for the loop. See
-/// [`repaint_action`].
+/// What a frame's egui repaint request means for the loop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RepaintAction {
     /// Ask for the next frame immediately — an animation is mid-flight.
@@ -805,28 +235,12 @@ pub(crate) enum RepaintAction {
     Idle,
 }
 
-/// The ceiling past which a "timed" repaint request is read as "never":
-/// egui reports `Duration::MAX` when nothing asked, and anything on the
-/// scale of a minute or more is indistinguishable from idle for a loop
-/// every real input wakes anyway.
+/// The ceiling past which a "timed" repaint request is read as "never": egui reports
+/// `Duration::MAX` when nothing asked, and anything on the scale of a minute or more is
+/// indistinguishable from idle for a loop every real input wakes anyway.
 const MAX_SCHEDULED_REPAINT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Classify a frame's `repaint_delay` (see `PreparedFrame::repaint_delay`).
-///
-/// The root cause of the second user test's "panel close shudders, then
-/// vanishes": the app runs on `ControlFlow::Wait` and *nothing read this
-/// value*, so `egui::Context::animate_bool_with_time` — which requests a
-/// zero-delay repaint on every frame it interpolates — animated only on the
-/// frames the user's own input events produced. A click's press, release
-/// and stray move made ~3 frames; the slide then froze mid-travel until the
-/// next input repainted whatever end state it had reached.
-///
-/// Zero means "now": `handle_redraw` requests the redraw on the spot, so an
-/// animation renders at the display's own cadence until egui stops asking.
-/// A finite delay schedules a wake instead — requesting an immediate frame
-/// for a 500 ms cursor blink would busy-loop the app at frame rate, since
-/// the blink re-requests itself on every paint. `Duration::MAX` (and
-/// anything past [`MAX_SCHEDULED_REPAINT`]) is idle.
 pub(crate) fn repaint_action(delay: std::time::Duration) -> RepaintAction {
     if delay == std::time::Duration::ZERO {
         RepaintAction::Now
@@ -838,51 +252,19 @@ pub(crate) fn repaint_action(delay: std::time::Duration) -> RepaintAction {
 }
 
 /// What one pass of [`App::prepare_volume`] did.
-///
-/// Three answers rather than a `bool`, for the reason
-/// `render_dispatch::SectionDispatch` has three: "the store now holds an answer
-/// for this target" and "nothing was spent because the budget was full" are
-/// different instructions to the caller. A loop dispatcher that treated a
-/// `Busy` as served would mark a frame in flight that nothing is building, and
-/// the frame would stay blank for the life of the loop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VolumePrepare {
-    /// The store holds an entry for this target — built, building or refused —
-    /// with the caller attached to it.
+    /// The store holds an entry for this target — built, building or refused — with the
+    /// caller attached to it.
     Served,
-    /// The data this target names has not arrived. Nothing was spent and
-    /// nothing recorded; ask again.
+    /// The data this target names has not arrived.
     Waiting,
-    /// The concurrent render budget is full. Nothing was spent; ask again.
+    /// The concurrent render budget is full.
     Busy,
 }
 
-/// What to resample for `target`, over the region it names or the default box
-/// about the site.
-///
-/// Split out of `handle_prepare_volume` so the one decision in it that can be
-/// silently wrong is testable without an `App`, a GPU or a decoded volume: which
-/// ground gets sampled. Both failure modes are quiet — a region ignored resamples
-/// the default box and looks like a region that was never committed, and a region
-/// applied to the wrong axis resamples real ground the user did not pick — and
-/// neither shows up as an error anywhere.
-///
-/// `site_lat`/`site_lon` are still needed when a region is present:
-/// `build_voxels` reports its `x`/`y` ranges relative to the **site** whatever
-/// the box is centred on.
-///
-/// `cells` is the **resolved** cell budget — `Budgets::grid_cells`, which is
-/// this device's rung of its bracket rather than the `cfg` constant its
-/// bracket floors at. That distinction is the whole of what a desktop browser
-/// gains here: `constants::VOLUME_GRID_CELLS` is one number for every machine
-/// that compiled the same binary, and a browser on an RTX 3090 and a browser on
-/// a phone compile the same binary.
-///
-/// `max_axis` is the device's `max_texture_dimension_3d`, which decides how that
-/// budget is spent over the three axes — see
-/// [`rustdar_device_profile::constants::volume_grid_shape_of`]. Both arrive as arguments rather
-/// than being read in here, for the reason everything else does: this function
-/// is pure, and its tests want to name a device rather than have one.
+/// What to resample for `target`, over the region it names or the default box about the
+/// site.
 fn voxel_request_for(
     target: &rustdar_egui::pane::VolumeTarget,
     site_lat: f64,
@@ -890,12 +272,6 @@ fn voxel_request_for(
     cells: [u32; 3],
     max_axis: u32,
 ) -> rustdar_radar::voxel::VoxelRequest {
-    // The picked region, or the site with no width at all — `None` is what
-    // asks `build_voxels` for the box the volume's own reach earns
-    // (`voxel::box_half_width_km`). Passing a width here instead would mean
-    // deriving it from a volume this function does not have, and the one it
-    // could reach for is the *pane's* volume rather than the one about to be
-    // resampled.
     let (centre, half_extent_km) = match target.region {
         Some(region) => (
             (region.centre().lat, region.centre().lon),
@@ -906,36 +282,15 @@ fn voxel_request_for(
     rustdar_radar::voxel::VoxelRequest {
         centre,
         half_extent_km,
-        // The vertical extent is a separate axis from the horizontal region and
-        // is deliberately not part of the pick: this decides what is sampled over
-        // the ground, while the pane's exaggeration knob changes only how the
-        // result is drawn. Conflating them would make a region drag silently
-        // re-cut the column as well.
         base_km_msl: rustdar_radar::voxel::DEFAULT_BASE_KM_MSL,
         top_km_msl: rustdar_radar::voxel::DEFAULT_TOP_KM_MSL,
         product: target.product,
-        // The resolved budget, not `voxel::default_shape()` and not
-        // `constants::volume_grid_shape`: the first takes a single `is_wasm`
-        // bool and cannot return `MOBILE_SHAPE`, because `mobile` is emitted by
-        // *this* crate's `build.rs` — asking it here is what made an Android
-        // build budget 192³ and request 256³ — and the second is the `cfg`
-        // constant, which is one answer for every machine that compiled this
-        // binary.
         shape: rustdar_device_profile::constants::volume_grid_shape_of(cells, max_axis),
-        // The raymarch reads indices only. The value plane is four times larger
-        // and exists for a hover readout, which a 3D pane does not have yet.
         values_wanted: false,
     }
 }
 
 /// Point a fresh `Gui` at the radar nearest this device's timezone.
-///
-/// Returns whether a site was actually chosen. `false` means the platform had no
-/// timezone or the timezone is not one we map, and the compiled-in default
-/// stands — see [`crate::location_hint`].
-///
-/// Called only when nothing was restored from storage. That is the whole
-/// precedence rule: a stored site is the user's, and this never touches it.
 fn apply_location_hint(gui: &mut Gui, platform: &dyn PlatformBridge) -> bool {
     let Some(zone) = platform.iana_timezone() else {
         log::debug!("no timezone available; keeping the default site");
@@ -950,27 +305,7 @@ fn apply_location_hint(gui: &mut Gui, platform: &dyn PlatformBridge) -> bool {
     true
 }
 
-/// Take out of `map` every value whose key `doomed` names, and hand them back
-/// **owned**.
-///
-/// This is `retain`'s inverse and exists because `retain` gives the caller no
-/// chance to say where the dropped values die: it frees them in place, on
-/// whatever thread called it, which for [`App::evict_unshown_scans`] is the
-/// frame. Returning them is what lets the caller pass them to
-/// `offload::discard_each` instead.
-///
-/// `extract_if` rather than collecting the keys and removing them one by one:
-/// it is one pass over the map, it hands back the values already moved out, and
-/// the predicate sees the same `(&K, &mut V)` a `retain` predicate would — so
-/// converting a call site is a change of destination and not of rule.
-///
-/// The *other* holder of whole volumes makes the same move one crate down:
-/// [`rustdar_radar::chunk_feed::ChunkFeedManager::retain_live`] (moved there
-/// at WO-RF1) extracts a departing site's assembler — the second full copy of
-/// a live volume — and hands it back owned, and the drain in `app_chunks` is
-/// what passes those to `discard_each`. Radar keeps its own three-line copy of
-/// this move: a `pub(crate)` helper does not cross a crate boundary, so "one
-/// helper for both callers" ends where the crate does.
+/// Take out of `map` every value whose key `doomed` names, and hand them back **owned**.
 pub(crate) fn evicted<V>(
     map: &mut HashMap<String, V>,
     doomed: &impl Fn(&String) -> bool,
@@ -982,15 +317,6 @@ pub(crate) fn evicted<V>(
 
 impl App {
     /// Build the application around a caller-supplied platform bridge.
-    ///
-    /// The bridge is injected rather than constructed here so that this type
-    /// stays free of any per-OS code: the concrete [`PlatformBridge`] impls
-    /// live alongside their entry points, and only the entry point knows which
-    /// one to build. Without that inversion the app layer and the platform
-    /// layer would have to depend on each other. The location facade arrives
-    /// the same way and for the same reason (WO-RL-4): its provider arm is
-    /// per-OS, feature-fenced inside rustdar-location, and only the entry
-    /// point knows which arm to construct.
     pub fn new(platform: Box<dyn PlatformBridge>, location: LocationFacade) -> Self {
         Self::with_instance(
             egui_wgpu::wgpu::Instance::new(instance_descriptor()),
@@ -1000,14 +326,6 @@ impl App {
     }
 
     /// Everything [`new`](Self::new) does once the wgpu instance exists.
-    ///
-    /// Split off so a test can supply an instance with no backends selected.
-    /// `Instance::new(instance_descriptor())` opens the Vulkan and GL loaders
-    /// and enumerates adapters — measured at ~72 ms per call on this machine,
-    /// against ~1 µs for an empty one — and nothing an `App` does without a
-    /// window ever asks it for a surface. The split is here rather than at the
-    /// field so that everything else `new` wires up, `set_supports_exit` and
-    /// the initial config load included, is on the tested side of it.
     fn with_instance(
         instance: wgpu::Instance,
         platform: Box<dyn PlatformBridge>,
@@ -1015,21 +333,7 @@ impl App {
     ) -> Self {
         let input = InputHandler::new();
         let channels = ChannelHub::new();
-        // Owns the single shared render-budget counter used by both the loop and
-        // static pane render paths (see `RenderDispatcher::renders_in_flight`).
-        // Resolved here and threaded from this point on. Every field is this
-        // build's own bracket floor, which is the `cfg` constant it replaces —
-        // see `rustdar_device_profile::budget`, where the reproduction is asserted field for
-        // field rather than claimed. There is no adapter yet, so there is
-        // nothing to promote on; `install_volume_bridge` re-resolves the moment
-        // there is.
         let mut device_profile = rustdar_device_profile::budget::DeviceProfile::for_target();
-        // Before the first frame, for the reason the site table is resolved
-        // before it: what a session learned by *failing* has to be in force
-        // from the first paint, or a user who had backed off would watch the
-        // application come up at a quality it has already been unable to serve
-        // and then fall out of it. The pool half of the memo is filled in
-        // below, once the bracket it is held inside exists.
         device_profile.memo = Some(rustdar_device_profile::budget::BudgetMemo {
             loop_pool_bytes: None,
             steps_back: crate::budget_memo::remembered_steps(platform.kv().as_deref()).unwrap_or(0),
@@ -1041,8 +345,8 @@ impl App {
         let tokio_runtime = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
         // Goes through `rustdar_radar::tls` rather than `reqwest::Client::builder`
-        // directly: that is what installs the rustls crypto provider (no provider
-        // is compiled in) and sets `https_only`. See `rustdar_radar::tls`.
+        // directly: that is what installs the rustls crypto provider (no provider is
+        // compiled in) and sets `https_only`.
         let http_client = rustdar_radar::tls::client(
             rustdar_radar::tls::USER_AGENT,
             std::time::Duration::from_secs(30),
@@ -1051,72 +355,19 @@ impl App {
         .expect("Failed to build HTTP client");
 
         let mut gui = Gui::new();
-        // The three startup-constant frame-input facts, captured here so they
-        // are in force from the first compose (`push_frame_inputs` at the end
-        // of this constructor). Once, and not at any poll's cadence: each is a
-        // property of the build, not of anything that changes while it runs.
         let supports_exit = platform.supports_exit();
         let loop_frame_budget = budgets.loop_frames_held;
         let location_settings_available = location.settings_available();
         let restored = platform
             .kv()
             .is_some_and(|store| gui.load_ui_config(store.as_ref()));
-        // Android has no config dir yet at this point and loads later in
-        // `set_config_dir`, so `restored` is false there even for a returning
-        // user. That is handled where the real load happens, not here.
         let site_is_provisional = !restored && apply_location_hint(&mut gui, platform.as_ref());
-        // Here rather than lazily on the first volume, because a position may
-        // only be applied *before* a pane's first paint. Reading it at
-        // construction means `ScanInfo::from_scan` already has it by the time
-        // the first volume decodes, so a corrected site is drawn corrected
-        // from the first frame rather than shifting under the user later.
-        // Reloaded in `set_config_dir` for Android, which has no store yet.
         let site_positions = crate::site_positions::SitePositions::load(platform.kv().as_deref());
-        // And the network catalogue this install last fetched, which is where
-        // *every* radar comes from on an install that has not opened one yet.
-        // Read from the cache and never from the network on this path: a fetch
-        // cannot finish before the first frame, and one that landed mid-session
-        // would move a marker under the user. The refresh is spawned below and
-        // is applied on the *next* launch — with one exception, below. See
-        // `crate::site_catalogue`.
         let site_catalogue = crate::site_catalogue::load(platform.kv().as_deref());
-        // The same reasoning one level down: the *table* is resolved here too,
-        // not on first use. A radar only becomes nameable and drawable once
-        // this runs, so if it ran after the first frame the map would gain a
-        // marker, the site list a row, and a section its height datum, under a
-        // user already looking at them. Resolving beside the load — before any
-        // frame exists — is what keeps reopening exactly 1:1.
-        //
-        // Both sources in one stream. `SiteFix` carries which is which, so the
-        // order they are chained in decides nothing: a learned position
-        // outranks a fetched one wherever both exist, and `sites::extended`
-        // settles that before it builds a row.
         let table =
             rustdar_radar::sites::resolve(site_positions.fixes().chain(site_catalogue.fixes()));
-        // The exception, and the one state the deleted seed used to make
-        // impossible: nothing outside this binary has yet said which radars
-        // exist. Whatever the table holds came from volumes this install
-        // decoded — at most a handful of rows — so the site list is not a list
-        // of the network and must not be presented as one until the fetch
-        // lands.
-        //
-        // Asked of the *catalogue* and not of the table, because the table
-        // conflates two sources: a returning user's learned positions place a
-        // row or two, which made `table.rows().is_empty()` false while the
-        // network was still entirely unknown. Recorded here rather than
-        // re-derived later because by the time the catalogue lands the
-        // catalogue is no longer empty to ask.
         let catalogue_pending = site_catalogue.is_empty();
-        // And separately: whether this launch has a site of its own to open on.
-        // A returning user does, and a catalogue landing mid-session must not
-        // move them off it; a first run does not, and at startup there was
-        // nothing for the hint to resolve against.
         let site_hint_pending = !restored && table.rows().is_empty();
-        // So the picker can say the list is short of the network — the
-        // `catalogue_pending` App field reaches it through the frame-input
-        // compose below. It cannot work this out for itself: two rows learned
-        // off two volumes look exactly like a two-radar network from the
-        // table alone.
         if catalogue_pending {
             log::info!(
                 "no radars are known yet; the site list holds only what this \
@@ -1124,12 +375,6 @@ impl App {
             );
         }
 
-        // Before the first frame and before any adapter exists, for the reason
-        // the site table is resolved here: what a session remembers has to be
-        // in force from the first paint, or the loop length would change under
-        // a user already watching one. The adapter's own say is folded in later
-        // by `LoopPool::for_device`, which runs once the renderer is built and
-        // only when nothing was remembered.
         let loop_pool_limits = crate::loop_pool::LoopPoolLimits::from_budgets(&budgets);
         let loop_pool_memo =
             crate::loop_pool::remembered(platform.kv().as_deref(), loop_pool_limits);
@@ -1137,11 +382,6 @@ impl App {
             loop_pool_memo.unwrap_or(loop_pool_limits.floor),
             loop_pool_limits,
         );
-        // The other half of what this machine learned. `resolve` does not read
-        // it — the pool leaves the resolver as a *pair* and is settled by
-        // `LoopPool::for_promotion` and `LoopPool::back_off` — but the profile
-        // is the one statement of what is known about this device, and a memo
-        // half of which lived somewhere else would be a second one.
         if let Some(memo) = device_profile.memo.as_mut() {
             memo.loop_pool_bytes = loop_pool_memo;
         }
@@ -1178,9 +418,6 @@ impl App {
             texture_counter: 0,
             cached_dark_theme: None,
             exit_requested: false,
-            // `last_written` starts empty rather than seeded from the config
-            // just loaded. The two differ whenever this build added a field, and
-            // that first corrective write is exactly what should happen.
             autosave: AutosaveState {
                 last_check: None,
                 last_written: None,
@@ -1206,52 +443,25 @@ impl App {
             manual_nav_pending: false,
             last_viewport: None,
             redraw_waker: RedrawWaker::new(),
-            // The gate inside is inert until the first `poll_platform_state`,
-            // which is inside the first frame — deliberately after
-            // `set_config_dir`, so it finds the memo Android only learns the
-            // path to during `android_main`.
+            // The gate inside is inert until the first `poll_platform_state`, which is
+            // inside the first frame — deliberately after `set_config_dir`, so it finds the
+            // memo Android only learns the path to during `android_main`.
             location,
             site_positions,
             site_catalogue,
         };
 
-        // Detached, and deliberately after the table is already resolved: this
-        // refreshes the *cache*, for the next launch. Nothing it produces
-        // reaches the table this session, so a slow endpoint, a captive portal
-        // or no network at all is invisible here — the app is already running
-        // on the cache plus the seed by the time this is spawned.
         app.spawn_site_catalogue_refresh();
 
-        // Here, and not later, because "later" does not exist for two of the
-        // producers: Android starts its theme poller from `set_theme_detector`,
-        // which `android_main` calls before `run_app`, and the facade's serial
-        // arm needs the wake already in hand when a menu toggle reaches
-        // `start_serial`. Both are before any window, which is the situation
-        // `RedrawWaker`'s slot exists for.
         app.platform.set_redraw_waker(app.redraw_waker.clone());
-        // The facade's arm gets the same wake at the same moment, for the same
-        // reasons — and this is also what brings the OS location provider up
-        // (prompting nobody; the two-phase contract in
-        // rustdar_location::os_location).
         let location_wake = app.redraw_waker.clone();
         app.location
             .set_wake(std::sync::Arc::new(move || location_wake.wake()));
-        // The first compose, so the startup-constant facts — supports_exit,
-        // the loop frame budget, the settings-page offer, catalogue_pending —
-        // are in the `Gui` from the first read, exactly as the setter pushes
-        // above used to leave them. Every later frame re-composes in
-        // `setup_egui_frame`, immediately before `Gui::ui`.
         app.push_frame_inputs();
         app
     }
 
     /// A handle an entry point can give its own sensor threads.
-    ///
-    /// The bridge gets one directly (see [`PlatformBridge::set_redraw_waker`]).
-    /// This is for the producers that are not the bridge's: `android_main`'s
-    /// location and compass threads, and the browser's `watchPosition` watch —
-    /// all three of which are started by an entry point that owns the `App` but
-    /// has no window either.
     pub fn redraw_waker(&self) -> RedrawWaker {
         self.redraw_waker.clone()
     }
@@ -1272,21 +482,8 @@ impl App {
     }
 
     fn handle_resized(&mut self, width: u32, height: u32) {
-        // A rotation moves the cutout and the navigation bar to other edges,
-        // and it reaches the app as a resize — not as a resume. Queried once in
-        // `resumed` and never again, the insets would describe the orientation
-        // the app happened to start in for the rest of the session, and the map
-        // would keep an exclusion band down the wrong side of the screen.
-        //
-        // A resize is also the only signal available that a *layout* has
-        // happened, which is what `getRootWindowInsets` needs before it has
-        // anything but the previous frame's numbers to return; see
-        // `rustdar_native::android::insets::get_system_insets`.
-        //
-        // Only on a real size. Android cannot distinguish a failed read from a
-        // genuine zero -- `get_system_insets` collapses every JNI failure,
-        // including a null `getRootWindowInsets()` before the first layout, to
-        // all-zero -- so querying at 0x0 replaces good insets with bad ones.
+        // A rotation moves the cutout and the navigation bar to other edges, and it reaches
+        // the app as a resize — not as a resume.
         if width > 0 && height > 0 {
             self.refresh_safe_area_insets();
         }
@@ -1300,29 +497,6 @@ impl App {
     }
 
     /// Ask the platform what the system bars are covering and hand it to the UI.
-    ///
-    /// A bridge with nothing to say answers `None` and the last value stands
-    /// rather than being zeroed: desktop has no system bars, and on iOS
-    /// egui-winit fills `RawInput::safe_area_insets` itself, so writing zeros
-    /// here would be this code overriding the platform's own answer with a
-    /// worse one.
-    ///
-    /// Android is the only platform that answers `Some`, and it answers
-    /// all-zero for a failed read as readily as for a real one, so callers
-    /// must not ask unless a layout has actually happened.
-    ///
-    /// # Known gap: insets can change without a resize
-    ///
-    /// Switching between gesture and 3-button navigation, and the system bars
-    /// showing or hiding under `Theme.DeviceDefault.NoActionBar.Fullscreen`,
-    /// move the insets without changing the window size. Android reports both
-    /// as `MainEvent::InsetsChanged` and winit discards it outright —
-    /// `winit-0.30.13/src/platform_impl/android/mod.rs:294` logs
-    /// `"TODO: handle Android InsetsChanged notification"` and forwards no
-    /// event — so this function's two call sites, `resumed` and
-    /// `handle_resized`, are the only signal the app has, and stale insets
-    /// stand until the next resize. Re-check that line when winit is bumped; an
-    /// `InsetsChanged` forwarded upstream is the fix.
     fn refresh_safe_area_insets(&mut self) {
         if let Some((top, bottom, left, right)) = self.platform.query_insets() {
             self.safe_area_insets = (top, bottom, left, right);
@@ -1334,24 +508,14 @@ impl App {
         self.poll_platform_state();
         self.poll_data_channels();
         self.evict_unshown_scans();
-        // The frame's teardown allowance, right behind the eviction pass that
-        // feeds it: free what this frame can afford of whatever
-        // `offload::discard` deferred. The budget is what keeps a multi-volume
-        // teardown from spending the frame — see
-        // `DEFERRED_DROP_BUDGET_PER_FRAME` — and the wake-up term below is
-        // what keeps the rest of the queue from waiting on the user. Natively
-        // this is usually an empty-queue check: `discard` hands the pool's free
-        // lane the payload, and only a lane with no worker lands here.
         rustdar_worker::offload::drain_deferred_drops(
             rustdar_device_profile::constants::DEFERRED_DROP_BUDGET_PER_FRAME,
         );
-        // Ahead of the minimized and zero-area early returns below: a window
-        // that is minimized or still sizing is exactly one whose session might
-        // be about to end, and skipping the save there is how the last change
-        // gets lost.
+        // Ahead of the minimized and zero-area early returns below: a window that is
+        // minimized or still sizing is exactly one whose session might be about to end, and
+        // skipping the save there is how the last change gets lost.
         self.autosave_config(false);
 
-        // Skip rendering when minimized
         if let Some(window) = self.window.as_ref()
             && let Some(min) = window.is_minimized()
             && min
@@ -1360,20 +524,6 @@ impl App {
             return;
         }
 
-        // Skip rendering a window with no area.
-        //
-        // On web this is the *normal* state of the first frame or two, not an
-        // edge case: winit's web backend serves `inner_size()` from a cell that
-        // starts at zero and is written only when the ResizeObserver it installs
-        // on the canvas first fires, which is after the initial redraw.
-        //
-        // Rendering anyway does not fail cleanly. The surface gets configured at
-        // one pixel, egui lays the UI out inside a degenerate rect, and the map
-        // code then unprojects that rect into latitudes far outside the world —
-        // `draw_label_tiles_overlay` turns those into a tile index of `u32::MAX`
-        // and panics on the `+ 1`. On wasm a panic is unrecoverable, so the app
-        // dies on frame one and the resize that would have fixed everything
-        // never arrives.
         if let Some(window) = self.window.as_ref() {
             let size = window.inner_size();
             if size.width == 0 || size.height == 0 {
@@ -1395,61 +545,20 @@ impl App {
         let repaint_delay = self.present_frame(screen_descriptor);
         self.process_gui_actions(gui_actions);
 
-        // Request redraw only while there is pending background work.
-        //
-        // Every term here is something that finishes: a render, a loop frame, a
-        // chunk round, a socket that comes back up. Auto-poll used to be one of
-        // them and is not, because it never finishes — see
-        // [`Self::auto_poll_at`], which schedules its wake instead.
         if self.render.any_render_in_flight()
             || self.gui.any_loop_active()
-            // A pane holding the previous picture while the next one's bands
-            // cross. It finishes — see `Gui::any_raster_held` — and until it
-            // does the loop owes the frames those bands move on *and* the frame
-            // that swaps. `end_pass_and_upload`'s zero `repaint_delay` covers
-            // only the first: on the frame the last band lands nothing is
-            // pending any more, so without this term a raster would finish
-            // uploading and then sit unswapped behind the previous sweep until
-            // some unrelated input woke the loop.
             || self.gui.any_raster_held()
             || self.chunk_feeds.any_in_flight()
-            // A down socket reconnects from `sync_sites`, which only runs on a
-            // frame. Without this term the retry would depend on something else
-            // happening to keep the loop awake, so turning auto-poll off with the
-            // notifier unreachable would strand it permanently.
-            //
-            // The *handshake* only. The backoff half of this used to be here
-            // too, and it does not finish: the notifier's retry doubles to a
-            // five-minute ceiling and never gives up, so anyone who cannot
-            // reach the service at all held the loop at refresh rate for the
-            // whole session. It is scheduled instead, through
-            // `ChunkNotifier::next_retry_delay`.
             || self.chunk_notify.handshake_pending()
-            // Memory this application has already decided it does not want,
-            // waiting for a frame to free it. It finishes — the drain takes at
-            // least one payload per call — and until it does, nothing else here
-            // is necessarily true: an eviction is exactly the moment when no
-            // render is in flight and no loop is running, so without this term
-            // a teardown would stop after one frame and the remainder would
-            // stay resident until the user next touched the app. See
-            // `offload::drain_deferred_drops`, where the invariant is written.
             || rustdar_worker::offload::has_deferred_drops()
         {
             notify_redraw(&self.window);
         }
 
-        // What auto-poll owes a frame for, as of the frame just drawn.
-        // Recomputed every frame rather than accumulated, so a change that
-        // ends the obligation — the last live pane going historic, the status
-        // bar collapsing — takes the wake down with it.
         self.auto_poll_at = self
             .auto_poll_delay()
             .map(|delay| web_time::Instant::now() + delay);
 
-        // egui's own repaint request — the animation fix (see
-        // `repaint_action`): an immediate ask repaints now, a timed one
-        // schedules a wake `about_to_wait` spends, and idle clears any
-        // stale schedule so a parked loop stays parked.
         match repaint_action(repaint_delay) {
             RepaintAction::Now => {
                 self.egui_repaint_at = None;
@@ -1465,21 +574,6 @@ impl App {
     }
 
     /// Take a theme reading, and say whether it changed anything.
-    ///
-    /// Every source goes through here: Android's poll thread, winit's
-    /// `ThemeChanged`, and the per-frame read of `window.theme()` that the
-    /// desktops answer — see [`resolve_theme`](Self::resolve_theme). One
-    /// funnel because the cache is not a memo: `cached_dark_theme` is what
-    /// overlay rasterization reads (`RasterizeContext::is_dark`, and the
-    /// `is_dark` handed to `rasterize_radar_sites`), and those run off-frame
-    /// with no window to ask. A source that writes the theme somewhere else,
-    /// or not at all, leaves them rasterizing light under a dark UI.
-    ///
-    /// Only a *change* invalidates. The site labels are raster textures baked
-    /// in the theme's colours, so they are stale the moment it flips — but
-    /// Android's poller re-sends its reading every two seconds whether or not
-    /// it moved (see `spawn_state_poller`), so an unguarded bump would
-    /// re-rasterise every label on every pane twice a second, forever.
     fn adopt_theme(&mut self, dark: bool) -> bool {
         if self.cached_dark_theme == Some(dark) {
             return false;
@@ -1490,16 +584,6 @@ impl App {
     }
 
     /// What this frame draws in, adopted into the cache on the way past.
-    ///
-    /// winit answers `window.theme()` on Windows and macOS and that answer is
-    /// authoritative, so it is taken first — and *recorded*, which is the half
-    /// that used to be missing. Desktop's [`PlatformBridge::poll_theme`] is
-    /// hardwired `None`, so on those platforms nothing else ever writes the
-    /// cache and everything reading it off-frame saw `None` forever.
-    ///
-    /// The bridge is asked only where winit has no answer — X11 and Android —
-    /// and only once: the read is a JNI call there, and the poll thread keeps
-    /// the cache current from then on.
     fn resolve_theme(&mut self) -> bool {
         let dark = match self.window.as_ref().and_then(|w| w.theme()) {
             Some(theme) => matches!(theme, winit::window::Theme::Dark),
@@ -1512,31 +596,23 @@ impl App {
         dark
     }
 
-    /// Poll for platform-specific theme, location, GPS fix, and compass heading
-    /// changes.
+    /// Poll for platform-specific theme, location, GPS fix, and compass heading changes.
     fn poll_platform_state(&mut self) {
         if let Some(new_theme) = self.platform.poll_theme()
             && self.adopt_theme(new_theme)
         {
             notify_redraw(&self.window);
         }
-        // Ahead of the fix poll, and that ordering is the point: this is what
-        // starts delivery in the first place, so on the frame after a grant
-        // lands the fix it produces is drained in the same pass rather than the
-        // next one.
+        // Ahead of the fix poll, and that ordering is the point: this is what starts
+        // delivery in the first place, so on the frame after a grant lands the fix it
+        // produces is drained in the same pass rather than the next one.
         let platform = &self.platform;
         let step = self
             .location
             .step(&|| platform.kv(), self.gui.settings_visible());
         if step.changed {
-            // The location facts themselves are composed from the gate every
-            // frame (`push_frame_inputs`); what a *change* still owes is the
-            // frame that will carry it to the screen.
             notify_redraw(&self.window);
         }
-        // Consent for the position on screen has gone away. The serial reader
-        // is deliberately exempt: a dongle the user plugged in is not covered
-        // by this permission and its dot must survive a location denial.
         if step.revoked && !self.location.serial_active() {
             self.user_gps = None;
         }
@@ -1551,38 +627,6 @@ impl App {
     }
 
     /// Lazily initialize wgpu rendering state on first redraw after window creation.
-    ///
-    /// # This blocks the frame thread on purpose, and it was measured
-    ///
-    /// It is the one place in the application that does, so it gets raised
-    /// every time somebody audits the frame thread. It costs **135 ms median**
-    /// on an RTX 3090 over Vulkan (`request_device` 99 ms of it,
-    /// `request_adapter` 11 ms, surface configure 17 ms, `EguiRenderer::new`
-    /// 6 ms), which is about half of the 262 ms from `exec` to first pixel.
-    ///
-    /// Two things say to leave it blocking, both of them readings rather than
-    /// arguments:
-    ///
-    /// 1. **Nothing yields.** Driven by hand with a no-op waker, the future
-    ///    this awaits reaches `Ready` on **poll one**, every run: native wgpu's
-    ///    `request_adapter` and `request_device` are synchronous behind an
-    ///    async facade. So the browser's shape below — hold a receiver, collect
-    ///    on a later frame — buys native nothing at all. A per-frame state
-    ///    machine would sit in exactly this call for exactly this long, inside
-    ///    one poll. Only a real OS thread moves it, which is what was tried.
-    /// 2. **The thread made it worse.** Ported onto the arm below with
-    ///    `std::thread::spawn` in place of `spawn_local`, `exec` to first pixel
-    ///    went **262 ms -> 315 ms (+20%)** over five runs each, with no
-    ///    overlap between the two samples. `request_adapter` alone went
-    ///    **11.4 ms -> 51.8 ms**: asked from off the main thread, matching a
-    ///    Wayland surface against each adapter has to reach the compositor
-    ///    through the connection the event loop owns.
-    ///
-    /// And there is no frame to protect. Nothing can be drawn until the device
-    /// exists, so this time is not taken from a frame — it *is* the wait before
-    /// the first one, and moving it only delays the first pixel. The browser
-    /// arm is not the same case: there `block_on` would spin forever, and the
-    /// future really does yield.
     #[cfg(not(target_arch = "wasm32"))]
     fn ensure_rendering_state(&mut self) {
         if self.state.is_none() && self.window.is_some() {
@@ -1608,16 +652,8 @@ impl App {
     }
 
     /// See the native variant above.
-    ///
-    /// The browser cannot block on a future. `pollster::block_on` here would
-    /// spin forever rather than deadlock loudly: the executor that resolves an
-    /// adapter request *is* the event loop being blocked, so the future it is
-    /// waiting on can never be polled. The request is therefore spawned and its
-    /// result collected on a later frame, which is the whole reason this arm is
-    /// a state machine and the native one is a straight line.
     #[cfg(target_arch = "wasm32")]
     fn ensure_rendering_state(&mut self) {
-        // A request already in flight: collect it if it has landed.
         if let Some(rx) = self.pending_state.as_ref() {
             match rx.try_recv() {
                 Ok(state) => {
@@ -1629,11 +665,7 @@ impl App {
                     self.restore_cached_render(&ctx);
                     self.install_volume_bridge();
                 }
-                // Still running — nothing to do until the redraw it will post.
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                // The task was dropped without sending. Clearing the slot lets a
-                // later frame retry instead of wedging forever on a dead
-                // receiver, which is what leaving it in place would do.
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => self.pending_state = None,
             }
             return;
@@ -1651,9 +683,6 @@ impl App {
         self.pending_state = Some(rx);
 
         let instance = self.instance.clone();
-        // Copied into the future rather than reached for through `self`: the
-        // browser arm builds the device on a spawned task, and `Budgets` is
-        // `Copy` precisely so a seam like this costs nothing.
         let budgets = self.budgets;
         let redraw_target = self.window.clone();
         wasm_bindgen_futures::spawn_local(async move {
@@ -1666,51 +695,14 @@ impl App {
             )
             .await;
             let _ = tx.send(state);
-            // The frame that kicked this off returned without a renderer, and
-            // under `ControlFlow::Wait` nothing schedules another frame on its
-            // own. Without this redraw the app would sit on a blank canvas
-            // holding a perfectly good `AppState` it never collects.
+            // The frame that kicked this off returned without a renderer, and under
+            // `ControlFlow::Wait` nothing schedules another frame on its own.
             notify_redraw(&redraw_target);
         });
     }
 
-    /// Build the volume pipelines on the device that has just appeared and hand
-    /// the `Gui` something that can draw a 3D pane.
-    ///
-    /// Called from both arms of `ensure_rendering_state`, which is every place a
-    /// renderer comes into existence — first start, resume from suspend, and
-    /// recovery from a lost surface. The matching teardown is
-    /// `Gui::clear_graphics_state`, which drops the painter; there is no third
-    /// place either half can be forgotten.
-    ///
-    /// The painter is installed **even when the probe said no**, because it is
-    /// what tells the pane *why*. A pane with no painter falls back to a generic
-    /// "unavailable", which is the one message that helps nobody.
-    /// Fold what the adapter says about itself into the profile, and re-resolve.
-    ///
-    /// **The one place a real device meets the budgets**, and the seam the whole
-    /// of `rustdar_device_profile::budget` was extracted to have. Two readings go in and nothing
-    /// else does:
-    ///
-    /// * the **class** the driver names, which is honest on Vulkan/Metal/DX12
-    ///   and is `Unknown` in every browser and on at least one real GL adapter
-    ///   (this project's own RTX 3090 reports `DiscreteGpu` through Vulkan and
-    ///   `Other` through GL);
-    /// * the **ceilings the adapter reports**, off the *device* rather than off
-    ///   the adapter, because the web arm of `rustdar_gpu::device::device_limits` has
-    ///   already reconciled them with what WebGL2 can express — so this is the
-    ///   figure the app can actually spend on every target rather than a claim
-    ///   one of them would refuse.
-    ///
-    /// There is no browser term and there cannot be one: two browsers on one
-    /// machine are the same binary from the same origin and differ only in what
-    /// they report, so what separates them is these two numbers or nothing.
-    ///
-    /// Idempotent, and it has to be: this runs on first start, on resume from
-    /// suspend and on recovery from a lost surface. `resolve` is pure over the
-    /// profile, so running it again on an unchanged profile is the same answer —
-    /// which is also what keeps a reopen 1:1 rather than showing a different
-    /// loop length every time a display comes back.
+    /// Build the volume pipelines on the device that has just appeared and hand the `Gui`
+    /// something that can draw a 3D pane.
     fn update_device_profile(&mut self, class: rustdar_device_profile::quality::DeviceClass) {
         let Some(state) = self.state.as_ref() else {
             return;
@@ -1740,41 +732,20 @@ impl App {
     fn install_volume_bridge(&mut self) {
         use rustdar_device_profile::quality;
 
-        // Read before the `&mut` borrow below, because the pool it also decides
-        // lives on `App` rather than on `AppState` — see `Self::loop_pool`.
+        // Read before the `&mut` borrow below, because the pool it also decides lives on
+        // `App` rather than on `AppState` — see `Self::loop_pool`.
         let Some(class) = self.state.as_ref().map(|state| {
             rustdar_gpu::device::device_class_of(state.adapter.get_info().device_type)
         }) else {
             return;
         };
 
-        // **Where the application stops guessing.** Until this line the budgets
-        // are `DeviceProfile::for_target()`'s — every runtime field at its most
-        // conservative reading, which resolves to the `cfg` constants this
-        // build shipped. Here an adapter exists, so the profile can carry what
-        // it says about itself, and `budget::resolve` spends it.
-        //
-        // It runs *before* everything below reads `self.budgets`: the quality
-        // ceiling `select` is capped by, the offscreen budget the painter fits
-        // every pane against, and the cell budget `voxel_request_for` puts on
-        // the wire. Moving it after any of those would leave that one on the
-        // pre-adapter answer, which is the shape of bug this whole module
-        // exists to make impossible.
         self.update_device_profile(class);
 
-        // The same signal, spent a second time on a different question, and the
-        // *only* one there is for capacity: wgpu 29.0.4 reports no memory on any
-        // backend. `Device::generate_allocator_report` reports what this process
-        // has allocated, not what the device has, and `VK_EXT_memory_budget`'s
-        // `heapBudget` is read by wgpu-hal solely to refuse an allocation past a
-        // threshold the application sets — never handed back. See
-        // `crate::loop_pool` for the citations.
+        // The same signal, spent a second time on a different question, and the *only* one
+        // there is for capacity: wgpu 29.0.4 reports no memory on any backend.
         if !self.loop_pool_sized {
             self.loop_pool_sized = true;
-            // The rung, not the class. They are the same answer on every native
-            // adapter — `Promotion::for_class` reproduces `for_device`'s arms
-            // exactly — and they differ on the one target that reports no class
-            // at all, which is the browser this stage is here for.
             self.loop_pool = crate::loop_pool::LoopPool::for_promotion(
                 self.budgets.promotion,
                 None,
@@ -1791,14 +762,11 @@ impl App {
             return;
         };
 
-        // The one production call site of `quality::select`, and the reason its
-        // `Virtual`/`Unknown` arms matter: that is what a browser reports for
-        // every adapter it exposes, so the web build takes them on every device.
         let quality = quality::select(class, self.budgets.quality_ceiling);
 
-        // Nothing is built on a device that cannot render a volume — the
-        // pipelines would compile a shader against limits already known to be
-        // short, and `create_render_pipeline` has no `Result` to notice it in.
+        // Nothing is built on a device that cannot render a volume — the pipelines would
+        // compile a shader against limits already known to be short, and
+        // `create_render_pipeline` has no `Result` to notice it in.
         if rustdar_volumetric::support(&state.volume_support).is_supported() {
             log::info!(
                 "3D volume view: {quality:?} on {:?}",
@@ -1825,44 +793,8 @@ impl App {
         self.gui.apply(GuiEvent::VolumePainter(Some(painter)));
     }
 
-    /// Dispatch the voxel build a 3D pane asked for, unless the volume is
-    /// already in hand or in flight.
-    ///
-    /// The build runs through [`rustdar_worker::offload::offload_job`] — a thread
-    /// natively, the render worker on wasm — never on the frame thread. It
-    /// used to run here synchronously at a measured 150–200 ms per volume,
-    /// which was tolerable when the source was an archive volume that changed
-    /// every few minutes; on the merged substrate a rebuild lands with *every
-    /// sealed sweep*, and a 150 ms hitch each 15–25 s is exactly the frame
-    /// stall the user asked to be rid of.
-    ///
-    /// What stays on this thread is the extraction — the walk that copies the
-    /// product's moment out of the merged volume into the payload — which is
-    /// the same per-seal cost the section path already pays, and is logged so
-    /// the claim stays measured.
-    ///
-    /// # The dedupe, now that the build is asynchronous
-    ///
-    /// `PrepareVolume` is level-triggered: the pane re-asks every frame until
-    /// its `rendered_for` matches. The synchronous build's dedupe was the
-    /// result existing before the next frame; the worker path's is the
-    /// `VolumeEntry::Building` placeholder [`VolumeStore::begin_build`] opens
-    /// at dispatch — the next frame, and any second pane, finds it through
-    /// `share` and attaches instead of dispatching again. The placeholder is
-    /// also what recognises a stale reply: a build superseded by a newer
-    /// sealed sweep finds its entry gone and is dropped in `complete`.
-    /// The largest 3D texture axis this device will hold, or the WebGL2
-    /// guarantee when there is no device yet.
-    ///
-    /// The one runtime capability `rustdar_device_profile::constants::volume_grid_shape` needs,
-    /// read off the device this app actually got — `device_limits`' web arm has
-    /// already reconciled it with what the browser reports, so this is the real
-    /// figure on every target rather than a portable floor.
-    ///
-    /// The fallback is not a guess: with no device there is no volume to build
-    /// either, and the guarantee is what every conforming device must allow, so
-    /// a request formed before the renderer exists asks for the shape that
-    /// shipped rather than one nothing has agreed to.
+    /// Dispatch the voxel build a 3D pane asked for, unless the volume is already in hand
+    /// or in flight.
     fn volume_grid_axis_limit(&self) -> u32 {
         self.state.as_ref().map_or(
             rustdar_device_profile::constants::WEBGL2_MAX_TEXTURE_DIMENSION_3D,
@@ -1878,45 +810,7 @@ impl App {
         }
     }
 
-    /// The body of [`Self::handle_prepare_volume`], shared with the 3D loop's
-    /// dispatcher.
-    ///
-    /// `hold` is the whole difference between the two callers: a live 3D pane
-    /// holds one grid and lets the store shed the rest, a loop holds its whole
-    /// frame list. See [`rustdar_volumetric::bridge::Hold`].
-    ///
-    /// # Which volume a target names
-    ///
-    /// This used to refuse outright any `collected` that was not the site's
-    /// newest — the pane and the App both computed the stamp through
-    /// `current::resolve`, so a mismatch meant a sweep had sealed between
-    /// publish and here and the superseded build was not worth a resample.
-    /// That is still true of the live pane, and is still what happens: the live
-    /// stamp is re-derived below and a *live* target that disagrees with it is
-    /// dropped exactly as before.
-    ///
-    /// What the gate could not distinguish is a target naming a **past**
-    /// volume. There are two kinds and they come from different holders:
-    ///
-    ///  * every frame of a 3D loop but the newest, served from the loop's own
-    ///    downloaded scans — which is where the section loop's frames come
-    ///    from too;
-    ///  * the volume a pane has been **navigated** to off the timeline, served
-    ///    from the site's base holder, which the scan drain re-bases onto
-    ///    whatever a manual navigation fetched.
-    ///
-    /// The navigated arm is the one a scrub needs and the one that was
-    /// missing: the pane's target names `scan_info.timestamp` once it is off
-    /// live, that is by construction *not* the merged volume's newest data
-    /// time, and without this arm every scrubbed 3D pane fell through to
-    /// `Waiting` and rebuilt nothing for the rest of the session. It extracts
-    /// the base volume **alone** rather than the merge: the merge would fold
-    /// the live feed's newer sweeps into a picture the caption dates to the
-    /// navigated moment, which is the one lie a historic view must not tell.
-    ///
-    /// A time that is none of the three is not refused but left alone — it is
-    /// a loop frame whose download is still in flight, and the level-triggered
-    /// caller asks again.
+    /// The body of [`Self::handle_prepare_volume`], shared with the 3D loop's dispatcher.
     fn prepare_volume(
         &mut self,
         pane_idx: usize,
@@ -1925,7 +819,6 @@ impl App {
     ) -> VolumePrepare {
         use rustdar_volumetric::bridge::VolumeEntry;
 
-        // Built, building, or refused — attach and share rather than repeat.
         if self.volume_store.share_held(pane_idx, target, hold) {
             return VolumePrepare::Served;
         }
@@ -1933,18 +826,11 @@ impl App {
         let live = self
             .current_volume_stamp(&target.volume.site)
             .is_some_and(|stamp| stamp.newest == target.volume.collected);
-        // The volume the site's base holder carries, named by the key the
-        // holder is stamped with — which is `ScanInfo::timestamp`, the very
-        // field a navigated pane's target is built from, so this is an exact
-        // identity rather than a nearest match.
         let navigated = !live
             && self
                 .base_scans
                 .get(&target.volume.site)
                 .is_some_and(|(_, _, held)| *held == target.volume.collected);
-        // No volume at all yet, live, navigated or downloaded. Deliberately no
-        // entry: the caller goes on asking, and the first frame after data
-        // lands builds it.
         if !live
             && !navigated
             && !self
@@ -1966,14 +852,6 @@ impl App {
             return VolumePrepare::Served;
         };
 
-        // The budget gate, **before** the extraction — the same shape
-        // `spawn_section_render` has built in. The extraction below is the
-        // full merged-volume walk and copy, multi-ms on the frame thread, and
-        // `PrepareVolume` is level-triggered: refused *after* extracting, the
-        // walk repeats every frame until a slot frees — on wasm, where the
-        // budget is 1, that is a per-frame multi-ms stall behind any
-        // in-flight render. `spawn_voxel_build`'s own check stays as the
-        // belt; this one is what decides whether the walk is paid at all.
         if !self.render.render_slot_free() {
             return VolumePrepare::Busy;
         }
@@ -1987,8 +865,6 @@ impl App {
             self.extract_loop_volume(&target.volume.site, target.volume.collected, target.product)
         };
         let Some(input) = extracted else {
-            // The volume carries this moment nowhere — the same answer
-            // `build_voxels` would give, decided before paying for a dispatch.
             self.volume_store.insert_held(
                 pane_idx,
                 target.clone(),
@@ -2028,28 +904,14 @@ impl App {
             self.window.clone(),
         );
         if !spawned {
-            // Budget full. Nothing dispatched and nothing marked: the
-            // level-triggered caller asks again next frame.
             return VolumePrepare::Busy;
         }
         self.volume_store.begin_build_held(pane_idx, target, hold);
         VolumePrepare::Served
     }
 
-    /// The payload for one of a 3D loop's **past** volumes, out of the scans
-    /// the loop has already downloaded.
-    ///
-    /// The counterpart of [`Self::extract_current_volume`], and the same walk:
-    /// what differs is only where the `Scan` comes from. `spawn_loop_section_render`
-    /// does exactly this for a cross-section frame, off the same cache and with
-    /// the storm motion vector read off the dispatcher rather than passed in,
-    /// so that the vector a grid is *keyed* on cannot differ from the one it is
-    /// derived with.
-    ///
-    /// On the frame thread, as the live one is, and for the same two reasons:
-    /// the job wire carries a `RenderInput` rather than a `Scan`, and on wasm
-    /// the volume is only reachable from the main thread. That is what
-    /// `MAX_LOOP_VOLUME_BUILDS_PER_FRAME` paces.
+    /// The payload for one of a 3D loop's **past** volumes, out of the scans the loop has
+    /// already downloaded.
     fn extract_loop_volume(
         &mut self,
         site: &str,
@@ -2071,11 +933,6 @@ impl App {
             radar.lon,
             self.render.storm_motion_override_kt(),
         )
-        // The same stamp the live payload takes, off the loop's own copy of the
-        // volume's declarations. A 3D loop frame of NROT or SRV is dealiased on
-        // the worker, and a frame that arrived without this would fold around an
-        // estimate while the still frame beside it folded around the RDA's
-        // statement of the same cut.
         .map(|input| {
             input
                 .with_declared_nyquist(&declared)
@@ -2084,12 +941,6 @@ impl App {
     }
 
     /// Take delivery of finished voxel builds.
-    ///
-    /// The result is resolved by **target**, not by pane: `complete` swaps the
-    /// store's `Building` entry for the grid and every attached pane starts
-    /// painting it on this very frame — the seamless half of the swap whose
-    /// other half is `lookup_for_pane` keeping the old grid on screen while
-    /// the build ran.
     fn poll_voxel_results(&mut self) {
         use rustdar_volumetric::bridge::VolumeEntry;
 
@@ -2097,8 +948,6 @@ impl App {
             let ready_grid = vr.grid.map(|grid| std::sync::Arc::new(*grid));
             let entry = match &ready_grid {
                 Some(grid) => VolumeEntry::Ready(std::sync::Arc::clone(grid)),
-                // `build_voxels` has already logged which invariant it refused
-                // on; the message is for the centre of the pane.
                 None => VolumeEntry::Refused(format!(
                     "This volume could not be resampled for 3D.\n\n({} at {} UTC)",
                     vr.target.volume.site, vr.target.volume.collected,
@@ -2112,10 +961,6 @@ impl App {
                 );
                 continue;
             }
-            // After the swap, so it counts what is now held. One grid is up to
-            // 8 MiB and the bound is one per 3D pane plus one in flight, which
-            // is the sort of figure that should be readable in a log — see
-            // `VolumeStore::memory_bytes`.
             log::info!(
                 "3D volume view: the store holds {} volume(s), {} MiB",
                 self.volume_store.live_ids().len(),
@@ -2124,11 +969,8 @@ impl App {
         }
     }
 
-    /// The current merged volume's whole-volume payload for `site` and
-    /// `product`, extracted on this thread.
-    ///
-    /// One resolver call — `current::resolve` over the base and the live
-    /// snapshot — so this cannot disagree with the stamp the App publishes.
+    /// The current merged volume's whole-volume payload for `site` and `product`, extracted
+    /// on this thread.
     fn extract_current_volume(
         &mut self,
         site: &str,
@@ -2137,15 +979,8 @@ impl App {
         self.extract_site_volume(site, product, true)
     }
 
-    /// The **base** volume's whole-volume payload for `site` and `product` —
-    /// the same walk, over the base holder alone.
-    ///
-    /// What a pane navigated off live builds from. The live snapshot is
-    /// deliberately left out: on a chunk-fed site the feed is minutes ahead of
-    /// whatever a manual navigation re-based onto, and merging it in would put
-    /// current sweeps under a caption dated to the navigated moment. The
-    /// difference is nothing at all on a site with no feed, which is the
-    /// ordinary case for a historic view.
+    /// The **base** volume's whole-volume payload for `site` and `product` — the same walk,
+    /// over the base holder alone.
     fn extract_base_volume(
         &mut self,
         site: &str,
@@ -2154,8 +989,8 @@ impl App {
         self.extract_site_volume(site, product, false)
     }
 
-    /// The body of the two above: resolve the site's volume — with or without
-    /// the live overlay merged in — and walk the product's moment out of it.
+    /// The body of the two above: resolve the site's volume — with or without the live
+    /// overlay merged in — and walk the product's moment out of it.
     fn extract_site_volume(
         &mut self,
         site: &str,
@@ -2186,15 +1021,10 @@ impl App {
             product,
             radar.lat,
             radar.lon,
-            // The user's storm motion vector, for the worker-side SRV
-            // derivation; the extraction keeps it only on an SRV payload.
+            // The user's storm motion vector, for the worker-side SRV derivation; the
+            // extraction keeps it only on an SRV payload.
             self.render.storm_motion_override_kt(),
         )
-        // Stamped with the same table the merge resolved, so the worker's
-        // velocity fold guard reads the limits this thread would have read.
-        // Dropping this line is not a compile error and not a visible one: the
-        // worker would fall back to estimating, and the two threads would part
-        // company on a band of borderline pairs with nothing to point at.
         .map(|input| {
             input
                 .with_declared_nyquist(current.declared_nyquist())
@@ -2203,9 +1033,8 @@ impl App {
     }
 
     /// The re-cut key for `site`'s current merged volume under `product` —
-    /// [`rustdar_radar::sampler::ladder_fingerprint`] over the same resolve
-    /// the section payload is extracted from, so the key and the cut cannot
-    /// describe different volumes.
+    /// [`rustdar_radar::sampler::ladder_fingerprint`] over the same resolve the section
+    /// payload is extracted from, so the key and the cut cannot describe different volumes.
     pub(crate) fn current_ladder_fingerprint(
         &mut self,
         site: &str,
@@ -2226,13 +1055,8 @@ impl App {
         .ladder_fingerprint(product)
     }
 
-    /// The stamp of `site`'s current merged volume: the newest data time (its
-    /// identity, advanced by every sealed sweep) and the base volume's start
-    /// where one contributes.
-    ///
-    /// `None` while the site has no volume at all — no base and no sealed
-    /// sweeps — which is the cold-start window the panes caption as
-    /// downloading.
+    /// The stamp of `site`'s current merged volume: the newest data time (its identity,
+    /// advanced by every sealed sweep) and the base volume's start where one contributes.
     fn current_volume_stamp(&mut self, site: &str) -> Option<rustdar_egui::CurrentVolumeStamp> {
         let base = self
             .base_scans
@@ -2249,9 +1073,6 @@ impl App {
                 .map(|live| rustdar_radar::nyquist::Volume::new(&live.scan, &live.declared)),
         )?;
         let newest = current.newest_data_time()?;
-        // The base is named only where it contributes: after a VCP change the
-        // merge honestly drops it, and a caption naming it anyway would claim
-        // tilts the ladder no longer carries.
         let base_started = (current.base_sweeps() > 0)
             .then(|| base.as_ref().map(|(_, _, collected)| *collected))
             .flatten();
@@ -2262,12 +1083,6 @@ impl App {
     }
 
     /// This pane is holding nothing, on the host **and** on the GPU.
-    ///
-    /// The GPU half is the part that is easy to leave out and impossible to see:
-    /// a pane-sized `Rgba8Unorm` offscreen is ~3 MiB at 900², and the voxel
-    /// texture behind it is up to 8 MiB. Dropping the store entry alone would
-    /// leave both alive inside egui's callback resources until the renderer
-    /// itself was rebuilt.
     fn handle_release_volume(&mut self, pane_idx: usize) {
         self.volume_store.release(pane_idx);
         let live = self.volume_store.live_ids();
@@ -2281,51 +1096,11 @@ impl App {
         }
     }
 
-    /// Give back what the layout's hidden panes are still holding — the other
-    /// way a 3D pane stops needing its volume.
-    ///
-    /// `GuiAction::ReleaseVolume` covers one of the two: a pane **converted**
-    /// out of `Volume`, which the UI knows it did. It does not cover the other.
-    /// Splitting to fewer panes hides a 3D pane without converting it — the
-    /// `PaneState` stays in the vector so a re-split remembers it — and nothing
-    /// in the frame comes back to ask, so the store went on holding a resolved
-    /// grid (36 MiB of GPU texture, ~8 MiB of host bytes) plus that pane's
-    /// offscreen for the rest of the session.
-    ///
-    /// # Where the safe point is
-    ///
-    /// **Here, and not inside the pane loop.** A pane that is merely *not
-    /// currently drawn* is not a pane that is *gone*: `rustdar-egui` holds a
-    /// pane out of its vector with `mem::take` while the settings panel and the
-    /// layer stack draw, and the taken slot reads as a **default `PaneState` —
-    /// a `Map` with an empty site**. Any predicate that asked a pane whether it
-    /// still wanted its volume from inside that window would read the phantom
-    /// and release a live pane's grid. This runs from `setup_egui_frame`,
-    /// before `Gui::ui` opens the frame's first take window, so every pane is
-    /// in the vector and the layout's count is the whole truth.
-    ///
-    /// # What it must not disturb
-    ///
-    /// A 3D loop holds a **set** of grids ([`rustdar_volumetric::bridge::Hold::Set`]),
-    /// exempt from every shed there is. Two directions therefore matter and
-    /// both are pinned:
-    ///
-    /// * releasing a hidden pane must not tear down a *visible* pane's resident
-    ///   set — it cannot, because the store refcounts by pane and this detaches
-    ///   one pane rather than dropping an entry;
-    /// * a hidden pane that *was* a set holder must be released — it is the one
-    ///   holder nothing else bounds, since `dispatch_loop_renders` never walks a
-    ///   hidden pane and so never restates its `retain_set`.
-    ///
-    /// `rendered_for` is cleared with the release, and that half is not
-    /// bookkeeping. `PrepareVolume` is level-triggered on it, so a pane whose
-    /// grid was released while it still named one would come back from a
-    /// re-split with a key that no longer matches anything, never ask again,
-    /// and read "Building…" for ever. The 3D loop teardown in
-    /// `dispatch_loop_renders` clears it for the same reason.
+    /// Give back what the layout's hidden panes are still holding — the other way a 3D pane
+    /// stops needing its volume.
     pub(super) fn release_hidden_pane_volumes(&mut self) {
-        // The panes the layout is showing, from the same slice `render_panes`
-        // draws — not the raw `pane_count`, which may outrun the vector.
+        // The panes the layout is showing, from the same slice `render_panes` draws — not
+        // the raw `pane_count`, which may outrun the vector.
         let visible = self.gui.panes().len();
         for pane_idx in self.volume_store.hidden_holders(visible) {
             self.handle_release_volume(pane_idx);
@@ -2338,9 +1113,7 @@ impl App {
         }
     }
 
-    /// Record that this pane's 3D view is now about `target`, so it stops
-    /// asking. Set for a refusal as well as for a grid: a volume that cannot be
-    /// resampled must not be re-attempted every frame at 100 ms a go.
+    /// Record that this pane's 3D view is now about `target`, so it stops asking.
     fn mark_volume_rendered(&mut self, pane_idx: usize, target: &rustdar_egui::pane::VolumeTarget) {
         if let Some(pane) = self.gui.pane_mut(pane_idx)
             && let Some(volume) = pane.volume_mut()
@@ -2351,7 +1124,6 @@ impl App {
 
     /// Process all GUI actions emitted during this frame.
     fn process_gui_actions(&mut self, actions: Vec<GuiAction>) {
-        // Separate overlay render actions for deduplication
         let mut overlay_renders: Vec<(usize, LayerId, fetch::OverlayRenderRequest)> = Vec::new();
 
         for action in actions {
@@ -2364,16 +1136,10 @@ impl App {
                 zoom,
             } = action
             {
-                // The unexpanded viewport, which is what a region-scoped fetch
-                // wants — the renderer's overdraw margin is a rasterization
-                // concern and would over-fetch if it leaked into the request.
+                // The unexpanded viewport, which is what a region-scoped fetch wants — the
+                // renderer's overdraw margin is a rasterization concern and would over-
+                // fetch if it leaked into the request.
                 self.last_viewport = Some(geo_bounds);
-                // The action's id travels all the way to the dispatch: there
-                // is nothing between here and `spawn_overlay_render` that
-                // needs to know the layer by anything but its id, so an id
-                // no handler is registered for is not dropped on the way —
-                // it reaches the dispatch's own unregistered arm, which
-                // clears the marks it set.
                 overlay_renders.push((
                     pane_idx,
                     overlay_kind,
@@ -2391,10 +1157,6 @@ impl App {
         }
 
         if !overlay_renders.is_empty() {
-            // Groupable only while every visible map pane is viewport- and
-            // layer-linked (M11's per-pane model): the dedup key carries no
-            // geo bounds, so one unlinked pane means its texture must stay
-            // its own.
             let should_group = self.gui.overlay_renders_groupable();
             let grouped = deduplicate_overlay_renders(overlay_renders, should_group);
             for (pane_indices, id, req) in grouped {
@@ -2411,21 +1173,7 @@ impl App {
     }
 
     /// Drain the archive scan channel and apply every queued volume.
-    ///
-    /// FRAME_PUMP row 1 (`Ingest`) — see `frame_pump::FRAME_PUMP` for the
-    /// order it runs in. Extracted verbatim, comments included, from the
-    /// inline drain that used to open `poll_data_channels` (WO-E3); it
-    /// stays in this file so the drain reads beside the state it applies.
     fn poll_scan_results(&mut self) {
-        // Every queued scan result, not one per frame (with generation check).
-        //
-        // Responses arrive in batches — auto-poll sends one `CheckForNewScans`
-        // per live site, and two quick navigations queue two — while winit
-        // coalesces the redraws they each ask for into a single
-        // `RedrawRequested`. Taking one per frame therefore strands the rest:
-        // the end-of-frame re-arm in `handle_redraw` only fires for a render in
-        // flight, auto-poll, or an active loop, so a queued response can sit
-        // there until some unrelated OS event wakes the loop.
         while let Ok(scan_resp) = self.channels.scan_receiver.try_recv() {
             if self
                 .render
@@ -2436,33 +1184,14 @@ impl App {
                     scan_resp.site,
                     scan_resp.generation
                 );
-                // Throwing the result away still ends the wait it belonged to.
-                // Nothing else does: the fetch that superseded this one is
-                // typically the auto-poll check, and `check_and_fetch_latest`
-                // sends no response at all when there is no newer volume — so a
-                // spinner left up here stays up until some later volume happens
-                // to land, and a `fetching` flag left set blocks the very poll
-                // that would have cleared it (`check_auto_polls` refuses to poll
-                // while it is true). `SwitchRadarSite` raises a `loading_site`
-                // and sets no `fetching` flag at all, so that gate does not
-                // protect this path either — a switch superseded by one auto-poll
-                // check is the case this was found on.
-                //
-                // The cost is the other order: a newer fetch that raised a
-                // spinner of its own before this landed has it taken down early.
-                // That is a frame or two of understatement against a wait
-                // indicator nothing ever takes down, and the newer result still
-                // arrives and repaints the pane. The flag is global rather than
-                // per-site, which is the same coarseness the `Error` event has
-                // on the error arm below.
                 self.gui.apply(GuiEvent::Fetching(false));
                 self.gui.clear_loading_site_for_site(&scan_resp.site);
             } else {
                 match scan_resp.result {
                     Ok(scan_data) => {
-                        // The archive path is the only one that can *learn*: a
-                        // downloaded volume carries the Volume Data Block the
-                        // chunk feed's reassembled `Scan` has no room for.
+                        // The archive path is the only one that can *learn*: a downloaded
+                        // volume carries the Volume Data Block the chunk feed's reassembled
+                        // `Scan` has no room for.
                         let scan_info = self.scan_info_learning_position(
                             &scan_data.scan,
                             &scan_data.site,
@@ -2471,94 +1200,16 @@ impl App {
                         let site = scan_data.site;
                         let timestamp = scan_data.timestamp;
                         let scan_arc = Arc::new(scan_data.scan);
-                        // What the archive declared each cut's Nyquist velocity
-                        // to be, held beside the volume for as long as it is the
-                        // merge base. It cannot ride inside the `Scan`.
+                        // What the archive declared each cut's Nyquist velocity to be, held
+                        // beside the volume for as long as it is the merge base.
                         let declared_nyquist = Arc::new(scan_data.declared_nyquist);
 
-                        // An archive volume for a site the chunk feed has already
-                        // moved past.
-                        //
-                        // The archive publishes a volume only once every cut is
-                        // finished, so what it returns while a feed is running is
-                        // by construction the volume *before* the one being
-                        // assembled. Applying it walks the display backwards by a
-                        // whole volume — which is what a user pressing Refresh
-                        // least expects, and how this was found.
-                        //
-                        // The volume is still real and still complete, so it goes
-                        // to the loops and the cache; only the live display is
-                        // left alone. Once the feed retires `chunks_are_feeding`
-                        // goes false and the archive is applied unconditionally,
-                        // which is the whole point of the fallback.
-                        //
-                        // Two states outrank the guard, and both are the same
-                        // statement: this response is not a "latest" the feed
-                        // has already beaten, it is a *destination*.
-                        //
-                        // A pending **manual navigation** (Back, Forward, the
-                        // scrubber, an adjacent-scan step — everything that
-                        // sets `manual_nav_pending`) asked for an archive
-                        // moment on purpose. The guard reading that answer as
-                        // "stale" made the whole timeline transport inert on
-                        // any chunk-fed site whose feed had not retired by the
-                        // time the fetch landed — every navigation fetched,
-                        // arrived, and was thrown away here, which is the M10
-                        // "time controls do nothing" report. Auto-poll results
-                        // are exempt from the exemption: they really are
-                        // "latest" claims, whatever else is pending.
-                        //
-                        // And a site with **no live pane** has no live display
-                        // for the guard to protect: whatever asked for this
-                        // volume (the Set Time dialog parks its pane before
-                        // fetching) meant to look at it. This also closes the
-                        // retire race — `drive_chunk_feeds` drops a parked
-                        // site's feed a frame later, and a response draining
-                        // on exactly the click's frame used to catch the feed
-                        // still nominally up.
                         let feed_is_ahead = self.chunks_are_feeding(&site)
                             && self.any_pane_live_for_site(&site)
                             && !(self.manual_nav_pending && !scan_resp.is_auto_poll)
                             && fetch::latest_scan_time_for_site(self.gui.panes(), &site)
                                 .is_some_and(|shown| timestamp <= shown);
 
-                        // Every path out of this arm holds a complete archive
-                        // volume, including the two below that decline to put it
-                        // on screen — so the 3D pane is offered it here, above
-                        // the branch, rather than in the one branch that also
-                        // happens to update the plan view. A site being watched
-                        // live takes `feed_is_ahead` on every poll, and recording
-                        // this inside the `else` would leave a 3D pane on that
-                        // site waiting forever for a volume the app already had.
-                        //
-                        // **`scan_info.timestamp`, not `scan_data.timestamp`**,
-                        // and the difference is seconds with a visible
-                        // consequence. The first is when the volume's first
-                        // radial was collected; the second is the archive's own
-                        // key for the object. `PaneState::scan_info` carries the
-                        // former, and a 3D pane compares the two to decide
-                        // whether to name a second volume the app holds for the
-                        // site — so recording the archive key here would make
-                        // that line appear on *every* ordinary archive view,
-                        // where it is not merely wrong but actively harmful: a
-                        // warning that is always on is one the reader learns to
-                        // ignore, and it is the same line that has to be
-                        // believed in live mode.
-                        //
-                        // Guarded against walking *backwards* while the feed is
-                        // ahead: the feed's whole closed volumes roll the base
-                        // forward at volume end, up to ~7 minutes before the
-                        // archive publishes the same volume, so in that window a
-                        // manual Refresh returns the volume *before* the one
-                        // already based — and an unconditional insert would put
-                        // the older ladder back under every whole-volume
-                        // consumer. Deliberately **not** a plain only-if-newer:
-                        // with no feed ahead the insert stays unconditional, so a
-                        // historic navigation still re-bases the substrate on
-                        // the volume shown — a section pane stamps its target
-                        // with the pane's own time while cutting from
-                        // `base_scans`, and a base pinned newer than the display
-                        // would cut newer data under the navigated caption.
                         let advances_the_base = self
                             .base_scans
                             .get(&site)
@@ -2574,9 +1225,6 @@ impl App {
                             );
                         }
 
-                        // When auto-poll delivers a new scan, check if any pane
-                        // on this site is viewing live. If all panes on this site
-                        // are historic, cache silently for JumpToLive.
                         let any_pane_live_for_site = scan_resp.is_auto_poll && {
                             let count = self.gui.pane_count();
                             (0..count).any(|i| {
@@ -2607,11 +1255,6 @@ impl App {
                                 scan_arc,
                                 declared_nyquist,
                             );
-                            // The wait this fetch belonged to still has to end.
-                            // A Refresh raises `fetching`, and `check_auto_polls`
-                            // refuses to poll while it is set — so skipping
-                            // `ScanInfoForSite` without this leaves the
-                            // spinner up and the archive poll wedged behind it.
                             self.gui.apply(GuiEvent::Fetching(false));
                             self.gui.clear_loading_site_for_site(&site);
                         } else {
@@ -2627,13 +1270,8 @@ impl App {
                             self.gui.clear_loading_site_for_site(&site);
                             self.render.reset_panes_for_site(&site, &self.gui);
                             self.spawn_level3_fetches(&site);
-                            // The volume just became the one the panes draw:
-                            // rebuild their extraction payloads at arrival
-                            // (WO-E4.9) — after the ScanInfoForSite apply, so
-                            // the tuple read here is the tuple dispatch reads.
                             self.refresh_extract_cache_for_site(&site);
 
-                            // Append the new scan to any active loops on this site
                             self.append_scan_to_active_loops(
                                 &site,
                                 timestamp,
@@ -2641,7 +1279,6 @@ impl App {
                                 Arc::clone(&declared_nyquist),
                             );
 
-                            // If this was a manual navigation, reinitialize active loops
                             if self.manual_nav_pending {
                                 self.manual_nav_pending = false;
                                 self.reinit_active_loops();
@@ -2661,37 +1298,19 @@ impl App {
     }
 
     /// Poll all data channels for completed async results (scan, overlays).
-    ///
-    /// The body is the pump's `Ingest` phase: the rows, their order, and
-    /// the arguments for that order live in `frame_pump::FRAME_PUMP`.
     fn poll_data_channels(&mut self) {
         self.run_frame_pump(frame_pump::PumpPhase::Ingest, None);
     }
 
     /// Drain the unified overlay fetch channel.
-    ///
-    /// FRAME_PUMP row 6 (`Ingest`) — extracted verbatim from the inline
-    /// drain that used to close `poll_data_channels` (WO-E3).
     fn poll_overlay_fetch_results(&mut self) {
-        // Check for received overlay fetch results (unified channel)
         while let Ok(result) = self.channels.overlay_fetch_receiver.try_recv() {
             self.gui.overlays.apply_fetch_result(result);
         }
     }
 
-    /// Tell the UI each site's current-volume stamp — what a whole-volume pane
-    /// may build from, and how fresh it is.
-    ///
-    /// Stamps only — the `Scan`s themselves stay here, because `rustdar-egui`
-    /// has no business holding a decoded volume and the pane only needs to
-    /// *name* the one it wants. `handle_prepare_volume` resolves the same
-    /// stamp back through `current_volume_stamp`, and the two agree because
-    /// both are one `current::resolve` over the same holders.
-    ///
-    /// Covers the union of sites with a base and sites with a live feed: a
-    /// site whose first volume is still filling has sealed sweeps and no base,
-    /// and a historic site has a base and no feed — both are buildable and
-    /// both publish.
+    /// Tell the UI each site's current-volume stamp — what a whole-volume pane may build
+    /// from, and how fresh it is.
     fn publish_base_volumes(&mut self) {
         let mut sites: Vec<String> = self.base_scans.keys().cloned().collect();
         for site in self.gui.live_sites() {
@@ -2709,24 +1328,6 @@ impl App {
     }
 
     /// Drop the decoded volumes no pane is showing.
-    ///
-    /// The retention rule, and why it is the *union* of two site fields rather
-    /// than either one, is written down at [`scan_data`](Self::scan_data).
-    ///
-    /// Once a frame rather than at the inserts: there are two of those and one
-    /// of them (`handle_jump_to_live`) is nowhere near this, so a sweep is the
-    /// only form that cannot be half-wired. It costs a walk of a map that is
-    /// never longer than the pane count plus whatever one frame's switches left
-    /// behind.
-    ///
-    /// **The absence of a `pane_has_no_plan_view` filter here is deliberate**, and
-    /// the one place in this file where adding one would be the bug. Every other
-    /// all-panes loop that names that predicate is asking "should this pane be
-    /// *given* a plan-view raster"; this one asks "is anyone still reading this
-    /// volume", and a section or a 3D pane reads the whole volume rather than one
-    /// tilt of it — so skipping it would free the very data it is sampling, on the
-    /// next frame, for ever. Pinned by
-    /// `a_whole_volume_pane_keeps_the_volume_it_is_sampling`.
     fn evict_unshown_scans(&mut self) {
         let mut shown: Vec<&str> = Vec::with_capacity(self.gui.pane_count() * 2);
         for idx in 0..self.gui.pane_count() {
@@ -2738,67 +1339,24 @@ impl App {
                 shown.push(info.site.name);
             }
         }
-        // **Handed over, not dropped here.** `retain` frees in place, and in
-        // place is this frame: an entry is a whole decoded volume, 47–69 MiB
-        // across thousands of per-radial buffers, and the walk that returns
-        // them is the frame-thread cost `offload::discard` exists to move. Each
-        // map's evictions go over individually, because the drain's budget is
-        // spent *between* payloads — see `offload::discard_each`.
-        //
-        // # What the hand-over buys, given that these maps share allocations
-        //
-        // A `scan_data` entry and a `base_scans` entry are often the same
-        // `Arc<Scan>` (see the field docs), so two of the three hand-overs will
-        // be refcount decrements that free nothing. That does not weaken the
-        // move, it is the reason all three have to make it: whichever handle
-        // turns out to be the last one is the one that pays the deep free, and
-        // it can only be paid off-frame if *every* holder hands its handle
-        // over. A site still shown by some other holder frees nothing at all
-        // this pass, which is the same answer `retain` gave.
+        // place is this frame: an entry is a whole decoded volume, 47–69 MiB across
+        // thousands of per-radial buffers, and the walk that returns them is the frame-
+        // thread cost `offload::discard` exists to move.
         let unshown = |site: &String| !shown.iter().any(|shown| *shown == site);
         rustdar_worker::offload::discard_each(
             "evicted-scan",
             evicted(&mut self.scan_data, &unshown),
         );
-        // The same bound, for the same reason: an entry is a whole decoded
-        // volume, and a session that visits ten sites would otherwise keep all
-        // ten resident. `shown` already covers a pane's live site *and* the site
-        // of the scan it is drawing, which is what stops a switch evicting the
-        // volume a 3D pane is still building from.
         rustdar_worker::offload::discard_each(
             "evicted-base-volume",
             evicted(&mut self.base_scans, &unshown),
         );
-        // And the third holder of whole volumes, which used to be exempt and
-        // simply grew: an entry is written for every site whose panes are all
-        // historic when its feed delivers, it was removed only by
-        // `handle_jump_to_live` for that one site, and nothing else ever
-        // touched it — so a session that toured sites in historic mode kept
-        // every one of their latest volumes for the life of the process. The
-        // entry exists to serve `JumpToLive`, which is a per-pane action, so a
-        // site no pane shows cannot be jumped to and holds nothing here.
         rustdar_worker::offload::discard_each(
             "evicted-cached-volume",
             evicted(&mut self.latest_cached_scans, &unshown),
         );
-        // The extraction payloads (WO-E4.9): entries die with their volume,
-        // on this same pass — a site no pane names has no dispatch left to
-        // serve. (Within a shown site, each arrival already swept the
-        // previous volume's entries in `refresh_extract_cache_for_site`.)
-        // Before the loop sweep below only because `unshown` borrows the
-        // pane list and that sweep takes `&mut self`.
         self.render.retain_extracts(|key| !unshown(&key.site));
         self.evict_unneeded_loop_scans();
-        // And the derivation memo (WO-E4.8), pruned against what SURVIVED the
-        // passes above — every holder of a whole decoded volume contributes,
-        // the loop cache included, because a 3D loop derives per frame it
-        // revisits and a memo pruned against the plan-view stores alone would
-        // re-run those derivations once a frame. Native is where this call
-        // does the invalidating; on wasm the entries live in the worker's own
-        // instance of the memo (jobs run there), so this is a no-op on an
-        // empty map and the worker is bounded by the memo's LRU capacity plus
-        // its sealed-sweeps re-keying instead — `derive::retain_volumes` says
-        // so where the bound lives.
         rustdar_radar::derive::retain_volumes(
             self.scan_data
                 .values()
@@ -2813,162 +1371,19 @@ impl App {
         );
     }
 
-    /// Drop the loop caches' data no live loop frame names — the decoded Level
-    /// II volumes and the paired Level III objects alike.
-    ///
-    /// # The fourth holder of whole volumes, and the one nothing bounded
-    ///
-    /// `LoopDownloadManager::scan_cache` holds one `Arc<Scan>` per
-    /// `(site, timestamp)`, written by `append_scan_to_active_loops` on every
-    /// auto-poll and every completed live volume, and by the loop download
-    /// path. Nothing removed an entry: loop-frame eviction retires a pane's
-    /// *frame*, the site switch's wholesale clear was the only other remover
-    /// and has since gone, and the loop pool's byte budget counts texture
-    /// bytes, so these CPU-side volumes sat outside every budget in the
-    /// workspace. A pane parked on a live radar accumulated 0.4–1 GB an hour,
-    /// unbounded — fatal inside wasm32's 4 GiB address space, and an OOM rather
-    /// than a leak on a handheld.
-    ///
-    /// # And the sibling that had the same shape
-    ///
-    /// `LoopDownloadManager::l3_cache` is the same defect on the other
-    /// datasource: one `Level3Product` per `(site, AWIPS code, volume start)`,
-    /// written by `cache_l3_product` for every frame of every Level III loop,
-    /// and taken out by nothing but that same site switch. Each carries the
-    /// decoded message *and* the bytes it was decoded from, a few hundred
-    /// kilobytes rather than a volume's ~10 MB — smaller per entry, unbounded on
-    /// the same axis, and it grows on every re-listing: a product switch, a time
-    /// navigation, `reinit_active_loops`. It is swept here with the *same*
-    /// predicate object, so the two caches cannot come to disagree about which
-    /// frames still matter.
-    ///
-    /// # Needs-based retention, not a window and not an LRU
-    ///
-    /// The retention set is the union of `(ls.site, frame.timestamp)` over every
-    /// **active** pane loop, and that set is exact rather than approximate:
-    /// every reader of the cache — `frame_data`, `frame_sweep`, `frame_section`,
-    /// [`Self::extract_loop_volume`] and a sibling's `own_sweep` — resolves
-    /// through a loop frame's timestamp against the loop's own site. An entry
-    /// no frame names is an entry nothing can ask for.
-    ///
-    /// The Level III readers are the same claim with a shorter list:
-    /// `l3_frame_state` and `l3_frame_products` are reached only through
-    /// `frame_data`, `frame_data_settled` and `frame_data_in_flight`, each of
-    /// which is asked with a loop frame's timestamp and `RenderTarget::site`,
-    /// which is `ls.site`. Nothing outside the loop path reads that cache at
-    /// all — the still image's Level III objects live in
-    /// `render_dispatch`'s own `level3_data`, keyed `(site, code)` with no
-    /// volume in it — so it needs no counterpart to the exception below.
-    ///
-    /// One reader does **not** resolve through a loop frame, and it is the one
-    /// an enumeration of the loop path misses: `prepare_volume`'s third arm
-    /// (`App::extract_loop_volume` reached through `handle_prepare_volume`)
-    /// serves a 3D pane whose target is neither live nor the base. So each
-    /// pane's own `(scan_info.site, scan_info.timestamp)` is in the set too —
-    /// two entries per pane, normally holding nothing here at all. See the
-    /// comment at the insert for the branch that makes it reachable.
-    ///
-    /// `frame_gates` is the one reader that asks with a *response's* timestamp
-    /// rather than a frame's, and it needs no exception: a response naming a
-    /// frame the window has since retired is refused by `accept_render_result`
-    /// — which resolves the frame before the gates are used at all — so the
-    /// `None` it now answers changes nothing. A response whose frame is still
-    /// there names an entry the set holds, on either the origin's loop or a
-    /// broadcast sibling's, because `is_rendered_for` already ties the
-    /// receiver's own site to the one in the result.
-    ///
-    /// The two rules that look cheaper are both wrong here:
-    ///
-    /// * A **wall-clock window** would evict a historic loop's entire working
-    ///   set. `begin_loop_for_pane` anchors the window at the pane's *viewed*
-    ///   scan, not at now, so a loop parked on last week's storm holds frames a
-    ///   clock-anchored rule calls stale — every one of them.
-    /// * A **byte-LRU** may evict an entry a live frame still names, and that
-    ///   frame's dispatch immediately re-requests it: permanent refetch churn,
-    ///   over a network, on the loop the user is watching.
-    ///
-    /// # The site is the loop's own, not the pane's
-    ///
-    /// `LoopPlaybackState::site` is the geometry site captured at loop
-    /// creation, and it is the site downloads file under —
-    /// `begin_loop_for_pane` builds both from one `scan_info.site`. `pane.site`
-    /// is re-synced across panes without their loops being rebuilt, so keying
-    /// on it would name a site whose entries this cache does not hold and let
-    /// the ones it does hold go.
-    ///
-    /// # The grace rule, and the clock on it
-    ///
-    /// A loop in `LoopPhase::FetchingScanList` has no frames yet — its listing
-    /// is in flight — so its site is skipped whole. Without it, every product
-    /// switch and every loop re-init would evict its own window in the gap
-    /// before the new listing installs frames, and re-download all of it. That
-    /// is the contract `begin_loop_for_pane` states across the rebuild it
-    /// performs, and this is what preserves it now that the cache is swept.
-    ///
-    /// **The exemption expires after [`LOOP_LISTING_GRACE`], and it has to.**
-    /// An earlier draft of this doc claimed the wait was bounded by one listing
-    /// round-trip because a failed listing arrives as an empty list that
-    /// `accept_scan_listing` answers by switching the loop off. That is true of
-    /// a listing that *fails* and false of one that never returns:
-    ///
-    /// * On **wasm32** nothing ends the wait at all. `rustdar_radar::tls::client`
-    ///   accepts and ignores its timeout — reqwest's wasm `ClientBuilder` has no
-    ///   `timeout`, and a browser `fetch()` has no default of its own — so a
-    ///   black-holed connection leaves the future pending for the life of the
-    ///   tab. Nothing else rescues the loop: `settle_loop_phase` returns early
-    ///   on an empty frame list, and `accept_scan_listing` returns without
-    ///   touching the phase when the site does not match. The site stays exempt
-    ///   every frame while the poll and chunk-feed paths keep writing a volume
-    ///   per seal — the leak at full rate, inside the address space this sweep
-    ///   exists to protect.
-    /// * **Natively** the wait is bounded but not by one round-trip:
-    ///   `ARCHIVE_TIMEOUT` is 300 s *per request* and `list_scans_for_range`
-    ///   issues one listing per UTC day the window touches, so a stall exempts a
-    ///   site for minutes — 35–170 MB at the accumulation rate above.
-    ///
-    /// The clock is [`LoopPlaybackState::listing_since`](rustdar_egui::pane::LoopPlaybackState::listing_since),
-    /// stamped by `new_for_loop`, which is the only writer of that phase. The
-    /// frame plan cannot stand in for it: `begin_loop_for_pane` calls
-    /// `remove_pending`, which deletes the plan, so "no plan" and "listing in
-    /// flight" are the same observation through it.
-    ///
-    /// # The accepted UX consequence
-    ///
-    /// Turning a loop off sheds its window, so re-enabling it re-downloads that
-    /// window — noticeable on a slow link, and the same cost a grace expiry
-    /// imposes. This is deliberate under the project rule that interaction stays
-    /// realtime while data may lag: the alternative is a cache bounded by
-    /// nothing, which costs the session rather than one re-fetch.
-    ///
-    /// [`LOOP_LISTING_GRACE`]: rustdar_device_profile::constants::LOOP_LISTING_GRACE
+    /// Drop the loop caches' data no live loop frame names — the decoded Level II volumes
+    /// and the paired Level III objects alike.
     fn evict_unneeded_loop_scans(&mut self) {
-        // Borrowed from `self.gui` and read against `self.loop_mgr`: two
-        // disjoint fields, so no clone of a site name is needed per frame.
-        //
-        // Nested by site rather than a flat set of `(site, timestamp)` pairs,
-        // and not for tidiness: the predicate is handed a `&str` borrowed from
-        // the cache's own key, which is shorter-lived than these, and a tuple
-        // key would need it to outlive them. A map keyed on `&str` is looked up
-        // through `Borrow<str>` and takes any lifetime.
         let mut needed: HashMap<&str, std::collections::HashSet<chrono::NaiveDateTime>> =
             HashMap::new();
         let mut settling: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        // One instant for the whole sweep, so two panes fetching the same
-        // listing cannot be judged against two different clocks.
+        // One instant for the whole sweep, so two panes fetching the same listing cannot be
+        // judged against two different clocks.
         let now = web_time::Instant::now();
         for idx in 0..self.gui.pane_count() {
             let Some(pane) = self.gui.pane(idx) else {
                 continue;
             };
-            // **The volume the pane itself is viewing, whatever its loop is
-            // doing.** `prepare_volume`'s third arm serves a 3D pane out of
-            // this cache when the target is neither the live stamp nor the
-            // base, and that arm is reachable: the scan drain's `feed_is_ahead`
-            // branch *moves* an archive volume into the loop cache and writes
-            // neither `scan_data` nor `base_scans`. Swept from under such a
-            // target, `prepare_volume` answers `Waiting` — level-triggered, so
-            // for ever — and the pane never builds. Two entries per pane at
-            // most, and normally none of them is in this cache at all.
             if let Some(info) = pane.scan_info.as_ref() {
                 needed
                     .entry(info.site.name)
@@ -2979,10 +1394,6 @@ impl App {
             if !ls.is_active() {
                 continue;
             }
-            // The grace rule, with its clock. `listing_wait` answers `None` for
-            // a loop that is not fetching, so a loop past the bound is treated
-            // exactly like one that never asked — see this function's doc for
-            // why an unbounded exemption is a wasm32 leak rather than a nicety.
             if ls.listing_wait(now).is_some_and(|waited| {
                 waited < rustdar_device_profile::constants::LOOP_LISTING_GRACE
             }) {
@@ -2993,62 +1404,15 @@ impl App {
                 frames.insert(frame.timestamp);
             }
         }
-        // One predicate, passed by value to both sweeps below: it captures two
-        // shared references and nothing else, so it is `Copy` and the second
-        // call is not a second rule.
         let keep = |site: &str, ts: &chrono::NaiveDateTime| {
             settling.contains(site) || needed.get(site).is_some_and(|frames| frames.contains(ts))
         };
-        // **The queues are swept by the same predicate, before the cache.**
-        // `dispatch_pending_loop_downloads` skips a queued timestamp whose
-        // volume `is_cached` already has, so the queue and the cache have to
-        // agree about which timestamps still matter — and `FramePlan::frames`
-        // is the *original listing*, which `append_polled_frame` never prunes
-        // as the window walks forward. Leaving it stale turns the next product
-        // switch into a re-download of a whole retired window, which is the
-        // refetch churn this design refuses a byte-LRU for. See
-        // `LoopDownloadManager::retain_plan_frames`.
         self.loop_mgr.retain_plan_frames(keep);
-        // Handed over rather than freed here, for the reason the three maps
-        // above are — and with the same caveat, which is larger on this path:
-        // a loop frame's volume is very often the same `Arc<Scan>` the pane's
-        // still image is drawn from, so a hand-over whose twin is still in
-        // `scan_data` or `base_scans` decrements a refcount and frees nothing.
-        // That is the correct outcome, not a shortfall: whichever holder turns
-        // out to hold the last handle pays the deep free, and it is paid
-        // off-frame only if every holder hands its own over.
         rustdar_worker::offload::discard_each(
             "evicted-loop-volume",
             self.loop_mgr.retain_scans(keep),
         );
-        // **The other datasource's cache, by the same rule and the same
-        // predicate.** `l3_cache` had exactly the shape `scan_cache` had — one
-        // entry per frame per AWIPS code, written by `cache_l3_product` and
-        // removed by nothing but the site switch — and each entry carries a
-        // decoded `Level3Message` *and* the bytes it was decoded from. Smaller
-        // per entry than a volume and unbounded on the same axis, so a Level III
-        // loop that re-lists leaves its whole previous window behind, per code,
-        // for the life of the process.
-        //
-        // The predicate is passed unchanged, which is what makes the two caches
-        // answer one question. It judges `(site, volume start)` and never the
-        // code — see `LoopDownloadManager::retain_l3` for why that is the rule
-        // rather than a shortcut, and note that the frames a loop names do not
-        // move when its product does.
         rustdar_worker::offload::discard_each("evicted-loop-object", self.loop_mgr.retain_l3(keep));
-        // **The bucket-key listings, at the only resolution their key has.**
-        // `l3_keys` is `(site, AWIPS code)` with no volume in it, so this asks
-        // whether anything still needs the site at all — derived from the *same
-        // two sets* as `keep`, not from a second observation, so the three
-        // sweeps cannot disagree about which sites are live.
-        //
-        // It is here because the site switch no longer wipes the manager:
-        // `clear_all` was the only thing that ever removed one of these, and it
-        // took every other site's state with it. Unswept, a session keeps a
-        // listing per `(site, code)` it ever looped — and worse than the bytes,
-        // `claim_l3_listing` refuses to re-list one this map holds, so a stale
-        // listing is re-used for a window whose days it does not cover and every
-        // frame outside them reads as a gap.
         let keep_site = |site: &str| settling.contains(site) || needed.contains_key(site);
         rustdar_worker::offload::discard_each(
             "evicted-loop-l3-listing",
@@ -3057,19 +1421,6 @@ impl App {
     }
 
     /// Persist the config if it has changed and the interval has elapsed.
-    ///
-    /// Cheap enough to call every frame: until [`AUTOSAVE_INTERVAL`] is up this
-    /// is a subtraction, and after it a serialization and a string compare. Only
-    /// a genuine change reaches the store.
-    ///
-    /// The serialization stays here on purpose — the string compare against
-    /// `last_written` is what decides whether to write at all, so the value has
-    /// to exist on this thread. Only the bytes leave: the filesystem backend
-    /// queues them for its writer thread, so what a frame pays is the
-    /// serialization and the compare, never `create_dir_all` and `write`.
-    ///
-    /// See [`AutosaveState`] for why the config is written on a timer rather
-    /// than at shutdown.
     fn autosave_config(&mut self, force: bool) {
         let now = web_time::Instant::now();
         if !force
@@ -3079,8 +1430,6 @@ impl App {
             return;
         }
         self.autosave.last_check = Some(now);
-        // The check is happening now, so activity up to this point is accounted
-        // for. Anything arriving after re-arms it and earns another wake-up.
         self.autosave.touched = false;
 
         let Some(json) = self.gui.ui_config_json() else {
@@ -3093,72 +1442,15 @@ impl App {
             return;
         };
         match store.store(rustdar_egui::UI_CONFIG_KEY, &json) {
-            // For a backend that queues, this says "accepted", not "written" —
-            // a write that then fails is reported where it failed. The cost is
-            // that a failing disk waits for the next genuine change rather than
-            // the next tick, which is the trade the backend documents.
+            // For a backend that queues, this says "accepted", not "written" — a write that
+            // then fails is reported where it failed.
             Ok(()) => self.autosave.last_written = Some(json),
-            // Not fatal and not retried on a shorter timer: the next tick tries
-            // again anyway, and a full `localStorage` would otherwise log once
-            // per frame forever.
             Err(e) => log::warn!("config autosave failed: {e}"),
         }
     }
 
-    /// Build a volume's [`ScanInfo`], and remember anything it taught about
-    /// where its radar is.
-    ///
-    /// Every `ScanInfo` in the application is built here, so that the
-    /// precedence `ScanInfo::from_scan` documents — the volume in hand, then
-    /// what an earlier volume taught, then the resolved table — is applied in
-    /// exactly one place and cannot be half-applied on one path.
-    ///
-    /// # Why the write is here rather than at the pane
-    ///
-    /// This is the moment something is *learned*, as opposed to recalled: only
-    /// [`SitePositionSource::Volume`] means a volume in hand stated a position,
-    /// and only that is worth persisting. Writing on
-    /// [`SitePositionSource::Learned`] as well would rewrite the store on every
-    /// volume for a value that came out of the store.
-    ///
-    /// The read happens *before* the `ScanInfo` exists, which is what keeps the
-    /// 1:1-on-reopen rule true: a learned position is applied before anything
-    /// is drawn from it, never as a late correction that shifts a pane the user
-    /// is already looking at.
-    ///
-    /// # Why the table is resolved again here
-    ///
-    /// [`ScanInfo::site`] is where the *data* goes: the raster is framed on it
-    /// by `ImageBounds::from_radar_site`, the range ring is drawn round it, and
-    /// the hover readout measures bearing and range from it. The site **marker**
-    /// comes from somewhere else — `sites::radars()`, walked afresh every frame
-    /// by `visible_radar_sites` and rasterized from the same table — and until
-    /// this call the two could disagree.
-    ///
-    /// They disagreed exactly once per radar per install, and it is the case
-    /// that matters: the first session in which a volume states a position the
-    /// seed does not have. `ScanInfo::from_scan` takes the volume's word
-    /// immediately, `sites::resolve` runs only at startup, so for the rest of
-    /// that session the icon and the label sat on the seeded coordinates while
-    /// the echo, the ring and the readout stood on the volume's. Bounded — the
-    /// largest step in the archive is `KTLX`'s 43 m re-survey — but it is a
-    /// radar drawn beside its own range ring, which is precisely the kind of
-    /// disagreement a user reads as "one of these is a bug".
-    ///
-    /// Only on the frame something is genuinely learned, which is what
-    /// [`SitePositions::learn`](crate::site_positions::SitePositions::learn)'s
-    /// return value is for: every later volume of that session restates the same
-    /// position, and `sites::resolve` on an unchanged fix set is a no-op that
-    /// does not even take the write lock.
-    ///
-    /// **This is not the "late arrival" the startup resolutions exist to avoid.**
-    /// That rule is about a position or a name appearing under a user who is
-    /// already looking at the radar it names — a store read that lands after the
-    /// first paint, a catalogue that lands off the network — and both of those
-    /// still happen strictly before any frame. Here the row moves on the very
-    /// frame its own volume moves the data, so the marker and the picture step
-    /// together rather than apart, and the texture generation is bumped so the
-    /// rasterized icons are redrawn with them rather than one poll later.
+    /// Build a volume's [`ScanInfo`], and remember anything it taught about where its radar
+    /// is.
     fn scan_info_learning_position(
         &mut self,
         scan: &nexrad_model::data::Scan,
@@ -3176,31 +1468,10 @@ impl App {
         {
             let store = self.platform.kv();
             let learned = self.site_positions.learn(store.as_deref(), site, position);
-            // `store` borrows `self.platform`; the resolve below wants two other
-            // fields and the bump wants `self.gui`.
+            // `store` borrows `self.platform`; the resolve below wants two other fields and
+            // the bump wants `self.gui`.
             drop(store);
             if learned {
-                // Into the live table, in this session, not only into the store
-                // for the next one — for two reasons that arrived separately
-                // and want the same line.
-                //
-                // The marker: a row that moved has to move on the frame its own
-                // volume moves the data, or the two disagree for a session.
-                //
-                // And the MSL datum. Without this a first run renders every
-                // height against a table that has no row for the radar it is
-                // rendering: `eet::radar_height_ft_near` answers `None` and the
-                // render paths fall back to 0 ft — sea level, which is a
-                // plausible reading for a coastal site and was 292 ft of error
-                // at KLWX. The binary used to carry a row for every radar, so
-                // the hole could not be reached; deleting the table opened it.
-                //
-                // Neither can move anything the user is looking at, which is
-                // the rule `sites::resolve` is otherwise held to. The row is
-                // built from the position this very volume states, and the pane
-                // is already drawn from that same position by way of the
-                // `ScanInfo` above — so the table is brought into agreement
-                // with the screen rather than the other way round.
                 rustdar_radar::sites::resolve(
                     self.site_positions
                         .fixes()
@@ -3213,33 +1484,10 @@ impl App {
     }
 
     /// Replace a timezone-guessed site with the one nearest an actual fix.
-    ///
-    /// This is the silent upgrade the timezone guess exists to be replaced by:
-    /// the guess resolves a *region* in time for the first paint, and a real fix
-    /// — which arrives only where the user has already granted location, so no
-    /// prompt is involved — resolves the actual radar a moment later.
-    ///
-    /// Does nothing once the site is no longer provisional, which is the
-    /// precedence rule the whole feature turns on. A user who has chosen a site,
-    /// or whose site came back from storage, keeps it: someone in Dallas
-    /// watching a storm over Kansas must not be yanked home by a fix arriving
-    /// late.
     fn upgrade_provisional_site(&mut self, fix: &rustdar_location::Fix) {
         if !self.site_is_provisional {
             return;
         }
-        // Not every fix is a statement about where the user is. `FixQuality::None`
-        // means the receiver's fix flag is clear, so its coordinates are stale;
-        // `Manual` is a position somebody typed into the dongle and `Simulation`
-        // is a canned track — both live on the serial path, both perfectly
-        // well-formed, and neither one a place. See `FixQuality::can_relocate`,
-        // which is named for *this* question rather than for whether there are
-        // coordinates in the struct.
-        //
-        // (The map itself never reads `fix_quality` at all — `ui_map.rs` draws
-        // the dot from latitude and longitude alone — so this gate is about the
-        // site choice and nothing else. An earlier version of this comment
-        // claimed the opposite, and named a variant that does not exist.)
         if !fix.fix_quality.can_relocate() {
             return;
         }
@@ -3256,8 +1504,6 @@ impl App {
         else {
             return;
         };
-        // Spent either way. A fix that confirms the guess must still stop the
-        // site being provisional, or every later fix re-runs this.
         self.site_is_provisional = false;
         if self.gui.pane(0).is_some_and(|p| p.site == site.name) {
             return;
@@ -3266,17 +1512,6 @@ impl App {
             "location fix refines the opening site to {} ({dist:.0} km)",
             site.name
         );
-        // Through the same action a click on the site picker raises, not through
-        // `set_initial_site`. Assigning `pane.site` is only the visible third of
-        // a site change: `SwitchRadarSite` also raises `loading_site`, resets the
-        // loop, clears the download manager and — the part that actually matters
-        // here — spawns the fetch. Setting the field alone left the pane naming a
-        // site whose volume nobody had asked for, so `scan_info` stayed `None`
-        // and the map fell back to its no-data centre, which is in Kansas.
-        //
-        // `set_initial_site` is still right for the startup guess, where this
-        // runs before the event loop and the app's own first fetch reads the
-        // site it leaves behind.
         self.handle_gui_action(
             GuiAction::SwitchRadarSite {
                 site: site.name.to_string(),
@@ -3287,42 +1522,13 @@ impl App {
     }
 
     /// Arrange for one more look if a change might still be unsaved.
-    ///
-    /// The app runs on `ControlFlow::Wait` and wakes only when something
-    /// happens, which leaves a gap the interval alone cannot close: the user
-    /// pans the map, the pan's final frame lands less than
-    /// [`AUTOSAVE_INTERVAL`] after the previous check, nothing else happens,
-    /// and the app sleeps forever holding an unwritten change. Asking for a
-    /// wake-up once the interval is up gives that change an iteration to be
-    /// saved on — an iteration, not a frame, because the timer that grants it
-    /// does not produce one (see [`about_to_wait`]).
-    ///
-    /// Only when something has actually happened. Scheduling unconditionally
-    /// would turn an idle tab into a 0.33 Hz poll for no benefit, which is the
-    /// cost `ControlFlow::Wait` was chosen to avoid in the first place.
-    ///
-    /// [`about_to_wait`]: App::about_to_wait
     fn schedule_wakeup(&self, event_loop: &ActiveEventLoop) {
         event_loop.set_control_flow(self.wakeup_control_flow());
     }
 
-    /// The state the loop should be left in, given what the autosave still
-    /// owes, when egui next wants a timed repaint, and when auto-poll next
-    /// needs a frame — whichever comes first.
-    ///
-    /// Split out of [`schedule_wakeup`] so the whole decision is
-    /// reachable from a test: an `ActiveEventLoop` cannot be had outside a
-    /// running winit loop, so a function that takes one can only ever be read
-    /// as source.
-    ///
-    /// [`ControlFlow::Wait`] — the loop's resting state, set once at startup by
-    /// each platform's entry point — is the answer whenever nothing is owed,
-    /// and returning it is load-bearing rather than tidy. `set_control_flow` is
-    /// sticky, and a `WaitUntil` is compared against the clock afresh every
-    /// iteration: one left behind after its deadline passes makes every
-    /// subsequent iteration compute a zero timeout, wake immediately, and find
-    /// the same expired deadline. Measured on X11 at winit 0.30.13, that is
-    /// ~164,000 iterations per second on a full core, forever.
+    /// The state the loop should be left in, given what the autosave still owes, when egui
+    /// next wants a timed repaint, and when auto-poll next needs a frame — whichever comes
+    /// first.
     fn wakeup_control_flow(&self) -> ControlFlow {
         let now = web_time::Instant::now();
         let until = |at: Option<web_time::Instant>| at.map(|at| at.saturating_duration_since(now));
@@ -3335,26 +1541,16 @@ impl App {
         .flatten()
         .min();
         match delay {
-            // `wait_duration` rather than `WaitUntil`: winit's `Instant` is
-            // `std::time`'s natively and `web_time`'s on wasm, so no single
-            // instant value typechecks for both targets. A duration does, and
-            // the helper also degrades an overflowing deadline to a plain
-            // `Wait`.
+            // `wait_duration` rather than `WaitUntil`: winit's `Instant` is `std::time`'s
+            // natively and `web_time`'s on wasm, so no single instant value typechecks for
+            // both targets.
             Some(delay) => ControlFlow::wait_duration(delay),
             None => ControlFlow::Wait,
         }
     }
 
-    /// How long the loop may sleep before the autosave next needs a look, or
-    /// `None` when nothing is owed and it may sleep until something happens.
-    ///
-    /// A duration rather than the deadline it was computed from, for the same
-    /// reason [`wakeup_control_flow`] builds its `WaitUntil` out of one: an
-    /// instant here would be `std::time`'s on three platforms and `web_time`'s
-    /// on the fourth, and a test naming either could only be written for half
-    /// the targets it is meant to hold for.
-    ///
-    /// [`wakeup_control_flow`]: App::wakeup_control_flow
+    /// How long the loop may sleep before the autosave next needs a look, or `None` when
+    /// nothing is owed and it may sleep until something happens.
     fn autosave_delay(&self) -> Option<std::time::Duration> {
         if !self.autosave.touched {
             return None;
@@ -3367,56 +1563,8 @@ impl App {
         Some(deadline.saturating_duration_since(web_time::Instant::now()))
     }
 
-    /// How long the loop may sleep before one of the app's timers next needs a
-    /// **frame**, or `None` when none of them do and it may sleep until
-    /// something happens.
-    ///
-    /// [`autosave_delay`](Self::autosave_delay)'s counterpart, and split out
-    /// for the same reason: this is the whole decision, reachable from a test.
-    /// Unlike the autosave, none of this can be spent off a bare iteration —
-    /// every one of these timers is checked from inside the frame.
-    ///
-    /// Four obligations, folded because they are spent the same way:
-    ///
-    /// * [`Gui::auto_poll_delay`] — when the radar archive poll or an
-    ///   overlay's refresh is next due, on the order of a minute.
-    /// * [`Gui::status_tick_delay`] — when the status bar's auto-poll chip
-    ///   next prints a different number, typically at 1 Hz, and only while
-    ///   that chip is on screen. Usually the soonest by a wide margin, and the
-    ///   difference between an app that draws once a second and one that draws
-    ///   once a minute.
-    /// * [`ChunkFeedManager::next_round_delay`] — when a live site's chunk
-    ///   feed next wants a round, every five to ten seconds. This one is not
-    ///   optional: rounds are dispatched from a frame, and they used to ride
-    ///   on the unconditional re-arm that auto-poll kept true.
-    /// * [`ChunkNotifier::next_retry_delay`] — when a notification socket's
-    ///   backoff is up, five seconds to five minutes out. Also not optional,
-    ///   and for a sharper reason: that backoff never gives up, so re-arming
-    ///   on it — which is what the frame loop did — is a permanent spinner for
-    ///   anyone who cannot reach the notifier at all.
-    ///
-    /// A zero becomes [`MIN_WAKE`] rather than a zero-length sleep. A term
-    /// reads zero only when the frame that just ran did not consume something
-    /// it was due, and re-arming at zero would spin the loop rather than retry
-    /// — the same failure an expired `WaitUntil` produces, measured at ~164,000
-    /// iterations per second (see [`wakeup_control_flow`]). The countdown term
-    /// is never zero by construction, so the sub-second precision that keeps
-    /// it honest survives this.
-    ///
-    /// This used to name a term that could sit on that floor for ever: an
-    /// overlay handler whose `create_fetch_tasks` returned nothing left
-    /// `overlay_poll_delay` at zero, because `App::fetch_overlay` returned
-    /// before `set_fetching` and no result would arrive to stamp anything. It
-    /// was fixed where this said it should be — at the handler seam, in
-    /// [`App::fetch_overlay`] — which now records the empty task list as a
-    /// failure against the layer's own ledger. No term reaches this floor
-    /// indefinitely any more.
-    ///
-    /// [`Gui::auto_poll_delay`]: rustdar_egui::Gui::auto_poll_delay
-    /// [`Gui::status_tick_delay`]: rustdar_egui::Gui::status_tick_delay
-    /// [`ChunkFeedManager::next_round_delay`]: rustdar_radar::chunk_feed::ChunkFeedManager::next_round_delay
-    /// [`ChunkNotifier::next_retry_delay`]: rustdar_radar::chunk_notify::ChunkNotifier::next_retry_delay
-    /// [`wakeup_control_flow`]: App::wakeup_control_flow
+    /// How long the loop may sleep before one of the app's timers next needs a **frame**,
+    /// or `None` when none of them do and it may sleep until something happens.
     fn auto_poll_delay(&self) -> Option<std::time::Duration> {
         [
             self.gui.auto_poll_delay(),
@@ -3430,50 +1578,25 @@ impl App {
         .map(|delay| if delay.is_zero() { MIN_WAKE } else { delay })
     }
 
-    /// Request application exit - handles both GUI and keyboard exit requests
     fn request_exit(&mut self, event_loop: Option<&ActiveEventLoop>) {
-        // Persist UI config before exiting
         if let Some(store) = self.platform.kv() {
             self.gui.save_ui_config(store.as_ref());
         }
         if !self.platform.supports_exit() {
-            // The config save above still ran, which is the part that matters.
             log::debug!("exit requested; ignored (this platform has no quit)");
             return;
         }
         if let Some(event_loop) = event_loop {
             self.exit_now(event_loop);
         } else {
-            // Defer exit until the next event where event_loop is available
             self.exit_requested = true;
         }
     }
 
-    /// Leave, now: the half of [`request_exit`](Self::request_exit) that needs
-    /// an event loop.
-    ///
-    /// Split out so the deferred replay in `window_event` can take exactly this
-    /// half and no more.
-    ///
-    /// The config save runs here as well as where the exit was requested, and
-    /// the second one is not redundant on the deferred route: `handle_redraw`
-    /// runs between the two, and its `autosave_config` *queues* a write that
-    /// the `process::exit` below discards without the writer thread ever
-    /// getting a turn. So the last change a user makes — in the very redraw
-    /// that processed the menu's Exit — would be the one lost. Writing the file
-    /// twice on the way out is much the cheaper mistake, and
-    /// [`KvStore::store_now`] is what makes this one the last word.
-    ///
-    /// `process::exit` is not redundant beside `event_loop.exit()`. On Android
-    /// the loop never unwinds, so nothing after `exit()` ever runs and the
-    /// process stays alive; that is also the platform where the menu's Exit is
-    /// the primary way out, and the menu is processed during a redraw with no
-    /// event loop to hand out. So the deferred route is exactly the one that
-    /// must not lose this.
+    /// Leave, now: the half of [`request_exit`](Self::request_exit) that needs an event
+    /// loop.
     fn exit_now(&self, event_loop: &ActiveEventLoop) {
         log::info!("Exiting application");
-        // Last, and synchronously: see the note above. Anything the writer
-        // thread still holds dies with the process a few lines down.
         if let Some(store) = self.platform.kv() {
             self.gui.save_ui_config(store.as_ref());
         }
@@ -3483,7 +1606,7 @@ impl App {
         }
     }
 
-    /// Set a callback to handle the back button (e.g. moveTaskToBack on Android).
+    /// Set a callback to handle the back button (e.g.
     pub fn set_back_handler(&mut self, handler: fn()) {
         self.platform.set_back_handler(handler);
     }
@@ -3496,55 +1619,23 @@ impl App {
     /// Override the UI config directory and load config from it.
     pub fn set_config_dir(&mut self, dir: std::path::PathBuf) {
         self.platform.set_config_dir(dir);
-        // Load config now — on Android this is called after App::new(),
-        // so the initial load in new() had no config dir yet.
+        // Load config now — on Android this is called after App::new(), so the initial load
+        // in new() had no config dir yet.
         if let Some(store) = self.platform.kv() {
-            // Same reason, and still before the first paint: this runs inside
-            // `android_main`, ahead of the event loop and so ahead of any
-            // volume. Unconditional rather than folded into the branch below —
-            // a returning user's learned positions are worth reading even on a
-            // run where the UI config itself does not come back.
             self.site_positions = crate::site_positions::SitePositions::load(Some(store.as_ref()));
-            // And the cached catalogue, for the same reason: on Android this is
-            // the first moment there is a store to read it out of, so `App::new`
-            // resolved without it and every radar the seed never had is still
-            // missing until here.
             self.site_catalogue = crate::site_catalogue::load(Some(store.as_ref()));
-            // Re-resolved, not merely re-loaded. This is the resolution that
-            // has anything to overlay on Android — `App::new` ran without a
-            // store — and it is why the table is swappable rather than a
-            // `OnceLock`: a one-shot resolve would have let the empty first
-            // attempt win and silently discarded every learned position on the
-            // one platform that needs this call.
-            //
-            // Still before the first paint: `android_main` calls this ahead of
-            // the event loop.
             let table = rustdar_radar::sites::resolve(
                 self.site_positions
                     .fixes()
                     .chain(self.site_catalogue.fixes()),
             );
-            // Both recomputed, because `App::new` answered them against a store
-            // it did not have yet. Leaving them alone left a returning Android
-            // user with `site_hint_pending` armed from a launch that could not
-            // see their saved site — so the catalogue landing mid-session ran
-            // the timezone hint and moved them off it. The mirror image of the
-            // web bug, from the same fused flag.
             self.catalogue_pending = self.site_catalogue.is_empty();
             if self.gui.load_ui_config(store.as_ref()) {
-                // A returning user on Android reaches the timezone guess before
-                // their stored site is readable, so the guess has to be undone
-                // here rather than merely not applied.
                 self.site_is_provisional = false;
                 self.site_hint_pending = false;
             } else {
-                // No stored site came back, so the hint may still place them —
-                // but only if the table it would resolve against is still
-                // empty, which is the same predicate `App::new` applies.
                 self.site_hint_pending = table.rows().is_empty();
                 if !self.site_is_provisional {
-                    // Still a first run, and `App::new` had no bridge answer to
-                    // work with. This is the first chance to place them.
                     self.site_is_provisional =
                         apply_location_hint(&mut self.gui, self.platform.as_ref());
                 }
@@ -3552,23 +1643,7 @@ impl App {
         }
     }
 
-    // The three below are forwards to trait methods that are *not* gated: the
-    // bridge declares them for every platform with a no-op default, and only
-    // Android and the web override any of them. Gating the forwards on
-    // `target_os = "android"` therefore bought nothing and cost twice: the web
-    // entry point had to reach past `App` and call the trait method on its own
-    // bridge before boxing it, and a host build — which is every build the
-    // tests run in — compiled none of this, so nothing here could be exercised
-    // anywhere. `set_theme_detector` beside them was never gated at all.
-    //
-    // `set_safe_area_insets` used to sit here too and is gone. It pushed insets
-    // straight at the UI, and no entry point has called it since Android
-    // switched to injecting a querier; the live route is `set_insets_querier`
-    // -> `query_insets` -> `refresh_safe_area_insets`.
 
-    // `set_gps_fix_receiver` and `set_location_hooks` sat here until WO-RL-4:
-    // fixes and the permission calls now flow inside the LocationFacade's own
-    // arm, which the entry point constructs and hands to `App::new`.
 
     /// Set a receiver for compass heading updates (Android only).
     pub fn set_heading_receiver(&mut self, receiver: std::sync::mpsc::Receiver<f32>) {
@@ -3585,28 +1660,13 @@ impl App {
         self.platform.set_theme_detector(detector);
     }
 
-    /// Set a callback that takes a back press delivered outside the input
-    /// queue (Android's `OnBackInvokedDispatcher`; see
-    /// [`PlatformBridge::poll_back_press`]).
+    /// Set a callback that takes a back press delivered outside the input queue (Android's
+    /// `OnBackInvokedDispatcher`; see [`PlatformBridge::poll_back_press`]).
     pub fn set_back_press_taker(&mut self, taker: fn() -> bool) {
         self.platform.set_back_press_taker(taker);
     }
 
     /// Whether egui is going to want this key press for itself.
-    ///
-    /// `egui_wants_keyboard_input` is true whenever *any* widget holds focus,
-    /// not only a text field, and that is the right question: Escape is how egui
-    /// surrenders focus, whatever kind of widget has it. Read off the context
-    /// the last frame left, which is the answer egui will give for this press
-    /// too — focus moves only inside a pass, and no pass has run since.
-    ///
-    /// `false` with no renderer yet. Nothing can be focused before the first
-    /// frame, so a press then is the app's to spend.
-    ///
-    /// Only the raw-key route asks. `about_to_wait` collects a press Android's
-    /// `OnBackInvokedDispatcher` delivered, and nothing in egui is competing for
-    /// that one — it never entered the keyboard queue, and on Android it is the
-    /// route back actually arrives by.
     fn ui_is_taking_keys(&self) -> bool {
         self.state
             .as_ref()
@@ -3614,35 +1674,14 @@ impl App {
     }
 
     fn handle_input_events(&mut self, event_loop: &ActiveEventLoop) {
-        // Both keys mean the same thing — back out of the thing I am in — so
-        // both take the same route. They used to differ only in that back gave
-        // the platform first refusal, and on Android a handler is always
-        // installed, so back never reached any of the decisions below it.
-        // Taken, not read: this runs on every keyboard press, not once a frame.
-        //
-        // Taken *before* the focus test, and deliberately: a press left latched
-        // because the UI wanted it is spent by the next key of any kind, which
-        // is the same double dismissal one keystroke later. `InputHandler` reads
-        // the raw `WindowEvent` and is never told what egui consumed, so this is
-        // the only place the two can be reconciled — without it, Escape in a
-        // text field unfocuses the field *and* closes the layer behind it.
         if self.input.take_back_out_press() && !self.ui_is_taking_keys() {
             self.back_out(event_loop);
         }
     }
 
     /// One press of Escape or the back button.
-    ///
-    /// Three callers, one body: `handle_input_events` for Escape and for
-    /// `KEYCODE_BACK` off the input queue, and `about_to_wait` for a press
-    /// Android's `OnBackInvokedDispatcher` delivered instead. Anything that
-    /// makes a route to `resolve_back_press` its own is the bug this shape
-    /// exists to prevent — the predictive-back callback used to be exactly
-    /// that, minimising on its own with no route into Rust at all.
     fn back_out(&mut self, event_loop: &ActiveEventLoop) {
         match Self::resolve_back_press(&mut self.gui, self.platform.as_ref()) {
-            // Nothing else consumed the press, so nothing else will schedule
-            // the frame that shows the layer gone.
             BackPress::Dismissed => notify_redraw(&self.window),
             BackPress::PlatformHandled => {}
             BackPress::Exit => self.request_exit(Some(event_loop)),
@@ -3650,20 +1689,6 @@ impl App {
     }
 
     /// Resolve one press of Escape or back.
-    ///
-    /// The single decision for every route in: Escape, `KEYCODE_BACK` off the
-    /// input queue, and Android's `OnBackInvokedDispatcher`. The last of those
-    /// is a Java callback that could perfectly well minimise for itself, and
-    /// deliberately does not — see `BackHandler.java`.
-    ///
-    /// The UI gets first refusal and the platform is asked only about a press
-    /// it did not want. That order is the whole fix: on Android a back handler
-    /// is always installed, so [`PlatformBridge::handle_back`] reports every
-    /// press consumed, and asking it first meant nothing after it was ever
-    /// asked at all — one press with the drawer open minimised the app.
-    ///
-    /// Takes the two collaborators rather than `&mut self` so the decision can
-    /// be exercised without an event loop or a GPU.
     fn resolve_back_press(gui: &mut Gui, platform: &dyn PlatformBridge) -> BackPress {
         if gui.dismiss_top_layer() {
             return BackPress::Dismissed;
@@ -3675,47 +1700,26 @@ impl App {
     }
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop) {
-        // The bridge gets to amend the attributes because the web backend has to
-        // bind its canvas here and nowhere else. See `PlatformBridge::window_attributes`.
+        // The bridge gets to amend the attributes because the web backend has to bind its
+        // canvas here and nowhere else.
         let attributes = self
             .platform
             .window_attributes(Window::default_attributes().with_title("Rustdar"));
         let window = event_loop.create_window(attributes).unwrap();
 
         let window = Arc::new(window);
-        // Native opens at a fixed default size. On web the canvas already has
-        // whatever size the page's layout gave it, and overriding that with a
-        // 1920x1080 backing store would both ignore the layout and, at a
-        // devicePixelRatio above 1, ask for a surface past WebGL2's texture
-        // ceiling — which is a validation error, not a clamp.
         #[cfg(not(target_arch = "wasm32"))]
         let _ = window.request_inner_size(PhysicalSize::new(RENDER_WIDTH, RENDER_HEIGHT));
         self.window = Some(window.clone());
 
-        // Every sensor thread's waker is a clone of one slot, and this is where
-        // the slot learns what a wake means. Written beside the assignment above
-        // because the two must not drift: a producer holding a waker that points
-        // at a *previous* window would be asking a destroyed surface for frames.
         let held = Some(window.clone());
         self.redraw_waker.install(move || notify_redraw(&held));
 
-        // Rendering state is initialized lazily in handle_redraw().
-        // This keeps resumed() fast on Android, preventing ANRs during
-        // configuration changes (e.g. folding/unfolding the device).
         window.request_redraw();
     }
 }
 
 /// Deduplicate overlay render requests.
-///
-/// When `should_group` is true (viewport sync + layer sync both on), groups requests
-/// by `(overlay_kind, zoom, data_generation, width, height)` and merges pane indices
-/// so one render serves multiple panes. When false, each request passes through as-is.
-///
-/// The overdraw fraction is deliberately absent from the key. It is a function of the
-/// pane's size and the one adapter limit, so two requests that already agree on width
-/// and height cannot disagree about it — keying on it would only add a field that is
-/// always equal when the rest are.
 fn deduplicate_overlay_renders(
     overlay_renders: Vec<(usize, LayerId, fetch::OverlayRenderRequest)>,
     should_group: bool,
@@ -3733,9 +1737,6 @@ fn deduplicate_overlay_renders(
         pane_indices: Vec<usize>,
     }
 
-    // The id is cloned into the key beside the group it names — a
-    // `Cow::Borrowed` clone is a pointer copy, and both halves are needed:
-    // the key to hash on and the group to hand back to the dispatch.
     let mut grouped: HashMap<(LayerId, i32, u64, u32, u32), GroupedRender> = HashMap::new();
 
     for (pane_idx, id, req) in overlay_renders {
@@ -3771,41 +1772,19 @@ impl ApplicationHandler for App {
         log::info!("App resumed");
         self.create_window(event_loop);
 
-        // Query system bar insets now that the window is ready. Not the only
-        // query — see `handle_resized`, which catches the orientation changes
-        // that never come back through here.
         self.refresh_safe_area_insets();
 
-        // A location permission can be changed in system settings while the app
-        // is in the background, and in a settled state the gate has stopped
-        // polling for it entirely — so this is the one moment a revocation made
-        // outside the app is noticed at all.
+        // A location permission can be changed in system settings while the app is in the
+        // background, and in a settled state the gate has stopped polling for it entirely —
+        // so this is the one moment a revocation made outside the app is noticed at all.
         self.location.resumed();
     }
 
     /// Pick up a back press the platform delivered outside the input queue.
-    ///
-    /// Android's predictive-back dispatcher hands the press to a Java callback
-    /// on the UI thread, which parks it and wakes this loop with
-    /// `EventLoopProxy::send_event` — the flag alone would not do, because
-    /// winit's Android backend drops a bare wake unless the loop is running
-    /// *and* a redraw or user event is already outstanding. (Which also means a
-    /// press that arrives while the app is paused waits for the resume; the
-    /// dispatcher does not deliver one there anyway.) Everywhere else
-    /// `poll_back_press` is the trait's `false` default and this costs one load
-    /// per iteration.
-    ///
-    /// Here rather than in `user_event` so the press is spent on the iteration
-    /// it arrived in even if the wake coalesced with a real event, and so the
-    /// funnel does not depend on *which* winit callback the wake surfaces as.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.platform.poll_back_press() {
             self.back_out(event_loop);
         }
-        // A due timed repaint (`request_repaint_after` — see
-        // `repaint_action`) is spent as a redraw request: this is the one
-        // callback the wake-up timer reaches, and the frame itself must go
-        // through `RedrawRequested` like every other frame.
         if self
             .egui_repaint_at
             .is_some_and(|at| web_time::Instant::now() >= at)
@@ -3813,16 +1792,6 @@ impl ApplicationHandler for App {
             self.egui_repaint_at = None;
             notify_redraw(&self.window);
         }
-        // A due auto-poll, spent the same way and deliberately *not* the way
-        // the autosave below is. `check_auto_polls` runs inside the egui pass,
-        // so this obligation can only be discharged by a real frame; there is
-        // no cheap direct call to make instead.
-        //
-        // Cleared as it is spent, so the redraw is asked for once. The frame
-        // it produces recomputes the deadline from scratch
-        // (`handle_redraw`) — which is what bounds the retry when a poll
-        // somehow cannot be consumed: the next deadline is at least
-        // `MIN_WAKE` away rather than immediately due again.
         if self
             .auto_poll_at
             .is_some_and(|at| web_time::Instant::now() >= at)
@@ -3830,47 +1799,25 @@ impl ApplicationHandler for App {
             self.auto_poll_at = None;
             notify_redraw(&self.window);
         }
-        // The save the wake-up below is scheduled for, spent here rather than on
-        // a frame. A `WaitUntil` deadline expiring dispatches `new_events` and
-        // then this — and nothing else. It never delivers `RedrawRequested`, so
-        // `handle_redraw`, the app's only other route into `autosave_config`, is
-        // unreachable from the one timer that exists to reach it.
-        //
-        // Directly rather than by asking for a redraw: the check is a
-        // subtraction until the interval is up and a serialization plus a string
-        // compare after it, against a whole frame — egui pass, texture sampling,
-        // present — to write a few hundred bytes of JSON on a timer whose entire
-        // premise is that the app is otherwise asleep.
         self.autosave_config(false);
         self.schedule_wakeup(event_loop);
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         log::info!("App suspended - clearing graphics state");
-        // Save config on suspend — on Android this is the only reliable save
-        // point before the system may kill the process.
+        // Save config on suspend — on Android this is the only reliable save point before
+        // the system may kill the process.
         if let Some(store) = self.platform.kv() {
             self.gui.save_ui_config(store.as_ref());
         }
         self.render.clear_last_rendered();
         self.texture_counter = 0;
         self.gui.clear_graphics_state(); // Keep cached_render intact so we can re-upload the texture
-        // immediately on resume without re-rendering.        // Clear both window and state so resumed() creates fresh ones.
-        // Leaving state alive would keep a wgpu surface referencing the destroyed window.
         self.window = None;
         self.state = None;
-        // The third holder of that window, and the only one this thread does
-        // not own outright: five sensor threads have a clone of the waker. A
-        // slot left filled would leave every one of them holding an
-        // `Arc<Window>` whose `ANativeWindow` is gone — surviving a suspend is
-        // the bug, not the virtue. `resumed` refills it through
-        // `create_window`; until then a wake is a no-op, which is the right
-        // answer for an app with nothing on screen.
+        // The third holder of that window, and the only one this thread does not own
+        // outright: five sensor threads have a clone of the waker.
         self.redraw_waker.detach();
-        // An init in flight targets the window just dropped. Leaving the
-        // receiver in place would let `ensure_rendering_state` collect an
-        // `AppState` holding a surface for a destroyed window and treat it as
-        // current, which is worse than starting the request over.
         #[cfg(target_arch = "wasm32")]
         {
             self.pending_state = None;
@@ -3883,12 +1830,10 @@ impl ApplicationHandler for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
-        // Update input handler — pass &WindowEvent directly (no clone needed)
         if self.input.process_event(&event) {
             self.handle_input_events(event_loop);
         }
 
-        // Let egui process the event, but only if state exists
         let mut needs_repaint = false;
         if let (Some(state), Some(window)) = (self.state.as_mut(), self.window.as_ref()) {
             needs_repaint = state.egui_renderer.handle_input(window, &event);
@@ -3900,11 +1845,6 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 self.handle_redraw();
-                // Spend a deferred exit (set during redraw, where there was no
-                // event loop to hand out) through the same door an immediate one
-                // uses — `process::exit` and the final synchronous config save
-                // included. The redraw just above may have queued a save of its
-                // own, which is exactly what `exit_now` cannot rely on.
                 if std::mem::take(&mut self.exit_requested) {
                     self.exit_now(event_loop);
                 }
@@ -3914,24 +1854,12 @@ impl ApplicationHandler for App {
                 notify_redraw(&self.window);
             }
             WindowEvent::ThemeChanged(theme) => {
-                // winit hands the new theme over, so take it rather than
-                // clearing the cache and hoping something re-detects: on the
-                // desktops the bridge's `poll_theme` never answers, so an
-                // emptied cache is one that stays empty for every off-frame
-                // reader — which is what overlay rasterization is.
                 if self.adopt_theme(matches!(theme, winit::window::Theme::Dark)) {
                     notify_redraw(&self.window);
                 }
             }
             _ => {
-                // Everything the user does to change the config — clicking,
-                // dragging, typing, panning — arrives here, so this is where the
-                // autosave learns it has something to look at. Deliberately not
-                // set for the named arms above: a redraw is the frame the
-                // autosave wake-up itself asks for, and re-arming from it would
-                // never let an idle app sleep.
                 self.autosave.touched = true;
-                // For other events, request redraw only if egui needs it
                 if needs_repaint {
                     notify_redraw(&self.window);
                 }

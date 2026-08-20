@@ -7,11 +7,6 @@
 //! (`rustdar_egui::overlay_cache::plan_overlay_texture`), so on a display at
 //! two of them per point every one of those lengths would draw at half its
 //! intended size unless it is told the density.
-//!
-//! Half-size markers are the kind of regression that reads as "the HiDPI build
-//! looks a bit thin" rather than as a bug, and nobody diffs it — so it is
-//! asserted against the bytes here, on a fixture where the *only* thing that
-//! differs between the two runs is the scale.
 
 use super::{RadarSiteInfo, SitesInput, rasterize_radar_sites};
 use rustdar_geo::GeoBounds;
@@ -39,26 +34,12 @@ fn one_site(device_scale: f32) -> SitesInput {
 }
 
 /// How many pixels the rasterizer actually painted.
-///
-/// The marker is the only thing in the fixture, so its area is what this
-/// counts — and area is what makes the assertion a *ratio* rather than a
-/// threshold somebody has to justify.
 fn painted(rgba: &[u8]) -> usize {
     rgba.chunks_exact(4).filter(|px| px[3] > 0).count()
 }
 
 /// A site marker on a 2x texture covers four times the texels, because it is
 /// the same size on screen and the screen has four times as many.
-///
-/// The texture is doubled along with the scale, exactly as
-/// `plan_overlay_texture` doubles it, so the geographic ground and the marker's
-/// on-screen size are both held fixed and density is the only free variable. A
-/// build that ignored `device_scale` would paint the same texel count into the
-/// larger texture and fail this by a factor of four.
-///
-/// The tolerance is on the ratio and not the count: anti-aliased edges are a
-/// perimeter term, so they do not scale with the area and the ratio approaches
-/// four from below.
 #[test]
 fn a_denser_texture_draws_its_markers_at_the_same_size_on_screen() {
     const W: u32 = 256;
@@ -81,11 +62,6 @@ fn a_denser_texture_draws_its_markers_at_the_same_size_on_screen() {
 
 /// One texel per point is byte-identical to what this module produced before
 /// it could be told otherwise.
-///
-/// The whole change is inert on an unscaled display, which is every desktop
-/// this workspace has measured. Asserted rather than assumed because the
-/// scaling went in at a dozen separate literals and any one of them could have
-/// picked up a stray factor that only shows at 1.0.
 #[test]
 fn an_unscaled_display_rasterizes_exactly_as_it_did_before() {
     const W: u32 = 256;

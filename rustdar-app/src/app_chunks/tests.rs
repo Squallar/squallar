@@ -1,15 +1,3 @@
-/// The chunk drain and driver must run in the pump phase
-/// `poll_data_channels` runs, which `handle_redraw` calls before
-/// `evict_unshown_scans` and before `setup_egui_frame` lays the frame out.
-///
-/// A source probe because no type system expresses it: the drain is what
-/// makes a newly assembled volume the one `dispatch_pane_renders` reads, and
-/// `evict_unshown_scans` would drop a volume stored after it ran. Since
-/// WO-E3 the drain and driver are `FRAME_PUMP` rows, so their presence and
-/// order are read off the table's source. The sibling guarantee for the
-/// pollers `setup_egui_frame` runs is pinned by
-/// `app_render::frame_build_order_tests::every_poller_runs_before_the_frame_is_laid_out`;
-/// this is the half that lives outside it.
 #[test]
 fn the_chunk_drain_runs_before_the_frame_is_laid_out() {
     let source = include_str!("../app.rs");
@@ -35,9 +23,6 @@ fn the_chunk_drain_runs_before_the_frame_is_laid_out() {
         panic!("unbalanced braces in {name}");
     };
 
-    // `poll_data_channels`' body is the `Ingest` runner, so the drain's run
-    // moment is still that call's — and the rows themselves are read off
-    // the pump table.
     let poll = body("fn poll_data_channels(");
     assert!(
         poll.contains("run_frame_pump") && poll.contains("PumpPhase::Ingest"),
@@ -78,22 +63,6 @@ fn the_chunk_drain_runs_before_the_frame_is_laid_out() {
     );
 }
 
-/// Reconnection must not be conditional on anything else being busy.
-///
-/// Three source probes, because all of it is positional and none of it has a
-/// type that could carry the requirement. `sync_sites` is the only thing that
-/// reopens a dropped socket and it only runs on a frame, so the frame has to
-/// keep coming while a reconnect is owed — and the notification driver has to
-/// sit ahead of the `enabled` gate, or turning the chunk feed off would
-/// strand the socket rather than narrowing it to the archive feed.
-///
-/// The reconnect is owed in two different ways and each needs its own route.
-/// A handshake resolves or times out within `CONNECT_TIMEOUT`, so the re-arm
-/// carries it; a backoff doubles to a five-minute ceiling and never gives up,
-/// so the *schedule* carries it. Putting the backoff back in the re-arm is
-/// what this catches, and it is not a hypothetical: that is where it was, and
-/// for anyone who cannot reach the notifier it drew at refresh rate for the
-/// whole session.
 #[test]
 fn a_down_socket_is_retried_regardless_of_other_activity() {
     let redraw = include_str!("../app.rs");

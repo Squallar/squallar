@@ -58,17 +58,10 @@ mod tests {
         assert_eq!(parse_hex_color("bad", 128), [128, 128, 128, 128]);
     }
 
-    /// The fill property is network data and can hold multi-byte text. "€€" is
-    /// six *bytes*, so it passes the length gate and reaches the channel
-    /// slices, which used to panic on the char boundary — inside the fetch
-    /// task, where the panic is swallowed and the overlay wedges in "fetching".
     #[test]
     fn a_multi_byte_fill_string_falls_back_to_grey_instead_of_panicking() {
         assert_eq!(parse_hex_color("€€", 128), [128, 128, 128, 128]);
         assert_eq!(parse_hex_color("#€€", 64), [128, 128, 128, 64]);
-        // Mixed: a valid ASCII red pair still parses; the channels landing
-        // inside the multi-byte character fall back per channel, matching the
-        // existing per-channel `unwrap_or` behaviour.
         assert_eq!(parse_hex_color("ff€€", 255), [255, 128, 128, 255]);
     }
 }

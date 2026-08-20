@@ -1,86 +1,5 @@
-//! What a pane *is*, as opposed to what it is looking at.
-//!
-//! Every pane in rustdar has been a plan-view map. A vertical cross-section and
-//! a 3D volume view are two more things a pane can be, and this module is the
-//! discriminant plus the state each one needs that a map pane does not.
-//!
-//! # Why the per-kind state is one field and everything else stays flat
-//!
-//! [`PaneState`](crate::pane::PaneState) gains exactly one field — `content` —
-//! and every field it already had stays where it was. That is not tidiness; it
-//! is the decision this whole refactor turns on.
-//!
-//! There are roughly 53 production loops over "every pane" across 44 functions,
-//! and almost all of them read `site`, `scan_info`, `viewing_live`,
-//! `map_memory` or `loop_state`. Every one of those is still meaningful for a
-//! section or a volume pane: a section is cut from a site's volume, it is
-//! either live or parked at a time, it has a viewport, and it can loop. With
-//! the fields flat, all of those call sites compile and keep working unchanged.
-//!
-//! One of them is load-bearing rather than merely convenient.
-//! `App::evict_unshown_scans` drops every decoded volume no pane is showing, and
-//! it decides that by reading `pane.site` and `pane.scan_info.site` on each pane.
-//! A section pane that had its own site tucked inside an enum variant would be
-//! invisible to that walk, so the volume it is sampling would be evicted from
-//! under it — a use-after-evict-shaped bug, in a pass whose whole job is to know
-//! what is on screen. Flat fields mean it keeps protecting a non-map pane with
-//! no edit at all.
-//!
-//! # Why the discriminant is a method and not a field
-//!
-//! Two representations were rejected:
-//!
-//! * **`kind: PaneKind` beside two `Option`s.** That makes
-//!   `kind == CrossSection && cross_section.is_none()` representable, so every
-//!   render frame needs an unwrap or a fallback for a state that should not
-//!   exist, and config loading can construct it from a file. Two fields can
-//!   disagree; one cannot disagree with itself.
-//! * **A full `enum PaneState`.** That is what would have broken
-//!   `evict_unshown_scans` and the other ~52 loops above.
-//!
-//! So the kind is *derived* from `content`
-//! ([`PaneContent::kind`]), and `content` is the only place the answer lives.
-//!
-//! # Why the fat variants are boxed
-//!
-//! `PaneState` is `std::mem::take`n once per pane per frame — six sites do it
-//! (`ui_map.rs`, `ui_shell.rs`, and four in `ui.rs`) — so its size is on the
-//! hot path. Boxing [`CrossSectionPane`] and [`VolumePane`] keeps
-//! `size_of::<PaneContent>()` at one pointer plus the tag, which keeps a map
-//! pane costing what it costs today however much state the other two kinds
-//! accumulate.
-//!
-//! # `Default` means `Map`, and it is a choice with consequences
-//!
-//! `PaneContent: Default` is the one bound this module is obliged to satisfy,
-//! because `PaneState`'s own `Default` is hand-written and has to fill every
-//! field. Nothing about the *types* then dictates which variant that default is:
-//! both non-map variants derive `Default` themselves, so a hand-written
-//! `impl Default for PaneContent` yielding a section pane compiles perfectly
-//! well. Only `derive(Default)`'s `#[default]` attribute narrows it, and that is
-//! a property of the macro rather than of anything in the data.
-//!
-//! It is `Map` because of what a default is *used for* here. Six sites
-//! `std::mem::take` a `PaneState`, and a take leaves
-//! `PaneContent::default()` sitting in `Gui::panes[idx]` for the rest of the UI
-//! pass — where the all-panes filters that key off [`PaneState::is_map`] read it.
-//! With a section pane as the default, every one of those filters would silently
-//! *exclude* whichever pane is currently being drawn: no render dispatched for
-//! it, no sibling texture offered to it, no error to say why. `Map` is the value
-//! that makes the placeholder indistinguishable from the pane it stands in for,
-//! for every consumer that has not been taught about kinds — which is all of them
-//! today and most of them afterwards.
-//!
-//! [`PaneState::is_map`]: crate::pane::PaneState::is_map
-//!
-//! **The same choice is the sharpest hazard in the feature**, in the opposite
-//! direction: during the UI pass `self.panes[idx]` genuinely reads as a map pane
-//! whatever the real pane is. Nothing may branch on kind through
-//! `self.panes[..]` or `active_pane()` while a pane is out; branch on the taken
-//! value. The compiler cannot help with this, which is why the mitigation is the
-//! `last_pane_content` probe: it records what each render arm actually drew, so a
-//! branch reading the wrong thing shows up as an arm that ran for the wrong kind
-//! rather than as a subtly wrong picture.
+//! What a pane *is*, as opposed to what it is looking at: the discriminant plus
+//! the state a cross-section or 3D pane needs that a map pane does not.
 
 use chrono::NaiveDateTime;
 use rustdar_radar::types::{RadarProduct, RenderView};
@@ -88,18 +7,8 @@ use rustdar_radar::xsect::CrossSection;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// Which of the two things a pane is.
-///
-/// A *kind* is a different **place**: a map pane looks down at a patch of
-/// ground, and a cross-section pane looks at a vertical slice along a line
-/// drawn somewhere else. How a pane *draws* the place it is looking at is a
-/// separate question, answered by [`MapRender`] — a 3D volume is the same
-/// ground as the plan view beside it, seen from a different eye, so it is a
-/// render mode of a map pane rather than a kind of its own.
-///
-/// Serialized into the UI config as the pane's `kind`, so the variant names are
-/// part of the on-disk format. `Default` is `Map`, which is what makes a config
-/// written before this existed load as a screen full of map panes.
+/// Which of the two things a pane is. How a pane *draws* that place is a
+/// separate question answered by [`MapRender`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PaneKind {
     /// A patch of ground, drawn either as the plan view or as the 3D volume
@@ -110,21 +19,11 @@ pub enum PaneKind {
     CrossSection,
 }
 
-/// How a map pane draws the ground it is looking at.
-///
-/// The two modes are the same *place* — same site, same viewport, same product,
-/// same moment — differing only in where the eye is. That is the whole reason
-/// this is a mode rather than a pane kind: switching it must feel like turning
-/// a picture over, not like losing the pane and opening another.
-///
-/// Serialized as the pane's `render` key, so the variant names are on-disk
-/// format. `Default` is `Plan`, so a config written before this key existed —
-/// or one whose `render` names a mode this build does not know — comes back as
-/// the plan view, which is what every pane was.
+/// How a map pane draws the ground it is looking at: the same *place* — site,
+/// viewport, product, moment — differing only in where the eye is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum MapRender {
-    /// One sweep, drawn flat and looked down on. What every pane has always
-    /// been.
+    /// One sweep, drawn flat and looked down on.
     #[default]
     Plan,
     /// The whole volume over the same ground, raymarched from an orbit camera,
@@ -135,21 +34,12 @@ pub enum MapRender {
 impl PaneKind {
     /// What a pane of this kind draws when it is not a map, or `None` because a
     /// map pane's view depends on its [`MapRender`] rather than on its kind.
-    ///
-    /// The kind alone stopped being able to answer when the 3D view became a
-    /// mode: `Map` denotes two different render views. So the whole mapping
-    /// lives on [`PaneContent::render_view`], which has the mode in hand, and
-    /// this exists only for the callers that hold a kind and nothing else.
-    ///
-    /// Exhaustive, matching `RadarProduct::wire_code`'s discipline: a third
-    /// pane kind fails to compile until it has been classified here.
     pub fn render_view(self) -> Option<RenderView> {
         match self {
             // Two answers, and the kind cannot choose between them.
             Self::Map => None,
             // A section interpolates between the tilts bracketing each sample by
-            // beam height. That is vertical structure, which one sweep does not
-            // have — and it is the same answer whatever else the pane is doing.
+            // beam height — vertical structure, which one sweep does not have.
             Self::CrossSection => Some(RenderView::CrossSection),
         }
     }
@@ -157,13 +47,10 @@ impl PaneKind {
 
 impl MapRender {
     /// What a render dispatched for a map pane in this mode produces.
-    ///
-    /// Exhaustive for the reason [`PaneKind::render_view`] is: a third mode
-    /// must be classified rather than defaulting into a view.
+    /// Exhaustive: a third mode must be classified rather than defaulting.
     pub fn render_view(self) -> RenderView {
         match self {
-            // One sweep, chosen by `render::find_sweep` out of the product's own
-            // moment. Everything else in the volume is irrelevant to it.
+            // One sweep, chosen by `render::find_sweep` out of the product's moment.
             Self::Plan => RenderView::PlanView,
             // A raymarch reads a grid resampled from every cut in the ladder.
             Self::Volume => RenderView::Volume,
@@ -171,31 +58,19 @@ impl MapRender {
     }
 }
 
-/// The per-kind state a pane holds, and the sole source of its
-/// [`PaneKind`](PaneKind).
-///
-/// See the module documentation for why this is one field on a pane whose other
-/// fields stay flat, why the fat variants are boxed, and why `Default` is
-/// `Map`.
+/// The per-kind state a pane holds, and the sole source of its [`PaneKind`].
 #[derive(Debug, PartialEq)]
 pub enum PaneContent {
-    /// A patch of ground. Everything a map pane needs to say *where* it is
-    /// looking is already a flat field on the pane; what is in here is how it
-    /// draws that place and the state the 3D mode needs to.
+    /// A patch of ground. Where it is looking is already a flat field on the
+    /// pane; what is in here is how it draws that place.
     Map(Box<MapPane>),
     CrossSection(Box<CrossSectionPane>),
 }
 
 impl Default for PaneContent {
-    /// A **plan-view** map, and the module doc is about why that matters far
-    /// more than a default usually does: this is the value left in
-    /// `Gui::panes[idx]` while a pane is `mem::take`n, so it is what every
-    /// all-panes filter reads about the pane currently being drawn.
-    ///
-    /// Hand-written rather than derived because `Map` now carries state, and
-    /// `#[default]` does not apply to a variant with a field. The choice it
-    /// encodes is unchanged: the placeholder has to be indistinguishable from
-    /// the most ordinary pane there is.
+    /// A **plan-view** map: this is the value left in `Gui::panes[idx]` while a
+    /// pane is `mem::take`n, so it is what every all-panes filter reads about
+    /// the pane currently being drawn. See the module doc.
     fn default() -> Self {
         Self::Map(Box::default())
     }
@@ -210,18 +85,10 @@ impl PaneContent {
         }
     }
 
-    /// What a render dispatched for this pane produces.
-    ///
-    /// The single content → view table, and the only place the mapping lives.
-    /// `rustdar_app` keys its render cache and its sibling-texture
-    /// broadcast on the *view*, not on the pane kind: a cached raster outlives
-    /// the pane that asked for it, and the thing that must not be handed to the
-    /// wrong consumer is the buffer's shape.
-    ///
-    /// It reads the *content* rather than the kind because a map pane answers
-    /// two different views depending on its [`MapRender`] — that is what a
-    /// render mode is. Both halves stay exhaustive, so a third kind or a third
-    /// mode fails to compile until it has been classified.
+    /// What a render dispatched for this pane produces — the single content →
+    /// view table. `rustdar_app` keys its render cache and sibling-texture
+    /// broadcast on the *view*, not the pane kind: a cached raster outlives the
+    /// pane that asked for it.
     pub fn render_view(&self) -> RenderView {
         match self {
             Self::Map(map) => map.render.render_view(),
@@ -238,47 +105,16 @@ impl PaneContent {
     }
 
     /// Drop every `egui::TextureHandle` this content holds, because the context
-    /// that owns them is going away.
-    ///
-    /// Called from `Gui::clear_graphics_state`, which is the only place a
-    /// pane-held handle is released when the egui context dies (`app.rs`'s
-    /// suspend path and `app_render.rs`'s surface-loss path both route through
-    /// it). A handle outliving its context is a leak that nothing reports: it is
-    /// not a panic, not a blank pane, just memory that never comes back across a
-    /// suspend/resume cycle.
-    ///
-    /// # Releasing is only half of a cycle
-    ///
-    /// **Every arm that drops a handle owes a path that puts one back**, and the
-    /// owed path is a *restore*, not a re-render. Dropping a texture with nothing
-    /// to re-upload it leaves a pane that is not blank and not broken — it is
-    /// waiting, on a piece of work nobody will ever dispatch, because the
-    /// staleness key that would trigger the dispatch is still satisfied. That
-    /// state cost the section pane one review cycle: `texture: None` with
-    /// `section: Some(..)` and a matching `rendered_for` paints "Cutting the
-    /// cross-section…" forever, with the hover readout dead behind it.
-    /// `App::restore_section_textures` is the other half, and its doc is where
-    /// the argument for re-uploading over re-cutting lives.
-    ///
-    /// The `match` is exhaustive and by value, so a fourth kind stops the build
-    /// here — the same reasoning as `PaneLayout::for_count`'s clamp, which is
-    /// that a trap someone has to *remember* at the moment they add a field is a
-    /// trap that eventually catches someone. A doc comment on the field only
-    /// fires if it is read; this fires either way.
+    /// that owns them is going away. Called from `Gui::clear_graphics_state`.
     pub fn release_textures(&mut self) {
         match self {
             // Neither mode of a map pane holds a handle here: the plan view's
-            // raster is owned by the frontend's render cache, and the 3D mode's
-            // grids live in the application-wide volume store.
+            // raster is in the frontend's render cache, the 3D mode's grids in
+            // the application-wide volume store.
             Self::Map(_) => {}
             // The section raster, and **only** the raster. The `CrossSection`
-            // behind it is plain memory rather than a GPU handle and it is what
-            // a hover reads, so it stays; `rendered_for` stays with it, because
-            // together they are what lets `App::restore_section_textures`
-            // re-upload the picture that was on the glass instead of walking a
-            // 15.6 MB volume again for a volume that may have been evicted.
-            // Clearing the key here is the tempting one-line alternative and it
-            // is the expensive, fragile one.
+            // behind it is plain memory and is what a hover reads; `rendered_for`
+            // stays with it so the restore can re-upload rather than re-cut.
             Self::CrossSection(section) => section.texture = None,
         }
     }
@@ -286,22 +122,6 @@ impl PaneContent {
 
 /// A map pane's own state: how it draws its ground, and what the 3D mode needs
 /// in order to.
-///
-/// # Why the volume state is here rather than behind the mode
-///
-/// `render: MapRender` and `volume: VolumePane` as two fields makes
-/// "`render == Plan` with a camera the user aimed" representable, and that is
-/// the point rather than an oversight. Flipping a pane back to the plan view
-/// and forward again must return the *same* 3D view — the camera, the floor
-/// toggle, the isosurface threshold — because the two modes are two ways of
-/// looking at one pane, and a mode switch that forgot half of the pane would
-/// make them feel like two panes after all. State behind the enum variant
-/// would be destroyed on every toggle.
-///
-/// The cost is that a plan-view pane carries a `VolumePane` it is not using.
-/// It is a few floats behind the `Box` the whole content already sits in, and
-/// `PaneContent` is `mem::take`n once per pane per frame — so what is on the
-/// hot path is the pointer, not this.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MapPane {
     /// Plan view or 3D volume. See [`MapRender`].
@@ -310,31 +130,9 @@ pub struct MapPane {
     pub volume: VolumePane,
 }
 
-// A point on the ground is [`rustdar_geo::GeoPoint`] — moved verbatim to the
-// geodesy floor with its `is_on_earth` validity test; the re-export that kept
-// the old pane-module spelling naming it died at WO-G4.
 use rustdar_geo::GeoPoint;
 
 /// The line a cross-section is cut along, stored **geographically**.
-///
-/// # Why not screen coordinates
-///
-/// The user draws this line by dragging across a map pane, so screen positions
-/// are what the interaction produces and storing them is the obvious thing.
-/// It is also wrong twice over. A pixel pair denotes different ground after any
-/// pan, zoom or window resize — including a wheel-zoom *during* the drag, since
-/// the draw mode suppresses panning but not zooming — so the section would
-/// silently re-cut itself somewhere else. And a pixel pair cannot be persisted:
-/// restoring it into a session with a different window size or viewport would
-/// place the line over unrelated ground with nothing to say so.
-///
-/// Geographic endpoints are converted from the pointer inside `Map::show`, on
-/// the frame the press happens, where the projector is in hand. After that the
-/// line means one thing forever.
-///
-/// The fields are private because [`Self::new`] is the only writer, and it is
-/// what makes two properties true for everything downstream: the endpoints are
-/// finite, and they are distinct.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SectionLine {
     a: GeoPoint,
@@ -343,26 +141,6 @@ pub struct SectionLine {
 
 impl SectionLine {
     /// A section line from `a` to `b`, or `None` for a line that cannot be cut.
-    ///
-    /// Two refusals, and each one closes a distinct silent failure:
-    ///
-    /// * **Endpoints that are not points on Earth** ([`GeoPoint::is_on_earth`]).
-    ///   They arrive from a projector fed a degenerate viewport, or from a
-    ///   config file. Rejecting rather than clamping is the rule throughout this
-    ///   crate for the same reason it is on `StormMotionOverride::sample`:
-    ///   `f32::clamp` and `f64::clamp` *propagate* NaN, so a clamp launders a bad
-    ///   value into a bad value that looks checked. Worse, a NaN endpoint reaches
-    ///   [`SectionTarget`], where `NaN != NaN` makes the staleness key never
-    ///   match itself — so the pane re-renders its section on every frame,
-    ///   forever, with no error anywhere. A finite-but-absurd endpoint is quieter
-    ///   still: `lat: 1e9` walks a well-defined great circle over nowhere and the
-    ///   section renders as empty coverage, which is indistinguishable from a
-    ///   line drawn past the radar's range.
-    /// * **Coincident endpoints.** A zero-length line has no bearing, so the
-    ///   great-circle walk along it is `0/0` and every column of the raster
-    ///   samples the same point. This is the arithmetic bar; the usability bar
-    ///   (a drag shorter than a couple of dozen points is a mis-click, not a
-    ///   line) belongs to the interaction that produces the drag.
     pub fn new(a: GeoPoint, b: GeoPoint) -> Option<Self> {
         if !a.is_on_earth() || !b.is_on_earth() {
             return None;
@@ -385,12 +163,6 @@ impl SectionLine {
 }
 
 /// Which volume a rendered section or voxel grid was built from.
-///
-/// The site is here for the same reason it is on
-/// [`RenderTarget`](crate::pane::RenderTarget): the geometry is projected around
-/// a site's coordinates, so the same volume time at another site is a different
-/// picture. Two sites' volume times colliding to the second is unlikely, not
-/// impossible.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VolumeStamp {
     /// NEXRAD site code the volume belongs to (e.g. "KTLX").
@@ -401,174 +173,57 @@ pub struct VolumeStamp {
 
 /// Everything a rendered cross-section depends on, so that "is what is on
 /// screen still the truth?" is one comparison.
-///
-/// The volume time is the part that makes this work without help. A section is
-/// cut from a specific volume, so a new volume for the site makes the image on
-/// screen stale by definition — and because the time is *in* the key, that is
-/// noticed by the same comparison that notices a moved endpoint. No
-/// `reset_panes_for_*` arm has to remember to invalidate section panes, which is
-/// exactly the kind of thing that gets remembered for one of the two reset paths
-/// and not the other.
-///
-/// # Why the volume time is not enough on the live feed
-///
-/// [`VolumeStamp::collected`] comes from `ScanInfo::timestamp`, which is the
-/// **first** sweep's first radial. On the archive path that is a fine key: the
-/// volume arrives whole, so a new time is the only way it ever changes. On the
-/// live chunk feed it is a *constant for five to six minutes* — the `Scan` grows
-/// sweep by sweep with `sweeps[0]` fixed, so the tilt ladder goes from one rung
-/// to fourteen without the stamp moving a millisecond. A section cut from the
-/// first chunk therefore stood for the whole volume, showing a one-rung ladder
-/// against a map pane full of echo, and only the tilt-curve refusal made it
-/// visible at all.
-///
-/// [`ladder`](Self::ladder) is the missing input: the fingerprint of the tilt
-/// ladder the cut would be made from — which sweep every rung takes, under
-/// which declared pattern (`rustdar_radar::sampler::ladder_fingerprint`,
-/// computed by the App over the merged current volume). It moves for every
-/// kind of growth a section can show:
-///
-/// * **A new elevation**, which adds a rung to the ladder.
-/// * **A SAILS repeat of an angle already in the ladder**, which does not add
-///   a rung but does change which sweep that rung is *made of* — the sampler
-///   chooses newest-first — and that rung is the lowest one, which is the part
-///   of a severe-weather section most worth being current.
-/// * **A sealed sweep replacing the base volume's copy of its cut** on the
-///   merged substrate, which is the ordinary way every rung refreshes.
-///
-/// And — as load-bearing as the moving — it *holds still* when the picture
-/// would not change. The key this replaces was a count of sweeps carrying the
-/// moment, and a split cut's Doppler half carries a short-range reflectivity
-/// copy: its seal moved the count while the surveillance preference kept every
-/// chosen rung exactly where it was, so ~6 of the 18–23 re-cuts per VCP-212
-/// volume produced byte-identical pictures. A fingerprint of the *choices*
-/// cannot be moved by a seal that changes no choice.
-///
-/// The obvious alternative — the number of distinct elevation angles the UI
-/// knows about, from `ScanInfo::product_elevations` — was tried before either
-/// and is **wrong, for a reason that only shows up on the second volume of a
-/// session**: the `ChunkScanInfo` event merges angles and never removes
-/// one, so after the first complete volume the count is a constant for the
-/// rest of the session. Verified live: it grew 1 → 2 → 3 on a cold start and
-/// then sat at 16 for every volume after. The fingerprint is computed off the
-/// same resolved volume the payload is extracted from, so the key and the
-/// payload cannot describe different things.
-///
-/// It is deliberately **not** on [`VolumeStamp`], which [`VolumeTarget`] also
-/// uses: the 3D pane keys its rebuilds on the published stamp's newest-data
-/// time, and widening the shared stamp with a per-moment ladder key would
-/// re-cut every product's section when any one moment's ladder moved.
-///
-/// `PartialEq` is derived, floats and all, and that is deliberate: this compares
-/// a stored key against a stored key, never against a re-derived value, so
-/// bitwise equality is the right test rather than an approximation of one. It is
-/// only safe because [`SectionLine::new`] refuses non-finite endpoints — with a
-/// NaN in there the key would never equal itself and the section would re-render
-/// every frame for the life of the pane.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SectionTarget {
     pub volume: VolumeStamp,
-    /// The moment the section was cut from. Not every product is samplable —
-    /// column integrals and the hybrid-scan composite have no vertical
-    /// structure to slice — so this is narrower than the pane's product picker.
+    /// The moment the section was cut from. Not every product is samplable, so
+    /// this is narrower than the pane's product picker.
     pub product: RadarProduct,
     pub line: SectionLine,
     /// The fingerprint of the tilt ladder this cut would be made from, at
-    /// dispatch. See the type's docs: this is what makes a live volume re-cut
-    /// exactly when a rung's chosen sweep or the declared pattern changes,
-    /// and not on the seals that change neither. `0` when no ladder resolves
-    /// at all — its own honest value of the key.
+    /// dispatch. See the type's docs. `0` when no ladder resolves at all.
     pub ladder: u64,
 }
 
-/// Why a section pane has no picture, when it has none.
-///
-/// Every variant is a state a user can reach without doing anything wrong, and
-/// each one has a *different* thing to say. A single "no data" would collapse
-/// them, and the collapse is the failure: the two that matter most —
-/// [`AwaitingCoveragePattern`](Self::AwaitingCoveragePattern) and
-/// [`ProductHasNoVerticalStructure`](Self::ProductHasNoVerticalStructure) — are
-/// permanent-looking blanks whose causes are entirely unlike each other and
-/// entirely unlike "the volume has not arrived".
-///
-/// `Ord` is not derived and not wanted: nothing ranks these. The pane holds at
-/// most one, written by whoever refused.
+/// Why a section pane has no picture, when it has none. Every variant is a state
+/// a user can reach without doing anything wrong, and each has a *different*
+/// thing to say. The pane holds at most one, written by whoever refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SectionUnavailable {
     /// No decoded volume for the pane's site yet — the ordinary startup and
     /// site-switch state.
     AwaitingVolume,
     /// The volume was joined **mid-flight** and its coverage pattern has not
-    /// arrived, so it carries no elevation cut table.
-    ///
-    /// This is the live chunk feed's real behaviour, not a hypothetical:
-    /// `chunks.rs` stands in `placeholder_coverage_pattern(0)` until the VCP
-    /// message lands, and `VolumeSampler::new` correctly refuses a scan like
-    /// that rather than inventing a tilt ladder out of the sweeps' own
-    /// elevation numbers. Without a name of its own it reads as a section that
-    /// silently does not work on live data.
+    /// arrived, so it carries no elevation cut table. `chunks.rs` stands in
+    /// `placeholder_coverage_pattern(0)` until the VCP message lands, and
+    /// `VolumeSampler::new` refuses a scan like that.
     AwaitingCoveragePattern,
     /// The coverage pattern **has** arrived — so there is a tilt ladder to cut
-    /// along — but no sweep has been sealed onto it yet.
-    ///
-    /// The mid-flight join one step past
-    /// [`AwaitingCoveragePattern`](Self::AwaitingCoveragePattern): the start
-    /// chunk has landed and the antenna is still flying the first tilt, with no
-    /// archive base yet to fill the ladder from. It lasts as long as one cut
-    /// takes — up to about half a minute — and it is the ordinary state for a
-    /// site the user has only just switched to on the live feed.
-    ///
-    /// It had no name, and what it fell through to was
-    /// [`ProductMissingFromVolume`](Self::ProductMissingFromVolume): *"this
-    /// volume carries no Reflectivity to cut"*. True, and about the wrong
-    /// thing. The volume carries no anything; the product is not implicated;
-    /// and changing moment — which is what that message invites — does nothing
-    /// at all. See `app_render::section_source_refusal` for why a merge can
-    /// resolve and still be empty.
+    /// along — but no sweep has been sealed onto it yet. Lasts as long as one
+    /// cut takes, up to about half a minute. See
+    /// `app_render::section_source_refusal`.
     AwaitingFirstSweep,
     /// The pane's product has no vertical structure to slice — the column
     /// integrals, the hybrid-scan composite, the derived velocity fields. See
     /// `rustdar_radar::sampler::samplable`.
     ProductHasNoVerticalStructure(RadarProduct),
-    /// The cut was dispatched and answered nothing. Rare, and deliberately
-    /// distinct from "not yet": a section that will never appear must not look
-    /// like one that is on its way.
+    /// The cut was dispatched and answered nothing. Deliberately distinct from
+    /// "not yet": a section that will never appear must not look like one that is.
     RenderFailed,
-    /// **This volume** carries nothing to cut under the pane's product: no
-    /// sweep holds the moment, or the derivation refused it — above all
-    /// storm-relative velocity with no motion vector from either the override
-    /// or the volume's own winds.
-    ///
-    /// Not the same refusal as
-    /// [`ProductHasNoVerticalStructure`](Self::ProductHasNoVerticalStructure),
-    /// which is a property of the *product* and permanent. This one is a
-    /// property of the volume and resolves when a volume carrying the moment
-    /// arrives, which is why the staleness key it is written with carries the
-    /// volume stamp.
-    ///
-    /// It exists because without it this state had no name and no message.
-    /// The dispatcher's "no payload" answer was indistinguishable from "the
-    /// render budget is full", so the pane wrote no staleness key, re-asked on
-    /// every frame, and painted "Cutting the cross-section…" for as long as
-    /// the volume stood — a permanent wait, which this codebase shipped once
-    /// before and fixed, and which the pane's own doc calls the worst state a
-    /// pane can be in.
+    /// **This volume** carries nothing to cut under the pane's product: no sweep
+    /// holds the moment, or the derivation refused it. A property of the volume,
+    /// not of the product — which is why its staleness key carries the volume
+    /// stamp — unlike [`ProductHasNoVerticalStructure`](Self::ProductHasNoVerticalStructure).
     ProductMissingFromVolume(RadarProduct),
 }
 
 impl SectionUnavailable {
-    /// One line, addressed to whoever is looking at the empty pane.
-    ///
-    /// Says what is missing and, where the user can do something, what. The
-    /// mid-flight case is the one that most needs saying out loud — it is not
-    /// an error, it resolves on its own, and it is invisible from anywhere else
-    /// in the UI.
+    /// One line, addressed to whoever is looking at the empty pane. Says what is
+    /// missing and, where the user can do something, what.
     pub fn message(self) -> String {
         match self {
             // The cold-start window: a site switch fires the archive fetch
-            // immediately, so the first volume is already on its way — and
-            // once any volume has landed, a section cuts instantly from the
-            // merged current volume and this state is never seen again.
+            // immediately, and once any volume lands this is never seen again.
             Self::AwaitingVolume => {
                 "Downloading this site's first volume - the section appears the moment it lands"
                     .to_owned()
@@ -578,12 +233,8 @@ impl SectionUnavailable {
                  so there is no tilt ladder to cut along. It will appear on the next volume."
                     .to_owned()
             }
-            // One sentence, and deliberately: this is the state a user meets
-            // seconds after switching to a live site, and it is nothing going
-            // wrong. Naming what is being waited on (a tilt) and roughly how
-            // long (under a minute) is everything a reader can act on; the
-            // sibling above needs two sentences because a missing VCP message
-            // is a genuinely odd thing to have to explain.
+            // One sentence, deliberately: this is the state a user meets seconds
+            // after switching to a live site, and it is nothing going wrong.
             Self::AwaitingFirstSweep => {
                 "This volume has only just started - the section appears with its first \
                  completed tilt, within about half a minute."
@@ -606,77 +257,35 @@ impl SectionUnavailable {
 }
 
 /// A pane showing a vertical cross-section.
-///
-/// The first three fields are the ones whose *shape* is load-bearing — see
-/// [`SectionLine`] for why the endpoints are geographic and [`SectionTarget`]
-/// for why the staleness key carries the volume time. The last three are what
-/// the render path produces, and `texture` is released in
-/// [`PaneContent::release_textures`] — the only place a pane-held
-/// `egui::TextureHandle` is dropped when the egui context dies.
-///
-/// # Why `Debug` is hand-written
-///
-/// `egui::TextureHandle` has no `Debug`, and `CrossSection` has one that would
-/// print megabytes. Both are summarised instead, which is also what makes this
-/// type printable in an assertion message at all.
 #[derive(Clone, Default, PartialEq)]
 pub struct CrossSectionPane {
-    /// The line to cut along, or `None` until the user has drawn one. A section
-    /// pane with no line is an ordinary, expected state: it is what a pane looks
-    /// like between being converted and being aimed.
+    /// The line to cut along, or `None` until the user has drawn one — the
+    /// ordinary state between being converted and being aimed.
     pub line: Option<SectionLine>,
     /// Which map pane the line was drawn on, or `None` for a section that has
-    /// never been aimed.
-    ///
-    /// Persisted, and validated against the pane count on load: an index past the
-    /// end of the layout is how a config saved from a wider split comes back on a
-    /// narrower one, and a stale index would name a pane that is now something
-    /// else entirely.
-    ///
-    /// Nothing sets it yet. It is here because it is the retarget rule's input —
-    /// a second line drawn on the same map should re-aim the section already
-    /// sourced from it rather than convert another pane — and a section restored
-    /// from a config without it would be retargeted as though it had come from
-    /// nowhere.
+    /// never been aimed. Persisted, and validated against the pane count on
+    /// load: an index past the end of the layout is how a config saved from a
+    /// wider split comes back. Nothing sets it yet; it is the retarget rule's
+    /// input.
     pub source_pane: Option<usize>,
     /// What the section currently on screen was rendered for, or `None` before
     /// the first render. Compared against the current volume and line to decide
     /// whether to render again.
     pub rendered_for: Option<SectionTarget>,
     /// The cut itself: the picture, the values a hover reads, and the status
-    /// plane that says *why* a pixel is blank.
-    ///
-    /// `Arc` because the three planes are ~18 MB natively and this is read from
-    /// a hover on every frame the pointer is over the pane; a clone per frame
-    /// would be the most expensive thing in the UI pass.
-    ///
-    /// Kept when the texture is released, and `App::restore_section_textures`
-    /// is what makes the keeping worth anything: a suspend/resume re-uploads
-    /// this rather than re-cutting, because the volume behind the cut may have
-    /// been evicted by then, which would make the re-cut impossible rather than
-    /// merely slow.
+    /// plane that says *why* a pixel is blank. `Arc` because the three planes
+    /// are ~18 MB natively and a hover reads this every frame. Kept when the
+    /// texture is released, so the restore can re-upload rather than re-cut.
     pub section: Option<Arc<CrossSection>>,
     /// The section's raster, uploaded. Dropped by
     /// [`PaneContent::release_textures`] and put back by
-    /// `App::restore_section_textures` from
-    /// [`section`](Self::section) — the two are a pair, and a release with no
-    /// restore is a pane that waits forever.
+    /// `App::restore_section_textures` from [`section`](Self::section).
     pub texture: Option<egui::TextureHandle>,
     /// Why there is no section, when there is none *and* a line has been drawn.
-    ///
-    /// `None` with no [`line`](Self::line) is the ordinary "not aimed yet"
-    /// state, which is not a failure and has its own message. `None` with a
-    /// line and no [`section`](Self::section) means a cut is in flight.
     pub unavailable: Option<SectionUnavailable>,
-    /// Whether the caption's ⓘ detail — the long-form account of what the
-    /// picture is and is not — is expanded.
-    ///
-    /// View state, not a claim about the data, so it is deliberately **not**
-    /// persisted and **not** part of any staleness key: toggling it must never
-    /// cost a re-cut. It lives on the pane rather than in egui memory so the
-    /// renderer reads and writes it through the same struct everything else
-    /// about the pane goes through — and so a test can drive it without
-    /// reaching into a private id-keyed store.
+    /// Whether the caption's ⓘ detail is expanded. View state, so deliberately
+    /// **not** persisted and **not** part of any staleness key: toggling it must
+    /// never cost a re-cut.
     pub detail_open: bool,
 }
 
@@ -696,32 +305,8 @@ impl std::fmt::Debug for CrossSectionPane {
     }
 }
 
-/// Everything a built voxel grid depends on.
-///
-/// The same argument as [`SectionTarget`]: which volume, which moment, and over
-/// what ground. The region is in here for exactly the reason the line is in
-/// `SectionTarget`. It is an input to the resample, so a grid built for one box
-/// is the wrong picture for another, and putting it in the key means the same
-/// comparison that notices a new volume notices a re-framed box. Left out,
-/// `rendered_for` would still match after the pane was zoomed, no rebuild would
-/// be asked for, and the store's `lookup` would hand back the old box's grid — a
-/// picture that is wrong and looks right.
-///
-/// The camera is deliberately *not* in here — orbiting, panning and exaggerating
-/// all re-draw from the grid already in hand and must not rebuild it. That is the
-/// line between the two halves of this feature: the region changes what is
-/// *sampled*, the camera only how it is *drawn*.
-///
-/// `None` for the region means the pane's default box about its site, and it is
-/// a distinct key from any picked region — which is right, because it denotes a
-/// different box and follows the site rather than the ground.
-///
-/// `PartialEq` is derived, `f64`s and all, on the same reasoning `SectionTarget`
-/// gives: this compares a stored key against a stored key, and it is only safe
-/// because [`VolumeRegion::new`] refuses a non-finite centre and clamps the
-/// extent to a finite range. With a NaN in there the key would never equal
-/// itself and the pane would rebuild an 8 MiB grid every frame forever, with a
-/// hot CPU as its only symptom.
+/// Everything a built voxel grid depends on — the same argument as
+/// [`SectionTarget`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct VolumeTarget {
     pub volume: VolumeStamp,
@@ -731,69 +316,6 @@ pub struct VolumeTarget {
 }
 
 /// The patch of ground a 3D pane resamples, stored **geographically**.
-///
-/// # It is stored, and a gesture may not move it
-///
-/// A `Some` region is a **choice** — the ground the user picked out — and it
-/// stands until they pick another one. The alternative is `None`, which is not
-/// a smaller or a default box but a different *rule*: the volume's own data
-/// reach, circumscribed, resolved by the resampler because only the resampler
-/// holds a volume. Either way the box is a fact about the data or about a
-/// decision, never about the frame it is being drawn on.
-///
-/// This was **derived**, every frame, from the ground the pane's own viewport
-/// was showing, and that is the defect the stored form exists to remove. It
-/// made zoom, pan, divider drags and window resizes all rewrite the box, so a
-/// user zooming in lost the weather around what they were zooming into:
-///
-/// > the goddamn 3d viewer still covers less and less 3d geometry
-///
-/// > The 3d viewer's region should CAP at either the size of the data in the
-/// > radar scan, or the region selected if the user did that.
-///
-/// The derivation's own justification was real and is answered rather than
-/// dropped. It existed because the box and the floor under it used to be sized
-/// by two independent things, so a floor smaller than the box left the volume
-/// standing on transparency. That is now held the other way round — the floor
-/// strip is framed on *this*, so it covers the box by construction — which is
-/// the same property with the causality the user asked for.
-///
-/// Stored geographically rather than as a pixel rect, for the reason
-/// [`SectionLine`] gives — the affine that produced it is gone by the time the
-/// resampler runs, and a grid built for one box must be recognisably the wrong
-/// key for another.
-///
-/// # Why the footprint is a rectangle rather than a square
-///
-/// Because a region the user drew is whatever shape they drew, and nothing
-/// downstream ever needed a square: `build_voxels` takes a
-/// [`HalfExtentKm`] with an axis each, the grid's wire format writes its `x`
-/// and `y` ranges separately, and the renderer divides per axis throughout.
-///
-/// The cost is that the cells are rectangular — a fixed count per axis over
-/// unequal ground, so a 16:9 region's east–west cell is 1.78× its north–south
-/// one. That is a measured figure and its consequences are measured too; see
-/// [`Self::resolution_km`] and [`rustdar_radar::voxel::VoxelShape`]'s
-/// anisotropy note. A `None` region is square by construction, because a ring
-/// is.
-///
-/// [`HalfExtentKm`]: rustdar_radar::voxel::HalfExtentKm
-///
-/// # The extent is a resolution control, not just a crop
-///
-/// The grid has a fixed cell count, so a tighter region buys detail rather than
-/// saving memory: at 256 cells across, an 80 km half-extent is 0.625 km per
-/// cell and a 20 km half-extent is 0.156. That is what picking a region is
-/// *for*, so [`Self::resolution_km`] exists to be *shown* rather than inferred.
-///
-/// Fields are private because [`Self::new`] is the only writer, and it is what
-/// makes two things true downstream: the centre is a point on Earth, and the
-/// extent is inside the range `build_voxels` will honour. The second matters
-/// more than it looks — `build_voxels` *clamps* the extent rather than refusing
-/// it, so a region carrying 5 km would resample 10 km and the pane's own
-/// resolution readout would be a lie about the picture beside it.
-///
-/// [`VoxelRequest`]: rustdar_radar::voxel::VoxelRequest
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VolumeRegion {
     centre: GeoPoint,
@@ -802,71 +324,12 @@ pub struct VolumeRegion {
 
 /// The half-width a pane falls back to when nothing has sized its box yet,
 /// kilometres.
-///
-/// **Not the box a drawn pane ends up with.** That box is either a region the
-/// user picked or — for the `None` that a pane opens in — the volume's own
-/// reach, which `build_voxels` answers through
-/// [`rustdar_radar::voxel::box_half_width_km`]: **460.1 km** of half-width for a
-/// WSR-88D's reflectivity and 300 for its Doppler moments, the reach itself
-/// rather than a square inscribed in it, because the box circumscribes the ring.
-/// Only the resampler, which has the volume, can say which; this crate never
-/// sees one.
-///
-/// This is what stands in until one of those two has spoken, which is the
-/// window between a pane entering the 3D mode and its first grid landing.
-///
-/// [`rustdar_radar::voxel::BASE_HALF_WIDTH_KM`] read back rather than a copy
-/// of 230, and it is the resampler's own fallback for exactly the same
-/// situation: nothing known about the reach yet. The two answering differently
-/// would be a pane whose camera arithmetic is scaled against a box the
-/// resampler is not building, which shows up as a pan that drifts against the
-/// picture.
-///
-/// It still clears `types::BASE_EXTENT_KM`, so a pane in this state crops
-/// nothing a plan view at the raster's floor would have drawn. It is only ever
-/// **narrower** than the box that replaces it — 230 km of half-width against
-/// the 460.1 the reach earns — so what it can be wrong about is a camera posed
-/// a little too close for one or two frames, never a picture registered to
-/// ground the pane is not over. There is no picture to be wrong about while it
-/// is in force at all: such a pane is painting its empty state. So this is the
-/// width the *camera* is posed against for the frames before the first build
-/// lands, and nothing
-/// else.
 pub const BASE_HALF_WIDTH_KM: f64 = rustdar_radar::voxel::BASE_HALF_WIDTH_KM;
 
 impl VolumeRegion {
     /// A region centred on `centre` reaching `half` either side on each axis,
     /// or `None` if the centre is not a point on Earth or the extent is not
     /// finite.
-    ///
-    /// The extent is **clamped** where the centre is **refused**, and the
-    /// asymmetry is the same one [`OrbitCamera::restore`] draws. A centre that is
-    /// NaN or off-Earth means the projector was fed a degenerate viewport or a
-    /// config file was hand-edited: there is no nearest sensible answer, and
-    /// clamping would launder it, because `f64::clamp` propagates NaN. An
-    /// extent past the end of its range is a zoom control that has been wound
-    /// to its stop, and stopping is what a control should do.
-    ///
-    /// # Why the clamp is [`HalfExtentKm::clamped`] and not a `clamp` here
-    ///
-    /// It was `half_width_km.clamp(MIN_HALF_WIDTH_KM, MAX_HALF_WIDTH_KM)` — a
-    /// **third** spelling of a bound the resampler and the renderer already
-    /// share one definition of, and the only one of the three that clamps the
-    /// axes *independently*.
-    ///
-    /// That difference is not cosmetic once a region has two axes.
-    /// [`HalfExtentKm::clamped`] holds the corner inside
-    /// [`MAX_HALF_DIAGONAL_KM`] by scaling **both** axes by one factor, which
-    /// keeps the box the shape the pane is framing; per-axis clamping keeps the
-    /// corner inside the same bound (`MAX_HALF_WIDTH_KM · √2` *is*
-    /// `MAX_HALF_DIAGONAL_KM`, so it cannot do otherwise) but changes the
-    /// **aspect ratio** to do it — a 450 × 200 km ask comes back 332 × 200,
-    /// 1.66:1 where the viewport is 2.25:1. A stopped zoom is a control at its
-    /// stop; a silently reshaped box is a picture of ground the pane is not
-    /// showing.
-    ///
-    /// [`HalfExtentKm::clamped`]: rustdar_radar::voxel::HalfExtentKm::clamped
-    /// [`MAX_HALF_DIAGONAL_KM`]: rustdar_radar::voxel::MAX_HALF_DIAGONAL_KM
     pub fn new(centre: GeoPoint, half: rustdar_radar::voxel::HalfExtentKm) -> Option<Self> {
         if !centre.is_on_earth() || !half.is_finite() {
             return None;
@@ -882,14 +345,9 @@ impl VolumeRegion {
         self.centre
     }
 
-    /// Half the box's extent on each horizontal axis, kilometres.
-    ///
-    /// Handed on whole rather than as two `f64`s wherever it crosses a call
-    /// boundary, for the reason [`HalfExtentKm`] exists: two adjacent,
-    /// same-typed numbers naming different axes transpose without a compiler or
-    /// a square fixture noticing.
-    ///
-    /// [`HalfExtentKm`]: rustdar_radar::voxel::HalfExtentKm
+    /// Half the box's extent on each horizontal axis, kilometres. Handed on
+    /// whole rather than as two `f64`s: two adjacent, same-typed numbers naming
+    /// different axes transpose unnoticed.
     pub fn half_extent_km(self) -> rustdar_radar::voxel::HalfExtentKm {
         self.half
     }
@@ -905,18 +363,7 @@ impl VolumeRegion {
     }
 
     /// Kilometres per cell east–west and north–south, for `cells` cells along
-    /// each axis.
-    ///
-    /// The numbers the pane shows, and the reason a tight region is worth
-    /// picking. Answers `None` for a zero cell count rather than dividing by it.
-    ///
-    /// Two numbers because the grid's cell count is the same on both axes while
-    /// the box's extent is not: a 16:9 box spends the same 256 cells over 1.78×
-    /// as much ground east–west as north–south, and one figure would have to
-    /// pick an axis to be honest about. What that anisotropy costs the picture
-    /// is measured on [`rustdar_radar::voxel::VoxelShape`] — under 1.1% of the
-    /// ≥20 dBZ volume across four storm volumes, which is why there is no cap
-    /// on the box's aspect.
+    /// each axis. `None` for a zero cell count rather than dividing by it.
     pub fn resolution_km(self, cells: usize) -> Option<(f64, f64)> {
         Some((
             resolution_km(self.half.east_km, cells)?,
@@ -926,13 +373,6 @@ impl VolumeRegion {
 }
 
 /// Kilometres per cell across a box of `half_width_km`, `cells` cells wide.
-///
-/// A free function beside [`VolumeRegion::resolution_km`] rather than only the
-/// method, because the caption now prints this for boxes that are **not** a
-/// picked region — a pane with no region gets the width the volume's reach
-/// earns, and there is no `VolumeRegion` anywhere in that path to ask. One
-/// definition, two entry points; a caption dividing by its own copy is how the
-/// printed km-per-cell and the resampled one drift apart.
 pub fn resolution_km(half_width_km: f64, cells: usize) -> Option<f64> {
     (cells > 0).then(|| 2.0 * half_width_km / cells as f64)
 }
@@ -943,99 +383,25 @@ pub struct VolumePane {
     /// Where the eye is. See [`OrbitCamera`].
     pub camera: OrbitCamera,
     /// The ground this pane resamples — a **stored choice**, not a readback.
-    ///
-    /// `None` is the ordinary case and the one a pane opens in: it means "the
-    /// volume's own data reach, circumscribed", which is a fact about the scan
-    /// rather than about the pane, and only the resampler can resolve it
-    /// ([`rustdar_radar::voxel::box_half_width_km`] over
-    /// [`rustdar_radar::voxel::volume_reach_km`]). `Some` is a region the user
-    /// picked, which is smaller and follows the ground rather than the site.
-    ///
-    /// **It changes when the site, the product, the reach or the selection
-    /// changes, and at no other time.** Not on a zoom, not on a pan, not on a
-    /// divider drag, not on a window resize. That list is the whole of the
-    /// user's ask, and every entry not on it was a way the box used to move on
-    /// its own:
-    ///
-    /// > That region (the selector OR the radar's ring) must never change.
-    /// > Zooming should keep the rest of the region around and merely zoom into
-    /// > what's already there.
-    ///
-    /// It was derived from the pane's viewport, every frame, which is what put
-    /// zoom, pan, divider drags and window resizes all on that list at once.
-    /// The render arm has no business writing it now and does not: it reads it
-    /// to pose the camera and to key the build, and the loop planner — which
-    /// runs outside the egui pass and has to name the same ground for every
-    /// frame of a 3D loop — reads the same field for the same reason.
-    ///
-    /// Persisted, because it is a choice rather than a measurement. A
-    /// carefully aimed region that came back as the whole ring on the next
-    /// launch would be the pane silently un-aiming itself, which is the same
-    /// defect as a zoom doing it, one restart slower.
-    ///
-    /// [`BASE_HALF_WIDTH_KM`] stands in for the camera's own arithmetic on the
-    /// frames before a `None` pane's first grid lands and there is nothing yet
-    /// to read a width off.
     pub region: Option<VolumeRegion>,
-    /// Which map pane the region was dragged out on, or `None` for a pane
-    /// nobody aimed — one that opened on the whole ring, was reset, or came
-    /// back from a config whose index the layout no longer has.
-    ///
-    /// **Deliberately not inside [`VolumeRegion`]**, which is a
-    /// [`VolumeTarget`] field and therefore a resample cache key: a region
-    /// re-dragged from a different map is the same ground and must not rebuild
-    /// an 8 MiB grid to say so. This is a fact about *where the choice came
-    /// from*, not about the box, and the two have different lifetimes — the
-    /// index goes stale when the layout shrinks and the box does not.
-    ///
-    /// It earns its place twice. The pick's target rule re-aims the 3D pane a
-    /// map already feeds rather than opening a second one, which is what stops
-    /// a user adjusting a box from filling the screen with panes; and the
-    /// committed box is drawn back on that map, which is the honest answer to
-    /// "where is that volume from". Both are exactly what
-    /// [`CrossSectionPane::source_pane`] does for a section line, and this is
-    /// the same field for the same two reasons.
-    ///
-    /// Persisted beside the region, and validated against the restored pane
-    /// count the same way a section's is: a dangling index is dropped to `None`
-    /// rather than kept, because a stale index would aim a future drag at
-    /// whatever pane happened to inherit the slot.
+    /// Which map pane the region was dragged out on, or `None` for a pane nobody
+    /// aimed.
     pub source_pane: Option<crate::pane::PaneId>,
     /// Which volume the grid on screen was built from, or `None` before the
     /// first build.
     pub rendered_for: Option<VolumeTarget>,
     /// Whether this pane has turned the map floor **off**.
-    ///
-    /// Stored inverted so the derived `Default` — `false` — is the floor
-    /// showing, which is the shipped default: the floor is the ground the 2D
-    /// map gives the volume, and a pane that opens without it is a box
-    /// hanging in the void. The inversion is contained here; everything
-    /// downstream reads [`crate::volume_view::VolumeFrameState::floor`],
-    /// which is the positive form.
     pub hide_floor: bool,
-    /// Whether this pane's Volume Alpha editor window is open.
-    ///
-    /// Session state, not persisted: the *curves* the editor draws are the
-    /// durable thing (per product, in the UI config); an open tool window is
-    /// a posture, and restoring it over a pane whose volume has not built yet
-    /// would be a window full of "waiting" on every launch. Default `false`
-    /// keeps the derived `Default` honest.
+    /// Whether this pane's Volume Alpha editor window is open. Session state,
+    /// not persisted: the *curves* are the durable thing (per product, in the UI
+    /// config); an open tool window is a posture.
     pub alpha_editor_open: bool,
     /// How this pane draws its volume: the lit accumulation or an isosurface.
-    ///
-    /// Persisted (a pane set to isosurface should come back one), unlike the
-    /// camera-adjacent session state around it, because it changes *what kind
-    /// of picture* the pane is, not merely how the current one is posed. The
-    /// per-product thresholds live on `Gui`, beside the alpha curves and for
-    /// the same reason: a threshold drawn for one product must never apply to
-    /// another.
     pub view_mode: VolumeViewMode,
 }
 
-/// How a 3D pane draws its volume.
-///
-/// `Default` is the lit volume — today's render, and what every config from
-/// before this enum existed loads as through `#[serde(default)]`.
+/// How a 3D pane draws its volume. `Default` is the lit volume — what every
+/// config from before this enum existed loads as through `#[serde(default)]`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VolumeViewMode {
     /// The alpha-accumulating raymarch: translucent cloud, shaped by the
@@ -1049,49 +415,7 @@ pub enum VolumeViewMode {
 }
 
 /// The box's full extent in kilometres along each axis for a pane showing
-/// `region` — **what the pane itself can work out**, which is the whole answer
-/// for a measured viewport and a stand-in otherwise.
-///
-/// # Why this is derived rather than read off the grid
-///
-/// The grid is the truth and the painter reads it there. But the pane needs the
-/// box's proportions *before* the painter runs, on the frame a camera drag is
-/// folded in — the pan scale is a fraction of the box — and the grid lives
-/// behind the painter in another crate. Reading last frame's box would put the
-/// pan one frame behind the pointer, which is the exact defect
-/// `VolumePainter::paint`'s ordering exists to avoid.
-///
-/// For a `Some` region the two agree by construction rather than by luck:
-/// `build_voxels` spans `2 · east_km` and `2 · north_km` horizontally and
-/// `base..top` vertically, from the same clamped extent [`VolumeRegion::new`]
-/// holds and the same two constants used here. If they ever disagreed the
-/// symptom would be a pan that drifts against the picture, which is why they
-/// read one definition each.
-///
-/// **Both horizontal lanes come from the region, and the second one is the
-/// point.** This squared the region's single half-width into `x` and `y` for as
-/// long as a region had only one number to give. A camera posed against a
-/// square box while the grid is rectangular pans at the wrong speed on one axis
-/// and puts the pivot somewhere the user did not aim — on every frame before
-/// the first grid arrives, and on every frame the painter answers `None`, which
-/// is exactly the window this function exists to cover.
-///
-/// # The one case this cannot answer alone
-///
-/// `None` — the region a pane opens with, and the ordinary one. It means the
-/// volume's own reach, which `build_voxels` resolves through
-/// [`rustdar_radar::voxel::box_half_width_km`] and which is a fact about the
-/// *data* — 460.1 km of half-width for a WSR-88D's reflectivity, 300 for its
-/// Doppler moments — while no type in this crate holds a volume. So
-/// [`BASE_HALF_WIDTH_KM`] stands in here, and a caller that has a grid prefers
-/// `VolumePainter::box_size_km` over this, which is what the render arm does on
-/// every frame after the first build. There is no picture to be wrong about in
-/// the meantime: such a pane is painting its empty state.
-///
-/// A free function over an `Option<VolumeRegion>` rather than a method on
-/// either type, because the answer for `None` is not a property of any region —
-/// it is the stand-in above — and a method on [`VolumePane`] would put the
-/// same two-branch arithmetic behind a borrow the pan already has to release.
+/// `region` — **what the pane itself can work out**.
 pub fn box_size_km(region: Option<VolumeRegion>) -> [f32; 3] {
     let half = region.map_or(
         rustdar_radar::voxel::HalfExtentKm::square(BASE_HALF_WIDTH_KM),
@@ -1105,17 +429,10 @@ pub fn box_size_km(region: Option<VolumeRegion>) -> [f32; 3] {
     ]
 }
 
-/// A movement of the orbit camera: two angles and a zoom factor.
-///
-/// A struct rather than three `f32` parameters for the same reason
-/// [`BroadcastSweep`](crate::pane::BroadcastSweep) is one: `yaw_deg` and
-/// `pitch_deg` are the same type, adjacent, and both plausible in either
-/// position, so a swap would compile and merely feel wrong to use.
-///
-/// `Default` is "the camera did not move", which is why it is hand-written:
-/// `zoom_factor` is multiplicative, as every zoom input in this codebase is
-/// (egui's `zoom_delta`, walkers' pinch), so its neutral value is 1.0 and a
-/// derived `Default` would collapse the camera onto the volume instead.
+/// A movement of the orbit camera: two angles and a zoom factor. A struct rather
+/// than three `f32` parameters because `yaw_deg` and `pitch_deg` are the same
+/// type, adjacent, and plausible in either position. `Default` is "the camera
+/// did not move", hand-written because `zoom_factor` is multiplicative.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OrbitDelta {
     /// Rotation about the vertical axis, degrees. Positive is counter-clockwise
@@ -1126,36 +443,12 @@ pub struct OrbitDelta {
     pub pitch_deg: f32,
     /// Multiplicative dolly: a factor above 1 brings the eye *in*, dividing
     /// [`OrbitCamera::eye_distance`] by it.
-    ///
-    /// **This is where a 3D pane's scroll and pinch land**, through
-    /// `ui_region::zoom_camera`, which answers `2^levels` so that one Web
-    /// Mercator zoom level is one halving of the standoff. For a while nothing
-    /// produced one at all: the gesture aimed the *geography* instead and the
-    /// eye followed the box for free, which is exactly the arrangement that made
-    /// zooming shrink the ground the pane resampled. The box no longer moves, so
-    /// the eye has to.
-    ///
-    /// The standoff can also be set absolutely, through
-    /// [`OrbitCamera::set_eye_distance`] and the pane's own control; the two
-    /// share [`MIN_EYE_DISTANCE`]`..=`[`MAX_EYE_DISTANCE`] and neither may
-    /// exceed it.
-    ///
-    /// It stays a ratio because that is what a *delta* means, and because the
-    /// refusal and the clamp it carries into [`OrbitCamera::nudge`] are the
-    /// camera's invariants rather than the gesture's: a non-finite or
-    /// non-positive factor must refuse the whole delta rather than launder a NaN
-    /// into a camera whose staleness key never equals itself.
     pub zoom_factor: f32,
     /// Where to move the pivot, as a fraction of the box's half-extent on each
-    /// axis. See [`OrbitCamera::pivot`].
-    ///
-    /// **Already resolved into world axes by the caller**, not a screen-space
-    /// pair to be rotated here. The rotation needs the camera basis *and* the
-    /// box's proportions *and* the viewport height, and only
-    /// [`crate::volume_view::pan_for_drag`] has all three — so it does the whole
-    /// conversion and this carries the answer. The alternative, a screen delta
-    /// resolved here, would put a second copy of the camera basis in this module
-    /// for the two to drift apart.
+    /// axis. See [`OrbitCamera::pivot`]. **Already resolved into world axes by
+    /// the caller** — the rotation needs the camera basis, the box's proportions
+    /// and the viewport height, and only
+    /// [`crate::volume_view::pan_for_drag`] has all three.
     pub pan: [f32; 3],
 }
 
@@ -1175,96 +468,33 @@ impl Default for OrbitDelta {
 /// arbitrarily as the last representable digit of yaw changes.
 const MAX_PITCH_DEG: f32 = 89.0;
 /// Eye distance is in multiples of the volume box's *framing radius* — half the
-/// diagonal of the square its north–south extent stands on, which is
-/// `volume_view::framing_radius_km` and carries the argument for why that axis
-/// and no other. So the camera never has to know the grid's dimensions and the
-/// same limits hold for every grid-spec rung. 1.0 is the eye on the ground
-/// corner of a square box.
-///
-/// # The minimum admits the inside of the box
-///
-/// 0.05 is well inside the corner sphere: at the default whole-scan box it puts
-/// the eye a few kilometres from the pivot, which is inside-the-storm close —
-/// the zoom GR2Analyst allows and the one a 1.05 floor was refusing. Inside is
-/// a supported camera, not an accident: the raymarch clamps its slab entry to
-/// zero (`max(near.z, 0.0)` in `slab_entry_exit`), so a ray from inside the box
-/// marches forward from the eye rather than from behind it, and
-/// `rustdar-gpu`'s silhouette harness renders from an inside eye to prove
-/// the GPU agrees.
-///
-/// Not zero, and not merely to avoid a strange picture: at exactly 0 the eye
-/// sits *on* the pivot, the orbit offset is the zero vector, and
-/// `volume_view::build_view` finds no forward direction and refuses the frame —
-/// a pane that goes blank at the end of the zoom's travel. 0.05 keeps the
-/// direction defined with two orders of magnitude to spare.
+/// diagonal of the square its north–south extent stands on
+/// (`volume_view::framing_radius_km`). 1.0 is the eye on the ground corner of a
+/// square box.
 pub const MIN_EYE_DISTANCE: f32 = 0.05;
 pub const MAX_EYE_DISTANCE: f32 = 8.0;
 
 /// How far the pivot may be pushed from the box's centre, as a fraction of the
-/// box's half-extent on each axis.
-///
-/// **This is the clamp that stops the box being pushed off screen**, and 1.0 is
-/// the value that makes the guarantee exactly rather than approximately: at 1.0
-/// the pivot is on the box's own surface, so the point the camera is aimed at —
-/// which is the point that lands in the middle of the pane — is always a point
-/// of the box. Some of the box is therefore under the centre of the pane at
-/// every pan, whatever the yaw, pitch or zoom.
-///
-/// Expressed per axis rather than as a radius, because the box is a pancake —
-/// 36:1 wide open: a spherical bound of one half-extent would either let the
-/// pivot leave the box sideways or stop it well short of the top face.
+/// box's half-extent on each axis. 1.0 makes the guarantee exactly: the pivot is
+/// on the box's own surface, so the point the camera is aimed at is always a
+/// point of the box. Per axis rather than as a radius, because the box is a
+/// 36:1 pancake.
 const MAX_PIVOT_FRACTION: f32 = 1.0;
 
-/// The vertical exaggeration a 3D pane starts at.
-///
-/// A wide-open box is 651 km across for a WSR-88D's reflectivity and 18 km
-/// tall — **36:1** — and at true
-/// proportions it reads as a sheet of paper rather than as a volume with storms
-/// standing in it. That is a real property of the atmosphere and the flat view is the honest
-/// one, which is why the number is *shown* rather than hidden; but a view whose
-/// whole claim is that it shows vertical structure has to make the vertical
-/// structure visible, and 3 is where a supercell's overhang and a stratiform
-/// sheet become distinguishable at a glance.
-///
-/// 3 rather than more because it is the bottom of the 3–8 range GR2Analyst-like
-/// views are read at, and a default that starts at the bottom of a range is one
-/// the user turns *up* on purpose rather than one that has silently
-/// been making every storm look like a tower.
+/// The vertical exaggeration a 3D pane starts at. A wide-open box is 651 km
+/// across for a WSR-88D's reflectivity and 18 km tall — **36:1** — and at true
+/// proportions it reads as a sheet of paper. 3 is where a supercell's overhang
+/// and a stratiform sheet become distinguishable, and the bottom of the 3–8
+/// range GR2Analyst-like views are read at.
 pub const DEFAULT_VERTICAL_EXAGGERATION: f32 = 3.0;
 /// True proportions. The bottom of the control's travel is 1, never 0: a zero
 /// would collapse the box to a plane, which divides by zero in `box_from_world`.
 pub const MIN_VERTICAL_EXAGGERATION: f32 = 1.0;
-/// Past about 12 the box is taller than it is wide and the orbit stops behaving
-/// like an inspection of a storm — and the picture stops being a defensible
-/// rendering of anything, because a 15 km updraught drawn 180 km tall is no
-/// longer a shape a forecaster can read a height off.
+/// Past about 12 the box is taller than it is wide: a 15 km updraught drawn
+/// 180 km tall is no longer a shape a forecaster can read a height off.
 pub const MAX_VERTICAL_EXAGGERATION: f32 = 12.0;
 
 /// Where the eye is, for a 3D pane: an orbit about the centre of the volume.
-///
-/// # One writer, and it refuses rather than clamps
-///
-/// The fields are private and [`Self::nudge`] is the only way to move the
-/// camera. It rejects a non-finite [`OrbitDelta`] outright instead of clamping
-/// it into range, and the distinction is not stylistic:
-///
-/// * `f32::clamp` **propagates NaN** — `f32::NAN.clamp(0.0, 1.0)` is NaN — so a
-///   clamp on the way in would launder a bad delta into a bad camera that looks
-///   as though it had been checked. `rem_euclid`, which wraps the yaw, does the
-///   same.
-/// * A NaN camera is not merely a wrong picture. `NaN != NaN`, so the frame
-///   comparison that decides whether the view needs re-rendering fires on every
-///   single frame from then on, for the life of the pane, and the only symptom
-///   is a hot GPU. There is no error and nothing to look at.
-///
-/// A delta arrives from a pointer, a pinch or a wheel, and those can be
-/// non-finite: `zoom_delta` is a ratio, and a zero or degenerate gesture span
-/// divides by zero. So the boundary is here, and the only thing past it is
-/// arithmetic on finite numbers.
-///
-/// The matrices built from this camera live in `volume_view.rs` with the rest of
-/// the projection math; this is the state half, and it lives with the pane state
-/// because that is what is persisted and `mem::take`n.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OrbitCamera {
     /// Azimuth about the vertical axis, degrees in `[0, 360)`.
@@ -1277,49 +507,15 @@ pub struct OrbitCamera {
     /// The point the orbit turns about and the camera looks at, as a fraction of
     /// the box's half-extent on each axis, each component in
     /// `[-MAX_PIVOT_FRACTION, MAX_PIVOT_FRACTION]`.
-    ///
-    /// # Why a fraction of the box and not kilometres
-    ///
-    /// The box's size changes — a region drag re-cuts it from 460 km across to
-    /// as little as 20 — and a pivot in kilometres would survive that change by
-    /// pointing somewhere else, usually outside the new box. In box fractions the
-    /// same stored value means the same *part* of the box whatever the box is,
-    /// which is what a user who tightened a region and expected to still be
-    /// looking at the storm they aimed at will read as correct. It is also what
-    /// makes the clamp above a one-line guarantee rather than an argument about
-    /// aspect ratios.
-    ///
-    /// It is measured against the **exaggerated** box on the vertical axis, so
-    /// turning the exaggeration up does not slide the pivot off the top face.
     pivot: [f32; 3],
     /// How much the vertical axis is stretched when the box is drawn, in
     /// `[MIN_VERTICAL_EXAGGERATION, MAX_VERTICAL_EXAGGERATION]`.
-    ///
-    /// A property of the *camera* rather than of the grid, and that is the whole
-    /// design: it changes nothing about what was sampled, so turning it is free
-    /// and never triggers a rebuild. It is deliberately not in
-    /// [`VolumeTarget`] for the same reason the yaw is not.
-    ///
-    /// **Everything the pane reports about height stays in real units.** The
-    /// stretch is applied to the geometry and to nothing else; the pane's readout
-    /// reads the grid's own `z_range_km_msl`, which this never touches. A view
-    /// that quietly reported exaggerated heights would be worse than no
-    /// exaggeration at all, because the number would look like a measurement.
     vertical_exaggeration: f32,
 }
 
 impl Default for OrbitCamera {
     /// Looking north-ish from above the south-west, aimed at the box's centre
-    /// and stretched by [`DEFAULT_VERTICAL_EXAGGERATION`]: an angle that shows a
-    /// storm has height and depth at once, rather than the plan view the user
-    /// already has on another pane.
-    ///
-    /// The standoff is [`crate::volume_view::eye_distance_for_plan_scale`]
-    /// rather than a number of its own, and that function carries the
-    /// derivation: it is the distance at which the pane draws the ground at
-    /// exactly the scale its plan pane draws it at, so switching to 3D changes
-    /// the viewpoint and nothing else. It was 2.5, which opened a 3D pane
-    /// **1.287×** zoomed out from the pane it was made from.
+    /// and stretched by [`DEFAULT_VERTICAL_EXAGGERATION`].
     fn default() -> Self {
         Self {
             yaw_deg: 225.0,
@@ -1333,14 +529,6 @@ impl Default for OrbitCamera {
 
 impl OrbitCamera {
     /// Move the camera by `delta`, or leave it exactly as it is.
-    ///
-    /// The whole delta is refused if any part of it is unusable — a non-finite
-    /// angle, or a `zoom_factor` that is not finite and positive. Partial
-    /// application is deliberately not offered: a gesture that produced one bad
-    /// number produced it from the same pointer state as the others, so honoring
-    /// the rest of it is honoring half a garbled input.
-    ///
-    /// See the type documentation for why this refuses rather than clamps.
     pub fn nudge(&mut self, delta: OrbitDelta) {
         if !delta.yaw_deg.is_finite() || !delta.pitch_deg.is_finite() {
             return;
@@ -1348,9 +536,9 @@ impl OrbitCamera {
         if !delta.zoom_factor.is_finite() || delta.zoom_factor <= 0.0 {
             return;
         }
-        // Checked with the rest and refused with the rest: a pan arrives from
-        // the same pointer state as the orbit, through a division by the
-        // viewport height that a pane one frame wide makes infinite.
+        // Checked with the rest and refused with the rest: a pan arrives through
+        // a division by the viewport height that a one-frame-wide pane makes
+        // infinite.
         if !delta.pan.iter().all(|p| p.is_finite()) {
             return;
         }
@@ -1367,27 +555,6 @@ impl OrbitCamera {
     }
 
     /// Set how far back the eye sits, or leave it exactly as it is.
-    ///
-    /// # Why this is a control and not a gesture
-    ///
-    /// The scroll wheel used to drive it, and no longer does: scroll and pinch
-    /// aim the *geography* now, in both render modes, which is the one meaning
-    /// of "zoom" the application has. That is not a loss of magnification —
-    /// tightening the box brings the eye in with it, because this number is a
-    /// ratio of the box's framing radius rather than a distance — but it does
-    /// leave the *framing* with no gesture, and framing is a real judgement: how
-    /// much of the pane the box fills, and whether the eye is outside it looking
-    /// in or inside it looking out. [`MIN_EYE_DISTANCE`] documents the inside
-    /// view as a supported camera, and a change that made it unreachable would
-    /// have deleted a shipped capability by omission.
-    ///
-    /// So it is expressed where every other per-pane judgement is expressed, on
-    /// the pane's own controls, which is also the only spelling that works on a
-    /// touch screen and in a browser: there is no modifier key to hang a second
-    /// zoom on, and shipping one would have been a desktop-only model.
-    ///
-    /// Refuses a non-finite value and clamps a finite one, for the same reasons
-    /// [`Self::set_vertical_exaggeration`] gives.
     pub fn set_eye_distance(&mut self, eye_distance: f32) {
         if !eye_distance.is_finite() {
             return;
@@ -1396,14 +563,6 @@ impl OrbitCamera {
     }
 
     /// Set the vertical exaggeration, or leave it exactly as it is.
-    ///
-    /// The one writer for the knob, and it refuses a non-finite value for the
-    /// reason the type documentation gives: `f32::clamp` propagates NaN, and a
-    /// NaN here would reach `box_from_world` as a divide-by-NaN and hand the GPU
-    /// a matrix the driver renders as an empty pane with no error anywhere.
-    ///
-    /// Finite values are clamped rather than refused — this is a slider, and a
-    /// slider that reaches the end of its travel should stop.
     pub fn set_vertical_exaggeration(&mut self, exaggeration: f32) {
         if !exaggeration.is_finite() {
             return;
@@ -1413,24 +572,6 @@ impl OrbitCamera {
     }
 
     /// Rebuild a camera from persisted angles, or `None` if they are unusable.
-    ///
-    /// The second and last constructor, and the counterpart to the three
-    /// accessors below — which is what keeps the fields private while still
-    /// letting a camera survive a save and load.
-    ///
-    /// Refuses non-finite values rather than clamping them, for the reason the
-    /// type documentation gives at length: `f32::clamp` and `rem_euclid` both
-    /// *propagate* NaN, so a clamp on the way in launders a bad number into a bad
-    /// camera that looks as though it had been checked — and a NaN camera is not
-    /// a wrong picture but a re-render comparison that fires on every frame for
-    /// the life of the pane, with a hot GPU as its only symptom.
-    ///
-    /// Finite-but-out-of-range values are wrapped and clamped instead of refused,
-    /// through the same two expressions [`Self::nudge`] uses so the invariants
-    /// keep one description. Only a hand-edited or version-skewed config can
-    /// produce one, and `ui_config`'s `restore_viewport` reasons the same way
-    /// about a saved zoom: there is nothing to propagate, and the nearest legal
-    /// camera is a better answer than discarding the pane's kind over a number.
     pub fn restore(
         yaw_deg: f32,
         pitch_deg: f32,

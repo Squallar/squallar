@@ -6,9 +6,8 @@ use crate::result::{Error, Result};
 use super::header::{checked_end, read_i16, read_u16, read_u32};
 
 /// Set Colour Level (packet code 0x0802), ICD 2620001 Figure 3-11a: the code,
-/// a `0x0002` value indicator, then the level. Six bytes, fixed.
-///
-/// Returns the level and the offset after the packet.
+/// a `0x0002` value indicator, then the level. Six bytes, fixed. Returns the
+/// level and the offset after the packet.
 fn decode_contour_colour(data: &[u8], offset: usize) -> Result<(u16, usize)> {
     let indicator = read_u16(data, offset + 2)?;
     if indicator != 0x0002 {
@@ -30,11 +29,9 @@ fn decode_contour_colour(data: &[u8], offset: usize) -> Result<(u16, usize)> {
 /// ...     (I, J) pairs, signed halfwords
 /// ```
 ///
-/// The length halfword counts only the chained points, not the initial one —
-/// which is why the initial point is read before it rather than being the
-/// first pair. A byte count that is not a whole number of `(I, J)` pairs is
-/// refused rather than truncated: it means the packet is not this packet, and
-/// half-reading it would leave the rest of the layer misaligned.
+/// The length halfword counts only the chained points, not the initial one. A
+/// byte count that is not a whole number of `(I, J)` pairs is refused rather
+/// than truncated: half-reading it would misalign the rest of the layer.
 fn decode_linked_contour(data: &[u8], offset: usize) -> Result<(LinkedContourPacket, usize)> {
     let indicator = read_u16(data, offset + 2)?;
     if indicator != 0x8000 {
@@ -99,21 +96,18 @@ pub(crate) fn decode_symbology_block(data: &[u8], offset: usize) -> Result<Symbo
         while o + 2 <= layer_end && o + 2 <= data.len() {
             let packet_code = read_u16(data, o)?;
             match packet_code {
-                // Legacy Radial Data Array: RLE, halfword sizes, 4-bit gates.
                 0xAF1F => {
                     let (radial_packet, new_offset) =
                         super::radial::decode_legacy_radial_packet(data, o)?;
                     packets.push(DataPacket::DigitalRadial(radial_packet));
                     o = new_offset;
                 }
-                // Digital Radial Data Array: raw 8-bit gates, byte sizes.
                 16 => {
                     let (radial_packet, new_offset) =
                         super::radial::decode_digital_radial_packet(data, o)?;
                     packets.push(DataPacket::DigitalRadial(radial_packet));
                     o = new_offset;
                 }
-                // Generic Data Component: self-describing XDR.
                 28 => match super::radial::decode_generic_radial_packet(data, o) {
                     Ok((radial_packet, new_offset)) => {
                         packets.push(DataPacket::DigitalRadial(radial_packet));
@@ -129,20 +123,17 @@ pub(crate) fn decode_symbology_block(data: &[u8], offset: usize) -> Result<Symbo
                         break;
                     }
                 },
-                // Set Colour Level: the level the contours after it carry.
                 0x0802 => {
                     let (level, new_offset) = decode_contour_colour(data, o)?;
                     packets.push(DataPacket::ContourColour(level));
                     o = new_offset;
                 }
-                // Linked Contour Vector: one polyline.
                 0x0E03 => {
                     let (contour, new_offset) = decode_linked_contour(data, o)?;
                     packets.push(DataPacket::LinkedContour(contour));
                     o = new_offset;
                 }
                 _ => {
-                    // No length field to skip by, so abandon the layer.
                     log::warn!(
                         "Skipping unknown data packet code 0x{:04X} at offset {}",
                         packet_code,
@@ -175,7 +166,6 @@ pub(crate) fn decode_symbology_block(data: &[u8], offset: usize) -> Result<Symbo
 mod tests {
     use super::*;
 
-    /// Wrap `packets` in the block and layer headers a real product carries.
     fn block_of(packets: &[u8]) -> Vec<u8> {
         let mut d = Vec::new();
         d.extend_from_slice(&(-1i16).to_be_bytes()); // block divider
@@ -188,7 +178,6 @@ mod tests {
         d
     }
 
-    /// A Set Colour Level packet at `level`, ICD Figure 3-11a.
     fn colour(level: u16) -> Vec<u8> {
         let mut p = Vec::new();
         p.extend_from_slice(&0x0802u16.to_be_bytes());
@@ -197,7 +186,6 @@ mod tests {
         p
     }
 
-    /// A Linked Contour Vector packet: `start` then `chain`, ICD Figure 3-10.
     fn contour(start: (i16, i16), chain: &[(i16, i16)]) -> Vec<u8> {
         let mut p = Vec::new();
         p.extend_from_slice(&0x0E03u16.to_be_bytes());
@@ -212,15 +200,12 @@ mod tests {
         p
     }
 
-    /// The two packets the Melting Layer product is drawn from, in the order
-    /// it writes them, decoded off bytes laid out by hand from the ICD
-    /// figures — so this pins the layout and not our own encoder.
+    /// The two packets the Melting Layer product is drawn from, decoded off
+    /// bytes laid out by hand from the ICD figures.
     #[test]
     fn a_colour_and_contour_pair_decodes_to_its_level_and_its_points() {
         let mut packets = colour(3);
         packets.extend(contour((40, 0), &[(0, 40), (-40, 0), (0, -40), (40, 0)]));
-        // `let ... else` and not `expect`: the crate denies both
-        // `unwrap_used` and `expect_used`, tests included.
         let Ok(block) = decode_symbology_block(&block_of(&packets), 0) else {
             panic!("the hand-laid block should decode")
         };
@@ -249,17 +234,13 @@ mod tests {
         assert_eq!(km[3], (0.0, -10.0), "due south");
     }
 
-    /// A second contour after the first has to start where the first ended,
-    /// which is what the byte count is for. Two rings in one layer prove the
-    /// decoder advances by exactly the packet's own length.
+    /// A second contour has to start where the first ended.
     #[test]
     fn contours_after_the_first_are_found_at_the_right_offset() {
         let mut packets = colour(1);
         packets.extend(contour((8, 0), &[(0, 8)]));
         packets.extend(colour(2));
         packets.extend(contour((16, 0), &[(0, 16), (-16, 0)]));
-        // `let ... else` and not `expect`: the crate denies both
-        // `unwrap_used` and `expect_used`, tests included.
         let Ok(block) = decode_symbology_block(&block_of(&packets), 0) else {
             panic!("the hand-laid block should decode")
         };
@@ -286,9 +267,8 @@ mod tests {
         assert_eq!(levels, vec![1, 2]);
     }
 
-    /// The two indicator halfwords are the only thing that says a packet is
-    /// the packet its code claims. A wrong one is refused rather than read
-    /// as coordinates, which would silently misplace a contour.
+    /// The two indicator halfwords are the only thing that says a packet is the
+    /// packet its code claims.
     #[test]
     fn a_wrong_indicator_halfword_is_refused() {
         let mut bad_contour = contour((8, 0), &[(0, 8)]);
@@ -300,8 +280,8 @@ mod tests {
         assert!(decode_symbology_block(&block_of(&bad_colour), 0).is_err());
     }
 
-    /// A byte count that is not a whole number of `(I, J)` pairs cannot be
-    /// this packet; half-reading it would leave the layer misaligned.
+    /// A byte count that is not a whole number of `(I, J)` pairs cannot be this
+    /// packet.
     #[test]
     fn a_contour_byte_count_that_is_not_whole_pairs_is_refused() {
         let mut odd = contour((8, 0), &[(0, 8)]);
@@ -309,10 +289,9 @@ mod tests {
         assert!(decode_symbology_block(&block_of(&odd), 0).is_err());
     }
 
-    /// A one-layer block whose declared layer length is `u32::MAX`. Adding
-    /// it to the running offset overflows a 32-bit `usize` (wasm32); on
-    /// 64-bit the truncated packet inside errors first. Either way: an
-    /// error, never a panic.
+    /// A one-layer block whose declared layer length is `u32::MAX`: adding it
+    /// to the running offset overflows a 32-bit `usize`. Either way an error,
+    /// never a panic.
     #[test]
     fn a_layer_length_that_overflows_the_offset_is_an_error() {
         let mut d = Vec::new();

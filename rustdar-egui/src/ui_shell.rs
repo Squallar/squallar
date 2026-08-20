@@ -1,70 +1,5 @@
 //! The shell pass: the docked top bar, then the floating surfaces around the
 //! full-bleed map.
-//!
-//! # One docked panel; everything else floats
-//!
-//! The Synthesis design's full-bleed rule is that the map fills everything
-//! under the top bar and all other chrome floats over it, inside its bounds.
-//! So exactly one `Panel` claims space here — the top bar (`ui_topbar.rs`) —
-//! and what is left of the root `Ui` **is** the map's `CentralPanel`, edge to
-//! edge. That remainder is captured once, as [`ShellOutput::map_rect`], and
-//! every floating surface positions itself from it: the status bar along the
-//! bottom inset (`ui_statusbar.rs`), the layer stack at top-left
-//! (`ui_stack.rs`), the inspector at top-right (`ui_inspector.rs`), and the
-//! timeline transport the frame draws later, after the pane loop
-//! (`ui_timeline.rs`).
-//!
-//! The floating surfaces are `egui::Area`s above `Order::Background`, which is
-//! what keeps the map from reacting underneath them: every map click resolver
-//! runs through `filter_dialog_blocked`/`is_pos_blocked`, whose layer check
-//! drops a position covered by any layer above Background — no excluded-rect
-//! plumbing required.
-//!
-//! Below the Compact breakpoint the corner-floating pass stands down: the
-//! same flags present as pages of the phone sheet, drawn late in the frame by
-//! `ui_sheet.rs` through the same body renderers and the same take window —
-//! the shell keeps only the top bar there, and the status bar keeps nothing
-//! (its short scan summary lives in the phone top bar).
-//!
-//! # One take window for the stack and the inspector
-//!
-//! Both panels are about the active pane — the stack walks its `draw_order`
-//! and flips its layers, the inspector edits its product, kind and per-layer
-//! configs — and several of the renderers they host need `&mut PaneState`
-//! beside `&mut self`. So the pass holds the active pane out of the vector
-//! with `std::mem::take`, **once, around both panels**: everything either
-//! panel needs of the pane reads and writes the taken value, and nothing
-//! inside the window may read `self.panes[..]`, whose active slot holds a
-//! default placeholder until the restore. The menu model is built before any
-//! take (by the top bar), the stack's row status lines are built from the
-//! taken pane against a registry demonstrably loaded with its configs, and
-//! [`Gui::write_pane_overlay`] is how the eye and Show toggles write both
-//! halves without touching the vector. The restore is followed by
-//! `propagate_layer_sync`, so a reorder, a toggle or an edited config fans
-//! out to the synced panes the same frame.
-//!
-//! # Ids do not depend on the breakpoint
-//!
-//! Every area, panel and combo-box id prefix uses one constant id regardless
-//! of which presentation is on screen. egui keys widget memory — combo state,
-//! scroll offsets, panel sizes — on those ids, so keying any of them on the
-//! layout would silently reset the user's UI state every time the window
-//! crossed a breakpoint. The two pre-rebuild files had exactly that hazard
-//! latent in them: `"d_"`/`"m_"` control prefixes and
-//! `layers_panel`/`mobile_layers_panel` could never collide only because the
-//! two files were never compiled together.
-//!
-//! The full-bleed flip also *strengthened* the positional-id story. egui's
-//! `Ui::new_child` computes `unique_id = stable_id.with(parent's
-//! next_auto_id_salt)` (`egui-0.35.0/src/ui.rs:255`), so the root `Ui`'s
-//! auto-id counter folds into every panel's registered id — which is why a
-//! panel that appears or vanishes with the width would re-key everything shown
-//! after it. With the status bar, stack and inspector all floating `Area`s
-//! (whose ids are their own roots, not children of the root `Ui`), the top bar
-//! is the only thing that advances that counter at all, and it is drawn at
-//! every width. `crossing_a_breakpoint_re_keys_nothing` pins the whole claim,
-//! and `crossing_a_breakpoint_does_not_move_any_widget_id` pins the
-//! stored-state half of it.
 
 use crate::actions::GuiAction;
 use rustdar_source::id::{LayerId, known};
@@ -73,33 +8,12 @@ use super::{InspectorSelection, PaneState};
 
 /// The one frame every persistent floating surface draws in: the stock
 /// window frame with the drop shadow removed.
-///
-/// The second user test's finding: the timeline's window shadow cast onto
-/// the status bar floating under it, and every stacked pair of chrome
-/// surfaces (transport over status bar, sheet over bottom bar, chip over
-/// either) repeats the smudge. The persistent chrome — stack, inspector,
-/// timeline and its chip, status bar, bottom bar, sheet, error toast — is
-/// furniture, not a transient surface asserting elevation, so it draws flat;
-/// fill, stroke and rounding stay the stock theme's. Popovers, menus,
-/// tooltips and the modal dialogs deliberately keep their shadows: they are
-/// transient, and the shadow is how they read as *over* the furniture.
-///
-/// A source-scan test holds the chrome files to this constructor, so a new
-/// surface cannot quietly ship the shadowed frame.
 pub(crate) fn chrome_frame(style: &egui::Style) -> egui::Frame {
     egui::Frame::window(style).shadow(egui::Shadow::NONE)
 }
 
 /// The scroll sources every panel `ScrollArea` accepts: the stock set plus
 /// **mouse** drag-to-scroll.
-///
-/// egui 0.35's default is `DragScroll::OnTouch` — content drags scroll only
-/// where a touch screen is detected — so on a desktop, click-dragging a
-/// panel body did nothing (the second user test). `Always` extends the same
-/// gesture to the mouse; widgets that sense their own drags (sliders, the
-/// stack's reorder grip, the sheet handle) still win theirs, because the
-/// scroll area's catch-all interact registers before its content and egui
-/// resolves the overlap to the later registration.
 pub(crate) fn panel_scroll_source() -> egui::scroll_area::ScrollSource {
     egui::scroll_area::ScrollSource {
         drag: egui::scroll_area::DragScroll::Always,
@@ -109,11 +23,6 @@ pub(crate) fn panel_scroll_source() -> egui::scroll_area::ScrollSource {
 
 /// Where a hosted surface goes this frame: the placement the caller decides
 /// so the body renderers never key anything on the width.
-///
-/// Two callers build these — the shell's floating pass here, and the phone
-/// sheet (`ui_sheet.rs`), which is exactly why the type exists: the stack and
-/// inspector keep one `Area` id and one internal structure whoever is
-/// positioning them, and the only thing that changes hands is this geometry.
 pub(super) struct SurfaceSlot {
     /// Where the area's pivot corner goes.
     pub pos: egui::Pos2,
@@ -146,14 +55,6 @@ pub(super) struct ShellOutput {
     pub actions: Vec<GuiAction>,
     /// Screen rects of floating chrome drawn *over* the map, which map click
     /// handling must not treat as map clicks.
-    ///
-    /// This is an **output** of the shell rather than something the map
-    /// reconstructs — only the code that draws a floating thing knows where it
-    /// is. Empty in practice since the hamburger went: everything left either
-    /// claims panel space or is an egui layer above `Background`, which the
-    /// layer half of `is_pos_blocked` catches with no plumbing. The mechanism
-    /// stays because painted-in-pane chrome has no layer to be caught by, and
-    /// the next thing painted over a pane will need it again.
     pub excluded_rects: Vec<egui::Rect>,
     /// What the top bar left of the content rect — the rect the map's
     /// `CentralPanel` will fill, captured here so the floating surfaces (and
@@ -214,7 +115,7 @@ impl super::Gui {
             return;
         }
 
-        // The fade rule is total (§1.8): the fade closes both panels for
+        // The fade rule is total (the plan): the fade closes both panels for
         // real, so this gate is moot in the steady state — it exists for the
         // fade-out transition, whose closing remnants dim with the rest of
         // the chrome, and as the stated rule should anything ever render
@@ -223,7 +124,7 @@ impl super::Gui {
             return;
         };
 
-        // The slide animations (§3.3): each panel's open flag drives a
+        // The slide animations (the plan): each panel's open flag drives a
         // factor, and a closing panel renders as a non-interactive remnant
         // sliding off its own edge until the factor reaches zero. Under
         // `cfg(test)` the time is zero and the factors snap — see
@@ -321,12 +222,6 @@ impl super::Gui {
     /// The stack rows' status lines, one per layer in the pane's own order —
     /// empty for a pane that draws no map layers, which has no rows to carry
     /// them.
-    ///
-    /// Radar's is the exception with a reason: the product and tilt are pane
-    /// state — the radar handler holds only the layer toggle — so the line
-    /// is read off the taken pane rather than asked of the registry. The
-    /// caller must have loaded the pane's configs into the registry first;
-    /// both the shell pass above and the sheet pass do.
     pub(super) fn stack_row_statuses(&self, pane: &PaneState) -> Vec<(LayerId, Option<String>)> {
         if !pane.draws_map_layers() {
             return Vec::new();
@@ -348,17 +243,6 @@ impl super::Gui {
 /// The Radar row's status line: what picture this pane's radar layer is —
 /// product code and tilt, e.g. `REF - 0.5°`. `pub(super)` because the
 /// inspector's Radar layer body states the same line (`ui_inspector.rs`).
-///
-/// The tilt is the *snapped* angle where a scan is loaded — the one the pane
-/// is actually rendering — falling back to the raw selection before any scan
-/// arrives. `None` while the layer is hidden: the dimmed row carries no line,
-/// like every other layer's. `code()` is the fetch path's lowercase spelling,
-/// uppercased here because the row is a display, not a URL.
-///
-/// A pane that reads the whole volume states the product alone. Its
-/// `selected_elevation` is still on the pane, inert, and quoting it here would
-/// have the row name a cut the pane is not showing — the same reason
-/// `Gui::render_radar_controls` draws that pane no tilt picker.
 pub(super) fn radar_row_status(pane: &PaneState) -> Option<String> {
     if !pane.is_overlay_enabled(&known::RADAR) {
         return None;
@@ -409,9 +293,6 @@ mod chrome_frame_tests {
     /// `src` with comments, string literals and char literals blanked, so
     /// the scan below only ever matches *code* — a doc comment or an
     /// assertion message mentioning `Frame::window(` must not trip it.
-    /// Nested block comments, escapes, raw strings and the `'"'` char
-    /// literal are handled on the same terms as the glyph scanner
-    /// (`ui_glyphs.rs`), whose directory walk this test mirrors too.
     fn code_only(src: &str) -> String {
         let chars: Vec<char> = src.chars().collect();
         let mut out = String::with_capacity(src.len());

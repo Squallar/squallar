@@ -1,16 +1,5 @@
 //! The adapter, the readback and the planted fixtures every GPU test file
 //! shares.
-//!
-//! Extracted from `volume_gpu.rs` when `volume_shader_mutants.rs` was written,
-//! for the reason that file exists at all: the mutation battery has to drive
-//! *the same* fixtures the shipped tests drive, or it would prove that some
-//! other rendering can detect a broken shader. An integration test is its own
-//! crate, so sharing means a module both files declare rather than an import.
-//!
-//! Every function here is used by at least one of them and `dead_code` is
-//! allowed once, at the top: each test binary compiles its own copy of this
-//! module and only calls the part it needs, so an unused-function warning here
-//! would be a warning about the *other* file's usage.
 #![allow(dead_code)]
 
 use egui_wgpu::wgpu;
@@ -21,18 +10,9 @@ use rustdar_volumetric::raymarch::{CoarseLevel, FLOOR_FORMAT, PaneMirror, Volume
 use rustdar_volumetric::uniform::VolumeUniform;
 
 /// Held for the length of a test, so only one talks to the GPU at a time.
-///
-/// Four concurrent devices each blocking in `poll(wait_indefinitely)` deadlock
-/// reproducibly on this hardware, so serialising is a fix rather than a
-/// workaround — and it costs nothing, because the whole file runs in about a
-/// second.
 static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Take the GPU lock, ignoring poisoning.
-///
-/// Poisoning here means an earlier test already failed and unwound. That test
-/// will report its own failure; refusing to run the rest would replace four
-/// useful results with one and three panics about the mutex.
 pub fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
     ONE_AT_A_TIME
         .lock()
@@ -40,12 +20,6 @@ pub fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// Name the adapter these tests actually got, once per process.
-///
-/// Not decoration. CI runs these files against Mesa's lavapipe, and the failure
-/// mode that would make that worthless is a silent fall back to whatever real
-/// GPU the runner turns out to have: the suite would pass and prove nothing
-/// about the software path. Under `--nocapture` this line is the receipt. It
-/// goes to stderr so it survives a passing run's captured stdout.
 pub fn announce(adapter: &wgpu::Adapter) {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -58,9 +32,6 @@ pub fn announce(adapter: &wgpu::Adapter) {
 }
 
 /// A device on whatever adapter is to be had.
-///
-/// Same constructor the application uses, so `WGPU_BACKEND` selects the backend
-/// here too.
 pub fn device() -> (wgpu::Device, wgpu::Queue) {
     let instance =
         wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
@@ -121,11 +92,6 @@ pub fn render_target(
 }
 
 /// Read an RGBA8 texture back as one `[u8; 4]` per texel, row-major.
-///
-/// `copy_texture_to_buffer` wants rows padded to
-/// `COPY_BYTES_PER_ROW_ALIGNMENT`, so the padding is added on the way out and
-/// stripped on the way back — getting that wrong shears the image, which is
-/// exactly the kind of thing that looks like a shader bug.
 pub fn read_back(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -183,10 +149,6 @@ pub fn read_back(
 
 /// A `box_from_clip` that unprojects the far plane onto the far face of the
 /// box, looking down one axis.
-///
-/// `axis` is which box axis the ray travels along, and the camera sits on its
-/// positive side. Column-major, because that is what `VolumeUniform` packs and
-/// what WGSL's `mat4x4` is.
 pub fn box_from_clip_down(axis: usize) -> [[f32; 4]; 4] {
     // The two axes the screen spans, in order.
     let screen: [usize; 2] = match axis {
@@ -233,11 +195,6 @@ pub fn opaque_white_lut() -> Vec<u8> {
 }
 
 /// A grey ramp table: entry `i` is the colour `(i, i, i)`, opaque.
-///
-/// With [`VolumeUniform::ambient`] at 1 the isosurface's half-Lambert wrap
-/// collapses to exactly 1, so a pixel's grey level *is* the palette index the
-/// surface was found at, to within the 8-bit round trip. That is what turns
-/// "where did the surface land" into something a test can read off a pixel.
 pub fn grey_ramp_lut() -> Vec<u8> {
     let mut lut = vec![0u8; VOLUME_LUT_BYTES];
     for (i, entry) in lut.chunks_exact_mut(4).enumerate() {
@@ -251,9 +208,6 @@ pub fn grey_ramp_lut() -> Vec<u8> {
 
 /// An `8 x 8 x nz` grid whose index depends only on the slab: `levels[k]` is
 /// the value of every cell in slab `k`.
-///
-/// The eye of [`eye_outside`]`(2)` is above the box, so a ray descends through
-/// slab `nz-1` first and slab 0 last.
 pub fn slab_ramp(levels: &[u8]) -> ([u32; 3], Vec<u8>) {
     let cells = [8u32, 8, levels.len() as u32];
     let mut indices = Vec::with_capacity((cells[0] * cells[1] * cells[2]) as usize);
@@ -302,11 +256,6 @@ pub fn raymarch_once(
 
 /// [`raymarch_once`], told whether this grid is uploaded with a coarse mip
 /// level at all.
-///
-/// The decision `volume::bridge` makes per adapter and per grid, and on the
-/// shipped desktop default it is [`CoarseLevel::Omitted`] — so a suite that
-/// only ever went through [`raymarch_once`] would render every fixture on the
-/// one arm production mostly does not take.
 #[allow(clippy::too_many_arguments)]
 pub fn raymarch_once_at(
     device: &wgpu::Device,
@@ -359,24 +308,10 @@ pub fn raymarch_once_at(
 }
 
 /// The texel format every mirror built here is created in.
-///
-/// [`FLOOR_FORMAT`] is what production's own placeholder mirror uses, and being
-/// `Rgba8Unorm` it takes the bytes `write_mirror` is handed in the order they
-/// were written. That is worth stating rather than assuming: these tests build
-/// their *pipelines* for a `Bgra8Unorm` swapchain, and a mirror in that format
-/// would read the very same fixture bytes as BGRA and turn every red patch
-/// blue, with no validation error anywhere to say so.
 pub const MIRROR_FORMAT: wgpu::TextureFormat = FLOOR_FORMAT;
 
 /// A mirror of `size` texels holding `rgba`, through the very same
 /// `ensure_mirror` texture and bind group the frame path draws into.
-///
-/// `rgba` is premultiplied, row 0 at the top, in the mirror's own encoding —
-/// which is a change from the floor image this replaced, whose bytes were
-/// straight. Every fixture in these suites is fully opaque, and a fully opaque
-/// colour is the same four bytes premultiplied or straight, so the fixtures
-/// read as plain colours and the distinction costs nothing here. It would not
-/// be free for a translucent one.
 pub fn planted_mirror(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -440,21 +375,9 @@ pub fn centre(pixels: &[[u8; 4]], size: [u32; 2]) -> [u8; 4] {
 }
 
 /// The box side that spans exactly one degree of latitude, in kilometres.
-///
-/// Taken from `rustdar_geo::KM_PER_DEGREE_LAT` rather than spelled,
-/// because "one degree" is the fixture's whole premise: a copied literal that
-/// drifted from the shader's own conversion would leave every lane in
-/// [`equatorial_floor_lanes`] describing a box that is not a degree, and the
-/// harness would still look right.
 pub const DEGREE_BOX_KM: f32 = rustdar_geo::KM_PER_DEGREE_LAT as f32;
 
 /// Web Mercator's y at a latitude in degrees: `ln(tan(pi/4 + phi/2))`.
-///
-/// The projection's own definition, and line for line what the shader's
-/// `mercator_y` evaluates. Restated here rather than tabulated as a magic
-/// number so [`equatorial_floor_lanes`] is derived from the same closed form
-/// the thing under test uses — a constant copied out of a calculator would
-/// keep agreeing with a shader that had changed.
 pub fn mercator_y(lat_deg: f64) -> f64 {
     (std::f64::consts::FRAC_PI_4 + lat_deg.to_radians() / 2.0)
         .tan()
@@ -464,54 +387,12 @@ pub fn mercator_y(lat_deg: f64) -> f64 {
 /// The uniform's two floor lanes for a `DEGREE_BOX_KM`-square box whose site is
 /// at its centre **on the equator**, arranged so the box's footprint covers
 /// exactly the whole mirror with the mirror's row 0 along the box's north edge.
-///
-/// # Why this is arranged rather than assumed
-///
-/// The mirror is a Web Mercator picture of the whole frame, not a picture of
-/// the box, so `floor_colour` reprojects into it per pixel — out to geography
-/// in kilometres east and north of the site, and back through longitude and
-/// Mercator y, taking `cos φ` at *this pixel's* latitude. There is no longer
-/// any `(hit.x, 1 - hit.y)` texture lookup for a fixture to lean on. The
-/// orientation and registration cases below still want that simple
-/// correspondence to hold, so it is *established by the lanes* instead of
-/// assumed by the shader: on the equator `cos φ` is 1 and Mercator y is very
-/// nearly linear in latitude, and a box one degree on a side then maps onto the
-/// unit square of the mirror to within a rounding error. What those tests
-/// assert therefore becomes a check on the reprojection rather than on a
-/// texture lookup, which is strictly more than the old fixtures could say.
-///
-/// # The residual, and why it is legitimate rather than a fudge
-///
-/// `cos φ` runs from 1 at the site to 0.999962 at ±0.5°, so `u` departs from
-/// `hit.x` by at most 1.9e-5 — 1.5e-4 of a texel on an eight-texel mirror and
-/// 1.2e-3 of a texel on a sixty-four-texel one. Mercator's y is odd and cubic
-/// in latitude about the equator, so `v` departs from `1 - hit.y` by at most
-/// 2.4e-6, an order of magnitude smaller again. Both are far under the
-/// sub-texel wobble the floor's `Linear` sampler already has, and neither can
-/// move a centroid by a hundredth of the pixel bounds asserted below. The
-/// trapezoid the shader exists to correct is real on the shipped 460 km box at
-/// 41.7°N — 8.5 texels of 512 — and is deliberately absent here.
-///
-/// Returns `(floor_uv, floor_geo)`. `gamma_encoded` is the mirror's own
-/// [`PaneMirror::is_gamma_encoded`], which is what the shader is being told
-/// about the texels it is sampling.
 pub fn equatorial_floor_lanes(gamma_encoded: bool) -> ([f32; 4], [f32; 4]) {
     equatorial_floor_lanes_of(1.0, 1.0, gamma_encoded)
 }
 
 /// [`equatorial_floor_lanes`] for a box `east_degrees` of longitude wide and
 /// `north_degrees` of latitude tall.
-///
-/// The square case is `(1.0, 1.0)`, and everything the doc above says about
-/// why the residual is legitimate holds for any span of this order: `cos φ`
-/// departs from 1 by 1.5e-4 at ±1° and Mercator's y from linear by 2e-5, both
-/// far under the floor sampler's own sub-texel wobble.
-///
-/// The two spans exist so that a fixture built on these lanes can be
-/// **rectangular**. Every one of them was square, which makes `floor_colour`'s
-/// two reprojection lines interchangeable: writing `box_size_km.x` into both,
-/// or exchanging the two lines outright, renders exactly the same picture on a
-/// square box.
 pub fn equatorial_floor_lanes_of(
     east_degrees: f64,
     north_degrees: f64,
@@ -549,11 +430,6 @@ pub fn equatorial_floor_lanes_of(
 }
 
 /// The box extent [`equatorial_floor_lanes`] is written for.
-///
-/// Only the two horizontal axes take part in the reprojection. The vertical is
-/// left at the 10 km these tests always used, so the march's optical depth
-/// through a down- or up-looking camera — which is what every opacity assertion
-/// here turns on — is exactly what it was before the floor grew a projection.
 pub const fn equatorial_box_km() -> [f32; 3] {
     [DEGREE_BOX_KM, DEGREE_BOX_KM, 10.0]
 }

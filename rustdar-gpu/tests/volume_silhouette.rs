@@ -1,77 +1,37 @@
 //! Is the raymarch's silhouette the one the geometry says it should be?
 //!
-//! `volume_gpu.rs` asks whether the march composites the right *colour*. This
-//! file asks the orthogonal question: whether the volume ends up in the right
-//! *place*, at the right size and the right shape, for geometry whose projected
-//! outline can be written down in closed form.
-//!
-//! The method is deliberately oracle-free. A palette that is transparent at
-//! index 0 and fully opaque at every other index, plus an extinction large
-//! enough that one sample saturates, turns the render into a binary mask. The
-//! same `box_from_clip` and `eye_in_box` the shader was handed are then used on
-//! the host to cast one ray per pixel and intersect it analytically with the
-//! planted geometry. The two masks are compared. Nothing here is calibrated
-//! against a stored image, and no bound was widened to make a case green
-//! without the residual being printed alongside it.
-//!
-//! Everything is `#[ignore]`d, for the reason `volume_gpu.rs` gives: so that a
-//! checkout on a box with no working Vulkan loader still gives a green
-//! `cargo test`. CI opts back in — the `gpu` job in `test.yaml` runs this file
-//! with `-- --ignored` against Mesa's lavapipe on every PR. Run the lot
-//! yourself with:
+//! Oracle-free: a palette transparent at index 0 and opaque elsewhere, with an
+//! extinction large enough that one sample saturates, turns the render into a
+//! binary mask; the same `box_from_clip` and `eye_in_box` the shader was handed
+//! then cast one host ray per pixel and intersect the planted geometry
+//! analytically. `#[ignore]`d (CI's `gpu` job opts in on lavapipe), and the
+//! tests hold a process-wide lock: several devices on one adapter each blocking
+//! in `poll(wait_indefinitely)` deadlock on this hardware.
 //!
 //! ```text
 //! cargo test -p rustdar-gpu --test volume_silhouette -- --ignored --nocapture
 //! ```
 //!
-//! **These tests hold a process-wide lock and run one at a time**, for the same
-//! reason `volume_gpu.rs` does: several devices on one adapter each blocking in
-//! `poll(wait_indefinitely)` deadlock on this hardware.
+//! Metrics: IoU of the two masks; symmetric difference; **max boundary
+//! displacement**, the largest Chebyshev distance from a disagreeing pixel to
+//! the analytic mask's boundary (insensitive to edge length); **centroid
+//! offset**, the position check an area-only test cannot make.
 //!
-//! # What each metric means
-//!
-//! * **IoU** — intersection over union of the two pixel masks.
-//! * **symmetric difference** — pixels the two masks disagree about.
-//! * **max boundary displacement** — the largest Chebyshev distance, in pixels,
-//!   from a disagreeing pixel to the nearest pixel of the *analytic* mask's
-//!   boundary. It is the honest reading of "how far did the edge move", and it
-//!   is insensitive to how long the edge is.
-//! * **centroid offset** — the rendered mask's centroid minus the analytic
-//!   one's, in pixels. This is the position check: a silhouette can have a
-//!   perfect area and still be in the wrong place.
-//!
-//! # The two systematic residuals, named in advance
+//! Two systematic residuals, measured rather than corrected:
 //!
 //! 1. **Linear-filter bleed.** The grid is `Rg16Float` sampled `Linear` and
-//!    coverage-premultiplied, so what sets the reach is the interpolated
-//!    *coverage*, not the interpolated index. A cell contributes where coverage
-//!    reaches the shader's `COVERAGE_SKIP` = 1/255; the reconstructed index
-//!    gates nothing, because `R̄ / Ḡ` stays inside the convex hull of the
-//!    stored data and so never falls toward the no-data index at all. Coverage
-//!    runs from 1 at the outermost filled cell's **centre** to 0 at its empty
-//!    neighbour's centre, and 1/255 of that tent is essentially its whole
-//!    support — so the field extends very nearly a full cell past that centre,
-//!    i.e. half a cell past the nominal cell face.
-//!
-//!    The observable difference from the old path is that the reach no longer
-//!    depends on the stored value. An index-1 sphere and an index-255 sphere
-//!    now paint **bit-identically** — 5936 px each — where the `R8Unorm` index
-//!    gate gave 5434 against 5960, a faint echo reaching less far than a bright
-//!    one through the same geometry. Every comparison below is still reported
-//!    twice: against the exact planted surface, and against that surface
-//!    dilated by one cell along each axis.
-//! 2. **The jittered voxel-locked march.** `dt` is [`RAYMARCH_STEP_CELLS`]
-//!    cells along the ray (floored so [`RAYMARCH_STEP_CEILING`] steps always
-//!    span the box), and the comb starts a per-pixel hash fraction of a step
-//!    past the entry. A chord shorter than one step is therefore hit or
-//!    missed by the *pixel's own* jitter — at a silhouette tangent that is a
-//!    one-pixel-deep ring of coin flips on the analytic boundary itself,
-//!    measured below at 0.19% of a coarse-grid slab's mask and 0% of its
-//!    interior. (The fixed 96-step march this replaced missed whole *objects*
-//!    instead: a one-cell layer at 512 z-cells rendered 5.96% of its mask,
-//!    now 99.99%.)
-//!
-//! Both are measured here rather than corrected.
+//!    coverage-premultiplied, so the reach is set by interpolated *coverage*,
+//!    not index: a cell contributes where coverage reaches `COVERAGE_SKIP` =
+//!    1/255, and that tent runs from 1 at the outermost filled cell's centre to
+//!    0 at its empty neighbour's, so the field extends nearly a full cell past
+//!    that centre. Reach no longer depends on the stored value — an index-1 and
+//!    an index-255 sphere paint bit-identically. Every comparison is reported
+//!    twice: against the planted surface, and against it dilated one cell.
+//! 2. **The jittered voxel-locked march.** `dt` is [`RAYMARCH_STEP_CELLS`] cells
+//!    (floored so [`RAYMARCH_STEP_CEILING`] steps span the box) and the comb
+//!    starts a per-pixel hash fraction past the entry, so a chord shorter than
+//!    one step is hit or missed by that pixel's own jitter — at a tangent, a
+//!    one-pixel ring of coin flips, measured at 0.19% of a coarse slab's mask.
 #![cfg(not(target_arch = "wasm32"))]
 
 use egui_wgpu::wgpu;
@@ -98,10 +58,6 @@ fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// Name the adapter these tests actually got, once per process.
-///
-/// Same receipt `volume_gpu.rs` prints, and for the same reason: CI runs this
-/// file on a software rasteriser, and a silent fall back to a real GPU would
-/// leave the suite green while testing nothing it was added to test.
 fn announce(adapter: &wgpu::Adapter) {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -266,13 +222,6 @@ fn eye_outside(axis: usize) -> [f32; 3] {
 // ---------------------------------------------------------------------------
 
 /// Transparent at index 0, fully opaque white at every other index.
-///
-/// The whole point of the file: with this table plus a large extinction the
-/// alpha channel is a mask rather than an image. Every index from 1 up is
-/// opaque because the linear filter produces *interpolated* indices between a
-/// filled cell and an empty one, and a table that were opaque only at 255 would
-/// turn the filter's ramp into a soft edge and confound the two residuals this
-/// file is trying to separate.
 fn hard_mask_lut() -> Vec<u8> {
     let mut lut = vec![0u8; VOLUME_LUT_BYTES];
     for entry in 1..VOLUME_LUT_BYTES / 4 {
@@ -292,31 +241,14 @@ fn translucent_lut(alpha: u8) -> Vec<u8> {
 }
 
 /// Extinction per kilometre that saturates a single sample.
-///
-/// `1 − exp(−1 · 1000 · s)` is 1.0 in eight bits for any segment longer than
-/// about six metres, and the shortest segment any camera here produces is
-/// hundreds of metres. Verified by
-/// `a_hard_palette_makes_the_render_a_binary_mask_and_the_rows_run_top_down`,
-/// which is `#[ignore]`d behind a real adapter.
 const SATURATING_EXTINCTION: f32 = 1000.0;
 
 /// Fill a grid with index 255 wherever a cell's **centre** is inside the shape.
-///
-/// Centre sampling rather than any coverage rule, because the shader samples
-/// the field at points and the field is defined by the cell centres.
-/// `indices` is x-fastest, then y, then z, which is what `upload_volume` wants.
 fn plant<F: Fn([f32; 3]) -> bool>(cells: [u32; 3], inside: F) -> Vec<u8> {
     plant_at(cells, 255, inside)
 }
 
 /// [`plant`], at a chosen palette index.
-///
-/// The index matters to the boundary and not only to the colour. The shader
-/// skips a sample when `index > 0.5/255` is false, and between a filled cell of
-/// index `n` and an empty neighbour the interpolant reaches that threshold
-/// `1 − 0.5/n` of the way across. At `n = 255` that is 0.998 of a cell and at
-/// `n = 1` it is 0.5 of one, so the outer edge of a silhouette sits half a cell
-/// further out for a strong return than for a weak one.
 fn plant_at<F: Fn([f32; 3]) -> bool>(cells: [u32; 3], index: u8, inside: F) -> Vec<u8> {
     let mut indices = vec![0u8; (cells[0] * cells[1] * cells[2]) as usize];
     for z in 0..cells[2] {
@@ -361,12 +293,6 @@ fn unproject(m: [[f32; 4]; 4], ndc: [f32; 2], depth: f32) -> [f32; 3] {
 }
 
 /// The pixel-centre NDC of pixel `(px, py)` in a `size`-shaped target.
-///
-/// Row 0 is the **top** of the render target, so screen `y` runs down while NDC
-/// `y` runs up. That sign is the one assumption in this file that cannot be
-/// derived from the public API, and it is checked empirically by
-/// `a_hard_palette_makes_the_render_a_binary_mask_and_the_rows_run_top_down` —
-/// `#[ignore]`d, so the check happens only under `-- --ignored`.
 fn ndc_for_pixel(px: u32, py: u32, size: [u32; 2]) -> [f32; 2] {
     [
         (px as f32 + 0.5) / size[0] as f32 * 2.0 - 1.0,
@@ -406,15 +332,6 @@ fn march_dt(direction: [f32; 3], cells: [u32; 3], span: f32) -> f32 {
 
 /// The shader's per-pixel jitter, mirrored: Jimenez's interleaved gradient
 /// noise over the fragment's framebuffer coordinate (pixel centre, so +0.5).
-///
-/// Bitwise agreement with the GPU is *not* guaranteed — a driver may contract
-/// the multiplies into FMAs and land on the other side of a `fract` — so
-/// nothing below asserts through this to sub-step precision; it is for
-/// reporting where a pixel's first sample fell.
-///
-/// The literals are the shader's, character for character, which is the whole
-/// point of a mirror; clippy is right that f32 rounds the first one to
-/// 52.982918 either way, and textual identity with `volume.wgsl` wins.
 #[allow(clippy::excessive_precision)]
 fn ign(px: u32, py: u32) -> f32 {
     let x = px as f32 + 0.5;
@@ -448,11 +365,6 @@ fn hits_box(origin: [f32; 3], direction: [f32; 3], lo: [f32; 3], hi: [f32; 3]) -
 }
 
 /// Does the ray meet the axis-aligned ellipsoid in front of the eye?
-///
-/// Exact: the ray is taken into the space where the ellipsoid is the unit
-/// sphere — a per-axis divide — and the quadratic is solved there. A sphere is
-/// the case where the three radii agree, so there is one predicate for both the
-/// box-space sphere and the true-kilometre one.
 fn hits_ellipsoid(
     origin: [f32; 3],
     direction: [f32; 3],
@@ -505,9 +417,6 @@ fn rendered_mask(pixels: &[[u8; 4]]) -> Vec<bool> {
 
 /// Chebyshev distance from every pixel to the nearest pixel on `mask`'s
 /// boundary, by the two-pass chamfer.
-///
-/// The boundary is every pixel with a four-neighbour of the opposite value —
-/// taken from both sides, so a mask and its complement give the same edge.
 fn boundary_distance(mask: &[bool], size: [u32; 2]) -> Vec<f32> {
     let w = size[0] as usize;
     let h = size[1] as usize;
@@ -655,14 +564,6 @@ impl Metrics {
 }
 
 /// The fraction of `expected` that `rendered` paints.
-///
-/// The renderer may only ever *add* to a silhouette's **interior** — the
-/// linear filter dilates and never erodes, and every chord through an interior
-/// pixel is longer than a march step. The boundary ring is the one exception:
-/// a *tangent* chord can be shorter than one step, and whether the jittered
-/// comb lands a sample in it is the pixel's own hash. So "covers the interior
-/// completely, and all but a fraction of a percent of the boundary" is the
-/// hard answer now, and the slab test asserts exactly that split.
 fn covered_fraction(rendered: &[bool], expected: &[bool]) -> f64 {
     let need = expected.iter().filter(|on| **on).count();
     let got = rendered
@@ -680,11 +581,6 @@ fn covered_fraction(rendered: &[bool], expected: &[bool]) -> f64 {
 /// How far inside `expected` the deepest **lost** pixel sits, in Chebyshev
 /// pixels from `expected`'s boundary. Zero means every miss is on the boundary
 /// itself.
-///
-/// Only losses: overpaint is the linear filter's dilation and has its own
-/// bound (the two-cell envelope), while losses are the jittered march's — a
-/// tangent chord shorter than one step whose sample landed outside it — and
-/// those can reach exactly the boundary ring and no deeper.
 fn max_lost_distance(rendered: &[bool], expected: &[bool], size: [u32; 2]) -> f64 {
     let distance = boundary_distance(expected, size);
     let mut worst = 0.0f64;
@@ -707,13 +603,6 @@ fn overflow_fraction(rendered: &[bool], outer: &[bool], expected: &[bool]) -> f6
 }
 
 /// The IoU floor a render can be held to **without tuning a constant**.
-///
-/// If the exact analytic mask is contained in the render and the render is
-/// contained in an outer envelope, then `IoU = |exact| / |rendered|` and that is
-/// at least `|exact| / |outer|`. So the floor is a property of two analytic
-/// masks and of the cell size, and nothing about it is fitted to what the GPU
-/// happened to produce. It is loose by construction, which is the price of not
-/// being a magic number; the measured IoU is printed beside it every time.
 fn derived_iou_floor(exact: &[bool], outer: &[bool]) -> f64 {
     exact.iter().filter(|on| **on).count() as f64
         / outer.iter().filter(|on| **on).count().max(1) as f64
@@ -751,9 +640,6 @@ fn bounds(mask: &[bool], size: [u32; 2]) -> Option<(u32, u32, u32, u32)> {
 // ---------------------------------------------------------------------------
 
 /// A uniform set up for a hard-mask render through a real orbit camera.
-///
-/// `None` when the camera or the box cannot be looked at, which is `view_for`'s
-/// own refusal and never happens for the cameras below.
 fn masking_uniform(
     camera: OrbitCamera,
     box_size_km: [f32; 3],
@@ -777,22 +663,6 @@ fn camera(yaw: f32, pitch: f32, distance: f32, exaggeration: f32) -> OrbitCamera
 }
 
 /// The eye distance that frames [`BOX_KM`] the same size at every exaggeration.
-///
-/// `eye_distance` is in framing radii of the box's *true* north–south extent
-/// (`volume_view::framing_radius_km`), which the knob does not touch — so
-/// stretching the box no longer backs the eye off, deliberately: a vertical
-/// exaggeration that rescaled the ground would be a zoom, which is what
-/// `eye_distance` already is.
-///
-/// This harness wants the opposite, and has to ask for it rather than inherit
-/// it. It compares one silhouette against another across the knob's whole
-/// travel, and its residual is a **filter band a fixed number of pixels wide**;
-/// that is only comparable between two pictures of the same size. Left at a
-/// constant 2.5 the 12× sphere renders 4.9× the pixels of the 1× one, the band
-/// becomes proportionally thinner, and the IoU rises 0.0190 for a reason that
-/// has nothing to do with what the test is asking. So this holds the stretched
-/// box's half-diagonal at a constant 2.5 — the standoff the assertions were
-/// calibrated against — and the residual is the filter's again.
 fn framed_distance(exaggeration: f32) -> f32 {
     2.5 * stretched_half_diagonal(exaggeration) / (BOX_KM[1] * std::f32::consts::FRAC_1_SQRT_2)
 }
@@ -820,32 +690,6 @@ const COARSE: [u32; 3] = [64, 64, 64];
 // ---------------------------------------------------------------------------
 
 /// The mask really is a mask, and image rows really do run top-down.
-///
-/// Three assumptions everything after this rests on, each checked rather than
-/// asserted in a comment:
-///
-/// 1. **Saturation.** With [`hard_mask_lut`] and [`SATURATING_EXTINCTION`] the
-///    alpha channel must be two-valued. Anything in between is a soft edge, and
-///    a soft edge of width *w* pixels would put a floor of roughly *w* on every
-///    boundary displacement below. The histogram is printed either way.
-/// 2. **Row order.** `read_back` hands over row 0 first, and
-///    [`ndc_for_pixel`] assumes that is the *top* of the target. A slab planted
-///    in the bottom half of the box must therefore land in the bottom half of
-///    the image; if the sign were wrong every mask comparison would still be
-///    self-consistent and every silhouette would be upside down.
-/// 3. **The default edge width is hard.** Every uniform in this file leaves
-///    `edge_soft_width` at `DEFAULT_EDGE_SOFT_WIDTH`, whose claim is that zero
-///    keeps an instrument's edge binary — and an index-255 shape cannot check
-///    that claim, because under a saturating extinction a leaked soft width
-///    leaves a sub-saturation shell only ~0.2% of a cell wide there. The
-///    index-1 sphere is the observation: the same shell spans ~18% of a cell,
-///    so a soft default greys hundreds of boundary pixels instead of zero.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_silhouette \
-///     a_hard_palette_makes_the_render_a_binary_mask_and_the_rows_run_top_down \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn a_hard_palette_makes_the_render_a_binary_mask_and_the_rows_run_top_down() {
@@ -927,21 +771,6 @@ fn a_hard_palette_makes_the_render_a_binary_mask_and_the_rows_run_top_down() {
     assert!(full > 0 && zero > 0, "the mask must have both phases");
 
     // --- the default edge width really is hard, on a shape that can see it
-    //
-    // `DEFAULT_EDGE_SOFT_WIDTH` claims zero keeps every instrument's edge
-    // binary — but the index-255 sphere above cannot observe a soft default
-    // leaking in. Under saturating extinction only ramp values below ~1e-3
-    // leave a grey pixel, and at index 255 the interpolated index climbs 255
-    // index-steps per cell across the boundary, so with a leaked width of
-    // 8/255 that sub-saturation shell is ~0.2% of one cell: sub-pixel at this
-    // footprint, 0 grey pixels of 65536, and the flipped default survived the
-    // whole GPU set. At index 1 the same crossing climbs one index-step per
-    // cell, the shell spans ~18% of a cell, and the leak paints grey pixels
-    // by the hundreds along the silhouette boundary. So the low-index sphere
-    // is the shape on which the default's claim can observe its own bug.
-    //
-    // `masking_uniform` deliberately leaves `edge_soft_width` at the struct
-    // default — that is the channel every instrument in this file relies on.
     let faint_sphere = plant_at(cells, 1, |c| {
         let d = [c[0] - 0.5, c[1] - 0.5, c[2] - 0.5];
         (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() < 0.3
@@ -986,15 +815,6 @@ fn a_hard_palette_makes_the_render_a_binary_mask_and_the_rows_run_top_down() {
         "the index-1 mask must have both phases"
     );
     // --- and the two spheres are the SAME mask, which is residual #1's claim
-    //
-    // The module doc says the reach is set by interpolated *coverage* and not
-    // by the interpolated index. That has an executable consequence the old
-    // `R8Unorm` path could not satisfy: the index-1 sphere and the index-255
-    // sphere are the same planted geometry, so under a value-independent reach
-    // they must paint the same number of pixels — not nearly, exactly. On the
-    // index gate they did not (5434 against 5960 here: a faint echo reached
-    // less far than a bright one through identical geometry), and that
-    // discrepancy is what premultiplication removed.
     assert_eq!(
         faint_full, full,
         "an index-1 sphere paints {faint_full} px and an index-255 sphere \
@@ -1010,25 +830,6 @@ fn a_hard_palette_makes_the_render_a_binary_mask_and_the_rows_run_top_down() {
 
 /// A sphere planted in box space projects to the silhouette an exact
 /// ray-sphere test predicts.
-///
-/// The perspective silhouette of a sphere is a conic, and deriving the conic is
-/// unnecessary: testing per pixel whether the ray meets the sphere is the same
-/// statement and is exact. The world is anisotropic — the box is 240 x 240 x 60
-/// km — so the object is a sphere in **box** space, an ellipsoid in kilometres,
-/// and both the planting and the test live in the unit cube the shader marches.
-/// `a_sphere_in_kilometres_is_an_ellipsoid_in_box_space_and_renders_as_one` does
-/// the other case.
-///
-/// Reported against two predictions, for the reason the module doc gives: the
-/// exact planted radius, and that radius dilated by one cell per axis, which is
-/// where the linear filter puts the threshold crossing. The truth sits between
-/// them and the point is the size of the gap, not which side of it is "right".
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_silhouette \
-///     a_planted_sphere_projects_to_its_exact_ray_cast_silhouette \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn a_planted_sphere_projects_to_its_exact_ray_cast_silhouette() {
@@ -1118,19 +919,6 @@ fn a_planted_sphere_projects_to_its_exact_ray_cast_silhouette() {
 }
 
 /// An off-centre sphere puts its silhouette exactly where the rays say.
-///
-/// Area can be right while position is wrong — a transposed matrix column, a
-/// pivot applied to the wrong space, an eye that disagrees with its own
-/// `box_from_clip` all preserve the size of a blob and move it. The centroid is
-/// what sees that, and it is measured against the analytic centroid rather than
-/// against the image centre, so a legitimately off-centre silhouette is not
-/// mistaken for an error.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_silhouette \
-///     an_off_centre_sphere_puts_its_silhouette_where_the_rays_say \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn an_off_centre_sphere_puts_its_silhouette_where_the_rays_say() {
@@ -1184,25 +972,6 @@ fn an_off_centre_sphere_puts_its_silhouette_where_the_rays_say() {
 
 /// An eye **inside** the box sees what is ahead of it and none of what is
 /// behind it.
-///
-/// The GPU half of the #6 zoom: `OrbitCamera`'s minimum eye distance is 0.05
-/// framing radii, which puts the eye inside the volume, and the shader's
-/// licence for that is one clamp — `slab_entry_exit` takes
-/// `max(near.z, 0.0)`, so a ray from an inside eye marches forward from the
-/// eye rather than from the box wall *behind* it. This is the test that can
-/// see that clamp break: without it the march starts at a negative parameter,
-/// samples the line behind the eye, and a shape planted at the camera's back
-/// composites in front of everything. So two renders from the same inside
-/// camera: a sphere wholly behind the eye must paint **nothing**, and a
-/// sphere ahead must land exactly where the rays say. At 1x and 12x
-/// exaggeration: the stop itself no longer moves with the knob, but the box
-/// grows around the eye, so "inside" is worth re-asserting at both ends.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_silhouette \
-///     an_eye_inside_the_box_sees_ahead_and_none_of_what_is_behind \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn an_eye_inside_the_box_sees_ahead_and_none_of_what_is_behind() {
@@ -1299,18 +1068,6 @@ fn an_eye_inside_the_box_sees_ahead_and_none_of_what_is_behind() {
 
 /// An axis-aligned slab projects to the silhouette an exact ray-box test
 /// predicts.
-///
-/// Two shapes, because they fail differently: a horizontal layer spanning all
-/// of x and y is bounded by the *box's* faces on four sides and by its own on
-/// two, so it tests the shader's own slab clamp as much as the geometry; a
-/// wall thin in one horizontal axis is bounded by its own faces on the two
-/// axes a camera at 225° sees most obliquely.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_silhouette \
-///     a_planted_slab_projects_to_its_exact_ray_cast_silhouette \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn a_planted_slab_projects_to_its_exact_ray_cast_silhouette() {
@@ -1422,19 +1179,6 @@ fn a_planted_slab_projects_to_its_exact_ray_cast_silhouette() {
 
 /// A sphere that is a true sphere in **kilometres** is an ellipsoid in box
 /// space, and renders as one.
-///
-/// The case that separates "the renderer is correct" from "the renderer and the
-/// test share a mistake about the anisotropy". Every other geometry here is
-/// planted in box coordinates, where a mix-up between the box's axes would be
-/// invisible; this one is defined in kilometres, converted through
-/// `box_size_km` on the way in, and tested against the ellipsoid that
-/// conversion produces.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_silhouette \
-///     a_sphere_in_kilometres_is_an_ellipsoid_in_box_space_and_renders_as_one \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn a_sphere_in_kilometres_is_an_ellipsoid_in_box_space_and_renders_as_one() {
@@ -1514,52 +1258,6 @@ fn a_sphere_in_kilometres_is_an_ellipsoid_in_box_space_and_renders_as_one() {
 
 /// The silhouette tracks the rays at every vertical exaggeration, and a cube's
 /// measured aspect grows exactly linearly with the knob.
-///
-/// # The primary check
-///
-/// The exaggeration is applied to the *camera's* box only, so at every setting
-/// the render must still agree with the analytic ray cast computed from that
-/// setting's own `box_from_clip`. Nothing about the object moves; the frame
-/// around it does.
-///
-/// # What "predicts" means for the aspect
-///
-/// Derived rather than guessed. Put the camera due south and level (yaw 180,
-/// pitch 0), where `right` is world `+x` and `up` is world `+z` exactly. Plant
-/// a cube of half-extent `h` in **box** space; in the drawn world its half
-/// extents are `(h·Sx, h·Sy, h·Sz·E)` because the exaggeration stretches the
-/// box's `z` extent. With the eye at `(0, −D, 0)` and `f = 1/tan(fov_y/2)`, the
-/// silhouette of a box viewed face-on is the projection of its near face, so
-///
-/// ```text
-/// ndc_y_max = f · h·Sz·E / (D − h·Sy)
-/// ndc_x_max = f · h·Sx   / (aspect · (D − h·Sy))
-/// ```
-///
-/// and in pixels those become `ndc·H/2` and `ndc·W/2`. The measured
-/// **height/width ratio in pixels** is therefore
-///
-/// ```text
-/// (h·Sz·E / h·Sx) · aspect · H/W  =  E · Sz/Sx
-/// ```
-///
-/// — the depth term `(D − h·Sy)` cancels exactly, and with `aspect = W/H` so
-/// does the viewport. So the ratio is **linear in E with no compensation at
-/// all**, even though [`framed_distance`] grows `D` with `E` to hold the
-/// silhouette's size. Where that framing compensation shows up is
-/// in the *absolute* sizes, which is why both are printed: the silhouette's
-/// height grows by far less than `E` while its width shrinks, and the ratio is
-/// the product of the two.
-///
-/// The linear-filter bleed cancels from the ratio too, provided the grid is
-/// cubic: it is one cell in box space on both axes, and both axes carry the
-/// same box half-extent `h`.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_silhouette \
-///     the_silhouette_matches_the_rays_at_every_vertical_exaggeration \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn the_silhouette_matches_the_rays_at_every_vertical_exaggeration() {
@@ -1674,39 +1372,6 @@ fn the_silhouette_matches_the_rays_at_every_vertical_exaggeration() {
 
 /// Optical depth is measured against the **unexaggerated** box, and the raw
 /// alpha at the centre is not invariant — the two are different statements.
-///
-/// # What is actually invariant
-///
-/// `uniform.box_size_km` is the true extent, so `step_length_km` reconstructs
-/// kilometres from a box-space ray with the *unstretched* scale. That is the
-/// invariant, and it is what this measures: at each exaggeration the alpha at
-/// the silhouette centre is compared against `1 − exp(−A·σ·L)` where `L` is
-/// computed from the uniform's own ray and its own `box_size_km`. The step
-/// count drops out in expectation: every sample's segment is `dt` and the
-/// jittered comb takes `span/dt` samples on average, so the summed optical
-/// depth telescopes to `σ·L` with a residual of at most one segment — under
-/// 0.004 of optical depth at this test's extinction.
-///
-/// # What is *not* invariant, and why the obvious version of this test is wrong
-///
-/// The alpha at the centre pixel changes a great deal with the knob, and that
-/// is correct rather than a defect. Turning the exaggeration up moves the eye
-/// out along the *same world direction* but converts it into box space through
-/// a `z` divided by `Sz·E`, so the ray's direction **in box space** flattens.
-/// A flatter box-space ray crosses more cells and, reconstructed through the
-/// true `box_size_km`, more kilometres. An exaggerated view genuinely looks
-/// through more of the volume; comparing the two alphas directly would be
-/// asserting that it does not.
-///
-/// The discriminating measurement is the one below: the exaggerated case is
-/// checked against the true-box prediction, and the stretched-box prediction is
-/// printed next to it so the gap between the two is on the record.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_silhouette \
-///     optical_depth_is_measured_against_the_unexaggerated_box \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn optical_depth_is_measured_against_the_unexaggerated_box() {
@@ -1791,27 +1456,6 @@ fn optical_depth_is_measured_against_the_unexaggerated_box() {
 
 /// The linear filter bleeds half a cell past a sharp flat top. This measures
 /// how much, in pixels and in kilometres.
-///
-/// A slab whose top face is exactly on a cell boundary is viewed level from due
-/// south, where that edge is a perfectly horizontal image line — the top edge
-/// of the silhouette is the projection of a line of constant depth, so it is
-/// straight and horizontal, and "how many rows above it did anything paint" is
-/// a well-posed question.
-///
-/// The overshoot is then converted out of pixels by casting the ray at the
-/// topmost painted row and intersecting it with the box's near face, which is
-/// the plane the silhouette's top edge lies in. That gives the overshoot in box
-/// `z`, which multiplies straight into cells and into kilometres.
-///
-/// The two boxes are the *same shape scaled by six*, so the pixel figures are
-/// expected to be identical and only the kilometre figures move — the point
-/// being that the artifact is a fixed fraction of a cell, not a fixed distance.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_silhouette \
-///     the_linear_filter_bleeds_half_a_cell_past_a_sharp_top \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn the_linear_filter_bleeds_half_a_cell_past_a_sharp_top() {
@@ -1851,17 +1495,6 @@ fn the_linear_filter_bleeds_half_a_cell_past_a_sharp_top() {
             let analytic_top = top_row(&expected);
 
             // Out of pixels and into box z. Two places are worth naming:
-            //
-            // * the box's near face (`y = 0` for a camera due south), which is
-            //   where the silhouette's top edge geometrically lies, and
-            // * the ray's **first sample**, this pixel's jitter fraction of a
-            //   step further in, which is the first place the shader can see
-            //   anything at all.
-            //
-            // The filter's threshold crossing is a statement about the second.
-            // Reading the overshoot off the first would charge the filter for
-            // the march's lead-in as well. The host `ign` may differ from the
-            // GPU's by an FMA rounding, so this is reporting, not an oracle.
             let places = |row: u32| {
                 let (origin, direction) = ray_for_pixel(&uniform, column, row, size);
                 let (entry, exit) = slab(origin, direction, [0.0; 3], [1.0; 3]);
@@ -1909,23 +1542,6 @@ fn the_linear_filter_bleeds_half_a_cell_past_a_sharp_top() {
     }
 
     // --- the edge does NOT move with the value at the edge
-    //
-    // This used to be the opposite measurement, and it was the right one for
-    // the path it was written against: the skip was `index > 0.5/255` on the
-    // **interpolated index**, so between a filled cell of index `n` and an
-    // empty neighbour the crossing sat `1 − 0.5/n` of the way across — 0.998
-    // of a cell for a saturated return, 0.5 of one for the faintest. The same
-    // planted surface had two different silhouettes depending on how strong
-    // its edge was, and a storm's outline crept outward as its edge intensity
-    // rose.
-    //
-    // Under the coverage-premultiplied grid the gate is on the interpolated
-    // *coverage* and the stored value does not enter the reach at all, so this
-    // now measures that the four silhouettes are the **same row**. Kept as a
-    // measurement rather than deleted with the defect: it is the sharpest
-    // statement of what premultiplication bought, it is what residual #1 in
-    // the module doc claims, and it fails loudly if any future gate starts
-    // reading the index again.
     let cells = FINE;
     let box_km = [40.0f32, 40.0, 20.0];
     let uniform = masking_uniform(camera(180.0, 0.0, 1.6, 1.0), box_km, cells, size);
@@ -1987,40 +1603,6 @@ fn the_linear_filter_bleeds_half_a_cell_past_a_sharp_top() {
 
 /// What the voxel-locked march resolves, as two measurements rather than an
 /// argument.
-///
-/// # The step, stated in cells
-///
-/// `dt` is [`RAYMARCH_STEP_CELLS`] cells **along the ray** whatever the box or
-/// the camera, floored so [`RAYMARCH_STEP_CEILING`] steps always cover the
-/// span. The fixed 96-step march this replaced took `N/96` cells per step on
-/// an `N`-cell axis — two to four cells at the desktop grid — and anything
-/// whose chord was shorter than that could vanish. The figure is printed for
-/// every case below, and the depth sweep is where the difference is starkest:
-/// the 96-step march rendered **5.96%** of a one-cell layer at 512 z-cells
-/// and 3.02% at 1024; this march measures 99.99% and 99.83%.
-///
-/// # Thin slabs
-///
-/// A slab one and two cells thick, seen from two very different elevations.
-/// Note which way round the risk runs: a *grazing* camera gives a horizontal
-/// slab a long chord and is the easy case; the dangerous one is looking
-/// straight down at it, where the chord is the thickness itself. Coverage is
-/// reported against the exact slab and against the one-cell dilation, because
-/// the filter widens a one-cell slab to roughly three cells and the march
-/// samples every one of them.
-///
-/// # Grid resolution
-///
-/// The same sphere at 256³ and 64³. If the march were the dominant residual the
-/// coarse grid would do *better*, since its cells are larger relative to `dt`;
-/// if the filter dominates, the coarse grid does worse. The printed pair says
-/// which.
-///
-/// ```text
-/// cargo test -p rustdar-gpu --test volume_silhouette \
-///     what_the_voxel_locked_march_resolves_of_a_thin_slab_and_a_fine_grid \
-///     -- --ignored --exact --nocapture
-/// ```
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn what_the_voxel_locked_march_resolves_of_a_thin_slab_and_a_fine_grid() {
@@ -2090,15 +1672,6 @@ fn what_the_voxel_locked_march_resolves_of_a_thin_slab_and_a_fine_grid() {
     }
 
     // --- the sweep the 96-step march failed
-    //
-    // A one-cell layer at ever finer z. Under the fixed-count march this was
-    // a cliff — 99.14% coverage at 256 z-cells, 5.96% at 512, 3.02% at 1024 —
-    // because 96 samples per crossing is 96 samples however many cells there
-    // are. The voxel-locked step resolves the layer at every depth: past 512
-    // z-cells the near-vertical chord outruns the ceiling and the `dt` floor
-    // stretches the step to ~2 z-cells, which the filter's ~3-cell widening
-    // still covers. The assert is the whole ladder now, not only the shipped
-    // rung.
     println!("a one-cell layer at increasing z resolution, seen near-nadir:");
     for depth in [128u32, 256, 512, 1024] {
         let cells = [64u32, 64, depth];

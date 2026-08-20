@@ -11,23 +11,14 @@ use rustdar_geo::GeoPolygon;
 use super::alert::NwsAlert;
 use super::colors::alert_color;
 
-/// One year. Zone boundaries are effectively static.
 #[cfg(not(target_arch = "wasm32"))]
 const CACHE_TTL_SECS: u64 = 365 * 24 * 3600;
 
 /// Which simplification produced the polygons on disk.
 ///
-/// The cache stores the *simplified* rings, not what the origin sent, and it
-/// holds them for a year. So a change to [`crate::render::geo::simplify_ring`]
-/// does not reach a zone anyone has already looked at — it reaches it next
-/// August. Without this, fixing a simplifier that was deleting small islands
-/// would have left every island already deleted on this machine deleted, and
-/// the fix would have read as working only on a cache nobody has.
-///
-/// Bump it whenever the geometry written here changes shape. An entry with a
-/// different value — or with no `schema` field at all, which is every entry
-/// written before this existed — fails to deserialize or fails the check, and
-/// is refetched.
+/// The cache stores the *simplified* rings for a year, so a change to
+/// [`crate::render::geo::simplify_ring`] does not reach a zone already on disk.
+/// An entry with a different value, or with none, is refetched.
 #[cfg(not(target_arch = "wasm32"))]
 const ZONE_CACHE_SCHEMA: u32 = 1;
 
@@ -51,42 +42,21 @@ fn log_cache_write_failure(msg: &str) {
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CachedZone {
-    /// [`ZONE_CACHE_SCHEMA`]. No `serde` default, so an entry from before it
-    /// existed does not parse and is refetched rather than trusted.
     schema: u32,
-    /// Unix seconds.
     fetched_at: u64,
-    /// Already simplified.
     polygons: Vec<GeoPolygon>,
 }
 
-/// Why one zone's boundary did not arrive.
-///
-/// The leaf of the accounting, and the reason the panel can say *why* rather
-/// than only *how many*. Every route out of [`fetch_zone_geometry`] that is not
-/// a boundary lands on one of these; there is no fall-through, which is what
-/// stops a new failure mode from being invisible the way all five of these were.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ZoneFailure {
-    /// The request never produced a status: DNS, TLS, a dropped connection,
-    /// a timeout — or, on web, a CORS rejection wearing the browser's
-    /// deliberately opaque `TypeError`.
+    /// The request never produced a status: DNS, TLS, a dropped connection, a
+    /// timeout — or a CORS rejection wearing the browser's opaque `TypeError`.
     Unreachable,
-    /// The origin answered, and not with a boundary.
     Http(u16),
-    /// A body that would not read, or would not parse as JSON.
     Unreadable,
-    /// Parsed, and carried nothing this renderer can draw: a null `geometry`,
-    /// or a type that is not `Polygon`, `MultiPolygon`, or a
-    /// `GeometryCollection` of those.
-    ///
-    /// It used to mean two further things, and both of them were us rather than
-    /// the origin: a `GeometryCollection`, which is how the NWS serves 227 of
-    /// its 11,651 zones, and a zone every one of whose rings the simplifier ate.
-    /// With those closed, **no zone in the published corpus reaches this
-    /// variant** — measured over all 11,651 of them by the `zone_geometry_tests`
-    /// module, which is `cfg(test)` and so cannot be linked from here. A count
-    /// against it now really does mean the origin sent something undrawable.
+    /// Parsed, and carried nothing this renderer can draw. No zone in the
+    /// published corpus reaches this variant — measured over all 11,651 — so a
+    /// count against it means the origin sent something undrawable.
     NoBoundary,
 }
 
@@ -103,25 +73,12 @@ impl std::fmt::Display for ZoneFailure {
     }
 }
 
-/// What one pass of [`resolve_zone_geometries`] managed, in the terms the layer
-/// needs to say so.
-///
-/// This function returned `()`. It could not report failure, so nothing
-/// downstream could: a zone whose fetch failed was skipped at the one `if let`
-/// that consults the cache, an alert whose zones all failed kept an empty
-/// feature list and drew nothing, and the alerts layer went on reporting
-/// `Updated 0s ago` — truthfully, because the *alert* fetch had succeeded.
-/// Observed once: 212 of 297 warnings absent from the map with a fully green
-/// status line.
-///
-/// Alerts are counted in three buckets rather than two because the middle one
-/// is the worst: an alert that resolved some of its zones draws a real shape
-/// that is the **wrong** shape, and a three-county outline says nothing about
-/// the two counties missing from it.
+/// What one pass of [`resolve_zone_geometries`] managed. Alerts are counted in
+/// three buckets rather than two because the middle one is the worst: a
+/// partly-resolved alert draws a real shape that is the wrong shape.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ZoneResolution {
-    /// Alerts that arrived with zone references and no geometry of their own —
-    /// everything this pass was asked to place on the map.
+    /// Alerts that arrived with zone references and no geometry of their own.
     pub alerts_expected: usize,
     /// ...that ended up with every zone they named.
     pub alerts_complete: usize,
@@ -129,20 +86,13 @@ pub struct ZoneResolution {
     pub alerts_partial: usize,
     /// ...that ended up with none, and so draw nothing at all.
     pub alerts_missing: usize,
-    /// Distinct zone URLs needed, and obtained (from disk cache or network).
     pub zones_requested: usize,
     pub zones_resolved: usize,
-    /// Why the rest were not obtained, commonest first. Sums to
-    /// `zones_requested - zones_resolved`.
+    /// Why the rest were not obtained, commonest first.
     pub failures: Vec<(ZoneFailure, usize)>,
 }
 
 impl ZoneResolution {
-    /// The layer-agnostic report the UI renders, from the zone-specific one.
-    ///
-    /// The translation lives here, not in the handler: the handler's job is to
-    /// hold what it was given, and the words for "zone boundary" belong to the
-    /// module that fetches them.
     pub fn completeness(&self) -> DataCompleteness {
         DataCompleteness {
             expected: self.alerts_expected,
@@ -161,43 +111,17 @@ impl ZoneResolution {
     }
 }
 
-/// An alert this pass is asked to place: one that named zones and brought no
-/// geometry of its own.
 fn needs_zones(alert: &NwsAlert) -> bool {
     alert.features.is_empty() && !alert.affected_zones.is_empty()
 }
 
 /// A zone URL as the seen-set in [`distinct_zone_urls`] keys it.
 ///
-/// A newtype over the `&str` rather than the `&str` itself because it is then
-/// the **one place a zone URL is hashed or compared**, and under `cfg(test)`
-/// those two impls tally each examination. That is what lets
-/// `the_zone_list_costs_one_pass_not_one_scan_per_url` state the cost of the
-/// dedup as a count of URLs looked at rather than as a ratio of two
-/// `Instant`s, which is a reading of whatever else the machine was doing.
-///
-/// **The tally is stable within a band, not exact**, and the distinction
-/// matters enough to spell out. The hash half is one call per reference and is
-/// the same integer everywhere. The `eq` half is not: `hashbrown` calls it only
-/// when a 7-bit control byte collides, so it depends on `RandomState`'s
-/// per-process seed. Measured over two runs of the small round, the hash half
-/// held at 5,580 and the `eq` half moved 184 to 202, carrying the total from
-/// 5,764 to 5,782 — 10% of the `eq` half, 0.3% of the total, against the 1.7x
-/// of headroom the assertion leaves. That is why the band is a band
-/// and not an equality, and it is the one respect in which this count is weaker
-/// than `the_hover_lookup_does_not_walk_the_gates`', which has no randomness in
-/// it and is asserted as an exact `64`.
-///
-/// Outside `cfg(test)` the two impls are what `derive` would have written and
-/// forward straight to `&str`'s, so no build that ships pays for the wrapper or
-/// knows it was here.
-///
-/// **The tally has to move with the key type.** A rewrite of the dedup that is
-/// perfectly good on its own terms -- a `BTreeSet<String>`, a sort-and-dedup, a
-/// `HashMap<&str, usize>` -- stops going through these impls, the count reads
-/// zero, and the test red-gates on a change that broke nothing. The failure
-/// message says so in as many words rather than leaving it to be worked out,
-/// but the counter belongs wherever the membership decision ends up.
+/// A newtype over the `&str` because it is then the one place a zone URL is
+/// hashed or compared, and under `cfg(test)` those impls tally each examination
+/// — so the dedup's cost is a count of URLs looked at, not a ratio of two
+/// `Instant`s. Stable within a band, not exact: `hashbrown` calls `eq` only on a
+/// control-byte collision.
 struct SeenUrl<'a>(&'a str);
 
 impl PartialEq for SeenUrl<'_> {
@@ -220,23 +144,16 @@ impl std::hash::Hash for SeenUrl<'_> {
 
 #[cfg(test)]
 thread_local! {
-    /// Zone URLs examined -- hashed or compared -- on this thread since
-    /// [`take_url_examinations`] last took the tally.
-    ///
-    /// Thread-local rather than a `static`: the suite runs its tests in
-    /// parallel threads of one process, and [`distinct_zone_urls`] runs start
-    /// to finish on the thread that called it, so a per-thread tally is both
-    /// the whole tally and nobody else's.
+    /// Zone URLs examined on this thread since [`take_url_examinations`] last
+    /// took the tally. Thread-local: the suite runs its tests in parallel threads.
     static URL_EXAMINATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// One more URL looked at by the dedup.
 #[cfg(test)]
 fn note_url_examination() {
     URL_EXAMINATIONS.with(|n| n.set(n.get() + 1));
 }
 
-/// The examinations since this was last called, and the tally back to zero.
 #[cfg(test)]
 fn take_url_examinations() -> u64 {
     URL_EXAMINATIONS.with(|n| n.replace(0))
@@ -245,27 +162,10 @@ fn take_url_examinations() -> u64 {
 /// Every zone boundary a round has to obtain, once each, in the order the
 /// alerts first name them.
 ///
-/// Named and separated from [`resolve_zone_geometries`] because it is the one
-/// part of the round whose cost is set by the size of the round rather than by
-/// the network, and because that makes it measurable on its own. A busy
-/// afternoon names on the order of 1,900 zones across 220 geometryless alerts,
-/// and on wasm32 this runs on the browser's main thread — the thread that also
-/// has to keep the map moving under the user's hand.
-///
 /// First-seen order is part of the contract: it is the order the fetches are
-/// issued in, so a round that is interrupted has fetched a prefix that depends
-/// on nothing but the alert feed. That is why the answer stays a `Vec` and the
-/// set is only the membership test beside it — a bare `HashSet` would return
-/// the same URLs in an order that changes every run.
-///
-/// The set is not an optimisation detail, it is the difference between one
-/// pass and `n²/2` string compares — which is why it is keyed by [`SeenUrl`],
-/// so that a test can count those compares instead of timing them. A
-/// measured live round — 361 alerts, 223 of
-/// them geometryless, 1,904 references, 1,690 distinct — spent **22.5 ms in
-/// Firefox and 13.7 ms in Chrome** scanning the list it was building, on the
-/// browser's main thread, once per alert poll. That is a dropped frame at
-/// 60 Hz and three at 144 Hz, in the middle of a pan.
+/// issued in. The set beside the `Vec` is the difference between one pass and
+/// `n²/2` string compares — a measured live round (1,904 references, 1,690
+/// distinct) spent **22.5 ms in Firefox and 13.7 ms in Chrome** rescanning.
 pub fn distinct_zone_urls(alerts: &[NwsAlert]) -> Vec<String> {
     let mut needed_urls: Vec<String> = Vec::new();
     let mut seen: HashSet<SeenUrl<'_>> = HashSet::new();
@@ -280,14 +180,11 @@ pub fn distinct_zone_urls(alerts: &[NwsAlert]) -> Vec<String> {
 }
 
 /// Fills in `features` for alerts that carry only `affectedZones`, and reports
-/// what it managed. URLs are deduplicated, so each county is fetched at most
-/// once. Without `cache_dir` this is 1000+ requests on every launch.
+/// what it managed. URLs are deduplicated. Without `cache_dir` this is 1000+
+/// requests on every launch.
 ///
-/// **Nothing is dropped and nothing is invented.** An alert whose zones did not
-/// resolve keeps its place in the list with an empty feature vector — it is
-/// still selectable, still counted, still there next poll to try again — and no
-/// stand-in geometry is ever produced for it. What changes is that the count of
-/// them comes back to the caller instead of dying here; see [`ZoneResolution`].
+/// An alert whose zones did not resolve keeps its place in the list with an
+/// empty feature vector; no stand-in geometry is ever produced for it.
 pub async fn resolve_zone_geometries(
     client: &reqwest::Client,
     alerts: &mut [NwsAlert],
@@ -325,8 +222,8 @@ pub async fn resolve_zone_geometries(
         urls_to_fetch.len(),
     );
 
-    // Tallied by cause rather than kept per URL: the panel says how many and
-    // why, and a thousand-line list of counties is not a sentence anyone reads.
+    // Tallied by cause rather than kept per URL: a thousand-line list of
+    // counties is not a sentence anyone reads.
     let mut failures: BTreeMap<ZoneFailure, usize> = BTreeMap::new();
 
     if !urls_to_fetch.is_empty() {
@@ -335,8 +232,6 @@ pub async fn resolve_zone_geometries(
         const MAX_CONCURRENT_FETCHES: usize = 10;
 
         let results: Vec<_> = stream::iter(urls_to_fetch.into_iter().map(|url| {
-            // reqwest::Client is Arc-backed: this is a ref-count bump, not a
-            // connection-pool copy.
             let client = client.clone();
             async move {
                 let result = fetch_zone_geometry(&client, &url).await;
@@ -378,10 +273,8 @@ pub async fn resolve_zone_geometries(
         for url in &alert.affected_zones {
             if let Some(polys) = zone_cache.get(url) {
                 placed += 1;
-                // The alerts of this round are not yet published, so this is
-                // the parse-time build finishing, not a copy-on-write: the
-                // `Arc` is still uniquely held and `make_mut` mutates in
-                // place.
+                // The alerts of this round are not yet published, so the `Arc`
+                // is still uniquely held and `make_mut` mutates in place.
                 Arc::make_mut(&mut alert.features).push(OverlayFeature::new(
                     polys.clone(),
                     fill_rgba,
@@ -412,8 +305,7 @@ pub async fn resolve_zone_geometries(
         ..
     } = resolution;
     if alerts_partial > 0 || alerts_missing > 0 {
-        // WARN, not INFO: this is the layer under-drawing, and the log line was
-        // the only trace of it that ever existed.
+        // WARN, not INFO: this is the layer under-drawing.
         log::warn!(
             "Zone geometries incomplete: {zones_resolved}/{zones_requested} boundaries \
              resolved, so {alerts_missing} of {alerts_expected} alerts draw nothing and \
@@ -478,18 +370,9 @@ async fn fetch_zone_json(
     })
 }
 
-/// The zones API returns a bare Feature, not a FeatureCollection: `geometry`
-/// is at the top level. County rings run 100+ vertices each, which is finer
-/// than the map shows, so they are simplified here: fewer vertices to project
-/// and fill on every render, and smaller files in the on-disk zone cache.
-///
-/// The `len() >= 3` filter is defence, not policy, and it can no longer fire:
-/// [`parse_polygon_coords`](crate::types::parse_polygon_coords) admits no ring
-/// shorter than that and [`simplify_ring`](crate::render::geo::simplify_ring)
-/// no longer shortens one past it. When it *could* fire it was the whole
-/// mechanism by which small islands left the map, and — because it ran over
-/// every ring of a polygon including the first — a way for a surviving hole to
-/// be promoted to an exterior ring and painted solid.
+/// The zones API returns a bare Feature, not a FeatureCollection: `geometry` is
+/// at the top level. County rings run 100+ vertices each, finer than the map
+/// shows, so they are simplified here.
 fn parse_zone_polygons(json: &serde_json::Value, url: &str) -> Option<Vec<GeoPolygon>> {
     let polys = super::alert::parse_geometry(json.get("geometry"))?;
 
@@ -515,7 +398,6 @@ fn parse_zone_polygons(json: &serde_json::Value, url: &str) -> Option<Vec<GeoPol
     }
 }
 
-// ── Disk cache helpers ───────────────────────────────────────────────────
 
 #[cfg(not(target_arch = "wasm32"))]
 fn unix_now() -> u64 {
@@ -525,8 +407,8 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// `https://api.weather.gov/zones/county/TXC113` → `"county_TXC113"`. The kind
-/// must stay in the key: the same id exists under several zone kinds.
+/// `https://api.weather.gov/zones/county/TXC113` → `"county_TXC113"`: the kind
+/// must stay in the key, since the same id exists under several zone kinds.
 #[cfg(not(target_arch = "wasm32"))]
 fn zone_cache_key(url: &str) -> Option<String> {
     let trimmed = url.trim_end_matches('/');
@@ -537,14 +419,8 @@ fn zone_cache_key(url: &str) -> Option<String> {
 }
 
 /// `None` if missing, corrupt, written by a different simplification, or past
-/// the TTL.
-///
-/// The last three are one case, not three, and the reason to say so is the
-/// removal: a file that will not parse will not parse next poll either, and one
-/// left in place is re-read for every alert that names its zone until its
-/// year-long TTL — which it cannot reach, because reaching it requires parsing
-/// the timestamp inside it. Corrupt entries used to be exactly that, silently
-/// skipped and never cleared.
+/// the TTL. A file that will not parse will not parse next poll either, so a
+/// corrupt entry is removed rather than re-read for every alert naming its zone.
 #[cfg(not(target_arch = "wasm32"))]
 async fn read_cached_zone(cache_dir: &Path, url: &str) -> Option<Vec<GeoPolygon>> {
     let key = zone_cache_key(url)?;
@@ -595,13 +471,9 @@ async fn write_cached_zone(cache_dir: &Path, url: &str, polygons: &[GeoPolygon])
     }
 }
 
-// ── Web: no filesystem ───────────────────────────────────────────────────
-//
-// Same signatures rather than cfg at the call sites, so the caching *policy*
-// has one body on every target and cannot drift between native and web.
-//
-// Real behavioural difference, not a stub: on web every zone is re-fetched
-// each session, and the browser's own HTTP cache is the layer that absorbs it.
+// Web: no filesystem. Same signatures rather than cfg at the call sites, so the
+// caching *policy* has one body on every target. On web every zone is re-fetched
+// each session, and the browser's own HTTP cache absorbs it.
 
 #[cfg(target_arch = "wasm32")]
 async fn read_cached_zone(_cache_dir: &Path, _url: &str) -> Option<Vec<GeoPolygon>> {
@@ -611,25 +483,17 @@ async fn read_cached_zone(_cache_dir: &Path, _url: &str) -> Option<Vec<GeoPolygo
 #[cfg(target_arch = "wasm32")]
 async fn write_cached_zone(_cache_dir: &Path, _url: &str, _polygons: &[GeoPolygon]) {}
 
-/// Why a boundary goes missing, against the geometry the NWS really serves.
 #[cfg(test)]
 mod zone_geometry_tests;
 
-// ── Tests ────────────────────────────────────────────────────────────────
-//
-// Native-only: the loopback stub is `std::net::TcpListener` and a real thread,
-// neither of which exists on wasm32. The code under test is not gated — this is
-// the same production body on both targets.
+// Native-only: the loopback stub is `std::net::TcpListener` and a real thread.
+// The code under test is not gated.
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use crate::nws::alert::{AlertCategory, NwsAlert};
 
-    /// A canned GeoJSON zone Feature — the bare `Feature` the zones API really
-    /// returns, with `geometry` at the top level rather than a
-    /// `FeatureCollection`. Big enough that `simplify_ring` cannot reduce it
-    /// below three points.
     fn zone_body(lat: f64) -> String {
         format!(
             r#"{{"type":"Feature","geometry":{{"type":"Polygon","coordinates":
@@ -639,13 +503,8 @@ mod tests {
         )
     }
 
-    /// Serve canned responses by path from a loopback socket, forever.
-    ///
-    /// Routed rather than one-shot (`rustdar_radar::archive`'s `serve_once` is
-    /// the single-response shape): the whole point here is a round of many
-    /// requests where *some* succeed, which one response cannot express. An
-    /// unrouted path answers 500, so a test states only what it wants to
-    /// succeed.
+    /// Serve canned responses by path from a loopback socket, forever. An
+    /// unrouted path answers 500, so a test states only what it wants to succeed.
     fn serve(routes: HashMap<String, (u16, String)>) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
@@ -684,8 +543,6 @@ mod tests {
             .expect("client")
     }
 
-    /// A zone-based alert exactly as the parser admits one: zone URLs, no
-    /// geometry of its own, no features.
     fn zone_alert(id: &str, zones: Vec<String>) -> NwsAlert {
         NwsAlert {
             id: id.to_string(),
@@ -715,10 +572,6 @@ mod tests {
             .expect("a tokio runtime")
     }
 
-    /// Everything resolves: three counties, three outlines, nothing to report.
-    ///
-    /// The counterweight to the two below — without it, a resolver that failed
-    /// on everything would satisfy them both.
     #[test]
     fn a_round_that_resolves_every_zone_reports_nothing_missing() {
         let routes: HashMap<String, (u16, String)> = (0..3)
@@ -761,11 +614,7 @@ mod tests {
     }
 
     /// **The observed bug.** Every zone fails, so the alert draws nothing — and
-    /// the round still has to say so, because the alert fetch itself succeeded
-    /// and nothing else on screen will.
-    ///
-    /// The failure is counted by cause, not merely counted: 503 and a body that
-    /// is not JSON are different things to whoever is reading the panel.
+    /// the round still has to say so, counted by cause.
     #[test]
     fn a_round_that_resolves_no_zone_says_the_alert_draws_nothing() {
         let base = serve(HashMap::from([(
@@ -821,13 +670,7 @@ mod tests {
     }
 
     /// **The worst case, and the one nothing could see.** Two of three counties
-    /// resolve, so the alert draws a real outline that is the *wrong* outline —
-    /// and unlike a missing alert, there is nothing about the picture that looks
-    /// wrong at all.
-    ///
-    /// Counted apart from `alerts_missing` for exactly that reason: "212 not on
-    /// the map" and "6 drawing two thirds of themselves" are different things to
-    /// tell someone standing under the third county.
+    /// resolve, so the alert draws an outline that is the *wrong* outline.
     #[test]
     fn a_round_that_resolves_some_of_an_alerts_zones_reports_it_as_partial() {
         let base = serve(HashMap::from([
@@ -874,8 +717,7 @@ mod tests {
     }
 
     /// An alert is whole when **its own** zones are all there, however badly the
-    /// rest of the round went. Two alerts, one county each, one of the two
-    /// counties dead: one complete and one missing, not two partials.
+    /// rest of the round went.
     #[test]
     fn each_alert_is_judged_against_its_own_zones_and_not_the_round() {
         let base = serve(HashMap::from([(
@@ -900,10 +742,6 @@ mod tests {
         assert!(alerts[1].features.is_empty());
     }
 
-    /// An alert that arrived with its own geometry is not this pass's business:
-    /// it is not counted, and its features are left exactly as they were. Without
-    /// this the many alerts that carry *both* a polygon and an `affectedZones`
-    /// list would read as 1-of-5 partial for ever.
     #[test]
     fn an_alert_that_brought_its_own_geometry_is_not_counted_as_a_zone_alert() {
         let base = serve(HashMap::new());
@@ -932,10 +770,6 @@ mod tests {
         assert_eq!(alerts[0].features.len(), 1, "its own geometry is untouched");
     }
 
-    /// A body that parses but carries nothing drawable is its own cause, not a
-    /// transport failure — the panel line is what a user reads back, and
-    /// "unreachable" for a zone the origin served would send them to their
-    /// router.
     #[test]
     fn a_zone_with_no_drawable_boundary_is_reported_as_such() {
         let base = serve(HashMap::from([(
@@ -954,9 +788,8 @@ mod tests {
         assert_eq!(resolution.alerts_missing, 1);
     }
 
-    /// The contract [`distinct_zone_urls`] is allowed to be fast within: each
-    /// URL once, in the order the alerts first name it, and an alert that
-    /// brought its own geometry contributes nothing.
+    /// The contract [`distinct_zone_urls`] is allowed to be fast within: each URL
+    /// once, in first-name order, and an alert with its own geometry adds none.
     #[test]
     fn the_zone_list_is_first_seen_order_with_no_repeats() {
         let mut carries_geometry = zone_alert("has-own", vec!["z/never".to_string()]);
@@ -981,57 +814,20 @@ mod tests {
     /// A round costs one pass over its zone references, not one scan of
     /// everything already collected per reference.
     ///
-    /// **A count of URLs looked at, not a duration.** The property is a
-    /// traversal count, and a traversal count is the same integer on every
-    /// machine under every load; a duration is a statement about the machine
-    /// that took it. This test used to divide two `Instant`s and assert the
-    /// ratio was under 8, and on a contended box the numerator and denominator
-    /// sample different slices of a machine that is busy with something else —
-    /// it read 11.2x at a load average of 46 with nothing whatever wrong with
-    /// the code, and no number of repeats rescues a ratio, because both halves
-    /// of it are noise.
-    ///
-    /// [`SeenUrl`] is the one place a zone URL is hashed or compared, so
-    /// [`take_url_examinations`] is the whole cost of the dedup. It is asserted
-    /// in **two halves, and the first one is not optional**: that the count is
-    /// there at all and is the size one pass is — **between one and five
-    /// examinations per reference, and a little under three in fact** — and
-    /// only then that the per-reference figure does not move when the round
-    /// grows tenfold. A counter that had gone dead reads zero at both sizes,
-    /// and zero is perfectly invariant under anything; a test asserting only
-    /// the shape would pass on it while protecting nothing.
-    ///
-    /// Where the three comes from: one hash per reference, plus the set's own
-    /// rehashes as it grows, which `hashbrown` pays by re-hashing every element
-    /// it already holds at each doubling and which sum to about two more each.
-    /// The band is one to five rather than something tighter because that
-    /// number is a property of the set's growth policy, not of this code, and a
-    /// band that tracked it exactly would red-gate on a dependency bump. Even
-    /// five is a factor of two hundred below the rescan at this size.
-    ///
-    /// Reverting the set to `needed_urls.contains` looks at
-    /// `references × distinct / 2` instead: a thousand times as many at the
-    /// small size, growing a hundredfold rather than tenfold when the round
-    /// does. The live round this was written for -- 1,904 references, 1,690
-    /// distinct -- cost 22.5 ms on Firefox's main thread that way, per alert
-    /// poll.
+    /// **A count of URLs looked at, not a duration.** [`SeenUrl`] is the one
+    /// place a zone URL is hashed or compared. Asserted in two halves: that the
+    /// count is there and is the size one pass is — **one to five examinations
+    /// per reference** — and then that it does not move when the round grows
+    /// tenfold. A dead counter reads zero at both sizes.
     #[test]
     fn the_zone_list_costs_one_pass_not_one_scan_per_url() {
-        /// Zones per alert, as the feed groups them.
         const PER_ALERT: usize = 8;
-        /// Distinct URLs at the small size, each named exactly once, so this is
-        /// the reference count too.
+        /// Distinct URLs at the small size — the reference count too.
         const SMALL: usize = 2_000;
-        /// ...and at the large one. Ten rather than the two that would separate
-        /// linear from quadratic, so that an implementation scaling only partly
-        /// has less room to sit: one pass grows tenfold and a rescan per URL a
-        /// hundredfold. The threshold sits at twenty, which is 2x above linear
-        /// and 5x below quadratic -- not the same margin on both sides, and the
-        /// tight side is the one that would cry wolf.
+        /// ...and at the large one. Ten rather than two: one pass grows tenfold
+        /// and a rescan per URL a hundredfold.
         const LARGE: usize = SMALL * 10;
 
-        /// Full-length zone URLs, because the compare being counted here is a
-        /// `String` compare and short strings would flatter it.
         fn round(distinct: usize) -> Vec<NwsAlert> {
             (0..distinct.div_ceil(PER_ALERT))
                 .map(|alert| {
@@ -1048,8 +844,6 @@ mod tests {
                 .collect()
         }
 
-        /// What one pass over `alerts` looked at, with the tally taken fresh
-        /// first so that nothing the fixture did is counted in it.
         fn examinations(alerts: &[NwsAlert]) -> u64 {
             let _ = take_url_examinations();
             let urls = distinct_zone_urls(alerts);
@@ -1061,10 +855,8 @@ mod tests {
         let small = examinations(&round(SMALL));
         let large = examinations(&round(LARGE));
 
-        // Half one, and the half that does the work: the number is *there*, and
-        // it is the size one pass is. A counter that had gone dead reads zero at
-        // both sizes, and zero is perfectly invariant under anything, so a
-        // ratio alone would pass over it.
+        // Half one: the number is *there*, and it is the size one pass is.
+        // A dead counter reads zero at both sizes, so a ratio alone would pass.
         for (examined, references, size) in [
             (small, SMALL as u64, "small"),
             (large, LARGE as u64, "large"),
@@ -1083,11 +875,8 @@ mod tests {
             );
         }
 
-        // Half two: and it does not grow when the round does. Mostly implied by
-        // half one, which bounds both sizes per reference -- it bites on its own
-        // only where the small round comes in under 5,000 -- but it is the
-        // sentence the test is named for and it names the two growth curves in
-        // the failure, so it stays.
+        // Half two: it does not grow when the round does. Mostly implied by half
+        // one, but it names the two growth curves in the failure.
         assert!(
             large < small * 20,
             "ten times the round looked at {:.1}x the URLs ({small} -> \
@@ -1097,8 +886,6 @@ mod tests {
         );
     }
 
-    /// Nothing to do is not a fault: a round of alerts that all carry geometry
-    /// leaves the layer unmarked.
     #[test]
     fn a_round_with_no_zone_alerts_reports_nothing() {
         let mut alerts: Vec<NwsAlert> = Vec::new();

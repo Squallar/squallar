@@ -31,21 +31,14 @@ pub mod scan;
 pub mod site_position;
 pub mod sites;
 pub mod sounding;
-/// The radar layer's `SourceHandler` registration (WO-M9). Named `source`, not
-/// `sources`: this crate's root already publishes `sources` as the network-
-/// origins re-export just below, and one crate publishing two unrelated things
-/// under near-identical names is how a reader learns the wrong one.
+/// The radar layer's `SourceHandler` registration.
 pub mod source;
-/// Network origins, defined in `rustdar-source` and re-exported under the
-/// path this crate always published them at.
+/// Network origins, defined in `rustdar-source` and re-exported here.
 pub use rustdar_source::origins as sources;
 pub mod srm;
 pub mod srv;
-/// Process-wide TLS setup, defined in `rustdar-source` and re-exported under
-/// the path this crate always published it at.
 pub use rustdar_source::tls;
 /// The fresh-process pins tying `scan`/`archive`/`chunks` to `tls::init`.
-/// They stay in this crate because they call this crate; see the module doc.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tls_pins;
 pub mod twin;
@@ -63,8 +56,6 @@ pub use palette::{
     get_legend_scale_ref,
 };
 
-/// The one bounds-checked cursor over untrusted payload bytes, now defined in
-/// `rustdar-source`. Crate-visible only: the frontend's duplicate `Reader`
-/// stays deliberately separate until the M6/M7 unification, and this crate
-/// must not leak `wire` publicly meanwhile.
+/// Bounds-checked cursor over untrusted payload bytes, from `rustdar-source`;
+/// crate-visible only — `wire` must not leak publicly.
 pub(crate) use rustdar_source::wire;

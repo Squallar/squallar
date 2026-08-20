@@ -1,13 +1,4 @@
 //! Runtime layout context: the one place the UI asks "how much room is there?".
-//!
-//! This is what replaces the compile-time desktop/mobile split. There is
-//! exactly one UI; what it looks like is decided per frame from the size of the
-//! content area rather than from `cfg!(target_os = ...)`.
-//!
-//! The wasm build is why none of this can be compile-time: one binary serves a
-//! phone browser and a desktop browser, and a compile-time split is not
-//! expressible there. It is also simply more correct — a 500pt window on a
-//! desktop wants the compact chrome, and the old gate gave it the roomy one.
 
 use rustdar_device_profile::budget::{MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
 
@@ -24,11 +15,6 @@ const COMPACT_DIALOG_MARGIN: f32 = 32.0;
 const COMPACT_DIALOG_MIN_WIDTH: f32 = 200.0;
 
 /// How wide the content area is, bucketed.
-///
-/// Keyed on `Context::content_rect()` — **not** `screen_rect()`, which ignores
-/// safe-area insets, and **not** `ui.available_width()`, which oscillates as
-/// panels claim space (the sidebar's own width would feed back into the
-/// decision about whether to show the sidebar).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WidthClass {
     /// Phone-sized. The layers panel is a drawer; dialogs are full-bleed.
@@ -52,10 +38,6 @@ impl WidthClass {
     }
 
     /// How many panes the pane picker offers at this size.
-    ///
-    /// This is a *presentation* limit — how many panes are worth offering on a
-    /// screen this wide. It is deliberately not the limit a saved config is
-    /// clamped to: see [`Self::max_panes_absolute`].
     pub(crate) fn max_panes(self) -> usize {
         match self {
             Self::Compact => MAX_PANES_MOBILE,
@@ -65,34 +47,17 @@ impl WidthClass {
 
     /// Whether the layers panel takes its sidebar form — open by default and
     /// claiming panel space — as opposed to the drawer a narrower width gets.
-    ///
-    /// A default, not a mandate: the top bar's Layers toggle opens and closes
-    /// the panel at every width, so on Expanded this only says what the panel
-    /// is until the user says otherwise (see `Gui::stack_open`).
     pub(crate) fn has_persistent_sidebar(self) -> bool {
         self == Self::Expanded
     }
 
     /// The largest pane count any device may hold, used when *loading* a config.
-    ///
-    /// Clamping a loaded config to the current device's limit silently destroys
-    /// data: a 5-pane layout saved on a desktop, opened once on a phone, comes
-    /// back as 4 panes and is written back as 4 on the next save. The config is
-    /// shared state, so it is clamped to what the format allows and the picker
-    /// does the per-device narrowing.
     pub(crate) fn max_panes_absolute() -> usize {
         MAX_PANES_DESKTOP
     }
 }
 
 /// What is driving the pointer, latched across frames.
-///
-/// Seeded from `Context::os()` and then overridden by whatever real input
-/// arrives, so a Bluetooth mouse on a tablet and a touchscreen on a laptop both
-/// end up right. Independent of [`WidthClass`] on purpose: a 1400pt Android
-/// tablet is Expanded *and* Touch, a 500pt desktop window is Compact *and*
-/// Mouse. Collapsing the two axes into one "is mobile" boolean is what the old
-/// `cfg!(target_os = "android")` did, and it gets both of those cases wrong.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum PointerModality {
     /// The default is the conservative one, matching `LayoutCtx::default()`:
@@ -104,26 +69,6 @@ pub(crate) enum PointerModality {
 }
 
 /// Remembers the current [`PointerModality`] between frames.
-///
-/// # Why not `has_touch_screen()`
-///
-/// egui's `InputState::has_touch_screen()` is `any_touches() || <a latched
-/// flag>`, and that flag is set the first time a touch is ever seen and never
-/// cleared. One stray palm on a hybrid laptop's touchscreen therefore puts the
-/// whole session into touch mode permanently — including the 400ms tap deferral
-/// on every subsequent mouse click. This latch moves in *both* directions: the
-/// next real mouse event takes it back.
-///
-/// # Why frames, not events
-///
-/// A touch does not arrive as a lone `Touch` event. `egui-winit` maps one
-/// `TouchPhase::Started` to `Touch{Start}` **plus** `PointerMoved` **plus**
-/// `PointerButton{down}`, and eframe's web canvas emits `PointerButton{down}`
-/// *before* `Touch{Start}`. So a per-event rule that treats `PointerButton` as
-/// mouse evidence would flip to Mouse on the same frame every touch flips it to
-/// Touch, and the answer would depend on event order. Instead the whole frame
-/// is classified: a frame containing any `Touch` event is touch evidence and
-/// yields no mouse evidence at all.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ModalityLatch {
     current: Option<PointerModality>,
@@ -179,13 +124,6 @@ pub(crate) struct LayoutCtx {
 
 impl Default for LayoutCtx {
     /// The value a `Gui` holds before its first frame has resolved one.
-    ///
-    /// Nothing should ever read this — `Gui::ui` overwrites it before drawing
-    /// anything — so it is deliberately the *conservative* choice rather than a
-    /// plausible one: a zero-sized content rect classifies as `Compact`, which
-    /// is the layout that assumes the least room. A leak shows up as chrome
-    /// that is too cramped, which is visible, rather than chrome that overflows
-    /// a small screen, which is not.
     fn default() -> Self {
         Self {
             content_rect: egui::Rect::ZERO,
@@ -197,17 +135,6 @@ impl Default for LayoutCtx {
 
 impl LayoutCtx {
     /// Resolve this frame's layout.
-    ///
-    /// `extra_insets` are `(top, bottom, left, right)` insets supplied by the
-    /// host application, applied *on top of* the ones egui already knows about.
-    /// `egui-winit` fills `RawInput::safe_area_insets` itself on iOS, so
-    /// `content_rect()` is already correct there; the Android host pushes its
-    /// `WindowInsets` through a side channel on `Gui` instead, and this is
-    /// where the two are reconciled into one number. Routing the Android insets
-    /// to `egui_input_mut().safe_area_insets` would make `extra_insets` dead —
-    /// but that wiring lives in the host crate, and this type is the single
-    /// source of truth either way, so nothing below has to know which route
-    /// they took.
     pub(crate) fn resolve(
         ctx: &egui::Context,
         latch: &mut ModalityLatch,
@@ -224,9 +151,6 @@ impl LayoutCtx {
 
     /// Width for a modal dialog: full-bleed with a gutter when compact, a fixed
     /// comfortable width otherwise.
-    ///
-    /// Measured against the *content* rect, so a phone dialog stops at the
-    /// notch instead of running under it.
     pub(crate) fn dialog_width(&self, roomy_width: f32) -> f32 {
         match self.width {
             WidthClass::Compact => {
@@ -244,11 +168,6 @@ impl LayoutCtx {
 }
 
 /// Inset a rect, refusing to produce an inverted or degenerate one.
-///
-/// A host that reports insets larger than the window (a transient during
-/// rotation, or a units mix-up) must not hand the rest of the UI a negative
-/// width — every downstream consumer, from the breakpoint to the dialog width,
-/// would then get nonsense out of a perfectly ordinary comparison.
 fn shrink_to_content(rect: egui::Rect, top: f32, bottom: f32, left: f32, right: f32) -> egui::Rect {
     if !(top.is_finite() && bottom.is_finite() && left.is_finite() && right.is_finite()) {
         return rect;

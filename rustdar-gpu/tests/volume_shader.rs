@@ -1,48 +1,4 @@
 //! What a WebGL2 browser is actually handed.
-//!
-//! `src/volume.wgsl` is WGSL, and every target but one compiles it directly.
-//! The browser does not: wgpu's WebGL2 backend runs it through naga's GLSL
-//! backend first, and what the driver sees is that output. This file produces
-//! it, for every entry point, under the options wgpu-hal itself uses — so that
-//! a translation failure is a red CI row rather than a blank pane in Firefox.
-//!
-//! # The options matter more than the test does
-//!
-//! `glsl::Options::default()` is **ES 310** and emits `layout(binding = …)`,
-//! which WebGL2 forbids outright. A test run against the defaults would pass
-//! happily while proving nothing about the target it exists for. So the options
-//! here are transcribed from `wgpu-hal-29.0.4/src/gles/device.rs`:
-//!
-//! * `Version::Embedded { version: 300, is_webgl }` — `adapter.rs:279-298`
-//!   derives the version from the context's own `SHADING_LANGUAGE_VERSION` and
-//!   sets `is_webgl` from `cfg!(any(webgl, Emscripten))`. WebGL2's is ES 3.00.
-//! * `ADJUST_COORDINATE_SPACE | FORCE_POINT_SIZE` — `device.rs:1183-1198`. The
-//!   other two flags are driven by private capabilities a browser does not
-//!   have.
-//! * a `binding_map` built with **per-binding-type counters**, one pipeline
-//!   layout at a time — `device.rs:1199-1243`. Counters restart at zero for
-//!   each pipeline, which is why the raymarch and the blit are translated
-//!   against separate maps rather than one combined one.
-//! * `zero_initialize_workgroup_memory: true` — `device.rs:1259`.
-//! * `BoundsCheckPolicies` all `Unchecked` — `device.rs:253-268`. The
-//!   `ReadZeroSkipWrite` arm is selected only for desktop GL 4.3 and above,
-//!   because the image bounds check needs `TEXTURE_LEVELS`; it is unreachable
-//!   on ES.
-//!
-//! # What this does and does not establish
-//!
-//! It establishes that the generated GLSL is **legal ES 300**: naga's own
-//! validator accepted the module, the backend emitted every entry point, and
-//! the output carries none of the constructs ES 300 lacks.
-//!
-//! It does **not** establish that the program links in a real browser. Nothing
-//! in this repository does — spike 0a could not test it, because the machine it
-//! ran on has no display and a software-rasteriser result would have meant
-//! nothing. A driver may still refuse a program naga emitted correctly, which
-//! is what `volume::install_error_latch` and `volume::degrade` are for.
-//!
-//! Gated off wasm32 because the dev-dependency is: a `#[cfg]`-empty test file
-//! with an unused dependency fails the wasm clippy row.
 #![cfg(not(target_arch = "wasm32"))]
 
 use naga::back::glsl;
@@ -57,10 +13,6 @@ use rustdar_volumetric::raymarch::{
 };
 
 /// What kind of resource one bind group layout entry is.
-///
-/// Only the three kinds the volume pipelines use. wgpu-hal keeps a counter per
-/// kind and hands each binding the counter's value before incrementing it, so
-/// the *kind* is what decides the slot, not the binding number.
 #[derive(Clone, Copy)]
 enum BindingKind {
     UniformBuffer,
@@ -108,12 +60,6 @@ fn layout_for(entry_point: &str) -> Layout {
 }
 
 /// Build a binding map the way `wgpu-hal/src/gles/device.rs:1219-1243` does.
-///
-/// One counter per binding *type*, shared across every group in the pipeline
-/// layout, incremented after each entry. Writing `binding` into the map instead
-/// would be the plausible mistake and would be right only by coincidence — here
-/// it happens to differ for the LUT's texture and sampler, which is exactly why
-/// the raymarch layout is worth transcribing rather than guessing.
 fn binding_map(layout: Layout) -> glsl::BindingMap {
     let mut samplers = 0u8;
     let mut textures = 0u8;
@@ -215,11 +161,6 @@ fn naga_stage(stage: ShaderStage) -> naga::ShaderStage {
 }
 
 /// The shader parses and passes naga's own validator.
-///
-/// This is the check that would catch `textureSample` under the march's
-/// data-dependent break: implicit-LOD sampling in non-uniform control flow is
-/// `FunctionError::NonUniformControlFlow`, and it fails here rather than on one
-/// unlucky driver.
 #[test]
 fn the_volume_shader_is_valid_wgsl() {
     let (module, _) = validated_module();
@@ -230,10 +171,6 @@ fn the_volume_shader_is_valid_wgsl() {
 }
 
 /// The shader's entry points are exactly the ones the crate names.
-///
-/// Stronger than the source scan in `volume_raymarch.rs`, because this asks
-/// naga rather than a substring search — and it is the list this file iterates,
-/// so an entry point missing from it is one that never gets translated.
 #[test]
 fn the_shaders_entry_points_are_exactly_the_ones_the_crate_lists() {
     let (module, _) = validated_module();
@@ -259,17 +196,6 @@ fn the_shaders_entry_points_are_exactly_the_ones_the_crate_lists() {
 }
 
 /// Every entry point translates, and the output is legal ES 300.
-///
-/// Three constructs are checked by name, and each is a real ES 300 gap rather
-/// than a style preference:
-///
-/// * `layout(binding` — explicit binding points are ES 310 and desktop GL 4.2.
-///   WebGL2 rejects the qualifier outright, so a single occurrence is a shader
-///   that cannot compile in a browser.
-/// * `textureQueryLevels` — what `textureNumLevels` becomes. Gated on GLSL core
-///   130 with no ES version at all.
-/// * `#version 300 es` — the header, asserted so that a future options change
-///   that silently reverted to ES 310 cannot pass by emitting nothing else new.
 #[test]
 fn every_entry_point_translates_to_legal_glsl_es_300() {
     for (name, stage) in ENTRY_POINTS {
@@ -305,16 +231,6 @@ fn every_entry_point_translates_to_legal_glsl_es_300() {
 }
 
 /// The browser's translation and the native GLES one are byte-identical.
-///
-/// `is_webgl` is set from `cfg!(any(webgl, Emscripten))` inside wgpu-hal, so
-/// the desktop Linux and Android GLES paths compile the *same* WGSL with the
-/// flag off while the browser compiles it with the flag on. Identical output
-/// means a bug found on one is a bug found on all three, and — more usefully —
-/// that testing the native GLES path locally is testing the browser's.
-///
-/// If this ever fails it is not a defect: it means the shader has grown a
-/// construct naga treats differently in a browser, and the browser's arm then
-/// needs its own coverage.
 #[test]
 fn the_webgl_and_native_gles_translations_are_byte_identical() {
     for (name, stage) in ENTRY_POINTS {
@@ -330,21 +246,6 @@ fn the_webgl_and_native_gles_translations_are_byte_identical() {
 }
 
 /// The march's step ceiling reaches the GLSL as a compile-time constant.
-///
-/// Corrects an assumption worth writing down, because it was in the brief this
-/// work came from: naga does **not** delete constant declarations and inline
-/// them. It emits `const int RAYMARCH_STEP_CEILING = 1024;` at module scope and
-/// names it in the loop bound, folding only where a conversion forces it —
-/// `f32(RAYMARCH_STEP_CEILING)` becomes the literal `1024.0` inside the `dt`
-/// floor. Both are compile-time constant expressions to an ES 300 driver,
-/// which is the property that matters: the bound cannot vary per draw. (The
-/// march *breaks* at the box exit long before the ceiling on every shipped
-/// grid; the data-dependent break is legal where a data-dependent bound is
-/// not.)
-///
-/// The failure this rules out is the ceiling becoming a uniform. That
-/// compiles, looks identical, and makes the march's worst case invisible to
-/// the driver — on the target where fill rate is the whole risk.
 #[test]
 fn the_step_count_reaches_the_glsl_as_a_compile_time_constant() {
     let glsl_source = translate(ENTRY_FS_RAYMARCH, naga::ShaderStage::Fragment, true);
@@ -370,11 +271,6 @@ fn the_step_count_reaches_the_glsl_as_a_compile_time_constant() {
 }
 
 /// The raymarch really does sample a 3D texture, and with an explicit level.
-///
-/// A control on the three assertions above: they are all absences, and an
-/// absence is satisfied by an empty shader. This is the presence that says the
-/// thing being translated is the raymarch rather than a stub — `sampler3D` and
-/// `textureLod` are what `texture_3d` and `textureSampleLevel` become.
 #[test]
 fn the_translated_raymarch_samples_a_3d_texture_at_an_explicit_level() {
     let glsl_source = translate(ENTRY_FS_RAYMARCH, naga::ShaderStage::Fragment, true);
@@ -390,11 +286,6 @@ fn the_translated_raymarch_samples_a_3d_texture_at_an_explicit_level() {
 }
 
 /// The binding map is built the way wgpu-hal builds it.
-///
-/// wgpu-hal counts per binding *type*, so the LUT's texture is slot 1 while its
-/// sampler is slot 1 as well — two counters, not one. Writing the binding
-/// number into the map is the plausible mistake, and on the blit's layout it
-/// would even look right.
 #[test]
 fn the_binding_map_counts_per_binding_type_the_way_wgpu_hal_does() {
     let raymarch = binding_map(RAYMARCH_LAYOUT);
@@ -453,25 +344,6 @@ fn the_binding_map_counts_per_binding_type_the_way_wgpu_hal_does() {
 
 /// **`GRADIENT_EPSILON` says what it is measured in, and what it is worth in
 /// a box the user can actually be in.**
-///
-/// A prose pin, and named as one — but the thing it guards is not prose. The
-/// constant is compared against a `magnitude` whose units are set two
-/// functions away: `shading_field` returns the coverage-premultiplied channel
-/// on a 0-1 scale, and `shading` and `iso_shading` divide the differences by
-/// `cell_km`, so the magnitude is normalised palette index **per displayed
-/// kilometre** and rescales with the box, the grid shape and the vertical
-/// exaggeration. A reader given `1e-6` and nothing else cannot tell a
-/// conservative NaN guard from an accidentally significant cut, and this doc
-/// once said only that it was "unitless".
-///
-/// So the substrings below are the *load-bearing* claims rather than the
-/// wording: the metric, the box the arithmetic is done at, and a ratio against
-/// the constant itself. Any of them going missing means the constant is back
-/// to being unjudgeable, which is the regression — not a rephrasing.
-///
-/// It cannot check that the arithmetic is *right*; nothing can, short of
-/// re-deriving it here, which would be the same statement twice. What it can
-/// do is refuse a doc that does not state it.
 #[test]
 fn the_gradient_epsilon_states_its_metric_and_what_it_is_worth() {
     let decl = VOLUME_SHADER_WGSL
@@ -509,48 +381,6 @@ fn the_gradient_epsilon_states_its_metric_and_what_it_is_worth() {
 }
 
 /// **The floor composite's arm is decided by the frame, never by the ray.**
-///
-/// The composite after the march has two arms — the floor under the
-/// accumulation for an eye above the box's bottom plane, over it (faded) for an
-/// eye below — and `floor_fade` is already a function of `eye.z` alone. The arm
-/// has to be a function of the same one number, or a single frame can composite
-/// its floor two different ways in two different pixels.
-///
-/// It used to be `floor_t > span.x`: the ray's own crossing of the plane
-/// against the ray's own entry into the box. Both vary per pixel, both are the
-/// same quantity computed two ways — `floor_hit` divided where
-/// `slab_entry_exit` multiplies by a reciprocal — and at a grazing eye they
-/// land within a ULP of each other, so the comparison went both ways inside one
-/// frame.
-///
-/// # Why this test is textual, and why it is the load-bearing half
-///
-/// Because the property is about *which quantities the expression may read*,
-/// and that is a fact about the source rather than about a picture. The GPU
-/// half — `volume_gpu::the_floor_composites_on_one_arm_per_frame`, `#[ignore]`d
-/// behind a real adapter — sweeps 78 cameras and requires each frame to match a
-/// forced arm byte for byte, which is the stronger statement where it applies;
-/// but it can only report what its own driver rounds to, and on the adapter it
-/// was written against the pre-fix shader was uniform on every camera in the
-/// sweep. This one holds on every machine, including the ones with no GPU at
-/// all, and it cannot go quiet because a driver contracted a multiply.
-///
-/// A shader edit that renames or restructures the composite fails here rather
-/// than silently deleting the check. That is the intended cost: re-anchor it,
-/// and if the arm is genuinely gone, delete this deliberately.
-/// WGSL source with line and block comments replaced by a space.
-///
-/// Scanning raw source is unsound, and not in theory. This test used to delimit
-/// the arm expression at the first `;` **anywhere** after the binding, so
-///
-/// ```wgsl
-/// let eye_above_plane = eye.z >= 0.0 // one number; the frame's own
-///     && floor_t > span.x;
-/// ```
-///
-/// truncated at the semicolon inside the comment and never saw the live
-/// per-pixel term on the next line. Executed: naga folded the continuation into
-/// the binding, the shader was valid, and this test stayed green.
 fn without_comments(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     let mut rest = src;
@@ -577,13 +407,6 @@ fn without_comments(src: &str) -> String {
 }
 
 /// Every identifier in `src`, deduplicated, in source order.
-///
-/// The rule below is a **whitelist**, and that is the point. This test used to
-/// forbid a list of per-pixel names, and a blacklist over an expression can
-/// always be aliased around: `let entry = span.x;` followed by `floor_t > entry`
-/// reads exactly the quantity the fix removed and contains none of the
-/// forbidden words. What the arm may legitimately read is a short closed set;
-/// what it may not is not enumerable.
 fn identifiers(src: &str) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for word in src.split(|c: char| !c.is_alphanumeric() && c != '_') {
@@ -598,13 +421,6 @@ fn identifiers(src: &str) -> Vec<String> {
 }
 
 /// The rule itself, over any shader source, so it can be aimed at a mutant.
-///
-/// A textual rule cannot have GPU mutants — that is the whole reason this test
-/// exists, since the pre-fix shader was uniform on every camera of the 78-camera
-/// sweep on the adapter it was written against. What it can have, and now does,
-/// is `the_arm_rule_rejects_every_way_the_defect_can_come_back`: the rule aimed
-/// at sources that put the per-ray discriminant back, each of which passed the
-/// whole suite when the rule was a blacklist over the binding alone.
 fn frame_uniform_arm(shader: &str) -> Result<(), String> {
     let source = without_comments(shader);
 
@@ -720,11 +536,6 @@ fn the_floor_composites_arm_is_a_property_of_the_frame() {
 /// **The rule's own mutants.** Every source below is a way the defect comes
 /// back, and every one of them passed this test — and the other 713 — when the
 /// rule was a blacklist of per-pixel names over the binding expression alone.
-///
-/// The last row is the control that keeps the rule honest in the other
-/// direction: a semantically identical operand swap, which the old literal
-/// `&& eye_above_plane {` rejected with a message asserting the shader did not
-/// branch on `eye_above_plane` when it plainly did.
 #[test]
 fn the_arm_rule_rejects_every_way_the_defect_can_come_back() {
     // (name, from, to, must be rejected)

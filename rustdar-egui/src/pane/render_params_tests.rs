@@ -2,7 +2,6 @@ use super::*;
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::ScanInfo;
 
-/// A pane whose scan lists `products` with the angles given.
 fn pane_listing(products: &[(RadarProduct, &[f32])]) -> PaneState {
     let mut pane = PaneState::with_site("KTLX".to_string());
     pane.scan_info = Some(ScanInfo {
@@ -29,7 +28,6 @@ fn pane_listing(products: &[(RadarProduct, &[f32])]) -> PaneState {
     pane
 }
 
-/// The ordinary case: the selection snaps to the nearest listed tilt.
 #[test]
 fn a_selection_snaps_to_the_nearest_listed_tilt() {
     let mut pane = pane_listing(&[(RadarProduct::Reflectivity, &[0.5, 1.5, 2.4])]);
@@ -41,13 +39,8 @@ fn a_selection_snaps_to_the_nearest_listed_tilt() {
 }
 
 /// The parity case. `ScanInfo::from_scan` lists every Level III product the
-/// moment a volume loads and fills its angle in only when the fetch lands — and
-/// every archive poll rebuilds `ScanInfo` from the volume alone, reopening that
-/// window. Answering `None` there made it visible: no render was dispatched at
-/// all, so the pane went on showing the *previous* product's image, captioned as
-/// the new one, until the fetch happened to land. Standing the selection up
-/// immediately makes the switch behave like a Level II one, which also holds the
-/// old image for as long as its render takes.
+/// moment a volume loads and fills its angle in only when the fetch lands, so
+/// the selection must stand up before the angle does.
 #[test]
 fn a_listed_product_with_no_tilts_yet_still_renders_at_its_selection() {
     let mut pane = pane_listing(&[
@@ -64,7 +57,6 @@ fn a_listed_product_with_no_tilts_yet_still_renders_at_its_selection() {
              ever dispatched for it",
     );
 
-    // And the selection is the pane's own, not some other product's tilt.
     pane.selected_elevation = 2.4;
     assert_eq!(
         pane.get_rendering_params(),
@@ -81,13 +73,11 @@ fn a_product_the_scan_does_not_list_resolves_to_nothing() {
     absent.selected_product = RadarProduct::Velocity;
     assert_eq!(absent.get_rendering_params(), None);
 
-    // As is a pane with no scan at all.
     let empty = PaneState::with_site("KTLX".to_string());
     assert_eq!(empty.get_rendering_params(), None);
 }
 
-/// Under a loop the data line reports the playing frame, not the static
-/// render's time — and off a loop it reports the static render's.
+/// Under a loop the data line reports the playing frame, not the static render's.
 #[test]
 fn the_data_time_on_screen_follows_the_loop_when_one_is_running() {
     let volume = chrono::NaiveDate::from_ymd_opt(2026, 7, 26)

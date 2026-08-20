@@ -1,12 +1,5 @@
 //! The cross-section loop: what gets dispatched, what gets placed, and what the
 //! frame thread is allowed to spend doing it.
-//!
-//! The pane-level identity rules — which loop may take which picture, and why
-//! `RenderTarget` alone cannot answer that — live in
-//! `rustdar_egui::pane::section_loop_tests`. These are the host's half: the
-//! planning inside `dispatch_loop_renders`, the placement inside
-//! `poll_loop_section_results`, and the pacing that keeps the extraction off
-//! the frame budget.
 
 use super::*;
 use crate::app::tests::headless;
@@ -55,11 +48,8 @@ fn key() -> SectionLoopKey {
     SectionLoopKey::new(line(), None, rustdar_radar::srv::SrvFallback::default())
 }
 
-/// This suite's plan-view half of a section identity: [`test_keys::key`] at the
-/// site, product and tilt every test here shares. It delegates rather than being
-/// flattened into its callers because it is named inside `assert!` bodies, and
-/// rewriting an assertion to route a constructor would edit the pin instead of
-/// the plumbing.
+/// This suite's plan-view half of a section identity: [`test_keys::key`] at the site,
+/// product and tilt every test here shares.
 fn target() -> RenderTarget {
     test_keys::key(SITE, PRODUCT, TILT)
 }
@@ -93,15 +83,7 @@ fn app_with_section_loop(minutes: &[u32]) -> crate::app::App {
     app
 }
 
-/// A one-rung reflectivity volume **with an elevation cut table**, which is
-/// what `sampler::ladder_fingerprint` needs and the plan-view fixtures
-/// deliberately do without.
-///
-/// The cut table is the difference and it is load-bearing: `ladder_fingerprint`
-/// refuses a pattern with no cuts, which is `chunks.rs`' real mid-flight state
-/// and the reason `SectionUnavailable::AwaitingCoveragePattern` exists. A
-/// fixture without one would make every test below pass by never cutting
-/// anything.
+/// A one-rung reflectivity volume **with an elevation cut table**.
 fn volume() -> std::sync::Arc<nexrad_model::data::Scan> {
     use nexrad_model::data::{
         ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan,
@@ -178,11 +160,6 @@ fn volume() -> std::sync::Arc<nexrad_model::data::Scan> {
 
 /// A section frame whose volume has not downloaded is left alone: not cut, and
 /// above all not retired.
-///
-/// Retiring it would be the quiet failure. `render_failed` is terminal for the
-/// loop's current target, so a frame retired while its download was still in
-/// flight would stay blank for the life of the loop and playback would step
-/// over a volume that arrived perfectly well seconds later.
 #[test]
 fn a_frame_whose_volume_has_not_arrived_is_neither_cut_nor_retired() {
     let mut app = app_with_section_loop(&[0, 1, 2]);
@@ -202,14 +179,9 @@ fn a_frame_whose_volume_has_not_arrived_is_neither_cut_nor_retired() {
 
 /// A volume that carries nothing to cut retires the frame, so readiness stops
 /// waiting on it and the dispatcher stops retrying it.
-///
-/// The distinction from the test above is the whole point: "not here yet" and
-/// "here and empty" look identical from the frame and are opposite instructions.
 #[test]
 fn a_volume_with_no_ladder_retires_the_frame() {
     let mut app = app_with_section_loop(&[0]);
-    // Present, so the frame is not `Pending`, and carrying no sweeps, so
-    // `ladder_fingerprint` refuses it.
     app.loop_mgr.cache_scan(
         SITE,
         ts(0),
@@ -230,14 +202,6 @@ fn a_volume_with_no_ladder_retires_the_frame() {
 
 /// **The frame-thread cap.** However many frames are ready to cut, one dispatch
 /// pass starts at most [`MAX_LOOP_SECTION_CUTS_PER_FRAME`] of them.
-///
-/// Each cut costs a whole-volume extraction on the frame thread — measured at
-/// ~1.0 ms on a real VCP-212 reflectivity volume — because the job wire carries
-/// a `RenderInput` rather than a `Scan` and on wasm the volume is only reachable
-/// from the main thread at all. Without the cap a desktop pass would run
-/// `MAX_CONCURRENT_RENDERS` of them back to back on the frame that starts the
-/// loop, and the pane would drop frames at exactly the moment the user asked
-/// for an animation.
 #[test]
 fn one_dispatch_pass_starts_at_most_the_capped_number_of_cuts() {
     let mut app = app_with_section_loop(&[0, 1, 2, 3, 4]);
@@ -245,8 +209,6 @@ fn one_dispatch_pass_starts_at_most_the_capped_number_of_cuts() {
         app.loop_mgr
             .cache_scan(SITE, ts(m), (volume(), Default::default()));
     }
-    // Precondition: more frames are ready than the cap allows, or this test
-    // cannot tell a cap from its absence.
     const { assert!(MAX_LOOP_SECTION_CUTS_PER_FRAME < 5) };
 
     app.dispatch_loop_renders();
@@ -287,9 +249,6 @@ fn successive_dispatch_passes_work_through_the_render_set() {
                 started.insert(idx);
             }
         }
-        // Clear the marks the way a reply would, so the next pass sees the
-        // frames as available again — the cut itself needs a worker this test
-        // deliberately does not have.
         for frame in &mut app.gui.pane_mut(0).unwrap().loop_state.frames {
             if frame.render_in_flight {
                 frame.render_in_flight = false;
@@ -308,11 +267,6 @@ fn successive_dispatch_passes_work_through_the_render_set() {
 
 /// A finished cut is placed with its own axes and its own ladder, and the frame
 /// stops being in flight.
-///
-/// The axes travel with the raster because they are labels *on* it. A loop that
-/// placed the raster and kept the previous frame's scales would animate each
-/// volume's slice under the last one's height and distance axes, which is a
-/// wrong reading of a correct picture.
 #[test]
 fn a_finished_cut_is_placed_with_its_own_axes_and_ladder() {
     let ctx = egui::Context::default();
@@ -346,9 +300,8 @@ fn a_finished_cut_is_placed_with_its_own_axes_and_ladder() {
     assert_eq!(stored.axes, placed.axes);
 }
 
-/// A cut the loop has been retargeted away from is refused, and refusing it
-/// costs nothing — the upload is the expensive half and must not run for a
-/// raster that is about to be dropped.
+/// A cut the loop has been retargeted away from is refused, and refusing it costs
+/// nothing.
 #[test]
 fn a_cut_for_a_line_the_loop_has_left_is_refused_without_uploading() {
     let ctx = egui::Context::default();
@@ -360,7 +313,6 @@ fn a_cut_for_a_line_the_loop_has_left_is_refused_without_uploading() {
         render_in_flight: true,
         render_failed: false,
     }];
-    // Keyed to a line the reply below does not name.
     let elsewhere = SectionLine::new(
         GeoPoint {
             lat: 30.0,
@@ -429,13 +381,6 @@ fn a_cut_that_produced_nothing_retires_its_frame() {
 
 /// A frame already cut from the ladder its volume resolves *now* is not cut
 /// again; one cut from a different ladder is.
-///
-/// The newest frame's volume is re-cached under the same `(site, timestamp)`
-/// key as more of it seals, so a section cut from a two-rung ladder can
-/// otherwise stand at the head of a loop while the real volume grows to
-/// fourteen. This reuses `sampler::ladder_fingerprint` — the same fingerprint
-/// the live pane's `SectionTarget::ladder` carries — rather than inventing a
-/// second notion of section staleness.
 #[test]
 fn a_frame_is_recut_when_its_volume_resolves_a_different_ladder() {
     let ctx = egui::Context::default();
@@ -443,8 +388,6 @@ fn a_frame_is_recut_when_its_volume_resolves_a_different_ladder() {
     app.loop_mgr
         .cache_scan(SITE, ts(0), (volume(), Default::default()));
 
-    // The ladder the cached volume actually resolves, asked the way the
-    // dispatcher asks it, so the "matching" case below really matches.
     let FrameSection::At(current) = frame_section(&app.loop_mgr, &target(), ts(0)) else {
         panic!("the cached volume must resolve a ladder");
     };

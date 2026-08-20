@@ -1,8 +1,6 @@
 //! Enhanced Echo Tops (the RPG's product 135, "HREET") computed locally from
 //! the Level II reflectivity volume.
 //!
-//! # What is implemented, and from which documents
-//!
 //! **Algorithm rules** — ORPG man page `hireseet(1)` (task `cpc014/tsk012`,
 //! High Resolution Enhanced Echo Tops), from the WSR-88D CODE distribution:
 //! per column of a 1° × 1 km polar grid, scanning the volume's elevations,
@@ -20,8 +18,7 @@
 //!
 //! **Threshold** — 18.3 dBZ, the fleet default for `alg.vil_echo_tops
 //! min_refl` (`vil_echo_tops.alg`; a live KTLX EET PDB annotates it as the
-//! truncated `18`). Site-adaptable in principle; the twin harness (branch
-//! `campaign-harness`) measures whether 18.3 holds in practice.
+//! truncated `18`). Site-adaptable in principle.
 //!
 //! **Altitude and datum** — the RPG's own height computation, from the legacy
 //! VIL/Echo Tops source (`a313e1.ftn`):
@@ -49,14 +46,6 @@
 //! a live `TLX_EET` object (packet 16, 360 × 1° radials, 1 km gates, 346
 //! bins, thresholds `[127, 1, 2, 128]`).
 //!
-//! The crate's Level III render path and twin codec decode 135 through
-//! `l3_values::build_eet_lut`, which reads exactly these four threshold
-//! halfwords. (They once fell back to the PDB's scale 1 / offset 0 — 135's
-//! thresholds are not IEEE floats — which painted every bin 2 kft high and
-//! topped bins as absurd 130–199 kft heights.)
-//!
-//! # Documented gaps against the RPG
-//!
 //! * **Input** is raw Level II reflectivity, not the DQA-edited buffer the
 //!   RPG feeds HREET, so AP and constant-power artifacts the DQA would remove
 //!   can produce tops here. The harness's presence-disagreement gate is what
@@ -68,165 +57,14 @@
 //!   RPG does not (measured: topped bins are vanishingly rare on live
 //!   volumes). Here **only the volume's highest tilt makes a top topped**; a censored
 //!   cell above clamps the top to the crossing tilt's own altitude,
-//!   non-topped. Topped-flag agreement is printed by the harness so the gap
-//!   stays measured.
-//!
-//!   **This clamp is the dominant term in the depth-dependent low bias
-//!   below, and it is a bigger error than the cell statistic.** A column that
-//!   clamps forfeits the whole interpolation up into the gap above it, and
-//!   the gap grows with height because the upper cuts are further apart. Its
-//!   share of non-topped columns rises monotonically with the RPG's own
-//!   height — 2.0% below 15 kft, 9.0%, 10.4%, 16.9%, and **52.7% above
-//!   45 kft** — and it is the worse path exactly where it is commonest:
-//!   above 45 kft a clamped column sits −3.04 kft against the RPG with 16.8%
-//!   within a level, over a mean tilt gap of 10.55 kft, while a column that
-//!   found data above sits −1.59 kft with 51.5%. The two together are the
-//!   +0.05 → −2.38 kft grade.
-//!
-//!   The mechanism is the input, not the rule: above a storm top the RPG's
-//!   DQA buffer carries a valid *below-threshold* reflectivity where raw
-//!   Level II carries nothing at all, so HREET interpolates across that gap
-//!   where this clamps under it. That the RPG is not instead flagging those
-//!   columns topped is measured, not assumed — topped shares track ours
-//!   closely at every height (2.5% against 2.9% above 45 kft), so the RPG is
-//!   reading real data there rather than bad data. Closing this needs a
-//!   defensible value for "what is above the echo", which no public document
-//!   supplies and which must not be fitted to the twin.
-//!
-//!   **What the clamp is made of is now known, and lifting it is now measured
-//!   to lose.** The cube carries [`crate::types::GateReport`], so the `NaN`
-//!   above a crossing can be asked which of three things it is. It is
-//!   essentially always a measurement: of the clamping columns, **99.2–100%
-//!   are censored** (the tilt above looked and found nothing) and 0–0.8% are
-//!   a gate that was never reported — KDMX 4402 clamps at 100.0% censored,
-//!   KFTG 2143 at 99.8%, KMSX 502 at 99.2%. So the first half of the
-//!   mechanism above is confirmed: the RPG is reading its DQA buffer where
-//!   this crate has a censored cell, not where it has a coverage hole.
-//!
-//!   The second half does not follow. Whatever value "what is above the echo"
-//!   took, the interpolation is monotone in it, so an honest termination must
-//!   land somewhere in `[h, h_up]` — the crossing tilt's own altitude, which
-//!   is what ships, up to the tilt above it. Measured against product 135 on
-//!   KFTG/KDMX/KMSX (6,238 censored-clamp bins, twins paired by volume
-//!   identity, oracle decoded with MetPy), sweeping the top a fixed fraction
-//!   `f` up its own bracket:
-//!
-//!   | `f` | <15 | 15–25 | 25–35 | 35–45 | ≥45 kft | pooled mean (within 1 kft) |
-//!   |---|---|---|---|---|---|---|
-//!   | 0.00 — ships today | +1.27 | +0.61 | +0.23 | −0.62 | −3.08 | **−0.01 (52.6%)** |
-//!   | 0.10 | +1.57 | +1.12 | +0.86 | +0.19 | −2.10 | +0.63 (47.6%) |
-//!   | 0.32 | +2.24 | +2.23 | +2.27 | +1.95 | +0.05 | +2.02 (20.8%) |
-//!   | 1.00 — bracket ceiling | +4.30 | +5.65 | +6.60 | +7.41 | +6.69 | +6.31 (2.2%) |
-//!
-//!   `f = 0` is the optimum and every step up is monotonically worse. The
-//!   clamped population carries the **same** sign flip with height the whole
-//!   grid does (+1.27 shallow to −3.08 deep), and a bracket fraction moves
-//!   every band the same way, so the `f = 0.32` that zeroes the deep band
-//!   does it by pushing all four shallower bands to about +2.2 and halving
-//!   the within-a-level share. No value for "what is above the echo" — however
-//!   it were justified — flattens that grade.
-//!
-//!   And the grade is not the clamp's to begin with: columns that **never
-//!   clamp**, that interpolate against real data above, grade +0.70 → −1.87
-//!   over the same bands. The clamp is a steeper copy of a bias that is
-//!   already there without it. So the clamp stays, the information loss that
-//!   hid its composition is closed, and **the depth residual is somewhere
-//!   else** — HREET's own pre/post-processing remains the backstop candidate.
-//!   Do not spend another pass on the recombination or on this clamp.
+//!   non-topped.
 //! * **SAILS/MRLE revisits**: HREET consumes each elevation's DQA buffer once
 //!   as the volume completes, so the cube is deduplicated
 //!   [`DedupPolicy::FirstOfVolume`] — the coherent first pass the RPG's
-//!   volume products are computed from, not the freshest look. (Measured:
-//!   newest-wins is indistinguishable, so the choice is by the doc,
-//!   uncontradicted.)
+//!   volume products are computed from, not the freshest look.
 //! * **Cell statistic** — twin-arbitrated, and arbitrated *against* the
 //!   operational source: each 1° × 1 km cell takes the **maximum** dBZ of its
 //!   sub-gates ([`CellStat::Max`]).
-//!
-//!   The source says otherwise, and was tried. The ORPG's
-//!   `combine_radials.c` recombines super-resolution reflectivity by
-//!   linear-Z mean on both axes — `Combine_range` takes ΣZ/4, `Combine_azi`
-//!   takes (Z₁+Z₂)/2 — and `product_attr_table` puts that recombination on
-//!   DQA's input, which is what feeds HREET. `vil.rs` sits on the RPG's side
-//!   of exactly that rule. This module does not, and the reason is measured:
-//!   against the RPG's own product 135 on seven volumes at seven sites
-//!   (KFTG, KDMX, KMSX, KAMA, KHGX, KLIX, and KMLB as a holdout),
-//!   186,102 compared bins,
-//!
-//!   | recombination | within 1 kft | mean residual |
-//!   |---|---|---|
-//!   | `Max`, as shipped | **70.6%** | −0.34 kft |
-//!   | linear-Z mean, range axis | 59.3% | −1.80 kft |
-//!   | linear-Z mean, both axes | 60.0% | −1.79 kft |
-//!
-//!   `Max` wins at **all seven sites**, by 4.5 to 20.6 points over whichever
-//!   mean arm did better at each. The azimuth axis
-//!   is worth 0.7 points and is not the question: this crate's cube *selects*
-//!   the radial nearest each whole-degree centre rather than averaging the
-//!   pair, and closing that to the RPG's `Combine_azi` moves nothing.
-//!
-//!   Nor is the loss merely the depth defect above masking a correct
-//!   statistic. On the sub-population where that defect is nearly absent —
-//!   below 15 kft, neither side topped, the tilt above carrying data, where
-//!   only 2.0% of columns clamp — `Max` is unbiased at +0.09 kft (81.1%
-//!   within a level) while the linear-Z mean is biased low at −0.97 kft
-//!   (78.8%). A values-blind footprint test says the same and says it louder:
-//!   under the mean the RPG defines 5,309 bins at KFTG that this does not,
-//!   against 68 the other way, where `Max` is near-balanced at 2,203 against
-//!   1,631. The RPG has echo where a 1 km × 1° linear-Z mean has none, so
-//!   that mean is not what HREET is reading.
-//!
-//!   What it *is* reading is not settled here. `hireseet(4)` calls the output
-//!   a "flat polar" 360 × 345 projection and `product_attr_table` gives 135 —
-//!   alone among the products checked — an internal `x_azi_res 3600` /
-//!   `y_ran_res 460`, both finer than the 1° × 1 km it emits; thresholding a
-//!   column at that resolution and reducing afterwards would behave far more
-//!   like a peak than like a mean. `cpc014/tsk012` is in no public CODE
-//!   distribution, so this stays a measured choice with a plausible
-//!   mechanism, not a documented one. **Do not re-derive it from `vil.rs`:
-//!   the two products take their input from the same buffer and still
-//!   measure differently, which is the finding.**
-//!
-//! # Validation status — read before trusting the twin harness to pass
-//!
-//! **The live twin harness, its `validation_policy`, and the full survey
-//! record live on branch `campaign-harness`**; re-measuring means that
-//! branch.
-//!
-//! As last measured, this derivation does **not** meet the campaign bar
-//! (99% within one level, per site) against the RPG's own EET on
-//! convective volumes: clear-air/weak sites pass, sites with real storms
-//! fall well short with a storm-depth-dependent low bias, and the twin
-//! defines bins no per-column recomputation of the same Level II data can
-//! (its field is also visibly smoother than a raw column scan). Pooled over
-//! seven convective volumes at seven sites it is 70.6% within one level
-//! against a 99% bar, and the shortfall is overwhelmingly deep: 82.6% below
-//! 15 kft against 32.4% above 45 kft.
-//!
-//! **The residual is depth-dependent, and it is not the cell statistic.**
-//! Those are two questions, and the measurement separates them. The low bias
-//! grades monotonically with the RPG's own height — +0.05, −0.38, −0.25,
-//! −0.91, **−2.38 kft** across the `<15 / 15–25 / 25–35 / 35–45 / ≥45` kft
-//! bands — while moving the cell statistic to the RPG's documented linear-Z
-//! mean shifts the *whole* curve down by about 1.5 kft without flattening
-//! it, and loses at every site. The grade tracks the **tilt gap**, not the
-//! elevation angle: at a fixed height the residual *improves* toward the
-//! upper cuts, which is the opposite of what a slant-versus-ground
-//! projection error would do and rules that candidate out. What it tracks
-//! instead is the "bad data above" clamp among the gaps above, whose share
-//! of columns rises from 2.0% to 52.7% across those same bands.
-//!
-//! **The clamp has since been that next hand, and it came back negative.**
-//! The bullet above has the measurement: the clamp's `NaN` is 99.2–100%
-//! censored rather than unreported, so the mechanism was correctly
-//! identified, but no honest termination inside the bracket the physics
-//! allows improves the grade, and columns that never clamp carry the same
-//! grade anyway (+0.70 → −1.87). Two candidates are now spent — the
-//! recombination, measured three ways, and the clamp. HREET's own
-//! pre/post-processing is what is left (its input is the DQA buffer and its
-//! source, `cpc014/tsk012`, is in no public CODE distribution), so the
-//! residual is recorded here rather than papered over: do not lower the bar,
-//! and do not calibrate further heuristics against a single twin volume.
 
 use crate::sites::Datum;
 use crate::types::RadarProduct;
@@ -305,9 +143,7 @@ struct TiltView<'a> {
 pub fn compute_eet(scan: &Scan, radar_height_ft: f64) -> EetGrid {
     // Slant, and deliberately so. This module reproduces the RPG's product
     // 135 bin for bin and the RPG files a gate under the range it was measured
-    // at; binning on the ground here would move every bin of the twin
-    // comparison that is the only evidence this module is right. See
-    // `volumetric::RangeBinning`.
+// at. See `volumetric::RangeBinning`.
     let cube = VolumeCube::build_with_stats(
         scan,
         &[(RadarProduct::Reflectivity, CellStat::Max)],
@@ -359,8 +195,7 @@ pub fn compute_eet(scan: &Scan, radar_height_ft: f64) -> EetGrid {
                     if z_up.is_nan() {
                         // Censored above (below SNR in raw Level II): clamp
                         // to this tilt's altitude. See the module doc's
-                        // "bad data above" gap — this is deliberately not
-                        // marked topped.
+// "bad data above" gap.
                         (h, false)
                     } else {
                         // z_up < threshold, else ti would not be topmost.
@@ -385,97 +220,8 @@ pub fn compute_eet(scan: &Scan, radar_height_ft: f64) -> EetGrid {
 /// Height above MSL, in feet, of the site nearest a lat/lon, on `datum` — for
 /// the render path, which knows only the coordinates.
 ///
-/// # Why the caller names a datum
-///
-/// A site has two heights 30–115 ft apart, the ground and the feedhorn, and
-/// this used to return one number without saying which. Everything here is
-/// added to a beam height, and [`crate::beam`] measures heights above the
-/// **antenna**, so the answer every current caller wants is
-/// [`Datum::Feedhorn`]. Naming it is the point: the old signature let a
-/// caller inherit the ground silently and be a whole tower low.
-///
-/// # Why the nearest site rather than the named one
-///
-/// The render path is handed coordinates, not an ICAO. In practice those
-/// coordinates *came* from a [`crate::sites::RadarSite`] — a table row, or a
-/// row moved onto the position its own volume states — and every row is its
-/// own nearest neighbour (`every_site_is_its_own_nearest_neighbour`). So this
-/// resolves to the site the caller meant, exactly, and the nearest-neighbour
-/// search is an indirection rather than a guess.
-///
-/// # Coordinates that are not near any radar
-///
 /// `None`, rather than the height of whichever row happens to be least far
 /// away.
-///
-/// `ScanInfo::from_scan` places a site it cannot identify at (0, 0), and this
-/// used to answer that with a real site's elevation — the nearest row to Null
-/// Island, some two thousand kilometres away in the Gulf of Guinea, reported
-/// with the same confidence as `KTLX`'s own. The bound is
-/// [`crate::types::BASE_EXTENT_KM`], the WSR-88D's nominal unambiguous range:
-/// if not one radar in the table could observe the point being asked about,
-/// the table has nothing to say about the ground there and says so.
-///
-/// That constant is borrowed for its *number*, which is a property of the
-/// instrument, and not for its role as the plan view's extent floor — there
-/// is no second definition of 230 km in the workspace to reach for. A sweep
-/// that projects past the floor does not widen this bound, because how far a
-/// radar can see the ground has not changed.
-///
-/// It is deliberately measured against the nearest row **of any datum**, not
-/// against the nearest row that can answer `datum`. Those are different
-/// questions — "is there a radar here?" and "does that radar record this
-/// height?" — and conflating them would withdraw the neighbour's-ground
-/// fallback described below, which is a real and wanted behaviour.
-///
-/// # Sites the table cannot answer for
-///
-/// Rows that do not record `datum` are **skipped**, not selected and then
-/// unwrapped to zero. That distinction is the whole point: picking the
-/// nearest row and *then* asking it for a height meant a row that could not
-/// answer short-circuited the entire lookup to 0 ft — sea level, which is a
-/// perfectly plausible reading for a coastal site and was a 292 ft error at
-/// KLWX. Skipping degrades instead to a genuine neighbour's height, wrong by
-/// the terrain between them rather than by the whole height of the site.
-///
-/// No row this install can build fails to answer [`Datum::Feedhorn`]:
-/// `every_placed_row_records_an_elevation` walks a table built from every
-/// shape a fix can take — a WSR-88D volume, a TDWR volume, a station record
-/// onto nothing, and a station record onto a row that already had heights —
-/// and pins that none of them answers `None`.
-///
-/// **That property is why the feedhorn of a catalogue-placed WSR-88D is
-/// estimated rather than absent.** A station record states the ground and no
-/// tower (see [`crate::sites::SiteHeights::GroundOnly`]), so the honest
-/// alternative to adding [`crate::sites::NOMINAL_TOWER_M`] would be to answer
-/// `None` — and the skip above would then walk past every catalogue-placed row
-/// to whichever *learned* row happens to be nearest. On an install that has
-/// decoded one volume that is one radar's antenna height applied to the whole
-/// country; on an install that has decoded none it is the `None` that
-/// consumers turn into sea level. A 29 m assumption is a smaller error than
-/// either, by orders of magnitude, and it disappears the moment that radar's
-/// own volume is decoded.
-///
-/// Which rows cannot answer [`Datum::SiteBase`] is a rule about the
-/// instrument: a TDWR states one height twice and nothing separates it, so a
-/// TDWR row leaves the base unknown rather than equal to the feedhorn, which
-/// `only_a_tdwr_row_cannot_answer_the_base_datum` states. For those this
-/// returns a neighbour's ground, which is why no render path asks for that
-/// datum. An empty table answers `None`, having nothing else to say.
-///
-/// # Why the neighbour search measures kilometres
-///
-/// The degradation above is only as good as the word "nearest", and a degree
-/// of longitude is not a degree of latitude anywhere but the equator. This
-/// used to rank candidates on raw degree-squared separation, which weighs the
-/// two axes equally and so stretches the longitude axis by `1/cos(lat)` — a
-/// 2.4:1 skew at 65°N, where the fleet has rows. That picks a row that is
-/// further away in kilometres over one that is nearer, and the whole point of
-/// the fallback is that the answer degrades by the terrain between two
-/// genuinely close sites. [`crate::sites::distance_km`] is the same haversine
-/// the plausibility bound two lines above is measured with, so the search and
-/// the bound now agree about what "far" means instead of disagreeing by a
-/// factor that grows with latitude.
 pub fn radar_height_ft_near(lat: f64, lon: f64, datum: Datum) -> Option<f64> {
     let (nearest, _) = crate::sites::nearest_radar_site(lat, lon)?;
     if crate::sites::distance_km(lat, lon, nearest.lat, nearest.lon) > crate::types::BASE_EXTENT_KM
@@ -663,11 +409,6 @@ mod tests {
 
     /// A SAILS repeat late in the volume must not displace the first look:
     /// the RPG computes volume products from the volume's first pass.
-    ///
-    /// The repeat carries 50 dBZ where the first 0.5° look has 30 dBZ, and
-    /// the interpolation fraction depends on that value — (30−18.3)/20 of the
-    /// 0.5°→1.5° gap against (50−18.3)/40 — so a newest-wins dedup would move
-    /// the answer, not just the provenance.
     #[test]
     fn a_sails_repeat_does_not_displace_the_first_look() {
         let first = |az: usize| (az == 61).then_some(30.0);
@@ -732,14 +473,8 @@ mod tests {
 
     /// The render path's site lookup: the nearest site, on the datum asked
     /// for.
-    ///
-    /// Both datums are pinned at the same coordinate, because a lookup that
-    /// answered the same number for either would mean the parameter is
-    /// decorative. KTLX's ground is 1214 ft and its feedhorn 1276 — 370 m
-    /// and 19 m of tower as its volume reports them, converted.
     #[test]
     fn radar_height_lookup_finds_the_nearest_site() {
-        // The radars this renders against; there are none until a test asks.
         crate::sites::fixture::install();
         // KTLX's own coordinates give KTLX's heights.
         assert_eq!(
@@ -759,21 +494,8 @@ mod tests {
 
     /// The neighbour search ranks candidates by ground distance, not by raw
     /// degree-squared separation.
-    ///
-    /// The two disagree wherever a degree of longitude has stopped being a
-    /// degree of latitude, which is everywhere but the equator and matters at
-    /// the latitudes the fleet actually reaches. From (65°N, 150°W) the
-    /// fixture's `PAZA` is 1.0° north and `PAZB` is 1.8° east: degree-squared
-    /// ranks those 1.00 against 3.24 and answers with `PAZA`, while on the
-    /// ground they are 111 km and 85 km away and the nearer row is `PAZB`.
-    ///
-    /// Pinned through `radar_height_ft_near` rather than on a distance helper
-    /// because the defect was in *this* function's own comparator, and the
-    /// heights are what a caller would have been handed: a whole different
-    /// site's terrain, reported with the same confidence as the right one.
     #[test]
     fn the_nearest_row_is_measured_in_kilometres_not_degrees() {
-        // The radars this renders against; there are none until a test asks.
         crate::sites::fixture::install();
         let (lat, lon) = (65.0, -150.0);
 
@@ -809,17 +531,8 @@ mod tests {
 
     /// Coordinates that are not near any radar get no answer, rather than a
     /// real site's elevation reported with the same confidence as its own.
-    ///
-    /// (0, 0) is the case that matters, because that is exactly where
-    /// `ScanInfo::from_scan` leaves a site the build cannot identify — and
-    /// once the radar network stops being a compiled-in list, "an identifier
-    /// this binary has never heard of" stops being a hypothetical. Null Island
-    /// is 2000 km off West Africa; the nearest row to it is `TJUA` in San
-    /// Juan, and this used to hand back San Juan's 95 ft as the elevation of a
-    /// pane that had no idea where it was.
     #[test]
     fn coordinates_nowhere_near_a_radar_get_no_height_at_all() {
-        // The radars this renders against; there are none until a test asks.
         crate::sites::fixture::install();
         for (name, lat, lon) in [
             ("null island", 0.0, 0.0),
@@ -838,9 +551,7 @@ mod tests {
 
         // The bound is generous, not tight: a point well away from any site
         // but still inside somebody's coverage is answered for, because the
-        // neighbour's-terrain degradation below is wanted behaviour and this
-        // must not withdraw it. North-central Oklahoma has no radar on it and
-        // the lookup still has something to say about the ground there.
+// neighbour's-terrain degradation below is wanted behaviour.
         let (nearest, km) = crate::sites::nearest_radar_site(36.68, -97.2775).expect("finite");
         assert!(
             (50.0..crate::types::BASE_EXTENT_KM).contains(&km),
@@ -860,20 +571,8 @@ mod tests {
 
     /// The one row whose height moved when the table was put on its volumes,
     /// pinned where its consumers read it.
-    ///
-    /// `RKSG` was carrying the pre-move Osan site, 36 km and 1388 ft from the
-    /// Camp Humphreys RDA its volumes report. This is the number that reaches
-    /// [`crate::xsect`]'s `base_km_msl`, the [`crate::voxel`] grid's datum,
-    /// [`crate::hail`]'s above-radar-level heights and the wet-bulb heights
-    /// [`crate::hca`] and `hsda` classify against — every one of them adds a
-    /// beam height to it, so all four moved by the same 1388 ft together.
-    ///
-    /// Pinned at the *new* coordinates: at the old ones the lookup now finds
-    /// no site within 36 km and the answer is a neighbour's, which is the
-    /// failure this replaced rather than the behaviour to keep.
     #[test]
     fn the_relocated_site_reaches_its_consumers_at_its_new_height() {
-        // The radars this renders against; there are none until a test asks.
         crate::sites::fixture::install();
         assert_eq!(
             radar_height_ft_near(37.20757, 127.28556, Datum::Feedhorn),
@@ -892,22 +591,8 @@ mod tests {
 
     /// A row that cannot answer the datum must not drag the lookup down to
     /// sea level.
-    ///
-    /// This is the shape of the KLWX defect. `radar_height_ft_near` used to
-    /// pick the nearest row and *then* reach for its elevation, so standing
-    /// on a row that had none returned 0 ft rather than anything about the
-    /// terrain — and 0 ft is indistinguishable from a real answer, several
-    /// rows of the table being under 20 ft.
-    ///
-    /// The hole survived the move to two datums: a row can now record a
-    /// height and still be unable to answer the datum a caller names. So this
-    /// asserts the property on **both** datums — no coordinate anywhere in the
-    /// table's footprint returns exactly zero — which is the version that
-    /// fails if a future row records only a base and a feedhorn caller stands
-    /// on it.
     #[test]
     fn a_row_that_cannot_answer_never_reports_sea_level() {
-        // The radars this renders against; there are none until a test asks.
         crate::sites::fixture::install();
         // The precondition that makes "exactly 0 ft" a usable sentinel: no row
         // is genuinely at sea level, the lowest being KBYX at 87 ft. A future
@@ -950,19 +635,8 @@ mod tests {
 
     /// The six sites the table once shipped with no elevation, pinned by
     /// value on both datums.
-    ///
-    /// Their bases are `site_height` in metres — KDGX 151, KFSX 2261,
-    /// KRTX 492, KSRX 200, KVWX 156, KLWX 89 — and all six have now been read
-    /// back out of a real volume by `site_elev_probe`, which closes the gap
-    /// this test used to record: only KLWX had been measured, and a
-    /// transcription error in the other five would have gone unseen.
-    ///
-    /// KLWX is the one the cross-section campaign caught: it anchored a
-    /// section 89 m low, and 89 m is four and a half rows of a 1024-row raster
-    /// over a 20 km axis.
     #[test]
     fn the_six_formerly_unrecorded_sites_carry_their_measured_elevation() {
-        // The radars this renders against; there are none until a test asks.
         crate::sites::fixture::install();
         for (name, base_ft, feedhorn_ft) in [
             ("KDGX", 495, 607),

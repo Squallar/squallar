@@ -1,111 +1,41 @@
 //! The seam between the portable app and whatever OS it is running on.
 //!
-//! Only the *trait* lives here. Every concrete implementation lives beside the
-//! entry point that constructs it (the `rustdar` crate for desktop and Android),
-//! because this crate must build for targets whose bridges it has never heard
-//! of — and because a crate that named them would have to depend on the crate
-//! that depends on it.
+//! Only the trait lives here. Every concrete implementation lives beside the
+//! entry point that constructs it, because this crate must build for targets
+//! whose bridges it has never heard of.
 
-/// What a [`RedrawWaker`] fires, once there is a window to fire it at.
-///
-/// `Arc` rather than `Box` so [`RedrawWaker::wake`] can clone it out of the slot
-/// and drop the guard *before* calling it; see the poisoning note there.
+/// What a [`RedrawWaker`] fires, once there is a window to fire it at. `Arc`
+/// rather than `Box` so [`RedrawWaker::wake`] can drop the guard before calling.
 type WakeFn = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 /// A handle a foreign thread uses to ask the event loop for a frame.
 ///
-/// # The gap this closes
+/// The app runs on `ControlFlow::Wait` and `App::poll_platform_state` — the one
+/// thing that drains the sensor and theme channels — runs only from
+/// `handle_redraw`, so a value pushed by a thread the loop knows nothing about is
+/// invisible until something else produces a frame. Five producers share the gap.
 ///
-/// The app runs on `ControlFlow::Wait`, and `App::poll_platform_state` — the
-/// one thing that drains the sensor and theme channels — runs only from
-/// `handle_redraw`, i.e. only on a `RedrawRequested` frame. A value pushed into
-/// one of those channels by a thread the loop knows nothing about is therefore
-/// invisible until something *else* happens to produce a frame. Five producers
-/// share the gap: the serial GPS reader, Android's location and compass
-/// threads, the Android theme poller ([`spawn_state_poller`]), and the
-/// browser's `watchPosition` callback.
+/// A redraw request and not the event-loop proxy: `EventLoopProxy::send_event`
+/// (winit 0.30 has no `wake_up`) delivers to `ApplicationHandler::user_event`,
+/// which `App` does not override, so it produces an iteration and not a frame.
+/// Measured against a real winit 0.30.13 loop on `ControlFlow::Wait` under X11:
+/// one `request_redraw` from a foreign thread delivered `RedrawRequested` in
+/// 29–43 µs over three runs; two `send_event`s produced zero.
 ///
-/// It is masked today by auto-poll, which defaults on and is persisted, so
-/// `handle_redraw` re-arms a redraw every frame and the loop free-runs at the
-/// refresh rate — which is a power bug on a handheld, not a fix. Turn
-/// auto-refresh off, and the latency on a GPS fix or a light/dark switch is
-/// unbounded.
-///
-/// # Why a redraw request and not the event-loop proxy
-///
-/// The `rustdar` crate's android back module (`rustdar/src/android/back.rs`)
-/// already keeps an `EventLoopProxy` for predictive back, and it is right
-/// there. It stays there, and this is not it:
-///
-/// * `EventLoopProxy::send_event` (winit 0.30 has no `wake_up`; that is 0.31)
-///   delivers to `ApplicationHandler::user_event`, which `App` does not
-///   override — so a proxy wake produces an iteration, not a frame, and the
-///   channel drain lives on the frame. Back gets away with this because
-///   `about_to_wait` is where it is collected; a sensor value is not.
-/// * A proxy belongs to one `EventLoop`, and only the entry point that built
-///   the loop has one. `rustdar`, `rustdar-web` and this crate would
-///   each need their own plumbing for it. `Window` is `Send + Sync` on every
-///   backend and `App` already holds one.
-/// * `Window::request_redraw` wakes a parked loop everywhere: an X11 redraw
-///   channel send, a Wayland ping, `RedrawWindow` on Windows, a main-thread
-///   dispatch on macOS/iOS, `requestAnimationFrame` in the browser. On Android
-///   it is *stronger* than a bare wake — it sets `redraw_flag` before
-///   `waker.wake()`, and the backend drops a `PollEvent::Wake` unless a redraw
-///   or a user event is already outstanding, so the flag is what survives.
-///
-/// Measured against a real winit 0.30.13 loop on `ControlFlow::Wait` under
-/// X11, poked from a thread it knew nothing about. Idle: one opening frame,
-/// then nothing. One `request_redraw` from that thread: `RedrawRequested`
-/// delivered 29–43 µs later, over three runs. Two `send_event`s from it: two
-/// `user_event`s, two `about_to_wait`s, and **zero** `RedrawRequested`.
-///
-/// This is also the shape the rest of the crate already uses: `offload`'s jobs
-/// "send on an `mpsc::Sender` and call `notify_redraw`", and
-/// `ChunkNotifier::sync_sites` takes a `wake` for exactly this reason. Sensors
-/// are the case it was never applied to, because they are wired *before a
-/// window exists*.
-///
-/// # Why a slot, and why it empties
-///
-/// The facade's serial/OS arms, `android_main` and the browser entry all hand
-/// their producer a waker while `App::window` is still `None`, so a snapshot of
-/// the window would be a snapshot of nothing. Every handle is a clone of one
-/// `Arc`, so filling the slot in `create_window` reaches producers that took
-/// their copy at startup.
-///
-/// `App::suspended` empties it, and that is not tidiness. Suspend sets
-/// `window = None` and `state = None` precisely so no wgpu surface outlives the
-/// destroyed window; a slot that *survived* would leave five sensor threads
-/// holding an `Arc<Window>` whose `ANativeWindow` is gone. Surviving is the
-/// bug, not the virtue. `resumed` refills it through `create_window`.
-///
-/// # What is in the slot
-///
-/// The action, not the window. The window is what `App` captures in it — the
-/// `notify_redraw` call is written there and pinned by a source probe — and
-/// keeping the indirection is what makes this type's own guarantees checkable
-/// on a host, where no test in this repo can build a `Window`: that a wake
-/// before `install` is a no-op, that `detach` really drops what it was holding,
-/// and that an unwinding wake does not silence the next one.
-///
-/// [`EventLoopProxy`]: winit::event_loop::EventLoopProxy
+/// A slot rather than a window because producers are handed a waker while
+/// `App::window` is still `None`. `App::suspended` empties it so no sensor thread
+/// outlives the destroyed window; `resumed` refills it.
 #[derive(Clone, Default)]
 pub struct RedrawWaker {
     slot: std::sync::Arc<std::sync::Mutex<Option<WakeFn>>>,
 }
 
-/// Pins what the producers rely on: one waker is shared by five threads, and
-/// two of them (the serial reader, the theme poller) take it by clone into a
-/// `std::thread::spawn`. Losing any of the three turns a wiring change into a
-/// compile error here rather than a redesign at the call sites.
 const _: () = {
     const fn assert_shareable<T: Send + Sync + Clone>() {}
     assert_shareable::<RedrawWaker>();
 };
 
 impl std::fmt::Debug for RedrawWaker {
-    /// Says whether the slot is filled, which is the only thing about a waker
-    /// anyone can inspect — the contents are a closure.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let attached = self
             .slot
@@ -119,8 +49,7 @@ impl std::fmt::Debug for RedrawWaker {
 }
 
 impl RedrawWaker {
-    /// A waker with no window behind it yet. Waking is a no-op until one
-    /// arrives, which is the state every producer is handed its copy in.
+    /// A waker with no window behind it yet; waking is a no-op until one arrives.
     pub fn new() -> Self {
         Self::default()
     }
@@ -134,9 +63,6 @@ impl RedrawWaker {
     }
 
     /// Empty the slot, dropping whatever it was holding — the window included.
-    ///
-    /// See the type's note: this is what `App::suspended` calls, and the point
-    /// of it is the *drop*, not the silence.
     pub(crate) fn detach(&self) {
         *self
             .slot
@@ -146,21 +72,10 @@ impl RedrawWaker {
 
     /// Ask the event loop for a frame, if there is a window to ask through.
     ///
-    /// # Two rules about the lock
-    ///
-    /// The guard is dropped before the call. `notify_redraw` wraps
-    /// `request_redraw` in `catch_unwind` because X11's copy panics once the
-    /// loop has closed — and a `std::sync::Mutex` poisoned by an unwind *under
-    /// the guard* would make every later `unwrap()` here fail, silently
-    /// dropping every subsequent wake from every producer. That is strictly
-    /// worse than the bug this type exists to fix, so the unwind is arranged to
-    /// happen where no guard is held.
-    ///
-    /// The `unwrap_or_else` is then belt to that braces, and deliberately not
-    /// removed as unreachable: it is what keeps a *future* panic under the lock
-    /// from re-introducing the same silence. Same reasoning as
-    /// the android back module's `event_loop_proxy` (`rustdar/src/android/back.rs`),
-    /// which recovers for the same reason.
+    /// The guard is dropped before the call: `notify_redraw` wraps
+    /// `request_redraw` in `catch_unwind` because X11's copy panics once the loop
+    /// has closed, and a `Mutex` poisoned by an unwind under the guard would
+    /// silently drop every subsequent wake from every producer.
     pub fn wake(&self) {
         let wake = self
             .slot
@@ -175,10 +90,7 @@ impl RedrawWaker {
 
 /// Drain all pending messages from `rx`, returning the last one (if any).
 ///
-/// Sensor and theme channels are state, not events: only the newest value
-/// matters and the ones behind it are already stale. Draining rather than
-/// taking one per frame keeps a fast producer from building a backlog the UI
-/// then walks through one frame at a time.
+/// Sensor and theme channels are state, not events: only the newest value matters.
 pub fn drain_latest<T>(rx: &std::sync::mpsc::Receiver<T>) -> Option<T> {
     let mut latest = None;
     while let Ok(val) = rx.try_recv() {
@@ -191,44 +103,12 @@ pub fn drain_latest<T>(rx: &std::sync::mpsc::Receiver<T>) -> Option<T> {
 /// result, until the returned `Receiver` is dropped.
 ///
 /// For state a platform only exposes by polling. Android's theme is the one case
-/// today: NativeActivity never emits `WindowEvent::ThemeChanged`, so re-reading
-/// `Configuration.uiMode` is the *only* way a light/dark switch is ever noticed.
+/// today: NativeActivity never emits `WindowEvent::ThemeChanged`.
 ///
-/// Every sample is sent, not just the ones that differ from the last. Two
-/// reasons, and the second is the load-bearing one:
-///
-///   * Nothing downstream sees the repeats. [`drain_latest`] collapses the
-///     backlog to one value per frame and the consumers compare against their
-///     own cached copy before acting.
-///   * It is what lets the thread notice the receiver is gone. A loop that only
-///     sends on change stops calling `send` once the value settles, and a
-///     disconnected `mpsc::Sender` is *only* observable by trying to send — so
-///     on a device whose theme never changes, such a thread would poll forever
-///     and keep a permanent JVM attachment alive for a bridge that no longer
-///     exists. (`attach_current_thread` in jni 0.22 is the permanent attach;
-///     `attach_current_thread_for_scope` is the scoped one.)
-///
-/// The first sample is sent immediately rather than after `interval`: the
-/// consumer has no value at all until it arrives.
-///
-/// `wake` is what makes a sample visible at all. The theme channel is drained by
-/// `App::poll_platform_state`, which runs only on a frame, and under
-/// `ControlFlow::Wait` this thread is the only thing that knows there is a
-/// reason to draw one — so without it a light/dark switch waits for the next
-/// unrelated event, which with auto-refresh off may never come.
-///
-/// **Only a change wakes**, and the asymmetry with "every sample is sent" above
-/// is the point. Sending unconditionally is what lets the thread notice a
-/// dropped receiver; *waking* unconditionally would be a full frame — egui pass,
-/// texture sampling, present — every `interval` for the life of the process, on
-/// the one platform this poller exists for and the one where that is a battery
-/// cost rather than a rounding error. Nothing is lost by holding back: the
-/// consumer compares against its own cached copy anyway (`App::adopt_theme`
-/// returns `false` and requests nothing when the reading has not moved), so an
-/// unchanged sample has no frame to justify.
-///
-/// Returns the spawn error rather than panicking, so a bridge can degrade to its
-/// synchronous path instead of taking the process down.
+/// Every sample is sent, not just the ones that differ: that is what lets the
+/// thread notice the receiver is gone, since a disconnected `mpsc::Sender` is
+/// only observable by trying to send. Only a change wakes, since waking on every
+/// sample would be a full frame every `interval` for the life of the process.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn spawn_state_poller<T, F>(
     name: &str,
@@ -244,8 +124,7 @@ where
     std::thread::Builder::new()
         .name(name.to_owned())
         .spawn(move || {
-            // `None` until the first read, and that is what makes the first
-            // sample count as a change: the consumer has no value at all yet.
+            // `None` until the first read, which makes the first sample a change.
             let mut last: Option<T> = None;
             loop {
                 let sample = read();
@@ -264,10 +143,8 @@ where
 }
 
 /// Platform-specific behavior abstracted behind a common trait.
-/// Keeps `#[cfg(target_os = "android")]` blocks out of `app.rs`.
 pub trait PlatformBridge {
-    /// Poll for theme changes from the OS. Returns `Some(is_dark)` when
-    /// a change is detected, `None` otherwise.
+    /// Poll for theme changes from the OS. `Some(is_dark)` on a change.
     fn poll_theme(&mut self) -> Option<bool>;
 
     /// Poll for compass heading updates. Returns degrees (0–360) if available.
@@ -280,81 +157,42 @@ pub trait PlatformBridge {
     /// the event (e.g. Android moveTaskToBack), `false` if the app should exit.
     fn handle_back(&self) -> bool;
 
-    /// Take a back press the platform delivered *outside* the window's input
-    /// queue, if one is waiting.
+    /// Take a back press the platform delivered outside the window's input queue.
     ///
-    /// Android's `OnBackInvokedDispatcher` is the only source. Once the app
-    /// opts in to predictive back — explicitly, or by targeting an SDK that
-    /// opts in for it — back stops arriving as `KEYCODE_BACK` and is handed to
-    /// a Java callback on the UI thread instead, which is not the thread `App`
-    /// lives on. The callback therefore parks the press and wakes the loop, and
-    /// this is where the loop picks it up; from there it takes the same route
-    /// as Escape and as legacy back. See
-    /// `packaging/android/app/src/main/java/com/rustdar/BackHandler.java`.
-    ///
-    /// Consuming, like [`InputHandler::take_back_out_press`]: this is polled
-    /// every loop iteration, and a non-consuming read would spend one press on
-    /// every layer the UI has.
-    ///
-    /// Defaulted because no other platform has a second delivery route: the
-    /// desktop, iOS and the browser all deliver back (or Escape) as an input
-    /// event and nothing else.
-    ///
-    /// [`InputHandler::take_back_out_press`]: crate::input::InputHandler::take_back_out_press
+    /// Android's `OnBackInvokedDispatcher` is the only source: once the app opts in
+    /// to predictive back, back is handed to a Java callback on the UI thread,
+    /// which parks the press and wakes the loop. Consuming, because this is polled
+    /// every loop iteration.
     fn poll_back_press(&mut self) -> bool {
         false
     }
 
-    /// Set the reader for [`poll_back_press`](Self::poll_back_press) (Android
-    /// only, no-op elsewhere).
+    /// Set the reader for [`poll_back_press`](Self::poll_back_press) (Android only).
     ///
-    /// Injected for the same reason [`set_theme_detector`](Self::set_theme_detector)
-    /// is: the flag it reads is written by a JNI entry point, which lives in
-    /// the `rustdar` crate's cfg(android) back module. The injection is the
-    /// frontend portability contract, not a crate-graph workaround — this
-    /// crate must compile for targets that have never heard of JNI (the full
-    /// rule lives in `rustdar/src/android/mod.rs`).
+    /// Injected because the flag it reads is written by a JNI entry point in the
+    /// `rustdar` crate's cfg(android) back module.
     fn set_back_press_taker(&mut self, _taker: fn() -> bool) {}
 
-    /// Detect the current system dark theme preference.
     fn detect_dark_theme(&self) -> bool;
 
-    /// Set a callback for back-button behavior.
     fn set_back_handler(&mut self, handler: fn());
 
-    /// Set persistent cache directory for zone geometries.
     fn set_zone_cache_dir(&mut self, dir: std::path::PathBuf);
 
-    /// Get the zone cache directory.
     fn zone_cache_dir(&self) -> Option<&std::path::Path>;
 
-    /// Set the config directory for UI config persistence.
     fn set_config_dir(&mut self, dir: std::path::PathBuf);
 
-    /// Where this platform persists small blobs — the UI config, the learned
-    /// site data, and (through the closure `App` passes to its
-    /// [`rustdar_location::LocationFacade`]) the location gate's memo — or
-    /// `None` if the platform has not been told where yet (Android learns its
-    /// data path only after startup).
-    ///
-    /// Returns a store rather than a directory so the trait carries no
-    /// filesystem assumption: a web bridge hands back a `localStorage`
-    /// backend, which has no path to return.
-    ///
-    /// Declared here again since WO-RL-4 — it lived on the
-    /// `rustdar_location::LocationBridge` supertrait between RL-2 and RL-4,
-    /// and that trait collapsed into the facade with the location verbs.
+    /// Where this platform persists small blobs, or `None` if the platform has not
+    /// been told where yet (Android learns its data path only after startup).
+    /// A store rather than a directory, so a web bridge can hand back
+    /// `localStorage`.
     fn kv(&self) -> Option<Box<dyn rustdar_kv::KvStore>>;
 
     /// This device's IANA timezone name, e.g. `"America/Denver"`.
     ///
-    /// Used to pick a starting radar site on a first run, before any
-    /// configuration exists and without asking for a location permission. See
-    /// [`crate::location_hint`] for what that buys and what it does not.
-    ///
-    /// The default is `None`, which leaves the caller on its compiled-in
-    /// default. A platform that cannot answer is not an error — it is a platform
-    /// where the old behaviour stands.
+    /// Used to pick a starting radar site on a first run, without asking for a
+    /// location permission — see [`crate::location_hint`].
     fn iana_timezone(&self) -> Option<String> {
         None
     }
@@ -364,22 +202,16 @@ pub trait PlatformBridge {
     fn needs_process_exit(&self) -> bool;
 
     /// Whether quitting is something this platform lets an app do at all.
-    ///
-    /// `false` on iOS: calling `exit()` is an App Store rejection, and UIKit's
-    /// run loop never unwinds back to `run_app`'s caller, so `event_loop.exit()`
-    /// would leave the app running with its exit path already taken.
+    /// `false` on iOS: `exit()` is an App Store rejection, and UIKit's run loop
+    /// never unwinds back to `run_app`'s caller.
     fn supports_exit(&self) -> bool {
         true
     }
 
     /// Adjust the attributes the main window is created with.
     ///
-    /// Defaulted because only the web bridge has anything to add: winit's web
-    /// backend has to be told which `<canvas>` the window *is* before the window
-    /// exists, and that element is a `web_sys` type this crate cannot name
-    /// without taking a browser dependency on every target. Returning the
-    /// attributes unchanged is the correct behaviour everywhere else, so this is
-    /// a hook rather than a required method.
+    /// Only the web bridge has anything to add: winit's web backend must be told
+    /// which `<canvas>` the window is before it exists.
     fn window_attributes(
         &self,
         attributes: winit::window::WindowAttributes,
@@ -387,23 +219,10 @@ pub trait PlatformBridge {
         attributes
     }
 
-    /// Hand the bridge the handle its own background threads wake the loop
-    /// with.
+    /// Hand the bridge the handle its own background threads wake the loop with.
     ///
-    /// Called once from `App::with_instance`, which is before any window exists
-    /// — deliberately, and it is why [`RedrawWaker`] is a slot rather than a
-    /// window. A bridge that starts a producer at construction (Android's theme
-    /// poller, started from `set_theme_detector` during `android_main`) has
-    /// nowhere else to get one: the trait's other methods carry no window.
-    /// (`App` installs the same wake into its `LocationFacade` at the same
-    /// moment, for the same reason — the arms' producers push from their own
-    /// threads and callbacks.)
-    ///
-    /// A concrete type rather than `impl Fn()` because a `Box<dyn
-    /// PlatformBridge>` cannot hold a generic method.
-    ///
-    /// Defaulted: iOS has no pollable channels yet, and the web bridge's one
-    /// producer is wired by the entry point rather than by the bridge.
+    /// Called once from `App::with_instance`, before any window exists — which is
+    /// why [`RedrawWaker`] is a slot rather than a window.
     fn set_redraw_waker(&mut self, _waker: RedrawWaker) {}
 
     /// Set a receiver for compass heading updates (Android only, no-op on desktop).
@@ -412,48 +231,23 @@ pub trait PlatformBridge {
     /// Set a callback that queries system bar insets (Android only, no-op on desktop).
     fn set_insets_querier(&mut self, _querier: fn() -> (f32, f32, f32, f32)) {}
 
-    /// Set a callback that reads the OS dark-theme preference (Android only,
-    /// no-op elsewhere).
+    /// Set a callback that reads the OS dark-theme preference (Android only).
     ///
     /// Android reads this over JNI, which needs `unsafe` and the process
-    /// `JavaVM`. Both live in the `rustdar` crate's cfg(android) modules, and
-    /// they STAY there by rule, not by crate graph: the injection is the
-    /// frontend portability contract — `PlatformBridge` is declared in this
-    /// crate, which must compile for targets that have never heard of JNI; the
-    /// bridge structs stay `deny(unsafe_code)`-clean and host-testable
-    /// (TestBridge injects the same fn pointers). Injecting the reader is the
-    /// same inversion `set_insets_querier` and `set_back_handler` use; the
-    /// full rule lives in `rustdar/src/android/mod.rs`. Do not "simplify" the
-    /// `set_*` family into direct calls.
-    ///
-    /// Desktop and web answer `detect_dark_theme` themselves and ignore this.
+    /// `JavaVM`; both stay in the `rustdar` crate's cfg(android) modules because
+    /// this crate must compile for targets that have never heard of JNI.
     fn set_theme_detector(&mut self, _detector: fn() -> bool) {}
 
-    // ── Location left this trait at WO-RL-4 ─────────────────────────────
-    //
-    // The entire location/gps verb family — the gate's six calls (RL-2's
-    // supertrait), the serial trio, the settings-page pair, the android
-    // fix-receiver/hooks injection — lives in `rustdar_location` now: `App`
-    // holds a `LocationFacade` directly and the platform shells construct its
-    // provider arm. Only `kv` came back up (above): where blobs persist is a
-    // platform question, not a location one.
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ── RedrawWaker ─────────────────────────────────────────────────────
-    //
-    // No test in this repo can build a `winit::Window` — `headless()` has none
-    // and the loop is never run — so what `App` puts in the slot is pinned by a
-    // source probe in `app.rs`. What is checkable here is everything else the
-    // type promises, and all three of those promises have a failure mode that
-    // is silent on a device.
+    // No test here can build a `winit::Window`; what `App` puts in the slot is
+    // pinned by a source probe in `app.rs`.
 
-    /// A counting wake, and the count. `Arc<AtomicUsize>` rather than a `Cell`
-    /// because the slot's contents must be `Send + Sync`, which is the whole
-    /// reason a sensor thread can hold one.
+    /// `Arc<AtomicUsize>` because the slot's contents must be `Send + Sync`.
     fn counting_wake(waker: &RedrawWaker) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let probe = std::sync::Arc::clone(&count);
@@ -467,16 +261,10 @@ mod tests {
         count.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// The reason this is a slot and not a window.
-    ///
-    /// The facade's serial/OS arms, `android_main` and the browser entry all
-    /// hand a producer its waker while `App::window` is still `None`. A
-    /// snapshot taken then would be a snapshot of nothing, and the producer
-    /// would go on holding it for the life of the process.
+    /// Producers are handed their waker while `App::window` is still `None`.
     #[test]
     fn a_waker_handed_out_before_the_window_exists_still_finds_it() {
         let waker = RedrawWaker::new();
-        // What a sensor thread takes at startup: a clone, of an empty waker.
         let held_by_the_producer = waker.clone();
         held_by_the_producer.wake();
 
@@ -492,22 +280,16 @@ mod tests {
         );
     }
 
-    /// Waking before there is anything to wake must be quiet, not fatal: it is
-    /// the normal state between process start and the first `resumed`, and the
-    /// serial reader can be several seconds into a port probe by then.
+    /// Waking before there is anything to wake must be quiet, not fatal.
     #[test]
     fn a_wake_with_no_window_yet_is_a_no_op() {
         RedrawWaker::new().wake();
     }
 
-    /// `App::suspended` clears `window` and `state` so no wgpu surface outlives
-    /// the destroyed window. A slot handed to five sensor threads that survived
-    /// that would hold an `Arc<Window>` whose `ANativeWindow` is gone — so the
-    /// *drop* is the assertion here, not the silence.
+    /// `App::suspended` clears `window` and `state`, so the drop is the assertion.
     #[test]
     fn a_waker_stops_holding_the_window_once_the_app_is_suspended() {
         let waker = RedrawWaker::new();
-        // Stands in for the `Arc<Window>` the installed closure captures.
         let window = std::sync::Arc::new(());
         let held = std::sync::Arc::clone(&window);
         waker.install(move || {
@@ -523,17 +305,12 @@ mod tests {
             "the window is still referenced from the slot after a suspend, so \
              the surface it belongs to outlives it"
         );
-        // And a producer that kept its copy across the suspend is merely quiet.
         waker.clone().wake();
     }
 
-    /// The failure mode a `Mutex` in `wake` would have introduced.
-    ///
     /// `notify_redraw` wraps `request_redraw` in `catch_unwind` because X11's
-    /// panics once the loop has closed. Unwinding *under* a held guard poisons
-    /// the mutex, and then every later `lock().unwrap()` — from every one of
-    /// the five producers — panics or silently gives up. That is strictly worse
-    /// than the bug being fixed, so `wake` releases the guard before it calls.
+    /// panics once the loop has closed; unwinding under a held guard would poison
+    /// the mutex, so `wake` releases the guard before it calls.
     #[test]
     fn a_panicking_wake_does_not_silence_later_ones() {
         let waker = RedrawWaker::new();
@@ -552,7 +329,6 @@ mod tests {
         );
     }
 
-    /// Only the newest value survives a drain — that is the whole point of it.
     #[test]
     fn drain_latest_returns_the_newest_value() {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -563,7 +339,6 @@ mod tests {
         assert_eq!(drain_latest(&rx), Some(3));
     }
 
-    /// A drained channel must report empty rather than replaying the last value.
     #[test]
     fn drain_latest_is_empty_once_drained() {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -579,14 +354,7 @@ mod tests {
         assert_eq!(drain_latest(&rx), None);
     }
 
-    // ── spawn_state_poller ──────────────────────────────────────────────
-    //
-    // The Android theme bridge is the only caller and cannot run under test, so
-    // these pin the parts of it that are plain Rust.
-    //
-    // Carries the *same* cfg as the function: wasm32 has no threads, so the
-    // definition is absent there and ungated callers here broke
-    // `--all-targets` on that target while the lib arm stayed green.
+        // wasm32 has no threads, so the definition is absent there.
     #[cfg(not(target_arch = "wasm32"))]
     mod poller {
         use super::super::{RedrawWaker, spawn_state_poller};
@@ -594,9 +362,6 @@ mod tests {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::time::Duration;
 
-        /// A waker whose wakes can be counted, standing in for the one the
-        /// window fills in. See the `RedrawWaker` tests above for why no test
-        /// here can use a real window.
         fn counted() -> (RedrawWaker, Arc<AtomicUsize>) {
             let waker = RedrawWaker::new();
             let count = Arc::new(AtomicUsize::new(0));
@@ -607,8 +372,6 @@ mod tests {
             (waker, count)
         }
 
-        /// The consumer has nothing to show until the first sample lands, so it
-        /// must not wait out an interval first.
         #[test]
         fn poller_sends_an_initial_sample_without_waiting() {
             let rx = spawn_state_poller(
@@ -626,7 +389,6 @@ mod tests {
             );
         }
 
-        /// A flipped value must reach the consumer.
         #[test]
         fn poller_reports_a_change() {
             let state = Arc::new(AtomicBool::new(false));
@@ -655,10 +417,6 @@ mod tests {
             }
         }
 
-        /// The theme is Android's producer here, and a send alone reaches
-        /// nothing: `poll_theme` is drained by `poll_platform_state`, which runs
-        /// only on a frame. With auto-refresh off, a light/dark switch on a
-        /// waker-less poller waits for the next unrelated event.
         #[test]
         fn a_theme_change_arriving_while_the_app_is_idle_asks_for_a_frame() {
             let (waker, woke) = counted();
@@ -683,9 +441,6 @@ mod tests {
                     "poller never reported the flipped value"
                 );
             }
-            // The wake is fired after the send the loop will drain, so by the
-            // time the flipped value is in hand it has either happened or is
-            // about to. Poll rather than sleep on a guess.
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             while woke.load(Ordering::SeqCst) <= before {
                 assert!(
@@ -697,12 +452,6 @@ mod tests {
             }
         }
 
-        /// The other half of that rule, and the one that costs battery.
-        ///
-        /// Every sample is sent whether or not it moved — that is what lets the
-        /// thread notice a dropped receiver — but waking on every sample would
-        /// be a whole frame every two seconds forever on Android, for a reading
-        /// `adopt_theme` then discards as unchanged.
         #[test]
         fn an_unchanged_reading_does_not_ask_for_a_frame() {
             let (waker, woke) = counted();
@@ -715,7 +464,6 @@ mod tests {
             .unwrap();
 
             assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true));
-            // Long enough for ~40 more samples at a 5 ms interval.
             std::thread::sleep(Duration::from_millis(200));
             assert!(
                 rx.try_recv().is_ok(),
@@ -730,15 +478,8 @@ mod tests {
             );
         }
 
-        /// The regression this exists for: a send-on-change loop never retries
-        /// after the value settles, so it never observes the disconnect and runs
-        /// forever. Dropping the receiver must stop the thread even though
-        /// nothing changed.
         #[test]
         fn poller_exits_when_the_receiver_is_dropped_and_the_value_never_changes() {
-            // The closure owns a Sender; the thread dropping the closure on exit
-            // is what disconnects this probe channel. That makes "thread exited"
-            // observable without sleeping on a guess.
             let (probe_tx, probe_rx) = std::sync::mpsc::channel();
             let rx = spawn_state_poller(
                 "test-exit",
@@ -773,8 +514,6 @@ mod tests {
             );
         }
 
-        /// The thread must stop calling the detector after it exits — a leaked
-        /// thread would keep a JVM attachment alive on Android.
         #[test]
         fn poller_stops_sampling_after_exit() {
             let calls = Arc::new(AtomicUsize::new(0));
@@ -793,7 +532,6 @@ mod tests {
             assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true));
             drop(rx);
 
-            // Let it notice the disconnect, then confirm the count has settled.
             std::thread::sleep(Duration::from_millis(200));
             let settled = calls.load(Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(200));

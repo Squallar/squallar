@@ -18,18 +18,16 @@ pub const SIMPLIFY_EPSILON: f64 = 0.005;
 /// The fill for a layer drawn **over** another one: SPC's significant-severe
 /// area, which sits on top of the probability contours it qualifies.
 ///
-/// Deliberately low, for two reasons that point the same way — so the hatch
-/// lines stay visible through the fill, and so the contours underneath stay
-/// readable rather than being buried by the thing describing them.
+/// Deliberately low, so the hatch lines stay visible through the fill and the
+/// contours underneath stay readable.
 pub const SIGNIFICANT_FILL_ALPHA: u8 = 40;
 pub const REGULAR_FILL_ALPHA: u8 = 100;
 pub const NWS_FILL_ALPHA: u8 = 80;
 pub const STROKE_ALPHA: u8 = 255;
 
-// The feature vocabulary is defined in `rustdar-source` — the shared floor
-// under this crate and `rustdar-radar` — and re-exported here under the paths
-// this crate always published it at. The geo vocabulary is `rustdar-geo`'s and
-// is named at that one spelling since WO-G4 killed the re-export shim here.
+// The feature vocabulary is defined in `rustdar-source` and re-exported here
+// under the paths this crate always published it at. The geo vocabulary is
+// `rustdar-geo`'s.
 pub use rustdar_source::feature::{HatchPattern, OverlayFeature, OverlayLabel};
 
 use rustdar_geo::GeoPolygon;

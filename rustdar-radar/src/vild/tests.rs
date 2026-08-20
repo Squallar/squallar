@@ -8,15 +8,6 @@ use nexrad_level3::model::{
 const F16_ONE: u16 = 16 << 10;
 const F16_TWO: u16 = 17 << 10;
 
-/// Product 134's thresholds for a **deliberately linear** synthetic LUT:
-/// `lin_scale` 1.0, `lin_offset` 2.0, `log_start` 255 — so every level
-/// 2..=254 decodes as `level − 2` kg/m² and nothing lands in the log
-/// region.
-///
-/// The hybrid decode itself is pinned in [`crate::l3_values`]; what the
-/// tests here pin is the quotient, its datum, the presence rules and the
-/// resampling, and an exactly hand-computable numerator is what those want.
-/// `[5]` upward are unused by [`crate::l3_values::build_vil_lut`].
 fn dvl_thresholds() -> [u16; 16] {
     let mut t = [0u16; 16];
     t[0] = F16_ONE; // lin_scale
@@ -27,10 +18,6 @@ fn dvl_thresholds() -> [u16; 16] {
     t
 }
 
-/// Product 135's thresholds as a live `TLX_EET` carries them:
-/// DATA_MASK 127, SCALE 1, OFFSET 2, TOPPED_MASK 128 — so
-/// `kft = (level & 127) − 2`, level 2 is 0 kft and bit 7 only flags a top
-/// above the volume's highest cut.
 fn eet_thresholds() -> [u16; 16] {
     let mut t = [0u16; 16];
     t[0] = 127;
@@ -51,10 +38,6 @@ fn eet_level(kft: u16, topped: bool) -> u16 {
     kft + 2 + if topped { 128 } else { 0 }
 }
 
-/// One Level III message: `product_code`, its thresholds, a volume start
-/// (`volume_scan_time` seconds into MJD day `volume_scan_date`), the
-/// packet's gate spacing through `scale_factor`, and per-azimuth gate
-/// levels from `gates_at` (360 radials, one degree each).
 fn message(
     product_code: i16,
     thresholds: [u16; 16],
@@ -168,10 +151,6 @@ fn eet(volume_scan_time: u32, bins: usize, kft_at: impl Fn(usize) -> Option<u16>
     )
 }
 
-/// The pair the value tests read: DVL 35 kg/m² and a published 32 kft top
-/// at azimuth 10, 34 kg/m² over 32 kft at 11, a defined 0.0 kg/m² column
-/// at 12, DVL with no echo top at 13, an echo top with no DVL at 14, a
-/// published **zero** top at 15, and nothing at all at 16.
 fn golden_pair() -> (Level3Message, Level3Message) {
     let dvl_at = |az: usize| match az {
         10 => Some(35),
@@ -191,14 +170,6 @@ fn golden_pair() -> (Level3Message, Level3Message) {
     (dvl(VOL_TIME, 60, dvl_at), eet(VOL_TIME, 60, eet_at))
 }
 
-/// The two published products divided on the bin centre, hand-computed:
-///
-/// * az 10 — 35 kg/m² over a published 32 kft top is 32.5 kft = 9906.0 m,
-///   so `35000/9906` = **3.533212 g/m³**, above Amburn & Wolf's 3.5 break;
-/// * az 11 — 34 kg/m² over the same top is `34000/9906` = **3.432263**,
-///   below it;
-/// * az 12 — a defined 0.0 kg/m² column over a real top is a defined
-///   **0.0 g/m³**, not undefined.
 #[test]
 fn the_two_published_products_divide_to_hand_computed_vil_density() {
     let (num, den) = golden_pair();
@@ -225,30 +196,17 @@ fn the_two_published_products_divide_to_hand_computed_vil_density() {
 
 /// Amburn & Wolf's own formula against hand-computed pairs: 20 kg/m² over
 /// a 10 km top (32.8084 kft = 10,000 m) is exactly 2.0 g/m³, and 35 kg/m²
-/// over the same top is their 3.5 g/m³ severe-hail break. One kilofoot of
-/// top is `1000·VIL/304.8`.
+/// over the same top is their 3.5 g/m³ severe-hail break.
 #[test]
 fn the_arithmetic_reproduces_the_amburn_wolf_pairs() {
     assert!((vild_g_m3(20.0, 32.8084) - 2.0).abs() < 1e-5);
     assert!((vild_g_m3(35.0, 32.8084) - 3.5).abs() < 1e-5);
     assert!((vild_g_m3(1.0, 1.0) - 3.280_84).abs() < 1e-4);
-    // And through the published datum, which puts the same 2.0 g/m³ half a
-    // kilofoot lower down.
     assert!((vild_from_published(20.0, 32.3084) - 2.0).abs() < 1e-5);
     // A defined 0.0 kg/m² column is a defined 0.0 g/m³, not undefined.
     assert_eq!(vild_from_published(0.0, 32.0), 0.0);
 }
 
-/// The `+ 0.5` bin-centre datum is load-bearing, and a wrong datum fails
-/// here: 34 kg/m² over a published 32 kft top reads **3.432263** g/m³ on
-/// the bin centre but `34000/9753.6` = **3.485924** on the published floor
-/// — and 35 kg/m² reads 3.533212 against 3.588419, high by exactly
-/// 32.5/32 − 1 = 1.5625%.
-///
-/// The straddle case is the one that decides a warning: 34.4 kg/m² over
-/// the same top is 3.472643 on the centre and 3.526903 on the floor —
-/// opposite sides of the 3.5 g/m³ severe-hail break, from the same two
-/// published numbers.
 #[test]
 fn the_bin_centre_datum_is_what_the_quotient_divides_by() {
     let centre = vild_from_published(35.0, 32.0);
@@ -269,8 +227,6 @@ fn the_bin_centre_datum_is_what_the_quotient_divides_by() {
         "the datum decides the break: {straddle_centre} vs {straddle_floor}",
     );
 
-    // And the datum the *grid* applies is the centre, not the floor: the
-    // whole field would be 1.5625% high at a 32 kft top otherwise.
     let (num, den) = golden_pair();
     let grid = compute_vild(&num, &den).expect("renders");
     assert!(
@@ -282,8 +238,6 @@ fn the_bin_centre_datum_is_what_the_quotient_divides_by() {
         "a floor-datum grid would be indistinguishable — the pin is vacuous",
     );
 
-    // The published tops themselves become centres, with zero and
-    // undefined dropped.
     let tops = published_top_field(&[vec![0.0, 32.0, f32::NAN, -1.0, 69.0]]);
     assert!(tops[0][0].is_nan(), "a 0 kft top has no usable quotient");
     assert_eq!(tops[0][1], 32.5);
@@ -320,10 +274,6 @@ fn a_cell_is_undefined_wherever_either_input_is() {
     assert!(vild_g_m3(20.0, f32::NAN).is_nan());
 }
 
-/// A published echo top of **zero** kilofeet has no resolvable quotient —
-/// product 135's level 2, and the topped level 130 that decodes the same —
-/// so the cell is undefined rather than dividing by a zero denominator or
-/// by half a kilofoot of quantization noise.
 #[test]
 fn a_zero_published_echo_top_leaves_the_cell_undefined() {
     let (num, den) = golden_pair();
@@ -334,8 +284,6 @@ fn a_zero_published_echo_top_leaves_the_cell_undefined() {
         grid.values[15][30],
     );
 
-    // The topped flag decodes to the same 0 kft and is refused the same
-    // way, while a topped 32 kft is an ordinary defined cell.
     let topped = message(
         EET_PRODUCT_CODE,
         eet_thresholds(),
@@ -382,8 +330,6 @@ fn a_volume_mismatch_refuses_to_render() {
         Ok(_) => panic!("a mismatched pair must be refused, not painted"),
     }
 
-    // Inside the tolerance is the same volume — the RPG writes the two
-    // objects seconds apart.
     let jittered = eet(VOL_TIME + 30, 60, |az| (az == 10).then_some(32));
     assert!(
         compute_vild(&num, &jittered).is_ok(),
@@ -392,8 +338,6 @@ fn a_volume_mismatch_refuses_to_render() {
     let past = eet(VOL_TIME + 61, 60, |az| (az == 10).then_some(32));
     assert!(compute_vild(&num, &past).is_err(), "one second past it");
 
-    // An unreadable volume start is not a pair either: it cannot be shown
-    // to belong with the other object.
     let unreadable = message(EET_PRODUCT_CODE, eet_thresholds(), 0, VOL_TIME, 1.0, |_| {
         vec![eet_level(32, false); 60]
     });
@@ -438,12 +382,6 @@ fn only_a_134_over_135_pair_renders() {
     );
 }
 
-/// An EET on 0.25 km gates (`scale_factor` 4.0), so the two products'
-/// spacings differ: the shared resampler represents each 1 km cell by the
-/// packet gate whose centre sits nearest the cell centre, first gate
-/// winning ties. Cell 0's centre is 0.5 km and gate 1's is 0.375 —
-/// 0.125 away, tying with gate 2's 0.625 and beating gate 0's 0.125 km —
-/// so cell `r` reads gate `4r + 1`.
 fn a_finer_gated_denominator_resamples_onto_the_1_km_cells() -> Level3Message {
     message(
         EET_PRODUCT_CODE,
@@ -467,8 +405,6 @@ fn a_finer_gated_denominator_resamples_onto_the_1_km_cells() -> Level3Message {
 /// extents do not have to match.
 #[test]
 fn both_products_resample_onto_the_common_capped_grid() {
-    // DVL out to 60 km, EET out to 40 km at 1 km gates: cells beyond each
-    // packet's own extent are undefined.
     let short_eet = eet(VOL_TIME, 40, |az| (az == 10).then_some(32));
     let grid = compute_vild(
         &dvl(VOL_TIME, 60, |az| (az == 10).then_some(35)),
@@ -531,17 +467,6 @@ fn the_quantization_halfwidth_is_half_a_kilofoot_of_echo_top() {
     assert_eq!(EET_BIN_CENTRE_KFT, 0.5);
 }
 
-/// **The anti-drift pin.** The shipped entry point must compose the
-/// reference the [`crate::vil`] survey scores against, step for step:
-/// resample each packet through its own codec at its own gate spacing,
-/// turn the published tops into bin centres, divide.
-///
-/// Asserted through the constructors the survey's policy re-exports (the
-/// survey itself lives on branch `campaign-harness`) rather than by
-/// recomputing the arithmetic here, so the shipped product and the
-/// harness's reference cannot come apart: if [`compute_vild`] ever
-/// reorders, re-datums or re-resamples, this fails and the survey's
-/// verdict stops applying to what the app draws.
 #[test]
 fn the_shipped_path_is_the_surveys_reference_construction() {
     let policy = |dvl: &Level3Message, eet: &Level3Message| {
@@ -562,9 +487,6 @@ fn the_shipped_path_is_the_surveys_reference_construction() {
         density_field(&dvl_field, &published_top_field(&eet_field))
     };
 
-    // Fields with something in every category: values either side of both
-    // breaks, defined zeros, one-sided cells, a zero top, topped tops, and
-    // a denominator on a different gate spacing from the numerator.
     let (golden_dvl, golden_eet) = golden_pair();
     let mut total_finite = 0usize;
     for (label, dvl_msg, eet_msg) in [

@@ -13,7 +13,6 @@ use crate::render_key::{RenderKey, elevation_key, render_cache_key};
 use rustdar_device_profile::budget::Budgets;
 
 /// Drop guard that decrements an AtomicUsize counter on drop.
-/// Guarantees the counter is decremented even if the thread panics.
 pub(crate) struct RenderGuard(pub(crate) Arc<AtomicUsize>);
 
 impl Drop for RenderGuard {
@@ -28,80 +27,28 @@ pub struct CachedPaneRender {
     /// See [`crate::channels::RenderedImage::image`] — held converted, so a
     /// resume is an upload and not a second walk of 64 MiB.
     pub image: Arc<egui::ColorImage>,
-    /// The half-width the cached pixels were projected at, km. Kept beside
-    /// them because a restore has to place them where the render put them —
-    /// see `restore_cached_renders`, which rebuilds the bounds from this and
-    /// from nothing else.
+    /// The half-width the cached pixels were projected at, km.
     pub max_range_km: f64,
     /// The gates behind these pixels, for the readout — see
-    /// [`rustdar_radar::hover::HoverSource`]. Kept beside them because a
-    /// restore has to be able to answer the same questions the render did.
+    /// [`rustdar_radar::hover::HoverSource`].
     pub hover: Arc<rustdar_radar::hover::HoverSource>,
     pub product: RadarProduct,
     pub elevation: f32,
-    /// Where the cached sweep's cut declared its velocity folds, m/s. Kept for
-    /// the same reason `max_range_km` is: a restore has to describe the pixels
-    /// it puts back the way the render described them, and the volume behind
-    /// them may be gone by then.
+    /// Where the cached sweep's cut declared its velocity folds, m/s.
     pub nyquist_ms: Option<f64>,
-    /// Where the melting layer these cached pixels were classified against came
-    /// from. Kept for exactly the reason the fold limit is: the object behind it
-    /// is per-volume and the cache holding it will have been replaced by the
-    /// time a suspended pane resumes, so a restore that re-derived this would
-    /// caption an old classification with a new volume's provenance.
+    /// Where the melting layer these cached pixels were classified against came from.
     pub melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
     /// Where the storm motion vector these cached pixels were shifted by came
     /// from. Kept for exactly the reason the melting layer is: the `N0S`
-    /// behind it is per-volume and the cache holding it will have been
-    /// replaced by the time a suspended pane resumes, so a restore that
-    /// re-derived this would caption a right-mover prediction with the RPG's
-    /// name.
     pub storm_motion: Option<rustdar_radar::srv::SrvMotion>,
 }
 
 /// Per-pane render tracking state.
 pub struct PaneRenderState {
     /// True while a background render is in progress for this pane.
-    ///
-    /// Private, with [`render_started`](Self::render_started) and
-    /// [`render_finished`](Self::render_finished) the only ways it moves,
-    /// because it is now half of a pair: `in_flight_plan_view` below says
-    /// *which* picture is being made and is what a sibling pane reads to decide
-    /// it need not ask for the same one. A caller that could set this flag on
-    /// its own could leave a key behind for a render that had already answered,
-    /// and every pane wanting that picture would then wait for a result nobody
-    /// was going to send. The pair moves together or not at all — the same
-    /// reason [`RenderCache`]'s two halves are private.
     render_in_flight: bool,
-    /// Which **plan view** this pane's in-flight render is drawing, as the
-    /// `(site, product, view, elevation)` key [`render_cache_key`] builds — or
-    /// `None` when nothing is in flight, or when what is in flight is not a
-    /// plan view.
-    ///
-    /// # What it is for
-    ///
-    /// A volume landing on a four-pane split of one site, product and tilt used
-    /// to start **four** renders of one sweep: `dispatch_pane_renders` walks the
-    /// panes in one pass, and the render cache it consults is only written when
-    /// a result comes *back*, so the first pane's job is still in flight when
-    /// the second, third and fourth ask. Each of those panes then also paid a
-    /// full `RenderInput::extract` on the frame thread to build a payload
-    /// identical to the one already on its way.
-    ///
-    /// With this, the first pane to ask is the only one that asks. The
-    /// broadcast in `App::poll_render_results` already serves every sibling
-    /// from the one result — that is what `PlanViewUploads` was built around —
-    /// so the panes that skip here are not waiting on anything extra; they are
-    /// waiting on the same result they would have been handed anyway.
-    ///
-    /// # Why the key is the cache's own
-    ///
-    /// It is built by [`render_cache_key`] and by nothing else, so "a render is
-    /// already making this" and "the cache already holds this" are the same
-    /// question asked at two moments. A dedupe keyed even slightly differently
-    /// — on the raw elevation, say — would suppress a render whose result the
-    /// cache would then file under another key, and the pane that skipped would
-    /// never be served.
+    /// Which **plan view** this pane's in-flight render is drawing, as the `(site,
+    /// product, view, elevation)` key [`render_cache_key`] builds.
     in_flight_plan_view: Option<RenderKey>,
     /// Last rendered radar parameters to detect changes.
     pub last_rendered: Option<(RadarProduct, f32)>,
@@ -109,21 +56,6 @@ pub struct PaneRenderState {
     pub cached_render: Option<CachedPaneRender>,
     /// One flag per render dispatched for this pane and not yet finished, held
     /// alongside the copy the render thread carries.
-    ///
-    /// Clearing one abandons that render: the worker drops its result instead of
-    /// sending it. This is per **pane**, which is the finest granularity the
-    /// dispatch path can name — `spawn_level2_render` is handed a pane index and
-    /// no site — and it is what keeps a new scan for one site from discarding the
-    /// in-flight renders of panes on every *other* site, each of which then costs
-    /// a fresh 2048² image and value grid to redo.
-    ///
-    /// **Only [`reset_panes_for_site`](RenderDispatcher::reset_panes_for_site) and
-    /// [`reset_panes`](RenderDispatcher::reset_panes) clear these, and both clear
-    /// `render_in_flight` on the same pane in the same pass.** That pairing is
-    /// what makes a suppressed send safe: the receiver clears `render_in_flight`
-    /// when a result arrives, so abandoning a render without clearing the flag
-    /// would leave the pane believing a render it will never hear about is still
-    /// running, and it would never dispatch another.
     results_wanted: Vec<Arc<AtomicBool>>,
 }
 
@@ -149,26 +81,14 @@ impl PaneRenderState {
         self.render_in_flight
     }
 
-    /// Mark a render dispatched for this pane, `key` naming the plan view it
-    /// draws — `None` for a render that is not a plan view, which is every
-    /// cross-section.
-    ///
-    /// A section passes `None` rather than a key of its own on purpose. The
-    /// only reader is the plan-view dispatch, which asks "is this picture
-    /// already being made"; a section pane and a map pane can hold the same
-    /// `(site, product, elevation)` and are not making the same picture, and
-    /// [`RenderKey`]'s view axis exists to say so. Keeping sections out of
-    /// this field entirely is one fewer way for that axis to be got wrong.
+    /// Mark a render dispatched for this pane, `key` naming the plan view it draws —
+    /// `None` for a render that is not a plan view.
     pub fn render_started(&mut self, key: Option<RenderKey>) {
         self.render_in_flight = true;
         self.in_flight_plan_view = key;
     }
 
     /// Mark this pane's render finished — answered, discarded or abandoned.
-    ///
-    /// All three are the same fact for every reader: nothing is on its way any
-    /// more, so this pane may dispatch again and no sibling should be waiting
-    /// on it.
     pub fn render_finished(&mut self) {
         self.render_in_flight = false;
         self.in_flight_plan_view = None;
@@ -176,18 +96,6 @@ impl PaneRenderState {
 
     /// The flag a newly dispatched render reports through, live until this pane's
     /// renders are abandoned.
-    ///
-    /// Renders past stopping are dropped from the list first: the render holds the
-    /// only other reference to its own flag and releases it the moment it reads it,
-    /// so one strong reference means that render has already decided whether to
-    /// answer and clearing its flag would change nothing.
-    ///
-    /// That release is sequenced before the send, so a result taken off the channel
-    /// is proof that the flag it reported through is prunable here — the list is
-    /// bounded by the renders still *stoppable*, and not by how long a finished
-    /// worker takes to unwind. Before the release moved, this pruned on thread
-    /// teardown instead, and a pane that dispatched under load kept flags for
-    /// renders that had already answered.
     fn want_result(&mut self) -> Arc<AtomicBool> {
         self.results_wanted.retain(|f| Arc::strong_count(f) > 1);
         let flag = Arc::new(AtomicBool::new(true));
@@ -196,11 +104,6 @@ impl PaneRenderState {
     }
 
     /// Stop wanting every render currently running for this pane.
-    ///
-    /// A pane can have more than one: `reset_panes*` clears `render_in_flight`
-    /// while a render is still going, so the next dispatch spawns a second one
-    /// before the first has landed. Abandoning only the newest would leave the
-    /// older free to arrive last and paint the previous scan over the new one.
     fn abandon_results(&mut self) {
         for flag in self.results_wanted.drain(..) {
             flag.store(false, Ordering::Relaxed);
@@ -209,50 +112,30 @@ impl PaneRenderState {
 }
 
 /// Cached radar render output, shared across panes that show the same product/elevation.
-///
-/// The extent rides in the entry rather than being recomputed per pane, which
-/// is what makes the sharing sound: two panes on the same `(site, product,
-/// view, elevation)` are looking at one buffer, and a buffer projected at
-/// 417 km has to be placed at 417 km on both of them.
 pub struct CachedRenderOutput {
     pub image: Arc<egui::ColorImage>,
     pub max_range_km: f64,
-    /// The gates behind this shared raster — shared with it for the reason the
-    /// extent is: two panes on one `(site, product, view, elevation)` are
-    /// looking at one buffer of one cut, so they read one set of gates.
+    /// The gates behind this shared raster, shared with it for the reason the
+    /// extent is.
     pub hover: Arc<rustdar_radar::hover::HoverSource>,
-    /// Where the drawn sweep's cut declared its velocity folds, m/s — shared
-    /// with the buffer for the reason the extent is, and it is the same
-    /// argument: two panes on one `(site, product, view, elevation)` are
-    /// looking at one raster of one cut, so they are looking at one fold limit.
+    /// Where the drawn sweep's cut declared its velocity folds, m/s — shared with the
+    /// buffer for the reason the extent is.
     pub nyquist_ms: Option<f64>,
-    /// Where the melting layer behind this shared raster came from — shared for
-    /// the same argument as the two above: one buffer, one classification, one
-    /// provenance, whichever pane is looking at it.
+    /// Where the melting layer behind this shared raster came from — shared for the
+    /// same argument as the two above: one buffer, one classification.
     pub melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
-    /// Where the storm motion vector behind this shared raster came from —
-    /// shared for the same argument as the three above: one buffer, one
-    /// shift, one provenance, whichever pane is looking at it.
+    /// Where the storm motion vector behind this shared raster came from — shared for
+    /// the same argument as the three above: one buffer.
     pub storm_motion: Option<rustdar_radar::srv::SrvMotion>,
 }
 
 /// Bounded least-recently-used cache of render outputs shared between panes.
-///
-/// Each entry is a `side²` image plus a `side²` `f32` value grid — 32 MiB
-/// apiece at 2048², 128 MiB at 4096² — and before this was bounded the only
-/// thing that ever dropped one was `reset_panes*`, so switching product or
-/// elevation grew the cache without limit.
-///
-/// The recency queue holds exactly the keys of `entries`, each exactly once,
-/// oldest use first. Every method that touches one touches the other; the pair
-/// is private so no caller can desynchronise them.
 pub struct RenderCache {
     entries: HashMap<RenderKey, CachedRenderOutput>,
     recency: VecDeque<RenderKey>,
     capacity: usize,
     /// Bytes the resident entries occupy, kept in step with `entries` by
-    /// [`Self::insert`], [`Self::retain`] and [`Self::clear`] — the three
-    /// places an entry can arrive or leave.
+    /// [`Self::insert`], [`Self::retain`] and [`Self::clear`].
     resident_bytes: usize,
     byte_capacity: usize,
 }
@@ -260,42 +143,18 @@ pub struct RenderCache {
 impl RenderCache {
     /// `capacity` is floored at 1 — a zero-capacity cache would evict every entry
     /// on the way in, which is a silent way to disable pane sharing entirely.
-    ///
-    /// `byte_capacity` is the second bound and the one that actually holds now.
-    /// A count was a fair proxy for memory while every plan view was one of
-    /// three sizes: eight entries of `4096² × 8` is 1 GiB, and that figure was
-    /// what the count meant. It stopped being a proxy when the side became the
-    /// device's answer spent as far as a sweep's gates justify — the same eight
-    /// entries of a 7362 px surveillance cut are **3.3 GiB**, which is a
-    /// regression this cache would have introduced silently.
-    ///
-    /// So the bytes are counted. Both bounds apply, and which one binds depends
-    /// on what is resident: 1 GiB buys two long-range rasters, eight base-size
-    /// ones (where the count binds first, exactly as before) or thirty-two of a
-    /// browser's loop frames.
     pub fn new(capacity: usize, byte_capacity: usize) -> Self {
         Self {
             entries: HashMap::new(),
             recency: VecDeque::new(),
             capacity: capacity.max(1),
             resident_bytes: 0,
-            // Deliberately **not** floored the way `capacity` is. A budget too
-            // small for one entry cannot disable sharing here, because
-            // [`Self::insert`] never evicts down to nothing — the guard is
-            // structural rather than a constant that has to stay large enough,
-            // which is the same property with one fewer thing to keep true.
             byte_capacity,
         }
     }
 
     /// What one entry costs: the texture egui holds and the value grid a hover
     /// reads, both `side² × 4`.
-    ///
-    /// Measured off the buffers rather than derived from a side, because the
-    /// two are not always the same shape — a cross-section's raster is
-    /// `SECTION_WIDTH × SECTION_HEIGHT` and its value grid is sized to match —
-    /// and a cache that costed a section as though it were square would evict
-    /// against a number describing nothing in it.
     fn entry_bytes(value: &CachedRenderOutput) -> usize {
         value.image.pixels.len() * std::mem::size_of::<egui::Color32>()
             + value.hover.resident_bytes()
@@ -313,9 +172,6 @@ impl RenderCache {
     }
 
     /// Look up an entry, marking it most-recently-used.
-    ///
-    /// Takes `&mut self` deliberately: a lookup that did not count as a use would
-    /// let the pane currently on screen age out while an unwatched one survived.
     pub fn get(&mut self, key: &RenderKey) -> Option<&CachedRenderOutput> {
         if !self.entries.contains_key(key) {
             return None;
@@ -326,11 +182,6 @@ impl RenderCache {
 
     /// Insert an entry, evicting the least recently used until within **both**
     /// capacities.
-    ///
-    /// The entry going in is never the one evicted, even when it alone exceeds
-    /// the byte budget: the loop stops while it is the only thing left, because
-    /// a cache that refused the render just handed to it would make the pane
-    /// that asked re-render forever.
     pub fn insert(&mut self, key: RenderKey, value: CachedRenderOutput) {
         let bytes = Self::entry_bytes(&value);
         if let Some(old) = self.entries.insert(key.clone(), value) {
@@ -397,255 +248,68 @@ impl RenderCache {
 
 /// Whether a render of `view` showing `product` has to be given the whole
 /// volume rather than the one sweep `render::find_sweep` picks.
-///
-/// **One predicate, two halves, and neither can answer for the other.** The
-/// product half is [`RadarProduct::reads_whole_volume`] — "does this field
-/// integrate the column?" — and the view half is
-/// [`RenderView::reads_whole_volume`] — "does this picture slice vertically?".
-/// A reflectivity cross-section answers *no* to the first and *yes* to the
-/// second, so a dispatch that asked only the product question would extract one
-/// sweep and the section would be interpolated across the tilts that were not
-/// there: no error, no `NaN`, a smooth plausible layer that looks *better* than
-/// the truth.
-///
-/// It reads both rather than restating either. That is the lesson the campaign
-/// already paid for once: a hand-maintained second copy of the product half
-/// omitted storm-relative velocity, and live SRV panes fitted their dealias
-/// seed from volumes the feed had deliberately skipped cuts of.
-///
-/// `App::cut_selection_for` still asks the two halves at two different points
-/// rather than calling this, and deliberately: the view is known for a pane
-/// before its render parameters resolve, and the whole window between
-/// converting a pane and its volume arriving — which is exactly when the first
-/// section is cut — is time in which the product half cannot be asked at all.
-/// The safety property is the same; only the order differs.
 pub fn needs_whole_volume(view: RenderView, product: RadarProduct) -> bool {
     view.reads_whole_volume() || product.reads_whole_volume()
 }
 
 /// Manages radar rendering dispatch and Level III data caching.
-///
-/// Tracks per-pane render state, owns the Level III data cache, and
-/// provides generation-based staleness checks for both fetches and renders.
 pub struct RenderDispatcher {
     /// Per-pane render tracking (indexed by pane index).
     pub pane_render: Vec<PaneRenderState>,
     /// The latest fetched Level III object per `(AWIPS code, site)`.
-    ///
-    /// Keyed by the **code**, not by the product that wanted it, because an
-    /// object is not owned by a product: `DVL` is `VerticallyIntegratedLiquid`'s
-    /// whole field *and* VIL density's numerator, `EET` is `EchoTops`' field
-    /// *and* its denominator. A product-keyed cache had to be filled once per
-    /// product, which meant fetching the same ~100 KB object twice on every site
-    /// poll; keyed this way one fetch serves every reader
-    /// ([`RadarProduct::level3_readers`]).
-    ///
-    /// Which entries a product may read is still narrow, and is decided in one
-    /// place — the product's own [`RadarProduct::level3_products`] list, applied
-    /// by [`nearest_tilt`](Self::nearest_tilt) and
-    /// [`cached_by_code`](Self::cached_by_code). Nothing resolves an object it
-    /// does not name, so sharing the map does not let a product read a field it
-    /// has no palette for.
-    ///
-    /// Holds the whole [`Level3Product`], not just the message, so the stamp —
-    /// which object it came from and when it was written — reaches the UI
-    /// alongside the pixels. See [`rustdar_radar::level3::ProductStamp`].
-    ///
-    /// Private, so [`cache_level3`](Self::cache_level3) really is the only way
-    /// in: an insert that bypassed it would drop the storm motion vector on the
-    /// floor, and the pane would render with another volume's.
     level3_data: HashMap<(String, String), Arc<Level3Product>>,
-    /// Environmental 0 °C / −20 °C heights per site, from Open-Meteo — staged
-    /// for the products [`RadarProduct::reads_env_heights`] names, which will
-    /// read them at render time, and which
-    /// [`set_env_heights`](Self::set_env_heights) invalidates on. Written by
-    /// the sounding drain in `app_render`; read back by
-    /// `spawn_level3_fetches`'s TTL gate, which refetches on poll only once
-    /// [`rustdar_radar::sounding::EnvHeights::is_stale`] says the entry has
-    /// aged out. Survives both reset paths: the environment does not change
-    /// because a pane was reset, and the TTL is the eviction policy.
+    /// Environmental 0 °C / −20 °C heights per site, from Open-Meteo — staged for the
+    /// products [`RadarProduct::reads_env_heights`] names.
     pub env_heights: HashMap<String, rustdar_radar::sounding::EnvHeights>,
     /// The RPG's own Melting Layer object per site — the top rung of
-    /// `rustdar_radar::hca::resolve_melting_layer`, staged for the one product
-    /// that reads it and invalidated by
-    /// [`set_melting_layer`](Self::set_melting_layer).
-    ///
-    /// # Why this one carries a volume and `env_heights` does not
-    ///
-    /// A sounding is a fact about a place and an hour: applying an hour-old one
-    /// to this volume is merely old, which is why that map is keyed by site
-    /// alone and aged out on a TTL. An `N0M` object is a fact about **one
-    /// volume**. Applied to another it does not degrade, it lies — it places a
-    /// measured-looking layer at a height nothing measured for the volume on
-    /// screen, which is the same failure as the fleet default with the caption
-    /// removed. So the volume it names is stored with it and
-    /// [`melting_layer_product_for`](Self::melting_layer_product_for) refuses
-    /// every other volume.
-    ///
-    /// Survives both reset paths for the reason `env_heights` does, and more
-    /// safely: a stale entry here cannot be *applied*, so eviction is not what
-    /// makes it correct. Keeping it is what lets a pane switched back to a
-    /// volume still in hand classify without a second round-trip.
+    /// `rustdar_radar::hca::resolve_melting_layer`.
     melting_layer: HashMap<String, MeltingLayerObject>,
     /// The RPG's own storm motion vector per site — the second rung of
-    /// `rustdar_radar::srv::storm_motion`, staged for the one product that
-    /// reads it and invalidated by
-    /// [`set_storm_motion_choice`](Self::set_storm_motion_choice).
-    ///
-    /// Carries a volume for exactly the reason `melting_layer` does, and the
-    /// lie it prevents is the same shape: the previous volume's SCIT average
-    /// is a real vector of a real storm, so nothing about the shifted field
-    /// looks wrong, and the render would report itself as
-    /// [`RpgScitAverage`](rustdar_radar::srv::StormMotionSource::RpgScitAverage)
-    /// — the RPG's own, for this volume — while being neither.
-    /// [`rpg_storm_motion_for`](Self::rpg_storm_motion_for) refuses every other
-    /// volume.
-    ///
-    /// Survives both reset paths on the same terms: a stale entry here cannot
-    /// be *applied*, so eviction is not what makes it correct.
+    /// `rustdar_radar::srv::storm_motion`.
     storm_motion: HashMap<String, StormMotionObject>,
     /// Generation counter to discard stale render results after a **full** reset.
-    ///
-    /// Bumped by [`reset_panes`](Self::reset_panes) only. Per-site resets abandon
-    /// the affected panes' renders individually — see
-    /// [`PaneRenderState::results_wanted`] — because this counter is global and a
-    /// bump of it discards the in-flight renders of every pane on every other
-    /// site, which then respawn: a wasted 2048² image and value grid per pane per
-    /// cross-site poll, recurring every poll interval in a multi-site layout.
     pub render_generation: u64,
     /// Per-site fetch generation counters to discard stale fetch results.
     pub fetch_generations: HashMap<String, u64>,
     /// Shared counter for concurrent background render threads.
-    ///
-    /// This is the single source of truth for the concurrent-render budget and is
-    /// shared by *both* render paths: static pane renders (`spawn_render` below) and loop
-    /// frame renders (`App::spawn_loop_frame_render` / `App::dispatch_loop_renders`).
-    /// Never introduce a second counter — two independent counters would each enforce the
-    /// limit separately and allow up to 2x the intended number of concurrent 2048x2048
-    /// render threads (and the matching memory spike). All call sites must reach this
-    /// field, cloning the `Arc` only to hand a `RenderGuard` to a spawned thread.
     pub renders_in_flight: Arc<AtomicUsize>,
     /// Cache of the latest render output per (site, product, elevation_tenths), shared
     /// across panes that display the same product at the same elevation on the same site.
-    ///
-    /// Bounded on an LRU policy by a count **and** by bytes: it is a sharing
-    /// cache for the panes on screen, not a history, and each entry costs
-    /// `side² × 8` bytes — 32 MiB at the base side, 128 MiB at the long-range
-    /// one, and 414 MiB for a 7362 px surveillance cut on a device that reports
-    /// 32768. The count alone was a fair statement about memory while the side
-    /// was one of three; it is not one now, and `RenderCache::new` is where
-    /// both bounds and the byte figure they come from are argued.
     pub render_cache: RenderCache,
     /// Background radar renders that may be in flight at once — this build's
     /// `Budgets::concurrent_renders`, held rather than read from a `cfg`
-    /// constant. See [`RenderDispatcher::with_budgets`].
     concurrent_renders: usize,
-    /// The largest plan-view raster the device this process is drawing on can
-    /// hold — `AppState::raster_side_ceiling_px`, copied here because the
-    /// dispatch sites are where it turns into a job.
-    ///
-    /// The **base** size until a device exists, which is the safe direction: a
-    /// static render dispatched before `ensure_rendering_state` has installed
-    /// one goes out at a size every device can upload rather than at one
-    /// nothing can. Nothing dispatches that early in the shipped app — the
-    /// frame loop returns before `dispatch_pane_renders` while `state` is
-    /// `None` — so what actually observes the default is this crate's tests,
-    /// and the base size is what they were written against.
+    /// The largest plan-view raster the device this process is drawing on can hold —
+    /// `AppState::raster_side_ceiling_px`.
     raster_side_ceiling_px: usize,
-    /// The storm motion override the storm-relative renders on screen were
-    /// built with. Nothing else about a pane changes when the user edits the
-    /// vector, so without this the field would keep the old motion until the
-    /// next scan. Routed into the Level II render parameters by
-    /// [`spawn_level2_render`](Self::spawn_level2_render); with no override
-    /// the renderer applies the RPG's own vector for the volume, and failing
-    /// that the derived rung `last_srv_fallback` beside this names
-    /// (`rustdar_radar::srv`).
+    /// The storm motion override the storm-relative renders on screen were built with.
     last_storm_motion_override: Option<StormMotionSample>,
     /// Which derived rung the storm-relative renders on screen fell to when no
     /// override and no RPG vector applied — the reader's own choice.
-    ///
-    /// Beside the override and invalidated by the same setter, because it fails
-    /// the same way: nothing else about a pane changes when the reader picks a
-    /// different derived rung, so without this the field would keep the old
-    /// quantity until the next scan. It is a *quantity* change and not a
-    /// refinement — the 0-6 km mean wind and the Bunkers right-mover agree to
-    /// within one display level on well under half their gates.
     last_srv_fallback: rustdar_radar::srv::SrvFallback,
     /// The last whole-volume payload extracted for a cross-section, and what it
     /// was extracted from.
-    ///
-    /// # Why one entry and not a cache
-    ///
-    /// `RenderInput::extract_volume` walks every sweep of a volume carrying the
-    /// moment and copies its gates out: **15.6 MB** for a full reflectivity
-    /// ladder, and the walk itself is the expensive half. Everything that makes
-    /// a section pane want another cut re-uses the same volume and the same
-    /// moment — moving the line, a second section pane cut from the same map,
-    /// a line redrawn because the first one missed the storm — so a single entry
-    /// keyed on [`SectionInputKey`] catches all of it, and a second entry
-    /// would only ever hold a volume nothing on screen is looking at.
-    ///
-    /// The dominant protection is upstream of this and is a property of the
-    /// interaction rather than of a cache: sections are re-cut **on commit**,
-    /// never per drag frame. The rubber band is drawn locally with no render at
-    /// all, so the payload is built when a line is finished and not while it is
-    /// being aimed. That matters most exactly where this cache helps least —
-    /// wasm, where the concurrent-render budget is 1 with no preemption, so a
-    /// per-frame dispatch would not merely be wasteful but would queue behind
-    /// itself.
     section_input: Option<SectionInput>,
-    /// Plan-view extraction payloads, populated at **volume arrival** for the
-    /// panes currently showing the site (their current product + elevation
-    /// only — AF2: never all products, never unshown panes) and read back by
-    /// [`spawn_level2_render`](Self::spawn_level2_render)'s dispatch (WO-E4.9).
-    ///
-    /// The payload is cached **unstamped**: the four `.with_*` stamps consume
-    /// `self` and are applied at dispatch on a clone, because the melting
-    /// layer and the RPG motion arrive asynchronously minutes after the
-    /// volume — a pre-stamped cache would go stale the moment they land,
-    /// while an unstamped one is exactly what those re-renders hit instead
-    /// of paying the extraction walk again on the frame thread.
-    ///
-    /// A miss falls back to the inline extraction — today's path, byte for
-    /// byte — so nothing here can make a render fail that used to succeed.
-    /// Bounded at [`EXTRACT_CACHE_CAP`] entries LRU; entries die with their
-    /// volume (the same eviction pass as the derive memo) and with each new
-    /// arrival for their site, which is what keeps a live volume's sealed
-    /// sweeps from being served out of the sweep before.
+    /// Plan-view extraction payloads.
     extract_cache: HashMap<ExtractKey, Arc<rustdar_radar::render_input::RenderInput>>,
     /// The recency queue of `extract_cache`, oldest first — the same private
     /// pairing [`RenderCache`] keeps, for the same reason.
     extract_recency: VecDeque<ExtractKey>,
-    /// The dispatcher-local mpsc the native arrival-time extractions home
-    /// over (amendment C3: a RenderOrchestrator-local channel, NOT a
-    /// ChannelHub pair — the FRAME_PUMP row that drains it registers with
-    /// `drains: []`, an order-riding non-hub drain).
-    // On wasm the arrival drain populates inline and nothing sends — the
-    // pair still exists there so the pump row's drain has one shape on both
-    // targets (the cfg split selects the executor, not the machinery).
+    /// The dispatcher-local mpsc the native arrival-time extractions home over.
+    // On wasm the arrival drain populates inline and nothing sends.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     extract_results_tx: std::sync::mpsc::Sender<ExtractResult>,
     extract_results_rx: std::sync::mpsc::Receiver<ExtractResult>,
-    /// Frame-thread plan-view extractions performed at dispatch — the
-    /// frame-thread-payment probe for the plan view path, the sibling of
-    /// `App::volume_extractions` (which counts the whole-volume walks). A
-    /// cache hit performs zero; a miss exactly one.
+    /// Frame-thread plan-view extractions performed at dispatch — the frame-thread-
+    /// payment probe for the plan view path.
     #[cfg(test)]
     pub(crate) plan_view_extractions: std::cell::Cell<u32>,
-    /// Whether an adjacent-tilt pre-render is out (WO-E4.10). One at a time
-    /// IS the whole policy — together with "no interactive render in flight"
-    /// at the dispatch gate, deliberately NOT widened to fill-all-idle-lanes
-    /// (a scheduling change this phase does not make). Set by
-    /// [`spawn_speculative_render`](Self::spawn_speculative_render), cleared
-    /// by the speculative result's arrival, whatever it carried.
+    /// Whether an adjacent-tilt pre-render is out.
     speculative_in_flight: bool,
 }
 
 /// The identity of one plan-view extraction — **today's tuple, exactly the
 /// arguments [`rustdar_radar::render_input::RenderInput::extract`] takes**
-/// (the RenderKey re-key lands with E5/Phase 4; this is deliberately not a
-/// new identity). The site stands for the `(lat, lon)` pair the extraction
-/// reads; the float components are keyed by bits so the key is `Eq + Hash`.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct ExtractKey {
     pub(crate) site: String,
@@ -657,52 +321,24 @@ pub(crate) struct ExtractKey {
 }
 
 /// One homed arrival-time extraction: the key it was computed under and the
-/// unstamped payload (the four stamps are applied at dispatch — see
-/// `extract_cache`'s field doc).
+/// unstamped payload — the four stamps are applied at dispatch.
 pub(crate) type ExtractResult = (ExtractKey, Arc<rustdar_radar::render_input::RenderInput>);
 
 /// The extract tuple the arrival hook and the dispatch share: the cache key
 /// plus the two extraction arguments its float bits came from.
 pub(crate) type ExtractTuple = (ExtractKey, Option<(f32, f32)>, Option<(f64, f64)>);
 
-/// At most this many extraction payloads stay resident (WO-E4.9's cap 8):
-/// one per pane a desktop split can show, roughly, and each is one sweep's
-/// gates rather than a volume — small beside the render cache it feeds.
+/// At most this many extraction payloads stay resident: one per pane a desktop
+/// split can show, roughly.
 const EXTRACT_CACHE_CAP: usize = 8;
 
-/// Whether this build may pre-render an adjacent tilt at all (WO-E4.10) —
-/// the platform/budget half of the speculative gate, as a parameterized
-/// function so a host `cargo test` exercises BOTH arms (the WEB-const
-/// pattern: the caller passes `crate::app::WEB`).
-///
-/// **Never on wasm (AF8)**: the browser has one worker, so speculation
-/// queues behind interactive work instead of beside it — the exact inversion
-/// of the point. And never under a small budget: `concurrent_renders > 2`
-/// admits desktop (6) and mobile (3), refuses wasm's 1 twice over, and keeps
-/// at least two slots free for interactive work while a speculative runs.
+/// Whether this build may pre-render an adjacent tilt at all — the
+/// platform/budget half of the speculative gate.
 pub(crate) fn speculative_render_allowed(web: bool, concurrent_renders: usize) -> bool {
     !web && concurrent_renders > 2
 }
 
-/// One rendered frame's trip into the shape the frame thread applies — the
-/// deliver tail [`RenderDispatcher::spawn_render`] and
-/// [`RenderDispatcher::spawn_speculative_render`] share.
-///
-/// The RGBA bytes are finished with the moment they have been copied into
-/// the `ColorImage`, and this is the only place that copy happens for a
-/// static render — so this is where they go back to the renderer's slot
-/// rather than to the allocator. Recycled before the `?` so that a texture
-/// the display layer rejects gives its buffer up too. What goes back is a
-/// *premultiplied* buffer, which costs the slot nothing: `checkout_image`
-/// re-seeds every byte it lends, so the next render never sees this one's
-/// convention.
-///
-/// The raster value grid is already back in the renderer's slot —
-/// `From<SweepRender> for RenderedFrame` is where it dies, on every path —
-/// and what leaves here in its place is the gates, at the resolution the
-/// radar measured them. That is the whole of the residency change: the
-/// image `Arc` is held by the pane, the render cache and the suspend copy
-/// for as long as the picture is on screen, and it used to be 206.75 MiB.
+/// One rendered frame's trip into the shape the frame thread applies.
 fn rendered_image_from(
     frame: rustdar_radar::frame::RenderedFrame,
 ) -> Option<crate::channels::RenderedImage> {
@@ -718,9 +354,8 @@ fn rendered_image_from(
     })
 }
 
-/// The one place an [`ExtractKey`] is built, so the arrival-time populate and
-/// the dispatch lookup cannot key the same tuple two ways — the same
-/// single-definition argument [`render_cache_key`] makes.
+/// The one place an [`ExtractKey`] is built, so the arrival-time populate and the
+/// dispatch lookup cannot key the same tuple two ways.
 fn extract_key(
     site: &str,
     volume_start: chrono::NaiveDateTime,
@@ -740,94 +375,32 @@ fn extract_key(
 }
 
 /// One site's `N0M` object **and the volume start it names**.
-///
-/// The pair is the type. A bare `Arc<Vec<u8>>` would be an object with no
-/// statement of what it is an object *of*, and every consumer would then have
-/// to remember to ask — which is exactly the omission that produces a
-/// confidently misplaced melting layer. Held together, the question cannot be
-/// skipped: [`RenderDispatcher::melting_layer_product_for`] is the only reader
-/// and it compares before it hands anything out.
-///
-/// The bytes and not the decoded message: `rustdar_radar::render_input`
-/// carries the object to the worker as a blob, and a `Level3Message` has no
-/// wire form — the same reason `try_spawn_level3_render` dispatches bytes.
 pub struct MeltingLayerObject {
     /// The Level II volume start this object's PDB names, already validated by
-    /// `rustdar_radar::level3::fetch_product_for_volume` — so this field is
-    /// never a guess and never "close enough by listing time".
+    /// `rustdar_radar::level3::fetch_product_for_volume`.
     pub volume_start: chrono::NaiveDateTime,
     pub bytes: Arc<Vec<u8>>,
 }
 
 /// One site's `N0S` storm motion vector **and the volume start it names**.
-///
-/// [`MeltingLayerObject`]'s sibling, and the pair is the type for the same
-/// reason: a bare `(f32, f32)` would be a vector with no statement of what
-/// storm it is the motion *of*, and every consumer would then have to remember
-/// to ask. Held together, the question cannot be skipped —
-/// [`RenderDispatcher::rpg_storm_motion_for`] is the only reader and it
-/// compares before it hands anything out.
-///
-/// # Decoded, where the melting layer is bytes
-///
-/// The one place this path deliberately diverges from `N0M`. That object ships
-/// as a blob because `rustdar_radar::render_input` carries it to the worker
-/// for a per-azimuth field to be decoded off-thread. An `N0S` yields two
-/// scalars out of its Product Description Block, and the pairing step
-/// (`rustdar_radar::level3::fetch_product_for_volume`) has already decoded that
-/// PDB to check which volume the object names — so carrying the bytes this far
-/// would mean decoding the same header a second time to recover numbers the
-/// fetch already held.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StormMotionObject {
     /// The Level II volume start this object's PDB named, already validated by
-    /// `rustdar_radar::level3::fetch_product_for_volume` — so this field is
-    /// never a guess and never "close enough by listing time".
+    /// `rustdar_radar::level3::fetch_product_for_volume`.
     pub volume_start: chrono::NaiveDateTime,
     /// `(speed_kt, direction_from_deg)`, exactly as the PDB stated them.
-    ///
-    /// **`(0.0, 0.0)` is a reading and is held as one.** SCIT tracked no cells
-    /// and the RPG painted an unshifted field; that is the vector the reference
-    /// product was built with, so treating it as absent would substitute a
-    /// derived rung for the RPG's own answer and still call it the RPG's.
     pub motion: (f32, f32),
 }
 
 /// A whole-volume payload and the volume it came out of.
-///
-/// The product is part of the key because `extract_volume` narrows to one
-/// moment: a payload extracted for reflectivity carries no velocity, and handing
-/// it to a velocity section would produce a picture of an empty ladder rather
-/// than an error.
-///
-/// The ladder fingerprint is part of the key for the reason
-/// [`SectionTarget::ladder`](rustdar_egui::pane::SectionTarget) exists: on the
-/// live feed the volume time is frozen for the whole volume while the merged
-/// volume refreshes sweep by sweep, so `(site, collected, product)` alone
-/// would hand a payload extracted before a seal back to a cut dispatched
-/// after it. And because the fingerprint moves only when a rung's chosen
-/// sweep or the declared pattern changes, the walk this cache exists to avoid
-/// runs only when the picture will actually differ — a Doppler-half seal no
-/// longer invalidates a reflectivity payload it never changed.
 struct SectionInput {
     key: SectionInputKey,
-    /// `Arc` so the cache and the job in flight can hold it at once; the job
-    /// needs an owned `RenderInput`, so what crosses to the worker is a clone of
-    /// the bytes rather than a second walk of the volume.
+    /// `Arc` so the cache and the job in flight can hold it at once; the job needs an
+    /// owned `RenderInput`.
     input: Arc<rustdar_radar::render_input::RenderInput>,
 }
 
-/// What a section dispatch did — three answers, because two of them used to
-/// be one.
-///
-/// [`Busy`](Self::Busy) and [`NoPayload`](Self::NoPayload) were both `false`,
-/// and the caller's reading of `false` is "take no budget, write no staleness
-/// key, ask again next frame". That is right for a full budget and wrong for a
-/// volume that carries nothing to cut: the pane re-asked on every frame and
-/// painted "Cutting the cross-section…" for as long as the volume stood. A
-/// permanent wait is the worst state a pane can be in — it looks like progress
-/// and there is nothing to do about it — and this codebase shipped that exact
-/// bug once before and fixed it.
+/// What a section dispatch did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SectionDispatch {
     /// A cut is in flight. The caller writes the staleness key.
@@ -835,21 +408,12 @@ pub enum SectionDispatch {
     /// The render budget is full, or the pane index is out of range. Nothing
     /// was taken and nothing is wrong: ask again next frame, key unwritten.
     Busy,
-    /// This volume carries no field to cut under this product — no sweep
-    /// holds the moment, or the derivation refused it. The caller names the
-    /// state and *does* write the key: the key carries the volume stamp and
-    /// the ladder, so the next volume asks again on its own.
+    /// This volume carries no field to cut under this product — no sweep holds the
+    /// moment, or the derivation refused it.
     NoPayload,
 }
 
 /// What a cached section payload is a payload *of*.
-///
-/// A struct with a derived `PartialEq` rather than a chain of `&&`s at the reuse
-/// site, because the failure mode of the chain is forgetting a clause, and the
-/// consequence of forgetting one is not an error — it is the wrong volume, or an
-/// empty ladder, or (the quietest of the three) a picture of the right volume
-/// with most of it missing. Adding a field to this struct therefore cannot
-/// silently leave the comparison behind.
 #[derive(Clone, Debug, PartialEq)]
 struct SectionInputKey {
     site: String,
@@ -860,54 +424,15 @@ struct SectionInputKey {
     ladder: u64,
     /// The storm motion vector the payload was **derived** with, as raw bits,
     /// and `None` for every product that does not read one.
-    ///
-    /// This field is the fix for a silent wrong-field. A storm-relative
-    /// section is not a slice of a measured moment: `extract_volume_parts`
-    /// runs the SRV derivation on the way out, so the payload *is* a function
-    /// of the vector. Without the vector in the key, an override edit left
-    /// `reusable` true, `extract()` unrun and the previous vector's field
-    /// shipped to the worker — while the plan view and the 3D volume both
-    /// re-derived correctly, because their invalidations do cover it. The
-    /// user dragged the vector and watched the section visibly redraw showing
-    /// the old one, for up to a whole volume, with nothing saying so.
-    ///
-    /// In the key rather than as an eviction in
-    /// [`set_storm_motion_choice`](RenderDispatcher::set_storm_motion_choice),
-    /// which is the other place it could go. Two reasons. The payload cache
-    /// holds exactly one entry, so an eviction would throw away a
-    /// *reflectivity* payload the vector never touched and charge the next
-    /// cut a 15.6 MB re-walk for an edit that could not have changed it. And
-    /// identity is what this struct is for: its doc above is the promise that
-    /// a thing the payload depends on cannot be left out of the comparison,
-    /// and the vector is such a thing.
-    ///
-    /// Bits rather than `f32`s so the comparison is reflexive. A NaN vector
-    /// would never equal itself, and the consequence would not be a wrong
-    /// picture but a re-extraction of the whole volume on every frame the
-    /// section stood — the quiet kind of failure this file already carries
-    /// two notes about.
     storm_motion: Option<(u32, u32)>,
     /// Which derived rung the payload was derived with when the field above is
     /// `None`.
-    ///
-    /// The same silent wrong-field the vector above closes, in the half of the
-    /// chain that vector cannot reach: both derived rungs are reached with no
-    /// override at all, so switching between them changes the payload's every
-    /// gate while `storm_motion` stays `None` on both sides. In the key rather
-    /// than as an eviction for this struct's stated reason — a thing the
-    /// payload depends on cannot be left out of the comparison.
     srv_fallback: rustdar_radar::srv::SrvFallback,
 }
 
 impl SectionInputKey {
     /// The key a payload would have to carry to serve `target` under the
     /// storm motion vector `motion`.
-    ///
-    /// `motion` is the same `(speed_kt, direction_from_deg)` pair
-    /// [`RenderDispatcher::storm_motion_override_kt`] hands the extraction —
-    /// read from the dispatcher's own field at the call site, never taken
-    /// from the caller, so the vector a payload is keyed on cannot differ
-    /// from the vector it was derived with.
     fn of(
         target: &rustdar_egui::pane::SectionTarget,
         motion: Option<(f32, f32)>,
@@ -926,32 +451,6 @@ impl SectionInputKey {
 
 /// A finished plan-view raster in egui's pixel layout, or `None` if its length
 /// is not one this build can have produced.
-///
-/// **There is no unmultiply left here.** `offload::execute` premultiplies every
-/// raster it answers with, wherever the job ran, so what arrives is already the
-/// bytes a `Color32` is and this is `from_rgba_premultiplied` — a length check
-/// and a copy, with no per-pixel arithmetic in it at all.
-///
-/// That matters on the browser, where this runs on the main thread. Measured
-/// there rather than inferred from a native run of the same byte count, which
-/// understates it by more than a factor of three: over twelve real Level II
-/// rasters at the 2048 px browser ceiling, the walk this no longer does cost
-/// **14.3–14.7 ms in Firefox 153 and 8.0–8.4 ms in Chrome 151** against a
-/// 16.7 ms frame budget, and what is left here is 3.1 ms and 2.0 ms of copy.
-/// Natively `deliver` is the render thread and always was, so what moved there
-/// is the line rather than the cost.
-///
-/// The side is derived from the length rather than named, because a static
-/// render is anywhere from `IMAGE_SIZE` up to the ceiling this device reported,
-/// depending on how far its sweep reached and how finely its gates sampled it,
-/// and the caller here does not know which. Validating what comes back — a
-/// whole number of pixels, a perfect square, a side inside this build's own
-/// bounds — is what makes deriving it safe:
-/// `ColorImage::from_rgba_premultiplied` asserts on a mismatch exactly as its
-/// sibling did, and this is called on a render worker natively — where a panic
-/// means no `RenderResponse` ever arrives, `render_in_flight` never clears, and
-/// the pane stays blank for good. `None` instead routes a malformed buffer down
-/// the "no matching sweep" path the dispatcher already retires cleanly.
 fn plan_view_image(rgba: &[u8]) -> Option<egui::ColorImage> {
     let Some(side) = rustdar_device_profile::constants::raster_side_from_rgba_len(rgba.len())
     else {
@@ -975,11 +474,6 @@ impl Default for RenderDispatcher {
 
 impl RenderDispatcher {
     /// A dispatcher for this build's own budgets.
-    ///
-    /// The convenience arm over [`with_budgets`](Self::with_budgets), for the
-    /// tests that are about invalidation rather than about capacity. The
-    /// application takes the other one, so the two numbers this struct spends
-    /// arrive from the same resolved `Budgets` everything else reads.
     pub fn new() -> Self {
         Self::with_budgets(&rustdar_device_profile::budget::resolve(
             &rustdar_device_profile::budget::DeviceProfile::for_target(),
@@ -987,14 +481,9 @@ impl RenderDispatcher {
     }
 
     /// A dispatcher holding the concurrency and cache budgets it is handed.
-    ///
-    /// Handed rather than read from a `cfg` constant, for the reason
-    /// `volume::quality::select` and `LoopPool::for_device` take theirs as
-    /// parameters: this workspace runs `cargo test` on exactly one of three
-    /// arms, and a budget read inline is a budget checkable on one row.
     pub fn with_budgets(budgets: &Budgets) -> Self {
-        // The extract-results pair is dispatcher-local by amendment C3: it is
-        // not a ChannelHub channel and never becomes one.
+        // The extract-results pair is dispatcher-local: it is not a ChannelHub
+        // channel and never becomes one.
         let (extract_results_tx, extract_results_rx) = std::sync::mpsc::channel();
         Self {
             pane_render: vec![PaneRenderState::new()],
@@ -1026,55 +515,29 @@ impl RenderDispatcher {
     }
 
     /// Background radar renders that may be in flight at once.
-    ///
-    /// The single budget both the loop and the static pane paths spend, so the
-    /// two call sites outside this module read it from here rather than each
-    /// naming a constant.
     pub fn concurrent_renders(&self) -> usize {
         self.concurrent_renders
     }
 
     /// Record what the device that has just been created can hold. See
     /// [`raster_side_ceiling_px`](Self::raster_side_ceiling_px).
-    ///
-    /// Called where the device is installed rather than read from there per
-    /// dispatch, because the dispatcher outlives the device: a lost surface
-    /// drops `AppState` and a new one is built, and a dispatcher that reached
-    /// for a device would have to answer the question with no device in hand.
     pub fn set_raster_side_ceiling_px(&mut self, side: usize) {
         self.raster_side_ceiling_px = side;
     }
 
     /// The ceiling a **static** render dispatched now may take — the number
     /// that becomes the request envelope's `side_ceiling_px`.
-    ///
-    /// Static, because a loop frame's ceiling is `LOOP_IMAGE_SIZE` by policy;
-    /// see `offload::JobRequest::geometry` for both callers.
     fn static_side_ceiling_px(&self) -> usize {
         self.raster_side_ceiling_px
     }
 
     /// Cache a fetched Level III object under the `(AWIPS code, site)` it is.
-    ///
-    /// The only way into [`level3_data`](Self::level3_data). No product is named:
-    /// the object is whatever `code` says it is, and every product that reads
-    /// that code reads this one entry.
     pub fn cache_level3(&mut self, code: String, site: String, fetched: Level3Product) {
         self.level3_data.insert((code, site), Arc::new(fetched));
     }
 
     /// Record the storm motion override in force and, if it moved, drop every
     /// storm-relative render that used the old one.
-    ///
-    /// Returns whether anything was invalidated. Both the per-pane state and
-    /// the shared render cache have to go: the cache is keyed on
-    /// `(site, product, elevation)`, which the vector is not part of, so a
-    /// stale entry would be handed straight back to the next pane that asked.
-    ///
-    /// Every tilt: the field this records is the same one
-    /// [`spawn_level2_render`](Self::spawn_level2_render) reads into the
-    /// render parameters, so the vector a pane is invalidated for cannot
-    /// differ from the one it is redrawn with.
     pub fn set_storm_motion_choice(
         &mut self,
         motion: Option<StormMotionSample>,
@@ -1098,30 +561,8 @@ impl RenderDispatcher {
         true
     }
 
-    /// Record a site's environmental heights and, if the pair actually moved,
-    /// drop that site's renders of every product that reads it — the per-site
-    /// counterpart of
-    /// [`set_storm_motion_choice`](Self::set_storm_motion_choice), for the
-    /// other render parameter that is not part of the cache key. Written by
-    /// the sounding drain in `app_render`; the field it writes is the same one
-    /// [`env_heights_km_msl_for`](Self::env_heights_km_msl_for) reads into the
-    /// render parameters, so the environment a pane is invalidated for cannot
-    /// differ from the one it is redrawn with.
-    ///
-    /// The set is [`RadarProduct::reads_env_heights`] and not a list written
-    /// here: this predicate named the hail pair alone while the render
-    /// parameters already carried the pair to the hybrid classification too,
-    /// so an HCA pane went on showing a default-melting-layer picture until
-    /// the volume rolled. Asking the product resolves that by construction —
-    /// the invalidation set cannot fall behind the consuming set, because
-    /// they are the same sentence.
-    ///
-    /// An unchanged pair still refreshes the entry — that restarts the TTL the
-    /// poll's refetch gate reads — but invalidates nothing: soundings refetch
-    /// on a timer and normally land identical, and redrawing every affected
-    /// pane each time would repeat hourly for no visible change.
-    ///
-    /// Returns whether anything was invalidated.
+    /// Record a site's environmental heights and, if the pair actually moved, drop that
+    /// site's renders of every product that reads it.
     pub fn set_env_heights(
         &mut self,
         site: &str,
@@ -1149,21 +590,8 @@ impl RenderDispatcher {
         true
     }
 
-    /// Record a site's `N0M` object for the volume it names and, if that
-    /// changes what the classification would stand on, drop the site's
-    /// classification renders.
-    ///
-    /// The per-volume counterpart of
-    /// [`set_env_heights`](Self::set_env_heights), and it invalidates on a
-    /// narrower set for a narrower reason: exactly one product reads a melting
-    /// layer, so exactly one product's pictures can change when one lands.
-    ///
-    /// The comparison is on the **volume**, not on the bytes. Two objects for
-    /// one volume are the same answer however they were keyed, and an object
-    /// for a different volume is a different answer even if the bytes were
-    /// identical — which is the whole distinction this path is built on.
-    ///
-    /// Returns whether anything was invalidated.
+    /// Record a site's `N0M` object for the volume it names, dropping the renders
+    /// whose classification it changes.
     pub fn set_melting_layer(
         &mut self,
         site: &str,
@@ -1193,24 +621,8 @@ impl RenderDispatcher {
         true
     }
 
-    /// Record a site's `N0S` storm motion vector for the volume it names and,
-    /// if that changes what the storm-relative field would be shifted by, drop
-    /// the site's SRV renders.
-    ///
-    /// [`set_melting_layer`](Self::set_melting_layer)'s sibling, on the same
-    /// narrow invalidation for the same narrow reason: exactly one product
-    /// applies a storm motion vector, so exactly one product's pictures can
-    /// change when one lands.
-    ///
-    /// The comparison is on the **volume**, not on the vector. Two objects for
-    /// one volume are the same answer however they were keyed, and an object
-    /// for a different volume is a different answer even if the numbers were
-    /// identical — which is the whole distinction this path is built on. It is
-    /// also what keeps a legitimate `(0.0, 0.0)` from reading as "nothing
-    /// landed": the identity that matters here is the volume's, never the
-    /// vector's.
-    ///
-    /// Returns whether anything was invalidated.
+    /// Record a site's `N0S` storm motion vector for the volume it names, dropping
+    /// the storm-relative renders it changes.
     pub fn set_storm_motion(
         &mut self,
         site: &str,
@@ -1248,12 +660,6 @@ impl RenderDispatcher {
     }
 
     /// Reset render state for panes on a specific site (e.g. after a new scan loads for that site).
-    ///
-    /// Only those panes' in-flight renders are abandoned. The global
-    /// [`render_generation`](Self::render_generation) is deliberately *not* bumped:
-    /// it is a single comparison for every pane, so bumping it here would throw
-    /// away the renders of panes on other sites — whose data has not changed —
-    /// and have them redone on every poll of every site.
     pub fn reset_panes_for_site(&mut self, site: &str, gui: &rustdar_egui::Gui) {
         for (idx, prs) in self.pane_render.iter_mut().enumerate() {
             if gui.pane(idx).is_some_and(|p| p.site == site) {
@@ -1270,28 +676,6 @@ impl RenderDispatcher {
 
     /// The narrow counterpart to [`reset_panes_for_site`], for the real-time
     /// chunk feed: one elevation cut completed, not a whole volume.
-    ///
-    /// A pane showing another tilt is showing an image that is still correct,
-    /// and resetting it costs more than a wasted render. `RenderInput::extract`
-    /// answers `None` for a tilt the volume does not yet carry, which dispatches
-    /// `Job::renders_nothing`; that unwinds the pane's in-flight mark but
-    /// consumes a slot in the render budget, and it would happen for every
-    /// unarrived tilt on every cut of every volume.
-    ///
-    /// `angles` are matched against each pane's **snapped** render elevation —
-    /// what `get_rendering_params` resolves and what `last_rendered` records —
-    /// not against `selected_elevation`, which may name a tilt no sweep carries.
-    ///
-    /// The products [`RadarProduct::reads_whole_volume`] names are skipped here:
-    /// every one of them would read a volume still being assembled as a complete
-    /// short one, with no error and no NaN. What refreshes them is the
-    /// `volume_complete` branch of `App::apply_chunk_outcome`, which calls
-    /// [`reset_panes_for_site`](Self::reset_panes_for_site) — every pane on the
-    /// site, whatever its product. Level III panes are skipped here too, for a
-    /// different reason: their pixels come from `level3_data`, which a Level II
-    /// cut says nothing about.
-    ///
-    /// Returns how many panes were invalidated, for the log and the tests.
     pub fn reset_panes_for_tilts(
         &mut self,
         site: &str,
@@ -1309,9 +693,8 @@ impl RenderDispatcher {
         // Only the tilts that changed. A whole-site `retain` would throw away the
         // images the untouched panes are still sharing.
         self.render_cache.retain(|k| {
-            // Elevation-blind for the vertical views, whose elevation part is
-            // absent rather than a tilt: a completed cut changes what a section
-            // is cut from whatever tilt the pane names.
+            // Elevation-blind for the vertical views, whose elevation part is absent
+            // rather than a tilt.
             k.select.site != site
                 || !(match k.view {
                     RenderView::PlanView => angles
@@ -1325,26 +708,6 @@ impl RenderDispatcher {
 
     /// The `abandon_results` + `render_in_flight` pairing, written once for the
     /// tilt reset above.
-    ///
-    /// A `reset_panes_for_volume` — the complement of what
-    /// [`reset_panes_for_tilts`](Self::reset_panes_for_tilts) skips, i.e. the
-    /// whole-volume Level II products on their own — used to sit beside it and go
-    /// through here too. It was deleted rather than wired up: the `volume_complete`
-    /// branch of `App::apply_chunk_outcome` is the only path that would have
-    /// called it, and it needs the *wider*
-    /// [`reset_panes_for_site`](Self::reset_panes_for_site) for three separate
-    /// reasons. The branch fires at a volume *boundary* — `ChunkPoller::roll`
-    /// produces `closed` — and the volume it installs is the one that just ended,
-    /// so every pane on the site was drawing the volume before it, not just the
-    /// whole-volume readers. The `if/else` there means the closing round's own
-    /// `sealed_elevations`, which belong to the volume that just started, never
-    /// reach `reset_panes_for_tilts`, so the site reset is what stands in for
-    /// them. And `reset_panes_for_site` also drops the site's `level3_data` and
-    /// `render_cache`, which the `spawn_level3_fetches` on the next line depends
-    /// on and which a pane-only reset does not touch.
-    ///
-    /// Kept as a separate function anyway: the pairing is the invariant, and it
-    /// wants one home whether one caller reads it or two.
     fn invalidate_panes_where(
         &mut self,
         site: &str,
@@ -1371,24 +734,6 @@ impl RenderDispatcher {
 
     /// Reset every pane's render state, every site's, and bump
     /// [`render_generation`](Self::render_generation).
-    ///
-    /// **No production caller, and not for the reason it looks like.** It is worth
-    /// recording which, because the chunk feed's volume-close path sits next door
-    /// and the two are unrelated. This lost its last caller in March 2026, months
-    /// before the real-time feed existed, when the archive drain and the manual
-    /// navigation both narrowed to
-    /// [`reset_panes_for_site`](Self::reset_panes_for_site) — the right call for
-    /// both, since a scan arriving for one site has no business discarding another
-    /// site's in-flight renders, which is exactly what bumping the global
-    /// generation does. `App::apply_chunk_outcome`'s completed-volume branch wants
-    /// the per-site reset for the same reason and calls it.
-    ///
-    /// So `render_generation` never advances in a running app and
-    /// [`is_render_stale`](Self::is_render_stale) is always false. That is not a
-    /// hole — per-site resets abandon their panes' renders individually, through
-    /// `PaneRenderState::results_wanted` — but it does mean this function and
-    /// that counter stand or fall together, which is a judgement for whoever next
-    /// needs a global invalidation rather than a thing to delete in passing.
     pub fn reset_panes(&mut self) {
         for prs in &mut self.pane_render {
             prs.last_rendered = None;
@@ -1402,7 +747,6 @@ impl RenderDispatcher {
     }
 
     /// Clear render state for suspend/resume or surface loss.
-    /// Keeps `cached_render` intact for instant texture restore.
     pub fn clear_last_rendered(&mut self) {
         for prs in &mut self.pane_render {
             prs.last_rendered = None;
@@ -1422,10 +766,6 @@ impl RenderDispatcher {
     }
 
     /// Check if a fetch generation is stale for a site.
-    /// This site's current fetch generation, without bumping it.
-    ///
-    /// What a chunk round inherits: bumping would let a five-second tick
-    /// supersede a manual navigation whose fetch is still in the air.
     pub fn fetch_generation_for(&self, site: &str) -> u64 {
         self.fetch_generations.get(site).copied().unwrap_or(0)
     }
@@ -1440,9 +780,6 @@ impl RenderDispatcher {
     }
 
     /// Look up a cached render result for the given site, product, and elevation.
-    ///
-    /// `&mut self` because a hit counts as a use for the LRU: a pane that keeps
-    /// reusing its cached render must not age out behind one nobody is looking at.
     pub fn get_cached_render(
         &mut self,
         site: &str,
@@ -1478,26 +815,7 @@ pub struct RenderParams {
 
 impl RenderDispatcher {
     /// The Level III object for `site` closest to `elevation`, out of the objects
-    /// `product` names — matched on the **Product Description Block's** elevation
-    /// angle rather than on the AWIPS mnemonic.
-    ///
-    /// The candidate set is [`RadarProduct::level3_products`], which is what
-    /// keeps a shared cache from letting one product read another's field: echo
-    /// tops considers `EET` and nothing else, however many other objects the site
-    /// has served. A product naming several codes sees all of them here, which is
-    /// only meaningful for tilts of one field — VIL density's two inputs are not
-    /// that, and it resolves them through
-    /// [`cached_by_code`](Self::cached_by_code) instead.
-    ///
-    /// Ties break on elevation number so a split cut or a SAILS/MRLE repeat,
-    /// which share an angle, resolve to the same one every frame — and then on
-    /// the AWIPS code, which makes the order **total**. Without that last step
-    /// VIL density's two whole-volume inputs, both at elevation 0 and both
-    /// numbered 0, compare `Equal` and `min_by` yields whichever the hash
-    /// happened to visit first: the field's reported age would flip between
-    /// `DVL`'s stamp and `EET`'s from one process to the next. Alphabetical puts
-    /// `DVL` first, which is the numerator — the object the field is a density
-    /// *of*.
+    /// `product` names.
     fn nearest_tilt(
         &self,
         product: RadarProduct,
@@ -1526,56 +844,13 @@ impl RenderDispatcher {
 
     /// Record on `pane` when the data behind `render` was collected, so the status
     /// bar can say how old the image is.
-    ///
-    /// **Every product gets one**, from whichever datasource it came from: the
-    /// `ProductStamp` time of the Level III object behind it, or the pane's own
-    /// Level II volume time. That uniformity is the point — an age drawn only for
-    /// the bucket-fetched products let the user read the datasource off the status
-    /// bar, and let its absence mean something too.
-    ///
-    /// Three values have to agree for the Level III answer to mean anything — the
-    /// product and elevation of *this* render, and the site of *this* pane — and
-    /// they are read here rather than by the caller, which is what makes a
-    /// pane that took this image from a sibling's broadcast report the image's
-    /// age rather than whatever it was showing before.
-    ///
-    /// Assigned unconditionally, so switching a pane between datasources replaces
-    /// the time rather than leaving the previous one captioning a field it does not
-    /// describe.
-    ///
-    /// Resolved through [`nearest_tilt`](Self::nearest_tilt) — the same
-    /// selection the render was spawned from — rather than being handed to
-    /// `spawn_render` and carried back up the render thread. A value that is
-    /// only *passed along* cannot be tested at the point it is passed, and
-    /// `try_spawn_level3_render` has no test callers by design — the same
-    /// reasoning that keeps the storm motion override a field read here
-    /// rather than an argument (see `storm_motion_override_kt`).
-    ///
-    /// The cost is one render's worth of latency in the other direction: if a
-    /// newer object for this tilt lands while the render is in flight, this
-    /// reports the newer stamp for the frame or two before the re-render it
-    /// triggered arrives. `poll_level3_results` clears `last_rendered` for
-    /// every pane on the site, so that re-render is already queued.
-    /// # Returned rather than assigned
-    ///
-    /// It used to write `pane.data_time` itself, and it must not: the value
-    /// dates *this render's pixels*, and those pixels are not on screen when it
-    /// is called — they are still crossing to the GPU, and the pane is showing
-    /// the previous sweep for as long as that takes. Assigning here dated the
-    /// picture on screen with the volume of the picture behind it, which on a
-    /// site that went down yesterday is a difference of most of a day. It
-    /// travels in the held record instead and lands with the pixels; see
-    /// `rustdar_egui::overlay_cache::HeldOverlayTexture::data_time`.
     pub fn data_time_for_render(
         &self,
         pane: &rustdar_egui::pane::PaneState,
         render: &CachedPaneRender,
     ) -> Option<chrono::NaiveDateTime> {
         // A Level III product's own object, or — for anything read off the volume,
-        // derived products included — the volume this pane has loaded. Falling back
-        // to the scan time for a Level III product whose stamp is unreadable would
-        // report a bucket object as being as fresh as the volume, so the branch is
-        // on the product rather than on whether a stamp was found.
+        // derived products included — the volume this pane has loaded.
         if render.product.is_level3() {
             self.nearest_tilt(render.product, &pane.site, render.elevation)
                 .and_then(|tilt| tilt.stamp.time)
@@ -1586,11 +861,6 @@ impl RenderDispatcher {
 
     /// The storm motion override as the `(speed_kt, direction_deg)` pair the
     /// Level II render parameters carry, or `None` — a lower rung applies.
-    ///
-    /// Read from [`last_storm_motion_override`](Self::last_storm_motion_override),
-    /// the same field [`set_storm_motion_choice`](Self::set_storm_motion_choice)
-    /// invalidates on, so the vector a pane is invalidated for cannot differ
-    /// from the one it is drawn with.
     pub(crate) fn storm_motion_override_kt(&self) -> Option<(f32, f32)> {
         self.last_storm_motion_override
             .map(|s| (s.motion.speed_kt, s.motion.direction_deg))
@@ -1598,9 +868,6 @@ impl RenderDispatcher {
 
     /// [`set_storm_motion_choice`](Self::set_storm_motion_choice) with the
     /// shipped derived rung, for a test whose subject is the override alone.
-    ///
-    /// Named rather than defaulted at the call site so that a test which *is*
-    /// about the rung cannot reach it by accident.
     #[cfg(test)]
     pub(crate) fn set_storm_motion_choice_default(
         &mut self,
@@ -1609,26 +876,13 @@ impl RenderDispatcher {
         self.set_storm_motion_choice(motion, rustdar_radar::srv::SrvFallback::default())
     }
 
-    /// Which derived rung a Level II render's payload should carry, read from
-    /// the same field [`set_storm_motion_choice`](Self::set_storm_motion_choice) invalidates
-    /// on — so the rung a pane is invalidated for cannot differ from the rung it
-    /// is drawn with, exactly as for the vector above.
+    /// Which derived rung a Level II render's payload should carry.
     pub(crate) fn srv_fallback(&self) -> rustdar_radar::srv::SrvFallback {
         self.last_srv_fallback
     }
 
-    /// The environmental heights a Level II render's parameters carry: the
-    /// site's `(0 °C, −20 °C)` pair in km MSL for the products
-    /// [`RadarProduct::reads_env_heights`] names, `None` for every other
-    /// product — and `None` when no sounding has landed, which the hail
-    /// render answers by drawing nothing ([`rustdar_radar::hail`]) and the
-    /// hybrid classification by falling back to the operational adaptation
-    /// defaults ([`rustdar_radar::hca`]).
-    ///
-    /// Read from [`env_heights`](Self::env_heights), the same map
-    /// [`set_env_heights`](Self::set_env_heights) invalidates on, so the
-    /// environment a pane is invalidated for cannot differ from the one it is
-    /// drawn with.
+    /// The environmental heights a Level II render's parameters carry: the site's
+    /// `(0 °C, −20 °C)` pair in km MSL, for the products that read them.
     pub(crate) fn env_heights_km_msl_for(
         &self,
         product: RadarProduct,
@@ -1646,53 +900,6 @@ impl RenderDispatcher {
 
     /// The `N0M` object a render of `volume_start` may classify against — and
     /// `None` for every other volume, whatever is cached.
-    ///
-    /// # The comparison is the feature
-    ///
-    /// The cache holds one object per site and a site produces a new volume
-    /// every four to six minutes, so "the object we have" and "the object for
-    /// the picture being drawn" agree only in the window between the fetch
-    /// landing and the next volume rolling. Outside it the cached object names
-    /// the *previous* volume, whose melting layer is a real measurement of a
-    /// real atmosphere — and that is exactly what makes handing it over worse
-    /// than handing over nothing. `resolve_melting_layer`'s lower rungs know
-    /// they are guessing and say so on screen; an object from the volume before
-    /// would be reported as [`Rpg`](rustdar_radar::hca::MeltingLayerSource::Rpg)
-    /// — measured, for this volume — while being neither.
-    ///
-    /// There is deliberately no "latest object" fallback for the same reason.
-    /// `fetch_product_for_volume` already refuses an object whose PDB does not
-    /// name the volume, so nothing unvalidated can reach the map; this is the
-    /// other half — a validated object cannot outlive the volume it validated
-    /// against.
-    ///
-    /// Gated on the product as [`env_heights_km_msl_for`](Self::env_heights_km_msl_for)
-    /// is. `RenderInput::with_melting_layer_product` drops the object for every
-    /// other product anyway, so this gate buys no correctness — it buys not
-    /// cloning an `Arc` and not describing a render as classification-shaped
-    /// when it is a reflectivity sweep.
-    ///
-    /// # "The same volume" is a question, not an `==`
-    ///
-    /// The two sides are written by different code. `cached.volume_start` is
-    /// the pane's `ScanInfo::timestamp`, taken from the volume's **first
-    /// radial** with its milliseconds; `volume_start` is whatever the caller
-    /// is drawing, which for a *loop frame* is the S3 archive key parsed with
-    /// `%H%M%S` and so truncated to the whole second. Measured over 108
-    /// archive volumes the two differ by 1–993 ms and are **never** equal, so
-    /// the `==` this used to make answered `None` for every frame of every
-    /// loop — including the newest, the one volume an object had actually been
-    /// fetched for. The classification silently dropped a rung and the same
-    /// volume classified differently still versus looped.
-    ///
-    /// `rustdar_radar::scan::names_same_volume` is the pairing, and it carries
-    /// the whole argument: the tolerance is exactly the archive key's own
-    /// truncation, and the nearest volume it could confuse for its neighbour
-    /// is 198× further away than the widest pair it admits.
-    /// `a_loop_frame_keyed_by_the_archive_reaches_this_volumes_melting_layer`
-    /// pins the pairing and
-    /// `a_frame_one_scan_cycle_away_reaches_neither_the_melting_layer_nor_the_motion`
-    /// pins the bound.
     pub(crate) fn melting_layer_product_for(
         &self,
         product: RadarProduct,
@@ -1708,74 +915,12 @@ impl RenderDispatcher {
     }
 
     /// The volume the site's cached `N0M` object names, if there is one.
-    ///
-    /// The fetch gate's read: a poll that would ask for an object already in
-    /// hand for this volume asks for nothing instead.
-    ///
-    /// # Why this one is compared with `==` and its reader is not
-    ///
-    /// Because both sides of *this* comparison come from one place. The
-    /// gate in `spawn_level3_fetches` weighs this against
-    /// `latest_scan_time_for_site`, and the cached `volume_start` is the value
-    /// that same call produced when the fetch was dispatched — one quantity
-    /// stated twice, both times off `ScanInfo::timestamp`, both times with the
-    /// first radial's milliseconds. There is no archive key on either side, so
-    /// there is nothing for `scan::names_same_volume` to absorb.
-    ///
-    /// It would also be the wrong thing to widen for its own sake: the failure
-    /// this gate can produce is a **redundant fetch**, not a mispaired volume,
-    /// and a `!=` that answered "different" too eagerly costs one ~6 kB object.
-    /// The reader, by contrast, decides which volume's measured melting layer
-    /// a classification stands on. Same-looking comparison, different
-    /// consequence — which is why they are allowed to differ.
     pub(crate) fn melting_layer_volume(&self, site: &str) -> Option<chrono::NaiveDateTime> {
         self.melting_layer.get(site).map(|held| held.volume_start)
     }
 
     /// The RPG's own storm motion vector for **this** volume of this site, or
     /// `None`.
-    ///
-    /// [`melting_layer_product_for`](Self::melting_layer_product_for)'s
-    /// sibling, and it refuses identically: an object naming another volume is
-    /// withheld, and there is deliberately **no "latest vector" fallback**.
-    /// `fetch_product_for_volume` already refuses an object whose PDB does not
-    /// name the volume, so nothing unvalidated can reach the map; this is the
-    /// other half — a validated vector cannot outlive the volume it validated
-    /// against.
-    ///
-    /// The failure that buys is the same one the melting layer's docs record,
-    /// in SRV's terms. `srv::storm_motion`'s lower rungs know they are
-    /// predicting and the pane says so; the previous volume's SCIT average
-    /// would be reported as
-    /// [`RpgScitAverage`](rustdar_radar::srv::StormMotionSource::RpgScitAverage)
-    /// — the RPG's own, for this volume — while being neither, and a storm
-    /// motion error is a solid-body shift of every gate in the field.
-    ///
-    /// Gated on the product as its sibling is.
-    /// `RenderInput::with_rpg_storm_motion` drops the vector for every other
-    /// product anyway, so this gate buys no correctness — it buys not
-    /// describing a reflectivity render as storm-relative.
-    ///
-    /// **A `(0.0, 0.0)` reading is handed out like any other.** SCIT tracked no
-    /// cells and the RPG painted an unshifted field; that is the vector the
-    /// reference product was built with, and withholding it here would fall to
-    /// a derived vector for a storm the RPG did not think was moving.
-    ///
-    /// # "The same volume" is a question, not an `==`
-    ///
-    /// Paired by `rustdar_radar::scan::names_same_volume` for exactly the
-    /// reason its sibling above is, and it carried exactly the same defect: a
-    /// loop frame's start comes off the archive key truncated to the second
-    /// while the cached vector's comes off the volume's first radial with its
-    /// milliseconds, so under `==` **every** frame of every SRV loop —
-    /// including the newest, the one volume an `N0S` had really been fetched
-    /// for — silently shifted on a derived rung instead. This is the sharper
-    /// of the two failures, because a storm motion off by a volume is a
-    /// solid-body shift of every gate in the field.
-    /// `a_loop_frame_keyed_by_the_archive_reaches_this_volumes_storm_motion`
-    /// pins the pairing and
-    /// `a_frame_one_scan_cycle_away_reaches_neither_the_melting_layer_nor_the_motion`
-    /// pins the bound.
     pub(crate) fn rpg_storm_motion_for(
         &self,
         product: RadarProduct,
@@ -1791,28 +936,11 @@ impl RenderDispatcher {
     }
 
     /// The volume the site's cached `N0S` vector names, if there is one.
-    ///
-    /// The fetch gate's read, exactly as
-    /// [`melting_layer_volume`](Self::melting_layer_volume) is: a poll that
-    /// would ask for a vector already in hand for this volume asks for
-    /// nothing instead — and compared with `==` for the reason recorded there,
-    /// which applies here unchanged. Both sides are `latest_scan_time_for_site`
-    /// and the worst a mismatch buys is one redundant object.
     pub(crate) fn storm_motion_volume(&self, site: &str) -> Option<chrono::NaiveDateTime> {
         self.storm_motion.get(site).map(|held| held.volume_start)
     }
 
     /// The object cached for one `(AWIPS code, site)`.
-    ///
-    /// The by-code counterpart of [`nearest_tilt`](Self::nearest_tilt), for a
-    /// product whose cached objects are not tilts of itself but the **inputs** of
-    /// a derivation: VIL density's `DVL` and `EET` (`rustdar_radar::vild`).
-    /// Selecting those by nearest PDB elevation would be meaningless — both are
-    /// whole-volume products at elevation 0 — and would resolve by hash order.
-    ///
-    /// `product` is taken so the caller cannot ask for an object the product does
-    /// not name: it is the same restriction `nearest_tilt` applies, written once
-    /// per resolution path rather than trusted to the two call sites below.
     fn cached_by_code(
         &self,
         product: RadarProduct,
@@ -1828,21 +956,6 @@ impl RenderDispatcher {
     }
 
     /// Spawn a Level III render for a pane if applicable.
-    /// Returns `true` if a render was spawned.
-    ///
-    /// Storm-relative velocity never comes through here any more: it is a
-    /// Level II product, derived where the Level II render runs — see
-    /// [`spawn_level2_render`](Self::spawn_level2_render) and
-    /// [`rustdar_radar::srv`].
-    ///
-    /// VIL density takes the two-object path: it is derived from `DVL` over
-    /// `EET`, so both have to be in hand before anything can be drawn, and the
-    /// radar crate refuses the pair outright if they are not from the same
-    /// volume scan (`rustdar_radar::vild::Refusal`). `false` here — no render
-    /// spawned — is the same answer a product with no cached object gets, so
-    /// the pane keeps whatever it was showing and tries again next frame, which
-    /// is what happens for the volume or two while only one of the pair has
-    /// landed.
     pub fn try_spawn_level3_render(
         &mut self,
         pane_idx: usize,
@@ -1905,10 +1018,8 @@ impl RenderDispatcher {
             params.elevation,
             sender,
             window,
-            // The product's bytes rather than its decoded form: a
-            // `Level3Message` has no wire form, and re-decoding is cheap against
-            // the render it precedes — so on the web the decode moves off the
-            // main thread with it.
+            // The product's bytes rather than its decoded form: a `Level3Message` has
+            // no wire form.
             rustdar_worker::offload::Job::Described(rustdar_worker::offload::JobRequest::describe(
                 rustdar_radar::jobs::Level3Job {
                     bytes: std::sync::Arc::clone(&l3_msg.bytes),
@@ -1922,46 +1033,7 @@ impl RenderDispatcher {
         true
     }
 
-    /// Spawn a Level II render for a pane. `site` names the pane's radar for
-    /// the per-site render parameters; the projection geometry still comes
-    /// from `params`.
-    ///
-    /// `declared` is what the volume's cuts said about where their velocity
-    /// folds ([`rustdar_radar::nyquist::DeclaredNyquist`]), which `data` cannot
-    /// carry — the model type has no field for it. It is a *render* parameter
-    /// here and not merely provenance: NROT and SRV dealias, and the interval
-    /// they fold around is this number where the volume states one and an
-    /// estimate off the sweep's own extremes where it does not. Passing an
-    /// empty table is not an error and not a compile failure; it is the
-    /// plan view estimating a limit the section pane beside it was told.
-    ///
-    /// # Budget first, extraction second
-    ///
-    /// The `render_slot_free` gate below is not a duplicate of the one inside
-    /// [`spawn_render`](Self::spawn_render): it is the same gate asked *before*
-    /// the extraction rather than after it. `RenderInput::extract` walks the
-    /// sweeps this render reads and copies their gates out — a whole-volume
-    /// product's payload is every velocity tilt in the volume — and it ran
-    /// unconditionally, so a pane that then found the budget full had already
-    /// spent that walk on the frame thread and threw the payload away.
-    ///
-    /// It is not a one-off, which is what makes it worth a gate. Nothing about
-    /// a refused dispatch is recorded — no slot taken, no `render_in_flight`
-    /// set — so the pane asks again on the very next frame, and pays again, for
-    /// as long as the budget stays full. Measured on this volume corpus at
-    /// 0.1–1.0 ms a pane for a single tilt and 0.7–2.4 ms for a four-pane split
-    /// of storm-relative velocity, *per frame* (measured at main@ebe0ad3b,
-    /// 2026-08-12 web-baseline campaign; instrumentation 3673d316). It
-    /// matters most on wasm, where
-    /// The web arm's budget is 1 and so any second render at all is a
-    /// starved frame for as long as the first one runs.
-    ///
-    /// This is the shape [`spawn_section_render`](Self::spawn_section_render)
-    /// has always had and that [`render_slot_free`](Self::render_slot_free)
-    /// exists for; the plan view is joining its siblings on it. Advisory for
-    /// the reason that function documents — the count can move underneath —
-    /// and a false negative costs a frame's retry, exactly as `spawn_render`'s
-    /// own refusal does.
+    /// Spawn a Level II render for a pane.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_level2_render(
         &mut self,
@@ -1981,33 +1053,15 @@ impl RenderDispatcher {
         let elevation = params.elevation;
         let lat = params.lat;
         let lon = params.lon;
-        // The storm motion override rides the render parameters for the one
-        // product that reads it. Read here, from the field the invalidation
-        // reads, not passed by the caller — `dispatch_pane_renders` has no
-        // test callers, so an argument it merely forwarded would be untested
-        // by construction (the lesson the old Level III path's
-        // `storm_motion_for` note recorded). The environmental heights ride
-        // the same way for the hail pair and the classification, read from
-        // the field `set_env_heights` invalidates on; a missing or stale-kept
-        // entry means the product runs on its adaptation defaults, which is
-        // the documented no-sounding behavior, not an error. Both reads live
-        // in `extract_tuple_for` since WO-E4.9, so this dispatch and the
-        // arrival-time populate cannot read the pair differently.
+        // The storm motion override rides the render parameters for the one product
+        // that reads it.
         let (key, storm_motion, env_heights) =
             self.extract_tuple_for(site, volume_start, product, elevation);
-        // And the RPG's own melting layer for **this** volume, for the one
-        // product that classifies. `volume_start` is a parameter and not a
-        // field read because the dispatcher genuinely does not know which
-        // volume it is drawing — `data` is the volume and carries no start the
-        // pairing agrees on — so this is the one render input the caller has to
-        // name. Everything downstream of it is still a field read: the object
-        // is looked up in the map `set_melting_layer` invalidates on, and the
-        // lookup refuses any volume but this one.
+        // And the RPG's own melting layer for **this** volume, for the one product that
+        // classifies.
         let melting_layer = self.melting_layer_product_for(product, site, volume_start);
-        // And the RPG's own storm motion for **this** volume, for the one
-        // product that shifts by one. Read on exactly the terms above, from
-        // the map `set_storm_motion` invalidates on, and the lookup refuses
-        // any volume but this one.
+        // And the RPG's own storm motion for **this** volume, for the one product that
+        // shifts by one.
         let rpg_storm_motion = self.rpg_storm_motion_for(product, site, volume_start);
         log::info!(
             "Spawning background render for pane {}: {:?} at {:.1}°",
@@ -2015,21 +1069,8 @@ impl RenderDispatcher {
             product,
             elevation
         );
-        // Extracted here, against the volume, because the volume is the thing
-        // that must not travel: a decoded `Scan` is tens of megabytes and a
-        // `RenderInput` is the one sweep the renderer actually reads.
-        //
-        // `None` means no sweep carries this product, which is exactly what the
-        // renderer would have answered — so the job is dispatched anyway and
-        // answers nothing, leaving the in-flight bookkeeping to unwind the way
-        // a failed render always has.
-        //
-        // Since WO-E4.9 the extraction is served from `extract_cache` when the
-        // volume's arrival populated this exact tuple — a hit is zero
-        // frame-thread extraction, and the four stamps below are applied at
-        // dispatch either way (clone-then-stamp: the melting layer and the
-        // RPG motion arrive asynchronously, and a pre-stamped cache would go
-        // stale the moment they land). A miss IS today's path, unchanged.
+        // Extracted here, against the volume, because the volume is the thing that must
+        // not travel.
         let cached = self
             .extract_cache_lookup(&key)
             .map(|input| (*input).clone());
@@ -2054,22 +1095,7 @@ impl RenderDispatcher {
                 rustdar_worker::offload::Job::Described(
                     rustdar_worker::offload::JobRequest::describe(
                         rustdar_radar::jobs::RadarPlanJob {
-                            // Stamped after extraction rather than threaded through it,
-                            // which is the shape `with_declared_nyquist` is documented
-                            // for: the walk builds the payload out of the sweeps, and
-                            // the one thing the sweeps do not carry comes from the
-                            // table the caller holds. The wire field already existed
-                            // for the vertical views — this is the plan view joining
-                            // them on it, so a section and the map under it fold the
-                            // same sweep at the same speed.
-                            // Stamped alongside the fold table and for the same
-                            // reason: the walk builds the payload out of the sweeps,
-                            // and the melting layer is not in them. `None` here is
-                            // not an error — it is `resolve_melting_layer` falling to
-                            // its next rung, which the pane then says out loud.
-                            // Stamped on the same terms again, and `None` here is not
-                            // an error either — it is `srv::storm_motion` falling to
-                            // its next rung, which the pane then says out loud.
+                            // Stamped after extraction rather than threaded through it.
                             input: Box::new(
                                 input
                                     .with_declared_nyquist(declared)
@@ -2093,10 +1119,8 @@ impl RenderDispatcher {
         self.spawn_render(pane_idx, site, product, elevation, sender, window, job);
     }
 
-    /// The extract tuple a pane's arrival-time populate must build — **the
-    /// same reads the dispatch above makes**, off the same fields, so the key
-    /// written at arrival is the key looked up at dispatch. Returns the key
-    /// plus the two extraction arguments the key's bits came from.
+    /// The extract tuple a pane's arrival-time populate must build — **the same reads
+    /// the dispatch above makes**, off the same fields.
     pub(crate) fn extract_tuple_for(
         &self,
         site: &str,
@@ -2140,10 +1164,8 @@ impl RenderDispatcher {
         self.extract_cache.get(key).map(Arc::clone)
     }
 
-    /// File an arrival-time extraction under its key, evicting the least
-    /// recently used past [`EXTRACT_CACHE_CAP`]. The wasm arrival drain calls
-    /// this inline; the native results channel drains into it through
-    /// [`poll_extract_results`](Self::poll_extract_results).
+    /// File an arrival-time extraction under its key, evicting the least recently used
+    /// past [`EXTRACT_CACHE_CAP`].
     pub(crate) fn populate_extract(
         &mut self,
         key: ExtractKey,
@@ -2167,27 +1189,22 @@ impl RenderDispatcher {
     }
 
     /// Drain the extract-results channel into the cache — the body of the
-    /// `poll_extract_results` FRAME_PUMP row (Apply phase, `drains: []` per
-    /// amendment C3: this is a dispatcher-local mpsc, not a hub channel).
-    /// Positioned in Apply so an extraction that homed between frames serves
-    /// the same frame's dispatch.
+    /// `poll_extract_results` FRAME_PUMP row.
     pub(crate) fn poll_extract_results(&mut self) {
         while let Ok((key, input)) = self.extract_results_rx.try_recv() {
             self.populate_extract(key, input);
         }
     }
 
-    /// The sender the native arrival-time extraction homes over, cloned per
-    /// spawned walk. Unused on wasm, where the arrival drain populates
-    /// inline — see the `extract_results_tx` field note.
+    /// The sender the native arrival-time extraction homes over, cloned per spawned
+    /// walk.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn extract_sender(&self) -> std::sync::mpsc::Sender<ExtractResult> {
         self.extract_results_tx.clone()
     }
 
-    /// Drop every cached extraction that fails `keep` — the volume-eviction
-    /// pass's hook (entries die with their volume, the same pass the derive
-    /// memo prunes under) and the arrival hook's site-wide invalidation.
+    /// Drop every cached extraction that fails `keep` — the volume-eviction pass's
+    /// hook; entries die with their volume.
     pub(crate) fn retain_extracts(&mut self, keep: impl Fn(&ExtractKey) -> bool) {
         self.extract_cache.retain(|k, _| keep(k));
         self.extract_recency.retain(|k| keep(k));
@@ -2214,10 +1231,6 @@ impl RenderDispatcher {
 
     /// The storm motion vector the cached section payload will be **derived**
     /// with, or `None` if no payload is cached.
-    ///
-    /// The one observable that distinguishes "the section re-derived" from
-    /// "the section redrew the previous vector's field", which are otherwise
-    /// the same picture arriving at the same time.
     #[cfg(test)]
     pub(crate) fn section_payload_motion(&self) -> Option<Option<(f32, f32)>> {
         self.section_input
@@ -2226,21 +1239,6 @@ impl RenderDispatcher {
     }
 
     /// Cut a vertical cross-section for a section pane, in the background.
-    ///
-    /// See [`SectionDispatch`] for the three answers and why "the budget is
-    /// full" and "this volume has nothing to cut" must not be the same one.
-    /// Native builds have several slots; **wasm has exactly one, with no
-    /// preemption**, so on the platform where this matters most a section
-    /// queues behind whatever plan view is already rendering rather than
-    /// displacing it.
-    ///
-    /// The volume payload is taken from
-    /// [`section_input`](Self::section_input) when it is for this volume, moment
-    /// and ladder, and produced by `extract` — the caller's walk over the
-    /// merged current volume — when it is not. See that field for what the
-    /// walk costs and why one entry is the right size; taking a closure
-    /// rather than a `&Scan` is what lets the walk read a volume that is not
-    /// one `Scan` without this module holding the app's scan state.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_section_render(
         &mut self,
@@ -2250,14 +1248,8 @@ impl RenderDispatcher {
         sender: std::sync::mpsc::Sender<crate::channels::SectionResponse>,
         window: Option<WindowRef>,
     ) -> SectionDispatch {
-        // Bounds-checked once, here, rather than left to the two `pane_render`
-        // indexes further down. It cannot be out of range today — the only
-        // caller reaches this through `pane_render.get(pane_idx)` two lines
-        // earlier — but the two indexes straddle the budget increment and the
-        // `RenderGuard`, so an out-of-range pane would not merely panic, it
-        // would panic with the in-flight count already raised. Returning `false`
-        // is the same contract as a full budget: nothing has been taken, no
-        // staleness key is written, and the pane asks again next frame.
+        // Bounds-checked once, here, rather than left to the two `pane_render` indexes
+        // further down.
         if pane_idx >= self.pane_render.len() {
             return SectionDispatch::Busy;
         }
@@ -2266,15 +1258,7 @@ impl RenderDispatcher {
         }
 
         let product = target.product;
-        // Read here, off the dispatcher's own field, for the reason
-        // `spawn_level2_render` reads it here rather than taking it as an
-        // argument: `dispatch_section_renders` has no test callers, so a
-        // vector merely forwarded from there would be untested by
-        // construction. The `then` gate is the same one the plan-view path
-        // uses — only the storm-relative product's payload is a function of
-        // the vector, and keying the other eight on it would re-walk 15.6 MB
-        // of gates every time the user nudged a vector they were not looking
-        // through.
+        // Read here, off the dispatcher's own field.
         let motion = (product == RadarProduct::StormRelativeVelocity)
             .then(|| self.storm_motion_override_kt())
             .flatten();
@@ -2286,12 +1270,6 @@ impl RenderDispatcher {
         if !reusable {
             let Some(input) = extract() else {
                 // No sweep carries this moment, or the derivation refused.
-                // Not an error and not a job: the caller has taken no budget
-                // slot and marked nothing in flight, so there is nothing to
-                // unwind — unlike `spawn_level2_render`, which dispatches
-                // `renders_nothing` precisely because it has. It IS a state
-                // with a name, though, and saying so is what keeps the pane
-                // from waiting forever.
                 log::info!("no volume payload for a {product:?} section");
                 return SectionDispatch::NoPayload;
             };
@@ -2309,9 +1287,7 @@ impl RenderDispatcher {
             start: (target.line.a().lat, target.line.a().lon),
             end: (target.line.b().lat, target.line.b().lon),
             // The site's elevation plus 20 km, which clears every beam in every
-            // operational VCP at every range — so the axis clips nothing and is
-            // the same height whatever the line is, which is what makes two
-            // sections of one storm comparable by eye.
+            // operational VCP at every range.
             top_km_msl: None,
             product,
         };
@@ -2334,10 +1310,8 @@ impl RenderDispatcher {
             ));
         rustdar_worker::offload::offload_job("section-render", job, move |output| {
             let _guard = guard;
-            // An output of another kind becomes `None` — "nothing to draw" —
-            // which the receiver already handles, with the budget still unwound
-            // and the pane still told; the typed take is the accessor's
-            // stated contract (`DescribedOut::take`).
+            // An output of another kind becomes `None` — "nothing to draw" — which the
+            // receiver already handles.
             let section = output
                 .and_then(|out| out.take::<rustdar_radar::xsect::CrossSection>())
                 .map(Box::new);
@@ -2359,29 +1333,11 @@ impl RenderDispatcher {
 
     /// Whether a render slot is free right now — the caller's pre-flight for
     /// work that is only worth paying when a dispatch can actually follow.
-    ///
-    /// `handle_prepare_volume` reads this **before** running the merged-volume
-    /// extraction, the same shape [`Self::spawn_section_render`] has built in:
-    /// budget first, extraction only when a slot will be taken. Advisory by
-    /// nature — the count can move between this and the spawn — but every
-    /// increment happens on the frame thread, so within one handler a `true`
-    /// cannot turn stale (workers only ever *free* slots), and a `false` costs
-    /// a frame's retry exactly as the spawn's own refusal does.
     pub fn render_slot_free(&self) -> bool {
         self.renders_in_flight.load(Ordering::Relaxed) < self.concurrent_renders
     }
 
     /// Resample a volume into a voxel grid, away from the frame thread.
-    ///
-    /// Returns `false` when the render budget is full — the caller dispatches
-    /// nothing, opens no `Building` entry, and the level-triggered pane asks
-    /// again next frame. Taking a budget slot is what keeps the wasm worker's
-    /// FIFO honest: without it a ~150 ms resample could sit queued in front of
-    /// the plan-view render of the very sweep that triggered it.
-    ///
-    /// The reply carries the *target*, not a pane index: the store refcounts
-    /// builds by target, and `VolumeStore::complete` resolves every pane
-    /// attached to it — including panes that attached after this dispatch.
     pub fn spawn_voxel_build(
         &mut self,
         target: &rustdar_egui::pane::VolumeTarget,
@@ -2414,9 +1370,8 @@ impl RenderDispatcher {
             let grid = output
                 .and_then(|out| out.take::<rustdar_radar::voxel::VoxelGrid>())
                 .map(Box::new);
-            // The claim the whole worker move is measured by: the resample no
-            // longer spends this time on the frame thread. Logged with the
-            // outcome so a refused build is distinguishable from a slow one.
+            // The claim the whole worker move is measured by: the resample no longer
+            // spends this time on the frame thread.
             log::info!(
                 "3D volume view: {} for {} in {} ms off the frame thread",
                 if grid.is_some() { "built" } else { "no grid" },
@@ -2424,8 +1379,7 @@ impl RenderDispatcher {
                 started.elapsed().as_millis(),
             );
             // Sent unconditionally: this message is what resolves the store's
-            // `Building` entry, and a build that never reports back leaves
-            // every attached pane painting its old grid forever.
+            // `Building` entry.
             let _ = sender.send(crate::channels::VoxelResponse { target, grid });
             crate::app::notify_redraw(&window);
         });
@@ -2433,24 +1387,6 @@ impl RenderDispatcher {
     }
 
     /// Shared dispatch for both Level II and Level III renders.
-    ///
-    /// The tail below — the guard, the cancellation check, the send and the
-    /// redraw — is handed to the funnel as `deliver` rather than written into
-    /// the job. That is what lets the Level II arm run in a browser worker
-    /// without a second copy of it: `deliver` runs on this thread wherever the
-    /// rasterization happened, and holds the two things that must not outlive
-    /// the render either way.
-    ///
-    /// `site` is here for one reason: it completes the
-    /// [`RenderKey`] this render will be *filed* under, and this is where
-    /// that key is recorded as in flight
-    /// ([`PaneRenderState::in_flight_plan_view`]). Both callers already hold
-    /// the site, and building the key here rather than at each of them is what
-    /// makes the dedupe and the cache literally the same key — see that field.
-    ///
-    /// The extra argument takes the count past clippy's threshold. Bundling
-    /// them into a struct would only move the same seven values behind a name
-    /// that says nothing the parameters do not.
     #[allow(clippy::too_many_arguments)]
     fn spawn_render(
         &mut self,
@@ -2462,7 +1398,6 @@ impl RenderDispatcher {
         window: Option<WindowRef>,
         job: rustdar_worker::offload::Job,
     ) {
-        // Check concurrent render limit
         let current = self.renders_in_flight.load(Ordering::Relaxed);
         if current >= self.concurrent_renders {
             return;
@@ -2471,32 +1406,15 @@ impl RenderDispatcher {
         let guard = RenderGuard(Arc::clone(&self.renders_in_flight));
 
         let generation = self.render_generation;
-        // Cleared if this pane's data changes while the render runs, which is
-        // where a per-site reset stops a result — the global `generation` above
-        // cannot, since it says nothing about which site a result belongs to.
-        //
-        // `deliver` carries the only other reference to it, which is also what
-        // `want_result`'s `Arc::strong_count` pruning reads as "still stoppable".
+        // Cleared if this pane's data changes while the render runs, which is where a
+        // per-site reset stops a result.
         let wanted = self.pane_render[pane_idx].want_result();
         rustdar_worker::offload::offload_job("radar-render", job, move |output| {
             let _guard = guard;
             // An output of another kind is `None` here — "nothing to draw",
-            // which every path below already handles (`DescribedOut::take`
-            // states the contract).
+            // which every path below already handles.
             let frame = output.and_then(|out| out.take::<rustdar_radar::frame::RenderedFrame>());
-            // Sent whether or not there is a frame, because the receiver is what
-            // clears `render_in_flight` and a pane that never hears back stops
-            // dispatching. Still gated on `wanted`: an abandoned render must not
-            // clear the flag belonging to the render that superseded it.
-            //
-            // Read once and released immediately, because this read is where
-            // the flag stops meaning anything. An abandonment that lands after
-            // it cannot stop the send — the decision is already taken — so
-            // holding the reference until the thread finishes unwinding would
-            // only leave `want_result` reading a render that has already
-            // answered as one still running. Released here, the release is
-            // sequenced before the send, so a pane holding the result knows
-            // the flag behind it is already prunable.
+            // Sent whether or not there is a frame.
             let still_wanted = wanted.load(Ordering::Relaxed);
             drop(wanted);
             if still_wanted {
@@ -2513,9 +1431,6 @@ impl RenderDispatcher {
         });
         // The key this render's result will be cached under, recorded as in
         // flight so a sibling pane wanting the same picture asks for nothing.
-        // `RenderView::PlanView` because this function dispatches nothing else
-        // — the two callers are the Level II and Level III *plan-view* spawns,
-        // and a section goes through `spawn_section_render`.
         self.pane_render[pane_idx].render_started(Some(render_cache_key(
             site,
             product,
@@ -2524,27 +1439,7 @@ impl RenderDispatcher {
         )));
     }
 
-    /// One adjacent-tilt pre-render into the existing [`RenderCache`]
-    /// (WO-E4.10). Pane-less by design: **never marks any pane in flight,
-    /// never takes a pane render slot** — the speculative deliver inserts
-    /// into the RenderCache ONLY and clears
-    /// [`speculative_in_flight`](Self::speculative_in_flight). The user's
-    /// tilt-step then hits the existing cache lookup — no new read path.
-    ///
-    /// Same job path as [`spawn_level2_render`](Self::spawn_level2_render):
-    /// the extraction is served from WO-E4.9's cache where the tuple is
-    /// resident and walked inline otherwise (one tilt, the measured
-    /// 0.1–1.0 ms band, on a machine the caller's gate has already proven
-    /// idle); `values_wanted: true` because this raster becomes the pane's
-    /// static render on tilt-step, and values-stripped would kill hover.
-    /// The result rides the ordinary render channel marked
-    /// [`speculative_for`](crate::channels::RenderResponse::speculative_for);
-    /// there is no `results_wanted` flag because no pane waits on it — a
-    /// stale one is discarded by the generation check like any other.
-    ///
-    /// Refusals take nothing: a busy budget, a speculative already out, or a
-    /// tilt the volume does not carry all return with no slot taken and the
-    /// bool untouched.
+    /// One adjacent-tilt pre-render into the existing [`RenderCache`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_speculative_render(
         &mut self,
@@ -2614,19 +1509,14 @@ impl RenderDispatcher {
         rustdar_worker::offload::offload_job("radar-render", job, move |output| {
             let _guard = guard;
             let frame = output.and_then(|out| out.take::<rustdar_radar::frame::RenderedFrame>());
-            // Sent unconditionally: the receiver is what clears the
-            // one-speculative bool, and a speculative that stayed silent
-            // would wedge speculation for the session (the same shape as the
-            // pane-wedge hazard `plan_view_in_flight` documents, one bool
-            // wide instead of one key group).
+            // Sent unconditionally: the receiver is what clears the one-speculative
+            // bool.
             let _ = sender.send(RenderResponse {
                 rendered: frame.and_then(rendered_image_from),
                 product,
                 elevation,
                 generation,
-                // Pane-less: the marker below is what routes this result, and
-                // the sentinel keeps every pane-indexed bound check refusing
-                // it if the marker were ever ignored.
+                // Pane-less: the marker below is what routes this result.
                 pane_idx: usize::MAX,
                 speculative_for,
             });
@@ -2635,8 +1525,8 @@ impl RenderDispatcher {
         // Deliberately NO pane bookkeeping here — that is the whole point.
     }
 
-    /// Whether a speculative render is out right now — the
-    /// one-at-a-time half of WO-E4.10's gate.
+    /// Whether a speculative render is out right now — the one-at-a-time half
+    /// of the speculative gate.
     pub(crate) fn speculative_in_flight(&self) -> bool {
         self.speculative_in_flight
     }
@@ -2648,52 +1538,6 @@ impl RenderDispatcher {
     }
 
     /// Whether some pane already has **this exact plan view** in flight.
-    ///
-    /// The dispatch pass's answer to "somebody else is already making this".
-    /// A linear scan of the pane list, which is at most
-    /// [`rustdar_egui::pane::MAX_PANES_DESKTOP`] entries and is walked once per
-    /// pane that has missed the render cache — so a set keyed for lookup would
-    /// buy nothing but a second structure to keep in step with the flags.
-    ///
-    /// The key is [`render_cache_key`]'s, which is the whole point: see
-    /// [`PaneRenderState::in_flight_plan_view`]. The view is named here rather
-    /// than taken, for the same reason `spawn_render` names it: this question
-    /// has no meaning for any other view — a section stores no key at all — so
-    /// a `view` argument would only be a way to ask it wrongly.
-    ///
-    /// # A render that panics now wedges a key group, not a pane
-    ///
-    /// [`plan_view_image`] names the standing hazard: a render that panics
-    /// sends no [`RenderResponse`], so `render_in_flight` never clears and that
-    /// pane stays blank for good. **This widens the blast radius.** The panes
-    /// that deferred to that render are waiting on a result nobody will send
-    /// either, so what goes blank is every pane on that key rather than the one
-    /// whose render died. Panes on other keys are untouched — nothing here
-    /// crosses keys.
-    ///
-    /// Only the non-deterministic failures reach it. Everything the render
-    /// path can fail *predictably* comes back as a `RenderResponse` that drew
-    /// nothing — a malformed buffer takes `plan_view_image`'s `None` rather
-    /// than the `ColorImage` assertion, and no matching sweep takes
-    /// `Job::renders_nothing` — and `render_finished` clears flag and key alike
-    /// on every one of them, which is what
-    /// `a_render_that_answers_with_nothing_releases_its_siblings` pins. A
-    /// reader deciding whether to extend this mechanism should still know the
-    /// radius changed.
-    ///
-    /// # The two `String`s are deliberate
-    ///
-    /// This builds a whole key to compare it and drops it, and `render_started`
-    /// builds the one it stores. Comparing the tuple's parts instead would
-    /// avoid both allocations — and would mean writing out
-    /// [`render_cache_key`]'s rules a second time: which axis discriminates,
-    /// and which slot a tilt-independent product falls in. That the dedupe key
-    /// and the cache key have one definition is the entire safety argument for
-    /// this suppression (see [`PaneRenderState::in_flight_plan_view`]), and it
-    /// is not worth trading for a four-byte `malloc` on a path reached once per
-    /// dispatch plus once per deferring pane per frame while its render runs —
-    /// tens of allocations against the 70–175 ms of CPU per extra pane, per
-    /// volume, that the suppression saves.
     pub fn plan_view_in_flight(&self, site: &str, product: RadarProduct, elevation: f32) -> bool {
         let key = render_cache_key(site, product, RenderView::PlanView, elevation);
         self.pane_render

@@ -1,38 +1,4 @@
 //! The layer stack: one row per layer of the active pane, in draw order.
-//!
-//! One body for every shell. On Expanded it floats at the map's top-left,
-//! open by default; on Medium the same body is the slide-over drawer, closed
-//! until the top bar's Layers toggle opens it; on Compact it is the phone
-//! sheet's Layers page, in the slot `ui_sheet.rs` hands over —
-//! `Gui::layers_panel_visible` is the one definition of "open", exactly as it
-//! was for the panel this replaces. The area and scroll ids are the old
-//! panel's (`layers_panel`, `layers_scroll`) on purpose, at every one of the
-//! three hosts: egui's memory of the surface — its scroll offset above all —
-//! belongs to *the place the layers live*, not to which milestone's renderer
-//! or which width's host is drawing it.
-//!
-//! The rows walk the active pane's `draw_order` **reversed**, so the top row
-//! is drawn last — over everything — which is the reading the header's
-//! tooltip teaches. Reordering is a drag on the row's grip: the ⏶⏷ buttons
-//! this replaces were too small on a desktop and unusable on touch (the
-//! second user test). The grip is a painted 2×3-dot affordance — no carried
-//! glyph draws one; see `ui_glyphs.rs` — sensing the drag alone, so a swipe
-//! on the row body still scrolls the list on touch. The drag lifts the row
-//! (the source dims, a ghost follows the pointer), an insertion line names
-//! the slot, and the release permutes the same persisted `draw_order` the
-//! buttons used to swap, through the same `propagate_layer_sync` fan-out.
-//!
-//! # The panel is sized from the map, every frame
-//!
-//! Not `Area::default_size`: egui applies that only while the stored
-//! `AreaState` size is `None`, so after frame 1 the committed size becomes
-//! the sizing-pass ceiling — and a `ScrollArea` fills exactly what it is
-//! offered, so a shrink-then-grow of the window left the old panel stuck at
-//! its smallest-ever height (the §5.9 carried finding). The ceiling here is
-//! explicit per frame instead: the scroll body's `max_height` *and*
-//! `min_scrolled_height` are both the height the map currently affords, so
-//! an overflowing list is exactly that tall whatever stale size the area
-//! state remembers, and a short list still shrink-wraps.
 
 use crate::actions::GuiAction;
 use rustdar_overlays::render::overlay_state::STATUS_MARK;
@@ -42,19 +8,13 @@ use super::shell::SurfaceSlot;
 use super::{InspectorSelection, PaneState};
 
 /// Width of the stack, in both its sidebar and drawer forms.
-///
-/// One value, not two, because the panel keeps one egui id: a per-form width
-/// would make it jump when the window crossed the breakpoint, for no reason a
-/// user could see. (The phone sheet's Layers page is the exception with a
-/// reason: its slot is the sheet's own width, and the sheet is a different
-/// surface, not this panel at a third width.)
 pub(super) const STACK_WIDTH: f32 = 240.0;
 
 /// The stack's inset from the map's top-left corner.
 pub(super) const STACK_INSET: f32 = 8.0;
 
 /// What the stack leaves clear above the map's bottom edge: room for the
-/// status bar and the timeline transport floating there (plan §1.3).
+/// status bar and the timeline transport floating there.
 pub(super) const STACK_BOTTOM_CLEARANCE: f32 = 88.0;
 
 /// What the header row and its separator cost above the scroll body — charged
@@ -68,12 +28,12 @@ const HEADER_ALLOWANCE: f32 = 40.0;
 const COLLAPSE_LABEL: &str = "\u{2039}";
 
 /// The Add-layer buttons' label — one button above the rows and one below
-/// (plan §1.3), both opening the catalog: the list can be taller than the
+///, both opening the catalog: the list can be taller than the
 /// panel, and "add" is wanted at whichever end the scroll left the user.
 const ADD_LAYER_LABEL: &str = "+ Add layer";
 
 /// The layer-less body's route to where the pane's real controls live (plan
-/// §1.4): a pane that draws no map layers has no rows, and a panel that were
+/// the plan): a pane that draws no map layers has no rows, and a panel that were
 /// only the explanatory caption read as broken — this button is the body's one
 /// action, and it opens the inspector on Pane properties.
 const PANE_PROPS_BUTTON_LABEL: &str = "Pane properties...";
@@ -91,7 +51,7 @@ const GRIP_DOT_RADIUS: f32 = 1.2;
 /// Spacing between grip dot centres, both axes.
 const GRIP_DOT_SPACING: f32 = 5.0;
 
-/// The phone Layers page's helper caption (plan §1.3) — the demo's "same
+/// The phone Layers page's helper caption — the demo's "same
 /// stack as desktop" one-liner, in this app's own words. Sheet host only:
 /// on the wider widths the panel *is* visibly the desktop's, and the line
 /// would restate the screen.
@@ -126,7 +86,7 @@ pub(crate) struct StackRowProbe {
     /// Whether the row was drawn as the inspector's current selection.
     pub selected: bool,
     /// The trailing `›` chevron — drawn on the drawer and sheet hosts only
-    /// (plan §1.3), so `None` on the desktop sidebar.
+    ///, so `None` on the desktop sidebar.
     pub chevron: Option<egui::Rect>,
 }
 
@@ -177,13 +137,6 @@ impl Default for StackProbe {
 impl super::Gui {
     /// The stack, in the slot its host chose — the map's top-left corner
     /// from the shell, the sheet's body from the phone shell.
-    ///
-    /// `pane` is the active pane, `mem::take`n by the caller for the whole
-    /// stack+inspector pass — nothing in here reads `self.panes[..]`, whose
-    /// active slot holds a default placeholder until the caller restores it.
-    /// `statuses` is built by the caller from the *taken* pane — the live
-    /// one — against a registry it has demonstrably loaded with that pane's
-    /// configs (see `ui_shell.rs`).
     pub(super) fn render_stack(
         &mut self,
         ctx: &egui::Context,
@@ -194,7 +147,7 @@ impl super::Gui {
     ) {
         let is_drawer = !self.layout.width.has_persistent_sidebar();
         // The sheet host draws no header of its own here — the sheet's title
-        // row is the single header (plan §1.13 as polished in M7) — so the
+        // row is the single header — so the
         // whole slot is the body's.
         let max_body_height = if slot.sheet {
             slot.avail_height.max(0.0)
@@ -238,7 +191,7 @@ impl super::Gui {
                     // The sheet host draws no header row: the sheet's title
                     // row is the single header there (title + ×), and the ‹
                     // collapse would shadow the back-chain that already
-                    // closes the page (§1.13's no-back-buttons rule; M7's
+                    // closes the page (the plan's no-back-buttons rule; M7's
                     // sheet-header polish). The wider hosts keep both.
                     if !slot.sheet {
                         ui.horizontal(|ui| {
@@ -304,7 +257,7 @@ impl super::Gui {
                     // An explicit salt rather than egui's positional auto-id:
                     // the scroll offset must survive edits to the header, and
                     // the breakpoint tests read the offset back through this
-                    // id. `min_scrolled_height` is the §5.9 fix — see the
+                    // id. `min_scrolled_height` is the the plan fix — see the
                     // module note.
                     let scroll = egui::ScrollArea::vertical()
                         .scroll_source(super::shell::panel_scroll_source())
@@ -348,7 +301,7 @@ impl super::Gui {
     /// The scroll body: one row per layer for a pane that draws the map layers
     /// ([`PaneState::draws_map_layers`] — the plan view and the 3D pane), the
     /// explained absence for one that does not. `sheet` is the phone-sheet
-    /// host, which alone appends the helper caption under the rows (plan §1.3).
+    /// host, which alone appends the helper caption under the rows.
     #[allow(clippy::too_many_arguments)]
     fn render_stack_rows(
         &mut self,
@@ -403,9 +356,6 @@ impl super::Gui {
         }
 
         // Top row = drawn last: display row `i` is `draw_order[len - 1 - i]`.
-        // A grip drag in flight is resolved after the loop, once every row's
-        // rect for this frame is known — the insertion slot is a function of
-        // the pointer against all of them, and the release permutes then.
         let order: Vec<LayerId> = pane.draw_order.iter().rev().cloned().collect();
         let mut row_rects: Vec<egui::Rect> = Vec::with_capacity(order.len());
         let mut drag_released = false;
@@ -550,14 +500,10 @@ impl super::Gui {
                     self.set_pane_overlay_with_fetch(pane, idx, kind, !enabled, actions);
                 }
 
-                // A trailing `›` on the drawer and sheet hosts (plan §1.3):
+                // A trailing `›` on the drawer and sheet hosts:
                 // there a row click *pushes* the inspector over this list,
                 // and the chevron says so. The desktop sidebar, where the
                 // inspector opens beside the stack, carries none.
-                // Right-to-left so the chevron owns the edge and the name
-                // block takes what is left — the header's own device. The
-                // labels are explicitly non-selectable and carry no sense of
-                // their own: a click on the text *is* a click on the row.
                 #[cfg(test)]
                 let mut chevron_rect = None;
                 #[cfg(test)]
@@ -578,11 +524,6 @@ impl super::Gui {
 
                     // The name and status block. Hidden layers render
                     // dimmed — weak text is the stock theme's own dimming.
-                    // The selection highlight is the row's, painted above.
-                    // A nested top-down child flows from the *top* of the
-                    // row whatever the parent's cross-align says (the
-                    // second user test's sits-high finding), so the block
-                    // centres itself: half the row's slack above the text.
                     let block = ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         let text_height = ui.text_style_height(&egui::TextStyle::Body)
@@ -658,7 +599,7 @@ impl super::Gui {
             self.catalog_open = true;
         }
 
-        // The phone page's one-line orientation (plan §1.3): the sheet is
+        // The phone page's one-line orientation: the sheet is
         // the only host where "this is the desktop's panel" is not visibly
         // true, so it is the only host that says it.
         if sheet {
@@ -670,14 +611,6 @@ impl super::Gui {
     }
 
     /// Advance or land the grip drag, once the frame's row rects are known.
-    ///
-    /// While the drag flies: an insertion line at the slot the pointer names,
-    /// and a ghost of the lifted row following the pointer on the tooltip
-    /// order (over every panel, like any drag preview). On release the
-    /// display list is permuted — remove the lifted row, insert at the slot —
-    /// and written back **reversed** as the pane's `draw_order`, the same
-    /// persisted field the old ⏶⏷ pair swapped; the caller's post-restore
-    /// `propagate_layer_sync` fans it out to the synced panes.
     fn resolve_stack_drag(
         &mut self,
         ui: &egui::Ui,

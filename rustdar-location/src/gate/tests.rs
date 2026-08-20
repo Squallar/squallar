@@ -3,11 +3,8 @@ use super::*;
 use rustdar_kv::MemoryKvStore;
 use std::rc::Rc;
 
-/// A gate and the bridge it drives, with the clock in the test's hands.
-///
-/// `Instant` cannot be constructed from a number, so the clock is one
-/// reading taken up front and offsets added to it. That is enough: every
-/// decision the gate makes is on a *difference*.
+/// A gate and the bridge it drives, with the clock in the test's hands: offsets
+/// are added to one reading, since every decision is on a *difference*.
 struct Fixture {
     gate: LocationGate,
     bridge: GateDouble,
@@ -25,41 +22,34 @@ impl Fixture {
         }
     }
 
-    /// Move the clock forward, as the app idling does.
     fn wait(&mut self, by: Duration) -> &mut Self {
         self.elapsed += by;
         self
     }
 
-    /// One pass of the gate at the current clock.
     fn step(&mut self) -> LocationStep {
         let now = self.t0 + self.elapsed;
         self.gate.step_at(now, &mut self.bridge, false)
     }
 
-    /// One pass with the settings window on screen.
     fn step_in_settings(&mut self) -> LocationStep {
         let now = self.t0 + self.elapsed;
         self.gate.step_at(now, &mut self.bridge, true)
     }
 
-    /// Steps until the cadence has certainly let another query through.
     fn step_after_the_cadence(&mut self) -> LocationStep {
         self.wait(POLL_INTERVAL).step()
     }
 }
 
-/// A desktop bridge whose store the test keeps, so a "restart" can hand the
-/// same blobs to a fresh gate.
+/// A desktop bridge whose store the test keeps, so a "restart" can hand the same
+/// blobs to a fresh gate.
 fn desktop_with_store(store: Rc<MemoryKvStore>) -> GateDouble {
     GateDouble::desktop().with_store(store)
 }
 
-// ── Not asking ──────────────────────────────────────────────────────
-
-/// The audited web defect, pinned. The browser prompted on first paint
-/// because there was no way to say "I do not know yet" — and every platform
-/// has that window at startup, so this is not a web-only guard.
+/// The audited web defect, pinned: the browser prompted on first paint because
+/// there was no way to say "I do not know yet".
 #[test]
 fn a_platform_that_has_not_answered_yet_is_never_prompted() {
     let mut f = Fixture::new(GateDouble::web().with_permission(LocationPermission::Unknown));
@@ -77,8 +67,6 @@ fn a_platform_that_has_not_answered_yet_is_never_prompted() {
     assert_eq!(f.gate.permission(), LocationPermission::Unknown);
 }
 
-/// A platform with no location service must not be asked and must not be
-/// polled forever: there is no sequence of events that changes the answer.
 #[test]
 fn a_platform_without_location_is_never_asked_and_never_polled() {
     let mut f =
@@ -98,7 +86,6 @@ fn a_platform_without_location_is_never_asked_and_never_polled() {
     );
 }
 
-/// The user said no. Nothing this app does may produce another dialog.
 #[test]
 fn a_remembered_denial_is_never_prompted_again() {
     let store = Rc::new(MemoryKvStore::default());
@@ -110,7 +97,6 @@ fn a_remembered_denial_is_never_prompted_again() {
     }
     assert_eq!(f.bridge.location_requests(), 0);
 
-    // A fresh run, same install.
     let mut f = Fixture::new(desktop_with_store(store).with_permission(LocationPermission::Denied));
     for _ in 0..3 {
         f.step_after_the_cadence();
@@ -123,9 +109,6 @@ fn a_remembered_denial_is_never_prompted_again() {
     );
 }
 
-// ── Asking ──────────────────────────────────────────────────────────
-
-/// The startup ask, and the bound on it.
 #[test]
 fn a_first_run_asks_for_location_once_and_only_once() {
     let mut f = Fixture::new(GateDouble::desktop().with_permission(LocationPermission::Prompt));
@@ -142,10 +125,8 @@ fn a_first_run_asks_for_location_once_and_only_once() {
     );
 }
 
-/// The one thing the `bool` from `request_location` is worth. Android can
-/// genuinely fail to reach `Activity.requestPermissions` — no Activity
-/// stashed yet, JNI attach failed — and a user who was never asked must not
-/// be recorded as having declined.
+/// The one thing the `bool` from `request_location` is worth: Android can
+/// genuinely fail to reach `Activity.requestPermissions`.
 #[test]
 fn an_ask_that_never_reached_the_os_is_tried_again_within_the_bound() {
     let mut f = Fixture::new(
@@ -165,13 +146,8 @@ fn an_ask_that_never_reached_the_os_is_tried_again_within_the_bound() {
     );
 }
 
-/// **The regression the poll cadence exists for.**
-///
-/// The dialog is asynchronous everywhere. If polling stopped once the ask
-/// was made, the user tapping Allow would be observed by nothing, no
-/// stream would be started, and location would simply never work that
-/// session — with `start_location_thread`'s 10 s self-healing loop being
-/// removed, there is no second chance.
+/// **The regression the poll cadence exists for.** If polling stopped once the
+/// ask was made, the user tapping Allow would be observed by nothing.
 #[test]
 fn a_grant_that_arrives_after_the_ask_still_starts_delivery() {
     let mut f = Fixture::new(GateDouble::desktop().with_permission(LocationPermission::Prompt));
@@ -193,10 +169,8 @@ fn a_grant_that_arrives_after_the_ask_still_starts_delivery() {
     assert_eq!(f.gate.permission(), LocationPermission::Granted);
 }
 
-/// A dialog dismissed without an answer leaves the permission on `Prompt`,
-/// which is indistinguishable from never having asked. The memo is the only
-/// thing that knows better, and re-prompting every launch is what trains
-/// people to hit Deny.
+/// A dismissed dialog leaves the permission on `Prompt`, indistinguishable from
+/// never having asked; the memo is the only thing that knows better.
 #[test]
 fn a_prompt_the_user_walked_away_from_is_not_repeated_on_the_next_run() {
     let store = Rc::new(MemoryKvStore::default());
@@ -221,9 +195,8 @@ fn a_prompt_the_user_walked_away_from_is_not_repeated_on_the_next_run() {
     );
 }
 
-/// Fix (3). Web with site data blocked, and desktop with no `HOME`, are
-/// platforms where location itself works fine. Silently disabling it there
-/// is worse than forgetting the answer.
+/// Trap (3). Web with site data blocked, and desktop with no `HOME`, are
+/// platforms where location itself works fine.
 #[test]
 fn a_device_with_no_kv_is_still_asked() {
     let mut f = Fixture::new(
@@ -242,18 +215,8 @@ fn a_device_with_no_kv_is_still_asked() {
     );
 }
 
-// ── Stopping ────────────────────────────────────────────────────────
-
-/// Fix (4). Revoking in system settings restarts no process on any desktop
-/// OS, so without this the reader keeps running and the dot keeps moving
-/// from a position consent has been withdrawn for.
-///
-/// Observed through an open settings window, because a grant that is
-/// actually delivering is a *terminal* state for the cadence — see
-/// [`LocationGate::due`] — and the two things that re-open it are
-/// [`resumed`](LocationGate::resumed) and somebody looking at the control
-/// that reports it. Both are the routes a user who has just been in system
-/// settings takes.
+/// Trap (4). Observed through an open settings window, because a grant that is
+/// actually delivering is a *terminal* state for the cadence.
 #[test]
 fn a_revoked_permission_stops_delivery_and_clears_the_dot() {
     let mut f = Fixture::new(GateDouble::desktop().with_permission(LocationPermission::Granted));
@@ -274,8 +237,7 @@ fn a_revoked_permission_stops_delivery_and_clears_the_dot() {
     );
 }
 
-/// The app's own switch, which is not the OS's. Turning it off must stop
-/// the stream at the moment of the click, not at the next poll.
+/// The app's own switch, which is not the OS's.
 #[test]
 fn turning_location_off_in_settings_survives_a_restart() {
     let store = Rc::new(MemoryKvStore::default());
@@ -303,10 +265,7 @@ fn turning_location_off_in_settings_survives_a_restart() {
     );
 }
 
-// ── The settings gesture ────────────────────────────────────────────
-
-/// The button's job is to give a user who dismissed the dialog their
-/// prompt back. Without this the bound is permanent and there is no way in.
+/// Without this the bound is permanent and there is no way in.
 #[test]
 fn enabling_location_in_settings_asks_again_after_a_dismissal() {
     let store = Rc::new(MemoryKvStore::default());
@@ -331,9 +290,7 @@ fn enabling_location_in_settings_asks_again_after_a_dismissal() {
     );
 }
 
-/// The other half, and the one that matters more. A gesture resets the
-/// *counter*; it cannot reset the OS's own refusal, and trying would be a
-/// dialog the platform will not show anyway.
+/// A gesture resets the *counter*; it cannot reset the OS's own refusal.
 #[test]
 fn enabling_location_in_settings_cannot_re_ask_after_a_remembered_denial() {
     let mut f = Fixture::new(GateDouble::desktop().with_permission(LocationPermission::Denied));
@@ -351,10 +308,7 @@ fn enabling_location_in_settings_cannot_re_ask_after_a_remembered_denial() {
     );
 }
 
-// ── Cadence ─────────────────────────────────────────────────────────
-
-/// The other half of fix (1): keeping the poll alive must not mean polling
-/// on every frame. On Android each of these is a JNI call.
+/// The other half of trap (1). On Android each of these is a JNI call.
 #[test]
 fn a_pending_permission_is_polled_on_a_bounded_cadence_not_every_frame() {
     let mut f = Fixture::new(GateDouble::desktop().with_permission(LocationPermission::Prompt));
@@ -373,9 +327,6 @@ fn a_pending_permission_is_polled_on_a_bounded_cadence_not_every_frame() {
     );
 }
 
-/// A terminal state stops polling — except while the control that reports
-/// it is on screen, where a revocation made in system settings has to show
-/// up promptly.
 #[test]
 fn an_open_settings_window_keeps_watching_a_settled_permission() {
     let mut f = Fixture::new(GateDouble::desktop().with_permission(LocationPermission::Denied));
@@ -398,9 +349,7 @@ fn an_open_settings_window_keeps_watching_a_settled_permission() {
     );
 }
 
-/// Coming back to the foreground is the one moment a change made outside
-/// the app would otherwise never be noticed: the state is terminal, so the
-/// cadence has stopped entirely.
+/// The state is terminal, so the cadence has stopped entirely.
 #[test]
 fn a_permission_changed_while_the_app_was_away_is_noticed_on_resume() {
     let mut f = Fixture::new(GateDouble::desktop().with_permission(LocationPermission::Denied));
@@ -423,18 +372,15 @@ fn a_permission_changed_while_the_app_was_away_is_noticed_on_resume() {
     assert!(f.bridge.location_active(), "the stream was never restarted");
 }
 
-// ── The memo ────────────────────────────────────────────────────────
-
-/// A first run must behave exactly as the app behaved before this existed,
-/// which a derived `Default` would silently change.
+/// A derived `Default` would silently change how a first run behaves.
 #[test]
 fn a_default_memo_leaves_location_enabled() {
     assert!(LocationMemo::default().enabled);
     assert_eq!(LocationMemo::default().attempts, 0);
 }
 
-/// The memo is written the moment the decision is made, not on the autosave
-/// timer — the dismiss-and-close case lands inside that window.
+/// Written at the moment of the decision, not on the autosave timer — the
+/// dismiss-and-close case lands inside that window.
 #[test]
 fn an_attempt_is_persisted_before_the_ask_rather_than_at_shutdown() {
     let store = Rc::new(MemoryKvStore::default());
@@ -453,9 +399,7 @@ fn an_attempt_is_persisted_before_the_ask_rather_than_at_shutdown() {
 }
 
 /// A definite answer from the OS makes the counter meaningless, so it is
-/// cleared: a user who re-allows location in system settings gets their
-/// prompts back rather than inheriting a bound spent against a decision
-/// they have since reversed.
+/// cleared: a user who re-allows location gets their prompts back.
 #[test]
 fn a_definite_answer_clears_the_attempt_counter() {
     let store = Rc::new(MemoryKvStore::default());
@@ -472,17 +416,11 @@ fn a_definite_answer_clears_the_attempt_counter() {
     assert_eq!(memo.attempts, 0);
 }
 
-/// The half of the memo that has to leave this crate.
-///
-/// Android cannot tell "never asked" from "permanently denied" on its own —
-/// `shouldShowRequestPermissionRationale` is `false` at both ends — so the
-/// persisted count is the only thing that separates them, and it is only
-/// useful over there. [`LocationGate::set_attempts`] pushes it when it
-/// *moves*, which covers every ask; a run that loads a spent counter and is
-/// then correctly never asked again would push nothing at all, and that
-/// run's bridge would spend the whole session reporting a permanent denial
-/// as a fresh `Prompt`: a button that raises a dialog Android silently
-/// refuses to show.
+/// The half of the memo that has to leave this crate. Android cannot tell "never
+/// asked" from "permanently denied" on its own, and
+/// [`LocationGate::set_attempts`] pushes only a value that *moved*, so a run
+/// that loads a spent counter and is never asked again would leave the bridge
+/// reporting a permanent denial as a fresh `Prompt`.
 #[test]
 fn a_bridge_is_told_what_this_install_has_already_asked_before_it_is_queried() {
     let store = Rc::new(MemoryKvStore::default());
@@ -503,9 +441,6 @@ fn a_bridge_is_told_what_this_install_has_already_asked_before_it_is_queried() {
     );
 }
 
-/// Nothing crashes, and nothing is silently treated as a decision, if the
-/// blob is garbage — a half-written file or a `localStorage` key somebody
-/// edited.
 #[test]
 fn an_unreadable_memo_falls_back_to_asking() {
     let store = Rc::new(MemoryKvStore::default());

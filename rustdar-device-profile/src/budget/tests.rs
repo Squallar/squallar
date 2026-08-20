@@ -3,9 +3,6 @@ use crate::quality::{DESKTOP_PLATFORM_CEILING, MOBILE_PLATFORM_CEILING, WASM_PLA
 
 /// A profile for one shipped bracket, with every runtime field at its most
 /// conservative reading.
-///
-/// The three of these are what `resolve` has to reproduce the shipped constants
-/// for; everything else in this file varies around them.
 fn shipped_profile(limits: BudgetLimits) -> DeviceProfile {
     DeviceProfile {
         platform: if limits.name == "wasm32" {
@@ -25,27 +22,11 @@ fn shipped_profile(limits: BudgetLimits) -> DeviceProfile {
 }
 
 /// Every device class this workspace builds for, exactly once.
-///
-/// The successor to `constants::tests::arms()`, and the same table read the
-/// other way round: that one *was* a struct of budgets per class, which is what
-/// made the conversion less invention than it sounds. Here the rows are
-/// profiles and the budgets come out of [`resolve`].
 pub fn profiles() -> [DeviceProfile; 3] {
     BudgetLimits::SHIPPED.map(shipped_profile)
 }
 
 /// **The resolver reproduces every shipped constant, field for field.**
-///
-/// The claim the whole extraction rests on, and it is checked rather than
-/// argued: if a single field of a single arm came out different, the app would
-/// have changed behaviour on that target the moment the constant stopped being
-/// read directly — on two of three arms that no build here compiles.
-///
-/// Read against the **named arms** rather than against the `cfg`-selected
-/// constants, because the `cfg`-selected ones are one row out of three and this
-/// has to cover all three. The selection itself is covered by
-/// `the_compiled_targets_budgets_are_the_constants_this_build_selected` below,
-/// which is the one assertion that has to be `cfg`-gated.
 #[test]
 fn the_resolver_reproduces_every_shipped_constant() {
     use crate::constants::*;
@@ -143,13 +124,6 @@ fn the_resolver_reproduces_every_shipped_constant() {
 }
 
 /// The compiled target's own budgets are the `cfg`-selected constants.
-///
-/// The one thing no other target can check on this one's behalf: the test above
-/// covers all three bracket sets and says nothing about which one this build
-/// took. `constants::tests::every_cascade_in_this_file_selected_the_same_arm`
-/// is the same idea for the constants themselves, and this extends it across
-/// the seam — a `BudgetLimits::for_target` arm pointing at the wrong bracket
-/// would leave every other test in this file green.
 #[test]
 fn the_compiled_targets_budgets_are_the_constants_this_build_selected() {
     use crate::constants::*;
@@ -174,8 +148,6 @@ fn the_compiled_targets_budgets_are_the_constants_this_build_selected() {
     assert_eq!(b.render_cache_entries, MAX_RENDER_CACHE_ENTRIES);
     assert_eq!(b.quality_ceiling, crate::quality::PLATFORM_CEILING);
     assert_eq!(b.app_texture_ceiling_bytes, APP_TEXTURE_BUDGET_BYTES);
-    // And the shape a device at the guarantee is asked for is the one the
-    // wasm `cargo check` row's const-assert guards.
     assert_eq!(
         b.grid_shape(WEBGL2_MAX_TEXTURE_DIMENSION_3D),
         VOLUME_GRID_FLOOR_SHAPE,
@@ -183,24 +155,6 @@ fn the_compiled_targets_budgets_are_the_constants_this_build_selected() {
 }
 
 /// The limits an adapter might really report, as `(2D, 3D)` pairs.
-///
-/// The first four are spec floors and round numbers. The last two are
-/// **measured on real machines**, and they are now *spent*: their componentwise
-/// minimum is `DESKTOP_CLASS_REPORT`, the line a browser has to clear to be
-/// promoted off the web floor.
-///
-/// | row | machine | 2D reported | 2D allocatable | 3D | `EXT_texture_norm16` |
-/// |---|---|---|---|---|---|
-/// | `firefox_3090` | Firefox, RTX 3090 | 32768 | **16384** | 16384 | absent |
-/// | `chrome_890m`  | Chrome, Radeon 890M, DPR 2 | 16384 | 16384 | 8192 | present |
-///
-/// Two things they establish and one they do not. They establish that the
-/// reported ceiling varies across real devices, and that one of them
-/// **overstates by 2×** — so "cap against allocatable, not reported" is
-/// load-bearing rather than paranoia, and the `firefox_3090` row is entered at
-/// its allocatable figure for exactly that reason. They do not establish
-/// anything about *browsers*: the two differ in both browser and GPU, so no row
-/// is attributable to a browser alone. Neither is WebGPU present on either.
 const REPORTED_CEILINGS: [(&str, u32, u32); 6] = [
     ("webgl2-guarantee", 2048, 256),
     ("downlevel-defaults", 2048, 512),
@@ -222,9 +176,6 @@ const CLASSES: [DeviceClass; 5] = [
 /// The cross product the plan asks for: bracket × class × reported ceilings ×
 /// VRAM reading × memo, with the shipped rows named so a regression on a real
 /// target says which one.
-///
-/// 3 × 5 × 6 × 4 × 2 = **720 rows**, against the three the `cfg` cascade could
-/// ever compile. That is the whole value of this step stated as a number.
 fn synthetic_profiles() -> Vec<DeviceProfile> {
     let mut out = Vec::new();
     for limits in BudgetLimits::SHIPPED {
@@ -264,17 +215,11 @@ fn synthetic_profiles() -> Vec<DeviceProfile> {
 }
 
 /// Every invariant a resolved budget must satisfy, whatever produced it.
-///
-/// Factored out rather than written twice because the enumerated matrix and the
-/// random sweep below have to hold each other's ground: an invariant checked on
-/// only one of them is an invariant a profile nobody thought of can walk past.
 fn check_invariants(profile: &DeviceProfile, from: &str) {
     let limits = &profile.limits;
     let b = resolve(profile);
 
-    // Inside the bracket, both ends, on every field. This is the "monotone,
-    // never below the floor and never above it" pair from the plan, and it is
-    // what a promotion rule landing later has to keep true.
+    // Inside the bracket, both ends, on every field.
     let within = |name: &str, value: usize, bracket: Bracket| {
         assert!(
             value >= bracket.floor && value <= bracket.ceiling.max(bracket.floor),
@@ -374,8 +319,8 @@ fn check_invariants(profile: &DeviceProfile, from: &str) {
         total / (1024 * 1024),
         b.app_texture_ceiling_bytes / (1024 * 1024),
     );
-    // And the snugness proof beside it: a ceiling several times the real figure
-    // passes the line above while admitting a silent doubling of any term.
+    // Snugness: a ceiling several times the real figure passes the line above
+    // while admitting a silent doubling of any term.
     assert!(
         b.app_texture_ceiling_bytes * 4 <= total * 5,
         "{from} / {}: the {} MiB ceiling is more than 1.25x the {} MiB it bounds",
@@ -384,24 +329,12 @@ fn check_invariants(profile: &DeviceProfile, from: &str) {
         total / (1024 * 1024),
     );
 
-    // The grid fits its own budget **in bytes** is no longer asserted here:
-    // the byte figure is the raymarch's arithmetic (`resident_grid_bytes`),
-    // which sits above this crate, so that proof moved to rustdar-volumetric's
-    // `raymarch::tests::budget_agreement` at WO-RD
-    // (`the_volume_grid_fits_the_target_texture_budget`). Nothing is lost by
-    // the move: `resolve` spends one promotion on both brackets and `demote`'s
-    // grid rung resets both together, so every reachable
-    // `(grid_cells, volume_texture_bytes)` pair — synthetic and random sweeps
-    // included — is one of the three shipped pairs that test executes.
+    // The grid's byte budget is the raymarch's arithmetic
+    // (`resident_grid_bytes`), so those proofs live in rustdar-volumetric's
+    // `raymarch::tests::budget_agreement`.
 
-    // **One live 3D grid beside a looping one** is the other grid-byte
-    // invariant that moved with it: both halves are swept — at every
-    // promotion a bracket can reach, not only the shipped floors — by
-    // `every_reachable_grid_fits_its_budgets_in_bytes` beside the raymarch.
-
-    // The raster ceiling is a ceiling and never a *regression*: whatever a
-    // promotion or a back-off did to it, a plan view may still reach the size
-    // this build drew before any device was asked.
+    // The raster ceiling is never a regression: a plan view may still reach the
+    // size this build drew before any device was asked.
     assert!(
         b.raster_side_ceiling_px >= b.long_range_image_side_px,
         "{from} / {}: a {} px raster ceiling is below the {} px this build \
@@ -433,14 +366,10 @@ fn check_invariants(profile: &DeviceProfile, from: &str) {
         shape.cells(),
     );
 
-    // The loop is still a loop, and its history is still bounded by what the
-    // dispatcher will texture rather than by what the pool would pay for.
     assert!(b.loop_render_budget >= crate::constants::MIN_LOOP_FRAMES_PER_PANE);
     assert!(b.loop_render_budget <= b.loop_frames_held);
-    // And a loop of *any* cadence is still a loop. Both ends of the clamp, on
-    // every bracket the sweep reaches: a radar so slow one volume outlasts the
-    // whole budget still gets two frames, and one so fast the median is a
-    // second cannot buy frames the pool has not been sized for.
+    // Both ends of the clamp: a radar so slow one volume outlasts the budget
+    // still gets two frames, and one so fast cannot buy unsized frames.
     assert!(b.loop_span_secs > 0, "{from} / {}: a zero span", b.name);
     assert_eq!(
         b.frames_for_span(Some(u32::MAX)),
@@ -463,8 +392,6 @@ fn check_invariants(profile: &DeviceProfile, from: &str) {
     assert!(b.concurrent_renders > 0);
     assert!(b.render_cache_entries > 0);
     assert!(b.concurrent_loop_downloads > 0);
-    // A full screen of loops at the minimum is payable out of the floor, or
-    // the pool cliffs where it is meant to degrade.
     assert!(
         b.max_panes * crate::constants::MIN_LOOP_FRAMES_PER_PANE * b.loop_frame_bytes()
             <= b.loop_pool_floor_bytes,
@@ -474,12 +401,6 @@ fn check_invariants(profile: &DeviceProfile, from: &str) {
 }
 
 /// **The whole matrix, not one row of three.**
-///
-/// The compile-time proof over the shipped desktop configuration is not what
-/// this replaces — the floor's const-assert is still evaluated on the wasm
-/// `cargo check` row, and `constants::tests` still binds every literal. What
-/// this adds is the arms a `cfg` build can never reach: 720 configurations,
-/// including every one the shipped desktop build can resolve to.
 #[test]
 fn every_synthetic_profile_satisfies_every_invariant() {
     let rows = synthetic_profiles();
@@ -498,19 +419,6 @@ fn every_shipped_profile_satisfies_every_invariant() {
 }
 
 /// **Two browsers, one machine.**
-///
-/// The pair the disagreement rule is asserted over. Firefox and Chromium are the
-/// same binary from the same origin on the same silicon and are separated only
-/// by what they report, so a `cfg` cannot express the question *at all* — not
-/// coarsely, none. What governs is the **bracket**, not a branch: both resolve
-/// inside the web bracket, and neither can push the app past what the other
-/// would also survive.
-///
-/// The assertion is deliberately **relational** rather than absolute, so it is
-/// worth having before the figures are spent: it says the two agree on
-/// everything the bracket decides and differ only where the device does. The
-/// rows carry this project's own measured readings — see [`REPORTED_CEILINGS`]
-/// for what they are and what they are not evidence of.
 #[test]
 fn two_browser_profiles_on_one_machine_stay_inside_one_bracket() {
     let web = |two_d: u32, three_d: u32| DeviceProfile {
@@ -520,9 +428,8 @@ fn two_browser_profiles_on_one_machine_stay_inside_one_bracket() {
         },
         ..shipped_profile(BudgetLimits::WASM)
     };
-    // The measured pair. The Firefox row is entered at its **allocatable**
-    // 16384 rather than its reported 32768: a figure a device will not hand
-    // back is not a ceiling, it is a claim.
+    // The Firefox row is entered at its *allocatable* 16384 rather than its
+    // reported 32768.
     let firefox = web(16384, 16384);
     let chromium = web(16384, 8192);
 
@@ -535,10 +442,7 @@ fn two_browser_profiles_on_one_machine_stay_inside_one_bracket() {
         );
     }
 
-    // Same bracket, so same budgets: nothing here branches on browser identity,
-    // and there is no term in `DeviceProfile` that could. What differs between
-    // them is the *shape* the grid budget is spent into, which is the device's
-    // answer rather than the browser's.
+    // Same bracket, so same budgets: nothing branches on browser identity.
     assert_eq!(
         resolve(&firefox),
         resolve(&chromium),
@@ -555,11 +459,6 @@ fn two_browser_profiles_on_one_machine_stay_inside_one_bracket() {
 }
 
 /// A deterministic 64-bit generator, so a failing sweep reproduces exactly.
-///
-/// SplitMix64, written out rather than pulled in: this crate has no `proptest`
-/// or `rand` dependency and a sweep over universally quantified invariants
-/// needs neither shrinking nor a distribution — it needs a lot of rows and a
-/// seed that names them again.
 struct Rng(u64);
 
 impl Rng {
@@ -581,24 +480,13 @@ impl Rng {
 }
 
 /// **A profile nobody thought of is still covered.**
-///
-/// The enumerated matrix above sweeps the axes someone chose. The invariants are
-/// all universally quantified, so the rows that matter are the ones outside
-/// anybody's imagination: an adapter reporting a figure that is not a power of
-/// two, a memo from a machine that backed off to an odd number, a browser
-/// claiming a discrete GPU.
-///
-/// Deterministic, from a fixed seed, so a failure is reproducible from the
-/// message alone rather than being a row that appears once in a thousand runs.
 #[test]
 fn a_random_sweep_of_profiles_satisfies_every_invariant() {
     let mut rng = Rng(0x5EED_B0D6_1234_5678);
     for row in 0..4096u32 {
         let limits = rng.pick(&BudgetLimits::SHIPPED);
-        // Deliberately not held to powers of two, and deliberately allowed to
-        // be under the WebGL2 guarantee: `shape_for_budget` is what has to cope,
-        // and `every_axis_stays_within_the_limit_the_adapter_reported` is the
-        // claim being swept here on 4096 more rows than it had.
+        // Not held to powers of two, and allowed under the WebGL2 guarantee:
+        // `shape_for_budget` is what has to cope.
         let three_d = rng.in_range(1, 32768) as u32;
         let two_d = rng.in_range(1, 32768) as u32;
         let profile = DeviceProfile {
@@ -621,10 +509,8 @@ fn a_random_sweep_of_profiles_satisfies_every_invariant() {
                 0 => None,
                 _ => Some(BudgetMemo {
                     loop_pool_bytes: Some(rng.in_range(0, 8u64 << 30) as usize),
-                    // Every rung of the ladder, including counts far past what
-                    // `volume::degrade` lets a session reach: `demote` has to be
-                    // total, and a memo written by a later build is data this
-                    // one has to survive rather than trust.
+                    // Counts far past what a session can reach: `demote` has to
+                    // be total, and a memo from a later build is untrusted data.
                     steps_back: rng.in_range(0, 12) as u32,
                 }),
             },
@@ -635,11 +521,6 @@ fn a_random_sweep_of_profiles_satisfies_every_invariant() {
 }
 
 /// The measured inter-volume gaps, in seconds, and what each radar is.
-///
-/// Campaign of 2026-08-11: six TDWR and four WSR-88D sites, a full 24 h, with
-/// each object's VCP decoded from message 5 rather than inferred from its
-/// interval — which mattered, because VCP 80 and VCP 90 share a cadence and no
-/// interval could have told them apart.
 const MEASURED_CADENCES: [(&str, u32); 4] = [
     ("TDWR VCP 80", 360),
     ("TDWR VCP 90", 360),
@@ -648,17 +529,6 @@ const MEASURED_CADENCES: [(&str, u32); 4] = [
 ];
 
 /// **The same budget is the same wall clock on every radar.**
-///
-/// The whole point of a span budget, stated as the property rather than as the
-/// formula: whatever the cadence, the frames the budget buys span at most the
-/// budget and at least the budget less one volume. A frame count could not make
-/// that claim — the desktop 30 frames this replaced spanned 2 h 05 m on a
-/// WSR-88D in precip, 2 h 54 m on a TDWR and 4 h 18 m on the same WSR-88D in
-/// clear air.
-///
-/// The lower bound is `span - cadence` rather than `span` because a truncating
-/// divide is what makes this a *cap*: 2 h at 517 s is 14 frames covering
-/// 1 h 52 m, and the fifteenth frame would put the loop over the budget.
 #[test]
 fn a_loop_spans_its_budget_on_every_measured_radar() {
     for profile in profiles() {
@@ -671,10 +541,7 @@ fn a_loop_spans_its_budget_on_every_measured_radar() {
                 b.name,
             );
             if frames == b.loop_render_budget {
-                // The arm ran out of frames before it ran out of budget, which
-                // is the ceiling doing its job rather than the span failing —
-                // `constants::tests::the_span_budget_is_the_longest_the_ceiling
-                // _can_pay_for` is where that case is argued.
+                // The arm ran out of frames before budget: the ceiling working.
                 continue;
             }
             let covered = (frames - 1) * cadence as usize;
@@ -699,18 +566,6 @@ fn a_loop_spans_its_budget_on_every_measured_radar() {
 
 /// **A radar that changes VCP mid-window moves the loop, and moves it by the
 /// majority cadence.**
-///
-/// Not a corner case: on 2026-08-11 every measured site but TDFW alternated
-/// VCPs during the day, and a WSR-88D going from precip to clear air doubles
-/// its volume length. `median_step_secs` is a median for exactly this reason —
-/// the mean of a 259 s run and a 517 s run describes neither — so the frame
-/// count follows whichever cadence held for more than half the listing, and
-/// steps to the other one when the majority does.
-///
-/// What that buys is the property the caption depends on: the loop's wall clock
-/// does not lurch when the radar changes mode, because both counts span the
-/// same budget. What it costs is a step in the frame count, which is bounded
-/// here.
 #[test]
 fn a_vcp_change_moves_the_frame_count_between_the_two_cadences() {
     for profile in profiles() {
@@ -722,9 +577,7 @@ fn a_vcp_change_moves_the_frame_count_between_the_two_cadences() {
             "{}: clear air has longer volumes, so it cannot want more frames",
             b.name,
         );
-        // A window that straddles the change takes whichever ran for most of
-        // it, and both ends are inside the pair — there is no third answer for
-        // a mixed window to land on.
+        // A straddling window takes whichever VCP ran for most of it.
         for straddling in [259, 300, 400, 500, 517] {
             let frames = b.frames_for_span(Some(straddling));
             assert!(
@@ -738,18 +591,6 @@ fn a_vcp_change_moves_the_frame_count_between_the_two_cadences() {
 }
 
 /// **A desktop browser and a phone browser stop getting the same answer.**
-///
-/// The headline of this stage, stated as the two rows a `cfg` cascade cannot
-/// tell apart at all: same binary, same origin, same WebGL2 backend, same
-/// `DeviceClass::Unknown`, and the *only* thing between them is what the
-/// adapter reports.
-///
-/// The phone row is deliberately not a measurement — this project has no phone
-/// browser reading, and inventing one would be the scaled figure it forbids. It
-/// is the **WebGL2 guarantee**, which is what the web budgets were derived from
-/// in the first place, so what this asserts is the honest claim: a browser that
-/// reports no more than the spec floor keeps every byte it had, and a browser
-/// that reports what a measured desktop machine reported does not.
 #[test]
 fn a_desktop_class_browser_is_promoted_and_a_spec_floor_browser_is_not() {
     let web = |two_d: u32, three_d: u32| DeviceProfile {
@@ -779,7 +620,6 @@ fn a_desktop_class_browser_is_promoted_and_a_spec_floor_browser_is_not() {
          wasm32 configuration",
     );
 
-    // What the promotion actually buys, named rather than implied.
     let floor_cells: usize = floor.grid_cells.iter().map(|&n| n as usize).product();
     let promoted_cells: usize = promoted.grid_cells.iter().map(|&n| n as usize).product();
     assert!(
@@ -795,23 +635,13 @@ fn a_desktop_class_browser_is_promoted_and_a_spec_floor_browser_is_not() {
          getting this wrong: a handheld browser that reports desktop-class \
          figures is handed a budget handheld hardware already runs",
     );
-    // "And the pool it is divided out of moves with it, on the same rung" is
-    // asserted beside the pool: `LoopPool` sits above this crate, so that half
-    // lives in rustdar-app's `loop_pool::tests::budget_agreement`
-    // (`a_promoted_browsers_pool_moves_on_the_same_rung`, WO-RD).
-
-    // Neither is promoted past the bracket, and both satisfy every invariant.
+    // The pool half lives in rustdar-app's `loop_pool::tests::budget_agreement`.
     for profile in [&at_the_guarantee, &desktop_class] {
         check_invariants(profile, "browser separation");
     }
 }
 
 /// **A software rasteriser is never promoted, whatever it reports.**
-///
-/// The one class where the reported ceilings say nothing worth having: llvmpipe
-/// will advertise 16384 and then take seconds a frame. `quality::select`
-/// already puts it at the bottom of its own ladder, and this is the same
-/// judgement applied to the budgets.
 #[test]
 fn a_software_rasteriser_is_not_promoted_by_what_it_reports() {
     let profile = DeviceProfile {
@@ -831,12 +661,6 @@ fn a_software_rasteriser_is_not_promoted_by_what_it_reports() {
 }
 
 /// **The discrete desktop GPU stops eating the compromise it was still eating.**
-///
-/// Named in the one unit that matters to the user: what a maximised 4K pane is
-/// allowed to cost. Before this, 20 MiB paid for the 2560 x 1440 reference pane
-/// at `Native` and nothing larger, so a 3840 x 2160 pane on a card with 24576
-/// MiB of measured VRAM was rendered at half resolution and upscaled by the
-/// blit.
 #[test]
 fn a_discrete_desktop_gpu_can_afford_a_4k_pane_at_native_resolution() {
     use crate::quality::{ResolutionRung, VolumeQuality};
@@ -863,7 +687,6 @@ fn a_discrete_desktop_gpu_can_afford_a_4k_pane_at_native_resolution() {
          which is the compromise this stage is for",
     );
     assert_eq!(after.size, FOUR_K);
-    // And the sum still holds with six of them budgeted at once.
     check_invariants(
         &DeviceProfile {
             class: DeviceClass::Discrete,
@@ -872,15 +695,10 @@ fn a_discrete_desktop_gpu_can_afford_a_4k_pane_at_native_resolution() {
         "discrete desktop",
     );
 
-    // **An integrated desktop GPU is left exactly where it was, and it stays
-    // there even when it reports desktop-class ceilings.** That is the
-    // measurement's answer rather than an omission: the same cost model puts it
-    // at 12-23 ms for a *1440 x 900* pane, so a 4K one is not a frame. It is
-    // also the row this project actually measured — a Radeon 890M reporting
-    // 16384/8192, which clears `DESKTOP_CLASS_REPORT` outright. A rule that let
-    // the report raise a class the driver had already named would promote that
-    // machine past what it can hold a frame at, on the strength of a number
-    // about capacity answering a question about fill rate.
+    // An integrated desktop GPU stays put even when it reports desktop-class
+    // ceilings: the cost model puts it at 12-23 ms for a 1440 x 900 pane, so a
+    // 4K one is not a frame. Measured on a Radeon 890M reporting 16384/8192,
+    // which clears `DESKTOP_CLASS_REPORT` outright.
     for adapter in [
         AdapterCeilings::WEBGL2_GUARANTEE,
         AdapterCeilings {
@@ -903,10 +721,6 @@ fn a_discrete_desktop_gpu_can_afford_a_4k_pane_at_native_resolution() {
 }
 
 /// **Every arm of the mobile bracket is pinned, and it is pinned on purpose.**
-///
-/// aarch64 is three of five targets and is entirely unmeasured from here. This
-/// test is the standing note in executable form: if somebody unpins a mobile
-/// rung, they have to come and delete this and say what they measured.
 #[test]
 fn the_mobile_bracket_promotes_nothing_until_somebody_measures_aarch64() {
     let pinned = |b: Bracket| b.floor == b.step && b.step == b.ceiling;
@@ -927,10 +741,7 @@ fn the_mobile_bracket_promotes_nothing_until_somebody_measures_aarch64() {
         assert_eq!(
             resolve(&profile),
             Budgets {
-                // The rung is still *resolved* — a pinned bracket is a bracket
-                // with nothing to spend it on, not a signal that was ignored —
-                // so the claim is that every field came out the same, whatever
-                // rung this class earned.
+                // Every field comes out the same, whatever rung was earned.
                 promotion: profile.promotion(),
                 ..resolve(&shipped_profile(BudgetLimits::MOBILE))
             },
@@ -941,12 +752,6 @@ fn the_mobile_bracket_promotes_nothing_until_somebody_measures_aarch64() {
 }
 
 /// **The ladder is ordered, and lighting goes first.**
-///
-/// The order is the plan's, and it is the order the measurements argue for: the
-/// cloud rung is 0.766 ms dense against 0.263 for the flat march, which is the
-/// cheapest large saving in the application and the one a user is least likely
-/// to be able to name. Resolution is next, and the picture itself gets coarser
-/// only after both.
 #[test]
 fn the_ladder_surrenders_lighting_before_resolution_and_the_picture_last() {
     use crate::quality::{GradientShading, ResolutionRung};
@@ -965,14 +770,12 @@ fn the_ladder_surrenders_lighting_before_resolution_and_the_picture_last() {
     assert_eq!(top.quality_ceiling.shading, GradientShading::On);
     assert_eq!(top.quality_ceiling.resolution, ResolutionRung::Native);
 
-    // 1: lighting, and nothing else.
     let one = stepped(1);
     assert_eq!(one.quality_ceiling.shading, GradientShading::Off);
     assert_eq!(one.quality_ceiling.resolution, ResolutionRung::Native);
     assert_eq!(one.offscreen_bytes, top.offscreen_bytes);
     assert_eq!(one.grid_cells, top.grid_cells);
 
-    // 2: the offscreen, both the rung and the budget that enforces it.
     let two = stepped(2);
     assert_eq!(two.quality_ceiling.resolution, ResolutionRung::Half);
     assert_eq!(
@@ -982,7 +785,6 @@ fn the_ladder_surrenders_lighting_before_resolution_and_the_picture_last() {
     assert_eq!(two.grid_cells, top.grid_cells);
     assert_eq!(two.raster_side_ceiling_px, top.raster_side_ceiling_px);
 
-    // The picture's own resolution is late, and the raster side is last.
     let deep = stepped(9);
     assert_eq!(deep.grid_cells, BudgetLimits::DESKTOP.grid_cells.floor);
     assert_eq!(
@@ -993,12 +795,6 @@ fn the_ladder_surrenders_lighting_before_resolution_and_the_picture_last() {
 
 /// **A machine that keeps failing lands on the configuration this build already
 /// shipped it, and stops.**
-///
-/// The floor is a decision, not a limit that happens to be reached: below it
-/// the answer is not a smaller budget, it is `volume::degrade` retiring the 3D
-/// view, which latches after two surface losses and is a different mechanism.
-/// So the ladder has to be *total* — any number of steps, on any bracket, still
-/// resolves inside the bracket.
 #[test]
 fn no_number_of_back_offs_takes_a_machine_below_its_bracket_floor() {
     for limits in BudgetLimits::SHIPPED {
@@ -1028,8 +824,7 @@ fn no_number_of_back_offs_takes_a_machine_below_its_bracket_floor() {
                 b.name,
             );
             if steps >= 4 {
-                // Everything this ladder owns is at its stop, and what is left
-                // is the same configuration a device that said nothing got.
+                // Everything at its stop is the configuration a silent device got.
                 assert_eq!(b.offscreen_bytes, unreadable.offscreen_bytes);
                 assert_eq!(b.grid_cells, unreadable.grid_cells);
                 assert_eq!(b.volume_texture_bytes, unreadable.volume_texture_bytes);

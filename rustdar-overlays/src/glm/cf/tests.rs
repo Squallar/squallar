@@ -1,7 +1,7 @@
 use super::*;
 
-/// A packed `u16` above 32767 reads back as a *negative* `i16`; recovering
-/// it is a bit reinterpretation.
+/// A packed `u16` above 32767 reads back as a *negative* `i16`; recovering it
+/// is a bit reinterpretation.
 ///
 /// Values are the first real `event_lat` sample from `noaa-goes19` granule
 /// `OR_GLM-L2-LCFA_G19_s20262051200000_...`.
@@ -9,12 +9,9 @@ use super::*;
 fn unsigned_short_above_32767_reinterprets_not_negates() {
     let ty = VarType::SignedInt(2);
     assert_eq!(reinterpret_unsigned(-13585.0, ty, true), 51951.0);
-    // Without `_Unsigned` the same bits stay negative.
     assert_eq!(reinterpret_unsigned(-13585.0, ty, false), -13585.0);
-    // Values below 32768 are unaffected either way.
     assert_eq!(reinterpret_unsigned(11048.0, ty, true), 11048.0);
 
-    // ...and it must unpack to a real latitude in Ohio.
     let lat: f64 = 51951.0 * 0.00203128 + -66.56;
     assert!((lat - 38.967).abs() < 1e-3, "got {lat}");
     let wrong: f64 = -13585.0 * 0.00203128 + -66.56;
@@ -49,12 +46,10 @@ fn unsigned_reinterpretation_covers_the_other_int_widths() {
         reinterpret_unsigned(-1.0, VarType::SignedInt(8), true),
         18_446_744_073_709_551_615.0
     );
-    // Native unsigned storage is already correct and must be left alone.
     assert_eq!(
         reinterpret_unsigned(65535.0, VarType::UnsignedInt, true),
         65535.0
     );
-    // Floats are never reinterpreted.
     assert_eq!(
         reinterpret_unsigned(-13585.0, VarType::Float, true),
         -13585.0
@@ -97,7 +92,6 @@ fn cf_time_units_parse_unit_and_epoch() {
             .seconds_per_unit,
         1e-3
     );
-    // A units string we do not understand must not be guessed at.
     assert!(parse_time_units("fortnights since 2026-07-24").is_none());
     assert!(parse_time_units("degrees_north").is_none());
 }
@@ -108,9 +102,7 @@ fn cf_epoch_accepts_the_shapes_glm_writes() {
         .unwrap()
         .and_hms_opt(12, 0, 0)
         .unwrap();
-    // `time_coverage_start` global attribute form.
     assert_eq!(parse_cf_epoch("2026-07-24T12:00:00.0Z"), Some(expect));
-    // `units` attribute form.
     assert_eq!(parse_cf_epoch("2026-07-24 12:00:00.000"), Some(expect));
     assert_eq!(
         parse_cf_epoch("2026-07-24"),
@@ -119,14 +111,9 @@ fn cf_epoch_accepts_the_shapes_glm_writes() {
     assert!(parse_cf_epoch("not a date").is_none());
 }
 
-// ---------------------------------------------------------------------
-// File-backed tests: real NetCDF4 files through the same library that
-// reads the GOES granules, so the whole read path is exercised. A unit
-// test on `reinterpret_unsigned` alone cannot catch a reader that widens a
-// packed `short` before anyone looks at `_Unsigned`.
-// ---------------------------------------------------------------------
+// File-backed tests: real NetCDF4 files through the same library that reads the
+// GOES granules, so the whole read path is exercised.
 
-/// Description of a packed 16-bit variable, mirroring how GLM writes one.
 struct ShortVar<'a> {
     values: &'a [i16],
     unsigned: bool,
@@ -155,10 +142,8 @@ impl Default for ShortVar<'_> {
 
 /// Write a single packed variable to an HDF5 file and hand back its bytes.
 ///
-/// `scale_factor`/`add_offset` are taken as `f32` — GLM's width — and
-/// widened before writing, so the file holds exactly what a `float`
-/// attribute decodes to. `152601.9_f64` is a different constant from the
-/// `152601.859375` the real product yields.
+/// `scale_factor`/`add_offset` are taken as `f32` — GLM's width — so the file
+/// holds exactly what a `float` attribute decodes to.
 fn short_var_file(spec: &ShortVar<'_>) -> Vec<u8> {
     let mut w = hdf5_pure::FileBuilder::new();
     let b = w.create_dataset("v");
@@ -187,8 +172,7 @@ fn short_var_file(spec: &ShortVar<'_>) -> Vec<u8> {
     w.finish().expect("write packed fixture")
 }
 
-/// Write a single unpacked `float` variable — GLM's `group_lat`/`flash_lat`
-/// shape — and hand back its bytes.
+/// Write a single unpacked `float` variable — GLM's `group_lat` shape.
 fn float_var_file(values: &[f32], units: Option<&str>) -> Vec<u8> {
     let mut w = hdf5_pure::FileBuilder::new();
     let b = w.create_dataset("v");
@@ -226,10 +210,8 @@ fn packed_unsigned_short_above_32767_unpacks_correctly_from_a_file() {
     let got: Vec<f64> = v.values.iter().map(|x| x.expect("no fill")).collect();
     assert!((got[0] - 38.9670).abs() < 1e-3, "got {}", got[0]);
     assert!((got[1] - 39.0462).abs() < 1e-3, "got {}", got[1]);
-    // Below 32767 the signed and unsigned readings agree.
     assert!((got[2] - (-44.11)).abs() < 1e-2, "got {}", got[2]);
 
-    // The unreinterpreted reading is not a latitude at all.
     assert!(got[0] > 0.0 && got[0] < 90.0);
 }
 
@@ -331,11 +313,10 @@ fn float_variable_passes_through_unchanged() {
 
 /// An inverted `valid_range` is refused, not honoured.
 ///
-/// "Inverted" is only decidable *after* `_Unsigned` reinterpretation: GLM's
-/// real range `0s, -6s` is `0..=65530`, while the transposed `-6s, 0s` is
-/// `65530..=0`, which matches nothing and empties the variable. A `lo > hi`
-/// check in the *signed* domain gets this exactly backwards — it accepts
-/// the inverted range and rejects the real one.
+/// "Inverted" is only decidable *after* `_Unsigned` reinterpretation: GLM's real
+/// range `0s, -6s` is `0..=65530`, while the transposed `-6s, 0s` is
+/// `65530..=0`, which matches nothing. A `lo > hi` check in the *signed* domain
+/// gets this exactly backwards.
 #[test]
 fn an_inverted_valid_range_is_refused_rather_than_emptying_the_variable() {
     let inverted = read_v(&short_var_file(&ShortVar {
@@ -354,8 +335,6 @@ fn an_inverted_valid_range_is_refused_rather_than_emptying_the_variable() {
              the variable and renders identically to a quiet sky"
     );
 
-    // The same two bounds the right way round are the real GLM attribute,
-    // and must still be enforced.
     let correct = read_v(&short_var_file(&ShortVar {
         values: &[100, 200, -3], // -3 == 65533, past the 65530 cap
         unsigned: true,
@@ -365,7 +344,6 @@ fn an_inverted_valid_range_is_refused_rather_than_emptying_the_variable() {
     }));
     assert_eq!(correct.values, vec![Some(100.0), Some(200.0), None]);
 
-    // Inversion is refused on a plainly signed variable too.
     let signed = read_v(&short_var_file(&ShortVar {
         values: &[-20, 0, 20],
         unsigned: false,
@@ -398,7 +376,6 @@ fn a_valid_range_that_is_not_two_elements_is_ignored() {
              not a range the file declared"
     );
 
-    // One element: there is no upper bound to read at all.
     let one = read_v(&short_var_file(&ShortVar {
         values: &[100, -3],
         unsigned: true,
@@ -409,10 +386,9 @@ fn a_valid_range_that_is_not_two_elements_is_ignored() {
     assert_eq!(one.values, vec![Some(100.0), Some(65533.0)]);
 }
 
-/// A value that unpacks to NaN or ±inf is missing, not a measurement. Two
-/// routes in: coefficients that overflow `raw * scale + offset`, and a
-/// genuine `float` variable (GLM's `flash_lat`) holding NaN on disk with no
-/// `_FillValue` declared, where CF's fill machinery never sees it.
+/// A value that unpacks to NaN or ±inf is missing, not a measurement. Two routes
+/// in: coefficients that overflow `raw * scale + offset`, and a genuine `float`
+/// variable holding NaN on disk with no `_FillValue` declared.
 ///
 /// A published NaN propagates into the projection instead of announcing
 /// itself — `rasterize` sizes bolts by `energy.log10()`.

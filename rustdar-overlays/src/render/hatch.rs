@@ -115,13 +115,6 @@ fn draw_directional_hatch(
 
 /// A higher CIG level's area is excluded from lower levels' hatching, so
 /// nested outlook areas do not accumulate overlapping line sets.
-///
-/// The polygon this pass hatches is the same polygon `draw_feature`
-/// fills, holes and all — both go through [`project_polygon`] and
-/// [`build_filled_polygon_path`] so that they cannot read one shape as two.
-/// They did: the fill honoured interior rings while this pass took only
-/// `polygon.first()`, so a hole the fill had just cut got hatched straight
-/// across.
 pub(crate) fn draw_hatch_pass(
     pixmap: &mut Pixmap,
     features: &[OverlayFeature],
@@ -188,16 +181,6 @@ pub(crate) fn draw_hatch_pass(
 /// Coverage mask for one hatched polygon: the polygon's interior — holes
 /// already cut out of it by `rule` — minus the union of every exclusion
 /// polygon's interior, holes cut out of those too.
-///
-/// Subtraction, not parity: the previous implementation put the hatched ring
-/// and all exclusion rings into one path and filled it `EvenOdd`, which is
-/// correct only when a point falls inside at most one exclusion ring. In the
-/// nested case this pass exists for (CIG1 ⊃ CIG2 ⊃ CIG3, commit b7f2ebd) a
-/// point inside all three crosses three rings — odd parity — so CIG1's
-/// hatching came back inside CIG3; and a *disjoint* exclusion ring inside the
-/// bbox got the lower level's hatching drawn outside the hatched polygon
-/// entirely (one crossing, odd). Union-then-subtract holds for any nesting
-/// depth and any disjoint arrangement.
 ///
 /// `rule` comes from [`build_filled_polygon_path`], which is also what chose
 /// the path: a hole-free polygon still fills `Winding`, exactly as this
@@ -275,10 +258,6 @@ mod tests {
         hatch_mask_with_exclusions(100, 100, &path, rule, exclusions).expect("mask must build")
     }
 
-    /// The nested case the pass exists for: CIG1 ⊃ CIG2 ⊃ CIG3. A point inside
-    /// all three rings crossed *three* of them, so the old single `EvenOdd`
-    /// fill flipped back to "filled" and drew CIG1's hatching inside CIG3
-    /// again.
     #[test]
     fn cig1s_mask_excludes_a_point_inside_doubly_nested_exclusions() {
         let cig1 = solid(square(50.0, 50.0, 40.0));
@@ -297,14 +276,10 @@ mod tests {
             0,
             "inside CIG2 only: still excluded"
         );
-        // Controls: the exclusion must not eat the ring it is cut from.
         assert_eq!(coverage(&mask, 50, 15), 255, "inside CIG1 only: hatched");
         assert_eq!(coverage(&mask, 50, 5), 0, "outside CIG1: never hatched");
     }
 
-    /// The other parity failure: an exclusion ring disjoint from the hatched
-    /// polygon but inside its bbox crossed exactly one ring — odd — so the old
-    /// fill hatched *outside* the hatched polygon entirely.
     #[test]
     fn a_disjoint_exclusion_ring_does_not_pick_up_the_hatching() {
         let hatched = solid(square(30.0, 50.0, 15.0));
@@ -324,10 +299,6 @@ mod tests {
         );
     }
 
-    /// SPC does not promise consistent ring orientation, so two overlapping
-    /// exclusion rings winding opposite ways must still both exclude — a
-    /// single `Winding` fill over both at once cancels to zero where they
-    /// overlap.
     #[test]
     fn exclusion_survives_opposite_winding_directions() {
         let cig1 = solid(square(50.0, 50.0, 40.0));
@@ -349,9 +320,6 @@ mod tests {
         );
     }
 
-    /// The disagreement honouring holes in the fill would otherwise have
-    /// opened: `draw_feature` cuts the hole, and this pass used to hatch
-    /// straight across it, so the cut-out came back as a patch of bare lines.
     #[test]
     fn a_holed_polygon_is_not_hatched_inside_its_hole() {
         let hatched = ProjectedPolygon {
@@ -374,22 +342,6 @@ mod tests {
         assert_eq!(coverage(&mask, 50, 5), 0, "control: outside the exterior");
     }
 
-    /// **The whole path, on SPC's own bytes: feed → parse → raster → ink.**
-    ///
-    /// Every other test in this module drives `hatch_mask_with_exclusions`
-    /// directly with synthetic squares, which proves the geometry is right and
-    /// proves nothing about whether anything ever calls it. That question is
-    /// worth a test of its own, because it was once answered wrongly in both
-    /// directions: an audit concluded the subsystem was unreachable in
-    /// production because SPC's live product that day had no significant-severe
-    /// area in it at all.
-    ///
-    /// So this one starts from a real archived product
-    /// (`day1otlk_20260425_1300_hail.lyr.geojson`, saved verbatim), runs it
-    /// through the parser and the public rasterizer the handler calls, and
-    /// asserts hatch-coloured pixels landed on the texture. The hatch colour
-    /// is passed in by the caller — it is theme-dependent — so a colour SPC
-    /// never uses makes the ink unambiguous.
     #[test]
     fn a_real_spc_product_puts_hatch_lines_on_the_texture() {
         use crate::spc::outlook::{OutlookDay, OutlookProduct, parse_geojson};
@@ -408,7 +360,6 @@ mod tests {
             "premise: this product carries a significant-severe area",
         );
 
-        // The product's own extent, so the hatched area is on the texture.
         let (mut min_lat, mut max_lat) = (f64::MAX, f64::MIN);
         let (mut min_lon, mut max_lon) = (f64::MAX, f64::MIN);
         for feature in &outlook.features {

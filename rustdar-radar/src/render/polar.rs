@@ -1,82 +1,5 @@
 //! What a plan-view render painted, in the polar frame it painted *from*, and
 //! the one way to ask it what lies under a point.
-//!
-//! # Why this is not a picture
-//!
-//! Everything else a render hands back is raster-shaped: `side_px²` of RGBA,
-//! and — until this module existed — `side_px²` of `f32` beside it, so that a
-//! hover could index one number out of it. That grid was a resampled copy of
-//! data the readout cannot resolve past. A full-ring reflectivity sweep is
-//! 1832 gates × 720 radials, about 5 MiB of measurements;
-//! [`crate::types::raster_side_px`] draws it at 7362 px, and the matching value
-//! grid is `7362² × 4` = **206.75 MiB** — forty times the data, oversampled
-//! four-fold by area on purpose, because [`crate::types::TEXELS_PER_SAMPLE`] is
-//! 2.0 in each axis.
-//!
-//! This is the measurements themselves, at the resolution the radar took them,
-//! arranged the way [`super::MercatorProjection::render_gate`] read them.
-//!
-//! Measured on this box, `--release`, holding one render per pane the way a
-//! pane, the render cache and the suspend copy all did — a synthetic 720 × 1832
-//! surveillance cut at a 8192 ceiling, which lands on a 7328 px raster, each
-//! arm in its own process so the renderer's pools cannot confound them:
-//!
-//! | resident host bytes | grid | this |
-//! |---------------------|-----:|-----:|
-//! | marginal, per pane  | 214,806,528 B (204.86 MiB) | 5,288,000 B (5.04 MiB) |
-//! | six panes           | 1034.31 MiB | **35.22 MiB** |
-//!
-//! Forty-one times smaller, and the six-pane figure is what a display showing
-//! six distinct rasters was actually holding.
-//!
-//! # The rule is `render_gate`'s rule, backwards
-//!
-//! A readout that picked its gate by any rule of its own would name a different
-//! number from the one the colour under the cursor was painted with, and
-//! nothing would say so. So [`PolarGeometry::pick`] is written as the exact
-//! inverse of the forward paint, term for term:
-//!
-//!   * **Range.** `render_gate` paints a gate over
-//!     `[range_km − gate_interval/2, range_km + gate_interval/2)` — half-open,
-//!     because its `t` runs over `[0, 1)`, so the `+2` on the sample counts
-//!     raises sample density and never extent — with `range_km` the gate's
-//!     centre. Those centres are uniform **along the beam** and not on the
-//!     ground: [`crate::beam::ground_range_km`] is an arc, not a scale factor,
-//!     so the inverse converts first and indexes second. The gate holding a
-//!     ground range is `floor((slant(ground_km) - first_slant) /
-//!     interval_slant + 0.5)`, and a slant range outside the swept span is in
-//!     no gate at all. The conversion is exact both ways — the pair round-trips
-//!     to 1.7e-13 km — so this stays the inverse of the paint rather than an
-//!     approximation of it.
-//!   * **Azimuth.** A radial is painted over `[centre − half, centre + half)`,
-//!     half-open for the same reason, at the half-width
-//!     [`super::l2_wedge_half_widths_deg`] (or
-//!     [`super::derived_grid_half_widths_deg`]) gave it — its declared width,
-//!     widened to meet a neighbour that is close enough to have measured the
-//!     sky between them and *not* to one further off than that, which is the
-//!     whole point of those two functions. Those wedges tile, and they overlap
-//!     wherever a sweep ran tighter than it declared, so a point can be
-//!     inside two.
-//!   * **The tie.** When it is, [`super::write_key`] decides, and it ranks
-//!     claims radial-major: the greatest claim wins a `fetch_max`, so the
-//!     winner is the **highest radial index** whose wedge holds the point.
-//!     [`PolarGeometry::pick`] takes exactly that one. Within a radial there is
-//!     no tie to break — one ground range falls in one gate.
-//!
-//! # Where it disagrees with the raster, and why the gate is right
-//!
-//! The raster quantizes and a point does not. `render_gate` walks sample points
-//! and truncates them onto a pixel grid nothing aligns them to, so inside the
-//! range where a radial's arc is narrower than one pixel — about 14 km at
-//! 8 px/km and 0.5° — many radials land in the same pixel and `fetch_max` hands
-//! it to the highest-indexed of *all* of them, not to the one the cursor is
-//! inside. Out there the two answers are the same gate; in there the raster's
-//! answer is an arbitrary survivor of a quantization the reader cannot see, and
-//! this module's is the gate the pointer is actually on.
-//!
-//! `super::tests::the_polar_field_answers_what_the_value_grid_holds` measures
-//! how far in that reaches on a real sweep and pins that everything beyond it
-//! agrees exactly.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -85,32 +8,19 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub struct Wedge {
     /// The radial's own azimuth, degrees clockwise from true north.
     pub azimuth_deg: f32,
-    /// Half the width it was painted at, degrees —
-    /// [`super::l2_wedge_half_widths_deg`]'s answer for this radial, or
-    /// [`super::derived_grid_half_widths_deg`]'s for a derived grid's row.
+    /// Half the width it was painted at, degrees.
     pub half_width_deg: f32,
 }
 
 impl Wedge {
     /// The wedge of a radial that never reached
-    /// [`super::MercatorProjection::render_gate`] — every gate on it was below
-    /// threshold, or past the extent, or the sweep carried no moment for it.
-    ///
-    /// Not the same as a zero width, which is a wedge the renderer *clamped*
-    /// and painted as a spoke. [`Self::contains`] declines both, so the
-    /// distinction costs nothing at the call site; it is kept because a blank
-    /// radial answering for its neighbours is exactly the failure
-    /// [`super::l2_wedge_width_deg`] exists to prevent.
+    /// [`super::MercatorProjection::render_gate`].
     pub const UNPAINTED: Self = Self {
         azimuth_deg: f32::NAN,
         half_width_deg: f32::NAN,
     };
 
     /// Whether `azimuth_deg` is inside the sky this radial was painted over.
-    ///
-    /// Half-open on the far side, matching `render_gate`'s `t ∈ [0, 1)`: a
-    /// point exactly on the seam between two tiling wedges belongs to the one
-    /// that starts there, which is the one whose samples reach it.
     fn contains(&self, azimuth_deg: f64) -> bool {
         let half = f64::from(self.half_width_deg);
         if !half.is_finite() || !self.azimuth_deg.is_finite() {
@@ -134,11 +44,6 @@ fn wrap_deg(a: f64) -> f64 {
 }
 
 /// One gate of one radial, in the order the render walked them.
-///
-/// For a Level II sweep that order is `Sweep::radials`', so a consumer holding
-/// the same scan indexes the two alike — which is what lets a loop frame keep
-/// this module's geometry and read its numbers straight out of the volume it
-/// was rendered from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GateAt {
     /// Index into [`PolarGeometry::wedges`].
@@ -152,48 +57,10 @@ pub struct GateAt {
 thread_local! {
     /// Gate values read out of a picture on this thread since
     /// [`take_gate_reads`] last took the tally.
-    ///
-    /// `#[cfg(test)]` and nothing else, so no build that ships pays a `Cell`
-    /// bump for a readout. It exists so that [`crate::hover`]'s
-    /// `the_hover_lookup_does_not_walk_the_gates` can state its property as a
-    /// count of gates read — the same integer on every machine under every
-    /// load — rather than as a ratio of two `Instant`s, which on a contended
-    /// box is a reading of the rest of the machine.
-    ///
-    /// Thread-local rather than a `static`: the suite runs its tests in
-    /// parallel threads of one process, and a readout runs start to finish on
-    /// the thread that asked for it.
     static GATE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Note the gates an access actually read.
-///
-/// **`n` is computed from the span the caller took. It is never written as a
-/// literal.** A literal is a claim about the code rather than a measurement of
-/// it, and the first version of this counter was exactly that: it said `1` at a
-/// call site that decoded every gate up to the one asked for, so the guard read
-/// 64 while the readout read 6,477, and the test went green over the defect it
-/// was written to catch. The `.len()` at each site is the whole difference
-/// between a count and an assertion.
-///
-/// The two accessors the **readout** reaches a gate through are the callers:
-/// [`PolarField::at`] for a render that kept its numbers, and
-/// [`crate::render::moment_value_at`] for one reading back out of the volume.
-/// This is not every gate access in the crate — the fills walk whole radials on
-/// purpose and are no business of this counter.
-///
-/// `moment_value_at` is also the sampler's primitive, so this tallies
-/// `gate_sample` too, and in a test build the sampler pays a `Cell` bump per
-/// gate. That does not reach the hover test: the tally is thread-local, the
-/// suite gives each test its own thread, and the readout runs start to finish
-/// on the thread that drained it. A future test that sampled and hovered on one
-/// thread would have to drain between the two.
-///
-/// A reader that bypasses both accessors counts nothing, and the hover test's
-/// equality fails on the shortfall rather than passing on a zero. What no
-/// counter can catch is an accessor that walks the row and then reports one
-/// gate anyway; the guard against that one is that these two are the only gate
-/// accessors a readout has, and both are short enough to read.
 #[cfg(test)]
 pub(crate) fn note_gate_reads(n: u64) {
     GATE_READS.with(|reads| reads.set(reads.get() + n));
@@ -207,12 +74,6 @@ pub(crate) fn take_gate_reads() -> u64 {
 
 /// Where a render's gates are — everything needed to turn a point into a
 /// `(radial, gate)`, and nothing else.
-///
-/// Split from the numbers themselves because the two have wildly different
-/// costs and wildly different lifetimes. This is `radials × 8` bytes — 5.8 KiB
-/// for a full ring — and it is the half a loop frame keeps, because a loop
-/// frame's numbers are already resident in the volume it was rendered from and
-/// copying them per frame would cost 14 × 5.03 MiB on a browser's loop.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PolarGeometry {
     wedges: Vec<Wedge>,
@@ -223,18 +84,6 @@ pub struct PolarGeometry {
     /// The elevation the sweep was flown at, degrees, or `None` where the two
     /// ranges above are **already ground ranges** and must not be converted at
     /// all.
-    ///
-    /// Here because the slant geometry above is uniform and the *ground*
-    /// geometry it projects to is not, so a ground range cannot be turned back
-    /// into a gate index without it.
-    ///
-    /// `None` and not `Some(0.0)`: at zero elevation the arc is not the
-    /// identity — a horizontal beam still climbs away from a curving earth, and
-    /// the gap is 4.6 m at 100 km, 56 m at 230 and **449 m at 460**. The paths
-    /// that need this are the ones whose grids are ground grids already: the
-    /// 1 km volumetric cube, interpolated echo tops, and Level III radial
-    /// packets, which arrive binned on the ground by the RPG. Converting those
-    /// would invent a foreshortening nobody applied.
     elevation_deg: Option<f64>,
     gates: usize,
     reach_gates: usize,
@@ -243,26 +92,9 @@ pub struct PolarGeometry {
 impl PolarGeometry {
     /// The gate `render_gate` painted the point at (`azimuth_deg`,
     /// `ground_km`) from, or `None` where it painted no gate there.
-    ///
-    /// `azimuth_deg` and `ground_km` are what
-    /// [`rustdar_geo::site_bearing_range_km`] answers for a position — this
-    /// crate's one spelling of "where is this point, from the radar" — so a
-    /// caller does not have to know that a gate is measured along a slanted
-    /// beam and drawn on the ground beneath it. The foreshortening is already
-    /// undone here rather than assumed away: this holds the sweep's *slant*
-    /// grid and its elevation, and inverts the arc to reach it.
-    ///
-    /// **This is the module's whole subject; see the module docs for why each
-    /// term is what it is.** `None` here means "no gate", not "no value" — a
-    /// gate that was painted with nothing to say is a question for whatever
-    /// holds the numbers.
     pub fn pick(&self, azimuth_deg: f64, ground_km: f64) -> Option<GateAt> {
         let gate = self.gate_at(ground_km)?;
-        // Radial-major, greatest wins — `write_key`'s ordering, which is the
-        // order a single-threaded render would have written in. Walked
-        // downwards so the common case, a point inside exactly one wedge,
-        // stops at the first hit rather than scanning to the end to take a
-        // maximum it already had.
+        // Radial-major, greatest wins — `write_key`'s ordering.
         let radial = (0..self.wedges.len())
             .rev()
             .find(|&i| self.wedges[i].contains(azimuth_deg))?;
@@ -271,22 +103,6 @@ impl PolarGeometry {
 
     /// The gate whose footprint holds `ground_km`, or `None` past either end of
     /// a radial.
-    ///
-    /// # The inverse is taken in slant, where the grid is uniform
-    ///
-    /// The forward paint lays gate `j` over the ground interval
-    /// `[ground(s_j − ½Δ), ground(s_j + ½Δ))`, and `ground` — the spherical arc
-    /// — is strictly increasing. So a ground range is inside that interval
-    /// exactly when its **slant** range is inside `[s_j − ½Δ, s_j + ½Δ)`, and
-    /// that grid *is* uniform. Converting once and indexing uniformly is
-    /// therefore the exact inverse of the paint, not an approximation of it:
-    /// [`crate::beam::slant_range_for_ground_km`] and
-    /// [`crate::beam::ground_range_km`] round-trip to 1.7e-13 km over the whole
-    /// fleet domain, which is fourteen orders below a gate.
-    ///
-    /// Searching the ground edges directly would have been the alternative, and
-    /// it is both slower and less exact — a binary search over numbers that
-    /// were themselves rounded, instead of one closed-form step.
     fn gate_at(&self, ground_km: f64) -> Option<usize> {
         if self.gate_interval_slant_km <= 0.0 || self.reach_gates == 0 {
             return None;
@@ -310,44 +126,23 @@ impl PolarGeometry {
         self.wedges.len()
     }
 
-    /// How many gates each radial's row holds — the stride, and what the fill
-    /// *declared*.
+    /// How many gates each radial's row holds — the stride.
     pub fn gates(&self) -> usize {
         self.gates
     }
 
     /// How many of them the render actually reached, which is the bound
     /// [`Self::pick`] answers within.
-    ///
-    /// Not the same as [`Self::gates`], and the difference is the extent. Every
-    /// fill stops at `proj.extent_km`, and [`crate::types::plan_view_extent_km`]
-    /// caps that at [`crate::types::MAX_EXTENT_KM`] — so a radial declaring
-    /// gates past 470 km has them, and the picture does not. Without this bound
-    /// a readout over the corner of the square, outside the disc the data was
-    /// drawn in, would name a gate nothing was painted from.
-    ///
-    /// No product this display draws reaches that far: a WSR-88D surveillance
-    /// cut is 1832 × 0.25 km = 458 km and a TDWR long-range reflectivity 417.
-    /// It is bounded here anyway, because the alternative is a rule that is
-    /// correct only for the sweeps that exist today.
     pub fn reach_gates(&self) -> usize {
         self.reach_gates
     }
 
     /// Gate 0's centre **along the beam**, km.
-    ///
-    /// Renamed from `first_gate_km`, which answered a *ground* range. The
-    /// ground grid stopped being uniform when the conversion became the
-    /// spherical arc, so there is no single ground interval to report and a
-    /// caller that wants one has to name the gate it means. Keeping the old
-    /// name over the new meaning would have handed the next reader a wrong
-    /// belief in a correct-looking call.
     pub fn first_gate_slant_km(&self) -> f64 {
         self.first_gate_slant_km
     }
 
-    /// One gate's depth **along the beam**, km. See
-    /// [`Self::first_gate_slant_km`] for why this is no longer a ground figure.
+    /// One gate's depth **along the beam**, km.
     pub fn gate_interval_slant_km(&self) -> f64 {
         self.gate_interval_slant_km
     }
@@ -359,11 +154,6 @@ impl PolarGeometry {
 
     /// The ground range of gate `gate`'s centre, km — the projection of
     /// [`Self::first_gate_slant_km`] + `gate` × [`Self::gate_interval_slant_km`].
-    ///
-    /// The replacement for arithmetic callers used to do themselves on
-    /// `first_gate_km() + gate × gate_interval_km()`. That spelling is a
-    /// straight line and the ground grid is not one, so it now lives here where
-    /// it can be the same conversion the paint used.
     pub fn gate_ground_km(&self, gate: usize) -> f64 {
         let along_beam_km = self.first_gate_slant_km + gate as f64 * self.gate_interval_slant_km;
         match self.elevation_deg {
@@ -405,11 +195,6 @@ impl PolarGeometry {
 
 /// A render's geometry with the numbers it painted, row-major `radials ×
 /// gates`.
-///
-/// The values are `f32::NAN` where the render painted nothing and
-/// [`super::RANGE_FOLDED_BITS`] where it painted a range-folded gate — the same
-/// two states the raster value grid carried, kept so that a readout derived
-/// from this prints exactly what one derived from that printed.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PolarField {
     geometry: PolarGeometry,
@@ -424,37 +209,22 @@ impl PolarField {
 
     /// Give up the numbers and keep the geometry, for a render whose caller
     /// asked for the picture and not the values.
-    ///
-    /// The counterpart of `rustdar_app`'s `values_wanted`, and the reason
-    /// it can stay a request rather than becoming two render paths: a loop
-    /// frame drops 5.03 MiB of numbers it can read back out of the volume it
-    /// was rendered from and keeps 5.8 KiB of geometry it cannot.
     pub fn strip_values(&mut self) {
         self.values = Vec::new();
     }
 
-    /// Whether the numbers are resident. `false` after [`Self::strip_values`],
-    /// and for a render that painted nothing at all.
+    /// Whether the numbers are resident.
     pub fn has_values(&self) -> bool {
         !self.values.is_empty()
     }
 
     /// The value at a gate this render walked, or `None` where it painted
     /// nothing there.
-    ///
-    /// A range-folded gate answers `None`, matching the grid this replaced:
-    /// it is a reading, and it claims its pixel and takes the folded colour,
-    /// but it has no number to print — `RenderBuffers::into_output` erases the
-    /// sentinel from the values in the same pass that paints the colour.
     pub fn at(&self, at: GateAt) -> Option<f32> {
         if at.gate >= self.geometry.gates {
             return None;
         }
         let index = at.radial * self.geometry.gates + at.gate;
-        // Taken as the span it is so that the count below is produced by the
-        // access rather than declared about it: a reader that walked the row to
-        // reach the gate would hand over the length of its walk. See
-        // [`note_gate_reads`].
         let taken = self.values.get(index..=index)?;
         #[cfg(test)]
         note_gate_reads(taken.len() as u64);
@@ -468,8 +238,6 @@ impl PolarField {
     }
 
     /// Build one directly, for tests and for callers holding a polar grid.
-    ///
-    /// `values` is `geometry.radials() × geometry.gates()`, row-major.
     pub fn from_parts(geometry: PolarGeometry, values: Vec<f32>) -> Self {
         debug_assert!(
             values.is_empty() || values.len() == geometry.radials() * geometry.gates(),
@@ -486,38 +254,6 @@ impl PolarField {
 
     /// This field as bytes, little-endian, for the one boundary that can only
     /// carry buffers.
-    ///
-    /// The browser's page↔worker port is that boundary, and it is exactly the
-    /// reason this exists rather than a `serde` derive: the wire is
-    /// `postMessage`, the buffer is *transferred* rather than copied, and what
-    /// it costs is one pass to build and one to read. A full ring of a
-    /// surveillance cut is 5.03 MiB through it, where the raster grid it
-    /// replaced was 16 MiB on that target and 206.75 MiB on desktop.
-    ///
-    /// Not a general-purpose format and not versioned: the only thing that
-    /// writes it and the only thing that reads it ship in the same binary, and
-    /// `rustdar_web`'s protocol token already refuses a worker built from
-    /// different source.
-    ///
-    /// **The guard in `rustdar_web` does not cover this function, and the one
-    /// that does is
-    /// `tests::the_polar_wire_layout_is_the_one_this_protocol_ships`.**
-    /// `rustdar_web`'s `the_worker_reply_shape_is_the_one_this_build_ships`
-    /// scrapes the *field names* of the worker's reply object, so it fires when
-    /// a reply grows or loses a field. These bytes travel **inside** one of
-    /// those fields, so changing this encoding leaves the field set identical
-    /// and that guard silent — measured: the header once grew an `f64` and it
-    /// did not fire. The digest test beside this module pins the bytes
-    /// themselves, so an edit here goes red. A page and a worker on opposite
-    /// sides of a *deploy* cannot exchange a buffer they lay out differently:
-    /// their build tokens differ by `GITHUB_SHA` and the pair refuses at the
-    /// HELLO handshake. What no instrument covers is a **local** pair
-    /// differing only in these nested bytes — the local token digests the
-    /// framing rows (`rustdar_worker::wire_identity`), deliberately not the
-    /// payloads inside the reply's fields — so such a pair still attaches;
-    /// `from_bytes` length-checks turn most mismatches into `None` and a
-    /// quiet readout rather than a wrong one, the accepted residual
-    /// `wire_identity`'s module doc records.
     pub fn to_bytes(&self) -> Vec<u8> {
         let g = &self.geometry;
         let mut out = Vec::with_capacity(Self::HEADER + g.wedges.len() * 8 + self.values.len() * 4);
@@ -541,12 +277,6 @@ impl PolarField {
 
     /// The inverse of [`Self::to_bytes`], or `None` for anything this build did
     /// not write.
-    ///
-    /// Every length is checked against the buffer rather than trusted, so a
-    /// truncated or foreign message answers `None` and the readout goes quiet,
-    /// which is what a message from a worker this page cannot understand should
-    /// do. The alternative is a panic on a slice index, in a browser, on a
-    /// message a user cannot see.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < Self::HEADER {
             return None;
@@ -574,8 +304,8 @@ impl PolarField {
         {
             return None;
         }
-        // A values buffer that is neither empty nor exactly the shape says the
-        // two halves disagree about the picture, which no reader can repair.
+        // A values buffer that is neither empty nor exactly the shape means the
+        // two halves disagree about the picture.
         if n_values != 0 && n_values != radials.checked_mul(gates)? {
             return None;
         }
@@ -613,11 +343,6 @@ impl PolarField {
 
 /// The shape a render declares its polar source to have, so the buffer that
 /// records it can be sized before the first gate is painted.
-///
-/// Every rasterization path in [`super`] knows all three up front — a sweep's
-/// radials and its moment's gate count, or a derived grid's rows and columns —
-/// and none of them can be recovered from the raster afterwards, which is the
-/// whole reason the field exists.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PolarShape {
     /// How many radials (or grid rows) the fill will walk.
@@ -625,46 +350,16 @@ pub(super) struct PolarShape {
     /// The most gates any one of them carries.
     pub gates: usize,
     /// Gate 0's centre **along the beam**, km.
-    ///
-    /// Slant and not ground since the conversion became the spherical arc: the
-    /// ground grid a fill paints is no longer uniform, so it cannot be named by
-    /// a first value and a step, and the readout inverts the arc instead. A
-    /// path whose gates are already in ground kilometres passes its own spacing
-    /// with `elevation_deg` `None`.
     pub first_gate_slant_km: f64,
     /// One gate's depth **along the beam**, km.
     pub gate_interval_slant_km: f64,
-    /// The elevation the sweep was flown at, degrees, or `None` for a path
-    /// whose ranges are ground ranges already. See
-    /// [`PolarGeometry::elevation_deg`] for why `None` rather than zero.
+    /// The elevation the sweep was flown at, degrees, or `None` for a path whose ranges
+    /// are ground ranges already.
     pub elevation_deg: Option<f64>,
 }
 
 /// The field under construction, written by
 /// [`super::MercatorProjection::render_gate`] as it paints.
-///
-/// # Recorded where it is painted, not beside it
-///
-/// The alternative was for each of the nine rasterization paths to assemble its
-/// own field from the same polar source it hands the gate loop. That is one
-/// more thing per path to keep true, and the failure it invites is silent: a
-/// field built from a source the loop reads differently — a `break` the field
-/// does not take, a `continue` it does not make — describes a picture that was
-/// never drawn, and the readout then disagrees with the colour under it in
-/// exactly the cases the eye cannot check.
-///
-/// `render_gate` is the one place a `(radial, gate)` and the value painted from
-/// it exist together, so it is where they are recorded. Every path gets the
-/// field by construction, and a path that grows a new filter gets it too.
-///
-/// # Why atomics
-///
-/// The fills run [`crate::par`]'s `par_iter` over radials, so the writes are on
-/// many threads. They do not contend: a `(radial, gate)` is painted once, by
-/// the one thread that owns that radial, so every value slot has exactly one
-/// writer, and the two wedge slots have one writer each storing the same
-/// number once per gate. Relaxed stores are all either needs, and they are what
-/// the cell buffer beside them already uses — see [`super::RenderBuffers`].
 pub(super) struct PolarBuffers {
     values: Vec<AtomicU32>,
     azimuth: Vec<AtomicU32>,
@@ -680,13 +375,6 @@ const UNPAINTED_BITS: u32 = 0x7FC0_0000;
 
 impl PolarBuffers {
     /// A field of `shape`, every gate unpainted and every wedge unrecorded.
-    ///
-    /// `gate_interval_km` is the fill's own ground sample spacing —
-    /// [`super::FieldRadial::sample_km`], the same number it hands
-    /// `render_gate` as the gate depth — rather than a fourth member of
-    /// [`PolarShape`], because a field whose gate depth disagreed with the
-    /// spacing the raster was *sized* from would be describing a different
-    /// sweep from the one on the glass.
     pub(super) fn new(shape: PolarShape) -> Self {
         let cells = shape.radials.saturating_mul(shape.gates);
         Self {
@@ -705,12 +393,6 @@ impl PolarBuffers {
     }
 
     /// Record one gate as `render_gate` paints it.
-    ///
-    /// An index outside the declared shape is dropped rather than panicking. A
-    /// path that walks more than it declared has a bug and the `debug_assert`
-    /// is where it is caught; in release, losing the tail of one radial's
-    /// readout is a better failure than a rasterizer that panics mid-sweep on
-    /// a volume nobody can re-download.
     #[inline]
     pub(super) fn paint(
         &self,
@@ -740,9 +422,7 @@ impl PolarBuffers {
         }
     }
 
-    /// The finished field. Rasterization is over by the time this runs, and
-    /// taking `self` by value is what proves it, so every load below is a plain
-    /// one rather than an atomic read.
+    /// The finished field.
     pub(super) fn into_field(mut self) -> PolarField {
         let wedges = self
             .azimuth
@@ -753,11 +433,7 @@ impl PolarBuffers {
                 half_width_deg: f32::from_bits(*h.get_mut()),
             })
             .collect();
-        // The reach falls out of the same pass rather than costing one of its
-        // own, and out of what was *painted* rather than what was declared —
-        // see `PolarGeometry::reach_gates`. A `fetch_max` per gate in
-        // `render_gate` would have answered it too, and would have put an
-        // atomic read-modify-write in the loop `POOLED_CELLS` measures.
+        // Out of what was painted rather than what was declared.
         let mut reach_gates = 0usize;
         let gates = self.gates;
         let values: Vec<f32> = self
@@ -767,9 +443,8 @@ impl PolarBuffers {
             .map(|(i, v)| {
                 let bits = *v.get_mut();
                 let v = f32::from_bits(bits);
-                // On the bits and not on `is_nan`, because a range-folded gate
-                // is painted and its sentinel *is* a NaN — see
-                // `RANGE_FOLDED_BITS`. "Was this slot written" is the question.
+                // On the bits and not on `is_nan`: a range-folded gate is
+                // painted and its sentinel is a NaN.
                 if bits != UNPAINTED_BITS && gates > 0 {
                     reach_gates = reach_gates.max(i % gates + 1);
                 }

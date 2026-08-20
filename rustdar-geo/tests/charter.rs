@@ -1,16 +1,9 @@
 //! The crate's charter, held as tests: an empty dependency ceiling and the
 //! graph position the crate exists to hold.
 //!
-//! Both read `cargo metadata --no-deps --format-version 1` from the workspace
-//! root. `packages[].dependencies` there are *declared* dependencies —
-//! feature-independent and resolution-independent — so no feature selection
-//! (default, `--all-features`, CI's llvm-cov arm) can mask or fake what these
-//! assert. Dep-name mechanics, recorded at M0 and relied on here: a
-//! workspace-internal dep appears with `"req": "*"` and a `path`; `kind` is
-//! `null` for normal deps (normalised to "normal" below); one name may
-//! legitimately appear once per kind, so entries are judged per
-//! `(kind, name)`. Assertions key on dependency *names*, never on feature
-//! emptiness — a later feature on either crate must not disturb them.
+//! Both read `cargo metadata --no-deps` from the workspace root, whose
+//! `packages[].dependencies` are *declared* deps — feature-independent, so no
+//! feature selection can mask them. Entries are judged per `(kind, name)`.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeSet;
@@ -40,8 +33,7 @@ fn metadata() -> serde_json::Value {
 }
 
 /// `(kind, name)` for every dependency `package` declares. `kind: null` is a
-/// normal dependency; target-gated entries carry their kind like any other and
-/// are included — a gated dependency is still a dependency.
+/// normal dependency; target-gated entries are included.
 fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, String)> {
     let packages = meta["packages"]
         .as_array()
@@ -65,15 +57,9 @@ fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, S
         .collect()
 }
 
-/// The floor stays a floor: the *only* dependency this crate may declare, of
-/// any kind, is the dev-only serde_json that this file itself needs to parse
-/// `cargo metadata`. Equality and not ⊆ a list, because the ceiling is empty
-/// on purpose — pure geometry over `std` is the crate's whole identity, and
-/// the definitions it holds are exactly the ones every other crate must be
-/// able to reach without dragging anything else in.
-///
-/// The floor assertion at the bottom is what keeps this test falsifiable — a
-/// broken parse or a renamed package cannot pass as an empty set.
+/// The *only* dependency this crate may declare, of any kind, is the dev-only
+/// serde_json this file itself needs. Equality and not ⊆ a list, because the
+/// ceiling is empty on purpose.
 #[test]
 fn the_dependency_ceiling_holds() {
     let meta = metadata();
@@ -97,8 +83,7 @@ fn the_dependency_ceiling_holds() {
         );
     }
 
-    // Falsifiability floor: the crate really declares its one dev dependency,
-    // so a broken parse or a renamed package cannot pass as an empty set.
+    // Falsifiability floor: the crate really declares its one dev dependency.
     assert!(
         deps.iter().any(|(k, n)| k == "dev" && n == "serde_json"),
         "rustdar-geo no longer declares serde_json (dev) — either the crate \
@@ -106,12 +91,9 @@ fn the_dependency_ceiling_holds() {
     );
 }
 
-/// The graph shape WO-G1 created stays: rustdar-source stands on rustdar-geo,
-/// so every crate above the substrate reaches the floor's definitions by
-/// re-export rather than by restating them.
-///
-/// Presence, not absence, so it doubles as this file's second falsifiability
-/// floor: a renamed package or a broken parse cannot pass it.
+/// rustdar-source stands on rustdar-geo, so every crate above the substrate
+/// reaches the floor's definitions by re-export rather than by restating them.
+/// Presence, not absence, so it doubles as a falsifiability floor.
 #[test]
 fn the_floor_sits_under_the_substrate() {
     let meta = metadata();

@@ -1,21 +1,11 @@
 //! Invariants every `RenderMode::Texture` overlay has to satisfy, written over
 //! `sources()` so a new one is covered the day it is registered.
 //!
-//! `rasterize/alpha_tests` checks two rasterizers by calling them directly.
-//! That is a check on the *function*, and the thing that reaches the uploader
-//! is the [`RasterizeOutput`] a **handler** describes — so a handler could
-//! attach the wrong [`AlphaMode`] to a correct buffer and nothing there would
-//! notice. `the_polygon_rasterizers_hand_over_premultiplied_pixels` calls
-//! `rasterize_nws_alerts`, which returns a bare `Vec<u8>`; the mode is attached
-//! one layer up, in the handler's described input, and that layer was
-//! unpinned. Flipping it to `Straight` — which double-multiplies every
-//! translucent pixel of the alert layer on screen — failed nothing.
-//!
-//! So the walk below goes through `prepare_job` — the **only** dispatch a
-//! handler has, now that the closure twin (`prepare_rasterize`) is deleted —
-//! runs each described input through its own rasterizer exactly as
-//! `offload::execute`'s overlay arm does, and covers every place an
-//! `AlphaMode` is written down.
+//! The walk below goes through `prepare_job` — the only dispatch a handler has
+//! — and runs each described input through its own rasterizer exactly as
+//! `offload::execute`'s overlay arm does, so it covers every place an
+//! `AlphaMode` is written down. Calling a rasterizer directly checks the
+//! *function*; the mode is attached one layer up, in the handler's input.
 
 use std::collections::HashSet;
 
@@ -42,14 +32,9 @@ const BOUNDS: GeoBounds = GeoBounds {
     max_lon: -97.0,
 };
 
-/// The rasterize context a pane hands over: the light theme, because it is the
-/// one in which the site plate's own fill is bright enough for the two alpha
-/// conventions to disagree about it.
-///
-/// `now` is a real clock read, as the dispatch's is, because [`glm_fixture`]
-/// timestamps its flash *now* — and each test reads this **once** and hands
-/// the same context to both paths it compares, so the two cannot age a flash
-/// differently.
+/// The rasterize context a pane hands over: the light theme, in which the site
+/// plate's fill is bright enough for the two alpha conventions to disagree.
+/// `now` is a real clock read, taken **once** per test and handed to both paths.
 fn rctx() -> RasterizeContext {
     RasterizeContext {
         device_scale: 1.0,
@@ -59,11 +44,6 @@ fn rctx() -> RasterizeContext {
     }
 }
 
-/// Run a described job through the rasterizer its input type names — the
-/// same input-typed routing `offload::execute`'s overlay arm performs through
-/// the codec rows — answering the kind the input belongs to beside the
-/// raster, so a handler that described another kind's input is caught by name
-/// rather than by a wrong picture.
 fn run_described(
     job: &DescribedJob,
     bounds: &GeoBounds,
@@ -96,9 +76,7 @@ fn run_described(
     }
 }
 
-// ── Fixtures ─────────────────────────────────────────────────────────────
 
-/// A square covering most of [`BOUNDS`], so a fill lands on plenty of pixels.
 fn ring() -> Vec<(f64, f64)> {
     vec![
         (34.2, -98.8),
@@ -109,7 +87,6 @@ fn ring() -> Vec<(f64, f64)> {
     ]
 }
 
-/// Saturated and translucent, so premultiplying it moves every channel.
 fn feature() -> OverlayFeature {
     OverlayFeature::new(
         vec![vec![ring()]],
@@ -158,10 +135,6 @@ fn discussion_fixture() -> crate::spc::discussion::SpcDiscussion {
     }
 }
 
-/// Day 1 Categorical, which is what [`SpcOutlookHandler::set_enabled`] turns on
-/// from nothing — so the seeded product and the enabled one are the same.
-///
-/// [`SpcOutlookHandler::set_enabled`]: super::outlook::SpcOutlookHandler
 fn outlook_fixture() -> crate::spc::outlook::SpcOutlook {
     use crate::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
     SpcOutlook {
@@ -188,8 +161,8 @@ fn report_fixture() -> crate::spc::reports::StormReport {
     }
 }
 
-/// Timestamped *now*, because the GLM rasterizer fades a flash out over
-/// `time_window_secs` and drops it entirely once it is past the window.
+/// Timestamped *now*: the GLM rasterizer fades a flash out over
+/// `time_window_secs` and drops it past the window.
 fn glm_fixture() -> crate::glm::GlmFlash {
     use crate::glm::{GlmDataLevel, GlmFlash, GlmSatellite};
     GlmFlash {
@@ -204,11 +177,8 @@ fn glm_fixture() -> crate::glm::GlmFlash {
 }
 
 /// Uniform −100 J/kg of CIN over [`BOUNDS`] — the handler's own default
-/// parameter, so no control has to be driven to make it the selected one.
-///
-/// The palette entry that lands on is `[255, 165, 0, 160]`: bright, and
-/// translucent at an alpha two of its channels clear. That is what makes the
-/// straight declaration checkable against the bytes rather than assumed.
+/// parameter. The palette entry that lands on is `[255, 165, 0, 160]`: bright,
+/// and translucent at an alpha two of its channels clear.
 fn cin_grid() -> crate::hrrr::HrrrGridData {
     use crate::hrrr::{GridCoords, HrrrGridData, ModelParameter};
     let parameter = ModelParameter::SurfaceBasedCin;
@@ -218,7 +188,6 @@ fn cin_grid() -> crate::hrrr::HrrrGridData {
     let mut lons = Vec::with_capacity(ni * nj);
     for j in 0..nj {
         for i in 0..ni {
-            // Row 0 is the northern edge, matching the fixture grids next door.
             lats.push(BOUNDS.max_lat - (BOUNDS.max_lat - BOUNDS.min_lat) * (j as f64 / 3.0));
             lons.push(BOUNDS.min_lon + (BOUNDS.max_lon - BOUNDS.min_lon) * (i as f64 / 3.0));
         }
@@ -241,7 +210,6 @@ fn cin_grid() -> crate::hrrr::HrrrGridData {
     }
 }
 
-/// [`cin_grid`] as the input the rasterizer takes — the dispatch's own carry.
 fn whole(grid: crate::hrrr::HrrrGridData) -> ModelDataInput {
     ModelDataInput::Whole(std::sync::Arc::new(grid))
 }
@@ -262,18 +230,15 @@ fn site_fixtures() -> rasterize::SitesInput {
 }
 
 /// Give `handler` the smallest data it will actually draw, and turn it on.
-///
 /// `false` for a texture kind that never takes a fetch and never answers
-/// `prepare_job`: `RadarSites`, whose raster `app_fetch` describes itself from
-/// the site catalogue, and `Radar`, which `ui_map_pane` skips outright because
-/// its renders are driven by product and elevation rather than by the viewport.
+/// `prepare_job`: `RadarSites` and `Radar`.
 pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
     use crate::glm::{GlmFetchOutcome, GlmFetchResult};
     use crate::hrrr::HrrrFetchResult;
     use crate::spc::outlook::{OutlookDay, OutlookProduct};
 
-    // Outlook's "enabled" *is* its product set, and the set is what its data
-    // is keyed by, so the toggle has to precede the payload for the two to meet.
+    // Outlook's "enabled" *is* its product set, and the set is what its data is
+    // keyed by, so the toggle has to precede the payload.
     handler.set_enabled(true);
 
     let payload: FetchPayload = match &handler.id() {
@@ -292,9 +257,6 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
         }),
         id if *id == known::STORM_REPORTS => Box::new(super::reports::StormReportsFetchResult(Ok(
             crate::spc::reports::StormReportRound {
-                // Three, at distinct positions: a one-row seed cannot express
-                // order, and the alignment pin below reversed a one-item list
-                // to no effect the first time it was tried.
                 reports: vec![
                     report_fixture(),
                     crate::spc::reports::StormReport {
@@ -314,9 +276,6 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
             },
         ))),
         id if *id == known::LIGHTNING => Box::new(GlmFetchResult(Ok(GlmFetchOutcome {
-            // Three, spread across the box, so the seeded layer clears the
-            // painted-pixel floors the byte-parity walks stand on — one
-            // ~14 px bolt is real ink but near-vacuous ink.
             flashes: vec![
                 glm_fixture(),
                 crate::glm::GlmFlash {
@@ -353,9 +312,7 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
     true
 }
 
-// ── The alpha convention each handler hands over ─────────────────────────
 
-/// Every pixel the raster actually drew — alpha above zero.
 fn drawn(rgba: &[u8]) -> Vec<[u8; 4]> {
     rgba.chunks_exact(4)
         .filter(|p| p[3] > 0)
@@ -364,15 +321,9 @@ fn drawn(rgba: &[u8]) -> Vec<[u8; 4]> {
 }
 
 /// The declared mode against an invariant of the bytes that only that mode can
-/// satisfy.
-///
-/// Premultiplied RGB is `round(c · a / 255)`, so **no channel can exceed
-/// alpha**. Straight RGB is the colour table's own value, so a bright
-/// translucent entry has channels far above it. That asymmetry is what makes
-/// each half fail when the declaration is flipped: a premultiplied buffer can
-/// never produce the channel-above-alpha the straight arm demands, and a
-/// straight buffer of a bright colour always produces the one the
-/// premultiplied arm forbids.
+/// satisfy: premultiplied RGB is `round(c · a / 255)`, so **no channel can
+/// exceed alpha**, while a bright translucent straight entry has channels far
+/// above it.
 fn assert_alpha_matches_bytes(what: &str, out: &RasterizeOutput) {
     let pixels = drawn(&out.rgba);
     assert!(
@@ -408,13 +359,9 @@ fn assert_alpha_matches_bytes(what: &str, out: &RasterizeOutput) {
 }
 
 /// **The unpinned declarations.** The `AlphaMode` a handler's described input
-/// rasterizes to, checked against the bytes for every texture handler at once.
-///
-/// Written over `prepare_job` because that is the only seam a handler has:
-/// `offload::execute`'s overlay arm reads `RasterizeOutput::alpha` off exactly
-/// this output to decide whether a premultiply is owed inside the job, so a
-/// wrong declaration is every translucent pixel of one layer at the wrong
-/// brightness — which is a thing nobody diffs.
+/// rasterizes to, checked against the bytes for every texture handler at once —
+/// written over `prepare_job`, since `offload::execute`'s overlay arm reads
+/// `RasterizeOutput::alpha` off exactly this output.
 #[test]
 fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
     let ctx = rctx();
@@ -438,10 +385,6 @@ fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
              so a worker would rasterize the wrong layer under its panes",
         );
         assert_alpha_matches_bytes(name, &out);
-        // The painted floor the deleted closure-parity walk used to hold,
-        // kept now that the closure it compared against is gone: a described
-        // fixture that paints almost nothing makes every downstream byte
-        // comparison near-vacuous.
         assert!(
             drawn(&out.rgba).len() > 100,
             "{name}'s fixture painted almost nothing",
@@ -467,8 +410,7 @@ fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
     );
 
     // The seventh raster, and the one with no handler to speak for it:
-    // `app_fetch` builds its input from the site catalogue itself, which is
-    // why it returns a `RasterizeOutput` rather than a bare buffer.
+    // `app_fetch` builds its input from the site catalogue itself.
     assert_alpha_matches_bytes(
         "rasterize_radar_sites",
         &rasterize_radar_sites(&site_fixtures(), &BOUNDS, W, H),
@@ -478,10 +420,9 @@ fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
 /// The other three sites: each rasterizer's early returns, which hand back an
 /// empty buffer and must still name the convention its drawing path does.
 ///
-/// A zero-sided texture is the one branch reachable without a failed
-/// allocation — `Pixmap::new` refuses it — and it is what the tiny-skia
-/// rasterizers fall back through. `rasterize_model_data` has two of its own:
-/// an empty grid, and a grid whose projection window misses the texture.
+/// A zero-sided texture is the one branch reachable without a failed allocation
+/// — `Pixmap::new` refuses it. `rasterize_model_data` has two of its own: an
+/// empty grid, and a grid whose projection window misses the texture.
 #[test]
 fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
     let now = chrono::Utc::now().naive_utc();
@@ -531,10 +472,8 @@ fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
         AlphaMode::Straight,
     );
 
-    // A viewport out over the Atlantic, so `projection_window` narrows the
-    // HRRR domain to nothing. It takes a real Lambert grid to get there: an
-    // explicit-coordinate grid cannot name an index range at all and answers
-    // with the whole of itself, which is never empty.
+    // A viewport out over the Atlantic, so `projection_window` narrows the HRRR
+    // domain to nothing. It takes a real Lambert grid to get there.
     let lambert = crate::render::rasterize::lambert_fixture::lambert_grid(64, 64, 0b0100_0000);
     let atlantic = GeoBounds {
         min_lat: 29.5,
@@ -549,8 +488,7 @@ fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
 }
 
 /// The fixture set is only worth what it discriminates: every seeded handler
-/// has to draw pixels the two conventions actually disagree about, or the walk
-/// above passes on a picture too dark to tell them apart.
+/// has to draw pixels the two conventions actually disagree about.
 #[test]
 fn every_fixture_draws_pixels_the_two_conventions_disagree_about() {
     let ctx = rctx();
@@ -564,8 +502,6 @@ fn every_fixture_draws_pixels_the_two_conventions_disagree_about() {
             .prepare_job(&ctx)
             .expect("seeded above, and the walk next door asserts this");
         let (_, out) = run_described(&input, &BOUNDS, W, H);
-        // A pixel tells the conventions apart when it is translucent: at
-        // `a == 255` the premultiply is the identity and both readings agree.
         let translucent: HashSet<u8> = drawn(&out.rgba)
             .iter()
             .map(|p| p[3])
@@ -583,29 +519,15 @@ fn every_fixture_draws_pixels_the_two_conventions_disagree_about() {
     );
 }
 
-// ── `has_data` against the handler's own rasterizer ──────────────────────
 
 /// **The permanent-wakeup guard.** For every texture handler,
 /// `has_data() == prepare_job().is_some()`.
 ///
-/// `ui_map_pane` reads `has_data` for two decisions: whether to dispatch a
-/// `RenderOverlay`, and whether a *settle* render is still owed — and the
-/// second asks egui for a repaint 100 ms out for as long as the answer is yes.
-/// A handler that says it has data and then declines to describe a job is
-/// therefore not merely wasteful: the render is dispatched,
-/// `spawn_overlay_render` finds no input and abandons it, the texture stays at
-/// the old zoom, and the pane asks for another frame in 100 ms. For ever, on
-/// an idle app, with nothing on screen to say why.
-///
-/// `SpcOutlookHandler` was exactly that. `has_data` was `!state.data.is_empty()`
-/// while the rasterize dispatch needs the *selected day* crossed with the
-/// *ticked products* to yield a feature — so untick every SPC product, or move
-/// to a day whose products are not ticked, and the two disagreed for ever.
-///
-/// The states below are the ones the layer stack can actually reach, and the
-/// master toggle is the reachable route to the divergence: for a handler whose
-/// "enabled" *is* its product set, switching it off empties the very set
-/// `prepare_job` looks the data up by.
+/// `ui_map_pane` reads `has_data` both to dispatch a `RenderOverlay` and to
+/// decide whether a *settle* render is still owed, asking egui for a repaint
+/// 100 ms out for as long as the answer is yes — so a handler that says it has
+/// data and then declines to describe a job repaints for ever on an idle app.
+/// `SpcOutlookHandler` was exactly that.
 #[test]
 fn every_texture_handler_agrees_with_its_own_rasterizer() {
     let ctx = rctx();
@@ -617,17 +539,8 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
         let id = handler.id();
         let name = id.as_str();
         if id == known::RADAR_SITES {
-            // The one exempt kind here: there is no `prepare_job` for its
-            // `has_data` to agree *with*. Its `has_data` is an unconditional
-            // `true` and its pixels come from elsewhere — `app_fetch` describes
-            // the sites job from the site catalogue itself and it always
-            // produces a buffer. The dispatch cannot decline, so it cannot
-            // strand a settle.
-            //
-            // `Radar` was the second exemption until WO-M9 moved it out of this
-            // crate; the arm is gone rather than left unreachable, and the same
-            // claim about `RadarSource` is asserted over the composed registry
-            // in `rustdar_egui::sources`.
+            // The one exempt kind: there is no `prepare_job` for its `has_data`
+            // to agree *with*, and its dispatch cannot decline.
             assert!(
                 handler.prepare_job(&ctx).is_none(),
                 "{name} grew a `prepare_job`; it now has this invariant \
@@ -648,7 +561,6 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
             );
         };
 
-        // Nothing fetched.
         agree(handler.as_ref(), "empty");
 
         assert!(
@@ -656,18 +568,13 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
             "{name} is not exempt above, so it must be seedable",
         );
 
-        // Seeded and on.
         agree(handler.as_ref(), "seeded and enabled");
 
-        // Off. For alerts, MDs, reports, GLM and HRRR the master toggle is a
-        // `bool` the rasterizer never reads, so both halves stay `true`; for
-        // outlooks it clears the product set, and both must go to `false`.
+        // Off. For every kind but outlooks the master toggle is a `bool` the
+        // rasterizer never reads, so both halves stay `true`.
         handler.set_enabled(false);
         agree(handler.as_ref(), "seeded, then switched off");
 
-        // And back, because `set_enabled(true)` restores a *default* selection
-        // rather than the one that was there — which is another way for the two
-        // halves to part company.
         handler.set_enabled(true);
         agree(handler.as_ref(), "seeded, switched off, switched back on");
 
@@ -684,9 +591,8 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
 /// trait can reach: the day buttons.
 ///
 /// Day 5 publishes only `Probabilistic`, so a pane holding Day 1's Categorical
-/// tick and moving to Day 5 has a full `state.data` and nothing at all to draw.
-/// This is the state a user lands in by pressing one button, and before the fix
-/// it was a 10 Hz repaint that outlived the gesture, the pane and the session.
+/// tick and moving to Day 5 has a full `state.data` and nothing to draw — one
+/// button press into a 10 Hz repaint that outlives the gesture.
 #[test]
 fn an_outlook_day_with_no_ticked_products_has_no_data_to_draw() {
     use crate::spc::outlook::{OutlookDay, OutlookProduct};
@@ -723,28 +629,17 @@ fn an_outlook_day_with_no_ticked_products_has_no_data_to_draw() {
     );
 }
 
-// ── The described-job set ────────────────────────────────────────────────
 
-/// Whether `id` resolves clicks through a hit map, and therefore must
-/// answer [`OverlayHandler::hit_items`] exactly when it answers
-/// `prepare_job` — an input with rows and no items is a layer whose every
-/// hover zips to nothing.
+/// Whether `id` resolves clicks through a hit map, and therefore must answer
+/// [`OverlayHandler::hit_items`] exactly when it answers `prepare_job`.
 fn has_hit_map(id: &LayerId) -> bool {
     *id == known::STORM_REPORTS || *id == known::LIGHTNING
 }
 
 /// **Every texture kind that renders through a handler has a described job**
-/// — the model grid included, since the opaque closure path it was the last
-/// rider of is deleted — and, for the hit-map kinds, `hit_items` agrees with
-/// `prepare_job` in every state the layer stack can reach.
-///
-/// `rustdar-app`'s `spawn_overlay_render` routes by an explicit match on
-/// kind, not by probing `prepare_job` — so the match there and the
-/// implementations here are two statements of one set, and this test is what
-/// keeps a kind from joining one and not the other. A kind routed described
-/// without an implementation would answer `None` with data on hand, and its
-/// layer would silently never draw: precisely the disagreement the
-/// permanent-wakeup guard above exists to catch.
+/// and, for the hit-map kinds, `hit_items` agrees with `prepare_job` in every
+/// reachable state. `spawn_overlay_render` routes by an explicit match on kind,
+/// so it and the implementations here are two statements of one set.
 #[test]
 fn every_texture_kind_rasterizes_as_a_described_job() {
     let ctx = rctx();
@@ -796,10 +691,6 @@ fn every_texture_kind_rasterizes_as_a_described_job() {
         };
 
         agree(handler.as_ref(), "empty");
-        // Only the texture kinds can be seeded (the `seed` fixture panics on
-        // the others by design); a non-texture kind has had its `prepare_job`
-        // pinned `None` by the empty-state walk above, which is the whole
-        // claim for it.
         if handler.render_mode() != RenderMode::Texture || !seed(handler.as_mut()) {
             continue;
         }
@@ -824,17 +715,13 @@ fn every_texture_kind_rasterizes_as_a_described_job() {
     );
 }
 
-/// **The order-stability invariant at its source**: `hit_items()[i]` is the
-/// item whose row `prepare_job` describes at position `i`, checked against
-/// the item's **own** identity — its stored index and coordinates — rather
-/// than against the list it came from.
+/// **The order-stability invariant at its source**: `hit_items()[i]` is the item
+/// whose row `prepare_job` describes at position `i`, checked against the item's
+/// **own** identity rather than against the list it came from.
 ///
-/// This is the one place the check can be independent. The frontend's zip
-/// and probe tests take `hit_items` as the ground truth to zip with, so a
-/// handler that shuffled its items relative to its rows would satisfy them
-/// while every hover named the wrong report; here the concrete item types
-/// are nameable and each carries the index its data row was built at, which
-/// is a statement of order the shuffle cannot forge.
+/// The one place the check can be independent: the frontend's zip and probe
+/// tests take `hit_items` as ground truth, so a handler that shuffled its items
+/// would satisfy them while every hover named the wrong report.
 #[test]
 fn a_hit_map_kinds_items_align_with_its_described_rows() {
     let ctx = rctx();
@@ -895,24 +782,15 @@ fn a_hit_map_kinds_items_align_with_its_described_rows() {
     assert_eq!(checked, 2, "both hit-map kinds must be walked seeded");
 }
 
-// ── The handler ↔ codec-row pairing ──────────────────────────────────────
 
 /// **The registry pairing gate, bidirectional.** Every texture handler that
 /// rasterizes through the job boundary owns exactly one row of
-/// [`crate::render::jobs::JOB_CODECS`], each row is claimed exactly once,
-/// and no row goes unclaimed — so a handler cannot arrive without a codec
-/// and a codec cannot arrive without a handler.
+/// [`crate::render::jobs::JOB_CODECS`], claimed exactly once, none unclaimed.
 ///
 /// The kind → label pairing is spelled literally rather than derived, so a
-/// *swapped* pair of registrations — two handlers each claiming the other's
-/// row, which "claimed exactly once" alone cannot see — is caught by name.
-/// `RadarSites` claims its row while its `prepare_job` stays `None` (the
-/// dispatch builds the input until M10 — the row states how the bytes cross,
-/// not who builds them). `Radar` was the one texture kind with no row at all,
-/// because its pixels come from the radar render pipeline and never cross the
-/// overlay job boundary; since WO-M9 it is not this crate's handler at all, and
-/// that claim is asserted over the composed registry in
-/// `rustdar_egui::sources` instead of by an arm here that could never fire.
+/// *swapped* pair of registrations is caught by name. `RadarSites` claims its
+/// row while its `prepare_job` stays `None`: the row states how the bytes cross,
+/// not who builds them.
 #[test]
 fn every_texture_handler_owns_exactly_one_codec_row() {
     use crate::render::jobs::JOB_CODECS;

@@ -10,7 +10,6 @@ use rustdar_units::UserPreferences;
 
 use crate::handler::OverlayItem;
 
-/// Which corner of the text box sits at the given offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextAnchor {
     TopLeft,
@@ -24,13 +23,11 @@ pub enum TextAnchor {
     CenterBottom,
 }
 
-/// The UI crate projects and culls these, then calls `draw_point()` on the
-/// survivors.
+/// The UI crate projects and culls these, then calls `draw_point()`.
 pub struct MapPoint {
     pub lat: f64,
     pub lon: f64,
-    /// Index into the handler's data array; comes back in `draw_point()` and
-    /// `hover_text()`.
+    /// Index into the handler's data array; comes back in `draw_point()`.
     pub id: u32,
     pub selection: Arc<dyn OverlayItem>,
 }
@@ -45,7 +42,6 @@ pub trait PointPainter {
 
     fn line(&mut self, from: [f32; 2], to: [f32; 2], color: [u8; 4], width: f32);
 
-    /// Convex only.
     fn filled_polygon(&mut self, points: &[[f32; 2]], color: [u8; 4]);
 }
 

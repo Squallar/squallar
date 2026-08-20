@@ -19,14 +19,6 @@ impl AlertCategory {
     /// status line are all built by walking this, so a variant cannot exist in
     /// the enum and be missing from the set that decides whether it paints.
     ///
-    /// It could: `Other` was never inserted by any of the four writers of
-    /// `enabled_categories`, so `is_drawn` was permanently false for it and
-    /// every Air Quality Alert, Civil Emergency Message and Evacuation
-    /// Immediate in the feed was silently dropped — 25 of 271 active alerts in
-    /// the sample that found it. The counts filtered on the same predicate, so
-    /// the status line excluded them too and read a confident number that was
-    /// wrong by exactly the invisible set.
-    ///
     /// Order is the order the UI offers them, most severe first.
     pub const ALL: [AlertCategory; 4] = [
         AlertCategory::Warning,
@@ -286,19 +278,6 @@ pub(crate) fn parse_geometry(geom: Option<&serde_json::Value>) -> Option<Vec<Geo
 
 /// The three geometry types the NWS actually serves, `depth` guarding the one
 /// that contains the other two.
-///
-/// # Why `GeometryCollection` is here
-///
-/// It was not, and the omission took whole zones off the map. A zone made of
-/// separate landmasses arrives as a `GeometryCollection` of a `Polygon` and a
-/// `MultiPolygon` rather than as one `MultiPolygon` — the shape of the source
-/// data, not an error — and the `_ =>` arm turned every one of those into
-/// `ZoneFailure::NoBoundary`. Measured against the live feed: **227 of the
-/// 11,651 published NWS zones** are collections, and they are not obscure ones.
-/// 63 are in Virginia, 50 in Florida, 48 in Maryland, 36 in North Carolina;
-/// they include the Outer Banks, the Florida Keys, Chesapeake Bay's western
-/// shore and Kauai. Two consecutive live rounds resolved 1,791 and 1,806 zones
-/// with **28 failures each, all of them this, and nothing else failing at all**.
 fn parse_geometry_at(geom: Option<&serde_json::Value>, depth: u32) -> Option<Vec<GeoPolygon>> {
     let geom = geom?.as_object()?;
     let geom_type = geom.get("type")?.as_str()?;

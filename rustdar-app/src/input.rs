@@ -1,9 +1,6 @@
 use winit::event::{ElementState, WindowEvent};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 
-/// A simple input handler for keyboard events.
-/// Tracks keys pressed this frame (no held-key tracking needed).
-/// Handles Escape on desktop and the Android back button (GoBack).
 #[derive(Default)]
 pub struct InputHandler {
     escape_pressed: bool,
@@ -15,15 +12,11 @@ impl InputHandler {
         Self::default()
     }
 
-    /// Clear per-frame input state. Should be called once at the start of each frame.
     pub fn clear_frame_state(&mut self) {
         self.escape_pressed = false;
         self.back_pressed = false;
     }
 
-    /// Process a single window event for input handling.
-    /// Accepts `&WindowEvent` directly to avoid cloning the entire event.
-    /// Returns true if the event was an input-related event that was handled.
     pub fn process_event(&mut self, event: &WindowEvent) -> bool {
         match event {
             WindowEvent::KeyboardInput {
@@ -40,15 +33,8 @@ impl InputHandler {
         }
     }
 
-    /// Record one key-down.
-    ///
-    /// Split out of [`Self::process_event`] because `winit::event::KeyEvent`
-    /// has a private field and cannot be built by a test, while the three
-    /// things this actually reads all can be. Everything that decides *whether
-    /// a press counts* lives here, where it can be exercised.
     fn note_key(&mut self, physical: PhysicalKey, logical: &Key, repeat: bool) {
-        // Auto-repeat is not a second press. Held Escape would otherwise walk
-        // the whole dialog stack and then quit, at the OS repeat rate.
+        // Auto-repeat is not a second press.
         if repeat {
             return;
         }
@@ -58,24 +44,15 @@ impl InputHandler {
         {
             self.escape_pressed = true;
         }
-        // Back by *logical* key: Android's button and the browser's are named
-        // keys with no physical keycode at all.
+        // Back by *logical* key: Android's button and the browser's are named keys with no
+        // physical keycode at all.
         if let Key::Named(NamedKey::GoBack | NamedKey::BrowserBack) = logical {
             self.back_pressed = true;
         }
     }
 
-    /// Take this frame's "back out of the thing I am in" press — Escape or the
-    /// back button — if there was one.
-    ///
-    /// One predicate for both, so the desktop key and the phone button cannot
-    /// drift apart: they used to be two separate branches and only one ever
-    /// reached the dismissal path.
-    ///
-    /// **Consuming**, not a read. `clear_frame_state` runs once per redraw
-    /// while this is consulted from `window_event`, on *every* keyboard press —
-    /// so a flag left latched is read again by the next key of any kind, and
-    /// one physical press closes two layers.
+    /// Take this frame's "back out of the thing I am in" press — Escape or the back button
+    /// — if there was one.
     pub fn take_back_out_press(&mut self) -> bool {
         let pressed = self.escape_pressed || self.back_pressed;
         self.escape_pressed = false;
@@ -89,8 +66,7 @@ mod tests {
     use super::*;
     use winit::keyboard::SmolStr;
 
-    /// A key-down, decoded by the shipped `note_key`. `KeyEvent` itself has a
-    /// private field, but the three things that decide anything do not.
+    /// A key-down, decoded by the shipped `note_key`.
     fn press(handler: &mut InputHandler, physical: PhysicalKey, logical: Key, repeat: bool) {
         handler.note_key(physical, &logical, repeat);
     }
@@ -102,8 +78,8 @@ mod tests {
         )
     }
 
-    /// Android's back button and the browser's, which arrive as different
-    /// named keys and must both count.
+    /// Android's back button and the browser's, which arrive as different named keys and
+    /// must both count.
     fn back_keys() -> [(&'static str, (PhysicalKey, Key)); 2] {
         [
             (
@@ -137,8 +113,7 @@ mod tests {
         )
     }
 
-    /// Escape and back must both mean "back out". Only Escape did, which is why
-    /// the back button never reached the code that closes the drawer.
+    /// Escape and back must both mean "back out".
     #[test]
     fn either_key_counts_as_a_back_out() {
         for (name, (physical, logical)) in back_out_keys() {
@@ -160,13 +135,6 @@ mod tests {
     }
 
     /// Auto-repeat is not a second press.
-    ///
-    /// Modelled the way `window_event` really drives this — the press is
-    /// *taken* after each key-down, not once at the end. Setting a bool twice
-    /// is idempotent, so a test that pressed five times and then took once
-    /// would pass with the repeat guard deleted; the damage is one dismissal
-    /// per repeat, and only interleaving shows it. Held Escape would otherwise
-    /// walk the whole dialog stack and then quit, at the OS repeat rate.
     #[test]
     fn holding_a_key_down_is_still_one_press() {
         for (name, (physical, logical)) in back_out_keys() {
@@ -190,10 +158,6 @@ mod tests {
     }
 
     /// One physical press must be spendable once.
-    ///
-    /// `clear_frame_state` runs once per redraw, but `window_event` consults
-    /// this on every keyboard press — so with a non-consuming read, Escape
-    /// followed by any other key before the next frame closed two layers.
     #[test]
     fn a_back_out_press_is_spent_when_it_is_taken() {
         for (name, (physical, logical)) in back_out_keys() {
@@ -209,10 +173,6 @@ mod tests {
     }
 
     /// Escape is read from the physical key and back from the logical one.
-    ///
-    /// Not interchangeable: Android's back button and the browser's arrive as
-    /// named logical keys with no physical keycode this app would recognise,
-    /// and reading Escape logically would lose it under a remapped layout.
     #[test]
     fn each_key_is_read_from_the_side_that_carries_it() {
         let mut logical_only = InputHandler::new();
@@ -241,12 +201,6 @@ mod tests {
     }
 
     /// `process_event` must hand `note_key` the event's own three fields.
-    ///
-    /// Everything above tests `note_key`; nothing can test the call into it,
-    /// because `KeyEvent` cannot be constructed here. Passing a literal for any
-    /// of the three — `false` for `repeat` being the easy slip — leaves every
-    /// test above green while restoring the bug they pin. Reading the source is
-    /// the only handle, as it is for `egui_renderer`'s `begin_frame`.
     #[test]
     fn process_event_forwards_the_events_own_fields() {
         let (_, rest) = include_str!("input.rs")

@@ -1,8 +1,6 @@
 //! A TDWR volume states where its radar is, in whichever of the two scales its
 //! producer used.
 //!
-//! # What went wrong
-//!
 //! The Volume Data Block's `Lat`/`Long` are `Real*4` degrees — ICD 2620002AA
 //! Table XVII-B, *Data Block #1 (Volume Data)*. Older TDWR Level II volumes
 //! carry the **Level III** radar position in those fields instead: ICD
@@ -10,44 +8,14 @@
 //! count of thousandths of a degree, widened into the `Real*4` without being
 //! divided. `TORD20200810_000135_V08` states `41797.0, -87858.0`.
 //!
-//! "Older", and not "written before 2021-09-15", which is what this said until
-//! the switch was measured at more than one radar. It is a **per-site
-//! rollout**: five of the terminal radars below were already writing degrees on
-//! 2021-09-14 while `TORD` was not, and `TMIA` was still writing thousandths on
-//! 2021-09-16. `nexrad_decode`'s `VolumeDataBlock::latitude_raw` carries the
-//! table. The 2020 and 2026 fixtures here sit either side of every site's own
-//! switch whenever it happened, so the pairing is unaffected.
 //!
 //! Read as degrees, thousandths are not a place on Earth, and
 //! [`SitePosition::from_volume`](rustdar_radar::site_position::SitePosition::from_volume)
-//! refused them — correctly, on the evidence it had. Every TDWR volume in the
-//! archive older than its site's switch therefore placed no radar at all, and
-//! the whole terminal network was untestable through any path that needs a
-//! position.
-//!
-//! The reading is in `nexrad-decode`'s `VolumeDataBlock`, which is the one seam
-//! all four consumers of those fields pass through. This file is the check that
-//! it reaches a real volume: bytes off the archive, through
-//! [`decode_chunk`](rustdar_radar::chunks::decode_chunk), to the position the
-//! renderer would place the radar at.
-//!
-//! # The fixtures
-//!
 //! `testdata/` holds twelve files, each a real archive cut down to its first
 //! Message 31: the volume's own 24-byte header verbatim, then that one message
 //! verbatim, re-framed as a single LDM record. Nothing in the message is
 //! synthesised — the Volume Data Block under test is the radar's own bytes —
-//! and the position is restated identically on every radial, so the first one
-//! is the whole of what a position test needs. The largest is 2.6 KB.
 //!
-//! Five TDWR sites, each with one volume from either side of the producer's
-//! correction, and two WSR-88D volumes as the control. The five span 23° of
-//! latitude and 31° of longitude and include the one US site that is not in
-//! CONUS, because a scale rule arbitrated on one radar is a scale rule fitted
-//! to one radar. `TMIA` and `TPHX` were the holdout, checked the same way and
-//! not committed.
-//!
-//! # Where "true coordinates" come from
 //!
 //! Not from another Level II volume, which would make the check circular, and
 //! not from a table in this repository, which was itself read out of volumes.
@@ -55,31 +23,21 @@
 //! product, separately generated, whose radar position is a documented
 //! thousandths field nobody has to guess at. Read off the `NCR` products of
 //! 2026-08-12 with `nexrad_level3`'s own header decoder.
-//!
-//! That the two agree at all is the finding — the pre-correction Level II
-//! producer was writing the Level III field, so recovering the Level III number
-//! from it is exactly the claim being made.
 
 use rustdar_radar::site_position::SitePosition;
 use rustdar_radar::sites::distance_km;
 
 /// A committed fixture, and the position the site's Level III products state.
 struct Fixture {
-    /// The archive key the fixture was cut from.
     name: &'static str,
-    /// The trimmed archive.
     bytes: &'static [u8],
-    /// What the radar writes in its Message 31 headers.
     icao: &'static str,
-    /// Degrees north, from the site's Level III Product Description Block.
     truth_lat: f64,
-    /// Degrees east, from the same.
     truth_lon: f64,
 }
 
 /// The five TDWR sites as they read **before their own switch** — thousandths
 /// of a degree in a field declared in degrees. All five are 2020 volumes, which
-/// is a year clear of the earliest switch any of them made.
 const THOUSANDTHS: [Fixture; 5] = [
     Fixture {
         name: "TORD20200810_000135_V08",
@@ -159,8 +117,6 @@ const DEGREES: [Fixture; 5] = [
 ];
 
 /// The control: two WSR-88D volumes, one from either end of the same span, in
-/// both Volume Data Block formats — `KAMX`'s 2020 volume is the 40-byte block
-/// and `KTLX`'s is the 48-byte one.
 const WSR88D: [Fixture; 2] = [
     Fixture {
         name: "KAMX20200810_000424_V06",
@@ -219,10 +175,6 @@ fn error_km(fixture: &Fixture) -> f64 {
 
 /// Every fixture places its radar where that radar's Level III products place
 /// it.
-///
-/// The five thousandths rows are what fails without the scale being read: each
-/// states a latitude in the tens of thousands of degrees, which `from_volume`
-/// refuses outright, so `position_of` panics before it can measure anything.
 #[test]
 fn every_volume_places_its_radar_where_its_level_three_products_do() {
     for fixture in THOUSANDTHS.iter().chain(&DEGREES).chain(&WSR88D) {
@@ -237,13 +189,6 @@ fn every_volume_places_its_radar_where_its_level_three_products_do() {
 
 /// The two producers describe the same radar, and reading each in its own scale
 /// lands on the same place.
-///
-/// This is the check that the scale is being *read* rather than fitted: the
-/// two volumes of a pair share no bytes in these fields, and 4 of the 5 pairs
-/// come out identical to the micro-degree. `TSJU` is the fifth, and it differs
-/// by one thousandth of a degree of longitude — the old producer wrote
-/// −66.179 where the current one and the Level III stream both say −66.180,
-/// which is 106 m and the finest disagreement its field can express.
 #[test]
 fn both_producers_place_a_radar_alike() {
     let mut identical = Vec::new();
@@ -271,10 +216,6 @@ fn both_producers_place_a_radar_alike() {
 
 /// A WSR-88D decodes to the exact integers it decoded to before any of this,
 /// in both block formats.
-///
-/// Spelled as the micro-degrees rather than as a distance, because that is what
-/// "unchanged" means here: a tolerance would pass a value that had been divided
-/// by a thousand and multiplied back.
 #[test]
 fn a_wsr88d_position_is_the_integer_it_always_was() {
     let expected = [(25_611_084, -80_412_666), (35_333_363, -97_277_763)];
@@ -290,8 +231,6 @@ fn a_wsr88d_position_is_the_integer_it_always_was() {
 }
 
 /// The heights are not part of this and do not move. A TDWR states one figure
-/// twice, which is how [`SitePosition::heights_over`] tells the two instruments
-/// apart, and it states the same figure in both producers.
 #[test]
 fn a_tdwr_states_one_height_twice_in_both_producers() {
     for (old, new) in THOUSANDTHS.iter().zip(&DEGREES) {

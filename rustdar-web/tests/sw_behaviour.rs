@@ -1,12 +1,10 @@
 //! Runs the JavaScript behaviour suites under `cargo test`.
 //!
 //! The caching policy lives in `sw.js` and index.html's bootstrap, which no Rust
-//! code executes; `pwa_assets` only reads them as text. This shim puts the suites
-//! that actually run them under `cargo test --workspace`, which is what CI runs.
+//! code executes. This shim puts the suites that run them under `cargo test`.
 //!
 //! Missing Node is a failure, not a skip — a skip is green on a machine that
-//! never checked. `node --test` has been stable since Node 20 and needs no
-//! packages, lockfile or network.
+//! never checked.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::path::PathBuf;

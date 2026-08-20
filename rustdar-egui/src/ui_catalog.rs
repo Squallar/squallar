@@ -1,32 +1,4 @@
 //! The Add-layer catalog: one modal over everything, four groups, one search.
-//!
-//! Opened by the stack's two `+ Add layer` buttons (plan §1.3), presented as
-//! an [`egui::Modal`] on the two wide widths and as the phone sheet's
-//! full-height Catalog page on Compact — one body
-//! ([`Gui::render_catalog_body`](super::Gui)), two hosts (plan §1.9). The
-//! body is four groups the search filters across:
-//! **Presets** (the compiled-in three plus the user's own, §3.11), the 12
-//! **overlays**, the 17 **radar products** and the 16 **HRRR parameters** —
-//! the real app's real options and nothing else (decision §0: no planned
-//! groups, no SOON badges).
-//!
-//! Clicking a tile *applies* it and closes the catalog: an overlay tile turns
-//! the layer on through the shared enable-fetch helper
-//! ([`Gui::set_pane_overlay_with_fetch`](super::Gui)) and selects it in the
-//! inspector; a product tile aims the active pane at that product (converting
-//! it back to a map if it was not one) and selects the Radar layer; an HRRR
-//! tile enables the model layer, sets the parameter through the handler's own
-//! control route, and selects the model layer. A preset tile rebuilds the
-//! whole layout — see [`Gui::apply_preset`](super::Gui).
-//!
-//! # The catalog renders after everything else
-//!
-//! [`Gui::ui`](super::Gui::ui) calls this after the pane loop, the pending
-//! appliers and the feature popup: every `mem::take` window has closed, so
-//! applying a tile may write panes directly, and a preset may grow the pane
-//! count on the same terms as the region applier. The late draw also stacks
-//! the modal above a feature popup left open, which is the order
-//! `dismiss_top_layer` closes them in.
 
 use crate::actions::GuiAction;
 use rustdar_overlays::hrrr::ModelParameter;
@@ -47,7 +19,6 @@ const CATALOG_WIDTH: f32 = 520.0;
 /// modal stays inside the content rect.
 const HEADER_ALLOWANCE: f32 = 160.0;
 
-/// The close button's glyph — the same × the inspector's deselect uses.
 const CLOSE_LABEL: &str = "\u{d7}";
 
 /// The save tile's label. Drawn only while the search box is empty: the
@@ -57,22 +28,16 @@ const SAVE_TILE_LABEL: &str = "+ Save current view...";
 
 /// One saved multi-pane setup (plan §3.11): how many panes, what each shows,
 /// and which overlays the layout runs with.
-///
-/// Both the domain type ([`Gui::presets`](super::Gui) holds these) and the
-/// wire type (`UiConfig.presets` persists them verbatim) — the shape is flat
-/// enough that a separate config mirror would only be a copy to drift.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct PresetConfig {
     pub name: String,
     pub pane_count: usize,
-    /// Per-pane product and tilt, index-aligned with the layout.
     pub panes: Vec<PresetPane>,
     /// The enabled-overlay set, applied to every pane. A
-    /// [`KindList`](super::config::KindList): since M8b the names are open
-    /// [`LayerId`]s, so one from a newer build costs nothing — it rides in
-    /// [`KindList::known`](super::config::KindList) and is written back on
-    /// save; only the ids the registry serves are ever applied.
+    /// [`KindList`](super::config::KindList): the names are open [`LayerId`]s,
+    /// so one from a newer build rides through save; only ids the registry
+    /// serves are applied.
     pub overlays: super::config::KindList,
 }
 
@@ -87,13 +52,11 @@ impl Default for PresetConfig {
     }
 }
 
-/// One pane of a preset: what it shows.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct PresetPane {
-    /// Tolerant of product names this build does not know, exactly as the
-    /// pane configs are — one product from a newer build must not poison the
-    /// whole file. See [`product_or_default`](super::config).
+    /// Tolerant of product names this build does not know. See
+    /// [`product_or_default`](super::config).
     #[serde(deserialize_with = "super::config::product_or_default")]
     pub product: RadarProduct,
     pub elevation: f32,
@@ -109,21 +72,13 @@ impl Default for PresetPane {
 }
 
 /// The compiled-in presets (§1.10's three), built fresh per call — they hold
-/// `String`s and `Vec`s, so a `const` table is not on offer; being a function
-/// of nothing is the same guarantee. Never persisted: the user's file holds
-/// only their own.
-///
-/// The demo named the presets and their intent; the products are this
-/// codebase's own variants chosen to honour it — base tilt everywhere, since
-/// a preset is a starting arrangement rather than a saved investigation.
+/// `String`s and `Vec`s, so a `const` table is not on offer. Never persisted.
 pub(crate) fn builtin_presets() -> [PresetConfig; 3] {
     let pane = |product| PresetPane {
         product,
         elevation: 0.5,
     };
     [
-        // Chasing severe convection: reflectivity beside the three velocity
-        // readings of rotation, under the full severe-weather overlay set.
         PresetConfig {
             name: "Severe Wx".into(),
             pane_count: 4,
@@ -144,7 +99,6 @@ pub(crate) fn builtin_presets() -> [PresetConfig; 3] {
             ]
             .into(),
         },
-        // Watching rain fall and add up.
         PresetConfig {
             name: "Rainfall".into(),
             pane_count: 2,
@@ -160,8 +114,6 @@ pub(crate) fn builtin_presets() -> [PresetConfig; 3] {
             ]
             .into(),
         },
-        // Flying around weather: echo tops for the vertical extent, METAR and
-        // lightning for the field conditions.
         PresetConfig {
             name: "Aviation".into(),
             pane_count: 3,
@@ -182,7 +134,6 @@ pub(crate) fn builtin_presets() -> [PresetConfig; 3] {
     ]
 }
 
-/// Which group a drawn tile belongs to.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CatalogGroup {
@@ -193,39 +144,26 @@ pub(crate) enum CatalogGroup {
 }
 
 /// One tile the catalog actually drew, as it was drawn — reported by the
-/// renderer, never rebuilt by a test; see `ui_menu::DrawnMenuLeaf` for the
-/// pattern.
+/// renderer, never rebuilt by a test.
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CatalogTileProbe {
     pub group: CatalogGroup,
     pub label: String,
     pub rect: egui::Rect,
-    /// The × delete button beside a *user* preset tile — `None` on every
-    /// other tile, built-ins included: deleting a compiled-in preset is not
-    /// on offer.
     pub delete: Option<egui::Rect>,
 }
 
-/// What the catalog drew last frame.
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CatalogProbe {
-    /// Whether the catalog was on screen this frame.
     pub open: bool,
-    /// The modal content's whole rect.
     pub rect: egui::Rect,
-    /// The search field.
     pub search: egui::Rect,
-    /// The × close button.
     pub close: egui::Rect,
-    /// The "Save current view…" tile — [`egui::Rect::NOTHING`] while the
-    /// search hides it.
     pub save_tile: egui::Rect,
-    /// The inline name field and Save button, while the save editor is open.
     pub save_field: Option<egui::Rect>,
     pub save_button: Option<egui::Rect>,
-    /// Every tile drawn, in draw order.
     pub tiles: Vec<CatalogTileProbe>,
 }
 
@@ -253,12 +191,7 @@ fn matches_query(query: &str, label: &str) -> bool {
 
 impl super::Gui {
     /// Draw the catalog, when it is open — as the centred modal the two wide
-    /// widths get. On Compact the sheet's Catalog page hosts the same body
-    /// (plan §1.9: the phone never draws a modal), so this returns without
-    /// drawing there.
-    ///
-    /// Runs from [`Gui::ui`](super::Gui::ui) after the pane loop and the
-    /// appliers — see the module note for why that ordering is load-bearing.
+    /// widths get. On Compact the sheet's Catalog page hosts the same body.
     pub(super) fn render_catalog(&mut self, ctx: &egui::Context, actions: &mut Vec<GuiAction>) {
         if !self.catalog_open || self.layout.width == crate::ui_layout::WidthClass::Compact {
             return;
@@ -285,9 +218,6 @@ impl super::Gui {
         });
 
         if modal.backdrop_response.clicked() {
-            // The backdrop half of the dismissal contract; Escape goes
-            // through `dismiss_top_layer`, which the frontend resolves
-            // outside egui's own handling.
             self.catalog_open = false;
         }
 
@@ -301,9 +231,7 @@ impl super::Gui {
     }
 
     /// The catalog's content, host-free: header (title, search, ✕), then the
-    /// scrolling groups. The modal above and the sheet's Catalog page both
-    /// call this, so the two presentations cannot drift. `max_body` caps the
-    /// scroll — the host knows its own room.
+    /// scrolling groups, shared by the modal and the sheet's Catalog page.
     pub(super) fn render_catalog_body(
         &mut self,
         ui: &mut egui::Ui,
@@ -328,12 +256,8 @@ impl super::Gui {
                     // `catalog_scroll` below and `sheet_feature_scroll`
                     // (`ui_sheet.rs`): the salts are stable, but the parent
                     // layer is the modal above 600 pt and the phone sheet
-                    // below it, so the ids resolve differently either side
-                    // and egui-side state — this field's cursor, the
-                    // scroll's offset — does not carry across the
-                    // breakpoint. Gui-side state (`catalog_query`) does.
-                    // Contract 14's probed set (`widget_id_probes`) excludes
-                    // all three on purpose.
+                    // below it, so the ids resolve differently either side and
+                    // egui-side state does not carry across the breakpoint.
                     let search = ui.add_sized(
                         egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
                         egui::TextEdit::singleline(&mut self.catalog_query)
@@ -485,8 +409,6 @@ impl super::Gui {
         let shown_user: Vec<usize> = (0..self.presets.len())
             .filter(|&i| matches_query(query, &self.presets[i].name))
             .collect();
-        // The save tile shows only on the unfiltered view — see
-        // [`SAVE_TILE_LABEL`].
         let offer_save = query.is_empty();
         if shown_builtin.is_empty() && shown_user.is_empty() && !offer_save {
             return;
@@ -556,10 +478,8 @@ impl super::Gui {
         if self.catalog_saving && offer_save {
             // A name a built-in already owns is refused, with the reason
             // inline: a user preset named "Severe Wx" would put two
-            // identical tiles on screen with only one deletable, and the
-            // built-ins cannot be replaced the way a user's own are.
-            // Case-insensitive, because "severe wx" would make two tiles a
-            // glance cannot tell apart either.
+            // identical tiles on screen with only one deletable.
+            // Case-insensitive, because "severe wx" would too.
             let name = self.catalog_save_name.trim().to_owned();
             let shadows_builtin = builtin_presets()
                 .iter()
@@ -585,13 +505,9 @@ impl super::Gui {
                 if save.clicked() {
                     let preset = self.capture_preset(name.clone());
                     // Saving under an existing user preset's name replaces
-                    // it: two tiles with one name would be two buttons the
-                    // user cannot tell apart. Case-insensitive, on the same
-                    // reasoning as the built-in refusal above — "storm" and
-                    // "Storm" are two tiles a glance cannot tell apart — and
-                    // the replacement takes the newly typed casing. Built-in
-                    // names never get this far — the refusal disables Save
-                    // for them.
+                    // it: two tiles with one name would be two buttons the user
+                    // cannot tell apart. Case-insensitive; the replacement takes
+                    // the newly typed casing. Built-in names never get this far.
                     if let Some(existing) = self
                         .presets
                         .iter_mut()
@@ -641,9 +557,6 @@ impl super::Gui {
     fn catalog_apply_product(&mut self, product: RadarProduct) {
         let idx = self.active_pane;
         if !self.panes[idx].is_map() {
-            // Through the deferred applier like every other view writer: the
-            // direct write would be safe *here*, but one rule for all of them
-            // costs only a frame.
             self.request_pane_view(idx, rustdar_radar::types::RenderView::PlanView);
         }
         // A product tile means "show me this picture", so the Radar layer
@@ -659,8 +572,6 @@ impl super::Gui {
         let pane = &mut self.panes[idx];
         if pane.selected_product != product {
             pane.selected_product = product;
-            // The tilt belonged to the old product — the same reset the
-            // inspector's product combo makes.
             pane.selected_elevation = 0.0;
         }
         self.propagate_layer_sync();
@@ -731,22 +642,6 @@ impl super::Gui {
 
     /// Rebuild the layout from `preset`: pane count, per-pane product and
     /// tilt with every pane a map again, and the overlay set on each pane.
-    ///
-    /// Runs outside every `mem::take` window (the module note), so the kind
-    /// writes are direct on the same terms as `apply_pending_region`'s. A
-    /// volume pane converted away releases its voxel grid exactly as the
-    /// deferred applier would have.
-    ///
-    /// # Presets ignore the per-pane links, and leave them alone (M11)
-    ///
-    /// A preset sets up a whole workspace, so apply writes **every** pane it
-    /// configures — a layer-unlinked pane included; skipping it would build
-    /// half the workspace the tile promised, with nothing to say why — and
-    /// touches **no** link: which panes move together afterwards is the
-    /// user's standing arrangement, not part of the picture the preset
-    /// captured. The trailing `propagate_layer_sync` then applies the
-    /// ordinary per-pane gates, converging exactly the linked group and no
-    /// one else.
     fn apply_preset(&mut self, preset: &PresetConfig, actions: &mut Vec<GuiAction>) {
         let count = preset.pane_count.clamp(1, self.layout.width.max_panes());
         let _ = self.set_pane_count(count);
@@ -764,15 +659,9 @@ impl super::Gui {
             }
         }
 
-        // The overlay set, pane by pane through the shared helper — both
-        // halves of every flip, and at most one fetch per newly-enabled kind
-        // (the helper's dedupe).
         for idx in 0..count {
             let mut pane = std::mem::take(&mut self.panes[idx]);
             for kind in self.overlays.default_draw_order() {
-                // Only the ids the registry serves are applied; an id from a
-                // newer build keeps riding in `overlays.known`, which the
-                // save writes back verbatim.
                 let on = preset.overlays.known.contains(&kind);
                 self.set_pane_overlay_with_fetch(&mut pane, idx, &kind, on, actions);
             }

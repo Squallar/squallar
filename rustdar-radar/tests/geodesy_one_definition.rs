@@ -1,87 +1,9 @@
 //! One planet for horizontal geodesy, enforced by scanning the workspace.
-//!
-//! `rustdar_geo::EARTH_RADIUS_KM` and the
-//! `rustdar_geo::KM_PER_DEGREE_LAT` derived from it are the *only*
-//! sphere anything in this workspace may convert between degrees and ground
-//! kilometres on. That was not true: `render_gate` placed gates on 6371 while
-//! `ImageBounds`, the plan-view range ring, `volume.wgsl`'s floor and the
-//! region-drag preview all framed them with a literal `111.32` (a 6378.1 km
-//! equatorial sphere) and `volume_view` reduced the pane affine with a literal
-//! `111.319_49`. Three planets, 0.11 % apart, biased one way — so echoes sat
-//! consistently outside the geography drawn under them and the error grew with
-//! range.
-//!
-//! # Why a scan and not a comment
-//!
-//! Every one of those sites already carried a comment saying which convention
-//! it followed and why. Comments are not guards: each duplicate was added by
-//! someone who read the neighbouring comment, believed it, and copied the
-//! number anyway. The single-source arrangement removes the *reason* to write
-//! a fourth — `KM_PER_DEGREE_LAT` is an expression over `EARTH_RADIUS_KM`, so
-//! there is nothing to keep in sync — and this scan removes the *ability*.
-//!
-//! # What it looks at
-//!
-//! Every `.rs` and `.wgsl` file in the workspace, with comments and string and
-//! char literals blanked out first, so a number quoted in prose or in an
-//! assertion message is inert and only a number the compiler sees can fail
-//! this. Any positive numeric literal landing in one of [`BANDS`] must be at a
-//! site named in [`ALLOWED`], each with the reason it is not the shared
-//! constant. There is no wildcard.
-//!
-//! **Negative literals are skipped**, which is what keeps CONUS longitudes
-//! (`-111.19833`, `-110.63028`) out: a conversion factor is never negative and
-//! a longitude in this hemisphere always is.
-//!
-//! # What it deliberately does not look at
-//!
-//! *Metres.* `rustdar-overlays`'s Lambert projection is parameterised by the
-//! ellipsoid in the GRIB message (`LambertConformalConic::new(a, b, ..)`) and
-//! holds no radius constant at all; the metre-scale figures in its tests are
-//! PROJ reference fixtures for a datum that is genuinely not this one
-//! (6 371 229 m for HRRR's sphere, Clarke 1866 for Snyder's worked example).
-//! Those are a different projection's inputs, not a second opinion about this
-//! one, so the scan stays in kilometres — the unit the radar crate's geodesy
-//! is written in.
-//!
-//! *Refraction.* `beam::RE_EFF_KM` and the `1.21 · Re` Level III models are in
-//! [`ALLOWED`] rather than excluded, because they are exactly the sites a
-//! careless unification would "fix". Their entries say why they must not be.
-//!
-//! # The Web Mercator latitude limit rides along
-//!
-//! `rustdar_geo::MERCATOR_LAT_LIMIT_DEG` — 85.051128779806°, the latitude whose
-//! projected `y` is exactly `π` — went the same way and for the same reason.
-//! Three modules each spelled it `85.05`: the tile helpers, `overlay_cache`
-//! and `rustdar-overlays`'s `render::rasterize`. Two were repaired one at a
-//! time, and the third was *missed by the commit that repaired the second* —
-//! which is the whole argument for a scan. That truncation is 0.0011287798°
-//! short, 125.51 m of meridian, and in the rasterizer's case it desynchronised
-//! the Y-range a texture was drawn for from the Y-range it was placed
-//! between.
-//!
-//! Its band is deliberately narrow — see [`BANDS`] — and it is the one band
-//! test files are exempt from, see [`is_test_file`].
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::path::{Path, PathBuf};
 
 /// Value ranges a literal must not land in without an entry in [`ALLOWED`].
-///
-/// The degree band stops at 111.9 rather than at 112 so it spans exactly the
-/// real spread of a degree of latitude — 110.57 km at the equator to 111.69 at
-/// the poles — and no further; `112.0` in the wild is a pixel or a colour
-/// channel, never a geodesy figure.
-///
-/// The Mercator band starts at 85.04 rather than at 85.0 for the same kind of
-/// reason, measured the same way. The limit is 85.051128779806°, so every
-/// spelling of it anybody actually writes — `85.05`, `85.0511`,
-/// `85.05112878` — is at or above 85.05, while a figure rounded as far as
-/// `85.0` is 5.7 km short and is nobody's statement of a projection limit.
-/// Bare `85.0` *is* four things in this workspace, none of them a latitude:
-/// `palette.rs`'s 85 dBZ colour stop, `nrot.rs`'s rot-divisor table row and
-/// its assertion, and a green channel in `rasterize.rs`. Starting the band
-/// above them is what keeps this guard from crying wolf at a colour table.
 const BANDS: &[(&str, f64, f64)] = &[
     ("earth radius, km", 6300.0, 6400.0),
     ("km per degree", 110.5, 111.9),
@@ -98,13 +20,7 @@ const MERCATOR_BAND: &str = "mercator latitude limit";
 
 /// Every site in the workspace permitted to name one of [`BANDS`]' numbers,
 /// with the reason it is not `EARTH_RADIUS_KM` or `KM_PER_DEGREE_LAT`.
-///
-/// Matched as `(path suffix, substring of the stripped line)`. The substring
-/// is what makes an entry a licence for *one statement* rather than for a
-/// file: moving the constant is fine, quietly adding a second one beside it is
-/// not.
 const ALLOWED: &[(&str, &str, &str)] = &[
-    // ── The definition ──────────────────────────────────────────────────
     (
         "rustdar-geo/src/lib.rs",
         "pub const EARTH_RADIUS_KM: f64 = 6371.0;",
@@ -119,7 +35,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          reaches it by re-export rather than restating it, so this is the \
          only literal spelling in non-test code.",
     ),
-    // ── Atmospheric refraction: a different physical quantity ───────────
     (
         "rustdar-radar/src/beam.rs",
         "pub const RE_EFF_KM: f64 = 6371.0 * 4.0 / 3.0;",
@@ -158,7 +73,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          shown to differ from `RPG_HEIGHT_QUADRATIC_PER_KM`'s 1.21 model, \
          which `eet` uses to match its Level III twin bit-for-bit.",
     ),
-    // ── Tests that pin the refraction spellings ─────────────────────────
     (
         "rustdar-radar/src/beam/tests.rs",
         "let volumetric_spelling: f64 = 6371.0 * 4.0 / 3.0;",
@@ -183,7 +97,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "Asserts the definition's value, which is the one place a literal \
          6371 in an assertion is the point.",
     ),
-    // ── The one hand-written copy outside Rust ──────────────────────────
     (
         "rustdar-volumetric/src/volume.wgsl",
         "const KM_PER_DEGREE_LAT: f32 = 111.194927;",
@@ -196,10 +109,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
 
 /// Blank out comments and string/char literals, preserving byte offsets and
 /// line breaks so a hit still reports its own line.
-///
-/// Handles nested `/* */`, raw strings with any hash count, and escapes. Good
-/// enough for both Rust and WGSL, whose comment and string syntax Rust's is a
-/// superset of.
 fn strip_comments_and_strings(src: &str) -> String {
     let bytes: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
@@ -310,20 +219,6 @@ fn strip_comments_and_strings(src: &str) -> String {
 
 /// Every `.rs` and `.wgsl` file under the workspace root, skipping build
 /// output, nested checkouts and this file.
-///
-/// `.claude` is skipped because agent worktrees live under it — full copies of
-/// the repository at whatever commit they forked from. Scanning them reports
-/// every duplicate this guard ever removed, from trees that are not this one:
-/// 1566 findings on a developer box with worktrees present, and none in CI,
-/// where a fresh clone has no `.claude/worktrees`. A guard that fires only off
-/// CI is one people learn to ignore.
-///
-/// The self-exclusion is not a loophole: [`BANDS`] has to *state* the numbers
-/// it is looking for, so the scanner is the one file that cannot pass its own
-/// scan. `comments_and_string_literals_are_inert` and
-/// `a_fresh_duplicate_would_be_caught` are what cover this file instead — they
-/// exercise the stripper and the band test directly, which is stronger than
-/// scanning it would be.
 fn sources(dir: &Path, into: &mut Vec<PathBuf>) {
     let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
     for entry in entries {
@@ -344,22 +239,6 @@ fn sources(dir: &Path, into: &mut Vec<PathBuf>) {
 }
 
 /// Whether a workspace-relative path is a test file by name.
-///
-/// Only [`MERCATOR_BAND`] consults this, and only because the projection's own
-/// tests have to be able to *quote* latitudes at the limit to check what
-/// happens there. `tiles/tests.rs` carries fourteen of them — the limit to
-/// every digit, one ulp either side of it, and `85.05` itself, whose whole job
-/// is to be shown measurably short. Those are reference vectors checked
-/// against `mercantile`, deliberately written as literals so the table cannot
-/// validate the constant against itself, and making each one ask [`ALLOWED`]
-/// for permission would turn the guard into a form to fill in.
-///
-/// The two geodesy bands get no such exemption, because their duplicates
-/// *were* in test code as often as not and every one of them is in [`ALLOWED`]
-/// by name.
-///
-/// This is by filename, so a `#[cfg(test)] mod tests` inside an ordinary
-/// source file is still scanned — `nrot.rs`'s inline tests are, and should be.
 fn is_test_file(relative: &str) -> bool {
     let name = relative.rsplit('/').next().unwrap_or(relative);
     relative.contains("/tests/") || name == "tests.rs" || name.ends_with("_tests.rs")
@@ -431,10 +310,6 @@ fn scan() -> Vec<Hit> {
 }
 
 /// Positive numeric literals in a line of stripped code, as `(offset, text)`.
-///
-/// A run of digits, underscores and dots that starts where an identifier,
-/// another number or a field access cannot be continuing, and whose nearest
-/// non-space predecessor is not a minus sign.
 fn numeric_literals(line: &str) -> Vec<(usize, &str)> {
     let bytes = line.as_bytes();
     let mut out = Vec::new();
@@ -476,10 +351,6 @@ fn numeric_literals(line: &str) -> Vec<(usize, &str)> {
 /// No file in the workspace names an earth radius, a kilometres-per-degree
 /// figure or the Web Mercator latitude limit in code, unless [`ALLOWED`] says
 /// why.
-///
-/// The failure message is the whole point: it prints the offending line and
-/// tells the author the two things they can do about it, so the guard reads as
-/// guidance rather than as an obstacle.
 #[test]
 fn horizontal_geodesy_has_exactly_one_definition() {
     let mut unexplained = Vec::new();
@@ -522,9 +393,6 @@ fn horizontal_geodesy_has_exactly_one_definition() {
 
 /// Every [`ALLOWED`] entry still matches something, so the list cannot rot
 /// into a set of licences for code that no longer exists.
-///
-/// Without this, deleting an exception leaves a stale entry that would quietly
-/// re-permit the same literal if it ever came back.
 #[test]
 fn no_allowance_outlives_the_code_it_excuses() {
     let hits = scan();
@@ -606,10 +474,6 @@ fn a_fresh_duplicate_would_be_caught() {
         );
     }
 
-    // And the exclusions really do exclude: a CONUS longitude and a tower
-    // height are not conversion factors, and a bare `85.0` is a dBZ stop, a
-    // table row or a colour channel — every one of those is real code in this
-    // workspace, quoted from `palette.rs`, `nrot.rs` and `rasterize.rs`.
     for benign in [
         "min_lon: -111.1424,",
         "tower_ft: 112,",
@@ -632,10 +496,6 @@ fn a_fresh_duplicate_would_be_caught() {
 }
 
 /// The one exemption in this file recognises test files and nothing else.
-///
-/// It is spelled by filename, so it is exactly as wide as its name suggests —
-/// which is worth pinning, because a looser rule (any path containing `test`)
-/// would quietly exempt real source and the guard would still pass.
 #[test]
 fn only_files_named_as_tests_are_exempt() {
     for path in [

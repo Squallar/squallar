@@ -22,8 +22,6 @@ fn monospace_size(layout: &LayoutCtx) -> f32 {
 }
 
 /// Show a centered detail popup window sized for the current layout.
-///
-/// Returns `true` if the user closed the popup (via the X button).
 fn show_detail_popup(
     ctx: &egui::Context,
     layout: &LayoutCtx,
@@ -39,14 +37,6 @@ fn show_detail_popup(
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
-        // Since egui 0.35 (#7725, "rework `Window` margins") this is the window's
-        // OUTER width — it used to size the content. Content is now narrower by
-        // 2 x (`spacing.window_margin` + `visuals.window_stroke`), 14px at the
-        // stock theme. Deliberately not compensated: when compact `popup_width`
-        // is `content - 32`, which reads as "a 16px gutter each side", and only
-        // the new meaning actually delivers that. Adding 14 back would restore
-        // the old content width but hardcode a theme-derived constant that rots
-        // the moment the style changes.
         .default_width(popup_width)
         .pivot(egui::Align2::CENTER_CENTER)
         .default_pos(layout.dialog_center())
@@ -86,10 +76,6 @@ fn render_popup_sections(
                 ui.label(rt);
             }
             PopupSection::KeyValueGrid(rows) => {
-                // Section-indexed, not a fixed salt: two grids in one popup
-                // used to share `"popup_kv_grid"`, so egui keyed both grids'
-                // column-width state on one id and the second grid laid its
-                // columns out to the first grid's widths.
                 egui::Grid::new(ui.id().with(("popup_kv", idx)))
                     .num_columns(2)
                     .show(ui, |ui| {
@@ -127,7 +113,6 @@ fn render_popup_sections(
         }
     }
 
-    // Action buttons
     if !content.actions.is_empty() {
         ui.add_space(6.0);
         ui.separator();
@@ -146,16 +131,11 @@ impl super::Gui {
     /// wide widths get. On Compact the sheet's Feature page hosts the same
     /// body ([`Self::render_feature_page_body`]); the phone never draws this
     /// window (plan §1.9).
-    ///
-    /// Shows the currently selected overlay item with prev/next navigation
-    /// when multiple overlays are stacked. Fully generic — uses PopupContent
-    /// descriptors from the overlay crate.
     pub(super) fn render_overlay_popup(&mut self, ctx: &egui::Context) {
         if self.overlays.selected_overlays.is_empty() || self.layout.width == WidthClass::Compact {
             return;
         }
 
-        // Clamp page index
         let count = self.overlays.selected_overlays.len();
         if self.overlays.selected_overlay_page >= count {
             self.overlays.selected_overlay_page = count - 1;
@@ -164,7 +144,6 @@ impl super::Gui {
         let page = self.overlays.selected_overlay_page;
         let current = self.overlays.selected_overlays[page].clone();
 
-        // Build popup content from overlay data
         let content = self.overlays.popup_content(&*current, &self.preferences);
 
         let accent = egui::Color32::from_rgb(
@@ -200,8 +179,6 @@ impl super::Gui {
 
     /// The current feature page's title and accent, for the sheet's title
     /// row — the same values the window above puts in its own title bar.
-    /// `None` only when nothing is selected, in which case there is no
-    /// Feature page to be titling.
     pub(super) fn feature_page_heading(&self) -> Option<(String, egui::Color32)> {
         let count = self.overlays.selected_overlays.len();
         if count == 0 {
@@ -220,12 +197,7 @@ impl super::Gui {
         ))
     }
 
-    /// The feature dialog's content, host-free, for the sheet's Feature page:
-    /// the overlap pager, the sections and the action buttons — the same
-    /// pieces the window assembles, over the same handling, so the two
-    /// presentations cannot mean different things. The page flag is
-    /// `selected_overlays` itself; the sheet's ✕ and the dismissal chain
-    /// clear it, so no close affordance is drawn here.
+    /// The feature dialog's content, host-free, for the sheet's Feature page.
     pub(super) fn render_feature_page_body(&mut self, ui: &mut egui::Ui) {
         let count = self.overlays.selected_overlays.len();
         if count == 0 {
@@ -248,16 +220,6 @@ impl super::Gui {
     }
 
     /// Apply this frame's triggered action buttons — the **first one only**.
-    ///
-    /// The render loop above trusts `clicked()` per button, so nothing shapes
-    /// `triggered` to one entry. egui 0.35's pointer path happens to: the
-    /// interaction snapshot holds a single clicked id, and a focused button's
-    /// Enter-click is re-read after a same-frame pointer click has surrendered
-    /// its focus. But an AccessKit click request fires `clicked()` with no
-    /// pointer involved, and none of that is this code's contract to lean on.
-    /// Two entries used to both run: each removal indexes `page` into a vector
-    /// the previous removal already shortened, so the second removed — or
-    /// panicked on — a page nobody pressed a button for.
     fn handle_triggered_popup_actions(
         &mut self,
         content: &PopupContent,
@@ -366,10 +328,6 @@ mod tests {
     }
 
     /// Two grids in one popup keep their own column widths.
-    ///
-    /// They used to share the fixed egui id `"popup_kv_grid"`, so both grids'
-    /// column-width state lived under one key and the second grid indented its
-    /// values to the first grid's much wider key column.
     #[test]
     fn each_kv_grid_in_a_popup_lays_out_its_own_columns() {
         let mut h = InputHarness::new();
@@ -419,15 +377,6 @@ mod tests {
 
     /// One frame handles at most one popup action, however many buttons the
     /// renderer reported as clicked.
-    ///
-    /// The two-trigger frame is driven into the shipped handler directly
-    /// rather than through synthetic input, because egui 0.35's pointer path
-    /// cannot produce it (verified against the source: the interaction
-    /// snapshot holds one clicked id, and a focused button's Enter-click is
-    /// re-read after a same-frame pointer click has surrendered its focus) —
-    /// while an AccessKit click request still can, and nothing makes the
-    /// renderer's per-button `clicked()` loop one-entry by contract. The
-    /// handler is what the guard lives in, so the handler is what is held.
     #[test]
     fn one_frame_handles_at_most_one_popup_action() {
         let mut gui = crate::Gui::new();

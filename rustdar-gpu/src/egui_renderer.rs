@@ -11,147 +11,77 @@ pub struct EguiRenderer {
     state: State,
     renderer: Renderer,
     applied_visuals_dark: Option<bool>,
-    /// The attachments [`EguiRenderer::draw`]'s render pass has. Recorded at
-    /// construction because there is nowhere else to read them back from — see
-    /// [`AttachmentConfig`].
+    /// The attachments [`EguiRenderer::draw`]'s render pass has.
     attachment_config: AttachmentConfig,
-    /// Where egui's texture deltas actually cross PCIe. See
-    /// [`texture_upload`] for why they no longer do it in one go.
+    /// Where egui's texture deltas actually cross PCIe.
     uploads: texture_upload::TextureUploads,
 }
 
-/// The attachment layout of the egui render pass.
-///
-/// A `wgpu::RenderPipeline` has to declare the colour format, depth-stencil
-/// state and sample count of the pass it will be used in; a mismatch is a
-/// validation error at `create_render_pipeline`, and `create_render_pipeline`
-/// does not return `Result`. So anything building a pipeline that draws into
-/// egui's own pass has to be told these three, and `egui_wgpu::Renderer` exposes
-/// none of them — hence recording them on the way past.
-///
-/// **The volume raymarch is not the consumer.** It renders into an offscreen
-/// `Rgba8Unorm` target of its own, so it is bound by that target's format rather
-/// than by this. The consumer is the **blit quad** that composites that target
-/// into egui's pass, which is the one pipeline that genuinely has to match.
+/// The attachment layout of the egui render pass. A pipeline drawing into it
+/// must declare these three, and `egui_wgpu::Renderer` exposes none of them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttachmentConfig {
-    /// The colour attachment's format — the swapchain's, in practice.
-    ///
-    /// Note this is deliberately *not* always non-sRGB.
-    /// `device::preferred_surface_format` prefers a non-sRGB format on
-    /// wasm32 and prefers `Bgra8Unorm` — also non-sRGB — natively, falling back
-    /// to `capabilities.formats[0]` only on an adapter that does not offer it.
-    /// So an sRGB format here is the *rare* case rather than the routine
-    /// native one, which is exactly why nothing may assume either way: anything
-    /// that has to match egui's gamma convention must key off
-    /// `TextureFormat::is_srgb` on this value.
+    /// The swapchain's format. May be sRGB or not, so anything matching egui's
+    /// gamma convention must key off `TextureFormat::is_srgb` on this value.
     pub color_format: TextureFormat,
     /// The depth-stencil attachment's format, or `None` when the pass has none.
-    /// `EguiRenderer::draw` attaches no depth buffer today.
     pub depth_format: Option<TextureFormat>,
     /// Samples per pixel in the pass. 1 today, i.e. MSAA off.
     pub msaa_samples: u32,
 }
 
 /// How large the mirror is drawn, and how often that is allowed to change.
-///
-/// Its own module because the decision grew from "halve until it fits" into a
-/// rung keyed to the 3D camera, with a hysteresis and a dwell — none of which
-/// has anything to do with the pass below that draws it.
 mod mirror;
 
 pub use mirror::{
     MIRROR_RUNG_DWELL_FRAMES, MIRROR_RUNG_HYSTERESIS, MIRROR_SCALE_MAX, MirrorLimits, MirrorPlan,
     MirrorRungs, mirror_plan, mirror_size_for, wanted_scale_for,
 };
-// The side cap lives in the floor crate (WO-RD moved it beside the mirror
-// byte cascade); re-exported here so the mirror's own consumers and tests keep
-// one spelling beside the mirror vocabulary above. New readers outside this
-// crate import rustdar_device_profile directly.
 pub use rustdar_device_profile::constants::MIRROR_MAX_SIDE;
 
 /// How a texture delta gets onto the GPU without the frame paying for it.
-///
-/// Its own module because it is a whole upload strategy — row bands, a staging
-/// ring, a fallback and the arithmetic that bounds all three — and none of it is
-/// about the pass below that draws the result.
 pub mod texture_upload;
 
-/// What the mirror pass is asked to copy, and where to put it.
-///
-/// The 3D view's map floor is not a picture built for the floor: it is the
-/// pane's **own map render**, drawn into an off-screen strip below the frame and
-/// copied here for the raymarch to sample. Every layer the pane has — tiles, the
-/// radar raster, outlooks, alerts, storm reports, lightning, METARs, the
-/// location dot, labels — lands on the floor for free and stays in step with the
-/// pane's own options by construction, because it *is* the pane's own geometry.
+/// What the mirror pass is asked to copy, and where to put it. The 3D view's
+/// map floor is the pane's own map render, drawn into an off-screen strip below
+/// the frame and copied here for the raymarch to sample.
 pub struct MirrorRequest<'a> {
     /// The colour attachment to draw into. Must have the same sRGB-ness as the
-    /// swapchain — `egui_wgpu` picked its fragment entry point from the
-    /// swapchain's format once, at `Renderer::new`, and that same pipeline
-    /// draws this.
+    /// swapchain, whose format picked egui's fragment entry point at
+    /// `Renderer::new`.
     pub view: &'a wgpu::TextureView,
     /// The mirror's size in texels and the scale to draw at, from
     /// [`mirror_size_for`].
     pub size_in_pixels: [u32; 2],
     /// See [`mirror_size_for`].
     pub pixels_per_point: f32,
-    /// The strips, in points, whose primitives are copied — every one of them
-    /// below the frame's bottom edge. Everything outside them is left
-    /// transparent, which the shader reads as "no ground here".
+    /// The strips, in points, whose primitives are copied — all below the
+    /// frame's bottom edge. Outside them stays transparent: "no ground here".
     pub source_rects: &'a [egui::Rect],
 }
 
-/// An egui pass that has been ended, tessellated and uploaded.
-///
-/// Holding one is proof that [`EguiRenderer::end_pass_and_upload`] already ran,
-/// which is the ordering guarantee the frame path depends on.
+/// An egui pass that has been ended, tessellated and uploaded. Holding one is
+/// proof that [`EguiRenderer::end_pass_and_upload`] already ran.
 pub struct PreparedFrame {
     tris: Vec<egui::ClippedPrimitive>,
     /// The descriptor this geometry was built for. Carried with the geometry so
     /// the draw cannot be clipped at a different scale than it was laid out at.
     screen_descriptor: ScreenDescriptor,
-    /// Textures egui retired this frame.
     textures_to_free: Vec<egui::TextureId>,
-    /// How soon egui asked to be painted again — the root viewport's
-    /// `repaint_delay` off `FullOutput::viewport_output`. `Duration::ZERO`
-    /// while an animation is in flight (`animate_bool_with_time` calls
-    /// `request_repaint` every frame it interpolates), a finite delay for a
-    /// timed request (`request_repaint_after` — the text cursor's blink),
-    /// and `Duration::MAX` when nothing asked.
-    ///
-    /// This field exists because dropping it — which this code did until the
-    /// second user test's "panel close shudders" finding — means the app
-    /// loop, which runs on `ControlFlow::Wait`, never learns egui wants
-    /// another frame: an open/close animation advanced only on the frames
-    /// the click's own events happened to produce (press, release, a stray
-    /// move — the reported ~3 frames) and then froze until the next input.
-    /// Honoured by `App::handle_redraw` via the app side's `repaint_action`
-    /// (rustdar-app's `app` module).
+    /// The root viewport's `repaint_delay`: `ZERO` while an animation is in
+    /// flight, a finite delay for a timed request, `MAX` when nothing asked.
+    /// Honoured by the app side's `repaint_action`; the loop runs on
+    /// `ControlFlow::Wait`, so dropping it strands the animation.
     repaint_delay: std::time::Duration,
-    /// Command buffers egui collected from this frame's paint callbacks.
-    ///
-    /// `egui_wgpu::Renderer::update_buffers` returns whatever every
-    /// [`egui_wgpu::CallbackTrait::prepare`] and `finish_prepare` handed back
-    /// (`egui-wgpu-0.35.0/src/renderer.rs:1050-1075`), and that return is *not*
-    /// `#[must_use]`. This field exists because dropping it — which this code did
-    /// until the fix — means a callback recording into its own command buffers
-    /// renders nothing at all, with no validation error and no warning anywhere.
-    ///
-    /// Drained by [`PreparedFrame::submit`].
+    /// Command buffers egui collected from this frame's paint callbacks
+    /// (`egui-wgpu-0.35.0/src/renderer.rs:1050-1075`). `update_buffers`' return
+    /// is *not* `#[must_use]`, and dropping it makes a callback render nothing
+    /// at all, with no validation error. Drained by [`PreparedFrame::submit`].
     user_command_buffers: Vec<wgpu::CommandBuffer>,
 }
 
-/// Order a frame's command buffers the way egui-wgpu documents.
-///
-/// The callbacks' buffers go first and egui's own last. This is not cosmetic:
-/// a callback's `prepare` exists to produce the resources its `paint` then reads
-/// inside egui's render pass, so submitting egui's buffer first would run the
-/// paint against whatever the callback's target held on the *previous* frame.
-///
-/// Generic over the buffer type purely so the ordering can be unit-tested
-/// without a GPU — the order is the one thing here a refactor can quietly
-/// invert. It matches `egui_wgpu`'s own painter, which submits
+/// Callbacks' command buffers first, egui's own last: a callback's `prepare`
+/// produces what its `paint` reads inside egui's pass. Matches `egui_wgpu`'s
 /// `chain(user_cmd_bufs, [encoded])` (`egui-wgpu-0.35.0/src/winit.rs:733`).
 fn submission_order<T>(callbacks: Vec<T>, egui: T) -> Vec<T> {
     let mut ordered = callbacks;
@@ -160,45 +90,27 @@ fn submission_order<T>(callbacks: Vec<T>, egui: T) -> Vec<T> {
 }
 
 impl PreparedFrame {
-    /// Textures egui retired this frame, to be freed once the GPU is done.
     pub fn textures_to_free(&self) -> &[egui::TextureId] {
         &self.textures_to_free
     }
 
-    /// How soon egui asked to be painted again. See the field.
     pub fn repaint_delay(&self) -> std::time::Duration {
         self.repaint_delay
     }
 
-    /// Submit every command buffer this frame recorded, egui's included.
-    ///
-    /// Takes the encoder **by value** so that finishing egui's own commands and
-    /// submitting the callbacks' cannot be separated: there is no way to reach
-    /// `encoder.finish()` through this type without also handing over
-    /// [`Self::user_command_buffers`]. That is the shape of the guarantee, and
-    /// `the_frame_path_submits_only_through_prepared_frame` is what keeps the
-    /// caller from routing round it.
-    ///
-    /// Safe to call on the frame that never acquired a surface, too: egui's
-    /// uploads still have to land, and a callback that recorded work for a frame
-    /// nobody draws still has to be flushed rather than leaked.
+    /// Submit every command buffer this frame recorded, egui's included. Takes
+    /// the encoder by value so egui's `finish` and the callbacks' submit cannot
+    /// be separated. Safe on a frame that never acquired a surface.
     pub fn submit(&mut self, queue: &Queue, encoder: CommandEncoder) {
         let callbacks = std::mem::take(&mut self.user_command_buffers);
         queue.submit(submission_order(callbacks, encoder.finish()));
     }
 }
 
-/// A primitive's clip rect, narrowed to whichever source rect it belongs to.
-///
-/// `Rect::ZERO` for a primitive that belongs to none of them — a zero-size
-/// scissor, which `egui_wgpu::Renderer::render` skips while still advancing its
-/// buffer iterators. That is the whole filtering mechanism; see
-/// [`EguiRenderer::render_mirror`].
-///
-/// First match rather than the union, and that is not a shortcut: the sources
-/// are the off-screen map strips, egui clips each strip's contents to it, and
-/// one uniform translation of the pane rects leaves the strips disjoint — so a
-/// primitive can only be inside one of them.
+/// A primitive's clip rect, narrowed to whichever source rect it belongs to;
+/// `Rect::ZERO` for none — a zero-size scissor, which `Renderer::render` skips
+/// while still advancing its buffer iterators. First match, not the union: the
+/// source strips are disjoint.
 fn clamp_to_sources(clip: egui::Rect, sources: &[egui::Rect]) -> egui::Rect {
     sources
         .iter()
@@ -206,31 +118,12 @@ fn clamp_to_sources(clip: egui::Rect, sources: &[egui::Rect]) -> egui::Rect {
         .map_or(egui::Rect::ZERO, |source| clip.intersect(*source))
 }
 
-/// Make `ctx.request_repaint()` reach the event loop.
+/// Make `ctx.request_repaint()` reach the event loop: it only sets a flag the
+/// next `begin_pass` reads, and a loop on `ControlFlow::Wait` never gets there.
 ///
-/// egui's own answer to "something off-frame changed, draw again" is
-/// [`egui::Context::request_repaint`], and on its own that call reaches winit
-/// through **nothing at all**: it sets a flag the next `begin_pass` reads, and
-/// a loop parked on `ControlFlow::Wait` never gets there. The one channel out
-/// is this callback, and until it was installed the workspace had two callers
-/// relying on a wake that did not exist — `tile_source`'s tile arrival (whose
-/// own module doc names the symptom: "without which a fetched tile would not
-/// appear until some unrelated input woke the UI") and `ui_map`'s. They worked
-/// only because the frame loop happened to be re-arming unconditionally, and
-/// stopped working the moment it stopped.
-///
-/// Installed at the one place a `Context` is made, rather than at each caller,
-/// because the loop now sleeps for real: every future `request_repaint` from a
-/// background thread is a wake this closes in advance.
-///
-/// **Only a zero delay wakes.** A timed request — `request_repaint_after`, a
-/// tooltip's dwell, a cursor blink — is already carried out of the frame by
-/// `FullOutput`'s `repaint_delay` and scheduled by the app side's
-/// `repaint_action` (rustdar-app's `app` module), and honouring it here as
-/// well would turn every such request into an immediate redraw: egui re-asks
-/// on each pass, so the "wait half a second" would become a frame per frame,
-/// forever. The one thing this drops is an off-frame *timed* request, which
-/// nothing makes and which has no meaning without a frame to schedule it from.
+/// **Only a zero delay wakes.** A timed request is already carried out of the
+/// frame by `FullOutput`'s `repaint_delay` and scheduled by the app side;
+/// honouring it here too would turn it into a redraw per frame, forever.
 pub(crate) fn install_repaint_wake(ctx: &Context, wake: impl Fn() + Send + Sync + 'static) {
     ctx.set_request_repaint_callback(move |info| {
         if info.delay.is_zero() {
@@ -250,16 +143,12 @@ impl EguiRenderer {
         output_depth_format: Option<TextureFormat>,
         msaa_samples: u32,
         window: &crate::WindowRef,
-        // The app side's redraw request, injected because this crate cannot —
-        // and must not — name the event loop. The caller's closure holds the
-        // window and ends in its `notify_redraw`; see `install_repaint_wake`
-        // for what the wake is and why only a zero delay fires it.
+        // The app side's redraw request; this crate cannot name the event loop.
         wake: impl Fn() + Send + Sync + 'static,
     ) -> EguiRenderer {
         let egui_context = Context::default();
         install_repaint_wake(&egui_context, wake);
 
-        // Query the device's actual texture size limit
         let max_texture_side = device.limits().max_texture_dimension_2d as usize;
 
         let egui_state = egui_winit::State::new(
@@ -284,8 +173,7 @@ impl EguiRenderer {
             state: egui_state,
             renderer: egui_renderer,
             applied_visuals_dark: None,
-            // The same three values `Renderer::new` was just given, kept because
-            // it offers no way to ask for them back.
+            // The three values `Renderer::new` was given; it offers no way back.
             attachment_config: AttachmentConfig {
                 color_format: output_color_format,
                 depth_format: output_depth_format,
@@ -300,22 +188,10 @@ impl EguiRenderer {
         self.attachment_config
     }
 
-    /// egui's per-type store for resources a paint callback needs across frames.
-    ///
-    /// `egui_wgpu::Renderer::callback_resources` is `pub`
-    /// (`egui-wgpu-0.35.0/src/renderer.rs:259`) but [`Self::renderer`] is not, so
-    /// this accessor is the only way to reach it — and it is the *only* channel
-    /// there is, because `CallbackTrait::prepare` and `paint` both take `&self`
-    /// and so cannot own mutable state of their own.
-    ///
-    /// `_mut` even though [`Self::draw`] takes `&self`: `update_buffers` already
-    /// hands callbacks a `&mut CallbackResources`, so nothing here is made more
-    /// mutable than it already was.
-    ///
-    /// A caveat worth knowing before inserting: `CallbackResources` is a
-    /// `TypeMap` keyed by type, not by pane or by callback. One inserted type is
-    /// one slot for the whole application, so anything that needs to be
-    /// per-instance has to carry its own map inside that slot.
+    /// egui's per-type store for resources a paint callback needs across frames
+    /// — the only such channel, since `prepare` and `paint` take `&self`. Keyed
+    /// by type, not by pane: one type is one slot for the whole application, so
+    /// anything per-instance carries its own map inside that slot.
     pub fn callback_resources_mut(&mut self) -> &mut egui_wgpu::CallbackResources {
         &mut self.renderer.callback_resources
     }
@@ -325,29 +201,18 @@ impl EguiRenderer {
         response.repaint
     }
 
-    /// Start an egui pass.
+    /// Start an egui pass. The zoom is applied *before* `begin_pass`: egui
+    /// consumes a pending zoom change at the start of a pass.
     ///
-    /// Applied *before* `begin_pass`, not after. egui consumes a pending zoom
-    /// change at the start of a pass, so setting it afterwards — as this used to
-    /// — would not take effect until the next frame, leaving that frame's
-    /// geometry a scale behind. Setting it here makes
-    /// `Context::pixels_per_point()` authoritative for the pass that follows,
-    /// which is what the tessellation and the screen descriptor are both taken
-    /// from.
-    ///
-    /// `zoom_factor` is the application's own scaling only — it deliberately
-    /// excludes the window's DPI. egui multiplies it by the native
-    /// pixels-per-point carried on the raw input, which egui-winit keeps in step
-    /// with the window. Passing a finished pixels_per_point instead would make
-    /// egui divide it back out by the native scale it *currently* holds, and on
-    /// the one frame a monitor's DPI changes that is still the old value, so the
-    /// result overshoots by the ratio of the two before self-correcting the
-    /// frame after.
+    /// `zoom_factor` excludes the window's DPI — egui multiplies it by the
+    /// native pixels-per-point on the raw input. A finished pixels_per_point
+    /// gets divided back out by the scale egui currently holds, which
+    /// overshoots on the frame a monitor's DPI changes.
     pub fn begin_frame(&mut self, window: &Window, zoom_factor: f32) {
         self.context().set_zoom_factor(zoom_factor);
         let mut raw_input = self.state.take_egui_input(window);
         // Before `begin_pass`: egui buckets touches by device as it folds the
-        // events in, so a later rewrite would be a frame too late.
+        // events in.
         rustdar_egui::normalize_touch_devices(&mut raw_input);
         // Web only: native reports one line per notch, which egui's native
         // `line_scroll_speed` already scales correctly.
@@ -358,17 +223,10 @@ impl EguiRenderer {
 
     /// End the egui pass, tessellate it, and upload everything the GPU needs.
     ///
-    /// **This must run before the swapchain is touched, and unconditionally.**
-    /// `Context::end_pass` is what pops egui's viewport stack and hands over the
-    /// frame's texture deltas — including font-atlas growth, which egui emits
-    /// exactly once per region. A frame that returns early because the surface
-    /// could not be acquired leaves the pass open (every later frame then nests
-    /// one level deeper, and egui stops applying zoom changes because it no
-    /// longer believes it is on the outermost viewport) and strands those
-    /// uploads.
-    ///
-    /// Only queue writes happen here, so none of it depends on having a render
-    /// target. See `app::render::finish_then_acquire` for the ordering.
+    /// **Must run before the swapchain is touched, and unconditionally.**
+    /// `end_pass` pops egui's viewport stack and hands over the texture deltas;
+    /// returning early on a failed acquire leaves the pass open and strands
+    /// them. Only queue writes happen here.
     pub fn end_pass_and_upload(
         &mut self,
         device: &Device,
@@ -380,51 +238,43 @@ impl EguiRenderer {
     ) -> PreparedFrame {
         let full_output = self.state.egui_ctx().end_pass();
 
-        // The root viewport's repaint request, taken before the output is
-        // dismembered: this is the one channel through which egui says an
-        // animation is mid-flight (see `PreparedFrame::repaint_delay`).
+        // Taken before the output is dismembered.
         let repaint_delay = full_output
             .viewport_output
             .get(&egui::viewport::ViewportId::ROOT)
             .map(|out| out.repaint_delay)
             .unwrap_or(std::time::Duration::MAX);
 
-        // Handle platform output more carefully to avoid animation loops
         self.state
             .handle_platform_output(window, full_output.platform_output);
 
-        // Taken from the context rather than from a cached scale factor so the
-        // geometry and the descriptor that clips it cannot disagree: this is the
-        // value the pass was actually laid out at.
+        // From the context, not a cached scale factor: the geometry and the
+        // descriptor that clips it cannot disagree.
         let pixels_per_point = self.state.egui_ctx().pixels_per_point();
         let screen_descriptor = ScreenDescriptor {
             size_in_pixels,
             pixels_per_point,
         };
 
-        // Always render - the change detection was causing panels to blink
         let mut tris = self
             .state
             .egui_ctx()
             .tessellate(full_output.shapes, pixels_per_point);
 
-        // Not `Renderer::update_texture` in a loop, which is `queue.write_texture`
-        // in a loop, which is up to 59 ms of blocking host stores on this thread
-        // at the raster ceiling. See [`texture_upload`].
+        // Not `Renderer::update_texture` in a loop: that is up to 59 ms of
+        // blocking host stores on this thread at the raster ceiling.
         let uploading = self.uploads.apply(
             device,
             queue,
             &mut self.renderer,
             &full_output.textures_delta.set,
         );
-        // Before the `update_buffers` below, not after, and that ordering is
-        // the whole design — see `render_mirror`.
+        // Before the `update_buffers` below, not after — see `render_mirror`.
         if let Some(request) = mirror {
             self.render_mirror(device, queue, &mut tris, &request);
         }
-        // `update_buffers` also dispatches every paint callback's `prepare` and
-        // `finish_prepare`, and returns the command buffers they produced. The
-        // return must be carried to the submit — see `user_command_buffers`.
+        // `update_buffers` also dispatches every callback's `prepare` and
+        // returns their command buffers; they must reach the submit.
         let user_command_buffers =
             self.renderer
                 .update_buffers(device, queue, encoder, &tris, &screen_descriptor);
@@ -436,10 +286,8 @@ impl EguiRenderer {
             // resources still referenced by the recorded render pass.
             textures_to_free: full_output.textures_delta.free,
             user_command_buffers,
-            // An upload still has bands to move, so there must be another frame
-            // to move them on — the loop runs on `ControlFlow::Wait` and would
-            // otherwise leave the raster half on the glass until some unrelated
-            // input woke it. See `texture_upload`'s note on this.
+            // Bands still to move need another frame to move them on: the loop
+            // runs on `ControlFlow::Wait`.
             repaint_delay: if uploading {
                 std::time::Duration::ZERO
             } else {
@@ -451,42 +299,25 @@ impl EguiRenderer {
     /// Draw the floor strips' own geometry into the mirror, and get it onto the
     /// GPU before anything samples it.
     ///
-    /// # The ordering, which is the entire difficulty
-    ///
-    /// `egui_wgpu::Renderer::update_buffers` does two jobs in one call: it
-    /// stages the frame's index and vertex buffers, and *then* dispatches every
-    /// paint callback's `prepare` (`egui-wgpu-0.35.0/src/renderer.rs:1049-1074`).
-    /// The volume raymarch is encoded in one of those `prepare`s, and it samples
-    /// the mirror — so the mirror has to be finished before `prepare` runs,
-    /// while the geometry the mirror draws is staged by the very call that runs
-    /// it. Hence two calls with a submit between them:
+    /// `update_buffers` stages the frame's index/vertex buffers and *then*
+    /// dispatches every callback's `prepare` (`renderer.rs:1049-1074`) — one of
+    /// which is the raymarch, which samples the mirror. Hence two calls with a
+    /// submit between them:
     ///
     /// ```text
     /// update_buffers(filtered, scratch encoder) -> mirror pass -> queue.submit
     ///     -> update_buffers(whole frame, main encoder) -> draw
     /// ```
     ///
-    /// **That submit is load-bearing.** `queue.write_buffer`/`write_buffer_with`
-    /// data lands at the *next* submit, so without one here the second
-    /// `update_buffers` would overwrite the staging belt before the mirror pass
-    /// ever ran, and the mirror would draw the wrong meshes through
-    /// correct-looking geometry — a plausible picture, no validation error.
+    /// That submit is load-bearing: `queue.write_buffer` data lands at the
+    /// *next* submit, so without one the second `update_buffers` overwrites the
+    /// staging belt before the mirror pass runs.
     ///
-    /// # How the frame is filtered without rebuilding it
-    ///
-    /// `render` advances the index and vertex slice iterators even when it skips
-    /// a zero-size scissor (`renderer.rs:516-527`), so a primitive is dropped by
-    /// **clamping its `clip_rect`** rather than by removing it. No mesh is
-    /// cloned and no list is rebuilt; the clip rects are 16 bytes each and are
-    /// put back before the real `update_buffers` sees them.
-    ///
-    /// Callbacks are swapped for empty meshes over the same window. `render`
-    /// already ignores `Primitive::Callback` — which is what stops the volume
-    /// callback recursing into the mirror — but `update_buffers` does *not*: it
-    /// would run every `prepare` a second time, and the raymarch is the most
-    /// expensive thing in the frame. An empty mesh occupies the same one slot in
-    /// the slice iterators that a real one would, so the sequence `render` walks
-    /// stays in step.
+    /// Filtering: `render` advances the slice iterators even when it skips a
+    /// zero-size scissor (`renderer.rs:516-527`), so a primitive is dropped by
+    /// clamping its `clip_rect`. Callbacks are swapped for empty meshes —
+    /// `render` ignores `Primitive::Callback` but `update_buffers` does not, and
+    /// would run every `prepare` twice.
     fn render_mirror(
         &mut self,
         device: &Device,
@@ -519,10 +350,8 @@ impl EguiRenderer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("egui pane mirror"),
         });
-        // Empty in practice — every callback was swapped out above — but
-        // carried to the submit rather than dropped, because dropping a
-        // callback's command buffers is a silent no-render and this code has
-        // made that mistake before (see `PreparedFrame::user_command_buffers`).
+        // Empty in practice, but carried to the submit: dropping a callback's
+        // command buffers is a silent no-render.
         let user_command_buffers =
             self.renderer
                 .update_buffers(device, queue, &mut encoder, tris, &descriptor);
@@ -534,8 +363,7 @@ impl EguiRenderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         // Transparent, not black: the shader reads zero alpha
-                        // as "the pane's map is not showing this ground",
-                        // and a black clear would carpet the floor instead.
+                        // as "the pane's map is not showing this ground".
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: StoreOp::Store,
                     },
@@ -561,15 +389,9 @@ impl EguiRenderer {
         }
     }
 
-    /// Record the render pass for an already-prepared frame.
-    ///
-    /// Note the pass this opens has **no depth attachment and no resolve
-    /// target**, which is what makes [`Self::attachment_config`] honest only
-    /// while `new` is called with `None` depth and one sample. Both halves are
-    /// pinned by `the_pass_draw_opens_matches_what_attachment_config_promises` —
-    /// a pipeline built from a depth format this pass does not attach fails
-    /// validation at draw time, and `create_render_pipeline` returns no `Result`
-    /// to notice it in.
+    /// Record the render pass for an already-prepared frame. It has no depth
+    /// attachment and no resolve target, which makes [`Self::attachment_config`]
+    /// honest only while `new` is called with `None` depth and one sample.
     pub fn draw(
         &mut self,
         encoder: &mut CommandEncoder,
@@ -601,11 +423,7 @@ impl EguiRenderer {
     }
 
     /// Whether every texel egui handed over for `id` has reached the GPU.
-    ///
-    /// The one question the app asks of the upload machinery — see
-    /// [`texture_upload::TextureUploads::is_delivered`]. Forwarded rather than
-    /// handing out the uploads themselves, because everything else on that type
-    /// is this renderer's own business.
+    /// See [`texture_upload::TextureUploads::is_delivered`].
     pub fn is_delivered(&self, id: egui::TextureId) -> bool {
         self.uploads.is_delivered(id)
     }
@@ -615,12 +433,9 @@ impl EguiRenderer {
         for id in ids {
             self.renderer.free_texture(id);
         }
-        // And whatever `texture_upload` was still holding for them: the texture
-        // it allocated, and any band of it that had not crossed yet.
         self.uploads.free(ids);
     }
 
-    /// Apply dark/light theme only when it actually changes.
     pub fn apply_theme(&mut self, use_dark: bool) {
         if self.applied_visuals_dark != Some(use_dark) {
             self.applied_visuals_dark = Some(use_dark);
@@ -630,19 +445,8 @@ impl EguiRenderer {
 }
 
 /// The theme as one context-level application: the palette, plus the style
-/// rules that must hold under both palettes.
-///
-/// `selectable_labels` goes off here because rustdar's labels are readouts,
-/// not documents: a map drag that ends over the chrome left label text
-/// highlighted as though selected (the M8 first-run finding), and nothing in
-/// the app wants label text selected — `TextEdit` fields keep their own
-/// selection regardless of this flag. `all_styles_mut` writes the rule into
-/// both of egui's per-theme styles, so a later visuals flip cannot resurrect
-/// it.
-///
-/// A free function over the `Context` rather than a renderer method so a host
-/// test can drive it against a bare context — the renderer itself needs a
-/// wgpu device no host test has.
+/// rules that must hold under both palettes. `all_styles_mut` writes into both
+/// per-theme styles so a visuals flip cannot resurrect the old rule.
 pub fn apply_theme_to_context(ctx: &egui::Context, use_dark: bool) {
     let visuals = if use_dark {
         egui::Visuals::dark()

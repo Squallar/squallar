@@ -3,19 +3,7 @@ use crate::budget::{self, Budgets, DeviceProfile};
 use rustdar_radar::types::IMAGE_SIZE;
 use rustdar_radar::xsect::{NATIVE_SECTION_WIDTH, WASM_SECTION_WIDTH};
 
-/// Every device class this workspace builds for, exactly once — as the
-/// **profiles** they are, rather than as a hand-built table of budgets.
-///
-/// # What this replaces
-///
-/// It was `arms() -> [Arm; 3]`, a struct of budgets per device class, built
-/// because the four invariants below used to read the `cfg`-selected constants
-/// directly and so checked one arm out of three while leaving the other two
-/// free. That table was already `crate::budget::Budgets` under another name —
-/// which is why the conversion is a rename and a delegation rather than an
-/// invention. The rows are `DeviceProfile`s now and the budgets come out of
-/// `budget::resolve`, so every proof below is a proof about the function the
-/// application actually runs rather than about a copy of its answers.
+/// Every device class this workspace builds for, exactly once.
 fn profiles() -> [DeviceProfile; 3] {
     crate::budget::BudgetLimits::SHIPPED.map(|limits| DeviceProfile {
         limits,
@@ -28,21 +16,12 @@ fn profiles() -> [DeviceProfile; 3] {
     })
 }
 
-/// What [`profiles`] resolve to. The loop variable below is still called `arm`
-/// because that is what one row of this is: one device class's share of every
-/// cascade in this file.
+/// What [`profiles`] resolve to.
 fn arms() -> [Budgets; 3] {
     profiles().map(|profile| budget::resolve(&profile))
 }
 
-/// The section raster is `SECTION_WIDTH` by half of it, which is what makes
-/// [`Budgets::section_frame_bytes`] a reconstruction rather than a guess.
-///
-/// Split out of that method when it moved to `crate::budget`: the per-arm
-/// figure is what every budget row uses, and this is the one claim about the
-/// *compiled* target that keeps the reconstruction honest. Section loop frames
-/// carry no value or status plane, for the reason plan-view frames carry no
-/// value grid — see `rustdar_egui::pane::SectionImageData`.
+/// The section raster is `SECTION_WIDTH` by half of it.
 #[test]
 fn the_section_raster_is_its_width_by_half_of_it() {
     let compiled = if cfg!(target_arch = "wasm32") {
@@ -64,24 +43,6 @@ fn the_section_raster_is_its_width_by_half_of_it() {
 
 /// **One loop, on the worst device this target admits, gets the whole of
 /// [`LOOP_SPAN_BUDGET_SECS`] — at the fastest radar there is.**
-///
-/// The property that makes the pool safe to ship, and the reason
-/// [`LOOP_POOL_FLOOR_BYTES`] carries no numbers of its own: the floor **is**
-/// [`MAX_LOOP_RENDER_BUDGET`] frames, to the byte. Nobody with a single loop
-/// open loses a minute of the span budget on any device; what the pool changed
-/// is that six of them no longer cost six times it.
-///
-/// This was named for what one pane used to get, and the equality was the same
-/// one read off the frame count instead of the span — 480 / 192 / 32 MiB
-/// against 512 / 256 / 48 MiB floors, where the rounding up to a power of two
-/// was the only slack in it. Pricing the span removed even that, so the
-/// assertion is an **equality** now rather than a bound: a floor
-/// above what the render budget spends is memory reserved for frames no loop
-/// will ever ask for, and one below it is a span budget the device silently
-/// cannot deliver.
-///
-/// This is the table in [`LOOP_POOL_FLOOR_BYTES`]' doc comment, executed, on
-/// **every** arm rather than the one this build compiled.
 #[test]
 fn one_loop_at_the_floor_gets_the_whole_span_budget() {
     for arm in arms() {
@@ -98,25 +59,11 @@ fn one_loop_at_the_floor_gets_the_whole_span_budget() {
             total / (1024 * 1024),
             arm.loop_pool_floor_bytes / (1024 * 1024),
         );
-        // And a section loop, which is half the frame, comfortably so — the
-        // pool is bytes, so this needs no table of its own any more.
         assert!(arm.textured_frames() * arm.section_frame_bytes() <= arm.loop_pool_floor_bytes);
     }
 }
 
 /// **The floor seats a full screen of loops without blanking one.**
-///
-/// [`MIN_LOOP_FRAMES_PER_PANE`] is what makes the degradation smooth rather
-/// than a cliff, and it is worth nothing unless the floor can actually pay for
-/// it on every pane the width class admits. Without this, adding the last pane
-/// on a browser would take a loop to zero frames, which reads as a bug and
-/// which the user has no way to undo except by guessing.
-///
-/// wasm32 is the tight row — six loops at two frames of 4 MiB is 48 MiB against
-/// a 56 MiB floor, one frame of margin in the whole browser arm — so this is the
-/// line a change to the browser floor, the minimum, the pane count or the web
-/// image size has to come past. It was exact to the byte until
-/// [`LOOP_SPAN_BUDGET_SECS`] took the browser floor from 48 MiB to 56.
 #[test]
 fn the_floor_seats_every_pane_without_blanking_one() {
     for arm in arms() {
@@ -136,11 +83,6 @@ fn the_floor_seats_every_pane_without_blanking_one() {
 }
 
 /// The bounds are a pair, and the floor is the one that wins.
-///
-/// `LoopPoolLimits::hold` is a `clamp`, and `clamp` **panics** on a crossed
-/// pair — at startup, on one target only, which is the arm no host test can
-/// reach. The compile-time block beside the constants asserts it for the
-/// compiled arm; this is the other two.
 #[test]
 fn every_pool_ceiling_is_at_least_its_own_floor() {
     for arm in arms() {
@@ -154,17 +96,7 @@ fn every_pool_ceiling_is_at_least_its_own_floor() {
     }
 }
 
-/// A section loop can never be the binding case, and that is a property of the
-/// raster's shape rather than of the numbers chosen for it.
-///
-/// `SECTION_HEIGHT` is half `SECTION_WIDTH`, and `SECTION_WIDTH` is pinned per
-/// target at the same figure a loop frame takes, so a section frame is exactly
-/// half a plan-view loop frame on every target. That used to fall out of both
-/// following `IMAGE_SIZE`; the web plan view moving to 2048 while its loops and
-/// sections stayed at 1024 is what turned it into two decisions that have to
-/// agree. Pinned so that changing either has to come here and re-argue the
-/// budget rather than quietly making a section loop the largest thing on the
-/// screen.
+/// A section loop can never be the binding case.
 #[test]
 fn a_section_loop_frame_is_half_a_plan_view_one() {
     for arm in arms() {
@@ -178,30 +110,7 @@ fn a_section_loop_frame_is_half_a_plan_view_one() {
     }
 }
 
-/// The whole application's GPU texture memory, against a ceiling — the line
-/// nothing drew before, because the pane count and the per-pane budgets live in
-/// different crates.
-///
-/// This is the table in [`APP_TEXTURE_BUDGET_BYTES`]' doc, executed. It fails
-/// if `MAX_PANES_DESKTOP` grows, if any per-pane budget grows, or if the 3D
-/// loop's grids are ever made per-pane instead of application-wide.
-///
-/// # It did not model the path that runs, and two arms were over
-///
-/// The sum was `pool ceiling + panes × offscreen`, which is what the *pool*
-/// permits. What actually runs is `App::setup_egui_frame`'s
-/// `.max(VOLUME_LOOP_TEXTURE_BUDGET_BYTES)` on the volume store's eviction
-/// bound, and [`Arm::app_texture_bytes`] works through why that adds a whole
-/// pool floor on top rather than hiding inside the pool.
-///
-/// Adding it put mobile at 916 MiB against a 768 MiB ceiling and wasm32 at
-/// 270 against 256. Desktop was already clear at 3704 of 3840, which is why
-/// walking the desktop layouts found nothing — but the mobile figure is
-/// reachable rather than merely permitted: an `IntegratedGpu` phone resolves a
-/// 512 MiB pool, and 512 + 256 + 20 is 788 MiB, over the old ceiling with the
-/// pool nowhere near its own. So the two ceilings moved, deliberately, and
-/// `the_app_ceiling_is_not_slack_enough_to_hide_a_doubling` is what stops that
-/// from having been a way to admit anything else.
+/// The whole application's GPU texture memory, against a ceiling.
 #[test]
 fn the_whole_application_fits_its_gpu_ceiling() {
     for arm in arms() {
@@ -222,14 +131,8 @@ fn the_whole_application_fits_its_gpu_ceiling() {
     }
 }
 
-/// The whole-application ceiling is snug, on the same reasoning
-/// `the_volume_budget_is_not_slack_enough_to_hide_a_doubling` gives: a ceiling
-/// several times the real figure passes the check above while admitting a
-/// silent doubling of any term inside it.
-///
-/// 1.25x, which is tighter than the ~1.33x the per-subsystem budgets keep,
-/// because this one is a sum of already-padded figures rather than a raw
-/// allocation with alignment overhead to absorb.
+/// The whole-application ceiling is snug: a ceiling several times the real
+/// figure passes the check above while admitting a silent doubling.
 #[test]
 fn the_app_ceiling_is_not_slack_enough_to_hide_a_doubling() {
     for arm in arms() {
@@ -246,55 +149,6 @@ fn the_app_ceiling_is_not_slack_enough_to_hide_a_doubling() {
 }
 
 /// **What a loop of a given wall clock costs in frames, measured.**
-///
-/// `(window seconds, frames)`, where the frames are the largest render set a
-/// loop of that window can ever be asked for, over every site and every
-/// listing in the campaign of 2026-08-11: six TDWR and four WSR-88D sites, a
-/// full 24 h, 2560 objects, with each object's VCP decoded from message 5
-/// rather than inferred from its interval. The holdout was TPIT, TMIA and THOU
-/// on 2026-06-15 and 2026-02-03, which agreed.
-///
-/// # Why it is not `window / median`
-///
-/// Two reasons, and the first is the one that bites:
-///
-/// * `accept_scan_listing` reads the median over the **whole listing**, which
-///   covers the user's lookback rather than the span budget — so a 30-minute
-///   lookback taken during a burst hands `frames_for_span` a median no daily
-///   figure predicts. KPBZ's lowest 30-minute median is 198 s against a 259 s
-///   daily median for the same VCP, and `1 + 7200/198` is 37 where
-///   `1 + 7200/259` is 28.
-/// * `render_set_indices` clamps to the frame count, so a window can only ever
-///   be charged for volumes that exist in it — which is what takes that 37
-///   back down to 36.
-///
-/// So each row is `max over every listing window of min(1 + window/median, n)`,
-/// which is the arithmetic the application runs, swept over the measured day.
-/// Per site, at the three shipped windows:
-///
-/// | window | TDWR (all six) | KPBZ | KLOT | KFTG | KOKX |
-/// |---|---:|---:|---:|---:|---:|
-/// | 45 min |  8 | 14 | 14 | 12 | 12 |
-/// | 1 h    | 11 | 18 | 18 | 16 | 16 |
-/// | 2 h    | 21 | 36 | 35 | 30 | 30 |
-///
-/// **The worst case is a WSR-88D in precip and never a TDWR** — a TDWR volume
-/// is 360 s where a WSR-88D precip volume is 259 s, so a TDWR loop covers more
-/// wall clock per frame, not less. Sizing an arm against "the fastest-cadence
-/// radar" as that phrase is usually meant would pick TDWR and under-budget the
-/// real worst case by 71%.
-///
-/// # The rows are round windows, and that is a decision
-///
-/// Half an hour, three quarters, an hour, and so on — not the byte-maximal
-/// figure each arm could reach. A span budget is the one number in
-/// [`crate::constants`] a *user* can read off the screen, so it is chosen from
-/// windows a user already thinks in: wasm32 could pay for 50 minutes and takes
-/// 45, and the six it leaves are margin on the one arm whose answer to running
-/// out of texture memory is to restart the browser's whole GPU process — see
-/// [`LOOP_POOL_FLOOR_BYTES`]. [`the_span_budget_is_the_longest_the_ceiling_can_pay_for`]
-/// holds each arm to the longest *row* it can pay for, so adding a row between
-/// two of these is a real change and has to be argued here.
 const MEASURED_PEAK_LOOP_FRAMES: [(usize, usize); 7] = [
     (30 * 60, 10),
     (45 * 60, 14),
@@ -322,11 +176,6 @@ fn peak_frames(secs: usize) -> usize {
 
 /// **The span budget is priced at the fastest radar, and the render budget is
 /// that price.**
-///
-/// Not an inequality. A render budget above the price is memory reserved for
-/// frames no site will ever produce; one below it is a loop that silently stops
-/// short of the wall clock it was budgeted, on exactly the site — a WSR-88D in
-/// precip — where a user is most likely to be watching.
 #[test]
 fn the_render_budget_is_the_span_priced_at_the_fastest_radar() {
     for arm in arms() {
@@ -343,19 +192,6 @@ fn the_render_budget_is_the_span_priced_at_the_fastest_radar() {
 }
 
 /// **Each arm's span is the longest window its GPU ceiling can pay for.**
-///
-/// The budget the span had to fit inside is [`APP_TEXTURE_BUDGET_BYTES`] minus
-/// the two terms that do not move with it — the pool ceiling and the per-pane
-/// raymarch offscreens — because the third term *is* [`LOOP_POOL_FLOOR_BYTES`],
-/// which is the span priced in frames. Divided by a loop frame, that headroom
-/// is 16 frames on wasm32, 22 on mobile and 40 on desktop.
-///
-/// So this checks both halves: that the shipped window fits, and that the next
-/// window the campaign measured does **not**. Without the second half a span
-/// could be quietly shortened and nothing would notice; with it, lengthening
-/// one means either finding memory somewhere real or moving
-/// [`APP_TEXTURE_BUDGET_BYTES`] deliberately and re-arguing
-/// [`the_app_ceiling_is_not_slack_enough_to_hide_a_doubling`].
 #[test]
 fn the_span_budget_is_the_longest_the_ceiling_can_pay_for() {
     for arm in arms() {
@@ -390,13 +226,7 @@ fn the_span_budget_is_the_longest_the_ceiling_can_pay_for() {
     }
 }
 
-/// The 3D loop's pacing cap is a real cap, on the same terms
-/// [`MAX_LOOP_SECTION_CUTS_PER_FRAME`]'s is.
-///
-/// The upper bound is the whole point: a cap at or above
-/// [`MAX_CONCURRENT_RENDERS`] would let one dispatch pass run every
-/// `extract_volume_parts` it could start back to back on the frame that starts
-/// the loop, which is exactly the hitch the constant exists to prevent.
+/// The 3D loop's pacing cap is a real cap.
 #[test]
 fn the_volume_build_cap_paces_rather_than_stalls() {
     const { assert!(MAX_LOOP_VOLUME_BUILDS_PER_FRAME >= 1) };
@@ -413,25 +243,6 @@ fn the_volume_build_cap_paces_rather_than_stalls() {
 
 /// The teardown slice paces rather than stalls: a real slice of a frame, and a
 /// small one.
-///
-/// The two bounds are not the pair the sibling caps above assert, because the
-/// quantity is not the same kind. There is no count to compare against a render
-/// budget — see [`DEFERRED_DROP_BUDGET_PER_FRAME`] for why a count could not be
-/// justified at all — so what is checked is the budget's relationship to the
-/// frame it is a slice of:
-///
-/// * **Non-zero**, for rate rather than for progress: `drain_deferred_drops`
-///   frees at least one payload per call whatever this says, so zero is not a
-///   no-op the way a zero *count* silently was — it is a teardown that takes
-///   one frame per payload while the memory stays resident.
-/// * **An eighth of a frame**, which is what the constant's own doc claims and
-///   therefore what is pinned. A looser bound here would let the doc and the
-///   check disagree, which is the failure this file exists to prevent.
-///
-/// Neither bound makes this a bound on *frame time*, and the assertion
-/// deliberately does not imply one: the drain checks its budget after each
-/// free, so a frame's real spend is this plus one whole payload — on wasm, up
-/// to a 47–69 MiB volume. See [`DEFERRED_DROP_BUDGET_PER_FRAME`].
 #[test]
 fn the_teardown_slice_paces_rather_than_stalls() {
     const FRAME: std::time::Duration = std::time::Duration::from_micros(16_667);
@@ -447,12 +258,6 @@ fn the_teardown_slice_paces_rather_than_stalls() {
 
 /// The pacing cap is a real cap: at least one cut per pass, and fewer than the
 /// concurrent render budget on every arm.
-///
-/// The lower bound is what makes a section loop progress at all; the upper is
-/// the whole point of the constant, since a cap at or above
-/// `MAX_CONCURRENT_RENDERS` would let a dispatch pass run every extraction it
-/// could start back to back on one frame — which is the hitch the cap exists to
-/// prevent. See [`MAX_LOOP_SECTION_CUTS_PER_FRAME`].
 #[test]
 fn the_section_cut_cap_paces_rather_than_stalls() {
     const { assert!(MAX_LOOP_SECTION_CUTS_PER_FRAME >= 1) };
@@ -467,8 +272,8 @@ fn the_section_cut_cap_paces_rather_than_stalls() {
     }
 }
 
-/// The budget is meant to be snug. A ceiling several times the real figure would
-/// pass the check above while permitting a silent doubling of any constant in it.
+/// The budget is snug: a ceiling several times the real figure would pass the
+/// check above while permitting a silent doubling.
 #[test]
 fn the_budget_is_not_slack_enough_to_hide_a_doubling() {
     for arm in arms() {
@@ -485,12 +290,8 @@ fn the_budget_is_not_slack_enough_to_hide_a_doubling() {
     }
 }
 
-/// The eviction budget is what bounds memory, so it has to be the smaller of the
-/// two. If it ever exceeded the frame cap, `render_set_indices` would clamp it
-/// back to the frame count and every held frame would stay textured — silently
-/// restoring the `MAX_LOOP_FRAMES × frame` figure the budget above rules out.
-/// The ordering itself is asserted at compile time next to the constants — but
-/// only for the compiled arm, which is why it is asserted for all three here.
+/// The eviction budget bounds memory, so it must be the smaller of the two: if
+/// it exceeded the frame cap, every held frame would stay textured.
 #[test]
 fn the_render_budget_is_what_bounds_the_textured_frames() {
     for arm in arms() {
@@ -500,19 +301,12 @@ fn the_render_budget_is_what_bounds_the_textured_frames() {
             "{}",
             arm.name
         );
-        // A zero anywhere in the cascade is a loop that renders nothing, and
-        // the compile-time block next to the constants only sees one arm.
         assert!(arm.loop_render_budget > 0, "{}", arm.name);
         assert!(arm.concurrent_renders > 0, "{}", arm.name);
     }
 }
 
 /// The literals behind the tables in the two budget doc comments.
-///
-/// The invariants above are relations, and a relation holds just as well
-/// after both of its sides move together — which is the one change they
-/// cannot see. `the_grid_dimensions_match_the_shapes_rustdar_radar_names`
-/// pins the grid triples for the same reason; this is the rest of the row.
 #[test]
 fn the_documented_per_class_figures_are_what_the_arms_actually_say() {
     let expected = [
@@ -584,10 +378,6 @@ fn the_documented_per_class_figures_are_what_the_arms_actually_say() {
         assert_eq!(arm.loop_image_side_px, loop_image, "{name} loop image size");
         assert_eq!(arm.section_width_px, section_width, "{name} section width");
         // The three sides a plan-view raster can have on this class, ordered.
-        // The loop never exceeds the base — a loop frame is the same picture
-        // or a leaner one, never a larger one — and the long-range ceiling
-        // never falls under it, or `raster_side_px` would shrink a raster the
-        // moment its sweep reached further.
         assert!(
             arm.loop_image_side_px <= arm.image_side_px,
             "{name}: a loop frame is larger than a still one"
@@ -614,12 +404,6 @@ fn the_documented_per_class_figures_are_what_the_arms_actually_say() {
 }
 
 /// This target's cascades all selected the *same* arm as each other.
-///
-/// `cfg`-gated, because the selection is the one thing here no other target
-/// can check on behalf of this one — and it is a real hazard rather than a
-/// formality: the arms are six near-identical `#[cfg(all(…))]` lines per
-/// constant, and a mismatched one gives a build a mobile frame budget with
-/// a desktop texture ceiling, which passes every invariant above.
 #[test]
 fn every_cascade_in_this_file_selected_the_same_arm() {
     #[cfg(target_arch = "wasm32")]
@@ -688,27 +472,6 @@ fn cascade_arms(code: &str, name: &str) -> Vec<(String, String)> {
 
 /// The name of every `const` whose wasm32 arm this file declares, sorted
 /// and deduplicated.
-///
-/// Keyed on the wasm32 arm because that is the one no build on this machine
-/// compiles. Two-arm `mobile` / `not(mobile)` cascades — the download and
-/// render-cache caps — have no `target_arch` arm at all, so a host build
-/// picks between the same two values a phone build would and they are not
-/// device-class cascades in this sense.
-///
-/// Three near-misses this deliberately does *not* have, each of which was a
-/// way to add a cascade the census could not see:
-///
-/// - **a doc comment between the attribute and the item.** Legal Rust,
-///   `fmt`-clean, and a look at line `i + 1` alone walks straight past it.
-///   So the look-ahead skips `///`, `//` and blank lines, exactly as
-///   [`cascade_arms`] already does looking *back*.
-/// - **`const` without `pub`, or an indented one.** Neither changes that the
-///   value is `cfg`-selected.
-/// - **a wasm arm spelled some other way**, e.g. `all(target_arch =
-///   "wasm32")`. Matched on content rather than byte-for-byte: any `cfg`
-///   naming the wasm arch, other than the `not(...)` guard the sibling arms
-///   carry. The per-name check below then insists on the canonical spelling,
-///   so an odd one fails there rather than vanishing here.
 fn wasm_gated_constants(code: &str) -> Vec<&str> {
     let lines: Vec<&str> = code.lines().collect();
     let is_wasm_arm = |line: &str| {
@@ -738,21 +501,6 @@ fn wasm_gated_constants(code: &str) -> Vec<&str> {
 }
 
 /// Every `cfg` arm selects the constant named for *its own* device class.
-///
-/// `every_cascade_in_this_file_selected_the_same_arm` covers this for the
-/// arm the running target compiles and can cover no other. That is not a
-/// theoretical gap: pointing the wasm32 arm of `MAX_LOOP_FRAMES` at
-/// `DESKTOP_MAX_LOOP_FRAMES` leaves every test in this workspace passing
-/// and the wasm `cargo check` exiting 0, because nothing on a host ever
-/// evaluates that line. It is the one mutation that survived the probe run
-/// that landed these tests, which is why this exists.
-///
-/// So read the cascades as source instead. Three arms per constant in one
-/// fixed shape: the `cfg` picks the device class, and the right-hand side
-/// has to name the constant for that class. Reading the source is the weak
-/// form of the check — it cannot see a wrongly *valued* constant, which is
-/// what every test above is for — but it is the only form available without
-/// a wasm test runner.
 #[test]
 fn every_cfg_arm_selects_the_constant_named_for_its_device_class() {
     let source = include_str!("../constants.rs");
@@ -775,54 +523,33 @@ fn every_cfg_arm_selects_the_constant_named_for_its_device_class() {
     ];
 
     let covered = [
-        // The two raster-size cascades. `IMAGE_SIZE` itself is not here — it
-        // is `rustdar_radar`'s, and its own crate's
-        // `each_cfg_arm_selects_the_image_size_named_for_it` reads it the same
-        // way.
+        // The two raster-size cascades; `IMAGE_SIZE` is `rustdar_radar`'s.
         "LONG_RANGE_IMAGE_SIZE",
         "LOOP_IMAGE_SIZE",
         "MAX_CONCURRENT_RENDERS",
-        // The loop budget and what it costs. `LOOP_SPAN_BUDGET_SECS` landed as
-        // a cascade of its own rather than as one figure because the window an
-        // arm can afford is a fact about that arm's texture ceiling, not about
-        // radars.
+        // The loop budget and what it costs.
         "LOOP_SPAN_BUDGET_SECS",
         "MAX_LOOP_RENDER_BUDGET",
         "MAX_LOOP_FRAMES",
-        // The pool's two bounds, landed when the loop budget stopped being a
-        // per-pane allowance. Both are cascades, so both have to be here.
+        // The pool's two bounds.
         "LOOP_POOL_FLOOR_BYTES",
         "LOOP_POOL_CEILING_BYTES",
         "VOLUME_GRID_CELLS",
         "VOLUME_TEXTURE_BUDGET_BYTES",
-        // Lifted by WP-I after this test first listed it as exempt. It is
-        // covered here as well as by
-        // `each_offscreen_budget_arm_selects_its_own_classs_constant`; the
-        // overlap is deliberate, because that test checks one cascade and
-        // this one checks that no cascade is missing.
+        // Also covered by
+        // `each_offscreen_budget_arm_selects_its_own_classs_constant`; that
+        // test checks one cascade, this one that no cascade is missing.
         "VOLUME_OFFSCREEN_BUDGET_BYTES",
-        // The 3D loop's cascade, landed with it. Its sibling
-        // `MAX_LOOP_VOLUME_FRAMES` was retired rather than lifted: it had no
-        // runtime consumer, and the count `LoopPool::plan` derives is the only
-        // one anything reads.
+        // The 3D loop's cascade.
         "APP_TEXTURE_BUDGET_BYTES",
-        // Lifted into three arms when the pane mirror gained an adaptive rung:
-        // the ceiling stopped being "the guaranteed texture cap squared" (one
-        // figure, true everywhere) and became a per-target decision about how
-        // much supersampling a 3D floor is worth.
+        // Three arms: how much supersampling a 3D floor is worth per target.
         "VOLUME_MIRROR_BYTES_MAX",
     ];
 
     // Cascades that still spell their arms as literals, and so cannot be
-    // checked here. Written down rather than left implicit: a test named
-    // "every cfg arm" that silently covered six of seven would be the same
-    // shape of vacuity it exists to catch. Empty today, and the mechanism
-    // stays because the next cascade to land will need it before it is
-    // lifted — as `VOLUME_OFFSCREEN_BUDGET_BYTES` did for one commit.
+    // checked here. Empty today; the mechanism stays for the next one to land.
     let exempt: [&str; 0] = [];
 
-    // Every three-arm cascade in the file is one or the other, so adding a
-    // new one is a failure here rather than a silent gap.
     let found = wasm_gated_constants(code);
     let mut accounted: Vec<&str> = covered.iter().chain(exempt.iter()).copied().collect();
     accounted.sort_unstable();
@@ -833,13 +560,9 @@ fn every_cfg_arm_selects_the_constant_named_for_its_device_class() {
              or listed in `exempt` with the reason it cannot be."
     );
 
-    // An exemption has to still *be* one. The rot that matters runs the
-    // other way from the obvious one: a cascade gets lifted and nobody
-    // moves it out of `exempt`, so it looks accounted for while its arms go
-    // unchecked — which is exactly what happened to
-    // `VOLUME_OFFSCREEN_BUDGET_BYTES` between this test landing and WP-I
-    // lifting it, and the census did not notice. A lifted arm's right-hand
-    // side is a bare `SCREAMING_CASE` name; a literal never is.
+    // An exemption has to still *be* one: a cascade lifted but left in
+    // `exempt` looks accounted for while its arms go unchecked. A lifted arm's
+    // right-hand side is a bare `SCREAMING_CASE` name; a literal never is.
     for name in exempt {
         for (cfg, rhs) in cascade_arms(code, name) {
             assert!(
@@ -878,13 +601,6 @@ fn every_cfg_arm_selects_the_constant_named_for_its_device_class() {
 
 /// The reference pane fits this target's offscreen budget **at its own
 /// quality ceiling**, i.e. without being degraded to get there.
-///
-/// The sibling of `the_volume_grid_fits_the_target_texture_budget`, with
-/// one extra assertion it does not need: the grid either fits or it does
-/// not, whereas the offscreen would silently step down a rung. A budget
-/// that forced the reference pane to degrade would pass a plain "fits"
-/// check while quietly halving the resolution of every volume on a display
-/// this target is meant to render at full size.
 #[test]
 fn the_reference_pane_fits_the_target_offscreen_budget_undegraded() {
     let fitted = crate::quality::reference_offscreen();
@@ -906,10 +622,6 @@ fn the_reference_pane_fits_the_target_offscreen_budget_undegraded() {
 }
 
 /// And the offscreen budget is snug, exactly as the other two are.
-///
-/// The realistic regression is the reference pane growing or the ceiling
-/// moving up a rung — both of which double the figure, and both of which a
-/// budget several times the real number would absorb without a word.
 #[test]
 fn the_offscreen_budget_is_not_slack_enough_to_hide_a_doubling() {
     let total = crate::quality::reference_offscreen().bytes();
@@ -922,18 +634,6 @@ fn the_offscreen_budget_is_not_slack_enough_to_hide_a_doubling() {
 
 /// Both offscreen budget checks, on **all three** arms rather than the one
 /// this build compiled.
-///
-/// The two tests above are one-sided in exactly the way
-/// `the_grid_dimensions_match_the_shapes_rustdar_radar_names` was before
-/// `3292e8d`: they read `VOLUME_OFFSCREEN_BUDGET_BYTES` and
-/// `PLATFORM_CEILING`, both `cfg`-selected, so two of three arms went
-/// unchecked. A budget that could not pay for its own reference pane on
-/// wasm would be a browser whose every volume is quietly rendered a rung
-/// coarser than intended, and no CI row would say so.
-///
-/// The pairing is the point: each arm is checked against **its own**
-/// ceiling, because the ceiling is what decides how many pixels the
-/// reference pane costs there.
 #[test]
 fn every_offscreen_budget_arm_pays_for_its_own_reference_pane() {
     use crate::quality::{
@@ -981,15 +681,6 @@ fn every_offscreen_budget_arm_pays_for_its_own_reference_pane() {
 }
 
 /// Each offscreen budget arm selects **its own** class's constant.
-///
-/// Naming the arms outside the cascade pins their values and nothing else:
-/// pointing the wasm32 arm at `DESKTOP_VOLUME_OFFSCREEN_BUDGET_BYTES` was
-/// measured to leave the whole workspace green with the wasm
-/// `--all-targets` check at 0, because on a host the other two arms are
-/// dead text. Reading the source is the only instrument that sees it.
-///
-/// Shares its reasoning, and its shape, with
-/// `volume::quality::each_ceiling_arm_selects_its_own_classs_constant`.
 #[test]
 fn each_offscreen_budget_arm_selects_its_own_classs_constant() {
     let source = include_str!("../constants.rs");
@@ -1024,9 +715,6 @@ fn each_offscreen_budget_arm_selects_its_own_classs_constant() {
 }
 
 /// The compiled cascade selects one of the three named budgets.
-///
-/// Weaker than the scrape above and kept anyway: it is the one assertion
-/// that survives the source being reformatted out from under the scrape.
 #[test]
 fn the_compiled_offscreen_budget_is_one_of_the_named_arms() {
     assert!(
@@ -1042,47 +730,27 @@ fn the_compiled_offscreen_budget_is_one_of_the_named_arms() {
 }
 
 /// [`VOLUME_GRID_CELLS`] and `rustdar_radar::voxel`'s named shapes are two
-/// hand-maintained copies of the same three triples, in two crates.
-///
-/// The split is forced, not accidental: only *this* crate has a `build.rs`
-/// emitting `mobile`, so only this crate can pick the middle arm — while
-/// the grid is *built* in `rustdar-radar`, which therefore has to name all
-/// three as plain constants and let a caller choose. `voxel::default_shape`
-/// says as much and deliberately cannot return the mobile one.
-///
-/// Two copies that agree today is exactly the shape of the
-/// `needs_whole_volume` / `RenderInput::extract` divergence this campaign
-/// already paid for once, where the copies were "obviously" the same until
-/// one of them was not. They agree; this is what keeps them agreeing, and
-/// it checks **all three** arms rather than only the one this target
-/// compiles, because the arm a host build skips is the one nothing else
-/// would catch.
+/// copies of the same three triples, in two crates.
 #[test]
 fn the_grid_dimensions_match_the_shapes_rustdar_radar_names() {
     use rustdar_radar::voxel::{DESKTOP_SHAPE, LUT_LEN, MOBILE_SHAPE, VoxelShape, WASM_SHAPE};
 
     let triple = |s: VoxelShape| [s.nx as u32, s.ny as u32, s.nz as u32];
 
-    // **All three arms, unconditionally.** The first version of this test
-    // bound only the arm the running target compiled, which left two of
-    // the three free to drift — a reviewer changed the wasm triple to
-    // `[160, 160, 80]` and the entire workspace suite passed 1507/0 with
-    // the wasm `--all-targets` check exiting 0. Both sides are now named
-    // constants, so both sides are reachable from any host.
+    // All three arms, unconditionally: both sides are named constants, so
+    // both are reachable from any host.
     assert_eq!(WASM_VOLUME_GRID_CELLS, triple(WASM_SHAPE));
     assert_eq!(MOBILE_VOLUME_GRID_CELLS, triple(MOBILE_SHAPE));
     assert_eq!(DESKTOP_VOLUME_GRID_CELLS, triple(DESKTOP_SHAPE));
 
-    // Pinned literals as well as the binding, so that editing *both* sides
-    // in step — the one change the comparison above cannot see — still has
-    // to be deliberate.
+    // Pinned literals as well as the binding, so editing both sides in step
+    // still has to be deliberate.
     assert_eq!(WASM_VOLUME_GRID_CELLS, [128, 128, 64]);
     assert_eq!(MOBILE_VOLUME_GRID_CELLS, [192, 192, 96]);
     assert_eq!(DESKTOP_VOLUME_GRID_CELLS, [256, 256, 128]);
 
-    // And that this target's cascade selected the matching one. This half
-    // *is* cfg-gated, because the cascade is the one thing here that no
-    // other target can check on its behalf.
+    // This target's cascade selected the matching one. cfg-gated, because no
+    // other target can check the cascade on its behalf.
     #[cfg(target_arch = "wasm32")]
     assert_eq!(VOLUME_GRID_CELLS, WASM_VOLUME_GRID_CELLS);
     #[cfg(all(not(target_arch = "wasm32"), mobile))]
@@ -1090,9 +758,7 @@ fn the_grid_dimensions_match_the_shapes_rustdar_radar_names() {
     #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
     assert_eq!(VOLUME_GRID_CELLS, DESKTOP_VOLUME_GRID_CELLS);
 
-    // Every axis must clear the WebGL2 floor on **every** arm, not just
-    // this one — that bound is the reason the triples are what they are,
-    // and it was previously checked on one arm out of three.
+    // Every axis must clear the WebGL2 floor on every arm.
     for cells in [
         WASM_VOLUME_GRID_CELLS,
         MOBILE_VOLUME_GRID_CELLS,
@@ -1106,41 +772,17 @@ fn the_grid_dimensions_match_the_shapes_rustdar_radar_names() {
         }
     }
 
-    // The table travels *inside* the grid, so its size is one number in
-    // two places too.
     assert_eq!(VOLUME_LUT_BYTES, LUT_LEN);
 }
 
 /// The shape the frontend **asks** `build_voxels` for is the one this target's
 /// budgets were computed from.
-///
-/// It was not, and nothing here could see it: `voxel_request_for` called
-/// `voxel::default_shape()`, which takes one `is_wasm` bool and so cannot
-/// return `MOBILE_SHAPE` at all. A mobile *native* build therefore budgeted
-/// against `MOBILE_VOLUME_GRID_CELLS` — 3.375 MiB of indices — and requested
-/// `DESKTOP_SHAPE`'s 8 MiB, 2.4× over, on the class least able to afford it.
-///
-/// Routed through [`shape_of`] for the reason `voxel::default_shape_for` and
-/// `mobile_cfg.rs` are: a `cfg`-gated body is invisible to every target that
-/// does not compile it, and this workspace runs `cargo test` on exactly one of
-/// three. All three arms are checked here from any host; what stays unpinned
-/// is only the `cfg` cascade in `VOLUME_GRID_CELLS`, which the test above
-/// covers as far as a host can.
-///
-/// **The shape is a runtime answer now**, so what this can still state as an
-/// identity is the *floor*: the shape a device reporting exactly the WebGL2
-/// guarantee is asked for, which is the budget triple unchanged and is what
-/// makes "nothing regresses" checkable. The claim about every other device is
-/// a relation rather than an identity, and it is
-/// [`the_requested_shape_never_outgrows_the_budget_it_was_computed_against`].
 #[test]
 fn the_requested_shape_is_the_one_this_targets_budget_was_computed_for() {
     use rustdar_radar::voxel::{DESKTOP_SHAPE, MOBILE_SHAPE, VoxelShape, WASM_SHAPE};
 
-    // The axis order asserted rather than trusted. Every real triple has
-    // `nx == ny`, so an x/y transposition here would be invisible on all
-    // three of them and would only ever surface as a rectangular box drawn
-    // with its axes exchanged.
+    // The axis order asserted rather than trusted: every real triple has
+    // `nx == ny`, so a transposition would be invisible on all three.
     assert_eq!(
         shape_of([1, 2, 3]),
         VoxelShape {
@@ -1155,9 +797,8 @@ fn the_requested_shape_is_the_one_this_targets_budget_was_computed_for() {
     assert_eq!(shape_of(MOBILE_VOLUME_GRID_CELLS), MOBILE_SHAPE);
     assert_eq!(shape_of(DESKTOP_VOLUME_GRID_CELLS), DESKTOP_SHAPE);
 
-    // The floor — the shape a device at the guarantee is asked for — is this
-    // target's own budget triple, unchanged. That is the no-regression claim,
-    // and it is the one arm of the cascade a host can check by name.
+    // The shape a device at the guarantee is asked for is this target's own
+    // budget triple, unchanged — the no-regression claim.
     #[cfg(target_arch = "wasm32")]
     assert_eq!(
         volume_grid_shape(WEBGL2_MAX_TEXTURE_DIMENSION_3D),
@@ -1183,10 +824,6 @@ fn the_requested_shape_is_the_one_this_targets_budget_was_computed_for() {
 }
 
 /// The limits a real adapter might report, which every sweep below runs.
-///
-/// The guarantee, the two powers of two either side of it, the 704 an
-/// unaligned reading of the desktop budget lands on, and a modern desktop's
-/// own figure.
 const REPORTED_LIMITS: [u32; 5] = [256, 512, 704, 1024, 2048];
 
 /// The three budget triples, whatever this target's cascade selected.
@@ -1197,13 +834,6 @@ const ALL_ARMS: [(&str, [u32; 3]); 3] = [
 ];
 
 /// A device is never asked for an axis it did not say it could hold.
-///
-/// The runtime half of the guarantee the const assert in `constants.rs` used to
-/// make about every shape. It can only make that claim about
-/// [`VOLUME_GRID_FLOOR_SHAPE`] now, because that is the only shape that is
-/// still a compile-time constant; this is what guards everything above it, and
-/// it is the reason `voxel::MAX_AXIS` could be widened off the GLES 3.0
-/// guarantee without any device being asked for more than it reports.
 #[test]
 fn every_axis_stays_within_the_limit_the_adapter_reported() {
     for (name, budget) in ALL_ARMS {
@@ -1222,17 +852,7 @@ fn every_axis_stays_within_the_limit_the_adapter_reported() {
     }
 }
 
-/// The **device guarantee**, which is what `voxel::tests`'
-/// `an_axis_outside_the_guarantee_is_refused` used to assert with a literal
-/// 257.
-///
-/// It could not stay there. `MAX_AXIS` is 1625 now — the largest axis whose
-/// cube fits a 32-bit cell count, which is the only bound `rustdar-radar` can
-/// actually check, having no `wgpu` and no adapter. The guarantee is a fact
-/// about a *device*, so it moved to the crate that meets one, and it is
-/// asserted the way it is meant: a shape derived for a device reporting exactly
-/// the guarantee has every axis inside it. Neither test was dropped; each went
-/// where its subject lives.
+/// The device guarantee.
 #[test]
 fn a_shape_derived_for_a_device_at_the_guarantee_stays_within_it() {
     for (name, budget) in ALL_ARMS {
@@ -1251,38 +871,7 @@ fn a_shape_derived_for_a_device_at_the_guarantee_stays_within_it() {
     }
 }
 
-/// The static pane textures the app ceiling does **not** count, named so the
-/// figure is on the record rather than absent.
-///
-/// [`APP_TEXTURE_BUDGET_BYTES`] bounds loops, 3D grids and raymarch
-/// offscreens. A still pane's own radar texture has never been in it — it was
-/// 4 MiB on the web and 16 MiB native, small against the loop term and not a
-/// term anyone had to reason about. The long-range raster changed the size of
-/// that omission, not its shape, and the device-derived ceiling has changed it
-/// again — by four times on desktop, which is exactly the "future change to
-/// either raster size" the last paragraph of this doc demanded come past a
-/// stated number. It has, and here is the number:
-///
-/// | target  | panes | static texture | worst case |
-/// |---------|------:|---------------:|-----------:|
-/// | desktop |     6 |        256 MiB |   1536 MiB |
-/// | mobile  |     4 |         64 MiB |    256 MiB |
-/// | wasm32  |     6 |         16 MiB |     96 MiB |
-///
-/// The desktop row is `DESKTOP_RASTER_SIDE_CEILING` squared in RGBA, and it is
-/// the **ceiling** rather than a size anything reaches: the widest sweep a
-/// WSR-88D flies stops at 7362 px and 207 MiB, because
-/// `rustdar_radar::types::data_limited_side_px` will not ask for texels no gate
-/// can fill, and the ceiling is only reached on a device reporting at least
-/// 16384. Mobile and wasm32 are unmoved because their ceilings are pinned to
-/// what those classes already render.
-///
-/// Reachable only with every pane on a sweep that reaches past 230 km on a
-/// device that can hold one, and never at the same time as the loop term
-/// above it — a pane showing a loop is not showing a still frame. It is still
-/// not added to the ceiling, because doing so would fold two mutually
-/// exclusive worst cases into one sum; it is pinned here so that the next
-/// change to either raster size has to come past this number in turn.
+/// The static pane textures the app ceiling does **not** count.
 #[test]
 fn the_static_render_textures_are_named_even_though_the_ceiling_omits_them() {
     let expected = [
@@ -1303,13 +892,6 @@ fn the_static_render_textures_are_named_even_though_the_ceiling_omits_them() {
 
 /// The closed set a finished raster's length is read against, and the
 /// lengths that are not in it.
-///
-/// Every consumer of a render derives its side this way — see
-/// [`raster_side_from_rgba_len`] — so this is the one place the set is
-/// stated. The refusals matter as much as the acceptances: a length that
-/// slipped through would reach `ColorImage::from_rgba_premultiplied`'s
-/// `assert_eq!`, which on a native render thread means no response ever
-/// arrives and the pane stays blank for good.
 #[test]
 fn a_rasters_side_is_read_back_from_its_length_against_a_closed_set() {
     for side in [
@@ -1345,27 +927,7 @@ fn a_rasters_side_is_read_back_from_its_length_against_a_closed_set() {
     }
 }
 
-/// The raster ceiling is the device's own answer, bounded by a measurement —
-/// and it can only ever add to what this build already shipped.
-///
-/// The row that matters most is the first. This box reports 32768 through
-/// Vulkan (`vulkaninfo`: `maxImageDimension2D = 32768`, confirmed against
-/// wgpu's adapter limits), and every render it made was 4096, because the only
-/// question anything asked the device was `>= 4096`. A `bool` cannot carry a
-/// size, and the size it was turned back into was a literal.
-///
-/// Halving what is reported is not caution for its own sake: this box fails to
-/// allocate the 32768 texture it advertises — `GL_OUT_OF_MEMORY` in Firefox
-/// 153, `GL_INVALID_VALUE` in Chrome — while an AMD 890M reporting 16384
-/// allocates 16384. One of the two overstates by a doubling and the number
-/// alone does not say which. But halving *alone* would take the long-range
-/// raster away from a device reporting exactly 4096, which draws one today, so
-/// the long-range image side is the floor under the result.
-///
-/// Run over all three shipped brackets rather than the one this target
-/// compiled, which is the property `budget` exists to give: the two classes
-/// whose ceiling is pinned are asserted to be *unmoved* by any adapter, and
-/// that is a claim about them, not an absence of one.
+/// The raster ceiling is the device's own answer, bounded by a measurement.
 #[test]
 fn the_raster_ceiling_follows_the_device_and_never_falls_below_what_shipped() {
     for arm in arms() {
@@ -1375,21 +937,16 @@ fn the_raster_ceiling_follows_the_device_and_never_falls_below_what_shipped() {
             let reported = reports as usize;
             let why = format!("{}, a device reporting {reports}", arm.name);
 
-            // Never more than the device claimed at all.
             assert!(got <= reported, "{why}: {got} px over {reported} px");
-            // Never more than half of it, unless the floor is holding it up.
             assert!(
                 got <= (reported / 2).max(floor.min(reported)),
                 "{why}: {got} px is more than half of what was reported",
             );
-            // Never past the ceiling this class was measured to.
             assert!(
                 got <= arm.raster_side_ceiling_px,
                 "{why}: {got} px over the {} px ceiling",
                 arm.raster_side_ceiling_px,
             );
-            // And never below what this build already draws on such a device,
-            // which is the whole no-regression guarantee.
             assert!(
                 got >= floor.min(reported),
                 "{why}: {got} px is under the {} px this build already draws",
@@ -1397,14 +954,10 @@ fn the_raster_ceiling_follows_the_device_and_never_falls_below_what_shipped() {
             );
         }
 
-        // A device that reports nothing usable still gets a raster it can hold
-        // rather than one it cannot.
         assert!(arm.raster_side_for_adapter(0) <= 1);
         assert!(arm.raster_side_for_adapter(1) <= 1);
 
-        // The two classes with a pinned ceiling must be unmoved by *any*
-        // adapter — that is what declining to raise them means, and asserting
-        // it is what stops a later edit raising them by accident.
+        // The two classes with a pinned ceiling must be unmoved by any adapter.
         if arm.raster_side_ceiling_px == arm.long_range_image_side_px {
             assert_eq!(
                 arm.raster_side_for_adapter(32768),
@@ -1415,10 +968,8 @@ fn the_raster_ceiling_follows_the_device_and_never_falls_below_what_shipped() {
         }
     }
 
-    // The reading is a *reading*: on the class whose ceiling was raised, two
-    // devices that differ must not be given the same answer. This is the
-    // assertion the `bool` could not make, and it fails if the ceiling is ever
-    // pinned back to its floor without this test being revisited.
+    // On the class whose ceiling was raised, two devices that differ must not
+    // be given the same answer.
     let desktop = budget::resolve(&DeviceProfile {
         limits: crate::budget::BudgetLimits::DESKTOP,
         ..DeviceProfile::for_target()

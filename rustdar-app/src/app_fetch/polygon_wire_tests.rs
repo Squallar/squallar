@@ -1,26 +1,3 @@
-//! The three polygon overlay dispatches are **described jobs**, end to end.
-//!
-//! `spawn_overlay_render`'s handler arm used to close over a rasterize
-//! closure and hand it to the opaque funnel, whose wasm arm ran it inline on
-//! the browser's one thread — 224 ms of measured gesture-end stall for the
-//! layer set these kinds make up (measured at main@ebe0ad3b, 2026-08-12
-//! web-baseline campaign; instrumentation 3673d316). These pin the
-//! replacement, per kind: the
-//! dispatch asks the handler for its described input (`prepare_job`), builds
-//! a `JobRequest::Overlay`, and hands it to the funnel — so a browser with a
-//! worker attached posts it across the port instead of paying the raster on
-//! the frame. And a job that is never answered still un-wedges the pane.
-//!
-//! Reverting the dispatch to a closure fails
-//! [`each_polygon_kind_dispatches_as_a_described_job_of_its_own_input`] by
-//! shape — the port records nothing, because a closure is executed rather
-//! than posted — and fails the un-wedge half by silence, since no failure
-//! response can exist for a job that was never described. The hit-map kinds
-//! took the same route a slice later (`hitmap_wire_tests`), the model grid
-//! last (`model_wire_tests`), and the described set as a whole is pinned
-//! from the other side by `rustdar-overlays`'
-//! `every_texture_kind_rasterizes_as_a_described_job`.
-
 use rustdar_egui::overlay_cache::OverlayTexturePlan;
 use rustdar_geo::GeoBounds;
 use rustdar_overlays::render::overlay_state::OverlayFetchResult;
@@ -28,10 +5,6 @@ use rustdar_overlays::types::{HatchPattern, OverlayFeature};
 use rustdar_source::id::{LayerId, known};
 use std::sync::{Arc, Mutex};
 
-/// A sink that records what the funnel hands it and takes every job —
-/// `sites_wire_tests`' port, restated here because each test file owns its
-/// double. The round trip is asserted on the recording, so the codec is on
-/// this path exactly as it is on the browser's.
 struct RecordingPort {
     taken: Arc<Mutex<Vec<(u64, rustdar_worker::offload::JobRequest)>>>,
 }
@@ -66,11 +39,6 @@ fn a_render_request() -> super::OverlayRenderRequest {
     }
 }
 
-/// The codec-row label whose input type `job` carries — the naming half the
-/// deleted `OverlayJobInput` match used to provide, restated over
-/// `downcast_ref` so a dispatch that described another kind's input is still
-/// caught by name. All seven texture inputs are listed; an input no row
-/// claims panics.
 fn described_label(job: &rustdar_source::job::DescribedJob) -> &'static str {
     use rustdar_overlays::render::rasterize as rz;
     if job.downcast_ref::<rz::AlertsInput>().is_some() {
@@ -92,8 +60,6 @@ fn described_label(job: &rustdar_source::job::DescribedJob) -> &'static str {
     }
 }
 
-/// A filled square inside [`a_render_request`]'s box, so every seeded kind
-/// has geometry that would paint.
 fn a_feature() -> OverlayFeature {
     OverlayFeature::new(
         vec![vec![vec![
@@ -110,10 +76,6 @@ fn a_feature() -> OverlayFeature {
     )
 }
 
-/// Give `app`'s registry the smallest data `kind`'s handler will describe.
-///
-/// Through `apply_fetch_result` — the same door a live fetch uses — so the
-/// handler's own delivery path runs, not some test-only installer.
 fn seed(app: &mut crate::app::App, id: &LayerId) {
     use rustdar_overlays::render::handlers::{alert, discussion, outlook};
     let data: rustdar_overlays::render::overlay_state::FetchPayload = match id {
@@ -143,10 +105,6 @@ fn seed(app: &mut crate::app::App, id: &LayerId) {
         }
         id if *id == known::SPC_OUTLOOK => {
             use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
-            // The outlook's "enabled" *is* its product set, and its data is
-            // keyed by (day, product): the toggle has to precede the payload
-            // for the two to meet — the same order `texture_tests::seed`
-            // states.
             app.gui.overlays.set_enabled(id, true);
             Box::new(outlook::SpcOutlookFetchResult {
                 day: OutlookDay::Day1,
@@ -187,13 +145,6 @@ fn seed(app: &mut crate::app::App, id: &LayerId) {
         kind: id.clone(),
         data,
     });
-    // Keep the pane's stored per-layer config in step with the handler, the
-    // way the UI does after every control change (`Gui::initialize_pane_enabled`
-    // seeded pane defaults at startup, and `spawn_overlay_render` reloads
-    // them at dispatch): without this, the dispatch would restore the
-    // outlook's default empty product set over the toggle this seed just set,
-    // and the test would be exercising a stale-config path rather than the
-    // routing it is about.
     let configs = app.gui.overlays.save_pane_configs();
     if let Some(pane) = app.gui.pane_mut(0) {
         pane.overlay_configs = configs;
@@ -208,14 +159,6 @@ fn in_flight(app: &mut crate::app::App, id: &LayerId) -> bool {
         .render_in_flight
 }
 
-/// Each polygon kind's dispatch posts **one described job** carrying **its
-/// own input variant** — not a closure, and not another kind's payload — and
-/// what it posts survives its own wire round trip and marks the pane in
-/// flight.
-///
-/// All three kinds in one walk because the routing is one match arm: a kind
-/// quietly moved back to the closure path posts nothing here, which is the
-/// exact regression this test exists to name.
 #[test]
 fn each_polygon_kind_dispatches_as_a_described_job_of_its_own_input() {
     let taken = Arc::new(Mutex::new(Vec::new()));
@@ -242,8 +185,6 @@ fn each_polygon_kind_dispatches_as_a_described_job_of_its_own_input() {
              the inline gesture-end rasterization this slice removed",
         );
         let (_, request) = &posted[before];
-        // The envelope destructure is irrefutable since WO-M7.2; the typed
-        // downcast below is what proves the dispatch posted this kind.
         let rustdar_worker::offload::JobRequest { geometry, job } = request;
         assert_eq!(
             (geometry.width, geometry.height),
@@ -262,8 +203,6 @@ fn each_polygon_kind_dispatches_as_a_described_job_of_its_own_input() {
             "the {kind:?} dispatch described some other kind's input — the \
              worker would rasterize the wrong layer under this pane's marks",
         );
-        // The browser's sink serialises exactly this value on its way out;
-        // the round trip here keeps the codec on the recorded path.
         assert_eq!(
             rustdar_worker::offload::JobRequest::from_bytes(&request.to_bytes()).as_ref(),
             Some(request),
@@ -277,13 +216,6 @@ fn each_polygon_kind_dispatches_as_a_described_job_of_its_own_input() {
     }
 }
 
-/// The failure path closes the loop for the polygon kinds the way it does
-/// for sites: the worker dies with the job outstanding, the funnel fails it,
-/// and the image-less response — the only thing that clears the named panes'
-/// in-flight marks — reaches the channel. One kind stands for the three
-/// because the deliver is one shared function (`overlay_job_deliver`, pinned
-/// by `frame_thread_conversion_tests`); what is per-kind is the dispatch,
-/// which the walk above covers.
 #[test]
 fn a_dead_worker_unwedges_an_alert_pane() {
     let taken = Arc::new(Mutex::new(Vec::new()));

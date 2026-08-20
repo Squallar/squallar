@@ -2,11 +2,6 @@ use crate::UI_CONFIG_KEY;
 use rustdar_kv::{KvStore, MemoryKvStore};
 
 /// Settings the user changed must come back after a save/load cycle.
-///
-/// Every asserted field is first checked to *differ* from what a fresh
-/// `Gui` starts with. Without that guard this test would still pass if
-/// `load_ui_config` did nothing at all, since the default would supply the
-/// expected value on its own.
 #[test]
 fn changed_settings_survive_a_save_and_load() {
     use crate::pane::{OrbitDelta, PaneKind};
@@ -31,8 +26,6 @@ fn changed_settings_survive_a_save_and_load() {
     gui.loop_speed_fps = 12.5;
     gui.pane_mut(0).unwrap().viewport_link = false;
     gui.pane_mut(0).unwrap().layer_link = false;
-    // A 3D pane whose camera has been moved off its default, so the assertion
-    // below is about the saved value rather than about two defaults agreeing.
     gui.pane_mut(0)
         .unwrap()
         .set_view(rustdar_radar::types::RenderView::Volume);
@@ -42,8 +35,6 @@ fn changed_settings_survive_a_save_and_load() {
             yaw_deg: -47.5,
             pitch_deg: 12.25,
             zoom_factor: 1.5,
-            // Panned and stretched too, so the round trip below covers every
-            // field the camera persists rather than only the three angles.
             pan: [0.2, -0.35, 0.1],
         });
         volume.camera.set_vertical_exaggeration(5.5);
@@ -76,15 +67,10 @@ fn changed_settings_survive_a_save_and_load() {
     );
 }
 
-/// M11-3. **An old config's `viewport_sync: false` loads as every restored
-/// pane viewport-unlinked, and `sync_layers: false` as every pane layer- and
-/// time-unlinked — the retired globals fold into the per-pane links once,
-/// on load.**
-///
-/// `sync_layers` seeds `time_link` too because under the old model that one
-/// global gated the whole shared-time fan-out: a pane's stored `time_link`
-/// was inert while it was off, and a migrated config must keep behaving as
-/// it observably did — no fan-out.
+/// M11-3. **An old config's `viewport_sync: false` loads as every restored pane
+/// viewport-unlinked, and `sync_layers: false` as every pane layer- and
+/// time-unlinked — the retired globals fold into the per-pane links once, on
+/// load.**
 #[test]
 fn a_legacy_global_off_seeds_every_restored_panes_links_off() {
     let store = MemoryKvStore::default();
@@ -120,7 +106,6 @@ fn a_legacy_global_off_seeds_every_restored_panes_links_off() {
         .unwrap();
     let mut restored = crate::Gui::new();
     assert!(restored.load_ui_config(&store));
-    // Pane 1 has no PaneConfig at all — the fold must reach it too.
     for idx in 0..2 {
         let pane = restored.pane(idx).unwrap();
         assert!(
@@ -135,14 +120,9 @@ fn a_legacy_global_off_seeds_every_restored_panes_links_off() {
     }
 }
 
-/// M11-4. **A config with no legacy globals — one this build wrote, or an
-/// old one that simply never mentioned them — loads with every pane linked,
-/// and the legacy fields are never written again.**
-///
-/// The second half is what makes the fold a *migration* rather than a
-/// second copy of the state: a save from the new model must not put
-/// `viewport_sync`/`sync_layers` back on the wire, or a later load would
-/// AND stale globals into links the user has since changed.
+/// M11-4. **A config with no legacy globals — one this build wrote, or an old one
+/// that simply never mentioned them — loads with every pane linked, and the legacy
+/// fields are never written again.**
 #[test]
 fn absent_legacy_globals_mean_linked_and_are_never_rewritten() {
     let store = MemoryKvStore::default();
@@ -176,12 +156,6 @@ fn absent_legacy_globals_mean_linked_and_are_never_rewritten() {
 
 /// A drawn Volume Alpha curve survives the round trip, per product, and an
 /// untouched product comes back untouched.
-///
-/// The untouched half is the bit-exactness pin at the persistence layer: a
-/// product with no entry must load with no entry, because "no entry" is
-/// what licenses the renderer to upload the palette's own LUT unmodified.
-/// A load that filled every product with a synthesised default curve would
-/// round-trip every *assertion about values* here and still break that.
 #[test]
 fn volume_alpha_curves_survive_a_save_and_load() {
     use crate::volume_alpha::{AlphaCurve, CURVE_LEN};
@@ -212,16 +186,13 @@ fn volume_alpha_curves_survive_a_save_and_load() {
     );
 }
 
-/// A config written before Volume Alpha existed loads with every editor
-/// untouched — the field defaults to empty, and empty means bit-exact.
+/// A config written before Volume Alpha existed loads with every editor untouched —
+/// the field defaults to empty, and empty means bit-exact.
 #[test]
 fn an_old_config_without_volume_alpha_loads_with_every_editor_untouched() {
     use rustdar_radar::types::RadarProduct;
 
     let store = MemoryKvStore::default();
-    // A minimal pre-feature config: every field the format has ever had is
-    // `#[serde(default)]`-covered, so `{}` is exactly what an old file
-    // looks like to the new deserializer.
     store
         .store(UI_CONFIG_KEY, "{}")
         .expect("the memory store accepts a write");
@@ -234,20 +205,14 @@ fn an_old_config_without_volume_alpha_loads_with_every_editor_untouched() {
     );
 }
 
-/// A hand-edited or version-skewed curve cannot poison the load: a wrong
-/// length is dropped by name, and a curve claiming a visible no-data index
-/// is re-clamped on the way in.
-///
-/// The re-clamp half is the config-side door of the index-0 invariant —
-/// the editor and the stroke both enforce it live, and this is the one
-/// writer that bypasses them.
+/// A hand-edited or version-skewed curve cannot poison the load: a wrong length is
+/// dropped by name, and a curve claiming a visible no-data index is re-clamped on
+/// the way in.
 #[test]
 fn a_hostile_volume_alpha_entry_is_dropped_or_reclamped_never_trusted() {
     use rustdar_radar::types::RadarProduct;
 
     let store = MemoryKvStore::default();
-    // Entry one: three alphas where 256 are required. Entry two: a full
-    // curve whose entry 0 claims opaque no-data.
     let mut full: Vec<String> = vec!["255".to_owned(); 256];
     full[1] = "9".to_owned();
     let json = format!(
@@ -285,14 +250,8 @@ fn a_hostile_volume_alpha_entry_is_dropped_or_reclamped_never_trusted() {
     assert_eq!(velocity.alphas()[255], 255);
 }
 
-/// A 3D pane's view mode and the per-product isosurface thresholds
-/// survive the round trip; an untouched product comes back untouched.
-///
-/// The untouched half is the exceptions-store pin, exactly as the alpha
-/// curves': absence means the argued default, and a load that filled
-/// every product with an entry would survive the value assertions and
-/// still break "re-arguing a default reaches everyone who never moved
-/// it".
+/// A 3D pane's view mode and the per-product isosurface thresholds survive the
+/// round trip; an untouched product comes back untouched.
 #[test]
 fn the_isosurface_mode_and_thresholds_survive_a_save_and_load() {
     use crate::pane::VolumeViewMode;
@@ -327,18 +286,6 @@ fn the_isosurface_mode_and_thresholds_survive_a_save_and_load() {
 }
 
 /// A 3D pane that turned its map floor off comes back with it off.
-///
-/// The rule this serves is the codebase's standing one: reopening the app is
-/// 1:1 visually with how it was closed, live data excepted. The floor is not
-/// live data — it is a choice the user made with a checkbox — so a pane that
-/// closed without a floor and opened with one is a visible difference on
-/// launch, which is exactly what the rule forbids. `hide_floor` was
-/// hardcoded to `false` on load and commented as session state; this is the
-/// pin on that no longer being true.
-///
-/// Both directions are asserted, because a field written but never read and a
-/// field read but never written fail in opposite halves of the round trip and
-/// a one-sided test sees only one of them.
 #[test]
 fn a_hidden_map_floor_survives_a_save_and_load() {
     let store = MemoryKvStore::default();
@@ -370,12 +317,6 @@ fn a_hidden_map_floor_survives_a_save_and_load() {
 }
 
 /// The derived-rung choice survives a save and load, both directions.
-///
-/// Reopening is 1:1 with how the app was closed, and this setting is one of the
-/// least visible there is: it does nothing at all until a volume arrives with no
-/// NWS storm motion on it. A reader who chose the Bunkers right-mover, closed
-/// the app, and later found the mean wind would have no way to tell a lost
-/// setting from a setting that simply had not applied yet.
 #[test]
 fn the_storm_motion_fallback_survives_a_save_and_load() {
     use rustdar_radar::srv::SrvFallback;
@@ -398,7 +339,6 @@ fn the_storm_motion_fallback_survives_a_save_and_load() {
         "a reader who asked for the right-mover must come back to it",
     );
 
-    // And back again, or the field is written once and pinned.
     restored.srv_fallback = SrvFallback::MeanWind;
     restored.save_ui_config(&store);
     let mut again = crate::Gui::new();
@@ -406,13 +346,8 @@ fn the_storm_motion_fallback_survives_a_save_and_load() {
     assert_eq!(again.srv_fallback, SrvFallback::MeanWind);
 }
 
-/// A config written before the choice existed comes back on the mean wind, and
-/// one naming a rung this build does not have does **not** cost the whole file.
-///
-/// The second half is `product_or_default`'s lesson applied here: a bare derived
-/// `Deserialize` fails the entire load on an unknown variant, the autosave then
-/// rewrites from defaults, and a reader who ran a newer build once loses their
-/// site, layout and curves permanently. A round trip can never see either case.
+/// A config written before the choice existed comes back on the mean wind, and one
+/// naming a rung this build does not have does **not** cost the whole file.
 #[test]
 fn a_config_from_another_build_still_loads_its_storm_motion_fallback() {
     use rustdar_radar::srv::SrvFallback;
@@ -444,14 +379,6 @@ fn a_config_from_another_build_still_loads_its_storm_motion_fallback() {
 
 /// A config written before `hide_floor` existed comes back with the floor
 /// **showing**.
-///
-/// This is what the wire form's inversion buys, and it is the reason the
-/// persisted field is `hide_floor` rather than a positive `show_floor`:
-/// `#[serde(default)]` supplies `false` for the missing key, and `false` is
-/// the floor showing. Stored the other way round, every config already on
-/// every user's disk would restore with the floor off — a silent, global
-/// regression on the first launch after the upgrade, and one no round-trip
-/// test would catch because a round trip never sees an absent key.
 #[test]
 fn a_config_written_before_the_floor_toggle_keeps_its_floor() {
     let store = MemoryKvStore::default();
@@ -473,22 +400,8 @@ fn a_config_written_before_the_floor_toggle_keeps_its_floor() {
     );
 }
 
-/// A config from a build in which 3D was a **pane kind** comes back as a map
-/// pane in the 3D render mode — the same picture, with its camera.
-///
-/// `"kind": "Volume"` is a name this program no longer has, and there are three
-/// things it could do with it. Failing the load loses the user's entire
-/// configuration over one word. Falling back to a plain map — which is what
-/// `kind_or_default` does with a name it does not recognise — silently
-/// downgrades their layout on the first launch after an update, with the camera
-/// they aimed still sitting in the file underneath. Reading it as the mode it
-/// always meant is the only one that keeps the promise the persistence makes,
-/// so `PaneKindConfig` keeps the variant on the wire deliberately: read-only,
-/// never written again.
-///
-/// The camera is asserted too, not just the mode. A migration that produced a
-/// 3D pane pointing somewhere else would be a pane the user has to re-aim, and
-/// it would look exactly like the app forgetting.
+/// A config from a build in which 3D was a **pane kind** comes back as a map pane
+/// in the 3D render mode — the same picture, with its camera.
 #[test]
 fn a_config_naming_the_old_3d_pane_kind_comes_back_as_a_3d_render_mode() {
     use crate::pane::{MapRender, OrbitCamera, PaneKind};
@@ -562,34 +475,19 @@ fn a_config_naming_the_old_3d_pane_kind_comes_back_as_a_3d_render_mode() {
         "and so must the floor they turned off — through the inverted key, \
          unchanged on the wire",
     );
-    // `source_pane` no longer exists at all, and the `region` block beside it is
-    // the **square-drag** form: `half_width_km`, one number, plus the pane the
-    // drag happened on. A region is stored again and under the same key, so this
-    // is the migration hazard `VolumeRegionConfig::restore` exists for — the old
-    // block's extent keys are absent, `#[serde(default)]` reads them as zero,
-    // and `VolumeRegion::new`'s clamp would turn that into a 10 km box centred
-    // on the old drag. A pane opening onto a twentieth of a county is a worse
-    // answer than one opening onto the whole ring, and it would look exactly
-    // like the user had asked for it.
     assert_eq!(
         volume.region, None,
         "the square-drag region block was resurrected as a two-axis pick - the \
          extent keys it does not have were laundered through the extent clamp",
     );
 
-    // The pane beside it is untouched, so the migration is about the one pane
-    // rather than about the file.
     let sibling = gui.pane(1).expect("pane 1");
     assert_eq!(sibling.kind(), PaneKind::Map);
     assert_eq!(sibling.map_render(), Some(MapRender::Plan));
 }
 
-/// Saving after that migration writes the **new** vocabulary, so the legacy
-/// name is read once and never again.
-///
-/// Without this the wire would keep two spellings of one state alive
-/// indefinitely, and the `Volume` variant would quietly become something this
-/// build writes rather than something it only tolerates.
+/// Saving after that migration writes the **new** vocabulary, so the legacy name is
+/// read once and never again.
 #[test]
 fn a_migrated_3d_pane_is_saved_in_the_new_vocabulary() {
     use crate::pane::MapRender;
@@ -615,7 +513,6 @@ fn a_migrated_3d_pane_is_saved_in_the_new_vocabulary() {
         "with the render mode carrying what the kind used to",
     );
 
-    // And it round-trips through the new spelling.
     let again = MemoryKvStore::default();
     again.store(UI_CONFIG_KEY, &json).expect("storable");
     let mut restored = crate::Gui::new();
@@ -626,9 +523,9 @@ fn a_migrated_3d_pane_is_saved_in_the_new_vocabulary() {
     );
 }
 
-/// A view mode from a future build loads as the lit volume, and a
-/// threshold for an unknown product is dropped — the same forward
-/// tolerance the product enum has, pinned for the two new fields.
+/// A view mode from a future build loads as the lit volume, and a threshold for an
+/// unknown product is dropped — the same forward tolerance the product enum has,
+/// pinned for the two new fields.
 #[test]
 fn an_unknown_view_mode_or_iso_product_does_not_poison_the_load() {
     use crate::pane::VolumeViewMode;
@@ -676,16 +573,6 @@ fn an_unknown_view_mode_or_iso_product_does_not_poison_the_load() {
 }
 
 /// A config naming a product this build does not know still loads.
-///
-/// The products WP multiplies the entries in saved configs, so the failure
-/// this pins is a *forward*-compatibility one: a config written by a later
-/// build (or the same build with a product since renamed) must not fail
-/// the whole load — which would cost the user their site, layout and
-/// curves permanently, because the autosave then rewrites the file from
-/// defaults. The pane falls back to the default product; everything else
-/// in the file survives. The fixture site is deliberately not the KTLX
-/// default, so "the site survived" cannot pass by the default masking a
-/// failed load.
 #[test]
 fn a_config_naming_a_product_from_the_future_still_loads() {
     use rustdar_radar::types::RadarProduct;
@@ -719,19 +606,6 @@ fn a_config_naming_a_product_from_the_future_still_loads() {
 }
 
 /// A config naming a **pane kind** this build does not know still loads.
-///
-/// Exactly the loss [`a_config_naming_a_product_from_the_future_still_loads`]
-/// closes, on the field this application is currently adding variants to: a
-/// pane kind is a unit enum on the wire, `serde` refuses an unknown one, and
-/// `load_ui_config` has a single `Result` for the entire file — so one word
-/// from a later build used to cost the user their site, layout, camera and
-/// curves permanently, because the autosave then rewrites the file from
-/// defaults.
-///
-/// The second pane carries a live volume so the assertion is not merely that
-/// *something* loaded: an unknown kind on pane 0 must not disturb pane 1, and
-/// the fixture's site and lookback are deliberately not the defaults, so a
-/// failed load cannot pass by looking like a fresh one.
 #[test]
 fn a_config_naming_a_pane_kind_from_the_future_still_loads() {
     let store = MemoryKvStore::default();
@@ -776,23 +650,8 @@ fn a_config_naming_a_pane_kind_from_the_future_still_loads() {
     );
 }
 
-/// A hand-edited `site` made of bytes no identifier contains is refused here,
-/// at the file, and never reaches the byte range that used to split it.
-///
-/// This is the config-side door of a **panic**, not of a wrong picture.
-/// `level3::site_code` reduces the four-letter ICAO to the three-letter code
-/// the Level III bucket keys on by taking `&id[1..]`, and `id.len()` counts
-/// bytes: `"éab"` is four bytes with a two-byte leading character, so that
-/// range landed inside a UTF-8 sequence. `ui.json` is a file on the user's
-/// disk, so typing those three characters into it was enough to kill the
-/// process on the next Level III fetch.
-///
-/// Both `site` fields are hostile, because they are two separate doors — the
-/// top-level one seeds panes the file did not describe, and the per-pane one
-/// overrides it. Empty is the refusal, which `apply_to` already reads as "not
-/// set"; the pane keeps the site startup picked rather than a name no radar
-/// has. The lookback and the second pane's site are ordinary and must survive,
-/// so a load that failed outright cannot pass this by looking like a fresh one.
+/// A hand-edited `site` made of bytes no identifier contains is refused here, at
+/// the file, and never reaches the byte range that used to split it.
 #[test]
 fn a_config_naming_a_site_no_radar_could_have_is_refused_not_sliced() {
     let store = MemoryKvStore::default();
@@ -820,12 +679,6 @@ fn a_config_naming_a_site_no_radar_could_have_is_refused_not_sliced() {
 
     let restored = gui.pane(0).map(|pane| pane.site.clone()).expect("a pane");
 
-    // Reduced before anything is asserted about *which* site survived, and
-    // that order is the point of the test: the defect is a panic, not a wrong
-    // answer, so the line that has to run is the one the process used to die
-    // in. Remove either half of the fix and this is where the run ends, with
-    // `byte index 1 is not a char boundary`, reached from nothing but a text
-    // editor pointed at `ui.json`.
     assert!(
         rustdar_radar::level3::site_code(&restored).is_ascii(),
         "the surviving identifier must reduce cleanly",
@@ -851,14 +704,8 @@ fn a_config_naming_a_site_no_radar_could_have_is_refused_not_sliced() {
     );
 }
 
-/// An alpha curve saved for an unknown product is dropped, never
-/// reassigned to a product this build knows.
-///
-/// Falling back to a default here — the way the pane's product picker does
-/// — would be wrong in kind, not just in degree: the curve would silently
-/// restyle a product the user never drew it for. The entry beside it must
-/// still load, pinning that the drop is per-entry rather than the whole
-/// list.
+/// An alpha curve saved for an unknown product is dropped, never reassigned to a
+/// product this build knows.
 #[test]
 fn an_alpha_curve_for_an_unknown_product_is_dropped_not_reassigned() {
     use rustdar_radar::types::RadarProduct;
@@ -891,17 +738,6 @@ fn an_alpha_curve_for_an_unknown_product_is_dropped_not_reassigned() {
 }
 
 /// A cross-section pane's line and source survive the round trip.
-///
-/// Separate from the test above because a section pane is the kind nothing
-/// creates yet: it is reachable only through `set_kind`, and its persistence
-/// has to be right *before* WP-G's draw interaction starts producing them —
-/// otherwise the first line a user ever draws is also the first one to be
-/// silently lost on restart.
-///
-/// The endpoints are compared exactly. They are `f64` written and read as
-/// decimal by `serde_json`, which round-trips every finite `f64` exactly, and
-/// `SectionTarget`'s staleness comparison is bitwise — so an approximate
-/// assertion here would hide the one kind of drift that matters.
 #[test]
 fn a_drawn_section_line_survives_a_save_and_load() {
     use crate::pane::{PaneKind, SectionLine};
@@ -958,15 +794,8 @@ fn a_drawn_section_line_survives_a_save_and_load() {
     );
 }
 
-/// Every shape a config can describe that the in-memory representation
-/// cannot, and each one falls back to a map rather than failing the load.
-///
-/// `PaneContent` derives the kind from the content, so none of these is
-/// representable in the app — they exist only on the wire, where a file can
-/// say anything: hand-edited, shared between versions, or written by a later
-/// version than the one reading it. `Map` is the fallback because it is the
-/// kind that needs nothing, and refusing the whole config would throw away
-/// the site, the layout and every layer setting over one bad number.
+/// Every shape a config can describe that the in-memory representation cannot, and
+/// each one falls back to a map rather than failing the load.
 #[test]
 fn a_pane_config_that_cannot_be_a_pane_loads_as_a_map() {
     use crate::pane::PaneKind;
@@ -1016,12 +845,8 @@ fn a_pane_config_that_cannot_be_a_pane_loads_as_a_map() {
     }
 }
 
-/// A section pane converted but not yet aimed is an ordinary state, not a
-/// corrupt one.
-///
-/// It is what every section pane looks like between being created and having
-/// a line drawn on a map, so a loader that treated a missing line as
-/// unrecoverable would convert it back to a map on every restart.
+/// A section pane converted but not yet aimed is an ordinary state, not a corrupt
+/// one.
 #[test]
 fn a_section_pane_with_no_line_yet_comes_back_as_a_section() {
     use crate::pane::PaneKind;
@@ -1047,15 +872,8 @@ fn a_section_pane_with_no_line_yet_comes_back_as_a_section() {
     assert_eq!(restored.pane(0).unwrap().kind(), PaneKind::CrossSection);
 }
 
-/// A source-pane index the restored layout does not have is forgotten, and the
-/// pane stays a section.
-///
-/// This is a six-pane desktop config opened on a phone: the clamp narrows the
-/// layout, and an index saved against the wider one now names a different pane
-/// or none at all. Dropped rather than clamped, because retargeting a section
-/// onto whichever map happens to sit nearby is worse than treating it as never
-/// having been aimed from anywhere — and the kind is kept, because the line
-/// itself is still a perfectly good line.
+/// A source-pane index the restored layout does not have is forgotten, and the pane
+/// stays a section.
 #[test]
 fn a_section_sourced_from_a_pane_that_is_gone_forgets_where_it_came_from() {
     use crate::pane::PaneKind;
@@ -1093,10 +911,6 @@ fn a_section_sourced_from_a_pane_that_is_gone_forgets_where_it_came_from() {
 }
 
 /// A config written before pane kinds existed loads as a screen full of maps.
-///
-/// The container carries `#[serde(default)]`, so no per-field attribute is
-/// needed — the same mechanism `live_chunks` and `notifier_endpoint` rely on.
-/// This is the shape every already-installed copy has on disk.
 #[test]
 fn a_config_predating_pane_kinds_loads_as_maps() {
     use crate::pane::PaneKind;
@@ -1123,19 +937,8 @@ fn a_config_predating_pane_kinds_loads_as_maps() {
     assert_eq!(restored.pane(1).unwrap().site, "KOUN");
 }
 
-/// A restored non-map pane arrives with the same invariants as a converted
-/// one: no running loop.
-///
-/// The loader goes through `PaneState::set_content` rather than writing
-/// `content`, so that the teardown a kind change implies has exactly one
-/// description — see `PaneState::set_kind` for what a loop left running on a
-/// pane nothing renders frames for actually does, which includes stopping
-/// every *other* pane's loop from ever starting.
-///
-/// The pane is given a live loop first, which the startup path cannot
-/// currently produce (the config is loaded into a fresh `Gui`). That is the
-/// point: the invariant belongs to the setter rather than to the sequence its
-/// callers happen to run in today.
+/// A restored non-map pane arrives with the same invariants as a converted one: no
+/// running loop.
 #[test]
 fn a_restored_non_map_pane_has_no_running_loop() {
     use crate::pane::LoopPhase;
@@ -1171,13 +974,6 @@ fn a_restored_non_map_pane_has_no_running_loop() {
 }
 
 /// A finite camera outside the documented range is clamped, not discarded.
-///
-/// The distinction the loader draws: a value that is *unusable* — non-finite,
-/// off the earth, a line with no bearing — costs the pane its kind, and one
-/// that is merely *out of range* is brought inside it. Only a hand-edited or
-/// version-skewed config can produce the second, and `restore_viewport`
-/// reasons the same way about a saved zoom: there is nothing to propagate, and
-/// the nearest legal camera beats discarding the pane over a number.
 #[test]
 fn a_saved_camera_out_of_range_is_clamped_rather_than_dropped() {
     let store = MemoryKvStore::default();
@@ -1219,18 +1015,6 @@ fn a_saved_camera_out_of_range_is_clamped_rather_than_dropped() {
 }
 
 /// A picked region survives a save and a load, both axes and both coordinates.
-///
-/// The region is a **choice**, and the pane's own doc says so in as many words:
-/// a carefully aimed box coming back as the whole ring on the next launch is
-/// the pane un-aiming itself, one restart slower than the zoom used to do it.
-/// For a while there was nothing to save — the box was measured off the viewport
-/// every frame — while the config's doc went on claiming it was persisted. This
-/// is what makes that claim true.
-///
-/// The four numbers are all different and none is the default, so a lane
-/// dropped, defaulted or transposed fails: `half_east_km` and `half_north_km`
-/// are adjacent and same-typed, which is the transposition
-/// `rustdar_radar::voxel::HalfExtentKm` exists to make visible.
 #[test]
 fn a_picked_region_survives_a_save_and_load() {
     let picked = crate::pane::VolumeRegion::new(
@@ -1274,12 +1058,6 @@ fn a_picked_region_survives_a_save_and_load() {
 }
 
 /// The map a region was picked on survives the round trip beside the region.
-///
-/// Two things depend on it and both are invisible until they are gone: a second
-/// drag on that map re-aims *this* pane rather than opening another one, and
-/// this pane's box is drawn back on that map — the only on-screen answer to
-/// "where is that volume from". A reopen that lost it would leave a layout that
-/// looked identical and behaved differently the next time the user dragged.
 #[test]
 fn the_map_a_region_was_picked_on_survives_a_save_and_load() {
     let picked = crate::pane::VolumeRegion::new(
@@ -1330,20 +1108,8 @@ fn the_map_a_region_was_picked_on_survives_a_save_and_load() {
     );
 }
 
-/// A source index the restored layout does not have is **forgotten, and the
-/// region is kept**.
-///
-/// Six panes opened on a desktop and reopened on a phone brings back indices
-/// that now name a different pane or none at all. Dropped rather than clamped,
-/// for the reason a section's dangling source is: re-aiming a 3D view from
-/// whichever map happens to sit at a nearby index is worse than treating it as
-/// never having been aimed from anywhere.
-///
-/// The **region survives it**, and that asymmetry is the point. A region is
-/// ground, and ground does not stop existing because the map it was drawn on
-/// did — the pane comes back showing exactly what it showed, which is the whole
-/// of the 1:1 reopen rule. What is lost is only the preference about where a
-/// future drag lands, which is a fact about a layout that no longer exists.
+/// A source index the restored layout does not have is **forgotten, and the region
+/// is kept**.
 #[test]
 fn a_dangling_source_pane_is_forgotten_and_the_region_kept() {
     let picked = crate::pane::VolumeRegion::new(
@@ -1367,15 +1133,12 @@ fn a_dangling_source_pane_is_forgotten_and_the_region_kept() {
             .volume_mut()
             .expect("a 3D pane");
         volume.region = Some(picked);
-        // The highest pane of the wide layout, so the narrow one below cannot
-        // hold it.
         volume.source_pane = Some(3);
     }
 
     let store = MemoryKvStore::default();
     wide.save_ui_config(&store);
 
-    // Reopened into a layout that does not reach index 3.
     let mut narrow = crate::Gui::new();
     narrow.load_ui_config(&store);
     narrow.set_pane_count(2);
@@ -1394,22 +1157,8 @@ fn a_dangling_source_pane_is_forgotten_and_the_region_kept() {
     );
 }
 
-/// What the write-side finiteness filter actually prevents — and it is worse
-/// than "the config fails to serialize".
-///
-/// `serde_json` does **not** refuse a non-finite float. It writes `null`. So
-/// the write succeeds silently, the file on disk looks fine, and it is the
-/// *next load* that fails: `null` will not deserialize into an `f32`, so
-/// `from_str::<UiConfig>` errors, `load_ui_config` logs one warning and
-/// returns `false`, and every setting in the file is gone. The user's only
-/// symptom is the app forgetting everything — one run after the mistake, with
-/// nothing at the time to connect the two, and permanently, because the next
-/// autosave rewrites the file from defaults.
-///
-/// That is why the guard is on the *write* side for every float, including the
-/// ones whose in-memory writers already promise finiteness
-/// (`OrbitCamera::nudge`, `SectionLine::new`): a filter costs one pane its
-/// kind, a missing filter costs the user their whole configuration.
+/// What the write-side finiteness filter actually prevents — and it is worse than
+/// "the config fails to serialize".
 #[test]
 fn a_non_finite_float_would_poison_the_config_file_permanently() {
     assert_eq!(
@@ -1423,14 +1172,9 @@ fn a_non_finite_float_would_poison_the_config_file_permanently() {
         "and this is the half that makes it permanent"
     );
 
-    // The property the filter protects: a `Gui` with a non-map pane writes a
-    // config that loads back, rather than one that reads as corrupt.
     let mut gui = crate::Gui::new();
     let pane = gui.pane_mut(0).unwrap();
     pane.set_view(rustdar_radar::types::RenderView::Volume);
-    // Moved, because an untouched camera is omitted from the file entirely —
-    // and a file with no `volume` block would exercise none of the guards
-    // below.
     pane.map_mut()
         .expect("a map pane")
         .volume
@@ -1444,10 +1188,6 @@ fn a_non_finite_float_would_poison_the_config_file_permanently() {
     let json = gui
         .ui_config_json()
         .expect("a 3D pane stopped the config from being written at all");
-    // Checked per field rather than by looking for `null` anywhere: the file
-    // legitimately contains several, because an absent `Option` is written that
-    // way and reads back as `None`. It is the **non-**`Option` numbers that
-    // cannot survive one.
     let written: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
     for field in ["yaw_deg", "pitch_deg", "eye_distance"] {
         let value = &written["panes"][0]["volume"][field];
@@ -1499,15 +1239,12 @@ fn a_panned_and_zoomed_map_comes_back_where_it_was_left() {
     let pane = restored.pane(0).unwrap();
     assert_eq!(pane.map_memory.zoom(), 9.0);
     let center = pane.map_memory.detached().expect("the pan was persisted");
-    // `Position` is (x, y) = (lon, lat). A transposition here is silently a
-    // valid coordinate, just the wrong hemisphere.
     assert!((center.y() - 44.9778).abs() < 1e-9, "lat {}", center.y());
     assert!((center.x() + 93.2650).abs() < 1e-9, "lon {}", center.x());
 }
 
-/// Following the site and being centred on the site's coordinates look the
-/// same until the pane changes site, at which point one moves and the other
-/// does not. A round trip must not silently convert the first into the second.
+/// Following the site and being centred on the site's coordinates look the same
+/// until the pane changes site, at which point one moves and the other does not.
 #[test]
 fn a_map_following_its_site_does_not_come_back_pinned() {
     let store = MemoryKvStore::default();
@@ -1527,15 +1264,13 @@ fn a_map_following_its_site_does_not_come_back_pinned() {
     );
 }
 
-/// Configs written before the viewport was persisted must keep the built-in
-/// default zoom rather than being read as "saved zoom 0".
+/// Configs written before the viewport was persisted must keep the built-in default
+/// zoom rather than being read as "saved zoom 0".
 #[test]
 fn a_config_predating_viewport_persistence_keeps_the_default_zoom() {
     let store = MemoryKvStore::default();
     let default_zoom = crate::Gui::new().pane(0).unwrap().map_memory.zoom();
 
-    // A config with panes but no `zoom`/`center` keys at all — exactly the
-    // shape every already-installed copy of the app has on disk right now.
     store
         .store(
             UI_CONFIG_KEY,
@@ -1555,19 +1290,9 @@ fn a_config_predating_viewport_persistence_keeps_the_default_zoom() {
     assert!(restored.pane(0).unwrap().map_memory.detached().is_none());
 }
 
-// --- The restored viewport vs. the session's first scan -------------------
-//
-// Everything below asserts *past* the first scan, which is the blind spot the
-// rest of this file has: `a_panned_and_zoomed_map_comes_back_where_it_was_left`
-// checks the zoom at the load boundary and stops, and no persistence test ever
-// delivers data afterwards. `Gui::claim_initial_zoom` runs on the first scan of
-// the process and used to overwrite every pane's zoom with
-// `DEFAULT_INITIAL_ZOOM` — including the one the load had just restored, which
-// the next autosave then wrote back to disk.
-
-/// A minimal `ScanInfo`. Only its arrival matters here, not its contents; the
-/// site the delivery is *addressed to* is the `ScanInfoForSite` event's
-/// site field, not this.
+/// A minimal `ScanInfo`. Only its arrival matters here, not its contents; the site
+/// the delivery is *addressed to* is the `ScanInfoForSite` event's site field, not
+/// this.
 fn a_scan() -> rustdar_radar::types::ScanInfo {
     rustdar_radar::types::ScanInfo {
         site: rustdar_radar::sites::RadarSite {
@@ -1590,11 +1315,6 @@ fn a_scan() -> rustdar_radar::types::ScanInfo {
 }
 
 /// Save at zoom 9, reload, then let the session's first scan arrive.
-///
-/// The restore was already correct; what was broken is that it did not survive
-/// contact with the first volume, and the clobbered value was then persisted —
-/// so one launch destroyed the zoom permanently, unrecoverably by quitting
-/// without touching anything.
 #[test]
 fn a_restored_zoom_survives_the_sessions_first_scan() {
     let store = MemoryKvStore::default();
@@ -1628,8 +1348,6 @@ fn a_restored_zoom_survives_the_sessions_first_scan() {
         "the session's first scan overwrote the zoom the load had restored"
     );
 
-    // The destructive half: whatever is on the pane now is what the next
-    // autosave commits to disk.
     let second = MemoryKvStore::default();
     restored.save_ui_config(&second);
     let mut again = crate::Gui::new();
@@ -1641,9 +1359,9 @@ fn a_restored_zoom_survives_the_sessions_first_scan() {
     );
 }
 
-/// The chunk-path twin. With live mode fed by the real-time chunk bucket, the
-/// first data of a session arrives through `ChunkScanInfo` instead, and
-/// it claims the same latch.
+/// The chunk-path twin. With live mode fed by the real-time chunk bucket, the first
+/// data of a session arrives through `ChunkScanInfo` instead, and it claims the
+/// same latch.
 #[test]
 fn a_restored_zoom_survives_the_sessions_first_chunk_volume() {
     let store = MemoryKvStore::default();
@@ -1670,9 +1388,7 @@ fn a_restored_zoom_survives_the_sessions_first_chunk_volume() {
 }
 
 /// Anti-degeneration guard 1: deleting the latch also makes the two tests above
-/// pass. A first run has no config to restore, so its panes are still at the
-/// roughly continental `DEFAULT_PANE_ZOOM`, and the first scan is what makes
-/// that a radar view. That must keep happening.
+/// pass.
 #[test]
 fn a_first_run_with_no_config_still_zooms_to_the_radar_on_its_first_scan() {
     let store = MemoryKvStore::default();
@@ -1703,9 +1419,8 @@ fn a_first_run_with_no_config_still_zooms_to_the_radar_on_its_first_scan() {
 }
 
 /// Anti-degeneration guard 2: a config written before viewport persistence
-/// (`ee823ca5`) has no `zoom` key at all — every already-installed copy of the
-/// app on disk right now. Nothing was restored, so the pane is at the same
-/// continental default as a first run and the latch must still fire.
+/// (`ee823ca5`) has no `zoom` key at all — every already-installed copy of the app
+/// on disk right now.
 #[test]
 fn a_config_without_a_saved_zoom_still_zooms_to_the_radar_on_its_first_scan() {
     let store = MemoryKvStore::default();
@@ -1737,11 +1452,6 @@ fn a_config_without_a_saved_zoom_still_zooms_to_the_radar_on_its_first_scan() {
 }
 
 /// A scan nobody asked for must not spend the one-shot latch, nor move maps.
-///
-/// The latch is claimed after the match loop, so a volume arriving for a site
-/// no pane is on — a fetch that landed after the pane switched away — used to
-/// zoom *every* pane and burn the claim, leaving the scan the user is actually
-/// waiting on with nothing to do.
 #[test]
 fn a_scan_no_pane_is_watching_neither_moves_a_map_nor_spends_the_latch() {
     let mut gui = crate::Gui::new();
@@ -1771,14 +1481,6 @@ fn a_scan_no_pane_is_watching_neither_moves_a_map_nor_spends_the_latch() {
 }
 
 /// A pane layout wider than a phone offers survives the round trip.
-///
-/// This is the data-loss bug the clamp exists to prevent, asserted at the
-/// call site rather than on the constant. `max_panes_absolute()`'s *value*
-/// was already pinned in `ui_layout`, but nothing checked that
-/// `load_ui_config` used it: reverting the clamp to
-/// `WidthClass::Compact.max_panes()` — the precise regression — passed the
-/// whole suite. A 6-pane desktop layout opened once on a phone came back as
-/// 4 and was written back as 4 on the next save.
 #[test]
 fn a_pane_layout_wider_than_a_phone_offers_survives_the_round_trip() {
     use crate::ui_layout::WidthClass;
@@ -1804,8 +1506,6 @@ fn a_pane_layout_wider_than_a_phone_offers_survives_the_round_trip() {
              user's layout is gone and the next save writes the truncated one"
     );
 
-    // Saving it again must not quietly narrow it either — the round trip
-    // is what turns a one-off clamp into permanent data loss.
     let second = MemoryKvStore::default();
     restored.save_ui_config(&second);
     let mut again = crate::Gui::new();
@@ -1819,8 +1519,8 @@ fn a_pane_layout_wider_than_a_phone_offers_survives_the_round_trip() {
     );
 }
 
-/// Loading from a store with nothing in it must leave the defaults alone
-/// rather than zeroing them — this is every first run.
+/// Loading from a store with nothing in it must leave the defaults alone rather
+/// than zeroing them — this is every first run.
 #[test]
 fn an_empty_store_leaves_defaults_untouched() {
     let store = MemoryKvStore::default();
@@ -1846,18 +1546,6 @@ fn unparseable_config_is_ignored() {
 }
 
 /// A fold limit is a fact about a sweep, so it is never written to the config.
-///
-/// The velocity legend's `folds ±N` annotation is derived from the radar
-/// texture's own metadata and from nothing else, which is what makes a
-/// schema-free reopen honest: the number belongs to the volume that was on the
-/// glass, and a session that reopens tomorrow downloads a different volume,
-/// possibly from a radar that has since reselected its PRFs. A persisted copy
-/// would come back beside those new pixels and describe the old ones — the one
-/// failure the whole "what is on the glass" gate exists to prevent.
-///
-/// So a restored pane starts silent and speaks again with its first render, and
-/// this pins both halves: nothing in the written blob mentions a fold limit,
-/// and the pane that comes back out of it answers `None`.
 #[test]
 fn a_reopened_pane_carries_no_fold_limit_until_its_first_render() {
     let store = MemoryKvStore::default();
@@ -1889,8 +1577,8 @@ fn a_reopened_pane_carries_no_fold_limit_until_its_first_render() {
     );
 }
 
-/// Saving writes under the shared key, which is what the filesystem backend
-/// maps onto `ui.json`.
+/// Saving writes under the shared key, which is what the filesystem backend maps
+/// onto `ui.json`.
 #[test]
 fn save_writes_under_the_ui_key() {
     let store = MemoryKvStore::default();

@@ -3,11 +3,8 @@ use nmea::sentences::FixType;
 
 /// The GGA fix-quality indicator, in this crate's own vocabulary.
 ///
-/// Exactly the nine codes NMEA can put on the wire — nothing else, because a
-/// parser can only report what a sentence said. What each one means to the
-/// *app* (which of them may relocate a map, which are noise) is the fix
-/// model's business, and the fix model lives above this crate:
-/// `rustdar_location`'s `serial` module owns that translation.
+/// Exactly the nine codes NMEA can put on the wire. What each one means to the
+/// *app* is the fix model's business, in `rustdar_location`'s `serial` module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParsedQuality {
     None,
@@ -24,11 +21,9 @@ pub enum ParsedQuality {
 /// One position-bearing sentence's accumulated result, in this crate's own
 /// vocabulary.
 ///
-/// Deliberately not the app's fix type: this crate parses NMEA and knows
-/// nothing about what an application does with a position. There is no
-/// accuracy field because NMEA has none — GGA and GSA give
-/// [`hdop`](Self::hdop), a dimensionless geometry factor, and turning that
-/// into metres needs the receiver's UERE, which it does not report.
+/// Deliberately not the app's fix type. There is no accuracy field because
+/// NMEA has none — GGA and GSA give [`hdop`](Self::hdop), a dimensionless
+/// geometry factor, and turning that into metres needs the receiver's UERE.
 #[derive(Debug, Clone)]
 pub struct ParsedFix {
     /// Latitude in decimal degrees, positive = North.
@@ -41,8 +36,7 @@ pub struct ParsedFix {
     pub speed_mps: Option<f64>,
     /// True course heading in degrees (0–360, from RMC/VTG). Suppressed below
     /// `MIN_SPEED_FOR_BEARING_MPS` — course-over-ground from a near-stationary
-    /// receiver is noise. That is a statement about NMEA receivers, so the
-    /// parser is where it is decided.
+    /// receiver is noise.
     pub heading_deg: Option<f64>,
     /// Number of satellites in use (from GGA).
     pub satellites: Option<u8>,

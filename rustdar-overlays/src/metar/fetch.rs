@@ -5,8 +5,6 @@
 //! 2026-07-25 with `curl -H 'Origin: https://example.com'`, it answers `200`
 //! with no `Access-Control-Allow-Origin` at all, so the web build cannot use it.
 //!
-//! # The request must stay "simple"
-//!
 //! Probed with curl: `mesonet.agron.iastate.edu` answers an OPTIONS preflight
 //! with `405 Method Not Allowed`, but answers the plain `GET` with
 //! `Access-Control-Allow-Origin: *`. Any non-safelisted request header —
@@ -159,10 +157,8 @@ struct Record {
     /// compute a reduction, not IEM.
     #[serde(default)]
     mslp: Option<Value>,
-    /// Present weather codes.
     #[serde(default)]
     wxcodes: Option<Value>,
-    /// The raw METAR text.
     #[serde(default)]
     raw: Option<String>,
     /// Observation time, ISO 8601 UTC.
@@ -189,17 +185,6 @@ struct Record {
 // ── Fetch ─────────────────────────────────────────────────────────────────
 
 /// What one round of the viewport's state networks delivered.
-///
-/// A skipped network used to be invisible. Refusing the round only when **every**
-/// network failed is right — one state's ASOS feed being down still leaves
-/// observations to draw across the rest of the viewport — but the survivors then
-/// went through `set_data`, which declares an answer whole. Measured over a
-/// socket with a viewport spanning eight plains networks and Oklahoma's refused
-/// 503: health `Ok`, `is_incomplete()` false, no mark, a fresh clock, and every
-/// Oklahoma station absent from a map centred on Oklahoma.
-///
-/// Nothing about that is *stale*, so no rung of the health ladder could express
-/// it. This is the coverage half.
 #[derive(Debug)]
 pub struct MetarRound {
     pub observations: Vec<MetarOb>,
@@ -212,15 +197,6 @@ pub struct MetarRound {
 
 impl MetarRound {
     /// The layer-agnostic report the UI renders.
-    ///
-    /// A network is the unit: each covers a state and a missing one takes every
-    /// station in that state off the map, whole. There is no part-drawn case —
-    /// `currents.json` either parsed or it did not — so no second denominator.
-    ///
-    /// Stations that were present and unparseable are **not** counted here.
-    /// They are a schema or unit change upstream rather than a round that
-    /// half-arrived, they are already warned about by count, and folding them in
-    /// would put a per-station number under a per-network noun.
     pub fn completeness(&self) -> crate::fetch_policy::DataCompleteness {
         crate::fetch_policy::DataCompleteness {
             expected: self.networks_asked,
@@ -640,9 +616,6 @@ fn parse_wind_token(token: &str) -> Option<(Option<u16>, u16)> {
             // counted bytes. The token "éééKT" left a six-byte body that
             // cleared that gate, and splitting it at byte 3 cut the second `é`
             // in half — before the ASCII-digit test below could reject it.
-            // The gate is gone rather than corrected: the split failing is the
-            // same answer, and the length that actually matters is the one
-            // `speed_digits` is checked against further down.
             let (d, rest) = body.split_at_checked(3)?;
             if !d.bytes().all(|b| b.is_ascii_digit()) {
                 return None;

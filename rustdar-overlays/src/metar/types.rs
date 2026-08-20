@@ -9,7 +9,6 @@ pub enum FlightCategory {
 }
 
 impl FlightCategory {
-    /// Standard aviation category colours.
     pub fn color_rgba(self) -> [u8; 4] {
         match self {
             FlightCategory::VFR => [0, 180, 0, 220],    // green
@@ -38,13 +37,11 @@ impl FlightCategory {
 /// (78.5%), so an `f64` discards exactly the good-visibility reports.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Visibility {
-    /// For an `or_greater` report this is the floor, not the true visibility.
     pub miles: f64,
     pub or_greater: bool,
 }
 
 impl Visibility {
-    /// Parses AWC's `visibility_statute_mi` spelling, trailing `+` included.
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim();
         let (digits, or_greater) = match s.strip_suffix('+') {
@@ -59,8 +56,7 @@ impl Visibility {
         Some(Visibility { miles, or_greater })
     }
 
-    /// `"10+"`, `"6+"`, `"15"`, `"2.5"`. Whole numbers lose the decimal to stay
-    /// legible in the station plot; the `+` is never dropped.
+    /// `"10+"`, `"6+"`, `"15"`, `"2.5"`; the `+` is never dropped.
     pub fn label(self) -> String {
         let n = if self.miles.fract() == 0.0 {
             format!("{:.0}", self.miles)
@@ -82,12 +78,10 @@ pub enum WindDir {
     Calm,
     /// A real wind whose direction is not steady (`VRBnnKT`).
     Variable,
-    /// Degrees true, 1–360.
     Degrees(u16),
 }
 
 impl WindDir {
-    /// `"CALM"`, `"VRB"`, `"180°"`.
     pub fn label(self) -> String {
         match self {
             WindDir::Calm => "CALM".to_string(),
@@ -108,7 +102,6 @@ impl WindDir {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct CloudLayer {
-    /// FEW, SCT, BKN, OVC, CLR, SKC, VV, OVX.
     pub cover: String,
     /// Feet AGL. `None` for CLR/SKC.
     #[serde(rename = "base")]
@@ -117,16 +110,13 @@ pub struct CloudLayer {
 
 #[derive(Debug, Clone)]
 pub struct MetarOb {
-    /// ICAO, e.g. "KTLX" — not IEM's 3-letter local id.
     pub station_id: String,
     pub name: String,
     pub lat: f64,
     pub lon: f64,
-    /// Metres MSL.
     pub elev_m: Option<f64>,
     pub temp_c: Option<f64>,
     pub dewp_c: Option<f64>,
-    /// `None` only when the report carries no wind data at all.
     pub wind_dir: Option<WindDir>,
     pub wind_speed_kt: Option<u16>,
     pub wind_gust_kt: Option<u16>,
@@ -138,17 +128,13 @@ pub struct MetarOb {
     pub altimeter_hpa: Option<f64>,
     /// Mean sea level pressure, hectopascals, reduced by the reporting station
     /// with its own temperature. This is the quantity the station model's
-    /// pressure code carries. `None` on most of the network: the feed
-    /// published it for 572 of 1324 records across 20 state ASOS networks,
-    /// and the gap cannot be filled by deriving one (see the M-1 record on
-    /// `campaign-harness` — the derivation lands on the right printed code
-    /// 8.2% of the time and lands hardest on the sites least able to check it).
+    /// pressure code carries. `None` on most of the network: the feed published
+    /// it for 572 of 1324 records across 20 state ASOS networks, and the gap
+    /// cannot be filled by deriving one.
     pub mslp_hpa: Option<f64>,
     pub flight_category: Option<FlightCategory>,
     pub raw_ob: String,
     pub clouds: Vec<CloudLayer>,
-    /// Present weather, e.g. "-RA BR".
     pub wx_string: Option<String>,
-    /// ISO 8601.
     pub obs_time: String,
 }

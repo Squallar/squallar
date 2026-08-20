@@ -1,8 +1,5 @@
-//! The adjacent-tilt pre-render (WO-E4.10): after a static plan view
-//! DELIVERS, one speculative render of the nearest tilt above (else below)
-//! goes into the existing RenderCache — never marking a pane, never taking a
-//! pane render slot, never more than one at a time, and never on wasm (AF8)
-//! or under a small budget.
+//! The adjacent-tilt pre-render: after a static plan view DELIVERS, one
+//! speculative render of the nearest tilt above (else below).
 
 use rustdar_radar::types::RadarProduct;
 use rustdar_worker::offload::{JobRequest, JobSink};
@@ -223,10 +220,7 @@ fn post_speculative(app: &mut crate::app::App, product: RadarProduct, elevation:
         .expect("the receiver lives on the App");
 }
 
-/// **Ordered test (a).** A speculative dispatch never sets `render_in_flight`
-/// on any pane — and it really did dispatch: one job, for the nearest tilt
-/// above the delivered one, with `values_wanted: true` (it becomes the
-/// pane's static render on tilt-step; values-stripped would kill hover).
+/// **Ordered test (a).**
 #[test]
 fn a_speculative_dispatch_never_marks_a_pane_in_flight() {
     let (recorded, _worker) = recorder();
@@ -262,16 +256,10 @@ fn a_speculative_dispatch_never_marks_a_pane_in_flight() {
     );
 }
 
-/// **Ordered test (b).** The platform/budget gate, host-tested on BOTH arms
-/// of the WEB const: wasm never speculates whatever the budget claims, and
-/// `concurrent_renders <= 2` never speculates on any platform — plus the
-/// integration arm: a dispatcher rebuilt at budget 2 posts zero speculative
-/// jobs on the same delivery that posted one at the desktop budget.
+/// **Ordered test (b).**
 #[test]
 fn a_small_budget_or_the_web_never_speculates() {
     use crate::render_dispatch::speculative_render_allowed;
-    // The parameterized fn, both arms — wasm (true) refused at every budget,
-    // native (false) admitted only past 2.
     for budget in [0, 1, 2, 3, 6, 64] {
         assert!(
             !speculative_render_allowed(true, budget),
@@ -285,8 +273,6 @@ fn a_small_budget_or_the_web_never_speculates() {
         );
     }
 
-    // Integration: the same delivery that speculates at the desktop budget
-    // dispatches NOTHING when the resolved budget is 2.
     let (recorded, _worker) = recorder();
     let ctx = egui::Context::default();
     let mut app = crate::app::tests::n_pane_app(1, SITE);
@@ -308,10 +294,7 @@ fn a_small_budget_or_the_web_never_speculates() {
     assert!(!app.render.speculative_in_flight());
 }
 
-/// **Ordered test (c).** At most one speculative in flight: a second
-/// delivery while one is out dispatches nothing; the speculative result's
-/// arrival lands in the RenderCache ONLY (no pane touched), clears the bool,
-/// and re-arms speculation for the next delivery.
+/// **Ordered test (c).**
 #[test]
 fn at_most_one_speculative_is_ever_in_flight() {
     let (recorded, _worker) = recorder();
@@ -319,7 +302,6 @@ fn at_most_one_speculative_is_ever_in_flight() {
     let mut app = crate::app::tests::n_pane_app(1, SITE);
     aim(&mut app, RadarProduct::Reflectivity, TILT);
 
-    // First delivery speculates 1.5°; the second finds one out and defers.
     post_interactive(&mut app, RadarProduct::Reflectivity, TILT);
     app.poll_render_results(&ctx);
     post_interactive(&mut app, RadarProduct::Reflectivity, TILT);
@@ -330,11 +312,6 @@ fn at_most_one_speculative_is_ever_in_flight() {
         "a second delivery while a speculative is out must dispatch nothing",
     );
 
-    // The speculative answers: RenderCache gains the tilt, no pane moved,
-    // the bool clears. The recorder holds jobs instead of running them, so
-    // the deliver closure that would drop the RenderGuard never runs — the
-    // store below stands in for that unwind, exactly as the budget suites'
-    // own stores do.
     post_speculative(&mut app, RadarProduct::Reflectivity, MID_TILT);
     app.poll_render_results(&ctx);
     app.render
@@ -363,9 +340,6 @@ fn at_most_one_speculative_is_ever_in_flight() {
         );
     }
 
-    // Re-armed: a delivery at 1.5° speculates its neighbour above (2.4°) —
-    // the 0.5° below is skipped because above wins, and 1.5° itself is now
-    // cached.
     post_interactive(&mut app, RadarProduct::Reflectivity, MID_TILT);
     app.poll_render_results(&ctx);
     let asked = asked_for(&recorded);
@@ -380,11 +354,6 @@ fn at_most_one_speculative_is_ever_in_flight() {
         "the 1.5° delivery must speculate the nearest tilt above it",
     );
 
-    // And the top of the ladder speculates the nearest BELOW — but 1.5° is
-    // already cached, so nothing dispatches: the goal state needs no work.
-    // (The guard stand-in again, so the residency check is the ONLY gate
-    // this arm can refuse on — a raised counter would refuse too and make
-    // the assertion vacuous.)
     post_speculative(&mut app, RadarProduct::Reflectivity, TOP_TILT);
     app.poll_render_results(&ctx);
     app.render

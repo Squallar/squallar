@@ -5,9 +5,6 @@ use rustdar_radar::loop_downloads::LoopDownloadManager;
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::{RadarProduct, ScanInfo};
 
-/// `minute` minutes past midnight, added as a duration rather than written into
-/// the minute field: the frame-cap tests below walk a whole day of lookback, and
-/// `and_hms_opt(0, 90, 0)` is `None`.
 fn ts(minute: u32) -> NaiveDateTime {
     chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
         .unwrap()
@@ -29,21 +26,8 @@ fn site(name: &'static str, lat: f64, lon: f64) -> RadarSite {
     }
 }
 
-/// The site every `pane_showing` pane's `site` field names, and which its scan
-/// did not come from. Deliberately not a site any test here builds a loop from.
 const SWITCHED_TO: &str = "KFWS";
 
-/// A pane showing `site`'s scan at `timestamp`, with its live `site` field
-/// naming [`SWITCHED_TO`] instead.
-///
-/// The two are separate fields and nothing enforces their agreement: `pane.site`
-/// is the radar the pane is aimed at, `scan_info.site` is the radar the volume in
-/// hand came from. The loop must be built from the second — the one place where
-/// the code, the coordinates and the timestamp all come from the same radar.
-///
-/// Handing the pane a `site` equal to `scan_info.site.name` would make the two
-/// interchangeable, and every assertion below would hold just as well for a
-/// `begin_loop_for_pane` that read the wrong one.
 fn pane_showing(site: RadarSite, timestamp: NaiveDateTime) -> PaneState {
     assert_ne!(
         site.name, SWITCHED_TO,
@@ -63,7 +47,6 @@ fn pane_showing(site: RadarSite, timestamp: NaiveDateTime) -> PaneState {
     pane
 }
 
-/// A pane with an active loop on `site`, holding frames at the given minutes.
 fn pane_looping_on(site: RadarSite, lookback_secs: u64, frames: &[u32]) -> PaneState {
     let mut pane = PaneState::with_site(site.name.to_string());
     pane.loop_state = LoopPlaybackState::new_for_loop(
@@ -82,36 +65,14 @@ fn pane_looping_on(site: RadarSite, lookback_secs: u64, frames: &[u32]) -> PaneS
     pane
 }
 
-/// The pool's answer for a single loop at the floor — what a pane used to get
-/// before the pool existed, which is the shape every test here is written
-/// against. Named once so the frame cap these appends are held to is the
-/// shipped one rather than a literal.
 fn allocation() -> crate::loop_pool::LoopAllocation {
     crate::app::render::test_loop_allocation()
 }
 
-/// This build's resolved budgets, which is where the raster frame cap now comes
-/// from. Named beside [`allocation`] because `loop_frames_held` reads both.
 fn budgets() -> rustdar_device_profile::budget::Budgets {
     crate::app::render::test_budgets()
 }
 
-/// The cap the append path will hold this pane's loop to, through the function
-/// the append path itself calls.
-///
-/// It takes a **pane** rather than a view because the cap is resolved from the
-/// loop state now, not from the view alone: a 3D loop's frame list is its
-/// resident set, so `constants::LOOP_SPAN_BUDGET_SECS` reaches it through
-/// `LoopPlaybackState::scan_step_secs`. For the two raster kinds it does not —
-/// a held frame is scan data and a timestamp rather than a texture — so a
-/// plan-view loop answers `Budgets::loop_frames_held` whatever its site's
-/// cadence, and whether it has learned one yet.
-///
-/// That is why the tests below may ask an **empty** loop for the cap they are
-/// about to fill it to. It is deliberately not the `scan_step_secs == None`
-/// arm in disguise: for a plan-view loop the cadence is never consulted at all,
-/// so the empty loop and the full one give the same answer for the same reason
-/// rather than by coincidence.
 fn held_for(pane: &PaneState) -> usize {
     crate::app::render::loop_frames_held(allocation(), &pane.loop_state, &budgets())
 }
@@ -120,12 +81,8 @@ fn frame_times(pane: &PaneState) -> Vec<NaiveDateTime> {
     pane.loop_state.frames.iter().map(|f| f.timestamp).collect()
 }
 
-/// The defect: `handle_enable_loop` read the *active* pane's scan info and
-/// `reinit_active_loops` then applied it to every looping pane, so a pane on
-/// another site silently showed the active pane's radar under its own label.
 #[test]
 fn a_loop_is_built_from_its_own_panes_scan_not_the_active_panes() {
-    // Pane 0 is the active one in every real call path that reaches here.
     let mut panes = [
         pane_showing(site("KTLX", 35.33, -97.27), ts(10)),
         pane_showing(site("KOUN", 35.23, -97.46), ts(25)),
@@ -139,10 +96,6 @@ fn a_loop_is_built_from_its_own_panes_scan_not_the_active_panes() {
 
     let req = begin_loop_for_pane(&mut panes, &mut mgr, 1, 600).expect("pane 1 has a scan");
 
-    // Pane 1's *scan_info* site, which is neither the active pane's site nor its
-    // own live `site` field. Both are in reach at the listing site and both are
-    // wrong: the identifiers this listing returns are cached and projected with
-    // the coordinates that came out of the same `scan_info`.
     assert_eq!(
         req.site, "KOUN",
         "the listing must be requested for pane 1's loaded scan's site"
@@ -154,26 +107,19 @@ fn a_loop_is_built_from_its_own_panes_scan_not_the_active_panes() {
     );
     assert_eq!(req.start, ts(15), "walked back by the lookback");
 
-    // The loop state is built from the same site value the listing names, so the
-    // code it is compared on and the coordinates it projects with agree.
     let ls = &panes[1].loop_state;
     assert_eq!(ls.site, "KOUN");
     assert_eq!(ls.site_lat, 35.23);
     assert_eq!(ls.site_lon, -97.46);
     assert!(ls.is_fetching(), "and it is waiting for that listing");
 
-    // The pane that was *not* asked for is untouched, so nothing here is
-    // incidentally right because both panes were written.
     assert!(!panes[0].loop_state.is_active());
 
-    // Pane 0 reads as itself when it is the one asked for.
     let req = begin_loop_for_pane(&mut panes, &mut mgr, 0, 600).expect("pane 0 has a scan");
     assert_eq!(req.site, "KTLX");
     assert_eq!(req.end, ts(10));
 }
 
-/// A pane with nothing loaded yet has no loop parameters, and must not borrow
-/// another pane's — nor leave a loop half-built.
 #[test]
 fn a_pane_with_no_scan_yields_no_loop() {
     let mut panes = [
@@ -191,16 +137,8 @@ fn a_pane_with_no_scan_yields_no_loop() {
     );
 }
 
-/// The defect: auto-poll asked one question per live site but answered every
-/// one of them with the *active* pane's scan time. With two sites on screen the
-/// site that was not active either never updated (its latest was older than the
-/// active pane's, so `check_and_fetch_latest` declined) or was re-downloaded and
-/// re-rendered in full every poll interval (the active pane was parked on
-/// historic data, so everything looked new).
 #[test]
 fn each_site_is_polled_against_its_own_current_scan() {
-    // Pane 0 is the active one in every path that reaches here, and is the
-    // newer of the two.
     let panes = [
         pane_showing(site("KTLX", 35.33, -97.27), ts(25)),
         pane_showing(site("KOUN", 35.23, -97.46), ts(10)),
@@ -219,10 +157,6 @@ fn each_site_is_polled_against_its_own_current_scan() {
     );
 }
 
-/// The scan's own site decides, not the pane's live `site` field: the two
-/// diverge for as long as a switched pane's new scan takes to land, and reading
-/// the pane's field would offer the old site's timestamp as the new site's
-/// current — suppressing the very fetch the switch is waiting on.
 #[test]
 fn a_scans_own_site_decides_which_poll_it_answers() {
     let panes = [pane_showing(site("KTLX", 35.33, -97.27), ts(10))];
@@ -239,9 +173,6 @@ fn a_scans_own_site_decides_which_poll_it_answers() {
     );
 }
 
-/// Two panes on one site, one stepped back in time: the poll must compare
-/// against the newest of them, or every interval re-downloads a scan the other
-/// pane already has.
 #[test]
 fn one_sites_current_scan_is_the_newest_pane_showing_it() {
     let ktlx = || site("KTLX", 35.33, -97.27);
@@ -249,9 +180,6 @@ fn one_sites_current_scan_is_the_newest_pane_showing_it() {
     assert_eq!(latest_scan_time_for_site(&panes, "KTLX"), Some(ts(25)));
 }
 
-/// Enabling a loop drops the previous listing's undispatched downloads: they
-/// were queued for the loop this call is replacing, and on a site switch they
-/// are another radar's files.
 #[test]
 fn beginning_a_loop_clears_the_panes_pending_downloads() {
     let mut panes = [pane_showing(site("KTLX", 35.33, -97.27), ts(10))];
@@ -275,9 +203,6 @@ fn beginning_a_loop_clears_the_panes_pending_downloads() {
     );
 }
 
-/// The defect this half of the site fix exists for. Auto-poll delivers one
-/// site's scan; a loop on a different site used to take a frame for it, then
-/// render that scan around its own coordinates.
 #[test]
 fn a_polled_scan_only_reaches_loops_on_its_own_site() {
     let ktlx = site("KTLX", 35.33, -97.27);
@@ -297,15 +222,10 @@ fn a_polled_scan_only_reaches_loops_on_its_own_site() {
     );
 }
 
-/// The loop's own site is the geometry site captured when it was built. A pane
-/// whose live `site` field has been re-synced without its loop being rebuilt
-/// must still be judged on the loop's site, or the frame lands in a loop that
-/// projects it somewhere else.
 #[test]
 fn the_loops_site_decides_not_the_panes_live_site() {
     let koun = site("KOUN", 35.23, -97.46);
     let mut panes = [pane_looping_on(koun, 3600, &[0])];
-    // `propagate_layer_sync` converges the pane's site without rebuilding loops.
     panes[0].site = "KTLX".to_string();
 
     append_polled_frame_to_loops(&mut panes, "KTLX", ts(10), allocation(), &budgets());
@@ -319,8 +239,6 @@ fn the_loops_site_decides_not_the_panes_live_site() {
     assert_eq!(frame_times(&panes[0]), vec![ts(0), ts(10)]);
 }
 
-/// Single-frame mode keeps a `LoopPlaybackState` around whose `site` is an
-/// empty placeholder. A poll must not turn that into a frame list.
 #[test]
 fn an_inactive_loop_takes_no_frames() {
     let mut panes = [PaneState::with_site("KTLX".to_string())];
@@ -340,7 +258,6 @@ fn a_polled_frame_is_inserted_in_time_order_and_never_twice() {
     let ktlx = site("KTLX", 35.33, -97.27);
     let mut panes = [pane_looping_on(ktlx, 3600, &[0, 10])];
 
-    // Out-of-order arrival still lands between its neighbours.
     append_polled_frame_to_loops(&mut panes, "KTLX", ts(5), allocation(), &budgets());
     assert_eq!(frame_times(&panes[0]), vec![ts(0), ts(5), ts(10)]);
 
@@ -352,11 +269,9 @@ fn a_polled_frame_is_inserted_in_time_order_and_never_twice() {
     );
 }
 
-/// Frames older than the lookback window are dropped as new ones arrive.
 #[test]
 fn appending_evicts_past_the_lookback_window() {
     let ktlx = site("KTLX", 35.33, -97.27);
-    // 10 minutes of lookback, frames every 5 minutes.
     let mut panes = [pane_looping_on(ktlx, 600, &[0, 5, 10])];
 
     append_polled_frame_to_loops(&mut panes, "KTLX", ts(15), allocation(), &budgets());
@@ -368,21 +283,12 @@ fn appending_evicts_past_the_lookback_window() {
     );
 }
 
-/// The playhead has to come back inside the list when eviction shortens it.
-///
-/// A poll gap wider than the lookback — the site was down, the app was asleep,
-/// the machine was suspended — evicts the whole window at once. Left alone,
-/// `current_frame` points past the end, `PaneState::displayed_frame` resolves it
-/// with `.get()` and finds nothing, and the pane renders blank. A paused loop
-/// never advances, so it stays blank.
 #[test]
 fn eviction_pulls_the_playhead_back_inside_the_list() {
     let ktlx = site("KTLX", 35.33, -97.27);
     let mut panes = [pane_looping_on(ktlx, 600, &[0, 5, 10])];
     panes[0].loop_state.current_frame = 2;
 
-    // 15 minutes on from the newest frame, with a 10 minute window: everything
-    // that was there is now older than the cutoff.
     append_polled_frame_to_loops(&mut panes, "KTLX", ts(25), allocation(), &budgets());
 
     assert_eq!(
@@ -404,26 +310,10 @@ fn eviction_pulls_the_playhead_back_inside_the_list() {
     );
 }
 
-/// **The frame cap holds against live appends, not only against the listing.**
-///
-/// The measured defect, at the shipped desktop numbers: a 24 h loop on a
-/// WSR-88D in precip lists ~333 volumes and `accept_scan_listing` samples them
-/// down to [`MAX_LOOP_FRAMES`]. Every poll after that appended a frame and the
-/// only eviction it ran was the lookback window's — which cannot bind here, by
-/// construction: a loop that had to sample its listing is one whose window
-/// already holds more scans than the cap. Sixty appends later the loop held
-/// **120 frames against a stated cap of 60**, and the transport's own caption
-/// printed both numbers in one sentence.
-///
-/// The cap is read off `loop_frames_held` rather than written down, so the two
-/// enforcement points cannot come to disagree about what the cap is.
 #[test]
 fn live_appends_do_not_take_a_loop_past_its_frame_cap() {
     let ktlx = site("KTLX", 35.33, -97.27);
     let held = held_for(&pane_looping_on(ktlx.clone(), 72 * 3600, &[]));
-    // Three days of lookback against a day and a bit of frames, so the window
-    // eviction never fires and the cap is the only thing standing between this
-    // loop and unbounded growth.
     let sampled: Vec<u32> = (0..held as u32).map(|i| i * 26).collect();
     let mut panes = [pane_looping_on(ktlx, 72 * 3600, &sampled)];
     panes[0].loop_state.listing_sampled = Some(true);
@@ -456,13 +346,6 @@ fn live_appends_do_not_take_a_loop_past_its_frame_cap() {
     );
 }
 
-/// The cap costs resolution, never span — the invariant `accept_scan_listing`
-/// samples rather than truncates for, held across the append path too.
-///
-/// Taking the surplus off the old end would satisfy the cap just as well and is
-/// what a reader expects an eviction to do. It would also give back a whole
-/// sampled step per append while gaining one scan interval, so a 24 h loop's
-/// window would erode in front of the user: this pins that both ends stay put.
 #[test]
 fn capping_an_appended_loop_keeps_its_whole_window() {
     let ktlx = site("KTLX", 35.33, -97.27);
@@ -491,25 +374,9 @@ fn capping_an_appended_loop_keeps_its_whole_window() {
     );
 }
 
-/// A loop holding every scan re-measures the site's cadence as it follows the
-/// site forward; a sampled one keeps the listing's figure.
-///
-/// `scan_step_secs` was written once, by `accept_scan_listing`, and never again.
-/// It is what the timeline caption quotes as the site's cadence, and every VCP
-/// change makes a stale one wrong — on 2026-08-11 every measured site but TDFW
-/// alternated VCPs during the day, and a WSR-88D going VCP 212 to VCP 35 moves
-/// from 259 s to 517 s.
-///
-/// The two halves are one rule: refresh it exactly where it is measurable. On a
-/// loop holding every scan the frame list *is* the listing and its median gap is
-/// the same statistic. On a sampled loop every gap is a sampled gap — the reason
-/// the figure was recorded before the sampling at all — so there is nothing to
-/// measure and the listing's median stands, which is precisely what "sampled
-/// from ~4 min scans" claims.
 #[test]
 fn a_loop_holding_every_scan_re_measures_the_cadence_as_it_follows_the_site() {
     let ktlx = site("KTLX", 35.33, -97.27);
-    // Nine minutes apart: a WSR-88D in clear air, VCP 35.
     let mut panes = [pane_looping_on(ktlx, 72 * 3600, &[0, 9, 18, 27])];
 
     for (sampled, expected) in [(Some(false), Some(540)), (Some(true), Some(259))] {
@@ -521,7 +388,6 @@ fn a_loop_holding_every_scan_re_measures_the_cadence_as_it_follows_the_site() {
             panes[0].loop_state.scan_step_secs, expected,
             "listing_sampled = {sampled:?}",
         );
-        // Put the loop back where the row above found it.
         panes[0].loop_state.frames.pop();
     }
 }

@@ -1,10 +1,5 @@
 //! HRRR data fetching from the `noaa-hrrr-bdp-pds` S3 bucket.
 //!
-//! Replaces the NOMADS filter CGI
-//! (`nomads.ncep.noaa.gov/cgi-bin/filter_hrrr_2d.pl`), which answers `200` with
-//! no `Access-Control-Allow-Origin` at all (verified 2026-07-25 with
-//! `curl -H 'Origin: …'`) and is therefore unreachable from the web build.
-//!
 //! S3 serves whole files, but every HRRR GRIB2 file has an `.idx` sidecar —
 //! ~9 KB of text listing each record's byte offset:
 //!
@@ -17,20 +12,6 @@
 //! so subsetting becomes: fetch the index, find the record, `Range`-request the
 //! bytes to the next offset. Two requests, but the large one is *smaller* than
 //! NOMADS' — 1.03 MB against 2.27 MB for the same field, measured.
-//!
-//! That difference is packing. The old request carried `subregion=`, which made
-//! NOMADS re-encode through wgrib2, turning data representation template **5.3**
-//! (complex packing with spatial differencing) into **5.0** (simple packing) and
-//! re-rounding `Lo1` from 237280472 to 237280471 microdegrees. S3 serves the
-//! operational bytes, so the live path decodes **5.3** and `Lo1` 237280472; a
-//! test constant taken from a NOMADS download is off by one microdegree. grib
-//! handles 5.0 and 5.3 in pure Rust — neither needs the JPEG2000 or CCSDS
-//! features this crate drops.
-//!
-//! Dropping `subregion` did **not** enlarge the grid: NOMADS never subset
-//! Lambert-conformal grids, so both paths return the full 1799x1059 CONUS grid
-//! (1,905,141 points), and `parse_grib2` derives bounds from the grid it is
-//! handed rather than from a requested region.
 
 use chrono::{NaiveDate, NaiveDateTime, Timelike, Utc};
 use grib::{Grib2SubmessageDecoder, GridDefinitionTemplateValues, LatLons, SubMessage};
@@ -41,8 +22,6 @@ use crate::fetch_policy::{FetchError, FetchFailure, NotFound};
 use rustdar_geo::GeoBounds;
 
 /// Live tests only. Production fetches with `ctx.client` (30 s).
-///
-/// Gated off wasm32 with the module that uses it, or it would be dead there.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 const HRRR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -107,13 +86,6 @@ pub fn parse_idx(text: &str) -> Vec<IdxRecord> {
 ///  8:…:REFD:263 K level:1 hour fcst:        44:…:REFD:263 K level:0-1 hour max fcst:
 /// 68:…:WEASD:surface:1 hour fcst:           85:…:WEASD:surface:0-1 hour acc fcst:
 /// ```
-///
-/// rustdar requests neither, and
-/// `live_every_parameter_selects_exactly_one_record` checks that against the
-/// live index rather than assuming it — taking the instantaneous `REFD` where a
-/// caller wanted the maximum is the same quiet class of error as the
-/// constant-zero f00 `MXUPHL`. [`IdxRecord::forecast`] is carried as the
-/// disambiguator for a parameter whose pair does repeat.
 pub fn byte_range(records: &[IdxRecord], var: &str, level: &str) -> Option<(u64, Option<u64>)> {
     let idx = records
         .iter()
@@ -156,13 +128,6 @@ fn previous_run(date: NaiveDate, hour: u8) -> (NaiveDate, u8) {
 
 /// How to get the lat/lon of any grid point of a submessage, in scanning-mode
 /// order.
-///
-/// `grib` is built with `default-features = false` (no C/C++), which drops
-/// `gridpoints-proj` and with it the only `latlons()` for template 3.30 —
-/// grib returns `NotSupported`. HRRR is 3.30 for every field, so without the
-/// [`lambert`] branch below every HRRR fetch fails here. Other templates still
-/// go through grib, which needs no PROJ for them, and are materialised because
-/// there is nothing here to recompute them from.
 fn grid_coords<R>(submessage: &SubMessage<'_, R>) -> Result<GridCoords, String> {
     let grid_def = submessage.grid_def();
     let template = GridDefinitionTemplateValues::try_from(grid_def)
@@ -186,10 +151,6 @@ fn grid_coords<R>(submessage: &SubMessage<'_, R>) -> Result<GridCoords, String> 
 }
 
 /// The grid we walked must hold exactly as many points as section 3 declares.
-///
-/// A mismatch means it is not the grid the data was packed against, and the
-/// values would then be laid out over the wrong coordinates — a plausible field
-/// in the wrong places, which looks like weather.
 fn check_point_count(computed: usize, declared: usize) -> Result<(), String> {
     if computed != declared {
         return Err(format!(
@@ -218,26 +179,14 @@ fn exactly_one_submessage(count: usize) -> Result<(), String> {
 /// been shown correct for.
 ///
 /// HRRR CONUS measures -134.0955..-60.9172, corner-verified against real GRIB2
-/// section 3 in `hrrr::lambert::tests`. This is that with margin either side,
-/// and the margin matters in one direction only: the near edge is 40° from the
-/// antimeridian, far enough that no viewport containing this domain can also
-/// be written in a second longitude frame.
+/// section 3 in `hrrr::lambert::tests`. This is that with margin either side.
 const VALIDATED_DOMAIN_LON: std::ops::RangeInclusive<f64> = -140.0..=-50.0;
 
 /// Marks [`check_domain_longitude`]'s refusal so [`classify_parse_error`] can
 /// tell it apart from a genuine decode failure.
-///
-/// A string rather than a typed error only because `parse_grib2` reports every
-/// other fault as one too; the coupling is pinned by
-/// `the_domain_refusal_is_classified_permanent` rather than left to a reader
-/// noticing both ends.
 const DOMAIN_REFUSAL_MARK: &str = "unsupported model domain";
 
 /// A `parse_grib2` error, classified for the retry ladder.
-///
-/// Everything `parse_grib2` rejects is transient — a truncated or mis-ranged
-/// record is worth another go — *except* a domain the renderer cannot place,
-/// which will be exactly as unplaceable next time.
 fn classify_parse_error(message: String) -> FetchError {
     if message.contains(DOMAIN_REFUSAL_MARK) {
         FetchError::permanent(message)
@@ -248,29 +197,11 @@ fn classify_parse_error(message: String) -> FetchError {
 
 /// Refuse a model domain whose longitude the renderer has never been shown to
 /// place correctly — and say what decision the refusal is asking for.
-///
-/// This is a guard against a state that decays *silently*. Today
-/// `DataSources::hrrr_url` hardcodes `/conus/`, so the only domain that can
-/// reach here is inside [`VALIDATED_DOMAIN_LON`] by 40°, and this never fires.
-/// The day a non-CONUS domain is added it fires immediately, at the moment and
-/// in front of the person who can choose correctly — rather than shipping a
-/// layer that silently paints nothing.
-///
-/// It is deliberately a refusal and not a log line: a warning nobody can act
-/// on is a defect, and this one has exactly one reader, who is mid-change.
-///
-/// The refusal carries [`DOMAIN_REFUSAL_MARK`] so the fetch layer can classify
-/// it [`FetchFailure::Permanent`]. A domain does not become placeable by being
-/// asked for again, and the default for a parse error here is `Transient` —
-/// which would retry a configuration mistake on the backoff ladder forever and
-/// present it as though the network were at fault.
 fn check_domain_longitude(bounds: &GeoBounds) -> Result<(), String> {
     // `min > max` and not just `!is_finite`: the bounds walk above seeds
     // `min_lon` at `f64::MAX` and `max_lon` at `f64::MIN`, and both of those
     // *are* finite, so a grid whose coordinates could not be walked arrives
-    // here as an inverted extent rather than a NaN one. Reported as itself,
-    // because it is a decode problem and the message below is not about
-    // decoding.
+    // here as an inverted extent rather than a NaN one.
     if !bounds.min_lon.is_finite() || !bounds.max_lon.is_finite() || bounds.min_lon > bounds.max_lon
     {
         return Err(format!(
@@ -322,11 +253,6 @@ fn check_domain_longitude(bounds: &GeoBounds) -> Result<(), String> {
 }
 
 /// Parse GRIB2 bytes into `HrrrGridData`.
-///
-/// The bytes must be exactly one record with exactly one submessage, and that is
-/// checked rather than assumed: NOMADS guaranteed it server-side, byte-ranging
-/// guarantees it only via [`byte_range`]'s arithmetic, and an off-by-one there
-/// delivers two records that decode to a plausible grid for the wrong field.
 fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, String> {
     let grib2 = grib::from_reader(std::io::Cursor::new(bytes))
         .map_err(|e| format!("GRIB2 parse error: {e}"))?;
@@ -341,7 +267,6 @@ fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, Stri
         .next()
         .ok_or_else(|| "No submessages in GRIB2 data".to_string())?;
 
-    // Borrows submessage, releases here.
     let coords = grid_coords(&submessage)?;
 
     let (ni, nj) = submessage
@@ -372,9 +297,7 @@ fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, Stri
     let ref_time = NaiveDateTime::new(ref_date, ref_clock);
 
     // S3 serves the operational DRT 5.3 (complex packing with spatial
-    // differencing); NOMADS re-encoded to 5.0. `dispatch()` picks by template
-    // and both are pure Rust in grib, but this is the line that fails if the
-    // feature set in Cargo.toml is trimmed further.
+    // differencing); NOMADS re-encoded to 5.0.
     let decoder =
         Grib2SubmessageDecoder::from(submessage).map_err(|e| format!("Decode init error: {e}"))?;
     let values: Vec<f32> = decoder
@@ -391,8 +314,6 @@ fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, Stri
     let Some(bounds) = GeoBounds::from_points((0..coords.len()).map_while(|i| coords.at(i))) else {
         return Err("GRIB2 grid decoded no coordinates".into());
     };
-    // Here, not in the rasterizer: this is where a *domain* first states its
-    // extent, and the person who changed the domain is standing here.
     check_domain_longitude(&bounds)?;
 
     let (visible_points, value_range) = super::summarize_values(&values, param);
@@ -503,9 +424,6 @@ async fn fetch_record(
 }
 
 /// Fetch HRRR model data for the given parameter.
-///
-/// Tries the latest available run first; if that fails, falls back to the
-/// previous hour.
 pub async fn fetch_hrrr_data(
     client: &reqwest::Client,
     sources: &DataSources,
@@ -536,35 +454,6 @@ pub async fn fetch_hrrr_data(
 }
 
 /// One verdict for a two-run attempt, carrying both attempts' words.
-///
-/// The two runs are the same product an hour apart, so either succeeding fixes
-/// the layer — which is exactly the shape [`FetchFailure::of_round`] is for, and
-/// "refused only if every part was" is the right rule here for a sharper reason
-/// than usual: the fallback is the *older* run, so it is the one **less** likely
-/// to be missing. A refusal that survives both is a refusal of the product.
-///
-/// # Why an all-404 round does not stay routine
-///
-/// A single run 404ing is genuinely routine — the bucket carries a rolling
-/// window and each run's files land over several minutes, which is the whole
-/// reason this fallback exists. So [`fetch_record`] classifies its 404s
-/// [`IsRoutine`](NotFound::IsRoutine), and a lone one reads as
-/// [`Absent`](FetchFailure::Absent): "not published right now", ladder reset,
-/// ordinary hourly poll, no fault reported. Correct.
-///
-/// But the bucket should always carry *at least one* of the last two hourly
-/// runs. Both missing is not the publication schedule; it is a moved path, a
-/// renamed product, or an outage. Left as `Absent` that state is invisible for
-/// ever — `Absent` resets the ladder, stamps the clock and reports no fault, so
-/// a permanently moved HRRR would poll hourly and say nothing, which is the
-/// same silence this module exists to end, just wearing a friendlier verdict.
-///
-/// Escalated to [`Transient`](FetchFailure::Transient) rather than
-/// [`Permanent`](FetchFailure::Permanent) deliberately: a 404 alone cannot tell
-/// a moved product from an outage, and `Transient` costs the ceiling — one poll
-/// an hour, what a healthy HRRR costs — while still surfacing as "not loading"
-/// in the layer's own panel. Claiming a refusal here would be claiming more
-/// than two 404s can prove.
 fn round_verdict(parts: [FetchError; 2], context: &str) -> FetchError {
     let mut round = FetchError::of_round(&parts, context);
     if round.failure == FetchFailure::Absent {
@@ -665,7 +554,6 @@ async fn try_fetch_composite(
         ));
     }
 
-    // Merge: compute magnitude √(a² + b²) element-wise.
     let base = &grids[0];
     let other = &grids[1];
 
@@ -704,10 +592,6 @@ async fn try_fetch_composite(
 
 /// The client the **live tests in this module** use, `#[cfg(test)]` so it cannot
 /// be mistaken for production (which passes `ctx.client`, timeout 30 s).
-///
-/// A `User-Agent` is fine on this origin, unlike IEM and SPC: S3 answers the
-/// preflight `200` with `Access-Control-Allow-Headers: user-agent`. See
-/// `rustdar_source::origins`.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 fn hrrr_client() -> Result<reqwest::Client, String> {
     rustdar_source::tls::client(rustdar_source::tls::USER_AGENT, HRRR_TIMEOUT)

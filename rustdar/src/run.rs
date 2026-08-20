@@ -8,8 +8,7 @@ fn create_event_loop() -> EventLoop<()> {
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Pin the rustls provider at a predictable point rather than letting
-    // whichever background task fetches first choose it. Redundant — every
-    // client constructor calls this too (see `rustdar_radar::tls`).
+    // whichever background task fetches first choose it. Redundant.
     rustdar_app::tls::init();
 
     env_logger::Builder::from_default_env()
@@ -17,9 +16,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     // Swallow the EventLoopClosed panics background threads raise on exit.
-    // Matched on the payload, not a stringified PanicInfo (whose paths and line
-    // numbers shift across Rust versions); both &str and String because
-    // `panic!()` produces &str for literals and String for formatted messages.
+    // Matched on the payload, not a stringified PanicInfo; both &str and String
+    // because `panic!()` produces &str for literals and String for formatted.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let is_event_loop_closed = info

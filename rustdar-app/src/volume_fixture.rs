@@ -1,23 +1,13 @@
 //! The `Ready` volume fixture for the app-side tests that measure what a
 //! resident grid costs and releases.
-//!
-//! rustdar-volumetric's bridge tests keep their own twin of this fixture
-//! (`ready_grid` there predates this copy and stayed with its suite at
-//! WO-RV): a test helper does not cross a crate boundary, and its home
-//! module is `cfg(test)`-gated, invisible to this crate — the same rule that
-//! gave `budget_arms` its twins. Keep the two in step with the resampler
-//! together; the byte-figure helpers beside each consumer are what notice a
-//! drift.
 
 use std::sync::Arc;
 
 use rustdar_radar::types::RadarProduct;
 use rustdar_volumetric::bridge::VolumeEntry;
 
-/// A real, tiny grid, for the tests whose subject is what may *stand in*
-/// on screen — only a `Ready` entry ever does, so a `Refused` stub cannot
-/// exercise them. Built through `build_voxels` because that is the one
-/// constructor a `VoxelGrid` has.
+/// A real, tiny grid, for the tests whose subject is what may *stand in* on screen —
+/// only a `Ready` entry ever does.
 pub(crate) fn ready_grid() -> VolumeEntry {
     use nexrad_model::data::{
         MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,

@@ -6,24 +6,6 @@ use nexrad_model::data::{
     VolumeCoveragePattern, WaveformType,
 };
 
-// ── Fixtures ────────────────────────────────────────────────────────────
-//
-// Built to break this module, not to pass it. Deliberately different from
-// `sampler`'s fixtures in every axis they share, so the two suites are
-// independent evidence rather than one suite twice:
-//
-// * **Sweeps arrive out of cut order**, with a SAILS repeat, so a ladder
-//   that trusted collection order would come out scrambled.
-// * **Azimuths start off north and wrap through 0°**, so an index that
-//   assumed `radial[i].azimuth == i·spacing` is wrong from radial one.
-// * **Fields vary along range and azimuth**, so a rasterizer that read one
-//   gate and smeared it, or that dropped the range axis, still paints
-//   something — and it is the wrong something.
-// * **Upper cuts are range-truncated**, which is what real volumes do and
-//   what makes `BeyondRange` an ordinary status rather than a fault.
-// * **The first gate's centre is nonzero** (2.125 km, the operational
-//   super-resolution value), so forgetting it is ~8 gates of silent error.
-
 const REFL_SCALE: f32 = 2.0;
 const REFL_OFFSET: f32 = 66.0;
 const FIRST_GATE_M: u16 = 2125;
@@ -32,14 +14,6 @@ const GATE_M: u16 = 250;
 /// KTLX, whose feedhorn `eet::radar_height_ft_near` reports as 1275 ft.
 const SITE: (f64, f64) = (35.3333, -97.2778);
 /// The **feedhorn**, 1213 ft of ground plus a 62 ft tower.
-///
-/// It was the 1213 before the section named a datum, which put the height
-/// axis a whole tower low — every beam height on it is measured above the
-/// antenna, not above the ground the antenna stands on. Written out rather
-/// than taken from [`FT_TO_KM`] so that an edit to the module's factor fails
-/// here instead of moving the expected value along with the measured one,
-/// and written as the sum so that switching the render back to
-/// `Datum::SiteBase` fails this file rather than passing quietly.
 const SITE_ELEV_KM: f64 = (1214.0 + 62.0) * 0.000_304_8;
 
 /// Raw code for a range-folded gate. Not a magic 1: the sampler's decoder
@@ -95,11 +69,6 @@ fn sweep(
 }
 
 /// [`sweep`] with a clock on every radial, milliseconds since the Unix epoch.
-///
-/// `0` is the decoder's own "no timestamp" value and is what every fixture
-/// that does not care about time passes, through [`sweep`]. The ones that do
-/// care need *distinct* clocks per sweep: a volume of identical zeros cannot
-/// tell a ladder that dated its rungs from one that dated none of them.
 #[allow(clippy::too_many_arguments)]
 fn sweep_at(
     collected_ms: i64,
@@ -204,10 +173,6 @@ fn vcp(cut_angles: &[f64]) -> VolumeCoveragePattern {
 /// The tilt ladder every geometry test below runs on: five cuts spanning
 /// 0.5° to 19.5°, **delivered out of order** and with the 0.5° cut repeated
 /// the way a SAILS volume repeats its base tilt.
-///
-/// Gate counts fall with elevation, so the upper cuts are range-truncated
-/// exactly as real ones are: 0.5° reaches 2.125 + 1199·0.25 = 302 km of
-/// slant, 19.5° only 77 km.
 const LADDER: [(u8, f32, usize); 5] = [
     (1, 0.53, 1200),
     (2, 1.31, 1200),
@@ -223,16 +188,11 @@ fn scan_with(field: &dyn Fn(f64, f64) -> Gate) -> Scan {
 }
 
 fn scan_with_first_gate(field: &dyn Fn(f64, f64) -> Gate, first_gate_m: u16) -> Scan {
-    // Collection order: 4.0°, the base tilt, 19.5°, 1.3°, 10.0°, then the
-    // SAILS repeat of the base tilt. Nothing about this is ascending.
     let order = [2usize, 0, 4, 1, 3];
     let mut sweeps: Vec<Sweep> = order
         .iter()
         .map(|&i| {
             let (number, elevation, gates) = LADDER[i];
-            // Each rung starts at a different azimuth, so a per-rung index
-            // that leaked between rungs is off by a different amount on
-            // each of them.
             let first_az = 13.7 * (i as f64 + 1.0);
             sweep(number, elevation, 720, gates, first_az, field, first_gate_m)
         })
@@ -249,17 +209,7 @@ fn scan_with_first_gate(field: &dyn Fn(f64, f64) -> Gate, first_gate_m: u16) -> 
     Scan::new(vcp(&[0.5, 1.3, 4.0, 10.0, 19.5]), sweeps)
 }
 
-/// A point `range_km` from `SITE` on `bearing_deg`, found by inverting
-/// [`rustdar_geo::site_bearing_range_km`] numerically rather than by a second
-/// forward formula — so a fixture and the code under test cannot share a
-/// mistake.
-///
-/// Bisects on latitude for a due-north/south leg and then solves the
-/// longitude, which is exact enough (1e-9 km) for every assertion here.
 fn point_at(bearing_deg: f64, range_km: f64) -> (f64, f64) {
-    // Start from the spherical direct solution and refine: the direct
-    // formula is on the same sphere, so one Newton step on the residual
-    // range is already at machine precision.
     let ang = range_km / rustdar_geo::EARTH_RADIUS_KM;
     let (lat1, lon1) = (SITE.0.to_radians(), SITE.1.to_radians());
     let brg = bearing_deg.to_radians();
@@ -308,10 +258,6 @@ fn pixel_at(section: &CrossSection, col: usize, row: usize) -> (u8, u8, u8, u8) 
 }
 
 /// The column whose centre is nearest `distance_km` along the line.
-///
-/// Nearest rather than a hard-coded index, because the two supported
-/// rasters are 1024 and 2048 columns wide and an index that named a place
-/// on one names a different place on the other.
 fn nearest_column(axes: &SectionAxes, distance_km: f64) -> usize {
     (0..SECTION_WIDTH)
         .min_by(|&a, &b| {
@@ -335,12 +281,6 @@ fn nearest_row(axes: &SectionAxes, height_km_msl: f64) -> usize {
 
 /// The two comparisons whose boundary no rendered fixture can reach, at
 /// the boundary.
-///
-/// Mutation testing found both: `<` and `<=` are indistinguishable to every
-/// other test here, because the equality case needs a great-circle solution
-/// or a beam height to land on an exact `f64`. They are named functions and
-/// tested directly for that reason — one of them is a taste question and
-/// the other is not, and only this test says which.
 #[test]
 fn the_two_boundary_predicates_round_the_way_the_docs_say() {
     // Taste: a column at exactly the guard's range is sampled.
@@ -348,9 +288,6 @@ fn the_two_boundary_predicates_round_the_way_the_docs_say() {
     assert!(is_blind(BLIND_GROUND_RANGE_KM * (1.0 - f64::EPSILON)));
     assert!(!is_blind(BLIND_GROUND_RANGE_KM * (1.0 + f64::EPSILON)));
 
-    // Not taste: the cone test has to agree with what the sampler answers
-    // at that exact height, so the rule is read off the sampler rather than
-    // off this module's doc.
     let scan = scan_with(&|_az, _slant| Gate::Dbz(30.0));
     let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
     let column = sampler.column(45.0, 40.0);
@@ -378,34 +315,6 @@ fn the_two_boundary_predicates_round_the_way_the_docs_say() {
     assert!(ceiling_is_under(ceiling, just_over));
 }
 
-/// No pixel of a rendered section carries a `Value` whose geometry places
-/// it above the top rung — the module's "no upward extrapolation" rule,
-/// stated where a reader measures it rather than where the sampler
-/// implements it.
-///
-/// # Why this exists at the section level
-///
-/// `sampler::tests::nothing_is_extrapolated_above_or_below_the_ladder`
-/// already pins `Column::at_height_km`'s two edges. This pins the property
-/// that survives the whole raster: every column, every row, through the
-/// MSL axis and back. A clamp reintroduced anywhere between the ladder and
-/// the pixel — in the rung search, in the row-height mapping, in a future
-/// "fill the cone" convenience — shows up here even if
-/// `at_height_km` keeps its contract.
-///
-/// # The trap this also nails down
-///
-/// A validation pass read a KDMX section as returning a value at an
-/// implied 20.07° against a 19.56° top tilt, which looks exactly like
-/// upward extrapolation and is not. Beam heights are **above the
-/// antenna**; the height axis is **MSL**. Invert the beam equation on a
-/// row's MSL height without subtracting
-/// [`SectionAxes::base_km_msl`] and the implied angle comes out high by an
-/// amount that grows with the site's elevation — nothing at sea-level
-/// KLWX, half a degree at KDMX's 299 m, twelve degrees at KFTG's 1675 m.
-/// The second half of this test performs that mistake deliberately and
-/// asserts it overshoots, so the difference between the two readings is
-/// recorded as a measured fact rather than as prose.
 #[test]
 fn no_value_in_a_section_sits_above_the_top_rung() {
     // The radars this renders against; there are none until a test asks.
@@ -418,10 +327,7 @@ fn no_value_in_a_section_sits_above_the_top_rung() {
         .last()
         .expect("the ladder has rungs");
 
-    // Invert `beam::height_at_ground_km` for the elevation angle. Bisection
-    // rather than a closed form so the test cannot inherit an algebra
-    // error from the code it is checking: it only ever calls the shipped
-    // forward function.
+    // Invert `beam::height_at_ground_km` for the elevation angle.
     let implied_deg = |ground_km: f64, height_km: f64| {
         let (mut lo, mut hi) = (-5.0f64, 89.0f64);
         for _ in 0..200 {
@@ -466,9 +372,7 @@ fn no_value_in_a_section_sits_above_the_top_rung() {
              so passing says nothing",
     );
 
-    // The same raster read the wrong way. `SITE_ELEV_KM` is 0.37 km, so
-    // forgetting it inflates the implied angle and manufactures exactly the
-    // overshoot that was reported as extrapolation.
+    // The same raster read the wrong way.
     let mut worst_msl = f64::NEG_INFINITY;
     for col in 0..SECTION_WIDTH {
         let ground_km = axes.column_distance_km(col);
@@ -489,20 +393,8 @@ fn no_value_in_a_section_sits_above_the_top_rung() {
     );
 }
 
-// ── The raster's shape and its two axis mappings ────────────────────────
-
 /// The raster is twice as wide as it is tall and fits the WebGL2 floor on
 /// both targets.
-///
-/// Pinned because the two constants are the load-bearing half of "the UI
-/// does not clamp against `max_texture_side`": if either stopped being a
-/// power of two at or under 2048, a section would start failing to upload
-/// on a device that reports the GLES 3.0 floor, and nothing in this crate
-/// would notice.
-///
-/// The width no longer follows `IMAGE_SIZE`, and the arms are checked from
-/// one host build for the reason that constant's own test gives — the arm a
-/// build does not compile is the one nothing else catches.
 #[test]
 fn the_raster_is_a_half_height_image_size_and_fits_the_webgl2_floor() {
     assert_eq!(WASM_SECTION_WIDTH, 1024);
@@ -516,22 +408,14 @@ fn the_raster_is_a_half_height_image_size_and_fits_the_webgl2_floor() {
         assert!(n <= 2048, "the section {name} {n} exceeds the WebGL2 floor");
         assert!(n > 0);
     }
-    // And this target selected the arm named for it: 2048 x 1024 native,
-    // 1024 x 512 on wasm.
     #[cfg(target_arch = "wasm32")]
     assert_eq!((SECTION_WIDTH, SECTION_HEIGHT), (1024, 512));
     #[cfg(not(target_arch = "wasm32"))]
     assert_eq!((SECTION_WIDTH, SECTION_HEIGHT), (2048, 1024));
 }
 
-// ── The raster's two axis mappings ──────────────────────────────────────
-
 /// Row 0 is the top, the last row is the bottom, both are half a cell
 /// inside the axis, and the spacing is uniform.
-///
-/// Every geometric assertion below is read through these two functions, so
-/// this is the one place they are checked against arithmetic written out by
-/// hand.
 #[test]
 fn the_axes_map_rows_downward_and_columns_from_the_start_point() {
     let axes = SectionAxes {
@@ -554,8 +438,6 @@ fn the_axes_map_rows_downward_and_columns_from_the_start_point() {
         axes.row_height_km_msl(SECTION_HEIGHT - 1),
         20.4 - (SECTION_HEIGHT as f64 - 0.5) * cell,
     );
-    // Row 0 is the top: the first row is *higher* than the last, and the
-    // last sits half a cell above the base rather than on it.
     assert!(axes.row_height_km_msl(0) > axes.row_height_km_msl(SECTION_HEIGHT - 1));
     assert!(
         (axes.row_height_km_msl(SECTION_HEIGHT - 1) - (0.4 + 0.5 * cell)).abs() < 1e-12,
@@ -577,8 +459,6 @@ fn the_axes_map_rows_downward_and_columns_from_the_start_point() {
         axes.column_distance_km(SECTION_WIDTH - 1),
         (SECTION_WIDTH as f64 - 0.5) * width,
     );
-    // The mapping is a fraction of the line, so the last column is inside
-    // its far end by half a cell rather than on it.
     assert!(
         axes.column_distance_km(SECTION_WIDTH - 1) < 200.0,
         "the last column sits at or past the end of the line",
@@ -587,19 +467,6 @@ fn the_axes_map_rows_downward_and_columns_from_the_start_point() {
 
 /// Every pixel is the volume sampled at that pixel's own place — checked
 /// against geometry written out here rather than called.
-///
-/// This is the rasterizer's whole contract in one test, and it is
-/// deliberately not routed through [`SectionAxes`]'s two accessors: the
-/// fraction, the great-circle point, the radar-relative coordinates, the
-/// MSL→above-antenna conversion and the row centre are all spelled out
-/// below, so an edit that moved the row order, dropped a half-pixel
-/// centring, mixed up the two height datums or measured the track on a
-/// different sphere fails here even if it edited both the renderer and the
-/// accessors in step.
-///
-/// A grid rather than the whole raster, because the whole raster is the
-/// section rendered twice and takes a second; the grid is chosen to include
-/// both corners, both edges and a prime stride through the interior.
 #[test]
 fn every_pixel_is_the_volume_sampled_at_that_pixels_own_place() {
     let scan = scan_with(&|az, slant| {
@@ -611,9 +478,6 @@ fn every_pixel_is_the_volume_sampled_at_that_pixels_own_place() {
             Gate::Dbz(-8.0 + slant / 5.0 + az / 90.0)
         }
     });
-    // A line that does not start at the site and does not run along a
-    // radial, so the azimuth changes down the raster and a track measured
-    // as a straight lat/lon lerp would drift off it.
     let req = request(point_at(310.0, 40.0), point_at(65.0, 190.0));
     let section = render_section(
         &scan,
@@ -634,16 +498,11 @@ fn every_pixel_is_the_volume_sampled_at_that_pixels_own_place() {
     rows.push(SECTION_HEIGHT - 1);
 
     for &col in &cols {
-        // Spelled out, not called: `column_distance_km` divided by
-        // `length_km` is the same fraction, and this is the place that must
-        // not share it.
         let t = (col as f64 + 0.5) / SECTION_WIDTH as f64;
         let point = rustdar_geo::great_circle_point(req.start, req.end, t);
         let (azimuth, ground) =
             rustdar_geo::site_bearing_range_km(SITE.0, SITE.1, point.0, point.1);
         for &row in &rows {
-            // Row 0 at the top, centres half a row inside the axis, and
-            // the query height is above the *antenna* while the axis is MSL.
             let height_msl = axes.top_km_msl
                 - (row as f64 + 0.5) * (axes.top_km_msl - axes.base_km_msl) / SECTION_HEIGHT as f64;
             let expected = sampler.sample(azimuth, ground, height_msl - axes.base_km_msl);
@@ -669,8 +528,6 @@ fn every_pixel_is_the_volume_sampled_at_that_pixels_own_place() {
     }
     assert_eq!(checked, cols.len() * rows.len());
     // precondition: the grid really covered more than one kind of answer.
-    // Four of the seven statuses is what this geometry produces; a fixture
-    // that produced one would make the comparison above vacuous.
     assert!(
         statuses.len() >= 4,
         "the grid hit only {} statuses ({statuses:?})",
@@ -678,28 +535,11 @@ fn every_pixel_is_the_volume_sampled_at_that_pixels_own_place() {
     );
 }
 
-// ── Geometry, against analytic fixtures ─────────────────────────────────
-
 /// A slab planted between two heights paints between those two rows, and
 /// nowhere else.
-///
-/// The slab is planted in **beam coordinates** — a gate is in it when
-/// `beam::height_km(slant, elevation)` lands in the band — so what is being
-/// tested is that the rasterizer maps rows to those same heights, not that
-/// two copies of the same formula agree.
-///
-/// The band is 4–6 km above the antenna, which on this ladder is crossed by
-/// three rungs at the ranges tested, so the vertical lerp has real brackets
-/// above and below rather than falling off the end of the ladder.
 #[test]
 fn a_planted_slab_paints_between_the_rows_of_its_planted_heights() {
     const SLAB: (f64, f64) = (4.0, 6.0);
-    // A slab is a fact about *height*, and a gate's height depends on the
-    // rung that flew it — so the field is planted per rung, in that rung's
-    // own beam coordinates, and every rung's gates end up in the slab at a
-    // different slant range. A field planted in slant range alone would be
-    // a cone, not a slab, and would pass a rasterizer that ignored
-    // elevation entirely.
     let slab_scan = {
         let order = [2usize, 0, 4, 1, 3];
         let mut sweeps: Vec<Sweep> = order
@@ -751,9 +591,6 @@ fn a_planted_slab_paints_between_the_rows_of_its_planted_heights() {
     let section = radial_section(&slab_scan, 47.0, 200.0);
     let axes = *section.axes();
 
-    // Probe at 65 km, where exactly one rung's beam passes through the
-    // slab. That is not a convenience — it is what a 2 km slab *is* to a
-    // five-rung ladder, and it fixes the answer analytically.
     let col = (0..SECTION_WIDTH)
         .min_by(|&a, &b| {
             (axes.column_distance_km(a) - 65.0)
@@ -763,9 +600,6 @@ fn a_planted_slab_paints_between_the_rows_of_its_planted_heights() {
         .unwrap();
     let ground = axes.column_distance_km(col);
 
-    // The ladder over that column, in the elevations the sampler actually
-    // chose — the base rung is the SAILS repeat, one hundredth of a degree
-    // up from the first pass.
     let rung_heights: Vec<f64> = [
         f64::from(LADDER[0].1 + 0.01),
         f64::from(LADDER[1].1),
@@ -793,13 +627,7 @@ fn a_planted_slab_paints_between_the_rows_of_its_planted_heights() {
              has no bracket on one side and the prediction below is wrong",
     );
 
-    // What the section must paint. The sampler's vertical blend hands a
-    // height to whichever bracketing rung carries the most weight when one
-    // of them has no value, so the boundary of a one-rung layer sits at the
-    // **midpoint** between that rung and its neighbours — not at the
-    // planted 4–6 km. That is the sampler's documented edge treatment, and
-    // predicting it is what makes this a test of the raster's row mapping
-    // rather than of the blend.
+    // What the section must paint.
     let predicted_bottom = (rung_heights[carrier - 1] + rung_heights[carrier]) / 2.0;
     let predicted_top = (rung_heights[carrier] + rung_heights[carrier + 1]) / 2.0;
 
@@ -813,8 +641,6 @@ fn a_planted_slab_paints_between_the_rows_of_its_planted_heights() {
     let top = axes.row_height_km_msl(painted[0]) - axes.base_km_msl;
     let bottom = axes.row_height_km_msl(*painted.last().unwrap()) - axes.base_km_msl;
 
-    // Two rows of slack: the boundary is exact but falls between row
-    // centres, and one row is 19.5 m native / 39 m on wasm.
     let row_km = (axes.top_km_msl - axes.base_km_msl) / SECTION_HEIGHT as f64;
     assert!(
         (top - predicted_top).abs() < 2.0 * row_km,
@@ -830,16 +656,13 @@ fn a_planted_slab_paints_between_the_rows_of_its_planted_heights() {
         LADDER[carrier - 1].1,
         LADDER[carrier].1,
     );
-    // And the planted slab really is inside what was painted, which is the
-    // sanity the prediction could otherwise talk itself out of.
     assert!(
         bottom < SLAB.0 && top > SLAB.1,
         "the painted band {bottom:.3}..{top:.3} km does not contain the \
              planted {:?} km slab",
         SLAB,
     );
-    // precondition: the band is a band, not the axis. A rasterizer that
-    // ignored the height axis would paint every row.
+    // precondition: the band is a band, not the axis.
     assert!(
         painted.len() < SECTION_HEIGHT / 3,
         "the layer painted {} of {SECTION_HEIGHT} rows",
@@ -866,15 +689,6 @@ fn a_planted_slab_paints_between_the_rows_of_its_planted_heights() {
 
 /// A wall planted at one ground range paints in the columns at that ground
 /// range — on every rung, which is what proves the `cos e` correction runs.
-///
-/// The wall is planted in **ground** range: a gate is in it when
-/// `beam::ground_range_km(slant, elevation)` falls in the band. A
-/// rasterizer that forgot `cos e` would paint the 19.5° rung's share of the
-/// wall 5.7 % further out and every other rung's in the right place, so the
-/// wall would lean. On this fixture's geometry — a 60 km wall drawn on a
-/// 150 km line — that is **3.65 km, about 50 native columns**, which
-/// `dropping_the_cos_e_correction_would_move_the_wall_further_than_the_tolerance`
-/// measures rather than assumes.
 #[test]
 fn a_planted_wall_paints_at_its_ground_range_on_every_rung() {
     const WALL: (f64, f64) = (60.0, 62.0);
@@ -910,8 +724,6 @@ fn a_planted_wall_paints_at_its_ground_range_on_every_rung() {
     let section = radial_section(&wall_scan, 312.0, 150.0);
     let axes = *section.axes();
 
-    // Every painted pixel, anywhere in the raster, is inside the wall's
-    // ground-range band. A leaning wall fails this at its top.
     let mut painted_columns: Vec<usize> = Vec::new();
     let mut worst = (0.0f64, 0usize, 0usize);
     for row in 0..SECTION_HEIGHT {
@@ -934,11 +746,6 @@ fn a_planted_wall_paints_at_its_ground_range_on_every_rung() {
         }
     }
     assert!(!painted_columns.is_empty(), "the wall painted nothing");
-    // One column is 150/SECTION_WIDTH km (73 m native); the bilinear in
-    // slant range spreads the 2 km wall by up to one gate either side, so
-    // 0.6 km is generous for the smear and 6.1x under the 3.6509 km a
-    // missing `cos e` would put the 19.5° rung out at a 60 km wall — the
-    // figure the companion test below measures.
     assert!(
         worst.0 < 0.6,
         "a value painted {:.3} km outside the wall at column {} (ground \
@@ -949,9 +756,6 @@ fn a_planted_wall_paints_at_its_ground_range_on_every_rung() {
         worst.2,
     );
 
-    // precondition: the wall really was sampled on the steep rungs too, or
-    // the `cos e` claim rests on nothing. The 19.5° beam is at 20.5 km ARL
-    // over a 60 km ground range, so the wall must paint that high.
     let highest = (0..SECTION_HEIGHT)
         .find(|&row| {
             (0..SECTION_WIDTH).any(|col| status_at(&section, col, row) == SampleStatus::Value)
@@ -967,10 +771,6 @@ fn a_planted_wall_paints_at_its_ground_range_on_every_rung() {
 
 /// The wall test's negative: a rasterizer that dropped `cos e` really would
 /// fail it.
-///
-/// Measured rather than asserted by construction — the divergence has to be
-/// bigger than the tolerance the test above uses, or that test proves
-/// nothing about `cos e` at all.
 #[test]
 fn dropping_the_cos_e_correction_would_move_the_wall_further_than_the_tolerance() {
     for &(_, elevation, _) in &LADDER {
@@ -989,11 +789,6 @@ fn dropping_the_cos_e_correction_would_move_the_wall_further_than_the_tolerance(
             );
         }
     }
-    // The figure the beam module quotes, restated as the kilometres this
-    // test depends on. It was 3.6509 km — `60/cos 19.5° − 60`, the
-    // tangent-plane inverse, 5.7 % of 60 km. The arc's inverse has to reach
-    // further, because 60 km of curved ground is more ground than 60 km of
-    // tangent plane, so it is now 3.8116 km, 6.35 %.
     let at_195 = beam::slant_range_for_ground_km(60.0, 19.5) - 60.0;
     assert!(
         (at_195 - 3.8116).abs() < 0.001,
@@ -1002,33 +797,8 @@ fn dropping_the_cos_e_correction_would_move_the_wall_further_than_the_tolerance(
     );
 }
 
-// ── The two spheres ─────────────────────────────────────────────────────
-
 /// The ground track and the plan view's range ring are on one sphere, and
 /// the closure is measured rather than asserted in a comment.
-///
-/// This test used to record a **seam**. `ImageBounds` framed the raster with
-/// `1.0 / 111.32` degrees per km — a 6378.1 km sphere — while the gates
-/// inside it, and this module's columns, walked
-/// [`rustdar_geo::EARTH_RADIUS_KM`] = 6371. A point the 230 km ring drew
-/// therefore measured 229.741580 km here: a 258.42 m gap, 1.1505 px on a
-/// 2048-wide plan view, always in the same direction. `ImageBounds` reads
-/// [`rustdar_geo::KM_PER_DEGREE_LAT`] now, which is the *expression*
-/// `EARTH_RADIUS_KM · π/180`, so the ring's latitude offset converts back to
-/// exactly the extent it was drawn at. The pixel figure below is computed from
-/// [`crate::types::IMAGE_SIZE`] rather than quoted, so it keeps meaning if
-/// either arm of that constant moves.
-///
-/// Measured at [`crate::types::BASE_EXTENT_KM`], and that is enough for every
-/// extent. The closure is a *ratio* of the two spheres, now 1, so it holds at
-/// a TDWR's 417 km frame and a surveillance cut's 458 km one for the same
-/// reason it holds here — there is no per-extent case to check.
-///
-/// The residual is asserted at the millimetre rather than at zero because
-/// `site_bearing_range_km` is a haversine round trip through `sin`/`asin` and
-/// not the inverse of a multiplication; sub-millimetre float noise is the
-/// honest expectation, and a *bit-exact* assertion here would fail for a
-/// reason that has nothing to do with which sphere anything is on.
 #[test]
 fn the_ground_track_and_the_range_ring_are_the_same_sphere() {
     let ring_deg = types::BASE_EXTENT_KM / rustdar_geo::KM_PER_DEGREE_LAT;
@@ -1047,12 +817,6 @@ fn the_ground_track_and_the_range_ring_are_the_same_sphere() {
         types::BASE_EXTENT_KM,
     );
 
-    // In pixels of the plan view the ring is drawn on: under a millionth of
-    // one, at the floor's own 2048 on either target, so the figure is stated
-    // rather than branched on. The scale is computed rather than read off a
-    // constant because there is no longer a constant to read — a render's
-    // pixels-per-km is its own `IMAGE_SIZE / (2 · extent)`, and this is that
-    // at the floor.
     let px_per_km = types::IMAGE_SIZE as f64 / (2.0 * types::BASE_EXTENT_KM);
     let px = gap_mm / 1e6 * px_per_km;
     assert!(
@@ -1061,10 +825,6 @@ fn the_ground_track_and_the_range_ring_are_the_same_sphere() {
              apart on a 2048-wide view before the spheres were unified",
     );
 
-    // precondition: the unification is the *expression*, not a rounded
-    // literal that happens to be close. A `KM_PER_DEGREE_LAT` spelled
-    // `111.195` would pass the assertions above at this tolerance and still
-    // be a second definition of the planet.
     assert_eq!(
         rustdar_geo::KM_PER_DEGREE_LAT.to_bits(),
         (rustdar_geo::EARTH_RADIUS_KM * std::f64::consts::PI / 180.0).to_bits(),
@@ -1072,32 +832,14 @@ fn the_ground_track_and_the_range_ring_are_the_same_sphere() {
     );
 }
 
-// ── Coverage, clipping, and what runs out where ─────────────────────────
-
 /// The section draws the whole line and says where the data stopped, rather
 /// than stopping at a fixed range.
-///
-/// The fixture's base tilt reaches 302 km of slant range, past
-/// [`crate::types::BASE_EXTENT_KM`], and the line is 420 km long — so a
-/// rasterizer holding to any single number would leave the last 190 km empty
-/// and report 230.
-///
-/// A plan view no longer holds to one either: it is projected at whatever its
-/// own sweep reaches. What still separates the two is what they are drawn
-/// *to* — a raster's extent is the data's, so it never runs out, while a
-/// section's length is the line the user drew and routinely outruns the volume.
-/// Which is why `coverage_ground_range_km` exists here and has no counterpart
-/// there.
 #[test]
 fn the_section_draws_the_whole_line_and_reports_where_the_data_ends() {
     let scan = scan_with(&|_az, slant| Gate::Dbz(10.0 + slant / 20.0));
     let section = radial_section(&scan, 91.0, 420.0);
     let axes = *section.axes();
 
-    // The last gate centre of the base tilt, in ground range on its own
-    // elevation — the farthest this volume can answer. The base rung is the
-    // **SAILS repeat**, one hundredth of a degree up from the first pass,
-    // because the ladder takes the newest sweep of a repeated cut.
     let last_slant = gate_slant_km(LADDER[0].2 - 1);
     let reach = beam::ground_range_km(last_slant, f64::from(LADDER[0].1 + 0.01));
     assert!(
@@ -1106,9 +848,6 @@ fn the_section_draws_the_whole_line_and_reports_where_the_data_ends() {
              tests the clip it is here to test",
     );
 
-    // Coverage is measured on the column grid and a column half a gate past
-    // the last gate centre still resolves to it, so the window is one
-    // column wide either way — which is 0.21 km native and 0.41 km on wasm.
     let tolerance = axes.length_km / SECTION_WIDTH as f64 + 0.2;
     assert!(
         (axes.coverage_ground_range_km - reach).abs() < tolerance,
@@ -1120,8 +859,6 @@ fn the_section_draws_the_whole_line_and_reports_where_the_data_ends() {
         "the section clipped at the plan view's floor: coverage {:.1} km",
         axes.coverage_ground_range_km,
     );
-    // And it ran out before the line did, which is the comparison the field
-    // exists to support.
     assert!(
         axes.coverage_ground_range_km < axes.far_ground_range_km,
         "precondition: the {:.1} km line did not outrun the {:.1} km of \
@@ -1130,15 +867,9 @@ fn the_section_draws_the_whole_line_and_reports_where_the_data_ends() {
         axes.coverage_ground_range_km,
     );
 
-    // Past the coverage the pixels say `BeyondRange`, not `NoCoverage` and
-    // not a value: the ladder's rungs are all there, they simply stop.
     let past = (0..SECTION_WIDTH)
         .find(|&col| axes.column_distance_km(col) > axes.coverage_ground_range_km + 2.0)
         .expect("some column lies past the data");
-    // A row inside the ladder at that range, which at 320 km is high: earth
-    // curvature alone puts the base tilt's beam at 9 km ARL there, so
-    // anything lower would read `BelowLowestBeam` and prove nothing about
-    // the range clip. Take the lowest drawn row that clears it.
     let floor_msl = axes.base_km_msl
         + beam::height_at_ground_km(axes.column_distance_km(past), f64::from(LADDER[0].1 + 0.01));
     let row = (0..SECTION_HEIGHT)
@@ -1159,9 +890,6 @@ fn the_section_draws_the_whole_line_and_reports_where_the_data_ends() {
 
 /// A below-threshold return counts as coverage: the radar looked and saw
 /// nothing, which is different from not having looked.
-///
-/// Without this the coverage number would collapse to "the farthest echo",
-/// and a clear-air section would report that its data ran out at the site.
 #[test]
 fn clear_air_still_counts_as_coverage() {
     let scan = scan_with(&|_az, _slant| Gate::BelowThreshold);
@@ -1184,14 +912,8 @@ fn clear_air_still_counts_as_coverage() {
     assert_eq!(pixel_at(&section, SECTION_WIDTH / 2, row), (0, 0, 0, 0));
 }
 
-// ── The cone of silence ─────────────────────────────────────────────────
-
 /// The cone is reported as an extent, and the extent is exactly the columns
 /// whose top row falls above the volume.
-///
-/// The equivalence is the point: the number and the pixels are two readings
-/// of one fact, so a consumer that draws a hatch over `cone_of_silence_km`
-/// covers precisely the empty columns and no others.
 #[test]
 fn the_cone_of_silence_is_reported_as_the_extent_of_the_empty_columns() {
     let scan = scan_with(&|_az, _slant| Gate::Dbz(35.0));
@@ -1205,9 +927,6 @@ fn the_cone_of_silence_is_reported_as_the_extent_of_the_empty_columns() {
         !empty_top.is_empty(),
         "a section starting at the site has no column above the volume",
     );
-    // The blind column at the site reads `NoCoverage`, not `AboveVolume`,
-    // and is inside the cone by definition — so the count is the empty ones
-    // plus the blind ones.
     let blind = (0..SECTION_WIDTH)
         .filter(|&col| status_at(&section, col, 0) == SampleStatus::NoCoverage)
         .count();
@@ -1222,8 +941,6 @@ fn the_cone_of_silence_is_reported_as_the_extent_of_the_empty_columns() {
         (empty_top.len() + blind) as f64 * width,
     );
 
-    // The cone is the *near* end of the line, contiguous, and its far edge
-    // is where the top rung's beam reaches the top row.
     assert_eq!(
         *empty_top.last().unwrap() + 1,
         empty_top.len() + blind,
@@ -1246,8 +963,6 @@ fn the_cone_of_silence_is_reported_as_the_extent_of_the_empty_columns() {
         LADDER[4].1,
     );
 
-    // A section far from the site is not in the cone at all, which is what
-    // makes the number a measurement rather than a constant.
     let far = render_section(
         &scan,
         &request(point_at(5.0, 120.0), point_at(35.0, 150.0)),
@@ -1291,17 +1006,12 @@ fn the_cone_extent_follows_the_axis_the_caller_asked_for() {
         "a 5 km axis reports the same {:.2} km cone as a 20 km one",
         tall.axes().cone_of_silence_km,
     );
-    // Roughly proportional: the cone's edge is `h / tan(e_top)` plus the
-    // beam's own curvature, so a quarter of the height is about a quarter
-    // of the reach.
     let ratio = low.axes().cone_of_silence_km / tall.axes().cone_of_silence_km;
     assert!(
         (0.15..0.35).contains(&ratio),
         "the 5 km cone is {ratio:.3} of the 20 km one",
     );
 }
-
-// ── The site crossing ───────────────────────────────────────────────────
 
 /// A line drawn across the site produces a blind column, a ground range
 /// that goes to zero and comes back, and a 180° flip in bearing.
@@ -1362,15 +1072,6 @@ fn a_line_across_the_site_blinds_one_column_and_flips_the_bearing() {
         "the bearing turned {flip:.3}° across the site, not 180°",
     );
 
-    // The blind columns are exactly the ones inside the guard, they are
-    // contiguous, and each is blind at every row.
-    //
-    // *How many* is target-dependent and deliberately not asserted as one:
-    // the guard is a 0.25 km window and a column is `length/WIDTH` wide —
-    // 0.098 km native, 0.195 km on wasm — so a native raster sees two or
-    // three and a wasm one sees one or two. What is target-independent is
-    // that the blind region is the guard's width plus at most a column,
-    // which is what the bound below says.
     let blind: Vec<usize> = (0..SECTION_WIDTH)
         .filter(|&col| ranges[col] < BLIND_GROUND_RANGE_KM)
         .collect();
@@ -1402,10 +1103,7 @@ fn a_line_across_the_site_blinds_one_column_and_flips_the_bearing() {
             assert_eq!(pixel_at(&section, col, row), (0, 0, 0, 0));
         }
     }
-    // And the guard is a slit, not a wedge. The comparison has to be made
-    // past the first gate's 2.125 km centre, which is its own reason for
-    // emptiness and would otherwise be mistaken for the guard's: at 5 km
-    // out the section paints again.
+    // And the guard is a slit, not a wedge.
     let out = (0..SECTION_WIDTH)
         .min_by(|&a, &b| (ranges[a] - 5.0).abs().total_cmp(&(ranges[b] - 5.0).abs()))
         .unwrap();
@@ -1421,12 +1119,6 @@ fn a_line_across_the_site_blinds_one_column_and_flips_the_bearing() {
 
 /// The blind guard is observable, and not merely redundant with the first
 /// gate's range.
-///
-/// With a nonzero `first_gate_range_km` the sampler refuses a sub-gate
-/// query anyway, so a fixture built the usual way cannot tell whether the
-/// guard exists. This one starts its gates at the antenna, so without the
-/// guard the column over the site would sample a bearing that is `atan2` of
-/// two rounding errors and paint whatever it found.
 #[test]
 fn the_blind_guard_holds_where_the_first_gate_starts_at_the_antenna() {
     let scan = scan_with_first_gate(&|az, _slant| Gate::Dbz(20.0 + az / 12.0), 0);
@@ -1452,9 +1144,6 @@ fn the_blind_guard_holds_where_the_first_gate_starts_at_the_antenna() {
         })
         .unwrap();
 
-    // precondition: with gates from zero, the neighbouring columns *do*
-    // paint — so the blind column's emptiness is the guard and not the
-    // absence of data.
     let row = (0..SECTION_HEIGHT)
         .find(|&row| axes.row_height_km_msl(row) < SITE_ELEV_KM + 0.05)
         .unwrap();
@@ -1474,15 +1163,10 @@ fn the_blind_guard_holds_where_the_first_gate_starts_at_the_antenna() {
     }
 }
 
-// ── Colour ──────────────────────────────────────────────────────────────
-
 /// The colours come from `get_color_for_value`, floors and all — including
 /// the reflectivity floor that lives *only* there and not in the legend.
 #[test]
 fn the_transparency_floors_come_from_the_shared_colour_function() {
-    // −5 dBZ is under reflectivity's 0 dBZ floor, which
-    // `get_color_for_value` paints transparent and `LegendScale` does not
-    // mention at all.
     let scan = scan_with(&|_az, _slant| Gate::Dbz(-5.0));
     let section = radial_section(&scan, 260.0, 100.0);
     let axes = *section.axes();
@@ -1503,8 +1187,6 @@ fn the_transparency_floors_come_from_the_shared_colour_function() {
         "a sub-floor reflectivity was painted",
     );
 
-    // And a value above the floor is exactly what the shared function says,
-    // rather than a second scale that happens to look similar.
     let strong = scan_with(&|_az, _slant| Gate::Dbz(47.5));
     let section = radial_section(&strong, 260.0, 100.0);
     let v = value_at(&section, col, row);
@@ -1529,8 +1211,6 @@ fn a_range_folded_gate_is_painted_rather_than_left_transparent() {
     });
     let section = radial_section(&scan, 118.0, 120.0);
     let axes = *section.axes();
-    // 50 km out and 3 km up: inside the fold on every rung that reaches
-    // there, and well clear of the lowest beam (0.75 km ARL at 50 km).
     let row = nearest_row(&axes, axes.base_km_msl + 3.0);
     let col = nearest_column(&axes, 50.0);
 
@@ -1544,11 +1224,6 @@ fn a_range_folded_gate_is_painted_rather_than_left_transparent() {
         "precondition: `get_color_for_value` no longer erases a folded \
              gate, so the extra arm has nothing to fix",
     );
-    // A folded gate is also the radar *looking*, so a volume that folds
-    // everywhere still reports its full coverage. Without this arm the
-    // coverage number would collapse to "the farthest unambiguous echo",
-    // and a section through a wholly folded second trip would claim its
-    // data ran out at the site.
     let all_folded = scan_with(&|_az, _slant| Gate::RangeFolded);
     let folded_section = radial_section(&all_folded, 118.0, 120.0);
     assert!(
@@ -1567,14 +1242,8 @@ fn a_range_folded_gate_is_painted_rather_than_left_transparent() {
     );
 }
 
-// ── The ladder's two warnings ───────────────────────────────────────────
-
 /// `tilt_count` and `widest_tilt_gap_deg` reach the axes, and they report
 /// the ladder rather than the sweep list.
-///
-/// The fixture's six sweeps are five cuts plus a SAILS repeat, so a count
-/// that counted sweeps would say six. Its widest gap is 19.47 − 9.94 =
-/// 9.53°, which no pair of *adjacent sweeps in collection order* produces.
 #[test]
 fn the_ladders_shape_travels_with_the_raster() {
     let scan = scan_with(&|_az, _slant| Gate::Dbz(25.0));
@@ -1582,9 +1251,6 @@ fn the_ladders_shape_travels_with_the_raster() {
     let axes = *section.axes();
 
     assert_eq!(axes.tilt_count, 5, "six sweeps, five cuts");
-    // The rung elevations come back through `f32` radial angles, so the
-    // expected gap is written the same way rather than in decimal — the
-    // two differ by 2.7e-7°, which is float width and not a discrepancy.
     let expected = f64::from(LADDER[4].1) - f64::from(LADDER[3].1);
     assert!(
         (axes.widest_tilt_gap_deg - expected).abs() < 1e-12,
@@ -1594,8 +1260,6 @@ fn the_ladders_shape_travels_with_the_raster() {
         LADDER[3].1,
         LADDER[4].1,
     );
-    // precondition: the widest gap really is that pair, so the assertion
-    // is about the ladder's shape and not about any two adjacent numbers.
     for pair in LADDER.windows(2) {
         assert!(
             f64::from(pair[1].1) - f64::from(pair[0].1) <= expected,
@@ -1609,28 +1273,6 @@ fn the_ladders_shape_travels_with_the_raster() {
 
 /// **The section carries the ladder it was cut from**, and it carries where
 /// that ladder stops against where the pattern says it should.
-///
-/// # Why the rungs travel with the raster
-///
-/// Drawing the rungs is the section's first honesty device, and a rung
-/// drawn at the wrong angle over a correct picture is worse than no rung at
-/// all. Before this the consumer had to *rediscover* the ladder — from
-/// `ScanInfo::product_elevations`, which rounds each sweep's median to 0.1°
-/// and dedups, against a sampler that groups by the cut table's nominal
-/// angle. Those count different things and disagree whenever two sweeps of
-/// one cut have medians straddling an `x.x5` boundary, which is half of all
-/// precipitation-mode volumes, complete ones included. The guard that
-/// noticed the disagreement could only refuse, so the device was simply
-/// absent there. One ladder, arriving with the picture, has nothing to
-/// disagree with.
-///
-/// # Why the two tops
-///
-/// `widest_tilt_gap_deg` is the *wrong* number mid-volume and it is wrong
-/// in the flattering direction: a volume four rungs in is all low, closely
-/// spaced cuts, so its gap reads better than a complete volume's. Where the
-/// ladder **stops** is the number that degrades as the volume truncates,
-/// and it only means anything beside what the pattern declares.
 #[test]
 fn the_section_carries_its_own_rungs_and_says_where_they_stop() {
     let field = |_az: f64, _slant: f64| Gate::Dbz(25.0);
@@ -1655,23 +1297,15 @@ fn the_section_carries_its_own_rungs_and_says_where_they_stop() {
     let complete = build(&LADDER);
     let section = radial_section(&complete, 77.0, 100.0);
 
-    // One rung per rung, always — `from_parts` refuses any other length, so
-    // a consumer never has a count to check against.
     assert_eq!(
         section.tilt_elevations_deg().len(),
         section.axes().tilt_count,
         "the ladder and the count that describes it disagree",
     );
-    // And they are the *sampler's* angles, the ones every height in the
-    // raster was computed from — not the cut table's nominal keys, which
-    // sit up to 0.044° off and would draw each curve slightly clear of the
-    // data it is meant to mark.
     let sampler = crate::sampler::VolumeSampler::new(&complete, RadarProduct::Reflectivity)
         .expect("the fixture volume samples");
     let expected: Vec<f64> = sampler.elevations_deg().collect();
     assert_eq!(section.tilt_elevations_deg(), expected.as_slice());
-    // Which is emphatically not the nominal ladder: if it were, the two
-    // would be interchangeable and this test would be pinning nothing.
     let nominal: Vec<f64> = sampler.nominal_elevations_deg().collect();
     assert_ne!(
         expected, nominal,
@@ -1679,8 +1313,6 @@ fn the_section_carries_its_own_rungs_and_says_where_they_stop() {
              cannot tell a section carrying geometry from one carrying keys",
     );
 
-    // A volume that flew its whole pattern has reached its own ceiling, so
-    // the blank above the top rung really is the cone of silence.
     assert_eq!(
         section.axes().top_tilt_deg,
         section.axes().top_declared_cut_deg,
@@ -1688,9 +1320,6 @@ fn the_section_carries_its_own_rungs_and_says_where_they_stop() {
     );
     assert_eq!(section.axes().top_declared_cut_deg, 19.5);
 
-    // Four rungs into the same pattern — the live chunk feed's ordinary
-    // state for most of every six minutes — the ceiling is the *volume's*,
-    // and the picture has to be able to say so.
     let partial = build(&LADDER[..2]);
     let mid_flight = radial_section(&partial, 77.0, 100.0);
     assert_eq!(mid_flight.axes().tilt_count, 2);
@@ -1701,10 +1330,6 @@ fn the_section_carries_its_own_rungs_and_says_where_they_stop() {
         mid_flight.axes().top_tilt_deg,
         mid_flight.axes().top_declared_cut_deg,
     );
-    // The declared ceiling is a property of the *pattern*, so it does not
-    // move as the volume fills. That is what makes the comparison mean
-    // anything: a number that shrank with the ladder would always agree
-    // with it.
     assert_eq!(
         mid_flight.axes().top_declared_cut_deg,
         section.axes().top_declared_cut_deg,
@@ -1712,8 +1337,6 @@ fn the_section_carries_its_own_rungs_and_says_where_they_stop() {
              volume can never be told from a complete one",
     );
 
-    // And it survives the wire, which is where a section that was cut in a
-    // worker reaches the pane that draws it.
     let decoded =
         CrossSection::from_bytes(&mid_flight.to_bytes()).expect("a mid-flight section round-trips");
     assert_eq!(
@@ -1729,25 +1352,8 @@ fn the_section_carries_its_own_rungs_and_says_where_they_stop() {
 
 /// A short ladder is the hazard these numbers exist for: it fills the gap
 /// with a smooth layer that is not there, and only the numbers say so.
-///
-/// The field is planted so that **only the base tilt and the top tilt see
-/// anything** — the three cuts between them looked and found nothing. That
-/// is a real shape: an elevated layer over a surface return, with clear air
-/// between.
-///
-/// * The five-rung volume measures the gap and draws it: two thin bands
-///   with empty sky between.
-/// * The two-rung volume has nothing to measure it with, so both of its
-///   rungs carry a value, the vertical lerp runs the whole 18.94° between
-///   them, and it paints **one continuous column of echo** across a gap it
-///   never sampled — smooth, finite, `Value`-statused, with no `NaN`, no
-///   seam and nothing in any of the three planes to give it away.
-///
-/// Which is why the two numbers travel with the raster.
 #[test]
 fn a_short_ladder_fills_the_gap_it_cannot_measure_and_only_the_numbers_object() {
-    // Echo on the lowest and highest cuts only, and varying along range so
-    // a rasterizer that smeared one gate still gets the shape wrong.
     let plant = |elev: f64| {
         move |_az: f64, slant: f64| {
             if !(1.0..=15.0).contains(&elev) {
@@ -1777,8 +1383,6 @@ fn a_short_ladder_fills_the_gap_it_cannot_measure_and_only_the_numbers_object() 
     };
 
     let full = build(&LADDER, &[0.5, 1.3, 4.0, 10.0, 19.5]);
-    // The same volume with the middle of the ladder abandoned: only the
-    // base tilt and the top one arrived.
     let short = build(&[LADDER[0], LADDER[4]], &[0.5, 1.3, 4.0, 10.0, 19.5]);
 
     let full_section = radial_section(&full, 200.0, 120.0);
@@ -1792,10 +1396,6 @@ fn a_short_ladder_fills_the_gap_it_cannot_measure_and_only_the_numbers_object() 
         "the short ladder's gap reported {:.6}°, not {expected:.6}°",
         short_section.axes().widest_tilt_gap_deg,
     );
-    // The abandoned ladder's widest gap *is* its whole span — there is
-    // nothing between its two rungs — while the full ladder's worst gap is
-    // half of it. That contrast is the number's whole job, so it is
-    // asserted as a relation rather than as two decimals.
     assert!(
         full_section.axes().widest_tilt_gap_deg < 0.6 * expected,
         "the full ladder's widest gap is {:.3}° of a {expected:.3}° span, \
@@ -1803,8 +1403,7 @@ fn a_short_ladder_fills_the_gap_it_cannot_measure_and_only_the_numbers_object() 
         full_section.axes().widest_tilt_gap_deg,
     );
 
-    // Now the pixels. Take one column, well out from the site, and read the
-    // whole height axis in both volumes.
+    // Now the pixels.
     let axes = *full_section.axes();
     let col = nearest_column(&axes, 50.0);
     let painted_rows = |s: &CrossSection| -> Vec<usize> {
@@ -1842,9 +1441,6 @@ fn a_short_ladder_fills_the_gap_it_cannot_measure_and_only_the_numbers_object() 
         full_rows.len(),
     );
 
-    // And the fabricated rows are indistinguishable from measured ones:
-    // status `Value`, a finite number, and a colour off the same scale.
-    // There is nothing in any of the three planes to warn on.
     let fabricated: Vec<usize> = short_rows
         .iter()
         .copied()
@@ -1870,8 +1466,6 @@ fn a_short_ladder_fills_the_gap_it_cannot_measure_and_only_the_numbers_object() 
         );
     }
 }
-
-// ── Refusals, invariants and the wire ───────────────────────────────────
 
 /// The four request-shape refusals, each for its own reason.
 #[test]
@@ -1935,8 +1529,6 @@ fn a_request_that_names_no_section_is_refused() {
             "a top of {top:?} km MSL rendered",
         );
     }
-    // A top above the site does render, so the refusals above are a
-    // boundary and not a blanket.
     assert!(
         render_section(
             &scan,
@@ -1951,9 +1543,6 @@ fn a_request_that_names_no_section_is_refused() {
         .is_some(),
     );
 
-    // A product with no Level II moment behind it, and a volume whose
-    // coverage pattern is the empty placeholder a worker's reconstructed
-    // scan carries.
     assert!(
         render_section(
             &scan,
@@ -2033,44 +1622,6 @@ fn every_axis_number_of_a_rendered_section_is_finite() {
 /// The default height axis **does** cut the top off an ordinary tilt ladder,
 /// and it is a middle cut at long range that reaches over it — not the top of
 /// the pattern at short range.
-///
-/// # Why this test exists
-///
-/// [`DEFAULT_AXIS_HEIGHT_KM`]'s doc used to claim the opposite: that 20 km
-/// clears "every beam in the volume at every range", because the 19.5° cut only
-/// passes it at 55.9 km of ground and "no lower cut gets there at all". The
-/// second clause compares the two *ends* of the ladder and skips its middle,
-/// where the beams that reach highest actually are — a cut's beam peaks at that
-/// cut's own maximum range, and the middle cuts outrange the top one by a
-/// factor of three. Over a 158-volume corpus, 115 volumes carry gates above
-/// this axis; the shallowest cut that does is 4.48°, and the highest beam
-/// centre reached is 21.28 km.
-///
-/// # Why it is not circular
-///
-/// The height is recomputed here from the **exact spherical** form
-///
-/// ```text
-/// h = √(r² + Rₑ² + 2·r·Rₑ·sin e) − Rₑ
-/// ```
-///
-/// — Doviak & Zrnić (1993) eq. 2.28, which is what
-/// `nexrad_model::geo::RadarCoordinateSystem::polar_to_geo` and Py-ART's
-/// `antenna_to_cartesian` both evaluate — rather than from
-/// [`crate::beam::height_at_ground_km`]'s quadratic, which is the form under
-/// test. The two agree to 23.5 m anywhere below 20 km (the identity is derived
-/// in [`crate::beam`]'s module doc), so either would land this assertion;
-/// running the independent one is what makes the claim about beam geometry
-/// instead of about this crate's spelling of it. Nothing here reads a stored
-/// digest of our own output.
-///
-/// The **radius** is deliberately [`crate::beam::RE_EFF_KM`] rather than a
-/// second literal, and that is not the circularity this guards against. What
-/// has to be independent is the *equation*; the sphere has to be **shared**, or
-/// the two forms differ by their refraction model and the comparison stops
-/// measuring the geometry at all. `geodesy_one_definition` refuses a second
-/// spelling of an earth radius anywhere in the crate for the same reason, and
-/// caught this test writing one.
 #[test]
 fn the_default_axis_clips_the_top_of_an_ordinary_ladder() {
     /// Doviak & Zrnić eq. 2.28 on the 4/3 effective earth, spelled out rather
@@ -2081,8 +1632,6 @@ fn the_default_axis_clips_the_top_of_an_ordinary_ladder() {
             - re
     }
 
-    // A 4.53° cut carrying gates to 230.12 km of slant range — the reach a
-    // VCP 21/32 mid cut has, and the case measured at KLOT and KGRB.
     let (elev_deg, slant_km) = (4.53, 230.12);
     let height_km = spherical_height_km(slant_km, elev_deg);
     assert!(
@@ -2091,24 +1640,18 @@ fn the_default_axis_clips_the_top_of_an_ordinary_ladder() {
          used to claim a {DEFAULT_AXIS_HEIGHT_KM} km axis clears",
     );
 
-    // And it is *shallow*: the top of the pattern is four times this angle, so
-    // this cannot be dismissed as the ladder's extreme rung.
     assert!(
         elev_deg < 5.0,
         "the point of this case is that an ordinary middle cut reaches over the \
          axis, so it stops being evidence if {elev_deg}° is near the top of a VCP",
     );
 
-    // The clipping is shallow — the other half of the corrected doc, and the
-    // reason 20 km is still the default rather than a defect.
     assert!(
         height_km < DEFAULT_AXIS_HEIGHT_KM + 1.5,
         "a {height_km} km beam is further over the axis than the corpus's worst \
          (21.28 km); the doc's \"at most 1.3 km deep\" would need re-measuring",
     );
 
-    // The half of the old claim that was true stays pinned: the 0.5° cut really
-    // does stay under the axis, at every range a volume reaches.
     let base_tilt_km = spherical_height_km(470.0, 0.5);
     assert!(
         base_tilt_km < DEFAULT_AXIS_HEIGHT_KM,
@@ -2117,15 +1660,8 @@ fn the_default_axis_clips_the_top_of_an_ordinary_ladder() {
 }
 
 /// A section of nothing equals a copy of itself.
-///
-/// This is the property a derived `PartialEq` destroys: every pixel of a
-/// blank section carries `f32::NAN`, and `NaN != NaN`, so WP-D's
-/// `assert_eq!(execute(&…), None)` over a `JobOutput` containing one would
-/// fail on a byte-identical value with nothing in the message saying why.
 #[test]
 fn a_section_with_no_values_still_equals_itself() {
-    // Well outside the volume: every rung is `BeyondRange`, so every pixel
-    // is missing and every value is `NaN`.
     let scan = scan_with(&|_az, _slant| Gate::Dbz(30.0));
     let far = render_section(
         &scan,
@@ -2140,17 +1676,10 @@ fn a_section_with_no_values_still_equals_itself() {
         "precondition: the far section has values in it, so it is not the \
              blank raster this test needs",
     );
-    // precondition: `all` is vacuously true on an empty slice, so the
-    // assertion above says nothing unless the plane is the full raster.
     assert_eq!(far.values().len(), SECTION_WIDTH * SECTION_HEIGHT);
     let copy = far.clone();
     assert_eq!(far, copy, "a blank section is unequal to a copy of itself");
 
-    // An ordinary near-site section — a real echo, drawn a few tens of km
-    // out — is the case that makes this more than a corner. It is mostly
-    // values, and it *still* fails under derived semantics, because the
-    // upper cuts stop short, the base tilt has a floor and the cone has a
-    // ceiling, so some pixel somewhere is a `NaN`.
     let near = radial_section(&scan, 45.0, 100.0);
     assert!(
         near.values().iter().any(|v| v.is_nan()) && near.values().iter().any(|v| v.is_finite()),
@@ -2163,8 +1692,6 @@ fn a_section_with_no_values_still_equals_itself() {
         "an ordinary section is unequal to a copy of itself",
     );
 
-    // And a section *with* values still compares on them: a changed number
-    // is a changed section.
     let mut tweaked = near.clone();
     let i = tweaked
         .status
@@ -2174,17 +1701,11 @@ fn a_section_with_no_values_still_equals_itself() {
     tweaked.values[i] += 1.0;
     assert_ne!(near, tweaked, "a changed value did not change the section");
 
-    // A changed *status* is a changed section even where both values are
-    // NaN — the status plane is compared unconditionally.
     let mut restatused = far.clone();
     assert_ne!(far.status[0], SampleStatus::NoCoverage.wire_code());
     restatused.status[0] = SampleStatus::NoCoverage.wire_code();
     assert_ne!(far, restatused);
 
-    // Every part is compared, and each is checked on its own: otherwise a
-    // conjunct could be dropped one at a time with every other assertion
-    // here still passing, and two sections of different places or
-    // different pictures would compare equal on the wire.
     let mut reaxed = far.clone();
     reaxed.axes.top_km_msl += 1.0;
     assert_ne!(far, reaxed, "a changed axis did not change the section");
@@ -2193,9 +1714,6 @@ fn a_section_with_no_values_still_equals_itself() {
     repainted.image[0] = repainted.image[0].wrapping_add(1);
     assert_ne!(far, repainted, "a changed pixel did not change the section");
 
-    // A length mismatch is an inequality and not a panic: without the
-    // length test the `zip` would compare the shorter prefix and call a
-    // truncated payload equal to a whole one.
     let mut truncated = far.clone();
     truncated.values.pop();
     assert_ne!(
@@ -2268,9 +1786,6 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
         "a short status plane was accepted",
     );
 
-    // A status byte this build cannot name — what a payload from a newer
-    // sender looks like. Accepting it would make `sample` have to invent an
-    // answer.
     let mut future = section.status().to_vec();
     future[7] = 200;
     assert!(
@@ -2286,9 +1801,7 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
         "an unknown status code was accepted",
     );
 
-    // A non-finite axis. Every field is checked on its own, because a
-    // single `all_finite` walk that dropped one of them would still pass
-    // an assertion made about any other.
+    // A non-finite axis.
     for name in [
         "length_km",
         "base_km_msl",
@@ -2299,10 +1812,6 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
         "cone_of_silence_km",
         "widest_tilt_gap_deg",
     ] {
-        // Both bars, because `is_finite` and `!is_nan` differ exactly on
-        // the infinities and a mapping is affine in these fields: an
-        // infinite `top_km_msl` gives every row height an infinity, and
-        // `inf - inf` at the bottom of the axis a `NaN`.
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let mut broken = axes;
             match name {
@@ -2330,10 +1839,6 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
             );
         }
     }
-    // The two tilt-top angles are checked by the same walk, and they are
-    // the pair a caption reads to decide whether a ceiling in the picture
-    // is the radar's or the volume's. A `NaN` in either makes that
-    // comparison answer "truncated" for every complete volume there is.
     for name in ["top_tilt_deg", "top_declared_cut_deg"] {
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let mut broken = axes;
@@ -2357,9 +1862,6 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
         }
     }
 
-    // `tilt_count` is a `usize` and has no non-finite value to have, so a
-    // whole-axes rejection would be wrong: an ordinary count still builds —
-    // as long as the ladder that comes with it is that long.
     assert!(
         CrossSection::from_parts(
             section.image().to_vec(),
@@ -2376,12 +1878,6 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
         "the finiteness check refused something that has no finiteness",
     );
 
-    // **The ladder and the count that describes it are one fact.** This is
-    // the refusal that lets a consumer draw the rungs without first
-    // checking them against a separately-discovered elevation list — the
-    // check that counted something else and went silent on half of all
-    // precipitation-mode volumes. A section whose two halves disagree is
-    // not representable.
     assert!(
         !ladder().is_empty(),
         "precondition: the fixture has a ladder to shorten"
@@ -2402,11 +1898,6 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
             axes.tilt_count,
         );
     }
-    // **And the clocks are one per rung too.** A consumer zips the two lists
-    // to say "this rung, this old", so a short clock list either truncates
-    // the ladder or pairs a rung with its neighbour's age — and an age is a
-    // number no reader can sanity-check by looking at the picture, unlike an
-    // elevation, which lands the curve visibly in the wrong place.
     for wrong in [
         clocks()[1..].to_vec(),
         Vec::new(),
@@ -2428,9 +1919,7 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
         );
     }
 
-    // And a rung that is not an angle. A `NaN` elevation draws no curve and
-    // reports nothing, so the honesty device goes quiet in the one way
-    // nobody notices.
+    // And a rung that is not an angle.
     for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         let mut broken = ladder();
         broken[0] = bad;
@@ -2448,10 +1937,7 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
         );
     }
 
-    // A `Value` status over a number that is not one. Both bars are
-    // exercised: `NaN` paints nothing, but an **infinity** compares larger
-    // than every threshold in the scale and paints the top of it, so a
-    // section carrying one looks like the strongest echo in the volume.
+    // A `Value` status over a number that is not one.
     let at = section
         .status()
         .iter()
@@ -2473,9 +1959,6 @@ fn the_wire_constructor_refuses_a_misshaped_section() {
             "a Value pixel carrying {bad} was accepted",
         );
     }
-    // And the same number under a status that has no number is ordinary —
-    // it is what every missing pixel already holds — so the check is a
-    // pairing rather than a blanket ban on `NaN` in the plane.
     let missing = section
         .status()
         .iter()
@@ -2540,19 +2023,12 @@ fn the_pixel_reader_recovers_the_sample_behind_a_pixel() {
 /// Nothing is extrapolated: off the top of the ladder the section says
 /// `AboveVolume`, off the bottom it says `BelowLowestBeam`, and neither
 /// carries a number.
-///
-/// The two happen at opposite ends of the *line*, not of one column, and
-/// that is the geometry rather than a convenience: near the site the ladder
-/// is squashed under the axis top and near its far end the lowest beam is
-/// above the axis bottom.
 #[test]
 fn the_section_says_which_side_of_the_ladder_it_fell_off() {
     let scan = scan_with(&|_az, _slant| Gate::Dbz(40.0));
     let section = radial_section(&scan, 133.0, 200.0);
     let axes = *section.axes();
 
-    // Off the top: 20 km up over a column 10 km from the site, where even
-    // the 19.5° beam is only 3.6 km ARL.
     let near = nearest_column(&axes, 10.0);
     assert_eq!(
         status_at(&section, near, 0),
@@ -2562,8 +2038,6 @@ fn the_section_says_which_side_of_the_ladder_it_fell_off() {
         status_at(&section, near, 0),
     );
 
-    // Off the bottom: the bottom row at 150 km, where earth curvature alone
-    // has lifted the base tilt's beam to 2.7 km ARL.
     let far = nearest_column(&axes, 150.0);
     assert_eq!(
         status_at(&section, far, SECTION_HEIGHT - 1),
@@ -2581,13 +2055,6 @@ fn the_section_says_which_side_of_the_ladder_it_fell_off() {
 
 /// A bracketing rung whose gates stop short reads `BeyondRange`, and that
 /// is ordinary rather than exceptional.
-///
-/// Every real volume has one at 230 km and 300 km because the upper cuts
-/// are range-truncated, and 8 of 19 measured volumes have one at 150 km.
-/// A rasterizer that treated it as an error, or that dropped the empty rung
-/// and widened the bracket, would interpolate straight across a tilt that
-/// measured nothing — which is the fabrication the whole status plane
-/// exists to make visible.
 #[test]
 fn a_bracketing_rung_that_stops_short_reads_beyond_range() {
     let scan = scan_with(&|_az, _slant| Gate::Dbz(40.0));
@@ -2595,9 +2062,6 @@ fn a_bracketing_rung_that_stops_short_reads_beyond_range() {
     let axes = *section.axes();
 
     // At 150 km the 9.94° rung has run out (500 gates, 125 km of ground)
-    // while the 4.02° rung below it (800 gates, 201 km) has not. A height
-    // above their midpoint therefore brackets a live rung and a dead one,
-    // and the dead one is the heavier.
     let col = nearest_column(&axes, 150.0);
     let ground = axes.column_distance_km(col);
     let low = beam::height_at_ground_km(ground, f64::from(LADDER[2].1));
@@ -2618,8 +2082,6 @@ fn a_bracketing_rung_that_stops_short_reads_beyond_range() {
     );
     assert!(value_at(&section, col, row).is_nan());
 
-    // And just under the midpoint the live rung wins, so the truncation is
-    // a boundary in the picture rather than a blanket refusal.
     let live = nearest_row(&axes, axes.base_km_msl + low + 0.2);
     assert_eq!(
         status_at(&section, col, live),
@@ -2632,10 +2094,6 @@ fn a_bracketing_rung_that_stops_short_reads_beyond_range() {
 /// The three planes agree pixel for pixel: a status of `Value` has a
 /// number, anything else has `NaN`, and the colour is what the colour
 /// function says about that pair.
-///
-/// Swept over the whole raster rather than sampled, because a disagreement
-/// between the planes is exactly what a hover readout would surface as
-/// "42 dBZ (below the lowest beam)".
 #[test]
 fn the_three_planes_agree_everywhere() {
     let scan = scan_with(&|az, slant| {
@@ -2671,8 +2129,6 @@ fn the_three_planes_agree_everywhere() {
             "pixel {i} ({status:?}, {value}) is painted wrong",
         );
     }
-    // precondition: the fixture really exercised more than one status, or
-    // the sweep above is a sweep over one arm.
     assert!(
         seen.len() >= 4,
         "the fixture produced only {} statuses ({seen:?}); this sweep is \
@@ -2681,23 +2137,9 @@ fn the_three_planes_agree_everywhere() {
     );
 }
 
-// ── The wire codec ──────────────────────────────────────────────────────
-
 /// Where each of the three planes' length prefixes sits in an encoded
 /// section: after the magic, the version and the nine axis numbers, then
 /// after each preceding plane.
-///
-/// Written out here rather than taken from the encoder, so a layout change
-/// that moved a field has to be made in both places — the mutations these
-/// offsets support are the whole point of the tests below, and an offset
-/// derived from the code under test would follow it wherever it went.
-/// `the_length_prefixes_are_where_the_tests_think_they_are` checks them,
-/// [`WIRE_FIXTURE_RUNGS`] included.
-///
-/// How many rungs every fixture below encodes: `scan_with` flies a
-/// five-cut pattern, and the ladder sits between the axes and the first
-/// plane — **twice**, an `f64` of elevation per rung and an `i64` of
-/// collection time per rung, each behind its own `u32` length.
 const WIRE_FIXTURE_RUNGS: usize = 5;
 const IMAGE_LEN_AT: usize =
     4 + 2 + 7 * 8 + 4 + 3 * 8 + 4 + WIRE_FIXTURE_RUNGS * 8 + 4 + WIRE_FIXTURE_RUNGS * 8;
@@ -2726,11 +2168,6 @@ fn wire_fixture() -> CrossSection {
 
 /// The three offsets the mutation tests below index by are the three the
 /// encoder actually wrote.
-///
-/// Every refusal test plants a value at one of them, so an offset that had
-/// drifted would leave those tests corrupting a byte of some other field
-/// and passing for the wrong reason — the classic way a suite of negative
-/// assertions goes green while testing nothing.
 #[test]
 fn the_length_prefixes_are_where_the_tests_think_they_are() {
     let fixture = wire_fixture();
@@ -2757,39 +2194,6 @@ fn the_length_prefixes_are_where_the_tests_think_they_are() {
 
 /// The version this layout ships is **3**, and it is written where a
 /// decoder from another build reads it.
-///
-/// `a_malformed_section_payload_is_refused_rather_than_misread` plants
-/// `0xFF 0xFF` and watches the decode refuse, which pins that *a* version
-/// check exists — not *which* version ships. Setting `FORMAT_VERSION` back
-/// to 1 left that test, and every other test in the workspace, green: both
-/// ends of the codec move together, so a build is always self-consistent
-/// and the constant is only load-bearing *between* builds.
-///
-/// Between builds is where it is the only defence. `rustdar-web`'s
-/// page/worker handshake compares `build_token`; in a deployed build it
-/// carries `GITHUB_SHA`, so pairs across a deploy boundary refuse each
-/// other at the HELLO handshake. Locally there is no SHA and the token
-/// folds the wire's pinned framing rows
-/// (`rustdar_worker::wire_identity`), deliberately not this nested
-/// payload — so a stale worker differing only here still shares a token
-/// with a fresh page. If a layout change forgets the bump — reordering two
-/// same-width `f64` axis fields is the easy one, since it round-trips
-/// perfectly through its own build's codec — the stale worker's payload
-/// decodes into the new field order silently, and a section is drawn with
-/// its axes swapped.
-///
-/// So the literal is written twice on purpose: once as the constant, once
-/// as the bytes on the wire. Mirrors `render_input`'s
-/// `the_format_version_is_the_one_this_layout_ships`, which the same
-/// argument applies to.
-///
-/// The magic is a literal for the same reason at lower stakes. Asserting
-/// it against `MAGIC` is self-consistency — the encoder writes that
-/// constant — and the relabel loop in
-/// `a_malformed_section_payload_is_refused_rather_than_misread` pins
-/// `RDXS` only against `RDRI` and `RDVX`, its two port-mates; any *unused*
-/// four bytes stayed green either way. A changed magic is at least a clean
-/// refusal rather than a misparse.
 #[test]
 fn the_format_version_is_the_one_this_layout_ships() {
     assert_eq!(FORMAT_VERSION, 3);
@@ -2804,28 +2208,6 @@ fn the_format_version_is_the_one_this_layout_ships() {
 
 /// A section assembled by hand, for
 /// [`the_wire_layout_is_the_one_this_version_ships`].
-///
-/// Every number is a literal and exactly representable, so the encoding is the
-/// same bytes on every target. [`wire_fixture`] cannot serve: it is rendered
-/// through beam geometry, so its axes and its whole value plane are whatever
-/// the platform's libm said, and a digest of it would be a digest of that.
-///
-/// **The planes are six pixels, not [`SECTION_WIDTH`] × [`SECTION_HEIGHT`].**
-/// That width is 1024 on the web and 2048 native, so a full-size fixture would
-/// give this test two different digests on two targets — and worse, a *change*
-/// to the raster size would then demand a [`FORMAT_VERSION`] bump it does not
-/// deserve. A raster resize is already handled on the wire by the three length
-/// prefixes, and [`CrossSection::from_bytes`] refuses a payload sized for
-/// another build by reading them; it is not a layout change. Six pixels keeps
-/// this test about the layout and nothing else.
-///
-/// The consequence is that this fixture will not survive
-/// [`CrossSection::from_bytes`] on any real build — its planes are the wrong
-/// size for the raster. That is fine and deliberate: this test only encodes.
-/// The round trip is `a_section_round_trips_through_its_wire_form`'s job.
-///
-/// Struct literals with no `..`, so a new field on [`CrossSection`] or
-/// [`SectionAxes`] fails to compile here rather than slipping onto the wire.
 fn layout_fixture() -> CrossSection {
     CrossSection {
         image: vec![
@@ -2852,41 +2234,9 @@ fn layout_fixture() -> CrossSection {
 }
 
 /// The bytes this version ships are **these** bytes.
-///
-/// [`the_format_version_is_the_one_this_layout_ships`] asserts
-/// `FORMAT_VERSION == 3` and that a `3` sits at byte 4. Both are our value
-/// compared against our value: they fail for the one who *raises* the number
-/// and are silent for the one who changes the layout and does not — which is
-/// the person the number exists to catch, because raising it is the safe act.
-///
-/// Measured, not argued. The same class of change was applied to this crate's
-/// two sibling codecs with the version left alone, and their version tests
-/// stayed green through all of it; `render_input`'s survived a `radar_lat` /
-/// `radar_lon` swap with the entire library suite passing. `xsect` is better
-/// defended than `render_input` — its hand-written `IMAGE_LEN_AT` /
-/// `VALUE_LEN_AT` / `STATUS_LEN_AT` offsets catch a header field added or
-/// resized, and its total-length assertion catches an append — but those
-/// offsets are blind to the change its own doc names as the danger: a
-/// **same-width reorder**, two of the seven leading `f64` axes swapped, which
-/// moves no offset and no length. See `campaigns/wire-layout-pin-audit.md` on
-/// `campaign-harness`.
-///
-/// This is the encoder's own output over a fixture nothing computes. A field
-/// added, removed, reordered, retyped, or written at a different width moves
-/// the length or the digest, and the only way past it is to write the new
-/// numbers down — which is where the bump obligation is met.
-///
-/// **This one is about to be exercised.** Carrying the storm-motion vector
-/// into a section takes `FORMAT_VERSION` 3 → 4; when that lands, this test
-/// fails, and the fix is to bump the constant *and* record the new length and
-/// digest. If it ever passes across a layout change, it has stopped working.
 #[test]
 fn the_wire_layout_is_the_one_this_version_ships() {
     let bytes = layout_fixture().to_bytes();
-    // The claim in `layout_fixture`'s doc, executed rather than asserted in
-    // prose: six pixels is not this build's raster, so the payload is one
-    // `from_bytes` refuses. If this ever starts decoding, the fixture has
-    // become a real section and the reasoning above needs rereading.
     assert!(
         CrossSection::from_bytes(&bytes).is_none(),
         "the layout fixture decoded, so its planes now match this build's \
@@ -2914,11 +2264,6 @@ fn the_wire_layout_is_the_one_this_version_ships() {
 
 /// A real section survives the wire, including one that is `NaN` in every
 /// pixel.
-///
-/// This is what [`CrossSection`]'s hand-written `PartialEq` was written
-/// for: a blank section carries `f32::NAN` in every value, and under
-/// derived semantics `assert_eq!` here would fail on a byte-identical
-/// payload with nothing in the message saying why.
 #[test]
 fn a_section_round_trips_through_its_wire_form() {
     let scan = scan_with(&|az, slant| {
@@ -2930,8 +2275,6 @@ fn a_section_round_trips_through_its_wire_form() {
             Gate::Dbz(-6.0 + slant / 6.0)
         }
     });
-    // A mixed section, a blank one and one whose axis the caller chose —
-    // three different shapes of payload, not three copies of one.
     let mixed = radial_section(&scan, 137.0, 150.0);
     let blank = render_section(
         &scan,
@@ -2979,9 +2322,6 @@ fn a_section_round_trips_through_its_wire_form() {
         let decoded = CrossSection::from_bytes(&section.to_bytes())
             .unwrap_or_else(|| panic!("the {name} section did not decode"));
         assert_eq!(*section, decoded, "the {name} section changed in transit");
-        // `PartialEq` ignores a value under a non-`Value` status, so an
-        // encoder that dropped the value plane's NaN payloads would still
-        // satisfy the assertion above. The bytes say more.
         assert_eq!(
             section.to_bytes(),
             decoded.to_bytes(),
@@ -2990,8 +2330,6 @@ fn a_section_round_trips_through_its_wire_form() {
         assert_eq!(section.axes(), decoded.axes(), "{name}");
     }
 
-    // And the comparison is not vacuous: three sections of three
-    // different places do not decode to one another.
     assert_ne!(mixed, blank);
     assert_ne!(mixed, shallow);
     assert_ne!(
@@ -3006,8 +2344,6 @@ fn a_section_round_trips_through_its_wire_form() {
 fn the_encoded_length_of_a_section_is_exact() {
     let section = wire_fixture();
     assert_eq!(section.encoded_len(), section.to_bytes().len());
-    // A second shape, so the estimate is pinned against something other
-    // than one raster's constant total.
     let blank = render_section(
         &scan_with(&|_az, _slant| Gate::Dbz(30.0)),
         &request(point_at(0.0, 800.0), point_at(90.0, 800.0)),
@@ -3030,12 +2366,6 @@ fn a_malformed_section_payload_is_refused_rather_than_misread() {
     assert!(CrossSection::from_bytes(&[]).is_none(), "empty");
     assert!(CrossSection::from_bytes(b"nope").is_none(), "wrong magic");
 
-    // A **whole** payload relabelled, including with the two magics that
-    // share this port. Mutation testing is why: a four-byte buffer cannot
-    // pin the magic test, because it fails on the version read instead —
-    // deleting the magic comparison outright left every short-buffer
-    // assertion here green, and a `RenderInput` frame would then have been
-    // decoded as a section.
     for wrong in [*b"nope", *b"RDRI", *b"RDVX"] {
         let mut relabelled = good.clone();
         relabelled[..4].copy_from_slice(&wrong);
@@ -3078,10 +2408,6 @@ fn a_malformed_section_payload_is_refused_rather_than_misread() {
         "trailing bytes mean the layouts disagree",
     );
 
-    // A length that cannot fit in what remains, on each of the three
-    // planes. The value plane is the one that matters: four bytes an
-    // element, so a believed `u32::MAX` reserves 16 GiB before the read
-    // fails.
     for (name, at) in [
         ("image", IMAGE_LEN_AT),
         ("values", VALUE_LEN_AT),
@@ -3095,11 +2421,6 @@ fn a_malformed_section_payload_is_refused_rather_than_misread() {
         );
     }
 
-    // A plane sized for a different build's raster — the ordinary
-    // cross-build case, since `SECTION_WIDTH` is 2048 native and 1024 on
-    // wasm. Shrunk by one element each, with the prefix moved to match, so
-    // the frame is well-formed right through to `at_end` and only
-    // `from_parts` can object.
     for (name, at, element) in [
         ("image", IMAGE_LEN_AT, 1usize),
         ("values", VALUE_LEN_AT, 4),
@@ -3116,8 +2437,6 @@ fn a_malformed_section_payload_is_refused_rather_than_misread() {
         );
     }
 
-    // A status byte this build cannot name — a payload from a newer
-    // sender.
     let mut future = good.clone();
     future[STATUS_LEN_AT + 4 + 7] = 200;
     assert!(
@@ -3125,8 +2444,7 @@ fn a_malformed_section_payload_is_refused_rather_than_misread() {
         "an unknown status code decoded",
     );
 
-    // A non-finite axis. `top_km_msl` is the third `f64`, and it is the
-    // one that makes every row height `NaN`.
+    // A non-finite axis.
     let mut nan_axis = good.clone();
     nan_axis[4 + 2 + 16..4 + 2 + 24].copy_from_slice(&f64::NAN.to_le_bytes());
     assert!(
@@ -3150,9 +2468,6 @@ fn a_malformed_section_payload_is_refused_rather_than_misread() {
         );
     }
 
-    // precondition: the fixture the mutations were made against decodes,
-    // so every refusal above is the mutation's doing and not the
-    // fixture's.
     assert_eq!(
         CrossSection::from_bytes(&good).expect("the unmutated payload decodes"),
         section,
@@ -3162,16 +2477,6 @@ fn a_malformed_section_payload_is_refused_rather_than_misread() {
 
 /// The capacity guard, tested directly, because nothing end to end can
 /// see it.
-///
-/// [`Reader::bounded`] does not change *what*
-/// [`CrossSection::from_bytes`] answers. `take` bounds every read, so a
-/// believed length fails on the read either way and the payload is refused
-/// with or without it. What it changes is whether four billion elements
-/// are reserved **first** — a 16 GiB allocation on the way to a `None`, on
-/// a worker thread, in a browser tab. Mutation testing confirms the gap
-/// rather than assuming it: deleting the call from `from_bytes` leaves the
-/// whole suite green, which is why the helper is named and pinned here
-/// instead, exactly as `is_blind` and `ceiling_is_under` are above.
 #[test]
 fn the_capacity_guard_refuses_a_length_the_buffer_cannot_hold() {
     let bytes = [0u8; 16];
@@ -3181,9 +2486,6 @@ fn the_capacity_guard_refuses_a_length_the_buffer_cannot_hold() {
     assert_eq!(r.bounded(5, 4), None, "20 bytes claimed from 16");
     assert_eq!(r.bounded(u32::MAX, 4), None, "16 GiB claimed from 16 bytes");
 
-    // It measures against what is *left*, not against the whole buffer —
-    // otherwise a length prefix late in a frame would be judged against
-    // bytes already consumed.
     let mut part_way = Reader::new(&bytes);
     part_way.take(8).expect("half the buffer");
     assert_eq!(part_way.bounded(2, 4), Some(2));
@@ -3196,20 +2498,6 @@ fn the_capacity_guard_refuses_a_length_the_buffer_cannot_hold() {
 /// Milliseconds since the epoch the clocked ladder below starts at.
 const SECTION_T0: i64 = 1_760_000_000_000;
 
-/// **A rendered section carries its ladder's clocks, rung for rung.**
-///
-/// A section reads as an instant and is not one: a VCP takes four to ten
-/// minutes to fly, so the bottom of the picture and the top are minutes apart,
-/// and the pane used to caption the whole thing with one volume time. The
-/// numbers that withdraw that claim have to travel *with the raster* — a pane
-/// keeps a section across a suspend and re-uploads it rather than re-cutting,
-/// precisely because the volume behind it may be gone by then.
-///
-/// The fixture flies its cuts in a hostile order (4.0°, 0.5°, 19.5°, 1.3°,
-/// 10.0°, then a SAILS repeat of the base tilt) and stamps each with a clock
-/// **in that collection order**, so the assertion is a statement about the
-/// ladder's own ordering as much as about the clocks: a list merely copied in
-/// sweep order would come out shuffled against the elevations beside it.
 #[test]
 fn a_section_carries_the_clock_of_every_rung_it_was_cut_from() {
     let field = |_az: f64, _slant: f64| Gate::Dbz(30.0);
@@ -3231,10 +2519,6 @@ fn a_section_carries_the_clock_of_every_rung_it_was_cut_from() {
             )
         })
         .collect();
-    // The SAILS repeat of the base tilt, six minutes in and newest of all —
-    // and it is a *reflectivity* repeat here, so the surveillance preference
-    // has nothing to prefer and "newest wins" takes it. The 0.5° rung must
-    // therefore be dated to this sweep and not to the one at index 1.
     sweeps.push(sweep_at(
         SECTION_T0 + 5 * 60_000,
         LADDER[0].0,
@@ -3267,11 +2551,6 @@ fn a_section_carries_the_clock_of_every_rung_it_was_cut_from() {
          then a fabrication: {clocks:?}",
     );
 
-    // The ladder is ascending by cut, and the clocks are the *collection*
-    // order — 0.5° was flown second and repeated last, 19.5° third — so the
-    // two lists are deliberately not in the same order as each other. A
-    // section that copied sweep order into the clock list would come out
-    // ascending here, and it must not.
     assert_eq!(
         clocks,
         [
@@ -3285,8 +2564,6 @@ fn a_section_carries_the_clock_of_every_rung_it_was_cut_from() {
          actually took",
     );
 
-    // Five minutes of clock across the ladder, which is what a caption asks
-    // for. The literal is the fixture's own spread, not a re-derivation.
     assert_eq!(
         section.assembly_span_secs(),
         Some(300),
@@ -3320,8 +2597,6 @@ fn an_unclocked_ladder_reports_no_span_rather_than_a_zero_one() {
         assembly_span_secs(&[SECTION_T0, SECTION_T0 + 360_000]),
         Some(360),
     );
-    // A `0` beside real clocks is skipped rather than minimised over — taking
-    // it would date the section to 1970 and report a span of half a century.
     assert_eq!(
         assembly_span_secs(&[0, SECTION_T0, SECTION_T0 + 360_000]),
         Some(360),
@@ -3331,50 +2606,19 @@ fn an_unclocked_ladder_reports_no_span_rather_than_a_zero_one() {
 
 /// A set of planes out of the pool is what three fresh `vec!`s would be — the
 /// right length, and seeded, whatever it was holding before.
-///
-/// # Why this tests the mechanism and not the renderer
-///
-/// The end-to-end claim — a cut never inherits a pixel from the cut before it —
-/// is `tests/section_plane_pool.rs`, and that file says why it has to be a
-/// process of its own. What it *cannot* do is fail today: this module's raster
-/// loop writes every pixel of all three planes, so a pooled buffer's contents
-/// are currently unobservable and a version of [`SectionPlanes::fit`] that
-/// skipped the re-seed would pass it. That is exactly the vacuity that let a
-/// stale tail through twice already in this campaign.
-///
-/// So the invariant is pinned here instead, on the primitive, where it is
-/// observable directly and where no global slot is involved — the planes below
-/// are built by hand, so no other test can take them mid-assertion and there is
-/// nothing to make flaky.
-///
-/// The four starting states are the four a slot can hold: nothing (a pool
-/// miss), a longer buffer (which a grow-only `fit` would leave a stale tail
-/// on), a shorter one (which a shrink-only `fit` would leave short — and
-/// `from_parts` would then refuse the section built from it), and the
-/// production case, an exactly-sized set full of the previous cut's bytes.
 #[test]
 fn a_fitted_plane_set_is_what_three_fresh_vecs_would_be() {
     let pixels = SECTION_WIDTH * SECTION_HEIGHT;
-    // The three `vec!`s this pool replaced, written out here rather than
-    // referenced, so that changing the seed in `fit` fails this test instead of
-    // moving the expectation along with it.
     let fresh_image = vec![0u8; pixels * 4];
     let fresh_values = vec![f32::NAN; pixels];
     let fresh_status = vec![SampleStatus::NoCoverage.wire_code(); pixels];
 
-    // `0xa5` and `Value` and a real number, because none of the three is the
-    // seed: a plane that came back un-reseeded is visible in every byte.
     let poison = |n: usize| SectionPlanes {
         image: vec![0xa5u8; n * 4],
         values: vec![7.5f32; n],
         status: vec![SampleStatus::Value.wire_code(); n],
     };
 
-    // Reported by position rather than by `assert_eq!` on the planes
-    // themselves: these are 8 MiB each, and a failed `assert_eq!` prints both
-    // sides in full. The index is also the more useful fact — a stale *tail*
-    // and a stale *whole plane* are different defects and the first differing
-    // element tells them apart.
     fn first_diff<T: PartialEq + Copy>(got: &[T], want: &[T]) -> Option<usize> {
         if got.len() != want.len() {
             return Some(got.len().min(want.len()));
@@ -3407,11 +2651,6 @@ fn a_fitted_plane_set_is_what_three_fresh_vecs_would_be() {
             "{label}: the status plane differs from `vec![NoCoverage; pixels]` \
              at this index",
         );
-        // Bit patterns: `f32::NAN != f32::NAN`, so a plane of the seed compares
-        // unequal to itself under `==` and the assertion would be vacuously
-        // *failing* rather than vacuously passing. `vec![f32::NAN; n]` is one
-        // bit pattern repeated, and it is the pattern a `from_parts` round trip
-        // has to preserve.
         let got_bits: Vec<u32> = planes.values.iter().map(|v| v.to_bits()).collect();
         let want_bits: Vec<u32> = fresh_values.iter().map(|v| v.to_bits()).collect();
         assert_eq!(
@@ -3422,8 +2661,6 @@ fn a_fitted_plane_set_is_what_three_fresh_vecs_would_be() {
         );
     }
 
-    // The poison is genuinely different from the seed, so none of the four
-    // cases above passed by starting where it finished.
     let unfitted = poison(pixels);
     assert_eq!(
         first_diff(&unfitted.image, &fresh_image),

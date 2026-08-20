@@ -17,24 +17,11 @@ use crate::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
 use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
 
-/// `pub` for the reason `NwsAlertFetchResult` is: the frontend's described-job
-/// dispatch tests seed a live registry through `apply_fetch_result`, whose
-/// payload the handler downcasts to exactly this.
 pub struct SpcOutlookFetchResult {
     pub day: OutlookDay,
     pub product: OutlookProduct,
     pub result: Result<SpcOutlook, crate::fetch_policy::FetchError>,
 }
-/// [`Assembled`], and the shape is the **round's**, not this struct's.
-///
-/// One of these is one product's answer; the layer's round is up to four of
-/// them in flight at once, and any can fail while its siblings draw. That is
-/// the assembled shape however few requests a single payload represents, and
-/// the state it lands in says so — see `SpcOutlookHandler::file_round_verdict`
-/// for where this layer writes its ledger, which is once per round rather than
-/// once per payload.
-///
-/// [`Assembled`]: crate::fetch_policy::Assembled
 impl crate::fetch_policy::FetchRound for SpcOutlookFetchResult {
     type Shape = crate::fetch_policy::Assembled;
 }
@@ -42,24 +29,14 @@ impl crate::fetch_policy::FetchRound for SpcOutlookFetchResult {
 #[derive(Debug)]
 pub(crate) struct OutlookItem {
     pub label: String,
-    /// Which outlook the clicked feature came from — the popup's subject.
     pub day: OutlookDay,
     pub product: OutlookProduct,
-    /// The outlook's own validity window, as parsed from the feed. `None`
-    /// where the feed did not carry one; the grid says "Unknown" rather than
-    /// omitting the row, so a missing time reads as the feed's gap and not as
-    /// a shorter dialog.
     pub valid: Option<chrono::NaiveDateTime>,
     pub expire: Option<chrono::NaiveDateTime>,
 }
 
 /// The SPC page that shows `day`'s outlook — the popup's "Open on SPC
 /// website" target.
-///
-/// A *website* link for a person, not a data fetch, so it does not route
-/// through `DataSources::spc_base` (that table exists to keep fetch origins
-/// browser-reachable; a link opens in the browser by definition). Days 1–3
-/// each have their own page; days 4–8 share one experimental page.
 fn outlook_page_url(day: OutlookDay) -> String {
     if day.is_extended() {
         "https://www.spc.noaa.gov/products/exper/day4-8/".to_owned()
@@ -77,7 +54,6 @@ impl OverlayItem for OutlookItem {
     }
 
     fn popup_content(&self, prefs: &rustdar_units::UserPreferences) -> PopupContent {
-        // `None` prints as a word, not as absence — see the field note.
         let time = |t: Option<chrono::NaiveDateTime>| match t {
             Some(t) => prefs.timezone.format_naive_utc(t, "%b %d %Y %H:%M"),
             None => "Unknown".to_owned(),
@@ -87,8 +63,6 @@ impl OverlayItem for OutlookItem {
             accent_rgb: [200, 200, 100],
             width: 300.0,
             sections: vec![
-                // The clicked feature's own label — the risk category or
-                // probability band the user actually clicked on.
                 PopupSection::Heading(self.label.clone()),
                 PopupSection::KeyValueGrid(vec![
                     ("Day".into(), self.day.to_string()),
@@ -107,10 +81,6 @@ impl OverlayItem for OutlookItem {
     }
 
     fn matches(&self, other: &dyn OverlayItem) -> bool {
-        // Day and product joined the identity with the real popup content: a
-        // "5%" band exists in Tornado and Wind alike, and keeping one open
-        // across a refetch must re-find *this* product's band, not whichever
-        // same-labelled band lists first.
         other
             .as_any()
             .downcast_ref::<OutlookItem>()
@@ -126,11 +96,6 @@ impl OverlayItem for OutlookItem {
 
 /// What one round's answers add up to, before anything is written to the
 /// ledger.
-///
-/// Split out so the *derivation* has one expression and the two callers can
-/// differ on what they are allowed to do with it: a completed round may climb
-/// the ladder, a selection change may only take the layer back down. See
-/// [`SpcOutlookHandler::round_verdict`].
 enum RoundVerdict {
     /// Nothing the layer asks for is failing.
     Clear,
@@ -151,28 +116,8 @@ pub(crate) struct SpcOutlookHandler {
     /// The last answer per product that was **not** a success, including
     /// [`Absent`](crate::fetch_policy::FetchFailure::Absent) — see
     /// [`Self::round_verdict`], which is what splits the two apart.
-    ///
-    /// This layer is the only one that issues **several fetch tasks per round**,
-    /// one per enabled product, and they all land on one shared `state.retry`.
-    /// Filing each result as it arrived made the layer's health depend on which
-    /// task happened to resolve last: three products succeeding and one 500ing
-    /// showed a fault or showed nothing depending on the order. Keeping the
-    /// failures per product and deriving the ledger from the whole map makes the
-    /// answer a property of the round instead of a race.
     per_product_error: HashMap<(OutlookDay, OutlookProduct), crate::fetch_policy::FetchError>,
     /// How many of this layer's fetch tasks are still in flight.
-    ///
-    /// A **count**, where every other handler keeps a bool, because a round here
-    /// is one task per enabled product. As a bool the first task to land cleared
-    /// it while three were still outstanding — so the layer stopped reading as
-    /// fetching before it had finished, and the ledger was rewritten once per
-    /// landing rather than once per round. That second part is what made the
-    /// verdict order-dependent as soon as *two* products failed: an attempt
-    /// count of one or two for the identical round, depending on whether the
-    /// successes landed before or after the failures.
-    ///
-    /// Kept in step with `state.fetching` by [`Self::set_outstanding`], so the
-    /// shared field is never a lie for anything that reads it.
     outstanding: usize,
     /// Whether anything the layer is **currently** asking for has answered since
     /// the last round verdict. See [`Self::file_round_verdict`].
@@ -201,43 +146,18 @@ impl SpcOutlookHandler {
     }
 
     /// Move the outstanding-task count, keeping `state.fetching` in step.
-    ///
-    /// The bool is what `OverlayState::enable_should_refetch` and every generic
-    /// reader consults; the count is this handler's own, and two records of the
-    /// same fact that can disagree is how the first version of this went wrong.
     fn set_outstanding(&mut self, outstanding: usize) {
         self.outstanding = outstanding;
         self.state.fetching = outstanding > 0;
     }
 
     /// Is this key something the layer is asking for *right now*?
-    ///
-    /// Both halves matter: a product the user unticked and a product belonging
-    /// to a day they have navigated away from are equally out of scope, and a
-    /// task for either can still be in flight when they do it.
     fn in_scope(&self, key: &(OutlookDay, OutlookProduct)) -> bool {
         key.0 == self.selected_day && self.enabled_products.contains(&key.1)
     }
 
     /// What every product's last answer adds up to, as a **property of the
     /// selection** rather than of the order its tasks resolved in.
-    ///
-    /// Pure, and derived from state that outlives any one round, so it gives
-    /// the same answer however many times it is asked and whenever it is asked.
-    /// That is what lets [`Self::file_round_verdict`] and
-    /// [`Self::refile_after_selection_change`] share it while differing only in
-    /// what they are permitted to write.
-    ///
-    /// Walks the day's own publication order rather than `enabled_products`'
-    /// `HashSet` order, for the same reason
-    /// [`status_line`](OverlayHandler::status_line) does: a message built from a
-    /// `HashSet` walk jitters between frames.
-    ///
-    /// [`Absent`](crate::fetch_policy::FetchFailure::Absent) is never counted as
-    /// a failure. SPC does not keep every product up at every hour, so "not
-    /// published right now" for one of four is an answer about that product and
-    /// not a fault in the layer — and it only becomes the *layer's* answer when
-    /// nothing else in scope drew.
     fn round_verdict(&self) -> RoundVerdict {
         let day = self.selected_day;
         let scope: Vec<OutlookProduct> = day
@@ -258,9 +178,6 @@ impl SpcOutlookHandler {
                     absent.push((product, e));
                 }
                 Some(e) => failed.push((product, e)),
-                // No failure on file *and* something to draw: this product
-                // answered. A product that has simply never been asked yet is
-                // neither, and must not count as a good answer.
                 None if self.state.data.contains_key(&key) => drew = true,
                 None => {}
             }
@@ -301,44 +218,6 @@ impl SpcOutlookHandler {
 
     /// What of this selection is **not on the map**, as distinct from what is
     /// merely out of date.
-    ///
-    /// The coverage axis for the one layer that builds its map a product at a
-    /// time. [`round_verdict`](Self::round_verdict) above is the time axis and
-    /// stays exactly as it is: a round in which one of four products refused
-    /// did not complete, and the ladder has to hear about it or a genuinely
-    /// dead SPC endpoint never reaches
-    /// [`Broken`](crate::fetch_policy::FetchHealth::Broken). But that verdict
-    /// was the *whole* of what the row said, and `! not updating` is the wrong
-    /// half of the answer when three products are fresh and the fourth is
-    /// simply not there: the layer is updating, and what a user needs is which
-    /// product they are not looking at. The row names all four.
-    ///
-    /// So a product counts as missing here only when **it has never answered
-    /// for this day** — `state.data` has no entry for it. One that failed this
-    /// round while its previous outlook is still there is drawn and stale,
-    /// which is precisely what the health axis already says; counting it on
-    /// both would put two marks on the row for one fault and make neither mean
-    /// anything.
-    ///
-    /// Entry presence, not `!features.is_empty()`, and that difference is
-    /// deliberate: SPC publishing a product with no risk areas is an answer,
-    /// and the empty map it produces is the **right** map. Marking it would put
-    /// a fault on the row of a layer drawing exactly what was issued, which is
-    /// the same argument [`Absent`] gets below. It is also the reading
-    /// [`round_verdict`](Self::round_verdict)'s `drew` takes, and the two must
-    /// agree or the layer would call one round both complete and empty.
-    ///
-    /// A product with no failure on file and nothing in `state.data` is not
-    /// missing either — it has not been asked yet, which is the same reading
-    /// `round_verdict` takes of it.
-    ///
-    /// [`Absent`] is not missing, for the reason
-    /// [`StormReportRound::completeness`] gives at length: SPC does not keep
-    /// every product up at every hour, and a mark that is on when nothing is
-    /// wrong is a mark nobody reads on the day something is.
-    ///
-    /// [`Absent`]: crate::fetch_policy::FetchFailure::Absent
-    /// [`StormReportRound::completeness`]: crate::spc::reports::StormReportRound::completeness
     fn round_coverage(&self) -> crate::fetch_policy::DataCompleteness {
         let day = self.selected_day;
         let mut expected = 0;
@@ -372,26 +251,6 @@ impl SpcOutlookHandler {
 
     /// File the round's verdict on the ledger — **once**, when the last of its
     /// tasks lands.
-    ///
-    /// One writing per round is the whole point. Rewriting the ledger on every
-    /// landing made an identical round read as one failed attempt or as two
-    /// depending on arrival order, and made four sibling requests refused by the
-    /// same CDN edge in the same instant reach
-    /// [`Broken`](crate::fetch_policy::FetchHealth::Broken) inside a single
-    /// round — which is exactly the WAF blip
-    /// [`REFUSALS_BEFORE_BROKEN`](crate::fetch_policy::REFUSALS_BEFORE_BROKEN)
-    /// exists to survive, and it says so: "asking a second time separates the
-    /// two at a cost of exactly one extra request".
-    ///
-    /// **A round that answered nothing in scope still files.** The user can
-    /// untick a product while its task is in flight, and its error then belongs
-    /// to no product the layer is asking for — but it is still evidence about
-    /// the origin, and a failure that files nothing is the storm shape this
-    /// crate exists to prevent: `auto_fetch_delay` reads an unstamped clock and
-    /// an empty ladder as "due now", which on the web build measured 3089
-    /// requests in 105 s. In-scope answers win when there are any: three
-    /// products that arrived from the same origin in the same round are stronger
-    /// evidence than the fourth that did not.
     fn file_round_verdict(&mut self) {
         let answered = std::mem::take(&mut self.round_answered_in_scope);
         let strays = std::mem::take(&mut self.round_stray_failures);
@@ -414,43 +273,12 @@ impl SpcOutlookHandler {
                 RoundVerdict::Clear => self.state.retry.record_success(),
             }
         }
-        // The other axis, written in the same one-writing-per-round, and the
-        // half this layer never had: the verdict above says whether the round
-        // completed, and this says which of the products the row is naming are
-        // not on the map.
-        //
-        // Filed on **every** ending, including the round that answered nothing
-        // in scope, which is the one place the verdict above cannot be written.
-        // A user can untick the product that failed, or leave its day, while
-        // its request is still on the wire: the selection change defers to this
-        // round (`refile_after_selection_change` returns while `outstanding` is
-        // non-zero), and then this round answers nothing it is still asked
-        // about. Skipping the report here left `missing 1 of 2 outlook
-        // products` in the options panel of a layer with that product no longer
-        // ticked — the stuck mark this file already has one function for, on
-        // the axis that function does not write. Safe because
-        // [`round_coverage`](Self::round_coverage) is derived from the
-        // selection as it stands now, not from anything this round did.
         let coverage = self.round_coverage();
         self.state.record_coverage(coverage);
     }
 
     /// Every enabled product's features, concatenated in the order they will be
     /// painted.
-    ///
-    /// Walks the day's own publication order, not `enabled_products`' — the
-    /// same rule [`Self::status_line`] and [`Self::round_verdict`] follow, and
-    /// for a sharper reason here: this vector **is** the paint order
-    /// (`rasterize::rasterize_spc_outlooks` draws in list order) and
-    /// `HashSet`'s iteration order is seeded per process. Walking the set
-    /// directly let one selection paint in a different order after a restart,
-    /// so a reopened session was not the 1:1 image it closed as.
-    ///
-    /// It is also what puts Day 3's significant-severe hatching on top:
-    /// [`ConditionalIntensity`](OutlookProduct::ConditionalIntensity) is last
-    /// in `OutlookDay::Day3.products()`, so its overlay tier lands above the
-    /// probabilistic fills rather than under whichever product the hash
-    /// happened to yield last.
     fn features_in_paint_order(&self) -> Vec<crate::types::OverlayFeature> {
         let day = self.selected_day;
         let mut features = Vec::new();
@@ -465,15 +293,6 @@ impl SpcOutlookHandler {
         features
     }
 
-    /// What the rasterizer reads, captured once — the **one** builder
-    /// `prepare_job` answers from, kept a private helper so a second dispatch
-    /// path could not quietly capture different state.
-    ///
-    /// The hatch colour is a page-side fact (the theme) resolved **here**, at
-    /// capture time, and carried as the resolved value: the worker a described
-    /// job may run in has no theme to consult, and everything the hatch pass
-    /// reads beyond it — each feature's own `HatchPattern` and rings — is on
-    /// the feature list itself.
     fn paint_input(&self, ctx: &RasterizeContext) -> Option<rasterize::OutlooksInput> {
         let features = self.features_in_paint_order();
         if features.is_empty() {
@@ -493,34 +312,6 @@ impl SpcOutlookHandler {
 
     /// Bring the products that are not independently selectable into line with
     /// the ones that are, and drop any that the selected day does not publish.
-    ///
-    /// [`OutlookProduct::implied_by`] names a governing product for each such
-    /// product — today only Day 3's
-    /// [`ConditionalIntensity`](OutlookProduct::ConditionalIntensity), governed
-    /// by [`Probabilistic`](OutlookProduct::Probabilistic). This makes the
-    /// implied product's membership of `enabled_products` mirror its parent's
-    /// exactly, so that it takes part in the fetch scope, the `outstanding`
-    /// count and the `per_product_error` ledger like any other product while
-    /// never appearing as a toggle of its own.
-    ///
-    /// This is the **only** thing that inserts or removes an implied product,
-    /// and three paths need it:
-    ///
-    /// * the day buttons — arriving on Day 3 from a day whose only product is
-    ///   `Probabilistic` retains a parent with no child;
-    /// * the product toggles — ticking `Probabilistic` inserts a parent with no
-    ///   child;
-    /// * [`deserialize_state`](Self::deserialize_state) — a session persisted
-    ///   before Day 3 had a significant-severe product at all restores a parent
-    ///   with no child, and without this would never fetch `_cigprob` again.
-    ///
-    /// The first two both run through
-    /// [`refile_after_selection_change`](Self::refile_after_selection_change),
-    /// which is documented as being called from every path that moves
-    /// `selected_day` or `enabled_products`, so calling it there covers both.
-    /// `set_enabled` cannot break the invariant — it either clears everything
-    /// or inserts the day's first product, which is always a selectable one —
-    /// but it runs this too rather than rely on that staying true.
     fn sync_implied_products(&mut self) {
         let published = self.selected_day.products();
         self.enabled_products
@@ -539,23 +330,6 @@ impl SpcOutlookHandler {
 
     /// Drop what is no longer asked for, and take the layer back off the ledger
     /// if nothing that is left is failing.
-    ///
-    /// Called from every path that moves `selected_day` or `enabled_products`.
-    /// Without it, unticking the one product that failed left `! not updating`
-    /// on the stack row **for ever**: unticking returns
-    /// [`ControlEffect::None`], so no round follows, and this layer declares no
-    /// `auto_poll_interval`, so nothing automatic will ever land an `Ok` to
-    /// clear the ledger either. The layer drew exactly the fresh product it was
-    /// asked for and went on saying it had stopped updating.
-    ///
-    /// Never climbs the ladder. A selection change is not new evidence about the
-    /// origin, so a verdict that is still [`Failed`](RoundVerdict::Failed) is
-    /// left exactly as the round that earned it wrote it — including its
-    /// sentence, which describes the round that was actually asked for and is
-    /// replaced by the next one.
-    ///
-    /// Defers entirely while a round is in flight: that round files its own
-    /// verdict when its last task lands, from the scope as it stands then.
     fn refile_after_selection_change(&mut self) {
         self.sync_implied_products();
         let day = self.selected_day;
@@ -570,11 +344,6 @@ impl SpcOutlookHandler {
             RoundVerdict::NotPublished(e) => self.state.retry.record_failure(&e),
             RoundVerdict::Clear => self.state.retry.clear(),
         }
-        // Coverage moves here even though the ladder does not, because what the
-        // layer was *asked* for has changed: unticking the product that would
-        // not load leaves the layer drawing everything it asks for, and a mark
-        // that outlived the selection it was about is the stuck `! not
-        // updating` this function exists for, one axis over.
         let coverage = self.round_coverage();
         self.state.record_coverage(coverage);
     }
@@ -606,9 +375,6 @@ impl OverlayHandler for SpcOutlookHandler {
         RenderMode::Texture
     }
 
-    /// The hatch colour branches on `RasterizeContext::is_dark` (see
-    /// `rasterize_outlook`'s `hatch_color`), so the same outlook is two
-    /// different pictures and the cached one has to be discarded on a flip.
     fn theme_sensitive(&self) -> bool {
         true
     }
@@ -617,20 +383,6 @@ impl OverlayHandler for SpcOutlookHandler {
         !self.enabled_products.is_empty()
     }
 
-    /// The master toggle over a layer whose "enabled" is really a product
-    /// set — the same arrangement, and the same accepted forgetting, as
-    /// `NwsAlertHandler::set_enabled`. On restores the selected day's
-    /// *first* product, which is Categorical where the day publishes one and
-    /// Probabilistic where that is all there is — the entry a user starting
-    /// from nothing would tick.
-    ///
-    /// Deliberately does **not** re-derive the ledger the way the product
-    /// toggles do ([`Self::refile_after_selection_change`]). The eye is a
-    /// visibility switch, not a change to what the layer asks for, and the
-    /// re-ask rule reads exactly this ledger to decide that switching a stale
-    /// layer back on should go to the origin rather than trust what is already
-    /// drawn — clearing it here is how "toggling a frozen layer does nothing"
-    /// comes back.
     fn set_enabled(&mut self, enabled: bool) {
         if enabled {
             if self.enabled_products.is_empty()
@@ -646,17 +398,11 @@ impl OverlayHandler for SpcOutlookHandler {
         }
     }
 
-    /// E.g. `"Day 1 - Categorical, Tornado"`. The products are named in the
-    /// day's own publication order, not the `HashSet`'s, so the line cannot
-    /// jitter between frames.
+    /// E.g. `"Day 1 - Categorical, Tornado"`.
     fn status_line(&self) -> Option<String> {
         if !self.is_enabled() {
             return None;
         }
-        // Named the way the toggles are named: an implied product is not
-        // something the user chose, so listing it would describe a selection
-        // that is not on offer. Days 1-2 name no significant-severe product
-        // here either, for the same reason.
         let products: Vec<String> = self
             .selected_day
             .products()
@@ -672,24 +418,6 @@ impl OverlayHandler for SpcOutlookHandler {
     }
 
     /// Data **this selection** can draw, not data this layer has ever fetched.
-    ///
-    /// Every other handler's `has_data` is the same test its own
-    /// `prepare_job` opens with, and this one was not: outlooks are keyed
-    /// by `(day, product)`, so a full `state.data` says nothing about whether
-    /// the selected day crossed with the ticked products yields a single
-    /// feature. Untick every product, or move to a day whose products are not
-    /// ticked, and the old answer was `true` while the rasterize dispatch
-    /// answered `None`.
-    ///
-    /// That gap is not cosmetic. `ui_map_pane` reads this to decide both
-    /// whether to dispatch a render *and* whether a settle render is still owed
-    /// — and the second one asks for a repaint 100 ms out for as long as it is
-    /// owed. An overlay that is asked for for ever and abandoned in
-    /// `spawn_overlay_render` for ever is a permanent 10 Hz wakeup on an
-    /// otherwise idle app, on the battery, with nothing on screen to say why.
-    /// So this is the exact complement of `prepare_job`'s own early
-    /// return, and `every_texture_handler_agrees_with_its_own_rasterizer` is
-    /// what keeps the two from drifting apart again.
     fn has_data(&self) -> bool {
         self.enabled_products.iter().any(|product| {
             self.state
@@ -705,15 +433,6 @@ impl OverlayHandler for SpcOutlookHandler {
 
     /// The host says a round has started or been abandoned; this layer's round
     /// is one task per enabled product, so the count moves by that many.
-    ///
-    /// `+=` rather than `=`: pressing Refresh while a round is in flight really
-    /// does put both rounds' tasks on the wire, and the verdict is owed when the
-    /// last of *all* of them lands. The number is the same expression
-    /// [`create_fetch_tasks`](OverlayHandler::create_fetch_tasks) builds its
-    /// list from, which
-    /// `the_outstanding_count_is_the_number_of_tasks_actually_built` pins.
-    /// Floored at one so that "the host marked me fetching" is never silently
-    /// nothing.
     fn set_fetching(&mut self, fetching: bool) {
         if fetching {
             self.set_outstanding(self.outstanding + self.enabled_products.len().max(1));
@@ -770,12 +489,6 @@ impl OverlayHandler for SpcOutlookHandler {
         };
         let key = (fetch.day, fetch.product);
         let in_scope = self.in_scope(&key);
-        // The **ledger** is never written here: one task's answer is one
-        // product's answer, and this layer has several tasks in flight at once.
-        // `file_round_verdict` writes it once, below, when the last of them
-        // lands. The clock is the layer's own and *is* stamped here — an answer
-        // arrived, whichever product it was about, and a round that answered
-        // and left the clock unstamped is due again immediately.
         match fetch.result {
             Ok(outlook) => {
                 log::info!("Received SPC outlook: {:?} {:?}", fetch.day, fetch.product);
@@ -805,12 +518,6 @@ impl OverlayHandler for SpcOutlookHandler {
                 if in_scope {
                     self.per_product_error.insert(key, e);
                 } else {
-                    // The user unticked this product, or left this day, while
-                    // its request was on the wire. It belongs to no product the
-                    // layer asks for, so it cannot join the round's verdict —
-                    // but it is still evidence about the origin, and dropping
-                    // it entirely is a failure that files nothing at all. See
-                    // `file_round_verdict`.
                     self.round_stray_failures.push(e);
                 }
             }
@@ -818,9 +525,6 @@ impl OverlayHandler for SpcOutlookHandler {
         if in_scope {
             self.round_answered_in_scope = true;
         }
-        // Zero either because this was the round's last task or because the
-        // host never marked one — the seeding paths in tests land a lone result
-        // that way, and a lone result is a round of one.
         self.set_outstanding(self.outstanding.saturating_sub(1));
         if self.outstanding == 0 {
             self.file_round_verdict();
@@ -847,10 +551,6 @@ impl OverlayHandler for SpcOutlookHandler {
             return Vec::new();
         }
         let day = self.selected_day;
-        // Publication order, not the `HashSet`'s: `sync_implied_products` keeps
-        // `enabled_products` a subset of `day.products()`, so this builds the
-        // same number of tasks `set_fetching` counted while giving the log line
-        // and the task order the same shape on every run.
         let products: Vec<OutlookProduct> = day
             .products()
             .iter()
@@ -916,12 +616,6 @@ impl OverlayHandler for SpcOutlookHandler {
             .collect();
         items.push(ControlItem::ButtonRow { buttons });
 
-        // Only the products the selected day actually publishes, and only the
-        // ones the user picks directly. Day 3's `ConditionalIntensity` is
-        // fetched and accounted for like any other product but has no toggle:
-        // it follows `Probabilistic`, exactly as the same features do on Days
-        // 1-2 where they ride inside the hazard products. See
-        // [`OutlookProduct::implied_by`].
         for &product in self
             .selected_day
             .products()
@@ -943,11 +637,6 @@ impl OverlayHandler for SpcOutlookHandler {
             });
         }
 
-        // Ungated on enabled (the every-option rule, M9.1): a hidden
-        // layer's options stay visible and editable - edits take effect
-        // when the eye shows it again - Refresh still fetches (nothing
-        // on the fetch path reads enabled), and the status lines keep
-        // reporting.
         items.push(ControlItem::ButtonRow {
             buttons: vec![ControlButton {
                 id: "refresh",
@@ -985,14 +674,10 @@ impl OverlayHandler for SpcOutlookHandler {
                 };
                 if new_day != self.selected_day {
                     self.selected_day = new_day;
-                    // Days publish different product sets; drop the ones the
-                    // new day has no endpoint for.
                     let valid: HashSet<OutlookProduct> =
                         new_day.products().iter().copied().collect();
                     self.enabled_products.retain(|p| valid.contains(p));
                     self.config_generation = self.config_generation.wrapping_add(1);
-                    // What the layer is asking for changed, so what its ledger
-                    // is a verdict about changed with it.
                     self.refile_after_selection_change();
                     if !self.enabled_products.is_empty() {
                         return ControlEffect::Fetch;
@@ -1016,10 +701,6 @@ impl OverlayHandler for SpcOutlookHandler {
                         self.enabled_products.remove(&product);
                     }
                     self.config_generation = self.config_generation.wrapping_add(1);
-                    // Unticking is the case that used to leave `! not updating`
-                    // on the row for ever: it returns `None` below, so no round
-                    // follows it, and this layer has no automatic poll to land
-                    // an `Ok` later.
                     self.refile_after_selection_change();
                     if enabled {
                         return ControlEffect::Fetch;
@@ -1027,12 +708,6 @@ impl OverlayHandler for SpcOutlookHandler {
                 }
                 ControlEffect::None
             }
-            // Refreshing a layer with no product ticked has nothing to ask for.
-            // Left as an unconditional `Fetch`, it reached
-            // `create_fetch_tasks`, got an empty list, and the host recorded
-            // that as a failure — which used to be invisible and is now a
-            // "what is shown may be stale" line in this very panel, said about
-            // a layer that is empty because the user emptied it.
             "refresh" if self.enabled_products.is_empty() => ControlEffect::None,
             "refresh" => ControlEffect::Fetch,
             _ => ControlEffect::None,
@@ -1040,13 +715,7 @@ impl OverlayHandler for SpcOutlookHandler {
     }
 
     fn serialize_state(&self) -> serde_json::Value {
-        // Declaration order, never the `HashSet`'s: a set's iteration order
-        // is per-instance noise, so writing it raw makes save→load→save
-        // produce a different file every reopen — the instability the config
-        // fixpoint test pins, and the same jitter `round_verdict` already
-        // avoids by walking the day's publication order. Sorted by
-        // discriminant rather than through a literal list, so a new variant
-        // cannot be silently dropped from saves.
+        // Declaration order, never the `HashSet`'s: set iteration order is per-instance noise.
         let mut enabled: Vec<OutlookProduct> = self.enabled_products.iter().copied().collect();
         enabled.sort_by_key(|product| *product as u8);
         serde_json::json!({
@@ -1068,10 +737,6 @@ impl OverlayHandler for SpcOutlookHandler {
         {
             self.enabled_products = products;
         }
-        // A session persisted before Day 3 had a significant-severe product
-        // restores `Probabilistic` with no `ConditionalIntensity` beside it.
-        // Without this the layer would reopen looking exactly as it did and
-        // quietly never ask for `_cigprob` again.
         self.sync_implied_products();
     }
 }
@@ -1080,10 +745,6 @@ impl OverlayHandler for SpcOutlookHandler {
 mod tests {
     use super::*;
 
-    /// The master toggle restores the *selected day's* first product, not a
-    /// hardcoded Categorical: days 4-8 publish only Probabilistic, and a
-    /// master that inserted a product the day has no endpoint for would show
-    /// an enabled layer that can never fetch anything.
     #[test]
     fn the_master_toggle_restores_a_product_the_day_actually_publishes() {
         let mut handler = SpcOutlookHandler::new();
@@ -1108,9 +769,6 @@ mod tests {
         );
     }
 
-    /// A handler on Day 3 with the probabilistic product ticked, through the
-    /// real control path so the implied product is filled in the way the app
-    /// fills it.
     fn day3_probabilistic() -> SpcOutlookHandler {
         let mut h = SpcOutlookHandler::new();
         h.selected_day = OutlookDay::Day3;
@@ -1140,10 +798,6 @@ mod tests {
         }));
     }
 
-    /// Day 3's significant-severe area is a separate endpoint, and until this
-    /// was fixed it was never requested at all: `outlook_url` built only
-    /// `_cat` and `_prob`, and neither carries it.
-    ///
     /// It must be `_cigprob` and not `_sigprob`. `_sigprob` still answers 200
     /// with a real `SIGN` polygon but has not been re-issued since 2026-03-03,
     /// so asking for it would paint a months-old hazard area as current.
@@ -1165,10 +819,6 @@ mod tests {
         );
     }
 
-    /// The product is fetched and accounted for, but the user never sees a
-    /// toggle for it — Days 1-2 carry the same features inline with no toggle
-    /// of their own, and an extra switch on Day 3 alone would be an asymmetry
-    /// in the one place the user looks.
     #[test]
     fn the_significant_area_is_fetched_but_has_no_toggle_of_its_own() {
         let handler = day3_probabilistic();
@@ -1203,10 +853,6 @@ mod tests {
         );
     }
 
-    /// One product, one URL, one task, one ledger entry. Merging the two
-    /// requests behind the `Probabilistic` key would have put two fetches
-    /// behind one error slot, which is how a partial round comes to read as a
-    /// complete one.
     #[test]
     fn the_significant_area_is_its_own_task_and_its_own_ledger_entry() {
         let mut handler = day3_probabilistic();
@@ -1222,7 +868,6 @@ mod tests {
             "Probabilistic and its significant area are two tasks"
         );
 
-        // The significant area fails; the probabilistic field succeeds.
         handler.set_fetching(true);
         land_day3(
             &mut handler,
@@ -1247,13 +892,8 @@ mod tests {
         );
     }
 
-    /// The invariant has three ways in, and the persisted one is the quiet
-    /// one: a session saved before this product existed restores
-    /// `Probabilistic` alone and would otherwise never ask for `_cigprob`
-    /// again, looking exactly as it did when it closed.
     #[test]
     fn every_path_that_enables_the_parent_brings_the_significant_area() {
-        // 1. the product toggle
         let handler = day3_probabilistic();
         assert!(
             handler
@@ -1262,8 +902,6 @@ mod tests {
             "toggle path"
         );
 
-        // 2. the day buttons, arriving from a day whose only product is
-        //    Probabilistic
         let mut from_day5 = SpcOutlookHandler::new();
         from_day5.selected_day = OutlookDay::Day5;
         from_day5.set_enabled(true);
@@ -1284,7 +922,6 @@ mod tests {
             "day-button path"
         );
 
-        // 3. a session persisted before this product existed
         let mut reopened = SpcOutlookHandler::new();
         reopened.deserialize_state(serde_json::json!({
             "selected_day": "Day3",
@@ -1298,8 +935,6 @@ mod tests {
         );
     }
 
-    /// The mirror holds in both directions, and the implied product never
-    /// survives onto a day that does not publish it.
     #[test]
     fn the_significant_area_leaves_when_its_parent_or_its_day_does() {
         let mut handler = day3_probabilistic();
@@ -1321,11 +956,6 @@ mod tests {
         );
     }
 
-    /// `features` is the paint order, and `HashSet` iteration is seeded per
-    /// process — so walking the set directly repainted the same selection in a
-    /// different order after a restart. The significant-severe hatching is the
-    /// overlay tier and must land on top, which the day's publication order
-    /// gives for free.
     #[test]
     fn the_outlooks_paint_in_publication_order_not_hash_order() {
         let mut handler = day3_probabilistic();
@@ -1350,9 +980,6 @@ mod tests {
             handler.state.data.insert((OutlookDay::Day3, product), o);
         }
 
-        // A hash-order walk is stable within one process, so a single run of
-        // this could pass by luck; what it pins is the *rule* — the order is
-        // read off `OutlookDay::Day3.products()` and cannot depend on the set.
         let order: Vec<String> = handler
             .features_in_paint_order()
             .into_iter()
@@ -1365,8 +992,6 @@ mod tests {
         );
     }
 
-    /// The popup names the outlook, states its window and links to SPC —
-    /// this used to be a literal "coming soon" stub.
     #[test]
     fn the_popup_states_the_outlooks_window_and_links_to_spc() {
         let item = OutlookItem {
@@ -1425,8 +1050,6 @@ mod tests {
         );
     }
 
-    /// Days 4–8 share one experimental SPC page, and a window the feed did
-    /// not carry prints as a word rather than vanishing.
     #[test]
     fn an_extended_day_links_to_the_shared_page_and_owns_its_gaps() {
         let item = OutlookItem {
@@ -1454,8 +1077,6 @@ mod tests {
         );
     }
 
-    /// The identity a kept-open popup re-finds across a refetch is the
-    /// product's own band: a "5%" in Tornado is not the "5%" in Wind.
     #[test]
     fn a_band_matches_only_its_own_days_product() {
         let band = |product: OutlookProduct| OutlookItem {
@@ -1470,8 +1091,6 @@ mod tests {
         assert!(!tornado.matches(&band(OutlookProduct::Wind)));
     }
 
-    /// `"Day N · <products>"`, in the day's own publication order — the
-    /// status line under the stack's SPC Outlooks row.
     #[test]
     fn the_status_line_names_the_day_and_its_enabled_products() {
         let mut handler = SpcOutlookHandler::new();
@@ -1496,7 +1115,6 @@ mod tests {
         }
     }
 
-    /// Deliver one product's result through the real ingest path.
     fn land(
         handler: &mut SpcOutlookHandler,
         product: OutlookProduct,
@@ -1509,13 +1127,6 @@ mod tests {
         }));
     }
 
-    /// One whole round through the real path: the host marks the layer fetching
-    /// once, one task per enabled product, and the results land in the given
-    /// order.
-    ///
-    /// Declaring the round is not test ceremony — it is what `App::fetch_overlay`
-    /// does, and it is the only thing that tells the handler how many answers
-    /// this round is owed.
     fn round(
         handler: &mut SpcOutlookHandler,
         results: Vec<(
@@ -1529,7 +1140,6 @@ mod tests {
         }
     }
 
-    /// A handler asking for all four of day 1's products.
     fn four_product_handler() -> SpcOutlookHandler {
         let mut h = SpcOutlookHandler::new();
         for &p in OutlookDay::Day1.products() {
@@ -1542,7 +1152,6 @@ mod tests {
         crate::fetch_policy::FetchError::transient("HTTP 500")
     }
 
-    /// Press one of the layer's own controls, exactly as the options panel does.
     fn toggle(handler: &mut SpcOutlookHandler, id: &'static str, on: bool) -> ControlEffect {
         let mut ctx = PaneControlContextMut {
             pane_idx: 0,
@@ -1557,11 +1166,6 @@ mod tests {
         )
     }
 
-    /// **The resolution-order test.** This layer is the only one that puts
-    /// several fetch tasks in flight at once, and they all land on one shared
-    /// `state.retry`. Three products succeeding and one failing must read the
-    /// same either way round; it used to read as a fault or as nothing at all
-    /// depending on which task the network happened to finish last.
     #[test]
     fn a_partly_failed_round_reads_the_same_whichever_task_lands_last() {
         use OutlookProduct::{Categorical, Hail, Tornado, Wind};
@@ -1606,23 +1210,10 @@ mod tests {
             note.contains("1 of 4"),
             "the note must say how much of the round is missing: {note}",
         );
-        // Both orders left all three good products drawable.
         assert_eq!(failure_first.state.data.len(), 3);
         assert_eq!(failure_last.state.data.len(), 3);
     }
 
-    /// **The order test again, with the second failure that broke it.**
-    ///
-    /// `refile_round_health`'s claim to be idempotent held only while *exactly
-    /// one* product failed, which is all its own test exercised. With two, the
-    /// ledger was rewritten once per landing: the successes reset the ladder in
-    /// between, so the identical round read as one failed attempt when the
-    /// failures landed first and as two when they landed last. The mark on the
-    /// row and the merged sentence were right either way, which is what made it
-    /// invisible — only the attempt count, and on an auto-polling layer the
-    /// ladder rung it buys, differed.
-    ///
-    /// A round is one attempt because it is one ask.
     #[test]
     fn a_round_with_two_failures_is_one_attempt_whichever_order_they_land_in() {
         use OutlookProduct::{Categorical, Hail, Tornado, Wind};
@@ -1675,15 +1266,6 @@ mod tests {
         );
     }
 
-    /// **Four sibling requests refused at once are one refusal.**
-    ///
-    /// `REFUSALS_BEFORE_BROKEN` is two because one is not evidence: the origins
-    /// here are public services behind CDNs, and a single 4xx is far more often
-    /// a WAF rule or a bad edge node than a real change in what is published.
-    /// "Asking a second time separates the two at a cost of exactly one extra
-    /// request" — but the four products of a round leave in the same instant and
-    /// hit the same edge, so a per-landing filing reached `Broken` on the
-    /// *second landing of the first round*, which is not asking again at all.
     #[test]
     fn a_round_of_refusals_is_believed_only_when_a_second_round_repeats_it() {
         use OutlookProduct::{Categorical, Hail, Tornado, Wind};
@@ -1716,8 +1298,6 @@ mod tests {
         );
     }
 
-    /// A round where everything arrives is clean, and a product that recovers
-    /// takes the layer back to healthy rather than leaving a stuck note.
     #[test]
     fn a_recovered_product_clears_the_layers_verdict() {
         use OutlookProduct::{Categorical, Hail, Tornado, Wind};
@@ -1749,14 +1329,6 @@ mod tests {
         );
     }
 
-    /// "Not published right now" for one product is an answer about that
-    /// product, not a fault in the layer. Days 4-8 publish one product and SPC
-    /// does not keep every outlook up at every hour, so treating a routine 404
-    /// as staleness would put a permanent warning on a working layer.
-    ///
-    /// And it is the layer's *own* answer only when nothing in scope drew: three
-    /// products on the map beside one unpublished fourth is a layer that is
-    /// working, whichever order the four landed in.
     #[test]
     fn an_absent_product_is_not_reported_as_the_layer_being_stale() {
         use OutlookProduct::{Categorical, Hail, Tornado, Wind};
@@ -1784,8 +1356,6 @@ mod tests {
              unpublished",
         );
 
-        // The whole selection unpublished *is* the layer's answer, and says so
-        // without climbing the ladder.
         let mut alone = SpcOutlookHandler::new();
         alone.enabled_products.insert(Tornado);
         round(
@@ -1802,17 +1372,6 @@ mod tests {
         assert_eq!(alone.state.retry.failures(), 0);
     }
 
-    /// **Unticking the product that failed takes the mark off the row.**
-    ///
-    /// The row read `! not updating` for ever on a layer drawing exactly the
-    /// fresh product it was asked for. Unticking returns `ControlEffect::None`,
-    /// so no round follows it; the ledger was only ever re-derived from
-    /// `apply_fetch_result`; and this layer declares no `auto_poll_interval`, so
-    /// nothing automatic would ever land an `Ok` to clear it either. Only
-    /// Refresh, or switching the whole layer off and on again, cleared it.
-    ///
-    /// Driven through `apply_control`, because the defect was in which paths
-    /// re-derive and not in the derivation.
     #[test]
     fn unticking_the_product_that_failed_stops_the_layer_reading_as_stale() {
         use OutlookProduct::{Categorical, Tornado};
@@ -1846,8 +1405,6 @@ mod tests {
         );
     }
 
-    /// Leaving the day the failure belonged to is the same fact wearing a
-    /// different control.
     #[test]
     fn navigating_to_another_day_leaves_the_old_days_failure_behind() {
         use OutlookProduct::Categorical;
@@ -1875,14 +1432,6 @@ mod tests {
         );
     }
 
-    /// **A failure that arrives after its product was unticked still counts.**
-    ///
-    /// The user can untick a product while its request is on the wire. Scoping
-    /// the round's verdict to what is still asked for — which is what fixes the
-    /// stuck mark above — filed that error precisely nowhere: no ladder, no
-    /// clock, `health` back to `Ok`. That is the storm shape this crate exists
-    /// to prevent, because `auto_fetch_delay` reads an unstamped clock and an
-    /// empty ladder as "due now" and would ask again on the very next frame.
     #[test]
     fn a_failure_that_lands_after_its_product_was_unticked_still_reaches_the_ladder() {
         use OutlookProduct::Tornado;
@@ -1912,9 +1461,6 @@ mod tests {
         );
     }
 
-    /// In-scope answers are the round's evidence when it has any: a failure for
-    /// a product the user has just unticked must not condemn a round that three
-    /// live products answered.
     #[test]
     fn a_stray_failure_does_not_condemn_a_round_that_otherwise_answered() {
         use OutlookProduct::{Categorical, Hail, Tornado, Wind};
@@ -1933,19 +1479,6 @@ mod tests {
         );
     }
 
-    /// **The sixth silence, and the one the shapes surfaced.**
-    ///
-    /// This layer's round is up to four products at once, so it is
-    /// [`Assembled`](crate::fetch_policy::Assembled) — and it declared nothing
-    /// at all on the coverage axis. A tornado outlook that would not load left
-    /// the row saying `! not updating`, which is the *other* fault: three of
-    /// the four products were fresh, the layer was updating, and the status
-    /// line went on naming a product that was not on the map anywhere.
-    ///
-    /// Both axes now, because the round is both things at once: it did not
-    /// complete, so the ladder hears about it and a dead endpoint can still
-    /// reach `Broken`; and one of the four products the row names is absent, so
-    /// the row says that too.
     #[test]
     fn a_product_that_would_not_load_is_missing_from_the_map_and_not_merely_stale() {
         use OutlookProduct::{Categorical, Hail, Tornado, Wind};
@@ -1982,11 +1515,6 @@ mod tests {
             );
         }
 
-        // A product that failed while its **previous** outlook is still on
-        // file is stale, not missing, and must not be counted on both axes.
-        // `outlook()` builds an outlook with no features, which is the harder
-        // half of that rule on purpose: a product SPC published with no risk
-        // areas has answered, and the empty map it produces is the right map.
         let mut drawn = four_product_handler();
         round(
             &mut drawn,
@@ -2016,8 +1544,6 @@ mod tests {
              answered is stale, which is what the health axis is for",
         );
 
-        // Unticking the product that would not load leaves the layer drawing
-        // everything it asks for, on both axes.
         assert_eq!(toggle(&mut h, "tor", false), ControlEffect::None);
         assert!(
             !h.state.retry.is_incomplete(),
@@ -2025,20 +1551,6 @@ mod tests {
         );
     }
 
-    /// **The round that answers nothing it is still asked about.**
-    ///
-    /// A selection change while a round is in flight defers to that round —
-    /// `refile_after_selection_change` returns on `outstanding > 0` — and the
-    /// round then lands entirely out of scope, so `file_round_verdict` takes
-    /// its `!answered` path. That path files a stray failure and used to file
-    /// nothing else, which left the previous round's coverage report standing
-    /// about products nobody is asking for any more: `missing 1 of 2 outlook
-    /// products: Tornado` in the options panel of a layer with no product
-    /// ticked at all.
-    ///
-    /// The same stuck mark `refile_after_selection_change` was written for, on
-    /// the axis it does not write, which is why the report is filed on **every**
-    /// ending of a round and not only on the ones that answered.
     #[test]
     fn a_round_that_lands_wholly_out_of_scope_still_retires_its_coverage_report() {
         use OutlookProduct::{Categorical, Tornado};
@@ -2057,8 +1569,6 @@ mod tests {
             "premise: the tornado outlook did not load and is on no map",
         );
 
-        // A second round goes out, and the user unticks both products while it
-        // is on the wire. Nothing the round is about is asked for any more.
         h.set_fetching(true);
         assert_eq!(toggle(&mut h, "tor", false), ControlEffect::None);
         assert_eq!(toggle(&mut h, "cat", false), ControlEffect::None);
@@ -2077,9 +1587,6 @@ mod tests {
         );
     }
 
-    /// The count `set_fetching` adds is the number of tasks the round really
-    /// puts on the wire. Two expressions of one fact, and a round that waits for
-    /// more answers than it asked for never files a verdict at all.
     #[test]
     fn the_outstanding_count_is_the_number_of_tasks_actually_built() {
         use crate::render::overlay_state::FetchConfig;

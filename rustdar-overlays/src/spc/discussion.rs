@@ -2,12 +2,10 @@ use super::colors::{md_fill_color, md_stroke_color};
 use crate::types::{HatchPattern, OverlayFeature};
 use rustdar_geo::{GeoPolygon, GeoPolygonRing};
 
-/// Not an SPC field: derived from keywords in the discussion text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MdType {
     Convective,
     WinterWeather,
-    /// Fire weather, heavy rain, anything else.
     Other,
 }
 
@@ -24,13 +22,11 @@ impl std::fmt::Display for MdType {
 #[derive(Debug, Clone)]
 pub struct SpcDiscussion {
     pub number: u32,
-    /// RSS `<title>`, e.g. "Mesoscale Discussion #0153".
     pub title: String,
     pub text: String,
     pub link: String,
     pub md_type: MdType,
     pub polygon: GeoPolygon,
-    /// Pre-built for generic click detection and rendering.
     pub feature: OverlayFeature,
     pub concerning: Option<String>,
 }
@@ -78,7 +74,6 @@ pub fn parse_lat_lon_polygon(text: &str) -> Option<GeoPolygonRing> {
             break;
         }
         if trimmed.is_empty() {
-            // One blank line may precede the block; the second ends it.
             if coords.is_empty() {
                 continue;
             }
@@ -106,9 +101,8 @@ pub fn parse_lat_lon_polygon(text: &str) -> Option<GeoPolygonRing> {
 
 /// Longitude fields below this had their leading `1` stripped (see
 /// [`parse_coord_token`]). The threshold sits in a dead band: `6000` is 60.00°W
-/// unshifted, `5999` restores to 159.99°W and fails the range check. No real
-/// product reaches 60°W — easternmost archived MD point is 66.83°W (Caribou,
-/// ME), and NWS's GIS service declares `xmax = -65.2554`.
+/// unshifted, `5999` restores to 159.99°W and fails the range check, and no real
+/// product reaches 60°W (easternmost archived MD point is 66.83°W).
 const LON_DROPPED_HUNDREDS_THRESHOLD: u32 = 6000;
 
 /// SPC coordinate tokens are fixed-width: exactly 8 ASCII digits.
@@ -125,16 +119,9 @@ fn is_coord_token(token: &str) -> bool {
 ///
 /// <https://www.weather.gov/media/directives/010_pdfs/pd01005017curr.pdf>
 ///
-/// So 120.34°W is `2034`. Without restoring that hundreds digit every point
-/// west of 100°W decodes into the Atlantic and is dropped by the range check,
-/// deforming the polygon of any discussion over the western third of the US.
-///
-/// The field is zero-padded, so there is no 7-digit form (104.50°W is `0450`,
-/// never `450`); a 7-digit token is malformed input. Runs on network text, so
-/// it returns `None` rather than panicking.
-///
-/// The encoding is lossy: a corrupt token can land on a plausible CONUS point
-/// rather than being rejected (`"35000100"` reads as 35.00°N, 101.00°W).
+/// So 120.34°W is `2034`. Without restoring that hundreds digit every point west
+/// of 100°W decodes into the Atlantic and is dropped by the range check. The
+/// encoding is lossy: a corrupt token can land on a plausible CONUS point.
 fn parse_coord_token(token: &str) -> Option<(f64, f64)> {
     if !is_coord_token(token) {
         return None;
@@ -158,7 +145,6 @@ fn parse_coord_token(token: &str) -> Option<(f64, f64)> {
     Some((lat, lon))
 }
 
-/// The feed uses both `CONCERNING...` and `Concerning...`.
 fn extract_concerning(text: &str) -> Option<String> {
     for line in text.lines() {
         let trimmed = line.trim();
@@ -172,14 +158,12 @@ fn extract_concerning(text: &str) -> Option<String> {
     None
 }
 
-/// From "Mesoscale Discussion #0153" and similar.
 fn extract_md_number(title: &str) -> Option<u32> {
     if let Some(hash_pos) = title.find('#') {
         let after = &title[hash_pos + 1..];
         let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
         return digits.parse().ok();
     }
-    // Fallback: the trailing digit run.
     let mut num_str = String::new();
     for ch in title.chars().rev() {
         if ch.is_ascii_digit() {
@@ -214,7 +198,6 @@ pub fn parse_md_rss(xml: &str) -> Result<Vec<SpcDiscussion>, String> {
         let link = child_text("link");
         let description = child_text("description");
 
-        // The description is usually HTML-encoded.
         let text = strip_html_tags(&decode_html_entities(&description));
 
         let number = extract_md_number(&title).unwrap_or(0);
@@ -298,25 +281,20 @@ mod tests {
 
     #[test]
     fn test_parse_coord_token_rejects_7digit() {
-        // NWSI 10-517 zero-pads the longitude field (104.50°W is "0450"), and
-        // no 7-digit token appears in the MD archive. Skip, do not guess.
         assert_eq!(parse_coord_token("9519755"), None);
         assert_eq!(parse_coord_token("3517450"), None);
     }
 
     #[test]
     fn test_parse_coord_token_west_of_100() {
-        // "2034" is 120.34°W. Real token, MD 1 of 2024 (Sierra Nevada).
         let (lat, lon) = parse_coord_token("39282034").unwrap();
         assert!((lat - 39.28).abs() < 0.001);
         assert!((lon - (-120.34)).abs() < 0.001);
 
-        // Real token, MD 112 of 2024 (northern Arizona).
         let (lat, lon) = parse_coord_token("34611154").unwrap();
         assert!((lat - 34.61).abs() < 0.001);
         assert!((lon - (-111.54)).abs() < 0.001);
 
-        // Zero-padded form for 100-109.99°W.
         let (lat, lon) = parse_coord_token("35060450").unwrap();
         assert!((lat - 35.06).abs() < 0.001);
         assert!((lon - (-104.50)).abs() < 0.001);
@@ -332,15 +310,13 @@ mod tests {
         // First unshifted field: must stay 60.00°W, not become 160°W.
         assert_eq!(parse_coord_token("35006000"), Some((35.00, -60.00)));
 
-        // One below the threshold: shifts to 159.99°W, then fails the range
-        // check. Nothing in the archive lands here.
+        // One below the threshold: shifts to 159.99°W, then fails the range check.
         assert_eq!(parse_coord_token("35005999"), None);
     }
 
     #[test]
     fn test_parse_coord_token_malformed_never_panics() {
-        // A panic here runs inside a background fetch task, is swallowed by the
-        // runtime, and leaves the overlay stuck in its "fetching" state.
+        // A panic here runs inside a background fetch task and is swallowed.
         for token in [
             "",
             "3",
@@ -352,7 +328,6 @@ mod tests {
             "351797\u{e9}", // multi-byte char landing on the 8-byte boundary
             "\u{e9}\u{e9}\u{e9}\u{e9}",
             "99999999", // decodes out of domain
-            // Fails on latitude (0.0, outside 15..=60) before the lon is read.
             "00000000",
         ] {
             assert_eq!(parse_coord_token(token), None, "token {token:?}");
@@ -361,8 +336,8 @@ mod tests {
 
     #[test]
     fn test_parse_lat_lon_polygon_western_md() {
-        // Real LAT...LON block, SPC MD 1 of 2024 (Sierra Nevada), in product
-        // order. Fails if points west of 100°W are dropped as out of range.
+        // Real LAT...LON block, SPC MD 1 of 2024. Fails if points west of
+        // 100°W are dropped as out of range.
         let text = "ATTN...WFO...REV...STO...\n\
                     \n\
                     LAT...LON   39282034 38832002 38131950 37361936 37671975\n\
@@ -456,8 +431,7 @@ LAT...LON   35179718 34899754 34449768 34209745 35179718
     #[test]
     fn test_parse_md_rss_plaintext_plus_cdata_description() {
         // spcmdrss.xml's real shape: <description> holds a plain-text summary
-        // and a CDATA product body as *sibling* nodes. Fails if roxmltree does
-        // not merge the two, which puts the polygon out of reach entirely.
+        // and a CDATA product body as *sibling* nodes.
         let xml = r#"<?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0"><channel>
   <item>

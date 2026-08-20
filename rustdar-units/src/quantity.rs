@@ -2,48 +2,27 @@ use super::UserPreferences;
 use crate::HailSizeUnit;
 
 /// The unit domain a measured radar value lives in — what a number *is*, so
-/// that converting it, suffixing it and choosing its precision are one
-/// decision made where the value is declared rather than three matches kept
-/// in sync where it is printed.
-///
-/// Each variant names the **source** unit a value arrives in (`SpeedMps` is
-/// metres per second, `HeightKft` is thousands of feet, …); the user's
-/// [`UserPreferences`] pick what it is displayed as. `Unitless` carries its
-/// own fixed label because a dimensionless field still titles its colour bar
-/// (`dBZ`, `CC`, `NROT`).
-///
-/// Declared here, in `rustdar-units`, so that a product registry (in
-/// `rustdar-radar`) and the things that print values (legends, readouts) can
-/// share the vocabulary without either depending on the other.
+/// that converting it, suffixing it and choosing its precision are one decision
+/// made where the value is declared. Each variant names the **source** unit a
+/// value arrives in; the user's [`UserPreferences`] pick the display unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Quantity {
-    /// Speed in metres per second.
     SpeedMps,
-    /// Height in thousands of feet (the unit Level III products state
-    /// heights in).
+    /// Height in thousands of feet, as Level III products state heights.
     HeightKft,
-    /// Distance in kilometres.
     DistanceKm,
-    /// Precipitation rate in inches per hour.
     PrecipRateInPerHr,
-    /// Hail size in inches (the unit US hail sizes are reported in).
+    /// Hail size in inches, as US hail sizes are reported.
     HailSizeIn,
-    /// Temperature in degrees Celsius.
     TemperatureC,
-    /// Energy in joules. No preference exists for it; it passes through.
     EnergyJ,
-    /// A dimensionless value, labelled with the fixed unit string its colour
-    /// bar and readout print (`""` for a truly bare number).
+    /// A dimensionless value with the fixed unit string its colour bar prints.
     Unitless { label: &'static str },
 }
 
 impl Quantity {
-    /// `value` (in this quantity's source unit) converted to the unit the
-    /// user's preferences ask for.
-    ///
-    /// Distance and temperature convert through `f64` — the round trip their
-    /// unit enums expose — and narrow back to `f32` at the end. `EnergyJ` and
-    /// `Unitless` have no preference to consult and pass the value through.
+    /// `value` (in this quantity's source unit) converted to the unit the user's
+    /// preferences ask for; `EnergyJ` and `Unitless` pass it through.
     pub fn convert(self, value: f32, prefs: &UserPreferences) -> f32 {
         match self {
             Quantity::SpeedMps => prefs.speed.convert_from_ms(value),
@@ -56,8 +35,6 @@ impl Quantity {
         }
     }
 
-    /// The unit string printed after a converted value — and as a colour
-    /// bar's title.
     pub fn suffix(self, prefs: &UserPreferences) -> &'static str {
         match self {
             Quantity::SpeedMps => prefs.speed.suffix(),
@@ -65,12 +42,8 @@ impl Quantity {
             Quantity::DistanceKm => prefs.distance.suffix(),
             Quantity::PrecipRateInPerHr => prefs.precip_rate.suffix(),
             // `HailSizeUnit::suffix()` is the inch *mark*, which reads well
-            // pressed against a bare number (`1.75"`, as the storm-report popup
-            // writes it) but not as a colour-bar title, and not after the space
-            // this crate's readouts put before their unit. `in` is also what
-            // MEHS has printed since it shipped, so the default reading is
-            // character for character what it was. Every other unit takes its
-            // own suffix.
+            // against a bare number but not as a colour-bar title. `in` is
+            // also what MEHS has printed since it shipped.
             Quantity::HailSizeIn => match prefs.hail_size {
                 HailSizeUnit::Inches => "in",
                 unit => unit.suffix(),
@@ -81,15 +54,8 @@ impl Quantity {
         }
     }
 
-    /// Decimals a value of this quantity reads well in, in the preferred
-    /// unit.
-    ///
-    /// Speed (1), height (1), precipitation rate (2) and hail size
-    /// (`prefs.hail_size.decimals()`) match the precision
-    /// `RadarProduct::format_value` prints those quantities at today.
-    /// Distance (1), temperature (0), energy (0) and `Unitless` (1) have no
-    /// consumer of this method yet: those are stated defaults, adjustable
-    /// when their consumer lands (E9/M9).
+    /// Decimals a value of this quantity reads well in, in the preferred unit,
+    /// matching what `RadarProduct::format_value` prints today.
     pub fn decimals(self, prefs: &UserPreferences) -> usize {
         match self {
             Quantity::SpeedMps => 1,
@@ -104,29 +70,21 @@ impl Quantity {
     }
 }
 
-/// A value together with the quantity it measures — enough to convert and
-/// print it under any [`UserPreferences`] without asking anything else.
+/// A value together with the quantity it measures — enough to convert and print
+/// it under any [`UserPreferences`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Measured {
-    /// In `quantity`'s source unit.
     pub value: f32,
     pub quantity: Quantity,
 }
 
 impl Measured {
-    /// [`Quantity::convert`] applied to this value.
     pub fn convert(&self, prefs: &UserPreferences) -> f32 {
         self.quantity.convert(self.value, prefs)
     }
 
-    /// The converted value at [`Quantity::decimals`] precision, followed by
-    /// [`Quantity::suffix`] — with no trailing space when the suffix is
-    /// empty.
-    ///
-    /// Not consumed by `rustdar-radar` at M4: `RadarProduct::format_value`
-    /// deliberately keeps its per-product string shapes (the comment there
-    /// says why). This is the vocabulary the overlay legends and the E9
-    /// field registry adopt.
+    /// The converted value at [`Quantity::decimals`] precision followed by
+    /// [`Quantity::suffix`], with no trailing space when the suffix is empty.
     pub fn display(&self, prefs: &UserPreferences) -> String {
         let converted = self.convert(prefs);
         let decimals = self.quantity.decimals(prefs);
@@ -147,12 +105,8 @@ mod tests {
     };
 
     /// Every variant, under default preferences and under one non-default
-    /// preference each, against **hand-written** expected strings — computed
-    /// by hand from the unit tables, not by running the conversion the test
-    /// is checking, so a consistent pair of wrong formulas cannot pass.
-    ///
-    /// `EnergyJ` and `Unitless` have no preference; their "non-default" rows
-    /// flip every preference at once and pin that the output does not move.
+    /// preference each, against **hand-written** expected strings, so a
+    /// consistent pair of wrong formulas cannot pass.
     #[test]
     fn every_quantity_converts_suffixes_and_displays_per_the_preference() {
         let defaults = UserPreferences::default();
@@ -191,7 +145,6 @@ mod tests {
             ..UserPreferences::default()
         };
 
-        // (case, quantity, raw value, prefs, suffix, decimals, display)
         let table: &[(&str, Quantity, f32, &UserPreferences, &str, usize, &str)] = &[
             // 10 m/s is 22.3694 mph.
             (
@@ -269,8 +222,7 @@ mod tests {
                 2,
                 "38.10 mm/hr",
             ),
-            // Inches suffix is "in" — the colour-bar rule — never the inch
-            // mark `"`; 1.75 in is 4.445 cm, at centimetres' one decimal.
+            // Inches suffix is "in", never the inch mark; 1.75 in is 4.445 cm.
             (
                 "hail default",
                 Quantity::HailSizeIn,
@@ -308,8 +260,7 @@ mod tests {
                 0,
                 "20 °C",
             ),
-            // No preference: identical under defaults and under everything
-            // flipped at once.
+            // No preference: identical under defaults and everything flipped.
             (
                 "energy default",
                 Quantity::EnergyJ,
@@ -356,7 +307,6 @@ mod tests {
         }
     }
 
-    /// An empty `Unitless` label leaves a bare number: no trailing space.
     #[test]
     fn an_empty_suffix_is_trimmed_from_the_display() {
         let prefs = UserPreferences::default();
@@ -367,9 +317,7 @@ mod tests {
         assert_eq!(bare.display(&prefs), "2.5");
     }
 
-    /// The conversions are the unit enums' own: one spot check per converting
-    /// variant against an independently hand-computed value, so `convert`
-    /// cannot silently route a quantity through the wrong unit table.
+    /// One spot check per converting variant against a hand-computed value.
     #[test]
     fn convert_routes_each_quantity_through_its_own_unit_table() {
         let prefs = UserPreferences {
@@ -382,19 +330,12 @@ mod tests {
             ..UserPreferences::default()
         };
 
-        // 10 m/s = 36 km/h.
         assert!((Quantity::SpeedMps.convert(10.0, &prefs) - 36.0).abs() < 1e-3);
-        // 10 kft = 3.048 km.
         assert!((Quantity::HeightKft.convert(10.0, &prefs) - 3.048).abs() < 1e-4);
-        // 10 km = 5.39957 nmi.
         assert!((Quantity::DistanceKm.convert(10.0, &prefs) - 5.39957).abs() < 1e-4);
-        // 2 in/hr = 50.8 mm/hr.
         assert!((Quantity::PrecipRateInPerHr.convert(2.0, &prefs) - 50.8).abs() < 1e-3);
-        // 2 in = 50.8 mm.
         assert!((Quantity::HailSizeIn.convert(2.0, &prefs) - 50.8).abs() < 1e-3);
-        // 0 °C = 32 °F.
         assert!((Quantity::TemperatureC.convert(0.0, &prefs) - 32.0).abs() < 1e-4);
-        // Pass-throughs.
         assert_eq!(Quantity::EnergyJ.convert(7.25, &prefs), 7.25);
         assert_eq!(
             Quantity::Unitless { label: "NROT" }.convert(-3.5, &prefs),

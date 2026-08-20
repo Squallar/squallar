@@ -1,27 +1,22 @@
 //! [`rustdar_kv::KvStore`] backed by the browser's `localStorage`.
 //!
-//! This is the reason [`rustdar_kv::KvStore`] addresses blobs by logical key
-//! rather than by path: `localStorage` is a flat string-to-string map with no
-//! directories and no filenames, so there is nothing here for a `&Path` to mean.
+//! This is why [`rustdar_kv::KvStore`] addresses blobs by logical key rather
+//! than by path: `localStorage` is a flat string-to-string map.
 
-/// Namespacing, not security: a shared origin (project page, preview deploy,
-/// reused `localhost` port) sees one `localStorage` for every app on it, and a
-/// bare `"ui"` would collide.
+/// Namespacing, not security: a shared origin sees one `localStorage` for every
+/// app on it, and a bare `"ui"` would collide.
 const KEY_PREFIX: &str = "rustdar.";
 
-/// Map a logical config key onto its `localStorage` key.
-///
-/// Split out and public so it is testable without a browser. An altered prefix
-/// does not fail; it quietly stops finding every layout the previous build saved.
+/// Map a logical config key onto its `localStorage` key. Public so it is
+/// testable without a browser. An altered prefix does not fail; it quietly
+/// stops finding every layout the previous build saved.
 pub fn storage_key(key: &str) -> String {
     format!("{KEY_PREFIX}{key}")
 }
 
-/// A [`rustdar_kv::KvStore`] that persists into `window.localStorage`.
-///
-/// The handle is obtained once in [`LocalStorageKvStore::new`], which is
-/// also where failure is absorbed: `localStorage` *throws* rather than returning
-/// null when site data is blocked or the page is a sandboxed iframe.
+/// A [`rustdar_kv::KvStore`] that persists into `window.localStorage`. The
+/// handle is obtained once in `new`, which is where failure is absorbed:
+/// `localStorage` *throws* when site data is blocked.
 #[cfg(target_arch = "wasm32")]
 pub struct LocalStorageKvStore {
     storage: web_sys::Storage,
@@ -29,11 +24,9 @@ pub struct LocalStorageKvStore {
 
 #[cfg(target_arch = "wasm32")]
 impl LocalStorageKvStore {
-    /// Obtain the backing store, or `None` where the browser refuses access.
     pub fn new() -> Option<Self> {
-        // Three distinct failures, all meaning "nowhere to persist": no window,
-        // the getter throwing (site data blocked, sandboxed iframe), and the
-        // getter returning null.
+        // Three failures, all meaning "nowhere to persist": no window, the
+        // getter throwing, and the getter returning null.
         let storage = web_sys::window()?.local_storage().ok()??;
         Some(Self { storage })
     }
@@ -42,16 +35,15 @@ impl LocalStorageKvStore {
 #[cfg(target_arch = "wasm32")]
 impl rustdar_kv::KvStore for LocalStorageKvStore {
     fn load(&self, key: &str) -> Option<String> {
-        // Err (store became inaccessible) and Ok(None) (never written) both
-        // report as None per the trait, so the chain folds.
+        // Err and Ok(None) both report as None per the trait.
         self.storage.get_item(&storage_key(key)).ok()?
     }
 
     fn store(&self, key: &str, value: &str) -> Result<(), String> {
         self.storage
             .set_item(&storage_key(key), value)
-            // `QuotaExceededError` (origin's ~5 MB budget full) is the one that
-            // happens. Stringified because no caller branches on it.
+            // `QuotaExceededError` is the one that happens; stringified because
+            // no caller branches on it.
             .map_err(|e| format!("localStorage write failed: {e:?}"))
     }
 }
@@ -66,15 +58,13 @@ mod tests {
         assert_eq!(storage_key(UI_CONFIG_KEY), "rustdar.ui");
     }
 
-    /// The mapping has to be injective or two configs overwrite each other.
     #[test]
     fn distinct_keys_stay_distinct() {
         assert_ne!(storage_key("ui"), storage_key("other"));
     }
 
     /// The logical key must survive verbatim and at the *end*. A mapping that
-    /// merely contained it (`"rustdar.layout.v1"`) reads back consistently
-    /// within one build while orphaning everything the previous one saved.
+    /// merely contained it would orphan everything the previous build saved.
     #[test]
     fn the_logical_key_survives_verbatim_at_the_end() {
         let mapped = storage_key("layout");

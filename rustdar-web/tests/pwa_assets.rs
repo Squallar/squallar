@@ -1,13 +1,7 @@
 //! Gates on the static PWA assets: `manifest.webmanifest`, `sw.js`,
-//! `index.html`, `icons/`. Nothing in the Rust build reads them, so the two
-//! silent failures worth catching mechanically are a root-relative URL (works at
-//! `python3 -m http.server`, 404s under `https://<user>.github.io/rustdar/`) and
-//! a new [`DataSources`] entry nobody thought to deny in `sw.js`.
-//!
-//! Every test here reads *text*. A claim about what a file says belongs here; a
-//! claim about what it *does* belongs in `tests/sw_routing.test.mjs` or
-//! `tests/index_bootstrap.test.mjs`, which `sw_behaviour.rs` runs. The caching
-//! policy could be deleted outright and everything here would still pass.
+//! `index.html`, `icons/`. Every test here reads *text*; a claim about what a
+//! file *does* belongs in `tests/sw_routing.test.mjs` or
+//! `tests/index_bootstrap.test.mjs`, which `sw_behaviour.rs` runs.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,13 +25,7 @@ fn manifest() -> serde_json::Value {
     serde_json::from_str(MANIFEST).expect("manifest.webmanifest is not valid JSON")
 }
 
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
-
-/// Strip `//` line comments so a comment's punctuation cannot be mistaken for
-/// source. Block comments are not stripped; none of the literals scanned below
-/// sit inside one.
+/// Strip `//` line comments so a comment's punctuation is not read as source.
 fn without_line_comments(src: &str) -> String {
     src.lines()
         .map(|line| match line.find("//") {
@@ -48,13 +36,8 @@ fn without_line_comments(src: &str) -> String {
         .join("\n")
 }
 
-/// Collect the double-quoted string literals from the JS array or set literal
-/// that starts at `marker`, up to its closing `]`.
-///
-/// A real JS parser would be overkill: `sw.js` is a file in this repository and
-/// both literals it is pointed at are flat lists of plain strings. If that stops
-/// being true the extraction returns nothing and every caller fails loudly,
-/// which is the safe direction.
+/// The double-quoted string literals of the JS array or set literal that starts
+/// at `marker`, up to its closing `]`.
 fn js_string_list(src: &str, marker: &str) -> Vec<String> {
     let src = without_line_comments(src);
     let start = src
@@ -80,11 +63,7 @@ fn js_string_list(src: &str, marker: &str) -> Vec<String> {
     out
 }
 
-/// The single-quoted or double-quoted literal that follows `marker`.
-///
-/// Used to read a path out of source rather than restate it here: a test that
-/// hardcodes the same string it is checking passes whether or not the two
-/// files still agree.
+/// The literal that follows `marker`, read out of source rather than restated.
 fn literal_after(src: &str, what: &str, marker: &str) -> String {
     let start = src
         .find(marker)
@@ -106,11 +85,8 @@ fn page_module_specifier() -> String {
     literal_after(INDEX_HTML, "index.html", "import init, { start } from \"")
 }
 
-/// Width and height from a PNG's IHDR.
-///
-/// Layout is fixed by the spec: an 8-byte signature, then IHDR's 4-byte length
-/// and 4-byte type, then width and height as big-endian u32. Reading them is
-/// what makes the icon test check the image rather than the filename.
+/// Width and height from a PNG's IHDR: an 8-byte signature, then IHDR's length
+/// and type, then width and height as big-endian u32.
 fn png_dimensions(path: &Path) -> (u32, u32) {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
     assert!(
@@ -147,22 +123,14 @@ fn html_url_attributes(html: &str) -> Vec<(String, String)> {
     out
 }
 
-/// The hostname rustdar will contact for one declared origin.
-///
-/// [`DataSources`] stores S3 sources as bare bucket names — addressed through
-/// its own `s3_base` template — and everything else as a full `https://` base,
-/// exactly as [`DataSources::s3_object_url`] and the fetch modules consume
-/// them.
+/// The hostname rustdar will contact for one declared origin: [`DataSources`]
+/// stores S3 sources as bare bucket names, everything else as an https base.
 fn host_of(source: &str) -> String {
     match source.strip_prefix("https://") {
         Some(rest) => rest.split('/').next().unwrap().to_string(),
         None => host_of(&DataSources::production().s3_bucket_url(source)),
     }
 }
-
-// ---------------------------------------------------------------------------
-// manifest
-// ---------------------------------------------------------------------------
 
 #[test]
 fn manifest_start_url_and_scope_are_relative_so_a_subpath_deploy_resolves() {
@@ -177,8 +145,7 @@ fn manifest_start_url_and_scope_are_relative_so_a_subpath_deploy_resolves() {
              root and breaks the https://<user>.github.io/rustdar/ deploy"
         );
     }
-    // Installability requires start_url to be inside scope. Both resolving to
-    // the same directory is the strongest form of that.
+    // Installability requires start_url to be inside scope.
     assert_eq!(
         m["start_url"], m["scope"],
         "start_url must resolve within scope"
@@ -187,9 +154,7 @@ fn manifest_start_url_and_scope_are_relative_so_a_subpath_deploy_resolves() {
 
 #[test]
 fn manifest_display_mode_is_one_that_makes_the_app_installable() {
-    // A manifest with `display: "browser"` is valid and is *not* installable:
-    // Chromium and Firefox both require a display mode that leaves the browser
-    // chrome behind.
+    // `display: "browser"` is valid and is *not* installable.
     let installable = ["standalone", "fullscreen", "minimal-ui"];
     let m = manifest();
     let display = m["display"].as_str().expect("display is missing");
@@ -260,15 +225,10 @@ fn every_manifest_icon_is_relative_and_the_file_matches_its_declared_size() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// index.html
-// ---------------------------------------------------------------------------
-
 #[test]
 fn index_html_has_no_root_relative_urls() {
-    // The whole subpath story rests on this. A single `href="/sw.js"` works at
-    // `python3 -m http.server` and 404s under `/rustdar/`, and nothing else in
-    // the build would notice.
+    // A single `href="/sw.js"` works at `python3 -m http.server` and 404s
+    // under `/rustdar/`, and nothing else in the build would notice.
     for (attr, value) in html_url_attributes(INDEX_HTML) {
         assert!(
             !value.starts_with('/'),
@@ -295,9 +255,8 @@ fn index_html_links_the_manifest_and_registers_the_worker_relatively() {
 
 #[test]
 fn index_html_carries_an_explicit_offline_state() {
-    // Not decoration. rustdar caches no weather data, so going offline shows a
-    // map that has simply stopped updating — indistinguishable from clear skies
-    // unless the page says so.
+    // rustdar caches no weather data, so offline shows a map that has simply
+    // stopped updating — indistinguishable from clear skies.
     assert!(
         INDEX_HTML.contains(r#"id="rustdar-offline""#),
         "index.html has no offline banner element"
@@ -309,12 +268,8 @@ fn index_html_carries_an_explicit_offline_state() {
     );
 }
 
-/// The canvas must opt out of the browser's own touch gestures.
-///
-/// winit sets no `touch-action` and only calls `preventDefault()`, which for
-/// pointer events does not stop a two-finger gesture being taken as page zoom.
-/// Nothing in the Rust build reads this stylesheet, so losing the rule would
-/// only ever show up as pinch mysteriously not reaching the app.
+/// The canvas must opt out of the browser's own touch gestures: winit sets no
+/// `touch-action`, and `preventDefault()` does not stop a two-finger page zoom.
 #[test]
 fn the_canvas_opts_out_of_browser_touch_gestures() {
     let canvas_rule = INDEX_HTML
@@ -329,10 +284,6 @@ fn the_canvas_opts_out_of_browser_touch_gestures() {
          claim pinch as page zoom and never deliver the second pointer"
     );
 }
-
-// ---------------------------------------------------------------------------
-// service worker
-// ---------------------------------------------------------------------------
 
 /// Pinned so adding an origin to the Rust declaration fails here and forces a
 /// decision about `sw.js`.
@@ -357,14 +308,10 @@ fn data_sources_has_the_fields_the_worker_was_written_against() {
         "spc_base",
         "iem_base",
         "sounding_base",
-        // Not an origin of its own: the URL template the six bucket names above
-        // are addressed through, so every host it can produce is already listed
-        // by one of them. It is here because it is what makes those buckets
-        // injectable — see `DataSources::s3_bucket_url`.
+        // Not an origin: the URL template the bucket names are addressed through.
         "s3_base",
-        // Not origins: flags selecting which TLS client the SPC and METAR
-        // fetches use. Listed so this set stays an exact match on the struct,
-        // which is what makes a *new origin* impossible to add unnoticed.
+        // Not origins: TLS-client flags, listed so this set stays an exact
+        // match on the struct.
         "metar_sends_user_agent",
         "spc_sends_user_agent",
     ]
@@ -379,12 +326,8 @@ fn data_sources_has_the_fields_the_worker_was_written_against() {
     );
 }
 
-/// Gates the *declaration*, not the behaviour: deleting the `NEVER_CACHE_HOSTS`
-/// check from `routeFor` leaves this green. The behavioural gate is in
-/// `tests/sw_routing.test.mjs` ("keeps the deny list load-bearing even when
-/// rustdar is served from a data origin"), which roots the worker at
-/// `https://api.weather.gov/rustdar/` — the one configuration where that check
-/// is the only thing preventing a weather response from being cached.
+/// Gates the *declaration*, not the behaviour. The behavioural gate is
+/// `tests/sw_routing.test.mjs`.
 #[test]
 fn the_worker_states_every_production_data_origin_in_its_deny_list() {
     let denied = js_string_list(SERVICE_WORKER, "const NEVER_CACHE_HOSTS = new Set([");
@@ -420,9 +363,8 @@ fn the_worker_states_every_production_data_origin_in_its_deny_list() {
 
 #[test]
 fn the_worker_shell_list_cannot_name_a_cross_origin_asset() {
-    // `routeFor` builds shell URLs from SHELL_PATHS against the worker's own
-    // directory, so while every entry is relative with no scheme and no leading
-    // slash the shell rule cannot match any other origin.
+    // `routeFor` builds shell URLs against the worker's own directory, so a
+    // relative entry cannot match any other origin.
     for path in js_string_list(SERVICE_WORKER, "const SHELL_PATHS = [") {
         assert!(
             !path.starts_with('/'),
@@ -443,8 +385,7 @@ fn every_shell_asset_that_is_not_build_output_exists() {
     assert!(paths.len() > 1, "SHELL_PATHS in sw.js parsed as near-empty");
 
     for path in paths {
-        // "" is the directory index (index.html, served as `./`), and pkg/ is
-        // what `wasm-pack build` writes and is not in the repository.
+        // "" is the directory index; pkg/ is build output, not in the repo.
         if path.is_empty() || path.starts_with("pkg/") {
             continue;
         }
@@ -481,11 +422,8 @@ fn the_worker_precaches_the_manifest_and_both_halves_of_the_wasm_bundle() {
     );
 }
 
-/// The rasterization worker is what keeps a ~160-190 ms Level II frame off the
-/// main thread. Every way of losing it is silent — the funnel just falls back
-/// to rendering inline — so the script `worker_port.rs` asks for has to be a
-/// file that exists and an entry the shell precaches, and both are read from
-/// the source that names it rather than restated here.
+/// The rasterization worker keeps a ~160-190 ms Level II frame off the main
+/// thread, and every way of losing it is silent.
 #[test]
 fn the_script_the_page_asks_for_is_shipped_and_precached() {
     let requested = requested_worker_url();
@@ -505,14 +443,8 @@ fn the_script_the_page_asks_for_is_shipped_and_precached() {
     );
 }
 
-/// One wasm module, instantiated twice.
-///
-/// `sw.js` pins each client to a single shell generation because a mismatched
-/// glue/module pair is a `LinkError`, and that machinery is written for exactly
-/// one `(glue, wasm)` pair. A worker built from a *second* artifact would need
-/// its own pair kept atomic with the first — so if this assertion ever has to
-/// change, `SHELL_PATHS`, the version probes and the per-client pinning all
-/// need revisiting together.
+/// One wasm module, instantiated twice: `sw.js` pins each client to a single
+/// shell generation because a mismatched glue/module pair is a `LinkError`.
 #[test]
 fn the_rasterization_worker_loads_the_same_module_as_the_page() {
     let glue = page_module_specifier();
@@ -528,8 +460,7 @@ fn the_rasterization_worker_loads_the_same_module_as_the_page() {
     );
 }
 
-/// The same subpath rule the rest of the deploy lives under, applied to the one
-/// file that is fetched by a Worker rather than by the page.
+/// The subpath rule, for the one file fetched by a Worker rather than the page.
 #[test]
 fn the_rasterization_worker_uses_only_relative_paths() {
     for (line_no, line) in RASTER_WORKER.lines().enumerate() {
@@ -545,22 +476,13 @@ fn the_rasterization_worker_uses_only_relative_paths() {
     }
 }
 
-/// The protocol is versionless, and the **build token** names the build.
-///
-/// `worker_protocol` is `#[cfg(target_arch = "wasm32")]`, so nothing a host
-/// `cargo test` compiles can call `build_token` at all — a source scrape is
-/// the only instrument here, as for every guard in this block. What it pins:
-/// the hand-kept protocol version was deleted at M5 and must stay deleted,
-/// and the token that replaced it still reads both of its halves. What
-/// distinguishes two builds is the token itself — `GITHUB_SHA` in CI, finer
-/// than any hand-kept number and impossible to forget, and
-/// `wire_identity::wire_digest()` locally, a fold over the pinned framing
-/// rows, so two local builds whose wire rows differ refuse each other where
-/// the hand-kept number matched any two local builds alike.
+/// The protocol is versionless, and the **build token** names the build:
+/// `GITHUB_SHA` in CI, `wire_identity::wire_digest()` locally.
+/// `worker_protocol` is `wasm32`-only, so a source scrape is the only
+/// instrument here.
 #[test]
 fn the_worker_protocol_is_versionless_and_the_token_names_the_build() {
-    // Split literal (the arch_ratchets needle discipline): this file must not
-    // itself hit the campaign's zero-grep for the deleted constant.
+    // Split literal so this file does not itself contain the deleted constant.
     let version_const = concat!("PROTOCOL_", "VERSION");
     assert!(
         !WORKER_PROTOCOL.contains(version_const),
@@ -594,19 +516,9 @@ fn the_worker_protocol_is_versionless_and_the_token_names_the_build() {
     }
 }
 
-/// Every arm of the worker's reply writes every field.
-///
-/// The page holds a render slot, a pane's in-flight mark and a pending-map
-/// entry against each id it posted, and only a reply releases them — so a path
-/// through `post_result` that left a field absent, or posted nothing at all,
-/// wedges that pane forever with no error anywhere. The defaults are written
-/// once before the answering arm, which is what makes "every arm" a property
-/// of the shape rather than of the arms agreeing; this pins that shape,
-/// because the function is `wasm32`-only and no host test can run it.
-///
-/// Three fields since WO-M7d: the whole reply is the `OUT`/`OUT_KIND`/
-/// `TAILS` trio (the eight frame fields died with the named-field frame
-/// path at WO-M7c; the tails joined at WO-M7d).
+/// Every arm of the worker's reply writes every field. The page holds a render
+/// slot and a pending-map entry against each id it posted, and only a reply
+/// releases them, so a path that left a field absent wedges that pane.
 #[test]
 fn the_worker_reply_writes_every_field_on_every_arm() {
     let body = RASTER_WORKER_RS
@@ -618,10 +530,8 @@ fn the_worker_reply_writes_every_field_on_every_arm() {
         .expect("post_result no longer branches on the result")
         .0;
     for field in [
-        // Matched **with the trailing comma**, because `proto::OUT` is a prefix
-        // of `proto::OUT_KIND`: without it, deleting the `OUT` default outright
-        // still satisfied this loop, which is exactly how that mutation
-        // survived this test's first draft.
+        // Matched **with the trailing comma**, because `proto::OUT` is a
+        // prefix of `proto::OUT_KIND`.
         "proto::OUT,",
         "proto::OUT_KIND,",
         "proto::TAILS,",
@@ -635,33 +545,10 @@ fn the_worker_reply_writes_every_field_on_every_arm() {
     }
 }
 
-/// The frame reply rides the `OUT`/`OUT_KIND`/`TAILS` trio and **every**
-/// reply buffer is **transferred** — the head once, each nominated tail
-/// inside the tails loop — the reply direction's shape since WO-M7d,
-/// pinned at the source because `post_result` is `wasm32`-only and no host
-/// test can run it.
-///
-/// Three claims, each of which would fail silently at runtime:
-///
-/// * **Exactly two literal `transfer.push(` sites on the answering arm** —
-///   the `OUT` head push and the per-tail push inside the tails loop
-///   (which transfers EVERY tail: the loop is one site however many
-///   buffers ride it). A lost push would structured-clone up to ~16 MiB
-///   per still-frame image tail instead of transferring it, and nothing
-///   else would fail; a third site would mean a payload this protocol
-///   does not have.
-/// * **`OUT`, `OUT_KIND` and `TAILS` are written on the answering arm.**
-///   The trio is the whole answer; an arm that dropped one would post a
-///   payload the page refuses (the kind verification, the frame decoder's
-///   tail count) or a kind with no payload.
-/// * **The eight frame-field idents are GONE from worker.rs** — the
-///   deletion pin. `proto::IMAGE`/`proto::POLAR` and the six beside them
-///   were the frame's named-field path; a write that came back would be a
-///   second reply shape beside the codec's, and the page would have to
-///   arbitrate between two outputs for one job. (The frame's polar and
-///   image ride `TAILS` as codec-nominated buffers, not as named fields —
-///   no field name says what a tail is, the dispatched row's decoder
-///   does.)
+/// The frame reply rides the `OUT`/`OUT_KIND`/`TAILS` trio and **every** reply
+/// buffer is **transferred** — the head once, each nominated tail inside the
+/// tails loop — which is why exactly two literal `transfer.push(` sites are
+/// expected. A lost push would structured-clone up to ~16 MiB per image tail.
 #[test]
 fn the_frame_reply_rides_the_out_pair_and_transfers_its_buffer() {
     let body = without_line_comments(RASTER_WORKER_RS);
@@ -688,9 +575,8 @@ fn the_frame_reply_rides_the_out_pair_and_transfers_its_buffer() {
         );
     }
 
-    // The deletion pin: the eight frame-field idents died with the
-    // named-field frame path. Split literals (the arch_ratchets needle
-    // discipline) so this file never contains what it forbids.
+    // The deletion pin. Split literals so this file never contains what it
+    // forbids.
     for ident in [
         concat!("proto::", "IMAGE"),
         concat!("proto::", "POLAR"),
@@ -709,23 +595,9 @@ fn the_frame_reply_rides_the_out_pair_and_transfers_its_buffer() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// the reply's shape, read off the source rather than restated
-// ---------------------------------------------------------------------------
-//
-// Everything above enumerates *names it expects to find*, which catches a
-// deletion and is blind to an addition: the three tests before this one all
-// stayed green through a version-7 reply that wrote two fields no list here
-// mentioned. What follows extracts the whole set instead, so a field nobody
-// added to a list is a field that fails.
-
 /// `ident -> wire key` for every `pub const <NAME>: &str = "<key>";` in
-/// `worker_protocol.rs` — the vocabulary a message may be built out of.
-///
-/// The declarations are the whole specification of this boundary. There is no
-/// serde on it: both directions build a bare `js_sys::Object` and set fields on
-/// it by name, so no type anywhere binds a reply's shape and nothing but a read
-/// of this source can say what the shape is.
+/// `worker_protocol.rs`. There is no serde on this boundary: both directions
+/// set fields on a bare `js_sys::Object` by name.
 fn worker_protocol_vocabulary() -> BTreeMap<String, String> {
     let src = without_line_comments(WORKER_PROTOCOL);
     let mut out = BTreeMap::new();
@@ -752,7 +624,7 @@ fn worker_protocol_vocabulary() -> BTreeMap<String, String> {
 }
 
 /// `post_result`'s body, cut at the `post_message` that ends it so the only
-/// `&message` left in it belongs to a `set_field`.
+/// `&message` left belongs to a `set_field`.
 fn post_result_body() -> String {
     let src = without_line_comments(RASTER_WORKER_RS);
     src.split_once("fn post_result(")
@@ -765,14 +637,7 @@ fn post_result_body() -> String {
 }
 
 /// That body split into the two places a field can be written: before the
-/// answering arm (the defaults every reply carries), and the answering arm
-/// itself.
-///
-/// The same two slices the tests above take, by the same marker. The null
-/// reply falls in no slice of its own because it writes nothing beyond the
-/// defaults; if a third place ever writes a field the call-site count in
-/// [`the_worker_reply_shape_is_the_one_this_build_ships`] is what notices,
-/// which is the point of counting.
+/// answering arm, and the answering arm itself.
 fn post_result_arms() -> Vec<(&'static str, String)> {
     let body = post_result_body();
     let (head, answer) = body
@@ -782,10 +647,7 @@ fn post_result_arms() -> Vec<(&'static str, String)> {
 }
 
 /// The key argument of every `set_field(&message, <KEY>, ..)` in one slice, in
-/// source order.
-///
-/// Reads the *argument*, not every `proto::` token: `KIND`'s value is
-/// `proto::DONE`, and a token scan would call that a field.
+/// source order. Reads the *argument*, not every `proto::` token.
 fn message_field_idents(arm: &str) -> Vec<String> {
     arm.split("&message,")
         .skip(1)
@@ -800,89 +662,10 @@ fn message_field_idents(arm: &str) -> Vec<String> {
         .collect()
 }
 
-/// The shape of a `done` reply, whole, pinned against the build that ships
-/// it: a within-build shape pin and refactor gate.
-///
-/// # What this is for
-///
-/// The three enumerations above are lists of names they expect to *find*, so
-/// a reply that grows a field passes all of them; this extracts the whole
-/// set, so a field nobody added to a list is a field that fails, and the
-/// person who changes the reply's shape is stopped here and told what they
-/// owe. Deploy-skew protection is NOT this test's job and not any hand-kept
-/// number's: it is the build token's — `GITHUB_SHA` in CI, the
-/// `wire_identity::wire_digest()` fold locally — which refuses a mismatched
-/// page/worker pair at the handshake, so the wire below this pin is
-/// same-build-only by construction.
-///
-/// # What this still cannot see, and what sees it instead
-///
-/// It watches the reply's **field set**, so it catches a field added, removed
-/// or renamed. It cannot catch a change to the *bytes inside* a field,
-/// because the field set is identical either side of one. `POLAR` carries
-/// `rustdar_radar::render::polar::PolarField::to_bytes`, a hand-rolled layout
-/// whose header once grew an `f64` without a single name here changing —
-/// this test passed, unmodified, across that change.
-///
-/// That gap is covered by digests rather than by this test, because a
-/// buffer's layout is not visible from a crate that cannot link the encoder.
-/// Each of the codecs that crosses this port inside a buffer pins the bytes
-/// it produces over a fixture built from literals:
-///
-///   * `rustdar_radar::render::polar::tests::the_polar_wire_layout_is_the_one_this_protocol_ships`
-///     for the polar block inside a frame reply;
-///   * `rustdar_radar::volume_wire::tests::the_volume_wire_layout_is_the_one_this_version_ships`
-///     for the decoded volume `OUT` carries under the decode row's registry
-///     code (the section and voxel payloads were already pinned by their
-///     own crates);
-///   * `rustdar_worker::offload::tests::the_job_framing_is_the_one_this_protocol_ships`
-///     for the page->worker direction named below,
-///     `..._the_overlay_reply_framing_is_the_one_this_protocol_ships` for
-///     the overlay reply payloads (hit-map cells riding ahead of raw RGBA;
-///     the RGBA tail has no layout to digest, and its guard is the
-///     dispatching page's own `width × height × 4` length check), and
-///     `..._the_frame_reply_framing_is_the_one_this_registry_ships` for the
-///     frame reply's head+tails form — six rows since WO-M7d: head, polar
-///     tail and image tail per fixture (WO-M7c is the layout change that
-///     retired the eight named frame fields this list once pinned; WO-M7d
-///     moved the frame's two big buffers onto `TAILS`).
-///
-/// Those framing rows do double duty since M5: they live in
-/// `rustdar_worker::wire_identity` as production consts, and the local
-/// build token digests them — so the layout change this field-set pin cannot
-/// see is exactly the change that now diverges two local builds' tokens.
-///
-/// Each digest was measured against an uncooperative regressor: a same-width
-/// field reorder made to encoder and decoder in step left every other test
-/// in its crate green (890 of 891 in `rustdar-radar`, 807 of 808 in
-/// what is now `rustdar-worker`) and the guards here green as well, and only the
-/// digest fell over.
-///
-/// # Why a list and not a digest
-///
-/// A hash of the shape would be exactly as binding and would say nothing.
-/// This list makes the diff of a shape change read
-/// `+ "frame | HAIL_SIZE | hsz"` beside the row it displaced, which is the
-/// sentence the author needs to see, and it stays greppable: the wire key of
-/// any field is findable from here.
-///
-/// # Why a source scrape
-///
-/// `worker_protocol` and `worker` are both `#[cfg(target_arch = "wasm32")]`,
-/// so nothing a host `cargo test` compiles can name `post_result` or
-/// `build_token`, and the wasm CI rows are `wasm-pack build` and
-/// `cargo check` — neither runs a test. (The Tier-1 browser gate runs four
-/// wasm tests, but a browser harness is no place to pin source text.)
-/// Reading the source is the only instrument available, and the tests above
-/// already do it.
-///
-/// # What this does not cover
-///
-/// The page→worker `job` direction and the `hello`/`fatal` messages. The `job`
-/// direction is a byte codec rather than a field set, and it is pinned by
-/// `rustdar_worker`'s `the_job_framing_is_the_one_this_protocol_ships` — see
-/// above. `hello` and `fatal` are still built elsewhere and are as unbound as
-/// this one was.
+/// The shape of a `done` reply, whole, pinned against the build that ships it.
+/// The enumerations above are lists of names they expect to *find*; this
+/// extracts the whole set. It watches the **field set** only — bytes inside a
+/// field are covered by the per-codec layout digests.
 #[test]
 fn the_worker_reply_shape_is_the_one_this_build_ships() {
     let vocabulary = worker_protocol_vocabulary();
@@ -904,10 +687,8 @@ fn the_worker_reply_shape_is_the_one_this_build_ships() {
     }
     written.sort();
 
-    // A `set_field` the extractor above did not recognise — a different target
-    // than `&message`, a key that is not a `proto::` path — would otherwise be
-    // silently skipped, and a guard with a hole in it is worse than none
-    // because it reads green over the hole.
+    // An unrecognised `set_field` would be silently skipped, and a guard with a
+    // hole in it reads green over the hole.
     let call_sites = post_result_body().matches("proto::set_field(").count();
     assert_eq!(
         call_sites,
@@ -948,19 +729,9 @@ fn the_worker_reply_shape_is_the_one_this_build_ships() {
     );
 }
 
-/// Every field an arm writes is also written before the match.
-///
-/// This is the invariant `post_result` states in prose over its default block:
-/// *written first and overwritten by the arm that has one, so no path out of
-/// this function can leave a field absent*. An arm that writes a field the
-/// defaults do not breaks it, and breaks it quietly — the page reads an absent
-/// field and a null one through the same `as_f64` filter, so the reply that
-/// omits one is indistinguishable from the reply that says "none" until some
-/// later reader stops being lenient about the difference.
-///
-/// It is a derived check and needs no list: the two sets come out of the same
-/// extraction the shape test uses. `smv`'s speed and direction were written on
-/// the `Frame` arm and nowhere else, which is what this catches.
+/// Every field an arm writes is also written before the match. An arm that
+/// writes a field the defaults do not breaks that quietly: the page reads an
+/// absent field and a null one through the same `as_f64` filter.
 #[test]
 fn no_arm_of_the_worker_reply_writes_a_field_the_defaults_do_not() {
     let arms = post_result_arms();

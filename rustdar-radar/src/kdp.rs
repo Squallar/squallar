@@ -1,179 +1,5 @@
 //! Specific Differential Phase (the RPG's product 163, AWIPS `N0K`) computed
 //! locally from the Level II dual-pol moments of one tilt.
-//!
-//! # What is implemented, and from which documents
-//!
-//! Unlike the reflectivity-derived volume products (EET, DVL — whose RPG
-//! tasks sit behind the closed `cpc014` DQA family, see [`crate::eet`] and
-//! [`crate::vil`]), the WSR-88D **Dual-Polarization Preprocessor** is fully
-//! public: task `cpc004/tsk011` (`dpprep`) ships complete C source in the
-//! CODE distribution (mirrored at github `likev/CodeOrpgPub`). Everything
-//! below is transcribed from that source, function for function, with the
-//! fleet-default adaptation values from `cpc104/lib006/dpprep.alg`. The
-//! algorithm lineage is Ryzhkov/Zrnić (NSSL) via Istok et al. 2009, "WSR-88D
-//! dual polarization initial operational capabilities" (AMS 25th IIPS).
-//!
-//! **Chain** (`cpc104/lib003/task_attr_table`): super-res base data →
-//! `a_recomb` (azimuth recombination, `cpc004/tsk009`) → `dpprep` → HCA →
-//! `dualpol8bit` (`cpc024/tsk001`, products 159/161/163). So the RPG's KDP is
-//! computed at **1° × 0.25 km**, after the two half-degree radials of each
-//! degree are recombined.
-//!
-//! **Azimuth recombination** — `recomb_dp_fields.c` (`RCDP_dp_recomb` /
-//! `Recomb_dp_data`): consecutive half-degree radials pair when the first
-//! sits in the first half of the degree and the two are within 0.75°. Per
-//! gate the DP fields are combined **coherently**: with `Ph = 10^(Z/10)`
-//! (the site/range calibration factors cancel between the two radials —
-//! they share the range gate) and `Pv = Ph / 10^(ZDR/10)`, each radial forms
-//! the correlation vector `t·e^{-iφ}` with `t = ρ·√(Ph·Pv)`, the vectors and
-//! powers are averaged (single-radial fallback per field when one side is
-//! missing), and
-//!
-//! ```text
-//! φc = −atan2(Im, Re)  (+360 if negative)      ρc = √((Re²+Im²)/(Ph·Pv))
-//! ```
-//!
-//! A gate whose reflectivity is missing on both radials has no vector, so
-//! the recombined PhiDP there is missing — the RDA's own SNR censoring of Z
-//! carries into the DP fields, exactly as the source does it. Reflectivity
-//! itself recombines as the linear-power mean (`Combine_azi`), velocity and
-//! spectrum width feed only the high-attenuation test and are pair-averaged
-//! here (the source's `Combine_dops` is power-weighted; the difference is
-//! confined to that yes/no radial test, and the split-cut surveillance
-//! radials `N0K` is built from carry no Doppler moments at all).
-//!
-//! **PhiDP unfolding** — `Unfold_PhiDP` (`dpp_process.c`), constants from
-//! the source: fold 360°, historical median over the previous 30 gates whose
-//! RhoHV ≥ 0.85 (needs > 25 of them, standard deviation < 120°), unfolding
-//! allowed only past gate 240 (60 km) with > 15 valid gates accumulated;
-//! when `|φ − median| ≥ 180°` the closer of `φ+360` / `φ+720` wins. The seed
-//! median is the **initial system differential phase** (`init_fdp`).
-//!
-//! **Initial system PhiDP** — the RPG reads it from the radial header
-//! (`bh->sys_diff_phase`, the RDA volume data block's "Initial System
-//! Differential Phase"); the `isdp_apply` adjustment defaults to `NO`
-//! (`dpprep.alg`) and is not applied. [`KdpParams::from_archive`] extracts
-//! the RDA value from the Level II file. When it is unavailable (the render
-//! path holds a decoded `Scan`, which does not carry it), the documented
-//! estimator (`calc_system_PhiDP.c`, Krause/Klein) stands in: per radial the
-//! first run of 11 consecutive gates past 25 km with RhoHV ≥ 0.986, Z ≥ 0
-//! and none ≥ 40 dBZ yields a 360°-aware median; with ≥ 40 such radials the
-//! estimate is the 5th-percentile entry (`NINT(n/20)`) of the sorted queue.
-//!
-//! **Gate quality / censoring** — `DPPP_process_data`: a gate is
-//! *meteorological* when its 5-gate-averaged RhoHV ≥ 0.9 (`corr_thresh`)
-//! and its PhiDP is present; on a **high-attenuation radial** (≥ 10 gates
-//! past bin 180 with Z in [30, 50] dBZ, |V| ≥ 1 m/s, RhoHV ≤ 0.8, SW >
-//! 2 m/s — `Is_high_atten_radial` with `dpprep.alg` values) the flag runs on
-//! SNR ≥ 5 dB instead, from the 3-gate-smoothed Z and the radial header's
-//! `dBZ0`/atmos. The final KDP is censored wherever that same smoothed
-//! RhoHV is below 0.9, and the product marks a gate wherever the
-//! (recombined) PhiDP input itself is missing (`Add_moment` keys the output
-//! level on the *input* φ).
-//!
-//! **Smoothing and interpolation** — the unfolded φ is 5-gate median
-//! filtered, censored to the meteorological gates, then run through **two**
-//! chains: a 9-gate running average (`short_gate`) and a 25-gate one
-//! (`long_gate`), each followed by `Interpolate`: gaps between valid
-//! meteorological groups (size ≥ the window) are bridged linearly between
-//! the smoothed values at `end−w/2` and `start+w/2`, the stretch before the
-//! first group ramps from `init_fdp`, and the stretch after the last group
-//! holds constant — which flattens the last `w/2` gates of the final group.
-//!
-//! **KDP** — `Calculate_kdp`/`Calculate_lls_kdp`: per gate, the
-//! least-squares slope of the interpolated φ over the window (9 or 25
-//! gates, shrunk at the radial ends), **halved** for the two-way phase
-//! path: `factor = 6/(g·m(m²−1))` is exactly `½ · 12/(g·m(m²−1))`. The
-//! short-gate estimate is kept where the attenuation-corrected smoothed
-//! reflectivity exceeds 40 dBZ (`dbz_thresh`; `z_prcd = Z̄₃ +
-//! 0.04·(φ_long − init_fdp)` per `Create_corrected_fields_and_adjust_kdp`),
-//! the long-gate estimate everywhere else — including gates with no
-//! reflectivity, whose `z_prcd` is NO-DATA and compares low. The RPG's
-//! noise correction of ρ (`RPG_NOISE_CORRECTION`) is compiled out in the
-//! released build (`LOCAL_DEFINES` empty in `dpprep.mak`), so the censor
-//! runs on the plain smoothed ρ, as here.
-//!
-//! **Encoding** — `dualpol8bit.c`/`.h`: KDP is capped at 10.0 °/km
-//! (`MAX_KDP_DISPLAY`), floored at −2.05 (the 16-bit intermediate's minimum
-//! data level 2 through `Get_new_scale(20, 43, …)` preserves that physical
-//! value), and product 163 encodes `level = round(kdp·20 + 43)` —
-//! `KDP_ICD_SCALE` 20, `KDP_ICD_OFFSET` 43, maximum level 243, levels 0/1
-//! below-threshold/range-folded. One data level is 0.05 °/km. The live
-//! harness verifies the scale/offset a real N0K PDB declares instead of
-//! trusting this transcription.
-//!
-//! # Documented gaps against the RPG
-//!
-//! * **Doppler recombination** for the high-attenuation test is a plain
-//!   pair mean, not `Combine_dops`' power-weighted average. The test is a
-//!   per-radial yes/no with a 10-gate margin, and the surveillance cuts the
-//!   low-tilt products come from carry no velocity, making it moot there.
-//! * **`dBZ0`/atmos** for the SNR path come from the volume/elevation data
-//!   blocks when [`KdpParams::from_archive`] is used; the plain render path
-//!   lacks them and falls back to the RhoHV flag on high-attenuation
-//!   radials.
-//! * The RPG computes in `float`; this module computes in `f64`. The
-//!   difference is orders of magnitude below the 0.05 °/km data level.
-//!
-//! # Validation status — read before trusting the twin harness to pass
-//!
-//! **The live twin harness, its `validation_policy`, and the full survey
-//! record live on branch `campaign-harness`**; re-measuring means that
-//! branch.
-//!
-//! The harness scores the derivation against the RPG's own N0K for the
-//! **same volume and cut** (paired by PDB volume start plus elevation
-//! number, angle-matched where a site's product cut numbering differs from
-//! the RDA's), in the twin's own data levels — the PDB's declared scale 20
-//! / offset 43 was verified on every live twin, so one data level is
-//! 0.05 °/km. As last measured (three full-roster surveys) the derivation
-//! does **not** meet the campaign's double bar: quiet/stratiform sites
-//! read gate-exact, convective sites miss. What the surveys established,
-//! each A/B scored on tuning sites and confirmed on holdouts that played
-//! no part in the choice:
-//!
-//! * **Coherent recombination** wins everywhere, both sets, every survey,
-//!   on levels and on presence. The documented `Recomb_dp_data` average
-//!   is the primary, uncontradicted.
-//! * **The attenuation term in the window switch** (`delta_z`) is inert:
-//!   identical scores to two decimals at every site. Kept, per the source.
-//! * **Initial system phase** is the residual's first component. Every
-//!   RDA header on the roster declares the default 60.0°, but the twins
-//!   behave like the `isdp_apply` branch is live in the fleet: the misses
-//!   concentrate in a one-sided +1-level shoulder — the signature of
-//!   leading-edge ramps climbing from 60° to the data's true system phase
-//!   while the twin's sit flat. Where the single-volume estimator
-//!   concludes, applying it recovers within-±1 and never loses; but it
-//!   concludes only in broad rain, while the RPG **persists** its
-//!   estimate across volumes in `DP_ISDP_EST` — state a single archived
-//!   volume cannot reproduce. The documented `isdp_apply = NO` default
-//!   stays primary and the finding is recorded instead of tuned around.
-//! * The rest of the residual is weak-band jitter around gradients: the
-//!   censor and the meteorological grouping both hinge on `rho_smd ≥ 0.9`
-//!   at gates where smoothed ρ sits within rounding of the threshold, and
-//!   one flipped gate moves a whole interpolation bridge. `corr_thresh`
-//!   itself is URC-adaptable per site ([0.5, 1.0]), like the ISDP store —
-//!   operational state the archive stream does not carry. Nothing
-//!   undocumented was chased.
-//!
-//! Product 163 therefore **stays a Level III fetch**; this module ships as
-//! the documented local derivation with the render path wired
-//! ([`crate::render::render_derived_kdp_to_image`], the `kdp` arm of the
-//! `render_product.rs` example on branch `campaign-harness`) and that
-//! provenance recorded.
-//!
-//! # Build 21 note (2026-07 cross-check)
-//!
-//! The CODE Build 21.0r1.7 source confirms every constant above unchanged,
-//! but B21's `dpprep.alg` defaults `metsignal_processing = ON` (CCR
-//! NA14-00100): the fleet's meteorological flag and unfold filter come from
-//! the fuzzy met signal, not `rho_smd ≥ 0.9` — see [`crate::dpprep`]'s
-//! module doc. That machinery is implemented and is the HCA chain's
-//! primary; **this module's pipeline keeps the legacy flag its survey
-//! record was measured with** (the record lives on branch
-//! `campaign-harness`; the product ships as a fetch either way), so the
-//! record and the code stay one thing. The B21-new `ra_gate` φ chain
-//! (`DPRA`, window 7) and `DPIN` feed DP QPE/CDA, not KDP.
 
 #[cfg(test)]
 use crate::dpprep::coherent_phi_rho;
@@ -200,12 +26,6 @@ pub const KDP_MIN_DISPLAY: f32 = -2.05;
 
 /// Radial-header parameters the RPG reads that a decoded
 /// [`Scan`](nexrad_model::data::Scan) does not carry.
-///
-/// [`from_archive`](Self::from_archive) extracts them from the Level II
-/// file's message 31 blocks — the same fields `dpp_format.c` reads off the
-/// base data header. All optional: a missing initial phase falls back to the
-/// documented data estimator, and missing `dBZ0`/atmos disable only the
-/// high-attenuation SNR flag (see the module doc's gap list).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KdpParams {
     /// The RDA's initial system differential phase, degrees
@@ -226,36 +46,6 @@ impl KdpParams {
     /// The render path's stand-in when only a decoded `Scan` is in hand
     /// (the model drops the radial-header blocks): fleet-typical values
     /// for the two parameters the classification cannot run without.
-    /// `dbz0` −43.5 dB sits mid-range of the RDA calibration constants
-    /// read from live archives; `atmos` −0.012 dB/km was the value at
-    /// every site surveyed (measured provenance: branch
-    /// `campaign-harness`). The
-    /// initial phase stays `None` — the documented estimator resolves it
-    /// from the data. A ±2 dB `dbz0` error moves only the no-echo boundary
-    /// at the SNR-5 dB fringe; the twin-validated paths always read the
-    /// real values via [`from_archive`](Self::from_archive).
-    ///
-    /// **Provenance, stated because this pair is original and it ships.**
-    /// Neither number is transcribed from anywhere: the ORPG reads both out of
-    /// the RDA headers and publishes no fleet-typical stand-in, so there is no
-    /// authority to check these two against. They are also not test-only —
-    /// [`crate::render`] and [`crate::derive`] both build a `KdpParams` from
-    /// this, and the same values reach the rendered HHC composite through
-    /// [`crate::hhc`], where a wrong `dbz0` is invisible rather than loud.
-    ///
-    /// Three separate honesty notes, because the three claims above have
-    /// three different standings:
-    ///
-    /// * **−43.5 dB "mid-range"** — no count of archives, no site list and no
-    ///   spread is recorded with it, here or on `campaign-harness`. It is a
-    ///   remembered reading, not a survey result.
-    /// * **−0.012 dB/km "every site surveyed"** — a real survey, whose record
-    ///   lives only on `campaign-harness`. It is a historical measurement this
-    ///   tree cannot reproduce; re-running it means checking out that branch
-    ///   and re-reading `atmos_atten` across the roster's volume headers.
-    /// * **"±2 dB moves only the SNR-5 dB fringe"** — an argument from where
-    ///   `dbz0` enters the SNR test, not a sweep. Nothing measured what a ±2 dB
-    ///   shift does to the classification, and no test bounds it.
     pub fn render_fallback() -> Self {
         Self {
             init_fdp_deg: None,
@@ -382,11 +172,6 @@ pub struct DerivedKdp {
 }
 
 impl DerivedKdp {
-    /// Resample onto the 360° × 230 km comparison grid, cell for cell the
-    /// way [`crate::twin::compare::tally_packet`] resamples the Level III
-    /// twin: the radial nearest the cell centre `az + 0.5°`, and per 1-km
-    /// cell the gate whose centre falls nearest the cell centre, earlier
-    /// gate winning ties.
     pub fn to_polar_grid(&self) -> Vec<Vec<f32>> {
         let mut grid = vec![vec![f32::NAN; RANGE_BINS]; 360];
         if self.values.is_empty() {
@@ -411,9 +196,6 @@ impl DerivedKdp {
             }
         }
 
-        // A radial only claims cells its own span covers (plus tenth-degree
-        // slack), so an incomplete sweep leaves the uncovered sector
-        // undefined instead of smearing the nearest radial across it.
         let cover = 0.5 * self.radial_width_deg + 0.05;
         for (az, row) in grid.iter_mut().enumerate() {
             let centre = az as f64 + 0.5;
@@ -451,8 +233,7 @@ fn circular_distance(a: f64, b: f64) -> f64 {
 /// Compute the tilt's KDP per the rules in the module doc: recombine the
 /// sweep's radials to 1°, unfold and smooth PhiDP, take the half least-squares
 /// slope over the 9/25-gate window selected by the 40 dBZ rule, censor on
-/// smoothed RhoHV, clamp to the product's display range. `None` when no
-/// radial carries the differential phase moment.
+/// smoothed RhoHV, clamp to the product's display range.
 pub fn compute_kdp(radials: &[Radial], params: &KdpParams) -> Option<DerivedKdp> {
     compute_kdp_impl(radials, params, KdpOptions::primary())
 }
@@ -530,9 +311,6 @@ fn process_radial(
     }
 
     let mut phi = radial.phi.clone();
-    // The legacy (metsignal-OFF) filter pair — the configuration this
-    // module's survey record was measured with; see the module doc's B21
-    // note.
     unfold_phidp(&mut phi, &radial.rho, UNFOLD_MIN_RHO, init_fdp);
 
     let rho_smd = average_filter(&radial.rho, WINDOW);
@@ -604,9 +382,6 @@ fn process_radial(
 
     (0..n)
         .map(|i| {
-            // Censor on the smoothed RhoHV (rho_prcd — the noise correction
-            // is compiled out of the released RPG), and on the recombined
-            // input φ, which is what the output moment's level keys on.
             if rho_smd[i].is_nan() || rho_smd[i] < CORR_THRESH || radial.phi[i].is_nan() {
                 return f32::NAN;
             }
@@ -628,10 +403,7 @@ fn process_radial(
 /// The documented estimator at its own scope: `calc_system_PhiDP` queues
 /// radial phases across **every cut below the fourth** (`max_elev_num`),
 /// 200 deep, not per sweep — three cuts of samples where a single sweep
-/// often falls short of the 40-radial floor. The value feeds
-/// [`KdpParams::isdp_est_deg`]; the RPG persists its own across volumes
-/// (`DP_ISDP_EST`), so using the current volume's estimate is one volume
-/// fresher than the operational value, not a different algorithm.
+/// often falls short of the 40-radial floor.
 pub fn estimate_volume_isdp(scan: &nexrad_model::data::Scan) -> Option<f32> {
     let mut queue: Vec<f64> = Vec::new();
     for sweep in scan.sweeps() {

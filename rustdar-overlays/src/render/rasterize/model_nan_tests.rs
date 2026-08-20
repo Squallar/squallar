@@ -58,7 +58,6 @@ fn a_missing_grid_point_paints_nothing() {
     }
 }
 
-/// Without this, the NaN test passes on a fixture that draws nothing.
 #[test]
 fn the_fixture_paints_when_values_are_present() {
     let alarming = grid(ModelParameter::SurfaceBasedCin, vec![-400.0; 4]);

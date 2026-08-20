@@ -66,10 +66,6 @@ fn volume(sweeps: u8) -> Arc<nexrad_model::data::Scan> {
 
 /// The progress a volume of `sweeps` cuts reports once every one of them has
 /// sealed and the volume has ended.
-///
-/// `whole` is the difference the loop-cache gate turns on: a volume assembled
-/// under `CutSelection::Tilts` reports `volume_complete` with only the cuts the
-/// selection asked for, and `whole_volume_complete` false.
 fn complete(sweeps: u8, whole: bool) -> VolumeProgress {
     VolumeProgress {
         volume: vol(42),
@@ -108,15 +104,8 @@ fn closing_round_of(sweeps: u8, whole: bool) -> PollOutcome {
     }
 }
 
-/// An app with one live KTLX pane on `product` that has already drawn the
-/// previous volume — `last_rendered` set and an image in the cache, which is
-/// exactly the state a pane sits in between volumes.
-///
-/// Deliberately started with **no chunk feed for the site**, so
-/// `chunk_feeds.snapshot` answers `None`. That is not a convenience: on the
-/// round under test the feed's live snapshot is the *new* volume with no
-/// complete cut in it, so a completed volume must be applied without
-/// consulting it at all. Reintroducing that read fails every test here.
+/// An app with one live KTLX pane on `product` that has already drawn the previous
+/// volume — `last_rendered` set and an image in the cache.
 fn app_showing_a_drawn_volume(product: RadarProduct) -> App {
     let mut app = headless(TestBridge::desktop());
     show(&mut app, product, 0.5, &[0.5, 1.0, 1.5]);
@@ -144,11 +133,6 @@ fn app_showing_a_drawn_volume(product: RadarProduct) -> App {
 
 /// **The staleness bug.** A volume that completes on a healthy feed must
 /// re-render the panes reading it.
-///
-/// Swept over every product `reads_whole_volume` names rather than a written
-/// list of the six: the predicate is what decides which panes the tilt reset
-/// declines, so those are exactly the panes for which this branch is the
-/// *only* refresh. A product added to that set is covered the day it is added.
 #[test]
 fn a_completed_volume_re_renders_every_whole_volume_pane() {
     let mut whole_volume = 0;
@@ -197,10 +181,6 @@ fn a_completed_volume_re_renders_every_whole_volume_pane() {
 }
 
 /// The rest of the branch, which is what the site reset exists to serve.
-///
-/// `scan_info` moved to the completed volume — the `ScanInfoForSite` event,
-/// the wide form, not the mid-volume merge — and the volume reached the loop
-/// cache under its own start time, which is the frame an active loop takes.
 #[test]
 fn a_completed_volume_reaches_the_scan_info_and_the_loop_cache() {
     let mut app = app_showing_a_drawn_volume(RadarProduct::EchoTopsInterpolated);
@@ -224,25 +204,10 @@ fn a_completed_volume_reaches_the_scan_info_and_the_loop_cache() {
 
 /// A completed volume **replaces** the site's scan info; it does not merge
 /// into it.
-///
-/// `apply_chunk_scan_info` is the mid-volume form: it unions the product and
-/// elevation lists, because a volume still being assembled knows only the cuts
-/// that have completed and replacing would shrink the tilt picker every few
-/// seconds. At completion the volume knows every cut it has, and the point of
-/// this branch is that the steady state after each volume is *exactly* what the
-/// archive path produces — so a tilt the previous volume had and this one does
-/// not has to go. Merging here would accumulate a union across volumes for the
-/// rest of the session, and a VCP change would never shrink it.
-///
-/// The second half is the spinner and the archive backoff, which only the wide
-/// form touches. This is the one moment the chunk feed is entitled to: a volume
-/// just finished, so a Refresh waiting on one is satisfied and the archive's
-/// retreat is over.
 #[test]
 fn a_completed_volume_replaces_the_scan_info_rather_than_merging_into_it() {
     let product = RadarProduct::EchoTopsInterpolated;
     let mut app = app_showing_a_drawn_volume(product);
-    // A tilt from the previous volume that the completed one does not carry.
     app.gui
         .pane_mut(0)
         .unwrap()
@@ -278,18 +243,10 @@ fn a_completed_volume_replaces_the_scan_info_rather_than_merging_into_it() {
 }
 
 /// Freshness is stamped from the volume that was applied, cut for cut.
-///
-/// The round's own `sealed_elevations` belong to the volume that just
-/// *started*, so pairing them with the closed volume's scan would date the new
-/// volume's cuts from the old volume's radials. The closed volume's own cuts
-/// are the only consistent pairing.
 #[test]
 fn a_completed_volume_stamps_freshness_for_its_own_cuts() {
     let mut app = app_showing_a_drawn_volume(RadarProduct::EchoTopsInterpolated);
     let mut outcome = closing_round(5);
-    // What a backoff round carries: the new volume's first cut, at an angle
-    // the closed volume also has, so a mis-pairing would still find a sweep
-    // and pass unnoticed.
     outcome.sealed_elevations = vec![1];
     outcome.sealed_angles = vec![0.5];
 
@@ -305,37 +262,9 @@ fn a_completed_volume_stamps_freshness_for_its_own_cuts() {
 }
 
 /// **A volume that is complete but not whole must not enter the loop cache.**
-///
-/// The narrow selection is the *default*: one Reflectivity pane at 0.5° yields
-/// `CutSelection::Tilts([0.5])`, so on a healthy feed every volume closes
-/// `volume_complete` with a single sweep. `cut_selection_for` keeps that off the
-/// live display by widening to `All` whenever a whole-volume product appears —
-/// but the loop cache is written unconditionally, read product-blind by
-/// `frame_data`, and never re-downloaded once `is_cached`. So a one-sweep volume
-/// cached under a Reflectivity loop is still there when the pane is switched to
-/// echo tops, and `compute_echo_tops` clamps every column to 0.5° and reports a
-/// plausible, low, wrong altitude in kft.
-///
-/// Its lifetime no longer helps: `App::evict_unneeded_loop_scans` now sweeps the
-/// cache every frame, but it keeps exactly what the live loop frames name — and
-/// a frame naming this volume is precisely the case that goes wrong — so the
-/// entry survives for as long as it can do harm. The eviction pass made this
-/// guard no less necessary, which is why it is said here rather than left to
-/// read as a note about the wholesale clear a site switch used to make.
-///
-/// Asserted on the *cache*, not on the frame list, because the cache write in
-/// `append_scan_to_active_loops` does not require an active loop — the entry is
-/// laid down whether or not anything is looping yet, and the pane that later
-/// reads it may be showing anything.
-///
-/// The live half is asserted alongside, because the two questions genuinely
-/// differ: those cuts *are* all the display asked for, so the pane still has to
-/// be refreshed. A guard that fixed the cache by skipping the whole branch would
-/// reintroduce the staleness bug for every narrow-selection site.
 #[test]
 fn a_volume_complete_only_for_its_selection_stays_out_of_the_loop_cache() {
     let mut app = app_showing_a_drawn_volume(RadarProduct::Reflectivity);
-    // One cut, complete for the tilts asked for, not a whole volume.
     let outcome = closing_round_of(1, false);
 
     app.apply_chunk_outcome("KTLX", &outcome);
@@ -358,12 +287,7 @@ fn a_volume_complete_only_for_its_selection_stays_out_of_the_loop_cache() {
     );
 }
 
-/// **A whole closed volume becomes the site's merge base** — the live
-/// writer that keeps sections and 3D standing on a complete volume across
-/// every roll without another archive download — and a volume that closed
-/// short of whole does not: a base missing cuts would put a plausible,
-/// short ladder under every whole-volume consumer for the whole next
-/// volume, with nothing to notice.
+/// **A whole closed volume becomes the site's merge base**.
 #[test]
 fn a_whole_closed_volume_becomes_the_merge_base() {
     let mut app = app_showing_a_drawn_volume(RadarProduct::Reflectivity);
@@ -418,18 +342,6 @@ fn a_whole_volume_does_reach_the_loop_cache() {
 
 /// The Level III refetch, which is the one of the three named consequences no
 /// behavioural test here can see.
-///
-/// `spawn_level3_fetches` reaches the network through `spawn_async_task` and
-/// leaves nothing behind on `App` to assert on, so this is a source probe —
-/// the same tool this module's other positional guarantees use. Deleting the
-/// call is otherwise invisible: every Level III pane on the site would simply
-/// keep the previous volume's object, because `reset_panes_for_site` dropped
-/// `level3_data` and nothing refilled it.
-///
-/// The loop append is checked from the other side, as an *absence*: mid-volume
-/// it must not happen at all. `append_polled_frame` dedupes by timestamp and a
-/// `LoopFrame` has no "the scan got better" transition, so a frame appended
-/// while the volume is still assembling freezes on the cuts it had then.
 #[test]
 fn the_completed_branch_refetches_level_three_and_owns_the_loop_append() {
     let source = include_str!("../app_chunks.rs");
@@ -471,19 +383,6 @@ fn the_completed_branch_refetches_level_three_and_owns_the_loop_append() {
 
 /// The round the coverage pattern arrives on invalidates the site's panes,
 /// even though it seals nothing.
-///
-/// Until the start chunk lands the live snapshot carries
-/// `placeholder_coverage_pattern`, whose cut table is empty, and
-/// `current::resolve` refuses a volume that cannot key its own sweeps — so
-/// every plan pane on the site drew without the live volume in it. The start
-/// chunk carries no radials, so the round it arrives on seals nothing and the
-/// early return above would take it, leaving those images in `render_cache`
-/// with nothing to drop them: `reset_panes_for_tilts` matches this round's
-/// angles, and there are none. Per-frame consumers re-resolve on their own;
-/// the drawn picture does not.
-///
-/// Probed against the source for the same reason as the test above: reaching
-/// this branch for real needs an `App`, a `Gui` and a bucket.
 #[test]
 fn a_learned_coverage_pattern_resets_the_sites_panes() {
     let source = include_str!("../app_chunks.rs");
@@ -512,17 +411,6 @@ fn a_learned_coverage_pattern_resets_the_sites_panes() {
 }
 
 /// A volume that ended *without* completing is not applied as one.
-///
-/// The gate is `progress.volume_complete`, not merely `closed.is_some()`. A
-/// volume joined mid-flight or one that lost a chunk closes with cuts missing,
-/// and `compute_echo_tops` would clamp every column to the topmost tilt that
-/// happened to arrive and report a plausible, low, wrong number in kft.
-///
-/// Driven with the scan still present, which is *not* what `roll` produces —
-/// it builds one only when the volume completed. The point is that the flag is
-/// what decides, so a `ClosedVolume` carrying both a short volume's progress and
-/// a scan is refused on the flag alone rather than by happening to have nothing
-/// to apply.
 #[test]
 fn an_incomplete_closed_volume_is_not_applied() {
     let product = RadarProduct::EchoTopsInterpolated;

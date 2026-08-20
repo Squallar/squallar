@@ -1,16 +1,5 @@
 //! The crate's charter, held as tests: a closed dependency ceiling and the
 //! graph position the crate exists to hold.
-//!
-//! Both read `cargo metadata --no-deps --format-version 1` from the workspace
-//! root. `packages[].dependencies` there are *declared* dependencies —
-//! feature-independent and resolution-independent — so no feature selection
-//! (default, `--all-features`, CI's llvm-cov arm) can mask or fake what these
-//! assert. Dep-name mechanics, recorded at M0 and relied on here: a
-//! workspace-internal dep appears with `"req": "*"` and a `path`; `kind` is
-//! `null` for normal deps (normalised to "normal" below); one name may
-//! legitimately appear once per kind, so entries are judged per
-//! `(kind, name)`. Assertions key on dependency *names*, never on feature
-//! emptiness — a later feature on either crate must not disturb them.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeSet;
@@ -40,8 +29,7 @@ fn metadata() -> serde_json::Value {
 }
 
 /// `(kind, name)` for every dependency `package` declares. `kind: null` is a
-/// normal dependency; target-gated entries carry their kind like any other and
-/// are included — a gated dependency is still a dependency.
+/// normal dependency; target-gated entries are included.
 fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, String)> {
     let packages = meta["packages"]
         .as_array()
@@ -67,13 +55,6 @@ fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, S
 
 /// The ceiling: declared `(kind, name)` pairs are a subset of the three the
 /// charter names, and the two the crate's identity rests on are really there.
-///
-/// rustdar-radar (+ log) is forced, not convenient: `VoxelShape` sits in this
-/// crate's public signatures (`grid_shape`, `volume_grid_shape`,
-/// `VOLUME_GRID_FLOOR_SHAPE`) and the wire/raster ceilings the brackets are
-/// denominated in are radar's vocabulary — parameterising those return types
-/// away is not possible without moving radar's voxel vocabulary, which is
-/// fenced.
 #[test]
 fn the_dependency_ceiling_holds() {
     let meta = metadata();
@@ -105,9 +86,7 @@ fn the_dependency_ceiling_holds() {
         );
     }
 
-    // Falsifiability floor: the crate really declares its two load-bearing
-    // dependencies, so a broken parse or a renamed package cannot pass as an
-    // empty set.
+    // Falsifiability floor: a broken parse cannot pass as an empty set.
     for (kind, name) in [("normal", "rustdar-radar"), ("dev", "serde_json")] {
         assert!(
             deps.iter().any(|(k, n)| k == kind && n == name),
@@ -118,12 +97,8 @@ fn the_dependency_ceiling_holds() {
     }
 }
 
-/// The graph shape WO-RD created stays: the app side stands on the policy
-/// floor — rustdar-app reads its budgets from here, and rustdar-egui
-/// reads the pane caps from here rather than the other way round.
-///
-/// Presence, not absence, so it doubles as this file's second falsifiability
-/// floor: a renamed package or a broken parse cannot pass it.
+/// The app side stands on the policy floor: rustdar-app reads its budgets from
+/// here, and rustdar-egui reads the pane caps from here.
 #[test]
 fn the_floor_sits_under_the_app_side() {
     let meta = metadata();

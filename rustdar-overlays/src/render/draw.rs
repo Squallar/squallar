@@ -1,6 +1,3 @@
-//! Shim: the abstract per-frame drawing primitives moved to
-//! `rustdar_source::draw` at WO-M9, with the `SourceHandler` trait whose
-//! `per_frame_points()`/`draw_point()`/`hover_text()` speak them.
-//!
-//! Glob-re-exported for the reason the sibling `fetch_policy` shim gives.
+//! Shim: the abstract per-frame drawing primitives live in `rustdar_source::draw`,
+//! glob-re-exported so there is no list to keep in step.
 pub use rustdar_source::draw::*;

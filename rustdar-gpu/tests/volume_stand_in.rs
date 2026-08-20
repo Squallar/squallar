@@ -1,30 +1,4 @@
 //! What a 3D pane **paints** while the grid for its box is still building.
-//!
-//! # Why this is an integration test and not a `#[cfg(test)]` module
-//!
-//! `BridgeVolumePainter::paint` consults `volume::support`, which folds in
-//! `volume::degrade`'s process-global surface-loss counter. That counter is
-//! deliberately never reset, and one lib test
-//! (`the_global_loss_counter_survives_and_retires_the_view`) drives it past the
-//! retirement threshold on purpose — after which every `paint` in that binary
-//! answers `Empty`, whatever the store holds. `cargo test` runs a binary's
-//! tests in parallel threads of one process, so a lib test that called `paint`
-//! would pass or fail on scheduling order. An integration test is its own
-//! process and sees a clean counter.
-//!
-//! # What it pins
-//!
-//! Scroll on a 3D pane zooms the *geography*, and the box is the pane's own
-//! viewport, so a zoom names a new `VolumeTarget` on the frame the wheel turns.
-//! The grid for that box is a resample and a GPU upload away, and — because
-//! every frame of the gesture names another box — no build in flight ever
-//! answers what the pane is currently asking for, so the wait used to last the
-//! whole scroll plus a build (12 frames over a 200 ms wheel turn, measured).
-//! The pane must keep drawing through that window — the held grid, put into the
-//! box the user just asked for — and its caption must say what is really on
-//! screen. Both halves are asserted here, and the file's shape is chosen so
-//! that neither can pass vacuously: every assertion that something *is* painted
-//! sits beside one showing the same painter answering `Empty` when it should.
 
 use std::sync::Arc;
 
@@ -41,12 +15,6 @@ const SITE: (f64, f64) = (35.33, -97.27);
 const HALF_KM: f64 = 40.0;
 
 /// A resolved grid over `HALF_KM` about `SITE`.
-///
-/// Its own copy of the scan rather than a share with `volume_bridge`'s
-/// `ready_grid`: that one is `#[cfg(test)]` inside the library and an
-/// integration binary links the library's *public* surface only. `build_voxels`
-/// is the sole constructor a `VoxelGrid` has, so a fixture here has to go
-/// through a scan whichever crate it lives in.
 fn ready_grid() -> VolumeEntry {
     use nexrad_model::data::{
         ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan,
@@ -133,7 +101,6 @@ fn ready_grid() -> VolumeEntry {
         centre: SITE,
         // A picked width, not the volume's own reach: this fixture's scan is
         // synthetic and what its gates happen to reach is not the subject.
-        // Square, because that is what the `VolumeRegion` in `target` carries.
         half_extent_km: Some(rustdar_radar::voxel::HalfExtentKm::square(HALF_KM)),
         base_km_msl: 0.0,
         top_km_msl: 10.0,
@@ -205,12 +172,6 @@ fn painter(store: Arc<VolumeStore>) -> BridgeVolumePainter {
 
 /// **The defect.** A zoom must leave a picture on screen, and the caption must
 /// describe the picture rather than the box that is still building.
-///
-/// The `Empty` assertion at the top is not decoration: it is what makes the
-/// rest of the file impossible to pass vacuously. The same painter, over the
-/// same target, answers `Empty` with an empty store and `Callback` once a grid
-/// is in hand — so a `Callback` further down cannot be an artefact of a painter
-/// that answers `Callback` to everything.
 #[test]
 fn a_zoom_keeps_a_picture_on_screen_and_the_caption_says_what_it_is() {
     let store = Arc::new(VolumeStore::new());
@@ -305,8 +266,6 @@ fn zooming_out_paints_the_middle_and_says_the_rest_is_coming() {
 
 /// A retarget the crop cannot redeem still blanks — and must, because there is
 /// no transform that makes one radar's grid an answer about another's.
-///
-/// The counterweight to every `Callback` above.
 #[test]
 fn another_radars_grid_is_still_no_picture_at_all() {
     let store = Arc::new(VolumeStore::new());

@@ -1,33 +1,14 @@
 //! Oracle tests for the Bunkers right-mover against MetPy 1.7.1
 //! (`metpy.calc.bunkers_storm_motion`), an independent implementation of the
 //! Bunkers et al. 2000 formulation.
-//!
-//! **Non-circular by construction.** The *inputs* are real VAD wind profiles
-//! this crate fitted from Level II volumes in the shared corpus; the
-//! *expected values* are MetPy's output on those identical numbers,
-//! transcribed from a MetPy run. Nothing below asserts against a rustdar
-//! constant — flipping `BUNKERS_DEVIATION_MS`, either band or the
-//! right/left sense fails these tests rather than moving them.
-//!
-//! Six volumes, three used for every judgement and three held out, spanning
-//! VCPs 12/21/31/35 and site elevations from 185 m to 883 m.
-//!
-//! Scope: this pins the *formulation* — the mean-wind layer, the two shear
-//! bands, the deviation magnitude and the right/left convention. It says
-//! nothing about whether the profile handed in is a good fit. That question
-//! has a different oracle (the RPG's own NVW product) and needs the network,
-//! so it is measured rather than asserted here.
 
 use rustdar_radar::nrot::WindProfile;
 use rustdar_radar::srv::bunkers_right_mover_uv;
 
 /// One fitted profile and what MetPy makes of it.
 struct Case {
-    /// The volume the profile was fitted from, and whether it was a decision
-    /// site or a holdout.
     volume: &'static str,
-    /// Layer winds in m/s. Index `l` is the layer centred at
-    /// `(l as f64 + 0.5) * WindProfile::LAYER_KM`.
+    /// Layer winds in m/s.
     layers: &'static [Option<(f64, f64)>],
     /// `bunkers_storm_motion(...)[0]`, the right-mover, m/s.
     metpy_right_mover: (f64, f64),
@@ -44,16 +25,12 @@ fn profile(layers: &[Option<(f64, f64)>]) -> WindProfile {
     WindProfile::from_levels(&levels).expect("a full profile builds")
 }
 
-/// Metres per second per knot, so the residual is reported in the unit the
-/// product displays.
 const MS_PER_KNOT: f64 = 0.514_444;
 
 fn knots_apart(a: (f64, f64), b: (f64, f64)) -> f64 {
     ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt() / MS_PER_KNOT
 }
 
-/// Volumes whose 0-0.5 -> 5.5-6 km shear clears rustdar's floor, so the
-/// deviation term applies and the whole formulation is exercised.
 const SHEARED: &[Case] = &[
     Case {
         volume: "DMX (decision)",
@@ -339,8 +316,6 @@ const SHEARED: &[Case] = &[
     },
 ];
 
-/// A quiet clear-air volume whose shear falls under rustdar's local floor,
-/// where rustdar deliberately departs from the published formulation.
 const CALM: Case = Case {
     volume: "HNX (decision)",
     layers: &[
@@ -389,18 +364,6 @@ const CALM: Case = Case {
     metpy_mean_wind: (0.0511171, 0.113884),
 };
 
-/// The formulation agrees with MetPy's to within the averaging convention.
-///
-/// The two differ only in how each averages a band: MetPy takes a
-/// pressure-weighted trapezoidal mean of a continuous profile, this crate
-/// takes a plain mean of its 0.3 km layer centres, which also skews each band
-/// by half a layer. Measured across the corpus that is worth about a knot and
-/// never more than ~2.
-///
-/// The bar is set just above that, and it is discriminating: widening the
-/// mean-wind layer to 8.4 km, moving either shear band by one layer, changing
-/// the deviation from 7.5 m/s, or returning the left mover all push at least
-/// one of these volumes past it.
 #[test]
 fn bunkers_right_mover_matches_metpy_on_real_vad_profiles() {
     for case in SHEARED {
@@ -418,9 +381,6 @@ fn bunkers_right_mover_matches_metpy_on_real_vad_profiles() {
     }
 }
 
-/// The deviation goes to the **right** of the shear. MetPy's left mover is
-/// the mean wind's reflection of its right mover, and ours must sit nearer
-/// the right one — a sign slip in `(S x k)` lands on the left mover exactly.
 #[test]
 fn the_deviation_is_right_of_the_shear_the_way_metpy_has_it() {
     for case in SHEARED {
@@ -440,14 +400,6 @@ fn the_deviation_is_right_of_the_shear_the_way_metpy_has_it() {
     }
 }
 
-/// Under its own shear floor rustdar returns the 0-6 km mean wind and drops
-/// the deviation term entirely. That is a departure from the published
-/// formulation rather than an arithmetic error, and this pins both halves of
-/// that sentence against MetPy: the wind rustdar falls back to is the mean
-/// wind MetPy computes, and MetPy's right mover is a further 7.5 m/s away —
-/// the whole deviation, which rustdar is not applying.
-///
-/// If the floor is ever removed, this test is the one that should fail.
 #[test]
 fn under_the_shear_floor_rustdar_returns_metpys_mean_wind_and_omits_the_deviation() {
     let ours = bunkers_right_mover_uv(&profile(CALM.layers)).expect("falls back to the mean");

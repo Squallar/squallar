@@ -1,10 +1,4 @@
 //! One sweep, one texture, however many panes are looking at it.
-//!
-//! Every assertion here is a count of uploads read off egui's own texture delta
-//! (`app::tests::drain_uploads`) rather than a timing, because the cost being
-//! removed is a `queue.write_texture` of the whole raster and the delta is
-//! exactly what produces one. A test that only checked that each pane *has* a
-//! texture passed before this change and after it.
 
 use super::*;
 use crate::app::tests::{drain_uploads, n_pane_app};
@@ -16,18 +10,10 @@ const OTHER_SITE: &str = "KMPX";
 const TILT: f32 = 0.5;
 
 /// The raster size these tests use — deliberately not `IMAGE_SIZE`.
-///
-/// Nothing here is timing anything, and a 2048² blank costs 16 MiB per fixture
-/// and a visible fraction of a second to build. What is being counted is
-/// uploads, and an upload of a small picture is one upload.
 const SIDE: usize = 4;
 
-/// Pixels whose bytes depend on `seed`, so a pane handed the wrong raster is a
-/// failed comparison rather than a coincidence of two blanks.
-///
-/// The alphas walk the three arms of `Color32::from_rgba_unmultiplied` for the
-/// reason `overlay_upload_tests` gives: `0` and `255` are early returns and
-/// `palette.rs`'s `TRANSPARENCY = 180` is the one nearly every data pixel takes.
+/// Pixels whose bytes depend on `seed`, so a pane handed the wrong raster is a failed
+/// comparison rather than a coincidence of two blanks.
 fn raster(seed: u8) -> Arc<egui::ColorImage> {
     let mut rgba = Vec::with_capacity(SIDE * SIDE * 4);
     for i in 0..(SIDE * SIDE) as u8 {
@@ -45,16 +31,15 @@ fn raster(seed: u8) -> Arc<egui::ColorImage> {
     ))
 }
 
-/// Aim a pane at `site` showing `product` at [`TILT`], far enough along that
-/// the broadcast will accept it and `apply_render_to_pane` will not bail out.
+/// Aim a pane at `site` showing `product` at [`TILT`], far enough along that the broadcast
+/// will accept it and `apply_render_to_pane` will not bail out.
 fn point_at(app: &mut crate::app::App, pane_idx: usize, site: &str, product: RadarProduct) {
     point_at_tilts(app, pane_idx, site, product, &[TILT]);
 }
 
-/// As [`point_at`], but with a volume offering more than one tilt — which is
-/// what makes a tilt change reachable at all, since
-/// `PaneState::get_rendering_params` snaps the selection onto a tilt the scan
-/// actually carries.
+/// As [`point_at`], but with a volume offering more than one tilt — which is what makes a
+/// tilt change reachable at all, since `PaneState::get_rendering_params` snaps the
+/// selection onto a tilt the scan actually carries.
 fn point_at_tilts(
     app: &mut crate::app::App,
     pane_idx: usize,
@@ -115,11 +100,6 @@ fn deliver_at(
 }
 
 /// Put a finished render on the channel **without** draining it.
-///
-/// The drain is what scopes `PlanViewUploads`, so a test that posts twice and
-/// polls twice never puts two rasters in front of one memo — which is exactly
-/// the arrangement a memo keyed on anything at all survives. Separating the
-/// post from the poll is what lets a test choose.
 fn post(
     app: &mut crate::app::App,
     pane_idx: usize,
@@ -160,11 +140,6 @@ fn placed(app: &mut crate::app::App, pane_idx: usize) -> egui::TextureId {
 }
 
 /// A split on one site is one upload, not one per pane.
-///
-/// Run at every pane count a user can reach on this path and over products
-/// from both datasources, because the broadcast is keyed on site, product and
-/// elevation and a fix that only held for Level II would be invisible against
-/// the Level III panes beside it.
 #[test]
 fn every_pane_on_one_sweep_shares_a_single_upload() {
     for product in [
@@ -210,10 +185,6 @@ fn every_pane_on_one_sweep_shares_a_single_upload() {
 }
 
 /// The shared texture holds the renderer's pixels, unchanged.
-///
-/// Sharing a handle is only sound if the handle is of *these* pixels, and the
-/// delta is the one place that can be read back — a `TextureHandle` offers an
-/// id and a size and never its contents.
 #[test]
 fn the_shared_texture_holds_the_renderers_own_pixels() {
     for product in [RadarProduct::Reflectivity, RadarProduct::EchoTops] {
@@ -244,29 +215,8 @@ fn the_shared_texture_holds_the_renderers_own_pixels() {
     }
 }
 
-/// Two panes on **different** sites get two textures, because they are two
-/// pictures — and the memo has to hold both at once to be asked the question.
-///
-/// The control for the test above: an upload count of one is only evidence of
-/// sharing if a case that must not share still costs two. A memo keyed on
-/// something coarser than the buffer's own identity — the size, the product,
-/// the pane count — passes every assertion above and paints one site's ground
-/// on another site's pane here.
-///
-/// # Both responses are posted before the single drain, and that is the test
-///
-/// `PlanViewUploads` is created **per drain**. A version of this that posted
-/// and polled twice — which is what `deliver` does — gave each raster its own
-/// memo, so no memo ever held two entries and the key was never consulted at
-/// all. Mutating `Arc::ptr_eq(seen, image)` to `seen.size == image.size` left
-/// that version green: two same-sized rasters, two lookups that never had to
-/// discriminate. It is green for the same reason a lock is never contended in
-/// a single-threaded test.
-///
-/// One drain over two rasters is the only arrangement in which the key does
-/// work, and it is also the arrangement production is in — the render channel
-/// is drained once per frame and two sites finishing in the same frame is
-/// ordinary, not contrived.
+/// Two panes on **different** sites get two textures, because they are two pictures — and
+/// the memo has to hold both at once to be asked the question.
 #[test]
 fn two_sites_in_one_drain_do_not_share_a_texture() {
     let ctx = egui::Context::default();
@@ -275,8 +225,8 @@ fn two_sites_in_one_drain_do_not_share_a_texture() {
     point_at(&mut app, 1, OTHER_SITE, RadarProduct::Reflectivity);
     let _ = drain_uploads(&ctx);
 
-    // Same dimensions, different pixels: a key that compared shape rather than
-    // identity would call these one raster.
+    // Same dimensions, different pixels: a key that compared shape rather than identity
+    // would call these one raster.
     post(&mut app, 0, RadarProduct::Reflectivity, TILT, raster(1));
     post(&mut app, 1, RadarProduct::Reflectivity, TILT, raster(2));
     app.poll_render_results(&ctx);
@@ -291,8 +241,8 @@ fn two_sites_in_one_drain_do_not_share_a_texture() {
         placed(&mut app, 1),
         "a pane on {OTHER_SITE} is drawing {SITE}'s texture"
     );
-    // And the pixels, not merely the handles: a shared handle is only wrong
-    // because of what it paints.
+    // And the pixels, not merely the handles: a shared handle is only wrong because of what
+    // it paints.
     let on_pane = |idx: usize, seed: u8| {
         let want = raster(seed);
         let got = app
@@ -310,13 +260,6 @@ fn two_sites_in_one_drain_do_not_share_a_texture() {
 }
 
 /// A resume puts every pane back with one upload.
-///
-/// `apply_render_to_pane` stores `Arc::clone(&render.image)` into each served
-/// pane's `cached_render`, so four panes on one site come out of a suspend
-/// holding four handles on one buffer. Paying four uploads to put them back is
-/// worst exactly here: on Android a resume is the frame with the least budget
-/// there is, and `restore_cached_render` exists because it is the one that must
-/// not drop.
 #[test]
 fn a_resume_puts_four_panes_back_with_one_upload() {
     let ctx = egui::Context::default();
@@ -339,8 +282,8 @@ fn a_resume_puts_four_panes_back_with_one_upload() {
         );
     }
 
-    // What a suspend, a display change or a surface loss does: every handle
-    // released, every `cached_render` deliberately kept.
+    // What a suspend, a display change or a surface loss does: every handle released, every
+    // `cached_render` deliberately kept.
     app.gui.clear_graphics_state();
     app.render.clear_last_rendered();
     let _ = drain_uploads(&ctx);
@@ -368,10 +311,6 @@ fn a_resume_puts_four_panes_back_with_one_upload() {
     }
 }
 
-/// The four products whose plan view is the same picture at every tilt, read
-/// off the predicate rather than restated — `render_cache_tests` is where that
-/// list is pinned against the renderer's own dispatch, and a second copy here
-/// would be a second thing to keep in step.
 fn tilt_independent() -> Vec<RadarProduct> {
     RadarProduct::all()
         .iter()
@@ -394,19 +333,8 @@ fn stamped_elevation(app: &mut crate::app::App, pane_idx: usize) -> f32 {
         .elevation
 }
 
-/// Clicking to another tilt on a tilt-independent pane costs no upload — and
-/// still moves the label.
-///
-/// `render_cache_key` leaves the elevation part out of all four, so the
-/// dispatch pass finds the render already there. But `needs_render` compares
-/// the raw elevation and is still true, so `apply_render_to_pane` ran anyway
-/// and put the whole raster back on the GPU to redraw a picture provably
-/// already on it.
-///
-/// The last assertion is the half that makes the first safe:
-/// `PaneState::stale_image_on_screen` reads `RadarTextureMeta::elevation` and
-/// nothing else, so an upload skipped without the restamp would leave the pane
-/// disowning its own correct picture for as long as it showed it.
+/// Clicking to another tilt on a tilt-independent pane costs no upload — and still moves
+/// the label.
 #[test]
 fn a_tilt_click_on_a_tilt_independent_pane_reuploads_nothing() {
     let products = tilt_independent();
@@ -446,19 +374,8 @@ fn a_tilt_click_on_a_tilt_independent_pane_reuploads_nothing() {
     }
 }
 
-/// The control: a pane handed genuinely different pixels still uploads them,
-/// and retires the texture it was showing — **once the new one is whole**.
-///
-/// Buffer identity is what the skip is keyed on, and this is the case that must
-/// not be caught by it. A skip keyed on anything coarser — the product, the
-/// pane, "this pane already has a texture" — passes the test above and freezes
-/// the map here.
-///
-/// The upload and the swap are separate events now, and this pins both: the
-/// pixels go to the GPU the moment the render lands, and the pane goes on
-/// drawing the sweep it has until they have all arrived. The old texture is
-/// retired by the swap and not before, which is the one thing that costs
-/// anything — see the peak-residency note in `App::apply_render_to_pane`.
+/// The control: a pane handed genuinely different pixels still uploads them, and retires
+/// the texture it was showing — **once the new one is whole**.
 #[test]
 fn a_pane_handed_a_different_raster_uploads_it() {
     let ctx = egui::Context::default();
@@ -486,8 +403,8 @@ fn a_pane_handed_a_different_raster_uploads_it() {
         uploads[0].pixels, second_raster.pixels,
         "the pane uploaded something other than the sweep it was given"
     );
-    // Uploaded, and *not yet shown*: the pane keeps a whole picture rather than
-    // filling a new one in top-down over the frames its bands take.
+    // Uploaded, and *not yet shown*: the pane keeps a whole picture rather than filling a
+    // new one in top-down over the frames its bands take.
     assert_eq!(
         placed(&mut app, 0),
         first,
@@ -505,14 +422,7 @@ fn a_pane_handed_a_different_raster_uploads_it() {
         first,
         "the pane is still drawing the previous sweep's texture"
     );
-    // And the one it stopped drawing is *gone*, not parked. Asserted against
-    // egui's own texture manager rather than against any holding pen in `App`,
-    // because being absent from there is the whole point: a meta entry lives
-    // exactly as long as some `TextureHandle` does, so this fails whether a
-    // replaced raster is kept deliberately or by accident — which is right,
-    // since neither is wanted. An `old_textures` vector used to make this false
-    // for a whole extra frame; see the note in `App::apply_render_to_pane` for
-    // why nothing has to hold a replaced handle at all.
+    // And the one it stopped drawing is *gone*, not parked.
     assert!(
         ctx.tex_manager().read().meta(first).is_none(),
         "the replaced texture is still allocated after the pane stopped drawing \

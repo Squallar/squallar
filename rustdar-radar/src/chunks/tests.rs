@@ -4,8 +4,6 @@ fn vol(n: u16) -> VolumeIndex {
     VolumeIndex::new(n).expect("valid index")
 }
 
-// -- VolumeIndex --------------------------------------------------------
-
 /// The rotation is 1..=999 inclusive, and 0 is not a volume.
 #[test]
 fn volume_indices_outside_the_rotation_are_refused() {
@@ -41,8 +39,6 @@ fn volume_prefixes_are_not_zero_padded() {
     assert_eq!(vol(10).prefix("KTLX"), "KTLX/10/");
     assert_eq!(vol(100).prefix("KTLX"), "KTLX/100/");
 }
-
-// -- ChunkId ------------------------------------------------------------
 
 /// Fails on an off-by-one in either slice: the sequence is `name[16..19]`
 /// and the type is the last character.
@@ -132,8 +128,6 @@ fn a_key_with_the_wrong_shape_is_refused() {
     }
 }
 
-// -- discovery ----------------------------------------------------------
-
 /// S3 hands directories back in UTF-8 order because the index is not
 /// zero-padded, so `10` arrives between `1` and `2`. Everything downstream
 /// treats the list as rotation order, which it only is once sorted.
@@ -167,9 +161,6 @@ fn unparseable_volume_directories_are_dropped() {
 }
 
 /// Drive `newest_by_rotation` over a canned ladder, counting probes.
-///
-/// The future is polled by hand rather than through an executor — the probe
-/// is immediate, so it never yields — mirroring `archive::tests::paginate`.
 fn search(times: &[(u16, i64)]) -> (Option<VolumeIndex>, usize) {
     let base = chrono::NaiveDate::from_ymd_opt(2026, 7, 28)
         .unwrap()
@@ -183,8 +174,6 @@ fn search(times: &[(u16, i64)]) -> (Option<VolumeIndex>, usize) {
         probes.set(probes.get() + 1);
         let at = table.get(&v.get()).copied();
         async move {
-            // A negative minute stands for a directory holding nothing
-            // readable.
             Ok(at
                 .filter(|m| *m >= 0)
                 .map(|m| base + chrono::Duration::minutes(m)))
@@ -263,8 +252,6 @@ fn a_directory_with_nothing_readable_does_not_derail_the_search() {
     assert_eq!(found, Some(vol(12)));
 }
 
-// -- decode -------------------------------------------------------------
-
 /// Neither magic sequence is present, so the bytes are named rather than
 /// guessed at.
 #[test]
@@ -294,16 +281,6 @@ fn a_start_chunk_too_short_for_its_header_does_not_panic() {
 }
 
 /// The magic bytes choose the decoder, not the name's `S`/`I`/`E` letter.
-///
-/// `ShortStartChunk` is the discriminator: it can only be reached from the
-/// volume-header route. So a short `AR2` buffer *named as an intermediate*
-/// must still produce it, and a bare LDM record *named as a start* must not
-/// — even though it is also shorter than a volume header, which is exactly
-/// what routing by filename would trip over.
-///
-/// The mis-decode this prevents is silent, not loud: an intermediate chunk
-/// has no volume header, so the header route would slice 24 bytes off the
-/// front of a real record and read a length from the middle of its payload.
 #[test]
 fn the_magic_bytes_choose_the_decoder_not_the_name() {
     let short_headered = b"AR2V0006.".to_vec();
@@ -330,8 +307,6 @@ fn the_magic_bytes_choose_the_decoder_not_the_name() {
              mis-sliced, got {outcome:?}"
     );
 }
-
-// -- assembly -----------------------------------------------------------
 
 use nexrad_model::data::{Radial, RadialStatus};
 
@@ -386,19 +361,6 @@ fn renumber(r: &Radial, elevation: u8) -> Radial {
 
 /// `volumetric::tests::golden_scan` re-sliced into the chunks the bucket
 /// actually publishes.
-///
-/// 120 radials per chunk is the real size — confirmed against the live
-/// bucket by `live_a_start_chunk_decodes_and_carries_the_coverage_pattern`
-/// — `#[ignore]`d, since it reaches the live bucket — which decodes an
-/// intermediate chunk to exactly 120, so a super-resolution
-/// cut is 6 chunks and a standard one 3. The slicing is the bucket's, not an
-/// arbitrary split.
-///
-/// Two edits the fixture needs. Sequence 1 is a synthetic start chunk
-/// carrying the VCP and no radials, which is what a real one looks like. And
-/// each sweep's last radial is rebuilt with `ElevationEnd` — `ScanEnd` on the
-/// final sweep — because the generator marks every radial
-/// `IntermediateRadialData`, so without this nothing would ever seal.
 fn golden_chunks() -> Vec<(u16, ChunkKind, ChunkContents)> {
     let scan = crate::volumetric::tests::golden_scan();
     let sweeps = scan.sweeps();
@@ -496,14 +458,6 @@ fn digest(a: &mut VolumeAssembler) -> u64 {
 
 /// **The claim this module rests on**: assembling a volume from chunks
 /// produces the same `Scan` that decoding the whole volume does.
-///
-/// Driven through `compute_echo_tops` and pinned on
-/// `volumetric::tests::golden_echo_tops_grid_is_pinned`'s own digest, so it
-/// exercises gridding, newest-wins dedup, beam heights and interpolation and
-/// demands bit-identity — not merely "some sweeps arrived". The NaN
-/// assertion additionally pins that ascending elevation-number order
-/// reproduces newest-wins, which is the invariant `find_sweep`'s `.rev()`
-/// and `VolumeCube` both stand on.
 #[test]
 fn the_assembled_golden_volume_reproduces_the_pinned_digest() {
     let mut a = assemble(golden_chunks());
@@ -536,21 +490,6 @@ fn the_assembled_golden_volume_reproduces_the_pinned_digest() {
 }
 
 /// A chunk-fed volume places its own radar.
-///
-/// Every Message 31 carries a Volume Data Block, including the ones the
-/// real-time feed publishes, and until [`ChunkContents::site`] existed the
-/// position in it was decoded and dropped: the snapshot went out through
-/// `Scan::new` with no site on it, so `ScanInfo::from_scan` skipped its first
-/// rung and a live feed for a radar this install had never opened fell back to
-/// whatever the catalogue could say about it. Now the first chunk that states
-/// a position puts it on every snapshot, and `from_scan` reaches
-/// [`SitePositionSource::Volume`] with it — from an **empty** site table,
-/// which is what a fresh install has.
-///
-/// The two fixtures land on chunks 2 and 3, both of which carry radials: the
-/// claim is that the first chunk to *state* a position wins, not that the
-/// start chunk is special. The start chunk carries message 5 and no radials
-/// and states nothing.
 #[test]
 fn a_chunk_fed_snapshot_carries_the_position_its_chunks_stated() {
     let stated = nexrad_model::meta::Site::new(*b"KTLX", 35.33306, -97.2775, 370, 20);
@@ -572,9 +511,6 @@ fn a_chunk_fed_snapshot_carries_the_position_its_chunks_stated() {
         crate::site_position::SitePositionSource::Volume,
         "a chunk-fed scan that states its position must place itself from it",
     );
-    // Against `from_volume`'s own answer rather than against the `f32` literals
-    // above: the rounding to micro-degrees happens there and once, and pinning
-    // the decimals here would be pinning that conversion a second time.
     assert_eq!(
         info.site_position,
         crate::site_position::SitePosition::from_volume(&stated),
@@ -588,8 +524,6 @@ fn a_chunk_fed_snapshot_carries_the_position_its_chunks_stated() {
 #[test]
 fn a_shuffled_chunk_order_assembles_the_same_volume() {
     let mut chunks = golden_chunks();
-    // A fixed permutation rather than a random one: no `rand` dependency,
-    // and a failure reproduces.
     let mid = chunks.len() / 2;
     let mut shuffled: Vec<_> = Vec::with_capacity(chunks.len());
     let back = chunks.split_off(mid);
@@ -692,21 +626,7 @@ fn a_terminator_without_the_radial_count_does_not_seal() {
     );
 }
 
-/// The final cut of a volume carries `ScanEnd`, not `ElevationEnd`. Reading
-/// only `ElevationEnd` leaves the topmost cut open forever, so
-/// `volume_complete` never fires and everything gated on it — echo tops, the
-/// Level III refetch, the loop append — is dead.
-///
-/// **This is only half of that claim, and the half it is not covers a bug that
-/// shipped.** Everything here stops at the assembler: the flag is read off
-/// `VolumeAssembler::progress` in the same breath as `snapshot`, so of course
-/// the two agree. What the frontend actually reads is
-/// `PollOutcome::closed`, produced one layer up by [`ChunkPoller::roll`] —
-/// which for a long time reported the completion and dropped the volume in the
-/// same statement, so the flag fired and everything gated on it was dead
-/// anyway. `a_roll_hands_back_the_volume_it_closed` is the missing layer, and
-/// any future claim of the form "`volume_complete` reaches a reader" belongs
-/// there rather than here.
+/// The final cut of a volume carries `ScanEnd`, not `ElevationEnd`.
 #[test]
 fn the_final_cut_seals_on_scan_end() {
     let mut a = assemble(golden_chunks());
@@ -720,18 +640,6 @@ fn the_final_cut_seals_on_scan_end() {
     let _ = a.snapshot();
 }
 
-/// **A roll must hand back the volume whose completion it reports.**
-///
-/// [`ChunkPoller::roll`] is the only producer of [`PollOutcome::closed`], and
-/// both callers set that field in the same statement that replaces the
-/// assembler [`ChunkPoller::snapshot`] reads. Whatever the roll does not hand
-/// back is gone: the caller learns a volume completed at the exact instant it
-/// can no longer read it, and everything gated on `volume_complete` — echo
-/// tops, the Level III refetch, the loop append — is dead on a healthy feed.
-///
-/// Asserted against the *live* snapshot as well, because that is the read the
-/// frontend used to make and the number it got back. Reverting `roll` to
-/// return only [`VolumeProgress`] cannot pass this.
 #[test]
 fn a_roll_hands_back_the_volume_it_closed() {
     let mut poller = ChunkPoller::new("KTLX");
@@ -754,8 +662,6 @@ fn a_roll_hands_back_the_volume_it_closed() {
         expected,
         "the roll reported a completed volume and did not hand it over"
     );
-    // And the scan really is the volume the progress describes, not some
-    // other one: same cuts, in the same order.
     let handed: Vec<u8> = scan.sweeps().iter().map(|s| s.elevation_number()).collect();
     assert_eq!(
         handed, closed.progress.sealed_elevations,
@@ -772,28 +678,8 @@ fn a_roll_hands_back_the_volume_it_closed() {
 
 /// A volume that closed short reports the cuts it lost and hands back **no
 /// scan**.
-///
-/// No scan because nothing reads one: every consumer gates on
-/// `volume_complete` first, and building it would deep-copy every sealed
-/// `Sweep` — `close` clears [`VolumeAssembler::snapshot`]'s cache exactly when
-/// it abandoned a cut, so the cold rebuild landed precisely on the volumes that
-/// get discarded.
-///
-/// This deliberately gives up a guarantee an earlier version of this test
-/// asserted — that a partial cut is absent from the scan a short close hands
-/// over — because there is now no such scan to inspect. Nothing consumed it. The
-/// underlying property is unchanged and still pinned where it belongs, on
-/// `snapshot` itself, by `a_partial_cut_never_reaches_the_snapshot`.
-///
-/// The mutation this kills is `roll` reading `progress()` instead of `close()`:
-/// the still-`Open` cut would be missing from `progress.abandoned`, so a caller
-/// asking "what is this volume missing?" would be told "nothing". Verified by
-/// mutation, along with the discovery that the *order* of `close` and `snapshot`
-/// is not observable and so is not claimed to be.
 #[test]
 fn a_roll_leaves_an_abandoned_cut_out_of_the_scan_it_hands_back() {
-    // Drop the chunk carrying the 0.5° cut's terminator, so that cut is still
-    // open when the volume closes.
     let mut chunks = golden_chunks();
     let dropped = chunks
         .iter()
@@ -826,14 +712,6 @@ fn a_roll_leaves_an_abandoned_cut_out_of_the_scan_it_hands_back() {
     );
 }
 
-/// **`volume_complete` is not "whole", and `roll` reports both.**
-///
-/// Under a narrow [`CutSelection`] a volume completes on the cuts it was asked
-/// for — one, for a single 0.5° pane, which is the *default* layout. That is the
-/// right answer for the tilts on screen and the wrong one for anything that
-/// integrates the column, and the two used to be one flag, leaving the
-/// distinction to callers. A frontend that cached such a volume for its loops
-/// then handed it to echo tops the moment the pane changed product.
 #[test]
 fn a_narrow_selection_completes_without_the_volume_being_whole() {
     let narrow = CutSelection::Tilts(vec![0.5]);
@@ -865,14 +743,6 @@ fn a_narrow_selection_completes_without_the_volume_being_whole() {
 
 /// A volume assembled the way a 0.5°-only feed assembles one: the start chunk,
 /// both halves of the 0.5° split cut, and the volume's terminator.
-///
-/// The terminator is the faithful part. It carries the *final* cut's radials,
-/// and it arrives even under a narrow selection because its sequence runs past
-/// the planned ranges the coverage pattern implies — SAILS and MRLE inserts are
-/// not in message 5, so real sequence numbers overrun the map, and
-/// `ElevationChunkMap::wants` deliberately answers `true` for anything it cannot
-/// place. That is what lets a narrow volume ever see `ScanEnd` and so ever
-/// report complete, and it is also why the top cut is present but partial.
 fn narrow_volume(selection: &CutSelection) -> VolumeAssembler {
     let vcp = vcp_with(&[(0.5, true), (0.5, true), (4.0, false), (6.0, false)]);
     let map = ElevationChunkMap::from_coverage_pattern(&vcp).expect("cuts");
@@ -896,9 +766,6 @@ fn narrow_volume(selection: &CutSelection) -> VolumeAssembler {
     );
 
     let scan = crate::volumetric::tests::golden_scan();
-    // Both 0.5° cuts, each ending on `ElevationEnd`, at the sequences the map
-    // places them at — checked against `wants_chunk`, so the fixture cannot
-    // quietly stop being what a narrow feed downloads.
     let mut sequence = 2u16;
     for elevation in [1u8, 2u8] {
         let sweep = &scan.sweeps()[0];
@@ -994,10 +861,6 @@ fn a_whole_volume_reports_both_flags() {
 
 /// A volume joined mid-flight is complete for a narrow selection that happens
 /// to want only cuts it caught, and is still not whole.
-///
-/// The contiguity clause is what separates them. Without it the missing lower
-/// cuts would be invisible and `compute_echo_tops` would integrate tilts 3..23
-/// and report every column's top far too low.
 #[test]
 fn a_volume_joined_mid_flight_is_never_whole() {
     let chunks: Vec<_> = golden_chunks()
@@ -1015,13 +878,6 @@ fn a_volume_joined_mid_flight_is_never_whole() {
 
 /// One closing round describes **two** volumes, which is why the closed one
 /// cannot be represented by the live snapshot.
-///
-/// This is the shape `poll` produces whenever the probe round finds the new
-/// directory already filling — after an error backoff of up to
-/// [`MAX_BACKOFF`], several cuts' worth. A consumer that trusted
-/// `closed.volume_complete` and then read the snapshot got a one-cut volume:
-/// no error, no NaN, a plausible wrong answer from every product
-/// [`crate::types::RadarProduct::reads_whole_volume`] names.
 #[test]
 fn a_closing_round_can_also_seal_a_cut_of_the_new_volume() {
     let mut poller = ChunkPoller::new("KTLX");
@@ -1029,8 +885,6 @@ fn a_closing_round_can_also_seal_a_cut_of_the_new_volume() {
     let closed = poller.roll(vol(43)).expect("a volume was open");
     assert!(closed.progress.volume_complete);
 
-    // What `poll` does next in the same round: list the new volume's
-    // directory and ingest whatever is already in it.
     let current = poller.current.as_mut().expect("the roll started one");
     let mut sealed: Vec<u8> = Vec::new();
     for (sequence, kind, contents) in golden_chunks() {
@@ -1075,9 +929,7 @@ fn a_cut_is_reported_sealed_on_the_chunk_that_finishes_it() {
 }
 
 /// A volume joined mid-flight has no entry for the cuts that finished before
-/// the first chunk arrived. Without the contiguity clause it would report
-/// complete, and `compute_echo_tops` would integrate only the upper tilts
-/// and report every column's top far too low.
+/// the first chunk arrived.
 #[test]
 fn a_volume_joined_mid_flight_never_reports_complete() {
     let chunks: Vec<_> = golden_chunks()
@@ -1103,8 +955,6 @@ fn late_radials_for_a_sealed_cut_are_dropped() {
     let mut a = assemble(golden_chunks());
     let before = a.snapshot();
     let replay = golden_chunks();
-    // Re-deliver one cut's chunks under fresh sequence numbers so the
-    // idempotence check does not short-circuit them.
     let mut next_sequence = 900u16;
     for (_, kind, contents) in replay {
         if contents
@@ -1156,20 +1006,6 @@ fn the_snapshot_is_shared_until_a_cut_seals() {
 
 /// The start chunk arriving late must reach the served volume, not just the
 /// assembler's field.
-///
-/// The start chunk is the only carrier of message 5, and a listed-then-missing
-/// key is ordinary — S3 is eventually consistent, and `fetch_disposition`
-/// answers `Skip` — so a cut can seal while the coverage pattern is still
-/// absent. The snapshot then carries `placeholder_coverage_pattern`, whose cut
-/// table is empty, and `current::resolve` drops an overlay that cannot key its
-/// own sweeps. That is deliberate *while the pattern is unknown*; what was not
-/// deliberate is that learning the pattern did not invalidate the cache, so
-/// every reader kept getting the placeholder `Scan` and the live volume stayed
-/// discarded until the next seal — one cut later — happened to rebuild it.
-///
-/// Asserted on the volume actually served, and through `resolve`, because the
-/// failure is the silent kind: `coverage_pattern` is set, the round reports a
-/// sealed cut, nothing errors, and the map under-draws.
 #[test]
 fn a_late_start_chunk_reaches_the_snapshot_rather_than_the_next_seal() {
     let mut a = VolumeAssembler::new("KTLX", vol(42));
@@ -1182,9 +1018,6 @@ fn a_late_start_chunk_reaches_the_snapshot_rather_than_the_next_seal() {
         ChunkKind::Start,
         "the fixture's start chunk is sequence 1, and it is the one held back"
     );
-    // Carrying a pattern with a real cut table, unlike `volumetric::tests::vcp`,
-    // whose table is empty: an empty one is what the *placeholder* looks like,
-    // so the two would be indistinguishable exactly where this test looks.
     let start = (
         chunks[0].0,
         ChunkKind::Start,
@@ -1270,8 +1103,6 @@ fn a_chunk_from_another_volume_is_refused() {
     assert_eq!(a.progress().sealed_elevations, sealed_before);
     assert_eq!(a.progress().chunks_ingested, 1);
 }
-
-// -- poller -------------------------------------------------------------
 
 /// Seed a poller's assembler with one chunk so it has a volume time.
 fn primed(volume: VolumeIndex) -> ChunkPoller {
@@ -1435,10 +1266,6 @@ fn the_interval_backs_off_on_failure_and_on_quiet_but_not_on_progress() {
     assert_eq!(p.suggested_interval(), POLL_INTERVAL);
 }
 
-/// A notification for a newer volume rolls the assembler without any probe —
-/// the chunk's own name carries the volume start time, which is what
-/// distinguishes a new volume from the previous pass through the same
-/// rotating index.
 #[test]
 fn a_notified_chunk_from_a_newer_volume_rolls_the_assembler() {
     let p = primed(vol(42));
@@ -1447,8 +1274,6 @@ fn a_notified_chunk_from_a_newer_volume_rolls_the_assembler() {
         .to_string();
     let next = ChunkId::parse("KTLX", vol(43), &format!("{later}-001-S")).expect("parses");
 
-    // `plan` would have said `Fill` — the current volume has not ended — so
-    // this roll comes from the notification alone.
     assert_eq!(p.plan(volume_time()), PollPlan::Fill { volume: vol(42) });
     assert!(
         p.should_roll_to(&next),
@@ -1481,12 +1306,6 @@ fn a_notified_chunk_of_the_current_volume_is_just_ingested() {
 
 /// Feed one chunk through the poller's assembler the way a round's ingest arm
 /// does, folding what sealed into the round's outcome.
-///
-/// A copy of production's fold, because a real round needs a bucket and this
-/// crate has no seam to fake one. It can therefore drift from the fold it
-/// mirrors: what holds the two together is
-/// `both_round_paths_warm_the_snapshot_before_they_return`, which reads the
-/// real methods rather than this one.
 fn round_ingest(
     p: &mut ChunkPoller,
     outcome: &mut PollOutcome,
@@ -1505,13 +1324,6 @@ fn round_ingest(
 }
 
 /// The round the start chunk lands on reports the pattern it brought.
-///
-/// Without this the flag dies in [`IngestOutcome`]: the round seals nothing —
-/// a start chunk carries no radials — so a caller gating on
-/// `sealed_elevations` learns nothing happened, and every image drawn while
-/// the pattern was the placeholder stays on screen. The invalidation the
-/// frontend does with it is pinned in
-/// `app_chunks::volume_close_tests::a_learned_coverage_pattern_resets_the_sites_panes`.
 #[test]
 fn the_round_the_coverage_pattern_arrives_on_says_so() {
     let mut p = ChunkPoller::resume("KTLX", vol(42));
@@ -1551,10 +1363,6 @@ fn the_round_the_coverage_pattern_arrives_on_says_so() {
     );
 }
 
-/// A round that seals rebuilds the snapshot cache before it returns, so the
-/// caller's first `snapshot()` after the round — the frame thread's, applying
-/// the outcome — is an `Arc` clone rather than a deep copy of every sealed
-/// gate byte.
 #[test]
 fn a_sealing_round_leaves_the_snapshot_cache_warm() {
     let mut p = ChunkPoller::resume("KTLX", vol(42));
@@ -1592,8 +1400,6 @@ fn a_sealing_round_leaves_the_snapshot_cache_warm() {
 #[test]
 fn a_round_that_seals_nothing_leaves_the_cache_untouched() {
     let mut p = primed(vol(42));
-    // `primed` ingests one radial chunk and seals nothing, so the cache
-    // starts cold.
     let quiet = PollOutcome::default();
     p.warm_snapshot(&quiet);
     assert!(
@@ -1611,12 +1417,6 @@ fn a_round_that_seals_nothing_leaves_the_cache_untouched() {
 }
 
 /// Warming is a cache fill, not a cache pin.
-///
-/// `the_snapshot_is_shared_until_a_cut_seals` pins that a seal invalidates a
-/// cache a *caller* filled. What is new here is the poller-filled one: a cache
-/// nothing asked for could otherwise go on being served past the cut that
-/// obsoletes it, which would make warming a staleness bug rather than a saved
-/// copy. The re-warm after the second seal carries the new cut.
 #[test]
 fn a_seal_after_warming_still_invalidates_the_cache() {
     let mut p = ChunkPoller::resume("KTLX", vol(42));
@@ -1653,8 +1453,6 @@ fn a_seal_after_warming_still_invalidates_the_cache() {
         !std::sync::Arc::ptr_eq(&warmed, &after),
         "a snapshot warmed last round survived a seal"
     );
-    // Counted off what the round reported rather than assuming the span seals
-    // exactly one cut, so re-slicing the fixture cannot quietly weaken this.
     assert_eq!(
         after.sweeps().len(),
         warmed.sweeps().len() + next_round.sealed_elevations.len(),
@@ -1663,13 +1461,6 @@ fn a_seal_after_warming_still_invalidates_the_cache() {
 }
 
 /// A volume that completed is still reported when the very next fetch fails.
-///
-/// `roll` closes a volume by replacing the assembler `snapshot` reads, so the
-/// `ClosedVolume` in the outcome is the only way back to it. Both round paths
-/// roll before they fetch, and an `Err` return drops the outcome — so the
-/// volume went missing entirely, while the caller saw what looked like an
-/// ordinary transient failure. Nothing anywhere said a finished volume had been
-/// thrown away.
 #[test]
 fn a_volume_that_closed_survives_the_round_that_failed_after_it() {
     let mut p = ChunkPoller::new("KTLX");
@@ -1729,22 +1520,12 @@ fn a_volume_that_closed_survives_the_round_that_failed_after_it() {
 
 /// A second volume closing before the first was delivered queues behind it —
 /// neither is overwritten.
-///
-/// The state this needs was argued unreachable when the park was a single slot,
-/// and the argument was wrong: a round that ingests a chunk and *then* fails
-/// leaves through `Err`, re-parking as it goes, so the assembler has a volume
-/// time while a volume is still parked. From there `should_roll_to` is true and
-/// the next roll had nowhere to put its volume that did not discard the first —
-/// the exact loss the park exists to prevent, reintroduced by it.
 #[test]
 fn a_second_volume_closing_queues_behind_the_first_rather_than_replacing_it() {
     let mut p = ChunkPoller::new("KTLX");
     p.current = Some(assemble(golden_chunks()));
 
     // Round 1 rolls to V43 and fails.
-    // `roll` reports the volume it *closed*, so the two rounds assemble at
-    // different indices — otherwise both reports read 42 and every assertion
-    // below is satisfied by either volume, which is no test at all.
     let mut first = PollOutcome::default();
     let closed = p.roll(vol(43));
     p.deliver_or_queue(&mut first, closed);
@@ -1756,8 +1537,6 @@ fn a_second_volume_closing_queues_behind_the_first_rather_than_replacing_it() {
     p.park_for_next_round(&mut first);
     drop(first);
 
-    // Round 2 drains 42's report, assembles 43, and fails after ingesting —
-    // which is what puts a volume time on the assembler with one still parked.
     let mut second = PollOutcome {
         closed: p.pending_closed.pop_front(),
         ..Default::default()
@@ -1802,9 +1581,6 @@ fn a_second_volume_closing_queues_behind_the_first_rather_than_replacing_it() {
 }
 
 /// The body of one `ChunkPoller` method, for the placement probes below.
-///
-/// A method's own closing brace is the first one at four-space indentation
-/// after its signature; everything nested inside closes deeper.
 fn poller_method(signature: &str) -> &'static str {
     let source = include_str!("../chunks.rs");
     let start = source
@@ -1819,14 +1595,7 @@ fn poller_method(signature: &str) -> &'static str {
 
 /// **The placement is the whole slice.** Every other test here calls
 /// `warm_snapshot` by hand, so all of them pass with the production calls
-/// deleted and the frame thread back to paying the rebuild. Only the
-/// `#[ignore]`d live test reaches the real round, so without this nothing in a
-/// default run notices the calls going missing.
-///
-/// Probed against the source in the pattern
-/// `app_chunks::volume_close_tests::the_completed_branch_refetches_level_three_and_owns_the_loop_append`
-/// uses, because the alternative — a fake `DataSources` — is a bucket
-/// transport this crate has no seam for.
+/// deleted and the frame thread back to paying the rebuild.
 #[test]
 fn both_round_paths_warm_the_snapshot_before_they_return() {
     for signature in ["pub async fn poll(", "pub async fn fetch_notified("] {
@@ -1842,17 +1611,6 @@ fn both_round_paths_warm_the_snapshot_before_they_return() {
 const WARM_CALL: &str = "self.warm_snapshot(&outcome);";
 
 /// And the *failing* round warms it too.
-///
-/// A chunk mid-round can seal a cut and a later chunk's download can then abort
-/// the round. The seal has already cleared the cache, so returning from inside
-/// the loop leaves exactly the rounds a flaky network produces paying the
-/// rebuild on the paint path — the stall taken off the happy path and left on
-/// the bad one.
-///
-/// Both positions are asserted separately because `poll` holds two warm calls
-/// and a bare `contains` over the whole method would be satisfied by either
-/// one: deleting the epilogue's call would leave the error arm's, and read
-/// green.
 #[test]
 fn the_aborting_round_warms_the_snapshot_before_it_returns_the_error() {
     let poll = poller_method("pub async fn poll(");
@@ -1882,12 +1640,6 @@ fn the_aborting_round_warms_the_snapshot_before_it_returns_the_error() {
 
 /// Every way a round can fail parks the closed volume first, and every round
 /// starts by picking up whatever a previous one parked.
-///
-/// The behavioural test above drives the park by hand, so it passes with either
-/// call site deleted; these two error paths are the only places the loss can be
-/// reintroduced, and a new fallible call before the epilogue would be a third.
-/// Adjacency is asserted rather than mere presence, so a park that drifts above
-/// an intervening early return does not read as covered.
 #[test]
 fn every_failing_round_parks_the_closed_volume_and_every_round_collects_it() {
     const PARK: &str = "self.park_for_next_round(&mut outcome);";
@@ -1900,8 +1652,6 @@ fn every_failing_round_parks_the_closed_volume_and_every_round_collects_it() {
                  round, so a parked one is never delivered"
             )
         });
-        // Position, not presence: a drain below an early return is a drain that
-        // round never reaches.
         let first_return = body.find("return ").unwrap_or(body.len());
         assert!(
             drain < first_return,
@@ -1909,11 +1659,6 @@ fn every_failing_round_parks_the_closed_volume_and_every_round_collects_it() {
                  returned, so that exit delivers nothing"
         );
 
-        // `?` would return without parking and the loop below would not see it,
-        // which is precisely how this loss comes back: one
-        // `list_chunks(..).await?` after the roll is enough. Covers the operator
-        // in the forms that reach a fallible call — the only `?` either body may
-        // otherwise hold is the `{e:?}` of a log line.
         for operator in ["?;", "await?", ")?"] {
             assert!(
                 !body.contains(operator),
@@ -1950,8 +1695,6 @@ fn every_failing_round_parks_the_closed_volume_and_every_round_collects_it() {
         );
     }
 }
-
-// -- selective download --------------------------------------------------
 
 /// A VCP whose first `super_res` cuts are half-degree and the rest standard,
 /// which is the shape every real pattern has.
@@ -2004,14 +1747,6 @@ fn vcp_with(cuts: &[(f32, bool)]) -> VolumeCoveragePattern {
 }
 
 /// The feed's slack stays wider than the renderer's match window.
-///
-/// These two were once the same 0.3, and the comment here cited
-/// `find_sweep` as the reason. They answer different questions: the
-/// renderer compares a request against a sweep already flown and can be
-/// exact, while this compares it against the VCP's *planned* angle for a cut
-/// that has not been downloaded — the decision being what to skip. The
-/// errors are asymmetric too, so when the renderer's window narrowed this
-/// one deliberately did not follow it down.
 #[test]
 fn the_feeds_slack_stays_wider_than_the_renderers_window() {
     assert!(
@@ -2021,8 +1756,6 @@ fn the_feeds_slack_stays_wider_than_the_renderers_window() {
         crate::render::ELEVATION_WINDOW,
     );
 
-    // Concretely: a planned cut a quarter of a degree from the selection is
-    // further off than the renderer would accept, and is fetched anyway.
     let vcp = vcp_with(&[(0.5, true), (0.75, true)]);
     let map = ElevationChunkMap::from_coverage_pattern(&vcp).expect("cuts");
     let (second, angle) = map.cut_for(8).expect("the second cut starts at sequence 8");
@@ -2039,12 +1772,6 @@ fn the_feeds_slack_stays_wider_than_the_renderers_window() {
 }
 
 /// A site that points its lowest cut below the horizon can still ask for it.
-///
-/// The VCP carries the angle unsigned, so KMSX declares its base tilt as
-/// 359.82° while its radials report −0.124°. Taken at face value that cut is
-/// 360° from any angle a user could select, so under a narrow
-/// [`CutSelection`] it would never be wanted, never downloaded, and the
-/// lowest tilt of a mountain-top site would stay empty for good.
 #[test]
 fn a_cut_below_the_horizon_is_wanted_by_the_angle_it_actually_points_at() {
     let vcp = vcp_with(&[(359.82, true), (0.48, true), (0.88, true)]);
@@ -2068,18 +1795,12 @@ fn a_cut_below_the_horizon_is_wanted_by_the_angle_it_actually_points_at() {
         "and that cut is the one the volume must wait for",
     );
 
-    // The rest of the pattern is unaffected: a positive selection does not
-    // suddenly reach the sub-horizon cut.
     assert!(
         !map.wants(2, &CutSelection::Tilts(vec![0.9])),
         "0.9° must not reach the cut below the horizon",
     );
 }
 
-/// The mapping this rests on, against the volume shape measured on the live
-/// bucket: KTLX VCP 35, twelve cuts, six chunks each for the six
-/// super-resolution ones and three for the six standard ones, sealing on
-/// sequences 7, 13, 19, 25, 31, 37, 40, 43, 46, 49, 52, 55.
 #[test]
 fn the_chunk_map_reproduces_a_measured_volume() {
     let mut cuts: Vec<(f32, bool)> = (0..6).map(|i| (0.5 + i as f32 * 0.4, true)).collect();
@@ -2151,8 +1872,6 @@ fn the_start_chunk_is_always_wanted() {
     let vcp = vcp_with(&[(0.5, true), (4.0, false)]);
     let map = ElevationChunkMap::from_coverage_pattern(&vcp).expect("cuts");
     assert!(map.wants(1, &CutSelection::Tilts(vec![90.0])));
-    // And so is a sequence past the end of the pattern — skipping something
-    // unplaceable would be guessing.
     assert!(map.wants(999, &CutSelection::Tilts(vec![90.0])));
 }
 
@@ -2196,8 +1915,6 @@ fn a_selective_volume_completes_on_the_cuts_it_asked_for() {
     let mut a = VolumeAssembler::new("KTLX", vol(42));
     a.set_selection(CutSelection::Tilts(vec![0.5]));
 
-    // Start chunk carrying the pattern, then the 0.5° cut, then the volume
-    // ends — cuts 2 and 3 never arrive because they were never fetched.
     a.ingest_contents(
         1,
         ChunkKind::Start,
@@ -2247,13 +1964,6 @@ fn a_selective_volume_completes_on_the_cuts_it_asked_for() {
 
 /// The pairing that keeps a selective volume away from `compute_echo_tops`:
 /// under `All`, a volume with a hole is not complete.
-///
-/// Contiguity is what carries this rather than the planned cut list, and
-/// deliberately so — SAILS and MRLE cuts are inserted at runtime, so the
-/// number of sweeps a volume produces need not match the number its message 5
-/// lists, and requiring the planned set could leave a volume that will never
-/// complete. `ScanEnd` marks the true final cut, so seeing it with 1..=n
-/// sealed and no gaps genuinely is the whole volume.
 #[test]
 fn a_volume_with_a_hole_is_incomplete_when_everything_was_asked_for() {
     let scan = crate::volumetric::tests::golden_scan();
@@ -2270,8 +1980,6 @@ fn a_volume_with_a_hole_is_incomplete_when_everything_was_asked_for() {
         },
     );
 
-    // Every cut but the second, with the last radial of the last one marking
-    // the end of the volume — the shape a lost chunk leaves behind.
     let sweeps = scan.sweeps();
     let mut sequence = 2u16;
     for (si, sweep) in sweeps.iter().enumerate() {
@@ -2348,16 +2056,9 @@ fn widening_the_selection_makes_the_skipped_chunks_wanted_again() {
     );
 }
 
-// -- live ---------------------------------------------------------------
-//
-// Run with:
-//   cargo test -p rustdar-radar --lib -- --ignored --nocapture chunks::tests::live_
-
 /// The claim this whole module rests on, mirroring
 /// `archive::tests::live_listing_needs_no_credentials` — which is `#[ignore]`d
-/// too, so neither side of the mirror runs by default. If the chunk bucket
-/// ever required signing, every other live test here would fail with a
-/// confusing decode error while this one names the cause.
+/// too, so neither side of the mirror runs by default.
 #[ignore = "hits the live unidata-nexrad-level2-chunks S3 bucket"]
 #[tokio::test]
 async fn live_chunk_bucket_allows_anonymous_listing() {
@@ -2378,11 +2079,6 @@ async fn live_chunk_bucket_allows_anonymous_listing() {
 }
 
 /// Discovery lands on a volume the radar is actually writing.
-///
-/// Catches the bucket dropping `CommonPrefixes`, the search regressing to a
-/// linear scan, the name format changing, and — the reason the ladder is
-/// sorted numerically — a regression to lexicographic order, which would
-/// pick a volume hours or days stale.
 #[ignore = "hits the live unidata-nexrad-level2-chunks S3 bucket"]
 #[tokio::test]
 async fn live_discovery_finds_a_current_volume() {
@@ -2459,11 +2155,6 @@ async fn live_a_volume_starts_at_sequence_one_and_is_ordered() {
 }
 
 /// The poller end to end: discover, fill, seal.
-///
-/// Two rounds a few seconds apart, which is the cadence the frontend will
-/// drive. Prints the age of each cut's freshest radial at the moment it
-/// became renderable — **the measurement the whole feature is for**, against
-/// the archive path's five to seven minutes.
 #[ignore = "hits the live unidata-nexrad-level2-chunks S3 bucket"]
 #[tokio::test]
 async fn live_a_few_poll_rounds_assemble_and_seal() {
@@ -2471,9 +2162,6 @@ async fn live_a_few_poll_rounds_assemble_and_seal() {
     crate::tls::init();
     let mut poller = ChunkPoller::new("KTLX");
 
-    // Polled to a deadline rather than a fixed round count: a cut is 3 or 6
-    // chunks and the radar takes ~30-40 s over one, so a handful of rounds
-    // can legitimately seal nothing.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
     let mut total_sealed = 0usize;
     let mut round = 0;
@@ -2481,8 +2169,6 @@ async fn live_a_few_poll_rounds_assemble_and_seal() {
         round += 1;
         let outcome = poller.poll(&sources).await.expect("a poll round");
         if !outcome.sealed_elevations.is_empty() {
-            // The end of a sealing round is where `warm_snapshot` runs; this
-            // is the one test that reaches it through the real `poll`.
             assert!(
                 poller
                     .current
@@ -2604,12 +2290,6 @@ async fn live_a_start_chunk_decodes_and_carries_the_coverage_pattern() {
             !contents.radials.is_empty(),
             "an intermediate chunk decoded to no radials"
         );
-        // The bucket's own answer to "does a headerless chunk still say where
-        // its radar is?" — the fixture-based
-        // `a_chunk_fed_snapshot_carries_the_position_its_chunks_stated` cannot
-        // ask it, because it hands `ChunkContents` its site instead of
-        // decoding one. An intermediate chunk has no volume header at all, so
-        // the identifier here can only have come off the Message 31 itself.
         let site = contents
             .site
             .expect("an intermediate chunk's Message 31s state a position");

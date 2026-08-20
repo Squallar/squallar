@@ -6,7 +6,6 @@ fn date(y: i32, m: u32, d: u32) -> NaiveDate {
 
 // -- Identifier ---------------------------------------------------------
 
-/// Site and time come out of the fixed offsets the bucket's naming uses.
 #[test]
 fn identifier_splits_site_and_collection_time() {
     let id = Identifier::new("KTLX20240520_000004_V06".to_string());
@@ -19,8 +18,6 @@ fn identifier_splits_site_and_collection_time() {
     );
 }
 
-/// A name too short to slice must yield `None`, not panic —
-/// `key_to_identifier` emits an empty name for any unexpected key shape.
 #[test]
 fn identifier_rejects_names_it_cannot_slice() {
     for name in ["", "KTL", "KTLX", "KTLX2024"] {
@@ -34,17 +31,12 @@ fn identifier_rejects_names_it_cannot_slice() {
 
 // -- key -> name --------------------------------------------------------
 
-/// Fails on an off-by-one either way: `skip(3)` leaves the site glued to
-/// the front, `skip(5)` empties the name.
 #[test]
 fn key_to_identifier_drops_exactly_the_date_and_site_segments() {
     let id = key_to_identifier("2024/05/20/KTLX/KTLX20240520_000004_V06");
     assert_eq!(id.name(), "KTLX20240520_000004_V06");
 }
 
-/// `_MDM` sidecars are returned, not filtered: `crate::scan` breaks ties by
-/// taking the first name, and the bucket orders `..._V06` before
-/// `..._V06_MDM`. Filtering here looks like a cleanup but changes behaviour.
 #[test]
 fn key_to_identifier_keeps_mdm_sidecars() {
     let id = key_to_identifier("2024/05/20/KTLX/KTLX20240520_000004_V06_MDM");
@@ -53,15 +45,12 @@ fn key_to_identifier_keeps_mdm_sidecars() {
 
 // -- URLs ---------------------------------------------------------------
 
-/// The single-digit month is the case that distinguishes `%Y/%m/%d` from a
-/// hand-rolled `{}/{}/{}`.
 #[test]
 fn day_prefix_is_zero_padded_and_date_partitioned() {
     assert_eq!(day_prefix("KTLX", &date(2024, 5, 6)), "2024/05/06/KTLX");
     assert_eq!(day_prefix("KDMX", &date(2011, 11, 27)), "2011/11/27/KDMX");
 }
 
-/// A first-page URL is a `list-type=2` prefix query with no cursor.
 #[test]
 fn list_url_is_a_v2_prefix_query() {
     let url = list_url(
@@ -73,7 +62,6 @@ fn list_url_is_a_v2_prefix_query() {
     .expect("url");
     assert!(url.starts_with("https://bkt.s3.amazonaws.com/?"), "{url}");
     assert!(url.contains("list-type=2"), "{url}");
-    // The live bucket accepts the percent-encoded separators.
     assert!(url.contains("prefix=2024%2F05%2F20%2FKTLX"), "{url}");
     assert!(
         !url.contains("continuation-token"),
@@ -81,7 +69,6 @@ fn list_url_is_a_v2_prefix_query() {
     );
 }
 
-/// `max-keys` is only present when asked for.
 #[test]
 fn list_url_carries_max_keys_only_when_set() {
     let bare = list_url("https://bkt.s3.amazonaws.com", "p", None, None).expect("url");
@@ -90,9 +77,6 @@ fn list_url_carries_max_keys_only_when_set() {
     assert!(capped.contains("max-keys=7"), "{capped}");
 }
 
-/// Real tokens contain `/` and can contain `+` and `=`; an unencoded `+`
-/// arrives at S3 as a space and the page is rejected. That is a distinct
-/// failure from never sending the token, so both are asserted.
 #[test]
 fn list_url_percent_encodes_the_continuation_token() {
     let token = "abc/def+ghi=";
@@ -107,8 +91,6 @@ fn list_url_percent_encodes_the_continuation_token() {
     );
 }
 
-/// Object URLs are bucket-host plus the full key path, from the one place the
-/// S3 URL shape is declared.
 #[test]
 fn object_url_is_the_key_under_the_bucket_host() {
     assert_eq!(
@@ -120,9 +102,6 @@ fn object_url_is_the_key_under_the_bucket_host() {
 
 // -- status classification ---------------------------------------------
 
-/// The non-200 2xx entries are the point: `is_success()` or
-/// `error_for_status()` would accept `206 Partial Content` and hand a
-/// truncated volume to the decoder.
 #[test]
 fn only_200_is_treated_as_a_complete_body() {
     assert_eq!(classify(StatusCode::OK), StatusClass::Ok);
@@ -188,11 +167,6 @@ fn parse_list_page_reads_a_final_page() {
     assert_eq!(page.next_token, None);
 }
 
-/// A `<Key>` is only an object inside `<Contents>`. The fixture plants one
-/// in an `<Error>` block and adds a `<CommonPrefixes>` entry, because a
-/// plain `ListBucketResult` has no stray `<Key>` to guard against. Without
-/// `if in_contents` the phantom key is returned and `crate::scan` tries to
-/// download it.
 #[test]
 fn parse_list_page_only_takes_keys_inside_contents() {
     let doc = listing(&["a/b/c/d/real"], None).replacen(
@@ -216,10 +190,6 @@ fn parse_list_page_only_takes_keys_inside_contents() {
     );
 }
 
-/// The mirror image of the guard above. Every `ListBucketResult` echoes the
-/// requested prefix at top level; without `if in_common_prefixes` that echo
-/// is returned as a directory, so a volume-discovery listing gains a phantom
-/// entry naming the site itself.
 #[test]
 fn parse_list_page_only_takes_prefixes_inside_common_prefixes() {
     let doc = listing(&[], None);
@@ -235,8 +205,6 @@ fn parse_list_page_only_takes_prefixes_inside_common_prefixes() {
     );
 }
 
-/// A delimited listing carries no `Contents` at all, and its directories are
-/// what the caller asked for.
 #[test]
 fn parse_list_page_reads_a_delimited_listing() {
     let doc = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -257,7 +225,6 @@ fn parse_list_page_reads_a_delimited_listing() {
     );
 }
 
-/// The delimiter reaches the wire, and a plain listing still carries none.
 #[test]
 fn list_url_delimited_asks_for_directories() {
     let url =
@@ -272,8 +239,6 @@ fn list_url_delimited_asks_for_directories() {
     );
 }
 
-/// An empty listing is an empty result, not an error:
-/// `crate::scan::list_files_with_fallback` rolls back a day on the former.
 #[test]
 fn parse_list_page_reads_an_empty_listing() {
     let page = parse_list_page(&listing(&[], None)).expect("parses");
@@ -284,8 +249,6 @@ fn parse_list_page_reads_an_empty_listing() {
 // -- pagination ---------------------------------------------------------
 
 /// Drive `collect_keys` over canned pages, recording the URLs requested.
-/// The future is driven by hand (no `pollster` here); it never yields,
-/// because the fetcher is immediate.
 fn paginate(
     pages: Vec<std::result::Result<String, ArchiveError>>,
 ) -> (Result<Vec<String>>, Vec<String>) {
@@ -315,9 +278,6 @@ fn paginate(
     (outcome, urls.into_inner())
 }
 
-/// Three pages, so the token is observed threading *between* pages. Fails
-/// if the token is dropped (one page, two keys), if paging stops early
-/// (four keys), or if pages are gathered out of order.
 #[test]
 fn pagination_follows_the_cursor_across_every_page() {
     let (keys, urls) = paginate(vec![
@@ -356,8 +316,6 @@ fn pagination_follows_the_cursor_across_every_page() {
     );
 }
 
-/// An untruncated page ends the listing even if a cursor is echoed: paging
-/// while `next_token.is_some()` would request forever here.
 #[test]
 fn pagination_stops_on_the_truncation_flag_not_the_cursor() {
     let body = listing(&["a/b/c/d/k1"], None).replace(
@@ -369,8 +327,6 @@ fn pagination_stops_on_the_truncation_flag_not_the_cursor() {
     assert_eq!(urls.len(), 1, "followed a cursor on an untruncated page");
 }
 
-/// A truncated page with no cursor is an error: returning the partial
-/// result would be silent data loss.
 #[test]
 fn pagination_refuses_to_truncate_silently() {
     let body = listing(&["a/b/c/d/k1"], None).replace(
@@ -386,7 +342,6 @@ fn pagination_refuses_to_truncate_silently() {
     assert_eq!(urls.len(), 1);
 }
 
-/// A server that never stops truncating is bounded rather than hanging.
 #[test]
 fn pagination_gives_up_after_the_page_cap() {
     let pages = (0..MAX_LIST_PAGES + 5)
@@ -401,7 +356,6 @@ fn pagination_gives_up_after_the_page_cap() {
     assert_eq!(urls.len(), MAX_LIST_PAGES, "page cap not enforced");
 }
 
-/// A fetch failure aborts the listing rather than returning what it had.
 #[test]
 fn pagination_propagates_a_page_failure() {
     let (keys, urls) = paginate(vec![
@@ -447,10 +401,6 @@ fn http_response(status_line: &str, body: &str) -> String {
     )
 }
 
-/// A cleartext-capable client: [`super::client`] sets `https_only`, which
-/// loopback URLs cannot satisfy. `tls::init()` is still required — with
-/// `rustls-no-provider` and `aws-lc-rs` out of the graph, `build()` panics
-/// without a provider whatever scheme is used.
 fn loopback_client() -> reqwest::Client {
     crate::tls::init();
     reqwest::Client::builder()
@@ -459,8 +409,6 @@ fn loopback_client() -> reqwest::Client {
         .expect("client")
 }
 
-/// The counterweight to the two below: without it, a `get_text` that
-/// errored on everything would satisfy them both.
 #[tokio::test]
 async fn get_text_returns_the_body_on_200() {
     let url = serve_once(http_response("200 OK", "<ListBucketResult/>"));
@@ -470,9 +418,7 @@ async fn get_text_returns_the_body_on_200() {
     assert_eq!(body, "<ListBucketResult/>");
 }
 
-/// A `503` is an error, not an empty listing. This is the upstream bug:
-/// zero objects reads as "nothing recorded for this date", so an outage
-/// was shown to the user as an absence of weather.
+/// A `503` is an error, not an empty listing.
 #[tokio::test]
 async fn get_text_reports_a_server_error_instead_of_an_empty_listing() {
     let url = serve_once(http_response(
@@ -510,9 +456,7 @@ async fn get_text_reports_a_404_as_not_found() {
 // Run with:
 //   cargo test -p rustdar-radar --lib -- --ignored --nocapture archive::tests::live_
 
-/// End-to-end against the real bucket. Fails if the prefix scheme is wrong
-/// (empty listing), the key derivation is wrong (404), anonymous access
-/// stops working (403), or the bytes are not a decodable Archive II volume.
+/// End-to-end against the real bucket.
 #[ignore = "hits the live unidata-nexrad-level2 S3 bucket"]
 #[tokio::test]
 async fn live_archive_lists_downloads_and_decodes_a_volume() {
@@ -528,8 +472,6 @@ async fn live_archive_lists_downloads_and_decodes_a_volume() {
         files.len()
     );
 
-    // The `_MDM` sidecars are in the listing on purpose; only a volume
-    // decodes.
     let volume = files
         .iter()
         .find(|f| f.name().ends_with("_V06"))
@@ -554,11 +496,6 @@ async fn live_archive_lists_downloads_and_decodes_a_volume() {
     assert!(sweeps > 0, "decoded a volume with no sweeps");
 }
 
-/// Paging against real S3 reproduces the unpaginated listing exactly: the
-/// token is accepted and advances the cursor, rather than being ignored
-/// (looping on page one) or rejected. A real site-day is ~235 keys against
-/// a 1000-key default page, so the small `max-keys` is what makes the
-/// truncation path reachable at all.
 #[ignore = "hits the live unidata-nexrad-level2 S3 bucket"]
 #[tokio::test]
 async fn live_paged_listing_equals_the_single_page_listing() {
@@ -612,8 +549,6 @@ async fn live_paged_listing_equals_the_single_page_listing() {
     );
 }
 
-/// Fails if the 404 branch is dropped in favour of `error_for_status()`
-/// (wrong variant) or, worse, if a 404 body is handed back as volume data.
 #[ignore = "hits the live unidata-nexrad-level2 S3 bucket"]
 #[tokio::test]
 async fn live_missing_volume_is_reported_as_not_found() {
@@ -630,9 +565,7 @@ async fn live_missing_volume_is_reported_as_not_found() {
     );
 }
 
-/// The claim this whole module rests on: no SigV4, no credential chain. If
-/// the bucket ever required signing, every other live test would fail with
-/// a confusing decode error while this one names the cause.
+/// The claim this whole module rests on: no SigV4, no credential chain.
 #[ignore = "hits the live unidata-nexrad-level2 S3 bucket"]
 #[tokio::test]
 async fn live_listing_needs_no_credentials() {
@@ -657,25 +590,6 @@ async fn live_listing_needs_no_credentials() {
     );
 }
 
-/// The two data-model assumptions the real-time chunk assembler is built on,
-/// probed against a real volume before anything depends on them.
-///
-/// 1. **`elevation_number` is contiguous `1..=n` with no repeats**, SAILS and
-///    MRLE inserts included. The assembler accumulates into a
-///    `BTreeMap<u8, Cut>` keyed on it, so a repeat would silently merge two
-///    distinct cuts into one oversized sweep. The archive path only
-///    *tolerates* a repeat — `Sweep::from_radials` groups by consecutive runs
-///    and would emit two sweeps — so nothing today would notice.
-///
-/// 2. **The last radial of a cut carries `ElevationEnd`, and the last radial
-///    of the volume carries `ScanEnd` rather than `ElevationEnd`.** The
-///    assembler seals a cut on that terminator; reading only `ElevationEnd`
-///    would leave the topmost cut open forever and `volume_complete` would
-///    never fire.
-///
-/// Uses the archive path deliberately: a chunk volume is assembled from the
-/// same radials, so this answers the question without any chunk code
-/// existing, and it keeps answering it as a regression test afterwards.
 #[ignore = "hits the live unidata-nexrad-level2 S3 bucket"]
 #[tokio::test]
 async fn live_volume_elevation_numbers_are_contiguous_and_terminated() {

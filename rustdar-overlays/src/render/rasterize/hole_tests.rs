@@ -10,7 +10,7 @@ use crate::types::HatchPattern;
 use rustdar_geo::GeoPolygon;
 
 /// Real NWS zone geometry, in rustdar's own cache form: `(lat, lon)` pairs,
-/// already RDP-simplified. See the `_source` key in the file.
+/// already RDP-simplified.
 const ZONE_FIXTURE: &str = include_str!("../../../testdata/nws_zone_polygons.json");
 
 const FILL: [u8; 4] = [220, 40, 40, 255];
@@ -48,14 +48,12 @@ fn polygons_at(v: &serde_json::Value) -> Vec<GeoPolygon> {
         .collect()
 }
 
-/// Sussex County, Virginia: one exterior ring, one interior ring. Production
+/// Sussex County, Virginia: one exterior ring, one interior ring — production
 /// NWS zone geometry, not a construction.
 fn donut_polygons() -> Vec<GeoPolygon> {
     polygons_at(&fixture()["donut"]["polygons"])
 }
 
-/// Nine real zones, none of which has an interior ring — the shapes this
-/// change must leave untouched.
 fn hole_free_zones() -> Vec<(String, Vec<GeoPolygon>)> {
     fixture()["hole_free"]
         .as_array()
@@ -81,16 +79,12 @@ fn feature(polygons: Vec<GeoPolygon>, stroke: [u8; 4]) -> OverlayFeature {
     )
 }
 
-/// A feature drawn alone, plus the projection it was drawn under, so a test
-/// can ask about a geographic point rather than a pixel index.
 struct Rendered {
     pixmap: Pixmap,
     mb: MercatorBounds,
 }
 
 impl Rendered {
-    /// The texture spans the feature's own bounds with 5% padding, so the
-    /// outline is never clipped by the texture edge.
     fn of(feature: &OverlayFeature) -> Self {
         let b = feature
             .geo_bounds
@@ -109,9 +103,7 @@ impl Rendered {
         Self { pixmap, mb }
     }
 
-    /// Premultiplied RGBA, as tiny-skia leaves it — which is now also what the
-    /// public entry points return, since none of them un-premultiplies on the
-    /// way out any more. See [`super::AlphaMode`].
+    /// Premultiplied RGBA, as tiny-skia leaves it. See [`super::AlphaMode`].
     fn rgba_at_geo(&self, lat: f64, lon: f64) -> [u8; 4] {
         let (px, py) = self.mb.project(lat, lon, W as f32, H as f32);
         let idx = ((py as u32) * W + px as u32) as usize * 4;
@@ -127,7 +119,6 @@ impl Rendered {
 const IN_HOLE: (f64, f64) = (36.695138, -77.538071);
 const IN_SOLID_RING: (f64, f64) = (36.617478, -77.613143);
 
-/// The bug itself, on real data.
 #[test]
 fn a_real_zone_donuts_hole_is_left_unpainted() {
     let r = Rendered::of(&feature(donut_polygons(), [0, 0, 0, 0]));
@@ -150,9 +141,8 @@ fn a_real_zone_donuts_hole_is_left_unpainted() {
 /// Why the fill rule is even-odd and not non-zero.
 ///
 /// Re-wound so the interior ring turns the same way as its exterior, which
-/// GeoJSON's right-hand rule forbids and two rings in a real 7,015-zone cache
-/// do anyway. `FillRule::Winding` renders this solid; even-odd does not care
-/// which way either ring turns.
+/// GeoJSON's right-hand rule forbids and two rings in a real 7,015-zone cache do
+/// anyway. `FillRule::Winding` renders this solid; even-odd does not care.
 #[test]
 fn a_hole_wound_like_its_exterior_is_still_cut() {
     let mut polygons = donut_polygons();
@@ -177,7 +167,6 @@ fn a_hole_wound_like_its_exterior_is_still_cut() {
     );
 }
 
-/// Shoelace sign in `(lon, lat)`, matching how the rings project.
 fn ring_is_ccw(ring: &[(f64, f64)]) -> bool {
     let ring = strip_closing_dup(ring);
     let n = ring.len();
@@ -190,12 +179,10 @@ fn ring_is_ccw(ring: &[(f64, f64)]) -> bool {
     twice > 0.0
 }
 
-/// The hole's edge is a boundary of the feature, so the outline follows it.
 #[test]
 fn the_holes_rim_is_stroked() {
     let r = Rendered::of(&feature(donut_polygons(), STROKE));
 
-    // Midpoint of the hole's longest edge, an 18 px run at this texture size.
     let rim = r.rgba_at_geo(36.688812, -77.559497);
     assert!(
         rim[3] > 0,
@@ -217,12 +204,9 @@ fn the_holes_rim_is_stroked() {
 /// An interior ring that encloses nothing must not become a scratch.
 ///
 /// RDP simplification collapses small closed rings to retracing out-and-back
-/// slivers — 2,515 of the 4,579 interior rings in a full zone cache have
-/// exactly zero area, and every one of them is a three-point ring that walks
-/// out and comes straight back. Even-odd already ignores them for the fill, but
-/// each is still a subpath, and the stroke would draw every one of them.
-/// Pinning this as byte equality, because "nearly invisible" is what a scratch
-/// looks like until there are two thousand of them.
+/// slivers — 2,515 of the 4,579 interior rings in a full zone cache have exactly
+/// zero area. Even-odd already ignores them for the fill, but each is still a
+/// subpath and the stroke would draw every one. Pinned as byte equality.
 #[test]
 fn a_zero_area_interior_ring_changes_no_pixel() {
     let (id, polygons) = hole_free_zones()
@@ -233,10 +217,9 @@ fn a_zero_area_interior_ring_changes_no_pixel() {
     let plain = Rendered::of(&feature(polygons.clone(), STROKE));
 
     let mut with_sliver = polygons;
-    // `a → b → a`: the corpus's own shape, and the only one that is exactly
-    // zero at every texture size. Three *collinear* points would not do — they
-    // are collinear in lat/lon but not in Mercator, so their projected area is
-    // merely small, and small scales with the square of the texture width.
+    // `a → b → a`: the corpus's own shape, and the only one exactly zero at
+    // every texture size. Three *collinear* points would not do — collinear in
+    // lat/lon is not collinear in Mercator.
     let a = with_sliver[0][0][0];
     let b = with_sliver[0][0][1];
     with_sliver[0].push(vec![a, b, a]);
@@ -253,12 +236,10 @@ fn a_zero_area_interior_ring_changes_no_pixel() {
 
 /// A ring can clear the area floor and still be nothing but a stroke.
 ///
-/// The area test alone leaves the slivers `MIN_HOLE_WIDTH_PX` exists for: a
-/// hole a fortieth of a pixel wide removes no visible alpha, but its rim is
-/// still outlined at full opacity, which is a line drawn across a zone that has
-/// no hole in it. Both numbers below are `forecast_PKZ785`'s worst interior
-/// ring as `hole_tests` would project it, restated as the rectangle of the same
-/// area and perimeter.
+/// A hole a fortieth of a pixel wide removes no visible alpha, but its rim is
+/// still outlined at full opacity — a line drawn across a zone that has no hole
+/// in it. Both numbers below are `forecast_PKZ785`'s worst interior ring,
+/// restated as the rectangle of the same area and perimeter.
 #[test]
 fn a_sliver_hole_is_dropped_even_though_its_area_clears_the_floor() {
     let sliver = [
@@ -279,8 +260,7 @@ fn a_sliver_hole_is_dropped_even_though_its_area_clears_the_floor() {
     );
 
     // The real cut-out this must not touch: Sussex County's enclave, 588.6 px²
-    // over 107.7 px of rim at the size `Rendered` draws it, restated the same
-    // way.
+    // over 107.7 px of rim, restated the same way.
     let enclave = [(0.0, 0.0), (38.62, 0.0), (38.62, 15.24), (0.0, 15.24)];
     assert!(
         hole_is_drawable(&enclave),
@@ -303,14 +283,12 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// The regression guard: hole-free polygons must rasterize to the *same bytes*
 /// they did before holes were honoured.
 ///
-/// These digests were taken from the rasterizer as it stood before this change
-/// (`cb6f2246`), running this very fixture, and they have not moved since.
-/// That is what makes them evidence rather than a restatement: hole handling
-/// only ever adds subpaths, and a polygon with no interior rings gets the same
-/// single-ring path filled under the same `FillRule::Winding` as always.
+/// Taken from the rasterizer as it stood before this change (`cb6f2246`) on this
+/// very fixture: hole handling only ever adds subpaths, so a polygon with no
+/// interior rings gets the same single-ring path filled under the same
+/// `FillRule::Winding` as always.
 #[test]
 fn hole_free_zones_rasterize_to_the_same_bytes_as_before_holes_were_honoured() {
-    // (zone id, FNV-1a of the premultiplied RGBA buffer).
     const PINNED: &[(&str, u64)] = &[
         ("county_TXC113", 0x1037_4a55_89b3_9cb6),
         ("county_OKC109", 0x3d99_3381_bcd6_3e04),
