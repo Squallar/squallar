@@ -3,8 +3,8 @@
 
 use crate::input_harness::InputHarness;
 use crate::ui::{
-    CatalogGroup, DrawnControlItem, DrawnControlKind, OVERLAY_CONTROL_ORDER, SETTINGS_ROWS,
-    builtin_presets, is_master_control,
+    CatalogGroup, DrawnControlItem, DrawnControlKind, SETTINGS_ROWS, builtin_presets,
+    is_master_control,
 };
 use crate::ui_layout::WidthClass;
 use rustdar_overlays::hrrr::ModelParameter;
@@ -168,8 +168,33 @@ const HIDDEN_WALK_HANDLER: LayerId = known::LIGHTNING;
 /// Every handler's every control, reachable through its stack row and the
 /// inspector's layer body.
 fn walk_layer_controls(h: &mut InputHarness, width: WidthClass) {
+    // **The LIVE registry, in registry order.** There is no second list a
+    // handler can be dropped from: a layer that registers is a layer this walk
+    // covers, which is what makes "registered but never audited" unspellable.
+    let registered: Vec<LayerId> = h.gui().overlays.handlers().map(|h| h.id()).collect();
+    // **The floor on THIS leg's own list**, and it is not decoration: a walk is
+    // a PARITY, so a handler missing from the list it iterates leaves nothing
+    // to look for and nothing to fail on. Filtering one id out of this vector
+    // was tampered and came back GREEN before this assertion existed. The
+    // cross-check is the hand-kept `REGISTERED_LAYER_COUNT`, never a second
+    // read of the registry.
+    assert_eq!(
+        registered.len(),
+        crate::sources::REGISTERED_LAYER_COUNT,
+        "the control walk is about to cover {} handlers on {width:?}, but this \
+         build registers {} — every handler it does not iterate is a handler \
+         whose every option goes unaudited, in silence: {registered:?}",
+        registered.len(),
+        crate::sources::REGISTERED_LAYER_COUNT,
+    );
+    assert!(
+        registered.contains(&HIDDEN_WALK_HANDLER),
+        "the hidden-leg handler {HIDDEN_WALK_HANDLER:?} is not registered in \
+         this build — a rename would otherwise retire that leg in silence, \
+         leaving every handler walked shown and none walked hidden",
+    );
     h.set_overlay_on_pane(0, &HIDDEN_WALK_HANDLER, false);
-    for handler in OVERLAY_CONTROL_ORDER {
+    for handler in &registered {
         if *handler == HIDDEN_WALK_HANDLER {
             assert!(
                 !h.overlay_enabled_on(0, handler),
@@ -309,22 +334,26 @@ fn walk_catalog(h: &mut InputHarness, width: WidthClass) {
         inventory.push((CatalogGroup::Hrrr, param.display_name().to_owned()));
     }
 
-    // Anti-shrink floor on the one inventory leg that is *derived*.
+    // **The anti-shrink floor**, on the one inventory leg that is *derived*.
     // `default_draw_order` reads the composed registry, so a composition that
-    // quietly lost a source crate would hand this walk a shorter list.
-    // Cross-checked against `OVERLAY_CONTROL_ORDER`, a hand-kept literal: the
-    // two spellings cannot shrink together by accident.
+    // quietly lost a source crate would hand this walk a shorter list and the
+    // walk would check that many fewer tiles and still pass.
+    //
+    // The cross-check is `sources::REGISTERED_LAYER_COUNT`, a **hand-kept
+    // literal** — deliberately not a second read of the registry, which would
+    // compare the registry against itself and could not fail. See that
+    // constant's own doc; it is the reason this assertion is worth writing.
     let layers_in_inventory = inventory
         .iter()
         .filter(|(group, _)| *group == CatalogGroup::Overlays)
         .count();
     assert_eq!(
         layers_in_inventory,
-        OVERLAY_CONTROL_ORDER.len(),
+        crate::sources::REGISTERED_LAYER_COUNT,
         "the catalog leg's layer inventory is {layers_in_inventory} on \
-         {width:?} but the audit's canonical layer list has {} — the walk \
-         would check that many fewer tiles and still pass",
-        OVERLAY_CONTROL_ORDER.len(),
+         {width:?} but this build registers {} layers — the walk would check \
+         that many fewer tiles and still pass",
+        crate::sources::REGISTERED_LAYER_COUNT,
     );
 
     h.open_catalog();
