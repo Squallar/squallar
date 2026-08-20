@@ -5,6 +5,8 @@
 pub mod alert;
 mod colorscale;
 pub mod discussion;
+#[cfg(feature = "fake-source")]
+pub mod fake;
 mod glm;
 mod labels;
 mod location;
@@ -20,13 +22,14 @@ mod texture_tests;
 use super::overlay_state::OverlayHandler;
 
 /// **This crate's layer registrations — eleven rows, and the only place they
-/// are named.**
+/// are named**; twelve under `fake-source`, which nothing that ships enables.
 ///
 /// Radar is not here: it lives in `rustdar_radar::sources`, and the app's whole
 /// layer set is `rustdar_egui::sources::all`. Adding an overlay means one row
 /// here plus a `known::` const and a `LAYER_ID_LEDGER` entry.
 pub fn sources() -> Vec<Box<dyn OverlayHandler>> {
-    vec![
+    #[allow(unused_mut)]
+    let mut rows: Vec<Box<dyn OverlayHandler>> = vec![
         Box::new(model::ModelDataHandler::new()),
         Box::new(outlook::SpcOutlookHandler::new()),
         Box::new(discussion::SpcDiscussionHandler::new()),
@@ -38,7 +41,13 @@ pub fn sources() -> Vec<Box<dyn OverlayHandler>> {
         Box::new(sites::RadarSitesHandler::new()),
         Box::new(location::UserLocationHandler::new()),
         Box::new(colorscale::ColorScaleHandler::new()),
-    ]
+    ];
+    // ONE registration line, appended: the count this adds is the `1` every
+    // `12 + cfg!(feature = "fake-source") as usize` pin downstream is written
+    // against.
+    #[cfg(feature = "fake-source")]
+    rows.push(Box::new(fake::FakeSourceHandler::new()));
+    rows
 }
 
 /// The one step of the coverage guarantee the compiler cannot take on its own.
@@ -52,10 +61,14 @@ pub fn sources() -> Vec<Box<dyn OverlayHandler>> {
 mod round_delivery_tests {
     /// Every handler file, whether or not it fetches today: the one that
     /// reintroduces this is by definition the one nobody has read yet.
-    const HANDLER_SOURCES: [(&str, &str); 11] = [
+    const HANDLER_SOURCES: [(&str, &str); 12] = [
         ("alert", include_str!("alert.rs")),
         ("colorscale", include_str!("colorscale.rs")),
         ("discussion", include_str!("discussion.rs")),
+        // Listed unconditionally: `include_str!` reads the file whether or not
+        // the module is compiled, and a source that is only checked in one
+        // feature arm is a source nobody checked in the other.
+        ("fake", include_str!("fake.rs")),
         ("glm", include_str!("glm.rs")),
         ("labels", include_str!("labels.rs")),
         ("location", include_str!("location.rs")),

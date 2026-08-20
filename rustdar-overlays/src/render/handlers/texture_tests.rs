@@ -49,6 +49,34 @@ fn rctx() -> RasterizeContext {
     }
 }
 
+/// The fake source's rasterizer, reached the same way as every other row's —
+/// in its own function so the walk above has one shape in both feature arms.
+#[cfg(feature = "fake-source")]
+fn run_fake(
+    job: &DescribedJob,
+    bounds: &GeoBounds,
+    w: u32,
+    h: u32,
+) -> Option<(LayerId, RasterizeOutput)> {
+    let input = job.downcast_ref::<super::fake::FakeInput>()?;
+    Some((
+        known::FAKE_SOURCE,
+        super::fake::rasterize_fake(input, bounds, w, h),
+    ))
+}
+
+/// The same, for a build with no fake registered: nothing can describe that
+/// input, so nothing can match it.
+#[cfg(not(feature = "fake-source"))]
+fn run_fake(
+    _job: &DescribedJob,
+    _bounds: &GeoBounds,
+    _w: u32,
+    _h: u32,
+) -> Option<(LayerId, RasterizeOutput)> {
+    None
+}
+
 fn run_described(
     job: &DescribedJob,
     bounds: &GeoBounds,
@@ -81,6 +109,8 @@ fn run_described(
             known::RADAR_SITES,
             rasterize_radar_sites(input, bounds, w, h),
         )
+    } else if let Some(pair) = run_fake(job, bounds, w, h) {
+        pair
     } else {
         panic!("a handler described an input no handler-backed texture layer claims: {job:?}")
     }
@@ -251,6 +281,28 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
     // Outlook's "enabled" *is* its product set, and the set is what its data is
     // keyed by, so the toggle has to precede the payload.
     handler.set_enabled(true, &mut PaneMut::bare(0));
+
+    // The fake takes its data one FRAME at a time rather than as a round, so it
+    // is seeded through the frame door instead of the fetch door — before the
+    // match below, because `apply_frame` needs the handler mutably and the
+    // match holds it borrowed.
+    #[cfg(feature = "fake-source")]
+    if handler.id() == known::FAKE_SOURCE {
+        let stamp = super::fake::frames_in((
+            chrono::DateTime::from_timestamp(0, 0)
+                .expect("the epoch is in chrono's range")
+                .naive_utc(),
+            chrono::DateTime::from_timestamp(super::fake::FRAME_STEP_SECS * 4, 0)
+                .expect("a literal in chrono's range")
+                .naive_utc(),
+        ))[2];
+        handler.apply_frame(
+            stamp,
+            Box::new(super::fake::FakeFrameData::for_stamp(stamp.valid)),
+            &PaneRef::across(&[]),
+        );
+        return true;
+    }
 
     let payload: FetchPayload = match &handler.id() {
         id if *id == known::NWS_ALERTS => Box::new(super::alert::NwsAlertFetchResult(Ok(
@@ -429,10 +481,12 @@ fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
     // be walked through. It has a pane now, the arm is gone, and the "seven
     // described kinds" list in `spawn_overlay_render` is this same seven.
     assert_eq!(
-        checked, 7,
+        checked,
+        7 + cfg!(feature = "fake-source") as usize,
         "the seven texture handlers that rasterize through `prepare_job` \
-         must all be covered; a new one is not exempt, and a removed one \
-         should be removed from this count deliberately",
+         must all be covered — eight with the fake source registered; a new \
+         one is not exempt, and a removed one should be removed from this \
+         count deliberately",
     );
 
     // The same rasterizer reached directly, so the walk above is checked
@@ -596,9 +650,10 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
         checked += 1;
     }
     assert_eq!(
-        checked, 7,
+        checked,
+        7 + cfg!(feature = "fake-source") as usize,
         "the seven texture handlers that rasterize through `prepare_job` \
-         must all be covered",
+         must all be covered — eight with the fake source registered",
     );
 }
 
@@ -727,10 +782,12 @@ fn every_texture_kind_rasterizes_as_a_described_job() {
         described += 1;
     }
     assert_eq!(
-        described, 7,
+        described,
+        7 + cfg!(feature = "fake-source") as usize,
         "the three polygon kinds, the two hit-map kinds, the model grid and \
-         the site table must all have been walked seeded; a kind that \
-         stopped seeding is a kind whose described job was never tested",
+         the site table must all have been walked seeded — plus the fake \
+         source where it is registered; a kind that stopped seeding is a kind \
+         whose described job was never tested",
     );
 }
 
@@ -814,6 +871,7 @@ fn every_texture_handler_owns_exactly_one_codec_row() {
     use crate::render::jobs::JOB_CODECS;
 
     // Deliberately spelled out. Do not regenerate this from the registry.
+    #[cfg(not(feature = "fake-source"))]
     let expected: [(LayerId, &str); 7] = [
         (known::RADAR_SITES, "overlay/sites"),
         (known::NWS_ALERTS, "overlay/alerts"),
@@ -822,6 +880,19 @@ fn every_texture_handler_owns_exactly_one_codec_row() {
         (known::STORM_REPORTS, "overlay/reports"),
         (known::LIGHTNING, "overlay/glm"),
         (known::MODEL_DATA, "overlay/model"),
+    ];
+    // Two `#[cfg]`'d definitions for the same reason `JOB_CODECS` has two:
+    // `#[cfg]` on an array element is not stable.
+    #[cfg(feature = "fake-source")]
+    let expected: [(LayerId, &str); 8] = [
+        (known::RADAR_SITES, "overlay/sites"),
+        (known::NWS_ALERTS, "overlay/alerts"),
+        (known::SPC_OUTLOOK, "overlay/outlooks"),
+        (known::SPC_DISCUSSIONS, "overlay/discussions"),
+        (known::STORM_REPORTS, "overlay/reports"),
+        (known::LIGHTNING, "overlay/glm"),
+        (known::MODEL_DATA, "overlay/model"),
+        (known::FAKE_SOURCE, crate::render::jobs::FAKE_LABEL),
     ];
 
     let mut claimed: Vec<&'static str> = Vec::new();

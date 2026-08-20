@@ -192,9 +192,9 @@ mod controls_parity_tests {
         let kinds: Vec<LayerId> = registry.handlers().map(|h| h.id()).collect();
         assert_eq!(
             kinds.len(),
-            12,
-            "the registry carries all twelve handlers - the walk below \
-             must cover every one"
+            12 + cfg!(feature = "fake-source") as usize,
+            "the registry carries all twelve handlers - thirteen with the \
+             fake source registered - and the walk below must cover every one"
         );
         let ctx = PaneRef::bare(0);
         for kind in kinds {
@@ -218,6 +218,7 @@ mod state_key_tests {
     /// Every name saved handler state has ever been filed under, as a
     /// **literal** list — the self-verifying-inventory discipline: the live
     /// set is checked against it below, so neither side can rot alone.
+    #[cfg(not(feature = "fake-source"))]
     const STATE_KEYS: [&str; 12] = [
         "ModelData",
         "SpcOutlook",
@@ -231,6 +232,26 @@ mod state_key_tests {
         "RadarSites",
         "UserLocation",
         "ColorScale",
+    ];
+
+    /// The same twelve plus the fake source's own key. **A second definition
+    /// rather than a `#[cfg]`'d element**, because `#[cfg]` on an array element
+    /// is not stable.
+    #[cfg(feature = "fake-source")]
+    const STATE_KEYS: [&str; 13] = [
+        "ModelData",
+        "SpcOutlook",
+        "SpcDiscussions",
+        "NwsAlerts",
+        "StormReports",
+        "Lightning",
+        "Metar",
+        "Radar",
+        "CityLabels",
+        "RadarSites",
+        "UserLocation",
+        "ColorScale",
+        "FakeSource",
     ];
 
     /// **The tripwire on the bytes saved handler state is filed under.**
@@ -272,7 +293,12 @@ mod registry_identity_tests {
     #[test]
     fn no_two_handlers_share_an_id() {
         let handlers = all();
-        assert_eq!(handlers.len(), 12, "the walk below must cover all twelve");
+        assert_eq!(
+            handlers.len(),
+            12 + cfg!(feature = "fake-source") as usize,
+            "the walk below must cover all twelve — thirteen with the fake \
+             source registered",
+        );
         let mut seen = std::collections::HashSet::new();
         for h in &handlers {
             assert!(
@@ -318,22 +344,27 @@ mod registry_identity_tests {
             .iter()
             .map(|h| h.id().as_str().to_string())
             .collect();
+        #[allow(unused_mut)]
+        let mut expected: Vec<&str> = vec![
+            "ModelData",
+            "SpcOutlook",
+            "Radar",
+            "SpcDiscussions",
+            "NwsAlerts",
+            "StormReports",
+            "Lightning",
+            "Metar",
+            "CityLabels",
+            "RadarSites",
+            "UserLocation",
+            "ColorScale",
+        ];
+        // Topmost where it is registered, which is deliberate: the fake exists
+        // to be seen, and a proof layer under everything else proves less.
+        #[cfg(feature = "fake-source")]
+        expected.push("FakeSource");
         assert_eq!(
-            ids,
-            [
-                "ModelData",
-                "SpcOutlook",
-                "Radar",
-                "SpcDiscussions",
-                "NwsAlerts",
-                "StormReports",
-                "Lightning",
-                "Metar",
-                "CityLabels",
-                "RadarSites",
-                "UserLocation",
-                "ColorScale",
-            ],
+            ids, expected,
             "the weight order drifted from the historical default draw order",
         );
     }
@@ -365,7 +396,8 @@ mod registry_identity_tests {
             typical_step: std::time::Duration::from_secs(300),
             extends_future: false,
         };
-        let expected: Vec<(&str, TimeAxis)> = vec![
+        #[allow(unused_mut)]
+        let mut expected: Vec<(&str, TimeAxis)> = vec![
             ("ModelData", hourly_forecast),
             ("SpcOutlook", TimeAxis::Live),
             ("Radar", volume_cadence),
@@ -379,6 +411,16 @@ mod registry_identity_tests {
             ("UserLocation", TimeAxis::Live),
             ("ColorScale", TimeAxis::Live),
         ];
+        // The fake's step is deliberately neither of the two shipped cadences
+        // — that is the whole reason it declares one.
+        #[cfg(feature = "fake-source")]
+        expected.push((
+            "FakeSource",
+            TimeAxis::FrameSeries {
+                typical_step: std::time::Duration::from_secs(420),
+                extends_future: false,
+            },
+        ));
 
         let mut actual: Vec<(String, TimeAxis)> = all()
             .iter()
@@ -422,21 +464,39 @@ mod registry_identity_tests {
             .collect();
         assert_eq!(
             framed.len(),
-            2,
+            2 + cfg!(feature = "fake-source") as usize,
             "exactly two layers come in stamped frames; a third joining changes \
-             which one a pane's clock follows and must be ruled on, not absorbed",
+             which one a pane's clock follows and must be ruled on, not \
+             absorbed. The fake source IS such a third, and this is where that \
+             ruling is written down: it declares a deliberately alien cadence \
+             and sits topmost, so a build that registers it hands it the clock \
+             on purpose — which is the property WO-E10.3 exercises.",
         );
         framed.sort_by_key(|(_, weight)| *weight);
-        let topmost = framed.last().expect("two rows");
+        // The topmost frame-series layer is what a pane's clock walks.
+        let expected_topmost = if cfg!(feature = "fake-source") {
+            "FakeSource"
+        } else {
+            "Radar"
+        };
         assert_eq!(
-            topmost.0, "Radar",
+            framed.last().map(|(id, _)| id.as_str()),
+            Some(expected_topmost),
             "the topmost frame-series layer in the draw order is what a pane's \
-             clock walks, and it is radar",
+             clock walks",
         );
+        // Radar above the model holds in BOTH arms: it is the shipped fact,
+        // and the fake must not be able to disturb their relative order.
+        let shipped: Vec<&str> = framed
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .filter(|id| *id != "FakeSource")
+            .collect();
         assert_eq!(
-            framed.first().map(|(id, _)| id.as_str()),
-            Some("ModelData"),
-            "and the model is the other one, below it",
+            shipped,
+            ["ModelData", "Radar"],
+            "of the layers this app ships, radar is the topmost frame-series \
+             one and the model is below it",
         );
         assert!(
             framed[0].1 < framed[1].1,
@@ -512,10 +572,10 @@ mod field_registry_tests {
         );
         assert_eq!(
             fields.len(),
-            17 + 16,
+            17 + 16 + cfg!(feature = "fake-source") as usize,
             "the composed field count moved (radar's seventeen products plus \
-             the model's sixteen parameters); re-cut this pin in the land that \
-             changed it",
+             the model's sixteen parameters, plus the fake's one where it is \
+             registered); re-cut this pin in the land that changed it",
         );
 
         let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
@@ -603,6 +663,16 @@ mod field_registry_tests {
             Some(16),
             "the model group's size moved",
         );
-        assert_eq!(counts.len(), 2, "an unexpected group appeared: {counts:?}");
+        #[cfg(feature = "fake-source")]
+        assert_eq!(
+            counts.get("Fake").copied(),
+            Some(1),
+            "the fake source's group is registered and holds its one field",
+        );
+        assert_eq!(
+            counts.len(),
+            2 + cfg!(feature = "fake-source") as usize,
+            "an unexpected group appeared: {counts:?}",
+        );
     }
 }

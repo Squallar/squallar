@@ -1,5 +1,6 @@
-//! Layer identity as an open string: [`LayerId`]. The twelve values below are
-//! the **exact bytes sitting in every user's config file today**.
+//! Layer identity as an open string: [`LayerId`]. The shipped values below are
+//! the **exact bytes sitting in every user's config file today**; the thirteenth
+//! is a reservation, registered only under `rustdar-overlays/fake-source`.
 
 use std::borrow::Cow;
 
@@ -58,6 +59,11 @@ pub mod known {
     pub const RADAR_SITES: LayerId = LayerId::from_static("RadarSites");
     pub const USER_LOCATION: LayerId = LayerId::from_static("UserLocation");
     pub const COLOR_SCALE: LayerId = LayerId::from_static("ColorScale");
+    /// The proof layer `rustdar-overlays`' `fake-source` feature registers.
+    /// The const is unconditional — a ledger row is a *reservation* of a
+    /// spelling, and reserving one under a `cfg` would let a build that has
+    /// the feature off hand the same string to something else.
+    pub const FAKE_SOURCE: LayerId = LayerId::from_static("FakeSource");
 }
 
 /// Every layer id ever registered, in the default draw order — bottom to top.
@@ -65,7 +71,7 @@ pub mod known {
 /// **APPEND-ONLY.** These strings are persisted in user config files. Renaming
 /// a layer requires a config migration step plus a load-time alias for the old
 /// spelling — never an edit to an existing row.
-pub const LAYER_ID_LEDGER: [&str; 12] = [
+pub const LAYER_ID_LEDGER: [&str; 13] = [
     "ModelData",
     "SpcOutlook",
     "Radar",
@@ -78,6 +84,11 @@ pub const LAYER_ID_LEDGER: [&str; 12] = [
     "RadarSites",
     "UserLocation",
     "ColorScale",
+    // Registered only when `rustdar-overlays/fake-source` is on, listed here
+    // unconditionally: the ledger is append-only and names every spelling ever
+    // claimed, including ones this build does not register. The `cfg` lives in
+    // the consuming tests' expected sets, never in this table.
+    "FakeSource",
 ];
 
 #[cfg(test)]
@@ -100,6 +111,7 @@ mod tests {
             known::RADAR_SITES,
             known::USER_LOCATION,
             known::COLOR_SCALE,
+            known::FAKE_SOURCE,
         ];
         assert_eq!(known_ids.len(), LAYER_ID_LEDGER.len());
         for id in &known_ids {

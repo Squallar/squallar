@@ -296,7 +296,10 @@ pub(crate) fn push_user_overlay_fetch(
 }
 
 /// Every handler with controls, in the audit's canonical order.
-#[cfg(test)]
+///
+/// **Two `#[cfg]`'d definitions**, because `#[cfg]` on an array element is not
+/// stable and the fake source is registered only under its feature.
+#[cfg(all(test, not(feature = "fake-source")))]
 pub(crate) const OVERLAY_CONTROL_ORDER: &[LayerId] = &[
     known::RADAR,
     known::MODEL_DATA,
@@ -310,6 +313,24 @@ pub(crate) const OVERLAY_CONTROL_ORDER: &[LayerId] = &[
     known::RADAR_SITES,
     known::USER_LOCATION,
     known::COLOR_SCALE,
+];
+
+/// The same list plus the fake source — see the note above.
+#[cfg(all(test, feature = "fake-source"))]
+pub(crate) const OVERLAY_CONTROL_ORDER: &[LayerId] = &[
+    known::RADAR,
+    known::MODEL_DATA,
+    known::SPC_OUTLOOK,
+    known::SPC_DISCUSSIONS,
+    known::NWS_ALERTS,
+    known::STORM_REPORTS,
+    known::LIGHTNING,
+    known::METAR,
+    known::CITY_LABELS,
+    known::RADAR_SITES,
+    known::USER_LOCATION,
+    known::COLOR_SCALE,
+    known::FAKE_SOURCE,
 ];
 
 /// The label the open list puts against `value`, or the raw value for one the
