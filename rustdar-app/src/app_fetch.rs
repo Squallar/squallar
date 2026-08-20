@@ -82,6 +82,91 @@ impl super::App {
         });
     }
 
+    /// **The one construction of the fetch context**, so a task a handler
+    /// builds for its data and one it builds for its frames are built against
+    /// the same origins, client and viewport.
+    pub(super) fn fetch_config(&self) -> rustdar_overlays::render::overlay_state::FetchConfig {
+        rustdar_overlays::render::overlay_state::FetchConfig {
+            client: self.http_client.clone(),
+            zone_cache_dir: self.platform.zone_cache_dir().map(|p| p.to_path_buf()),
+            sources: rustdar_radar::sources::DataSources::production(),
+            viewport: self.last_viewport,
+        }
+    }
+
+    /// **The one construction of a pane's layer view for a source task.**
+    ///
+    /// **The real pane**, not `PaneRef::bare`: a handler's selection is the
+    /// pane's since WO-M10c, so a task built against a bare pane would be
+    /// built against the layer's defaults and fetch the wrong thing. The
+    /// slots are hydrated first, because an unhydrated pane carries no state
+    /// and no published selection at all.
+    ///
+    /// `None` for a pane index the layout does not have.
+    pub(super) fn with_layer_pane<R>(
+        &mut self,
+        pane_idx: usize,
+        id: &rustdar_source::id::LayerId,
+        f: impl FnOnce(
+            &mut rustdar_overlays::render::overlay_state::OverlayRegistry,
+            &rustdar_source::handler::PaneRef<'_>,
+        ) -> R,
+    ) -> Option<R> {
+        let (panes, overlays) = self.gui.panes_and_overlays_mut();
+        if pane_idx >= panes.len() {
+            return None;
+        }
+        panes[pane_idx].hydrate_layer_states(overlays, pane_idx);
+        let view = panes[pane_idx].view(pane_idx);
+        let pane_ref = view.layer(id);
+        Some(f(overlays, &pane_ref))
+    }
+
+    /// Spawn a listing task a layer built, and land its answer on the one
+    /// source arrival path as [`SourceEvent::Frames`].
+    fn spawn_frame_list_task(&self, task: rustdar_overlays::render::overlay_state::FetchTask) {
+        use rustdar_overlays::render::overlay_state::FrameListingResult;
+        let kind = task.kind.clone();
+        let sender = self.channels.overlay_fetch_sender.clone();
+        let window = self.window.clone();
+        self.spawn_detached(async move {
+            let data = task.future.await;
+            match FrameListingResult::event(kind, data) {
+                Some(event) => {
+                    let _ = sender.send(event);
+                }
+                // Unreachable through `FrameListingResult::task`. A handler
+                // that built its task some other way gets no arrival at all
+                // rather than an empty listing it never produced.
+                None => log::error!(
+                    "a frame-list task answered with something that is not a frame listing",
+                ),
+            }
+            super::notify_redraw(&window);
+        });
+    }
+
+    /// Spawn one frame's fetch task, landing its payload as
+    /// [`SourceEvent::FrameReady`] with the stamp that asked for it.
+    pub(super) fn spawn_frame_fetch_task(
+        &self,
+        stamp: rustdar_source::time::FrameStamp,
+        task: rustdar_overlays::render::overlay_state::FetchTask,
+    ) {
+        let kind = task.kind.clone();
+        let sender = self.channels.overlay_fetch_sender.clone();
+        let window = self.window.clone();
+        self.spawn_detached(async move {
+            let data = task.future.await;
+            let _ = sender.send(SourceEvent::FrameReady {
+                id: kind,
+                stamp,
+                data,
+            });
+            super::notify_redraw(&window);
+        });
+    }
+
     /// Hand a downloaded archive's **decode** to the job funnel, then answer on
     /// `sender`.
     fn decode_offloaded<T: Send + 'static>(
@@ -605,27 +690,10 @@ impl super::App {
 
     /// Fetch overlay data for the given kind, resolving parameters from current state.
     fn fetch_overlay(&mut self, kind: rustdar_source::id::LayerId, pane_idx: usize) {
-        use rustdar_overlays::render::overlay_state::FetchConfig;
+        let config = self.fetch_config();
 
-        let config = FetchConfig {
-            client: self.http_client.clone(),
-            zone_cache_dir: self.platform.zone_cache_dir().map(|p| p.to_path_buf()),
-            sources: rustdar_radar::sources::DataSources::production(),
-            viewport: self.last_viewport,
-        };
-
-        // **The real pane**, not `PaneRef::bare`: a handler's selection is the
-        // pane's since WO-M10c, so a task built against a bare pane would be
-        // built against the layer's defaults and fetch the wrong thing.
-        let tasks = {
-            let (panes, overlays) = self.gui.panes_and_overlays_mut();
-            let Some(pane) = panes.get_mut(pane_idx) else {
-                return;
-            };
-            pane.hydrate_layer_states(overlays, pane_idx);
-            let view = panes[pane_idx].view(pane_idx);
-            let pane_ref = view.layer(&kind);
-            let tasks = overlays.create_fetch_tasks(&kind, &config, &pane_ref);
+        let tasks = self.with_layer_pane(pane_idx, &kind.clone(), |overlays, pane_ref| {
+            let tasks = overlays.create_fetch_tasks(&kind, &config, pane_ref);
             if tasks.is_empty() {
                 // A handler that cannot build a task says so, and is believed.
                 log::warn!("{kind:?}: no fetch task could be built; backing off");
@@ -634,17 +702,20 @@ impl super::App {
                     &rustdar_overlays::fetch_policy::FetchError::permanent(
                         "no fetch task could be built",
                     ),
-                    &pane_ref,
+                    pane_ref,
                 );
-                return;
+                return Vec::new();
             }
             log::info!(
                 "Fetching overlay data for {:?} ({} task(s))",
                 kind,
                 tasks.len()
             );
-            overlays.set_fetching(&kind, true, &pane_ref);
+            overlays.set_fetching(&kind, true, pane_ref);
             tasks
+        });
+        let Some(tasks) = tasks.filter(|tasks| !tasks.is_empty()) else {
+            return;
         };
 
         for task in tasks {
@@ -906,33 +977,34 @@ impl super::App {
         };
         let LoopScanRequest { site, start, end } = request;
 
-        self.spawn_async_task(self.channels.loop_scan_list_sender.clone(), async move {
-            match scan::list_scans_for_range(&site, start, end).await {
-                Ok(scans) => {
-                    log::info!(
-                        "Loop: found {} {} scans in range for pane {}",
-                        scans.len(),
-                        site,
-                        pane_idx
-                    );
-                    crate::channels::LoopScanListResponse {
-                        pane_idx,
-                        site,
-                        scans,
-                    }
-                }
-                Err(e) => {
-                    log::error!("Loop scan listing failed for {}: {:?}", site, e);
-                    // An empty list is how a failed listing reaches the pane:
-                    // `accept_scan_listing` switches the loop back off.
-                    crate::channels::LoopScanListResponse {
-                        pane_idx,
-                        site,
-                        scans: Vec::new(),
-                    }
-                }
-            }
-        });
+        // **The layer lists its own archive.** The identifiers the listing
+        // yields stay with it — nothing here holds one — and the site it was
+        // listed for is captured inside the task, at dispatch, not read back
+        // off the pane when it lands.
+        let config = self.fetch_config();
+        let task = self
+            .with_layer_pane(
+                pane_idx,
+                &rustdar_source::id::known::RADAR,
+                |overlays, pane_ref| {
+                    overlays.create_frame_list_task(
+                        &rustdar_source::id::known::RADAR,
+                        &config,
+                        pane_ref,
+                        (start, end),
+                    )
+                },
+            )
+            .flatten();
+        let Some(task) = task else {
+            log::warn!(
+                "Loop: the radar layer could not build a {site} scan listing for pane \
+                 {pane_idx}; leaving loop mode",
+            );
+            self.handle_disable_loop(pane_idx);
+            return;
+        };
+        self.spawn_frame_list_task(task);
     }
 
     /// Disable radar loop for a pane: resets to single-frame mode.
@@ -1096,55 +1168,47 @@ impl super::App {
         self.spawn_fetch(pane_site, utc_timestamp);
     }
 
-    /// Spawn a download task for a single loop frame scan.
-    pub(super) fn spawn_loop_scan_download(
-        &self,
-        pane_idx: usize,
-        site: String,
-        timestamp: NaiveDateTime,
-        identifier: rustdar_radar::archive::Identifier,
-    ) {
-        let window = self.window.clone();
+    /// **Take delivery of one loop frame's archive object** and hand its
+    /// decode to the job funnel.
+    ///
+    /// The bytes arrive on the one source path, from the task
+    /// `SourceHandler::fetch_frame` built; the decode is dispatched here, from
+    /// the arrival, so it is scheduled beside every other offloaded job rather
+    /// than inside a network task.
+    ///
+    /// **Every loop frame comes through here**, and on wasm that is up to
+    /// `MAX_LOOP_FRAMES` of them — 14, not the 60 desktop holds.
+    pub(super) fn take_loop_frame_archive(&self, fetch: rustdar_radar::source::RadarFrameFetch) {
+        let rustdar_radar::source::RadarFrameFetch {
+            site,
+            timestamp,
+            archive,
+        } = fetch;
         let sender = self.channels.loop_scan_download_sender.clone();
-        self.spawn_detached(async move {
-            let archive = match scan::fetch_scan_object(identifier).await {
-                Ok(archive) => archive,
-                Err(e) => {
-                    log::error!(
-                        "Loop scan download failed for pane {} ({} @ {}): {:?}",
-                        pane_idx,
-                        site,
-                        timestamp,
-                        e
-                    );
-                    let _ = sender.send(crate::channels::LoopScanDownloadResponse {
-                        pane_idx,
-                        site,
-                        timestamp,
-                        scan: None,
-                    });
-                    crate::app::notify_redraw(&window);
-                    return;
-                }
-            };
-            // **Every loop frame comes through here**, and on wasm that is up to
-            // `MAX_LOOP_FRAMES` of them — 14, not the 60 desktop holds.
-            Self::decode_offloaded(window, sender, archive, move |volume| {
-                // Both halves, because a loop frame is dealiased on the same terms as
-                // the still frame beside it.
-                let scan = volume.map(|volume| {
-                    (
-                        std::sync::Arc::new(volume.scan),
-                        std::sync::Arc::new(volume.declared_nyquist),
-                    )
-                });
-                Some(crate::channels::LoopScanDownloadResponse {
-                    pane_idx,
-                    site,
-                    timestamp,
-                    scan,
-                })
+        // A failed download still arrives: the response is the only thing that
+        // clears the frame's in-flight mark, so it can be retried.
+        let Some(archive) = archive else {
+            let _ = sender.send(crate::channels::LoopScanDownloadResponse {
+                site,
+                timestamp,
+                scan: None,
             });
+            return;
+        };
+        Self::decode_offloaded(self.window.clone(), sender, archive, move |volume| {
+            // Both halves, because a loop frame is dealiased on the same terms as
+            // the still frame beside it.
+            let scan = volume.map(|volume| {
+                (
+                    std::sync::Arc::new(volume.scan),
+                    std::sync::Arc::new(volume.declared_nyquist),
+                )
+            });
+            Some(crate::channels::LoopScanDownloadResponse {
+                site,
+                timestamp,
+                scan,
+            })
         });
     }
 

@@ -322,8 +322,6 @@ fn re_picking_the_site_a_pane_is_on_keeps_its_scan() {
 /// **A pane that did not change radar keeps its loop.**
 #[test]
 fn a_pane_that_did_not_change_radar_keeps_its_loop() {
-    use rustdar_radar::archive::Identifier;
-
     /// The bystander's radar: a third site, so "kept" cannot be confused with
     /// "the destination's state was rebuilt".
     const BYSTANDER: &str = "KTLX";
@@ -380,15 +378,7 @@ fn a_pane_that_did_not_change_radar_keeps_its_loop() {
         1,
         rustdar_radar::loop_downloads::FramePlan::new(
             BYSTANDER.to_string(),
-            [0u32, 4, 8]
-                .iter()
-                .map(|&minute| {
-                    (
-                        at(minute),
-                        Identifier::new(format!("KTLX20260811_18{minute:02}00_V06")),
-                    )
-                })
-                .collect(),
+            [0u32, 4, 8].iter().map(|&minute| at(minute)).collect(),
         ),
     );
     assert!(
@@ -398,13 +388,7 @@ fn a_pane_that_did_not_change_radar_keeps_its_loop() {
     );
     app.loop_mgr.set_plan(
         0,
-        rustdar_radar::loop_downloads::FramePlan::new(
-            WSR88D.to_string(),
-            vec![(
-                at(0),
-                Identifier::new("KPBZ20260811_180000_V06".to_string()),
-            )],
-        ),
+        rustdar_radar::loop_downloads::FramePlan::new(WSR88D.to_string(), vec![at(0)]),
     );
     assert!(
         app.loop_mgr
@@ -472,8 +456,6 @@ fn a_pane_that_did_not_change_radar_keeps_its_loop() {
 /// not reach.
 #[test]
 fn re_picking_the_site_a_pane_is_on_keeps_its_loop() {
-    use rustdar_radar::archive::Identifier;
-
     let mut app = headless(TestBridge::desktop());
     pane_on(&mut app, WSR88D, Some(wsr88d_scan_info()));
 
@@ -508,12 +490,7 @@ fn re_picking_the_site_a_pane_is_on_keeps_its_loop() {
         0,
         rustdar_radar::loop_downloads::PendingDownloads {
             site: WSR88D.to_string(),
-            queue: [(
-                at(8),
-                Identifier::new("KPBZ20260811_180800_V06".to_string()),
-            )]
-            .into_iter()
-            .collect(),
+            queue: [at(8)].into_iter().collect(),
         },
     );
     assert!(

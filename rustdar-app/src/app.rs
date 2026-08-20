@@ -167,6 +167,12 @@ pub struct App {
     pending_state: Option<std::sync::mpsc::Receiver<app_state::AppState>>,
     http_client: reqwest::Client,
     loop_mgr: LoopDownloadManager,
+    /// **Radar frame listings that landed this frame**, as `(site, window)`.
+    ///
+    /// The arrival is drained in `Ingest` and the loops waiting on it are
+    /// built in `Apply` — the phase the listing channel's own drain ran in —
+    /// so re-pointing the supply did not move when a listing becomes a plan.
+    loop_listings_arrived: Vec<(String, (chrono::NaiveDateTime, chrono::NaiveDateTime))>,
     /// Per-site real-time chunk feeds.
     chunk_feeds: rustdar_radar::chunk_feed::ChunkFeedManager,
     /// Push notification of new chunks.
@@ -443,6 +449,7 @@ impl App {
             #[cfg(target_arch = "wasm32")]
             pending_state: None,
             loop_mgr: LoopDownloadManager::new(),
+            loop_listings_arrived: Vec::new(),
             chunk_feeds: rustdar_radar::chunk_feed::ChunkFeedManager::new(),
             chunk_notify: rustdar_radar::chunk_notify::ChunkNotifier::new(),
             latest_cached_scans: HashMap::new(),
@@ -1311,13 +1318,14 @@ impl App {
 
     /// Drain the unified overlay fetch channel — **every** arrival a source
     /// produces, in one `match`.
-    ///
-    /// The `Frames`/`FrameReady` arms are **dark**: nothing sends them until
-    /// WO-E7/WO-M12 give `create_frame_list_task`/`fetch_frame` callers. They
-    /// are here so that when a producer lands, the drain that must route it
-    /// already exists and the compiler is what says so.
     fn poll_overlay_fetch_results(&mut self) {
         use rustdar_overlays::render::overlay_state::SourceEvent;
+        // The two radar-shaped outcomes are collected rather than acted on
+        // in place: the decode needs the whole `App`, and `gui` is bound once
+        // for the whole drain. The decode is offloaded either way, so nothing
+        // observable turns on where in this pass it is dispatched.
+        let mut listed: Vec<(String, (chrono::NaiveDateTime, chrono::NaiveDateTime))> = Vec::new();
+        let mut archives: Vec<rustdar_radar::source::RadarFrameFetch> = Vec::new();
         // Bound once for the whole drain, not per arrival.
         let gui = &mut self.gui;
         while let Ok(event) = self.channels.overlay_fetch_receiver.try_recv() {
@@ -1327,11 +1335,38 @@ impl App {
             // and builds that view.
             match event {
                 SourceEvent::Data(result) => gui.deliver_overlay_fetch(result),
-                SourceEvent::Frames { id, listing } => gui.deliver_frame_listing(&id, listing),
+                SourceEvent::Frames { id, listing, scope } => {
+                    // **What the listing was about is in the scope**, which is
+                    // the layer's own type: the generic halves — the stamps,
+                    // the `PaneRef` union — name no site by contract, and this
+                    // crate is radar's own frontend. The site is read here and
+                    // the scope is handed on whole.
+                    if id == rustdar_source::id::known::RADAR
+                        && let Some(radar) =
+                            scope.downcast_ref::<rustdar_radar::source::RadarListing>()
+                    {
+                        listed.push((radar.site.clone(), radar.range));
+                    }
+                    gui.deliver_frame_listing(&id, listing, scope);
+                }
                 SourceEvent::FrameReady { id, stamp, data } => {
-                    gui.deliver_frame(&id, stamp, data);
+                    // Radar's frames are held by the loop cache this crate
+                    // owns, so its bytes are taken below and decoded through
+                    // the funnel; every other layer's go to the handler.
+                    if id == rustdar_source::id::known::RADAR {
+                        match data.downcast::<rustdar_radar::source::RadarFrameFetch>() {
+                            Ok(fetch) => archives.push(*fetch),
+                            Err(data) => gui.deliver_frame(&id, stamp, data),
+                        }
+                    } else {
+                        gui.deliver_frame(&id, stamp, data);
+                    }
                 }
             }
+        }
+        self.loop_listings_arrived.extend(listed);
+        for fetch in archives {
+            self.take_loop_frame_archive(fetch);
         }
     }
 

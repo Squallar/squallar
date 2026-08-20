@@ -103,11 +103,12 @@ fn a_pane_animating_two_layers_splits_the_frame_cap_between_them() {
 /// sampled down to the share, not to the whole cap.
 ///
 /// This pins `accept_scan_listing`'s own arithmetic. Its *caller-side* count —
-/// that `poll_loop_scan_list_results` passes the pane's real
-/// `animating_layers().count()` rather than a constant — is NOT pinned here
-/// and cannot be without driving the scan-list channel through a whole `App`;
-/// it is named in the WO-E7d log entry as a residual rather than left to be
-/// discovered. The append path above IS pinned end-to-end.
+/// that `accept_loop_scan_listings` passes the pane's real
+/// `animating_layers().count()` rather than a constant — is NOT pinned here:
+/// a pane animating one layer and a pane animating none divide the same cap,
+/// so no single-layer fixture discriminates them. It is named in the WO-E7d
+/// log entry as a residual rather than left to be discovered. The append path
+/// above IS pinned end-to-end.
 #[test]
 fn a_listing_is_sampled_down_to_the_share_not_to_the_whole_cap() {
     let allocation = crate::app::render::test_loop_allocation();
@@ -116,14 +117,7 @@ fn a_listing_is_sampled_down_to_the_share_not_to_the_whole_cap() {
     let halved = crate::app::render::layer_share(budgets.loop_frames_held, 2);
     assert!(halved < whole, "precondition: halving the cap is visible");
 
-    let scans: Vec<(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)> = (0..200)
-        .map(|minute| {
-            (
-                ts(minute),
-                rustdar_radar::archive::Identifier::new(format!("scan-{minute}")),
-            )
-        })
-        .collect();
+    let scans: Vec<chrono::NaiveDateTime> = (0..200).map(ts).collect();
 
     let build = |animating: usize| {
         let mut pane = pane_animating(&[]);

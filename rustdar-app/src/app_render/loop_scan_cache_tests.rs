@@ -3,7 +3,6 @@ use crate::app::tests::{empty_scan, headless};
 use crate::platform_double::TestBridge;
 use crate::test_keys;
 use rustdar_egui::pane::LoopPhase;
-use rustdar_radar::archive::Identifier;
 use rustdar_radar::types::{RadarProduct, RenderView};
 
 const SITE: &str = "KTLX";
@@ -64,15 +63,7 @@ fn age_listing(app: &mut crate::app::App, secs: u64) {
 fn install_listing(app: &mut crate::app::App, minutes: &[u32]) {
     let allocation = test_loop_allocation();
     let budgets = test_budgets();
-    let scans: Vec<_> = minutes
-        .iter()
-        .map(|&minute| {
-            (
-                at(minute),
-                Identifier::new(format!("KTLX2024010100{minute:02}00_V06")),
-            )
-        })
-        .collect();
+    let scans: Vec<_> = minutes.iter().map(|&minute| at(minute)).collect();
     let pane = app.gui.pane_mut(0).expect("a fresh Gui has one pane");
     accept_scan_listing(allocation, &budgets, pane.loop_state_mut(), SITE, scans, 1)
         .expect("a non-empty listing for this loop's own site is accepted");
@@ -141,15 +132,7 @@ fn pair(app: &mut crate::app::App, code: &str, minute: u32) {
 fn plan_for(minutes: &[u32]) -> rustdar_radar::loop_downloads::FramePlan {
     rustdar_radar::loop_downloads::FramePlan::new(
         SITE.to_string(),
-        minutes
-            .iter()
-            .map(|&minute| {
-                (
-                    at(minute),
-                    Identifier::new(format!("KTLX2024010100{minute:02}00_V06")),
-                )
-            })
-            .collect(),
+        minutes.iter().map(|&minute| at(minute)).collect(),
     )
 }
 

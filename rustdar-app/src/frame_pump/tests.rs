@@ -234,7 +234,7 @@ const EXPECTED_ROWS: &[(&str, PumpPhase)] = &[
     ("poll_level3_results", PumpPhase::Apply),
     ("poll_site_catalogue", PumpPhase::Apply),
     ("poll_overlay_render_results", PumpPhase::Apply),
-    ("poll_loop_scan_list_results", PumpPhase::Apply),
+    ("accept_loop_scan_listings", PumpPhase::Apply),
     ("poll_loop_scan_download_results", PumpPhase::Apply),
     ("poll_loop_l3_list_results", PumpPhase::Apply),
     ("poll_loop_l3_fetch_results", PumpPhase::Apply),

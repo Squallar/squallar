@@ -109,11 +109,15 @@ pub(super) const FRAME_PUMP: &[DrainEntry] = &[
         drains: &["overlay_render_receiver"],
         run: super::render::pump_poll_overlay_render_results,
     },
+    // Not a channel drain since WO-M12b: a radar frame listing arrives on the
+    // one source path in `Ingest`, and this is where the panes waiting on it
+    // build their loops. It holds the position the listing channel's own drain
+    // held, so a listing still turns into a plan and a dispatch in `Apply`.
     DrainEntry {
-        name: "poll_loop_scan_list_results",
+        name: "accept_loop_scan_listings",
         phase: PumpPhase::Apply,
-        drains: &["loop_scan_list_receiver"],
-        run: super::render::pump_poll_loop_scan_list_results,
+        drains: &[],
+        run: super::render::pump_accept_loop_scan_listings,
     },
     DrainEntry {
         name: "poll_loop_scan_download_results",

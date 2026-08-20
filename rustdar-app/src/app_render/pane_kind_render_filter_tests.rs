@@ -570,13 +570,7 @@ fn converting_a_pane_tears_its_loop_down_on_both_sides() {
         app.loop_mgr = LoopDownloadManager::new();
         app.loop_mgr.set_plan(
             0,
-            rustdar_radar::loop_downloads::FramePlan::new(
-                SITE.to_string(),
-                vec![(
-                    volume_time(),
-                    rustdar_radar::archive::Identifier::new("a-volume".to_string()),
-                )],
-            ),
+            rustdar_radar::loop_downloads::FramePlan::new(SITE.to_string(), vec![volume_time()]),
         );
         app.loop_mgr.plan_downloads_for(0, PRODUCT);
         assert!(
