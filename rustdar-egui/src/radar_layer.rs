@@ -79,6 +79,18 @@ pub fn archive_poll_delay(overlays: &OverlayRegistry) -> Option<std::time::Durat
     overlays.auto_fetch_delay(&POLL_LAYER)
 }
 
+/// **Whether a radar round someone is waiting on is in flight** — the
+/// spinner's answer, and the layer's own.
+///
+/// The shell used to keep a second copy of this beside the layer's, raised
+/// and dropped at the same four moments; WO-E8d deleted the copy. The two
+/// could not disagree at any observable point — every path that dropped the
+/// shell's flag ended the layer's round in the same statement pair — which is
+/// what made one of them redundant rather than load-bearing.
+pub fn archive_fetching(overlays: &OverlayRegistry) -> bool {
+    overlays.is_fetching(&POLL_LAYER)
+}
+
 /// Switch the archive poll on or off, through the layer's own control surface
 /// — the one write both the ☰ menu leaf and the settings row make, so the two
 /// cannot drift.

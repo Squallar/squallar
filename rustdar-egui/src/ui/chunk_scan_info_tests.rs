@@ -132,12 +132,55 @@ fn archive_failures(gui: &Gui) -> u32 {
     }
 }
 
+/// **A radar error ends the round it belonged to**: the spinner comes down
+/// and the failure files against the layer's ladder.
+///
+/// Both halves are load-bearing and NEITHER was pinned. Since WO-E8d the
+/// in-flight flag is the radar layer's own, and `auto_fetch_delay` refuses to
+/// schedule a round while one is in flight — so an error that did not end the
+/// round would leave the spinner up and wedge the archive poll for the rest
+/// of the session. The ladder half was unpinned before this land too: nothing
+/// connected a shell-side `GuiEvent::Error` to `FetchRetry`.
+///
+/// Found by a tamper, not by reading: deleting `end_radar_round` from the
+/// `Error` arm was **green** across both packages.
+#[test]
+fn a_radar_error_ends_the_round_it_belonged_to() {
+    // **No product named on purpose.** This test is about a round's end, not
+    // about a tilt, and `PRODUCT_IN_EGUI_MAX` is at its floor — a mention
+    // added for scenery would have spent the ceiling on nothing.
+    let mut gui = gui_with(info(0, &[]));
+
+    gui.apply(crate::shell_api::GuiEvent::Fetching(true));
+    assert!(
+        gui.fetching(),
+        "premise: a round must be in flight to be ended"
+    );
+    assert_eq!(
+        archive_failures(&gui),
+        0,
+        "premise: the ladder starts clean"
+    );
+
+    gui.apply(crate::shell_api::GuiEvent::Error("network down".to_owned()));
+
+    assert!(
+        !gui.fetching(),
+        "an error left the spinner up, and the archive poll wedged behind it"
+    );
+    assert!(
+        archive_failures(&gui) > 0,
+        "an error never reached the layer's retry ladder, so a failing origin \
+         is asked again on the next frame instead of being spaced out"
+    );
+}
+
 /// A chunk round happens on its own every few seconds.
 #[test]
 fn a_chunk_update_leaves_the_fetch_spinner_and_the_backoff_alone() {
     let mut gui = gui_with(info(0, &[(RadarProduct::Reflectivity, &[0.5])]));
     gui.end_radar_round(crate::ui::RoundOutcome::Failed("network down"));
-    gui.radar.fetching = true;
+    gui.set_radar_round_in_flight(true);
     let backed_off = archive_failures(&gui);
     assert!(backed_off > 0, "the fixture must actually be backed off");
 
@@ -147,7 +190,7 @@ fn a_chunk_update_leaves_the_fetch_spinner_and_the_backoff_alone() {
     });
 
     assert!(
-        gui.radar.fetching,
+        gui.fetching(),
         "a chunk update cancelled a manual fetch's spinner"
     );
     assert_eq!(

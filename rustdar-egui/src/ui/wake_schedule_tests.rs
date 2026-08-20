@@ -213,7 +213,7 @@ fn auto_poll_switched_off_asks_for_nothing() {
 }
 
 /// A fetch in flight suppresses the poll (`check_auto_polls` refuses while
-/// `radar.fetching`), so it must suppress the wake too.
+/// the layer's own in-flight flag), so it must suppress the wake too.
 #[test]
 fn a_fetch_in_flight_yields_the_wake_to_whatever_ends_it() {
     let mut gui = Gui::new();

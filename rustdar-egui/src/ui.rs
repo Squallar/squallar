@@ -217,18 +217,57 @@ pub(crate) enum InspectorSelection {
     Layer(LayerId),
 }
 
-/// Radar fetch lifecycle state.
+/// **What is left of the radar shell state after WO-E8d**, and why each half
+/// is still here rather than in the radar layer.
+///
+/// `fetching` and the selected timestamp left: the first was a second copy of
+/// the layer's own in-flight flag, the second belongs beside the dialog that
+/// edits it ([`TimeDialogState::timestamp`]).
+///
+/// **`site`** is the persisted *global* site — the fallback a pane with no
+/// site of its own is opened on, and the one the Set Time dialog fetches
+/// against. WO-E8d's order called this half dead because no fetch path reads
+/// it (every one substitutes the pane's own site). That is true of fetching
+/// and false of the file: `ui_config` writes it as the top-level `site` key
+/// and reads it back as the seed at two places, and the Tier-2 browser rig
+/// pins its scene by seeding exactly that key. Deriving it from the panes
+/// instead would change what a multi-pane session persists and would hollow
+/// three tests whose premise is that a global exists to be wrongly used.
+///
+/// **`error_message`** is the app's only dismissible error surface, and the
+/// DISMISSAL is presentation state: `FetchHealth` has no dismissed state and
+/// no occurrence identity that survives an identical repeat. A generic
+/// dismissible-error surface is a real design question and not this order's.
+///
+/// Both are the stated remainder of WO-E8's "zero radar-specific root
+/// fields", which this order does NOT reach.
 pub(super) struct RadarState {
-    pub config: RadarConfig,
-    pub fetching: bool,
+    pub site: String,
     pub error_message: Option<String>,
 }
 
 /// Time editing dialog state.
 pub(super) struct TimeDialogState {
+    /// **The time on display**, and the value the two strings below are a
+    /// view of. It moved here from the radar config at WO-E8d because this is
+    /// what edits it: the dialog's OK parses the strings into it, Cancel and
+    /// "Use Current Time" reformat the strings from it, and the shell pushes
+    /// it in whenever a navigation lands on a different scan.
+    pub timestamp: chrono::NaiveDateTime,
     pub date_string: String,
     pub time_string: String,
     pub show: bool,
+}
+
+impl TimeDialogState {
+    /// Take a new selected time **and re-render both strings from it**, which
+    /// is the one place that pairing happens — a timestamp written without
+    /// them leaves the dialog showing the previous time.
+    pub fn select(&mut self, timestamp: chrono::NaiveDateTime) {
+        self.timestamp = timestamp;
+        self.date_string = timestamp.format("%Y-%m-%d").to_string();
+        self.time_string = timestamp.format("%H:%M:%S").to_string();
+    }
 }
 
 /// Where an in-flight cross-section draw started.
@@ -551,11 +590,14 @@ pub(crate) fn is_master_control(item: &ControlItem) -> bool {
 
 impl Gui {
     /// The config a radar fetch on the active pane's behalf must use: the
-    /// shared `radar.config` with the active pane's site substituted in.
+    /// time on display, against the **active pane's own site** — never the
+    /// persisted global one, which is only a fallback for a pane that names
+    /// no site.
     pub(super) fn active_pane_fetch_config(&self) -> RadarConfig {
-        let mut config = self.radar.config.clone();
-        config.site = self.active_pane().site().to_string();
-        config
+        RadarConfig {
+            site: self.active_pane().site().to_string(),
+            timestamp: self.time_dialog.timestamp,
+        }
     }
 
     /// Apply one event-shaped push from the App.
@@ -570,7 +612,6 @@ impl Gui {
                         any_pane_took_it = true;
                     }
                 }
-                self.radar.fetching = false;
                 self.end_radar_round(RoundOutcome::Delivered);
                 // Only a scan someone is actually looking at is a reason to zoom to
                 // radar scale. A volume for a site no pane is on — a fetch that landed
@@ -628,28 +669,25 @@ impl Gui {
                 }
             }
             GuiEvent::Fetching(fetching) => {
-                self.radar.fetching = fetching;
-                // The layer's own in-flight flag rides with the shell's, so
-                // `auto_fetch_delay` refuses to schedule a second round on top
-                // of the one already in the air. The rising edge is also what
+                // The layer's own in-flight flag, and since WO-E8d the only
+                // one: `auto_fetch_delay` refuses to schedule a second round
+                // on top of the one already in the air, and the rising edge
                 // stamps the layer's poll clock.
                 self.set_radar_round_in_flight(fetching);
             }
             // Set an error message. The spinner comes down and the archive
             // backoff advances with it — an error ends the wait it belonged to.
             GuiEvent::Error(error) => {
+                // `end_radar_round` drops the in-flight flag itself, which is
+                // why nothing clears a spinner beside it.
                 self.end_radar_round(RoundOutcome::Failed(&error));
                 self.radar.error_message = Some(error);
-                self.radar.fetching = false;
             }
             // Set the radar config, keeping the Set Time dialog's strings in
             // sync with it.
             GuiEvent::RadarConfig(config) => {
-                let date = config.timestamp.format("%Y-%m-%d").to_string();
-                let time = config.timestamp.format("%H:%M:%S").to_string();
-                self.radar.config = config;
-                self.time_dialog.date_string = date;
-                self.time_dialog.time_string = time;
+                self.radar.site = config.site;
+                self.time_dialog.select(config.timestamp);
             }
             GuiEvent::ViewingLiveForPane { pane_idx, live } => {
                 if let Some(pane) = self.panes.get_mut(pane_idx) {
@@ -726,9 +764,10 @@ impl Gui {
         sites
     }
 
-    /// Whether a fetch someone is waiting on is in flight.
+    /// Whether a fetch someone is waiting on is in flight — asked of the
+    /// radar layer, which is the only thing that knows.
     pub fn fetching(&self) -> bool {
-        self.radar.fetching
+        crate::radar_layer::archive_fetching(&self.overlays)
     }
 
     /// The Set Time dialog's body, host-free: the window above wraps it on
@@ -751,11 +790,7 @@ impl Gui {
             ui.add_space(10.0);
 
             if ui.button("Use Current Time").clicked() {
-                self.radar.config.timestamp = chrono::Local::now().naive_local();
-                self.time_dialog.date_string =
-                    self.radar.config.timestamp.format("%Y-%m-%d").to_string();
-                self.time_dialog.time_string =
-                    self.radar.config.timestamp.format("%H:%M:%S").to_string();
+                self.time_dialog.select(chrono::Local::now().naive_local());
             }
 
             ui.add_space(15.0);
@@ -769,20 +804,27 @@ impl Gui {
                     if let Ok(timestamp) =
                         chrono::NaiveDateTime::parse_from_str(&datetime_str, "%Y-%m-%d %H:%M:%S")
                     {
-                        self.radar.config.timestamp = timestamp;
+                        self.time_dialog.timestamp = timestamp;
                         if let Some(pane) = self.panes.get_mut(self.active_pane) {
                             pane.viewing_live = false;
                         }
-                        action = Some(GuiAction::FetchRadarScan(self.radar.config.clone()));
+                        // **The persisted global site, not the active pane's.**
+                        // That is what this button has always fetched, and the
+                        // two differ whenever a pane has been switched away
+                        // from the global.
+                        action = Some(GuiAction::FetchRadarScan(RadarConfig {
+                            site: self.radar.site.clone(),
+                            timestamp,
+                        }));
                     }
                     self.time_dialog.show = false;
                 }
 
                 if ui.button("Cancel").clicked() {
-                    self.time_dialog.date_string =
-                        self.radar.config.timestamp.format("%Y-%m-%d").to_string();
-                    self.time_dialog.time_string =
-                        self.radar.config.timestamp.format("%H:%M:%S").to_string();
+                    // Both strings back to the time still selected, so a
+                    // half-typed edit does not survive the dialog.
+                    let selected = self.time_dialog.timestamp;
+                    self.time_dialog.select(selected);
                     self.time_dialog.show = false;
                 }
             });
@@ -1612,8 +1654,18 @@ impl Gui {
         })
     }
 
-    pub fn get_radar_config(&self) -> &RadarConfig {
-        &self.radar.config
+    /// **The time on display**, which every navigation the shell drives reads
+    /// before it writes a new one.
+    pub fn selected_timestamp(&self) -> chrono::NaiveDateTime {
+        self.time_dialog.timestamp
+    }
+
+    /// **The persisted global site**: the fallback a pane that names no site
+    /// of its own is opened on, and what the Set Time dialog fetches against.
+    /// A fetch on a pane's behalf uses [`Self::active_pane_fetch_config`]
+    /// instead — these two disagree whenever a pane has been switched.
+    pub fn global_site(&self) -> &str {
+        &self.radar.site
     }
 
     pub fn clear_loading_site_for_site(&mut self, site: &str) {

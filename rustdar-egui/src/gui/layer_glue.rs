@@ -104,9 +104,10 @@ impl Gui {
                 // and its site is the default one — so the shared config's
                 // site is substituted from the pane the caller is holding,
                 // exactly as the settings row this button replaced did.
-                let mut config = self.radar.config.clone();
-                config.site = pane.site().to_string();
-                actions.push(GuiAction::FetchRadarScan(config));
+                actions.push(GuiAction::FetchRadarScan(RadarConfig {
+                    site: pane.site().to_string(),
+                    timestamp: self.time_dialog.timestamp,
+                }));
             }
         }
 

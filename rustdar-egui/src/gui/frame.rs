@@ -114,13 +114,12 @@ impl Gui {
         // that declares no interval — would quietly make it the second thing.
         let never_asked = !crate::radar_layer::archive_poll_started(&self.overlays);
 
-        if never_asked && !self.radar.fetching {
-            self.radar.fetching = true;
+        if never_asked && !self.fetching() {
             // The tracked round: the shell drains its answer, so the flag
             // comes back down on delivery or on error.
             self.set_radar_round_in_flight(true);
             actions.push(GuiAction::FetchRadarScan(self.active_pane_fetch_config()));
-        } else if radar_due && self.is_any_pane_live() && !self.radar.fetching {
+        } else if radar_due && self.is_any_pane_live() && !self.fetching() {
             let now = chrono::Local::now().naive_local();
             let current_scan_time = now
                 .with_second(0)

@@ -4,6 +4,7 @@ use chrono::NaiveDateTime;
 use chrono::TimeZone;
 use rustdar_device_profile::constants::LOOP_IMAGE_SIZE;
 use rustdar_egui::actions::GuiAction;
+use rustdar_egui::actions::RadarConfig;
 use rustdar_egui::radar_layer;
 use rustdar_egui::shell_api::GuiEvent;
 use rustdar_overlays::render::overlay_state::{OverlayFetchResult, SourceEvent};
@@ -620,8 +621,10 @@ impl super::App {
             GuiAction::SwitchRadarSite { site, pane_idx } => {
                 log::info!("Switch radar site requested: pane {} -> {}", pane_idx, site);
 
-                let mut new_config = self.gui.get_radar_config().clone();
-                new_config.site = site.clone();
+                let new_config = RadarConfig {
+                    site: site.clone(),
+                    timestamp: self.gui.selected_timestamp(),
+                };
                 self.gui.apply(GuiEvent::RadarConfig(new_config.clone()));
 
                 // The linked group moves together; an unlinked pane moves alone.
@@ -1042,8 +1045,10 @@ impl super::App {
         self.manual_nav_pending = true;
 
         let local_ts = chrono::TimeZone::from_utc_datetime(&chrono::Local, &target).naive_local();
-        let mut config = self.gui.get_radar_config().clone();
-        config.timestamp = local_ts;
+        let config = RadarConfig {
+            site: self.gui.global_site().to_string(),
+            timestamp: local_ts,
+        };
         self.gui.apply(GuiEvent::RadarConfig(config));
         self.gui.apply(GuiEvent::Fetching(true));
 
@@ -1133,8 +1138,10 @@ impl super::App {
 
             let local_ts =
                 chrono::TimeZone::from_utc_datetime(&chrono::Local, &timestamp).naive_local();
-            let mut config = self.gui.get_radar_config().clone();
-            config.timestamp = local_ts;
+            let config = RadarConfig {
+                site: self.gui.global_site().to_string(),
+                timestamp: local_ts,
+            };
             self.gui.apply(GuiEvent::RadarConfig(config));
             self.gui.apply(GuiEvent::ScanInfoForSite {
                 site: pane_site.clone(),
@@ -1159,8 +1166,10 @@ impl super::App {
         }
 
         let now = chrono::Local::now().naive_local();
-        let mut config = self.gui.get_radar_config().clone();
-        config.timestamp = now;
+        let config = RadarConfig {
+            site: self.gui.global_site().to_string(),
+            timestamp: now,
+        };
         self.gui.apply(GuiEvent::RadarConfig(config));
         self.gui.apply(GuiEvent::Fetching(true));
 

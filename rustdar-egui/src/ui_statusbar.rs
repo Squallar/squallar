@@ -104,7 +104,7 @@ impl super::Gui {
                         }
 
                         let refresh_button = ui.add_enabled(
-                            !self.radar.fetching,
+                            !self.fetching(),
                             egui::Button::new("\u{21bb}").frame(false),
                         );
                         #[cfg(test)]
@@ -121,7 +121,7 @@ impl super::Gui {
 
                         let drawn = render_auto_poll_status(
                             ui,
-                            self.radar.fetching,
+                            self.fetching(),
                             ArchivePoll::of(&self.overlays),
                             &crate::radar_layer::chunk_status(self.liveness()),
                         );

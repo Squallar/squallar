@@ -244,7 +244,7 @@ impl super::App {
 
         // The volume's own start, from its first radial — stable across the whole
         // volume. Same helper as the archive drain, so positions cannot diverge.
-        let requested = self.gui.get_radar_config().timestamp;
+        let requested = self.gui.selected_timestamp();
         let info = self.scan_info_learning_position(&scan, site, requested);
         let timestamp = info.timestamp;
 
@@ -326,7 +326,7 @@ impl super::App {
     /// `set_error`, which would reset the archive poll's backoff.
     fn fall_back_to_archive(&mut self, site: &str, reason: Retirement) {
         log::warn!("{site}: chunk feed retired ({reason:?}); refetching from the archive");
-        let timestamp = Self::local_to_utc(self.gui.get_radar_config().timestamp);
+        let timestamp = Self::local_to_utc(self.gui.selected_timestamp());
         self.spawn_fetch(site.to_string(), timestamp);
     }
 
