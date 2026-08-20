@@ -10,8 +10,9 @@ use chrono::Timelike;
 use egui::Context;
 use rustdar_overlays::fetch_policy::FetchHealth;
 use rustdar_overlays::render::overlay_state::OverlayRegistry;
-use rustdar_radar::types::{RadarProduct, ScanInfo};
+use rustdar_radar::types::ScanInfo;
 use rustdar_source::id::{LayerId, known};
+use rustdar_source::product::FieldId;
 use rustdar_units::UserPreferences;
 use std::collections::HashMap;
 
@@ -912,15 +913,19 @@ impl Gui {
                         let scan_info = pane.scan_info.as_ref().expect("presence checked above");
                         let product_combo =
                             egui::ComboBox::from_id_salt(format!("{id_prefix}product_sel"))
-                                .selected_text(pane.selected_product().name())
+                                .selected_text(crate::field_facts::name(&pane.selected_product()))
                                 .width(combo_width)
                                 .show_ui(ui, |ui| {
-                                    pills::product_list_ui(
-                                        ui,
-                                        &scan_info.available_products,
-                                        pane.selected_product(),
-                                    )
-                                    .picked
+                                    // The scan lists what it offers in the
+                                    // radar layer's own terms; the combo names
+                                    // fields by id.
+                                    let options: Vec<_> = scan_info
+                                        .available_products
+                                        .iter()
+                                        .map(|p| rustdar_radar::fields::spec(*p).id.clone())
+                                        .collect();
+                                    pills::product_list_ui(ui, &options, &pane.selected_product())
+                                        .picked
                                 });
                         (product_combo.inner.flatten(), product_combo.response.id)
                     };
@@ -939,7 +944,11 @@ impl Gui {
                     // one whose angles have not arrived yet.
                     let scan_info = pane.scan_info.as_ref().expect("presence checked above");
                     if let Some(elevations) = offer_tilt
-                        .then(|| scan_info.product_elevations.get(&pane.selected_product()))
+                        .then(|| {
+                            let product =
+                                rustdar_radar::fields::product_for(&pane.selected_product())?;
+                            scan_info.product_elevations.get(&product)
+                        })
                         .flatten()
                     {
                         let selected_angle = elevations
@@ -1347,7 +1356,7 @@ impl Gui {
             .is_some_and(|pane| pane.render_view().reads_whole_volume())
     }
 
-    pub fn get_rendering_params_for_pane(&self, pane_idx: PaneId) -> Option<(RadarProduct, f32)> {
+    pub fn get_rendering_params_for_pane(&self, pane_idx: PaneId) -> Option<(FieldId, f32)> {
         self.panes
             .get(pane_idx)
             .and_then(|p| p.get_rendering_params())

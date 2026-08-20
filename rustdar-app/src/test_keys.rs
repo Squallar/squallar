@@ -1,9 +1,12 @@
 //! The one place this crate's loop suites spell a render identity.
 
 use rustdar_egui::pane::RenderTarget;
-use rustdar_radar::types::RadarProduct;
+use rustdar_source::product::FieldId;
 
 /// The render identity of a loop frame for `site`, `product` and `elevation`.
-pub(crate) fn key(site: impl Into<String>, product: RadarProduct, elevation: f32) -> RenderTarget {
+///
+/// The field is named by its id: since WO-E9e a render target holds a `FieldId`
+/// rather than the radar layer's own enum.
+pub(crate) fn key(site: impl Into<String>, product: &FieldId, elevation: f32) -> RenderTarget {
     RenderTarget::new(site, product, elevation)
 }

@@ -1,4 +1,5 @@
 use super::*;
+use rustdar_radar::fields as radar_fields;
 use rustdar_source::handler::PaneRef;
 use rustdar_source::id::{LayerId, known};
 
@@ -1137,7 +1138,6 @@ fn the_color_scale_axis_comes_from_the_panel_not_a_pane() {
 /// 8c. **The hail-size preference reaches the MEHS colour bar on the glass.**
 #[test]
 fn the_mehs_colour_bar_paints_the_users_hail_size_unit() {
-    use rustdar_radar::types::RadarProduct;
     use rustdar_units::HailSizeUnit;
 
     /// The ¼-in stops of `palette::MEHS` as the bar labels them in inches.
@@ -1148,7 +1148,7 @@ fn the_mehs_colour_bar_paints_the_users_hail_size_unit() {
     ];
 
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    h.select_product(0, RadarProduct::MaxExpectedHailSize);
+    h.select_product(0, &radar_fields::known::MAX_EXPECTED_HAIL_SIZE);
     let pane = h.pane_rects()[0];
 
     let painted = h.painted_text_strings_in(pane);
@@ -1206,18 +1206,23 @@ fn velocity_pane(site: &str, nyquist_ms: Option<f64>) -> InputHarness {
 /// The same, on a screen of the caller's choosing — the portrait case puts the bar
 /// along the bottom, where the annotation is laid out differently.
 fn velocity_pane_on(screen: egui::Vec2, site: &str, nyquist_ms: Option<f64>) -> InputHarness {
-    use rustdar_radar::types::RadarProduct;
-
     let mut h = InputHarness::with_screen(screen);
     h.load_scan(site);
     h.gui_mut()
         .pane_mut(0)
         .unwrap()
         .set_overlay_enabled(known::RADAR, true);
-    h.offer_product(0, RadarProduct::Reflectivity, 0.5);
-    h.offer_product(0, RadarProduct::Velocity, 0.5);
-    h.select_product(0, RadarProduct::Velocity);
-    h.place_radar_image(0, RadarProduct::Velocity, 0.5, nyquist_ms, None, None);
+    h.offer_product(0, &radar_fields::known::REFLECTIVITY, 0.5);
+    h.offer_product(0, &radar_fields::known::VELOCITY, 0.5);
+    h.select_product(0, &radar_fields::known::VELOCITY);
+    h.place_radar_image(
+        0,
+        &radar_fields::known::VELOCITY,
+        0.5,
+        nyquist_ms,
+        None,
+        None,
+    );
     h
 }
 
@@ -1339,8 +1344,6 @@ fn a_nyquist_past_the_end_of_the_bar_is_named_but_not_marked() {
 /// 8f. **An undeclared sweep leaves the bar exactly as it was.**
 #[test]
 fn a_sweep_that_declared_no_nyquist_gets_the_bar_unchanged() {
-    use rustdar_radar::types::RadarProduct;
-
     let mut h = velocity_pane("KTLX", None);
     let pane = h.pane_rects()[0];
 
@@ -1369,8 +1372,8 @@ fn a_sweep_that_declared_no_nyquist_gets_the_bar_unchanged() {
             .fold(f32::INFINITY, f32::min)
     };
     let undeclared = title_baseline(&h, "mph");
-    h.select_product(0, RadarProduct::Reflectivity);
-    h.place_radar_image(0, RadarProduct::Reflectivity, 0.5, None, None, None);
+    h.select_product(0, &radar_fields::known::REFLECTIVITY);
+    h.place_radar_image(0, &radar_fields::known::REFLECTIVITY, 0.5, None, None, None);
     assert_eq!(
         undeclared,
         title_baseline(&h, "dBZ"),
@@ -1411,25 +1414,23 @@ fn a_pane_with_no_usable_fold_limit_captions_nothing() {
 /// 8g. **The annotation describes the pixels, not the selection.**
 #[test]
 fn a_pane_annotates_no_fold_while_its_image_lags_the_selection() {
-    use rustdar_radar::types::RadarProduct;
-
     let mut h = velocity_pane("KTLX", Some(DECLARED_NYQUIST_MS));
     assert!(
         fold_line_painted(&h).is_some(),
         "precondition: the pane must be annotating its own render",
     );
 
-    h.select_product(0, RadarProduct::Reflectivity);
+    h.select_product(0, &radar_fields::known::REFLECTIVITY);
     assert_eq!(
         fold_line_painted(&h),
         None,
         "the reflectivity bar carries a velocity sweep's fold limit",
     );
 
-    h.select_product(0, RadarProduct::Velocity);
+    h.select_product(0, &radar_fields::known::VELOCITY);
     h.place_radar_image(
         0,
-        RadarProduct::Velocity,
+        &radar_fields::known::VELOCITY,
         2.4,
         Some(DECLARED_NYQUIST_MS),
         None,
@@ -1442,7 +1443,7 @@ fn a_pane_annotates_no_fold_while_its_image_lags_the_selection() {
     );
     h.place_radar_image(
         0,
-        RadarProduct::Velocity,
+        &radar_fields::known::VELOCITY,
         0.5,
         Some(DECLARED_NYQUIST_MS),
         None,
@@ -1604,7 +1605,6 @@ fn a_phones_colour_scale_clears_the_bottom_bar_that_was_hiding_it() {
 /// 8h(iii). **Every unit title is drawn inside the pane it labels.**
 #[test]
 fn every_products_unit_title_fits_inside_its_pane() {
-    use rustdar_radar::types::RadarProduct;
     use rustdar_units::{HailSizeUnit, HeightUnit, PrecipRateUnit, SpeedUnit};
 
     for screen in [egui::vec2(900.0, 1400.0), egui::vec2(1400.0, 900.0)] {
@@ -1621,9 +1621,10 @@ fn every_products_unit_title_fits_inside_its_pane() {
                             prefs.hail_size = hail_size;
                             prefs.precip_rate = precip_rate;
                         }
-                        for &product in RadarProduct::all() {
+                        for product in radar_fields::known::ALL.iter() {
                             h.select_product(0, product);
-                            let unit = product.unit_label(&h.gui_mut().preferences);
+                            let unit =
+                                crate::field_facts::unit_label(product, &h.gui_mut().preferences);
                             let titles: Vec<egui::Rect> = h
                                 .painted_text_rects()
                                 .into_iter()
@@ -1656,8 +1657,6 @@ fn every_products_unit_title_fits_inside_its_pane() {
 /// 8i. **The purple on the map has a key, on the two products that can paint it.**
 #[test]
 fn the_range_folded_purple_is_keyed_on_the_bars_that_can_paint_it() {
-    use rustdar_radar::types::RadarProduct;
-
     let mut h = velocity_pane("KTLX", Some(DECLARED_NYQUIST_MS));
     let pane = h.pane_rects()[0];
     let purple = {
@@ -1675,9 +1674,16 @@ fn the_range_folded_purple_is_keyed_on_the_bars_that_can_paint_it() {
         h.painted_text_strings_in(pane),
     );
 
-    h.offer_product(0, RadarProduct::SpectrumWidth, 0.5);
-    h.select_product(0, RadarProduct::SpectrumWidth);
-    h.place_radar_image(0, RadarProduct::SpectrumWidth, 0.5, None, None, None);
+    h.offer_product(0, &radar_fields::known::SPECTRUM_WIDTH, 0.5);
+    h.select_product(0, &radar_fields::known::SPECTRUM_WIDTH);
+    h.place_radar_image(
+        0,
+        &radar_fields::known::SPECTRUM_WIDTH,
+        0.5,
+        None,
+        None,
+        None,
+    );
     assert!(
         keyed(&h),
         "spectrum width carries range-folded gates too and has no key for \
@@ -1686,8 +1692,8 @@ fn the_range_folded_purple_is_keyed_on_the_bars_that_can_paint_it() {
     );
     assert_eq!(fold_line_painted(&h), None);
 
-    h.select_product(0, RadarProduct::Reflectivity);
-    h.place_radar_image(0, RadarProduct::Reflectivity, 0.5, None, None, None);
+    h.select_product(0, &radar_fields::known::REFLECTIVITY);
+    h.place_radar_image(0, &radar_fields::known::REFLECTIVITY, 0.5, None, None, None);
     assert!(
         !keyed(&h),
         "the reflectivity bar keys a colour its surveillance cut does not \
@@ -1700,8 +1706,6 @@ fn the_range_folded_purple_is_keyed_on_the_bars_that_can_paint_it() {
 /// nothing has to persist it.**
 #[test]
 fn the_fold_annotation_returns_with_the_picture_rather_than_from_a_config() {
-    use rustdar_radar::types::RadarProduct;
-
     let mut h = velocity_pane("KTLX", Some(DECLARED_NYQUIST_MS));
     let before = fold_line_painted(&h).expect("precondition: an annotated pane");
 
@@ -1720,7 +1724,7 @@ fn the_fold_annotation_returns_with_the_picture_rather_than_from_a_config() {
 
     h.place_radar_image(
         0,
-        RadarProduct::Velocity,
+        &radar_fields::known::VELOCITY,
         0.5,
         Some(DECLARED_NYQUIST_MS),
         None,
@@ -3964,14 +3968,7 @@ fn a_compact_mouse_press_and_hold_raises_the_value_popup() {
     let mut h = InputHarness::with_screen(egui::vec2(420.0, 900.0));
     h.load_scan("KTLX");
     let spot = h.pane_rects()[0].center();
-    h.place_radar_image(
-        0,
-        rustdar_radar::types::RadarProduct::Reflectivity,
-        0.5,
-        None,
-        None,
-        None,
-    );
+    h.place_radar_image(0, &radar_fields::known::REFLECTIVITY, 0.5, None, None, None);
     h.warm_up();
 
     h.mouse_press(spot);
@@ -4545,8 +4542,6 @@ fn scrubbing_to_the_right_end_restores_live() {
 /// 26e. **A product whose tilts have not arrived keeps its tilt picker.**
 #[test]
 fn a_product_whose_tilts_have_not_arrived_keeps_its_tilt_picker() {
-    use rustdar_radar::types::RadarProduct;
-
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.load_scan("KTLX");
     h.open_pane_props();
@@ -4554,12 +4549,21 @@ fn a_product_whose_tilts_have_not_arrived_keeps_its_tilt_picker() {
         let pane = h.gui_mut().pane_mut(0).unwrap();
         pane.set_overlay_enabled(known::RADAR, true);
         let info = pane.scan_info.as_mut().expect("a scan was loaded");
-        info.product_elevations
-            .insert(RadarProduct::Reflectivity, vec![0.5, 1.5]);
-        info.available_products.push(RadarProduct::EchoTops);
-        info.product_elevations
-            .insert(RadarProduct::EchoTops, Vec::new());
-        pane.set_selected_product(RadarProduct::EchoTops);
+        info.product_elevations.insert(
+            rustdar_radar::fields::product_for(&radar_fields::known::REFLECTIVITY)
+                .expect("a registered field"),
+            vec![0.5, 1.5],
+        );
+        info.available_products.push(
+            rustdar_radar::fields::product_for(&radar_fields::known::ECHO_TOPS)
+                .expect("a registered field"),
+        );
+        info.product_elevations.insert(
+            rustdar_radar::fields::product_for(&radar_fields::known::ECHO_TOPS)
+                .expect("a registered field"),
+            Vec::new(),
+        );
+        pane.set_selected_product(radar_fields::known::ECHO_TOPS);
         pane.set_selected_elevation(0.0);
     }
     h.warm_up();
@@ -4572,13 +4576,13 @@ fn a_product_whose_tilts_have_not_arrived_keeps_its_tilt_picker() {
     );
     assert_eq!(
         h.gui_mut().pane(0).unwrap().get_rendering_params(),
-        Some((RadarProduct::EchoTops, 0.0)),
+        Some((radar_fields::known::ECHO_TOPS, 0.0)),
     );
 
     h.gui_mut()
         .pane_mut(0)
         .unwrap()
-        .set_selected_product(RadarProduct::Reflectivity);
+        .set_selected_product(radar_fields::known::REFLECTIVITY);
     h.warm_up();
     assert!(
         h.painted_text_strings().iter().any(|t| t == "0.5\u{b0}"),
@@ -4589,27 +4593,25 @@ fn a_product_whose_tilts_have_not_arrived_keeps_its_tilt_picker() {
 
 /// A harness with one pane on KTLX offering a Level II and a Level III product at
 /// 0.5°, radar layer on, showing a finished `showing` image.
-fn pane_showing(showing: rustdar_radar::types::RadarProduct) -> InputHarness {
-    use rustdar_radar::types::RadarProduct;
-
+fn pane_showing(showing: &rustdar_source::product::FieldId) -> InputHarness {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.load_scan("KTLX");
     h.gui_mut()
         .pane_mut(0)
         .unwrap()
         .set_overlay_enabled(known::RADAR, true);
-    h.offer_product(0, RadarProduct::Reflectivity, 0.5);
-    h.offer_product(0, RadarProduct::EchoTops, 0.5);
+    h.offer_product(0, &radar_fields::known::REFLECTIVITY, 0.5);
+    h.offer_product(0, &radar_fields::known::ECHO_TOPS, 0.5);
     h.select_product(0, showing);
     h.place_radar_image(0, showing, 0.5, None, None, None);
     h
 }
 
 /// The pending-render notice for `product`, as the pane paints it.
-fn notice_painted(h: &InputHarness, product: rustdar_radar::types::RadarProduct) -> bool {
+fn notice_painted(h: &InputHarness, product: rustdar_source::product::FieldId) -> bool {
     h.painted_text_strings()
         .iter()
-        .any(|t| t.starts_with('\u{27f3}') && t.contains(product.name()))
+        .any(|t| t.starts_with('\u{27f3}') && t.contains(crate::field_facts::name(&product)))
 }
 
 /// Any pending-render notice at all, whatever it names.
@@ -4622,18 +4624,16 @@ fn any_notice_painted(h: &InputHarness) -> bool {
 /// 26f. **A pane says when its image is not the product it is labelled with.**
 #[test]
 fn a_pane_says_when_its_image_is_not_the_selected_product() {
-    use rustdar_radar::types::RadarProduct;
-
-    let mut h = pane_showing(RadarProduct::Reflectivity);
+    let mut h = pane_showing(&radar_fields::known::REFLECTIVITY);
     assert!(
         !any_notice_painted(&h),
         "a pane showing what it selected has nothing to disown; painted: {:?}",
         h.painted_text_strings(),
     );
 
-    h.select_product(0, RadarProduct::EchoTops);
+    h.select_product(0, &radar_fields::known::ECHO_TOPS);
     assert!(
-        notice_painted(&h, RadarProduct::Reflectivity),
+        notice_painted(&h, radar_fields::known::REFLECTIVITY),
         "the pane is showing reflectivity and labelled echo tops, and said \
              nothing; painted: {:?}",
         h.painted_text_strings(),
@@ -4654,7 +4654,7 @@ fn a_pane_says_when_its_image_is_not_the_selected_product() {
         "the pane was cleared rather than annotated",
     );
 
-    h.place_radar_image(0, RadarProduct::EchoTops, 0.5, None, None, None);
+    h.place_radar_image(0, &radar_fields::known::ECHO_TOPS, 0.5, None, None, None);
     assert!(
         !any_notice_painted(&h),
         "the notice outlived the render it was waiting for; painted: {:?}",
@@ -4665,11 +4665,9 @@ fn a_pane_says_when_its_image_is_not_the_selected_product() {
 /// 26g. **…and it does not flash on a routine refresh.**
 #[test]
 fn a_same_selection_re_render_draws_no_notice() {
-    use rustdar_radar::types::RadarProduct;
-
-    let mut h = pane_showing(RadarProduct::Reflectivity);
+    let mut h = pane_showing(&radar_fields::known::REFLECTIVITY);
     for _ in 0..2 {
-        h.place_radar_image(0, RadarProduct::Reflectivity, 0.5, None, None, None);
+        h.place_radar_image(0, &radar_fields::known::REFLECTIVITY, 0.5, None, None, None);
         assert!(
             !any_notice_painted(&h),
             "a routine re-render of the selected product drew a notice; \
@@ -4682,7 +4680,7 @@ fn a_same_selection_re_render_draws_no_notice() {
     h.warm_up();
     assert_eq!(
         h.gui_mut().pane(0).unwrap().get_rendering_params(),
-        Some((RadarProduct::Reflectivity, 0.5)),
+        Some((radar_fields::known::REFLECTIVITY, 0.5)),
         "precondition: the selection snaps to the drawn sweep",
     );
     assert!(
@@ -4695,10 +4693,15 @@ fn a_same_selection_re_render_draws_no_notice() {
 /// 26h. **The notice is the same for a Level II and a Level III product.**
 #[test]
 fn the_pending_notice_is_identical_for_both_datasources() {
-    use rustdar_radar::types::RadarProduct;
+    use rustdar_source::product::FieldId;
 
-    let (l2, l3) = (RadarProduct::Reflectivity, RadarProduct::EchoTops);
-    assert!(!l2.is_level3() && l3.is_level3(), "one of each datasource");
+    let (l2, l3) = (
+        &radar_fields::known::REFLECTIVITY,
+        &radar_fields::known::ECHO_TOPS,
+    );
+    let l3_of =
+        |id: &FieldId| rustdar_radar::fields::product_for(id).is_some_and(|p| p.is_level3());
+    assert!(!l3_of(l2) && l3_of(l3), "one of each datasource");
 
     let mut awaiting_l3 = pane_showing(l2);
     awaiting_l3.select_product(0, l3);
@@ -4728,8 +4731,8 @@ fn the_pending_notice_is_identical_for_both_datasources() {
 
     let strip = |t: &str, name: &str| t.replace(name, "<product>");
     assert_eq!(
-        strip(&notice_of(&awaiting_l3), l2.name()),
-        strip(&notice_of(&awaiting_l2), l3.name()),
+        strip(&notice_of(&awaiting_l3), crate::field_facts::name(l2)),
+        strip(&notice_of(&awaiting_l2), crate::field_facts::name(l3)),
         "the two datasources drew differently shaped notices, which is a way \
              to tell them apart",
     );
@@ -4743,30 +4746,28 @@ fn the_pending_notice_is_identical_for_both_datasources() {
 /// 26i. **A pane with no image says nothing, and neither does a looping one.**
 #[test]
 fn nothing_is_said_where_there_is_no_stale_image() {
-    use rustdar_radar::types::RadarProduct;
-
     let mut bare = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     bare.load_scan("KTLX");
     bare.gui_mut()
         .pane_mut(0)
         .unwrap()
         .set_overlay_enabled(known::RADAR, true);
-    bare.offer_product(0, RadarProduct::EchoTops, 0.5);
-    bare.select_product(0, RadarProduct::EchoTops);
+    bare.offer_product(0, &radar_fields::known::ECHO_TOPS, 0.5);
+    bare.select_product(0, &radar_fields::known::ECHO_TOPS);
     assert!(
         !any_notice_painted(&bare),
         "an empty pane has no pixels to disown; painted: {:?}",
         bare.painted_text_strings(),
     );
 
-    let mut looping = pane_showing(RadarProduct::Reflectivity);
+    let mut looping = pane_showing(&radar_fields::known::REFLECTIVITY);
     let site = rustdar_radar::sites::get_radar_site("KTLX").expect("a real radar");
     {
         let pane = looping.gui_mut().pane_mut(0).unwrap();
         *pane.loop_state_mut() =
             crate::radar_layer::begin_loop(600, site, rustdar_radar::types::RenderView::PlanView);
     }
-    looping.select_product(0, RadarProduct::EchoTops);
+    looping.select_product(0, &radar_fields::known::ECHO_TOPS);
     assert!(
         looping.gui_mut().pane(0).unwrap().loop_state().is_active(),
         "precondition: the loop is running",
@@ -5745,7 +5746,7 @@ fn a_converted_pane_keeps_its_site_and_viewport() {
             .gui_mut()
             .pane_mut(0)
             .expect("a fresh harness has one pane");
-        pane.set_selected_product(rustdar_radar::types::RadarProduct::Velocity);
+        pane.set_selected_product(radar_fields::known::VELOCITY);
         pane.set_selected_elevation(1.5);
         pane.viewing_live = false;
         let _ = pane.map_memory.set_zoom(9.25);
@@ -5769,7 +5770,7 @@ fn a_converted_pane_keeps_its_site_and_viewport() {
         (
             pane.site().to_string(),
             pane.scan_info.as_ref().map(|info| info.site.name),
-            pane.selected_product().name().to_owned(),
+            crate::field_facts::name(&pane.selected_product()).to_owned(),
             pane.selected_elevation(),
             pane.viewing_live,
             pane.map_memory.zoom(),
@@ -5921,7 +5922,7 @@ fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
     ] {
         let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
         h.load_scan("KTLX");
-        h.offer_product(0, rustdar_radar::types::RadarProduct::Reflectivity, 0.5);
+        h.offer_product(0, &radar_fields::known::REFLECTIVITY, 0.5);
         h.open_pane_props();
         assert_eq!(
             combos(&h),
@@ -6327,7 +6328,7 @@ fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
         .expect("pane 0 is a 3D pane")
         .view_mode = crate::pane::VolumeViewMode::Isosurface;
     h.gui_mut().volume_alpha.set(
-        &rustdar_radar::fields::spec(rustdar_radar::types::RadarProduct::Reflectivity).id,
+        &radar_fields::known::REFLECTIVITY,
         crate::volume_alpha::AlphaCurve::from_alphas([7u8; crate::volume_alpha::CURVE_LEN]),
     );
     h.frames_for(2, FRAME_DT);
@@ -8210,7 +8211,7 @@ fn the_catalog_search_filters_and_a_product_tile_aims_the_active_pane() {
     let pane = h.gui_mut().pane(0).expect("pane 0");
     assert_eq!(
         pane.selected_product(),
-        rustdar_radar::types::RadarProduct::SpectrumWidth,
+        radar_fields::known::SPECTRUM_WIDTH,
         "the tile did not set the active pane's product"
     );
     assert_eq!(
@@ -8321,7 +8322,7 @@ fn a_saved_preset_appears_applies_and_deletes() {
     h.gui_mut()
         .pane_mut(0)
         .expect("pane 0")
-        .set_selected_product(rustdar_radar::types::RadarProduct::Velocity);
+        .set_selected_product(radar_fields::known::VELOCITY);
     h.set_overlay_on_pane(0, &known::STORM_REPORTS, true);
     h.warm_up();
 
@@ -8355,7 +8356,7 @@ fn a_saved_preset_appears_applies_and_deletes() {
     h.gui_mut()
         .pane_mut(0)
         .expect("pane 0")
-        .set_selected_product(rustdar_radar::types::RadarProduct::Reflectivity);
+        .set_selected_product(radar_fields::known::REFLECTIVITY);
     h.set_overlay_on_pane(0, &known::STORM_REPORTS, false);
     h.warm_up();
     let tile = h
@@ -8371,7 +8372,7 @@ fn a_saved_preset_appears_applies_and_deletes() {
     assert_eq!(h.pane_count(), 2, "the preset's pane count must come back");
     assert_eq!(
         h.gui_mut().pane(0).expect("pane 0").selected_product(),
-        rustdar_radar::types::RadarProduct::Velocity,
+        radar_fields::known::VELOCITY,
         "the preset's per-pane product must come back"
     );
     assert!(
@@ -8789,8 +8790,8 @@ fn the_site_pill_popover_searches_and_switches() {
 fn the_product_and_tilt_pill_popovers_write_the_pane() {
     let mut h = pill_harness();
     h.load_scan("KTLX");
-    h.offer_product(0, rustdar_radar::types::RadarProduct::Reflectivity, 0.5);
-    h.offer_product(0, rustdar_radar::types::RadarProduct::Reflectivity, 1.5);
+    h.offer_product(0, &radar_fields::known::REFLECTIVITY, 0.5);
+    h.offer_product(0, &radar_fields::known::REFLECTIVITY, 1.5);
     h.close_layers();
 
     let (code, pill) = h.pill(0, PillKind::Product).expect("a product pill");
@@ -8818,7 +8819,7 @@ fn the_product_and_tilt_pill_popovers_write_the_pane() {
         let pane = h.gui_mut().pane(0).expect("pane 0");
         assert_eq!(
             pane.selected_product(),
-            rustdar_radar::types::RadarProduct::Velocity,
+            radar_fields::known::VELOCITY,
             "the pick did not set the pane's product"
         );
         assert_eq!(
@@ -8828,7 +8829,7 @@ fn the_product_and_tilt_pill_popovers_write_the_pane() {
         );
     }
 
-    h.select_product(0, rustdar_radar::types::RadarProduct::Reflectivity);
+    h.select_product(0, &radar_fields::known::REFLECTIVITY);
     let (_, pill) = h
         .pill(0, PillKind::Tilt)
         .expect("a map pane draws a tilt pill");
@@ -12737,19 +12738,17 @@ fn a_stale_zoom_asks_for_the_frame_its_settle_needs() {
 /// A harness with one pane on KTLX showing a finished hybrid-classification image
 /// that stood on `source`.
 fn classification_showing(source: Option<rustdar_radar::hca::MeltingLayerSource>) -> InputHarness {
-    use rustdar_radar::types::RadarProduct;
-
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.load_scan("KTLX");
     h.gui_mut()
         .pane_mut(0)
         .unwrap()
         .set_overlay_enabled(known::RADAR, true);
-    h.offer_product(0, RadarProduct::HydrometeorClassification, 0.5);
-    h.select_product(0, RadarProduct::HydrometeorClassification);
+    h.offer_product(0, &radar_fields::known::HYDROMETEOR_CLASSIFICATION, 0.5);
+    h.select_product(0, &radar_fields::known::HYDROMETEOR_CLASSIFICATION);
     h.place_radar_image(
         0,
-        RadarProduct::HydrometeorClassification,
+        &radar_fields::known::HYDROMETEOR_CLASSIFICATION,
         0.5,
         None,
         source,
@@ -12831,7 +12830,6 @@ fn a_classification_says_when_its_melting_layer_was_never_measured() {
 fn the_top_of_pane_notices_never_stack() {
     use rustdar_radar::hca::MeltingLayerSource;
     use rustdar_radar::srv::StormMotionSource;
-    use rustdar_radar::types::RadarProduct;
 
     let mut h = classification_showing(Some(MeltingLayerSource::FleetDefault));
     assert!(
@@ -12846,8 +12844,8 @@ fn the_top_of_pane_notices_never_stack() {
         h.painted_text_strings(),
     );
 
-    h.offer_product(0, RadarProduct::Reflectivity, 0.5);
-    h.select_product(0, RadarProduct::Reflectivity);
+    h.offer_product(0, &radar_fields::known::REFLECTIVITY, 0.5);
+    h.select_product(0, &radar_fields::known::REFLECTIVITY);
     assert!(
         any_notice_painted(&h),
         "precondition: the pane is showing a classification labelled \
@@ -12874,8 +12872,8 @@ fn the_top_of_pane_notices_never_stack() {
         srv.painted_text_strings(),
     );
 
-    srv.offer_product(0, RadarProduct::Reflectivity, 0.5);
-    srv.select_product(0, RadarProduct::Reflectivity);
+    srv.offer_product(0, &radar_fields::known::REFLECTIVITY, 0.5);
+    srv.select_product(0, &radar_fields::known::REFLECTIVITY);
     assert!(
         any_notice_painted(&srv),
         "precondition: the pane is showing a storm-relative field labelled \
@@ -12893,19 +12891,17 @@ fn the_top_of_pane_notices_never_stack() {
 /// A harness with one pane on KTLX showing a finished storm-relative velocity image
 /// that was shifted by `source`.
 fn storm_relative_showing(source: Option<rustdar_radar::srv::SrvMotion>) -> InputHarness {
-    use rustdar_radar::types::RadarProduct;
-
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.load_scan("KTLX");
     h.gui_mut()
         .pane_mut(0)
         .unwrap()
         .set_overlay_enabled(known::RADAR, true);
-    h.offer_product(0, RadarProduct::StormRelativeVelocity, 0.5);
-    h.select_product(0, RadarProduct::StormRelativeVelocity);
+    h.offer_product(0, &radar_fields::known::STORM_RELATIVE_VELOCITY, 0.5);
+    h.select_product(0, &radar_fields::known::STORM_RELATIVE_VELOCITY);
     h.place_radar_image(
         0,
-        RadarProduct::StormRelativeVelocity,
+        &radar_fields::known::STORM_RELATIVE_VELOCITY,
         0.5,
         None,
         None,
@@ -13236,14 +13232,15 @@ fn applying_a_preset_that_names_an_unregistered_field_leaves_the_pane_alone() {
     // this test is about field ids, and reading one back through
     // `fields::product_for` is both the path under test and one fewer place the
     // enum has to be spelled.
-    let start = rustdar_radar::fields::product_for(&rustdar_source::product::FieldId::from_static(
-        "SpectrumWidth",
-    ))
-    .expect("the radar layer registers SpectrumWidth");
+    let start = rustdar_source::product::FieldId::from_static("SpectrumWidth");
+    assert!(
+        rustdar_radar::fields::spec_for(&start).is_some(),
+        "the radar layer registers SpectrumWidth"
+    );
     h.gui_mut()
         .pane_mut(0)
         .expect("pane 0")
-        .set_selected_product(start);
+        .set_selected_product(start.clone());
     h.warm_up();
 
     h.gui_mut().push_preset_for_test(crate::ui::PresetConfig {

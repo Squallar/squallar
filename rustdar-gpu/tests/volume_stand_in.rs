@@ -123,7 +123,7 @@ fn target(half_width_km: f64) -> VolumeTarget {
                 .and_hms_opt(22, 0, 0)
                 .unwrap(),
         },
-        product: RadarProduct::Reflectivity,
+        product: rustdar_radar::fields::known::REFLECTIVITY,
         region: Some(
             VolumeRegion::new(
                 GeoPoint {

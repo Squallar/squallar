@@ -1,4 +1,5 @@
 use super::*;
+use rustdar_radar::fields as radar_fields;
 
 /// A measured caption height standing in for one wrapped row, for the tests that
 /// are about the *rest* of the layout.
@@ -244,7 +245,7 @@ fn the_caption_wraps_and_the_layout_pays_for_the_rows_it_takes() {
             false,
             caption_lines(
                 &truncated,
-                RadarProduct::Reflectivity,
+                &radar_fields::known::REFLECTIVITY,
                 None,
                 BARE_LADDER,
                 None,
@@ -317,7 +318,7 @@ fn the_caption_wraps_and_the_layout_pays_for_the_rows_it_takes() {
             false,
             caption_lines(
                 &truncated,
-                RadarProduct::Reflectivity,
+                &radar_fields::known::REFLECTIVITY,
                 None,
                 BARE_LADDER,
                 Some(crate::pane::SectionUnavailable::RenderFailed),
@@ -350,7 +351,7 @@ fn a_degenerate_ladder_does_not_report_itself_as_a_perfect_one() {
         };
         caption_lines(
             &axes,
-            RadarProduct::Reflectivity,
+            &radar_fields::known::REFLECTIVITY,
             None,
             BARE_LADDER,
             None,
@@ -415,7 +416,7 @@ fn a_ladder_that_stopped_short_stays_calm_and_explains_on_request() {
     let lines = |axes: SectionAxes, detail_open: bool| {
         caption_lines(
             &axes,
-            RadarProduct::Reflectivity,
+            &radar_fields::known::REFLECTIVITY,
             None,
             BARE_LADDER,
             None,
@@ -580,7 +581,7 @@ fn red_is_reserved_for_broken_states() {
     let lines = |axes: SectionAxes, unavailable: Option<SectionUnavailable>| {
         caption_lines(
             &axes,
-            RadarProduct::Reflectivity,
+            &radar_fields::known::REFLECTIVITY,
             None,
             BARE_LADDER,
             unavailable,
@@ -633,13 +634,13 @@ fn red_is_reserved_for_broken_states() {
         (SectionUnavailable::AwaitingCoveragePattern, false),
         (
             SectionUnavailable::ProductHasNoVerticalStructure(
-                RadarProduct::VerticallyIntegratedLiquid,
+                radar_fields::known::VERTICALLY_INTEGRATED_LIQUID,
             ),
             false,
         ),
         (SectionUnavailable::RenderFailed, true),
     ] {
-        let all = lines(axes(), Some(reason));
+        let all = lines(axes(), Some(reason.clone()));
         let status = all.last().expect("a status line was pushed");
         assert_eq!(
             status.color == visuals.error_fg_color,
@@ -811,7 +812,7 @@ fn the_caption_names_the_assembly_span_only_when_it_is_beyond_one_volume() {
         let axes = axes();
         caption_lines(
             &axes,
-            RadarProduct::Reflectivity,
+            &radar_fields::known::REFLECTIVITY,
             None,
             Ladder {
                 elevations_deg: &degs,
@@ -845,7 +846,7 @@ fn the_caption_names_the_assembly_span_only_when_it_is_beyond_one_volume() {
         let axes = axes();
         caption_lines(
             &axes,
-            RadarProduct::Reflectivity,
+            &radar_fields::known::REFLECTIVITY,
             None,
             Ladder {
                 elevations_deg: &degs,
@@ -869,7 +870,7 @@ fn the_caption_names_the_assembly_span_only_when_it_is_beyond_one_volume() {
         let axes = axes();
         caption_lines(
             &axes,
-            RadarProduct::Reflectivity,
+            &radar_fields::known::REFLECTIVITY,
             None,
             Ladder {
                 elevations_deg: &degs,
@@ -897,7 +898,7 @@ fn the_caption_names_the_assembly_span_only_when_it_is_beyond_one_volume() {
         let axes = axes();
         caption_lines(
             &axes,
-            RadarProduct::Reflectivity,
+            &radar_fields::known::REFLECTIVITY,
             None,
             Ladder {
                 elevations_deg: &[0.5, 1.5, 2.4],
@@ -927,7 +928,7 @@ fn the_info_detail_lists_every_rung_with_its_own_age() {
         let axes = axes();
         caption_lines(
             &axes,
-            RadarProduct::Reflectivity,
+            &radar_fields::known::REFLECTIVITY,
             None,
             Ladder {
                 elevations_deg: degs,
@@ -1053,7 +1054,7 @@ fn the_hover_names_the_sweep_it_came_from_and_how_old_it_is() {
             &section,
             &layout,
             at(km_msl),
-            RadarProduct::Reflectivity,
+            &radar_fields::known::REFLECTIVITY,
             Some(source),
             prefs,
         )

@@ -6,7 +6,7 @@ use rustdar_geo::{GeoBounds, PlacedRaster};
 use rustdar_overlays::render::geo as overlay_geo;
 use rustdar_overlays::render::rasterize::HitMap;
 use rustdar_overlays::types::{OverlayFeature, ScreenPoint};
-use rustdar_radar::types::RadarProduct;
+use rustdar_source::product::FieldId;
 
 // ── Viewport state (reused for render-trigger detection) ─────────────────
 
@@ -139,7 +139,7 @@ pub struct RadarTextureMeta {
     /// Where the storm motion vector these pixels were shifted by came from,
     /// or `None` for a raster that shifted nothing.
     pub storm_motion: Option<rustdar_radar::srv::SrvMotion>,
-    pub product: RadarProduct,
+    pub product: FieldId,
     /// The sweep angle these pixels depict — the *snapped* elevation the
     /// renderer was given, which is what
     /// [`crate::pane::PaneState::get_rendering_params`] resolves and what the

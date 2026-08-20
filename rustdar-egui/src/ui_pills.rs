@@ -4,7 +4,8 @@
 use crate::actions::GuiAction;
 use crate::pane::PaneId;
 use crate::ui_layout::PointerModality;
-use rustdar_radar::types::{RadarProduct, RenderView};
+use rustdar_radar::types::RenderView;
+use rustdar_source::product::FieldId;
 
 /// The row's idle opacity; the reveal animates between this and 1.0.
 const PILL_IDLE_OPACITY: f32 = 0.35;
@@ -312,12 +313,17 @@ fn shown_total_tdwrs(
 /// inspector's product combo body and the product pill's popover alike.
 pub(super) fn product_list_ui(
     ui: &mut egui::Ui,
-    options: &[RadarProduct],
-    current: RadarProduct,
-) -> PickOutcome<RadarProduct> {
+    options: &[FieldId],
+    current: &FieldId,
+) -> PickOutcome<FieldId> {
     let mut outcome = PickOutcome::default();
-    for &product in options {
-        outcome.row(ui, product.name(), product == current, product);
+    for product in options {
+        outcome.row(
+            ui,
+            crate::field_facts::name(product),
+            product == current,
+            product.clone(),
+        );
     }
     outcome
 }
@@ -524,12 +530,20 @@ impl super::Gui {
                 (pane.viewport_link, pane.layer_link, pane.time_link),
                 pane.cross_section().and_then(|s| s.line).is_none(),
                 tilt,
+                pane.scan_info.as_ref().map(|info| {
+                    // The scan lists what it offers in the radar layer's own
+                    // terms; the picker names fields by id.
+                    info.available_products
+                        .iter()
+                        .map(|p| rustdar_radar::fields::spec(*p).id.clone())
+                        .collect::<Vec<_>>()
+                }),
                 pane.scan_info
                     .as_ref()
-                    .map(|info| info.available_products.clone()),
-                pane.scan_info
-                    .as_ref()
-                    .and_then(|info| info.product_elevations.get(&pane.selected_product()))
+                    .and_then(|info| {
+                        let product = rustdar_radar::fields::product_for(&pane.selected_product())?;
+                        info.product_elevations.get(&product)
+                    })
                     .cloned()
                     .unwrap_or_default(),
             )
@@ -605,7 +619,7 @@ impl super::Gui {
                         self.site_pill_popover(&pill, idx, &site, actions);
                     }
 
-                    let code = product.code().to_uppercase();
+                    let code = crate::field_facts::code(&product).to_uppercase();
                     let pill = ui.button(code.as_str()).on_hover_text("Radar product");
                     #[cfg(test)]
                     probe.pills.push((PillKind::Product, code, pill.rect));
@@ -617,7 +631,7 @@ impl super::Gui {
                         }
                     }
                     if !swallow {
-                        self.product_pill_popover(&pill, idx, products.as_deref(), product);
+                        self.product_pill_popover(&pill, idx, products.as_deref(), &product);
                     }
 
                     if is_map {
@@ -752,8 +766,8 @@ impl super::Gui {
         &mut self,
         pill: &egui::Response,
         idx: PaneId,
-        options: Option<&[RadarProduct]>,
-        current: RadarProduct,
+        options: Option<&[FieldId]>,
+        current: &FieldId,
     ) {
         let shown = egui::Popup::menu(pill)
             .id(pill_popup_id(idx, PillKind::Product))

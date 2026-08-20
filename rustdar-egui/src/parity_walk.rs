@@ -357,8 +357,8 @@ fn walk_catalog(h: &mut InputHarness, width: WidthClass) {
 
     // **The field floor, and it is new at WO-E9d land 2 because the exposure is
     // new.** Before this land the field legs were enumerated from
-    // `RadarProduct::all()` / `ModelParameter::all()` — enums in other crates,
-    // and therefore already an independent second spelling of what the
+    // the two source enums' own `all()` lists — enums in other crates, and
+    // therefore already an independent second spelling of what the
     // catalogue drew. Deriving the inventory from `fields()` removed that
     // independence in exactly the way ruling (30) described for layers: the
     // walk and the thing it walks would read one list, and a registry that

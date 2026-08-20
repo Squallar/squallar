@@ -14,15 +14,16 @@ use std::sync::Arc;
 
 use crate::tile_source::HttpsTiles;
 use rustdar_geo::KM_PER_DEGREE_LAT;
+use rustdar_radar::get_color_for_value;
 use rustdar_radar::hca::MeltingLayerSource;
 use rustdar_radar::hover::{HoverSource, Reading};
 use rustdar_radar::sites::RadarSite;
-use rustdar_radar::types::RadarProduct;
-use rustdar_radar::{get_color_for_value, get_legend_scale_ref};
 use rustdar_source::id::{LayerId, known};
+use rustdar_source::product::FieldId;
 use rustdar_source::time::TimeAxis;
 
 use super::super::map_overlays::{OverlayDrawContext, draw_tile_layer, is_pos_blocked};
+use rustdar_radar::fields as radar_fields;
 
 /// Which of a pane's surfaces one call to [`render_pane_map_content`] paints.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -129,7 +130,7 @@ pub(super) fn render_pane_map_content(
         let mut selected: Vec<Arc<dyn OverlayItem>> = Vec::new();
         // The stale-image notice, deferred out of the Radar arm's position:
         // it must read over every overlay drawn after the radar.
-        let mut pending_notice: Option<(RadarProduct, f32)> = None;
+        let mut pending_notice: Option<(FieldId, f32)> = None;
         let mut melting_layer_caveat: Option<MeltingLayerSource> = None;
 
         let draw_order: Vec<LayerId> = ctx.pane.draw_order_vec();
@@ -299,7 +300,7 @@ pub(super) fn render_pane_map_content(
                 // The pill row's measured clearance, not the one-row
                 // constant: a narrow pane wraps the row.
                 crate::ui::pills::pill_row_clearance(ui.ctx(), ctx.pane_idx),
-                on_screen,
+                &on_screen,
                 elevation,
             );
         }
@@ -627,7 +628,7 @@ fn update_pane_hover_value_from_meta(
             hover_lat: map_pos.y(),
             hover_lon: map_pos.x(),
         },
-        pane.selected_product(),
+        &pane.selected_product(),
         prefs,
     ));
 }
@@ -965,7 +966,7 @@ pub(super) fn color_scale_gutter(
         return 0.0;
     }
     let product = pane.selected_product();
-    let legend = get_legend_scale_ref(product);
+    let legend = crate::field_facts::facts(&product).scale;
     if legend.thresholds.len() < 2 {
         return 0.0;
     }
@@ -984,7 +985,13 @@ pub(super) fn color_scale_gutter(
     // bar-and-gap further in. Every one is measured, not the innermost alone.
     let view = pane.view(pane_idx);
     let ticks = memoized_ticks(measure.ctx(), pane, prefs);
-    let mut reach = legend_block_reach(measure, horizontal, 0.0, &ticks, product.unit_label(prefs));
+    let mut reach = legend_block_reach(
+        measure,
+        horizontal,
+        0.0,
+        &ticks,
+        crate::field_facts::unit_label(&product, prefs),
+    );
     let mut offset = 0.0;
     for id in pane.draw_order() {
         if *id == known::COLOR_SCALE || !pane.is_overlay_enabled(id) {
@@ -1104,8 +1111,9 @@ fn short_tick(value: f32) -> String {
 /// Every value label `render_color_scale` writes beside `product`'s bar, in
 /// order, before `MIN_LABEL_SPACING` thinning. The **formatting**, not the
 /// per-frame answer: [`memoized_ticks`] calls this on a miss.
-pub(super) fn legend_ticks(product: RadarProduct, prefs: &UserPreferences) -> Vec<String> {
-    get_legend_scale_ref(product)
+pub(super) fn legend_ticks(product: &FieldId, prefs: &UserPreferences) -> Vec<String> {
+    crate::field_facts::facts(product)
+        .scale
         .thresholds
         .iter()
         .map(|&(value, _)| format_legend_value(product, value, prefs))
@@ -1123,9 +1131,11 @@ fn memoized_ticks(
     let product = pane.selected_product();
     legend_ramp::labels(
         ctx,
-        egui::Id::new(("rustdar::legend_ticks::radar", product)),
+        // The memo key is still (field, prefs); the field half is a `FieldId`
+        // rather than the enum since WO-E9e, and `FieldId` hashes by its bytes.
+        egui::Id::new(("rustdar::legend_ticks::radar", product.as_str())),
         prefs.clone(),
-        || legend_ticks(product, prefs),
+        || legend_ticks(&product, prefs),
     )
 }
 
@@ -1156,26 +1166,45 @@ fn memoized_overlay_ticks(
 /// [`legend_ramp::IMMUTABLE`].
 fn radar_ramp(ctx: &egui::Context, pane: &PaneState, horizontal: bool) -> egui::TextureHandle {
     let product = pane.selected_product();
-    let scale = get_legend_scale_ref(product);
+    let scale = crate::field_facts::facts(&product).scale;
     let min = scale.min_value;
     let range = scale.max_value - min;
+    // The palette is keyed by the radar layer's own field type, so the id is
+    // resolved once here rather than per sample. A field this build does not
+    // register has no palette to bake, and the ramp falls back to the default
+    // field's — the same fallback `field_facts::facts` takes, for the same
+    // reason.
+    let ramp_product = radar_fields::product_for(&product)
+        .or_else(|| radar_fields::product_for(&radar_fields::known::REFLECTIVITY))
+        .expect("the default field is registered by the radar crate");
     legend_ramp::ramp(
         ctx,
-        egui::Id::new(("rustdar::legend_ramp::radar", product, horizontal)),
+        egui::Id::new(("rustdar::legend_ramp::radar", product.as_str(), horizontal)),
         legend_ramp::IMMUTABLE,
         "legend_ramp_radar",
         horizontal,
         |t| {
-            let (r, g, b, a) = get_color_for_value(product, min + t * range);
+            let (r, g, b, a) = get_color_for_value(ramp_product, min + t * range);
             [r, g, b, a]
         },
     )
 }
 
 /// Format a legend label value. For HHC uses category names; for others, a short numeric string.
-fn format_legend_value(product: RadarProduct, value: f32, prefs: &UserPreferences) -> String {
-    match product {
-        RadarProduct::HydrometeorClassification => match value as u16 {
+///
+/// **The conversion is the registry's, the precision is the bar's.** The value
+/// is converted by the field's own [`Quantity`](rustdar_units::Quantity) —
+/// which is where WO-E9a put the unit each field's numbers live in — while how
+/// many decimals survive is a property of a 20 px colour bar, not of the field,
+/// so it stays here. The arms below therefore compare field *identity*, which
+/// after WO-E9e is a `FieldId` rather than a source's enum; `FieldId` is an
+/// open string, so these are comparisons and not `match` patterns.
+fn format_legend_value(product: &FieldId, value: f32, prefs: &UserPreferences) -> String {
+    use radar_fields::known;
+
+    // The one discrete domain: the RPG's own displayed codes from `hc.lgd`.
+    if *product == known::HYDROMETEOR_CLASSIFICATION {
+        return match value as u16 {
             10 => "Bio".into(),
             20 => "AP".into(),
             30 => "IC".into(),
@@ -1193,49 +1222,59 @@ fn format_legend_value(product: RadarProduct, value: f32, prefs: &UserPreference
             140 => "UK".into(),
             150 => "RF".into(),
             _ => format!("{value:.0}"),
-        },
-        RadarProduct::Velocity | RadarProduct::StormRelativeVelocity => {
-            let converted = prefs.speed.convert_from_ms(value);
-            format!("{converted:.0}")
-        }
-        RadarProduct::SpectrumWidth => {
-            let converted = prefs.speed.convert_from_ms(value);
-            format!("{converted:.0}")
-        }
-        // Both echo-tops products: both are titled off `HeightUnit::kilo_suffix`
-        // and read out through `convert_kft_to_kilo`.
-        RadarProduct::EchoTops | RadarProduct::EchoTopsInterpolated => {
-            let converted = prefs.height.convert_kft_to_kilo(value);
-            format!("{converted:.0}")
-        }
-        RadarProduct::PrecipitationRate => {
-            let converted = prefs.precip_rate.convert_from_in_per_hr(value);
-            if converted < 1.0 {
-                format!("{converted:.2}")
-            } else {
-                format!("{converted:.1}")
-            }
-        }
-        // The ramp's stops are the NWS quarter-inch reporting steps; the ticks
-        // are whatever unit the reader thinks in. Inches keep the generic short
-        // form; cm and mm take the unit's own precision, which keeps `25.40`
-        // off a 20px bar.
-        RadarProduct::MaxExpectedHailSize => {
-            let converted = prefs.hail_size.convert_from_inches(value);
-            match prefs.hail_size {
-                HailSizeUnit::Inches => short_tick(converted),
-                unit => {
-                    let decimals = unit.decimals();
-                    format!("{converted:.decimals$}")
-                }
-            }
-        }
-        RadarProduct::CorrelationCoefficient => format!("{value:.2}"),
-        RadarProduct::DifferentialReflectivity | RadarProduct::SpecificDifferentialPhase => {
-            format!("{value:.1}")
-        }
-        _ => short_tick(value),
+        };
     }
+
+    let converted = crate::field_facts::facts(product)
+        .quantity
+        .convert(value, prefs);
+
+    // Speeds and echo tops: whole numbers, in the reader's own unit. Both
+    // echo-tops fields are titled off `HeightUnit::kilo_suffix` and read out
+    // through `convert_kft_to_kilo`, which is what `Quantity::HeightKft` does.
+    if *product == known::VELOCITY
+        || *product == known::STORM_RELATIVE_VELOCITY
+        || *product == known::SPECTRUM_WIDTH
+        || *product == known::ECHO_TOPS
+        || *product == known::ECHO_TOPS_INTERPOLATED
+    {
+        return format!("{converted:.0}");
+    }
+
+    if *product == known::PRECIPITATION_RATE {
+        return if converted < 1.0 {
+            format!("{converted:.2}")
+        } else {
+            format!("{converted:.1}")
+        };
+    }
+
+    // The ramp's stops are the NWS quarter-inch reporting steps; the ticks
+    // are whatever unit the reader thinks in. Inches keep the generic short
+    // form; cm and mm take the unit's own precision, which keeps `25.40`
+    // off a 20px bar.
+    if *product == known::MAX_EXPECTED_HAIL_SIZE {
+        return match prefs.hail_size {
+            HailSizeUnit::Inches => short_tick(converted),
+            unit => {
+                let decimals = unit.decimals();
+                format!("{converted:.decimals$}")
+            }
+        };
+    }
+
+    // The remaining arms print the raw value: every one of them is a
+    // `Quantity::Unitless` field, whose `convert` is the identity, so
+    // `converted` and `value` are the same number here.
+    if *product == known::CORRELATION_COEFFICIENT {
+        return format!("{value:.2}");
+    }
+    if *product == known::DIFFERENTIAL_REFLECTIVITY
+        || *product == known::SPECIFIC_DIFFERENTIAL_PHASE
+    {
+        return format!("{value:.1}");
+    }
+    short_tick(value)
 }
 
 // ── Pending-render notice ─────────────────────────────────────────────────
@@ -1248,8 +1287,12 @@ const PENDING_PADDING: egui::Vec2 = egui::vec2(8.0, 3.0);
 
 /// What a pane says while the image on screen is not yet the product and tilt it
 /// has selected — the one piece of information nothing else on the pane carries.
-fn pending_render_notice(product: RadarProduct, elevation: f32) -> String {
-    format!("\u{27f3} showing {} {:.1}\u{b0}", product.name(), elevation)
+fn pending_render_notice(product: &FieldId, elevation: f32) -> String {
+    format!(
+        "\u{27f3} showing {} {:.1}\u{b0}",
+        crate::field_facts::name(product),
+        elevation
+    )
 }
 
 /// Draw the notice across the top of the pane, over the imagery. Non-blocking:
@@ -1259,7 +1302,7 @@ pub(super) fn draw_pending_render_notice(
     painter: &egui::Painter,
     pane_rect: egui::Rect,
     top_margin: f32,
-    product: RadarProduct,
+    product: &FieldId,
     elevation: f32,
 ) {
     draw_top_notice(
@@ -1362,7 +1405,7 @@ pub(super) fn render_color_scale(
     prefs: &UserPreferences,
 ) {
     let product = pane.selected_product();
-    let legend = get_legend_scale_ref(product);
+    let legend = crate::field_facts::facts(&product).scale;
     if legend.thresholds.len() < 2 {
         return;
     }
@@ -1550,7 +1593,7 @@ pub(super) fn render_color_scale(
 
     // --- Title: unit label above the bar (desktop) or under it (mobile),
     //     with velocity's fold annotation on the line after it ---
-    let unit = product.unit_label(prefs);
+    let unit = crate::field_facts::unit_label(&product, prefs);
     let fold_line = legend_second_line(pane, prefs);
     if horizontal {
         // Under the bar's left end, reading left to right: `mph  folds ±50`.
@@ -1603,7 +1646,7 @@ pub(super) fn render_color_scale(
     }
 
     // --- The range-folded key ---
-    if range_folded_is_painted(product, pane) {
+    if range_folded_is_painted(&product, pane) {
         // In both orientations the key stands past the end of the bar, in the
         // pane's bottom-right corner, label reading outward from the swatch —
         // a label on the bar's own side prints through the ±80 tick.
@@ -1700,13 +1743,14 @@ fn legend_second_line(pane: &PaneState, prefs: &UserPreferences) -> Option<Strin
 
 /// Whether the purple [`rustdar_radar::RANGE_FOLDED`] can appear in this pane's
 /// picture, and therefore needs a key beside it.
-fn range_folded_is_painted(product: RadarProduct, pane: &PaneState) -> bool {
+fn range_folded_is_painted(product: &FieldId, pane: &PaneState) -> bool {
     // SRV is rasterized from `srv::compute_srv_grid`'s finished `f32` field,
     // whose NaNs are skipped, so there is no purple on an SRV raster to key.
-    matches!(
-        product,
-        RadarProduct::Velocity | RadarProduct::SpectrumWidth
-    ) && pane.is_map()
+    //
+    // A comparison rather than a `matches!`: a `FieldId` is an open string, so
+    // its consts are not patterns. The two fields named are the same two.
+    (*product == radar_fields::known::VELOCITY || *product == radar_fields::known::SPECTRUM_WIDTH)
+        && pane.is_map()
 }
 
 /// Render color scale legends for overlay layers that provide their own legend
@@ -2029,7 +2073,9 @@ fn draw_long_press_tooltip(
         rustdar_geo::site_bearing_range_km(lat, lon, map_pos.y(), map_pos.x());
 
     let text = match hover.read(azimuth, ground_km) {
-        Reading::Value(value) => pane.selected_product().format_value(value, prefs),
+        Reading::Value(value) => {
+            crate::field_facts::format_value(&pane.selected_product(), value, prefs)
+        }
         Reading::Unpainted => "No data".to_string(),
         Reading::NotResident => "No value held for this frame".to_string(),
     };
@@ -2053,8 +2099,360 @@ mod tests {
     use rustdar_units::SpeedUnit;
 
     /// The ticks `render_color_scale` would paint for `product`, in order.
-    fn ticks(product: RadarProduct, prefs: &UserPreferences) -> Vec<String> {
+    fn ticks(product: &FieldId, prefs: &UserPreferences) -> Vec<String> {
         legend_ticks(product, prefs)
+    }
+
+    /// Every legend tick string and every colour-bar unit title, for every
+    /// registered field under three unit preferences, against literals
+    /// **captured from the build before WO-E9e re-keyed this file**.
+    ///
+    /// The order's Reopen-1:1 rule is that a bar's labels render byte-identical
+    /// across the move off the product enum, and this is the only thing that
+    /// can say so: the conversion now runs through the field's own
+    /// [`rustdar_units::Quantity::convert`] instead of a hand-written arm per
+    /// product, and the unit title through `Quantity::suffix` instead of the
+    /// enum's `unit_label`. The expectations below were **measured** at
+    /// `ed5a1f9b` and pasted in, not derived from the new code, so a formula
+    /// that is consistently wrong in both spellings cannot pass.
+    #[test]
+    fn every_tick_and_unit_string_is_what_it_was_before_the_field_ids() {
+        let sets: [(&str, UserPreferences); 3] = [
+            ("default", UserPreferences::default()),
+            (
+                "metric",
+                UserPreferences {
+                    speed: SpeedUnit::MetersPerSec,
+                    height: rustdar_units::HeightUnit::Meters,
+                    precip_rate: rustdar_units::PrecipRateUnit::MillimetersPerHour,
+                    hail_size: HailSizeUnit::Centimeters,
+                    ..UserPreferences::default()
+                },
+            ),
+            (
+                "mm",
+                UserPreferences {
+                    hail_size: HailSizeUnit::Millimeters,
+                    ..UserPreferences::default()
+                },
+            ),
+        ];
+        // (preference set, field id, the ticks joined by `|`, the unit title)
+        const EXPECTED: [(&str, &str, &str, &str); 51] = [
+            (
+                "default",
+                "Reflectivity",
+                "0|2.5|5|7.5|10|15|20|25|30|35|40|45|50|55|60|65|70|75|80|85|90|95",
+                "dBZ",
+            ),
+            (
+                "default",
+                "Velocity",
+                "-81|-69|-58|-46|-35|-23|-12|-0|0|12|23|35|46|58|69|81",
+                "mph",
+            ),
+            ("default", "SpectrumWidth", "0|5|9|14|18|23", "mph"),
+            (
+                "default",
+                "DifferentialPhase",
+                "0|15|30|45|60|75|90|105|120|135|150|165|180|195|210|225|240|255|270|285|300|315|330|345",
+                "°",
+            ),
+            (
+                "default",
+                "CorrelationCoefficient",
+                "0.45|0.55|0.75|0.80|0.90|0.96|0.98",
+                "CC",
+            ),
+            (
+                "default",
+                "DifferentialReflectivity",
+                "-2.0|-1.0|0.0|0.2|1.0|1.5|2.0|2.5|3.0|4.0|5.0|5.5",
+                "dB",
+            ),
+            (
+                "default",
+                "StormRelativeVelocity",
+                "-81|-69|-58|-46|-35|-23|-12|-0|0|12|23|35|46|58|69|81",
+                "mph",
+            ),
+            (
+                "default",
+                "SpecificDifferentialPhase",
+                "-2.0|-1.0|-0.5|0.0|1.0|1.5|2.0|2.5|3.0|4.0|5.0|6.0|6.5",
+                "°/km",
+            ),
+            (
+                "default",
+                "EchoTops",
+                "5|10|15|20|25|30|35|40|45|50|55|60",
+                "kft",
+            ),
+            (
+                "default",
+                "EchoTopsInterpolated",
+                "5|10|15|20|25|30|35|40|45|50|55|60",
+                "kft",
+            ),
+            (
+                "default",
+                "VerticallyIntegratedLiquid",
+                "1|5|10|15|20|25|30|35|40|50|60",
+                "kg/m²",
+            ),
+            (
+                "default",
+                "VilDensity",
+                "0.5|1|1.5|2|2.5|3|3.5|4|4.5|5|6",
+                "g/m³",
+            ),
+            (
+                "default",
+                "ProbabilityOfSevereHail",
+                "10|20|30|40|50|60|70|80|90|100",
+                "%",
+            ),
+            (
+                "default",
+                "MaxExpectedHailSize",
+                "0.2|0.5|0.8|1|1.2|1.5|1.8|2|2.5|3|3.5|4",
+                "in",
+            ),
+            (
+                "default",
+                "HydrometeorClassification",
+                "Bio|AP|IC|DS|WS|RA|HR|BD|GR|HA|LH|GH|MS|UK|RF",
+                "HHC",
+            ),
+            (
+                "default",
+                "PrecipitationRate",
+                "0.01|0.10|0.25|0.50|1.0|2.0|3.0|4.0|6.0|8.0|12.0",
+                "in/hr",
+            ),
+            (
+                "default",
+                "NormalizedRotation",
+                "-2|-1|-1.0|-0.2|0.2|1.0|1|1.5|1.5|2.0|2|2.5|2.5|3.0|3",
+                "NROT",
+            ),
+            (
+                "metric",
+                "Reflectivity",
+                "0|2.5|5|7.5|10|15|20|25|30|35|40|45|50|55|60|65|70|75|80|85|90|95",
+                "dBZ",
+            ),
+            (
+                "metric",
+                "Velocity",
+                "-36|-31|-26|-21|-15|-10|-5|-0|0|5|10|15|21|26|31|36",
+                "m/s",
+            ),
+            ("metric", "SpectrumWidth", "0|2|4|6|8|10", "m/s"),
+            (
+                "metric",
+                "DifferentialPhase",
+                "0|15|30|45|60|75|90|105|120|135|150|165|180|195|210|225|240|255|270|285|300|315|330|345",
+                "°",
+            ),
+            (
+                "metric",
+                "CorrelationCoefficient",
+                "0.45|0.55|0.75|0.80|0.90|0.96|0.98",
+                "CC",
+            ),
+            (
+                "metric",
+                "DifferentialReflectivity",
+                "-2.0|-1.0|0.0|0.2|1.0|1.5|2.0|2.5|3.0|4.0|5.0|5.5",
+                "dB",
+            ),
+            (
+                "metric",
+                "StormRelativeVelocity",
+                "-36|-31|-26|-21|-15|-10|-5|-0|0|5|10|15|21|26|31|36",
+                "m/s",
+            ),
+            (
+                "metric",
+                "SpecificDifferentialPhase",
+                "-2.0|-1.0|-0.5|0.0|1.0|1.5|2.0|2.5|3.0|4.0|5.0|6.0|6.5",
+                "°/km",
+            ),
+            ("metric", "EchoTops", "2|3|5|6|8|9|11|12|14|15|17|18", "km"),
+            (
+                "metric",
+                "EchoTopsInterpolated",
+                "2|3|5|6|8|9|11|12|14|15|17|18",
+                "km",
+            ),
+            (
+                "metric",
+                "VerticallyIntegratedLiquid",
+                "1|5|10|15|20|25|30|35|40|50|60",
+                "kg/m²",
+            ),
+            (
+                "metric",
+                "VilDensity",
+                "0.5|1|1.5|2|2.5|3|3.5|4|4.5|5|6",
+                "g/m³",
+            ),
+            (
+                "metric",
+                "ProbabilityOfSevereHail",
+                "10|20|30|40|50|60|70|80|90|100",
+                "%",
+            ),
+            (
+                "metric",
+                "MaxExpectedHailSize",
+                "0.6|1.3|1.9|2.5|3.2|3.8|4.4|5.1|6.3|7.6|8.9|10.2",
+                "cm",
+            ),
+            (
+                "metric",
+                "HydrometeorClassification",
+                "Bio|AP|IC|DS|WS|RA|HR|BD|GR|HA|LH|GH|MS|UK|RF",
+                "HHC",
+            ),
+            (
+                "metric",
+                "PrecipitationRate",
+                "0.25|2.5|6.3|12.7|25.4|50.8|76.2|101.6|152.4|203.2|304.8",
+                "mm/hr",
+            ),
+            (
+                "metric",
+                "NormalizedRotation",
+                "-2|-1|-1.0|-0.2|0.2|1.0|1|1.5|1.5|2.0|2|2.5|2.5|3.0|3",
+                "NROT",
+            ),
+            (
+                "mm",
+                "Reflectivity",
+                "0|2.5|5|7.5|10|15|20|25|30|35|40|45|50|55|60|65|70|75|80|85|90|95",
+                "dBZ",
+            ),
+            (
+                "mm",
+                "Velocity",
+                "-81|-69|-58|-46|-35|-23|-12|-0|0|12|23|35|46|58|69|81",
+                "mph",
+            ),
+            ("mm", "SpectrumWidth", "0|5|9|14|18|23", "mph"),
+            (
+                "mm",
+                "DifferentialPhase",
+                "0|15|30|45|60|75|90|105|120|135|150|165|180|195|210|225|240|255|270|285|300|315|330|345",
+                "°",
+            ),
+            (
+                "mm",
+                "CorrelationCoefficient",
+                "0.45|0.55|0.75|0.80|0.90|0.96|0.98",
+                "CC",
+            ),
+            (
+                "mm",
+                "DifferentialReflectivity",
+                "-2.0|-1.0|0.0|0.2|1.0|1.5|2.0|2.5|3.0|4.0|5.0|5.5",
+                "dB",
+            ),
+            (
+                "mm",
+                "StormRelativeVelocity",
+                "-81|-69|-58|-46|-35|-23|-12|-0|0|12|23|35|46|58|69|81",
+                "mph",
+            ),
+            (
+                "mm",
+                "SpecificDifferentialPhase",
+                "-2.0|-1.0|-0.5|0.0|1.0|1.5|2.0|2.5|3.0|4.0|5.0|6.0|6.5",
+                "°/km",
+            ),
+            (
+                "mm",
+                "EchoTops",
+                "5|10|15|20|25|30|35|40|45|50|55|60",
+                "kft",
+            ),
+            (
+                "mm",
+                "EchoTopsInterpolated",
+                "5|10|15|20|25|30|35|40|45|50|55|60",
+                "kft",
+            ),
+            (
+                "mm",
+                "VerticallyIntegratedLiquid",
+                "1|5|10|15|20|25|30|35|40|50|60",
+                "kg/m²",
+            ),
+            (
+                "mm",
+                "VilDensity",
+                "0.5|1|1.5|2|2.5|3|3.5|4|4.5|5|6",
+                "g/m³",
+            ),
+            (
+                "mm",
+                "ProbabilityOfSevereHail",
+                "10|20|30|40|50|60|70|80|90|100",
+                "%",
+            ),
+            (
+                "mm",
+                "MaxExpectedHailSize",
+                "6|13|19|25|32|38|44|51|64|76|89|102",
+                "mm",
+            ),
+            (
+                "mm",
+                "HydrometeorClassification",
+                "Bio|AP|IC|DS|WS|RA|HR|BD|GR|HA|LH|GH|MS|UK|RF",
+                "HHC",
+            ),
+            (
+                "mm",
+                "PrecipitationRate",
+                "0.01|0.10|0.25|0.50|1.0|2.0|3.0|4.0|6.0|8.0|12.0",
+                "in/hr",
+            ),
+            (
+                "mm",
+                "NormalizedRotation",
+                "-2|-1|-1.0|-0.2|0.2|1.0|1|1.5|1.5|2.0|2|2.5|2.5|3.0|3",
+                "NROT",
+            ),
+        ];
+        assert_eq!(
+            EXPECTED.len(),
+            sets.len() * radar_fields::known::ALL.len(),
+            "the table must cover every registered field in every preference \
+             set, or a field could drop out of it with nothing going red",
+        );
+        for (label, field, want_ticks, want_unit) in EXPECTED {
+            let id = FieldId::from_static(field);
+            assert!(
+                radar_fields::known::ALL.contains(&id),
+                "{field} is not a field this crate has a const for",
+            );
+            let (_, prefs) = sets
+                .iter()
+                .find(|(name, _)| *name == label)
+                .expect("a preference set named in the table");
+            assert_eq!(
+                ticks(&id, prefs).join("|"),
+                want_ticks,
+                "{field} under {label} preferences: the colour bar's labels moved",
+            );
+            assert_eq!(
+                crate::field_facts::unit_label(&id, prefs),
+                want_unit,
+                "{field} under {label} preferences: the colour bar's unit title moved",
+            );
+        }
     }
 
     /// The MEHS colour bar is labelled in the user's hail-size unit; its stops
@@ -2088,7 +2486,7 @@ mod tests {
                 ..UserPreferences::default()
             };
             assert_eq!(
-                ticks(RadarProduct::MaxExpectedHailSize, &prefs),
+                ticks(&radar_fields::known::MAX_EXPECTED_HAIL_SIZE, &prefs),
                 labels,
                 "{unit:?} ticks",
             );
@@ -2096,11 +2494,13 @@ mod tests {
 
         // The stops themselves are untouched by the preference: this is a
         // relabelling, not a repalettising.
-        let inch_stops: Vec<f32> = get_legend_scale_ref(RadarProduct::MaxExpectedHailSize)
-            .thresholds
-            .iter()
-            .map(|&(v, _)| v)
-            .collect();
+        let inch_stops: Vec<f32> =
+            crate::field_facts::facts(&radar_fields::known::MAX_EXPECTED_HAIL_SIZE)
+                .scale
+                .thresholds
+                .iter()
+                .map(|&(v, _)| v)
+                .collect();
         assert_eq!(
             inch_stops,
             [
@@ -2118,12 +2518,15 @@ mod tests {
                 hail_size: unit,
                 ..UserPreferences::default()
             };
-            let product = RadarProduct::MaxExpectedHailSize;
-            for &(stop, _) in get_legend_scale_ref(product).thresholds {
-                let tick = format_legend_value(product, stop, &prefs);
+            let product = radar_fields::known::MAX_EXPECTED_HAIL_SIZE;
+            for &(stop, _) in &crate::field_facts::facts(&product).scale.thresholds {
+                let tick = format_legend_value(&product, stop, &prefs);
                 assert_eq!(
-                    product.format_value(stop, &prefs),
-                    format!("MEHS: {tick} {}", product.unit_label(&prefs)),
+                    crate::field_facts::format_value(&product, stop, &prefs),
+                    format!(
+                        "MEHS: {tick} {}",
+                        crate::field_facts::unit_label(&product, &prefs)
+                    ),
                     "{unit:?} at the {stop} in stop",
                 );
             }
@@ -2139,8 +2542,8 @@ mod tests {
             ..UserPreferences::default()
         };
         let default = UserPreferences::default();
-        for &product in RadarProduct::all() {
-            if product == RadarProduct::MaxExpectedHailSize {
+        for product in radar_fields::known::ALL.iter() {
+            if *product == radar_fields::known::MAX_EXPECTED_HAIL_SIZE {
                 continue;
             }
             assert_eq!(
@@ -2170,30 +2573,34 @@ mod tests {
             height: HeightUnit::Meters,
             ..UserPreferences::default()
         };
-        for product in [RadarProduct::EchoTops, RadarProduct::EchoTopsInterpolated] {
+        for product in [
+            radar_fields::known::ECHO_TOPS,
+            radar_fields::known::ECHO_TOPS_INTERPOLATED,
+        ] {
             assert_eq!(
-                ticks(product, &feet).last().map(String::as_str),
+                ticks(&product, &feet).last().map(String::as_str),
                 Some("60"),
                 "{product:?} in feet is the bar as it has always been labelled",
             );
             assert_eq!(
-                ticks(product, &metres).last().map(String::as_str),
+                ticks(&product, &metres).last().map(String::as_str),
                 Some("18"),
                 "{product:?} in metres is labelled in kft: 60 kft is 18 km",
             );
             // And the number on the bar is the number the readout gives for the
             // same stop, to the tick's own precision.
-            let top = get_legend_scale_ref(product)
+            let top = crate::field_facts::facts(&product)
+                .scale
                 .thresholds
                 .last()
                 .expect("the echo-tops ramp has stops")
                 .0;
-            let readout = product.format_value(top, &metres);
+            let readout = crate::field_facts::format_value(&product, top, &metres);
             assert!(
                 readout.contains("18.3 km"),
                 "{product:?} reads out {readout:?} for the stop its bar calls \
                  {:?}",
-                ticks(product, &metres).last(),
+                ticks(&product, &metres).last(),
             );
         }
     }
@@ -2201,7 +2608,7 @@ mod tests {
     /// The velocity ramp's own reach, m/s — what a fold marker has to fall
     /// inside to be drawable.
     fn velocity_bounds() -> (f32, f32) {
-        let legend = get_legend_scale_ref(RadarProduct::Velocity);
+        let legend = crate::field_facts::facts(&radar_fields::known::VELOCITY).scale;
         (legend.min_value, legend.max_value)
     }
 

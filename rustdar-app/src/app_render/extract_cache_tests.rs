@@ -160,7 +160,7 @@ fn point_at(
     {
         let pane = app.gui.pane_mut(idx).expect("pane exists");
         pane.set_site(site.to_string());
-        pane.set_selected_product(product);
+        pane.set_selected_product(rustdar_radar::fields::spec(product).id.clone());
         pane.set_selected_elevation(elevation);
     }
     app.gui

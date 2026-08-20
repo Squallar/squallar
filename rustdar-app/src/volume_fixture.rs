@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 
-use rustdar_radar::types::RadarProduct;
 use rustdar_volumetric::bridge::VolumeEntry;
 
 /// A real, tiny grid, for the tests whose subject is what may *stand in* on screen —
@@ -93,7 +92,7 @@ pub(crate) fn ready_grid() -> VolumeEntry {
         half_extent_km: Some(rustdar_radar::voxel::HalfExtentKm::square(40.0)),
         base_km_msl: 0.0,
         top_km_msl: 10.0,
-        product: RadarProduct::Reflectivity,
+        product: rustdar_radar::types::RadarProduct::Reflectivity,
         shape: rustdar_radar::voxel::WASM_SHAPE,
         values_wanted: false,
     };

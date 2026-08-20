@@ -54,7 +54,7 @@ fn point_at_tilts(
     product_elevations.insert(product, tilts.to_vec());
     let pane = app.gui.pane_mut(pane_idx).expect("pane exists");
     pane.set_site(site.to_string());
-    pane.set_selected_product(product);
+    pane.set_selected_product(rustdar_radar::fields::spec(product).id.clone());
     pane.set_selected_elevation(tilts[0]);
     app.gui
         .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForPane {

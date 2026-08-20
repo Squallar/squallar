@@ -440,7 +440,7 @@ fn changing_the_override_invalidates_the_storm_relative_renders() {
     assert_eq!(d.pane_render[0].last_rendered, None);
     assert_eq!(
         d.pane_render[1].last_rendered,
-        Some((RadarProduct::Reflectivity, 0.5)),
+        Some((rustdar_radar::types::RadarProduct::Reflectivity, 0.5)),
         "an unrelated product must not be re-rendered",
     );
     assert_eq!(d.pane_render[2].last_rendered, None);

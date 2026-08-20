@@ -2,11 +2,12 @@
 
 use super::*;
 use rustdar_geo::GeoPoint;
+use rustdar_radar::fields as radar_fields;
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::RenderView;
 
 const SITE: &str = "KTLX";
-const PRODUCT: RadarProduct = RadarProduct::Reflectivity;
+const PRODUCT: FieldId = radar_fields::known::REFLECTIVITY;
 const TILT: f32 = 0.5;
 
 /// The row every loop below is keyed to, built here rather than read out of
@@ -30,7 +31,7 @@ fn ts(minute: u32) -> NaiveDateTime {
 /// The one target both loops in every test below are keyed to. Built once so a
 /// test cannot accidentally prove its point by disagreeing about the site.
 fn shared_target() -> RenderTarget {
-    RenderTarget::new(SITE, PRODUCT, TILT)
+    RenderTarget::new(SITE, &PRODUCT, TILT)
 }
 
 fn line() -> SectionLine {
@@ -65,7 +66,7 @@ fn loop_in(view: RenderView, count: u32) -> LayerTimeState {
         })
         .collect();
     let section = (view == RenderView::CrossSection).then(key);
-    ls.retarget_renders_for(PRODUCT, TILT, section);
+    ls.retarget_renders_for(&PRODUCT, TILT, section);
     ls
 }
 
@@ -248,7 +249,7 @@ fn moving_the_line_discards_every_frame() {
     .expect("two distinct points on Earth");
     assert!(
         ls.retarget_renders_for(
-            PRODUCT,
+            &PRODUCT,
             TILT,
             Some(SectionLoopKey::new(
                 elsewhere,
@@ -277,9 +278,9 @@ fn editing_the_storm_motion_vector_discards_every_frame() {
             render_failed: false,
         })
         .collect();
-    let srv = RadarProduct::StormRelativeVelocity;
+    let srv = radar_fields::known::STORM_RELATIVE_VELOCITY;
     ls.retarget_renders_for(
-        srv,
+        &srv,
         TILT,
         Some(SectionLoopKey::new(
             line(),
@@ -293,7 +294,7 @@ fn editing_the_storm_motion_vector_discards_every_frame() {
 
     assert!(
         ls.retarget_renders_for(
-            srv,
+            &srv,
             TILT,
             Some(SectionLoopKey::new(
                 line(),
@@ -313,11 +314,14 @@ fn editing_the_storm_motion_vector_discards_every_frame() {
 /// refuses on. Derived rather than listed because *which* products are
 /// sectionable is not what these two tests are about — the view is — and a
 /// stale hand-list would quietly stop covering a newly sectionable product.
-fn sectionable_products() -> Vec<RadarProduct> {
-    RadarProduct::all()
+fn sectionable_products() -> Vec<FieldId> {
+    radar_fields::known::ALL
         .iter()
-        .copied()
-        .filter(|p| rustdar_radar::derive::volume_slot(*p).is_some())
+        .filter(|p| {
+            rustdar_radar::fields::product_for(p)
+                .is_some_and(|p| rustdar_radar::derive::volume_slot(p).is_some())
+        })
+        .cloned()
         .collect()
 }
 
@@ -330,8 +334,8 @@ fn a_tilt_change_re_cuts_no_section_but_still_re_renders_the_plan_view() {
     let ctx = egui::Context::default();
     let products = sectionable_products();
     for pair in [
-        RadarProduct::NormalizedRotation,
-        RadarProduct::StormRelativeVelocity,
+        radar_fields::known::NORMALIZED_ROTATION,
+        radar_fields::known::STORM_RELATIVE_VELOCITY,
     ] {
         assert!(
             products.contains(&pair),
@@ -351,13 +355,13 @@ fn a_tilt_change_re_cuts_no_section_but_still_re_renders_the_plan_view() {
                 render_failed: false,
             })
             .collect();
-        section.retarget_renders_for(product, TILT, Some(key()));
+        section.retarget_renders_for(&product, TILT, Some(key()));
         for frame in &mut section.frames {
             frame.image = Some(section_picture(&ctx, 1));
         }
 
         assert!(
-            !section.retarget_renders_for(product, 19.5, Some(key())),
+            !section.retarget_renders_for(&product, 19.5, Some(key())),
             "{product:?}: a tilt click re-cut a section the tilt cannot move",
         );
         assert!(
@@ -367,12 +371,12 @@ fn a_tilt_change_re_cuts_no_section_but_still_re_renders_the_plan_view() {
         );
 
         let mut plan = loop_in(RenderView::PlanView, 3);
-        plan.retarget_renders(product, TILT);
+        plan.retarget_renders(&product, TILT);
         for frame in &mut plan.frames {
             frame.image = Some(plan_view_picture(&ctx));
         }
         assert!(
-            plan.retarget_renders(product, 19.5),
+            plan.retarget_renders(&product, 19.5),
             "{product:?}: a plan-view loop kept frames drawn from another tilt's \
              sweep",
         );
@@ -389,10 +393,10 @@ fn a_tilt_change_re_cuts_no_section_but_still_re_renders_the_plan_view() {
 #[test]
 fn rewriting_the_same_storm_motion_vector_invalidates_nothing() {
     let mut ls = crate::radar_layer::begin_loop(3600, &site(), RenderView::CrossSection);
-    let srv = RadarProduct::StormRelativeVelocity;
+    let srv = radar_fields::known::STORM_RELATIVE_VELOCITY;
     let motion = Some((30.0, 240.0));
     ls.retarget_renders_for(
-        srv,
+        &srv,
         TILT,
         Some(SectionLoopKey::new(
             line(),
@@ -402,7 +406,7 @@ fn rewriting_the_same_storm_motion_vector_invalidates_nothing() {
     );
     assert!(
         !ls.retarget_renders_for(
-            srv,
+            &srv,
             TILT,
             Some(SectionLoopKey::new(
                 line(),

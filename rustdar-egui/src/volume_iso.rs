@@ -76,25 +76,29 @@ impl IsoThresholds {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustdar_radar::fields as radar_fields;
 
-    fn field(product: rustdar_radar::types::RadarProduct) -> FieldId {
-        rustdar_radar::fields::spec(product).id.clone()
+    fn field(product: &FieldId) -> FieldId {
+        product.clone()
     }
 
-    fn default_of(product: rustdar_radar::types::RadarProduct) -> f32 {
-        rustdar_radar::voxel::default_iso_threshold(product)
+    /// The shipped threshold for a field, asked of the radar layer through the
+    /// one id door — the voxel table is keyed by the layer's own field value.
+    fn default_of(product: &FieldId) -> f32 {
+        rustdar_radar::voxel::default_iso_threshold(
+            rustdar_radar::fields::product_for(product).expect("a registered field"),
+        )
     }
 
     /// The store holds exceptions: setting a field back to its default erases it.
     #[test]
     fn thresholds_are_stored_per_field_as_exceptions() {
-        use rustdar_radar::types::RadarProduct;
         let mut store = IsoThresholds::default();
-        let reflectivity = field(RadarProduct::Reflectivity);
-        let velocity = field(RadarProduct::Velocity);
+        let reflectivity = field(&radar_fields::known::REFLECTIVITY);
+        let velocity = field(&radar_fields::known::VELOCITY);
         assert_eq!(
             store.get(&reflectivity),
-            default_of(RadarProduct::Reflectivity),
+            default_of(&radar_fields::known::REFLECTIVITY),
         );
         assert!(!store.is_edited(&reflectivity));
 
@@ -103,11 +107,14 @@ mod tests {
         assert!(store.is_edited(&reflectivity));
         assert_eq!(
             store.get(&velocity),
-            default_of(RadarProduct::Velocity),
+            default_of(&radar_fields::known::VELOCITY),
             "one field's threshold must never bleed into another's",
         );
 
-        store.set(&reflectivity, default_of(RadarProduct::Reflectivity));
+        store.set(
+            &reflectivity,
+            default_of(&radar_fields::known::REFLECTIVITY),
+        );
         assert!(
             !store.is_edited(&reflectivity),
             "back at the default is the same as never touched",
@@ -124,9 +131,9 @@ mod tests {
     /// deleted that guard came back GREEN while this test used a known field.
     #[test]
     fn a_non_finite_threshold_is_refused() {
-        use rustdar_radar::types::RadarProduct;
+        use rustdar_source::product::FieldId;
         let mut store = IsoThresholds::default();
-        let reflectivity = field(RadarProduct::Reflectivity);
+        let reflectivity = field(&radar_fields::known::REFLECTIVITY);
         store.set(&reflectivity, f32::NAN);
         store.set(&reflectivity, f32::INFINITY);
         assert!(!store.is_edited(&reflectivity), "the editor's door");
@@ -156,7 +163,7 @@ mod tests {
     /// applied to nothing at all.
     #[test]
     fn a_threshold_for_a_field_this_build_does_not_register_is_kept_inert() {
-        use rustdar_radar::types::RadarProduct;
+        use rustdar_source::product::FieldId;
         let unknown = FieldId::new("NoBuildRegistersThisField");
         let mut store = IsoThresholds::default();
         store.restore(unknown.clone(), 12.0);
@@ -165,9 +172,9 @@ mod tests {
             "the entry must survive the round trip, not be dropped",
         );
         assert_eq!(store.get(&unknown), 12.0);
-        for product in RadarProduct::all() {
+        for product in radar_fields::known::ALL.iter() {
             assert!(
-                !store.is_edited(&field(*product)),
+                !store.is_edited(&field(product)),
                 "an unknown id leaked onto {:?}",
                 product,
             );
@@ -179,12 +186,11 @@ mod tests {
     /// for a field this build knows.
     #[test]
     fn a_persisted_threshold_at_the_default_is_not_an_exception() {
-        use rustdar_radar::types::RadarProduct;
         let mut store = IsoThresholds::default();
         store.restore(
-            field(RadarProduct::Velocity),
-            default_of(RadarProduct::Velocity),
+            field(&radar_fields::known::VELOCITY),
+            default_of(&radar_fields::known::VELOCITY),
         );
-        assert!(!store.is_edited(&field(RadarProduct::Velocity)));
+        assert!(!store.is_edited(&field(&radar_fields::known::VELOCITY)));
     }
 }

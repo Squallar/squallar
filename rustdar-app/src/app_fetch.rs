@@ -1513,10 +1513,15 @@ impl super::App {
             return SectionDispatch::Busy;
         }
 
-        let product = target.product;
+        let field = target.product.clone();
+        // The extraction is radar's own, keyed by radar's field; the target
+        // names it by id.
+        let Some(product) = crate::render_key::radar_field(&field) else {
+            return SectionDispatch::NoPayload;
+        };
         // Read off the dispatcher, never from the caller, so the vector a frame is
         // *keyed* on cannot differ from the one it is derived with.
-        let motion = (product == rustdar_radar::types::RadarProduct::StormRelativeVelocity)
+        let motion = (field == rustdar_radar::fields::known::STORM_RELATIVE_VELOCITY)
             .then(|| self.render.storm_motion_override_kt())
             .flatten();
         // Read off the dispatcher for the same reason and stamped on the payload below.

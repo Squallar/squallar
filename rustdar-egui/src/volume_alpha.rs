@@ -147,7 +147,8 @@ impl AlphaCurves {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustdar_radar::types::RadarProduct;
+    use rustdar_radar::fields as radar_fields;
+    use rustdar_source::product::FieldId;
 
     /// A palette shaped like reflectivity's: entry 0 transparent, a 64-index
     /// fade band, then a ramp of visible entries.
@@ -322,8 +323,8 @@ mod tests {
         }
     }
 
-    fn field(product: RadarProduct) -> FieldId {
-        rustdar_radar::fields::spec(product).id.clone()
+    fn field(product: &FieldId) -> FieldId {
+        product.clone()
     }
 
     /// The store is per-field: a curve set for one field neither answers
@@ -334,8 +335,8 @@ mod tests {
         let mut alphas = [0u8; CURVE_LEN];
         alphas[200] = 99;
         let curve = AlphaCurve::from_alphas(alphas);
-        let reflectivity = field(RadarProduct::Reflectivity);
-        let velocity = field(RadarProduct::Velocity);
+        let reflectivity = field(&radar_fields::known::REFLECTIVITY);
+        let velocity = field(&radar_fields::known::VELOCITY);
 
         curves.set(&reflectivity, curve.clone());
         assert_eq!(curves.get(&reflectivity), Some(curve));
@@ -372,9 +373,9 @@ mod tests {
         let unknown = FieldId::new("NoBuildRegistersThisField");
         curves.set(&unknown, AlphaCurve::from_alphas(alphas));
         assert!(curves.is_edited(&unknown));
-        for product in RadarProduct::all() {
+        for product in radar_fields::known::ALL.iter() {
             assert!(
-                !curves.is_edited(&field(*product)),
+                !curves.is_edited(&field(product)),
                 "an unknown id leaked onto {product:?}",
             );
         }

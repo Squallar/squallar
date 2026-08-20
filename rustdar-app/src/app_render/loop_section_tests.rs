@@ -11,10 +11,12 @@ use rustdar_egui::pane::{
 use rustdar_geo::GeoPoint;
 use rustdar_radar::loop_downloads::LoopDownloadManager;
 use rustdar_radar::sites::RadarSite;
-use rustdar_radar::types::{RadarProduct, RenderView};
+use rustdar_radar::types::RenderView;
 
 const SITE: &str = "KTLX";
-const PRODUCT: RadarProduct = RadarProduct::Reflectivity;
+/// The field every test here shares, named the way a pane and a render
+/// key name it.
+const PRODUCT_ID: rustdar_source::product::FieldId = rustdar_radar::fields::known::REFLECTIVITY;
 const TILT: f32 = 0.5;
 
 fn ts(minute: u32) -> chrono::NaiveDateTime {
@@ -56,7 +58,7 @@ fn key() -> SectionLoopKey {
 /// This suite's plan-view half of a section identity: [`test_keys::key`] at the site,
 /// product and tilt every test here shares.
 fn target() -> RenderTarget {
-    test_keys::key(SITE, PRODUCT, TILT)
+    test_keys::key(SITE, &PRODUCT_ID, TILT)
 }
 
 /// An app with one aimed cross-section pane running a section loop over
@@ -67,7 +69,7 @@ fn app_with_section_loop(minutes: &[u32]) -> crate::app::App {
     app.loop_mgr = LoopDownloadManager::new();
     let pane = app.gui.pane_mut(0).expect("pane 0 exists");
     pane.set_site(SITE.to_string());
-    pane.set_selected_product(PRODUCT);
+    pane.set_selected_product(PRODUCT_ID);
     pane.set_selected_elevation(TILT);
     pane.set_kind(PaneKind::CrossSection);
     pane.cross_section_mut().expect("a section pane").line = Some(line());
@@ -83,7 +85,7 @@ fn app_with_section_loop(minutes: &[u32]) -> crate::app::App {
             render_failed: false,
         })
         .collect();
-    ls.retarget_renders_for(PRODUCT, TILT, Some(key()));
+    ls.retarget_renders_for(&PRODUCT_ID, TILT, Some(key()));
     *pane.loop_state_mut() = ls;
     app
 }
@@ -283,7 +285,7 @@ fn a_finished_cut_is_placed_with_its_own_axes_and_ladder() {
         render_in_flight: true,
         render_failed: false,
     }];
-    ls.retarget_renders_for(PRODUCT, TILT, Some(key()));
+    ls.retarget_renders_for(&PRODUCT_ID, TILT, Some(key()));
     ls.frames[0].render_in_flight = true;
 
     let mut sr = section_response(&ctx, 4242);
@@ -330,7 +332,7 @@ fn a_cut_for_a_line_the_loop_has_left_is_refused_without_uploading() {
     )
     .expect("two distinct points on Earth");
     ls.retarget_renders_for(
-        PRODUCT,
+        &PRODUCT_ID,
         TILT,
         Some(SectionLoopKey::new(
             elsewhere,
@@ -369,7 +371,7 @@ fn a_cut_that_produced_nothing_retires_its_frame() {
         render_in_flight: true,
         render_failed: false,
     }];
-    ls.retarget_renders_for(PRODUCT, TILT, Some(key()));
+    ls.retarget_renders_for(&PRODUCT_ID, TILT, Some(key()));
     ls.frames[0].render_in_flight = true;
 
     let mut sr = section_response(&ctx, 1);
@@ -445,7 +447,7 @@ fn the_cut_dedupe_weighs_both_halves_of_the_key() {
         !section_already_queued(
             queued.iter(),
             ts(0),
-            &test_keys::key("KOUN", PRODUCT, TILT),
+            &test_keys::key("KOUN", &PRODUCT_ID, TILT),
             &key()
         ),
         "another site's cut was suppressed, so its frame is served by neither"

@@ -1,4 +1,5 @@
 use super::*;
+use rustdar_radar::fields as radar_fields;
 use rustdar_radar::render::polar::{PolarField, PolarGeometry, Wedge};
 
 /// The committed ground track follows the great circle the cut follows, not
@@ -102,7 +103,7 @@ fn the_hover_readout_reports_range_and_azimuth_from_the_site() {
                 hover_lat,
                 hover_lon,
             },
-            RadarProduct::Reflectivity,
+            &radar_fields::known::REFLECTIVITY,
             &prefs,
         )
     };
@@ -144,7 +145,7 @@ fn the_hover_reads_the_gate_the_point_falls_in() {
                 hover_lat,
                 hover_lon,
             },
-            RadarProduct::Reflectivity,
+            &radar_fields::known::REFLECTIVITY,
             &prefs,
         )
     };
@@ -187,7 +188,7 @@ fn a_loop_frame_with_no_values_says_so_rather_than_reading_as_no_data() {
                 hover_lat,
                 hover_lon: site_lon,
             },
-            RadarProduct::NormalizedRotation,
+            &radar_fields::known::NORMALIZED_ROTATION,
             &prefs,
         )
     };
@@ -284,7 +285,7 @@ const PINNED_READOUTS: &[(&str, &str)] = &[
 
 /// The product, preferences and value behind each row of [`PINNED_READOUTS`],
 /// in the same order.
-fn pinned_cases() -> Vec<(RadarProduct, UserPreferences, Option<f32>)> {
+fn pinned_cases() -> Vec<(FieldId, UserPreferences, Option<f32>)> {
     use rustdar_units::{DistanceUnit, HailSizeUnit, PrecipRateUnit, SpeedUnit};
     let imperial = UserPreferences {
         distance: DistanceUnit::Miles,
@@ -295,27 +296,55 @@ fn pinned_cases() -> Vec<(RadarProduct, UserPreferences, Option<f32>)> {
     };
     let si = UserPreferences::default;
     vec![
-        (RadarProduct::Reflectivity, si(), Some(42.5)),
-        (RadarProduct::Reflectivity, si(), Some(-8.25)),
-        (RadarProduct::Reflectivity, imperial.clone(), Some(42.5)),
-        (RadarProduct::Velocity, si(), Some(-17.5)),
-        (RadarProduct::Velocity, imperial.clone(), Some(-17.5)),
-        (RadarProduct::SpectrumWidth, si(), Some(3.25)),
-        (RadarProduct::DifferentialReflectivity, si(), Some(1.75)),
-        (RadarProduct::CorrelationCoefficient, si(), Some(0.987)),
-        (RadarProduct::DifferentialPhase, si(), Some(122.0)),
-        (RadarProduct::SpecificDifferentialPhase, si(), Some(0.85)),
-        (RadarProduct::NormalizedRotation, si(), Some(2.75)),
-        (RadarProduct::EchoTops, si(), Some(42.0)),
-        (RadarProduct::VerticallyIntegratedLiquid, si(), Some(18.0)),
+        (radar_fields::known::REFLECTIVITY, si(), Some(42.5)),
+        (radar_fields::known::REFLECTIVITY, si(), Some(-8.25)),
         (
-            RadarProduct::MaxExpectedHailSize,
+            radar_fields::known::REFLECTIVITY,
+            imperial.clone(),
+            Some(42.5),
+        ),
+        (radar_fields::known::VELOCITY, si(), Some(-17.5)),
+        (radar_fields::known::VELOCITY, imperial.clone(), Some(-17.5)),
+        (radar_fields::known::SPECTRUM_WIDTH, si(), Some(3.25)),
+        (
+            radar_fields::known::DIFFERENTIAL_REFLECTIVITY,
+            si(),
+            Some(1.75),
+        ),
+        (
+            radar_fields::known::CORRELATION_COEFFICIENT,
+            si(),
+            Some(0.987),
+        ),
+        (radar_fields::known::DIFFERENTIAL_PHASE, si(), Some(122.0)),
+        (
+            radar_fields::known::SPECIFIC_DIFFERENTIAL_PHASE,
+            si(),
+            Some(0.85),
+        ),
+        (radar_fields::known::NORMALIZED_ROTATION, si(), Some(2.75)),
+        (radar_fields::known::ECHO_TOPS, si(), Some(42.0)),
+        (
+            radar_fields::known::VERTICALLY_INTEGRATED_LIQUID,
+            si(),
+            Some(18.0),
+        ),
+        (
+            radar_fields::known::MAX_EXPECTED_HAIL_SIZE,
             imperial.clone(),
             Some(1.25),
         ),
-        (RadarProduct::HydrometeorClassification, si(), Some(6.0)),
-        (RadarProduct::PrecipitationRate, imperial, Some(0.35)),
-        (RadarProduct::Reflectivity, si(), None),
+        (
+            radar_fields::known::HYDROMETEOR_CLASSIFICATION,
+            si(),
+            Some(6.0),
+        ),
+        (
+            radar_fields::known::PRECIPITATION_RATE,
+            imperial,
+            Some(0.35),
+        ),
+        (radar_fields::known::REFLECTIVITY, si(), None),
     ]
 }
 
@@ -352,7 +381,7 @@ fn the_hover_readouts_digits_do_not_move() {
         }
         let source = HoverSource::resident(PolarField::from_parts(geometry, values));
 
-        let got = compute_hover_info_raw(&source, &input, *product, prefs);
+        let got = compute_hover_info_raw(&source, &input, product, prefs);
         assert_eq!(got, expected, "{label}");
     }
 }

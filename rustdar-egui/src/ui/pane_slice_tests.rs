@@ -1,4 +1,5 @@
 use super::*;
+use rustdar_radar::fields as radar_fields;
 
 /// Splitting to fewer panes leaves the extra `PaneState`s in the vector so a
 /// re-split can restore them. They are not drawn and not updated, so the
@@ -409,7 +410,7 @@ fn a_retargeted_section_takes_the_maps_site_and_drops_the_old_picture() {
     let ctx = egui::Context::default();
     let mut gui = wide(2);
     gui.panes[0].set_site("KTLX".to_owned());
-    gui.panes[0].set_selected_product(RadarProduct::Velocity);
+    gui.panes[0].set_selected_product(radar_fields::known::VELOCITY);
     gui.panes[1].set_site("KINX".to_owned());
     gui.panes[1].set_kind(crate::pane::PaneKind::CrossSection);
     {
@@ -424,7 +425,7 @@ fn a_retargeted_section_takes_the_maps_site_and_drops_the_old_picture() {
                     .and_hms_opt(18, 30, 0)
                     .unwrap(),
             },
-            product: RadarProduct::Reflectivity,
+            product: radar_fields::known::REFLECTIVITY,
             line: other_line(),
             ladder: 9,
         });
@@ -441,7 +442,7 @@ fn a_retargeted_section_takes_the_maps_site_and_drops_the_old_picture() {
 
     let pane = gui.pane(1).unwrap();
     assert_eq!(pane.site(), "KTLX");
-    assert_eq!(pane.selected_product(), RadarProduct::Velocity);
+    assert_eq!(pane.selected_product(), radar_fields::known::VELOCITY);
     let section = pane.cross_section().unwrap();
     assert_eq!(section.line, Some(drawn_line()));
     assert!(
@@ -498,7 +499,7 @@ fn converting_a_pane_tears_down_its_loop_and_nothing_else() {
         {
             let pane = gui.pane_mut(0).unwrap();
             pane.set_site("KDDC".to_owned());
-            pane.set_selected_product(RadarProduct::Velocity);
+            pane.set_selected_product(radar_fields::known::VELOCITY);
             pane.set_selected_elevation(1.5);
             pane.viewing_live = false;
             pane.time.step = crate::pane::TimeStep::from_secs(1800);
@@ -519,7 +520,7 @@ fn converting_a_pane_tears_down_its_loop_and_nothing_else() {
                  loop back and never finish"
         );
         assert_eq!(pane.site(), "KDDC", "{view:?}: the site went with the loop");
-        assert_eq!(pane.selected_product(), RadarProduct::Velocity);
+        assert_eq!(pane.selected_product(), radar_fields::known::VELOCITY);
         assert_eq!(pane.selected_elevation(), 1.5);
         assert!(!pane.viewing_live);
         assert_eq!(pane.time.step.as_secs(), 1800);

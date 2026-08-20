@@ -309,3 +309,77 @@ fn every_known_field_is_registered() {
     ids.dedup();
     assert_eq!(ids.len(), before, "two `known::` consts share a spelling");
 }
+
+/// [`super::spec_for`] answers by id exactly what [`spec`] answers by value,
+/// for every registered field — and `None` for an id this crate does not
+/// register.
+///
+/// The by-id door is what every caller outside this crate uses after WO-E9e, so
+/// a drift between the two lookups would show as the *wrong field's* colour
+/// scale, name and unit on a pane that had asked for the right one.
+#[test]
+fn the_by_id_lookup_answers_what_the_by_value_lookup_answers() {
+    for &p in RadarProduct::all() {
+        let by_value = spec(p);
+        let by_id = super::spec_for(&by_value.id)
+            .unwrap_or_else(|| panic!("{p:?} is registered but not reachable by its own id"));
+        assert!(
+            std::ptr::eq(by_id, by_value),
+            "{p:?}: the by-id lookup returned a different row from the by-value \
+             lookup, so a caller holding an id reads another field's facts",
+        );
+    }
+    assert!(
+        super::spec_for(&FieldId::from_static("NoSuchFieldAnywhere")).is_none(),
+        "an id this crate does not register must answer None rather than \
+         resolving to some field, or the open-id doctrine is a fiction",
+    );
+}
+
+/// [`super::format_value`] is a **door onto `RadarProduct::format_value`, not a
+/// second table**: for every registered field, at values spanning its own
+/// colour scale, under two unit preferences, the string is character for
+/// character the enum method's.
+///
+/// This is what makes it safe for the UI to have stopped naming the enum: the
+/// readout under the pointer did not move, and if someone re-implements this
+/// door as a formatter of its own, this fails.
+#[test]
+fn the_readout_door_prints_exactly_what_the_enum_method_prints() {
+    let imperial = rustdar_units::UserPreferences::default();
+    let metric = rustdar_units::UserPreferences {
+        speed: rustdar_units::SpeedUnit::MetersPerSec,
+        height: rustdar_units::HeightUnit::Meters,
+        precip_rate: rustdar_units::PrecipRateUnit::MillimetersPerHour,
+        hail_size: rustdar_units::HailSizeUnit::Centimeters,
+        ..rustdar_units::UserPreferences::default()
+    };
+    let mut compared = 0usize;
+    for &p in RadarProduct::all() {
+        let s = spec(p);
+        // Across the field's own domain, so the hydrometeor class arms and the
+        // precipitation-rate decimal switch are both actually exercised.
+        for step in 0..=10 {
+            let value =
+                s.scale.min_value + (s.scale.max_value - s.scale.min_value) * (step as f32 / 10.0);
+            for prefs in [&imperial, &metric] {
+                assert_eq!(
+                    super::format_value(&s.id, value, prefs).as_deref(),
+                    Some(p.format_value(value, prefs).as_str()),
+                    "{p:?} at {value}: the by-id readout is not the enum's",
+                );
+                compared += 1;
+            }
+        }
+    }
+    // Non-triviality floor: a loop that compared nothing would pass above.
+    assert_eq!(
+        compared,
+        RadarProduct::all().len() * 11 * 2,
+        "the comparison did not run over every field, value and preference set",
+    );
+    assert!(
+        super::format_value(&FieldId::from_static("NoSuchFieldAnywhere"), 1.0, &imperial).is_none(),
+        "an unregistered id must have no readout rather than some field's",
+    );
+}

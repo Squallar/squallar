@@ -251,7 +251,7 @@ pub(super) fn radar_row_status(pane: &PaneState) -> Option<String> {
     let (product, tilt) = pane
         .get_rendering_params()
         .unwrap_or((pane.selected_product(), pane.selected_elevation()));
-    let code = product.code().to_uppercase();
+    let code = crate::field_facts::code(&product).to_uppercase();
     if pane.render_view().reads_whole_volume() {
         return Some(code);
     }

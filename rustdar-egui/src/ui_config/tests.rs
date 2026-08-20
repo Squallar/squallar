@@ -1,5 +1,6 @@
 use crate::UI_CONFIG_KEY;
 use rustdar_kv::{KvStore, MemoryKvStore};
+use rustdar_radar::fields as radar_fields;
 
 /// Settings the user changed must come back after a save/load cycle.
 #[test]
@@ -159,7 +160,6 @@ fn absent_legacy_globals_mean_linked_and_are_never_rewritten() {
 #[test]
 fn volume_alpha_curves_survive_a_save_and_load() {
     use crate::volume_alpha::{AlphaCurve, CURVE_LEN};
-    use rustdar_radar::types::RadarProduct;
 
     let store = MemoryKvStore::default();
     let mut gui = crate::Gui::new();
@@ -168,10 +168,8 @@ fn volume_alpha_curves_survive_a_save_and_load() {
         *slot = (i / 2) as u8; // a curve no default produces
     }
     let curve = AlphaCurve::from_alphas(alphas);
-    gui.volume_alpha.set(
-        &rustdar_radar::fields::spec(RadarProduct::Reflectivity).id,
-        curve.clone(),
-    );
+    gui.volume_alpha
+        .set(&radar_fields::known::REFLECTIVITY, curve.clone());
     gui.save_ui_config(&store);
 
     let mut restored = crate::Gui::new();
@@ -179,14 +177,12 @@ fn volume_alpha_curves_survive_a_save_and_load() {
     assert_eq!(
         restored
             .volume_alpha
-            .get(&rustdar_radar::fields::spec(RadarProduct::Reflectivity).id),
+            .get(&radar_fields::known::REFLECTIVITY),
         Some(curve),
         "the drawn curve must come back exactly",
     );
     assert_eq!(
-        restored
-            .volume_alpha
-            .get(&rustdar_radar::fields::spec(RadarProduct::Velocity).id),
+        restored.volume_alpha.get(&radar_fields::known::VELOCITY),
         None,
         "a product the user never edited must come back with no curve at all",
     );
@@ -196,8 +192,6 @@ fn volume_alpha_curves_survive_a_save_and_load() {
 /// the field defaults to empty, and empty means bit-exact.
 #[test]
 fn an_old_config_without_volume_alpha_loads_with_every_editor_untouched() {
-    use rustdar_radar::types::RadarProduct;
-
     let store = MemoryKvStore::default();
     store
         .store(UI_CONFIG_KEY, "{}")
@@ -207,7 +201,7 @@ fn an_old_config_without_volume_alpha_loads_with_every_editor_untouched() {
     assert!(gui.load_ui_config(&store), "an old config still loads");
     assert!(
         !gui.volume_alpha
-            .is_edited(&rustdar_radar::fields::spec(RadarProduct::Reflectivity).id),
+            .is_edited(&radar_fields::known::REFLECTIVITY),
         "an old config must not conjure a curve for any product",
     );
 }
@@ -217,8 +211,6 @@ fn an_old_config_without_volume_alpha_loads_with_every_editor_untouched() {
 /// the way in.
 #[test]
 fn a_hostile_volume_alpha_entry_is_dropped_or_reclamped_never_trusted() {
-    use rustdar_radar::types::RadarProduct;
-
     let store = MemoryKvStore::default();
     let mut full: Vec<String> = vec!["255".to_owned(); 256];
     full[1] = "9".to_owned();
@@ -236,14 +228,13 @@ fn a_hostile_volume_alpha_entry_is_dropped_or_reclamped_never_trusted() {
     let mut gui = crate::Gui::new();
     assert!(gui.load_ui_config(&store), "the rest of the config loads");
     assert_eq!(
-        gui.volume_alpha
-            .get(&rustdar_radar::fields::spec(RadarProduct::Reflectivity).id),
+        gui.volume_alpha.get(&radar_fields::known::REFLECTIVITY),
         None,
         "a wrong-length curve must be dropped, not padded or truncated",
     );
     let velocity = gui
         .volume_alpha
-        .get(&rustdar_radar::fields::spec(RadarProduct::Velocity).id)
+        .get(&radar_fields::known::VELOCITY)
         .expect("a well-sized curve loads");
     assert_eq!(
         velocity.alphas()[0],
@@ -263,7 +254,6 @@ fn a_hostile_volume_alpha_entry_is_dropped_or_reclamped_never_trusted() {
 #[test]
 fn the_isosurface_mode_and_thresholds_survive_a_save_and_load() {
     use crate::pane::VolumeViewMode;
-    use rustdar_radar::types::RadarProduct;
 
     let store = MemoryKvStore::default();
     let mut gui = crate::Gui::new();
@@ -271,12 +261,12 @@ fn the_isosurface_mode_and_thresholds_survive_a_save_and_load() {
         .unwrap()
         .set_view(rustdar_radar::types::RenderView::Volume);
     gui.pane_mut(0).unwrap().volume_mut().unwrap().view_mode = VolumeViewMode::Isosurface;
-    gui.volume_iso.set(
-        &rustdar_radar::fields::spec(RadarProduct::Velocity).id,
-        35.0,
-    );
+    gui.volume_iso.set(&radar_fields::known::VELOCITY, 35.0);
     assert_ne!(
-        rustdar_radar::voxel::default_iso_threshold(RadarProduct::Velocity),
+        rustdar_radar::voxel::default_iso_threshold(
+            rustdar_radar::fields::product_for(&radar_fields::known::VELOCITY)
+                .expect("a registered field"),
+        ),
         35.0,
         "precondition: the saved threshold must differ from the default",
     );
@@ -290,15 +280,13 @@ fn the_isosurface_mode_and_thresholds_survive_a_save_and_load() {
         "a pane set to isosurface must come back one",
     );
     assert_eq!(
-        restored
-            .volume_iso
-            .get(&rustdar_radar::fields::spec(RadarProduct::Velocity).id),
+        restored.volume_iso.get(&radar_fields::known::VELOCITY),
         35.0
     );
     assert!(
         !restored
             .volume_iso
-            .is_edited(&rustdar_radar::fields::spec(RadarProduct::Reflectivity).id),
+            .is_edited(&radar_fields::known::REFLECTIVITY),
         "an untouched product must come back at the argued default",
     );
 }
@@ -547,7 +535,6 @@ fn a_migrated_3d_pane_is_saved_in_the_new_vocabulary() {
 #[test]
 fn an_unknown_view_mode_or_iso_product_does_not_poison_the_load() {
     use crate::pane::VolumeViewMode;
-    use rustdar_radar::types::RadarProduct;
 
     let store = MemoryKvStore::default();
     store
@@ -579,19 +566,17 @@ fn an_unknown_view_mode_or_iso_product_does_not_poison_the_load() {
         "an unknown mode falls back to the lit volume",
     );
     assert_eq!(
-        gui.volume_iso
-            .get(&rustdar_radar::fields::spec(RadarProduct::Velocity).id),
+        gui.volume_iso.get(&radar_fields::known::VELOCITY),
         30.0,
         "the entry beside the unknown one still loads",
     );
     // The guarantee that mattered, unchanged: never reassigned.
-    for product in RadarProduct::all() {
-        if *product == RadarProduct::Velocity {
+    for product in radar_fields::known::ALL.iter() {
+        if *product == radar_fields::known::VELOCITY {
             continue;
         }
         assert!(
-            !gui.volume_iso
-                .is_edited(&rustdar_radar::fields::spec(*product).id),
+            !gui.volume_iso.is_edited(product),
             "the unknown threshold was reassigned to {product:?}",
         );
     }
@@ -611,8 +596,6 @@ fn an_unknown_view_mode_or_iso_product_does_not_poison_the_load() {
 /// A config naming a product this build does not know still loads.
 #[test]
 fn a_config_naming_a_product_from_the_future_still_loads() {
-    use rustdar_radar::types::RadarProduct;
-
     let store = MemoryKvStore::default();
     store
         .store(
@@ -632,7 +615,7 @@ fn a_config_naming_a_product_from_the_future_still_loads() {
     );
     assert_eq!(
         gui.pane(0).unwrap().selected_product(),
-        RadarProduct::Reflectivity,
+        radar_fields::known::REFLECTIVITY,
         "the unknown product falls back to the default product",
     );
     assert_eq!(
@@ -749,8 +732,6 @@ fn a_config_naming_a_site_no_radar_could_have_is_refused_not_sliced() {
 /// product this build knows.
 #[test]
 fn an_alpha_curve_for_an_unknown_product_is_dropped_not_reassigned() {
-    use rustdar_radar::types::RadarProduct;
-
     let store = MemoryKvStore::default();
     let full: Vec<String> = vec!["128".to_owned(); 256];
     let json = format!(
@@ -768,20 +749,19 @@ fn an_alpha_curve_for_an_unknown_product_is_dropped_not_reassigned() {
     assert!(gui.load_ui_config(&store), "the rest of the config loads");
     assert!(
         gui.volume_alpha
-            .get(&rustdar_radar::fields::spec(RadarProduct::Velocity).id)
+            .get(&radar_fields::known::VELOCITY)
             .is_some(),
         "the entry beside the unknown one still loads",
     );
 
     // **The guarantee, unchanged**: a curve saved under a name this build does
     // not know is never applied to a field this build DOES know.
-    for product in RadarProduct::all() {
-        if *product == RadarProduct::Velocity {
+    for product in radar_fields::known::ALL.iter() {
+        if *product == radar_fields::known::VELOCITY {
             continue;
         }
         assert!(
-            !gui.volume_alpha
-                .is_edited(&rustdar_radar::fields::spec(*product).id),
+            !gui.volume_alpha.is_edited(product),
             "the unknown entry was remapped onto {product:?}",
         );
     }
@@ -1387,7 +1367,10 @@ fn a_scan() -> rustdar_radar::types::ScanInfo {
             .and_hms_opt(18, 0, 0)
             .unwrap(),
         vcp_number: 212,
-        available_products: vec![rustdar_radar::types::RadarProduct::Reflectivity],
+        available_products: vec![
+            rustdar_radar::fields::product_for(&radar_fields::known::REFLECTIVITY)
+                .expect("a registered field"),
+        ],
         product_elevations: std::collections::HashMap::new(),
         status: "test".to_string(),
     }
@@ -1631,7 +1614,7 @@ fn a_reopened_pane_carries_no_fold_limit_until_its_first_render() {
     let mut gui = crate::Gui::new();
     gui.pane_mut(0)
         .unwrap()
-        .set_selected_product(rustdar_radar::types::RadarProduct::Velocity);
+        .set_selected_product(radar_fields::known::VELOCITY);
     gui.save_ui_config(&store);
 
     let written = store.load(UI_CONFIG_KEY).expect("config should be stored");
@@ -1647,7 +1630,7 @@ fn a_reopened_pane_carries_no_fold_limit_until_its_first_render() {
     let pane = restored.pane(0).expect("a restored pane");
     assert_eq!(
         pane.selected_product(),
-        rustdar_radar::types::RadarProduct::Velocity,
+        radar_fields::known::VELOCITY,
         "precondition: the pane must come back on velocity, or it would \
          answer None for the wrong reason",
     );
@@ -1655,6 +1638,77 @@ fn a_reopened_pane_carries_no_fold_limit_until_its_first_render() {
         pane.displayed_nyquist_ms(),
         None,
         "a pane with no picture on it claimed to know where that picture folds",
+    );
+}
+
+/// A pane's field comes back as the registry's own `&'static` spelling, not as
+/// the bytes that were on disk.
+///
+/// **Pointer identity, because that is the property and equality is not.** The
+/// two `FieldId`s compare equal either way; what
+/// [`crate::ui_config::product_or_default`] promises is that the surviving one
+/// borrows the registry's static string, so `PaneState::selected_product`
+/// returns a `Cow::Borrowed` and reading a pane's field on the frame path
+/// allocates nothing. A load that handed back an owned copy of the same bytes
+/// would pass an `assert_eq!` and fail this.
+#[test]
+fn the_loaded_field_is_the_registrys_own_static_spelling() {
+    let store = MemoryKvStore::default();
+    let mut gui = crate::Gui::new();
+    // Written through a *constructed* id rather than the const, so the bytes
+    // that reach the disk cannot already be the static this test is looking for.
+    gui.pane_mut(0)
+        .unwrap()
+        .set_selected_product(rustdar_source::product::FieldId::new(String::from(
+            "Velocity",
+        )));
+    gui.save_ui_config(&store);
+
+    let mut restored = crate::Gui::new();
+    assert!(restored.load_ui_config(&store));
+    let loaded = restored
+        .pane(0)
+        .expect("a restored pane")
+        .selected_product();
+    assert_eq!(
+        loaded,
+        radar_fields::known::VELOCITY,
+        "precondition: the pane must come back on velocity",
+    );
+    let registered = rustdar_radar::fields::spec_for(&radar_fields::known::VELOCITY)
+        .expect("the radar layer registers Velocity");
+    assert!(
+        std::ptr::eq(loaded.as_str(), registered.id.as_str()),
+        "the pane's field is a copy of the bytes off the disk, not the \
+         registry's own static spelling: reading it on the frame path now \
+         allocates once per read",
+    );
+}
+
+/// An unknown field on disk falls back to the default field, and the fallback is
+/// itself the registry's static spelling.
+#[test]
+fn a_pane_whose_saved_field_this_build_does_not_register_falls_back() {
+    let store = MemoryKvStore::default();
+    let mut gui = crate::Gui::new();
+    gui.pane_mut(0)
+        .unwrap()
+        .set_selected_product(rustdar_source::product::FieldId::new(String::from(
+            "NoSuchFieldAnywhere",
+        )));
+    gui.save_ui_config(&store);
+
+    let mut restored = crate::Gui::new();
+    assert!(restored.load_ui_config(&store));
+    let loaded = restored
+        .pane(0)
+        .expect("a restored pane")
+        .selected_product();
+    assert_eq!(
+        loaded,
+        radar_fields::known::REFLECTIVITY,
+        "a pane's selection has to name a field this build can draw; unlike a \
+         saved curve there is nothing for it to be preserved inert *on*",
     );
 }
 

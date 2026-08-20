@@ -179,7 +179,7 @@ fn app_with_section(product: RadarProduct, scan: Arc<Scan>) -> crate::app::App {
     {
         let pane = app.gui.pane_mut(0).unwrap();
         pane.set_site(SITE.to_owned());
-        pane.set_selected_product(product);
+        pane.set_selected_product(rustdar_radar::fields::spec(product).id.clone());
         pane.set_kind(PaneKind::CrossSection);
         pane.cross_section_mut().unwrap().line = Some(line());
     }
@@ -441,7 +441,7 @@ fn a_product_with_no_vertical_structure_says_so_and_stops_asking() {
     assert_eq!(
         state(&app).unavailable,
         Some(SectionUnavailable::ProductHasNoVerticalStructure(
-            RadarProduct::EchoTops
+            rustdar_radar::fields::known::ECHO_TOPS
         )),
     );
     assert!(
@@ -452,7 +452,8 @@ fn a_product_with_no_vertical_structure_says_so_and_stops_asking() {
     assert!(!app.render.pane_render[0].render_in_flight());
 
     let message =
-        SectionUnavailable::ProductHasNoVerticalStructure(RadarProduct::EchoTops).message();
+        SectionUnavailable::ProductHasNoVerticalStructure(rustdar_radar::fields::known::ECHO_TOPS)
+            .message();
     assert!(message.contains(RadarProduct::EchoTops.name()), "{message}");
 }
 
@@ -465,7 +466,7 @@ fn an_override_edit_invalidates_the_srv_vertical_views() {
             site: SITE.to_owned(),
             collected: volume_time(),
         },
-        product: RadarProduct::StormRelativeVelocity,
+        product: rustdar_radar::fields::known::STORM_RELATIVE_VELOCITY,
         line: line(),
         ladder: 7,
     };
@@ -474,7 +475,7 @@ fn an_override_edit_invalidates_the_srv_vertical_views() {
             site: SITE.to_owned(),
             collected: volume_time(),
         },
-        product: RadarProduct::StormRelativeVelocity,
+        product: rustdar_radar::fields::known::STORM_RELATIVE_VELOCITY,
         region: None,
     };
     let arm = |app: &mut crate::app::App| {
@@ -584,7 +585,7 @@ fn a_volume_with_nothing_to_cut_is_named_rather_than_waited_on() {
     assert_eq!(
         state(&app).unavailable,
         Some(SectionUnavailable::ProductMissingFromVolume(
-            RadarProduct::StormRelativeVelocity
+            rustdar_radar::fields::known::STORM_RELATIVE_VELOCITY
         )),
         "the pane is waiting on a cut that can never come",
     );
@@ -593,7 +594,7 @@ fn a_volume_with_nothing_to_cut_is_named_rather_than_waited_on() {
         "without the staleness key the pane re-dispatches every frame — a \
              busy loop whose only symptom is a warm machine",
     );
-    let message = state(&app).unavailable.expect("named").message();
+    let message = state(&app).unavailable.as_ref().expect("named").message();
     assert!(
         message.contains("carries no"),
         "the state has a name but no explanation: {message:?}",
@@ -1066,7 +1067,7 @@ fn a_new_volume_makes_the_section_on_screen_stale_with_no_reset_arm() {
     app.gui
         .pane_mut(0)
         .unwrap()
-        .set_selected_product(RadarProduct::Velocity);
+        .set_selected_product(rustdar_radar::fields::known::VELOCITY);
     assert_ne!(app.section_target_for_pane(0), Some(after));
 
     app.gui
@@ -1201,7 +1202,7 @@ fn a_seal_that_changes_no_chosen_rung_does_not_move_the_section_key() {
     app.gui
         .pane_mut(0)
         .unwrap()
-        .set_selected_product(RadarProduct::Velocity);
+        .set_selected_product(rustdar_radar::fields::known::VELOCITY);
     let vel_after = app.section_target_for_pane(0).expect("aimed at velocity");
     app.base_scans.insert(
         SITE.to_owned(),

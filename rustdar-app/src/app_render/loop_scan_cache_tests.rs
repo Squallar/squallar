@@ -199,7 +199,7 @@ fn a_live_loops_frames_keep_their_volumes() {
 
     app.evict_unshown_scans();
 
-    let target = test_keys::key(SITE, RadarProduct::Reflectivity, 0.5);
+    let target = test_keys::key(SITE, &rustdar_radar::fields::known::REFLECTIVITY, 0.5);
     for minute in [0, 4, 8] {
         assert!(
             app.loop_mgr.get_cached(SITE, &at(minute)).is_some(),
@@ -510,7 +510,7 @@ fn a_live_level3_loops_frames_keep_their_objects() {
 
     app.evict_unshown_scans();
 
-    let target = test_keys::key(SITE, RadarProduct::EchoTops, 0.5);
+    let target = test_keys::key(SITE, &rustdar_radar::fields::known::ECHO_TOPS, 0.5);
     for minute in [0, 4, 8] {
         assert!(
             matches!(
@@ -547,7 +547,7 @@ fn switching_product_keeps_the_objects_of_frames_still_in_the_window() {
     app.gui
         .pane_mut(0)
         .expect("a fresh Gui has one pane")
-        .set_selected_product(RadarProduct::SpecificDifferentialPhase);
+        .set_selected_product(rustdar_radar::fields::known::SPECIFIC_DIFFERENTIAL_PHASE);
 
     app.evict_unshown_scans();
 

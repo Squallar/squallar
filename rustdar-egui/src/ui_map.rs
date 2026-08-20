@@ -1,8 +1,9 @@
 use super::map_overlays::draw_tile_layer;
 use crate::actions::GuiAction;
 use rustdar_radar::hover::{HoverSource, Reading};
-use rustdar_radar::types::{RadarProduct, RenderView};
+use rustdar_radar::types::RenderView;
 use rustdar_source::id::known;
+use rustdar_source::product::FieldId;
 use rustdar_units::UserPreferences;
 
 #[path = "ui_map_pane.rs"]
@@ -1021,7 +1022,7 @@ impl super::Gui {
                 &painter,
                 pane_rect,
                 crate::ui::pills::pill_row_clearance(ui.ctx(), pane_idx),
-                on_screen,
+                &on_screen,
                 elevation,
             );
         }
@@ -1309,7 +1310,7 @@ fn volume_pane_outcome(
     // The gate is the field's own registered fact, not a second reading of the
     // derive table: `vertical` IS `volume_slot(p).is_some()`, pinned as such
     // where the projection is built.
-    let facts = rustdar_radar::fields::spec(product);
+    let facts = crate::field_facts::facts(&product);
     if !facts.vertical {
         return VolumeOutcome::empty_state(format!(
             "{} has no vertical structure to render in 3D - pick a moment the radar measures \
@@ -1320,7 +1321,7 @@ fn volume_pane_outcome(
 
     let live_target = VolumeTarget {
         volume: volume_stamp,
-        product,
+        product: product.clone(),
         region,
     };
     let (target, from_loop) = match loop_grid {
@@ -1350,9 +1351,9 @@ fn volume_pane_outcome(
         floor,
         source: source_geo,
         mirror_size_points: [mirror_size_points.x, mirror_size_points.y],
-        alpha: alpha_curves.get(&rustdar_radar::fields::spec(product).id),
+        alpha: alpha_curves.get(&crate::field_facts::facts(&product).id),
         view_mode,
-        iso_threshold: iso_thresholds.get(&rustdar_radar::fields::spec(product).id),
+        iso_threshold: iso_thresholds.get(&crate::field_facts::facts(&product).id),
     }) {
         VolumePaint::Callback { payload, showing } => {
             ui.painter()
@@ -1472,7 +1473,7 @@ pub(crate) fn render_volume_controls(
             // wildcard that used to answer for a field with no stated domain is
             // gone: a field with no vertical extent never reaches this arm, and
             // gets the refusal plate above instead.
-            let facts = rustdar_radar::fields::spec(product);
+            let facts = crate::field_facts::facts(&product);
             let (prefix, suffix) = facts.domain_label_ends;
             let (domain_start, domain_end) = facts.value_domain;
             let mut threshold = iso_thresholds.get(&facts.id);
@@ -2014,7 +2015,7 @@ const NOT_RESIDENT: &str = "| no value held for this frame";
 pub(super) fn compute_hover_info_raw(
     hover: &HoverSource,
     input: &HoverInput,
-    product: RadarProduct,
+    product: &FieldId,
     prefs: &UserPreferences,
 ) -> String {
     let (azimuth, distance_km) = rustdar_geo::site_bearing_range_km(
@@ -2025,7 +2026,10 @@ pub(super) fn compute_hover_info_raw(
     );
 
     let value_str = match hover.read(azimuth, distance_km) {
-        Reading::Value(value) => format!("| {}", product.format_value(value, prefs)),
+        Reading::Value(value) => format!(
+            "| {}",
+            crate::field_facts::format_value(product, value, prefs)
+        ),
         Reading::Unpainted => String::new(),
         Reading::NotResident => NOT_RESIDENT.to_string(),
     };

@@ -15,7 +15,7 @@ fn target(site: &str, minute: u32, product: RadarProduct, ladder: u64) -> Sectio
             site: site.to_owned(),
             collected: at(minute),
         },
-        product,
+        product: rustdar_radar::fields::spec(product).id.clone(),
         line: SectionLine::new(
             GeoPoint {
                 lat: 35.3,

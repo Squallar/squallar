@@ -591,7 +591,7 @@ use rustdar_volumetric::bridge::{Hold, VolumeEntry};
 fn volume_target(site: &str, minute: u32) -> VolumeTarget {
     VolumeTarget {
         region: None,
-        product: RadarProduct::Reflectivity,
+        product: rustdar_radar::fields::known::REFLECTIVITY,
         volume: VolumeStamp {
             site: site.to_owned(),
             collected: at(minute),

@@ -1,6 +1,5 @@
 //! What size a loop frame is dispatched at.
 
-use super::*;
 use crate::platform_double::TestBridge;
 use crate::test_keys;
 use rustdar_worker::offload::{JobRequest, JobSink};
@@ -122,7 +121,7 @@ fn a_loop_frame_is_dispatched_leaner_than_the_still_frame_beside_it() {
     app.render.set_raster_side_ceiling_px(DEVICE_CEILING);
 
     let params = || crate::render_dispatch::RenderParams {
-        product: RadarProduct::Reflectivity,
+        product: rustdar_radar::types::RadarProduct::Reflectivity,
         elevation: 0.5,
         lat: site.lat,
         lon: site.lon,
@@ -144,7 +143,7 @@ fn a_loop_frame_is_dispatched_leaner_than_the_still_frame_beside_it() {
             0,
             frame_time,
             params(),
-            test_keys::key(SITE, RadarProduct::Reflectivity, 0.5),
+            test_keys::key(SITE, &rustdar_radar::fields::known::REFLECTIVITY, 0.5),
         ),
         "the fixture must actually reach the dispatch",
     );

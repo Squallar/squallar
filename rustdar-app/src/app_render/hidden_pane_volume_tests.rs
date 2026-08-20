@@ -4,7 +4,6 @@ use crate::volume_fixture::ready_grid;
 use rustdar_egui::UI_CONFIG_KEY;
 use rustdar_egui::pane::{VolumeStamp, VolumeTarget};
 use rustdar_kv::{KvStore, MemoryKvStore};
-use rustdar_radar::types::RadarProduct;
 use rustdar_volumetric::bridge::{Hold, VolumeEntry};
 
 const SITE: &str = "KTLX";
@@ -12,7 +11,7 @@ const SITE: &str = "KTLX";
 fn target(minute: u32) -> VolumeTarget {
     VolumeTarget {
         region: None,
-        product: RadarProduct::Reflectivity,
+        product: rustdar_radar::fields::known::REFLECTIVITY,
         volume: VolumeStamp {
             site: SITE.to_owned(),
             collected: chrono::NaiveDate::from_ymd_opt(2026, 8, 11)

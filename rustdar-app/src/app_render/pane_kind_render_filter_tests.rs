@@ -9,6 +9,8 @@ use rustdar_source::id::known;
 
 const SITE: &str = "KTLX";
 const PRODUCT: RadarProduct = RadarProduct::Reflectivity;
+/// The same field named the way a pane and a render key name it.
+const PRODUCT_ID: rustdar_source::product::FieldId = rustdar_radar::fields::known::REFLECTIVITY;
 const TILT: f32 = 0.5;
 
 fn volume_time() -> chrono::NaiveDateTime {
@@ -33,7 +35,7 @@ fn point_at_site(app: &mut crate::app::App, pane_idx: usize) {
     product_elevations.insert(PRODUCT, vec![TILT]);
     let pane = app.gui.pane_mut(pane_idx).expect("pane exists");
     pane.set_site(SITE.to_string());
-    pane.set_selected_product(PRODUCT);
+    pane.set_selected_product(PRODUCT_ID);
     pane.set_selected_elevation(TILT);
     app.gui
         .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForPane {
@@ -250,7 +252,7 @@ fn active_loop(timestamps: &[chrono::NaiveDateTime]) -> LayerTimeState {
             render_failed: false,
         })
         .collect();
-    ls.retarget_renders(PRODUCT, TILT);
+    ls.retarget_renders(&PRODUCT_ID, TILT);
     assert!(
         ls.rendered_for.is_some(),
         "precondition: a fresh loop must take its first target"
@@ -304,7 +306,7 @@ fn the_first_loop_dispatch_pass_skips_only_the_panes_that_cannot_loop() {
             }
             *pane.loop_state_mut() = active_loop(&[volume_time()]);
             pane.loop_state_mut().view = kind;
-            pane.set_selected_product(moved_to);
+            pane.set_selected_product(rustdar_radar::fields::spec(moved_to).id.clone());
             pane.set_selected_elevation(0.0);
         }
 
@@ -317,7 +319,12 @@ fn the_first_loop_dispatch_pass_skips_only_the_panes_that_cannot_loop() {
             .loop_state()
             .rendered_for
             .as_ref()
-            .map(|target| (target.product, target.elevation));
+            .and_then(|target| {
+                Some((
+                    rustdar_radar::fields::product_for(&target.product)?,
+                    target.elevation,
+                ))
+            });
         assert_eq!(
             keyed, expected,
             "{label}: the loop's render target moved for a pane whose frames \

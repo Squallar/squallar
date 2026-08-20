@@ -1,7 +1,21 @@
 use super::*;
+use rustdar_radar::fields as radar_fields;
 use rustdar_radar::sites::RadarSite;
-use rustdar_radar::types::RadarProduct;
+use rustdar_source::product::FieldId;
 use std::collections::HashMap;
+
+/// The radar layer's own field value for an id.
+///
+/// A [`ScanInfo`](rustdar_radar::types::ScanInfo) is radar's fact about a scan
+/// and its tables are keyed by radar's own field, so these fixtures resolve
+/// ids through the one door instead of naming the layer's type. A macro rather
+/// than a function because the answer's type is the layer's, and a function
+/// would have to write it down.
+macro_rules! resolve {
+    ($id:expr) => {
+        rustdar_radar::fields::product_for($id).expect("a registered field")
+    };
+}
 
 fn site() -> RadarSite {
     RadarSite {
@@ -19,10 +33,10 @@ fn at(minute: u32) -> chrono::NaiveDateTime {
         .unwrap()
 }
 
-fn info(minute: u32, products: &[(RadarProduct, &[f32])]) -> ScanInfo {
+fn info(minute: u32, products: &[(FieldId, &[f32])]) -> ScanInfo {
     let mut product_elevations = HashMap::new();
     for (product, angles) in products {
-        product_elevations.insert(*product, angles.to_vec());
+        product_elevations.insert(resolve!(product), angles.to_vec());
     }
     ScanInfo {
         site: site(),
@@ -30,7 +44,7 @@ fn info(minute: u32, products: &[(RadarProduct, &[f32])]) -> ScanInfo {
         site_position: None,
         timestamp: at(minute),
         vcp_number: 212,
-        available_products: products.iter().map(|(p, _)| *p).collect(),
+        available_products: products.iter().map(|(p, _)| resolve!(p)).collect(),
         product_elevations,
         status: format!("minute {minute}"),
     }
@@ -48,18 +62,21 @@ fn gui_with(existing: ScanInfo) -> Gui {
 fn a_partial_volume_does_not_shrink_the_tilt_list() {
     let full = info(
         0,
-        &[(RadarProduct::Reflectivity, &[0.5, 1.5, 2.4, 3.4, 4.3])],
+        &[(
+            radar_fields::known::REFLECTIVITY,
+            &[0.5, 1.5, 2.4, 3.4, 4.3],
+        )],
     );
     let mut gui = gui_with(full);
 
     gui.apply(crate::shell_api::GuiEvent::ChunkScanInfo {
         site: "KTLX".to_owned(),
-        info: info(5, &[(RadarProduct::Reflectivity, &[0.5])]),
+        info: info(5, &[(radar_fields::known::REFLECTIVITY, &[0.5])]),
     });
 
     let merged = gui.pane(0).unwrap().scan_info.clone().unwrap();
     assert_eq!(
-        merged.product_elevations[&RadarProduct::Reflectivity],
+        merged.product_elevations[&resolve!(&radar_fields::known::REFLECTIVITY)],
         vec![0.5, 1.5, 2.4, 3.4, 4.3],
         "the tilt list shrank to the cuts assembled so far"
     );
@@ -78,26 +95,26 @@ fn a_partial_volume_keeps_the_level3_products_already_registered() {
     let existing = info(
         0,
         &[
-            (RadarProduct::Reflectivity, &[0.5, 1.5]),
-            (RadarProduct::StormRelativeVelocity, &[0.5]),
+            (radar_fields::known::REFLECTIVITY, &[0.5, 1.5]),
+            (radar_fields::known::STORM_RELATIVE_VELOCITY, &[0.5]),
         ],
     );
     let mut gui = gui_with(existing);
 
     gui.apply(crate::shell_api::GuiEvent::ChunkScanInfo {
         site: "KTLX".to_owned(),
-        info: info(5, &[(RadarProduct::Reflectivity, &[0.5])]),
+        info: info(5, &[(radar_fields::known::REFLECTIVITY, &[0.5])]),
     });
 
     let merged = gui.pane(0).unwrap().scan_info.clone().unwrap();
     assert!(
         merged
             .available_products
-            .contains(&RadarProduct::StormRelativeVelocity),
+            .contains(&resolve!(&radar_fields::known::STORM_RELATIVE_VELOCITY)),
         "the Level III product was dropped by a Level II cut completing"
     );
     assert_eq!(
-        merged.product_elevations[&RadarProduct::StormRelativeVelocity],
+        merged.product_elevations[&resolve!(&radar_fields::known::STORM_RELATIVE_VELOCITY)],
         vec![0.5],
         "and its tilt list with it"
     );
@@ -106,10 +123,10 @@ fn a_partial_volume_keeps_the_level3_products_already_registered() {
 /// A tilt the assembling volume reveals for the first time still has to appear.
 #[test]
 fn a_newly_seen_tilt_is_added_to_the_list() {
-    let mut gui = gui_with(info(0, &[(RadarProduct::Reflectivity, &[0.5])]));
+    let mut gui = gui_with(info(0, &[(radar_fields::known::REFLECTIVITY, &[0.5])]));
     gui.apply(crate::shell_api::GuiEvent::ChunkScanInfo {
         site: "KTLX".to_owned(),
-        info: info(5, &[(RadarProduct::Reflectivity, &[0.5, 6.4])]),
+        info: info(5, &[(radar_fields::known::REFLECTIVITY, &[0.5, 6.4])]),
     });
     assert_eq!(
         gui.pane(0)
@@ -117,7 +134,7 @@ fn a_newly_seen_tilt_is_added_to_the_list() {
             .scan_info
             .as_ref()
             .unwrap()
-            .product_elevations[&RadarProduct::Reflectivity],
+            .product_elevations[&resolve!(&radar_fields::known::REFLECTIVITY)],
         vec![0.5, 6.4]
     );
 }
@@ -178,7 +195,7 @@ fn a_radar_error_ends_the_round_it_belonged_to() {
 /// A chunk round happens on its own every few seconds.
 #[test]
 fn a_chunk_update_leaves_the_fetch_spinner_and_the_backoff_alone() {
-    let mut gui = gui_with(info(0, &[(RadarProduct::Reflectivity, &[0.5])]));
+    let mut gui = gui_with(info(0, &[(radar_fields::known::REFLECTIVITY, &[0.5])]));
     gui.end_radar_round(crate::ui::RoundOutcome::Failed("network down"));
     gui.set_radar_round_in_flight(true);
     let backed_off = archive_failures(&gui);
@@ -186,7 +203,7 @@ fn a_chunk_update_leaves_the_fetch_spinner_and_the_backoff_alone() {
 
     gui.apply(crate::shell_api::GuiEvent::ChunkScanInfo {
         site: "KTLX".to_owned(),
-        info: info(5, &[(RadarProduct::Reflectivity, &[0.5])]),
+        info: info(5, &[(radar_fields::known::REFLECTIVITY, &[0.5])]),
     });
 
     assert!(
@@ -203,11 +220,11 @@ fn a_chunk_update_leaves_the_fetch_spinner_and_the_backoff_alone() {
 /// With chunks feeding live mode, the first data of a session arrives here.
 #[test]
 fn the_first_chunk_volume_of_a_session_still_claims_the_initial_zoom() {
-    let mut gui = gui_with(info(0, &[(RadarProduct::Reflectivity, &[0.5])]));
+    let mut gui = gui_with(info(0, &[(radar_fields::known::REFLECTIVITY, &[0.5])]));
     gui.initial_zoom_set = false;
     gui.apply(crate::shell_api::GuiEvent::ChunkScanInfo {
         site: "KTLX".to_owned(),
-        info: info(5, &[(RadarProduct::Reflectivity, &[0.5])]),
+        info: info(5, &[(radar_fields::known::REFLECTIVITY, &[0.5])]),
     });
     assert!(gui.initial_zoom_set);
 }
@@ -215,11 +232,11 @@ fn the_first_chunk_volume_of_a_session_still_claims_the_initial_zoom() {
 /// ...but only when a pane is actually on that site.
 #[test]
 fn a_chunk_volume_no_pane_is_watching_does_not_claim_the_initial_zoom() {
-    let mut gui = gui_with(info(0, &[(RadarProduct::Reflectivity, &[0.5])]));
+    let mut gui = gui_with(info(0, &[(radar_fields::known::REFLECTIVITY, &[0.5])]));
     gui.initial_zoom_set = false;
     gui.apply(crate::shell_api::GuiEvent::ChunkScanInfo {
         site: "KABX".to_owned(),
-        info: info(5, &[(RadarProduct::Reflectivity, &[0.5])]),
+        info: info(5, &[(radar_fields::known::REFLECTIVITY, &[0.5])]),
     });
     assert!(
         !gui.initial_zoom_set,
@@ -230,11 +247,11 @@ fn a_chunk_volume_no_pane_is_watching_does_not_claim_the_initial_zoom() {
 /// A pane on another site is not touched.
 #[test]
 fn a_chunk_update_only_reaches_its_own_site() {
-    let mut gui = gui_with(info(0, &[(RadarProduct::Reflectivity, &[0.5])]));
+    let mut gui = gui_with(info(0, &[(radar_fields::known::REFLECTIVITY, &[0.5])]));
     gui.pane_mut(0).unwrap().set_site("KOUN".to_string());
     gui.apply(crate::shell_api::GuiEvent::ChunkScanInfo {
         site: "KTLX".to_owned(),
-        info: info(5, &[(RadarProduct::Reflectivity, &[0.5])]),
+        info: info(5, &[(radar_fields::known::REFLECTIVITY, &[0.5])]),
     });
     assert_eq!(
         gui.pane(0).unwrap().scan_info.as_ref().unwrap().timestamp,

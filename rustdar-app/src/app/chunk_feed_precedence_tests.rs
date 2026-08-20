@@ -208,12 +208,19 @@ fn the_requested_shape_is_the_one_this_device_can_hold() {
                 .and_hms_opt(22, 33, 0)
                 .expect("a real time"),
         },
-        product: rustdar_radar::types::RadarProduct::Reflectivity,
+        product: rustdar_radar::fields::known::REFLECTIVITY,
         region: None,
     };
 
     for axis in [256u32, 512, 2048] {
-        let request = voxel_request_for(&target, 35.33, -97.28, SHIPPED_CELLS, axis);
+        let request = voxel_request_for(
+            &target,
+            35.33,
+            -97.28,
+            SHIPPED_CELLS,
+            rustdar_radar::types::RadarProduct::Reflectivity,
+            axis,
+        );
         assert_eq!(
             request.shape,
             rustdar_device_profile::constants::volume_grid_shape(axis),
@@ -237,6 +244,7 @@ fn the_requested_shape_is_the_one_this_device_can_hold() {
             35.33,
             -97.28,
             SHIPPED_CELLS,
+            rustdar_radar::types::RadarProduct::Reflectivity,
             rustdar_device_profile::constants::WEBGL2_MAX_TEXTURE_DIMENSION_3D,
         )
         .shape,
@@ -259,11 +267,18 @@ fn a_picked_region_decides_the_ground_that_is_resampled() {
                 .and_hms_opt(22, 33, 0)
                 .expect("a real time"),
         },
-        product: rustdar_radar::types::RadarProduct::Reflectivity,
+        product: rustdar_radar::fields::known::REFLECTIVITY,
         region,
     };
 
-    let default = voxel_request_for(&target(None), 35.33, -97.28, SHIPPED_CELLS, DEVICE_AXIS);
+    let default = voxel_request_for(
+        &target(None),
+        35.33,
+        -97.28,
+        SHIPPED_CELLS,
+        rustdar_radar::types::RadarProduct::Reflectivity,
+        DEVICE_AXIS,
+    );
     assert_eq!(default.centre, (35.33, -97.28), "no region means the site");
     assert_eq!(
         default.half_extent_km, None,
@@ -284,6 +299,7 @@ fn a_picked_region_decides_the_ground_that_is_resampled() {
         35.33,
         -97.28,
         SHIPPED_CELLS,
+        rustdar_radar::types::RadarProduct::Reflectivity,
         DEVICE_AXIS,
     );
     assert_eq!(
@@ -311,7 +327,7 @@ fn a_region_pick_does_not_move_the_top_or_the_bottom_of_the_box() {
                 .and_hms_opt(22, 33, 0)
                 .expect("a real time"),
         },
-        product: rustdar_radar::types::RadarProduct::Reflectivity,
+        product: rustdar_radar::fields::known::REFLECTIVITY,
         region,
     };
     let picked = VolumeRegion::new(
@@ -323,7 +339,14 @@ fn a_region_pick_does_not_move_the_top_or_the_bottom_of_the_box() {
     );
 
     for target in [make(None), make(picked)] {
-        let request = voxel_request_for(&target, 35.33, -97.28, SHIPPED_CELLS, DEVICE_AXIS);
+        let request = voxel_request_for(
+            &target,
+            35.33,
+            -97.28,
+            SHIPPED_CELLS,
+            rustdar_radar::types::RadarProduct::Reflectivity,
+            DEVICE_AXIS,
+        );
         assert_eq!(
             request.base_km_msl,
             rustdar_radar::voxel::DEFAULT_BASE_KM_MSL
@@ -431,7 +454,7 @@ fn the_3d_build_reads_the_base_volume_and_not_the_live_snapshot() {
             site: "KTLX".to_owned(),
             collected: at(10),
         },
-        product: rustdar_radar::types::RadarProduct::Reflectivity,
+        product: rustdar_radar::fields::known::REFLECTIVITY,
         region: None,
     };
 
@@ -470,7 +493,7 @@ fn a_full_budget_refuses_the_3d_ask_before_paying_the_extraction() {
             site: "KTLX".to_owned(),
             collected: at(10),
         },
-        product: rustdar_radar::types::RadarProduct::Reflectivity,
+        product: rustdar_radar::fields::known::REFLECTIVITY,
         region: None,
     };
     let mut app = headless(TestBridge::desktop());
@@ -524,7 +547,7 @@ fn a_3d_pane_is_not_handed_a_volume_other_than_the_one_it_asked_for() {
             site: "KTLX".to_owned(),
             collected: at(10),
         },
-        product: rustdar_radar::types::RadarProduct::Reflectivity,
+        product: rustdar_radar::fields::known::REFLECTIVITY,
         region: None,
     };
 
@@ -1057,7 +1080,7 @@ fn volume_target(collected: chrono::NaiveDateTime) -> rustdar_egui::pane::Volume
             site: "KTLX".to_owned(),
             collected,
         },
-        product: rustdar_radar::types::RadarProduct::Reflectivity,
+        product: rustdar_radar::fields::known::REFLECTIVITY,
         region: None,
     }
 }
@@ -1120,7 +1143,7 @@ fn the_requested_shape_is_the_budget_this_device_resolved() {
                 .and_hms_opt(22, 33, 0)
                 .expect("a real time"),
         },
-        product: rustdar_radar::types::RadarProduct::Reflectivity,
+        product: rustdar_radar::fields::known::REFLECTIVITY,
         region: None,
     };
 
@@ -1142,9 +1165,16 @@ fn the_requested_shape_is_the_budget_this_device_resolved() {
     );
 
     let cells_on = |budgets: rustdar_device_profile::budget::Budgets, axis: u32| {
-        voxel_request_for(&target, 35.33, -97.28, budgets.grid_cells, axis)
-            .shape
-            .cells()
+        voxel_request_for(
+            &target,
+            35.33,
+            -97.28,
+            budgets.grid_cells,
+            rustdar_radar::types::RadarProduct::Reflectivity,
+            axis,
+        )
+        .shape
+        .cells()
     };
     assert!(
         cells_on(desktop, 8192) > cells_on(phone, 256),

@@ -418,7 +418,9 @@ pub enum SectionDispatch {
 struct SectionInputKey {
     site: String,
     collected: chrono::NaiveDateTime,
-    product: RadarProduct,
+    /// `None` for an id this build does not register — which cannot reach a
+    /// dispatch, but is representable and so is stated rather than unwrapped.
+    product: Option<RadarProduct>,
     /// The fingerprint of the ladder this payload was extracted under —
     /// exactly the choices `extract_volume_parts` copied.
     ladder: u64,
@@ -441,7 +443,7 @@ impl SectionInputKey {
         Self {
             site: target.volume.site.clone(),
             collected: target.volume.collected,
-            product: target.product,
+            product: crate::render_key::radar_field(&target.product),
             ladder: target.ladder,
             storm_motion: motion.map(|(speed, direction)| (speed.to_bits(), direction.to_bits())),
             srv_fallback: fallback,
@@ -557,7 +559,7 @@ impl RenderDispatcher {
             }
         }
         self.render_cache
-            .retain(|k| k.select.product != RadarProduct::StormRelativeVelocity);
+            .retain(|k| k.select.product != rustdar_radar::fields::known::STORM_RELATIVE_VELOCITY);
         true
     }
 
@@ -585,8 +587,11 @@ impl RenderDispatcher {
                 prs.last_rendered = None;
             }
         }
-        self.render_cache
-            .retain(|k| k.select.site != site || !k.select.product.reads_env_heights());
+        self.render_cache.retain(|k| {
+            k.select.site != site
+                || !rustdar_radar::fields::product_for(&k.select.product)
+                    .is_some_and(|p| p.reads_env_heights())
+        });
         true
     }
 
@@ -616,7 +621,8 @@ impl RenderDispatcher {
             }
         }
         self.render_cache.retain(|k| {
-            k.select.site != site || k.select.product != RadarProduct::HydrometeorClassification
+            k.select.site != site
+                || k.select.product != rustdar_radar::fields::known::HYDROMETEOR_CLASSIFICATION
         });
         true
     }
@@ -647,7 +653,8 @@ impl RenderDispatcher {
             }
         }
         self.render_cache.retain(|k| {
-            k.select.site != site || k.select.product != RadarProduct::StormRelativeVelocity
+            k.select.site != site
+                || k.select.product != rustdar_radar::fields::known::STORM_RELATIVE_VELOCITY
         });
         true
     }
@@ -719,6 +726,9 @@ impl RenderDispatcher {
             let matches = gui.pane(idx).is_some_and(|p| p.site() == site)
                 && gui
                     .get_rendering_params_for_pane(idx)
+                    .and_then(|(id, elevation)| {
+                        Some((rustdar_radar::fields::product_for(&id)?, elevation))
+                    })
                     .is_some_and(|(product, elevation)| want(product, elevation));
             if matches {
                 prs.last_rendered = None;
@@ -787,8 +797,12 @@ impl RenderDispatcher {
         view: RenderView,
         elevation: f32,
     ) -> Option<&CachedRenderOutput> {
-        self.render_cache
-            .get(&render_cache_key(site, product, view, elevation))
+        self.render_cache.get(&render_cache_key(
+            site,
+            &rustdar_radar::fields::spec(product).id,
+            view,
+            elevation,
+        ))
     }
 
     /// Store a render result in the cache for sharing across panes.
@@ -800,8 +814,15 @@ impl RenderDispatcher {
         elevation: f32,
         output: CachedRenderOutput,
     ) {
-        self.render_cache
-            .insert(render_cache_key(site, product, view, elevation), output);
+        self.render_cache.insert(
+            render_cache_key(
+                site,
+                &rustdar_radar::fields::spec(product).id,
+                view,
+                elevation,
+            ),
+            output,
+        );
     }
 }
 
@@ -1257,7 +1278,11 @@ impl RenderDispatcher {
             return SectionDispatch::Busy;
         }
 
-        let product = target.product;
+        // The section is cut by radar's own machinery, which is keyed by
+        // radar's field; the target names it by id.
+        let Some(product) = crate::render_key::radar_field(&target.product) else {
+            return SectionDispatch::NoPayload;
+        };
         // Read here, off the dispatcher's own field.
         let motion = (product == RadarProduct::StormRelativeVelocity)
             .then(|| self.storm_motion_override_kt())
@@ -1433,7 +1458,7 @@ impl RenderDispatcher {
         // flight so a sibling pane wanting the same picture asks for nothing.
         self.pane_render[pane_idx].render_started(Some(render_cache_key(
             site,
-            product,
+            &rustdar_radar::fields::spec(product).id,
             RenderView::PlanView,
             elevation,
         )));
@@ -1539,7 +1564,12 @@ impl RenderDispatcher {
 
     /// Whether some pane already has **this exact plan view** in flight.
     pub fn plan_view_in_flight(&self, site: &str, product: RadarProduct, elevation: f32) -> bool {
-        let key = render_cache_key(site, product, RenderView::PlanView, elevation);
+        let key = render_cache_key(
+            site,
+            &rustdar_radar::fields::spec(product).id,
+            RenderView::PlanView,
+            elevation,
+        );
         self.pane_render
             .iter()
             .any(|prs| prs.in_flight_plan_view.as_ref() == Some(&key))

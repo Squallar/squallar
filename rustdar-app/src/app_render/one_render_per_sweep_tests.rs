@@ -161,7 +161,7 @@ fn point_at(
     {
         let pane = app.gui.pane_mut(idx).expect("pane exists");
         pane.set_site(site.to_string());
-        pane.set_selected_product(product);
+        pane.set_selected_product(rustdar_radar::fields::spec(product).id.clone());
         pane.set_selected_elevation(elevation);
     }
     app.gui
@@ -258,7 +258,7 @@ fn the_panes_that_asked_for_nothing_are_served_anyway() {
                 melting_layer_source: None,
                 storm_motion: None,
             }),
-            product: RadarProduct::Reflectivity,
+            product: rustdar_radar::types::RadarProduct::Reflectivity,
             elevation: TILT,
             generation: app.render.render_generation,
             pane_idx: 0,
@@ -344,7 +344,7 @@ fn a_render_that_answers_with_nothing_releases_its_siblings() {
         .render_sender
         .send(crate::channels::RenderResponse {
             rendered: None,
-            product: RadarProduct::Reflectivity,
+            product: rustdar_radar::types::RadarProduct::Reflectivity,
             elevation: TILT,
             generation: app.render.render_generation,
             pane_idx: 0,
