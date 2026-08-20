@@ -168,19 +168,25 @@ fn volume_alpha_curves_survive_a_save_and_load() {
         *slot = (i / 2) as u8; // a curve no default produces
     }
     let curve = AlphaCurve::from_alphas(alphas);
-    gui.volume_alpha
-        .set(RadarProduct::Reflectivity, curve.clone());
+    gui.volume_alpha.set(
+        &rustdar_radar::fields::spec(RadarProduct::Reflectivity).id,
+        curve.clone(),
+    );
     gui.save_ui_config(&store);
 
     let mut restored = crate::Gui::new();
     assert!(restored.load_ui_config(&store));
     assert_eq!(
-        restored.volume_alpha.get(RadarProduct::Reflectivity),
+        restored
+            .volume_alpha
+            .get(&rustdar_radar::fields::spec(RadarProduct::Reflectivity).id),
         Some(curve),
         "the drawn curve must come back exactly",
     );
     assert_eq!(
-        restored.volume_alpha.get(RadarProduct::Velocity),
+        restored
+            .volume_alpha
+            .get(&rustdar_radar::fields::spec(RadarProduct::Velocity).id),
         None,
         "a product the user never edited must come back with no curve at all",
     );
@@ -200,7 +206,8 @@ fn an_old_config_without_volume_alpha_loads_with_every_editor_untouched() {
     let mut gui = crate::Gui::new();
     assert!(gui.load_ui_config(&store), "an old config still loads");
     assert!(
-        !gui.volume_alpha.is_edited(RadarProduct::Reflectivity),
+        !gui.volume_alpha
+            .is_edited(&rustdar_radar::fields::spec(RadarProduct::Reflectivity).id),
         "an old config must not conjure a curve for any product",
     );
 }
@@ -229,13 +236,14 @@ fn a_hostile_volume_alpha_entry_is_dropped_or_reclamped_never_trusted() {
     let mut gui = crate::Gui::new();
     assert!(gui.load_ui_config(&store), "the rest of the config loads");
     assert_eq!(
-        gui.volume_alpha.get(RadarProduct::Reflectivity),
+        gui.volume_alpha
+            .get(&rustdar_radar::fields::spec(RadarProduct::Reflectivity).id),
         None,
         "a wrong-length curve must be dropped, not padded or truncated",
     );
     let velocity = gui
         .volume_alpha
-        .get(RadarProduct::Velocity)
+        .get(&rustdar_radar::fields::spec(RadarProduct::Velocity).id)
         .expect("a well-sized curve loads");
     assert_eq!(
         velocity.alphas()[0],
@@ -263,7 +271,10 @@ fn the_isosurface_mode_and_thresholds_survive_a_save_and_load() {
         .unwrap()
         .set_view(rustdar_radar::types::RenderView::Volume);
     gui.pane_mut(0).unwrap().volume_mut().unwrap().view_mode = VolumeViewMode::Isosurface;
-    gui.volume_iso.set(RadarProduct::Velocity, 35.0);
+    gui.volume_iso.set(
+        &rustdar_radar::fields::spec(RadarProduct::Velocity).id,
+        35.0,
+    );
     assert_ne!(
         rustdar_radar::voxel::default_iso_threshold(RadarProduct::Velocity),
         35.0,
@@ -278,9 +289,16 @@ fn the_isosurface_mode_and_thresholds_survive_a_save_and_load() {
         VolumeViewMode::Isosurface,
         "a pane set to isosurface must come back one",
     );
-    assert_eq!(restored.volume_iso.get(RadarProduct::Velocity), 35.0);
+    assert_eq!(
+        restored
+            .volume_iso
+            .get(&rustdar_radar::fields::spec(RadarProduct::Velocity).id),
+        35.0
+    );
     assert!(
-        !restored.volume_iso.is_edited(RadarProduct::Reflectivity),
+        !restored
+            .volume_iso
+            .is_edited(&rustdar_radar::fields::spec(RadarProduct::Reflectivity).id),
         "an untouched product must come back at the argued default",
     );
 }
@@ -561,14 +579,32 @@ fn an_unknown_view_mode_or_iso_product_does_not_poison_the_load() {
         "an unknown mode falls back to the lit volume",
     );
     assert_eq!(
-        gui.volume_iso.get(RadarProduct::Velocity),
+        gui.volume_iso
+            .get(&rustdar_radar::fields::spec(RadarProduct::Velocity).id),
         30.0,
         "the entry beside the unknown one still loads",
     );
+    // The guarantee that mattered, unchanged: never reassigned.
+    for product in RadarProduct::all() {
+        if *product == RadarProduct::Velocity {
+            continue;
+        }
+        assert!(
+            !gui.volume_iso
+                .is_edited(&rustdar_radar::fields::spec(*product).id),
+            "the unknown threshold was reassigned to {product:?}",
+        );
+    }
+    // And the open-id doctrine in place of the drop: preserved inert.
     assert_eq!(
         gui.volume_iso.entries().count(),
-        1,
-        "the unknown product's threshold is dropped, never reassigned",
+        2,
+        "the unknown field's threshold is preserved inert, not dropped",
+    );
+    assert_eq!(
+        gui.volume_iso
+            .get(&rustdar_source::product::FieldId::new("TornadoProbability")),
+        5.0,
     );
 }
 
@@ -730,15 +766,53 @@ fn an_alpha_curve_for_an_unknown_product_is_dropped_not_reassigned() {
 
     let mut gui = crate::Gui::new();
     assert!(gui.load_ui_config(&store), "the rest of the config loads");
+    assert!(
+        gui.volume_alpha
+            .get(&rustdar_radar::fields::spec(RadarProduct::Velocity).id)
+            .is_some(),
+        "the entry beside the unknown one still loads",
+    );
+
+    // **The guarantee, unchanged**: a curve saved under a name this build does
+    // not know is never applied to a field this build DOES know.
+    for product in RadarProduct::all() {
+        if *product == RadarProduct::Velocity {
+            continue;
+        }
+        assert!(
+            !gui.volume_alpha
+                .is_edited(&rustdar_radar::fields::spec(*product).id),
+            "the unknown entry was remapped onto {product:?}",
+        );
+    }
+
+    // **What changed, and it is the open-id doctrine**: the entry is no longer
+    // DROPPED. It is kept inert -- applying to nothing, because no pane can
+    // select a field the registry does not offer -- and written back verbatim,
+    // so a curve drawn on a newer build survives a session under this one.
     assert_eq!(
         gui.volume_alpha.entries().count(),
-        1,
-        "exactly the known product's curve loads — the unknown one is \
-             dropped, not remapped onto some default product",
+        2,
+        "the unknown entry must be preserved beside the known one, not dropped",
     );
     assert!(
-        gui.volume_alpha.get(RadarProduct::Velocity).is_some(),
-        "the entry beside the unknown one still loads",
+        gui.volume_alpha
+            .is_edited(&rustdar_source::product::FieldId::new("TornadoProbability")),
+        "the unknown entry is kept under its own id",
+    );
+    let saved = gui.ui_config_json().expect("serializable");
+    let value: serde_json::Value = serde_json::from_str(&saved).expect("valid JSON");
+    let names: Vec<&str> = value["volume_alpha"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|e| e["product"].as_str().expect("a bare string"))
+        .collect();
+    assert_eq!(
+        names,
+        ["Velocity", "TornadoProbability"],
+        "both entries are written back, the known one under its code order and \
+         the unknown one after it",
     );
 }
 
@@ -1598,4 +1672,62 @@ fn save_writes_under_the_ui_key() {
         serde_json::from_str::<super::UiConfig>(&written).is_ok(),
         "stored blob should parse back as a UiConfig"
     );
+}
+
+/// **The alias mechanism, exercised against a table that is not empty** —
+/// because the production table [`super::FIELD_ALIASES`] is, and an
+/// identity function proves nothing about the machinery a rename will need.
+#[test]
+fn a_saved_field_key_is_read_through_the_alias_table() {
+    use rustdar_source::product::FieldId;
+
+    let table: &[(&str, &str)] = &[("OldSpelling", "Reflectivity"), ("Stale", "Velocity")];
+    assert_eq!(
+        super::resolve_field_alias(table, FieldId::new("OldSpelling")),
+        FieldId::new("Reflectivity"),
+        "a renamed field's saved key must read as its current id",
+    );
+    assert_eq!(
+        super::resolve_field_alias(table, FieldId::new("Velocity")),
+        FieldId::new("Velocity"),
+        "an id with no row is itself",
+    );
+    assert_eq!(
+        super::resolve_field_alias(table, FieldId::new("NeverHeardOfIt")),
+        FieldId::new("NeverHeardOfIt"),
+        "an id this build does not register is passed through, not dropped — \
+         the open-id doctrine survives the alias hop",
+    );
+    // Single hop: a row whose target is itself another row's source must not
+    // chain, or two rows could conspire into a rename nobody wrote down.
+    let chain: &[(&str, &str)] = &[("A", "B"), ("B", "C")];
+    assert_eq!(
+        super::resolve_field_alias(chain, FieldId::new("A")),
+        FieldId::new("B"),
+        "resolution is single-hop",
+    );
+}
+
+/// The shipped alias table is empty, and every row it ever gains must name a
+/// field this build actually registers on the right-hand side — an alias
+/// pointing at nothing would orphan the saved state it was added to rescue.
+#[test]
+fn the_shipped_alias_table_is_empty_and_every_row_lands_on_a_registered_field() {
+    use rustdar_source::product::FieldId;
+
+    assert!(
+        super::FIELD_ALIASES.is_empty(),
+        "no radar field has been renamed; a first row here is a deliberate act \
+         and this assertion is where it gets noticed: {:?}",
+        super::FIELD_ALIASES,
+    );
+    for (old, current) in super::FIELD_ALIASES {
+        assert!(
+            rustdar_radar::fields::product_for(&FieldId::new(*current)).is_some(),
+            "the alias {old} -> {current} points at a field this build does \
+             not register, so it orphans exactly the saved state it exists to \
+             rescue",
+        );
+        assert_ne!(old, current, "an alias to itself is a no-op row");
+    }
 }

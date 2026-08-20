@@ -1,124 +1,190 @@
-//! Per-product isosurface thresholds — the session state the sidebar slider edits,
+//! Per-field isosurface thresholds — the session state the sidebar slider edits,
 //! the frame reads, and the config persists.
 
 use std::collections::HashMap;
 
-use rustdar_radar::types::RadarProduct;
-use rustdar_radar::voxel::default_iso_threshold;
+use rustdar_source::product::FieldId;
 
-/// Every product's user-set isosurface threshold, in the product's own units.
+/// The argued default threshold for a field, or `None` for a field this build
+/// does not register.
+///
+/// **The one place a saved threshold meets radar's default.** The default is
+/// still radar's own argued number rather than a registry fact, so the id is
+/// resolved back through radar's projection to ask for it; nothing else here
+/// names a product.
+fn default_threshold(field: &FieldId) -> Option<f32> {
+    rustdar_radar::fields::product_for(field).map(rustdar_radar::voxel::default_iso_threshold)
+}
+
+/// Every field's user-set isosurface threshold, in the field's own units.
 #[derive(Default)]
 pub struct IsoThresholds {
-    thresholds: HashMap<RadarProduct, f32>,
+    thresholds: HashMap<FieldId, f32>,
 }
 
 impl IsoThresholds {
-    /// The threshold for `product`: the user's where one is set, else the argued
-    /// default.
-    pub fn get(&self, product: RadarProduct) -> f32 {
+    /// The threshold for `field`: the user's where one is set, else the argued
+    /// default. `0.0` for a field this build does not register — nothing can
+    /// reach this with such an id, because no pane can select a field that is
+    /// not in the registry.
+    pub fn get(&self, field: &FieldId) -> f32 {
         self.thresholds
-            .get(&product)
+            .get(field)
             .copied()
-            .unwrap_or_else(|| default_iso_threshold(product))
+            .unwrap_or_else(|| default_threshold(field).unwrap_or(0.0))
     }
 
-    pub fn set(&mut self, product: RadarProduct, threshold: f32) {
+    /// The editor's door: a value back at the default erases the exception.
+    pub fn set(&mut self, field: &FieldId, threshold: f32) {
         if !threshold.is_finite() {
             return;
         }
-        if threshold == default_iso_threshold(product) {
-            self.thresholds.remove(&product);
+        if Some(threshold) == default_threshold(field) {
+            self.thresholds.remove(field);
         } else {
-            self.thresholds.insert(product, threshold);
+            self.thresholds.insert(field.clone(), threshold);
         }
     }
 
-    pub fn is_edited(&self, product: RadarProduct) -> bool {
-        self.thresholds.contains_key(&product)
+    /// **Take a persisted entry.** A field this build registers goes through
+    /// the editor's own door, so a stored value equal to the default is
+    /// dropped exactly as an edit back to the default is. One it does **not**
+    /// register is kept verbatim: under the open-id doctrine an unknown field
+    /// is preserved inert rather than dropped, so a threshold saved by a newer
+    /// build survives a session under this one. It applies to nothing here —
+    /// no pane can select a field the registry does not offer.
+    pub fn restore(&mut self, field: FieldId, threshold: f32) {
+        if !threshold.is_finite() {
+            return;
+        }
+        if default_threshold(&field).is_some() {
+            self.set(&field, threshold);
+        } else {
+            self.thresholds.insert(field, threshold);
+        }
     }
 
-    pub fn entries(&self) -> impl Iterator<Item = (RadarProduct, f32)> + '_ {
-        self.thresholds.iter().map(|(&p, &t)| (p, t))
+    pub fn is_edited(&self, field: &FieldId) -> bool {
+        self.thresholds.contains_key(field)
     }
-}
 
-/// The slider's travel for a product, in its own units — ergonomics, not physics.
-pub fn slider_range(product: RadarProduct) -> std::ops::RangeInclusive<f32> {
-    match product {
-        RadarProduct::Reflectivity => 0.0..=75.0,
-        RadarProduct::Velocity | RadarProduct::StormRelativeVelocity => 2.0..=60.0,
-        RadarProduct::SpectrumWidth => 1.0..=20.0,
-        RadarProduct::DifferentialReflectivity => 0.5..=6.0,
-        RadarProduct::DifferentialPhase => 10.0..=350.0,
-        RadarProduct::CorrelationCoefficient => 0.5..=1.0,
-        RadarProduct::SpecificDifferentialPhase => 0.25..=8.0,
-        RadarProduct::NormalizedRotation => 0.25..=3.0,
-        _ => 0.0..=1.0,
+    pub fn entries(&self) -> impl Iterator<Item = (&FieldId, f32)> + '_ {
+        self.thresholds.iter().map(|(field, &t)| (field, t))
     }
-}
-
-/// What the slider's number means, as a short prefix — "≥" for a value, "|±| ≥" for
-/// a deviation, "≤" for ρHV's bound — plus the unit suffix.
-pub fn slider_labels(product: RadarProduct) -> (&'static str, &'static str) {
-    use rustdar_radar::voxel::{IsoShape, iso_shape};
-    let prefix = match iso_shape(product) {
-        IsoShape::Sequential => "\u{2265}",
-        IsoShape::DeviationFrom { .. } => "|\u{b1}| \u{2265}",
-        IsoShape::AtOrBelow => "\u{2264}",
-    };
-    let suffix = match product {
-        RadarProduct::Reflectivity => " dBZ",
-        RadarProduct::Velocity
-        | RadarProduct::StormRelativeVelocity
-        | RadarProduct::SpectrumWidth => " m/s",
-        RadarProduct::DifferentialReflectivity => " dB",
-        RadarProduct::DifferentialPhase => "\u{b0}",
-        RadarProduct::SpecificDifferentialPhase => "\u{b0}/km",
-        _ => "",
-    };
-    (prefix, suffix)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The store holds exceptions: setting a product back to its default erases it.
+    fn field(product: rustdar_radar::types::RadarProduct) -> FieldId {
+        rustdar_radar::fields::spec(product).id.clone()
+    }
+
+    fn default_of(product: rustdar_radar::types::RadarProduct) -> f32 {
+        rustdar_radar::voxel::default_iso_threshold(product)
+    }
+
+    /// The store holds exceptions: setting a field back to its default erases it.
     #[test]
-    fn thresholds_are_stored_per_product_as_exceptions() {
+    fn thresholds_are_stored_per_field_as_exceptions() {
+        use rustdar_radar::types::RadarProduct;
         let mut store = IsoThresholds::default();
+        let reflectivity = field(RadarProduct::Reflectivity);
+        let velocity = field(RadarProduct::Velocity);
         assert_eq!(
-            store.get(RadarProduct::Reflectivity),
-            default_iso_threshold(RadarProduct::Reflectivity),
+            store.get(&reflectivity),
+            default_of(RadarProduct::Reflectivity),
         );
-        assert!(!store.is_edited(RadarProduct::Reflectivity));
+        assert!(!store.is_edited(&reflectivity));
 
-        store.set(RadarProduct::Reflectivity, 35.0);
-        assert_eq!(store.get(RadarProduct::Reflectivity), 35.0);
-        assert!(store.is_edited(RadarProduct::Reflectivity));
+        store.set(&reflectivity, 35.0);
+        assert_eq!(store.get(&reflectivity), 35.0);
+        assert!(store.is_edited(&reflectivity));
         assert_eq!(
-            store.get(RadarProduct::Velocity),
-            default_iso_threshold(RadarProduct::Velocity),
-            "one product's threshold must never bleed into another's",
+            store.get(&velocity),
+            default_of(RadarProduct::Velocity),
+            "one field's threshold must never bleed into another's",
         );
 
-        store.set(
-            RadarProduct::Reflectivity,
-            default_iso_threshold(RadarProduct::Reflectivity),
-        );
+        store.set(&reflectivity, default_of(RadarProduct::Reflectivity));
         assert!(
-            !store.is_edited(RadarProduct::Reflectivity),
+            !store.is_edited(&reflectivity),
             "back at the default is the same as never touched",
         );
     }
 
-    /// A non-finite threshold is refused at the door, like every persisted float in
-    /// this codebase.
+    /// A non-finite threshold is refused at the door, like every persisted float
+    /// in this codebase — **at BOTH doors**.
+    ///
+    /// The `restore` half is asserted over an UNREGISTERED id on purpose. For
+    /// a field this build knows, `restore` delegates to `set`, whose own guard
+    /// would refuse the value anyway; the unknown-id branch inserts directly
+    /// and is the only place `restore`'s guard is load-bearing. A tamper that
+    /// deleted that guard came back GREEN while this test used a known field.
     #[test]
     fn a_non_finite_threshold_is_refused() {
+        use rustdar_radar::types::RadarProduct;
         let mut store = IsoThresholds::default();
-        store.set(RadarProduct::Reflectivity, f32::NAN);
-        store.set(RadarProduct::Reflectivity, f32::INFINITY);
-        assert!(!store.is_edited(RadarProduct::Reflectivity));
+        let reflectivity = field(RadarProduct::Reflectivity);
+        store.set(&reflectivity, f32::NAN);
+        store.set(&reflectivity, f32::INFINITY);
+        assert!(!store.is_edited(&reflectivity), "the editor's door");
+
+        let unknown = FieldId::new("NoBuildRegistersThisField");
+        assert!(
+            default_threshold(&unknown).is_none(),
+            "precondition: this id takes `restore`'s direct-insert branch, \
+             which is the only branch its own finite guard covers",
+        );
+        store.restore(unknown.clone(), f32::NAN);
+        store.restore(unknown.clone(), f32::NEG_INFINITY);
+        assert!(
+            !store.is_edited(&unknown),
+            "a non-finite threshold saved under an unregistered id reached the \
+             store: it would be written back and eventually resolve to a field",
+        );
+    }
+
+    /// **The open-id doctrine, in the direction that used to drop the entry.**
+    /// A threshold saved under a field this build does not register is kept
+    /// verbatim -- it applies to nothing, and survives to be written back.
+    ///
+    /// This is what replaces `known_product_or_none`'s drop-on-load: the
+    /// guarantee that mattered was that a threshold saved for one field is
+    /// never applied to another, and an id that resolves to no field is
+    /// applied to nothing at all.
+    #[test]
+    fn a_threshold_for_a_field_this_build_does_not_register_is_kept_inert() {
+        use rustdar_radar::types::RadarProduct;
+        let unknown = FieldId::new("NoBuildRegistersThisField");
+        let mut store = IsoThresholds::default();
+        store.restore(unknown.clone(), 12.0);
+        assert!(
+            store.is_edited(&unknown),
+            "the entry must survive the round trip, not be dropped",
+        );
+        assert_eq!(store.get(&unknown), 12.0);
+        for product in RadarProduct::all() {
+            assert!(
+                !store.is_edited(&field(*product)),
+                "an unknown id leaked onto {:?}",
+                product,
+            );
+        }
+    }
+
+    /// A persisted entry that is already the default is dropped, exactly as an
+    /// edit back to the default is -- the restore path is the editor's door
+    /// for a field this build knows.
+    #[test]
+    fn a_persisted_threshold_at_the_default_is_not_an_exception() {
+        use rustdar_radar::types::RadarProduct;
+        let mut store = IsoThresholds::default();
+        store.restore(
+            field(RadarProduct::Velocity),
+            default_of(RadarProduct::Velocity),
+        );
+        assert!(!store.is_edited(&field(RadarProduct::Velocity)));
     }
 }

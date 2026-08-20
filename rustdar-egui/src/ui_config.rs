@@ -26,6 +26,7 @@ pub const UI_CONFIG_BACKUP_KEY: &str = "ui.v2.backup";
 use rustdar_overlays::spc::outlook::OutlookDay;
 use rustdar_radar::types::RadarProduct;
 use rustdar_source::id::{LayerId, known};
+use rustdar_source::product::FieldId;
 use rustdar_units::UserPreferences;
 
 use super::PaneLayout;
@@ -547,29 +548,77 @@ struct UiConfig {
     unknown: serde_json::Map<String, serde_json::Value>,
 }
 
-/// One product's persisted isosurface threshold.
+/// **Field-id renames, as a migration rather than a break.**
+///
+/// A row is `(old spelling, current spelling)`: a saved key on the left is read
+/// as the id on the right, so renaming a field costs a row here instead of
+/// silently orphaning every user's curves and thresholds for it.
+///
+/// **Empty today, deliberately.** No radar field has been renamed, and the
+/// spellings `rustdar_radar::fields` registers are byte-identical to the ones
+/// the product enum used to serialize — which is the whole zero-migration
+/// guarantee WO-E9c rests on. The table exists so the *next* rename is a row.
+///
+/// **Honesty note**: with this table empty, [`resolve_field_alias`] is the
+/// identity and no test can distinguish the load path calling it from the load
+/// path not calling it. What is proven is the mechanism — `resolve_field_alias`
+/// is exercised against a non-empty fixture table below — and the emptiness of
+/// this table, so a first row is a deliberate act by a person.
+pub(crate) const FIELD_ALIASES: &[(&str, &str)] = &[];
+
+/// Read one saved field key through `aliases`.
+///
+/// Single-hop on purpose: a chain would let two rows conspire into a rename
+/// nobody wrote down, and a cycle would not terminate.
+fn resolve_field_alias(aliases: &[(&str, &str)], id: FieldId) -> FieldId {
+    match aliases.iter().find(|(old, _)| *old == id.as_str()) {
+        Some((_, current)) => FieldId::new(*current),
+        None => id,
+    }
+}
+
+/// The order the two volume-editor tables are written to disk in.
+///
+/// **Byte-compatible with what it replaces**: the sort was `product.code()`
+/// and it still is for every field this build registers, so a file with no
+/// unknown ids is written in exactly the same order it always was. A field
+/// this build does **not** register has no code to sort by; those entries sort
+/// last, by their id, so the file stays deterministic instead of depending on
+/// a `HashMap`'s per-process seed.
+fn save_order_key(field: &FieldId) -> (bool, String) {
+    match rustdar_radar::fields::product_for(field) {
+        Some(product) => (false, product.code().to_owned()),
+        None => (true, field.as_str().to_owned()),
+    }
+}
+
+/// One field's persisted isosurface threshold.
 #[derive(Serialize, Deserialize)]
 struct VolumeIsoConfig {
-    /// `None` for a product this build does not know; the entry is dropped
-    /// on load, exactly as a Volume Alpha curve's is.
-    #[serde(default, deserialize_with = "known_product_or_none")]
-    product: Option<RadarProduct>,
-    /// In the product's own units. Validated finite on load —
-    /// `IsoThresholds::set` refuses non-finite values, the same door every
+    /// **The on-disk key and its spelling are unchanged.** `FieldId` is
+    /// `#[serde(transparent)]` and the radar crate registers each field under
+    /// the product enum's own serde spelling, so this member reads and writes
+    /// exactly the bytes it did when it was a `RadarProduct`.
+    ///
+    /// No longer dropped when this build does not know the name: under the
+    /// open-id doctrine an unrecognised id is preserved inert (it applies to
+    /// nothing, because no pane can select a field the registry does not
+    /// offer) and written back verbatim, which is what makes a downgrade safe.
+    product: FieldId,
+    /// In the field's own units. Validated finite on load —
+    /// `IsoThresholds::restore` refuses non-finite values, the same door every
     /// persisted float goes through.
     threshold: f32,
 }
 
-/// One product's persisted Volume Alpha curve.
+/// One field's persisted Volume Alpha curve.
 #[derive(Serialize, Deserialize)]
 struct VolumeAlphaConfig {
-    /// `None` when the saved name is a product this build does not know — the
-    /// entry is then dropped on load with a log line, because a curve drawn
-    /// for one product must never be applied to another (see
-    /// [`known_product_or_none`]). Saves always write `Some`, which serializes
-    /// as the bare product name, so the on-disk format is unchanged.
-    #[serde(default, deserialize_with = "known_product_or_none")]
-    product: Option<RadarProduct>,
+    /// Same spelling, same key, same open-id tolerance as
+    /// [`VolumeIsoConfig::product`]. A curve saved for one field is still
+    /// never applied to another — an id that resolves to no field is applied
+    /// to nothing at all, which is the guarantee the old drop-on-load bought.
+    product: FieldId,
     /// Exactly [`crate::volume_alpha::CURVE_LEN`] alphas, entry 0 first.
     alpha: Vec<u8>,
 }
@@ -665,22 +714,6 @@ where
                  falling back to the plan view"
             );
             Ok(MapRender::default())
-        }
-    }
-}
-
-/// Deserialize a [`RadarProduct`] as `None` when the name is unknown, so the
-/// caller can drop the entry it keys rather than misassign it.
-fn known_product_or_none<'de, D>(deserializer: D) -> Result<Option<RadarProduct>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    match RadarProduct::deserialize(&value) {
-        Ok(product) => Ok(Some(product)),
-        Err(_) => {
-            log::warn!("dropping a config entry keyed by an unknown product ({value})");
-            Ok(None)
         }
     }
 }
@@ -966,24 +999,24 @@ impl super::Gui {
                 let mut curves: Vec<VolumeAlphaConfig> = self
                     .volume_alpha
                     .entries()
-                    .map(|(product, curve)| VolumeAlphaConfig {
-                        product: Some(product),
+                    .map(|(field, curve)| VolumeAlphaConfig {
+                        product: field.clone(),
                         alpha: curve.alphas().to_vec(),
                     })
                     .collect();
-                curves.sort_by_key(|c| c.product.map(|p| p.code()));
+                curves.sort_by_cached_key(|c| save_order_key(&c.product));
                 curves
             },
             volume_iso: {
                 let mut thresholds: Vec<VolumeIsoConfig> = self
                     .volume_iso
                     .entries()
-                    .map(|(product, threshold)| VolumeIsoConfig {
-                        product: Some(product),
+                    .map(|(field, threshold)| VolumeIsoConfig {
+                        product: field.clone(),
                         threshold,
                     })
                     .collect();
-                thresholds.sort_by_key(|c| c.product.map(|p| p.code()));
+                thresholds.sort_by_cached_key(|c| save_order_key(&c.product));
                 thresholds
             },
             unknown: self.config_unknown_fields.clone(),
@@ -1055,29 +1088,26 @@ impl super::Gui {
 
         self.volume_alpha = crate::volume_alpha::AlphaCurves::default();
         for entry in config.volume_alpha {
-            let Some(product) = entry.product else {
-                continue;
-            };
             let Ok(alphas) = <[u8; crate::volume_alpha::CURVE_LEN]>::try_from(entry.alpha) else {
                 log::warn!(
                     "the saved Volume Alpha curve for {} is not {} entries; dropping it",
-                    product.name(),
+                    entry.product,
                     crate::volume_alpha::CURVE_LEN,
                 );
                 continue;
             };
             self.volume_alpha.set(
-                product,
+                &resolve_field_alias(FIELD_ALIASES, entry.product),
                 crate::volume_alpha::AlphaCurve::from_alphas(alphas),
             );
         }
 
         self.volume_iso = crate::volume_iso::IsoThresholds::default();
         for entry in config.volume_iso {
-            let Some(product) = entry.product else {
-                continue;
-            };
-            self.volume_iso.set(product, entry.threshold);
+            self.volume_iso.restore(
+                resolve_field_alias(FIELD_ALIASES, entry.product),
+                entry.threshold,
+            );
         }
 
         // **The handlers' own state is restored FIRST**, ahead of the pane

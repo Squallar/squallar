@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rustdar_radar::types::RadarProduct;
+use rustdar_source::product::FieldId;
 
 /// Palette entries a curve spans — one alpha per LUT index.
 pub const CURVE_LEN: usize = 256;
@@ -102,44 +102,52 @@ pub fn apply_stroke(alphas: &mut [u8; CURVE_LEN], from: (f32, f32), to: (f32, f3
 /// frame reads, and the config persists.
 #[derive(Default)]
 pub struct AlphaCurves {
-    curves: HashMap<RadarProduct, AlphaCurve>,
+    curves: HashMap<FieldId, AlphaCurve>,
 }
 
 impl AlphaCurves {
-    /// The curve for `product`, or `None` for an untouched editor.
-    pub fn get(&self, product: RadarProduct) -> Option<AlphaCurve> {
-        self.curves.get(&product).cloned()
+    /// The curve for `field`, or `None` for an untouched editor.
+    pub fn get(&self, field: &FieldId) -> Option<AlphaCurve> {
+        self.curves.get(field).cloned()
     }
 
-    /// Store `product`'s curve. Live during a drag: the editor writes every
+    /// Store `field`'s curve. Live during a drag: the editor writes every
     /// frame of the stroke, and the frontend re-uploads the 1 KiB LUT only
     /// when the bytes actually changed.
-    pub fn set(&mut self, product: RadarProduct, curve: AlphaCurve) {
-        self.curves.insert(product, curve);
+    ///
+    /// **The one door, for the editor and for the config alike.** A curve
+    /// saved under a field this build does not register is kept here verbatim
+    /// under the open-id doctrine: it applies to nothing — no pane can select
+    /// a field the registry does not offer — and it survives to be written
+    /// back, so a newer build's curve is not destroyed by a session under this
+    /// one.
+    pub fn set(&mut self, field: &FieldId, curve: AlphaCurve) {
+        self.curves.insert(field.clone(), curve);
     }
 
-    /// Forget `product`'s curve — the reset, back to the grid table's own
+    /// Forget `field`'s curve — the reset, back to the grid table's own
     /// alpha. See [`AlphaCurve::from_palette`] for why that is not the same
     /// thing as the palette's.
-    pub fn reset(&mut self, product: RadarProduct) {
-        self.curves.remove(&product);
+    pub fn reset(&mut self, field: &FieldId) {
+        self.curves.remove(field);
     }
 
-    /// Whether `product` has a user curve at all.
-    pub fn is_edited(&self, product: RadarProduct) -> bool {
-        self.curves.contains_key(&product)
+    /// Whether `field` has a user curve at all.
+    pub fn is_edited(&self, field: &FieldId) -> bool {
+        self.curves.contains_key(field)
     }
 
-    /// Every edited product and its curve, in an arbitrary order — the save
-    /// path sorts by product code so the config file is deterministic.
-    pub fn entries(&self) -> impl Iterator<Item = (RadarProduct, &AlphaCurve)> {
-        self.curves.iter().map(|(product, curve)| (*product, curve))
+    /// Every edited field and its curve, in an arbitrary order — the save
+    /// path sorts so the config file is deterministic.
+    pub fn entries(&self) -> impl Iterator<Item = (&FieldId, &AlphaCurve)> {
+        self.curves.iter()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustdar_radar::types::RadarProduct;
 
     /// A palette shaped like reflectivity's: entry 0 transparent, a 64-index
     /// fade band, then a ramp of visible entries.
@@ -314,35 +322,61 @@ mod tests {
         }
     }
 
-    /// The store is per-product: a curve set for one product neither answers
+    fn field(product: RadarProduct) -> FieldId {
+        rustdar_radar::fields::spec(product).id.clone()
+    }
+
+    /// The store is per-field: a curve set for one field neither answers
     /// nor resets another's.
     #[test]
-    fn curves_are_stored_per_product() {
+    fn curves_are_stored_per_field() {
         let mut curves = AlphaCurves::default();
         let mut alphas = [0u8; CURVE_LEN];
         alphas[200] = 99;
         let curve = AlphaCurve::from_alphas(alphas);
+        let reflectivity = field(RadarProduct::Reflectivity);
+        let velocity = field(RadarProduct::Velocity);
 
-        curves.set(RadarProduct::Reflectivity, curve.clone());
-        assert_eq!(curves.get(RadarProduct::Reflectivity), Some(curve));
+        curves.set(&reflectivity, curve.clone());
+        assert_eq!(curves.get(&reflectivity), Some(curve));
         assert_eq!(
-            curves.get(RadarProduct::Velocity),
+            curves.get(&velocity),
             None,
-            "another product's editor is untouched",
+            "another field's editor is untouched",
         );
-        assert!(curves.is_edited(RadarProduct::Reflectivity));
-        assert!(!curves.is_edited(RadarProduct::Velocity));
+        assert!(curves.is_edited(&reflectivity));
+        assert!(!curves.is_edited(&velocity));
 
-        curves.reset(RadarProduct::Velocity);
+        curves.reset(&velocity);
         assert!(
-            curves.is_edited(RadarProduct::Reflectivity),
-            "resetting one product must not reset another",
+            curves.is_edited(&reflectivity),
+            "resetting one field must not reset another",
         );
-        curves.reset(RadarProduct::Reflectivity);
+        curves.reset(&reflectivity);
         assert_eq!(
-            curves.get(RadarProduct::Reflectivity),
+            curves.get(&reflectivity),
             None,
             "reset restores the untouched state, which is what makes it bit-exact",
         );
+    }
+
+    /// **The open-id doctrine on the curve store.** A curve saved under a
+    /// field this build does not register is kept verbatim and applies to
+    /// nothing — which is the guarantee `known_product_or_none`'s
+    /// drop-on-load used to buy, without destroying the entry.
+    #[test]
+    fn a_curve_for_a_field_this_build_does_not_register_is_kept_inert() {
+        let mut curves = AlphaCurves::default();
+        let mut alphas = [0u8; CURVE_LEN];
+        alphas[200] = 99;
+        let unknown = FieldId::new("NoBuildRegistersThisField");
+        curves.set(&unknown, AlphaCurve::from_alphas(alphas));
+        assert!(curves.is_edited(&unknown));
+        for product in RadarProduct::all() {
+            assert!(
+                !curves.is_edited(&field(*product)),
+                "an unknown id leaked onto {product:?}",
+            );
+        }
     }
 }

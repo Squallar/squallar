@@ -1306,11 +1306,15 @@ fn volume_pane_outcome(
              lands, then updates tilt by tilt as new sweeps arrive.",
         ));
     };
-    if rustdar_radar::derive::volume_slot(product).is_none() {
+    // The gate is the field's own registered fact, not a second reading of the
+    // derive table: `vertical` IS `volume_slot(p).is_some()`, pinned as such
+    // where the projection is built.
+    let facts = rustdar_radar::fields::spec(product);
+    if !facts.vertical {
         return VolumeOutcome::empty_state(format!(
             "{} has no vertical structure to render in 3D - pick a moment the radar measures \
              or derives tilt by tilt",
-            product.name(),
+            facts.name,
         ));
     }
 
@@ -1346,9 +1350,9 @@ fn volume_pane_outcome(
         floor,
         source: source_geo,
         mirror_size_points: [mirror_size_points.x, mirror_size_points.y],
-        alpha: alpha_curves.get(product),
+        alpha: alpha_curves.get(&rustdar_radar::fields::spec(product).id),
         view_mode,
-        iso_threshold: iso_thresholds.get(product),
+        iso_threshold: iso_thresholds.get(&rustdar_radar::fields::spec(product).id),
     }) {
         VolumePaint::Callback { payload, showing } => {
             ui.painter()
@@ -1463,29 +1467,32 @@ pub(crate) fn render_volume_controls(
             .on_hover_text("One opaque, lit surface at the threshold below - the shell of everything at or beyond it.");
         });
         if volume.view_mode == crate::pane::VolumeViewMode::Isosurface {
-            let (prefix, suffix) = crate::volume_iso::slider_labels(product);
-            let mut threshold = iso_thresholds.get(product);
+            // The slider's travel and the meaning of its number are the
+            // field's own registered facts now, read once. The `_ => 0.0..=1.0`
+            // wildcard that used to answer for a field with no stated domain is
+            // gone: a field with no vertical extent never reaches this arm, and
+            // gets the refusal plate above instead.
+            let facts = rustdar_radar::fields::spec(product);
+            let (prefix, suffix) = facts.domain_label_ends;
+            let (domain_start, domain_end) = facts.value_domain;
+            let mut threshold = iso_thresholds.get(&facts.id);
             ui.horizontal(|ui| {
                 ui.label(format!("{prefix}:"));
                 let response = ui.add(
-                    egui::Slider::new(&mut threshold, crate::volume_iso::slider_range(product))
+                    egui::Slider::new(&mut threshold, domain_start..=domain_end)
                         .suffix(suffix)
-                        .fixed_decimals(if *crate::volume_iso::slider_range(product).end() <= 4.0 {
-                            2
-                        } else {
-                            0
-                        }),
+                        .fixed_decimals(if domain_end <= 4.0 { 2 } else { 0 }),
                 );
                 if response.changed() {
-                    iso_thresholds.set(product, threshold);
+                    iso_thresholds.set(&facts.id, threshold);
                 }
                 response.on_hover_text(format!(
                     "Where {}'s surface sits. Per product - every 3D pane showing this \
                      product shares it.",
-                    product.name(),
+                    facts.name,
                 ));
             });
-            if alpha_curves.is_edited(product) {
+            if alpha_curves.is_edited(&facts.id) {
                 ui.label(
                     egui::RichText::new(
                         "The isosurface reads the data itself; your Volume Alpha curve \

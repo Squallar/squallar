@@ -6327,7 +6327,7 @@ fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
         .expect("pane 0 is a 3D pane")
         .view_mode = crate::pane::VolumeViewMode::Isosurface;
     h.gui_mut().volume_alpha.set(
-        rustdar_radar::types::RadarProduct::Reflectivity,
+        &rustdar_radar::fields::spec(rustdar_radar::types::RadarProduct::Reflectivity).id,
         crate::volume_alpha::AlphaCurve::from_alphas([7u8; crate::volume_alpha::CURVE_LEN]),
     );
     h.frames_for(2, FRAME_DT);
