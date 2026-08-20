@@ -11,11 +11,13 @@ use rustdar_egui::pane::{
 use rustdar_geo::GeoPoint;
 use rustdar_radar::loop_downloads::LoopDownloadManager;
 use rustdar_radar::sites::RadarSite;
-use rustdar_radar::types::{RadarProduct, RenderView};
+use rustdar_radar::types::RenderView;
 use rustdar_volumetric::bridge::VolumeEntry;
 
 const SITE: &str = "KTLX";
-const PRODUCT: RadarProduct = RadarProduct::Reflectivity;
+/// The field every test here shares, named the way a pane and a render
+/// key name it.
+const PRODUCT_ID: rustdar_source::product::FieldId = rustdar_radar::fields::known::REFLECTIVITY;
 const TILT: f32 = 0.5;
 
 fn ts(minute: u32) -> chrono::NaiveDateTime {
@@ -52,7 +54,7 @@ fn app_with_volume_loop(minutes: &[u32]) -> crate::app::App {
 
     let pane = app.gui.pane_mut(0).expect("pane 0 exists");
     pane.set_site(SITE.to_string());
-    pane.set_selected_product(PRODUCT);
+    pane.set_selected_product(PRODUCT_ID);
     pane.set_selected_elevation(TILT);
     pane.set_view(rustdar_radar::types::RenderView::Volume);
 
@@ -78,7 +80,7 @@ fn frame_target(minute: u32, region: Option<VolumeRegion>) -> VolumeTarget {
             site: SITE.to_owned(),
             collected: ts(minute),
         },
-        product: PRODUCT,
+        product: PRODUCT_ID,
         region,
     }
 }

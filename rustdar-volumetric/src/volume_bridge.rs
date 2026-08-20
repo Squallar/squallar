@@ -395,9 +395,9 @@ impl VolumeStore {
     }
 
     /// Drop every entry whose target names `product`.
-    pub fn evict_product(&self, product: rustdar_radar::types::RadarProduct) {
+    pub fn evict_product(&self, product: &rustdar_radar::fields::Id) {
         let mut inner = self.lock();
-        inner.entries.retain(|e| e.target.product != product);
+        inner.entries.retain(|e| e.target.product != *product);
     }
 
     /// What is in hand for `target`, if anything.
@@ -616,7 +616,7 @@ impl VolumePainter for BridgeVolumePainter {
             // retarget with nothing old worth showing.
             return VolumePaint::Empty(format!(
                 "Building the {} volume...",
-                frame.target.product.code(),
+                field_code(&frame.target.product),
             ));
         };
         let grid = match &found.entry {
@@ -627,7 +627,7 @@ impl VolumePainter for BridgeVolumePainter {
             VolumeEntry::Building => {
                 return VolumePaint::Empty(format!(
                     "Building the {} volume...",
-                    frame.target.product.code(),
+                    field_code(&frame.target.product),
                 ));
             }
             VolumeEntry::Refused(why) => return VolumePaint::Empty(why.clone()),
@@ -659,7 +659,7 @@ impl VolumePainter for BridgeVolumePainter {
             // ground it is not over.
             return VolumePaint::Empty(format!(
                 "Building the {} volume...",
-                frame.target.product.code(),
+                field_code(&frame.target.product),
             ));
         };
         let box_size_km = drawn.size_km();
@@ -1396,3 +1396,8 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
 #[path = "volume_bridge/tests.rs"]
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// A field's short code, for the log lines that name what a slot is holding.
+fn field_code(id: &rustdar_radar::fields::Id) -> &str {
+    rustdar_radar::fields::spec_for(id).map_or_else(|| id.as_str(), |spec| spec.code)
+}

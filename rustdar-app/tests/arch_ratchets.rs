@@ -199,7 +199,42 @@ const GUI_IMPL_SETTER_MAX: usize = 1;
 /// against `096ca4c3`. The single survivor in `ui_catalog.rs` is the typed
 /// `product_for`/`spec` round trip the pane still forces, and WO-E9e removes it
 /// with the pane's own type.
-const PRODUCT_IN_EGUI_MAX: usize = 386;
+///
+/// # 0 since WO-E9e land 2 — and this constant records what 0 means
+///
+/// **0 means the enum's NAME is gone from `rustdar-egui`. It does NOT mean no
+/// field-identity comparison remains there.** A ceiling counts the spelling it
+/// was built to count, and this one was built to count `RadarProduct`. Reaching
+/// 0 while comparisons survive under another spelling is honest only if the
+/// ceiling says so on itself — the WO-M12d precedent, where a ceiling recorded
+/// its own remainder rather than pretending it was gone. So, stated:
+///
+/// * **Three annotation guards in `pane.rs`** — `displayed_nyquist_ms` on
+///   Velocity, `displayed_melting_layer_source` on hydrometeor classification,
+///   `displayed_storm_motion` on SRV — are now `FieldId` comparisons against
+///   `rustdar_radar::fields::known::` consts. They ask "does this readout belong
+///   to the picture on the glass", not "which catalogue row is this". Whether
+///   they deserve declared registry facts is **WO-M14's** question.
+/// * **`ui_map_pane::format_legend_value` keeps six identity arms** — the class
+///   table, the whole-number speeds and heights, precipitation rate, hail size,
+///   the correlation coefficient and the two 1-decimal fields — and
+///   `range_folded_is_painted` keeps one. These are legend *layout* policy (how
+///   many decimals survive a 20 px bar), which is the UI's own fact and not the
+///   registry's; the unit *conversion* under them does come from the field's
+///   registered `Quantity`.
+/// * **The radar layer's enum values still flow through egui inside
+///   `rustdar_radar::types::ScanInfo`** (`available_products`,
+///   `product_elevations`). Egui declares no field of that type and never names
+///   it: it projects at the boundary through `fields::spec` / `fields::product_for`.
+///   Re-typing radar's own scan metadata is not this order's — radar keeping its
+///   enum inside the crate that owns it is the point.
+///
+/// **What 0 does buy, and it is the campaign's oldest acceptance criterion:** no
+/// type, field, signature, pattern or import in `rustdar-egui` names
+/// `RadarProduct`. The pane's selection, `RenderTarget`, `SectionTarget`,
+/// `VolumeTarget`, `RadarTextureMeta` and (per amendment M8) the app's
+/// `SelectKey` all hold a `FieldId`.
+const PRODUCT_IN_EGUI_MAX: usize = 0;
 /// Row 6.
 ///
 /// **17 since WO-M12b**: the loop scan-list channel is gone — a radar frame
@@ -567,12 +602,15 @@ fn the_product_enum_never_spreads_further_into_egui() {
     let files = load_tree(&root.join("rustdar-egui"));
     assert_anchored(&files, "rustdar-egui/src/lib.rs", UI_MOD_ANCHOR);
     let n = count(&files, PRODUCT_ENUM);
-    assert!(
-        n <= PRODUCT_IN_EGUI_MAX,
-        "the product enum spread further into rustdar-egui: {n} occurrences > \
-         ceiling {PRODUCT_IN_EGUI_MAX}. WO-E9 (FieldId) drives this to 0. Lower the \
-         MAX in the land that earns it; never raise it without a written plan \
-         amendment."
+    // `assert_eq!` rather than `<=`: at 0 the two are the same test, and the
+    // equality says what the constant's doc says — this is a value that records
+    // a finished state, not a budget with room left in it.
+    assert_eq!(
+        n, PRODUCT_IN_EGUI_MAX,
+        "the product enum spread back into rustdar-egui: {n} occurrences, \
+         ceiling {PRODUCT_IN_EGUI_MAX}. WO-E9e drove this to 0 and the UI names \
+         fields by `FieldId` now — see `rustdar_radar::fields::known` for the \
+         spellings. Never raise this without a written plan amendment."
     );
 }
 

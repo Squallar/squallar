@@ -1,6 +1,7 @@
 use super::*;
 use crate::input_harness::InputHarness;
 use crate::volume_view::{Showing, StubVolumePainter, VolumeFrameState};
+use rustdar_radar::fields as radar_fields;
 use rustdar_source::id::known;
 use std::sync::Arc;
 
@@ -292,9 +293,7 @@ fn the_alpha_curve_rides_the_frame_only_when_one_is_stored() {
     alphas[128..].fill(255);
     let curve = AlphaCurve::from_alphas(alphas);
     let product = h.gui_mut().pane(1).expect("pane 1").selected_product();
-    h.gui_mut()
-        .volume_alpha
-        .set(&rustdar_radar::fields::spec(product).id, curve.clone());
+    h.gui_mut().volume_alpha.set(&product, curve.clone());
     h.frames_for(1, FRAME_DT);
     assert_eq!(
         last_seen(&painter).alpha,
@@ -302,9 +301,7 @@ fn the_alpha_curve_rides_the_frame_only_when_one_is_stored() {
         "the stored curve for the pane's product must ride the frame",
     );
 
-    h.gui_mut()
-        .volume_alpha
-        .reset(&rustdar_radar::fields::spec(product).id);
+    h.gui_mut().volume_alpha.reset(&product);
     h.frames_for(1, FRAME_DT);
     assert_eq!(
         last_seen(&painter).alpha,
@@ -355,7 +352,7 @@ fn a_product_with_no_vertical_structure_is_refused_by_name() {
     // rest, so writing it to pane 1 alone is undone on the next frame by
     // pane 0.
     for pane in h.gui_mut().panes_mut() {
-        pane.set_selected_product(rustdar_radar::types::RadarProduct::EchoTops);
+        pane.set_selected_product(radar_fields::known::ECHO_TOPS);
     }
     let before = painter.seen.lock().unwrap().len();
     h.frames_for(2, FRAME_DT);
@@ -376,23 +373,23 @@ fn a_product_with_no_vertical_structure_is_refused_by_name() {
 /// is asked for.
 #[test]
 fn a_derived_product_is_asked_for_rather_than_refused_by_name() {
-    use rustdar_radar::types::RadarProduct;
     for product in [
-        RadarProduct::StormRelativeVelocity,
-        RadarProduct::NormalizedRotation,
-        RadarProduct::SpecificDifferentialPhase,
+        radar_fields::known::STORM_RELATIVE_VELOCITY,
+        radar_fields::known::NORMALIZED_ROTATION,
+        radar_fields::known::SPECIFIC_DIFFERENTIAL_PHASE,
     ] {
         assert!(
-            rustdar_radar::sampler::samplable(product).is_none(),
+            rustdar_radar::fields::product_for(&product)
+                .is_none_or(|p| rustdar_radar::sampler::samplable(p).is_none()),
             "precondition: {} has no native moment, so this is about the \
                  `volume_slot` gate and not about `samplable`",
-            product.name(),
+            crate::field_facts::name(&product),
         );
         let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
         // Every pane: the linked sync pass propagates the active pane's
         // product.
         for pane in h.gui_mut().panes_mut() {
-            pane.set_selected_product(product);
+            pane.set_selected_product(product.clone());
         }
         h.frames_for(2, FRAME_DT);
 
@@ -402,14 +399,14 @@ fn a_derived_product_is_asked_for_rather_than_refused_by_name() {
                 .as_deref()
                 .is_some_and(|o| o.contains("no vertical structure")),
             "{} is derived tilt by tilt, but the 3D pane refused it: {outcome:?}",
-            product.name(),
+            crate::field_facts::name(&product),
         );
         assert!(
             h.last_actions()
                 .iter()
                 .any(|a| matches!(a, GuiAction::PrepareVolume { .. })),
             "{} never got a grid request, so the pane refused it silently",
-            product.name(),
+            crate::field_facts::name(&product),
         );
     }
 }
@@ -1913,12 +1910,12 @@ fn the_panes_legend_is_painted_onto_the_glass_and_never_into_the_strip() {
 }
 
 /// Every legend a 3D pane can paint, with a preference set that paints it.
-fn every_legend_a_volume_pane_can_paint() -> Vec<(RadarProduct, UserPreferences)> {
+fn every_legend_a_volume_pane_can_paint() -> Vec<(FieldId, UserPreferences)> {
     use rustdar_units::{HailSizeUnit, HeightUnit, PrecipRateUnit, SpeedUnit};
 
-    let mut said: Vec<(RadarProduct, Vec<String>, &'static str)> = Vec::new();
+    let mut said: Vec<(FieldId, Vec<String>, &'static str)> = Vec::new();
     let mut legends = Vec::new();
-    for &product in RadarProduct::all() {
+    for product in radar_fields::known::ALL.iter() {
         for &speed in SpeedUnit::ALL {
             for &height in HeightUnit::ALL {
                 for &hail_size in HailSizeUnit::ALL {
@@ -1935,13 +1932,13 @@ fn every_legend_a_volume_pane_can_paint() -> Vec<(RadarProduct, UserPreferences)
                         // a list that collapsed them would never run the arm
                         // for a product at all.
                         let says = (
-                            product,
+                            product.clone(),
                             pane_render::legend_ticks(product, &prefs),
-                            product.unit_label(&prefs),
+                            crate::field_facts::unit_label(product, &prefs),
                         );
                         if !said.contains(&says) {
                             said.push(says);
-                            legends.push((product, prefs));
+                            legends.push((product.clone(), prefs));
                         }
                     }
                 }
@@ -1965,12 +1962,12 @@ fn the_colour_scale_does_not_print_through_the_volume_alpha_button() {
 
     let legends = every_legend_a_volume_pane_can_paint();
     assert!(
-        legends.len() > RadarProduct::all().len(),
+        legends.len() > radar_fields::known::ALL.len(),
         "precondition: {} legends for {} products means the unit crossing \
          collapsed to nothing and only the default preferences are being \
          drawn",
         legends.len(),
-        RadarProduct::all().len(),
+        radar_fields::known::ALL.len(),
     );
 
     for (product, prefs) in legends {
@@ -1978,13 +1975,17 @@ fn the_colour_scale_does_not_print_through_the_volume_alpha_button() {
         // `propagate_layer_sync` copies the *active* pane's product to the
         // rest, so writing it to pane 0 alone is undone on the next frame.
         for pane in h.gui_mut().panes_mut() {
-            pane.set_selected_product(product);
+            pane.set_selected_product(product.clone());
         }
         h.gui_mut().preferences = prefs.clone();
         h.frames_for(2, FRAME_DT);
         // Named by the two things that pick a legend out of the list: what it
         // is a scale of, and what it is labelled in.
-        let what = format!("{} as {}", product.name(), product.unit_label(&prefs));
+        let what = format!(
+            "{} as {}",
+            crate::field_facts::name(&product),
+            crate::field_facts::unit_label(&product, &prefs)
+        );
 
         let pane_rect = h.pane_rects()[0];
         let (_, button) = *h
@@ -2000,7 +2001,7 @@ fn the_colour_scale_does_not_print_through_the_volume_alpha_button() {
 
         // The pane is landscape, so the panel-wide orientation puts the bars on
         // the right edge — the same edge the button hangs off.
-        let witness = product.unit_label(&prefs);
+        let witness = crate::field_facts::unit_label(&product, &prefs);
         let title: Vec<egui::Rect> = h
             .painted_text_rects()
             .into_iter()

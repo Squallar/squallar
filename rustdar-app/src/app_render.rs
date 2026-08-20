@@ -297,7 +297,10 @@ impl super::App {
                 if !other.is_map() || other.site() != origin_site {
                     continue;
                 }
-                let Some((other_product, other_elevation)) = other.get_rendering_params() else {
+                let Some((other_product, other_elevation)) = other
+                    .get_rendering_params()
+                    .and_then(|(id, e)| Some((rustdar_radar::fields::product_for(&id)?, e)))
+                else {
                     continue;
                 };
                 if other_product == render_result.product
@@ -509,7 +512,7 @@ impl super::App {
                 nyquist_ms: render.nyquist_ms,
                 melting_layer_source: render.melting_layer_source,
                 storm_motion: render.storm_motion,
-                product: render.product,
+                product: crate::render_key::field_id_of(render.product),
                 elevation: render.elevation,
             }),
             hit_map: None,
@@ -758,7 +761,8 @@ impl super::App {
                     && self
                         .gui
                         .get_rendering_params_for_pane(idx)
-                        .is_some_and(|(p, _)| readers.contains(&p))
+                        .and_then(|(id, _)| crate::render_key::radar_field(&id))
+                        .is_some_and(|p| readers.contains(&p))
                 {
                     prs.last_rendered = None;
                 }
@@ -893,13 +897,12 @@ impl super::App {
             return false;
         }
         self.volume_store
-            .evict_product(rustdar_radar::types::RadarProduct::StormRelativeVelocity);
+            .evict_product(&rustdar_radar::fields::known::STORM_RELATIVE_VELOCITY);
         for pane_idx in 0..self.gui.pane_count() {
             let Some(pane) = self.gui.pane_mut(pane_idx) else {
                 continue;
             };
-            if pane.selected_product() != rustdar_radar::types::RadarProduct::StormRelativeVelocity
-            {
+            if pane.selected_product() != rustdar_radar::fields::known::STORM_RELATIVE_VELOCITY {
                 continue;
             }
             if let Some(volume) = pane.volume_mut() {
@@ -922,7 +925,10 @@ impl super::App {
             if !pane.is_map() || pane.site() != site {
                 continue;
             }
-            let Some((product, elevation)) = pane.get_rendering_params() else {
+            let Some((product, elevation)) = pane
+                .get_rendering_params()
+                .and_then(|(id, e)| Some((rustdar_radar::fields::product_for(&id)?, e)))
+            else {
                 continue;
             };
             // Level III renders from fetched objects, not from the volume —
@@ -991,7 +997,11 @@ impl super::App {
             if self.gui.pane_has_no_plan_view(pane_idx) {
                 continue;
             }
-            if let Some((product, elevation)) = self.gui.get_rendering_params_for_pane(pane_idx) {
+            if let Some((product, elevation)) = self
+                .gui
+                .get_rendering_params_for_pane(pane_idx)
+                .and_then(|(id, e)| Some((rustdar_radar::fields::product_for(&id)?, e)))
+            {
                 let prs = &self.render.pane_render[pane_idx];
                 let needs_render = prs
                     .last_rendered
@@ -1134,14 +1144,17 @@ impl super::App {
                 self.mark_section_unavailable(pane_idx, reason);
                 continue;
             }
-            if rustdar_radar::derive::volume_slot(target.product).is_none() {
+            if crate::render_key::radar_field(&target.product)
+                .and_then(rustdar_radar::derive::volume_slot)
+                .is_none()
+            {
                 // Permanent for this product, so the key *is* written: nothing
                 // about this volume will make a column integral sliceable, and
                 // re-asking every frame would be a busy loop with no output.
                 self.mark_section_unavailable(
                     pane_idx,
                     rustdar_egui::pane::SectionUnavailable::ProductHasNoVerticalStructure(
-                        target.product,
+                        target.product.clone(),
                     ),
                 );
                 if let Some(section) = self
@@ -1154,7 +1167,12 @@ impl super::App {
                 continue;
             }
 
-            let product = target.product;
+            // The extraction is radar's own and keyed by radar's field; the
+            // target names it by id, and the arm above already refused an id
+            // with no vertical slot.
+            let Some(product) = crate::render_key::radar_field(&target.product) else {
+                continue;
+            };
             // Captured before the closure: the user's storm motion vector,
             // for the worker-side SRV derivation. The extraction keeps it
             // only on an SRV payload.
@@ -1204,7 +1222,7 @@ impl super::App {
                     self.mark_section_unavailable(
                         pane_idx,
                         rustdar_egui::pane::SectionUnavailable::ProductMissingFromVolume(
-                            target.product,
+                            target.product.clone(),
                         ),
                     );
                     if let Some(section) = self
@@ -1238,7 +1256,7 @@ impl super::App {
         let pane = self.gui.pane(pane_idx)?;
         let section = pane.cross_section()?;
         let line = section.line?;
-        let product = pane.selected_product();
+        let product = rustdar_radar::fields::product_for(&pane.selected_product())?;
         let site = pane.site().to_string();
         let Some(collected) = pane.scan_info.as_ref().map(|s| s.timestamp) else {
             self.mark_section_unavailable(
@@ -1252,7 +1270,7 @@ impl super::App {
             .unwrap_or(0);
         Some(rustdar_egui::pane::SectionTarget {
             volume: rustdar_egui::pane::VolumeStamp { site, collected },
-            product,
+            product: crate::render_key::field_id_of(product),
             line,
             ladder,
         })
@@ -1458,7 +1476,7 @@ impl super::App {
                         nyquist_ms,
                         melting_layer_source,
                         storm_motion,
-                        product,
+                        product: crate::render_key::field_id_of(product),
                         elevation,
                     }),
                     hit_map: None,
@@ -1650,7 +1668,11 @@ impl super::App {
                         continue;
                     }
                     pane.hydrate_layer_states(overlays, pane_idx);
-                    let product = pane.selected_product();
+                    let Some(product) =
+                        rustdar_radar::fields::product_for(&pane.selected_product())
+                    else {
+                        continue;
+                    };
                     // The whole-pane cap divides across the layers this pane is
                     // animating, and it is counted HERE — where the budget is
                     // consumed — not pushed down with it.
@@ -2284,7 +2306,9 @@ impl super::App {
             let Some(pane) = self.gui.pane_mut(pane_idx) else {
                 continue;
             };
-            let product = pane.selected_product();
+            let Some(product) = rustdar_radar::fields::product_for(&pane.selected_product()) else {
+                continue;
+            };
             let elevation = pane.selected_elevation();
             let section_key = pane.cross_section().and_then(|s| s.line).map(|line| {
                 rustdar_egui::pane::SectionLoopKey::new(
@@ -2327,7 +2351,11 @@ impl super::App {
                 rustdar_radar::types::RenderView::PlanView => None,
             };
 
-            if ls.retarget_renders_keyed(product, elevation, view_key) {
+            if ls.retarget_renders_keyed(
+                &crate::render_key::field_id_of(product),
+                elevation,
+                view_key,
+            ) {
                 if ls.view == rustdar_radar::types::RenderView::Volume {
                     release_volume_sets.push(pane_idx);
                 }
@@ -2440,7 +2468,7 @@ impl super::App {
                             site: target.site.clone(),
                             collected: frame.timestamp,
                         },
-                        product: target.product,
+                        product: target.product.clone(),
                         region: key.region,
                     };
                     to_build.push(LoopVolumeRequest {
@@ -2646,11 +2674,13 @@ impl super::App {
             // Asked here rather than inside the spawn because "the data has not
             // arrived" is not a failed render: this frame is skipped and asked
             // again next pass, and nothing about it is marked.
-            if !self.loop_mgr.frame_data_arrived(
-                &req.target.site,
-                req.target.product,
-                &req.timestamp,
-            ) {
+            let Some(req_product) = crate::render_key::radar_field(&req.target.product) else {
+                continue;
+            };
+            if !self
+                .loop_mgr
+                .frame_data_arrived(&req.target.site, req_product, &req.timestamp)
+            {
                 continue;
             }
 
@@ -2672,9 +2702,11 @@ impl super::App {
             {
                 break;
             }
-            let Some((scan, declared)) =
-                self.loop_mgr
-                    .frame_volume(&req.target.site, req.target.product, &req.timestamp)
+            let Some((scan, declared)) = crate::render_key::radar_field(&req.target.product)
+                .and_then(|p| {
+                    self.loop_mgr
+                        .frame_volume(&req.target.site, p, &req.timestamp)
+                })
             else {
                 if let Some(pane) = self.gui.pane_mut(req.pane_idx)
                     && let Some(frame) = pane.loop_state_mut().frames.get_mut(req.frame_idx)
@@ -3002,7 +3034,8 @@ fn frame_gates(
     rr: &crate::channels::LoopRenderResponse,
 ) -> Option<rustdar_radar::hover::SweepGates> {
     let (scan, _) = loop_mgr.get_cached(&rr.target.site, &rr.timestamp)?;
-    rustdar_radar::hover::SweepGates::new(Arc::clone(scan), rr.target.product, rr.snapped)
+    let product = crate::render_key::radar_field(&rr.target.product)?;
+    rustdar_radar::hover::SweepGates::new(Arc::clone(scan), product, rr.snapped)
 }
 
 /// Place a finished loop render on the frame of `ls` that asked for it, returning
@@ -3096,7 +3129,8 @@ fn frame_data(
     target: &RenderTarget,
     timestamp: chrono::NaiveDateTime,
 ) -> Option<rustdar_radar::loop_downloads::LoopFrameData> {
-    loop_mgr.frame_data(&target.site, target.product, &timestamp)
+    crate::render_key::radar_field(&target.product)
+        .and_then(|p| loop_mgr.frame_data(&target.site, p, &timestamp))
 }
 
 /// What one frame's own data makes of the pane's elevation selection.
@@ -3116,13 +3150,16 @@ fn frame_sweep(
     target: &RenderTarget,
     timestamp: chrono::NaiveDateTime,
 ) -> FrameSweep {
-    if target.product.is_level3() {
-        return match loop_mgr.l3_frame_state(&target.site, target.product, &timestamp) {
+    let Some(product) = crate::render_key::radar_field(&target.product) else {
+        return FrameSweep::Unrenderable;
+    };
+    if product.is_level3() {
+        return match loop_mgr.l3_frame_state(&target.site, product, &timestamp) {
             L3FrameState::Pending => FrameSweep::Pending,
             L3FrameState::Absent => FrameSweep::Unrenderable,
             L3FrameState::Ready => {
                 match loop_mgr
-                    .l3_frame_products(&target.site, target.product, &timestamp)
+                    .l3_frame_products(&target.site, product, &timestamp)
                     .as_deref()
                     .and_then(<[_]>::first)
                 {
@@ -3138,7 +3175,7 @@ fn frame_sweep(
     let Some((scan, _)) = loop_mgr.get_cached(&target.site, &timestamp) else {
         return FrameSweep::Pending;
     };
-    match rustdar_radar::render::find_closest_elevation(scan, target.product, target.elevation) {
+    match rustdar_radar::render::find_closest_elevation(scan, product, target.elevation) {
         Some(snapped) => FrameSweep::At(snapped),
         None => FrameSweep::Unrenderable,
     }
@@ -3150,14 +3187,14 @@ fn own_sweep(
     loop_mgr: &rustdar_radar::loop_downloads::LoopDownloadManager,
     ls: &rustdar_egui::pane::LayerTimeState,
     timestamp: chrono::NaiveDateTime,
-    product: rustdar_radar::types::RadarProduct,
+    product: rustdar_source::product::FieldId,
     elevation: f32,
 ) -> Option<f32> {
     // Resolved through the same function the dispatcher plans with, against the
     // receiver's own site: a second rule for "which sweep does this frame show"
     match frame_sweep(
         loop_mgr,
-        &RenderTarget::new(radar_layer::site(ls).to_string(), product, elevation),
+        &RenderTarget::new(radar_layer::site(ls).to_string(), &product, elevation),
         timestamp,
     ) {
         FrameSweep::At(sweep) => Some(sweep),
@@ -3177,7 +3214,7 @@ fn broadcast_sweep(
             loop_mgr,
             ls,
             rr.timestamp,
-            rr.target.product,
+            rr.target.product.clone(),
             rr.target.elevation,
         ),
     }
@@ -3187,7 +3224,9 @@ fn broadcast_sweep(
 fn loop_product(
     ls: &rustdar_egui::pane::LayerTimeState,
 ) -> Option<rustdar_radar::types::RadarProduct> {
-    ls.rendered_for.as_ref().map(|t| t.product)
+    ls.rendered_for
+        .as_ref()
+        .and_then(|t| crate::render_key::radar_field(&t.product))
 }
 
 /// Whether every frame `ls` intends to render has settled, given what has arrived.
@@ -3228,11 +3267,10 @@ fn frame_section(
         return FrameSection::Pending;
     };
     let sweeps: Vec<&nexrad_model::data::Sweep> = scan.sweeps().iter().collect();
-    match rustdar_radar::sampler::ladder_fingerprint(
-        scan.coverage_pattern(),
-        &sweeps,
-        target.product,
-    ) {
+    let Some(product) = crate::render_key::radar_field(&target.product) else {
+        return FrameSection::Unrenderable;
+    };
+    match rustdar_radar::sampler::ladder_fingerprint(scan.coverage_pattern(), &sweeps, product) {
         Some(ladder) => FrameSection::At(ladder),
         None => FrameSection::Unrenderable,
     }
@@ -3402,7 +3440,8 @@ impl LoopRenderRequest {
     /// The inputs the renderer is handed.
     fn render_params(&self) -> crate::render_dispatch::RenderParams {
         crate::render_dispatch::RenderParams {
-            product: self.target.product,
+            product: crate::render_key::radar_field(&self.target.product)
+                .expect("a loop render request names a field the radar layer registers"),
             elevation: self.snapped,
             lat: self.site_lat,
             lon: self.site_lon,

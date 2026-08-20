@@ -287,6 +287,7 @@ fn voxel_request_for(
     site_lat: f64,
     site_lon: f64,
     cells: [u32; 3],
+    product: rustdar_radar::types::RadarProduct,
     max_axis: u32,
 ) -> rustdar_radar::voxel::VoxelRequest {
     let (centre, half_extent_km) = match target.region {
@@ -301,7 +302,9 @@ fn voxel_request_for(
         half_extent_km,
         base_km_msl: rustdar_radar::voxel::DEFAULT_BASE_KM_MSL,
         top_km_msl: rustdar_radar::voxel::DEFAULT_TOP_KM_MSL,
-        product: target.product,
+        // Resolved by the caller: `prepare_volume` refuses an id this build
+        // does not register before it gets this far.
+        product,
         shape: rustdar_device_profile::constants::volume_grid_shape_of(cells, max_axis),
         values_wanted: false,
     }
@@ -876,13 +879,28 @@ impl App {
             return VolumePrepare::Busy;
         }
 
+        // The resample is radar's own and keyed by radar's field; the target
+        // names it by id.
+        let Some(product) = crate::render_key::radar_field(&target.product) else {
+            self.volume_store.insert_held(
+                pane_idx,
+                target.clone(),
+                VolumeEntry::Refused(format!(
+                    "This build does not know the field {}.",
+                    target.product.as_str(),
+                )),
+                hold,
+            );
+            return VolumePrepare::Served;
+        };
+
         let started = web_time::Instant::now();
         let extracted = if live {
-            self.extract_current_volume(&target.volume.site, target.product)
+            self.extract_current_volume(&target.volume.site, product)
         } else if navigated {
-            self.extract_base_volume(&target.volume.site, target.product)
+            self.extract_base_volume(&target.volume.site, product)
         } else {
-            self.extract_loop_volume(&target.volume.site, target.volume.collected, target.product)
+            self.extract_loop_volume(&target.volume.site, target.volume.collected, product)
         };
         let Some(input) = extracted else {
             self.volume_store.insert_held(
@@ -890,7 +908,7 @@ impl App {
                 target.clone(),
                 VolumeEntry::Refused(format!(
                     "This volume carries no {} to resample for 3D.\n\n({} at {} UTC)",
-                    target.product.name(),
+                    rustdar_radar::fields::spec(product).name,
                     target.volume.site,
                     target.volume.collected,
                 )),
@@ -914,6 +932,7 @@ impl App {
             site.lat,
             site.lon,
             self.budgets.grid_cells,
+            product,
             self.volume_grid_axis_limit(),
         );
         let spawned = self.render.spawn_voxel_build(

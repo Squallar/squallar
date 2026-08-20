@@ -1,5 +1,6 @@
 use super::*;
 use rustdar_device_profile::budget::MAX_PANES_DESKTOP;
+use rustdar_radar::fields as radar_fields;
 use rustdar_radar::sites::RadarSite;
 use rustdar_source::id::known;
 use std::collections::HashSet;
@@ -225,7 +226,7 @@ fn all_scans_available(_: &LoopFrame) -> bool {
 }
 
 /// The target a render result carries, as stamped by `spawn_loop_frame_render`.
-fn target(site: &str, product: RadarProduct, elevation: f32) -> RenderTarget {
+fn target(site: &str, product: &FieldId, elevation: f32) -> RenderTarget {
     RenderTarget::new(site, product, elevation)
 }
 
@@ -327,10 +328,10 @@ fn failed_frames_do_not_block_readiness() {
 fn retarget_is_a_noop_before_the_first_dispatch() {
     let mut state = loop_with_frames(3, 0);
     assert!(state.rendered_for.is_none());
-    assert!(!state.retarget_renders(RadarProduct::Reflectivity, 0.5));
+    assert!(!state.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5));
     let adopted = state.rendered_for.as_ref().expect("target adopted");
     assert!(adopted.matches(
-        &target(SITE, RadarProduct::Reflectivity, 0.5),
+        &target(SITE, &radar_fields::known::REFLECTIVITY, 0.5),
         RenderView::PlanView
     ));
 }
@@ -339,12 +340,12 @@ fn retarget_is_a_noop_before_the_first_dispatch() {
 fn retarget_keeps_frames_when_the_selection_is_unchanged() {
     let ctx = egui::Context::default();
     let mut state = loop_with_frames(3, 0);
-    state.retarget_renders(RadarProduct::Reflectivity, 0.5);
+    state.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
     state.frames[0].image = Some(dummy_texture(&ctx));
 
-    assert!(!state.retarget_renders(RadarProduct::Reflectivity, 0.5));
+    assert!(!state.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5));
     assert!(state.frames[0].image.is_some());
-    assert!(!state.retarget_renders(RadarProduct::Reflectivity, 0.505));
+    assert!(!state.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.505));
     assert!(state.frames[0].image.is_some());
 }
 
@@ -354,13 +355,13 @@ fn retarget_keeps_frames_when_the_selection_is_unchanged() {
 fn retarget_discards_frame_state_that_judged_the_old_product() {
     let ctx = egui::Context::default();
     let mut state = loop_with_frames(4, 0);
-    state.retarget_renders(RadarProduct::Velocity, 0.5);
+    state.retarget_renders(&radar_fields::known::VELOCITY, 0.5);
     state.frames[0].image = Some(dummy_texture(&ctx));
     state.frames[1].render_failed = true;
     state.frames[2].render_failed = true;
     state.frames[3].render_in_flight = true;
 
-    assert!(state.retarget_renders(RadarProduct::Reflectivity, 0.5));
+    assert!(state.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5));
     assert!(state.frames.iter().all(|f| f.image.is_none()));
     assert!(state.frames.iter().all(|f| !f.render_failed));
     assert!(state.frames.iter().all(|f| !f.render_in_flight));
@@ -372,14 +373,14 @@ fn retarget_discards_frame_state_that_judged_the_old_product() {
 fn retarget_reacts_to_an_elevation_change() {
     let ctx = egui::Context::default();
     let mut state = loop_with_frames(3, 0);
-    state.retarget_renders(RadarProduct::Reflectivity, 0.5);
+    state.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
     state.frames[0].image = Some(dummy_texture(&ctx));
 
-    assert!(state.retarget_renders(RadarProduct::Reflectivity, 1.5));
+    assert!(state.retarget_renders(&radar_fields::known::REFLECTIVITY, 1.5));
     assert!(state.frames[0].image.is_none());
     let retargeted = state.rendered_for.as_ref().expect("target adopted");
     assert!(retargeted.matches(
-        &target(SITE, RadarProduct::Reflectivity, 1.5),
+        &target(SITE, &radar_fields::known::REFLECTIVITY, 1.5),
         RenderView::PlanView
     ));
 }
@@ -387,11 +388,11 @@ fn retarget_reacts_to_an_elevation_change() {
 /// The four products whose plan view is the same picture at every tilt, named here
 /// rather than derived: naming them is what makes this a test of the predicate
 /// rather than a restatement of it.
-const TILT_INDEPENDENT: [RadarProduct; 4] = [
-    RadarProduct::EchoTopsInterpolated,
-    RadarProduct::ProbabilityOfSevereHail,
-    RadarProduct::MaxExpectedHailSize,
-    RadarProduct::HydrometeorClassification,
+const TILT_INDEPENDENT: [FieldId; 4] = [
+    radar_fields::known::ECHO_TOPS_INTERPOLATED,
+    radar_fields::known::PROBABILITY_OF_SEVERE_HAIL,
+    radar_fields::known::MAX_EXPECTED_HAIL_SIZE,
+    radar_fields::known::HYDROMETEOR_CLASSIFICATION,
 ];
 
 /// A plan-view loop of a product the tilt cannot move must keep its frames when
@@ -401,11 +402,11 @@ fn a_tilt_change_keeps_a_tilt_independent_plan_view_loops_frames() {
     let ctx = egui::Context::default();
     for product in TILT_INDEPENDENT {
         let mut state = loop_with_frames(3, 0);
-        state.retarget_renders(product, 0.5);
+        state.retarget_renders(&product, 0.5);
         state.frames[0].image = Some(dummy_texture(&ctx));
 
         assert!(
-            !state.retarget_renders(product, 19.5),
+            !state.retarget_renders(&product, 19.5),
             "{product:?} re-rendered every loop frame for a byte-identical picture",
         );
         assert!(
@@ -421,8 +422,8 @@ fn a_tilt_change_keeps_a_tilt_independent_plan_view_loops_frames() {
 #[test]
 fn a_tilt_change_still_discards_a_tilt_dependent_plan_view_loops_frames() {
     let ctx = egui::Context::default();
-    for product in RadarProduct::all().iter().copied() {
-        if TILT_INDEPENDENT.contains(&product) {
+    for product in radar_fields::known::ALL.iter() {
+        if TILT_INDEPENDENT.contains(product) {
             continue;
         }
         let mut state = loop_with_frames(3, 0);
@@ -447,20 +448,22 @@ fn a_tilt_change_still_discards_a_tilt_dependent_plan_view_loops_frames() {
 #[test]
 fn a_result_rendered_for_another_site_is_rejected() {
     let mut state = loop_with_frames(3, 0);
-    state.retarget_renders(RadarProduct::Reflectivity, 0.5);
+    state.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
     let frame_ts = state.frames[0].timestamp;
     state.frames[0].render_in_flight = true;
 
     assert_eq!(
-        state
-            .frame_awaiting_render_result(frame_ts, &target(SITE, RadarProduct::Reflectivity, 0.5)),
+        state.frame_awaiting_render_result(
+            frame_ts,
+            &target(SITE, &radar_fields::known::REFLECTIVITY, 0.5)
+        ),
         Some(0),
         "the loop's own site is accepted"
     );
     assert_eq!(
         state.frame_awaiting_render_result(
             frame_ts,
-            &target("KOUN", RadarProduct::Reflectivity, 0.5)
+            &target("KOUN", &radar_fields::known::REFLECTIVITY, 0.5)
         ),
         None,
         "an image projected around another site's coordinates must be rejected"
@@ -476,13 +479,13 @@ fn a_result_rendered_for_another_site_is_rejected() {
 #[test]
 fn a_rebuilt_loop_rejects_the_previous_sites_in_flight_result() {
     let mut old = loop_with_frames(3, 0);
-    old.retarget_renders(RadarProduct::Reflectivity, 0.5);
+    old.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
     let frame_ts = old.frames[0].timestamp;
     old.frames[0].render_in_flight = true;
     let in_flight_target = old.rendered_for.clone().expect("dispatched target");
 
     let mut rebuilt = loop_for_site(&site("KOUN", 35.2, -97.5), 3, 0);
-    rebuilt.retarget_renders(RadarProduct::Reflectivity, 0.5);
+    rebuilt.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
     rebuilt.frames[0].render_in_flight = true;
 
     assert_eq!(
@@ -497,7 +500,7 @@ fn a_rebuilt_loop_rejects_the_previous_sites_in_flight_result() {
     assert_eq!(
         rebuilt.frame_awaiting_render_result(
             frame_ts,
-            &target("KOUN", RadarProduct::Reflectivity, 0.5)
+            &target("KOUN", &radar_fields::known::REFLECTIVITY, 0.5)
         ),
         Some(0),
         "the new site's own render is still accepted"
@@ -510,13 +513,13 @@ fn a_rebuilt_loop_rejects_the_previous_sites_in_flight_result() {
 #[test]
 fn a_sibling_on_another_site_does_not_accept_the_broadcast() {
     let mut sibling = loop_for_site(&site("KOUN", 35.2, -97.5), 3, 0);
-    sibling.retarget_renders(RadarProduct::Reflectivity, 0.5);
+    sibling.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
 
     assert!(
-        !sibling.is_rendered_for(&target(SITE, RadarProduct::Reflectivity, 0.5)),
+        !sibling.is_rendered_for(&target(SITE, &radar_fields::known::REFLECTIVITY, 0.5)),
         "same product and elevation, different geometry"
     );
-    assert!(sibling.is_rendered_for(&target("KOUN", RadarProduct::Reflectivity, 0.5)));
+    assert!(sibling.is_rendered_for(&target("KOUN", &radar_fields::known::REFLECTIVITY, 0.5)));
 }
 
 /// The render target is compared on the site *code* while frames are projected with
@@ -539,17 +542,23 @@ fn a_loop_takes_its_code_and_its_coordinates_from_one_site() {
 fn a_donor_on_another_site_is_not_offered() {
     let ctx = egui::Context::default();
     let mut donor = loop_with_frames(3, 0);
-    donor.retarget_renders(RadarProduct::Reflectivity, 0.5);
+    donor.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
     donor.frames[0].image = Some(dummy_texture(&ctx));
     let frame_ts = donor.frames[0].timestamp;
 
     assert_eq!(
-        donor.frame_donatable_to(frame_ts, &target(SITE, RadarProduct::Reflectivity, 0.5)),
+        donor.frame_donatable_to(
+            frame_ts,
+            &target(SITE, &radar_fields::known::REFLECTIVITY, 0.5)
+        ),
         Some(0),
         "a pane on the same target may take this texture"
     );
     assert_eq!(
-        donor.frame_donatable_to(frame_ts, &target("KOUN", RadarProduct::Reflectivity, 0.5)),
+        donor.frame_donatable_to(
+            frame_ts,
+            &target("KOUN", &radar_fields::known::REFLECTIVITY, 0.5)
+        ),
         None,
         "a pane whose loop is on another site must render its own"
     );
@@ -561,16 +570,16 @@ fn a_donor_on_another_site_is_not_offered() {
 fn donor_and_broadcast_agree_on_who_may_serve_a_frame() {
     let ctx = egui::Context::default();
     let mut donor = loop_with_frames(3, 0);
-    donor.retarget_renders(RadarProduct::Reflectivity, 0.5);
+    donor.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
     donor.frames[1].image = Some(dummy_texture(&ctx));
     let frame_ts = donor.frames[1].timestamp;
 
     let same_site = loop_with_frames(3, 0);
     let mut same_site = same_site;
-    same_site.retarget_renders(RadarProduct::Reflectivity, 0.5);
+    same_site.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
 
     let mut other_site = loop_for_site(&site("KOUN", 35.2, -97.5), 3, 0);
-    other_site.retarget_renders(RadarProduct::Reflectivity, 0.5);
+    other_site.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
 
     for (label, receiver) in [("same site", &same_site), ("other site", &other_site)] {
         let offered = donor
@@ -606,8 +615,8 @@ fn donor_and_broadcast_agree_on_who_may_serve_a_frame() {
 fn an_untextured_frame_is_not_donatable() {
     let ctx = egui::Context::default();
     let mut donor = loop_with_frames(3, 0);
-    donor.retarget_renders(RadarProduct::Reflectivity, 0.5);
-    let current = target(SITE, RadarProduct::Reflectivity, 0.5);
+    donor.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
+    let current = target(SITE, &radar_fields::known::REFLECTIVITY, 0.5);
     let frame_ts = donor.frames[0].timestamp;
 
     assert_eq!(
@@ -629,8 +638,8 @@ fn an_untextured_frame_is_not_donatable() {
 fn a_textured_frame_does_not_accept_a_broadcast() {
     let ctx = egui::Context::default();
     let mut state = loop_with_frames(3, 0);
-    state.retarget_renders(RadarProduct::Reflectivity, 0.5);
-    let current = target(SITE, RadarProduct::Reflectivity, 0.5);
+    state.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
+    let current = target(SITE, &radar_fields::known::REFLECTIVITY, 0.5);
     let frame_ts = state.frames[0].timestamp;
 
     assert_eq!(
@@ -652,8 +661,8 @@ fn a_textured_frame_does_not_accept_a_broadcast() {
 #[test]
 fn a_broadcast_of_a_different_sweep_is_refused() {
     let mut state = loop_with_frames(3, 0);
-    state.retarget_renders(RadarProduct::Reflectivity, 0.5);
-    let current = target(SITE, RadarProduct::Reflectivity, 0.5);
+    state.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
+    let current = target(SITE, &radar_fields::known::REFLECTIVITY, 0.5);
     let frame_ts = state.frames[0].timestamp;
 
     assert!(
@@ -703,8 +712,8 @@ fn a_broadcast_of_a_different_sweep_is_refused() {
 #[test]
 fn a_broadcast_is_refused_when_the_receiver_has_no_sweep_of_its_own() {
     let mut state = loop_with_frames(3, 0);
-    state.retarget_renders(RadarProduct::Reflectivity, 0.5);
-    let current = target(SITE, RadarProduct::Reflectivity, 0.5);
+    state.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
+    let current = target(SITE, &radar_fields::known::REFLECTIVITY, 0.5);
     let frame_ts = state.frames[0].timestamp;
 
     assert_eq!(
@@ -725,8 +734,8 @@ fn a_broadcast_is_refused_when_the_receiver_has_no_sweep_of_its_own() {
 #[test]
 fn the_mutable_broadcast_accessor_applies_the_sweep_test() {
     let mut state = loop_with_frames(3, 0);
-    state.retarget_renders(RadarProduct::Reflectivity, 0.5);
-    let current = target(SITE, RadarProduct::Reflectivity, 0.5);
+    state.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
+    let current = target(SITE, &radar_fields::known::REFLECTIVITY, 0.5);
     let frame_ts = state.frames[0].timestamp;
 
     assert!(
@@ -755,8 +764,8 @@ fn the_mutable_broadcast_accessor_applies_the_sweep_test() {
 fn an_inactive_loop_takes_nothing_from_any_path() {
     let ctx = egui::Context::default();
     let mut state = loop_with_frames(3, 0);
-    state.retarget_renders(RadarProduct::Reflectivity, 0.5);
-    let current = target(SITE, RadarProduct::Reflectivity, 0.5);
+    state.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
+    let current = target(SITE, &radar_fields::known::REFLECTIVITY, 0.5);
     let frame_ts = state.frames[0].timestamp;
     state.frames[0].render_in_flight = true;
     state.frames[1].image = Some(dummy_texture(&ctx));
@@ -784,8 +793,8 @@ fn an_inactive_loop_takes_nothing_from_any_path() {
 #[test]
 fn the_mutable_accessors_hand_back_the_frame_that_was_chosen() {
     let mut state = loop_with_frames(3, 0);
-    state.retarget_renders(RadarProduct::Reflectivity, 0.5);
-    let current = target(SITE, RadarProduct::Reflectivity, 0.5);
+    state.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
+    let current = target(SITE, &radar_fields::known::REFLECTIVITY, 0.5);
 
     let shared = state.frames[0].timestamp;
     state.frames[2].timestamp = shared;
@@ -807,8 +816,8 @@ fn the_mutable_accessors_hand_back_the_frame_that_was_chosen() {
 fn the_broadcast_accessor_hands_back_the_frame_that_was_chosen() {
     let ctx = egui::Context::default();
     let mut state = loop_with_frames(3, 0);
-    state.retarget_renders(RadarProduct::Reflectivity, 0.5);
-    let current = target(SITE, RadarProduct::Reflectivity, 0.5);
+    state.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
+    let current = target(SITE, &radar_fields::known::REFLECTIVITY, 0.5);
 
     let shared = state.frames[0].timestamp;
     state.frames[2].timestamp = shared;
@@ -843,7 +852,10 @@ fn the_broadcast_accessor_hands_back_the_frame_that_was_chosen() {
 /// bucket rather than by a tolerance — and the site is still exact.
 #[test]
 fn target_matching_tolerates_elevation_jitter_only() {
-    let (refl, vel) = (RadarProduct::Reflectivity, RadarProduct::Velocity);
+    let (refl, vel) = (
+        &radar_fields::known::REFLECTIVITY,
+        &radar_fields::known::VELOCITY,
+    );
     let base = target(SITE, refl, 0.5);
     let view = RenderView::PlanView;
     assert!(base.matches(&target(SITE, refl, 0.505), view));
@@ -867,14 +879,14 @@ fn the_acceptance_comparison_asks_the_tilt_only_when_the_tilt_selects_the_pictur
         RenderView::CrossSection,
         RenderView::Volume,
     ] {
-        for product in RadarProduct::all().iter().copied() {
+        for product in radar_fields::known::ALL.iter() {
             let base = target(SITE, product, 0.5);
             // Far enough apart that no bucket and no tolerance could join them.
             let moved = target(SITE, product, 19.5);
             let same_picture = base.matches(&moved, view);
             assert_eq!(
                 same_picture,
-                !view.elevation_selects_picture(product),
+                !crate::field_facts::elevation_selects_picture(view, product),
                 "{view:?}/{product:?}: the acceptance comparison and \
                  `elevation_selects_picture` disagree about whether the tilt \
                  names a different picture",
@@ -902,7 +914,7 @@ fn the_acceptance_comparison_asks_the_tilt_only_when_the_tilt_selects_the_pictur
 #[test]
 fn the_bucket_and_the_tolerance_part_company_at_two_named_boundaries() {
     let view = RenderView::PlanView;
-    let product = RadarProduct::Reflectivity;
+    let product = &radar_fields::known::REFLECTIVITY;
 
     // 0.002 apart — inside ELEVATION_TOLERANCE, so this used to be an
     // acceptance; buckets 5 and 6, so it is now an INVALIDATION and the render
@@ -932,7 +944,7 @@ fn the_bucket_and_the_tolerance_part_company_at_two_named_boundaries() {
 #[test]
 fn the_accepted_frame_is_the_one_that_is_in_flight() {
     let mut state = loop_with_frames(3, 0);
-    state.retarget_renders(RadarProduct::Reflectivity, 0.5);
+    state.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
 
     let shared = state.frames[0].timestamp;
     state.frames[2].timestamp = shared;
@@ -944,7 +956,10 @@ fn the_accepted_frame_is_the_one_that_is_in_flight() {
         "precondition: a timestamp-only lookup lands on the wrong frame"
     );
     assert_eq!(
-        state.frame_awaiting_render_result(shared, &target(SITE, RadarProduct::Reflectivity, 0.5)),
+        state.frame_awaiting_render_result(
+            shared,
+            &target(SITE, &radar_fields::known::REFLECTIVITY, 0.5)
+        ),
         Some(2),
         "the result must be written to the frame that was actually dispatched"
     );
@@ -982,11 +997,11 @@ fn eviction_keeps_exactly_the_render_set() {
 #[test]
 fn stale_result_is_rejected_after_the_frame_is_respawned() {
     let mut state = loop_with_frames(3, 0);
-    state.retarget_renders(RadarProduct::Velocity, 0.5);
+    state.retarget_renders(&radar_fields::known::VELOCITY, 0.5);
     let frame_ts = state.frames[0].timestamp;
     state.frames[0].render_in_flight = true; // render dispatched for Velocity
 
-    assert!(state.retarget_renders(RadarProduct::Reflectivity, 0.5));
+    assert!(state.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5));
     state.frames[0].render_in_flight = true;
 
     assert!(
@@ -994,13 +1009,18 @@ fn stale_result_is_rejected_after_the_frame_is_respawned() {
         "precondition: an in-flight-only guard would accept the stale result here"
     );
     assert_eq!(
-        state.frame_awaiting_render_result(frame_ts, &target(SITE, RadarProduct::Velocity, 0.5)),
+        state.frame_awaiting_render_result(
+            frame_ts,
+            &target(SITE, &radar_fields::known::VELOCITY, 0.5)
+        ),
         None,
         "a result for the abandoned target must be rejected"
     );
     assert_eq!(
-        state
-            .frame_awaiting_render_result(frame_ts, &target(SITE, RadarProduct::Reflectivity, 0.5)),
+        state.frame_awaiting_render_result(
+            frame_ts,
+            &target(SITE, &radar_fields::known::REFLECTIVITY, 0.5)
+        ),
         Some(0),
         "the re-dispatched render for the current target is still accepted"
     );
@@ -1010,10 +1030,10 @@ fn stale_result_is_rejected_after_the_frame_is_respawned() {
 fn results_for_frames_not_awaiting_one_are_rejected() {
     let ctx = egui::Context::default();
     let mut state = loop_with_frames(3, 0);
-    state.retarget_renders(RadarProduct::Reflectivity, 0.5);
+    state.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
     let frame_ts = state.frames[0].timestamp;
 
-    let current = target(SITE, RadarProduct::Reflectivity, 0.5);
+    let current = target(SITE, &radar_fields::known::REFLECTIVITY, 0.5);
 
     assert_eq!(state.frame_awaiting_render_result(frame_ts, &current), None);
     state.frames[0].image = Some(dummy_texture(&ctx));
@@ -1073,7 +1093,7 @@ fn frames_outside_the_render_set_do_not_block_readiness() {
 
 /// A pane showing a finished velocity render whose cut declared `nyquist_ms`.
 fn velocity_pane(ctx: &egui::Context, nyquist_ms: Option<f64>) -> PaneState {
-    pane_showing_render(ctx, RadarProduct::Velocity, nyquist_ms, None, None)
+    pane_showing_render(ctx, &radar_fields::known::VELOCITY, nyquist_ms, None, None)
 }
 
 /// A pane showing a finished classification render that stood on `source`.
@@ -1083,7 +1103,7 @@ fn classification_pane(
 ) -> PaneState {
     pane_showing_render(
         ctx,
-        RadarProduct::HydrometeorClassification,
+        &radar_fields::known::HYDROMETEOR_CLASSIFICATION,
         None,
         source,
         None,
@@ -1097,7 +1117,7 @@ fn storm_relative_pane(
 ) -> PaneState {
     pane_showing_render(
         ctx,
-        RadarProduct::StormRelativeVelocity,
+        &radar_fields::known::STORM_RELATIVE_VELOCITY,
         None,
         None,
         source.map(srm_vector),
@@ -1125,7 +1145,7 @@ fn srm_vector(source: rustdar_radar::srv::StormMotionSource) -> rustdar_radar::s
 /// carries about itself that nothing else can recompute.
 fn pane_showing_render(
     ctx: &egui::Context,
-    product: RadarProduct,
+    product: &FieldId,
     nyquist_ms: Option<f64>,
     melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
     storm_motion: Option<rustdar_radar::srv::SrvMotion>,
@@ -1134,7 +1154,7 @@ fn pane_showing_render(
 
     let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
     let mut pane = PaneState::new();
-    pane.set_selected_product(product);
+    pane.set_selected_product(product.clone());
     pane.overlay_cache_mut(&known::RADAR)
         .show(OverlayTextureData {
             texture: ctx.load_texture("fold", image, egui::TextureOptions::NEAREST),
@@ -1156,7 +1176,7 @@ fn pane_showing_render(
                 nyquist_ms,
                 melting_layer_source,
                 storm_motion,
-                product,
+                product: product.clone(),
                 elevation: 0.5,
             }),
             hit_map: None,
@@ -1210,12 +1230,12 @@ fn only_a_plan_view_of_base_velocity_carries_a_fold_limit() {
     let mut pane = velocity_pane(&ctx, Some(22.14));
     assert_eq!(pane.displayed_nyquist_ms(), Some(22.14));
 
-    for product in [
-        RadarProduct::StormRelativeVelocity,
-        RadarProduct::SpectrumWidth,
-        RadarProduct::Reflectivity,
+    for product in &[
+        radar_fields::known::STORM_RELATIVE_VELOCITY,
+        radar_fields::known::SPECTRUM_WIDTH,
+        radar_fields::known::REFLECTIVITY,
     ] {
-        pane.set_selected_product(product);
+        pane.set_selected_product(product.clone());
         assert_eq!(
             pane.displayed_nyquist_ms(),
             None,
@@ -1223,7 +1243,7 @@ fn only_a_plan_view_of_base_velocity_carries_a_fold_limit() {
         );
     }
 
-    pane.set_selected_product(RadarProduct::Velocity);
+    pane.set_selected_product(radar_fields::known::VELOCITY);
     pane.set_map_render(MapRender::Volume);
     assert_eq!(
         pane.displayed_nyquist_ms(),
@@ -1261,12 +1281,12 @@ fn a_classification_pane_reports_the_layer_its_pixels_stood_on() {
     );
 
     let mut other = classification_pane(&ctx, Some(MeltingLayerSource::FleetDefault));
-    for product in [
-        RadarProduct::Reflectivity,
-        RadarProduct::Velocity,
-        RadarProduct::CorrelationCoefficient,
+    for product in &[
+        radar_fields::known::REFLECTIVITY,
+        radar_fields::known::VELOCITY,
+        radar_fields::known::CORRELATION_COEFFICIENT,
     ] {
-        other.set_selected_product(product);
+        other.set_selected_product(product.clone());
         assert_eq!(
             other.displayed_melting_layer_source(),
             None,
@@ -1331,12 +1351,12 @@ fn a_storm_relative_pane_reports_the_vector_its_pixels_were_shifted_by() {
     }
 
     let mut other = storm_relative_pane(&ctx, Some(StormMotionSource::BunkersRightMover));
-    for product in [
-        RadarProduct::Reflectivity,
-        RadarProduct::Velocity,
-        RadarProduct::HydrometeorClassification,
+    for product in &[
+        radar_fields::known::REFLECTIVITY,
+        radar_fields::known::VELOCITY,
+        radar_fields::known::HYDROMETEOR_CLASSIFICATION,
     ] {
-        other.set_selected_product(product);
+        other.set_selected_product(product.clone());
         assert_eq!(
             other.displayed_storm_motion(),
             None,

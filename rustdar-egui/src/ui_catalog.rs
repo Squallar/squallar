@@ -629,14 +629,9 @@ impl super::Gui {
                 self.panes[idx] = pane;
             }
             None => {
-                // The pane owns this layer's field selection.
-                //
-                // **The typed conversion below is the last of it, and WO-E9e
-                // removes it**: the pane still stores radar's field as a
-                // `RadarProduct`, so a `FieldId` has to be resolved back through
-                // the radar registry to be written. Once the pane's slot holds a
-                // `FieldId`, this arm writes `spec.id` directly and stops naming
-                // any source's type.
+                // The pane owns this layer's field selection, and since
+                // WO-E9e it owns it as a `FieldId`, so the registry's own id
+                // is written straight through with no source type named.
                 if !self.panes[idx].is_map() {
                     self.request_pane_view(idx, rustdar_radar::types::RenderView::PlanView);
                 }
@@ -644,12 +639,10 @@ impl super::Gui {
                     overlays, panes, ..
                 } = self;
                 Self::write_pane_overlay(overlays, idx, &mut panes[idx], owner, true);
-                if let Some(product) = rustdar_radar::fields::product_for(&spec.id) {
-                    let pane = &mut self.panes[idx];
-                    if pane.selected_product() != product {
-                        pane.set_selected_product(product);
-                        pane.set_selected_elevation(0.0);
-                    }
+                let pane = &mut self.panes[idx];
+                if pane.selected_product() != spec.id {
+                    pane.set_selected_product(spec.id.clone());
+                    pane.set_selected_elevation(0.0);
                 }
                 // No fetch rule: radar data arrives through the scan path, not
                 // `FetchOverlay`.
@@ -673,10 +666,7 @@ impl super::Gui {
                 .panes()
                 .iter()
                 .map(|pane| PresetPane {
-                    // WO-E9e removes this projection with the pane's own type.
-                    product: rustdar_radar::fields::spec(pane.selected_product())
-                        .id
-                        .clone(),
+                    product: pane.selected_product(),
                     elevation: finite(pane.selected_elevation()),
                 })
                 .collect(),
@@ -708,8 +698,8 @@ impl super::Gui {
                 // leaves the pane's field as it was — the preserve rule. It is
                 // never substituted for a default, which would silently rewrite
                 // the preset on the next save.
-                if let Some(product) = rustdar_radar::fields::product_for(&pp.product) {
-                    pane.set_selected_product(product);
+                if rustdar_radar::fields::spec_for(&pp.product).is_some() {
+                    pane.set_selected_product(pp.product.clone());
                 }
                 pane.set_selected_elevation(pp.elevation);
             }

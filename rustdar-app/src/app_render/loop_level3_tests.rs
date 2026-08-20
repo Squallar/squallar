@@ -11,6 +11,9 @@ const SITE: &str = "KTLX";
 /// Echo tops: one AWIPS code (`EET`), and the product whose loop this exercises.
 const L3: RadarProduct = RadarProduct::EchoTops;
 const L2: RadarProduct = RadarProduct::Reflectivity;
+/// The same two fields named the way a render target names them.
+const L3_ID: rustdar_source::product::FieldId = rustdar_radar::fields::known::ECHO_TOPS;
+const L2_ID: rustdar_source::product::FieldId = rustdar_radar::fields::known::REFLECTIVITY;
 
 fn ts(minute: u32) -> chrono::NaiveDateTime {
     chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
@@ -100,7 +103,7 @@ fn loop_for(product: RadarProduct, n: u32) -> LayerTimeState {
             render_failed: false,
         })
         .collect();
-    ls.retarget_renders(product, 0.5);
+    ls.retarget_renders(&rustdar_radar::fields::spec(product).id, 0.5);
     ls
 }
 
@@ -278,7 +281,7 @@ fn a_frame_needs_every_one_of_its_products_codes() {
 fn a_level3_frames_sweep_is_its_objects_own_elevation() {
     let mut mgr = LoopDownloadManager::new();
     let code = codes(L3)[0];
-    let tgt = test_keys::key(SITE, L3, 0.5);
+    let tgt = test_keys::key(SITE, &L3_ID, 0.5);
 
     assert!(
         matches!(frame_sweep(&mgr, &tgt, ts(0)), FrameSweep::Pending),
@@ -299,7 +302,7 @@ fn a_gap_makes_its_frame_unrenderable_rather_than_pending() {
     let mut mgr = LoopDownloadManager::new();
     mgr.cache_l3_product(SITE, codes(L3)[0], ts(0), None);
     assert!(matches!(
-        frame_sweep(&mgr, &test_keys::key(SITE, L3, 0.5), ts(0)),
+        frame_sweep(&mgr, &test_keys::key(SITE, &L3_ID, 0.5), ts(0)),
         FrameSweep::Unrenderable
     ));
 }
@@ -310,12 +313,12 @@ fn frame_data_follows_the_targets_own_product() {
     let mut mgr = LoopDownloadManager::new();
     mgr.cache_l3_product(SITE, codes(L3)[0], ts(0), Some(object(0)));
 
-    match frame_data(&mgr, &test_keys::key(SITE, L3, 0.5), ts(0)) {
+    match frame_data(&mgr, &test_keys::key(SITE, &L3_ID, 0.5), ts(0)) {
         Some(LoopFrameData::Products(objects)) => assert_eq!(objects.len(), codes(L3).len()),
         _ => panic!("a Level III target must resolve to its objects"),
     }
     assert!(
-        frame_data(&mgr, &test_keys::key(SITE, L2, 0.5), ts(0)).is_none(),
+        frame_data(&mgr, &test_keys::key(SITE, &L2_ID, 0.5), ts(0)).is_none(),
         "a Level II target reads the volume cache, which holds nothing here",
     );
 }

@@ -47,7 +47,21 @@ use crate::ui::DrawnMenuLeaf;
 use crate::ui_input::{MapPointerFrame, TouchGestures};
 use crate::ui_layout::PointerModality;
 use rustdar_geo::GeoPoint;
+use rustdar_radar::fields as radar_fields;
 use rustdar_source::id::LayerId;
+
+/// The radar layer's own field value for an id.
+///
+/// A [`ScanInfo`](rustdar_radar::types::ScanInfo) is radar's fact about a scan
+/// and its tables are keyed by radar's own field, so these fixtures resolve
+/// ids through the one door instead of naming the layer's type. A macro rather
+/// than a function because the answer's type is the layer's, and a function
+/// would have to write it down.
+macro_rules! resolve {
+    ($id:expr) => {
+        rustdar_radar::fields::product_for($id).expect("a registered field")
+    };
+}
 
 /// Viewport size used by the harness — a landscape desktop-ish window.
 const SCREEN_SIZE: egui::Vec2 = egui::vec2(1024.0, 768.0);
@@ -1319,8 +1333,8 @@ impl InputHarness {
                 .unwrap(),
             vcp_number: 212,
             available_products: vec![
-                rustdar_radar::types::RadarProduct::Reflectivity,
-                rustdar_radar::types::RadarProduct::Velocity,
+                resolve!(&radar_fields::known::REFLECTIVITY),
+                resolve!(&radar_fields::known::VELOCITY),
             ],
             product_elevations: Default::default(),
             status: String::new(),
@@ -1384,7 +1398,7 @@ impl InputHarness {
     pub(crate) fn offer_product(
         &mut self,
         idx: usize,
-        product: rustdar_radar::types::RadarProduct,
+        product: &rustdar_source::product::FieldId,
         elevation: f32,
     ) {
         let pane = self
@@ -1395,12 +1409,15 @@ impl InputHarness {
             .scan_info
             .as_mut()
             .expect("load_scan first: a product is offered on a scan");
-        if !info.available_products.contains(&product) {
-            info.available_products.push(product);
+        let resolved = resolve!(&product);
+        if !info.available_products.contains(&resolved) {
+            info.available_products.push(resolved);
+            // Sorted by the field's own registered order, read from the
+            // registry rather than from a method on the layer's enum.
             info.available_products
-                .sort_by_key(rustdar_radar::types::RadarProduct::sort_order);
+                .sort_by_key(|p| rustdar_radar::fields::spec(*p).sort_order);
         }
-        let angles = info.product_elevations.entry(product).or_default();
+        let angles = info.product_elevations.entry(resolved).or_default();
         if !angles.iter().any(|a| (a - elevation).abs() < 0.05) {
             angles.push(elevation);
             angles.sort_by(|a, b| a.total_cmp(b));
@@ -1413,14 +1430,14 @@ impl InputHarness {
     pub(crate) fn select_product(
         &mut self,
         idx: usize,
-        product: rustdar_radar::types::RadarProduct,
+        product: &rustdar_source::product::FieldId,
     ) {
         let pane = self
             .gui
             .pane_mut(idx)
             .unwrap_or_else(|| panic!("no pane {idx}"));
-        if pane.selected_product() != product {
-            pane.set_selected_product(product);
+        if pane.selected_product() != *product {
+            pane.set_selected_product(product.clone());
             pane.set_selected_elevation(0.0);
         }
         self.warm_up();
@@ -1432,7 +1449,7 @@ impl InputHarness {
     pub(crate) fn place_radar_image(
         &mut self,
         idx: usize,
-        product: rustdar_radar::types::RadarProduct,
+        product: &rustdar_source::product::FieldId,
         elevation: f32,
         nyquist_ms: Option<f64>,
         melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
@@ -1488,7 +1505,7 @@ impl InputHarness {
                 nyquist_ms,
                 melting_layer_source,
                 storm_motion,
-                product,
+                product: product.clone(),
                 elevation,
             }),
             hit_map: None,

@@ -1,9 +1,10 @@
 use super::*;
 use chrono::NaiveDate;
 use rustdar_egui::pane::VolumeStamp;
-use rustdar_radar::types::RadarProduct;
+use rustdar_radar::fields::Id as FieldId;
+use rustdar_radar::fields::known;
 
-fn target(product: RadarProduct, minute: u32) -> VolumeTarget {
+fn target(product: &FieldId, minute: u32) -> VolumeTarget {
     VolumeTarget {
         region: None,
         volume: VolumeStamp {
@@ -13,7 +14,7 @@ fn target(product: RadarProduct, minute: u32) -> VolumeTarget {
                 .and_hms_opt(22, minute, 0)
                 .unwrap(),
         },
-        product,
+        product: product.clone(),
     }
 }
 
@@ -156,7 +157,7 @@ pub(crate) fn ready_grid() -> VolumeEntry {
         half_extent_km: Some(rustdar_radar::voxel::HalfExtentKm::square(40.0)),
         base_km_msl: 0.0,
         top_km_msl: 10.0,
-        product: RadarProduct::Reflectivity,
+        product: rustdar_radar::types::RadarProduct::Reflectivity,
         shape: rustdar_radar::voxel::WASM_SHAPE,
         values_wanted: false,
     };
@@ -173,7 +174,7 @@ pub(crate) fn ready_grid() -> VolumeEntry {
 #[test]
 fn a_build_in_flight_absorbs_every_further_ask_for_its_target() {
     let store = VolumeStore::new();
-    let t = target(RadarProduct::Reflectivity, 0);
+    let t = target(&known::REFLECTIVITY, 0);
 
     assert!(!store.share(0, &t), "the first ask owns the dispatch");
     store.begin_build(0, &t);
@@ -203,7 +204,7 @@ fn a_build_in_flight_absorbs_every_further_ask_for_its_target() {
 #[test]
 fn two_panes_on_one_volume_share_one_build() {
     let store = VolumeStore::new();
-    let t = target(RadarProduct::Reflectivity, 0);
+    let t = target(&known::REFLECTIVITY, 0);
 
     build(&store, 0, &t, "stub");
     assert!(
@@ -231,8 +232,8 @@ fn two_panes_on_one_volume_share_one_build() {
 #[test]
 fn a_pane_joining_a_volume_someone_else_built_drops_what_it_held() {
     let store = VolumeStore::new();
-    let held = target(RadarProduct::Reflectivity, 0);
-    let shared = target(RadarProduct::Velocity, 6);
+    let held = target(&known::REFLECTIVITY, 0);
+    let shared = target(&known::VELOCITY, 6);
 
     build(&store, 0, &held, "held");
     build(&store, 1, &shared, "shared");
@@ -257,8 +258,8 @@ fn a_pane_joining_a_volume_someone_else_built_drops_what_it_held() {
 #[test]
 fn the_old_grid_stands_in_while_its_replacement_builds_and_then_leaves() {
     let store = VolumeStore::new();
-    let first = target(RadarProduct::Reflectivity, 0);
-    let second = target(RadarProduct::Reflectivity, 6);
+    let first = target(&known::REFLECTIVITY, 0);
+    let second = target(&known::REFLECTIVITY, 6);
 
     // A real grid, because only a `Ready` entry may stand in: an old
     // *refusal* painted under a new target's caption would be a stale
@@ -307,13 +308,13 @@ fn an_out_of_scope_grid_never_stands_in() {
     let elsewhere = VolumeTarget {
         volume: VolumeStamp {
             site: "KFWS".to_owned(),
-            ..target(RadarProduct::Reflectivity, 0).volume
+            ..target(&known::REFLECTIVITY, 0).volume
         },
-        ..target(RadarProduct::Reflectivity, 0)
+        ..target(&known::REFLECTIVITY, 0)
     };
-    for other in [target(RadarProduct::Velocity, 0), elsewhere] {
+    for other in [target(&known::VELOCITY, 0), elsewhere] {
         let store = VolumeStore::new();
-        let refl = target(RadarProduct::Reflectivity, 0);
+        let refl = target(&known::REFLECTIVITY, 0);
         assert!(!store.share(0, &refl), "the first ask owns the dispatch");
         store.begin_build(0, &refl);
         assert!(store.complete(&refl, ready_grid()));
@@ -323,7 +324,7 @@ fn an_out_of_scope_grid_never_stands_in() {
         assert!(
             store.lookup_for_pane(0, &other).is_none(),
             "a KTLX reflectivity grid must not stand in for {} at {}",
-            other.product.code(),
+            super::field_code(&other.product),
             other.volume.site,
         );
     }
@@ -349,7 +350,7 @@ fn box_target(half_width_km: f64) -> VolumeTarget {
             )
             .expect("a finite in-range half-width on a real centre is a region"),
         ),
-        ..target(RadarProduct::Reflectivity, 0)
+        ..target(&known::REFLECTIVITY, 0)
     }
 }
 
@@ -452,8 +453,8 @@ fn the_drawn_box_is_the_one_asked_for_and_the_crop_finds_it_in_the_grid() {
 #[test]
 fn a_superseded_builds_reply_is_dropped() {
     let store = VolumeStore::new();
-    let first = target(RadarProduct::Reflectivity, 0);
-    let second = target(RadarProduct::Reflectivity, 6);
+    let first = target(&known::REFLECTIVITY, 0);
+    let second = target(&known::REFLECTIVITY, 6);
 
     assert!(!store.share(0, &first));
     store.begin_build(0, &first);
@@ -475,12 +476,12 @@ fn a_superseded_builds_reply_is_dropped() {
 #[test]
 fn a_released_id_is_never_handed_out_again() {
     let store = VolumeStore::new();
-    let first = target(RadarProduct::Reflectivity, 0);
+    let first = target(&known::REFLECTIVITY, 0);
     build(&store, 0, &first, "a");
     let first_id = store.lookup(&first).expect("stored").id;
     store.release(0);
 
-    let second = target(RadarProduct::Velocity, 0);
+    let second = target(&known::VELOCITY, 0);
     build(&store, 0, &second, "b");
     assert_ne!(
         store.lookup(&second).expect("stored").id,
@@ -1154,9 +1155,7 @@ fn the_store_eviction_actually_bounds() {
     };
     assert!(one > 0, "precondition: a resident grid costs something");
 
-    let targets: Vec<VolumeTarget> = (0..4)
-        .map(|m| target(RadarProduct::Reflectivity, m))
-        .collect();
+    let targets: Vec<VolumeTarget> = (0..4).map(|m| target(&known::REFLECTIVITY, m)).collect();
     for t in &targets {
         assert!(!store.share_held(0, t, Hold::Set), "each target is new");
         store.begin_build_held(0, t, Hold::Set);
@@ -1199,9 +1198,7 @@ fn the_store_eviction_actually_bounds() {
 #[test]
 fn a_set_holder_keeps_its_whole_set_through_a_build_landing() {
     let store = VolumeStore::new();
-    let targets: Vec<VolumeTarget> = (0..3)
-        .map(|m| target(RadarProduct::Reflectivity, m))
-        .collect();
+    let targets: Vec<VolumeTarget> = (0..3).map(|m| target(&known::REFLECTIVITY, m)).collect();
 
     for t in &targets {
         store.begin_build_held(0, t, Hold::Set);
@@ -1242,9 +1239,7 @@ fn a_set_holder_keeps_its_whole_set_through_a_build_landing() {
 #[test]
 fn retain_set_states_the_whole_set_and_release_set_gives_it_all_back() {
     let store = VolumeStore::new();
-    let targets: Vec<VolumeTarget> = (0..3)
-        .map(|m| target(RadarProduct::Reflectivity, m))
-        .collect();
+    let targets: Vec<VolumeTarget> = (0..3).map(|m| target(&known::REFLECTIVITY, m)).collect();
     for t in &targets {
         store.begin_build_held(0, t, Hold::Set);
         assert!(store.complete(t, ready_grid()), "the build resolves");
@@ -1261,7 +1256,7 @@ fn retain_set_states_the_whole_set_and_release_set_gives_it_all_back() {
     // And the exemption that makes `release_set` safe to call for every pane
     // whose loop is not active: a live 3D pane holds one grid, is not a set
     // holder, and must not lose it.
-    let live = target(RadarProduct::Velocity, 9);
+    let live = target(&known::VELOCITY, 9);
     store.begin_build(1, &live);
     assert!(store.complete(&live, ready_grid()), "the build resolves");
     assert_eq!(
@@ -1312,23 +1307,19 @@ fn hidden_holders_names_the_panes_the_layout_dropped_and_their_bytes_go() {
     );
 
     // Pane 0: a *visible* 3D loop holding a set of two.
-    let kept: Vec<VolumeTarget> = (0..2)
-        .map(|m| target(RadarProduct::Reflectivity, m))
-        .collect();
+    let kept: Vec<VolumeTarget> = (0..2).map(|m| target(&known::REFLECTIVITY, m)).collect();
     for t in &kept {
         store.begin_build_held(0, t, Hold::Set);
         assert!(store.complete(t, ready_grid()), "the build resolves");
     }
     // Pane 1: hidden, holding one live grid the ordinary way.
-    let single = target(RadarProduct::Reflectivity, 2);
+    let single = target(&known::REFLECTIVITY, 2);
     store.begin_build(1, &single);
     assert!(store.complete(&single, ready_grid()), "the build resolves");
     // Pane 2: hidden, and a set holder — the case nothing else bounds, because
     // `dispatch_loop_renders` never walks a hidden pane and so never restates
     // its `retain_set`.
-    let stranded: Vec<VolumeTarget> = (3..5)
-        .map(|m| target(RadarProduct::Reflectivity, m))
-        .collect();
+    let stranded: Vec<VolumeTarget> = (3..5).map(|m| target(&known::REFLECTIVITY, m)).collect();
     for t in &stranded {
         store.begin_build_held(2, t, Hold::Set);
         assert!(store.complete(t, ready_grid()), "the build resolves");
@@ -1408,7 +1399,7 @@ fn hidden_holders_names_the_panes_the_layout_dropped_and_their_bytes_go() {
 #[test]
 fn a_hidden_pane_still_marked_a_set_holder_is_named_so_the_mark_goes_too() {
     let store = VolumeStore::new();
-    let t = target(RadarProduct::Reflectivity, 0);
+    let t = target(&known::REFLECTIVITY, 0);
     store.begin_build_held(1, &t, Hold::Set);
     assert!(store.complete(&t, ready_grid()), "the build resolves");
     assert_eq!(store.release_set(1), 1, "the set goes");

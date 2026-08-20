@@ -2,8 +2,9 @@
 //! the state a cross-section or 3D pane needs that a map pane does not.
 
 use chrono::NaiveDateTime;
-use rustdar_radar::types::{RadarProduct, RenderView};
+use rustdar_radar::types::RenderView;
 use rustdar_radar::xsect::CrossSection;
+use rustdar_source::product::FieldId;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -178,7 +179,7 @@ pub struct SectionTarget {
     pub volume: VolumeStamp,
     /// The moment the section was cut from. Not every product is samplable, so
     /// this is narrower than the pane's product picker.
-    pub product: RadarProduct,
+    pub product: FieldId,
     pub line: SectionLine,
     /// The fingerprint of the tilt ladder this cut would be made from, at
     /// dispatch. See the type's docs. `0` when no ladder resolves at all.
@@ -188,7 +189,11 @@ pub struct SectionTarget {
 /// Why a section pane has no picture, when it has none. Every variant is a state
 /// a user can reach without doing anything wrong, and each has a *different*
 /// thing to say. The pane holds at most one, written by whoever refused.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// **No longer `Copy` since WO-E9e**: two variants carry the field they are
+/// about, and a field is a `FieldId` — an open string — rather than a source's
+/// own enum.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SectionUnavailable {
     /// No decoded volume for the pane's site yet — the ordinary startup and
     /// site-switch state.
@@ -206,7 +211,7 @@ pub enum SectionUnavailable {
     /// The pane's product has no vertical structure to slice — the column
     /// integrals, the hybrid-scan composite, the derived velocity fields. See
     /// `rustdar_radar::sampler::samplable`.
-    ProductHasNoVerticalStructure(RadarProduct),
+    ProductHasNoVerticalStructure(FieldId),
     /// The cut was dispatched and answered nothing. Deliberately distinct from
     /// "not yet": a section that will never appear must not look like one that is.
     RenderFailed,
@@ -214,13 +219,13 @@ pub enum SectionUnavailable {
     /// holds the moment, or the derivation refused it. A property of the volume,
     /// not of the product — which is why its staleness key carries the volume
     /// stamp — unlike [`ProductHasNoVerticalStructure`](Self::ProductHasNoVerticalStructure).
-    ProductMissingFromVolume(RadarProduct),
+    ProductMissingFromVolume(FieldId),
 }
 
 impl SectionUnavailable {
     /// One line, addressed to whoever is looking at the empty pane. Says what is
     /// missing and, where the user can do something, what.
-    pub fn message(self) -> String {
+    pub fn message(&self) -> String {
         match self {
             // The cold-start window: a site switch fires the archive fetch
             // immediately, and once any volume lands this is never seen again.
@@ -243,14 +248,14 @@ impl SectionUnavailable {
             Self::ProductHasNoVerticalStructure(product) => format!(
                 "{} has no vertical structure to slice - pick a moment the radar measures \
                  tilt by tilt",
-                product.name()
+                crate::field_facts::name(product)
             ),
             Self::RenderFailed => "The cross-section could not be cut from this volume".to_owned(),
             Self::ProductMissingFromVolume(product) => format!(
                 "This volume carries no {} to cut - the section appears as soon as one \
                  that does arrives. Storm-relative velocity also needs a motion vector, from \
                  the volume's own winds or the override.",
-                product.name()
+                crate::field_facts::name(product)
             ),
         }
     }
@@ -310,7 +315,7 @@ impl std::fmt::Debug for CrossSectionPane {
 #[derive(Clone, Debug, PartialEq)]
 pub struct VolumeTarget {
     pub volume: VolumeStamp,
-    pub product: RadarProduct,
+    pub product: FieldId,
     /// The ground to resample, or `None` for the default box about the site.
     pub region: Option<VolumeRegion>,
 }

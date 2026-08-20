@@ -149,7 +149,7 @@ fn aim(app: &mut crate::app::App, product: RadarProduct, elevation: f32) {
     {
         let pane = app.gui.pane_mut(0).expect("pane exists");
         pane.set_site(SITE.to_string());
-        pane.set_selected_product(product);
+        pane.set_selected_product(rustdar_radar::fields::spec(product).id.clone());
         pane.set_selected_elevation(elevation);
     }
     app.gui

@@ -87,7 +87,7 @@ impl Gui {
             // The copy arrives with configs but no state: a slot's
             // state is derived, never shared between panes.
             p.adopt_layers(&active_layers);
-            p.set_selected_product(active_selected_product);
+            p.set_selected_product(active_selected_product.clone());
             p.set_selected_elevation(active_selected_elevation);
             // This is the second way a pane's enabled map changes, and it is the
             // one that bypasses `write_pane_overlay` entirely: the map arrives

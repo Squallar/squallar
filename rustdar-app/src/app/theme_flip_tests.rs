@@ -3,7 +3,7 @@
 use crate::platform_double::TestBridge;
 use crate::render_dispatch::CachedRenderOutput;
 use crate::render_key::RenderKey;
-use rustdar_radar::types::{RadarProduct, RenderView};
+use rustdar_radar::types::RenderView;
 use std::sync::Arc;
 
 use super::tests::headless;
@@ -14,7 +14,7 @@ fn a_radar_entry() -> (RenderKey, CachedRenderOutput) {
     (
         crate::render_key::render_cache_key(
             "KTLX",
-            RadarProduct::Reflectivity,
+            &rustdar_radar::fields::known::REFLECTIVITY,
             RenderView::PlanView,
             0.5,
         ),

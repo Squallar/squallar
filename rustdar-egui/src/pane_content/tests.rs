@@ -1,4 +1,5 @@
 use super::*;
+use rustdar_radar::fields as radar_fields;
 
 fn point(lat: f64, lon: f64) -> GeoPoint {
     GeoPoint { lat, lon }
@@ -199,7 +200,7 @@ fn a_section_pane_drops_its_texture_and_keeps_its_cut() {
                 .and_hms_opt(18, 42, 0)
                 .expect("a real time"),
         },
-        product: RadarProduct::Reflectivity,
+        product: radar_fields::known::REFLECTIVITY,
         line,
         ladder: 11,
     };
@@ -288,7 +289,7 @@ fn a_section_target_goes_stale_when_the_volume_does() {
             site: site.to_owned(),
             collected: at(minute),
         },
-        product: RadarProduct::Reflectivity,
+        product: radar_fields::known::REFLECTIVITY,
         line,
         ladder,
     };

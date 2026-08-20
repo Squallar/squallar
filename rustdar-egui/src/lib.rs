@@ -1,4 +1,5 @@
 pub mod actions;
+pub(crate) mod field_facts;
 pub(crate) mod legend_ramp;
 pub mod overlay_cache;
 pub mod pane;

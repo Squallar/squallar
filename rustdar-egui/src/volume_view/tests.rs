@@ -1,4 +1,5 @@
 use super::*;
+use rustdar_radar::fields as radar_fields;
 
 const BOX_KM: [f32; 3] = [240.0, 240.0, 18.0];
 
@@ -275,7 +276,7 @@ fn the_stub_payload_is_the_kind_egui_wgpu_discards_in_silence() {
                     .and_hms_opt(22, 0, 0)
                     .unwrap(),
             },
-            product: rustdar_radar::types::RadarProduct::Reflectivity,
+            product: radar_fields::known::REFLECTIVITY,
         },
         camera: OrbitCamera::default(),
         size_px: [800, 600],

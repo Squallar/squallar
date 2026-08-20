@@ -6,7 +6,7 @@ use rustdar_device_profile::constants::MAX_RENDER_CACHE_ENTRIES;
 fn key(site: &str, elevation_tenths: i32) -> RenderKey {
     render_cache_key(
         site,
-        RadarProduct::Reflectivity,
+        &rustdar_radar::fields::known::REFLECTIVITY,
         RenderView::PlanView,
         elevation_tenths as f32 / 10.0,
     )

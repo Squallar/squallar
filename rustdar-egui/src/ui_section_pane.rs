@@ -3,8 +3,8 @@
 use crate::pane::PaneState;
 use rustdar_radar::beam;
 use rustdar_radar::sampler::SampleStatus;
-use rustdar_radar::types::RadarProduct;
 use rustdar_radar::xsect::{CrossSection, SECTION_HEIGHT, SECTION_WIDTH, SectionAxes};
+use rustdar_source::product::FieldId;
 use rustdar_units::UserPreferences;
 
 /// Width of the height-axis gutter, in points.
@@ -61,7 +61,7 @@ pub(super) fn render_cross_section(
         };
         (state, line)
     };
-    let unavailable = state.unavailable;
+    let unavailable = state.unavailable.clone();
     let detail_open = state.detail_open;
     let live = (state.section.clone(), state.texture.clone());
     let live_collected = state.rendered_for.as_ref().map(|t| t.volume.collected);
@@ -82,7 +82,7 @@ pub(super) fn render_cross_section(
         )
     } else {
         let (Some(section), Some(texture)) = live else {
-            let message = state.unavailable.map_or_else(
+            let message = state.unavailable.as_ref().map_or_else(
                 || "Cutting the cross-section...".to_owned(),
                 |u| u.message(),
             );
@@ -106,7 +106,7 @@ pub(super) fn render_cross_section(
         horizontal_color_scale,
         caption_lines(
             &axes,
-            product,
+            &product,
             collected,
             ladder,
             unavailable,
@@ -213,7 +213,7 @@ pub(super) fn render_cross_section(
             section,
             &layout,
             pos,
-            product,
+            &product,
             site.map(|(lat, lon)| SectionSource {
                 ladder,
                 line,
@@ -663,7 +663,7 @@ struct CaptionLine {
 #[allow(clippy::too_many_arguments)]
 fn caption_lines(
     axes: &SectionAxes,
-    product: RadarProduct,
+    product: &FieldId,
     collected: Option<chrono::NaiveDateTime>,
     ladder: Ladder<'_>,
     unavailable: Option<crate::pane::SectionUnavailable>,
@@ -688,7 +688,7 @@ fn caption_lines(
             format!(
                 "{} - no tilts: this volume carried none of this product, so \
                  nothing below was measured{stamp}",
-                product.name(),
+                crate::field_facts::name(product),
             ),
             visuals.error_fg_color,
         ),
@@ -696,14 +696,14 @@ fn caption_lines(
             format!(
                 "{} - one tilt: a single scanned surface, not a vertical \
                  profile{stamp}",
-                product.name(),
+                crate::field_facts::name(product),
             ),
             calm,
         ),
         rungs => (
             format!(
                 "{} - {rungs} tilts to {:.1}\u{b0}{stamp}",
-                product.name(),
+                crate::field_facts::name(product),
                 axes.top_tilt_deg,
             ),
             calm,
@@ -885,7 +885,7 @@ fn hover_readout(
     section: &CrossSection,
     layout: &SectionLayout,
     pos: egui::Pos2,
-    product: RadarProduct,
+    product: &FieldId,
     source: Option<SectionSource<'_>>,
     prefs: &UserPreferences,
 ) -> Option<String> {
@@ -904,7 +904,7 @@ fn hover_readout(
     let height_shown = prefs.height.convert_km_to_kilo(height_km);
 
     let value = match sample.value() {
-        Some(value) => product.format_value(value, prefs),
+        Some(value) => crate::field_facts::format_value(product, value, prefs),
         None => describe_missing(sample.status(), ladder_reaches_pattern_top(axes)).to_owned(),
     };
     let from = source.map_or_else(String::new, |source| {

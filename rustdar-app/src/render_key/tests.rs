@@ -8,7 +8,7 @@ use std::collections::HashMap;
 fn plan_key(site: &str, elevation: f32) -> RenderKey {
     render_cache_key(
         site,
-        RadarProduct::Reflectivity,
+        &rustdar_radar::fields::known::REFLECTIVITY,
         RenderView::PlanView,
         elevation,
     )
@@ -81,9 +81,11 @@ fn the_elevation_part_is_present_exactly_when_the_tilt_selects_the_picture() {
     let mut absent = 0usize;
 
     for &view in RenderView::all() {
-        for &product in RadarProduct::all() {
+        for product in rustdar_radar::fields::known::ALL.iter() {
             let key = render_cache_key("KTLX", product, view, 1.5);
-            let expected = view.elevation_selects_picture(product);
+            let expected = view.elevation_selects_picture(
+                rustdar_radar::fields::product_for(product).expect("a registered field"),
+            );
             assert_eq!(
                 key.select.elevation_tenths.is_some(),
                 expected,

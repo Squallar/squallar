@@ -18,7 +18,7 @@ fn ts(minute: u32) -> chrono::NaiveDateTime {
 }
 
 fn target(site: &str, elevation: f32) -> RenderTarget {
-    test_keys::key(site, RadarProduct::Reflectivity, elevation)
+    test_keys::key(site, &rustdar_radar::fields::known::REFLECTIVITY, elevation)
 }
 
 pub(super) fn scan_with_sweeps(elevations: &[f32]) -> Arc<Scan> {
@@ -100,7 +100,7 @@ fn loop_on(ctx: &egui::Context, site: &'static str, textured: &[usize]) -> Layer
             render_failed: false,
         })
         .collect();
-    ls.retarget_renders(RadarProduct::Reflectivity, 0.5);
+    ls.retarget_renders(&rustdar_radar::fields::known::REFLECTIVITY, 0.5);
     for &i in textured {
         let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
         ls.frames[i].image = Some(rustdar_egui::pane::LoopFrameImage::PlanView(
@@ -242,7 +242,7 @@ fn suppression_and_acceptance_weigh_the_same_sweep() {
 #[test]
 fn a_queued_render_for_another_product_suppresses_nothing() {
     let q = [queued(target("KTLX", 0.5), ts(0), 0.48)];
-    let velocity = test_keys::key("KTLX", RadarProduct::Velocity, 0.5);
+    let velocity = test_keys::key("KTLX", &rustdar_radar::fields::known::VELOCITY, 0.5);
     assert!(!render_already_queued(q.iter(), ts(0), &velocity, 0.48));
 }
 
@@ -697,12 +697,24 @@ fn the_receivers_sweep_comes_from_the_receivers_own_scan() {
     let koun = loop_on(&ctx, "KOUN", &[]);
 
     assert_eq!(
-        own_sweep(&mgr, &ktlx, ts(0), RadarProduct::Reflectivity, 0.5),
+        own_sweep(
+            &mgr,
+            &ktlx,
+            ts(0),
+            rustdar_radar::fields::known::REFLECTIVITY,
+            0.5
+        ),
         Some(0.5),
         "KTLX's scan carries the selected sweep"
     );
     assert_eq!(
-        own_sweep(&mgr, &koun, ts(0), RadarProduct::Reflectivity, 0.5),
+        own_sweep(
+            &mgr,
+            &koun,
+            ts(0),
+            rustdar_radar::fields::known::REFLECTIVITY,
+            0.5
+        ),
         Some(1.4),
         "KOUN's own scan snaps the same selection somewhere else"
     );
@@ -747,14 +759,26 @@ fn a_receiver_with_nothing_to_compare_reports_no_sweep() {
     let ktlx = loop_on(&ctx, "KTLX", &[]);
 
     assert_eq!(
-        own_sweep(&mgr, &ktlx, ts(0), RadarProduct::Reflectivity, 0.5),
+        own_sweep(
+            &mgr,
+            &ktlx,
+            ts(0),
+            rustdar_radar::fields::known::REFLECTIVITY,
+            0.5
+        ),
         None,
         "nothing downloaded for this frame yet"
     );
 
     mgr.cache_scan("KTLX", ts(0), volume_with_sweeps(&[0.5]));
     assert_eq!(
-        own_sweep(&mgr, &ktlx, ts(0), RadarProduct::Velocity, 0.5),
+        own_sweep(
+            &mgr,
+            &ktlx,
+            ts(0),
+            rustdar_radar::fields::known::VELOCITY,
+            0.5
+        ),
         None,
         "the scan carries no sweep for this product"
     );
@@ -981,7 +1005,7 @@ fn hovering_a_looping_pane_reads_a_value_out_of_the_frames_own_volume() {
 
     let mut rr = response(
         ts(0),
-        test_keys::key("KTLX", RadarProduct::Reflectivity, 0.5),
+        test_keys::key("KTLX", &rustdar_radar::fields::known::REFLECTIVITY, 0.5),
     );
     rr.site_lat = lat;
     rr.site_lon = lon;

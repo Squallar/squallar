@@ -47,7 +47,7 @@ pub(crate) fn editor_ui(
 ) {
     // The field's registered facts, read once: this file names no product
     // type at all now, only what the registry says about the pane's field.
-    let facts = rustdar_radar::fields::spec(pane.selected_product());
+    let facts = crate::field_facts::facts(&pane.selected_product());
     let Some(volume) = pane.volume_mut() else {
         return;
     };

@@ -344,7 +344,7 @@ fn the_catalogue_landing_draws_the_volume_the_launch_could_not_place() {
     {
         let pane = app.gui.pane_mut(0).expect("a pane exists");
         pane.set_site(BLIND.to_string());
-        pane.set_selected_product(rustdar_radar::types::RadarProduct::Reflectivity);
+        pane.set_selected_product(rustdar_radar::fields::known::REFLECTIVITY);
         pane.set_selected_elevation(0.5);
     }
     app.gui

@@ -110,7 +110,10 @@ fn a_landed_sounding_routes_into_hail_renders_and_a_moved_pair_drops_them() {
     );
     assert_eq!(
         d.pane_render[0].last_rendered,
-        Some((RadarProduct::ProbabilityOfSevereHail, 0.5)),
+        Some((
+            rustdar_radar::types::RadarProduct::ProbabilityOfSevereHail,
+            0.5
+        )),
     );
 
     assert!(
@@ -119,7 +122,10 @@ fn a_landed_sounding_routes_into_hail_renders_and_a_moved_pair_drops_them() {
     );
     assert_eq!(
         d.pane_render[0].last_rendered,
-        Some((RadarProduct::ProbabilityOfSevereHail, 0.5)),
+        Some((
+            rustdar_radar::types::RadarProduct::ProbabilityOfSevereHail,
+            0.5
+        )),
         "another site's sounding must not touch this pane",
     );
 
@@ -397,7 +403,7 @@ fn gui_on_tilt(
     let mut gui = rustdar_egui::Gui::new();
     let pane = gui.pane_mut(0).expect("a fresh Gui has one pane");
     pane.set_site(site.to_string());
-    pane.set_selected_product(product);
+    pane.set_selected_product(rustdar_radar::fields::spec(product).id.clone());
     pane.set_selected_elevation(selected);
     let mut product_elevations = std::collections::HashMap::new();
     product_elevations.insert(product, available.to_vec());
@@ -852,7 +858,10 @@ fn a_landed_melting_layer_drops_the_classification_renders_that_missed_it() {
     );
     assert_eq!(
         d.pane_render[0].last_rendered,
-        Some((RadarProduct::HydrometeorClassification, 0.5)),
+        Some((
+            rustdar_radar::types::RadarProduct::HydrometeorClassification,
+            0.5
+        )),
     );
 
     // The next volume's object is, and the cache moves with it.

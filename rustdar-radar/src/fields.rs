@@ -17,6 +17,11 @@ use std::sync::LazyLock;
 
 use rustdar_source::product::{FieldId, ProductSpec};
 
+/// The substrate's field vocabulary, re-exported so a consumer that already
+/// depends on this crate can name a field without taking a second dependency
+/// — the same courtesy `palette` does for `LegendScale`.
+pub use rustdar_source::product::{FieldId as Id, ProductSpec as Spec};
+
 use crate::product_spec::spec as row;
 use crate::types::RadarProduct;
 use crate::voxel::IsoShape;
@@ -84,6 +89,33 @@ pub fn product_for(id: &FieldId) -> Option<RadarProduct> {
         .iter()
         .copied()
         .find(|&p| spec(p).id == *id)
+}
+
+/// The registration `id` names, or `None` for an id this crate does not
+/// register.
+///
+/// The by-id twin of [`spec`], for a caller that holds a field's open-string
+/// identity rather than the enum — which, after WO-E9e, is every caller
+/// outside this crate.
+pub fn spec_for(id: &FieldId) -> Option<&'static ProductSpec> {
+    product_for(id).map(spec)
+}
+
+/// The readout line the UI prints for one sampled value of `id`.
+///
+/// **A door, not a second table.** The string is
+/// [`RadarProduct::format_value`]'s, unchanged: the per-field prefixes
+/// ("Corr. Coefficient", "KDP", "POSH"), the per-field precision and the
+/// hydrometeor class names are this crate's vocabulary, and none of them is
+/// derivable from a [`ProductSpec`] as it stands — `quantity` carries the unit
+/// and its preference conversion, not the label a readout is titled with. So
+/// the caller stops naming the enum and the bytes it prints do not move.
+pub fn format_value(
+    id: &FieldId,
+    value: f32,
+    prefs: &rustdar_units::UserPreferences,
+) -> Option<String> {
+    product_for(id).map(|p| p.format_value(value, prefs))
 }
 
 #[cfg(test)]

@@ -24,7 +24,6 @@ pub const UI_CONFIG_KEY: &str = "ui";
 pub const UI_CONFIG_BACKUP_KEY: &str = "ui.v2.backup";
 
 use rustdar_overlays::spc::outlook::OutlookDay;
-use rustdar_radar::types::RadarProduct;
 use rustdar_source::id::{LayerId, known};
 use rustdar_source::product::FieldId;
 use rustdar_units::UserPreferences;
@@ -40,6 +39,7 @@ use crate::pane::{
 };
 use crate::ui_layout::WidthClass;
 use rustdar_geo::GeoPoint;
+use rustdar_radar::fields as radar_fields;
 
 /// Serializable per-pane state persisted across sessions.
 #[derive(Serialize, Deserialize)]
@@ -270,10 +270,10 @@ impl PaneConfig {
 
     /// This pane's radar product, read through [`product_or_default`] — the
     /// one tolerant path, unchanged by the move into the slot.
-    fn selected_product(&self) -> RadarProduct {
+    fn selected_product(&self) -> FieldId {
         self.radar_member("product")
             .and_then(|v| product_or_default(v).ok())
-            .unwrap_or(RadarProduct::Reflectivity)
+            .unwrap_or(radar_fields::known::REFLECTIVITY)
     }
 
     /// This pane's elevation angle in degrees.
@@ -579,15 +579,15 @@ fn resolve_field_alias(aliases: &[(&str, &str)], id: FieldId) -> FieldId {
 
 /// The order the two volume-editor tables are written to disk in.
 ///
-/// **Byte-compatible with what it replaces**: the sort was `product.code()`
+/// **Byte-compatible with what it replaces**: the sort was `crate::field_facts::code(&product)`
 /// and it still is for every field this build registers, so a file with no
 /// unknown ids is written in exactly the same order it always was. A field
 /// this build does **not** register has no code to sort by; those entries sort
 /// last, by their id, so the file stays deterministic instead of depending on
 /// a `HashMap`'s per-process seed.
 fn save_order_key(field: &FieldId) -> (bool, String) {
-    match rustdar_radar::fields::product_for(field) {
-        Some(product) => (false, product.code().to_owned()),
+    match rustdar_radar::fields::spec_for(field) {
+        Some(spec) => (false, spec.code.to_owned()),
         None => (true, field.as_str().to_owned()),
     }
 }
@@ -598,7 +598,7 @@ struct VolumeIsoConfig {
     /// **The on-disk key and its spelling are unchanged.** `FieldId` is
     /// `#[serde(transparent)]` and the radar crate registers each field under
     /// the product enum's own serde spelling, so this member reads and writes
-    /// exactly the bytes it did when it was a `RadarProduct`.
+    /// exactly the bytes it did when it was a source enum.
     ///
     /// No longer dropped when this build does not know the name: under the
     /// open-id doctrine an unrecognised id is preserved inert (it applies to
@@ -623,22 +623,37 @@ struct VolumeAlphaConfig {
     alpha: Vec<u8>,
 }
 
-/// Deserialize a [`RadarProduct`], falling back to the default product when
-/// the name is unknown.
-pub(crate) fn product_or_default<'de, D>(deserializer: D) -> Result<RadarProduct, D::Error>
+/// Deserialize a pane's selected [`FieldId`], falling back to the default
+/// field when this build does not register the name on disk.
+///
+/// **The fallback is what a *selection* needs and what the iso/alpha tables
+/// deliberately do not do.** A curve saved for an unknown field is preserved
+/// inert because it applies to nothing; a pane's selection has to name a field
+/// this build can actually draw, or the pane has no picture at all.
+///
+/// **The id that comes back is always the registry's own `&'static` spelling**,
+/// not the bytes off the disk: `spec_for` resolves it and its `id` is cloned,
+/// so a pane's field is a borrowed `Cow` and reading it costs no allocation on
+/// the frame path. `the_loaded_field_is_the_registrys_own_static_spelling`
+/// is the pin.
+pub(crate) fn product_or_default<'de, D>(deserializer: D) -> Result<FieldId, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let value = serde_json::Value::deserialize(deserializer)?;
-    match RadarProduct::deserialize(&value) {
-        Ok(product) => Ok(product),
-        Err(_) => {
+    let named = FieldId::deserialize(&value).ok();
+    match named
+        .as_ref()
+        .and_then(|id| rustdar_radar::fields::spec_for(id))
+    {
+        Some(spec) => Ok(spec.id.clone()),
+        None => {
             log::warn!(
                 "config names a product this build does not know ({value}); \
                  falling back to {}",
-                RadarProduct::Reflectivity.name(),
+                crate::field_facts::name(&radar_fields::known::REFLECTIVITY),
             );
-            Ok(RadarProduct::Reflectivity)
+            Ok(radar_fields::known::REFLECTIVITY)
         }
     }
 }

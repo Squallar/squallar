@@ -118,7 +118,7 @@ fn app_showing_site() -> crate::app::App {
     {
         let pane = app.gui.pane_mut(0).unwrap();
         pane.set_site(SITE.to_string());
-        pane.set_selected_product(RadarProduct::NormalizedRotation);
+        pane.set_selected_product(rustdar_radar::fields::known::NORMALIZED_ROTATION);
         pane.set_selected_elevation(0.5);
     }
     app.gui
@@ -189,7 +189,7 @@ fn a_plan_view_and_a_section_of_one_sweep_fold_at_the_same_speed() {
     {
         let pane = app.gui.pane_mut(0).unwrap();
         pane.set_kind(rustdar_egui::pane::PaneKind::CrossSection);
-        pane.set_selected_product(RadarProduct::NormalizedRotation);
+        pane.set_selected_product(rustdar_radar::fields::known::NORMALIZED_ROTATION);
         pane.cross_section_mut().unwrap().line = Some(
             rustdar_egui::pane::SectionLine::new(
                 rustdar_geo::GeoPoint {
@@ -253,7 +253,7 @@ fn a_loop_frame_and_the_still_frame_beside_it_fold_at_the_same_speed() {
 
     let site = rustdar_radar::sites::get_radar_site(SITE).expect("KTLX is a real radar");
     let params = crate::render_dispatch::RenderParams {
-        product: RadarProduct::NormalizedRotation,
+        product: rustdar_radar::types::RadarProduct::NormalizedRotation,
         elevation: 0.5,
         lat: site.lat,
         lon: site.lon,
@@ -270,7 +270,7 @@ fn a_loop_frame_and_the_still_frame_beside_it_fold_at_the_same_speed() {
             params,
             rustdar_egui::pane::RenderTarget {
                 site: SITE.to_string(),
-                product: RadarProduct::NormalizedRotation,
+                product: rustdar_radar::fields::known::NORMALIZED_ROTATION,
                 elevation: 0.5,
             },
         ),

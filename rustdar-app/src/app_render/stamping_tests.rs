@@ -6,6 +6,8 @@ use rustdar_radar::types::{RadarProduct, ScanInfo};
 
 pub(super) const SITE: &str = "KMPX";
 const PRODUCT: RadarProduct = RadarProduct::EchoTops;
+/// The same field named the way a pane and a render key name it.
+const PRODUCT_ID: rustdar_source::product::FieldId = rustdar_radar::fields::known::ECHO_TOPS;
 
 pub(super) fn tilt(elevation_tenths: i16, key: &str) -> Level3Product {
     Level3Product {
@@ -195,7 +197,7 @@ fn a_placed_render_describes_what_it_depicts() {
     app.gui
         .pane_mut(0)
         .unwrap()
-        .set_selected_product(RadarProduct::Reflectivity);
+        .set_selected_product(rustdar_radar::fields::known::REFLECTIVITY);
     app.apply_render_to_pane(
         &ctx,
         0,
@@ -204,12 +206,15 @@ fn a_placed_render_describes_what_it_depicts() {
     );
     assert_eq!(
         app.gui.pane(0).unwrap().stale_image_on_screen(),
-        Some((PRODUCT, 0.5)),
+        Some((PRODUCT_ID, 0.5)),
         "the placed image's own product and sweep, reported so the pane can \
              say the label is ahead of the pixels",
     );
 
-    app.gui.pane_mut(0).unwrap().set_selected_product(PRODUCT);
+    app.gui
+        .pane_mut(0)
+        .unwrap()
+        .set_selected_product(PRODUCT_ID);
     assert_eq!(
         app.gui.pane(0).unwrap().stale_image_on_screen(),
         None,
@@ -232,7 +237,7 @@ fn a_placed_render_describes_what_it_depicts() {
     app.deliver_held_rasters();
     assert_eq!(
         app.gui.pane(0).unwrap().stale_image_on_screen(),
-        Some((RadarProduct::Reflectivity, 0.5)),
+        Some((rustdar_radar::fields::known::REFLECTIVITY, 0.5)),
     );
 }
 
@@ -331,7 +336,7 @@ fn a_resumed_velocity_pane_annotates_the_fold_again() {
     app.gui
         .pane_mut(0)
         .unwrap()
-        .set_selected_product(RadarProduct::Velocity);
+        .set_selected_product(rustdar_radar::fields::known::VELOCITY);
 
     let render = CachedPaneRender {
         nyquist_ms: Some(26.42),

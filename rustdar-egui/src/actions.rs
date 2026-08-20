@@ -200,7 +200,7 @@ impl std::fmt::Display for GuiAction {
                 write!(
                     f,
                     "Prepare {} volume for pane {} from {} at {}",
-                    target.product.code(),
+                    crate::field_facts::code(&target.product),
                     pane_idx,
                     target.volume.site,
                     target.volume.collected,

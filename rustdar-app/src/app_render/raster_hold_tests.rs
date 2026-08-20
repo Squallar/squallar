@@ -25,7 +25,7 @@ fn point_at(app: &mut crate::app::App, pane_idx: usize) {
     product_elevations.insert(RadarProduct::Reflectivity, vec![TILT]);
     let pane = app.gui.pane_mut(pane_idx).expect("pane exists");
     pane.set_site(SITE.to_string());
-    pane.set_selected_product(RadarProduct::Reflectivity);
+    pane.set_selected_product(rustdar_radar::fields::known::REFLECTIVITY);
     pane.set_selected_elevation(TILT);
     app.gui
         .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForPane {
@@ -59,7 +59,7 @@ fn render_of(image: Arc<egui::ColorImage>) -> crate::render_dispatch::CachedPane
         image,
         max_range_km: 230.0,
         hover: Arc::new(rustdar_radar::hover::HoverSource::empty()),
-        product: RadarProduct::Reflectivity,
+        product: rustdar_radar::types::RadarProduct::Reflectivity,
         elevation: TILT,
         nyquist_ms: None,
         melting_layer_source: None,

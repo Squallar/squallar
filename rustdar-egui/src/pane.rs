@@ -2,14 +2,17 @@ use crate::overlay_cache::OverlayTextureCache;
 use chrono::NaiveDateTime;
 use rustdar_device_profile::budget::MAX_PANES_DESKTOP;
 use rustdar_radar::hover::HoverSource;
-use rustdar_radar::types::{RadarProduct, RenderView, ScanInfo};
+use rustdar_radar::types::{RenderView, ScanInfo};
 use rustdar_source::handler::{PaneMut, PaneRef};
 use rustdar_source::id::{LayerId, known};
+use rustdar_source::product::FieldId;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 use walkers::MapMemory;
 
+use crate::field_facts::elevation_selects_picture;
+use rustdar_radar::fields as radar_fields;
 #[path = "pane_content.rs"]
 mod content;
 
@@ -164,16 +167,16 @@ pub fn elevation_tenths(elevation: f32) -> i32 {
 pub struct RenderTarget {
     /// NEXRAD site code supplying the projection geometry (e.g. "KTLX").
     pub site: String,
-    pub product: RadarProduct,
+    pub product: FieldId,
     /// The pane's *selected* elevation, not the per-scan snapped sweep angle.
     pub elevation: f32,
 }
 
 impl RenderTarget {
-    pub fn new(site: impl Into<String>, product: RadarProduct, elevation: f32) -> Self {
+    pub fn new(site: impl Into<String>, product: &FieldId, elevation: f32) -> Self {
         Self {
             site: site.into(),
-            product,
+            product: product.clone(),
             elevation,
         }
     }
@@ -189,18 +192,18 @@ impl RenderTarget {
     pub fn matches_parts(
         &self,
         site: &str,
-        product: RadarProduct,
+        product: &FieldId,
         elevation: f32,
         view: RenderView,
     ) -> bool {
         self.site == site
-            && self.product == product
-            && (!view.elevation_selects_picture(product)
+            && self.product == *product
+            && (!elevation_selects_picture(view, product)
                 || elevation_tenths(self.elevation) == elevation_tenths(elevation))
     }
 
     pub fn matches(&self, other: &RenderTarget, view: RenderView) -> bool {
-        self.matches_parts(&other.site, other.product, other.elevation, view)
+        self.matches_parts(&other.site, &other.product, other.elevation, view)
     }
 }
 
@@ -680,7 +683,7 @@ pub struct PaneState {
     /// When the data behind this pane's current radar image was collected (UTC).
     pub data_time: Option<NaiveDateTime>,
     /// Private since WO-E6b — see [`Self::site`].
-    selected_product: RadarProduct,
+    selected_product: FieldId,
     /// Private since WO-E6b — see [`Self::site`].
     selected_elevation: f32,
     /// **Whether this pane's *selection* follows live data** — which sites
@@ -1052,14 +1055,14 @@ impl LayerTimeState {
     /// Point the loop's frame renders at `product`/`elevation`, discarding every
     /// frame's render state if that differs from what the frames were last rendered
     /// for. Returns `true` if frames were invalidated.
-    pub fn retarget_renders(&mut self, product: RadarProduct, elevation: f32) -> bool {
+    pub fn retarget_renders(&mut self, product: &FieldId, elevation: f32) -> bool {
         self.retarget_renders_for(product, elevation, None)
     }
 
     /// [`Self::retarget_renders`] including the section half of the key.
     pub fn retarget_renders_for(
         &mut self,
-        product: RadarProduct,
+        product: &FieldId,
         elevation: f32,
         section: Option<SectionLoopKey>,
     ) -> bool {
@@ -1069,7 +1072,7 @@ impl LayerTimeState {
     /// [`Self::retarget_renders`] including whichever view half this loop has.
     pub fn retarget_renders_keyed(
         &mut self,
-        product: RadarProduct,
+        product: &FieldId,
         elevation: f32,
         key: Option<LoopViewKey>,
     ) -> bool {
@@ -1214,13 +1217,20 @@ impl PaneState {
         self.site = site;
     }
 
-    /// The radar product this pane has selected.
-    pub fn selected_product(&self) -> RadarProduct {
-        self.selected_product
+    /// The radar field this pane has selected.
+    ///
+    /// **By value, and that costs nothing**: a pane's field is always the
+    /// registry's own `&'static` spelling — the constructor starts there, and
+    /// [`crate::ui_config::product_or_default`] resolves whatever is on disk
+    /// back to it — so the `Cow` inside is always borrowed and the clone is a
+    /// pointer copy. Returning it owned is what keeps the hundred-odd callers
+    /// free of a borrow of the pane they are usually about to write to.
+    pub fn selected_product(&self) -> FieldId {
+        self.selected_product.clone()
     }
 
     /// Set the selected radar product. Plain assignment — see [`Self::site`].
-    pub fn set_selected_product(&mut self, product: RadarProduct) {
+    pub fn set_selected_product(&mut self, product: FieldId) {
         self.selected_product = product;
     }
 
@@ -1245,7 +1255,7 @@ impl PaneState {
             site,
             scan_info: None,
             data_time: None,
-            selected_product: RadarProduct::Reflectivity,
+            selected_product: radar_fields::known::REFLECTIVITY,
             selected_elevation: 0.0,
             viewing_live: true,
             time_link: true,
@@ -1462,7 +1472,7 @@ impl PaneState {
     /// What the radar image on screen depicts, **when that is not what this pane
     /// has selected** — the product and sweep the pixels really are, so a caller
     /// can say so.
-    pub fn stale_image_on_screen(&self) -> Option<(RadarProduct, f32)> {
+    pub fn stale_image_on_screen(&self) -> Option<(FieldId, f32)> {
         if self.loop_state().is_active() {
             return None;
         }
@@ -1481,7 +1491,7 @@ impl PaneState {
             // against, so the product alone decides.
             None => meta.product == self.selected_product(),
         };
-        (!matches_selection).then_some((meta.product, meta.elevation))
+        (!matches_selection).then_some((meta.product.clone(), meta.elevation))
     }
 
     /// Where the picture **on the glass** folds, m/s — the Nyquist velocity
@@ -1491,7 +1501,7 @@ impl PaneState {
     /// `rustdar_radar::nyquist`), so past ±Vny the sign wraps. A TDWR always
     /// answers `None`: it declares `nyquist_velocity = 0` on every cut.
     pub fn displayed_nyquist_ms(&self) -> Option<f64> {
-        if self.selected_product() != RadarProduct::Velocity || !self.is_map() {
+        if self.selected_product() != radar_fields::known::VELOCITY || !self.is_map() {
             return None;
         }
         if self.loop_state().is_active() {
@@ -1513,7 +1523,9 @@ impl PaneState {
     /// Where the melting layer behind the classification **on screen** came
     /// from, or `None` when the picture is not a classification.
     pub fn displayed_melting_layer_source(&self) -> Option<rustdar_radar::hca::MeltingLayerSource> {
-        if self.selected_product() != RadarProduct::HydrometeorClassification || !self.is_map() {
+        if self.selected_product() != radar_fields::known::HYDROMETEOR_CLASSIFICATION
+            || !self.is_map()
+        {
             return None;
         }
         if self.loop_state().is_active() {
@@ -1534,7 +1546,8 @@ impl PaneState {
     /// The storm motion vector behind the storm-relative field **on screen**,
     /// or `None` when the picture is not storm-relative.
     pub fn displayed_storm_motion(&self) -> Option<rustdar_radar::srv::SrvMotion> {
-        if self.selected_product() != RadarProduct::StormRelativeVelocity || !self.is_map() {
+        if self.selected_product() != radar_fields::known::STORM_RELATIVE_VELOCITY || !self.is_map()
+        {
             return None;
         }
         if self.loop_state().is_active() {
@@ -1882,7 +1895,7 @@ impl PaneState {
         } else {
             0.0
         };
-        let product = match serde_json::to_value(self.selected_product) {
+        let product = match serde_json::to_value(&self.selected_product) {
             Ok(product) => product,
             Err(e) => {
                 log::error!("this pane's product cannot be published to its slot ({e})");
@@ -2137,12 +2150,12 @@ impl PaneState {
         }
     }
 
-    pub fn get_rendering_params(&self) -> Option<(RadarProduct, f32)> {
-        let elevations = self
-            .scan_info
-            .as_ref()?
-            .product_elevations
-            .get(&self.selected_product)?;
+    pub fn get_rendering_params(&self) -> Option<(FieldId, f32)> {
+        // The scan's tilt table is radar's own, keyed by radar's own field
+        // type, so the id is resolved through the one door rather than the
+        // table being re-keyed: a scan is the radar layer's fact about itself.
+        let product = radar_fields::product_for(&self.selected_product)?;
+        let elevations = self.scan_info.as_ref()?.product_elevations.get(&product)?;
         let snapped = elevations
             .iter()
             .min_by(|a, b| {
@@ -2151,7 +2164,7 @@ impl PaneState {
             })
             .copied()
             .unwrap_or(self.selected_elevation);
-        Some((self.selected_product, snapped))
+        Some((self.selected_product.clone(), snapped))
     }
 }
 

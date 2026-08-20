@@ -161,14 +161,14 @@ fn both_dispatch_paths_classify_against_this_volumes_melting_layer_and_no_other(
     );
 
     let params = || crate::render_dispatch::RenderParams {
-        product: RadarProduct::HydrometeorClassification,
+        product: rustdar_radar::types::RadarProduct::HydrometeorClassification,
         elevation: 0.5,
         lat: site.lat,
         lon: site.lon,
     };
     let target = || rustdar_egui::pane::RenderTarget {
         site: SITE.to_string(),
-        product: RadarProduct::HydrometeorClassification,
+        product: rustdar_radar::fields::known::HYDROMETEOR_CLASSIFICATION,
         elevation: 0.5,
     };
 
@@ -257,7 +257,7 @@ fn a_product_that_classifies_nothing_carries_no_melting_layer() {
     app.render.spawn_level2_render(
         0,
         &crate::render_dispatch::RenderParams {
-            product: RadarProduct::Reflectivity,
+            product: rustdar_radar::types::RadarProduct::Reflectivity,
             elevation: 0.5,
             lat: site.lat,
             lon: site.lon,
@@ -315,14 +315,14 @@ fn both_dispatch_paths_shift_by_this_volumes_storm_motion_and_no_other() {
     );
 
     let params = || crate::render_dispatch::RenderParams {
-        product: RadarProduct::StormRelativeVelocity,
+        product: rustdar_radar::types::RadarProduct::StormRelativeVelocity,
         elevation: 0.5,
         lat: site.lat,
         lon: site.lon,
     };
     let target = || rustdar_egui::pane::RenderTarget {
         site: SITE.to_string(),
-        product: RadarProduct::StormRelativeVelocity,
+        product: rustdar_radar::fields::known::STORM_RELATIVE_VELOCITY,
         elevation: 0.5,
     };
 

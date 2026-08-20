@@ -4,7 +4,7 @@
 use crate::Gui;
 use crate::UI_CONFIG_KEY;
 use rustdar_kv::{KvStore, MemoryKvStore};
-use rustdar_radar::types::RadarProduct;
+use rustdar_radar::fields as radar_fields;
 use rustdar_source::handler::PaneRef;
 use rustdar_source::id::known;
 
@@ -85,7 +85,7 @@ fn a_current_config_reaches_its_save_fixpoint_in_one_round_trip() {
     assert_eq!(gui.pane(0).expect("pane 0").site(), "KTLX");
     let pane1 = gui.pane(1).expect("pane 1");
     assert_eq!(pane1.site(), "KOUN");
-    assert_eq!(pane1.selected_product(), RadarProduct::Velocity);
+    assert_eq!(pane1.selected_product(), radar_fields::known::VELOCITY);
     assert!(!pane1.time_link, "pane 1 saved its time link off");
     assert_eq!(gui.presets.len(), 1, "the user preset arrived");
 
@@ -160,7 +160,7 @@ fn a_future_builds_config_survives_a_session_with_every_unknown_intact() {
     assert_eq!(pane.site(), "KTLX", "the radar slot's site is the pane's");
     assert_eq!(
         pane.selected_product(),
-        RadarProduct::Reflectivity,
+        radar_fields::known::REFLECTIVITY,
         "the unknown product falls back to the default, as ever",
     );
     assert_eq!(pane.selected_elevation(), 0.5, "the slot's tilt applied");
@@ -281,7 +281,7 @@ fn a_corrupt_pane_costs_that_pane_its_settings_and_nothing_else() {
         "the pane AFTER the corrupt one kept its own position — salvage is \
          defaults-in-place, never removal",
     );
-    assert_eq!(p2.selected_product(), RadarProduct::Velocity);
+    assert_eq!(p2.selected_product(), radar_fields::known::VELOCITY);
     assert_eq!(p2.time.step.as_secs(), 900);
 }
 
@@ -1592,17 +1592,17 @@ fn a_pre_field_id_config_keeps_every_volume_curve_on_its_own_product_and_its_own
         "a file whose volume tables predate FieldId must still load",
     );
 
-    let field = |p: RadarProduct| rustdar_radar::fields::spec(p).id.clone();
+    let field = |p: &FieldId| p.clone();
 
     // Direction 1, by value. The two curves in the file are deliberately
     // different shapes, so a swap is visible.
     let reflectivity = gui
         .volume_alpha
-        .get(&field(RadarProduct::Reflectivity))
+        .get(&field(&radar_fields::known::REFLECTIVITY))
         .expect("the file names a Reflectivity curve");
     let kdp = gui
         .volume_alpha
-        .get(&field(RadarProduct::SpecificDifferentialPhase))
+        .get(&field(&radar_fields::known::SPECIFIC_DIFFERENTIAL_PHASE))
         .expect("the file names a KDP curve");
     assert_ne!(
         reflectivity.alphas(),
@@ -1621,10 +1621,14 @@ fn a_pre_field_id_config_keeps_every_volume_curve_on_its_own_product_and_its_own
          one product's curve on another reads the wrong number here",
     );
 
-    assert_eq!(gui.volume_iso.get(&field(RadarProduct::Reflectivity)), 42.0,);
     assert_eq!(
         gui.volume_iso
-            .get(&field(RadarProduct::StormRelativeVelocity)),
+            .get(&field(&radar_fields::known::REFLECTIVITY)),
+        42.0,
+    );
+    assert_eq!(
+        gui.volume_iso
+            .get(&field(&radar_fields::known::STORM_RELATIVE_VELOCITY)),
         27.5,
     );
 
@@ -1634,21 +1638,22 @@ fn a_pre_field_id_config_keeps_every_volume_curve_on_its_own_product_and_its_own
         rustdar_radar::fields::product_for(&unknown).is_none(),
         "premise"
     );
-    for product in RadarProduct::all() {
-        if matches!(
-            product,
-            RadarProduct::Reflectivity
-                | RadarProduct::SpecificDifferentialPhase
-                | RadarProduct::StormRelativeVelocity
-        ) {
+    for product in radar_fields::known::ALL.iter() {
+        // Comparisons, not a `matches!`: a `FieldId` is an open string, so
+        // its consts are values rather than patterns. The three named are the
+        // same three.
+        if *product == radar_fields::known::REFLECTIVITY
+            || *product == radar_fields::known::SPECIFIC_DIFFERENTIAL_PHASE
+            || *product == radar_fields::known::STORM_RELATIVE_VELOCITY
+        {
             continue;
         }
         assert!(
-            !gui.volume_alpha.is_edited(&field(*product)),
+            !gui.volume_alpha.is_edited(&field(product)),
             "the unknown curve was reassigned to {product:?}",
         );
         assert!(
-            !gui.volume_iso.is_edited(&field(*product)),
+            !gui.volume_iso.is_edited(&field(product)),
             "the unknown threshold was reassigned to {product:?}",
         );
     }
