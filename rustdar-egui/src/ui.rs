@@ -85,6 +85,8 @@ pub(crate) use sheet::{BottomBarProbe, ErrorToastProbe, SheetProbe};
 mod catalog;
 /// The preset shape, re-used by the config writer.
 pub(crate) use catalog::PresetConfig;
+#[cfg(test)]
+pub(crate) use catalog::PresetPane;
 /// The compiled-in presets, for the parity walk.
 #[cfg(test)]
 pub(crate) use catalog::builtin_presets;
@@ -1484,6 +1486,15 @@ impl Gui {
     #[cfg(test)]
     pub(crate) fn click_consumed_for_test(&self) -> bool {
         self.click_consumed_frame
+    }
+
+    /// Install a preset directly, so a test can build one this build's own
+    /// save path cannot produce — in particular one naming a field no
+    /// registered source offers, which is exactly the case the open-id
+    /// preserve rule exists for.
+    #[cfg(test)]
+    pub(crate) fn push_preset_for_test(&mut self, preset: PresetConfig) {
+        self.presets.push(preset);
     }
 
     #[cfg(test)]

@@ -704,6 +704,24 @@ pub trait SourceHandler: Send {
         &[]
     }
 
+    /// The id of the control that selects which of this layer's
+    /// [`products`](Self::products) a pane is showing, if the choice is made
+    /// through a control at all.
+    ///
+    /// **This is the layer stating its own field-selection route**, so a
+    /// catalogue tile can be applied without anything above knowing which
+    /// layer it belongs to. `Some(id)` means "send a
+    /// [`ControlUpdate`] with this id and the field's own id as the value, and
+    /// my `apply_control` will do the rest" — the model's parameter dropdown.
+    /// `None` means the selection is not a control of mine: the pane owns it,
+    /// as it owns radar's product and elevation.
+    ///
+    /// Defaulted to `None` because most layers have no fields at all, and a
+    /// layer with one picture has nothing to select between.
+    fn field_control_id(&self) -> Option<&'static str> {
+        None
+    }
+
     /// The fields this layer offers as catalogue tiles.
     ///
     /// Defaults to [`products`](Self::products): a layer that publishes fields

@@ -984,7 +984,7 @@ impl super::Gui {
                         .panes
                         .iter()
                         .map(|pane| super::catalog::PresetPane {
-                            product: pane.product,
+                            product: pane.product.clone(),
                             elevation: if pane.elevation.is_finite() {
                                 pane.elevation
                             } else {

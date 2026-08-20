@@ -216,6 +216,14 @@ impl OverlayHandler for ModelDataHandler {
     fn products(&self) -> &'static [rustdar_source::product::ProductSpec] {
         crate::hrrr::fields::products()
     }
+
+    /// The parameter dropdown: its option values are the parameters'
+    /// `as_str()` spellings, which are exactly the `FieldId`s
+    /// [`crate::hrrr::fields`] registers, so a catalogue tile's id can be sent
+    /// straight through `apply_control`.
+    fn field_control_id(&self) -> Option<&'static str> {
+        Some("parameter")
+    }
     fn id(&self) -> LayerId {
         known::MODEL_DATA
     }

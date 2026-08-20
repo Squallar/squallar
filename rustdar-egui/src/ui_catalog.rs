@@ -1,11 +1,11 @@
 //! The Add-layer catalog: one modal over everything, four groups, one search.
 
 use crate::actions::GuiAction;
-use rustdar_overlays::hrrr::ModelParameter;
 use rustdar_overlays::render::controls::{ControlEffect, ControlUpdate, ControlValue};
-use rustdar_radar::types::RadarProduct;
+use rustdar_overlays::render::overlay_state::OverlayRegistry;
 use rustdar_source::handler::PaneMut;
 use rustdar_source::id::{LayerId, known};
+use rustdar_source::product::{FieldId, ProductSpec};
 use serde::{Deserialize, Serialize};
 
 /// The catalog's roomy width, narrowed by
@@ -51,20 +51,29 @@ impl Default for PresetConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct PresetPane {
-    /// Tolerant of product names this build does not know. See
-    /// [`product_or_default`](super::config).
-    #[serde(deserialize_with = "super::config::product_or_default")]
-    pub product: RadarProduct,
+    /// The field this pane shows, as an open id.
+    ///
+    /// **No tolerant deserializer, because none is needed any more.** `FieldId`
+    /// is serde-transparent, so *any* spelling loads — including one this build
+    /// does not register. Such an entry is preserved inert: it is written back
+    /// verbatim on the next save and simply does not resolve when the preset is
+    /// applied, so a preset authored on a newer build survives a session on an
+    /// older one instead of being silently rewritten to Reflectivity. That is
+    /// the open-id doctrine replacing `product_or_default`'s substitution.
+    pub product: FieldId,
     pub elevation: f32,
 }
 
 impl Default for PresetPane {
     fn default() -> Self {
         Self {
-            product: RadarProduct::Reflectivity,
+            // The on-disk spelling, not a derivation: this is the byte string
+            // already in every preset file. `the_builtin_presets_name_registered_fields`
+            // is what stops it from silently becoming an id nothing registers.
+            product: FieldId::from_static("Reflectivity"),
             elevation: 0.0,
         }
     }
@@ -73,8 +82,8 @@ impl Default for PresetPane {
 /// The compiled-in presets (§1.10's three), built fresh per call — they hold
 /// `String`s and `Vec`s, so a `const` table is not on offer. Never persisted.
 pub(crate) fn builtin_presets() -> [PresetConfig; 3] {
-    let pane = |product| PresetPane {
-        product,
+    let pane = |product: &'static str| PresetPane {
+        product: FieldId::from_static(product),
         elevation: 0.5,
     };
     [
@@ -82,10 +91,10 @@ pub(crate) fn builtin_presets() -> [PresetConfig; 3] {
             name: "Severe Wx".into(),
             pane_count: 4,
             panes: vec![
-                pane(RadarProduct::Reflectivity),
-                pane(RadarProduct::Velocity),
-                pane(RadarProduct::StormRelativeVelocity),
-                pane(RadarProduct::NormalizedRotation),
+                pane("Reflectivity"),
+                pane("Velocity"),
+                pane("StormRelativeVelocity"),
+                pane("NormalizedRotation"),
             ],
             overlays: vec![
                 known::RADAR,
@@ -102,8 +111,8 @@ pub(crate) fn builtin_presets() -> [PresetConfig; 3] {
             name: "Rainfall".into(),
             pane_count: 2,
             panes: vec![
-                pane(RadarProduct::PrecipitationRate),
-                pane(RadarProduct::VerticallyIntegratedLiquid),
+                pane("PrecipitationRate"),
+                pane("VerticallyIntegratedLiquid"),
             ],
             overlays: vec![
                 known::RADAR,
@@ -117,9 +126,9 @@ pub(crate) fn builtin_presets() -> [PresetConfig; 3] {
             name: "Aviation".into(),
             pane_count: 3,
             panes: vec![
-                pane(RadarProduct::Reflectivity),
-                pane(RadarProduct::EchoTops),
-                pane(RadarProduct::SpectrumWidth),
+                pane("Reflectivity"),
+                pane("EchoTops"),
+                pane("SpectrumWidth"),
             ],
             overlays: vec![
                 known::RADAR,
@@ -133,13 +142,22 @@ pub(crate) fn builtin_presets() -> [PresetConfig; 3] {
     ]
 }
 
+/// Which heading a catalogue tile was drawn under.
+///
+/// **`Fields` carries the group label as data rather than naming it as a
+/// variant.** The label comes from the field's own `ProductSpec::group`, so a
+/// source that brings a new group of fields gets its own heading with no arm
+/// added anywhere in this crate — which is the whole point of the registry
+/// being a read contract. The closed `{Presets, Overlays, Products, Hrrr}` set
+/// this replaces could not express a group it had not been edited to know.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CatalogGroup {
     Presets,
-    Overlays,
-    Products,
-    Hrrr,
+    /// One tile per registered layer.
+    Layers,
+    /// One tile per registered field, under its registration's group label.
+    Fields(&'static str),
 }
 
 /// One tile the catalog actually drew, as it was drawn — reported by the
@@ -323,7 +341,7 @@ impl super::Gui {
                     let tile = ui.button(name.as_str());
                     #[cfg(test)]
                     probe.tiles.push(CatalogTileProbe {
-                        group: CatalogGroup::Overlays,
+                        group: CatalogGroup::Layers,
                         label: name.clone(),
                         rect: tile.rect,
                         delete: None,
@@ -336,54 +354,42 @@ impl super::Gui {
             });
         }
 
-        // -- Radar products --
-        let products: Vec<RadarProduct> = RadarProduct::all()
-            .iter()
-            .copied()
-            .filter(|p| matches_query(&query, p.name()))
-            .collect();
-        if !products.is_empty() {
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new(format!("Radar products ({})", products.len())).strong());
-            ui.horizontal_wrapped(|ui| {
-                for product in products {
-                    let tile = ui.button(product.name());
-                    #[cfg(test)]
-                    probe.tiles.push(CatalogTileProbe {
-                        group: CatalogGroup::Products,
-                        label: product.name().to_owned(),
-                        rect: tile.rect,
-                        delete: None,
-                    });
-                    if tile.clicked() {
-                        self.catalog_apply_product(product);
-                        self.catalog_open = false;
-                    }
-                }
-            });
+        // -- Fields, one heading per group label the registrations declare --
+        //
+        // ONE loop, not one per source. The headings, their order and their
+        // contents all come from `OverlayRegistry::fields()`, so a source that
+        // registers a new group of fields appears here with no edit to this
+        // crate. Registry order is the drawn order: WO-E9d's rule is that the
+        // catalogue does not invent an ordering of its own.
+        let mut groups: Vec<&'static str> = Vec::new();
+        for (_, spec) in self.overlays.fields() {
+            if !groups.contains(&spec.group) {
+                groups.push(spec.group);
+            }
         }
-
-        // -- HRRR parameters --
-        let params: Vec<ModelParameter> = ModelParameter::all()
-            .iter()
-            .copied()
-            .filter(|p| matches_query(&query, p.display_name()))
-            .collect();
-        if !params.is_empty() {
+        for group in groups {
+            let hits: Vec<(LayerId, &'static ProductSpec)> = self
+                .overlays
+                .fields()
+                .filter(|(_, spec)| spec.group == group && matches_query(&query, spec.name))
+                .collect();
+            if hits.is_empty() {
+                continue;
+            }
             ui.add_space(6.0);
-            ui.label(egui::RichText::new(format!("HRRR parameters ({})", params.len())).strong());
+            ui.label(egui::RichText::new(format!("{group} ({})", hits.len())).strong());
             ui.horizontal_wrapped(|ui| {
-                for param in params {
-                    let tile = ui.button(param.display_name());
+                for (owner, spec) in hits {
+                    let tile = ui.button(spec.name);
                     #[cfg(test)]
                     probe.tiles.push(CatalogTileProbe {
-                        group: CatalogGroup::Hrrr,
-                        label: param.display_name().to_owned(),
+                        group: CatalogGroup::Fields(group),
+                        label: spec.name.to_owned(),
                         rect: tile.rect,
                         delete: None,
                     });
                     if tile.clicked() {
-                        self.catalog_apply_hrrr(param, actions);
+                        self.catalog_apply_field(&owner, spec, actions);
                         self.catalog_open = false;
                     }
                 }
@@ -428,7 +434,7 @@ impl super::Gui {
             for preset in shown_builtin {
                 let tile = ui
                     .button(preset.name.as_str())
-                    .on_hover_text(preset_hover(preset));
+                    .on_hover_text(preset_hover(&self.overlays, preset));
                 #[cfg(test)]
                 probe.tiles.push(CatalogTileProbe {
                     group: CatalogGroup::Presets,
@@ -444,7 +450,7 @@ impl super::Gui {
                 let preset = &self.presets[i];
                 let tile = ui
                     .button(preset.name.as_str())
-                    .on_hover_text(preset_hover(preset));
+                    .on_hover_text(preset_hover(&self.overlays, preset));
                 let remove = ui
                     .add(egui::Button::new(egui::RichText::new(CLOSE_LABEL).small()).frame(false))
                     .on_hover_text(format!("Delete \"{}\"", preset.name));
@@ -551,77 +557,107 @@ impl super::Gui {
         self.select_layer(kind);
     }
 
-    /// Aim the active pane at `product` — converting it back to a map if it
-    /// is not one — and select the Radar layer.
-    fn catalog_apply_product(&mut self, product: RadarProduct) {
+    /// Apply one field tile: turn the owning layer on, then select the field
+    /// through **that layer's own route**, and select the layer.
+    ///
+    /// ONE apply for every source. The branch below is not on *which layer this
+    /// is* — no `known::RADAR` or `known::MODEL_DATA` decides anything here —
+    /// but on what the handler itself declares through
+    /// [`SourceHandler::field_control_id`]: a layer whose field selection is a
+    /// control of its own gets a `ControlUpdate`, and a layer whose pane owns
+    /// the selection gets the pane route. A new source picks its arm by
+    /// answering that one question, not by being added to a match.
+    fn catalog_apply_field(
+        &mut self,
+        owner: &LayerId,
+        spec: &'static ProductSpec,
+        actions: &mut Vec<GuiAction>,
+    ) {
         let idx = self.active_pane;
-        if !self.panes[idx].is_map() {
-            self.request_pane_view(idx, rustdar_radar::types::RenderView::PlanView);
-        }
-        // A product tile means "show me this picture", so the Radar layer
-        // turns on with it — a product under a hidden radar layer is a click
-        // that visibly did nothing. No fetch rule: radar data arrives through
-        // the scan path, not `FetchOverlay`.
-        let Self {
-            overlays, panes, ..
-        } = self;
-        Self::write_pane_overlay(overlays, idx, &mut panes[idx], &known::RADAR, true);
-        let pane = &mut self.panes[idx];
-        if pane.selected_product() != product {
-            pane.set_selected_product(product);
-            pane.set_selected_elevation(0.0);
-        }
-        self.propagate_layer_sync();
-        self.select_layer(known::RADAR);
-    }
-
-    /// Enable the model layer, set its parameter through the handler's own
-    /// control route, and select the layer — what clicking an HRRR tile
-    /// means.
-    fn catalog_apply_hrrr(&mut self, param: ModelParameter, actions: &mut Vec<GuiAction>) {
-        let idx = self.active_pane;
-        let mut pane = std::mem::take(&mut self.panes[idx]);
-        self.set_pane_overlay_with_fetch(&mut pane, idx, &known::MODEL_DATA, true, actions);
-
-        // Through `apply_control` rather than a field write, so the handler's
-        // own rules hold: a cached parameter re-renders without a fetch, an
-        // uncached one asks for one.
-        pane.hydrate_layer_states(&self.overlays, idx);
-        let update = ControlUpdate {
-            id: "parameter",
-            value: ControlValue::String(param.as_str().to_owned()),
-        };
-        // The other panes' state for this layer — see
-        // `render_overlay_controls_one`, which builds the same view for the
-        // same reason. `self.panes[idx]` is the `mem::take`n placeholder while
-        // `pane` is out, so the edited pane cannot appear twice.
-        let peers: Vec<&dyn std::any::Any> = self
-            .panes
-            .iter()
-            .take(self.pane_layout.pane_count)
-            .filter_map(|p| p.slot(&known::MODEL_DATA))
-            .filter_map(|slot| slot.state.as_deref())
-            .map(|s| s as &dyn std::any::Any)
-            .collect();
-        let mut pane_ctx = PaneMut {
-            pane_idx: idx,
-            state: pane
-                .slot_mut(&known::MODEL_DATA)
-                .and_then(|slot| slot.state.as_deref_mut())
-                .map(|s| s as &mut dyn std::any::Any),
-            peers: &peers,
-        };
-        let effect = self
+        // A field tile means "show me this picture", so the owning layer turns
+        // on with it — a field under a hidden layer is a click that visibly did
+        // nothing.
+        let control = self
             .overlays
-            .apply_control(&known::MODEL_DATA, &update, &mut pane_ctx);
-        if matches!(effect, ControlEffect::Fetch) {
-            crate::ui::push_user_overlay_fetch(&mut self.overlays, actions, known::MODEL_DATA, idx);
-        }
-        pane.adopt_handler_state(&self.overlays);
+            .get_handler(owner)
+            .and_then(|h| h.field_control_id());
 
-        self.panes[idx] = pane;
+        match control {
+            Some(control_id) => {
+                let mut pane = std::mem::take(&mut self.panes[idx]);
+                self.set_pane_overlay_with_fetch(&mut pane, idx, owner, true, actions);
+
+                // Through `apply_control` rather than a field write, so the
+                // handler's own rules hold: a cached field re-renders without a
+                // fetch, an uncached one asks for one.
+                pane.hydrate_layer_states(&self.overlays, idx);
+                let update = ControlUpdate {
+                    id: control_id,
+                    value: ControlValue::String(spec.id.as_str().to_owned()),
+                };
+                // The other panes' state for this layer — see
+                // `render_overlay_controls_one`, which builds the same view for
+                // the same reason. `self.panes[idx]` is the `mem::take`n
+                // placeholder while `pane` is out, so the edited pane cannot
+                // appear twice.
+                let peers: Vec<&dyn std::any::Any> = self
+                    .panes
+                    .iter()
+                    .take(self.pane_layout.pane_count)
+                    .filter_map(|p| p.slot(owner))
+                    .filter_map(|slot| slot.state.as_deref())
+                    .map(|s| s as &dyn std::any::Any)
+                    .collect();
+                let mut pane_ctx = PaneMut {
+                    pane_idx: idx,
+                    state: pane
+                        .slot_mut(owner)
+                        .and_then(|slot| slot.state.as_deref_mut())
+                        .map(|s| s as &mut dyn std::any::Any),
+                    peers: &peers,
+                };
+                let effect = self.overlays.apply_control(owner, &update, &mut pane_ctx);
+                if matches!(effect, ControlEffect::Fetch) {
+                    crate::ui::push_user_overlay_fetch(
+                        &mut self.overlays,
+                        actions,
+                        owner.clone(),
+                        idx,
+                    );
+                }
+                pane.adopt_handler_state(&self.overlays);
+                self.panes[idx] = pane;
+            }
+            None => {
+                // The pane owns this layer's field selection.
+                //
+                // **The typed conversion below is the last of it, and WO-E9e
+                // removes it**: the pane still stores radar's field as a
+                // `RadarProduct`, so a `FieldId` has to be resolved back through
+                // the radar registry to be written. Once the pane's slot holds a
+                // `FieldId`, this arm writes `spec.id` directly and stops naming
+                // any source's type.
+                if !self.panes[idx].is_map() {
+                    self.request_pane_view(idx, rustdar_radar::types::RenderView::PlanView);
+                }
+                let Self {
+                    overlays, panes, ..
+                } = self;
+                Self::write_pane_overlay(overlays, idx, &mut panes[idx], owner, true);
+                if let Some(product) = rustdar_radar::fields::product_for(&spec.id) {
+                    let pane = &mut self.panes[idx];
+                    if pane.selected_product() != product {
+                        pane.set_selected_product(product);
+                        pane.set_selected_elevation(0.0);
+                    }
+                }
+                // No fetch rule: radar data arrives through the scan path, not
+                // `FetchOverlay`.
+            }
+        }
+
         self.propagate_layer_sync();
-        self.select_layer(known::MODEL_DATA);
+        self.select_layer(owner.clone());
     }
 
     /// The current view as a preset: pane count, each visible pane's product
@@ -637,7 +673,10 @@ impl super::Gui {
                 .panes()
                 .iter()
                 .map(|pane| PresetPane {
-                    product: pane.selected_product(),
+                    // WO-E9e removes this projection with the pane's own type.
+                    product: rustdar_radar::fields::spec(pane.selected_product())
+                        .id
+                        .clone(),
                     elevation: finite(pane.selected_elevation()),
                 })
                 .collect(),
@@ -665,7 +704,13 @@ impl super::Gui {
             let pane = &mut self.panes[idx];
             pane.set_view(rustdar_radar::types::RenderView::PlanView);
             if let Some(pp) = preset.panes.get(idx) {
-                pane.set_selected_product(pp.product);
+                // An id this build does not register resolves to nothing and
+                // leaves the pane's field as it was — the preserve rule. It is
+                // never substituted for a default, which would silently rewrite
+                // the preset on the next save.
+                if let Some(product) = rustdar_radar::fields::product_for(&pp.product) {
+                    pane.set_selected_product(product);
+                }
                 pane.set_selected_elevation(pp.elevation);
             }
         }
@@ -684,11 +729,20 @@ impl super::Gui {
 }
 
 /// The sentence a preset tile offers on hover: what applying it builds.
-fn preset_hover(preset: &PresetConfig) -> String {
+///
+/// Field names come from the registry, so a preset naming a field this build
+/// does not register shows **the id it actually holds** rather than a
+/// substituted default — the hover tells the truth about the file.
+fn preset_hover(registry: &OverlayRegistry, preset: &PresetConfig) -> String {
     let products: Vec<&str> = preset
         .panes
         .iter()
-        .map(|pane| pane.product.name())
+        .map(|pane| {
+            registry
+                .field(&pane.product)
+                .map(|(_, spec)| spec.name)
+                .unwrap_or_else(|| pane.product.as_str())
+        })
         .collect();
     format!(
         "{} pane{}: {}",
