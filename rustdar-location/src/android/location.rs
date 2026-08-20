@@ -108,12 +108,12 @@ fn fix_from_location(
     use jni::{jni_sig, jni_str};
 
     let lat = env
-        .call_method(&location, jni_str!("getLatitude"), jni_sig!("()D"), &[])
+        .call_method(location, jni_str!("getLatitude"), jni_sig!("()D"), &[])
         .ok()?
         .d()
         .ok()?;
     let lon = env
-        .call_method(&location, jni_str!("getLongitude"), jni_sig!("()D"), &[])
+        .call_method(location, jni_str!("getLongitude"), jni_sig!("()D"), &[])
         .ok()?
         .d()
         .ok()?;
@@ -125,32 +125,32 @@ fn fix_from_location(
     }
 
     let altitude_m = env
-        .call_method(&location, jni_str!("getAltitude"), jni_sig!("()D"), &[])
+        .call_method(location, jni_str!("getAltitude"), jni_sig!("()D"), &[])
         .and_then(|v| v.d())
         .ok()
         .filter(|_| {
-            env.call_method(&location, jni_str!("hasAltitude"), jni_sig!("()Z"), &[])
+            env.call_method(location, jni_str!("hasAltitude"), jni_sig!("()Z"), &[])
                 .and_then(|v| v.z())
                 .unwrap_or(false)
         });
 
     let speed_mps = env
-        .call_method(&location, jni_str!("getSpeed"), jni_sig!("()F"), &[])
+        .call_method(location, jni_str!("getSpeed"), jni_sig!("()F"), &[])
         .and_then(|v| v.f())
         .ok()
         .filter(|_| {
-            env.call_method(&location, jni_str!("hasSpeed"), jni_sig!("()Z"), &[])
+            env.call_method(location, jni_str!("hasSpeed"), jni_sig!("()Z"), &[])
                 .and_then(|v| v.z())
                 .unwrap_or(false)
         })
         .map(|s| s as f64);
 
     let heading_deg = env
-        .call_method(&location, jni_str!("getBearing"), jni_sig!("()F"), &[])
+        .call_method(location, jni_str!("getBearing"), jni_sig!("()F"), &[])
         .and_then(|v| v.f())
         .ok()
         .filter(|_| {
-            env.call_method(&location, jni_str!("hasBearing"), jni_sig!("()Z"), &[])
+            env.call_method(location, jni_str!("hasBearing"), jni_sig!("()Z"), &[])
                 .and_then(|v| v.z())
                 .unwrap_or(false)
         })
@@ -159,11 +159,11 @@ fn fix_from_location(
     // Guarded by `hasAccuracy()`: a `Location` without one returns 0.0, and
     // 0 m would read as a perfect fix rather than an absent field.
     let accuracy_m = env
-        .call_method(&location, jni_str!("getAccuracy"), jni_sig!("()F"), &[])
+        .call_method(location, jni_str!("getAccuracy"), jni_sig!("()F"), &[])
         .and_then(|v| v.f())
         .ok()
         .filter(|_| {
-            env.call_method(&location, jni_str!("hasAccuracy"), jni_sig!("()Z"), &[])
+            env.call_method(location, jni_str!("hasAccuracy"), jni_sig!("()Z"), &[])
                 .and_then(|v| v.z())
                 .unwrap_or(false)
         })
