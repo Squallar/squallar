@@ -123,7 +123,7 @@ impl super::Gui {
                             ui,
                             self.radar.fetching,
                             ArchivePoll::of(&self.overlays),
-                            &self.chunk_status,
+                            &crate::radar_layer::chunk_status(self.liveness()),
                         );
                         self.status_bar_tick = drawn.as_ref().and_then(|&(_, _, tick)| tick);
                         #[cfg(test)]

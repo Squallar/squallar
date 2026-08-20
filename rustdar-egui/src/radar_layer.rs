@@ -13,6 +13,7 @@ use rustdar_radar::loop_geometry::LoopGeometry;
 use rustdar_radar::sites::RadarSite;
 use rustdar_source::controls::ControlItem;
 use rustdar_source::id::{LayerId, known};
+use rustdar_source::liveness::SourceLiveness;
 
 use crate::pane::LayerTimeState;
 
@@ -243,4 +244,65 @@ pub fn fan_out_live_chunks<'a>(
 /// [`ControlEffect::Fetch`]: rustdar_source::controls::ControlEffect
 pub fn refresh_requested(update: &rustdar_source::controls::ControlUpdate) -> bool {
     update.id == rustdar_radar::source::REFRESH_CONTROL
+}
+
+// ── The radar layer's liveness (WO-E8c) ──────────────────────────────────
+//
+// What the chunk feed and the current-volume merge are doing. It used to be
+// two typed fields on `FrameInputs` and two on the `Gui`; it is now one
+// opaque `SourceLiveness` payload filed under the radar id, and this module
+// is the only place that knows what is inside it.
+
+/// One site's current-volume stamp, as the App publishes it each frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CurrentVolumeStamp {
+    /// Collection time of the newest data in the merged volume — the identity
+    /// a 3D pane names its build by. Every sealed sweep advances it, which is
+    /// what makes the 3D view rebuild in step with the map beside it.
+    pub newest: chrono::NaiveDateTime,
+    /// When the complete base volume under the merge began, where one
+    /// contributes at all. `None` while the site's first volume is still
+    /// filling: there is no complete volume yet and the caption says so.
+    pub base_started: Option<chrono::NaiveDateTime>,
+}
+
+/// **The radar layer's whole live status**, in the layer's own vocabulary.
+///
+/// The payload of the [`SourceLiveness`] entry filed under [`POLL_LAYER`].
+/// Built by the shell when either half **changes**, not per frame: it travels
+/// behind an `Arc` and a frame that publishes it re-states the same one.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RadarLiveness {
+    /// What the real-time chunk feed is doing.
+    pub chunk_status: rustdar_radar::chunk_feed::ChunkFeedStatus,
+    /// Each site's current-volume stamp, advanced by every sealed sweep. A 3D
+    /// pane names the volume it wants by [`CurrentVolumeStamp::newest`], which
+    /// is what makes its rebuilds follow the live feed.
+    pub current_volumes: std::collections::HashMap<String, CurrentVolumeStamp>,
+}
+
+/// The radar layer's entry in `liveness`, or `None` when the shell has not
+/// published one yet. A payload of another shape answers `None` too, which is
+/// the honest answer to "did radar say this?".
+pub fn liveness(entries: &[SourceLiveness]) -> Option<&RadarLiveness> {
+    SourceLiveness::find::<RadarLiveness>(entries, &POLL_LAYER)
+}
+
+/// What the real-time chunk feed is doing, or the resting answer when radar
+/// has published nothing — the same default the field this replaced was born
+/// holding.
+pub fn chunk_status(entries: &[SourceLiveness]) -> rustdar_radar::chunk_feed::ChunkFeedStatus {
+    liveness(entries)
+        .map(|live| live.chunk_status)
+        .unwrap_or_default()
+}
+
+/// The stamp of `site`'s current volume, if this build holds one at all.
+pub fn current_volume_for(entries: &[SourceLiveness], site: &str) -> Option<CurrentVolumeStamp> {
+    liveness(entries)?.current_volumes.get(site).copied()
+}
+
+/// The `SourceLiveness` entry the shell publishes for this layer.
+pub fn liveness_entry(live: RadarLiveness) -> SourceLiveness {
+    SourceLiveness::new(POLL_LAYER, live)
 }

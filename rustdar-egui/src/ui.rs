@@ -6,7 +6,7 @@ const DEFAULT_INITIAL_ZOOM: f64 = 7.0;
 use crate::pane::{ColorScaleOrientation, PaneId, PaneLayout, PaneState};
 use crate::tiles::MapTileState;
 use crate::ui_layout::{LayoutCtx, ModalityLatch};
-use chrono::{NaiveDateTime, Timelike};
+use chrono::Timelike;
 use egui::Context;
 use rustdar_overlays::fetch_policy::FetchHealth;
 use rustdar_overlays::render::overlay_state::OverlayRegistry;
@@ -103,7 +103,7 @@ mod probes;
 pub(crate) use probes::ControlProbe;
 #[path = "gui/state.rs"]
 mod state;
-pub use state::{CurrentVolumeStamp, Gui, StormMotionOverride};
+pub use state::{Gui, StormMotionOverride};
 #[path = "gui/frame.rs"]
 mod frame;
 #[path = "gui/layer_glue.rs"]
@@ -689,8 +689,9 @@ impl Gui {
         }
         self.user_heading = inputs.user_heading;
         self.catalogue_pending = inputs.catalogue_pending;
-        self.chunk_status = inputs.chunk_status;
-        self.current_volumes = inputs.current_volumes.clone();
+        // Cloned, not borrowed: each entry is an id plus an `Arc`, so a frame
+        // that publishes an unchanged status re-states the same allocation.
+        self.liveness = inputs.liveness.to_vec();
         self.floor_tile_zoom_bias = inputs.floor_tile_zoom_bias;
     }
 
@@ -703,13 +704,14 @@ impl Gui {
     // [`Gui::apply_layer_control`], which names a layer and an update rather
     // than a field.
 
-    pub fn chunk_status(&self) -> &rustdar_radar::chunk_feed::ChunkFeedStatus {
-        &self.chunk_status
-    }
-
-    /// The stamp of `site`'s current volume, if this build holds one at all.
-    pub fn current_volume_for(&self, site: &str) -> Option<CurrentVolumeStamp> {
-        self.current_volumes.get(site).copied()
+    /// **What every layer says it is doing**, as the App last stated it.
+    ///
+    /// The generic half of the liveness seam (WO-E8c): a caller that wants a
+    /// particular layer's answer asks that layer's own glue to read it — see
+    /// [`crate::radar_layer::chunk_status`] and
+    /// [`crate::radar_layer::current_volume_for`].
+    pub fn liveness(&self) -> &[rustdar_source::liveness::SourceLiveness] {
+        &self.liveness
     }
 
     /// The distinct sites some pane is watching live — the unit the chunk feed

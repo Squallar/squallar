@@ -8,7 +8,7 @@
 
 use super::FrameInputs;
 use crate::input_harness::InputHarness;
-use crate::ui::CurrentVolumeStamp;
+use crate::radar_layer::{CurrentVolumeStamp, RadarLiveness};
 use rustdar_radar::chunk_feed::ChunkFeedStatus;
 
 /// A timestamp no default produces, so reading it back can only mean the
@@ -42,6 +42,10 @@ fn every_frame_input_surfaces_and_persists() {
         pushed: true,
         tilt: None,
     };
+    let liveness = vec![crate::radar_layer::liveness_entry(RadarLiveness {
+        chunk_status: status,
+        current_volumes: volumes.clone(),
+    })];
     h.gui_mut().apply_frame_inputs(FrameInputs {
         safe_area_insets: (11.0, 22.0, 33.0, 44.0),
         supports_exit: false,
@@ -51,8 +55,7 @@ fn every_frame_input_surfaces_and_persists() {
         gps: Some((rustdar_location::Fix::from_lat_lon(12.5, -34.25), gps_at)),
         user_heading: Some(123.0),
         catalogue_pending: true,
-        chunk_status: status,
-        current_volumes: &volumes,
+        liveness: &liveness,
         floor_tile_zoom_bias: 2,
     });
 
@@ -102,12 +105,12 @@ fn every_frame_input_surfaces_and_persists() {
             "catalogue_pending did not survive frame {frame}"
         );
         assert_eq!(
-            *gui.chunk_status(),
+            crate::radar_layer::chunk_status(gui.liveness()),
             status,
-            "chunk_status did not survive frame {frame}"
+            "the radar layer's chunk status did not survive frame {frame}"
         );
         assert_eq!(
-            gui.current_volume_for("KTLX"),
+            crate::radar_layer::current_volume_for(gui.liveness(), "KTLX"),
             Some(CurrentVolumeStamp {
                 newest: sentinel_stamp(),
                 base_started: Some(sentinel_stamp()),
@@ -128,7 +131,6 @@ fn every_frame_input_surfaces_and_persists() {
 #[test]
 fn a_none_gps_clears_the_fix() {
     let mut h = InputHarness::new();
-    let volumes = std::collections::HashMap::new();
     let base = FrameInputs {
         safe_area_insets: (0.0, 0.0, 0.0, 0.0),
         supports_exit: true,
@@ -141,8 +143,7 @@ fn a_none_gps_clears_the_fix() {
         )),
         user_heading: None,
         catalogue_pending: false,
-        chunk_status: ChunkFeedStatus::default(),
-        current_volumes: &volumes,
+        liveness: &[],
         floor_tile_zoom_bias: 0,
     };
     h.gui_mut().apply_frame_inputs(base);
@@ -160,8 +161,7 @@ fn a_none_gps_clears_the_fix() {
         location_settings_available: false,
         user_heading: None,
         catalogue_pending: false,
-        chunk_status: ChunkFeedStatus::default(),
-        current_volumes: &volumes,
+        liveness: &[],
         floor_tile_zoom_bias: 0,
     });
     h.frame();

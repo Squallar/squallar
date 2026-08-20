@@ -628,7 +628,7 @@ fn the_recorded_base_volume_is_published_to_the_pane_that_names_it() {
     let mut app = app_showing(at(10));
     app.chunk_feeds.ensure("KTLX");
     assert_eq!(
-        app.gui.current_volume_for("KTLX"),
+        rustdar_egui::radar_layer::current_volume_for(app.gui.liveness(), "KTLX"),
         None,
         "precondition: nothing published yet",
     );
@@ -637,9 +637,7 @@ fn the_recorded_base_volume_is_published_to_the_pane_that_names_it() {
     app.poll_data_channels();
     app.push_frame_inputs();
 
-    let stamp = app
-        .gui
-        .current_volume_for("KTLX")
+    let stamp = rustdar_egui::radar_layer::current_volume_for(app.gui.liveness(), "KTLX")
         .expect("the app holds a base volume the 3D pane is never told about");
     assert_eq!(
         stamp.newest,
@@ -1295,5 +1293,107 @@ fn the_ladder_position_stops_rising_once_every_rung_is_at_its_stop() {
     assert_eq!(
         app.budgets.raster_side_ceiling_px,
         shipped.long_range_image_side_px.floor,
+    );
+}
+
+/// **The liveness entry is rebuilt when it CHANGES, not once a frame.**
+///
+/// WO-E8c's payload is an `Arc` the shell re-states every frame, and the map
+/// inside it is a per-site `HashMap` the frame path recomputes anyway. A
+/// per-frame rebuild would be a per-frame allocation and a per-frame clone for
+/// a value that moves on the order of once a scan, so the shell compares
+/// before it publishes.
+///
+/// The instrument is pointer identity: same `Arc`, no rebuild. It has a
+/// **non-triviality floor** — the second act moves the volume and asserts the
+/// pointer *did* change, so a build that never published at all could not pass
+/// the first half by publishing nothing.
+#[test]
+fn an_unchanged_liveness_answer_is_restated_and_not_rebuilt() {
+    fn entry(app: &App) -> std::sync::Arc<dyn std::any::Any + Send + Sync> {
+        app.gui
+            .liveness()
+            .iter()
+            .find(|e| e.id == rustdar_egui::radar_layer::POLL_LAYER)
+            .expect("the radar layer publishes its liveness")
+            .payload
+            .clone()
+    }
+
+    let mut app = app_showing(at(10));
+    app.chunk_feeds.ensure("KTLX");
+    send_archive_scan(&app, at(5), stamped_scan(5));
+    app.poll_data_channels();
+    app.push_frame_inputs();
+    let first = entry(&app);
+
+    // A frame that changes nothing.
+    app.poll_data_channels();
+    app.push_frame_inputs();
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &entry(&app)),
+        "the shell rebuilt the radar layer's liveness payload on a frame \
+         where nothing about it moved",
+    );
+
+    // …and one that changes something.
+    send_archive_scan(&app, at(15), stamped_scan(15));
+    app.poll_data_channels();
+    app.push_frame_inputs();
+    let moved = entry(&app);
+    assert!(
+        !std::sync::Arc::ptr_eq(&first, &moved),
+        "a newer volume did not reach the seam — the comparison above would \
+         pass on a build that never published at all",
+    );
+    assert_eq!(
+        rustdar_egui::radar_layer::current_volume_for(app.gui.liveness(), "KTLX")
+            .expect("a stamp")
+            .newest,
+        at(15),
+        "the rebuilt payload does not carry the newer volume",
+    );
+}
+
+/// **The chunk feed's status reaches the chip that prints it.**
+///
+/// Registered as a gap this land found rather than one it made: WO-E8c's
+/// tamper — the shell never publishing the status at all — came back **green**
+/// on the whole workspace. The sentinel-expression contract test drives
+/// `FrameInputs` by hand and so pins the `Gui`'s half; nothing pinned the
+/// App's, so `drive_chunk_feeds` could compute a status and drop it on the
+/// floor with every gate still reading green.
+///
+/// The precondition is the non-triviality floor: the resting answer is `false`
+/// on both halves, so the assertion below cannot pass on a default.
+#[test]
+fn the_chunk_feeds_status_reaches_the_seam_that_publishes_it() {
+    let mut app = app_showing(at(10));
+    app.drive_chunk_feeds();
+    app.push_frame_inputs();
+    let resting = rustdar_egui::radar_layer::chunk_status(app.gui.liveness());
+    assert!(
+        !resting.feeding,
+        "precondition: nothing is feeding yet, or the assertion below could \
+         pass off a status that was already true; got {resting:?}",
+    );
+    assert!(
+        resting.interval_secs > 0,
+        "the shell published `ChunkFeedStatus::default()` rather than the \
+         status it computed — the feed's own cadence is never zero; got \
+         {resting:?}",
+    );
+
+    app.chunk_feeds.ensure("KTLX");
+    app.chunk_feeds
+        .force_serving("KTLX", Arc::new(empty_scan()));
+    app.drive_chunk_feeds();
+    app.push_frame_inputs();
+
+    let live = rustdar_egui::radar_layer::chunk_status(app.gui.liveness());
+    assert!(
+        live.feeding,
+        "the feed is serving and the status bar would still say it is not: \
+         the shell computed a status and never published it; got {live:?}",
     );
 }

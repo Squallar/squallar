@@ -13,6 +13,7 @@ pub mod fetch_policy;
 pub mod handler;
 pub mod id;
 pub mod job;
+pub mod liveness;
 pub mod origins;
 pub mod time;
 pub mod tls;

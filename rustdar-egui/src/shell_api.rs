@@ -5,8 +5,6 @@
 //! [`crate::actions`]. The re-verbed `GuiAction` lands here at E5.
 
 use crate::actions::RadarConfig;
-use crate::ui::CurrentVolumeStamp;
-use rustdar_radar::chunk_feed::ChunkFeedStatus;
 use rustdar_radar::types::ScanInfo;
 
 /// One frame's facts, composed by the App from state it already owns, applied
@@ -31,10 +29,15 @@ pub struct FrameInputs<'a> {
     pub user_heading: Option<f32>,
     /// Whether the site list is still short of the network.
     pub catalogue_pending: bool,
-    /// What the real-time chunk feed is doing. `Copy` — by value.
-    pub chunk_status: ChunkFeedStatus,
-    /// Each site's current-volume stamp; cloned into the `Gui` on apply.
-    pub current_volumes: &'a std::collections::HashMap<String, CurrentVolumeStamp>,
+    /// **What each layer says it is doing**, in the layer's own vocabulary
+    /// behind an opaque payload (WO-E8c). This replaced two radar-shaped
+    /// members — the chunk-feed status and the per-site volume stamps — and
+    /// the reason it is opaque is that the second one was already the third
+    /// radar field to want a home here.
+    ///
+    /// The shell rebuilds an entry when that layer's answer **changes**;
+    /// every other frame re-states the same `Arc`s.
+    pub liveness: &'a [rustdar_source::liveness::SourceLiveness],
     /// How much extra tile detail the 3D floor can actually show. Pushed from
     /// `present_frame` after this frame's `Gui::ui` under the setter regime,
     /// so the UI always read it a frame late; composed at the top of the next

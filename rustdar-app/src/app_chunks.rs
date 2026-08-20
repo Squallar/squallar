@@ -30,7 +30,10 @@ impl super::App {
             && showing
                 .as_ref()
                 .is_some_and(|(site, _)| self.chunk_notify.chunk_link_open(site));
-        self.chunk_feed_status = status;
+        if self.radar_liveness.chunk_status != status {
+            self.radar_liveness.chunk_status = status;
+            self.republish_liveness();
+        }
         // Ahead of the `enabled` gate on purpose: archive pushes matter most when
         // the chunk feed is off, and reconnection runs from here.
         self.drive_chunk_notifications(&live);
