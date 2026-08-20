@@ -81,6 +81,38 @@ fn a_current_config_reaches_its_save_fixpoint_in_one_round_trip() {
     assert!(gui2.load_ui_config(&store2));
     let save2 = gui2.ui_config_json().expect("a reloaded Gui serializes");
 
+    // The divergence itself, named on the RELOADED panes rather than left
+    // implied by the fixpoint below. This file is the corpus's multi-pane
+    // divergent-site/product fixture, and WO-E6b's shape transform builds one
+    // radar slot per pane out of exactly these three values: a migration that
+    // collapsed them onto the top-level `site`, or onto pane 0's, would still
+    // reach a fixpoint while showing both panes the same picture.
+    let selection = |g: &Gui, i| {
+        let p = g.pane(i).expect("the restored layout has both panes");
+        (
+            p.site().to_string(),
+            p.selected_product(),
+            p.selected_elevation(),
+        )
+    };
+    assert_ne!(
+        selection(&gui, 0),
+        selection(&gui, 1),
+        "premise: this file's two panes differ in all three values",
+    );
+    assert_eq!(
+        selection(&gui2, 0),
+        selection(&gui, 0),
+        "pane 0's site, product and tilt did not survive the reload",
+    );
+    assert_eq!(
+        selection(&gui2, 1),
+        selection(&gui, 1),
+        "pane 1's site, product and tilt did not survive the reload — a \
+         migration that collapsed the panes onto one selection reaches the \
+         fixpoint below while showing both panes the same picture",
+    );
+
     let v1: serde_json::Value = serde_json::from_str(&save1).expect("save1 is JSON");
     let v2: serde_json::Value = serde_json::from_str(&save2).expect("save2 is JSON");
     assert_eq!(
@@ -437,5 +469,110 @@ fn an_unknown_ids_saved_state_survives_a_layer_toggle() {
         v["panes"][0]["overlay_configs"]["MysteryLayer"],
         serde_json::json!({"band": "infrared"}),
         "the save after the toggle must still carry the unknown id's state",
+    );
+
+    // The reload leg (WO-E6a). The pin above stopped at the save, so the
+    // corpus proved the unknown id's *position* survives a round trip (the
+    // draw-order test) and its *state* survives a save — but never the whole
+    // triple through a second session. WO-E6b folds all three into one
+    // `LayerSlot` per id, and that transform can lose the enabled flag or the
+    // config while leaving the order intact, so the reload is the direction
+    // that has to be nailed down before the shape moves.
+    let mut second = Gui::new();
+    assert!(
+        second.load_ui_config(&store_with(&saved)),
+        "the save must reload",
+    );
+    let reloaded = second.pane(0).expect("pane 0");
+    assert_eq!(
+        reloaded.overlay_configs.get(&mystery).cloned(),
+        Some(serde_json::json!({"band": "infrared"})),
+        "the second session lost the unknown id's config",
+    );
+    assert_eq!(
+        reloaded.enabled_overlays.get(&mystery).copied(),
+        Some(true),
+        "the second session lost the unknown id's enabled flag",
+    );
+    assert_eq!(
+        reloaded.draw_order,
+        gui.pane(0).expect("pane 0").draw_order,
+        "the second session's draw order must equal the first's",
+    );
+    let resaved = second.ui_config_json().expect("serializable");
+    let rv: serde_json::Value = serde_json::from_str(&resaved).expect("valid JSON");
+    assert_eq!(
+        rv["panes"][0], v["panes"][0],
+        "save→reload→save is not a fixpoint for a pane carrying an unknown \
+         id's order, enabled flag and config together",
+    );
+}
+
+/// A file whose **global** `live_chunks` is `false`, over two panes.
+///
+/// The setting round-trips today through `set_live_chunks` and a direct
+/// `UiConfig` parse (`live_chunks_config_tests`), but nothing in the corpus
+/// drove the *whole-file* path — `load_ui_config` → `Gui` → `ui_config_json`
+/// — with the value **off**. That is the leg that matters: every other file
+/// here carries the default `true`, so an assertion on it could not tell the
+/// file's value from the value a fresh `Gui` starts with.
+///
+/// WO-E6b turns this global into a per-pane radar-slot member and fans it out
+/// to every pane, so this fixture is deliberately two-pane and deliberately
+/// `false`: after that land, one pane taking the fan-out and the other
+/// silently keeping the default is a difference this test can see, and the
+/// save-fixpoint below is what says the value survives the shape transform in
+/// both directions.
+#[test]
+fn a_global_live_chunks_off_reaches_the_gui_and_returns_on_the_save() {
+    let store = store_with(include_str!("fixtures/live_chunks_off.json"));
+
+    let mut gui = Gui::new();
+    assert!(
+        gui.live_chunks_enabled(),
+        "precondition: a fresh Gui starts with live chunks ON, or the \
+         assertion below could pass without the file being read at all",
+    );
+    assert!(gui.load_ui_config(&store), "the fixture must load");
+    assert!(
+        !gui.live_chunks_enabled(),
+        "the file's live_chunks=false did not reach the Gui",
+    );
+
+    // The rest of the file arrived, so the `false` above came from a load
+    // that worked rather than from one that failed part-way.
+    assert_eq!(gui.pane(0).expect("pane 0").site(), "KDMX");
+    assert_eq!(gui.pane(1).expect("pane 1").site(), "KFTG");
+    assert_ne!(
+        gui.pane(1).expect("pane 1").selected_product(),
+        gui.pane(0).expect("pane 0").selected_product(),
+        "the file gives the two panes different products — equal here means \
+         one of them fell back to the default",
+    );
+
+    // Direction 2, and the reopen-1:1 rule: the save says `false`, a second
+    // session reads it back as `false`, and save₁ == save₂.
+    let save1 = gui.ui_config_json().expect("a loaded Gui serializes");
+    let v1: serde_json::Value = serde_json::from_str(&save1).expect("save1 is JSON");
+    assert_eq!(
+        v1["live_chunks"],
+        serde_json::json!(false),
+        "the save reinstated the default instead of writing the loaded value",
+    );
+
+    let mut gui2 = Gui::new();
+    assert!(
+        gui2.load_ui_config(&store_with(&save1)),
+        "the save must reload"
+    );
+    assert!(
+        !gui2.live_chunks_enabled(),
+        "the second session lost the setting",
+    );
+    let save2 = gui2.ui_config_json().expect("a reloaded Gui serializes");
+    let v2: serde_json::Value = serde_json::from_str(&save2).expect("save2 is JSON");
+    assert_eq!(
+        v1, v2,
+        "save-load-save moved the file: reopening the app would not be 1:1"
     );
 }

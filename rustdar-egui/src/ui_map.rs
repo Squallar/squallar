@@ -136,7 +136,7 @@ impl super::Gui {
 
                     let center = if let Some(scan_info) = &pane.scan_info {
                         Position::new(scan_info.site.lon, scan_info.site.lat)
-                    } else if let Some(site) = rustdar_radar::sites::get_radar_site(&pane.site) {
+                    } else if let Some(site) = rustdar_radar::sites::get_radar_site(pane.site()) {
                         Position::new(site.lon, site.lat)
                     } else {
                         Position::new(-98.5795, 39.8283) // Geographic center of contiguous USA
@@ -369,7 +369,7 @@ impl super::Gui {
                                     actions: &mut actions,
                                 },
                             );
-                            let current_stamp = self.current_volume_for(&pane.site);
+                            let current_stamp = self.current_volume_for(pane.site());
                             let chrome = self.chrome_fade();
                             let chrome_rect = pane_render::color_scale_free_rect(
                                 child_ui.painter(),
@@ -1261,8 +1261,8 @@ fn volume_pane_outcome(
 
     delta.zoom_factor = crate::ui_region::zoom_camera(ui.ctx(), response);
 
-    let site_code = pane.site.clone();
-    let product = pane.selected_product;
+    let site_code = pane.site().to_string();
+    let product = pane.selected_product();
     let loop_grid = pane.active_volume_frame().cloned();
     let navigated = (!pane.viewing_live)
         .then(|| pane.scan_info.as_ref().map(|info| info.timestamp))
@@ -1391,7 +1391,7 @@ pub(crate) fn render_volume_controls(
     alpha_curves: &crate::volume_alpha::AlphaCurves,
     drawing_nothing: Option<&str>,
 ) {
-    let product = pane.selected_product;
+    let product = pane.selected_product();
     let Some(volume) = pane.volume_mut() else {
         return;
     };

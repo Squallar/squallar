@@ -20,7 +20,7 @@ impl super::App {
         let showing = self
             .gui
             .get_rendering_params_for_pane(self.gui.active_pane_idx())
-            .map(|(_, elevation)| (self.gui.active_pane().site.clone(), elevation));
+            .map(|(_, elevation)| (self.gui.active_pane().site().to_string(), elevation));
         let mut status = self.chunk_feeds.status(
             &live,
             enabled,
@@ -331,7 +331,7 @@ impl super::App {
         (0..self.gui.pane_count()).any(|i| {
             self.gui
                 .pane(i)
-                .is_some_and(|p| p.site == site && p.viewing_live)
+                .is_some_and(|p| p.site() == site && p.viewing_live)
         })
     }
 

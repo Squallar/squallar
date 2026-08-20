@@ -570,9 +570,9 @@ impl super::Gui {
             true,
         );
         let pane = &mut self.panes[idx];
-        if pane.selected_product != product {
-            pane.selected_product = product;
-            pane.selected_elevation = 0.0;
+        if pane.selected_product() != product {
+            pane.set_selected_product(product);
+            pane.set_selected_elevation(0.0);
         }
         self.propagate_layer_sync();
         self.select_layer(known::RADAR);
@@ -626,8 +626,8 @@ impl super::Gui {
                 .panes()
                 .iter()
                 .map(|pane| PresetPane {
-                    product: pane.selected_product,
-                    elevation: finite(pane.selected_elevation),
+                    product: pane.selected_product(),
+                    elevation: finite(pane.selected_elevation()),
                 })
                 .collect(),
             overlays: self
@@ -654,8 +654,8 @@ impl super::Gui {
             let pane = &mut self.panes[idx];
             pane.set_view(rustdar_radar::types::RenderView::PlanView);
             if let Some(pp) = preset.panes.get(idx) {
-                pane.selected_product = pp.product;
-                pane.selected_elevation = pp.elevation;
+                pane.set_selected_product(pp.product);
+                pane.set_selected_elevation(pp.elevation);
             }
         }
 

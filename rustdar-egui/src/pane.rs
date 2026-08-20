@@ -785,6 +785,60 @@ impl LoopPlaybackState {
 }
 
 impl PaneState {
+    /// The NEXRAD site this pane is viewing.
+    ///
+    /// # Why a method beside a public field
+    ///
+    /// This accessor and the five below it are plain delegation to the
+    /// same-named fields and do **nothing else** — no invalidation, no
+    /// generation bump, no derived state. They exist so that every production
+    /// read and write of the three radar-selection fields already goes through
+    /// a function on the day WO-E6b moves those fields behind a layer slot: at
+    /// that point the field becomes private and only these six bodies change.
+    /// A call site converted here is a call site that migration never touches.
+    ///
+    /// The fields stay `pub` deliberately — the test suites read them directly
+    /// and are migrated in E6b's own named sub-task, and a field and a method
+    /// of the same name are two different namespaces in Rust, so both spellings
+    /// resolve.
+    ///
+    /// **The setters must never grow a side effect.** Load flows assign a
+    /// pane's site part-way through applying a config, before the scan, the
+    /// product list or the viewport have been restored; anything "helpful"
+    /// added here (dropping the scan, bumping
+    /// [`radar_sites_render_gen`](Self::radar_sites_render_gen), clearing the
+    /// loop) would fire in the middle of that sequence and change load
+    /// ordering. The invalidations that belong to a site change already live at
+    /// the call sites that mean it.
+    pub fn site(&self) -> &str {
+        &self.site
+    }
+
+    /// Set the site this pane is viewing. Plain assignment — see [`Self::site`].
+    pub fn set_site(&mut self, site: String) {
+        self.site = site;
+    }
+
+    /// The radar product this pane has selected.
+    pub fn selected_product(&self) -> RadarProduct {
+        self.selected_product
+    }
+
+    /// Set the selected radar product. Plain assignment — see [`Self::site`].
+    pub fn set_selected_product(&mut self, product: RadarProduct) {
+        self.selected_product = product;
+    }
+
+    /// The elevation angle this pane has selected, in degrees.
+    pub fn selected_elevation(&self) -> f32 {
+        self.selected_elevation
+    }
+
+    /// Set the selected elevation angle. Plain assignment — see [`Self::site`].
+    pub fn set_selected_elevation(&mut self, elevation: f32) {
+        self.selected_elevation = elevation;
+    }
+
     pub fn new() -> Self {
         Self::with_site("KTLX".to_string())
     }
@@ -1026,7 +1080,7 @@ impl PaneState {
             // product at all, so no render will be dispatched and the old image
             // will stand indefinitely. There is no snapped angle to compare
             // against, so the product alone decides.
-            None => meta.product == self.selected_product,
+            None => meta.product == self.selected_product(),
         };
         (!matches_selection).then_some((meta.product, meta.elevation))
     }
@@ -1038,7 +1092,7 @@ impl PaneState {
     /// `rustdar_radar::nyquist`), so past ±Vny the sign wraps. A TDWR always
     /// answers `None`: it declares `nyquist_velocity = 0` on every cut.
     pub fn displayed_nyquist_ms(&self) -> Option<f64> {
-        if self.selected_product != RadarProduct::Velocity || !self.is_map() {
+        if self.selected_product() != RadarProduct::Velocity || !self.is_map() {
             return None;
         }
         if self.loop_state.is_active() {
@@ -1060,7 +1114,7 @@ impl PaneState {
     /// Where the melting layer behind the classification **on screen** came
     /// from, or `None` when the picture is not a classification.
     pub fn displayed_melting_layer_source(&self) -> Option<rustdar_radar::hca::MeltingLayerSource> {
-        if self.selected_product != RadarProduct::HydrometeorClassification || !self.is_map() {
+        if self.selected_product() != RadarProduct::HydrometeorClassification || !self.is_map() {
             return None;
         }
         if self.loop_state.is_active() {
@@ -1081,7 +1135,7 @@ impl PaneState {
     /// The storm motion vector behind the storm-relative field **on screen**,
     /// or `None` when the picture is not storm-relative.
     pub fn displayed_storm_motion(&self) -> Option<rustdar_radar::srv::SrvMotion> {
-        if self.selected_product != RadarProduct::StormRelativeVelocity || !self.is_map() {
+        if self.selected_product() != RadarProduct::StormRelativeVelocity || !self.is_map() {
             return None;
         }
         if self.loop_state.is_active() {

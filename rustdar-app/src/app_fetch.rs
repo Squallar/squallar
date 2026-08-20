@@ -545,7 +545,7 @@ impl super::App {
                 for idx in moving {
                     if let Some(pane) = self.gui.pane_mut(idx) {
                         // Only where the site really moves.
-                        if pane.site != site {
+                        if pane.site() != site {
                             left_a_radar.push(idx);
                             pane.scan_info = None;
                             pane.data_time = None;
@@ -563,7 +563,7 @@ impl super::App {
                             pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new();
                         }
                         pane.loading_site = Some(site.clone());
-                        pane.site = site.clone();
+                        pane.set_site(site.clone());
                         pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
                     }
                 }
@@ -853,7 +853,7 @@ impl super::App {
                     self.clear_overlay_render_marks(&pane_indices, id);
                     return;
                 };
-                let target_site = target_pane.site.clone();
+                let target_site = target_pane.site().to_string();
                 let target_loading = target_pane.loading_site.clone();
                 let is_dark = self.cached_dark_theme.unwrap_or(false);
                 let actual_zoom = zoom as f64 / ZOOM_QUANTIZATION_FACTOR;
@@ -1083,7 +1083,7 @@ impl super::App {
     fn handle_jump_to_live(&mut self, pane_idx: usize) {
         // The pane's site decides everything below — which cached scan is applied,
         // which site the fallback fetch names.
-        let Some(pane_site) = self.gui.pane(pane_idx).map(|p| p.site.clone()) else {
+        let Some(pane_site) = self.gui.pane(pane_idx).map(|p| p.site().to_string()) else {
             return;
         };
 

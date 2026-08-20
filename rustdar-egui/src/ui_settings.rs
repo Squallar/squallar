@@ -421,7 +421,7 @@ impl super::Gui {
                     ui.add_enabled(!self.radar.fetching, egui::Button::new("Refresh radar"));
                 if refresh.clicked() {
                     let mut config = self.radar.config.clone();
-                    config.site = pane.site.clone();
+                    config.site = pane.site().to_string();
                     actions.push(GuiAction::FetchRadarScan(config));
                 }
                 true

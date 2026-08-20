@@ -47,7 +47,7 @@ pub(super) fn render_cross_section(
 ) {
     pane.hover_value = None;
 
-    let product = pane.selected_product;
+    let product = pane.selected_product();
     let site = pane.scan_info.as_ref().map(|s| (s.site.lat, s.site.lon));
 
     let looping = pane.loop_state.is_active();

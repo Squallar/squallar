@@ -131,10 +131,10 @@ impl Gui {
 
             let mut seen_sites: Vec<&str> = Vec::with_capacity(self.pane_layout.pane_count);
             for pane in self.panes.iter().take(self.pane_layout.pane_count) {
-                if pane.viewing_live && !seen_sites.contains(&pane.site.as_str()) {
-                    seen_sites.push(&pane.site);
+                if pane.viewing_live && !seen_sites.contains(&pane.site()) {
+                    seen_sites.push(pane.site());
                     let config = RadarConfig {
-                        site: pane.site.clone(),
+                        site: pane.site().to_string(),
                         timestamp: current_scan_time,
                     };
                     actions.push(GuiAction::CheckForNewScans(config));
@@ -285,8 +285,8 @@ impl Gui {
 
         let (source_product, source_site, source_scan) = match self.panes.get(source) {
             Some(pane) => (
-                pane.selected_product,
-                pane.site.clone(),
+                pane.selected_product(),
+                pane.site().to_string(),
                 pane.scan_info.clone(),
             ),
             None => {
@@ -307,8 +307,8 @@ impl Gui {
             return;
         };
         pane.set_kind(crate::pane::PaneKind::CrossSection);
-        pane.selected_product = source_product;
-        pane.site = source_site;
+        pane.set_selected_product(source_product);
+        pane.set_site(source_site);
         pane.scan_info = source_scan;
         if let Some(section) = pane.cross_section_mut() {
             section.line = Some(line);
@@ -330,8 +330,8 @@ impl Gui {
 
         let (source_product, source_site, source_scan) = match self.panes.get(source) {
             Some(pane) => (
-                pane.selected_product,
-                pane.site.clone(),
+                pane.selected_product(),
+                pane.site().to_string(),
                 pane.scan_info.clone(),
             ),
             None => {
@@ -353,8 +353,8 @@ impl Gui {
         };
         pane.set_kind(crate::pane::PaneKind::Map);
         pane.set_map_render(crate::pane::MapRender::Volume);
-        pane.selected_product = source_product;
-        pane.site = source_site;
+        pane.set_selected_product(source_product);
+        pane.set_site(source_site);
         pane.scan_info = source_scan;
         if let Some(volume) = pane.volume_mut() {
             volume.region = Some(region);

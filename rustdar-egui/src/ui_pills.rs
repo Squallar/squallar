@@ -515,11 +515,11 @@ impl super::Gui {
             let pane = &self.panes[idx];
             let (_, tilt) = pane
                 .get_rendering_params()
-                .unwrap_or((pane.selected_product, pane.selected_elevation));
+                .unwrap_or((pane.selected_product(), pane.selected_elevation()));
             (
-                pane.site.clone(),
+                pane.site().to_string(),
                 pane.render_view(),
-                pane.selected_product,
+                pane.selected_product(),
                 pane.shares_viewport(),
                 (pane.viewport_link, pane.layer_link, pane.time_link),
                 pane.cross_section().and_then(|s| s.line).is_none(),
@@ -529,7 +529,7 @@ impl super::Gui {
                     .map(|info| info.available_products.clone()),
                 pane.scan_info
                     .as_ref()
-                    .and_then(|info| info.product_elevations.get(&pane.selected_product))
+                    .and_then(|info| info.product_elevations.get(&pane.selected_product()))
                     .cloned()
                     .unwrap_or_default(),
             )
@@ -779,9 +779,9 @@ impl super::Gui {
                 if let Some(picked) = outcome.picked {
                     self.active_pane = idx;
                     let pane = &mut self.panes[idx];
-                    if pane.selected_product != picked {
-                        pane.selected_product = picked;
-                        pane.selected_elevation = 0.0;
+                    if pane.selected_product() != picked {
+                        pane.set_selected_product(picked);
+                        pane.set_selected_elevation(0.0);
                     }
                     self.propagate_layer_sync();
                     ui.close_kind(egui::UiKind::Menu);
@@ -797,7 +797,7 @@ impl super::Gui {
             .id(pill_popup_id(idx, PillKind::Tilt))
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
-                let current = self.panes[idx].selected_elevation;
+                let current = self.panes[idx].selected_elevation();
                 let outcome = if elevations.is_empty() {
                     ui.label("Waiting for this product's data");
                     PickOutcome::default()
@@ -816,7 +816,7 @@ impl super::Gui {
                 }
                 if let Some(angle) = outcome.picked {
                     self.active_pane = idx;
-                    self.panes[idx].selected_elevation = angle;
+                    self.panes[idx].set_selected_elevation(angle);
                     self.propagate_layer_sync();
                     ui.close_kind(egui::UiKind::Menu);
                 }
