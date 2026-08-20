@@ -896,30 +896,9 @@ fn a_listing_teaches_the_cadence_before_the_frame_count_is_spent() {
 
 #[test]
 fn the_caption_fixtures_name_caps_this_workspace_ships() {
-    const HEADER: &str = "| target | listing | held | dropped |";
-    let source = include_str!("../../../rustdar-egui/src/ui_timeline/tests.rs");
-    let caps: Vec<usize> = source
-        .lines()
-        .map(|line| line.trim().trim_start_matches("///").trim())
-        .skip_while(|line| *line != HEADER)
-        .skip(2) // the header and the alignment rule
-        .take_while(|line| line.starts_with('|'))
-        .map(|row| {
-            let cells: Vec<&str> = row
-                .split('|')
-                .map(str::trim)
-                .filter(|c| !c.is_empty())
-                .collect();
-            cells[2]
-                .parse()
-                .unwrap_or_else(|_| panic!("the `held` cell of {row:?} is not a frame count"))
-        })
-        .collect();
-    assert_eq!(
-        caps.len(),
-        2,
-        "the measured-defect table is no longer two rows this can read: {caps:?}",
-    );
+    // The `held` values `ui_timeline::tests`'s decimation fixture is built on,
+    // in `a_loop_that_dropped_a_third_of_the_scans_never_claims_every_scan`.
+    let caps = [14usize, 60];
 
     let shipped: Vec<usize> = rustdar_device_profile::budget::BudgetLimits::SHIPPED
         .iter()
@@ -928,11 +907,11 @@ fn the_caption_fixtures_name_caps_this_workspace_ships() {
     for cap in caps {
         assert!(
             shipped.contains(&cap),
-            "`ui_timeline`'s fidelity table quotes a {cap}-frame raster cap, and \
-             the arms this workspace ships are {shipped:?}. The table is a claim \
-             about a measured defect on a real target, so a cap belonging to \
-             none of them makes it a claim about nothing — re-derive the row \
-             against the arm that moved.",
+            "`ui_timeline`'s decimation fixture is built on a {cap}-frame raster \
+             cap, and the arms this workspace ships are {shipped:?}. The fixture \
+             is a claim about a measured defect on a real target, so a cap \
+             belonging to none of them makes it a claim about nothing — \
+             re-derive it against the arm that moved.",
         );
     }
 }

@@ -713,57 +713,48 @@ mod budget_agreement {
         }
     }
 
-    /// The budget table in `constants.rs` still matches what the constants derive.
+    /// The shipped 3D loop budget per target: frame count, one grid, the resident
+    /// set it makes, and the headroom left inside the share.
     #[test]
-    fn the_loop_budget_table_is_the_one_the_constants_derive() {
+    fn the_loop_budget_is_what_the_constants_derive() {
         const MIB: f64 = 1024.0 * 1024.0;
-        // Anchored on this table's own header: `constants.rs` carries a dozen tables keyed
-        // by target name, and matching on the names alone reads all of them.
-        const HEADER: &str = "| target  | frames | 3D texture | resident  | headroom | share   |";
-        // The table lives in the floor crate's doc comment; this side owns the planner that
-        // derives it, so the scrape crosses the crate boundary by path (from rustdar-
-        // app/src/loop_pool/ up to the workspace root).
-        let source = include_str!("../../../rustdar-device-profile/src/constants.rs");
-        let rows: Vec<Vec<String>> = source
-            .lines()
-            .map(|line| line.trim().trim_start_matches("///").trim())
-            .skip_while(|line| *line != HEADER)
-            .skip(2) // the header and the alignment rule
-            .take_while(|line| line.starts_with('|'))
-            .map(|row| {
-                row.split('|')
-                    .map(|cell| cell.trim().replace(" MiB", ""))
-                    .filter(|cell| !cell.is_empty())
-                    .collect()
-            })
-            .collect();
-        assert_eq!(
-            rows.len(),
-            3,
-            "the budget table is no longer three target rows this can read: {rows:?}",
-        );
+        // target, frames, one 3D texture, resident set, headroom, share (MiB).
+        let shipped = [
+            ("wasm32", 11usize, "4.598", "50.57", "5.43", 56usize),
+            ("mobile", 17, "15.550", "264.35", "23.65", 288),
+            ("desktop", 14, "36.598", "512.37", "63.63", 576),
+        ];
 
-        for ((arm, frames), row) in arms().into_iter().zip(SHIPPED_VOLUME_LOOP_FRAMES).zip(rows) {
-            assert_eq!(
-                row[0], arm.name,
-                "the table's rows are out of order: {row:?}"
-            );
+        for ((arm, frames), row) in arms()
+            .into_iter()
+            .zip(SHIPPED_VOLUME_LOOP_FRAMES)
+            .zip(shipped)
+        {
+            let (name, want_frames, texture, resident_mib, headroom, share) = row;
+            assert_eq!(arm.name, name, "the arms are out of order");
+            assert_eq!(frames, want_frames, "{name}: shipped 3D loop frame count");
+
             let grid = volume_bytes(&arm);
             let resident = grid * frames;
-            let expected = [
-                arm.name.to_string(),
-                frames.to_string(),
-                format!("{:.3}", grid as f64 / MIB),
-                format!("{:.2}", resident as f64 / MIB),
-                format!("{:.2}", (arm.volume_loop_bytes() - resident) as f64 / MIB),
-                format!("{}", arm.volume_loop_bytes() / (1024 * 1024)),
-            ];
             assert_eq!(
-                row, expected,
-                "the {} row of the budget table has drifted from what the constants \
-                 derive — the table is what a reader consults before moving a frame \
-                 count, so it is the half that has to be right",
-                arm.name,
+                format!("{:.3}", grid as f64 / MIB),
+                texture,
+                "{name}: one 3D texture",
+            );
+            assert_eq!(
+                format!("{:.2}", resident as f64 / MIB),
+                resident_mib,
+                "{name}: the resident set a full loop holds",
+            );
+            assert_eq!(
+                format!("{:.2}", (arm.volume_loop_bytes() - resident) as f64 / MIB),
+                headroom,
+                "{name}: headroom left inside the share",
+            );
+            assert_eq!(
+                arm.volume_loop_bytes() / (1024 * 1024),
+                share,
+                "{name}: the share itself",
             );
         }
     }
