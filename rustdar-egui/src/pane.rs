@@ -143,6 +143,20 @@ pub fn listing_sample_indices(total: usize, held: usize) -> Option<Vec<usize>> {
 /// same and whether a queued render already covers a frame.
 pub const ELEVATION_TOLERANCE: f32 = 0.01;
 
+/// **One selected tilt as a render's identity carries it: tenths of a degree.**
+///
+/// The one spelling of the quantum. `rustdar-app`'s render-key builder calls
+/// this rather than rounding again, so a picture's cache slot and the check
+/// asking whether that picture is already in hand can never disagree about
+/// which two angles are the same angle.
+///
+/// A bucket, not a tolerance: bucketing is transitive and a tolerance is not,
+/// which is why identity uses this and the snapped-sweep *agreement* checks
+/// still use [`ELEVATION_TOLERANCE`].
+pub fn elevation_tenths(elevation: f32) -> i32 {
+    (elevation * 10.0).round() as i32
+}
+
 /// Every input `render_radar_to_image` is given *except the scan itself*: the radar
 /// site whose coordinates set the projection, and the product/elevation selection
 /// that picks the sweep out of that scan.
@@ -164,18 +178,29 @@ impl RenderTarget {
         }
     }
 
-    /// Whether this target names the same image as `site`/`product`/`elevation`.
-    /// Site and product are exact; elevation is compared within
-    /// `ELEVATION_TOLERANCE`, since the selection is an `f32` that round-trips
-    /// through the UI and the scan's own sweep angles.
-    pub fn matches_parts(&self, site: &str, product: RadarProduct, elevation: f32) -> bool {
+    /// Whether this target names the same picture as `site`/`product`/`elevation`
+    /// **when that picture is drawn as `view`**.
+    ///
+    /// Site and product are exact. The tilt is compared **only when it selects
+    /// the picture** — `RenderView::elevation_selects_picture` is the single
+    /// arbiter, the same question `retarget_renders_keyed` asks — and then by
+    /// [`elevation_tenths`] bucket, which is the quantum the render's own
+    /// identity is built on.
+    pub fn matches_parts(
+        &self,
+        site: &str,
+        product: RadarProduct,
+        elevation: f32,
+        view: RenderView,
+    ) -> bool {
         self.site == site
             && self.product == product
-            && (self.elevation - elevation).abs() <= ELEVATION_TOLERANCE
+            && (!view.elevation_selects_picture(product)
+                || elevation_tenths(self.elevation) == elevation_tenths(elevation))
     }
 
-    pub fn matches(&self, other: &RenderTarget) -> bool {
-        self.matches_parts(&other.site, other.product, other.elevation)
+    pub fn matches(&self, other: &RenderTarget, view: RenderView) -> bool {
+        self.matches_parts(&other.site, other.product, other.elevation, view)
     }
 }
 
@@ -730,7 +755,7 @@ impl LayerTimeState {
     pub fn is_rendered_for(&self, target: &RenderTarget) -> bool {
         self.rendered_for
             .as_ref()
-            .is_some_and(|t| t.matches(target))
+            .is_some_and(|t| t.matches(target, self.view))
     }
 
     /// The index of the frame a finished render for `timestamp`, produced for
@@ -936,19 +961,16 @@ impl LayerTimeState {
         elevation: f32,
         key: Option<LoopViewKey>,
     ) -> bool {
-        let tilt_matters = self.view.elevation_selects_picture(product);
         // Runs for every looping pane every frame, and almost always finds no change,
         // so ask before building a target rather than allocating one to throw away.
         // The site the frames are projected from, which this layer keeps in its
         // own anchor rather than in the generic timeline beside it.
         let site = crate::radar_layer::site(self);
-        if self.rendered_for.as_ref().is_some_and(|t| {
-            if tilt_matters {
-                t.matches_parts(site, product, elevation)
-            } else {
-                t.site == site && t.product == product
-            }
-        }) && self.view_key == key
+        if self
+            .rendered_for
+            .as_ref()
+            .is_some_and(|t| t.matches_parts(site, product, elevation, self.view))
+            && self.view_key == key
         {
             return false;
         }

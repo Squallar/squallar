@@ -3210,7 +3210,14 @@ fn section_already_queued<'a>(
     target: &RenderTarget,
     key: &rustdar_egui::pane::SectionLoopKey,
 ) -> bool {
-    queued.any(|r| r.timestamp == timestamp && r.target.matches(target) && &r.key == key)
+    // A cut's picture is a function of the line, the volume and the storm
+    // motion; the tilt is not an input to it, and `CrossSection` is what says so.
+    queued.any(|r| {
+        r.timestamp == timestamp
+            && r.target
+                .matches(target, rustdar_radar::types::RenderView::CrossSection)
+            && &r.key == key
+    })
 }
 
 /// A loop frame render the dispatcher intends to spawn.
@@ -3268,9 +3275,13 @@ fn render_already_queued<'a>(
     target: &RenderTarget,
     snapped: f32,
 ) -> bool {
+    // A `LoopRenderRequest` carries the site coordinates it builds `RenderParams`
+    // from, so it is a plan view by construction. The snapped term stays: it is
+    // sweep *agreement*, not identity.
     queued.any(|r| {
         r.timestamp == timestamp
-            && r.target.matches(target)
+            && r.target
+                .matches(target, rustdar_radar::types::RenderView::PlanView)
             && (r.snapped - snapped).abs() <= ELEVATION_TOLERANCE
     })
 }

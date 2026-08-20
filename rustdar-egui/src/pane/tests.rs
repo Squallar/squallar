@@ -329,7 +329,10 @@ fn retarget_is_a_noop_before_the_first_dispatch() {
     assert!(state.rendered_for.is_none());
     assert!(!state.retarget_renders(RadarProduct::Reflectivity, 0.5));
     let adopted = state.rendered_for.as_ref().expect("target adopted");
-    assert!(adopted.matches(&target(SITE, RadarProduct::Reflectivity, 0.5)));
+    assert!(adopted.matches(
+        &target(SITE, RadarProduct::Reflectivity, 0.5),
+        RenderView::PlanView
+    ));
 }
 
 #[test]
@@ -375,7 +378,10 @@ fn retarget_reacts_to_an_elevation_change() {
     assert!(state.retarget_renders(RadarProduct::Reflectivity, 1.5));
     assert!(state.frames[0].image.is_none());
     let retargeted = state.rendered_for.as_ref().expect("target adopted");
-    assert!(retargeted.matches(&target(SITE, RadarProduct::Reflectivity, 1.5)));
+    assert!(retargeted.matches(
+        &target(SITE, RadarProduct::Reflectivity, 1.5),
+        RenderView::PlanView
+    ));
 }
 
 /// The four products whose plan view is the same picture at every tilt, named here
@@ -833,14 +839,93 @@ fn the_broadcast_accessor_hands_back_the_frame_that_was_chosen() {
     );
 }
 
-/// Elevation is still compared with tolerance, and the site exactly.
+/// Elevation is still absorbed at the jitter scale — now by sharing a tenths
+/// bucket rather than by a tolerance — and the site is still exact.
 #[test]
 fn target_matching_tolerates_elevation_jitter_only() {
-    let base = target(SITE, RadarProduct::Reflectivity, 0.5);
-    assert!(base.matches(&target(SITE, RadarProduct::Reflectivity, 0.505)));
-    assert!(!base.matches(&target(SITE, RadarProduct::Reflectivity, 1.5)));
-    assert!(!base.matches(&target(SITE, RadarProduct::Velocity, 0.5)));
-    assert!(!base.matches(&target("KOUN", RadarProduct::Reflectivity, 0.5)));
+    let (refl, vel) = (RadarProduct::Reflectivity, RadarProduct::Velocity);
+    let base = target(SITE, refl, 0.5);
+    let view = RenderView::PlanView;
+    assert!(base.matches(&target(SITE, refl, 0.505), view));
+    assert!(!base.matches(&target(SITE, refl, 1.5), view));
+    assert!(!base.matches(&target(SITE, vel, 0.5), view));
+    assert!(!base.matches(&target("KOUN", refl, 0.5), view));
+}
+
+/// **The tilt is part of the acceptance comparison exactly when it selects the
+/// picture** — the same question `retarget_renders_keyed` asks, now asked in one
+/// place. Walks every `(view, product)` pair and compares against
+/// `elevation_selects_picture` rather than against a second list, so the two
+/// cannot drift; the tilt-independent products are named at `TILT_INDEPENDENT`
+/// above, which is what keeps this from restating the predicate.
+#[test]
+fn the_acceptance_comparison_asks_the_tilt_only_when_the_tilt_selects_the_picture() {
+    let mut dropped = 0;
+    let mut kept = 0;
+    for view in [
+        RenderView::PlanView,
+        RenderView::CrossSection,
+        RenderView::Volume,
+    ] {
+        for product in RadarProduct::all().iter().copied() {
+            let base = target(SITE, product, 0.5);
+            // Far enough apart that no bucket and no tolerance could join them.
+            let moved = target(SITE, product, 19.5);
+            let same_picture = base.matches(&moved, view);
+            assert_eq!(
+                same_picture,
+                !view.elevation_selects_picture(product),
+                "{view:?}/{product:?}: the acceptance comparison and \
+                 `elevation_selects_picture` disagree about whether the tilt \
+                 names a different picture",
+            );
+            if same_picture {
+                dropped += 1
+            } else {
+                kept += 1
+            }
+        }
+    }
+    // Non-triviality floor: both answers must actually occur, or a predicate
+    // stuck at one of them would pass the walk above.
+    assert!(
+        dropped > 0 && kept > 0,
+        "the walk saw only one answer ({dropped} dropped, {kept} kept) and so \
+         could not have caught a comparison stuck at either",
+    );
+}
+
+/// **The two boundaries where a bucket and a tolerance disagree, pinned by the
+/// exact angles the campaign named.** A bucket is transitive and a tolerance is
+/// not, and this is what that difference looks like from the outside: the
+/// change is stated here rather than smoothed away.
+#[test]
+fn the_bucket_and_the_tolerance_part_company_at_two_named_boundaries() {
+    let view = RenderView::PlanView;
+    let product = RadarProduct::Reflectivity;
+
+    // 0.002 apart — inside ELEVATION_TOLERANCE, so this used to be an
+    // acceptance; buckets 5 and 6, so it is now an INVALIDATION and the render
+    // is dispatched again.
+    assert!(
+        (0.549_f32 - 0.551_f32).abs() <= ELEVATION_TOLERANCE,
+        "precondition: the old rule called these the same angle",
+    );
+    assert!(
+        !target(SITE, product, 0.549).matches(&target(SITE, product, 0.551), view),
+        "0.549 and 0.551 straddle a tenths boundary and must no longer match",
+    );
+
+    // 0.03 apart — outside ELEVATION_TOLERANCE, so this used to be a refusal;
+    // both in bucket 5, so it is now an EARLY-OUT and the render is skipped.
+    assert!(
+        (0.50_f32 - 0.53_f32).abs() > ELEVATION_TOLERANCE,
+        "precondition: the old rule called these different angles",
+    );
+    assert!(
+        target(SITE, product, 0.50).matches(&target(SITE, product, 0.53), view),
+        "0.50 and 0.53 share a tenths bucket and must now match",
+    );
 }
 
 /// Item 2: the accept check and the write must resolve to the same frame.

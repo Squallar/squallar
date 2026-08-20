@@ -102,7 +102,11 @@ const UI_SETTER_MAX: usize = 3;
 /// ratified +2 against the pre-pass 444, i.e. 446; the comment pass then took
 /// the row down to 438, so the amendment lands at 440 and spends 6 less than
 /// it was granted. Anything beyond +2 from WO-E6a is not this amendment.
-const PRODUCT_IN_EGUI_MAX: usize = 440;
+///
+/// **439 since WO-E7e**: its two new pins name the enum twice, and hoisting the
+/// repeated product bindings in `target_matching_tolerates_elevation_jitter_only`
+/// gave back three — lowered in the land that earned it, never raised.
+const PRODUCT_IN_EGUI_MAX: usize = 439;
 /// Row 6.
 const HUB_RECEIVER_MAX: usize = 18;
 

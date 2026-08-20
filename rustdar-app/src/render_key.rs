@@ -5,8 +5,14 @@ use rustdar_radar::types::{RadarProduct, RenderView};
 use rustdar_source::id::{LayerId, known};
 
 /// Quantize an elevation angle to tenths of a degree for cache key use.
+///
+/// **Delegates rather than rounds.** The quantum is one value in one place —
+/// `rustdar_egui::pane::elevation_tenths` — because the acceptance check that
+/// asks "is this picture already in hand?" compares the same two angles this
+/// key separates them by, and a second spelling here is how those two answers
+/// would drift apart.
 pub(crate) fn elevation_key(elevation: f32) -> i32 {
-    (elevation * 10.0).round() as i32
+    rustdar_egui::pane::elevation_tenths(elevation)
 }
 
 /// Whether the radar layer's cached raster would come out different in the other UI theme —

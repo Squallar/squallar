@@ -166,3 +166,35 @@ fn selections_in_one_tenths_bucket_are_one_key_and_a_bucket_apart_are_two() {
         "control: two sites at one tilt collapsed to one key",
     );
 }
+
+/// **The quantum has one spelling, and this is what holds it to one.** The
+/// render key separates two tilts into two cache slots; the acceptance check
+/// decides whether a picture already in hand is the one being asked for. If
+/// those two rounded independently, a pane could hold a texture the key says
+/// belongs to a different picture — so `elevation_key` delegates, and this
+/// walks angles either could have disagreed on.
+#[test]
+fn the_key_and_the_acceptance_check_bucket_a_tilt_the_same_way() {
+    // Boundaries, midpoints, negatives and the two angles the campaign named.
+    let angles: [f32; 12] = [
+        0.0, 0.04, 0.05, 0.5, 0.53, 0.549, 0.551, 1.45, 1.5, 19.5, -0.04, -0.06,
+    ];
+    let mut buckets = std::collections::HashSet::new();
+    for a in angles {
+        assert_eq!(
+            elevation_key(a),
+            rustdar_egui::pane::elevation_tenths(a),
+            "{a} buckets differently for the cache key than for the \
+             acceptance check",
+        );
+        buckets.insert(elevation_key(a));
+    }
+    // Non-triviality floor: a quantizer stuck on a constant would satisfy the
+    // equality above at every angle.
+    assert!(
+        buckets.len() >= 6,
+        "the walk produced only {} distinct buckets, so it could not have \
+         caught a quantizer stuck on a constant",
+        buckets.len(),
+    );
+}
