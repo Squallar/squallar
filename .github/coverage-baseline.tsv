@@ -6,9 +6,9 @@ nexrad-level3/src/model/header.rs	219	217
 nexrad-level3/src/model/radial.rs	86	85
 nexrad-level3/src/model/symbology.rs	5	5
 rustdar-app/src/app.rs	1191	857
-rustdar-app/src/app_chunks.rs	212	125
-rustdar-app/src/app_fetch.rs	1240	809
-rustdar-app/src/app_render.rs	2254	1570
+rustdar-app/src/app_chunks.rs	212	116
+rustdar-app/src/app_fetch.rs	1240	836
+rustdar-app/src/app_render.rs	2255	1571
 rustdar-app/src/app_state.rs	72	0
 rustdar-app/src/budget_arms.rs	17	17
 rustdar-app/src/budget_memo.rs	54	52
@@ -39,14 +39,14 @@ rustdar-egui/src/gui/sync.rs	133	131
 rustdar-egui/src/input_harness.rs	1307	1297
 rustdar-egui/src/legend_ramp.rs	146	146
 rustdar-egui/src/overlay_cache.rs	235	230
-rustdar-egui/src/pane.rs	815	790
+rustdar-egui/src/pane.rs	833	808
 rustdar-egui/src/pane_content.rs	202	189
 rustdar-egui/src/parity_walk.rs	313	271
 rustdar-egui/src/point_painter.rs	55	0
 rustdar-egui/src/sources.rs	86	79
 rustdar-egui/src/tile_source.rs	242	235
 rustdar-egui/src/tiles.rs	107	96
-rustdar-egui/src/ui.rs	1031	874
+rustdar-egui/src/ui.rs	1032	874
 rustdar-egui/src/ui_catalog.rs	468	461
 rustdar-egui/src/ui_config.rs	732	687
 rustdar-egui/src/ui_config/migrate.rs	31	30
@@ -55,7 +55,7 @@ rustdar-egui/src/ui_glyphs.rs	218	206
 rustdar-egui/src/ui_input.rs	335	335
 rustdar-egui/src/ui_inspector.rs	282	274
 rustdar-egui/src/ui_layout.rs	257	257
-rustdar-egui/src/ui_map.rs	1484	1421
+rustdar-egui/src/ui_map.rs	1480	1417
 rustdar-egui/src/ui_map_overlays.rs	186	178
 rustdar-egui/src/ui_map_pane.rs	1511	1290
 rustdar-egui/src/ui_menu.rs	384	350
@@ -151,7 +151,7 @@ rustdar-radar/src/beam.rs	33	33
 rustdar-radar/src/catalogue.rs	137	122
 rustdar-radar/src/chunk_feed.rs	271	257
 rustdar-radar/src/chunk_notify.rs	340	309
-rustdar-radar/src/chunks.rs	975	710
+rustdar-radar/src/chunks.rs	975	702
 rustdar-radar/src/current.rs	117	116
 rustdar-radar/src/derive.rs	311	294
 rustdar-radar/src/dpprep.rs	1022	956
@@ -164,7 +164,7 @@ rustdar-radar/src/hover.rs	49	49
 rustdar-radar/src/jobs.rs	559	525
 rustdar-radar/src/kdp.rs	247	203
 rustdar-radar/src/l3_values.rs	282	281
-rustdar-radar/src/level3.rs	188	115
+rustdar-radar/src/level3.rs	188	134
 rustdar-radar/src/loop_downloads.rs	690	683
 rustdar-radar/src/nrot.rs	3227	3168
 rustdar-radar/src/nyquist.rs	126	107
