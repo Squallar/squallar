@@ -315,7 +315,7 @@ pub enum LoopPhase {
 /// **Generic on purpose.** No member here names a radar site or a coordinate.
 /// The source-specific half of a layer's timeline — for radar, the geometry
 /// its frames are projected from — rides in [`Self::anchor`] as a value only
-/// the owning layer's own code names ([`crate::radar_layer::LoopGeometry`]),
+/// the owning layer's own code names ([`rustdar_radar::loop_geometry::LoopGeometry`]),
 /// so a second frame-series layer inherits a timeline rather than three
 /// NEXRAD fields.
 pub struct LayerTimeState {
@@ -360,7 +360,7 @@ pub struct LayerTimeState {
     pub listing_since: Option<web_time::Instant>,
     /// **The source-specific half of this layer's timeline**, opaque here and
     /// named by the layer that owns it. Radar puts a
-    /// [`crate::radar_layer::LoopGeometry`] in it; read it back with
+    /// [`rustdar_radar::loop_geometry::LoopGeometry`] in it; read it back with
     /// [`Self::anchor_as`].
     pub anchor: Option<rustdar_source::handler::FetchPayload>,
     /// The [`RenderTarget`] every frame's render state was produced for, or `None`
