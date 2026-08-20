@@ -1,5 +1,9 @@
-//! Compass heading via JNI (CompassHelper.java): the class handle and the
+//! Compass heading via JNI (`CompassHelper.kt`): the class handle and the
 //! 200 ms poll thread.
+//!
+//! The sensor itself is registered and unregistered on the Kotlin side, against
+//! the Activity's resumed window — see the class doc there. This side only
+//! reads, and a paused app answers `-1` until it resumes.
 
 use super::with_env;
 

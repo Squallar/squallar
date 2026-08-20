@@ -153,6 +153,11 @@ pub struct App {
     platform: Box<dyn PlatformBridge>,
     texture_counter: u32,
     cached_dark_theme: Option<bool>,
+    /// The last predictive-back claim pushed to the platform, so the push is
+    /// edge-triggered. `false` at construction because nothing is open on the
+    /// first frame — which is also what the platform assumes until told
+    /// otherwise, so the two start in agreement.
+    back_claimed: bool,
     exit_requested: bool,
     /// Native only.
     #[cfg(not(target_arch = "wasm32"))]
@@ -417,6 +422,7 @@ impl App {
             platform,
             texture_counter: 0,
             cached_dark_theme: None,
+            back_claimed: false,
             exit_requested: false,
             autosave: AutosaveState {
                 last_check: None,
@@ -544,6 +550,7 @@ impl App {
         let (screen_descriptor, gui_actions) = self.setup_egui_frame();
         let repaint_delay = self.present_frame(screen_descriptor);
         self.process_gui_actions(gui_actions);
+        self.push_back_claim();
 
         if self.render.any_render_in_flight()
             || self.gui.any_loop_active()
@@ -1348,8 +1355,11 @@ impl App {
 
     /// Drop the decoded volumes no pane is showing.
     fn evict_unshown_scans(&mut self) {
-        let mut shown: Vec<&str> = Vec::with_capacity(self.gui.pane_count() * 2);
-        for idx in 0..self.gui.pane_count() {
+        // One query, not two: this runs on every frame, and the second call was
+        // asking the same question of the same unchanged Gui.
+        let pane_count = self.gui.pane_count();
+        let mut shown: Vec<&str> = Vec::with_capacity(pane_count * 2);
+        for idx in 0..pane_count {
             let Some(pane) = self.gui.pane(idx) else {
                 continue;
             };
@@ -1683,6 +1693,12 @@ impl App {
         self.platform.set_back_press_taker(taker);
     }
 
+    /// Set the sink this app publishes its predictive-back claim to (Android only;
+    /// see [`PlatformBridge::set_back_claimed`]).
+    pub fn set_back_claim_reporter(&mut self, reporter: fn(bool)) {
+        self.platform.set_back_claim_reporter(reporter);
+    }
+
     /// Whether egui is going to want this key press for itself.
     fn ui_is_taking_keys(&self) -> bool {
         self.state
@@ -1693,6 +1709,30 @@ impl App {
     fn handle_input_events(&mut self, event_loop: &ActiveEventLoop) {
         if self.input.take_back_out_press() && !self.ui_is_taking_keys() {
             self.back_out(event_loop);
+        }
+    }
+
+    /// Tell the platform whether the next back press has something to close.
+    ///
+    /// Registering and unregistering truthfully at every sheet transition IS the
+    /// whole obligation the Android predictive-back route places on this side:
+    /// the dispatcher decides before the gesture whether the app or the system
+    /// owns it, and takes no answer afterwards. So this runs at the end of every
+    /// frame, once the frame's actions have been applied and the Gui's state is
+    /// final.
+    ///
+    /// On change only. The far end is a JNI static call, and a per-frame hop at
+    /// 120 Hz is the cost this shape exists to avoid.
+    ///
+    /// The claim is not consulted by anything yet: Android ships opted OUT of
+    /// the predictive-back dispatcher, on a measurement recorded in the app's
+    /// manifest, so back still arrives as a key. What this keeps alive is the
+    /// truthfulness, which is the part that cannot be added later in a hurry.
+    fn push_back_claim(&mut self) {
+        let claimed = self.gui.back_would_dismiss();
+        if claimed != self.back_claimed {
+            self.back_claimed = claimed;
+            self.platform.set_back_claimed(claimed);
         }
     }
 
@@ -1833,7 +1873,8 @@ impl ApplicationHandler for App {
         self.window = None;
         self.state = None;
         // The third holder of that window, and the only one this thread does not own
-        // outright: five sensor threads have a clone of the waker.
+        // outright: five sensor threads have a clone of the waker, and on Android
+        // so does the predictive-back callback's parking slot.
         self.redraw_waker.detach();
         #[cfg(target_arch = "wasm32")]
         {

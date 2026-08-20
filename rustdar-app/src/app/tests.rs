@@ -330,20 +330,23 @@ fn a_dismissal_asks_for_the_frame_that_shows_it() {
 
 // ── The second delivery route: Android's predictive back ────────────
 // `OnBackInvokedDispatcher` does not go through the input queue, so none of the pins above
-// see it.
+// see it. It is also not a route this app is reachable through today -- the manifest does not
+// opt in, on a measurement recorded there -- so everything below pins the SOURCE of a route
+// kept correct and dormant, not a behaviour a device would exhibit.
 
-/// The Java half of the route, so a rename on either side is a build failure rather than an
+/// The Kotlin half of the route, so a rename on either side is a build failure rather than an
 /// `UnsatisfiedLinkError` on a device.
-const BACK_HANDLER_JAVA: &str =
-    include_str!("../../../packaging/android/app/src/main/java/com/rustdar/BackHandler.java");
+const BACK_HANDLER_KT: &str =
+    include_str!("../../../packaging/android/app/src/main/kotlin/com/rustdar/BackHandler.kt");
 
 /// The Rust half: the one module file that CONTAINS the exported JNI symbol
 /// (`rustdar/src/android/back.rs`) -- NOT the crate root, which since the android fold
 /// holds only module mounts and would silently pin wrong text.
 const ANDROID_BACK: &str = include_str!("../../../rustdar/src/android/back.rs");
 
-/// `src` with its Java comments removed.
-fn java_code(src: &str) -> String {
+/// `src` with its comments removed. Kotlin's `//` and `/* */` are Java's, so the
+/// same stripper serves both; KDoc is a `/** */`, which `/*` already opens.
+fn jvm_code(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     let mut rest = src;
     while let Some(slash) = rest.find('/') {
@@ -381,56 +384,278 @@ fn a_back_press_from_the_platform_reaches_the_funnel_too() {
 }
 
 /// The two ends of the JNI hop must agree on one name.
+///
+/// `@JvmStatic` is checked here because it is load-bearing twice and invisible
+/// both times: without it an `object`'s members are not static methods of
+/// `BackHandler`, so `Java_com_rustdar_BackHandler_nativeBackPressed` binds to
+/// nothing and `call_static_method("setClaimed")` throws `NoSuchMethodError` —
+/// neither of which a host build can notice. This grep only proves the spelling;
+/// WO-RP-SPIKE is where the binding itself was proven on a device.
 #[test]
-fn the_java_callback_calls_the_symbol_rust_exports() {
-    let java = java_code(BACK_HANDLER_JAVA);
+fn the_kotlin_callback_calls_the_symbol_rust_exports() {
+    let kt = jvm_code(BACK_HANDLER_KT);
     assert!(
-        java.contains("package com.rustdar;")
-            && java.contains("class BackHandler")
-            && java.contains("native boolean nativeBackPressed()"),
-        "the Java side no longer declares com.rustdar.BackHandler.nativeBackPressed",
+        kt.contains("package com.rustdar")
+            && kt.contains("object BackHandler")
+            && kt.contains("external fun nativeBackPressed()"),
+        "the Kotlin side no longer declares com.rustdar.BackHandler.nativeBackPressed",
     );
+    for (marker, why) in [
+        ("external fun nativeBackPressed", "the native symbol binds"),
+        ("fun setClaimed", "the claim call reaches a static method"),
+        (
+            "fun register",
+            "register_java_helper's (Landroid/app/Activity;)V call lands",
+        ),
+    ] {
+        let at = kt
+            .find(marker)
+            .unwrap_or_else(|| panic!("BackHandler.kt no longer declares `{marker}`"));
+        let line_start = kt[..at].rfind('\n').map_or(0, |nl| nl + 1);
+        let preceding = &kt[..line_start];
+        assert!(
+            preceding.trim_end().ends_with("@JvmStatic"),
+            "`{marker}` lost its @JvmStatic, so {why} no longer holds",
+        );
+    }
     assert!(
         ANDROID_BACK.contains("fn Java_com_rustdar_BackHandler_nativeBackPressed("),
         "nothing exports the symbol BackHandler.nativeBackPressed() binds to",
     );
 }
 
-/// Offsets of every *call* to `name`, skipping the line that declares it.
-fn call_sites(java: &str, name: &str) -> Vec<usize> {
-    java.match_indices(name)
-        .map(|(at, _)| at)
-        .filter(|at| {
-            let line = java[..*at].rfind('\n').map_or(0, |nl| nl + 1);
-            !java[line..*at].contains("native ")
-        })
-        .collect()
+/// Three spellings of one library, and the native method binds only if they agree.
+///
+/// `BackHandler.kt` declares a native method, so ART has to find
+/// `librustdar_native.so` on the JavaVM's library list under the app's own
+/// ClassLoader — and it is not there, because NativeActivity dlopen()s the file
+/// by path instead of going through `System.loadLibrary`. The `init` block that
+/// repairs that names the library as a bare string, so this pins the string
+/// against the two declarations that actually decide the filename: rustdar's
+/// `[lib] name` (which is what cargo calls the cdylib) and the manifest's
+/// `android.app.lib_name` (which is what NativeActivity resolves). A rename of
+/// either without the third is an `UnsatisfiedLinkError` on a device and nothing
+/// at all on a host.
+#[test]
+fn the_kotlin_helper_loads_the_library_the_manifest_names() {
+    const CARGO: &str = include_str!("../../../rustdar/Cargo.toml");
+    const MANIFEST: &str =
+        include_str!("../../../packaging/android/app/src/main/AndroidManifest.xml");
+
+    let lib_name = CARGO
+        .split_once("[lib]")
+        .and_then(|(_, rest)| rest.split_once("name = \""))
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(name, _)| name)
+        .expect("rustdar/Cargo.toml no longer declares a [lib] name");
+    assert_eq!(
+        lib_name, "rustdar_native",
+        "the cdylib was renamed; the manifest and BackHandler.kt below have to move with it",
+    );
+    assert!(
+        MANIFEST.contains(&format!("android:value=\"{lib_name}\"")),
+        "AndroidManifest's android.app.lib_name is no longer {lib_name}, so \
+         NativeActivity dlopen()s a different file than the one BackHandler loads",
+    );
+    assert!(
+        jvm_code(BACK_HANDLER_KT).contains(&format!("System.loadLibrary(\"{lib_name}\")")),
+        "BackHandler.kt no longer loads {lib_name} under its own ClassLoader. \
+         NativeActivity's dlopen does not register the library with ART, so \
+         without this the native method binds to nothing and every claimed back \
+         press is dropped on the UI thread",
+    );
 }
 
-/// The bomb this route was built to defuse.
+/// The one manifest attribute that decides whether this app can be reopened.
+///
+/// `android:enableOnBackInvokedCallback="true"` opts the app into the
+/// predictive-back dispatcher, and that is the whole reason `BackHandler.kt`
+/// exists. It is nevertheless ABSENT, on a measurement: with it present, a back
+/// press with nothing open backgrounds the app exactly as designed and the app
+/// can then never be reopened — the relaunch starts a fresh
+/// `android.app.NativeActivity` and `android_main` does not run for a second
+/// Activity in this process, so the stock splash stays up (WO-RP-SPIKE leg 4b,
+/// paired A/B on device, 2/2 each arm).
+///
+/// Nothing in a host build can notice that attribute coming back, and the
+/// machinery below it is written to work — so a reader who takes the
+/// class doc at face value and "finishes the job" bricks the app silently.
+/// This is the guard that refuses instead. When `android_main` runs for a
+/// re-created Activity, delete this test in the land that proves it.
 #[test]
-fn the_predictive_back_callback_asks_rust_before_it_minimises() {
-    let java = java_code(BACK_HANDLER_JAVA);
-    assert!(
-        java.contains("registerOnBackInvokedCallback"),
-        "BackHandler no longer registers a callback",
-    );
+fn the_manifest_does_not_opt_into_predictive_back() {
+    const MANIFEST: &str =
+        include_str!("../../../packaging/android/app/src/main/AndroidManifest.xml");
 
-    let asks = *call_sites(&java, "nativeBackPressed(")
-        .first()
-        .expect("BackHandler declares the native funnel but never calls it");
+    // XML comments carry the reasoning above, including the attribute's own
+    // name, so the document has to be read without them.
+    let mut markup = String::with_capacity(MANIFEST.len());
+    let mut rest = MANIFEST;
+    while let Some(open) = rest.find("<!--") {
+        markup.push_str(&rest[..open]);
+        let after = &rest[open + 4..];
+        match after.find("-->") {
+            Some(close) => rest = &after[close + 3..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    markup.push_str(rest);
 
-    for minimises in call_sites(&java, "moveTaskToBack(") {
+    // Presence control: a stripper that ate the document would make the
+    // absence below true for the wrong reason.
+    for anchor in [
+        "<application",
+        "android:hasCode=\"true\"",
+        "android.app.lib_name",
+    ] {
         assert!(
-            minimises > asks,
-            "BackHandler minimises before it asks Rust, so one press with \
-                 the drawer open minimises the app",
+            markup.contains(anchor),
+            "the comment stripper ate the manifest: `{anchor}` is gone, so the \
+             absence this test asserts would hold vacuously",
         );
     }
+
+    assert_eq!(
+        markup.matches("enableOnBackInvokedCallback").count(),
+        0,
+        "the manifest opts into the predictive-back dispatcher again. Measured on \
+         a device (WO-RP-SPIKE leg 4b): with this attribute an unclaimed back \
+         press backgrounds the app and the app CANNOT BE REOPENED, because \
+         android_main does not run for the second Activity the relaunch creates. \
+         Fix that first; the attribute is the last step, not the first",
+    );
+}
+
+/// The decision this class is not allowed to make.
+///
+/// The old Java version minimised for itself when it could not route a press,
+/// and the one allowance was argued as a fallback. Under the claim design there
+/// is nothing left to fall back to: the callback is registered only while Rust
+/// says something is open, so a press that reaches it always has a funnel, and a
+/// press with nothing open never reaches it at all — that is what leaves the
+/// platform free to draw its own back-to-home preview. A `moveTaskToBack` here
+/// would take that animation away and re-open the "one press with the drawer
+/// open minimises the app" hole from the other side.
+///
+/// Live today only as a property of the source: the app is not opted into the
+/// dispatcher, so the callback is never invoked (the manifest carries why).
+/// The pin is what keeps the class re-openable — a minimise added into it while
+/// it is dormant is a bug that would ship the day the opt-in does.
+#[test]
+fn the_predictive_back_callback_never_minimises() {
+    let kt = jvm_code(BACK_HANDLER_KT);
     assert!(
-        java.matches("moveTaskToBack(").count() <= 1,
-        "a second minimise appeared in BackHandler; the one this class is \
-             allowed is the fallback for a press with no event loop to route to",
+        kt.contains("registerOnBackInvokedCallback")
+            && kt.contains("unregisterOnBackInvokedCallback"),
+        "BackHandler no longer registers AND unregisters its callback; a claim \
+         it cannot withdraw is a claim it cannot make truthfully",
+    );
+    assert!(
+        kt.contains("nativeBackPressed()"),
+        "BackHandler declares the native funnel but never calls it",
+    );
+    assert_eq!(
+        kt.matches("moveTaskToBack").count(),
+        0,
+        "BackHandler minimises for itself again; the minimise belongs to \
+         App::resolve_back_press, which is the only side that knows whether \
+         the press closed anything",
+    );
+    assert_eq!(
+        kt.matches("OnBackAnimationCallback").count(),
+        0,
+        "an OnBackAnimationCallback appeared: this app draws no in-app back \
+         animation, and registering one takes the system's own preview away",
+    );
+}
+
+/// A claim that has gone stale must still land somewhere safe.
+///
+/// The claim is pushed at the end of a frame and the press arrives whenever the
+/// user makes it, so the two can disagree for a frame. The design's answer is
+/// that the claimed route is not a second decision path: it parks a flag that
+/// `about_to_wait` funnels into the very same `back_out` the legacy KEYCODE_BACK
+/// route ends in, and that funnel minimises through `handle_back` when it finds
+/// nothing to dismiss. This pins the funnel, not the prose.
+#[test]
+fn a_stale_back_claim_still_resolves_through_the_app() {
+    assert!(
+        ANDROID_BACK.contains("BACK_PRESS_PENDING.store(true"),
+        "the JNI callback no longer parks a press for the loop to collect",
+    );
+    assert!(
+        ANDROID_BACK.contains("pub(super) fn take_back_press() -> bool"),
+        "nothing exposes the parked press to the bridge's poll_back_press",
+    );
+
+    let about_to_wait = fn_body("fn about_to_wait(");
+    assert!(
+        about_to_wait.contains("if self.platform.poll_back_press() {")
+            && about_to_wait.contains("self.back_out("),
+        "the parked press no longer reaches back_out: {about_to_wait}",
+    );
+
+    let resolve = fn_body("fn resolve_back_press(");
+    let dismisses = resolve
+        .find("dismiss_top_layer()")
+        .expect("resolve_back_press no longer asks the Gui to close anything");
+    let minimises = resolve
+        .find("platform.handle_back()")
+        .expect("resolve_back_press no longer has a minimise for a press that closed nothing");
+    assert!(
+        minimises > dismisses,
+        "resolve_back_press minimises before it tries to dismiss, so a stale \
+         claim would background the app with a sheet open: {resolve}",
+    );
+}
+
+/// The claim, and the fact that it is only pushed when it moves.
+///
+/// Android's dispatcher decides ownership of the gesture before it happens, so
+/// the claim has to be published ahead of the press and has to be true at every
+/// transition. It also has to be published on transitions ONLY: the far end is a
+/// JNI static call and this runs at the end of every frame, so a push per frame
+/// is a JNI hop at the display's refresh rate for a value that changes when the
+/// user opens a sheet.
+#[test]
+fn the_back_claim_is_pushed_when_it_changes_and_only_then() {
+    let bridge = TestBridge::android();
+    let claims = bridge.back_claim_log();
+    let mut app = headless(bridge);
+
+    app.push_back_claim();
+    app.push_back_claim();
+    assert!(
+        claims.borrow().is_empty(),
+        "a claim of `false` was pushed with nothing open; the platform starts \
+         unregistered, so that push says nothing and costs a JNI call: {:?}",
+        claims.borrow(),
+    );
+
+    app.gui.open_settings();
+    app.push_back_claim();
+    app.push_back_claim();
+    app.push_back_claim();
+    assert_eq!(
+        &*claims.borrow(),
+        &[true],
+        "opening the inspector must claim the next press exactly once",
+    );
+
+    assert!(
+        app.gui.dismiss_top_layer(),
+        "precondition: the inspector was the open layer",
+    );
+    app.push_back_claim();
+    app.push_back_claim();
+    assert_eq!(
+        &*claims.borrow(),
+        &[true, false],
+        "closing the last open layer must WITHDRAW the claim, or the app keeps \
+         swallowing back presses the platform should have taken home",
     );
 }
 

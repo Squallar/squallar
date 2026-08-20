@@ -5,7 +5,7 @@
 //! `android_main`: the entry point NativeActivity dlsym()s out of
 //! `librustdar_native.so`, and all the wiring it installs.
 
-use super::back::{set_event_loop_proxy, take_back_press};
+use super::back::{BACK_CLASS, report_back_claim, set_back_waker, take_back_press};
 use super::compass::{COMPASS_CLASS, start_compass_thread};
 use super::density::get_display_density;
 use super::insets::get_system_insets;
@@ -92,12 +92,20 @@ fn android_main(app: AndroidApp) {
                 .and_then(|v| v.l())
                 .expect("Context.getClassLoader() failed");
 
-            // Predictive back. Once the app opts in, back bypasses the native
-            // input queue and goes through OnBackInvokedDispatcher; unhandled,
-            // NativeActivity calls finish() and the process dies. Registered
-            // before the event loop exists, so presses in that window take the
-            // callback's own minimise.
-            register_java_helper(env, &loader, &activity, "com.rustdar.BackHandler");
+            // Predictive back. `register` only stashes the Activity: the
+            // callback goes on and off with the app's claim, pushed from the
+            // frame loop through `report_back_claim` below. The manifest does
+            // NOT opt this app into OnBackInvokedDispatcher (it was measured
+            // and the app could not be reopened afterwards -- the reading is in
+            // AndroidManifest.xml), so that callback is never invoked and back
+            // arrives as KEYCODE_BACK through `take_back_press`'s neighbour,
+            // the native input queue. Wired truthfully against the targetSdk 36
+            // deadline, when the opt-in stops being a choice.
+            if let Some(cls) =
+                register_java_helper(env, &loader, &activity, "com.rustdar.BackHandler")
+            {
+                let _ = BACK_CLASS.set(cls);
+            }
 
             if let Some(cls) =
                 register_java_helper(env, &loader, &activity, "com.rustdar.CompassHelper")
@@ -123,21 +131,29 @@ fn android_main(app: AndroidApp) {
         .build()
         .expect("Failed to create event loop");
 
-    // The predictive-back callback runs on the UI thread and cannot touch the
-    // App; this is how it reaches the loop that can. Installed before
-    // `run_app` — until it is, `post_back_press` reports `false`. An
-    // *overwrite*: a previous proxy is attached to a consumed `EventLoop`.
-    set_event_loop_proxy(Some(event_loop.create_proxy()));
-
     let mut platform_app = rustdar_app::app::App::new(
         Box::new(crate::platform::create_platform()),
         crate::platform::create_location(),
     );
 
+    // The legacy route's minimise — the only delivery below API 33 — and the
+    // safety net above it: a press that reaches `resolve_back_press` with
+    // nothing to dismiss minimises here rather than finishing the Activity.
     platform_app.set_back_handler(move_task_to_back);
 
     // ...and where a press from OnBackInvokedDispatcher is collected.
     platform_app.set_back_press_taker(take_back_press);
+
+    // What the app tells BackHandler about the next press. Edge-triggered from
+    // the end of a frame; see `App::push_back_claim`.
+    platform_app.set_back_claim_reporter(report_back_claim);
+
+    // The predictive-back callback runs on the UI thread and cannot touch the
+    // App; this is how a press it parks asks for the iteration that spends it.
+    // The same handle the sensor threads wake with — a *clone*, so `suspended`
+    // detaching the app's copy takes this one with it. An overwrite: a previous
+    // waker belongs to a consumed `EventLoop`.
+    set_back_waker(Some(platform_app.redraw_waker()));
 
     if let Some(cache_path) = android_zone_cache {
         platform_app.set_zone_cache_dir(cache_path);
@@ -184,10 +200,9 @@ fn android_main(app: AndroidApp) {
         log::error!("Application error: {}", e);
     }
 
-    // `run_app` consumed the loop, so the proxy above is a corpse. Dropping it
-    // means a back press before the next `android_main` minimises rather than
-    // looking like a delivery failure.
-    set_event_loop_proxy(None);
+    // `run_app` consumed the loop, so the waker above has nothing behind it.
+    // Dropping it also drops the press parked against the loop that just died.
+    set_back_waker(None);
 
     // Same for the Activity context: the object behind [`JAVA`] is a destroyed
     // Activity from here, so let the global ref go and let the helpers degrade.

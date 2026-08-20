@@ -10577,6 +10577,276 @@ fn a_back_press_walks_the_full_wide_chain_in_order() {
     );
 }
 
+/// 65c. **The predicate and the act never disagree** — `back_would_dismiss()`
+///     answers, for every state the chain above walks, exactly what
+///     `dismiss_top_layer()` then does.
+///
+/// This pair is not a convenience. Android's predictive-back dispatcher decides
+/// BEFORE the gesture whether the app or the system owns it, and takes no answer
+/// afterwards, so the app publishes the predicate's verdict ahead of the press
+/// (`App::push_back_claim` → `BackHandler.setClaimed`). A pair that has drifted
+/// is therefore a claim that lies in one of two directions: a press swallowed
+/// with nothing to close (no back-to-home, no preview animation), or the
+/// Activity finished out from under an open sheet.
+///
+/// The app is not opted into that dispatcher today (`BackHandler.kt` and the
+/// Android manifest carry the device measurement that keeps it out), so the
+/// published claim is currently read by nothing. That is exactly why this pin
+/// matters rather than why it does not: a drift introduced while the route is
+/// dark surfaces on the day it is switched on, and nothing between here and
+/// there would have caught it.
+///
+/// The walk is the same matrix tests 65 and 65b use, plus the two arms they do
+/// not reach — the armed region pick and a section-endpoint drag in flight — and
+/// the rung counters at the end are what stop this passing on a chain that never
+/// found anything open.
+#[test]
+fn back_would_dismiss_agrees_with_dismiss_top_layer_in_every_ui_state() {
+    /// One rung: ask, then act, then insist they said the same thing.
+    fn paired(h: &mut InputHarness, state: &str) -> bool {
+        let predicted = h.gui_mut().back_would_dismiss();
+        let dismissed = h.gui_mut().dismiss_top_layer();
+        assert_eq!(
+            predicted, dismissed,
+            "back_would_dismiss() answered {predicted} and dismiss_top_layer()              then did {dismissed}, with {state}: the predictive-back claim is a              lie in this state"
+        );
+        dismissed
+    }
+
+    /// One isolated rung: what to call the state, and how to raise it.
+    type Rung = (&'static str, fn(&mut InputHarness));
+
+    // Rungs where a press had something to close, and rungs where it did not.
+    let mut had = 0usize;
+    let mut had_not = 0usize;
+
+    // ── The wide chain ───────────────────────────────────────────────────
+    let mut h = InputHarness::with_screen(egui::vec2(800.0, 1200.0));
+    assert_eq!(h.width_class(), crate::ui_layout::WidthClass::Medium);
+    assert!(!paired(&mut h, "a fresh wide screen, nothing open"));
+    had_not += 1;
+
+    h.mouse_click(h.map_center());
+    h.warm_up();
+    assert!(h.faded(), "precondition: the click beside the chrome faded");
+    assert!(paired(&mut h, "the fade"));
+    had += 1;
+    h.warm_up();
+
+    h.set_section_draw_armed(true);
+    h.set_drawer_open(true);
+    h.gui_mut().open_settings();
+    h.gui_mut().set_time_dialog_open_for_test(true);
+    h.gui_mut().overlays.selected_overlays = vec![std::sync::Arc::new(SheetStubFeature)];
+    h.gui_mut().set_catalog_open_for_test(true);
+    h.warm_up();
+    for state in [
+        "the catalog on top",
+        "the feature popup on top",
+        "the time dialog on top",
+        "the inspector on top",
+        "the drawer on top",
+        "an armed section draw and nothing above it",
+    ] {
+        assert!(paired(&mut h, state), "{state}: the chain stopped early");
+        had += 1;
+        h.warm_up();
+    }
+    assert!(!paired(&mut h, "the wide chain walked to its end"));
+    had_not += 1;
+
+    h.set_region_pick_armed(true);
+    h.warm_up();
+    assert!(paired(&mut h, "an armed region pick"));
+    had += 1;
+    assert!(!paired(&mut h, "the region pick disarmed again"));
+    had_not += 1;
+
+    // ── The Compact projection ───────────────────────────────────────────
+    let mut h = phone();
+    h.set_drawer_open(true);
+    h.gui_mut().open_settings();
+    h.gui_mut().set_sheet_menu_open_for_test(true);
+    h.gui_mut().set_time_dialog_open_for_test(true);
+    h.gui_mut().overlays.selected_overlays = vec![std::sync::Arc::new(SheetStubFeature)];
+    h.set_section_draw_armed(true);
+    h.warm_up();
+    for state in [
+        "the Feature sheet page",
+        "the Time sheet page",
+        "the Menu sheet page",
+        "the Inspector sheet page",
+        "the Layers sheet page",
+        "an armed section draw below the closed sheet",
+    ] {
+        assert!(
+            paired(&mut h, state),
+            "{state}: the projection stopped early"
+        );
+        had += 1;
+        h.warm_up();
+    }
+    assert!(!paired(&mut h, "the phone projection walked to its end"));
+    had_not += 1;
+
+    // ── Every arm ALONE ──────────────────────────────────────────────────
+    //
+    // The two walks above stack states, and a stacked walk cannot see a single
+    // inverted arm: with the section draw still armed underneath, a
+    // `back_would_dismiss` that has stopped believing in the drawer still
+    // answers `true` at the drawer rung, for the wrong reason, and agrees with
+    // a `dismiss_top_layer` that closed the drawer. Measured — inverting the
+    // drawer arm left the stacked walk GREEN. So each arm is also raised on its
+    // own, where nothing below it can answer in its place.
+    let arms: [Rung; 7] = [
+        ("the catalog alone", |h| {
+            h.gui_mut().set_catalog_open_for_test(true)
+        }),
+        ("the feature popup alone", |h| {
+            h.gui_mut().overlays.selected_overlays = vec![std::sync::Arc::new(SheetStubFeature)]
+        }),
+        ("the time dialog alone", |h| {
+            h.gui_mut().set_time_dialog_open_for_test(true)
+        }),
+        ("the inspector alone", |h| h.gui_mut().open_settings()),
+        ("the drawer alone", |h| h.set_drawer_open(true)),
+        ("an armed section draw alone", |h| {
+            h.set_section_draw_armed(true)
+        }),
+        ("an armed region pick alone", |h| {
+            h.set_region_pick_armed(true)
+        }),
+    ];
+    for (name, raise) in arms {
+        let mut h = InputHarness::with_screen(egui::vec2(800.0, 1200.0));
+        h.warm_up();
+        assert!(
+            !paired(&mut h, "a fresh wide screen, before the arm is raised"),
+            "{name}: the harness did not start empty, so this rung proves nothing"
+        );
+        had_not += 1;
+
+        raise(&mut h);
+        h.warm_up();
+        assert!(
+            paired(&mut h, name),
+            "{name}: raising the arm closed nothing"
+        );
+        had += 1;
+        h.warm_up();
+
+        assert!(
+            !paired(&mut h, &format!("{name}, after it was dismissed")),
+            "{name}: something was left behind the one arm this rung raised"
+        );
+        had_not += 1;
+    }
+
+    // The menu popup on its own. No setter reaches `menu_popup_open` — it is
+    // written from the top bar's own `Popup::is_id_open` read — so this rung
+    // goes through the button, which is also the only way a user gets there.
+    let mut h = InputHarness::with_screen(egui::vec2(800.0, 1200.0));
+    h.warm_up();
+    assert!(!paired(
+        &mut h,
+        "a fresh wide screen, before the menu is opened"
+    ));
+    had_not += 1;
+    h.open_menu();
+    assert!(paired(&mut h, "the menu popup alone"));
+    had += 1;
+    h.warm_up();
+    assert!(!paired(
+        &mut h,
+        "the menu popup alone, after it was dismissed"
+    ));
+    had_not += 1;
+
+    // ── Every Compact sheet page ALONE ───────────────────────────────────
+    //
+    // Same reason as the arms above, for the other half of the branch: the
+    // phone walk stacks pages over an armed section draw, and the arm below
+    // answers for a `top_sheet_page()` the predicate has stopped consulting.
+    // Measured — inverting the Compact branch left the stacked phone walk GREEN.
+    let pages: [Rung; 5] = [
+        ("the Feature page alone", |h| {
+            h.gui_mut().overlays.selected_overlays = vec![std::sync::Arc::new(SheetStubFeature)]
+        }),
+        ("the Time page alone", |h| {
+            h.gui_mut().set_time_dialog_open_for_test(true)
+        }),
+        ("the Menu page alone", |h| {
+            h.gui_mut().set_sheet_menu_open_for_test(true)
+        }),
+        ("the Inspector page alone", |h| h.gui_mut().open_settings()),
+        ("the Layers page alone", |h| h.set_drawer_open(true)),
+    ];
+    for (name, raise) in pages {
+        let mut h = phone();
+        h.warm_up();
+        assert!(
+            !paired(&mut h, "a fresh phone screen, before the page is opened"),
+            "{name}: the harness did not start empty, so this rung proves nothing"
+        );
+        had_not += 1;
+
+        raise(&mut h);
+        h.warm_up();
+        assert!(
+            h.sheet().page.is_some(),
+            "{name}: the setup did not put a page on the sheet"
+        );
+        assert!(paired(&mut h, name), "{name}: the page closed nothing");
+        had += 1;
+        h.warm_up();
+
+        assert!(
+            !paired(&mut h, &format!("{name}, after it was dismissed")),
+            "{name}: something was left behind the one page this rung opened"
+        );
+        had_not += 1;
+    }
+
+    // The fade on its own, which no setter reaches — it is a click.
+    let mut h = InputHarness::with_screen(egui::vec2(800.0, 1200.0));
+    h.mouse_click(h.map_center());
+    h.warm_up();
+    assert!(h.faded(), "precondition: the click beside the chrome faded");
+    assert!(paired(&mut h, "the fade alone"));
+    had += 1;
+    h.warm_up();
+    assert!(!paired(&mut h, "the fade alone, after it was dismissed"));
+    had_not += 1;
+
+    // ── The arm neither chain above reaches: a drag in flight ────────────
+    let (mut h, _a, b) = harness_with_committed_section();
+    let b_px = h.screen_of(0, b);
+    h.mouse_move(b_px);
+    h.frame();
+    h.mouse_press(b_px);
+    h.frame();
+    h.mouse_move(b_px + egui::vec2(-60.0, 30.0));
+    h.frame();
+    assert!(
+        h.gui_mut().section_edit_drag_for_test().is_some(),
+        "precondition: the press on the B cap began a section endpoint drag"
+    );
+    assert!(paired(&mut h, "a section endpoint drag in flight"));
+    had += 1;
+
+    // The floor. Without it, a chain that silently stopped finding anything open
+    // would agree with a predicate that always answers `false`, and this test
+    // would pass while proving nothing.
+    assert!(
+        had >= 28,
+        "only {had} of the walked states had something for a press to close;          the matrix has stopped exercising the chain"
+    );
+    assert!(
+        had_not >= 31,
+        "only {had_not} of the walked states had nothing to close; a pair that          always answers `true` would survive this walk"
+    );
+}
+
 /// 65b. **The Compact chain keeps its projection-first order with the fade at its
 /// head** — the fade leg, then the sheet walk of
 /// `a_back_press_walks_the_phone_sheet_pages_top_down`, abbreviated to the seam

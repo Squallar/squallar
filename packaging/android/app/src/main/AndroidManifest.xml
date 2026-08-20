@@ -33,6 +33,37 @@
         android:hasCode="true">
 
         <!--
+          android:enableOnBackInvokedCallback is deliberately ABSENT, and this
+          comment is the measurement that keeps it absent.
+
+          Setting it to "true" opts the app into the predictive-back dispatcher
+          on API 33+, which is what would let com.rustdar.BackHandler decline a
+          press and let the platform draw its own back-to-home preview. It was
+          tried, on a device: with the attribute present, an unclaimed press
+          does exactly what the design wanted (the launcher takes the foreground,
+          type = CLOSE, no moveTaskToBack) and THE APP CAN THEN NEVER BE
+          REOPENED. Relaunching starts a fresh android.app.NativeActivity, and
+          android_main does not run for a second Activity in this process, so
+          the stock splash stays up forever. Measured as a paired A/B on one
+          build one attribute apart, 2/2 on each arm (WO-RP-SPIKE leg 4b,
+          2026-08-20); with the attribute absent the same press backgrounds the
+          app and it resumes with its cached radar image.
+
+          So back is delivered the legacy way on every API level this app runs
+          on: KEYCODE_BACK through the native input queue into
+          InputHandler::take_back_out_press. BackHandler's callback is
+          registered and unregistered truthfully by the claim Rust pushes, and
+          the platform never invokes it — inert, exactly as the Java class this
+          replaced was.
+
+          What has to be true before this attribute comes back: android_main
+          must run for a re-created Activity. Until then the attribute is the
+          one thing standing between a working app and an unopenable one, and
+          from targetSdk 36 there is no opting out — so that fix is the
+          prerequisite for the bump, not a nicety.
+        -->
+
+        <!--
           allowBackup is false, and that is a downgrade from the "true" this
           inherited from cargo-apk. With no fullBackupContent or
           dataExtractionRules to scope it, "true" means Android uploads the whole

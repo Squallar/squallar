@@ -155,6 +155,22 @@ impl Gui {
     }
 
     /// Close the topmost thing the user has open, and say whether there was one.
+    ///
+    /// Paired with [`back_would_dismiss`](Self::back_would_dismiss), which
+    /// answers the same question without doing it. The two walk the same
+    /// priority chain and MUST agree on every UI state: Android publishes the
+    /// predicate's answer to the platform *before* a back press arrives (the
+    /// dispatcher takes no answer afterwards), so a pair that has drifted is a
+    /// claim that lies — either a press swallowed with nothing to close, or the
+    /// app finished out from under an open sheet. The paired-truth test in the
+    /// input harness walks a matrix of UI states asserting the two agree;
+    /// change one of these and you change both.
+    ///
+    /// Android is not opted into that dispatcher today, so the published claim
+    /// is read by nothing (`BackHandler.kt` carries the measured reason). The
+    /// pairing obligation stands regardless: it is what makes the claim safe to
+    /// switch on, and a drift introduced while nobody is looking is exactly the
+    /// bug that would surface on the day it is.
     pub fn dismiss_top_layer(&mut self) -> bool {
         if self.section_edit_drag.is_some() {
             self.section_edit_drag = None;
@@ -221,6 +237,56 @@ impl Gui {
         }
         if self.region_pick_armed {
             self.set_region_pick_armed(false);
+            return true;
+        }
+        false
+    }
+
+    /// Whether [`dismiss_top_layer`](Self::dismiss_top_layer) would close
+    /// something — the same chain, read-only.
+    ///
+    /// A pure predicate on purpose: it is called every frame on Android to keep
+    /// the predictive-back claim truthful, and a query with a side effect there
+    /// would close layers nobody pressed back on. See the pairing note on
+    /// `dismiss_top_layer`.
+    pub fn back_would_dismiss(&self) -> bool {
+        if self.section_edit_drag.is_some() {
+            return true;
+        }
+        if self.ui_faded {
+            return true;
+        }
+        if self.menu_popup_open {
+            return true;
+        }
+        if self.layout.width == crate::ui_layout::WidthClass::Compact {
+            if self.top_sheet_page().is_some() {
+                return true;
+            }
+        } else {
+            if self.catalog_open {
+                return true;
+            }
+            if !self.overlays.selected_overlays.is_empty() {
+                return true;
+            }
+            if self.time_dialog.show {
+                return true;
+            }
+            if self.menu_open {
+                return true;
+            }
+            if self.insp_open {
+                return true;
+            }
+            if self.drawer_open {
+                return true;
+            }
+        }
+        if self.section_draw_armed {
+            return true;
+        }
+        if self.region_pick_armed {
             return true;
         }
         false
