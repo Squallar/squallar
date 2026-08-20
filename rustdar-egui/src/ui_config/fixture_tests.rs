@@ -156,7 +156,7 @@ fn a_future_builds_config_survives_a_session_with_every_unknown_intact() {
     // selection lives. The file's top-level site is a DIFFERENT one on
     // purpose: reading "KTLX" here can only have come from the slot.
     let pane = gui.pane(0).expect("pane 0");
-    assert_eq!(gui.radar.config.site, "KGRR", "premise: the globals differ");
+    assert_eq!(gui.radar.site, "KGRR", "premise: the globals differ");
     assert_eq!(pane.site(), "KTLX", "the radar slot's site is the pane's");
     assert_eq!(
         pane.selected_product(),
@@ -1369,6 +1369,70 @@ fn a_handler_is_told_the_site_this_pane_is_on_now() {
         gui.pane(1).expect("pane 1").site(),
         "KFWS",
         "control: the pane itself really did move",
+    );
+}
+
+/// **The top-level `site` key is the persisted GLOBAL site, and it is the
+/// seed a pane that names no site of its own is opened on.**
+///
+/// WO-E8d's order calls this half of the radar config dead post-E6. It is
+/// dead to *fetching* — every fetch path substitutes the pane's own site —
+/// and it is not dead to the file, which is why the field survived that land.
+/// This is the gate that says so, because a doc comment saying "load-bearing"
+/// is prose and prose is not evidence.
+///
+/// Both halves were unpinned: a tamper writing the ACTIVE PANE's site into
+/// the key instead of the global was **green** across both packages. The
+/// corpus fixtures could not tell the arms apart because in every one of them
+/// the global and the pane already agree — so this test makes them disagree.
+///
+/// The load half is not hypothetical: the Tier-2 browser rig pins its scene
+/// by seeding `{"site":"KTLX"}` and nothing else, and reaches pane 0 through
+/// exactly this path.
+#[test]
+fn the_persisted_site_is_the_global_one_and_it_seeds_a_pane_that_names_none() {
+    // ---- save side: the global and the active pane disagree on purpose.
+    let mut gui = Gui::new();
+    gui.apply(crate::shell_api::GuiEvent::RadarConfig(
+        crate::actions::RadarConfig {
+            site: "KDMX".to_string(),
+            timestamp: gui.selected_timestamp(),
+        },
+    ));
+    gui.pane_mut(0)
+        .expect("a fresh Gui has one pane")
+        .set_site("KGRR".to_string());
+    assert_ne!(
+        gui.global_site(),
+        gui.pane(0).expect("pane 0").site(),
+        "premise: the two must disagree, or this test could pass off either",
+    );
+
+    let saved = gui.ui_config_json().expect("serializable");
+    let v: serde_json::Value = serde_json::from_str(&saved).expect("valid JSON");
+    assert_eq!(
+        v["site"].as_str(),
+        Some("KDMX"),
+        "the top-level key took the active pane's site instead of the global \
+         one, which changes what a multi-pane session persists: {saved}",
+    );
+
+    // ---- load side: that key is what a pane naming no site opens on.
+    let seeded = format!(
+        r#"{{"config_version":{},"pane_count":1,"site":"KDMX","panes":[{{}}]}}"#,
+        super::migrate::CONFIG_VERSION,
+    );
+    let mut fresh = Gui::new();
+    assert!(
+        fresh.load_ui_config(&store_with(&seeded)),
+        "the file must load"
+    );
+    assert_eq!(
+        fresh.pane(0).expect("pane 0").site(),
+        "KDMX",
+        "a pane that named no site of its own was not opened on the file's \
+         global site, so the key is write-only and the rig's scene seed is a \
+         coincidence",
     );
 }
 

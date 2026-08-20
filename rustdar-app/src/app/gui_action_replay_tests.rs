@@ -62,7 +62,7 @@ fn a_scripted_action_batch_lands_through_the_seam() {
     let target = seeded_utc() - chrono::Duration::seconds(300);
     let expected_local = chrono::TimeZone::from_utc_datetime(&chrono::Local, &target).naive_local();
     assert_eq!(
-        app.gui.get_radar_config().timestamp,
+        app.gui.selected_timestamp(),
         expected_local,
         "the radar config does not carry the scripted step's timestamp"
     );

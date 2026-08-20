@@ -902,7 +902,7 @@ impl super::Gui {
             active_pane: self.active_pane,
             viewport_sync: true,
             sync_layers: true,
-            site: self.radar.config.site.clone(),
+            site: self.radar.site.clone(),
             loop_lookback_secs: self.loop_lookback_secs,
             loop_speed_fps: fps,
             time_step_secs: self.panes.first().map_or(600, |p| p.time.step.as_secs()),
@@ -1037,7 +1037,7 @@ impl super::Gui {
         };
 
         if !config.site.is_empty() {
-            self.radar.config.site = config.site.clone();
+            self.radar.site = config.site.clone();
         }
 
         // The file's numbers are the pane's numbers: the two settings are
@@ -1205,7 +1205,7 @@ impl super::Gui {
 
     /// Point every pane at `site`, for a first run with no stored config.
     pub fn set_initial_site(&mut self, site: &str) {
-        self.radar.config.site = site.to_string();
+        self.radar.site = site.to_string();
         for pane in &mut self.panes {
             pane.set_site(site.to_string());
         }

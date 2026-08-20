@@ -857,7 +857,7 @@ fn navigate_time_steps_relative_to_the_panes_scan_and_parks_it() {
     assert_eq!(app.render.fetch_generation_for("KTLX"), generation + 1);
     let expected = chrono::TimeZone::from_utc_datetime(&chrono::Local, &at(20)).naive_local();
     assert_eq!(
-        app.gui.get_radar_config().timestamp,
+        app.gui.selected_timestamp(),
         expected,
         "the fetch target must be the pane's scan time stepped by the payload"
     );

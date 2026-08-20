@@ -356,20 +356,21 @@ impl Default for Gui {
 
 impl Gui {
     pub fn new() -> Self {
-        let radar_config = RadarConfig::default();
-        let date_string = radar_config.timestamp.format("%Y-%m-%d").to_string();
-        let time_string = radar_config.timestamp.format("%H:%M:%S").to_string();
+        // The same two defaults the radar config used to carry, now taken
+        // from it one last time so the opening site and the opening time are
+        // still declared in exactly one place.
+        let RadarConfig { site, timestamp } = RadarConfig::default();
 
         let mut gui = Self {
             radar: RadarState {
-                config: radar_config,
-                fetching: false,
+                site,
                 error_message: None,
             },
             liveness: Vec::new(),
             time_dialog: TimeDialogState {
-                date_string,
-                time_string,
+                timestamp,
+                date_string: timestamp.format("%Y-%m-%d").to_string(),
+                time_string: timestamp.format("%H:%M:%S").to_string(),
                 show: false,
             },
             initial_zoom_set: false,

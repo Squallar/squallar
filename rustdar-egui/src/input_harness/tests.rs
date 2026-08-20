@@ -5486,8 +5486,12 @@ fn refresh_fetches_the_active_panes_site_not_the_global_one() {
          of them"
     );
 
-    let mut config = h.gui_mut().get_radar_config().clone();
-    config.site = "KDMX".to_owned();
+    // The global site, written through the one door that sets it — the
+    // active pane stays on KTLX, so the two disagree.
+    let config = crate::actions::RadarConfig {
+        site: "KDMX".to_owned(),
+        timestamp: h.gui_mut().selected_timestamp(),
+    };
     h.gui_mut()
         .apply(crate::shell_api::GuiEvent::RadarConfig(config));
     h.warm_up();
@@ -5510,6 +5514,101 @@ fn refresh_fetches_the_active_panes_site_not_the_global_one() {
         fetched_site(h.last_actions()).as_deref(),
         Some("KTLX"),
         "the menu's Refresh fetched the global site, not the active pane's"
+    );
+}
+
+/// 37b. **The Set Time dialog fetches the persisted GLOBAL site, not the
+/// active pane's** — the exact opposite of the Refresh above, which is why
+/// both are pinned: the two controls read different sites on purpose.
+///
+/// Added at WO-E8d, where the selected timestamp moved out of the radar
+/// config and beside the dialog that edits it. Rebuilding this action from
+/// `active_pane_fetch_config()` is the natural-looking edit, and **nothing in
+/// the workspace would have caught it**: a probe that made this arm read the
+/// active pane came back green across all 3,673 rows before this test
+/// existed.
+#[test]
+fn the_time_dialogs_ok_fetches_the_global_site_not_the_active_panes() {
+    let mut h = InputHarness::with_screen(egui::vec2(800.0, 900.0));
+
+    // The global site, written through the one door that sets it.
+    let config = crate::actions::RadarConfig {
+        site: "KDMX".to_owned(),
+        timestamp: h.gui_mut().selected_timestamp(),
+    };
+    h.gui_mut()
+        .apply(crate::shell_api::GuiEvent::RadarConfig(config));
+    h.gui_mut().set_time_dialog_open_for_test(true);
+    h.warm_up();
+
+    assert_eq!(
+        h.gui_mut().active_pane().site(),
+        "KTLX",
+        "precondition: the active pane and the global site must disagree, or \
+         this test could pass off either one"
+    );
+    assert!(
+        h.text_painted_in(h.screen_rect(), "Select Time"),
+        "precondition: the dialog must be on screen to click its OK"
+    );
+
+    let ok = h
+        .painted_text_rects()
+        .into_iter()
+        .find(|(_, text)| text == "OK")
+        .expect("the time dialog draws an OK button")
+        .0;
+    h.mouse_click(ok.center());
+
+    assert_eq!(
+        fetched_site(h.last_actions()).as_deref(),
+        Some("KDMX"),
+        "the Set Time dialog fetched a site that is not the global one it has \
+         always fetched"
+    );
+}
+
+/// 37c. **The Set Time dialog shows the time that is actually selected.**
+///
+/// The two text boxes are a *view* of `TimeDialogState::timestamp`, and the
+/// three writers that must keep them in step are the shell's push, "Use
+/// Current Time" and Cancel — the last of which is how a half-typed edit is
+/// thrown away. WO-E8d put all three behind `TimeDialogState::select`.
+///
+/// Pinned here because **nothing pinned it before**: a tamper that made
+/// `select` write the timestamp and leave both strings stale was green across
+/// both packages, which would have shown the user the previous scan's time
+/// while fetching a different one.
+#[test]
+fn the_time_dialog_shows_the_time_the_shell_last_selected() {
+    let mut h = InputHarness::with_screen(egui::vec2(800.0, 900.0));
+
+    let picked = chrono::NaiveDate::from_ymd_opt(2019, 5, 20)
+        .expect("a real date")
+        .and_hms_opt(21, 7, 33)
+        .expect("a real time");
+    let site = h.gui_mut().global_site().to_string();
+    h.gui_mut().apply(crate::shell_api::GuiEvent::RadarConfig(
+        crate::actions::RadarConfig {
+            site,
+            timestamp: picked,
+        },
+    ));
+    h.gui_mut().set_time_dialog_open_for_test(true);
+    h.warm_up();
+
+    let screen = h.screen_rect();
+    assert!(
+        h.text_painted_in(screen, "Select Time"),
+        "precondition: the dialog must be on screen for its boxes to be read"
+    );
+    assert!(
+        h.text_painted_in(screen, "2019-05-20"),
+        "the date box shows a date that is not the selected one"
+    );
+    assert!(
+        h.text_painted_in(screen, "21:07:33"),
+        "the time box shows a time that is not the selected one"
     );
 }
 
@@ -12986,7 +13085,7 @@ fn radar_control_rect(h: &mut InputHarness, label: &str) -> egui::Rect {
 #[test]
 fn the_radar_layers_refresh_button_asks_the_shell_for_this_panes_scan() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    // A site the shared `radar.config` does NOT carry, so an action naming it
+    // A site the persisted global does NOT carry, so an action naming it
     // can only have come from the pane.
     h.gui_mut()
         .pane_mut(0)
@@ -12994,7 +13093,7 @@ fn the_radar_layers_refresh_button_asks_the_shell_for_this_panes_scan() {
         .set_site("KGRR".to_string());
     h.warm_up();
     assert_ne!(
-        h.gui_mut().get_radar_config().site,
+        h.gui_mut().global_site(),
         "KGRR",
         "precondition: the shared config must not already name this site, or \
          the assertion below could pass off the global",
