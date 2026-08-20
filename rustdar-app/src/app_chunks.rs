@@ -14,7 +14,7 @@ impl super::App {
     /// Start or stop feeds so the set matches the sites panes are watching live,
     /// and dispatch a round for any that is due. Called once a frame.
     pub(super) fn drive_chunk_feeds(&mut self) {
-        let enabled = self.gui.live_chunks_enabled();
+        let enabled = rustdar_egui::radar_layer::live_chunks_enabled(&self.gui);
         let live = self.gui.live_sites();
         // Published every frame, so the status bar never shows a stale claim.
         let showing = self
@@ -84,7 +84,7 @@ impl super::App {
     /// anything they said into an early round. A notification never carries data
     /// — it marks the site due and the ordinary poller does the rest.
     fn drive_chunk_notifications(&mut self, live: &[String]) {
-        if !self.gui.chunk_notifications_enabled() {
+        if !rustdar_egui::radar_layer::chunk_notifications_enabled(&self.gui) {
             // Drop every socket rather than ignoring them, so the setting off
             // actually stops the connections.
             self.chunk_notify.sync_sites(&[], &[], "", || {});
@@ -92,9 +92,9 @@ impl super::App {
         }
         // Chunk pushes only matter while the live feed runs; archive pushes stand
         // on their own.
-        let chunks = self.gui.live_chunks_enabled();
+        let chunks = rustdar_egui::radar_layer::live_chunks_enabled(&self.gui);
         let feeds: &[Feed] = if chunks { &Feed::ALL } else { &[Feed::Archive] };
-        let endpoint = self.gui.notifier_endpoint().to_string();
+        let endpoint = rustdar_egui::radar_layer::notifier_endpoint(&self.gui);
         let window = self.window.clone();
         self.chunk_notify
             .sync_sites(live, feeds, &endpoint, move || {
@@ -338,7 +338,8 @@ impl super::App {
     /// Whether the chunk feed is serving this site, so the 60 s archive check is
     /// redundant.
     pub(super) fn chunks_are_feeding(&self, site: &str) -> bool {
-        self.gui.live_chunks_enabled() && self.chunk_feeds.is_feeding(site)
+        rustdar_egui::radar_layer::live_chunks_enabled(&self.gui)
+            && self.chunk_feeds.is_feeding(site)
     }
 }
 

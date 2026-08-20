@@ -166,7 +166,10 @@ fn without_a_feed_the_archive_is_applied_unconditionally() {
 #[test]
 fn turning_live_chunks_off_stops_the_overlay_from_standing() {
     let mut app = app_showing(at(10));
-    app.gui.set_chunk_notifications(false);
+    app.gui.apply_layer_control(
+        &rustdar_egui::radar_layer::POLL_LAYER,
+        &rustdar_egui::radar_layer::chunk_notifications_update(false),
+    );
     app.chunk_feeds.ensure("KTLX");
     app.chunk_feeds
         .force_serving("KTLX", Arc::new(empty_scan()));
@@ -175,7 +178,10 @@ fn turning_live_chunks_off_stops_the_overlay_from_standing() {
         "precondition: the feed is serving an overlay",
     );
 
-    app.gui.set_live_chunks(false);
+    app.gui.apply_layer_control(
+        &rustdar_egui::radar_layer::POLL_LAYER,
+        &rustdar_egui::radar_layer::live_chunks_update(false),
+    );
     app.drive_chunk_feeds();
 
     assert!(

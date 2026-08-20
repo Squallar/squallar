@@ -72,6 +72,8 @@ const RADAR_PATH: &str = concat!("rustdar_", "radar::");
 // split so a future absence-grep for a deleted definition stays clean).
 const APP_ANCHOR: &str = concat!("pub struct ", "App");
 const GUI_IMPL_ANCHOR: &str = concat!("impl ", "Gui");
+/// Row 2's replacement: the one generic write door the deleted setters became.
+const GENERIC_CONTROL_DOOR: &str = concat!("pub fn apply_layer", "_control");
 const UI_MOD_ANCHOR: &str = concat!("mod ", "ui;");
 const HUB_ANCHOR: &str = concat!("struct ", "ChannelHub");
 const OFFLOAD_ANCHOR: &str = concat!("pub fn ", "offload_job(");
@@ -114,7 +116,19 @@ const SELF_GUI_MAX: usize = 185;
 /// Row 1b — the same needle outside test-named paths.
 const SELF_GUI_NON_TEST_MAX: usize = 180;
 /// Row 2.
-const UI_SETTER_MAX: usize = 3;
+///
+/// **0 since WO-E8b**, which is where the plan said it would land. The last
+/// three were `set_live_chunks`, `set_chunk_notifications` and
+/// `set_notifier_endpoint`; their fields are now `RadarSource`'s and the one
+/// write door is `Gui::apply_layer_control(kind, update)`, which names a
+/// layer and a control update rather than a field.
+///
+/// **This ceiling is only worth 0 if the needle was not moved instead of the
+/// coupling.** The setters were not renamed or relocated out of the walk: the
+/// shell's own call — `rustdar-app`'s `app.gui.set_live_chunks(false)` — is
+/// gone rather than re-spelled, and what replaced it is generic. A future
+/// `pub fn set_` on the `Gui` impl, wherever spelled, must not appear.
+const UI_SETTER_MAX: usize = 0;
 /// Row 4a.
 ///
 /// **440, not 438: WO-E6a's accessors add exactly two occurrences** — the
@@ -368,12 +382,26 @@ fn the_config_swap_stays_deleted() {
 fn the_gui_setter_surface_never_grows() {
     let ui_rs = Path::new(ROOT).join("rustdar-egui/src/ui.rs");
     let text = anchored_file(&ui_rs, GUI_IMPL_ANCHOR);
-    let n = text.matches(PUB_FN_SET).count();
+    // **Neither half passes on an empty haystack.** `anchored_file` proves
+    // the walked file is still the Gui's; this proves the door the message
+    // sends the reader to is real. A zero here has to mean "the setters are
+    // gone and the generic write exists", never "the walk read a file that
+    // was not there".
+    let glue = read(&Path::new(ROOT).join("rustdar-egui/src/gui/layer_glue.rs"));
     assert!(
-        n <= UI_SETTER_MAX,
-        "the Gui setter surface grew: {n} setter fns > ceiling {UI_SETTER_MAX}. \
-         WO-E2 Land 2 leaves 3; WO-E8b reaches 0. Lower the MAX in the land that \
-         earns it; never raise it without a written plan amendment."
+        glue.contains(GENERIC_CONTROL_DOOR),
+        "presence control: {GENERIC_CONTROL_DOOR:?} is gone from the layer          glue, so a setter-free `Gui` would mean the write door was deleted          rather than replaced.",
+    );
+    let n = text.matches(PUB_FN_SET).count();
+    // `assert_eq!` rather than `<=`, because the ceiling is 0: a `<=` against
+    // the minimum of the type is a comparison that cannot fail, which is the
+    // vacuity this suite exists to refuse.
+    assert_eq!(
+        n, UI_SETTER_MAX,
+        "the Gui setter surface is {n}, not {UI_SETTER_MAX}. WO-E2 Land 2 \
+         left 3; WO-E8b reached 0, and 0 is where it stays. A switch a layer \
+         owns is written through `Gui::apply_layer_control`, not through a \
+         setter beside it. Never raise it without a written plan amendment."
     );
 }
 

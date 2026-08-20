@@ -21,6 +21,18 @@ pub enum ControlItem {
         options: Vec<(String, String)>,
         selected: String,
     },
+    /// A free-text box. `value` is the text the handler currently holds and
+    /// `hint` is the greyed placeholder an empty box shows — a box whose empty
+    /// state means "use the built-in" has to say what the built-in is, or the
+    /// user is looking at a blank field with no way to learn what it falls back
+    /// to. An edit comes back as [`ControlValue::String`], one update per
+    /// change, exactly like a dropdown's selection.
+    TextField {
+        id: &'static str,
+        label: String,
+        value: String,
+        hint: String,
+    },
     Slider {
         id: &'static str,
         label: String,

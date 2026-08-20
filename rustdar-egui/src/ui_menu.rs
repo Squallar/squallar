@@ -247,14 +247,14 @@ impl super::Gui {
                         value: crate::radar_layer::auto_poll_enabled(&self.overlays),
                     },
                     MenuNode::Toggle {
-                        label: "Live: real-time chunks",
+                        label: rustdar_radar::source::LIVE_CHUNKS_LABEL,
                         toggle: MenuToggle::LiveChunks,
-                        value: self.live_chunks,
+                        value: crate::radar_layer::live_chunks_enabled(self),
                     },
                     MenuNode::Toggle {
-                        label: "Live: push notifications",
+                        label: rustdar_radar::source::CHUNK_NOTIFICATIONS_LABEL,
                         toggle: MenuToggle::ChunkNotifications,
-                        value: self.chunk_notifications,
+                        value: crate::radar_layer::chunk_notifications_enabled(self),
                     },
                     MenuNode::Separator,
                     MenuNode::Item {
@@ -295,8 +295,14 @@ impl super::Gui {
                 self.propagate_layer_sync();
             }
             MenuEvent::Toggled(MenuToggle::AutoPoll, on) => self.set_auto_poll_enabled(on),
-            MenuEvent::Toggled(MenuToggle::LiveChunks, on) => self.set_live_chunks(on),
-            MenuEvent::Toggled(MenuToggle::ChunkNotifications, on) => self.chunk_notifications = on,
+            MenuEvent::Toggled(MenuToggle::LiveChunks, on) => self.apply_layer_control(
+                &crate::radar_layer::POLL_LAYER,
+                &crate::radar_layer::live_chunks_update(on),
+            ),
+            MenuEvent::Toggled(MenuToggle::ChunkNotifications, on) => self.apply_layer_control(
+                &crate::radar_layer::POLL_LAYER,
+                &crate::radar_layer::chunk_notifications_update(on),
+            ),
             MenuEvent::Toggled(MenuToggle::VolumePane, on) => {
                 // Recorded rather than written, through the one route the UI has.
                 self.request_pane_view(
@@ -412,8 +418,8 @@ mod tests {
             gui.time_dialog.show,
             gui.drawer_open,
             crate::radar_layer::auto_poll_enabled(&gui.overlays),
-            gui.live_chunks,
-            gui.chunk_notifications,
+            crate::radar_layer::live_chunks_enabled(gui),
+            crate::radar_layer::chunk_notifications_enabled(gui),
             gui.active_pane().render_view(),
             // Both halves, because a pane view change is deliberately a two-step
             // operation: recording the request is the whole of what the dispatcher's

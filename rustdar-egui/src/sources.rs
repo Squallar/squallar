@@ -120,7 +120,63 @@ mod controls_parity_tests {
                 let children: Vec<String> = items.iter().map(shape).collect();
                 format!("section:{label}[{}]", children.join(";"))
             }
+            ControlItem::TextField { id, label, .. } => format!("textfield:{id}:{label}"),
             ControlItem::Separator => "separator".into(),
+        }
+    }
+
+    /// **The four surfaces WO-E8b moved into the radar layer's own body are
+    /// still in it.**
+    ///
+    /// The parity walk is a *parity*: it asserts that everything a handler
+    /// declares is reachable, so a control deleted from the tree it walks
+    /// leaves it with nothing to look for and nothing to fail on. The rows
+    /// this land moved left `SETTINGS_ROWS` at the same time, so without an
+    /// inventory floor beside the walk, dropping one would fall out of both
+    /// walks in silence — the failure the option-expression rule names.
+    ///
+    /// This is that floor: the labels are asserted as well as the ids,
+    /// because a surface a user cannot recognise is not expressed either.
+    #[test]
+    fn the_radar_layer_still_offers_every_surface_that_moved_into_it() {
+        use rustdar_radar::source as radar;
+
+        let registry = OverlayRegistry::with_handlers(all());
+        let shapes: Vec<String> = registry
+            .controls(&rustdar_source::id::known::RADAR, &PaneRef::bare(0))
+            .iter()
+            .map(shape)
+            .collect();
+        for expected in [
+            format!(
+                "toggle:{}:{}",
+                radar::AUTO_POLL_CONTROL,
+                radar::AUTO_POLL_LABEL
+            ),
+            format!(
+                "toggle:{}:{}",
+                radar::LIVE_CHUNKS_CONTROL,
+                radar::LIVE_CHUNKS_LABEL
+            ),
+            format!(
+                "toggle:{}:{}",
+                radar::CHUNK_NOTIFICATIONS_CONTROL,
+                radar::CHUNK_NOTIFICATIONS_LABEL
+            ),
+            format!("buttons:{}", radar::REFRESH_CONTROL),
+            format!(
+                "textfield:{}:{}",
+                radar::NOTIFIER_ENDPOINT_CONTROL,
+                radar::NOTIFIER_ENDPOINT_LABEL
+            ),
+            format!("info:{}", radar::NOTIFIER_ENDPOINT_NOTE),
+        ] {
+            assert!(
+                shapes.contains(&expected),
+                "the radar layer no longer offers {expected:?}. It left \
+                 SETTINGS_ROWS at WO-E8b, so this is the only walk that can \
+                 still see it; offered: {shapes:?}",
+            );
         }
     }
 

@@ -153,7 +153,7 @@ impl super::Gui {
                                 {
                                     probe.mode = Some(InspectorSelection::AppSettings);
                                 }
-                                self.render_settings_body(ui, pane, actions);
+                                self.render_settings_body(ui, actions);
                             }
                             InspectorSelection::PaneProps => {
                                 #[cfg(test)]

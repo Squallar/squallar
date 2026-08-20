@@ -87,6 +87,27 @@ impl Gui {
             if matches!(effect, ControlEffect::Fetch) {
                 push_user_overlay_fetch(&mut self.overlays, actions, kind, active_pane);
             }
+            // The live-chunk switch's second half, and the refresh button's
+            // whole answer. Both are radar-shaped and both are asked of the
+            // radar glue, which decides for itself whether this edit was one
+            // of its own. The edited pane is the `mem::take`n one the caller
+            // holds, so it is chained in: the vector's slot for it is a
+            // placeholder until the inspector puts it back.
+            crate::radar_layer::fan_out_live_chunks(
+                self.panes.iter_mut().chain(std::iter::once(&mut *pane)),
+                &update,
+            );
+            if crate::radar_layer::refresh_requested(&update) {
+                // **`pane`, not `self.active_pane()`.** While this body
+                // renders, the pane vector's slot for the active pane is the
+                // `mem::take`n placeholder the inspector's host left behind,
+                // and its site is the default one — so the shared config's
+                // site is substituted from the pane the caller is holding,
+                // exactly as the settings row this button replaced did.
+                let mut config = self.radar.config.clone();
+                config.site = pane.site().to_string();
+                actions.push(GuiAction::FetchRadarScan(config));
+            }
         }
 
         pane.adopt_handler_state(&self.overlays);
@@ -405,21 +426,61 @@ impl Gui {
         f(overlays, &PaneRef::across(&peers))
     }
 
+    /// **The [`ControlItem`] tree `kind`'s handler is offering the active
+    /// pane** — a layer's declared surface, read rather than drawn.
+    ///
+    /// This is the only door `rustdar-egui` and the shell have to a handler's
+    /// own fields: the registry hands out `&dyn SourceHandler` and `as_any` is
+    /// refused, so a switch that lives inside a handler is read back off the
+    /// control it declares for it.
+    pub fn layer_controls(&self, kind: &LayerId) -> Vec<ControlItem> {
+        let view = self.panes[self.active_pane].view(self.active_pane);
+        self.overlays.controls(kind, &view.layer(kind))
+    }
+
+    /// **The [`ControlItem`] tree `kind`'s handler offers with no pane at
+    /// all** — the layer's own answer, with every per-pane override out of the
+    /// way. [`PaneRef::bare`]'s config is null by construction, so a control
+    /// whose value is "this pane's copy, else the global" answers with the
+    /// global.
+    pub fn layer_default_controls(&self, kind: &LayerId) -> Vec<ControlItem> {
+        self.overlays
+            .controls(kind, &PaneRef::bare(self.active_pane))
+    }
+
+    /// **Apply one control edit to a layer from outside its inspector body** —
+    /// the ☰ menu's leaves and the shell's own callers, which hold a switch's
+    /// new value and nothing else.
+    ///
+    /// Generic by construction: it names a [`LayerId`] and a
+    /// [`ControlUpdate`], never a field. It replaces the three `Gui::set_*`
+    /// methods WO-E8b deleted, and it is not a rename of them — those wrote
+    /// `Gui` fields that no longer exist, and this writes the handler's own
+    /// through the same door the inspector uses.
+    ///
+    /// **A bare pane view, and deliberately.** Every switch reached this way is
+    /// a layer-global one, so there is no per-pane state for the edit to land
+    /// in, and handing it a real pane view would drag `adopt_handler_state` in
+    /// behind it and re-derive every OTHER layer's flag as a side effect of
+    /// toggling this one. The inspector's copy of the same control goes through
+    /// the full pane construction and writes the same field.
+    ///
+    /// The radar glue is given every edit afterwards because one of them —
+    /// the live-chunk switch — has a second half no handler can write: see
+    /// [`crate::radar_layer::fan_out_live_chunks`].
+    pub fn apply_layer_control(&mut self, kind: &LayerId, update: &ControlUpdate) {
+        let mut pane = PaneMut::bare(self.active_pane);
+        self.overlays.apply_control(kind, update, &mut pane);
+        crate::radar_layer::fan_out_live_chunks(self.panes.iter_mut(), update);
+    }
+
     /// Switch the archive poll on or off — the one write behind the ☰ menu
-    /// leaf, the settings row and (from the inspector) the layer's own control
-    /// row, so no two of them can disagree about the switch's state.
+    /// leaf and (from the inspector) the layer's own control row, so neither
+    /// can disagree with the other about the switch's state.
     pub(super) fn set_auto_poll_enabled(&mut self, on: bool) {
         let id = crate::radar_layer::POLL_LAYER;
         let update = crate::radar_layer::auto_poll_update(on);
-        // **A bare pane view, and deliberately.** This switch is the layer's
-        // own — one answer for the whole app, like the endpoint it will sit
-        // beside — so there is no per-pane state for the edit to land in, and
-        // handing it a real pane view would drag `adopt_handler_state` in
-        // behind it and re-derive every OTHER layer's flag as a side effect of
-        // toggling this one. The inspector's copy of the same control goes
-        // through the full pane construction and writes the same field.
-        let mut pane = PaneMut::bare(self.active_pane);
-        self.overlays.apply_control(&id, &update, &mut pane);
+        self.apply_layer_control(&id, &update);
     }
 
     /// **What the radar layer's round ended as**, which is the only thing the

@@ -57,11 +57,7 @@ pub(crate) const SETTINGS_ROWS: &[&str] = &[
     "storm.override",
     "storm.speed",
     "storm.direction",
-    "advanced.notifier",
     "data.auto_poll",
-    "data.live_chunks",
-    "data.push",
-    "data.refresh",
     "about.version",
     "about.platform",
     "reset",
@@ -93,17 +89,12 @@ fn mid_edit(response: &egui::Response) -> bool {
 
 impl super::Gui {
     /// The settings content — the inspector's App › Settings body.
-    pub(super) fn render_settings_body(
-        &mut self,
-        ui: &mut egui::Ui,
-        pane: &crate::pane::PaneState,
-        actions: &mut Vec<GuiAction>,
-    ) {
+    pub(super) fn render_settings_body(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
         self.storm_motion_editing = false;
         for &row in SETTINGS_ROWS {
             #[cfg(test)]
             let row_top = ui.cursor().top();
-            let drawn = self.render_settings_row(ui, row, pane, actions);
+            let drawn = self.render_settings_row(ui, row, actions);
             #[cfg(test)]
             if drawn {
                 self.probes.last_settings_rows.push(DrawnSettingsRow {
@@ -128,7 +119,6 @@ impl super::Gui {
         &mut self,
         ui: &mut egui::Ui,
         id: &str,
-        pane: &crate::pane::PaneState,
         actions: &mut Vec<GuiAction>,
     ) -> bool {
         match id {
@@ -381,25 +371,6 @@ impl super::Gui {
                 self.storm_motion_editing |= mid_edit(&widget);
                 true
             }
-            "advanced.notifier" => {
-                section_break(ui);
-                ui.heading("Advanced");
-                ui.add_space(SETTINGS_SMALL_SPACING);
-                ui.label("Notifier endpoint:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.notifier_endpoint)
-                        .font(egui::TextStyle::Monospace)
-                        .hint_text(crate::DEFAULT_NOTIFIER_ENDPOINT),
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "WebSocket chunk-notify URL. Empty uses the built-in default.",
-                    )
-                    .small()
-                    .weak(),
-                );
-                true
-            }
             "data.auto_poll" => {
                 section_break(ui);
                 ui.heading("Data & live");
@@ -413,34 +384,6 @@ impl super::Gui {
                     .changed()
                 {
                     self.set_auto_poll_enabled(enabled);
-                }
-                true
-            }
-            "data.live_chunks" => {
-                // Through the setter, not the field: the switch fans out to
-                // every pane's radar slot, and a bare `&mut self.live_chunks`
-                // would move the global and leave the panes on the old value.
-                let mut enabled = self.live_chunks_enabled();
-                if ui
-                    .checkbox(&mut enabled, "Live: real-time chunks")
-                    .changed()
-                {
-                    self.set_live_chunks(enabled);
-                }
-                true
-            }
-            "data.push" => {
-                ui.checkbox(&mut self.chunk_notifications, "Live: push notifications");
-                true
-            }
-            "data.refresh" => {
-                ui.add_space(SETTINGS_SMALL_SPACING);
-                let refresh =
-                    ui.add_enabled(!self.radar.fetching, egui::Button::new("Refresh radar"));
-                if refresh.clicked() {
-                    let mut config = self.radar.config.clone();
-                    config.site = pane.site().to_string();
-                    actions.push(GuiAction::FetchRadarScan(config));
                 }
                 true
             }

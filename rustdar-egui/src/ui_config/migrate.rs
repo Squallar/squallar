@@ -1,7 +1,7 @@
 //! Stepwise config-format migrations, applied to the raw JSON tree before
 //! `UiConfig` ever sees it.
 
-pub(crate) const CONFIG_VERSION: u32 = 3;
+pub(crate) const CONFIG_VERSION: u32 = 4;
 
 /// The version a file with no `config_version` key speaks: every config
 /// written before the field existed. A constant fact about history — this
@@ -16,7 +16,11 @@ type Migration = (u32, fn(&mut serde_json::Value));
 
 /// One step per entry: a file at exactly the named version is rewritten in
 /// place to speak the next one, in order, so a v1 file walks every rung.
-const MIGRATIONS: &[Migration] = &[(1, split_gps_config), (2, panes_take_layer_slots)];
+const MIGRATIONS: &[Migration] = &[
+    (1, split_gps_config),
+    (2, panes_take_layer_slots),
+    (3, radar_takes_its_settings),
+];
 
 /// v1 → v2: the `gps_config` container split — the serial half (`port_path`,
 /// `baud_rate`) keeps the container under the new name `serial_config`, and
@@ -176,6 +180,69 @@ fn panes_take_layer_slots(value: &mut serde_json::Value) {
 /// fact about a file that was already written, and it must not move when the
 /// constant a live build uses moves.
 const RADAR_ID: &str = "Radar";
+
+/// v3 → v4: **the archive poll and the chunk feed's three switches move from
+/// the config root into the radar layer's own state blob.**
+///
+/// `auto_poll`, `live_chunks`, `chunk_notifications` and `notifier_endpoint`
+/// were four root keys read by `Gui` fields. The fields are now
+/// `RadarSource`'s, so the keys travel with the layer, under
+/// `overlay_states["Radar"]` — the same place every other handler's settings
+/// already live, written and read by `serialize_state`/`deserialize_state`.
+///
+/// **A pure key move.** Each value is carried across **verbatim**, by
+/// `serde_json::Value` and not by type: a `live_chunks` some other build wrote
+/// as a string is handed to the handler's own tolerant reader exactly as it
+/// arrived, rather than being coerced or dropped here. A key the file does not
+/// have is not invented — the handler's default stands, which is what
+/// `#[serde(default)]` did for these keys at the root.
+///
+/// **It runs after [`panes_take_layer_slots`]**, which reads the root
+/// `live_chunks` for its per-pane fan-out. The chain guarantees the order: a
+/// v2 file walks rung 2 before rung 3, so the fan-out reads the key while it
+/// is still at the root.
+///
+/// An existing `overlay_states["Radar"]` entry is **not** replaced — its
+/// members are merged under, so a key the blob already carries wins over the
+/// root's copy. A file holding both is one a newer build wrote and an older
+/// one handed back, and the blob is the newer half.
+fn radar_takes_its_settings(value: &mut serde_json::Value) {
+    const MOVED: [&str; 4] = [
+        "auto_poll",
+        "live_chunks",
+        "chunk_notifications",
+        "notifier_endpoint",
+    ];
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    let carried: Vec<(String, serde_json::Value)> = MOVED
+        .iter()
+        .filter_map(|key| root.remove(*key).map(|v| ((*key).to_string(), v)))
+        .collect();
+    if carried.is_empty() {
+        return;
+    }
+    let states = root
+        .entry("overlay_states".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !states.is_object() {
+        // A malformed `overlay_states` is dropped by the loader's own repair
+        // step; overwriting it here would hide that from it.
+        return;
+    }
+    let states = states.as_object_mut().expect("shape checked above");
+    let radar = states
+        .entry(RADAR_ID.to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !radar.is_object() {
+        return;
+    }
+    let radar = radar.as_object_mut().expect("shape checked above");
+    for (key, moved) in carried {
+        radar.entry(key).or_insert(moved);
+    }
+}
 
 /// Walk `value` up from whatever version it speaks to [`CONFIG_VERSION`].
 pub(crate) fn migrate_to_current(value: &mut serde_json::Value) {

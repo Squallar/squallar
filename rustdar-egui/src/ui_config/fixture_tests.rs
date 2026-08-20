@@ -560,8 +560,8 @@ fn an_unknown_ids_saved_state_survives_a_layer_toggle() {
 
 /// A file whose **global** `live_chunks` is `false`, over two panes.
 ///
-/// The setting round-trips today through `set_live_chunks` and a direct
-/// `UiConfig` parse (`live_chunks_config_tests`), but nothing in the corpus
+/// The setting round-trips today through the layer's own control and the
+/// radar state blob (`live_chunks_config_tests`), but nothing in the corpus
 /// drove the *whole-file* path — `load_ui_config` → `Gui` → `ui_config_json`
 /// — with the value **off**. That is the leg that matters: every other file
 /// here carries the default `true`, so an assertion on it could not tell the
@@ -579,13 +579,13 @@ fn a_global_live_chunks_off_reaches_the_gui_and_returns_on_the_save() {
 
     let mut gui = Gui::new();
     assert!(
-        gui.live_chunks_enabled(),
+        crate::radar_layer::live_chunks_enabled(&gui),
         "precondition: a fresh Gui starts with live chunks ON, or the \
          assertion below could pass without the file being read at all",
     );
     assert!(gui.load_ui_config(&store), "the fixture must load");
     assert!(
-        !gui.live_chunks_enabled(),
+        !crate::radar_layer::live_chunks_enabled(&gui),
         "the file's live_chunks=false did not reach the Gui",
     );
 
@@ -605,7 +605,7 @@ fn a_global_live_chunks_off_reaches_the_gui_and_returns_on_the_save() {
     let save1 = gui.ui_config_json().expect("a loaded Gui serializes");
     let v1: serde_json::Value = serde_json::from_str(&save1).expect("save1 is JSON");
     assert_eq!(
-        v1["live_chunks"],
+        v1["overlay_states"]["Radar"]["live_chunks"],
         serde_json::json!(false),
         "the save reinstated the default instead of writing the loaded value",
     );
@@ -616,7 +616,7 @@ fn a_global_live_chunks_off_reaches_the_gui_and_returns_on_the_save() {
         "the save must reload"
     );
     assert!(
-        !gui2.live_chunks_enabled(),
+        !crate::radar_layer::live_chunks_enabled(&gui2),
         "the second session lost the setting",
     );
     let save2 = gui2.ui_config_json().expect("a reloaded Gui serializes");
@@ -739,11 +739,20 @@ fn the_shape_migration_folds_three_maps_into_slots_and_fans_the_global_out() {
          it too takes the fan-out — one pane taking it and the other keeping \
          a default is the divergence this step must not introduce",
     );
+    // **The global's own home moved at the next rung** (WO-E8b): the chain
+    // does not stop at v3, so by the time the walk finishes, `live_chunks`
+    // has left the root for the radar layer's state blob. Its *value* is what
+    // this step is about, and it is the same one on the other side.
     assert_eq!(
         tree["live_chunks"],
+        serde_json::Value::Null,
+        "the root kept a second copy — one fact, one home",
+    );
+    assert_eq!(
+        tree["overlay_states"]["Radar"]["live_chunks"],
         serde_json::json!(false),
-        "the global stays at the root: the settings UI still writes it and an \
-         older build still reads it",
+        "the global did not survive the walk: the value the fan-out above \
+         read is not the value the layer ends up holding",
     );
     // The walk does not stamp `config_version` — the save does, from
     // [`CONFIG_VERSION`] — so this step has to be safe to run twice on its
@@ -982,20 +991,29 @@ fn the_live_chunk_switch_reaches_every_panes_radar_slot() {
         );
     }
 
-    gui.set_live_chunks(true);
+    gui.apply_layer_control(
+        &crate::radar_layer::POLL_LAYER,
+        &crate::radar_layer::live_chunks_update(true),
+    );
     for i in 0..2 {
         assert_eq!(
             gui.pane(i).expect("both panes").radar_live_chunks(),
             Some(true),
-            "pane {i} kept the old value — the setter moved the global only, \
-             and one toggle no longer means every pane",
+            "pane {i} kept the old value — the write moved the layer's global \
+             only, and one toggle no longer means every pane",
         );
     }
-    assert!(gui.live_chunks_enabled(), "the active pane answers");
+    assert!(
+        crate::radar_layer::live_chunks_enabled(&gui),
+        "the active pane answers"
+    );
 
     let v: serde_json::Value =
         serde_json::from_str(&gui.ui_config_json().expect("serializable")).expect("valid JSON");
-    assert_eq!(v["live_chunks"], serde_json::json!(true));
+    assert_eq!(
+        v["overlay_states"]["Radar"]["live_chunks"],
+        serde_json::json!(true)
+    );
     for i in 0..2 {
         assert_eq!(
             v["panes"][i]["layer_slots"]

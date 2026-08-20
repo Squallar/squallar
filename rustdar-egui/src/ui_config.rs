@@ -483,15 +483,12 @@ struct UiConfig {
     /// restored pane's `layer_link` **and** `time_link` off.
     #[serde(skip_serializing, default = "default_true")]
     sync_layers: bool,
-    auto_poll: bool,
-    /// Feed live panes from the real-time chunk bucket rather than polling the
-    /// archive for completed volumes.
-    live_chunks: bool,
-    /// Subscribe to the push-notification service for new chunks.
-    chunk_notifications: bool,
-    /// Where that service lives. Empty means the built-in default.
-    #[serde(default)]
-    notifier_endpoint: String,
+    // **The archive poll and the chunk feed's three switches used to be four
+    // root keys here.** WO-E8b's v3 → v4 migration moves them into
+    // `overlay_states["Radar"]`, where the layer that owns them describes
+    // them through `serialize_state`/`deserialize_state` like every other
+    // handler's settings. The migration is what an older file walks up
+    // through; nothing reads them here any more.
     #[serde(deserialize_with = "site_or_default")]
     site: String,
     loop_lookback_secs: u64,
@@ -826,10 +823,6 @@ impl Default for UiConfig {
             active_pane: 0,
             viewport_sync: true,
             sync_layers: true,
-            auto_poll: true,
-            live_chunks: true,
-            chunk_notifications: true,
-            notifier_endpoint: String::new(),
             site: "KTLX".to_string(),
             loop_lookback_secs: 3600,
             loop_speed_fps: 5.0,
@@ -869,6 +862,9 @@ impl super::Gui {
         } else {
             5.0
         };
+        // The layer's own answer, read once: a pane that carries no copy of
+        // the switch is saved with this one.
+        let global_live_chunks = crate::radar_layer::live_chunks_default(self);
         let pane_configs: Vec<PaneConfig> = self
             .panes
             .iter()
@@ -885,7 +881,7 @@ impl super::Gui {
                     time_link: pane.time_link,
                     viewport_link: pane.viewport_link,
                     layer_link: pane.layer_link,
-                    layer_slots: pane_slot_list(pane, self.live_chunks),
+                    layer_slots: pane_slot_list(pane, global_live_chunks),
                     unknown: pane.config_baggage.fields.clone(),
                     zoom: pane
                         .map_memory
@@ -906,10 +902,6 @@ impl super::Gui {
             active_pane: self.active_pane,
             viewport_sync: true,
             sync_layers: true,
-            auto_poll: crate::radar_layer::auto_poll_enabled(&self.overlays),
-            live_chunks: self.live_chunks,
-            chunk_notifications: self.chunk_notifications,
-            notifier_endpoint: self.notifier_endpoint.clone(),
             site: self.radar.config.site.clone(),
             loop_lookback_secs: self.loop_lookback_secs,
             loop_speed_fps: fps,
@@ -1044,11 +1036,6 @@ impl super::Gui {
             0
         };
 
-        self.set_auto_poll_enabled(config.auto_poll);
-        self.live_chunks = config.live_chunks;
-        self.chunk_notifications = config.chunk_notifications;
-        self.notifier_endpoint = config.notifier_endpoint;
-
         if !config.site.is_empty() {
             self.radar.config.site = config.site.clone();
         }
@@ -1114,13 +1101,22 @@ impl super::Gui {
         if !config.overlay_states.is_empty() {
             self.overlays
                 .deserialize_handler_states(&config.overlay_states);
-        } else if let Some(enabled) = config
+        }
+        // **Independent of the block above, and it has to be** (WO-E8b). The
+        // v0 toggle map's Radar entry is the only thing that carries that
+        // era's radar switch, and no handler's state blob has ever held it —
+        // radar's `enabled` lives in the pane's slot, not in its
+        // `serialize_state`. It used to be reached through an `else`, which
+        // was safe only while a v0 file had no `overlay_states` at all; the
+        // v3 → v4 key move gives every file one, so the `else` would have
+        // retired this migration silently. A file this build wrote answers
+        // `None` here — the save writes `layers` as an empty object — so the
+        // two cannot fight.
+        if let Some(enabled) = config
             .panes
             .iter()
             .find_map(|pc| pc.layers.get("Radar").copied())
         {
-            // The v0 toggle map's Radar entry, applied to the registry's own
-            // default before any pane exists to carry it.
             self.overlays
                 .set_enabled(&known::RADAR, enabled, &mut PaneMut::bare(0));
         }

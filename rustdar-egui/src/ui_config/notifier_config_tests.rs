@@ -1,25 +1,63 @@
-use super::*;
 use crate::Gui;
+use rustdar_kv::{KvStore, MemoryKvStore};
 
+/// A store holding exactly one file, as the disk would.
+fn store_with(file: &str) -> MemoryKvStore {
+    let store = MemoryKvStore::default();
+    store
+        .store(crate::UI_CONFIG_KEY, file)
+        .expect("the memory store accepts a write");
+    store
+}
+
+/// Write one of the notifier settings the one way the app writes them now — a
+/// layer id and a control update, through the generic door. There is no `Gui`
+/// setter for either any more, and that is the point of WO-E8b.
+fn apply(gui: &mut Gui, update: rustdar_source::controls::ControlUpdate) {
+    gui.apply_layer_control(&crate::radar_layer::POLL_LAYER, &update);
+}
+
+/// **WO-E8b moved where these are written**: the two values used to be root
+/// keys on `UiConfig` and are now members of the radar layer's own state blob,
+/// so the assertions read that blob instead of those fields. The property —
+/// both settings survive the save — is unchanged.
 #[test]
 fn the_notifier_settings_round_trip() {
     let mut gui = Gui::new();
-    gui.set_chunk_notifications(false);
-    gui.set_notifier_endpoint("wss://example.test");
+    apply(
+        &mut gui,
+        crate::radar_layer::chunk_notifications_update(false),
+    );
+    apply(
+        &mut gui,
+        crate::radar_layer::notifier_endpoint_update("wss://example.test"),
+    );
     let json = gui.ui_config_json().expect("serialises");
-    let parsed: UiConfig = serde_json::from_str(&json).expect("parses");
-    assert!(!parsed.chunk_notifications);
-    assert_eq!(parsed.notifier_endpoint, "wss://example.test");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("parses");
+    let radar = &parsed["overlay_states"]["Radar"];
+    assert_eq!(radar["chunk_notifications"], serde_json::json!(false));
+    assert_eq!(
+        radar["notifier_endpoint"],
+        serde_json::json!("wss://example.test")
+    );
 }
 
 /// A config written before these fields existed keeps the low-latency
-/// defaults rather than failing to parse or silently opting out.
+/// defaults rather than failing to load or silently opting out.
+///
+/// **WO-E8b moved the mechanism too**: the tolerance was `#[serde(default)]`
+/// on the container and is now the handler's own `deserialize_state`, which is
+/// only reachable through the whole load.
 #[test]
 fn an_older_config_defaults_to_notifications_on() {
     let old = r#"{"pane_count":1,"auto_poll":true,"site":"KTLX"}"#;
-    let parsed: UiConfig = serde_json::from_str(old).expect("an older config still parses");
-    assert!(parsed.chunk_notifications);
-    assert!(parsed.live_chunks);
+    let mut gui = Gui::new();
+    assert!(
+        gui.load_ui_config(&store_with(old)),
+        "an older config still loads"
+    );
+    assert!(crate::radar_layer::chunk_notifications_enabled(&gui));
+    assert!(crate::radar_layer::live_chunks_enabled(&gui));
 }
 
 /// A cleared endpoint box falls back to the built-in default rather than
@@ -27,10 +65,27 @@ fn an_older_config_defaults_to_notifications_on() {
 #[test]
 fn an_empty_endpoint_falls_back_to_the_default() {
     let mut gui = Gui::new();
-    gui.set_notifier_endpoint("   ");
-    assert_eq!(gui.notifier_endpoint(), crate::DEFAULT_NOTIFIER_ENDPOINT);
-    gui.set_notifier_endpoint("wss://example.test/");
-    assert_eq!(gui.notifier_endpoint(), "wss://example.test/");
+    apply(
+        &mut gui,
+        crate::radar_layer::notifier_endpoint_update("   "),
+    );
+    assert_eq!(
+        crate::radar_layer::notifier_endpoint(&gui),
+        rustdar_radar::source::DEFAULT_NOTIFIER_ENDPOINT
+    );
+    assert_eq!(
+        crate::radar_layer::notifier_endpoint_raw(&gui),
+        "   ",
+        "the box stopped showing what the user typed",
+    );
+    apply(
+        &mut gui,
+        crate::radar_layer::notifier_endpoint_update("wss://example.test/"),
+    );
+    assert_eq!(
+        crate::radar_layer::notifier_endpoint(&gui),
+        "wss://example.test/"
+    );
 }
 
 /// A config written before the camera grew fields loads at the defaults
