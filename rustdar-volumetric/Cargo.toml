@@ -14,7 +14,7 @@ edition.workspace = true
 rustdar-gpu = { workspace = true }
 # The device-class policy floor: grid cells, LUT/texture budgets, quality.
 rustdar-device-profile = { workspace = true }
-# The voxel vocabulary the bridge marches (VoxelGrid) and the product names
+# The voxel vocabulary the bridge marches (VolumeGrid) and the product names
 # the store evicts by.
 rustdar-radar = { workspace = true }
 # The pane/paint vocabulary the bridge answers to: pane::VolumeTarget,

@@ -310,6 +310,77 @@ fn the_alpha_curve_rides_the_frame_only_when_one_is_stored() {
     );
 }
 
+/// **The curve is keyed by the pane's OWN field id, not by the registry row
+/// that id resolves to.**
+///
+/// WO-E9c wrote the frame's curve lookup as a product -> id bridge; WO-E9e
+/// re-typed the pane's selection to an id and left a `FieldId -> spec ->
+/// FieldId` round trip behind it, which WO-M14a deleted. **For every field
+/// this build registers the round trip is the identity**, so no fixture in
+/// this suite could tell the two spellings apart — restoring the bridge left
+/// the whole package green. This one holds an id the build does NOT register,
+/// which is the single input where they differ: the round trip substituted
+/// the default field's key, so a pane would have painted Reflectivity's
+/// user-edited curve onto a field that is not Reflectivity.
+#[test]
+fn a_curve_is_keyed_by_the_panes_own_field_not_by_the_row_it_resolves_to() {
+    use crate::volume_alpha::{AlphaCurve, CURVE_LEN};
+
+    let (mut h, painter) = volume_harness(StubVolumePainter::painting());
+    let mut alphas = [0u8; CURVE_LEN];
+    alphas[128..].fill(255);
+    let curve = AlphaCurve::from_alphas(alphas);
+
+    // The precondition, and it is what makes the assertion below able to
+    // fail: with the pane on the default field, that field's curve rides.
+    let default_field = h.gui_mut().pane(1).expect("pane 1").selected_product();
+    h.gui_mut().volume_alpha.set(&default_field, curve.clone());
+    h.frames_for(1, FRAME_DT);
+    assert_eq!(
+        last_seen(&painter).alpha,
+        Some(curve),
+        "precondition: the pane's own field's curve must ride the frame, or \
+         the substitution below is invisible",
+    );
+
+    // An id this build does not register. `field_facts::facts` answers for it
+    // with the DEFAULT row — that is its documented totality — so the pane
+    // still reaches the volume arm, and the only question left is which key
+    // the curve was looked up under.
+    let alien = rustdar_source::product::FieldId::new("NotAFieldThisBuildRegisters");
+    assert!(
+        rustdar_radar::fields::spec_for(&alien).is_none(),
+        "precondition: the fixture id must be unregistered",
+    );
+    assert_eq!(
+        crate::field_facts::facts(&alien).id,
+        default_field,
+        "precondition: the deleted round trip resolved this id to the DEFAULT \
+         field, which is the substitution this test exists to refuse",
+    );
+    // Both panes: `propagate_layer_sync` copies the ACTIVE pane's field onto
+    // every linked pane every frame, so setting only the 3D pane's would be
+    // undone before the next paint — measured, not assumed.
+    for idx in [0, 1] {
+        h.gui_mut()
+            .pane_mut(idx)
+            .expect("pane")
+            .set_selected_product(alien.clone());
+    }
+    h.frames_for(2, FRAME_DT);
+    assert_eq!(
+        last_seen(&painter).target.product,
+        alien,
+        "precondition: the frame must actually be aimed at the alien field",
+    );
+    assert_eq!(
+        last_seen(&painter).alpha,
+        None,
+        "a field with no stored curve of its own must ride with no curve — \
+         never the default field's",
+    );
+}
+
 /// The Volume Alpha button is on the 3D pane — the editor's only door.
 #[test]
 fn the_volume_alpha_button_is_painted_on_a_3d_pane() {

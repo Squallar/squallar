@@ -39,7 +39,7 @@ use rustdar_egui::volume_view::view_for;
 use rustdar_gpu::egui_renderer::AttachmentConfig;
 use rustdar_radar::types::RadarProduct;
 use rustdar_radar::voxel::{
-    HalfExtentKm, VoxelGrid, VoxelRequest, build_voxels_with_motion, default_shape,
+    HalfExtentKm, VolumeGrid, VoxelRequest, build_voxels_with_motion, default_shape,
 };
 use rustdar_volumetric::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
 use rustdar_volumetric::raymarch::{FLOOR_FORMAT, VolumePipelines};
@@ -100,7 +100,7 @@ fn render_a_real_volume_mask() {
 
     let size = size_from_env();
     let box_size_km = box_size_km(&grid);
-    let shape = grid.shape();
+    let shape = grid.dims();
     let grid_dims = [shape.nx as u32, shape.ny as u32, shape.nz as u32];
 
     let (camera_source, box_from_clip, eye_in_box, exaggeration) = camera(box_size_km, size);
@@ -299,7 +299,7 @@ fn render_a_real_volume_mask() {
     let (y0, y1) = grid.y_range_km();
     let (z0, z1) = grid.z_range_km_msl();
     let (value_lo, value_hi) = grid.value_range();
-    let (grid_lat, grid_lon) = grid.site();
+    let (grid_lat, grid_lon) = grid.anchor();
     let meta = format!(
         "volume            {}\n\
          site              {site_name} at {grid_lat:.5}, {grid_lon:.5}\n\
@@ -346,8 +346,8 @@ fn render_a_real_volume_mask() {
         box_size_km[0],
         box_size_km[1],
         box_size_km[2],
-        grid.tilt_count(),
-        grid.widest_tilt_gap_deg(),
+        grid.levels(),
+        grid.widest_level_gap_deg(),
         product.name(),
         grid.fade_band(),
         shape.cells(),
@@ -407,7 +407,7 @@ fn measure_boundary_honesty_and_smoothness() {
 
     let size = size_from_env();
     let box_size_km = box_size_km(&grid);
-    let shape = grid.shape();
+    let shape = grid.dims();
     let grid_dims = [shape.nx as u32, shape.ny as u32, shape.nz as u32];
     let (camera_source, box_from_clip, eye_in_box, exaggeration) = camera(box_size_km, size);
 
@@ -616,7 +616,7 @@ fn silhouette_roughness(pixels: &[[u8; 4]], size: [u32; 2]) -> (f64, u64, u64) {
 
 /// The box's true physical extent in kilometres, exactly as
 /// `volume_bridge::box_size_km` computes it.
-fn box_size_km(grid: &VoxelGrid) -> [f32; 3] {
+fn box_size_km(grid: &VolumeGrid) -> [f32; 3] {
     let (x0, x1) = grid.x_range_km();
     let (y0, y1) = grid.y_range_km();
     let (z0, z1) = grid.z_range_km_msl();
@@ -625,7 +625,7 @@ fn box_size_km(grid: &VoxelGrid) -> [f32; 3] {
 
 /// A palette that is opaque at or above `threshold` and absent below it, plus
 /// the index the cut landed on.
-fn hard_lut(grid: &VoxelGrid, threshold: f32) -> (Vec<u8>, u8) {
+fn hard_lut(grid: &VolumeGrid, threshold: f32) -> (Vec<u8>, u8) {
     let mut lut = vec![0u8; VOLUME_LUT_BYTES];
     let mut cut = None;
     for index in 1..=u8::MAX {

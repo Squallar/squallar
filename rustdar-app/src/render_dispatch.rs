@@ -1393,7 +1393,7 @@ impl RenderDispatcher {
             let _guard = guard;
             // An output of another kind is `None` — "nothing to draw".
             let grid = output
-                .and_then(|out| out.take::<rustdar_radar::voxel::VoxelGrid>())
+                .and_then(|out| out.take::<rustdar_radar::voxel::VolumeGrid>())
                 .map(Box::new);
             // The claim the whole worker move is measured by: the resample no longer
             // spends this time on the frame thread.

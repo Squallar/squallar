@@ -94,7 +94,7 @@ pub struct SectionResponse {
 /// store refcounts grids by target, and a stale target is dropped.
 pub struct VoxelResponse {
     pub target: rustdar_egui::pane::VolumeTarget,
-    pub grid: Option<Box<rustdar_radar::voxel::VoxelGrid>>,
+    pub grid: Option<Box<rustdar_radar::voxel::VolumeGrid>>,
 }
 
 /// Result from a Level III object fetch. Names the AWIPS code and no product:

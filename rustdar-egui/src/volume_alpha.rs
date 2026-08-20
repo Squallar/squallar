@@ -32,7 +32,7 @@ impl AlphaCurve {
 
     /// A grid table's alpha channel as a curve — what an untouched editor
     /// shows, and what a first stroke starts from. `None` unless `lut` is the
-    /// exact 1024 bytes a `VoxelGrid::lut()` hands over.
+    /// exact 1024 bytes a `VolumeGrid::lut()` hands over.
     pub fn from_palette(lut: &[u8]) -> Option<Self> {
         if lut.len() != CURVE_LEN * 4 {
             return None;
@@ -50,7 +50,7 @@ impl AlphaCurve {
     }
 
     /// How many indices above the no-data index this curve keeps fully
-    /// transparent — [`VoxelGrid::fade_band`]'s rule, over the curve instead
+    /// transparent — `TransferTable::fade_band`'s rule, over the curve instead
     /// of the palette, spelled identically on purpose: the raymarch's skip
     /// threshold is anchored at `(band + 0.5) / 255`, and the two producers of
     /// `band` must agree about what it counts or the march skips visible data
@@ -277,7 +277,7 @@ mod tests {
         );
     }
 
-    /// The curve's `fade_band` follows `VoxelGrid::fade_band`'s exact rule:
+    /// The curve's `fade_band` follows `TransferTable::fade_band`'s exact rule:
     /// the first nonzero-alpha entry at index `n` means a band of `n - 1`, and
     /// an all-transparent curve answers `u8::MAX`. The skip threshold
     /// `(band + 0.5) / 255` then sits strictly between the last transparent

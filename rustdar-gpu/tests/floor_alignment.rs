@@ -169,7 +169,7 @@ struct BoxGeo {
 }
 
 impl BoxGeo {
-    fn from_grid(grid: &rustdar_radar::voxel::VoxelGrid) -> Self {
+    fn from_grid(grid: &rustdar_radar::voxel::VolumeGrid) -> Self {
         let (x0, x1) = grid.x_range_km();
         let (y0, y1) = grid.y_range_km();
         BoxGeo {
@@ -522,9 +522,9 @@ fn sample_floor(mirror: &Mirror, geo: &BoxGeo, mapping: Mapping) -> FloorSample 
 
 /// The grid's echo footprint on the same lattice: the column maximum of the
 /// voxel grid, thresholded, nearest-sampled into probe texels.
-fn sample_grid(grid: &rustdar_radar::voxel::VoxelGrid, thresh: f32) -> Mask {
+fn sample_grid(grid: &rustdar_radar::voxel::VolumeGrid, thresh: f32) -> Mask {
     let side = PROBE_TEXELS;
-    let shape = grid.shape();
+    let shape = grid.dims();
     let cut = grid.value_to_index(thresh);
     let mut column_max = vec![0u8; shape.nx * shape.ny];
     for iz in 0..shape.nz {
@@ -706,7 +706,7 @@ fn measure_floor_against_grid_on_a_real_volume() {
     // ── The numbers ──────────────────────────────────────────────────────
     let (x0, x1) = grid.x_range_km();
     let (y0, y1) = grid.y_range_km();
-    let shape = grid.shape();
+    let shape = grid.dims();
     // **Per axis.** The probe lattice is a fixed `PROBE_TEXELS`² over whatever
     // the box footprint is, so on a rectangular box a texel is not square on
     // the ground and one number cannot convert both lanes of a translation.
@@ -1300,7 +1300,7 @@ fn a_planted_storm_lands_on_the_floor_exactly_under_its_own_voxels() {
     // Where each path put the disc, in kilometres east/north of the site.
     let (x0, x1) = grid.x_range_km();
     let (y0, y1) = grid.y_range_km();
-    let shape = grid.shape();
+    let shape = grid.dims();
     let cut = grid.value_to_index(30.0);
     let (mut gn, mut gx, mut gy) = (0usize, 0.0f64, 0.0f64);
     for iy in 0..shape.ny {

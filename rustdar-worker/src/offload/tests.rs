@@ -7,7 +7,7 @@ use rustdar_radar::jobs::{
 };
 use rustdar_radar::render_input::RenderInput;
 use rustdar_radar::scan::DecodedScan;
-use rustdar_radar::voxel::VoxelGrid;
+use rustdar_radar::voxel::VolumeGrid;
 use rustdar_radar::voxel::{VoxelRequest, VoxelShape};
 use rustdar_radar::xsect::CrossSection;
 use rustdar_radar::xsect::SectionRequest;
@@ -935,9 +935,9 @@ fn the_vertical_jobs_produce_their_own_output_kinds() {
 
     let voxels = execute(&a_voxel_job()).expect("the voxel job builds");
     let grid = voxels
-        .take::<VoxelGrid>()
+        .take::<VolumeGrid>()
         .expect("the voxel job answers a grid");
-    assert_eq!(grid.shape().cells(), 8 * 6 * 4);
+    assert_eq!(grid.dims().cells(), 8 * 6 * 4);
 
     // And the same jobs off the wire, which is the path a worker takes.
     assert!(
@@ -949,7 +949,7 @@ fn the_vertical_jobs_produce_their_own_output_kinds() {
     assert!(
         execute_bytes(&a_voxel_job().to_bytes())
             .expect("the voxel job builds via the wire")
-            .downcast_ref::<VoxelGrid>()
+            .downcast_ref::<VolumeGrid>()
             .is_some(),
     );
 }
@@ -976,12 +976,12 @@ fn a_frame_consumer_sees_nothing_rather_than_another_kinds_buffers() {
     );
     assert!(
         execute(&a_job())
-            .and_then(|out| out.take::<VoxelGrid>())
+            .and_then(|out| out.take::<VolumeGrid>())
             .is_none()
     );
     assert!(
         execute(&a_section_job())
-            .and_then(|out| out.take::<VoxelGrid>())
+            .and_then(|out| out.take::<VolumeGrid>())
             .is_none()
     );
 }
@@ -993,7 +993,7 @@ fn a_reply_payload_of_the_wrong_kind_is_refused_by_the_rows_codec() {
         .and_then(|out| out.take::<CrossSection>())
         .expect("the section job draws");
     let grid = execute(&a_voxel_job())
-        .and_then(|out| out.take::<VoxelGrid>())
+        .and_then(|out| out.take::<VolumeGrid>())
         .expect("the voxel job builds");
 
     let row_decode_out = |label: &str| {
@@ -1003,7 +1003,8 @@ fn a_reply_payload_of_the_wrong_kind_is_refused_by_the_rows_codec() {
             .decode_out
     };
     let section_bytes = section.to_bytes();
-    let grid_bytes = grid.to_bytes();
+    let grid_bytes =
+        rustdar_radar::voxel::to_bytes(&grid).expect("a registered field has a wire code");
 
     // Each row decodes its own payload — the control that the refusals below
     // are about the pairing, not the bytes.
@@ -1013,7 +1014,7 @@ fn a_reply_payload_of_the_wrong_kind_is_refused_by_the_rows_codec() {
         Some(section),
     );
     assert_eq!(
-        row_decode_out("voxels")(&grid_bytes, Vec::new()).and_then(|out| out.take::<VoxelGrid>()),
+        row_decode_out("voxels")(&grid_bytes, Vec::new()).and_then(|out| out.take::<VolumeGrid>()),
         Some(grid),
     );
 
@@ -1804,17 +1805,17 @@ fn the_voxel_build_is_byte_identical_direct_and_via_the_wire() {
     );
 
     let direct = execute(&job)
-        .and_then(|out| out.take::<VoxelGrid>())
+        .and_then(|out| out.take::<VolumeGrid>())
         .expect("the fixture volume builds a grid");
     assert_eq!(
-        direct.shape().cells(),
+        direct.dims().cells(),
         8 * 6 * 4,
         "the fixture's grid is not the asked-for shape, so the comparison \
          below is not about the build this test believes it is",
     );
 
     let via_wire = execute_bytes(&bytes)
-        .and_then(|out| out.take::<VoxelGrid>())
+        .and_then(|out| out.take::<VolumeGrid>())
         .expect("the described voxel job builds off its own wire form");
     assert_eq!(
         via_wire, direct,
@@ -3207,7 +3208,7 @@ fn an_overlay_reply_travels_as_its_own_out_kind() {
     );
     assert!(
         execute(&an_overlay_sites_job())
-            .and_then(|out| out.take::<VoxelGrid>())
+            .and_then(|out| out.take::<VolumeGrid>())
             .is_none()
     );
 

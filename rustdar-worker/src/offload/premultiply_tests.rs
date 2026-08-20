@@ -133,7 +133,7 @@ fn a_voxel_grid_passes_through_the_output_stage_untouched() {
     .expect("the fixture volume builds a grid");
 
     let through = execute(&tests::a_voxel_job())
-        .and_then(|out| out.take::<rustdar_radar::voxel::VoxelGrid>())
+        .and_then(|out| out.take::<rustdar_radar::voxel::VolumeGrid>())
         .expect("the same job through the funnel builds the same grid");
 
     assert_eq!(

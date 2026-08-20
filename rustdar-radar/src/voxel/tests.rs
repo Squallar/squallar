@@ -1070,7 +1070,7 @@ fn a_long_range_volumes_box_holds_the_echo_the_fixed_box_cut_off() {
     );
 
     let cut = grid.value_to_index(50.0).max(1);
-    let shape = grid.shape();
+    let shape = grid.dims();
     let mut lit = 0usize;
     let mut farthest = 0.0f64;
     for iy in 0..shape.ny {
@@ -1368,7 +1368,7 @@ fn the_centre_may_sit_away_from_the_site() {
         "and stays on the site's own latitude; got {:?}",
         grid.y_range_km(),
     );
-    assert_eq!(grid.site(), SITE);
+    assert_eq!(grid.anchor(), SITE);
 
     let centred = build_voxels(&scan, &request(ODD), SITE.0, SITE.1).unwrap();
     assert_eq!(centred.x_range_km(), (-60.0, 60.0));
@@ -1385,12 +1385,15 @@ fn the_output_carries_everything_a_model_matrix_needs() {
         ..request(ODD)
     };
     let grid = build_voxels(&scan, &req, SITE.0, SITE.1).unwrap();
-    assert_eq!(grid.shape(), ODD);
+    assert_eq!(grid.dims(), ODD);
     assert_eq!(grid.x_range_km(), (-37.5, 37.5));
     assert_eq!(grid.y_range_km(), (-37.5, 37.5));
     assert_eq!(grid.z_range_km_msl(), (0.75, 15.25));
-    assert_eq!(grid.site(), SITE);
-    assert_eq!(grid.product(), RadarProduct::Reflectivity);
+    assert_eq!(grid.anchor(), SITE);
+    assert_eq!(
+        crate::fields::product_for(grid.field()),
+        Some(RadarProduct::Reflectivity)
+    );
     assert_eq!(
         grid.value_range(),
         (-32.5, 95.0),
@@ -1427,17 +1430,17 @@ fn the_output_carries_everything_a_model_matrix_needs() {
 fn the_grid_reports_the_ladder_it_was_built_from() {
     let scan = scan_of(&|_, _| Some(35.0));
     let grid = build_voxels(&scan, &request(ODD), SITE.0, SITE.1).unwrap();
-    assert_eq!(grid.tilt_count(), 2);
+    assert_eq!(grid.levels(), 2);
     assert!(
-        (grid.widest_tilt_gap_deg() - (f64::from(HIGH_DEG) - f64::from(LOW_DEG))).abs() < 1e-6,
+        (grid.widest_level_gap_deg() - (f64::from(HIGH_DEG) - f64::from(LOW_DEG))).abs() < 1e-6,
         "0.53° and 4.47° are 3.94° apart; reported {}",
-        grid.widest_tilt_gap_deg(),
+        grid.widest_level_gap_deg(),
     );
-    assert!(grid.widest_tilt_gap_deg() > 3.0);
+    assert!(grid.widest_level_gap_deg() > 3.0);
 
     let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
-    assert_eq!(grid.tilt_count(), sampler.tilt_count());
-    assert_eq!(grid.widest_tilt_gap_deg(), sampler.widest_tilt_gap_deg());
+    assert_eq!(grid.levels(), sampler.tilt_count());
+    assert_eq!(grid.widest_level_gap_deg(), sampler.widest_tilt_gap_deg());
 }
 
 #[test]
@@ -1453,8 +1456,8 @@ fn a_single_tilt_volume_fills_nothing_rather_than_smearing_one_beam() {
         )],
     );
     let grid = build_voxels(&scan, &request(ODD), SITE.0, SITE.1).unwrap();
-    assert_eq!(grid.tilt_count(), 1);
-    assert_eq!(grid.widest_tilt_gap_deg(), 0.0);
+    assert_eq!(grid.levels(), 1);
+    assert_eq!(grid.widest_level_gap_deg(), 0.0);
     assert!(
         grid.indices().iter().all(|&i| i == NO_DATA_INDEX),
         "one rung has no vertical extent, so nothing may be filled in",
@@ -1483,7 +1486,7 @@ fn a_layer_is_quantised_to_the_ladder_rather_than_to_nz() {
 
     // ── a layer measured on exactly one rung ──
     let grid = build_voxels(&one_rung_carries_data(Some(1)), &req, SITE.0, SITE.1).unwrap();
-    assert_eq!(grid.tilt_count(), 3, "all three rungs must survive");
+    assert_eq!(grid.levels(), 3, "all three rungs must survive");
     let rows: Vec<usize> = (0..nz)
         .filter(|&iz| grid.index_at(1, 0, iz) != Some(NO_DATA_INDEX))
         .collect();
@@ -1523,7 +1526,7 @@ fn a_layer_is_quantised_to_the_ladder_rather_than_to_nz() {
 
     // ── a layer that no rung looked at ──
     let missed = build_voxels(&one_rung_carries_data(None), &req, SITE.0, SITE.1).unwrap();
-    assert_eq!(missed.tilt_count(), 3, "the ladder is the same one");
+    assert_eq!(missed.levels(), 3, "the ladder is the same one");
     assert!(
         missed.indices().iter().all(|&i| i == NO_DATA_INDEX),
         "a layer between tilts is measured by nothing and painted nowhere, \
@@ -1709,26 +1712,29 @@ fn two_identical_grids_compare_equal_through_the_nan_value_plane() {
     assert_ne!(a, build_voxels(&scan, &lean, SITE.0, SITE.1).unwrap());
 }
 
-fn hand_built(values: Option<Vec<f32>>) -> VoxelGrid {
+fn hand_built(values: Option<Vec<f32>>) -> VolumeGrid {
     let value_range = value_range_for(MomentSlot::Reflectivity);
-    VoxelGrid {
+    VolumeGrid::from_parts(VolumeParts {
         indices: vec![0, 7, 200, 255],
         values,
-        lut: colormap_lut(RadarProduct::Reflectivity, value_range),
-        shape: VoxelShape {
+        dims: VoxelShape {
             nx: 2,
             ny: 2,
             nz: 1,
         },
+        anchor: SITE,
         x_range_km: (-10.0, 10.0),
         y_range_km: (-10.0, 10.0),
         z_range_km_msl: (0.0, 5.0),
-        site: SITE,
-        value_range,
-        product: RadarProduct::Reflectivity,
-        tilt_count: 2,
-        widest_tilt_gap_deg: 3.94,
-    }
+        field: crate::fields::known::REFLECTIVITY,
+        transfer: transfer_table_over(
+            colormap_lut(RadarProduct::Reflectivity, value_range),
+            RadarProduct::Reflectivity,
+            value_range,
+        ),
+        levels: 2,
+        widest_level_gap_deg: 3.94,
+    })
 }
 
 #[test]
@@ -1769,7 +1775,12 @@ fn debug_is_a_summary_rather_than_the_grid() {
     let text = format!("{grid:?}");
     assert_eq!(text.lines().count(), 1, "{text}");
     assert!(text.len() < 400, "{} chars: {text}", text.len());
-    assert!(text.contains("ref"), "{text}");
+    // WO-M14a: the summary names the grid's FIELD, and a field is an open id
+    // now rather than this crate's enum — so the identity token moved from
+    // the product's short code `ref` to the registered spelling
+    // `Reflectivity`. The substrate cannot reach `ProductSpec::code`: it has
+    // the id and no registry to look one up in. Same property, new spelling.
+    assert!(text.contains("Reflectivity"), "{text}");
     assert!(text.contains("11x13x7"), "{text}");
 
     let filled = grid
@@ -1951,7 +1962,7 @@ fn every_volume_product_builds_a_populated_grid_and_a_full_table() {
         };
         let grid = build_voxels(&scan, &req, SITE.0, SITE.1).unwrap();
         assert_eq!(grid.lut().len(), LUT_LEN, "{}", product.name());
-        assert_eq!(grid.product(), product);
+        assert_eq!(crate::fields::product_for(grid.field()), Some(product));
         let filled = grid
             .indices()
             .iter()
@@ -2083,7 +2094,10 @@ fn the_table_filter_is_nearest_only_for_a_non_gradient_scale() {
         assert_eq!(
             grid.lut_filter() == LutFilter::Linear,
             get_legend_scale(product).is_gradient,
-            "the filter is derived from the scale, never stored",
+            "WO-M14a: the filter IS stored now — baked into the transfer \
+             table at build time rather than matched on the product on \
+             demand — so what this asserts is that the stored byte still \
+             agrees with the scale it was baked from",
         );
     }
     assert_eq!(
@@ -2325,12 +2339,22 @@ fn the_fade_band_is_measured_per_product() {
         "a quarter of the whole ramp",
     );
 
-    let mut opaque = hand_built(None);
-    opaque.lut = vec![255; LUT_LEN];
-    opaque.lut[3] = 0;
+    // The two degenerate tables, built directly now that the band is measured
+    // once when the table is: entry 0 is forced transparent, so an otherwise
+    // opaque table has a band of zero, and an entirely transparent one fades
+    // the whole ramp.
+    let table_of = |lut: Vec<u8>| {
+        transfer_table_over(
+            lut,
+            RadarProduct::Reflectivity,
+            value_range_for(MomentSlot::Reflectivity),
+        )
+    };
+    let mut opaque_lut = vec![255; LUT_LEN];
+    opaque_lut[3] = 0;
+    let opaque = table_of(opaque_lut);
     assert_eq!(opaque.fade_band(), 0);
-    let mut clear = hand_built(None);
-    clear.lut = vec![0; LUT_LEN];
+    let clear = table_of(vec![0; LUT_LEN]);
     assert_eq!(clear.fade_band(), u8::MAX);
 }
 
@@ -2852,7 +2876,14 @@ fn prefix_at(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"))
 }
 
-fn wire_fixture() -> VoxelGrid {
+/// [`to_bytes`] for a grid whose field this build certainly registers — every
+/// fixture in this file is built through `build_voxels` or from a registered
+/// product, so the refusal arm is unreachable here and has its own test.
+fn encoded(grid: &VolumeGrid) -> Vec<u8> {
+    to_bytes(grid).expect("a registered field has a wire code")
+}
+
+fn wire_fixture() -> VolumeGrid {
     let scan = scan_of(&|az, slant| (az < 120.0 && slant < 90.0).then_some(48.0));
     build_voxels(&scan, &request(ODD), SITE.0, SITE.1).expect("the fixture grid builds")
 }
@@ -2885,7 +2916,7 @@ fn a_supported_shape_always_has_a_cell_so_an_absent_plane_is_unambiguous() {
 #[test]
 fn the_length_prefixes_are_where_the_tests_think_they_are() {
     let grid = wire_fixture();
-    let bytes = grid.to_bytes();
+    let bytes = encoded(&grid);
     let cells = ODD.cells();
     assert_eq!(prefix_at(&bytes, SHAPE_AT), ODD.nx as u32);
     assert_eq!(prefix_at(&bytes, SHAPE_AT + 4), ODD.ny as u32);
@@ -2899,7 +2930,7 @@ fn the_length_prefixes_are_where_the_tests_think_they_are() {
 #[test]
 fn the_format_version_is_the_one_this_layout_ships() {
     assert_eq!(FORMAT_VERSION, 1);
-    let bytes = wire_fixture().to_bytes();
+    let bytes = encoded(&wire_fixture());
     assert_eq!(&bytes[..4], b"RDVX", "the magic moved");
     assert_eq!(
         u16::from_le_bytes([bytes[4], bytes[5]]),
@@ -2909,18 +2940,17 @@ fn the_format_version_is_the_one_this_layout_ships() {
     let grid = wire_fixture();
     assert_eq!(
         grid.indices().len(),
-        grid.shape().cells(),
+        grid.dims().cells(),
         "the payload carries more than one byte per cell — a coverage plane \
          on the wire is a layout change and must bump FORMAT_VERSION",
     );
 }
 
-fn layout_fixture() -> VoxelGrid {
-    VoxelGrid {
+fn layout_fixture() -> VolumeGrid {
+    VolumeGrid::from_parts(VolumeParts {
         indices: vec![0, 1, 128, NO_DATA_INDEX, 255, 7],
         values: Some(vec![0.0, -1.5, 2.25, f32::NAN, 0.5, -0.75]),
-        lut: (0..LUT_LEN).map(|i| (i % 251) as u8).collect(),
-        shape: VoxelShape {
+        dims: VoxelShape {
             nx: 3,
             ny: 2,
             nz: 1,
@@ -2928,17 +2958,66 @@ fn layout_fixture() -> VoxelGrid {
         x_range_km: (-1.5, 2.5),
         y_range_km: (-3.25, 4.75),
         z_range_km_msl: (0.5, 8.5),
-        site: (35.25, -97.5),
-        value_range: (-32.0, 96.0),
-        product: RadarProduct::Reflectivity,
-        tilt_count: 5,
-        widest_tilt_gap_deg: 1.25,
-    }
+        anchor: (35.25, -97.5),
+        field: crate::fields::known::REFLECTIVITY,
+        transfer: transfer_table_over(
+            (0..LUT_LEN).map(|i| (i % 251) as u8).collect(),
+            RadarProduct::Reflectivity,
+            (-32.0, 96.0),
+        ),
+        levels: 5,
+        widest_level_gap_deg: 1.25,
+    })
+}
+
+/// A grid carrying a field this build does not register has **no wire form**.
+///
+/// The FieldId <-> wire-code map is this crate's private table, so a payload
+/// it cannot name has nothing to write at byte 6 — and writing anything else
+/// there would decode as a different moment on the far end.
+#[test]
+fn a_grid_whose_field_this_build_cannot_name_has_no_wire_form() {
+    let good = wire_fixture();
+    assert!(
+        to_bytes(&good).is_some(),
+        "precondition: a registered field must encode, or the refusal below \
+         passes for the wrong reason",
+    );
+
+    let same_but_alien = |field: crate::fields::Id| {
+        VolumeGrid::from_parts(VolumeParts {
+            indices: good.indices().to_vec(),
+            values: good.values().map(<[f32]>::to_vec),
+            dims: good.dims(),
+            anchor: good.anchor(),
+            x_range_km: good.x_range_km(),
+            y_range_km: good.y_range_km(),
+            z_range_km_msl: good.z_range_km_msl(),
+            field,
+            transfer: good.transfer().clone(),
+            levels: good.levels(),
+            widest_level_gap_deg: good.widest_level_gap_deg(),
+        })
+    };
+
+    // The control: everything but the field, and it still encodes.
+    assert_eq!(
+        to_bytes(&same_but_alien(good.field().clone())),
+        to_bytes(&good),
+        "rebuilding the fixture through its own accessors must not change it",
+    );
+    assert!(
+        to_bytes(&same_but_alien(crate::fields::Id::new(
+            "NotAMomentThisBuildHas"
+        )))
+        .is_none(),
+        "a field with no wire code must have no payload",
+    );
 }
 
 #[test]
 fn the_wire_layout_is_the_one_this_version_ships() {
-    let bytes = layout_fixture().to_bytes();
+    let bytes = encoded(&layout_fixture());
     assert_eq!(
         (
             FORMAT_VERSION,
@@ -2984,19 +3063,23 @@ fn a_grid_round_trips_through_its_wire_form() {
                 );
             }
 
-            let decoded = VoxelGrid::from_bytes(&grid.to_bytes())
-                .unwrap_or_else(|| panic!("{what} did not decode"));
+            let decoded =
+                from_bytes(&encoded(&grid)).unwrap_or_else(|| panic!("{what} did not decode"));
             assert_eq!(grid, decoded, "{what} changed in transit");
             assert_eq!(
                 decoded.values().is_some(),
                 values_wanted,
                 "{what}: the value plane's presence did not survive",
             );
-            assert_eq!(decoded.product(), product, "{what}");
-            assert_eq!(decoded.shape(), ODD, "{what}");
+            assert_eq!(
+                crate::fields::product_for(decoded.field()),
+                Some(product),
+                "{what}"
+            );
+            assert_eq!(decoded.dims(), ODD, "{what}");
             assert_eq!(decoded.lut(), grid.lut(), "{what}");
-            assert_eq!(decoded.tilt_count(), grid.tilt_count(), "{what}");
-            assert_eq!(grid.to_bytes(), decoded.to_bytes(), "{what}");
+            assert_eq!(decoded.levels(), grid.levels(), "{what}");
+            assert_eq!(encoded(&grid), encoded(&decoded), "{what}");
         }
     }
 
@@ -3023,8 +3106,8 @@ fn a_grid_round_trips_through_its_wire_form() {
     .unwrap();
     for (name, other) in [("a different box", &elsewhere), ("no value plane", &lean)] {
         assert_ne!(
-            VoxelGrid::from_bytes(&a.to_bytes()).unwrap(),
-            VoxelGrid::from_bytes(&other.to_bytes()).unwrap(),
+            from_bytes(&encoded(&a)).unwrap(),
+            from_bytes(&encoded(other)).unwrap(),
             "{name} decoded to the same grid",
         );
     }
@@ -3049,8 +3132,8 @@ fn the_encoded_length_of_a_grid_is_exact() {
             };
             let grid = build_voxels(&scan, &req, SITE.0, SITE.1).unwrap();
             assert_eq!(
-                grid.encoded_len(),
-                grid.to_bytes().len(),
+                encoded_len(&grid),
+                encoded(&grid).len(),
                 "{shape:?} values={values_wanted}",
             );
         }
@@ -3059,9 +3142,9 @@ fn the_encoded_length_of_a_grid_is_exact() {
 
 #[test]
 fn a_grid_header_that_cannot_describe_its_own_product_is_refused() {
-    let good = wire_fixture().to_bytes();
+    let good = encoded(&wire_fixture());
     assert!(
-        VoxelGrid::from_bytes(&good).is_some(),
+        from_bytes(&good).is_some(),
         "precondition: the unmutated payload must decode, or every \
              assertion below passes for the wrong reason"
     );
@@ -3081,16 +3164,13 @@ fn a_grid_header_that_cannot_describe_its_own_product_is_refused() {
         for (what, bits) in [("NaN", f64::NAN), ("inf", f64::INFINITY)] {
             let mut bad = good.clone();
             bad[at..at + 8].copy_from_slice(&bits.to_le_bytes());
-            assert!(
-                VoxelGrid::from_bytes(&bad).is_none(),
-                "{name} = {what} decoded",
-            );
+            assert!(from_bytes(&bad).is_none(), "{name} = {what} decoded",);
         }
     }
     let mut moved = good.clone();
     moved[20..28].copy_from_slice(&(-999.0f64).to_le_bytes());
     assert!(
-        VoxelGrid::from_bytes(&moved).is_some_and(|g| g.x_range_km().0 == -999.0),
+        from_bytes(&moved).is_some_and(|g| g.x_range_km().0 == -999.0),
         "offset 20 is not x_range.0, so the finiteness assertions above are \
              corrupting some other field into invalidity",
     );
@@ -3107,7 +3187,7 @@ fn a_grid_header_that_cannot_describe_its_own_product_is_refused() {
     ramp[LUT_LEN_AT + 4..LUT_LEN_AT + 4 + LUT_LEN]
         .copy_from_slice(&colormap_lut(RadarProduct::Reflectivity, bogus));
     assert!(
-        VoxelGrid::from_bytes(&ramp).is_none(),
+        from_bytes(&ramp).is_none(),
         "a value range this product's quantisation never produces decoded, \
              carrying a colour table built to agree with it — so `index_to_value` \
              would have read every index off the wrong scale",
@@ -3127,7 +3207,7 @@ fn a_grid_header_that_cannot_describe_its_own_product_is_refused() {
              them proves nothing",
     );
     assert!(
-        VoxelGrid::from_bytes(&swapped).is_none(),
+        from_bytes(&swapped).is_none(),
         "a colour table built for another product decoded, and the \
              raymarch would have painted it",
     );
@@ -3136,18 +3216,18 @@ fn a_grid_header_that_cannot_describe_its_own_product_is_refused() {
 #[test]
 fn a_malformed_grid_payload_is_refused_rather_than_misread() {
     let grid = wire_fixture();
-    let good = grid.to_bytes();
+    let good = encoded(&grid);
     let cells = ODD.cells();
     let values_prefix_at = value_len_at(cells);
 
-    assert!(VoxelGrid::from_bytes(&[]).is_none(), "empty");
-    assert!(VoxelGrid::from_bytes(b"nope").is_none(), "wrong magic");
+    assert!(from_bytes(&[]).is_none(), "empty");
+    assert!(from_bytes(b"nope").is_none(), "wrong magic");
 
     for wrong in [*b"nope", *b"RDRI", *b"RDXS"] {
         let mut relabelled = good.clone();
         relabelled[..4].copy_from_slice(&wrong);
         assert!(
-            VoxelGrid::from_bytes(&relabelled).is_none(),
+            from_bytes(&relabelled).is_none(),
             "a whole payload labelled {} decoded as a grid",
             String::from_utf8_lossy(&wrong),
         );
@@ -3157,14 +3237,14 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
     wrong_version[4] = 0xFF;
     wrong_version[5] = 0xFF;
     assert!(
-        VoxelGrid::from_bytes(&wrong_version).is_none(),
+        from_bytes(&wrong_version).is_none(),
         "an unknown version decoded",
     );
 
     let mut unknown_product = good.clone();
     unknown_product[6..8].copy_from_slice(&0xFFFEu16.to_le_bytes());
     assert!(
-        VoxelGrid::from_bytes(&unknown_product).is_none(),
+        from_bytes(&unknown_product).is_none(),
         "an unknown product code decoded",
     );
     let mut underivable = good.clone();
@@ -3179,7 +3259,7 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
              refusal this assertion is about",
     );
     assert!(
-        VoxelGrid::from_bytes(&underivable).is_none(),
+        from_bytes(&underivable).is_none(),
         "a product with no native moment decoded",
     );
 
@@ -3189,7 +3269,7 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
             broken[SHAPE_AT + axis * 4..SHAPE_AT + axis * 4 + 4]
                 .copy_from_slice(&bad.to_le_bytes());
             assert!(
-                VoxelGrid::from_bytes(&broken).is_none(),
+                from_bytes(&broken).is_none(),
                 "axis {axis} of {bad} decoded",
             );
         }
@@ -3197,7 +3277,7 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
     let mut reshaped = good.clone();
     reshaped[SHAPE_AT..SHAPE_AT + 4].copy_from_slice(&((ODD.nx + 1) as u32).to_le_bytes());
     assert!(
-        VoxelGrid::from_bytes(&reshaped).is_none(),
+        from_bytes(&reshaped).is_none(),
         "a shape claiming more cells than the index plane holds decoded — \
              every accessor indexes that plane with an offset from the shape",
     );
@@ -3208,7 +3288,7 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
         empty.extend_from_slice(&0u32.to_le_bytes());
         empty.extend_from_slice(&0u32.to_le_bytes());
         assert!(
-            VoxelGrid::from_bytes(&empty).is_none(),
+            from_bytes(&empty).is_none(),
             "axis {axis} of zero decoded into a grid with no cells",
         );
     }
@@ -3220,7 +3300,7 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
     };
     let over_shape = build_voxels(&scan_of(&|_, _| Some(40.0)), &request(tall), SITE.0, SITE.1)
         .expect("a shape at the guarantee builds");
-    let mut over = over_shape.to_bytes();
+    let mut over = encoded(&over_shape);
     let tall_cells = tall.cells();
     over[SHAPE_AT..SHAPE_AT + 4].copy_from_slice(&((MAX_AXIS + 1) as u32).to_le_bytes());
     over[INDEX_LEN_AT..INDEX_LEN_AT + 4].copy_from_slice(&((tall_cells + 1) as u32).to_le_bytes());
@@ -3229,7 +3309,7 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
     over[moved..moved + 4].copy_from_slice(&((tall_cells + 1) as u32).to_le_bytes());
     over.extend_from_slice(&f32::NAN.to_le_bytes());
     assert!(
-        VoxelGrid::from_bytes(&over).is_none(),
+        from_bytes(&over).is_none(),
         "an axis of {} — one over the GLES 3.0 guarantee — decoded, with \
              planes sized to agree with it",
         MAX_AXIS + 1,
@@ -3249,7 +3329,7 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
         good.len() - 1,
     ] {
         assert!(
-            VoxelGrid::from_bytes(&good[..cut]).is_none(),
+            from_bytes(&good[..cut]).is_none(),
             "truncated to {cut} bytes",
         );
     }
@@ -3257,7 +3337,7 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
     let mut trailing = good.clone();
     trailing.push(0);
     assert!(
-        VoxelGrid::from_bytes(&trailing).is_none(),
+        from_bytes(&trailing).is_none(),
         "trailing bytes mean the layouts disagree",
     );
 
@@ -3269,7 +3349,7 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
         let mut absurd = good.clone();
         absurd[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(
-            VoxelGrid::from_bytes(&absurd).is_none(),
+            from_bytes(&absurd).is_none(),
             "an absurd {name} plane length reached a read",
         );
     }
@@ -3285,7 +3365,7 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
         short[at..at + 4].copy_from_slice(&((count - 1) as u32).to_le_bytes());
         short.drain(plane_end - element..plane_end);
         assert!(
-            VoxelGrid::from_bytes(&short).is_none(),
+            from_bytes(&short).is_none(),
             "a {name} plane one element short decoded",
         );
     }
@@ -3294,24 +3374,24 @@ fn a_malformed_grid_payload_is_refused_rather_than_misread() {
     one_value.truncate(values_prefix_at + 4 + 4);
     one_value[values_prefix_at..values_prefix_at + 4].copy_from_slice(&1u32.to_le_bytes());
     assert!(
-        VoxelGrid::from_bytes(&one_value).is_none(),
+        from_bytes(&one_value).is_none(),
         "a one-element value plane decoded",
     );
 
     let mut absent = good.clone();
     absent.truncate(values_prefix_at + 4);
     absent[values_prefix_at..values_prefix_at + 4].copy_from_slice(&0u32.to_le_bytes());
-    let decoded = VoxelGrid::from_bytes(&absent)
-        .expect("a grid with no value plane is a grid, not a malformed one");
+    let decoded =
+        from_bytes(&absent).expect("a grid with no value plane is a grid, not a malformed one");
     assert_eq!(decoded.values(), None);
     assert_eq!(decoded.indices(), grid.indices());
 
     assert_eq!(
-        VoxelGrid::from_bytes(&good).expect("the unmutated payload decodes"),
+        from_bytes(&good).expect("the unmutated payload decodes"),
         grid,
     );
     assert!(
-        VoxelGrid::from_bytes(&over_shape.to_bytes()).is_some(),
+        from_bytes(&encoded(&over_shape)).is_some(),
         "precondition: the shape-at-the-guarantee payload does not decode \
              unmutated either, so the assertion about it says nothing",
     );

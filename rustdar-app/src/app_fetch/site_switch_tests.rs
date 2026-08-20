@@ -605,7 +605,7 @@ fn one_grid_bytes() -> usize {
     let VolumeEntry::Ready(grid) = ready_grid() else {
         unreachable!("ready_grid is Ready")
     };
-    let shape = grid.shape();
+    let shape = grid.dims();
     rustdar_volumetric::raymarch::resident_grid_bytes([
         u32::try_from(shape.nx).unwrap(),
         u32::try_from(shape.ny).unwrap(),
