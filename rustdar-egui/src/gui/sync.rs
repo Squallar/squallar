@@ -63,6 +63,8 @@ impl Gui {
                 p.viewing_live = active_viewing_live;
                 p.time_step_secs = active_time_step_secs;
             }
+            // The copy arrives with configs but no state: a slot's
+            // state is derived, never shared between panes.
             p.adopt_layers(&active_layers);
             p.set_selected_product(active_selected_product);
             p.set_selected_elevation(active_selected_elevation);

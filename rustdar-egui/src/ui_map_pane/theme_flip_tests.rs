@@ -5,6 +5,7 @@ use rustdar_overlays::render::handlers::outlook::SpcOutlookFetchResult;
 use rustdar_overlays::render::overlay_state::OverlayFetchResult;
 use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
 use rustdar_overlays::types::{HatchPattern, OverlayFeature};
+use rustdar_source::handler::{PaneMut, PaneRef};
 
 /// The theme-dependent layer under test — see the module note for why this
 /// one.
@@ -19,7 +20,8 @@ const SITES: rustdar_source::id::LayerId = rustdar_source::id::known::RADAR_SITE
 /// one a live session would carry.
 fn gui_with_an_outlook() -> Gui {
     let mut gui = Gui::new();
-    gui.overlays.set_enabled(&OUTLOOK, true);
+    gui.overlays
+        .set_enabled(&OUTLOOK, true, &mut PaneMut::bare(0));
 
     let polygon = vec![vec![(35.0, -97.0), (36.0, -97.0), (36.0, -96.0)]];
     let feature = OverlayFeature::new(
@@ -30,22 +32,25 @@ fn gui_with_an_outlook() -> Gui {
         String::new(),
         HatchPattern::None,
     );
-    gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: OUTLOOK,
-        data: Box::new(SpcOutlookFetchResult {
-            day: OutlookDay::Day1,
-            product: OutlookProduct::Categorical,
-            result: Ok(SpcOutlook {
+    gui.overlays.apply_fetch_result(
+        OverlayFetchResult {
+            kind: OUTLOOK,
+            data: Box::new(SpcOutlookFetchResult {
                 day: OutlookDay::Day1,
                 product: OutlookProduct::Categorical,
-                valid: None,
-                expire: None,
-                features: vec![feature],
+                result: Ok(SpcOutlook {
+                    day: OutlookDay::Day1,
+                    product: OutlookProduct::Categorical,
+                    valid: None,
+                    expire: None,
+                    features: vec![feature],
+                }),
             }),
-        }),
-    });
+        },
+        &PaneRef::bare(0),
+    );
     assert!(
-        gui.overlays.has_data(&OUTLOOK),
+        gui.overlays.has_data(&OUTLOOK, &PaneRef::bare(0)),
         "premise: the outlook landed, so the signature under test is a live one",
     );
     gui
@@ -60,8 +65,8 @@ fn a_theme_flip_changes_the_overlay_cache_token() {
     let gui = gui_with_an_outlook();
     let pane = gui.pane(0).expect("a fresh Gui has one pane");
 
-    let dark = super::overlay_cache_token(&gui.overlays, pane, &OUTLOOK, true);
-    let light = super::overlay_cache_token(&gui.overlays, pane, &OUTLOOK, false);
+    let dark = super::overlay_cache_token(&gui.overlays, 0, pane, &OUTLOOK, true);
+    let light = super::overlay_cache_token(&gui.overlays, 0, pane, &OUTLOOK, false);
     assert_ne!(
         dark, light,
         "one outlook, two themes, one token — the cache would keep compositing \
@@ -73,12 +78,12 @@ fn a_theme_flip_changes_the_overlay_cache_token() {
     // re-rasterize every overlay every frame.
     assert_eq!(
         dark,
-        super::overlay_cache_token(&gui.overlays, pane, &OUTLOOK, true),
+        super::overlay_cache_token(&gui.overlays, 0, pane, &OUTLOOK, true),
         "the dark-theme token must be stable across frames with unchanged content",
     );
     assert_eq!(
         light,
-        super::overlay_cache_token(&gui.overlays, pane, &OUTLOOK, false),
+        super::overlay_cache_token(&gui.overlays, 0, pane, &OUTLOOK, false),
         "the light-theme token must be stable across frames with unchanged content",
     );
 }
@@ -97,8 +102,8 @@ fn a_theme_flip_invalidates_exactly_the_declared_layers() {
     for handler in gui.overlays.handlers() {
         let id = handler.id();
         walked += 1;
-        let dark = super::overlay_cache_token(&gui.overlays, pane, &id, true);
-        let light = super::overlay_cache_token(&gui.overlays, pane, &id, false);
+        let dark = super::overlay_cache_token(&gui.overlays, 0, pane, &id, true);
+        let light = super::overlay_cache_token(&gui.overlays, 0, pane, &id, false);
         if dark != light {
             moved.push(id.as_str().to_owned());
         }
@@ -157,8 +162,8 @@ fn the_radar_sites_arm_is_invalidated_by_the_declaration_as_well_as_the_gen() {
     // The token, at one fixed generation — i.e. with the gen bump held still,
     // which is exactly the world the pane-ref work leaves behind.
     assert_ne!(
-        super::overlay_cache_token(&gui.overlays, pane, &SITES, true),
-        super::overlay_cache_token(&gui.overlays, pane, &SITES, false),
+        super::overlay_cache_token(&gui.overlays, 0, pane, &SITES, true),
+        super::overlay_cache_token(&gui.overlays, 0, pane, &SITES, false),
         "with the generation unchanged, the declaration alone must still move \
          the radar-sites token",
     );
@@ -167,8 +172,8 @@ fn the_radar_sites_arm_is_invalidated_by_the_declaration_as_well_as_the_gen() {
     bumped.bump_all_radar_sites_gen();
     let after = bumped.pane(0).expect("a fresh Gui has one pane");
     assert_ne!(
-        super::overlay_cache_token(&gui.overlays, pane, &SITES, true),
-        super::overlay_cache_token(&bumped.overlays, after, &SITES, true),
+        super::overlay_cache_token(&gui.overlays, 0, pane, &SITES, true),
+        super::overlay_cache_token(&bumped.overlays, 0, after, &SITES, true),
         "the generation bump must still move the token on its own",
     );
 }

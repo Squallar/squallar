@@ -6,6 +6,7 @@ use rustdar_egui::overlay_cache::OverlayTexturePlan;
 use rustdar_geo::GeoBounds;
 use rustdar_overlays::render::overlay_state::OverlayFetchResult;
 use rustdar_overlays::render::rasterize::HitCells;
+use rustdar_source::handler::{PaneMut, PaneRef};
 use rustdar_source::id::{LayerId, known};
 use std::sync::{Arc, Mutex};
 
@@ -100,7 +101,9 @@ fn seed(app: &mut crate::app::App, id: &LayerId) {
                 lon,
                 comments: String::new(),
             };
-            app.gui.overlays.set_enabled(id, true);
+            app.gui
+                .overlays
+                .set_enabled(id, true, &mut PaneMut::bare(0));
             Box::new(StormReportsFetchResult(Ok(StormReportRound {
                 reports: vec![
                     report(StormReportKind::Tornado, 34.0, -98.2),
@@ -126,7 +129,9 @@ fn seed(app: &mut crate::app::App, id: &LayerId) {
                 satellite: GlmSatellite::GoesEast,
                 level: GlmDataLevel::Flash,
             };
-            app.gui.overlays.set_enabled(id, true);
+            app.gui
+                .overlays
+                .set_enabled(id, true, &mut PaneMut::bare(0));
             Box::new(GlmFetchResult(Ok(GlmFetchOutcome {
                 flashes: vec![flash(10, 34.0, -98.2), flash(20, 36.2, -96.8)],
                 dead_feeds: Vec::new(),
@@ -145,10 +150,13 @@ fn seed(app: &mut crate::app::App, id: &LayerId) {
             other.as_str()
         ),
     };
-    app.gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: id.clone(),
-        data,
-    });
+    app.gui.overlays.apply_fetch_result(
+        OverlayFetchResult {
+            kind: id.clone(),
+            data,
+        },
+        &PaneRef::bare(0),
+    );
     let registry_snapshot = std::mem::take(&mut app.gui.overlays);
     if let Some(pane) = app.gui.pane_mut(0) {
         pane.adopt_handler_state(&registry_snapshot);

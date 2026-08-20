@@ -1062,12 +1062,15 @@ fn a_satellite_whose_listing_failed_marks_the_layer_and_names_it() {
     let ctx = PaneRef::bare(0);
     let kind = known::LIGHTNING;
     let mut registry = OverlayRegistry::default();
-    registry.set_enabled(&kind, true);
+    registry.set_enabled(&kind, true, &mut PaneMut::bare(0));
 
-    registry.apply_fetch_result(OverlayFetchResult {
-        kind: kind.clone(),
-        data: half_listed_round(),
-    });
+    registry.apply_fetch_result(
+        OverlayFetchResult {
+            kind: kind.clone(),
+            data: half_listed_round(),
+        },
+        &PaneRef::bare(0),
+    );
 
     let line = registry
         .status_line(&kind, &PaneRef::bare(0))
@@ -1107,15 +1110,18 @@ fn a_satellite_whose_listing_failed_marks_the_layer_and_names_it() {
         "a half round is not stale: {line}"
     );
 
-    registry.apply_fetch_result(OverlayFetchResult {
-        kind: kind.clone(),
-        data: outcome(
-            vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
-            Vec::new(),
-            None,
-            None,
-        ),
-    });
+    registry.apply_fetch_result(
+        OverlayFetchResult {
+            kind: kind.clone(),
+            data: outcome(
+                vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
+                Vec::new(),
+                None,
+                None,
+            ),
+        },
+        &PaneRef::bare(0),
+    );
     assert!(
         !registry
             .status_line(&kind, &PaneRef::bare(0))
@@ -1149,11 +1155,14 @@ fn marks(payload: FetchPayload) -> (String, Option<String>) {
 
     let kind = known::LIGHTNING;
     let mut registry = OverlayRegistry::default();
-    registry.set_enabled(&kind, true);
-    registry.apply_fetch_result(OverlayFetchResult {
-        kind: kind.clone(),
-        data: payload,
-    });
+    registry.set_enabled(&kind, true, &mut PaneMut::bare(0));
+    registry.apply_fetch_result(
+        OverlayFetchResult {
+            kind: kind.clone(),
+            data: payload,
+        },
+        &PaneRef::bare(0),
+    );
     let ctx = PaneRef::bare(0);
     let note = registry
         .controls(&kind, &ctx)

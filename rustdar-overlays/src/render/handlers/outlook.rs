@@ -379,11 +379,11 @@ impl OverlayHandler for SpcOutlookHandler {
         true
     }
 
-    fn is_enabled(&self) -> bool {
+    fn is_enabled(&self, _pane: &PaneRef<'_>) -> bool {
         !self.enabled_products.is_empty()
     }
 
-    fn set_enabled(&mut self, enabled: bool) {
+    fn set_enabled(&mut self, enabled: bool, _pane: &mut PaneMut<'_>) {
         if enabled {
             if self.enabled_products.is_empty()
                 && let Some(&first) = self.selected_day.products().first()
@@ -399,8 +399,8 @@ impl OverlayHandler for SpcOutlookHandler {
     }
 
     /// E.g. `"Day 1 - Categorical, Tornado"`.
-    fn status_line(&self, _pane: &PaneRef<'_>) -> Option<String> {
-        if !self.is_enabled() {
+    fn status_line(&self, pane: &PaneRef<'_>) -> Option<String> {
+        if !self.is_enabled(pane) {
             return None;
         }
         let products: Vec<String> = self
@@ -418,7 +418,7 @@ impl OverlayHandler for SpcOutlookHandler {
     }
 
     /// Data **this selection** can draw, not data this layer has ever fetched.
-    fn has_data(&self) -> bool {
+    fn has_data(&self, _pane: &PaneRef<'_>) -> bool {
         self.enabled_products.iter().any(|product| {
             self.state
                 .data
@@ -433,7 +433,7 @@ impl OverlayHandler for SpcOutlookHandler {
 
     /// The host says a round has started or been abandoned; this layer's round
     /// is one task per enabled product, so the count moves by that many.
-    fn set_fetching(&mut self, fetching: bool) {
+    fn set_fetching(&mut self, fetching: bool, _pane: &PaneRef<'_>) {
         if fetching {
             self.set_outstanding(self.outstanding + self.enabled_products.len().max(1));
         } else {
@@ -455,11 +455,11 @@ impl OverlayHandler for SpcOutlookHandler {
         self.state.fetch_time
     }
 
-    fn item_count(&self) -> usize {
+    fn item_count(&self, _pane: &PaneRef<'_>) -> usize {
         self.state.data.len()
     }
 
-    fn clickable_items(&self) -> Vec<ClickableItem<'_>> {
+    fn clickable_items<'a>(&'a self, _pane: &PaneRef<'_>) -> Vec<ClickableItem<'a>> {
         let day = self.selected_day;
         let mut items = Vec::new();
         for &product in &self.enabled_products {
@@ -531,7 +531,7 @@ impl OverlayHandler for SpcOutlookHandler {
         }
     }
 
-    fn retain_selections(&self, _selections: &mut Vec<Arc<dyn OverlayItem>>) {
+    fn retain_selections(&self, _selections: &mut Vec<Arc<dyn OverlayItem>>, _pane: &PaneRef<'_>) {
         // Nothing to prune: outlook items match on day, product and label,
         // not on a data ID.
     }
@@ -744,20 +744,23 @@ mod tests {
     #[test]
     fn the_master_toggle_restores_a_product_the_day_actually_publishes() {
         let mut handler = SpcOutlookHandler::new();
-        assert!(!handler.is_enabled(), "precondition: outlooks default off");
+        assert!(
+            !handler.is_enabled(&PaneRef::bare(0)),
+            "precondition: outlooks default off"
+        );
 
-        handler.set_enabled(true);
+        handler.set_enabled(true, &mut PaneMut::bare(0));
         assert_eq!(
             handler.enabled_products.iter().copied().collect::<Vec<_>>(),
             vec![OutlookProduct::Categorical],
             "day 1's first product is Categorical"
         );
 
-        handler.set_enabled(false);
-        assert!(!handler.is_enabled());
+        handler.set_enabled(false, &mut PaneMut::bare(0));
+        assert!(!handler.is_enabled(&PaneRef::bare(0)));
 
         handler.selected_day = OutlookDay::Day5;
-        handler.set_enabled(true);
+        handler.set_enabled(true, &mut PaneMut::bare(0));
         assert_eq!(
             handler.enabled_products.iter().copied().collect::<Vec<_>>(),
             vec![OutlookProduct::Probabilistic],
@@ -861,7 +864,7 @@ mod tests {
             "Probabilistic and its significant area are two tasks"
         );
 
-        handler.set_fetching(true);
+        handler.set_fetching(true, &PaneRef::bare(0));
         land_day3(
             &mut handler,
             OutlookProduct::Probabilistic,
@@ -897,7 +900,7 @@ mod tests {
 
         let mut from_day5 = SpcOutlookHandler::new();
         from_day5.selected_day = OutlookDay::Day5;
-        from_day5.set_enabled(true);
+        from_day5.set_enabled(true, &mut PaneMut::bare(0));
         assert_eq!(
             from_day5
                 .enabled_products
@@ -1131,7 +1134,7 @@ mod tests {
             Result<SpcOutlook, crate::fetch_policy::FetchError>,
         )>,
     ) {
-        handler.set_fetching(true);
+        handler.set_fetching(true, &PaneRef::bare(0));
         for (product, result) in results {
             land(handler, product, result);
         }
@@ -1429,7 +1432,7 @@ mod tests {
         let mut h = SpcOutlookHandler::new();
         h.enabled_products.insert(Tornado);
 
-        h.set_fetching(true);
+        h.set_fetching(true, &PaneRef::bare(0));
         assert!(h.is_fetching(), "premise: the request is on the wire");
         assert_eq!(toggle(&mut h, "tor", false), ControlEffect::None);
 
@@ -1456,7 +1459,7 @@ mod tests {
     fn a_stray_failure_does_not_condemn_a_round_that_otherwise_answered() {
         use OutlookProduct::{Categorical, Hail, Tornado, Wind};
         let mut h = four_product_handler();
-        h.set_fetching(true);
+        h.set_fetching(true, &PaneRef::bare(0));
         assert_eq!(toggle(&mut h, "tor", false), ControlEffect::None);
 
         for p in [Categorical, Wind, Hail] {
@@ -1560,7 +1563,7 @@ mod tests {
             "premise: the tornado outlook did not load and is on no map",
         );
 
-        h.set_fetching(true);
+        h.set_fetching(true, &PaneRef::bare(0));
         assert_eq!(toggle(&mut h, "tor", false), ControlEffect::None);
         assert_eq!(toggle(&mut h, "cat", false), ControlEffect::None);
         land(&mut h, Categorical, Ok(outlook(Categorical)));
@@ -1596,7 +1599,7 @@ mod tests {
                 h.enabled_products.insert(p);
             }
             let built = h.create_fetch_tasks(&ctx, &PaneRef::bare(0)).len();
-            h.set_fetching(true);
+            h.set_fetching(true, &PaneRef::bare(0));
             assert_eq!(
                 h.outstanding, built,
                 "the round waits for {} answers and asked {built} questions",

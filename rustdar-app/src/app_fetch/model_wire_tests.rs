@@ -4,6 +4,7 @@
 use rustdar_egui::overlay_cache::OverlayTexturePlan;
 use rustdar_geo::GeoBounds;
 use rustdar_overlays::render::overlay_state::OverlayFetchResult;
+use rustdar_source::handler::PaneRef;
 use rustdar_source::id::known;
 use std::sync::{Arc, Mutex};
 
@@ -90,10 +91,13 @@ fn seed(app: &mut crate::app::App) {
     let data: rustdar_overlays::render::overlay_state::FetchPayload = Box::new(
         rustdar_overlays::hrrr::HrrrFetchResult(Ok(a_seedable_grid())),
     );
-    app.gui.overlays.apply_fetch_result(OverlayFetchResult {
-        kind: known::MODEL_DATA,
-        data,
-    });
+    app.gui.overlays.apply_fetch_result(
+        OverlayFetchResult {
+            kind: known::MODEL_DATA,
+            data,
+        },
+        &PaneRef::bare(0),
+    );
     let registry_snapshot = std::mem::take(&mut app.gui.overlays);
     if let Some(pane) = app.gui.pane_mut(0) {
         pane.adopt_handler_state(&registry_snapshot);

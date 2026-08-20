@@ -348,6 +348,81 @@ impl PaneMut<'_> {
     pub fn state_as<T: 'static>(&mut self) -> Option<&mut T> {
         self.state.as_deref_mut()?.downcast_mut::<T>()
     }
+
+    /// The **read** view of the same pane, for the handler methods a control
+    /// edit has to consult mid-edit (`is_enabled`, `has_data`). It carries the
+    /// state, which is the half those answers are computed from; it carries no
+    /// config or siblings, because a mutable pane is being written through,
+    /// not loaded from.
+    pub fn as_ref(&self) -> PaneRef<'_> {
+        PaneRef {
+            pane_idx: self.pane_idx,
+            config: &NULL_CONFIG,
+            state: self.state.as_deref(),
+            slots: &[],
+            loading_site: None,
+        }
+    }
+}
+
+/// **The whole per-pane state of a layer whose only per-pane fact is whether
+/// this pane draws it** — seven of the twelve handlers, and the exact shape the
+/// `"enabled"` member of a slot config has always had, so a converted handler's
+/// saved bytes are the bytes it already wrote.
+pub struct PaneToggle {
+    pub enabled: bool,
+}
+
+impl PaneToggle {
+    /// A pane that has saved nothing: the layer's own default, **not** whatever
+    /// some other pane last left in the handler.
+    pub fn create(default_on: bool) -> Option<FetchPayload> {
+        Some(Box::new(PaneToggle {
+            enabled: default_on,
+        }))
+    }
+
+    /// A pane's saved config, decoded. An absent or non-boolean member falls
+    /// back to the layer's default — the reading that used to come out as
+    /// "leave the handler as it is", which was one pane inheriting another's.
+    pub fn restore(value: &serde_json::Value, default_on: bool) -> Option<FetchPayload> {
+        Some(Box::new(PaneToggle {
+            enabled: value
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(default_on),
+        }))
+    }
+
+    /// Back to JSON — byte-identical to the `serialize_state` these handlers
+    /// have always written.
+    pub fn save(state: &dyn Any) -> serde_json::Value {
+        match state.downcast_ref::<PaneToggle>() {
+            Some(toggle) => serde_json::json!({ "enabled": toggle.enabled }),
+            None => serde_json::Value::Null,
+        }
+    }
+
+    /// This pane's answer, or `fallback` for a caller that supplied no pane —
+    /// which during WO-M10b is still the registry's own copy, kept by the swap.
+    pub fn is_on(pane: &PaneRef<'_>, fallback: bool) -> bool {
+        pane.state_as::<PaneToggle>()
+            .map_or(fallback, |toggle| toggle.enabled)
+    }
+
+    /// Write this pane's answer. **`false` means the caller supplied no pane**
+    /// and must fall back to the handler's own field, so a missed pane is a
+    /// visible branch rather than a silently dropped edit.
+    #[must_use]
+    pub fn set(pane: &mut PaneMut<'_>, on: bool) -> bool {
+        match pane.state_as::<PaneToggle>() {
+            Some(toggle) => {
+                toggle.enabled = on;
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// Adding a layer means: implement this, give it a [`known`](crate::id::known)
@@ -377,10 +452,15 @@ pub trait SourceHandler: Send {
     /// Bumped on every data replacement; drives texture cache invalidation.
     fn data_generation(&self) -> u64;
 
-    /// A cheap token for **what this handler would draw**: a refetch returning
-    /// the same content should keep it stable. Called every frame, so it must
-    /// not clone.
-    fn content_signature(&self) -> u64 {
+    /// A cheap token for **what this handler would draw in this pane**: a
+    /// refetch returning the same content should keep it stable. Called every
+    /// frame, so it must not clone.
+    ///
+    /// Pane-aware because it is a **cache token**: two panes showing the same
+    /// layer with different filters draw different pictures, and one token for
+    /// both is one texture for both.
+    fn content_signature(&self, pane: &PaneRef<'_>) -> u64 {
+        let _ = pane;
         self.data_generation()
     }
 
@@ -392,11 +472,16 @@ pub trait SourceHandler: Send {
         false
     }
 
-    fn has_data(&self) -> bool;
+    /// Whether this pane has something to draw. Pane-aware: what "data" means
+    /// is a function of the pane's own selection — the model layer's resident
+    /// grid is *this pane's* parameter's grid.
+    fn has_data(&self, pane: &PaneRef<'_>) -> bool;
 
     fn is_fetching(&self) -> bool;
 
-    fn set_fetching(&mut self, fetching: bool);
+    /// Takes the pane read-only: a layer whose round is one task per selected
+    /// product sizes the round from the pane's selection.
+    fn set_fetching(&mut self, fetching: bool, pane: &PaneRef<'_>);
 
     fn fetch_time(&self) -> Option<web_time::Instant>;
 
@@ -431,15 +516,21 @@ pub trait SourceHandler: Send {
         Some(by_clock.max(by_backoff))
     }
 
-    fn item_count(&self) -> usize {
+    fn item_count(&self, pane: &PaneRef<'_>) -> usize {
+        let _ = pane;
         0
     }
 
-    fn is_enabled(&self) -> bool {
+    /// **Is this layer on, in this pane?** Computed from the pane's own state,
+    /// never mirrored into a bool beside it: for a layer whose "enabled" is
+    /// really a set (the alert categories, the outlook's products) the set is
+    /// the fact and this is how it is read, so the two cannot disagree.
+    fn is_enabled(&self, pane: &PaneRef<'_>) -> bool {
+        let _ = pane;
         true
     }
 
-    fn set_enabled(&mut self, _enabled: bool) {}
+    fn set_enabled(&mut self, _enabled: bool, _pane: &mut PaneMut<'_>) {}
 
     /// One line of live status for the layer stack's row — `"3 shown · W/Wa"`.
     /// Called every frame; a disabled handler returns `None`.
@@ -478,7 +569,8 @@ pub trait SourceHandler: Send {
 
     /// The features a click is tested against, borrowed from this handler.
     /// Called **only on a frame that has a click to resolve**.
-    fn clickable_items(&self) -> Vec<ClickableItem<'_>> {
+    fn clickable_items<'a>(&'a self, pane: &PaneRef<'_>) -> Vec<ClickableItem<'a>> {
+        let _ = pane;
         Vec::new()
     }
 
@@ -493,8 +585,9 @@ pub trait SourceHandler: Send {
         false
     }
 
-    /// Drops selections whose `matches()` finds nothing in the refreshed data.
-    fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>);
+    /// Drops selections whose `matches()` finds nothing in the refreshed data
+    /// — or which this pane's own filters no longer draw.
+    fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>, pane: &PaneRef<'_>);
 
     fn per_frame_points(&self) -> &[MapPoint] {
         &[]
@@ -510,7 +603,7 @@ pub trait SourceHandler: Send {
         None
     }
 
-    fn hover_value_at(&self, _lat: f64, _lon: f64) -> Option<String> {
+    fn hover_value_at(&self, _lat: f64, _lon: f64, _pane: &PaneRef<'_>) -> Option<String> {
         None
     }
 
@@ -531,7 +624,17 @@ pub trait SourceHandler: Send {
     }
 
     /// e.g. selected product, loop state. `None` if there is no per-pane state.
-    fn create_pane_state(&self) -> Option<FetchPayload> {
+    ///
+    /// A handler that answers `Some` here has **moved** those fields out of
+    /// itself: the pane owns them, and every method that reads them takes a
+    /// [`PaneRef`] and downcasts [`PaneRef::state`].
+    ///
+    /// `enabled` is the pane's own slot flag — what the file said about this
+    /// pane before any handler was asked. A fresh state starts from it, so a
+    /// pane that has saved a flag but no config comes back the way it was
+    /// left rather than at the layer's default.
+    fn create_pane_state(&self, enabled: bool) -> Option<FetchPayload> {
+        let _ = enabled;
         None
     }
 
@@ -545,7 +648,14 @@ pub trait SourceHandler: Send {
         serde_json::Value::Null
     }
 
-    fn deserialize_pane_state(&self, _value: serde_json::Value) -> Option<FetchPayload> {
+    /// `enabled` is the pane's slot flag, the fallback for anything the saved
+    /// config does not name — the config wins wherever it has an opinion,
+    /// which is the precedence the swap has always produced.
+    fn deserialize_pane_state(
+        &self,
+        _value: serde_json::Value,
+        _enabled: bool,
+    ) -> Option<FetchPayload> {
         None
     }
 

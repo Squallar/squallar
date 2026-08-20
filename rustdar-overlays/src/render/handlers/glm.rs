@@ -608,11 +608,11 @@ impl OverlayHandler for GlmHandler {
         true
     }
 
-    fn is_enabled(&self) -> bool {
+    fn is_enabled(&self, _pane: &PaneRef<'_>) -> bool {
         self.enabled
     }
 
-    fn set_enabled(&mut self, enabled: bool) {
+    fn set_enabled(&mut self, enabled: bool, _pane: &mut PaneMut<'_>) {
         self.enabled = enabled;
     }
 
@@ -633,7 +633,7 @@ impl OverlayHandler for GlmHandler {
         self.state.data_generation
     }
 
-    fn has_data(&self) -> bool {
+    fn has_data(&self, _pane: &PaneRef<'_>) -> bool {
         !self.state.data.is_empty()
     }
 
@@ -641,7 +641,7 @@ impl OverlayHandler for GlmHandler {
         self.state.fetching
     }
 
-    fn set_fetching(&mut self, fetching: bool) {
+    fn set_fetching(&mut self, fetching: bool, _pane: &PaneRef<'_>) {
         self.state.fetching = fetching;
     }
 
@@ -657,7 +657,7 @@ impl OverlayHandler for GlmHandler {
         self.state.fetch_time
     }
 
-    fn item_count(&self) -> usize {
+    fn item_count(&self, _pane: &PaneRef<'_>) -> usize {
         self.state.data.len()
     }
 
@@ -665,7 +665,7 @@ impl OverlayHandler for GlmHandler {
         Some(20)
     }
 
-    fn clickable_items(&self) -> Vec<ClickableItem<'_>> {
+    fn clickable_items<'a>(&'a self, _pane: &PaneRef<'_>) -> Vec<ClickableItem<'a>> {
         // Lightning uses hit-buffer click detection, not polygon containment.
         Vec::new()
     }
@@ -702,7 +702,7 @@ impl OverlayHandler for GlmHandler {
         }
     }
 
-    fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>) {
+    fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>, _pane: &PaneRef<'_>) {
         let count = self.state.data.len();
         selections.retain(|sel| {
             if sel.layer_id() != known::LIGHTNING {
@@ -933,12 +933,16 @@ impl OverlayHandler for GlmHandler {
         items
     }
 
-    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneMut<'_>) -> ControlEffect {
+    fn apply_control(&mut self, update: &ControlUpdate, pane: &mut PaneMut<'_>) -> ControlEffect {
         match update.id {
             "enabled" => {
                 if let ControlValue::Bool(val) = update.value {
                     self.enabled = val;
-                    if val && self.state.enable_should_refetch(self.has_data()) {
+                    if val
+                        && self
+                            .state
+                            .enable_should_refetch(self.has_data(&pane.as_ref()))
+                    {
                         return ControlEffect::Fetch;
                     }
                 }

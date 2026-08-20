@@ -4,8 +4,9 @@ use rustdar_device_profile::budget::MAX_PANES_DESKTOP;
 use rustdar_radar::hover::HoverSource;
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::{RadarProduct, RenderView, ScanInfo};
-use rustdar_source::handler::PaneRef;
+use rustdar_source::handler::{PaneMut, PaneRef};
 use rustdar_source::id::{LayerId, known};
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 use walkers::MapMemory;
@@ -339,7 +340,6 @@ pub struct PaneConfigBaggage {
 /// on the same [`LayerId`] and had to be kept in step by hand, and a
 /// transform that dropped an id from one of them left the other two saying
 /// something the user could not see.
-#[derive(Clone, Debug, PartialEq)]
 pub struct LayerSlot {
     /// Which layer this slot is. Open — an id no handler in this build serves
     /// is a layer a newer build has, and it keeps its slot and its position.
@@ -350,6 +350,52 @@ pub struct LayerSlot {
     /// — a handler with a `null` slot keeps whatever state it already has,
     /// which is exactly what an absent map entry meant before.
     pub config: serde_json::Value,
+    /// **The live per-pane state, for a handler that defined one.** Runtime
+    /// only: [`Self::config`] is what persists, and this is derived from it
+    /// by [`PaneState::hydrate_layer_states`] and written back to it by
+    /// [`PaneState::adopt_handler_state`]. A slot that has never been
+    /// hydrated — a fresh pane, a clone — carries `None` and is re-derived on
+    /// the next hydrate rather than being copied.
+    pub state: Option<rustdar_source::handler::FetchPayload>,
+}
+
+/// **Cloning a slot does not clone its state.** The state is a `dyn Any` with
+/// no `Clone` to call, and it does not need one: `config` is the same facts in
+/// a form that copies, and the clone's `None` is re-derived from it the next
+/// time the pane is hydrated. Layer-link sync is the caller this matters to —
+/// it copies a whole stack between panes, and the copy comes up with the
+/// source's saved configuration rather than a shared handle to its state.
+impl Clone for LayerSlot {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            enabled: self.enabled,
+            config: self.config.clone(),
+            state: None,
+        }
+    }
+}
+
+/// The state is a `dyn Any`: it can be reported present or absent and no more.
+impl std::fmt::Debug for LayerSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LayerSlot")
+            .field("id", &self.id)
+            .field("enabled", &self.enabled)
+            .field("config", &self.config)
+            .field("state", &self.state.is_some())
+            .finish()
+    }
+}
+
+/// **Two slots are equal when they carry the same layer, flag and saved
+/// configuration.** The runtime state is deliberately not compared: it is
+/// derived from `config`, so comparing it would make a hydrated slot unequal
+/// to the identical slot that has not been asked for yet.
+impl PartialEq for LayerSlot {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.enabled == other.enabled && self.config == other.config
+    }
 }
 
 impl LayerSlot {
@@ -359,6 +405,7 @@ impl LayerSlot {
             id,
             enabled,
             config: serde_json::Value::Null,
+            state: None,
         }
     }
 }
@@ -384,7 +431,9 @@ impl<'a> PaneView<'a> {
         PaneRef {
             pane_idx: self.pane_idx,
             config: slot.map_or(&serde_json::Value::Null, |slot| &slot.config),
-            state: None,
+            state: slot
+                .and_then(|slot| slot.state.as_deref())
+                .map(|s| s as &dyn Any),
             slots: &self.slots,
             loading_site: self.loading_site,
         }
@@ -394,6 +443,25 @@ impl<'a> PaneView<'a> {
     pub fn pane_idx(&self) -> usize {
         self.pane_idx
     }
+}
+
+/// **The radar slot's two owners, merged.** `fresh` is the handler's half; the
+/// pane's [`RADAR_SLOT_PANE_KEYS`] in `config` are left exactly as they were.
+/// A plain overwrite would erase this pane's whole selection.
+fn merge_radar_slot(config: &mut serde_json::Value, fresh: &serde_json::Value) {
+    let mut merged = match config.take() {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    if let serde_json::Value::Object(fresh) = fresh {
+        for (key, value) in fresh {
+            if RADAR_SLOT_PANE_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    *config = serde_json::Value::Object(merged);
 }
 
 /// **The radar slot's config is the pane's, not a handler's.** It carries
@@ -1233,6 +1301,27 @@ impl PaneState {
             .storm_motion
     }
 
+    /// **One layer's `PaneRef`, for a caller that asks about exactly one.**
+    ///
+    /// The sibling table is **empty**: materialising it needs a `Vec` that
+    /// outlives the call, which is what [`Self::view`] exists for. A caller
+    /// whose handler reads a sibling slot (the site picker reading the radar
+    /// slot's `"site"`) must go through `view()`; every other caller wants
+    /// this, because it composes into one expression and borrows nothing that
+    /// has to be kept alive.
+    pub fn layer_ref(&self, pane_idx: usize, id: &LayerId) -> PaneRef<'_> {
+        let slot = self.slot(id);
+        PaneRef {
+            pane_idx,
+            config: slot.map_or(&serde_json::Value::Null, |slot| &slot.config),
+            state: slot
+                .and_then(|slot| slot.state.as_deref())
+                .map(|s| s as &dyn Any),
+            slots: &[],
+            loading_site: self.loading_site.as_deref(),
+        }
+    }
+
     /// **This pane, as handlers see it.** Build once per pane per frame and
     /// ask it for each layer in turn: the sibling table is materialised here
     /// rather than per layer, which is the whole reason the type exists.
@@ -1374,6 +1463,78 @@ impl PaneState {
         self.layers = layers.to_vec();
     }
 
+    /// **Give every slot its live state**, for the handlers that keep one.
+    ///
+    /// Derived from `slot.config` when the pane has something saved, and from
+    /// the handler's own default when it has not — the same two answers the
+    /// registry swap produced, except that they land in the pane instead of in
+    /// a handler every other pane shares. Idempotent: a slot that already has
+    /// state is left alone, so this is safe to call on every frame that is
+    /// about to ask a handler about this pane.
+    ///
+    /// The flag follows the state, not the other way round: a config that says
+    /// the layer is on has always won over the slot's own flag, because the
+    /// swap deserialized it and `adopt_handler_state` copied the result back.
+    pub fn hydrate_layer_states(
+        &mut self,
+        registry: &rustdar_overlays::render::overlay_state::OverlayRegistry,
+        pane_idx: usize,
+    ) {
+        for slot in &mut self.layers {
+            if slot.state.is_some() {
+                continue;
+            }
+            // The slot's own flag is the fallback: it is what the file said
+            // about THIS pane, and a config that names `enabled` still wins.
+            slot.state = registry.create_pane_state(&slot.id, &slot.config, slot.enabled);
+            let Some(state) = slot.state.as_deref() else {
+                // No state means the handler has not moved its fields yet, so
+                // its answer still comes off the registry — and the registry
+                // may be holding some *other* pane's configs at this moment.
+                // Asking it here would write that pane's flag into this one.
+                continue;
+            };
+            let view = PaneRef {
+                pane_idx,
+                config: &slot.config,
+                state: Some(state as &dyn Any),
+                slots: &[],
+                loading_site: None,
+            };
+            slot.enabled = registry.is_enabled(&slot.id, &view);
+        }
+    }
+
+    /// Turn `id` on or off **in this pane**, through its own state.
+    ///
+    /// The slot's flag is what draws and the state's is what persists, so both
+    /// move together or the next reopen restores the one that did not.
+    pub fn set_layer_enabled(
+        &mut self,
+        registry: &mut rustdar_overlays::render::overlay_state::OverlayRegistry,
+        pane_idx: usize,
+        id: &LayerId,
+        enabled: bool,
+    ) {
+        let Some(slot) = self.layers.iter_mut().find(|slot| slot.id == *id) else {
+            self.set_overlay_enabled(id.clone(), enabled);
+            return;
+        };
+        let Some(state) = slot.state.as_deref_mut() else {
+            slot.enabled = enabled;
+            return;
+        };
+        let mut write = PaneMut {
+            pane_idx,
+            state: Some(state as &mut dyn Any),
+        };
+        registry.set_enabled(id, enabled, &mut write);
+        // Asked, not assumed: for a layer whose "enabled" is a set, the set
+        // is the fact and `enabled` was only the request.
+        let on = registry.is_enabled(id, &write.as_ref());
+        slot.enabled = on;
+    }
+
     /// Overwrite the **handler-owned** part of this pane's slots with the
     /// registry's fresh serialize, KEEPING every slot whose id no handler
     /// serves: an unknown id's saved state (a newer build's layer) must ride
@@ -1389,9 +1550,32 @@ impl PaneState {
         registry: &rustdar_overlays::render::overlay_state::OverlayRegistry,
     ) {
         let configs = registry.save_pane_configs();
-        let enabled = registry.save_enabled_map();
+        // The swap branch's answer, which is what the registry is holding for
+        // this pane right now — the converted branch above never reaches it.
+        let enabled = registry.save_enabled_map(&PaneRef::bare(0));
         for slot in &mut self.layers {
             if registry.handler_by_id(&slot.id).is_none() {
+                continue;
+            }
+            // A slot that owns its state is not told what it holds: it is
+            // asked, and what it answers is what persists. This is the branch
+            // that grows as handlers move their per-pane fields into the pane,
+            // and the swap's branch below is what shrinks to nothing.
+            if let Some(state) = slot.state.as_deref() {
+                let view = PaneRef {
+                    pane_idx: 0,
+                    config: &serde_json::Value::Null,
+                    state: Some(state as &dyn Any),
+                    slots: &[],
+                    loading_site: None,
+                };
+                slot.enabled = registry.is_enabled(&slot.id, &view);
+                let fresh = registry.serialize_pane_state(&slot.id, state);
+                if slot.id != known::RADAR {
+                    slot.config = fresh;
+                } else {
+                    merge_radar_slot(&mut slot.config, &fresh);
+                }
                 continue;
             }
             if let Some(&on) = enabled.get(&slot.id) {
@@ -1406,26 +1590,20 @@ impl PaneState {
             }
             // The radar slot has two owners. The handler's members land
             // beside the pane's, never over them.
-            let mut merged = match slot.config.take() {
-                serde_json::Value::Object(map) => map,
-                _ => serde_json::Map::new(),
-            };
-            if let serde_json::Value::Object(fresh) = fresh {
-                for (key, value) in fresh {
-                    if RADAR_SLOT_PANE_KEYS.contains(&key.as_str()) {
-                        continue;
-                    }
-                    merged.insert(key.clone(), value.clone());
-                }
-            }
-            slot.config = serde_json::Value::Object(merged);
+            merge_radar_slot(&mut slot.config, fresh);
         }
         // A registered handler this pane has no slot for at all: it joins the
         // stack, exactly as the old `extend` gave it a map entry.
         let missing: Vec<(LayerId, u32, bool)> = registry
             .handlers()
             .filter(|h| !self.layers.iter().any(|slot| slot.id == h.id()))
-            .map(|h| (h.id(), h.draw_order_weight(), h.is_enabled()))
+            .map(|h| {
+                (
+                    h.id(),
+                    h.draw_order_weight(),
+                    h.is_enabled(&PaneRef::bare(0)),
+                )
+            })
             .collect();
         if !missing.is_empty() {
             let weights: HashMap<LayerId, u32> = registry

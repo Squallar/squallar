@@ -133,7 +133,7 @@ fn skewed_gui(ctx: &egui::Context) -> Gui {
 /// every eye, Show switch, catalog tile and preset routes through.
 fn toggle(gui: &mut Gui, on: bool) {
     let mut pane = std::mem::take(&mut gui.panes[0]);
-    Gui::write_pane_overlay(&mut gui.overlays, &mut pane, &KIND, on);
+    Gui::write_pane_overlay(&mut gui.overlays, 0, &mut pane, &KIND, on);
     gui.panes[0] = pane;
 }
 

@@ -159,14 +159,14 @@ impl OverlayHandler for SpcDiscussionHandler {
         true
     }
 
-    fn is_enabled(&self) -> bool {
+    fn is_enabled(&self, _pane: &PaneRef<'_>) -> bool {
         self.enabled
     }
 
     // A simple toggle handler, like `sites` and `labels`: without this
     // override, `set_active_pane_overlay`'s `set_enabled` is a silent no-op
     // for MDs and the saved config keeps the old value.
-    fn set_enabled(&mut self, enabled: bool) {
+    fn set_enabled(&mut self, enabled: bool, _pane: &mut PaneMut<'_>) {
         self.enabled = enabled;
     }
 
@@ -174,7 +174,7 @@ impl OverlayHandler for SpcDiscussionHandler {
         self.state.data_generation
     }
 
-    fn content_signature(&self) -> u64 {
+    fn content_signature(&self, _pane: &PaneRef<'_>) -> u64 {
         use std::hash::{DefaultHasher, Hash, Hasher};
         if !self.enabled {
             return 0;
@@ -193,7 +193,7 @@ impl OverlayHandler for SpcDiscussionHandler {
         folded ^ visible.rotate_left(32)
     }
 
-    fn has_data(&self) -> bool {
+    fn has_data(&self, _pane: &PaneRef<'_>) -> bool {
         !self.state.data.is_empty()
     }
 
@@ -201,7 +201,7 @@ impl OverlayHandler for SpcDiscussionHandler {
         self.state.fetching
     }
 
-    fn set_fetching(&mut self, fetching: bool) {
+    fn set_fetching(&mut self, fetching: bool, _pane: &PaneRef<'_>) {
         self.state.fetching = fetching;
     }
 
@@ -221,11 +221,11 @@ impl OverlayHandler for SpcDiscussionHandler {
         Some(120)
     }
 
-    fn item_count(&self) -> usize {
+    fn item_count(&self, _pane: &PaneRef<'_>) -> usize {
         self.state.data.len()
     }
 
-    fn clickable_items(&self) -> Vec<ClickableItem<'_>> {
+    fn clickable_items<'a>(&'a self, _pane: &PaneRef<'_>) -> Vec<ClickableItem<'a>> {
         self.state
             .data
             .iter()
@@ -270,7 +270,7 @@ impl OverlayHandler for SpcDiscussionHandler {
         }
     }
 
-    fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>) {
+    fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>, _pane: &PaneRef<'_>) {
         selections.retain(|sel| {
             if sel.layer_id() != known::SPC_DISCUSSIONS {
                 return true;
@@ -353,12 +353,16 @@ impl OverlayHandler for SpcDiscussionHandler {
         items
     }
 
-    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneMut<'_>) -> ControlEffect {
+    fn apply_control(&mut self, update: &ControlUpdate, pane: &mut PaneMut<'_>) -> ControlEffect {
         match update.id {
             "enabled" => {
                 if let ControlValue::Bool(val) = update.value {
                     self.enabled = val;
-                    if val && self.state.enable_should_refetch(self.has_data()) {
+                    if val
+                        && self
+                            .state
+                            .enable_should_refetch(self.has_data(&pane.as_ref()))
+                    {
                         return ControlEffect::Fetch;
                     }
                 }
@@ -419,7 +423,7 @@ mod tests {
     #[test]
     fn a_refetch_of_the_same_discussion_set_keeps_the_signature() {
         let mut handler = handler_with(vec![md(101), md(102)]);
-        let first = handler.content_signature();
+        let first = handler.content_signature(&PaneRef::bare(0));
         handler.apply_fetch_result(Box::new(SpcDiscussionFetchResult(Ok(vec![
             md(101),
             md(102),
@@ -430,7 +434,7 @@ mod tests {
             "the fixture must have refetched",
         );
         assert_eq!(
-            handler.content_signature(),
+            handler.content_signature(&PaneRef::bare(0)),
             first,
             "an unchanged MD set must keep its signature across a refetch",
         );
@@ -439,25 +443,25 @@ mod tests {
     #[test]
     fn every_change_to_the_drawn_set_moves_the_signature() {
         let mut handler = handler_with(vec![md(101)]);
-        let one = handler.content_signature();
+        let one = handler.content_signature(&PaneRef::bare(0));
 
         handler.apply_fetch_result(Box::new(SpcDiscussionFetchResult(Ok(vec![
             md(101),
             md(102),
         ]))));
-        let two = handler.content_signature();
+        let two = handler.content_signature(&PaneRef::bare(0));
         assert_ne!(one, two, "an MD issuing must move the signature");
 
         handler.apply_fetch_result(Box::new(SpcDiscussionFetchResult(Ok(vec![md(102)]))));
         assert_ne!(
-            handler.content_signature(),
+            handler.content_signature(&PaneRef::bare(0)),
             two,
             "an MD expiring must move the signature",
         );
 
-        handler.set_enabled(false);
+        handler.set_enabled(false, &mut PaneMut::bare(0));
         assert_eq!(
-            handler.content_signature(),
+            handler.content_signature(&PaneRef::bare(0)),
             0,
             "the toggle off must zero the signature — the floor would draw nothing",
         );
@@ -511,8 +515,8 @@ mod tests {
         let forward = handler_with(vec![md(101), md(102), md(103)]);
         let reversed = handler_with(vec![md(103), md(102), md(101)]);
         assert_eq!(
-            forward.content_signature(),
-            reversed.content_signature(),
+            forward.content_signature(&PaneRef::bare(0)),
+            reversed.content_signature(&PaneRef::bare(0)),
             "the same MDs in another order draw the same picture",
         );
     }

@@ -638,6 +638,7 @@ impl super::App {
                 &rustdar_overlays::fetch_policy::FetchError::permanent(
                     "no fetch task could be built",
                 ),
+                &PaneRef::bare(pane_idx),
             );
             return;
         }
@@ -647,7 +648,9 @@ impl super::App {
             kind,
             tasks.len()
         );
-        self.gui.overlays.set_fetching(&kind, true);
+        self.gui
+            .overlays
+            .set_fetching(&kind, true, &PaneRef::bare(pane_idx));
 
         for task in tasks {
             let task_kind = task.kind;

@@ -17,8 +17,8 @@ use crate::types::OverlayLabel;
 
 pub use rustdar_source::handler::{
     ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayItem, OverlayLegend, OverlayState,
-    PaneMut, PaneRef, PopupAction, PopupActionKind, PopupContent, PopupSection, RasterizeContext,
-    RenderMode, Signed, SourceHandler as OverlayHandler, Surface, TaskFuture,
+    PaneMut, PaneRef, PaneToggle, PopupAction, PopupActionKind, PopupContent, PopupSection,
+    RasterizeContext, RenderMode, Signed, SourceHandler as OverlayHandler, Surface, TaskFuture,
 };
 
 /// What opens a layer-stack status line that is reporting a fault rather than a
@@ -110,8 +110,8 @@ impl OverlayRegistry {
 
     /// [`OverlayHandler::content_signature`] for `kind`; `0` for a kind with
     /// no handler.
-    pub fn content_signature(&self, id: &LayerId) -> u64 {
-        self.handler(id).map_or(0, |h| h.content_signature())
+    pub fn content_signature(&self, id: &LayerId, pane: &PaneRef<'_>) -> u64 {
+        self.handler(id).map_or(0, |h| h.content_signature(pane))
     }
 
     #[doc(hidden)]
@@ -155,17 +155,17 @@ impl OverlayRegistry {
         }
     }
 
-    pub fn has_data(&self, id: &LayerId) -> bool {
-        self.handler(id).is_some_and(|h| h.has_data())
+    pub fn has_data(&self, id: &LayerId, pane: &PaneRef<'_>) -> bool {
+        self.handler(id).is_some_and(|h| h.has_data(pane))
     }
 
     pub fn is_fetching(&self, id: &LayerId) -> bool {
         self.handler(id).is_some_and(|h| h.is_fetching())
     }
 
-    pub fn set_fetching(&mut self, id: &LayerId, fetching: bool) {
+    pub fn set_fetching(&mut self, id: &LayerId, fetching: bool, pane: &PaneRef<'_>) {
         if let Some(h) = self.handler_mut(id) {
-            h.set_fetching(fetching);
+            h.set_fetching(fetching, pane);
         }
     }
 
@@ -191,9 +191,9 @@ impl OverlayRegistry {
     }
 
     /// File a failure against `kind`'s ladder from outside the handler.
-    pub fn record_fetch_failure(&mut self, id: &LayerId, error: &FetchError) {
+    pub fn record_fetch_failure(&mut self, id: &LayerId, error: &FetchError, pane: &PaneRef<'_>) {
         if let Some(h) = self.handler_mut(id) {
-            h.set_fetching(false);
+            h.set_fetching(false, pane);
             if let Some(r) = h.retry_mut() {
                 r.record_failure(error);
             }
@@ -205,17 +205,17 @@ impl OverlayRegistry {
         self.handler(id).and_then(|h| h.retry()).map(|r| r.health())
     }
 
-    pub fn item_count(&self, id: &LayerId) -> usize {
-        self.handler(id).map_or(0, |h| h.item_count())
+    pub fn item_count(&self, id: &LayerId, pane: &PaneRef<'_>) -> usize {
+        self.handler(id).map_or(0, |h| h.item_count(pane))
     }
 
-    pub fn is_enabled(&self, id: &LayerId) -> bool {
-        self.handler(id).is_some_and(|h| h.is_enabled())
+    pub fn is_enabled(&self, id: &LayerId, pane: &PaneRef<'_>) -> bool {
+        self.handler(id).is_some_and(|h| h.is_enabled(pane))
     }
 
-    pub fn set_enabled(&mut self, id: &LayerId, enabled: bool) {
+    pub fn set_enabled(&mut self, id: &LayerId, enabled: bool, pane: &mut PaneMut<'_>) {
         if let Some(h) = self.handler_mut(id) {
-            h.set_enabled(enabled);
+            h.set_enabled(enabled, pane);
         }
     }
 
@@ -224,7 +224,7 @@ impl OverlayRegistry {
     pub fn status_line(&self, id: &LayerId, pane: &PaneRef<'_>) -> Option<String> {
         let handler = self.handler(id)?;
         let line = handler.status_line(pane);
-        if !handler.is_enabled() {
+        if !handler.is_enabled(pane) {
             return line;
         }
         let retry = handler.retry();
@@ -242,9 +242,13 @@ impl OverlayRegistry {
         })
     }
 
-    pub fn clickable_items(&self, id: &LayerId) -> Vec<ClickableItem<'_>> {
+    pub fn clickable_items<'a>(
+        &'a self,
+        id: &LayerId,
+        pane: &PaneRef<'_>,
+    ) -> Vec<ClickableItem<'a>> {
         self.handler(id)
-            .map_or_else(Vec::new, |h| h.clickable_items())
+            .map_or_else(Vec::new, |h| h.clickable_items(pane))
     }
 
     /// [`OverlayHandler::map_labels`] for `kind`; empty for a kind with no
@@ -253,8 +257,15 @@ impl OverlayRegistry {
         self.handler(id).map_or(&[], |h| h.map_labels())
     }
 
-    pub fn hover_value_at(&self, id: &LayerId, lat: f64, lon: f64) -> Option<String> {
-        self.handler(id).and_then(|h| h.hover_value_at(lat, lon))
+    pub fn hover_value_at(
+        &self,
+        id: &LayerId,
+        lat: f64,
+        lon: f64,
+        pane: &PaneRef<'_>,
+    ) -> Option<String> {
+        self.handler(id)
+            .and_then(|h| h.hover_value_at(lat, lon, pane))
     }
 
     pub fn legend(&self, id: &LayerId, pane: &PaneRef<'_>) -> Option<Signed<OverlayLegend>> {
@@ -282,12 +293,14 @@ impl OverlayRegistry {
     }
 
     /// Re-runs `retain_selections` afterwards, since the data just changed.
-    pub fn apply_fetch_result(&mut self, result: OverlayFetchResult) {
+    /// `pane` is the pane whose fetch this answered: the selection filter a
+    /// handler applies in `retain_selections` is that pane's.
+    pub fn apply_fetch_result(&mut self, result: OverlayFetchResult, pane: &PaneRef<'_>) {
         let id = result.kind;
         self.forget_loaded_config(&id);
         if let Some(idx) = self.handlers.iter().position(|h| h.id() == id) {
             self.handlers[idx].apply_fetch_result(result.data);
-            self.handlers[idx].retain_selections(&mut self.selected_overlays);
+            self.handlers[idx].retain_selections(&mut self.selected_overlays, pane);
         }
         if self.selected_overlay_page >= self.selected_overlays.len().max(1) {
             self.selected_overlay_page = 0;
@@ -363,11 +376,43 @@ impl OverlayRegistry {
     }
 
     /// Seeds a new pane's `enabled_overlays`; call after config deserialization.
-    pub fn build_enabled_map(&self) -> std::collections::HashMap<LayerId, bool> {
+    pub fn build_enabled_map(
+        &self,
+        pane: &PaneRef<'_>,
+    ) -> std::collections::HashMap<LayerId, bool> {
         self.handlers
             .iter()
-            .map(|h| (h.id(), h.is_enabled()))
+            .map(|h| (h.id(), h.is_enabled(pane)))
             .collect()
+    }
+
+    /// **A pane's live state for `id`** — the handler's saved config decoded,
+    /// or a fresh one when the pane has nothing saved. `None` from a handler
+    /// that keeps no per-pane state, which is what every handler answered
+    /// before WO-M10.
+    pub fn create_pane_state(
+        &self,
+        id: &LayerId,
+        config: &serde_json::Value,
+        enabled: bool,
+    ) -> Option<FetchPayload> {
+        let handler = self.handler(id)?;
+        if !config.is_null()
+            && let Some(state) = handler.deserialize_pane_state(config.clone(), enabled)
+        {
+            return Some(state);
+        }
+        handler.create_pane_state(enabled)
+    }
+
+    /// `id`'s per-pane state, back as the JSON its slot persists.
+    pub fn serialize_pane_state(
+        &self,
+        id: &LayerId,
+        state: &dyn std::any::Any,
+    ) -> serde_json::Value {
+        self.handler(id)
+            .map_or(serde_json::Value::Null, |h| h.serialize_pane_state(state))
     }
 
     pub fn save_pane_configs(&self) -> std::collections::HashMap<LayerId, serde_json::Value> {
@@ -400,10 +445,10 @@ impl OverlayRegistry {
         }
     }
 
-    pub fn save_enabled_map(&self) -> std::collections::HashMap<LayerId, bool> {
+    pub fn save_enabled_map(&self, pane: &PaneRef<'_>) -> std::collections::HashMap<LayerId, bool> {
         self.handlers
             .iter()
-            .map(|h| (h.id(), h.is_enabled()))
+            .map(|h| (h.id(), h.is_enabled(pane)))
             .collect()
     }
 
@@ -474,9 +519,9 @@ mod pane_config_tests {
     use super::*;
 
     fn mds_off(registry: &mut OverlayRegistry) -> std::collections::HashMap<LayerId, Value> {
-        registry.set_enabled(&known::SPC_DISCUSSIONS, false);
+        registry.set_enabled(&known::SPC_DISCUSSIONS, false, &mut PaneMut::bare(0));
         let configs = registry.save_pane_configs();
-        registry.set_enabled(&known::SPC_DISCUSSIONS, true);
+        registry.set_enabled(&known::SPC_DISCUSSIONS, true, &mut PaneMut::bare(0));
         configs
     }
 
@@ -487,19 +532,19 @@ mod pane_config_tests {
         let mut registry = OverlayRegistry::default();
         let configs = mds_off(&mut registry);
         assert!(
-            registry.is_enabled(&known::SPC_DISCUSSIONS),
+            registry.is_enabled(&known::SPC_DISCUSSIONS, &PaneRef::bare(0)),
             "fixture: the handler is on, so the config has something to do",
         );
 
         registry.load_pane_configs(&configs);
         assert!(
-            !registry.is_enabled(&known::SPC_DISCUSSIONS),
+            !registry.is_enabled(&known::SPC_DISCUSSIONS, &PaneRef::bare(0)),
             "the first load must apply the config",
         );
 
         registry.load_pane_configs(&configs);
         assert!(
-            !registry.is_enabled(&known::SPC_DISCUSSIONS),
+            !registry.is_enabled(&known::SPC_DISCUSSIONS, &PaneRef::bare(0)),
             "a repeat load changed the answer",
         );
     }
@@ -517,10 +562,13 @@ mod pane_config_tests {
             "fixture: a load has to record what it read for the skip to exist",
         );
 
-        registry.apply_fetch_result(OverlayFetchResult {
-            kind: known::SPC_DISCUSSIONS,
-            data: OverlayRegistry::spc_discussions_payload(Vec::new()),
-        });
+        registry.apply_fetch_result(
+            OverlayFetchResult {
+                kind: known::SPC_DISCUSSIONS,
+                data: OverlayRegistry::spc_discussions_payload(Vec::new()),
+            },
+            &PaneRef::bare(0),
+        );
 
         assert!(
             !registry
@@ -536,12 +584,12 @@ mod pane_config_tests {
         let mut registry = OverlayRegistry::default();
         let configs = mds_off(&mut registry);
         registry.load_pane_configs(&configs);
-        assert!(!registry.is_enabled(&known::SPC_DISCUSSIONS));
+        assert!(!registry.is_enabled(&known::SPC_DISCUSSIONS, &PaneRef::bare(0)));
 
-        registry.set_enabled(&known::SPC_DISCUSSIONS, true);
+        registry.set_enabled(&known::SPC_DISCUSSIONS, true, &mut PaneMut::bare(0));
         registry.load_pane_configs(&configs);
         assert!(
-            !registry.is_enabled(&known::SPC_DISCUSSIONS),
+            !registry.is_enabled(&known::SPC_DISCUSSIONS, &PaneRef::bare(0)),
             "a `set_enabled` that never reached the config survived the \
              reload — the skip went stale",
         );
@@ -549,10 +597,10 @@ mod pane_config_tests {
         registry
             .handler_by_id_mut(&known::SPC_DISCUSSIONS)
             .expect("the MD handler is registered")
-            .set_enabled(true);
+            .set_enabled(true, &mut PaneMut::bare(0));
         registry.load_pane_configs(&configs);
         assert!(
-            !registry.is_enabled(&known::SPC_DISCUSSIONS),
+            !registry.is_enabled(&known::SPC_DISCUSSIONS, &PaneRef::bare(0)),
             "a change made through `get_handler_mut` survived the reload",
         );
     }
@@ -563,19 +611,19 @@ mod pane_config_tests {
         let off = mds_off(&mut registry);
         let on = registry.save_pane_configs();
         assert!(
-            registry.is_enabled(&known::SPC_DISCUSSIONS),
+            registry.is_enabled(&known::SPC_DISCUSSIONS, &PaneRef::bare(0)),
             "fixture: the two configs differ",
         );
 
         for _ in 0..3 {
             registry.load_pane_configs(&off);
             assert!(
-                !registry.is_enabled(&known::SPC_DISCUSSIONS),
+                !registry.is_enabled(&known::SPC_DISCUSSIONS, &PaneRef::bare(0)),
                 "the off pane did not get its config",
             );
             registry.load_pane_configs(&on);
             assert!(
-                registry.is_enabled(&known::SPC_DISCUSSIONS),
+                registry.is_enabled(&known::SPC_DISCUSSIONS, &PaneRef::bare(0)),
                 "the on pane did not get its config",
             );
         }
@@ -672,7 +720,11 @@ mod retry_ledger_tests {
         for kind in kinds {
             let quiet = registry.controls(&kind, &ctx).len();
 
-            registry.record_fetch_failure(&kind, &FetchError::transient("connection refused"));
+            registry.record_fetch_failure(
+                &kind,
+                &FetchError::transient("connection refused"),
+                &PaneRef::bare(0),
+            );
             let note = registry
                 .fetch_health(&kind)
                 .and_then(|_| {
@@ -771,7 +823,7 @@ mod retry_ledger_tests {
             .collect();
 
         for kind in kinds {
-            registry.set_enabled(&kind, true);
+            registry.set_enabled(&kind, true, &mut PaneMut::bare(0));
             let healthy = registry.status_line(&kind, &PaneRef::bare(0));
             assert!(
                 !healthy
@@ -780,7 +832,11 @@ mod retry_ledger_tests {
                 "{kind:?} claims to be failing before anything has failed: {healthy:?}",
             );
 
-            registry.record_fetch_failure(&kind, &FetchError::transient("connection refused"));
+            registry.record_fetch_failure(
+                &kind,
+                &FetchError::transient("connection refused"),
+                &PaneRef::bare(0),
+            );
             let marked = registry
                 .status_line(&kind, &PaneRef::bare(0))
                 .unwrap_or_else(|| panic!("{kind:?} says nothing on the row while failing"));
@@ -853,10 +909,15 @@ mod retry_ledger_tests {
         let kind = known::NWS_ALERTS;
         let mut registry = OverlayRegistry::default();
 
-        registry.apply_fetch_result(OverlayFetchResult {
-            kind: kind.clone(),
-            data: OverlayRegistry::nws_alerts_payload(alerts_where_only_some_resolved(297, 297)),
-        });
+        registry.apply_fetch_result(
+            OverlayFetchResult {
+                kind: kind.clone(),
+                data: OverlayRegistry::nws_alerts_payload(alerts_where_only_some_resolved(
+                    297, 297,
+                )),
+            },
+            &PaneRef::bare(0),
+        );
         assert_eq!(
             registry.status_line(&kind, &PaneRef::bare(0)).as_deref(),
             Some("297 shown - W/Wa/Adv/Oth"),
@@ -864,21 +925,24 @@ mod retry_ledger_tests {
         );
         let quiet = registry.controls(&kind, &ctx).len();
 
-        registry.apply_fetch_result(OverlayFetchResult {
-            kind: kind.clone(),
-            data: OverlayRegistry::nws_alerts_partial_payload(
-                alerts_where_only_some_resolved(297, 85),
-                ZoneResolution {
-                    alerts_expected: 297,
-                    alerts_complete: 85,
-                    alerts_partial: 0,
-                    alerts_missing: 212,
-                    zones_requested: 1200,
-                    zones_resolved: 995,
-                    failures: vec![(ZoneFailure::Http(503), 198), (ZoneFailure::NoBoundary, 7)],
-                },
-            ),
-        });
+        registry.apply_fetch_result(
+            OverlayFetchResult {
+                kind: kind.clone(),
+                data: OverlayRegistry::nws_alerts_partial_payload(
+                    alerts_where_only_some_resolved(297, 85),
+                    ZoneResolution {
+                        alerts_expected: 297,
+                        alerts_complete: 85,
+                        alerts_partial: 0,
+                        alerts_missing: 212,
+                        zones_requested: 1200,
+                        zones_resolved: 995,
+                        failures: vec![(ZoneFailure::Http(503), 198), (ZoneFailure::NoBoundary, 7)],
+                    },
+                ),
+            },
+            &PaneRef::bare(0),
+        );
 
         assert_eq!(
             registry.status_line(&kind, &PaneRef::bare(0)).as_deref(),
@@ -935,10 +999,15 @@ mod retry_ledger_tests {
             "the partial round must stamp its own clock: {since:?}",
         );
 
-        registry.apply_fetch_result(OverlayFetchResult {
-            kind: kind.clone(),
-            data: OverlayRegistry::nws_alerts_payload(alerts_where_only_some_resolved(297, 297)),
-        });
+        registry.apply_fetch_result(
+            OverlayFetchResult {
+                kind: kind.clone(),
+                data: OverlayRegistry::nws_alerts_payload(alerts_where_only_some_resolved(
+                    297, 297,
+                )),
+            },
+            &PaneRef::bare(0),
+        );
         assert_eq!(
             registry.status_line(&kind, &PaneRef::bare(0)).as_deref(),
             Some("297 shown - W/Wa/Adv/Oth"),
@@ -952,27 +1021,34 @@ mod retry_ledger_tests {
 
         let kind = known::NWS_ALERTS;
         let mut registry = OverlayRegistry::default();
-        registry.apply_fetch_result(OverlayFetchResult {
-            kind: kind.clone(),
-            data: OverlayRegistry::nws_alerts_partial_payload(
-                alerts_where_only_some_resolved(297, 85),
-                ZoneResolution {
-                    alerts_expected: 297,
-                    alerts_complete: 85,
-                    alerts_missing: 212,
-                    zones_requested: 1200,
-                    zones_resolved: 995,
-                    failures: vec![(ZoneFailure::Http(503), 205)],
-                    ..ZoneResolution::default()
-                },
-            ),
-        });
+        registry.apply_fetch_result(
+            OverlayFetchResult {
+                kind: kind.clone(),
+                data: OverlayRegistry::nws_alerts_partial_payload(
+                    alerts_where_only_some_resolved(297, 85),
+                    ZoneResolution {
+                        alerts_expected: 297,
+                        alerts_complete: 85,
+                        alerts_missing: 212,
+                        zones_requested: 1200,
+                        zones_resolved: 995,
+                        failures: vec![(ZoneFailure::Http(503), 205)],
+                        ..ZoneResolution::default()
+                    },
+                ),
+            },
+            &PaneRef::bare(0),
+        );
         assert_eq!(
             registry.status_line(&kind, &PaneRef::bare(0)).as_deref(),
             Some("! incomplete - 85 of 297 shown - W/Wa/Adv/Oth"),
         );
 
-        registry.record_fetch_failure(&kind, &FetchError::transient("connection refused"));
+        registry.record_fetch_failure(
+            &kind,
+            &FetchError::transient("connection refused"),
+            &PaneRef::bare(0),
+        );
         assert_eq!(
             registry.status_line(&kind, &PaneRef::bare(0)).as_deref(),
             Some("! not updating, incomplete - 85 of 297 shown - W/Wa/Adv/Oth"),
@@ -1030,8 +1106,12 @@ mod retry_ledger_tests {
     fn a_hidden_layer_is_not_marked_on_the_stack_row() {
         let mut registry = OverlayRegistry::default();
         let kind = known::NWS_ALERTS;
-        registry.record_fetch_failure(&kind, &FetchError::transient("connection refused"));
-        registry.set_enabled(&kind, false);
+        registry.record_fetch_failure(
+            &kind,
+            &FetchError::transient("connection refused"),
+            &PaneRef::bare(0),
+        );
+        registry.set_enabled(&kind, false, &mut PaneMut::bare(0));
         assert!(
             !registry
                 .status_line(&kind, &PaneRef::bare(0))
