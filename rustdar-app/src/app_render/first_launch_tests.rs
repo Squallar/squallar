@@ -240,3 +240,145 @@ fn a_catalogue_that_cannot_be_persisted_is_still_applied_to_this_session() {
         "and it reaches the table, which is what the user actually sees",
     );
 }
+
+// ── The volume decoded before its radar was known ───────────────────
+
+/// The moment a volume in these tests was collected.
+fn volume_time() -> chrono::NaiveDateTime {
+    chrono::NaiveDate::from_ymd_opt(2026, 8, 20)
+        .unwrap()
+        .and_hms_opt(19, 41, 36)
+        .unwrap()
+}
+
+/// A volume that states where its radar is, the way a Message 31 volume does.
+fn volume_stating(id: &[u8; 4], lat: f32, lon: f32) -> nexrad_model::data::Scan {
+    use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
+    Scan::with_site(
+        nexrad_model::meta::Site::new(*id, lat, lon, 370, 20),
+        VolumeCoveragePattern::new(
+            212,
+            0,
+            0.5,
+            PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            Vec::new(),
+        ),
+        Vec::new(),
+    )
+}
+
+/// **The volume that teaches the table where its radar is can name it too.**
+///
+/// Measured on a fresh config tree, 2026-08-20: the first volume was fetched
+/// and decoded and never rasterised, because the position it states reaches
+/// the site table one line *after* the `ScanInfo` that has to name the radar
+/// is built — so the info said `UNKNOWN`, and `dispatch_pane_renders` looks
+/// the volume up in a `scan_data` keyed by the site.
+#[test]
+fn a_volume_that_places_its_own_radar_names_it_in_the_same_breath() {
+    const TAUGHT: &str = "ZZQJ";
+    let mut app = headless(TestBridge::desktop());
+    assert!(
+        !rustdar_radar::sites::knows_site(TAUGHT),
+        "precondition: nothing may place this radar yet, or this proves nothing",
+    );
+
+    let info = app.scan_info_learning_position(
+        &volume_stating(b"ZZQJ", -30.5, -140.5),
+        TAUGHT,
+        volume_time(),
+    );
+
+    assert_eq!(
+        info.site_source,
+        rustdar_radar::site_position::SitePositionSource::Volume,
+        "precondition: the volume has to be the thing that placed it, or this \
+         pins some other path",
+    );
+    assert_eq!(
+        info.site.name, TAUGHT,
+        "the volume's own position reached the table in this same call, so the \
+         info it produced must be able to name the radar; UNKNOWN is not a key \
+         `scan_data` holds and the picture is never made",
+    );
+}
+
+/// **A volume decoded before the catalogue landed is drawn once it lands.**
+///
+/// The other half of the same first-launch defect: a volume that states no
+/// position of its own cannot place its radar, so nothing renders — correctly,
+/// because a row at (0, 0) would be worse than no picture. The catalogue's
+/// arrival is the moment that can un-skip it, and before this it did not:
+/// 0 renders in 83 s on a fresh tree, against 15 within a second on a launch
+/// that had a cached catalogue.
+#[test]
+fn the_catalogue_landing_draws_the_volume_the_launch_could_not_place() {
+    const BLIND: &str = "ZZQK";
+    let (recorded, _worker) = super::one_render_per_sweep_tests::recorder();
+    let ctx = egui::Context::default();
+    let mut app = headless(TestBridge::desktop());
+    app.catalogue_pending = true;
+    app.render.ensure_pane_count(1);
+    assert!(
+        !rustdar_radar::sites::knows_site(BLIND),
+        "precondition: nothing may place this radar yet, or this proves nothing",
+    );
+
+    let scan = super::one_render_per_sweep_tests::sample_scan();
+    let info = app.scan_info_learning_position(&scan, BLIND, volume_time());
+    assert_eq!(
+        info.site.name,
+        rustdar_radar::sites::UNKNOWN_SITE_NAME,
+        "precondition: a volume stating nothing about an unplaced radar is the \
+         state under test",
+    );
+    {
+        let pane = app.gui.pane_mut(0).expect("a pane exists");
+        pane.set_site(BLIND.to_string());
+        pane.set_selected_product(rustdar_radar::types::RadarProduct::Reflectivity);
+        pane.set_selected_elevation(0.5);
+    }
+    app.gui
+        .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForSite {
+            site: BLIND.to_string(),
+            info,
+        });
+    app.scan_data.insert(
+        BLIND.to_string(),
+        (
+            scan,
+            std::sync::Arc::new(rustdar_radar::nyquist::DeclaredNyquist::empty()),
+        ),
+    );
+
+    app.dispatch_pane_renders(&ctx);
+    assert_eq!(
+        super::one_render_per_sweep_tests::asked_for(&recorded),
+        Vec::new(),
+        "precondition: a radar nothing can place has no picture to make",
+    );
+
+    app.channels
+        .site_catalogue_sender
+        .send(landed(Some(catalogue_naming(BLIND, -36_000_000))))
+        .unwrap();
+    app.poll_site_catalogue();
+    app.dispatch_pane_renders(&ctx);
+
+    assert_eq!(
+        super::one_render_per_sweep_tests::asked_for(&recorded),
+        vec![(rustdar_radar::types::RadarProduct::Reflectivity, 0.5)],
+        "the volume was already fetched and decoded; the catalogue's arrival \
+         has to un-skip the render it made impossible, or the map stays blank \
+         for the whole session",
+    );
+}

@@ -349,6 +349,28 @@ impl Gui {
         );
     }
 
+    /// **Re-place every pane's volume against the site table as it stands.**
+    ///
+    /// Answers how many moved. A volume decoded before its radar was in the
+    /// table is named
+    /// [`UNKNOWN_SITE_NAME`](rustdar_radar::sites::UNKNOWN_SITE_NAME), and
+    /// everything that looks a volume up by that name then misses — on the
+    /// dispatch path that means the volume is fetched, decoded, and never
+    /// rasterised. Run beside [`Self::publish_radar_sites`] whenever the table
+    /// moves: the pictures already on screen were named against the old one.
+    pub fn place_shown_volumes_against_the_table(&mut self) -> usize {
+        let mut replaced = 0;
+        for pane in self.panes_mut() {
+            let site = pane.site().to_string();
+            if let Some(info) = pane.scan_info.as_mut()
+                && info.place_against_the_table(&site)
+            {
+                replaced += 1;
+            }
+        }
+        replaced
+    }
+
     /// **Take delivery of one overlay fetch round.**
     ///
     /// The arrival names a layer and no pane, so the handler is handed a

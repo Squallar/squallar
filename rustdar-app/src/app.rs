@@ -1548,7 +1548,7 @@ impl App {
         site: &str,
         requested_timestamp: chrono::NaiveDateTime,
     ) -> ScanInfo {
-        let info = ScanInfo::from_scan(
+        let mut info = ScanInfo::from_scan(
             scan,
             site,
             requested_timestamp,
@@ -1571,6 +1571,12 @@ impl App {
                 self.gui.bump_all_radar_sites_gen();
             }
         }
+        // The info above was built against the table as it stood *before* the line
+        // that just taught it where this radar is. On an install with no cached
+        // catalogue that table was empty, so the volume that supplies the position
+        // is the one whose info cannot name its own radar -- and `UNKNOWN` is not a
+        // key `scan_data` holds, so the picture is never made.
+        info.place_against_the_table(site);
         info
     }
 
