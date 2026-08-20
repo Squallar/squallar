@@ -9,9 +9,12 @@ use rustdar_device_profile::constants::{
 use rustdar_egui::actions::GuiAction;
 use rustdar_egui::pane::{BroadcastSweep, ELEVATION_TOLERANCE, RenderTarget};
 use rustdar_egui::radar_layer;
-use rustdar_radar::loop_downloads::{
-    FramePlan, L3FrameState, LoopFrameData, PendingDownloads, PendingL3Pairings,
-};
+use rustdar_radar::loop_downloads::{FramePlan, L3FrameState, PendingDownloads, PendingL3Pairings};
+// Test-only since WO-M12d: production loop dispatch holds a frame's payload
+// only as radar's own described job. What still names the arms is the suites'
+// own inspection of `frame_data` below.
+#[cfg(test)]
+use rustdar_radar::loop_downloads::LoopFrameData;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -2628,14 +2631,20 @@ impl super::App {
                 break;
             }
 
-            let Some(data) = frame_data(&self.loop_mgr, &req.target, req.timestamp) else {
+            // Asked here rather than inside the spawn because "the data has not
+            // arrived" is not a failed render: this frame is skipped and asked
+            // again next pass, and nothing about it is marked.
+            if !self.loop_mgr.frame_data_arrived(
+                &req.target.site,
+                req.target.product,
+                &req.timestamp,
+            ) {
                 continue;
-            };
+            }
 
             let spawned = self.spawn_loop_frame_render(
                 req.pane_idx,
                 req.timestamp,
-                data,
                 req.render_params(),
                 req.target,
             );
@@ -2651,8 +2660,9 @@ impl super::App {
             {
                 break;
             }
-            let Some(LoopFrameData::Volume(scan, declared)) =
-                frame_data(&self.loop_mgr, &req.target, req.timestamp)
+            let Some((scan, declared)) =
+                self.loop_mgr
+                    .frame_volume(&req.target.site, req.target.product, &req.timestamp)
             else {
                 if let Some(pane) = self.gui.pane_mut(req.pane_idx)
                     && let Some(frame) = pane.loop_state_mut().frames.get_mut(req.frame_idx)
@@ -3063,11 +3073,17 @@ fn pairing_days_for_frames(
 
 /// The data a loop keyed to `target` renders for `timestamp`: the Level II volume,
 /// or every Level III object of that volume, whichever `target.product` reads.
+///
+/// Test-only since WO-M12d: the dispatch path asks radar for the *described job*
+/// a frame's data makes and never holds the arms themselves. What the suites
+/// below still pin through here is the keying — that a frame's data is looked up
+/// under its own target's site and its own target's product.
+#[cfg(test)]
 fn frame_data(
     loop_mgr: &rustdar_radar::loop_downloads::LoopDownloadManager,
     target: &RenderTarget,
     timestamp: chrono::NaiveDateTime,
-) -> Option<LoopFrameData> {
+) -> Option<rustdar_radar::loop_downloads::LoopFrameData> {
     loop_mgr.frame_data(&target.site, target.product, &timestamp)
 }
 

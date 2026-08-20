@@ -21,6 +21,32 @@ pub enum LoopFrameData {
     Products(Vec<Arc<Level3Product>>),
 }
 
+/// What a loop frame's render needs that the frame's own data does not carry:
+/// the pane's selection, and the four per-render rungs the dispatcher above
+/// holds for the site.
+///
+/// Every field is read by exactly one arm of
+/// [`frame_render_job`](LoopDownloadManager::frame_render_job) or by both; the
+/// dispatcher fills it in without knowing which arm will read what.
+pub struct LoopRenderContext {
+    /// The product the pane's loop is rendering.
+    pub product: RadarProduct,
+    /// The sweep angle the pane's elevation selection snapped to.
+    pub elevation: f32,
+    pub lat: f64,
+    pub lon: f64,
+    /// The storm motion override, where a lower rung does not apply.
+    pub storm_motion: Option<(f32, f32)>,
+    /// The site's `(0 °C, −20 °C)` pair in km MSL, for products that read them.
+    pub env_heights: Option<(f64, f64)>,
+    /// Which derived rung a Level II render's payload carries.
+    pub srv_fallback: crate::srv::SrvFallback,
+    /// The `N0M` object **this frame's own volume** may classify against.
+    pub melting_layer: Option<Arc<Vec<u8>>>,
+    /// The RPG's storm motion vector for **this frame's own volume**.
+    pub rpg_storm_motion: Option<(f32, f32)>,
+}
+
 /// One downloaded volume as the loop caches it: the sweeps, and what their cuts
 /// declared their Nyquist velocities to be.
 pub type CachedVolume = (
@@ -511,6 +537,101 @@ impl LoopDownloadManager {
         }
         self.get_cached(site, ts)
             .map(|(scan, declared)| LoopFrameData::Volume(Arc::clone(scan), Arc::clone(declared)))
+    }
+
+    /// Whether frame `ts` of `product`'s loop on `site` has everything it needs
+    /// to render — [`frame_data`](Self::frame_data)'s own question, asked without
+    /// building the answer's arms.
+    ///
+    /// Delegates rather than re-deciding: a second copy of "which cache does this
+    /// product read" is exactly the kind that drifts from the first.
+    pub fn frame_data_arrived(
+        &self,
+        site: &str,
+        product: RadarProduct,
+        ts: &chrono::NaiveDateTime,
+    ) -> bool {
+        self.frame_data(site, product, ts).is_some()
+    }
+
+    /// The Level II volume frame `ts` of `product`'s loop on `site` renders.
+    ///
+    /// `None` where [`frame_data`](Self::frame_data) is `None`, and also where it
+    /// answers the Level III arm: a loop whose product reads objects has no
+    /// volume to hand out, whatever this site's volume cache happens to hold.
+    pub fn frame_volume(
+        &self,
+        site: &str,
+        product: RadarProduct,
+        ts: &chrono::NaiveDateTime,
+    ) -> Option<CachedVolume> {
+        match self.frame_data(site, product, ts)? {
+            LoopFrameData::Volume(scan, declared) => Some((scan, declared)),
+            LoopFrameData::Products(_) => None,
+        }
+    }
+
+    /// The described render job frame `ts` of `product`'s loop on `site` runs,
+    /// with its concrete input type erased.
+    ///
+    /// This is the whole of what a loop frame's *closed arms* decide: which job
+    /// input a frame's own data makes, and what of `ctx` each arm reads. The
+    /// dispatcher above holds the answer without naming either arm — the codec
+    /// row that owns the input type is what runs it (`crate::jobs::JOB_CODECS`).
+    ///
+    /// `None` is "there is nothing to draw", not "the data has not arrived":
+    /// callers ask [`frame_data`](Self::frame_data) for the latter. The two
+    /// `None` sources here are a volume with no such sweep and a Level III frame
+    /// whose object list is empty.
+    pub fn frame_render_job(
+        &self,
+        site: &str,
+        ts: &chrono::NaiveDateTime,
+        ctx: &LoopRenderContext,
+    ) -> Option<rustdar_source::job::DescribedJob> {
+        match self.frame_data(site, ctx.product, ts)? {
+            // The scan is reduced to the one sweep this frame draws before the
+            // job is dispatched.
+            LoopFrameData::Volume(scan_data, declared) => {
+                let input = crate::render_input::RenderInput::extract(
+                    &scan_data,
+                    ctx.elevation,
+                    ctx.product,
+                    ctx.lat,
+                    ctx.lon,
+                    ctx.storm_motion,
+                    ctx.env_heights,
+                )?;
+                Some(rustdar_source::job::DescribedJob::new(
+                    crate::jobs::RadarPlanJob {
+                        // The same stamp the still frame takes, off this frame's
+                        // own volume.
+                        input: Box::new(
+                            input
+                                .with_declared_nyquist(&declared)
+                                .with_srv_fallback(ctx.srv_fallback)
+                                .with_melting_layer_product(ctx.melting_layer.clone())
+                                .with_rpg_storm_motion(ctx.rpg_storm_motion),
+                        ),
+                        // Loop frames store an empty value grid.
+                        values_wanted: false,
+                    },
+                ))
+            }
+            // The object's *bytes*, exactly as the static Level III pane render
+            // dispatches them (`try_spawn_level3_render`).
+            LoopFrameData::Products(products) => {
+                let first = products.first()?;
+                Some(rustdar_source::job::DescribedJob::new(
+                    crate::jobs::Level3Job {
+                        bytes: Arc::clone(&first.bytes),
+                        product: ctx.product,
+                        radar_lat: ctx.lat,
+                        radar_lon: ctx.lon,
+                    },
+                ))
+            }
+        }
     }
 
     /// Whether frame `ts`'s data question has been *answered* — the volume is

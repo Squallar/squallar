@@ -185,33 +185,28 @@ fn both_dispatch_paths_classify_against_this_volumes_melting_layer_and_no_other(
         None,
     );
 
+    // The loop dispatch reads this frame's volume out of the loop cache, so the
+    // fixture is seeded there rather than handed to the spawn.
+    app.loop_mgr.cache_scan(
+        SITE,
+        volume(0),
+        (std::sync::Arc::new(dual_pol_scan()), Default::default()),
+    );
+    app.loop_mgr.cache_scan(
+        SITE,
+        volume(6),
+        (std::sync::Arc::new(dual_pol_scan()), Default::default()),
+    );
+
     // 2.
     assert!(
-        app.spawn_loop_frame_render(
-            0,
-            volume(0),
-            rustdar_radar::loop_downloads::LoopFrameData::Volume(
-                std::sync::Arc::new(dual_pol_scan()),
-                Default::default(),
-            ),
-            params(),
-            target(),
-        ),
+        app.spawn_loop_frame_render(0, volume(0), params(), target()),
         "the fixture must actually reach the loop dispatch",
     );
 
     // 3.
     assert!(
-        app.spawn_loop_frame_render(
-            0,
-            volume(6),
-            rustdar_radar::loop_downloads::LoopFrameData::Volume(
-                std::sync::Arc::new(dual_pol_scan()),
-                Default::default(),
-            ),
-            params(),
-            target(),
-        ),
+        app.spawn_loop_frame_render(0, volume(6), params(), target()),
         "the fixture must actually reach the loop dispatch",
     );
 
@@ -344,33 +339,28 @@ fn both_dispatch_paths_shift_by_this_volumes_storm_motion_and_no_other() {
         None,
     );
 
+    // The loop dispatch reads this frame's volume out of the loop cache, so the
+    // fixture is seeded there rather than handed to the spawn.
+    app.loop_mgr.cache_scan(
+        SITE,
+        volume(0),
+        (std::sync::Arc::new(dual_pol_scan()), Default::default()),
+    );
+    app.loop_mgr.cache_scan(
+        SITE,
+        volume(6),
+        (std::sync::Arc::new(dual_pol_scan()), Default::default()),
+    );
+
     // 2.
     assert!(
-        app.spawn_loop_frame_render(
-            0,
-            volume(0),
-            rustdar_radar::loop_downloads::LoopFrameData::Volume(
-                std::sync::Arc::new(dual_pol_scan()),
-                Default::default(),
-            ),
-            params(),
-            target(),
-        ),
+        app.spawn_loop_frame_render(0, volume(0), params(), target()),
         "the fixture must actually reach the loop dispatch",
     );
 
     // 3.
     assert!(
-        app.spawn_loop_frame_render(
-            0,
-            volume(6),
-            rustdar_radar::loop_downloads::LoopFrameData::Volume(
-                std::sync::Arc::new(dual_pol_scan()),
-                Default::default(),
-            ),
-            params(),
-            target(),
-        ),
+        app.spawn_loop_frame_render(0, volume(6), params(), target()),
         "the fixture must actually reach the loop dispatch",
     );
 

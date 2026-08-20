@@ -3284,6 +3284,164 @@ fn a_listing_that_arrives_on_the_source_path_builds_the_loop_waiting_for_it() {
     );
 }
 
+/// **A task is built against the site the pane is on NOW.**
+///
+/// `with_layer_pane` hydrates before it hands the view over, and this is the
+/// property that hydrate carries: `set_site` is a side-effect-free assignment
+/// by its own written contract, so what publishes a pane's selection into the
+/// slot a handler reads it from is the hydrate and nothing else. Without it a
+/// task is built against whatever site the pane's config last named — the
+/// load-time site for the whole session.
+///
+/// Registered as unpinned by WO-M12b (its tamper stayed green because
+/// `Gui::across_panes` hydrates every visible pane on the ARRIVAL path); this
+/// is the dispatch path, where nothing else hydrates first.
+#[test]
+fn a_task_is_built_against_the_site_the_pane_is_on_now() {
+    let mut app = n_pane_app(1, "KTLX");
+    app.gui
+        .pane_mut(0)
+        .expect("the fixture built one pane")
+        .set_site("KOUN".to_string());
+
+    let named = app
+        .with_layer_pane(0, &rustdar_source::id::known::RADAR, |_, pane_ref| {
+            pane_ref
+                .config
+                .get("site")
+                .and_then(|site| site.as_str())
+                .map(str::to_owned)
+        })
+        .expect("pane 0 is in the layout");
+
+    assert_eq!(
+        named.as_deref(),
+        Some("KOUN"),
+        "the layer was handed the site the pane carried when its config was \
+         loaded, not the site it is on now",
+    );
+}
+
+/// **A pane the layout is not showing is hydrated too, before its frames are
+/// read.**
+///
+/// `accept_loop_scan_listings` walks EVERY pane; `Gui::across_panes` — which
+/// hydrates on the arrival path — walks only the visible ones, and shrinking
+/// the layout does not drop the panes above the count. So a hidden pane that
+/// is still looping reaches this walk unhydrated, and the hydrate inside it is
+/// the only thing that publishes its site before `list_frames` is scoped to
+/// it.
+///
+/// This is the second of WO-M12b's two green-tamper findings, pinned rather
+/// than deleted: the redundancy it reported holds for visible panes only.
+#[test]
+fn a_hidden_panes_loop_is_still_built_from_the_site_it_is_on_now() {
+    use rustdar_overlays::render::overlay_state::SourceEvent;
+    use rustdar_source::time::{FrameListing, FrameStamp};
+
+    /// Built here rather than looked up: a process-global site table makes a
+    /// test mean one thing alone and another beside its neighbours.
+    const KOUN: rustdar_radar::sites::RadarSite = rustdar_radar::sites::RadarSite {
+        name: "KOUN",
+        lat: 35.23,
+        lon: -97.46,
+        heights: None,
+    };
+    fn at(minute: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            + chrono::Duration::minutes(i64::from(minute))
+    }
+
+    let mut app = n_pane_app(2, "KTLX");
+    // The layout shrinks; the pane does not go away. Neither `set_pane_count`
+    // nor a config load ever shortens the vector, which is what puts pane 1
+    // outside every visible walk and inside this one.
+    {
+        use rustdar_egui::UI_CONFIG_KEY;
+        use rustdar_kv::KvStore;
+        let store = MemoryKvStore::default();
+        store
+            .store(UI_CONFIG_KEY, r#"{"pane_count":1,"site":"KTLX"}"#)
+            .expect("the memory store always accepts a write");
+        assert!(
+            app.gui.load_ui_config(&store),
+            "the one-pane layout did not parse"
+        );
+    }
+    assert_eq!(
+        app.gui.pane_count(),
+        1,
+        "precondition: the layout must be showing one pane",
+    );
+    assert!(
+        app.gui.pane_mut(1).is_some(),
+        "precondition: the pane above the count must still be in the vector, \
+         or this test is about nothing",
+    );
+
+    let span_secs = 600u64;
+    let range = (at(0) - chrono::Duration::seconds(span_secs as i64), at(0));
+    let pane = app.gui.pane_mut(1).expect("the fixture built two panes");
+    pane.set_site("KOUN".to_string());
+    pane.scan_info = Some(scan_info_for("KOUN"));
+    *pane.loop_state_mut() = rustdar_egui::radar_layer::begin_loop(
+        span_secs,
+        &KOUN,
+        rustdar_radar::types::RenderView::PlanView,
+    );
+    assert_eq!(
+        pane.loop_state().phase,
+        rustdar_egui::pane::LoopPhase::FetchingScanList,
+        "precondition: the hidden pane must be waiting on a listing",
+    );
+
+    let scans = vec![(
+        at(0),
+        rustdar_radar::archive::Identifier::new("KOUN-00".to_string()),
+    )];
+    app.channels
+        .overlay_fetch_sender
+        .send(SourceEvent::Frames {
+            id: rustdar_source::id::known::RADAR,
+            listing: FrameListing {
+                range,
+                frames: vec![FrameStamp {
+                    valid: at(0),
+                    run: None,
+                }],
+                complete: true,
+            },
+            scope: Box::new(rustdar_radar::source::RadarListing {
+                site: "KOUN".to_string(),
+                range,
+                scans,
+            }),
+        })
+        .expect("the receiver is alive");
+
+    app.poll_overlay_fetch_results();
+    app.accept_loop_scan_listings();
+
+    let loop_state = app
+        .gui
+        .pane(1)
+        .expect("the fixture built two panes")
+        .loop_state();
+    assert_eq!(
+        loop_state
+            .frames
+            .iter()
+            .map(|frame| frame.timestamp)
+            .collect::<Vec<_>>(),
+        vec![at(0)],
+        "the hidden pane's loop was scoped to a site it is no longer on, so \
+         its own listing answered nothing",
+    );
+}
+
 /// **A listing for one site does not build a loop a second pane is running on
 /// another** — the fixed bug, at the seam where the arrival names no pane.
 #[test]

@@ -128,17 +128,21 @@ fn a_loop_frame_is_dispatched_leaner_than_the_still_frame_beside_it() {
         lon: site.lon,
     };
 
+    let frame_time = chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap();
+    // The loop dispatch reads this frame's volume out of the loop cache, so the
+    // fixture is seeded there rather than handed to the spawn.
+    app.loop_mgr.cache_scan(
+        SITE,
+        frame_time,
+        (std::sync::Arc::new(sample_scan()), Default::default()),
+    );
     assert!(
         app.spawn_loop_frame_render(
             0,
-            chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
-                .unwrap()
-                .and_hms_opt(0, 0, 0)
-                .unwrap(),
-            rustdar_radar::loop_downloads::LoopFrameData::Volume(
-                std::sync::Arc::new(sample_scan()),
-                Default::default(),
-            ),
+            frame_time,
             params(),
             test_keys::key(SITE, RadarProduct::Reflectivity, 0.5),
         ),

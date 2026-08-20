@@ -1281,7 +1281,6 @@ impl super::App {
         &self,
         pane_idx: usize,
         timestamp: NaiveDateTime,
-        data: rustdar_radar::loop_downloads::LoopFrameData,
         params: crate::render_dispatch::RenderParams,
         target: rustdar_egui::pane::RenderTarget,
     ) -> bool {
@@ -1306,87 +1305,53 @@ impl super::App {
         let sender = self.channels.loop_render_sender.clone();
         let window = self.window.clone();
 
-        let job = match data {
-            // The scan is reduced to the one sweep this frame draws before the job is
-            // dispatched.
-            rustdar_radar::loop_downloads::LoopFrameData::Volume(scan_data, declared) => {
-                // The storm motion override is read from the dispatcher for the same
-                // reason `spawn_level2_render` reads it there.
-                let storm_motion = (product
-                    == rustdar_radar::types::RadarProduct::StormRelativeVelocity)
-                    .then(|| self.render.storm_motion_override_kt())
-                    .flatten();
-                // The environmental heights ride the same way for the hail pair and the
-                // classification.
-                let env_heights = self.render.env_heights_km_msl_for(product, &target.site);
-                // The melting layer does **not** ride the same way, and the difference
-                // is `timestamp`.
-                let melting_layer =
-                    self.render
-                        .melting_layer_product_for(product, &target.site, timestamp);
-                // The RPG's storm motion is asked per frame for exactly the reason the
-                // melting layer is.
-                let rpg_storm_motion =
-                    self.render
-                        .rpg_storm_motion_for(product, &target.site, timestamp);
-                match rustdar_radar::render_input::RenderInput::extract(
-                    &scan_data,
-                    snapped,
-                    product,
-                    lat,
-                    lon,
-                    storm_motion,
-                    env_heights,
-                ) {
-                    Some(input) => {
-                        rustdar_worker::offload::Job::Described(
-                            rustdar_worker::offload::JobRequest::describe(
-                                rustdar_radar::jobs::RadarPlanJob {
-                                    // The same stamp the still frame takes, off this
-                                    // frame's own volume.
-                                    input: Box::new(
-                                        input
-                                            .with_declared_nyquist(&declared)
-                                            .with_srv_fallback(self.render.srv_fallback())
-                                            .with_melting_layer_product(melting_layer)
-                                            .with_rpg_storm_motion(rpg_storm_motion),
-                                    ),
-                                    // Loop frames store an empty value grid.
-                                    values_wanted: false,
-                                },
-                                // The same policy in the other dimension.
-                                rustdar_worker::offload::ceiling_only_geometry(
-                                    rustdar_device_profile::constants::LOOP_IMAGE_SIZE as u32,
-                                ),
-                            ),
-                        )
-                    }
-                    None => rustdar_worker::offload::Job::renders_nothing(),
-                }
+        // The storm motion override is read from the dispatcher for the same
+        // reason `spawn_level2_render` reads it there.
+        let storm_motion = (product == rustdar_radar::types::RadarProduct::StormRelativeVelocity)
+            .then(|| self.render.storm_motion_override_kt())
+            .flatten();
+        // The environmental heights ride the same way for the hail pair and the
+        // classification.
+        let env_heights = self.render.env_heights_km_msl_for(product, &target.site);
+        // The melting layer does **not** ride the same way, and the difference
+        // is `timestamp`.
+        let melting_layer = self
+            .render
+            .melting_layer_product_for(product, &target.site, timestamp);
+        // The RPG's storm motion is asked per frame for exactly the reason the
+        // melting layer is.
+        let rpg_storm_motion = self
+            .render
+            .rpg_storm_motion_for(product, &target.site, timestamp);
+        let ctx = rustdar_radar::loop_downloads::LoopRenderContext {
+            product,
+            elevation: snapped,
+            lat,
+            lon,
+            storm_motion,
+            env_heights,
+            srv_fallback: self.render.srv_fallback(),
+            melting_layer,
+            rpg_storm_motion,
+        };
+        // Which job input this frame's data makes is radar's answer, not this
+        // crate's: the described job crosses back with its input type erased and
+        // is dispatched here without either arm being named.
+        let job = match self
+            .loop_mgr
+            .frame_render_job(&target.site, &timestamp, &ctx)
+        {
+            Some(described) => {
+                rustdar_worker::offload::Job::Described(rustdar_worker::offload::JobRequest {
+                    job: described,
+                    // A loop frame, so the loop size — the one envelope both
+                    // radar frame rows take.
+                    geometry: rustdar_worker::offload::ceiling_only_geometry(
+                        rustdar_device_profile::constants::LOOP_IMAGE_SIZE as u32,
+                    ),
+                })
             }
-            // The object's *bytes*, exactly as the static Level III pane render
-            // dispatches them (`try_spawn_level3_render`).
-            rustdar_radar::loop_downloads::LoopFrameData::Products(products) => {
-                match products.first() {
-                    Some(first) => {
-                        rustdar_worker::offload::Job::Described(
-                            rustdar_worker::offload::JobRequest::describe(
-                                rustdar_radar::jobs::Level3Job {
-                                    bytes: std::sync::Arc::clone(&first.bytes),
-                                    product,
-                                    radar_lat: lat,
-                                    radar_lon: lon,
-                                },
-                                // A loop frame, so the loop size — see the Level II arm.
-                                rustdar_worker::offload::ceiling_only_geometry(
-                                    rustdar_device_profile::constants::LOOP_IMAGE_SIZE as u32,
-                                ),
-                            ),
-                        )
-                    }
-                    None => rustdar_worker::offload::Job::renders_nothing(),
-                }
-            }
+            None => rustdar_worker::offload::Job::renders_nothing(),
         };
         rustdar_worker::offload::offload_job("loop-render", job, move |output| {
             let _guard = guard;
