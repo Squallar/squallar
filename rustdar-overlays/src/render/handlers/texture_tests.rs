@@ -606,7 +606,7 @@ fn an_outlook_day_with_no_ticked_products_has_no_data_to_draw() {
         "fixture: Day 1 Categorical is both ticked and fetched",
     );
 
-    handler.selected_day = OutlookDay::Day5;
+    handler.defaults.selected_day = OutlookDay::Day5;
     assert!(
         !OutlookDay::Day5
             .products()

@@ -6,7 +6,7 @@ use rustdar_egui::overlay_cache::OverlayTexturePlan;
 use rustdar_geo::GeoBounds;
 use rustdar_overlays::render::overlay_state::OverlayFetchResult;
 use rustdar_overlays::render::rasterize::HitCells;
-use rustdar_source::handler::{PaneMut, PaneRef};
+use rustdar_source::handler::PaneRef;
 use rustdar_source::id::{LayerId, known};
 use std::sync::{Arc, Mutex};
 
@@ -85,6 +85,20 @@ fn a_render_request() -> super::OverlayRenderRequest {
     }
 }
 
+/// Turn `id` on **in pane 0's own state**, the door a layer toggle takes.
+///
+/// Not `overlays.set_enabled(.., PaneMut::bare(0))`: a converted handler keeps
+/// "on" in the pane, and a write to the registry alone is one
+/// `adopt_handler_state` away from being undone.
+fn enable_on_pane0(app: &mut crate::app::App, id: &LayerId) {
+    let mut registry = std::mem::take(&mut app.gui.overlays);
+    if let Some(pane) = app.gui.pane_mut(0) {
+        pane.hydrate_layer_states(&registry, 0);
+        pane.set_layer_enabled(&mut registry, 0, id, true);
+    }
+    app.gui.overlays = registry;
+}
+
 fn seed(app: &mut crate::app::App, id: &LayerId) {
     use rustdar_overlays::render::handlers::reports::StormReportsFetchResult;
     let data: rustdar_overlays::render::overlay_state::FetchPayload = match id {
@@ -101,9 +115,7 @@ fn seed(app: &mut crate::app::App, id: &LayerId) {
                 lon,
                 comments: String::new(),
             };
-            app.gui
-                .overlays
-                .set_enabled(id, true, &mut PaneMut::bare(0));
+            enable_on_pane0(app, id);
             Box::new(StormReportsFetchResult(Ok(StormReportRound {
                 reports: vec![
                     report(StormReportKind::Tornado, 34.0, -98.2),
@@ -129,9 +141,7 @@ fn seed(app: &mut crate::app::App, id: &LayerId) {
                 satellite: GlmSatellite::GoesEast,
                 level: GlmDataLevel::Flash,
             };
-            app.gui
-                .overlays
-                .set_enabled(id, true, &mut PaneMut::bare(0));
+            enable_on_pane0(app, id);
             Box::new(GlmFetchResult(Ok(GlmFetchOutcome {
                 flashes: vec![flash(10, 34.0, -98.2), flash(20, 36.2, -96.8)],
                 dead_feeds: Vec::new(),
