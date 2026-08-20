@@ -1351,9 +1351,13 @@ fn volume_pane_outcome(
         floor,
         source: source_geo,
         mirror_size_points: [mirror_size_points.x, mirror_size_points.y],
-        alpha: alpha_curves.get(&crate::field_facts::facts(&product).id),
+        // WO-M14a: keyed by the pane's OWN field id. WO-E9c wrote this as a
+        // product -> id bridge and E9e re-typed the selection to an id, which
+        // left a FieldId -> spec -> FieldId round trip whose only effect was
+        // to substitute the default field's key for an unregistered one.
+        alpha: alpha_curves.get(&product),
         view_mode,
-        iso_threshold: iso_thresholds.get(&crate::field_facts::facts(&product).id),
+        iso_threshold: iso_thresholds.get(&product),
     }) {
         VolumePaint::Callback { payload, showing } => {
             ui.painter()

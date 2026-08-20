@@ -729,7 +729,7 @@ fn only_sentence_shaped_names_are_treated_as_citations() {
         "render_gate",
         // Types and constants are not tests.
         "EARTH_RADIUS_KM",
-        "VoxelGrid",
+        "VolumeGrid",
         "RenderInput",
         // Prose in backticks is not an identifier.
         "a real sentence about a test",

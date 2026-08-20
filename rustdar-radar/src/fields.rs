@@ -8,7 +8,7 @@
 //! [`crate::palette`]'s built-once colour scales). Nothing here is a fact this
 //! crate does not already state somewhere else.
 //!
-//! **The wire code deliberately does not cross.** `VoxelGrid::to_bytes` writes
+//! **The wire code deliberately does not cross.** `voxel::to_bytes` writes
 //! `product.wire_code()` as a `u16` at byte offset 6, so the `FieldId` ↔ wire
 //! code map has to stay private to this crate: a consumer that could read it
 //! could pin a byte layout it does not own.

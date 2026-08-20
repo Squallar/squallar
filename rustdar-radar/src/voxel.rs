@@ -8,30 +8,19 @@ use crate::sampler::{Column, VolumeSampler};
 use crate::types::{MomentSlot, RadarProduct};
 use std::sync::LazyLock;
 
-/// The palette index meaning "the radar did not measure anything here", and
-/// simultaneously the bottom of the affine value ramp.
-pub const NO_DATA_INDEX: u8 = 0;
-
-/// Bytes in [`VoxelGrid::lut`]: 256 entries × RGBA.
-pub const LUT_LEN: usize = 256 * 4;
-
-/// The alpha at or under which a table entry counts as see-through for
-/// [`VoxelGrid::see_through_indices`] — a quarter opacity.
-pub const SEE_THROUGH_ALPHA_CEILING: u8 = 64;
-
-/// The largest any axis may be for the wire and the arithmetic — the largest `n` with
-/// `n³ ≤ u32::MAX`, since [`VoxelShape::cells`] multiplies three untrusted `u32`s and
-/// `usize` is 32 bits on wasm32.
-pub const MAX_AXIS: usize = largest_cubable_axis();
-
-/// The largest `n` with `n³ ≤ u32::MAX`.
-const fn largest_cubable_axis() -> usize {
-    let mut n: u64 = 1;
-    while (n + 1) * (n + 1) * (n + 1) <= u32::MAX as u64 {
-        n += 1;
-    }
-    n as usize
-}
+/// The output shape itself lives in the substrate, so a consumer can read a
+/// volume without naming the crate that resampled it. Re-exported here — as
+/// `palette` re-exports `LegendScale` — so no consumer spelling had to move
+/// and no consumer needed a new dependency.
+///
+/// `VoxelShape` is this crate's own name for the substrate's `VolumeDims`:
+/// [`VoxelRequest`] asks in it, the device profile answers in it, and the two
+/// are ONE type, not two.
+pub use rustdar_source::volume::{
+    IsoShape, LUT_LEN, LutFilter, MAX_AXIS, NO_DATA_INDEX, SEE_THROUGH_ALPHA_CEILING,
+    TransferTable, VolumeDims as VoxelShape, VolumeGrid, VolumeParts, axis_centre, ramp_index,
+    ramp_value,
+};
 
 /// Narrowest half-extent a request may ask for on either axis, km.
 pub const MIN_HALF_WIDTH_KM: f64 = 10.0;
@@ -242,29 +231,6 @@ pub fn default_shape(max_axis: usize) -> VoxelShape {
     shape_for_budget(default_shape_for(false), max_axis)
 }
 
-/// How many cells a grid has along each axis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct VoxelShape {
-    pub nx: usize,
-    pub ny: usize,
-    pub nz: usize,
-}
-
-impl VoxelShape {
-    /// Total cells — the length of [`VoxelGrid::indices`].
-    pub const fn cells(self) -> usize {
-        self.nx * self.ny * self.nz
-    }
-
-    /// Whether every axis is between 1 and [`MAX_AXIS`] inclusive.
-    pub const fn is_supported(self) -> bool {
-        const fn ok(n: usize) -> bool {
-            n >= 1 && n <= MAX_AXIS
-        }
-        ok(self.nx) && ok(self.ny) && ok(self.nz)
-    }
-}
-
 /// What to resample, over what box.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VoxelRequest {
@@ -284,290 +250,6 @@ pub struct VoxelRequest {
     pub shape: VoxelShape,
     /// Whether to also keep the values in their own units.
     pub values_wanted: bool,
-}
-
-/// How the colour table itself must be sampled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LutFilter {
-    /// The product's scale interpolates between stops, so the table may be
-    /// interpolated too.
-    Linear,
-    /// The product's scale steps.
-    Nearest,
-}
-
-/// A resampled Cartesian volume, ready to become one 3D texture and one 1D
-/// colour table.
-#[derive(Clone)]
-pub struct VoxelGrid {
-    indices: Vec<u8>,
-    values: Option<Vec<f32>>,
-    lut: Vec<u8>,
-    shape: VoxelShape,
-    x_range_km: (f64, f64),
-    y_range_km: (f64, f64),
-    z_range_km_msl: (f64, f64),
-    site: (f64, f64),
-    value_range: (f32, f32),
-    /// Kept so [`VoxelGrid::lut_filter`] and [`VoxelGrid::wraps`] can be
-    /// derived rather than stored alongside it.
-    product: RadarProduct,
-    tilt_count: usize,
-    widest_tilt_gap_deg: f64,
-}
-
-/// One line, never the grid.
-impl std::fmt::Debug for VoxelGrid {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let filled = self.indices.iter().filter(|&&i| i != NO_DATA_INDEX).count();
-        write!(
-            f,
-            "{} {}x{}x{} x{:?} y{:?} z{:?} km msl, site {:?}, range {:?}, \
-             {} rungs (widest gap {:.2}°), {filled}/{} cells with data, \
-             values {}",
-            self.product.code(),
-            self.shape.nx,
-            self.shape.ny,
-            self.shape.nz,
-            self.x_range_km,
-            self.y_range_km,
-            self.z_range_km_msl,
-            self.site,
-            self.value_range,
-            self.tilt_count,
-            self.widest_tilt_gap_deg,
-            self.indices.len(),
-            if self.values.is_some() {
-                "kept"
-            } else {
-                "dropped"
-            },
-        )
-    }
-}
-
-/// Equality that compares the value plane **bitwise**.
-impl PartialEq for VoxelGrid {
-    fn eq(&self, other: &Self) -> bool {
-        fn same_values(a: Option<&Vec<f32>>, b: Option<&Vec<f32>>) -> bool {
-            match (a, b) {
-                (None, None) => true,
-                (Some(a), Some(b)) => {
-                    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
-                }
-                _ => false,
-            }
-        }
-        self.shape == other.shape
-            && self.product == other.product
-            && self.tilt_count == other.tilt_count
-            && self.widest_tilt_gap_deg == other.widest_tilt_gap_deg
-            && self.x_range_km == other.x_range_km
-            && self.y_range_km == other.y_range_km
-            && self.z_range_km_msl == other.z_range_km_msl
-            && self.site == other.site
-            && self.value_range == other.value_range
-            && self.indices == other.indices
-            && self.lut == other.lut
-            && same_values(self.values.as_ref(), other.values.as_ref())
-    }
-}
-
-impl VoxelGrid {
-    /// One palette index per cell, `nx·ny·nz` of them, ordered `z·(ny·nx) + y·nx + x`.
-    pub fn indices(&self) -> &[u8] {
-        &self.indices
-    }
-
-    /// The same cells in the product's own units, `NaN` wherever
-    /// [`indices`](Self::indices) holds [`NO_DATA_INDEX`].
-    pub fn values(&self) -> Option<&[f32]> {
-        self.values.as_deref()
-    }
-
-    /// Exactly [`LUT_LEN`] bytes: 256 RGBA entries, entry `i` the colour of index `i`.
-    pub fn lut(&self) -> &[u8] {
-        &self.lut
-    }
-
-    pub fn shape(&self) -> VoxelShape {
-        self.shape
-    }
-
-    /// Km east of the site at the box's west and east faces.
-    pub fn x_range_km(&self) -> (f64, f64) {
-        self.x_range_km
-    }
-
-    /// Km north of the site at the box's south and north faces.
-    pub fn y_range_km(&self) -> (f64, f64) {
-        self.y_range_km
-    }
-
-    /// Km MSL at the box's bottom and top faces.
-    pub fn z_range_km_msl(&self) -> (f64, f64) {
-        self.z_range_km_msl
-    }
-
-    /// The radar's `(latitude, longitude)` — the origin the `x`/`y` ranges are
-    /// measured from.
-    pub fn site(&self) -> (f64, f64) {
-        self.site
-    }
-
-    /// The values index 0 and index 255 stand for.
-    pub fn value_range(&self) -> (f32, f32) {
-        self.value_range
-    }
-
-    pub fn product(&self) -> RadarProduct {
-        self.product
-    }
-
-    /// How many rungs the tilt ladder had when this grid was resampled.
-    pub fn tilt_count(&self) -> usize {
-        self.tilt_count
-    }
-
-    /// The largest angular step between adjacent rungs, degrees — `0.0` for a single-
-    /// rung ladder.
-    pub fn widest_tilt_gap_deg(&self) -> f64 {
-        self.widest_tilt_gap_deg
-    }
-
-    /// How [`lut`](Self::lut) must be sampled.
-    pub fn lut_filter(&self) -> LutFilter {
-        if get_legend_scale(self.product).is_gradient {
-            LutFilter::Linear
-        } else {
-            LutFilter::Nearest
-        }
-    }
-
-    /// Whether the moment is circular, so that the two ends of the ramp are the
-    /// same physical value and a linear filter across the seam returns the
-    /// opposite phase rather than a blend. True only for differential phase.
-    pub fn wraps(&self) -> bool {
-        self.product == RadarProduct::DifferentialPhase
-    }
-
-    /// The value index `i` stands for.
-    pub fn index_to_value(&self, index: u8) -> f32 {
-        ramp_value(self.value_range, index)
-    }
-
-    /// The index a value encodes to.
-    pub fn value_to_index(&self, value: f32) -> u8 {
-        ramp_index(self.value_range, value)
-    }
-
-    /// How many indices above [`NO_DATA_INDEX`] the table is still fully
-    /// transparent — the width, in index steps, of the band a `Linear` fetch
-    /// fades through when it straddles an echo edge.
-    pub fn fade_band(&self) -> u8 {
-        match self.lut.chunks_exact(4).position(|entry| entry[3] != 0) {
-            // Entry 0 is forced transparent, so the band under the first
-            // opaque entry is `n − 1` wide.
-            Some(n) => n.saturating_sub(1) as u8,
-            // No opaque entry anywhere: the whole ramp fades.
-            None => u8::MAX,
-        }
-    }
-
-    /// How many of the 255 **data** entries are see-through — at or under
-    /// [`SEE_THROUGH_ALPHA_CEILING`] — wherever they sit on the ramp.
-    pub fn see_through_indices(&self) -> u16 {
-        self.lut
-            .chunks_exact(4)
-            .skip(1)
-            .filter(|entry| entry[3] <= SEE_THROUGH_ALPHA_CEILING)
-            .count() as u16
-    }
-
-    /// The isosurface uniform pair `(centre, threshold)` for a user-facing
-    /// threshold in the product's own units, both in the shader's 0-1 index
-    /// space.
-    pub fn iso_uniform_params(&self, user_threshold: f32) -> (f32, f32) {
-        let user = if user_threshold.is_finite() {
-            user_threshold
-        } else {
-            default_iso_threshold(self.product)
-        };
-        let norm = |index: u8| f32::from(index) / 255.0;
-        match iso_shape(self.product) {
-            IsoShape::Sequential => (-1.0, norm(self.value_to_index(user))),
-            IsoShape::DeviationFrom { centre } => {
-                let c = self.value_to_index(centre);
-                let at = self.value_to_index(centre + user.abs());
-                (norm(c), norm(at.saturating_sub(c).max(1)))
-            }
-            IsoShape::AtOrBelow => {
-                let top = 255u8;
-                let at = self.value_to_index(user);
-                (norm(top), norm(top.saturating_sub(at).max(1)))
-            }
-        }
-    }
-
-    /// The offset of cell `(x, y, z)` in [`indices`](Self::indices) and
-    /// [`values`](Self::values). `None` outside the grid.
-    pub fn cell_offset(&self, x: usize, y: usize, z: usize) -> Option<usize> {
-        (x < self.shape.nx && y < self.shape.ny && z < self.shape.nz)
-            .then(|| z * self.shape.ny * self.shape.nx + y * self.shape.nx + x)
-    }
-
-    /// The index at cell `(x, y, z)`, or `None` outside the grid.
-    pub fn index_at(&self, x: usize, y: usize, z: usize) -> Option<u8> {
-        self.cell_offset(x, y, z).map(|o| self.indices[o])
-    }
-
-    /// The value at cell `(x, y, z)`, or `None` outside the grid or with no
-    /// value plane. `Some(NaN)` where there is no data.
-    pub fn value_at(&self, x: usize, y: usize, z: usize) -> Option<f32> {
-        let o = self.cell_offset(x, y, z)?;
-        self.values.as_ref().map(|v| v[o])
-    }
-
-    /// The centre of cell `(x, y, z)` as `(km east, km north, km MSL)`, all relative to
-    /// [`site`](Self::site) except the last which is MSL.
-    pub fn cell_centre_km(&self, x: usize, y: usize, z: usize) -> Option<(f64, f64, f64)> {
-        self.cell_offset(x, y, z)?;
-        Some((
-            axis_centre(self.x_range_km, self.shape.nx, x),
-            axis_centre(self.y_range_km, self.shape.ny, y),
-            axis_centre(self.z_range_km_msl, self.shape.nz, z),
-        ))
-    }
-
-    /// Bytes this grid holds: index plane, value plane if present, and table.
-    pub fn memory_bytes(&self) -> usize {
-        self.indices.len() + self.values.as_ref().map_or(0, |v| v.len() * 4) + self.lut.len()
-    }
-}
-
-/// The centre of cell `i` on an axis spanning `range` in `n` cells.
-fn axis_centre(range: (f64, f64), n: usize, i: usize) -> f64 {
-    range.0 + (i as f64 + 0.5) * (range.1 - range.0) / n as f64
-}
-
-/// The value palette index `i` stands for, affine over the whole 0..=255.
-fn ramp_value(range: (f32, f32), index: u8) -> f32 {
-    let (lo, hi) = range;
-    lo + (hi - lo) * (f32::from(index) / 255.0)
-}
-
-/// The inverse, clamped to `1..=255` so no finite measurement encodes as
-/// [`NO_DATA_INDEX`].
-fn ramp_index(range: (f32, f32), value: f32) -> u8 {
-    if !value.is_finite() {
-        return NO_DATA_INDEX;
-    }
-    let (lo, hi) = (f64::from(range.0), f64::from(range.1));
-    let step = (f64::from(value) - lo) / (hi - lo) * 255.0;
-    if !step.is_finite() {
-        return NO_DATA_INDEX;
-    }
-    step.round().clamp(1.0, 255.0) as u8
 }
 
 /// The bottom and top **data** levels of a moment: the values index 1 and
@@ -679,21 +361,6 @@ mod volume_alpha_profile {
 fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
     let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
-}
-
-/// How a product's isosurface threshold reads its scale — the per-product
-/// twin of the transparency profile above, for the other view mode.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum IsoShape {
-    /// The surface of `value >= threshold`: the sequential products, whose
-    /// interesting side is up-scale.
-    Sequential,
-    /// The surface of `|value − centre| >= threshold`: the diverging products,
-    /// whose interesting surfaces sit on both sides of their background.
-    DeviationFrom { centre: f32 },
-    /// The surface of `value <= threshold`: ρHV, whose background is the top of
-    /// its scale. Implemented as a deviation from the ramp top.
-    AtOrBelow,
 }
 
 /// The isosurface shape per product.
@@ -853,7 +520,7 @@ struct VoxelRow<'grid> {
 
 /// A box of `half` about `centre`, as `(x_range_km, y_range_km)` —
 /// kilometres east and north of the radar, which is the frame
-/// [`VoxelGrid::x_range_km`] and [`VoxelGrid::y_range_km`] report in.
+/// [`VolumeGrid::x_range_km`] and [`VolumeGrid::y_range_km`] report in.
 ///
 /// The extent is taken as already decided and already clamped through
 /// [`HalfExtentKm::clamped`]. This is the one definition, because the
@@ -893,7 +560,7 @@ pub fn build_voxels<'a>(
     req: &VoxelRequest,
     lat: f64,
     lon: f64,
-) -> Option<VoxelGrid> {
+) -> Option<VolumeGrid> {
     build_voxels_with_motion(volume, req, lat, lon, crate::srv::MotionInputs::default())
 }
 
@@ -906,7 +573,7 @@ pub fn build_voxels_with_motion<'a>(
     lat: f64,
     lon: f64,
     motion: crate::srv::MotionInputs,
-) -> Option<VoxelGrid> {
+) -> Option<VolumeGrid> {
     let volume = volume.into();
     let shape = req.shape;
     if !shape.is_supported() {
@@ -975,8 +642,7 @@ pub fn build_voxels_with_motion<'a>(
         .unwrap_or(0.0)
         * 0.0003048;
 
-    let value_range = value_range_for_product(req.product, slot);
-    let lut = volume_lut_static(req.product)?.to_vec();
+    let transfer = transfer_table_for(req.product, slot)?;
 
     let (nx, ny, nz) = (shape.nx, shape.ny, shape.nz);
     let cells = shape.cells();
@@ -1030,7 +696,7 @@ pub fn build_voxels_with_motion<'a>(
                 else {
                     continue;
                 };
-                row.indices[iz][ix] = ramp_index(value_range, value);
+                row.indices[iz][ix] = transfer.value_to_index(value);
                 if let Some(plane_cells) = row.values.get_mut(iz) {
                     plane_cells[ix] = value;
                 }
@@ -1038,20 +704,58 @@ pub fn build_voxels_with_motion<'a>(
         }
     });
 
-    Some(VoxelGrid {
+    Some(VolumeGrid::from_parts(VolumeParts {
         indices,
         values,
-        lut,
-        shape,
+        dims: shape,
+        anchor: (lat, lon),
         x_range_km,
         y_range_km,
         z_range_km_msl,
-        site: (lat, lon),
+        field: crate::fields::spec(req.product).id.clone(),
+        transfer,
+        levels: sampler.tilt_count(),
+        widest_level_gap_deg: sampler.widest_tilt_gap_deg(),
+    }))
+}
+
+/// The transfer table for `product`, built ONCE here and stored on the grid.
+///
+/// **One definition, two callers**: the builder bakes it, and the wire decoder
+/// rebuilds it from the same two statics the payload is checked against. A
+/// second spelling would let a decoded grid disagree with the grid it decoded
+/// from about how its own indices become colour.
+fn transfer_table_for(product: RadarProduct, slot: MomentSlot) -> Option<TransferTable> {
+    Some(transfer_table_over(
+        volume_lut_static(product)?.to_vec(),
+        product,
+        value_range_for_product(product, slot),
+    ))
+}
+
+/// [`transfer_table_for`] over a table and ramp the caller already holds — the
+/// decoder's arm, which keeps the bytes that arrived rather than the statics
+/// it just compared them against.
+fn transfer_table_over(
+    lut: Vec<u8>,
+    product: RadarProduct,
+    value_range: (f32, f32),
+) -> TransferTable {
+    TransferTable::new(
+        lut,
+        if get_legend_scale(product).is_gradient {
+            LutFilter::Linear
+        } else {
+            LutFilter::Nearest
+        },
+        // Circular: the two ends of the ramp are the same physical value, so a
+        // linear filter across the seam returns the opposite phase rather than
+        // a blend. True only for differential phase.
+        product == RadarProduct::DifferentialPhase,
         value_range,
-        product: req.product,
-        tilt_count: sampler.tilt_count(),
-        widest_tilt_gap_deg: sampler.widest_tilt_gap_deg(),
-    })
+        iso_shape(product),
+        default_iso_threshold(product),
+    )
 }
 
 // ── Codec ────────────────────────────────────────────────────────────────────
@@ -1067,174 +771,186 @@ const MAGIC: [u8; 4] = *b"RDVX";
 /// Bumped whenever the layout below changes.
 const FORMAT_VERSION: u16 = 1;
 
-impl VoxelGrid {
-    /// Encode for transport.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.encoded_len());
-        out.extend_from_slice(&MAGIC);
-        out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        out.extend_from_slice(&self.product.wire_code().to_le_bytes());
+/// Encode for transport, or `None` when this build has no wire code for the
+/// grid's field.
+///
+/// The FieldId <-> wire-code map is **private to this crate**: the payload
+/// names its moment as a `RadarProduct::wire_code`, and a grid carrying a
+/// field this build does not register has no code to write. Nothing in the
+/// tree can produce one — `build_voxels` takes the id from `fields::spec` —
+/// so this is a refusal rather than a panic: the impossible case stays
+/// checked for one branch, and the alternative is a payload that decodes
+/// into a different moment.
+pub fn to_bytes(grid: &VolumeGrid) -> Option<Vec<u8>> {
+    let product = crate::fields::product_for(grid.field())?;
+    let mut out = Vec::with_capacity(encoded_len(grid));
+    out.extend_from_slice(&MAGIC);
+    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&product.wire_code().to_le_bytes());
 
-        out.extend_from_slice(&(self.shape.nx as u32).to_le_bytes());
-        out.extend_from_slice(&(self.shape.ny as u32).to_le_bytes());
-        out.extend_from_slice(&(self.shape.nz as u32).to_le_bytes());
+    let dims = grid.dims();
+    out.extend_from_slice(&(dims.nx as u32).to_le_bytes());
+    out.extend_from_slice(&(dims.ny as u32).to_le_bytes());
+    out.extend_from_slice(&(dims.nz as u32).to_le_bytes());
 
-        for (lo, hi) in [self.x_range_km, self.y_range_km, self.z_range_km_msl] {
-            out.extend_from_slice(&lo.to_le_bytes());
-            out.extend_from_slice(&hi.to_le_bytes());
-        }
-        out.extend_from_slice(&self.site.0.to_le_bytes());
-        out.extend_from_slice(&self.site.1.to_le_bytes());
-        out.extend_from_slice(&self.value_range.0.to_le_bytes());
-        out.extend_from_slice(&self.value_range.1.to_le_bytes());
+    for (lo, hi) in [grid.x_range_km(), grid.y_range_km(), grid.z_range_km_msl()] {
+        out.extend_from_slice(&lo.to_le_bytes());
+        out.extend_from_slice(&hi.to_le_bytes());
+    }
+    let anchor = grid.anchor();
+    out.extend_from_slice(&anchor.0.to_le_bytes());
+    out.extend_from_slice(&anchor.1.to_le_bytes());
+    let value_range = grid.value_range();
+    out.extend_from_slice(&value_range.0.to_le_bytes());
+    out.extend_from_slice(&value_range.1.to_le_bytes());
 
-        // A `u32` for a `usize` field: the ladder has one rung per elevation
-        // flown, and the model numbers its cuts in a `u8`.
-        out.extend_from_slice(&(self.tilt_count as u32).to_le_bytes());
-        out.extend_from_slice(&self.widest_tilt_gap_deg.to_le_bytes());
+    // A `u32` for a `usize` field: the ladder has one rung per elevation
+    // flown, and the model numbers its cuts in a `u8`.
+    out.extend_from_slice(&(grid.levels() as u32).to_le_bytes());
+    out.extend_from_slice(&grid.widest_level_gap_deg().to_le_bytes());
 
-        out.extend_from_slice(&(self.lut.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.lut);
-        out.extend_from_slice(&(self.indices.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.indices);
-        match &self.values {
-            None => out.extend_from_slice(&0u32.to_le_bytes()),
-            Some(values) => {
-                out.extend_from_slice(&(values.len() as u32).to_le_bytes());
-                for value in values {
-                    out.extend_from_slice(&value.to_le_bytes());
-                }
+    out.extend_from_slice(&(grid.lut().len() as u32).to_le_bytes());
+    out.extend_from_slice(grid.lut());
+    out.extend_from_slice(&(grid.indices().len() as u32).to_le_bytes());
+    out.extend_from_slice(grid.indices());
+    match grid.values() {
+        None => out.extend_from_slice(&0u32.to_le_bytes()),
+        Some(values) => {
+            out.extend_from_slice(&(values.len() as u32).to_le_bytes());
+            for value in values {
+                out.extend_from_slice(&value.to_le_bytes());
             }
         }
-        out
+    }
+    Some(out)
+}
+
+/// Decode a payload [`to_bytes`] produced.
+pub fn from_bytes(bytes: &[u8]) -> Option<VolumeGrid> {
+    let mut r = Reader::new(bytes);
+    if r.take(4)? != MAGIC {
+        return None;
+    }
+    if r.u16()? != FORMAT_VERSION {
+        return None;
+    }
+    let product = RadarProduct::from_wire_code(r.u16()?)?;
+    // The same refusal `build_voxels` makes: a product with neither a
+    // native moment nor a derivation has no ramp its indices decode against.
+    let slot = crate::derive::volume_slot(product)?;
+
+    let dims = VoxelShape {
+        nx: r.u32()? as usize,
+        ny: r.u32()? as usize,
+        nz: r.u32()? as usize,
+    };
+    // Before `cells()`, which multiplies three untrusted numbers: with
+    // every axis at or under `MAX_AXIS` the product cannot overflow a
+    // 32-bit `usize`, and a zero axis would give a plane length of zero
+    // that every later check then agreed with.
+    if !dims.is_supported() {
+        return None;
+    }
+    let cells = dims.cells();
+
+    let x_range_km = (r.f64()?, r.f64()?);
+    let y_range_km = (r.f64()?, r.f64()?);
+    let z_range_km_msl = (r.f64()?, r.f64()?);
+    let anchor = (r.f64()?, r.f64()?);
+    let value_range = (r.f32()?, r.f32()?);
+    let levels = r.u32()? as usize;
+    let widest_level_gap_deg = r.f64()?;
+
+    // Every number that describes where the box is.
+    if ![
+        x_range_km.0,
+        x_range_km.1,
+        y_range_km.0,
+        y_range_km.1,
+        z_range_km_msl.0,
+        z_range_km_msl.1,
+        anchor.0,
+        anchor.1,
+        widest_level_gap_deg,
+    ]
+    .iter()
+    .all(|v| v.is_finite())
+        || !value_range.0.is_finite()
+        || !value_range.1.is_finite()
+    {
+        return None;
     }
 
-    /// Decode a payload [`to_bytes`](Self::to_bytes) produced.
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let mut r = Reader::new(bytes);
-        if r.take(4)? != MAGIC {
-            return None;
-        }
-        if r.u16()? != FORMAT_VERSION {
-            return None;
-        }
-        let product = RadarProduct::from_wire_code(r.u16()?)?;
-        // The same refusal `build_voxels` makes: a product with neither a
-        // native moment nor a derivation has no ramp its indices decode against.
-        let slot = crate::derive::volume_slot(product)?;
+    // `value_range` and the table are both functions of the product, so a payload
+    // states each twice and the copies can disagree without failing anything.
+    if value_range != value_range_for_product(product, slot) {
+        return None;
+    }
 
-        let shape = VoxelShape {
-            nx: r.u32()? as usize,
-            ny: r.u32()? as usize,
-            nz: r.u32()? as usize,
-        };
-        // Before `cells()`, which multiplies three untrusted numbers: with
-        // every axis at or under `MAX_AXIS` the product cannot overflow a
-        // 32-bit `usize`, and a zero axis would give a plane length of zero
-        // that every later check then agreed with.
-        if !shape.is_supported() {
-            return None;
-        }
-        let cells = shape.cells();
+    // One byte per element, so `take` is the bound: nothing is reserved on
+    // the claimed length.
+    let lut_len = r.u32()?;
+    let lut = r.take(lut_len as usize)?.to_vec();
+    if lut.len() != LUT_LEN || Some(lut.as_slice()) != volume_lut_static(product) {
+        return None;
+    }
+    let index_len = r.u32()?;
+    let indices = r.take(index_len as usize)?.to_vec();
+    if indices.len() != cells {
+        return None;
+    }
 
-        let x_range_km = (r.f64()?, r.f64()?);
-        let y_range_km = (r.f64()?, r.f64()?);
-        let z_range_km_msl = (r.f64()?, r.f64()?);
-        let site = (r.f64()?, r.f64()?);
-        let value_range = (r.f32()?, r.f32()?);
-        let tilt_count = r.u32()? as usize;
-        let widest_tilt_gap_deg = r.f64()?;
-
-        // Every number that describes where the box is.
-        if ![
-            x_range_km.0,
-            x_range_km.1,
-            y_range_km.0,
-            y_range_km.1,
-            z_range_km_msl.0,
-            z_range_km_msl.1,
-            site.0,
-            site.1,
-            widest_tilt_gap_deg,
-        ]
-        .iter()
-        .all(|v| v.is_finite())
-            || !value_range.0.is_finite()
-            || !value_range.1.is_finite()
-        {
-            return None;
-        }
-
-        // `value_range` and the table are both functions of the product, so a payload
-        // states each twice and the copies can disagree without failing anything.
-        if value_range != value_range_for_product(product, slot) {
-            return None;
-        }
-
-        // One byte per element, so `take` is the bound: nothing is reserved on
-        // the claimed length.
-        let lut_len = r.u32()?;
-        let lut = r.take(lut_len as usize)?.to_vec();
-        if lut.len() != LUT_LEN || Some(lut.as_slice()) != volume_lut_static(product) {
-            return None;
-        }
-        let index_len = r.u32()?;
-        let indices = r.take(index_len as usize)?.to_vec();
-        if indices.len() != cells {
-            return None;
-        }
-
-        // Four bytes per element, so the claimed count is measured against what
-        // remains before it becomes a capacity: a believed `u32::MAX` would
-        // otherwise reserve 16 GiB and then fail the read.
-        let value_len = r.u32()?;
-        let value_len = r.bounded(value_len, 4)?;
-        let values = match value_len {
-            // `is_supported` put at least one cell in the grid, so zero can
-            // only mean "no plane".
-            0 => None,
-            n if n == cells => {
-                let mut values = Vec::with_capacity(n);
-                for _ in 0..n {
-                    values.push(r.f32()?);
-                }
-                Some(values)
+    // Four bytes per element, so the claimed count is measured against what
+    // remains before it becomes a capacity: a believed `u32::MAX` would
+    // otherwise reserve 16 GiB and then fail the read.
+    let value_len = r.u32()?;
+    let value_len = r.bounded(value_len, 4)?;
+    let values = match value_len {
+        // `is_supported` put at least one cell in the grid, so zero can
+        // only mean "no plane".
+        0 => None,
+        n if n == cells => {
+            let mut values = Vec::with_capacity(n);
+            for _ in 0..n {
+                values.push(r.f32()?);
             }
-            // Any other length is a plane that does not describe this grid.
-            _ => return None,
-        };
-
-        // Trailing bytes mean the two ends disagree about the layout even
-        // though the version matched.
-        if !r.at_end() {
-            return None;
+            Some(values)
         }
-        Some(Self {
-            indices,
-            values,
-            lut,
-            shape,
-            x_range_km,
-            y_range_km,
-            z_range_km_msl,
-            site,
-            value_range,
-            product,
-            tilt_count,
-            widest_tilt_gap_deg,
-        })
-    }
+        // Any other length is a plane that does not describe this grid.
+        _ => return None,
+    };
 
-    /// What [`to_bytes`](Self::to_bytes) will write, exactly.
-    fn encoded_len(&self) -> usize {
-        // Magic, version, product, three axes, three ranges, the site, the
-        // value range, the tilt count and the widest gap.
-        let header = 4 + 2 + 2 + 3 * 4 + 3 * 16 + 16 + 8 + 4 + 8;
-        header
-            + (4 + self.lut.len())
-            + (4 + self.indices.len())
-            + (4 + self.values.as_ref().map_or(0, |v| v.len() * 4))
+    // Trailing bytes mean the two ends disagree about the layout even
+    // though the version matched.
+    if !r.at_end() {
+        return None;
     }
+    Some(VolumeGrid::from_parts(VolumeParts {
+        indices,
+        values,
+        dims,
+        anchor,
+        x_range_km,
+        y_range_km,
+        z_range_km_msl,
+        field: crate::fields::spec(product).id.clone(),
+        // The table the bytes carried, not a second one: `lut` and
+        // `value_range` were just proven equal to the statics above.
+        transfer: transfer_table_over(lut, product, value_range),
+        levels,
+        widest_level_gap_deg,
+    }))
+}
+
+/// What [`to_bytes`] will write, exactly.
+fn encoded_len(grid: &VolumeGrid) -> usize {
+    // Magic, version, product, three axes, three ranges, the anchor, the
+    // value range, the level count and the widest gap.
+    let header = 4 + 2 + 2 + 3 * 4 + 3 * 16 + 16 + 8 + 4 + 8;
+    header
+        + (4 + grid.lut().len())
+        + (4 + grid.indices().len())
+        + (4 + grid.values().map_or(0, |v| v.len() * 4))
 }
 
 /// A bounds-checked cursor.

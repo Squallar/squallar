@@ -16,7 +16,7 @@ use egui_wgpu::wgpu;
 use rustdar_egui::pane::VolumeTarget;
 use rustdar_egui::volume_alpha::AlphaCurve;
 use rustdar_egui::volume_view::{VolumeFrameState, VolumePaint, VolumePainter, view_for};
-use rustdar_radar::voxel::VoxelGrid;
+use rustdar_radar::voxel::VolumeGrid;
 
 use crate::VolumeSupport;
 use crate::raymarch::staging::VolumeStaging;
@@ -74,7 +74,7 @@ fn coarse_level_for(gradient_shading: bool, largest_cell_km: f32) -> CoarseLevel
 }
 
 /// The march's skip threshold for a palette whose
-/// [`VoxelGrid::fade_band`](rustdar_radar::voxel::VoxelGrid::fade_band) is
+/// [`VolumeGrid::fade_band`](rustdar_radar::voxel::VolumeGrid::fade_band) is
 /// `band`, in the shader's 0-1 index units.
 pub fn empty_index_threshold_for(band: u8) -> f32 {
     (f32::from(band) + 0.5) / 255.0
@@ -108,7 +108,7 @@ pub enum VolumeEntry {
     /// A build is in flight for this target.
     Building,
     /// Built. The `Arc` is shared with every callback that draws it.
-    Ready(Arc<VoxelGrid>),
+    Ready(Arc<VolumeGrid>),
     /// Not built, and why — in a sentence fit for the centre of a pane.
     Refused(String),
 }
@@ -162,7 +162,7 @@ impl StoredVolume {
         let VolumeEntry::Ready(grid) = &self.entry else {
             return 0;
         };
-        let shape = grid.shape();
+        let shape = grid.dims();
         let Ok(cells) = [shape.nx, shape.ny, shape.nz]
             .iter()
             .map(|&n| u32::try_from(n))
@@ -634,7 +634,7 @@ impl VolumePainter for BridgeVolumePainter {
         };
 
         // On the tilt *count*, never on "the index plane is all no-data".
-        if grid.tilt_count() == 1 {
+        if grid.levels() == 1 {
             return VolumePaint::Empty(
                 "This volume has a single tilt, so there is no vertical structure to render. \
                  Wait for a full scan."
@@ -671,7 +671,7 @@ impl VolumePainter for BridgeVolumePainter {
             return VolumePaint::Empty("This pane is too small to draw a volume in.".to_owned());
         };
 
-        let shape = grid.shape();
+        let shape = grid.dims();
         let mut uniform = VolumeUniform::new(
             box_size_km,
             [shape.nx as u32, shape.ny as u32, shape.nz as u32],
@@ -717,7 +717,7 @@ impl VolumePainter for BridgeVolumePainter {
         // The floor: drawn only when the pane wants it AND the map it was
         // dragged on has told us where it is.
         let floor = frame.floor.then_some(frame.source).flatten().map(|geo| {
-            let (site_lat, site_lon) = grid.site();
+            let (site_lat, site_lon) = grid.anchor();
             let site_points = geo.project(site_lat, site_lon);
             FloorSource {
                 site_points: [site_points.x, site_points.y],
@@ -738,7 +738,7 @@ impl VolumePainter for BridgeVolumePainter {
         // floor is actually resolved, so a pane with the floor hidden — or one
         // whose source map has not said where it is — asks for no texels.
         if let Some(geo) = floor.is_some().then_some(frame.source).flatten() {
-            let (site_lat, _) = grid.site();
+            let (site_lat, _) = grid.anchor();
             if let Some(magnification) = rustdar_egui::volume_view::floor_magnification(
                 frame.camera,
                 uniform.box_size_km,
@@ -807,7 +807,7 @@ impl VolumePainter for BridgeVolumePainter {
         let VolumeEntry::Ready(grid) = &found.entry else {
             return None;
         };
-        Some(grid.shape().nx)
+        Some(grid.dims().nx)
     }
 }
 
@@ -868,7 +868,7 @@ impl DrawnBox {
 
     /// The grid drawn in its own box — the settled case, and the one every
     /// mask instrument in this repository measures.
-    fn settled(grid: &VoxelGrid) -> Self {
+    fn settled(grid: &VolumeGrid) -> Self {
         Self {
             x_km: grid.x_range_km(),
             y_km: grid.y_range_km(),
@@ -901,11 +901,11 @@ impl DrawnBox {
     /// Doppler sweep at 0.5°, first and second in the volume. If it ever did
     /// move, this is a stand-in behaving as a stand-in: one pop when the real
     /// grid lands, where the alternative is a blank pane every volume.
-    fn for_target(target: &VolumeTarget, grid: &VoxelGrid) -> Option<Self> {
+    fn for_target(target: &VolumeTarget, grid: &VolumeGrid) -> Option<Self> {
         let Some(region) = target.region else {
             return Some(Self::settled(grid));
         };
-        let (site_lat, site_lon) = grid.site();
+        let (site_lat, site_lon) = grid.anchor();
         // `clamped` is the resampler's own, not a copy of its bounds:
         // `horizontal_ranges_km` gives the arithmetic that needs the two to
         // agree bit for bit.
@@ -937,7 +937,7 @@ impl DrawnBox {
     }
 
     /// The box a pane holding `lookup` for `target` is drawing.
-    fn for_lookup(lookup: &VolumeLookup, target: &VolumeTarget, grid: &VoxelGrid) -> Option<Self> {
+    fn for_lookup(lookup: &VolumeLookup, target: &VolumeTarget, grid: &VolumeGrid) -> Option<Self> {
         if lookup.stood_in {
             Self::for_target(target, grid)
         } else {
@@ -950,14 +950,14 @@ impl DrawnBox {
 /// — the resolution the picture on screen really has, which is not the
 /// requested region's while a stand-in is up. `None` for a grid with no cells
 /// across either axis, which `build_voxels` does not produce.
-fn cell_km(grid: &VoxelGrid) -> Option<(f32, f32)> {
+fn cell_km(grid: &VolumeGrid) -> Option<(f32, f32)> {
     let axis = |(a, b): (f64, f64), cells: usize| {
         let cells = u32::try_from(cells).ok()?;
         (cells > 0).then(|| ((b - a) / f64::from(cells)) as f32)
     };
     Some((
-        axis(grid.x_range_km(), grid.shape().nx)?,
-        axis(grid.y_range_km(), grid.shape().ny)?,
+        axis(grid.x_range_km(), grid.dims().nx)?,
+        axis(grid.y_range_km(), grid.dims().ny)?,
     ))
 }
 
@@ -969,7 +969,11 @@ fn cell_km(grid: &VoxelGrid) -> Option<(f32, f32)> {
 /// world = box_min + p · box_size          (what the shader marches)
 /// t     = (world − grid_min) / grid_size  (where the texture has it)
 /// ```
-fn crop_into(grid: &VoxelGrid, x_km: (f64, f64), y_km: (f64, f64)) -> Option<([f32; 3], [f32; 3])> {
+fn crop_into(
+    grid: &VolumeGrid,
+    x_km: (f64, f64),
+    y_km: (f64, f64),
+) -> Option<([f32; 3], [f32; 3])> {
     let axes = [
         (x_km, grid.x_range_km()),
         (y_km, grid.y_range_km()),
@@ -1000,14 +1004,21 @@ fn largest_cell_km(uniform: &VolumeUniform) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
-/// Why this moment cannot be drawn as a volume, or `None` if it can.
-fn palette_refusal(grid: &VoxelGrid) -> Option<String> {
-    palette_refusal_for(grid.see_through_indices(), grid.product().name())
+/// Why this field cannot be drawn as a volume, or `None` if it can.
+///
+/// The name comes from the registry the field is registered in, not from the
+/// grid: a grid carries an id, and the id's own spelling is the fallback when
+/// this build does not register it — a saved-then-retired field still gets a
+/// message a reader can act on rather than a blank.
+fn palette_refusal(grid: &VolumeGrid) -> Option<String> {
+    let field = grid.field();
+    let name = rustdar_radar::fields::spec_for(field).map_or(field.as_str(), |spec| spec.name);
+    palette_refusal_for(grid.see_through_indices(), name)
 }
 
 /// [`palette_refusal`] over the two things it actually reads, so the decision is
-/// testable without a `VoxelGrid` — which has no constructor outside
-/// `build_voxels` and would need a synthetic `Scan` to obtain.
+/// testable without a `VolumeGrid` — which radar builds through `build_voxels`
+/// and would need a synthetic `Scan` to obtain.
 fn palette_refusal_for(see_through: u16, moment: &str) -> Option<String> {
     if see_through >= u16::from(MINIMUM_FADE_INDICES) {
         return None;
@@ -1215,7 +1226,7 @@ impl VolumeResources {
 struct VolumeCallback {
     pane_idx: usize,
     grid_id: u64,
-    grid: Arc<VoxelGrid>,
+    grid: Arc<VolumeGrid>,
     /// Where this box's ground is inside the pane mirror, when the pane wants
     /// a floor and its source map has said where it is. `uniform.map_floor` is
     /// true exactly when this is `Some`.
@@ -1281,7 +1292,7 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
         if !resources.ensure_pane_offscreen(device, self.pane_idx, self.offscreen_px) {
             return Vec::new();
         }
-        let shape = self.grid.shape();
+        let shape = self.grid.dims();
         if !resources.ensure_upload(
             device,
             queue,
@@ -1390,7 +1401,7 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
 }
 
 /// `pub(crate)` for one item alone: `tests::ready_grid`, the crate's only
-/// real `VoxelGrid` — `build_voxels` is the sole constructor, and a second
+/// real `VolumeGrid` — `build_voxels` is the sole constructor, and a second
 /// copy of its fixture in another test module would be a second thing to keep
 /// in step with the resampler. Everything else in here is a `#[test]`.
 #[path = "volume_bridge/tests.rs"]

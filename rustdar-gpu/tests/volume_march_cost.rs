@@ -21,7 +21,7 @@ use rustdar_egui::pane::OrbitCamera;
 use rustdar_egui::volume_view::view_for;
 use rustdar_gpu::egui_renderer::AttachmentConfig;
 use rustdar_radar::types::RadarProduct;
-use rustdar_radar::voxel::{DESKTOP_SHAPE, HalfExtentKm, VoxelGrid, VoxelRequest, build_voxels};
+use rustdar_radar::voxel::{DESKTOP_SHAPE, HalfExtentKm, VolumeGrid, VoxelRequest, build_voxels};
 use rustdar_volumetric::raymarch::VolumePipelines;
 use rustdar_volumetric::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
 use rustdar_volumetric::uniform::VolumeUniform;
@@ -54,7 +54,7 @@ fn measure_the_raymarch_cost_on_a_real_volume() {
     };
     let grid = build_voxels(&scan, &request, site_lat, site_lon)
         .expect("build_voxels refused the reflectivity volume");
-    let shape = grid.shape();
+    let shape = grid.dims();
     let grid_dims = [shape.nx as u32, shape.ny as u32, shape.nz as u32];
     let box_size_km = box_size_km(&grid);
 
@@ -230,7 +230,7 @@ fn timed_passes(
 }
 
 /// The box's true physical extent in kilometres.
-fn box_size_km(grid: &VoxelGrid) -> [f32; 3] {
+fn box_size_km(grid: &VolumeGrid) -> [f32; 3] {
     let (x0, x1) = grid.x_range_km();
     let (y0, y1) = grid.y_range_km();
     let (z0, z1) = grid.z_range_km_msl();

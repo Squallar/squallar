@@ -10,7 +10,7 @@ use crate::frame::RenderedFrame;
 use crate::render_input::RenderInput;
 use crate::scan::DecodedScan;
 use crate::types::RadarProduct;
-use crate::voxel::{HalfExtentKm, VoxelGrid, VoxelRequest, VoxelShape};
+use crate::voxel::{HalfExtentKm, VolumeGrid, VoxelRequest, VoxelShape};
 use crate::xsect::{CrossSection, SectionRequest};
 
 /// The six radar rows, in dispatch order: **radar, level3, level3/vild,
@@ -283,7 +283,7 @@ rustdar_source::impl_job_input!(VoxelJob);
 
 impl JobSpec for VoxelJob {
     type In = VoxelJob;
-    type Out = VoxelGrid;
+    type Out = VolumeGrid;
     const LABEL: &'static str = "voxels";
     const COST: JobCost = JobCost::Raster;
 
@@ -305,7 +305,7 @@ impl JobSpec for VoxelJob {
         ))
     }
 
-    fn run(input: &VoxelJob, _geo: &JobGeometry) -> Option<VoxelGrid> {
+    fn run(input: &VoxelJob, _geo: &JobGeometry) -> Option<VolumeGrid> {
         let (scan, declared) = (input.input.to_scan(), input.input.declared_nyquist());
         crate::voxel::build_voxels_with_motion(
             crate::nyquist::Volume::new(&scan, &declared),
@@ -318,30 +318,25 @@ impl JobSpec for VoxelJob {
 }
 
 impl JobOutCodec for VoxelJob {
-    fn encode_out(v: VoxelGrid, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
-        head.extend_from_slice(&v.to_bytes());
+    fn encode_out(v: VolumeGrid, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
+        // `to_bytes` refuses a field this build has no wire code for. No
+        // builder can produce one, so the empty head that follows is not a
+        // reachable state — but it decodes to `None` on the magic rather than
+        // into a different moment, and it says so in the log.
+        match crate::voxel::to_bytes(&v) {
+            Some(bytes) => head.extend_from_slice(&bytes),
+            None => log::error!(
+                "voxel reply not encoded: no wire code for field {}",
+                v.field(),
+            ),
+        }
     }
 
-    fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<VoxelGrid> {
+    fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<VolumeGrid> {
         if !tails.is_empty() {
             return None;
         }
-        VoxelGrid::from_bytes(head)
-    }
-}
-
-/// The reply half of the job boundary's erasure seam: a described voxel
-impl rustdar_source::job::JobOut for VoxelGrid {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
-        self
-    }
-
-    fn straight_rasters_mut(&mut self) -> Vec<&mut [u8]> {
-        Vec::new()
+        crate::voxel::from_bytes(head)
     }
 }
 
@@ -518,7 +513,7 @@ fn decode_voxel_request(r: &mut Reader) -> Option<VoxelRequest> {
     // `MAX_AXIS` stopped being the 256 a GLES 3.0 device guarantees.
     // `is_supported` now admits 1625 an axis, which is 4.29 *billion* cells —
     // the bound is on what `VoxelShape::cells` can represent, not on what a
-    // machine can hold, and unlike `VoxelGrid::from_bytes` there is no payload
+    // machine can hold, and unlike `voxel::from_bytes` there is no payload
     // in hand here whose length would have to match. A request is thirty-odd
     // bytes and `build_voxels` allocates the grid it names, so without this a
     // malformed job would be a multi-gigabyte allocation rather than a refusal.

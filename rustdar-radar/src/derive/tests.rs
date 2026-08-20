@@ -539,8 +539,10 @@ fn a_derived_voxel_grid_resamples_the_derived_field() {
         "NROT's index 0 sits one step under −5",
     );
 
-    let restored = crate::voxel::VoxelGrid::from_bytes(&srv.to_bytes())
-        .expect("a derived grid round-trips the wire");
+    let restored = crate::voxel::from_bytes(
+        &crate::voxel::to_bytes(&srv).expect("a registered field has a wire code"),
+    )
+    .expect("a derived grid round-trips the wire");
     assert_eq!(restored.value_range(), srv.value_range());
     assert_eq!(restored.lut(), srv.lut());
 }

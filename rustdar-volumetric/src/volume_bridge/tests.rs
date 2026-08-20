@@ -42,7 +42,7 @@ fn the_payload_the_painter_hands_over_is_one_egui_wgpu_can_draw() {
 }
 
 /// Open and resolve a build the way production does: dispatch, then the
-/// worker's reply. `Refused` because a `VoxelGrid` has no constructor
+/// worker's reply. `Refused` because a `VolumeGrid` has no constructor
 /// outside `build_voxels`; the store treats every resolved entry alike.
 fn build(store: &VolumeStore, pane: usize, t: &VolumeTarget, note: &str) {
     assert!(
@@ -71,7 +71,7 @@ fn fade_lut(band: usize) -> Vec<u8> {
 /// A real, tiny grid, for the tests whose subject is what may *stand in*
 /// on screen — only a `Ready` entry ever does, so a `Refused` stub cannot
 /// exercise them. Built through `build_voxels` because that is the one
-/// constructor a `VoxelGrid` has.
+/// constructor a `VolumeGrid` has.
 pub(crate) fn ready_grid() -> VolumeEntry {
     use nexrad_model::data::{
         MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
@@ -589,7 +589,7 @@ fn every_samplable_moments_default_table_clears_the_gate() {
     // with every literal above still green.
     assert!(
         include_str!("../volume_bridge.rs")
-            .contains("palette_refusal_for(grid.see_through_indices(), grid.product().name())"),
+            .contains("palette_refusal_for(grid.see_through_indices(), name)"),
         "palette_refusal no longer reads the see-through measure",
     );
 }
@@ -631,7 +631,7 @@ fn the_guards_paint_cannot_be_tested_through_are_still_in_it() {
     let body = &body[..end];
 
     assert!(
-        body.contains("grid.tilt_count() == 1"),
+        body.contains("grid.levels() == 1"),
         "`paint` no longer branches on the tilt count",
     );
     assert!(
@@ -1146,9 +1146,9 @@ fn the_store_eviction_actually_bounds() {
     let store = VolumeStore::new();
     let one = match ready_grid() {
         VolumeEntry::Ready(grid) => crate::raymarch::resident_grid_bytes([
-            u32::try_from(grid.shape().nx).unwrap(),
-            u32::try_from(grid.shape().ny).unwrap(),
-            u32::try_from(grid.shape().nz).unwrap(),
+            u32::try_from(grid.dims().nx).unwrap(),
+            u32::try_from(grid.dims().ny).unwrap(),
+            u32::try_from(grid.dims().nz).unwrap(),
         ])
         .expect("a fixture grid cannot overflow"),
         _ => unreachable!("ready_grid is Ready"),
@@ -1274,7 +1274,7 @@ fn retain_set_states_the_whole_set_and_release_set_gives_it_all_back() {
 fn one_grid_texture_bytes() -> usize {
     match ready_grid() {
         VolumeEntry::Ready(grid) => {
-            let shape = grid.shape();
+            let shape = grid.dims();
             crate::raymarch::resident_grid_bytes([
                 u32::try_from(shape.nx).unwrap(),
                 u32::try_from(shape.ny).unwrap(),
