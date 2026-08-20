@@ -3,7 +3,7 @@ use crate::legend_ramp;
 use crate::overlay_cache::{
     current_quantized_zoom, draw_overlay_texture, plan_overlay_texture, viewport_geo_bounds,
 };
-use crate::pane::{PaneState, RadarImageData};
+use crate::pane::{PaneState, RadarImageData, TimeMode};
 use crate::point_painter::EguiPointPainter;
 use rustdar_overlays::render::draw::{DrawPointContext, HoverContext};
 use rustdar_overlays::render::overlay_state::{
@@ -20,6 +20,7 @@ use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::RadarProduct;
 use rustdar_radar::{get_color_for_value, get_legend_scale_ref};
 use rustdar_source::id::{LayerId, known};
+use rustdar_source::time::TimeAxis;
 
 use super::super::map_overlays::{OverlayDrawContext, draw_tile_layer, is_pos_blocked};
 
@@ -480,7 +481,41 @@ fn overlay_cache_token(
         overlays.content_signature(id, &pane.layer_ref(pane_idx, id))
     };
     let themed = is_dark && overlays.theme_sensitive(id);
-    base ^ if themed { 0x9E37_79B9_7F4A_7C15 } else { 0 }
+    base ^ if themed { 0x9E37_79B9_7F4A_7C15 } else { 0 } ^ as_of_term(overlays, pane, id)
+}
+
+/// **The as-of half of the cache token, and it is `0` on a live pane.**
+///
+/// An [`TimeAxis::EventLifetime`] layer's picture is *which items are valid at
+/// the depicted instant*, so a scrubbed pane must not be handed the texture
+/// the live pane rasterized. It keys on the instant **quantized** by the
+/// layer's own quantum rather than on the raw instant, so dragging the
+/// scrubber re-uses rasters instead of minting one per frame.
+///
+/// Under [`TimeMode::Live`] this is `0` and the token is byte-for-byte what it
+/// was before WO-E7c — which is what keeps a live pane's one-second lightning
+/// quantum from re-rasterizing it every second. The `Live` fast path also
+/// costs one enum test: the registry walk below only runs on a scrubbed pane.
+///
+/// It is mixed into `data_generation`, which is part of the key
+/// `group_overlay_renders` shares one raster across panes on — so two panes on
+/// two instants get two rasters without anything else having to know.
+fn as_of_term(overlays: &OverlayRegistry, pane: &PaneState, id: &LayerId) -> u64 {
+    let TimeMode::AsOf(instant) = pane.time.mode else {
+        return 0;
+    };
+    let Some(handler) = overlays.handlers().find(|h| h.id() == *id) else {
+        return 0;
+    };
+    if !matches!(handler.time_axis(), TimeAxis::EventLifetime) {
+        return 0;
+    }
+    // Hashed rather than mixed raw: the bucket is a small integer and adjacent
+    // buckets must not land on adjacent tokens beside a content signature.
+    let bucket = crate::pane::as_of_bucket(instant, handler.as_of_quantum());
+    let mut hasher = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(&bucket, &mut hasher);
+    std::hash::Hasher::finish(&hasher)
 }
 
 /// Render the radar image overlay, range ring, and hover tooltip (loop playback
@@ -2329,3 +2364,7 @@ mod raster_registration_tests;
 #[path = "ui_map_pane/theme_flip_tests.rs"]
 #[cfg(test)]
 mod theme_flip_tests;
+
+#[path = "ui_map_pane/as_of_token_tests.rs"]
+#[cfg(test)]
+mod as_of_token_tests;
