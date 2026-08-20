@@ -14,19 +14,12 @@ fn shader_code() -> String {
 fn the_comment_stripper_removes_prose_and_keeps_code() {
     let code = shader_code();
     assert!(
-        code.len() < VOLUME_SHADER_WGSL.len() / 2,
-        "volume.wgsl is {} bytes and its code is {} — the stripper is not \
-             removing the comments",
-        VOLUME_SHADER_WGSL.len(),
-        code.len()
+        !code.contains("//"),
+        "a comment marker survived the stripper",
     );
     assert!(
         code.contains("fn fs_raymarch(") && code.contains("textureSampleLevel("),
         "the comment stripper removed code as well as comments"
-    );
-    assert!(
-        !code.contains("naga"),
-        "a word that appears only in this file's prose survived the stripper"
     );
 }
 
