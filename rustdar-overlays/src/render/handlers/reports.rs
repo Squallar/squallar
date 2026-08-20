@@ -219,6 +219,12 @@ impl OverlayHandler for StormReportsHandler {
         RenderMode::Texture
     }
 
+    /// `is_dark` rides into the described job (`StormReportsInput`) and picks
+    /// the marker outline, so a cached raster is a raster in one theme.
+    fn theme_sensitive(&self) -> bool {
+        true
+    }
+
     fn is_enabled(&self) -> bool {
         self.enabled
     }

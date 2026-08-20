@@ -655,7 +655,7 @@ impl super::App {
         uploads: &mut PlanViewUploads,
     ) {
         use rustdar_egui::overlay_cache::{OverlayTextureData, RadarTextureMeta};
-        use rustdar_geo::GeoBounds;
+        use rustdar_geo::PlacedRaster;
         use rustdar_radar::types::ImageBounds;
 
         // Extract site coordinates before mutable borrow
@@ -853,8 +853,12 @@ impl super::App {
         // the texture is placed on exactly the ground its gates were painted
         // onto, whether that is a TDWR Doppler cut's 88.8 km or the same
         // radar's 417 km long-range reflectivity.
+        //
+        // Placed once, here, rather than at every draw: `PlacedRaster` carries
+        // both the edges and the mercator span the placement needs, so nothing
+        // downstream re-derives either.
         let bounds = ImageBounds::from_radar_site(lat, lon, render.max_range_km);
-        let geo_bounds = GeoBounds::from(bounds);
+        let placed_raster: PlacedRaster = bounds.into();
         let pane = self.gui.pane_mut(pane_idx).unwrap();
         // Dropping this call is silent: the pane simply keeps whatever time it
         // was last stamped with, which reads as a current image of another
@@ -865,7 +869,7 @@ impl super::App {
         let data_time = self.render.data_time_for_render(pane, render);
         let placed = OverlayTextureData {
             texture,
-            geo_bounds,
+            placed: placed_raster,
             data_generation: 0,
             render_zoom: 0,
             width: side as u32,
@@ -1478,7 +1482,7 @@ impl super::App {
 
                 let data = OverlayTextureData {
                     texture: texture.clone(),
-                    geo_bounds: resp.geo_bounds,
+                    placed: rustdar_geo::PlacedRaster::of(resp.geo_bounds),
                     data_generation: resp.generation,
                     render_zoom: resp.zoom,
                     width,
@@ -2300,7 +2304,7 @@ impl super::App {
     /// renderer, so a test could not tell a skipped pane from a skipped call.
     pub(super) fn restore_cached_render(&mut self, ctx: &egui::Context) {
         use rustdar_egui::overlay_cache::{OverlayTextureData, RadarTextureMeta};
-        use rustdar_geo::GeoBounds;
+        use rustdar_geo::PlacedRaster;
         use rustdar_radar::types::ImageBounds;
 
         // Every raster still arriving is let go of first, on **every** pane and
@@ -2389,14 +2393,14 @@ impl super::App {
             // anything else would put a restored long-range image back at the
             // wrong size, which reads as a pane that moved while suspended.
             let bounds = ImageBounds::from_radar_site(lat, lon, max_range_km);
-            let geo_bounds = GeoBounds::from(bounds);
+            let placed: PlacedRaster = bounds.into();
             if let Some(pane) = self.gui.pane_mut(pane_idx) {
                 let cache = pane.overlay_cache_mut(&rustdar_source::id::known::RADAR);
                 // Showing retires whatever the pane was showing; see the note
                 // in `App::apply_render_to_pane`.
                 cache.show(OverlayTextureData {
                     texture,
-                    geo_bounds,
+                    placed,
                     data_generation: 0,
                     render_zoom: 0,
                     width: side as u32,
@@ -4478,6 +4482,17 @@ fn rendered_image(
         lat: rr.site_lat,
         lon: rr.site_lon,
         max_range_km: rr.max_range_km,
+        // The loop frame's placement, worked out here and carried, so playback
+        // draws it instead of rebuilding it from these three numbers on every
+        // frame of every animating pane. Through radar's own delivery-time
+        // constructor, which is the same one the plan-view and resume paths
+        // reach — one placement arithmetic, three delivery sites.
+        placed: rustdar_radar::types::ImageBounds::from_radar_site(
+            rr.site_lat,
+            rr.site_lon,
+            rr.max_range_km,
+        )
+        .into(),
         nyquist_ms: rr.nyquist_ms,
         melting_layer_source: rr.melting_layer_source,
         storm_motion: rr.storm_motion,

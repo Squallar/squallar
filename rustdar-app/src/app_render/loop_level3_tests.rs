@@ -774,6 +774,7 @@ fn image() -> rustdar_egui::pane::RadarImageData {
         lat: 35.33,
         lon: -97.27,
         max_range_km: 100.0,
+        placed: rustdar_radar::types::ImageBounds::from_radar_site(35.33, -97.27, 100.0).into(),
         nyquist_ms: None,
         melting_layer_source: None,
         storm_motion: None,

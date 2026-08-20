@@ -130,6 +130,8 @@ fn loop_on(ctx: &egui::Context, site: &'static str, textured: &[usize]) -> LoopP
                 lat: 35.0,
                 lon: -97.0,
                 max_range_km: 100.0,
+                placed: rustdar_radar::types::ImageBounds::from_radar_site(35.0, -97.0, 100.0)
+                    .into(),
                 nyquist_ms: None,
                 melting_layer_source: None,
                 storm_motion: None,

@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use rustdar_geo::GeoBounds;
+use rustdar_geo::{GeoBounds, PlacedRaster};
 use rustdar_overlays::render::geo as overlay_geo;
 use rustdar_overlays::render::rasterize::HitMap;
 use rustdar_overlays::types::{OverlayFeature, ScreenPoint};
@@ -63,7 +63,7 @@ fn quantize_zoom(zoom: f64) -> i32 {
 /// rest it is meant to be exact.
 ///
 /// It is safe to relax this far because [`draw_overlay_texture`] projects the
-/// texture's stored `geo_bounds` through the *current* projector, so a
+/// texture's stored `placed` bounds through the *current* projector, so a
 /// stale-zoom texture is drawn over the right ground and only its resolution is
 /// behind. Nor can it strand the viewport off the texture: see
 /// [`pan_exceeds_coverage`], whose containment proof holds for any band and
@@ -270,7 +270,7 @@ impl OverlayTexturePlan {
     /// The geographic ground a texture built to this plan covers, when it is
     /// rasterised for `viewport`.
     ///
-    /// This is what gets stored as the texture's `geo_bounds`, so it is also what
+    /// This is what gets stored as the texture's `placed` bounds, so it is also what
     /// [`pan_exceeds_coverage`] later measures the overdraw band from. The two must
     /// describe the same rectangle: the pixel count and the coverage both come from
     /// `self.overdraw`, and there is no parameter here through which they could be
@@ -451,8 +451,13 @@ pub struct RadarTextureMeta {
 pub struct OverlayTextureData {
     /// The egui texture containing the rasterised overlay.
     pub texture: egui::TextureHandle,
-    /// Geographic (lat/lon) extent of this texture.
-    pub geo_bounds: GeoBounds,
+    /// Where these pixels sit on the ground, worked out once at delivery.
+    ///
+    /// The four edges are what this field has always carried; the mercator
+    /// span rides along because it is derived from them and re-deriving it
+    /// somewhere else is how a second spelling of the projection starts. See
+    /// [`rustdar_geo::PlacedRaster`].
+    pub placed: PlacedRaster,
     /// The cache token these pixels were rendered for (detects stale results).
     ///
     /// Whatever `ui_map_pane::overlay_cache_token` answered at the time — the
@@ -877,7 +882,7 @@ impl OverlayTextureCache {
             return true;
         }
         // Check if the viewport has panned outside the texture coverage
-        pan_exceeds_coverage(&tex.geo_bounds, viewport_bounds)
+        pan_exceeds_coverage(&tex.placed.geo, viewport_bounds)
     }
 }
 
@@ -1046,37 +1051,69 @@ fn pan_exceeds_coverage(texture_bounds: &GeoBounds, viewport_bounds: &GeoBounds)
 
 // ── Drawing ──────────────────────────────────────────────────────────────
 
-/// Compute the screen-space rectangle for an overlay texture.
-pub fn overlay_texture_rect(
+/// The screen rect a north-west / south-east geographic corner pair covers.
+///
+/// **The one spelling.** There were four, all identical — project the NW
+/// corner, project the SE corner, `Rect::from_two_pos` — and each was written
+/// out where it was needed: the radar frame's placement in `ui_map_pane`, an
+/// overlay texture's here, a basemap tile's in `ui_map_overlays`, a region
+/// box's in `ui_map`. Four copies of two projector calls is not expensive; it
+/// is a place for them to *disagree*, which is what a picture drawn one corner
+/// convention and hit-tested by another looks like, and the previous
+/// convergence pass (`rustdar-geo`'s) deliberately left these for this one.
+///
+/// Corners are `(lat, lon)`, in that order — the argument order
+/// [`walkers::lat_lon`] itself takes, so the pair cannot be swapped on the way
+/// in. Which of the two is "north-west" is not enforced and does not need to
+/// be: `Rect::from_two_pos` normalises, so a caller that hands them the other
+/// way round gets the same rect.
+///
+/// Through the projector, per corner. Mapping a raster's cached
+/// [`rustdar_geo::PlacedRaster::mercator_y`] linearly onto screen `y` would be
+/// a second copy of `walkers::Projector::project`'s own arithmetic living in
+/// this crate — the projector is the map widget's statement of where the ground
+/// is, and there is no version of "agrees with the basemap" that re-derives it.
+pub fn geo_corner_rect(
     projector: &walkers::Projector,
-    tex: &OverlayTextureData,
+    nw: (f64, f64),
+    se: (f64, f64),
 ) -> egui::Rect {
-    let nw = projector
-        .project(walkers::lat_lon(
-            tex.geo_bounds.max_lat,
-            tex.geo_bounds.min_lon,
-        ))
-        .to_pos2();
-    let se = projector
-        .project(walkers::lat_lon(
-            tex.geo_bounds.min_lat,
-            tex.geo_bounds.max_lon,
-        ))
-        .to_pos2();
-    egui::Rect::from_two_pos(nw, se)
+    let project = |(lat, lon): (f64, f64)| projector.project(walkers::lat_lon(lat, lon)).to_pos2();
+    egui::Rect::from_two_pos(project(nw), project(se))
+}
+
+/// The screen rect a placed raster covers. See [`geo_corner_rect`].
+pub fn placed_rect(projector: &walkers::Projector, placed: &PlacedRaster) -> egui::Rect {
+    geo_corner_rect(
+        projector,
+        (placed.geo.max_lat, placed.geo.min_lon),
+        (placed.geo.min_lat, placed.geo.max_lon),
+    )
 }
 
 /// Draw an overlay texture as a geo-positioned image on the map.
 ///
 /// This is the per-frame draw call — projects the texture's NW/SE corners
 /// to screen space and emits a single `painter.image()`.
+///
+/// # The off-screen skip is this function's, not the placement's
+///
+/// It stays here rather than moving into [`placed_rect`] with the projection.
+/// `ui_map_pane::render_radar_overlay` places its raster through the same
+/// arithmetic and has never culled, and converging the *rect* is not a licence
+/// to converge the *behaviour*: a radar frame that stops being submitted when
+/// its bounds leave the pane is a change to what loop playback draws, and
+/// nothing has measured that it is an improvement. Overlay textures are
+/// deliberately rasterised with pan overdraw beyond the viewport (see
+/// [`pan_exceeds_coverage`]), which is why this one had a skip worth having in
+/// the first place. Two draw sites, two decisions, both stated.
 pub fn draw_overlay_texture(
     painter: &egui::Painter,
     projector: &walkers::Projector,
     tex: &OverlayTextureData,
     screen_rect: egui::Rect,
 ) {
-    let rect = overlay_texture_rect(projector, tex);
+    let rect = placed_rect(projector, &tex.placed);
 
     // Skip if entirely off-screen
     if !screen_rect.intersects(rect) {

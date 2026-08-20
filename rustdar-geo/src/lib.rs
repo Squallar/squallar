@@ -411,6 +411,55 @@ pub fn compute_geo_bounds(polygons: &[GeoPolygon]) -> Option<GeoBounds> {
     )
 }
 
+/// Where a finished raster belongs on the ground, computed **once**, where the
+/// raster is delivered.
+///
+/// A raster's placement is a property of the picture, not of the frame that
+/// happens to be drawing it. The loop playback path used to re-derive it: it
+/// rebuilt `rustdar_radar::types::ImageBounds::from_radar_site` — a `cos`, two
+/// `tan`s and two `ln`s — from the frame's `(lat, lon, max_range_km)` on
+/// *every* frame of every animating pane, to arrive at the four edges the
+/// delivery already knew. This type is where that answer is kept, so the
+/// per-frame rebuild has nothing left to do.
+///
+/// # What it is not
+///
+/// It is not a projection. `mercator_y` is the pair [`lat_rad_to_mercator_y`]
+/// answers for the two latitude edges, carried because the workspace's other
+/// consumers of a placed raster want it and re-deriving it is the
+/// second-spelling hazard this crate exists to close. Turning a placed raster
+/// into *screen* pixels is still the map widget's projector's job, and
+/// deliberately so: a linear map from these two numbers to screen `y` would be
+/// a second copy of `walkers::Projector::project`'s own arithmetic, which is
+/// exactly the drift this crate forbids.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlacedRaster {
+    /// The four edges the pixels span.
+    pub geo: GeoBounds,
+    /// Web Mercator `y` of `geo.min_lat` and `geo.max_lat`, in that order.
+    ///
+    /// A pair rather than two fields because the two are never useful apart:
+    /// every reader wants the span.
+    pub mercator_y: (f64, f64),
+}
+
+impl PlacedRaster {
+    /// The one constructor: the mercator pair is **derived**, never supplied.
+    ///
+    /// Through [`lat_rad_to_mercator_y`] and nothing else — `rustdar-radar`'s
+    /// `ImageBounds` reaches the same function for the same two edges, so a
+    /// raster placed through either arrives at identical bits.
+    pub fn of(geo: GeoBounds) -> Self {
+        Self {
+            mercator_y: (
+                lat_rad_to_mercator_y(geo.min_lat.to_radians()),
+                lat_rad_to_mercator_y(geo.max_lat.to_radians()),
+            ),
+            geo,
+        }
+    }
+}
+
 /// The latitude Web Mercator ends at: the one whose projected `y` is exactly
 /// `π`, so the world is the square the tile grid needs it to be.
 ///

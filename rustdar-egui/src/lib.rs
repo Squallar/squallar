@@ -1,4 +1,5 @@
 pub mod actions;
+pub(crate) mod legend_ramp;
 pub mod overlay_cache;
 pub mod pane;
 pub(crate) mod point_painter;

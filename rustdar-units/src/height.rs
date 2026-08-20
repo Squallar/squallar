@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use super::UnitLabel;
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum HeightUnit {
     #[default]
     Feet,

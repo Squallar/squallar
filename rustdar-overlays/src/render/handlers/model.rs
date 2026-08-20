@@ -11,7 +11,7 @@ use crate::render::controls::{
 use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
     FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayLegend, OverlayState,
-    RasterizeContext, RenderMode,
+    RasterizeContext, RenderMode, Signed,
 };
 use crate::render::rasterize;
 use rustdar_source::id::{LayerId, known};
@@ -369,19 +369,32 @@ impl OverlayHandler for ModelDataHandler {
         if text.is_empty() { None } else { Some(text) }
     }
 
-    fn legend(&self) -> Option<OverlayLegend> {
+    /// The signature is the selected parameter and nothing else, because the
+    /// bar is: `legend_thresholds`, `unit_label` and the bounds read off them
+    /// are all pure functions of `selected_param`. Deliberately **not**
+    /// `data_generation` — every HRRR fetch bumps that, and none of them
+    /// recolours a bar the parameter alone decides, so keying on it would
+    /// throw a baked ramp away hourly for an identical one.
+    ///
+    /// `+ 1` keeps the first parameter's signature off `0`, so a caller whose
+    /// "nothing cached yet" sentinel is a zero cannot mistake a real answer
+    /// for one.
+    fn legend(&self) -> Option<Signed<OverlayLegend>> {
         if !self.enabled {
             return None;
         }
         let thresholds = self.selected_param.legend_thresholds();
         let min = thresholds.first().map_or(0.0, |e| e.0);
         let max = thresholds.last().map_or(1.0, |e| e.0);
-        Some(OverlayLegend {
-            thresholds,
-            is_gradient: true,
-            min_value: min,
-            max_value: max,
-            unit_label: self.selected_param.unit_label(),
+        Some(Signed {
+            signature: self.selected_param as u64 + 1,
+            items: OverlayLegend {
+                thresholds,
+                is_gradient: true,
+                min_value: min,
+                max_value: max,
+                unit_label: self.selected_param.unit_label(),
+            },
         })
     }
 

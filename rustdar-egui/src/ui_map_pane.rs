@@ -1,11 +1,14 @@
 use crate::actions::GuiAction;
+use crate::legend_ramp;
 use crate::overlay_cache::{
     current_quantized_zoom, draw_overlay_texture, plan_overlay_texture, viewport_geo_bounds,
 };
 use crate::pane::{PaneState, RadarImageData};
 use crate::point_painter::EguiPointPainter;
 use rustdar_overlays::render::draw::{DrawPointContext, HoverContext};
-use rustdar_overlays::render::overlay_state::{OverlayItem, OverlayRegistry, RenderMode, Surface};
+use rustdar_overlays::render::overlay_state::{
+    OverlayItem, OverlayLegend, OverlayRegistry, RenderMode, Signed, Surface,
+};
 use rustdar_units::{HailSizeUnit, UserPreferences};
 use std::sync::Arc;
 
@@ -14,8 +17,8 @@ use rustdar_geo::KM_PER_DEGREE_LAT;
 use rustdar_radar::hca::MeltingLayerSource;
 use rustdar_radar::hover::{HoverSource, Reading};
 use rustdar_radar::sites::RadarSite;
-use rustdar_radar::types::{ImageBounds, RadarProduct};
-use rustdar_radar::{get_color_for_value, get_legend_scale};
+use rustdar_radar::types::RadarProduct;
+use rustdar_radar::{get_color_for_value, get_legend_scale_ref};
 use rustdar_source::id::{LayerId, known};
 
 use super::super::map_overlays::{OverlayDrawContext, draw_tile_layer, is_pos_blocked};
@@ -69,8 +72,11 @@ pub(super) struct PaneRenderCtx<'a> {
     pub actions: &'a mut Vec<GuiAction>,
     pub pane_rect: egui::Rect,
     /// Which halves of the pane's content this pass is for. See
-    /// [`PaneSurfaces`] — and [`PaneSurface`] for the rule that decides which
-    /// half anything is in.
+    /// [`PaneSurfaces`] — and
+    /// [`OverlayHandler::surface`](rustdar_overlays::render::overlay_state::OverlayHandler::surface)
+    /// for the rule that decides which half anything is in. (It named
+    /// `PaneSurface`, a type deleted at WO-M8b when the handler took over the
+    /// declaration; the rule survived the type.)
     pub surfaces: PaneSurfaces,
     /// Whether this frame's color scale bars run along the bottom edge
     /// (`true`) or the right edge (`false`). Resolved once for the whole map
@@ -658,25 +664,50 @@ pub(super) fn render_pane_map_content(
 ///
 /// # The theme is a coordinate of the picture
 ///
-/// Handlers rasterize *in* the theme: the SPC outlook's hatch colour, the GLM
-/// and storm-report glyphs, and the METAR station text all branch on
-/// `RasterizeContext::is_dark` at raster time. So a dark-mode raster and a
-/// light-mode raster of identical content are different pictures, and the
+/// Some handlers rasterize *in* the theme: the SPC outlook's hatch colour, the
+/// GLM and storm-report glyphs, and the radar-site plates all branch on
+/// `RasterizeContext::is_dark` at raster time. So for those, a dark-mode raster
+/// and a light-mode raster of identical content are different pictures, and the
 /// token says so by XOR-ing in a fixed odd 64-bit constant when the theme is
-/// dark — distinct token per theme, applied uniformly to both arms (the
-/// `RadarSites` gen is bumped on a theme flip anyway, so the mix is redundant
-/// there — harmless, and uniformity beats a special case). The caller reads
-/// the live theme each frame, which is what makes a flip propagate on the
-/// next frame with no app-side plumbing; the collision worst case of the XOR
+/// dark. The caller reads the **live** theme each frame — off the egui context,
+/// not off any app-side cached copy — which is what makes a flip propagate on
+/// the frame it happens with no plumbing; the collision worst case of the XOR
 /// is one redundant raster.
 ///
-/// E5-forward: at E5 `is_dark` formalizes into `RenderKey` as a
-/// **handler-declared** `SelectKey` part — not universal. The radar's
-/// theme-independent 32-128 MiB `RenderCache` LRU must not flush on a theme
-/// flip; this fix keeps radar out of the theme term via the draw loop's
-/// radar skip, and E5 must preserve that.
+/// # Which handlers, and who decides
+///
+/// [`OverlayHandler::theme_sensitive`] does — the handler, in its own file,
+/// beside the branch it is describing. The term used to be applied *uniformly*
+/// to every layer, which was the right shape for a fix that had to be certain
+/// it missed nothing, and the wrong shape to keep: a layer whose pixels are
+/// theme-independent paid a full re-rasterize on every flip, and the only
+/// record of which layers actually needed it was this comment.
+///
+/// It answers `true` for exactly the four `RenderMode::Texture` handlers whose
+/// job input carries `is_dark` — SPC outlook, lightning, storm reports and
+/// radar sites. **METAR is not among them**, and that is not an omission: it is
+/// `RenderMode::PerFramePoint`, it has no cached raster and reaches no branch
+/// of this function, and its theme read is per frame and already correct. See
+/// that method's own doc for why a layer that plainly *looks* different in dark
+/// mode still declares `false` here.
+///
+/// # RadarSites is invalidated twice, and stays that way
+///
+/// Its base is the pane's own `radar_sites_render_gen`, which
+/// `App::adopt_theme` bumps on a flip, **and** it declares `theme_sensitive`,
+/// so the XOR applies too. Either alone would do it today. Both are kept
+/// deliberately: the gen bump is scheduled to move to the pane-ref work, and a
+/// token that quietly became single-sourced on it in the meantime would lose
+/// its theme invalidation at the moment that bump moves, with nothing failing
+/// to say so.
+///
+/// The radar image itself is not a layer this function is ever asked about —
+/// the draw loop's radar arm never calls it — so radar's 32-128 MiB-per-entry
+/// `RenderCache` LRU still cannot be flushed by a theme flip, which is the
+/// property `app::theme_flip_tests` holds from the other side.
 ///
 /// [`OverlayHandler::content_signature`]: rustdar_overlays::render::overlay_state::OverlayHandler::content_signature
+/// [`OverlayHandler::theme_sensitive`]: rustdar_overlays::render::overlay_state::OverlayHandler::theme_sensitive
 fn overlay_cache_token(
     overlays: &OverlayRegistry,
     pane: &PaneState,
@@ -688,10 +719,27 @@ fn overlay_cache_token(
     } else {
         overlays.content_signature(id)
     };
-    base ^ if is_dark { 0x9E37_79B9_7F4A_7C15 } else { 0 }
+    let themed = is_dark && overlays.theme_sensitive(id);
+    base ^ if themed { 0x9E37_79B9_7F4A_7C15 } else { 0 }
 }
 
-/// Render the radar image overlay, range ring, and hover tooltip (loop playback path) (loop playback path).
+/// Render the radar image overlay, range ring, and hover tooltip (loop playback
+/// path).
+///
+/// # This is the loop's per-frame path, and it no longer computes a placement
+///
+/// It used to open with `ImageBounds::from_radar_site(img.lat, img.lon,
+/// img.max_range_km)` — a `cos`, two `tan`s and two `ln`s — to rebuild, on
+/// every frame of every animating pane, the four edges the delivery had already
+/// worked out from the very same three numbers. The frame carries
+/// [`RadarImageData::placed`] now and this reads it.
+///
+/// **No off-screen cull, deliberately.** [`draw_overlay_texture`] skips a
+/// submission whose rect misses the pane and this does not; the two share the
+/// rect arithmetic (`overlay_cache::placed_rect`) and nothing else. Adding one
+/// here would change what loop playback draws, unmeasured, on the strength of a
+/// convergence that was about arithmetic — see `draw_overlay_texture`'s own
+/// note for the other half of the decision.
 fn render_radar_overlay(
     ui: &egui::Ui,
     projector: &walkers::Projector,
@@ -700,19 +748,9 @@ fn render_radar_overlay(
     pane_rect: egui::Rect,
     prefs: &UserPreferences,
 ) {
-    let bounds = ImageBounds::from_radar_site(img.lat, img.lon, img.max_range_km);
-
-    let nw = projector
-        .project(walkers::lat_lon(bounds.max_lat, bounds.min_lon))
-        .to_pos2();
-    let se = projector
-        .project(walkers::lat_lon(bounds.min_lat, bounds.max_lon))
-        .to_pos2();
-    let rect = egui::Rect::from_two_pos(nw, se);
-
     ui.painter().image(
         img.texture.id(),
-        rect,
+        crate::overlay_cache::placed_rect(projector, &img.placed),
         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
         egui::Color32::WHITE,
     );
@@ -1177,7 +1215,7 @@ const FOLD_TICK_THICKNESS: f32 = 2.0;
 /// How far a fold marker sticks out past each face of the bar, logical pixels.
 ///
 /// **The overhang is load-bearing, not decoration.** `InputHarness::
-/// color_scale_strips` classifies a legend by shape — a rect 20 points across
+/// color_scale_bars` classifies a legend by shape — a rect 20 points across
 /// the bar and ≤4 along it is one strip of the ramp — and a marker drawn to the
 /// bar's own width would be counted as one more strip of colour by every test
 /// that asserts on those counts. Standing 3 points proud of both faces takes
@@ -1267,7 +1305,7 @@ pub(super) fn color_scale_gutter(
         return 0.0;
     }
     let product = pane.selected_product;
-    let legend = get_legend_scale(product);
+    let legend = get_legend_scale_ref(product);
     if legend.thresholds.len() < 2 {
         return 0.0;
     }
@@ -1286,7 +1324,7 @@ pub(super) fn color_scale_gutter(
     // bar-and-gap further in. Every one of them is measured rather than the
     // innermost alone, because which block reaches deepest is a question about
     // their titles and ticks and not only about their offsets.
-    let ticks = legend_ticks(product, prefs);
+    let ticks = memoized_ticks(measure.ctx(), pane, prefs);
     let mut reach = legend_block_reach(measure, horizontal, 0.0, &ticks, product.unit_label(prefs));
     let mut offset = 0.0;
     for id in &pane.draw_order {
@@ -1296,24 +1334,17 @@ pub(super) fn color_scale_gutter(
         let Some(overlay) = overlays.legend(id) else {
             continue;
         };
-        if overlay.thresholds.len() < 2 {
+        if overlay.items.thresholds.len() < 2 {
             continue;
         }
         offset += SCALE_BAR_WIDTH + SCALE_STACK_GAP;
-        // `{val:.0}` is the form `render_overlay_color_scales` writes them in:
-        // an overlay legend carries no product, so there is no unit preference
-        // to convert through.
-        let ticks: Vec<String> = overlay
-            .thresholds
-            .iter()
-            .map(|&(value, _)| format!("{value:.0}"))
-            .collect();
+        let ticks = memoized_overlay_ticks(measure.ctx(), id, &overlay);
         reach = reach.max(legend_block_reach(
             measure,
             horizontal,
             offset,
             &ticks,
-            overlay.unit_label,
+            overlay.items.unit_label,
         ));
     }
     let mut gutter = SCALE_MARGIN + reach;
@@ -1446,12 +1477,89 @@ fn short_tick(value: f32) -> String {
 /// to leave room for what the painter writes, and the tests that check the
 /// wording. Two spellings of the tick list is how the gutter comes to reserve
 /// room for labels the bar is no longer labelled with.
+///
+/// The **formatting**, not the per-frame answer: [`memoized_ticks`] is what the
+/// painter and the gutter call, and it calls this on a miss. Tests call it
+/// directly, which is the point of it staying a plain function of its
+/// arguments.
 pub(super) fn legend_ticks(product: RadarProduct, prefs: &UserPreferences) -> Vec<String> {
-    get_legend_scale(product)
+    get_legend_scale_ref(product)
         .thresholds
         .iter()
         .map(|&(value, _)| format_legend_value(product, value, prefs))
         .collect()
+}
+
+/// [`legend_ticks`], formatted at most once per preferences change.
+///
+/// The bar's labels are a `Vec<String>` per call, and both per-frame callers
+/// want the same one — a preference the user changes by opening a settings
+/// sheet, rebuilt sixty times a second by two functions each. The version key
+/// is the preferences themselves rather than a hash of them: a collision here
+/// would show as a bar labelled in the wrong unit, and there is nothing to be
+/// gained by risking one.
+fn memoized_ticks(
+    ctx: &egui::Context,
+    pane: &PaneState,
+    prefs: &UserPreferences,
+) -> std::sync::Arc<Vec<String>> {
+    let product = pane.selected_product;
+    legend_ramp::labels(
+        ctx,
+        egui::Id::new(("rustdar::legend_ticks::radar", product)),
+        prefs.clone(),
+        || legend_ticks(product, prefs),
+    )
+}
+
+/// An overlay bar's value labels, formatted at most once per legend signature.
+///
+/// `{val:.0}` is the form these have always been written in: an overlay legend
+/// carries no product, so there is no unit preference to convert through — its
+/// `unit_label` is a fixed string it supplies itself.
+fn memoized_overlay_ticks(
+    ctx: &egui::Context,
+    id: &LayerId,
+    legend: &Signed<OverlayLegend>,
+) -> std::sync::Arc<Vec<String>> {
+    legend_ramp::labels(
+        ctx,
+        egui::Id::new(("rustdar::legend_ticks::overlay", id.as_str())),
+        legend.signature,
+        || {
+            legend
+                .items
+                .thresholds
+                .iter()
+                .map(|&(value, _)| format!("{value:.0}"))
+                .collect()
+        },
+    )
+}
+
+/// The baked ramp for `pane`'s radar colour bar.
+///
+/// Sampled through [`get_color_for_value`] — the same function the per-pixel
+/// draw called, at the same values — so the bar is the palette's own answer and
+/// not a re-interpolation of the legend's stops. The palette is a compile-time
+/// table, so the ramp is [`legend_ramp::IMMUTABLE`]: baked on the frame the
+/// product changes, and never again.
+fn radar_ramp(ctx: &egui::Context, pane: &PaneState, horizontal: bool) -> egui::TextureHandle {
+    let product = pane.selected_product;
+    let scale = get_legend_scale_ref(product);
+    let min = scale.min_value;
+    let range = scale.max_value - min;
+    legend_ramp::ramp(
+        ctx,
+        egui::Id::new(("rustdar::legend_ramp::radar", product, horizontal)),
+        legend_ramp::IMMUTABLE,
+        "legend_ramp_radar",
+        horizontal,
+        |t| {
+            let (r, g, b, a) = get_color_for_value(product, min + t * range);
+            [r, g, b, a]
+        },
+    )
 }
 
 /// Format a legend label value. For HHC uses category names; for others, a short numeric string.
@@ -1778,7 +1886,7 @@ pub(super) fn render_color_scale(
     prefs: &UserPreferences,
 ) {
     let product = pane.selected_product;
-    let legend = get_legend_scale(product);
+    let legend = get_legend_scale_ref(product);
     if legend.thresholds.len() < 2 {
         return;
     }
@@ -1824,35 +1932,30 @@ pub(super) fn render_color_scale(
     let n = legend.thresholds.len();
 
     if legend.is_gradient {
-        // Gradient scales: per-pixel sampling for smooth interpolation.
-        let steps = bar_length.ceil() as usize;
-        for i in 0..steps {
-            let t = i as f32 / (steps - 1).max(1) as f32;
-            let value = min_val + t * range;
-            let (r, g, b, a) = get_color_for_value(product, value);
-            if a == 0 {
-                continue;
-            }
-            let color = egui::Color32::from_rgb(r, g, b);
-            // Use 2px wide strips to avoid sub-pixel gaps
-            if horizontal {
-                let x = bar_rect.left() + t * bar_rect.width();
-                let strip = egui::Rect::from_min_size(
-                    egui::pos2(x, bar_rect.top()),
-                    egui::vec2(2.0, SCALE_BAR_WIDTH),
-                );
-                painter.rect_filled(strip, 0.0, color);
-            } else {
-                let y = bar_rect.bottom() - t * bar_rect.height();
-                let strip = egui::Rect::from_min_size(
-                    egui::pos2(bar_rect.left(), y - 1.0),
-                    egui::vec2(SCALE_BAR_WIDTH, 2.0),
-                );
-                painter.rect_filled(strip, 0.0, color);
-            }
-        }
+        // Gradient scales: one image over a ramp baked once per product.
+        //
+        // This was a per-pixel loop — `bar_length.ceil()` strips, each a
+        // `rect_filled` behind a binary search of the palette — which is ~1032
+        // of each per bar on a 1080-point pane, every frame, for a picture that
+        // is a pure function of the product. See `crate::legend_ramp`.
+        painter.image(
+            radar_ramp(painter.ctx(), pane, horizontal).id(),
+            bar_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
     } else {
         // Discrete scales: equal-sized blocks, one per threshold.
+        //
+        // Left as blocks on purpose. The cost the bake exists to remove is the
+        // gradient's — a search per pixel of bar; a discrete bar reads
+        // `thresholds[i]` directly and issues one rect per stop, at most a few
+        // dozen. What it would *lose* is the reason: these blocks are hard
+        // edges at exact fractions of the bar, drawn as rects and antialiased
+        // by the tessellator, and a stretched `NEAREST` texture would put each
+        // boundary within a texel of where it is now rather than on it. A
+        // category bar whose edges moved is a visible change bought for
+        // nothing.
         for i in 0..n {
             let (_, rgb) = legend.thresholds[i];
             let color = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
@@ -1956,13 +2059,9 @@ pub(super) fn render_color_scale(
     let label_font = egui::FontId::proportional(SCALE_FONT_SIZE);
     let title_font = egui::FontId::proportional(SCALE_TITLE_FONT_SIZE);
 
-    let mut label_positions: Vec<(f32, String)> = Vec::new();
-    for ((i, &(val, _)), text) in legend
-        .thresholds
-        .iter()
-        .enumerate()
-        .zip(legend_ticks(product, prefs))
-    {
+    let mut label_positions: Vec<(f32, &str)> = Vec::new();
+    let tick_text = memoized_ticks(painter.ctx(), pane, prefs);
+    for ((i, &(val, _)), text) in legend.thresholds.iter().enumerate().zip(tick_text.iter()) {
         let pixel_pos = if legend.is_gradient {
             // Gradient: value-proportional positioning
             let t = (val - min_val) / range;
@@ -1996,7 +2095,7 @@ pub(super) fn render_color_scale(
             prev_pos = Some(*pos);
             true
         })
-        .map(|(pos, text)| (*pos, text.as_str()))
+        .copied()
         .collect();
 
     for (pixel_pos, text) in &thinned {
@@ -2310,7 +2409,7 @@ fn render_overlay_color_scales(
         let Some(legend) = overlays.legend(id) else {
             continue;
         };
-        if legend.thresholds.len() < 2 {
+        if legend.items.thresholds.len() < 2 {
             continue;
         }
 
@@ -2339,50 +2438,53 @@ fn render_overlay_color_scales(
             egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom))
         };
 
-        let min_val = legend.min_value;
-        let max_val = legend.max_value;
+        let min_val = legend.items.min_value;
+        let max_val = legend.items.max_value;
         let range = max_val - min_val;
         if range.abs() < f32::EPSILON {
             continue;
         }
 
-        // Always gradient for overlay legends.
-        let steps = bar_length.ceil() as usize;
-        for i in 0..steps {
-            let t = i as f32 / (steps - 1).max(1) as f32;
-            let value = min_val + t * range;
-            let color = interpolate_legend_color(&legend.thresholds, value);
-            let [r, g, b] = color;
-            if horizontal {
-                let x = bar_rect.left() + t * bar_rect.width();
-                let strip = egui::Rect::from_min_size(
-                    egui::pos2(x, bar_rect.top()),
-                    egui::vec2(2.0, SCALE_BAR_WIDTH),
-                );
-                painter.rect_filled(strip, 0.0, egui::Color32::from_rgb(r, g, b));
-            } else {
-                let y = bar_rect.bottom() - t * bar_rect.height();
-                let strip = egui::Rect::from_min_size(
-                    egui::pos2(bar_rect.left(), y - 1.0),
-                    egui::vec2(SCALE_BAR_WIDTH, 2.0),
-                );
-                painter.rect_filled(strip, 0.0, egui::Color32::from_rgb(r, g, b));
-            }
-        }
+        // Always gradient for overlay legends — one image over a ramp baked
+        // once per legend signature.
+        //
+        // This was the worse of the two per-pixel loops: `bar_length.ceil()`
+        // strips, each behind a **linear** scan of the threshold list rather
+        // than the radar bar's binary search, per stacked overlay bar per pane
+        // per frame. See `crate::legend_ramp`.
+        let thresholds = &legend.items.thresholds;
+        painter.image(
+            legend_ramp::ramp(
+                painter.ctx(),
+                egui::Id::new(("rustdar::legend_ramp::overlay", id.as_str(), horizontal)),
+                legend.signature,
+                "legend_ramp_overlay",
+                horizontal,
+                |t| {
+                    let [r, g, b] = interpolate_legend_color(thresholds, min_val + t * range);
+                    [r, g, b, 255]
+                },
+            )
+            .id(),
+            bar_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
 
         // Labels
         let label_font = egui::FontId::proportional(SCALE_FONT_SIZE);
         let title_font = egui::FontId::proportional(SCALE_TITLE_FONT_SIZE);
 
-        let mut label_positions: Vec<(f32, String)> = Vec::new();
-        for &(val, _) in &legend.thresholds {
+        let tick_text = memoized_overlay_ticks(painter.ctx(), id, &legend);
+        let mut label_positions: Vec<(f32, &str)> = Vec::new();
+        for (&(val, _), text) in legend.items.thresholds.iter().zip(tick_text.iter()) {
             let t = (val - min_val) / range;
             let pixel_pos = if horizontal {
                 bar_rect.left() + t * bar_rect.width()
             } else {
                 bar_rect.bottom() - t * bar_rect.height()
             };
-            label_positions.push((pixel_pos, format!("{val:.0}")));
+            label_positions.push((pixel_pos, text));
         }
 
         let mut prev_pos: Option<f32> = None;
@@ -2397,7 +2499,7 @@ fn render_overlay_color_scales(
                 prev_pos = Some(*pos);
                 true
             })
-            .map(|(pos, text)| (*pos, text.as_str()))
+            .copied()
             .collect();
 
         for (pixel_pos, text) in &thinned {
@@ -2423,7 +2525,7 @@ fn render_overlay_color_scales(
         }
 
         // Title
-        let unit = legend.unit_label;
+        let unit = legend.items.unit_label;
         if horizontal {
             // Under its own bar, for the reason the radar bar's title is: 12
             // points is not enough to lay `kg/m²` out in, and the pane's clip
@@ -2707,7 +2809,7 @@ mod tests {
 
         // The stops themselves are untouched by the preference: this is a
         // relabelling, not a repalettising.
-        let inch_stops: Vec<f32> = get_legend_scale(RadarProduct::MaxExpectedHailSize)
+        let inch_stops: Vec<f32> = get_legend_scale_ref(RadarProduct::MaxExpectedHailSize)
             .thresholds
             .iter()
             .map(|&(v, _)| v)
@@ -2740,7 +2842,7 @@ mod tests {
                 ..UserPreferences::default()
             };
             let product = RadarProduct::MaxExpectedHailSize;
-            for &(stop, _) in &get_legend_scale(product).thresholds {
+            for &(stop, _) in get_legend_scale_ref(product).thresholds {
                 let tick = format_legend_value(product, stop, &prefs);
                 assert_eq!(
                     product.format_value(stop, &prefs),
@@ -2812,7 +2914,7 @@ mod tests {
             // And the number on the bar is the number the readout gives for the
             // same stop, to the tick's own precision — the half-converted pane
             // is the failure, not the rounding.
-            let top = get_legend_scale(product)
+            let top = get_legend_scale_ref(product)
                 .thresholds
                 .last()
                 .expect("the echo-tops ramp has stops")
@@ -2830,7 +2932,7 @@ mod tests {
     /// The velocity ramp's own reach, m/s — what a fold marker has to fall
     /// inside to be drawable.
     fn velocity_bounds() -> (f32, f32) {
-        let legend = get_legend_scale(RadarProduct::Velocity);
+        let legend = get_legend_scale_ref(RadarProduct::Velocity);
         (legend.min_value, legend.max_value)
     }
 

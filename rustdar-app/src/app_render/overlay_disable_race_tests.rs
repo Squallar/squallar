@@ -82,7 +82,7 @@ fn app_awaiting_a_render(ctx: &egui::Context) -> (crate::app::App, egui::Texture
     let cache = pane.overlay_cache_mut(&KIND);
     cache.show(OverlayTextureData {
         texture: parked,
-        geo_bounds: bounds(),
+        placed: rustdar_geo::PlacedRaster::of(bounds()),
         data_generation: 1,
         render_zoom: 32,
         width: W,
