@@ -247,7 +247,11 @@ impl Gui {
             }
             None
         }
-        OVERLAY_CONTROL_ORDER
+        // The live registry, same as the walk: a handler with a dropdown that
+        // no list mentions is still a handler this helper can reach.
+        let registered: Vec<rustdar_source::id::LayerId> =
+            self.overlays.handlers().map(|h| h.id()).collect();
+        registered
             .iter()
             .find_map(|kind| find(&self.overlays.controls(kind, &view.layer(kind)), label))
     }

@@ -13,6 +13,26 @@ pub fn all() -> Vec<Box<dyn SourceHandler>> {
         .collect()
 }
 
+/// **How many layers this build registers — a hand-kept number, and it must
+/// stay one.**
+///
+/// This is the *second spelling* of the registry's size, and the whole point
+/// of it is that it does not come from [`all`]. WO-M9 built the catalog leg's
+/// anti-shrink floor as two spellings maintained on opposite sides of one
+/// question, so they cannot shrink together by accident; the first spelling is
+/// the derived inventory the parity walk builds out of the live registry, and
+/// this is the one a person has to change on purpose.
+///
+/// **Never derive this from `all()`, `sources()`, `LAYER_ID_LEDGER::len()` or
+/// anything else that moves when a registration moves.** A floor computed from
+/// the thing it is meant to floor compares the registry against itself and
+/// cannot fail — the shape that cost this campaign an entire class of pins.
+///
+/// The `cfg!` term is the fake source, which is registered only under
+/// `rustdar-overlays/fake-source`.
+#[cfg(test)]
+pub(crate) const REGISTERED_LAYER_COUNT: usize = 12 + cfg!(feature = "fake-source") as usize;
+
 /// The default draw order, bottom to top — every registered layer's id sorted
 /// by `SourceHandler::draw_order_weight`.
 pub fn default_draw_order() -> Vec<LayerId> {
@@ -290,14 +310,19 @@ mod registry_identity_tests {
     /// compiler to refuse a duplicate the way the enum's match arms did, so
     /// the registry pins uniqueness instead — the replacement rigor the M8c
     /// enum deletion depends on.
+    ///
+    /// **This is also half of the anti-shrink floor WO-E9d rebuilt.** The
+    /// count it asserts is [`super::REGISTERED_LAYER_COUNT`], a hand-kept
+    /// literal, so a composition that quietly lost a registration fails here
+    /// rather than handing every derived walk a shorter list to be satisfied
+    /// by. The other half is `every_handlers_id_sits_in_the_ledger` below.
     #[test]
     fn no_two_handlers_share_an_id() {
         let handlers = all();
         assert_eq!(
             handlers.len(),
-            12 + cfg!(feature = "fake-source") as usize,
-            "the walk below must cover all twelve — thirteen with the fake \
-             source registered",
+            super::REGISTERED_LAYER_COUNT,
+            "the walk below must cover every registered layer",
         );
         let mut seen = std::collections::HashSet::new();
         for h in &handlers {
@@ -312,6 +337,13 @@ mod registry_identity_tests {
 
     /// b1 pin: every handler's id sits in the append-only ledger — a handler
     /// cannot register a spelling `LAYER_ID_LEDGER` does not carry.
+    ///
+    /// **The other half of the rebuilt anti-shrink floor**, and asserted in
+    /// ONE direction on purpose: every registered id is in the ledger, never
+    /// the reverse. The ledger is append-only and may legitimately name a
+    /// spelling this build does not register — a retired layer, or the fake
+    /// source with its feature off — so the reverse would be a gate that fails
+    /// on correct behaviour.
     #[test]
     fn every_handlers_id_sits_in_the_ledger() {
         for h in &all() {

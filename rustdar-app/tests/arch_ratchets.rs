@@ -178,7 +178,19 @@ const GUI_IMPL_SETTER_MAX: usize = 1;
 /// **439 since WO-E7e**: its two new pins name the enum twice, and hoisting the
 /// repeated product bindings in `target_matching_tolerates_elevation_jitter_only`
 /// gave back three — lowered in the land that earned it, never raised.
-const PRODUCT_IN_EGUI_MAX: usize = 439;
+///
+/// **405 since WO-E9d, and the lowering was WO-E9c's to take.** E9c deleted
+/// `slider_range` and `slider_labels` and re-keyed both 3D editor stores,
+/// which moved the haystack per file against `80a964a3`: `volume_iso.rs`
+/// 38 -> 16, `volume_alpha.rs` 16 -> 5, `ui_volume_alpha.rs` 10 -> 0,
+/// `ui_config.rs` 13 -> 9, while the corpus fixture and config suites that
+/// prove the on-disk spelling did not move gave 9 and 4 back:
+/// `439 - 22 - 11 - 10 - 4 + 9 + 4 = 405`, re-measured per file rather than
+/// inferred. **E9c earned that and did not take it**, leaving the pin 34
+/// above its own haystack -- slack a later land could have spent with nothing
+/// going red. The rule is "lower it in the land that earns it"; this note
+/// exists so the arrears stay on the record instead of being absorbed.
+const PRODUCT_IN_EGUI_MAX: usize = 405;
 /// Row 6.
 ///
 /// **17 since WO-M12b**: the loop scan-list channel is gone — a radar frame
