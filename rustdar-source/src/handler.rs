@@ -792,6 +792,14 @@ pub trait SourceHandler: Send {
     ///
     /// The frame cache is the **handler's own**: nothing above keeps a parallel
     /// map of frames, so nothing above can disagree with this answer.
+    ///
+    /// **Not yet true of the radar layer**, which is the only implementor of
+    /// this surface today: the decoded volumes and the paired Level III
+    /// objects its frames are made of are held ABOVE it, so it takes the
+    /// default here and answers with none while the frames exist. It becomes
+    /// true when those two caches move behind the handler — WO-M12d — and the
+    /// claim above is a statement about the contract, not about the tree,
+    /// until then.
     fn frames_resident(&self, pane: &PaneRef<'_>) -> Vec<FrameStamp> {
         let _ = pane;
         Vec::new()
@@ -799,7 +807,8 @@ pub trait SourceHandler: Send {
 
     /// Drop every resident frame **not** in `keep`. The one eviction door, so
     /// the budget that decides what to keep lives above and the storage stays
-    /// below.
+    /// below — with the same caveat [`Self::frames_resident`] carries: radar's
+    /// storage is still above, so radar still evicts its own.
     fn retain_frames(&mut self, pane: &PaneRef<'_>, keep: &[FrameStamp]) {
         let _ = (pane, keep);
     }

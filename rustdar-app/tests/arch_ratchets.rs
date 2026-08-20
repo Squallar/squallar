@@ -36,6 +36,8 @@
 //!  7a  overlays-crate path occurrences in offload.rs     0    0  rg -o 'rustdar_''overlays::' rustdar-worker/src/offload.rs | wc -l
 //!  7b  radar-crate path occurrences in offload.rs        0    0  rg -o 'rustdar_''radar::' rustdar-worker/src/offload.rs | wc -l
 //!  8   config-swap occurrences, six crates                0    -  rg -o 'load_pane''_configs|save_pane''_configs|loaded_''configs' rustdar-{overlays,egui,app,radar,source,worker} --glob '*.rs' | wc -l
+//!  9a  radar-geometry definitions in rustdar-radar        1    -  rg -o 'struct Loop''Geometry' rustdar-radar --glob '*.rs' | wc -l
+//!  9b  ... in rustdar-egui                                 0    1  rg -o 'struct Loop''Geometry' rustdar-egui --glob '*.rs' | wc -l
 //! ```
 //!
 //! Rows 1b, 2, 6, 7a and 7b were already pinned at their measured values and do
@@ -83,6 +85,12 @@ const SWAP_MEMO: &str = concat!("loaded_", "configs");
 /// If the walk stops seeing this, it is reading the wrong tree and the three
 /// zeroes below mean nothing.
 const SWAP_REPLACEMENT: &str = concat!("serialize_pane", "_state");
+
+/// Row 9 — the radar geometry type's DEFINITION, wherever it lives. Split so
+/// neither half can be satisfied by a haystack the walk never reached: the
+/// definition must be found in `rustdar-radar` and must not be found in
+/// `rustdar-egui`.
+const GEOMETRY_DEF: &str = concat!("struct Loop", "Geometry");
 
 // --------------------------------------------------------------------------- Ceilings
 // — at-land measurements (see the table above).
@@ -394,4 +402,45 @@ fn offload_names_zero_source_crate_types() {
              over anything."
         );
     }
+}
+
+/// Row 9 — **a radar type is not defined in the presentation crate.**
+///
+/// `LoopGeometry` is the site code and the coordinates a radar loop's frames
+/// are projected about. It was parked in `rustdar-egui/src/radar_layer.rs`
+/// because WO-E7a's fence forbade touching `rustdar-radar`; WO-M12e moved it
+/// to `rustdar_radar::loop_geometry`, where the type's own crate owns it and
+/// the presentation crate only reads it back out of a timeline's anchor.
+///
+/// The zero is checked against the definition being found in radar on the
+/// SAME needle — a definition that moved back, or a needle that rotted, fails
+/// one half or the other rather than passing both for the wrong reason.
+#[test]
+fn the_radar_geometry_type_is_defined_in_radar_and_not_in_egui() {
+    let radar = load_tree(&Path::new(ROOT).join("rustdar-radar"));
+    let egui = load_tree(&Path::new(ROOT).join("rustdar-egui"));
+    assert!(
+        radar.len() > 20 && egui.len() > 20,
+        "presence control: the walk reached {} radar and {} egui .rs files, \
+         which is too few to be the real trees — both counts below would be \
+         about nothing",
+        radar.len(),
+        egui.len(),
+    );
+    assert_eq!(
+        count(&radar, GEOMETRY_DEF),
+        1,
+        "the radar geometry type is not defined in rustdar-radar. Either it \
+         moved back out of its own crate, or the needle {GEOMETRY_DEF:?} \
+         rotted — a dead needle would leave the zero below green over \
+         anything. See WO-M12e.",
+    );
+    assert_eq!(
+        count(&egui, GEOMETRY_DEF),
+        0,
+        "a radar type is defined in the presentation crate again \
+         ({GEOMETRY_DEF:?}). Radar's own types belong in rustdar-radar; \
+         rustdar-egui reads this one back out of `LayerTimeState::anchor` and \
+         never declares it. See WO-M12e, and ruling (15) as amended by (23).",
+    );
 }
