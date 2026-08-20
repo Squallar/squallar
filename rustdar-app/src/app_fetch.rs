@@ -1723,7 +1723,10 @@ fn append_polled_frame_to_loops(
             super::render::loop_frames_held(allocation, pane.loop_state(), budgets),
             pane.animating_layers().count(),
         );
-        if append_polled_frame(pane.loop_state_mut(), site, timestamp, held) {
+        // Read before the timeline is borrowed mutably: the window this
+        // append evicts against is the pane's clock, not the layer's.
+        let clock = pane.time.mode;
+        if append_polled_frame(pane.loop_state_mut(), site, timestamp, held, clock) {
             // The frame list moved under the playhead — evicted at the front,
             // possibly re-sampled — so the pane's clock names a different
             // index now. It names the same INSTANT, which is the point.
@@ -1779,6 +1782,7 @@ fn append_polled_frame(
     site: &str,
     timestamp: chrono::NaiveDateTime,
     held: usize,
+    clock: rustdar_egui::pane::TimeMode,
 ) -> bool {
     use rustdar_egui::pane::LoopFrame;
 
@@ -1805,9 +1809,19 @@ fn append_polled_frame(
         },
     );
 
+    // **The window is anchored on the pane's CLOCK** (WO-M12f), resolved
+    // through this layer's own axis: a live pane's clock is the newest frame
+    // it holds — which is what `TimeMode::Live` means to a frame series — and
+    // a scrubbed pane's is the instant it is parked on. Anchored on the newest
+    // frame unconditionally, as it was, one arriving live frame evicted the
+    // frames a scrubbed pane was actually looking at.
     let lookback = chrono::Duration::seconds(ls.span_secs as i64);
-    if let Some(newest) = ls.frames.last().map(|f| f.timestamp) {
-        let cutoff = newest - lookback;
+    let anchor = match clock {
+        rustdar_egui::pane::TimeMode::AsOf(instant) => Some(instant),
+        rustdar_egui::pane::TimeMode::Live => ls.frames.last().map(|f| f.timestamp),
+    };
+    if let Some(anchor) = anchor {
+        let cutoff = anchor - lookback;
         ls.frames.retain(|f| f.timestamp >= cutoff);
     }
 
