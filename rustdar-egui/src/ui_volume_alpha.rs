@@ -45,7 +45,9 @@ pub(crate) fn editor_ui(
     curves: &mut AlphaCurves,
     #[cfg(test)] probe: &mut Vec<(usize, egui::Rect)>,
 ) {
-    let product = pane.selected_product();
+    // The field's registered facts, read once: this file names no product
+    // type at all now, only what the registry says about the pane's field.
+    let facts = rustdar_radar::fields::spec(pane.selected_product());
     let Some(volume) = pane.volume_mut() else {
         return;
     };
@@ -82,14 +84,14 @@ pub(crate) fn editor_ui(
     }
 
     let mut open = true;
-    egui::Window::new(format!("Volume Alpha - {}", product.name()))
+    egui::Window::new(format!("Volume Alpha - {}", facts.name))
         .id(egui::Id::new(("volume_alpha_editor", pane_idx)))
         .open(&mut open)
         .default_width(460.0)
         .default_pos(pane_rect.center() - egui::vec2(230.0, 90.0))
         .resizable(true)
         .show(ui.ctx(), |ui| {
-            editor_contents(ui, pane_idx, product, painter, target, curves);
+            editor_contents(ui, pane_idx, facts, painter, target, curves);
         });
     volume.alpha_editor_open = open;
 }
@@ -105,12 +107,16 @@ fn corner_button_rect(chrome_rect: egui::Rect) -> Option<egui::Rect> {
 }
 
 /// What the editor says when there is no table to draw a curve over.
-fn absent_curve_message(product: rustdar_radar::types::RadarProduct) -> String {
-    if rustdar_radar::derive::volume_slot(product).is_none() {
+///
+/// The gate is the field's own registered `vertical`, not a second reading of
+/// the derive table — the two are the same fact, pinned as such where the
+/// projection is built. The words are unchanged.
+fn absent_curve_message(facts: &rustdar_source::product::ProductSpec) -> String {
+    if !facts.vertical {
         format!(
             "{} does not render in 3D, so there is no volume opacity to edit \
              - pick a moment the radar measures or derives tilt by tilt.",
-            product.name(),
+            facts.name,
         )
     } else {
         "The volume is still building - its palette arrives with it, and the \
@@ -124,7 +130,7 @@ fn absent_curve_message(product: rustdar_radar::types::RadarProduct) -> String {
 fn editor_contents(
     ui: &mut egui::Ui,
     pane_idx: usize,
-    product: rustdar_radar::types::RadarProduct,
+    facts: &rustdar_source::product::ProductSpec,
     painter: Option<&dyn crate::volume_view::VolumePainter>,
     target: Option<&crate::pane::VolumeTarget>,
     curves: &mut AlphaCurves,
@@ -132,15 +138,15 @@ fn editor_contents(
     let palette = target.and_then(|t| painter.and_then(|p| p.palette(pane_idx, t)));
     let palette_curve = palette.as_deref().and_then(AlphaCurve::from_palette);
 
-    let shown = curves.get(product).or_else(|| palette_curve.clone());
+    let shown = curves.get(&facts.id).or_else(|| palette_curve.clone());
     let Some(shown) = shown else {
-        ui.label(absent_curve_message(product));
+        ui.label(absent_curve_message(facts));
         return;
     };
 
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(curves.is_edited(product), egui::Button::new(RESET_LABEL))
+            .add_enabled(curves.is_edited(&facts.id), egui::Button::new(RESET_LABEL))
             .on_hover_text(
                 "Forget the drawn curve and render through this product's default volume \
                  opacity again - the plan-view palette's alpha shaped by the product's \
@@ -150,9 +156,9 @@ fn editor_contents(
             )
             .clicked()
         {
-            curves.reset(product);
+            curves.reset(&facts.id);
         }
-        if curves.is_edited(product) {
+        if curves.is_edited(&facts.id) {
             ui.weak("edited");
         }
     });
@@ -177,7 +183,9 @@ fn editor_contents(
         strip_rect,
         &shown,
         palette.as_deref(),
-        palette_curve.as_ref().filter(|_| curves.is_edited(product)),
+        palette_curve
+            .as_ref()
+            .filter(|_| curves.is_edited(&facts.id)),
     );
 
     let anchor_id = response.id.with("stroke_anchor");
@@ -192,7 +200,7 @@ fn editor_contents(
                 .unwrap_or(sample);
             let mut alphas = *shown.alphas();
             apply_stroke(&mut alphas, previous, sample);
-            curves.set(product, AlphaCurve::from_alphas(alphas));
+            curves.set(&facts.id, AlphaCurve::from_alphas(alphas));
             ui.ctx().data_mut(|d| d.insert_temp(anchor_id, sample));
         }
     } else {
@@ -204,11 +212,11 @@ fn editor_contents(
             let sample = curve_point(curve_rect, pos);
             let mut alphas = *shown.alphas();
             apply_stroke(&mut alphas, sample, sample);
-            curves.set(product, AlphaCurve::from_alphas(alphas));
+            curves.set(&facts.id, AlphaCurve::from_alphas(alphas));
         }
     }
     if response.secondary_clicked() {
-        curves.reset(product);
+        curves.reset(&facts.id);
     }
 
     ui.weak(
@@ -306,36 +314,64 @@ fn paint_editor(
 mod tests {
     use super::*;
 
-    /// The reset button must not promise the palette's opacity.
+    /// **The editor admits the derived fields and refuses only the fieldless**,
+    /// re-pinned through field ids rather than through enum variants.
+    ///
+    /// The intent is unchanged — SRV, NROT and KDP admitted, the four
+    /// composites refused — and the gate under test is now the registered
+    /// `vertical` fact, which is asserted per id beside the message so a
+    /// registration that flipped is a named diff rather than a message that
+    /// quietly changed.
     #[test]
-    fn the_editor_admits_the_derived_products_and_refuses_only_the_fieldless() {
-        use rustdar_radar::types::RadarProduct;
-        let refused = |p| absent_curve_message(p).contains("does not render in 3D");
-        for product in [
-            RadarProduct::StormRelativeVelocity,
-            RadarProduct::NormalizedRotation,
-            RadarProduct::SpecificDifferentialPhase,
+    fn the_editor_admits_the_derived_fields_and_refuses_only_the_fieldless() {
+        use rustdar_source::product::FieldId;
+        let spec = |id: &str| {
+            let id = FieldId::new(id);
+            rustdar_radar::fields::products()
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("{id} is registered"))
+        };
+        let refused = |s| absent_curve_message(s).contains("does not render in 3D");
+
+        for id in [
+            "StormRelativeVelocity",
+            "NormalizedRotation",
+            "SpecificDifferentialPhase",
         ] {
+            let facts = spec(id);
             assert!(
-                !refused(product),
-                "{} is derived tilt by tilt and renders in 3D, but the editor \
-                 refuses it by name",
-                product.name(),
+                facts.vertical,
+                "precondition: {id} is registered as having vertical extent, \
+                 which is the gate this test is about",
             );
             assert!(
-                rustdar_radar::sampler::samplable(product).is_none(),
-                "precondition: {} has no native moment, so this test is about \
-                 the `volume_slot` gate and not about `samplable`",
-                product.name(),
+                !refused(facts),
+                "{id} is derived tilt by tilt and renders in 3D, but the editor \
+                 refuses it by name",
+            );
+            assert!(
+                rustdar_radar::sampler::samplable(
+                    rustdar_radar::fields::product_for(&facts.id).expect("registered")
+                )
+                .is_none(),
+                "precondition: {id} has no native moment, so this test is about \
+                 the vertical gate and not about `samplable`",
             );
         }
-        for product in [
-            RadarProduct::HydrometeorClassification,
-            RadarProduct::VerticallyIntegratedLiquid,
-            RadarProduct::EchoTops,
-            RadarProduct::PrecipitationRate,
+
+        for id in [
+            "HydrometeorClassification",
+            "VerticallyIntegratedLiquid",
+            "EchoTops",
+            "PrecipitationRate",
         ] {
-            assert!(refused(product), "{}", product.name());
+            let facts = spec(id);
+            assert!(
+                !facts.vertical,
+                "precondition: {id} is registered as having no vertical extent",
+            );
+            assert!(refused(facts), "{id}");
         }
     }
 

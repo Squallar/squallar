@@ -1562,3 +1562,145 @@ fn the_you_are_here_marker_follows_the_site_the_pane_moved_to() {
          on, for the whole session",
     );
 }
+
+/// **The zero-migration guarantee for the two volume editors, both
+/// directions** — a whole file written *before* `FieldId` existed, whose
+/// `volume_alpha` and `volume_iso` entries are keyed by the bare product
+/// spellings the enum used to serialize.
+///
+/// Direction 1 (load): every curve and threshold lands on the field the file
+/// named — checked by *value*, so a load that shifted every entry one place
+/// along would fail here rather than pass a count.
+///
+/// Direction 2 (save): the file is written back with the same keys, the same
+/// spellings and the same order, and the round trip reaches a fixpoint.
+///
+/// The file also carries an entry for a field this build does not register.
+/// Before WO-E9c that entry was DROPPED on load; under the open-id doctrine it
+/// is preserved inert — applying to nothing, since no pane can select a field
+/// the registry does not offer — and handed back verbatim on save. What the
+/// drop bought is asserted here unchanged: it is never reassigned to a field
+/// this build does know.
+#[test]
+fn a_pre_field_id_config_keeps_every_volume_curve_on_its_own_product_and_its_own_spelling() {
+    use rustdar_source::product::FieldId;
+
+    let store = store_with(include_str!("fixtures/volume_editors_v2.json"));
+    let mut gui = Gui::new();
+    assert!(
+        gui.load_ui_config(&store),
+        "a file whose volume tables predate FieldId must still load",
+    );
+
+    let field = |p: RadarProduct| rustdar_radar::fields::spec(p).id.clone();
+
+    // Direction 1, by value. The two curves in the file are deliberately
+    // different shapes, so a swap is visible.
+    let reflectivity = gui
+        .volume_alpha
+        .get(&field(RadarProduct::Reflectivity))
+        .expect("the file names a Reflectivity curve");
+    let kdp = gui
+        .volume_alpha
+        .get(&field(RadarProduct::SpecificDifferentialPhase))
+        .expect("the file names a KDP curve");
+    assert_ne!(
+        reflectivity.alphas(),
+        kdp.alphas(),
+        "premise: the two saved curves differ, so a swap would be visible",
+    );
+    assert_eq!(
+        reflectivity.alphas()[128],
+        128,
+        "Reflectivity's curve is the ascending ramp the file holds",
+    );
+    assert_eq!(
+        kdp.alphas()[128],
+        127,
+        "KDP's curve is the descending ramp the file holds — a load that put \
+         one product's curve on another reads the wrong number here",
+    );
+
+    assert_eq!(gui.volume_iso.get(&field(RadarProduct::Reflectivity)), 42.0,);
+    assert_eq!(
+        gui.volume_iso
+            .get(&field(RadarProduct::StormRelativeVelocity)),
+        27.5,
+    );
+
+    // The unknown entry applies to nothing this build registers.
+    let unknown = FieldId::new("TornadoProbability");
+    assert!(
+        rustdar_radar::fields::product_for(&unknown).is_none(),
+        "premise"
+    );
+    for product in RadarProduct::all() {
+        if matches!(
+            product,
+            RadarProduct::Reflectivity
+                | RadarProduct::SpecificDifferentialPhase
+                | RadarProduct::StormRelativeVelocity
+        ) {
+            continue;
+        }
+        assert!(
+            !gui.volume_alpha.is_edited(&field(*product)),
+            "the unknown curve was reassigned to {product:?}",
+        );
+        assert!(
+            !gui.volume_iso.is_edited(&field(*product)),
+            "the unknown threshold was reassigned to {product:?}",
+        );
+    }
+    assert!(
+        gui.volume_alpha.is_edited(&unknown) && gui.volume_iso.is_edited(&unknown),
+        "the unknown entries must be preserved inert, not dropped",
+    );
+
+    // Direction 2: the same spellings come back out, in the same order.
+    let save1 = gui.ui_config_json().expect("a loaded Gui serializes");
+    let v1: serde_json::Value = serde_json::from_str(&save1).expect("valid JSON");
+    let names = |v: &serde_json::Value, key: &str| -> Vec<String> {
+        v[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("{key} is an array"))
+            .iter()
+            .map(|e| {
+                e["product"]
+                    .as_str()
+                    .expect("the key is a BARE string, not a tagged value")
+                    .to_owned()
+            })
+            .collect()
+    };
+    assert_eq!(
+        names(&v1, "volume_alpha"),
+        // Code order, exactly as before this land: "kdp" sorts before "ref".
+        [
+            "SpecificDifferentialPhase",
+            "Reflectivity",
+            "TornadoProbability"
+        ],
+        "the saved curve keys are the product spellings the file used, in the \
+         code order the save has always written, with the unregistered id last",
+    );
+    assert_eq!(
+        names(&v1, "volume_iso"),
+        // "ref" before "srv", and the unregistered id after both.
+        [
+            "Reflectivity",
+            "StormRelativeVelocity",
+            "TornadoProbability"
+        ],
+    );
+
+    // And the whole file is a fixpoint, so reopening is 1:1.
+    let mut gui2 = Gui::new();
+    assert!(gui2.load_ui_config(&store_with(&save1)));
+    let save2 = gui2.ui_config_json().expect("a reloaded Gui serializes");
+    let v2: serde_json::Value = serde_json::from_str(&save2).expect("valid JSON");
+    assert_eq!(
+        v1, v2,
+        "save-load-save moved the file: reopening the app would not be 1:1",
+    );
+}

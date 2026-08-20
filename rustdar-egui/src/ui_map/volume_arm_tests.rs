@@ -292,7 +292,9 @@ fn the_alpha_curve_rides_the_frame_only_when_one_is_stored() {
     alphas[128..].fill(255);
     let curve = AlphaCurve::from_alphas(alphas);
     let product = h.gui_mut().pane(1).expect("pane 1").selected_product();
-    h.gui_mut().volume_alpha.set(product, curve.clone());
+    h.gui_mut()
+        .volume_alpha
+        .set(&rustdar_radar::fields::spec(product).id, curve.clone());
     h.frames_for(1, FRAME_DT);
     assert_eq!(
         last_seen(&painter).alpha,
@@ -300,7 +302,9 @@ fn the_alpha_curve_rides_the_frame_only_when_one_is_stored() {
         "the stored curve for the pane's product must ride the frame",
     );
 
-    h.gui_mut().volume_alpha.reset(product);
+    h.gui_mut()
+        .volume_alpha
+        .reset(&rustdar_radar::fields::spec(product).id);
     h.frames_for(1, FRAME_DT);
     assert_eq!(
         last_seen(&painter).alpha,
