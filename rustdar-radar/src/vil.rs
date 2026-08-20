@@ -140,14 +140,14 @@ const FOUR_THIRDS: f64 = 4.0 / 3.0;
 enum LwMapping {
     /// The `A313B1` table's exact semantics: floored at hundredths of g/m³
     /// (zero below 8.5 dBZ), saturated at 5.40. The legacy 16-level
-/// product's quantization, kept as an A/B variant.
+    /// product's quantization, kept as an A/B variant.
     #[cfg_attr(not(test), allow(dead_code))]
     TableFloor,
     /// Greene–Clark in floating point over the **whole** dBZ range — no
     /// floor and no 56 dBZ hail cap. The primary, and both halves of that
     /// are specified: FMH-11 Part C § 3.2.6 has DVL using "non-quantized
     /// reflectivity factor data" and converting reflectivity "below 18 dBZ
-/// threshold and above the greater dBZ (i.e., all reflectivity used)".
+    /// threshold and above the greater dBZ (i.e., all reflectivity used)".
     Analytic,
 }
 
@@ -163,19 +163,19 @@ struct VilOptions {
     depth_at_centre: bool,
     /// A participation gate on each dBZ sample: `Some(18.3)` is the legacy
     /// task's `IREFMIN` (`a313f1.ftn`); `None` lets every valid gate through
-/// to the LWC table, whose own floor zeroes everything below 8.5 dBZ.
+    /// to the LWC table, whose own floor zeroes everything below 8.5 dBZ.
     min_refl: Option<f32>,
     /// `true`: a column with no participating gate is undefined — the
     /// legacy 4×4 km product's background. `false`: any column carrying
     /// valid reflectivity is defined, at 0.0 if nothing contributes — the
-/// convention product 134 encodes (its level 2 is a defined 0.0 kg/m²).
+    /// convention product 134 encodes (its level 2 is a defined 0.0 kg/m²).
     echo_only: bool,
 }
 
 impl VilOptions {
     /// The primary: the largest sub-gate in the cell, floating-point
     /// Greene–Clark, depths at the outer bin edge, no participation gate,
-/// every data-carrying column defined.
+    /// every data-carrying column defined.
     const fn primary() -> Self {
         Self {
             stat: CellStat::Max,
@@ -187,7 +187,7 @@ impl VilOptions {
     }
 
     /// The legacy `cpc013` reading: the floored LWC table, `IREFMIN`-gated,
-/// background undefined.
+    /// background undefined.
     #[cfg_attr(not(test), allow(dead_code))]
     const fn legacy_threshold() -> Self {
         Self {
@@ -753,7 +753,7 @@ mod tests {
     ///
     /// This is what the 0.751 was. The sub-gates here are 20/20/20/50 dBZ,
     /// a single hot gate in an otherwise weak cell — the sharp-gradient case
-/// that deep convection supplies and a smooth stratiform volume does not.
+    /// that deep convection supplies and a smooth stratiform volume does not.
     #[test]
     fn a_textured_cell_reads_its_largest_sub_gate() {
         const SUB: usize = 4;

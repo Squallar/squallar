@@ -130,7 +130,6 @@ fn the_nomads_filter_reencodes_lo1_by_one_microdegree() {
     );
 }
 
-
 /// [`LambertGrid::ij_at`] reproduces grib's `GridPointIndexIterator` in closed
 /// form. Pinned against that iterator across **all sixteen** scanning modes —
 /// HRRR only ever sends 0b0100_0000, so the other fifteen have no other guard.

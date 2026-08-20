@@ -17,7 +17,9 @@ pub enum Quantity {
     TemperatureC,
     EnergyJ,
     /// A dimensionless value with the fixed unit string its colour bar prints.
-    Unitless { label: &'static str },
+    Unitless {
+        label: &'static str,
+    },
 }
 
 impl Quantity {

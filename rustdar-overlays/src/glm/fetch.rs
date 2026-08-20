@@ -351,11 +351,11 @@ async fn list_glm_files(
                     objects_seen += 1;
                     if key.ends_with(".nc")
                         && let Some(file_start) = parse_filename_start_time(key)
-                            && file_start >= start
-                            && file_start <= end
-                        {
-                            all_keys.push(key.to_string());
-                        }
+                        && file_start >= start
+                        && file_start <= end
+                    {
+                        all_keys.push(key.to_string());
+                    }
                 }
             }
 

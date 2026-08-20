@@ -1253,12 +1253,8 @@ fn volume_pane_outcome(
         _ => None,
     };
     if let Some(drag) = pan_drag
-        && let Some(pan) = crate::volume_view::pan_for_drag(
-            camera_before,
-            box_size_km,
-            pane_rect.height(),
-            drag,
-        )
+        && let Some(pan) =
+            crate::volume_view::pan_for_drag(camera_before, box_size_km, pane_rect.height(), drag)
     {
         delta.pan = pan;
     }

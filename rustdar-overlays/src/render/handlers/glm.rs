@@ -855,7 +855,6 @@ impl OverlayHandler for GlmHandler {
             items.push(ControlItem::InfoText { text });
         }
 
-
         let selected = self.satellite.to_satellites();
         for feed in self
             .dead_feeds

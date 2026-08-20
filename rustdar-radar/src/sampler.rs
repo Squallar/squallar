@@ -631,26 +631,26 @@ pub(crate) fn resolve_ladder(
     Ok(choices)
 }
 
-        // `partition_point` counts the rungs at or below the query, so 0 means
-        // the query is under the lowest beam and `len` means it is at or over
-        // the highest.
-        //
-        // The `span > 0.0` arm below is unreachable given finite rung heights
-        // and kept anyway: a `NaN` rung height sorts last under `total_cmp`,
-        // so it *can* become the upper bracket, and a panic would turn a
-        // benign degradation into a dead frame.
-        //
-        // **The seam between two rungs is where a fold does the most damage.**
-        // A two-corner lerp at `t = 0.5` of `+v` and `−v` is identically zero,
-        // where the four-corner bilinear at least needs its other two corners
-        // to agree. Measured over fourteen volumes: of 12,918 rung pairs an
-        // independent continuity oracle confirms as folds, 12,903 average to
-        // less than a quarter of the sweep's Nyquist velocity.
-        //
-        // The smaller of the two limits governs, and the guard's line sits at
-        // `SEAM_PROXIMITY_ACROSS_TILTS` — lower than the bilinear's, because
-        // across hundreds of metres of depth a real fold's ends stray further
-        // from the seam.
+// `partition_point` counts the rungs at or below the query, so 0 means
+// the query is under the lowest beam and `len` means it is at or over
+// the highest.
+//
+// The `span > 0.0` arm below is unreachable given finite rung heights
+// and kept anyway: a `NaN` rung height sorts last under `total_cmp`,
+// so it *can* become the upper bracket, and a panic would turn a
+// benign degradation into a dead frame.
+//
+// **The seam between two rungs is where a fold does the most damage.**
+// A two-corner lerp at `t = 0.5` of `+v` and `−v` is identically zero,
+// where the four-corner bilinear at least needs its other two corners
+// to agree. Measured over fourteen volumes: of 12,918 rung pairs an
+// independent continuity oracle confirms as folds, 12,903 average to
+// less than a quarter of the sweep's Nyquist velocity.
+//
+// The smaller of the two limits governs, and the guard's line sits at
+// `SEAM_PROXIMITY_ACROSS_TILTS` — lower than the bilinear's, because
+// across hundreds of metres of depth a real fold's ends stray further
+// from the seam.
 pub fn ladder_fingerprint(
     pattern: &nexrad_model::data::VolumeCoveragePattern,
     sweeps: &[&Sweep],
@@ -851,17 +851,17 @@ impl<'a> VolumeSampler<'a> {
         self.product
     }
 
-/// The identity of the sweeps the ladder would choose for `product` — the
-/// re-cut key for anything that draws from a whole volume.
-///
-/// Two volumes fingerprint equal exactly when, for this moment, every rung
-/// would be cut from the same measured data under the same declared pattern.
-/// Hashed: the **declared cut table**, and per chosen sweep the **rung key**,
-/// **elevation number**, **radial count**, first and last radials'
-/// **collection timestamps**, and the first radial's **gate count**. A sealed
-/// sweep is immutable, so this tuple names one sweep's data uniquely.
-/// [`std::hash::DefaultHasher`] is stable within a process, which is the only
-/// place the key is compared; it must never be persisted.
+    /// The identity of the sweeps the ladder would choose for `product` — the
+    /// re-cut key for anything that draws from a whole volume.
+    ///
+    /// Two volumes fingerprint equal exactly when, for this moment, every rung
+    /// would be cut from the same measured data under the same declared pattern.
+    /// Hashed: the **declared cut table**, and per chosen sweep the **rung key**,
+    /// **elevation number**, **radial count**, first and last radials'
+    /// **collection timestamps**, and the first radial's **gate count**. A sealed
+    /// sweep is immutable, so this tuple names one sweep's data uniquely.
+    /// [`std::hash::DefaultHasher`] is stable within a process, which is the only
+    /// place the key is compared; it must never be persisted.
     fn describe(&self) -> String {
         let rungs: Vec<String> = self
             .rungs
@@ -1145,17 +1145,17 @@ fn gate_bracket(moment: &MomentData, slant_km: f64) -> (Sample, Sample, f64) {
     )
 }
 
-    /// The ladder, as one line: per rung, `nominal->median radials×gates`.
-    ///
-    /// Hand-written rather than derived because a derived `Debug` would walk
-    /// the borrowed radials and print the whole ~10 M-gate volume.
-    ///
-    /// **The radial and gate counts are the load-bearing part**: on a real
-    /// split cut the two halves share a cut angle *and* a median — 0.4834° for
-    /// both on a measured KMPX VCP 212 volume — so only range separates them,
-    /// 1832 reflectivity gates against 1192. A rung guarding velocity appends
-    /// `±<limit>d` or `±<limit>e` for declared or estimated; the letter is
-    /// what makes a lost declared table visible before the numbers differ.
+/// The ladder, as one line: per rung, `nominal->median radials×gates`.
+///
+/// Hand-written rather than derived because a derived `Debug` would walk
+/// the borrowed radials and print the whole ~10 M-gate volume.
+///
+/// **The radial and gate counts are the load-bearing part**: on a real
+/// split cut the two halves share a cut angle *and* a median — 0.4834° for
+/// both on a measured KMPX VCP 212 volume — so only range separates them,
+/// 1832 reflectivity gates against 1192. A rung guarding velocity appends
+/// `±<limit>d` or `±<limit>e` for declared or estimated; the letter is
+/// what makes a lost declared table visible before the numbers differ.
 fn gate_sample(moment: &MomentData, gate: usize) -> Sample {
     let Some(value) = crate::render::moment_value_at(moment, gate) else {
         return Sample::missing(SampleStatus::BeyondRange);

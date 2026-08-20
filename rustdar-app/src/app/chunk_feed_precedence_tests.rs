@@ -1061,11 +1061,7 @@ fn a_navigated_3d_pane_is_served_the_volume_it_names() {
     let mut app = headless(TestBridge::desktop());
     app.base_scans.insert(
         "KTLX".to_string(),
-        (
-            Arc::new(spanning_scan(10, 14)),
-            Default::default(),
-            at(10),
-        ),
+        (Arc::new(spanning_scan(10, 14)), Default::default(), at(10)),
     );
     let newest = app
         .current_volume_stamp("KTLX")

@@ -596,7 +596,6 @@ mod tests {
         assert!(!lines.iter().any(|l| l.contains('\u{26a0}')), "{lines:?}");
     }
 
-
     fn hover_handler() -> ModelDataHandler {
         let parameter = ModelParameter::SurfaceBasedCape;
         let values = vec![300.0, 1200.0, 2600.0, 4100.0];
@@ -705,7 +704,6 @@ mod tests {
         let lines = info_lines(&h);
         assert!(!lines.iter().any(|l| l.contains("HTTP 500")), "{lines:?}");
     }
-
 
     /// The parameters these tests fill the cache with, in fetch order: exactly
     /// enough to fill it, plus one more to overflow it. Taken from

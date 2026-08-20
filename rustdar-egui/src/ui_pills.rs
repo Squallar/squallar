@@ -576,7 +576,6 @@ impl super::Gui {
                 }
                 ui.set_max_width((pane_rect.width() - 2.0 * PILL_INSET).max(40.0));
                 ui.horizontal_wrapped(|ui| {
-
                     let number = ui
                         .button(format!("{}", idx + 1))
                         .on_hover_text("Make this the active pane");

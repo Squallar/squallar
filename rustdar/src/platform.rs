@@ -1,9 +1,9 @@
 //! Concrete [`PlatformBridge`] implementations. The trait lives in
 //! `rustdar-app`, which must never name a per-OS type.
 
-use rustdar_app::platform::{PlatformBridge, RedrawWaker};
 #[cfg(target_os = "android")]
 use rustdar_app::platform::drain_latest;
+use rustdar_app::platform::{PlatformBridge, RedrawWaker};
 
 /// System bar insets as `(top, bottom, left, right)`. Aliased because
 /// `clippy::type_complexity` rejects the bare fn pointer in the field below.
@@ -443,4 +443,3 @@ pub fn create_platform() -> AndroidPlatform {
 pub fn create_platform() -> IosPlatform {
     IosPlatform::new()
 }
-

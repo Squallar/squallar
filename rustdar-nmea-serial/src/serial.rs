@@ -286,5 +286,4 @@ mod tests {
         drop(stop_tx);
         assert!(should_stop(&stop_rx));
     }
-
 }

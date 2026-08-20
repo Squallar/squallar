@@ -1,4 +1,3 @@
-
 /// The App-pokes-Gui coupling (a field access of `gui` on `self`, dot included), split so
 /// this file cannot count itself.
 const SELF_GUI: &str = concat!("self.", "gui.");

@@ -219,7 +219,6 @@ impl super::Gui {
                 }
                 #[cfg(not(test))]
                 let _ = scan_text;
-
             });
         });
     }

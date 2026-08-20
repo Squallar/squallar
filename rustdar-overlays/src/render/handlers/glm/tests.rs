@@ -441,7 +441,6 @@ fn parse_and_transport_failures_are_tracked_independently() {
     assert!(!texts.iter().any(|t| t.contains("could not be downloaded")));
 }
 
-
 struct CaptureLogger;
 
 static LOG_RECORDS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
@@ -917,7 +916,6 @@ fn escalation_and_recovery_each_log_once() {
     assert_eq!(count_containing(&logs, "recovered"), 1, "{logs:?}");
 }
 
-
 fn outcome(
     queried: Vec<GlmSatellite>,
     dead_feeds: Vec<DeadFeed>,
@@ -1030,7 +1028,6 @@ fn apply_fetch_result_forwards_queried_set_and_failures() {
     );
 }
 
-
 fn half_listed_round() -> FetchPayload {
     Box::new(GlmFetchResult(Ok(crate::glm::GlmFetchOutcome {
         flashes: vec![crate::glm::GlmFlash {
@@ -1132,7 +1129,6 @@ fn a_satellite_whose_listing_failed_marks_the_layer_and_names_it() {
         "the mark outlived the round it was about",
     );
 }
-
 
 fn round(
     dead_feeds: Vec<DeadFeed>,

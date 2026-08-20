@@ -14,7 +14,6 @@ use crate::spc::reports::StormReportKind;
 use crate::types::OverlayFeature;
 use rustdar_geo::{GeoBounds, GeoPolygonRing};
 
-
 /// The portable half of click detection: which quarter-resolution cells the
 /// rasterizer drew which item **indices** into — positions in its input list,
 /// so both halves must come from one order.
@@ -142,7 +141,6 @@ impl rustdar_source::job::JobOut for RasterizeOutput {
     }
 }
 
-
 /// Web Mercator's own limit, from [`rustdar_geo`].
 const MAX_MERCATOR_LAT: f64 = rustdar_geo::MERCATOR_LAT_LIMIT_DEG;
 
@@ -172,9 +170,9 @@ impl MercatorBounds {
         self.min_lon + (lon - self.min_lon).rem_euclid(360.0)
     }
 
-/// The whole multiple of 360° carrying a datum spanning `[min_lon, max_lon]`
-/// to its representation *nearest* this box — a rigid translation, only defined
-/// for a datum inside a half-turn.
+    /// The whole multiple of 360° carrying a datum spanning `[min_lon, max_lon]`
+    /// to its representation *nearest* this box — a rigid translation, only defined
+    /// for a datum inside a half-turn.
     #[inline]
     pub(crate) fn lon_shift(&self, min_lon: f64, max_lon: f64) -> f64 {
         crate::render::geo::lon_shift(min_lon, max_lon, self.min_lon, self.max_lon)
@@ -198,7 +196,6 @@ impl MercatorBounds {
         (px, py)
     }
 }
-
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutlooksInput {
@@ -515,7 +512,6 @@ pub fn rasterize_radar_sites(
     }
 }
 
-
 /// Tornado: funnel, i.e. an inverted triangle.
 fn draw_tornado_symbol(pixmap: &mut Pixmap, px: f32, py: f32, r: f32, color: Color) {
     let s = r * 0.6; // symbol half-size
@@ -759,7 +755,6 @@ pub fn rasterize_storm_reports(
     }
 }
 
-
 fn draw_lightning_bolt(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32, rgba: [u8; 4]) {
     let s = size * 0.5;
     let mut pb = PathBuilder::new();
@@ -930,7 +925,6 @@ pub fn rasterize_glm_strikes(
     }
 }
 
-
 fn draw_feature(
     pixmap: &mut Pixmap,
     feature: &OverlayFeature,
@@ -974,7 +968,6 @@ fn draw_feature(
         }
     }
 }
-
 
 /// Thins the stroke below a 40-point minimum dimension, so a small polygon is
 /// not swallowed by its own outline. Points in, texels per point as `scale`.
@@ -1161,7 +1154,6 @@ fn stroke_path(pixmap: &mut Pixmap, path: &tiny_skia::Path, rgba: [u8; 4], width
     pixmap.stroke_path(path, &paint, &stroke, Transform::identity(), None);
 }
 
-
 pub(crate) fn strip_closing_dup(ring: &[(f64, f64)]) -> &[(f64, f64)] {
     if ring.len() > 3 && ring.first() == ring.last() {
         &ring[..ring.len() - 1]
@@ -1175,7 +1167,6 @@ use crate::hrrr::HrrrGridData;
 fn merc_y_to_lat(merc_y: f64) -> f64 {
     rustdar_geo::mercator_y_to_lat_rad(merc_y).to_degrees()
 }
-
 
 /// Half-open `(i, j)` ranges of the grid the rasterizer touches.
 ///

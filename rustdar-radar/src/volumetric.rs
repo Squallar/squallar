@@ -490,7 +490,7 @@ impl LinearZMemo {
     /// front of the only call site and this is a NaN.
     const FREE: u32 = u32::MAX;
 
-/// Buckets only for the statistic that converts.
+    /// Buckets only for the statistic that converts.
     fn for_stat(stat: CellStat) -> Self {
         Self {
             slots: match stat {
@@ -609,7 +609,7 @@ fn sweep_to_grid(
             if z >= 999.0 || z.is_nan() {
                 // The decoder's own out-of-range sentinels. A gate was
                 // reported, but it carries neither a number nor either of the
-// two meanings the other arms have, so it raises nothing.
+                // two meanings the other arms have, so it raises nothing.
                 continue;
             }
             match stat {
@@ -634,7 +634,7 @@ fn sweep_to_grid(
                 };
                 // Written from the same `n > 0` the value is, in the same
                 // pass, so the plane and the grid cannot disagree about which
-// cells are defined.
+                // cells are defined.
                 status[cell][r] = GateReport::Value;
             }
         }

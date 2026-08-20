@@ -381,7 +381,6 @@ mod tests {
         assert_eq!(fill, [200, 200, 200, NWS_FILL_ALPHA]);
     }
 
-
     #[test]
     fn extreme_heat_is_not_tornado_coloured() {
         assert_eq!(rgb_of("Extreme Heat Warning"), (199, 21, 133));
@@ -501,7 +500,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn only_tornado_warning_is_pure_red() {
         let reds: Vec<&str> = sample_events()
@@ -598,7 +596,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn every_live_entry_matches_a_real_event() {

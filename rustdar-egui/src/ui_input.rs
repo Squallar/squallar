@@ -376,7 +376,7 @@ impl DoubleTapDragDetector {
                 tap_time: time,
                 tap_pos: pos,
             };
-        } 
+        }
     }
 
     pub(crate) fn is_zooming(&self) -> bool {

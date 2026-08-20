@@ -398,7 +398,6 @@ fn parse_zone_polygons(json: &serde_json::Value, url: &str) -> Option<Vec<GeoPol
     }
 }
 
-
 #[cfg(not(target_arch = "wasm32"))]
 fn unix_now() -> u64 {
     web_time::SystemTime::now()

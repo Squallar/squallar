@@ -1696,7 +1696,7 @@ mod melting_layer_product {
         );
     }
 
-/// Fewer than four contours is not a partial layer, it is no layer.
+    /// Fewer than four contours is not a partial layer, it is no layer.
     #[test]
     fn a_product_short_of_four_contours_is_refused() {
         assert!(MeltingLayer::from_melting_layer_product(&product_166(5, &[604, 531])).is_none());
@@ -1706,7 +1706,7 @@ mod melting_layer_product {
     }
 
     /// An elevation of zero (or a nonsense one) makes the inversion
-/// meaningless — the beam-height model degenerates — so it is refused.
+    /// meaningless — the beam-height model degenerates — so it is refused.
     #[test]
     fn an_unusable_elevation_is_refused() {
         assert!(

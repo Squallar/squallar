@@ -467,7 +467,6 @@ fn poll_plan_separates_window_size_from_work_to_do() {
     );
 }
 
-
 fn t0() -> NaiveDateTime {
     chrono::NaiveDate::from_ymd_opt(2026, 7, 24)
         .unwrap()
@@ -1142,7 +1141,6 @@ fn a_listing_round_is_refused_only_when_every_satellite_was() {
         );
     }
 }
-
 
 fn listing_xml(key: &str) -> String {
     format!(

@@ -143,7 +143,7 @@ struct TiltView<'a> {
 pub fn compute_eet(scan: &Scan, radar_height_ft: f64) -> EetGrid {
     // Slant, and deliberately so. This module reproduces the RPG's product
     // 135 bin for bin and the RPG files a gate under the range it was measured
-// at. See `volumetric::RangeBinning`.
+    // at. See `volumetric::RangeBinning`.
     let cube = VolumeCube::build_with_stats(
         scan,
         &[(RadarProduct::Reflectivity, CellStat::Max)],
@@ -195,7 +195,7 @@ pub fn compute_eet(scan: &Scan, radar_height_ft: f64) -> EetGrid {
                     if z_up.is_nan() {
                         // Censored above (below SNR in raw Level II): clamp
                         // to this tilt's altitude. See the module doc's
-// "bad data above" gap.
+                        // "bad data above" gap.
                         (h, false)
                     } else {
                         // z_up < threshold, else ti would not be topmost.
@@ -551,7 +551,7 @@ mod tests {
 
         // The bound is generous, not tight: a point well away from any site
         // but still inside somebody's coverage is answered for, because the
-// neighbour's-terrain degradation below is wanted behaviour.
+        // neighbour's-terrain degradation below is wanted behaviour.
         let (nearest, km) = crate::sites::nearest_radar_site(36.68, -97.2775).expect("finite");
         assert!(
             (50.0..crate::types::BASE_EXTENT_KM).contains(&km),

@@ -5,7 +5,6 @@ use rustdar_gpu::egui_renderer;
 /// Minimum window dimension (width or height) in pixels
 const MIN_SIZE: u32 = 1;
 
-
 pub struct AppState {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -119,4 +118,3 @@ impl AppState {
         }
     }
 }
-

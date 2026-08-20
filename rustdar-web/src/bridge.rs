@@ -42,7 +42,6 @@ impl PlatformBridge for WebPlatform {
             .is_some_and(|list| list.matches())
     }
 
-
     /// `DeviceOrientationEvent` needs a secure context and, on iOS, a separate
     /// gesture-gated permission.
     fn poll_heading(&mut self) -> Option<f32> {

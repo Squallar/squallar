@@ -440,8 +440,8 @@ impl OverlayHandler for NwsAlertHandler {
                 }),
         );
 
-            // Ungated on enabled: a hidden layer's options stay visible and
-            // editable, and the status lines keep reporting.
+        // Ungated on enabled: a hidden layer's options stay visible and
+        // editable, and the status lines keep reporting.
         items.push(ControlItem::ButtonRow {
             buttons: vec![ControlButton {
                 id: "refresh",

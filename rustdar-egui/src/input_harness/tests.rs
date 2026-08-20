@@ -6670,11 +6670,7 @@ fn a_rendered_sections_caption_is_calm_and_its_detail_is_one_click_away() {
     h.mouse_click(glyph.center());
     h.frame();
 
-    for phrase in [
-        "4.9",
-        "not measured",
-        "Echoes sit at",
-    ] {
+    for phrase in ["4.9", "not measured", "Echoes sit at"] {
         assert!(
             h.text_painted_in(pane, phrase),
             "the opened detail never said {phrase:?}; it painted {:?}",
