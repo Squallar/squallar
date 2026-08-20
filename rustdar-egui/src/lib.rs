@@ -4,6 +4,9 @@ pub mod overlay_cache;
 pub mod pane;
 pub(crate) mod point_painter;
 pub mod shell_api;
+/// The app's layer set, composed from the source crates that own the data
+/// (WO-M9). See the module doc for why the composition lives in this crate.
+pub mod sources;
 pub mod tile_source;
 pub mod tiles;
 mod ui;

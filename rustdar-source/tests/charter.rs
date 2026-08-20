@@ -68,7 +68,7 @@ fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, S
 
 /// The substrate stays a substrate: its dependency set may not grow past the
 /// charter. `[dependencies]` ⊆ {rustdar-geo, rustdar-units, chrono, serde,
-/// web-time, reqwest, rustls, log}; dev additionally {tokio, serde_json}; no
+/// serde_json, web-time, reqwest, rustls, log}; dev additionally {tokio}; no
 /// build deps.
 ///
 /// `rustdar-geo` entered the ceiling at WO-G1 (the Phase 2G rustdar-geo
@@ -77,6 +77,24 @@ fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, S
 /// `geo` module used to define moved down to the workspace's geometry floor,
 /// and the module re-exports it wholesale so every path above keeps
 /// resolving.
+///
+/// **`serde_json` crossed from `dev` to `normal` at WO-M9**, and this
+/// paragraph is that step's written amendment. The `SourceHandler` trait moved
+/// into this crate with its four config-persistence hooks
+/// (`serialize_state`/`deserialize_state`/`serialize_pane_state`/
+/// `deserialize_pane_state`), every one of them typed on `serde_json::Value`
+/// — the shape a layer's saved state has taken in every user's config file
+/// since long before this crate existed. It is vocabulary the contract is
+/// *made of*, not machinery the contract reaches for, which is the line this
+/// ceiling draws; and the package was already declared here, as the dev
+/// dependency `cargo metadata` parsing above uses. The three other names the
+/// move needed — `rustdar-units`, `web-time`, `serde` — were already on the
+/// ceiling and required no amendment. **No third-party package new to this
+/// crate entered the graph at WO-M9.**
+///
+/// `serde_json` stays out of `DEV_EXTRA` on purpose: it is now a normal
+/// dependency, so `NORMAL_CEILING` already permits it for both kinds and a
+/// second entry would be a second place to keep in step.
 ///
 /// A ⊆ ceiling and not equality on purpose: the charter *allows* the unlisted
 /// members (serde arrives with later steps) without requiring them. The floor
@@ -89,12 +107,13 @@ fn the_dependency_ceiling_holds() {
         "rustdar-units",
         "chrono",
         "serde",
+        "serde_json",
         "web-time",
         "reqwest",
         "rustls",
         "log",
     ];
-    const DEV_EXTRA: &[&str] = &["tokio", "serde_json"];
+    const DEV_EXTRA: &[&str] = &["tokio"];
 
     let meta = metadata();
     let deps = declared_deps(&meta, "rustdar-source");

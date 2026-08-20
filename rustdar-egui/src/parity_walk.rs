@@ -361,7 +361,7 @@ fn walk_catalog(h: &mut InputHarness, width: WidthClass) {
     for preset in builtin_presets() {
         inventory.push((CatalogGroup::Presets, preset.name));
     }
-    for kind in rustdar_overlays::render::handlers::default_draw_order() {
+    for kind in crate::sources::default_draw_order() {
         inventory.push((
             CatalogGroup::Overlays,
             h.overlay_display_name(&kind).to_owned(),
@@ -373,6 +373,27 @@ fn walk_catalog(h: &mut InputHarness, width: WidthClass) {
     for param in ModelParameter::all() {
         inventory.push((CatalogGroup::Hrrr, param.display_name().to_owned()));
     }
+
+    // Anti-shrink floor on the one inventory leg that is *derived* (WO-M9).
+    // `default_draw_order` reads the composed registry — this crate's
+    // `sources::all`, which chains `rustdar-overlays`' eleven with
+    // `rustdar-radar`'s one — so a composition that quietly lost a source
+    // crate would hand this walk a shorter list and the walk would pass by
+    // checking fewer tiles. Cross-checked against `OVERLAY_CONTROL_ORDER`,
+    // which is a hand-kept literal maintained on the other side of the same
+    // question: the two spellings cannot shrink together by accident.
+    let layers_in_inventory = inventory
+        .iter()
+        .filter(|(group, _)| *group == CatalogGroup::Overlays)
+        .count();
+    assert_eq!(
+        layers_in_inventory,
+        OVERLAY_CONTROL_ORDER.len(),
+        "the catalog leg's layer inventory is {layers_in_inventory} on \
+         {width:?} but the audit's canonical layer list has {} — the walk \
+         would check that many fewer tiles and still pass",
+        OVERLAY_CONTROL_ORDER.len(),
+    );
 
     h.open_catalog();
     // Where the wheel points: the sheet on the phone, the modal elsewhere —

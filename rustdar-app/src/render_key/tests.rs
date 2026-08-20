@@ -29,7 +29,13 @@ fn plan_key(site: &str, elevation: f32) -> RenderKey {
 /// structural.
 #[test]
 fn the_radar_key_is_the_same_in_dark_and_light() {
-    let overlays = OverlayRegistry::default();
+    // The COMPOSED registry, not `OverlayRegistry::default()`: since WO-M9
+    // that default is the overlay crate's eleven and does not contain radar
+    // at all — and a missing handler answers `theme_sensitive` `false`, which
+    // is the same answer this test is trying to verify radar declares. The
+    // control below could not tell those apart either, because it asks about
+    // a different layer.
+    let overlays = OverlayRegistry::with_handlers(rustdar_egui::sources::all());
 
     // Non-vacuity control FIRST: the reader must be able to answer `true`, or
     // every assertion below passes on a registry that lost its handlers.

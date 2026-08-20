@@ -1,59 +1,6 @@
-//! Abstract drawing primitives for per-frame overlay rendering.
+//! Shim: the abstract per-frame drawing primitives moved to
+//! `rustdar_source::draw` at WO-M9, with the `SourceHandler` trait whose
+//! `per_frame_points()`/`draw_point()`/`hover_text()` speak them.
 //!
-//! All coordinates are **pixel offsets from the point's screen-space centre**,
-//! never absolute. The UI crate owns lat/lon → screen projection; handlers
-//! specify layout offsets only.
-
-use std::sync::Arc;
-
-use rustdar_units::UserPreferences;
-
-use super::overlay_state::OverlayItem;
-
-/// Which corner of the text box sits at the given offset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TextAnchor {
-    TopLeft,
-    TopRight,
-    BottomLeft,
-    BottomRight,
-    CenterLeft,
-    CenterRight,
-    Center,
-    CenterTop,
-    CenterBottom,
-}
-
-/// The UI crate projects and culls these, then calls `draw_point()` on the
-/// survivors.
-pub struct MapPoint {
-    pub lat: f64,
-    pub lon: f64,
-    /// Index into the handler's data array; comes back in `draw_point()` and
-    /// `hover_text()`.
-    pub id: u32,
-    pub selection: Arc<dyn OverlayItem>,
-}
-
-/// `offset` is `[x, y]` pixels from the point centre; colours are `[r, g, b, a]`.
-pub trait PointPainter {
-    fn circle_filled(&mut self, offset: [f32; 2], radius: f32, color: [u8; 4]);
-
-    fn circle_stroke(&mut self, offset: [f32; 2], radius: f32, color: [u8; 4], width: f32);
-
-    fn text(&mut self, offset: [f32; 2], text: &str, color: [u8; 4], size: f32, anchor: TextAnchor);
-
-    fn line(&mut self, from: [f32; 2], to: [f32; 2], color: [u8; 4], width: f32);
-
-    /// Convex only.
-    fn filled_polygon(&mut self, points: &[[f32; 2]], color: [u8; 4]);
-}
-
-pub struct DrawPointContext {
-    pub zoom: f32,
-    pub is_dark: bool,
-}
-
-pub struct HoverContext<'a> {
-    pub prefs: &'a UserPreferences,
-}
+//! Glob-re-exported for the reason the sibling `fetch_policy` shim gives.
+pub use rustdar_source::draw::*;

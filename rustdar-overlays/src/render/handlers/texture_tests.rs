@@ -1,5 +1,5 @@
 //! Invariants every `RenderMode::Texture` overlay has to satisfy, written over
-//! `create_handlers()` so a new one is covered the day it is registered.
+//! `sources()` so a new one is covered the day it is registered.
 //!
 //! `rasterize/alpha_tests` checks two rasterizers by calling them directly.
 //! That is a check on the *function*, and the thing that reaches the uploader
@@ -22,7 +22,7 @@ use std::collections::HashSet;
 use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::DescribedJob;
 
-use super::create_handlers;
+use super::sources;
 use crate::render::overlay_state::{FetchPayload, OverlayHandler, RasterizeContext, RenderMode};
 use crate::render::rasterize::{
     self, AlphaMode, ModelDataInput, RadarSiteInfo, RasterizeOutput, rasterize_glm_strikes,
@@ -341,7 +341,7 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
             record_drops: crate::glm::RecordDrops::default(),
         }))),
         id if *id == known::MODEL_DATA => Box::new(HrrrFetchResult(Ok(cin_grid()))),
-        id if *id == known::RADAR_SITES || *id == known::RADAR => return false,
+        id if *id == known::RADAR_SITES => return false,
         other => panic!(
             "{} is a texture overlay this fixture does not know how to \
              seed. Add it here — the walks in this file are what stop a new \
@@ -419,7 +419,7 @@ fn assert_alpha_matches_bytes(what: &str, out: &RasterizeOutput) {
 fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
     let ctx = rctx();
     let mut checked = 0;
-    for handler in create_handlers().iter_mut() {
+    for handler in sources().iter_mut() {
         if handler.render_mode() != RenderMode::Texture {
             continue;
         }
@@ -555,7 +555,7 @@ fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
 fn every_fixture_draws_pixels_the_two_conventions_disagree_about() {
     let ctx = rctx();
     let mut opaque_only: Vec<LayerId> = Vec::new();
-    for handler in create_handlers().iter_mut() {
+    for handler in sources().iter_mut() {
         if handler.render_mode() != RenderMode::Texture || !seed(handler.as_mut()) {
             continue;
         }
@@ -610,20 +610,24 @@ fn every_fixture_draws_pixels_the_two_conventions_disagree_about() {
 fn every_texture_handler_agrees_with_its_own_rasterizer() {
     let ctx = rctx();
     let mut checked = 0;
-    for handler in create_handlers().iter_mut() {
+    for handler in sources().iter_mut() {
         if handler.render_mode() != RenderMode::Texture {
             continue;
         }
         let id = handler.id();
         let name = id.as_str();
-        if id == known::RADAR_SITES || id == known::RADAR {
-            // The two exempt kinds: there is no `prepare_job` for their
-            // `has_data` to agree *with*. Their `has_data` is an unconditional
-            // `true` and their pixels come from elsewhere — `app_fetch`
-            // describes the sites job from the site catalogue itself and it
-            // always produces a buffer, and `ui_map_pane` skips `Radar`
-            // outright. Neither dispatch can decline, so neither can strand a
-            // settle.
+        if id == known::RADAR_SITES {
+            // The one exempt kind here: there is no `prepare_job` for its
+            // `has_data` to agree *with*. Its `has_data` is an unconditional
+            // `true` and its pixels come from elsewhere — `app_fetch` describes
+            // the sites job from the site catalogue itself and it always
+            // produces a buffer. The dispatch cannot decline, so it cannot
+            // strand a settle.
+            //
+            // `Radar` was the second exemption until WO-M9 moved it out of this
+            // crate; the arm is gone rather than left unreachable, and the same
+            // claim about `RadarSource` is asserted over the composed registry
+            // in `rustdar_egui::sources`.
             assert!(
                 handler.prepare_job(&ctx).is_none(),
                 "{name} grew a `prepare_job`; it now has this invariant \
@@ -745,12 +749,11 @@ fn has_hit_map(id: &LayerId) -> bool {
 fn every_texture_kind_rasterizes_as_a_described_job() {
     let ctx = rctx();
     let mut described = 0;
-    for handler in create_handlers().iter_mut() {
+    for handler in sources().iter_mut() {
         let id = handler.id();
         let name = id.as_str();
-        let handler_backed = handler.render_mode() == RenderMode::Texture
-            && id != known::RADAR_SITES
-            && id != known::RADAR;
+        let handler_backed =
+            handler.render_mode() == RenderMode::Texture && id != known::RADAR_SITES;
 
         let agree = |h: &dyn OverlayHandler, state: &str| {
             if !handler_backed {
@@ -836,7 +839,7 @@ fn every_texture_kind_rasterizes_as_a_described_job() {
 fn a_hit_map_kinds_items_align_with_its_described_rows() {
     let ctx = rctx();
     let mut checked = 0;
-    for handler in create_handlers().iter_mut() {
+    for handler in sources().iter_mut() {
         let id = handler.id();
         let name = id.as_str();
         if !has_hit_map(&id) || !seed(handler.as_mut()) {
@@ -905,9 +908,11 @@ fn a_hit_map_kinds_items_align_with_its_described_rows() {
 /// row, which "claimed exactly once" alone cannot see — is caught by name.
 /// `RadarSites` claims its row while its `prepare_job` stays `None` (the
 /// dispatch builds the input until M10 — the row states how the bytes cross,
-/// not who builds them); `Radar` is the one texture kind with no row at all,
-/// because its pixels come from the radar render pipeline and never cross
-/// the overlay job boundary.
+/// not who builds them). `Radar` was the one texture kind with no row at all,
+/// because its pixels come from the radar render pipeline and never cross the
+/// overlay job boundary; since WO-M9 it is not this crate's handler at all, and
+/// that claim is asserted over the composed registry in
+/// `rustdar_egui::sources` instead of by an arm here that could never fire.
 #[test]
 fn every_texture_handler_owns_exactly_one_codec_row() {
     use crate::render::jobs::JOB_CODECS;
@@ -924,7 +929,7 @@ fn every_texture_handler_owns_exactly_one_codec_row() {
     ];
 
     let mut claimed: Vec<&'static str> = Vec::new();
-    for handler in create_handlers() {
+    for handler in sources() {
         let id = handler.id();
         let name = id.as_str();
         if handler.render_mode() != RenderMode::Texture {
@@ -933,16 +938,6 @@ fn every_texture_handler_owns_exactly_one_codec_row() {
                 "{name} is not a texture layer and has no raster to frame, \
                  but it answers a codec row — the dispatch would label and \
                  encode a job this layer can never describe",
-            );
-            continue;
-        }
-        if id == known::RADAR {
-            assert!(
-                handler.job_codec().is_none(),
-                "Radar grew a codec row; its pixels come from the radar \
-                 render pipeline, never the overlay job boundary. If that \
-                 changed, decide its row story deliberately and move it into \
-                 the `expected` table above",
             );
             continue;
         }

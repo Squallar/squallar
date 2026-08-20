@@ -33,7 +33,7 @@ const KIND: rustdar_source::id::LayerId = rustdar_source::id::known::SPC_DISCUSS
 /// is unambiguous.
 fn gui_with_only_discussions() -> Gui {
     let mut gui = Gui::new();
-    for kind in rustdar_overlays::render::handlers::default_draw_order() {
+    for kind in crate::sources::default_draw_order() {
         let on = kind == KIND;
         gui.pane_mut(0)
             .expect("a fresh Gui has one pane")

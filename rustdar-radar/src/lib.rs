@@ -31,6 +31,11 @@ pub mod scan;
 pub mod site_position;
 pub mod sites;
 pub mod sounding;
+/// The radar layer's `SourceHandler` registration (WO-M9). Named `source`, not
+/// `sources`: this crate's root already publishes `sources` as the network-
+/// origins re-export just below, and one crate publishing two unrelated things
+/// under near-identical names is how a reader learns the wrong one.
+pub mod source;
 /// Network origins, defined in `rustdar-source` and re-exported under the
 /// path this crate always published them at.
 pub use rustdar_source::origins as sources;

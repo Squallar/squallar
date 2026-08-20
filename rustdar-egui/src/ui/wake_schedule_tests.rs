@@ -35,7 +35,7 @@ const INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// one that has never been fetched is due *now* — a true answer, and the one
 /// the overlay test below is about, but not the one these are.
 fn only_the_radar_poll(gui: &mut Gui) {
-    for kind in rustdar_overlays::render::handlers::default_draw_order() {
+    for kind in crate::sources::default_draw_order() {
         gui.pane_mut(0)
             .expect("a fresh Gui has one pane")
             .enabled_overlays

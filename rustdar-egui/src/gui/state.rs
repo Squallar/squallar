@@ -829,7 +829,10 @@ impl Gui {
             location_settings_available: false,
             catalogue_pending: false,
             user_heading: None,
-            overlays: OverlayRegistry::default(),
+            // The composed twelve, not `OverlayRegistry::default()`'s eleven:
+            // `default()` is the overlay crate's own set, and radar is a
+            // separate source crate since WO-M9. See `crate::sources`.
+            overlays: OverlayRegistry::with_handlers(crate::sources::all()),
             panes: vec![PaneState::new()],
             active_pane: 0,
             pane_layout: PaneLayout::default(),

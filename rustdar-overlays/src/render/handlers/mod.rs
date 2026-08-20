@@ -13,7 +13,6 @@ mod location;
 mod metar;
 mod model;
 pub mod outlook;
-mod radar;
 pub mod reports;
 mod sites;
 
@@ -24,28 +23,24 @@ mod sites;
 #[cfg(test)]
 mod texture_tests;
 
-use rustdar_source::id::LayerId;
-
 use super::overlay_state::OverlayHandler;
 
-/// The default draw order, bottom to top — every registered handler's id
-/// sorted by [`OverlayHandler::draw_order_weight`]. The free-function twin of
-/// `OverlayRegistry::default_draw_order`, for the callers (fresh-pane
-/// construction, the config-absent serde default) that have no live registry
-/// in reach. Never a literal list: the weights are the one spelling of the
-/// order, and the literal-list pin in `registry_identity_tests` is what holds
-/// them to the order users have always seen.
-pub fn default_draw_order() -> Vec<LayerId> {
-    let mut handlers = create_handlers();
-    handlers.sort_by_key(|h| h.draw_order_weight());
-    handlers.iter().map(|h| h.id()).collect()
-}
-
-/// Create the default set of overlay handlers.
-pub(crate) fn create_handlers() -> Vec<Box<dyn OverlayHandler>> {
+/// **This crate's layer registrations — eleven rows, and the only place they
+/// are named.**
+///
+/// The twelfth layer of the shipped app is radar, and it is not here: WO-M9
+/// moved it to `rustdar_radar::sources`, because a source belongs in the crate
+/// that owns its data and this crate cannot name `rustdar-radar` at all (the
+/// WO-M3 charter cut that edge). The app's whole layer set is
+/// `rustdar_egui::sources::all`, which is this function chained with radar's;
+/// nothing else composes a layer list.
+///
+/// Adding an overlay means one row here plus a `known::` const and a
+/// `LAYER_ID_LEDGER` entry — `rustdar_source::handler::SourceHandler`'s own
+/// doc states the whole recipe.
+pub fn sources() -> Vec<Box<dyn OverlayHandler>> {
     vec![
         Box::new(model::ModelDataHandler::new()),
-        Box::new(radar::RadarHandler::new()),
         Box::new(outlook::SpcOutlookHandler::new()),
         Box::new(discussion::SpcDiscussionHandler::new()),
         Box::new(alert::NwsAlertHandler::new()),
@@ -78,7 +73,7 @@ pub(crate) fn create_handlers() -> Vec<Box<dyn OverlayHandler>> {
 mod round_delivery_tests {
     /// Every handler file, whether or not it fetches today: the one that
     /// reintroduces this is by definition the one nobody has read yet.
-    const HANDLER_SOURCES: [(&str, &str); 12] = [
+    const HANDLER_SOURCES: [(&str, &str); 11] = [
         ("alert", include_str!("alert.rs")),
         ("colorscale", include_str!("colorscale.rs")),
         ("discussion", include_str!("discussion.rs")),
@@ -88,7 +83,6 @@ mod round_delivery_tests {
         ("metar", include_str!("metar.rs")),
         ("model", include_str!("model.rs")),
         ("outlook", include_str!("outlook.rs")),
-        ("radar", include_str!("radar.rs")),
         ("reports", include_str!("reports.rs")),
         ("sites", include_str!("sites.rs")),
     ];
