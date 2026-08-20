@@ -55,7 +55,8 @@ fn pane_looping_on(site: RadarSite, lookback_secs: u64, frames: &[u32]) -> PaneS
             pane.loop_state(),
             &crate::app::render::test_budgets(),
         );
-        append_polled_frame(pane.loop_state_mut(), site.name, ts(minute), held);
+        let clock = pane.time.mode;
+        append_polled_frame(pane.loop_state_mut(), site.name, ts(minute), held, clock);
     }
     pane
 }
@@ -287,7 +288,18 @@ fn appending_evicts_past_the_lookback_window() {
 fn eviction_pulls_the_playhead_back_inside_the_list() {
     let ktlx = site("KTLX", 35.33, -97.27);
     let mut panes = [pane_looping_on(ktlx, 600, &[0, 5, 10])];
+    // A LIVE pane whose playhead is on the newest frame it holds. Parking is
+    // the only writer of the playhead, so the clock is put back to `Live`
+    // straight after — and after WO-M12f that posture is what decides the
+    // window: a live pane's is anchored on its newest frame, exactly as every
+    // pane's was before. The scrubbed pane's is pinned next door.
     panes[0].park_on_loop_frame(2);
+    panes[0].set_time_mode(rustdar_egui::pane::TimeMode::Live);
+    assert_eq!(
+        panes[0].loop_state().current_frame(),
+        2,
+        "precondition: the playhead is past where the window will leave it"
+    );
 
     append_polled_frame_to_loops(&mut panes, "KTLX", ts(25), allocation(), &budgets());
 
@@ -308,6 +320,80 @@ fn eviction_pulls_the_playhead_back_inside_the_list() {
             .get(panes[0].loop_state().current_frame())
             .is_some(),
         "and resolve to one, which is what the pane renders through"
+    );
+}
+
+/// **A scrubbed pane's frame-list window follows its clock, not the newest
+/// frame** (WO-M12f).
+///
+/// OLD behaviour, and the value this replaces: the cutoff was
+/// `newest_frame - span` for every posture, so this same scenario answered
+/// `vec![ts(25)]` — one arriving live frame evicted `ts(0)`, `ts(5)` and
+/// `ts(10)`, which are the frames the pane is parked on and rendering. NEW:
+/// the cutoff is `clock - span`, so the window sits where the pane is
+/// looking and the arriving frame joins it.
+#[test]
+fn a_scrubbed_panes_window_follows_its_clock_not_the_newest_frame() {
+    let ktlx = site("KTLX", 35.33, -97.27);
+    let mut panes = [pane_looping_on(ktlx, 600, &[0, 5, 10])];
+    panes[0].park_on_loop_frame(1);
+    assert_eq!(
+        panes[0].loop_state().playhead_stamp(),
+        Some(ts(5)),
+        "precondition: the pane is parked five minutes back"
+    );
+
+    append_polled_frame_to_loops(&mut panes, "KTLX", ts(25), allocation(), &budgets());
+
+    assert_eq!(
+        frame_times(&panes[0]),
+        vec![ts(0), ts(5), ts(10), ts(25)],
+        "the frames the scrubbed pane is looking at were evicted by a live \
+         arrival — the window followed the newest frame instead of the clock"
+    );
+    assert_eq!(
+        panes[0].loop_state().playhead_stamp(),
+        Some(ts(5)),
+        "and the playhead still names the instant it was parked on"
+    );
+
+    // And it FOLLOWS the clock rather than merely being wider than it: move
+    // the clock onto the new frame and the same window now bites, dropping
+    // everything more than the lookback behind it. Without this the test
+    // above could not tell a clock-anchored cutoff from no cutoff at all.
+    panes[0].park_on_loop_frame(3);
+    assert_eq!(
+        panes[0].loop_state().playhead_stamp(),
+        Some(ts(25)),
+        "precondition: the clock moved forward onto the arrival"
+    );
+    append_polled_frame_to_loops(&mut panes, "KTLX", ts(30), allocation(), &budgets());
+    assert_eq!(
+        frame_times(&panes[0]),
+        vec![ts(25), ts(30)],
+        "the window did not move up with the clock"
+    );
+}
+
+/// **A live pane keeps the window it always had**, stated beside the change
+/// so the two postures are visibly one decision: `Live` resolves to the
+/// newest frame on a frame series, which is the anchor the cutoff used
+/// unconditionally before WO-M12f.
+#[test]
+fn a_live_panes_window_is_still_anchored_on_its_newest_frame() {
+    let ktlx = site("KTLX", 35.33, -97.27);
+    let mut panes = [pane_looping_on(ktlx, 600, &[0, 5, 10])];
+    assert!(
+        matches!(panes[0].time.mode, rustdar_egui::pane::TimeMode::Live),
+        "precondition: a pane is live until something parks it"
+    );
+
+    append_polled_frame_to_loops(&mut panes, "KTLX", ts(25), allocation(), &budgets());
+
+    assert_eq!(
+        frame_times(&panes[0]),
+        vec![ts(25)],
+        "a live pane stopped evicting past its lookback"
     );
 }
 

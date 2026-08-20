@@ -357,7 +357,8 @@ fn a_pane_that_did_not_change_radar_keeps_its_loop() {
             pane.loop_state(),
             &crate::app::render::test_budgets(),
         );
-        super::append_polled_frame(pane.loop_state_mut(), BYSTANDER, at(minute), held);
+        let clock = pane.time.mode;
+        super::append_polled_frame(pane.loop_state_mut(), BYSTANDER, at(minute), held, clock);
     }
     let frames_before: Vec<NaiveDateTime> = pane
         .loop_state()
@@ -474,7 +475,8 @@ fn re_picking_the_site_a_pane_is_on_keeps_its_loop() {
             pane.loop_state(),
             &crate::app::render::test_budgets(),
         );
-        super::append_polled_frame(pane.loop_state_mut(), WSR88D, at(minute), held);
+        let clock = pane.time.mode;
+        super::append_polled_frame(pane.loop_state_mut(), WSR88D, at(minute), held, clock);
     }
     let frames_before: Vec<NaiveDateTime> = pane
         .loop_state()
