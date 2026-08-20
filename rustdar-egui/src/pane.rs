@@ -320,7 +320,13 @@ pub enum LoopPhase {
 /// NEXRAD fields.
 pub struct LayerTimeState {
     pub phase: LoopPhase,
-    pub current_frame: usize,
+    /// **Which frame this layer is showing, as an index into [`Self::frames`]
+    /// — a cache, not a decision.** The decision is the pane's
+    /// [`PaneTimePosture::mode`]: the frame shown is the latest whose stamp is
+    /// at or before the instant the pane depicts. This field is written by
+    /// [`Self::settle_playhead`] and by nothing else, so no caller can park
+    /// the picture on a frame the pane's own clock does not name.
+    current_frame: usize,
     pub frames: Vec<LoopFrame>,
     /// The window this layer's frames were listed for, in seconds — the extent
     /// the arrival path slides as newer frames land.
@@ -412,13 +418,54 @@ impl TimeStep {
     }
 }
 
-/// **One pane's posture on the timeline**: how wide a window it is looking
-/// over, how fast it plays, and how far one step moves it.
+/// **The instant a pane's picture depicts.**
+///
+/// One clock per pane, and every layer on it is shown at the moment this
+/// names — which is what lets a scrub move a radar loop and a warning
+/// polygon together instead of each on its own playhead.
+///
+/// [`Live`](TimeMode::Live) is *the newest there is*, not a timestamp: a
+/// live pane follows arrivals instead of parking on the instant they landed,
+/// which is why it cannot be spelled as an `AsOf(now)` sampled once.
+///
+/// Not the same question as [`PaneState::viewing_live`], and the two are
+/// deliberately separate — see that field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeMode {
+    /// The newest thing each layer has.
+    Live,
+    /// A named instant, UTC. Each layer shows the latest frame at or before
+    /// it; an [`rustdar_source::time::TimeAxis::EventLifetime`] layer shows
+    /// what was valid then (WO-E7c).
+    AsOf(NaiveDateTime),
+}
+
+impl TimeMode {
+    /// The instant this names, or `None` while the pane is following live.
+    pub fn as_of(self) -> Option<NaiveDateTime> {
+        match self {
+            Self::Live => None,
+            Self::AsOf(t) => Some(t),
+        }
+    }
+
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Live)
+    }
+}
+
+/// **One pane's posture on the timeline**: the instant it depicts, how wide a
+/// window it is looking over, how fast it plays, and how far one step moves
+/// it.
 ///
 /// A pane fact, not a layer fact — the layers each keep their own
 /// [`LayerTimeState`] and are shown at whatever moment this posture names.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PaneTimePosture {
+    /// **The instant this pane depicts** — the clock every layer's playhead is
+    /// derived from, and the one thing a scrub, a step and a playback advance
+    /// all write.
+    pub mode: TimeMode,
     /// How far back the pane's timeline reaches, in seconds. The setting a
     /// new listing is asked for; the window a listing was actually built with
     /// is the layer's own [`LayerTimeState::span_secs`].
@@ -435,6 +482,7 @@ pub struct PaneTimePosture {
 impl Default for PaneTimePosture {
     fn default() -> Self {
         Self {
+            mode: TimeMode::Live,
             span_secs: 3600,
             speed_fps: 5.0,
             step: TimeStep::Secs(600),
@@ -619,6 +667,15 @@ pub struct PaneState {
     selected_product: RadarProduct,
     /// Private since WO-E6b — see [`Self::site`].
     selected_elevation: f32,
+    /// **Whether this pane's *selection* follows live data** — which sites
+    /// keep a chunk feed, whether the archive auto-poll runs, and which way
+    /// the Live button is painted.
+    ///
+    /// **Not** [`PaneTimePosture::mode`], and deliberately not folded into it:
+    /// that is the instant the picture *depicts*, and a pane playing a loop
+    /// depicts an older instant every frame while still following the live
+    /// site. Folding the two would stop the chunk feed the moment a loop
+    /// played, which is a behaviour change, not a simplification.
     pub viewing_live: bool,
     /// Whether this pane follows shared time (plan §3.7). Persisted; default
     /// **true** — every pane before the field existed behaved as linked.
@@ -717,6 +774,45 @@ impl LayerTimeState {
 
     pub fn is_active(&self) -> bool {
         !matches!(self.phase, LoopPhase::Inactive)
+    }
+
+    /// Which of [`Self::frames`] this layer is showing. Read-only: the value
+    /// is a derivation of the pane's clock, and [`Self::settle_playhead`] is
+    /// the one thing that writes it.
+    pub fn current_frame(&self) -> usize {
+        self.current_frame
+    }
+
+    /// **The derivation, and the only writer of the playhead.** The frame
+    /// shown at [`TimeMode::AsOf`] `T` is the latest whose stamp is at or
+    /// before `T`; under [`TimeMode::Live`] it is the newest frame there is.
+    ///
+    /// When no frame qualifies — the clock sits before the oldest frame this
+    /// layer still holds, which is what eviction leaves behind — the playhead
+    /// floors to the oldest rather than dangling: an index into `frames` must
+    /// name a frame that exists, because it is what the pane renders through.
+    pub fn settle_playhead(&mut self, mode: TimeMode) {
+        self.current_frame = self.frame_at(mode);
+    }
+
+    /// [`Self::settle_playhead`]'s answer, without writing it.
+    pub fn frame_at(&self, mode: TimeMode) -> usize {
+        if self.frames.is_empty() {
+            return 0;
+        }
+        match mode {
+            TimeMode::Live => self.frames.len() - 1,
+            TimeMode::AsOf(t) => self
+                .frames
+                .partition_point(|frame| frame.timestamp <= t)
+                .saturating_sub(1),
+        }
+    }
+
+    /// The stamp of the frame the playhead is on, or `None` for a layer
+    /// holding no frames.
+    pub fn playhead_stamp(&self) -> Option<NaiveDateTime> {
+        self.frames.get(self.current_frame).map(|f| f.timestamp)
     }
 
     pub fn is_playing(&self) -> bool {
@@ -998,14 +1094,13 @@ impl LayerTimeState {
         let Some(indices) = listing_sample_indices(self.frames.len(), held) else {
             return false;
         };
-        // The survivor nearest the playhead, so a paused loop stays on the
-        // moment the user parked it rather than jumping to the start.
-        self.current_frame = indices
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, frame)| frame.abs_diff(self.current_frame))
-            .map(|(position, _)| position)
-            .unwrap_or(0);
+        // A paused loop stays on the moment the user parked it: the pane's
+        // clock does not move because the frame list was thinned, so the next
+        // `settle_playhead` puts the playhead on whichever survivor that
+        // moment now names. Nothing here touches the index — before WO-E7b
+        // this hunt for "the survivor nearest the old index" was how the same
+        // intention was spelled, and an index is the wrong thing to preserve
+        // across a resample.
         let mut kept: Vec<Option<LoopFrame>> = self.frames.drain(..).map(Some).collect();
         self.frames = indices.into_iter().filter_map(|i| kept[i].take()).collect();
         self.sampled = Some(true);
@@ -1332,7 +1427,7 @@ impl PaneState {
     fn active_loop_image(&self) -> Option<&LoopFrameImage> {
         self.loop_state()
             .frames
-            .get(self.loop_state().current_frame)
+            .get(self.loop_state().current_frame())
             .and_then(|f| f.image.as_ref())
     }
 
@@ -1342,7 +1437,7 @@ impl PaneState {
             return self
                 .loop_state()
                 .frames
-                .get(self.loop_state().current_frame)
+                .get(self.loop_state().current_frame())
                 .map(|f| f.timestamp);
         }
         self.data_time
@@ -1502,6 +1597,80 @@ impl PaneState {
             .find(|slot| slot.id == *id)
             .expect("the slot was just inserted")
             .time
+    }
+
+    /// **The layer whose stamps this pane's clock walks** — its *time-primary*
+    /// layer, the topmost animating one in the draw order (the slot list runs
+    /// bottom to top, so the last match wins).
+    ///
+    /// Only a [`rustdar_source::time::TimeAxis::FrameSeries`] layer can hold
+    /// frames, so this is that set narrowed to the ones actually running. The
+    /// other half of the question — which layers *declare* `FrameSeries` on a
+    /// pane that is animating nothing, which is what decides whether a
+    /// one-frame step is offered at all — needs the registry and is asked of
+    /// [`crate::Gui`].
+    pub fn clock_layer(&self) -> Option<&LayerId> {
+        self.layers
+            .iter()
+            .rev()
+            .find(|slot| slot.time.is_active())
+            .map(|slot| &slot.id)
+    }
+
+    /// Every layer this pane is animating, bottom to top — the set a frame
+    /// budget divides across (WO-E7d).
+    pub fn animating_layers(&self) -> impl Iterator<Item = &LayerSlot> {
+        self.layers.iter().filter(|slot| slot.time.is_active())
+    }
+
+    /// **Whether this pane's clock is running.** Asked of the pane, answered
+    /// by the time-primary layer's [`LoopPhase`], which stays the one
+    /// authority: a `playing` stored beside it would be a second truth to
+    /// keep in step, and the phase is what the transport, the dispatcher and
+    /// the wake term already read.
+    pub fn playing(&self) -> bool {
+        self.clock_layer()
+            .is_some_and(|id| self.time_state(id).is_playing())
+    }
+
+    /// **Re-derive every layer's playhead from this pane's clock.** The one
+    /// door: call it after the clock moves or a layer's frame list changes,
+    /// and no other code writes a playhead.
+    pub fn settle_playheads(&mut self) {
+        let mode = self.time.mode;
+        for slot in &mut self.layers {
+            slot.time.settle_playhead(mode);
+        }
+    }
+
+    /// Move this pane's clock, and settle every layer onto it.
+    pub fn set_time_mode(&mut self, mode: TimeMode) {
+        self.time.mode = mode;
+        self.settle_playheads();
+    }
+
+    /// **Park this pane's clock on one layer's frame**, named by index — what
+    /// the scrubber and the frame-step buttons do. The clock takes that
+    /// frame's own stamp, so every other layer on the pane moves to the same
+    /// instant rather than each keeping a private index. `false` for an index
+    /// that names no frame, and then nothing moved.
+    pub fn park_on_frame(&mut self, id: &LayerId, index: usize) -> bool {
+        let Some(stamp) = self
+            .time_state(id)
+            .frames
+            .get(index)
+            .map(|frame| frame.timestamp)
+        else {
+            return false;
+        };
+        self.set_time_mode(TimeMode::AsOf(stamp));
+        true
+    }
+
+    /// [`Self::park_on_frame`] on the radar layer — the loop the transport
+    /// means by "this pane's loop".
+    pub fn park_on_loop_frame(&mut self, index: usize) -> bool {
+        self.park_on_frame(&known::RADAR, index)
     }
 
     /// **The radar layer's timeline in this pane** — what the loop transport,

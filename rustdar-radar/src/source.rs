@@ -47,6 +47,15 @@ impl SourceHandler for RadarSource {
     fn render_mode(&self) -> RenderMode {
         RenderMode::Texture
     }
+    /// Discrete stamped volumes, never ahead of the wall clock. The nominal
+    /// step is the WSR-88D precipitation cadence; the measured truth for a
+    /// window is the loop's own `cadence_secs`, which this never overrides.
+    fn time_axis(&self) -> rustdar_source::time::TimeAxis {
+        rustdar_source::time::TimeAxis::FrameSeries {
+            typical_step: std::time::Duration::from_secs(300),
+            extends_future: false,
+        }
+    }
     fn default_enabled(&self) -> bool {
         true
     }

@@ -1989,10 +1989,10 @@ impl super::App {
             let ls = pane.loop_state_mut();
             ls.phase = rustdar_egui::pane::LoopPhase::Playing;
             ls.last_advance = Some(now);
-            // Align all panes to the last frame so they start from the same position
-            if !ls.frames.is_empty() {
-                ls.current_frame = ls.frames.len() - 1;
-            }
+            // Align all panes to the last frame so they start from the same
+            // position — said as a clock rather than as an index: `Live` is
+            // "the newest there is", which is the same frame on every pane.
+            pane.set_time_mode(rustdar_egui::pane::TimeMode::Live);
         }
     }
 
@@ -2007,7 +2007,14 @@ impl super::App {
             // The pane's own posture, which every pane carries the same copy
             // of — see `Gui::set_loop_speed_fps`.
             let interval = loop_interval(pane.time.speed_fps);
-            let ls = pane.loop_state_mut();
+            let mode = pane.time.mode;
+            // The pane's time-primary layer — the topmost one animating — is
+            // whose stamps the clock walks. On a radar pane that is radar,
+            // which sits above the model in the draw order.
+            let Some(id) = pane.clock_layer().cloned() else {
+                continue;
+            };
+            let ls = pane.time_state_mut(&id);
             if !ls.is_active() || !ls.is_playing() || ls.frames.is_empty() {
                 continue;
             }
@@ -2019,14 +2026,18 @@ impl super::App {
 
             if should_advance {
                 ls.last_advance = Some(now);
-                // Skip to the next frame that has a rendered texture
+                // Skip to the next frame that has a rendered texture, and move
+                // the pane's CLOCK onto that frame's stamp rather than the
+                // playhead onto its index: the playhead is derived from the
+                // clock, and every other layer on the pane rides the same one.
                 let num_frames = ls.frames.len();
-                for offset in 1..=num_frames {
-                    let candidate = (ls.current_frame + offset) % num_frames;
-                    if ls.frames[candidate].image.is_some() {
-                        ls.current_frame = candidate;
-                        break;
-                    }
+                let from = ls.frame_at(mode);
+                let landed = (1..=num_frames)
+                    .map(|offset| (from + offset) % num_frames)
+                    .find(|&candidate| ls.frames[candidate].image.is_some())
+                    .map(|candidate| ls.frames[candidate].timestamp);
+                if let Some(stamp) = landed {
+                    pane.set_time_mode(rustdar_egui::pane::TimeMode::AsOf(stamp));
                 }
             }
         }
@@ -2793,9 +2804,9 @@ fn accept_scan_listing(
             render_failed: false,
         })
         .collect();
-    if !ls.frames.is_empty() {
-        ls.current_frame = ls.frames.len() - 1; // start at newest
-    }
+    // A freshly built loop is parked on its newest frame; the pane's own
+    // clock takes over at the next settle.
+    ls.settle_playhead(rustdar_egui::pane::TimeMode::Live);
 
     Some(FramePlan::new(site.to_string(), scans))
 }

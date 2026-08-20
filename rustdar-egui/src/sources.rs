@@ -216,8 +216,15 @@ mod registry_identity_tests {
     /// layer cannot join without this list saying what it does with the clock,
     /// and a layer that quietly changes arm is a named diff. Alerts and
     /// lightning are the two `EventLifetime` layers (items with validity
-    /// windows); the model is the one `FrameSeries` (hourly runs, ahead of the
-    /// clock); the other nine draw the latest thing they fetched.
+    /// windows); radar and the model are the two `FrameSeries` layers — radar
+    /// on the ~5-minute volume cadence and never ahead of the clock, the model
+    /// on hourly runs that are — and the other eight draw the latest thing
+    /// they fetched.
+    ///
+    /// **Radar's row moved deliberately at WO-E7b** (was `Live`), which is
+    /// what gives a radar pane a time-primary layer for its clock to walk;
+    /// radar sits above the model in the draw order (weight 30 against 10),
+    /// so it is the time-primary layer of any pane that draws it.
     #[test]
     fn every_layer_declares_what_it_does_with_the_clock() {
         use rustdar_source::time::TimeAxis;
@@ -226,10 +233,14 @@ mod registry_identity_tests {
             typical_step: std::time::Duration::from_secs(3600),
             extends_future: true,
         };
+        let volume_cadence = TimeAxis::FrameSeries {
+            typical_step: std::time::Duration::from_secs(300),
+            extends_future: false,
+        };
         let expected: Vec<(&str, TimeAxis)> = vec![
             ("ModelData", hourly_forecast),
             ("SpcOutlook", TimeAxis::Live),
-            ("Radar", TimeAxis::Live),
+            ("Radar", volume_cadence),
             ("SpcDiscussions", TimeAxis::Live),
             ("NwsAlerts", TimeAxis::EventLifetime),
             ("StormReports", TimeAxis::Live),
@@ -259,6 +270,52 @@ mod registry_identity_tests {
                 .collect::<Vec<_>>(),
             "a layer's relationship to the clock changed, or a new layer \
              joined without declaring one",
+        );
+    }
+
+    /// **Which layer takes a pane's clock, read off the two declarations that
+    /// decide it** — `time_axis` and `draw_order_weight` — rather than by
+    /// knowing which layer is radar.
+    ///
+    /// The time-primary layer is the topmost enabled `FrameSeries` layer in
+    /// the draw order. Two layers declare `FrameSeries`, and radar's weight
+    /// (30) puts it above the model's (10), so radar is time-primary on any
+    /// pane that draws it and the model takes over only where radar is off.
+    /// This is the fact WO-E7b's clock rests on; it is a **coincidence of two
+    /// independent declarations**, so it is pinned rather than assumed.
+    #[test]
+    fn radar_takes_the_clock_wherever_it_is_drawn() {
+        use rustdar_source::time::TimeAxis;
+
+        let mut framed: Vec<(String, u32)> = all()
+            .iter()
+            .filter(|h| matches!(h.time_axis(), TimeAxis::FrameSeries { .. }))
+            .map(|h| (h.id().as_str().to_owned(), h.draw_order_weight()))
+            .collect();
+        assert_eq!(
+            framed.len(),
+            2,
+            "exactly two layers come in stamped frames; a third joining changes \
+             which one a pane's clock follows and must be ruled on, not absorbed",
+        );
+        framed.sort_by_key(|(_, weight)| *weight);
+        let topmost = framed.last().expect("two rows");
+        assert_eq!(
+            topmost.0, "Radar",
+            "the topmost frame-series layer in the draw order is what a pane's \
+             clock walks, and it is radar",
+        );
+        assert_eq!(
+            framed.first().map(|(id, _)| id.as_str()),
+            Some("ModelData"),
+            "and the model is the other one, below it",
+        );
+        assert!(
+            framed[0].1 < framed[1].1,
+            "precondition: the two weights actually differ ({} vs {}), so \
+             \"topmost\" is a fact and not a tie broken by registration order",
+            framed[0].1,
+            framed[1].1,
         );
     }
 

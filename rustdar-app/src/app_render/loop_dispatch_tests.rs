@@ -447,7 +447,7 @@ fn the_frame_list_and_the_frame_plan_describe_the_same_scans() {
         "the sampled set is the frame list, frame for frame"
     );
     assert_eq!(
-        ls.current_frame,
+        ls.current_frame(),
         ls.frames.len() - 1,
         "playback starts at the newest"
     );

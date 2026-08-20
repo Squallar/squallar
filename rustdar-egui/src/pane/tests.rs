@@ -1465,3 +1465,223 @@ fn a_pane_with_no_slot_for_a_layer_answers_with_an_empty_timeline() {
         "and the write landed where the read looks",
     );
 }
+
+// ── WO-E7b: the pane's clock decides which frame is shown ─────────────────
+
+/// A timeline holding frames at whole minutes `0..count`, active and unparked.
+fn timeline_at_minutes(count: u32) -> LayerTimeState {
+    let mut state =
+        crate::radar_layer::begin_loop(3600, &site(SITE, 35.0, -97.0), RenderView::PlanView);
+    state.phase = LoopPhase::Rendering;
+    state.frames = (0..count)
+        .map(|i| LoopFrame {
+            timestamp: ts(i),
+            image: None,
+            render_in_flight: false,
+            render_failed: false,
+        })
+        .collect();
+    state
+}
+
+/// **The derivation itself**: the frame a layer shows at instant `T` is the
+/// latest one stamped at or before `T`, and under `Live` it is the newest
+/// there is. Walked over a clock that lands between frames, exactly on one,
+/// before all of them and after all of them — four different questions, and a
+/// floor that refuses an answer which is the same for all of them.
+#[test]
+fn the_frame_shown_is_the_latest_one_at_or_before_the_panes_clock() {
+    let timeline = timeline_at_minutes(4);
+
+    let cases: [(TimeMode, usize, &str); 6] = [
+        (TimeMode::Live, 3, "Live is the newest frame there is"),
+        (
+            TimeMode::AsOf(ts(3)),
+            3,
+            "a clock past every frame rests on the last",
+        ),
+        (
+            TimeMode::AsOf(ts(2)),
+            2,
+            "a clock exactly on a stamp shows that frame",
+        ),
+        (
+            TimeMode::AsOf(ts(2) + chrono::Duration::seconds(30)),
+            2,
+            "a clock between two frames shows the earlier one, never the later",
+        ),
+        (TimeMode::AsOf(ts(1)), 1, "and again one frame back"),
+        (
+            TimeMode::AsOf(ts(0) - chrono::Duration::seconds(1)),
+            0,
+            "a clock before every frame floors to the oldest held, because an \
+             index into the frame list is what the pane renders through",
+        ),
+    ];
+
+    let answers: HashSet<usize> = cases
+        .iter()
+        .map(|(mode, _, _)| timeline.frame_at(*mode))
+        .collect();
+    assert!(
+        answers.len() >= 3,
+        "non-triviality floor: the derivation gave {} distinct answers across \
+         six clocks spanning the whole timeline, so a constant would pass",
+        answers.len(),
+    );
+
+    for (mode, want, why) in cases {
+        assert_eq!(timeline.frame_at(mode), want, "{why}");
+    }
+}
+
+/// A timeline holding nothing answers `0` rather than panicking or naming a
+/// frame — `frame_at` is read on every pane every frame, including the ones
+/// whose listing has not landed.
+#[test]
+fn an_empty_timeline_names_no_frame_and_does_not_panic() {
+    let empty = LayerTimeState::new();
+    assert_eq!(empty.frame_at(TimeMode::Live), 0);
+    assert_eq!(empty.frame_at(TimeMode::AsOf(ts(5))), 0);
+    assert_eq!(empty.playhead_stamp(), None, "and names no instant either");
+}
+
+/// **The playhead has one writer.** Moving the pane's clock moves every
+/// layer's playhead onto it; `park_on_frame` is the same move said by index,
+/// and it takes the frame's own stamp so a second layer lands on the same
+/// instant rather than the same index.
+#[test]
+fn the_clock_moves_the_playhead_and_two_layers_land_on_one_instant() {
+    let mut pane = PaneState::new();
+    *pane.time_state_mut(&known::RADAR) = timeline_at_minutes(6);
+    // A second frame-series layer on a coarser cadence: frames at 0 and 4.
+    let mut model = timeline_at_minutes(6);
+    model
+        .frames
+        .retain(|f| f.timestamp == ts(0) || f.timestamp == ts(4));
+    *pane.time_state_mut(&known::MODEL_DATA) = model;
+
+    pane.set_time_mode(TimeMode::AsOf(ts(5)));
+    assert_eq!(
+        pane.time_state(&known::RADAR).current_frame(),
+        5,
+        "radar has a frame at 5 and shows it",
+    );
+    assert_eq!(
+        pane.time_state(&known::MODEL_DATA).current_frame(),
+        1,
+        "the coarser layer shows its 4-minute frame — the latest it has at or \
+         before the same instant, not the same index",
+    );
+
+    // Said by index instead, on radar's frame 2, which is 2 minutes.
+    assert!(pane.park_on_loop_frame(2), "frame 2 exists");
+    assert_eq!(
+        pane.time.mode,
+        TimeMode::AsOf(ts(2)),
+        "parking on a frame moves the CLOCK to that frame's stamp",
+    );
+    assert_eq!(pane.time_state(&known::MODEL_DATA).current_frame(), 0);
+    assert!(
+        !pane.park_on_loop_frame(99),
+        "an index naming no frame moves nothing",
+    );
+    assert_eq!(
+        pane.time.mode,
+        TimeMode::AsOf(ts(2)),
+        "and the clock did not move"
+    );
+}
+
+/// **The time-primary layer is the topmost animating one**, read off the draw
+/// order rather than by knowing which layer is radar. Radar's draw weight (30)
+/// sits above the model's (10), so radar wins on any pane that draws both.
+#[test]
+fn the_clock_follows_the_topmost_animating_layer() {
+    let mut pane = PaneState::new();
+    assert_eq!(
+        pane.clock_layer(),
+        None,
+        "a pane animating nothing has no clock layer"
+    );
+    assert!(!pane.playing(), "and is not playing");
+
+    *pane.time_state_mut(&known::MODEL_DATA) = timeline_at_minutes(3);
+    assert_eq!(
+        pane.clock_layer(),
+        Some(&known::MODEL_DATA),
+        "the only animating layer is the time-primary one",
+    );
+
+    // Radar joins, and the slot list is the draw order bottom-to-top.
+    *pane.time_state_mut(&known::RADAR) = timeline_at_minutes(3);
+    let order: Vec<&LayerId> = pane.draw_order().collect();
+    assert!(
+        order.iter().position(|id| **id == known::RADAR)
+            > order.iter().position(|id| **id == known::MODEL_DATA),
+        "precondition: radar is drawn above the model on this pane",
+    );
+    assert_eq!(
+        pane.clock_layer(),
+        Some(&known::RADAR),
+        "the topmost animating layer takes the clock",
+    );
+
+    pane.time_state_mut(&known::RADAR).phase = LoopPhase::Playing;
+    assert!(
+        pane.playing(),
+        "the pane plays when its time-primary layer does"
+    );
+
+    // The arm raised ALONE, because "any layer is playing" passes every other
+    // case here: the layer BELOW the time-primary one plays and the
+    // time-primary one does not. The pane is paused, and a `playing` that
+    // polled the whole stack would say otherwise.
+    pane.time_state_mut(&known::MODEL_DATA).phase = LoopPhase::Playing;
+    pane.time_state_mut(&known::RADAR).phase = LoopPhase::Paused;
+    assert!(
+        pane.time_state(&known::MODEL_DATA).is_playing(),
+        "precondition: the layer below really is playing",
+    );
+    assert!(
+        !pane.playing(),
+        "and a paused time-primary layer is a paused pane, whatever the layer \
+         below it is doing",
+    );
+}
+
+/// **Eviction keeps the pane on the moment, not on the index.** A loop parked
+/// at 20 minutes whose older frames are dropped still names 20 minutes; before
+/// WO-E7b the index was preserved instead, which silently moved the picture.
+#[test]
+fn eviction_keeps_the_pane_on_the_moment_it_was_parked_at() {
+    let mut pane = PaneState::new();
+    *pane.time_state_mut(&known::RADAR) = timeline_at_minutes(5);
+    assert!(pane.park_on_loop_frame(2), "parked on the 2-minute frame");
+
+    // The two oldest frames age out of the window.
+    pane.time_state_mut(&known::RADAR)
+        .frames
+        .retain(|f| f.timestamp >= ts(1));
+    pane.settle_playheads();
+
+    assert_eq!(
+        pane.time_state(&known::RADAR).playhead_stamp(),
+        Some(ts(2)),
+        "the same instant is on screen, at a different index",
+    );
+    assert_eq!(
+        pane.time_state(&known::RADAR).current_frame(),
+        1,
+        "which is index 1 now, not the 2 it was",
+    );
+
+    // And when the clock falls off the front entirely, it floors rather than
+    // dangling: an index must name a frame that exists.
+    pane.time_state_mut(&known::RADAR)
+        .frames
+        .retain(|f| f.timestamp >= ts(3));
+    pane.settle_playheads();
+    assert_eq!(pane.time_state(&known::RADAR).current_frame(), 0);
+    assert_eq!(pane.time_state(&known::RADAR).playhead_stamp(), Some(ts(3)));
+}

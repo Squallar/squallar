@@ -920,7 +920,7 @@ fn the_loop_transport_payloads_drive_the_playback_state() {
         *app.gui.pane_mut(0).unwrap().loop_state_mut() = state;
     }
     let phase = |app: &App| app.gui.pane(0).unwrap().loop_state().phase;
-    let frame = |app: &App| app.gui.pane(0).unwrap().loop_state().current_frame;
+    let frame = |app: &App| app.gui.pane(0).unwrap().loop_state().current_frame();
 
     app.handle_gui_action(GuiAction::ToggleLoopPlayback { pane_idx: 0 }, None);
     assert_eq!(phase(&app), LoopPhase::Playing, "Ready + toggle = Playing");

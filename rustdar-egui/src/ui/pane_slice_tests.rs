@@ -921,14 +921,14 @@ fn a_layer_link_sync_moves_the_stack_and_leaves_every_pane_on_its_own_clock() {
         let ls = pane.loop_state_mut();
         ls.phase = crate::pane::LoopPhase::Playing;
         ls.frames = (0..(4 + idx as i64 * 2)).map(loop_frame).collect();
-        ls.current_frame = 1 + idx * 4;
+        pane.park_on_loop_frame(1 + idx * 4);
     }
     // The sync has work to do: the two stacks disagree about a layer.
     gui.panes[0].set_overlay_enabled(known::NWS_ALERTS, false);
     gui.panes[1].set_overlay_enabled(known::NWS_ALERTS, true);
     assert_ne!(
-        gui.panes[0].loop_state().current_frame,
-        gui.panes[1].loop_state().current_frame,
+        gui.panes[0].loop_state().current_frame(),
+        gui.panes[1].loop_state().current_frame(),
         "precondition: the two panes are on different frames",
     );
     assert_ne!(
@@ -944,7 +944,7 @@ fn a_layer_link_sync_moves_the_stack_and_leaves_every_pane_on_its_own_clock() {
         "precondition: the sync ran and moved the stack at all",
     );
     assert_eq!(
-        gui.panes[1].loop_state().current_frame,
+        gui.panes[1].loop_state().current_frame(),
         5,
         "pane 1 was moved to the active pane's playhead by a stack copy",
     );
@@ -954,7 +954,7 @@ fn a_layer_link_sync_moves_the_stack_and_leaves_every_pane_on_its_own_clock() {
         "pane 1's own frames were replaced by the active pane's",
     );
     assert_eq!(
-        gui.panes[0].loop_state().current_frame,
+        gui.panes[0].loop_state().current_frame(),
         1,
         "and the active pane is where it was",
     );

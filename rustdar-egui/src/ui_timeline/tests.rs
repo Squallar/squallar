@@ -308,3 +308,45 @@ fn without_a_known_cadence_the_caption_makes_no_fidelity_claim() {
     assert!(!phrase.contains("every scan"));
     assert!(!phrase.contains("sampled"));
 }
+
+// ── WO-E7b: the step picker's options are steps, not a sentinel ──────────
+
+/// **The `0` sentinel is gone from the picker.** `TIME_STEP_OPTIONS` offers
+/// [`TimeStep`] values, "1 scan" first, and the six real durations after it —
+/// and the `0` survives in exactly one place, which is what the config file
+/// writes for the one that is not a duration.
+#[test]
+fn the_step_picker_offers_one_scan_first_and_no_zero_sentinel() {
+    use crate::pane::TimeStep;
+
+    let (first, label) = super::TIME_STEP_OPTIONS[0];
+    assert_eq!(
+        first,
+        TimeStep::OneFrame,
+        "the one-frame step leads the list"
+    );
+    assert_eq!(label, "1 scan");
+
+    let durations: Vec<i64> = super::TIME_STEP_OPTIONS[1..]
+        .iter()
+        .map(|(step, _)| match step {
+            TimeStep::Secs(secs) => *secs,
+            TimeStep::OneFrame => panic!("only the first option is the one-frame step"),
+        })
+        .collect();
+    assert_eq!(
+        durations,
+        vec![600, 1800, 3600, 7200, 21600, 43200],
+        "the six offered durations are unchanged",
+    );
+    assert!(
+        durations.iter().all(|secs| *secs != 0),
+        "no option is a zero-second duration - zero is not a step, it is the \
+         spelling the config file gives the one-frame step",
+    );
+    assert_eq!(
+        TimeStep::OneFrame.as_secs(),
+        0,
+        "and that spelling is still the zero every existing config carries",
+    );
+}
