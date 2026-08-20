@@ -269,3 +269,43 @@ fn an_unregistered_field_id_names_no_product() {
         "the lookup itself is broken if even a known id misses",
     );
 }
+
+/// Every `known::` const names a field this crate actually registers.
+///
+/// The open string has no compiler to catch a typo, and these consts are what
+/// the UI spells instead of the product enum — so a drifted one would be a
+/// selection that silently resolves to nothing rather than a build error.
+#[test]
+fn every_known_field_is_registered() {
+    assert_eq!(
+        known::ALL.len(),
+        RadarProduct::all().len(),
+        "the `known::` list and the registration disagree in size",
+    );
+    for id in &known::ALL {
+        assert!(
+            product_for(id).is_some(),
+            "known::{} names {:?}, which this crate does not register",
+            id.as_str(),
+            id.as_str(),
+        );
+    }
+    // Every registered field is reachable as a const, not merely the reverse:
+    // a product added without its const would otherwise pass silently.
+    for &p in RadarProduct::all() {
+        assert!(
+            known::ALL.contains(&spec(p).id),
+            "{p:?} is registered but has no `known::` const, so the UI has no \
+             spelling for it that does not name the enum",
+        );
+    }
+    // Non-triviality floor: the consts are distinct.
+    // Bound to a local first: `known::ALL` is a `const`, so referring to it
+    // directly creates a temporary that dies at the end of the statement.
+    let all = known::ALL;
+    let mut ids: Vec<&str> = all.iter().map(|i| i.as_str()).collect();
+    ids.sort_unstable();
+    let before = ids.len();
+    ids.dedup();
+    assert_eq!(ids.len(), before, "two `known::` consts share a spelling");
+}
