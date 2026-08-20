@@ -6,6 +6,7 @@
 //! see [`ModelParameter::forecast_hour`].
 
 pub mod fetch;
+pub mod fields;
 pub mod lambert;
 
 use rustdar_geo::GeoBounds;

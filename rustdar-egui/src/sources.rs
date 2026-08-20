@@ -469,3 +469,140 @@ mod registry_identity_tests {
         }
     }
 }
+
+/// The composed registry's **field** contract, which only exists once radar and
+/// the overlays are in one list.
+///
+/// These pins live here rather than in either source crate because that is where
+/// the composition lives (WO-M9): a `FieldId` collision between two *different*
+/// crates' fields is invisible to each crate's own suite, and it is exactly the
+/// collision that would make one field's saved curves, thresholds and preset
+/// panes silently resolve to the other's.
+#[cfg(test)]
+mod field_registry_tests {
+    use rustdar_source::product::FieldId;
+
+    use super::all;
+
+    /// Every field the composed registry offers, with its owning layer.
+    fn fields() -> Vec<(String, &'static rustdar_source::product::ProductSpec)> {
+        all()
+            .iter()
+            .flat_map(|h| {
+                let id = h.id().as_str().to_owned();
+                h.products().iter().map(move |s| (id.clone(), s))
+            })
+            .collect()
+    }
+
+    /// No two fields — from any two layers — share an id.
+    #[test]
+    fn no_two_fields_share_an_id_across_the_whole_registry() {
+        let fields = fields();
+        // Non-triviality floor: there are fields from more than one layer, so
+        // the check is actually cross-crate and not a restatement of one
+        // crate's own uniqueness test.
+        let owners: std::collections::HashSet<&str> =
+            fields.iter().map(|(o, _)| o.as_str()).collect();
+        assert!(
+            owners.len() >= 2,
+            "only {} layer(s) register fields, so this pin cannot see a \
+             cross-layer collision: {owners:?}",
+            owners.len(),
+        );
+        assert_eq!(
+            fields.len(),
+            17 + 16,
+            "the composed field count moved (radar's seventeen products plus \
+             the model's sixteen parameters); re-cut this pin in the land that \
+             changed it",
+        );
+
+        let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for (owner, spec) in &fields {
+            if let Some(prev) = seen.insert(spec.id.as_str(), owner.as_str()) {
+                panic!(
+                    "{:?} is registered by both {prev} and {owner}; one \
+                     layer's saved curves, thresholds and preset panes would \
+                     resolve to the other's field",
+                    spec.id.as_str(),
+                );
+            }
+        }
+    }
+
+    /// Every registered field states all eleven facts usefully — the doctrine
+    /// that no field carries a `Default`, checked rather than claimed.
+    #[test]
+    fn every_registered_field_states_its_facts() {
+        for (owner, s) in fields() {
+            assert!(!s.id.as_str().is_empty(), "{owner} registered an empty id");
+            assert!(!s.name.is_empty(), "{:?} has no display name", s.id);
+            assert!(!s.code.is_empty(), "{:?} has no code", s.id);
+            assert!(!s.group.is_empty(), "{:?} is filed under no group", s.id);
+            assert!(
+                !s.scale.thresholds.is_empty(),
+                "{:?} has a colour bar with no stops",
+                s.id,
+            );
+            let (lo, hi) = s.value_domain;
+            assert!(
+                lo.is_finite() && hi.is_finite() && lo < hi,
+                "{:?}'s value domain is {lo}..={hi}, which nothing can travel",
+                s.id,
+            );
+            assert!(
+                !s.domain_label_ends.0.is_empty(),
+                "{:?} states no threshold prefix",
+                s.id,
+            );
+            // `vertical` implies the field is `tilted`: a field with vertical
+            // extent is sampled or derived tilt by tilt.
+            if s.vertical {
+                assert!(
+                    s.tilted,
+                    "{:?} claims vertical extent without a per-tilt field",
+                    s.id,
+                );
+            }
+        }
+    }
+
+    /// The registry's `by_id` read answers for every registered field and
+    /// refuses one it does not have.
+    #[test]
+    fn a_field_id_resolves_to_exactly_its_own_registration() {
+        let fields = fields();
+        for (_, s) in &fields {
+            let hits = fields.iter().filter(|(_, o)| o.id == s.id).count();
+            assert_eq!(hits, 1, "{:?} resolved {hits} ways", s.id);
+        }
+        let unknown = FieldId::new("NoBuildRegistersThisField");
+        assert!(
+            !fields.iter().any(|(_, s)| s.id == unknown),
+            "an unregistered id must resolve to nothing",
+        );
+    }
+
+    /// Every group a field declares is one of the two this build registers, and
+    /// both are actually populated — a group label nobody uses would make the
+    /// catalogue's generic loop draw an empty heading.
+    #[test]
+    fn the_declared_groups_are_populated() {
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (_, s) in fields() {
+            *counts.entry(s.group).or_default() += 1;
+        }
+        assert_eq!(
+            counts.get("Radar products").copied(),
+            Some(17),
+            "the radar group's size moved",
+        );
+        assert_eq!(
+            counts.get("HRRR parameters").copied(),
+            Some(16),
+            "the model group's size moved",
+        );
+        assert_eq!(counts.len(), 2, "an unexpected group appeared: {counts:?}");
+    }
+}

@@ -19,6 +19,7 @@ use crate::fetch_policy::{
 };
 use crate::id::LayerId;
 use crate::job::{DescribedJob, JobCodec};
+use crate::product::ProductSpec;
 use crate::time::{FrameListing, FrameStamp, TimeAxis};
 
 /// Not `rustdar_radar::LegendScale`: duplicated here to avoid the dependency.
@@ -690,6 +691,26 @@ pub trait SourceHandler: Send {
     fn legend(&self, pane: &PaneRef<'_>) -> Option<Signed<OverlayLegend>> {
         let _ = pane;
         None
+    }
+
+    /// The renderable fields this layer offers, as data.
+    ///
+    /// A layer with one picture and nothing to choose between returns the empty
+    /// default. A layer that publishes several quantities — radar's moments,
+    /// the model's parameters — returns one [`ProductSpec`] each, and the UI
+    /// builds its pickers, legends and catalogue tiles from those rows without
+    /// naming a single one of them.
+    fn products(&self) -> &'static [ProductSpec] {
+        &[]
+    }
+
+    /// The fields this layer offers as catalogue tiles.
+    ///
+    /// Defaults to [`products`](Self::products): a layer that publishes fields
+    /// normally wants all of them on offer. A layer whose catalogue presence is
+    /// narrower than its field list overrides this.
+    fn catalog(&self) -> &'static [ProductSpec] {
+        self.products()
     }
 
     fn controls(&self, _pane: &PaneRef<'_>) -> Vec<ControlItem> {

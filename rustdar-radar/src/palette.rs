@@ -487,14 +487,13 @@ static NROT_ANTICYCLONIC: ColorScale = &(
 // ————————————————————————————————————————————————————————————————————
 
 /// Color bar description for a product.
-#[derive(Clone)]
-pub struct LegendScale {
-    /// Color stops, sorted ascending by value.
-    pub thresholds: Vec<(f32, [u8; 3])>,
-    pub is_gradient: bool,
-    pub min_value: f32,
-    pub max_value: f32,
-}
+///
+/// **Defined in the substrate** (`rustdar_source::product::LegendScale`) since
+/// WO-E9a, because `ProductSpec::scale` names it and that table sits below
+/// every source crate. The values are still built here — the palette tables
+/// above are the physics — and this re-export keeps every consumer's spelling
+/// unchanged.
+pub use rustdar_source::product::LegendScale;
 
 fn extract_scale(scale: ColorScale) -> LegendScale {
     let &(thresholds, gradient) = scale;

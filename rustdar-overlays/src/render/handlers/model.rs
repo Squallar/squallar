@@ -211,6 +211,11 @@ impl ModelDataHandler {
 }
 
 impl OverlayHandler for ModelDataHandler {
+    /// The sixteen HRRR parameters this layer offers, projected into the
+    /// substrate's read contract by [`crate::hrrr::fields`].
+    fn products(&self) -> &'static [rustdar_source::product::ProductSpec] {
+        crate::hrrr::fields::products()
+    }
     fn id(&self) -> LayerId {
         known::MODEL_DATA
     }
