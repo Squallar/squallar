@@ -2,6 +2,7 @@
 
 use super::*;
 use rustdar_geo::GeoPoint;
+use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::RenderView;
 
 const SITE: &str = "KTLX";
@@ -52,8 +53,8 @@ fn key() -> SectionLoopKey {
 
 /// A loop of `count` blank frames in the given view, already retargeted so
 /// `rendered_for` (and `section_key`, for a section) is set.
-fn loop_in(view: RenderView, count: u32) -> LoopPlaybackState {
-    let mut ls = LoopPlaybackState::new_for_loop(3600, &site(), view);
+fn loop_in(view: RenderView, count: u32) -> LayerTimeState {
+    let mut ls = crate::radar_layer::begin_loop(3600, &site(), view);
     ls.phase = LoopPhase::Rendering;
     ls.frames = (0..count)
         .map(|i| LoopFrame {
@@ -266,7 +267,7 @@ fn moving_the_line_discards_every_frame() {
 #[test]
 fn editing_the_storm_motion_vector_discards_every_frame() {
     let ctx = egui::Context::default();
-    let mut ls = LoopPlaybackState::new_for_loop(3600, &site(), RenderView::CrossSection);
+    let mut ls = crate::radar_layer::begin_loop(3600, &site(), RenderView::CrossSection);
     ls.phase = LoopPhase::Rendering;
     ls.frames = (0..3)
         .map(|i| LoopFrame {
@@ -340,7 +341,7 @@ fn a_tilt_change_re_cuts_no_section_but_still_re_renders_the_plan_view() {
     }
 
     for product in products {
-        let mut section = LoopPlaybackState::new_for_loop(3600, &site(), RenderView::CrossSection);
+        let mut section = crate::radar_layer::begin_loop(3600, &site(), RenderView::CrossSection);
         section.phase = LoopPhase::Rendering;
         section.frames = (0..3)
             .map(|i| LoopFrame {
@@ -387,7 +388,7 @@ fn a_tilt_change_re_cuts_no_section_but_still_re_renders_the_plan_view() {
 /// every frame on every dispatch pass for ever.
 #[test]
 fn rewriting_the_same_storm_motion_vector_invalidates_nothing() {
-    let mut ls = LoopPlaybackState::new_for_loop(3600, &site(), RenderView::CrossSection);
+    let mut ls = crate::radar_layer::begin_loop(3600, &site(), RenderView::CrossSection);
     let srv = RadarProduct::StormRelativeVelocity;
     let motion = Some((30.0, 240.0));
     ls.retarget_renders_for(
@@ -551,17 +552,17 @@ fn a_section_pane_cannot_loop_until_it_has_a_line() {
 #[test]
 fn converting_between_two_looping_kinds_tears_the_loop_down() {
     let mut pane = PaneState::new();
-    pane.loop_state = LoopPlaybackState::new_for_loop(3600, &site(), RenderView::PlanView);
-    assert!(pane.loop_state.is_active());
+    *pane.loop_state_mut() = crate::radar_layer::begin_loop(3600, &site(), RenderView::PlanView);
+    assert!(pane.loop_state().is_active());
 
     pane.set_kind(PaneKind::CrossSection);
     assert!(
-        !pane.loop_state.is_active(),
+        !pane.loop_state().is_active(),
         "a map pane's plan-view frames survived the conversion to a section \
          pane, which would animate a list nothing can refill while holding \
          MAX_LOOP_RENDER_BUDGET textures alive to do it"
     );
-    assert_eq!(pane.loop_state.view, RenderView::PlanView);
+    assert_eq!(pane.loop_state().view, RenderView::PlanView);
 }
 
 /// `active_image` and `active_section_image` read the same frame and each
@@ -571,9 +572,9 @@ fn converting_between_two_looping_kinds_tears_the_loop_down() {
 fn the_playhead_answers_only_for_the_shape_it_holds() {
     let ctx = egui::Context::default();
     let mut pane = PaneState::new();
-    pane.loop_state = loop_in(RenderView::CrossSection, 3);
-    pane.loop_state.current_frame = 1;
-    pane.loop_state.frames[1].image = Some(section_picture(&ctx, 5));
+    *pane.loop_state_mut() = loop_in(RenderView::CrossSection, 3);
+    pane.loop_state_mut().current_frame = 1;
+    pane.loop_state_mut().frames[1].image = Some(section_picture(&ctx, 5));
 
     assert!(
         pane.active_image().is_none(),
@@ -585,7 +586,7 @@ fn the_playhead_answers_only_for_the_shape_it_holds() {
         "the section painter was not handed the frame on the playhead"
     );
 
-    pane.loop_state.frames[1].image = Some(plan_view_picture(&ctx));
+    pane.loop_state_mut().frames[1].image = Some(plan_view_picture(&ctx));
     assert!(pane.active_image().is_some());
     assert!(
         pane.active_section_image().is_none(),

@@ -152,7 +152,7 @@ pub(super) fn render_pane_map_content(
             let mut painted_layer = ui.painter().layer_id();
             match id {
                 id if *id == known::RADAR => {
-                    if ctx.pane.loop_state.is_active() {
+                    if ctx.pane.loop_state().is_active() {
                         if let Some(img) = ctx.pane.active_image().cloned() {
                             render_radar_overlay(
                                 ui,

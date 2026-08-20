@@ -1,5 +1,6 @@
 use super::*;
 use rustdar_device_profile::budget::MAX_PANES_DESKTOP;
+use rustdar_radar::sites::RadarSite;
 use rustdar_source::id::known;
 use std::collections::HashSet;
 
@@ -199,12 +200,12 @@ fn site(name: &'static str, lat: f64, lon: f64) -> RadarSite {
     }
 }
 
-fn loop_with_frames(count: usize, current_frame: usize) -> LoopPlaybackState {
+fn loop_with_frames(count: usize, current_frame: usize) -> LayerTimeState {
     loop_for_site(&site(SITE, 35.0, -97.0), count, current_frame)
 }
 
-fn loop_for_site(site: &RadarSite, count: usize, current_frame: usize) -> LoopPlaybackState {
-    let mut state = LoopPlaybackState::new_for_loop(3600, site, RenderView::PlanView);
+fn loop_for_site(site: &RadarSite, count: usize, current_frame: usize) -> LayerTimeState {
+    let mut state = crate::radar_layer::begin_loop(3600, site, RenderView::PlanView);
     state.phase = LoopPhase::Rendering;
     state.frames = (0..count)
         .map(|i| LoopFrame {
@@ -461,7 +462,7 @@ fn a_result_rendered_for_another_site_is_rejected() {
 }
 
 /// The site-change path. Switching site tears the loop down and builds a new one
-/// (`LoopPlaybackState::new()` then `new_for_loop`), which is what closes this
+/// (`LayerTimeState::new()` then `new_for_loop`), which is what closes this
 /// today — but only incidentally: once the new loop has listed its scans, adopted
 /// the same product/elevation and re-marked a frame in flight, an old render still
 /// running for the previous site would be accepted on nothing but a timestamp
@@ -517,11 +518,12 @@ fn a_sibling_on_another_site_does_not_accept_the_broadcast() {
 #[test]
 fn a_loop_takes_its_code_and_its_coordinates_from_one_site() {
     let koun = site("KOUN", 35.23, -97.46);
-    let state = LoopPlaybackState::new_for_loop(3600, &koun, RenderView::PlanView);
+    let state = crate::radar_layer::begin_loop(3600, &koun, RenderView::PlanView);
 
-    assert_eq!(state.site, koun.name);
-    assert_eq!(state.site_lat, koun.lat);
-    assert_eq!(state.site_lon, koun.lon);
+    let geo = crate::radar_layer::geometry(&state).expect("the loop carries its geometry");
+    assert_eq!(geo.site, koun.name);
+    assert_eq!(geo.lat, koun.lat);
+    assert_eq!(geo.lon, koun.lon);
 }
 
 /// The dispatcher's donor search is a second, independent way one pane's image
@@ -741,7 +743,7 @@ fn the_mutable_broadcast_accessor_applies_the_sweep_test() {
     );
 }
 
-/// Single-frame mode keeps a `LoopPlaybackState` around with stale placeholder site
+/// Single-frame mode keeps a `LayerTimeState` around with stale placeholder site
 /// fields.
 #[test]
 fn an_inactive_loop_takes_nothing_from_any_path() {
@@ -1096,9 +1098,9 @@ fn a_looping_pane_reports_the_playing_frames_fold_limit() {
         "precondition: a still pane says what its own static render declared",
     );
 
-    pane.loop_state = loop_with_frames(3, 1);
-    pane.loop_state.frames[0].image = Some(plan_view_folding_at(&ctx, Some(31.0)));
-    pane.loop_state.frames[1].image = Some(plan_view_folding_at(&ctx, Some(22.14)));
+    *pane.loop_state_mut() = loop_with_frames(3, 1);
+    pane.loop_state_mut().frames[0].image = Some(plan_view_folding_at(&ctx, Some(31.0)));
+    pane.loop_state_mut().frames[1].image = Some(plan_view_folding_at(&ctx, Some(22.14)));
     assert_eq!(
         pane.displayed_nyquist_ms(),
         Some(22.14),
@@ -1106,13 +1108,13 @@ fn a_looping_pane_reports_the_playing_frames_fold_limit() {
          on the glass",
     );
 
-    pane.loop_state.current_frame = 0;
+    pane.loop_state_mut().current_frame = 0;
     assert_eq!(pane.displayed_nyquist_ms(), Some(31.0));
 
-    pane.loop_state.frames[0].image = Some(plan_view_folding_at(&ctx, None));
+    pane.loop_state_mut().frames[0].image = Some(plan_view_folding_at(&ctx, None));
     assert_eq!(pane.displayed_nyquist_ms(), None);
 
-    pane.loop_state.current_frame = 2;
+    pane.loop_state_mut().current_frame = 2;
     assert_eq!(pane.displayed_nyquist_ms(), None);
 }
 
@@ -1202,8 +1204,8 @@ fn a_looping_classification_pane_reports_the_playing_frames_layer() {
 
     let ctx = egui::Context::default();
     let mut pane = classification_pane(&ctx, Some(MeltingLayerSource::Rpg));
-    pane.loop_state = loop_with_frames(3, 1);
-    pane.loop_state.frames[1].image = Some(LoopFrameImage::PlanView(RadarImageData {
+    *pane.loop_state_mut() = loop_with_frames(3, 1);
+    pane.loop_state_mut().frames[1].image = Some(LoopFrameImage::PlanView(RadarImageData {
         melting_layer_source: Some(MeltingLayerSource::FleetDefault),
         ..dummy_plan_view(&ctx)
     }));
@@ -1213,7 +1215,7 @@ fn a_looping_classification_pane_reports_the_playing_frames_layer() {
         "the loop reported the static render's layer, not the frame on the glass",
     );
 
-    pane.loop_state.current_frame = 2;
+    pane.loop_state_mut().current_frame = 2;
     assert_eq!(pane.displayed_melting_layer_source(), None);
 }
 
@@ -1286,8 +1288,8 @@ fn a_looping_storm_relative_pane_reports_the_playing_frames_vector() {
 
     let ctx = egui::Context::default();
     let mut pane = storm_relative_pane(&ctx, Some(StormMotionSource::RpgScitAverage));
-    pane.loop_state = loop_with_frames(3, 1);
-    pane.loop_state.frames[1].image = Some(LoopFrameImage::PlanView(RadarImageData {
+    *pane.loop_state_mut() = loop_with_frames(3, 1);
+    pane.loop_state_mut().frames[1].image = Some(LoopFrameImage::PlanView(RadarImageData {
         storm_motion: Some(srm_vector(StormMotionSource::BunkersRightMover)),
         ..dummy_plan_view(&ctx)
     }));
@@ -1297,6 +1299,84 @@ fn a_looping_storm_relative_pane_reports_the_playing_frames_vector() {
         "the loop reported the static render's vector, not the frame on the glass",
     );
 
-    pane.loop_state.current_frame = 2;
+    pane.loop_state_mut().current_frame = 2;
     assert_eq!(pane.displayed_storm_motion(), None);
+}
+
+/// **`OneFrame` is the `0` the config file has always written for it**, and
+/// every other option is the number it always was. WO-E7a gave the step a type
+/// and deliberately did not give it a new serde form: a file written by this
+/// build and a file written by the last one say the same thing.
+#[test]
+fn one_scan_is_the_zero_the_config_file_has_always_written() {
+    assert_eq!(TimeStep::OneFrame.as_secs(), 0);
+    assert_eq!(TimeStep::from_secs(0), TimeStep::OneFrame);
+    for secs in [600, 1800, 3600, 7200, 21600, 43200] {
+        assert_eq!(
+            TimeStep::from_secs(secs),
+            TimeStep::Secs(secs),
+            "{secs} is a duration, not the sentinel",
+        );
+        assert_eq!(
+            TimeStep::from_secs(secs).as_secs(),
+            secs,
+            "{secs} round-trips through the config file's own spelling",
+        );
+    }
+}
+
+/// **Two layers in one pane keep two timelines.** The whole point of moving
+/// the loop state onto the slot: a pane animating radar and a pane animating
+/// something else are one pane, and neither reads the other's playhead.
+#[test]
+fn two_layers_in_one_pane_keep_two_timelines() {
+    let mut pane = PaneState::with_site(SITE.to_string());
+    pane.loop_state_mut().current_frame = 3;
+    pane.time_state_mut(&known::MODEL_DATA).current_frame = 7;
+
+    assert_eq!(
+        pane.loop_state().current_frame,
+        3,
+        "the radar layer kept its own playhead",
+    );
+    assert_eq!(
+        pane.time_state(&known::MODEL_DATA).current_frame,
+        7,
+        "and the model layer kept its own",
+    );
+    assert_eq!(
+        pane.time_state(&known::NWS_ALERTS).current_frame,
+        0,
+        "a layer nothing has written for is at the start, not at somebody else's frame",
+    );
+}
+
+/// **A pane with no slot for a layer has no timeline for it either**, and
+/// gains one only when something writes. A fresh `PaneState` starts with an
+/// empty stack (WO-E6b), so every read of a loop that has not begun has to
+/// answer "inactive" without inventing a slot.
+#[test]
+fn a_pane_with_no_slot_for_a_layer_answers_with_an_empty_timeline() {
+    let mut pane = PaneState::with_site(SITE.to_string());
+    assert!(
+        pane.layers.is_empty(),
+        "precondition: a fresh pane carries no slots at all",
+    );
+    assert!(!pane.loop_state().is_active());
+    assert!(pane.loop_state().frames.is_empty());
+    assert!(
+        pane.slot(&known::RADAR).is_none(),
+        "and reading did not create one",
+    );
+
+    pane.loop_state_mut().phase = LoopPhase::Playing;
+
+    assert!(
+        pane.slot(&known::RADAR).is_some(),
+        "writing the timeline gave the layer a slot to keep it on",
+    );
+    assert!(
+        pane.loop_state().is_active(),
+        "and the write landed where the read looks",
+    );
 }

@@ -2,7 +2,7 @@
 //! one surface floating over the map's bottom edge.
 
 use crate::actions::GuiAction;
-use crate::pane::LoopFrame;
+use crate::pane::{LoopFrame, TimeStep};
 
 /// Available time step options: (seconds, label). 0 = "one scan". Moved here
 /// from the layers panel with the navigation buttons that consume it.
@@ -538,7 +538,7 @@ impl super::Gui {
             actions.push(GuiAction::JumpToLive { pane_idx });
         }
 
-        let step_secs = self.panes[pane_idx].time_step_secs;
+        let step_secs = self.panes[pane_idx].time.step.as_secs();
         let back = ui.button("\u{23f4}").on_hover_text("Back one step");
         #[cfg(test)]
         {
@@ -604,11 +604,11 @@ impl super::Gui {
         #[cfg(not(test))]
         let _ = combo;
         if new_step != step_secs {
-            self.panes[pane_idx].time_step_secs = new_step;
+            self.panes[pane_idx].time.step = TimeStep::from_secs(new_step);
         }
 
         let can_loop = self.panes[pane_idx].can_loop();
-        let loop_active = self.panes[pane_idx].loop_state.is_active();
+        let loop_active = self.panes[pane_idx].loop_state().is_active();
         let loop_toggle = ui
             .add_enabled(
                 can_loop,
@@ -630,7 +630,9 @@ impl super::Gui {
                 for pane_idx in self.loop_sync_targets() {
                     actions.push(GuiAction::EnableLoop {
                         pane_idx,
-                        lookback_secs: self.loop_lookback_secs,
+                        // The pane's own window, which carries the one number
+                        // the file holds — see `Gui::set_loop_span_secs`.
+                        lookback_secs: self.panes[pane_idx].time.span_secs,
                     });
                 }
             }
@@ -648,7 +650,7 @@ impl super::Gui {
         ui.spacing_mut().slider_width =
             (ui.available_width() - ui.spacing().item_spacing.x).max(60.0);
 
-        let loop_state = &self.panes[pane_idx].loop_state;
+        let loop_state = self.panes[pane_idx].loop_state();
         let loop_frames = loop_state
             .is_active()
             .then_some(loop_state.frames.len())
@@ -657,7 +659,7 @@ impl super::Gui {
         if let Some(total) = loop_frames {
             let seek = ui
                 .push_id("scrub_loop", |ui| {
-                    let mut frame_idx = self.panes[pane_idx].loop_state.current_frame;
+                    let mut frame_idx = self.panes[pane_idx].loop_state().current_frame;
                     let seek = ui
                         .add(egui::Slider::new(&mut frame_idx, 0..=(total - 1)).show_value(false));
                     if seek.changed() {
@@ -683,7 +685,7 @@ impl super::Gui {
             return;
         }
 
-        let lookback_secs = self.loop_lookback_secs.max(1) as f32;
+        let lookback_secs = self.panes[pane_idx].time.span_secs.max(1) as f32;
         let resting = if self.panes[pane_idx].viewing_live {
             1.0
         } else {
@@ -753,7 +755,7 @@ impl super::Gui {
     /// Row 2: the loop tuning, shown behind `⋯`.
     fn render_timeline_row2(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
         let pane_idx = self.active_pane;
-        let loop_active = self.panes[pane_idx].loop_state.is_active();
+        let loop_active = self.panes[pane_idx].loop_state().is_active();
         #[cfg(test)]
         let mut row2 = TimelineRow2Probe::default();
 
@@ -776,12 +778,12 @@ impl super::Gui {
             if lookback.drag_stopped() {
                 let new_secs = (lookback_mins * 60.0) as u64;
                 if new_secs != self.loop_lookback_secs {
-                    self.loop_lookback_secs = new_secs;
+                    self.set_loop_span_secs(new_secs);
                     if loop_active {
                         for pane_idx in self.loop_sync_targets() {
                             actions.push(GuiAction::EnableLoop {
                                 pane_idx,
-                                lookback_secs: new_secs,
+                                lookback_secs: self.panes[pane_idx].time.span_secs,
                             });
                         }
                     }
@@ -789,11 +791,15 @@ impl super::Gui {
             }
 
             ui.label("Speed:");
+            let mut fps = self.loop_speed_fps;
             let speed = ui.add(
-                egui::Slider::new(&mut self.loop_speed_fps, 1.0..=30.0)
+                egui::Slider::new(&mut fps, 1.0..=30.0)
                     .suffix(" fps")
                     .clamping(egui::SliderClamping::Always),
             );
+            if fps != self.loop_speed_fps {
+                self.set_loop_speed_fps(fps);
+            }
             #[cfg(test)]
             {
                 row2.speed = speed.rect;
@@ -803,7 +809,7 @@ impl super::Gui {
         });
 
         if loop_active {
-            let ls = &self.panes[pane_idx].loop_state;
+            let ls = self.panes[pane_idx].loop_state();
             let rendered = ls.frames.iter().filter(|f| f.image.is_some()).count();
             let total = ls.frames.len();
             let rendering = total > 0 && !ls.is_render_ready();
@@ -931,11 +937,11 @@ impl super::Gui {
         }
 
         let span = if loop_active {
-            let ls = &self.panes[pane_idx].loop_state;
+            let ls = self.panes[pane_idx].loop_state();
             loop_span_phrase(
                 &ls.frames,
-                ls.listing_sampled,
-                ls.scan_step_secs,
+                ls.sampled,
+                ls.cadence_secs,
                 ls.is_render_ready(),
             )
         } else {

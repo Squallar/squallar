@@ -6,8 +6,7 @@ use crate::app::tests::{empty_scan, headless};
 use crate::platform_double::TestBridge;
 use rustdar_device_profile::constants::MAX_LOOP_FRAMES;
 use rustdar_egui::pane::{
-    LoopFrame, LoopFrameImage, LoopPhase, LoopPlaybackState, VolumeRegion, VolumeStamp,
-    VolumeTarget,
+    LayerTimeState, LoopFrame, LoopFrameImage, LoopPhase, VolumeRegion, VolumeStamp, VolumeTarget,
 };
 use rustdar_geo::GeoPoint;
 use rustdar_radar::loop_downloads::LoopDownloadManager;
@@ -52,7 +51,7 @@ fn app_with_volume_loop(minutes: &[u32]) -> crate::app::App {
     pane.set_selected_elevation(TILT);
     pane.set_view(rustdar_radar::types::RenderView::Volume);
 
-    let mut ls = LoopPlaybackState::new_for_loop(3600, &site(), RenderView::Volume);
+    let mut ls = rustdar_egui::radar_layer::begin_loop(3600, &site(), RenderView::Volume);
     ls.phase = LoopPhase::Rendering;
     ls.frames = minutes
         .iter()
@@ -63,7 +62,7 @@ fn app_with_volume_loop(minutes: &[u32]) -> crate::app::App {
             render_failed: false,
         })
         .collect();
-    pane.loop_state = ls;
+    *pane.loop_state_mut() = ls;
     app
 }
 
@@ -135,7 +134,7 @@ fn the_resident_set_is_the_whole_frame_list() {
 
     // And the frames name them, which is what makes the playhead able to march one: a store
     // entry nothing points at is memory, not a loop.
-    let frames = &app.gui.pane(0).expect("pane 0").loop_state.frames;
+    let frames = &app.gui.pane(0).expect("pane 0").loop_state().frames;
     for (idx, frame) in frames.iter().enumerate() {
         assert!(
             frame.render_failed || frame.image.is_some(),
@@ -250,7 +249,7 @@ fn switching_the_loop_off_gives_the_resident_set_back() {
         "precondition: a full set must be resident to be given back",
     );
 
-    app.gui.pane_mut(0).expect("pane 0").loop_state = LoopPlaybackState::new();
+    *app.gui.pane_mut(0).expect("pane 0").loop_state_mut() = LayerTimeState::new();
     app.dispatch_loop_renders();
 
     assert_eq!(
@@ -277,7 +276,7 @@ fn switching_the_loop_off_lets_the_pane_ask_for_a_live_volume_again() {
         .expect("a 3D pane")
         .rendered_for = Some(frame_target(MINUTES[0], None));
 
-    app.gui.pane_mut(0).expect("pane 0").loop_state = LoopPlaybackState::new();
+    *app.gui.pane_mut(0).expect("pane 0").loop_state_mut() = LayerTimeState::new();
     app.dispatch_loop_renders();
 
     assert!(
@@ -321,7 +320,7 @@ fn a_volume_with_nothing_to_resample_retires_its_frame() {
     let mut app = app_with_volume_loop(&MINUTES);
     dispatch_until_settled(&mut app, MINUTES.len());
 
-    let frames = &app.gui.pane(0).expect("pane 0").loop_state.frames;
+    let frames = &app.gui.pane(0).expect("pane 0").loop_state().frames;
     assert!(
         frames.iter().all(|f| f.render_failed),
         "an empty volume left its frame un-retired, so readiness waits on a \
@@ -350,7 +349,7 @@ fn a_volume_with_nothing_to_resample_retires_its_frame() {
 /// `MAX_LOOP_FRAMES`.
 #[test]
 fn the_scan_listing_is_sampled_to_the_resident_frame_count() {
-    let mut ls = LoopPlaybackState::new_for_loop(3600, &site(), RenderView::Volume);
+    let mut ls = rustdar_egui::radar_layer::begin_loop(3600, &site(), RenderView::Volume);
     ls.phase = LoopPhase::Rendering;
     let listing: Vec<_> = (0..MAX_LOOP_FRAMES + 20)
         .map(|i| {
@@ -385,7 +384,7 @@ fn the_scan_listing_is_sampled_to_the_resident_frame_count() {
 
     // The plan-view loop is unchanged, which is what makes the assertion above about the
     // view rather than about the cap having moved for everyone.
-    let mut plan = LoopPlaybackState::new_for_loop(3600, &site(), RenderView::PlanView);
+    let mut plan = rustdar_egui::radar_layer::begin_loop(3600, &site(), RenderView::PlanView);
     plan.phase = LoopPhase::Rendering;
     accept_scan_listing(
         test_loop_allocation(),
@@ -405,9 +404,9 @@ fn the_playing_frame_is_a_grid_and_no_raster_consumer_takes_it() {
     // A resident grid named on the playhead's frame, planted directly: what is under test
     // is which accessor answers, not how the frame was filled.
     let pane = app.gui.pane_mut(0).expect("pane 0");
-    pane.loop_state.phase = LoopPhase::Playing;
-    pane.loop_state.current_frame = 1;
-    pane.loop_state.frames[1].image = Some(LoopFrameImage::Volume(
+    pane.loop_state_mut().phase = LoopPhase::Playing;
+    pane.loop_state_mut().current_frame = 1;
+    pane.loop_state_mut().frames[1].image = Some(LoopFrameImage::Volume(
         rustdar_egui::pane::VolumeFrameGrid {
             id: 42,
             target: frame_target(MINUTES[1], None),
@@ -585,7 +584,7 @@ fn the_resident_set_survives_its_own_frames_landing() {
 
     let live = app.volume_store.live_ids();
     let resident = resident_times(&app);
-    let frames = &app.gui.pane(0).expect("pane 0").loop_state.frames;
+    let frames = &app.gui.pane(0).expect("pane 0").loop_state().frames;
     assert_eq!(
         frames.len(),
         MINUTES.len(),
@@ -627,7 +626,7 @@ fn the_resident_set_survives_its_own_frames_landing() {
 fn a_slow_site_shortens_a_3d_loops_list_without_shortening_its_span() {
     let budgets = test_budgets();
     let step_mins = 15i64;
-    let mut ls = LoopPlaybackState::new_for_loop(10 * 3600, &site(), RenderView::Volume);
+    let mut ls = rustdar_egui::radar_layer::begin_loop(10 * 3600, &site(), RenderView::Volume);
     ls.phase = LoopPhase::Rendering;
     let listing: Vec<_> = (0..40)
         .map(|i| {
@@ -673,7 +672,7 @@ fn a_slow_site_shortens_a_3d_loops_list_without_shortening_its_span() {
         "the newest scan went, so the loop stops short of what the pane shows",
     );
     assert_eq!(
-        ls.listing_sampled,
+        ls.sampled,
         Some(true),
         "the span budget cut the list without the sampler recording it, so the \
          caption would claim every scan over a list that dropped 31 of them",
@@ -682,7 +681,7 @@ fn a_slow_site_shortens_a_3d_loops_list_without_shortening_its_span() {
     // And the plan-view loop beside it is untouched: a raster frame's history costs no
     // texture until it is in the render set, so holding fewer would throw away resolution
     // the span budget never paid for.
-    let mut plan = LoopPlaybackState::new_for_loop(10 * 3600, &site(), RenderView::PlanView);
+    let mut plan = rustdar_egui::radar_layer::begin_loop(10 * 3600, &site(), RenderView::PlanView);
     plan.phase = LoopPhase::Rendering;
     accept_scan_listing(test_loop_allocation(), &budgets, &mut plan, SITE, listing);
     assert_eq!(plan.frames.len(), MAX_LOOP_FRAMES.min(40));

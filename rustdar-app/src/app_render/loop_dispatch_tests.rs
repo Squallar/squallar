@@ -4,7 +4,7 @@ use nexrad_model::data::{
     MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
 };
 use rustdar_device_profile::constants::MAX_LOOP_FRAMES;
-use rustdar_egui::pane::{LoopFrame, LoopPhase, LoopPlaybackState};
+use rustdar_egui::pane::{LayerTimeState, LoopFrame, LoopPhase};
 use rustdar_radar::archive::Identifier;
 use rustdar_radar::loop_downloads::LoopDownloadManager;
 use rustdar_radar::sites::RadarSite;
@@ -85,8 +85,8 @@ pub(super) fn volume_with_sweeps(
     (scan_with_sweeps(elevations), Arc::default())
 }
 
-fn loop_on(ctx: &egui::Context, site: &'static str, textured: &[usize]) -> LoopPlaybackState {
-    let mut ls = LoopPlaybackState::new_for_loop(
+fn loop_on(ctx: &egui::Context, site: &'static str, textured: &[usize]) -> LayerTimeState {
+    let mut ls = rustdar_egui::radar_layer::begin_loop(
         3600,
         &RadarSite {
             name: site,
@@ -526,12 +526,12 @@ fn a_listing_one_scan_over_the_cap_is_recorded_as_sampled() {
         .expect("accepted");
 
         assert_eq!(
-            ls.listing_sampled,
+            ls.sampled,
             Some(expected),
             "a listing of {listed} against a cap of {cap} kept {} frames and \
              recorded {:?}",
             ls.frames.len(),
-            ls.listing_sampled,
+            ls.sampled,
         );
     }
 }
@@ -539,7 +539,7 @@ fn a_listing_one_scan_over_the_cap_is_recorded_as_sampled() {
 #[test]
 fn a_loop_that_has_taken_no_listing_records_no_fidelity() {
     let ctx = egui::Context::default();
-    assert_eq!(loop_on(&ctx, "KTLX", &[]).listing_sampled, None);
+    assert_eq!(loop_on(&ctx, "KTLX", &[]).sampled, None);
 }
 
 #[test]
@@ -550,10 +550,11 @@ fn a_rendered_frame_is_placed_where_the_render_actually_drew_it() {
     let mut rr = response(ts(1), ls.rendered_for.clone().expect("target adopted"));
 
     assert_ne!(
-        rr.site_lat, ls.site_lat,
+        rr.site_lat,
+        rustdar_egui::radar_layer::coords(&ls).0,
         "precondition: the two sources differ"
     );
-    assert_ne!(rr.site_lon, ls.site_lon);
+    assert_ne!(rr.site_lon, rustdar_egui::radar_layer::coords(&ls).1);
 
     let texture = accept_render_result(&mut ls, &mut rr, None, |_| dummy_texture(&ctx))
         .expect("the loop is awaiting this result");
@@ -828,7 +829,7 @@ fn a_loops_render_set_is_its_span_budget_at_its_own_sites_cadence() {
         ("WSR-88D clear air", 517),
     ] {
         let mut ls = loop_on(&ctx, "KTLX", &[]);
-        ls.scan_step_secs = Some(cadence);
+        ls.cadence_secs = Some(cadence);
         let frames = loop_render_budget(allocation, &ls, &budgets);
         assert!(
             frames >= rustdar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE,
@@ -852,7 +853,7 @@ fn a_loop_that_has_not_learned_a_cadence_keeps_the_whole_budget() {
     let budgets = test_budgets();
     let ls = loop_on(&ctx, "KTLX", &[]);
     assert_eq!(
-        ls.scan_step_secs, None,
+        ls.cadence_secs, None,
         "precondition: a freshly built loop knows nothing about its site's cadence"
     );
     assert_eq!(
@@ -882,13 +883,13 @@ fn a_listing_teaches_the_cadence_before_the_frame_count_is_spent() {
     .expect("accepted");
 
     assert_eq!(
-        ls.scan_step_secs,
+        ls.cadence_secs,
         Some(360),
         "the median rides over the missing scan rather than being pulled by it"
     );
     let budgets = test_budgets();
     assert_eq!(
-        budgets.frames_for_span(ls.scan_step_secs),
+        budgets.frames_for_span(ls.cadence_secs),
         (1 + budgets.loop_span_secs / 360).min(budgets.loop_render_budget),
         "and the count spends that figure, not the arm's ceiling"
     );

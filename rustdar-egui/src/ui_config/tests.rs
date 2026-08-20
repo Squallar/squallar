@@ -959,9 +959,9 @@ fn a_restored_non_map_pane_has_no_running_loop() {
         .unwrap();
 
     let mut restored = crate::Gui::new();
-    restored.pane_mut(0).unwrap().loop_state.phase = LoopPhase::Playing;
+    restored.pane_mut(0).unwrap().loop_state_mut().phase = LoopPhase::Playing;
     assert!(
-        restored.pane(0).unwrap().loop_state.is_active(),
+        restored.pane(0).unwrap().loop_state().is_active(),
         "precondition: the loop must be running before the load"
     );
 
@@ -972,7 +972,7 @@ fn a_restored_non_map_pane_has_no_running_loop() {
         rustdar_radar::types::RenderView::Volume
     );
     assert!(
-        !restored.pane(0).unwrap().loop_state.is_active(),
+        !restored.pane(0).unwrap().loop_state().is_active(),
         "a restored 3D pane came back with a loop nothing will ever render \
              frames for, which holds every other pane's loop back too"
     );

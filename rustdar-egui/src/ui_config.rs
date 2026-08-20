@@ -881,7 +881,7 @@ impl super::Gui {
                     volume,
                     layers: BTreeMap::new(),
                     spc_day: OutlookDay::Day1,
-                    time_step_secs: pane.time_step_secs,
+                    time_step_secs: pane.time.step.as_secs(),
                     time_link: pane.time_link,
                     viewport_link: pane.viewport_link,
                     layer_link: pane.layer_link,
@@ -913,7 +913,7 @@ impl super::Gui {
             site: self.radar.config.site.clone(),
             loop_lookback_secs: self.loop_lookback_secs,
             loop_speed_fps: fps,
-            time_step_secs: self.panes.first().map(|p| p.time_step_secs).unwrap_or(600),
+            time_step_secs: self.panes.first().map_or(600, |p| p.time.step.as_secs()),
             panes: pane_configs,
             preferences: self.preferences.clone(),
             // The handlers' live state written OVER the carried entries no
@@ -1053,8 +1053,11 @@ impl super::Gui {
             self.radar.config.site = config.site.clone();
         }
 
-        self.loop_lookback_secs = config.loop_lookback_secs;
-        self.loop_speed_fps = config.loop_speed_fps;
+        // The file's numbers are the pane's numbers: the two settings are
+        // persisted once and every pane's posture carries the same value, so a
+        // pane's own reads and the global cannot answer differently.
+        self.set_loop_span_secs(config.loop_lookback_secs);
+        self.set_loop_speed_fps(config.loop_speed_fps);
         self.preferences = config.preferences;
         self.serial_config = config.serial_config;
         self.heading_source = config.heading_source;
@@ -1126,7 +1129,7 @@ impl super::Gui {
         for (i, pane) in self.panes.iter_mut().enumerate().take(count) {
             let pc = config.panes.get(i);
             let Some(pc) = pc else {
-                pane.time_step_secs = config.time_step_secs;
+                pane.time.step = crate::pane::TimeStep::from_secs(config.time_step_secs);
                 pane.viewport_link = config.viewport_sync;
                 pane.layer_link = config.sync_layers;
                 pane.time_link = config.sync_layers;
@@ -1141,7 +1144,7 @@ impl super::Gui {
             } else if !config.site.is_empty() {
                 pane.set_site(config.site.clone());
             }
-            pane.time_step_secs = pc.time_step_secs;
+            pane.time.step = crate::pane::TimeStep::from_secs(pc.time_step_secs);
             pane.time_link = pc.time_link && config.sync_layers;
             pane.viewport_link = pc.viewport_link && config.viewport_sync;
             pane.layer_link = pc.layer_link && config.sync_layers;
@@ -1169,6 +1172,9 @@ impl super::Gui {
                         // Derived from `config` at the next hydrate, never
                         // read off the wire.
                         state: None,
+                        // A timeline is a live position, and a file names
+                        // none: this pane starts wherever a fresh one does.
+                        time: crate::pane::LayerTimeState::new(),
                     }
                 })
                 .collect();

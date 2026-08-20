@@ -1,7 +1,7 @@
 use super::*;
 use crate::test_keys;
 use nexrad_level3::model::{Level3Message, MessageHeader, ProductDescriptionBlock};
-use rustdar_egui::pane::{LoopFrame, LoopPhase, LoopPlaybackState};
+use rustdar_egui::pane::{LayerTimeState, LoopFrame, LoopPhase};
 use rustdar_radar::archive::Identifier;
 use rustdar_radar::level3::{Level3Product, ProductStamp};
 use rustdar_radar::loop_downloads::{L3FrameState, LoopDownloadManager};
@@ -91,8 +91,8 @@ fn object(elevation_tenths: i16) -> Arc<Level3Product> {
 }
 
 /// A loop on [`SITE`] with `n` frames, retargeted to `product`.
-fn loop_for(product: RadarProduct, n: u32) -> LoopPlaybackState {
-    let mut ls = LoopPlaybackState::new_for_loop(
+fn loop_for(product: RadarProduct, n: u32) -> LayerTimeState {
+    let mut ls = rustdar_egui::radar_layer::begin_loop(
         3600,
         &RadarSite {
             name: SITE,

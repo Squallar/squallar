@@ -2,7 +2,7 @@ use super::*;
 use crate::app::tests::{empty_scan, headless};
 use crate::platform_double::TestBridge;
 use crate::test_keys;
-use rustdar_egui::pane::{LoopPhase, LoopPlaybackState};
+use rustdar_egui::pane::LoopPhase;
 use rustdar_radar::archive::Identifier;
 use rustdar_radar::types::{RadarProduct, RenderView};
 
@@ -34,14 +34,15 @@ fn begin_loop(app: &mut crate::app::App, lookback_secs: u64) {
         .expect("KTLX is in the resolved site table")
         .clone();
     let pane = app.gui.pane_mut(0).expect("a fresh Gui has one pane");
-    pane.loop_state = LoopPlaybackState::new_for_loop(lookback_secs, &site, RenderView::PlanView);
+    *pane.loop_state_mut() =
+        rustdar_egui::radar_layer::begin_loop(lookback_secs, &site, RenderView::PlanView);
     assert_eq!(
-        pane.loop_state.phase,
+        pane.loop_state().phase,
         LoopPhase::FetchingScanList,
         "precondition: a freshly built loop is waiting on its listing",
     );
     assert!(
-        pane.loop_state.listing_since.is_some(),
+        pane.loop_state().listing_since.is_some(),
         "precondition: entering the fetching phase starts the clock on the \
          grace exemption",
     );
@@ -50,10 +51,10 @@ fn begin_loop(app: &mut crate::app::App, lookback_secs: u64) {
 fn age_listing(app: &mut crate::app::App, secs: u64) {
     let pane = app.gui.pane_mut(0).expect("a fresh Gui has one pane");
     let since = pane
-        .loop_state
+        .loop_state()
         .listing_since
         .expect("the loop is fetching, so it has a clock");
-    pane.loop_state.listing_since = Some(
+    pane.loop_state_mut().listing_since = Some(
         since
             .checked_sub(std::time::Duration::from_secs(secs))
             .expect("the monotonic clock's origin is younger than the grace bound, which needs a host booted seconds ago"),
@@ -73,10 +74,10 @@ fn install_listing(app: &mut crate::app::App, minutes: &[u32]) {
         })
         .collect();
     let pane = app.gui.pane_mut(0).expect("a fresh Gui has one pane");
-    accept_scan_listing(allocation, &budgets, &mut pane.loop_state, SITE, scans)
+    accept_scan_listing(allocation, &budgets, pane.loop_state_mut(), SITE, scans)
         .expect("a non-empty listing for this loop's own site is accepted");
     assert_eq!(
-        pane.loop_state.frames.len(),
+        pane.loop_state().frames.len(),
         minutes.len(),
         "precondition: the listing became frames without being sampled",
     );
@@ -156,7 +157,7 @@ fn frames(app: &crate::app::App) -> Vec<chrono::NaiveDateTime> {
     app.gui
         .pane(0)
         .expect("a fresh Gui has one pane")
-        .loop_state
+        .loop_state()
         .frames
         .iter()
         .map(|frame| frame.timestamp)
@@ -182,7 +183,7 @@ fn polled_volumes_no_loop_asked_for_are_not_kept() {
         !app.gui
             .pane(0)
             .expect("a fresh Gui has one pane")
-            .loop_state
+            .loop_state()
             .is_active(),
         "precondition: no loop names any of these volumes",
     );
@@ -337,7 +338,7 @@ fn the_volume_a_pane_is_viewing_survives_with_no_loop_naming_it() {
         !app.gui
             .pane(0)
             .expect("a fresh Gui has one pane")
-            .loop_state
+            .loop_state()
             .is_active(),
         "precondition: no loop names anything, so only the pane's own view can \
          keep an entry",
@@ -387,7 +388,7 @@ fn a_listing_that_never_returns_stops_exempting_its_site() {
         app.gui
             .pane(0)
             .expect("a fresh Gui has one pane")
-            .loop_state
+            .loop_state()
             .is_fetching(),
         "precondition: nothing moved the phase — this is the stuck listing, not \
          a loop that quietly finished",
@@ -463,7 +464,7 @@ fn paired_objects_no_live_frame_names_are_not_kept() {
         !app.gui
             .pane(0)
             .expect("a fresh Gui has one pane")
-            .loop_state
+            .loop_state()
             .is_active(),
         "precondition: no loop names any of these volumes",
     );

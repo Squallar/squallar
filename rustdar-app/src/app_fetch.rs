@@ -4,6 +4,7 @@ use chrono::NaiveDateTime;
 use chrono::TimeZone;
 use rustdar_device_profile::constants::LOOP_IMAGE_SIZE;
 use rustdar_egui::actions::GuiAction;
+use rustdar_egui::radar_layer;
 use rustdar_egui::shell_api::GuiEvent;
 use rustdar_overlays::render::overlay_state::{OverlayFetchResult, SourceEvent};
 use rustdar_radar::types::RadarProduct;
@@ -380,7 +381,7 @@ impl super::App {
             }
             GuiAction::ToggleLoopPlayback { pane_idx } => {
                 if let Some(pane) = self.gui.pane_mut(pane_idx) {
-                    let ls = &mut pane.loop_state;
+                    let ls = pane.loop_state_mut();
                     match ls.phase {
                         rustdar_egui::pane::LoopPhase::Playing => {
                             ls.phase = rustdar_egui::pane::LoopPhase::Paused;
@@ -396,7 +397,7 @@ impl super::App {
             }
             GuiAction::StepLoopFrame { pane_idx, forward } => {
                 if let Some(pane) = self.gui.pane_mut(pane_idx) {
-                    let ls = &mut pane.loop_state;
+                    let ls = pane.loop_state_mut();
                     if !ls.frames.is_empty() {
                         if forward {
                             ls.current_frame = (ls.current_frame + 1) % ls.frames.len();
@@ -413,7 +414,7 @@ impl super::App {
                 frame_index,
             } => {
                 if let Some(pane) = self.gui.pane_mut(pane_idx) {
-                    let ls = &mut pane.loop_state;
+                    let ls = pane.loop_state_mut();
                     if frame_index < ls.frames.len() {
                         ls.current_frame = frame_index;
                     }
@@ -560,7 +561,7 @@ impl super::App {
                             }
                             // The loop is the same judgement as the scan above and
                             // belongs behind the same guard.
-                            pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new();
+                            *pane.loop_state_mut() = rustdar_egui::pane::LayerTimeState::new();
                         }
                         pane.loading_site = Some(site.clone());
                         pane.set_site(site.clone());
@@ -928,7 +929,7 @@ impl super::App {
     /// Disable radar loop for a pane: resets to single-frame mode.
     fn handle_disable_loop(&mut self, pane_idx: usize) {
         if let Some(pane) = self.gui.pane_mut(pane_idx) {
-            pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new();
+            *pane.loop_state_mut() = rustdar_egui::pane::LayerTimeState::new();
         }
         self.loop_mgr.remove_pending(pane_idx);
         if pane_idx < self.render.pane_render.len() {
@@ -1398,9 +1399,9 @@ impl super::App {
         let mut to_reinit = Vec::new();
         for pane_idx in 0..self.gui.pane_count() {
             if let Some(pane) = self.gui.pane_mut(pane_idx)
-                && pane.loop_state.is_active()
+                && pane.loop_state().is_active()
             {
-                to_reinit.push((pane_idx, pane.loop_state.lookback_secs));
+                to_reinit.push((pane_idx, pane.loop_state().span_secs));
             }
         }
         for (pane_idx, lookback_secs) in to_reinit {
@@ -1623,8 +1624,7 @@ fn begin_loop_for_pane(
     if !view.can_loop() {
         return None;
     }
-    panes[pane_idx].loop_state =
-        rustdar_egui::pane::LoopPlaybackState::new_for_loop(lookback_secs, &radar_site, view);
+    *panes[pane_idx].loop_state_mut() = radar_layer::begin_loop(lookback_secs, &radar_site, view);
 
     Some(LoopScanRequest {
         site: radar_site.name.to_string(),
@@ -1643,14 +1643,14 @@ fn append_polled_frame_to_loops(
     budgets: &rustdar_device_profile::budget::Budgets,
 ) {
     for (pane_idx, pane) in panes.iter_mut().enumerate() {
-        let held = super::render::loop_frames_held(allocation, &pane.loop_state, budgets);
-        if append_polled_frame(&mut pane.loop_state, site, timestamp, held) {
+        let held = super::render::loop_frames_held(allocation, pane.loop_state(), budgets);
+        if append_polled_frame(pane.loop_state_mut(), site, timestamp, held) {
             log::info!(
                 "Appended {} scan {} to loop on pane {} ({} frames)",
                 site,
                 timestamp,
                 pane_idx,
-                pane.loop_state.frames.len()
+                pane.loop_state().frames.len()
             );
         }
     }
@@ -1659,7 +1659,7 @@ fn append_polled_frame_to_loops(
 /// Add a frame at `timestamp` to `ls` if the loop is active, is on `site`, and does
 /// not already have that frame. Returns whether a frame was added.
 fn append_polled_frame(
-    ls: &mut rustdar_egui::pane::LoopPlaybackState,
+    ls: &mut rustdar_egui::pane::LayerTimeState,
     site: &str,
     timestamp: chrono::NaiveDateTime,
     held: usize,
@@ -1669,9 +1669,9 @@ fn append_polled_frame(
     if !ls.is_active() {
         return false;
     }
-    // `LoopPlaybackState::site` is the loop's *geometry* site, captured when the loop
+    // `LayerTimeState::site` is the loop's *geometry* site, captured when the loop
     // was built — not the pane's live `site` field.
-    if ls.site != site {
+    if radar_layer::site(ls) != site {
         return false;
     }
     if ls.frames.iter().any(|f| f.timestamp == timestamp) {
@@ -1689,7 +1689,7 @@ fn append_polled_frame(
         },
     );
 
-    let lookback = chrono::Duration::seconds(ls.lookback_secs as i64);
+    let lookback = chrono::Duration::seconds(ls.span_secs as i64);
     if let Some(newest) = ls.frames.last().map(|f| f.timestamp) {
         let cutoff = newest - lookback;
         ls.frames.retain(|f| f.timestamp >= cutoff);
@@ -1699,10 +1699,10 @@ fn append_polled_frame(
     }
 
     // Re-measure the site's cadence, while it is still measurable.
-    if ls.listing_sampled != Some(true) {
+    if ls.sampled != Some(true) {
         let times: Vec<_> = ls.frames.iter().map(|f| f.timestamp).collect();
         if let Some(step) = super::render::median_step_secs(&times) {
-            ls.scan_step_secs = Some(step);
+            ls.cadence_secs = Some(step);
         }
     }
 

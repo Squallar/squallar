@@ -260,11 +260,12 @@ fn a_corrupt_pane_costs_that_pane_its_settings_and_nothing_else() {
 
     let p0 = gui.pane(0).expect("pane 0");
     assert_eq!(p0.site(), "KTLX");
-    assert_eq!(p0.time_step_secs, 300, "pane 0 arrived intact");
+    assert_eq!(p0.time.step.as_secs(), 300, "pane 0 arrived intact");
 
     let p1 = gui.pane(1).expect("pane 1");
     assert_eq!(
-        p1.time_step_secs, 600,
+        p1.time.step.as_secs(),
+        600,
         "the corrupt pane is at defaults, not at its unreadable values",
     );
     assert_eq!(
@@ -281,7 +282,7 @@ fn a_corrupt_pane_costs_that_pane_its_settings_and_nothing_else() {
          defaults-in-place, never removal",
     );
     assert_eq!(p2.selected_product(), RadarProduct::Velocity);
-    assert_eq!(p2.time_step_secs, 900);
+    assert_eq!(p2.time.step.as_secs(), 900);
 }
 
 /// A corrupt top-level container costs its own settings and nothing else:

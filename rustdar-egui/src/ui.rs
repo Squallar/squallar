@@ -1698,7 +1698,7 @@ impl Gui {
             .iter()
             .take(self.pane_layout.pane_count)
             .any(|p| {
-                let ls = &p.loop_state;
+                let ls = p.loop_state();
                 ls.is_active()
                     && (ls.is_playing()
                         || ls.is_fetching()
@@ -1731,7 +1731,7 @@ impl Gui {
         for pane in &mut self.panes {
             pane.loading_site = None;
             pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
-            for frame in &mut pane.loop_state.frames {
+            for frame in &mut pane.loop_state_mut().frames {
                 frame.image = None;
                 frame.render_in_flight = false;
             }
