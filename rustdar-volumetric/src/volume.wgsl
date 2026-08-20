@@ -1,215 +1,112 @@
 // The offscreen volume raymarch, and the quad that composites it into egui.
 //
-// Both live in one module because they share the 48-byte fullscreen quad and
-// the two sRGB transfer functions, and because the naga translation test then
-// has one source to check rather than two. They do NOT share a bind group: the
-// raymarch owns bindings 0..4 and the blit owns 5..6, so that the two pipeline
-// layouts can each declare only what their own entry points use while every
-// binding in the module stays unique. Reusing 0..1 for the blit would be a
-// duplicate group/binding pair in one WGSL module, which the spec forbids
-// whether or not any single entry point sees both.
-//
-// Rules this file follows, every one of them a naga constraint rather than a
-// preference (see `volume_raymarch.rs`'s module doc for the citations):
-//
-//   * `textureSampleLevel` for everything that is *sampled*. The march breaks
-//     on a data-dependent condition, and implicit-LOD sampling under
-//     non-uniform control flow is a hard validator failure on every target.
-//     The one `textureLoad` (the jitter tile) is not an exception to this: it
-//     takes an explicit level and is not implicit-LOD. It translates to
-//     `texelFetch`, which is core GLSL ES 300.
-//   * `RAYMARCH_STEP_CEILING` is a `const` so it folds to a literal in the loop.
-//   * one sampler per texture per pipeline.
-//   * `textureNumLevels` appears nowhere; it is gated on GLSL core 130 with no
-//     ES version at all, so it is unreachable on WebGL2 forever.
-
-// ---------------------------------------------------------------------------
-// Uniform block
-// ---------------------------------------------------------------------------
+// Every rule below is a naga/WGSL validator constraint, not a preference:
+//   * `textureSampleLevel` for everything sampled: the march breaks on a
+//     data-dependent condition, and implicit-LOD sampling under non-uniform
+//     control flow is a hard validator failure. `textureLoad` takes an explicit
+//     level and so is not implicit-LOD.
+//   * `RAYMARCH_STEP_CEILING` stays `const` so the loop bound folds to a literal.
+//   * One sampler per texture per pipeline.
+//   * Group/binding pairs are unique across the whole module, whether or not one
+//     entry point sees both: raymarch owns 0..4 and 7, blit owns 5..6.
+//   * `textureNumLevels` is GLSL core 130 with no ES version, so it is
+//     unreachable on WebGL2 forever and appears nowhere.
 
 // One `mat4x4<f32>` plus ten `vec4<f32>`: 64 + 160 = 224 bytes, std140-clean.
-//
-// Every member is `f32`, including the two that are conceptually integers
-// (`grid_dims`) and the one that is conceptually a bool (`flags`). Mixing
-// integer and float members in a std140 block is where driver bugs live, and
-// the cost of the float round-trip is one `f32()` that the compiler folds.
-//
-// `volume_uniform.rs` writes these 224 bytes by hand and pins every offset, as
-// `VOLUME_UNIFORM_BYTES`. This comment read "six vec4, 160 bytes" until
-// 2026-08-13, four lanes after it stopped being true — worth stating because
-// the probe's `REQUIRED_UNIFORM_BINDING_SIZE` is 256, so the room left for
-// another member is **two lanes**, not the eight the stale figure implied.
+// Every member is `f32`, including the conceptually-integer (`grid_dims`) and
+// conceptually-bool (`flags`) ones: mixing integer and float members in a std140
+// block is where driver bugs live. `volume_uniform.rs` writes these 224 bytes by
+// hand and pins every offset; `REQUIRED_UNIFORM_BINDING_SIZE` is 256.
 struct Volume {
-    // Clip space to box space, where box space is the unit cube [0,1]^3 over
-    // the voxel grid. Built compositionally by the caller
-    // (box_from_world * world_from_view * view_from_clip), never by inverting a
-    // general 4x4.
+    // Clip space to box space, box space being the unit cube [0,1]^3 over the
+    // voxel grid. Built as box_from_world * world_from_view * view_from_clip,
+    // never by inverting a general 4x4.
     box_from_clip: mat4x4<f32>,
-    // xyz: the camera position in box space. w: the isosurface threshold in
-    // 0-1 index units, or negative for the lit-volume march — negative, not
-    // zero, because an index-0 threshold is a real configuration ("the
-    // surface of any data").
-    //
-    // xyz is the *perspective* eye. Rays are cast from it, which is what makes
-    // a camera inside the box behave (the entry parameter clamps to zero rather
-    // than starting behind the viewer). An orthographic camera has no such
-    // point and would need a different derivation.
+    // xyz: the *perspective* camera position in box space, rays cast from it.
+    // w: isosurface threshold in 0-1 index units, negative for the lit-volume
+    // march — negative, not zero, since an index-0 threshold is a real setting.
     eye_in_box: vec4<f32>,
-    // xyz: the physical extent of the box in kilometres. w: the camera's
-    // vertical exaggeration, >= 1 — the one place the shader is told about the
-    // stretch, and only the *shading* reads it: normals are taken against the
-    // displayed geometry, so a slope that is drawn steep is lit steep. Optical
-    // depth stays against xyz alone, which is the honest, unexaggerated
-    // kilometre.
+    // xyz: box extent in km. w: vertical exaggeration, >= 1, read only by the
+    // shading (normals are against the displayed geometry); optical depth uses
+    // xyz alone.
     box_size_km: vec4<f32>,
-    // xyz: the voxel counts along each axis, as floats. w: the centre index
-    // a diverging product's isosurface measures its threshold from, in 0-1
-    // index units, or negative for a sequential product whose threshold
-    // reads the index directly. Only read in isosurface mode.
+    // xyz: voxel counts per axis, as floats. w: the centre index a diverging
+    // product's isosurface measures its threshold from, in 0-1 index units, or
+    // negative for a sequential product. Isosurface mode only.
     grid_dims: vec4<f32>,
     // xyz: unit light direction in box space. w: the ambient term, 0..1.
     light_dir_ambient: vec4<f32>,
     // x: extinction per kilometre at LUT alpha 1.
-    // y: the palette index at or below which a cell contributes nothing —
-    //    the PALETTE's own transparent run, not an emptiness test. Air is
-    //    excluded by coverage, which is a property of the measurement rather
-    //    than of the table (COVERAGE_SKIP for the lit volume, COVERAGE_FLOOR
-    //    for the isosurface's binary hit test).
-    // z: the transmittance at which the march stops early.
+    // y: index at or below which a cell contributes nothing — the PALETTE's own
+    //    transparent run; air is excluded by coverage instead.
+    // z: transmittance at which the march stops early.
     // w: the opacity ramp's width above y, in 0-1 index units; 0 is hard.
     transfer: vec4<f32>,
     // x: 1 to shade with the gradient, 0 to skip it.
-    // y: the reconstruction level the march samples the grid at, in mip
-    //    units: 0 is the raw trilinear field — the bit-exact instrument
-    //    configuration every mask harness runs at — and values towards 1
-    //    blend continuously into the hand-built two-cell mean below it. The
-    //    render-side softening that turns single-voxel spikes and tilt-shelf
-    //    cliffs into cloud. Never negative: the sentinel that used to select
-    //    a nearest-neighbour snap went with the per-product split.
+    // y: reconstruction level, in mip units: 0 the raw trilinear field, towards 1
+    //    blending into the hand-built two-cell mean. Never negative.
     // z: cells one step advances along the ray, in the grid's own anisotropic
-    //    cell metric. 1 is the instrument default the silhouette harness
-    //    mirrors; the cloud rung halves it, which is what takes the jitter's
-    //    per-step opacity quantum below visibility. A zero (a stale buffer)
-    //    falls to the dt floor against the ceiling rather than hanging.
-    // w: 1 to draw the map floor — the ground texture on the box's bottom
-    //    face, composited behind the volume at the ray's own plane hit. 0 —
-    //    the instrument default — draws no floor and leaves every mask
-    //    exactly as it was.
+    //    cell metric. Zero falls to the dt floor rather than hanging.
+    // w: 1 to draw the map floor on the box's bottom face.
     flags: vec4<f32>,
-    // Where the box's site sits in the pane mirror and how fast the mirror's
-    // texture coordinates run with geography:
-    //   x, y: (u, v) at the site itself.
-    //   z: u per degree of longitude east.
-    //   w: v per unit of Mercator y.
-    // See `floor_colour` for why the floor is sampled through geography and
-    // not through the box.
+    // x, y: (u, v) of the site itself in the pane mirror. z: u per degree of
+    // longitude east. w: v per unit of Mercator y.
     floor_uv: vec4<f32>,
-    // x: site latitude, degrees.
-    // y, z: the box's west and south edges, km east/north of the site — its
-    //    position, which `box_size_km` does not carry.
-    // w: 1 when the mirror holds gamma-encoded texels, 0 when linear. Set
-    //    from the swapchain's format, because that is what picks egui's
-    //    fragment entry point and hence what lands in the mirror.
+    // x: site latitude, degrees. y, z: the box's west and south edges, km
+    // east/north of the site — its position, which `box_size_km` does not carry.
+    // w: 1 when the mirror holds gamma-encoded texels, 0 when linear.
     floor_geo: vec4<f32>,
-    // Where a position in the drawn box's unit cube sits in the GRID texture:
-    //   xyz: the per-axis scale.
-    //   w:   1 when the drawn box reaches outside the grid, so every fetch has
-    //        to be tested against the grid's bounds and answered as air when it
-    //        falls outside. 0 when the box is inside the grid (which includes
-    //        the ordinary case, where it IS the grid).
+    // xyz: per-axis scale from the drawn box's unit cube into the GRID texture.
+    // w: 1 when the drawn box reaches outside the grid, so every fetch has to be
+    //    bounds-tested and answered as air outside; 0 when it is inside.
     grid_from_box_a: vec4<f32>,
-    // xyz: the per-axis offset. w: reserved, written zero.
-    //
-    // Together: `t = grid_from_box_a.xyz * p + grid_from_box_b.xyz`. Scale 1
-    // and offset 0 — the ordinary case — make that `t = p` exactly.
-    //
-    // See `VolumeUniform::grid_from_box_scale` for what the other case is: a
-    // pane that has been zoomed and is drawing the grid it already has, in the
-    // box the user just asked for, until the build for that box lands.
+    // xyz: per-axis offset. w: reserved, written zero. Together
+    // `t = grid_from_box_a.xyz * p + grid_from_box_b.xyz`; scale 1 and offset 0 —
+    // the ordinary case — make that `t = p` exactly.
     grid_from_box_b: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> volume: Volume;
 
-// A position in the drawn box's unit cube, as a grid texture coordinate.
-//
-// Exactly `p` in the ordinary case: the scale is 1 and the offset 0, and no
-// finite `f32` moves under a multiply by one and an add of zero.
 fn grid_coord(p: vec3<f32>) -> vec3<f32> {
     return p * volume.grid_from_box_a.xyz + volume.grid_from_box_b.xyz;
 }
 
-// Whether a grid coordinate falls outside the grid, and so must read as air.
-//
-// Short-circuits on the flag, so the ordinary path pays one comparison and
-// never reaches the bounds test — which matters twice over: the test costs
-// three `any`s per fetch, and at the identity affine a march parameter that
-// overshoots the exit face by an ulp would have its last sample discarded,
-// which no mask instrument in this repository was measured against.
-//
-// The alternative is what the sampler does on its own — clamp to the edge
-// texel — and that is not a rendering artefact but a false claim: it paints
-// the grid's rim across ground the radar never reported.
+// Outside the grid must read as air. The sampler's alternative — clamp to the
+// edge texel — paints the grid's rim across ground the radar never reported.
 fn outside_grid(t: vec3<f32>) -> bool {
     return volume.grid_from_box_a.w > 0.5
         && (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0)));
 }
 
-// The voxel grid: `Rg16Float`, **coverage-premultiplied**, sampled `Linear` on
-// both channels.
-//
-//   R = coverage x index      G = coverage
-//
-// where coverage is 1 for a cell the radar measured and 0 for empty air. The
-// march reconstructs `index = R_bar / G_bar` — the coverage-weighted mean over
-// the covered texels alone, because air contributes 0 to BOTH the numerator
-// and the denominator and so drops out of the average instead of taking part
-// in it as a value. See `field_at`.
+// The voxel grid: `Rg16Float`, **coverage-premultiplied**, sampled `Linear`.
+//   R = coverage x index    G = coverage    (1 measured, 0 empty air)
+// The march reconstructs `index = R_bar / G_bar`; see `field_at`.
 @group(0) @binding(1) var grid_texture: texture_3d<f32>;
 @group(0) @binding(2) var grid_sampler: sampler;
 
-// The 256-entry colour table those indices name, as a 256x1 2D texture sampled
-// `Nearest`. A `texture_1d` would be the honest shape and is not usable: GLES
-// 3.0 has no `sampler1D` at all.
+// The 256-entry colour table, as a 256x1 2D texture sampled `Nearest`. A
+// `texture_1d` would be the honest shape: GLES 3.0 has no `sampler1D` at all.
 @group(0) @binding(3) var lut_texture: texture_2d<f32>;
 @group(0) @binding(4) var lut_sampler: sampler;
 
-// The march's stratification tile: `BLUE_NOISE_EDGE` square, `R8Unorm`, read
-// with `textureLoad` and so carrying **no sampler of its own** — the one
-// texture in this module that does not, because an offset table is indexed
-// rather than interpolated. See `blue_noise_jitter`.
+// The march's stratification tile: `BLUE_NOISE_EDGE` square, `R8Unorm`, read with
+// `textureLoad` and so carrying no sampler of its own.
 @group(0) @binding(7) var jitter_texture: texture_2d<f32>;
 
-// One less than the blue noise tile's edge, as a mask. Must equal
-// `blue_noise::BLUE_NOISE_EDGE - 1`, and
+// Must equal `blue_noise::BLUE_NOISE_EDGE - 1`;
 // `the_shader_and_the_blue_noise_tile_agree` pins this literal to it.
 const JITTER_TILE_MASK: i32 = 63;
 
-// The pane mirror: the 2D pane's own render, copied. Not a picture built for
-// the floor — literally the frame's egui geometry for the source pane, drawn
-// a second time into an offscreen target, so every layer the pane has (tiles,
-// the radar raster, outlooks, alerts, storm reports, lightning, METARs, the
-// location dot, labels) is on the floor for free and stays in step with the
-// pane's own options by construction.
-//
-// It is a **Web Mercator** picture covering the whole frame, not the box
-// footprint, so `floor_colour` reprojects into it rather than indexing it
-// directly. In its own group because its lifetime is its own — group 0 is
-// rebuilt per grid upload, the mirror once per frame — and a pipeline may
-// bind a placeholder here when no mirror is in hand.
-//
-// Premultiplied alpha, in whichever encoding `floor_geo.w` names; transparent
-// where the source pane painted nothing.
+// The pane mirror: the 2D pane's own egui geometry drawn a second time offscreen.
+// A **Web Mercator** picture covering the whole frame, not the box footprint, so
+// `floor_colour` reprojects into it. Premultiplied alpha, in whichever encoding
+// `floor_geo.w` names. Its own group: group 0 is rebuilt per grid upload.
 @group(1) @binding(0) var floor_texture: texture_2d<f32>;
 @group(1) @binding(1) var floor_sampler: sampler;
 
-// ---------------------------------------------------------------------------
-// sRGB transfer functions
-// ---------------------------------------------------------------------------
-//
-// Character-for-character egui's own (`egui-wgpu-0.35.0/src/egui.wgsl:44-57`).
-// Matching egui is the requirement here, not being right in the abstract, so
-// these are copied rather than rewritten.
+// sRGB transfer functions, character-for-character egui's own
+// (`egui-wgpu-0.35.0/src/egui.wgsl:44-57`). Matching egui is the requirement.
 
 // 0-1 linear from 0-1 sRGB gamma
 fn linear_from_gamma_rgb(srgb: vec3<f32>) -> vec3<f32> {
@@ -227,208 +124,68 @@ fn gamma_from_linear_rgb(rgb: vec3<f32>) -> vec3<f32> {
     return select(higher, lower, cutoff);
 }
 
-// ---------------------------------------------------------------------------
-// The raymarch
-// ---------------------------------------------------------------------------
-
-// The most samples one ray may take, whatever the step length works out to.
-//
-// A `const` rather than a uniform, so the loop bound is a compile-time constant
-// — naga emits it as `const int RAYMARCH_STEP_CEILING = 512;` and folds it
-// where a conversion forces the issue. A uniform bound would compile, look
-// identical, and hide the march's cost from the driver on the target where
-// fill rate is the whole risk.
-//
-// It is a **ceiling**, not the step count: the step length arrives per-frame
-// in `flags.z`, the loop breaks at the box exit, and the ceiling only
-// matters if a span ever outruns it. 1024 rather than 512 because the cloud
-// rung marches half-cell steps and the desktop 256 x 256 x 128 grid's longest
-// diagonal is 384 cells — 768 half-cell steps, which must fit or the far
-// corner of the box would fall to the stretched-dt fallback on every diagonal
-// view. When a span does outrun it, the `dt` floor in `fs_raymarch` stretches
-// the steps to cover it rather than truncating the far side of the volume.
+// A **ceiling** on samples per ray, not the step count: the step length arrives
+// in `flags.z` and the loop breaks at the box exit. `const` so naga folds the
+// bound to a literal. 1024 covers the desktop 256x256x128 grid's 384-cell
+// diagonal at the half-cell rung (768 steps); longer spans are covered by the
+// `dt` floor in `fs_raymarch` stretching the steps, not by truncation.
 const RAYMARCH_STEP_CEILING: i32 = 1024;
 
-// Entries in the colour table. Must equal `constants::VOLUME_LUT_BYTES / 4`;
+// Must equal `constants::VOLUME_LUT_BYTES / 4`;
 // `the_shader_and_the_lut_constant_agree` pins that.
 const LUT_ENTRIES: f32 = 256.0;
 
-// Smallest ray-direction component the slab test will divide by. Guards the
-// axis-parallel ray without relying on infinity arithmetic, which WGSL leaves
-// implementation-defined and WebGL2 drivers disagree about.
+// Smallest ray-direction component the slab test divides by: guards the
+// axis-parallel ray without infinity arithmetic, which WGSL leaves
+// implementation-defined.
 const RAY_DIRECTION_EPSILON: f32 = 1e-6;
 
 // How far under the bottom plane, in box heights, the eye travels before the
-// floor is fully gone. From above the floor is the opaque ground the box
-// stands on; from below it must not wall the volume off — the user asked for
-// exactly that — so its coverage is scaled by eye depth below the plane:
-// 1 at the plane and above (every above-plane pixel is bit-identical to the
-// pre-fade composite), 0 at this depth — ~1.4 km of the default 18 km
-// column, so the wall never persists: steady-state below is fully
-// transparent, and the descent dissolves it over the first FLOOR_BELOW_FADE
-// of eye depth rather than in a single step.
-//
-// What this is NOT: a pop-free crossing. Coverage is continuous in eye depth
-// (1 on both sides of the plane), but the composite's *order* switches at
-// the crossing — behind the accumulation from above, in front of it from
-// below — so a pixel where the volume occludes the floor can jump on the
-// crossing frame, at up to full coverage. The band was still put entirely
-// BELOW the plane on purpose: a band reaching above it would thin the
-// resting ground out of every low-angle above-plane view — a permanent cost
-// to the GR-solid floor — to soften a transient the descent already
-// dissolves in under a band-width of travel.
+// floor is fully gone. Coverage is 1 at the plane and above, 0 at this depth
+// (~1.4 km of the default 18 km column), so a below-plane eye is not walled off.
+// Entirely below the plane: a band reaching above would thin the ground in every
+// low-angle above-plane view.
 const FLOOR_BELOW_FADE: f32 = 0.08;
 
 // Below this the central difference is noise rather than a surface, and
-// normalising it would point the normal in an arbitrary direction.
-//
-// # What the magnitude it bounds is measured in
-//
-// **Normalised palette index per displayed kilometre.** Both halves need
-// saying: neither is guessable from the comparison itself, and without them
-// 1e-6 means a different physical thing in every box.
-//
-// *Normalised palette index*, because the field being differenced is
-// `shading_field` — the coverage-premultiplied channel, `coverage x index`
-// with the index stored as `index / 255` (`coverage_premultiplied_into`, in
-// `volume::raymarch`). It runs 0 at air to 1 at the top of the table, for
-// every product. `iso_shading`'s field (`iso_field(index) x coverage`) is on
-// that same 0-1 scale, which is what lets one constant serve both call sites.
-//
-// *Per displayed kilometre*, because `shading` and `iso_shading` both divide
-// the differences by `cell_km` — the box extent over the cell count, with the
-// vertical multiplied by the exaggeration the pane is drawn at. So this floor
-// rescales with the box, with the grid shape AND with the exaggeration knob,
-// and the bare number says nothing until it is put beside one of them.
-//
-// # What 1e-6 is worth at the box that ships
-//
-// The default box is the whole surveillance volume: `2 x MAX_HALF_WIDTH_KM`
-// = 460 km across, `DEFAULT_BASE_KM_MSL`..`DEFAULT_TOP_KM_MSL` = 0-18 km
-// deep. On the desktop grid (`DESKTOP_VOLUME_GRID_CELLS`, 256 x 256 x 128)
-// that is 1.797 km per horizontal cell and 0.141 km per vertical one — 1.69
-// km even at `MAX_VERTICAL_EXAGGERATION` (12), so the horizontal is the
-// coarsest displayed cell over the whole travel of the knob, and it is the
-// coarsest cell that sets the *smallest* gradient a real feature can make.
-//
-// The smallest signal the field can carry is one palette index, 1/255 =
-// 3.9e-3, across that cell:
-//
-//     3.9e-3 / 1.797 km  ~  2.2e-3 per km  ~  2200 x GRADIENT_EPSILON
-//
-// Conservative by a factor of two, deliberately: the difference above spans
-// two cells and is divided by one, so what is actually compared is ~4.4e-3.
-// That factor is uniform over the three axes, so it moves the magnitude and
-// never the normal.
-//
-// The coarsest configuration that ships at all is wasm32's 128 x 128 x 64
-// grid at the same box — 3.59 km a cell, one index step = 1.1e-3 per km,
-// still ~1100 x this constant. A picked *region* only ever refines the cell
-// and raises the figure, and a data edge (coverage 1 -> 0, a whole 1.0 step)
-// raises it by 255 again. For a one-index feature to fall under 1e-6 the
-// displayed cell would have to be ~3900 km — more than eight times the
-// widest box there is.
-//
-// So it is a **zero-detector**: three orders of magnitude below the smallest
-// thing an eight-bit field can express, guarding `gradient / magnitude`
-// against a uniform sample and nothing else. It is not a tuned threshold and
-// must not be read as one — moved anywhere near a real gradient it would
-// start classifying lit surfaces as flat.
+// normalising it would point the normal in an arbitrary direction. Units:
+// normalised palette index per DISPLAYED kilometre — the differenced field runs
+// 0 (air) to 1 (top of table), and `shading`/`iso_shading` divide by `cell_km`,
+// so the floor rescales with box, grid shape and exaggeration. A zero-detector,
+// not a tuned threshold: one palette step across the coarsest shipped cell is
+// 3.9e-3 / 1.797 km ~ 2.2e-3 per km, ~2200x this value.
 const GRADIENT_EPSILON: f32 = 1e-6;
 
-// Bisection steps refining an isosurface hit between the sample that crossed
-// and the one before it. A `const` bound for the same naga reason as
-// RAYMARCH_STEP_CEILING. Eight halvings of one march step place the surface
-// to under 1/256 of a step — finer than the eight-bit index can express — so
-// the per-pixel jitter's one-step start offset stops wobbling the surface.
+// Bisection steps refining an isosurface hit. `const` for the same naga reason as
+// RAYMARCH_STEP_CEILING. Eight halvings place the surface to under 1/256 of a
+// step — finer than the eight-bit index can express.
 const ISO_REFINE_STEPS: i32 = 8;
 
-// Reconstructed coverage at or above which a sample is INSIDE the data, for
-// the one decision that has to be binary: the isosurface's hit test.
-//
-// 0.5 rather than any other number because it is the *nearest-neighbour
-// decision boundary*: along an axis the trilinear coverage field's half level
-// set is exactly the midpoint between the last covered texel centre and the
-// first uncovered one, so a sample above it sits in the cell of a texel that
-// holds data and one below it in the cell of a texel that does not. An
-// isosurface is a level set — a point is on one side or the other — so it gets
-// a surface with the same *reach* as an honest nearest march, and one that is
-// smooth rather than a staircase of cube faces.
-//
-// That equivalence is exact in 1-D and only approximate in 3-D, where the tent
-// is the product of three axis weights: at u = v = w = 0.49 from a lone covered
-// texel, trilinear coverage is 0.51^3 = 0.133, well under the cut, while
-// nearest says inside. The corners of a lone texel's cell are therefore clipped
-// — 0.5 is a rounded nearest march, not a bit-exact one, and the smooth surface
-// is what it is chosen for.
-//
-// # It is a level-0 constant, and the isosurface marches at level 0
-//
-// Everything above is a statement about the RAW trilinear tent. At
-// reconstruction level 1 the coverage field is a two-cell box convolved with
-// that tent, and 0.5 stops meaning anything about texel cells: a lone measured
-// voxel is an eighth of its coarse texel and reconstructs to coverage
-// 32/255 = 0.125, a one-cell sheet to 128/255 = 0.502, so a `>= 0.5` cut
-// deletes the first outright and all but destroys the second. This is the same
-// erasure COVERAGE_SKIP refuses for the lit volume, arriving at the same
-// features through the gate.
-//
-// So `volume::bridge` sends `reconstruction_lod = 0` on the isosurface branch
-// — the smoothing rung is a presentation knob, and presentation is not what a
-// level set of the data is — and this cut is only ever applied to the field the
-// claim above is about. `an_isosurface_at_the_shipped_rung_keeps_its_sub_
-// kernel_features` measures both rungs and pins it.
-//
-// **The lit volume does not use it**, and that is deliberate rather than an
-// omission — see COVERAGE_SKIP.
+// Reconstructed coverage at or above which a sample is INSIDE the data, for the
+// one decision that has to be binary: the isosurface's hit test. 0.5 is the
+// nearest-neighbour decision boundary — along an axis the trilinear coverage
+// field's half level set is the midpoint between the last covered texel centre
+// and the first uncovered one. Exact in 1-D only (at u = v = w = 0.49 from a lone
+// texel, coverage is 0.51^3 = 0.133), so lone cells have their corners clipped.
+// It is a claim about the RAW tent, and the isosurface marches at level 0
+// (`volume::bridge` sends `reconstruction_lod = 0`). The lit volume does not use
+// it — see COVERAGE_SKIP.
 const COVERAGE_FLOOR: f32 = 0.5;
 
-// Coverage below which the LIT VOLUME skips a sample outright.
-//
-// A fill-rate and precision floor, **not** a decision about where the data is,
-// because for an integrated quantity there is no such decision to make: the
-// march accumulates optical depth along a ray, coverage is the fraction of a
-// sample's reconstruction footprint that was measured, and weighting the
-// optical depth by it is the partial-volume answer. The trilinear tent is a
-// partition of unity, so the coverage field integrates to exactly the hard
-// field's volume: the weighting REDISTRIBUTES an edge voxel's opacity across
-// the reconstruction footprint rather than adding any, which is what a
-// band-limited reconstruction of a hard edge is. (That conservation is of
-// `coverage x extinction`, so it is exact in the LUT's alpha only where the
-// alpha is constant across the indices the edge sweeps; where the ramp's alpha
-// varies the reconstruction still redistributes rather than invents, but the
-// integral is the alpha-weighted one, not the hard field's.)
-//
-// A COVERAGE_FLOOR-style cut here would instead destroy optical depth, and
-// above reconstruction level 0 it destroys whole features: a lone measured
-// voxel occupies an eighth of its coarse texel, so at the cloud rung's level
-// its coverage is 0.125 everywhere and a 0.5 cut erases it outright —
-// measured, `the_smoothed_reconstruction_spreads_a_lone_voxel` went from 43
-// painted pixels to 0. That is the same class of erasure as the naive mip's
-// (-90% of top-class pixels at 160 km), arriving through the gate instead of
-// through the mean, and the reconstruction rung exists to soften spikes rather
-// than to delete them.
-//
-// 1/255 is one step of the palette the index channel carries — a coverage
-// finer than the field it weights can resolve. (It used to be one stored
-// quantum of the coverage channel as well; the channel is a half float now and
-// has no such floor, which is what made the reconstruction adapter-independent
-// and is argued at `volume::VOLUME_TEXTURE_FORMAT`. The skip's own value did
-// not move with it, because what it is for did not.) It is a fill-rate floor
-// and not a claim of
-// invisibility: at DEFAULT_EXTINCTION_PER_KM over a several-kilometre segment a
-// sample at exactly this coverage absorbs on the order of a couple of percent
-// (~5 levels of 255 across a ~5 km segment), which is one or two eight-bit
-// steps in the pixel behind it, not none. What licenses the skip is that the
-// samples it drops are the outermost tail of the reconstruction tent, where the
-// alternative to a small error is the whole march paying for footprints that
-// are almost entirely air.
+// Coverage below which the LIT VOLUME skips a sample: a fill-rate and precision
+// floor, **not** a decision about where the data is. For an integrated quantity,
+// weighting optical depth by coverage IS the partial-volume answer — the
+// trilinear tent is a partition of unity, so it redistributes an edge voxel's
+// opacity across the reconstruction footprint rather than adding any. (The
+// conserved quantity is `coverage x extinction`, exact in the LUT alpha only
+// where that alpha is constant across the indices the edge sweeps.) 1/255 is one
+// step of the palette the index channel carries. A COVERAGE_FLOOR-style cut here
+// would delete whole features above level 0, where a lone voxel is an eighth of
+// its coarse texel and reads coverage 0.125.
 const COVERAGE_SKIP: f32 = 1.0 / 255.0;
 
-// Divisor floor for the coverage reconstruction, far under COVERAGE_SKIP so it
-// can only ever be reached by a sample that is about to be discarded. It exists
-// so an all-air fetch — R = G = 0 exactly — yields index 0 rather than a NaN
-// that would poison the comparisons downstream.
+// Divisor floor for the coverage reconstruction, far under COVERAGE_SKIP: an
+// all-air fetch (R = G = 0 exactly) yields index 0 rather than a NaN.
 const COVERAGE_EPSILON: f32 = 1e-6;
 
 struct RaymarchVertex {
@@ -449,23 +206,18 @@ fn unproject(ndc: vec2<f32>, depth: f32) -> vec3<f32> {
     return homogeneous.xyz / homogeneous.w;
 }
 
-// The ray direction as every plane crossing in this shader solves against it:
-// each component's magnitude floored at RAY_DIRECTION_EPSILON, its sign kept.
-//
-// One function rather than the same three lines twice, because the two callers
-// have to agree to the BIT. `floor_hit` used to divide where this multiplies by
-// a reciprocal, so the box's bottom face had two answers a ULP apart — and the
-// composite below then read the difference as "which side of the plane is the
-// eye on", a question the ray has no business being asked. See the composite
-// at the end of `fs_raymarch`.
+// The ray direction as every plane crossing here solves against it: each
+// component's magnitude floored at RAY_DIRECTION_EPSILON, its sign kept. One
+// function because `floor_hit` and `slab_entry_exit` must give the bottom face
+// the same answer to the BIT, not two a ULP apart.
 fn slab_direction(rd: vec3<f32>) -> vec3<f32> {
     let magnitude = max(abs(rd), vec3<f32>(RAY_DIRECTION_EPSILON));
     return select(magnitude, -magnitude, rd < vec3<f32>(0.0));
 }
 
 // Where the ray enters and leaves the unit cube, as (entry, exit) parameters.
-// `exit <= entry` means it misses. Entry is clamped to zero so that a camera
-// inside the box marches from itself rather than from behind itself.
+// `exit <= entry` means it misses. Entry is clamped to zero so a camera inside
+// the box marches from itself rather than from behind itself.
 fn slab_entry_exit(ro: vec3<f32>, rd: vec3<f32>) -> vec2<f32> {
     let inverse = vec3<f32>(1.0) / slab_direction(rd);
     let to_min = (vec3<f32>(0.0) - ro) * inverse;
@@ -477,113 +229,60 @@ fn slab_entry_exit(ro: vec3<f32>, rd: vec3<f32>) -> vec2<f32> {
     return vec2<f32>(entry, exit);
 }
 
-// Kilometres one `dt` step covers along `rd`.
-//
-// The direction is INSIDE the length, not outside it. `dt * length(box_size_km)`
-// compiles, reads plausibly and is wrong: it gives every direction the box's
-// diagonal. On a 240 x 240 x 20 km box that is 340 km, so a vertical step comes
-// out 17x too long and a horizontal one 1.4x — leaving a vertical ray 12x more
-// opaque, relative to a horizontal one, than it should be. It looks like haze
-// rather than like a bug.
+// Kilometres one `dt` step covers along `rd`. The direction is INSIDE the length:
+// `dt * length(box_size_km)` gives every direction the box's diagonal, which on a
+// 240 x 240 x 20 km box makes a vertical step 17x too long and a horizontal 1.4x.
 fn step_length_km(rd: vec3<f32>, dt: f32) -> f32 {
     return length(rd * dt * volume.box_size_km.xyz);
 }
 
-// The texel centre of palette entry `index`, where `index` is the 0-1 value
-// `field_at` reconstructs — the same units an eight-bit unorm fetch returns.
+// The texel centre of palette entry `index`, in the 0-1 units `field_at` returns.
 fn lut_coord(index: f32) -> vec2<f32> {
     return vec2<f32>((index * (LUT_ENTRIES - 1.0) + 0.5) / LUT_ENTRIES, 0.5);
 }
 
-// The field the march reads: `x` is the reconstructed palette index, `y` the
-// reconstructed coverage, both at the level flags.y, from ONE texture fetch.
+// The field the march reads: `x` the reconstructed palette index, `y` the
+// reconstructed coverage, both at level flags.y, from ONE fetch.
 //
-// # The reconstruction
-//
-// The texture holds `R = coverage x index`, `G = coverage`. Hardware `Linear`
-// filtering returns the tent-weighted means `R_bar` and `G_bar` of the same
-// eight (or, between levels, sixteen) texels under the same weights, so
+// The texture holds `R = coverage x index`, `G = coverage`, and `Linear`
+// filtering returns tent-weighted means of the same texels under the same
+// weights, so
 //
 //     R_bar / G_bar  =  sum(w_i c_i x_i) / sum(w_i c_i)
 //
-// which is the coverage-weighted mean of the index over the **covered** texels
-// alone. Empty air has c = 0 and contributes nothing to either sum, so it
-// cannot drag the result anywhere: the reconstructed index always lies inside
-// the convex hull of the stored indices that surround the sample, for every
-// product, whatever shape its palette ramp has. That is the whole point of the
-// premultiplication, and it is what retires the per-product
-// nearest-versus-blend split this shader used to carry — under which the seven
-// diverging, inverted and flat-ramped products marched nearest and looked
-// blocky, because a plain `R8Unorm` blend against the no-data index 0 swept
-// through every intervening palette band and manufactured structure. The shape
-// of the defect is the KLOT 2026-08-10 NROT arcs; the number is the 8^3
-// synthetic fixture that reproduces them, `coverage_reconstruction_never_paints
-// _a_band_the_data_does_not_occupy`, whose control render paints 6267 pixels of
-// a band the data never occupies against 122 honest ones.
+// the coverage-weighted mean of the index over the COVERED texels alone: air has
+// c = 0 and contributes to neither sum, so the result always lies inside the
+// convex hull of the surrounding stored indices, whatever the palette ramp. A
+// legitimate index 0 counts AS A ZERO (0 into R, 1 into G), though
+// `rustdar_radar::voxel::ramp_index` clamps finite measurements to 1..=255.
 //
-// The hull statement is about the filter's arithmetic, and it holds only as
-// far as the filter's *precision* does — which is why the texture is a float
-// format rather than the `Rg8Unorm` this began as. A sampler may compute a
-// filtered `unorm` result in the source format's own fixed point, and real
-// ones do; the error on each channel is then ABSOLUTE, up to one quantum, and
-// this division turns that into an index error of `2q / G_bar`. At full
-// coverage that is nothing. One cell out from an echo edge, where G_bar is a
-// few 255ths, it is the whole palette — which is exactly the shell this
-// reconstruction exists to be honest about. Measured on lavapipe with
-// `Rg8Unorm`: a lone data index of 147 reconstructed to 51-85 through the
-// shell, back inside the green under-band; a stored index of 1 reconstructed
-// to 0 for every coverage under a half, because `c/255` rounds away. A float
-// channel's error is relative instead, so it does not know how small G_bar
-// is, and the reconstruction is identical on a software rasteriser and on an
-// RTX 3090 to four decimals. See `volume::VOLUME_TEXTURE_FORMAT`.
+// The hull statement holds only as far as the filter's PRECISION does, which is
+// why the format is float and not `Rg8Unorm`: a unorm filter's per-channel error
+// is absolute, up to one quantum, and this division turns it into an index error
+// of `2q / G_bar` — the whole palette one cell out from an echo edge. See
+// `volume::VOLUME_TEXTURE_FORMAT`.
 //
-// A legitimate index 0 would still work — it adds 0 to R and 1 to G, so it is
-// counted **as a zero** rather than as an absence — though the encoding does
-// not produce one: `rustdar_radar::voxel::ramp_index` clamps every finite
-// measurement to 1..=255.
-//
-// # The level
-//
-// The grid travels with one hand-built mip below it — each level-1 texel the
-// plain box mean of its eight level-0 texels **in both channels**, which under
-// the ratio above is exactly the occupancy-weighted mean of the index and the
-// occupancy itself — and the sampler filters between levels, so this one fetch
-// reconstructs the field through a kernel that widens continuously with
-// flags.y: 0 is the raw trilinear tent, 1 is a two-cell box convolved with a
-// tent. The alternatives measured and rejected on fill-rate grounds were a
-// tricubic B-spline (eight taps) and a four-tap tetrahedral average (which
-// moired against the per-pixel jitter).
-//
-// This softening is *presentation*, exactly like the opacity ramp: the grid,
-// the palette and the threshold's anchor are untouched, and flags.y = 0 — the
-// uniform's default — is the bit-exact raw field every mask instrument was
-// written against (at LOD exactly 0 the level-1 weight is exactly zero).
-// flags.y is never negative any more; the sentinel that used to select a
-// nearest snap is gone with the split it served.
+// The level: one hand-built mip below the grid, each level-1 texel the box mean
+// of its eight level-0 texels in BOTH channels — under the ratio above, the
+// occupancy-weighted mean of the index and the occupancy itself — so flags.y
+// widens the kernel continuously: 0 the raw trilinear tent (level-1 weight
+// exactly zero), 1 a two-cell box convolved with a tent.
 fn field_at(p: vec3<f32>) -> vec2<f32> {
     let t = grid_coord(p);
     if outside_grid(t) {
-        // Air, in both channels: no index and no coverage, which is exactly
-        // what the reconstruction below already means by "nothing here".
         return vec2<f32>(0.0, 0.0);
     }
     let texel = textureSampleLevel(grid_texture, grid_sampler, t, volume.flags.y).rg;
-    // No `select`: an all-air fetch is R = G = 0 exactly, so the floored
-    // divisor returns index 0 for it, and every covered fetch has G well above
-    // the floor by the time the sample is used at all.
+    // No `select`: an all-air fetch is R = G = 0 exactly, so the floored divisor
+    // already returns index 0.
     return vec2<f32>(texel.r / max(texel.g, COVERAGE_EPSILON), texel.g);
 }
 
-// The premultiplied channel on its own — `coverage x index` — which is what
-// the lit volume's gradient is taken of.
-//
-// **Not** the reconstructed index. Inside the data coverage is 1 and the two
-// are identical, so nothing about interior shading changes; at an echo edge
-// the premultiplied channel falls continuously to zero while the reconstructed
-// index does not (it stays a real mean of real neighbours right up to the
-// cut), so this is the one that has a gradient there at all — and it points
-// out of the data, which is the normal of the surface being drawn. One fetch,
-// like the field it comes from.
+// The premultiplied channel alone — `coverage x index` — which is what the lit
+// volume's gradient is taken of, **not** the reconstructed index: at an echo edge
+// this falls continuously to zero while the reconstructed index stays a real mean
+// of real neighbours, so this is the one with a gradient there, pointing out of
+// the data.
 fn shading_field(p: vec3<f32>) -> f32 {
     let t = grid_coord(p);
     if outside_grid(t) {
@@ -592,86 +291,42 @@ fn shading_field(p: vec3<f32>) -> f32 {
     return textureSampleLevel(grid_texture, grid_sampler, t, volume.flags.y).r;
 }
 
-// Deterministic per-pixel jitter in [0, 1): a wrapped lookup into the blue
-// noise tile at binding 7.
-//
-// The march's sample comb is offset by this fraction of a step, per pixel.
-// Without it the comb is phase-locked to the eye, and every iso-`t` shell
-// draws a contour that stays put in screen space while the volume slides
-// beneath it — the "slithering" the 2026-08-09 recording shows. The jitter
-// trades that coherent crawling for fine noise that is **static**: the tile is
-// indexed by nothing but the pixel coordinate, so it must never be given a
-// time term — animated jitter is shimmer, which is the same artifact at one
-// remove.
-//
-// # Why a tile and not a hash
-//
-// This was Jimenez's interleaved gradient noise until 2026-08-11, and what it
-// leaves behind is not invisible: the residual is the hash's own spatial
-// spectrum, scaled by the per-step opacity quantum. IGN is a rank-1 lattice —
-// 81.6% of its energy in 0.1% of its frequency bins, a grating of period
-// 1.86 px at -35 degrees — so wherever that quantum is large enough to see, it
-// draws a fine diagonal weave over every smooth gradient. That is the artefact
-// reported against the 3D view, and no step count removes it: halving the step
-// only scales it down. A white hash removes the grating and is the worse
-// trade, putting fifteen times as much energy in the low band the eye actually
-// reads. See `volume::blue_noise` for the measurements, and for why the tile
-// is generated rather than shipped as bytes.
-//
-// `textureLoad`, not `textureSampleLevel`: the tile is a table of offsets
-// indexed by an exact integer coordinate, so there is nothing to filter and the
-// load needs no sampler of its own. It takes an explicit level, so it is not
-// implicit-LOD and the module's rule about non-uniform control flow does not
-// reach it — and this call sits above the march's data-dependent break in
-// uniform control flow regardless.
+// Deterministic per-pixel jitter in [0, 1) offsetting the march's sample comb by
+// that fraction of a step. Without it the comb is phase-locked to the eye and
+// every iso-`t` shell draws a contour that stays put in screen space while the
+// volume slides beneath it. Indexed by pixel coordinate alone — never add a time
+// term, animated jitter is shimmer. A tile rather than a hash because IGN is a
+// rank-1 lattice (81.6% of its energy in 0.1% of its bins, a 1.86 px grating at
+// -35 degrees) that draws a diagonal weave no step count removes, while a white
+// hash puts fifteen times as much energy in the low band. See
+// `volume::blue_noise`.
 fn blue_noise_jitter(px: vec2<f32>) -> f32 {
-    // A mask rather than `%`: the tile's edge is a power of two, and WGSL's
-    // remainder takes the sign of its left operand, so the mask is the form
-    // that cannot index backwards off the tile.
+    // A mask rather than `%`: the edge is a power of two, and WGSL's remainder
+    // takes the sign of its left operand, so the mask cannot index backwards.
     let at = vec2<i32>(px) & vec2<i32>(JITTER_TILE_MASK, JITTER_TILE_MASK);
     return textureLoad(jitter_texture, at, 0).r;
 }
 
-// Diffuse shading from the central-difference gradient, in 0..1.
+// Diffuse shading from the central-difference gradient, in 0..1. Six extra
+// fetches against the march's one — 2.4x on an RTX 3090 at 1440x900 (0.774 ms
+// against 0.325) — which is why it is a selectable rung.
 //
-// Six extra fetches against the march's one, which measured 2.4x on an RTX 3090
-// at 1440x900 (0.774 ms against 0.325). That is the whole reason this is a
-// separately selectable rung rather than something the shader always does.
-//
-// Two decisions here are the difference between "lit voxels" and "lit cloud",
-// and both were arrived at by rendering a real convective volume (KCRP
-// 2017-08-26, the Harvey landfall) rather than by argument:
-//
-//   * The gradient is taken in the *displayed* kilometre, not in box units.
-//     Box space is the unit cube over a pancake — 160 x 160 x 18 km at the
-//     tightest default, 25.6:1 at the widest — so a difference of raw box-space
-//     samples under-weights the vertical component by the box's aspect ratio,
-//     and every echo top is lit as though it were nearly flat. Dividing each
-//     component by that axis's displayed cell size (the true cell, stretched
-//     by the exaggeration in w) makes the normal the normal of the surface
-//     the user is actually looking at.
-//
-//   * Half-Lambert (Valve's wrap term, squared) instead of a clamped cosine.
-//     A cloud has no terminator: light scatters through it, so the away side
-//     is dimmer, never cut off. `max(dot, 0)` draws a hard day/night line
-//     across every storm core, and that line lands exactly where the gradient
-//     is noisiest — it reads as a torn edge. The wrap term is monotone in the
-//     same dot product with no clamp corner, so the same geometry shades
-//     smoothly from lit to ambient.
+//   * The gradient is taken in the DISPLAYED kilometre, not in box units: box
+//     space is the unit cube over a pancake (25.6:1 at the widest default), so
+//     raw box-space differences under-weight the vertical by the aspect ratio.
+//   * Half-Lambert (Valve's wrap term, squared) instead of a clamped cosine: a
+//     cloud has no terminator, and `max(dot, 0)` draws a hard day/night line
+//     across every storm core exactly where the gradient is noisiest.
 fn shading(p: vec3<f32>) -> f32 {
     let voxel = vec3<f32>(1.0) / volume.grid_dims.xyz;
-    // One displayed cell along each axis, in kilometres. `box_size_km.w` is
-    // the vertical exaggeration, >= 1 by the uniform's contract.
+    // One displayed cell per axis, in km; `box_size_km.w` is the exaggeration.
     let cell_km = vec3<f32>(
         volume.box_size_km.x,
         volume.box_size_km.y,
         volume.box_size_km.z * volume.box_size_km.w,
     ) * voxel;
-    // Differences of the same reconstruction the march reads, at the same
-    // level, so the normal belongs to the surface being drawn: raw differences
-    // over a smoothed field would light every voxel corner the smoothing just
-    // removed. Of the *premultiplied* channel — see `shading_field` for why
-    // that and not the reconstructed index.
+    // Differences of the same reconstruction the march reads, at the same level,
+    // of the *premultiplied* channel — see `shading_field`.
     let gradient = vec3<f32>(
         shading_field(p + vec3<f32>(voxel.x, 0.0, 0.0))
             - shading_field(p - vec3<f32>(voxel.x, 0.0, 0.0)),
@@ -685,50 +340,33 @@ fn shading(p: vec3<f32>) -> f32 {
     if magnitude < GRADIENT_EPSILON {
         return 1.0;
     }
-    // The gradient climbs towards denser cells, so the outward-facing normal is
-    // its negation.
+    // The gradient climbs towards denser cells, so the outward normal is negated.
     let normal = -gradient / magnitude;
     let wrap = 0.5 + 0.5 * dot(normal, normalize(volume.light_dir_ambient.xyz));
     return ambient + (1.0 - ambient) * wrap * wrap;
 }
 
-// ---------------------------------------------------------------------------
-// The isosurface
-// ---------------------------------------------------------------------------
-//
-// A per-pane view mode beside the lit volume: instead of accumulating alpha,
-// the march finds the first crossing of a threshold, refines it by bisection
-// and paints it as one opaque, gradient-lit surface. Selected by the sign of
-// `eye_in_box.w` (the threshold; negative = lit volume). The threshold reads
-// the DATA — the interpolated palette index — never the LUT's alpha, so a
-// Volume Alpha curve restyles the lit volume and leaves the isosurface where
-// the values put it.
+// The isosurface: the march finds the first crossing of a threshold, refines it
+// by bisection and paints it as one opaque, gradient-lit surface. Selected by the
+// sign of `eye_in_box.w` (negative = lit volume). The threshold reads the DATA —
+// the interpolated palette index — never the LUT's alpha.
 
 // The scalar field the isosurface is a level set of: the index itself for a
-// sequential product, the distance from the diverging centre (`grid_dims.w`)
-// for a diverging one — which renders BOTH lobes of a velocity couplet, each
-// wearing its own palette colour.
+// sequential product, the distance from the diverging centre (`grid_dims.w`) for
+// a diverging one, which renders BOTH lobes of a velocity couplet.
 fn iso_field(index: f32) -> f32 {
     return select(index, abs(index - volume.grid_dims.w), volume.grid_dims.w >= 0.0);
 }
 
-// Whether the field at `sample` — (index, coverage), as `field_at` returns it
-// — is at or beyond the iso threshold.
-//
-// The coverage term excludes unmeasured air, and it is what the old
-// `index > transfer.y` term was standing in for: without an air test a
-// diverging centre reads the no-data index 0 as a strong inbound crossing and
-// shrink-wraps the whole coverage cone, and for ρHV — whose centre sits at the
-// *top* of its ramp — index 0 is the most extreme "hit" the field can produce.
-// Coverage says the same thing directly, for every product, and it says it
-// without borrowing the palette's fade band, which is a statement about the
-// table rather than about no-data.
+// The coverage term excludes unmeasured air: without it a diverging centre reads
+// the no-data index 0 as a strong inbound crossing, and for rhoHV — whose centre
+// sits at the TOP of its ramp — index 0 is the most extreme hit possible.
 fn iso_hit_test(sample: vec2<f32>) -> bool {
     return sample.y >= COVERAGE_FLOOR && iso_field(sample.x) >= volume.eye_in_box.w;
 }
 
-// The crossing parameter between a sample outside the surface at `t_lo` and
-// one inside at `t_hi`, by ISO_REFINE_STEPS halvings.
+// The crossing parameter between a sample outside the surface at `t_lo` and one
+// inside at `t_hi`, by ISO_REFINE_STEPS halvings.
 fn refine_iso_hit(eye: vec3<f32>, direction: vec3<f32>, t_lo_in: f32, t_hi_in: f32) -> f32 {
     var lo = t_lo_in;
     var hi = t_hi_in;
@@ -743,27 +381,18 @@ fn refine_iso_hit(eye: vec3<f32>, direction: vec3<f32>, t_lo_in: f32, t_hi_in: f
     return hi;
 }
 
-// The isosurface's own level-set function at `p`, coverage-premultiplied:
-// `iso_field(index) x coverage`.
-//
-// The coverage factor is the same move `shading_field` makes one level down,
-// for the same reason. `iso_field` of an air sample is meaningless — for ρHV,
-// whose centre is at the top of the ramp, it is the largest value the function
-// takes — so an unweighted difference across the data boundary would point the
-// normal into the air rather than out of it. Multiplying by coverage sends air
-// to zero, which reads as "far outside the surface" for every product, and
-// inside the data coverage is 1 so the level set is exactly the one
-// `iso_hit_test` uses.
+// The isosurface's level-set function at `p`, coverage-premultiplied. `iso_field`
+// of air is meaningless — for rhoHV it is the function's largest value — so an
+// unweighted difference across the data boundary would point the normal into the
+// air; coverage sends air to zero and is 1 inside the data.
 fn iso_shading_field(p: vec3<f32>) -> f32 {
     let sample = field_at(p);
     return iso_field(sample.x) * sample.y;
 }
 
-// `shading`, over the isosurface's own field: the normal must belong to the
-// level set being drawn, and for a diverging product that set's gradient is
-// not the density's — on the inbound lobe the density *falls* toward the
-// core, so a density normal would light the surface from inside. Same six
-// fetches, same displayed-kilometre metric, same half-Lambert wrap.
+// `shading` over the isosurface's own field: for a diverging product the level
+// set's gradient is not the density's — on the inbound lobe density falls toward
+// the core, so a density normal would light the surface from inside.
 fn iso_shading(p: vec3<f32>) -> f32 {
     let voxel = vec3<f32>(1.0) / volume.grid_dims.xyz;
     let cell_km = vec3<f32>(
@@ -789,30 +418,18 @@ fn iso_shading(p: vec3<f32>) -> f32 {
     return ambient + (1.0 - ambient) * wrap * wrap;
 }
 
-// The lit, linear colour of the isosurface at `p`: the palette's colour for
-// the value there, always gradient-lit — an unlit opaque surface is a
-// silhouette, so the isosurface shades on every quality rung.
+// Always gradient-lit: an unlit opaque surface is a silhouette.
 fn iso_surface_colour(p: vec3<f32>) -> vec3<f32> {
     let index = field_at(p).x;
     let entry = textureSampleLevel(lut_texture, lut_sampler, lut_coord(index), 0.0);
     return linear_from_gamma_rgb(entry.rgb) * iso_shading(p);
 }
 
-// Where this ray meets the box's bottom face, or a negative number for a ray
-// that never does.
-//
-// The floor is the z = 0 plane clipped to the unit square in x and y — the
-// box's own bottom face, so a hit is always on the box boundary: for an eye
-// above the plane it coincides with the ray's box exit, and for an eye below
-// it with (or before) the entry.
-//
-// **Solved through `slab_direction`, so that coincidence is exact.** The plain
-// `-eye.z / direction.z` this used to be is the same value to within a ULP and
-// not the same float: `slab_entry_exit` multiplies by a reciprocal, and
-// `a * (1.0 / b)` is not `a / b`. A ULP is nothing to a sample position, and
-// the sample position is all this feeds now — but it was once compared against
-// the slab's own bound to choose a composite order, and there a ULP is the
-// whole answer.
+// Where this ray meets the box's bottom face — the z = 0 plane clipped to the
+// unit square — or negative for a ray that never does. For an eye above the plane
+// a hit coincides with the box exit, below it with (or before) the entry. Solved
+// through `slab_direction` so that coincidence is EXACT: `slab_entry_exit`
+// multiplies by a reciprocal, and `a * (1.0 / b)` is not `a / b`.
 fn floor_hit(eye: vec3<f32>, direction: vec3<f32>) -> f32 {
     if abs(direction.z) < RAY_DIRECTION_EPSILON {
         return -1.0;
@@ -828,11 +445,10 @@ fn floor_hit(eye: vec3<f32>, direction: vec3<f32>) -> f32 {
     return t;
 }
 
-// Kilometres per degree of latitude — `rustdar_radar::types::KM_PER_DEGREE_LAT`
-// (`EARTH_RADIUS_KM · pi/180`), the one sphere the whole workspace measures
-// ground distance on. WGSL cannot read a Rust constant, so this is the only
-// copy of that number anywhere; `volume_uniform::tests::
-// the_shaders_km_per_degree_is_the_radar_crates_own` pins this literal to it.
+// `rustdar_radar::types::KM_PER_DEGREE_LAT` (`EARTH_RADIUS_KM * pi/180`). WGSL
+// cannot read a Rust constant, so this is the only copy of it here;
+// `volume_uniform::tests::the_shaders_km_per_degree_is_the_radar_crates_own` pins
+// the literal.
 const KM_PER_DEGREE_LAT: f32 = 111.194927;
 
 // Web Mercator's y: `ln(tan(pi/4 + phi/2))`, the projection's definition.
@@ -840,47 +456,26 @@ fn mercator_y(lat_rad: f32) -> f32 {
     return log(tan(0.78539816 + lat_rad * 0.5));
 }
 
-// The same y from `sin phi`, by the identity `ln(tan(pi/4 + phi/2)) == atanh(sin phi)`.
-// `rustdar_radar::types::mercator_y_from_sin_lat`, and here for the same reason:
-// the reprojection below produces this pixel's latitude as a sine, and going
-// through the angle would mean an `asin` undone by a `tan`.
+// The same y from `sin phi`, by `ln(tan(pi/4 + phi/2)) == atanh(sin phi)`
+// (`rustdar_radar::types::mercator_y_from_sin_lat`): the reprojection below
+// produces latitude as a sine, and the angle would mean an `asin` undone by `tan`.
 fn mercator_y_from_sin(sin_lat: f32) -> f32 {
     return 0.5 * log((1.0 + sin_lat) / (1.0 - sin_lat));
 }
 
-// The floor's colour where the ray lands, linear and straight.
+// The floor's colour where the ray lands: STRAIGHT (un-premultiplied) linear RGB
+// with the mirror's own alpha, which is what the composite arms below expect.
 //
-// # Why this reprojects instead of indexing the mirror directly
-//
-// The mirror is Web Mercator; the box is a tangent plane in kilometres east
-// and north of the site. Mapping one onto the other with a scale and a
-// translate is exact at the box's centre and wrong at its corners — 7.6 km
-// across and 3.7 km down on the shipped 460 km box, because the footprint is
-// a trapezoid in longitude and because Mercator's y is not linear in
-// latitude. See `VolumeUniform::floor_uv` for the arithmetic.
-//
-// So the box position is carried out to geography and back into the mirror,
-// per pixel, through the same conversion the raster's own gates were placed by.
-//
-// # The box is polar, so the conversion is spherical
-//
-// `build_voxels` makes the box a **site-centred azimuthal-equidistant tangent
-// plane**: `(x, y)` is `range = hypot(x, y)`, `azimuth = atan2(x, y)` from the
-// radar and nothing else. So "where on the ground is this box point" is the
-// direct spherical problem from the site — `rustdar_radar::beam::
-// great_circle_destination` — and that is what the raster's gates are painted
-// at too, which is the whole reason this reprojection lands on them.
-//
-// It used to be `phi = phi0 + y/K`, `d_lon = x/(K cos phi)`: an
-// equirectangular approximation, the same one `render_gate` used, and the two
-// agreed only because they were wrong together. On the default box at 41.7 N
-// the two mappings differ by ~15 km at the corners — twice the trapezoid error
-// this reprojection was introduced to remove.
-//
-// Returns straight (un-premultiplied) linear RGB with the mirror's own alpha,
-// which is what the two composite arms below expect — they multiply by a
-// coverage of their own, so a premultiplied colour here would count alpha
-// twice.
+// It reprojects rather than indexing the mirror directly: the mirror is Web
+// Mercator and the box is a tangent plane in km east/north of the site, so a
+// scale and translate is off by 7.6 km across and 3.7 km down at the corners of
+// the shipped 460 km box (see `VolumeUniform::floor_uv`). The conversion is
+// spherical because the box is polar — `build_voxels` makes it a site-centred
+// azimuthal-equidistant tangent plane (`range = hypot(x, y)`,
+// `azimuth = atan2(x, y)`) — so this is the direct spherical problem from the
+// site, `rustdar_radar::beam::great_circle_destination`, which is where the
+// raster's own gates are painted. An equirectangular approximation differs by
+// ~15 km at the corners of the default box at 41.7 N.
 fn floor_colour(eye: vec3<f32>, direction: vec3<f32>, t: f32) -> vec4<f32> {
     let hit = eye + direction * t;
 
@@ -892,17 +487,15 @@ fn floor_colour(eye: vec3<f32>, direction: vec3<f32>, t: f32) -> vec4<f32> {
     let sin_phi0 = sin(site_lat_rad);
     let cos_phi0 = cos(site_lat_rad);
 
-    // The angle this box point subtends at the earth's centre. Taken as
-    // `radians(km / KM_PER_DEGREE_LAT)` so the earth's radius never has to be
-    // written down a second time: kilometres over kilometres-per-degree is
-    // degrees of arc, whatever the sphere.
+    // The angle this box point subtends at the earth's centre, as
+    // `radians(km / KM_PER_DEGREE_LAT)`, so the radius is never written twice.
     let range_km = length(vec2<f32>(x_km, y_km));
     let delta = radians(range_km / KM_PER_DEGREE_LAT);
     let sd = sin(delta);
     let cd = cos(delta);
-    // The bearing's sine and cosine without a trig call: `(x, y)/range` is
-    // already `(sin az, cos az)`. Zero at the site itself, where `sd` is zero
-    // too and both terms below vanish — the site maps to the site.
+    // The bearing's sine and cosine without a trig call: `(x, y)/range` is already
+    // `(sin az, cos az)`. Zero at the site, where `sd` is zero and both terms
+    // below vanish — the site maps to the site.
     let inv = select(0.0, 1.0 / range_km, range_km > 0.0);
     let sin_az = x_km * inv;
     let cos_az = y_km * inv;
@@ -918,10 +511,8 @@ fn floor_colour(eye: vec3<f32>, direction: vec3<f32>, t: f32) -> vec4<f32> {
         volume.floor_uv.x + d_lon_deg * volume.floor_uv.z,
         volume.floor_uv.y + d_merc * volume.floor_uv.w,
     );
-    // Off the mirror is not "the edge texel repeated" — it is ground the
-    // source pane is not currently showing, which has no colour to report.
-    // Clamping instead would smear the pane's border across the rest of the
-    // box, which reads as real map.
+    // Off the mirror is ground the source pane is not showing, which has no colour
+    // to report; clamping would smear the pane's border across the box.
     if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
@@ -930,23 +521,12 @@ fn floor_colour(eye: vec3<f32>, direction: vec3<f32>, t: f32) -> vec4<f32> {
     if sample.a <= 0.0 {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
-    // egui premultiplies in GAMMA space, so the un-premultiply has to be taken
-    // in gamma space too — in **both** arms, which is the whole subtlety here.
-    //
-    // `egui-wgpu-0.35.0/src/egui.wgsl` writes, from the one pipeline that also
-    // draws the mirror:
-    //
-    //  * `fs_main_gamma_framebuffer` (non-sRGB swapchain): `gamma(C) * A`.
-    //  * `fs_main_linear_framebuffer` (sRGB swapchain):
-    //    `linear_from_gamma_rgb(gamma(C) * A)`, alpha untouched.
-    //
-    // The linear arm is *an encoding applied to an already-premultiplied gamma
-    // value*, not a premultiply performed in linear space. So the texel has to
-    // be brought back to gamma first and only then divided: dividing the linear
-    // texel by `A` and calling the result straight linear returns 0.428 where
-    // 1.0 is correct at `C = 1, A = 0.5`. Both arms therefore end in the same
-    // `linear_from_gamma_rgb(gamma_premultiplied / A)`; they differ only in
-    // whether the texel already *is* that gamma value.
+    // egui premultiplies in GAMMA space, so the un-premultiply must be too, in
+    // BOTH arms. `egui-wgpu-0.35.0/src/egui.wgsl` writes `gamma(C) * A` for a
+    // non-sRGB swapchain and `linear_from_gamma_rgb(gamma(C) * A)` for an sRGB one
+    // — an encoding of an already-premultiplied gamma value, not a premultiply in
+    // linear space. Dividing the linear texel by `A` returns 0.428 where 1.0 is
+    // correct at `C = 1, A = 0.5`.
     let gamma_premultiplied = select(
         gamma_from_linear_rgb(sample.rgb),
         sample.rgb,
@@ -966,29 +546,13 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
     }
 
     let floor_t = select(-1.0, floor_hit(eye, direction), volume.flags.w > 0.5);
-    // The floor's coverage: full at and above the bottom plane, fading to
-    // nothing FLOOR_BELOW_FADE under it. An eye under the plane looking up
-    // meets the floor at (or before) its entry into the volume, so a full-
-    // coverage floor there would be an opaque wall in front of the whole
-    // volume — the fade is what turns that wall transparent from below while
-    // leaving every above-plane view exactly as composited before.
     let floor_fade = clamp(1.0 + eye.z / FLOOR_BELOW_FADE, 0.0, 1.0);
 
     // Cells this ray crosses per unit of `t`, in the grid's anisotropic cell
-    // metric — the same "direction inside the length" shape as
-    // `step_length_km`, for the same reason. The step is then flags.z cells
-    // *along the ray* whatever the direction: at the instrument default of 1,
-    // a vertical ray through the shipped grid takes ~128 samples and a
-    // horizontal one ~256, instead of both taking 96 samples of wildly
-    // different physical lengths. The linear filter band-limits the raw field
-    // to about one cell, so 1 resolves everything the grid holds; the cloud
-    // rung's half-cell step buys no resolution — it halves the per-step
-    // opacity quantum, which is what takes the stratified jitter's residual
-    // from a visible stipple to noise below an 8-bit level.
-    //
-    // The floor on `dt` is the ceiling honoured from the other side: a span
-    // that outruns RAYMARCH_STEP_CEILING steps gets covered in ceiling-many
-    // stretched steps rather than a volume truncated mid-box.
+    // metric — the same "direction inside the length" shape as `step_length_km`,
+    // so the step is flags.z cells ALONG THE RAY whatever the direction. The floor
+    // on `dt` honours the ceiling from the other side: a span that outruns
+    // RAYMARCH_STEP_CEILING steps is covered in stretched steps, not truncated.
     let cells_per_t = max(length(direction * volume.grid_dims.xyz), 1.0);
     let dt = max(volume.flags.z / cells_per_t, (span.y - span.x) / f32(RAYMARCH_STEP_CEILING));
     let segment_km = step_length_km(direction, dt);
@@ -996,21 +560,17 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
     // The view mode, selected by the threshold lane's sign — see the uniform.
     let iso = volume.eye_in_box.w >= 0.0;
 
-    // The sample comb starts a per-pixel fraction of a step past the entry —
-    // stratified sampling, with the stratum offset hashed from the pixel. The
-    // expected sample count over the jitter is exactly `span / dt`, so path
-    // integrals stay unbiased; what the jitter buys is that the residual
-    // quantisation is per-pixel noise instead of screen-space contours.
+    // Stratified sampling: the comb starts a per-pixel fraction of a step past the
+    // entry. The expected sample count over the jitter is exactly `span / dt`, so
+    // the integral stays unbiased and the residual quantisation is per-pixel noise
+    // rather than screen-space contours.
     let jitter = blue_noise_jitter(in.clip_position.xy);
     var t = span.x + jitter * dt;
     var transmittance = 1.0;
-    // Premultiplied and LINEAR. The conversion to egui's gamma-space
-    // premultiplied convention happens once, at the end.
+    // Premultiplied and LINEAR; converted to egui's convention once, at the end.
     var accumulated = vec3<f32>(0.0, 0.0, 0.0);
 
     for (var i: i32 = 0; i < RAYMARCH_STEP_CEILING; i = i + 1) {
-        // The step length is the voxel's, not the span's, so past the far face
-        // is a real state the loop reaches rather than one it rounds into.
         if t >= span.y {
             break;
         }
@@ -1019,12 +579,9 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
         let index = sample.x;
         let coverage = sample.y;
         if iso {
-            // First crossing wins: refine it between this sample and the
-            // last, paint it opaque and lit, and the march is over. The
-            // floor arm below still composites — an opaque surface leaves
-            // zero transmittance, so ground behind it stays hidden and
-            // ground beside it stays visible, which is what puts the
-            // isosurface ON the map floor rather than over it.
+            // First crossing wins. The floor arm below still composites: an opaque
+            // surface leaves zero transmittance, so ground behind it stays hidden
+            // and beside it visible, which puts the isosurface ON the floor.
             if iso_hit_test(sample) {
                 let hit_t = refine_iso_hit(eye, direction, max(t - dt, span.x), t);
                 let colour = iso_surface_colour(eye + direction * hit_t);
@@ -1034,38 +591,20 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
             }
         } else if coverage >= COVERAGE_SKIP && index > volume.transfer.y {
             let entry = textureSampleLevel(lut_texture, lut_sampler, lut_coord(index), 0.0);
-            // The table holds gamma-encoded colour, because it is produced by
-            // the same `get_color_for_value` the 2D products paint with.
-            // Accumulation is physical, so decode first.
+            // The table holds gamma-encoded colour (the same `get_color_for_value`
+            // the 2D products paint with); accumulation is physical, so decode.
             var colour = linear_from_gamma_rgb(entry.rgb);
             if shade {
                 colour = colour * shading(p);
             }
-            // The opacity ramp: 0 at the skip threshold, 1 at `transfer.w`
-            // index units above it, smoothstep between. It scales the optical
-            // depth rather than the accumulated alpha, so a saturating
-            // extinction still saturates — which is what keeps the mask
-            // harness's binary-alpha instrument meaningful.
-            //
-            // At `transfer.w = 0` (the uniform's default) the divisor's 1e-6
-            // floor makes the ramp reach 1 within a millionth of an index step
-            // of the threshold: the hard edge, to more precision than an
-            // eight-bit index can express. The production bridge passes a real
-            // width, which is what dissolves the palette's alpha cliff into a
-            // fade — the hard shelf rims of the 2026-08-09 report — and it is
-            // a *render* of the same data, softened exactly at the boundary
-            // the palette already declares, never a reshaping of the field.
+            // The opacity ramp: 0 at the skip threshold, 1 at `transfer.w` index
+            // units above it, smoothstep between. It scales the OPTICAL DEPTH, not
+            // the accumulated alpha, so a saturating extinction still saturates. At
+            // `transfer.w = 0` the 1e-6 divisor floor makes it hard.
             let rise = clamp((index - volume.transfer.y) / max(volume.transfer.w, 1e-6), 0.0, 1.0);
             let opacity_ramp = rise * rise * (3.0 - 2.0 * rise);
-            // Coverage scales the OPTICAL DEPTH, which is the same weighting
-            // the reconstruction uses, applied to absorption: a sample whose
-            // footprint is 60% measured absorbs 60% of what a fully measured
-            // one would. It is 1 everywhere inside the data, so nothing in the
-            // interior moves; across the outermost voxel it falls smoothly to
-            // 0, which is what turns the silhouette from a step in alpha into
-            // a ramp — and because the tent is a partition of unity the total
-            // optical depth along a ray is the hard field's own, redistributed
-            // rather than added to. See COVERAGE_SKIP.
+            // Coverage likewise scales the optical depth — the reconstruction's own
+            // weighting applied to absorption. See COVERAGE_SKIP.
             let absorbed =
                 1.0 - exp(-entry.a * opacity_ramp * coverage * volume.transfer.x * segment_km);
             accumulated = accumulated + transmittance * absorbed * colour;
@@ -1077,33 +616,17 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
         t = t + dt;
     }
 
-    // Which side of the bottom plane the EYE is on, which is the whole of what
-    // decides the composite order. `floor_fade` is already a function of this
-    // one number and the arm has to be the same function of it, or a frame can
-    // composite its floor two different ways in two different pixels.
-    //
-    // **It could, and it did.** This read `floor_t > span.x` — the ray's own
-    // crossing against the ray's own box entry — which is the same question
-    // asked of a quantity that varies per pixel and lands within a ULP of the
-    // boundary at a grazing eye. Swept over 175 cameras, 68 were not uniform in
-    // their arm and one mixed visibly: at `eye.z = -0.0703`, 193 pixels
-    // composited the floor behind the volume and 1172 composited it in front,
-    // in one frame. It was invisible only because every mixing camera found was
-    // deep enough in the fade band that both arms multiply by ~0 — an accident
-    // of where the boundary sits, not a property anything enforces.
-    //
-    // `>= 0.0` rather than `> 0.0`: an eye exactly on the plane has no floor
-    // hit at all (`floor_hit` refuses `t <= 0`), so the branch is unreachable
-    // there and the boundary is placed where the fade's is.
+    // Which side of the bottom plane the EYE is on decides the composite order,
+    // and it must be the same function of the same number as `floor_fade` or one
+    // frame composites its floor two ways in two pixels (measured against the
+    // per-pixel `floor_t > span.x` this replaced: 68 of 175 swept cameras were not
+    // uniform in their arm). `>= 0.0` rather than `> 0.0` because an eye exactly
+    // on the plane has no floor hit — `floor_hit` refuses `t <= 0`.
     let eye_above_plane = eye.z >= 0.0;
 
     // The floor behind the volume: an eye above the plane meets it at the box
-    // exit, so whatever light the march did not absorb lands on the ground
-    // and composites under the accumulation — the same premultiplied algebra
-    // as the volume's own samples, at the end because the plane bounds the
-    // box from below and nothing can be behind it. Coverage is the floor's
-    // own alpha times the fade — 1 above the plane, so this arm is unchanged
-    // there.
+    // exit, so light the march did not absorb lands on ground and composites under
+    // the accumulation. Coverage is the floor's alpha times the fade, 1 above.
     var transmitted = transmittance;
     if floor_t >= 0.0 && eye_above_plane {
         let ground = floor_colour(eye, direction, floor_t);
@@ -1111,12 +634,9 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
         accumulated = accumulated + transmittance * cover * ground.rgb;
         transmitted = transmittance * (1.0 - cover);
     } else if floor_t >= 0.0 && floor_fade > 0.0 {
-        // The floor in front of the volume: an eye under the plane meets it
-        // at (or before) the box entry, so the faded ground composites OVER
-        // the march — the same over operator from the other side. At fade 0
-        // this arm vanishes and the volume shows through where the wall
-        // stood. An inside-the-box eye is above the plane and so takes the
-        // arm above, which is what `span.x` used to be here for.
+        // The floor in front: an eye under the plane meets it at (or before) the
+        // box entry, so the faded ground composites OVER the march; at fade 0 the
+        // arm vanishes. An inside-the-box eye is above the plane.
         let ground = floor_colour(eye, direction, floor_t);
         let cover = ground.a * floor_fade;
         accumulated = ground.rgb * cover + accumulated * (1.0 - cover);
@@ -1127,21 +647,12 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
     if alpha <= 0.0 {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
-    // egui premultiplies in GAMMA space (`Color32` is gamma-encoded and
-    // multiplied by alpha after encoding), so the offscreen has to hold
-    // gamma(C) * A. Encoding the premultiplied linear value directly would be
-    // wrong at every alpha but 1, so un-premultiply, encode, re-premultiply.
-    //
-    // `accumulated` is bounded above by `alpha` — every contribution is
-    // `transmittance * absorbed * colour` with `colour <= 1` — so the division
-    // cannot overshoot.
+    // egui premultiplies in GAMMA space, so the offscreen must hold gamma(C) * A:
+    // un-premultiply, encode, re-premultiply. `accumulated` is bounded above by
+    // `alpha`, so the division cannot overshoot.
     let straight_linear = accumulated / alpha;
     return vec4<f32>(gamma_from_linear_rgb(straight_linear) * alpha, alpha);
 }
-
-// ---------------------------------------------------------------------------
-// The blit
-// ---------------------------------------------------------------------------
 
 @group(0) @binding(5) var blit_texture: texture_2d<f32>;
 @group(0) @binding(6) var blit_sampler: sampler;
@@ -1160,23 +671,18 @@ fn vs_blit(@location(0) clip_xy: vec2<f32>) -> BlitVertex {
     return out;
 }
 
-// The non-sRGB target: egui writes gamma-encoded premultiplied colour and
-// blends it in gamma space, and the offscreen already holds exactly that. So
-// the blit is a pass-through and the blend state does the rest.
+// The non-sRGB target: egui writes gamma-encoded premultiplied colour and blends
+// it in gamma space, which the offscreen already holds, so this is a pass-through.
 @fragment
 fn fs_blit_gamma_framebuffer(in: BlitVertex) -> @location(0) vec4<f32> {
     return textureSampleLevel(blit_texture, blit_sampler, in.uv, 0.0);
 }
 
-// The sRGB target, where the colour-theoretically correct answer is measurably
-// the wrong one.
-//
-// egui's `fs_main_linear_framebuffer` calls `linear_from_gamma_rgb` on a value
-// it has ALREADY premultiplied in gamma space, i.e. it composites
-// `linear(C*A)`, not `linear(C)*A`. The principled version — un-premultiply,
-// decode, re-premultiply — measured 60/255 off against egui's own
-// `rect_filled`; decoding the premultiplied value directly took the delta to
-// zero. Matching egui is the requirement.
+// The sRGB target. egui's `fs_main_linear_framebuffer` calls
+// `linear_from_gamma_rgb` on a value it has ALREADY premultiplied in gamma space,
+// so it composites `linear(C*A)`, not `linear(C)*A`. The principled version
+// measured 60/255 off against egui's own `rect_filled`; decoding the
+// premultiplied value directly took the delta to zero.
 @fragment
 fn fs_blit_linear_framebuffer(in: BlitVertex) -> @location(0) vec4<f32> {
     let premultiplied_gamma = textureSampleLevel(blit_texture, blit_sampler, in.uv, 0.0);
