@@ -153,7 +153,7 @@ impl SectionAxes {
     /// The height, km MSL, of the centre of row `row`.
     ///
     /// **Row 0 is the top.** Extrapolates outside `0..SECTION_HEIGHT` rather
-/// than clamping.
+    /// than clamping.
     pub fn row_height_km_msl(&self, row: usize) -> f64 {
         self.top_km_msl
             - (row as f64 + 0.5) * (self.top_km_msl - self.base_km_msl) / SECTION_HEIGHT as f64
@@ -186,7 +186,7 @@ pub struct CrossSection {
     /// the cut order the sampler resolved them in.
     tilt_elevations_deg: Vec<f64>,
     /// When each of those rungs was flown, milliseconds since the Unix epoch,
-/// in the same order.
+    /// in the same order.
     tilt_collected_ms: Vec<i64>,
 }
 
@@ -270,7 +270,7 @@ impl CrossSection {
     /// A `&mut [u8]` and not a `&mut Vec<u8>`, which is the whole of the
     /// safety: the length is what [`from_parts`](Self::from_parts) validated
     /// and what every consumer's `ColorImage` assertion stands on, and a slice
-/// cannot change it.
+    /// cannot change it.
     pub fn image_mut(&mut self) -> &mut [u8] {
         &mut self.image
     }
@@ -369,11 +369,11 @@ pub fn render_section<'a>(
     let volume = volume.into();
     // The derivation seam: native moments pass through as a borrow; derived
     // products are computed here, per sweep, before anything samples — so a
-// raw volume can never be sampled under a derived label.
+    // raw volume can never be sampled under a derived label.
     let prepared = crate::derive::prepare(volume, req.product, motion, lat, lon)?;
     // The declared Nyquist table follows the scan through the derivation: it
     // is keyed by elevation number, which `prepare` preserves, and a derived
-// scan's rungs are the same cuts flown at the same PRFs.
+    // scan's rungs are the same cuts flown at the same PRFs.
     let declared = volume.declared_nyquist();
     let sampler = match &prepared {
         crate::derive::Prepared::Native(scan) => {
@@ -439,7 +439,7 @@ fn render_with_sampler(
         .unwrap_or(base_km_msl + DEFAULT_AXIS_HEIGHT_KM);
     // Finiteness is tested separately from the ordering, because `inf` passes
     // the ordering: an infinite top is "above" the site and would give every
-// row an infinite height, a `NaN` step and a raster of `NoCoverage`.
+    // row an infinite height, a `NaN` step and a raster of `NoCoverage`.
     if !top_km_msl.is_finite() || top_km_msl <= base_km_msl {
         log::warn!(
             "cross-section refused: a top of {top_km_msl} km MSL is not a \
@@ -541,7 +541,7 @@ fn checkout() -> SectionPlanes {
     // Bound to a `let`, and deliberately not written as
     // `pool().take().unwrap_or_else(..)`: in that shape the temporary guard
     // lives to the end of the statement and holds the pool lock across the
-// fallback allocation below.
+    // fallback allocation below.
     let taken = pool().take();
     let mut planes = taken.unwrap_or_else(SectionPlanes::empty);
     planes.fit();
@@ -576,9 +576,9 @@ impl Drop for CrossSection {
 
 /// One output column's ground range and the tilt ladder over it.
 struct ColumnAt {
-/// Ground range from the site, km.
+    /// Ground range from the site, km.
     ground_range_km: f64,
-/// The ladder, or an empty one for a blind column.
+    /// The ladder, or an empty one for a blind column.
     column: Column,
 }
 

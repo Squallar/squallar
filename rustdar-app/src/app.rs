@@ -59,7 +59,6 @@ fn backends_for(web: bool, base: wgpu::InstanceDescriptor) -> wgpu::InstanceDesc
     }
 }
 
-
 /// Request a redraw if a window handle is available.
 pub(crate) fn notify_redraw(window: &Option<WindowRef>) {
     if let Some(w) = window {
@@ -1642,8 +1641,6 @@ impl App {
             }
         }
     }
-
-
 
     /// Set a receiver for compass heading updates (Android only).
     pub fn set_heading_receiver(&mut self, receiver: std::sync::mpsc::Receiver<f32>) {

@@ -269,8 +269,8 @@ mod tests {
             assert!(rows.closed);
             assert_eq!(rows.step_deg, 360.0 / n as f64);
             for i in 0..n {
-               // ±11 is the widest reach any consumer here has: the width-4
-               // NROT bank kernel's tap list.
+                // ±11 is the widest reach any consumer here has: the width-4
+                // NROT bank kernel's tap list.
                 for d in -11i32..=11 {
                     assert_eq!(
                         rows.neighbour(i, d),

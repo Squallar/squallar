@@ -8,9 +8,9 @@ use rustdar_source::id::known;
 use rustdar_source::job::{DescribedJob, JobCodec};
 use rustdar_units::UserPreferences;
 
-use crate::fetch_policy::{FetchError, FetchHealth, FetchRetry};
 #[cfg(test)]
 use crate::fetch_policy::{Assembled, Whole};
+use crate::fetch_policy::{FetchError, FetchHealth, FetchRetry};
 use crate::render::controls::{
     ControlEffect, ControlItem, ControlUpdate, PaneControlContext, PaneControlContextMut,
 };

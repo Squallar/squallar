@@ -23,7 +23,6 @@ fn records() -> Vec<IdxRecord> {
     parse_idx(SAMPLE_IDX)
 }
 
-
 #[test]
 fn an_idx_line_splits_into_number_offset_var_and_level() {
     let r = records();
@@ -51,7 +50,6 @@ fn a_blank_or_malformed_idx_line_is_skipped_not_fatal() {
     let mixed = format!("nonsense\n{}", SAMPLE_IDX.lines().next().unwrap());
     assert_eq!(parse_idx(&mixed).len(), 1);
 }
-
 
 #[test]
 fn a_byte_range_ends_one_byte_before_the_next_record() {
@@ -117,7 +115,6 @@ fn an_unmatched_variable_or_level_yields_no_range() {
     assert_eq!(byte_range(&r, "NOSUCH", "surface"), None);
     assert_eq!(byte_range(&r, "CIN", "Surface"), None, "matching is exact");
 }
-
 
 /// There is no rule to infer: HRRR orders layer bounds inconsistently between
 /// fields — `HLCY:3000-0` and `MXUPHL:5000-2000` put the top first,
@@ -212,7 +209,6 @@ fn no_two_parameters_select_the_same_index_record() {
     }
 }
 
-
 /// f00 `MXUPHL` is a `0-0 day max fcst` — a maximum over a zero-length
 /// window, which is identically 0.0 everywhere.
 #[test]
@@ -276,7 +272,6 @@ fn a_grid_point_count_must_match_what_section_three_declares() {
         "a grid one point long must be refused too",
     );
 }
-
 
 /// 3 x 2 = 6 points, which keeps the whole message to 188 bytes — a real
 /// HRRR record is ~1 MB, far too large to commit.
@@ -526,7 +521,6 @@ fn the_object_key_carries_the_parameters_forecast_hour() {
     assert!(key(ModelParameter::MaxUH0to2km).contains("wrfsfcf01.grib2"));
     assert!(key(ModelParameter::SurfaceBasedCin).contains("wrfsfcf00.grib2"));
 }
-
 
 /// The invariant the whole selection rests on, and a property of NCEP's index
 /// rather than of rustdar's code: [`byte_range`] takes the first `(var, level)`
@@ -829,7 +823,6 @@ fn a_two_run_round_is_refused_only_when_both_runs_were() {
         );
     }
 }
-
 
 /// The operational domain passes, and passes with room to spare: a refusal that
 /// refuses everything is not a guard, it is an outage.

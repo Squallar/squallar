@@ -17,7 +17,6 @@ fn init_is_idempotent() {
     assert!(super::default_is_ring());
 }
 
-
 /// Poll to completion *only if* the future never yields. `None` means it
 /// waited on something, which for reqwest means it opened a socket.
 fn poll_ready<F: Future>(fut: F) -> Option<F::Output> {
@@ -306,7 +305,6 @@ fn run_probe(name: &str) {
 fn client_installs_provider_in_a_fresh_process() {
     run_probe("tls::tests::probe_client_installs_ring");
 }
-
 
 /// Fails if the `init()` call is removed from [`super::client`].
 #[test]

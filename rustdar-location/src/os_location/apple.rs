@@ -121,6 +121,7 @@ mod corelocation {
     use std::rc::Rc;
     use std::sync::mpsc::Sender;
 
+    use crate::{Fix, LocationPermission};
     use objc2::rc::Retained;
     use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
     use objc2::{DefinedClass, MainThreadOnly, define_class};
@@ -128,10 +129,9 @@ mod corelocation {
         CLAuthorizationStatus, CLError, CLLocation, CLLocationManager, CLLocationManagerDelegate,
         kCLErrorDomain, kCLLocationAccuracyBest,
     };
-    use objc2_foundation::{MainThreadMarker, NSArray, NSError};
-    use crate::{Fix, LocationPermission};
     #[cfg(target_os = "macos")]
     use objc2_foundation::NSBundle;
+    use objc2_foundation::{MainThreadMarker, NSArray, NSError};
 
     use super::super::{OsLocationProvider, OsLocationSink, RedrawWake, ReportPermission};
 

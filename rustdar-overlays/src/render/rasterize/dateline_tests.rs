@@ -25,7 +25,6 @@
 use super::*;
 use crate::types::HatchPattern;
 
-
 /// `AKZ791` "Shemya and Attu Islands", largest ring, 41 vertices,
 /// lon 178.6194..179.4558 — **east** of the antimeridian.
 #[rustfmt::skip]
@@ -62,7 +61,6 @@ const AKZ787: [(f64, f64); 41] = [
 ];
 
 const TEX: u32 = 512;
-
 
 fn feature(ring: &[(f64, f64)]) -> OverlayFeature {
     OverlayFeature::new(
@@ -116,7 +114,6 @@ fn draw(features: &[OverlayFeature], b: &GeoBounds) -> Vec<u8> {
     )
     .rgba
 }
-
 
 /// The defect, on the two real zones either side of the seam. A view of
 /// 165E..165W arrives as `-195..-165`; `AKZ787` is already written in that frame
@@ -236,7 +233,6 @@ fn a_polygon_across_the_western_edge_is_clipped_not_torn() {
     );
 }
 
-
 /// Real stations, in a real view that spans the seam. `140..200` is 140E..160W;
 /// `PGUA` is the control, `PAEC` and `PABC` are written at -165.30 and -161.88.
 #[test]
@@ -310,7 +306,6 @@ fn a_station_just_west_of_the_texture_keeps_its_slack() {
          and must still paint its label; got {n} px"
     );
 }
-
 
 #[test]
 fn a_datum_already_in_frame_is_not_moved() {

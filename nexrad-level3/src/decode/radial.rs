@@ -277,7 +277,6 @@ pub(crate) fn decode_generic_radial_packet(
     ))
 }
 
-
 fn read_xdr_f32(data: &[u8], offset: usize) -> Result<f32> {
     let bits = read_u32(data, offset)?;
     Ok(f32::from_bits(bits))

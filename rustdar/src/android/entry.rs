@@ -172,7 +172,6 @@ fn android_main(app: AndroidApp) {
     // NativeActivity never emits WindowEvent::ThemeChanged, so the bridge polls.
     platform_app.set_theme_detector(detect_dark_theme);
 
-
     // The compass thread asks for the frame its value will be read on through a
     // handle that is *empty right now* — no window until the first `resumed()`.
 

@@ -141,8 +141,8 @@ impl LocationProvider for OsBackend {
                 report_waker();
             }),
         });
-            // An open receiver with nothing pushing would make `poll_fix` drain
-            // a channel forever.
+        // An open receiver with nothing pushing would make `poll_fix` drain
+        // a channel forever.
         self.fixes = self.provider.is_some().then_some(receiver);
         self.wake = Some(wake);
     }

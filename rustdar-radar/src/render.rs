@@ -230,7 +230,7 @@ impl RadialContext {
 /// the parallel result *is* the sequential result, not merely a stable one.
 struct RenderBuffers {
     /// Borrowed from [`POOLED_CELLS`] for the length of one render and handed
-/// back by [`Self::into_output`].
+    /// back by [`Self::into_output`].
     cells: Vec<AtomicU64>,
     /// The gates themselves, at the resolution the radar measured them,
     /// recorded as [`MercatorProjection::render_gate`] paints them.
@@ -280,7 +280,7 @@ fn checkout_image(len: usize) -> Vec<u8> {
     // Bound to a `let`, and deliberately **not** written as the scrutinee of
     // the `match` below. A guard produced inside a scrutinee temporary lives to
     // the end of the whole `match`, so `match image_pool().take() { .. }` would
-// hold the pool lock across the fallback allocation and the zero-fill.
+    // hold the pool lock across the fallback allocation and the zero-fill.
     let taken = image_pool().take();
     match taken {
         Some(mut image) => {
@@ -294,7 +294,7 @@ fn checkout_image(len: usize) -> Vec<u8> {
 
 /// An empty value grid with the pool's capacity if it has one.
 fn checkout_values() -> Vec<f32> {
-// See [`checkout_image`] for why this is a `let` and not a receiver.
+    // See [`checkout_image`] for why this is a `let` and not a receiver.
     let taken = values_pool().take();
     let mut values = taken.unwrap_or_default();
     values.clear();
@@ -344,18 +344,18 @@ impl RenderBuffers {
     ///
     /// The pool's invariant is that every cell it holds is [`Self::EMPTY`].
     /// [`Self::into_output`] is the only path that puts a buffer back and it
-/// establishes that.
+    /// establishes that.
     fn checkout(n: usize) -> Vec<AtomicU64> {
         // Bound to a `let`, and deliberately **not** written as the `match`
         // scrutinee. A guard produced in a scrutinee lives to the end of the
         // match, so `match Self::pool().take()` would hold the pool lock across
-// the fallback allocation below.
+        // the fallback allocation below.
         let pooled = Self::pool().take();
         match pooled {
             // Carried buffers are kept only while they are near the size being
             // asked for. `resize_with` never returns capacity, so a slot that
             // once held the largest raster this device allows would hold that
-// allocation for the life of the process.
+            // allocation for the life of the process.
             Some(cells) if cells.len() <= n.saturating_mul(CELL_POOL_REUSE_FACTOR) => {
                 let mut cells = cells;
                 cells.resize_with(n, || AtomicU64::new(Self::EMPTY));
@@ -378,7 +378,7 @@ impl RenderBuffers {
     ///
     /// **What the lock covers is one `Option::take` in [`Self::checkout`] and
     /// one `is_none` plus a move-assign in [`Self::recycle`], and nothing
-/// else.**
+    /// else.**
     fn pool() -> std::sync::MutexGuard<'static, Option<Vec<AtomicU64>>> {
         POOLED_CELLS
             .lock()
@@ -413,7 +413,7 @@ impl RenderBuffers {
     ///
     /// A carried buffer has to go back to the pool [`Self::EMPTY`] everywhere,
     /// or the next render inherits whatever pixels this one painted that it
-/// does not.
+    /// does not.
     fn into_output(self, extent_km: f64) -> SweepRender {
         let Self {
             mut cells,
@@ -484,7 +484,7 @@ pub struct SweepRender {
     pub polar: polar::PolarField,
     /// Where the rendered sweep's cut declared its velocity folds, m/s.
     ///
-/// A property of the **sweep**, not of the product drawn from it.
+    /// A property of the **sweep**, not of the product drawn from it.
     pub nyquist_ms: Option<f64>,
     /// Which melting layer the hybrid hydrometeor classification was computed
     /// against, or `None` for every other product — nothing else has one.
@@ -1149,7 +1149,7 @@ pub fn render_radar_to_image_full_sized(
 
     // The owner and not just its radials: the declared Nyquist table is keyed
     // by the RDA's `elevation_number`, and a `Sweep` is where that number is
-// authoritative.
+    // authoritative.
     let owner = find_sweep_owner(data, product, elevation_angle)?;
     let radials = owner.radials();
     let nyquist_ms = declared_nyquist.get(owner.elevation_number());
@@ -1186,7 +1186,7 @@ pub fn render_radar_to_image_full_sized(
     .unwrap_or(1.0);
     // Slant out of `compute_max_range`, ground into the projection: how far
     // the *data* goes is a property of the sweep, how wide the *picture* is
-// has to be the ground it covers.
+    // has to be the ground it covers.
     let sweep_elevation = sweep_elevation_deg_or_flat(radials);
     let slant_reach_km = compute_max_range(radials, product);
     let cos_e = sweep_ground_factor(slant_reach_km, sweep_elevation);
@@ -1241,7 +1241,7 @@ pub fn render_radar_to_image_full_sized(
                             |slant_km| crate::beam::ground_range_km(slant_km, sweep_elevation),
                         );
                         // `iter`, not `values`: the latter is `iter().collect()`
-// and this walk is strictly sequential.
+                        // and this walk is strictly sequential.
                         for ((gate_idx, moment_value), span) in moment.iter().enumerate().zip(edges)
                         {
                             // The gate's **inner** edge, because a gate that
@@ -1296,7 +1296,7 @@ fn render_nrot_to_image(
     // The physics keeps the first radial's angle. It is the same number the
     // shear normalization has always divided by, and the two are not
     // interchangeable: `sweep_ground_factor`'s median is where the sweep is
-// *drawn*, this is what the sweep was *computed* at.
+    // *drawn*, this is what the sweep was *computed* at.
     let elevation_deg = radials
         .first()
         .map(|r| r.elevation_angle_degrees() as f64)
@@ -1393,7 +1393,7 @@ fn render_srv_to_image(
         .unwrap_or(0.5);
     let profile = crate::velocity::volume_wind_profile(scan);
     // The RPG's vector inside `motion` is already paired to this volume by the
-// caller — see `render_dispatch::rpg_storm_motion_for`.
+    // caller — see `render_dispatch::rpg_storm_motion_for`.
     let motion = motion.resolve(profile.as_ref())?;
     log::info!(
         "SRV {elevation_deg:.1}°: {:.1} kt from {:.1}° ({:?})",
@@ -1687,7 +1687,7 @@ pub fn render_hhc_to_image(
     };
     // The object's own decoder, not a second description of the product. A
     // decode failure is not fatal here: it drops this rung of
-// `resolve_melting_layer`'s chain and the next one answers.
+    // `resolve_melting_layer`'s chain and the next one answers.
     let rpg_layer = melting_layer_product.and_then(|bytes| {
         match nexrad_level3::decode::decode_product(bytes) {
             Ok(message) => Some(message),

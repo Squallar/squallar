@@ -231,11 +231,11 @@ impl LoopPool {
     /// Divide the pool among the loops that want one.
     pub fn plan(&self, model: LoopFrameModel, demand: LoopDemand) -> LoopAllocation {
         let share_bytes = self.bytes / demand.shares().max(1);
-            // `render_budget` could be edited below the minimum, and `clamp`
-            // panics on a crossed pair; the floor wins.
+        // `render_budget` could be edited below the minimum, and `clamp`
+        // panics on a crossed pair; the floor wins.
         let cap = model.render_budget.max(MIN_LOOP_FRAMES_PER_PANE);
-            // A frame that costs nothing is a model built wrong; the cap
-            // cannot then divide by zero and cannot become an unbounded loop.
+        // A frame that costs nothing is a model built wrong; the cap
+        // cannot then divide by zero and cannot become an unbounded loop.
         let frames = |budget: usize, cost: usize| {
             budget
                 .checked_div(cost)

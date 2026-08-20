@@ -237,7 +237,6 @@ pub trait PlatformBridge {
     /// `JavaVM`; both stay in the `rustdar` crate's cfg(android) modules because
     /// this crate must compile for targets that have never heard of JNI.
     fn set_theme_detector(&mut self, _detector: fn() -> bool) {}
-
 }
 
 #[cfg(test)]
@@ -354,7 +353,7 @@ mod tests {
         assert_eq!(drain_latest(&rx), None);
     }
 
-        // wasm32 has no threads, so the definition is absent there.
+    // wasm32 has no threads, so the definition is absent there.
     #[cfg(not(target_arch = "wasm32"))]
     mod poller {
         use super::super::{RedrawWaker, spawn_state_poller};

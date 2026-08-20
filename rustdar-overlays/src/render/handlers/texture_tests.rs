@@ -76,7 +76,6 @@ fn run_described(
     }
 }
 
-
 fn ring() -> Vec<(f64, f64)> {
     vec![
         (34.2, -98.8),
@@ -312,7 +311,6 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
     true
 }
 
-
 fn drawn(rgba: &[u8]) -> Vec<[u8; 4]> {
     rgba.chunks_exact(4)
         .filter(|p| p[3] > 0)
@@ -519,7 +517,6 @@ fn every_fixture_draws_pixels_the_two_conventions_disagree_about() {
     );
 }
 
-
 /// **The permanent-wakeup guard.** For every texture handler,
 /// `has_data() == prepare_job().is_some()`.
 ///
@@ -628,7 +625,6 @@ fn an_outlook_day_with_no_ticked_products_has_no_data_to_draw() {
          ask for another frame 100 ms later, for as long as the app is open",
     );
 }
-
 
 /// Whether `id` resolves clicks through a hit map, and therefore must answer
 /// [`OverlayHandler::hit_items`] exactly when it answers `prepare_job`.
@@ -781,7 +777,6 @@ fn a_hit_map_kinds_items_align_with_its_described_rows() {
     }
     assert_eq!(checked, 2, "both hit-map kinds must be walked seeded");
 }
-
 
 /// **The registry pairing gate, bidirectional.** Every texture handler that
 /// rasterizes through the job boundary owns exactly one row of

@@ -500,7 +500,6 @@ fn escape_with_nothing_open_still_exits() {
     );
 }
 
-
 /// An `App` with no GPU behind it, wired the way `App::new` wires one.
 pub(super) fn headless(mut platform: TestBridge) -> App {
     crate::test_sites::install();
@@ -951,7 +950,6 @@ fn turning_location_off_stops_the_stream_and_clears_the_dot() {
     assert!(app.gui.gps_fix().is_none(), "the dot outlived the stream");
     assert!(!app.gui.location_active(), "the pane still reads 'On.'");
 }
-
 
 /// How many times `waker` has fired since this was called.
 fn count_wakes(waker: &RedrawWaker) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
@@ -2316,7 +2314,6 @@ fn starting_gps_hands_the_bridge_the_config_the_action_carried() {
         "the reader kept the serial port open after being told to stop",
     );
 }
-
 
 /// The classification the loop acts on: zero-delay requests (animations) repaint
 /// immediately, timed ones (cursor blink) schedule a wake, and egui's `Duration::MAX` idle

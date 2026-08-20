@@ -35,11 +35,11 @@ pub struct SitePositions {
 }
 
 impl SitePositions {
-/// Read what is remembered, or start with nothing.
-///
-/// Called before the first volume is decoded, which is the ordering the
-/// 1:1-on-reopen rule needs: a learned position may only be applied before a
-/// pane's first paint. An unreadable blob is logged and dropped.
+    /// Read what is remembered, or start with nothing.
+    ///
+    /// Called before the first volume is decoded, which is the ordering the
+    /// 1:1-on-reopen rule needs: a learned position may only be applied before a
+    /// pane's first paint. An unreadable blob is logged and dropped.
     pub fn load(store: Option<&dyn KvStore>) -> Self {
         let Some(raw) = store.and_then(|store| store.load(SITE_POSITIONS_KEY)) else {
             return Self::default();
@@ -67,27 +67,27 @@ impl SitePositions {
         self.known.is_empty()
     }
 
-/// Every remembered site, as `(ICAO, position)`.
+    /// Every remembered site, as `(ICAO, position)`.
     pub fn iter(&self) -> impl Iterator<Item = (&str, SitePosition)> {
         self.known
             .iter()
             .map(|(site, position)| (site.as_str(), *position))
     }
 
-/// The same entries, labelled with the authority they carry, for
-/// [`sites::resolve`](rustdar_radar::sites::resolve).
-///
-/// [`SiteFix::Learned`] because these came from a volume: they carry a Volume
-/// Data Block's two separately-reported heights, and outrank the network.
+    /// The same entries, labelled with the authority they carry, for
+    /// [`sites::resolve`](rustdar_radar::sites::resolve).
+    ///
+    /// [`SiteFix::Learned`] because these came from a volume: they carry a Volume
+    /// Data Block's two separately-reported heights, and outrank the network.
     pub fn fixes(&self) -> impl Iterator<Item = (&str, SiteFix)> {
         self.iter()
             .map(|(site, position)| (site, SiteFix::Learned(position)))
     }
 
-/// Remember what a volume just said, and write it out now.
-///
-/// Returns whether anything changed, which is also whether a write was
-/// attempted. A failed write is logged and dropped.
+    /// Remember what a volume just said, and write it out now.
+    ///
+    /// Returns whether anything changed, which is also whether a write was
+    /// attempted. A failed write is logged and dropped.
     pub fn learn(
         &mut self,
         store: Option<&dyn KvStore>,

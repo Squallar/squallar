@@ -181,7 +181,6 @@ pub(super) const FRAME_PUMP: &[DrainEntry] = &[
     },
 ];
 
-
 fn pump_poll_scan_results(app: &mut App, _ctx: Option<&egui::Context>) {
     app.poll_scan_results();
 }

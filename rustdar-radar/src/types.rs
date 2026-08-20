@@ -146,7 +146,7 @@ impl ImageBounds {
     /// On [`KM_PER_DEGREE_LAT`], which is [`rustdar_geo::EARTH_RADIUS_KM`]
     /// — the same
     /// sphere [`crate::render::render_gate`] paints the gates inside these
-/// bounds on.
+    /// bounds on.
     pub fn from_radar_site(radar_lat: f64, radar_lon: f64, extent_km: f64) -> Self {
         let radar_lat_rad = radar_lat.to_radians();
         let lat_deg_per_km = 1.0 / KM_PER_DEGREE_LAT;
@@ -205,7 +205,7 @@ pub struct ScanInfo {
     ///
     /// `None` for [`SitePositionSource::Table`] and
     /// [`SitePositionSource::Unknown`] — the table's rows are `f64` literals
-/// and there is nothing measured to remember. `Some` for the other two.
+    /// and there is nothing measured to remember. `Some` for the other two.
     pub site_position: Option<SitePosition>,
     /// From the **first** radial of the **first** sweep, not the request.
     pub timestamp: NaiveDateTime,
@@ -214,7 +214,7 @@ pub struct ScanInfo {
     pub available_products: Vec<RadarProduct>,
     /// Elevation angles per product, sorted ascending.
     ///
-/// **Accumulated by the UI, not a property of one volume.**
+    /// **Accumulated by the UI, not a property of one volume.**
     pub product_elevations: HashMap<RadarProduct, Vec<f32>>,
     pub status: String,
 }
@@ -232,7 +232,7 @@ fn confirmed_by_catalogue(site: &str, stated: &SitePosition) -> bool {
     if apart_km > CATALOGUE_DISAGREEMENT_LIMIT_KM {
         // Error, not warning. Every reachable cause is something somebody
         // needs to see: a corrupt Volume Data Block, a producer writing a
-// scale nothing here recognises, or a radar that genuinely relocated.
+        // scale nothing here recognises, or a radar that genuinely relocated.
         log::error!(
             "volume for {site} states ({:.5}, {:.5}), {apart_km:.1} km from where the \
              catalogue places it ({lat:.5}, {lon:.5}); keeping the catalogue's position",
@@ -248,21 +248,21 @@ impl ScanInfo {
     /// Level III products are listed with empty elevation vectors, filled in
     /// later as L3 data arrives.
     /// 1. **The volume in hand.** Every Message 31 volume states its own
-///    latitude, longitude and heights in its Volume Data Block.
+    ///    latitude, longitude and heights in its Volume Data Block.
     ///
     ///    **Within a kilometre of the fetched catalogue, and not otherwise.**
     ///    A radar reporting itself outranks a record about it by metres, which
-///    is the scale radars actually move at.
+    ///    is the scale radars actually move at.
     ///
     /// 2. **A position learned from an earlier volume**, supplied by the
-///    caller out of its own store.
+    ///    caller out of its own store.
     ///
     /// 3. **[`crate::sites::radars()`]**, whatever this process has resolved.
     ///    Still the answer for a pre-2010 `AR2V0001` volume, which is Message 1
-///    throughout and carries no Volume Data Block to read.
+    ///    throughout and carries no Volume Data Block to read.
     ///
     /// A site none of the three can place gets
-/// [`SitePositionSource::Unknown`] and a placeholder row.
+    /// [`SitePositionSource::Unknown`] and a placeholder row.
     pub fn from_scan(
         data: &Scan,
         site: &str,
@@ -285,7 +285,7 @@ impl ScanInfo {
 
         // A radar this process knows of and cannot place has no `row` and is
         // still not anonymous: the catalogue listed its identifier, and
-// `sites` leaked it.
+        // `sites` leaked it.
         let known_name = crate::sites::static_name(site);
         let radar_site = match (site_position, row) {
             (Some(position), Some(row)) => position.applied_to(Some(row)),
@@ -370,7 +370,7 @@ fn discover_product_elevations(scan: &Scan, site: &RadarSite) -> HashMap<RadarPr
             for product in RadarProduct::all() {
                 // The one product whose moment slot does not stand for the data
                 // it reads: reflectivity is where it *lists*, ΦDP and ρHV are
-// what it classifies from.
+                // what it classifies from.
                 if *product == RadarProduct::HydrometeorClassification && !volume_is_dual_pol {
                     continue;
                 }
@@ -411,7 +411,7 @@ fn discover_product_elevations(scan: &Scan, site: &RadarSite) -> HashMap<RadarPr
     // Level III objects are made by an RPG, and only the WSR-88D network has
     // one. A TDWR is served by the Supplemental Product Generator, which
     // publishes its own short list and none of the four objects
-// [`RadarProduct::level3_products`] names.
+    // [`RadarProduct::level3_products`] names.
     if site.is_wsr88d() {
         for l3_product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
             product_elevations.entry(*l3_product).or_default();
@@ -753,7 +753,7 @@ impl RadarProduct {
     /// [`crate::render::render_radar_to_image_full`] dispatches *before* it
     /// calls `find_sweep`: interpolated echo tops, the hail pair, and the
     /// hybrid classification. Each reduces the whole volume to one polar grid,
-/// and the `elevation_angle` argument reaches no line of any of them.
+    /// and the `elevation_angle` argument reaches no line of any of them.
     pub fn tilt_independent_plan_view(&self) -> bool {
         !self.is_level3() && crate::derive::volume_slot(*self).is_none()
     }
@@ -798,7 +798,7 @@ impl RadarProduct {
             RadarProduct::ProbabilityOfSevereHail => format!("POSH: {:.0}%", value),
             // The field computes in mm (`crate::hail`); the render seam
             // converts to inches, so the value arrives here in inches — the
-// unit US hail sizes are reported in.
+            // unit US hail sizes are reported in.
             RadarProduct::MaxExpectedHailSize => {
                 let converted = prefs.hail_size.convert_from_inches(value);
                 let decimals = prefs.hail_size.decimals();

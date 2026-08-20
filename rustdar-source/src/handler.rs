@@ -194,7 +194,6 @@ impl<T, S: RoundShape> OverlayState<T, S> {
         payload.downcast::<R>().ok().map(|round| *round)
     }
 
-
     /// End a fetch that did not produce data, filing it against the ladder.
     pub fn record_failure(&mut self, error: &FetchError) {
         self.fetching = false;
@@ -210,7 +209,6 @@ impl<T, S: RoundShape> OverlayState<T, S> {
     pub fn enable_should_refetch(&self, has_data: bool) -> bool {
         !self.fetching && (!has_data || self.retry.is_unhealthy() || self.retry.is_incomplete())
     }
-
 }
 
 /// How a layer gets onto the screen; dispatched on by the draw loop.
@@ -255,7 +253,6 @@ pub struct ClickableItem<'a> {
     pub item: Arc<dyn OverlayItem>,
 }
 
-
 /// Something a handler hands the UI, with a number that changes when it does,
 /// so a caller asking once per frame can decide **not to look**. Equal
 /// signature ⇒ equal `items`.
@@ -264,13 +261,11 @@ pub struct Signed<T> {
     pub items: T,
 }
 
-
 /// Adding a layer means: implement this, give it a [`known`](crate::id::known)
 /// const, append that spelling to
 /// [`LAYER_ID_LEDGER`](crate::id::LAYER_ID_LEDGER), and register it in the
 /// `sources()` of the crate that owns it.
 pub trait SourceHandler: Send {
-
     /// This layer's open-string identity — one of the
     /// [`known`](crate::id::known) consts, spelled as a **literal** in each
     /// impl. Every per-layer map is keyed by it, so it is bytes in the config.
@@ -289,7 +284,6 @@ pub trait SourceHandler: Send {
     fn default_enabled(&self) -> bool {
         false
     }
-
 
     /// Bumped on every data replacement; drives texture cache invalidation.
     fn data_generation(&self) -> u64;
@@ -364,14 +358,12 @@ pub trait SourceHandler: Send {
         None
     }
 
-
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
         let _ = ctx;
         Vec::new()
     }
 
     fn apply_fetch_result(&mut self, result: FetchPayload);
-
 
     /// This handler's raster as a described job, or `None` when there is nothing
     /// to render. `has_data()` must answer `false` exactly when this answers
@@ -394,7 +386,6 @@ pub trait SourceHandler: Send {
         None
     }
 
-
     /// The features a click is tested against, borrowed from this handler.
     /// Called **only on a frame that has a click to resolve**.
     fn clickable_items(&self) -> Vec<ClickableItem<'_>> {
@@ -414,7 +405,6 @@ pub trait SourceHandler: Send {
 
     /// Drops selections whose `matches()` finds nothing in the refreshed data.
     fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>);
-
 
     fn per_frame_points(&self) -> &[MapPoint] {
         &[]
@@ -440,7 +430,6 @@ pub trait SourceHandler: Send {
         None
     }
 
-
     fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
         Vec::new()
     }
@@ -454,12 +443,10 @@ pub trait SourceHandler: Send {
         ControlEffect::None
     }
 
-
     /// e.g. selected product, loop state. `None` if there is no per-pane state.
     fn create_pane_state(&self) -> Option<FetchPayload> {
         None
     }
-
 
     fn serialize_state(&self) -> serde_json::Value {
         serde_json::Value::Null
@@ -474,7 +461,6 @@ pub trait SourceHandler: Send {
     fn deserialize_pane_state(&self, _value: serde_json::Value) -> Option<FetchPayload> {
         None
     }
-
 
     fn supports_loop(&self) -> bool {
         false
@@ -541,7 +527,6 @@ pub struct FetchTask {
     pub kind: LayerId,
     pub future: TaskFuture,
 }
-
 
 pub struct PopupContent {
     pub title: String,

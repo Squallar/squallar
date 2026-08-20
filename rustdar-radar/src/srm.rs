@@ -117,9 +117,9 @@ const FIRST_DATA_GATE: u16 = 2;
 /// A storm-relative velocity field computed from a dealiased velocity product.
 #[derive(Debug, Clone)]
 pub struct DerivedSrm {
-/// Gate values are storm-relative knots through
-/// [`scale`](Self::scale)/[`offset`](Self::offset), in the same geometry as
-/// the source product.
+    /// Gate values are storm-relative knots through
+    /// [`scale`](Self::scale)/[`offset`](Self::offset), in the same geometry as
+    /// the source product.
     pub packet: RadialPacket,
     /// `knots = (gate - offset) / scale`.
     pub scale: f32,
@@ -127,8 +127,8 @@ pub struct DerivedSrm {
     pub offset: f32,
     /// From the source product's PDB, never from its AWIPS mnemonic.
     pub elevation_angle: f32,
-/// From the source product's PDB. Identifies the cut within the volume;
-/// split cuts and SAILS/MRLE repeats share an angle but not a number.
+    /// From the source product's PDB. Identifies the cut within the volume;
+    /// split cuts and SAILS/MRLE repeats share an angle but not a number.
     pub elevation_number: u16,
     /// The vector applied.
     pub motion: StormMotion,
@@ -153,8 +153,8 @@ pub enum MotionProvenance {
 }
 
 impl DerivedSrm {
-/// Whether the vector was fitted for this very volume — the accuracy
-/// signal, and `false` for an override, which has no volume to agree with.
+    /// Whether the vector was fitted for this very volume — the accuracy
+    /// signal, and `false` for an override, which has no volume to agree with.
     pub fn motion_volume_matches(&self) -> bool {
         self.motion_provenance == MotionProvenance::SameVolume
     }

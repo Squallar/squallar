@@ -849,10 +849,7 @@ fn lerp_color(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
 #[derive(Debug, Clone, PartialEq)]
 pub enum GridCoords {
     Lambert(lambert::LambertGrid),
-    Explicit {
-        lats: Vec<f64>,
-        lons: Vec<f64>,
-    },
+    Explicit { lats: Vec<f64>, lons: Vec<f64> },
 }
 
 impl GridCoords {
@@ -1144,7 +1141,6 @@ mod tests {
         keys.dedup();
         assert_eq!(keys.len(), total, "duplicate config key among {keys:?}");
     }
-
 
     fn explicit() -> GridCoords {
         GridCoords::Explicit {

@@ -60,7 +60,6 @@ pub fn point_in_polygon(point: ScreenPoint, vertices: &[ScreenPoint]) -> bool {
     inside
 }
 
-
 /// How far the tolerance may be tightened before a ring is kept unsimplified.
 ///
 /// Each step halves `epsilon`, so 16 takes 0.005° down to 7.6e-8° — about 8 mm.
