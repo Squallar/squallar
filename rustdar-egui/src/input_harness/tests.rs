@@ -14,7 +14,7 @@ const AFTER_DOUBLE_TAP_TIMEOUT: f64 = 0.5;
 const WATCH_PAST_LONG_PRESS: f64 = 30.0;
 
 /// 1. A single mouse click reports a click position at the clicked point and never
-/// suppresses panning.
+///    suppresses panning.
 #[test]
 fn mouse_single_click_reports_click_pos() {
     let mut h = InputHarness::new();
@@ -31,7 +31,7 @@ fn mouse_single_click_reports_click_pos() {
 }
 
 /// 2. A mouse double click reports a click on each release, and the touch pipeline
-/// defers instead of firing two overlay taps.
+///    defers instead of firing two overlay taps.
 #[test]
 fn mouse_double_click_reports_each_click() {
     let mut h = InputHarness::new();
@@ -49,7 +49,7 @@ fn mouse_double_click_reports_each_click() {
 }
 
 /// 3. Pressing and holding for ~1s without moving is a long press: it reports the
-/// held position and suppresses map panning, and it is not a click.
+///    held position and suppresses map panning, and it is not a click.
 #[test]
 fn press_and_hold_becomes_long_press() {
     let mut h = InputHarness::new();
@@ -130,7 +130,7 @@ fn a_moving_finger_never_becomes_a_long_press() {
 }
 
 /// 4. A touch tap is deferred until the double-tap window closes, then reported
-/// once at the tapped position.
+///    once at the tapped position.
 #[test]
 fn touch_tap_is_deferred_then_confirmed() {
     let mut h = InputHarness::new();
@@ -152,7 +152,7 @@ fn touch_tap_is_deferred_then_confirmed() {
 }
 
 /// 5. Tap, then press again and drag down: the map zooms, panning is suppressed for
-/// the whole drag, and no overlay tap is emitted.
+///    the whole drag, and no overlay tap is emitted.
 #[test]
 fn touch_double_tap_drag_zooms_and_suppresses_pan() {
     let mut h = InputHarness::new();
@@ -1733,7 +1733,7 @@ fn the_fold_annotation_returns_with_the_picture_rather_than_from_a_config() {
 }
 
 /// 53. A tap that lands on a floating dialog is filtered out by the dialog-blocking
-/// gate — for both the mouse and the touch path.
+///     gate — for both the mouse and the touch path.
 #[test]
 fn tap_on_floating_dialog_is_filtered_out() {
     let mut h = InputHarness::new();
@@ -1928,7 +1928,7 @@ fn the_same_drag_does_zoom_when_it_really_is_a_touch() {
 }
 
 /// 12. **A gesture interrupted by a modality change is abandoned, and stays
-/// abandoned when the modality comes back.**
+///     abandoned when the modality comes back.**
 #[test]
 fn a_touch_gesture_interrupted_by_a_mouse_does_not_resume_when_touch_returns() {
     let mut h = InputHarness::new();
@@ -2534,7 +2534,7 @@ fn a_menu_toggle_propagates_to_the_other_panes_when_sync_is_on() {
 }
 
 /// 76. **The menu carries the whole model at every width — the ☰ dropdown on the
-/// wide widths, the sheet's Menu page on the phone.**
+///     wide widths, the sheet's Menu page on the phone.**
 #[test]
 fn the_app_menu_dropdown_carries_the_whole_menu_at_every_width() {
     for (size, expected) in [
@@ -2745,7 +2745,7 @@ fn the_pane_picker_offers_fewer_panes_on_a_phone_than_on_a_desktop() {
 }
 
 /// 77. **The Layers toggle hides and restores the Expanded sidebar with its state
-/// intact.**
+///     intact.**
 #[test]
 fn the_layers_toggle_hides_and_restores_the_expanded_sidebar_with_its_state() {
     let mut h = InputHarness::with_screen(egui::vec2(1200.0, 500.0));
@@ -2819,7 +2819,7 @@ fn the_layers_toggle_hides_and_restores_the_expanded_sidebar_with_its_state() {
 }
 
 /// 78. **An explicit sidebar choice neither leaks into the drawer nor expires at
-/// the breakpoint.**
+///     the breakpoint.**
 #[test]
 fn an_explicit_sidebar_choice_survives_the_breakpoint_without_leaking() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -3316,7 +3316,7 @@ fn the_eye_toggles_a_layer_both_ways_and_it_sticks() {
 }
 
 /// 86. **The layer body carries no master toggle: the stack row's eye owns
-/// visibility.**
+///     visibility.**
 #[test]
 fn the_layer_body_carries_no_master_toggle() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -3388,8 +3388,8 @@ fn an_eye_toggle_loads_the_active_panes_config_before_saving_it() {
 }
 
 /// 88. **An eye toggle propagates over the layer-link fan-out mask — linked source
-/// to linked targets; an unlinked target is untouched; an unlinked source stays
-/// local.**
+///     to linked targets; an unlinked target is untouched; an unlinked source stays
+///     local.**
 #[test]
 fn an_eye_toggle_propagates_over_the_layer_link_mask() {
     let mut h = expanded_with_pane_1_active();
@@ -3545,7 +3545,7 @@ fn a_touch_drag_on_the_grip_lands_the_reorder() {
 }
 
 /// 68. **Dragging a row by its grip really reorders the draw order — permuted,
-/// persisted, redrawn.**
+///     persisted, redrawn.**
 #[test]
 fn dragging_a_row_by_its_grip_permutes_the_draw_order_and_it_persists() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -3644,7 +3644,7 @@ fn city_labels_dragged_above_the_color_scale_paint_after_it() {
 }
 
 /// 95. **The pane paints every enabled kind at its `draw_order` position, on one
-/// paint list.**
+///     paint list.**
 #[test]
 fn the_pane_paints_every_enabled_kind_in_draw_order_on_one_paint_list() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -3685,7 +3685,7 @@ fn the_pane_paints_every_enabled_kind_in_draw_order_on_one_paint_list() {
 }
 
 /// 89. **A stack row click selects that layer in the inspector, which opens
-/// itself.**
+///     itself.**
 #[test]
 fn a_stack_row_click_opens_that_layers_options_in_the_inspector() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -3728,7 +3728,7 @@ fn a_stack_row_click_opens_that_layers_options_in_the_inspector() {
 }
 
 /// 90. **The ⚙ toggle and the menu's Settings… entry both reach the settings
-/// body.**
+///     body.**
 #[test]
 fn the_inspector_toggle_and_the_settings_entry_reach_the_settings_body() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -3805,7 +3805,7 @@ fn the_control_pass_counter_counts_the_layer_body() {
 }
 
 /// 92. **The auto-poll chip's off state reads `⏸ Auto-poll off`, and its hover
-/// names the way back.**
+///     names the way back.**
 #[test]
 fn the_auto_poll_chip_pins_its_off_text_and_hover() {
     let mut h = InputHarness::new();
@@ -3919,7 +3919,7 @@ fn host_insets_move_the_breakpoint_through_the_real_ui() {
 }
 
 /// 25. **The hover readout follows the pointer, not the window width — and Compact
-/// has none at all (M9-17's revision).**
+///     has none at all (M9-17's revision).**
 #[test]
 fn the_hover_readout_follows_the_modality_not_the_width() {
     let mut narrow = InputHarness::with_screen(egui::vec2(500.0, 800.0));
@@ -4008,8 +4008,8 @@ fn a_compact_mouse_press_and_hold_raises_the_value_popup() {
 }
 
 /// 26. **The phone top bar carries the short scan text; the long form stays on the
-/// desktop status bar — and the Auto-poll toggle stays reachable through the menu
-/// everywhere.**
+///     desktop status bar — and the Auto-poll toggle stays reachable through the menu
+///     everywhere.**
 #[test]
 fn a_compact_status_bar_drops_the_long_summary_and_the_auto_poll_box() {
     let mut phone = InputHarness::with_screen(egui::vec2(420.0, 900.0));
@@ -4153,7 +4153,7 @@ fn a_looping_pane_reports_its_current_frames_time() {
 }
 
 /// 66. **Collapsing the transport leaves a restore chip at the map's bottom-right,
-/// and the chip restores it.**
+///     and the chip restores it.**
 #[test]
 fn collapsing_the_transport_leaves_a_chip_that_restores_it() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -5902,7 +5902,7 @@ fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
 }
 
 /// 45. **A pane with no ground does not keep the label-tile pyramid downloading —
-/// and a 3D pane's floor is ground.**
+///     and a 3D pane's floor is ground.**
 #[test]
 fn only_a_pane_with_ground_keeps_the_label_tiles_downloading() {
     fn tiles_remade_after_a_reset(h: &mut InputHarness) -> bool {
@@ -6019,7 +6019,7 @@ fn inspector_rect(h: &InputHarness) -> egui::Rect {
 }
 
 /// 49. **Every pane kind's Pane-properties body opens with the same identity
-/// line.**
+///     line.**
 #[test]
 fn every_pane_kinds_sidebar_opens_with_the_same_identity_line() {
     let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
@@ -6059,7 +6059,7 @@ fn every_pane_kinds_sidebar_opens_with_the_same_identity_line() {
 }
 
 /// 50. **The missing layer list is explained, in one line, for the one kind that is
-/// missing it — and for no other.**
+///     missing it — and for no other.**
 #[test]
 fn the_missing_layer_list_is_explained_for_the_kind_that_is_missing_it() {
     let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
@@ -6167,7 +6167,7 @@ fn a_3d_panes_layer_rows_are_the_layers_a_3d_pane_draws() {
 }
 
 /// 51. **A converted pane's own controls sit inside the Pane-properties body's
-/// shared structure, in its order.**
+///     shared structure, in its order.**
 #[test]
 fn kind_specific_blocks_sit_inside_the_shared_sidebar_structure() {
     /// The y-centre of the topmost painted run containing `needle`, inside the
@@ -6630,7 +6630,7 @@ fn an_armed_drag_on_a_map_becomes_a_cross_section_aimed_where_it_was_drawn() {
 }
 
 /// 56. **A rendered section's caption is calm by default, and the honesty detail is
-/// one click away — reachable, in the user's words, and closable again.**
+///     one click away — reachable, in the user's words, and closable again.**
 #[test]
 fn a_rendered_sections_caption_is_calm_and_its_detail_is_one_click_away() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -7562,7 +7562,7 @@ fn a_tap_while_armed_draws_nothing_and_leaves_the_mode_armed() {
 }
 
 /// 58. **While armed, a press on a map fires no overlay click and the map does not
-/// pan** — for every pane the frame resolves, not just the one the line is on.
+///     pan** — for every pane the frame resolves, not just the one the line is on.
 #[test]
 fn an_armed_press_suppresses_panning_and_fires_no_overlay_click() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -7829,7 +7829,7 @@ fn a_granted_permission_with_no_fix_yet_says_so() {
 }
 
 /// 69. **The site search narrows the list, highlights the current site, and a row
-/// click switches the pane's site.**
+///     click switches the pane's site.**
 #[test]
 fn the_site_search_narrows_the_list_and_a_row_click_switches_the_site() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -7931,8 +7931,8 @@ fn a_site_list_still_short_of_the_network_states_no_total() {
 }
 
 /// 70. **An unlinked pane is excluded from shared time — the loop fan-out and the
-/// sync pass's time pair — and the Pane-properties sync section mirrors the
-/// popover: the same five rows, its time checkbox reflecting and toggling.**
+///     sync pass's time pair — and the Pane-properties sync section mirrors the
+///     popover: the same five rows, its time checkbox reflecting and toggling.**
 #[test]
 fn an_unlinked_pane_is_excluded_from_shared_nav_and_loop_fan_out() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -9432,7 +9432,7 @@ impl rustdar_overlays::render::overlay_state::OverlayItem for SheetStubFeature {
 }
 
 /// 64. **A bar item tap switches to its page; the shown page's item closes the
-/// sheet whole.**
+///     sheet whole.**
 #[test]
 fn a_bar_item_switches_pages_and_the_shown_pages_item_closes_the_sheet() {
     let mut h = phone();
@@ -9687,7 +9687,7 @@ fn the_live_chip_never_intersects_the_bar_items() {
 }
 
 /// 71. **Dialogs are modals at ≥600pt and sheet pages below it — the phone never
-/// draws a modal.**
+///     draws a modal.**
 #[test]
 fn dialogs_are_modals_on_wide_screens_and_sheet_pages_on_the_phone() {
     let mut desk = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -9774,7 +9774,7 @@ fn dialogs_are_modals_on_wide_screens_and_sheet_pages_on_the_phone() {
 }
 
 /// 75. **The phone top bar shares the status bar's collapse state: collapsed, only
-/// the wordmark and the restore button remain.**
+///     the wordmark and the restore button remain.**
 #[test]
 fn the_phone_top_bar_shares_the_status_collapse_state() {
     let mut h = phone();
@@ -10169,7 +10169,7 @@ fn chrome_on_screen(h: &InputHarness) -> bool {
 }
 
 /// 60. **A qualifying tap fades all the floating chrome; the second restores it; a
-/// drag, a consumed click and an armed tool do not fade.**
+///     drag, a consumed click and an armed tool do not fade.**
 #[test]
 fn a_qualifying_tap_fades_the_chrome_and_the_second_restores_it() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -10290,7 +10290,7 @@ fn a_qualifying_tap_fades_the_phone_cluster_and_the_second_restores_it() {
 }
 
 /// 61. **Fading closes the panels and the sheet for real — state, not paint — and
-/// unfading reopens nothing.**
+///     unfading reopens nothing.**
 #[test]
 fn fading_closes_the_panels_for_real_and_unfading_reopens_nothing() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -10404,7 +10404,7 @@ fn the_fade_closes_the_volume_alpha_editor_for_real() {
 }
 
 /// 62. **A top-bar interaction while faded unfades first, then performs — nothing
-/// opens invisibly.**
+///     opens invisibly.**
 #[test]
 fn a_top_bar_interaction_while_faded_unfades_and_performs() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -10478,7 +10478,7 @@ fn a_keyboard_activation_while_faded_unfades_and_the_surface_stays() {
 }
 
 /// 63. **The top bar stays present and interactive while faded — the docked
-/// exception to §1.8's "fade all chrome".**
+///     exception to §1.8's "fade all chrome".**
 #[test]
 fn the_top_bar_stays_present_and_interactive_while_faded() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -10510,7 +10510,7 @@ fn the_top_bar_stays_present_and_interactive_while_faded() {
 }
 
 /// 65. **The full Esc/back order, fade included: fade → catalog → feature → time →
-/// inspector → drawer → armed drag, one layer per press.**
+///     inspector → drawer → armed drag, one layer per press.**
 #[test]
 fn a_back_press_walks_the_full_wide_chain_in_order() {
     let mut h = InputHarness::with_screen(egui::vec2(800.0, 1200.0));

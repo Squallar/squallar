@@ -194,17 +194,8 @@ pub const LOOP_POOL_DWELL_FRAMES: u32 = 15;
 /// frame list must *equal* its resident set — re-entering a window costs ~89 ms
 /// of resample against a 200 ms interval at [`DEFAULT_LOOP_SPEED_FPS`].
 /// At the floor the share buys 11 / 17 / 14 frames (wasm / mobile / desktop),
-/// leaving room for one live grid beside the loop.
-///
-/// `loop_pool`'s `the_loop_budget_table_is_the_one_the_constants_derive` scrapes
-/// this table and compares the cells as **strings**, so the `{:.3}` / `{:.2}`
-/// decimals are load-bearing and the three rows must stay in this order.
-///
-/// | target  | frames | 3D texture | resident  | headroom | share   |
-/// |---------|-------:|-----------:|----------:|---------:|--------:|
-/// | wasm32  |     11 |  4.598 MiB |  50.57 MiB |  5.43 MiB |  56 MiB |
-/// | mobile  |     17 | 15.550 MiB | 264.35 MiB | 23.65 MiB | 288 MiB |
-/// | desktop |     14 | 36.598 MiB | 512.37 MiB | 63.63 MiB | 576 MiB |
+/// leaving room for one live grid beside the loop. `loop_pool`'s
+/// `the_loop_budget_is_what_the_constants_derive` pins the derived figures.
 pub const VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = LOOP_POOL_FLOOR_BYTES;
 pub const WASM_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = WASM_LOOP_POOL_FLOOR_BYTES;
 pub const MOBILE_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = MOBILE_LOOP_POOL_FLOOR_BYTES;

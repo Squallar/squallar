@@ -167,15 +167,7 @@ fn a_decimated_loop_admits_it_is_showing_a_sample() {
 }
 
 /// **The measured defect: a third of the scans dropped, and the caption said "every
-/// scan".**
-///
-/// `loop_dispatch_tests::the_caption_fixtures_name_caps_this_workspace_ships`
-/// scrapes this table, so the rows and the `held` column are load-bearing.
-///
-/// | target | listing | held | dropped |
-/// |---|---|---|---|
-/// | browser | 20 scans, 1h 22m | 14 | 6, **30.0%** |
-/// | desktop | 89 scans, 6h 20m | 60 | 29, **32.6%** |
+/// scan".** Browser: 20 scans held at 14. Desktop: 89 held at 60.
 #[test]
 fn a_loop_that_dropped_a_third_of_the_scans_never_claims_every_scan() {
     for (listing_scans, held, dropped_pct) in [(20usize, 14usize, 30.0), (89, 60, 32.6)] {
