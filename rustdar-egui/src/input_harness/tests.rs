@@ -8320,29 +8320,41 @@ fn a_back_press_closes_the_catalog_first() {
 /// side moves the other, because there is only one thing to move.
 #[test]
 fn the_data_and_live_rows_share_state_with_the_menu_toggles() {
+    /// How far inside the inspector's own edges the label has to sit before
+    /// the click is the user's click: the body's scroll area is inset from
+    /// the panel and its clip ends short of the panel's bottom.
+    const CHROME_EDGE_CLEARANCE: f32 = 24.0;
+
     fn radar_auto_poll(h: &mut InputHarness) -> bool {
         let json = h.gui_mut().ui_config_json().expect("serialises");
         let value: serde_json::Value = serde_json::from_str(&json).expect("parses");
-        value["auto_poll"].as_bool().expect("a bool")
+        value["overlay_states"]["Radar"]["auto_poll"]
+            .as_bool()
+            .expect("a bool")
     }
 
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.open_settings();
     assert!(radar_auto_poll(&mut h), "precondition: auto-poll starts on");
 
-    let scroll_pos = h.inspector_rect().expect("the inspector is open").center();
-    let found = h.scroll_until(scroll_pos, egui::vec2(0.0, -160.0), 120, |h| {
-        h.settings_row("data.auto_poll")
-            .is_some_and(|row| h.screen_rect().contains(row.rect.center()))
-    });
-    assert!(found, "the auto-poll row never scrolled on screen");
-    h.frames_for(10, 0.05);
-    let found = h.scroll_until(scroll_pos, egui::vec2(0.0, -40.0), 40, |h| {
-        h.painted_text_rects()
-            .iter()
-            .any(|(_, text)| text == "Auto-poll")
-    });
-    assert!(found, "the Auto-poll checkbox never became visible");
+    let inspector = h.inspector_rect().expect("the inspector is open");
+    let scroll_pos = inspector.center();
+    // **Scrolled until the label is where a user could hit it**, not merely
+    // until it is somewhere on the screen: the inspector's body is a scroll
+    // area with its own clip, and a row painted past its bottom edge is drawn
+    // but not clickable. Asking for the label *inside the inspector's own
+    // rect, clear of its edges* is what makes the click below the user's
+    // click rather than a coordinate that happens to work at one row count.
+    let visible = |h: &InputHarness| {
+        h.painted_text_rects().iter().any(|(rect, text)| {
+            text == "Auto-poll"
+                && inspector
+                    .shrink(CHROME_EDGE_CLEARANCE)
+                    .contains(rect.center())
+        })
+    };
+    let found = h.scroll_until(scroll_pos, egui::vec2(0.0, -60.0), 200, visible);
+    assert!(found, "the Auto-poll checkbox never became clickable");
     h.frames_for(10, 0.05);
     let label = h
         .painted_text_rects()
@@ -12934,4 +12946,168 @@ fn no_storm_motion_rung_apologises_over_the_radar() {
             }
         }
     }
+}
+
+// ── WO-E8b: the chunk feed's switches, in the radar layer's own body ──────
+
+/// Scroll `label`'s painted text into the inspector's clickable interior and
+/// return its rect. The inspector body is a scroll area with its own clip:
+/// a control drawn past its bottom edge is painted but not hittable, so
+/// "somewhere on the screen" is not a place a user could click.
+fn radar_control_rect(h: &mut InputHarness, label: &str) -> egui::Rect {
+    let panel = h
+        .inspector_rect()
+        .expect("the radar layer body is open in the inspector");
+    let interior = panel.shrink(24.0);
+    let visible = |h: &InputHarness| {
+        h.painted_text_rects()
+            .iter()
+            .any(|(rect, text)| text == label && interior.contains(rect.center()))
+    };
+    assert!(
+        h.scroll_until(panel.center(), egui::vec2(0.0, -60.0), 200, visible),
+        "{label:?} never scrolled into the inspector's clickable interior",
+    );
+    h.painted_text_rects()
+        .into_iter()
+        .find(|(_, text)| text == label)
+        .expect("just asserted painted")
+        .0
+}
+
+/// **The radar layer's Refresh button asks the shell for THIS pane's scan.**
+///
+/// The row moved out of `SETTINGS_ROWS` into the layer's own control tree at
+/// WO-E8b, and it could not move as a `ControlEffect::Fetch`: that routes to
+/// `push_user_overlay_fetch`, which is the generic overlay fetch and not the
+/// site-and-timestamp fetch this layer's data arrives by. So the button is
+/// recognised by the radar glue and answered here, and this is the pin that
+/// says the answer is the right action for the right site.
+#[test]
+fn the_radar_layers_refresh_button_asks_the_shell_for_this_panes_scan() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    // A site the shared `radar.config` does NOT carry, so an action naming it
+    // can only have come from the pane.
+    h.gui_mut()
+        .pane_mut(0)
+        .expect("pane 0")
+        .set_site("KGRR".to_string());
+    h.warm_up();
+    assert_ne!(
+        h.gui_mut().get_radar_config().site,
+        "KGRR",
+        "precondition: the shared config must not already name this site, or \
+         the assertion below could pass off the global",
+    );
+
+    h.open_layer_in_inspector(&known::RADAR);
+    let button = radar_control_rect(&mut h, rustdar_radar::source::REFRESH_LABEL);
+    assert_eq!(
+        h.gui_mut().pane(0).expect("pane 0").site(),
+        "KGRR",
+        "premise: the pane is still on the site set above",
+    );
+    // Read on the release frame: `last_actions` is one frame's worth, and a
+    // warm-up would run past the frame the click was answered on.
+    h.mouse_click(button.center());
+
+    let asked: Vec<&str> = h
+        .last_actions()
+        .iter()
+        .filter_map(|action| match action {
+            crate::actions::GuiAction::FetchRadarScan(config) => Some(config.site.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        asked,
+        vec!["KGRR"],
+        "the Refresh button must ask for the active pane's site, exactly once",
+    );
+}
+
+/// **One live-chunk switch still means every pane — from the inspector too.**
+///
+/// The switch is two facts: the layer's global, which `apply_control` writes,
+/// and a copy in every pane's radar slot *config*, which no contract door can
+/// reach. The fan-out lives in the radar glue (ruling (27), route (b)) and the
+/// inspector is the awkward caller: the pane being edited is `mem::take`n out
+/// of the pane vector while its body renders, so a fan-out over the vector
+/// alone writes a placeholder and leaves the edited pane behind.
+///
+/// **Non-triviality floor**: both panes are asserted to start in agreement at
+/// the *opposite* value, so neither assertion below can pass on a fixture that
+/// already held the answer.
+#[test]
+fn the_inspectors_live_chunk_switch_reaches_every_pane_including_the_edited_one() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(2);
+    h.warm_up();
+    for i in 0..2 {
+        h.gui_mut()
+            .pane_mut(i)
+            .expect("both panes")
+            .set_radar_live_chunks(true);
+    }
+    h.warm_up();
+    for i in 0..2 {
+        assert_eq!(
+            h.gui_mut().pane(i).expect("both panes").radar_live_chunks(),
+            Some(true),
+            "precondition: pane {i} starts ON, or the assertion below could \
+             pass without the switch having moved anything",
+        );
+    }
+
+    h.open_layer_in_inspector(&known::RADAR);
+    let toggle = radar_control_rect(&mut h, rustdar_radar::source::LIVE_CHUNKS_LABEL);
+    h.mouse_click(toggle.center());
+    h.warm_up();
+
+    for i in 0..2 {
+        assert_eq!(
+            h.gui_mut().pane(i).expect("both panes").radar_live_chunks(),
+            Some(false),
+            "pane {i} kept the old value — one switch no longer means every pane",
+        );
+    }
+    assert!(
+        !crate::radar_layer::live_chunks_enabled(h.gui_mut()),
+        "the layer's own answer did not move with the panes",
+    );
+}
+
+/// **Typing in the endpoint box reaches the layer that owns the endpoint.**
+///
+/// `ControlItem::TextField` is new plumbing at WO-E8b — a variant, a renderer
+/// arm, a parity-walk kind and a shape row — and the half no other control
+/// exercises is the edit coming back as a `ControlValue::String`. Without this
+/// the box would draw, walk and persist while silently discarding every
+/// keystroke.
+#[test]
+fn typing_in_the_notifier_box_reaches_the_radar_layer() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.open_layer_in_inspector(&known::RADAR);
+    assert_eq!(
+        crate::radar_layer::notifier_endpoint_raw(h.gui_mut()),
+        rustdar_radar::source::DEFAULT_NOTIFIER_ENDPOINT,
+        "precondition: the box starts at the built-in default",
+    );
+
+    let label = radar_control_rect(&mut h, rustdar_radar::source::NOTIFIER_ENDPOINT_LABEL);
+    // The box itself sits directly under its label, in the same column.
+    h.mouse_click(egui::pos2(label.center().x, label.max.y + 12.0));
+    h.warm_up();
+    // To the end first: the click lands wherever in the string it lands, and
+    // this pin is about the keystroke arriving, not about where the caret was.
+    h.key_press(egui::Key::End);
+    h.type_text("!");
+    h.warm_up();
+
+    assert_eq!(
+        crate::radar_layer::notifier_endpoint_raw(h.gui_mut()),
+        format!("{}!", rustdar_radar::source::DEFAULT_NOTIFIER_ENDPOINT),
+        "the keystroke never reached the handler — the TextField's update \
+         path is not wired",
+    );
 }

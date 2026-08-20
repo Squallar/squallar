@@ -303,6 +303,7 @@ pub(crate) enum DrawnControlKind {
     Heading,
     Dropdown,
     Section,
+    TextField,
 }
 
 /// One control a handler's tree actually drew — the generalisation of
@@ -404,6 +405,35 @@ fn render_control_item(
         }
         ControlItem::Separator => {
             ui.separator();
+        }
+        ControlItem::TextField {
+            id,
+            label,
+            value,
+            hint,
+        } => {
+            let mut text = value.clone();
+            ui.label(label.as_str());
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut text)
+                    .id_salt(format!("{kind:?}_{id}"))
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text(hint.as_str()),
+            );
+            #[cfg(test)]
+            probe.record_item(kind, DrawnControlKind::TextField, label, response.rect);
+            // One update per edit, exactly as a dropdown reports a new
+            // selection: the handler holds the text, and the box is redrawn
+            // from it next frame.
+            if response.changed() {
+                updates.push((
+                    kind.clone(),
+                    ControlUpdate {
+                        id,
+                        value: ControlValue::String(text),
+                    },
+                ));
+            }
         }
         ControlItem::Dropdown {
             id,
@@ -664,51 +694,14 @@ impl Gui {
         self.floor_tile_zoom_bias = inputs.floor_tile_zoom_bias;
     }
 
-    /// Whether live panes should be fed from the real-time chunk bucket.
-    ///
-    /// **The active pane's radar slot answers, and the global is the
-    /// fallback** (WO-E6b). A per-pane answer is now expressible; nothing in
-    /// the UI diverges the panes yet, because [`Self::set_live_chunks`] fans
-    /// its value out to all of them.
-    pub fn live_chunks_enabled(&self) -> bool {
-        self.panes
-            .get(self.active_pane)
-            .and_then(PaneState::radar_live_chunks)
-            .unwrap_or(self.live_chunks)
-    }
-
-    /// Set by the settings UI and by the menu toggle. Writes the global **and
-    /// every pane's radar slot**: one switch has always meant every pane, and
-    /// the fan-out is what keeps that true now that each pane carries its own
-    /// copy.
-    pub fn set_live_chunks(&mut self, enabled: bool) {
-        self.live_chunks = enabled;
-        for pane in &mut self.panes {
-            pane.set_radar_live_chunks(enabled);
-        }
-    }
-
-    /// Whether to subscribe to the push-notification service.
-    pub fn chunk_notifications_enabled(&self) -> bool {
-        self.chunk_notifications
-    }
-
-    pub fn set_chunk_notifications(&mut self, enabled: bool) {
-        self.chunk_notifications = enabled;
-    }
-
-    /// Where the notifier service lives.
-    pub fn notifier_endpoint(&self) -> &str {
-        if self.notifier_endpoint.trim().is_empty() {
-            crate::DEFAULT_NOTIFIER_ENDPOINT
-        } else {
-            self.notifier_endpoint.trim()
-        }
-    }
-
-    pub fn set_notifier_endpoint(&mut self, endpoint: impl Into<String>) {
-        self.notifier_endpoint = endpoint.into();
-    }
+    // **The chunk feed's three switches used to live here** — `live_chunks`,
+    // `chunk_notifications` and `notifier_endpoint`, with a public setter each.
+    // WO-E8b moved the fields into `RadarSource`, where the layer that uses
+    // them can answer for them; the readers are
+    // `crate::radar_layer::{live_chunks_enabled, chunk_notifications_enabled,
+    // notifier_endpoint}` and the one write door is
+    // [`Gui::apply_layer_control`], which names a layer and an update rather
+    // than a field.
 
     pub fn chunk_status(&self) -> &rustdar_radar::chunk_feed::ChunkFeedStatus {
         &self.chunk_status

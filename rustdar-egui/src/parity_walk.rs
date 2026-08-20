@@ -89,6 +89,7 @@ fn drawn_kind(item: &ControlItem) -> Option<DrawnControlKind> {
         ControlItem::Dropdown { .. } => DrawnControlKind::Dropdown,
         ControlItem::Slider { .. } => DrawnControlKind::Slider,
         ControlItem::Section { .. } => DrawnControlKind::Section,
+        ControlItem::TextField { .. } => DrawnControlKind::TextField,
         ControlItem::ButtonRow { .. } | ControlItem::Separator => return None,
     })
 }
@@ -150,7 +151,8 @@ fn control_label(item: &ControlItem) -> &str {
         ControlItem::Toggle { label, .. }
         | ControlItem::Dropdown { label, .. }
         | ControlItem::Slider { label, .. }
-        | ControlItem::Section { label, .. } => label,
+        | ControlItem::Section { label, .. }
+        | ControlItem::TextField { label, .. } => label,
         ControlItem::Heading { text } | ControlItem::InfoText { text } => text,
         ControlItem::ButtonRow { .. } | ControlItem::Separator => "",
     }

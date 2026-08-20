@@ -26,12 +26,6 @@ pub struct CurrentVolumeStamp {
 
 pub struct Gui {
     pub(super) radar: RadarState,
-    /// See [`Gui::live_chunks_enabled`].
-    pub(super) live_chunks: bool,
-    /// See [`Gui::chunk_notifications_enabled`].
-    pub(super) chunk_notifications: bool,
-    /// See [`Gui::notifier_endpoint`].
-    pub(super) notifier_endpoint: String,
     /// What the real-time feed is doing, refreshed each frame by the App.
     pub(super) chunk_status: ChunkFeedStatus,
     /// Each site's current-volume stamp, refreshed each frame by the App and
@@ -389,9 +383,6 @@ impl Gui {
                 fetching: false,
                 error_message: None,
             },
-            live_chunks: true,
-            chunk_notifications: true,
-            notifier_endpoint: crate::DEFAULT_NOTIFIER_ENDPOINT.to_string(),
             chunk_status: ChunkFeedStatus::default(),
             current_volumes: HashMap::new(),
             time_dialog: TimeDialogState {

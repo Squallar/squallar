@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use crate::archive::Identifier;
 use chrono::NaiveDateTime;
-use rustdar_source::controls::{ControlEffect, ControlItem, ControlUpdate, ControlValue};
+use rustdar_source::controls::{
+    ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue,
+};
 use rustdar_source::fetch_policy::FetchRetry;
 use rustdar_source::handler::{
     FetchConfig, FetchPayload, FetchTask, FrameListingResult, OverlayItem, RenderMode,
@@ -34,6 +36,43 @@ pub const AUTO_POLL_CONTROL: &str = "auto_poll";
 /// The one spelling of that switch's label, so the menu leaf, the settings row
 /// and the inspector row cannot disagree about what it is called.
 pub const AUTO_POLL_LABEL: &str = "Auto-poll";
+
+/// **Whether live panes are fed from the real-time chunk bucket.** Two
+/// surfaces (the ☰ menu leaf and the inspector row) over one field, plus a
+/// per-pane copy in each pane's radar slot config that the presentation fans
+/// this value out to — see `rustdar_egui::radar_layer::fan_out_live_chunks`
+/// for why the fan-out cannot live behind `apply_control`.
+pub const LIVE_CHUNKS_CONTROL: &str = "live_chunks";
+/// The one spelling of that switch's label.
+pub const LIVE_CHUNKS_LABEL: &str = "Live: real-time chunks";
+
+/// **Whether to subscribe to the push-notification service** that says when a
+/// site's chunk feed has something new.
+pub const CHUNK_NOTIFICATIONS_CONTROL: &str = "chunk_notifications";
+/// The one spelling of that switch's label.
+pub const CHUNK_NOTIFICATIONS_LABEL: &str = "Live: push notifications";
+
+/// **Where the notifier service lives.** Empty means the built-in default:
+/// see [`DEFAULT_NOTIFIER_ENDPOINT`].
+pub const NOTIFIER_ENDPOINT_CONTROL: &str = "notifier_endpoint";
+/// The one spelling of that box's label.
+pub const NOTIFIER_ENDPOINT_LABEL: &str = "Notifier endpoint:";
+/// The line under the endpoint box, which is where "empty is not off" is said.
+pub const NOTIFIER_ENDPOINT_NOTE: &str =
+    "WebSocket chunk-notify URL. Empty uses the built-in default.";
+
+/// The notifier this build ships with. An empty endpoint is **not** an off
+/// switch — it falls back to this, which is what [`RadarSource::notifier_endpoint`]
+/// answers.
+pub const DEFAULT_NOTIFIER_ENDPOINT: &str = "wss://nexrad-aws-notifier.mcswain.dev";
+
+/// **Fetch this site's newest volume now** — the user's own ask, not the
+/// poll's. It is a [`ControlItem::ButtonRow`] button rather than a
+/// [`ControlEffect::Fetch`] because this layer's fetch is dispatched by the
+/// shell with a site and a timestamp, not by the generic overlay fetch path.
+pub const REFRESH_CONTROL: &str = "refresh";
+/// The one spelling of that button's label.
+pub const REFRESH_LABEL: &str = "Refresh radar";
 
 /// **What one archive listing said, filed under the site it was listed for.**
 ///
@@ -104,6 +143,16 @@ pub struct RadarSource {
     /// drift from the other. Off means this layer declares no poll interval,
     /// which is what makes [`SourceHandler::auto_fetch_delay`] answer `None`.
     auto_poll_enabled: bool,
+    /// **The live-chunk switch's global answer** — the fallback behind each
+    /// pane's own copy, and the value a pane that has never been told takes.
+    /// See [`LIVE_CHUNKS_CONTROL`].
+    live_chunks: bool,
+    /// See [`CHUNK_NOTIFICATIONS_CONTROL`].
+    chunk_notifications: bool,
+    /// See [`NOTIFIER_ENDPOINT_CONTROL`]. Stored exactly as typed, including
+    /// empty and including surrounding space; the substitution happens at the
+    /// read, in [`Self::notifier_endpoint`].
+    notifier_endpoint: String,
     /// **When a round was last asked for**, which is what this layer's poll
     /// clock counts from — see [`SourceHandler::set_fetching`] for why the ask
     /// and not the answer.
@@ -123,10 +172,37 @@ impl RadarSource {
             listings: HashMap::new(),
             covered: HashMap::new(),
             auto_poll_enabled: true,
+            live_chunks: true,
+            chunk_notifications: true,
+            notifier_endpoint: DEFAULT_NOTIFIER_ENDPOINT.to_string(),
             last_round: None,
             fetching: false,
             retry: FetchRetry::new(),
         }
+    }
+
+    /// **Where the notifier service lives**, with the empty box resolved.
+    ///
+    /// An empty endpoint — or one that is nothing but space — is not an off
+    /// switch: it means "use the one this build ships with". The substitution
+    /// lives here rather than at the write so the box keeps showing what the
+    /// user typed.
+    pub fn notifier_endpoint(&self) -> &str {
+        if self.notifier_endpoint.trim().is_empty() {
+            DEFAULT_NOTIFIER_ENDPOINT
+        } else {
+            self.notifier_endpoint.trim()
+        }
+    }
+
+    /// **This pane's live-chunk answer**: the pane's own copy if it carries
+    /// one, else the global. The precedence WO-E6b established, kept where the
+    /// field now is.
+    fn live_chunks_for(&self, pane: &PaneRef<'_>) -> bool {
+        pane.config
+            .get(LIVE_CHUNKS_CONTROL)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(self.live_chunks)
     }
 
     /// **The site this pane is on**, from the slot config `publish_radar_selection`
@@ -411,6 +487,36 @@ impl SourceHandler for RadarSource {
                 label: AUTO_POLL_LABEL.to_string(),
                 enabled: self.auto_poll_enabled,
             },
+            ControlItem::Toggle {
+                id: LIVE_CHUNKS_CONTROL,
+                label: LIVE_CHUNKS_LABEL.to_string(),
+                enabled: self.live_chunks_for(pane),
+            },
+            ControlItem::Toggle {
+                id: CHUNK_NOTIFICATIONS_CONTROL,
+                label: CHUNK_NOTIFICATIONS_LABEL.to_string(),
+                enabled: self.chunk_notifications,
+            },
+            ControlItem::ButtonRow {
+                buttons: vec![ControlButton {
+                    id: REFRESH_CONTROL,
+                    label: REFRESH_LABEL.to_string(),
+                    // The same gate the settings row's button carried: a
+                    // round the user is already waiting on is not a round to
+                    // ask for twice.
+                    enabled: !self.fetching,
+                    highlight: false,
+                }],
+            },
+            ControlItem::TextField {
+                id: NOTIFIER_ENDPOINT_CONTROL,
+                label: NOTIFIER_ENDPOINT_LABEL.to_string(),
+                value: self.notifier_endpoint.clone(),
+                hint: DEFAULT_NOTIFIER_ENDPOINT.to_string(),
+            },
+            ControlItem::InfoText {
+                text: NOTIFIER_ENDPOINT_NOTE.to_string(),
+            },
         ]
     }
 
@@ -428,9 +534,81 @@ impl SourceHandler for RadarSource {
                     self.auto_poll_enabled = val;
                 }
             }
+            // **The global half only.** Each pane keeps its own copy in its
+            // radar slot *config*, and no contract door writes another pane's
+            // slot config — `PaneMut` carries this pane's `state` and
+            // read-only `peers`. The fan-out that keeps the panes in step is
+            // `rustdar_egui::radar_layer::fan_out_live_chunks`, called beside
+            // this write (orchestrator ruling (27), route (b)).
+            LIVE_CHUNKS_CONTROL => {
+                if let ControlValue::Bool(val) = update.value {
+                    self.live_chunks = val;
+                }
+            }
+            CHUNK_NOTIFICATIONS_CONTROL => {
+                if let ControlValue::Bool(val) = update.value {
+                    self.chunk_notifications = val;
+                }
+            }
+            NOTIFIER_ENDPOINT_CONTROL => {
+                if let ControlValue::String(val) = &update.value {
+                    self.notifier_endpoint.clone_from(val);
+                }
+            }
+            // The button is answered by the presentation, which is the only
+            // half of this app that can name a site and a timestamp for the
+            // shell to fetch. Nothing to record here.
+            REFRESH_CONTROL => {}
             _ => {}
         }
         ControlEffect::None
+    }
+
+    /// **This layer's own settings, as one blob.** The four switches that used
+    /// to sit at the config root — the archive poll, the two live-chunk
+    /// switches and the notifier endpoint — now travel with the layer that
+    /// owns them, which is what the v3 → v4 migration moves them into.
+    fn serialize_state(&self) -> serde_json::Value {
+        serde_json::json!({
+            AUTO_POLL_CONTROL: self.auto_poll_enabled,
+            LIVE_CHUNKS_CONTROL: self.live_chunks,
+            CHUNK_NOTIFICATIONS_CONTROL: self.chunk_notifications,
+            NOTIFIER_ENDPOINT_CONTROL: self.notifier_endpoint,
+        })
+    }
+
+    /// Each member is taken only if it is present **and of the right type**:
+    /// a blob written by a build that did not have one of these keys leaves
+    /// this build's default standing, which is the same tolerance the root
+    /// keys had through `#[serde(default)]`.
+    fn deserialize_state(&mut self, value: serde_json::Value) {
+        let Some(map) = value.as_object() else {
+            return;
+        };
+        if let Some(on) = map
+            .get(AUTO_POLL_CONTROL)
+            .and_then(serde_json::Value::as_bool)
+        {
+            self.auto_poll_enabled = on;
+        }
+        if let Some(on) = map
+            .get(LIVE_CHUNKS_CONTROL)
+            .and_then(serde_json::Value::as_bool)
+        {
+            self.live_chunks = on;
+        }
+        if let Some(on) = map
+            .get(CHUNK_NOTIFICATIONS_CONTROL)
+            .and_then(serde_json::Value::as_bool)
+        {
+            self.chunk_notifications = on;
+        }
+        if let Some(text) = map
+            .get(NOTIFIER_ENDPOINT_CONTROL)
+            .and_then(serde_json::Value::as_str)
+        {
+            self.notifier_endpoint = text.to_string();
+        }
     }
 
     // ── Per-pane state (WO-M10b) ──────────────────────────────────────
