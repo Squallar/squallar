@@ -88,3 +88,59 @@ pub fn product_for(id: &FieldId) -> Option<RadarProduct> {
 
 #[cfg(test)]
 mod tests;
+
+/// The seventeen field ids this crate registers, as `const` items.
+///
+/// The exact model of [`rustdar_source::id::known`], and for the same reason:
+/// an open string has no compiler to catch a typo, so the spellings live in one
+/// place and everything else refers to them. **These are the bytes already in
+/// every user's config file** — the product enum's own `Serialize` output — so
+/// this module is as append-only as the layer ledger is.
+///
+/// `every_known_field_is_registered` is what stops one of these drifting away
+/// from the registration it names.
+pub mod known {
+    use rustdar_source::product::FieldId;
+
+    pub const REFLECTIVITY: FieldId = FieldId::from_static("Reflectivity");
+    pub const VELOCITY: FieldId = FieldId::from_static("Velocity");
+    pub const SPECTRUM_WIDTH: FieldId = FieldId::from_static("SpectrumWidth");
+    pub const DIFFERENTIAL_PHASE: FieldId = FieldId::from_static("DifferentialPhase");
+    pub const CORRELATION_COEFFICIENT: FieldId = FieldId::from_static("CorrelationCoefficient");
+    pub const DIFFERENTIAL_REFLECTIVITY: FieldId = FieldId::from_static("DifferentialReflectivity");
+    pub const STORM_RELATIVE_VELOCITY: FieldId = FieldId::from_static("StormRelativeVelocity");
+    pub const SPECIFIC_DIFFERENTIAL_PHASE: FieldId =
+        FieldId::from_static("SpecificDifferentialPhase");
+    pub const ECHO_TOPS: FieldId = FieldId::from_static("EchoTops");
+    pub const ECHO_TOPS_INTERPOLATED: FieldId = FieldId::from_static("EchoTopsInterpolated");
+    pub const VERTICALLY_INTEGRATED_LIQUID: FieldId =
+        FieldId::from_static("VerticallyIntegratedLiquid");
+    pub const VIL_DENSITY: FieldId = FieldId::from_static("VilDensity");
+    pub const PROBABILITY_OF_SEVERE_HAIL: FieldId = FieldId::from_static("ProbabilityOfSevereHail");
+    pub const MAX_EXPECTED_HAIL_SIZE: FieldId = FieldId::from_static("MaxExpectedHailSize");
+    pub const HYDROMETEOR_CLASSIFICATION: FieldId =
+        FieldId::from_static("HydrometeorClassification");
+    pub const PRECIPITATION_RATE: FieldId = FieldId::from_static("PrecipitationRate");
+    pub const NORMALIZED_ROTATION: FieldId = FieldId::from_static("NormalizedRotation");
+
+    /// Every const above, for the sweeps that have to cover all of them.
+    pub const ALL: [FieldId; 17] = [
+        REFLECTIVITY,
+        VELOCITY,
+        SPECTRUM_WIDTH,
+        DIFFERENTIAL_PHASE,
+        CORRELATION_COEFFICIENT,
+        DIFFERENTIAL_REFLECTIVITY,
+        STORM_RELATIVE_VELOCITY,
+        SPECIFIC_DIFFERENTIAL_PHASE,
+        ECHO_TOPS,
+        ECHO_TOPS_INTERPOLATED,
+        VERTICALLY_INTEGRATED_LIQUID,
+        VIL_DENSITY,
+        PROBABILITY_OF_SEVERE_HAIL,
+        MAX_EXPECTED_HAIL_SIZE,
+        HYDROMETEOR_CLASSIFICATION,
+        PRECIPITATION_RATE,
+        NORMALIZED_ROTATION,
+    ];
+}
