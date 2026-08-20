@@ -1,10 +1,9 @@
+use crate::render::overlay_state::{PaneMut, PaneRef};
 use std::sync::Arc;
 
 use rustdar_source::job::JobCodec;
 
-use crate::render::controls::{
-    ControlEffect, ControlItem, ControlUpdate, PaneControlContext, PaneControlContextMut,
-};
+use crate::render::controls::{ControlEffect, ControlItem, ControlUpdate};
 use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{FetchPayload, OverlayHandler, OverlayItem, RenderMode};
 use rustdar_source::id::{LayerId, known};
@@ -76,7 +75,7 @@ impl OverlayHandler for RadarSitesHandler {
     fn apply_fetch_result(&mut self, _result: FetchPayload) {}
     fn retain_selections(&self, _selections: &mut Vec<Arc<dyn OverlayItem>>) {}
 
-    fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
+    fn controls(&self, _ctx: &PaneRef<'_>) -> Vec<ControlItem> {
         vec![ControlItem::Toggle {
             id: "enabled",
             label: "Radar Sites".to_string(),
@@ -84,11 +83,7 @@ impl OverlayHandler for RadarSitesHandler {
         }]
     }
 
-    fn apply_control(
-        &mut self,
-        update: &ControlUpdate,
-        _ctx: &mut PaneControlContextMut<'_>,
-    ) -> ControlEffect {
+    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneMut<'_>) -> ControlEffect {
         if update.id == "enabled"
             && let crate::render::controls::ControlValue::Bool(val) = update.value
         {

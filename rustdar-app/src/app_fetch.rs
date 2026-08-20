@@ -7,6 +7,7 @@ use rustdar_egui::actions::GuiAction;
 use rustdar_egui::shell_api::GuiEvent;
 use rustdar_overlays::render::overlay_state::OverlayFetchResult;
 use rustdar_radar::types::RadarProduct;
+use rustdar_source::handler::PaneRef;
 use rustdar_source::id::{LayerId, known};
 use std::sync::atomic::Ordering;
 use winit::event_loop::ActiveEventLoop;
@@ -621,7 +622,14 @@ impl super::App {
             viewport: self.last_viewport,
         };
 
-        let tasks = self.gui.overlays.create_fetch_tasks(&kind, &config);
+        // The pane is named, not read: the swap above still hands the handler
+        // this pane's saved state, so there is nothing in the slot yet for a
+        // `PaneRef` to carry. WO-M10's deletion commit is what frees the
+        // registry's mutable borrow and lets the real pane be built here.
+        let tasks = self
+            .gui
+            .overlays
+            .create_fetch_tasks(&kind, &config, &PaneRef::bare(pane_idx));
         if tasks.is_empty() {
             // A handler that cannot build a task says so, and is believed.
             log::warn!("{kind:?}: no fetch task could be built; backing off");
@@ -805,7 +813,9 @@ impl super::App {
                 };
                 // One registry read for the three captures below — the job.
                 let overlays = &self.gui.overlays;
-                let Some(job) = overlays.prepare_job(id, &rctx) else {
+                // Named, not read — see `fetch_overlay`.
+                let pane = PaneRef::bare(first_pane_idx);
+                let Some(job) = overlays.prepare_job(id, &rctx, &pane) else {
                     self.clear_overlay_render_marks(&pane_indices, id);
                     return;
                 };

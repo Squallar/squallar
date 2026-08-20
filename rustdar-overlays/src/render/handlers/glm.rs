@@ -1,3 +1,4 @@
+use crate::render::overlay_state::{PaneMut, PaneRef};
 use std::any::Any;
 use std::sync::Arc;
 
@@ -10,8 +11,7 @@ use crate::glm::{
     GlmFetchOutcome, GlmFetchResult, GlmFlash, GlmSatellite, LevelFailure, RecordDrops, WindowGap,
 };
 use crate::render::controls::{
-    ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
-    PaneControlContextMut,
+    ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue,
 };
 use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
@@ -618,7 +618,7 @@ impl OverlayHandler for GlmHandler {
 
     /// E.g. `"312 flashes · 10 min"`: what the layer is holding, and how wide
     /// its window is.
-    fn status_line(&self) -> Option<String> {
+    fn status_line(&self, _pane: &PaneRef<'_>) -> Option<String> {
         if !self.enabled {
             return None;
         }
@@ -714,7 +714,7 @@ impl OverlayHandler for GlmHandler {
         });
     }
 
-    fn prepare_job(&self, ctx: &RasterizeContext) -> Option<DescribedJob> {
+    fn prepare_job(&self, ctx: &RasterizeContext, _pane: &PaneRef<'_>) -> Option<DescribedJob> {
         // Captures the dispatch's own `ctx.now`, which is what keeps the
         // flash ages a worker renders the ages this page computed.
         Some(DescribedJob::new(self.paint_input(ctx)?))
@@ -743,7 +743,7 @@ impl OverlayHandler for GlmHandler {
         )
     }
 
-    fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
+    fn create_fetch_tasks(&self, ctx: &FetchConfig, _pane: &PaneRef<'_>) -> Vec<FetchTask> {
         log::info!("Fetching GLM lightning data");
         let client = ctx.client.clone();
         let sources = ctx.sources.clone();
@@ -777,7 +777,7 @@ impl OverlayHandler for GlmHandler {
         }]
     }
 
-    fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
+    fn controls(&self, _ctx: &PaneRef<'_>) -> Vec<ControlItem> {
         let count = self.state.data.len();
         let label = if count == 0 {
             "GLM Lightning".to_string()
@@ -933,11 +933,7 @@ impl OverlayHandler for GlmHandler {
         items
     }
 
-    fn apply_control(
-        &mut self,
-        update: &ControlUpdate,
-        _ctx: &mut PaneControlContextMut<'_>,
-    ) -> ControlEffect {
+    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneMut<'_>) -> ControlEffect {
         match update.id {
             "enabled" => {
                 if let ControlValue::Bool(val) = update.value {

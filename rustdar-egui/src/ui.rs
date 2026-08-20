@@ -1,8 +1,5 @@
 use crate::actions::{GuiAction, RadarConfig};
-use rustdar_overlays::render::controls::{
-    ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
-    PaneControlContextMut,
-};
+use rustdar_overlays::render::controls::{ControlEffect, ControlItem, ControlUpdate, ControlValue};
 
 const DEFAULT_INITIAL_ZOOM: f64 = 7.0;
 

@@ -1,3 +1,4 @@
+use crate::render::overlay_state::{PaneMut, PaneRef};
 use std::any::Any;
 use std::sync::Arc;
 
@@ -6,8 +7,7 @@ use rustdar_units::UserPreferences;
 use crate::fetch_policy::Assembled;
 use crate::metar::types::{MetarOb, WindDir};
 use crate::render::controls::{
-    ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
-    PaneControlContextMut,
+    ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue,
 };
 use crate::render::draw::{DrawPointContext, HoverContext, MapPoint, PointPainter};
 use crate::render::overlay_state::Surface;
@@ -249,7 +249,7 @@ impl OverlayHandler for MetarHandler {
     }
 
     /// E.g. `"148 stations"` — how many observations the map is placing.
-    fn status_line(&self) -> Option<String> {
+    fn status_line(&self, _pane: &PaneRef<'_>) -> Option<String> {
         if !self.enabled {
             return None;
         }
@@ -332,7 +332,7 @@ impl OverlayHandler for MetarHandler {
         });
     }
 
-    fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
+    fn create_fetch_tasks(&self, ctx: &FetchConfig, _pane: &PaneRef<'_>) -> Vec<FetchTask> {
         // NOT `ctx.client` — see `metar_client`.
         let client = match metar_client(&ctx.sources) {
             Ok(c) => c,
@@ -379,7 +379,7 @@ impl OverlayHandler for MetarHandler {
             .map(|item| station_model::hover_text_for_metar(&item.ob, ctx.prefs))
     }
 
-    fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
+    fn controls(&self, _ctx: &PaneRef<'_>) -> Vec<ControlItem> {
         let count = self.state.data.len();
         let label = if count == 0 {
             "METAR".to_string()
@@ -419,11 +419,7 @@ impl OverlayHandler for MetarHandler {
         items
     }
 
-    fn apply_control(
-        &mut self,
-        update: &ControlUpdate,
-        _ctx: &mut PaneControlContextMut<'_>,
-    ) -> ControlEffect {
+    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneMut<'_>) -> ControlEffect {
         match update.id {
             "enabled" => {
                 if let ControlValue::Bool(val) = update.value {
@@ -580,7 +576,6 @@ mod tests {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod round_tests {
     use super::*;
-    use crate::render::controls::PaneControlContext;
     use crate::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
 
     fn plains() -> rustdar_geo::GeoBounds {
@@ -649,10 +644,7 @@ mod round_tests {
             kind: kind.clone(),
             data: Box::new(MetarFetchResult(result)) as FetchPayload,
         });
-        let ctx = PaneControlContext {
-            pane_idx: 0,
-            pane_state: None,
-        };
+        let ctx = PaneRef::bare(0);
         let note = registry
             .controls(&kind, &ctx)
             .into_iter()
@@ -660,7 +652,7 @@ mod round_tests {
                 ControlItem::InfoText { text } if text.starts_with("Incomplete") => Some(text),
                 _ => None,
             });
-        (registry.status_line(&kind), note)
+        (registry.status_line(&kind, &PaneRef::bare(0)), note)
     }
 
     #[test]

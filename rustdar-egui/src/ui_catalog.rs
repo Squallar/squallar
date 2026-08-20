@@ -2,10 +2,9 @@
 
 use crate::actions::GuiAction;
 use rustdar_overlays::hrrr::ModelParameter;
-use rustdar_overlays::render::controls::{
-    ControlEffect, ControlUpdate, ControlValue, PaneControlContextMut,
-};
+use rustdar_overlays::render::controls::{ControlEffect, ControlUpdate, ControlValue};
 use rustdar_radar::types::RadarProduct;
+use rustdar_source::handler::PaneMut;
 use rustdar_source::id::{LayerId, known};
 use serde::{Deserialize, Serialize};
 
@@ -596,10 +595,7 @@ impl super::Gui {
             id: "parameter",
             value: ControlValue::String(param.as_str().to_owned()),
         };
-        let mut pane_ctx = PaneControlContextMut {
-            pane_idx: idx,
-            pane_state: None,
-        };
+        let mut pane_ctx = PaneMut::bare(idx);
         let effect = self
             .overlays
             .apply_control(&known::MODEL_DATA, &update, &mut pane_ctx);

@@ -1,3 +1,4 @@
+use crate::render::overlay_state::{PaneMut, PaneRef};
 use std::any::Any;
 use std::sync::Arc;
 
@@ -5,8 +6,7 @@ use rustdar_units::UserPreferences;
 
 use crate::fetch_policy::Assembled;
 use crate::render::controls::{
-    ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
-    PaneControlContextMut,
+    ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue,
 };
 use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
@@ -205,7 +205,7 @@ impl OverlayHandler for StormReportsHandler {
         self.enabled = enabled;
     }
 
-    fn status_line(&self) -> Option<String> {
+    fn status_line(&self, _pane: &PaneRef<'_>) -> Option<String> {
         if !self.enabled {
             return None;
         }
@@ -295,7 +295,7 @@ impl OverlayHandler for StormReportsHandler {
         });
     }
 
-    fn prepare_job(&self, ctx: &RasterizeContext) -> Option<DescribedJob> {
+    fn prepare_job(&self, ctx: &RasterizeContext, _pane: &PaneRef<'_>) -> Option<DescribedJob> {
         Some(DescribedJob::new(self.paint_input(ctx)?))
     }
 
@@ -321,7 +321,7 @@ impl OverlayHandler for StormReportsHandler {
         )
     }
 
-    fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
+    fn create_fetch_tasks(&self, ctx: &FetchConfig, _pane: &PaneRef<'_>) -> Vec<FetchTask> {
         log::info!("Fetching SPC storm reports");
         // NOT `ctx.client`: SPC answers OPTIONS with 403, so a `User-Agent`
         // makes all three CSVs fail in the browser. See `spc::fetch`.
@@ -342,7 +342,7 @@ impl OverlayHandler for StormReportsHandler {
         }]
     }
 
-    fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
+    fn controls(&self, _ctx: &PaneRef<'_>) -> Vec<ControlItem> {
         let count = self.state.data.len();
         let label = if count == 0 {
             "SPC Storm Reports".to_string()
@@ -384,11 +384,7 @@ impl OverlayHandler for StormReportsHandler {
         items
     }
 
-    fn apply_control(
-        &mut self,
-        update: &ControlUpdate,
-        _ctx: &mut PaneControlContextMut<'_>,
-    ) -> ControlEffect {
+    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneMut<'_>) -> ControlEffect {
         match update.id {
             "enabled" => {
                 if let ControlValue::Bool(val) = update.value {
@@ -542,7 +538,6 @@ mod tests {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod round_tests {
     use super::*;
-    use crate::render::controls::PaneControlContext;
     use crate::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
     use crate::spc::reports::fetch_storm_reports;
 
@@ -608,10 +603,7 @@ mod round_tests {
             kind: kind.clone(),
             data: Box::new(StormReportsFetchResult(result)) as FetchPayload,
         });
-        let ctx = PaneControlContext {
-            pane_idx: 0,
-            pane_state: None,
-        };
+        let ctx = PaneRef::bare(0);
         let note = registry
             .controls(&kind, &ctx)
             .into_iter()
@@ -619,7 +611,7 @@ mod round_tests {
                 ControlItem::InfoText { text } if text.starts_with("Incomplete") => Some(text),
                 _ => None,
             });
-        (registry.status_line(&kind), note)
+        (registry.status_line(&kind, &PaneRef::bare(0)), note)
     }
 
     /// **A CSV that would not load takes a whole kind of report off the map.**

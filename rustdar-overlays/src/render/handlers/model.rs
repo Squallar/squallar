@@ -1,3 +1,4 @@
+use crate::render::overlay_state::{PaneMut, PaneRef};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -5,8 +6,7 @@ use std::sync::Arc;
 use crate::fetch_policy::Whole;
 use crate::hrrr::{HrrrFetchResult, HrrrGridData, ModelParameter};
 use crate::render::controls::{
-    ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
-    PaneControlContextMut,
+    ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue,
 };
 use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
@@ -165,7 +165,7 @@ impl OverlayHandler for ModelDataHandler {
         self.enabled = enabled;
     }
 
-    fn status_line(&self) -> Option<String> {
+    fn status_line(&self, _pane: &PaneRef<'_>) -> Option<String> {
         if !self.enabled {
             return None;
         }
@@ -282,7 +282,7 @@ impl OverlayHandler for ModelDataHandler {
     /// The signature is the selected parameter and nothing else, since the bar is
     /// a pure function of it — deliberately **not** `data_generation`, which every
     /// HRRR fetch bumps. `+ 1` keeps the first parameter's signature off `0`.
-    fn legend(&self) -> Option<Signed<OverlayLegend>> {
+    fn legend(&self, _pane: &PaneRef<'_>) -> Option<Signed<OverlayLegend>> {
         if !self.enabled {
             return None;
         }
@@ -304,7 +304,7 @@ impl OverlayHandler for ModelDataHandler {
     /// The [`Whole`](rasterize::ModelDataInput::Whole) carry: an `Arc` clone of
     /// the resident grid, so describing the job costs a refcount and the values
     /// memcpy happens only in the web encoder that knows the texture's bounds.
-    fn prepare_job(&self, _ctx: &RasterizeContext) -> Option<DescribedJob> {
+    fn prepare_job(&self, _ctx: &RasterizeContext, _pane: &PaneRef<'_>) -> Option<DescribedJob> {
         let grid = self.cached_grids.get(self.selected_param)?.clone();
         Some(DescribedJob::new(rasterize::ModelDataInput::Whole(grid)))
     }
@@ -315,7 +315,7 @@ impl OverlayHandler for ModelDataHandler {
             .find(|row| row.label == "overlay/model")
     }
 
-    fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
+    fn create_fetch_tasks(&self, ctx: &FetchConfig, _pane: &PaneRef<'_>) -> Vec<FetchTask> {
         let client = ctx.client.clone();
         let sources = ctx.sources.clone();
         let param = self.selected_param;
@@ -332,7 +332,7 @@ impl OverlayHandler for ModelDataHandler {
         }]
     }
 
-    fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
+    fn controls(&self, _ctx: &PaneRef<'_>) -> Vec<ControlItem> {
         let grid = self.cached_grids.get(self.selected_param);
 
         // f01+ must show its *valid* time and F-hour: a 0-1 h maximum labelled
@@ -416,11 +416,7 @@ impl OverlayHandler for ModelDataHandler {
         items
     }
 
-    fn apply_control(
-        &mut self,
-        update: &ControlUpdate,
-        _ctx: &mut PaneControlContextMut<'_>,
-    ) -> ControlEffect {
+    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneMut<'_>) -> ControlEffect {
         match update.id {
             "enabled" => {
                 if let ControlValue::Bool(val) = update.value {
@@ -511,10 +507,7 @@ mod tests {
     }
 
     fn controls_of(h: &ModelDataHandler) -> Vec<ControlItem> {
-        h.controls(&PaneControlContext {
-            pane_idx: 0,
-            pane_state: None,
-        })
+        h.controls(&PaneRef::bare(0))
     }
 
     fn toggle_label(h: &ModelDataHandler) -> String {
@@ -752,11 +745,8 @@ mod tests {
         }
     }
 
-    fn control_ctx<'a>() -> PaneControlContextMut<'a> {
-        PaneControlContextMut {
-            pane_idx: 0,
-            pane_state: None,
-        }
+    fn control_ctx<'a>() -> PaneMut<'a> {
+        PaneMut::bare(0)
     }
 
     fn full_cache() -> ModelDataHandler {
@@ -800,7 +790,7 @@ mod tests {
             h.selected_param = p;
             assert!(h.has_data(), "the pane showing {p:?} has no grid");
             assert!(
-                h.prepare_job(&rasterize_ctx()).is_some(),
+                h.prepare_job(&rasterize_ctx(), &PaneRef::bare(0)).is_some(),
                 "the pane showing {p:?} would be skipped by app_fetch and left \
                  drawing a stale texture",
             );
@@ -905,7 +895,7 @@ mod tests {
         let p = h.cached_grids.recency_order()[0];
         h.selected_param = p;
         assert!(
-            h.prepare_job(&rasterize_ctx()).is_some(),
+            h.prepare_job(&rasterize_ctx(), &PaneRef::bare(0)).is_some(),
             "the fixture must answer a rasterize",
         );
         counted_as_a_use(&h, p, "prepare_job");

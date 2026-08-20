@@ -248,6 +248,7 @@ pub(super) fn render_pane_map_content(
                         &painter,
                         clear_of_bottom_chrome(ui.max_rect(), ctx.color_scale_floor),
                         ctx.horizontal_color_scale,
+                        ctx.pane_idx,
                         ctx.pane,
                         ctx.overlays,
                         ctx.preferences,
@@ -909,6 +910,7 @@ pub(super) fn color_scale_gutter(
     measure: &egui::Painter,
     pane_rect: egui::Rect,
     horizontal: bool,
+    pane_idx: usize,
     pane: &PaneState,
     overlays: &OverlayRegistry,
     prefs: &UserPreferences,
@@ -936,6 +938,7 @@ pub(super) fn color_scale_gutter(
 
     // The radar bar stands on the margin; each stacked overlay bar stands one
     // bar-and-gap further in. Every one is measured, not the innermost alone.
+    let view = pane.view(pane_idx);
     let ticks = memoized_ticks(measure.ctx(), pane, prefs);
     let mut reach = legend_block_reach(measure, horizontal, 0.0, &ticks, product.unit_label(prefs));
     let mut offset = 0.0;
@@ -943,7 +946,7 @@ pub(super) fn color_scale_gutter(
         if *id == known::COLOR_SCALE || !pane.is_overlay_enabled(id) {
             continue;
         }
-        let Some(overlay) = overlays.legend(id) else {
+        let Some(overlay) = overlays.legend(id, &view.layer(id)) else {
             continue;
         };
         if overlay.items.thresholds.len() < 2 {
@@ -1022,11 +1025,14 @@ pub(super) fn color_scale_free_rect(
     measure: &egui::Painter,
     pane_rect: egui::Rect,
     horizontal: bool,
+    pane_idx: usize,
     pane: &PaneState,
     overlays: &OverlayRegistry,
     prefs: &UserPreferences,
 ) -> egui::Rect {
-    let gutter = color_scale_gutter(measure, pane_rect, horizontal, pane, overlays, prefs);
+    let gutter = color_scale_gutter(
+        measure, pane_rect, horizontal, pane_idx, pane, overlays, prefs,
+    );
     let mut free = pane_rect;
     if horizontal {
         // Bars along the bottom; the titles sit beside them, on the same edge.
@@ -1283,12 +1289,13 @@ pub(super) fn render_color_scales(
     painter: &egui::Painter,
     pane_rect: egui::Rect,
     horizontal: bool,
+    pane_idx: usize,
     pane: &PaneState,
     overlays: &OverlayRegistry,
     prefs: &UserPreferences,
 ) {
     render_color_scale(painter, pane_rect, horizontal, pane, prefs);
-    render_overlay_color_scales(painter, pane_rect, horizontal, pane, overlays);
+    render_overlay_color_scales(painter, pane_rect, horizontal, pane_idx, pane, overlays);
 }
 
 /// The part of `pane_rect` the colour-scale legend may draw in: the pane, less
@@ -1665,9 +1672,11 @@ fn render_overlay_color_scales(
     pane_rect: egui::Rect,
     // Same panel-wide orientation as the radar color scale.
     horizontal: bool,
+    pane_idx: usize,
     pane: &PaneState,
     overlays: &OverlayRegistry,
 ) {
+    let view = pane.view(pane_idx);
     // Offset each overlay legend to the left of (vertical) or above
     // (horizontal) the radar scale.
     let mut bar_offset = 0;
@@ -1676,7 +1685,7 @@ fn render_overlay_color_scales(
         if !pane.is_overlay_enabled(id) || *id == known::COLOR_SCALE {
             continue;
         }
-        let Some(legend) = overlays.legend(id) else {
+        let Some(legend) = overlays.legend(id, &view.layer(id)) else {
             continue;
         };
         if legend.items.thresholds.len() < 2 {

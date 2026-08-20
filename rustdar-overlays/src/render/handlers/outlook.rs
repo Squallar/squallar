@@ -1,11 +1,11 @@
+use crate::render::overlay_state::{PaneMut, PaneRef};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::fetch_policy::Assembled;
 use crate::render::controls::{
-    ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
-    PaneControlContextMut,
+    ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue,
 };
 use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
@@ -399,7 +399,7 @@ impl OverlayHandler for SpcOutlookHandler {
     }
 
     /// E.g. `"Day 1 - Categorical, Tornado"`.
-    fn status_line(&self) -> Option<String> {
+    fn status_line(&self, _pane: &PaneRef<'_>) -> Option<String> {
         if !self.is_enabled() {
             return None;
         }
@@ -536,7 +536,7 @@ impl OverlayHandler for SpcOutlookHandler {
         // not on a data ID.
     }
 
-    fn prepare_job(&self, ctx: &RasterizeContext) -> Option<DescribedJob> {
+    fn prepare_job(&self, ctx: &RasterizeContext, _pane: &PaneRef<'_>) -> Option<DescribedJob> {
         self.paint_input(ctx).map(DescribedJob::new)
     }
 
@@ -546,7 +546,7 @@ impl OverlayHandler for SpcOutlookHandler {
             .find(|row| row.label == "overlay/outlooks")
     }
 
-    fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
+    fn create_fetch_tasks(&self, ctx: &FetchConfig, _pane: &PaneRef<'_>) -> Vec<FetchTask> {
         if self.enabled_products.is_empty() {
             return Vec::new();
         }
@@ -588,7 +588,7 @@ impl OverlayHandler for SpcOutlookHandler {
             .collect()
     }
 
-    fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
+    fn controls(&self, _ctx: &PaneRef<'_>) -> Vec<ControlItem> {
         let mut items = vec![ControlItem::Heading {
             text: "SPC Outlooks".into(),
         }];
@@ -654,11 +654,7 @@ impl OverlayHandler for SpcOutlookHandler {
         items
     }
 
-    fn apply_control(
-        &mut self,
-        update: &ControlUpdate,
-        _ctx: &mut PaneControlContextMut<'_>,
-    ) -> ControlEffect {
+    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneMut<'_>) -> ControlEffect {
         match update.id {
             "day1" | "day2" | "day3" | "day4" | "day5" | "day6" | "day7" | "day8" => {
                 let new_day = match update.id {
@@ -830,10 +826,7 @@ mod tests {
         );
 
         let ids: Vec<&str> = handler
-            .controls(&PaneControlContext {
-                pane_idx: 0,
-                pane_state: None,
-            })
+            .controls(&PaneRef::bare(0))
             .into_iter()
             .filter_map(|item| match item {
                 ControlItem::Toggle { id, .. } => Some(id),
@@ -847,7 +840,7 @@ mod tests {
         );
 
         assert_eq!(
-            handler.status_line().as_deref(),
+            handler.status_line(&PaneRef::bare(0)).as_deref(),
             Some("Day 3 - Probabilistic"),
             "the status line names the selection, not the implied product"
         );
@@ -863,7 +856,7 @@ mod tests {
             viewport: None,
         };
         assert_eq!(
-            handler.create_fetch_tasks(&ctx).len(),
+            handler.create_fetch_tasks(&ctx, &PaneRef::bare(0)).len(),
             2,
             "Probabilistic and its significant area are two tasks"
         );
@@ -1094,12 +1087,16 @@ mod tests {
     #[test]
     fn the_status_line_names_the_day_and_its_enabled_products() {
         let mut handler = SpcOutlookHandler::new();
-        assert_eq!(handler.status_line(), None, "off means no line");
+        assert_eq!(
+            handler.status_line(&PaneRef::bare(0)),
+            None,
+            "off means no line"
+        );
 
         handler.enabled_products.insert(OutlookProduct::Tornado);
         handler.enabled_products.insert(OutlookProduct::Categorical);
         assert_eq!(
-            handler.status_line().as_deref(),
+            handler.status_line(&PaneRef::bare(0)).as_deref(),
             Some("Day 1 - Categorical, Tornado"),
             "publication order, not set-iteration order"
         );
@@ -1153,10 +1150,7 @@ mod tests {
     }
 
     fn toggle(handler: &mut SpcOutlookHandler, id: &'static str, on: bool) -> ControlEffect {
-        let mut ctx = PaneControlContextMut {
-            pane_idx: 0,
-            pane_state: None,
-        };
+        let mut ctx = PaneMut::bare(0);
         handler.apply_control(
             &ControlUpdate {
                 id,
@@ -1413,10 +1407,7 @@ mod tests {
         round(&mut h, vec![(Categorical, Err(transient()))]);
         assert!(h.state.retry.is_unhealthy(), "premise");
 
-        let mut ctx = PaneControlContextMut {
-            pane_idx: 0,
-            pane_state: None,
-        };
+        let mut ctx = PaneMut::bare(0);
         let effect = h.apply_control(
             &ControlUpdate {
                 id: "day2",
@@ -1604,7 +1595,7 @@ mod tests {
             for &p in &OutlookDay::Day1.products()[..products] {
                 h.enabled_products.insert(p);
             }
-            let built = h.create_fetch_tasks(&ctx).len();
+            let built = h.create_fetch_tasks(&ctx, &PaneRef::bare(0)).len();
             h.set_fetching(true);
             assert_eq!(
                 h.outstanding, built,

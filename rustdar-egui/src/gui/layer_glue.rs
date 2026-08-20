@@ -1,6 +1,7 @@
 //! The [`Gui`]'s overlay-registry access and pane-config swap sites, split out of
 //! `ui.rs` — the whole enclosing fn of each.
 use super::*;
+use rustdar_source::handler::PaneMut;
 use rustdar_source::id::LayerId;
 
 impl Gui {
@@ -44,10 +45,7 @@ impl Gui {
         #[cfg(not(test))]
         let _ = probe;
 
-        let mut pane_ctx = PaneControlContextMut {
-            pane_idx: self.active_pane,
-            pane_state: None,
-        };
+        let mut pane_ctx = PaneMut::bare(self.active_pane);
 
         let active_pane = self.active_pane;
         for (kind, update) in updates {

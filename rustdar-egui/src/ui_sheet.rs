@@ -700,7 +700,7 @@ impl super::Gui {
             }
             let body_id = match page {
                 SheetPage::Layers => {
-                    let statuses = self.stack_row_statuses(&pane);
+                    let statuses = self.stack_row_statuses(self.active_pane, &pane);
                     self.render_stack(ctx, slot, &mut pane, &statuses, actions);
                     "layers_panel"
                 }

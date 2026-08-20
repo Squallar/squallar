@@ -2,6 +2,7 @@
 //! drivers it dispatches — the auto-polls, the initial zoom claim, the pending
 //! appliers, the time dialog and the dismiss chain.
 use super::*;
+use rustdar_source::handler::PaneRef;
 
 impl Gui {
     /// Create the UI using egui.
@@ -105,11 +106,8 @@ impl Gui {
 
     /// The read-side context handlers are asked for their controls with, aimed at
     /// the active pane.
-    pub(super) fn active_pane_control_context(&self) -> PaneControlContext<'_> {
-        PaneControlContext {
-            pane_idx: self.active_pane,
-            pane_state: None,
-        }
+    pub(super) fn active_pane_control_context(&self) -> PaneRef<'_> {
+        PaneRef::bare(self.active_pane)
     }
 
     /// Check timers and emit fetch actions for auto-polling radar scans, NWS
