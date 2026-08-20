@@ -258,15 +258,15 @@ fn a_loop_frame_and_the_still_frame_beside_it_fold_at_the_same_speed() {
         lat: site.lat,
         lon: site.lon,
     };
-    let frame = app
-        .loop_mgr
-        .frame_data(SITE, RadarProduct::NormalizedRotation, &volume_time())
-        .expect("the fixture cached this frame's volume");
+    assert!(
+        app.loop_mgr
+            .frame_data_arrived(SITE, RadarProduct::NormalizedRotation, &volume_time()),
+        "the fixture cached this frame's volume",
+    );
     assert!(
         app.spawn_loop_frame_render(
             0,
             volume_time(),
-            frame,
             params,
             rustdar_egui::pane::RenderTarget {
                 site: SITE.to_string(),

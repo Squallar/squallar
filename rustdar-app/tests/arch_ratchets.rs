@@ -38,6 +38,8 @@
 //!  8   config-swap occurrences, six crates                0    -  rg -o 'load_pane''_configs|save_pane''_configs|loaded_''configs' rustdar-{overlays,egui,app,radar,source,worker} --glob '*.rs' | wc -l
 //!  9a  radar-geometry definitions in rustdar-radar        1    -  rg -o 'struct Loop''Geometry' rustdar-radar --glob '*.rs' | wc -l
 //!  9b  ... in rustdar-egui                                 0    1  rg -o 'struct Loop''Geometry' rustdar-egui --glob '*.rs' | wc -l
+//! 10a loop-frame-arm occurrences, rustdar-app             8   17  rg -o 'Loop''FrameData|L3Frame''Key|Cached''Volume' rustdar-app --glob '*.rs' | wc -l
+//! 10b ... excluding test-named paths                      2    6  rg -o 'Loop''FrameData|L3Frame''Key|Cached''Volume' rustdar-app --glob '*.rs' -g '!*tests*' | wc -l
 //! ```
 //!
 //! Rows 1b, 2, 6, 7a and 7b were already pinned at their measured values and do
@@ -92,6 +94,18 @@ const SWAP_REPLACEMENT: &str = concat!("serialize_pane", "_state");
 /// `rustdar-egui`.
 const GEOMETRY_DEF: &str = concat!("struct Loop", "Geometry");
 
+/// Row 10 — the closed arms a loop frame's data comes in, and the two aliases
+/// that key their caches. Split so this file never holds one contiguously.
+const LOOP_FRAME_ARMS: [&str; 3] = [
+    concat!("Loop", "FrameData"),
+    concat!("L3Frame", "Key"),
+    concat!("Cached", "Volume"),
+];
+/// The presence control for row 10: the manager whose caches those three name.
+/// If the walk stops seeing this in `rustdar-radar`, the needles have rotted
+/// and both counts below mean nothing.
+const LOOP_MANAGER_DEF: &str = concat!("struct LoopDownload", "Manager");
+
 // --------------------------------------------------------------------------- Ceilings
 // — at-land measurements (see the table above).
 
@@ -121,6 +135,37 @@ const PRODUCT_IN_EGUI_MAX: usize = 439;
 /// listing arrives on the one source path now — so the hub holds one pair
 /// fewer. Lowered in the land that earned it, never raised.
 const HUB_RECEIVER_MAX: usize = 17;
+
+/// Row 10a — **8 since WO-M12d, down from 17, and this ceiling records a real
+/// remainder rather than pretending it is gone.**
+///
+/// All eight are test-side reads of radar's own frame payload; the remainder is
+/// what could not be shed without moving an assertion value, which ruling
+/// (23)(b) forbids: three pin suites match the arms directly
+/// (`loop_dispatch_tests` twice, `loop_level3_tests`, `loop_scan_cache_tests`)
+/// and two build a cached volume through its alias. Re-pointing those to an
+/// accessor would change what they assert, not how it is spelled.
+///
+/// **What the number does NOT include, because it is 0**: any production
+/// occurrence — see [`LOOP_FRAME_ARMS_NON_TEST_MAX`]. The remaining reachable
+/// step is the decoded-volume cache move (`frames_resident`/`retain_frames`),
+/// blocked with M12c's Level III collapse; ruling (25) named both as parts of
+/// radar's bespoke half.
+const LOOP_FRAME_ARMS_MAX: usize = 8;
+/// Row 10b — the same needles outside test-named paths.
+///
+/// **2, and both are `#[cfg(test)]` items sitting in a production FILE**: the
+/// `use` at the top of `app_render.rs` and the return type of the `frame_data`
+/// wrapper below it, kept there so the three suites that reach them through
+/// `use super::*` need no edit at all. **Production loop dispatch names neither
+/// arm**: it asks the layer for the described render job a frame's data makes
+/// (`LoopDownloadManager::frame_render_job`) and hands it to the funnel with
+/// its input type erased, which is what WO-M12d's ratchet was for.
+///
+/// This may only reach 0 by those two items moving to a test-named module —
+/// worth doing in a land that has a reason to open the file, and NOT worth a
+/// glob re-export whose only effect is to hide a needle from this walk.
+const LOOP_FRAME_ARMS_NON_TEST_MAX: usize = 2;
 
 // --------------------------------------------------------------------------- Walker +
 // counters (std-only, pure file reads).
@@ -442,5 +487,62 @@ fn the_radar_geometry_type_is_defined_in_radar_and_not_in_egui() {
          ({GEOMETRY_DEF:?}). Radar's own types belong in rustdar-radar; \
          rustdar-egui reads this one back out of `LayerTimeState::anchor` and \
          never declares it. See WO-M12e, and ruling (15) as amended by (23).",
+    );
+}
+
+/// Row 10 — the closed arms a loop frame's data comes in stay radar's.
+///
+/// Split so neither half can pass on a haystack the walk never reached: the
+/// needles must be ALIVE in `rustdar-radar` (they are radar's own vocabulary
+/// and are not going away), and the counts in `rustdar-app` are what may only
+/// fall. See WO-M12d and ruling (25).
+#[test]
+fn the_loop_frame_arms_stay_radars_own_vocabulary() {
+    let crate_root = Path::new(ROOT).join("rustdar-app");
+    let app = load_tree(&crate_root);
+    let radar = load_tree(&Path::new(ROOT).join("rustdar-radar"));
+    assert_anchored(&app, "src/app_render.rs", concat!("fn frame_", "sweep("));
+    assert_eq!(
+        count(&radar, LOOP_MANAGER_DEF),
+        1,
+        "presence control: the loop download manager is not defined in \
+         rustdar-radar. Either it moved, or the needle {LOOP_MANAGER_DEF:?} \
+         rotted — and a rotted needle would leave both counts below green over \
+         anything.",
+    );
+    for needle in LOOP_FRAME_ARMS {
+        assert!(
+            count(&radar, needle) > 0,
+            "presence control: {needle:?} is not named anywhere in \
+             rustdar-radar, so counting it in rustdar-app is counting a dead \
+             needle. Re-anchor this ratchet in the land that renamed it.",
+        );
+    }
+
+    let total: usize = LOOP_FRAME_ARMS.iter().map(|n| count(&app, n)).sum();
+    let non_test: usize = app
+        .iter()
+        .filter(|(p, _)| !in_test_path(p, &crate_root))
+        .map(|(_, t)| {
+            LOOP_FRAME_ARMS
+                .iter()
+                .map(|n| t.matches(*n).count())
+                .sum::<usize>()
+        })
+        .sum();
+
+    assert!(
+        non_test <= LOOP_FRAME_ARMS_NON_TEST_MAX,
+        "a production file in rustdar-app names a loop frame's closed arms \
+         again: {non_test} occurrences > ceiling \
+         {LOOP_FRAME_ARMS_NON_TEST_MAX}. The dispatch path asks the layer for \
+         the described job a frame's data makes and never holds the arms — see \
+         WO-M12d.",
+    );
+    assert!(
+        total <= LOOP_FRAME_ARMS_MAX,
+        "the loop-frame vocabulary shared with rustdar-app grew: {total} \
+         occurrences > ceiling {LOOP_FRAME_ARMS_MAX}. Lower this in the land \
+         that sheds one; never raise it.",
     );
 }
