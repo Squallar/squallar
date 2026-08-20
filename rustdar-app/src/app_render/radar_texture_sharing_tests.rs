@@ -397,7 +397,7 @@ fn stamped_elevation(app: &mut crate::app::App, pane_idx: usize) -> f32 {
 /// Clicking to another tilt on a tilt-independent pane costs no upload — and
 /// still moves the label.
 ///
-/// `render_cache_key` collapses these four onto `NO_ELEVATION_SLOT`, so the
+/// `render_cache_key` leaves the elevation part out of all four, so the
 /// dispatch pass finds the render already there. But `needs_render` compares
 /// the raw elevation and is still true, so `apply_render_to_pane` ran anyway
 /// and put the whole raster back on the GPU to redraw a picture provably

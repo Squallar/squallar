@@ -728,6 +728,70 @@ fn a_tilt_reset_keeps_the_other_tilts_cached_renders() {
     );
 }
 
+/// A tilt-independent plan view has no tilt for a tilt reset to name, so a
+/// completed 0.0° sweep does not evict it.
+///
+/// **The angle is 0.0° on purpose.** Before WO-E5c the elevation part was an
+/// `i32` whose "no elevation" value was `NO_ELEVATION_SLOT = 0`, and this
+/// reset compared it against `elevation_key(angle)` — where `0` is also the
+/// bucket a genuine 0.0° render lands in. So a completed sweep at 0.0° evicted
+/// every tilt-independent entry for the site, for no reason anyone stated:
+/// those four products draw the same picture at every tilt, the pane half of
+/// this reset already skips them, and the invalidation that genuinely owns
+/// them is the whole-site one. The typed key's `Option` cannot collide, and
+/// this pins that it does not.
+#[test]
+fn a_tilt_reset_keeps_a_tilt_independent_plan_views_cached_render() {
+    use rustdar_radar::types::RenderView;
+    // Found rather than named, so the pin cannot rot into testing the ordinary
+    // path if the set is re-cut.
+    let tilt_blind = *RadarProduct::all()
+        .iter()
+        .find(|p| p.tilt_independent_plan_view())
+        .expect(
+            "premise: some product must key with no elevation part, or there is \
+             nothing here to be immune",
+        );
+    assert!(
+        !RadarProduct::Reflectivity.tilt_independent_plan_view(),
+        "premise: the control product must be tilt-dependent",
+    );
+
+    let gui = gui_on_tilt("KOUN", RadarProduct::Reflectivity, 0.0, &[0.0, 4.0]);
+    let mut d = RenderDispatcher::new();
+    d.ensure_pane_count(1);
+    d.cache_render("KOUN", tilt_blind, RenderView::PlanView, 3.0, cached(1.0));
+    // The control, and the reason this test cannot pass on a reset that evicts
+    // nothing: a tilt-dependent entry in the 0.0° bucket must still go.
+    d.cache_render(
+        "KOUN",
+        RadarProduct::Reflectivity,
+        RenderView::PlanView,
+        0.0,
+        cached(2.0),
+    );
+
+    d.reset_panes_for_tilts("KOUN", &gui, &[0.0]);
+
+    assert!(
+        d.get_cached_render("KOUN", tilt_blind, RenderView::PlanView, 3.0)
+            .is_some(),
+        "a 0.0° sweep evicted {tilt_blind:?}, a tilt-independent plan view — the sentinel is \
+         back, and the picture it threw away is the same at every tilt",
+    );
+    assert!(
+        d.get_cached_render(
+            "KOUN",
+            RadarProduct::Reflectivity,
+            RenderView::PlanView,
+            0.0
+        )
+        .is_none(),
+        "control: the completed tilt's own stale image survived, so this reset \
+         evicted nothing and the assertion above proves nothing",
+    );
+}
+
 /// The flag list is bounded by what is still stoppable, not by how many renders
 /// a session has dispatched.
 ///

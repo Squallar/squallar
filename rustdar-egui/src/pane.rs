@@ -175,13 +175,13 @@ pub struct SectionImageData {
 /// One field has neither problem, and the arms are what force every consumer to
 /// say which shape it means.
 ///
-/// That is the loop path's half of the axis [`RenderCacheKey`]'s doc describes:
+/// That is the loop path's half of the axis [`RenderKey`]'s doc describes:
 /// a plan view and a section of the same product at the same site are the same
 /// `(site, product, elevation)` and completely different pictures. On the static
 /// path they would collide in an LRU; here they would collide in a **broadcast**
 /// — see [`LoopPlaybackState::view`].
 ///
-/// [`RenderCacheKey`]: https://docs.rs/rustdar-app
+/// [`RenderKey`]: https://docs.rs/rustdar-app
 #[derive(Clone)]
 pub enum LoopFrameImage {
     /// A square plan-view raster, positioned by the site's coordinates.
@@ -737,7 +737,7 @@ pub struct LoopPlaybackState {
     /// So the acceptance, donation and result-placement predicates all test it
     /// — and each tests it against the *result's* view, not against the
     /// receiving pane's kind, because a pane and a result can both be sections
-    /// and still disagree about which. That is the same lesson `RenderCacheKey`
+    /// and still disagree about which. That is the same lesson `RenderKey`
     /// learnt on the static path, where the collision is a wrong-shaped buffer
     /// handed to `ColorImage::from_rgba_unmultiplied`'s `assert_eq!` on the main
     /// thread rather than a wrong picture.

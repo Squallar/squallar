@@ -9,6 +9,7 @@ use rustdar_radar::types::{RadarProduct, RenderView};
 
 use crate::WindowRef;
 use crate::channels::RenderResponse;
+use crate::render_key::{RenderKey, elevation_key, render_cache_key};
 use rustdar_device_profile::budget::Budgets;
 
 /// Drop guard that decrements an AtomicUsize counter on drop.
@@ -101,7 +102,7 @@ pub struct PaneRenderState {
     /// — on the raw elevation, say — would suppress a render whose result the
     /// cache would then file under another key, and the pane that skipped would
     /// never be served.
-    in_flight_plan_view: Option<RenderCacheKey>,
+    in_flight_plan_view: Option<RenderKey>,
     /// Last rendered radar parameters to detect changes.
     pub last_rendered: Option<(RadarProduct, f32)>,
     /// Cached render for instant texture restore after suspend/resume.
@@ -156,9 +157,9 @@ impl PaneRenderState {
     /// only reader is the plan-view dispatch, which asks "is this picture
     /// already being made"; a section pane and a map pane can hold the same
     /// `(site, product, elevation)` and are not making the same picture, and
-    /// [`RenderCacheKey`]'s view axis exists to say so. Keeping sections out of
+    /// [`RenderKey`]'s view axis exists to say so. Keeping sections out of
     /// this field entirely is one fewer way for that axis to be got wrong.
-    pub fn render_started(&mut self, key: Option<RenderCacheKey>) {
+    pub fn render_started(&mut self, key: Option<RenderKey>) {
         self.render_in_flight = true;
         self.in_flight_plan_view = key;
     }
@@ -235,24 +236,6 @@ pub struct CachedRenderOutput {
     pub storm_motion: Option<rustdar_radar::srv::SrvMotion>,
 }
 
-/// `(site, product, view, elevation_tenths)` — see [`elevation_key`] and
-/// [`render_cache_key`].
-///
-/// # Why the view is in the key
-///
-/// The cache is shared between panes, and what it shares is a *buffer*. A plan
-/// view of reflectivity and a cross-section of reflectivity at the same site
-/// are the same `(site, product, elevation)` and completely different shapes —
-/// a square of ground against `SECTION_WIDTH × SECTION_HEIGHT` of a
-/// vertical plane. Without this axis they collide in the LRU and one pane is
-/// handed the other's buffers, which is not a wrong picture: it is a texture of
-/// the wrong shape stretched over a pane's geography, with the hover reading
-/// a vertical plane's values through a plan view's bounds.
-///
-/// It is added now, while the cache still holds only plan-view rasters, because
-/// this is the last moment at which the change is mechanical.
-pub type RenderCacheKey = (String, RadarProduct, RenderView, i32);
-
 /// Bounded least-recently-used cache of render outputs shared between panes.
 ///
 /// Each entry is a `side²` image plus a `side²` `f32` value grid — 32 MiB
@@ -264,8 +247,8 @@ pub type RenderCacheKey = (String, RadarProduct, RenderView, i32);
 /// oldest use first. Every method that touches one touches the other; the pair
 /// is private so no caller can desynchronise them.
 pub struct RenderCache {
-    entries: HashMap<RenderCacheKey, CachedRenderOutput>,
-    recency: VecDeque<RenderCacheKey>,
+    entries: HashMap<RenderKey, CachedRenderOutput>,
+    recency: VecDeque<RenderKey>,
     capacity: usize,
     /// Bytes the resident entries occupy, kept in step with `entries` by
     /// [`Self::insert`], [`Self::retain`] and [`Self::clear`] — the three
@@ -319,7 +302,7 @@ impl RenderCache {
     }
 
     /// Move `key` to the most-recently-used end. No-op if absent.
-    fn touch(&mut self, key: &RenderCacheKey) {
+    fn touch(&mut self, key: &RenderKey) {
         if let Some(pos) = self.recency.iter().position(|k| k == key) {
             let k = self
                 .recency
@@ -333,7 +316,7 @@ impl RenderCache {
     ///
     /// Takes `&mut self` deliberately: a lookup that did not count as a use would
     /// let the pane currently on screen age out while an unwatched one survived.
-    pub fn get(&mut self, key: &RenderCacheKey) -> Option<&CachedRenderOutput> {
+    pub fn get(&mut self, key: &RenderKey) -> Option<&CachedRenderOutput> {
         if !self.entries.contains_key(key) {
             return None;
         }
@@ -348,7 +331,7 @@ impl RenderCache {
     /// the byte budget: the loop stops while it is the only thing left, because
     /// a cache that refused the render just handed to it would make the pane
     /// that asked re-render forever.
-    pub fn insert(&mut self, key: RenderCacheKey, value: CachedRenderOutput) {
+    pub fn insert(&mut self, key: RenderKey, value: CachedRenderOutput) {
         let bytes = Self::entry_bytes(&value);
         if let Some(old) = self.entries.insert(key.clone(), value) {
             // Replacing an existing entry: it is already in `recency`, just refresh it.
@@ -371,7 +354,7 @@ impl RenderCache {
     }
 
     /// Drop every entry whose key fails `keep`.
-    pub fn retain(&mut self, keep: impl Fn(&RenderCacheKey) -> bool) {
+    pub fn retain(&mut self, keep: impl Fn(&RenderKey) -> bool) {
         let freed: usize = self
             .entries
             .iter()
@@ -407,60 +390,9 @@ impl RenderCache {
 
     /// Keys ordered least- to most-recently-used.
     #[cfg(test)]
-    pub fn recency_order(&self) -> Vec<RenderCacheKey> {
+    pub fn recency_order(&self) -> Vec<RenderKey> {
         self.recency.iter().cloned().collect()
     }
-}
-
-/// Quantize an elevation angle to tenths of a degree for cache key use.
-///
-/// Coarser than `rustdar_egui::pane::ELEVATION_TOLERANCE`, deliberately: that is a
-/// pairwise comparison, this has to be a hashable bucket, and no exact bucketing
-/// agrees with a tolerance at the edges. Tenths is finer than any real sweep spacing,
-/// so two selections that compare equal never land in different buckets in practice.
-fn elevation_key(elevation: f32) -> i32 {
-    (elevation * 10.0).round() as i32
-}
-
-/// The elevation slot for a view that has no elevation.
-///
-/// A section cuts across every tilt and a voxel grid resamples all of them, so
-/// the pane's nominal elevation says nothing about the buffer — two sections of
-/// one product at one site are the same render whatever tilt each pane's
-/// selector happens to be parked on, and keying them apart would store the same
-/// picture several times and evict the plan views to do it.
-///
-/// **A sentinel would have been wrong here and the view axis is what makes this
-/// safe.** Any `i32` chosen for "no elevation" collides with a real
-/// [`elevation_key`] — `0` is a genuine 0.0° plan render — so before the key
-/// carried the view there was no value this could be. With the view in the key
-/// the slot is only ever compared against other entries of the same view, so
-/// `0` is not a sentinel at all: it is the one bucket a viewless render has.
-const NO_ELEVATION_SLOT: i32 = 0;
-
-/// The cache key for one render, and the only place one is built.
-///
-/// Written once rather than at each call site because the three rules above —
-/// which axis discriminates, which slot a viewless view uses, and which
-/// `(view, product)` pairs have no tilt to discriminate on — are the kind that
-/// a second copy gets half right.
-///
-/// The third of those is [`RenderView::elevation_selects_picture`], asked
-/// rather than restated here: the loop path keys its frames on the same
-/// question, and the two answering it separately is what let a section loop
-/// discard every frame for a tilt no section can see.
-fn render_cache_key(
-    site: &str,
-    product: RadarProduct,
-    view: RenderView,
-    elevation: f32,
-) -> RenderCacheKey {
-    let elevation = if view.elevation_selects_picture(product) {
-        elevation_key(elevation)
-    } else {
-        NO_ELEVATION_SLOT
-    };
-    (site.to_string(), product, view, elevation)
 }
 
 /// Whether a render of `view` showing `product` has to be given the whole
@@ -1161,9 +1093,8 @@ impl RenderDispatcher {
                 prs.last_rendered = None;
             }
         }
-        self.render_cache.retain(|(_site, product, _view, _elev)| {
-            *product != RadarProduct::StormRelativeVelocity
-        });
+        self.render_cache
+            .retain(|k| k.select.product != RadarProduct::StormRelativeVelocity);
         true
     }
 
@@ -1214,7 +1145,7 @@ impl RenderDispatcher {
             }
         }
         self.render_cache
-            .retain(|(s, product, _view, _elev)| s != site || !product.reads_env_heights());
+            .retain(|k| k.select.site != site || !k.select.product.reads_env_heights());
         true
     }
 
@@ -1256,8 +1187,8 @@ impl RenderDispatcher {
                 prs.last_rendered = None;
             }
         }
-        self.render_cache.retain(|(s, product, _view, _elev)| {
-            s != site || *product != RadarProduct::HydrometeorClassification
+        self.render_cache.retain(|k| {
+            k.select.site != site || k.select.product != RadarProduct::HydrometeorClassification
         });
         true
     }
@@ -1303,8 +1234,8 @@ impl RenderDispatcher {
                 prs.last_rendered = None;
             }
         }
-        self.render_cache.retain(|(s, product, _view, _elev)| {
-            s != site || *product != RadarProduct::StormRelativeVelocity
+        self.render_cache.retain(|k| {
+            k.select.site != site || k.select.product != RadarProduct::StormRelativeVelocity
         });
         true
     }
@@ -1334,8 +1265,7 @@ impl RenderDispatcher {
             }
         }
         self.level3_data.retain(|(_code, s), _| s != site);
-        self.render_cache
-            .retain(|(s, _prod, _view, _elev)| s != site);
+        self.render_cache.retain(|k| k.select.site != site);
     }
 
     /// The narrow counterpart to [`reset_panes_for_site`], for the real-time
@@ -1378,13 +1308,15 @@ impl RenderDispatcher {
         });
         // Only the tilts that changed. A whole-site `retain` would throw away the
         // images the untouched panes are still sharing.
-        self.render_cache.retain(|(s, _prod, view, elev)| {
-            // Elevation-blind for the vertical views, whose slot is
-            // `NO_ELEVATION_SLOT` rather than a tilt: a completed cut changes
-            // what a section is cut from whatever tilt the pane names.
-            s != site
-                || !(match view {
-                    RenderView::PlanView => angles.iter().any(|a| elevation_key(*a) == *elev),
+        self.render_cache.retain(|k| {
+            // Elevation-blind for the vertical views, whose elevation part is
+            // absent rather than a tilt: a completed cut changes what a section
+            // is cut from whatever tilt the pane names.
+            k.select.site != site
+                || !(match k.view {
+                    RenderView::PlanView => angles
+                        .iter()
+                        .any(|a| k.select.elevation_tenths == Some(elevation_key(*a))),
                     RenderView::CrossSection | RenderView::Volume => true,
                 })
         });
@@ -2510,7 +2442,7 @@ impl RenderDispatcher {
     /// the render either way.
     ///
     /// `site` is here for one reason: it completes the
-    /// [`RenderCacheKey`] this render will be *filed* under, and this is where
+    /// [`RenderKey`] this render will be *filed* under, and this is where
     /// that key is recorded as in flight
     /// ([`PaneRenderState::in_flight_plan_view`]). Both callers already hold
     /// the site, and building the key here rather than at each of them is what

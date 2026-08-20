@@ -1,12 +1,14 @@
 use super::*;
 use rustdar_device_profile::constants::MAX_RENDER_CACHE_ENTRIES;
 
-fn key(site: &str, elevation_tenths: i32) -> RenderCacheKey {
-    (
-        site.to_string(),
+/// A plan-view key at `elevation_tenths` tenths of a degree, built through the
+/// one construction site so these tests key exactly as production does.
+fn key(site: &str, elevation_tenths: i32) -> RenderKey {
+    render_cache_key(
+        site,
         RadarProduct::Reflectivity,
         RenderView::PlanView,
-        elevation_tenths,
+        elevation_tenths as f32 / 10.0,
     )
 }
 
@@ -145,7 +147,7 @@ fn retain_drops_keys_from_the_recency_queue_as_well() {
     cache.insert(key("KOUN", 1), output(1.0));
     cache.insert(key("KTLX", 2), output(2.0));
 
-    cache.retain(|(site, _, _, _)| site != "KTLX");
+    cache.retain(|k| k.select.site != "KTLX");
 
     assert_eq!(cache.entry_count(), 1);
     assert_eq!(cache.recency_order(), vec![key("KOUN", 1)]);
@@ -448,7 +450,7 @@ fn a_tilt_change_on_a_sweep_product_is_still_a_miss() {
 }
 
 /// The collapse is per product, and the cache still tells the four apart from
-/// each other and from the other views — a shared `NO_ELEVATION_SLOT` is not a
+/// each other and from the other views — a shared absent elevation part is not a
 /// shared entry.
 #[test]
 fn the_collapsed_products_still_key_apart_from_each_other() {
@@ -621,7 +623,7 @@ fn the_resident_total_survives_replacement_retention_and_clearing() {
         "a replacement double-counted"
     );
 
-    cache.retain(|(site, ..)| site == "KTLX");
+    cache.retain(|k| k.select.site == "KTLX");
     assert_eq!(cache.resident_bytes(), one, "retain did not release bytes");
 
     cache.clear();

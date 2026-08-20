@@ -4,7 +4,7 @@
 //!
 //! A loop frame's picture is identified by a [`RenderTarget`] — today
 //! `(site, product, elevation)`. That shape is about to change: WO-E5 replaces
-//! `RenderTarget`/`RenderCacheKey`/`RenderParams` with a single `RenderKey`
+//! `RenderTarget`/`RenderKey`/`RenderParams` with a single `RenderKey`
 //! built from a `SelectKey`, quantizing the elevation once at construction
 //! instead of comparing it within a tolerance at every read.
 //!
