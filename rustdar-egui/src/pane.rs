@@ -454,6 +454,22 @@ impl TimeMode {
     }
 }
 
+/// **The bucket an instant falls in at `quantum` resolution.**
+///
+/// What a scrubbed pane's texture cache keys an as-of-dependent layer on
+/// instead of the raw instant: dragging the scrubber moves the clock every
+/// frame, and keying on the instant itself would mint a texture per tick.
+/// The quantum is the layer's own
+/// [`SourceHandler::as_of_quantum`](rustdar_source::handler::SourceHandler::as_of_quantum)
+/// — a minute for NWS lifetimes, a second for lightning's fade ramp.
+///
+/// A zero quantum would divide by zero and is floored at one second; the
+/// contract has no zero, and a bucket is not the place to discover that.
+pub fn as_of_bucket(instant: NaiveDateTime, quantum: std::time::Duration) -> i64 {
+    let secs = (quantum.as_secs() as i64).max(1);
+    instant.and_utc().timestamp().div_euclid(secs)
+}
+
 /// **One pane's posture on the timeline**: the instant it depicts, how wide a
 /// window it is looking over, how fast it plays, and how far one step moves
 /// it.

@@ -809,9 +809,14 @@ impl super::App {
                     // live pane's depicted instant cannot drift a nanosecond
                     // from its wall clock.
                     now: clock,
-                    // Live posture: the picture depicts the present. WO-E7
-                    // writes a scrub instant here and leaves `now` alone.
-                    as_of: clock,
+                    // **The instant the picture depicts.** A live pane depicts
+                    // the present, so `as_of == now` and the bytes are what
+                    // they were before this field existed — which is what
+                    // keeps WO-M11's dark parity true permanently, not just
+                    // until someone scrubs. A scrubbed pane hands its own
+                    // clock to the layers whose picture is a function of it,
+                    // and `now` is left alone either way.
+                    as_of: as_of_for_layer(&self.gui, first_pane_idx, id, clock),
                 };
                 // **The real pane, with its siblings.** `PaneView` and not
                 // `layer_ref`: the site table reads the radar slot's `"site"`
@@ -877,6 +882,9 @@ impl super::App {
 
     /// Undo the in-flight marks [`spawn_overlay_render`](Self::spawn_overlay_render)
     /// set on its target panes.
+    ///
+    /// (See [`as_of_for_layer`] for the depicted instant this dispatch hands
+    /// the rasterizer.)
     fn clear_overlay_render_marks(&mut self, pane_indices: &[usize], id: &LayerId) {
         for &pidx in pane_indices {
             if let Some(pane) = self.gui.pane_mut(pidx) {
@@ -1661,6 +1669,39 @@ fn append_polled_frame_to_loops(
     }
 }
 
+/// **The instant a layer's raster should depict, for the pane it is dispatched
+/// from.**
+///
+/// Only a [`TimeAxis::EventLifetime`] layer reads it: its picture is *which of
+/// its items are valid then*, so a scrub has to move it. A `Live` layer draws
+/// whatever it last fetched and ignores the field by contract, and a
+/// `FrameSeries` layer's picture is one named frame rather than a function of
+/// an instant — both keep the wall clock, so neither's bytes move.
+///
+/// `fallback` is the page's own clock, captured once by the caller and handed
+/// to `now` as well, so a live pane's two fields cannot drift apart.
+fn as_of_for_layer(
+    gui: &rustdar_egui::Gui,
+    pane_idx: usize,
+    id: &rustdar_source::id::LayerId,
+    fallback: chrono::NaiveDateTime,
+) -> chrono::NaiveDateTime {
+    let Some(pane) = gui.pane(pane_idx) else {
+        return fallback;
+    };
+    let Some(instant) = pane.time.mode.as_of() else {
+        return fallback;
+    };
+    let event_lifetime = gui.overlays.handlers().any(|handler| {
+        handler.id() == *id
+            && matches!(
+                handler.time_axis(),
+                rustdar_source::time::TimeAxis::EventLifetime
+            )
+    });
+    if event_lifetime { instant } else { fallback }
+}
+
 /// Add a frame at `timestamp` to `ls` if the loop is active, is on `site`, and does
 /// not already have that frame. Returns whether a frame was added.
 fn append_polled_frame(
@@ -1724,6 +1765,10 @@ mod level3_site_gate_tests;
 #[path = "app_fetch/local_time_tests.rs"]
 #[cfg(test)]
 mod local_time_tests;
+
+#[path = "app_fetch/as_of_dispatch_tests.rs"]
+#[cfg(test)]
+mod as_of_dispatch_tests;
 
 #[path = "app_fetch/loop_frame_image_tests.rs"]
 #[cfg(test)]
