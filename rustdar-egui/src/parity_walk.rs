@@ -7,9 +7,7 @@ use crate::ui::{
     is_master_control,
 };
 use crate::ui_layout::WidthClass;
-use rustdar_overlays::hrrr::ModelParameter;
 use rustdar_overlays::render::controls::ControlItem;
-use rustdar_radar::types::RadarProduct;
 use rustdar_source::id::{LayerId, known};
 
 /// One wheel step of the walk's scrolling. Small enough that nothing can jump
@@ -323,15 +321,16 @@ fn walk_catalog(h: &mut InputHarness, width: WidthClass) {
     }
     for kind in crate::sources::default_draw_order() {
         inventory.push((
-            CatalogGroup::Overlays,
+            CatalogGroup::Layers,
             h.overlay_display_name(&kind).to_owned(),
         ));
     }
-    for product in RadarProduct::all() {
-        inventory.push((CatalogGroup::Products, product.name().to_owned()));
-    }
-    for param in ModelParameter::all() {
-        inventory.push((CatalogGroup::Hrrr, param.display_name().to_owned()));
+    // **The fields, derived from the live registry** — the same list the
+    // catalogue renders from, so a source that registers a new group of fields
+    // is walked without an edit here. The floor below is what keeps that from
+    // being a walk of the registry against itself.
+    for (_, spec) in h.gui().overlays.fields() {
+        inventory.push((CatalogGroup::Fields(spec.group), spec.name.to_owned()));
     }
 
     // **The anti-shrink floor**, on the one inventory leg that is *derived*.
@@ -345,7 +344,7 @@ fn walk_catalog(h: &mut InputHarness, width: WidthClass) {
     // constant's own doc; it is the reason this assertion is worth writing.
     let layers_in_inventory = inventory
         .iter()
-        .filter(|(group, _)| *group == CatalogGroup::Overlays)
+        .filter(|(group, _)| matches!(group, CatalogGroup::Layers))
         .count();
     assert_eq!(
         layers_in_inventory,
@@ -354,6 +353,29 @@ fn walk_catalog(h: &mut InputHarness, width: WidthClass) {
          {width:?} but this build registers {} layers — the walk would check \
          that many fewer tiles and still pass",
         crate::sources::REGISTERED_LAYER_COUNT,
+    );
+
+    // **The field floor, and it is new at WO-E9d land 2 because the exposure is
+    // new.** Before this land the field legs were enumerated from
+    // `RadarProduct::all()` / `ModelParameter::all()` — enums in other crates,
+    // and therefore already an independent second spelling of what the
+    // catalogue drew. Deriving the inventory from `fields()` removed that
+    // independence in exactly the way ruling (30) described for layers: the
+    // walk and the thing it walks would read one list, and a registry that
+    // quietly dropped a field would be met by a catalogue that quietly dropped
+    // the same tile. `REGISTERED_FIELD_COUNT` is the hand-kept literal that
+    // restores it.
+    let fields_in_inventory = inventory
+        .iter()
+        .filter(|(group, _)| matches!(group, CatalogGroup::Fields(_)))
+        .count();
+    assert_eq!(
+        fields_in_inventory,
+        crate::sources::REGISTERED_FIELD_COUNT,
+        "the catalog leg's field inventory is {fields_in_inventory} on \
+         {width:?} but this build registers {} fields — the walk would check \
+         that many fewer tiles and still pass",
+        crate::sources::REGISTERED_FIELD_COUNT,
     );
 
     h.open_catalog();

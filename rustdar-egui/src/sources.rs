@@ -33,6 +33,24 @@ pub fn all() -> Vec<Box<dyn SourceHandler>> {
 #[cfg(test)]
 pub(crate) const REGISTERED_LAYER_COUNT: usize = 12 + cfg!(feature = "fake-source") as usize;
 
+/// **How many FIELDS this build registers — the same hand-kept discipline as
+/// [`REGISTERED_LAYER_COUNT`], one level down.**
+///
+/// Radar's seventeen products plus the model's sixteen parameters, plus the
+/// fake source's one when its feature is on.
+///
+/// **Never derive this from `fields()`, `products()` or any registration.**
+/// WO-E9d land 2 made the catalogue's tiles *and* the parity walk's expected
+/// inventory both derive from `OverlayRegistry::fields()`. That is the right
+/// shape for the UI — a new source needs no arm — but it means the walk and the
+/// thing it walks now read the SAME list, so a registry that quietly lost a
+/// field would hand the walk a shorter expectation and be satisfied by a
+/// shorter catalogue. That is the collapse ruling (30) named for layers, and it
+/// recurs verbatim for fields; this constant is the independent second spelling
+/// that keeps the walk's field floor able to fail.
+#[cfg(test)]
+pub(crate) const REGISTERED_FIELD_COUNT: usize = 17 + 16 + cfg!(feature = "fake-source") as usize;
+
 /// The default draw order, bottom to top — every registered layer's id sorted
 /// by `SourceHandler::draw_order_weight`.
 pub fn default_draw_order() -> Vec<LayerId> {
@@ -604,7 +622,7 @@ mod field_registry_tests {
         );
         assert_eq!(
             fields.len(),
-            17 + 16 + cfg!(feature = "fake-source") as usize,
+            super::REGISTERED_FIELD_COUNT,
             "the composed field count moved (radar's seventeen products plus \
              the model's sixteen parameters, plus the fake's one where it is \
              registered); re-cut this pin in the land that changed it",

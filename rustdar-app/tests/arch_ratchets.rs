@@ -190,7 +190,16 @@ const GUI_IMPL_SETTER_MAX: usize = 1;
 /// above its own haystack -- slack a later land could have spent with nothing
 /// going red. The rule is "lower it in the land that earns it"; this note
 /// exists so the arrears stay on the record instead of being absorbed.
-const PRODUCT_IN_EGUI_MAX: usize = 405;
+///
+/// **386 since WO-E9d land 2, lowered in the land that earned it.** The
+/// catalogue's three inventory groups collapsed into one registry-derived loop
+/// and `PresetPane.product` became a `FieldId`: `ui_catalog.rs` 15 -> 1,
+/// `presets_config_tests.rs` 4 -> 0, `parity_walk.rs` 2 -> 1 (its inventory
+/// stopped enumerating the enum). **405 - 14 - 4 - 1 = 386**, measured per file
+/// against `096ca4c3`. The single survivor in `ui_catalog.rs` is the typed
+/// `product_for`/`spec` round trip the pane still forces, and WO-E9e removes it
+/// with the pane's own type.
+const PRODUCT_IN_EGUI_MAX: usize = 386;
 /// Row 6.
 ///
 /// **17 since WO-M12b**: the loop scan-list channel is gone — a radar frame

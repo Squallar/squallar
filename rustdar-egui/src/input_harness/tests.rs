@@ -8170,9 +8170,9 @@ fn the_catalog_search_filters_and_a_product_tile_aims_the_active_pane() {
     let catalog = h.catalog();
     for group in [
         crate::ui::CatalogGroup::Presets,
-        crate::ui::CatalogGroup::Overlays,
-        crate::ui::CatalogGroup::Products,
-        crate::ui::CatalogGroup::Hrrr,
+        crate::ui::CatalogGroup::Layers,
+        crate::ui::CatalogGroup::Fields(rustdar_radar::fields::GROUP),
+        crate::ui::CatalogGroup::Fields(rustdar_overlays::hrrr::fields::GROUP),
     ] {
         assert!(
             catalog.tiles.iter().any(|tile| tile.group == group),
@@ -8198,7 +8198,10 @@ fn the_catalog_search_filters_and_a_product_tile_aims_the_active_pane() {
     );
 
     let tile = h
-        .catalog_tile(crate::ui::CatalogGroup::Products, "Spectrum Width")
+        .catalog_tile(
+            crate::ui::CatalogGroup::Fields(rustdar_radar::fields::GROUP),
+            "Spectrum Width",
+        )
         .expect("the product tile survives its own name as the query");
     h.mouse_click(tile.rect.center());
     h.warm_up();
@@ -8238,7 +8241,7 @@ fn an_overlay_tile_enables_the_layer_and_selects_it() {
 
     h.open_catalog();
     let tile = h
-        .catalog_tile(crate::ui::CatalogGroup::Overlays, "SPC Outlooks")
+        .catalog_tile(crate::ui::CatalogGroup::Layers, "SPC Outlooks")
         .expect("the overlays group offers SPC Outlooks");
     h.mouse_click(tile.rect.center());
     assert!(
@@ -8271,7 +8274,10 @@ fn an_hrrr_tile_enables_the_model_layer_and_sets_the_parameter() {
     h.open_catalog();
 
     let tile = h
-        .catalog_tile(crate::ui::CatalogGroup::Hrrr, "Surface-Based CAPE")
+        .catalog_tile(
+            crate::ui::CatalogGroup::Fields(rustdar_overlays::hrrr::fields::GROUP),
+            "Surface-Based CAPE",
+        )
         .expect("the HRRR group offers the parameter");
     h.mouse_click(tile.rect.center());
     assert!(
@@ -13208,5 +13214,68 @@ fn typing_in_the_notifier_box_reaches_the_radar_layer() {
         format!("{}!", rustdar_radar::source::DEFAULT_NOTIFIER_ENDPOINT),
         "the keystroke never reached the handler — the TextField's update \
          path is not wired",
+    );
+}
+
+/// Applying a preset that names a field this build does not register leaves the
+/// pane's own field **as it was**, and still applies everything else.
+///
+/// **This test exists because a tamper found nothing to fail.** WO-E9d land 2's
+/// preserve rule was pinned only on the config load/save path
+/// (`an_unknown_preset_field_is_preserved_and_costs_neither_pane_nor_file`),
+/// which never calls `apply_preset` — so substituting a default at the *apply*
+/// site passed every suite. Preservation on disk is worth little if applying
+/// the preset silently rewrites the pane to Reflectivity, so the apply site
+/// gets its own pin.
+#[test]
+fn applying_a_preset_that_names_an_unregistered_field_leaves_the_pane_alone() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+    h.set_pane_count(1);
+    // Resolved through the registry rather than by naming the product enum:
+    // this test is about field ids, and reading one back through
+    // `fields::product_for` is both the path under test and one fewer place the
+    // enum has to be spelled.
+    let start = rustdar_radar::fields::product_for(&rustdar_source::product::FieldId::from_static(
+        "SpectrumWidth",
+    ))
+    .expect("the radar layer registers SpectrumWidth");
+    h.gui_mut()
+        .pane_mut(0)
+        .expect("pane 0")
+        .set_selected_product(start);
+    h.warm_up();
+
+    h.gui_mut().push_preset_for_test(crate::ui::PresetConfig {
+        name: "From a newer build".into(),
+        pane_count: 1,
+        panes: vec![crate::ui::PresetPane {
+            product: rustdar_source::product::FieldId::from_static("FutureProduct"),
+            elevation: 2.5,
+        }],
+        overlays: vec![known::RADAR].into(),
+    });
+    h.warm_up();
+
+    h.open_catalog();
+    let tile = h
+        .catalog_tile(crate::ui::CatalogGroup::Presets, "From a newer build")
+        .expect("the installed preset must be offered");
+    h.mouse_click(tile.rect.center());
+    h.warm_up();
+
+    assert_eq!(
+        h.gui_mut().pane(0).expect("pane 0").selected_product(),
+        start,
+        "a preset naming a field this build does not register must leave the \
+         pane's field untouched — substituting a default here silently \
+         rewrites a newer build's preset the next time this one saves",
+    );
+    // Non-vacuity: the preset really was applied, so the assertion above is
+    // about preservation and not about the click having done nothing.
+    assert!(
+        (h.gui_mut().pane(0).expect("pane 0").selected_elevation() - 2.5).abs() < 0.01,
+        "the rest of the preset must still apply — otherwise this test would \
+         pass on a preset that was never applied at all",
     );
 }
