@@ -188,7 +188,7 @@ impl KindList {
     /// enum-era default this replaced — the draw-weight order pin in
     /// rustdar-overlays holds them equal).
     fn default_draw_order() -> Self {
-        Self::from(rustdar_overlays::render::handlers::default_draw_order())
+        Self::from(crate::sources::default_draw_order())
     }
 }
 

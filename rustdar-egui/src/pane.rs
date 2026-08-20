@@ -1591,7 +1591,7 @@ impl PaneState {
             // Lazily filled by `overlay_cache_mut`; an absent entry answers
             // every read exactly as a fresh empty cache did.
             overlay_textures: HashMap::new(),
-            draw_order: rustdar_overlays::render::handlers::default_draw_order(),
+            draw_order: crate::sources::default_draw_order(),
             enabled_overlays: HashMap::new(),
             overlay_configs: HashMap::new(),
             config_baggage: PaneConfigBaggage::default(),
