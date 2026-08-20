@@ -13,7 +13,7 @@
 //! pane's axes, captioned with a height scale and a tilt ladder describing a
 //! vertical slice that is not there — and the reverse, a 2048×1024 section
 //! stretched across a map pane's geographic bounds. It is the loop path's form
-//! of the collision `RenderCacheKey`'s view axis closes on the static path,
+//! of the collision `RenderKey`'s view axis closes on the static path,
 //! where the same mistake is a wrong-shaped buffer reaching
 //! `ColorImage::from_rgba_unmultiplied`'s `assert_eq!` on the main thread.
 //!

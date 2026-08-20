@@ -9,15 +9,18 @@
 //! re-render every visible product for a change that cannot alter one of
 //! their pixels.
 //!
-//! Today `adopt_theme` touches only `radar_sites_render_gen`, so this holds
-//! by construction — the test exists for E5, where `is_dark` formalizes into
-//! `RenderKey` as a *handler-declared* `SelectKey` part: declared by the
-//! overlay handlers whose rasters branch on the theme, and never by the
-//! radar. An E5 that wires the theme into the radar's key or flushes the LRU
-//! on a flip goes red here.
+//! `adopt_theme` touches only `radar_sites_render_gen`, and since WO-E5c the
+//! key itself says why that is safe: `is_dark` is a *handler-declared*
+//! `SelectKey` part, filled from the layer's own
+//! `OverlayHandler::theme_sensitive` and therefore absent from radar's key
+//! entirely. `render_key::tests::the_radar_key_is_the_same_in_dark_and_light`
+//! pins that half against the live declaration; this file pins the behaviour it
+//! buys. A change that wires the theme into the radar's key or flushes the LRU
+//! on a flip goes red in one of the two.
 
 use crate::platform_double::TestBridge;
-use crate::render_dispatch::{CachedRenderOutput, RenderCacheKey};
+use crate::render_dispatch::CachedRenderOutput;
+use crate::render_key::RenderKey;
 use rustdar_radar::types::{RadarProduct, RenderView};
 use std::sync::Arc;
 
@@ -25,13 +28,13 @@ use super::tests::headless;
 
 /// One radar render-cache entry, the `render_cache_tests` way: empty buffers,
 /// `max_range_km` as the identity.
-fn a_radar_entry() -> (RenderCacheKey, CachedRenderOutput) {
+fn a_radar_entry() -> (RenderKey, CachedRenderOutput) {
     (
-        (
-            "KTLX".to_string(),
+        crate::render_key::render_cache_key(
+            "KTLX",
             RadarProduct::Reflectivity,
             RenderView::PlanView,
-            5,
+            0.5,
         ),
         CachedRenderOutput {
             image: Arc::new(egui::ColorImage::default()),

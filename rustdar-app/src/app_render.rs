@@ -460,7 +460,7 @@ impl super::App {
             // for a non-map pane, and `CachedRenderOutput` is a square
             // plan-view raster by construction. The axis exists so a section
             // cached later cannot be handed to this consumer — see
-            // `RenderCacheKey`.
+            // `RenderKey`.
             self.render.cache_render(
                 &origin_site,
                 render_result.product,
@@ -495,7 +495,7 @@ impl super::App {
             // receiving pane's kind is the whole of the question. When a section
             // render exists it will also have to be keyed on the *result's* view
             // — a pane and a result can both be sections and still disagree
-            // about which — and that arrives with `RenderCacheKey`'s view axis in
+            // about which — and that arrives with `RenderKey`'s view axis in
             // WP-G. Until then a view term here would compare a constant against
             // a constant.
             let pane_count = self.gui.pane_count();
@@ -682,7 +682,7 @@ impl super::App {
         //
         // The four products `RadarProduct::tilt_independent_plan_view` names
         // draw the same picture at every tilt, and `render_cache_key` collapses
-        // them onto `NO_ELEVATION_SLOT` for exactly that reason. So a tilt click
+        // them onto an absent elevation part for exactly that reason. So a tilt click
         // on one of those panes is a cache **hit** — and `needs_render` is still
         // true, because it compares the raw elevation — which put the whole
         // 16 MiB back on the GPU to redraw a picture that was already on it.

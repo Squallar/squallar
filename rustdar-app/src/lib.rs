@@ -40,6 +40,7 @@ pub mod platform;
 #[cfg(test)]
 pub(crate) mod platform_double;
 pub mod render_dispatch;
+pub mod render_key;
 pub mod site_catalogue;
 pub mod site_positions;
 /// The one place this crate's loop suites spell a render identity, so the
