@@ -112,6 +112,8 @@ fn seed(app: &mut crate::app::App, id: &LayerId) {
                 expires: String::new(),
                 onset: None,
                 ends: None,
+                valid_from: None,
+                valid_until: None,
                 affected_zones: Vec::new(),
                 features: Arc::new(vec![a_feature()]),
             };

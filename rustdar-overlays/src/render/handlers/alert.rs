@@ -16,6 +16,7 @@ use crate::render::overlay_state::{
 use crate::render::rasterize;
 use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
+use rustdar_source::time::TimeAxis;
 
 /// `pub`, not `pub(crate)`: `rustdar-app`'s described-job dispatch tests
 /// construct this type directly.
@@ -221,6 +222,11 @@ impl NwsAlertHandler {
     /// What the rasterizer reads, captured once. The rows are
     /// [`rasterize::AlertPaint`], not whole [`NwsAlert`]s: prose fields the
     /// raster never draws would be bytes on the wire per raster.
+    ///
+    /// **Rows outside the depicted instant do not travel.** This is the
+    /// layer's [`TimeAxis::EventLifetime`] arm: the picture is which alerts
+    /// are valid at `ctx.as_of`, and on a live pane `as_of` is the wall clock,
+    /// so the bytes are the bytes this layer has always sent.
     fn paint_input(
         &self,
         ctx: &RasterizeContext,
@@ -234,13 +240,33 @@ impl NwsAlertHandler {
                 .state
                 .data
                 .iter()
+                // **The as-of filter, and the whole of it**: two `Option`
+                // comparisons against fields parsed once at fetch time. An
+                // alert unbounded on a side passes on that side. Nothing is
+                // parsed, formatted or allocated here.
+                .filter(|i| {
+                    i.alert.valid_from.is_none_or(|from| from <= ctx.as_of)
+                        && i.alert.valid_until.is_none_or(|until| ctx.as_of < until)
+                })
                 .map(|i| rasterize::AlertPaint {
                     id: i.alert.id.clone(),
                     category: i.alert.category,
                     features: Arc::clone(&i.alert.features),
                 })
                 .collect(),
-            enabled_categories: view.enabled_categories.iter().copied().collect(),
+            // **In `ALL`'s declaration order, never the `HashSet`'s.** The
+            // set round-trips either way, but a `HashSet`'s iteration order
+            // is seeded per process, so iterating it raw made one picture
+            // encode to different bytes on every run — measured on
+            // main@62289151: four runs of one fixture, four digests, one
+            // length. The codec sorts `hidden_ids` for exactly this reason
+            // and says so; this is the same rule on the field the codec
+            // cannot sort, because by then it is a `Vec` whose order is
+            // already the answer.
+            enabled_categories: AlertCategory::ALL
+                .into_iter()
+                .filter(|category| view.enabled_categories.contains(category))
+                .collect(),
             hidden_ids: self.hidden_alerts.clone(),
             device_scale: ctx.device_scale,
         })
@@ -307,6 +333,15 @@ impl OverlayHandler for NwsAlertHandler {
 
     fn render_mode(&self) -> RenderMode {
         RenderMode::Texture
+    }
+
+    /// Every alert carries a validity window, and the picture is which of them
+    /// are true at the depicted instant — the definition of
+    /// [`TimeAxis::EventLifetime`]. The as-of filter is in
+    /// [`Self::paint_input`]; the quantum is the trait's 60 s default, which
+    /// is the resolution NWS lifetimes are actually published at.
+    fn time_axis(&self) -> TimeAxis {
+        TimeAxis::EventLifetime
     }
 
     fn default_enabled(&self) -> bool {
@@ -680,6 +715,8 @@ mod tests {
             expires: String::new(),
             onset: None,
             ends: None,
+            valid_from: None,
+            valid_until: None,
             affected_zones: Vec::new(),
             features: Arc::new(vec![OverlayFeature::new(
                 polygons,
@@ -1360,5 +1397,293 @@ mod tests {
             all.len(),
             "the registry's own copy took one of the panes' edits",
         );
+    }
+
+    // ── The as-of filter (WO-M11) ─────────────────────────────────────────
+
+    fn at(h: u32, m: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 8, 20)
+            .unwrap()
+            .and_hms_opt(h, m, 0)
+            .unwrap()
+    }
+
+    /// A live pane's context: `as_of` **is** the clock.
+    fn live_ctx(clock: chrono::NaiveDateTime) -> RasterizeContext {
+        RasterizeContext {
+            is_dark: false,
+            zoom: 7.0,
+            device_scale: 1.0,
+            now: clock,
+            as_of: clock,
+        }
+    }
+
+    /// `alert()` with the four CAP time strings filled in, and the parsed
+    /// window derived **through the parser's own function** so a fixture can
+    /// never disagree with what a real fetch would produce.
+    fn timed_alert(
+        id: &str,
+        effective: &str,
+        expires: &str,
+        onset: Option<&str>,
+        ends: Option<&str>,
+    ) -> NwsAlert {
+        let mut a = alert(id, "Tornado Warning");
+        let (from, until) = crate::nws::alert::parse_valid_window(effective, expires, onset, ends);
+        a.effective = effective.to_owned();
+        a.expires = expires.to_owned();
+        a.onset = onset.map(str::to_owned);
+        a.ends = ends.map(str::to_owned);
+        a.valid_from = from;
+        a.valid_until = until;
+        a
+    }
+
+    fn rows_at(h: &NwsAlertHandler, clock: chrono::NaiveDateTime) -> Vec<String> {
+        let job = h.prepare_job(&live_ctx(clock), &PaneRef::bare(0));
+        job.map(|job| {
+            job.downcast_ref::<rasterize::AlertsInput>()
+                .expect("the alerts row")
+                .alerts
+                .iter()
+                .map(|a| a.id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    /// **0 / 1 / 0 across one alert's own window.** Before onset it is not
+    /// yet true, inside it is, at `ends` it stops — the end is exclusive, so
+    /// the instant an alert ends is the first instant it is gone.
+    ///
+    /// The three readings come from one handler and one alert, so the only
+    /// thing that differs between them is the depicted instant.
+    #[test]
+    fn an_alert_appears_at_its_onset_and_is_gone_at_its_end() {
+        let h = handler_with(vec![timed_alert(
+            "urn:straddle",
+            "2026-08-20T14:00:00Z",
+            "2026-08-20T23:00:00Z",
+            Some("2026-08-20T18:00:00Z"),
+            Some("2026-08-20T22:00:00Z"),
+        )]);
+
+        assert_eq!(
+            rows_at(&h, at(17, 59)),
+            Vec::<String>::new(),
+            "an alert whose onset has not arrived was drawn anyway",
+        );
+        assert_eq!(
+            rows_at(&h, at(18, 0)),
+            vec!["urn:straddle".to_owned()],
+            "the onset instant itself is inside the window (`from <= as_of`)",
+        );
+        assert_eq!(
+            rows_at(&h, at(21, 59)),
+            vec!["urn:straddle".to_owned()],
+            "the last minute of the window",
+        );
+        assert_eq!(
+            rows_at(&h, at(22, 0)),
+            Vec::<String>::new(),
+            "the end instant is exclusive (`as_of < until`); an alert that \
+             has ended was still drawn",
+        );
+        assert_eq!(
+            rows_at(&h, at(23, 30)),
+            Vec::<String>::new(),
+            "an alert past even its message expiry was still drawn",
+        );
+    }
+
+    /// **A garbage window costs the alert nothing, at any instant.** Unbounded
+    /// on both sides is always valid, which is the failure posture: an alert
+    /// the parser could not time is an alert the user still sees.
+    ///
+    /// Paired with a *timed* alert in the same handler, so this is not a test
+    /// that the filter is off — the timed one comes and goes across the same
+    /// three readings while this one never does.
+    #[test]
+    fn an_alert_with_four_unreadable_times_is_drawn_at_every_instant() {
+        let h = handler_with(vec![
+            timed_alert(
+                "urn:garbage",
+                "soon",
+                "later",
+                Some("whenever"),
+                Some("eventually"),
+            ),
+            timed_alert(
+                "urn:timed",
+                "2026-08-20T14:00:00Z",
+                "2026-08-20T23:00:00Z",
+                Some("2026-08-20T18:00:00Z"),
+                Some("2026-08-20T22:00:00Z"),
+            ),
+        ]);
+
+        for clock in [at(0, 0), at(19, 0), at(23, 59)] {
+            assert!(
+                rows_at(&h, clock).contains(&"urn:garbage".to_owned()),
+                "the untimed alert vanished at {clock}",
+            );
+        }
+        assert_eq!(
+            rows_at(&h, at(0, 0)).len(),
+            1,
+            "control: the timed alert IS filtered at 00:00, so the reading \
+             above is the filter passing it and not the filter being off",
+        );
+        assert_eq!(rows_at(&h, at(19, 0)).len(), 2, "control: both inside");
+    }
+
+    /// FNV-1a 64 over the encoded job, so a byte that moves is a number that
+    /// moves. A copy of the house hash; `rustdar_radar::wire::layout_digest`
+    /// is `#[cfg(test)]` in another crate.
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// The alerts every other fixture in this workspace is made of: no time
+    /// strings at all, which is the shape **every** alert had before WO-M11,
+    /// since nothing parsed the four fields.
+    fn untimed_fixture() -> Vec<NwsAlert> {
+        vec![
+            alert("urn:oid:2.49.0.1.840.0001", "Tornado Warning"),
+            alert("urn:oid:2.49.0.1.840.0002", "Severe Thunderstorm Watch"),
+            alert("urn:oid:2.49.0.1.840.0003", "Flood Advisory"),
+        ]
+    }
+
+    fn encoded_job(h: &NwsAlertHandler, clock: chrono::NaiveDateTime) -> (usize, u64) {
+        use rustdar_source::job::{EncodeCtx, JobGeometry};
+        let job = h
+            .prepare_job(&live_ctx(clock), &PaneRef::bare(0))
+            .expect("the fixture has data, so it describes a job");
+        let row = h.job_codec().expect("the alerts row");
+        let mut bytes = Vec::new();
+        (row.encode)(
+            &job,
+            &EncodeCtx {
+                geometry: JobGeometry {
+                    width: 512,
+                    height: 512,
+                    bounds: rustdar_geo::GeoBounds {
+                        min_lat: 34.0,
+                        max_lat: 37.0,
+                        min_lon: -99.0,
+                        max_lon: -95.0,
+                    },
+                    side_ceiling_px: 2048,
+                },
+            },
+            &mut bytes,
+        );
+        (bytes.len(), fnv1a64(&bytes))
+    }
+
+    /// **The dark-land pin.** Length and FNV-1a-64 of the encoded alerts job
+    /// for [`untimed_fixture`], **measured on `main@62289151`** — the commit
+    /// before WO-M11, with no `valid_from`, no `valid_until` and no as-of
+    /// filter — by running this same body there against a `RasterizeContext`
+    /// that had only `now`. If WO-M11 changed one byte a live pane puts on
+    /// the wire, this number moves.
+    ///
+    /// **The baseline carries this land's category-ordering fix and nothing
+    /// else**, because without it main has no single answer to measure: on
+    /// `main@62289151` unmodified, four runs of this fixture gave four
+    /// digests — 0x8bfce14b813b2793, 0x94366c1cca5e64eb, 0x4f7aa91cb2f75513,
+    /// 0x37cd579f64c53c0b — and one length, 488, because `paint_input` built
+    /// `enabled_categories` by iterating a per-process-seeded `HashSet`. With
+    /// the ordering fix applied to `main` alone, three runs there and three
+    /// here agree on this exact pair, so the as-of filter moves nothing.
+    ///
+    /// It pins `prepare_job`'s **output**, not the codec: the codec is
+    /// untouched this step, and `rustdar_worker::wire_identity`'s framing rows
+    /// pin that separately.
+    const UNTIMED_JOB_PRE_M11: (usize, u64) = (488, 0x660e_6d95_ce1d_1641);
+
+    #[test]
+    fn a_live_pane_encodes_the_bytes_it_encoded_before_the_as_of_filter_existed() {
+        let h = handler_with(untimed_fixture());
+        assert_eq!(
+            encoded_job(&h, at(19, 0)),
+            UNTIMED_JOB_PRE_M11,
+            "a live pane's alerts job is no longer the bytes main@62289151 \
+             produced for the same alerts. WO-M11 dark-lands: with \
+             `as_of == now` and alerts that name no window, the filter is \
+             `true && true` and nothing may move.",
+        );
+        assert_eq!(
+            encoded_job(&h, at(3, 0)),
+            UNTIMED_JOB_PRE_M11,
+            "an alert with no readable window is instant-independent; the \
+             clock changed the bytes, so something is reading `as_of` that \
+             should not be",
+        );
+    }
+
+    /// Non-triviality floor for the pin above: the digest is a function of the
+    /// rows, so a fixture that lost an alert would be *caught* rather than
+    /// silently pinned. A four-alert set must not hash to the three-alert one.
+    #[test]
+    fn the_dark_land_pin_is_a_function_of_the_rows_it_pins() {
+        let three = handler_with(untimed_fixture());
+        let mut four = untimed_fixture();
+        four.push(alert("urn:oid:2.49.0.1.840.0004", "Tornado Warning"));
+        let four = handler_with(four);
+        assert_ne!(
+            encoded_job(&three, at(19, 0)),
+            encoded_job(&four, at(19, 0)),
+            "the digest does not see the alert rows, so the pin above would \
+             hold over a filter that dropped every one of them",
+        );
+    }
+
+    /// **The category set travels in `ALL`'s declaration order, never the
+    /// `HashSet`'s.** Found on `main@62289151`: `paint_input` built this `Vec`
+    /// by iterating a per-process-seeded `HashSet`, so one picture encoded to
+    /// a different byte string on every run — the exact defect the codec's own
+    /// comment cites as its reason for sorting `hidden_ids`, on the one field
+    /// the codec cannot sort because by then it is a `Vec` whose order **is**
+    /// the answer.
+    ///
+    /// Walked over all fifteen non-empty subsets: with the fix every one comes
+    /// out in declaration order, and a raw set iteration would have to land on
+    /// the right order fifteen times running to survive.
+    #[test]
+    fn the_category_set_travels_in_declaration_order_not_the_sets_own() {
+        for mask in 1u8..16 {
+            let chosen: Vec<AlertCategory> = AlertCategory::ALL
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, c)| c)
+                .collect();
+            let mut state = AlertPaneState::new(true);
+            state.enabled_categories = chosen.iter().copied().collect();
+            let h = handler_with(untimed_fixture());
+            let pane = PaneRef {
+                state: Some(&state),
+                ..PaneRef::bare(0)
+            };
+            let job = h
+                .prepare_job(&live_ctx(at(19, 0)), &pane)
+                .expect("the fixture has data");
+            assert_eq!(
+                job.downcast_ref::<rasterize::AlertsInput>()
+                    .expect("the alerts row")
+                    .enabled_categories,
+                chosen,
+                "subset {mask:#06b} reached the wire in the set's own order, \
+                 so one picture has more than one byte string",
+            );
+        }
     }
 }

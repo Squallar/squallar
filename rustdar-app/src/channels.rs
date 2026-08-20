@@ -2,7 +2,7 @@ use chrono::NaiveDateTime;
 use nexrad_model::data::Scan;
 use rustdar_egui::pane::RenderTarget;
 use rustdar_geo::GeoBounds;
-use rustdar_overlays::render::overlay_state::OverlayFetchResult;
+use rustdar_overlays::render::overlay_state::SourceEvent;
 use rustdar_overlays::render::rasterize::HitMap;
 use rustdar_radar::archive::Identifier;
 use rustdar_radar::level3::Level3Product;
@@ -325,8 +325,13 @@ pub struct ChannelHub {
     pub voxel_receiver: Receiver<VoxelResponse>,
     pub level3_sender: Sender<Level3Response>,
     pub level3_receiver: Receiver<Level3Response>,
-    pub overlay_fetch_sender: Sender<OverlayFetchResult>,
-    pub overlay_fetch_receiver: Receiver<OverlayFetchResult>,
+    /// **The one arrival path a source has.** Widened at WO-M11 from
+    /// `OverlayFetchResult` to [`SourceEvent`], whose `Frames`/`FrameReady`
+    /// arms are dark until WO-E7/WO-M12 give them producers — one channel and
+    /// one drain, so a new arrival shape is a compile error at the `match`
+    /// rather than a second channel nobody polls.
+    pub overlay_fetch_sender: Sender<SourceEvent>,
+    pub overlay_fetch_receiver: Receiver<SourceEvent>,
     pub overlay_render_sender: Sender<OverlayRenderResponse>,
     pub overlay_render_receiver: Receiver<OverlayRenderResponse>,
     pub loop_scan_list_sender: Sender<LoopScanListResponse>,

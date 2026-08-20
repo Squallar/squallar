@@ -1226,14 +1226,16 @@ fn two_panes_hold_different_hrrr_parameters_through_every_read_and_a_reopen() {
         );
     }
 
+    let clock = chrono::NaiveDate::from_ymd_opt(2026, 8, 20)
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
+        .unwrap();
     let ctx = RasterizeContext {
         is_dark: false,
         zoom: 7.0,
         device_scale: 1.0,
-        now: chrono::NaiveDate::from_ymd_opt(2026, 8, 20)
-            .unwrap()
-            .and_hms_opt(12, 0, 0)
-            .unwrap(),
+        now: clock,
+        as_of: clock,
     };
     let mut tokens = Vec::new();
     for (idx, parameter) in [(0usize, left), (1usize, right)] {

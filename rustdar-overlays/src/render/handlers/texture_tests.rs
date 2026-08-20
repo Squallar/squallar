@@ -37,11 +37,15 @@ const BOUNDS: GeoBounds = GeoBounds {
 /// plate's fill is bright enough for the two alpha conventions to disagree.
 /// `now` is a real clock read, taken **once** per test and handed to both paths.
 fn rctx() -> RasterizeContext {
+    // Live posture: one clock read, handed to both `now` and `as_of`, so every
+    // digest below is the byte-for-byte pre-M11 one.
+    let clock = chrono::Utc::now().naive_utc();
     RasterizeContext {
         device_scale: 1.0,
         is_dark: false,
         zoom: 7.0,
-        now: chrono::Utc::now().naive_utc(),
+        now: clock,
+        as_of: clock,
     }
 }
 
@@ -121,6 +125,8 @@ fn alert_fixture() -> crate::nws::alert::NwsAlert {
         expires: String::new(),
         onset: None,
         ends: None,
+        valid_from: None,
+        valid_until: None,
         affected_zones: Vec::new(),
         features: std::sync::Arc::new(vec![feature()]),
     }

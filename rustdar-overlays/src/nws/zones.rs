@@ -559,6 +559,8 @@ mod tests {
             expires: String::new(),
             onset: None,
             ends: None,
+            valid_from: None,
+            valid_until: None,
             affected_zones: zones,
             features: Arc::new(Vec::new()),
         }

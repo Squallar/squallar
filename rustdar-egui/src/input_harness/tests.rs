@@ -11679,6 +11679,8 @@ fn alert_over(id: &str, event: &str, lat: f64, lon: f64) -> rustdar_overlays::nw
         expires: String::new(),
         onset: None,
         ends: None,
+        valid_from: None,
+        valid_until: None,
         affected_zones: Vec::new(),
         features: std::sync::Arc::new(vec![rustdar_overlays::types::OverlayFeature::new(
             vec![vec![ring_about(lat, lon, 0.25)]],

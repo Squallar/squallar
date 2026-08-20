@@ -1301,16 +1301,29 @@ impl App {
         self.run_frame_pump(frame_pump::PumpPhase::Ingest, None);
     }
 
-    /// Drain the unified overlay fetch channel.
+    /// Drain the unified overlay fetch channel — **every** arrival a source
+    /// produces, in one `match`.
+    ///
+    /// The `Frames`/`FrameReady` arms are **dark**: nothing sends them until
+    /// WO-E7/WO-M12 give `create_frame_list_task`/`fetch_frame` callers. They
+    /// are here so that when a producer lands, the drain that must route it
+    /// already exists and the compiler is what says so.
     fn poll_overlay_fetch_results(&mut self) {
+        use rustdar_overlays::render::overlay_state::SourceEvent;
         // Bound once for the whole drain, not per arrival.
         let gui = &mut self.gui;
-        while let Ok(result) = self.channels.overlay_fetch_receiver.try_recv() {
+        while let Ok(event) = self.channels.overlay_fetch_receiver.try_recv() {
             // Not "the pane the fetch was for": the arrival carries a layer
             // id and no pane, and what the handler needs of it is the whole
             // layer's — every pane's selection, unioned. `Gui` owns the panes
             // and builds that view.
-            gui.deliver_overlay_fetch(result);
+            match event {
+                SourceEvent::Data(result) => gui.deliver_overlay_fetch(result),
+                SourceEvent::Frames { id, listing } => gui.deliver_frame_listing(&id, listing),
+                SourceEvent::FrameReady { id, stamp, data } => {
+                    gui.deliver_frame(&id, stamp, data);
+                }
+            }
         }
     }
 

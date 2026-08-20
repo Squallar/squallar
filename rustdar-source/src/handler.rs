@@ -19,6 +19,7 @@ use crate::fetch_policy::{
 };
 use crate::id::LayerId;
 use crate::job::{DescribedJob, JobCodec};
+use crate::time::{FrameListing, FrameStamp, TimeAxis};
 
 /// Not `rustdar_radar::LegendScale`: duplicated here to avoid the dependency.
 pub struct OverlayLegend {
@@ -723,25 +724,103 @@ pub trait SourceHandler: Send {
         None
     }
 
-    fn supports_loop(&self) -> bool {
-        false
+    // ── Time ──────────────────────────────────────────────────────────────
+    //
+    // How this layer relates to the clock. `time_axis` is the whole
+    // declaration: every presentation rule is derived from the arm, written
+    // on [`TimeAxis`] itself. The rest of this block is the frame supply a
+    // [`TimeAxis::FrameSeries`] layer answers through; the other two arms
+    // take the defaults and never see a frame.
+
+    /// This layer's relationship to the clock — see [`TimeAxis`] for the
+    /// rules each arm derives.
+    fn time_axis(&self) -> TimeAxis {
+        TimeAxis::Live
     }
 
-    fn create_loop_list_task(
+    /// **What frames this layer could show over `range`, as it already knows
+    /// it.** A synchronous query over handler-owned state — it **never**
+    /// performs I/O; [`Self::create_frame_list_task`] is the fetch that fills
+    /// that state in.
+    ///
+    /// Pane-scoped because frames are per-slot: two panes on two radar sites
+    /// hold two frame sets, and a [`FrameStamp`] carries no site, so an
+    /// unscoped answer would pool them into one bogus list.
+    fn list_frames(
         &self,
-        _ctx: &FetchConfig,
-        _start: chrono::NaiveDateTime,
-        _end: chrono::NaiveDateTime,
+        ctx: &FetchConfig,
+        pane: &PaneRef<'_>,
+        range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+    ) -> FrameListing {
+        let _ = (ctx, pane);
+        FrameListing::empty(range)
+    }
+
+    /// **The async supply for [`Self::list_frames`]** — the listing fetch that
+    /// teaches this handler what frames exist. Lands as
+    /// [`SourceEvent::Frames`]; `None` from a layer with no listing to fetch.
+    fn create_frame_list_task(
+        &self,
+        ctx: &FetchConfig,
+        pane: &PaneRef<'_>,
+        range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
     ) -> Option<FetchTask> {
+        let _ = (ctx, pane, range);
         None
     }
 
-    fn create_loop_frame_task(
+    /// **The async supply for one frame's data.** Lands as
+    /// [`SourceEvent::FrameReady`]; `None` when this handler cannot fetch that
+    /// stamp (or already holds it).
+    fn fetch_frame(
         &self,
-        _ctx: &FetchConfig,
-        _timestamp: chrono::NaiveDateTime,
+        ctx: &FetchConfig,
+        pane: &PaneRef<'_>,
+        stamp: &FrameStamp,
     ) -> Option<FetchTask> {
+        let _ = (ctx, pane, stamp);
         None
+    }
+
+    /// The stamps this handler is **holding data for** in this pane, ready to
+    /// draw without a fetch. A subset of what [`Self::list_frames`] names.
+    ///
+    /// The frame cache is the **handler's own**: nothing above keeps a parallel
+    /// map of frames, so nothing above can disagree with this answer.
+    fn frames_resident(&self, pane: &PaneRef<'_>) -> Vec<FrameStamp> {
+        let _ = pane;
+        Vec::new()
+    }
+
+    /// Drop every resident frame **not** in `keep`. The one eviction door, so
+    /// the budget that decides what to keep lives above and the storage stays
+    /// below.
+    fn retain_frames(&mut self, pane: &PaneRef<'_>, keep: &[FrameStamp]) {
+        let _ = (pane, keep);
+    }
+
+    /// **Cache-key quantum for [`TimeAxis::EventLifetime`] as-of
+    /// rasterization** — how coarsely the depicted instant is rounded before
+    /// it enters a texture cache key, so a scrubbing pane re-uses rasters
+    /// instead of minting one per clock tick.
+    ///
+    /// Consumed at WO-E7c, and **only under a scrubbed posture**: a live pane
+    /// keys on nothing time-shaped at all, which is why a one-second quantum
+    /// here does not re-raster a live layer every second.
+    fn as_of_quantum(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(60)
+    }
+
+    /// Take delivery of a frame listing this handler asked for. Dark until
+    /// WO-E7/WO-M12 give [`Self::create_frame_list_task`] a producer.
+    fn apply_frame_listing(&mut self, listing: FrameListing, pane: &PaneRef<'_>) {
+        let _ = (listing, pane);
+    }
+
+    /// Take delivery of one frame's data. Dark until WO-E7/WO-M12 give
+    /// [`Self::fetch_frame`] a producer.
+    fn apply_frame(&mut self, stamp: FrameStamp, data: FetchPayload, pane: &PaneRef<'_>) {
+        let _ = (stamp, data, pane);
     }
 }
 
@@ -764,9 +843,15 @@ pub struct RasterizeContext {
     /// in **texels** chosen from the map zoom, but textures are sized in
     /// physical pixels, so a 2× display would halve an unscaled radius.
     pub device_scale: f32,
-    /// The page's clock at dispatch, UTC — GLM's flash-age fade is the only
-    /// reader. Captured at the dispatch so a worker matches the direct call.
+    /// The page's **wall clock** at dispatch, UTC. Captured at the dispatch so
+    /// a worker matches the direct call.
     pub now: chrono::NaiveDateTime,
+    /// The instant the picture **DEPICTS**, UTC. Equal to [`Self::now`] on a
+    /// live pane; a scrubbed pane (WO-E7 and later) writes the scrub instant.
+    ///
+    /// A [`TimeAxis::EventLifetime`] layer filters on this and never on
+    /// `now`; a [`TimeAxis::Live`] layer ignores it.
+    pub as_of: chrono::NaiveDateTime,
 }
 
 // `Send` on native because `tokio::spawn` requires `Send + 'static`; not on
@@ -787,6 +872,37 @@ pub type TaskFuture = Pin<Box<dyn Future<Output = FetchPayload>>>;
 pub struct FetchTask {
     pub kind: LayerId,
     pub future: TaskFuture,
+}
+
+/// One completed fetch round's payload, on its way back to the handler that
+/// asked for it. The arrival names a **layer** and no pane: what a handler
+/// needs of it is a question about every pane at once.
+pub struct OverlayFetchResult {
+    pub kind: LayerId,
+    pub data: FetchPayload,
+}
+
+/// **Everything that arrives on a source's one return path.**
+///
+/// One channel, one drain, one `match` — so a new arrival shape is a compile
+/// error at the drain rather than a second channel nobody remembers to poll.
+///
+/// Generic over nothing: the payloads are the cfg'd [`FetchPayload`] alias, so
+/// the web arm (`Box<dyn Any>`, **not** `Send`) carries exactly what it can.
+pub enum SourceEvent {
+    /// Today's payload, unchanged — a whole fetch round for a layer.
+    Data(OverlayFetchResult),
+    /// What frames a layer can show, in answer to
+    /// [`SourceHandler::create_frame_list_task`]. **No producer yet**: dark
+    /// until WO-E7/WO-M12.
+    Frames { id: LayerId, listing: FrameListing },
+    /// One frame's data, in answer to [`SourceHandler::fetch_frame`]. **No
+    /// producer yet**: dark until WO-E7/WO-M12.
+    FrameReady {
+        id: LayerId,
+        stamp: FrameStamp,
+        data: FetchPayload,
+    },
 }
 
 pub struct PopupContent {
