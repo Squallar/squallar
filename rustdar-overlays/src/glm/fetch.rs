@@ -349,14 +349,13 @@ async fn list_glm_files(
                     && let Some(key) = node.text()
                 {
                     objects_seen += 1;
-                    if key.ends_with(".nc") {
-                        if let Some(file_start) = parse_filename_start_time(key)
+                    if key.ends_with(".nc")
+                        && let Some(file_start) = parse_filename_start_time(key)
                             && file_start >= start
                             && file_start <= end
                         {
                             all_keys.push(key.to_string());
                         }
-                    }
                 }
             }
 
