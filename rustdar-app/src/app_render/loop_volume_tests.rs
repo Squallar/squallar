@@ -26,6 +26,11 @@ fn ts(minute: u32) -> chrono::NaiveDateTime {
 }
 
 fn site() -> RadarSite {
+    // The fixture network is otherwise installed only as a side effect of
+    // `app::tests::headless`, so a test in here that reads the table before it
+    // builds an App reads whatever an earlier test left behind: green in the
+    // package run, red when the suite is filtered alone.
+    crate::test_sites::install();
     rustdar_radar::sites::get_radar_site(SITE)
         .expect("KTLX is a real radar")
         .clone()
