@@ -150,6 +150,18 @@ impl Gui {
         }
     }
 
+    /// Run the hydrate every caller runs before asking a handler about a
+    /// pane. It is where the pane publishes its radar selection into the slot
+    /// a handler reads it from, so a test that moves a selection and then asks
+    /// a handler goes through here exactly as the frame does.
+    #[cfg(test)]
+    pub(crate) fn hydrate_pane_layer_states_for_test(&mut self, idx: usize) {
+        let Self {
+            overlays, panes, ..
+        } = self;
+        panes[idx].hydrate_layer_states(overlays, idx);
+    }
+
     /// Set one pane's overlay state, writing the config as well as the enabled map
     /// — `render_overlay_controls_one` reloads the handlers from the config every
     /// frame it runs, so a write to `enabled_overlays` alone is undone.

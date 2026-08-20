@@ -1302,3 +1302,180 @@ fn two_panes_hold_different_hrrr_parameters_through_every_read_and_a_reopen() {
         );
     }
 }
+
+// ── The radar slot's selection is LIVE (WO-M12) ───────────────────────────
+//
+// `RADAR_SLOT_PANE_KEYS` declares that the radar slot's config carries this
+// pane's site, product and tilt, and it is the only thing a handler is given
+// that names them: `PaneRef` carries the layer's own config, its state and the
+// sibling slots' configs, and nothing else. The members were written by the
+// load and re-derived at the save and never in between, so every reader saw
+// the load-time selection. These four hold the repair open.
+
+/// The handler-visible radar config for `pane`, as a `PaneRef` carries it.
+fn radar_config_seen_by_a_handler(gui: &Gui, idx: usize) -> serde_json::Value {
+    let pane = gui.pane(idx).expect("the fixture's pane");
+    pane.view(idx).layer(&known::RADAR).config.clone()
+}
+
+#[test]
+fn a_handler_is_told_the_site_this_pane_is_on_now() {
+    let store = store_with(include_str!("fixtures/current_full.json"));
+    let mut gui = Gui::new();
+    assert!(gui.load_ui_config(&store), "the fixture must load");
+
+    let loaded = radar_config_seen_by_a_handler(&gui, 1);
+    assert_eq!(
+        loaded.get("site").and_then(serde_json::Value::as_str),
+        Some("KOUN"),
+        "premise: the file's own site is what a handler sees before anything moves",
+    );
+
+    gui.pane_mut(1)
+        .expect("pane 1")
+        .set_site("KFWS".to_string());
+    // Every caller that is about to ask a handler about a pane runs this
+    // first; it is where the selection is published.
+    gui.hydrate_pane_layer_states_for_test(1);
+
+    assert_eq!(
+        radar_config_seen_by_a_handler(&gui, 1)
+            .get("site")
+            .and_then(serde_json::Value::as_str),
+        Some("KFWS"),
+        "the pane moved to KFWS and a handler was still told KOUN — the slot \
+         member is a load-time snapshot, and `RadarSitesHandler::prepare_job` \
+         draws its \"you are here\" marker from exactly this read",
+    );
+    assert_eq!(
+        gui.pane(1).expect("pane 1").site(),
+        "KFWS",
+        "control: the pane itself really did move",
+    );
+}
+
+#[test]
+fn a_pane_that_no_file_ever_described_still_tells_a_handler_its_selection() {
+    let mut gui = Gui::new();
+    let idx = 0;
+    gui.pane_mut(idx)
+        .expect("a fresh Gui has a pane")
+        .set_site("KGRK".to_string());
+    gui.hydrate_pane_layer_states_for_test(idx);
+
+    let seen = radar_config_seen_by_a_handler(&gui, idx);
+    assert_eq!(
+        seen.get("site").and_then(serde_json::Value::as_str),
+        Some("KGRK"),
+        "a pane built in memory rather than loaded from a file had no \"site\" \
+         member at all, so a handler asking got nothing: {seen}",
+    );
+    // Spelled as the literal the serde form writes rather than through the
+    // product enum, which `PRODUCT_IN_EGUI_MAX` is driving out of this crate.
+    assert_eq!(
+        seen.get("product"),
+        Some(&serde_json::json!("Reflectivity")),
+        "the product travels with the site or a handler reads two panes' worth \
+         of half-truth: {seen}",
+    );
+}
+
+#[test]
+fn publishing_a_selection_leaves_the_files_own_tilt_byte_for_byte() {
+    let store = store_with(include_str!("fixtures/current_full.json"));
+    let mut gui = Gui::new();
+    assert!(gui.load_ui_config(&store), "the fixture must load");
+    assert_eq!(
+        radar_config_seen_by_a_handler(&gui, 1).get("elevation"),
+        Some(&serde_json::json!(0.9)),
+        "premise: the file writes this tilt as 0.9 and the load keeps it",
+    );
+
+    gui.hydrate_pane_layer_states_for_test(1);
+
+    assert_eq!(
+        radar_config_seen_by_a_handler(&gui, 1).get("elevation"),
+        Some(&serde_json::json!(0.9)),
+        "publishing an UNCHANGED selection rewrote the tilt: the pane holds it \
+         as an `f32`, and widening 0.9f32 back to f64 gives 0.8999999761581421. \
+         The comparison must be made in the pane's own precision, or every \
+         frame churns a member whose meaning has not moved",
+    );
+}
+
+#[test]
+fn the_you_are_here_marker_follows_the_site_the_pane_moved_to() {
+    use rustdar_overlays::render::handlers::sites::{RadarSitesFetchResult, SiteRow};
+    use rustdar_overlays::render::overlay_state::OverlayFetchResult;
+
+    let store = store_with(include_str!("fixtures/current_full.json"));
+    let mut gui = Gui::new();
+    assert!(gui.load_ui_config(&store), "the fixture must load");
+    gui.set_overlay_on_pane_for_test(1, &known::RADAR_SITES, true);
+    // The table is handed over explicitly rather than taken from
+    // `rustdar_radar::sites::radars()`, which is a process-global catalogue
+    // another test may or may not have adopted by the time this one runs.
+    gui.deliver_overlay_fetch(OverlayFetchResult {
+        kind: known::RADAR_SITES,
+        data: Box::new(RadarSitesFetchResult(vec![
+            SiteRow {
+                name: "KOUN".to_string(),
+                lat: 35.23,
+                lon: -97.46,
+            },
+            SiteRow {
+                name: "KFWS".to_string(),
+                lat: 32.57,
+                lon: -97.30,
+            },
+        ])),
+    });
+
+    let current_marks = |gui: &Gui, idx: usize| -> Vec<String> {
+        let pane = gui.pane(idx).expect("the fixture's pane");
+        let view = pane.view(idx);
+        let now = chrono::Utc::now().naive_utc();
+        let job = gui
+            .overlays
+            .prepare_job(
+                &known::RADAR_SITES,
+                &rustdar_source::handler::RasterizeContext {
+                    is_dark: false,
+                    zoom: 7.0,
+                    device_scale: 1.0,
+                    now,
+                    as_of: now,
+                },
+                &view.layer(&known::RADAR_SITES),
+            )
+            .expect("the sites layer describes a job once it holds the table");
+        let input = job
+            .downcast_ref::<rustdar_overlays::render::rasterize::SitesInput>()
+            .expect("the sites layer describes a sites job");
+        input
+            .sites
+            .iter()
+            .filter(|s| s.is_current)
+            .map(|s| s.name.clone())
+            .collect()
+    };
+
+    assert_eq!(
+        current_marks(&gui, 1),
+        vec!["KOUN".to_string()],
+        "premise: exactly the pane's own site is marked before it moves",
+    );
+
+    gui.pane_mut(1)
+        .expect("pane 1")
+        .set_site("KFWS".to_string());
+    gui.hydrate_pane_layer_states_for_test(1);
+
+    assert_eq!(
+        current_marks(&gui, 1),
+        vec!["KFWS".to_string()],
+        "the pane moved to KFWS and the radar-sites layer still marked KOUN as \
+         \"you are here\" — the marker followed the site the file was opened \
+         on, for the whole session",
+    );
+}
