@@ -7,7 +7,7 @@ nexrad-level3/src/model/radial.rs	86	85
 nexrad-level3/src/model/symbology.rs	5	5
 rustdar-app/src/app.rs	1241	900
 rustdar-app/src/app_chunks.rs	216	120
-rustdar-app/src/app_fetch.rs	1234	822
+rustdar-app/src/app_fetch.rs	1234	830
 rustdar-app/src/app_render.rs	2355	1708
 rustdar-app/src/app_state.rs	72	0
 rustdar-app/src/budget_arms.rs	17	17
@@ -17,7 +17,7 @@ rustdar-app/src/frame_pump.rs	23	23
 rustdar-app/src/input.rs	138	127
 rustdar-app/src/location_hint.rs	82	51
 rustdar-app/src/loop_pool.rs	179	178
-rustdar-app/src/platform.rs	272	231
+rustdar-app/src/platform.rs	272	228
 rustdar-app/src/platform_double.rs	236	220
 rustdar-app/src/render_dispatch.rs	999	900
 rustdar-app/src/render_key.rs	21	21
@@ -32,7 +32,7 @@ rustdar-device-profile/src/mobile_cfg.rs	19	19
 rustdar-device-profile/src/quality.rs	84	83
 rustdar-egui/src/actions.rs	60	26
 rustdar-egui/src/gui/frame.rs	330	317
-rustdar-egui/src/gui/layer_glue.rs	321	315
+rustdar-egui/src/gui/layer_glue.rs	323	317
 rustdar-egui/src/gui/probes.rs	68	68
 rustdar-egui/src/gui/state.rs	125	122
 rustdar-egui/src/gui/sync.rs	141	139
@@ -41,10 +41,10 @@ rustdar-egui/src/legend_ramp.rs	146	146
 rustdar-egui/src/overlay_cache.rs	235	230
 rustdar-egui/src/pane.rs	1215	1155
 rustdar-egui/src/pane_content.rs	202	189
-rustdar-egui/src/parity_walk.rs	315	274
+rustdar-egui/src/parity_walk.rs	320	278
 rustdar-egui/src/point_painter.rs	55	0
 rustdar-egui/src/radar_layer.rs	130	129
-rustdar-egui/src/sources.rs	312	299
+rustdar-egui/src/sources.rs	311	298
 rustdar-egui/src/tile_source.rs	242	235
 rustdar-egui/src/tiles.rs	107	96
 rustdar-egui/src/ui.rs	1051	926
@@ -180,11 +180,11 @@ rustdar-radar/src/render/polar.rs	264	260
 rustdar-radar/src/render_input.rs	663	633
 rustdar-radar/src/sampler.rs	573	553
 rustdar-radar/src/sampler/seam_fixture.rs	178	167
-rustdar-radar/src/scan.rs	368	214
+rustdar-radar/src/scan.rs	368	218
 rustdar-radar/src/site_position.rs	80	80
 rustdar-radar/src/sites.rs	579	579
 rustdar-radar/src/sounding.rs	234	207
-rustdar-radar/src/source.rs	501	447
+rustdar-radar/src/source.rs	501	457
 rustdar-radar/src/srm.rs	107	102
 rustdar-radar/src/srv.rs	203	203
 rustdar-radar/src/tls_pins.rs	64	62
