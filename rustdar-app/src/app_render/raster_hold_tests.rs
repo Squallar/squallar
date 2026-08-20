@@ -24,9 +24,9 @@ fn point_at(app: &mut crate::app::App, pane_idx: usize) {
     let mut product_elevations = std::collections::HashMap::new();
     product_elevations.insert(RadarProduct::Reflectivity, vec![TILT]);
     let pane = app.gui.pane_mut(pane_idx).expect("pane exists");
-    pane.site = SITE.to_string();
-    pane.selected_product = RadarProduct::Reflectivity;
-    pane.selected_elevation = TILT;
+    pane.set_site(SITE.to_string());
+    pane.set_selected_product(RadarProduct::Reflectivity);
+    pane.set_selected_elevation(TILT);
     app.gui
         .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForPane {
             pane_idx,

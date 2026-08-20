@@ -374,14 +374,19 @@ pub const RADAR_SLOT_PANE_KEYS: [&str; 4] = ["site", "product", "elevation", "li
 /// Per-pane state: each pane independently selects a radar product,
 /// elevation, layer toggles, and maintains its own map viewport.
 pub struct PaneState {
-    /// This pane's radar site. Persisted as a member of the radar slot's
-    /// config, decoded on load and re-emitted on save.
-    pub site: String,
+    /// This pane's radar site. **Private since WO-E6b**: it is persisted as
+    /// a member of the radar slot's config, decoded on load and re-emitted on
+    /// save, so every read and write goes through [`Self::site`] /
+    /// [`Self::set_site`] and there is one place to change when WO-E9 moves
+    /// the selection again.
+    site: String,
     pub scan_info: Option<ScanInfo>,
     /// When the data behind this pane's current radar image was collected (UTC).
     pub data_time: Option<NaiveDateTime>,
-    pub selected_product: RadarProduct,
-    pub selected_elevation: f32,
+    /// Private since WO-E6b — see [`Self::site`].
+    selected_product: RadarProduct,
+    /// Private since WO-E6b — see [`Self::site`].
+    selected_elevation: f32,
     pub viewing_live: bool,
     /// Time navigation step size in seconds (0 = single scan mode).
     pub time_step_secs: i64,

@@ -32,9 +32,9 @@ fn point_at_site(app: &mut crate::app::App, pane_idx: usize) {
     let mut product_elevations = std::collections::HashMap::new();
     product_elevations.insert(PRODUCT, vec![TILT]);
     let pane = app.gui.pane_mut(pane_idx).expect("pane exists");
-    pane.site = SITE.to_string();
-    pane.selected_product = PRODUCT;
-    pane.selected_elevation = TILT;
+    pane.set_site(SITE.to_string());
+    pane.set_selected_product(PRODUCT);
+    pane.set_selected_elevation(TILT);
     app.gui
         .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForPane {
             pane_idx,
@@ -304,8 +304,8 @@ fn the_first_loop_dispatch_pass_skips_only_the_panes_that_cannot_loop() {
             }
             pane.loop_state = active_loop(&[volume_time()]);
             pane.loop_state.view = kind;
-            pane.selected_product = moved_to;
-            pane.selected_elevation = 0.0;
+            pane.set_selected_product(moved_to);
+            pane.set_selected_elevation(0.0);
         }
 
         app.dispatch_loop_renders();

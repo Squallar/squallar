@@ -47,9 +47,9 @@ fn app_with_volume_loop(minutes: &[u32]) -> crate::app::App {
     }
 
     let pane = app.gui.pane_mut(0).expect("pane 0 exists");
-    pane.site = SITE.to_string();
-    pane.selected_product = PRODUCT;
-    pane.selected_elevation = TILT;
+    pane.set_site(SITE.to_string());
+    pane.set_selected_product(PRODUCT);
+    pane.set_selected_elevation(TILT);
     pane.set_view(rustdar_radar::types::RenderView::Volume);
 
     let mut ls = LoopPlaybackState::new_for_loop(3600, &site(), RenderView::Volume);

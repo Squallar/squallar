@@ -117,9 +117,9 @@ fn app_showing_site() -> crate::app::App {
     product_elevations.insert(RadarProduct::NormalizedRotation, vec![0.5]);
     {
         let pane = app.gui.pane_mut(0).unwrap();
-        pane.site = SITE.to_string();
-        pane.selected_product = RadarProduct::NormalizedRotation;
-        pane.selected_elevation = 0.5;
+        pane.set_site(SITE.to_string());
+        pane.set_selected_product(RadarProduct::NormalizedRotation);
+        pane.set_selected_elevation(0.5);
     }
     app.gui
         .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForPane {
@@ -189,7 +189,7 @@ fn a_plan_view_and_a_section_of_one_sweep_fold_at_the_same_speed() {
     {
         let pane = app.gui.pane_mut(0).unwrap();
         pane.set_kind(rustdar_egui::pane::PaneKind::CrossSection);
-        pane.selected_product = RadarProduct::NormalizedRotation;
+        pane.set_selected_product(RadarProduct::NormalizedRotation);
         pane.cross_section_mut().unwrap().line = Some(
             rustdar_egui::pane::SectionLine::new(
                 rustdar_geo::GeoPoint {

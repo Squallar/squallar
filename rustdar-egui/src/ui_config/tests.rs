@@ -370,7 +370,7 @@ fn a_config_from_another_build_still_loads_its_storm_motion_fallback() {
         assert!(gui.load_ui_config(&store), "{why}");
         assert_eq!(gui.srv_fallback, SrvFallback::MeanWind, "{why}");
         assert_eq!(
-            gui.pane(0).map(|p| p.site.clone()),
+            gui.pane(0).map(|p| p.site().to_string()),
             Some("KDMX".to_owned()),
             "{why}: the rest of the config was lost",
         );
@@ -595,7 +595,7 @@ fn a_config_naming_a_product_from_the_future_still_loads() {
         "one unknown product name must not fail the whole config load",
     );
     assert_eq!(
-        gui.pane(0).unwrap().selected_product,
+        gui.pane(0).unwrap().selected_product(),
         RadarProduct::Reflectivity,
         "the unknown product falls back to the default product",
     );
@@ -644,7 +644,7 @@ fn a_config_naming_a_pane_kind_from_the_future_still_loads() {
         "the rest of the file must survive the unknown pane kind",
     );
     assert_eq!(
-        gui.pane(0).map(|pane| pane.site.as_str()),
+        gui.pane(0).map(|pane| pane.site()),
         Some("KDMX"),
         "the unreadable pane keeps every field that was readable",
     );
@@ -671,13 +671,18 @@ fn a_config_naming_a_site_no_radar_could_have_is_refused_not_sliced() {
         .expect("the memory store accepts a write");
 
     let mut gui = crate::Gui::new();
-    let default_site = crate::Gui::new().pane(0).map(|pane| pane.site.clone());
+    let default_site = crate::Gui::new()
+        .pane(0)
+        .map(|pane| pane.site().to_string());
     assert!(
         gui.load_ui_config(&store),
         "one impossible site must not fail the whole config load",
     );
 
-    let restored = gui.pane(0).map(|pane| pane.site.clone()).expect("a pane");
+    let restored = gui
+        .pane(0)
+        .map(|pane| pane.site().to_string())
+        .expect("a pane");
 
     assert!(
         rustdar_radar::level3::site_code(&restored).is_ascii(),
@@ -694,7 +699,7 @@ fn a_config_naming_a_site_no_radar_could_have_is_refused_not_sliced() {
     );
 
     assert_eq!(
-        gui.pane(1).map(|pane| pane.site.as_str()),
+        gui.pane(1).map(|pane| pane.site()),
         Some("KDMX"),
         "the pane beside the refused one keeps its own site",
     );
@@ -838,7 +843,7 @@ fn a_pane_config_that_cannot_be_a_pane_loads_as_a_map() {
             "{name}: loaded as a pane whose kind and state disagree"
         );
         assert_eq!(
-            restored.pane(0).unwrap().site,
+            restored.pane(0).unwrap().site(),
             "KTLX",
             "{name}: the rest of the pane was lost with its kind"
         );
@@ -934,7 +939,7 @@ fn a_config_predating_pane_kinds_loads_as_maps() {
         vec![PaneKind::Map, PaneKind::Map],
     );
     assert_eq!(restored.pane(0).unwrap().map_memory.zoom(), 7.0);
-    assert_eq!(restored.pane(1).unwrap().site, "KOUN");
+    assert_eq!(restored.pane(1).unwrap().site(), "KOUN");
 }
 
 /// A restored non-map pane arrives with the same invariants as a converted one: no
@@ -1281,7 +1286,7 @@ fn a_config_predating_viewport_persistence_keeps_the_default_zoom() {
     let mut restored = crate::Gui::new();
     restored.load_ui_config(&store);
 
-    assert_eq!(restored.pane(0).unwrap().site, "KMPX");
+    assert_eq!(restored.pane(0).unwrap().site(), "KMPX");
     assert_eq!(
         restored.pane(0).unwrap().map_memory.zoom(),
         default_zoom,
@@ -1320,7 +1325,7 @@ fn a_restored_zoom_survives_the_sessions_first_scan() {
     let store = MemoryKvStore::default();
 
     let mut gui = crate::Gui::new();
-    let site = gui.pane(0).unwrap().site.clone();
+    let site = gui.pane(0).unwrap().site().to_string();
     assert_ne!(
         gui.pane(0).unwrap().map_memory.zoom(),
         9.0,
@@ -1367,7 +1372,7 @@ fn a_restored_zoom_survives_the_sessions_first_chunk_volume() {
     let store = MemoryKvStore::default();
 
     let mut gui = crate::Gui::new();
-    let site = gui.pane(0).unwrap().site.clone();
+    let site = gui.pane(0).unwrap().site().to_string();
     gui.pane_mut(0).unwrap().map_memory.set_zoom(9.0).unwrap();
     gui.save_ui_config(&store);
 
@@ -1398,7 +1403,7 @@ fn a_first_run_with_no_config_still_zooms_to_the_radar_on_its_first_scan() {
         !gui.load_ui_config(&store),
         "precondition: an empty store is a first run"
     );
-    let site = gui.pane(0).unwrap().site.clone();
+    let site = gui.pane(0).unwrap().site().to_string();
     assert_ne!(
         gui.pane(0).unwrap().map_memory.zoom(),
         crate::ui::DEFAULT_INITIAL_ZOOM,
@@ -1455,7 +1460,7 @@ fn a_config_without_a_saved_zoom_still_zooms_to_the_radar_on_its_first_scan() {
 #[test]
 fn a_scan_no_pane_is_watching_neither_moves_a_map_nor_spends_the_latch() {
     let mut gui = crate::Gui::new();
-    let site = gui.pane(0).unwrap().site.clone();
+    let site = gui.pane(0).unwrap().site().to_string();
     let before = gui.pane(0).unwrap().map_memory.zoom();
     assert_ne!(site, "KABX", "precondition: the stray site must be a stray");
 
@@ -1550,7 +1555,9 @@ fn unparseable_config_is_ignored() {
 fn a_reopened_pane_carries_no_fold_limit_until_its_first_render() {
     let store = MemoryKvStore::default();
     let mut gui = crate::Gui::new();
-    gui.pane_mut(0).unwrap().selected_product = rustdar_radar::types::RadarProduct::Velocity;
+    gui.pane_mut(0)
+        .unwrap()
+        .set_selected_product(rustdar_radar::types::RadarProduct::Velocity);
     gui.save_ui_config(&store);
 
     let written = store.load(UI_CONFIG_KEY).expect("config should be stored");
@@ -1565,7 +1572,7 @@ fn a_reopened_pane_carries_no_fold_limit_until_its_first_render() {
     restored.load_ui_config(&store);
     let pane = restored.pane(0).expect("a restored pane");
     assert_eq!(
-        pane.selected_product,
+        pane.selected_product(),
         rustdar_radar::types::RadarProduct::Velocity,
         "precondition: the pane must come back on velocity, or it would \
          answer None for the wrong reason",

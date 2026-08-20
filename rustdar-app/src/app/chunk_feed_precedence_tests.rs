@@ -17,7 +17,7 @@ fn app_showing(shown: chrono::NaiveDateTime) -> App {
     let mut app = headless(TestBridge::desktop());
     {
         let pane = app.gui.pane_mut(0).unwrap();
-        pane.site = "KTLX".to_string();
+        pane.set_site("KTLX".to_string());
         pane.viewing_live = true;
         pane.scan_info = Some(rustdar_radar::types::ScanInfo {
             site_source: rustdar_radar::site_position::SitePositionSource::Table,

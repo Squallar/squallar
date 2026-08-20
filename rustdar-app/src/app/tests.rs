@@ -535,7 +535,7 @@ fn stored_fps(store: &MemoryKvStore) -> f32 {
 
 /// The site every pane opens on, which is what a user actually sees.
 fn opening_site(app: &App) -> String {
-    app.gui.pane(0).expect("a pane exists").site.clone()
+    app.gui.pane(0).expect("a pane exists").site().to_string()
 }
 
 // ── First-run site selection ────────────────────────────────────────
@@ -562,7 +562,7 @@ fn different_timezones_open_on_different_sites() {
 #[test]
 fn a_platform_with_no_timezone_keeps_the_built_in_default() {
     let app = headless(TestBridge::desktop());
-    assert_eq!(opening_site(&app), Gui::new().pane(0).unwrap().site);
+    assert_eq!(opening_site(&app), Gui::new().pane(0).unwrap().site());
 }
 
 /// The precedence rule, and the one that matters most: a returning user's stored site is
@@ -623,7 +623,7 @@ fn a_refined_site_actually_requests_its_radar_data() {
     app.poll_platform_state();
 
     let pane = app.gui.pane(0).expect("a pane exists");
-    assert_eq!(pane.site, "KDLH");
+    assert_eq!(pane.site(), "KDLH");
     assert_eq!(
         pane.loading_site.as_deref(),
         Some("KDLH"),
@@ -1123,7 +1123,7 @@ fn a_guessed_site_is_persisted() {
 
     let mut reloaded = Gui::new();
     assert!(reloaded.load_ui_config(store.as_ref()));
-    assert_eq!(reloaded.pane(0).unwrap().site, "KFTG");
+    assert_eq!(reloaded.pane(0).unwrap().site(), "KFTG");
 }
 
 /// The state a pan leaves behind: an event has been seen, and the last autosave check was
@@ -1711,7 +1711,7 @@ fn every_queued_scan_response_is_spent_in_the_frame_it_arrives_in() {
     let mut app = headless(TestBridge::desktop());
     {
         let pane = app.gui.pane_mut(0).unwrap();
-        pane.site = "KTLX".to_string();
+        pane.set_site("KTLX".to_string());
         pane.loading_site = Some("KTLX".to_string());
     }
 
@@ -1766,7 +1766,7 @@ pub(super) fn two_pane_app(first: &str, second: &str) -> App {
         2,
         "precondition: the fixture must really have two panes"
     );
-    assert_eq!(app.gui.pane(1).map(|p| p.site.as_str()), Some(second));
+    assert_eq!(app.gui.pane(1).map(|p| p.site()), Some(second));
     app.render.ensure_pane_count(2);
     app
 }
@@ -1858,7 +1858,7 @@ fn scan_info_for(site: &str) -> ScanInfo {
 #[test]
 fn a_volume_no_pane_is_showing_is_dropped() {
     let mut app = headless(TestBridge::desktop());
-    app.gui.pane_mut(0).unwrap().site = "KTLX".to_string();
+    app.gui.pane_mut(0).unwrap().set_site("KTLX".to_string());
     app.gui
         .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForPane {
             pane_idx: 0,
@@ -2008,7 +2008,7 @@ fn the_volume_a_switching_pane_is_still_drawing_survives() {
             pane_idx: 0,
             info: scan_info_for("KTLX"),
         });
-    app.gui.pane_mut(0).unwrap().site = "KOUN".to_string();
+    app.gui.pane_mut(0).unwrap().set_site("KOUN".to_string());
     app.scan_data.insert(
         "KTLX".to_string(),
         (Arc::new(empty_scan()), Default::default()),
@@ -2042,7 +2042,7 @@ fn a_discarded_scan_result_still_takes_down_the_wait_it_belonged_to() {
     let mut app = headless(TestBridge::desktop());
     {
         let pane = app.gui.pane_mut(0).unwrap();
-        pane.site = "KTLX".to_string();
+        pane.set_site("KTLX".to_string());
         pane.loading_site = Some("KTLX".to_string());
     }
 

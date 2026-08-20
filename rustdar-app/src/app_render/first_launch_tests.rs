@@ -112,7 +112,7 @@ fn a_returning_users_open_site_survives_the_catalogue_landing() {
         !app.site_hint_pending,
         "a launch that restored a config brought its own site",
     );
-    let opened = app.gui.pane(0).expect("a pane exists").site.clone();
+    let opened = app.gui.pane(0).expect("a pane exists").site().to_string();
 
     app.channels
         .site_catalogue_sender
@@ -121,7 +121,7 @@ fn a_returning_users_open_site_survives_the_catalogue_landing() {
     app.poll_site_catalogue();
 
     assert_eq!(
-        app.gui.pane(0).expect("a pane exists").site,
+        app.gui.pane(0).expect("a pane exists").site(),
         opened,
         "the catalogue may add radars around them; it may not move them",
     );

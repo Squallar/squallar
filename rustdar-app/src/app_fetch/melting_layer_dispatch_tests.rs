@@ -149,7 +149,7 @@ fn both_dispatch_paths_classify_against_this_volumes_melting_layer_and_no_other(
     let site = rustdar_radar::sites::get_radar_site(SITE)
         .expect("KTLX is a real radar")
         .clone();
-    app.gui.pane_mut(0).unwrap().site = SITE.to_string();
+    app.gui.pane_mut(0).unwrap().set_site(SITE.to_string());
     app.render.ensure_pane_count(1);
     app.render.set_melting_layer(
         SITE,
@@ -247,7 +247,7 @@ fn a_product_that_classifies_nothing_carries_no_melting_layer() {
     let site = rustdar_radar::sites::get_radar_site(SITE)
         .expect("KTLX is a real radar")
         .clone();
-    app.gui.pane_mut(0).unwrap().site = SITE.to_string();
+    app.gui.pane_mut(0).unwrap().set_site(SITE.to_string());
     app.render.ensure_pane_count(1);
     app.render.set_melting_layer(
         SITE,
@@ -308,7 +308,7 @@ fn both_dispatch_paths_shift_by_this_volumes_storm_motion_and_no_other() {
     let site = rustdar_radar::sites::get_radar_site(SITE)
         .expect("KTLX is a real radar")
         .clone();
-    app.gui.pane_mut(0).unwrap().site = SITE.to_string();
+    app.gui.pane_mut(0).unwrap().set_site(SITE.to_string());
     app.render.ensure_pane_count(1);
     app.render.set_storm_motion(
         SITE,
@@ -406,7 +406,7 @@ fn a_product_that_applies_no_storm_motion_carries_none() {
     let site = rustdar_radar::sites::get_radar_site(SITE)
         .expect("KTLX is a real radar")
         .clone();
-    app.gui.pane_mut(0).unwrap().site = SITE.to_string();
+    app.gui.pane_mut(0).unwrap().set_site(SITE.to_string());
     app.render.ensure_pane_count(1);
     app.render.set_storm_motion(
         SITE,

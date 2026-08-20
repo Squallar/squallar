@@ -16,10 +16,10 @@ pub(super) fn show_on(
     available: &[f32],
 ) {
     let pane = app.gui.pane_mut(idx).unwrap();
-    pane.site = "KTLX".to_string();
+    pane.set_site("KTLX".to_string());
     pane.viewing_live = true;
-    pane.selected_product = product;
-    pane.selected_elevation = selected;
+    pane.set_selected_product(product);
+    pane.set_selected_elevation(selected);
     let mut product_elevations = std::collections::HashMap::new();
     product_elevations.insert(product, available.to_vec());
     pane.scan_info = Some(ScanInfo {

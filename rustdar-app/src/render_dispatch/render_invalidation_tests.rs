@@ -44,7 +44,9 @@ fn gated_nothing() -> (mpsc::Sender<()>, rustdar_worker::offload::Job) {
 /// One pane, on `site`, which is how `reset_panes_for_site` reads the layout.
 fn gui_showing(site: &str) -> rustdar_egui::Gui {
     let mut gui = rustdar_egui::Gui::new();
-    gui.pane_mut(0).expect("a fresh Gui has one pane").site = site.to_string();
+    gui.pane_mut(0)
+        .expect("a fresh Gui has one pane")
+        .set_site(site.to_string());
     gui
 }
 
@@ -394,9 +396,9 @@ fn gui_on_tilt(
     use rustdar_radar::types::ScanInfo;
     let mut gui = rustdar_egui::Gui::new();
     let pane = gui.pane_mut(0).expect("a fresh Gui has one pane");
-    pane.site = site.to_string();
-    pane.selected_product = product;
-    pane.selected_elevation = selected;
+    pane.set_site(site.to_string());
+    pane.set_selected_product(product);
+    pane.set_selected_elevation(selected);
     let mut product_elevations = std::collections::HashMap::new();
     product_elevations.insert(product, available.to_vec());
     pane.scan_info = Some(ScanInfo {
