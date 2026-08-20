@@ -116,7 +116,7 @@ fn a_loop_frame_is_dispatched_leaner_than_the_still_frame_beside_it() {
     let site = rustdar_radar::sites::get_radar_site(SITE)
         .expect("KTLX is a real radar")
         .clone();
-    app.gui.pane_mut(0).unwrap().site = SITE.to_string();
+    app.gui.pane_mut(0).unwrap().set_site(SITE.to_string());
     app.render.ensure_pane_count(1);
     const DEVICE_CEILING: usize = 8192;
     app.render.set_raster_side_ceiling_px(DEVICE_CEILING);

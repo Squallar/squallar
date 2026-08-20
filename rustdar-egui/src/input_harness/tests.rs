@@ -2042,7 +2042,7 @@ fn a_click_on_a_cell_no_pane_occupies_leaves_the_active_pane_alone() {
 
     assert_eq!(h.active_pane_index(), 0);
     assert_eq!(
-        h.gui_mut().active_pane().site,
+        h.gui_mut().active_pane().site(),
         "KTLX",
         "the slot still resolves to a pane rather than panicking"
     );
@@ -4558,8 +4558,8 @@ fn a_product_whose_tilts_have_not_arrived_keeps_its_tilt_picker() {
         info.available_products.push(RadarProduct::EchoTops);
         info.product_elevations
             .insert(RadarProduct::EchoTops, Vec::new());
-        pane.selected_product = RadarProduct::EchoTops;
-        pane.selected_elevation = 0.0;
+        pane.set_selected_product(RadarProduct::EchoTops);
+        pane.set_selected_elevation(0.0);
     }
     h.warm_up();
 
@@ -4574,7 +4574,10 @@ fn a_product_whose_tilts_have_not_arrived_keeps_its_tilt_picker() {
         Some((RadarProduct::EchoTops, 0.0)),
     );
 
-    h.gui_mut().pane_mut(0).unwrap().selected_product = RadarProduct::Reflectivity;
+    h.gui_mut()
+        .pane_mut(0)
+        .unwrap()
+        .set_selected_product(RadarProduct::Reflectivity);
     h.warm_up();
     assert!(
         h.painted_text_strings().iter().any(|t| t == "0.5\u{b0}"),
@@ -4674,7 +4677,7 @@ fn a_same_selection_re_render_draws_no_notice() {
         );
     }
 
-    h.gui_mut().pane_mut(0).unwrap().selected_elevation = 0.6;
+    h.gui_mut().pane_mut(0).unwrap().set_selected_elevation(0.6);
     h.warm_up();
     assert_eq!(
         h.gui_mut().pane(0).unwrap().get_rendering_params(),
@@ -5491,7 +5494,7 @@ fn refresh_fetches_the_active_panes_site_not_the_global_one() {
         .apply(crate::shell_api::GuiEvent::RadarConfig(config));
     h.warm_up();
     assert_eq!(
-        h.gui_mut().active_pane().site,
+        h.gui_mut().active_pane().site(),
         "KTLX",
         "precondition: the active pane and the global config must disagree"
     );
@@ -5645,8 +5648,8 @@ fn a_converted_pane_keeps_its_site_and_viewport() {
             .gui_mut()
             .pane_mut(0)
             .expect("a fresh harness has one pane");
-        pane.selected_product = rustdar_radar::types::RadarProduct::Velocity;
-        pane.selected_elevation = 1.5;
+        pane.set_selected_product(rustdar_radar::types::RadarProduct::Velocity);
+        pane.set_selected_elevation(1.5);
         pane.viewing_live = false;
         let _ = pane.map_memory.set_zoom(9.25);
         pane.map_memory.center_at(walkers::lat_lon(35.0, -97.8));
@@ -5667,10 +5670,10 @@ fn a_converted_pane_keeps_its_site_and_viewport() {
     ) {
         let pane = h.gui_mut().pane(0).expect("pane 0");
         (
-            pane.site.clone(),
+            pane.site().to_string(),
             pane.scan_info.as_ref().map(|info| info.site.name),
-            pane.selected_product.name().to_owned(),
-            pane.selected_elevation,
+            pane.selected_product().name().to_owned(),
+            pane.selected_elevation(),
             pane.viewing_live,
             pane.map_memory.zoom(),
             pane.map_memory.detached(),
@@ -8021,7 +8024,7 @@ fn an_unlinked_pane_is_excluded_from_shared_nav_and_loop_fan_out() {
         "the unlinked pane's step must stay its own"
     );
     assert_eq!(
-        gui.pane(1).expect("pane 1").site,
+        gui.pane(1).expect("pane 1").site(),
         "KTLX",
         "unlink is about time: every other synced field still converges"
     );
@@ -8106,12 +8109,13 @@ fn the_catalog_search_filters_and_a_product_tile_aims_the_active_pane() {
     assert!(!h.catalog().open, "applying a tile must close the catalog");
     let pane = h.gui_mut().pane(0).expect("pane 0");
     assert_eq!(
-        pane.selected_product,
+        pane.selected_product(),
         rustdar_radar::types::RadarProduct::SpectrumWidth,
         "the tile did not set the active pane's product"
     );
     assert_eq!(
-        pane.selected_elevation, 0.0,
+        pane.selected_elevation(),
+        0.0,
         "the old product's tilt must not survive the switch"
     );
     assert!(
@@ -8211,8 +8215,10 @@ fn a_saved_preset_appears_applies_and_deletes() {
     h.set_layer_links(false);
 
     h.set_pane_count(2);
-    h.gui_mut().pane_mut(0).expect("pane 0").selected_product =
-        rustdar_radar::types::RadarProduct::Velocity;
+    h.gui_mut()
+        .pane_mut(0)
+        .expect("pane 0")
+        .set_selected_product(rustdar_radar::types::RadarProduct::Velocity);
     h.set_overlay_on_pane(0, &known::STORM_REPORTS, true);
     h.warm_up();
 
@@ -8243,8 +8249,10 @@ fn a_saved_preset_appears_applies_and_deletes() {
     );
 
     h.set_pane_count(1);
-    h.gui_mut().pane_mut(0).expect("pane 0").selected_product =
-        rustdar_radar::types::RadarProduct::Reflectivity;
+    h.gui_mut()
+        .pane_mut(0)
+        .expect("pane 0")
+        .set_selected_product(rustdar_radar::types::RadarProduct::Reflectivity);
     h.set_overlay_on_pane(0, &known::STORM_REPORTS, false);
     h.warm_up();
     let tile = h
@@ -8259,7 +8267,7 @@ fn a_saved_preset_appears_applies_and_deletes() {
     );
     assert_eq!(h.pane_count(), 2, "the preset's pane count must come back");
     assert_eq!(
-        h.gui_mut().pane(0).expect("pane 0").selected_product,
+        h.gui_mut().pane(0).expect("pane 0").selected_product(),
         rustdar_radar::types::RadarProduct::Velocity,
         "the preset's per-pane product must come back"
     );
@@ -8672,7 +8680,10 @@ fn the_product_and_tilt_pill_popovers_write_the_pane() {
 
     let (code, pill) = h.pill(0, PillKind::Product).expect("a product pill");
     assert_eq!(code, "REF", "the pill shows the product code");
-    h.gui_mut().pane_mut(0).expect("pane 0").selected_elevation = 1.5;
+    h.gui_mut()
+        .pane_mut(0)
+        .expect("pane 0")
+        .set_selected_elevation(1.5);
     h.mouse_click(pill.center());
     h.frame(); // the popup's debut frame only registers it
     let popover = h.pill_popover().expect("the popover opened");
@@ -8691,12 +8702,13 @@ fn the_product_and_tilt_pill_popovers_write_the_pane() {
     {
         let pane = h.gui_mut().pane(0).expect("pane 0");
         assert_eq!(
-            pane.selected_product,
+            pane.selected_product(),
             rustdar_radar::types::RadarProduct::Velocity,
             "the pick did not set the pane's product"
         );
         assert_eq!(
-            pane.selected_elevation, 0.0,
+            pane.selected_elevation(),
+            0.0,
             "the old product's tilt must not survive the switch"
         );
     }
@@ -8720,7 +8732,7 @@ fn the_product_and_tilt_pill_popovers_write_the_pane() {
     h.mouse_click(popover.rows[1].1.center());
     h.warm_up();
     assert_eq!(
-        h.gui_mut().pane(0).expect("pane 0").selected_elevation,
+        h.gui_mut().pane(0).expect("pane 0").selected_elevation(),
         1.5,
         "the pick did not set the pane's tilt"
     );

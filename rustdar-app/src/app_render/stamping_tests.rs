@@ -88,7 +88,7 @@ pub(super) fn app_showing_site() -> crate::app::App {
     let site = rustdar_radar::sites::get_radar_site(SITE)
         .expect("KMPX is a real radar")
         .clone();
-    app.gui.pane_mut(0).unwrap().site = SITE.to_string();
+    app.gui.pane_mut(0).unwrap().set_site(SITE.to_string());
     app.gui
         .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForPane {
             pane_idx: 0,
@@ -192,7 +192,10 @@ fn a_placed_render_describes_what_it_depicts() {
         "one product from each datasource",
     );
 
-    app.gui.pane_mut(0).unwrap().selected_product = RadarProduct::Reflectivity;
+    app.gui
+        .pane_mut(0)
+        .unwrap()
+        .set_selected_product(RadarProduct::Reflectivity);
     app.apply_render_to_pane(
         &ctx,
         0,
@@ -206,7 +209,7 @@ fn a_placed_render_describes_what_it_depicts() {
              say the label is ahead of the pixels",
     );
 
-    app.gui.pane_mut(0).unwrap().selected_product = PRODUCT;
+    app.gui.pane_mut(0).unwrap().set_selected_product(PRODUCT);
     assert_eq!(
         app.gui.pane(0).unwrap().stale_image_on_screen(),
         None,
@@ -325,7 +328,10 @@ fn a_resume_puts_back_the_fold_limit_it_took_down() {
 fn a_resumed_velocity_pane_annotates_the_fold_again() {
     let ctx = egui::Context::default();
     let mut app = app_showing_site();
-    app.gui.pane_mut(0).unwrap().selected_product = RadarProduct::Velocity;
+    app.gui
+        .pane_mut(0)
+        .unwrap()
+        .set_selected_product(RadarProduct::Velocity);
 
     let render = CachedPaneRender {
         nyquist_ms: Some(26.42),

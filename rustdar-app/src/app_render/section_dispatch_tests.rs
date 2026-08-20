@@ -178,8 +178,8 @@ fn app_with_section(product: RadarProduct, scan: Arc<Scan>) -> crate::app::App {
         .clone();
     {
         let pane = app.gui.pane_mut(0).unwrap();
-        pane.site = SITE.to_owned();
-        pane.selected_product = product;
+        pane.set_site(SITE.to_owned());
+        pane.set_selected_product(product);
         pane.set_kind(PaneKind::CrossSection);
         pane.cross_section_mut().unwrap().line = Some(line());
     }
@@ -1063,7 +1063,10 @@ fn a_new_volume_makes_the_section_on_screen_stale_with_no_reset_arm() {
     let after = app.section_target_for_pane(0).expect("still aimed");
     assert_ne!(before, after, "a new volume did not make the key move");
 
-    app.gui.pane_mut(0).unwrap().selected_product = RadarProduct::Velocity;
+    app.gui
+        .pane_mut(0)
+        .unwrap()
+        .set_selected_product(RadarProduct::Velocity);
     assert_ne!(app.section_target_for_pane(0), Some(after));
 
     app.gui
@@ -1195,7 +1198,10 @@ fn a_seal_that_changes_no_chosen_rung_does_not_move_the_section_key() {
              anyway: that is a byte-identical re-cut per split cut per volume"
     );
 
-    app.gui.pane_mut(0).unwrap().selected_product = RadarProduct::Velocity;
+    app.gui
+        .pane_mut(0)
+        .unwrap()
+        .set_selected_product(RadarProduct::Velocity);
     let vel_after = app.section_target_for_pane(0).expect("aimed at velocity");
     app.base_scans.insert(
         SITE.to_owned(),

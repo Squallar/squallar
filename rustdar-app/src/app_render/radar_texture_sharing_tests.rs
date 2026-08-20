@@ -53,9 +53,9 @@ fn point_at_tilts(
     let mut product_elevations = std::collections::HashMap::new();
     product_elevations.insert(product, tilts.to_vec());
     let pane = app.gui.pane_mut(pane_idx).expect("pane exists");
-    pane.site = site.to_string();
-    pane.selected_product = product;
-    pane.selected_elevation = tilts[0];
+    pane.set_site(site.to_string());
+    pane.set_selected_product(product);
+    pane.set_selected_elevation(tilts[0]);
     app.gui
         .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForPane {
             pane_idx,
@@ -351,7 +351,10 @@ fn a_tilt_click_on_a_tilt_independent_pane_reuploads_nothing() {
         assert_eq!(stamped_elevation(&mut app, 0), TILT, "{product:?}");
         let _ = drain_uploads(&ctx);
 
-        app.gui.pane_mut(0).expect("pane exists").selected_elevation = 3.4;
+        app.gui
+            .pane_mut(0)
+            .expect("pane exists")
+            .set_selected_elevation(3.4);
         app.dispatch_pane_renders(&ctx);
 
         assert!(
@@ -387,7 +390,10 @@ fn a_pane_handed_a_different_raster_uploads_it() {
     let _ = drain_uploads(&ctx);
 
     let second_raster = raster(2);
-    app.gui.pane_mut(0).expect("pane exists").selected_elevation = 3.4;
+    app.gui
+        .pane_mut(0)
+        .expect("pane exists")
+        .set_selected_elevation(3.4);
     deliver_at(
         &mut app,
         &ctx,

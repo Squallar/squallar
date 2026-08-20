@@ -90,7 +90,8 @@ fn a_loop_is_built_from_its_own_panes_scan_not_the_active_panes() {
     let mut mgr = LoopDownloadManager::new();
 
     assert_eq!(
-        panes[1].site, SWITCHED_TO,
+        panes[1].site(),
+        SWITCHED_TO,
         "precondition: pane 1's live site has already moved"
     );
 
@@ -161,7 +162,8 @@ fn each_site_is_polled_against_its_own_current_scan() {
 fn a_scans_own_site_decides_which_poll_it_answers() {
     let panes = [pane_showing(site("KTLX", 35.33, -97.27), ts(10))];
     assert_eq!(
-        panes[0].site, SWITCHED_TO,
+        panes[0].site(),
+        SWITCHED_TO,
         "precondition: the pane's live site has already moved"
     );
 
@@ -226,7 +228,7 @@ fn a_polled_scan_only_reaches_loops_on_its_own_site() {
 fn the_loops_site_decides_not_the_panes_live_site() {
     let koun = site("KOUN", 35.23, -97.46);
     let mut panes = [pane_looping_on(koun, 3600, &[0])];
-    panes[0].site = "KTLX".to_string();
+    panes[0].set_site("KTLX".to_string());
 
     append_polled_frame_to_loops(&mut panes, "KTLX", ts(10), allocation(), &budgets());
     assert_eq!(

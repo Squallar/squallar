@@ -31,7 +31,7 @@ fn pane_listing(products: &[(RadarProduct, &[f32])]) -> PaneState {
 #[test]
 fn a_selection_snaps_to_the_nearest_listed_tilt() {
     let mut pane = pane_listing(&[(RadarProduct::Reflectivity, &[0.5, 1.5, 2.4])]);
-    pane.selected_elevation = 1.3;
+    pane.set_selected_elevation(1.3);
     assert_eq!(
         pane.get_rendering_params(),
         Some((RadarProduct::Reflectivity, 1.5)),
@@ -47,8 +47,8 @@ fn a_listed_product_with_no_tilts_yet_still_renders_at_its_selection() {
         (RadarProduct::Reflectivity, &[0.5, 1.5]),
         (RadarProduct::EchoTops, &[]),
     ]);
-    pane.selected_product = RadarProduct::EchoTops;
-    pane.selected_elevation = 0.0;
+    pane.set_selected_product(RadarProduct::EchoTops);
+    pane.set_selected_elevation(0.0);
 
     assert_eq!(
         pane.get_rendering_params(),
@@ -57,7 +57,7 @@ fn a_listed_product_with_no_tilts_yet_still_renders_at_its_selection() {
              ever dispatched for it",
     );
 
-    pane.selected_elevation = 2.4;
+    pane.set_selected_elevation(2.4);
     assert_eq!(
         pane.get_rendering_params(),
         Some((RadarProduct::EchoTops, 2.4)),
@@ -70,7 +70,7 @@ fn a_listed_product_with_no_tilts_yet_still_renders_at_its_selection() {
 fn a_product_the_scan_does_not_list_resolves_to_nothing() {
     let pane = pane_listing(&[(RadarProduct::Reflectivity, &[0.5])]);
     let mut absent = pane;
-    absent.selected_product = RadarProduct::Velocity;
+    absent.set_selected_product(RadarProduct::Velocity);
     assert_eq!(absent.get_rendering_params(), None);
 
     let empty = PaneState::with_site("KTLX".to_string());

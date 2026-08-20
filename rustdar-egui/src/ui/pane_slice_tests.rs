@@ -9,7 +9,7 @@ fn the_pane_slices_stop_at_the_visible_count() {
     let mut gui = Gui::new();
     gui.set_pane_count_for_test(4);
     for (idx, pane) in gui.panes_mut().iter_mut().enumerate() {
-        pane.site = format!("PANE{idx}");
+        pane.set_site(format!("PANE{idx}"));
     }
 
     gui.set_pane_count_for_test(2);
@@ -17,14 +17,11 @@ fn the_pane_slices_stop_at_the_visible_count() {
     assert_eq!(gui.panes().len(), 2);
     assert_eq!(gui.panes_mut().len(), 2);
     assert_eq!(
-        gui.panes()
-            .iter()
-            .map(|p| p.site.as_str())
-            .collect::<Vec<_>>(),
+        gui.panes().iter().map(|p| p.site()).collect::<Vec<_>>(),
         ["PANE0", "PANE1"],
     );
     assert_eq!(
-        gui.pane(3).map(|p| p.site.as_str()),
+        gui.pane(3).map(|p| p.site()),
         Some("PANE3"),
         "precondition: the hidden pane is still there to be reached by index"
     );
@@ -131,11 +128,12 @@ fn a_pane_kind_request_survives_the_pane_being_held_out_of_the_vector() {
         PaneKind::Map,
         "precondition: the pane starts as a map"
     );
-    gui.pane_mut(1).unwrap().site = "KDDC".to_owned();
+    gui.pane_mut(1).unwrap().set_site("KDDC".to_owned());
 
     let held = std::mem::take(&mut gui.panes[gui.active_pane]);
     assert_eq!(
-        gui.panes[1].site, "KTLX",
+        gui.panes[1].site(),
+        "KTLX",
         "precondition: the slot now holds a default PaneState, which is what \
              makes a direct write vanish"
     );
@@ -150,7 +148,7 @@ fn a_pane_kind_request_survives_the_pane_being_held_out_of_the_vector() {
     gui.apply_pending_pane_view(&mut Vec::new());
 
     assert_eq!(
-        gui.pane(1).unwrap().site,
+        gui.pane(1).unwrap().site(),
         "KDDC",
         "precondition: the original pane must be the one back in the slot"
     );
@@ -410,9 +408,9 @@ fn a_drawn_line_lands_somewhere_at_every_reachable_pane_count() {
 fn a_retargeted_section_takes_the_maps_site_and_drops_the_old_picture() {
     let ctx = egui::Context::default();
     let mut gui = wide(2);
-    gui.panes[0].site = "KTLX".to_owned();
-    gui.panes[0].selected_product = RadarProduct::Velocity;
-    gui.panes[1].site = "KINX".to_owned();
+    gui.panes[0].set_site("KTLX".to_owned());
+    gui.panes[0].set_selected_product(RadarProduct::Velocity);
+    gui.panes[1].set_site("KINX".to_owned());
     gui.panes[1].set_kind(crate::pane::PaneKind::CrossSection);
     {
         let section = gui.panes[1].cross_section_mut().unwrap();
@@ -442,8 +440,8 @@ fn a_retargeted_section_takes_the_maps_site_and_drops_the_old_picture() {
     gui.apply_pending_section_line();
 
     let pane = gui.pane(1).unwrap();
-    assert_eq!(pane.site, "KTLX");
-    assert_eq!(pane.selected_product, RadarProduct::Velocity);
+    assert_eq!(pane.site(), "KTLX");
+    assert_eq!(pane.selected_product(), RadarProduct::Velocity);
     let section = pane.cross_section().unwrap();
     assert_eq!(section.line, Some(drawn_line()));
     assert!(
@@ -499,9 +497,9 @@ fn converting_a_pane_tears_down_its_loop_and_nothing_else() {
         let mut gui = Gui::new();
         {
             let pane = gui.pane_mut(0).unwrap();
-            pane.site = "KDDC".to_owned();
-            pane.selected_product = RadarProduct::Velocity;
-            pane.selected_elevation = 1.5;
+            pane.set_site("KDDC".to_owned());
+            pane.set_selected_product(RadarProduct::Velocity);
+            pane.set_selected_elevation(1.5);
             pane.viewing_live = false;
             pane.time_step_secs = 1800;
             pane.loop_state.phase = LoopPhase::Playing;
@@ -520,9 +518,9 @@ fn converting_a_pane_tears_down_its_loop_and_nothing_else() {
             "{view:?}: the loop survived, so it will hold every other pane's \
                  loop back and never finish"
         );
-        assert_eq!(pane.site, "KDDC", "{view:?}: the site went with the loop");
-        assert_eq!(pane.selected_product, RadarProduct::Velocity);
-        assert_eq!(pane.selected_elevation, 1.5);
+        assert_eq!(pane.site(), "KDDC", "{view:?}: the site went with the loop");
+        assert_eq!(pane.selected_product(), RadarProduct::Velocity);
+        assert_eq!(pane.selected_elevation(), 1.5);
         assert!(!pane.viewing_live);
         assert_eq!(pane.time_step_secs, 1800);
 

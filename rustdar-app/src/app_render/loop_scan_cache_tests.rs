@@ -22,7 +22,10 @@ fn volume() -> rustdar_radar::loop_downloads::CachedVolume {
 
 fn app_on_site() -> crate::app::App {
     let mut app = headless(TestBridge::desktop());
-    app.gui.pane_mut(0).expect("a fresh Gui has one pane").site = SITE.to_string();
+    app.gui
+        .pane_mut(0)
+        .expect("a fresh Gui has one pane")
+        .set_site(SITE.to_string());
     app
 }
 
@@ -560,7 +563,7 @@ fn switching_product_keeps_the_objects_of_frames_still_in_the_window() {
     app.gui
         .pane_mut(0)
         .expect("a fresh Gui has one pane")
-        .selected_product = RadarProduct::SpecificDifferentialPhase;
+        .set_selected_product(RadarProduct::SpecificDifferentialPhase);
 
     app.evict_unshown_scans();
 

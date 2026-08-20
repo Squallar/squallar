@@ -94,9 +94,9 @@ fn section_pane_showing_the_wsr88ds_cut(app: &mut crate::app::App) {
     .expect("a full-size, all-NoCoverage section is well formed");
 
     let pane = app.gui.pane_mut(0).expect("a fresh Gui has one pane");
-    pane.site = WSR88D.to_string();
+    pane.set_site(WSR88D.to_string());
     pane.set_kind(rustdar_egui::pane::PaneKind::CrossSection);
-    let product = pane.selected_product;
+    let product = pane.selected_product();
     let xsect = pane.cross_section_mut().expect("just converted");
     xsect.line = Some(line);
     xsect.section = Some(std::sync::Arc::new(cut));
@@ -113,7 +113,7 @@ fn section_pane_showing_the_wsr88ds_cut(app: &mut crate::app::App) {
 
 fn pane_on(app: &mut crate::app::App, site: &str, info: Option<ScanInfo>) {
     let pane = app.gui.pane_mut(0).expect("a fresh Gui has one pane");
-    pane.site = site.to_string();
+    pane.set_site(site.to_string());
     pane.scan_info = info;
 }
 
@@ -152,7 +152,7 @@ fn switching_to_a_tdwr_stops_offering_the_wsr88ds_products() {
     switch_to(&mut app, TDWR);
 
     assert_eq!(
-        app.gui.pane(0).unwrap().site,
+        app.gui.pane(0).unwrap().site(),
         TDWR,
         "precondition: the switch did not move the pane",
     );
@@ -283,7 +283,8 @@ fn the_clear_reaches_every_pane_the_switch_moves() {
     for idx in 0..2 {
         let pane = app.gui.pane(idx).expect("the fixture built two panes");
         assert_eq!(
-            pane.site, TDWR,
+            pane.site(),
+            TDWR,
             "pane {idx} was not moved by the linked group's switch",
         );
         assert!(
@@ -638,7 +639,7 @@ fn one_grid_bytes() -> usize {
 /// stops `PrepareVolume` firing again.
 fn volume_pane_on_the_wsr88d(app: &mut crate::app::App, pane_idx: usize, t: &VolumeTarget) {
     let pane = app.gui.pane_mut(pane_idx).expect("the pane exists");
-    pane.site = WSR88D.to_owned();
+    pane.set_site(WSR88D.to_owned());
     pane.set_view(rustdar_radar::types::RenderView::Volume);
     pane.volume_mut()
         .expect("a 3D pane has volume state")

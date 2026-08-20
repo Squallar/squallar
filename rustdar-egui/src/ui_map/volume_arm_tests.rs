@@ -291,7 +291,7 @@ fn the_alpha_curve_rides_the_frame_only_when_one_is_stored() {
     let mut alphas = [0u8; CURVE_LEN];
     alphas[128..].fill(255);
     let curve = AlphaCurve::from_alphas(alphas);
-    let product = h.gui_mut().pane(1).expect("pane 1").selected_product;
+    let product = h.gui_mut().pane(1).expect("pane 1").selected_product();
     h.gui_mut().volume_alpha.set(product, curve.clone());
     h.frames_for(1, FRAME_DT);
     assert_eq!(
@@ -351,7 +351,7 @@ fn a_product_with_no_vertical_structure_is_refused_by_name() {
     // rest, so writing it to pane 1 alone is undone on the next frame by
     // pane 0.
     for pane in h.gui_mut().panes_mut() {
-        pane.selected_product = rustdar_radar::types::RadarProduct::EchoTops;
+        pane.set_selected_product(rustdar_radar::types::RadarProduct::EchoTops);
     }
     let before = painter.seen.lock().unwrap().len();
     h.frames_for(2, FRAME_DT);
@@ -388,7 +388,7 @@ fn a_derived_product_is_asked_for_rather_than_refused_by_name() {
         // Every pane: the linked sync pass propagates the active pane's
         // product.
         for pane in h.gui_mut().panes_mut() {
-            pane.selected_product = product;
+            pane.set_selected_product(product);
         }
         h.frames_for(2, FRAME_DT);
 
@@ -1974,7 +1974,7 @@ fn the_colour_scale_does_not_print_through_the_volume_alpha_button() {
         // `propagate_layer_sync` copies the *active* pane's product to the
         // rest, so writing it to pane 0 alone is undone on the next frame.
         for pane in h.gui_mut().panes_mut() {
-            pane.selected_product = product;
+            pane.set_selected_product(product);
         }
         h.gui_mut().preferences = prefs.clone();
         h.frames_for(2, FRAME_DT);

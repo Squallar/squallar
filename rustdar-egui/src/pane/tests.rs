@@ -1047,7 +1047,7 @@ fn pane_showing_render(
 
     let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
     let mut pane = PaneState::new();
-    pane.selected_product = product;
+    pane.set_selected_product(product);
     pane.overlay_cache_mut(&known::RADAR)
         .show(OverlayTextureData {
             texture: ctx.load_texture("fold", image, egui::TextureOptions::NEAREST),
@@ -1128,7 +1128,7 @@ fn only_a_plan_view_of_base_velocity_carries_a_fold_limit() {
         RadarProduct::SpectrumWidth,
         RadarProduct::Reflectivity,
     ] {
-        pane.selected_product = product;
+        pane.set_selected_product(product);
         assert_eq!(
             pane.displayed_nyquist_ms(),
             None,
@@ -1136,7 +1136,7 @@ fn only_a_plan_view_of_base_velocity_carries_a_fold_limit() {
         );
     }
 
-    pane.selected_product = RadarProduct::Velocity;
+    pane.set_selected_product(RadarProduct::Velocity);
     pane.set_map_render(MapRender::Volume);
     assert_eq!(
         pane.displayed_nyquist_ms(),
@@ -1179,7 +1179,7 @@ fn a_classification_pane_reports_the_layer_its_pixels_stood_on() {
         RadarProduct::Velocity,
         RadarProduct::CorrelationCoefficient,
     ] {
-        other.selected_product = product;
+        other.set_selected_product(product);
         assert_eq!(
             other.displayed_melting_layer_source(),
             None,
@@ -1249,7 +1249,7 @@ fn a_storm_relative_pane_reports_the_vector_its_pixels_were_shifted_by() {
         RadarProduct::Velocity,
         RadarProduct::HydrometeorClassification,
     ] {
-        other.selected_product = product;
+        other.set_selected_product(product);
         assert_eq!(
             other.displayed_storm_motion(),
             None,

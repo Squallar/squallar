@@ -39,7 +39,7 @@ fn info(minute: u32, products: &[(RadarProduct, &[f32])]) -> ScanInfo {
 fn gui_with(existing: ScanInfo) -> Gui {
     let mut gui = Gui::new();
     let pane = gui.pane_mut(0).expect("a fresh Gui has one pane");
-    pane.site = "KTLX".to_string();
+    pane.set_site("KTLX".to_string());
     pane.scan_info = Some(existing);
     gui
 }
@@ -177,7 +177,7 @@ fn a_chunk_volume_no_pane_is_watching_does_not_claim_the_initial_zoom() {
 #[test]
 fn a_chunk_update_only_reaches_its_own_site() {
     let mut gui = gui_with(info(0, &[(RadarProduct::Reflectivity, &[0.5])]));
-    gui.pane_mut(0).unwrap().site = "KOUN".to_string();
+    gui.pane_mut(0).unwrap().set_site("KOUN".to_string());
     gui.apply(crate::shell_api::GuiEvent::ChunkScanInfo {
         site: "KTLX".to_owned(),
         info: info(5, &[(RadarProduct::Reflectivity, &[0.5])]),
@@ -195,7 +195,7 @@ fn live_sites_are_distinct_and_exclude_historic_panes() {
     gui.set_pane_count_for_test(3);
     for (idx, site) in ["KTLX", "KTLX", "KOUN"].iter().enumerate() {
         let pane = gui.pane_mut(idx).unwrap();
-        pane.site = (*site).to_string();
+        pane.set_site((*site).to_string());
         pane.viewing_live = true;
     }
     assert_eq!(gui.live_sites(), vec!["KTLX", "KOUN"]);

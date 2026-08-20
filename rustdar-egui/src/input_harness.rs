@@ -1324,7 +1324,7 @@ impl InputHarness {
         };
         // The host matches panes by site, so point them at it first.
         for pane in self.gui.panes_mut() {
-            pane.site = site.to_owned();
+            pane.set_site(site.to_owned());
         }
         let collected = info.timestamp;
         self.gui.apply(crate::shell_api::GuiEvent::ScanInfoForSite {
@@ -1414,9 +1414,9 @@ impl InputHarness {
             .gui
             .pane_mut(idx)
             .unwrap_or_else(|| panic!("no pane {idx}"));
-        if pane.selected_product != product {
-            pane.selected_product = product;
-            pane.selected_elevation = 0.0;
+        if pane.selected_product() != product {
+            pane.set_selected_product(product);
+            pane.set_selected_elevation(0.0);
         }
         self.warm_up();
     }

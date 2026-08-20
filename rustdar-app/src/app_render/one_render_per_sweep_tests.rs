@@ -160,9 +160,9 @@ fn point_at(
     product_elevations.insert(product, vec![TILT, OTHER_TILT]);
     {
         let pane = app.gui.pane_mut(idx).expect("pane exists");
-        pane.site = site.to_string();
-        pane.selected_product = product;
-        pane.selected_elevation = elevation;
+        pane.set_site(site.to_string());
+        pane.set_selected_product(product);
+        pane.set_selected_elevation(elevation);
     }
     app.gui
         .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForPane {

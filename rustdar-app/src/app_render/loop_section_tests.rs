@@ -61,9 +61,9 @@ fn app_with_section_loop(minutes: &[u32]) -> crate::app::App {
     app.render.ensure_pane_count(1);
     app.loop_mgr = LoopDownloadManager::new();
     let pane = app.gui.pane_mut(0).expect("pane 0 exists");
-    pane.site = SITE.to_string();
-    pane.selected_product = PRODUCT;
-    pane.selected_elevation = TILT;
+    pane.set_site(SITE.to_string());
+    pane.set_selected_product(PRODUCT);
+    pane.set_selected_elevation(TILT);
     pane.set_kind(PaneKind::CrossSection);
     pane.cross_section_mut().expect("a section pane").line = Some(line());
 

@@ -148,9 +148,9 @@ fn aim(app: &mut crate::app::App, product: RadarProduct, elevation: f32) {
     product_elevations.insert(product, vec![TILT, MID_TILT, TOP_TILT]);
     {
         let pane = app.gui.pane_mut(0).expect("pane exists");
-        pane.site = SITE.to_string();
-        pane.selected_product = product;
-        pane.selected_elevation = elevation;
+        pane.set_site(SITE.to_string());
+        pane.set_selected_product(product);
+        pane.set_selected_elevation(elevation);
     }
     app.gui
         .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForPane {
