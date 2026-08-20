@@ -126,7 +126,7 @@ fn a_plan_view_result_finds_no_frame_in_a_section_loop_with_the_same_target() {
             .rendered_for
             .as_ref()
             .expect("the loop was retargeted")
-            .matches(&target),
+            .matches(&target, RenderView::CrossSection),
         "precondition: the two loops agree on the whole RenderTarget, so the \
          refusal below can only come from the view"
     );
