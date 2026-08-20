@@ -1685,3 +1685,51 @@ fn eviction_keeps_the_pane_on_the_moment_it_was_parked_at() {
     assert_eq!(pane.time_state(&known::RADAR).current_frame(), 0);
     assert_eq!(pane.time_state(&known::RADAR).playhead_stamp(), Some(ts(3)));
 }
+
+/// **WO-E7d: the loop caption describes the layer the clock walks.** The
+/// caption's four inputs are read off `clock_layer`'s timeline, so a pane
+/// animating something other than radar describes *that* rather than
+/// describing radar's empty timeline. On every pane in this build the answer
+/// is radar, which is why nothing the caption says today moves.
+#[test]
+fn the_caption_reads_the_timeline_of_the_layer_the_clock_walks() {
+    let mut pane = PaneState::new();
+
+    // Only the model animates: it is the clock layer, so its frames are what
+    // a caption would describe.
+    let mut model = timeline_at_minutes(3);
+    model.cadence_secs = Some(3600);
+    model.sampled = Some(false);
+    *pane.time_state_mut(&known::MODEL_DATA) = model;
+    let id = pane.clock_layer().cloned().expect("the model animates");
+    assert_eq!(id, known::MODEL_DATA);
+    assert_eq!(
+        pane.time_state(&id).cadence_secs,
+        Some(3600),
+        "the caption's cadence comes from the clock layer, not from radar's \
+         empty timeline",
+    );
+    assert_eq!(pane.time_state(&id).frames.len(), 3);
+
+    // Radar joins and takes the clock back, being drawn above the model.
+    let mut radar = timeline_at_minutes(9);
+    radar.cadence_secs = Some(259);
+    radar.sampled = Some(true);
+    *pane.time_state_mut(&known::RADAR) = radar;
+    let id = pane.clock_layer().cloned().expect("radar animates");
+    assert_eq!(id, known::RADAR, "radar is drawn above the model");
+    assert_eq!(
+        (
+            pane.time_state(&id).frames.len(),
+            pane.time_state(&id).cadence_secs,
+            pane.time_state(&id).sampled,
+        ),
+        (9, Some(259), Some(true)),
+        "and all four of the caption's inputs move with it",
+    );
+
+    // A pane animating nothing has no clock layer, so there is no caption —
+    // rather than a caption describing an empty radar timeline.
+    let bare = PaneState::new();
+    assert_eq!(bare.clock_layer(), None);
+}

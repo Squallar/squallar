@@ -1652,7 +1652,13 @@ fn append_polled_frame_to_loops(
     budgets: &rustdar_device_profile::budget::Budgets,
 ) {
     for (pane_idx, pane) in panes.iter_mut().enumerate() {
-        let held = super::render::loop_frames_held(allocation, pane.loop_state(), budgets);
+        // The pane's whole-loop cap, divided across the layers it is
+        // animating — the budget is a texture-memory allowance and a pane
+        // animating two things spends it twice.
+        let held = super::render::layer_share(
+            super::render::loop_frames_held(allocation, pane.loop_state(), budgets),
+            pane.animating_layers().count(),
+        );
         if append_polled_frame(pane.loop_state_mut(), site, timestamp, held) {
             // The frame list moved under the playhead — evicted at the front,
             // possibly re-sampled — so the pane's clock names a different
@@ -1769,6 +1775,10 @@ mod local_time_tests;
 #[path = "app_fetch/as_of_dispatch_tests.rs"]
 #[cfg(test)]
 mod as_of_dispatch_tests;
+
+#[path = "app_fetch/layer_budget_wiring_tests.rs"]
+#[cfg(test)]
+mod layer_budget_wiring_tests;
 
 #[path = "app_fetch/loop_frame_image_tests.rs"]
 #[cfg(test)]

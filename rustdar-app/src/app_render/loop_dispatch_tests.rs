@@ -283,7 +283,8 @@ fn a_listing_for_the_site_the_loop_left_is_refused() {
             &test_budgets(),
             &mut koun,
             "KTLX",
-            stale
+            stale,
+            1,
         )
         .is_none(),
         "a KTLX listing is not this KOUN loop's frame list"
@@ -297,6 +298,7 @@ fn a_listing_for_the_site_the_loop_left_is_refused() {
         &mut koun,
         "KOUN",
         live,
+        1,
     )
     .expect("its own listing");
     assert_eq!(
@@ -320,7 +322,8 @@ fn a_listing_for_an_inactive_loop_is_refused() {
             &test_budgets(),
             &mut ls,
             "KTLX",
-            scans
+            scans,
+            1,
         )
         .is_none()
     );
@@ -338,7 +341,8 @@ fn an_empty_listing_switches_the_loop_off() {
             &test_budgets(),
             &mut ls,
             "KTLX",
-            Vec::new()
+            Vec::new(),
+            1,
         )
         .is_none(),
         "there is nothing to download"
@@ -437,6 +441,7 @@ fn the_frame_list_and_the_frame_plan_describe_the_same_scans() {
         &mut ls,
         "KTLX",
         scans,
+        1,
     )
     .expect("accepted");
 
@@ -473,6 +478,7 @@ fn a_long_listing_is_sampled_evenly_across_its_whole_span() {
         &mut ls,
         "KTLX",
         scans,
+        1,
     )
     .expect("accepted");
 
@@ -522,6 +528,7 @@ fn a_listing_one_scan_over_the_cap_is_recorded_as_sampled() {
             &mut ls,
             "KTLX",
             scans,
+            1,
         )
         .expect("accepted");
 
@@ -879,6 +886,7 @@ fn a_listing_teaches_the_cadence_before_the_frame_count_is_spent() {
         &mut ls,
         "KTLX",
         scans,
+        1,
     )
     .expect("accepted");
 
