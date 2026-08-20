@@ -24,7 +24,7 @@ impl JobSink for Recorder {
 }
 
 /// Install a recorder, and the guard that retires it however the test ends.
-fn recorder() -> (
+pub(super) fn recorder() -> (
     Arc<Mutex<Vec<Vec<u8>>>>,
     rustdar_worker::offload::InstalledTestWorker,
 ) {
@@ -45,7 +45,7 @@ fn posted(recorded: &Mutex<Vec<Vec<u8>>>) -> Vec<JobRequest> {
 }
 
 /// The `(product, elevation)` of each posted plan-view job, in post order.
-fn asked_for(recorded: &Mutex<Vec<Vec<u8>>>) -> Vec<(RadarProduct, f32)> {
+pub(super) fn asked_for(recorded: &Mutex<Vec<Vec<u8>>>) -> Vec<(RadarProduct, f32)> {
     posted(recorded)
         .iter()
         .map(|job| {
@@ -67,7 +67,7 @@ fn volume_time() -> chrono::NaiveDateTime {
 
 /// A two-cut volume carrying reflectivity and velocity, so an extraction reaches a sweep at
 /// either tilt and a real `JobRequest::Radar` is built.
-fn sample_scan() -> Arc<nexrad_model::data::Scan> {
+pub(super) fn sample_scan() -> Arc<nexrad_model::data::Scan> {
     use nexrad_model::data::{
         ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan,
         Sweep, VolumeCoveragePattern, WaveformType,

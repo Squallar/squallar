@@ -219,6 +219,20 @@ pub struct ScanInfo {
     pub status: String,
 }
 
+/// Where a volume's radar sits once what it states about itself — or nothing —
+/// is applied to the table row that names it.
+///
+/// One definition, because [`ScanInfo::from_scan`] and
+/// [`ScanInfo::place_against_the_table`] have to agree: the second exists to
+/// redo the first's decision against a table that has since learned the
+/// radar, and two copies of this would let them drift.
+fn placed_on(position: Option<&SitePosition>, row: &'static RadarSite) -> RadarSite {
+    match position {
+        Some(position) => position.applied_to(Some(row)),
+        None => row.clone(),
+    }
+}
+
 /// Whether the fetched catalogue agrees that `site` is where `stated` puts it,
 /// or has nothing to say about `site` at all.
 ///
@@ -245,6 +259,32 @@ fn confirmed_by_catalogue(site: &str, stated: &SitePosition) -> bool {
 }
 
 impl ScanInfo {
+    /// Re-place this volume's radar against the site table as it stands now,
+    /// answering whether that moved anything.
+    ///
+    /// A `ScanInfo` names its radar out of the table it was built against, so
+    /// one built before that radar was in the table carries
+    /// [`sites::UNKNOWN_SITE_NAME`](crate::sites::UNKNOWN_SITE_NAME) — the
+    /// first volume of an install whose site catalogue is not cached yet, and
+    /// which nothing has decoded a volume for. Every consumer that looks the
+    /// volume up by that name then misses, which on the frontend means the
+    /// volume is fetched and decoded and never rasterised.
+    ///
+    /// Call it wherever the table learns a radar mid-session: the position a
+    /// volume states about itself, and the first fetched catalogue. A radar
+    /// the table still cannot place is left exactly as it was — a row at
+    /// (0, 0) would be worse than no picture.
+    pub fn place_against_the_table(&mut self, site: &str) -> bool {
+        if self.site.name != crate::sites::UNKNOWN_SITE_NAME {
+            return false;
+        }
+        let Some(row) = crate::sites::get_radar_site(site) else {
+            return false;
+        };
+        self.site = placed_on(self.site_position.as_ref(), row);
+        true
+    }
+
     /// Level III products are listed with empty elevation vectors, filled in
     /// later as L3 data arrives.
     /// 1. **The volume in hand.** Every Message 31 volume states its own
@@ -288,10 +328,10 @@ impl ScanInfo {
         // `sites` leaked it.
         let known_name = crate::sites::static_name(site);
         let radar_site = match (site_position, row) {
-            (Some(position), Some(row)) => position.applied_to(Some(row)),
+            (Some(position), Some(row)) => placed_on(Some(&position), row),
             (Some(position), None) => position
                 .applied_to_named(known_name.unwrap_or(crate::sites::UNKNOWN_SITE_NAME), None),
-            (None, Some(row)) => row.clone(),
+            (None, Some(row)) => placed_on(None, row),
             (None, None) => {
                 log::error!(
                     "no position for radar site '{site}': it is in no table row, \

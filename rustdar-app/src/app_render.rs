@@ -584,6 +584,19 @@ impl super::App {
         // that places radars mid-session has to be handed over again or the
         // map keeps drawing the list this install booted with.
         self.gui.publish_radar_sites();
+        // ...and the volumes already on screen were named against the table
+        // this call just replaced. One decoded before its radar was in it
+        // carries UNKNOWN, and `dispatch_pane_renders` looks the volume up
+        // under that name in a `scan_data` keyed by the site -- so the render
+        // was skipped, silently, and nothing else revisits it. This arrival is
+        // what un-skips it, which is a re-trigger and not a retry.
+        let replaced = self.gui.place_shown_volumes_against_the_table();
+        if replaced > 0 {
+            log::info!(
+                "the catalogue placed {replaced} radar(s) whose volume was \
+                 already in hand; those panes can be drawn after all",
+            );
+        }
     }
 
     /// Open on the radar nearest this device's timezone.
