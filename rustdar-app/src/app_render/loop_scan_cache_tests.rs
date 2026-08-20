@@ -74,7 +74,7 @@ fn install_listing(app: &mut crate::app::App, minutes: &[u32]) {
         })
         .collect();
     let pane = app.gui.pane_mut(0).expect("a fresh Gui has one pane");
-    accept_scan_listing(allocation, &budgets, pane.loop_state_mut(), SITE, scans)
+    accept_scan_listing(allocation, &budgets, pane.loop_state_mut(), SITE, scans, 1)
         .expect("a non-empty listing for this loop's own site is accepted");
     assert_eq!(
         pane.loop_state().frames.len(),

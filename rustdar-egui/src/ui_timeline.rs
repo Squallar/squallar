@@ -959,17 +959,26 @@ impl super::Gui {
             }
         }
 
-        let span = if loop_active {
-            let ls = self.panes[pane_idx].loop_state();
-            loop_span_phrase(
-                &ls.frames,
-                ls.sampled,
-                ls.cadence_secs,
-                ls.is_render_ready(),
-            )
-        } else {
-            None
-        };
+        // **The caption describes the layer the pane's clock walks** — its
+        // time-primary layer — rather than radar by name. On every pane in
+        // this build that IS radar (weight 30, above the model's 10), so the
+        // four inputs are the four it always read; what changes is that a
+        // pane animating something else describes that instead of describing
+        // an empty radar timeline. `markedly_longer` and the `NOTICEABLE_*`
+        // rules below it are untouched: that decision was tuned against KPBZ
+        // and travels whole.
+        let span = self.panes[pane_idx]
+            .clock_layer()
+            .cloned()
+            .map(|id| self.panes[pane_idx].time_state(&id))
+            .and_then(|ls| {
+                loop_span_phrase(
+                    &ls.frames,
+                    ls.sampled,
+                    ls.cadence_secs,
+                    ls.is_render_ready(),
+                )
+            });
         let budget = format!(
             "Loops keep up to {} frames on this platform - a pane with \
              \"Sync time\" off sits out the loop and shared navigation",

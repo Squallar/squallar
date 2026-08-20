@@ -374,6 +374,7 @@ fn the_scan_listing_is_sampled_to_the_resident_frame_count() {
         &mut ls,
         SITE,
         listing.clone(),
+        1,
     );
     assert_eq!(
         ls.frames.len(),
@@ -392,6 +393,7 @@ fn the_scan_listing_is_sampled_to_the_resident_frame_count() {
         &mut plan,
         SITE,
         listing,
+        1,
     );
     assert_eq!(plan.frames.len(), MAX_LOOP_FRAMES);
 }
@@ -653,6 +655,7 @@ fn a_slow_site_shortens_a_3d_loops_list_without_shortening_its_span() {
         &mut ls,
         SITE,
         listing.clone(),
+        1,
     );
 
     assert_eq!(
@@ -683,6 +686,13 @@ fn a_slow_site_shortens_a_3d_loops_list_without_shortening_its_span() {
     // the span budget never paid for.
     let mut plan = rustdar_egui::radar_layer::begin_loop(10 * 3600, &site(), RenderView::PlanView);
     plan.phase = LoopPhase::Rendering;
-    accept_scan_listing(test_loop_allocation(), &budgets, &mut plan, SITE, listing);
+    accept_scan_listing(
+        test_loop_allocation(),
+        &budgets,
+        &mut plan,
+        SITE,
+        listing,
+        1,
+    );
     assert_eq!(plan.frames.len(), MAX_LOOP_FRAMES.min(40));
 }

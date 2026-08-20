@@ -1613,12 +1613,17 @@ impl super::App {
             // list, is decided in one place — including refusing a listing for a
             // site the pane's loop has since moved off.
             let product = pane.selected_product();
+            // The whole-pane cap divides across the layers this pane is
+            // animating, and it is counted HERE — where the budget is
+            // consumed — not pushed down with it.
+            let animating = pane.animating_layers().count();
             let Some(plan) = accept_scan_listing(
                 allocation,
                 &budgets,
                 pane.loop_state_mut(),
                 &resp.site,
                 resp.scans,
+                animating,
             ) else {
                 continue;
             };
@@ -2757,6 +2762,7 @@ fn accept_scan_listing(
     ls: &mut rustdar_egui::pane::LayerTimeState,
     site: &str,
     scans: Vec<(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)>,
+    animating: usize,
 ) -> Option<FramePlan> {
     if !ls.is_active() || radar_layer::site(ls) != site {
         return None;
@@ -2781,7 +2787,7 @@ fn accept_scan_listing(
     // Cap the downloads by evenly sampling the listing. A 3D loop's cap is its
     // *resident* one and is far lower, because for that kind the frame list and
     // the resident set are one thing — see `loop_frames_held`.
-    let held = loop_frames_held(allocation, ls, budgets);
+    let held = layer_share(loop_frames_held(allocation, ls, budgets), animating);
     let total = scans.len();
     let sample = rustdar_egui::pane::listing_sample_indices(total, held);
     ls.sampled = Some(sample.is_some());
@@ -3152,7 +3158,8 @@ fn loop_render_budget(
         .min(budgets.frames_for_span(ls.cadence_secs))
 }
 
-/// Frames a loop of this view **holds**.
+/// Frames a loop of this view **holds**, before the pane's own layers divide
+/// it — see [`layer_share`].
 pub(super) fn loop_frames_held(
     allocation: LoopAllocation,
     ls: &rustdar_egui::pane::LayerTimeState,
@@ -3163,6 +3170,41 @@ pub(super) fn loop_frames_held(
         rustdar_radar::types::RenderView::PlanView
         | rustdar_radar::types::RenderView::CrossSection => budgets.loop_frames_held,
     }
+}
+
+/// **One animating layer's share of the pane's frame budget.**
+///
+/// The cap is a whole-pane number — it is a texture-memory allowance, and a
+/// pane animating radar and a model field at once spends it twice. So it
+/// divides, with a **floor of two frames per layer**: one frame is a still
+/// picture, and a layer that cannot hold two cannot animate at all, so the
+/// floor is where the budget stops being divisible rather than a cushion.
+///
+/// **A pane animating one layer gets the budget untouched.** Not
+/// `budget / 1` clamped — the one-layer case returns before the floor is
+/// applied, so a view whose own allowance is legitimately below two (a 3D
+/// loop on a small pool) is not silently raised to two by a division that did
+/// not happen. That is what makes this a no-op on every pane in the build
+/// today, and it is pinned as one.
+pub(super) fn layer_share(budget: usize, animating: usize) -> usize {
+    if animating <= 1 {
+        return budget;
+    }
+    (budget / animating).max(2)
+}
+
+/// [`accept_scan_listing`] under a name the sibling test modules can reach —
+/// the function itself is private to this module and stays that way.
+#[cfg(test)]
+pub(crate) fn accept_scan_listing_for_test(
+    allocation: LoopAllocation,
+    budgets: &rustdar_device_profile::budget::Budgets,
+    ls: &mut rustdar_egui::pane::LayerTimeState,
+    site: &str,
+    scans: Vec<(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)>,
+    animating: usize,
+) -> Option<FramePlan> {
+    accept_scan_listing(allocation, budgets, ls, site, scans, animating)
 }
 
 /// A 3D loop frame the dispatcher intends to make resident.
@@ -3370,6 +3412,10 @@ mod hidden_pane_volume_tests;
 #[path = "app_render/loop_interval_tests.rs"]
 #[cfg(test)]
 mod loop_interval_tests;
+
+#[path = "app_render/layer_share_tests.rs"]
+#[cfg(test)]
+mod layer_share_tests;
 
 /// The Level III half of the loop: pairing a bucket object to each frame's volume,
 /// what a gap does, and what happens when a pane retargets across the datasource
