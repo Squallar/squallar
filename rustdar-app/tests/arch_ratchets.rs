@@ -108,7 +108,11 @@ const UI_SETTER_MAX: usize = 3;
 /// gave back three — lowered in the land that earned it, never raised.
 const PRODUCT_IN_EGUI_MAX: usize = 439;
 /// Row 6.
-const HUB_RECEIVER_MAX: usize = 18;
+///
+/// **17 since WO-M12b**: the loop scan-list channel is gone — a radar frame
+/// listing arrives on the one source path now — so the hub holds one pair
+/// fewer. Lowered in the land that earned it, never raised.
+const HUB_RECEIVER_MAX: usize = 17;
 
 // --------------------------------------------------------------------------- Walker +
 // counters (std-only, pure file reads).

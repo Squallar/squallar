@@ -353,13 +353,10 @@ fn the_scan_listing_is_sampled_to_the_resident_frame_count() {
     ls.phase = LoopPhase::Rendering;
     let listing: Vec<_> = (0..MAX_LOOP_FRAMES + 20)
         .map(|i| {
-            (
-                // Minutes apart, which past an hour has to roll into the hour rather than
-                // saturate — `ts` above takes a minute-of-hour and this listing is longer
-                // than one.
-                ts(0) + chrono::Duration::minutes(i64::try_from(i).expect("a small index")),
-                rustdar_radar::archive::Identifier::new(format!("v{i}")),
-            )
+            // Minutes apart, which past an hour has to roll into the hour rather than
+            // saturate — `ts` above takes a minute-of-hour and this listing is longer
+            // than one.
+            ts(0) + chrono::Duration::minutes(i64::try_from(i).expect("a small index"))
         })
         .collect();
     assert!(
@@ -631,15 +628,10 @@ fn a_slow_site_shortens_a_3d_loops_list_without_shortening_its_span() {
     let mut ls = rustdar_egui::radar_layer::begin_loop(10 * 3600, &site(), RenderView::Volume);
     ls.phase = LoopPhase::Rendering;
     let listing: Vec<_> = (0..40)
-        .map(|i| {
-            (
-                ts(0) + chrono::Duration::minutes(i * step_mins),
-                rustdar_radar::archive::Identifier::new(format!("v{i}")),
-            )
-        })
+        .map(|i| ts(0) + chrono::Duration::minutes(i * step_mins))
         .collect();
-    let oldest = listing.first().expect("a listing").0;
-    let newest = listing.last().expect("a listing").0;
+    let oldest = *listing.first().expect("a listing");
+    let newest = *listing.last().expect("a listing");
 
     let wanted = budgets.frames_for_span(Some((step_mins * 60) as u32));
     assert!(

@@ -4,7 +4,6 @@ use rustdar_egui::pane::RenderTarget;
 use rustdar_geo::GeoBounds;
 use rustdar_overlays::render::overlay_state::SourceEvent;
 use rustdar_overlays::render::rasterize::HitMap;
-use rustdar_radar::archive::Identifier;
 use rustdar_radar::level3::Level3Product;
 use rustdar_radar::types::RadarProduct;
 use rustdar_source::id::LayerId;
@@ -133,17 +132,7 @@ pub struct OverlayRenderResponse {
     pub hit_map: Option<HitMap>,
 }
 
-pub struct LoopScanListResponse {
-    pub pane_idx: usize,
-    /// NEXRAD site the listing was requested for. A listing is an uncancellable
-    /// round-trip and a pane's loop can be rebuilt for another site while it is in
-    /// the air, so without this the receiver would take one site's list as another's.
-    pub site: String,
-    pub scans: Vec<(NaiveDateTime, Identifier)>,
-}
-
 pub struct LoopScanDownloadResponse {
-    pub pane_idx: usize,
     /// NEXRAD site this scan was downloaded from. Half of the cache key, and the
     /// site of the listing the identifier came from, not the pane's current site.
     pub site: String,
@@ -334,8 +323,6 @@ pub struct ChannelHub {
     pub overlay_fetch_receiver: Receiver<SourceEvent>,
     pub overlay_render_sender: Sender<OverlayRenderResponse>,
     pub overlay_render_receiver: Receiver<OverlayRenderResponse>,
-    pub loop_scan_list_sender: Sender<LoopScanListResponse>,
-    pub loop_scan_list_receiver: Receiver<LoopScanListResponse>,
     pub loop_scan_download_sender: Sender<LoopScanDownloadResponse>,
     pub loop_scan_download_receiver: Receiver<LoopScanDownloadResponse>,
     pub loop_l3_list_sender: Sender<LoopL3ListResponse>,
@@ -373,7 +360,6 @@ impl ChannelHub {
         let (level3_sender, level3_receiver) = std::sync::mpsc::channel();
         let (overlay_fetch_sender, overlay_fetch_receiver) = std::sync::mpsc::channel();
         let (overlay_render_sender, overlay_render_receiver) = std::sync::mpsc::channel();
-        let (loop_scan_list_sender, loop_scan_list_receiver) = std::sync::mpsc::channel();
         let (loop_scan_download_sender, loop_scan_download_receiver) = std::sync::mpsc::channel();
         let (loop_l3_list_sender, loop_l3_list_receiver) = std::sync::mpsc::channel();
         let (loop_l3_fetch_sender, loop_l3_fetch_receiver) = std::sync::mpsc::channel();
@@ -400,8 +386,6 @@ impl ChannelHub {
             overlay_fetch_receiver,
             overlay_render_sender,
             overlay_render_receiver,
-            loop_scan_list_sender,
-            loop_scan_list_receiver,
             loop_scan_download_sender,
             loop_scan_download_receiver,
             loop_l3_list_sender,

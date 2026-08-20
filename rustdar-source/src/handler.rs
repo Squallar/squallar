@@ -759,6 +759,11 @@ pub trait SourceHandler: Send {
     /// **The async supply for [`Self::list_frames`]** — the listing fetch that
     /// teaches this handler what frames exist. Lands as
     /// [`SourceEvent::Frames`]; `None` from a layer with no listing to fetch.
+    ///
+    /// Build the task through [`FrameListingResult::task`]: the scope this
+    /// listing will be filed under is **captured here, at dispatch**, and
+    /// travels with the round trip rather than being read back off a pane
+    /// that may have moved by the time it lands.
     fn create_frame_list_task(
         &self,
         ctx: &FetchConfig,
@@ -811,14 +816,23 @@ pub trait SourceHandler: Send {
         std::time::Duration::from_secs(60)
     }
 
-    /// Take delivery of a frame listing this handler asked for. Dark until
-    /// WO-E7/WO-M12 give [`Self::create_frame_list_task`] a producer.
-    fn apply_frame_listing(&mut self, listing: FrameListing, pane: &PaneRef<'_>) {
-        let _ = (listing, pane);
+    /// **Take delivery of a frame listing this handler asked for**, with the
+    /// `scope` its own [`Self::create_frame_list_task`] captured at dispatch.
+    ///
+    /// The scope is this handler's own type and nothing above reads it. It is
+    /// how the listing is *filed*: `listing` names no site, so a handler two
+    /// panes on two sites both ask of would otherwise pool two sites' stamps
+    /// into one list.
+    fn apply_frame_listing(
+        &mut self,
+        listing: FrameListing,
+        scope: FetchPayload,
+        pane: &PaneRef<'_>,
+    ) {
+        let _ = (listing, scope, pane);
     }
 
-    /// Take delivery of one frame's data. Dark until WO-E7/WO-M12 give
-    /// [`Self::fetch_frame`] a producer.
+    /// Take delivery of one frame's data.
     fn apply_frame(&mut self, stamp: FrameStamp, data: FetchPayload, pane: &PaneRef<'_>) {
         let _ = (stamp, data, pane);
     }
@@ -874,6 +888,58 @@ pub struct FetchTask {
     pub future: TaskFuture,
 }
 
+/// **What a frame-list task's future yields** — the two halves of
+/// [`SourceEvent::Frames`], so the driver that spawns the task never has to
+/// invent either one.
+///
+/// [`SourceHandler::create_frame_list_task`] returns an ordinary
+/// [`FetchTask`], so build it through [`Self::task`] and read it back through
+/// [`Self::event`]; a payload that did not come through `task` is a
+/// programming error at the handler, and `event` says so by answering `None`
+/// rather than fabricating an empty listing.
+pub struct FrameListingResult {
+    /// The generic half: what frames exist over the window that was asked
+    /// about. Names no site.
+    pub listing: FrameListing,
+    /// The source's own half, captured at dispatch and handed straight back
+    /// to [`SourceHandler::apply_frame_listing`].
+    pub scope: FetchPayload,
+}
+
+impl FrameListingResult {
+    /// Wrap a frame-list future as the [`FetchTask`] the contract carries.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn task(kind: LayerId, future: impl Future<Output = Self> + Send + 'static) -> FetchTask {
+        FetchTask {
+            kind,
+            future: Box::pin(async move { Box::new(future.await) as FetchPayload }),
+        }
+    }
+
+    /// Wrap a frame-list future as the [`FetchTask`] the contract carries.
+    ///
+    /// The web arm takes no `Send`: reqwest's futures are `!Send` there, and
+    /// the cfg'd [`TaskFuture`] alias is what already carries that difference.
+    #[cfg(target_arch = "wasm32")]
+    pub fn task(kind: LayerId, future: impl Future<Output = Self> + 'static) -> FetchTask {
+        FetchTask {
+            kind,
+            future: Box::pin(async move { Box::new(future.await) as FetchPayload }),
+        }
+    }
+
+    /// The arrival `data` names, or `None` when it is not a frame-list
+    /// payload at all.
+    pub fn event(kind: LayerId, data: FetchPayload) -> Option<SourceEvent> {
+        let result = data.downcast::<Self>().ok()?;
+        Some(SourceEvent::Frames {
+            id: kind,
+            listing: result.listing,
+            scope: result.scope,
+        })
+    }
+}
+
 /// One completed fetch round's payload, on its way back to the handler that
 /// asked for it. The arrival names a **layer** and no pane: what a handler
 /// needs of it is a question about every pane at once.
@@ -893,11 +959,24 @@ pub enum SourceEvent {
     /// Today's payload, unchanged — a whole fetch round for a layer.
     Data(OverlayFetchResult),
     /// What frames a layer can show, in answer to
-    /// [`SourceHandler::create_frame_list_task`]. **No producer yet**: dark
-    /// until WO-E7/WO-M12.
-    Frames { id: LayerId, listing: FrameListing },
-    /// One frame's data, in answer to [`SourceHandler::fetch_frame`]. **No
-    /// producer yet**: dark until WO-E7/WO-M12.
+    /// [`SourceHandler::create_frame_list_task`], with the **scope** that
+    /// question was asked in.
+    ///
+    /// `listing` is the generic half every reader understands and it names no
+    /// site, exactly as [`FrameStamp`] does not. `scope` is the source's own,
+    /// opaque here and interpreted only by the handler that built the task:
+    /// it is what makes a listing filable, because a [`FrameStamp`] alone is
+    /// never enough to key a cache a second site also writes to.
+    ///
+    /// **Captured at dispatch**, not read back off the pane on arrival — a
+    /// listing is an uncancellable round trip and the pane that asked can be
+    /// rebuilt for another site while it is in the air.
+    Frames {
+        id: LayerId,
+        listing: FrameListing,
+        scope: FetchPayload,
+    },
+    /// One frame's data, in answer to [`SourceHandler::fetch_frame`].
     FrameReady {
         id: LayerId,
         stamp: FrameStamp,

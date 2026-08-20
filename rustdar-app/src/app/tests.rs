@@ -2987,7 +2987,7 @@ fn android_resolves_the_table_when_the_config_directory_arrives() {
 #[derive(Default, Debug, PartialEq)]
 struct Recorded {
     data: Vec<String>,
-    listings: Vec<rustdar_source::time::FrameListing>,
+    listings: Vec<(rustdar_source::time::FrameListing, String)>,
     frames: Vec<(rustdar_source::time::FrameStamp, String)>,
 }
 
@@ -3048,13 +3048,15 @@ impl rustdar_overlays::render::overlay_state::OverlayHandler for FrameRecorder {
     fn apply_frame_listing(
         &mut self,
         listing: rustdar_source::time::FrameListing,
+        scope: rustdar_overlays::render::overlay_state::FetchPayload,
         _pane: &rustdar_source::handler::PaneRef<'_>,
     ) {
+        let scope = scope.downcast::<String>().map(|t| *t).unwrap_or_default();
         self.seen
             .lock()
             .expect("no poisoned lock")
             .listings
-            .push(listing);
+            .push((listing, scope));
     }
     fn apply_frame(
         &mut self,
@@ -3121,6 +3123,7 @@ fn every_source_event_arm_reaches_the_layer_it_names() {
         SourceEvent::Frames {
             id: mine.clone(),
             listing: listing.clone(),
+            scope: Box::new("listed-for-mine".to_owned()),
         },
         SourceEvent::FrameReady {
             id: mine.clone(),
@@ -3130,6 +3133,7 @@ fn every_source_event_arm_reaches_the_layer_it_names() {
         SourceEvent::Frames {
             id: other,
             listing: listing.clone(),
+            scope: Box::new("listed-for-nobody".to_owned()),
         },
     ] {
         app.channels
@@ -3149,9 +3153,10 @@ fn every_source_event_arm_reaches_the_layer_it_names() {
     );
     assert_eq!(
         recorder.listings,
-        vec![listing],
-        "the Frames arm did not reach apply_frame_listing exactly once — a \
-         listing for a layer nobody owns must be dropped, not delivered here",
+        vec![(listing, "listed-for-mine".to_owned())],
+        "the Frames arm did not reach apply_frame_listing exactly once, carrying \
+         the scope it was dispatched with — a listing for a layer nobody owns \
+         must be dropped, not delivered here",
     );
     assert_eq!(
         recorder.frames,
@@ -3161,5 +3166,303 @@ fn every_source_event_arm_reaches_the_layer_it_names() {
     assert!(
         app.channels.overlay_fetch_receiver.try_recv().is_err(),
         "the drain left an arrival in the channel",
+    );
+}
+
+// ── The frame supply, end to end (WO-M12b) ────────────────────────────────
+
+/// **A radar frame listing that arrives on the source path builds the loop
+/// that was waiting for it — through the production registry, not a stub.**
+///
+/// This is the whole re-point in one pass: the arrival lands in `Ingest` and
+/// is filed by `RadarSource` under the site the SCOPE names; the pane's loop
+/// is built in `Apply` from what `list_frames` answers, which is the layer's
+/// own cache and not the arrival's payload. Nothing between the two holds an
+/// archive identifier.
+#[test]
+fn a_listing_that_arrives_on_the_source_path_builds_the_loop_waiting_for_it() {
+    use rustdar_overlays::render::overlay_state::SourceEvent;
+    use rustdar_source::time::{FrameListing, FrameStamp};
+
+    /// Built here rather than looked up: a process-global site table makes a
+    /// test mean one thing alone and another beside its neighbours.
+    const SITE: rustdar_radar::sites::RadarSite = rustdar_radar::sites::RadarSite {
+        name: "KTLX",
+        lat: 35.33,
+        lon: -97.27,
+        heights: None,
+    };
+    fn at(minute: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            + chrono::Duration::minutes(i64::from(minute))
+    }
+
+    let mut app = n_pane_app(1, "KTLX");
+    let span_secs = 600u64;
+    let range = (at(0) - chrono::Duration::seconds(span_secs as i64), at(0));
+    let pane = app.gui.pane_mut(0).expect("the fixture built one pane");
+    pane.scan_info = Some(scan_info_for("KTLX"));
+    *pane.loop_state_mut() = rustdar_egui::radar_layer::begin_loop(
+        span_secs,
+        &SITE,
+        rustdar_radar::types::RenderView::PlanView,
+    );
+    assert_eq!(
+        pane.loop_state().phase,
+        rustdar_egui::pane::LoopPhase::FetchingScanList,
+        "precondition: the pane must be waiting on a listing, or the arrival \
+         has nothing to answer",
+    );
+    assert!(
+        pane.loop_state().frames.is_empty(),
+        "precondition: the loop has no frames yet",
+    );
+
+    let minutes = [-8i64, -4, 0];
+    let scans: Vec<(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)> = minutes
+        .iter()
+        .map(|&m| {
+            let ts = at(0) + chrono::Duration::minutes(m);
+            (
+                ts,
+                rustdar_radar::archive::Identifier::new(format!("KTLX{m}")),
+            )
+        })
+        .collect();
+    app.channels
+        .overlay_fetch_sender
+        .send(SourceEvent::Frames {
+            id: rustdar_source::id::known::RADAR,
+            listing: FrameListing {
+                range,
+                frames: scans
+                    .iter()
+                    .map(|(valid, _)| FrameStamp {
+                        valid: *valid,
+                        run: None,
+                    })
+                    .collect(),
+                complete: true,
+            },
+            scope: Box::new(rustdar_radar::source::RadarListing {
+                site: "KTLX".to_string(),
+                range,
+                scans: scans.clone(),
+            }),
+        })
+        .expect("the receiver is alive");
+
+    app.poll_overlay_fetch_results();
+    app.accept_loop_scan_listings();
+
+    let loop_state = app
+        .gui
+        .pane(0)
+        .expect("the fixture built one pane")
+        .loop_state();
+    assert_eq!(
+        loop_state
+            .frames
+            .iter()
+            .map(|frame| frame.timestamp)
+            .collect::<Vec<_>>(),
+        scans.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
+        "the listing did not reach the pane's frame list through the contract",
+    );
+    assert_eq!(
+        loop_state.phase,
+        rustdar_egui::pane::LoopPhase::Rendering,
+        "the loop was left waiting on a listing that had already landed",
+    );
+    assert_eq!(
+        app.loop_mgr.plan_frame_count(0),
+        scans.len(),
+        "the frame plan the downloads are derived from was not stored",
+    );
+}
+
+/// **A listing for one site does not build a loop a second pane is running on
+/// another** — the fixed bug, at the seam where the arrival names no pane.
+#[test]
+fn a_listing_for_one_site_leaves_another_sites_pane_waiting() {
+    use rustdar_overlays::render::overlay_state::SourceEvent;
+    use rustdar_source::time::{FrameListing, FrameStamp};
+
+    const KOUN: rustdar_radar::sites::RadarSite = rustdar_radar::sites::RadarSite {
+        name: "KOUN",
+        lat: 35.23,
+        lon: -97.46,
+        heights: None,
+    };
+    fn at(minute: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            + chrono::Duration::minutes(i64::from(minute))
+    }
+
+    let mut app = n_pane_app(1, "KOUN");
+    let span_secs = 600u64;
+    let range = (at(0) - chrono::Duration::seconds(span_secs as i64), at(0));
+    let pane = app.gui.pane_mut(0).expect("the fixture built one pane");
+    pane.scan_info = Some(scan_info_for("KOUN"));
+    *pane.loop_state_mut() = rustdar_egui::radar_layer::begin_loop(
+        span_secs,
+        &KOUN,
+        rustdar_radar::types::RenderView::PlanView,
+    );
+
+    // KTLX's listing, arriving while the only pane is on KOUN.
+    let scans = vec![(
+        at(0),
+        rustdar_radar::archive::Identifier::new("KTLX-00".to_string()),
+    )];
+    app.channels
+        .overlay_fetch_sender
+        .send(SourceEvent::Frames {
+            id: rustdar_source::id::known::RADAR,
+            listing: FrameListing {
+                range,
+                frames: vec![FrameStamp {
+                    valid: at(0),
+                    run: None,
+                }],
+                complete: true,
+            },
+            scope: Box::new(rustdar_radar::source::RadarListing {
+                site: "KTLX".to_string(),
+                range,
+                scans,
+            }),
+        })
+        .expect("the receiver is alive");
+
+    app.poll_overlay_fetch_results();
+    app.accept_loop_scan_listings();
+
+    let loop_state = app
+        .gui
+        .pane(0)
+        .expect("the fixture built one pane")
+        .loop_state();
+    assert!(
+        loop_state.frames.is_empty(),
+        "another site's listing was poured into this pane's frame list",
+    );
+    assert_eq!(
+        loop_state.phase,
+        rustdar_egui::pane::LoopPhase::FetchingScanList,
+        "another site's listing retired this pane's loop, which is still owed \
+         a listing of its own",
+    );
+}
+
+/// **Two panes looping one site with two spans ask two questions, and neither
+/// is answered with the other's.**
+///
+/// The arrival names no pane, so what selects the panes a listing builds is
+/// the window it covered. Same site on both, so the site guard cannot be what
+/// separates them — only the span can.
+#[test]
+fn a_listing_over_one_window_does_not_build_a_loop_asking_about_another() {
+    use rustdar_overlays::render::overlay_state::SourceEvent;
+    use rustdar_source::time::{FrameListing, FrameStamp};
+
+    const SITE: rustdar_radar::sites::RadarSite = rustdar_radar::sites::RadarSite {
+        name: "KTLX",
+        lat: 35.33,
+        lon: -97.27,
+        heights: None,
+    };
+    fn at(minute: i64) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+            .unwrap()
+            .and_hms_opt(2, 0, 0)
+            .unwrap()
+            + chrono::Duration::minutes(minute)
+    }
+
+    let mut app = n_pane_app(2, "KTLX");
+    // Pane 0 asks about ten minutes; pane 1 about half an hour.
+    for (pane_idx, span_secs) in [(0usize, 600u64), (1, 1800)] {
+        let pane = app
+            .gui
+            .pane_mut(pane_idx)
+            .expect("the fixture built two panes");
+        pane.scan_info = Some(scan_info_for("KTLX"));
+        *pane.loop_state_mut() = rustdar_egui::radar_layer::begin_loop(
+            span_secs,
+            &SITE,
+            rustdar_radar::types::RenderView::PlanView,
+        );
+    }
+
+    let range = (at(-10), at(0));
+    let scans: Vec<(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)> = [-8i64, -4, 0]
+        .iter()
+        .map(|&m| {
+            (
+                at(m),
+                rustdar_radar::archive::Identifier::new(format!("KTLX{m}")),
+            )
+        })
+        .collect();
+    app.channels
+        .overlay_fetch_sender
+        .send(SourceEvent::Frames {
+            id: rustdar_source::id::known::RADAR,
+            listing: FrameListing {
+                range,
+                frames: scans
+                    .iter()
+                    .map(|(valid, _)| FrameStamp {
+                        valid: *valid,
+                        run: None,
+                    })
+                    .collect(),
+                complete: true,
+            },
+            scope: Box::new(rustdar_radar::source::RadarListing {
+                site: "KTLX".to_string(),
+                range,
+                scans: scans.clone(),
+            }),
+        })
+        .expect("the receiver is alive");
+
+    app.poll_overlay_fetch_results();
+    app.accept_loop_scan_listings();
+
+    assert_eq!(
+        app.gui
+            .pane(0)
+            .expect("the fixture built two panes")
+            .loop_state()
+            .frames
+            .len(),
+        scans.len(),
+        "the pane that asked about this window was not built from it",
+    );
+    assert!(
+        app.gui
+            .pane(1)
+            .expect("the fixture built two panes")
+            .loop_state()
+            .frames
+            .is_empty(),
+        "a ten-minute listing was poured into a loop asking about half an hour",
+    );
+    assert_eq!(
+        app.gui
+            .pane(1)
+            .expect("the fixture built two panes")
+            .loop_state()
+            .phase,
+        rustdar_egui::pane::LoopPhase::FetchingScanList,
+        "the half-hour loop was retired by a listing that never answered it",
     );
 }

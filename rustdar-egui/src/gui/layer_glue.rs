@@ -336,23 +336,27 @@ impl Gui {
         });
     }
 
-    /// **A frame listing arriving for one layer.** The listing half of
-    /// `SourceEvent`, through the same door and the same
-    /// [`PaneRef::across`] union as [`Self::deliver_overlay_fetch`].
+    /// **A frame listing arriving for one layer**, with the scope the layer
+    /// captured when it asked.
     ///
-    /// **Dark**: nothing produces `SourceEvent::Frames` until WO-E7/WO-M12.
+    /// Through the same door as [`Self::deliver_overlay_fetch`], but **what
+    /// scopes it is the `scope`, not the pane**: the union's config is null
+    /// by construction, so a handler that read a site out of the `PaneRef`
+    /// would read nothing, and two panes on two sites would file one
+    /// another's frames. The union is still what is handed over, for the
+    /// question the other two arrivals ask of it.
     pub fn deliver_frame_listing(
         &mut self,
         id: &rustdar_source::id::LayerId,
         listing: rustdar_source::time::FrameListing,
+        scope: rustdar_overlays::render::overlay_state::FetchPayload,
     ) {
         self.across_panes(id, |overlays, pane| {
-            overlays.apply_frames(id, listing, pane);
+            overlays.apply_frames(id, listing, scope, pane);
         });
     }
 
-    /// **One frame's data arriving for one layer.** Dark for the same reason
-    /// as [`Self::deliver_frame_listing`].
+    /// **One frame's data arriving for one layer.**
     pub fn deliver_frame(
         &mut self,
         id: &rustdar_source::id::LayerId,

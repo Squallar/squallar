@@ -81,11 +81,13 @@ pub struct LoopDownloadManager {
 
 /// A pane's undispatched loop downloads, with the site they belong to.
 pub struct PendingDownloads {
-    /// The site the listing was made for. Every identifier in `queue` is one of
-    /// this site's files, and the scan each becomes is cached under it.
+    /// The site the listing was made for. Every volume in `queue` is one of
+    /// this site's, and the scan each becomes is cached under it.
     pub site: String,
-    /// Scans still to download, oldest-first.
-    pub queue: VecDeque<(chrono::NaiveDateTime, crate::archive::Identifier)>,
+    /// Volume starts still to download, oldest-first. The **archive object**
+    /// each one is stays with the layer that listed it — nothing here holds an
+    /// identifier, so nothing here can download from the wrong site's bucket.
+    pub queue: VecDeque<chrono::NaiveDateTime>,
 }
 
 /// A pane's undispatched Level III pairings, with the site they belong to.
@@ -101,11 +103,11 @@ pub struct PendingL3Pairings {
 /// Every volume a pane's loop frames name, kept so the download queues can be
 /// re-derived without re-listing the archive.
 pub struct FramePlan {
-    /// The site the listing was made for; every identifier below is one of its
-    /// files, and every pairing derived from this plan is against its keys.
+    /// The site the listing was made for; every volume below is one of its
+    /// own, and every pairing derived from this plan is against its keys.
     pub site: String,
-    /// Volume start and archive file per frame, oldest-first.
-    pub frames: Vec<(chrono::NaiveDateTime, crate::archive::Identifier)>,
+    /// Volume start per frame, oldest-first.
+    pub frames: Vec<chrono::NaiveDateTime>,
     /// The product the queues were last derived for. Compared, not assumed:
     /// re-deriving on every dispatch pass would rebuild both queues every frame
     /// of the UI, and re-deriving never would leave a retargeted pane waiting on
@@ -115,10 +117,7 @@ pub struct FramePlan {
 
 impl FramePlan {
     /// A plan for a fresh listing, with nothing derived from it yet.
-    pub fn new(
-        site: String,
-        frames: Vec<(chrono::NaiveDateTime, crate::archive::Identifier)>,
-    ) -> Self {
+    pub fn new(site: String, frames: Vec<chrono::NaiveDateTime>) -> Self {
         Self {
             site,
             frames,
@@ -255,12 +254,10 @@ impl LoopDownloadManager {
     /// the entries whose `(site, timestamp)` fails `keep`.
     pub fn retain_plan_frames(&mut self, keep: impl Fn(&str, &chrono::NaiveDateTime) -> bool) {
         for plan in self.plans.values_mut() {
-            plan.frames.retain(|(ts, _)| keep(plan.site.as_str(), ts));
+            plan.frames.retain(|ts| keep(plan.site.as_str(), ts));
         }
         for pending in self.pending_downloads.values_mut() {
-            pending
-                .queue
-                .retain(|(ts, _)| keep(pending.site.as_str(), ts));
+            pending.queue.retain(|ts| keep(pending.site.as_str(), ts));
         }
     }
 
@@ -327,7 +324,7 @@ impl LoopDownloadManager {
                 let queue = plan
                     .frames
                     .iter()
-                    .flat_map(|(ts, _)| codes.iter().map(move |code| (*ts, (*code).to_string())))
+                    .flat_map(|ts| codes.iter().map(move |code| (*ts, (*code).to_string())))
                     .collect();
                 self.pending_l3.insert(
                     pane,
@@ -340,7 +337,7 @@ impl LoopDownloadManager {
             }
             None => {
                 self.pending_l3.remove(&pane);
-                let queue = plan.frames.iter().cloned().collect();
+                let queue = plan.frames.iter().copied().collect();
                 self.pending_downloads
                     .insert(pane, PendingDownloads { site, queue });
             }
@@ -576,7 +573,6 @@ impl LoopDownloadManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::Identifier;
     use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
 
     fn ts(minute: u32) -> chrono::NaiveDateTime {
@@ -711,9 +707,7 @@ mod tests {
                 pane,
                 PendingDownloads {
                     site: site.to_string(),
-                    queue: [(ts(2), Identifier::new(format!("{site}20240101_000200_V06")))]
-                        .into_iter()
-                        .collect(),
+                    queue: [ts(2)].into_iter().collect(),
                 },
             );
         }
@@ -849,15 +843,7 @@ mod tests {
     fn plan_for(site: &str, minutes: &[u32]) -> FramePlan {
         FramePlan::new(
             site.to_string(),
-            minutes
-                .iter()
-                .map(|&minute| {
-                    (
-                        ts(minute),
-                        Identifier::new(format!("{site}20240101_00{minute:02}00_V06")),
-                    )
-                })
-                .collect(),
+            minutes.iter().map(|&minute| ts(minute)).collect(),
         )
     }
 

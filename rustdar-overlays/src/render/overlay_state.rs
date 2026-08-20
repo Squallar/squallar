@@ -17,9 +17,9 @@ use crate::render::draw::{DrawPointContext, HoverContext, MapPoint, PointPainter
 use crate::types::OverlayLabel;
 
 pub use rustdar_source::handler::{
-    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayFetchResult, OverlayItem,
-    OverlayLegend, OverlayState, PaneMut, PaneRef, PaneToggle, PopupAction, PopupActionKind,
-    PopupContent, PopupSection, RasterizeContext, RenderMode, Signed, SourceEvent,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, FrameListingResult, OverlayFetchResult,
+    OverlayItem, OverlayLegend, OverlayState, PaneMut, PaneRef, PaneToggle, PopupAction,
+    PopupActionKind, PopupContent, PopupSection, RasterizeContext, RenderMode, Signed, SourceEvent,
     SourceHandler as OverlayHandler, Surface, TaskFuture,
 };
 
@@ -303,15 +303,22 @@ impl OverlayRegistry {
 
     /// **A frame listing's arrival**, routed to the layer that asked for it.
     ///
-    /// The listing half of [`SourceEvent`]. Same pane discipline as
-    /// [`Self::apply_fetch_result`]: the arrival names a layer and no pane, so
-    /// `pane` is a [`PaneRef::across`] carrying every pane's state.
-    ///
-    /// **Dark**: nothing produces [`SourceEvent::Frames`] until WO-E7/WO-M12
-    /// give [`OverlayHandler::create_frame_list_task`] a caller.
-    pub fn apply_frames(&mut self, id: &LayerId, listing: FrameListing, pane: &PaneRef<'_>) {
+    /// The listing half of [`SourceEvent`]. **What identifies this delivery is
+    /// the `scope`, not the pane** — the handler captured it at dispatch and
+    /// files the listing under it, which is what lets two panes on two sites
+    /// keep two frame sets when the listing itself names neither. `pane` is
+    /// still the [`PaneRef::across`] union the other two arrivals take, and a
+    /// handler must not read a site out of it: the union's config is null by
+    /// construction.
+    pub fn apply_frames(
+        &mut self,
+        id: &LayerId,
+        listing: FrameListing,
+        scope: FetchPayload,
+        pane: &PaneRef<'_>,
+    ) {
         if let Some(handler) = self.handler_mut(id) {
-            handler.apply_frame_listing(listing, pane);
+            handler.apply_frame_listing(listing, scope, pane);
         }
     }
 
@@ -354,6 +361,46 @@ impl OverlayRegistry {
     ) -> Vec<FetchTask> {
         self.handler(id)
             .map_or_else(Vec::new, |h| h.create_fetch_tasks(ctx, pane))
+    }
+
+    /// [`OverlayHandler::list_frames`] for `id` — the synchronous read over
+    /// what that layer already knows, never a fetch. A layer with no handler
+    /// knows nothing, which is [`FrameListing::empty`].
+    pub fn list_frames(
+        &self,
+        id: &LayerId,
+        ctx: &FetchConfig,
+        pane: &PaneRef<'_>,
+        range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+    ) -> FrameListing {
+        self.handler(id).map_or_else(
+            || FrameListing::empty(range),
+            |h| h.list_frames(ctx, pane, range),
+        )
+    }
+
+    /// [`OverlayHandler::create_frame_list_task`] for `id`.
+    pub fn create_frame_list_task(
+        &self,
+        id: &LayerId,
+        ctx: &FetchConfig,
+        pane: &PaneRef<'_>,
+        range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+    ) -> Option<FetchTask> {
+        self.handler(id)
+            .and_then(|h| h.create_frame_list_task(ctx, pane, range))
+    }
+
+    /// [`OverlayHandler::fetch_frame`] for `id`.
+    pub fn fetch_frame(
+        &self,
+        id: &LayerId,
+        ctx: &FetchConfig,
+        pane: &PaneRef<'_>,
+        stamp: &FrameStamp,
+    ) -> Option<FetchTask> {
+        self.handler(id)
+            .and_then(|h| h.fetch_frame(ctx, pane, stamp))
     }
 
     /// The handler's own options, with its fetch health prepended.

@@ -5,7 +5,6 @@ use nexrad_model::data::{
 };
 use rustdar_device_profile::constants::MAX_LOOP_FRAMES;
 use rustdar_egui::pane::{LayerTimeState, LoopFrame, LoopPhase};
-use rustdar_radar::archive::Identifier;
 use rustdar_radar::loop_downloads::LoopDownloadManager;
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::RadarProduct;
@@ -20,10 +19,6 @@ fn ts(minute: u32) -> chrono::NaiveDateTime {
 
 fn target(site: &str, elevation: f32) -> RenderTarget {
     test_keys::key(site, RadarProduct::Reflectivity, elevation)
-}
-
-fn identifier(name: &str) -> Identifier {
-    Identifier::new(name.to_string())
 }
 
 pub(super) fn scan_with_sweeps(elevations: &[f32]) -> Arc<Scan> {
@@ -275,7 +270,7 @@ fn a_listing_for_the_site_the_loop_left_is_refused() {
     let ctx = egui::Context::default();
     let mut koun = loop_on(&ctx, "KOUN", &[]);
     koun.frames.clear();
-    let stale = vec![(ts(0), identifier("KTLX20240101_000000_V06"))];
+    let stale = vec![ts(0)];
 
     assert!(
         accept_scan_listing(
@@ -291,7 +286,7 @@ fn a_listing_for_the_site_the_loop_left_is_refused() {
     );
     assert!(koun.frames.is_empty(), "and left no frames behind");
 
-    let live = vec![(ts(0), identifier("KOUN20240101_000000_V06"))];
+    let live = vec![ts(0)];
     let plan = accept_scan_listing(
         test_loop_allocation(),
         &test_budgets(),
@@ -315,7 +310,7 @@ fn a_listing_for_an_inactive_loop_is_refused() {
     let mut ls = loop_on(&ctx, "KTLX", &[]);
     ls.phase = LoopPhase::Inactive;
 
-    let scans = vec![(ts(0), identifier("KTLX20240101_000000_V06"))];
+    let scans = vec![ts(0)];
     assert!(
         accept_scan_listing(
             test_loop_allocation(),
@@ -390,9 +385,7 @@ fn a_loop_still_waiting_on_its_scans_is_left_alone() {
         0,
         PendingDownloads {
             site: "KTLX".to_string(),
-            queue: [(ts(1), identifier("KTLX20240101_000100_V06"))]
-                .into_iter()
-                .collect(),
+            queue: [ts(1)].into_iter().collect(),
         },
     );
     assert!(!settle_loop_phase(
@@ -431,9 +424,7 @@ fn the_frame_list_and_the_frame_plan_describe_the_same_scans() {
         "precondition: a loop awaiting its listing"
     );
 
-    let scans: Vec<_> = (0..(MAX_LOOP_FRAMES as u32 + 40))
-        .map(|i| (ts(i), identifier(&format!("KTLX2024010{}_V06", i))))
-        .collect();
+    let scans: Vec<_> = (0..(MAX_LOOP_FRAMES as u32 + 40)).map(ts).collect();
 
     let plan = accept_scan_listing(
         test_loop_allocation(),
@@ -448,7 +439,7 @@ fn the_frame_list_and_the_frame_plan_describe_the_same_scans() {
     assert_eq!(plan.frames.len(), MAX_LOOP_FRAMES, "capped");
     assert_eq!(
         ls.frames.iter().map(|f| f.timestamp).collect::<Vec<_>>(),
-        plan.frames.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        plan.frames.clone(),
         "the sampled set is the frame list, frame for frame"
     );
     assert_eq!(
@@ -468,9 +459,7 @@ fn a_long_listing_is_sampled_evenly_across_its_whole_span() {
     let ctx = egui::Context::default();
     let mut ls = loop_on(&ctx, "KTLX", &[]);
     let total = MAX_LOOP_FRAMES * 3 + 7;
-    let scans: Vec<_> = (0..total as u32)
-        .map(|i| (ts(i), identifier(&format!("KTLX2024010{}_V06", i))))
-        .collect();
+    let scans: Vec<_> = (0..total as u32).map(ts).collect();
 
     accept_scan_listing(
         test_loop_allocation(),
@@ -518,9 +507,7 @@ fn a_listing_one_scan_over_the_cap_is_recorded_as_sampled() {
     );
     for (listed, expected) in [(cap, false), (cap + 1, true)] {
         let mut ls = loop_on(&ctx, "KTLX", &[]);
-        let scans: Vec<_> = (0..listed as u32)
-            .map(|i| (ts(i), identifier(&format!("KTLX2024010{}_V06", i))))
-            .collect();
+        let scans: Vec<_> = (0..listed as u32).map(ts).collect();
 
         accept_scan_listing(
             test_loop_allocation(),
@@ -643,7 +630,6 @@ fn a_download_is_cached_under_the_site_it_came_from() {
     apply_completed_download(
         &mut mgr,
         crate::channels::LoopScanDownloadResponse {
-            pane_idx: 0,
             site: "KTLX".to_string(),
             timestamp: ts(0),
             scan: Some(volume.clone()),
@@ -666,7 +652,6 @@ fn a_failed_download_clears_its_mark_and_caches_nothing() {
     apply_completed_download(
         &mut mgr,
         crate::channels::LoopScanDownloadResponse {
-            pane_idx: 0,
             site: "KTLX".to_string(),
             timestamp: ts(0),
             scan: None,
@@ -875,10 +860,7 @@ fn a_listing_teaches_the_cadence_before_the_frame_count_is_spent() {
     let ctx = egui::Context::default();
     let mut ls = loop_on(&ctx, "KTLX", &[]);
     ls.phase = LoopPhase::FetchingScanList;
-    let scans: Vec<_> = (0..13u32)
-        .filter(|i| *i != 4)
-        .map(|i| (ts(i * 6), identifier(&format!("KTLX2024010{i}_V06"))))
-        .collect();
+    let scans: Vec<_> = (0..13u32).filter(|i| *i != 4).map(|i| ts(i * 6)).collect();
 
     accept_scan_listing(
         test_loop_allocation(),

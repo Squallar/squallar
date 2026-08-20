@@ -1,6 +1,5 @@
 use super::*;
 use rustdar_egui::pane::PaneState;
-use rustdar_radar::archive::Identifier;
 use rustdar_radar::loop_downloads::LoopDownloadManager;
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::{RadarProduct, ScanInfo};
@@ -11,10 +10,6 @@ fn ts(minute: u32) -> NaiveDateTime {
         .and_hms_opt(0, 0, 0)
         .unwrap()
         + chrono::Duration::minutes(i64::from(minute))
-}
-
-fn identifier(name: &str) -> Identifier {
-    Identifier::new(name.to_string())
 }
 
 fn site(name: &'static str, lat: f64, lon: f64) -> RadarSite {
@@ -194,9 +189,7 @@ fn beginning_a_loop_clears_the_panes_pending_downloads() {
         0,
         rustdar_radar::loop_downloads::PendingDownloads {
             site: "KOUN".to_string(),
-            queue: [(ts(5), identifier("KOUN20240101_000500_V06"))]
-                .into_iter()
-                .collect(),
+            queue: [ts(5)].into_iter().collect(),
         },
     );
     assert!(!mgr.is_pane_done(0), "precondition: pane 0 has work queued");

@@ -1600,47 +1600,92 @@ impl super::App {
         repaint_delay
     }
 
-    /// Poll for loop scan listing results. Populates the pane's frame list
-    /// and kicks off downloads for each scan (throttled).
-    fn poll_loop_scan_list_results(&mut self) {
+    /// **Build the loops that were waiting on a listing that has now
+    /// landed.** Populates each pane's frame list and kicks off its downloads
+    /// (throttled).
+    ///
+    /// The frames come from the layer, not from the arrival: the listing is
+    /// filed by `apply_frame_listing` under the site it was listed for, and
+    /// this reads it back through `list_frames` scoped to each pane's own
+    /// site. A pane on another site therefore sees nothing of it, which is
+    /// what keeps two sites' stamps out of one list.
+    pub(super) fn accept_loop_scan_listings(&mut self) {
+        let arrived = std::mem::take(&mut self.loop_listings_arrived);
+        if arrived.is_empty() {
+            return;
+        }
         let allocation = self.loop_allocation();
         let budgets = self.budgets;
-        while let Ok(resp) = self.channels.loop_scan_list_receiver.try_recv() {
-            let Some(pane) = self.gui.pane_mut(resp.pane_idx) else {
-                continue;
-            };
-            // Whether this listing is still wanted, and what it makes of the frame
-            // list, is decided in one place — including refusing a listing for a
-            // site the pane's loop has since moved off.
-            let product = pane.selected_product();
-            // The whole-pane cap divides across the layers this pane is
-            // animating, and it is counted HERE — where the budget is
-            // consumed — not pushed down with it.
-            let animating = pane.animating_layers().count();
-            let Some(plan) = accept_scan_listing(
-                allocation,
-                &budgets,
-                pane.loop_state_mut(),
-                &resp.site,
-                resp.scans,
-                animating,
-            ) else {
-                continue;
-            };
-            log::info!(
-                "Loop: populated {} {} frames for pane {}",
-                plan.frames.len(),
-                plan.site,
-                resp.pane_idx
-            );
-
-            // Store the frame plan — with the site it was listed for — then derive
-            // the queue for whichever datasource this pane's product reads and
-            // dispatch the first batch.
-            self.loop_mgr.set_plan(resp.pane_idx, plan);
-            self.loop_mgr.plan_downloads_for(resp.pane_idx, product);
-            self.dispatch_pending_loop_downloads(resp.pane_idx);
-            self.dispatch_pending_loop_l3_pairings(resp.pane_idx);
+        let config = self.fetch_config();
+        for (site, range) in arrived {
+            let span_secs = (range.1 - range.0).num_seconds();
+            let mut built: Vec<(usize, FramePlan, rustdar_radar::types::RadarProduct)> = Vec::new();
+            {
+                let (panes, overlays) = self.gui.panes_and_overlays_mut();
+                for (pane_idx, pane) in panes.iter_mut().enumerate() {
+                    // Only a pane still waiting for a listing over this very
+                    // window: two panes looping one site with two spans ask
+                    // two questions, and neither may be answered with the
+                    // other's.
+                    if !pane.loop_state().is_active()
+                        || pane.loop_state().phase
+                            != rustdar_egui::pane::LoopPhase::FetchingScanList
+                        || pane.loop_state().span_secs as i64 != span_secs
+                    {
+                        continue;
+                    }
+                    pane.hydrate_layer_states(overlays, pane_idx);
+                    let product = pane.selected_product();
+                    // The whole-pane cap divides across the layers this pane is
+                    // animating, and it is counted HERE — where the budget is
+                    // consumed — not pushed down with it.
+                    let animating = pane.animating_layers().count();
+                    let frames: Vec<chrono::NaiveDateTime> = {
+                        let view = pane.view(pane_idx);
+                        let pane_ref = view.layer(&rustdar_source::id::known::RADAR);
+                        overlays
+                            .list_frames(
+                                &rustdar_source::id::known::RADAR,
+                                &config,
+                                &pane_ref,
+                                range,
+                            )
+                            .frames
+                            .iter()
+                            .map(|frame| frame.valid)
+                            .collect()
+                    };
+                    // Whether this listing is still wanted, and what it makes of the
+                    // frame list, is decided in one place — including refusing a
+                    // listing for a site the pane's loop has since moved off.
+                    let Some(plan) = accept_scan_listing(
+                        allocation,
+                        &budgets,
+                        pane.loop_state_mut(),
+                        &site,
+                        frames,
+                        animating,
+                    ) else {
+                        continue;
+                    };
+                    built.push((pane_idx, plan, product));
+                }
+            }
+            for (pane_idx, plan, product) in built {
+                log::info!(
+                    "Loop: populated {} {} frames for pane {}",
+                    plan.frames.len(),
+                    plan.site,
+                    pane_idx
+                );
+                // Store the frame plan — with the site it was listed for — then derive
+                // the queue for whichever datasource this pane's product reads and
+                // dispatch the first batch.
+                self.loop_mgr.set_plan(pane_idx, plan);
+                self.loop_mgr.plan_downloads_for(pane_idx, product);
+                self.dispatch_pending_loop_downloads(pane_idx);
+                self.dispatch_pending_loop_l3_pairings(pane_idx);
+            }
         }
     }
 
@@ -1813,8 +1858,8 @@ impl super::App {
         // Filter out timestamps already cached or in flight for this site
         let mut batch = Vec::new();
         while !queue.is_empty() && batch.len() < slots {
-            let (ts, _) = queue.front().unwrap();
-            if self.loop_mgr.is_cached(&site, ts) || self.loop_mgr.is_in_flight(&site, ts) {
+            let ts = *queue.front().unwrap();
+            if self.loop_mgr.is_cached(&site, &ts) || self.loop_mgr.is_in_flight(&site, &ts) {
                 // Already have or fetching this scan — remove from pending
                 queue.pop_front();
             } else {
@@ -1822,11 +1867,54 @@ impl super::App {
             }
         }
 
-        let spawned = batch.len();
+        // **The layer resolves each volume to an archive object**; nothing
+        // here holds one. A stamp it cannot resolve is a volume no listing of
+        // this pane's site named, so it is dropped rather than retried
+        // forever — the frame retires the way an unrenderable one does.
+        let config = self.fetch_config();
+        let listed = site.clone();
+        let tasks: Vec<(chrono::NaiveDateTime, rustdar_source::handler::FetchTask)> = self
+            .with_layer_pane(
+                pane_idx,
+                &rustdar_source::id::known::RADAR,
+                |overlays, pane_ref| {
+                    batch
+                        .into_iter()
+                        .filter_map(|ts| {
+                            let stamp = rustdar_source::time::FrameStamp {
+                                valid: ts,
+                                run: None,
+                            };
+                            let task = overlays.fetch_frame(
+                                &rustdar_source::id::known::RADAR,
+                                &config,
+                                pane_ref,
+                                &stamp,
+                            );
+                            if task.is_none() {
+                                log::warn!(
+                                    "Loop: no {listed} archive object is listed for {ts}; \
+                                     that frame cannot be fetched",
+                                );
+                            }
+                            task.map(|task| (ts, task))
+                        })
+                        .collect()
+                },
+            )
+            .unwrap_or_default();
 
-        for (ts, id) in batch {
+        let spawned = tasks.len();
+
+        for (ts, task) in tasks {
             self.loop_mgr.mark_in_flight(&site, ts);
-            self.spawn_loop_scan_download(pane_idx, site.clone(), ts, id);
+            self.spawn_frame_fetch_task(
+                rustdar_source::time::FrameStamp {
+                    valid: ts,
+                    run: None,
+                },
+                task,
+            );
         }
 
         // Put the queue back, still carrying its own site
@@ -2761,7 +2849,7 @@ fn accept_scan_listing(
     budgets: &rustdar_device_profile::budget::Budgets,
     ls: &mut rustdar_egui::pane::LayerTimeState,
     site: &str,
-    scans: Vec<(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)>,
+    scans: Vec<chrono::NaiveDateTime>,
     animating: usize,
 ) -> Option<FramePlan> {
     if !ls.is_active() || radar_layer::site(ls) != site {
@@ -2777,12 +2865,7 @@ fn accept_scan_listing(
     // The site's own cadence, read off the listing *before* the sampling below
     // throws scans away. Once sampled there is no way back to it, and it is what
     // the timeline caption needs to tell "every scan" from "one in five".
-    ls.cadence_secs = median_step_secs(
-        &scans
-            .iter()
-            .map(|(timestamp, _id)| *timestamp)
-            .collect::<Vec<_>>(),
-    );
+    ls.cadence_secs = median_step_secs(&scans);
 
     // Cap the downloads by evenly sampling the listing. A 3D loop's cap is its
     // *resident* one and is far lower, because for that kind the frame list and
@@ -2794,7 +2877,7 @@ fn accept_scan_listing(
     let scans = match sample {
         Some(indices) => {
             log::info!("Loop: sampled {total} down to {held} frames for {site}");
-            indices.into_iter().map(|i| scans[i].clone()).collect()
+            indices.into_iter().map(|i| scans[i]).collect()
         }
         None => scans,
     };
@@ -2803,7 +2886,7 @@ fn accept_scan_listing(
     // Oldest-first, matching the scan listing order.
     ls.frames = scans
         .iter()
-        .map(|(ts, _id)| rustdar_egui::pane::LoopFrame {
+        .map(|ts| rustdar_egui::pane::LoopFrame {
             timestamp: *ts,
             image: None,
             render_in_flight: false,
@@ -3201,7 +3284,7 @@ pub(crate) fn accept_scan_listing_for_test(
     budgets: &rustdar_device_profile::budget::Budgets,
     ls: &mut rustdar_egui::pane::LayerTimeState,
     site: &str,
-    scans: Vec<(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)>,
+    scans: Vec<chrono::NaiveDateTime>,
     animating: usize,
 ) -> Option<FramePlan> {
     accept_scan_listing(allocation, budgets, ls, site, scans, animating)
@@ -3521,8 +3604,8 @@ pub(super) fn pump_poll_overlay_render_results(app: &mut super::App, ctx: Option
     app.poll_overlay_render_results(ctx.expect("Apply rows run from setup_egui_frame"));
 }
 
-pub(super) fn pump_poll_loop_scan_list_results(app: &mut super::App, _ctx: Option<&egui::Context>) {
-    app.poll_loop_scan_list_results();
+pub(super) fn pump_accept_loop_scan_listings(app: &mut super::App, _ctx: Option<&egui::Context>) {
+    app.accept_loop_scan_listings();
 }
 
 pub(super) fn pump_poll_loop_scan_download_results(

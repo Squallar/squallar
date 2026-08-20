@@ -2,7 +2,6 @@ use super::*;
 use crate::test_keys;
 use nexrad_level3::model::{Level3Message, MessageHeader, ProductDescriptionBlock};
 use rustdar_egui::pane::{LayerTimeState, LoopFrame, LoopPhase};
-use rustdar_radar::archive::Identifier;
 use rustdar_radar::level3::{Level3Product, ProductStamp};
 use rustdar_radar::loop_downloads::{L3FrameState, LoopDownloadManager};
 use rustdar_radar::sites::RadarSite;
@@ -30,17 +29,7 @@ fn codes(product: RadarProduct) -> &'static [&'static str] {
 /// A frame plan for `n` volumes one minute apart, as `accept_scan_listing`
 /// builds one.
 fn plan(n: u32) -> rustdar_radar::loop_downloads::FramePlan {
-    rustdar_radar::loop_downloads::FramePlan::new(
-        SITE.to_string(),
-        (0..n)
-            .map(|i| {
-                (
-                    ts(i),
-                    Identifier::new(format!("KTLX20240101_00{i:02}00_V06")),
-                )
-            })
-            .collect(),
-    )
+    rustdar_radar::loop_downloads::FramePlan::new(SITE.to_string(), (0..n).map(ts).collect())
 }
 
 /// A decoded object whose PDB reports `elevation_tenths / 10` degrees.
