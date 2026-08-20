@@ -1578,10 +1578,21 @@ fn a_spent_poll_wakeup_lets_the_loop_sleep_again() {
 /// one under test.
 fn silence_the_other_timers(app: &mut App) {
     for idx in 0..app.gui.remembered_pane_count() {
-        let pane = app.gui.pane_mut(idx).expect("a remembered pane");
-        for id in rustdar_egui::sources::default_draw_order() {
-            pane.set_overlay_enabled(id, false);
+        {
+            let pane = app.gui.pane_mut(idx).expect("a remembered pane");
+            for id in rustdar_egui::sources::default_draw_order() {
+                pane.set_overlay_enabled(id, false);
+            }
         }
+        // The archive poll is gated on a pane VIEWING LIVE, not on the radar
+        // layer being enabled — a pane scrubbed to an archive time still has
+        // radar on — so turning the layer off above does not silence it. What
+        // does is nothing on screen asking for live data.
+        app.gui
+            .apply(rustdar_egui::shell_api::GuiEvent::ViewingLiveForPane {
+                pane_idx: idx,
+                live: false,
+            });
     }
     assert_eq!(
         app.gui.auto_poll_delay(),

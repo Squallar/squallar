@@ -103,12 +103,12 @@ mod probes;
 pub(crate) use probes::ControlProbe;
 #[path = "gui/state.rs"]
 mod state;
-pub(super) use state::AutoPollState;
 pub use state::{CurrentVolumeStamp, Gui, StormMotionOverride};
 #[path = "gui/frame.rs"]
 mod frame;
 #[path = "gui/layer_glue.rs"]
 mod layer_glue;
+pub(crate) use layer_glue::RoundOutcome;
 #[path = "gui/sync.rs"]
 mod sync;
 
@@ -541,7 +541,7 @@ impl Gui {
                     }
                 }
                 self.radar.fetching = false;
-                self.auto_poll.on_success();
+                self.end_radar_round(RoundOutcome::Delivered);
                 // Only a scan someone is actually looking at is a reason to zoom to
                 // radar scale. A volume for a site no pane is on — a fetch that landed
                 // after the pane switched away — must not spend the one-shot latch.
@@ -599,13 +599,18 @@ impl Gui {
             }
             GuiEvent::Fetching(fetching) => {
                 self.radar.fetching = fetching;
+                // The layer's own in-flight flag rides with the shell's, so
+                // `auto_fetch_delay` refuses to schedule a second round on top
+                // of the one already in the air. The rising edge is also what
+                // stamps the layer's poll clock.
+                self.set_radar_round_in_flight(fetching);
             }
             // Set an error message. The spinner comes down and the archive
             // backoff advances with it — an error ends the wait it belonged to.
             GuiEvent::Error(error) => {
+                self.end_radar_round(RoundOutcome::Failed(&error));
                 self.radar.error_message = Some(error);
                 self.radar.fetching = false;
-                self.auto_poll.on_error();
             }
             // Set the radar config, keeping the Set Time dialog's strings in
             // sync with it.
@@ -1697,17 +1702,13 @@ impl Gui {
     /// needs a **frame**, or `None` when nothing is polling and it may sleep
     /// until something happens.
     pub fn auto_poll_delay(&self) -> Option<std::time::Duration> {
-        let radar = if self.is_any_pane_live() && !self.radar.fetching {
-            self.auto_poll.poll_delay()
-        } else {
-            None
-        };
-        let overlays = self
-            .overlays
+        // Every layer through one term, radar included: its own gate is
+        // inside `overlay_poll_delay`, which is where the difference between
+        // "enabled somewhere" and "live somewhere" is written down.
+        self.overlays
             .handlers()
             .filter_map(|h| self.overlay_poll_delay(&h.id()))
-            .min();
-        [radar, overlays].into_iter().flatten().min()
+            .min()
     }
 
     /// How long until the status bar's own text would read differently, or

@@ -144,6 +144,14 @@ impl OverlayRegistry {
         }
     }
 
+    /// Age `kind`'s poll clock — see [`OverlayHandler::rewind_fetch_time`].
+    #[doc(hidden)]
+    pub fn rewind_fetch_time(&mut self, id: &LayerId, by: std::time::Duration) {
+        if let Some(h) = self.handler_mut(id) {
+            h.rewind_fetch_time(by);
+        }
+    }
+
     pub fn has_data(&self, id: &LayerId, pane: &PaneRef<'_>) -> bool {
         self.handler(id).is_some_and(|h| h.has_data(pane))
     }
@@ -176,6 +184,19 @@ impl OverlayRegistry {
     pub fn clear_retry(&mut self, id: &LayerId) {
         if let Some(r) = self.handler_mut(id).and_then(|h| h.retry_mut()) {
             r.clear();
+        }
+    }
+
+    /// A good answer arrived for `kind` from outside the handler: the round
+    /// ends, the ladder resets and the layer returns to its interval. The twin
+    /// of [`Self::record_fetch_failure`], for a layer whose answer arrives
+    /// somewhere other than `apply_fetch_result`.
+    pub fn record_fetch_success(&mut self, id: &LayerId, pane: &PaneRef<'_>) {
+        if let Some(h) = self.handler_mut(id) {
+            h.set_fetching(false, pane);
+            if let Some(r) = h.retry_mut() {
+                r.record_success();
+            }
         }
     }
 

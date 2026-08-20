@@ -7,18 +7,46 @@ use rustdar_source::handler::PaneRef;
 /// are bounds rather than equalities.
 const SLACK: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Put the radar layer's poll clock `ago` in the past, through the real
+/// doors: the round is asked for (which is what stamps the clock — see
+/// `RadarSource::set_fetching`), ends in the same breath because nothing
+/// tracks an archive check, and the clock is then aged.
 fn polled(gui: &mut Gui, ago: std::time::Duration) {
-    gui.auto_poll.last_fetch_time = Some(web_time::Instant::now() - ago);
+    gui.set_radar_round_in_flight(true);
+    gui.set_radar_round_in_flight(false);
+    gui.overlays
+        .rewind_fetch_time(&crate::radar_layer::POLL_LAYER, ago);
+}
+
+/// What the status bar's chip reads off the radar layer.
+fn chip(gui: &Gui) -> super::statusbar::ArchivePoll {
+    super::statusbar::ArchivePoll::of(&gui.overlays)
 }
 
 const INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Silence every layer's refresh but the archive poll's — and **leave the
+/// radar layer itself shown**, because that is what makes these tests about
+/// the gate they name.
+///
+/// The radar poll is gated on a pane VIEWING LIVE, not on the layer being
+/// enabled. Turning radar off here as well would make the two predicates
+/// agree on every fixture, and a test that cannot tell them apart proves
+/// nothing about which one the code consults.
 fn only_the_radar_poll(gui: &mut Gui) {
     for kind in crate::sources::default_draw_order() {
+        if kind == crate::radar_layer::POLL_LAYER {
+            continue;
+        }
         gui.pane_mut(0)
             .expect("a fresh Gui has one pane")
             .set_overlay_enabled(kind.clone(), false);
     }
+    assert!(
+        gui.any_pane_has_overlay_enabled(&crate::radar_layer::POLL_LAYER),
+        "precondition: the radar layer stays shown, so `viewing_live` is the \
+         only thing these fixtures vary"
+    );
 }
 
 /// The replacement's whole point: an idle app with auto-poll on is left to
@@ -41,6 +69,11 @@ fn an_idle_poller_sleeps_out_the_rest_of_its_interval() {
 
 /// The scheduling half and the firing half must agree, or a wake is spent on
 /// a frame that polls nothing — which is the busy loop with extra steps.
+///
+/// The two halves are read from opposite ends on purpose: the *firing* half is
+/// what `check_auto_polls` actually emits, not a second reading of the same
+/// delay the wake is computed from. A pin that asked `auto_fetch_delay`
+/// whether `auto_fetch_delay` was zero could not fail.
 #[test]
 fn the_wake_lands_exactly_when_the_poll_would_fire() {
     for (ago, due) in [
@@ -49,17 +82,24 @@ fn the_wake_lands_exactly_when_the_poll_would_fire() {
         (INTERVAL + std::time::Duration::from_secs(30), true),
     ] {
         let mut gui = Gui::new();
+        only_the_radar_poll(&mut gui);
         polled(&mut gui, ago);
+
+        let mut actions = Vec::new();
+        gui.check_auto_polls(&mut actions);
+        let fired = actions
+            .iter()
+            .any(|a| matches!(a, crate::actions::GuiAction::CheckForNewScans(_)));
         assert_eq!(
-            gui.auto_poll.should_poll(),
-            due,
+            fired, due,
             "the premise moved: {ago:?} into a {INTERVAL:?} interval"
         );
+
+        let mut gui = Gui::new();
+        only_the_radar_poll(&mut gui);
+        polled(&mut gui, ago);
         assert_eq!(
-            gui.auto_poll
-                .poll_delay()
-                .expect("a timer is running")
-                .is_zero(),
+            gui.auto_poll_delay().expect("a timer is running").is_zero(),
             due,
             "at {ago:?} the schedule and the poll disagree about whether a \
              round is due, so a wake will be spent on a frame that polls \
@@ -92,13 +132,77 @@ fn a_poll_no_pane_can_use_is_not_scheduled_for() {
     );
 }
 
+/// **An archive check is answered only when there is something newer**
+/// (`fetch_latest_if_newer` sends nothing back otherwise), so the clock this
+/// layer counts from is stamped by the ASK. A clock that waited for a
+/// delivery would leave the layer reading "never fetched" on the next frame,
+/// and the archive would be asked once per frame for ever.
+#[test]
+fn a_check_that_is_never_answered_still_spends_its_interval() {
+    let mut gui = Gui::new();
+    only_the_radar_poll(&mut gui);
+    polled(&mut gui, INTERVAL);
+
+    let mut actions = Vec::new();
+    gui.check_auto_polls(&mut actions);
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, crate::actions::GuiAction::CheckForNewScans(_))),
+        "precondition: the round was due and the check was asked for"
+    );
+
+    // Nothing arrives. No `ScanInfoForSite`, no `Error`, no `Fetching(false)`.
+    let mut again = Vec::new();
+    gui.check_auto_polls(&mut again);
+    assert!(
+        !again
+            .iter()
+            .any(|a| matches!(a, crate::actions::GuiAction::CheckForNewScans(_))),
+        "an unanswered check left the layer due on the very next frame, so \
+         the archive is being asked once per frame"
+    );
+    let delay = gui
+        .auto_poll_delay()
+        .expect("the poll is still owed its next round");
+    assert!(
+        delay > INTERVAL - SLACK,
+        "the unanswered check did not spend its interval: {delay:?}"
+    );
+}
+
+/// **Auto-poll off means stop checking for newer volumes; it has never meant
+/// show nothing at all.** The session's first fetch is not on the poll's gate,
+/// and folding it onto one would leave a user who turned the switch off with
+/// an empty map for the whole session.
+#[test]
+fn the_first_fetch_of_a_session_happens_with_the_poll_switched_off() {
+    let mut gui = Gui::new();
+    only_the_radar_poll(&mut gui);
+    gui.set_auto_poll_enabled(false);
+    assert_eq!(
+        gui.auto_poll_delay(),
+        None,
+        "precondition: with the switch off nothing is scheduled for"
+    );
+
+    let mut actions = Vec::new();
+    gui.check_auto_polls(&mut actions);
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, crate::actions::GuiAction::FetchRadarScan(_))),
+        "switching the archive poll off left the session with no radar at all"
+    );
+}
+
 /// Turning auto-poll off has to stop the wake as well as the poll.
 #[test]
 fn auto_poll_switched_off_asks_for_nothing() {
     let mut gui = Gui::new();
     only_the_radar_poll(&mut gui);
     polled(&mut gui, std::time::Duration::from_secs(5));
-    gui.auto_poll.enabled = false;
+    gui.set_auto_poll_enabled(false);
 
     assert_eq!(gui.auto_poll_delay(), None);
     assert_eq!(
@@ -176,14 +280,13 @@ fn the_countdown_wake_lands_on_the_second_the_number_moves() {
     let mut gui = Gui::new();
     polled(&mut gui, std::time::Duration::from_millis(10_400));
     assert_eq!(
-        gui.auto_poll.time_until_next(),
+        chip(&gui).secs(),
         Some(50),
         "precondition: the bar is printing `archive 50s`"
     );
 
-    let tick = gui
-        .auto_poll
-        .countdown_tick_delay()
+    let tick = chip(&gui)
+        .countdown_tick()
         .expect("the count is still moving");
     assert!(
         tick > std::time::Duration::from_millis(500)
@@ -200,12 +303,12 @@ fn a_countdown_that_has_bottomed_out_asks_for_no_more_frames() {
     let mut gui = Gui::new();
     polled(&mut gui, INTERVAL * 3);
     assert_eq!(
-        gui.auto_poll.time_until_next(),
+        chip(&gui).secs(),
         Some(0),
         "precondition: the count has bottomed out"
     );
 
-    assert_eq!(gui.auto_poll.countdown_tick_delay(), None);
+    assert_eq!(chip(&gui).countdown_tick(), None);
 }
 
 /// The tick is never zero, whatever the phase of the clock. A zero-length
@@ -215,9 +318,8 @@ fn the_countdown_tick_is_never_a_zero_length_sleep() {
     for millis in [0, 1, 999, 1_000, 1_001, 30_000, 59_999] {
         let mut gui = Gui::new();
         polled(&mut gui, std::time::Duration::from_millis(millis));
-        let tick = gui
-            .auto_poll
-            .countdown_tick_delay()
+        let tick = chip(&gui)
+            .countdown_tick()
             .expect("the count is still moving");
         assert!(
             !tick.is_zero() && tick <= std::time::Duration::from_secs(1),

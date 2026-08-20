@@ -5,6 +5,15 @@ use rustdar_source::handler::PaneMut;
 use rustdar_source::handler::PaneRef;
 use rustdar_source::id::LayerId;
 
+/// How a radar archive round finished. Two arms because the ladder treats
+/// them oppositely: a delivery wipes it, a failure files against it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RoundOutcome<'a> {
+    Delivered,
+    /// …carrying what went wrong, because the layer's options panel prints it.
+    Failed(&'a str),
+}
+
 impl Gui {
     /// Render **one** handler's controls — the only place handler [`ControlItem`]s
     /// render, hosted by the inspector's layer body.
@@ -396,12 +405,96 @@ impl Gui {
         f(overlays, &PaneRef::across(&peers))
     }
 
-    /// When one overlay's auto-refresh is next due, on the same terms as
+    /// Switch the archive poll on or off — the one write behind the ☰ menu
+    /// leaf, the settings row and (from the inspector) the layer's own control
+    /// row, so no two of them can disagree about the switch's state.
+    pub(super) fn set_auto_poll_enabled(&mut self, on: bool) {
+        let id = crate::radar_layer::POLL_LAYER;
+        let update = crate::radar_layer::auto_poll_update(on);
+        // **A bare pane view, and deliberately.** This switch is the layer's
+        // own — one answer for the whole app, like the endpoint it will sit
+        // beside — so there is no per-pane state for the edit to land in, and
+        // handing it a real pane view would drag `adopt_handler_state` in
+        // behind it and re-derive every OTHER layer's flag as a side effect of
+        // toggling this one. The inspector's copy of the same control goes
+        // through the full pane construction and writes the same field.
+        let mut pane = PaneMut::bare(self.active_pane);
+        self.overlays.apply_control(&id, &update, &mut pane);
+    }
+
+    /// **What the radar layer's round ended as**, which is the only thing the
+    /// shell knows about it that the layer cannot see for itself.
+    ///
+    /// The archive fetch is dispatched by the shell and answered on a channel
+    /// the shell drains, so success and failure reach the layer here rather
+    /// than through `apply_fetch_result` — the arrival carries a decoded
+    /// volume, not this layer's own payload.
+    pub(super) fn end_radar_round(&mut self, outcome: RoundOutcome<'_>) {
+        let id = crate::radar_layer::POLL_LAYER;
+        // Both doors end the round themselves, which is why neither arm
+        // clears the in-flight flag beside them.
+        self.across_panes(&id, |overlays, pane| {
+            match outcome {
+                // The ladder resets and the layer returns to its interval.
+                RoundOutcome::Delivered => overlays.record_fetch_success(&id, pane),
+                // …and files against it, which is what spaces a failing origin
+                // out instead of asking it again on the next frame.
+                //
+                // **Transient, always.** What reaches the shell is a message,
+                // not a status code, so nothing here can honestly call a round
+                // a refusal — which means radar walks the 2-4-8…-interval
+                // ladder and never reaches the `Broken` floor. Sniffing the
+                // string for one would be a guess wearing a classification's
+                // clothes; giving radar a real one means the fetch path
+                // reporting a classified `FetchError`, which is app-side.
+                RoundOutcome::Failed(message) => overlays.record_fetch_failure(
+                    &id,
+                    &rustdar_source::fetch_policy::FetchError::transient(message),
+                    pane,
+                ),
+            }
+        });
+    }
+
+    /// Mark the radar layer's round in flight, or not. The rising edge stamps
+    /// the layer's poll clock — see `RadarSource::set_fetching`.
+    pub(super) fn set_radar_round_in_flight(&mut self, in_flight: bool) {
+        let id = crate::radar_layer::POLL_LAYER;
+        self.across_panes(&id, |overlays, pane| {
+            overlays.set_fetching(&id, in_flight, pane);
+        });
+    }
+
+    /// When one layer's auto-refresh is next due, on the same terms as
     /// [`Self::auto_poll_delay`].
     pub(super) fn overlay_poll_delay(&self, kind: &LayerId) -> Option<std::time::Duration> {
-        if !self.any_pane_has_overlay_enabled(kind) {
+        if !self.some_pane_could_use(kind) {
             return None;
         }
         self.overlays.auto_fetch_delay(kind)
+    }
+
+    /// **Whether some pane on screen could use this layer's next round.**
+    ///
+    /// For every layer but one that is "the layer is on in some pane". The
+    /// radar layer is the exception, and the predicate is not
+    /// interchangeable: a pane scrubbed to an archive time still has radar
+    /// **enabled**, so the enabled test would have it poll for live data
+    /// nothing on screen is asking for. What it asks instead is whether any
+    /// pane is viewing live.
+    ///
+    /// That question is **presentation state** — it is about panes, and the
+    /// handler contract has never carried pane posture ([`PaneRef`] reaches
+    /// `auto_fetch_delay` nowhere; it takes no pane at all). So the term stays
+    /// here rather than moving into radar's own answer, by orchestrator ruling
+    /// (26). Whether every polling layer should be suppressed while all panes
+    /// are scrubbed is a real question and a different one: the eleven overlay
+    /// layers poll regardless of scrub posture today, and changing that is a
+    /// behaviour change no order has asked for.
+    fn some_pane_could_use(&self, kind: &LayerId) -> bool {
+        if *kind == crate::radar_layer::POLL_LAYER {
+            return self.is_any_pane_live();
+        }
+        self.any_pane_has_overlay_enabled(kind)
     }
 }

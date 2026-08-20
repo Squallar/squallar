@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::archive::Identifier;
 use chrono::NaiveDateTime;
 use rustdar_source::controls::{ControlEffect, ControlItem, ControlUpdate, ControlValue};
+use rustdar_source::fetch_policy::FetchRetry;
 use rustdar_source::handler::{
     FetchConfig, FetchPayload, FetchTask, FrameListingResult, OverlayItem, RenderMode,
     SourceHandler, Surface,
@@ -20,6 +21,19 @@ use rustdar_source::time::{FrameListing, FrameStamp};
 pub fn sources() -> Vec<Box<dyn SourceHandler>> {
     vec![Box::new(RadarSource::new())]
 }
+
+/// How often a live pane asks the archive whether a newer volume exists. The
+/// WSR-88D publishes a completed volume every few minutes; a minute is the
+/// coarsest check that never leaves one sitting unnoticed for a whole scan.
+const ARCHIVE_POLL_SECS: u64 = 60;
+
+/// The control id the archive poll's switch is written and read through — one
+/// field, two surfaces (the ☰ menu and the settings row), no copy to drift.
+pub const AUTO_POLL_CONTROL: &str = "auto_poll";
+
+/// The one spelling of that switch's label, so the menu leaf, the settings row
+/// and the inspector row cannot disagree about what it is called.
+pub const AUTO_POLL_LABEL: &str = "Auto-poll";
 
 /// **What one archive listing said, filed under the site it was listed for.**
 ///
@@ -85,6 +99,21 @@ pub struct RadarSource {
     /// [`SourceHandler::retain_frames`], which this layer does not yet
     /// answer.
     covered: HashMap<String, Vec<(NaiveDateTime, NaiveDateTime)>>,
+    /// **Whether the archive poll runs at all** — the ☰ menu's "Auto-poll" and
+    /// the settings row are two surfaces over this one field, so neither can
+    /// drift from the other. Off means this layer declares no poll interval,
+    /// which is what makes [`SourceHandler::auto_fetch_delay`] answer `None`.
+    auto_poll_enabled: bool,
+    /// **When a round was last asked for**, which is what this layer's poll
+    /// clock counts from — see [`SourceHandler::set_fetching`] for why the ask
+    /// and not the answer.
+    last_round: Option<web_time::Instant>,
+    /// Whether a *tracked* round is in flight. The 60 s check is not one: see
+    /// [`SourceHandler::set_fetching`].
+    fetching: bool,
+    /// The failure ladder every auto-polling layer carries, so a failed round
+    /// is not retried on the next frame.
+    retry: FetchRetry,
 }
 
 impl RadarSource {
@@ -93,6 +122,10 @@ impl RadarSource {
             enabled: true,
             listings: HashMap::new(),
             covered: HashMap::new(),
+            auto_poll_enabled: true,
+            last_round: None,
+            fetching: false,
+            retry: FetchRetry::new(),
         }
     }
 
@@ -318,30 +351,84 @@ impl SourceHandler for RadarSource {
         true
     }
     fn is_fetching(&self) -> bool {
-        false
+        self.fetching
     }
-    fn set_fetching(&mut self, _fetching: bool, _pane: &PaneRef<'_>) {}
+    /// **The rising edge stamps this layer's poll clock**, and that is the
+    /// whole reason this is not the default no-op.
+    ///
+    /// Every other layer's clock stamps on the *answer*, because every other
+    /// layer's round always produces one. Radar's 60 s check does not: the
+    /// archive is asked whether anything is newer than what the pane already
+    /// has, and a check that finds nothing sends nothing back. A clock that
+    /// waited for a delivery would therefore still read "never fetched" on the
+    /// next frame, and the layer would be due again immediately — the
+    /// per-frame poll storm [`SourceHandler::auto_fetch_delay`] exists to
+    /// stop. So the clock counts from the **ask**, which is exactly what the
+    /// state this replaced recorded.
+    fn set_fetching(&mut self, fetching: bool, _pane: &PaneRef<'_>) {
+        if fetching {
+            self.last_round = Some(web_time::Instant::now());
+        }
+        self.fetching = fetching;
+    }
     fn fetch_time(&self) -> Option<web_time::Instant> {
-        None
+        self.last_round
+    }
+
+    /// `None` when the user has switched the poll off, which is how the
+    /// trait's own [`SourceHandler::auto_fetch_delay`] comes to answer `None`
+    /// without a second copy of the two-term policy living here.
+    fn auto_poll_interval(&self) -> Option<u64> {
+        self.auto_poll_enabled.then_some(ARCHIVE_POLL_SECS)
+    }
+
+    fn retry(&self) -> Option<&FetchRetry> {
+        Some(&self.retry)
+    }
+
+    fn retry_mut(&mut self) -> Option<&mut FetchRetry> {
+        Some(&mut self.retry)
+    }
+
+    fn rewind_fetch_time(&mut self, by: std::time::Duration) {
+        if let Some(at) = self.last_round {
+            self.last_round = Some(at - by);
+        }
     }
 
     fn apply_fetch_result(&mut self, _result: FetchPayload, _pane: &PaneRef<'_>) {}
     fn retain_selections(&self, _selections: &mut Vec<Arc<dyn OverlayItem>>, _pane: &PaneRef<'_>) {}
 
     fn controls(&self, pane: &PaneRef<'_>) -> Vec<ControlItem> {
-        vec![ControlItem::Toggle {
-            id: "enabled",
-            label: "Radar".to_string(),
-            enabled: self.is_enabled(pane),
-        }]
+        vec![
+            ControlItem::Toggle {
+                id: "enabled",
+                label: "Radar".to_string(),
+                enabled: self.is_enabled(pane),
+            },
+            ControlItem::Toggle {
+                id: AUTO_POLL_CONTROL,
+                label: AUTO_POLL_LABEL.to_string(),
+                enabled: self.auto_poll_enabled,
+            },
+        ]
     }
 
     fn apply_control(&mut self, update: &ControlUpdate, pane: &mut PaneMut<'_>) -> ControlEffect {
-        if update.id == "enabled"
-            && let ControlValue::Bool(val) = update.value
-            && !PaneToggle::set(pane, val)
-        {
-            self.enabled = val;
+        match update.id {
+            "enabled" => {
+                if let ControlValue::Bool(val) = update.value
+                    && !PaneToggle::set(pane, val)
+                {
+                    self.enabled = val;
+                }
+            }
+            AUTO_POLL_CONTROL => {
+                if let ControlValue::Bool(val) = update.value {
+                    self.auto_poll_enabled = val;
+                }
+            }
+            _ => {}
         }
         ControlEffect::None
     }

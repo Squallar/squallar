@@ -404,7 +404,16 @@ impl super::Gui {
                 section_break(ui);
                 ui.heading("Data & live");
                 ui.add_space(SETTINGS_SMALL_SPACING);
-                ui.checkbox(&mut self.auto_poll.enabled, "Auto-poll");
+                // Through the layer's own control, not a field beside it: this
+                // row and the ☰ menu's leaf are two surfaces over one switch,
+                // and a copy here is the drift the no-copy rule forbids.
+                let mut enabled = crate::radar_layer::auto_poll_enabled(&self.overlays);
+                if ui
+                    .checkbox(&mut enabled, rustdar_radar::source::AUTO_POLL_LABEL)
+                    .changed()
+                {
+                    self.set_auto_poll_enabled(enabled);
+                }
                 true
             }
             "data.live_chunks" => {

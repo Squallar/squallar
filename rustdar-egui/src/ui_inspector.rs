@@ -305,7 +305,7 @@ impl super::Gui {
             if ui.button("Pane properties...").clicked() {
                 self.select_pane_props();
             }
-            return;
+            ui.add_space(6.0);
         }
 
         self.render_overlay_controls_one(ui, pane, kind, actions);

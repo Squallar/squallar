@@ -100,14 +100,27 @@ impl Gui {
     /// Check timers and emit fetch actions for auto-polling radar scans, NWS
     /// alerts, and SPC discussions.
     pub(super) fn check_auto_polls(&mut self, actions: &mut Vec<GuiAction>) {
-        if !self.auto_poll.initial_fetch_done && !self.radar.fetching {
-            self.radar.fetching = true;
-            self.auto_poll.initial_fetch_done = true;
-            self.auto_poll.record_fetch();
-            actions.push(GuiAction::FetchRadarScan(self.active_pane_fetch_config()));
-        }
+        // The radar layer answers the same question every other polling layer
+        // answers — "may an automatic round start now?" — through the one gate
+        // `auto_fetch_delay` is: the poll clock and the failure ladder, taken
+        // together, in the layer's own answer rather than in a timer struct
+        // beside it.
+        let radar_due =
+            crate::radar_layer::archive_poll_delay(&self.overlays).is_some_and(|d| d.is_zero());
+        // **The session's first fetch is NOT gated on the poll being on.** It
+        // never was: switching auto-poll off has always meant "stop checking
+        // for newer volumes", never "show nothing at all this session". Folding
+        // this arm into `auto_fetch_delay` — which answers `None` for a layer
+        // that declares no interval — would quietly make it the second thing.
+        let never_asked = !crate::radar_layer::archive_poll_started(&self.overlays);
 
-        if self.is_any_pane_live() && self.auto_poll.should_poll() && !self.radar.fetching {
+        if never_asked && !self.radar.fetching {
+            self.radar.fetching = true;
+            // The tracked round: the shell drains its answer, so the flag
+            // comes back down on delivery or on error.
+            self.set_radar_round_in_flight(true);
+            actions.push(GuiAction::FetchRadarScan(self.active_pane_fetch_config()));
+        } else if radar_due && self.is_any_pane_live() && !self.radar.fetching {
             let now = chrono::Local::now().naive_local();
             let current_scan_time = now
                 .with_second(0)
@@ -126,7 +139,16 @@ impl Gui {
                 }
             }
 
-            self.auto_poll.record_fetch();
+            // **The clock is stamped by the ask, and the round ends in the
+            // same breath.** This check is answered only when there IS
+            // something newer (`fetch_latest_if_newer`), so nothing would ever
+            // bring an in-flight flag back down — and a clock that waited for
+            // a delivery would leave the layer due again on the very next
+            // frame. The rising edge is what stamps it; the falling edge is
+            // the round ending, which for an unanswered check is the same
+            // instant.
+            self.set_radar_round_in_flight(true);
+            self.set_radar_round_in_flight(false);
         }
 
         let poll_ids: Vec<rustdar_source::id::LayerId> =

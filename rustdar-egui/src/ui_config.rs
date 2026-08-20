@@ -906,7 +906,7 @@ impl super::Gui {
             active_pane: self.active_pane,
             viewport_sync: true,
             sync_layers: true,
-            auto_poll: self.auto_poll.enabled,
+            auto_poll: crate::radar_layer::auto_poll_enabled(&self.overlays),
             live_chunks: self.live_chunks,
             chunk_notifications: self.chunk_notifications,
             notifier_endpoint: self.notifier_endpoint.clone(),
@@ -1044,7 +1044,7 @@ impl super::Gui {
             0
         };
 
-        self.auto_poll.enabled = config.auto_poll;
+        self.set_auto_poll_enabled(config.auto_poll);
         self.live_chunks = config.live_chunks;
         self.chunk_notifications = config.chunk_notifications;
         self.notifier_endpoint = config.notifier_endpoint;

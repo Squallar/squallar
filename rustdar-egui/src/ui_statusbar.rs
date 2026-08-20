@@ -122,7 +122,7 @@ impl super::Gui {
                         let drawn = render_auto_poll_status(
                             ui,
                             self.radar.fetching,
-                            &self.auto_poll,
+                            ArchivePoll::of(&self.overlays),
                             &self.chunk_status,
                         );
                         self.status_bar_tick = drawn.as_ref().and_then(|&(_, _, tick)| tick);
@@ -214,12 +214,82 @@ fn age_tick(secs: u64) -> std::time::Duration {
     }
 }
 
+/// One second, for [`countdown_tick`]'s remainder.
+const NANOS_PER_SEC: u32 = 1_000_000_000;
+
+/// How long until a countdown printing whole seconds of `remaining` prints a
+/// different number, or `None` when the number on screen has stopped moving.
+///
+/// The remainder is load-bearing and is why this is not simply one second:
+/// anything faster redraws the same string, anything slower drops a number.
+/// Strictly positive by construction — a zero-length sleep re-armed every
+/// iteration is the spin this path exists to avoid.
+///
+/// `remaining.subsec_nanos()` is the same quantity the elapsed-side spelling
+/// computed as `NANOS_PER_SEC - elapsed.subsec_nanos()`: the interval is whole
+/// seconds, so the two differ only where the clock lands exactly on a second,
+/// which is the case the zero arm carries.
+fn countdown_tick(remaining: std::time::Duration) -> Option<std::time::Duration> {
+    if remaining.is_zero() {
+        return None;
+    }
+    let remainder = remaining.subsec_nanos();
+    Some(std::time::Duration::from_nanos(u64::from(
+        if remainder == 0 {
+            NANOS_PER_SEC
+        } else {
+            remainder
+        },
+    )))
+}
+
+/// What the archive poll is doing, as the status bar needs to read it — the
+/// three questions the chip asks the radar layer, taken once.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ArchivePoll {
+    /// The switch. Off means the chip says so and no countdown runs.
+    enabled: bool,
+    /// How long until the next round may start; `None` when no round has ever
+    /// been asked for, so there is no timer to print.
+    remaining: Option<std::time::Duration>,
+}
+
+impl ArchivePoll {
+    pub(super) fn of(overlays: &rustdar_overlays::render::overlay_state::OverlayRegistry) -> Self {
+        Self {
+            enabled: crate::radar_layer::auto_poll_enabled(overlays),
+            remaining: crate::radar_layer::archive_poll_started(overlays)
+                .then(|| crate::radar_layer::archive_poll_delay(overlays))
+                .flatten(),
+        }
+    }
+
+    /// The number the chip prints, rounded **up** to the second: a countdown
+    /// showing `0` while a whole fraction of a second is still to run has
+    /// dropped a number, and the elapsed-side spelling this replaced counted
+    /// the same way.
+    pub(super) fn secs(self) -> Option<u64> {
+        let remaining = self.remaining?;
+        Some(remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0))
+    }
+
+    /// How long until [`Self::secs`] would print a different number, or `None`
+    /// when there is no number on screen to move: the poll is off, no round
+    /// has been asked for yet, or the count has bottomed out.
+    pub(super) fn countdown_tick(self) -> Option<std::time::Duration> {
+        if !self.enabled {
+            return None;
+        }
+        countdown_tick(self.remaining?)
+    }
+}
+
 /// The auto-poll chip: what the polling machinery is doing, in one glanceable
 /// state.
 fn render_auto_poll_status(
     ui: &mut egui::Ui,
     fetching: bool,
-    auto_poll: &super::AutoPollState,
+    auto_poll: ArchivePoll,
     chunks: &rustdar_radar::chunk_feed::ChunkFeedStatus,
 ) -> Option<(egui::Rect, String, Option<std::time::Duration>)> {
     if fetching {
@@ -229,11 +299,10 @@ fn render_auto_poll_status(
         return None;
     }
 
-    let (archive, archive_tick) = match auto_poll.time_until_next() {
-        Some(remaining) if auto_poll.enabled => (
-            format!("archive {remaining}s"),
-            auto_poll.countdown_tick_delay(),
-        ),
+    let (archive, archive_tick) = match auto_poll.secs() {
+        Some(remaining) if auto_poll.enabled => {
+            (format!("archive {remaining}s"), auto_poll.countdown_tick())
+        }
         _ => ("archive off".to_owned(), None),
     };
     let mut tick = archive_tick;

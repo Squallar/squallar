@@ -8,8 +8,10 @@
 //! [`LoopGeometry`] — so the generic layer vocabulary next door never grows a
 //! radar field.
 
+use rustdar_overlays::render::overlay_state::OverlayRegistry;
 use rustdar_radar::loop_geometry::LoopGeometry;
 use rustdar_radar::sites::RadarSite;
+use rustdar_source::id::{LayerId, known};
 
 use crate::pane::LayerTimeState;
 
@@ -41,4 +43,46 @@ pub fn begin_loop(
     view: rustdar_radar::types::RenderView,
 ) -> LayerTimeState {
     LayerTimeState::begin(span_secs, view, Box::new(LoopGeometry::of(site)))
+}
+
+// ── The archive poll (WO-E8a) ────────────────────────────────────────────
+//
+// The radar layer polls the archive on the same terms as every other
+// auto-polling layer, through `SourceHandler::auto_fetch_delay`. What stays
+// here is the *reading* of that answer: the presentation asks these three
+// questions and never names a radar field to do it.
+
+/// The layer whose poll the status bar's chip, the ☰ menu's leaf and the
+/// settings row are all about.
+pub const POLL_LAYER: LayerId = known::RADAR;
+
+/// Whether the archive poll is switched on. A layer that declares no interval
+/// is a layer that will not poll, and radar declares none exactly when the
+/// user has turned this off — so this is the switch, read through the
+/// contract rather than copied beside it.
+pub fn auto_poll_enabled(overlays: &OverlayRegistry) -> bool {
+    overlays.auto_poll_interval(&POLL_LAYER).is_some()
+}
+
+/// Whether a round has ever been asked for — what tells "counting down"
+/// from "no timer running yet", which is the difference between the chip
+/// printing a number and printing `archive off`.
+pub fn archive_poll_started(overlays: &OverlayRegistry) -> bool {
+    overlays.fetch_time(&POLL_LAYER).is_some()
+}
+
+/// How long until the archive poll's next round may start, or `None` while
+/// the poll is off or a tracked round is already in flight.
+pub fn archive_poll_delay(overlays: &OverlayRegistry) -> Option<std::time::Duration> {
+    overlays.auto_fetch_delay(&POLL_LAYER)
+}
+
+/// Switch the archive poll on or off, through the layer's own control surface
+/// — the one write both the ☰ menu leaf and the settings row make, so the two
+/// cannot drift.
+pub fn auto_poll_update(on: bool) -> rustdar_source::controls::ControlUpdate {
+    rustdar_source::controls::ControlUpdate {
+        id: rustdar_radar::source::AUTO_POLL_CONTROL,
+        value: rustdar_source::controls::ControlValue::Bool(on),
+    }
 }
