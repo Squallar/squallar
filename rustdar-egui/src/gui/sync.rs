@@ -45,9 +45,7 @@ impl Gui {
         let active_scan_info = src.scan_info.clone();
         let active_viewing_live = src.viewing_live;
         let active_time_step_secs = src.time_step_secs;
-        let active_draw_order = src.draw_order.clone();
-        let active_enabled_overlays = src.enabled_overlays.clone();
-        let active_overlay_configs = src.overlay_configs.clone();
+        let active_layers = src.layers.clone();
         let active_selected_product = src.selected_product();
         let active_selected_elevation = src.selected_elevation();
 
@@ -65,9 +63,7 @@ impl Gui {
                 p.viewing_live = active_viewing_live;
                 p.time_step_secs = active_time_step_secs;
             }
-            p.draw_order = active_draw_order.clone();
-            p.enabled_overlays = active_enabled_overlays.clone();
-            p.overlay_configs = active_overlay_configs.clone();
+            p.adopt_layers(&active_layers);
             p.set_selected_product(active_selected_product);
             p.set_selected_elevation(active_selected_elevation);
             // This is the second way a pane's enabled map changes, and it is the

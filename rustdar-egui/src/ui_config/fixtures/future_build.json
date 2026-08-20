@@ -2,23 +2,32 @@
   "config_version": 99,
   "pane_count": 1,
   "active_pane": 0,
-  "site": "KTLX",
+  "site": "KGRR",
   "loop_lookback_secs": 3600,
   "hologram_mode": { "depth": 3 },
   "panes": [
     {
-      "selected_product": "FutureProduct",
-      "selected_elevation": 0.5,
-      "site": "KTLX",
       "particle_engine": "on",
-      "draw_order": ["Radar", "FutureSatellite", "NwsAlerts"],
-      "enabled_overlays": {
-        "Radar": true,
-        "FutureSatellite": true
-      },
-      "overlay_configs": {
-        "FutureSatellite": { "band": "infrared" }
-      }
+      "layer_slots": [
+        {
+          "id": "Radar",
+          "enabled": true,
+          "config": {
+            "site": "KTLX",
+            "product": "FutureProduct",
+            "elevation": 0.5,
+            "live_chunks": true,
+            "beam_hologram": true
+          }
+        },
+        {
+          "id": "FutureSatellite",
+          "enabled": true,
+          "config": { "band": "infrared" }
+        },
+        { "id": "NwsAlerts", "enabled": false },
+        "a slot shape this build cannot read"
+      ]
     }
   ],
   "overlay_states": {

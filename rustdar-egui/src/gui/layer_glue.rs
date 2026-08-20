@@ -18,8 +18,8 @@ impl Gui {
             self.probes.control_render_passes += 1;
         }
 
-        if !pane.overlay_configs.is_empty() {
-            self.overlays.load_pane_configs(&pane.overlay_configs);
+        if pane.has_slot_configs() {
+            self.overlays.load_pane_configs(&pane.slot_config_map());
         }
 
         let ctx = self.active_pane_control_context();
@@ -81,16 +81,41 @@ impl Gui {
         }
     }
 
-    /// Initialize per-pane `enabled_overlays` from the current handler states.
+    /// **Give every pane a slot for every registered layer.** A saved stack
+    /// names only the layers the writing build had, so the ones this build
+    /// serves and the file never mentioned join here — each at the position
+    /// its `draw_order_weight` puts it in, which is the reconcile the flat
+    /// `draw_order` used to get on its own.
+    ///
+    /// The joined slot takes the handler's current enabled state and, when
+    /// the pane carries no handler configs at all, the handler's current
+    /// config too — the same two answers the parallel maps were seeded with.
     pub fn initialize_pane_enabled(&mut self) {
-        let defaults = self.overlays.build_enabled_map();
+        let mut wanted: Vec<(LayerId, u32, bool)> = self
+            .overlays
+            .handlers()
+            .map(|h| (h.id(), h.draw_order_weight(), h.is_enabled()))
+            .collect();
+        // Weight order, so each insertion lands among slots that are already
+        // in it — the same walk `reconcile_draw_order` made.
+        wanted.sort_by_key(|&(_, weight, _)| weight);
+        let weights: std::collections::HashMap<LayerId, u32> = wanted
+            .iter()
+            .map(|(id, weight, _)| (id.clone(), *weight))
+            .collect();
         let default_configs = self.overlays.save_pane_configs();
         for pane in &mut self.panes {
-            for (kind, &enabled) in &defaults {
-                pane.enabled_overlays.entry(kind.clone()).or_insert(enabled);
+            pane.insert_missing_slots(&wanted, &|id| weights.get(id).copied());
+            if pane.has_slot_configs() {
+                continue;
             }
-            if pane.overlay_configs.is_empty() {
-                pane.overlay_configs = default_configs.clone();
+            for slot in &mut pane.layers {
+                if slot.id == rustdar_source::id::known::RADAR {
+                    continue;
+                }
+                if let Some(config) = default_configs.get(&slot.id) {
+                    slot.config = config.clone();
+                }
             }
         }
     }
@@ -100,7 +125,7 @@ impl Gui {
     /// frame it runs, so a write to `enabled_overlays` alone is undone.
     #[cfg(test)]
     pub(crate) fn set_overlay_on_pane_for_test(&mut self, idx: usize, kind: &LayerId, on: bool) {
-        let configs = self.panes[idx].overlay_configs.clone();
+        let configs = self.panes[idx].slot_config_map();
         if !configs.is_empty() {
             self.overlays.load_pane_configs(&configs);
         }

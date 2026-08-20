@@ -18,8 +18,7 @@ fn gui_with_only_discussions() -> Gui {
         let on = kind == KIND;
         gui.pane_mut(0)
             .expect("a fresh Gui has one pane")
-            .enabled_overlays
-            .insert(kind, on);
+            .set_overlay_enabled(kind, on);
     }
     gui
 }

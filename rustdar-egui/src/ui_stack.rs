@@ -356,7 +356,7 @@ impl super::Gui {
         }
 
         // Top row = drawn last: display row `i` is `draw_order[len - 1 - i]`.
-        let order: Vec<LayerId> = pane.draw_order.iter().rev().cloned().collect();
+        let order: Vec<LayerId> = pane.draw_order().rev().cloned().collect();
         let mut row_rects: Vec<egui::Rect> = Vec::with_capacity(order.len());
         let mut drag_released = false;
 
@@ -655,7 +655,8 @@ impl super::Gui {
             display.remove(from);
             let insert_at = if slot > from { slot - 1 } else { slot }.min(display.len());
             display.insert(insert_at, dragged);
-            pane.draw_order = display.into_iter().rev().collect();
+            let reordered: Vec<LayerId> = display.into_iter().rev().collect();
+            pane.set_draw_order(&reordered);
             return;
         }
 

@@ -608,7 +608,7 @@ impl super::App {
         let pane_configs = self
             .gui
             .pane(pane_idx)
-            .map(|p| p.overlay_configs.clone())
+            .map(rustdar_egui::pane::PaneState::slot_config_map)
             .unwrap_or_default();
         if !pane_configs.is_empty() {
             self.gui.overlays.load_pane_configs(&pane_configs);
@@ -775,7 +775,7 @@ impl super::App {
                 self.clear_overlay_render_marks(&pane_indices, &id);
                 return;
             };
-            target_pane.overlay_configs.clone()
+            target_pane.slot_config_map()
         };
         if !pane_configs.is_empty() {
             self.gui.overlays.load_pane_configs(&pane_configs);

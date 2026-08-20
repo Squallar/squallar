@@ -321,16 +321,61 @@ pub struct LoopPlaybackState {
 /// between load and save so the file survives a session under this build.
 #[derive(Clone, Debug, Default)]
 pub struct PaneConfigBaggage {
-    /// `draw_order` entries that are not strings at all, verbatim,
-    /// re-appended after the ids on save.
-    pub draw_order: Vec<serde_json::Value>,
+    /// `layer_slots` entries that are not slot objects at all, verbatim,
+    /// re-appended after the slots on save.
+    pub layer_slots: Vec<serde_json::Value>,
     /// Whole pane-level fields this build does not know.
     pub fields: serde_json::Map<String, serde_json::Value>,
 }
 
+/// **One layer, in one pane: its identity, whether it draws, and its saved
+/// configuration — the three facts that used to live in three parallel
+/// containers.**
+///
+/// A pane's slots are an ordered list and **the vector's order IS the draw
+/// order**, bottom to top. That is the whole reason the three collections
+/// merged: `draw_order`, `enabled_overlays` and `overlay_configs` were keyed
+/// on the same [`LayerId`] and had to be kept in step by hand, and a
+/// transform that dropped an id from one of them left the other two saying
+/// something the user could not see.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerSlot {
+    /// Which layer this slot is. Open — an id no handler in this build serves
+    /// is a layer a newer build has, and it keeps its slot and its position.
+    pub id: LayerId,
+    /// Whether this pane draws the layer.
+    pub enabled: bool,
+    /// The layer's saved configuration, as JSON. `null` means "nothing saved"
+    /// — a handler with a `null` slot keeps whatever state it already has,
+    /// which is exactly what an absent map entry meant before.
+    pub config: serde_json::Value,
+}
+
+impl LayerSlot {
+    /// A slot for `id` with nothing configured.
+    pub fn new(id: LayerId, enabled: bool) -> Self {
+        Self {
+            id,
+            enabled,
+            config: serde_json::Value::Null,
+        }
+    }
+}
+
+/// **The radar slot's config is the pane's, not a handler's.** It carries
+/// this pane's own selection — site, product, elevation — and the live-chunk
+/// switch that used to be one global, none of which any handler produces.
+/// [`PaneState::adopt_handler_state`] and [`PaneState::slot_config_map`] both
+/// hold these four back from the radar handler for that reason, and
+/// `the_radar_handler_and_the_pane_do_not_claim_the_same_slot_members` is
+/// what says the two owners never collide.
+pub const RADAR_SLOT_PANE_KEYS: [&str; 4] = ["site", "product", "elevation", "live_chunks"];
+
 /// Per-pane state: each pane independently selects a radar product,
 /// elevation, layer toggles, and maintains its own map viewport.
 pub struct PaneState {
+    /// This pane's radar site. Persisted as a member of the radar slot's
+    /// config, decoded on load and re-emitted on save.
     pub site: String,
     pub scan_info: Option<ScanInfo>,
     /// When the data behind this pane's current radar image was collected (UTC).
@@ -358,17 +403,11 @@ pub struct PaneState {
     /// [`LayerId`]. Only texture overlay kinds (SPC, NWS, discussions) have
     /// cache entries; entries are created lazily.
     pub overlay_textures: HashMap<LayerId, OverlayTextureCache>,
-    /// Per-pane draw order (bottom to top). Controls the visual stacking of all
-    /// map layers. Persisted across sessions.
-    pub draw_order: Vec<LayerId>,
-    /// Per-pane overlay enabled state (master visibility for each overlay kind).
-    /// Propagated from a layer-linked active pane to the other layer-linked
-    /// panes by `propagate_layer_sync`.
-    pub enabled_overlays: HashMap<LayerId, bool>,
-    /// Per-pane overlay handler config snapshots (serialized handler state per kind).
-    /// Swapped into/out of the global OverlayRegistry around access points so each
-    /// pane can independently configure overlay sub-controls (categories, day, etc.).
-    pub overlay_configs: HashMap<LayerId, serde_json::Value>,
+    /// **This pane's layer stack: one [`LayerSlot`] per layer, bottom to top.**
+    /// The vector's order is the draw order; each slot carries its own enabled
+    /// flag and its own saved config. Replaces the three parallel containers
+    /// `draw_order` / `enabled_overlays` / `overlay_configs` (WO-E6b).
+    pub layers: Vec<LayerSlot>,
     /// Config-file content addressed to a build that is not this one — see
     /// [`PaneConfigBaggage`]. Written by `load_ui_config`, read only by
     /// `ui_config_json`, and never acted on in between.
@@ -864,9 +903,13 @@ impl PaneState {
             // Lazily filled by `overlay_cache_mut`; an absent entry answers
             // every read exactly as a fresh empty cache did.
             overlay_textures: HashMap::new(),
-            draw_order: crate::sources::default_draw_order(),
-            enabled_overlays: HashMap::new(),
-            overlay_configs: HashMap::new(),
+            // **Empty on purpose**, and it is the pane's whole layer state
+            // that starts empty rather than only its flags: a pane born here
+            // has no saved opinion about any layer, and `Gui` seeds it from
+            // the handlers through `initialize_pane_enabled` — which every
+            // site that makes a pane calls, because the flags always needed
+            // that seeding and now the order comes with them.
+            layers: Vec::new(),
             config_baggage: PaneConfigBaggage::default(),
             loop_state: LoopPlaybackState::new(),
             loading_site: None,
@@ -1151,28 +1194,219 @@ impl PaneState {
             .storm_motion
     }
 
+    /// This pane's slot for `id`, or `None` for a layer it has no slot for.
+    pub fn slot(&self, id: &LayerId) -> Option<&LayerSlot> {
+        self.layers.iter().find(|slot| slot.id == *id)
+    }
+
+    /// This pane's slot for `id`, mutably.
+    pub fn slot_mut(&mut self, id: &LayerId) -> Option<&mut LayerSlot> {
+        self.layers.iter_mut().find(|slot| slot.id == *id)
+    }
+
+    /// The draw order, bottom to top — the slot list's own order.
+    pub fn draw_order(&self) -> impl DoubleEndedIterator<Item = &LayerId> + ExactSizeIterator + '_ {
+        self.layers.iter().map(|slot| &slot.id)
+    }
+
+    /// The draw order as an owned list, for the callers that reorder it or
+    /// hold it across a borrow of the pane.
+    pub fn draw_order_vec(&self) -> Vec<LayerId> {
+        self.draw_order().cloned().collect()
+    }
+
+    /// Reorder the slot list to `order`, carrying each slot's enabled flag and
+    /// config with it. Ids in `order` this pane has no slot for join as fresh
+    /// disabled slots; slots `order` omits keep their relative order at the
+    /// end, so a partial list can never silently drop a layer.
+    pub fn set_draw_order(&mut self, order: &[LayerId]) {
+        let mut remaining = std::mem::take(&mut self.layers);
+        let mut reordered: Vec<LayerSlot> = Vec::with_capacity(remaining.len());
+        for id in order {
+            match remaining.iter().position(|slot| slot.id == *id) {
+                Some(pos) => reordered.push(remaining.remove(pos)),
+                None => reordered.push(LayerSlot::new(id.clone(), false)),
+            }
+        }
+        reordered.append(&mut remaining);
+        self.layers = reordered;
+    }
+
+    /// Give this pane a slot for every `id` it lacks one for, inserted at the
+    /// position `weight_of` puts it in among the slots that already have
+    /// weights — the reconcile a saved order gets when the build serves a
+    /// layer the file never named.
+    pub fn insert_missing_slots(
+        &mut self,
+        wanted: &[(LayerId, u32, bool)],
+        weight_of: &dyn Fn(&LayerId) -> Option<u32>,
+    ) {
+        for (id, weight, enabled) in wanted {
+            if self.layers.iter().any(|slot| slot.id == *id) {
+                continue;
+            }
+            let pos = self
+                .layers
+                .iter()
+                .position(|slot| weight_of(&slot.id).is_some_and(|w| w > *weight));
+            let slot = LayerSlot::new(id.clone(), *enabled);
+            match pos {
+                Some(pos) => self.layers.insert(pos, slot),
+                None => self.layers.push(slot),
+            }
+        }
+    }
+
     pub fn is_overlay_enabled(&self, id: &LayerId) -> bool {
-        self.enabled_overlays.get(id).copied().unwrap_or(false)
+        self.slot(id).is_some_and(|slot| slot.enabled)
     }
 
     pub fn set_overlay_enabled(&mut self, id: LayerId, enabled: bool) {
-        self.enabled_overlays.insert(id, enabled);
+        match self.slot_mut(&id) {
+            Some(slot) => slot.enabled = enabled,
+            // A layer with no slot has no place in the draw order either, so
+            // it joins at the top rather than being toggled into invisibility.
+            None => self.layers.push(LayerSlot::new(id, enabled)),
+        }
     }
 
-    /// Overwrite the **handler-owned** halves of this pane's overlay maps
-    /// with the registry's fresh serialize, KEEPING every entry whose id no
-    /// handler serves: an unknown id's saved state (a newer build's layer)
-    /// must ride through verbatim, or the next autosave makes the loss permanent.
+    /// This pane's enabled flags as a map, for the callers that compare whole
+    /// sets rather than walk the stack.
+    pub fn enabled_map(&self) -> HashMap<LayerId, bool> {
+        self.layers
+            .iter()
+            .map(|slot| (slot.id.clone(), slot.enabled))
+            .collect()
+    }
+
+    /// The configs the registry swap is fed, keyed by id. **Slots with a
+    /// `null` config are omitted**: `load_pane_configs` leaves a handler it
+    /// finds no entry for exactly as it is, which is what an absent map entry
+    /// has always meant here.
+    ///
+    /// The radar slot is handed over **without** [`RADAR_SLOT_PANE_KEYS`] —
+    /// those members are the pane's, and the radar handler owns the rest of
+    /// its own slot exactly as every other handler owns all of its.
+    pub fn slot_config_map(&self) -> HashMap<LayerId, serde_json::Value> {
+        self.layers
+            .iter()
+            .filter(|slot| !slot.config.is_null())
+            .filter_map(|slot| {
+                if slot.id != known::RADAR {
+                    return Some((slot.id.clone(), slot.config.clone()));
+                }
+                let mut handler_half = slot.config.as_object()?.clone();
+                handler_half.retain(|key, _| !RADAR_SLOT_PANE_KEYS.contains(&key.as_str()));
+                (!handler_half.is_empty())
+                    .then(|| (slot.id.clone(), serde_json::Value::Object(handler_half)))
+            })
+            .collect()
+    }
+
+    /// Whether any **handler's** slot carries a saved config — the question
+    /// `overlay_configs.is_empty()` used to ask, and the radar slot never
+    /// counted towards it because it did not exist.
+    pub fn has_slot_configs(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|slot| !slot.config.is_null() && slot.id != known::RADAR)
+    }
+
+    /// Take a whole layer stack — order, flags and configs together. The one
+    /// operation layer-link sync needs, and the reason it cannot lose a half:
+    /// there are no longer three halves to keep in step.
+    pub fn adopt_layers(&mut self, layers: &[LayerSlot]) {
+        self.layers = layers.to_vec();
+    }
+
+    /// Overwrite the **handler-owned** part of this pane's slots with the
+    /// registry's fresh serialize, KEEPING every slot whose id no handler
+    /// serves: an unknown id's saved state (a newer build's layer) must ride
+    /// through verbatim, or the next autosave makes the loss permanent.
+    ///
+    /// The radar slot's config has two owners: the handler's members are
+    /// adopted like any other slot's, and [`RADAR_SLOT_PANE_KEYS`] — this
+    /// pane's site, product, tilt and live-chunk switch — are left alone. A
+    /// plain overwrite would erase the pane's whole selection on the next
+    /// layer toggle.
     pub fn adopt_handler_state(
         &mut self,
         registry: &rustdar_overlays::render::overlay_state::OverlayRegistry,
     ) {
-        self.overlay_configs
-            .retain(|id, _| registry.handler_by_id(id).is_none());
-        self.overlay_configs.extend(registry.save_pane_configs());
-        self.enabled_overlays
-            .retain(|id, _| registry.handler_by_id(id).is_none());
-        self.enabled_overlays.extend(registry.save_enabled_map());
+        let configs = registry.save_pane_configs();
+        let enabled = registry.save_enabled_map();
+        for slot in &mut self.layers {
+            if registry.handler_by_id(&slot.id).is_none() {
+                continue;
+            }
+            if let Some(&on) = enabled.get(&slot.id) {
+                slot.enabled = on;
+            }
+            let Some(fresh) = configs.get(&slot.id) else {
+                continue;
+            };
+            if slot.id != known::RADAR {
+                slot.config = fresh.clone();
+                continue;
+            }
+            // The radar slot has two owners. The handler's members land
+            // beside the pane's, never over them.
+            let mut merged = match slot.config.take() {
+                serde_json::Value::Object(map) => map,
+                _ => serde_json::Map::new(),
+            };
+            if let serde_json::Value::Object(fresh) = fresh {
+                for (key, value) in fresh {
+                    if RADAR_SLOT_PANE_KEYS.contains(&key.as_str()) {
+                        continue;
+                    }
+                    merged.insert(key.clone(), value.clone());
+                }
+            }
+            slot.config = serde_json::Value::Object(merged);
+        }
+        // A registered handler this pane has no slot for at all: it joins the
+        // stack, exactly as the old `extend` gave it a map entry.
+        let missing: Vec<(LayerId, u32, bool)> = registry
+            .handlers()
+            .filter(|h| !self.layers.iter().any(|slot| slot.id == h.id()))
+            .map(|h| (h.id(), h.draw_order_weight(), h.is_enabled()))
+            .collect();
+        if !missing.is_empty() {
+            let weights: HashMap<LayerId, u32> = registry
+                .handlers()
+                .map(|h| (h.id(), h.draw_order_weight()))
+                .collect();
+            self.insert_missing_slots(&missing, &|id| weights.get(id).copied());
+            for (id, _, _) in &missing {
+                if let (Some(slot), Some(fresh)) = (self.slot_mut(id), configs.get(id)) {
+                    slot.config = fresh.clone();
+                }
+            }
+        }
+    }
+
+    /// The live-chunk switch this pane's radar slot carries, or `None` for a
+    /// slot that has never been given one (a fresh pane, or a file written
+    /// before the switch fanned out).
+    pub fn radar_live_chunks(&self) -> Option<bool> {
+        self.slot(&known::RADAR)?
+            .config
+            .get("live_chunks")?
+            .as_bool()
+    }
+
+    /// Write the live-chunk switch into this pane's radar slot.
+    pub fn set_radar_live_chunks(&mut self, enabled: bool) {
+        let Some(slot) = self.slot_mut(&known::RADAR) else {
+            return;
+        };
+        let mut map = match slot.config.take() {
+            serde_json::Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        map.insert("live_chunks".to_string(), serde_json::Value::Bool(enabled));
+        slot.config = serde_json::Value::Object(map);
     }
 
     pub fn overlay_cache(&self, id: &LayerId) -> Option<&OverlayTextureCache> {
@@ -1183,25 +1417,25 @@ impl PaneState {
         self.overlay_textures.entry(id.clone()).or_default()
     }
 
-    /// Whether `kind`'s texture may be let go, judged against the enabled map
+    /// Whether `kind`'s texture may be let go, judged against the slot list
     /// that decides it — the single definition of that question.
-    pub fn overlay_texture_releasable(enabled: &HashMap<LayerId, bool>, id: &LayerId) -> bool {
+    pub fn overlay_texture_releasable(layers: &[LayerSlot], id: &LayerId) -> bool {
         // The same fallback [`Self::is_overlay_enabled`] applies: an id with no
-        // entry is not drawn, so its texture is releasable.
-        *id != known::RADAR && !enabled.get(id).copied().unwrap_or(false)
+        // slot is not drawn, so its texture is releasable.
+        *id != known::RADAR && !layers.iter().any(|slot| slot.id == *id && slot.enabled)
     }
 
     pub fn overlay_texture_is_releasable(&self, id: &LayerId) -> bool {
-        Self::overlay_texture_releasable(&self.enabled_overlays, id)
+        Self::overlay_texture_releasable(&self.layers, id)
     }
 
     /// Let go of the GPU texture of every overlay this pane no longer draws.
     pub fn release_disabled_overlay_textures(&mut self) {
         // Two fields of one struct, borrowed disjointly, which is the whole
-        // reason the predicate above is an associated function over the map.
-        let enabled = &self.enabled_overlays;
+        // reason the predicate above is an associated function over the list.
+        let layers = &self.layers;
         for (id, cache) in &mut self.overlay_textures {
-            if Self::overlay_texture_releasable(enabled, id) {
+            if Self::overlay_texture_releasable(layers, id) {
                 cache.clear();
             }
         }

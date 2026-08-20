@@ -1355,7 +1355,7 @@ fn silence_the_other_timers(app: &mut App) {
     for idx in 0..app.gui.remembered_pane_count() {
         let pane = app.gui.pane_mut(idx).expect("a remembered pane");
         for id in rustdar_egui::sources::default_draw_order() {
-            pane.enabled_overlays.insert(id, false);
+            pane.set_overlay_enabled(id, false);
         }
     }
     assert_eq!(

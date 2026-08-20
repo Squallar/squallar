@@ -29,6 +29,6 @@ mod ui_glyphs;
 
 pub const DEFAULT_NOTIFIER_ENDPOINT: &str = "wss://nexrad-aws-notifier.mcswain.dev";
 
-pub use ui::config::UI_CONFIG_KEY;
+pub use ui::config::{UI_CONFIG_BACKUP_KEY, UI_CONFIG_KEY, back_up_pre_slot_config};
 pub use ui::{CurrentVolumeStamp, Gui, StormMotionOverride};
 pub use ui_input::{normalize_touch_devices, normalize_wheel_units};

@@ -1,15 +1,30 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use rustdar_kv::KvStore;
 
 /// Key the UI layout is persisted under.
 pub const UI_CONFIG_KEY: &str = "ui";
 
-use rustdar_overlays::render::overlay_state::OverlayRegistry;
+/// **Where the last pre-slot config is kept, untouched, forever.**
+///
+/// WO-E6b is the one structural rewrite of this file's shape: a pane's flat
+/// radar selection and its three parallel layer containers became one ordered
+/// slot list. That rewrite is not reversible by a downgrade — an older build
+/// reading a v3 file keeps every byte it cannot name but cannot put the panes
+/// back together — so the bytes as they stood are copied here **once**,
+/// before the first v3 write, and never written again.
+///
+/// The name says the version of what it holds: v2 is the last shape the flat
+/// fields existed in. (The order that commissioned this called it
+/// `ui_config.v1.backup`, written when the shape move was expected to be the
+/// 1 → 2 rung; M2's `gps_config` split had already taken that rung, so the
+/// bytes being preserved are v2 and the key says so.)
+pub const UI_CONFIG_BACKUP_KEY: &str = "ui.v2.backup";
+
 use rustdar_overlays::spc::outlook::OutlookDay;
 use rustdar_radar::types::RadarProduct;
-use rustdar_source::id::LayerId;
+use rustdar_source::id::{LayerId, known};
 use rustdar_units::UserPreferences;
 
 use super::PaneLayout;
@@ -28,13 +43,6 @@ use rustdar_geo::GeoPoint;
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct PaneConfig {
-    /// Tolerant of product names this build does not know: a config written by
-    /// a later version must not poison the whole load (see
-    /// [`product_or_default`]). The pane falls back to Reflectivity — the same
-    /// product a fresh pane starts on — and the rest of the file survives.
-    #[serde(deserialize_with = "product_or_default")]
-    selected_product: RadarProduct,
-    selected_elevation: f32,
     /// **Legacy, read-only**: the retired per-pane layer toggles, keyed by
     /// the serde spellings of the layer-kind enum that used to type this
     /// map. The enum itself is gone; the wire format never changes shape by
@@ -45,9 +53,6 @@ struct PaneConfig {
     /// registry took over.
     layers: BTreeMap<String, bool>,
     spc_day: OutlookDay,
-    /// Radar site code for this pane (e.g. "KTLX").
-    #[serde(default = "default_site", deserialize_with = "site_or_default")]
-    site: String,
     /// Time step size in seconds (0 = single scan mode).
     #[serde(default = "default_time_step")]
     time_step_secs: i64,
@@ -60,16 +65,19 @@ struct PaneConfig {
     /// Whether this pane's layer state belongs to the linked group.
     #[serde(default = "default_true")]
     layer_link: bool,
-    /// Visual stacking order for all map layers (bottom to top).
-    #[serde(default = "KindList::default_draw_order")]
-    draw_order: KindList,
-    /// Per-pane overlay enabled state (master visibility per overlay kind).
+    /// **This pane's layer stack, bottom to top** — the v3 shape. One entry
+    /// per layer, each carrying its own id, enabled flag and saved config;
+    /// the list's order IS the draw order. Replaces v2's three parallel
+    /// `draw_order` / `enabled_overlays` / `overlay_configs` containers, and
+    /// carries the radar layer's slot, whose config holds this pane's site,
+    /// product, elevation and live-chunk switch.
+    ///
+    /// The key is `layer_slots`, not `layers`: [`Self::layers`] is the v0
+    /// toggle map and still has to be readable, so the two cannot share a
+    /// name — an older build reading a v3 file would fail its whole pane on
+    /// the type mismatch and salvage it to defaults.
     #[serde(default)]
-    enabled_overlays: BTreeMap<String, bool>,
-    /// Per-pane overlay handler config snapshots — string-keyed and
-    /// `BTreeMap`-ordered for exactly [`Self::enabled_overlays`]' reasons.
-    #[serde(default)]
-    overlay_configs: BTreeMap<String, serde_json::Value>,
+    layer_slots: SlotList,
     /// Map zoom level, as `walkers::MapMemory` reports it.
     #[serde(default)]
     zoom: Option<f64>,
@@ -106,14 +114,6 @@ pub(crate) struct KindList {
     /// The list elements that are not strings, verbatim, appended after the
     /// ids on the way back out.
     pub(crate) unknown: Vec<serde_json::Value>,
-}
-
-impl KindList {
-    /// The default draw order, wrapped — what a config with no `draw_order`
-    /// key reads as: the registry weight order.
-    fn default_draw_order() -> Self {
-        Self::from(crate::sources::default_draw_order())
-    }
 }
 
 impl From<Vec<LayerId>> for KindList {
@@ -166,6 +166,120 @@ impl<'de> Deserialize<'de> for KindList {
             );
         }
         Ok(Self { known, unknown })
+    }
+}
+
+/// **One layer's slot, as it appears on the wire** — the v3 per-pane shape.
+///
+/// `enabled` is deliberately an `Option`: a slot that states nothing is a
+/// slot whose layer has no saved opinion, and the load resolves it from the
+/// handler exactly as an absent `enabled_overlays` entry always did. Writing
+/// a `false` there instead would turn "never chosen" into "chosen off".
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+struct SlotConfig {
+    /// The layer id — an open string, registered or not.
+    id: String,
+    /// Whether this pane draws the layer, or absent for "ask the handler".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    /// The layer's saved config, absent when there is none to save.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    config: serde_json::Value,
+}
+
+/// A pane's slot list as it appears on the wire: every entry this build can
+/// read as a slot, plus, verbatim, every entry it cannot.
+///
+/// The unknown half exists for the same reason [`KindList`]'s does — a list
+/// element written by a build that is not this one rides the session out and
+/// goes back to the file untouched.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct SlotList {
+    known: Vec<SlotConfig>,
+    unknown: Vec<serde_json::Value>,
+}
+
+impl Serialize for SlotList {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.known.len() + self.unknown.len()))?;
+        for slot in &self.known {
+            seq.serialize_element(slot)?;
+        }
+        for value in &self.unknown {
+            seq.serialize_element(value)?;
+        }
+        seq.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for SlotList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = Vec::<serde_json::Value>::deserialize(deserializer)?;
+        let mut known = Vec::new();
+        let mut unknown = Vec::new();
+        for value in raw {
+            match SlotConfig::deserialize(&value) {
+                Ok(slot) => known.push(slot),
+                Err(_) => unknown.push(value),
+            }
+        }
+        if !unknown.is_empty() {
+            let values: Vec<String> = unknown.iter().map(ToString::to_string).collect();
+            log::warn!(
+                "layer_slots carries {} entr(y/ies) that are not slots ({}); \
+                 keeping them verbatim for whatever wrote them",
+                unknown.len(),
+                values.join(", "),
+            );
+        }
+        Ok(Self { known, unknown })
+    }
+}
+
+impl PaneConfig {
+    /// This pane's radar slot, the one that carries its selection.
+    fn radar_slot(&self) -> Option<&SlotConfig> {
+        self.layer_slots
+            .known
+            .iter()
+            .find(|slot| slot.id == known::RADAR.as_str())
+    }
+
+    /// One member of the radar slot's config, or `None` when there is no
+    /// radar slot, no config, or no such member.
+    fn radar_member(&self, key: &str) -> Option<&serde_json::Value> {
+        self.radar_slot()?.config.get(key)
+    }
+
+    /// This pane's radar site, read through the same tolerance the field had
+    /// when it was a field: a name no radar could be called is ignored.
+    fn site(&self) -> String {
+        self.radar_member("site")
+            .and_then(|v| site_or_default(v).ok())
+            .unwrap_or_default()
+    }
+
+    /// This pane's radar product, read through [`product_or_default`] — the
+    /// one tolerant path, unchanged by the move into the slot.
+    fn selected_product(&self) -> RadarProduct {
+        self.radar_member("product")
+            .and_then(|v| product_or_default(v).ok())
+            .unwrap_or(RadarProduct::Reflectivity)
+    }
+
+    /// This pane's elevation angle in degrees.
+    fn selected_elevation(&self) -> f32 {
+        self.radar_member("elevation")
+            .and_then(serde_json::Value::as_f64)
+            .map(|v| v as f32)
+            .unwrap_or(0.0)
     }
 }
 
@@ -316,10 +430,6 @@ impl Default for VolumeConfig {
     }
 }
 
-fn default_site() -> String {
-    String::new()
-}
-
 fn default_time_step() -> i64 {
     600
 }
@@ -331,18 +441,13 @@ fn default_true() -> bool {
 impl Default for PaneConfig {
     fn default() -> Self {
         Self {
-            selected_product: RadarProduct::Reflectivity,
-            selected_elevation: 0.0,
             layers: BTreeMap::new(),
             spc_day: OutlookDay::Day1,
-            site: String::new(),
             time_step_secs: 600,
             time_link: true,
             viewport_link: true,
             layer_link: true,
-            draw_order: KindList::default_draw_order(),
-            enabled_overlays: BTreeMap::new(),
-            overlay_configs: BTreeMap::new(),
+            layer_slots: SlotList::default(),
             zoom: None,
             center: None,
             kind: PaneKindConfig::Map,
@@ -604,10 +709,112 @@ where
     }
 }
 
+/// Copy the stored config to [`UI_CONFIG_BACKUP_KEY`] if it predates the slot
+/// shape and nothing has been copied there yet. **One-time**: the guard is
+/// the backup key's own absence, so a second call — or a second session —
+/// cannot overwrite the original with something this build has already
+/// rewritten.
+///
+/// Called from both public entry points that can precede a v3 write:
+/// [`super::Gui::load_ui_config`] and [`super::Gui::save_ui_config`]. The
+/// frame-loop autosave in `rustdar-app` is downstream of a load in every flow
+/// that has one, so the load's copy is already in place by the time it runs.
+pub fn back_up_pre_slot_config(store: &dyn KvStore) {
+    if store.load(UI_CONFIG_BACKUP_KEY).is_some() {
+        return;
+    }
+    let Some(content) = store.load(UI_CONFIG_KEY) else {
+        return;
+    };
+    let version = serde_json::from_str::<serde_json::Value>(&content)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("config_version"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| u64::from(migrate::first_version()));
+    if version >= u64::from(migrate::CONFIG_VERSION) {
+        return;
+    }
+    if let Err(e) = store.store_now(UI_CONFIG_BACKUP_KEY, &content) {
+        log::warn!("could not keep a copy of the pre-slot config: {e}");
+    }
+}
+
 /// The wire key a layer's state is filed under — the id string
 /// ([`LayerId::as_str`]). Never `format!("{:?}")`.
 fn layer_key(id: &LayerId) -> String {
     id.as_str().to_string()
+}
+
+/// **The radar slot's config on the wire**: this pane's own selection, and
+/// the live-chunk switch, written over whatever else the slot carries so an
+/// entry a newer build put there rides the session out.
+///
+/// `product` is written with the product enum's own `Serialize`, which is the
+/// spelling [`product_or_default`] reads — the round trip is the same two
+/// functions the flat field used, moved.
+fn radar_slot_config(pane: &PaneState, global_live_chunks: bool) -> serde_json::Value {
+    let mut map = match pane.slot(&known::RADAR).map(|slot| slot.config.clone()) {
+        Some(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    map.insert(
+        "site".to_string(),
+        serde_json::Value::String(pane.site().to_string()),
+    );
+    match serde_json::to_value(pane.selected_product()) {
+        Ok(product) => {
+            map.insert("product".to_string(), product);
+        }
+        Err(e) => log::error!("this pane's product cannot be written to its slot ({e})"),
+    }
+    let elevation = if pane.selected_elevation().is_finite() {
+        pane.selected_elevation()
+    } else {
+        0.0
+    };
+    map.insert(
+        "elevation".to_string(),
+        serde_json::Value::from(f64::from(elevation)),
+    );
+    map.insert(
+        "live_chunks".to_string(),
+        serde_json::Value::Bool(pane.radar_live_chunks().unwrap_or(global_live_chunks)),
+    );
+    serde_json::Value::Object(map)
+}
+
+/// A pane's whole layer stack as the file carries it, in draw order, with the
+/// radar slot's config replaced by [`radar_slot_config`].
+fn pane_slot_list(pane: &PaneState, global_live_chunks: bool) -> SlotList {
+    let mut known: Vec<SlotConfig> = pane
+        .layers
+        .iter()
+        .map(|slot| SlotConfig {
+            id: layer_key(&slot.id),
+            enabled: Some(slot.enabled),
+            config: if slot.id == known::RADAR {
+                radar_slot_config(pane, global_live_chunks)
+            } else {
+                slot.config.clone()
+            },
+        })
+        .collect();
+    if !known.iter().any(|slot| slot.id == known::RADAR.as_str()) {
+        // Can't happen: the load gives every pane a slot for every registered
+        // layer. It is written down anyway because the alternative failure is
+        // silent — a pane with no radar slot has nowhere to keep its site.
+        log::warn!("a pane reached the save with no radar slot; appending one for its selection");
+        known.push(SlotConfig {
+            id: layer_key(&known::RADAR),
+            enabled: Some(true),
+            config: radar_slot_config(pane, global_live_chunks),
+        });
+    }
+    SlotList {
+        known,
+        unknown: pane.config_baggage.layer_slots.clone(),
+    }
 }
 
 impl Default for UiConfig {
@@ -648,6 +855,7 @@ impl super::Gui {
         let Some(json) = self.ui_config_json() else {
             return;
         };
+        back_up_pre_slot_config(store);
         if let Err(e) = store.store_now(UI_CONFIG_KEY, &json) {
             log::error!("Failed to write config: {}", e);
         }
@@ -670,33 +878,13 @@ impl super::Gui {
                     render,
                     cross_section,
                     volume,
-                    selected_product: pane.selected_product(),
-                    selected_elevation: if pane.selected_elevation().is_finite() {
-                        pane.selected_elevation()
-                    } else {
-                        0.0
-                    },
                     layers: BTreeMap::new(),
                     spc_day: OutlookDay::Day1,
-                    site: pane.site().to_string(),
                     time_step_secs: pane.time_step_secs,
                     time_link: pane.time_link,
                     viewport_link: pane.viewport_link,
                     layer_link: pane.layer_link,
-                    draw_order: KindList {
-                        known: pane.draw_order.clone(),
-                        unknown: pane.config_baggage.draw_order.clone(),
-                    },
-                    enabled_overlays: pane
-                        .enabled_overlays
-                        .iter()
-                        .map(|(id, &on)| (layer_key(id), on))
-                        .collect(),
-                    overlay_configs: pane
-                        .overlay_configs
-                        .iter()
-                        .map(|(id, val)| (layer_key(id), val.clone()))
-                        .collect(),
+                    layer_slots: pane_slot_list(pane, self.live_chunks),
                     unknown: pane.config_baggage.fields.clone(),
                     zoom: pane
                         .map_memory
@@ -818,6 +1006,7 @@ impl super::Gui {
 
     /// Load UI layout configuration from `store`.
     pub fn load_ui_config(&mut self, store: &dyn KvStore) -> bool {
+        back_up_pre_slot_config(store);
         let Some(content) = store.load(UI_CONFIG_KEY) else {
             return false;
         };
@@ -843,7 +1032,7 @@ impl super::Gui {
             let site = config
                 .panes
                 .get(self.panes.len())
-                .map(|pc| pc.site.clone())
+                .map(PaneConfig::site)
                 .unwrap_or_else(|| config.site.clone());
             self.panes.push(PaneState::with_site(site));
         }
@@ -900,88 +1089,12 @@ impl super::Gui {
             self.volume_iso.set(product, entry.threshold);
         }
 
-        let mut legacy_radar_enabled: Option<bool> = None;
-        let mut zoom_restored = false;
-        for (i, pane) in self.panes.iter_mut().enumerate().take(count) {
-            let pc = config.panes.get(i);
-            let Some(pc) = pc else {
-                pane.time_step_secs = config.time_step_secs;
-                pane.viewport_link = config.viewport_sync;
-                pane.layer_link = config.sync_layers;
-                pane.time_link = config.sync_layers;
-                pane.config_baggage = crate::pane::PaneConfigBaggage::default();
-                continue;
-            };
-            pane.set_selected_product(pc.selected_product);
-            pane.set_selected_elevation(pc.selected_elevation);
-            if !pc.site.is_empty() {
-                pane.set_site(pc.site.clone());
-            } else if !config.site.is_empty() {
-                pane.set_site(config.site.clone());
-            }
-            pane.time_step_secs = pc.time_step_secs;
-            pane.time_link = pc.time_link && config.sync_layers;
-            pane.viewport_link = pc.viewport_link && config.viewport_sync;
-            pane.layer_link = pc.layer_link && config.sync_layers;
-            if legacy_radar_enabled.is_none()
-                && let Some(&enabled) = pc.layers.get("Radar")
-            {
-                legacy_radar_enabled = Some(enabled);
-            }
-            pane.set_content(restore_content(i, pc, count));
-            pane.draw_order = reconcile_draw_order(&pc.draw_order.known, &self.overlays);
-            pane.config_baggage = crate::pane::PaneConfigBaggage {
-                draw_order: pc.draw_order.unknown.clone(),
-                fields: pc.unknown.clone(),
-            };
-            let enabled: HashMap<LayerId, bool> = pc
-                .enabled_overlays
-                .iter()
-                .map(|(name, &on)| (LayerId::new(name.clone()), on))
-                .collect();
-            let configs: HashMap<LayerId, serde_json::Value> = pc
-                .overlay_configs
-                .iter()
-                .map(|(name, state)| (LayerId::new(name.clone()), state.clone()))
-                .collect();
-            let unregistered: Vec<&str> = enabled
-                .keys()
-                .chain(configs.keys())
-                .filter(|id| self.overlays.handler_by_id(id).is_none())
-                .map(LayerId::as_str)
-                .collect();
-            if !unregistered.is_empty() {
-                log::warn!(
-                    "pane {i}'s config names layer id(s) no handler serves \
-                     ({}); keeping them for the build that does",
-                    unregistered.join(", "),
-                );
-            }
-            if enabled
-                .keys()
-                .any(|id| self.overlays.handler_by_id(id).is_some())
-            {
-                pane.enabled_overlays = enabled;
-            } else {
-                pane.enabled_overlays.extend(enabled);
-            }
-            if configs
-                .keys()
-                .any(|id| self.overlays.handler_by_id(id).is_some())
-            {
-                pane.overlay_configs = configs;
-            } else {
-                pane.overlay_configs.extend(configs);
-            }
-            zoom_restored |= restore_viewport(pane, pc);
-        }
-
-        if zoom_restored {
-            self.initial_zoom_set = true;
-        }
-
-        self.config_unknown_fields = config.unknown;
-
+        // **The handlers' own state is restored FIRST**, ahead of the pane
+        // loop, because a slot that states no `enabled` is resolved from the
+        // handler and the answer has to be the one this file asked for. The
+        // two blocks are independent — the pane loop never touches the
+        // registry and this one never touches a pane — so the order is free
+        // to be the one that makes the resolution honest.
         let handler_keys: std::collections::HashSet<String> = self
             .overlays
             .handlers()
@@ -997,10 +1110,82 @@ impl super::Gui {
         if !config.overlay_states.is_empty() {
             self.overlays
                 .deserialize_handler_states(&config.overlay_states);
-        } else if let Some(enabled) = legacy_radar_enabled {
-            self.overlays
-                .set_enabled(&rustdar_source::id::known::RADAR, enabled);
+        } else if let Some(enabled) = config
+            .panes
+            .iter()
+            .find_map(|pc| pc.layers.get("Radar").copied())
+        {
+            self.overlays.set_enabled(&known::RADAR, enabled);
         }
+
+        let mut zoom_restored = false;
+        for (i, pane) in self.panes.iter_mut().enumerate().take(count) {
+            let pc = config.panes.get(i);
+            let Some(pc) = pc else {
+                pane.time_step_secs = config.time_step_secs;
+                pane.viewport_link = config.viewport_sync;
+                pane.layer_link = config.sync_layers;
+                pane.time_link = config.sync_layers;
+                pane.config_baggage = crate::pane::PaneConfigBaggage::default();
+                continue;
+            };
+            pane.set_selected_product(pc.selected_product());
+            pane.set_selected_elevation(pc.selected_elevation());
+            let pane_site = pc.site();
+            if !pane_site.is_empty() {
+                pane.set_site(pane_site);
+            } else if !config.site.is_empty() {
+                pane.set_site(config.site.clone());
+            }
+            pane.time_step_secs = pc.time_step_secs;
+            pane.time_link = pc.time_link && config.sync_layers;
+            pane.viewport_link = pc.viewport_link && config.viewport_sync;
+            pane.layer_link = pc.layer_link && config.sync_layers;
+            pane.set_content(restore_content(i, pc, count));
+            pane.config_baggage = crate::pane::PaneConfigBaggage {
+                layer_slots: pc.layer_slots.unknown.clone(),
+                fields: pc.unknown.clone(),
+            };
+            pane.layers = pc
+                .layer_slots
+                .known
+                .iter()
+                .map(|slot| {
+                    let id = LayerId::new(slot.id.clone());
+                    let handler = self.overlays.handler_by_id(&id);
+                    crate::pane::LayerSlot {
+                        // Absent → whatever the handler says now, which is
+                        // what an absent `enabled_overlays` entry has always
+                        // resolved to. Unknown id → false: nothing draws it.
+                        enabled: slot
+                            .enabled
+                            .unwrap_or_else(|| handler.is_some_and(|h| h.is_enabled())),
+                        config: slot.config.clone(),
+                        id,
+                    }
+                })
+                .collect();
+            let unregistered: Vec<&str> = pane
+                .layers
+                .iter()
+                .filter(|slot| self.overlays.handler_by_id(&slot.id).is_none())
+                .map(|slot| slot.id.as_str())
+                .collect();
+            if !unregistered.is_empty() {
+                log::warn!(
+                    "pane {i}'s config names layer id(s) no handler serves \
+                     ({}); keeping them for the build that does",
+                    unregistered.join(", "),
+                );
+            }
+            zoom_restored |= restore_viewport(pane, pc);
+        }
+
+        if zoom_restored {
+            self.initial_zoom_set = true;
+        }
+
+        self.config_unknown_fields = config.unknown;
 
         self.initialize_pane_enabled();
         for pane in &mut self.panes {
@@ -1270,35 +1455,6 @@ fn sanitize_config_tree(value: &mut serde_json::Value) {
         log::warn!("the saved overlay states are not a map; dropping them");
         root.remove("overlay_states");
     }
-}
-
-/// Reconcile a saved draw order with the registered handlers.
-fn reconcile_draw_order(saved: &[LayerId], registry: &OverlayRegistry) -> Vec<LayerId> {
-    let mut result: Vec<LayerId> = saved.to_vec();
-    let mut registered: Vec<(LayerId, u32)> = registry
-        .handlers()
-        .map(|h| (h.id(), h.draw_order_weight()))
-        .collect();
-    registered.sort_by_key(|&(_, weight)| weight);
-    let weight_of = |id: &LayerId| {
-        registered
-            .iter()
-            .find(|(rid, _)| rid == id)
-            .map(|&(_, weight)| weight)
-    };
-    for (id, weight) in &registered {
-        if result.contains(id) {
-            continue;
-        }
-        let pos = result
-            .iter()
-            .position(|existing| weight_of(existing).is_some_and(|w| w > *weight));
-        match pos {
-            Some(pos) => result.insert(pos, id.clone()),
-            None => result.push(id.clone()),
-        }
-    }
-    result
 }
 
 #[path = "ui_config/live_chunks_config_tests.rs"]

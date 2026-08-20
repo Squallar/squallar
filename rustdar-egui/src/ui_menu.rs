@@ -295,7 +295,7 @@ impl super::Gui {
                 self.propagate_layer_sync();
             }
             MenuEvent::Toggled(MenuToggle::AutoPoll, on) => self.auto_poll.enabled = on,
-            MenuEvent::Toggled(MenuToggle::LiveChunks, on) => self.live_chunks = on,
+            MenuEvent::Toggled(MenuToggle::LiveChunks, on) => self.set_live_chunks(on),
             MenuEvent::Toggled(MenuToggle::ChunkNotifications, on) => self.chunk_notifications = on,
             MenuEvent::Toggled(MenuToggle::VolumePane, on) => {
                 // Recorded rather than written, through the one route the UI has.
@@ -397,9 +397,9 @@ mod tests {
     fn state_fingerprint(gui: &Gui) -> String {
         let mut overlays: Vec<(String, bool)> = gui
             .active_pane()
-            .enabled_overlays
+            .layers
             .iter()
-            .map(|(kind, on)| (format!("{kind:?}"), *on))
+            .map(|slot| (format!("{:?}", slot.id), slot.enabled))
             .collect();
         overlays.sort();
         format!(

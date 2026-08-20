@@ -408,7 +408,16 @@ impl super::Gui {
                 true
             }
             "data.live_chunks" => {
-                ui.checkbox(&mut self.live_chunks, "Live: real-time chunks");
+                // Through the setter, not the field: the switch fans out to
+                // every pane's radar slot, and a bare `&mut self.live_chunks`
+                // would move the global and leave the panes on the old value.
+                let mut enabled = self.live_chunks_enabled();
+                if ui
+                    .checkbox(&mut enabled, "Live: real-time chunks")
+                    .changed()
+                {
+                    self.set_live_chunks(enabled);
+                }
                 true
             }
             "data.push" => {

@@ -663,13 +663,27 @@ impl Gui {
     }
 
     /// Whether live panes should be fed from the real-time chunk bucket.
+    ///
+    /// **The active pane's radar slot answers, and the global is the
+    /// fallback** (WO-E6b). A per-pane answer is now expressible; nothing in
+    /// the UI diverges the panes yet, because [`Self::set_live_chunks`] fans
+    /// its value out to all of them.
     pub fn live_chunks_enabled(&self) -> bool {
-        self.live_chunks
+        self.panes
+            .get(self.active_pane)
+            .and_then(PaneState::radar_live_chunks)
+            .unwrap_or(self.live_chunks)
     }
 
-    /// Set by the settings UI and by the config load.
+    /// Set by the settings UI and by the menu toggle. Writes the global **and
+    /// every pane's radar slot**: one switch has always meant every pane, and
+    /// the fan-out is what keeps that true now that each pane carries its own
+    /// copy.
     pub fn set_live_chunks(&mut self, enabled: bool) {
         self.live_chunks = enabled;
+        for pane in &mut self.panes {
+            pane.set_radar_live_chunks(enabled);
+        }
     }
 
     /// Whether to subscribe to the push-notification service.
@@ -853,42 +867,53 @@ impl Gui {
         let probes = &mut self.probes.widget_id_probes;
         {
             ui.indent(format!("{id_prefix}radar_controls"), |ui| {
-                if let Some(scan_info) = &pane.scan_info {
+                if pane.scan_info.is_none() {
+                    ui.label("No scan loaded");
+                    return;
+                }
+                {
                     let prev_product = pane.selected_product();
-                    let product_combo =
-                        egui::ComboBox::from_id_salt(format!("{id_prefix}product_sel"))
-                            .selected_text(pane.selected_product().name())
-                            .width(combo_width)
-                            .show_ui(ui, |ui| {
-                                pills::product_list_ui(
-                                    ui,
-                                    &scan_info.available_products,
-                                    pane.selected_product(),
-                                )
-                                .picked
-                            });
-                    // The two writes below stay on the fields while every
-                    // other production write in this crate went to
-                    // `PaneState`'s setters (WO-E6a). `scan_info` above is an
-                    // immutable borrow of ONE field of `pane` and is still read
-                    // at the `product_elevations` lookup further down, so
-                    // field-level borrow splitting is what lets a write land
-                    // here at all; `set_selected_product`/`set_selected_elevation`
-                    // take `&mut self` and the borrow checker rejects them
-                    // (E0502, verified). Making them compile means restructuring
-                    // this block, which is WO-E6b's job when the fields go
-                    // private — not a conversion.
-                    if let Some(Some(picked)) = product_combo.inner {
-                        pane.selected_product = picked;
+                    // **The restructure WO-E6a handed forward.** `scan_info`
+                    // is an immutable borrow of ONE field of `pane`, and it
+                    // used to be held across the product write and on into
+                    // the tilt lookup below — so field-level borrow splitting
+                    // was the only thing that made the write legal, and a
+                    // `&mut self` setter beside it was E0502. The borrow now
+                    // ends with the combo that needs it: the picked product
+                    // comes out as a value, the write happens with no borrow
+                    // outstanding, and the tilt block takes its own fresh
+                    // borrow. Both writes go through the setters, and the
+                    // fields they used to reach are private.
+                    let (picked_product, product_combo_id) = {
+                        let scan_info = pane.scan_info.as_ref().expect("presence checked above");
+                        let product_combo =
+                            egui::ComboBox::from_id_salt(format!("{id_prefix}product_sel"))
+                                .selected_text(pane.selected_product().name())
+                                .width(combo_width)
+                                .show_ui(ui, |ui| {
+                                    pills::product_list_ui(
+                                        ui,
+                                        &scan_info.available_products,
+                                        pane.selected_product(),
+                                    )
+                                    .picked
+                                });
+                        (product_combo.inner.flatten(), product_combo.response.id)
+                    };
+                    if let Some(picked) = picked_product {
+                        pane.set_selected_product(picked);
                     }
                     #[cfg(test)]
-                    probes.push(("product_sel", product_combo.response.id));
+                    probes.push(("product_sel", product_combo_id));
+                    #[cfg(not(test))]
+                    let _ = product_combo_id;
                     if prev_product != pane.selected_product() {
-                        pane.selected_elevation = 0.0;
+                        pane.set_selected_elevation(0.0);
                     }
 
                     // The tilt picker is drawn for every listed product, including
                     // one whose angles have not arrived yet.
+                    let scan_info = pane.scan_info.as_ref().expect("presence checked above");
                     if let Some(elevations) = offer_tilt
                         .then(|| scan_info.product_elevations.get(&pane.selected_product()))
                         .flatten()
@@ -927,8 +952,6 @@ impl Gui {
                         #[cfg(not(test))]
                         let _ = elev_combo;
                     }
-                } else {
-                    ui.label("No scan loaded");
                 }
             });
         }
@@ -941,8 +964,8 @@ impl Gui {
         kind: &LayerId,
         on: bool,
     ) {
-        if !pane.overlay_configs.is_empty() {
-            overlays.load_pane_configs(&pane.overlay_configs);
+        if pane.has_slot_configs() {
+            overlays.load_pane_configs(&pane.slot_config_map());
         }
         overlays.set_enabled(kind, on);
         pane.adopt_handler_state(overlays);
