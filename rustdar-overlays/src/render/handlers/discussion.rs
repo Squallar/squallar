@@ -1,4 +1,4 @@
-use crate::render::overlay_state::{PaneMut, PaneRef};
+use crate::render::overlay_state::{PaneMut, PaneRef, PaneToggle};
 use std::sync::Arc;
 
 use crate::fetch_policy::{FetchError, FetchRetry, Whole};
@@ -88,6 +88,9 @@ impl OverlayItem for DiscussionItem {
 
 pub(crate) struct SpcDiscussionHandler {
     pub state: OverlayState<Vec<Arc<DiscussionItem>>, Whole>,
+    /// **The registry's own copy**, used only where no pane is supplied. The
+    /// config swap keeps it in step until WO-M10c deletes the swap; every
+    /// answer prefers [`PaneRef::state`] when there is one.
     pub enabled: bool,
     /// The "MD 1234" map labels, rebuilt whenever `state.data` is — never per frame.
     labels: Vec<OverlayLabel>,
@@ -159,24 +162,26 @@ impl OverlayHandler for SpcDiscussionHandler {
         true
     }
 
-    fn is_enabled(&self, _pane: &PaneRef<'_>) -> bool {
-        self.enabled
+    fn is_enabled(&self, pane: &PaneRef<'_>) -> bool {
+        PaneToggle::is_on(pane, self.enabled)
     }
 
     // A simple toggle handler, like `sites` and `labels`: without this
     // override, `set_active_pane_overlay`'s `set_enabled` is a silent no-op
     // for MDs and the saved config keeps the old value.
-    fn set_enabled(&mut self, enabled: bool, _pane: &mut PaneMut<'_>) {
-        self.enabled = enabled;
+    fn set_enabled(&mut self, enabled: bool, pane: &mut PaneMut<'_>) {
+        if !PaneToggle::set(pane, enabled) {
+            self.enabled = enabled;
+        }
     }
 
     fn data_generation(&self) -> u64 {
         self.state.data_generation
     }
 
-    fn content_signature(&self, _pane: &PaneRef<'_>) -> u64 {
+    fn content_signature(&self, pane: &PaneRef<'_>) -> u64 {
         use std::hash::{DefaultHasher, Hash, Hasher};
-        if !self.enabled {
+        if !self.is_enabled(pane) {
             return 0;
         }
         let mut folded = 0u64;
@@ -241,7 +246,7 @@ impl OverlayHandler for SpcDiscussionHandler {
         &self.labels
     }
 
-    fn apply_fetch_result(&mut self, result: FetchPayload) {
+    fn apply_fetch_result(&mut self, result: FetchPayload, _pane: &PaneRef<'_>) {
         let Some(fetch) = self
             .state
             .downcast_round::<SpcDiscussionFetchResult>(result)
@@ -313,7 +318,7 @@ impl OverlayHandler for SpcDiscussionHandler {
         }]
     }
 
-    fn controls(&self, _ctx: &PaneRef<'_>) -> Vec<ControlItem> {
+    fn controls(&self, pane: &PaneRef<'_>) -> Vec<ControlItem> {
         let count = self.state.data.len();
         let label = if count == 0 {
             "Mesoscale Disc.".to_string()
@@ -324,7 +329,7 @@ impl OverlayHandler for SpcDiscussionHandler {
         let mut items = vec![ControlItem::Toggle {
             id: "enabled",
             label,
-            enabled: self.enabled,
+            enabled: self.is_enabled(pane),
         }];
 
         items.push(ControlItem::ButtonRow {
@@ -357,7 +362,9 @@ impl OverlayHandler for SpcDiscussionHandler {
         match update.id {
             "enabled" => {
                 if let ControlValue::Bool(val) = update.value {
-                    self.enabled = val;
+                    if !PaneToggle::set(pane, val) {
+                        self.enabled = val;
+                    }
                     if val
                         && self
                             .state
@@ -371,6 +378,29 @@ impl OverlayHandler for SpcDiscussionHandler {
             "refresh" => ControlEffect::Fetch,
             _ => ControlEffect::None,
         }
+    }
+
+    // ── Per-pane state (WO-M10c) ──────────────────────────
+    //
+    // This layer's only per-pane fact is whether the pane draws it, so its
+    // state IS the toggle. `self.enabled` survives as the registry's own copy
+    // until the swap dies in this same order; every answer above prefers the
+    // pane's when a pane is supplied.
+
+    fn create_pane_state(&self, enabled: bool) -> Option<FetchPayload> {
+        PaneToggle::create(enabled)
+    }
+
+    fn deserialize_pane_state(
+        &self,
+        value: serde_json::Value,
+        enabled: bool,
+    ) -> Option<FetchPayload> {
+        PaneToggle::restore(&value, enabled)
+    }
+
+    fn serialize_pane_state(&self, state: &dyn std::any::Any) -> serde_json::Value {
+        PaneToggle::save(state)
     }
 
     fn serialize_state(&self) -> serde_json::Value {
@@ -416,7 +446,10 @@ mod tests {
 
     fn handler_with(mds: Vec<SpcDiscussion>) -> SpcDiscussionHandler {
         let mut handler = SpcDiscussionHandler::new();
-        handler.apply_fetch_result(Box::new(SpcDiscussionFetchResult(Ok(mds))));
+        handler.apply_fetch_result(
+            Box::new(SpcDiscussionFetchResult(Ok(mds))),
+            &PaneRef::across(&[]),
+        );
         handler
     }
 
@@ -424,10 +457,10 @@ mod tests {
     fn a_refetch_of_the_same_discussion_set_keeps_the_signature() {
         let mut handler = handler_with(vec![md(101), md(102)]);
         let first = handler.content_signature(&PaneRef::bare(0));
-        handler.apply_fetch_result(Box::new(SpcDiscussionFetchResult(Ok(vec![
-            md(101),
-            md(102),
-        ]))));
+        handler.apply_fetch_result(
+            Box::new(SpcDiscussionFetchResult(Ok(vec![md(101), md(102)]))),
+            &PaneRef::across(&[]),
+        );
         assert_ne!(
             handler.data_generation(),
             1,
@@ -445,14 +478,17 @@ mod tests {
         let mut handler = handler_with(vec![md(101)]);
         let one = handler.content_signature(&PaneRef::bare(0));
 
-        handler.apply_fetch_result(Box::new(SpcDiscussionFetchResult(Ok(vec![
-            md(101),
-            md(102),
-        ]))));
+        handler.apply_fetch_result(
+            Box::new(SpcDiscussionFetchResult(Ok(vec![md(101), md(102)]))),
+            &PaneRef::across(&[]),
+        );
         let two = handler.content_signature(&PaneRef::bare(0));
         assert_ne!(one, two, "an MD issuing must move the signature");
 
-        handler.apply_fetch_result(Box::new(SpcDiscussionFetchResult(Ok(vec![md(102)]))));
+        handler.apply_fetch_result(
+            Box::new(SpcDiscussionFetchResult(Ok(vec![md(102)]))),
+            &PaneRef::across(&[]),
+        );
         assert_ne!(
             handler.content_signature(&PaneRef::bare(0)),
             two,
@@ -494,10 +530,10 @@ mod tests {
         );
 
         // 101 expires; 104 issues.
-        handler.apply_fetch_result(Box::new(SpcDiscussionFetchResult(Ok(vec![
-            md(102),
-            md(104),
-        ]))));
+        handler.apply_fetch_result(
+            Box::new(SpcDiscussionFetchResult(Ok(vec![md(102), md(104)]))),
+            &PaneRef::across(&[]),
+        );
         let text: Vec<String> = handler
             .map_labels()
             .iter()

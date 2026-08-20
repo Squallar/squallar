@@ -258,9 +258,12 @@ fn failed_fetch_leaves_feed_verdict_untouched() {
     handler.defaults.enabled = true;
     handler.report_feed_changes(&BOTH, vec![dead_east()]);
 
-    handler.apply_fetch_result(Box::new(GlmFetchResult(Err(
-        crate::fetch_policy::FetchError::transient("network down"),
-    ))));
+    handler.apply_fetch_result(
+        Box::new(GlmFetchResult(Err(
+            crate::fetch_policy::FetchError::transient("network down"),
+        ))),
+        &PaneRef::across(&[]),
+    );
 
     assert_eq!(handler.dead_feeds, vec![dead_east()]);
 }
@@ -957,24 +960,27 @@ fn apply_fetch_result_forwards_both_level_fields() {
     let mut handler = GlmHandler::new();
     handler.defaults.enabled = true;
 
-    handler.apply_fetch_result(level_outcome(
-        vec![flash_level_gone()],
-        FLASH_EVALUATED.to_vec(),
-    ));
+    handler.apply_fetch_result(
+        level_outcome(vec![flash_level_gone()], FLASH_EVALUATED.to_vec()),
+        &PaneRef::across(&[]),
+    );
     assert_eq!(handler.level_failures, vec![flash_level_gone()]);
     assert!(
         info_texts(&handler).iter().any(|t| t.contains("Flashes")),
         "the failure must survive the seam to the panel"
     );
 
-    handler.apply_fetch_result(level_outcome(Vec::new(), Vec::new()));
+    handler.apply_fetch_result(level_outcome(Vec::new(), Vec::new()), &PaneRef::across(&[]));
     assert_eq!(
         handler.level_failures,
         vec![flash_level_gone()],
         "a poll that evaluated nothing must not clear the verdict"
     );
 
-    handler.apply_fetch_result(level_outcome(Vec::new(), FLASH_EVALUATED.to_vec()));
+    handler.apply_fetch_result(
+        level_outcome(Vec::new(), FLASH_EVALUATED.to_vec()),
+        &PaneRef::across(&[]),
+    );
     assert!(
         handler.level_failures.is_empty(),
         "an evaluated, healthy layer must clear through the seam"
@@ -990,20 +996,26 @@ fn apply_fetch_result_forwards_queried_set_and_failures() {
     let mut handler = GlmHandler::new();
     handler.defaults.enabled = true;
 
-    handler.apply_fetch_result(outcome(
-        vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
-        vec![dead_east()],
-        None,
-        None,
-    ));
+    handler.apply_fetch_result(
+        outcome(
+            vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
+            vec![dead_east()],
+            None,
+            None,
+        ),
+        &PaneRef::across(&[]),
+    );
     assert_eq!(handler.dead_feeds, vec![dead_east()]);
 
-    handler.apply_fetch_result(outcome(
-        vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
-        vec![dead_east()],
-        Some(total_failure()),
-        Some(partial_failure(2)),
-    ));
+    handler.apply_fetch_result(
+        outcome(
+            vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
+            vec![dead_east()],
+            Some(total_failure()),
+            Some(partial_failure(2)),
+        ),
+        &PaneRef::across(&[]),
+    );
     let texts = info_texts(&handler);
     assert!(
         texts.iter().any(|t| t.contains("failed to parse")),
@@ -1014,12 +1026,15 @@ fn apply_fetch_result_forwards_queried_set_and_failures() {
         "transport failures must survive the seam, got {texts:?}"
     );
 
-    handler.apply_fetch_result(outcome(
-        vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
-        Vec::new(),
-        None,
-        None,
-    ));
+    handler.apply_fetch_result(
+        outcome(
+            vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
+            Vec::new(),
+            None,
+            None,
+        ),
+        &PaneRef::across(&[]),
+    );
     assert!(
         handler.dead_feeds.is_empty(),
         "a queried satellite that stops being dead must clear through the seam"
@@ -1447,6 +1462,7 @@ fn two_panes_hold_different_glm_selections_and_the_registry_keeps_none_of_them()
         &mut PaneMut {
             pane_idx: 0,
             state: Some(&mut *a),
+            peers: &[],
         },
     );
     handler.apply_control(
@@ -1457,6 +1473,7 @@ fn two_panes_hold_different_glm_selections_and_the_registry_keeps_none_of_them()
         &mut PaneMut {
             pane_idx: 1,
             state: Some(&mut *b),
+            peers: &[],
         },
     );
 
@@ -1468,6 +1485,14 @@ fn two_panes_hold_different_glm_selections_and_the_registry_keeps_none_of_them()
         state: Some(&*b),
         ..PaneRef::bare(1)
     };
+
+    // The cache token is what the render dispatch groups panes by: an equal
+    // token here is one pane drawing the other pane's lightning.
+    assert_ne!(
+        handler.content_signature(&pane_a),
+        handler.content_signature(&pane_b),
+        "two panes on different satellites and windows shared one cache token",
+    );
 
     // Read back through the trait, not through the state: this is the path the
     // draw loop and the layer stack take.

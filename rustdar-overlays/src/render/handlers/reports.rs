@@ -254,7 +254,7 @@ impl OverlayHandler for StormReportsHandler {
         Vec::new() // Clicks resolve through the rasterizer's `HitMap` instead.
     }
 
-    fn apply_fetch_result(&mut self, result: FetchPayload) {
+    fn apply_fetch_result(&mut self, result: FetchPayload, _pane: &PaneRef<'_>) {
         let Some(fetch) = self.state.downcast_round::<StormReportsFetchResult>(result) else {
             log::error!("Storm reports handler received unexpected fetch result type");
             return;

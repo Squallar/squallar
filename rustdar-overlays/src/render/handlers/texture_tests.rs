@@ -308,7 +308,7 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
             other.as_str()
         ),
     };
-    handler.apply_fetch_result(payload);
+    handler.apply_fetch_result(payload, &PaneRef::across(&[]));
     true
 }
 

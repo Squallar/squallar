@@ -295,6 +295,20 @@ pub struct PaneRef<'a> {
     /// today lives on `Gui` rather than in any slot. WO-E8 dissolves the field
     /// it is read from; this member goes with it, and nothing new may read it.
     pub loading_site: Option<&'a str>,
+    /// **The same layer's state in the OTHER panes**, in pane order, for the
+    /// panes that have one.
+    ///
+    /// A handler answers about one pane through [`Self::state`]. It reads this
+    /// only where the question is about the **layer** rather than about a
+    /// pane — a fetch round every pane's selection contributes to, a cache
+    /// every pane draws from — and then the answer is the **union**:
+    /// [`Self::all_as`] walks this pane and its peers together, and what any
+    /// pane still needs is kept. Dropping what one pane selects to satisfy
+    /// another is the failure mode this exists to prevent, and the union is
+    /// what every other eviction path in this workspace already does
+    /// (`derive::retain_volumes` keeps what any live volume names;
+    /// `VolumeStore::retain_set` drops an entry when the last pane lets go).
+    pub peers: &'a [&'a dyn Any],
 }
 
 impl<'a> PaneRef<'a> {
@@ -308,6 +322,27 @@ impl<'a> PaneRef<'a> {
             state: None,
             slots: &[],
             loading_site: None,
+            peers: &[],
+        }
+    }
+
+    /// **No single pane — the layer as every pane holds it.**
+    ///
+    /// `state` is `None` and [`Self::peers`] carries every pane's, so
+    /// [`Self::all_as`] is the union over the whole layer and there is no
+    /// "this pane" for a handler to mistake for the answer. This is what the
+    /// **arrival path** passes: a fetch result carries a layer id and no
+    /// pane, and what a handler needs of it — is this product still asked
+    /// for, which parameter must the cache not evict — is a question about
+    /// every pane at once.
+    pub fn across(peers: &'a [&'a dyn Any]) -> Self {
+        Self {
+            pane_idx: 0,
+            config: &NULL_CONFIG,
+            state: None,
+            slots: &[],
+            loading_site: None,
+            peers,
         }
     }
 
@@ -315,6 +350,18 @@ impl<'a> PaneRef<'a> {
     /// layer (or it is not a `T`).
     pub fn state_as<T: 'static>(&self) -> Option<&'a T> {
         self.state?.downcast_ref::<T>()
+    }
+
+    /// **Every pane's state for this layer as `T`** — this one first, then the
+    /// peers, skipping any that is absent or not a `T`.
+    ///
+    /// The union door. A handler folds over this when the question is about
+    /// the layer rather than about one pane; folding over [`Self::state_as`]
+    /// alone would answer for one pane and act for all of them.
+    pub fn all_as<T: 'static>(&self) -> impl Iterator<Item = &'a T> + '_ {
+        self.state_as::<T>()
+            .into_iter()
+            .chain(self.peers.iter().filter_map(|p| p.downcast_ref::<T>()))
     }
 
     /// Another layer's saved config **in this same pane**.
@@ -332,6 +379,12 @@ impl<'a> PaneRef<'a> {
 pub struct PaneMut<'a> {
     pub pane_idx: usize,
     pub state: Option<&'a mut dyn Any>,
+    /// The same layer's state in the **other** panes, read-only — see
+    /// [`PaneRef::peers`]. A control edit that changes what the layer as a
+    /// whole is asking for (the outlook's day and product set) has to weigh
+    /// its own pane's new selection against the ones it is not editing, or it
+    /// takes the layer off a ledger another pane's selection is still on.
+    pub peers: &'a [&'a dyn Any],
 }
 
 impl PaneMut<'_> {
@@ -341,6 +394,7 @@ impl PaneMut<'_> {
         Self {
             pane_idx,
             state: None,
+            peers: &[],
         }
     }
 
@@ -361,6 +415,7 @@ impl PaneMut<'_> {
             state: self.state.as_deref(),
             slots: &[],
             loading_site: None,
+            peers: self.peers,
         }
     }
 }
@@ -544,7 +599,16 @@ pub trait SourceHandler: Send {
         Vec::new()
     }
 
-    fn apply_fetch_result(&mut self, result: FetchPayload);
+    /// Take delivery of one fetch round.
+    ///
+    /// `pane` is a [`PaneRef::across`]: an arrival carries a layer id and no
+    /// pane, so `state` is `None` and every pane's is in
+    /// [`peers`](PaneRef::peers). A handler whose bookkeeping depends on what
+    /// is being asked for — the outlook's day-and-product scope, the model
+    /// cache's un-evictable parameter — reads it through
+    /// [`PaneRef::all_as`] and takes the **union**: what any pane still wants
+    /// survives.
+    fn apply_fetch_result(&mut self, result: FetchPayload, pane: &PaneRef<'_>);
 
     /// This handler's raster as a described job, or `None` when there is nothing
     /// to render. `has_data()` must answer `false` exactly when this answers

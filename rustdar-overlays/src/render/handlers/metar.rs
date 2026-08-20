@@ -298,7 +298,7 @@ impl OverlayHandler for MetarHandler {
         Vec::new()
     }
 
-    fn apply_fetch_result(&mut self, result: FetchPayload) {
+    fn apply_fetch_result(&mut self, result: FetchPayload, _pane: &PaneRef<'_>) {
         let Some(fetch) = self.state.downcast_round::<MetarFetchResult>(result) else {
             log::error!("METAR handler received unexpected fetch result type");
             return;

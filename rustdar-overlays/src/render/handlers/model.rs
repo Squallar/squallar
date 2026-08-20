@@ -80,9 +80,20 @@ impl ModelGridCache {
         self.get(param).is_some()
     }
 
-    /// Neither the entry going in nor `pinned` is ever evicted; that all visible
-    /// parameters stay resident comes from the cap being at least the pane count.
-    fn insert(&mut self, param: ModelParameter, grid: Arc<HrrrGridData>, pinned: ModelParameter) {
+    /// Neither the entry going in nor anything in `pinned` is ever evicted.
+    ///
+    /// `pinned` is the **union** of every pane's selected parameter, not one
+    /// pane's: this cache is shared by every pane, and evicting what another
+    /// pane is showing to make room is the cross-pane collision the pane state
+    /// exists to prevent. That all visible parameters stay resident comes from
+    /// the cap being at least the pane count; the pin is what makes it hold
+    /// when an arrival lands mid-cycle.
+    fn insert(
+        &mut self,
+        param: ModelParameter,
+        grid: Arc<HrrrGridData>,
+        pinned: &[ModelParameter],
+    ) {
         if self.entries.insert(param, grid).is_some() {
             // A re-fetch of a resident parameter replaces its own key. Nothing
             // in this cache is keyed by run.
@@ -93,7 +104,10 @@ impl ModelGridCache {
         while self.entries.len() > MODEL_GRID_CACHE_ENTRIES {
             let victim = {
                 let mut recency = self.recency.borrow_mut();
-                let Some(pos) = recency.iter().position(|p| *p != param && *p != pinned) else {
+                let Some(pos) = recency
+                    .iter()
+                    .position(|p| *p != param && !pinned.contains(p))
+                else {
                     break;
                 };
                 recency.remove(pos)
@@ -118,10 +132,37 @@ impl ModelGridCache {
     }
 }
 
-pub(crate) struct ModelDataHandler {
-    pub state: OverlayState<Option<Arc<HrrrGridData>>, Whole>,
+/// **The whole per-pane state of the model layer**: whether this pane draws
+/// it, and which parameter it is showing. Both were fields of the handler,
+/// which is why two panes could never sit on two HRRR parameters — the config
+/// swap re-installed one pane's before every read and called that independence.
+///
+/// The grid cache is **not** here: a decoded HRRR grid is megabytes and is the
+/// same grid whichever pane asked for it, so it stays one shared cache and the
+/// selections merely pin it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ModelPaneState {
     pub enabled: bool,
     pub selected_param: ModelParameter,
+}
+
+impl ModelPaneState {
+    /// A pane that has saved nothing, with `enabled` supplied by the pane's
+    /// own slot flag.
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            selected_param: ModelParameter::SurfaceBasedCin,
+        }
+    }
+}
+
+pub(crate) struct ModelDataHandler {
+    pub state: OverlayState<Option<Arc<HrrrGridData>>, Whole>,
+    /// **The registry's own copy**, used only where no pane is supplied. The
+    /// config swap keeps it in step until WO-M10c deletes the swap; every
+    /// answer prefers [`PaneRef::state`] when there is one.
+    pub defaults: ModelPaneState,
     cached_grids: ModelGridCache,
     pub last_error: Option<String>,
 }
@@ -130,11 +171,41 @@ impl ModelDataHandler {
     pub fn new() -> Self {
         Self {
             state: OverlayState::new(),
-            enabled: false,
-            selected_param: ModelParameter::SurfaceBasedCin,
+            defaults: ModelPaneState::new(false),
             cached_grids: ModelGridCache::new(),
             last_error: None,
         }
+    }
+
+    /// **This pane's answer, or the registry's own copy** when no pane was
+    /// supplied.
+    fn view<'a>(&'a self, pane: &PaneRef<'a>) -> &'a ModelPaneState {
+        pane.state_as::<ModelPaneState>().unwrap_or(&self.defaults)
+    }
+
+    /// Edit this pane's state, falling back to the registry's copy for a
+    /// caller that supplied no pane.
+    fn edit(&mut self, pane: &mut PaneMut<'_>, f: impl FnOnce(&mut ModelPaneState)) {
+        match pane.state_as::<ModelPaneState>() {
+            Some(state) => f(state),
+            None => f(&mut self.defaults),
+        }
+    }
+
+    /// **Every parameter some pane is showing**, deduplicated — what the
+    /// shared cache must not evict. The union, per [`PaneRef::all_as`]; the
+    /// registry's own copy stands in when no pane answered at all.
+    fn pinned_params(&self, pane: &PaneRef<'_>) -> Vec<ModelParameter> {
+        let mut pinned: Vec<ModelParameter> = Vec::new();
+        for state in pane.all_as::<ModelPaneState>() {
+            if !pinned.contains(&state.selected_param) {
+                pinned.push(state.selected_param);
+            }
+        }
+        if pinned.is_empty() {
+            pinned.push(self.defaults.selected_param);
+        }
+        pinned
     }
 }
 
@@ -157,27 +228,37 @@ impl OverlayHandler for ModelDataHandler {
         RenderMode::Texture
     }
 
-    fn is_enabled(&self, _pane: &PaneRef<'_>) -> bool {
-        self.enabled
+    fn is_enabled(&self, pane: &PaneRef<'_>) -> bool {
+        self.view(pane).enabled
     }
 
-    fn set_enabled(&mut self, enabled: bool, _pane: &mut PaneMut<'_>) {
-        self.enabled = enabled;
+    fn set_enabled(&mut self, enabled: bool, pane: &mut PaneMut<'_>) {
+        self.edit(pane, |state| state.enabled = enabled);
     }
 
-    fn status_line(&self, _pane: &PaneRef<'_>) -> Option<String> {
-        if !self.enabled {
+    fn status_line(&self, pane: &PaneRef<'_>) -> Option<String> {
+        let view = self.view(pane);
+        if !view.enabled {
             return None;
         }
-        Some(self.selected_param.display_name().to_owned())
+        Some(view.selected_param.display_name().to_owned())
     }
 
     fn data_generation(&self) -> u64 {
         self.state.data_generation
     }
 
-    fn has_data(&self, _pane: &PaneRef<'_>) -> bool {
-        self.cached_grids.contains(self.selected_param)
+    /// **The selected parameter is in the token**, not just the fetch counter.
+    /// Two panes on two parameters draw two different grids, and the cache
+    /// token is what the render dispatch groups panes by — one token for both
+    /// is one raster for both, which is this layer's shape of the cross-pane
+    /// collision the pane state exists to prevent.
+    fn content_signature(&self, pane: &PaneRef<'_>) -> u64 {
+        self.data_generation() ^ (self.view(pane).selected_param as u64 + 1).rotate_left(32)
+    }
+
+    fn has_data(&self, pane: &PaneRef<'_>) -> bool {
+        self.cached_grids.contains(self.view(pane).selected_param)
     }
 
     fn is_fetching(&self) -> bool {
@@ -219,7 +300,7 @@ impl OverlayHandler for ModelDataHandler {
         Vec::new() // Gridded, not feature-based; hover uses `hover_value_at`.
     }
 
-    fn apply_fetch_result(&mut self, result: FetchPayload) {
+    fn apply_fetch_result(&mut self, result: FetchPayload, pane: &PaneRef<'_>) {
         let Some(fetch) = self.state.downcast_round::<HrrrFetchResult>(result) else {
             log::error!("ModelData handler received unexpected fetch result type");
             return;
@@ -238,10 +319,12 @@ impl OverlayHandler for ModelDataHandler {
                 }
                 let param = grid.parameter;
                 let arc = Arc::new(grid);
-                // The pin is the parameter the pane is showing, which is what
-                // every read path below keys on; an arrival must never blank it.
-                let selected = self.selected_param;
-                self.cached_grids.insert(param, arc.clone(), selected);
+                // The pin is every parameter SOME pane is showing, which is
+                // what every read path below keys on; an arrival must never
+                // blank one. The arrival carries no pane of its own — the
+                // union across panes is the whole answer here.
+                let pinned = self.pinned_params(pane);
+                self.cached_grids.insert(param, arc.clone(), &pinned);
                 self.state.set_data(Some(arc));
                 self.last_error = None;
             }
@@ -264,8 +347,8 @@ impl OverlayHandler for ModelDataHandler {
     ) {
     }
 
-    fn hover_value_at(&self, lat: f64, lon: f64, _pane: &PaneRef<'_>) -> Option<String> {
-        let grid = self.cached_grids.get(self.selected_param)?;
+    fn hover_value_at(&self, lat: f64, lon: f64, pane: &PaneRef<'_>) -> Option<String> {
+        let grid = self.cached_grids.get(self.view(pane).selected_param)?;
         if !grid.bounds.contains_point(lat, lon) {
             return None;
         }
@@ -286,21 +369,22 @@ impl OverlayHandler for ModelDataHandler {
     /// The signature is the selected parameter and nothing else, since the bar is
     /// a pure function of it — deliberately **not** `data_generation`, which every
     /// HRRR fetch bumps. `+ 1` keeps the first parameter's signature off `0`.
-    fn legend(&self, _pane: &PaneRef<'_>) -> Option<Signed<OverlayLegend>> {
-        if !self.enabled {
+    fn legend(&self, pane: &PaneRef<'_>) -> Option<Signed<OverlayLegend>> {
+        let view = self.view(pane);
+        if !view.enabled {
             return None;
         }
-        let thresholds = self.selected_param.legend_thresholds();
+        let thresholds = view.selected_param.legend_thresholds();
         let min = thresholds.first().map_or(0.0, |e| e.0);
         let max = thresholds.last().map_or(1.0, |e| e.0);
         Some(Signed {
-            signature: self.selected_param as u64 + 1,
+            signature: view.selected_param as u64 + 1,
             items: OverlayLegend {
                 thresholds,
                 is_gradient: true,
                 min_value: min,
                 max_value: max,
-                unit_label: self.selected_param.unit_label(),
+                unit_label: view.selected_param.unit_label(),
             },
         })
     }
@@ -308,8 +392,11 @@ impl OverlayHandler for ModelDataHandler {
     /// The [`Whole`](rasterize::ModelDataInput::Whole) carry: an `Arc` clone of
     /// the resident grid, so describing the job costs a refcount and the values
     /// memcpy happens only in the web encoder that knows the texture's bounds.
-    fn prepare_job(&self, _ctx: &RasterizeContext, _pane: &PaneRef<'_>) -> Option<DescribedJob> {
-        let grid = self.cached_grids.get(self.selected_param)?.clone();
+    fn prepare_job(&self, _ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
+        let grid = self
+            .cached_grids
+            .get(self.view(pane).selected_param)?
+            .clone();
         Some(DescribedJob::new(rasterize::ModelDataInput::Whole(grid)))
     }
 
@@ -319,10 +406,10 @@ impl OverlayHandler for ModelDataHandler {
             .find(|row| row.label == "overlay/model")
     }
 
-    fn create_fetch_tasks(&self, ctx: &FetchConfig, _pane: &PaneRef<'_>) -> Vec<FetchTask> {
+    fn create_fetch_tasks(&self, ctx: &FetchConfig, pane: &PaneRef<'_>) -> Vec<FetchTask> {
         let client = ctx.client.clone();
         let sources = ctx.sources.clone();
-        let param = self.selected_param;
+        let param = self.view(pane).selected_param;
         vec![FetchTask {
             kind: known::MODEL_DATA,
             future: Box::pin(async move {
@@ -336,8 +423,9 @@ impl OverlayHandler for ModelDataHandler {
         }]
     }
 
-    fn controls(&self, _ctx: &PaneRef<'_>) -> Vec<ControlItem> {
-        let grid = self.cached_grids.get(self.selected_param);
+    fn controls(&self, pane: &PaneRef<'_>) -> Vec<ControlItem> {
+        let view = self.view(pane);
+        let grid = self.cached_grids.get(view.selected_param);
 
         // f01+ must show its *valid* time and F-hour: a 0-1 h maximum labelled
         // with the run time alone reads as an analysis valid now.
@@ -354,7 +442,7 @@ impl OverlayHandler for ModelDataHandler {
         let mut items = vec![ControlItem::Toggle {
             id: "enabled",
             label,
-            enabled: self.enabled,
+            enabled: view.enabled,
         }];
 
         // Ungated on enabled: a hidden layer's options stay visible and
@@ -366,7 +454,7 @@ impl OverlayHandler for ModelDataHandler {
                 .iter()
                 .map(|p| (p.as_str().into(), p.display_name().into()))
                 .collect(),
-            selected: self.selected_param.as_str().into(),
+            selected: view.selected_param.as_str().into(),
         });
 
         items.push(ControlItem::ButtonRow {
@@ -399,10 +487,10 @@ impl OverlayHandler for ModelDataHandler {
             });
         }
 
-        if let Some(grid) = self.cached_grids.get(self.selected_param) {
+        if let Some(grid) = self.cached_grids.get(view.selected_param) {
             // Windowed fields are maxima over a period, not instantaneous
             // readings; "UH2-5 at 04:00z" alone reads as a snapshot.
-            if grid.forecast_hour > 0 && self.selected_param.is_windowed() {
+            if grid.forecast_hour > 0 && view.selected_param.is_windowed() {
                 items.push(ControlItem::InfoText {
                     text: format!(
                         "Maximum over {}-{}, not an analysis field",
@@ -424,7 +512,7 @@ impl OverlayHandler for ModelDataHandler {
         match update.id {
             "enabled" => {
                 if let ControlValue::Bool(val) = update.value {
-                    self.enabled = val;
+                    self.edit(pane, |state| state.enabled = val);
                     if val
                         && self
                             .state
@@ -438,8 +526,8 @@ impl OverlayHandler for ModelDataHandler {
             "parameter" => {
                 if let ControlValue::String(ref val) = update.value {
                     let new_param: ModelParameter = val.parse().unwrap();
-                    if new_param != self.selected_param {
-                        self.selected_param = new_param;
+                    if new_param != self.view(&pane.as_ref()).selected_param {
+                        self.edit(pane, |state| state.selected_param = new_param);
                         if self.cached_grids.contains(new_param) {
                             self.state.data_generation = self.state.data_generation.wrapping_add(1);
                             return ControlEffect::None;
@@ -454,19 +542,59 @@ impl OverlayHandler for ModelDataHandler {
         }
     }
 
+    // ── Per-pane state (WO-M10c) ──────────────────────────
+
+    fn create_pane_state(&self, enabled: bool) -> Option<FetchPayload> {
+        Some(Box::new(ModelPaneState::new(enabled)))
+    }
+
+    /// Field for field what `deserialize_state` does, against the pane's own
+    /// state instead of the registry's — and `enabled` falls back to the
+    /// pane's slot flag rather than to whatever another pane last left here.
+    fn deserialize_pane_state(
+        &self,
+        value: serde_json::Value,
+        enabled: bool,
+    ) -> Option<FetchPayload> {
+        let mut state = ModelPaneState::new(enabled);
+        if let Some(on) = value.get("enabled").and_then(|v| v.as_bool()) {
+            state.enabled = on;
+        }
+        if let Some(param) = value
+            .get("parameter")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+        {
+            state.selected_param = param;
+        }
+        Some(Box::new(state))
+    }
+
+    /// **Byte-identical to `serialize_state`** — same members, same order,
+    /// same values. The corpus is what says so.
+    fn serialize_pane_state(&self, state: &dyn std::any::Any) -> serde_json::Value {
+        let Some(state) = state.downcast_ref::<ModelPaneState>() else {
+            return serde_json::Value::Null;
+        };
+        serde_json::json!({
+            "enabled": state.enabled,
+            "parameter": state.selected_param.as_str(),
+        })
+    }
+
     fn serialize_state(&self) -> serde_json::Value {
         serde_json::json!({
-            "enabled": self.enabled,
-            "parameter": self.selected_param.as_str(),
+            "enabled": self.defaults.enabled,
+            "parameter": self.defaults.selected_param.as_str(),
         })
     }
 
     fn deserialize_state(&mut self, value: serde_json::Value) {
         if let Some(enabled) = value.get("enabled").and_then(|v| v.as_bool()) {
-            self.enabled = enabled;
+            self.defaults.enabled = enabled;
         }
         if let Some(param) = value.get("parameter").and_then(|v| v.as_str()) {
-            self.selected_param = param.parse().unwrap();
+            self.defaults.selected_param = param.parse().unwrap();
         }
     }
 }
@@ -508,9 +636,12 @@ mod tests {
 
     fn handler(parameter: ModelParameter, values: Vec<f32>) -> ModelDataHandler {
         let mut h = ModelDataHandler::new();
-        h.enabled = true;
-        h.selected_param = parameter;
-        h.apply_fetch_result(Box::new(HrrrFetchResult(Ok(grid(parameter, values)))));
+        h.defaults.enabled = true;
+        h.defaults.selected_param = parameter;
+        h.apply_fetch_result(
+            Box::new(HrrrFetchResult(Ok(grid(parameter, values)))),
+            &PaneRef::across(&[]),
+        );
         h
     }
 
@@ -625,9 +756,9 @@ mod tests {
             value_range,
         };
         let mut h = ModelDataHandler::new();
-        h.enabled = true;
-        h.selected_param = parameter;
-        h.apply_fetch_result(Box::new(HrrrFetchResult(Ok(g))));
+        h.defaults.enabled = true;
+        h.defaults.selected_param = parameter;
+        h.apply_fetch_result(Box::new(HrrrFetchResult(Ok(g))), &PaneRef::across(&[]));
         h
     }
 
@@ -688,11 +819,14 @@ mod tests {
     #[test]
     fn a_fetch_error_is_reported_in_the_controls() {
         let mut h = ModelDataHandler::new();
-        h.enabled = true;
-        h.selected_param = ModelParameter::MaxUH2to5km;
-        h.apply_fetch_result(Box::new(HrrrFetchResult(Err(
-            crate::fetch_policy::FetchError::transient("HTTP 500"),
-        ))));
+        h.defaults.enabled = true;
+        h.defaults.selected_param = ModelParameter::MaxUH2to5km;
+        h.apply_fetch_result(
+            Box::new(HrrrFetchResult(Err(
+                crate::fetch_policy::FetchError::transient("HTTP 500"),
+            ))),
+            &PaneRef::across(&[]),
+        );
 
         let lines = info_lines(&h);
         assert!(
@@ -704,15 +838,21 @@ mod tests {
     #[test]
     fn a_successful_fetch_clears_a_previous_error() {
         let mut h = ModelDataHandler::new();
-        h.enabled = true;
-        h.selected_param = ModelParameter::MaxUH2to5km;
-        h.apply_fetch_result(Box::new(HrrrFetchResult(Err(
-            crate::fetch_policy::FetchError::transient("HTTP 500"),
-        ))));
-        h.apply_fetch_result(Box::new(HrrrFetchResult(Ok(grid(
-            ModelParameter::MaxUH2to5km,
-            vec![120.0],
-        )))));
+        h.defaults.enabled = true;
+        h.defaults.selected_param = ModelParameter::MaxUH2to5km;
+        h.apply_fetch_result(
+            Box::new(HrrrFetchResult(Err(
+                crate::fetch_policy::FetchError::transient("HTTP 500"),
+            ))),
+            &PaneRef::across(&[]),
+        );
+        h.apply_fetch_result(
+            Box::new(HrrrFetchResult(Ok(grid(
+                ModelParameter::MaxUH2to5km,
+                vec![120.0],
+            )))),
+            &PaneRef::across(&[]),
+        );
 
         let lines = info_lines(&h);
         assert!(!lines.iter().any(|l| l.contains("HTTP 500")), "{lines:?}");
@@ -750,7 +890,10 @@ mod tests {
     }
 
     fn deliver(h: &mut ModelDataHandler, parameter: ModelParameter) {
-        h.apply_fetch_result(Box::new(HrrrFetchResult(Ok(grid(parameter, vec![300.0])))));
+        h.apply_fetch_result(
+            Box::new(HrrrFetchResult(Ok(grid(parameter, vec![300.0])))),
+            &PaneRef::across(&[]),
+        );
     }
 
     fn rasterize_ctx() -> RasterizeContext {
@@ -771,9 +914,9 @@ mod tests {
 
     fn full_cache() -> ModelDataHandler {
         let mut h = ModelDataHandler::new();
-        h.enabled = true;
+        h.defaults.enabled = true;
         for &p in resident_order() {
-            h.selected_param = p;
+            h.defaults.selected_param = p;
             deliver(&mut h, p);
         }
         assert_eq!(
@@ -800,14 +943,14 @@ mod tests {
         let panes = &ModelParameter::all()[..MAX_PANES_DESKTOP];
 
         let mut h = ModelDataHandler::new();
-        h.enabled = true;
+        h.defaults.enabled = true;
         for &p in panes {
-            h.selected_param = p;
+            h.defaults.selected_param = p;
             deliver(&mut h, p);
         }
 
         for &p in panes {
-            h.selected_param = p;
+            h.defaults.selected_param = p;
             assert!(
                 h.has_data(&PaneRef::bare(0)),
                 "the pane showing {p:?} has no grid"
@@ -830,7 +973,7 @@ mod tests {
     #[test]
     fn an_overflowing_parameter_evicts_the_least_recently_touched() {
         let mut h = full_cache();
-        h.selected_param = overflow();
+        h.defaults.selected_param = overflow();
         deliver(&mut h, overflow());
 
         assert!(
@@ -853,9 +996,9 @@ mod tests {
     #[test]
     fn cycling_every_parameter_leaves_exactly_the_cap_resident() {
         let mut h = ModelDataHandler::new();
-        h.enabled = true;
+        h.defaults.enabled = true;
         for (i, p) in ModelParameter::all().iter().enumerate() {
-            h.selected_param = *p;
+            h.defaults.selected_param = *p;
             deliver(&mut h, *p);
             let expected = (i + 1).min(MODEL_GRID_CACHE_ENTRIES);
             assert_eq!(
@@ -908,7 +1051,7 @@ mod tests {
         }
 
         let p = h.cached_grids.recency_order()[0];
-        h.selected_param = p;
+        h.defaults.selected_param = p;
         assert!(
             h.hover_value_at(35.0, -97.0, &PaneRef::bare(0)).is_some(),
             "the fixture must answer a hover, or this step proves nothing",
@@ -916,7 +1059,7 @@ mod tests {
         counted_as_a_use(&h, p, "hover_value_at");
 
         let p = h.cached_grids.recency_order()[0];
-        h.selected_param = p;
+        h.defaults.selected_param = p;
         assert!(
             h.prepare_job(&rasterize_ctx(), &PaneRef::bare(0)).is_some(),
             "the fixture must answer a rasterize",
@@ -924,7 +1067,7 @@ mod tests {
         counted_as_a_use(&h, p, "prepare_job");
 
         let p = h.cached_grids.recency_order()[0];
-        h.selected_param = p;
+        h.defaults.selected_param = p;
         assert_ne!(
             toggle_label(&h),
             "Model Data",
@@ -934,13 +1077,13 @@ mod tests {
         counted_as_a_use(&h, p, "controls");
 
         let p = h.cached_grids.recency_order()[0];
-        h.selected_param = p;
+        h.defaults.selected_param = p;
         assert!(h.has_data(&PaneRef::bare(0)), "{p:?} is resident");
         counted_as_a_use(&h, p, "has_data");
 
         let p = h.cached_grids.recency_order()[0];
         assert_ne!(
-            p, h.selected_param,
+            p, h.defaults.selected_param,
             "the dropdown branch runs only on a change"
         );
         let effect = h.apply_control(
@@ -963,13 +1106,13 @@ mod tests {
     #[test]
     fn a_hovered_parameter_outlives_one_that_was_only_fetched() {
         let mut h = full_cache();
-        h.selected_param = oldest();
+        h.defaults.selected_param = oldest();
         assert!(
             h.hover_value_at(35.0, -97.0, &PaneRef::bare(0)).is_some(),
             "the fixture must answer a hover",
         );
 
-        h.selected_param = overflow();
+        h.defaults.selected_param = overflow();
         deliver(&mut h, overflow());
 
         assert!(
@@ -989,7 +1132,7 @@ mod tests {
     #[test]
     fn the_selected_parameter_survives_an_insert_that_would_evict_it() {
         let mut h = full_cache();
-        h.selected_param = oldest();
+        h.defaults.selected_param = oldest();
         assert_eq!(
             h.cached_grids.recency_order(),
             resident_order().to_vec(),
@@ -1016,7 +1159,7 @@ mod tests {
     #[test]
     fn a_refetch_of_a_resident_parameter_replaces_its_own_key() {
         let mut h = full_cache();
-        h.selected_param = oldest();
+        h.defaults.selected_param = oldest();
         deliver(&mut h, oldest());
 
         assert_eq!(
@@ -1048,16 +1191,16 @@ mod tests {
     #[test]
     fn an_evicted_parameter_refetches_when_the_layer_is_toggled_back_on() {
         let mut h = full_cache();
-        h.selected_param = overflow();
+        h.defaults.selected_param = overflow();
         deliver(&mut h, overflow()); // evicts `oldest`
 
-        h.selected_param = oldest();
+        h.defaults.selected_param = oldest();
         assert!(
             !h.has_data(&PaneRef::bare(0)),
             "{:?} must be gone, or this is not the eviction case",
             oldest(),
         );
-        h.enabled = false;
+        h.defaults.enabled = false;
         assert_eq!(
             h.apply_control(
                 &ControlUpdate {
@@ -1070,13 +1213,13 @@ mod tests {
             "an evicted parameter must refetch on the toggle, not leave the layer blank",
         );
 
-        h.selected_param = overflow();
+        h.defaults.selected_param = overflow();
         assert!(
             h.has_data(&PaneRef::bare(0)),
             "{:?} is resident",
             overflow()
         );
-        h.enabled = false;
+        h.defaults.enabled = false;
         assert_eq!(
             h.apply_control(
                 &ControlUpdate {
@@ -1087,6 +1230,187 @@ mod tests {
             ),
             ControlEffect::None,
             "a resident grid must not be refetched on the toggle",
+        );
+    }
+
+    // ── Per-pane state (WO-M10c) ──────────────────────────────────────
+
+    /// A pane holding `param`, as the layer stack hands one over.
+    fn pane_state(param: ModelParameter) -> FetchPayload {
+        Box::new(ModelPaneState {
+            enabled: true,
+            selected_param: param,
+        })
+    }
+
+    /// **Two panes, two HRRR parameters** — the order's named subject, and the
+    /// thing the config swap could only fake by re-installing one pane's
+    /// selection before every read.
+    ///
+    /// The panes are asserted **equal first**: a test that never sees them
+    /// agree cannot tell divergence from two independently wrong answers. And
+    /// `defaults` is asserted untouched at the end — the assertion that fires
+    /// the moment any of these methods writes a per-pane value to `&mut self`.
+    #[test]
+    fn two_panes_hold_different_hrrr_parameters_and_the_registry_keeps_neither() {
+        let left = ModelParameter::all()[0];
+        let right = ModelParameter::all()[1];
+        assert_ne!(left, right, "premise: two distinct parameters");
+
+        let mut h = ModelDataHandler::new();
+        // Both grids resident, so a difference in the answers is a difference
+        // in the selection and not in what happens to be cached.
+        deliver(&mut h, left);
+        deliver(&mut h, right);
+
+        let a = pane_state(left);
+        let mut b = pane_state(left);
+        let same_a = PaneRef {
+            state: Some(&*a),
+            ..PaneRef::bare(0)
+        };
+        let same_b = PaneRef {
+            state: Some(&*b),
+            ..PaneRef::bare(1)
+        };
+        assert_eq!(
+            h.status_line(&same_a),
+            h.status_line(&same_b),
+            "premise: two panes on the same parameter answer the same",
+        );
+
+        // Diverge through the handler's own control route, not a field write.
+        let effect = h.apply_control(
+            &ControlUpdate {
+                id: "parameter",
+                value: ControlValue::String(right.as_str().to_owned()),
+            },
+            &mut PaneMut {
+                pane_idx: 1,
+                state: Some(&mut *b),
+                peers: &[&*a],
+            },
+        );
+        assert!(matches!(effect, ControlEffect::None), "{effect:?}");
+
+        let pane_a = PaneRef {
+            state: Some(&*a),
+            ..PaneRef::bare(0)
+        };
+        let pane_b = PaneRef {
+            state: Some(&*b),
+            ..PaneRef::bare(1)
+        };
+
+        assert_eq!(
+            h.status_line(&pane_a).as_deref(),
+            Some(left.display_name()),
+            "pane 0's parameter",
+        );
+        assert_eq!(
+            h.status_line(&pane_b).as_deref(),
+            Some(right.display_name()),
+            "pane 1's parameter",
+        );
+        assert_ne!(
+            h.legend(&pane_a).map(|l| l.signature),
+            h.legend(&pane_b).map(|l| l.signature),
+            "two parameters must not share one legend signature, or one pane \
+             draws the other's colour bar",
+        );
+        assert_eq!(
+            h.serialize_pane_state(&*a)["parameter"],
+            serde_json::json!(left.as_str()),
+            "pane 0's saved bytes",
+        );
+        assert_eq!(
+            h.serialize_pane_state(&*b)["parameter"],
+            serde_json::json!(right.as_str()),
+            "pane 1's saved bytes",
+        );
+        assert_eq!(
+            h.defaults.selected_param,
+            ModelParameter::SurfaceBasedCin,
+            "the registry's own copy took one of the panes' selections",
+        );
+    }
+
+    /// **Two panes on two parameters must not share one cache token.** The
+    /// render dispatch groups panes by `(layer, zoom, token, size)` and hands
+    /// one raster to the whole group, so an equal token is one pane drawing
+    /// the other's grid.
+    #[test]
+    fn two_panes_on_two_parameters_do_not_share_a_cache_token() {
+        let left = ModelParameter::all()[0];
+        let right = ModelParameter::all()[1];
+        let h = ModelDataHandler::new();
+        let a = pane_state(left);
+        let b = pane_state(right);
+        let same = pane_state(left);
+
+        let token = |state: &FetchPayload| {
+            h.content_signature(&PaneRef {
+                state: Some(&**state),
+                ..PaneRef::bare(0)
+            })
+        };
+        assert_eq!(
+            token(&a),
+            token(&same),
+            "premise: the same parameter is the same picture, so the same token",
+        );
+        assert_ne!(
+            token(&a),
+            token(&b),
+            "two panes on two HRRR parameters shared one cache token",
+        );
+    }
+
+    /// **The cache pin is the UNION of every pane's parameter, not one pane's.**
+    ///
+    /// The cache is shared: with a full cache and two panes on two parameters,
+    /// an arrival has to evict something, and pinning only the pane that
+    /// happens to be first takes the other pane's grid away — `prepare_job`
+    /// then answers `None` and that pane is left drawing a stale texture with
+    /// nothing to re-ask.
+    ///
+    /// Non-triviality floor: the two pinned parameters are the two **oldest**
+    /// in the cache, so an unpinned run evicts one of them for certain.
+    #[test]
+    fn an_arrival_evicts_no_parameter_that_any_pane_is_showing() {
+        let mut h = full_cache();
+        let pinned_a = oldest();
+        let pinned_b = next_oldest();
+        assert_eq!(
+            h.cached_grids.recency_order()[..2],
+            [pinned_a, pinned_b],
+            "premise: both pinned parameters are the next two to be evicted",
+        );
+
+        let a = pane_state(pinned_a);
+        let b = pane_state(pinned_b);
+        let peers: [&dyn std::any::Any; 2] = [&*a, &*b];
+        h.apply_fetch_result(
+            Box::new(HrrrFetchResult(Ok(grid(overflow(), vec![300.0])))),
+            &PaneRef::across(&peers),
+        );
+
+        assert!(
+            h.cached_grids.is_resident(pinned_a),
+            "pane 0's grid was evicted by another pane's arrival",
+        );
+        assert!(
+            h.cached_grids.is_resident(pinned_b),
+            "pane 1's grid was evicted by another pane's arrival",
+        );
+        assert!(
+            h.cached_grids.is_resident(overflow()),
+            "premise: the arriving grid is resident",
+        );
+        assert_eq!(
+            h.cached_grids.len(),
+            MODEL_GRID_CACHE_ENTRIES,
+            "the cap still holds",
         );
     }
 }

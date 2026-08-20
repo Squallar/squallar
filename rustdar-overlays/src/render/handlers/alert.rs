@@ -356,7 +356,7 @@ impl OverlayHandler for NwsAlertHandler {
         }
     }
 
-    fn apply_fetch_result(&mut self, result: FetchPayload) {
+    fn apply_fetch_result(&mut self, result: FetchPayload, _pane: &PaneRef<'_>) {
         let Some(fetch) = self.state.downcast_round::<NwsAlertFetchResult>(result) else {
             log::error!("NWS alert handler received unexpected fetch result type");
             return;
@@ -597,7 +597,7 @@ mod tests {
 
     fn handler_with(alerts: Vec<NwsAlert>) -> NwsAlertHandler {
         let mut handler = NwsAlertHandler::new();
-        handler.apply_fetch_result(whole(alerts));
+        handler.apply_fetch_result(whole(alerts), &PaneRef::across(&[]));
         handler
     }
 
@@ -645,7 +645,10 @@ mod tests {
              count would move on its own and this proves nothing",
         );
 
-        handler.apply_fetch_result(whole(vec![zone_alert("a", "Tornado Warning", 3)]));
+        handler.apply_fetch_result(
+            whole(vec![zone_alert("a", "Tornado Warning", 3)]),
+            &PaneRef::across(&[]),
+        );
         let resolved = handler.content_signature(&PaneRef::bare(0));
         assert_eq!(
             handler.drawn_count(),
@@ -658,7 +661,10 @@ mod tests {
              nothing re-rasterizes and the warning stays off the map",
         );
 
-        handler.apply_fetch_result(whole(vec![zone_alert("a", "Tornado Warning", 2)]));
+        handler.apply_fetch_result(
+            whole(vec![zone_alert("a", "Tornado Warning", 2)]),
+            &PaneRef::across(&[]),
+        );
         assert_ne!(
             handler.content_signature(&PaneRef::bare(0)),
             resolved,
@@ -673,7 +679,10 @@ mod tests {
         let mut handler = handler_with(vec![alert("a", "Tornado Warning")]);
         let first = handler.content_signature(&PaneRef::bare(0));
         let generation_before = handler.data_generation();
-        handler.apply_fetch_result(whole(vec![alert("a", "Tornado Warning")]));
+        handler.apply_fetch_result(
+            whole(vec![alert("a", "Tornado Warning")]),
+            &PaneRef::across(&[]),
+        );
         assert_ne!(
             handler.data_generation(),
             generation_before,
@@ -691,14 +700,20 @@ mod tests {
         let mut handler = handler_with(vec![alert("a", "Tornado Warning")]);
         let one_warning = handler.content_signature(&PaneRef::bare(0));
 
-        handler.apply_fetch_result(whole(vec![
-            alert("a", "Tornado Warning"),
-            alert("b", "Severe Thunderstorm Warning"),
-        ]));
+        handler.apply_fetch_result(
+            whole(vec![
+                alert("a", "Tornado Warning"),
+                alert("b", "Severe Thunderstorm Warning"),
+            ]),
+            &PaneRef::across(&[]),
+        );
         let two_warnings = handler.content_signature(&PaneRef::bare(0));
         assert_ne!(two_warnings, one_warning, "a new warning must move it");
 
-        handler.apply_fetch_result(whole(vec![alert("b", "Severe Thunderstorm Warning")]));
+        handler.apply_fetch_result(
+            whole(vec![alert("b", "Severe Thunderstorm Warning")]),
+            &PaneRef::across(&[]),
+        );
         let b_only = handler.content_signature(&PaneRef::bare(0));
         assert_ne!(b_only, two_warnings, "an expiry must move it");
         assert_ne!(
@@ -728,21 +743,24 @@ mod tests {
     #[test]
     fn the_status_line_splits_what_is_on_the_map_from_what_passed_the_filters() {
         let mut handler = NwsAlertHandler::new();
-        handler.apply_fetch_result(with_zones(
-            vec![
-                zone_alert("a", "Tornado Warning", 3),
-                zone_alert("b", "Tornado Warning", 0),
-                zone_alert("c", "Tornado Warning", 0),
-            ],
-            ZoneResolution {
-                alerts_expected: 3,
-                alerts_complete: 1,
-                alerts_missing: 2,
-                zones_requested: 9,
-                zones_resolved: 3,
-                ..ZoneResolution::default()
-            },
-        ));
+        handler.apply_fetch_result(
+            with_zones(
+                vec![
+                    zone_alert("a", "Tornado Warning", 3),
+                    zone_alert("b", "Tornado Warning", 0),
+                    zone_alert("c", "Tornado Warning", 0),
+                ],
+                ZoneResolution {
+                    alerts_expected: 3,
+                    alerts_complete: 1,
+                    alerts_missing: 2,
+                    zones_requested: 9,
+                    zones_resolved: 3,
+                    ..ZoneResolution::default()
+                },
+            ),
+            &PaneRef::across(&[]),
+        );
         assert_eq!(
             handler.drawn_count(),
             3,
@@ -762,7 +780,10 @@ mod tests {
         );
 
         handler.hidden_alerts.clear();
-        handler.apply_fetch_result(whole(vec![zone_alert("a", "Tornado Warning", 3)]));
+        handler.apply_fetch_result(
+            whole(vec![zone_alert("a", "Tornado Warning", 3)]),
+            &PaneRef::across(&[]),
+        );
         assert_eq!(
             handler.status_line(&PaneRef::bare(0)).as_deref(),
             Some("1 shown - W/Wa/Adv/Oth")

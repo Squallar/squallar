@@ -482,7 +482,7 @@ impl OverlayHandler for SpcOutlookHandler {
         items
     }
 
-    fn apply_fetch_result(&mut self, result: FetchPayload) {
+    fn apply_fetch_result(&mut self, result: FetchPayload, _pane: &PaneRef<'_>) {
         let Some(fetch) = self.state.downcast_round::<SpcOutlookFetchResult>(result) else {
             log::error!("SPC outlook handler received unexpected fetch result type");
             return;
@@ -790,11 +790,14 @@ mod tests {
         product: OutlookProduct,
         result: Result<SpcOutlook, crate::fetch_policy::FetchError>,
     ) {
-        handler.apply_fetch_result(Box::new(SpcOutlookFetchResult {
-            day: OutlookDay::Day3,
-            product,
-            result,
-        }));
+        handler.apply_fetch_result(
+            Box::new(SpcOutlookFetchResult {
+                day: OutlookDay::Day3,
+                product,
+                result,
+            }),
+            &PaneRef::across(&[]),
+        );
     }
 
     /// It must be `_cigprob` and not `_sigprob`. `_sigprob` still answers 200
@@ -1120,11 +1123,14 @@ mod tests {
         product: OutlookProduct,
         result: Result<SpcOutlook, crate::fetch_policy::FetchError>,
     ) {
-        handler.apply_fetch_result(Box::new(SpcOutlookFetchResult {
-            day: OutlookDay::Day1,
-            product,
-            result,
-        }));
+        handler.apply_fetch_result(
+            Box::new(SpcOutlookFetchResult {
+                day: OutlookDay::Day1,
+                product,
+                result,
+            }),
+            &PaneRef::across(&[]),
+        );
     }
 
     fn round(
