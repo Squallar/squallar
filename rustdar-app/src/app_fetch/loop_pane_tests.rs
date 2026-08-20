@@ -1,5 +1,5 @@
 use super::*;
-use rustdar_egui::pane::{LoopPlaybackState, PaneState};
+use rustdar_egui::pane::PaneState;
 use rustdar_radar::archive::Identifier;
 use rustdar_radar::loop_downloads::LoopDownloadManager;
 use rustdar_radar::sites::RadarSite;
@@ -49,7 +49,7 @@ fn pane_showing(site: RadarSite, timestamp: NaiveDateTime) -> PaneState {
 
 fn pane_looping_on(site: RadarSite, lookback_secs: u64, frames: &[u32]) -> PaneState {
     let mut pane = PaneState::with_site(site.name.to_string());
-    pane.loop_state = LoopPlaybackState::new_for_loop(
+    *pane.loop_state_mut() = rustdar_egui::radar_layer::begin_loop(
         lookback_secs,
         &site,
         rustdar_radar::types::RenderView::PlanView,
@@ -57,10 +57,10 @@ fn pane_looping_on(site: RadarSite, lookback_secs: u64, frames: &[u32]) -> PaneS
     for &minute in frames {
         let held = crate::app::render::loop_frames_held(
             crate::app::render::test_loop_allocation(),
-            &pane.loop_state,
+            pane.loop_state(),
             &crate::app::render::test_budgets(),
         );
-        append_polled_frame(&mut pane.loop_state, site.name, ts(minute), held);
+        append_polled_frame(pane.loop_state_mut(), site.name, ts(minute), held);
     }
     pane
 }
@@ -74,11 +74,15 @@ fn budgets() -> rustdar_device_profile::budget::Budgets {
 }
 
 fn held_for(pane: &PaneState) -> usize {
-    crate::app::render::loop_frames_held(allocation(), &pane.loop_state, &budgets())
+    crate::app::render::loop_frames_held(allocation(), pane.loop_state(), &budgets())
 }
 
 fn frame_times(pane: &PaneState) -> Vec<NaiveDateTime> {
-    pane.loop_state.frames.iter().map(|f| f.timestamp).collect()
+    pane.loop_state()
+        .frames
+        .iter()
+        .map(|f| f.timestamp)
+        .collect()
 }
 
 #[test]
@@ -108,13 +112,13 @@ fn a_loop_is_built_from_its_own_panes_scan_not_the_active_panes() {
     );
     assert_eq!(req.start, ts(15), "walked back by the lookback");
 
-    let ls = &panes[1].loop_state;
-    assert_eq!(ls.site, "KOUN");
-    assert_eq!(ls.site_lat, 35.23);
-    assert_eq!(ls.site_lon, -97.46);
+    let ls = panes[1].loop_state();
+    assert_eq!(rustdar_egui::radar_layer::site(ls), "KOUN");
+    assert_eq!(rustdar_egui::radar_layer::coords(ls).0, 35.23);
+    assert_eq!(rustdar_egui::radar_layer::coords(ls).1, -97.46);
     assert!(ls.is_fetching(), "and it is waiting for that listing");
 
-    assert!(!panes[0].loop_state.is_active());
+    assert!(!panes[0].loop_state().is_active());
 
     let req = begin_loop_for_pane(&mut panes, &mut mgr, 0, 600).expect("pane 0 has a scan");
     assert_eq!(req.site, "KTLX");
@@ -131,7 +135,7 @@ fn a_pane_with_no_scan_yields_no_loop() {
     let mut mgr = LoopDownloadManager::new();
 
     assert!(begin_loop_for_pane(&mut panes, &mut mgr, 1, 600).is_none());
-    assert!(!panes[1].loop_state.is_active(), "no loop was started");
+    assert!(!panes[1].loop_state().is_active(), "no loop was started");
     assert!(
         begin_loop_for_pane(&mut panes, &mut mgr, 7, 600).is_none(),
         "and neither does a pane that does not exist"
@@ -245,14 +249,15 @@ fn the_loops_site_decides_not_the_panes_live_site() {
 fn an_inactive_loop_takes_no_frames() {
     let mut panes = [PaneState::with_site("KTLX".to_string())];
     assert_eq!(
-        panes[0].loop_state.site, "",
+        rustdar_egui::radar_layer::site(panes[0].loop_state()),
+        "",
         "precondition: placeholder site"
     );
 
     append_polled_frame_to_loops(&mut panes, "KTLX", ts(10), allocation(), &budgets());
     append_polled_frame_to_loops(&mut panes, "", ts(11), allocation(), &budgets());
 
-    assert!(panes[0].loop_state.frames.is_empty());
+    assert!(panes[0].loop_state().frames.is_empty());
 }
 
 #[test]
@@ -289,7 +294,7 @@ fn appending_evicts_past_the_lookback_window() {
 fn eviction_pulls_the_playhead_back_inside_the_list() {
     let ktlx = site("KTLX", 35.33, -97.27);
     let mut panes = [pane_looping_on(ktlx, 600, &[0, 5, 10])];
-    panes[0].loop_state.current_frame = 2;
+    panes[0].loop_state_mut().current_frame = 2;
 
     append_polled_frame_to_loops(&mut panes, "KTLX", ts(25), allocation(), &budgets());
 
@@ -299,14 +304,15 @@ fn eviction_pulls_the_playhead_back_inside_the_list() {
         "precondition: only the new frame survives"
     );
     assert_eq!(
-        panes[0].loop_state.current_frame, 0,
+        panes[0].loop_state().current_frame,
+        0,
         "the playhead must land on a frame that exists"
     );
     assert!(
         panes[0]
-            .loop_state
+            .loop_state()
             .frames
-            .get(panes[0].loop_state.current_frame)
+            .get(panes[0].loop_state().current_frame)
             .is_some(),
         "and resolve to one, which is what the pane renders through"
     );
@@ -318,9 +324,9 @@ fn live_appends_do_not_take_a_loop_past_its_frame_cap() {
     let held = held_for(&pane_looping_on(ktlx.clone(), 72 * 3600, &[]));
     let sampled: Vec<u32> = (0..held as u32).map(|i| i * 26).collect();
     let mut panes = [pane_looping_on(ktlx, 72 * 3600, &sampled)];
-    panes[0].loop_state.listing_sampled = Some(true);
+    panes[0].loop_state_mut().sampled = Some(true);
     assert_eq!(
-        panes[0].loop_state.frames.len(),
+        panes[0].loop_state().frames.len(),
         held,
         "precondition: the loop starts full",
     );
@@ -337,13 +343,13 @@ fn live_appends_do_not_take_a_loop_past_its_frame_cap() {
     }
 
     assert_eq!(
-        panes[0].loop_state.frames.len(),
+        panes[0].loop_state().frames.len(),
         held,
         "{held} appends took the loop to {} frames against a cap of {held}",
-        panes[0].loop_state.frames.len(),
+        panes[0].loop_state().frames.len(),
     );
     assert!(
-        panes[0].loop_state.current_frame < panes[0].loop_state.frames.len(),
+        panes[0].loop_state().current_frame < panes[0].loop_state().frames.len(),
         "the playhead must land on a frame that exists",
     );
 }
@@ -354,7 +360,7 @@ fn capping_an_appended_loop_keeps_its_whole_window() {
     let held = held_for(&pane_looping_on(ktlx.clone(), 72 * 3600, &[]));
     let sampled: Vec<u32> = (0..held as u32).map(|i| i * 26).collect();
     let mut panes = [pane_looping_on(ktlx, 72 * 3600, &sampled)];
-    panes[0].loop_state.listing_sampled = Some(true);
+    panes[0].loop_state_mut().sampled = Some(true);
     let oldest = ts(sampled[0]);
 
     let newest = *sampled.last().expect("the cap is not zero");
@@ -382,14 +388,15 @@ fn a_loop_holding_every_scan_re_measures_the_cadence_as_it_follows_the_site() {
     let mut panes = [pane_looping_on(ktlx, 72 * 3600, &[0, 9, 18, 27])];
 
     for (sampled, expected) in [(Some(false), Some(540)), (Some(true), Some(259))] {
-        panes[0].loop_state.listing_sampled = sampled;
-        panes[0].loop_state.scan_step_secs = Some(259);
+        panes[0].loop_state_mut().sampled = sampled;
+        panes[0].loop_state_mut().cadence_secs = Some(259);
         append_polled_frame_to_loops(&mut panes, "KTLX", ts(36), allocation(), &budgets());
 
         assert_eq!(
-            panes[0].loop_state.scan_step_secs, expected,
+            panes[0].loop_state().cadence_secs,
+            expected,
             "listing_sampled = {sampled:?}",
         );
-        panes[0].loop_state.frames.pop();
+        panes[0].loop_state_mut().frames.pop();
     }
 }

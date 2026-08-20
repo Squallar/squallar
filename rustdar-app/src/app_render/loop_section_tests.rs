@@ -6,7 +6,7 @@ use crate::app::tests::headless;
 use crate::platform_double::TestBridge;
 use crate::test_keys;
 use rustdar_egui::pane::{
-    LoopFrame, LoopFrameImage, LoopPhase, LoopPlaybackState, PaneKind, SectionLine, SectionLoopKey,
+    LoopFrame, LoopFrameImage, LoopPhase, PaneKind, SectionLine, SectionLoopKey,
 };
 use rustdar_geo::GeoPoint;
 use rustdar_radar::loop_downloads::LoopDownloadManager;
@@ -67,7 +67,7 @@ fn app_with_section_loop(minutes: &[u32]) -> crate::app::App {
     pane.set_kind(PaneKind::CrossSection);
     pane.cross_section_mut().expect("a section pane").line = Some(line());
 
-    let mut ls = LoopPlaybackState::new_for_loop(3600, &site(), RenderView::CrossSection);
+    let mut ls = rustdar_egui::radar_layer::begin_loop(3600, &site(), RenderView::CrossSection);
     ls.phase = LoopPhase::Rendering;
     ls.frames = minutes
         .iter()
@@ -79,7 +79,7 @@ fn app_with_section_loop(minutes: &[u32]) -> crate::app::App {
         })
         .collect();
     ls.retarget_renders_for(PRODUCT, TILT, Some(key()));
-    pane.loop_state = ls;
+    *pane.loop_state_mut() = ls;
     app
 }
 
@@ -166,7 +166,7 @@ fn a_frame_whose_volume_has_not_arrived_is_neither_cut_nor_retired() {
 
     app.dispatch_loop_renders();
 
-    let ls = &app.gui.pane(0).unwrap().loop_state;
+    let ls = &app.gui.pane(0).unwrap().loop_state();
     assert!(
         ls.frames.iter().all(|f| !f.render_failed),
         "a section frame was retired while its volume was still downloading"
@@ -194,7 +194,7 @@ fn a_volume_with_no_ladder_retires_the_frame() {
     app.dispatch_loop_renders();
 
     assert!(
-        app.gui.pane(0).unwrap().loop_state.frames[0].render_failed,
+        app.gui.pane(0).unwrap().loop_state().frames[0].render_failed,
         "a frame whose volume carries nothing to cut was left waiting, so the \
          loop never settles and sits in Rendering for the session"
     );
@@ -217,7 +217,7 @@ fn one_dispatch_pass_starts_at_most_the_capped_number_of_cuts() {
         .gui
         .pane(0)
         .unwrap()
-        .loop_state
+        .loop_state()
         .frames
         .iter()
         .filter(|f| f.render_in_flight)
@@ -243,13 +243,13 @@ fn successive_dispatch_passes_work_through_the_render_set() {
     let mut started = std::collections::HashSet::new();
     for _ in 0..3 {
         app.dispatch_loop_renders();
-        let ls = &app.gui.pane(0).unwrap().loop_state;
+        let ls = &app.gui.pane(0).unwrap().loop_state();
         for (idx, frame) in ls.frames.iter().enumerate() {
             if frame.render_in_flight {
                 started.insert(idx);
             }
         }
-        for frame in &mut app.gui.pane_mut(0).unwrap().loop_state.frames {
+        for frame in &mut app.gui.pane_mut(0).unwrap().loop_state_mut().frames {
             if frame.render_in_flight {
                 frame.render_in_flight = false;
                 frame.render_failed = true;
@@ -270,7 +270,7 @@ fn successive_dispatch_passes_work_through_the_render_set() {
 #[test]
 fn a_finished_cut_is_placed_with_its_own_axes_and_ladder() {
     let ctx = egui::Context::default();
-    let mut ls = LoopPlaybackState::new_for_loop(3600, &site(), RenderView::CrossSection);
+    let mut ls = rustdar_egui::radar_layer::begin_loop(3600, &site(), RenderView::CrossSection);
     ls.phase = LoopPhase::Rendering;
     ls.frames = vec![LoopFrame {
         timestamp: ts(0),
@@ -305,7 +305,7 @@ fn a_finished_cut_is_placed_with_its_own_axes_and_ladder() {
 #[test]
 fn a_cut_for_a_line_the_loop_has_left_is_refused_without_uploading() {
     let ctx = egui::Context::default();
-    let mut ls = LoopPlaybackState::new_for_loop(3600, &site(), RenderView::CrossSection);
+    let mut ls = rustdar_egui::radar_layer::begin_loop(3600, &site(), RenderView::CrossSection);
     ls.phase = LoopPhase::Rendering;
     ls.frames = vec![LoopFrame {
         timestamp: ts(0),
@@ -356,7 +356,7 @@ fn a_cut_for_a_line_the_loop_has_left_is_refused_without_uploading() {
 #[test]
 fn a_cut_that_produced_nothing_retires_its_frame() {
     let ctx = egui::Context::default();
-    let mut ls = LoopPlaybackState::new_for_loop(3600, &site(), RenderView::CrossSection);
+    let mut ls = rustdar_egui::radar_layer::begin_loop(3600, &site(), RenderView::CrossSection);
     ls.phase = LoopPhase::Rendering;
     ls.frames = vec![LoopFrame {
         timestamp: ts(0),
@@ -392,19 +392,20 @@ fn a_frame_is_recut_when_its_volume_resolves_a_different_ladder() {
         panic!("the cached volume must resolve a ladder");
     };
 
-    app.gui.pane_mut(0).unwrap().loop_state.frames[0].image = Some(section_picture(&ctx, current));
+    app.gui.pane_mut(0).unwrap().loop_state_mut().frames[0].image =
+        Some(section_picture(&ctx, current));
     app.dispatch_loop_renders();
     assert!(
-        !app.gui.pane(0).unwrap().loop_state.frames[0].render_in_flight,
+        !app.gui.pane(0).unwrap().loop_state().frames[0].render_in_flight,
         "a frame already cut from this volume's ladder was cut again, so every \
          dispatch pass re-cuts the whole loop"
     );
 
-    app.gui.pane_mut(0).unwrap().loop_state.frames[0].image =
+    app.gui.pane_mut(0).unwrap().loop_state_mut().frames[0].image =
         Some(section_picture(&ctx, current.wrapping_add(1)));
     app.dispatch_loop_renders();
     assert!(
-        app.gui.pane(0).unwrap().loop_state.frames[0].render_in_flight,
+        app.gui.pane(0).unwrap().loop_state().frames[0].render_in_flight,
         "a frame cut from a ladder its volume no longer resolves was left \
          alone, so a section of a partial volume stands for the whole loop"
     );

@@ -348,7 +348,7 @@ fn a_pane_that_did_not_change_radar_keeps_its_loop() {
         .expect("KTLX is in the resolved site table")
         .clone();
     let pane = app.gui.pane_mut(1).expect("the fixture built two panes");
-    pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new_for_loop(
+    *pane.loop_state_mut() = rustdar_egui::radar_layer::begin_loop(
         3600,
         &bystander_site,
         rustdar_radar::types::RenderView::PlanView,
@@ -356,13 +356,13 @@ fn a_pane_that_did_not_change_radar_keeps_its_loop() {
     for minute in [0, 4, 8] {
         let held = crate::app::render::loop_frames_held(
             crate::app::render::test_loop_allocation(),
-            &pane.loop_state,
+            pane.loop_state(),
             &crate::app::render::test_budgets(),
         );
-        super::append_polled_frame(&mut pane.loop_state, BYSTANDER, at(minute), held);
+        super::append_polled_frame(pane.loop_state_mut(), BYSTANDER, at(minute), held);
     }
     let frames_before: Vec<NaiveDateTime> = pane
-        .loop_state
+        .loop_state()
         .frames
         .iter()
         .map(|frame| frame.timestamp)
@@ -419,7 +419,7 @@ fn a_pane_that_did_not_change_radar_keeps_its_loop() {
         .gui
         .pane(1)
         .expect("the fixture built two panes")
-        .loop_state;
+        .loop_state();
     assert!(
         loop_state.is_active(),
         "another pane's site switch switched this pane's loop off",
@@ -481,7 +481,7 @@ fn re_picking_the_site_a_pane_is_on_keeps_its_loop() {
         .expect("KPBZ is in the resolved site table")
         .clone();
     let pane = app.gui.pane_mut(0).expect("a fresh Gui has one pane");
-    pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new_for_loop(
+    *pane.loop_state_mut() = rustdar_egui::radar_layer::begin_loop(
         3600,
         &radar_site,
         rustdar_radar::types::RenderView::PlanView,
@@ -489,13 +489,13 @@ fn re_picking_the_site_a_pane_is_on_keeps_its_loop() {
     for minute in [0, 4, 8] {
         let held = crate::app::render::loop_frames_held(
             crate::app::render::test_loop_allocation(),
-            &pane.loop_state,
+            pane.loop_state(),
             &crate::app::render::test_budgets(),
         );
-        super::append_polled_frame(&mut pane.loop_state, WSR88D, at(minute), held);
+        super::append_polled_frame(pane.loop_state_mut(), WSR88D, at(minute), held);
     }
     let frames_before: Vec<NaiveDateTime> = pane
-        .loop_state
+        .loop_state()
         .frames
         .iter()
         .map(|frame| frame.timestamp)
@@ -527,7 +527,7 @@ fn re_picking_the_site_a_pane_is_on_keeps_its_loop() {
         .gui
         .pane(0)
         .expect("a fresh Gui has one pane")
-        .loop_state;
+        .loop_state();
     assert!(
         loop_state.is_active(),
         "a no-op pick switched the pane's loop off; nothing rebuilds it, so the \

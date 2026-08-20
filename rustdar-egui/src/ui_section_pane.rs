@@ -50,7 +50,7 @@ pub(super) fn render_cross_section(
     let product = pane.selected_product();
     let site = pane.scan_info.as_ref().map(|s| (s.site.lat, s.site.lon));
 
-    let looping = pane.loop_state.is_active();
+    let looping = pane.loop_state().is_active();
     let (state, line) = {
         let Some(state) = pane.cross_section() else {
             return;

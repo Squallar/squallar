@@ -2,7 +2,6 @@ use crate::overlay_cache::OverlayTextureCache;
 use chrono::NaiveDateTime;
 use rustdar_device_profile::budget::MAX_PANES_DESKTOP;
 use rustdar_radar::hover::HoverSource;
-use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::{RadarProduct, RenderView, ScanInfo};
 use rustdar_source::handler::{PaneMut, PaneRef};
 use rustdar_source::id::{LayerId, known};
@@ -281,32 +280,58 @@ pub enum LoopPhase {
     Paused,
 }
 
-pub struct LoopPlaybackState {
+/// **One layer's own place on the timeline, in one pane.**
+///
+/// Everything a layer knows about the frames it can show and which of them it
+/// is showing. It lives on the [`LayerSlot`], so two layers in one pane keep
+/// two of these and a layer in two panes keeps one per pane — which is what
+/// lets a pane animate radar and a model field at their own cadences.
+///
+/// **Generic on purpose.** No member here names a radar site or a coordinate.
+/// The source-specific half of a layer's timeline — for radar, the geometry
+/// its frames are projected from — rides in [`Self::anchor`] as a value only
+/// the owning layer's own code names ([`crate::radar_layer::LoopGeometry`]),
+/// so a second frame-series layer inherits a timeline rather than three
+/// NEXRAD fields.
+pub struct LayerTimeState {
     pub phase: LoopPhase,
     pub current_frame: usize,
     pub frames: Vec<LoopFrame>,
-    pub lookback_secs: u64,
+    /// The window this layer's frames were listed for, in seconds — the extent
+    /// the arrival path slides as newer frames land.
+    pub span_secs: u64,
+    /// **What the source answered when asked which frames exist.** `None`
+    /// until a listing has been accepted through the contract; the frames the
+    /// pane actually holds are [`Self::frames`], and this is the answer they
+    /// were chosen from. No producer writes it before WO-M12 — radar's
+    /// listing still arrives on its own path.
+    pub listing: Option<rustdar_source::time::FrameListing>,
     /// Whether the listing this loop was built from had to be **sampled** to fit
     /// the frame cap — `Some(true)` when scans were dropped, `Some(false)` when
     /// every scan in the window became a frame, `None` before a listing has been
     /// accepted at all.
-    pub listing_sampled: Option<bool>,
-    /// The site's own scan cadence over this loop's window, in seconds: the median
-    /// gap between consecutive scans in the listing the loop was built from,
+    ///
+    /// A **recorded decision, never a derivation**: the frames alone cannot say
+    /// whether a wider gap is a dropped scan or a slower sweep.
+    pub sampled: Option<bool>,
+    /// The source's own frame cadence over this window, in seconds: the median
+    /// gap between consecutive frames in the listing the loop was built from,
     /// measured **before** any sampling. `None` until a listing has been accepted.
     /// Measured cadences: TDWR 360 s (VCP 80 and 90), WSR-88D precip (VCP
     /// 212/215) 259 s, clear-air (VCP 35) 517 s. A median, not a mean: a site
     /// that changes VCP mid-window mixes two cadences.
-    pub scan_step_secs: Option<u32>,
+    ///
+    /// Recorded with [`Self::sampled`], and for the same reason.
+    pub cadence_secs: Option<u32>,
     pub last_advance: Option<web_time::Instant>,
     /// When this loop entered [`LoopPhase::FetchingScanList`], or `None` for a
     /// loop that was never built ([`Self::new`]).
     pub listing_since: Option<web_time::Instant>,
-    /// NEXRAD site code the loop's geometry belongs to, captured at loop creation
-    /// from the same lookup as `site_lat`/`site_lon` — not the pane's live `site`.
-    pub site: String,
-    pub site_lat: f64,
-    pub site_lon: f64,
+    /// **The source-specific half of this layer's timeline**, opaque here and
+    /// named by the layer that owns it. Radar puts a
+    /// [`crate::radar_layer::LoopGeometry`] in it; read it back with
+    /// [`Self::anchor_as`].
+    pub anchor: Option<rustdar_source::handler::FetchPayload>,
     /// The [`RenderTarget`] every frame's render state was produced for, or `None`
     /// before the first dispatch. When the pane's selection moves both the
     /// texture and the `render_failed` flag are stale; see `retarget_renders`.
@@ -328,6 +353,68 @@ pub struct PaneConfigBaggage {
     pub layer_slots: Vec<serde_json::Value>,
     /// Whole pane-level fields this build does not know.
     pub fields: serde_json::Map<String, serde_json::Value>,
+}
+
+/// **How far one press of the navigation buttons moves the pane's clock.**
+///
+/// [`Self::OneFrame`] is not a duration: it means "to the next frame the
+/// pane's time-primary layer actually has", which is a different distance at
+/// every site and every VCP. It persists as the `0` the config file has
+/// always written for it, so no reader of an older or newer file has to
+/// change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeStep {
+    Secs(i64),
+    OneFrame,
+}
+
+impl TimeStep {
+    /// The step as the config file spells it — `0` for [`Self::OneFrame`].
+    pub fn as_secs(self) -> i64 {
+        match self {
+            Self::Secs(secs) => secs,
+            Self::OneFrame => 0,
+        }
+    }
+
+    /// The step a config file's number names.
+    pub fn from_secs(secs: i64) -> Self {
+        if secs == 0 {
+            Self::OneFrame
+        } else {
+            Self::Secs(secs)
+        }
+    }
+}
+
+/// **One pane's posture on the timeline**: how wide a window it is looking
+/// over, how fast it plays, and how far one step moves it.
+///
+/// A pane fact, not a layer fact — the layers each keep their own
+/// [`LayerTimeState`] and are shown at whatever moment this posture names.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaneTimePosture {
+    /// How far back the pane's timeline reaches, in seconds. The setting a
+    /// new listing is asked for; the window a listing was actually built with
+    /// is the layer's own [`LayerTimeState::span_secs`].
+    pub span_secs: u64,
+    /// Playback rate, in frames per second.
+    pub speed_fps: f32,
+    /// How far one navigation step moves the pane.
+    pub step: TimeStep,
+}
+
+/// The posture a pane is born with: the same numbers the config file's own
+/// defaults carry, so a pane that has never been configured and a pane loaded
+/// from a default file are the same pane.
+impl Default for PaneTimePosture {
+    fn default() -> Self {
+        Self {
+            span_secs: 3600,
+            speed_fps: 5.0,
+            step: TimeStep::Secs(600),
+        }
+    }
 }
 
 /// **One layer, in one pane: its identity, whether it draws, and its saved
@@ -357,6 +444,11 @@ pub struct LayerSlot {
     /// hydrated — a fresh pane, a clone — carries `None` and is re-derived on
     /// the next hydrate rather than being copied.
     pub state: Option<rustdar_source::handler::FetchPayload>,
+    /// **This layer's own place on the timeline, in this pane** — the frames
+    /// it holds and which of them it is showing. Runtime only, like
+    /// [`Self::state`]: nothing here persists, and a stack copied between
+    /// panes does not bring another pane's frames with it.
+    pub time: LayerTimeState,
 }
 
 /// **Cloning a slot does not clone its state.** The state is a `dyn Any` with
@@ -372,6 +464,11 @@ impl Clone for LayerSlot {
             enabled: self.enabled,
             config: self.config.clone(),
             state: None,
+            // For the same reason `state` is not cloned, and one more: a
+            // timeline is *this pane's* position and *this pane's* textures,
+            // so handing a copy to another pane would show it frames it never
+            // asked for. `adopt_layers` keeps each destination pane's own.
+            time: LayerTimeState::new(),
         }
     }
 }
@@ -384,6 +481,7 @@ impl std::fmt::Debug for LayerSlot {
             .field("enabled", &self.enabled)
             .field("config", &self.config)
             .field("state", &self.state.is_some())
+            .field("frames", &self.time.frames.len())
             .finish()
     }
 }
@@ -391,7 +489,10 @@ impl std::fmt::Debug for LayerSlot {
 /// **Two slots are equal when they carry the same layer, flag and saved
 /// configuration.** The runtime state is deliberately not compared: it is
 /// derived from `config`, so comparing it would make a hydrated slot unequal
-/// to the identical slot that has not been asked for yet.
+/// to the identical slot that has not been asked for yet. The timeline is
+/// left out for the same reason and one more: it is a position, and two
+/// slots for the same layer are the same slot whether or not one of them is
+/// mid-playback.
 impl PartialEq for LayerSlot {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id && self.enabled == other.enabled && self.config == other.config
@@ -406,6 +507,7 @@ impl LayerSlot {
             enabled,
             config: serde_json::Value::Null,
             state: None,
+            time: LayerTimeState::new(),
         }
     }
 }
@@ -493,8 +595,6 @@ pub struct PaneState {
     /// Private since WO-E6b — see [`Self::site`].
     selected_elevation: f32,
     pub viewing_live: bool,
-    /// Time navigation step size in seconds (0 = single scan mode).
-    pub time_step_secs: i64,
     /// Whether this pane follows shared time (plan §3.7). Persisted; default
     /// **true** — every pane before the field existed behaved as linked.
     pub time_link: bool,
@@ -522,10 +622,15 @@ pub struct PaneState {
     /// [`PaneConfigBaggage`]. Written by `load_ui_config`, read only by
     /// `ui_config_json`, and never acted on in between.
     pub config_baggage: PaneConfigBaggage,
-    /// Radar display state. Always present; in single-frame mode holds at most
-    /// one frame (the current static radar image). In multi-frame mode holds
-    /// the full animated loop.
-    pub loop_state: LoopPlaybackState,
+    /// **Where this pane sits on the clock, and how it moves along it.** The
+    /// pane's own posture, shared by every layer it draws — the layers keep
+    /// their own [`LayerTimeState`] on their slots.
+    pub time: PaneTimePosture,
+    /// The answer [`Self::loop_state`] gives a pane that has no radar slot to
+    /// keep one on: inactive, empty, and never written. A pane the `Gui` owns
+    /// has been through `initialize_pane_enabled` and has the slot, so this is
+    /// what a bare [`PaneState`] answers before it is seeded.
+    orphan_time: LayerTimeState,
     /// Which site is currently being loaded for this pane (transient loading indicator).
     pub loading_site: Option<String>,
     /// Generation counter for RadarSites texture invalidation.
@@ -534,51 +639,55 @@ pub struct PaneState {
     pub content: PaneContent,
 }
 
-impl Default for LoopPlaybackState {
+impl Default for LayerTimeState {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl LoopPlaybackState {
+impl LayerTimeState {
+    /// A layer with no timeline: nothing listed, nothing held, inactive.
     pub fn new() -> Self {
         Self {
             phase: LoopPhase::Inactive,
             current_frame: 0,
             frames: Vec::new(),
-            lookback_secs: 0,
-            listing_sampled: None,
-            scan_step_secs: None,
+            span_secs: 0,
+            listing: None,
+            sampled: None,
+            cadence_secs: None,
             last_advance: None,
             listing_since: None,
-            site: String::new(),
-            site_lat: 0.0,
-            site_lon: 0.0,
+            anchor: None,
             rendered_for: None,
             view: RenderView::PlanView,
             view_key: None,
         }
     }
 
-    pub fn new_for_loop(lookback_secs: u64, site: &RadarSite, view: RenderView) -> Self {
+    /// A layer that has just been asked for a listing covering `span_secs`,
+    /// anchored at `anchor` — the source-specific half only that source names.
+    pub fn begin(
+        span_secs: u64,
+        view: RenderView,
+        anchor: rustdar_source::handler::FetchPayload,
+    ) -> Self {
         Self {
             phase: LoopPhase::FetchingScanList,
-            current_frame: 0,
-            frames: Vec::new(),
-            lookback_secs,
-            listing_sampled: None,
-            scan_step_secs: None,
-            last_advance: None,
+            span_secs,
             // The one place `FetchingScanList` is written, so the one place the
             // clock on that phase starts. See [`Self::listing_since`].
             listing_since: Some(web_time::Instant::now()),
-            site: site.name.to_string(),
-            site_lat: site.lat,
-            site_lon: site.lon,
-            rendered_for: None,
+            anchor: Some(anchor),
             view,
-            view_key: None,
+            ..Self::new()
         }
+    }
+
+    /// This layer's [`Self::anchor`] as `T`, or `None` when it has none (or it
+    /// is not a `T`). The one door onto the source-specific half.
+    pub fn anchor_as<T: 'static>(&self) -> Option<&T> {
+        self.anchor.as_deref()?.downcast_ref::<T>()
     }
 
     pub fn is_active(&self) -> bool {
@@ -830,11 +939,14 @@ impl LoopPlaybackState {
         let tilt_matters = self.view.elevation_selects_picture(product);
         // Runs for every looping pane every frame, and almost always finds no change,
         // so ask before building a target rather than allocating one to throw away.
+        // The site the frames are projected from, which this layer keeps in its
+        // own anchor rather than in the generic timeline beside it.
+        let site = crate::radar_layer::site(self);
         if self.rendered_for.as_ref().is_some_and(|t| {
             if tilt_matters {
-                t.matches_parts(&self.site, product, elevation)
+                t.matches_parts(site, product, elevation)
             } else {
-                t.site == self.site && t.product == product
+                t.site == site && t.product == product
             }
         }) && self.view_key == key
         {
@@ -843,7 +955,8 @@ impl LoopPlaybackState {
 
         // Nothing to discard before the first dispatch — frames start blank.
         let had_previous_target = self.rendered_for.is_some();
-        self.rendered_for = Some(RenderTarget::new(self.site.clone(), product, elevation));
+        let site = site.to_string();
+        self.rendered_for = Some(RenderTarget::new(site, product, elevation));
         self.view_key = key;
         if !had_previous_target {
             return false;
@@ -873,7 +986,7 @@ impl LoopPlaybackState {
             .unwrap_or(0);
         let mut kept: Vec<Option<LoopFrame>> = self.frames.drain(..).map(Some).collect();
         self.frames = indices.into_iter().filter_map(|i| kept[i].take()).collect();
-        self.listing_sampled = Some(true);
+        self.sampled = Some(true);
         true
     }
 
@@ -1002,7 +1115,6 @@ impl PaneState {
             selected_product: RadarProduct::Reflectivity,
             selected_elevation: 0.0,
             viewing_live: true,
-            time_step_secs: 600,
             time_link: true,
             viewport_link: true,
             layer_link: true,
@@ -1021,7 +1133,8 @@ impl PaneState {
             // that seeding and now the order comes with them.
             layers: Vec::new(),
             config_baggage: PaneConfigBaggage::default(),
-            loop_state: LoopPlaybackState::new(),
+            time: PaneTimePosture::default(),
+            orphan_time: LayerTimeState::new(),
             loading_site: None,
             radar_sites_render_gen: 0,
             content: PaneContent::Map(Box::default()),
@@ -1133,7 +1246,7 @@ impl PaneState {
             return true;
         }
         map.render = render;
-        self.loop_state = LoopPlaybackState::new();
+        *self.loop_state_mut() = LayerTimeState::new();
         true
     }
 
@@ -1171,7 +1284,7 @@ impl PaneState {
         let previous = self.render_view();
         self.content = content;
         if self.render_view() != previous || !self.render_view().can_loop() {
-            self.loop_state = LoopPlaybackState::new();
+            *self.loop_state_mut() = LayerTimeState::new();
         }
     }
 
@@ -1195,19 +1308,19 @@ impl PaneState {
     /// kind. One lookup, so the two accessors above cannot walk to different
     /// frames.
     fn active_loop_image(&self) -> Option<&LoopFrameImage> {
-        self.loop_state
+        self.loop_state()
             .frames
-            .get(self.loop_state.current_frame)
+            .get(self.loop_state().current_frame)
             .and_then(|f| f.image.as_ref())
     }
 
     /// When the data behind the image *currently on screen* was collected.
     pub fn data_time_on_screen(&self) -> Option<NaiveDateTime> {
-        if self.loop_state.is_active() {
+        if self.loop_state().is_active() {
             return self
-                .loop_state
+                .loop_state()
                 .frames
-                .get(self.loop_state.current_frame)
+                .get(self.loop_state().current_frame)
                 .map(|f| f.timestamp);
         }
         self.data_time
@@ -1217,7 +1330,7 @@ impl PaneState {
     /// has selected** — the product and sweep the pixels really are, so a caller
     /// can say so.
     pub fn stale_image_on_screen(&self) -> Option<(RadarProduct, f32)> {
-        if self.loop_state.is_active() {
+        if self.loop_state().is_active() {
             return None;
         }
         let meta = self
@@ -1248,7 +1361,7 @@ impl PaneState {
         if self.selected_product() != RadarProduct::Velocity || !self.is_map() {
             return None;
         }
-        if self.loop_state.is_active() {
+        if self.loop_state().is_active() {
             // No product gate here, and none is needed: `retarget_renders`
             // drops every frame texture the moment the selection moves, so a
             // looping pane cannot hold a frame depicting anything else.
@@ -1270,7 +1383,7 @@ impl PaneState {
         if self.selected_product() != RadarProduct::HydrometeorClassification || !self.is_map() {
             return None;
         }
-        if self.loop_state.is_active() {
+        if self.loop_state().is_active() {
             return self
                 .active_image()
                 .and_then(|frame| frame.melting_layer_source);
@@ -1291,7 +1404,7 @@ impl PaneState {
         if self.selected_product() != RadarProduct::StormRelativeVelocity || !self.is_map() {
             return None;
         }
-        if self.loop_state.is_active() {
+        if self.loop_state().is_active() {
             return self.active_image().and_then(|frame| frame.storm_motion);
         }
         if self.stale_image_on_screen().is_some() {
@@ -1348,6 +1461,38 @@ impl PaneState {
     }
 
     /// This pane's slot for `id`, mutably.
+    /// **One layer's timeline in this pane.** A layer with no slot has no
+    /// timeline either and answers with the empty one — inactive, no frames.
+    pub fn time_state(&self, id: &LayerId) -> &LayerTimeState {
+        self.slot(id).map_or(&self.orphan_time, |slot| &slot.time)
+    }
+
+    /// [`Self::time_state`], to write. A layer with no slot gains one, at the
+    /// top of the stack — the same answer [`Self::set_overlay_enabled`] gives
+    /// a layer it is asked about and this pane has never heard of.
+    pub fn time_state_mut(&mut self, id: &LayerId) -> &mut LayerTimeState {
+        if self.slot(id).is_none() {
+            self.layers.push(LayerSlot::new(id.clone(), false));
+        }
+        &mut self
+            .layers
+            .iter_mut()
+            .find(|slot| slot.id == *id)
+            .expect("the slot was just inserted")
+            .time
+    }
+
+    /// **The radar layer's timeline in this pane** — what the loop transport,
+    /// the dispatcher and the arrival path all mean by "this pane's loop".
+    pub fn loop_state(&self) -> &LayerTimeState {
+        self.time_state(&known::RADAR)
+    }
+
+    /// [`Self::loop_state`], to write.
+    pub fn loop_state_mut(&mut self) -> &mut LayerTimeState {
+        self.time_state_mut(&known::RADAR)
+    }
+
     pub fn slot_mut(&mut self, id: &LayerId) -> Option<&mut LayerSlot> {
         self.layers.iter_mut().find(|slot| slot.id == *id)
     }
@@ -1430,8 +1575,24 @@ impl PaneState {
     /// Take a whole layer stack — order, flags and configs together. The one
     /// operation layer-link sync needs, and the reason it cannot lose a half:
     /// there are no longer three halves to keep in step.
+    /// **Timelines do not travel.** The adopted stack arrives with fresh,
+    /// empty [`LayerTimeState`]s (see [`LayerSlot::clone`]); this pane's own
+    /// are carried across by id, so a layer-link sync moves flags, order and
+    /// configs and leaves every pane where it was on the clock. Before the
+    /// timeline lived on the slot it was a separate field this call could not
+    /// reach, and that behaviour is what is preserved here.
     pub fn adopt_layers(&mut self, layers: &[LayerSlot]) {
+        let mut mine: Vec<(LayerId, LayerTimeState)> = self
+            .layers
+            .drain(..)
+            .map(|slot| (slot.id, slot.time))
+            .collect();
         self.layers = layers.to_vec();
+        for slot in &mut self.layers {
+            if let Some(pos) = mine.iter().position(|(id, _)| *id == slot.id) {
+                slot.time = mine.remove(pos).1;
+            }
+        }
     }
 
     /// **Give every slot its live state**, for the handlers that keep one.

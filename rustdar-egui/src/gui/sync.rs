@@ -33,6 +33,27 @@ impl Gui {
             .collect()
     }
 
+    /// **Set the timeline window, everywhere it is read.** The setting is
+    /// persisted once, at the root of the config file, and every pane's
+    /// posture carries a copy — so it is written to every pane, not to the
+    /// sync group: the one number has always applied to the whole window,
+    /// linked or not.
+    pub(crate) fn set_loop_span_secs(&mut self, secs: u64) {
+        self.loop_lookback_secs = secs;
+        for pane in &mut self.panes {
+            pane.time.span_secs = secs;
+        }
+    }
+
+    /// [`Self::set_loop_span_secs`] for the playback rate, and for the same
+    /// reason.
+    pub(crate) fn set_loop_speed_fps(&mut self, fps: f32) {
+        self.loop_speed_fps = fps;
+        for pane in &mut self.panes {
+            pane.time.speed_fps = fps;
+        }
+    }
+
     /// Propagate layer settings from a layer-linked active pane to the other
     /// layer-linked panes. Also converges site and scan_info so the linked
     /// group displays the same radar site.
@@ -44,7 +65,7 @@ impl Gui {
         let active_site = src.site().to_string();
         let active_scan_info = src.scan_info.clone();
         let active_viewing_live = src.viewing_live;
-        let active_time_step_secs = src.time_step_secs;
+        let active_time_step = src.time.step;
         let active_layers = src.layers.clone();
         let active_selected_product = src.selected_product();
         let active_selected_elevation = src.selected_elevation();
@@ -61,7 +82,7 @@ impl Gui {
             // The one gated pair — see the method note.
             if p.time_link {
                 p.viewing_live = active_viewing_live;
-                p.time_step_secs = active_time_step_secs;
+                p.time.step = active_time_step;
             }
             // The copy arrives with configs but no state: a slot's
             // state is derived, never shared between panes.

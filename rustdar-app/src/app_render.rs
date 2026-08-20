@@ -8,6 +8,7 @@ use rustdar_device_profile::constants::{
 };
 use rustdar_egui::actions::GuiAction;
 use rustdar_egui::pane::{BroadcastSweep, ELEVATION_TOLERANCE, RenderTarget};
+use rustdar_egui::radar_layer;
 use rustdar_radar::loop_downloads::{
     FramePlan, L3FrameState, LoopFrameData, PendingDownloads, PendingL3Pairings,
 };
@@ -1615,7 +1616,7 @@ impl super::App {
             let Some(plan) = accept_scan_listing(
                 allocation,
                 &budgets,
-                &mut pane.loop_state,
+                pane.loop_state_mut(),
                 &resp.site,
                 resp.scans,
             ) else {
@@ -1846,7 +1847,7 @@ impl super::App {
 
             let counter = &mut self.texture_counter;
             let Some(texture) =
-                accept_render_result(&mut pane.loop_state, &mut rr, gates, |color_image| {
+                accept_render_result(pane.loop_state_mut(), &mut rr, gates, |color_image| {
                     *counter += 1;
                     // `color_image` is the only copy of this frame's pixels on this
                     // thread — the renderer's RGBA buffer was dropped on the worker —
@@ -1870,7 +1871,7 @@ impl super::App {
                     {
                         continue;
                     }
-                    let Some(sibling_loop) = self.gui.pane(sibling_idx).map(|p| &p.loop_state)
+                    let Some(sibling_loop) = self.gui.pane(sibling_idx).map(|p| p.loop_state())
                     else {
                         continue;
                     };
@@ -1882,7 +1883,7 @@ impl super::App {
                     let Some(sibling) = self.gui.pane_mut(sibling_idx) else {
                         continue;
                     };
-                    let Some(sframe) = sibling.loop_state.frame_accepting_broadcast_mut(
+                    let Some(sframe) = sibling.loop_state_mut().frame_accepting_broadcast_mut(
                         rr.timestamp,
                         &rr.target,
                         sweep,
@@ -1913,8 +1914,8 @@ impl super::App {
             let Some(p) = self.gui.pane_mut(pidx) else {
                 continue;
             };
-            let budget = loop_render_budget(allocation, &p.loop_state, &budgets);
-            if settle_loop_phase(loop_mgr, pidx, &mut p.loop_state, budget) {
+            let budget = loop_render_budget(allocation, p.loop_state(), &budgets);
+            if settle_loop_phase(loop_mgr, pidx, p.loop_state_mut(), budget) {
                 abandoned.push(pidx);
             }
         }
@@ -1952,7 +1953,7 @@ impl super::App {
             let Some(pane) = self.gui.pane(idx) else {
                 continue;
             };
-            let ls = &pane.loop_state;
+            let ls = pane.loop_state();
             if !ls.is_active() {
                 continue;
             }
@@ -1985,7 +1986,7 @@ impl super::App {
                 continue;
             }
             let pane = self.gui.pane_mut(idx).unwrap();
-            let ls = &mut pane.loop_state;
+            let ls = pane.loop_state_mut();
             ls.phase = rustdar_egui::pane::LoopPhase::Playing;
             ls.last_advance = Some(now);
             // Align all panes to the last frame so they start from the same position
@@ -1998,13 +1999,15 @@ impl super::App {
     /// Advance loop playback for all panes with active playing loops.
     fn advance_loop_playback(&mut self) {
         let now = web_time::Instant::now();
-        let interval = loop_interval(self.gui.loop_speed_fps);
 
         for pane_idx in 0..self.gui.pane_count() {
             let Some(pane) = self.gui.pane_mut(pane_idx) else {
                 continue;
             };
-            let ls = &mut pane.loop_state;
+            // The pane's own posture, which every pane carries the same copy
+            // of — see `Gui::set_loop_speed_fps`.
+            let interval = loop_interval(pane.time.speed_fps);
+            let ls = pane.loop_state_mut();
             if !ls.is_active() || !ls.is_playing() || ls.frames.is_empty() {
                 continue;
             }
@@ -2042,7 +2045,7 @@ impl super::App {
             let Some(pane) = self.gui.pane(pane_idx) else {
                 continue;
             };
-            let ls = &pane.loop_state;
+            let ls = pane.loop_state();
             if !ls.is_active() {
                 continue;
             }
@@ -2050,7 +2053,11 @@ impl super::App {
                 let Some(product) = loop_product(ls) else {
                     continue;
                 };
-                let key = (ls.site.clone(), product, ls.volume_key().cloned());
+                let key = (
+                    radar_layer::site(ls).to_string(),
+                    product,
+                    ls.volume_key().cloned(),
+                );
                 let seen_before = seen.contains(&key);
                 if !seen_before {
                     seen.push(key);
@@ -2182,7 +2189,7 @@ impl super::App {
                     self.render.srv_fallback(),
                 )
             });
-            let ls = &mut pane.loop_state;
+            let ls = pane.loop_state_mut();
             if !ls.is_active() {
                 retire_queues.push(pane_idx);
                 continue;
@@ -2281,13 +2288,13 @@ impl super::App {
             let Some(pane) = self.gui.pane(pane_idx) else {
                 continue;
             };
-            let ls = &pane.loop_state;
+            let ls = pane.loop_state();
             if !ls.is_active() || ls.frames.is_empty() {
                 continue;
             }
 
-            let site_lat = ls.site_lat;
-            let site_lon = ls.site_lon;
+            let site_lat = radar_layer::coords(ls).0;
+            let site_lon = radar_layer::coords(ls).1;
 
             // Set by `retarget_renders` in the loop above for every active, non-empty
             // loop. Carried through the plan so the dedup, the donor search and the
@@ -2297,7 +2304,7 @@ impl super::App {
             };
 
             // The intended render set — shared with the readiness check so the two
-            // cannot drift apart (see `LoopPlaybackState::render_set_settled`).
+            // cannot drift apart (see `LayerTimeState::render_set_settled`).
             let indices = ls.render_set_indices(loop_render_budget(allocation, ls, &budgets));
 
             if ls.view == rustdar_radar::types::RenderView::Volume {
@@ -2363,7 +2370,7 @@ impl super::App {
                         && let Some((src_pane, src_frame)) = find_section_donor(
                             (0..pane_count)
                                 .filter(|&i| self.gui.pane_layer_linked(i))
-                                .filter_map(|i| self.gui.pane(i).map(|p| (i, &p.loop_state))),
+                                .filter_map(|i| self.gui.pane(i).map(|p| (i, p.loop_state()))),
                             pane_idx,
                             frame.timestamp,
                             &target,
@@ -2425,7 +2432,7 @@ impl super::App {
                     let donor = find_donor(
                         (0..pane_count)
                             .filter(|&i| self.gui.pane_layer_linked(i))
-                            .filter_map(|i| self.gui.pane(i).map(|p| (i, &p.loop_state))),
+                            .filter_map(|i| self.gui.pane(i).map(|p| (i, p.loop_state()))),
                         pane_idx,
                         frame.timestamp,
                         &target,
@@ -2479,7 +2486,7 @@ impl super::App {
         // Retire frames that cannot be rendered at the selected product/elevation
         for (pane_idx, frame_idx) in to_mark_failed {
             if let Some(pane) = self.gui.pane_mut(pane_idx)
-                && let Some(frame) = pane.loop_state.frames.get_mut(frame_idx)
+                && let Some(frame) = pane.loop_state_mut().frames.get_mut(frame_idx)
             {
                 frame.render_failed = true;
             }
@@ -2493,7 +2500,7 @@ impl super::App {
                 let Some(src) = self.gui.pane(req.src_pane) else {
                     continue;
                 };
-                let Some(sframe) = src.loop_state.frames.get(req.src_frame) else {
+                let Some(sframe) = src.loop_state().frames.get(req.src_frame) else {
                     continue;
                 };
                 let Some(image) = sframe.image.clone() else {
@@ -2504,7 +2511,7 @@ impl super::App {
             let Some(dest) = self.gui.pane_mut(req.dest_pane) else {
                 continue;
             };
-            if let Some(dframe) = dest.loop_state.frames.get_mut(req.dest_frame) {
+            if let Some(dframe) = dest.loop_state_mut().frames.get_mut(req.dest_frame) {
                 dframe.image = Some(cloned);
             }
         }
@@ -2530,7 +2537,7 @@ impl super::App {
             );
 
             if spawned && let Some(pane) = self.gui.pane_mut(req.pane_idx) {
-                pane.loop_state.frames[req.frame_idx].render_in_flight = true;
+                pane.loop_state_mut().frames[req.frame_idx].render_in_flight = true;
             }
         }
 
@@ -2544,7 +2551,7 @@ impl super::App {
                 frame_data(&self.loop_mgr, &req.target, req.timestamp)
             else {
                 if let Some(pane) = self.gui.pane_mut(req.pane_idx)
-                    && let Some(frame) = pane.loop_state.frames.get_mut(req.frame_idx)
+                    && let Some(frame) = pane.loop_state_mut().frames.get_mut(req.frame_idx)
                 {
                     frame.render_failed = true;
                 }
@@ -2554,7 +2561,7 @@ impl super::App {
             match self.spawn_loop_section_render(req, scan, declared) {
                 crate::render_dispatch::SectionDispatch::Dispatched => {
                     if let Some(pane) = self.gui.pane_mut(pane_idx)
-                        && let Some(frame) = pane.loop_state.frames.get_mut(frame_idx)
+                        && let Some(frame) = pane.loop_state_mut().frames.get_mut(frame_idx)
                     {
                         frame.render_in_flight = true;
                     }
@@ -2563,7 +2570,7 @@ impl super::App {
                 crate::render_dispatch::SectionDispatch::Busy => {}
                 crate::render_dispatch::SectionDispatch::NoPayload => {
                     if let Some(pane) = self.gui.pane_mut(pane_idx)
-                        && let Some(frame) = pane.loop_state.frames.get_mut(frame_idx)
+                        && let Some(frame) = pane.loop_state_mut().frames.get_mut(frame_idx)
                     {
                         frame.render_failed = true;
                     }
@@ -2622,7 +2629,7 @@ impl super::App {
             let Some(pane) = self.gui.pane_mut(req.pane_idx) else {
                 continue;
             };
-            let Some(frame) = pane.loop_state.frames.get_mut(req.frame_idx) else {
+            let Some(frame) = pane.loop_state_mut().frames.get_mut(req.frame_idx) else {
                 continue;
             };
             match found.entry {
@@ -2660,7 +2667,7 @@ impl super::App {
 
             let counter = &mut self.texture_counter;
             let Some(placed) =
-                accept_section_result(&mut pane.loop_state, &mut sr, |color_image| {
+                accept_section_result(pane.loop_state_mut(), &mut sr, |color_image| {
                     *counter += 1;
                     ctx.load_texture(
                         format!("loop_section_{counter}"),
@@ -2689,13 +2696,16 @@ impl super::App {
                 let Some(sibling) = self.gui.pane_mut(sibling_idx) else {
                     continue;
                 };
-                let Some(sframe) = sibling.loop_state.frame_accepting_section_broadcast_mut(
-                    sr.timestamp,
-                    &sr.target,
-                    &sr.key,
-                    sr.ladder,
-                    own_ladder,
-                ) else {
+                let Some(sframe) = sibling
+                    .loop_state_mut()
+                    .frame_accepting_section_broadcast_mut(
+                        sr.timestamp,
+                        &sr.target,
+                        &sr.key,
+                        sr.ladder,
+                        own_ladder,
+                    )
+                else {
                     continue;
                 };
                 // Its own cut, if any, is now redundant: same key, same ladder,
@@ -2733,24 +2743,24 @@ fn section_source_refusal(
 fn accept_scan_listing(
     allocation: LoopAllocation,
     budgets: &rustdar_device_profile::budget::Budgets,
-    ls: &mut rustdar_egui::pane::LoopPlaybackState,
+    ls: &mut rustdar_egui::pane::LayerTimeState,
     site: &str,
     scans: Vec<(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)>,
 ) -> Option<FramePlan> {
-    if !ls.is_active() || ls.site != site {
+    if !ls.is_active() || radar_layer::site(ls) != site {
         return None;
     }
 
     if scans.is_empty() {
         log::warn!("Loop: no {site} scans in the requested window; leaving loop mode");
-        *ls = rustdar_egui::pane::LoopPlaybackState::new();
+        *ls = rustdar_egui::pane::LayerTimeState::new();
         return None;
     }
 
     // The site's own cadence, read off the listing *before* the sampling below
     // throws scans away. Once sampled there is no way back to it, and it is what
     // the timeline caption needs to tell "every scan" from "one in five".
-    ls.scan_step_secs = median_step_secs(
+    ls.cadence_secs = median_step_secs(
         &scans
             .iter()
             .map(|(timestamp, _id)| *timestamp)
@@ -2763,7 +2773,7 @@ fn accept_scan_listing(
     let held = loop_frames_held(allocation, ls, budgets);
     let total = scans.len();
     let sample = rustdar_egui::pane::listing_sample_indices(total, held);
-    ls.listing_sampled = Some(sample.is_some());
+    ls.sampled = Some(sample.is_some());
     let scans = match sample {
         Some(indices) => {
             log::info!("Loop: sampled {total} down to {held} frames for {site}");
@@ -2809,7 +2819,7 @@ pub(super) fn median_step_secs(times: &[chrono::NaiveDateTime]) -> Option<u32> {
 fn settle_loop_phase(
     loop_mgr: &rustdar_radar::loop_downloads::LoopDownloadManager,
     pane_idx: usize,
-    ls: &mut rustdar_egui::pane::LoopPlaybackState,
+    ls: &mut rustdar_egui::pane::LayerTimeState,
     budget: usize,
 ) -> bool {
     if !ls.is_active() || ls.is_render_ready() || ls.frames.is_empty() {
@@ -2827,12 +2837,12 @@ fn settle_loop_phase(
         && ls
             .frames
             .iter()
-            .any(|f| loop_mgr.frame_data_in_flight(&ls.site, product, &f.timestamp))
+            .any(|f| loop_mgr.frame_data_in_flight(radar_layer::site(ls), product, &f.timestamp))
     {
         return false;
     }
     log::warn!("Loop: no frame on pane {pane_idx} could be rendered; leaving loop mode");
-    *ls = rustdar_egui::pane::LoopPlaybackState::new();
+    *ls = rustdar_egui::pane::LayerTimeState::new();
     true
 }
 
@@ -2876,7 +2886,7 @@ fn frame_gates(
 /// Place a finished loop render on the frame of `ls` that asked for it, returning
 /// the texture that was uploaded so the caller can offer it to sibling panes.
 fn accept_render_result(
-    ls: &mut rustdar_egui::pane::LoopPlaybackState,
+    ls: &mut rustdar_egui::pane::LayerTimeState,
     rr: &mut crate::channels::LoopRenderResponse,
     gates: Option<rustdar_radar::hover::SweepGates>,
     upload: impl FnOnce(egui::ColorImage) -> egui::TextureHandle,
@@ -2898,7 +2908,7 @@ fn accept_render_result(
 
 /// [`accept_render_result`] for a finished cross-section cut.
 fn accept_section_result(
-    ls: &mut rustdar_egui::pane::LoopPlaybackState,
+    ls: &mut rustdar_egui::pane::LayerTimeState,
     sr: &mut crate::channels::LoopSectionResponse,
     upload: impl FnOnce(egui::ColorImage) -> egui::TextureHandle,
 ) -> Option<rustdar_egui::pane::SectionImageData> {
@@ -3010,7 +3020,7 @@ fn frame_sweep(
 /// `None` if it has none or that data carries nothing for the product.
 fn own_sweep(
     loop_mgr: &rustdar_radar::loop_downloads::LoopDownloadManager,
-    ls: &rustdar_egui::pane::LoopPlaybackState,
+    ls: &rustdar_egui::pane::LayerTimeState,
     timestamp: chrono::NaiveDateTime,
     product: rustdar_radar::types::RadarProduct,
     elevation: f32,
@@ -3019,7 +3029,7 @@ fn own_sweep(
     // receiver's own site: a second rule for "which sweep does this frame show"
     match frame_sweep(
         loop_mgr,
-        &RenderTarget::new(ls.site.clone(), product, elevation),
+        &RenderTarget::new(radar_layer::site(ls).to_string(), product, elevation),
         timestamp,
     ) {
         FrameSweep::At(sweep) => Some(sweep),
@@ -3030,7 +3040,7 @@ fn own_sweep(
 /// The sweep pair for offering `rr`'s finished image to the loop `ls`.
 fn broadcast_sweep(
     loop_mgr: &rustdar_radar::loop_downloads::LoopDownloadManager,
-    ls: &rustdar_egui::pane::LoopPlaybackState,
+    ls: &rustdar_egui::pane::LayerTimeState,
     rr: &crate::channels::LoopRenderResponse,
 ) -> BroadcastSweep {
     BroadcastSweep {
@@ -3047,7 +3057,7 @@ fn broadcast_sweep(
 
 /// The product a loop's frames are keyed to, or `None` before the first dispatch.
 fn loop_product(
-    ls: &rustdar_egui::pane::LoopPlaybackState,
+    ls: &rustdar_egui::pane::LayerTimeState,
 ) -> Option<rustdar_radar::types::RadarProduct> {
     ls.rendered_for.as_ref().map(|t| t.product)
 }
@@ -3055,7 +3065,7 @@ fn loop_product(
 /// Whether every frame `ls` intends to render has settled, given what has arrived.
 fn loop_batch_settled(
     loop_mgr: &rustdar_radar::loop_downloads::LoopDownloadManager,
-    ls: &rustdar_egui::pane::LoopPlaybackState,
+    ls: &rustdar_egui::pane::LayerTimeState,
     budget: usize,
 ) -> bool {
     let Some(product) = loop_product(ls) else {
@@ -3065,7 +3075,7 @@ fn loop_batch_settled(
     // Not merely "nothing in flight this instant": the render budget is shared with
     // static pane renders, so part of a batch can be starved and not yet spawned.
     ls.render_set_settled(budget, |f| {
-        loop_mgr.frame_data_settled(&ls.site, product, &f.timestamp)
+        loop_mgr.frame_data_settled(radar_layer::site(ls), product, &f.timestamp)
     })
 }
 
@@ -3123,18 +3133,18 @@ pub(crate) fn test_budgets() -> rustdar_device_profile::budget::Budgets {
 /// Frames this loop may keep **textured**, which is the term that bounds memory.
 fn loop_render_budget(
     allocation: LoopAllocation,
-    ls: &rustdar_egui::pane::LoopPlaybackState,
+    ls: &rustdar_egui::pane::LayerTimeState,
     budgets: &rustdar_device_profile::budget::Budgets,
 ) -> usize {
     allocation
         .frames_for(ls.view)
-        .min(budgets.frames_for_span(ls.scan_step_secs))
+        .min(budgets.frames_for_span(ls.cadence_secs))
 }
 
 /// Frames a loop of this view **holds**.
 pub(super) fn loop_frames_held(
     allocation: LoopAllocation,
-    ls: &rustdar_egui::pane::LoopPlaybackState,
+    ls: &rustdar_egui::pane::LayerTimeState,
     budgets: &rustdar_device_profile::budget::Budgets,
 ) -> usize {
     match ls.view {
@@ -3175,7 +3185,7 @@ pub(crate) struct LoopSectionRequest {
 /// A section frame another pane's loop can donate to `receiver`, as
 /// `(pane, frame)`.
 fn find_section_donor<'a>(
-    loops: impl IntoIterator<Item = (usize, &'a rustdar_egui::pane::LoopPlaybackState)>,
+    loops: impl IntoIterator<Item = (usize, &'a rustdar_egui::pane::LayerTimeState)>,
     receiver: usize,
     timestamp: chrono::NaiveDateTime,
     target: &RenderTarget,
@@ -3240,7 +3250,7 @@ struct LoopCloneRequest {
 /// The `(pane, frame)` that can serve `timestamp` for a pane keyed to `target`
 /// without a new render, or `None` if nobody can.
 fn find_donor<'a>(
-    loops: impl IntoIterator<Item = (usize, &'a rustdar_egui::pane::LoopPlaybackState)>,
+    loops: impl IntoIterator<Item = (usize, &'a rustdar_egui::pane::LayerTimeState)>,
     receiver: usize,
     timestamp: chrono::NaiveDateTime,
     target: &RenderTarget,

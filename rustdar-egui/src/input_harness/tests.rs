@@ -4124,18 +4124,18 @@ fn a_looping_pane_reports_its_current_frames_time() {
     let frame_time = written_ago(7);
     {
         let pane = h.gui_mut().pane_mut(0).unwrap();
-        pane.loop_state = crate::pane::LoopPlaybackState::new_for_loop(
+        *pane.loop_state_mut() = crate::radar_layer::begin_loop(
             600,
             rustdar_radar::sites::get_radar_site("KTLX").unwrap(),
             rustdar_radar::types::RenderView::PlanView,
         );
-        pane.loop_state.frames = vec![crate::pane::LoopFrame {
+        pane.loop_state_mut().frames = vec![crate::pane::LoopFrame {
             timestamp: frame_time,
             image: None,
             render_in_flight: false,
             render_failed: false,
         }];
-        pane.loop_state.current_frame = 0;
+        pane.loop_state_mut().current_frame = 0;
     }
     h.warm_up();
 
@@ -4763,15 +4763,12 @@ fn nothing_is_said_where_there_is_no_stale_image() {
     let site = rustdar_radar::sites::get_radar_site("KTLX").expect("a real radar");
     {
         let pane = looping.gui_mut().pane_mut(0).unwrap();
-        pane.loop_state = crate::pane::LoopPlaybackState::new_for_loop(
-            600,
-            site,
-            rustdar_radar::types::RenderView::PlanView,
-        );
+        *pane.loop_state_mut() =
+            crate::radar_layer::begin_loop(600, site, rustdar_radar::types::RenderView::PlanView);
     }
     looping.select_product(0, RadarProduct::EchoTops);
     assert!(
-        looping.gui_mut().pane(0).unwrap().loop_state.is_active(),
+        looping.gui_mut().pane(0).unwrap().loop_state().is_active(),
         "precondition: the loop is running",
     );
     assert!(
@@ -8006,7 +8003,7 @@ fn an_unlinked_pane_is_excluded_from_shared_nav_and_loop_fan_out() {
     {
         let gui = h.gui_mut();
         gui.pane_mut(1).expect("pane 1").viewing_live = false;
-        gui.pane_mut(1).expect("pane 1").time_step_secs = 0;
+        gui.pane_mut(1).expect("pane 1").time.step = crate::pane::TimeStep::from_secs(0);
         gui.pane_mut(2).expect("pane 2").viewing_live = false;
     }
     h.warm_up();
@@ -8020,7 +8017,7 @@ fn an_unlinked_pane_is_excluded_from_shared_nav_and_loop_fan_out() {
         "the unlinked pane must stay frozen"
     );
     assert_eq!(
-        gui.pane(1).expect("pane 1").time_step_secs,
+        gui.pane(1).expect("pane 1").time.step.as_secs(),
         0,
         "the unlinked pane's step must stay its own"
     );
@@ -8413,16 +8410,16 @@ fn the_timeline_row2_caption_states_the_running_loops_span_and_fidelity() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     {
         let pane = h.gui_mut().pane_mut(0).unwrap();
-        pane.loop_state = crate::pane::LoopPlaybackState::new_for_loop(
+        *pane.loop_state_mut() = crate::radar_layer::begin_loop(
             3600,
             rustdar_radar::sites::get_radar_site("KTLX").unwrap(),
             rustdar_radar::types::RenderView::PlanView,
         );
-        pane.loop_state.phase = crate::pane::LoopPhase::Playing;
-        pane.loop_state.listing_sampled = Some(false);
-        pane.loop_state.scan_step_secs = Some(259);
+        pane.loop_state_mut().phase = crate::pane::LoopPhase::Playing;
+        pane.loop_state_mut().sampled = Some(false);
+        pane.loop_state_mut().cadence_secs = Some(259);
         let base = written_ago(60);
-        pane.loop_state.frames = (0..14)
+        pane.loop_state_mut().frames = (0..14)
             .map(|i| crate::pane::LoopFrame {
                 timestamp: base + chrono::Duration::seconds(i * 259),
                 image: None,
@@ -8430,7 +8427,7 @@ fn the_timeline_row2_caption_states_the_running_loops_span_and_fidelity() {
                 render_failed: false,
             })
             .collect();
-        pane.loop_state.current_frame = 13;
+        pane.loop_state_mut().current_frame = 13;
     }
     h.mouse_click(h.timeline().expander.center());
     h.warm_up();
@@ -10732,18 +10729,18 @@ fn the_loop_and_archive_scrubbers_resolve_distinct_ids() {
 
     {
         let pane = h.gui_mut().pane_mut(0).unwrap();
-        pane.loop_state = crate::pane::LoopPlaybackState::new_for_loop(
+        *pane.loop_state_mut() = crate::radar_layer::begin_loop(
             600,
             rustdar_radar::sites::get_radar_site("KTLX").unwrap(),
             rustdar_radar::types::RenderView::PlanView,
         );
-        pane.loop_state.frames = vec![crate::pane::LoopFrame {
+        pane.loop_state_mut().frames = vec![crate::pane::LoopFrame {
             timestamp: chrono::Utc::now().naive_utc(),
             image: None,
             render_in_flight: false,
             render_failed: false,
         }];
-        pane.loop_state.current_frame = 0;
+        pane.loop_state_mut().current_frame = 0;
     }
     h.warm_up();
     let loop_id = h
@@ -11500,7 +11497,7 @@ fn the_transport_controls_emit_the_exact_payloads_the_frontend_acts_on() {
         .expect("the open step combo lists '1 scan'");
     h.mouse_click(entry.0.center());
     assert_eq!(
-        h.gui_mut().pane(0).expect("pane 0").time_step_secs,
+        h.gui_mut().pane(0).expect("pane 0").time.step.as_secs(),
         0,
         "picking '1 scan' must write the active pane's step"
     );
@@ -11527,12 +11524,8 @@ fn the_transport_controls_emit_the_exact_payloads_the_frontend_acts_on() {
         "the loop toggle must enable with the shared lookback"
     );
     let site = rustdar_radar::sites::get_radar_site("KTLX").expect("known site");
-    h.gui_mut().pane_mut(0).expect("pane 0").loop_state =
-        crate::pane::LoopPlaybackState::new_for_loop(
-            3600,
-            site,
-            rustdar_radar::types::RenderView::PlanView,
-        );
+    *h.gui_mut().pane_mut(0).expect("pane 0").loop_state_mut() =
+        crate::radar_layer::begin_loop(3600, site, rustdar_radar::types::RenderView::PlanView);
     h.warm_up();
     let (rect, on) = h.timeline().loop_toggle;
     assert!(on, "precondition: the probe reports the loop as on");
@@ -11628,12 +11621,8 @@ fn the_loop_toggle_is_a_real_button_with_a_visible_on_state() {
     );
 
     let site = rustdar_radar::sites::get_radar_site("KTLX").expect("known site");
-    h.gui_mut().pane_mut(0).expect("pane 0").loop_state =
-        crate::pane::LoopPlaybackState::new_for_loop(
-            3600,
-            site,
-            rustdar_radar::types::RenderView::PlanView,
-        );
+    *h.gui_mut().pane_mut(0).expect("pane 0").loop_state_mut() =
+        crate::radar_layer::begin_loop(3600, site, rustdar_radar::types::RenderView::PlanView);
     h.frames_for(5, 0.1);
     let (rect, on) = h.timeline().loop_toggle;
     assert!(on, "the probe must report the loop as on");

@@ -1,4 +1,5 @@
 use egui_wgpu::wgpu;
+use rustdar_egui::radar_layer;
 use std::collections::HashMap;
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
@@ -1408,16 +1409,16 @@ impl App {
                     .or_default()
                     .insert(info.timestamp);
             }
-            let ls = &pane.loop_state;
+            let ls = &pane.loop_state();
             if !ls.is_active() {
                 continue;
             }
             if ls.listing_wait(now).is_some_and(|waited| {
                 waited < rustdar_device_profile::constants::LOOP_LISTING_GRACE
             }) {
-                settling.insert(ls.site.as_str());
+                settling.insert(radar_layer::site(ls));
             }
-            let frames = needed.entry(ls.site.as_str()).or_default();
+            let frames = needed.entry(radar_layer::site(ls)).or_default();
             for frame in &ls.frames {
                 frames.insert(frame.timestamp);
             }

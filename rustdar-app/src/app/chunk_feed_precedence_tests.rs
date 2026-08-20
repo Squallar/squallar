@@ -898,13 +898,16 @@ fn navigate_one_scan_spends_a_generation_and_marks_pending() {
 #[test]
 fn the_loop_transport_payloads_drive_the_playback_state() {
     use rustdar_egui::actions::GuiAction;
-    use rustdar_egui::pane::{LoopFrame, LoopPhase, LoopPlaybackState};
+    use rustdar_egui::pane::{LoopFrame, LoopPhase};
 
     let mut app = app_showing(at(10));
     let site = rustdar_radar::sites::get_radar_site("KTLX").unwrap();
     {
-        let mut state =
-            LoopPlaybackState::new_for_loop(3600, site, rustdar_radar::types::RenderView::PlanView);
+        let mut state = rustdar_egui::radar_layer::begin_loop(
+            3600,
+            site,
+            rustdar_radar::types::RenderView::PlanView,
+        );
         state.phase = LoopPhase::Ready;
         state.frames = (0..3)
             .map(|i| LoopFrame {
@@ -914,10 +917,10 @@ fn the_loop_transport_payloads_drive_the_playback_state() {
                 render_failed: false,
             })
             .collect();
-        app.gui.pane_mut(0).unwrap().loop_state = state;
+        *app.gui.pane_mut(0).unwrap().loop_state_mut() = state;
     }
-    let phase = |app: &App| app.gui.pane(0).unwrap().loop_state.phase;
-    let frame = |app: &App| app.gui.pane(0).unwrap().loop_state.current_frame;
+    let phase = |app: &App| app.gui.pane(0).unwrap().loop_state().phase;
+    let frame = |app: &App| app.gui.pane(0).unwrap().loop_state().current_frame;
 
     app.handle_gui_action(GuiAction::ToggleLoopPlayback { pane_idx: 0 }, None);
     assert_eq!(phase(&app), LoopPhase::Playing, "Ready + toggle = Playing");
