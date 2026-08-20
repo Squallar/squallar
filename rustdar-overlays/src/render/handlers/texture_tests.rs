@@ -72,6 +72,11 @@ fn run_described(
         (known::LIGHTNING, rasterize_glm_strikes(input, bounds, w, h))
     } else if let Some(input) = job.downcast_ref::<ModelDataInput>() {
         (known::MODEL_DATA, rasterize_model_data(input, bounds, w, h))
+    } else if let Some(input) = job.downcast_ref::<rasterize::SitesInput>() {
+        (
+            known::RADAR_SITES,
+            rasterize_radar_sites(input, bounds, w, h),
+        )
     } else {
         panic!("a handler described an input no handler-backed texture layer claims: {job:?}")
     }
@@ -300,7 +305,16 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
             record_drops: crate::glm::RecordDrops::default(),
         }))),
         id if *id == known::MODEL_DATA => Box::new(HrrrFetchResult(Ok(cin_grid()))),
-        id if *id == known::RADAR_SITES => return false,
+        // **Seeded like every other kind since WO-M10c**: the site table is
+        // installed through the arrival door by the shell that owns it, so
+        // this layer has data of its own and answers `prepare_job` from it.
+        id if *id == known::RADAR_SITES => Box::new(super::sites::RadarSitesFetchResult(vec![
+            super::sites::SiteRow {
+                name: "KTLX".into(),
+                lat: 35.0,
+                lon: -98.0,
+            },
+        ])),
         other => panic!(
             "{} is a texture overlay this fixture does not know how to \
              seed. Add it here — the walks in this file are what stop a new \
@@ -403,15 +417,20 @@ fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
         }
         checked += 1;
     }
+    // **Seven since WO-M10c.** The seventh is `RadarSites`, which used to be
+    // rasterized by a dispatch arm of its own in `app_fetch` — the handler
+    // could not see which site its pane was on, so it had no `prepare_job` to
+    // be walked through. It has a pane now, the arm is gone, and the "seven
+    // described kinds" list in `spawn_overlay_render` is this same seven.
     assert_eq!(
-        checked, 6,
-        "the six texture handlers that rasterize through `prepare_job` \
+        checked, 7,
+        "the seven texture handlers that rasterize through `prepare_job` \
          must all be covered; a new one is not exempt, and a removed one \
          should be removed from this count deliberately",
     );
 
-    // The seventh raster, and the one with no handler to speak for it:
-    // `app_fetch` builds its input from the site catalogue itself.
+    // The same rasterizer reached directly, so the walk above is checked
+    // against a fixture this file owns rather than only against the handler's.
     assert_alpha_matches_bytes(
         "rasterize_radar_sites",
         &rasterize_radar_sites(&site_fixtures(), &BOUNDS, W, H),
@@ -538,16 +557,6 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
         }
         let id = handler.id();
         let name = id.as_str();
-        if id == known::RADAR_SITES {
-            // The one exempt kind: there is no `prepare_job` for its `has_data`
-            // to agree *with*, and its dispatch cannot decline.
-            assert!(
-                handler.prepare_job(&ctx, &PaneRef::bare(0)).is_none(),
-                "{name} grew a `prepare_job`; it now has this invariant \
-                 to keep, so seed it in `seed` and drop it from this exemption",
-            );
-            continue;
-        }
 
         let agree = |h: &dyn OverlayHandler, state: &str| {
             assert_eq!(
@@ -581,8 +590,8 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
         checked += 1;
     }
     assert_eq!(
-        checked, 6,
-        "the six texture handlers that rasterize through `prepare_job` \
+        checked, 7,
+        "the seven texture handlers that rasterize through `prepare_job` \
          must all be covered",
     );
 }
@@ -647,8 +656,10 @@ fn every_texture_kind_rasterizes_as_a_described_job() {
     for handler in sources().iter_mut() {
         let id = handler.id();
         let name = id.as_str();
-        let handler_backed =
-            handler.render_mode() == RenderMode::Texture && id != known::RADAR_SITES;
+        // **No exemption since WO-M10c**: every texture kind is
+        // handler-backed now that `RadarSites` answers `prepare_job` from the
+        // table the shell installs in it.
+        let handler_backed = handler.render_mode() == RenderMode::Texture;
 
         let agree = |h: &dyn OverlayHandler, state: &str| {
             if !handler_backed {
@@ -710,10 +721,10 @@ fn every_texture_kind_rasterizes_as_a_described_job() {
         described += 1;
     }
     assert_eq!(
-        described, 6,
-        "the three polygon kinds, the two hit-map kinds and the model grid \
-         must all have been walked seeded; a kind that stopped seeding is a \
-         kind whose described job was never tested",
+        described, 7,
+        "the three polygon kinds, the two hit-map kinds, the model grid and \
+         the site table must all have been walked seeded; a kind that \
+         stopped seeding is a kind whose described job was never tested",
     );
 }
 

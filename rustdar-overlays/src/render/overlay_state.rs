@@ -32,10 +32,6 @@ pub struct OverlayRegistry {
     /// Populated by map clicks; paged through in the popup.
     pub selected_overlays: Vec<Arc<dyn OverlayItem>>,
     pub selected_overlay_page: usize,
-    /// The config value each handler was last loaded from, for the handlers
-    /// whose state has not moved since — the dirty half of
-    /// [`load_pane_configs`], which every pane calls on every frame.
-    loaded_configs: std::collections::HashMap<LayerId, serde_json::Value>,
 }
 
 /// This crate's own eleven — and **only** those.
@@ -51,7 +47,6 @@ impl OverlayRegistry {
             handlers,
             selected_overlays: Vec::new(),
             selected_overlay_page: 0,
-            loaded_configs: std::collections::HashMap::new(),
         }
     }
 
@@ -60,20 +55,12 @@ impl OverlayRegistry {
     }
 
     fn handler_mut(&mut self, id: &LayerId) -> Option<&mut dyn OverlayHandler> {
-        self.forget_loaded_config(id);
         for handler in &mut self.handlers {
             if &handler.id() == id {
                 return Some(&mut **handler);
             }
         }
         None
-    }
-
-    /// Drop `id`'s "already loaded" note, so the next
-    /// [`load_pane_configs`](OverlayRegistry::load_pane_configs) re-applies
-    /// its config rather than skipping it.
-    fn forget_loaded_config(&mut self, id: &LayerId) {
-        self.loaded_configs.remove(id);
     }
 
     pub fn handlers(&self) -> impl Iterator<Item = &dyn OverlayHandler> {
@@ -303,7 +290,6 @@ impl OverlayRegistry {
     /// any pane keeps.
     pub fn apply_fetch_result(&mut self, result: OverlayFetchResult, pane: &PaneRef<'_>) {
         let id = result.kind;
-        self.forget_loaded_config(&id);
         if let Some(idx) = self.handlers.iter().position(|h| h.id() == id) {
             self.handlers[idx].apply_fetch_result(result.data, pane);
             self.handlers[idx].retain_selections(&mut self.selected_overlays, pane);
@@ -421,43 +407,6 @@ impl OverlayRegistry {
             .map_or(serde_json::Value::Null, |h| h.serialize_pane_state(state))
     }
 
-    pub fn save_pane_configs(&self) -> std::collections::HashMap<LayerId, serde_json::Value> {
-        self.handlers
-            .iter()
-            .map(|h| (h.id(), h.serialize_state()))
-            .collect()
-    }
-
-    /// Handlers absent from `configs` keep their current state.
-    pub fn load_pane_configs(
-        &mut self,
-        configs: &std::collections::HashMap<LayerId, serde_json::Value>,
-    ) {
-        let Self {
-            handlers,
-            loaded_configs,
-            ..
-        } = self;
-        for h in handlers {
-            let id = h.id();
-            let Some(val) = configs.get(&id) else {
-                continue;
-            };
-            if loaded_configs.get(&id).is_some_and(|seen| seen == val) {
-                continue;
-            }
-            h.deserialize_state(val.clone());
-            loaded_configs.insert(id, val.clone());
-        }
-    }
-
-    pub fn save_enabled_map(&self, pane: &PaneRef<'_>) -> std::collections::HashMap<LayerId, bool> {
-        self.handlers
-            .iter()
-            .map(|h| (h.id(), h.is_enabled(pane)))
-            .collect()
-    }
-
     // ── Per-frame point rendering delegates ───────────────────────────
 
     pub fn per_frame_points(&self, id: &LayerId) -> &[MapPoint] {
@@ -504,7 +453,6 @@ impl OverlayRegistry {
         &mut self,
         states: &serde_json::Map<String, serde_json::Value>,
     ) {
-        self.loaded_configs.clear();
         for h in &mut self.handlers {
             if let Some(val) = states.get(h.id().as_str()) {
                 h.deserialize_state(val.clone());
@@ -518,122 +466,6 @@ impl OverlayRegistry {
 pub struct OverlayFetchResult {
     pub kind: LayerId,
     pub data: FetchPayload,
-}
-
-#[cfg(test)]
-mod pane_config_tests {
-    use super::*;
-
-    fn mds_off(registry: &mut OverlayRegistry) -> std::collections::HashMap<LayerId, Value> {
-        registry.set_enabled(&known::SPC_DISCUSSIONS, false, &mut PaneMut::bare(0));
-        let configs = registry.save_pane_configs();
-        registry.set_enabled(&known::SPC_DISCUSSIONS, true, &mut PaneMut::bare(0));
-        configs
-    }
-
-    use serde_json::Value;
-
-    #[test]
-    fn loading_a_config_twice_lands_where_loading_it_once_did() {
-        let mut registry = OverlayRegistry::default();
-        let configs = mds_off(&mut registry);
-        assert!(
-            registry.is_enabled(&known::SPC_DISCUSSIONS, &PaneRef::bare(0)),
-            "fixture: the handler is on, so the config has something to do",
-        );
-
-        registry.load_pane_configs(&configs);
-        assert!(
-            !registry.is_enabled(&known::SPC_DISCUSSIONS, &PaneRef::bare(0)),
-            "the first load must apply the config",
-        );
-
-        registry.load_pane_configs(&configs);
-        assert!(
-            !registry.is_enabled(&known::SPC_DISCUSSIONS, &PaneRef::bare(0)),
-            "a repeat load changed the answer",
-        );
-    }
-
-    #[test]
-    fn a_fetch_result_forgets_the_config_the_handler_was_loaded_from() {
-        let mut registry = OverlayRegistry::default();
-        let configs = mds_off(&mut registry);
-
-        registry.load_pane_configs(&configs);
-        assert!(
-            registry
-                .loaded_configs
-                .contains_key(&known::SPC_DISCUSSIONS),
-            "fixture: a load has to record what it read for the skip to exist",
-        );
-
-        registry.apply_fetch_result(
-            OverlayFetchResult {
-                kind: known::SPC_DISCUSSIONS,
-                data: OverlayRegistry::spc_discussions_payload(Vec::new()),
-            },
-            &PaneRef::bare(0),
-        );
-
-        assert!(
-            !registry
-                .loaded_configs
-                .contains_key(&known::SPC_DISCUSSIONS),
-            "a fetch may move what `serialize_state` reports, so the next load \
-             has to run rather than be skipped",
-        );
-    }
-
-    #[test]
-    fn a_handler_change_outside_the_config_is_still_undone_by_the_next_load() {
-        let mut registry = OverlayRegistry::default();
-        let configs = mds_off(&mut registry);
-        registry.load_pane_configs(&configs);
-        assert!(!registry.is_enabled(&known::SPC_DISCUSSIONS, &PaneRef::bare(0)));
-
-        registry.set_enabled(&known::SPC_DISCUSSIONS, true, &mut PaneMut::bare(0));
-        registry.load_pane_configs(&configs);
-        assert!(
-            !registry.is_enabled(&known::SPC_DISCUSSIONS, &PaneRef::bare(0)),
-            "a `set_enabled` that never reached the config survived the \
-             reload — the skip went stale",
-        );
-
-        registry
-            .handler_by_id_mut(&known::SPC_DISCUSSIONS)
-            .expect("the MD handler is registered")
-            .set_enabled(true, &mut PaneMut::bare(0));
-        registry.load_pane_configs(&configs);
-        assert!(
-            !registry.is_enabled(&known::SPC_DISCUSSIONS, &PaneRef::bare(0)),
-            "a change made through `get_handler_mut` survived the reload",
-        );
-    }
-
-    #[test]
-    fn alternating_two_panes_configs_gives_each_pane_its_own() {
-        let mut registry = OverlayRegistry::default();
-        let off = mds_off(&mut registry);
-        let on = registry.save_pane_configs();
-        assert!(
-            registry.is_enabled(&known::SPC_DISCUSSIONS, &PaneRef::bare(0)),
-            "fixture: the two configs differ",
-        );
-
-        for _ in 0..3 {
-            registry.load_pane_configs(&off);
-            assert!(
-                !registry.is_enabled(&known::SPC_DISCUSSIONS, &PaneRef::bare(0)),
-                "the off pane did not get its config",
-            );
-            registry.load_pane_configs(&on);
-            assert!(
-                registry.is_enabled(&known::SPC_DISCUSSIONS, &PaneRef::bare(0)),
-                "the on pane did not get its config",
-            );
-        }
-    }
 }
 
 #[cfg(test)]

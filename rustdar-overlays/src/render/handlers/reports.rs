@@ -428,16 +428,6 @@ impl OverlayHandler for StormReportsHandler {
     fn serialize_pane_state(&self, state: &dyn std::any::Any) -> serde_json::Value {
         PaneToggle::save(state)
     }
-
-    fn serialize_state(&self) -> serde_json::Value {
-        serde_json::json!({ "enabled": self.enabled })
-    }
-
-    fn deserialize_state(&mut self, value: serde_json::Value) {
-        if let Some(enabled) = value.get("enabled").and_then(|v| v.as_bool()) {
-            self.enabled = enabled;
-        }
-    }
 }
 
 #[cfg(test)]

@@ -577,6 +577,10 @@ impl super::App {
             table.rows().len(),
             table.unplaced().len(),
         );
+        // The site layer draws from its own copy of the table, so a catalogue
+        // that places radars mid-session has to be handed over again or the
+        // map keeps drawing the list this install booted with.
+        self.gui.publish_radar_sites();
     }
 
     /// Open on the radar nearest this device's timezone.

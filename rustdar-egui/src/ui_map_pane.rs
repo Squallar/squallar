@@ -97,9 +97,6 @@ pub(super) fn render_pane_map_content(
     ctx: &mut PaneRenderCtx<'_>,
 ) {
     ctx.pane.hydrate_layer_states(ctx.overlays, ctx.pane_idx);
-    if ctx.pane.has_slot_configs() {
-        ctx.overlays.load_pane_configs(&ctx.pane.slot_config_map());
-    }
 
     // Cleared every frame and re-set by the radar arm below. That arm is the
     // only writer, and it runs only while Radar is enabled and has an image.

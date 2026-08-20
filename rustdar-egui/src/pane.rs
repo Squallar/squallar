@@ -470,8 +470,8 @@ fn merge_radar_slot(config: &mut serde_json::Value, fresh: &serde_json::Value) {
 /// **The radar slot's config is the pane's, not a handler's.** It carries
 /// this pane's own selection — site, product, elevation — and the live-chunk
 /// switch that used to be one global, none of which any handler produces.
-/// [`PaneState::adopt_handler_state`] and [`PaneState::slot_config_map`] both
-/// hold these four back from the radar handler for that reason, and
+/// [`PaneState::adopt_handler_state`] holds these four back from the radar
+/// handler for that reason, and
 /// `the_radar_handler_and_the_pane_do_not_claim_the_same_slot_members` is
 /// what says the two owners never collide.
 pub const RADAR_SLOT_PANE_KEYS: [&str; 4] = ["site", "product", "elevation", "live_chunks"];
@@ -1427,39 +1427,6 @@ impl PaneState {
             .collect()
     }
 
-    /// The configs the registry swap is fed, keyed by id. **Slots with a
-    /// `null` config are omitted**: `load_pane_configs` leaves a handler it
-    /// finds no entry for exactly as it is, which is what an absent map entry
-    /// has always meant here.
-    ///
-    /// The radar slot is handed over **without** [`RADAR_SLOT_PANE_KEYS`] —
-    /// those members are the pane's, and the radar handler owns the rest of
-    /// its own slot exactly as every other handler owns all of its.
-    pub fn slot_config_map(&self) -> HashMap<LayerId, serde_json::Value> {
-        self.layers
-            .iter()
-            .filter(|slot| !slot.config.is_null())
-            .filter_map(|slot| {
-                if slot.id != known::RADAR {
-                    return Some((slot.id.clone(), slot.config.clone()));
-                }
-                let mut handler_half = slot.config.as_object()?.clone();
-                handler_half.retain(|key, _| !RADAR_SLOT_PANE_KEYS.contains(&key.as_str()));
-                (!handler_half.is_empty())
-                    .then(|| (slot.id.clone(), serde_json::Value::Object(handler_half)))
-            })
-            .collect()
-    }
-
-    /// Whether any **handler's** slot carries a saved config — the question
-    /// `overlay_configs.is_empty()` used to ask, and the radar slot never
-    /// counted towards it because it did not exist.
-    pub fn has_slot_configs(&self) -> bool {
-        self.layers
-            .iter()
-            .any(|slot| !slot.config.is_null() && slot.id != known::RADAR)
-    }
-
     /// Take a whole layer stack — order, flags and configs together. The one
     /// operation layer-link sync needs, and the reason it cannot lose a half:
     /// there are no longer three halves to keep in step.
@@ -1555,74 +1522,54 @@ impl PaneState {
         &mut self,
         registry: &rustdar_overlays::render::overlay_state::OverlayRegistry,
     ) {
-        let configs = registry.save_pane_configs();
-        // The swap branch's answer, which is what the registry is holding for
-        // this pane right now — the converted branch above never reaches it.
-        let enabled = registry.save_enabled_map(&PaneRef::bare(0));
         for slot in &mut self.layers {
             if registry.handler_by_id(&slot.id).is_none() {
                 continue;
             }
             // A slot that owns its state is not told what it holds: it is
-            // asked, and what it answers is what persists. This is the branch
-            // that grows as handlers move their per-pane fields into the pane,
-            // and the swap's branch below is what shrinks to nothing.
-            if let Some(state) = slot.state.as_deref() {
-                let view = PaneRef {
-                    pane_idx: 0,
-                    config: &serde_json::Value::Null,
-                    state: Some(state as &dyn Any),
-                    slots: &[],
-                    loading_site: None,
-                    peers: &[],
-                };
-                slot.enabled = registry.is_enabled(&slot.id, &view);
-                let fresh = registry.serialize_pane_state(&slot.id, state);
-                if slot.id != known::RADAR {
-                    slot.config = fresh;
-                } else {
-                    merge_radar_slot(&mut slot.config, &fresh);
-                }
-                continue;
-            }
-            if let Some(&on) = enabled.get(&slot.id) {
-                slot.enabled = on;
-            }
-            let Some(fresh) = configs.get(&slot.id) else {
+            // asked, and what it answers is what persists. **There is no
+            // other branch** — the config swap is what used to answer for a
+            // slot with no state of its own, and it answered with some other
+            // pane's. A slot that has not been hydrated yet is left exactly
+            // as it is rather than being overwritten from a global.
+            let Some(state) = slot.state.as_deref() else {
                 continue;
             };
+            let view = PaneRef {
+                pane_idx: 0,
+                config: &serde_json::Value::Null,
+                state: Some(state as &dyn Any),
+                slots: &[],
+                loading_site: None,
+                peers: &[],
+            };
+            slot.enabled = registry.is_enabled(&slot.id, &view);
+            let fresh = registry.serialize_pane_state(&slot.id, state);
             if slot.id != known::RADAR {
-                slot.config = fresh.clone();
-                continue;
+                slot.config = fresh;
+            } else {
+                // The radar slot has two owners. The handler's members land
+                // beside the pane's, never over them.
+                merge_radar_slot(&mut slot.config, &fresh);
             }
-            // The radar slot has two owners. The handler's members land
-            // beside the pane's, never over them.
-            merge_radar_slot(&mut slot.config, fresh);
         }
         // A registered handler this pane has no slot for at all: it joins the
         // stack, exactly as the old `extend` gave it a map entry.
         let missing: Vec<(LayerId, u32, bool)> = registry
             .handlers()
             .filter(|h| !self.layers.iter().any(|slot| slot.id == h.id()))
-            .map(|h| {
-                (
-                    h.id(),
-                    h.draw_order_weight(),
-                    h.is_enabled(&PaneRef::bare(0)),
-                )
-            })
+            .map(|h| (h.id(), h.draw_order_weight(), h.default_enabled()))
             .collect();
         if !missing.is_empty() {
             let weights: HashMap<LayerId, u32> = registry
                 .handlers()
                 .map(|h| (h.id(), h.draw_order_weight()))
                 .collect();
+            // No config is written for the joining slot: it has saved
+            // nothing, and `create_pane_state(slot.enabled)` at the next
+            // hydrate is what gives it its state. Seeding it from the
+            // registry's serialize is what handed one pane another's.
             self.insert_missing_slots(&missing, &|id| weights.get(id).copied());
-            for (id, _, _) in &missing {
-                if let (Some(slot), Some(fresh)) = (self.slot_mut(id), configs.get(id)) {
-                    slot.config = fresh.clone();
-                }
-            }
         }
     }
 

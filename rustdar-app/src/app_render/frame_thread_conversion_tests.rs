@@ -81,15 +81,21 @@ fn every_overlay_dispatch_is_described_and_converts_nothing() {
          arm receives pixels `offload::execute` already premultiplied inside \
          the job.",
     );
+    // **One** since WO-M10c, and the count is the point rather than the
+    // number: there used to be two, because `RadarSites` was dispatched by an
+    // arm of its own that built `SitesInput` inline — the handler could not
+    // see which site its pane was on. It can now, so it answers `prepare_job`
+    // like the other six and its arm is gone. A SECOND deliver reappearing
+    // means a kind has grown a dispatch of its own again.
     assert_eq!(
         body.matches("Self::overlay_job_deliver(").count(),
-        2,
-        "`spawn_overlay_render`'s two dispatch sites — the handler-kind arm \
-         and the sites arm — must both hand their reply to the one shared \
-         `overlay_job_deliver`. Fewer means an arm grew a deliver of its \
-         own, which is the drift the shared builder exists to prevent; more \
-         means a third dispatch site exists that this module has never heard \
-         of.",
+        1,
+        "`spawn_overlay_render`'s described-kind arm is the one dispatch \
+         site, and it must hand its reply to the one shared \
+         `overlay_job_deliver`. Zero means the arm grew a deliver of its own, \
+         which is the drift the shared builder exists to prevent; two or more \
+         means a kind is being dispatched outside the described-kind arm \
+         again, which is what the `RadarSites` migration removed.",
     );
     assert!(
         !body.contains("from_rgba_premultiplied"),

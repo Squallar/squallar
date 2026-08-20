@@ -919,16 +919,6 @@ impl OverlayHandler for SpcOutlookHandler {
             None => serde_json::Value::Null,
         }
     }
-
-    fn serialize_state(&self) -> serde_json::Value {
-        Self::save_selection(&self.defaults)
-    }
-
-    fn deserialize_state(&mut self, value: serde_json::Value) {
-        let mut state = std::mem::replace(&mut self.defaults, OutlookPaneState::new(false));
-        Self::restore_selection(&mut state, &value);
-        self.defaults = state;
-    }
 }
 
 #[cfg(test)]
@@ -1129,14 +1119,22 @@ mod tests {
             "day-button path"
         );
 
-        let mut reopened = SpcOutlookHandler::new();
-        reopened.deserialize_state(serde_json::json!({
-            "selected_day": "Day3",
-            "enabled_products": ["Probabilistic"],
-        }));
+        // The reopen path is `deserialize_pane_state` since WO-M10c: the
+        // selection is the PANE's, and the global `serialize_state` no longer
+        // carries it.
+        let reopened = SpcOutlookHandler::new()
+            .deserialize_pane_state(
+                serde_json::json!({
+                    "selected_day": "Day3",
+                    "enabled_products": ["Probabilistic"],
+                }),
+                true,
+            )
+            .expect("the outlook keeps per-pane state");
         assert!(
             reopened
-                .defaults
+                .downcast_ref::<OutlookPaneState>()
+                .expect("the outlook layer's own state type")
                 .enabled_products
                 .contains(&OutlookProduct::ConditionalIntensity),
             "reopen path: a pre-change session must start asking for _cigprob"

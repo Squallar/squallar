@@ -696,9 +696,6 @@ impl super::Gui {
         if let Some(slot) = body_slot {
             let mut pane = std::mem::take(&mut self.panes[self.active_pane]);
             pane.hydrate_layer_states(&self.overlays, self.active_pane);
-            if pane.has_slot_configs() {
-                self.overlays.load_pane_configs(&pane.slot_config_map());
-            }
             let body_id = match page {
                 SheetPage::Layers => {
                     let statuses = self.stack_row_statuses(self.active_pane, &pane);

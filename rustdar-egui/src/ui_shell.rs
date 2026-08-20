@@ -147,16 +147,12 @@ impl super::Gui {
 
         let mut pane = std::mem::take(&mut self.panes[self.active_pane]);
 
-        // The registry must hold *this* pane's configs before anything asks a
-        // handler about itself — the status lines below, and the layer body's
-        // round trip, both read handler state as "the active pane's". The
-        // frame-end reload in `Gui::ui` usually guarantees it already, but an
-        // active-pane switch earlier this same frame (the top bar's segments)
-        // would leave the previous pane's configs loaded.
+        // Every question below is asked OF this pane: the status lines and
+        // the layer body's round trip pass its own `PaneRef`, so there is no
+        // "the registry is holding the wrong pane" to guard against. All this
+        // has to do is make sure the slots it will be asked about have their
+        // state.
         pane.hydrate_layer_states(&self.overlays, self.active_pane);
-        if pane.has_slot_configs() {
-            self.overlays.load_pane_configs(&pane.slot_config_map());
-        }
 
         let statuses: Vec<(LayerId, Option<String>)> = if stack_slide > 0.0 {
             self.stack_row_statuses(self.active_pane, &pane)

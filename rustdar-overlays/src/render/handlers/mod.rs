@@ -1,6 +1,7 @@
-// The polygon-kind modules and `reports` are `pub` because their fetch-result
-// types are: `rustdar-app`'s described-job dispatch tests construct the payload
-// type. Everything else in them keeps its own visibility.
+// The polygon-kind modules, `reports` and `sites` are `pub` because their
+// fetch-result types are: `rustdar-app`'s described-job dispatch tests
+// construct the payload type, and `sites` is the layer the frontend installs
+// the radar table into. Everything else in them keeps its own visibility.
 pub mod alert;
 mod colorscale;
 pub mod discussion;
@@ -11,7 +12,7 @@ mod metar;
 mod model;
 pub mod outlook;
 pub mod reports;
-mod sites;
+pub mod sites;
 
 #[cfg(test)]
 mod texture_tests;
@@ -130,10 +131,17 @@ mod round_delivery_tests {
                  delivery of its round some other way",
             );
         }
+        // **Eight since WO-M10c**, and the eighth is the odd one: `sites`
+        // builds no fetch task at all, but the frontend installs the radar
+        // table through the same arrival door, so it takes delivery of a
+        // round like the seven that do fetch. A handler that started or
+        // stopped taking delivery must be accounted for here rather than
+        // silently skipped.
         assert_eq!(
-            checked, 7,
-            "seven handlers fetch; a handler that started or stopped fetching \
-             must be accounted for here rather than silently skipped",
+            checked, 8,
+            "eight handlers take delivery of a round; a handler that started \
+             or stopped must be accounted for here rather than silently \
+             skipped",
         );
     }
 }

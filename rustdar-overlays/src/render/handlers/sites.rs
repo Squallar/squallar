@@ -1,22 +1,52 @@
 use crate::render::overlay_state::{PaneMut, PaneRef, PaneToggle};
 use std::sync::Arc;
 
-use rustdar_source::job::JobCodec;
+use rustdar_source::job::{DescribedJob, JobCodec};
 
+use crate::fetch_policy::Whole;
 use crate::render::controls::{ControlEffect, ControlItem, ControlUpdate};
 use crate::render::overlay_state::Surface;
-use crate::render::overlay_state::{FetchPayload, OverlayHandler, OverlayItem, RenderMode};
+use crate::render::overlay_state::{
+    FetchPayload, OverlayHandler, OverlayItem, OverlayState, RasterizeContext, RenderMode,
+};
+use crate::render::rasterize;
 use rustdar_source::id::{LayerId, known};
 
-/// Toggle state only. Rasterization and per-frame interaction (text labels,
-/// site clicking) happen in `rustdar-egui`.
+/// **One radar site, as this crate is allowed to know it.** Name and position
+/// and nothing else: the site table lives in `rustdar-radar`, which this crate
+/// must not name (WO-M3's edge cut), so the frontend that owns the table
+/// installs the rows through [`RadarSitesFetchResult`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SiteRow {
+    pub name: String,
+    pub lat: f64,
+    pub lon: f64,
+}
+
+/// The site table arriving from the frontend. Not a *fetch* — this layer never
+/// builds a task — but the same door, so the rows land where every other
+/// layer's data lands.
+pub struct RadarSitesFetchResult(pub Vec<SiteRow>);
+
+impl crate::fetch_policy::FetchRound for RadarSitesFetchResult {
+    type Shape = Whole;
+}
+
+/// The site table, plus which pane draws it. Per-frame interaction (text
+/// labels, site clicking) still happens in `rustdar-egui`.
 pub(crate) struct RadarSitesHandler {
+    pub state: OverlayState<Vec<SiteRow>, Whole>,
+    /// **The layer's own default**, for a caller that supplied no pane.
+    /// Nothing reads it into a pane.
     pub enabled: bool,
 }
 
 impl RadarSitesHandler {
     pub fn new() -> Self {
-        Self { enabled: false }
+        Self {
+            state: OverlayState::new(),
+            enabled: false,
+        }
     }
 }
 
@@ -55,10 +85,42 @@ impl OverlayHandler for RadarSitesHandler {
     }
 
     fn data_generation(&self) -> u64 {
-        0
+        self.state.data_generation
     }
     fn has_data(&self, _pane: &PaneRef<'_>) -> bool {
-        true
+        !self.state.data.is_empty()
+    }
+
+    /// **The pane's own site, read from the radar slot beside it.** This is
+    /// the whole reason WO-M6 deferred this layer and WO-M10c closes it: the
+    /// input used to be built inline in `app_fetch` because the handler could
+    /// not see which site this pane is on, or which one it is loading.
+    fn prepare_job(&self, ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
+        if self.state.data.is_empty() {
+            return None;
+        }
+        let current = pane
+            .sibling(&known::RADAR)
+            .and_then(|config| config.get("site"))
+            .and_then(serde_json::Value::as_str);
+        let loading = pane.loading_site;
+        Some(DescribedJob::new(rasterize::SitesInput {
+            sites: self
+                .state
+                .data
+                .iter()
+                .map(|site| rasterize::RadarSiteInfo {
+                    name: site.name.clone(),
+                    lat: site.lat,
+                    lon: site.lon,
+                    is_current: current == Some(site.name.as_str()),
+                    is_loading: loading == Some(site.name.as_str()),
+                })
+                .collect(),
+            zoom: ctx.zoom,
+            is_dark: ctx.is_dark,
+            device_scale: ctx.device_scale,
+        }))
     }
 
     fn job_codec(&self) -> Option<&'static JobCodec> {
@@ -74,7 +136,14 @@ impl OverlayHandler for RadarSitesHandler {
         None
     }
 
-    fn apply_fetch_result(&mut self, _result: FetchPayload, _pane: &PaneRef<'_>) {}
+    /// The site table, installed by the frontend that owns it.
+    fn apply_fetch_result(&mut self, result: FetchPayload, _pane: &PaneRef<'_>) {
+        let Some(rows) = self.state.downcast_round::<RadarSitesFetchResult>(result) else {
+            log::error!("radar sites handler received unexpected fetch result type");
+            return;
+        };
+        self.state.set_data(rows.0);
+    }
     fn retain_selections(&self, _selections: &mut Vec<Arc<dyn OverlayItem>>, _pane: &PaneRef<'_>) {}
 
     fn controls(&self, pane: &PaneRef<'_>) -> Vec<ControlItem> {
@@ -116,15 +185,5 @@ impl OverlayHandler for RadarSitesHandler {
 
     fn serialize_pane_state(&self, state: &dyn std::any::Any) -> serde_json::Value {
         PaneToggle::save(state)
-    }
-
-    fn serialize_state(&self) -> serde_json::Value {
-        serde_json::json!({ "enabled": self.enabled })
-    }
-
-    fn deserialize_state(&mut self, value: serde_json::Value) {
-        if let Some(enabled) = value.get("enabled").and_then(|v| v.as_bool()) {
-            self.enabled = enabled;
-        }
     }
 }

@@ -652,17 +652,6 @@ impl OverlayHandler for NwsAlertHandler {
             None => serde_json::Value::Null,
         }
     }
-
-    fn serialize_state(&self) -> serde_json::Value {
-        Self::save_categories(&self.defaults.enabled_categories)
-    }
-
-    /// A category the saving build never offered is **not** a category the user
-    /// declined, so it comes back on. An **empty** set is left alone: that is
-    /// the master toggle off.
-    fn deserialize_state(&mut self, value: serde_json::Value) {
-        Self::restore_categories(&mut self.defaults.enabled_categories, &value);
-    }
 }
 
 #[cfg(test)]
@@ -1210,36 +1199,51 @@ mod tests {
     /// A set persisted by a build that had three toggles is not a user who
     /// turned the fourth off — they were never offered it. An empty set is the
     /// master toggle off and stays off.
+    ///
+    /// Read through `deserialize_pane_state`, which is where a saved set lands
+    /// since WO-M10c: the set is the PANE's, and the global `serialize_state`
+    /// no longer carries it.
     #[test]
     fn a_category_the_saved_build_never_offered_comes_back_on() {
-        let legacy = serde_json::json!({
-            "enabled_categories": ["Warning", "Watch", "Advisory"],
-        });
-        let mut handler = NwsAlertHandler::new();
-        handler.deserialize_state(legacy);
-        assert!(
-            handler
-                .defaults
+        let restored = |value: serde_json::Value, on: bool| {
+            let state = NwsAlertHandler::new()
+                .deserialize_pane_state(value, on)
+                .expect("alerts keep per-pane state");
+            state
+                .downcast_ref::<AlertPaneState>()
+                .expect("the alert layer's own state type")
                 .enabled_categories
-                .contains(&AlertCategory::Other),
+                .clone()
+        };
+
+        assert!(
+            restored(
+                serde_json::json!({
+                    "enabled_categories": ["Warning", "Watch", "Advisory"],
+                }),
+                true,
+            )
+            .contains(&AlertCategory::Other),
             "a category with no toggle in the saving build was never declined",
         );
 
-        let mut handler = NwsAlertHandler::new();
-        handler.deserialize_state(serde_json::json!({
-            "enabled_categories": ["Warning"],
-            "known_categories": AlertCategory::ALL,
-        }));
         assert_eq!(
-            handler.defaults.enabled_categories,
+            restored(
+                serde_json::json!({
+                    "enabled_categories": ["Warning"],
+                    "known_categories": AlertCategory::ALL,
+                }),
+                true,
+            ),
             HashSet::from([AlertCategory::Warning]),
             "the user turned three categories off and they must stay off",
         );
 
-        let mut handler = NwsAlertHandler::new();
-        handler.deserialize_state(serde_json::json!({ "enabled_categories": [] }));
+        // An empty set is the master toggle off, and the pane's own flag says
+        // so too — the two are one fact, and `adopt_handler_state` writes them
+        // together.
         assert!(
-            handler.defaults.enabled_categories.is_empty(),
+            restored(serde_json::json!({ "enabled_categories": [] }), false).is_empty(),
             "an empty set is a deliberate state, not a build to migrate",
         );
     }
