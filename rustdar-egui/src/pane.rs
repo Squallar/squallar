@@ -1819,6 +1819,7 @@ impl PaneState {
         registry: &rustdar_overlays::render::overlay_state::OverlayRegistry,
         pane_idx: usize,
     ) {
+        self.publish_radar_selection();
         for slot in &mut self.layers {
             if slot.state.is_some() {
                 continue;
@@ -1843,6 +1844,89 @@ impl PaneState {
             };
             slot.enabled = registry.is_enabled(&slot.id, &view);
         }
+    }
+
+    /// **Publish this pane's radar selection into the slot a handler reads
+    /// it from.**
+    ///
+    /// [`RADAR_SLOT_PANE_KEYS`] declares that the radar slot's config carries
+    /// this pane's site, product and tilt, and `merge_radar_slot` holds those
+    /// three back from the handler so the two owners never collide. Nothing
+    /// kept them *current*: the members were written by the config load and
+    /// re-derived at the save, and [`Self::set_site`] and its two siblings are
+    /// plain assignments by their own written contract. So between a load and
+    /// the next reload, every handler reading them saw the selection the pane
+    /// had when the file was opened — and a pane that was never loaded from a
+    /// file (a fresh pane, a split, a test fixture) had no `"site"` member at
+    /// all.
+    ///
+    /// The one live consumer today is `RadarSitesHandler::prepare_job`, whose
+    /// `is_current` flag is the "you are here" marker on the radar-sites
+    /// layer; it followed the load-time site. WO-M12 needs the same three
+    /// members for the frame-supply contract — `list_frames` and
+    /// `create_frame_list_task` are handed a [`PaneRef`] and nothing else —
+    /// which is what brought the staleness to light.
+    ///
+    /// Called from [`Self::hydrate_layer_states`], which every caller already
+    /// runs before asking a handler anything about this pane. Writes only when
+    /// a member actually differs, so a pane whose selection has not moved
+    /// allocates nothing.
+    ///
+    /// `live_chunks` is deliberately NOT projected: unlike the other three it
+    /// has no field on the pane to be projected *from* — the slot's config is
+    /// its only home, read by [`Self::radar_live_chunks`] and written by
+    /// [`Self::set_radar_live_chunks`].
+    fn publish_radar_selection(&mut self) {
+        let elevation = if self.selected_elevation.is_finite() {
+            self.selected_elevation
+        } else {
+            0.0
+        };
+        let product = match serde_json::to_value(self.selected_product) {
+            Ok(product) => product,
+            Err(e) => {
+                log::error!("this pane's product cannot be published to its slot ({e})");
+                return;
+            }
+        };
+        let site = self.site.clone();
+        let Some(slot) = self.layers.iter_mut().find(|slot| slot.id == known::RADAR) else {
+            return;
+        };
+        let held = slot.config.as_object();
+        // **Compared in the pane's own precision, not the file's.** The tilt is
+        // an `f32` on the pane and an f64 in JSON, and widening `0.9f32` gives
+        // `0.8999999761581421` — so a value-wise comparison would call every
+        // slot stale on the first frame and rewrite a member the file's own
+        // round trip had preserved exactly. The save path widens it too, so
+        // nothing here changes what is eventually written; it only refuses to
+        // churn a member whose meaning has not moved.
+        let site_fresh = held.and_then(|m| m.get("site")).and_then(|v| v.as_str()) == Some(&site);
+        let product_fresh = held.and_then(|m| m.get("product")) == Some(&product);
+        let elevation_fresh = held
+            .and_then(|m| m.get("elevation"))
+            .and_then(serde_json::Value::as_f64)
+            .is_some_and(|held| held as f32 == elevation);
+        if site_fresh && product_fresh && elevation_fresh {
+            return;
+        }
+        let mut map = match slot.config.take() {
+            serde_json::Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        if !site_fresh {
+            map.insert("site".to_string(), serde_json::Value::String(site));
+        }
+        if !product_fresh {
+            map.insert("product".to_string(), product);
+        }
+        if !elevation_fresh {
+            map.insert(
+                "elevation".to_string(),
+                serde_json::Value::from(f64::from(elevation)),
+            );
+        }
+        slot.config = serde_json::Value::Object(map);
     }
 
     /// Turn `id` on or off **in this pane**, through its own state.
