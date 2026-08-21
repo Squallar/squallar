@@ -167,7 +167,7 @@ pins it.
 
 * **Owner**: `rustdar-source/src/handler.rs`. Fifty-eight methods; most
   defaulted. `RadarSource` (`rustdar-radar/src/source.rs`) overrides
-  thirty-three of them.
+  thirty-four of them.
 * **The scope line, as ruled**:
 
   > at campaign end `RadarSource` implements every `SourceHandler` surface
@@ -177,7 +177,7 @@ pins it.
   > the per-pane fetch seam is post-campaign.
 
   Measured beside it, so the sentence is not read wider than it is:
-  `create_fetch_tasks` is one of the twenty-five surfaces `RadarSource` leaves
+  `create_fetch_tasks` is one of the twenty-four surfaces `RadarSource` leaves
   at their trait default. It is the one that *matters*, because it is the
   overlay fetch door; radar arrives instead through `create_frame_list_task`,
   `list_frames`, `fetch_frame`, `apply_frame_listing` and its own bespoke
