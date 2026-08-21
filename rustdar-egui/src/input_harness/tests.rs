@@ -7929,6 +7929,67 @@ fn a_granted_permission_with_no_fix_yet_says_so() {
     );
 }
 
+/// **The site list is grouped by network, WSR-88D first, and the search spans
+/// both groups.**
+///
+/// The grouping is presentation only: every radar the flat list offered is
+/// still offered, still pickable, and what a pick persists is unchanged.
+#[test]
+fn the_site_list_groups_by_network_and_the_search_reaches_both() {
+    use rustdar_radar::sites::RadarNetwork;
+
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.open_pane_props();
+
+    let inspector = h.inspector();
+    let networks: Vec<RadarNetwork> = inspector
+        .site_rows
+        .iter()
+        .map(|(name, _, _)| RadarNetwork::of_id(name))
+        .collect();
+
+    // Non-triviality: both groups must be populated, or "grouped" is a claim
+    // about a list with one kind in it and the ordering below cannot fail.
+    assert!(
+        networks.contains(&RadarNetwork::Wsr88d) && networks.contains(&RadarNetwork::Tdwr),
+        "the harness table must offer both networks: {networks:?}",
+    );
+
+    let first_tdwr = networks
+        .iter()
+        .position(|n| *n == RadarNetwork::Tdwr)
+        .expect("a terminal radar is drawn");
+    assert!(
+        networks[first_tdwr..]
+            .iter()
+            .all(|n| *n == RadarNetwork::Tdwr),
+        "a WSR-88D is drawn below a TDWR, so the list is not grouped: {networks:?}",
+    );
+
+    // Nothing was dropped on the way into the groups.
+    let total = rustdar_radar::sites::radars().len() + rustdar_radar::sites::unplaced().len();
+    assert_eq!(
+        inspector.site_rows.len(),
+        total,
+        "the grouping lost a radar"
+    );
+
+    // The search spans both groups: a terminal radar is reachable by typing.
+    h.mouse_click(inspector.site_search.center());
+    h.type_text("tokc");
+    h.warm_up();
+    let inspector = h.inspector();
+    assert_eq!(
+        inspector
+            .site_rows
+            .iter()
+            .map(|(code, _, _)| code.as_str())
+            .collect::<Vec<_>>(),
+        vec!["TOKC"],
+        "the search must reach the TDWR group",
+    );
+}
+
 /// 69. **The site search narrows the list, highlights the current site, and a row
 ///     click switches the pane's site.**
 #[test]
