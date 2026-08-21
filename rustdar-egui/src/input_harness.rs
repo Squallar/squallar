@@ -1092,6 +1092,12 @@ impl InputHarness {
         self.gui.pane_layout_for_test().grid().to_vec()
     }
 
+    /// The egui context the harness drives frames through — what a call into
+    /// the `Gui` that closes popovers needs.
+    pub(crate) fn ctx(&self) -> &egui::Context {
+        &self.ctx
+    }
+
     pub(crate) fn pane_option_counts(&self) -> Vec<usize> {
         self.pane_options().iter().map(|o| o.count).collect()
     }

@@ -96,7 +96,30 @@ impl Gui {
 
         self.render_catalog(ctx, &mut actions);
 
+        self.apply_pending_pane_close(ctx, &mut actions);
+
         actions
+    }
+
+    /// **Last thing in the frame, and both halves of that matter.**
+    ///
+    /// After the last surface has drawn, so every `mem::take`n pane is back in
+    /// the vector — removing a slot with one still out would restore it into
+    /// the wrong one. And with the whole frame's action list in hand, which is
+    /// what [`Gui::close_pane`] filters: an action queued earlier this frame
+    /// for a pane at or above the closed one is addressed to a pane that no
+    /// longer sits there.
+    pub(super) fn apply_pending_pane_close(
+        &mut self,
+        ctx: &egui::Context,
+        actions: &mut Vec<GuiAction>,
+    ) {
+        let Some(idx) = self.pending_pane_close.take() else {
+            return;
+        };
+        if !self.close_pane(ctx, idx, actions) {
+            log::warn!("pane {idx} cannot be closed; leaving the layout alone");
+        }
     }
 
     /// Check timers and emit fetch actions for auto-polling radar scans, NWS

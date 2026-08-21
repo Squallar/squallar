@@ -34,6 +34,11 @@ const COMBO_BOX_WIDTH: f32 = 150.0;
 /// Id prefix for the product/tilt combos.
 const LAYER_CONTROL_ID_PREFIX: &str = "layers_";
 
+/// What the pane-props close button promises. Says which panes move, because
+/// `PaneId` is a slot position and the ones above the closed pane renumber.
+const CLOSE_PANE_HOVER: &str =
+    "Close this pane. The panes after it move up a number and take its room.";
+
 /// What the inspector drew last frame, as it was drawn.
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
@@ -65,6 +70,9 @@ pub(crate) struct InspectorProbe {
     /// they were handed and the two action rows with `false`
     /// (`pills::sync_section_ui`'s outcome, verbatim).
     pub sync_rows: Vec<(String, egui::Rect, bool)>,
+    /// The pane-props body's "Close this pane" button. `NOTHING` whenever the
+    /// body drew none — one pane has no close.
+    pub close_pane: egui::Rect,
 }
 
 #[cfg(test)]
@@ -81,6 +89,7 @@ impl Default for InspectorProbe {
             site_rows: Vec::new(),
             site_caption: String::new(),
             sync_rows: Vec::new(),
+            close_pane: egui::Rect::NOTHING,
         }
     }
 }
@@ -368,6 +377,26 @@ impl super::Gui {
                 );
             }
         });
+
+        // **The close lives here, and deliberately not on the pill row.** The
+        // pills idle at 35% opacity until the pointer finds them; a control
+        // that destroys a pane has no business being the one you discover by
+        // accident. Last in the body, under its own separator, and only with
+        // another pane to fall back to.
+        if self.pane_layout.pane_count > 1 {
+            ui.add_space(6.0);
+            ui.separator();
+            let close = ui
+                .button(format!("Close pane {}", self.active_pane + 1))
+                .on_hover_text(CLOSE_PANE_HOVER);
+            #[cfg(test)]
+            {
+                probe.close_pane = close.rect;
+            }
+            if close.clicked() {
+                self.request_pane_close(self.active_pane);
+            }
+        }
     }
 
     /// The radar-site search: a filter box over the full compiled-in table and a
