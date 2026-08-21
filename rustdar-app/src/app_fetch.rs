@@ -14,7 +14,13 @@ use std::sync::atomic::Ordering;
 use winit::event_loop::ActiveEventLoop;
 
 /// Parameters for a background overlay rasterization request.
-pub(super) struct OverlayRenderRequest {
+///
+/// `pub(crate)` and `Clone` since WO-M13a: [`crate::render_dispatch::RenderDispatcher`]
+/// keeps the last one dispatched per `(pane, layer)`, which is what lets a
+/// data arrival re-dispatch **the geometry that was already agreed** rather
+/// than invent one from a frame that has not been laid out yet.
+#[derive(Clone)]
+pub(crate) struct OverlayRenderRequest {
     /// The pane's viewport, *before* overdraw is applied.
     pub geo_bounds: rustdar_geo::GeoBounds,
     /// Pixel dimensions and the overdraw fraction they were sized for.
@@ -979,6 +985,7 @@ impl super::App {
     ) {
         use rustdar_egui::overlay_cache::ZOOM_QUANTIZATION_FACTOR;
 
+        let record = req.clone();
         let OverlayRenderRequest {
             geo_bounds,
             texture,
@@ -1007,6 +1014,13 @@ impl super::App {
             if let Some(pane) = self.gui.pane_mut(pidx) {
                 pane.overlay_cache_mut(&id).render_in_flight = true;
             }
+            // **The record, written here and nowhere else** — beside the mark, so
+            // "this pane has a raster of this layer out" and "this is what it was
+            // asked for" are set by the same statement and cannot disagree. Both
+            // paths reach this function, so both write it; the arrival path reads
+            // it back for the geometry alone (WO-M13a).
+            self.render
+                .record_overlay_dispatch(pidx, &id, record.clone());
         }
 
         let render_bounds = texture.coverage(&geo_bounds);
@@ -1115,6 +1129,137 @@ impl super::App {
                 self.clear_overlay_render_marks(&pane_indices, &id);
             }
         }
+    }
+
+    /// **The rasters a data arrival has just made stale**, one ask per
+    /// `(pane, layer)`, ready for the same dedupe/grouping/dispatch the action
+    /// path runs.
+    ///
+    /// This is the arrival half of WO-M13a: the draw loop stops being the only
+    /// thing that can *discover* a stale overlay raster. It is not a second
+    /// dispatcher — every ask returned here goes through
+    /// [`App::dispatch_overlay_renders`] and then
+    /// [`Self::spawn_overlay_render`], the same two functions the action path
+    /// uses, because that is where the `render_in_flight` marks are owned.
+    ///
+    /// **The token is recomputed, never read back.** The recorded
+    /// `data_generation` is what the picture on the glass was keyed at, so it
+    /// is stale by construction — that staleness *is* the trigger. The fresh
+    /// one comes from [`rustdar_egui::overlay_cache_token`], the very function
+    /// the draw loop's `needs_rerender` pass calls, so the two paths cannot
+    /// disagree about what "the picture would be different" means.
+    ///
+    /// **The geometry is re-used, never recomputed.** Viewport, texture plan
+    /// and zoom come off the record unchanged: this runs in `Ingest`, before
+    /// the frame is laid out, and a zoom-driven rebuild is the draw loop's to
+    /// discover on the frame that actually knows the new zoom.
+    pub(super) fn arrived_overlay_asks(
+        &mut self,
+        arrived: &[LayerId],
+    ) -> Vec<(usize, LayerId, OverlayRenderRequest)> {
+        let mut asks: Vec<(usize, LayerId, OverlayRenderRequest)> = Vec::new();
+
+        // Every (pane, layer, record) an arrival could bear on, collected before
+        // `gui` is borrowed.
+        let mut holders: Vec<(usize, LayerId, OverlayRenderRequest)> = Vec::new();
+        for id in arrived {
+            // **Radar is not on this path and must never be.** Radar's own
+            // arrival dispatch is WO-M14c's, at the volume stamp; the overlay
+            // record is the texture path's, and the draw loop excludes radar
+            // from `needs_rerender` for the same reason.
+            if *id == known::RADAR {
+                continue;
+            }
+            holders.extend(
+                self.render
+                    .overlay_record_holders(id)
+                    .into_iter()
+                    .map(|(pane_idx, req)| (pane_idx, id.clone(), req)),
+            );
+        }
+        if holders.is_empty() {
+            return asks;
+        }
+
+        // The theme the dispatch would rasterize at, and the same term the draw
+        // loop mixes into its token.
+        let is_dark = self.cached_dark_theme.unwrap_or(false);
+        // The panes the layout is showing, from the same slice `render_panes`
+        // draws. A record outlives its pane going hidden, and a raster for a
+        // pane nobody paints is the speculation this path refuses.
+        let visible = self.gui.panes().len();
+        let (panes, overlays) = self.gui.panes_and_overlays_mut();
+
+        for (pane_idx, id, recorded) in holders {
+            if pane_idx >= visible {
+                continue;
+            }
+            let Some(pane) = panes.get_mut(pane_idx) else {
+                continue;
+            };
+            if !pane.is_overlay_enabled(&id) {
+                continue;
+            }
+            if overlays.render_mode(&id)
+                != Some(rustdar_overlays::render::overlay_state::RenderMode::Texture)
+            {
+                continue;
+            }
+            // Not a dedupe: a second ask under an outstanding one would take a
+            // render slot for a picture the first is already drawing, and the
+            // draw loop declines on the same flag.
+            if pane.overlay_cache_mut(&id).render_in_flight {
+                continue;
+            }
+            // **No hydrate here, and that is measured rather than assumed.**
+            // The only caller is the `SourceEvent::Data` drain, and
+            // `Gui::deliver_overlay_fetch` goes through `across_panes`, which
+            // hydrates every pane up to `pane_layout.pane_count` — the same
+            // set `visible` above admits — one statement before this runs. A
+            // hydrate here was written, tampered, and came back green because
+            // of that; it is gone rather than kept as a line no test can fail.
+            // If a second caller ever reaches this function from somewhere the
+            // delivery door does not, it hydrates first.
+            //
+            // The draw loop refuses on this too. An arrival that emptied a
+            // layer is not a reason to rasterize nothing.
+            if !overlays.has_data(&id, &pane.layer_ref(pane_idx, &id)) {
+                continue;
+            }
+            let fresh = rustdar_egui::overlay_cache_token(overlays, pane_idx, pane, &id, is_dark);
+            if fresh == recorded.data_generation {
+                continue;
+            }
+            // **`info!`, and the level is load-bearing.** The browser build
+            // initialises `console_log` at `Level::Info`, so a `debug!` line
+            // here is invisible to the only instrument the [WEB] gate has —
+            // and this line is what shows a raster was dispatched from the
+            // arrival drain rather than from a frame. Its cadence is one per
+            // (pane, layer) per arrival that moved the token, which is the
+            // cadence `offload`'s own per-job timing line already runs at.
+            //
+            // "ahead of this frame's draw-loop pass", precisely: the drain is
+            // `Ingest`, which runs before `setup_egui_frame` builds the paint
+            // list; the pass that would have noticed runs inside that build,
+            // and the action it emits is not processed until after
+            // `present_frame`.
+            log::info!(
+                "overlay raster: pane {pane_idx} asked {} to redraw as its data \
+                 arrived, ahead of this frame's draw-loop pass (token {} -> {})",
+                id.as_str(),
+                recorded.data_generation,
+                fresh,
+            );
+            asks.push((
+                pane_idx,
+                id,
+                OverlayRenderRequest {
+                    data_generation: fresh,
+                    ..recorded
+                },
+            ));
+        }
+        asks
     }
 
     /// Undo the in-flight marks [`spawn_overlay_render`](Self::spawn_overlay_render)
@@ -2043,3 +2188,7 @@ mod model_wire_tests;
 #[path = "app_fetch/site_switch_tests.rs"]
 #[cfg(test)]
 mod site_switch_tests;
+
+#[cfg(test)]
+#[path = "app_fetch/overlay_arrival_tests.rs"]
+mod overlay_arrival_tests;

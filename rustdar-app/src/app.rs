@@ -26,7 +26,9 @@ use rustdar_radar::types::ScanInfo;
 use rustdar_source::id::LayerId;
 
 #[path = "app_fetch.rs"]
-mod fetch;
+// `pub(crate)` for one type: `render_dispatch` holds the last
+// `OverlayRenderRequest` per (pane, layer) — see `last_overlay_dispatch`.
+pub(crate) mod fetch;
 
 #[path = "app_render.rs"]
 mod render;
@@ -1257,19 +1259,37 @@ impl App {
             }
         }
 
-        if !overlay_renders.is_empty() {
-            let should_group = self.gui.overlay_renders_groupable();
-            let grouped = deduplicate_overlay_renders(overlay_renders, should_group);
-            for (pane_indices, id, req) in grouped {
-                if should_group {
-                    log::debug!(
-                        "Spawning overlay render for {} targeting {} panes",
-                        id.as_str(),
-                        pane_indices.len()
-                    );
-                }
-                self.spawn_overlay_render(pane_indices, id, req);
+        self.dispatch_overlay_renders(overlay_renders);
+    }
+
+    /// **The one way an overlay raster is asked for**, whichever path noticed
+    /// it was needed.
+    ///
+    /// The draw loop's `needs_rerender` pass reaches it through
+    /// [`Self::process_gui_actions`]; a data arrival reaches it through
+    /// [`fetch::App::arrived_overlay_asks`]. Both get the same grouping, the
+    /// same dedupe and the same `spawn_overlay_render` — which is what owns
+    /// the `render_in_flight` marks, and is why neither path may call
+    /// `offload_job` on its own: an unmarked dispatch is dispatched again on
+    /// the next frame.
+    fn dispatch_overlay_renders(
+        &mut self,
+        overlay_renders: Vec<(usize, LayerId, fetch::OverlayRenderRequest)>,
+    ) {
+        if overlay_renders.is_empty() {
+            return;
+        }
+        let should_group = self.gui.overlay_renders_groupable();
+        let grouped = deduplicate_overlay_renders(overlay_renders, should_group);
+        for (pane_indices, id, req) in grouped {
+            if should_group {
+                log::debug!(
+                    "Spawning overlay render for {} targeting {} panes",
+                    id.as_str(),
+                    pane_indices.len()
+                );
             }
+            self.spawn_overlay_render(pane_indices, id, req);
         }
     }
 
@@ -1413,6 +1433,9 @@ impl App {
         // observable turns on where in this pass it is dispatched.
         let mut listed: Vec<(String, (chrono::NaiveDateTime, chrono::NaiveDateTime))> = Vec::new();
         let mut archives: Vec<rustdar_radar::source::RadarFrameFetch> = Vec::new();
+        // The layers this drain installed data for, deduplicated: two rounds of
+        // the same layer in one pass are one re-ask, not two.
+        let mut arrived: Vec<rustdar_source::id::LayerId> = Vec::new();
         // Bound once for the whole drain, not per arrival.
         let gui = &mut self.gui;
         while let Ok(event) = self.channels.overlay_fetch_receiver.try_recv() {
@@ -1421,7 +1444,17 @@ impl App {
             // layer's — every pane's selection, unioned. `Gui` owns the panes
             // and builds that view.
             match event {
-                SourceEvent::Data(result) => gui.deliver_overlay_fetch(result),
+                SourceEvent::Data(result) => {
+                    // **The raster-now obligation `Data` carries** (WO-M13a):
+                    // which layer just changed, so the panes already showing
+                    // it can be re-asked below without waiting for a frame to
+                    // notice.
+                    let id = result.kind.clone();
+                    gui.deliver_overlay_fetch(result);
+                    if !arrived.contains(&id) {
+                        arrived.push(id);
+                    }
+                }
                 SourceEvent::Frames { id, listing, scope } => {
                     // **What the listing was about is in the scope**, which is
                     // the layer's own type: the generic halves — the stamps,
@@ -1455,6 +1488,21 @@ impl App {
         for fetch in archives {
             self.take_loop_frame_archive(fetch);
         }
+        // **The arrival half of the render trigger.** The draw loop's
+        // `needs_rerender` pass is untouched and still runs every frame — it
+        // remains the only discoverer for a first render, a resize, a pan and a
+        // zoom settle, and it is still where the settle clock is recorded.
+        //
+        // Said precisely, because the loose version is false: this does not
+        // add a *raster*. On the frame data arrives, the pass would have seen
+        // the same moved token and pushed its own action; it now finds
+        // either the mark set or — if the raster already landed — the cache's
+        // own token caught up, and declines on guards it has always had.
+        // What moved is who initiated the one raster and when —
+        // this runs in `Ingest`, ahead of the paint-list build and the
+        // present that a draw-time action waits behind.
+        let asks = self.arrived_overlay_asks(&arrived);
+        self.dispatch_overlay_renders(asks);
     }
 
     /// Tell the UI each site's current-volume stamp — what a whole-volume pane may build

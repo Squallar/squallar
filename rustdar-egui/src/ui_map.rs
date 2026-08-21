@@ -7,7 +7,7 @@ use rustdar_source::product::FieldId;
 use rustdar_units::UserPreferences;
 
 #[path = "ui_map_pane.rs"]
-mod pane_render;
+pub(crate) mod pane_render;
 
 #[path = "ui_section_pane.rs"]
 pub(crate) mod section_render;

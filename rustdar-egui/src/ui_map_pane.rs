@@ -466,7 +466,12 @@ pub(super) fn render_pane_map_content(
 
 /// The token a texture overlay's cached raster is keyed by: it moves exactly
 /// when the picture would be different.
-fn overlay_cache_token(
+///
+/// **Public because it has two callers and must never have two definitions.**
+/// The draw loop calls it below to notice a stale raster; the arrival path
+/// (WO-M13a) calls it to recompute a recorded dispatch's token *fresh*, and
+/// the comparison it makes is only meaningful if both sides are this function.
+pub fn overlay_cache_token(
     overlays: &OverlayRegistry,
     pane_idx: usize,
     pane: &PaneState,
