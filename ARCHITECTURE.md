@@ -410,6 +410,18 @@ raise, and do not re-spell.
   **Do not name a test in a comment unless it exists.** Genuine non-defects go
   in that file's `ALLOWED` table *with the reason*.
 * **One geodesy definition** — `rustdar-radar/tests/geodesy_one_definition.rs`.
+* **No release-artifact row asks for a test-only feature** —
+  `rustdar/src/release_artifact_features.rs` parses `.github/workflows/build.yaml`'s
+  build matrix and, for every row carrying an `artifact:` key, asserts that the
+  feature **set** that row's cargo command requests contains no test-only
+  feature. `--all-features` fails it because it expands to every feature the
+  member manifests declare — the property, not the spelling. It carries two
+  presence controls (the four desktop rows are found by name with a `cmd:`
+  each; every needle names a feature some manifest declares). Its module docs
+  record the one residual it deliberately does **not** assert: `--all-targets`
+  unifies `rustdar-radar/test-support` into the shipped lib unit, measured, and
+  unfolding the artifact build from the coverage build is not a change a gate
+  should force.
 * **On-screen strings are ASCII unless the glyph is registered** —
   `rustdar-egui/src/ui_glyphs.rs` holds the one inventory of icon and text
   glyphs, verified against the fonts egui actually bundles, and
