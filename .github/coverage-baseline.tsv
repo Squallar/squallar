@@ -5,9 +5,9 @@ nexrad-level3/src/decode/symbology.rs	195	172
 nexrad-level3/src/model/header.rs	219	217
 nexrad-level3/src/model/radial.rs	86	85
 nexrad-level3/src/model/symbology.rs	5	5
-rustdar-app/src/app.rs	1321	998
+rustdar-app/src/app.rs	1328	998
 rustdar-app/src/app_chunks.rs	216	129
-rustdar-app/src/app_fetch.rs	1371	961
+rustdar-app/src/app_fetch.rs	1359	961
 rustdar-app/src/app_render.rs	2384	1732
 rustdar-app/src/app_state.rs	72	0
 rustdar-app/src/budget_arms.rs	17	17
@@ -17,7 +17,7 @@ rustdar-app/src/frame_pump.rs	24	24
 rustdar-app/src/input.rs	138	127
 rustdar-app/src/location_hint.rs	82	51
 rustdar-app/src/loop_pool.rs	179	178
-rustdar-app/src/platform.rs	272	228
+rustdar-app/src/platform.rs	276	228
 rustdar-app/src/platform_double.rs	236	220
 rustdar-app/src/render_dispatch.rs	1039	938
 rustdar-app/src/render_key.rs	27	27
@@ -34,9 +34,9 @@ rustdar-egui/src/acceptance_fake_source.rs	286	281
 rustdar-egui/src/actions.rs	63	26
 rustdar-egui/src/field_facts.rs	32	26
 rustdar-egui/src/gui/frame.rs	330	317
-rustdar-egui/src/gui/layer_glue.rs	323	317
+rustdar-egui/src/gui/layer_glue.rs	342	336
 rustdar-egui/src/gui/probes.rs	68	68
-rustdar-egui/src/gui/state.rs	125	122
+rustdar-egui/src/gui/state.rs	123	120
 rustdar-egui/src/gui/sync.rs	141	139
 rustdar-egui/src/input_harness.rs	1308	1298
 rustdar-egui/src/legend_ramp.rs	146	146
@@ -49,7 +49,7 @@ rustdar-egui/src/radar_layer.rs	130	129
 rustdar-egui/src/sources.rs	310	297
 rustdar-egui/src/tile_source.rs	242	235
 rustdar-egui/src/tiles.rs	107	96
-rustdar-egui/src/ui.rs	1059	939
+rustdar-egui/src/ui.rs	1061	941
 rustdar-egui/src/ui_catalog.rs	479	472
 rustdar-egui/src/ui_config.rs	781	733
 rustdar-egui/src/ui_config/migrate.rs	146	139
@@ -68,10 +68,10 @@ rustdar-egui/src/ui_region.rs	179	177
 rustdar-egui/src/ui_section_edit.rs	342	329
 rustdar-egui/src/ui_section_pane.rs	735	708
 rustdar-egui/src/ui_settings.rs	382	323
-rustdar-egui/src/ui_sheet.rs	542	515
+rustdar-egui/src/ui_sheet.rs	549	522
 rustdar-egui/src/ui_shell.rs	246	239
 rustdar-egui/src/ui_stack.rs	384	361
-rustdar-egui/src/ui_statusbar.rs	312	290
+rustdar-egui/src/ui_statusbar.rs	317	294
 rustdar-egui/src/ui_timeline.rs	688	602
 rustdar-egui/src/ui_topbar.rs	302	295
 rustdar-egui/src/ui_volume_alpha.rs	252	118
@@ -153,7 +153,7 @@ rustdar-overlays/src/types.rs	24	24
 rustdar-radar/src/archive.rs	249	222
 rustdar-radar/src/azimuth.rs	191	191
 rustdar-radar/src/beam.rs	33	33
-rustdar-radar/src/catalogue.rs	149	137
+rustdar-radar/src/catalogue.rs	149	134
 rustdar-radar/src/chunk_feed.rs	271	257
 rustdar-radar/src/chunk_notify.rs	340	309
 rustdar-radar/src/chunks.rs	975	710
@@ -170,7 +170,7 @@ rustdar-radar/src/hover.rs	49	49
 rustdar-radar/src/jobs.rs	594	558
 rustdar-radar/src/kdp.rs	247	203
 rustdar-radar/src/l3_values.rs	282	281
-rustdar-radar/src/level3.rs	188	132
+rustdar-radar/src/level3.rs	188	118
 rustdar-radar/src/loop_downloads.rs	736	717
 rustdar-radar/src/loop_geometry.rs	7	7
 rustdar-radar/src/nrot.rs	3227	3168
@@ -182,11 +182,11 @@ rustdar-radar/src/render/polar.rs	264	260
 rustdar-radar/src/render_input.rs	663	633
 rustdar-radar/src/sampler.rs	573	553
 rustdar-radar/src/sampler/seam_fixture.rs	178	167
-rustdar-radar/src/scan.rs	374	220
+rustdar-radar/src/scan.rs	374	225
 rustdar-radar/src/site_position.rs	81	81
 rustdar-radar/src/sites.rs	636	636
 rustdar-radar/src/sounding.rs	234	207
-rustdar-radar/src/source.rs	520	468
+rustdar-radar/src/source.rs	520	478
 rustdar-radar/src/srm.rs	107	102
 rustdar-radar/src/srv.rs	203	203
 rustdar-radar/src/tls_pins.rs	64	62
@@ -200,7 +200,7 @@ rustdar-radar/src/volumetric.rs	287	283
 rustdar-radar/src/voxel.rs	504	500
 rustdar-radar/src/xsect.rs	447	446
 rustdar-source/src/feature.rs	19	19
-rustdar-source/src/fetch_policy.rs	555	547
+rustdar-source/src/fetch_policy.rs	558	550
 rustdar-source/src/handler.rs	319	201
 rustdar-source/src/id.rs	46	46
 rustdar-source/src/job.rs	184	157
@@ -238,6 +238,7 @@ rustdar/src/android/back.rs	26	0
 rustdar/src/android/compass.rs	31	0
 rustdar/src/android/density.rs	24	0
 rustdar/src/android/insets.rs	123	0
+rustdar/src/android/lifecycle.rs	7	0
 rustdar/src/android/mod.rs	54	0
 rustdar/src/android/task_to_back.rs	15	0
 rustdar/src/android/theme.rs	25	0
