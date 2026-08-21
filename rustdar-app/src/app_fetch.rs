@@ -1362,11 +1362,7 @@ impl super::App {
         self.manual_nav_pending = true;
 
         let local_ts = chrono::TimeZone::from_utc_datetime(&chrono::Local, &target).naive_local();
-        let config = RadarConfig {
-            site: self.gui.global_site().to_string(),
-            timestamp: local_ts,
-        };
-        self.gui.apply(GuiEvent::RadarConfig(config));
+        self.gui.apply(GuiEvent::SelectedTime(local_ts));
         self.gui.apply(GuiEvent::Fetching(true));
 
         self.spawn_fetch(site, target);
@@ -1455,11 +1451,7 @@ impl super::App {
 
             let local_ts =
                 chrono::TimeZone::from_utc_datetime(&chrono::Local, &timestamp).naive_local();
-            let config = RadarConfig {
-                site: self.gui.global_site().to_string(),
-                timestamp: local_ts,
-            };
-            self.gui.apply(GuiEvent::RadarConfig(config));
+            self.gui.apply(GuiEvent::SelectedTime(local_ts));
             self.gui.apply(GuiEvent::ScanInfoForSite {
                 site: pane_site.clone(),
                 info: scan_info,
@@ -1483,11 +1475,7 @@ impl super::App {
         }
 
         let now = chrono::Local::now().naive_local();
-        let config = RadarConfig {
-            site: self.gui.global_site().to_string(),
-            timestamp: now,
-        };
-        self.gui.apply(GuiEvent::RadarConfig(config));
+        self.gui.apply(GuiEvent::SelectedTime(now));
         self.gui.apply(GuiEvent::Fetching(true));
 
         let utc_timestamp = Self::local_to_utc(now);
