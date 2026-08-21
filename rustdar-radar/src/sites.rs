@@ -373,6 +373,35 @@ impl SiteTable {
         self.nearest_where(lat, lon, |site| site.is_wsr88d() && site.is_operational())
     }
 
+    /// The `n` rows closest to `lat`/`lon`, nearest first, each with its
+    /// distance in kilometres.
+    ///
+    /// Every network, unfiltered — the sibling of [`Self::nearest`] rather
+    /// than of [`Self::nearest_wsr88d`]. The filters that one applies exist to
+    /// stop an *automatic* pick landing on a TDWR or the ROC test bed; a list
+    /// a person reads and chooses from is the case where those radars are
+    /// worth offering.
+    ///
+    /// Shorter than `n` when the table holds fewer rows, and empty for a
+    /// non-finite input.
+    pub fn nearest_n(&self, lat: f64, lon: f64, n: usize) -> Vec<(&'static RadarSite, f64)> {
+        if !lat.is_finite() || !lon.is_finite() || n == 0 {
+            return Vec::new();
+        }
+        let mut ranked: Vec<(&'static RadarSite, f64)> = self
+            .rows
+            .iter()
+            .map(|site| (site, distance_km(lat, lon, site.lat, site.lon)))
+            .collect();
+        // `total_cmp` for `nearest_where`'s reason: no unwrap on a partial
+        // comparison in a path a NaN row would turn into a panic.
+        ranked.sort_by(|(a_site, a), (b_site, b)| {
+            a.total_cmp(b).then_with(|| a_site.name.cmp(b_site.name))
+        });
+        ranked.truncate(n);
+        ranked
+    }
+
     fn nearest_where(
         &self,
         lat: f64,
@@ -873,6 +902,12 @@ pub fn nearest_wsr88d_site(lat: f64, lon: f64) -> Option<(&'static RadarSite, f6
     table().nearest_wsr88d(lat, lon)
 }
 
+/// The `n` radar sites closest to `lat`/`lon`, nearest first, with distances
+/// in kilometres — [`SiteTable::nearest_n`] over the process table.
+pub fn nearest_sites(lat: f64, lon: f64, n: usize) -> Vec<(&'static RadarSite, f64)> {
+    table().nearest_n(lat, lon, n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1034,6 +1069,54 @@ mod tests {
                 site.name, found.name, dist
             );
         }
+    }
+
+    #[test]
+    fn the_n_nearest_are_ordered_and_agree_with_the_single_nearest() {
+        let table = build_table([
+            ("ZZZA", learned(-30_000_000, -140_000_000, 100, 20)),
+            (
+                "TZZB",
+                learned_single_height(-30_100_000, -140_000_000, 100),
+            ),
+            ("KCRI", learned(-30_400_000, -140_000_000, 100, 20)),
+            ("ZZZD", learned(48_000_000, 9_000_000, 500, 20)),
+        ]);
+
+        let near = table.nearest_n(-30.0, -140.0, 3);
+        assert_eq!(
+            near.iter().map(|(s, _)| s.name).collect::<Vec<_>>(),
+            ["ZZZA", "TZZB", "KCRI"],
+            "the list is every network, ordered by distance",
+        );
+        assert!(
+            near.windows(2).all(|w| w[0].1 <= w[1].1),
+            "distances rise: {:?}",
+            near.iter().map(|(_, d)| *d).collect::<Vec<_>>(),
+        );
+
+        let (single, _) = table.nearest(-30.0, -140.0).expect("a finite coordinate");
+        assert_eq!(
+            single.name, near[0].0.name,
+            "the head of the list is the single-site answer",
+        );
+    }
+
+    #[test]
+    fn the_n_nearest_stop_at_the_table_and_refuse_a_bad_question() {
+        let table = build_table([
+            ("ZZZA", learned(-30_000_000, -140_000_000, 100, 20)),
+            ("ZZZB", learned(12_000_000, -80_000_000, 30, 10)),
+        ]);
+
+        assert_eq!(
+            table.nearest_n(-30.0, -140.0, 9).len(),
+            2,
+            "asking for more than the table holds yields the table",
+        );
+        assert!(table.nearest_n(-30.0, -140.0, 0).is_empty());
+        assert!(table.nearest_n(f64::NAN, -140.0, 3).is_empty());
+        assert!(table.nearest_n(-30.0, f64::INFINITY, 3).is_empty());
     }
 
     #[test]
