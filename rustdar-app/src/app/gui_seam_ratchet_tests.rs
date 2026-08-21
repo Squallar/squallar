@@ -56,10 +56,17 @@ fn no_production_file_pushes_through_a_gui_setter() {
 ///
 /// # What the numbers are, and what they are not
 ///
-/// WO-E10.4 lowered every one to the count it measures, so **none of them has
-/// headroom**. The old message here said WO-E8 would drive them to 0 "when the
-/// radar root fields dissolve": E8 landed, the fields dissolved, and these did
-/// not reach 0. A ceiling that names a future that already happened is a
+/// **The rule is that each ceiling equals the count it measures, and the land
+/// that sheds an occurrence lowers the constant with it.** The values below
+/// are the last measurement that satisfied it — re-measured at WO-ARREARS,
+/// 2026-08-21, base `178ab361`, by the scrape below. They are not a standing
+/// claim about the future: a land that sheds and does not lower leaves
+/// **arrears**, which is exactly what happened between WO-E10.4 and here
+/// (`1e94ce59` took `app_fetch.rs` 45 -> 42 and left the pin at 45).
+///
+/// The old message here said WO-E8 would drive them to 0 "when the radar root
+/// fields dissolve": E8 landed, the fields dissolved, and these did not reach
+/// 0. A ceiling that names a future that already happened is a
 /// prose-is-not-evidence defect sitting inside a gate, so it says what is true
 /// instead.
 ///
@@ -71,8 +78,20 @@ fn no_production_file_pushes_through_a_gui_setter() {
 /// through a local binding, which makes this scrape read zero while the
 /// coupling is identical.
 ///
-/// `app_chunks.rs` fell furthest here (18 to 13) because its ceiling had been
-/// carrying slack since WO-E2; the other three fell by one each.
+/// `app_chunks.rs` fell furthest at WO-E10.4 (18 to 13) because its ceiling
+/// had been carrying slack since WO-E2; the other three fell by one each.
+///
+/// # Two of these four files hide reaches from this scrape
+///
+/// `app.rs` and `app_render.rs` each contain one `let gui = &mut self` +
+/// `.gui;` binding — the construct the message below forbids by name. WO-ARREARS
+/// **compile-proved neither is borrow-forced** (a direct reach builds with no
+/// diagnostic) and measured what they hide: `app.rs` reads 37 here and is
+/// really 41, `app_render.rs` reads 108 and is really 109. Shedding them puts
+/// both files above their ceilings, so the shed needs a land that can also
+/// shed the difference. The full record, including the crate-wide figure, is
+/// on `arch_ratchets.rs`'s `SELF_GUI_MAX`. It is recorded here too because
+/// **this is the scrape those two bindings defeat**.
 #[test]
 fn the_gui_coupling_only_ever_shrinks() {
     // Presence control: the scrape reads real, current source. Without it every
@@ -84,7 +103,7 @@ fn the_gui_coupling_only_ever_shrinks() {
     );
     for (name, source, ceiling) in [
         ("app.rs", APP, 37),
-        ("app_fetch.rs", APP_FETCH, 45),
+        ("app_fetch.rs", APP_FETCH, 42),
         ("app_render.rs", APP_RENDER, 108),
         ("app_chunks.rs", APP_CHUNKS, 13),
     ] {
@@ -92,8 +111,8 @@ fn the_gui_coupling_only_ever_shrinks() {
         assert!(
             n <= ceiling,
             "{name}: {n} `{SELF_GUI}` occurrences > ceiling {ceiling}. This is a \
-             PERMANENT contract sitting at its measured value, so there is no \
-             headroom: shed first, then land. The two honest sheds are \
+             PERMANENT contract sitting on its measured value, so there is no \
+             slack to spend: shed first, then land. The two honest sheds are \
              loop-state addressing and the all-panes-versus-visible-panes \
              distinction. Lower this in the land that earns it; never raise it \
              without a written plan amendment, and never hide the reads behind \
