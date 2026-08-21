@@ -8407,6 +8407,48 @@ fn an_unlinked_pane_is_excluded_from_shared_nav_and_loop_fan_out() {
         "KTLX",
         "unlink is about time: every other synced field still converges"
     );
+
+    // **The gap this pin used to have.** It covered `viewing_live` and
+    // `time.step` but never the *moment on display* — the field the render
+    // reads to find its volume, and the one an archive delivery overwrote on
+    // every same-site pane regardless of the link. That is why the defect
+    // `UNLINK_NOTE` describes survived this test. See
+    // `ui::scan_info_audience_tests` for the delivery rule itself.
+    let parked = gui
+        .pane(1)
+        .and_then(|p| p.scan_info.as_ref().map(|i| i.timestamp))
+        .expect("load_scan put a volume on every pane");
+    let scrubbed_to = parked - chrono::Duration::minutes(20);
+    let mut arrival = gui
+        .pane(0)
+        .and_then(|p| p.scan_info.clone())
+        .expect("load_scan put a volume on every pane");
+    arrival.timestamp = scrubbed_to;
+    gui.apply(crate::shell_api::GuiEvent::ScanInfoForTimeGroup {
+        site: "KTLX".to_owned(),
+        requester: 0,
+        info: arrival,
+    });
+    let gui = h.gui_mut();
+    assert_eq!(
+        gui.pane(0)
+            .and_then(|p| p.scan_info.as_ref().map(|i| i.timestamp)),
+        Some(scrubbed_to),
+        "the pane that scrubbed must show what it scrubbed to",
+    );
+    assert_eq!(
+        gui.pane(1)
+            .and_then(|p| p.scan_info.as_ref().map(|i| i.timestamp)),
+        Some(parked),
+        "the unlinked pane was dragged to the scrubbing pane's moment; \
+         `UNLINK_NOTE` promises it holds its own",
+    );
+    assert_eq!(
+        gui.pane(2)
+            .and_then(|p| p.scan_info.as_ref().map(|i| i.timestamp)),
+        Some(scrubbed_to),
+        "and the linked pane must still follow",
+    );
 }
 
 /// **A keyboard nudge on the archive scrubber commits** (§5.9 carried finding:

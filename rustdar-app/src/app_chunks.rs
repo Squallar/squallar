@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::channels::ChunkResponse;
+use crate::channels::{ChunkResponse, FetchRequester};
 use rustdar_radar::chunk_feed::Retirement;
 use rustdar_radar::chunk_notify::{ChunkAvailable, Feed, Notified};
 
@@ -278,7 +278,7 @@ impl super::App {
                 );
             }
             self.gui
-                .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForSite {
+                .apply(rustdar_egui::shell_api::GuiEvent::LiveScanInfoForSite {
                     site: site.to_owned(),
                     info,
                 });
@@ -334,7 +334,9 @@ impl super::App {
     fn fall_back_to_archive(&mut self, site: &str, reason: Retirement) {
         log::warn!("{site}: chunk feed retired ({reason:?}); refetching from the archive");
         let timestamp = Self::local_to_utc(self.gui.selected_timestamp());
-        self.spawn_fetch(site.to_string(), timestamp);
+        // The feed served the whole site and its replacement does too: no pane
+        // asked for this, so every pane on the site takes it.
+        self.spawn_fetch(site.to_string(), timestamp, FetchRequester::Site);
     }
 
     pub(super) fn any_pane_live_for_site(&self, site: &str) -> bool {
@@ -364,3 +366,9 @@ mod tests;
 #[path = "app_chunks/volume_close_tests.rs"]
 #[cfg(test)]
 mod volume_close_tests;
+
+/// Who the live feed's volumes are for: every pane on the site that is
+/// following live, and no one else.
+#[path = "app_chunks/live_follow_tests.rs"]
+#[cfg(test)]
+mod live_follow_tests;

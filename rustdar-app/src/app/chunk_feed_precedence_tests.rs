@@ -76,6 +76,7 @@ fn send_archive_scan(app: &App, timestamp: chrono::NaiveDateTime, scan: nexrad_m
         .send(crate::channels::ScanResponse {
             generation,
             site: "KTLX".to_string(),
+            requester: crate::channels::FetchRequester::Site,
             result: Ok(crate::channels::ScanData {
                 scan,
                 declared_nyquist: Default::default(),
@@ -96,6 +97,7 @@ fn send_auto_poll_archive(app: &App, timestamp: chrono::NaiveDateTime) {
         .send(crate::channels::ScanResponse {
             generation,
             site: "KTLX".to_string(),
+            requester: crate::channels::FetchRequester::Site,
             result: Ok(crate::channels::ScanData {
                 scan: empty_scan(),
                 declared_nyquist: Default::default(),

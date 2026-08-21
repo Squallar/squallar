@@ -2070,6 +2070,7 @@ fn every_queued_scan_response_is_spent_in_the_frame_it_arrives_in() {
             .send(crate::channels::ScanResponse {
                 generation: 1,
                 site: site.to_string(),
+                requester: crate::channels::FetchRequester::Site,
                 result: Err("no data".to_string()),
                 is_auto_poll: false,
             })
@@ -2414,6 +2415,7 @@ fn a_discarded_scan_result_still_takes_down_the_wait_it_belonged_to() {
         .send(crate::channels::ScanResponse {
             generation: superseded,
             site: "KTLX".to_string(),
+            requester: crate::channels::FetchRequester::Site,
             result: Ok(crate::channels::ScanData {
                 scan: empty_scan(),
                 declared_nyquist: Default::default(),

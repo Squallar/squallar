@@ -587,12 +587,60 @@ impl Gui {
                     self.claim_initial_zoom();
                 }
             }
+            // The live feed's counterpart to the arm above: the same site-wide
+            // sweep, refusing the panes that are not following live. A pane
+            // parked in the archive keeps its moment whichever subsystem
+            // delivered the site's newest volume.
+            GuiEvent::LiveScanInfoForSite { site, info } => {
+                let mut any_pane_took_it = false;
+                for pane in &mut self.panes {
+                    if pane.site() == site && pane.viewing_live {
+                        pane.scan_info = Some(info.clone());
+                        any_pane_took_it = true;
+                    }
+                }
+                self.end_radar_round(RoundOutcome::Delivered);
+                if any_pane_took_it {
+                    self.claim_initial_zoom();
+                }
+            }
+            // The addressed counterpart to the arm above. Same writes, a
+            // narrower audience: the requester's time group rather than the
+            // whole site. Splitting them is the point — an archive volume one
+            // pane scrubbed to must not overwrite a same-site pane parked at
+            // its own moment, and a live volume must still reach every pane
+            // on the site.
+            GuiEvent::ScanInfoForTimeGroup {
+                site,
+                requester,
+                info,
+            } => {
+                let mut any_pane_took_it = false;
+                for idx in self.time_sync_targets_for(requester) {
+                    if let Some(pane) = self.panes.get_mut(idx)
+                        && pane.site() == site
+                    {
+                        pane.scan_info = Some(info.clone());
+                        any_pane_took_it = true;
+                    }
+                }
+                self.end_radar_round(RoundOutcome::Delivered);
+                // Same one-shot latch, same reason as `ScanInfoForSite`.
+                if any_pane_took_it {
+                    self.claim_initial_zoom();
+                }
+            }
             // Apply scan info for a volume still being assembled from the real-time
             // chunk feed.
             GuiEvent::ChunkScanInfo { site, info: fresh } => {
                 let mut any_pane_took_it = false;
                 for pane in &mut self.panes {
-                    if pane.site() != site {
+                    // Same audience as `LiveScanInfoForSite`, and for the same
+                    // reason: this is the same feed, a volume earlier. The
+                    // merge below moves `timestamp`, so an ungated pass drags
+                    // a parked pane forward exactly as the closed-volume path
+                    // did.
+                    if pane.site() != site || !pane.viewing_live {
                         continue;
                     }
                     any_pane_took_it = true;
@@ -2007,3 +2055,7 @@ mod overlay_retry_tests;
 
 #[cfg(test)]
 mod overlay_texture_release_tests;
+
+/// Which panes each scan-info event is addressed to.
+#[cfg(test)]
+mod scan_info_audience_tests;

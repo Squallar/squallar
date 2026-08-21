@@ -21,9 +21,37 @@ pub struct ScanData {
     pub timestamp: NaiveDateTime,
 }
 
+/// **Who asked for a scan.**
+///
+/// Carried from `spawn_fetch` through [`ScanResponse`] to the decode landing,
+/// because delivery has to know: an archive volume is not a broadcast. A pane
+/// that scrubbed owns the volume it scrubbed to, and writing it onto a
+/// same-site pane parked at its own moment is the defect `UNLINK_NOTE`
+/// promises against.
+///
+/// It is also the key half of the fetch generation. `is_scan_stale` used to
+/// mean "a newer request for this *site* superseded yours", which cancelled a
+/// same-site sibling's in-flight fetch: A scrubs at generation 5, B scrubs at
+/// 6, and A's reply is thrown away. Per requester, only A's own next request
+/// supersedes A — while a genuine re-request still does, which keying on the
+/// timestamp instead would have destroyed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FetchRequester {
+    /// Nobody in particular: the archive auto-poll, a site switch, the refetch
+    /// a retired chunk feed falls back to. Every pane on the site takes it,
+    /// and the site-wide generation is what supersedes it.
+    Site,
+    /// One pane navigated, and this volume is that pane's and its time
+    /// group's.
+    Pane(usize),
+}
+
 pub struct ScanResponse {
     pub generation: u64,
     pub site: String,
+    /// Which pane this volume was fetched for, and so which panes it may be
+    /// delivered to. See [`FetchRequester`].
+    pub requester: FetchRequester,
     pub result: Result<ScanData, String>,
     pub is_auto_poll: bool,
 }
