@@ -1,0 +1,173 @@
+{
+  "active_pane": 0,
+  "config_version": 4,
+  "heading_source": "Auto",
+  "loop_lookback_secs": 3600,
+  "loop_speed_fps": 5.0,
+  "overlay_states": {
+    "Radar": {
+      "auto_poll": true,
+      "chunk_notifications": true,
+      "live_chunks": true,
+      "notifier_endpoint": "wss://nexrad-aws-notifier.mcswain.dev"
+    }
+  },
+  "pane_count": 1,
+  "panes": [
+    {
+      "center": null,
+      "cross_section": null,
+      "kind": "Map",
+      "layer_link": true,
+      "layer_slots": [
+        {
+          "config": {
+            "enabled": false,
+            "parameter": "sbcin"
+          },
+          "enabled": false,
+          "id": "ModelData"
+        },
+        {
+          "config": {
+            "enabled_products": [],
+            "selected_day": "Day1"
+          },
+          "enabled": false,
+          "id": "SpcOutlook"
+        },
+        {
+          "config": {
+            "elevation": 0.0,
+            "enabled": true,
+            "live_chunks": true,
+            "product": "Reflectivity",
+            "site": "KTLX"
+          },
+          "enabled": true,
+          "id": "Radar"
+        },
+        {
+          "config": {
+            "enabled": true
+          },
+          "enabled": true,
+          "id": "SpcDiscussions"
+        },
+        {
+          "config": {
+            "enabled_categories": [
+              "Warning",
+              "Watch",
+              "Advisory",
+              "Other"
+            ],
+            "known_categories": [
+              "Warning",
+              "Watch",
+              "Advisory",
+              "Other"
+            ]
+          },
+          "enabled": true,
+          "id": "NwsAlerts"
+        },
+        {
+          "config": {
+            "enabled": false
+          },
+          "enabled": false,
+          "id": "StormReports"
+        },
+        {
+          "config": {
+            "enabled": false,
+            "satellite": "both",
+            "show_events": false,
+            "show_flashes": true,
+            "show_groups": true,
+            "time_window_secs": 300.0
+          },
+          "enabled": false,
+          "id": "Lightning"
+        },
+        {
+          "config": {
+            "enabled": false
+          },
+          "enabled": false,
+          "id": "Metar"
+        },
+        {
+          "config": {
+            "enabled": true
+          },
+          "enabled": true,
+          "id": "CityLabels"
+        },
+        {
+          "config": {
+            "enabled": false
+          },
+          "enabled": false,
+          "id": "RadarSites"
+        },
+        {
+          "config": {
+            "enabled": true
+          },
+          "enabled": true,
+          "id": "UserLocation"
+        },
+        {
+          "config": {
+            "enabled": true
+          },
+          "enabled": true,
+          "id": "ColorScale"
+        },
+        {
+          "config": {
+            "enabled": true,
+            "tint": "cool"
+          },
+          "enabled": true,
+          "id": "FakeSource"
+        }
+      ],
+      "layers": {},
+      "render": "Plan",
+      "spc_day": "Day1",
+      "time_link": true,
+      "time_step_secs": 600,
+      "viewport_link": true,
+      "volume": null,
+      "zoom": 4.0
+    }
+  ],
+  "pin_pane_controls": false,
+  "preferences": {
+    "distance": "Kilometers",
+    "hail_size": "Inches",
+    "height": "Feet",
+    "precip_rate": "InchesPerHour",
+    "speed": "Mph",
+    "temperature": "Fahrenheit",
+    "timezone": "Local"
+  },
+  "presets": [],
+  "serial_config": {
+    "baud_rate": 0,
+    "port_path": null
+  },
+  "site": "KTLX",
+  "srv_fallback": "MeanWind",
+  "storm_motion_override": {
+    "direction_deg": 240.0,
+    "enabled": false,
+    "speed_kt": 30.0
+  },
+  "time_step_secs": 600,
+  "volume_alpha": [],
+  "volume_iso": []
+}

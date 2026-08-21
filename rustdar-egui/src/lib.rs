@@ -21,6 +21,11 @@ pub mod volume_alpha;
 pub mod volume_iso;
 pub mod volume_view;
 
+/// The C1 acceptance suite: the UI half of `fake_source`'s five criteria.
+/// Campaign infrastructure, landed once at WO-E10.3.
+#[cfg(test)]
+mod acceptance_fake_source;
+
 #[cfg(test)]
 mod input_harness;
 
