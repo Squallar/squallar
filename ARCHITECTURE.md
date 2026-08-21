@@ -102,8 +102,9 @@ of truth; don't restate versions elsewhere and don't upgrade without testing.
 
 ## 2. The two boundary rules
 
-These two sentences are carried verbatim out of `.github/copilot-instructions.md`,
-which this file replaces. Both were re-verified against the tree at the time of
+These two sentences are carried verbatim out of the repository instructions this
+file replaced (`.github/copilot-instructions.md`, deleted once this file and
+`CLAUDE.md` took over). Both were re-verified against the tree at the time of
 writing.
 
 > **UI ↔ Platform boundary:** `rustdar-egui` must not depend on wgpu/winit.
@@ -473,7 +474,8 @@ denominator.
 
 ## 7. Before landing
 
-Carried verbatim from `.github/copilot-instructions.md` and re-verified against
+Carried verbatim from the repository instructions this file replaced
+(`.github/copilot-instructions.md`, since deleted) and re-verified against
 `.github/workflows/` at the time of writing. This is the one section ported
 forward, because it is the one that was checked.
 
