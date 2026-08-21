@@ -351,18 +351,20 @@ fn the_catalogue_landing_draws_the_volume_the_launch_could_not_place() {
         pane.set_selected_product(rustdar_radar::fields::known::REFLECTIVITY);
         pane.set_selected_elevation(0.5);
     }
+    let collected = info.timestamp;
     app.gui
         .apply(rustdar_egui::shell_api::GuiEvent::ScanInfoForSite {
             site: BLIND.to_string(),
             info,
         });
-    app.volumes.install_still(
+    drop(app.volumes.install_still(
         BLIND.to_string(),
+        collected,
         (
             scan,
             std::sync::Arc::new(rustdar_radar::nyquist::DeclaredNyquist::empty()),
         ),
-    );
+    ));
 
     app.dispatch_pane_renders(&ctx);
     assert_eq!(

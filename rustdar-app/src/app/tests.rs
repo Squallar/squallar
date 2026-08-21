@@ -2214,10 +2214,11 @@ fn a_volume_no_pane_is_showing_is_dropped() {
             info: scan_info_for("KTLX"),
         });
     for site in ["KTLX", "KOUN"] {
-        app.volumes.install_still(
+        drop(app.volumes.install_still(
             site.to_string(),
+            scan_info_for(site).timestamp,
             (Arc::new(empty_scan()), Default::default()),
-        );
+        ));
         app.volumes.install_base(
             site.to_string(),
             (
@@ -2240,11 +2241,12 @@ fn a_volume_no_pane_is_showing_is_dropped() {
     app.evict_unshown_scans();
 
     assert!(
-        app.volumes.holds_still("KTLX"),
+        app.volumes
+            .holds_still("KTLX", scan_info_for("KTLX").timestamp),
         "the volume the pane is drawing from was evicted",
     );
     assert!(
-        !app.volumes.holds_still("KOUN"),
+        !app.volumes.holds_any_still("KOUN"),
         "a radar no pane is on is still holding its whole decoded volume",
     );
     assert!(
@@ -2285,7 +2287,7 @@ fn an_evicted_volume_is_handed_over_rather_than_freed_on_the_frame() {
     // teardown on the frame. The first two are the inventory's, which takes them out
     // owned under its own names; the third is still a bare map on the `App`.
     for holder in [
-        "self.volumes.evict_still(&unshown)",
+        "self.volumes.retain_still(&wanted)",
         "self.volumes.evict_base(&unshown)",
         "evicted(&mut self.latest_cached_scans, &unshown)",
     ] {
@@ -2363,10 +2365,11 @@ fn the_volume_a_switching_pane_is_still_drawing_survives() {
             info: scan_info_for("KTLX"),
         });
     app.gui.pane_mut(0).unwrap().set_site("KOUN".to_string());
-    app.volumes.install_still(
+    drop(app.volumes.install_still(
         "KTLX".to_string(),
+        scan_info_for("KTLX").timestamp,
         (Arc::new(empty_scan()), Default::default()),
-    );
+    ));
     app.volumes.install_base(
         "KTLX".to_string(),
         (
@@ -2379,7 +2382,8 @@ fn the_volume_a_switching_pane_is_still_drawing_survives() {
     app.evict_unshown_scans();
 
     assert!(
-        app.volumes.holds_still("KTLX"),
+        app.volumes
+            .holds_still("KTLX", scan_info_for("KTLX").timestamp),
         "the pane's own scan info still names KTLX, which is what the \
              render path looks the volume up by",
     );

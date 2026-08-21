@@ -1448,8 +1448,15 @@ impl super::App {
                 pane_site,
                 timestamp
             );
-            self.volumes
-                .install_still(pane_site.clone(), (scan_arc, declared));
+            // `scan_info.timestamp` and not `timestamp`: the cached tuple holds
+            // both, and it is the `ScanInfo`'s that lands on the pane below and
+            // that the render then looks the volume up with.
+            let forced = self.volumes.install_still(
+                pane_site.clone(),
+                scan_info.timestamp,
+                (scan_arc, declared),
+            );
+            rustdar_worker::offload::discard_each("capped-still", forced);
 
             let local_ts =
                 chrono::TimeZone::from_utc_datetime(&chrono::Local, &timestamp).naive_local();

@@ -166,7 +166,8 @@ fn a_completed_volume_re_renders_every_whole_volume_pane() {
         );
         assert_eq!(
             app.volumes
-                .still_for("KTLX")
+                .newest_still_for("KTLX")
+                .and_then(|at| app.volumes.still_for("KTLX", at))
                 .map(|(scan, _)| scan.sweeps().len())
                 .unwrap_or(0),
             5,
@@ -433,7 +434,7 @@ fn an_incomplete_closed_volume_is_not_applied() {
     app.apply_chunk_outcome("KTLX", &outcome);
 
     assert!(
-        !app.volumes.holds_still("KTLX"),
+        !app.volumes.holds_any_still("KTLX"),
         "a volume that closed short was installed anyway"
     );
     assert_eq!(

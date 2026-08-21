@@ -393,7 +393,10 @@ impl super::App {
         {
             return;
         }
-        let Some((data, declared)) = self.volumes.still_for(inputs.scan_site) else {
+        let Some((data, declared)) = self
+            .volumes
+            .still_for(inputs.scan_site, inputs.volume_start)
+        else {
             return;
         };
         self.render.spawn_speculative_render(
@@ -946,10 +949,14 @@ impl super::App {
             let Some(scan_info) = pane.scan_info.as_ref() else {
                 continue;
             };
-            // The same stores and the same names the dispatch reads: the key
-            // is the pane's site, the volume is looked up under the
-            // scan_info's, and the coordinates are the scan_info's.
-            let Some((data, _declared)) = self.volumes.still_for(scan_info.site.name) else {
+            // The same stores and the same names the dispatch reads: the
+            // extract key is the pane's site, the volume is looked up under
+            // the scan_info's site *and its moment*, and the coordinates are
+            // the scan_info's.
+            let Some((data, _declared)) = self
+                .volumes
+                .still_for(scan_info.site.name, scan_info.timestamp)
+            else {
                 continue;
             };
             let (lat, lon) = (scan_info.site.lat, scan_info.site.lon);
@@ -1075,8 +1082,9 @@ impl super::App {
                             self.channels.render_sender.clone(),
                             self.window.clone(),
                         );
-                    } else if let Some((data, declared)) =
-                        self.volumes.still_for(scan_info.site.name)
+                    } else if let Some((data, declared)) = self
+                        .volumes
+                        .still_for(scan_info.site.name, scan_info.timestamp)
                     {
                         // Handed back as refcounts, so the dispatcher below can be
                         // borrowed mutably in the same statement.

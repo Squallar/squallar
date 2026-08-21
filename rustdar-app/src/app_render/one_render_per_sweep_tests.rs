@@ -178,13 +178,14 @@ fn point_at(
                 status: String::new(),
             },
         });
-    app.volumes.install_still(
+    drop(app.volumes.install_still(
         site.to_string(),
+        volume_time(),
         (
             sample_scan(),
             Arc::new(rustdar_radar::nyquist::DeclaredNyquist::empty()),
         ),
-    );
+    ));
 }
 
 /// `n` map panes, each aimed by `aim`.
