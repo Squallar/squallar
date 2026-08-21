@@ -1459,7 +1459,12 @@ impl App {
 
     /// Tell the UI each site's current-volume stamp — what a whole-volume pane may build
     /// from, and how fresh it is.
-    fn publish_base_volumes(&mut self) {
+    ///
+    /// Returns the sites whose stamp **moved on this frame**: a volume that
+    /// installed, or one whose newest sweep just sealed. That is the arrival
+    /// moment WO-M14c dispatches a 3D build at, and it is derivable only here,
+    /// where the previous stamp is still in hand to compare against.
+    fn publish_base_volumes(&mut self) -> HashMap<String, rustdar_egui::CurrentVolumeStamp> {
         let mut sites: Vec<String> = self.base_scans.keys().cloned().collect();
         for site in self.gui.live_sites() {
             if !sites.contains(&site) {
@@ -1472,9 +1477,45 @@ impl App {
                 stamps.insert(site, stamp);
             }
         }
-        if self.radar_liveness.current_volumes != stamps {
-            self.radar_liveness.current_volumes = stamps;
-            self.republish_liveness();
+        if self.radar_liveness.current_volumes == stamps {
+            return HashMap::new();
+        }
+        let arrived: HashMap<String, rustdar_egui::CurrentVolumeStamp> = stamps
+            .iter()
+            .filter(|(site, stamp)| self.radar_liveness.current_volumes.get(*site) != Some(*stamp))
+            .map(|(site, stamp)| (site.clone(), *stamp))
+            .collect();
+        self.radar_liveness.current_volumes = stamps;
+        self.republish_liveness();
+        arrived
+    }
+
+    /// **Build the volume a 3D pane is waiting for on the frame it arrives**,
+    /// instead of on the frame after the draw loop notices (WO-M14c).
+    ///
+    /// The identical call the draw-time level-trigger makes — same refusal
+    /// path, same budget gate inside [`Self::prepare_volume`], same
+    /// `mark_volume_rendered` bookkeeping, which is what makes the trigger
+    /// quiesce rather than ask again. When the budget gate turns the eager ask
+    /// away (on wasm the render budget is 1, so a busy slot does exactly that)
+    /// nothing is marked and the draw-time trigger picks it up as before: the
+    /// eager ask **losing** is the fallback working, not a fault.
+    ///
+    /// Which panes qualify is [`Self::arrived_volume_asks`]', and its doc is
+    /// where the boundary is written down.
+    fn dispatch_arrived_volumes(
+        &mut self,
+        arrived: &HashMap<String, rustdar_egui::CurrentVolumeStamp>,
+    ) {
+        for (pane_idx, layer, target) in self.arrived_volume_asks(arrived) {
+            log::debug!(
+                "3D volume view: pane {pane_idx} asked {} for {} at {} UTC as it arrived, \
+                 ahead of the draw loop",
+                layer.as_str(),
+                target.product.as_str(),
+                target.volume.collected,
+            );
+            self.handle_prepare_volume(pane_idx, &layer, target);
         }
     }
 
@@ -2093,3 +2134,7 @@ mod theme_flip_tests;
 /// The far end of the 3D ask: the layer it names, resolved.
 #[cfg(test)]
 mod volume_layer_tests;
+
+/// The arrival path: a 3D pane's volume built on the frame it lands.
+#[cfg(test)]
+mod volume_arrival_tests;

@@ -8,6 +8,26 @@ use rustdar_volumetric::bridge::VolumeEntry;
 /// A real, tiny grid, for the tests whose subject is what may *stand in* on screen —
 /// only a `Ready` entry ever does.
 pub(crate) fn ready_grid() -> VolumeEntry {
+    let scan = ready_scan();
+    let request = rustdar_radar::voxel::VoxelRequest {
+        centre: (35.33, -97.27),
+        half_extent_km: Some(rustdar_radar::voxel::HalfExtentKm::square(40.0)),
+        base_km_msl: 0.0,
+        top_km_msl: 10.0,
+        product: rustdar_radar::types::RadarProduct::Reflectivity,
+        shape: rustdar_radar::voxel::WASM_SHAPE,
+        values_wanted: false,
+    };
+    let grid = rustdar_radar::voxel::build_voxels(scan.as_ref(), &request, 35.33, -97.27)
+        .expect("the fixture volume resamples");
+    VolumeEntry::Ready(Arc::new(grid))
+}
+
+/// The two-sweep reflectivity volume [`ready_grid`] is resampled from —
+/// exposed because the tests whose subject is a volume *arriving* need the
+/// scan itself in `base_scans`, and a second fixture volume beside this one
+/// could drift from it silently.
+pub(crate) fn ready_scan() -> Arc<nexrad_model::data::Scan> {
     use nexrad_model::data::{
         MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
     };
@@ -68,7 +88,7 @@ pub(crate) fn ready_grid() -> VolumeEntry {
             false,
         )
     };
-    let scan = Scan::new(
+    Arc::new(Scan::new(
         VolumeCoveragePattern::new(
             212,
             0,
@@ -86,17 +106,5 @@ pub(crate) fn ready_grid() -> VolumeEntry {
             vec![cut(0.5), cut(1.5)],
         ),
         vec![sweep(1, 0.5), sweep(2, 1.5)],
-    );
-    let request = rustdar_radar::voxel::VoxelRequest {
-        centre: (35.33, -97.27),
-        half_extent_km: Some(rustdar_radar::voxel::HalfExtentKm::square(40.0)),
-        base_km_msl: 0.0,
-        top_km_msl: 10.0,
-        product: rustdar_radar::types::RadarProduct::Reflectivity,
-        shape: rustdar_radar::voxel::WASM_SHAPE,
-        values_wanted: false,
-    };
-    let grid = rustdar_radar::voxel::build_voxels(&scan, &request, 35.33, -97.27)
-        .expect("the fixture volume resamples");
-    VolumeEntry::Ready(Arc::new(grid))
+    ))
 }

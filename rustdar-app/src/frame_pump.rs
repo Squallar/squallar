@@ -62,6 +62,12 @@ pub(super) const FRAME_PUMP: &[DrainEntry] = &[
         drains: &["voxel_receiver"],
         run: pump_poll_voxel_results,
     },
+    // Two halves of one moment, in one row on purpose (WO-M14c): the stamps
+    // are published, and the 3D panes that were waiting for exactly this
+    // volume are dispatched from the same set, before the frame is drawn.
+    // Splitting them into two rows would need the arrival set to survive
+    // between rows as App state that nothing keeps in step; the row's `name`
+    // therefore under-describes it, and this comment is the correction.
     DrainEntry {
         name: "publish_base_volumes",
         phase: PumpPhase::Ingest,
@@ -202,7 +208,8 @@ fn pump_poll_voxel_results(app: &mut App, _ctx: Option<&egui::Context>) {
 }
 
 fn pump_publish_base_volumes(app: &mut App, _ctx: Option<&egui::Context>) {
-    app.publish_base_volumes();
+    let arrived = app.publish_base_volumes();
+    app.dispatch_arrived_volumes(&arrived);
 }
 
 fn pump_poll_overlay_fetch_results(app: &mut App, _ctx: Option<&egui::Context>) {

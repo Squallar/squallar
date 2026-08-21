@@ -1235,7 +1235,7 @@ fn volume_pane_outcome(
     // level up, where the layer registry is in scope.
     volume_ask: &Result<crate::pane::VolumeAsk, String>,
 ) -> VolumeOutcome {
-    use crate::pane::{OrbitDelta, VolumeStamp, VolumeTarget};
+    use crate::pane::OrbitDelta;
     use crate::volume_view::{VolumeFrameState, VolumePaint};
 
     let Some((camera_before, view_mode, region)) =
@@ -1285,25 +1285,10 @@ fn volume_pane_outcome(
 
     let site_code = pane.site().to_string();
     let loop_grid = pane.active_volume_frame().cloned();
-    let navigated = (!pane.viewing_live)
-        .then(|| pane.scan_info.as_ref().map(|info| info.timestamp))
-        .flatten();
-    let stamp = current_stamp.map(|stamp| match navigated {
-        Some(collected) => (
-            VolumeStamp {
-                site: site_code.clone(),
-                collected,
-            },
-            Some(collected),
-        ),
-        None => (
-            VolumeStamp {
-                site: site_code.clone(),
-                collected: stamp.newest,
-            },
-            stamp.base_started,
-        ),
-    });
+    // Which volume this pane is about, live or navigated. Answered by the
+    // pane so the arrival path (WO-M14c) reads the same answer from the same
+    // place rather than re-deriving it a frame earlier.
+    let stamp = pane.volume_stamp(current_stamp);
 
     let Some(volume) = pane.volume_mut() else {
         return VolumeOutcome::empty_state(VOLUME_EMPTY_STATE.to_owned());
@@ -1311,7 +1296,6 @@ fn volume_pane_outcome(
     volume.camera.nudge(delta);
     let camera = volume.camera;
     let floor = !volume.hide_floor;
-    let already_rendered = volume.rendered_for.clone();
 
     let Some(painter) = painter else {
         return VolumeOutcome::empty_state(VOLUME_EMPTY_STATE.to_owned());
@@ -1334,17 +1318,17 @@ fn volume_pane_outcome(
     };
     let product = ask.field.clone();
 
-    let live_target = VolumeTarget {
-        volume: volume_stamp,
-        product: product.clone(),
-        region,
-    };
-    let (target, from_loop) = match loop_grid {
-        Some(grid) => (grid.target, true),
-        None => (live_target, false),
+    let target = match loop_grid {
+        Some(grid) => grid.target,
+        None => pane.volume_target_for(&product, volume_stamp),
     };
     let collected = target.volume.collected;
-    if !from_loop && already_rendered.as_ref() != Some(&target) {
+    // **The level trigger, and the whole of it.** `volume_build_due` holds
+    // all three refusals — not in Volume mode, playing a 3D loop, already
+    // rendered for this target — and the arrival path asks the same function
+    // at install time, so an eager build quiesces this arm rather than racing
+    // it.
+    if pane.volume_build_due(&target) {
         actions.push(GuiAction::PrepareVolume {
             pane_idx,
             layer: ask.layer.clone(),
