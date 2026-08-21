@@ -1937,6 +1937,12 @@ impl App {
         self.platform.set_back_claim_reporter(reporter);
     }
 
+    /// Set what [`suspended`](Self::suspended) asks to tell a finish from a
+    /// backgrounding (Android only).
+    pub fn set_terminal_suspend_probe(&mut self, probe: fn() -> bool) {
+        self.platform.set_terminal_suspend_probe(probe);
+    }
+
     /// Whether egui is going to want this key press for itself.
     fn ui_is_taking_keys(&self) -> bool {
         self.state
@@ -2098,7 +2104,7 @@ impl ApplicationHandler for App {
         self.schedule_wakeup(event_loop);
     }
 
-    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
         log::info!("App suspended - clearing graphics state");
         // Save config on suspend — on Android this is the only reliable save point before
         // the system may kill the process.
@@ -2117,6 +2123,27 @@ impl ApplicationHandler for App {
         #[cfg(target_arch = "wasm32")]
         {
             self.pending_state = None;
+        }
+        // A suspend is usually the app going to the background, and the loop
+        // keeps running. When the platform says this one is a *finish*, the
+        // loop has to end here and nowhere else: Android's glue blocks the
+        // Java UI thread inside `onDestroy` waiting for this thread to stop,
+        // and the window is already gone by the time that runs, so `Suspended`
+        // is the last moment at which ending it is still cheap.
+        //
+        // `exit_now`, which takes the process down with it on the platform
+        // that needs it, and that is not a shortcut. Letting the loop unwind
+        // and leaving the process warm was tried first, because a warm process
+        // is the better reopen: it does not work. winit permits **one
+        // `EventLoop` per process** (`EventLoopError::RecreationAttempt`), so
+        // the second `android_main` in a surviving process panics building
+        // one -- measured on the emulator, 2026-08-21, at
+        // `rustdar/src/android/entry.rs`'s `EventLoop::build`. Ending the
+        // process is what makes the relaunch a fresh one, and a fresh one is
+        // the only kind that works.
+        if self.platform.suspend_is_terminal() {
+            log::info!("Activity is finishing - ending the event loop");
+            self.exit_now(event_loop);
         }
     }
 

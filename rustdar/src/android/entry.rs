@@ -9,6 +9,7 @@ use super::back::{BACK_CLASS, report_back_claim, set_back_waker, take_back_press
 use super::compass::{COMPASS_CLASS, start_compass_thread};
 use super::density::get_display_density;
 use super::insets::get_system_insets;
+use super::lifecycle::activity_is_finishing;
 use super::task_to_back::move_task_to_back;
 use super::theme::detect_dark_theme;
 use super::{JavaContext, register_java_helper, set_java_context};
@@ -126,10 +127,31 @@ fn android_main(app: AndroidApp) {
 
     let android_config_dir = app.internal_data_path().map(|p| p.join("config"));
 
-    let event_loop = winit::event_loop::EventLoop::builder()
+    // winit permits **one `EventLoop` per process** and answers
+    // `EventLoopError::RecreationAttempt` for a second one. That is reachable:
+    // this process outlives a backgrounded Activity, and anything that then
+    // creates a *new* Activity rather than resuming the old one (a launcher
+    // intent onto a removed task, a notification) runs `android_main` a second
+    // time. It used to panic here, leaving a live process behind a black
+    // screen -- measured on the emulator, 2026-08-21.
+    //
+    // Ending the process instead hands Android the one thing that does work: a
+    // clean start. The Activity that triggered this dies with the process and
+    // is started again into a fresh one.
+    let event_loop = match winit::event_loop::EventLoop::builder()
         .with_android_app(app)
         .build()
-        .expect("Failed to create event loop");
+    {
+        Ok(event_loop) => event_loop,
+        Err(e) => {
+            log::warn!(
+                "A second Activity was created in this process and winit allows one \
+                 event loop per process ({e}); ending the process so Android starts a \
+                 clean one"
+            );
+            std::process::exit(0);
+        }
+    };
 
     let mut platform_app = rustdar_app::app::App::new(
         Box::new(crate::platform::create_platform()),
@@ -143,6 +165,11 @@ fn android_main(app: AndroidApp) {
 
     // ...and where a press from OnBackInvokedDispatcher is collected.
     platform_app.set_back_press_taker(take_back_press);
+
+    // What tells a finish from a backgrounding when the window goes away. The
+    // event loop has to end itself on a finish or the Activity that replaces
+    // this one never draws; see `android::lifecycle`.
+    platform_app.set_terminal_suspend_probe(activity_is_finishing);
 
     // What the app tells BackHandler about the next press. Edge-triggered from
     // the end of a frame; see `App::push_back_claim`.

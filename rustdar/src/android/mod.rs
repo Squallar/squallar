@@ -19,6 +19,7 @@ pub mod compass;
 pub mod density;
 mod entry;
 pub mod insets;
+pub mod lifecycle;
 pub mod task_to_back;
 pub mod theme;
 

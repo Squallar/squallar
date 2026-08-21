@@ -30,37 +30,41 @@
 
         android:networkSecurityConfig="@xml/network_security_config"
 
-        android:hasCode="true">
+        android:hasCode="true"
+        android:enableOnBackInvokedCallback="true">
 
         <!--
-          android:enableOnBackInvokedCallback is deliberately ABSENT, and this
-          comment is the measurement that keeps it absent.
+          android:enableOnBackInvokedCallback="true" opts this app into the
+          predictive-back dispatcher on API 33+, which is what lets
+          com.rustdar.BackHandler decline a press and lets the platform draw
+          its own back-to-home preview.
 
-          Setting it to "true" opts the app into the predictive-back dispatcher
-          on API 33+, which is what would let com.rustdar.BackHandler decline a
-          press and let the platform draw its own back-to-home preview. It was
-          tried, on a device: with the attribute present, an unclaimed press
-          does exactly what the design wanted (the launcher takes the foreground,
-          type = CLOSE, no moveTaskToBack) and THE APP CAN THEN NEVER BE
-          REOPENED. Relaunching starts a fresh android.app.NativeActivity, and
-          android_main does not run for a second Activity in this process, so
-          the stock splash stays up forever. Measured as a paired A/B on one
-          build one attribute apart, 2/2 on each arm (WO-RP-SPIKE leg 4b,
-          2026-08-20); with the attribute absent the same press backgrounds the
-          app and it resumes with its cached radar image.
+          It was struck once, at WO-RP-3, because opting in made the app
+          unopenable: an unclaimed press did what the design wanted (launcher
+          to the foreground, type = CLOSE, no moveTaskToBack) and a relaunch
+          then sat on the stock splash forever, because android_main did not
+          run for the re-created Activity.
 
-          So back is delivered the legacy way on every API level this app runs
-          on: KEYCODE_BACK through the native input queue into
-          InputHandler::take_back_out_press. BackHandler's callback is
-          registered and unregistered truthfully by the claim Rust pushes, and
-          the platform never invokes it — inert, exactly as the Java class this
-          replaced was.
+          That was not an Activity-recreation problem. android-activity's
+          notify_destroyed() blocks the Java UI thread in a condvar until the
+          Rust android_main thread reports Stopped, and winit 0.30's Android
+          backend does not act on MainEvent::Destroy (an upstream TODO that logs
+          a warning and returns), so android_main never returned,
+          the UI thread stayed blocked, and ActivityTaskManager gave up with
+          "Activity destroy timeout" ten seconds later. The next Activity was
+          started behind a deadlocked main thread. Measured on the emulator,
+          2026-08-21: one launch, one unclaimed back press, one relaunch, and
+          "Starting Rustdar Platform" stayed at a count of 1.
 
-          What has to be true before this attribute comes back: android_main
-          must run for a re-created Activity. Until then the attribute is the
-          one thing standing between a working app and an unopenable one, and
-          from targetSdk 36 there is no opting out — so that fix is the
-          prerequisite for the bump, not a nicety.
+          The app now ends its own loop instead. winit delivers Suspended
+          before onDestroy runs, and Activity.isFinishing() tells a finish from
+          a backgrounding, so App::suspended exits the event loop on a finish
+          and leaves it running on a backgrounding. See
+          rustdar/src/android/lifecycle.rs.
+
+          This is also the prerequisite for the targetSdk bump: from
+          targetSdk 36 the dispatcher is not opt-in and this attribute stops
+          being a choice.
         -->
 
         <!--

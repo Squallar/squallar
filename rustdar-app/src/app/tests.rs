@@ -470,20 +470,32 @@ fn the_kotlin_helper_loads_the_library_the_manifest_names() {
 ///
 /// `android:enableOnBackInvokedCallback="true"` opts the app into the
 /// predictive-back dispatcher, and that is the whole reason `BackHandler.kt`
-/// exists. It is nevertheless ABSENT, on a measurement: with it present, a back
-/// press with nothing open backgrounds the app exactly as designed and the app
-/// can then never be reopened — the relaunch starts a fresh
-/// `android.app.NativeActivity` and `android_main` does not run for a second
-/// Activity in this process, so the stock splash stays up (WO-RP-SPIKE leg 4b,
-/// paired A/B on device, 2/2 each arm).
+/// exists: only a registered callback can decline a press, and only a declined
+/// press buys the platform's own back-to-home preview.
 ///
-/// Nothing in a host build can notice that attribute coming back, and the
-/// machinery below it is written to work — so a reader who takes the
-/// class doc at face value and "finishes the job" bricks the app silently.
-/// This is the guard that refuses instead. When `android_main` runs for a
-/// re-created Activity, delete this test in the land that proves it.
+/// It was ABSENT for one release, on a measurement: with it present, an
+/// unclaimed press did exactly what the design wanted and the app could then
+/// never be reopened (WO-RP-SPIKE leg 4b). That was never an
+/// Activity-recreation problem. android-activity's `notify_destroyed()` blocks
+/// the Java **UI thread** until the Rust `android_main` thread reports
+/// `Stopped`, and winit 0.30's Android backend does not act on
+/// `MainEvent::Destroy` — an upstream `TODO` that logs and returns — so
+/// `android_main` never returned and the UI thread stayed blocked until
+/// ActivityTaskManager gave up with an "Activity destroy timeout".
+///
+/// [`App::suspended`] ends the loop itself now, on the
+/// `Activity.isFinishing()` probe that tells a finish from a backgrounding.
+/// Measured on the emulator, 2026-08-21, one build one change apart: three
+/// close-and-reopen cycles, three `android_main` starts, zero destroy
+/// timeouts, zero panics — against a count that stayed at 1 before it.
+///
+/// This test now guards the attribute's **presence**, because losing it is a
+/// silent regression in the other direction: back would go back to the legacy
+/// `KEYCODE_BACK` route, the preview would disappear, and nothing else in a
+/// host build would notice. From targetSdk 36 the dispatcher is not opt-in and
+/// this attribute stops being a choice at all.
 #[test]
-fn the_manifest_does_not_opt_into_predictive_back() {
+fn the_manifest_opts_into_predictive_back() {
     const MANIFEST: &str =
         include_str!("../../../packaging/android/app/src/main/AndroidManifest.xml");
 
@@ -504,8 +516,8 @@ fn the_manifest_does_not_opt_into_predictive_back() {
     }
     markup.push_str(rest);
 
-    // Presence control: a stripper that ate the document would make the
-    // absence below true for the wrong reason.
+    // Presence control: a stripper that ate the document, or one that left the
+    // comments in, would make the assertion below true for the wrong reason.
     for anchor in [
         "<application",
         "android:hasCode=\"true\"",
@@ -513,19 +525,22 @@ fn the_manifest_does_not_opt_into_predictive_back() {
     ] {
         assert!(
             markup.contains(anchor),
-            "the comment stripper ate the manifest: `{anchor}` is gone, so the \
-             absence this test asserts would hold vacuously",
+            "the comment stripper ate the manifest: `{anchor}` is gone, so what \
+             this test asserts would hold for the wrong reason",
         );
     }
 
     assert_eq!(
-        markup.matches("enableOnBackInvokedCallback").count(),
-        0,
-        "the manifest opts into the predictive-back dispatcher again. Measured on \
-         a device (WO-RP-SPIKE leg 4b): with this attribute an unclaimed back \
-         press backgrounds the app and the app CANNOT BE REOPENED, because \
-         android_main does not run for the second Activity the relaunch creates. \
-         Fix that first; the attribute is the last step, not the first",
+        markup
+            .matches("enableOnBackInvokedCallback=\"true\"")
+            .count(),
+        1,
+        "the manifest no longer opts into the predictive-back dispatcher. \
+         BackHandler.kt's callback is then never invoked, back falls back to the \
+         legacy KEYCODE_BACK route, and the platform's back-to-home preview is \
+         gone. If this was removed because the app became unopenable again, the \
+         thing to check is App::suspended's terminal-suspend exit, not this \
+         attribute",
     );
 }
 
