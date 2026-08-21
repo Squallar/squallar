@@ -8229,11 +8229,14 @@ fn the_site_search_narrows_the_list_and_a_row_click_switches_the_site() {
              fetched by identifier, and the volume then places it",
         );
     }
+    // The caption counts RADARS, not rows: the shortcut sections above the
+    // groups repeat some of them, so a bare "N shown" would disagree with what
+    // a reader can count on screen. Both halves of the ratio are radars.
     assert!(
         inspector
             .site_caption
-            .starts_with(&format!("{total} shown")),
-        "the caption must count what is shown; drew {:?}",
+            .starts_with(&format!("{total} of {total} radars")),
+        "the caption must count what is shown against a named total; drew {:?}",
         inspector.site_caption
     );
     let highlighted: Vec<&str> = inspector
@@ -8262,7 +8265,9 @@ fn the_site_search_narrows_the_list_and_a_row_click_switches_the_site() {
         "the filter must narrow to the match"
     );
     assert!(
-        inspector.site_caption.starts_with("1 shown"),
+        inspector
+            .site_caption
+            .starts_with(&format!("1 of {total} radars")),
         "the caption must follow the filter; drew {:?}",
         inspector.site_caption
     );
@@ -8286,14 +8291,14 @@ fn a_site_list_still_short_of_the_network_states_no_total() {
     let settled = h.inspector().site_caption;
     let total = rustdar_radar::sites::radars().len() + rustdar_radar::sites::unplaced().len();
     assert!(
-        settled.contains(&format!("{total} sites")),
+        settled.contains(&format!("of {total} radars")),
         "precondition: a settled list states its total; drew {settled:?}",
     );
 
     h.set_catalogue_pending(true);
     let pending = h.inspector().site_caption;
     assert!(
-        pending.starts_with(&format!("{total} shown")),
+        pending.starts_with(&format!("{total} radars so far")),
         "it still says what it is showing; drew {pending:?}",
     );
     assert!(

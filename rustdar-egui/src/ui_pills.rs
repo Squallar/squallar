@@ -307,15 +307,64 @@ const NEARBY_SITE_COUNT: usize = 5;
 /// The star's column width inside a site row.
 const SITE_STAR_WIDTH: f32 = 22.0;
 
-/// Whether `name` answers an already-trimmed, already-uppercased `query`.
-fn matches(name: &str, query: &str) -> bool {
-    query.is_empty() || name.contains(query)
+/// How well one identifier answers the query — the sort key, best first.
+///
+/// The list was an **unranked filter**: `contains` over the identifier, in
+/// table order. With place names in the predicate that is no longer good
+/// enough, because typing an identifier would bury the exact radar under every
+/// place whose name happens to carry the same letters.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum MatchRank {
+    /// The query *is* the identifier.
+    ExactId,
+    /// The identifier begins with the query.
+    IdPrefix,
+    /// The identifier carries the query somewhere inside it — how the
+    /// three-letter short form (`TLX` for `KTLX`) reaches its radar, which is
+    /// why this rung survives the ranking rather than folding into the one
+    /// above it.
+    IdSubstring,
+    /// The place name carries the query.
+    Place,
 }
 
-/// How one site row reads: the identifier, and the markers that say a pick
-/// lands somewhere unexpected.
+/// Where `name` ranks against an already-trimmed, already-uppercased `query`,
+/// or `None` if it does not match at all.
+///
+/// An empty query matches everything at one rank, so the sort is the identity
+/// there and the table's own order survives.
+fn match_rank(name: &str, query: &str) -> Option<MatchRank> {
+    if query.is_empty() {
+        return Some(MatchRank::IdSubstring);
+    }
+    if name == query {
+        return Some(MatchRank::ExactId);
+    }
+    if name.starts_with(query) {
+        return Some(MatchRank::IdPrefix);
+    }
+    if name.contains(query) {
+        return Some(MatchRank::IdSubstring);
+    }
+    // The place is free text from the station record — one field, no separable
+    // state — so it is matched whole: `"Charleston,SC"` and `"Western
+    // Arkansas"` are names, not a name and a state to be split apart.
+    rustdar_radar::sites::table()
+        .place(name)
+        .filter(|place| place.to_uppercase().contains(query))
+        .map(|_| MatchRank::Place)
+}
+
+/// How one site row reads: the identifier, the place if this process has been
+/// told one, and the markers that say a pick lands somewhere unexpected.
 fn site_row_label(name: &str, network: RadarNetwork, is_placed: bool) -> String {
     let mut label = name.to_owned();
+    // `None` is the ordinary state on a fresh install, and a dangling
+    // `"KMKX - "` is worse than a bare `"KMKX"`.
+    if let Some(place) = rustdar_radar::sites::table().place(name) {
+        label.push_str(" - ");
+        label.push_str(place);
+    }
     // TDWRs stay marked as well as grouped: a pick lands on a different
     // instrument (single-pol, ~89 km of Doppler range around one airport, none
     // of the Level III products this app fetches), and the marker is what says
@@ -491,7 +540,7 @@ fn draw_site_sections(
                     entries: Vec<(String, Option<String>)>| {
         let mut drew_heading = false;
         for (name, note) in entries {
-            if !matches(&name, query) {
+            if match_rank(&name, query).is_none() {
                 continue;
             }
             if !drew_heading {
@@ -587,27 +636,34 @@ pub(super) fn site_list_ui(
     // The row carries the network as DATA. `is_tdwr_id` survives at exactly one
     // site — the unplaced members, which have no row to ask — and nothing here
     // re-derives the classification from a prefix.
-    let shown: Vec<(&'static str, RadarNetwork, bool)> = radars
+    let mut shown: Vec<(&'static str, RadarNetwork, bool, MatchRank)> = radars
         .iter()
-        .filter(|site| matches(site.name, &query))
-        .map(|site| (site.name, site.network, true))
-        .chain(
-            unplaced
-                .iter()
-                .filter(|name| matches(name, &query))
-                .map(|name| (*name, RadarNetwork::of_id(name), false)),
-        )
+        .filter_map(|site| {
+            match_rank(site.name, &query).map(|rank| (site.name, site.network, true, rank))
+        })
+        .chain(unplaced.iter().filter_map(|name| {
+            match_rank(name, &query).map(|rank| (*name, RadarNetwork::of_id(name), false, rank))
+        }))
         .collect();
+    // Stable, so an empty query — every row at one rank — leaves the table's
+    // own order exactly where it was.
+    shown.sort_by_key(|(_, _, _, rank)| *rank);
 
     let total = radars.len() + unplaced.len();
     let tdwr = shown_total_tdwrs(radars, unplaced);
+    // **The count is of radars, not of rows.** The sections above repeat some
+    // of what the groups list, so a bare "N shown" would disagree with what a
+    // reader can count on screen. Naming the denominator — `of {total} radars`
+    // — is what makes the numerator legible as the same unit.
     let caption = if total == 0 {
         "Finding radars...".to_owned()
     } else if catalogue_pending {
-        format!("{} shown - still finding the network", shown.len())
+        // No total, deliberately: how big the network is, is a claim nothing
+        // has made yet.
+        format!("{} radars so far - still finding the network", shown.len())
     } else if unplaced.is_empty() {
         format!(
-            "{} shown - {} sites ({} NEXRAD + {} TDWR)",
+            "{} of {} radars - {} NEXRAD + {} TDWR",
             shown.len(),
             total,
             total - tdwr,
@@ -615,7 +671,7 @@ pub(super) fn site_list_ui(
         )
     } else {
         format!(
-            "{} shown - {} sites ({} NEXRAD + {} TDWR, {} unplaced)",
+            "{} of {} radars - {} NEXRAD + {} TDWR, {} unplaced",
             shown.len(),
             total,
             total - tdwr,
@@ -659,12 +715,13 @@ pub(super) fn site_list_ui(
             ];
             let labelled = groups
                 .iter()
-                .filter(|(network, _)| shown.iter().any(|(_, n, _)| n == network))
+                .filter(|(network, _)| shown.iter().any(|(_, n, ..)| n == network))
                 .count()
                 > 1;
             for (network, heading) in groups {
                 let mut drew_heading = false;
-                for (name, row_network, is_placed) in shown.iter().filter(|(_, n, _)| *n == network)
+                for (name, row_network, is_placed, _) in
+                    shown.iter().filter(|(_, n, ..)| *n == network)
                 {
                     if labelled && !drew_heading {
                         section_heading(ui, heading);
