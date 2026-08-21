@@ -130,7 +130,7 @@ fn an_archive_volume_older_than_the_feed_does_not_replace_it() {
         "Refresh walked the display back to the previous archive volume"
     );
     assert!(
-        !app.volumes.holds_still("KTLX"),
+        !app.volumes.holds_any_still("KTLX"),
         "and it replaced the volume the panes render from"
     );
 }
@@ -165,7 +165,7 @@ fn an_archive_volume_newer_than_the_feed_is_applied() {
     app.poll_data_channels();
 
     assert!(
-        app.volumes.holds_still("KTLX"),
+        app.volumes.holds_any_still("KTLX"),
         "a newer archive volume was refused"
     );
 }
@@ -181,7 +181,7 @@ fn without_a_feed_the_archive_is_applied_unconditionally() {
     app.poll_data_channels();
 
     assert!(
-        app.volumes.holds_still("KTLX"),
+        app.volumes.holds_any_still("KTLX"),
         "the fallback cannot restore a site if an older archive volume is \
              refused when no feed is running"
     );
@@ -461,10 +461,11 @@ fn the_3d_build_reads_the_base_volume_and_not_the_live_snapshot() {
     };
 
     let mut live_only = headless(TestBridge::desktop());
-    live_only.volumes.install_still(
+    drop(live_only.volumes.install_still(
         "KTLX".to_string(),
+        at(10),
         (Arc::new(stamped_scan(10)), Default::default()),
-    );
+    ));
     live_only.handle_prepare_volume(0, &rustdar_source::id::known::RADAR, target.clone());
     assert!(
         live_only.volume_store.lookup(&target).is_none(),
@@ -576,7 +577,7 @@ fn every_archive_path_offers_its_volume_to_the_3d_pane() {
     send_archive(&shown, at(15));
     shown.poll_data_channels();
     assert!(
-        shown.volumes.holds_still("KTLX"),
+        shown.volumes.holds_any_still("KTLX"),
         "precondition: this is the arm that puts the volume on screen",
     );
     assert_eq!(collected(&shown), Some(at(15)));
@@ -586,7 +587,7 @@ fn every_archive_path_offers_its_volume_to_the_3d_pane() {
     send_archive(&behind, at(5));
     behind.poll_data_channels();
     assert!(
-        !behind.volumes.holds_still("KTLX"),
+        !behind.volumes.holds_any_still("KTLX"),
         "precondition: this is the `feed_is_ahead` arm",
     );
     assert_eq!(
@@ -601,7 +602,7 @@ fn every_archive_path_offers_its_volume_to_the_3d_pane() {
     send_auto_poll_archive(&historic, at(15));
     historic.poll_data_channels();
     assert!(
-        !historic.volumes.holds_still("KTLX"),
+        !historic.volumes.holds_any_still("KTLX"),
         "precondition: this is the auto-poll-while-historic arm",
     );
     assert_eq!(collected(&historic), Some(at(15)));
@@ -747,7 +748,7 @@ fn a_manual_navigation_outranks_the_feed_guard() {
         "the applied navigation must clear its pending flag"
     );
     assert!(
-        app.volumes.holds_still("KTLX"),
+        app.volumes.holds_any_still("KTLX"),
         "the navigated volume must become the site's displayed scan"
     );
 }

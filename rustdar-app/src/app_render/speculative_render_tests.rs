@@ -166,13 +166,14 @@ fn aim(app: &mut crate::app::App, product: RadarProduct, elevation: f32) {
                 status: String::new(),
             },
         });
-    app.volumes.install_still(
+    drop(app.volumes.install_still(
         SITE.to_string(),
+        volume_time(),
         (
             sample_scan(),
             Arc::new(rustdar_radar::nyquist::DeclaredNyquist::empty()),
         ),
-    );
+    ));
 }
 
 /// A finished interactive render for pane 0, put on the channel.

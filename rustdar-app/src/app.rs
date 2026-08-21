@@ -1353,10 +1353,16 @@ impl App {
                             self.gui.clear_loading_site_for_site(&site);
                         } else {
                             log::info!("Received scan data from background thread");
-                            self.volumes.install_still(
+                            // Keyed by the volume's own collected-at, which is
+                            // what the `ScanInfoForSite` below writes onto every
+                            // pane on the site — so the key installed is the key
+                            // the pane's render reads back with.
+                            let forced = self.volumes.install_still(
                                 site.clone(),
+                                scan_info.timestamp,
                                 (Arc::clone(&scan_arc), Arc::clone(&declared_nyquist)),
                             );
+                            rustdar_worker::offload::discard_each("capped-still", forced);
                             self.gui.apply(GuiEvent::ScanInfoForSite {
                                 site: site.clone(),
                                 info: scan_info,
@@ -1564,6 +1570,11 @@ impl App {
         // asking the same question of the same unchanged Gui.
         let pane_count = self.gui.pane_count();
         let mut shown: Vec<&str> = Vec::with_capacity(pane_count * 2);
+        // What a pane is actually parked at, exactly. The still store is keyed
+        // by moment as well as site, so "this site is on screen" is no longer a
+        // fine enough question to retain by: two panes on one site at two
+        // moments hold two volumes, and the one nobody is parked at has to go.
+        let mut parked: Vec<(&str, chrono::NaiveDateTime)> = Vec::with_capacity(pane_count);
         for idx in 0..pane_count {
             let Some(pane) = self.gui.pane(idx) else {
                 continue;
@@ -1571,13 +1582,31 @@ impl App {
             shown.push(pane.site());
             if let Some(info) = pane.scan_info.as_ref() {
                 shown.push(info.site.name);
+                parked.push((info.site.name, info.timestamp));
             }
         }
-        // place is this frame: an entry is a whole decoded volume, 47–69 MiB across
-        // thousands of per-radial buffers, and the walk that returns them is the frame-
-        // thread cost `offload::discard` exists to move.
+        // place is this frame: an entry is a whole decoded volume, a measured 46 MiB
+        // median and 58.3 MiB worst case (`volume_inventory::MAX_RESIDENT_STILL_VOLUMES`)
+        // across thousands of per-radial buffers, and the walk that returns them is the
+        // frame-thread cost `offload::discard` exists to move.
         let unshown = |site: &String| !shown.iter().any(|shown| *shown == site);
-        rustdar_worker::offload::discard_each("evicted-scan", self.volumes.evict_still(&unshown));
+        // A pane on a site whose `scan_info` has not caught up to the newest
+        // volume there keeps that newest one — the site-keyed retention this
+        // replaces, narrowed from "every moment for the site" to exactly one.
+        // Resolved here rather than inside `wanted`, which cannot ask the store
+        // a question while the store is being retained.
+        for &site in &shown {
+            if let Some(at) = self.volumes.newest_still_for(site)
+                && !parked.iter().any(|&(s, t)| s == site && t == at)
+            {
+                parked.push((site, at));
+            }
+        }
+        let wanted = |site: &str, at: chrono::NaiveDateTime| {
+            parked.iter().any(|&(s, t)| s == site && t == at)
+        };
+        let evicted_stills = self.volumes.retain_still(&wanted);
+        rustdar_worker::offload::discard_each("evicted-scan", evicted_stills);
         rustdar_worker::offload::discard_each(
             "evicted-base-volume",
             self.volumes.evict_base(&unshown),

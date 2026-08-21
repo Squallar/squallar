@@ -256,8 +256,15 @@ impl super::App {
             return;
         }
 
-        self.volumes
-            .install_still(site.to_string(), (Arc::clone(&scan), Arc::clone(&declared)));
+        // Keyed by the volume's own collected-at -- `timestamp` above, which is
+        // exactly what the `ScanInfo` published below carries onto every pane on
+        // the site, so the key installed is the key the render reads back with.
+        let forced = self.volumes.install_still(
+            site.to_string(),
+            timestamp,
+            (Arc::clone(&scan), Arc::clone(&declared)),
+        );
+        rustdar_worker::offload::discard_each("capped-still", forced);
 
         if let Some((closed, _)) = completed {
             // A whole closed volume is the same volume the archive will publish
