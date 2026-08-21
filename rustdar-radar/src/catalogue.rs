@@ -9,6 +9,15 @@
 //!   510 KB raw and 22 KB gzipped. Its **positions** agree with the archive:
 //!   against each site's own Volume Data Block over 54 corpus sites the median
 //!   separation is 1.7 m and the largest is 73.4 m, a third of one 250 m gate.
+//! * **What place they are at** — the same station record's `name`, which is a
+//!   settlement or a landmark and never the identifier: `"Milwaukee"` for
+//!   `KMKX`, `"Andrews Air Force Base"` for `TADW`. Measured over the live body
+//!   on 2026-08-21: all 208 stations carry one, every one ASCII, the longest 22
+//!   characters. It is free text with no separable state — `"Charleston,SC"` and
+//!   `"Western Arkansas"` are both whole names — so it is carried as one string
+//!   and never split. Two radars may share a name — 18 names are carried by a
+//!   pair each, 36 radars, almost always a metro's WSR-88D and its TDWR — which
+//!   is a fact about the network rather than a collision to resolve.
 //!
 //! ```text
 //! TPBI   archive data through 2026/07/15   404 from the NWS API (renamed TDJT)
@@ -38,8 +47,12 @@ const DELIMITER: &str = "/";
 /// The path on [`DataSources::nws_api_base`] that lists every station.
 const STATIONS_PATH: &str = "/radar/stations";
 
-/// Where the published station record puts one radar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// What the published station record says about one radar: where it is, which
+/// network it is on, and what place it is at.
+///
+/// Not `Copy`, since [`place`](Self::place) is owned text. It was `Copy` while
+/// every field was an `i32`; the callers that leant on that clone instead.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CataloguePosition {
     /// Latitude, micro-degrees north.
     pub lat_udeg: i32,
@@ -72,6 +85,36 @@ pub struct CataloguePosition {
     /// green, and making the field required is what turns it red.
     #[serde(default)]
     pub network: Option<RadarNetwork>,
+    /// The station record's `name` — the place, not the identifier — or `None`
+    /// where the record carries none or carries one `place_from_record`
+    /// rejects.
+    ///
+    /// Cached with the position because it is read before the first frame and
+    /// the fetch that could supply it lands after: a launch that had to wait
+    /// for the network would show a list of bare ICAOs and then relabel it
+    /// under the reader. Additive on the same terms as
+    /// [`network`](Self::network) — a cache written before this field existed
+    /// loads with `None` here.
+    #[serde(default)]
+    pub place: Option<String>,
+}
+
+/// The longest station name this build will carry, characters.
+///
+/// The live body's longest is 22 (`"Andrews Air Force Base"`). This is a bound
+/// on what a doctored feed or a hand-edited cache can push into a row, not a
+/// judgement about real names.
+const MAX_PLACE_CHARS: usize = 64;
+
+/// The station record's `name` as a place worth showing, or `None`.
+///
+/// One rule, applied at both trust boundaries — the parsed feed and the loaded
+/// cache — so a name that reaches a row got there the same way whichever it
+/// came from. Empty is `None` rather than `Some("")`: a caller drawing
+/// `"KMKX — "` with nothing after the dash is worse than one drawing `"KMKX"`.
+pub(crate) fn place_from_record(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty() && trimmed.chars().count() <= MAX_PLACE_CHARS).then_some(trimmed)
 }
 
 /// Every radar the live archive carries, with a position where one is
@@ -92,7 +135,7 @@ impl SiteCatalogue {
             sites: bucket_ids
                 .into_iter()
                 .map(|id| {
-                    let position = positions.get(&id).copied();
+                    let position = positions.get(&id).cloned();
                     (id, position)
                 })
                 .collect(),
@@ -107,7 +150,23 @@ impl SiteCatalogue {
     /// Where this catalogue puts `id`, or `None` if it does not carry it or
     /// cannot place it.
     pub fn position(&self, id: &str) -> Option<CataloguePosition> {
-        self.sites.get(id).copied().flatten()
+        self.sites.get(id).cloned().flatten()
+    }
+
+    /// What place this catalogue says `id` is at, or `None` where it does not
+    /// carry `id`, cannot place it, or was written before the station record's
+    /// name was read.
+    ///
+    /// A **placed** row is the only one that can carry this, for the same
+    /// reason [`network`](Self::network) gives: the record that names a radar
+    /// is the record that places it.
+    pub fn place(&self, id: &str) -> Option<&str> {
+        self.sites
+            .get(id)?
+            .as_ref()?
+            .place
+            .as_deref()
+            .and_then(place_from_record)
     }
 
     /// Which network this catalogue says `id` is on, or `None` where it does
@@ -118,11 +177,7 @@ impl SiteCatalogue {
     /// bucket lists and the NWS does not has no station record to have stated a
     /// type. [`RadarNetwork::of_id`] is what answers for those.
     pub fn network(&self, id: &str) -> Option<RadarNetwork> {
-        self.sites
-            .get(id)
-            .copied()
-            .flatten()
-            .and_then(|p| p.network)
+        self.sites.get(id)?.as_ref()?.network
     }
 
     /// How many radars this catalogue carries, placed or not.
@@ -141,13 +196,17 @@ impl SiteCatalogue {
     }
 
     /// What this catalogue has to say to [`crate::sites::resolve`].
-    pub fn fixes(&self) -> impl Iterator<Item = (&str, SiteFix)> {
+    pub fn fixes(&self) -> impl Iterator<Item = (&str, SiteFix<'_>)> {
         self.sites.iter().map(|(id, position)| {
             let fix = match position {
                 Some(position) => SiteFix::Network {
                     lat_udeg: position.lat_udeg,
                     lon_udeg: position.lon_udeg,
                     elevation_m: position.elevation_m,
+                    // Re-checked here and not only at the parse: this half of
+                    // the pair is read straight off a cache file, which is
+                    // outside the process and editable.
+                    place: position.place.as_deref().and_then(place_from_record),
                 },
                 None => SiteFix::Unplaced,
             };
@@ -167,10 +226,20 @@ pub async fn fetch(sources: &DataSources) -> Option<SiteCatalogue> {
     };
     let positions = fetch_station_positions(sources).await?;
     let catalogue = SiteCatalogue::union(ids, &positions);
+    // Counted over the fixes that carry something, not over `fixes()` itself:
+    // every member yields a fix, so the old `fixes().count()` was `len()` in
+    // another spelling and read as "all of them placed" whatever had happened.
+    let placed = catalogue
+        .fixes()
+        .filter(|(_, fix)| matches!(fix, SiteFix::Network { .. }))
+        .count();
+    let named = catalogue
+        .fixes()
+        .filter(|(_, fix)| matches!(fix, SiteFix::Network { place: Some(_), .. }))
+        .count();
     log::info!(
-        "site catalogue: {} radars listed, {} placed",
+        "site catalogue: {} radars listed, {placed} placed, {named} named",
         catalogue.len(),
-        catalogue.fixes().count(),
     );
     Some(catalogue)
 }
@@ -256,6 +325,11 @@ struct Geometry {
 #[derive(serde::Deserialize)]
 struct StationProperties {
     id: String,
+    /// The place this radar is at — `"Milwaukee"`, `"Andrews Air Force Base"`.
+    /// Optional because a record with no name is still a record with a
+    /// position, and the position is what the table is built from.
+    #[serde(default)]
+    name: Option<String>,
     elevation: Option<Quantity>,
     /// `"WSR-88D"`, `"TDWR"`, or something this build does not recognise —
     /// the API carries profilers too. Never a reason to skip a station: an
@@ -306,6 +380,12 @@ pub(crate) fn parse_stations(body: &str) -> BTreeMap<String, CataloguePosition> 
                 Some("TDWR") => Some(RadarNetwork::Tdwr),
                 _ => None,
             };
+            let place = station
+                .properties
+                .name
+                .as_deref()
+                .and_then(place_from_record)
+                .map(str::to_owned);
             Some((
                 station.properties.id,
                 CataloguePosition {
@@ -313,6 +393,7 @@ pub(crate) fn parse_stations(body: &str) -> BTreeMap<String, CataloguePosition> 
                     lon_udeg: crate::site_position::micro_from_degrees(lon),
                     elevation_m: elevation_m.round() as i32,
                     network,
+                    place,
                 },
             ))
         })

@@ -53,9 +53,10 @@ fn from_volume(site: &str) -> SitePosition {
 fn from_station_record(site: &str) -> super::CataloguePosition {
     let body = std::fs::read_to_string("testdata/nws_radar_stations.json")
         .expect("the station fixture is in the tree");
-    *parse_stations(&body)
+    parse_stations(&body)
         .get(site)
         .unwrap_or_else(|| panic!("{site} is in the station fixture and is placeable"))
+        .clone()
 }
 
 /// The published elevation is the ground the tower stands on, not the feedhorn.
@@ -116,6 +117,7 @@ fn a_fetched_row_states_the_ground_a_learned_row_measures() {
                 lat_udeg: record.lat_udeg,
                 lon_udeg: record.lon_udeg,
                 elevation_m: record.elevation_m,
+                place: record.place.as_deref(),
             },
         )]);
         let fetched = fetched.get(site).expect("a fetched row");
