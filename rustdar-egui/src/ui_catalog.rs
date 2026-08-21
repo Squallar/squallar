@@ -28,6 +28,9 @@ const CLOSE_LABEL: &str = "\u{d7}";
 /// the act "add" made the stack below read as an incomplete list.
 pub(crate) const CATALOG_HEADING: &str = "Show a layer";
 
+/// The saved-preset delete control's label.
+const DELETE_LABEL: &str = "Delete";
+
 /// The save tile's label. Drawn only while the search box is empty: the
 /// search is for *finding* tiles, and a save offer matching the query "save"
 /// would be the one tile that is not a result.
@@ -459,8 +462,12 @@ impl super::Gui {
                 let tile = ui
                     .button(preset.name.as_str())
                     .on_hover_text(preset_hover(&self.overlays, preset));
+                // A word, not a `\u{d7}`: this deletes the user's saved preset,
+                // and `\u{d7}` is the app's close glyph and nothing else
+                // (`ui_glyphs.rs`). A destructive control wearing the dismissal
+                // glyph is the same defect the inspector's crumb carried.
                 let remove = ui
-                    .add(egui::Button::new(egui::RichText::new(CLOSE_LABEL).small()).frame(false))
+                    .add(egui::Button::new(egui::RichText::new(DELETE_LABEL).small()).frame(false))
                     .on_hover_text(format!("Delete \"{}\"", preset.name));
                 #[cfg(test)]
                 probe.tiles.push(CatalogTileProbe {
