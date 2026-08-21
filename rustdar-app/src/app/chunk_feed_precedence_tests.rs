@@ -463,7 +463,7 @@ fn the_3d_build_reads_the_base_volume_and_not_the_live_snapshot() {
         "KTLX".to_string(),
         (Arc::new(stamped_scan(10)), Default::default()),
     );
-    live_only.handle_prepare_volume(0, target.clone());
+    live_only.handle_prepare_volume(0, &rustdar_source::id::known::RADAR, target.clone());
     assert!(
         live_only.volume_store.lookup(&target).is_none(),
         "a volume only the map panes hold was handed to the resampler",
@@ -474,7 +474,7 @@ fn the_3d_build_reads_the_base_volume_and_not_the_live_snapshot() {
         "KTLX".to_string(),
         (Arc::new(stamped_scan(10)), Default::default(), at(10)),
     );
-    based.handle_prepare_volume(0, target.clone());
+    based.handle_prepare_volume(0, &rustdar_source::id::known::RADAR, target.clone());
     assert!(
         based.volume_store.lookup(&target).is_some(),
         "the 3D pane was offered a base volume and the build never \
@@ -506,7 +506,7 @@ fn a_full_budget_refuses_the_3d_ask_before_paying_the_extraction() {
         .renders_in_flight
         .store(MAX_CONCURRENT_RENDERS, Ordering::Relaxed);
     for _ in 0..3 {
-        app.handle_prepare_volume(0, target.clone());
+        app.handle_prepare_volume(0, &rustdar_source::id::known::RADAR, target.clone());
     }
     assert_eq!(
         app.volume_extractions.get(),
@@ -520,7 +520,7 @@ fn a_full_budget_refuses_the_3d_ask_before_paying_the_extraction() {
     );
 
     app.render.renders_in_flight.store(0, Ordering::Relaxed);
-    app.handle_prepare_volume(0, target.clone());
+    app.handle_prepare_volume(0, &rustdar_source::id::known::RADAR, target.clone());
     assert_eq!(
         app.volume_extractions.get(),
         1,
@@ -531,7 +531,7 @@ fn a_full_budget_refuses_the_3d_ask_before_paying_the_extraction() {
         "the freed slot dispatches the build",
     );
 
-    app.handle_prepare_volume(0, target.clone());
+    app.handle_prepare_volume(0, &rustdar_source::id::known::RADAR, target.clone());
     assert_eq!(
         app.volume_extractions.get(),
         1,
@@ -556,7 +556,7 @@ fn a_3d_pane_is_not_handed_a_volume_other_than_the_one_it_asked_for() {
         "KTLX".to_string(),
         (Arc::new(stamped_scan(15)), Default::default(), at(15)),
     );
-    app.handle_prepare_volume(0, target.clone());
+    app.handle_prepare_volume(0, &rustdar_source::id::known::RADAR, target.clone());
 
     assert!(
         app.volume_store.lookup(&target).is_none(),
@@ -1106,7 +1106,7 @@ fn a_navigated_3d_pane_is_served_the_volume_it_names() {
     );
 
     let navigated = volume_target(at(10));
-    app.handle_prepare_volume(0, navigated.clone());
+    app.handle_prepare_volume(0, &rustdar_source::id::known::RADAR, navigated.clone());
     assert!(
         app.volume_store.lookup(&navigated).is_some(),
         "the pane named the volume it is showing and the host had it in hand, \
@@ -1114,14 +1114,14 @@ fn a_navigated_3d_pane_is_served_the_volume_it_names() {
     );
 
     let live = volume_target(newest);
-    app.handle_prepare_volume(1, live.clone());
+    app.handle_prepare_volume(1, &rustdar_source::id::known::RADAR, live.clone());
     assert!(
         app.volume_store.lookup(&live).is_some(),
         "the live target stopped being served",
     );
 
     let unheld = volume_target(at(30));
-    app.handle_prepare_volume(2, unheld.clone());
+    app.handle_prepare_volume(2, &rustdar_source::id::known::RADAR, unheld.clone());
     assert!(
         app.volume_store.lookup(&unheld).is_none(),
         "a volume the app does not hold was answered for, which stops the pane \

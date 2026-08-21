@@ -224,6 +224,23 @@ impl OverlayHandler for ModelDataHandler {
     fn field_control_id(&self) -> Option<&'static str> {
         Some("parameter")
     }
+
+    /// **The parameter this pane's dropdown is on**, taken from this layer's
+    /// own per-pane state and projected through its registry row — never
+    /// spelled as a fresh string, so the id can only ever be one
+    /// [`crate::hrrr::fields`] registers.
+    ///
+    /// This layer is not [`SourceHandler::volume`]-capable, so the 3D walk
+    /// stops before it asks; the answer is here because "which field is this
+    /// pane showing" is a question about a layer with fields, not a question
+    /// about 3D.
+    fn current_field(&self, pane: &PaneRef<'_>) -> Option<rustdar_source::product::FieldId> {
+        Some(
+            crate::hrrr::fields::spec(self.view(pane).selected_param)
+                .id
+                .clone(),
+        )
+    }
     fn id(&self) -> LayerId {
         known::MODEL_DATA
     }
@@ -699,6 +716,39 @@ mod tests {
 
     fn controls_of(h: &ModelDataHandler) -> Vec<ControlItem> {
         h.controls(&PaneRef::bare(0))
+    }
+
+    /// **This layer answers "which field is this pane showing" from its own
+    /// per-pane state, and answers it with a registered id.**
+    ///
+    /// The pane-side 3D walk asks every layer this before it decides which to
+    /// ask for a grid, so an answer spelled by hand rather than taken from the
+    /// registry row would be an id no lookup can resolve.
+    #[test]
+    fn the_current_field_is_this_panes_own_parameter_as_the_registry_spells_it() {
+        let h = handler(ModelParameter::SurfaceBasedCape, vec![1.0]);
+        let state = pane_state(ModelParameter::SurfaceBasedCin);
+        let pane = PaneRef {
+            state: Some(&*state),
+            ..PaneRef::bare(0)
+        };
+
+        let field = h
+            .current_field(&pane)
+            .expect("a layer with sixteen parameters has a current field");
+        assert_eq!(
+            field,
+            crate::hrrr::fields::spec(ModelParameter::SurfaceBasedCin)
+                .id
+                .clone(),
+            "the answer must be THIS PANE's parameter, not the registry \
+             copy's — the pane holds CIN and the handler's own default is CAPE",
+        );
+        assert!(
+            h.products().iter().any(|spec| spec.id == field),
+            "the id must be one this layer publishes, or nothing above can \
+             resolve it to a row",
+        );
     }
 
     fn toggle_label(h: &ModelDataHandler) -> String {

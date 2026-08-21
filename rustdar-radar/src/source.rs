@@ -234,6 +234,14 @@ impl Default for RadarSource {
     }
 }
 
+/// **Radar's 3D answer is exactly its own registry's `vertical` rows**, so it
+/// takes [`VolumeCapable::builds`]'s default rather than restating the
+/// predicate. That is not a coincidence to be re-derived here: `fields.rs`
+/// builds `vertical` as `derive::volume_slot(p).is_some()`, and
+/// `vertical_agrees_with_volume_slot` is the pin that keeps the two the same
+/// fact. An override would be a second copy of a table that already exists.
+impl rustdar_source::volume::VolumeCapable for RadarSource {}
+
 impl SourceHandler for RadarSource {
     fn id(&self) -> LayerId {
         known::RADAR
@@ -252,6 +260,26 @@ impl SourceHandler for RadarSource {
     fn products(&self) -> &'static [ProductSpec] {
         crate::fields::products()
     }
+    /// **The field this pane has selected**, read out of the slot config
+    /// `publish_radar_selection` keeps current — the same door
+    /// [`Self::site_of`] reads the pane's site through, and the same
+    /// staleness argument applies to both.
+    ///
+    /// `None` on a pane whose slots have never been hydrated, on a
+    /// `PaneRef::across` union (whose config is null by construction), and on
+    /// a member this build cannot read as a field id. A caller that gets
+    /// `None` has not learned that the pane is showing nothing — it has
+    /// learned that this layer cannot say, which is why the 3D walk treats it
+    /// as "not this slot" rather than as a refusal.
+    fn current_field(&self, pane: &PaneRef<'_>) -> Option<rustdar_source::product::FieldId> {
+        serde_json::from_value(pane.config.get("product")?.clone()).ok()
+    }
+
+    /// Radar is this build's one 3D source.
+    fn volume(&self) -> Option<&dyn rustdar_source::volume::VolumeCapable> {
+        Some(self)
+    }
+
     fn render_mode(&self) -> RenderMode {
         RenderMode::Texture
     }

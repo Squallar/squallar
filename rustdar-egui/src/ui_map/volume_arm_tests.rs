@@ -310,20 +310,33 @@ fn the_alpha_curve_rides_the_frame_only_when_one_is_stored() {
     );
 }
 
-/// **The curve is keyed by the pane's OWN field id, not by the registry row
-/// that id resolves to.**
+/// **An id this build does not register is refused by name — never resolved
+/// to the default row and drawn as if it were that field.**
 ///
-/// WO-E9c wrote the frame's curve lookup as a product -> id bridge; WO-E9e
-/// re-typed the pane's selection to an id and left a `FieldId -> spec ->
-/// FieldId` round trip behind it, which WO-M14a deleted. **For every field
-/// this build registers the round trip is the identity**, so no fixture in
-/// this suite could tell the two spellings apart — restoring the bridge left
-/// the whole package green. This one holds an id the build does NOT register,
-/// which is the single input where they differ: the round trip substituted
-/// the default field's key, so a pane would have painted Reflectivity's
-/// user-edited curve onto a field that is not Reflectivity.
+/// **This pin is WO-M14a's, re-pointed by WO-M14b-1, and what moved is said
+/// here rather than smoothed away.** WO-E9c wrote the frame's curve lookup as
+/// a product -> id bridge; WO-E9e re-typed the pane's selection to an id and
+/// left a `FieldId -> spec -> FieldId` round trip behind it, which WO-M14a
+/// deleted. For every field this build registers that round trip is the
+/// identity, so an unregistered id was the single input that could tell the
+/// two spellings apart, and WO-M14a's pin drove one through the arm and
+/// asserted the painter got **no** curve rather than the default field's.
+///
+/// WO-M14b-1 makes that drive impossible, and deliberately: the 3D ask is now
+/// resolved by a walk that asks each layer for its own current field and
+/// matches it against that layer's own registered rows, so an id with no row
+/// never reaches the curve lookup at all. **The substitution is now refused
+/// one step earlier than the pin used to catch it**, which is why the
+/// assertion below is about the refusal and not about the curve: an
+/// unregistered field cannot be painted as the default one if it cannot be
+/// painted at all.
+///
+/// The first half is unchanged and is still the positive control — with the
+/// pane on its own registered field, that field's curve rides — because an
+/// assertion that nothing is painted is worthless beside a pane that paints
+/// nothing anyway.
 #[test]
-fn a_curve_is_keyed_by_the_panes_own_field_not_by_the_row_it_resolves_to() {
+fn an_unregistered_field_is_refused_by_name_rather_than_resolved_to_the_default_row() {
     use crate::volume_alpha::{AlphaCurve, CURVE_LEN};
 
     let (mut h, painter) = volume_harness(StubVolumePainter::painting());
@@ -344,9 +357,8 @@ fn a_curve_is_keyed_by_the_panes_own_field_not_by_the_row_it_resolves_to() {
     );
 
     // An id this build does not register. `field_facts::facts` answers for it
-    // with the DEFAULT row — that is its documented totality — so the pane
-    // still reaches the volume arm, and the only question left is which key
-    // the curve was looked up under.
+    // with the DEFAULT row — that is its documented totality — which is
+    // exactly the substitution that must not decide what a pane draws.
     let alien = rustdar_source::product::FieldId::new("NotAFieldThisBuildRegisters");
     assert!(
         rustdar_radar::fields::spec_for(&alien).is_none(),
@@ -355,9 +367,10 @@ fn a_curve_is_keyed_by_the_panes_own_field_not_by_the_row_it_resolves_to() {
     assert_eq!(
         crate::field_facts::facts(&alien).id,
         default_field,
-        "precondition: the deleted round trip resolved this id to the DEFAULT \
-         field, which is the substitution this test exists to refuse",
+        "precondition: the substituting read resolves this id to the DEFAULT \
+         field, which is what this test exists to refuse",
     );
+    let asks_before = painter.seen.lock().unwrap().len();
     // Both panes: `propagate_layer_sync` copies the ACTIVE pane's field onto
     // every linked pane every frame, so setting only the 3D pane's would be
     // undone before the next paint — measured, not assumed.
@@ -368,16 +381,30 @@ fn a_curve_is_keyed_by_the_panes_own_field_not_by_the_row_it_resolves_to() {
             .set_selected_product(alien.clone());
     }
     h.frames_for(2, FRAME_DT);
-    assert_eq!(
-        last_seen(&painter).target.product,
-        alien,
-        "precondition: the frame must actually be aimed at the alien field",
+    let outcome = h.volume_arms()[0]
+        .outcome
+        .clone()
+        .expect("an unregistered field must produce an empty state, never a blank pane");
+    assert!(
+        outcome.contains(alien.as_str()),
+        "the refusal must name the field the pane is actually on, or the \
+         reader cannot tell which field this build is missing; got {outcome:?}",
+    );
+    assert!(
+        outcome.contains("Radar"),
+        "the refusal must name the layer that has no such field, since the \
+         pane has more than one; got {outcome:?}",
+    );
+    assert!(
+        !outcome.contains(crate::field_facts::name(&default_field)),
+        "the refusal must not name the DEFAULT field: naming it is the \
+         substitution, printed instead of drawn; got {outcome:?}",
     );
     assert_eq!(
-        last_seen(&painter).alpha,
-        None,
-        "a field with no stored curve of its own must ride with no curve — \
-         never the default field's",
+        painter.seen.lock().unwrap().len(),
+        asks_before,
+        "an id with no registered row must never reach the painter — a grid \
+         asked for under a substituted key is the defect itself",
     );
 }
 
@@ -492,7 +519,9 @@ fn a_volume_pane_asks_for_its_grid_until_the_host_says_it_has_one() {
         .last_actions()
         .iter()
         .filter_map(|a| match a {
-            GuiAction::PrepareVolume { pane_idx, target } => Some((*pane_idx, target.clone())),
+            GuiAction::PrepareVolume {
+                pane_idx, target, ..
+            } => Some((*pane_idx, target.clone())),
             _ => None,
         })
         .collect();
@@ -2553,5 +2582,219 @@ fn a_settled_pane_asks_for_one_box_for_ever() {
         "picking a new region never reached the painter, so the stability \
          asserted above is the readback being blind rather than the box being \
          still",
+    );
+}
+
+/// **The ask names the layer that will build it**, and that layer is the one
+/// the live registry answers `Some` for — not a name this arm holds.
+///
+/// The end-to-end half of `pane::volume_ask_tests`: those drive the walk over
+/// stub layers because one real 3D source cannot discriminate "topmost", and
+/// this drives the real registry because stubs cannot show that radar is
+/// wired into it.
+#[test]
+fn the_3d_ask_names_the_layer_that_builds_it() {
+    let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
+    h.frames_for(1, FRAME_DT);
+    let asked: Vec<rustdar_source::id::LayerId> = h
+        .last_actions()
+        .iter()
+        .filter_map(|a| match a {
+            GuiAction::PrepareVolume { layer, .. } => Some(layer.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        asked,
+        vec![known::RADAR],
+        "the 3D pane must ask a named layer for its grid",
+    );
+}
+
+/// **The published selection the walk gates on is CURRENT, not the one the
+/// pane had when its config was opened.**
+///
+/// This is the condition WO-M14b-1's own ruling makes binding, discharged
+/// rather than asserted: a handler answers `current_field` out of its own slot
+/// config, and `publish_radar_selection` is the only thing that keeps the
+/// radar slot's `"product"` member in step with the pane's selection. The 3D
+/// arm is not on the plan-view draw path that runs that publish for a map
+/// pane, so it runs the same hydrate itself; without it, this pane's slot
+/// would still name the field it started on and the walk would gate on a
+/// selection one or more frames stale.
+///
+/// Both halves are asserted: the member is **present**, and it is **equal to
+/// the selection the ask went out under**.
+#[test]
+fn the_3d_walk_gates_on_the_selection_the_pane_has_now() {
+    let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
+    let before = h.gui_mut().pane(1).expect("pane 1").selected_product();
+
+    // A different field, and one with vertical extent so the change is
+    // visible as a *different ask* rather than as a refusal.
+    let after = radar_fields::known::VELOCITY;
+    assert_ne!(before, after, "fixture precondition: the field must change");
+    assert!(
+        radar_fields::spec_for(&after).expect("registered").vertical,
+        "fixture precondition: the new field must be renderable in 3D, or a \
+         stale read and a refusal look the same",
+    );
+    // Both panes: `propagate_layer_sync` copies the ACTIVE pane's field onto
+    // every linked pane every frame.
+    for idx in [0, 1] {
+        h.gui_mut()
+            .pane_mut(idx)
+            .expect("pane")
+            .set_selected_product(after.clone());
+    }
+    h.frames_for(1, FRAME_DT);
+
+    let published = h
+        .gui_mut()
+        .pane(1)
+        .expect("pane 1")
+        .slot(&known::RADAR)
+        .expect("the 3D pane has a radar slot")
+        .config
+        .get("product")
+        .cloned()
+        .expect("the radar slot must carry the pane's published field");
+    assert_eq!(
+        published,
+        serde_json::to_value(&after).expect("a field id serializes"),
+        "the slot member the walk reads must name the field the pane is on \
+         NOW; a stale member is the whole reason WO-M12a exists",
+    );
+
+    let asked: Vec<FieldId> = h
+        .last_actions()
+        .iter()
+        .filter_map(|a| match a {
+            GuiAction::PrepareVolume { target, .. } => Some(target.product.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        asked,
+        vec![after],
+        "the grid asked for must be of the field the pane selected, not the \
+         one its slot was published with earlier",
+    );
+}
+
+/// **A 3D pane whose only volume-capable layer is switched off says which
+/// layer to turn on** — never a blank pane, and never a sentence the reader
+/// cannot act on.
+#[test]
+fn a_3d_pane_with_its_only_3d_layer_off_says_which_to_turn_on() {
+    let (mut h, painter) = volume_harness(StubVolumePainter::painting());
+    let asks_before = painter.seen.lock().unwrap().len();
+    for idx in [0, 1] {
+        h.gui_mut()
+            .set_overlay_on_pane_for_test(idx, &known::RADAR, false);
+    }
+    h.frames_for(2, FRAME_DT);
+
+    let outcome = h.volume_arms()[0]
+        .outcome
+        .clone()
+        .expect("a pane with nothing to ask must say so");
+    assert!(
+        outcome.contains("Turn on"),
+        "the plate must name the action that fixes it; got {outcome:?}",
+    );
+    assert!(
+        outcome.contains("Radar"),
+        "the plate must name the layer to turn on; got {outcome:?}",
+    );
+    assert!(
+        !h.last_actions()
+            .iter()
+            .any(|a| matches!(a, GuiAction::PrepareVolume { .. })),
+        "a pane with no qualifying layer must not ask for a grid",
+    );
+    assert_eq!(
+        painter.seen.lock().unwrap().len(),
+        asks_before,
+        "nor reach the painter",
+    );
+}
+
+/// **The publication is current on a pane that is the ONLY pane** — the case
+/// no other pane can rescue.
+///
+/// **This test exists because its two-pane sibling could not fail.** Removing
+/// the 3D arm's own hydrate left
+/// `the_3d_walk_gates_on_the_selection_the_pane_has_now` green, and following
+/// that one step found why: `propagate_layer_sync` copies the ACTIVE pane's
+/// whole slot list — configs included — onto every layer-linked pane, and in
+/// a two-pane fixture the active pane is a plan-view one whose own draw path
+/// runs the hydrate. So the 3D pane was reading a member some *other* pane
+/// had published, kept fresh by a mechanism that has nothing to do with 3D
+/// and switches off with one click of the layer link.
+///
+/// One pane, in Volume mode, is the layout where that rescue does not exist:
+/// nothing else hydrates and nothing else has a stack to copy. The walk's own
+/// hydrate is the only thing keeping the member it gates on current, and this
+/// is the fixture that says so.
+#[test]
+fn a_lone_3d_pane_still_gates_on_the_selection_it_has_now() {
+    let painter = Arc::new(StubVolumePainter::painting());
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(1);
+    h.make_pane_volume(0);
+    h.load_scan("KTLX");
+    h.gui_mut()
+        .apply(crate::shell_api::GuiEvent::VolumePainter(Some(
+            painter.clone(),
+        )));
+    h.frames_for(2, FRAME_DT);
+    assert_eq!(
+        h.gui_mut().panes_mut().len(),
+        1,
+        "fixture precondition: exactly one pane, so no sibling can publish \
+         this pane's selection for it",
+    );
+    // **And the chrome closed.** `render_stack_and_inspector` hydrates the
+    // active pane too — and returns before it does so when neither panel is
+    // on screen. With the stack open, this fixture is rescued by the layers
+    // panel exactly as its two-pane sibling was rescued by pane 0, and could
+    // not fail either.
+    h.close_layers();
+    h.close_inspector();
+    assert!(
+        !h.layers_panel_on_screen(),
+        "fixture precondition: the layers panel must be off screen, or it \
+         publishes this pane's selection and the walk's own hydrate is \
+         unfalsifiable",
+    );
+    assert!(
+        !h.inspector().open,
+        "fixture precondition: the inspector must be closed, for the same \
+         reason",
+    );
+
+    let before = h.gui_mut().pane(0).expect("pane 0").selected_product();
+    let after = radar_fields::known::VELOCITY;
+    assert_ne!(before, after, "fixture precondition: the field must change");
+    h.gui_mut()
+        .pane_mut(0)
+        .expect("pane 0")
+        .set_selected_product(after.clone());
+    h.frames_for(1, FRAME_DT);
+
+    let asked: Vec<FieldId> = h
+        .last_actions()
+        .iter()
+        .filter_map(|a| match a {
+            GuiAction::PrepareVolume { target, .. } => Some(target.product.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        asked,
+        vec![after],
+        "a lone 3D pane must ask for the field it is on now; anything else \
+         means the walk gated on a slot member nothing kept current",
     );
 }
