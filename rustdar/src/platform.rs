@@ -151,6 +151,9 @@ pub struct AndroidPlatform {
     /// Injected by `android::entry`: the flag it reads is set by the JNI callback
     /// `BackHandler.kt` invokes on the UI thread (`android::back`).
     back_press_taker: Option<fn() -> bool>,
+    /// Injected by `android::entry`: the `Activity.isFinishing()` read that
+    /// tells a suspend caused by a finish from one caused by backgrounding.
+    terminal_suspend_probe: Option<fn() -> bool>,
     /// Injected by `android::entry`: the JNI static call that publishes this
     /// app's claim on the next press to `BackHandler.setClaimed`.
     back_claim_reporter: Option<fn(bool)>,
@@ -178,6 +181,7 @@ impl AndroidPlatform {
             insets_querier: None,
             back_handler: None,
             back_press_taker: None,
+            terminal_suspend_probe: None,
             back_claim_reporter: None,
             zone_cache_dir: None,
             config_dir: None,
@@ -215,6 +219,17 @@ impl PlatformBridge for AndroidPlatform {
 
     fn set_back_press_taker(&mut self, taker: fn() -> bool) {
         self.back_press_taker = Some(taker);
+    }
+
+    /// Absent probe answers `false`: an app that has not installed one is an
+    /// app that would rather stay running than end a loop by accident.
+    fn suspend_is_terminal(&self) -> bool {
+        self.terminal_suspend_probe
+            .is_some_and(|finishing| finishing())
+    }
+
+    fn set_terminal_suspend_probe(&mut self, probe: fn() -> bool) {
+        self.terminal_suspend_probe = Some(probe);
     }
 
     fn set_back_claimed(&mut self, claimed: bool) {

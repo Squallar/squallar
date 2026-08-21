@@ -173,6 +173,27 @@ pub trait PlatformBridge {
     /// `rustdar` crate's cfg(android) back module.
     fn set_back_press_taker(&mut self, _taker: fn() -> bool) {}
 
+    /// Whether the suspend now being handled is this app going away for good,
+    /// rather than going to the background.
+    ///
+    /// winit reports `Suspended` for both, because both destroy the window,
+    /// and only Android can tell them apart — or needs to. Its glue blocks the
+    /// Java **UI thread** inside `onDestroy` until this event loop ends, so a
+    /// loop that keeps running through a finish deadlocks the Activity that
+    /// replaces it. Every other platform answers `false`, which is the
+    /// behaviour every platform had before this existed.
+    fn suspend_is_terminal(&self) -> bool {
+        false
+    }
+
+    /// Set the probe for [`suspend_is_terminal`](Self::suspend_is_terminal)
+    /// (Android only).
+    ///
+    /// Injected for the same reason as the back hooks above: the read is a JNI
+    /// call, and this trait is declared in a crate that compiles for targets
+    /// that have never heard of JNI.
+    fn set_terminal_suspend_probe(&mut self, _probe: fn() -> bool) {}
+
     /// Tell the platform whether the next back press has something to close.
     ///
     /// Android's predictive-back dispatcher only lets an app decline a press by
