@@ -252,6 +252,37 @@ pub struct VoxelRequest {
     pub values_wanted: bool,
 }
 
+/// **The request a [`VolumeJobContext`] names**, or `None` for a field this
+/// build registers no product for.
+///
+/// The frontend hands over a centre, a reach and a cell budget; everything
+/// else on a [`VolumeRequest`](VoxelRequest) is radar's own answer and is
+/// stated here rather than at a call site that would have to know it. The
+/// vertical extent is deliberately not part of what the caller may aim: a
+/// picked region moves the box across the ground and never up or down.
+///
+/// **The budget is spent here, not upstream.** `cells` is what the device
+/// affords and `max_axis` is what its 3D textures will hold;
+/// [`shape_for_budget`] is the arithmetic that turns the two into a grid, and
+/// it lives on this side because it is about how a *radar* volume is best
+/// sampled — wide and shallow — not about the device.
+pub fn request_for(ctx: &rustdar_source::volume::VolumeJobContext) -> Option<VoxelRequest> {
+    Some(VoxelRequest {
+        centre: (ctx.centre.lat, ctx.centre.lon),
+        half_extent_km: ctx
+            .half_extent_km
+            .map(|(east_km, north_km)| HalfExtentKm { east_km, north_km }),
+        base_km_msl: DEFAULT_BASE_KM_MSL,
+        top_km_msl: DEFAULT_TOP_KM_MSL,
+        product: crate::fields::product_for(&ctx.field)?,
+        shape: shape_for_budget(VoxelShape::of_cells(ctx.cells), ctx.max_axis as usize),
+        // The 3D view paints palette indices through a transfer table; the
+        // values in their own units are a second buffer nothing up there
+        // reads.
+        values_wanted: false,
+    })
+}
+
 /// The bottom and top **data** levels of a moment: the values index 1 and
 /// index 255 stand for.
 fn data_levels(slot: MomentSlot) -> (f32, f32) {

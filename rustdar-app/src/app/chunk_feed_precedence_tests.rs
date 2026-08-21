@@ -5,6 +5,30 @@ use crate::platform_double::TestBridge;
 /// The cell budget a device that says nothing about itself resolves.
 const SHIPPED_CELLS: [u32; 3] = rustdar_device_profile::constants::VOLUME_GRID_CELLS;
 
+/// **The request the seam shapes for `target` on a device with this budget.**
+///
+/// Both halves of the production path and nothing else: `volume_job_context`
+/// is exactly what `prepare_volume` hands over, and `request_for` is exactly
+/// what `RadarSource::volume_job` makes of it before wrapping it in an
+/// envelope. The moment is no longer an argument — it comes off the target's
+/// own field, which is the one place a 3D ask names a field at all.
+///
+/// **The payload is a stand-in, and that is a statement rather than a
+/// shortcut**: `request_for` is a pure function of the ground, the budget and
+/// the field, and it never reads the payload. The downcast half — where the
+/// payload is the whole question — is pinned separately in
+/// `volume_layer_tests`, against a real extracted volume.
+fn shaped_request(
+    target: &rustdar_egui::pane::VolumeTarget,
+    site_lat: f64,
+    site_lon: f64,
+    cells: [u32; 3],
+    max_axis: u32,
+) -> rustdar_radar::voxel::VoxelRequest {
+    let ctx = volume_job_context(target, site_lat, site_lon, cells, max_axis, Box::new(()));
+    rustdar_radar::voxel::request_for(&ctx).expect("Reflectivity is a field radar registers")
+}
+
 fn at(minute: u32) -> chrono::NaiveDateTime {
     chrono::NaiveDate::from_ymd_opt(2026, 7, 28)
         .unwrap()
@@ -213,14 +237,7 @@ fn the_requested_shape_is_the_one_this_device_can_hold() {
     };
 
     for axis in [256u32, 512, 2048] {
-        let request = voxel_request_for(
-            &target,
-            35.33,
-            -97.28,
-            SHIPPED_CELLS,
-            rustdar_radar::types::RadarProduct::Reflectivity,
-            axis,
-        );
+        let request = shaped_request(&target, 35.33, -97.28, SHIPPED_CELLS, axis);
         assert_eq!(
             request.shape,
             rustdar_device_profile::constants::volume_grid_shape(axis),
@@ -239,13 +256,12 @@ fn the_requested_shape_is_the_one_this_device_can_hold() {
         }
     }
     assert_eq!(
-        voxel_request_for(
+        shaped_request(
             &target,
             35.33,
             -97.28,
             SHIPPED_CELLS,
-            rustdar_radar::types::RadarProduct::Reflectivity,
-            rustdar_device_profile::constants::WEBGL2_MAX_TEXTURE_DIMENSION_3D,
+            rustdar_device_profile::constants::WEBGL2_MAX_TEXTURE_DIMENSION_3D
         )
         .shape,
         rustdar_device_profile::constants::VOLUME_GRID_FLOOR_SHAPE,
@@ -271,14 +287,7 @@ fn a_picked_region_decides_the_ground_that_is_resampled() {
         region,
     };
 
-    let default = voxel_request_for(
-        &target(None),
-        35.33,
-        -97.28,
-        SHIPPED_CELLS,
-        rustdar_radar::types::RadarProduct::Reflectivity,
-        DEVICE_AXIS,
-    );
+    let default = shaped_request(&target(None), 35.33, -97.28, SHIPPED_CELLS, DEVICE_AXIS);
     assert_eq!(default.centre, (35.33, -97.28), "no region means the site");
     assert_eq!(
         default.half_extent_km, None,
@@ -294,12 +303,11 @@ fn a_picked_region_decides_the_ground_that_is_resampled() {
         rustdar_radar::voxel::HalfExtentKm::square(22.5),
     )
     .expect("a valid region");
-    let aimed = voxel_request_for(
+    let aimed = shaped_request(
         &target(Some(picked)),
         35.33,
         -97.28,
         SHIPPED_CELLS,
-        rustdar_radar::types::RadarProduct::Reflectivity,
         DEVICE_AXIS,
     );
     assert_eq!(
@@ -339,14 +347,7 @@ fn a_region_pick_does_not_move_the_top_or_the_bottom_of_the_box() {
     );
 
     for target in [make(None), make(picked)] {
-        let request = voxel_request_for(
-            &target,
-            35.33,
-            -97.28,
-            SHIPPED_CELLS,
-            rustdar_radar::types::RadarProduct::Reflectivity,
-            DEVICE_AXIS,
-        );
+        let request = shaped_request(&target, 35.33, -97.28, SHIPPED_CELLS, DEVICE_AXIS);
         assert_eq!(
             request.base_km_msl,
             rustdar_radar::voxel::DEFAULT_BASE_KM_MSL
@@ -1165,16 +1166,9 @@ fn the_requested_shape_is_the_budget_this_device_resolved() {
     );
 
     let cells_on = |budgets: rustdar_device_profile::budget::Budgets, axis: u32| {
-        voxel_request_for(
-            &target,
-            35.33,
-            -97.28,
-            budgets.grid_cells,
-            rustdar_radar::types::RadarProduct::Reflectivity,
-            axis,
-        )
-        .shape
-        .cells()
+        shaped_request(&target, 35.33, -97.28, budgets.grid_cells, axis)
+            .shape
+            .cells()
     };
     assert!(
         cells_on(desktop, 8192) > cells_on(phone, 256),
@@ -1183,9 +1177,9 @@ fn the_requested_shape_is_the_budget_this_device_resolved() {
     );
 
     let call = include_str!("../app.rs")
-        .split_once("let request = voxel_request_for(")
+        .split_once("let ctx = volume_job_context(")
         .map(|(_, rest)| rest.split_once(");").expect("a call site").0)
-        .expect("`voxel_request_for` is still called from `prepare_volume`");
+        .expect("`volume_job_context` is still called from `prepare_volume`");
     assert!(
         call.contains("self.budgets.grid_cells"),
         "the production call site passes `{call}` — the resolved budget is the \
@@ -1425,5 +1419,304 @@ fn the_chunk_feeds_status_reaches_the_seam_that_publishes_it() {
         live.feeding,
         "the feed is serving and the status bar would still say it is not: \
          the shell computed a status and never published it; got {live:?}",
+    );
+}
+
+// ── The job-shaping seam (WO-M14b-2) ────────────────────────────────────
+
+/// **A volume-capable layer that answers "I cannot shape this".**
+///
+/// It publishes radar's own registered rows, so the resolution's field gate
+/// passes and this fixture varies exactly one thing: what `volume_job`
+/// answers. That is the arm this build's ONE implementor cannot reach —
+/// radar refuses an unregistered field earlier, at the extraction gate — and
+/// it is the arm a second implementor will reach first.
+struct RefusingVolumeLayer;
+
+const REFUSING_LAYER: rustdar_source::id::LayerId =
+    rustdar_source::id::LayerId::from_static("test.refuses-to-shape");
+
+impl rustdar_source::volume::VolumeCapable for RefusingVolumeLayer {
+    fn volume_job(
+        &self,
+        _ctx: rustdar_source::volume::VolumeJobContext,
+    ) -> Option<rustdar_source::job::DescribedJob> {
+        None
+    }
+}
+
+impl rustdar_overlays::render::overlay_state::OverlayHandler for RefusingVolumeLayer {
+    fn id(&self) -> rustdar_source::id::LayerId {
+        REFUSING_LAYER
+    }
+    fn surface(&self) -> rustdar_source::handler::Surface {
+        rustdar_source::handler::Surface::Ground
+    }
+    fn draw_order_weight(&self) -> u32 {
+        0
+    }
+    fn display_name(&self) -> &str {
+        "Refusing"
+    }
+    fn render_mode(&self) -> rustdar_source::handler::RenderMode {
+        rustdar_source::handler::RenderMode::Texture
+    }
+    fn data_generation(&self) -> u64 {
+        0
+    }
+    fn has_data(&self, _pane: &rustdar_source::handler::PaneRef<'_>) -> bool {
+        true
+    }
+    fn is_fetching(&self) -> bool {
+        false
+    }
+    fn set_fetching(&mut self, _fetching: bool, _pane: &rustdar_source::handler::PaneRef<'_>) {}
+    fn fetch_time(&self) -> Option<web_time::Instant> {
+        None
+    }
+    fn apply_fetch_result(
+        &mut self,
+        _result: rustdar_source::handler::FetchPayload,
+        _pane: &rustdar_source::handler::PaneRef<'_>,
+    ) {
+    }
+    fn retain_selections(
+        &self,
+        _selections: &mut Vec<std::sync::Arc<dyn rustdar_source::handler::OverlayItem>>,
+        _pane: &rustdar_source::handler::PaneRef<'_>,
+    ) {
+    }
+    fn products(&self) -> &'static [rustdar_source::product::ProductSpec] {
+        rustdar_radar::fields::products()
+    }
+    fn volume(&self) -> Option<&dyn rustdar_source::volume::VolumeCapable> {
+        Some(self)
+    }
+}
+
+/// **A layer that cannot shape the job is refused into the store, not left
+/// pending.**
+///
+/// The seam's whole point is that the frontend does not know how a volume is
+/// built — so it cannot know in advance that a build is impossible, and the
+/// only honest answer to `None` is a refusal the pane can show. Left as
+/// `Waiting` instead, the level-trigger would re-ask every frame and pay the
+/// extraction every time, for ever.
+///
+/// **The preconditions are asserted, not assumed**: the ask must get past the
+/// budget gate and past extraction, or this would be green over an arm it
+/// never reached.
+#[test]
+fn a_capable_layer_that_cannot_shape_a_job_is_refused_rather_than_left_pending() {
+    let target = rustdar_egui::pane::VolumeTarget {
+        volume: rustdar_egui::pane::VolumeStamp {
+            site: "KTLX".to_owned(),
+            collected: at(10),
+        },
+        product: rustdar_radar::fields::known::REFLECTIVITY,
+        region: None,
+    };
+    let mut app = headless(TestBridge::desktop());
+    let mut handlers = rustdar_egui::sources::all();
+    handlers.push(Box::new(RefusingVolumeLayer));
+    app.gui.overlays =
+        rustdar_overlays::render::overlay_state::OverlayRegistry::with_handlers(handlers);
+    app.base_scans.insert(
+        "KTLX".to_string(),
+        (Arc::new(stamped_scan(10)), Default::default(), at(10)),
+    );
+
+    app.handle_prepare_volume(0, &REFUSING_LAYER, target.clone());
+
+    assert_eq!(
+        app.volume_extractions.get(),
+        1,
+        "precondition: the ask must have got past the budget gate and paid \
+         the extraction, or the refusal below is about some earlier gate",
+    );
+    let entry = app
+        .volume_store
+        .lookup(&target)
+        .expect("a layer that cannot shape a job must still answer into the store")
+        .entry
+        .clone();
+    let rustdar_volumetric::bridge::VolumeEntry::Refused(why) = entry else {
+        panic!("the store answered with a build rather than the refusal the layer gave");
+    };
+    assert!(
+        why.contains(REFUSING_LAYER.as_str()),
+        "the refusal must name the layer that could not build it; got {why:?}",
+    );
+
+    // The level-trigger is quiesced: a second ask attaches to the refusal
+    // rather than paying the walk again.
+    app.handle_prepare_volume(0, &REFUSING_LAYER, target.clone());
+    assert_eq!(
+        app.volume_extractions.get(),
+        1,
+        "the refusal did not quiesce the level-trigger: the pane re-extracts \
+         a multi-ms merged volume every frame for a build that can never \
+         happen",
+    );
+}
+
+/// **An asymmetric reach survives the seam with its axes in place.**
+///
+/// The reach crosses as a bare pair — `rustdar-source` cannot name
+/// `HalfExtentKm` — so it is taken apart on this side and put back together
+/// on radar's. **Two swaps would cancel**, and every other region fixture in
+/// this workspace is square, where neither swap is visible; this drives both
+/// halves of the round trip with `east != north`.
+#[test]
+fn an_asymmetric_region_survives_the_seam_with_its_axes_in_place() {
+    use rustdar_egui::pane::{VolumeRegion, VolumeStamp, VolumeTarget};
+    use rustdar_geo::GeoPoint;
+
+    let picked = VolumeRegion::new(
+        GeoPoint {
+            lat: 36.1,
+            lon: -98.4,
+        },
+        rustdar_radar::voxel::HalfExtentKm {
+            east_km: 12.5,
+            north_km: 47.5,
+        },
+    )
+    .expect("a valid region");
+    let target = VolumeTarget {
+        volume: VolumeStamp {
+            site: "KTLX".to_owned(),
+            collected: at(10),
+        },
+        product: rustdar_radar::fields::known::REFLECTIVITY,
+        region: Some(picked),
+    };
+    let request = shaped_request(&target, 35.33, -97.28, SHIPPED_CELLS, DEVICE_AXIS);
+    assert_eq!(
+        request.half_extent_km,
+        Some(rustdar_radar::voxel::HalfExtentKm {
+            east_km: 12.5,
+            north_km: 47.5,
+        }),
+        "a swap on either side alone gives (47.5, 12.5); a swap on BOTH gives \
+         this. MEASURED, not argued: with both sides swapped this test is \
+         green and radar's own \
+         `the_reach_that_crosses_the_seam_keeps_east_east_and_north_north` is \
+         what fires. This pin is not sufficient on its own.",
+    );
+}
+
+/// **The dispatch side names no voxel job type.**
+///
+/// Since WO-M14b-2 the layer hands back an envelope already shaped, and this
+/// side owns the render slot, the run envelope and the reply — nothing about
+/// what is being resampled. The zero is checked against a presence control on
+/// the SAME scrape: the file still names other radar job rows, which are other
+/// orders' business, so a zero here is a moved type rather than a needle that
+/// rotted or a file the walk never read.
+#[test]
+fn the_voxel_dispatch_names_no_voxel_job_type() {
+    let dispatch = include_str!("../render_dispatch.rs");
+    assert!(
+        dispatch.contains("fn spawn_voxel_build"),
+        "control: the scrape is not reading the dispatch it exists to guard",
+    );
+    let others = dispatch.matches("rustdar_radar::jobs::").count();
+    assert!(
+        others > 0,
+        "control: the file names no radar job row at all, so the zero below \
+         would be about a haystack that moved rather than about the voxel job",
+    );
+    assert_eq!(
+        dispatch.matches("VoxelJob").count(),
+        0,
+        "the voxel job type is named in the dispatch again. Shaping the job \
+         is the answering layer's — `VolumeCapable::volume_job` — and this \
+         side receives it as a `DescribedJob` it cannot look inside.",
+    );
+    assert_eq!(
+        dispatch.matches("VoxelRequest").count(),
+        0,
+        "the voxel request type is named in the dispatch again; see above.",
+    );
+}
+
+/// **The field that crosses the seam is the target's own**, not a constant.
+///
+/// The ask names a field, the walk matched it against the answering layer's
+/// own rows, and the handover has to carry that one rather than whatever the
+/// 3D view happens to open on. A build of the wrong moment looks entirely
+/// plausible on screen.
+#[test]
+fn the_field_the_seam_carries_is_the_targets_own() {
+    for (id, product) in [
+        (
+            rustdar_radar::fields::known::VELOCITY,
+            rustdar_radar::types::RadarProduct::Velocity,
+        ),
+        (
+            rustdar_radar::fields::known::CORRELATION_COEFFICIENT,
+            rustdar_radar::types::RadarProduct::CorrelationCoefficient,
+        ),
+    ] {
+        let target = rustdar_egui::pane::VolumeTarget {
+            volume: rustdar_egui::pane::VolumeStamp {
+                site: "KTLX".to_owned(),
+                collected: at(10),
+            },
+            product: id,
+            region: None,
+        };
+        assert_eq!(
+            shaped_request(&target, 35.33, -97.28, SHIPPED_CELLS, DEVICE_AXIS).product,
+            product,
+            "the handover carried a moment other than the one the target names",
+        );
+    }
+}
+
+/// **The volume the frontend extracted is what the layer is handed** — and the
+/// proof is that the real handler accepts it.
+///
+/// The payload crosses as `dyn Any`, so nothing about the handover is checked
+/// by the compiler: a stand-in, a stale buffer or another layer's type would
+/// all compile, and every one of them would come back as a refusal that reads
+/// exactly like a build the app never started. This drives the whole
+/// production path — seed, extract, hand over, shape, dispatch — and asserts
+/// the store is left BUILDING.
+#[test]
+fn the_volume_the_frontend_extracted_is_what_the_layer_is_handed() {
+    let target = rustdar_egui::pane::VolumeTarget {
+        volume: rustdar_egui::pane::VolumeStamp {
+            site: "KTLX".to_owned(),
+            collected: at(10),
+        },
+        product: rustdar_radar::fields::known::REFLECTIVITY,
+        region: None,
+    };
+    let mut app = headless(TestBridge::desktop());
+    app.base_scans.insert(
+        "KTLX".to_string(),
+        (Arc::new(stamped_scan(10)), Default::default(), at(10)),
+    );
+
+    app.handle_prepare_volume(0, &rustdar_source::id::known::RADAR, target.clone());
+
+    assert_eq!(
+        app.volume_extractions.get(),
+        1,
+        "precondition: the extraction must have happened, or what follows is \
+         about an ask that never got that far",
+    );
+    let entry = app
+        .volume_store
+        .lookup(&target)
+        .expect("the ask must have been answered into the store")
+        .entry
+        .clone();
+    assert!(
+        matches!(entry, rustdar_volumetric::bridge::VolumeEntry::Building),
+        "the layer did not accept the payload the frontend extracted, so the \
+         pane is showing a refusal where a build belongs",
     );
 }

@@ -1363,11 +1363,14 @@ impl RenderDispatcher {
     }
 
     /// Resample a volume into a voxel grid, away from the frame thread.
+    ///
+    /// `job` arrives already shaped by the layer that answered the ask (WO-M14b-2):
+    /// this side owns the slot accounting, the run envelope and the reply, and
+    /// names nothing about what is being resampled.
     pub fn spawn_voxel_build(
         &mut self,
         target: &rustdar_egui::pane::VolumeTarget,
-        input: rustdar_radar::render_input::RenderInput,
-        request: rustdar_radar::voxel::VoxelRequest,
+        job: rustdar_source::job::DescribedJob,
         sender: std::sync::mpsc::Sender<crate::channels::VoxelResponse>,
         window: Option<WindowRef>,
     ) -> bool {
@@ -1379,16 +1382,12 @@ impl RenderDispatcher {
         let target = target.clone();
         let started = web_time::Instant::now();
 
-        let job =
-            rustdar_worker::offload::Job::Described(rustdar_worker::offload::JobRequest::describe(
-                rustdar_radar::jobs::VoxelJob {
-                    input: Box::new(input),
-                    request,
-                },
-                // A voxel grid's shape is already on the wire, so its envelope
-                // carries no ceiling — the same effective 0 it has always had.
-                rustdar_worker::offload::ceiling_only_geometry(0),
-            ));
+        let job = rustdar_worker::offload::Job::Described(rustdar_worker::offload::JobRequest {
+            job,
+            // A voxel grid's shape is already on the wire, so its envelope
+            // carries no ceiling — the same effective 0 it has always had.
+            geometry: rustdar_worker::offload::ceiling_only_geometry(0),
+        });
         rustdar_worker::offload::offload_job("voxels", job, move |output| {
             let _guard = guard;
             // An output of another kind is `None` — "nothing to draw".

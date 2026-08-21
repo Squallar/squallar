@@ -40,7 +40,20 @@ impl StubLayer {
     }
 }
 
-impl rustdar_source::volume::VolumeCapable for StubLayer {}
+impl rustdar_source::volume::VolumeCapable for StubLayer {
+    /// **This fixture's subject is the WALK, which never shapes a job.** The
+    /// stub exists so "topmost wins", "a switched-off layer is walked past"
+    /// and "a capable layer on a flat field is walked past" have more than one
+    /// capable layer to discriminate between; the dispatch half of the seam is
+    /// exercised against the live handler in `rustdar-app`, where a real
+    /// payload exists to shape.
+    fn volume_job(
+        &self,
+        _ctx: rustdar_source::volume::VolumeJobContext,
+    ) -> Option<rustdar_source::job::DescribedJob> {
+        None
+    }
+}
 
 impl OverlayHandler for StubLayer {
     fn id(&self) -> LayerId {

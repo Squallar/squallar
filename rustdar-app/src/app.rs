@@ -280,33 +280,42 @@ pub(crate) enum VolumePrepare {
     Busy,
 }
 
-/// What to resample for `target`, over the region it names or the default box about the
-/// site.
-fn voxel_request_for(
+/// **The handover a volume ask becomes**: what ground to resample, what budget
+/// to spend on it, and the payload the frontend has already extracted.
+///
+/// This end resolves the two things only it can — the box's centre and reach,
+/// which come off a picked region or fall back to the site — and hands over
+/// the rest as numbers. **What is deliberately NOT decided here** is the grid
+/// shape, the vertical extent and which moment: those are the answering
+/// layer's, and since WO-M14b-2 they are stated on its side of the seam.
+fn volume_job_context(
     target: &rustdar_egui::pane::VolumeTarget,
     site_lat: f64,
     site_lon: f64,
     cells: [u32; 3],
-    product: rustdar_radar::types::RadarProduct,
     max_axis: u32,
-) -> rustdar_radar::voxel::VoxelRequest {
+    payload: Box<dyn std::any::Any + Send>,
+) -> rustdar_source::volume::VolumeJobContext {
     let (centre, half_extent_km) = match target.region {
-        Some(region) => (
-            (region.centre().lat, region.centre().lon),
-            Some(region.half_extent_km()),
+        Some(region) => {
+            let extent = region.half_extent_km();
+            (region.centre(), Some((extent.east_km, extent.north_km)))
+        }
+        None => (
+            rustdar_geo::GeoPoint {
+                lat: site_lat,
+                lon: site_lon,
+            },
+            None,
         ),
-        None => ((site_lat, site_lon), None),
     };
-    rustdar_radar::voxel::VoxelRequest {
+    rustdar_source::volume::VolumeJobContext {
+        payload,
+        field: target.product.clone(),
         centre,
         half_extent_km,
-        base_km_msl: rustdar_radar::voxel::DEFAULT_BASE_KM_MSL,
-        top_km_msl: rustdar_radar::voxel::DEFAULT_TOP_KM_MSL,
-        // Resolved by the caller: `prepare_volume` refuses an id this build
-        // does not register before it gets this far.
-        product,
-        shape: rustdar_device_profile::constants::volume_grid_shape_of(cells, max_axis),
-        values_wanted: false,
+        cells,
+        max_axis,
     }
 }
 
@@ -856,19 +865,30 @@ impl App {
             self.mark_volume_rendered(pane_idx, &target);
             return;
         }
-        if self.prepare_volume(pane_idx, &target, rustdar_volumetric::bridge::Hold::Single)
-            == VolumePrepare::Served
+        if self.prepare_volume(
+            pane_idx,
+            &target,
+            rustdar_volumetric::bridge::Hold::Single,
+            layer,
+        ) == VolumePrepare::Served
         {
             self.mark_volume_rendered(pane_idx, &target);
         }
     }
 
     /// The body of [`Self::handle_prepare_volume`], shared with the 3D loop's dispatcher.
+    ///
+    /// `layer` is who to ask for the job once the payload exists. It is a
+    /// parameter rather than something re-derived here because the two callers
+    /// know it for different reasons and neither can be made to guess: the
+    /// action carries the layer the pane's own walk landed on, and the loop
+    /// pass is radar's loop end to end.
     fn prepare_volume(
         &mut self,
         pane_idx: usize,
         target: &rustdar_egui::pane::VolumeTarget,
         hold: rustdar_volumetric::bridge::Hold,
+        layer: &rustdar_source::id::LayerId,
     ) -> VolumePrepare {
         use rustdar_volumetric::bridge::VolumeEntry;
 
@@ -957,18 +977,30 @@ impl App {
             started.elapsed().as_millis(),
         );
 
-        let request = voxel_request_for(
+        let ctx = volume_job_context(
             target,
             site.lat,
             site.lon,
             self.budgets.grid_cells,
-            product,
             self.volume_grid_axis_limit(),
+            Box::new(input),
         );
+        let Some(job) = self.volume_job(layer, ctx) else {
+            self.volume_store.insert_held(
+                pane_idx,
+                target.clone(),
+                VolumeEntry::Refused(format!(
+                    "{} could not shape a 3D build of {} from this volume.",
+                    layer.as_str(),
+                    target.product.as_str(),
+                )),
+                hold,
+            );
+            return VolumePrepare::Served;
+        };
         let spawned = self.render.spawn_voxel_build(
             target,
-            input,
-            request,
+            job,
             self.channels.voxel_sender.clone(),
             self.window.clone(),
         );

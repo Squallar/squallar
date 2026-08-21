@@ -3575,3 +3575,170 @@ fn the_rows_build_the_grid_the_one_buffer_serial_loop_built() {
         }
     }
 }
+
+// ── The request the seam shapes (WO-M14b-2) ─────────────────────────────
+
+/// A context aimed at `centre` with `extent`, on a device that affords
+/// `cells` at `max_axis`. The payload is never read by `request_for`, so a
+/// stand-in states that rather than pretending a volume is involved.
+fn ctx_for(
+    field: rustdar_source::product::FieldId,
+    centre: rustdar_geo::GeoPoint,
+    half_extent_km: Option<(f64, f64)>,
+    cells: [u32; 3],
+    max_axis: u32,
+) -> rustdar_source::volume::VolumeJobContext {
+    rustdar_source::volume::VolumeJobContext {
+        payload: Box::new(()),
+        field,
+        centre,
+        half_extent_km,
+        cells,
+        max_axis,
+    }
+}
+
+/// **The two horizontal axes of a picked reach do not swap.**
+///
+/// The reach crosses the seam as a bare pair — the substrate cannot name
+/// `HalfExtentKm` — and this side puts the names back on. **Every other
+/// fixture in this workspace picks a SQUARE region**, where a transposition
+/// is invisible; this one is deliberately asymmetric, and it is the only
+/// thing standing between an east/north swap and a box that is resampled
+/// sideways.
+#[test]
+fn the_reach_that_crosses_the_seam_keeps_east_east_and_north_north() {
+    let request = request_for(&ctx_for(
+        crate::fields::known::REFLECTIVITY,
+        rustdar_geo::GeoPoint {
+            lat: 36.1,
+            lon: -98.4,
+        },
+        Some((12.5, 47.5)),
+        [128, 128, 32],
+        2048,
+    ))
+    .expect("Reflectivity is a field this build registers");
+    assert_eq!(
+        request.half_extent_km,
+        Some(HalfExtentKm {
+            east_km: 12.5,
+            north_km: 47.5,
+        }),
+        "the pair is read (east, north); a swap would give (47.5, 12.5)",
+    );
+    assert_eq!(
+        request.centre,
+        (36.1, -98.4),
+        "the centre is read (lat, lon)",
+    );
+}
+
+/// **The vertical extent and the value plane are this side's answer, not the
+/// caller's.** Neither is on the context at all: a caller that wanted a
+/// different box top or a second buffer of values in their own units would
+/// have to say so here, where the reason can be written down.
+#[test]
+fn the_box_top_and_the_value_plane_are_decided_on_this_side_of_the_seam() {
+    for extent in [None, Some((30.0, 30.0))] {
+        let request = request_for(&ctx_for(
+            crate::fields::known::VELOCITY,
+            rustdar_geo::GeoPoint {
+                lat: 35.0,
+                lon: -97.0,
+            },
+            extent,
+            [128, 128, 32],
+            2048,
+        ))
+        .expect("Velocity is a field this build registers");
+        assert_eq!(request.base_km_msl, DEFAULT_BASE_KM_MSL);
+        assert_eq!(request.top_km_msl, DEFAULT_TOP_KM_MSL);
+        assert!(
+            !request.values_wanted,
+            "the 3D view paints palette indices through a transfer table; a \
+             second plane of values in their own units is a buffer nothing up \
+             there reads",
+        );
+    }
+}
+
+/// **A field this build registers no product for shapes no request.**
+///
+/// The id crosses the seam as an open string. The frontend matched it against
+/// this layer's own rows before asking — but the ask and the answer are
+/// separated by an action channel, so this side refuses rather than resolving
+/// an unknown id to whatever the first row happens to be.
+#[test]
+fn an_unregistered_field_shapes_no_request() {
+    let alien = rustdar_source::product::FieldId::from_static("NotAFieldThisBuildHas");
+    assert!(
+        crate::fields::product_for(&alien).is_none(),
+        "precondition: the id must really be unregistered, or this test \
+         passes for the wrong reason",
+    );
+    assert!(
+        request_for(&ctx_for(
+            alien,
+            rustdar_geo::GeoPoint {
+                lat: 35.0,
+                lon: -97.0,
+            },
+            None,
+            [128, 128, 32],
+            2048,
+        ))
+        .is_none(),
+    );
+    // Control on the same walk: a registered id through the identical call
+    // does shape one, so the `None` above is about the field and not about
+    // the fixture.
+    assert!(
+        request_for(&ctx_for(
+            crate::fields::known::REFLECTIVITY,
+            rustdar_geo::GeoPoint {
+                lat: 35.0,
+                lon: -97.0,
+            },
+            None,
+            [128, 128, 32],
+            2048,
+        ))
+        .is_some(),
+    );
+}
+
+/// **The device's ceiling is spent here, and it binds.**
+///
+/// `cells` is a budget and `max_axis` is a hard limit; the frontend hands over
+/// both and never resolves them into a shape, because how a radar volume is
+/// best sampled — wide and shallow — is this side's arithmetic.
+#[test]
+fn the_budget_is_spent_against_the_axis_the_device_reported() {
+    let shape_at = |max_axis: u32| {
+        request_for(&ctx_for(
+            crate::fields::known::REFLECTIVITY,
+            rustdar_geo::GeoPoint {
+                lat: 35.0,
+                lon: -97.0,
+            },
+            None,
+            [256, 256, 64],
+            max_axis,
+        ))
+        .expect("Reflectivity is a field this build registers")
+        .shape
+    };
+    let small = shape_at(64);
+    for (axis, n) in [("nx", small.nx), ("ny", small.ny), ("nz", small.nz)] {
+        assert!(
+            n <= 64,
+            "a device that reported 64 was asked for {n} cells of {axis}",
+        );
+    }
+    assert!(
+        shape_at(2048).cells() > small.cells(),
+        "the ceiling has to actually bind, or the assertion above holds over \
+         a shape the ceiling never touched",
+    );
+}

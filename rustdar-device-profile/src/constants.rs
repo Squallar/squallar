@@ -249,16 +249,6 @@ pub const VOLUME_GRID_CELLS: [u32; 3] = MOBILE_VOLUME_GRID_CELLS;
 #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
 pub const VOLUME_GRID_CELLS: [u32; 3] = DESKTOP_VOLUME_GRID_CELLS;
 
-/// A cell triple as the `VoxelShape` a [`rustdar_radar::voxel::VoxelRequest`]
-/// carries.
-const fn shape_of(cells: [u32; 3]) -> rustdar_radar::voxel::VoxelShape {
-    rustdar_radar::voxel::VoxelShape {
-        nx: cells[0] as usize,
-        ny: cells[1] as usize,
-        nz: cells[2] as usize,
-    }
-}
-
 /// The grid shape this target should actually **request** on a device whose 3D
 /// textures may be `max_axis` on a side.
 pub const fn volume_grid_shape(max_axis: u32) -> rustdar_radar::voxel::VoxelShape {
@@ -270,7 +260,10 @@ pub const fn volume_grid_shape_of(
     cells: [u32; 3],
     max_axis: u32,
 ) -> rustdar_radar::voxel::VoxelShape {
-    rustdar_radar::voxel::shape_for_budget(shape_of(cells), max_axis as usize)
+    rustdar_radar::voxel::shape_for_budget(
+        rustdar_radar::voxel::VoxelShape::of_cells(cells),
+        max_axis as usize,
+    )
 }
 
 /// The grid this target builds on a device reporting exactly the guarantee —

@@ -1,6 +1,7 @@
 use super::*;
 use crate::budget::{self, Budgets, DeviceProfile};
 use rustdar_radar::types::IMAGE_SIZE;
+use rustdar_radar::voxel::VoxelShape;
 use rustdar_radar::xsect::{NATIVE_SECTION_WIDTH, WASM_SECTION_WIDTH};
 
 /// Every device class this workspace builds for, exactly once.
@@ -779,12 +780,12 @@ fn the_grid_dimensions_match_the_shapes_rustdar_radar_names() {
 /// budgets were computed from.
 #[test]
 fn the_requested_shape_is_the_one_this_targets_budget_was_computed_for() {
-    use rustdar_radar::voxel::{DESKTOP_SHAPE, MOBILE_SHAPE, VoxelShape, WASM_SHAPE};
+    use rustdar_radar::voxel::{DESKTOP_SHAPE, MOBILE_SHAPE, WASM_SHAPE};
 
     // The axis order asserted rather than trusted: every real triple has
     // `nx == ny`, so a transposition would be invisible on all three.
     assert_eq!(
-        shape_of([1, 2, 3]),
+        VoxelShape::of_cells([1, 2, 3]),
         VoxelShape {
             nx: 1,
             ny: 2,
@@ -793,9 +794,12 @@ fn the_requested_shape_is_the_one_this_targets_budget_was_computed_for() {
         "VOLUME_GRID_CELLS is x, y, z",
     );
 
-    assert_eq!(shape_of(WASM_VOLUME_GRID_CELLS), WASM_SHAPE);
-    assert_eq!(shape_of(MOBILE_VOLUME_GRID_CELLS), MOBILE_SHAPE);
-    assert_eq!(shape_of(DESKTOP_VOLUME_GRID_CELLS), DESKTOP_SHAPE);
+    assert_eq!(VoxelShape::of_cells(WASM_VOLUME_GRID_CELLS), WASM_SHAPE);
+    assert_eq!(VoxelShape::of_cells(MOBILE_VOLUME_GRID_CELLS), MOBILE_SHAPE);
+    assert_eq!(
+        VoxelShape::of_cells(DESKTOP_VOLUME_GRID_CELLS),
+        DESKTOP_SHAPE
+    );
 
     // The shape a device at the guarantee is asked for is this target's own
     // budget triple, unchanged — the no-regression claim.
@@ -838,7 +842,10 @@ const ALL_ARMS: [(&str, [u32; 3]); 3] = [
 fn every_axis_stays_within_the_limit_the_adapter_reported() {
     for (name, budget) in ALL_ARMS {
         for limit in REPORTED_LIMITS {
-            let shape = rustdar_radar::voxel::shape_for_budget(shape_of(budget), limit as usize);
+            let shape = rustdar_radar::voxel::shape_for_budget(
+                VoxelShape::of_cells(budget),
+                limit as usize,
+            );
             for (axis, n) in [("nx", shape.nx), ("ny", shape.ny), ("nz", shape.nz)] {
                 assert!(
                     n as u32 <= limit,
@@ -857,7 +864,7 @@ fn every_axis_stays_within_the_limit_the_adapter_reported() {
 fn a_shape_derived_for_a_device_at_the_guarantee_stays_within_it() {
     for (name, budget) in ALL_ARMS {
         let shape = rustdar_radar::voxel::shape_for_budget(
-            shape_of(budget),
+            VoxelShape::of_cells(budget),
             WEBGL2_MAX_TEXTURE_DIMENSION_3D as usize,
         );
         for (axis, n) in [("nx", shape.nx), ("ny", shape.ny), ("nz", shape.nz)] {
