@@ -61,7 +61,7 @@ rustdar-egui/src/ui_map.rs	1473	1412
 rustdar-egui/src/ui_map_overlays.rs	186	178
 rustdar-egui/src/ui_map_pane.rs	1603	1380
 rustdar-egui/src/ui_menu.rs	391	357
-rustdar-egui/src/ui_pills.rs	605	581
+rustdar-egui/src/ui_pills.rs	626	602
 rustdar-egui/src/ui_popups.rs	299	221
 rustdar-egui/src/ui_region.rs	179	177
 rustdar-egui/src/ui_section_edit.rs	342	329
@@ -175,7 +175,7 @@ rustdar-radar/src/loop_geometry.rs	7	7
 rustdar-radar/src/nrot.rs	3227	3168
 rustdar-radar/src/nyquist.rs	126	107
 rustdar-radar/src/palette.rs	421	402
-rustdar-radar/src/product_spec.rs	398	397
+rustdar-radar/src/product_spec.rs	444	443
 rustdar-radar/src/render.rs	1250	1086
 rustdar-radar/src/render/polar.rs	264	260
 rustdar-radar/src/render_input.rs	663	633
@@ -190,7 +190,7 @@ rustdar-radar/src/srm.rs	107	102
 rustdar-radar/src/srv.rs	203	203
 rustdar-radar/src/tls_pins.rs	64	62
 rustdar-radar/src/twin.rs	425	387
-rustdar-radar/src/types.rs	381	374
+rustdar-radar/src/types.rs	387	380
 rustdar-radar/src/velocity.rs	105	103
 rustdar-radar/src/vil.rs	364	354
 rustdar-radar/src/vild.rs	96	94
