@@ -616,7 +616,11 @@ fn the_product_enum_never_spreads_further_into_egui() {
 
 // Row 5 — retired; the enum it counted is gone.
 
-/// Row 6 — ChannelHub receiver-field count, ceiling 18.
+/// Row 6 — ChannelHub receiver-field count, ceiling [`HUB_RECEIVER_MAX`].
+///
+/// The ceiling has been **17 since WO-M12b**; the function name records the 18
+/// it was written against at WO-E0c and is left alone because the plan's own
+/// tamper record cites it by that name.
 #[test]
 fn the_channel_hub_never_grows_past_eighteen_receiver_pairs() {
     let channels_rs = Path::new(ROOT).join("rustdar-app/src/channels.rs");

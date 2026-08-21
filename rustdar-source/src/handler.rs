@@ -1055,6 +1055,45 @@ pub struct OverlayFetchResult {
 ///
 /// Generic over nothing: the payloads are the cfg'd [`FetchPayload`] alias, so
 /// the web arm (`Box<dyn Any>`, **not** `Send`) carries exactly what it can.
+///
+/// # The eventing posture (written and verified at WO-M13b)
+///
+/// **This enum IS a source's arrival path — there is no other, and getting one
+/// is not how a source is added.** The frontend holds exactly one channel of
+/// `SourceEvent`, kind-agnostic: every layer's arrival travels on it and names
+/// itself by [`LayerId`] in the payload rather than by the channel it came
+/// down. That channel is drained in exactly one place, which
+/// `every_hub_receiver_is_drained_by_exactly_one_row` holds from the frontend
+/// side, and once per frame, which is measured rather than pinned (WO-M13b).
+/// **A new source registers a handler; it never adds a channel** —
+/// `the_channel_hub_only_ever_shrinks` refuses one that tries.
+///
+/// **[`SourceEvent::Data`] carries the raster-now obligation (WO-M13a).** It is
+/// not only "here is this layer's new state": the pass that installs the data
+/// is also the one that re-asks the panes already showing that layer, so the
+/// pictures made from a `Data` arrival are redrawn on the frame it lands
+/// rather than on whichever later frame a draw loop notices they went stale.
+/// A handler that answers with `Data` should expect its rasterization to be
+/// asked for immediately, not eventually.
+///
+/// **What the frontend's remaining channels are, so this posture is not read
+/// as bigger than it is.** They are radar's own stage-plumbing — its
+/// multi-stage ingest and its own raster replies — which survive because
+/// amendment M-H scopes `RadarSource` out of [`SourceHandler::create_fetch_tasks`]:
+/// the unified fetch seam cannot express a per-pane multi-stage ingest. They
+/// only ever shrink, and the post-campaign per-pane fetch seam and the
+/// LiveFeeds/chunk-transport fold are what shrink them. Per-type channels were
+/// **kept deliberately**: one channel would order cross-type arrivals by
+/// whichever background task finished first instead of by the frame pump's
+/// pinned row order.
+///
+/// **The generic streaming-push verb stays DEFERRED.** Restated verbatim from
+/// the plan's post-campaign register: *"Generic streaming-push verb (deferred
+/// until a second real stream exists)."* This enum is a **pull**-shaped
+/// vocabulary: three arms, each the answer to a question a handler was asked.
+/// Radar's chunk feed is the one real stream in the tree, and a push verb
+/// generalised from a single implementor is a guess — so the fence stands
+/// until a second one exists.
 pub enum SourceEvent {
     /// Today's payload, unchanged — a whole fetch round for a layer.
     Data(OverlayFetchResult),

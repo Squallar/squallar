@@ -127,8 +127,16 @@ fn every_hub_receiver_is_drained_by_exactly_one_row() {
     }
 }
 
-/// The 18 channel pairs of record, in field order. Removal is legal;
+/// The 17 channel pairs of record, in field order. Removal is legal;
 /// addition never is.
+///
+/// **18 at WO-E3, 17 since WO-M12b**, and never anything else: the
+/// `loop_scan_list` pair went when the archive listing moved behind the frame
+/// contract and a radar frame listing began arriving on the one source path.
+/// WO-M12b lowered `HUB_RECEIVER_MAX` in the land that earned it but left the
+/// retired name sitting here, where it went on excusing the very channel that
+/// land deleted; WO-M13b verified the pin and removed it. Shrinking this list
+/// is the only edit it takes.
 const HUB_BASE_NAMES: &[&str] = &[
     "scan",
     "render",
@@ -137,7 +145,6 @@ const HUB_BASE_NAMES: &[&str] = &[
     "level3",
     "overlay_fetch",
     "overlay_render",
-    "loop_scan_list",
     "loop_scan_download",
     "loop_l3_list",
     "loop_l3_fetch",

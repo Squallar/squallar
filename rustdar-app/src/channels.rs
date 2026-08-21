@@ -303,6 +303,71 @@ pub struct SiteCatalogueResponse {
 }
 
 /// Channel hub for async communication between the App and background tasks.
+///
+/// # The eventing posture (written and verified at WO-M13b)
+///
+/// **A source has ONE arrival path, and it is not a channel of its own.**
+/// Everything a source produces comes back on `overlay_fetch_*` as a
+/// [`SourceEvent`]: one **kind-agnostic** channel carrying `Data`, `Frames`
+/// and `FrameReady` for every layer, each arrival naming its `LayerId` in the
+/// payload rather than in the channel it came down. It is drained by the one
+/// `FRAME_PUMP` row `poll_overlay_fetch_results`, **once per frame**. The two
+/// halves of that sentence are held differently, and which is which is worth
+/// knowing: *one row* is pinned by
+/// `every_hub_receiver_is_drained_by_exactly_one_row`; *once per frame* is
+/// measured — `poll_data_channels` runs the pump's `Ingest` phase, and
+/// `handle_redraw` is its only production caller (WO-M13b) — and only partly
+/// pinned, by `the_chunk_drain_runs_before_the_frame_is_laid_out`, which holds
+/// that `poll_data_channels` runs `Ingest` and where in the frame it sits, not
+/// that it is called exactly once. Since WO-M13a a `Data` arrival also
+/// carries the **raster-now obligation**: the same pass that installs the data
+/// re-asks the panes already showing that layer, so an overlay raster is
+/// redrawn when its data arrives rather than when the next draw loop notices
+/// it went stale.
+///
+/// **A new source NEVER adds a channel — it registers a handler.** Its
+/// arrivals ride `overlay_fetch_*`; its rasters ride `overlay_render_*`, which
+/// is keyed by `LayerId` and carries the finished raster for the seven layers
+/// the job funnel builds; its 3D builds ride `voxel_*`, whose job the layer
+/// shapes for itself through `VolumeCapable` (WO-M14b-2). Those three pairs are
+/// seams rather than plumbing, and the count is the evidence: the hub has gone
+/// **18 pairs at WO-E3 → 17 since WO-M12b** and has never once gone up — the
+/// whole-source `FakeSource` added at WO-E9b needed no row here.
+/// `the_channel_hub_only_ever_shrinks` refuses any pair whose base name is not
+/// already on its pinned list, which is what makes this paragraph a test and
+/// not an intention.
+///
+/// **The other fourteen pairs are radar's own stage-plumbing, and they only
+/// ever shrink.** Ten are ingest stages (`scan`, `chunk`, `level3`,
+/// `sounding`, `melting_layer`, `storm_motion`, `site_catalogue`,
+/// `loop_scan_download`, `loop_l3_list`, `loop_l3_fetch`); four are raster
+/// replies radar does **not** send through `overlay_render_*` (`render`,
+/// `section`, `loop_render`, `loop_section`) — so "radar's bespoke half" is its
+/// render path as well as its ingest, and saying only "ingest" understates it.
+/// They exist because amendment M-H scopes `RadarSource` out of
+/// `create_fetch_tasks`: the unified fetch seam — a client, the sources and one
+/// optional viewport — cannot express radar's per-pane multi-stage ingest, so
+/// that stays bespoke behind `RadarSource`. **The post-campaign per-pane fetch
+/// seam and the LiveFeeds/chunk-transport fold are what shrink these**, not a
+/// tidying pass here: retiring a pair is legal and is the only legal
+/// direction.
+///
+/// **Per-type channels were KEPT deliberately; one channel is not the tidier
+/// answer.** A `Receiver` is FIFO only within itself, so what orders two
+/// arrivals of *different* types is the pump's row order — pinned by
+/// `the_pump_rows_are_in_the_pinned_order` — and, within a row owning several
+/// receivers, the order that row drains them in (`poll_level3_results` owns
+/// four). Collapsing the fourteen into one channel would replace that with
+/// whatever order the background tasks happened to finish in, so a Level III
+/// object could be applied before the volume it was paired against. The
+/// ordering guarantee lives in the row table, which is why the row table is
+/// what is pinned.
+///
+/// **The generic streaming-push verb stays DEFERRED.** Restated verbatim from
+/// the plan's post-campaign register: *"Generic streaming-push verb (deferred
+/// until a second real stream exists)."* Radar's chunk feed is the one real
+/// stream in the tree; a verb generalised from a single implementor is a
+/// guess, and this fence stands until a second one exists.
 pub struct ChannelHub {
     pub scan_sender: Sender<ScanResponse>,
     pub scan_receiver: Receiver<ScanResponse>,
@@ -314,11 +379,15 @@ pub struct ChannelHub {
     pub voxel_receiver: Receiver<VoxelResponse>,
     pub level3_sender: Sender<Level3Response>,
     pub level3_receiver: Receiver<Level3Response>,
-    /// **The one arrival path a source has.** Widened at WO-M11 from
-    /// `OverlayFetchResult` to [`SourceEvent`], whose `Frames`/`FrameReady`
-    /// arms are dark until WO-E7/WO-M12 give them producers — one channel and
-    /// one drain, so a new arrival shape is a compile error at the `match`
-    /// rather than a second channel nobody polls.
+    /// **The one arrival path a source has** — see the posture on
+    /// [`ChannelHub`]. Widened at WO-M11 from `OverlayFetchResult` to
+    /// [`SourceEvent`]: one channel and one drain, so a new arrival shape is a
+    /// compile error at the `match` rather than a second channel nobody polls.
+    ///
+    /// All three arms have producers as of WO-M12b — `Frames` from a
+    /// handler's frame-list task and `FrameReady` from its frame fetch — so the
+    /// "dark until WO-E7/WO-M12" caveat this doc used to carry is retired
+    /// rather than repeated.
     pub overlay_fetch_sender: Sender<SourceEvent>,
     pub overlay_fetch_receiver: Receiver<SourceEvent>,
     pub overlay_render_sender: Sender<OverlayRenderResponse>,
