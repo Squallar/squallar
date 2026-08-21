@@ -125,6 +125,13 @@ impl super::App {
 
         let ctx = self.state.as_ref().unwrap().egui_renderer.context().clone();
 
+        // First use of the context this frame, and it has to be: `begin_frame`
+        // above is the moment egui is told this device's real texture limit,
+        // and the restore is an upload. See `App::restore_cached_render`.
+        if self.restore_pending {
+            self.restore_cached_render(&ctx);
+        }
+
         // Before the pollers, which is before `Gui::ui` builds the paint list: a
         // raster whose last band landed on the previous frame goes on screen in
         // *this* frame's paint list rather than the next one. See the callee.
@@ -1408,11 +1415,62 @@ impl super::App {
         }
     }
 
+    /// The largest side this restore would hand egui.
+    ///
+    /// Plan views only, and that is the whole set rather than a shortcut: a
+    /// cross-section is `SECTION_WIDTH` by half of it — 2048 native, 1024 on
+    /// wasm — and 2048 is the *smallest* limit any `egui::Context` reports,
+    /// the `InputState::default` one. A section can therefore never be the
+    /// raster that does not fit. Pinned by
+    /// `a_cross_section_can_never_be_the_raster_that_does_not_fit`, which goes
+    /// red if a section ever grows past that floor and this has to widen.
+    fn widest_raster_to_restore(&self) -> usize {
+        self.render
+            .pane_render
+            .iter()
+            .filter_map(|prs| prs.cached_render.as_ref())
+            .map(|cached| cached.image.width().max(cached.image.height()))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Restore the radar image from cached raw RGBA data.
+    ///
+    /// **The context must already have run a pass.** `egui::Context::load_texture`
+    /// checks the picture it is handed against `InputState::max_texture_side`,
+    /// and a context that has not begun a pass carries the 2048 that
+    /// `InputState::default` carries — not what the adapter reports, which on
+    /// the API-34 x86_64 emulator is 32768 and on any mobile device is at least
+    /// twice the 4096 a long-range plan view reaches. Handing it a 4096 px
+    /// raster there trips a `debug_assert!` that takes the winit loop, and with
+    /// it the Activity, down; measured 3 of 3 on `main@178ab361` and again 3 of
+    /// 3 on `main@5dbe9339`, 2026-08-21, API-34 x86_64 emulator.
+    /// egui learns the real number from the `RawInput` `begin_frame` hands it,
+    /// so the restore runs from inside the frame. The guard below is that
+    /// sentence checked rather than assumed: it defers rather than clamping,
+    /// because a halved raster is a visible change to the picture the user had.
     pub(super) fn restore_cached_render(&mut self, ctx: &egui::Context) {
         use rustdar_egui::overlay_cache::{OverlayTextureData, RadarTextureMeta};
         use rustdar_geo::PlacedRaster;
         use rustdar_radar::types::ImageBounds;
+
+        // Ahead of every mutation below, so a deferral is a whole one. The
+        // flag is this function's own: it clears it by doing the work and
+        // raises it by declining to, so no caller has to know the rule.
+        let widest = self.widest_raster_to_restore();
+        let admitted = ctx.input(|i| i.max_texture_side);
+        if widest > admitted {
+            // Said rather than passed over in silence: this frame put nothing
+            // back, and the two numbers are what tells a frame that ran too
+            // early from an adapter that really is this small.
+            log::info!(
+                "restore deferred: a {widest} px raster against a context \
+                 admitting {admitted} px"
+            );
+            self.restore_pending = true;
+            return;
+        }
+        self.restore_pending = false;
 
         // Every raster still arriving is let go of first, on **every** pane and
         // whether or not this goes on to restore one.
@@ -3608,6 +3666,11 @@ mod loop_scan_cache_tests;
 #[path = "app_render/pane_kind_render_filter_tests.rs"]
 #[cfg(test)]
 mod pane_kind_render_filter_tests;
+
+/// The restore's one precondition: egui knows this device's texture limit.
+#[path = "app_render/restore_texture_limit_tests.rs"]
+#[cfg(test)]
+mod restore_texture_limit_tests;
 
 /// A restored image describes itself too.
 #[path = "app_render/restore_describes_its_image_tests.rs"]
