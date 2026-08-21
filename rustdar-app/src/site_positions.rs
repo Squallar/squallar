@@ -79,7 +79,7 @@ impl SitePositions {
     ///
     /// [`SiteFix::Learned`] because these came from a volume: they carry a Volume
     /// Data Block's two separately-reported heights, and outrank the network.
-    pub fn fixes(&self) -> impl Iterator<Item = (&str, SiteFix)> {
+    pub fn fixes(&self) -> impl Iterator<Item = (&str, SiteFix<'_>)> {
         self.iter()
             .map(|(site, position)| (site, SiteFix::Learned(position)))
     }

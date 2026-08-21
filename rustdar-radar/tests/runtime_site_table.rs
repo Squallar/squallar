@@ -4,7 +4,7 @@
 use rustdar_radar::site_position::SitePosition;
 use rustdar_radar::sites::{self, Datum, SiteFix};
 
-fn remote(lat_udeg: i32, lon_udeg: i32) -> SiteFix {
+fn remote(lat_udeg: i32, lon_udeg: i32) -> SiteFix<'static> {
     SiteFix::Learned(SitePosition {
         lat_udeg,
         lon_udeg,

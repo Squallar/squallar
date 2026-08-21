@@ -28,6 +28,9 @@ const NETWORK_LAT_UDEG: i32 = 32_000_000;
 /// Longitude every candidate shares: only the latitude varies, so a failure
 /// names a rung rather than a coordinate.
 const LON_UDEG: i32 = -97_000_000;
+/// The place the *network catalogue* names. Only it has one: a volume states
+/// where a radar is and never what it is called.
+const NETWORK_PLACE: &str = "Bunkerville";
 
 fn learned() -> SitePosition {
     SitePosition {
@@ -38,11 +41,12 @@ fn learned() -> SitePosition {
     }
 }
 
-fn network() -> SiteFix {
+fn network() -> SiteFix<'static> {
     SiteFix::Network {
         lat_udeg: NETWORK_LAT_UDEG,
         lon_udeg: LON_UDEG,
         elevation_m: 400,
+        place: Some(NETWORK_PLACE),
     }
 }
 
@@ -315,7 +319,65 @@ fn an_arrival_only_the_catalogue_knows_takes_its_elevation() {
     );
 }
 
+/// **The name is not on the precedence ladder.** A volume outranks the
+/// catalogue about where a radar is; it says nothing about what place it is at,
+/// and losing that rung must not lose the name.
+///
+/// The order here is the one that hurts: the catalogue first, then a volume
+/// that displaces its position. Read after ranking rather than before, the
+/// second resolution drops the `Network` fix whole and the name goes with it —
+/// so every site the user has actually watched would be the one with no name.
+#[test]
+fn a_volume_takes_the_position_from_the_catalogue_and_leaves_the_name() {
+    let _gate = serialized();
+    assert!(
+        !sites::knows_site("ZZPA"),
+        "precondition: ZZPA must be unknown, or this proves nothing",
+    );
+    sites::resolve([("ZZPA", network())]);
+    assert_eq!(
+        sites::table().place("ZZPA"),
+        Some(NETWORK_PLACE),
+        "the catalogue named it",
+    );
+
+    sites::resolve([("ZZPA", SiteFix::Learned(learned()))]);
+
+    let row = sites::get_radar_site("ZZPA").expect("still a row");
+    assert_eq!(
+        row.lat,
+        f64::from(LEARNED_LAT_UDEG) / 1e6,
+        "the control: the volume did take the position, so this is the case \
+         that would have dropped the name",
+    );
+    assert_eq!(row.place(), Some(NETWORK_PLACE), "and the name stayed");
+}
+
+/// A radar nothing has named answers `None`, not an empty string. Every site
+/// is in this state on a fresh install, before any catalogue lands.
+#[test]
+fn a_radar_no_catalogue_has_named_has_no_place_at_all() {
+    let _gate = serialized();
+    assert!(
+        !sites::knows_site("ZZPB"),
+        "precondition: ZZPB must be unknown, or this proves nothing",
+    );
+    sites::resolve([("ZZPB", SiteFix::Learned(learned()))]);
+
+    let row = sites::get_radar_site("ZZPB").expect("the volume placed it");
+    assert_eq!(row.place(), None);
+    assert_eq!(sites::table().place("ZZPB"), None);
+    assert_eq!(
+        sites::table().place("ZZPC"),
+        None,
+        "and so does a radar the table has never heard of",
+    );
+}
+
 /// Resolving twice with the same catalogue must build nothing the second time.
+/// Since the catalogue now carries names, this is also what pins the name
+/// **not** being leaked afresh on every launch: a name equal to the one on
+/// record is not a change.
 #[test]
 fn a_second_resolution_with_the_same_catalogue_reuses_the_table() {
     let _gate = serialized();

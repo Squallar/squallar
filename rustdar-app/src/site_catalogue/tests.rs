@@ -9,6 +9,7 @@ fn placed(lat_udeg: i32) -> CataloguePosition {
         lon_udeg: -97_000_000,
         elevation_m: 400,
         network: None,
+        place: Some("Norman".to_owned()),
     }
 }
 
@@ -39,6 +40,12 @@ fn a_fetched_catalogue_is_written_at_once_and_read_back_next_run() {
     let next_run = load(Some(&store));
     assert_eq!(next_run, fetched);
     assert_eq!(next_run.position("KTLX"), Some(placed(35_333_340)));
+    assert_eq!(
+        next_run.place("KTLX"),
+        Some("Norman"),
+        "the place has to survive the cache too: this read is what a launch \
+         has before the first frame, and the fetch lands after it",
+    );
     assert!(
         next_run.contains("TPBI") && next_run.position("TPBI").is_none(),
         "the unplaced member has to survive: dropping it turns the union \

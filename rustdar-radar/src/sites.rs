@@ -204,6 +204,21 @@ pub struct RadarSite {
 }
 
 impl RadarSite {
+    /// What place this radar is at — `"Milwaukee"` for `KMKX` — or `None`
+    /// where nothing this process read has named it.
+    ///
+    /// Not a field: the name is not part of the row, for the reason
+    /// `SiteTable::places` gives, and is read from the process table this row
+    /// came from. A `RadarSite` built by hand outside a table answers for its
+    /// identifier, which is the question, or `None` when nothing has resolved.
+    ///
+    /// **A caller must handle `None` without drawing anything** — most rows
+    /// have no name on a fresh install, and a dangling `"KMKX — "` is worse
+    /// than a bare `"KMKX"`.
+    pub fn place(&self) -> Option<&'static str> {
+        table().place(self.name)
+    }
+
     /// This site's height on `datum`, feet MSL, or `None` if the row does not
     /// record that datum.
     ///
@@ -244,6 +259,11 @@ pub const UNKNOWN_SITE_NAME: &str = "UNKNOWN";
 /// they are [`unplaced`](Self::unplaced) — the only numbers available would be
 /// zeros, a marker in the Gulf of Guinea with the confidence of a real one.
 ///
+/// Where each radar *is* comes from the same three rungs. What **place** it is
+/// at comes from one source only — the fetched catalogue — and is kept beside
+/// the rows in `places` rather than in them, so a volume that
+/// wins the position does not take the name with it.
+///
 /// The rows are leaked on the way in, which is what lets every lookup hand out
 /// `&'static RadarSite`. The name index is built with the rows and travels
 /// with them, so the two cannot disagree about which radars exist.
@@ -259,6 +279,20 @@ pub struct SiteTable {
     /// claim, the only one a volume cannot have written and so the only one a
     /// volume can honestly be checked against.
     catalogued: HashMap<&'static str, (i32, i32)>,
+    /// What place the fetched catalogue says each radar it named is at.
+    ///
+    /// **Beside the rows rather than in them**, for the same two reasons
+    /// `catalogued` is: it is one source's claim rather than the adjudicated
+    /// answer, and the source that carries it is not the source that wins the
+    /// position. A radar this install has decoded a volume for is placed by
+    /// [`SiteFix::Learned`], which knows nothing about names; folding the name
+    /// into the row would mean the sites the user actually watches are the
+    /// ones that lose it.
+    ///
+    /// Sparse: an entry exists only for a radar some catalogue named. Absence
+    /// is the normal state for a fresh install and must read as "no name",
+    /// never as an empty one.
+    places: HashMap<&'static str, &'static str>,
 }
 
 impl SiteTable {
@@ -313,6 +347,20 @@ impl SiteTable {
                 crate::site_position::degrees_from_micro(lon_udeg),
             )
         })
+    }
+
+    /// What place `site` is at — `"Milwaukee"` for `KMKX` — or `None` where no
+    /// catalogue this process read has named it.
+    ///
+    /// Free text from the station record, which is a settlement, a metro pair
+    /// (`"Dallas/Ft Worth"`), a base (`"Andrews Air Force Base"`) or a region
+    /// (`"Western Arkansas"`). There is no separable state field to offer: the
+    /// few names that carry one carry it inside the string (`"Charleston,SC"`).
+    ///
+    /// Never `Some("")` — `catalogue::place_from_record` is the one rule that
+    /// decides, and it is applied before anything reaches here.
+    pub fn place(&self, site: &str) -> Option<&'static str> {
+        self.places.get(site).copied()
     }
 
     /// The row closest to `lat`/`lon`, with its distance in kilometres.
@@ -378,7 +426,7 @@ pub enum SiteFixRank {
 /// record about the radar rather than a report from it. A bucket listing says
 /// a radar exists and nothing more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SiteFix {
+pub enum SiteFix<'a> {
     /// What a volume this install decoded stated about itself. Carries the
     /// Volume Data Block's own fields, so it can speak to both height datums.
     Learned(SitePosition),
@@ -397,6 +445,21 @@ pub enum SiteFix {
         /// a WSR-88D; for a TDWR it agrees with the single height its volume
         /// states twice, which [`SiteHeights::FeedhornOnly`] reads as unsettled.
         elevation_m: i32,
+        /// What place the station record says this radar is at, or `None`
+        /// where it says nothing usable.
+        ///
+        /// **Borrowed, and the only reason this type has a lifetime.** The
+        /// catalogue is read from a cache on every launch and Android resolves
+        /// twice from one; owning the string here would copy ~200 names per
+        /// resolution and leaking it here would leak them. `extended` leaks
+        /// exactly the names that are new to the table and nothing else.
+        ///
+        /// It rides on the *position* fix and not on its own rung because it
+        /// comes off the same station record, and it is read out of the stream
+        /// **before** ranking for the reason `extended` gives: a name is not
+        /// a claim about where a radar is, so losing the ranking must not lose
+        /// the name.
+        place: Option<&'a str>,
     },
     /// The radar exists and nothing here knows where it is: the archive bucket
     /// lists an identifier `api.weather.gov` does not place (`TPBI`, `KCRI`).
@@ -405,7 +468,7 @@ pub enum SiteFix {
     Unplaced,
 }
 
-impl SiteFix {
+impl SiteFix<'_> {
     /// How much authority this claim carries. See [`SiteFixRank`].
     pub fn rank(&self) -> SiteFixRank {
         match self {
@@ -432,6 +495,10 @@ impl SiteFix {
     ///
     /// `Unplaced` produces no row at all, which is a different thing from a row
     /// with no elevation.
+    ///
+    /// The place a `Network` fix carries is deliberately **not** read here: a
+    /// row is what the winning fix says about where a radar is, and the name
+    /// is kept beside the rows instead — see [`SiteTable::place`].
     fn applied(&self, name: &'static str, known: Option<SiteHeights>) -> Option<RadarSite> {
         match *self {
             Self::Learned(position) => Some(position.applied_to_named(name, known)),
@@ -439,6 +506,7 @@ impl SiteFix {
                 lat_udeg,
                 lon_udeg,
                 elevation_m,
+                place: _,
             } => Some(RadarSite {
                 name,
                 network: RadarNetwork::of_id(name),
@@ -467,7 +535,7 @@ impl SiteFix {
 /// is leaked; a radar the base table already has keeps the name it had.
 pub fn build_table<'a, I>(fixes: I) -> &'static SiteTable
 where
-    I: IntoIterator<Item = (&'a str, SiteFix)>,
+    I: IntoIterator<Item = (&'a str, SiteFix<'a>)>,
 {
     extended(empty_table(), fixes).unwrap_or_else(empty_table)
 }
@@ -483,21 +551,33 @@ where
 /// `unplaced` in the same resolution that gives it a row.
 fn extended<'a, I>(base: &'static SiteTable, fixes: I) -> Option<&'static SiteTable>
 where
-    I: IntoIterator<Item = (&'a str, SiteFix)>,
+    I: IntoIterator<Item = (&'a str, SiteFix<'a>)>,
 {
     // The strongest claim per radar, decided before a row is built, so "a
     // fetched position never outranks a learned one" is a property of the input
     // rather than of the order two loops happened to run in.
-    let mut best: HashMap<&'a str, SiteFix> = HashMap::new();
+    let mut best: HashMap<&'a str, SiteFix<'a>> = HashMap::new();
     // Every catalogue claim in this resolution, recorded *before* ranking:
     // ranking is lossy on purpose, and the discarded half is what this keeps.
     let mut claimed: Vec<(&'a str, (i32, i32))> = Vec::new();
+    // And every name it carried, on the same terms and for a sharper reason:
+    // ranking discards the whole `Network` fix for any radar this install has
+    // decoded a volume for, and `Learned` has no name in it. Read after
+    // ranking, the sites a user actually watches would be the ones that lost
+    // their name.
+    let mut named: Vec<(&'a str, &'a str)> = Vec::new();
     for (name, fix) in fixes {
         if let SiteFix::Network {
-            lat_udeg, lon_udeg, ..
+            lat_udeg,
+            lon_udeg,
+            place,
+            ..
         } = fix
         {
             claimed.push((name, (lat_udeg, lon_udeg)));
+            if let Some(place) = place {
+                named.push((name, place));
+            }
         }
         match best.entry(name) {
             std::collections::hash_map::Entry::Vacant(slot) => {
@@ -533,7 +613,7 @@ where
 
     // Sorted, so a table resolved from the same inputs is the same table
     // whichever order a `HashMap` felt like iterating in.
-    let mut arrivals: Vec<(&'a str, SiteFix)> = best.into_iter().collect();
+    let mut arrivals: Vec<(&'a str, SiteFix<'a>)> = best.into_iter().collect();
     arrivals.sort_unstable_by_key(|(name, _)| *name);
 
     let mut unplaced: Vec<&'static str> = base.unplaced().to_vec();
@@ -567,6 +647,21 @@ where
         }
     }
 
+    // The names, on the same key and with one addition: the string is leaked
+    // only where it differs from the one already recorded. A catalogue re-read
+    // on every launch, and twice on Android, then leaks nothing at all.
+    let mut places = base.places.clone();
+    for (name, place) in named {
+        let Some(&name) = placed.get(name) else {
+            continue;
+        };
+        if places.get(name).copied() == Some(place) {
+            continue;
+        }
+        places.insert(name, Box::leak(place.to_owned().into_boxed_str()));
+        changed = true;
+    }
+
     if !changed {
         return None;
     }
@@ -579,6 +674,7 @@ where
         by_name,
         unplaced: Box::leak(unplaced.into_boxed_slice()),
         catalogued,
+        places,
     })))
 }
 
@@ -591,6 +687,7 @@ fn empty_table() -> &'static SiteTable {
             by_name: HashMap::new(),
             unplaced: &[],
             catalogued: HashMap::new(),
+            places: HashMap::new(),
         }))
     });
     *EMPTY
@@ -630,7 +727,7 @@ pub fn table() -> &'static SiteTable {
 /// index into [`radars()`] was never valid across a resolution.
 pub fn resolve<'a, I>(fixes: I) -> &'static SiteTable
 where
-    I: IntoIterator<Item = (&'a str, SiteFix)>,
+    I: IntoIterator<Item = (&'a str, SiteFix<'a>)>,
 {
     // The write lock is held across the read *and* the build. Reading,
     // extending and storing as three steps is a lost update: whichever of two
@@ -787,7 +884,7 @@ mod tests {
     // are deliberately synthetic and far from the real network.
 
     /// A WSR-88D-shaped volume report: two separately-stated heights.
-    fn learned(lat_udeg: i32, lon_udeg: i32, site_m: i32, tower_m: i32) -> SiteFix {
+    fn learned(lat_udeg: i32, lon_udeg: i32, site_m: i32, tower_m: i32) -> SiteFix<'static> {
         SiteFix::Learned(SitePosition {
             lat_udeg,
             lon_udeg,
@@ -798,17 +895,28 @@ mod tests {
 
     /// A TDWR-shaped volume report: `tower_height` byte-identical to
     /// `site_height`, which is how the two instruments are told apart.
-    fn learned_single_height(lat_udeg: i32, lon_udeg: i32, height_m: i32) -> SiteFix {
+    fn learned_single_height(lat_udeg: i32, lon_udeg: i32, height_m: i32) -> SiteFix<'static> {
         learned(lat_udeg, lon_udeg, height_m, height_m)
     }
 
     /// A published station record: a position and one elevation, on the
     /// ground for a WSR-88D identifier and on the feedhorn for a TDWR one.
-    fn network(lat_udeg: i32, lon_udeg: i32, elevation_m: i32) -> SiteFix {
+    fn network(lat_udeg: i32, lon_udeg: i32, elevation_m: i32) -> SiteFix<'static> {
         SiteFix::Network {
             lat_udeg,
             lon_udeg,
             elevation_m,
+            place: None,
+        }
+    }
+
+    /// The same record, with the station name it publishes.
+    fn network_named(lat_udeg: i32, lon_udeg: i32, elevation_m: i32, place: &str) -> SiteFix<'_> {
+        SiteFix::Network {
+            lat_udeg,
+            lon_udeg,
+            elevation_m,
+            place: Some(place),
         }
     }
 
@@ -1248,6 +1356,7 @@ mod tests {
             lat_udeg: -30_000_000,
             lon_udeg: -140_000_000,
             elevation_m: 1,
+            place: None,
         };
         let catalogued = extended(base, [("ZZZA", identical)])
             .expect("the first catalogue claim is something the table did not have");
@@ -1270,6 +1379,126 @@ mod tests {
         assert!(
             extended(catalogued, [("ZZZA", identical)]).is_none(),
             "and the same catalogue a second time — Android's case — builds nothing",
+        );
+    }
+
+    // -- places -------------------------------------------------------------
+    //
+    // Read through the table these tests built, never through
+    // `RadarSite::place`, which reads the process-wide table a unit-test binary
+    // deliberately never resolves. `site_precedence.rs` is where that spelling
+    // is exercised, against a table it resolved.
+
+    #[test]
+    fn the_catalogue_names_the_place_and_the_table_answers_with_it() {
+        let table = build_table([(
+            "ZZZA",
+            network_named(-30_000_000, -140_000_000, 1, "Sullivan"),
+        )]);
+
+        assert_eq!(table.place("ZZZA"), Some("Sullivan"));
+        assert_eq!(
+            table.get("ZZZA").expect("a placed row").name,
+            "ZZZA",
+            "the name field is still the identifier: the place sits beside it",
+        );
+    }
+
+    #[test]
+    fn a_radar_the_catalogue_did_not_name_has_no_place() {
+        let table = build_table([
+            ("ZZZA", learned(-30_000_000, -140_000_000, 100, 20)),
+            ("ZZZB", network(-31_000_000, -141_000_000, 1)),
+            ("ZZZC", SiteFix::Unplaced),
+        ]);
+
+        for (case, site) in [
+            (
+                "a volume knows where a radar is, never what it is called",
+                "ZZZA",
+            ),
+            (
+                "a station record that carries no name supplies none",
+                "ZZZB",
+            ),
+            ("and a bare membership carries nothing at all", "ZZZC"),
+        ] {
+            assert_eq!(table.place(site), None, "{case}");
+        }
+        assert_eq!(table.place("ZZZZ"), None, "nor does an unknown identifier");
+    }
+
+    /// The name has to survive the fix that carries it losing the ranking, and
+    /// the arrival order must not decide.
+    #[test]
+    fn a_learned_position_outranks_the_catalogue_without_taking_its_name() {
+        let volume = learned(-31_000_000, -141_000_000, 100, 20);
+        let record = network_named(-30_000_000, -140_000_000, 1, "Sullivan");
+
+        for (case, fixes) in [
+            ("the catalogue first", [("ZZZA", record), ("ZZZA", volume)]),
+            ("the volume first", [("ZZZA", volume), ("ZZZA", record)]),
+        ] {
+            let table = build_table(fixes);
+            assert_eq!(
+                table.get("ZZZA").expect("a row").lat,
+                -31.0,
+                "{case}: the control — the volume won the position",
+            );
+            assert_eq!(table.place("ZZZA"), Some("Sullivan"), "{case}");
+        }
+    }
+
+    #[test]
+    fn a_name_that_changed_rebuilds_and_a_name_that_did_not_reuses_the_table() {
+        let base = build_table([(
+            "ZZZA",
+            network_named(-30_000_000, -140_000_000, 1, "Sullivan"),
+        )]);
+
+        assert!(
+            extended(
+                base,
+                [(
+                    "ZZZA",
+                    network_named(-30_000_000, -140_000_000, 1, "Sullivan")
+                )]
+            )
+            .is_none(),
+            "the same catalogue again — every launch, and twice on Android — \
+             must not leak the same name a second time",
+        );
+
+        let renamed = extended(
+            base,
+            [(
+                "ZZZA",
+                network_named(-30_000_000, -140_000_000, 1, "Sullivan/Milwaukee"),
+            )],
+        )
+        .expect("a station the NWS renamed is a change, and the only one here");
+        assert_eq!(renamed.place("ZZZA"), Some("Sullivan/Milwaukee"));
+        assert_eq!(
+            renamed.get("ZZZA"),
+            base.get("ZZZA"),
+            "and the row it hangs off did not move",
+        );
+    }
+
+    #[test]
+    fn a_name_carries_forward_into_the_table_the_next_resolution_builds() {
+        let base = build_table([(
+            "ZZZA",
+            network_named(-30_000_000, -140_000_000, 1, "Sullivan"),
+        )]);
+
+        let table = extended(base, [("ZZZB", learned(1_000_000, 1_000_000, 100, 20))])
+            .expect("a radar the base table had never heard of");
+
+        assert_eq!(
+            table.place("ZZZA"),
+            Some("Sullivan"),
+            "a resolution about some other radar must not drop this one's name",
         );
     }
 
