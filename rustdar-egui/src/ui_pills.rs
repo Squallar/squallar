@@ -273,6 +273,10 @@ pub(super) struct SiteSections {
 /// star that was clicked, and a click on the row that is already current.
 pub(super) struct SiteListOutcome {
     pub picked: Option<String>,
+    /// The current site's own row was clicked. There is nothing to switch to,
+    /// so the caller closes the picker (W20). Deliberately **not** a refresh:
+    /// refresh lives in the menu, and this row must not grow a second meaning.
+    pub picked_current: bool,
     /// A star was clicked; the caller flips this identifier's favourite bit.
     pub toggled_favorite: Option<String>,
     /// **The inventory**: one entry per radar the filter kept, in the network
@@ -515,8 +519,12 @@ fn fold_site_row(
 ) {
     if star.clicked() {
         outcome.toggled_favorite = Some(name.to_owned());
-    } else if row.clicked() && !is_current {
-        outcome.picked = Some(name.to_owned());
+    } else if row.clicked() {
+        if is_current {
+            outcome.picked_current = true;
+        } else {
+            outcome.picked = Some(name.to_owned());
+        }
     }
 }
 
@@ -683,6 +691,7 @@ pub(super) fn site_list_ui(
 
     let mut outcome = SiteListOutcome {
         picked: None,
+        picked_current: false,
         toggled_favorite: None,
         #[cfg(test)]
         rows: Vec::new(),
@@ -973,6 +982,31 @@ impl super::Gui {
         }
     }
 
+    /// Give `search` the keyboard on the pass its surface opens, and on no
+    /// other.
+    ///
+    /// "Opens" is read off the pass counter rather than off any host's open
+    /// flag: the site search has two hosts and the catalog has two, and a rule
+    /// spelled per host is a rule that goes stale when a third arrives. A
+    /// field that did not draw on the previous pass is being drawn afresh, and
+    /// that is the definition here.
+    pub(super) fn focus_search_on_open(
+        &mut self,
+        ui: &egui::Ui,
+        field: super::state::SearchField,
+        search: &egui::Response,
+    ) {
+        let pass = ui.ctx().cumulative_pass_nr();
+        let opening = self
+            .search_focus_pass
+            .get(&field)
+            .is_none_or(|&last| last + 1 < pass);
+        self.search_focus_pass.insert(field, pass);
+        if opening {
+            search.request_focus();
+        }
+    }
+
     /// Ask for pane `idx` to show `view` the pickers' way: through the
     /// deferred applier, arming the cross-section draw when the pane has no
     /// line to show yet.
@@ -1251,6 +1285,7 @@ impl super::Gui {
                         .id_salt("pill_site_query")
                         .hint_text("Search radar sites"),
                 );
+                self.focus_search_on_open(ui, super::state::SearchField::SitePopover(idx), &search);
                 let query = self.site_query.clone();
                 let outcome = site_list_ui(ui, &query, current, self.catalogue_pending, &sections);
                 #[cfg(test)]
@@ -1264,8 +1299,6 @@ impl super::Gui {
                         site_rows: outcome.drawn.clone(),
                     });
                 }
-                #[cfg(not(test))]
-                let _ = search;
                 if let Some(site) = outcome.toggled_favorite {
                     self.toggle_favorite_site(&site);
                 }
@@ -1278,6 +1311,13 @@ impl super::Gui {
                         site: picked,
                         pane_idx: idx,
                     });
+                    ui.close_kind(egui::UiKind::Menu);
+                } else if outcome.picked_current {
+                    // The row is already the answer, so there is nothing to
+                    // switch to — but a highlighted row that swallows a click
+                    // and leaves the picker up reads as a dead control.
+                    // Dismissing is the honest response, and deliberately not
+                    // a refresh: refresh lives in the menu.
                     ui.close_kind(egui::UiKind::Menu);
                 }
             });
