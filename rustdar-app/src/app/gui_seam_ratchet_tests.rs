@@ -43,21 +43,62 @@ fn no_production_file_pushes_through_a_gui_setter() {
     }
 }
 
+/// The per-file coupling ceilings. **Permanent, and at their measured values.**
+///
+/// # These are not migration scaffolding
+///
+/// They were written as scaffolding and described themselves that way. **User
+/// ruling, 2026-08-21: "Keep them, I want loud failures if that contract is
+/// broken."** They are not deleted at campaign close or at any milestone. The
+/// contract is the one [`SELF_GUI`] names: the app layer does not grow its
+/// reach into the UI layer, and an attempt to is a **build failure**, not a
+/// review comment.
+///
+/// # What the numbers are, and what they are not
+///
+/// WO-E10.4 lowered every one to the count it measures, so **none of them has
+/// headroom**. The old message here said WO-E8 would drive them to 0 "when the
+/// radar root fields dissolve": E8 landed, the fields dissolved, and these did
+/// not reach 0. A ceiling that names a future that already happened is a
+/// prose-is-not-evidence defect sitting inside a gate, so it says what is true
+/// instead.
+///
+/// **They may only ever FALL.** The correct response to needing a new reach is
+/// **shed first, then land**. The two honest sheds are **loop-state
+/// addressing** and **the all-panes-versus-visible-panes distinction**, which
+/// has already produced one bug. If neither is reachable inside a change's
+/// charter, **stop and report** — never raise, and never re-spell the reads
+/// through a local binding, which makes this scrape read zero while the
+/// coupling is identical.
+///
+/// `app_chunks.rs` fell furthest here (18 to 13) because its ceiling had been
+/// carrying slack since WO-E2; the other three fell by one each.
 #[test]
 fn the_gui_coupling_only_ever_shrinks() {
+    // Presence control: the scrape reads real, current source. Without it every
+    // ceiling below is satisfied by four empty strings.
+    assert!(
+        collapsed(APP).contains(SELF_GUI_APPLY),
+        "control: app.rs no longer contains the seam call — the scrape is not \
+         reading the source these ceilings exist to measure",
+    );
     for (name, source, ceiling) in [
-        ("app.rs", APP, 38),
-        ("app_fetch.rs", APP_FETCH, 46),
-        ("app_render.rs", APP_RENDER, 109),
-        ("app_chunks.rs", APP_CHUNKS, 18),
+        ("app.rs", APP, 37),
+        ("app_fetch.rs", APP_FETCH, 45),
+        ("app_render.rs", APP_RENDER, 108),
+        ("app_chunks.rs", APP_CHUNKS, 13),
     ] {
         let n = collapsed(source).matches(SELF_GUI).count();
         assert!(
             n <= ceiling,
-            "{name}: {n} `{SELF_GUI}` occurrences > ceiling {ceiling}. This \
-             count only ratchets DOWN — lower the pin in the land that earns \
-             it; never raise. WO-E8 drives it to 0 when the radar root \
-             fields dissolve.",
+            "{name}: {n} `{SELF_GUI}` occurrences > ceiling {ceiling}. This is a \
+             PERMANENT contract sitting at its measured value, so there is no \
+             headroom: shed first, then land. The two honest sheds are \
+             loop-state addressing and the all-panes-versus-visible-panes \
+             distinction. Lower this in the land that earns it; never raise it \
+             without a written plan amendment, and never hide the reads behind \
+             a local binding - this scrape would read zero while the coupling \
+             is identical.",
         );
     }
 }

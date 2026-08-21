@@ -337,15 +337,17 @@ amendment**. Never hide a needle instead of shedding the coupling — the
 `let gui = &mut self.gui;` re-spelling is **forbidden by name**, because it
 makes the walker read zero while the coupling is identical.
 
-Values below are **current**, measured at the time of writing, not final
-targets.
+Values below are **final**, re-measured at WO-E10.4 (campaign close). Every one
+of them equals the count it measures, so **none has headroom** — which is what a
+ceiling is for once the migration that spent them down is over.
 
-### 6.1 `rustdar-app/tests/arch_ratchets.rs` — 8 tests
+### 6.1 `rustdar-app/tests/arch_ratchets.rs` — 9 tests
 
 | Test | Constant | Ceiling | What it counts |
 |---|---|---|---|
-| `the_app_pokes_gui_coupling_never_grows` | `SELF_GUI_MAX` | 185 | `self.gui.` anywhere in `rustdar-app` |
-| | `SELF_GUI_NON_TEST_MAX` | 180 | the same, outside test-named paths |
+| `the_app_pokes_gui_coupling_never_grows` | `SELF_GUI_MAX` | 184 | `self.gui.` anywhere in `rustdar-app` |
+| | `SELF_GUI_NON_TEST_MAX` | 179 | the same, outside test-named paths |
+| | — | 0 | `self.gui.set_` anywhere in `rustdar-app` — the target zero, held as a test rather than as a grep |
 | `the_config_swap_stays_deleted` | — | 0 | `load_pane_configs` / `save_pane_configs` / `loaded_configs`, with `serialize_pane_state` as the presence control |
 | `the_gui_setter_surface_never_grows` | `UI_SETTER_MAX` | 0 | `pub fn set_` in `rustdar-egui/src/ui.rs` |
 | | `GUI_IMPL_SETTER_MAX` | 1 | the same needle over **every** inherent `impl Gui` block in `rustdar-egui` |
@@ -355,12 +357,13 @@ targets.
 | `the_radar_geometry_type_is_defined_in_radar_and_not_in_egui` | — | 1 / 0 | `struct LoopGeometry` in radar / in egui |
 | `the_loop_frame_arms_stay_radars_own_vocabulary` | `LOOP_FRAME_ARMS_MAX` | 8 | the loop frame's closed arms and their two cache aliases |
 | | `LOOP_FRAME_ARMS_NON_TEST_MAX` | 2 | the same, outside tests |
+| `the_ingest_phase_has_exactly_one_production_caller` | `INGEST_CALLERS_NON_TEST` | 1 | `self.poll_data_channels(` outside test paths — the frame pump's `Ingest` phase, whose once-per-frame property WO-M13b measured and registered as unpinned |
 
 Run it by target name — a filter matching zero tests is a failed run, not a
 pass:
 
 ```bash
-cargo test -p rustdar-app --test arch_ratchets   # 8/8
+cargo test -p rustdar-app --test arch_ratchets   # 9/9
 ```
 
 ### 6.2 `rustdar-app/src/app/gui_seam_ratchet_tests.rs` — the per-file coupling ceilings
@@ -368,16 +371,18 @@ cargo test -p rustdar-app --test arch_ratchets   # 8/8
 | Test | File | Ceiling |
 |---|---|---|
 | `no_production_file_pushes_through_a_gui_setter` | `app.rs`, `app_fetch.rs`, `app_render.rs`, `app_chunks.rs` | 0 `self.gui.set_` each |
-| `the_gui_coupling_only_ever_shrinks` | `app.rs` | 38 |
-| | `app_fetch.rs` | 46 |
-| | `app_render.rs` | 109 |
-| | `app_chunks.rs` | 18 |
+| `the_gui_coupling_only_ever_shrinks` | `app.rs` | 37 |
+| | `app_fetch.rs` | 45 |
+| | `app_render.rs` | 108 |
+| | `app_chunks.rs` | 13 |
 
 Both scrapes are **whitespace-collapsed**, so a call wrapped across lines counts
 exactly like one that is not, and a comment containing the needle counts too.
-`no_production_file_pushes_through_a_gui_setter` carries a presence control
-(`self.gui.apply` must still be found in `app.rs`) so the scrape cannot pass by
-reading nothing.
+**Both** tests carry the same presence control (`self.gui.apply` must still be
+found in `app.rs`) so neither can pass by reading nothing —
+`the_gui_coupling_only_ever_shrinks` gained it at WO-E10.4, when its ceilings
+came down to their measured values and four empty strings would otherwise have
+satisfied all four.
 
 ### 6.3 These ceilings are permanent
 
@@ -386,10 +391,12 @@ They are not deleted at any milestone. The contract they state is: **the app
 layer does not grow its reach into the UI layer, and an attempt to is a build
 failure, not a review comment.** They may only ever **fall**.
 
-Three of them sit at or near their measured value, which is deliberate: under a
-permanent ceiling the correct response to needing a new reach is **shed first,
-then land** — not "ask whether the ceiling should move". The two honest sheds
-are:
+**Since WO-E10.4 every one of them sits exactly on its measured value**, so none
+has headroom: under a permanent ceiling the correct response to needing a new
+reach is **shed first, then land** — not "ask whether the ceiling should move".
+(Before that land they each carried one spare slot, and "three ratchets at zero
+headroom" was a paraphrase that was never true; the ceilings are the record, not
+the paraphrase.) The two honest sheds are:
 
 * **loop-state addressing** — the vocabulary by which the app reaches loop state
   held on the `Gui`; and
@@ -429,6 +436,38 @@ raise, and do not re-spell.
   `rustdar-egui`, `rustdar-overlays`, `rustdar-app` and `rustdar-volumetric`
   (non-test sources) for unregistered non-ASCII characters. Check it whenever a
   user-visible string changes: either spell it in ASCII or register the glyph.
+
+### 6.5 Recorded measurements — information, never assertions
+
+**`cfg(target_arch = "wasm32")` lines per crate.** A count-based ceiling on
+these was **rejected by user ruling** ("ratchets for things like this seem super
+sketchy and inappropriate for the rust ecosystem"), and nothing in the tree
+asserts these numbers. They are recorded because the *shape* of the number is
+worth watching by eye, not because a number is a contract.
+
+The rule that does bind is qualitative and lives here and in review: **a `cfg`
+may select a value, a dependency or a type alias. It may never fork behaviour
+inside a function body.** Two arms of one function that do different things are
+two untested programs; a `cfg` that picks a constant or an implementation is one
+program with a platform-appropriate part.
+
+Measured at WO-E10.4 (matching lines, per crate, `target`/`pkg` excluded):
+
+| crate | lines | | crate | lines |
+|---|---:|---|---|---:|
+| `rustdar-device-profile` | 70 | | `rustdar-overlays` | 21 |
+| `rustdar-radar` | 44 | | `rustdar-gpu` | 18 |
+| `rustdar-app` | 41 | | `rustdar-location` | 17 |
+| `rustdar-egui` | 39 | | `rustdar-source` | 17 |
+| `rustdar-worker` | 26 | | `rustdar-web` | 14 |
+| | | | `rustdar-volumetric` | 12 |
+| | | | `rustdar-geo`, `rustdar-kv`, `rustdar-nmea-serial` | 1 each |
+
+**Total 322 across 14 crates.** The plan's older baseline (`165/54/40/30/25,
+Σ314`) is **not comparable** and should not be read as a rise of 8: it was taken
+over five pre-reshape crates, and the Phase-3R/3F dissolution re-partitioned that
+same code across fourteen. Comparing them would be a figure without its
+denominator.
 
 ---
 

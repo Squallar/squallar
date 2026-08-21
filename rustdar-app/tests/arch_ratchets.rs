@@ -15,40 +15,50 @@
 //! root; the walker skips dirs named `target`/`pkg` and never leaves the
 //! workspace.
 //!
-//! Baseline RE-MEASURED 2026-08-19 at main @ b85bfa2d, on the tree left by the
-//! comment pass `be5b203a`..`ee8bcc7c` (443 files, 99,212 deletions measured
-//! `0e45ccb5`..`ee8bcc7c`). Every needle is counted in comments as in code,
-//! so a pass that deletes prose lowers these counts without changing one line
-//! of behaviour. The ceilings move down with them: the land that earns a lower
-//! count takes it, and this land earned two. The `was` column is the
-//! 2026-08-18 reading at main @ 854f4a64, kept so the size of the prose's
-//! share stays visible.
+//! # FINAL values, re-measured at WO-E10.4 (campaign close)
+//!
+//! Every ceiling below now equals the count it measures. **None of them has
+//! headroom, and that is the point**: the campaign is over, so a ceiling is no
+//! longer a budget a migration spends down — it is the line the architecture
+//! sits on. The response to needing one more occurrence is to shed one first,
+//! or to stop and report. The `was` column is the pre-E10.4 literal, kept so it
+//! stays visible that every move was DOWN.
 //!
 //! ```text
 //!  #   metric                                        value  was  command (run from the workspace root)
-//!  1a  App-pokes-Gui occurrences, rustdar-app          185  191  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' | wc -l
-//!  1b  ... excluding test-named paths                  180  186  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' -g '!*tests*' | wc -l
-//!  2   Gui setter fns in rustdar-egui/src/ui.rs          3    3  rg -o 'pub fn ''set_' rustdar-egui/src/ui.rs | wc -l
-//!  3   wasm-cfg lines per crate  [NOT ASSERTED]          -    -  rg -c 'target_arch = "wasm''32"' "$c" --glob '*.rs'
-//!  4a  product-enum occurrences in rustdar-egui        440  444  rg -o 'Radar''Product' rustdar-egui --glob '*.rs' | wc -l
-//!  4b  ... files containing it (info)                   29   29  rg -l 'Radar''Product' rustdar-egui --glob '*.rs' | wc -l
-//!  6   ChannelHub receiver fields                       18   18  rg -o '_receiver: ''Receiver<' rustdar-app/src/channels.rs | wc -l
+//!  1a  App-pokes-Gui occurrences, rustdar-app          184  185  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' | wc -l
+//!  1b  ... excluding test-named paths                  179  180  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' -g '!*tests*' | wc -l
+//!  1c  ... that are setter pushes  [TARGET 0, HELD]      0    -  rg -o 'self\.''gui\.''set_' rustdar-app --glob '*.rs' | wc -l
+//!  2a  Gui setter fns in rustdar-egui/src/ui.rs          0    0  rg -o 'pub fn ''set_' rustdar-egui/src/ui.rs | wc -l
+//!  2b  ... over every inherent `impl Gui` block          1    1  see GUI_IMPL_SETTER_MAX — the walk, not a one-file grep
+//!  3   wasm-cfg lines per crate  [NOT ASSERTED]          -    -  recorded in ARCHITECTURE.md §6.5, by user ruling
+//!  4a  product-enum occurrences in rustdar-egui          0    0  rg -o 'Radar''Product' rustdar-egui --glob '*.rs' | wc -l
+//!  4b  ... files containing it (info)                    0    -  rg -l 'Radar''Product' rustdar-egui --glob '*.rs' | wc -l
+//!  6   ChannelHub receiver fields                       17   17  rg -o '_receiver: ''Receiver<' rustdar-app/src/channels.rs | wc -l
 //!  7a  overlays-crate path occurrences in offload.rs     0    0  rg -o 'rustdar_''overlays::' rustdar-worker/src/offload.rs | wc -l
 //!  7b  radar-crate path occurrences in offload.rs        0    0  rg -o 'rustdar_''radar::' rustdar-worker/src/offload.rs | wc -l
-//!  8   config-swap occurrences, six crates                0    -  rg -o 'load_pane''_configs|save_pane''_configs|loaded_''configs' rustdar-{overlays,egui,app,radar,source,worker} --glob '*.rs' | wc -l
-//!  9a  radar-geometry definitions in rustdar-radar        1    -  rg -o 'struct Loop''Geometry' rustdar-radar --glob '*.rs' | wc -l
-//!  9b  ... in rustdar-egui                                 0    1  rg -o 'struct Loop''Geometry' rustdar-egui --glob '*.rs' | wc -l
-//! 10a loop-frame-arm occurrences, rustdar-app             8   17  rg -o 'Loop''FrameData|L3Frame''Key|Cached''Volume' rustdar-app --glob '*.rs' | wc -l
-//! 10b ... excluding test-named paths                      2    6  rg -o 'Loop''FrameData|L3Frame''Key|Cached''Volume' rustdar-app --glob '*.rs' -g '!*tests*' | wc -l
+//!  8   config-swap occurrences, six crates               0    0  rg -o 'load_pane''_configs|save_pane''_configs|loaded_''configs' rustdar-{overlays,egui,app,radar,source,worker} --glob '*.rs' | wc -l
+//!  9a  radar-geometry definitions in rustdar-radar       1    1  rg -o 'struct Loop''Geometry' rustdar-radar --glob '*.rs' | wc -l
+//!  9b  ... in rustdar-egui                               0    0  rg -o 'struct Loop''Geometry' rustdar-egui --glob '*.rs' | wc -l
+//! 10a  loop-frame-arm occurrences, rustdar-app           8    8  rg -o 'Loop''FrameData|L3Frame''Key|Cached''Volume' rustdar-app --glob '*.rs' | wc -l
+//! 10b  ... excluding test-named paths                    2    2  rg -o 'Loop''FrameData|L3Frame''Key|Cached''Volume' rustdar-app --glob '*.rs' -g '!*tests*' | wc -l
+//! 11   Ingest-phase callers outside test paths           1    -  rg -o 'self\.poll_data''_channels(' rustdar-app --glob '*.rs' -g '!*tests*' | wc -l
 //! ```
 //!
-//! Rows 1b, 2, 6, 7a and 7b were already pinned at their measured values and do
-//! not move: the comment pass left no prose mention of those needles to delete.
-//! Row 4a reads 440 rather than the pass's 438 because WO-E6a's two accessor
-//! signatures land in this crate — see the note on the const itself.
+//! **Read the commands as documentation, not as the gate.** The gate is the
+//! test below it in every case, because a command in a comment cannot fail. The
+//! two differ in one way worth knowing: this file is excluded from its own walk,
+//! so the ripgrep figures include occurrences here that the tests do not count.
+//!
+//! Rows 1a/1b and the four per-file ceilings in
+//! `rustdar-app/src/app/gui_seam_ratchet_tests.rs` are a **standing contract by
+//! user ruling** and survive the campaign — see [`SELF_GUI_MAX`].
 //!
 //! Row 3 is recorded, not asserted, by user ruling: no count ratchets on style
-//! metrics. Row 5 (the overlay-kind enum) is retired — the enum is gone, and
+//! metrics. The qualitative rule — a cfg may select a value, a dependency or a
+//! type alias, and may never fork behaviour inside a function body — lives in
+//! ARCHITECTURE.md and in review. Row 5 (the overlay-kind enum) is retired: the
+//! enum is gone, and
 //! `rustdar_overlays::render::overlay_state::overlay_kind_stays_deleted_tests`
 //! holds its absence.
 
@@ -62,6 +72,8 @@ const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
 // Needles — split literals so this file never contains what it counts.
 
 const SELF_GUI: &str = concat!("self.", "gui.");
+/// Row 1c — the setter push through that coupling. Target 0, held as a test.
+const SELF_GUI_SET: &str = concat!("self.", "gui.", "set_");
 const PUB_FN_SET: &str = concat!("pub fn ", "set_");
 const PRODUCT_ENUM: &str = concat!("Radar", "Product");
 const RECEIVER_FIELD: &str = concat!("_receiver: ", "Receiver<");
@@ -120,10 +132,47 @@ const LOOP_MANAGER_DEF: &str = concat!("struct LoopDownload", "Manager");
 // --------------------------------------------------------------------------- Ceilings
 // — at-land measurements (see the table above).
 
-/// Row 1a.
-const SELF_GUI_MAX: usize = 185;
+/// Row 1a — the App-pokes-Gui coupling, crate-wide.
+///
+/// # This ceiling is PERMANENT. It is not migration scaffolding.
+///
+/// It was written as scaffolding and this doc used to read that way. **User
+/// ruling, 2026-08-21: "Keep them, I want loud failures if that contract is
+/// broken."** It is not deleted at campaign close, or at any milestone. A
+/// permanent gate whose own documentation calls itself temporary is a defect
+/// inside the gate, which is why these words replaced the old ones.
+///
+/// **The contract**: the app layer does not grow its reach into the UI layer.
+/// An attempt to is a **build failure**, not a review comment.
+///
+/// **It may only ever FALL.** Lower it in the land that earns it; never raise
+/// it without a written plan amendment. WO-E10.4 lowered it to the measured
+/// value, so there is **no headroom**: the correct response to needing a new
+/// reach is **shed first, then land** — never "ask whether the ceiling should
+/// move". If no shed is reachable inside a change's charter, **stop and
+/// report**.
+///
+/// **The two honest sheds**, named so nobody has to rediscover them:
+///
+/// * **loop-state addressing** — the vocabulary by which the app reaches loop
+///   state held on the `Gui`; and
+/// * **the all-panes-versus-visible-panes distinction**, which has already
+///   produced one bug.
+///
+/// **Forbidden by name, because it works and it is a lie**: re-spelling the
+/// reads through one `let gui = &mut self` + `.gui;` binding. The walker then
+/// counts zero while the coupling is identical. It is the same move refused as
+/// a glob re-export and as a re-export route earlier in this campaign; under a
+/// **permanent** ceiling it is worse than dishonest bookkeeping, because it is
+/// the mechanism by which a permanent contract silently stops binding.
+const SELF_GUI_MAX: usize = 184;
 /// Row 1b — the same needle outside test-named paths.
-const SELF_GUI_NON_TEST_MAX: usize = 180;
+///
+/// Everything on [`SELF_GUI_MAX`] applies here: permanent, falls only, no
+/// headroom, same two sheds, same forbidden re-spelling. This row is the one
+/// that matters for behaviour — the other counts the suites that exercise the
+/// coupling as well, and a suite is allowed to name what it tests.
+const SELF_GUI_NON_TEST_MAX: usize = 179;
 /// Row 2a — **`ui.rs`'s own `impl Gui` block, and only that file**.
 ///
 /// **0 since WO-E8b**, which is where the plan said it would land. The last
@@ -241,6 +290,28 @@ const PRODUCT_IN_EGUI_MAX: usize = 0;
 /// listing arrives on the one source path now — so the hub holds one pair
 /// fewer. Lowered in the land that earned it, never raised.
 const HUB_RECEIVER_MAX: usize = 17;
+
+/// Row 11 — the frame pump's `Ingest` phase has exactly ONE production caller.
+///
+/// WO-M13b measured this and deliberately did **not** pin it, registering the
+/// gap instead: `poll_data_channels` runs the pump's `Ingest` phase and
+/// `handle_redraw` is its only production caller, so every hub receiver is
+/// drained once per frame. `the_chunk_drain_runs_before_the_frame_is_laid_out`
+/// holds *where* in the frame it sits; nothing held *how many times*.
+///
+/// A second production caller would drain each receiver twice per frame. That
+/// is not a crash — it is arrivals landing in a half-built frame, which is the
+/// shape of defect that reads green everywhere and shows up as a stale pane.
+///
+/// **1, measured, and the needle is proven live** by the two suites that scrape
+/// the same string for the ordering pin. Test-side calls are excluded: a suite
+/// driving the phase directly is exactly how the arrival paths are tested.
+const INGEST_CALLERS_NON_TEST: usize = 1;
+/// The presence control for row 11: the phase function itself must still be
+/// defined in the walked crate, or the count above is counting nothing.
+const INGEST_DEF: &str = concat!("fn poll_data", "_channels(");
+/// Row 11's needle — the call, not the definition.
+const INGEST_CALL: &str = concat!("self.poll_data", "_channels(");
 
 /// Row 10a — **8 since WO-M12d, down from 17, and this ceiling records a real
 /// remainder rather than pretending it is gone.**
@@ -431,15 +502,32 @@ fn the_app_pokes_gui_coupling_never_grows() {
     assert!(
         total <= SELF_GUI_MAX,
         "the App-pokes-Gui coupling grew: {total} occurrences > ceiling {SELF_GUI_MAX}. \
-         WO-E2/WO-E8 drive this to 0 via GuiEvent. Lower the MAX in the land that \
-         earns it; never raise it without a written plan amendment."
+         This is a PERMANENT contract with no headroom, not migration scaffolding: \
+         shed first, then land. The two honest sheds are loop-state addressing and \
+         the all-panes-versus-visible-panes distinction; if neither is reachable \
+         inside your charter, stop and report. Never raise this without a written \
+         plan amendment, and never re-spell the reads through a local binding - \
+         that makes this walk read zero while the coupling is identical."
     );
     assert!(
         non_test <= SELF_GUI_NON_TEST_MAX,
         "the App-pokes-Gui coupling grew outside tests: {non_test} occurrences > \
-         ceiling {SELF_GUI_NON_TEST_MAX}. WO-E2/WO-E8 drive this to 0 via GuiEvent. \
-         Lower the MAX in the land that earns it; never raise it without a written \
-         plan amendment."
+         ceiling {SELF_GUI_NON_TEST_MAX}. Same permanent contract, same two sheds, \
+         same refusal to raise or re-spell - see the constant's own doc."
+    );
+
+    // The target-zero half, held as a TEST rather than as a grep in a log: the
+    // app never pushes UI state through a setter, ANYWHERE in the crate. The
+    // per-file scrape in `app/gui_seam_ratchet_tests.rs` covers four files
+    // whitespace-collapsed; this covers all of them, plainly.
+    let setters = count(&files, SELF_GUI_SET);
+    assert_eq!(
+        setters, 0,
+        "rustdar-app pushes UI state through {setters} Gui setter call(s). \
+         WO-E2 replaced the setter push with Gui::apply for event-shaped state \
+         and Gui::apply_frame_inputs for frame-composed state, and WO-E8b took \
+         the last one; route the new push through the seam. This is a 0 and \
+         stays a 0.",
     );
 }
 
@@ -765,5 +853,31 @@ fn the_loop_frame_arms_stay_radars_own_vocabulary() {
         "the loop-frame vocabulary shared with rustdar-app grew: {total} \
          occurrences > ceiling {LOOP_FRAME_ARMS_MAX}. Lower this in the land \
          that sheds one; never raise it.",
+    );
+}
+
+/// Row 11 — the `Ingest` phase runs once a frame because one place calls it.
+#[test]
+fn the_ingest_phase_has_exactly_one_production_caller() {
+    let crate_root = Path::new(ROOT).join("rustdar-app");
+    let files = load_tree(&crate_root);
+
+    // Presence control: the phase function is still here, in the walked set.
+    assert_anchored(&files, "src/app.rs", INGEST_DEF);
+
+    let non_test: usize = files
+        .iter()
+        .filter(|(p, _)| !in_test_path(p, &crate_root))
+        .map(|(_, t)| t.matches(INGEST_CALL).count())
+        .sum();
+
+    assert_eq!(
+        non_test, INGEST_CALLERS_NON_TEST,
+        "the pump's Ingest phase has {non_test} production caller(s), not \
+         {INGEST_CALLERS_NON_TEST}. Two callers drain every hub receiver twice \
+         per frame, so an arrival lands in a half-built frame - a defect that \
+         reads green everywhere and shows as a stale pane. If a second call \
+         site is genuinely wanted, it is a frame-pump change and this pin is \
+         where it gets argued.",
     );
 }

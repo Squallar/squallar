@@ -110,6 +110,43 @@ fn the_dependency_ceiling_holds() {
     );
 }
 
+/// **Neither layer crate declares a GUI dependency, of any kind.**
+///
+/// The rule is older than this test and was held only by reading the manifests:
+/// `rustdar-overlays` and `rustdar-source` are contract, vocabulary and
+/// behaviour, and nothing in them may name the toolkit. `rustdar-source`'s
+/// charter ceiling above is an allowlist and already refuses it; overlays had
+/// no ceiling at all, so this is where the rule becomes a test instead of a
+/// grep somebody once ran. WO-E10.4.
+///
+/// The floor is the falsifiability half: both crates must declare *something*,
+/// or "declares no egui" is true of an empty list.
+#[test]
+fn no_layer_crate_declares_a_gui_dependency() {
+    const GUI_CRATES: &[&str] = &["egui", "eframe", "epaint", "emath", "egui-winit"];
+    let meta = metadata();
+    for package in ["rustdar-overlays", "rustdar-source"] {
+        let deps = declared_deps(&meta, package);
+        assert!(
+            !deps.is_empty(),
+            "{package} declares no dependencies at all, so every absence below \
+             is the reader's and not the manifest's",
+        );
+        let gui: Vec<_> = deps
+            .iter()
+            .filter(|(_, name)| GUI_CRATES.contains(&name.as_str()))
+            .collect();
+        assert!(
+            gui.is_empty(),
+            "{package} declares {gui:?}. These crates are the layer contract \
+             and the vocabulary under it; a handler that can name the toolkit \
+             can draw, and then the seam is no longer the only way in. \
+             Anything genuinely shared belongs on the trait or in \
+             rustdar-source's own types.",
+        );
+    }
+}
+
 /// rustdar-overlays declares NO dependency on rustdar-radar, of any kind. The
 /// second half is the presence control that keeps the first falsifiable.
 #[test]
