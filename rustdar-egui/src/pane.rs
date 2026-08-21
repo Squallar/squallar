@@ -51,6 +51,88 @@ pub const NO_VOLUME_LAYER: &str = "No layer in this pane can build a 3D volume."
 
 pub type PaneId = usize;
 
+/// **Which link group a pane belongs to.** The identity the three per-pane
+/// link booleans never had: they said *whether* a pane synced, never *with
+/// whom*, so an app with six panes carried eighteen hidden bits and no way to
+/// answer "what is linked to what".
+///
+/// A group is named by a letter wherever it is shown and stored as the index
+/// behind that letter. There are never more groups than panes, so
+/// [`MAX_PANES_DESKTOP`] bounds the alphabet at `A..=F`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GroupId(u8);
+
+impl GroupId {
+    /// The group every fresh pane starts in, and the one every pane of a
+    /// config written before groups existed lands in — which is what makes
+    /// the migration exact: one group holding everybody is precisely the
+    /// model the three booleans described.
+    pub const FIRST: Self = Self(0);
+
+    /// Every group a layout can express, in letter order.
+    pub fn all() -> impl Iterator<Item = Self> {
+        (0..Self::COUNT).map(Self)
+    }
+
+    /// How many distinct groups exist — one per pane a layout can hold.
+    pub const COUNT: u8 = MAX_PANES_DESKTOP as u8;
+
+    /// The group at `index`, or `None` for an index no layout can reach.
+    /// The read side of the wire format: a file naming a group this build
+    /// has no letter for is a file from a build with more panes.
+    pub fn from_index(index: u8) -> Option<Self> {
+        (index < Self::COUNT).then_some(Self(index))
+    }
+
+    /// This group's index — what is persisted.
+    pub fn index(self) -> u8 {
+        self.0
+    }
+
+    /// The letter this group is named by, on the pill, on the border and in
+    /// the sync section. One spelling, derived, so the three cannot drift.
+    pub fn letter(self) -> char {
+        char::from(b'A' + self.0)
+    }
+
+    /// **This group's accent, the same in both OS themes.** The pane border
+    /// paints it, the sync section's group row tints its letter with it, and
+    /// the two are the same function so they cannot disagree.
+    ///
+    /// Deliberately not read off `Visuals`: the accent sits on map tiles,
+    /// whose brightness has nothing to do with the app theme, so a
+    /// theme-derived colour would be picked against the wrong background half
+    /// the time. It is drawn over its own dark backing instead — see
+    /// `ui_map::draw_pane_border` — which is what makes one palette legible
+    /// on both. The hues are spaced around the wheel and no two are a
+    /// red/green pair.
+    pub fn accent(self) -> egui::Color32 {
+        const ACCENTS: [egui::Color32; GroupId::COUNT as usize] = [
+            egui::Color32::from_rgb(56, 189, 248),  // A - sky
+            egui::Color32::from_rgb(251, 146, 60),  // B - orange
+            egui::Color32::from_rgb(163, 230, 53),  // C - lime
+            egui::Color32::from_rgb(192, 132, 252), // D - violet
+            egui::Color32::from_rgb(244, 114, 182), // E - pink
+            egui::Color32::from_rgb(45, 212, 191),  // F - teal
+        ];
+        ACCENTS[self.0 as usize]
+    }
+
+    /// What reads against [`Self::accent`] — black or white, whichever the
+    /// accent's own luminance calls for, so the letter on the border tab is
+    /// legible without asking the theme.
+    pub fn accent_ink(self) -> egui::Color32 {
+        let c = self.accent();
+        let luma =
+            0.2126 * f32::from(c.r()) + 0.7152 * f32::from(c.g()) + 0.0722 * f32::from(c.b());
+        if luma > 140.0 {
+            egui::Color32::BLACK
+        } else {
+            egui::Color32::WHITE
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RadarImageData {
     pub texture: egui::TextureHandle,
@@ -719,8 +801,20 @@ pub struct PaneState {
     /// site. Folding the two would stop the chunk feed the moment a loop
     /// played, which is a behaviour change, not a simplification.
     pub viewing_live: bool,
+    /// **Which group this pane's three links are scoped to** — `None` for a
+    /// pane that belongs to no group and so syncs with nobody, whatever its
+    /// flags say. Persisted; default [`GroupId::FIRST`], which is what makes
+    /// a pre-group config load unchanged: one group holding every pane is the
+    /// model the flags alone described.
+    ///
+    /// The flags are kept beside it rather than folded into it because a pure
+    /// group model cannot say "in this group, but keeping my own clock" — the
+    /// partial membership the border paints as a dashed accent.
+    pub group: Option<GroupId>,
     /// Whether this pane follows shared time (plan §3.7). Persisted; default
     /// **true** — every pane before the field existed behaved as linked.
+    /// Scoped to [`Self::group`]: on, but in no group, still syncs with
+    /// nobody.
     pub time_link: bool,
     /// Whether this pane's viewport belongs to the linked group. Persisted;
     /// default **true**.
@@ -1281,6 +1375,7 @@ impl PaneState {
             selected_product: radar_fields::known::REFLECTIVITY,
             selected_elevation: 0.0,
             viewing_live: true,
+            group: Some(GroupId::FIRST),
             time_link: true,
             viewport_link: true,
             layer_link: true,
@@ -1339,6 +1434,27 @@ impl PaneState {
     /// [`Gui::sync_viewports`](crate::Gui) moves together, at **both** ends.
     pub fn shares_viewport(&self) -> bool {
         self.is_map()
+    }
+
+    /// Whether these two panes are in the same group. Two panes with no group
+    /// are **not** in the same group: `None` means "with nobody", not "with
+    /// the other loners".
+    pub fn in_group_with(&self, other: &Self) -> bool {
+        matches!((self.group, other.group), (Some(a), Some(b)) if a == b)
+    }
+
+    /// Whether every link this pane can offer is on — the pill's one-bit
+    /// reading, said once so the pill, the border and the section agree.
+    /// A pane that shows no map is not asked about the viewport.
+    pub fn fully_linked(&self) -> bool {
+        (!self.shares_viewport() || self.viewport_link) && self.layer_link && self.time_link
+    }
+
+    /// **In a group, and opted out of at least one of its dimensions.** The
+    /// state the border marks differently from a full member, because it is
+    /// the one a group letter alone would misdescribe.
+    pub fn partial_member(&self) -> bool {
+        self.group.is_some() && !self.fully_linked()
     }
 
     /// Whether this pane draws the map layers at all — the Layers panel's gate,
