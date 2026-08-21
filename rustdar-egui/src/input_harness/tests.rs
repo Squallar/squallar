@@ -3721,15 +3721,46 @@ fn a_stack_row_click_opens_that_layers_options_in_the_inspector() {
         "the selected layer's row must draw selected"
     );
 
-    h.mouse_click(inspector.deselect.center());
+    // The crumb is the way back up, one level per segment — what the deleted
+    // \u{d7}-deselect used to do in one jump, now spelled where it reads.
+    let (text, seg) = inspector
+        .crumb_links
+        .first()
+        .cloned()
+        .expect("the layer body's crumb must offer its Pane N segment");
+    assert_eq!(text, "Pane 1", "the crumb's link segment names the pane");
+    h.mouse_click(seg.center());
     h.warm_up();
     let inspector = h.inspector();
-    assert!(inspector.open, "deselecting must not close the inspector");
+    assert!(inspector.open, "navigating must not close the inspector");
+    assert_eq!(
+        inspector.mode,
+        Some(crate::ui::InspectorSelection::PaneProps),
+        "the layer body's Pane N segment must go one level up, to the pane's properties"
+    );
+
+    let (_, seg) = inspector
+        .crumb_links
+        .first()
+        .cloned()
+        .expect("the pane-props body's crumb must offer its Pane N segment too");
+    h.mouse_click(seg.center());
+    h.warm_up();
+    let inspector = h.inspector();
+    assert!(inspector.open, "navigating must not close the inspector");
     assert_eq!(
         inspector.mode,
         Some(crate::ui::InspectorSelection::AppSettings),
-        "\u{2715} must return to App \u{203a} Settings"
+        "the pane-props body's Pane N segment must reach the root, App \u{203a} Settings"
     );
+    assert!(
+        inspector.crumb_links.is_empty(),
+        "App \u{203a} Settings is the root: it has nowhere to navigate to"
+    );
+
+    h.mouse_click(inspector.close.center());
+    h.warm_up();
+    assert!(!h.inspector().open, "\u{d7} must close the inspector");
 }
 
 /// 90. **The ⚙ toggle and the menu's Settings… entry both reach the settings
@@ -11300,8 +11331,12 @@ fn the_transport_outer_width_is_the_stated_formula() {
 
 /// **The sheet host draws no duplicate headers** (M7's sheet-header polish): the
 /// sheet's title row is the single header — the stack's own header row and ⟨ do not
-/// render there, the inspector's crumb keeps its ✕-deselect (selection, not
-/// navigation) but drops its ⟩ — while the wider hosts keep all of it.
+/// render there — while the wider hosts keep all of it.
+///
+/// The inspector's × is the exception, and deliberately so: it is the panel's
+/// one close, and the host that suppressed it left the crumb's *other* × — a
+/// deselect — as the only × in the body, forty points under the sheet's real
+/// one. With one honest close there is nothing to suppress.
 #[test]
 fn the_sheet_host_draws_no_duplicate_headers() {
     let mut h = phone();
@@ -11328,15 +11363,15 @@ fn the_sheet_host_draws_no_duplicate_headers() {
 
     h.open_layer_in_inspector(&known::NWS_ALERTS);
     let insp = h.inspector();
-    assert_eq!(
-        insp.collapse,
-        egui::Rect::NOTHING,
-        "the ⟩ collapse is the back-chain's job in the sheet"
+    assert!(
+        insp.close.is_positive(),
+        "the crumb's × draws in the sheet too: it is the inspector's one close"
     );
-    assert_ne!(
-        insp.deselect,
-        egui::Rect::NOTHING,
-        "the crumb's ✕-deselect stays: it is selection, not navigation"
+    h.mouse_click(insp.close.center());
+    h.warm_up();
+    assert!(
+        !h.inspector().open,
+        "and it closes the inspector from the sheet host"
     );
 
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -11344,7 +11379,7 @@ fn the_sheet_host_draws_no_duplicate_headers() {
     h.warm_up();
     assert_ne!(h.stack().header, egui::Rect::NOTHING);
     assert_ne!(h.stack().collapse, egui::Rect::NOTHING);
-    assert_ne!(h.inspector().collapse, egui::Rect::NOTHING);
+    assert!(h.inspector().close.is_positive());
     assert!(
         !h.text_painted_in(h.screen_rect(), "The same layer stack as on a desktop"),
         "the helper caption is the phone page's alone"

@@ -21,11 +21,11 @@ pub(super) const INSPECTOR_BOTTOM_CLEARANCE: f32 = 88.0;
 /// What the crumb row and its separator cost above the scroll body.
 const HEADER_ALLOWANCE: f32 = 40.0;
 
-/// The collapse button's glyph: the panel slides out to the right.
-const COLLAPSE_LABEL: &str = "\u{203a}";
-
-/// The deselect button's glyph — back to App › Settings.
-const DESELECT_LABEL: &str = "\u{d7}";
+/// The close button's glyph. `×` and nothing else: the panel used to spell its
+/// close with `›` and its *deselect* with `×`, which put the close glyph on the
+/// one control that did not close. The route the deselect served is the crumb's
+/// `Pane N` segment now.
+const CLOSE_LABEL: &str = "\u{d7}";
 
 /// Width of combo boxes inside the inspector — the layers panel's old value, kept
 /// with the `layers_` salts so the combos' stored state moved intact.
@@ -42,11 +42,12 @@ pub(crate) struct InspectorProbe {
     pub rect: egui::Rect,
     /// The crumb row's text, e.g. `Pane 2 › Properties`.
     pub crumb: String,
-    /// The `×` deselect button — [`egui::Rect::NOTHING`] on the App › Settings
-    /// body, which has nothing to deselect.
-    pub deselect: egui::Rect,
-    /// The `›` collapse button.
-    pub collapse: egui::Rect,
+    /// The crumb segments that navigate, in draw order — every segment left of
+    /// the tail, with the text it drew. Empty on the root body.
+    pub crumb_links: Vec<(String, egui::Rect)>,
+    /// The `×` close button. Drawn by every host, including the sheet — the
+    /// inspector has exactly one dismissal control and it spells `×`.
+    pub close: egui::Rect,
     /// Whether the inspector was on screen this frame.
     pub open: bool,
     /// Which body arm actually drew, written by that arm as a literal — the
@@ -72,8 +73,8 @@ impl Default for InspectorProbe {
         Self {
             rect: egui::Rect::NOTHING,
             crumb: String::new(),
-            deselect: egui::Rect::NOTHING,
-            collapse: egui::Rect::NOTHING,
+            crumb_links: Vec::new(),
+            close: egui::Rect::NOTHING,
             open: false,
             mode: None,
             site_search: egui::Rect::NOTHING,
@@ -125,7 +126,6 @@ impl super::Gui {
                     ui.set_width(slot.width);
                     self.render_inspector_crumb(
                         ui,
-                        slot.sheet,
                         #[cfg(test)]
                         &mut probe,
                     );
@@ -197,39 +197,26 @@ impl super::Gui {
     }
 
     /// The crumb row: where the body's subject is named, and where it is changed.
+    ///
+    /// Two controls, one meaning each. `×` closes the inspector — at every
+    /// width, the sheet included, because a host that suppressed the real close
+    /// left the panel's only `×` bound to something else. Moving *between* the
+    /// three bodies is the crumb's own job: every segment left of the tail is a
+    /// button that goes where it reads.
     fn render_inspector_crumb(
         &mut self,
         ui: &mut egui::Ui,
-        sheet: bool,
         #[cfg(test)] probe: &mut InspectorProbe,
     ) {
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if !sheet {
-                    let collapse = ui
-                        .button(COLLAPSE_LABEL)
-                        .on_hover_text("Collapse the inspector");
-                    #[cfg(test)]
-                    {
-                        probe.collapse = collapse.rect;
-                    }
-                    if collapse.clicked() {
-                        self.insp_open = false;
-                    }
+                let close = ui.button(CLOSE_LABEL).on_hover_text("Close the inspector");
+                #[cfg(test)]
+                {
+                    probe.close = close.rect;
                 }
-
-                if self.inspector_sel != InspectorSelection::AppSettings {
-                    let deselect = ui
-                        .button(DESELECT_LABEL)
-                        .on_hover_text("Back to App \u{203a} Settings");
-                    #[cfg(test)]
-                    {
-                        probe.deselect = deselect.rect;
-                    }
-                    if deselect.clicked() {
-                        self.inspector_sel = InspectorSelection::AppSettings;
-                        self.insp_scroll_reset = true;
-                    }
+                if close.clicked() {
+                    self.insp_open = false;
                 }
 
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -242,10 +229,17 @@ impl super::Gui {
                             "Settings".to_owned()
                         }
                         InspectorSelection::PaneProps => {
-                            let _ = ui.selectable_label(
-                                true,
-                                egui::RichText::new(pane_label.as_str()).strong(),
-                            );
+                            let seg = ui
+                                .selectable_label(
+                                    false,
+                                    egui::RichText::new(pane_label.as_str()).strong(),
+                                )
+                                .on_hover_text("App \u{203a} Settings");
+                            #[cfg(test)]
+                            probe.crumb_links.push((pane_label.clone(), seg.rect));
+                            if seg.clicked() {
+                                self.open_settings();
+                            }
                             ui.label("\u{203a}");
                             ui.label("Properties");
                             "Properties".to_owned()
@@ -257,6 +251,8 @@ impl super::Gui {
                                     egui::RichText::new(pane_label.as_str()).strong(),
                                 )
                                 .on_hover_text("This pane's properties");
+                            #[cfg(test)]
+                            probe.crumb_links.push((pane_label.clone(), seg.rect));
                             if seg.clicked() {
                                 self.select_pane_props();
                             }

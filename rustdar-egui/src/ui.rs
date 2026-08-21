@@ -997,7 +997,8 @@ impl Gui {
     }
 
     /// Open the inspector on the App › Settings body — what the menu's
-    /// Settings… entry does, and the state a `✕` deselect returns to.
+    /// Settings… entry does, and where the crumb's `Pane N` segment goes from
+    /// the pane-properties body.
     pub fn open_settings(&mut self) {
         self.insp_scroll_reset = self.inspector_sel != InspectorSelection::AppSettings;
         self.inspector_sel = InspectorSelection::AppSettings;
