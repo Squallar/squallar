@@ -221,6 +221,16 @@ pub struct Gui {
     /// same terms as [`Self::sheet_last_page`]; never read while an error is
     /// up. Session-only bookkeeping.
     pub(super) toast_last_error: Option<String>,
+    /// Which failure the user has dismissed the banner for, per layer.
+    ///
+    /// Keyed on [`FetchRetry::last_failure`] rather than on the message,
+    /// because two failures can carry the same words: dismissing hides *that*
+    /// failure, and the next one -- new instant -- comes back. Session state,
+    /// as the field it replaced was: nothing here is persisted.
+    ///
+    /// Generic on purpose. The banner is sourced from the radar layer today,
+    /// which is the only layer that has one, but nothing in this map is.
+    pub(super) dismissed_errors: std::collections::HashMap<LayerId, web_time::Instant>,
     /// The user's saved presets (the plan). Persisted; the built-ins are
     /// compiled in beside them (`catalog::builtin_presets`) and never saved.
     pub(super) presets: Vec<PresetConfig>,
@@ -362,10 +372,7 @@ impl Gui {
         let RadarConfig { site, timestamp } = RadarConfig::default();
 
         let mut gui = Self {
-            radar: RadarState {
-                site,
-                error_message: None,
-            },
+            radar: RadarState { site },
             liveness: Vec::new(),
             time_dialog: TimeDialogState {
                 timestamp,
@@ -435,6 +442,7 @@ impl Gui {
             fade_factor: 1.0,
             sheet_last_page: None,
             toast_last_error: None,
+            dismissed_errors: std::collections::HashMap::new(),
             presets: Vec::new(),
             // The desktop arm of `constants::MAX_LOOP_FRAMES`; the frontend
             // pushes the real target's value at startup.

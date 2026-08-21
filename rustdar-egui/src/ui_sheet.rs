@@ -782,14 +782,15 @@ impl super::Gui {
         map_rect: egui::Rect,
         carries: bool,
     ) {
-        let present = carries && self.radar.error_message.is_some();
+        let live = self.layer_error(&crate::radar_layer::POLL_LAYER);
+        let present = carries && live.is_some();
         let factor = ctx.animate_bool_with_time(
             egui::Id::new("error_toast_open"),
             present,
             super::fade::anim_time(),
         );
         if present {
-            self.toast_last_error = self.radar.error_message.clone();
+            self.toast_last_error = live.clone();
         }
         if factor <= 0.0 {
             // Fully off screen: forget the remnant so a much later fall can
@@ -798,13 +799,15 @@ impl super::Gui {
             return;
         }
         // What the banner shows: the live message, or the fall's remembered
-        // one — the remnant copy is what `render_error_display` mutates.
-        // dismiss, so the real state is only ever written back from its live copy.
-        let mut shown = if present {
-            self.radar.error_message.clone()
+        // one. A cross clicked on the remnant is a cross clicked on a message
+        // that is already gone, which is why the dismissal below is recorded
+        // only while the live one is what is on screen.
+        let shown = if present {
+            live.clone()
         } else {
             self.toast_last_error.clone()
         };
+        let mut dismissed = false;
         // `Order::Tooltip`, so the toast reads over the sheet cluster: the
         // scrim, sheet and hosted bodies are all `Order::Foreground`, and an
         // error banner under a scrim is an error the user can neither see
@@ -823,13 +826,19 @@ impl super::Gui {
                 super::shell::chrome_frame(&ctx.global_style())
                     .show(ui, |ui| {
                         super::fade::dim(ui, factor);
-                        ui.horizontal(|ui| super::statusbar::render_error_display(ui, &mut shown))
-                            .inner
+                        ui.horizontal(|ui| {
+                            super::statusbar::render_error_display(
+                                ui,
+                                shown.as_deref(),
+                                &mut dismissed,
+                            )
+                        })
+                        .inner
                     })
                     .inner
             });
-        if present {
-            self.radar.error_message = shown;
+        if present && dismissed {
+            self.dismiss_layer_error(&crate::radar_layer::POLL_LAYER);
         }
         #[cfg(test)]
         {

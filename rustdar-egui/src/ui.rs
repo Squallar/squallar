@@ -237,16 +237,15 @@ pub(crate) enum InspectorSelection {
 /// instead would change what a multi-pane session persists and would hollow
 /// three tests whose premise is that a global exists to be wrongly used.
 ///
-/// **`error_message`** is the app's only dismissible error surface, and the
-/// DISMISSAL is presentation state: `FetchHealth` has no dismissed state and
-/// no occurrence identity that survives an identical repeat. A generic
-/// dismissible-error surface is a real design question and not this order's.
-///
-/// Both are the stated remainder of WO-E8's "zero radar-specific root
-/// fields", which this order does NOT reach.
+/// It is the last radar-specific field on this struct. `error_message` used to
+/// sit beside it, on the reasoning that the DISMISSAL is presentation state
+/// with nowhere to live because `FetchHealth` carries no dismissed state and no
+/// occurrence identity. The first half was right and the second was wrong:
+/// [`FetchRetry::last_failure`] is that identity, and the banner now reads its
+/// message straight off the layer's own ledger and keys the dismissal on the
+/// instant. See [`Gui::layer_error`].
 pub(super) struct RadarState {
     pub site: String,
-    pub error_message: Option<String>,
 }
 
 /// Time editing dialog state.
@@ -665,9 +664,10 @@ impl Gui {
             // backoff advances with it — an error ends the wait it belonged to.
             GuiEvent::Error(error) => {
                 // `end_radar_round` drops the in-flight flag itself, which is
-                // why nothing clears a spinner beside it.
+                // why nothing clears a spinner beside it -- and it files the
+                // message against the layer's own retry ledger, which is where
+                // the banner reads it from. There is no second copy to keep.
                 self.end_radar_round(RoundOutcome::Failed(&error));
-                self.radar.error_message = Some(error);
             }
             // Set the radar config, keeping the Set Time dialog's strings in
             // sync with it.

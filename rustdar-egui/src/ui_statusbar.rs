@@ -169,15 +169,24 @@ impl super::Gui {
                             }
                         }
 
-                        if self.radar.error_message.is_some() {
+                        let radar_error = self.layer_error(&crate::radar_layer::POLL_LAYER);
+                        if radar_error.is_some() {
+                            let mut dismissed = false;
                             ui.scope_builder(
                                 egui::UiBuilder::new()
                                     .id(ui.id().with("status_error"))
                                     .layout(egui::Layout::right_to_left(egui::Align::Center)),
                                 |ui| {
-                                    render_error_display(ui, &mut self.radar.error_message);
+                                    render_error_display(
+                                        ui,
+                                        radar_error.as_deref(),
+                                        &mut dismissed,
+                                    );
                                 },
                             );
+                            if dismissed {
+                                self.dismiss_layer_error(&crate::radar_layer::POLL_LAYER);
+                            }
                         }
                     });
                 });
@@ -428,22 +437,27 @@ pub(super) fn render_hover_info(ui: &mut egui::Ui, panes: &[PaneState]) {
 
 /// `pub(super)` because the phone shell's error toast (`ui_sheet.rs`) hosts the
 /// same dismissable body — the phone has no status bar row to carry it.
+/// Draw `message` with a dismiss cross, and report through `dismissed` whether
+/// the cross was clicked.
+///
+/// The widget reports rather than mutates: what a dismissal means is "the user
+/// acknowledged *this failure*", and only the caller knows which failure that
+/// is (see [`Gui::layer_error`]). It used to take `&mut Option<String>` and
+/// clear it, which is what made the message a piece of state the shell had to
+/// own a copy of.
 pub(super) fn render_error_display(
     ui: &mut egui::Ui,
-    error_message: &mut Option<String>,
+    message: Option<&str>,
+    dismissed: &mut bool,
 ) -> Option<egui::Rect> {
-    let mut dismiss = false;
     let mut close = None;
-    if let Some(msg) = error_message.as_deref() {
+    if let Some(msg) = message {
         let button = ui.button("\u{d7}");
         if button.clicked() {
-            dismiss = true;
+            *dismissed = true;
         }
         close = Some(button.rect);
         ui.label(msg);
-    }
-    if dismiss {
-        *error_message = None;
     }
     close
 }
