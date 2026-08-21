@@ -40,6 +40,15 @@ pub struct Gui {
     pub(super) panes: Vec<PaneState>,
     pub(super) active_pane: PaneId,
     pub(super) pane_layout: PaneLayout,
+    /// **How the user wants a multi-pane window split**, or `Auto` to let the
+    /// width class answer. App-wide rather than per-pane: it describes the
+    /// window, not any one pane. Persisted; see `ui_config`.
+    pub(super) split_orientation: crate::pane::SplitOrientation,
+    /// Divider positions carried out of a config file and not yet adopted:
+    /// the grid they belong to is only known once the first frame has resolved
+    /// the real width class, which is later than the load. One shot — see
+    /// `Gui::settle_pane_layout`.
+    pub(super) restored_ratios: Option<(Vec<f32>, Vec<Vec<f32>>)>,
     /// Remembered color-scale bar orientation for the map panel (hysteresis, so
     /// a resize near the boundary cannot make the bars hop).
     pub(super) color_scale_orientation: ColorScaleOrientation,
@@ -406,6 +415,8 @@ impl Gui {
             panes: vec![PaneState::with_site(site)],
             active_pane: 0,
             pane_layout: PaneLayout::default(),
+            split_orientation: crate::pane::SplitOrientation::default(),
+            restored_ratios: None,
             color_scale_orientation: ColorScaleOrientation::default(),
             map_pane_geo: HashMap::new(),
             volume_empty_states: HashMap::new(),

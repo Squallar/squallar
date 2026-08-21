@@ -1072,6 +1072,26 @@ impl InputHarness {
     }
 
     /// Just the counts, in draw order.
+    /// The split-orientation buttons the last frame drew, in draw order.
+    pub(crate) fn split_options(&self) -> Vec<crate::ui::SplitOptionProbe> {
+        self.gui.split_options_for_test().to_vec()
+    }
+
+    /// One split-orientation button by the orientation it sets.
+    pub(crate) fn split_option(
+        &self,
+        orientation: crate::pane::SplitOrientation,
+    ) -> Option<crate::ui::SplitOptionProbe> {
+        self.split_options()
+            .into_iter()
+            .find(|probe| probe.orientation == orientation)
+    }
+
+    /// The grid the layout is actually laid out on: columns per row.
+    pub(crate) fn pane_grid(&self) -> Vec<usize> {
+        self.gui.pane_layout_for_test().grid().to_vec()
+    }
+
     pub(crate) fn pane_option_counts(&self) -> Vec<usize> {
         self.pane_options().iter().map(|o| o.count).collect()
     }
@@ -2147,6 +2167,11 @@ fn web_touch(pointer_id: u64, phase: egui::TouchPhase, pos: egui::Pos2) -> egui:
         force: None,
     }
 }
+
+/// The pane grid at the width it is drawn at, the toggle over it, and closing
+/// one specific pane.
+#[cfg(test)]
+mod pane_layout_tests;
 
 #[cfg(test)]
 mod tests;

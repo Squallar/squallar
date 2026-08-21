@@ -2264,6 +2264,15 @@ fn the_volume_alpha_button_stays_inside_its_pane_at_every_width() {
     // itself.
     let mut portrait = InputHarness::with_screen(egui::vec2(432.0, 936.0));
     portrait.set_pane_count(2);
+    // **Columns, explicitly, and the sweep is why.** A 432pt window is
+    // `WidthClass::Compact`, where `Auto` now stacks a pair — and a stacked
+    // pair has no column divider to drag, so the sweep would never narrow a
+    // pane and the vacuity guard below would (correctly) refuse the run. The
+    // narrow pane is still reachable on a phone, by the split toggle, which is
+    // the state this test is about.
+    portrait
+        .gui_mut()
+        .set_split_orientation(crate::pane::SplitOrientation::Columns);
     portrait
         .gui_mut()
         .enable_overlay_for_test(&known::COLOR_SCALE);

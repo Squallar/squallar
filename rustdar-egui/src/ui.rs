@@ -129,6 +129,16 @@ pub(crate) struct PaneOptionProbe {
     pub rect: egui::Rect,
 }
 
+/// One split-orientation button the picker drew, as it was drawn. Empty
+/// whenever the picker drew none — one pane has no split to orient.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SplitOptionProbe {
+    pub orientation: crate::pane::SplitOrientation,
+    pub selected: bool,
+    pub rect: egui::Rect,
+}
+
 /// What the top bar drew: the rects a test drives it by, and the state each
 /// toggle was showing. Reported by the renderer, never rebuilt by a test.
 #[cfg(test)]
@@ -1166,11 +1176,24 @@ impl Gui {
         // a missing entry as *off*. Seed it from the handlers, which hold the
         // active pane's state, the same way startup does.
         self.initialize_pane_enabled();
-        self.pane_layout = PaneLayout::for_count(count);
+        self.pane_layout = PaneLayout::for_count(count, self.layout.width, self.split_orientation);
         if self.active_pane >= self.pane_layout.pane_count {
             self.active_pane = 0;
         }
         self.pane_layout.pane_count == count
+    }
+
+    /// **Take the user's split preference and re-lay the grid to it now.**
+    ///
+    /// Applied here rather than waiting for the next frame's
+    /// `settle_pane_layout`, so that the click and the new arrangement are the
+    /// same frame; the settle then finds nothing to do.
+    pub(crate) fn set_split_orientation(&mut self, orientation: crate::pane::SplitOrientation) {
+        if self.split_orientation == orientation {
+            return;
+        }
+        self.split_orientation = orientation;
+        self.pane_layout.reflow(self.layout.width, orientation);
     }
 
     #[cfg(test)]
@@ -1339,10 +1362,33 @@ impl Gui {
         while self.panes.len() < count {
             self.panes.push(PaneState::new());
         }
-        self.pane_layout = PaneLayout::for_count(count);
+        self.pane_layout = PaneLayout::for_count(count, self.layout.width, self.split_orientation);
         if self.active_pane >= count {
             self.active_pane = 0;
         }
+    }
+
+    /// Put this `Gui` at a width class without running a frame — what a config
+    /// test needs, since `load_ui_config` runs before the first `ui()` and
+    /// reads whatever the layout last resolved to.
+    #[cfg(test)]
+    pub(crate) fn set_width_class_for_test(&mut self, width: crate::ui_layout::WidthClass) {
+        self.layout.width = width;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pane_layout_for_test(&self) -> &PaneLayout {
+        &self.pane_layout
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pane_layout_mut_for_test(&mut self) -> &mut PaneLayout {
+        &mut self.pane_layout
+    }
+
+    #[cfg(test)]
+    pub(crate) fn split_orientation_for_test(&self) -> crate::pane::SplitOrientation {
+        self.split_orientation
     }
 
     #[cfg(test)]
@@ -1393,6 +1439,11 @@ impl Gui {
     #[cfg(test)]
     pub(crate) fn pane_options_for_test(&self) -> &[PaneOptionProbe] {
         &self.probes.last_pane_options
+    }
+
+    #[cfg(test)]
+    pub(crate) fn split_options_for_test(&self) -> &[SplitOptionProbe] {
+        &self.probes.last_split_options
     }
 
     #[cfg(test)]
@@ -1572,7 +1623,7 @@ impl Gui {
 
     #[cfg(test)]
     pub(crate) fn claim_pane_count_for_test(&mut self, count: usize) {
-        self.pane_layout = PaneLayout::for_count(count);
+        self.pane_layout = PaneLayout::for_count(count, self.layout.width, self.split_orientation);
     }
 
     /// Whether pane `idx`'s layer state belongs to the linked group. Out of

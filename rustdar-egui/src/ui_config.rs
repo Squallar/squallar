@@ -524,6 +524,28 @@ struct UiConfig {
     /// loads an older config as unpinned, which is what those sessions were.
     #[serde(default)]
     pin_pane_controls: bool,
+    /// **How the window splits between panes**, and where the user dragged the
+    /// dividers. App-wide rather than per-pane: all three describe the window.
+    ///
+    /// Declared here rather than left to the `unknown` passthrough on purpose
+    /// — a `#[serde(flatten)]` map swallows any key the struct does not name,
+    /// and these would round-trip as opaque baggage nothing could read.
+    ///
+    /// Additive on `pin_pane_controls`' terms: `#[serde(default)]`, **no
+    /// `CONFIG_VERSION` bump and no `migrate.rs` step.** Absence loads as
+    /// `Auto` with the `PaneLayout::for_count` defaults, which is exactly what
+    /// a session written before this field was.
+    #[serde(default)]
+    split_orientation: crate::pane::SplitOrientation,
+    /// Row heights, one per grid row, each a fraction of the map panel.
+    /// **Never trusted**: `PaneLayout::adopt_ratios` checks the arity against
+    /// the grid this window actually has, the floor against `MIN_RATIO` and
+    /// the sum against 1.0, and refuses the lot on any failure.
+    #[serde(default)]
+    row_ratios: Vec<f32>,
+    /// Column widths within each row, on the same terms.
+    #[serde(default)]
+    col_ratios: Vec<Vec<f32>>,
     /// The user's saved presets (§3.11). Built-ins are compiled in and never
     /// written here; an older config simply has none.
     #[serde(default)]
@@ -880,6 +902,12 @@ impl Default for UiConfig {
             storm_motion_override: super::StormMotionOverride::default(),
             srv_fallback: rustdar_radar::srv::SrvFallback::default(),
             pin_pane_controls: false,
+            split_orientation: crate::pane::SplitOrientation::Auto,
+            // Empty rather than the one-pane run: the fields' absence is what
+            // says "no dividers were described", and `adopt_ratios` refuses an
+            // empty run against any grid, which is the same outcome.
+            row_ratios: Vec::new(),
+            col_ratios: Vec::new(),
             presets: Vec::new(),
             volume_alpha: Vec::new(),
             volume_iso: Vec::new(),
@@ -985,6 +1013,15 @@ impl super::Gui {
             },
             srv_fallback: self.srv_fallback,
             pin_pane_controls: self.pin_pane_controls,
+            split_orientation: self.split_orientation,
+            row_ratios: {
+                let (rows, _) = self.pane_layout.ratios();
+                rows.to_vec()
+            },
+            col_ratios: {
+                let (_, cols) = self.pane_layout.ratios();
+                cols.to_vec()
+            },
             presets: self
                 .presets
                 .iter()
@@ -1105,7 +1142,21 @@ impl super::Gui {
             };
             self.panes.push(pane);
         }
-        self.pane_layout = PaneLayout::for_count(count);
+        // **Before the layout is built, because it is one of its two inputs.**
+        self.split_orientation = config.split_orientation;
+        self.pane_layout = PaneLayout::for_count(count, self.layout.width, self.split_orientation);
+        // **Two attempts, one validating function, and the second is the one
+        // that counts.** A load happens before any frame has run, so
+        // `self.layout.width` here is still the default rather than this
+        // window's — the grid built above may not be the grid the first frame
+        // settles on. The attempt below is what makes a headless load (a test,
+        // a save straight after a load) see its own dividers; the stash is
+        // what lets `Gui::settle_pane_layout` re-offer them against the real
+        // grid one frame later. Both refuse a file that does not describe the
+        // grid it is offered against, so neither can install a bad ratio.
+        self.pane_layout
+            .adopt_ratios(&config.row_ratios, &config.col_ratios);
+        self.restored_ratios = Some((config.row_ratios, config.col_ratios));
         self.active_pane = if config.active_pane < count {
             config.active_pane
         } else {
@@ -1545,6 +1596,11 @@ mod notifier_config_tests;
 #[path = "ui_config/storm_motion_config_tests.rs"]
 #[cfg(test)]
 mod storm_motion_config_tests;
+
+/// The split preference and the dragged dividers, across a restart.
+#[path = "ui_config/pane_layout_config_tests.rs"]
+#[cfg(test)]
+mod pane_layout_config_tests;
 
 #[path = "ui_config/presets_config_tests.rs"]
 #[cfg(test)]

@@ -15,6 +15,7 @@ impl Gui {
         self.check_auto_polls(&mut actions);
 
         self.layout = LayoutCtx::resolve(ctx, &mut self.modality, self.safe_area_insets);
+        self.settle_pane_layout();
         #[cfg(test)]
         {
             self.probes.widget_id_probes.clear();
@@ -28,6 +29,7 @@ impl Gui {
             self.probes.last_alpha_buttons.clear();
             self.probes.last_paint_order.clear();
             self.probes.last_pane_options.clear();
+            self.probes.last_split_options.clear();
             self.probes.last_dropdowns.clear();
             self.probes.last_control_items.clear();
             self.probes.last_settings_rows.clear();
@@ -377,6 +379,30 @@ impl Gui {
                 action = self.render_time_dialog_body(ui);
             });
         action
+    }
+
+    /// **Re-ask the pane grid for the room this frame actually has**, and take
+    /// up any divider positions a config file brought in.
+    ///
+    /// Runs immediately after [`LayoutCtx::resolve`], because this is the
+    /// first moment in a session at which the real width class is known: a
+    /// config load happens before any frame, so the layout it built was built
+    /// against the default width. The restored ratios are a one-shot for
+    /// exactly that reason — they are validated against whatever grid the real
+    /// width produces, and refused rather than stretched if it is a different
+    /// one.
+    pub(super) fn settle_pane_layout(&mut self) {
+        self.pane_layout
+            .reflow(self.layout.width, self.split_orientation);
+        if let Some((rows, cols)) = self.restored_ratios.take()
+            && !self.pane_layout.adopt_ratios(&rows, &cols)
+        {
+            log::debug!(
+                "saved pane dividers do not describe this window's {:?} grid; \
+                 using the defaults for it",
+                self.pane_layout.grid(),
+            );
+        }
     }
 
     /// Apply the view change the frame asked for, if any.
