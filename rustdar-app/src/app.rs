@@ -1736,7 +1736,15 @@ impl App {
             return;
         };
         self.site_is_provisional = false;
-        if self.gui.pane(0).is_some_and(|p| p.site() == site.name) {
+        // The pane asked has to be the pane moved. They were both pane 0 while there was
+        // one pane; with two, asking pane 0 about a switch aimed at the active pane skips
+        // the move and spends the upgrade anyway.
+        let pane_idx = self.gui.active_pane_idx();
+        if self
+            .gui
+            .pane(pane_idx)
+            .is_some_and(|p| p.site() == site.name)
+        {
             return;
         }
         log::info!(
@@ -1746,7 +1754,7 @@ impl App {
         self.handle_gui_action(
             GuiAction::SwitchRadarSite {
                 site: site.name.to_string(),
-                pane_idx: self.gui.active_pane_idx(),
+                pane_idx,
             },
             None,
         );

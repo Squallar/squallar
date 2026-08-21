@@ -384,3 +384,51 @@ fn the_catalogue_landing_draws_the_volume_the_launch_could_not_place() {
          for the whole session",
     );
 }
+
+/// The timezone hint has the same shape of defect as the location-fix upgrade: it asks
+/// **pane 0** whether the open would be a no-op, then opens the **active** pane. Two panes
+/// are enough for those to disagree, and the hint is spent on entry (`site_hint_pending` is
+/// cleared before the check) whether or not the pane it names ever moves.
+#[test]
+fn the_timezone_hint_opens_the_active_pane_even_when_pane_zero_is_already_there() {
+    use rustdar_egui::UI_CONFIG_KEY;
+
+    let mut app = headless(TestBridge::desktop().with_timezone("America/Chicago"));
+    let hinted = crate::location_hint::site_for_timezone("America/Chicago")
+        .expect("America/Chicago names a radar, which is what the hint is for");
+
+    // Pane 0 is already the hint's radar; the active pane is a different one.
+    let store = MemoryKvStore::default();
+    store
+        .store(
+            UI_CONFIG_KEY,
+            &format!(
+                r#"{{"pane_count":2,"active_pane":1,"site":"{hinted}",
+                     "panes":[{{"site":"{hinted}"}},{{"site":"KDLH"}}]}}"#
+            ),
+        )
+        .expect("the memory store always accepts a write");
+    assert!(
+        app.gui.load_ui_config(&store),
+        "the two-pane fixture config did not parse"
+    );
+    app.render.ensure_pane_count(2);
+    assert_eq!(
+        (
+            app.gui.active_pane_idx(),
+            app.gui.pane(0).expect("a pane exists").site()
+        ),
+        (1, hinted),
+        "precondition: pane 0 on the hint's radar, and the active pane elsewhere",
+    );
+
+    app.site_hint_pending = true;
+    app.open_on_the_timezones_radar();
+
+    assert_eq!(
+        app.gui.pane(1).expect("the fixture built two panes").site(),
+        hinted,
+        "the hint opened nothing: the no-op check asked pane 0, which was \
+         already there, so the pane the switch names never moved",
+    );
+}
