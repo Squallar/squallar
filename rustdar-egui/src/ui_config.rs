@@ -524,6 +524,17 @@ struct UiConfig {
     /// loads an older config as unpinned, which is what those sessions were.
     #[serde(default)]
     pin_pane_controls: bool,
+    /// **The user's starred radar sites**, bare ICAO identifiers in the order
+    /// they were starred — the same spelling a pick persists, so a favourite
+    /// and a current site are the one kind of value.
+    ///
+    /// At the root rather than on a pane: a favourite is a fact about the
+    /// person, not about a window. Additive on `pin_pane_controls`' terms —
+    /// `#[serde(default)]`, **no `CONFIG_VERSION` bump and no `migrate.rs`
+    /// step**. Absence loads as "nothing starred", which is what every session
+    /// written before this field was.
+    #[serde(default)]
+    favorite_sites: Vec<String>,
     /// **How the window splits between panes**, and where the user dragged the
     /// dividers. App-wide rather than per-pane: all three describe the window.
     ///
@@ -902,6 +913,7 @@ impl Default for UiConfig {
             storm_motion_override: super::StormMotionOverride::default(),
             srv_fallback: rustdar_radar::srv::SrvFallback::default(),
             pin_pane_controls: false,
+            favorite_sites: Vec::new(),
             split_orientation: crate::pane::SplitOrientation::Auto,
             // Empty rather than the one-pane run: the fields' absence is what
             // says "no dividers were described", and `adopt_ratios` refuses an
@@ -1013,6 +1025,7 @@ impl super::Gui {
             },
             srv_fallback: self.srv_fallback,
             pin_pane_controls: self.pin_pane_controls,
+            favorite_sites: self.favorite_sites.clone(),
             split_orientation: self.split_orientation,
             row_ratios: {
                 let (rows, _) = self.pane_layout.ratios();
@@ -1174,6 +1187,7 @@ impl super::Gui {
         self.storm_motion_override = config.storm_motion_override;
         self.srv_fallback = config.srv_fallback;
         self.pin_pane_controls = config.pin_pane_controls;
+        self.favorite_sites = config.favorite_sites;
         self.presets = config.presets;
 
         self.volume_alpha = crate::volume_alpha::AlphaCurves::default();

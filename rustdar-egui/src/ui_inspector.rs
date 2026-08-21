@@ -66,6 +66,11 @@ pub(crate) struct InspectorProbe {
     pub site_rows: Vec<(String, egui::Rect, bool)>,
     /// The site list's count caption, verbatim.
     pub site_caption: String,
+    /// Every row the site list painted, shortcut sections included and each
+    /// tagged with the block it was drawn in. A superset of
+    /// [`Self::site_rows`], which is the *inventory* — one entry per matching
+    /// radar — where this is the paint.
+    pub site_section_rows: Vec<super::pills::SiteRowProbe>,
     /// The sync section's rows as drawn — the three link checkboxes with the state
     /// they were handed and the two action rows with `false`
     /// (`pills::sync_section_ui`'s outcome, verbatim).
@@ -88,6 +93,7 @@ impl Default for InspectorProbe {
             site_search: egui::Rect::NOTHING,
             site_rows: Vec::new(),
             site_caption: String::new(),
+            site_section_rows: Vec::new(),
             sync_rows: Vec::new(),
             close_pane: egui::Rect::NOTHING,
         }
@@ -424,16 +430,27 @@ impl super::Gui {
             #[cfg(not(test))]
             let _ = search;
 
+            // The pane the body is editing is `mem::take`n out of the vector
+            // while this runs, so the sections are assembled around the hole:
+            // `site_sections` reads `self.panes`, which cannot answer for the
+            // active slot. It excludes that slot anyway — its own site is the
+            // one row the "in other panes" section must never carry.
+            let sections = self.site_sections(self.active_pane, pane.site());
             let outcome = super::pills::site_list_ui(
                 ui,
                 &self.site_query,
                 pane.site(),
                 self.catalogue_pending,
+                &sections,
             );
             #[cfg(test)]
             {
                 probe.site_caption = outcome.caption.clone();
                 probe.site_rows = outcome.rows.clone();
+                probe.site_section_rows = outcome.drawn.clone();
+            }
+            if let Some(site) = outcome.toggled_favorite {
+                self.toggle_favorite_site(&site);
             }
             if let Some(picked) = outcome.picked {
                 pane.loading_site = Some(picked.clone());

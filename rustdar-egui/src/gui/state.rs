@@ -185,6 +185,13 @@ pub struct Gui {
     /// The site list's search text — the inspector body and the site pill's
     /// popover filter through the one field, as they render the one list.
     pub(super) site_query: String,
+    /// The user's starred radar sites, bare ICAO identifiers, in the order
+    /// they were starred.
+    ///
+    /// **App-wide rather than per-pane**: a favourite is a fact about the
+    /// person, not about a window. Persisted; absent from an older config,
+    /// which loads as "nothing starred" — what those sessions were.
+    pub(super) favorite_sites: Vec<String>,
     /// The stack row being drag-reordered by its grip, if one is in flight.
     pub(super) stack_drag: Option<rustdar_source::id::LayerId>,
     /// A layer whose stack row the next stack pass should scroll into view,
@@ -456,6 +463,7 @@ impl Gui {
             catalog_save_name: String::new(),
             catalog_saving: false,
             site_query: String::new(),
+            favorite_sites: Vec::new(),
             stack_drag: None,
             stack_scroll_to: None,
             pill_revealed: None,

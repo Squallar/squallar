@@ -174,6 +174,9 @@ pub(crate) struct PillPopoverProbe {
     /// The option rows drawn: label, rect, and whether the row read as the
     /// current selection.
     pub rows: Vec<(String, egui::Rect, bool)>,
+    /// Every row the *site* popover painted, sections included and tagged.
+    /// Empty on every other pill: only the site list has sections.
+    pub site_rows: Vec<SiteRowProbe>,
 }
 
 /// What one shared picker pass produced: the option the user picked, if any,
@@ -206,43 +209,392 @@ impl<T> PickOutcome<T> {
     }
 }
 
+/// Which block of the site list a row was drawn in — how a probe tells a
+/// shortcut row from the network group that carries the same radar again.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SiteSection {
+    Favorites,
+    InUse,
+    Nearby,
+    /// A row in one of the two network groups. Only the probes ever ask which
+    /// block a row came from, and only the group rows are tagged there.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Network(RadarNetwork),
+}
+
+/// One drawn site row, as the probes see it.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SiteRowProbe {
+    pub section: SiteSection,
+    /// The bare identifier the row picks — never the decorated label.
+    pub site: String,
+    /// The text the row actually drew, decorations and all.
+    pub label: String,
+    /// The right-aligned note, where the row had one: the pane number, or the
+    /// distance in the user's own unit. `None` in the network groups.
+    pub note: Option<String>,
+    pub rect: egui::Rect,
+    pub is_current: bool,
+    /// The star's own rect, which sits *inside* [`Self::rect`].
+    pub star: egui::Rect,
+    pub starred: bool,
+}
+
+/// The shortcut sections drawn above the network groups, and everything they
+/// need to draw.
+///
+/// [`site_list_ui`] is a free function with no `&Gui` — deliberately, so the
+/// one picker body cannot grow a second opinion about the app. What the `Gui`
+/// knows therefore arrives here as data, assembled by
+/// [`super::Gui::site_sections`] on both routes.
+///
+/// **Every field empty is the ordinary case** — one pane, nothing starred, no
+/// location fix — and draws no sections at all.
+#[derive(Default)]
+pub(super) struct SiteSections {
+    /// The user's starred sites, in the order they starred them.
+    pub favorites: Vec<String>,
+    /// What every *other* visible pane is showing: the site, and the pane
+    /// index showing it. The pane number is drawn on the row, so a repeat
+    /// reads as "pane 3 is here" rather than as an unexplained duplicate.
+    pub in_use: Vec<(String, PaneId)>,
+    /// The sites closest to the user's own position, nearest first, with the
+    /// distance in kilometres. **Empty when there is no fix**, and an empty
+    /// section is not drawn — which is how "this app does not know where you
+    /// are" reads here. A caption saying so is a notice nobody can act on.
+    pub nearby: Vec<(&'static str, f64)>,
+    /// The unit [`Self::nearby`]'s distances are shown in.
+    pub distance: rustdar_units::DistanceUnit,
+}
+
 /// [`PickOutcome`] plus the site list's count caption, which the inspector's
-/// probe records verbatim.
+/// probe records verbatim, and the two things only the caller can act on: a
+/// star that was clicked, and a click on the row that is already current.
 pub(super) struct SiteListOutcome {
     pub picked: Option<String>,
+    /// A star was clicked; the caller flips this identifier's favourite bit.
+    pub toggled_favorite: Option<String>,
+    /// **The inventory**: one entry per radar the filter kept, in the network
+    /// groups' own order. Not the rows on screen — the sections above repeat
+    /// some of these, and [`Self::drawn`] is what counts paint.
     #[cfg(test)]
     pub rows: Vec<(String, egui::Rect, bool)>,
+    /// **The paint**: every row drawn, sections included, each tagged with the
+    /// block it was drawn in.
+    #[cfg(test)]
+    pub drawn: Vec<SiteRowProbe>,
     #[cfg(test)]
     pub caption: String,
 }
 
-/// The filterable list of every radar this process knows of: count caption,
-/// then a scrolling list with the current site highlighted, TDWRs marked and
-/// radars with no known position marked too. Returns the site a click picked —
-/// always a site other than `current`.
+/// The Favorites section's heading.
+pub(crate) const FAVORITES_HEADING: &str = "Favorites";
+
+/// The in-use section's heading — what the *other* panes are showing.
+pub(crate) const IN_USE_HEADING: &str = "In other panes";
+
+/// The nearby section's heading.
+pub(crate) const NEARBY_HEADING: &str = "Nearby";
+
+/// How many of the closest sites the Nearby section offers. Enough to cover
+/// the case the section exists for — the radar wanted is rarely the single
+/// closest, since the closest is often a TDWR or a neighbour with the weather
+/// on its far side — and few enough that the section stays a shortcut rather
+/// than a second list.
+const NEARBY_SITE_COUNT: usize = 5;
+
+/// The star's column width inside a site row.
+const SITE_STAR_WIDTH: f32 = 22.0;
+
+/// Whether `name` answers an already-trimmed, already-uppercased `query`.
+fn matches(name: &str, query: &str) -> bool {
+    query.is_empty() || name.contains(query)
+}
+
+/// How one site row reads: the identifier, and the markers that say a pick
+/// lands somewhere unexpected.
+fn site_row_label(name: &str, network: RadarNetwork, is_placed: bool) -> String {
+    let mut label = name.to_owned();
+    // TDWRs stay marked as well as grouped: a pick lands on a different
+    // instrument (single-pol, ~89 km of Doppler range around one airport, none
+    // of the Level III products this app fetches), and the marker is what says
+    // so on the row itself rather than only above it.
+    match (network, is_placed) {
+        (RadarNetwork::Tdwr, true) => label.push_str(" - TDWR"),
+        (RadarNetwork::Tdwr, false) => label.push_str(" - TDWR, position unknown"),
+        (RadarNetwork::Wsr88d, false) => label.push_str(" - position unknown"),
+        (RadarNetwork::Wsr88d, true) => {}
+    }
+    label
+}
+
+/// One site row: a full-width click target with a favourite star sitting on
+/// top of its right edge, and an optional right-aligned note.
+///
+/// **Not one widget any more.** A `selectable_label` cannot carry a second
+/// button, so this follows `ui_stack`'s eye-and-grip row: the row rect is
+/// allocated with its own click sense *first*, and the star is drawn after,
+/// inside it — egui resolves an overlap to the later registration, so the star
+/// keeps its own click while the rest of the row keeps the row's.
+///
+/// The highlight reads `contains_pointer`, **not** `hovered`: the star sits on
+/// top of this rect and takes `hovered` with it, so a `hovered` read would
+/// blink the row's highlight off as the pointer crossed the star.
+fn site_row_ui(
+    ui: &mut egui::Ui,
+    label: &str,
+    note: Option<&str>,
+    is_current: bool,
+    starred: bool,
+) -> (egui::Response, egui::Response) {
+    let padding = ui.spacing().button_padding;
+    let row_height = ui.text_style_height(&egui::TextStyle::Body) + 2.0 * padding.y;
+    let (row_rect, row) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), row_height),
+        egui::Sense::click(),
+    );
+
+    let hovered = row.contains_pointer();
+    if is_current || hovered || row.has_focus() {
+        let mut visuals = if hovered {
+            ui.style().visuals.widgets.hovered
+        } else {
+            ui.style().interact_selectable(&row, is_current)
+        };
+        if is_current {
+            // `interact_selectable`'s own override, re-applied on the hovered
+            // branch so the current site paints one fill wherever inside the
+            // row the pointer is.
+            visuals.weak_bg_fill = ui.visuals().selection.bg_fill;
+        }
+        ui.painter().rect(
+            row_rect,
+            visuals.corner_radius,
+            visuals.weak_bg_fill,
+            visuals.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
+    let text_color = ui
+        .style()
+        .interact_selectable(&row, is_current)
+        .text_color();
+
+    let star_rect = egui::Rect::from_min_max(
+        egui::pos2(row_rect.right() - SITE_STAR_WIDTH, row_rect.top()),
+        row_rect.max,
+    );
+    let body = row_rect
+        .with_max_x(star_rect.left())
+        .shrink2(egui::vec2(padding.x, 0.0));
+
+    // The note is measured and given its own column rather than appended to
+    // the label: a truncating label eats its own tail first, and the tail is
+    // exactly the part — the distance, the pane number — the note exists for.
+    let small = egui::TextStyle::Small.resolve(ui.style());
+    let note_width = note.map_or(0.0, |note| {
+        ui.painter()
+            .layout_no_wrap(note.to_owned(), small.clone(), egui::Color32::PLACEHOLDER)
+            .size()
+            .x
+    });
+    let text_rect = if note_width > 0.0 {
+        body.with_max_x((body.right() - note_width - padding.x).max(body.left()))
+    } else {
+        body
+    };
+
+    let mut text_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(text_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    text_ui.add(
+        egui::Label::new(egui::RichText::new(label).color(text_color))
+            .selectable(false)
+            .truncate(),
+    );
+
+    if let Some(note) = note.filter(|_| note_width > 0.0) {
+        let mut note_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(body.with_min_x(body.right() - note_width))
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
+        note_ui.add(
+            egui::Label::new(egui::RichText::new(note).small().weak())
+                .selectable(false)
+                .extend(),
+        );
+    }
+
+    let mut star_ui = ui.new_child(egui::UiBuilder::new().max_rect(star_rect).layout(
+        egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+    ));
+    let star_text = if starred {
+        egui::RichText::new("\u{2605}")
+    } else {
+        egui::RichText::new("\u{2606}").weak()
+    };
+    let star = star_ui
+        .add(egui::Button::new(star_text).frame(false))
+        .on_hover_text(if starred {
+            "Remove from favorites"
+        } else {
+            "Add to favorites"
+        });
+
+    (row, star)
+}
+
+/// One section heading. A heading never appears alone: every caller draws it
+/// on the first row it actually has, so an empty section is absent rather than
+/// present and bare.
+fn section_heading(ui: &mut egui::Ui, heading: &str) {
+    ui.label(egui::RichText::new(heading).small().weak());
+}
+
+/// Fold one drawn row's two clicks into the outcome. The star wins over the
+/// row it sits inside, which is what makes the pair one row and two meanings.
+fn fold_site_row(
+    row: &egui::Response,
+    star: &egui::Response,
+    name: &str,
+    is_current: bool,
+    outcome: &mut SiteListOutcome,
+) {
+    if star.clicked() {
+        outcome.toggled_favorite = Some(name.to_owned());
+    } else if row.clicked() && !is_current {
+        outcome.picked = Some(name.to_owned());
+    }
+}
+
+/// The three shortcut sections, above the network groups.
+///
+/// Each is filtered by the same query the groups are — a search that narrowed
+/// the list below while the shortcuts went on showing everything would read as
+/// a broken filter — and each is omitted entirely, heading and all, when
+/// nothing survives.
+fn draw_site_sections(
+    ui: &mut egui::Ui,
+    query: &str,
+    current: &str,
+    sections: &SiteSections,
+    outcome: &mut SiteListOutcome,
+) {
+    let favorites = sections.favorites.clone();
+    let mut draw = |ui: &mut egui::Ui,
+                    section: SiteSection,
+                    heading: &str,
+                    entries: Vec<(String, Option<String>)>| {
+        let mut drew_heading = false;
+        for (name, note) in entries {
+            if !matches(&name, query) {
+                continue;
+            }
+            if !drew_heading {
+                section_heading(ui, heading);
+                drew_heading = true;
+            }
+            let is_current = current == name;
+            // A shortcut may name a radar this process cannot place — a stale
+            // favourite, or one the catalogue has not reached yet. It is still
+            // pickable: the data is fetched by identifier, and the volume then
+            // places it.
+            let placed = rustdar_radar::sites::get_radar_site(&name).is_some();
+            let label = site_row_label(&name, RadarNetwork::of_id(&name), placed);
+            let starred = favorites.contains(&name);
+            let (row, star) = site_row_ui(ui, &label, note.as_deref(), is_current, starred);
+            #[cfg(test)]
+            outcome.drawn.push(SiteRowProbe {
+                section,
+                site: name.clone(),
+                label,
+                note: note.clone(),
+                rect: row.rect,
+                is_current,
+                star: star.rect,
+                starred,
+            });
+            #[cfg(not(test))]
+            let _ = (section, label);
+            fold_site_row(&row, &star, &name, is_current, outcome);
+        }
+    };
+
+    draw(
+        ui,
+        SiteSection::Favorites,
+        FAVORITES_HEADING,
+        sections
+            .favorites
+            .iter()
+            .map(|site| (site.clone(), None))
+            .collect(),
+    );
+    draw(
+        ui,
+        SiteSection::InUse,
+        IN_USE_HEADING,
+        sections
+            .in_use
+            .iter()
+            .map(|(site, idx)| (site.clone(), Some(format!("pane {}", idx + 1))))
+            .collect(),
+    );
+    draw(
+        ui,
+        SiteSection::Nearby,
+        NEARBY_HEADING,
+        sections
+            .nearby
+            .iter()
+            .map(|(site, km)| {
+                (
+                    (*site).to_owned(),
+                    Some(format!(
+                        "{:.0} {}",
+                        sections.distance.convert_from_km(*km),
+                        sections.distance.suffix()
+                    )),
+                )
+            })
+            .collect(),
+    );
+}
+
+/// The filterable list of every radar this process knows of: the count
+/// caption, then a scrolling list — the shortcut sections first, then the two
+/// network groups — with the current site highlighted, TDWRs marked and radars
+/// with no known position marked too.
+///
+/// **A site may appear in a section and in its network group.** The sections
+/// are shortcuts, not a partition.
 pub(super) fn site_list_ui(
     ui: &mut egui::Ui,
     query: &str,
     current: &str,
     catalogue_pending: bool,
+    sections: &SiteSections,
 ) -> SiteListOutcome {
     let table = rustdar_radar::sites::table();
     let radars = table.rows();
     let unplaced = table.unplaced();
 
     let query = query.trim().to_uppercase();
-    let matches = |name: &str| query.is_empty() || name.contains(query.as_str());
     // The row carries the network as DATA. `is_tdwr_id` survives at exactly one
     // site — the unplaced members, which have no row to ask — and nothing here
     // re-derives the classification from a prefix.
     let shown: Vec<(&'static str, RadarNetwork, bool)> = radars
         .iter()
-        .filter(|site| matches(site.name))
+        .filter(|site| matches(site.name, &query))
         .map(|site| (site.name, site.network, true))
         .chain(
             unplaced
                 .iter()
-                .filter(|name| matches(name))
+                .filter(|name| matches(name, &query))
                 .map(|name| (*name, RadarNetwork::of_id(name), false)),
         )
         .collect();
@@ -275,8 +627,11 @@ pub(super) fn site_list_ui(
 
     let mut outcome = SiteListOutcome {
         picked: None,
+        toggled_favorite: None,
         #[cfg(test)]
         rows: Vec::new(),
+        #[cfg(test)]
+        drawn: Vec::new(),
         #[cfg(test)]
         caption,
     };
@@ -288,6 +643,8 @@ pub(super) fn site_list_ui(
         .id_salt("site_list")
         .max_height(SITE_LIST_HEIGHT)
         .show(ui, |ui| {
+            draw_site_sections(ui, &query, current, sections, &mut outcome);
+
             // Two groups, WSR-88D first. The split is presentation only: the
             // search above spans both, every row stays pickable, and what a
             // pick persists is still the bare ICAO, so a reopen is unchanged.
@@ -310,30 +667,31 @@ pub(super) fn site_list_ui(
                 for (name, row_network, is_placed) in shown.iter().filter(|(_, n, _)| *n == network)
                 {
                     if labelled && !drew_heading {
-                        ui.label(egui::RichText::new(heading).small().weak());
+                        section_heading(ui, heading);
                         drew_heading = true;
                     }
                     let name = *name;
                     let is_current = current == name;
-                    // TDWRs stay marked as well as grouped: a pick lands on a
-                    // different instrument (single-pol, ~89 km of Doppler range
-                    // around one airport, none of the Level III products this
-                    // app fetches), and the marker is what says so on the row
-                    // itself rather than only above it.
-                    let label = match (*row_network, *is_placed) {
-                        (RadarNetwork::Tdwr, true) => format!("{name} - TDWR"),
-                        (RadarNetwork::Tdwr, false) => {
-                            format!("{name} - TDWR, position unknown")
-                        }
-                        (RadarNetwork::Wsr88d, false) => format!("{name} - position unknown"),
-                        (RadarNetwork::Wsr88d, true) => name.to_owned(),
-                    };
-                    let row = ui.selectable_label(is_current, label.as_str());
+                    let label = site_row_label(name, *row_network, *is_placed);
+                    let starred = sections.favorites.iter().any(|s| s == name);
+                    let (row, star) = site_row_ui(ui, &label, None, is_current, starred);
                     #[cfg(test)]
-                    outcome.rows.push((name.to_owned(), row.rect, is_current));
-                    if row.clicked() && !is_current {
-                        outcome.picked = Some(name.to_owned());
+                    {
+                        outcome.rows.push((name.to_owned(), row.rect, is_current));
+                        outcome.drawn.push(SiteRowProbe {
+                            section: SiteSection::Network(*row_network),
+                            site: name.to_owned(),
+                            label,
+                            note: None,
+                            rect: row.rect,
+                            is_current,
+                            star: star.rect,
+                            starred,
+                        });
                     }
+                    #[cfg(not(test))]
+                    let _ = label;
+                    fold_site_row(&row, &star, name, is_current, &mut outcome);
                 }
             }
         });
@@ -501,6 +859,63 @@ fn sync_pill_hover(
 }
 
 impl super::Gui {
+    /// The shortcut sections pane `idx`'s site picker offers.
+    ///
+    /// Assembled here rather than inside [`site_list_ui`] because that body is
+    /// a free function with no `&Gui`: what the app knows crosses as data, and
+    /// the two routes cannot drift into two answers.
+    /// `current` is passed rather than read off `self.panes[idx]`: the
+    /// inspector route runs with the active pane `mem::take`n out of the
+    /// vector, so the slot holds a placeholder that would answer for the wrong
+    /// site.
+    pub(super) fn site_sections(&self, idx: PaneId, current: &str) -> SiteSections {
+        // Deliberately NOT `Gui::live_sites`, which filters to panes watching
+        // live — the right predicate for the chunk feed, the wrong one here. A
+        // pane parked in the archive is still a pane showing a site.
+        let mut in_use: Vec<(String, PaneId)> = Vec::new();
+        for (other, pane) in self
+            .panes
+            .iter()
+            .enumerate()
+            .take(self.pane_layout.pane_count)
+        {
+            let site = pane.site();
+            if other == idx || site == current || in_use.iter().any(|(seen, _)| seen == site) {
+                continue;
+            }
+            in_use.push((site.to_owned(), other));
+        }
+
+        // No fix, no section: `user_fix` absent is the whole condition, and
+        // the empty vector is what makes the section vanish rather than draw
+        // an apology the reader cannot act on.
+        let nearby = self.user_fix.as_ref().map_or_else(Vec::new, |fix| {
+            rustdar_radar::sites::nearest_sites(fix.point.lat, fix.point.lon, NEARBY_SITE_COUNT)
+                .into_iter()
+                .map(|(site, km)| (site.name, km))
+                .collect()
+        });
+
+        SiteSections {
+            favorites: self.favorite_sites.clone(),
+            in_use,
+            nearby,
+            distance: self.preferences.distance,
+        }
+    }
+
+    /// Star or unstar `site`. App-wide: a favourite belongs to the person, not
+    /// to the pane whose picker the star was clicked in.
+    pub(super) fn toggle_favorite_site(&mut self, site: &str) {
+        match self.favorite_sites.iter().position(|s| s == site) {
+            Some(at) => {
+                self.favorite_sites.remove(at);
+            }
+            // Appended, so the section reads in the order the user built it.
+            None => self.favorite_sites.push(site.to_owned()),
+        }
+    }
+
     /// Ask for pane `idx` to show `view` the pickers' way: through the
     /// deferred applier, arming the cross-section draw when the pane has no
     /// line to show yet.
@@ -768,6 +1183,7 @@ impl super::Gui {
         current: &str,
         actions: &mut Vec<GuiAction>,
     ) {
+        let sections = self.site_sections(idx, current);
         let shown = egui::Popup::menu(pill)
             .id(pill_popup_id(idx, PillKind::Site))
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
@@ -779,7 +1195,7 @@ impl super::Gui {
                         .hint_text("Search radar sites"),
                 );
                 let query = self.site_query.clone();
-                let outcome = site_list_ui(ui, &query, current, self.catalogue_pending);
+                let outcome = site_list_ui(ui, &query, current, self.catalogue_pending, &sections);
                 #[cfg(test)]
                 {
                     self.probes.last_pill_popover = Some(PillPopoverProbe {
@@ -788,10 +1204,14 @@ impl super::Gui {
                         rect: egui::Rect::NOTHING,
                         search: Some(search.rect),
                         rows: outcome.rows.clone(),
+                        site_rows: outcome.drawn.clone(),
                     });
                 }
                 #[cfg(not(test))]
                 let _ = search;
+                if let Some(site) = outcome.toggled_favorite {
+                    self.toggle_favorite_site(&site);
+                }
                 if let Some(picked) = outcome.picked {
                     self.active_pane = idx;
                     let pane = &mut self.panes[idx];
@@ -834,6 +1254,7 @@ impl super::Gui {
                         rect: egui::Rect::NOTHING,
                         search: None,
                         rows: outcome.rows.clone(),
+                        site_rows: Vec::new(),
                     });
                 }
                 if let Some(picked) = outcome.picked {
@@ -872,6 +1293,7 @@ impl super::Gui {
                         rect: egui::Rect::NOTHING,
                         search: None,
                         rows: outcome.rows.clone(),
+                        site_rows: Vec::new(),
                     });
                 }
                 if let Some(angle) = outcome.picked {
@@ -911,6 +1333,7 @@ impl super::Gui {
                         rect: egui::Rect::NOTHING,
                         search: None,
                         rows: outcome.rows,
+                        site_rows: Vec::new(),
                     });
                 }
             });
@@ -939,6 +1362,7 @@ impl super::Gui {
                         rect: egui::Rect::NOTHING,
                         search: None,
                         rows: outcome.rows.clone(),
+                        site_rows: Vec::new(),
                     });
                 }
                 if let Some(view) = outcome.picked {
@@ -960,6 +1384,10 @@ impl super::Gui {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ui_pills/site_picker_tests.rs"]
+mod site_picker_tests;
 
 #[cfg(test)]
 mod clearance_tests {

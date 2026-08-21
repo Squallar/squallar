@@ -37,6 +37,8 @@ pub(crate) const ICON_GLYPHS: &[(char, &str)] = &[
         "refresh (status bar, layer bodies); rotate the line clockwise",
     ),
     ('\u{1f441}', "layer visibility eye (stack rows)"),
+    ('\u{2605}', "a favorited radar site (site list rows)"),
+    ('\u{2606}', "an unfavorited radar site (site list rows)"),
     ('\u{2297}', "unlinked from shared time (the Sync pill)"),
     (
         '\u{d7}',
