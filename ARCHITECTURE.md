@@ -338,16 +338,20 @@ amendment**. Never hide a needle instead of shedding the coupling — the
 `let gui = &mut self.gui;` re-spelling is **forbidden by name**, because it
 makes the walker read zero while the coupling is identical.
 
-Values below are **final**, re-measured at WO-E10.4 (campaign close). Every one
-of them equals the count it measures, so **none has headroom** — which is what a
-ceiling is for once the migration that spent them down is over.
+**The rule**: a ceiling equals the count it measures, and the land that sheds
+an occurrence lowers the constant with it. A value below is therefore never a
+standing promise — it is the last measurement that satisfied the rule. Values
+here were re-measured at **WO-ARREARS, 2026-08-21, base `178ab361`**, each by
+its own instrument (the crate-wide walk in `arch_ratchets.rs`; the
+whitespace-collapsed per-file scrape in `gui_seam_ratchet_tests.rs` — they are
+different instruments and one's number is never the other's).
 
 ### 6.1 `rustdar-app/tests/arch_ratchets.rs` — 9 tests
 
 | Test | Constant | Ceiling | What it counts |
 |---|---|---|---|
-| `the_app_pokes_gui_coupling_never_grows` | `SELF_GUI_MAX` | 184 | `self.gui.` anywhere in `rustdar-app` |
-| | `SELF_GUI_NON_TEST_MAX` | 179 | the same, outside test-named paths |
+| `the_app_pokes_gui_coupling_never_grows` | `SELF_GUI_MAX` | 181 | `self.gui.` anywhere in `rustdar-app` |
+| | `SELF_GUI_NON_TEST_MAX` | 176 | the same, outside test-named paths |
 | | — | 0 | `self.gui.set_` anywhere in `rustdar-app` — the target zero, held as a test rather than as a grep |
 | `the_config_swap_stays_deleted` | — | 0 | `load_pane_configs` / `save_pane_configs` / `loaded_configs`, with `serialize_pane_state` as the presence control |
 | `the_gui_setter_surface_never_grows` | `UI_SETTER_MAX` | 0 | `pub fn set_` in `rustdar-egui/src/ui.rs` |
@@ -373,7 +377,7 @@ cargo test -p rustdar-app --test arch_ratchets   # 9/9
 |---|---|---|
 | `no_production_file_pushes_through_a_gui_setter` | `app.rs`, `app_fetch.rs`, `app_render.rs`, `app_chunks.rs` | 0 `self.gui.set_` each |
 | `the_gui_coupling_only_ever_shrinks` | `app.rs` | 37 |
-| | `app_fetch.rs` | 45 |
+| | `app_fetch.rs` | 42 |
 | | `app_render.rs` | 108 |
 | | `app_chunks.rs` | 13 |
 
@@ -392,12 +396,21 @@ They are not deleted at any milestone. The contract they state is: **the app
 layer does not grow its reach into the UI layer, and an attempt to is a build
 failure, not a review comment.** They may only ever **fall**.
 
-**Since WO-E10.4 every one of them sits exactly on its measured value**, so none
-has headroom: under a permanent ceiling the correct response to needing a new
-reach is **shed first, then land** — not "ask whether the ceiling should move".
-(Before that land they each carried one spare slot, and "three ratchets at zero
-headroom" was a paraphrase that was never true; the ceilings are the record, not
-the paraphrase.) The two honest sheds are:
+**The standing rule is that a ceiling equals the count it measures**, so under
+a permanent ceiling the correct response to needing a new reach is **shed
+first, then land** — not "ask whether the ceiling should move".
+
+**That is a rule, not a property the tree keeps on its own.** A land that sheds
+an occurrence and does not lower the pin leaves **arrears**: unearned slack a
+later land can spend with nothing going red. It has happened twice on the
+record — WO-E9c left `PRODUCT_IN_EGUI_MAX` 34 above its haystack, and
+`1e94ce59` left three ceilings above theirs between WO-E10.4 and WO-ARREARS.
+So the honest form of the claim is dated: **as re-measured at WO-ARREARS
+(2026-08-21, base `178ab361`) every ceiling in §6.1 and §6.2 sits on its
+measured value.** Checking that is a `git diff` of the constants against a
+fresh measurement, not a sentence to trust.
+
+The two honest sheds are:
 
 * **loop-state addressing** — the vocabulary by which the app reaches loop state
   held on the `Gui`; and
@@ -406,6 +419,22 @@ the paraphrase.) The two honest sheds are:
 
 If neither is reachable inside a change's charter, **stop and report**. Do not
 raise, and do not re-spell.
+
+**The tree currently contains the forbidden re-spelling twice**, and the
+ceilings above are the number the walk sees, not the coupling the crate has.
+`App::poll_overlay_fetch_results` (`app.rs`) hides 4 reaches behind one
+`let gui = &mut self.gui;` and `App::poll_overlay_render_results`
+(`app_render.rs`) hides 1. WO-ARREARS **compile-proved neither is
+borrow-forced** — a direct reach builds with no diagnostic in either case — so
+they are evasion, not borrow-splitting. Shedding them makes the crate-wide walk
+read **186** against the 181 it reads today — five above the ceiling, and above
+both values it has carried since WO-E9e (185, then 184). (It would have fitted
+under the 188 the ceiling carried earlier in the campaign; that headroom was
+spent down deliberately and is not available to reclaim.) The shed therefore
+needs a land that can also shed the difference, and it was **refused rather
+than paid for with a raise**. The full record lives on `SELF_GUI_MAX`'s own doc. A third such
+binding has no standing: these two are documented because they were found and
+measured, not because the construct is allowed.
 
 ### 6.4 Other standing pins
 

@@ -15,19 +15,29 @@
 //! root; the walker skips dirs named `target`/`pkg` and never leaves the
 //! workspace.
 //!
-//! # FINAL values, re-measured at WO-E10.4 (campaign close)
+//! # The rule, and the last snapshot that satisfied it
 //!
-//! Every ceiling below now equals the count it measures. **None of them has
-//! headroom, and that is the point**: the campaign is over, so a ceiling is no
-//! longer a budget a migration spends down — it is the line the architecture
-//! sits on. The response to needing one more occurrence is to shed one first,
-//! or to stop and report. The `was` column is the pre-E10.4 literal, kept so it
+//! **The rule**: a ceiling equals the count it measures, and the land that
+//! sheds an occurrence lowers the constant with it. A ceiling is not a budget
+//! a migration spends down — it is the line the architecture sits on, so the
+//! response to needing one more occurrence is to shed one first, or to stop
+//! and report. **The rule is what binds; a value below is only the last
+//! measurement that satisfied it.**
+//!
+//! A land that sheds and does not lower leaves **arrears**: slack a later land
+//! can spend with nothing going red. WO-E10.4 set every value to its
+//! measurement; `1e94ce59` then shed three and left them, which is the defect
+//! this note now exists to make visible rather than to absorb.
+//!
+//! **Snapshot: re-measured at WO-ARREARS, 2026-08-21, base `178ab361`**, by
+//! the walker below (not by the `rg` column, which is documentation — see the
+//! note after the table). The `was` column is the previous literal, kept so it
 //! stays visible that every move was DOWN.
 //!
 //! ```text
 //!  #   metric                                        value  was  command (run from the workspace root)
-//!  1a  App-pokes-Gui occurrences, rustdar-app          184  185  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' | wc -l
-//!  1b  ... excluding test-named paths                  179  180  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' -g '!*tests*' | wc -l
+//!  1a  App-pokes-Gui occurrences, rustdar-app          181  184  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' | wc -l
+//!  1b  ... excluding test-named paths                  176  179  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' -g '!*tests*' | wc -l
 //!  1c  ... that are setter pushes  [TARGET 0, HELD]      0    -  rg -o 'self\.''gui\.''set_' rustdar-app --glob '*.rs' | wc -l
 //!  2a  Gui setter fns in rustdar-egui/src/ui.rs          0    0  rg -o 'pub fn ''set_' rustdar-egui/src/ui.rs | wc -l
 //!  2b  ... over every inherent `impl Gui` block          1    1  see GUI_IMPL_SETTER_MAX — the walk, not a one-file grep
@@ -165,14 +175,60 @@ const LOOP_MANAGER_DEF: &str = concat!("struct LoopDownload", "Manager");
 /// a glob re-export and as a re-export route earlier in this campaign; under a
 /// **permanent** ceiling it is worse than dishonest bookkeeping, because it is
 /// the mechanism by which a permanent contract silently stops binding.
-const SELF_GUI_MAX: usize = 184;
+///
+/// # The tree contains that construct TWICE, and the debt is recorded here
+///
+/// A gate whose doc forbids a construct the tree contains twice is a
+/// prose-is-not-evidence defect sitting inside the gate. So, stated rather
+/// than implied — **WO-ARREARS measured both, and neither is borrow-forced**:
+///
+/// * `App::poll_overlay_fetch_results` in `app.rs` binds once before the drain
+///   and hides **4** reaches (`deliver_overlay_fetch`, `deliver_frame_listing`,
+///   `deliver_frame` twice).
+/// * `App::poll_overlay_render_results` in `app_render.rs` binds once inside
+///   the drain and hides **1** (`pane_mut`, inside the `retain` closure).
+///
+/// **Proven by compiling, not by reading.** Replacing each binding with a
+/// direct `self.``gui.` reach and building the crate's lib test target
+/// succeeds with **no diagnostic at all** — exit 0, no error, no warning, in
+/// both cases separately. The `app.rs` drain's other borrow is `self.channels`
+/// in the `while let` head, which is a disjoint field and released before the
+/// body runs; the `app_render.rs` closure's other borrow is `resp`, a local
+/// moved out of the channel. Neither binding splits a borrow. **They are
+/// evasion, and this doc says so.**
+///
+/// # Why they are still here, and what it costs
+///
+/// Shedding both makes this walk read **186** (measured: the walker's own
+/// failure message with both shed), against the 181 it reads with them in
+/// place. That is five above this ceiling, and above both values it has
+/// carried since WO-E9e — 185, then 184. It is *not* above every value in this
+/// constant's history: the pin has read 204, 192, 191 and 188 earlier in the
+/// campaign, and 186 would have fitted under any of those. That headroom was
+/// spent down deliberately and is not available to reclaim, which is the whole
+/// point of a ratchet. So the shed cannot be landed together with the honest
+/// number — it would need a **raise**, which requires a written plan amendment
+/// and which WO-ARREARS refused to take on its own authority. The per-file scrape moves the same
+/// way: `app.rs` 37 -> 41 and `app_render.rs` 108 -> 109.
+///
+/// So the debt is **recorded, not absorbed**: the coupling this crate really
+/// has is 186, this walk sees 181, and the difference is those five reaches.
+/// The land that sheds them is the land that must also shed five real reaches
+/// — or carry the amendment that says otherwise. **A third such binding has no
+/// standing at all**: it would be new evasion, and this doc is the record that
+/// the two here were found, measured and left deliberately rather than
+/// overlooked.
+const SELF_GUI_MAX: usize = 181;
 /// Row 1b — the same needle outside test-named paths.
 ///
-/// Everything on [`SELF_GUI_MAX`] applies here: permanent, falls only, no
-/// headroom, same two sheds, same forbidden re-spelling. This row is the one
-/// that matters for behaviour — the other counts the suites that exercise the
-/// coupling as well, and a suite is allowed to name what it tests.
-const SELF_GUI_NON_TEST_MAX: usize = 179;
+/// Everything on [`SELF_GUI_MAX`] applies here: permanent, falls only, sits on
+/// its measurement, same two sheds, same forbidden re-spelling — and the same
+/// recorded debt, because **both hidden bindings are in production files**, so
+/// all five of them are missing from this count too (176 seen, 181 real). This
+/// row is the one that matters for behaviour — the other counts the suites
+/// that exercise the coupling as well, and a suite is allowed to name what it
+/// tests.
+const SELF_GUI_NON_TEST_MAX: usize = 176;
 /// Row 2a — **`ui.rs`'s own `impl Gui` block, and only that file**.
 ///
 /// **0 since WO-E8b**, which is where the plan said it would land. The last
@@ -502,8 +558,8 @@ fn the_app_pokes_gui_coupling_never_grows() {
     assert!(
         total <= SELF_GUI_MAX,
         "the App-pokes-Gui coupling grew: {total} occurrences > ceiling {SELF_GUI_MAX}. \
-         This is a PERMANENT contract with no headroom, not migration scaffolding: \
-         shed first, then land. The two honest sheds are loop-state addressing and \
+         This is a PERMANENT contract sitting on its measured value, not \
+         migration scaffolding: shed first, then land. The two honest sheds are loop-state addressing and \
          the all-panes-versus-visible-panes distinction; if neither is reachable \
          inside your charter, stop and report. Never raise this without a written \
          plan amendment, and never re-spell the reads through a local binding - \
@@ -513,7 +569,8 @@ fn the_app_pokes_gui_coupling_never_grows() {
         non_test <= SELF_GUI_NON_TEST_MAX,
         "the App-pokes-Gui coupling grew outside tests: {non_test} occurrences > \
          ceiling {SELF_GUI_NON_TEST_MAX}. Same permanent contract, same two sheds, \
-         same refusal to raise or re-spell - see the constant's own doc."
+         same refusal to raise or re-spell - see the constant's own doc, which \
+         also records the five reaches two local bindings currently hide."
     );
 
     // The target-zero half, held as a TEST rather than as a grep in a log: the
