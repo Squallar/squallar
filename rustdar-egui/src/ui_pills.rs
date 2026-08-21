@@ -4,6 +4,7 @@
 use crate::actions::GuiAction;
 use crate::pane::PaneId;
 use crate::ui_layout::PointerModality;
+use rustdar_radar::sites::RadarNetwork;
 use rustdar_radar::types::RenderView;
 use rustdar_source::product::FieldId;
 
@@ -221,15 +222,18 @@ pub(super) fn site_list_ui(
 
     let query = query.trim().to_uppercase();
     let matches = |name: &str| query.is_empty() || name.contains(query.as_str());
-    let shown: Vec<(&'static str, bool, bool)> = radars
+    // The row carries the network as DATA. `is_tdwr_id` survives at exactly one
+    // site — the unplaced members, which have no row to ask — and nothing here
+    // re-derives the classification from a prefix.
+    let shown: Vec<(&'static str, RadarNetwork, bool)> = radars
         .iter()
         .filter(|site| matches(site.name))
-        .map(|site| (site.name, site.is_tdwr(), true))
+        .map(|site| (site.name, site.network, true))
         .chain(
             unplaced
                 .iter()
                 .filter(|name| matches(name))
-                .map(|name| (*name, rustdar_radar::sites::is_tdwr_id(name), false)),
+                .map(|name| (*name, RadarNetwork::of_id(name), false)),
         )
         .collect();
 
@@ -274,23 +278,52 @@ pub(super) fn site_list_ui(
         .id_salt("site_list")
         .max_height(SITE_LIST_HEIGHT)
         .show(ui, |ui| {
-            for (name, is_tdwr, is_placed) in shown {
-                let is_current = current == name;
-                // TDWRs are marked rather than hidden or disabled: they are
-                // pickable, but a pick lands on a different instrument
-                // (single-pol, ~89 km of Doppler range around one airport,
-                // none of the Level III products this app fetches).
-                let label = match (is_tdwr, is_placed) {
-                    (true, true) => format!("{name} - TDWR"),
-                    (true, false) => format!("{name} - TDWR, position unknown"),
-                    (false, false) => format!("{name} - position unknown"),
-                    (false, true) => name.to_owned(),
-                };
-                let row = ui.selectable_label(is_current, label.as_str());
-                #[cfg(test)]
-                outcome.rows.push((name.to_owned(), row.rect, is_current));
-                if row.clicked() && !is_current {
-                    outcome.picked = Some(name.to_owned());
+            // Two groups, WSR-88D first. The split is presentation only: the
+            // search above spans both, every row stays pickable, and what a
+            // pick persists is still the bare ICAO, so a reopen is unchanged.
+            // A heading is drawn only over a group that has rows -- an empty
+            // section is not an expressed option, it is furniture.
+            let groups = [
+                // "NEXRAD" rather than "WSR-88D" because the caption three
+                // lines above already spells it that way, and one widget must
+                // not use two words for one network.
+                (RadarNetwork::Wsr88d, "NEXRAD"),
+                (RadarNetwork::Tdwr, "TDWR"),
+            ];
+            let labelled = groups
+                .iter()
+                .filter(|(network, _)| shown.iter().any(|(_, n, _)| n == network))
+                .count()
+                > 1;
+            for (network, heading) in groups {
+                let mut drew_heading = false;
+                for (name, row_network, is_placed) in shown.iter().filter(|(_, n, _)| *n == network)
+                {
+                    if labelled && !drew_heading {
+                        ui.label(egui::RichText::new(heading).small().weak());
+                        drew_heading = true;
+                    }
+                    let name = *name;
+                    let is_current = current == name;
+                    // TDWRs stay marked as well as grouped: a pick lands on a
+                    // different instrument (single-pol, ~89 km of Doppler range
+                    // around one airport, none of the Level III products this
+                    // app fetches), and the marker is what says so on the row
+                    // itself rather than only above it.
+                    let label = match (*row_network, *is_placed) {
+                        (RadarNetwork::Tdwr, true) => format!("{name} - TDWR"),
+                        (RadarNetwork::Tdwr, false) => {
+                            format!("{name} - TDWR, position unknown")
+                        }
+                        (RadarNetwork::Wsr88d, false) => format!("{name} - position unknown"),
+                        (RadarNetwork::Wsr88d, true) => name.to_owned(),
+                    };
+                    let row = ui.selectable_label(is_current, label.as_str());
+                    #[cfg(test)]
+                    outcome.rows.push((name.to_owned(), row.rect, is_current));
+                    if row.clicked() && !is_current {
+                        outcome.picked = Some(name.to_owned());
+                    }
                 }
             }
         });
@@ -302,10 +335,13 @@ fn shown_total_tdwrs(
     radars: &[rustdar_radar::sites::RadarSite],
     unplaced: &[&'static str],
 ) -> usize {
-    radars.iter().filter(|site| site.is_tdwr()).count()
+    radars
+        .iter()
+        .filter(|site| site.network == RadarNetwork::Tdwr)
+        .count()
         + unplaced
             .iter()
-            .filter(|name| rustdar_radar::sites::is_tdwr_id(name))
+            .filter(|name| RadarNetwork::of_id(name) == RadarNetwork::Tdwr)
             .count()
 }
 
