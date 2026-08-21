@@ -93,6 +93,13 @@ fn a_pane_in_no_group_is_alone_in_every_dimension() {
     );
     assert_eq!(gui.layer_sync_targets(1), vec![1]);
     assert!(!gui.panes_layer_linked(0, 1) && !gui.panes_time_linked(0, 1));
+    // But it still matches itself: the app-side dedup filters ask this of
+    // their own pane's queued work, and a pane that could not match itself
+    // would stop deduplicating its own renders on leaving every group.
+    assert!(
+        gui.panes_share_group(1, 1) && gui.panes_layer_linked(1, 1),
+        "a pane must answer true about itself whether or not it is in a group"
+    );
 }
 
 /// **Two groups load and converge independently.** Pane 0 drives group A onto

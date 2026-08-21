@@ -11,11 +11,20 @@ use super::*;
 use crate::pane::GroupId;
 
 impl Gui {
-    /// Whether panes `a` and `b` are in the same link group. An index no pane
-    /// occupies answers **true**, matching the `is_none_or` reading every
-    /// per-pane predicate here has always used: a target that does not exist
-    /// is not a target this function is entitled to exclude.
+    /// Whether panes `a` and `b` are in the same link group.
+    ///
+    /// One pane always answers **true** about itself, group or no group. The
+    /// app-side dedup filters ask this of their own pane's queued work, and a
+    /// pane that could not match itself would stop deduplicating its own
+    /// renders the moment it left every group.
+    ///
+    /// An index no pane occupies also answers true, matching the `is_none_or`
+    /// reading every per-pane predicate here has always used: a target that
+    /// does not exist is not a target this function is entitled to exclude.
     pub fn panes_share_group(&self, a: PaneId, b: PaneId) -> bool {
+        if a == b {
+            return true;
+        }
         match (self.panes.get(a), self.panes.get(b)) {
             (Some(x), Some(y)) => x.in_group_with(y),
             _ => true,
