@@ -137,6 +137,16 @@ fn pill_popup_id(idx: PaneId, pill: PillKind) -> egui::Id {
     egui::Id::new(("pill_popup", idx, pill))
 }
 
+/// **Shut every popover pane `idx` owns.** Called by `Gui::close_pane` for the
+/// closed slot and every slot above it: these ids are salted on the pane
+/// index, so an open popover left behind at index 3 reopens on whichever pane
+/// renumbering puts at 3.
+pub(super) fn close_pane_popovers(ctx: &egui::Context, idx: PaneId) {
+    for pill in POPOVER_PILLS {
+        egui::Popup::close_id(ctx, pill_popup_id(idx, pill));
+    }
+}
+
 /// One pane's pill row, as it was drawn — reported by the renderer.
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]

@@ -105,6 +105,57 @@ pub enum GuiAction {
     ReleaseVolume {
         pane_idx: usize,
     },
+    /// **Every store you key on this pane index and the ones above it is now
+    /// about a different pane.** Emitted once, by `Gui::close_pane`, after the
+    /// slot has been removed and the panes above it have shifted down.
+    ///
+    /// `PaneId` is positional, so a close renumbers. The app's own per-pane
+    /// stores — the positional `pane_render` vector and the
+    /// `(pane_idx, layer)`-keyed overlay dispatch records — cannot see that
+    /// happen, and a render already running for the old index would land on
+    /// whatever pane now stands there. This is the wire that tells them to let
+    /// go. It is a *drop*, not a shift: stable pane ids are the real fix and
+    /// are much larger than this.
+    PaneClosed {
+        pane_idx: usize,
+    },
+}
+
+impl GuiAction {
+    /// **Which pane this action is about**, or `None` for one that is about
+    /// the app rather than a pane.
+    ///
+    /// Matched exhaustively with no wildcard arm on purpose: a new variant
+    /// carrying a `pane_idx` has to answer here, or it will not compile — and
+    /// an action that escapes this is an action `Gui::close_pane` cannot
+    /// invalidate.
+    pub fn pane_idx(&self) -> Option<usize> {
+        match self {
+            Self::Exit
+            | Self::FetchRadarScan(_)
+            | Self::CheckForNewScans(_)
+            | Self::StartGps { .. }
+            | Self::StopGps
+            | Self::RequestLocation
+            | Self::StopLocation
+            | Self::OpenLocationSettings => None,
+            Self::SwitchRadarSite { pane_idx, .. }
+            | Self::FetchOverlay { pane_idx, .. }
+            | Self::RefreshOverlay { pane_idx, .. }
+            | Self::RenderOverlay { pane_idx, .. }
+            | Self::EnableLoop { pane_idx, .. }
+            | Self::DisableLoop { pane_idx }
+            | Self::ToggleLoopPlayback { pane_idx }
+            | Self::StepLoopFrame { pane_idx, .. }
+            | Self::SeekLoopFrame { pane_idx, .. }
+            | Self::NavigateTime { pane_idx, .. }
+            | Self::NavigateOneScan { pane_idx, .. }
+            | Self::JumpToLive { pane_idx }
+            | Self::PrepareVolume { pane_idx, .. }
+            | Self::ReleaseVolume { pane_idx }
+            | Self::PaneClosed { pane_idx } => Some(*pane_idx),
+        }
+    }
 }
 
 impl std::fmt::Display for GuiAction {
@@ -222,6 +273,13 @@ impl std::fmt::Display for GuiAction {
             }
             GuiAction::ReleaseVolume { pane_idx } => {
                 write!(f, "Release the volume pane {} was holding", pane_idx)
+            }
+            GuiAction::PaneClosed { pane_idx } => {
+                write!(
+                    f,
+                    "Pane {} closed; every store keyed on it or above it is stale",
+                    pane_idx
+                )
             }
         }
     }

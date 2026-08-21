@@ -49,6 +49,10 @@ pub struct Gui {
     /// the real width class, which is later than the load. One shot — see
     /// `Gui::settle_pane_layout`.
     pub(super) restored_ratios: Option<(Vec<f32>, Vec<Vec<f32>>)>,
+    /// A pane the user has asked to close, applied at the end of the frame —
+    /// after every `mem::take`n pane is back in the vector, and with the whole
+    /// frame's action list in hand to invalidate. See `Gui::close_pane`.
+    pub(super) pending_pane_close: Option<PaneId>,
     /// Remembered color-scale bar orientation for the map panel (hysteresis, so
     /// a resize near the boundary cannot make the bars hop).
     pub(super) color_scale_orientation: ColorScaleOrientation,
@@ -417,6 +421,7 @@ impl Gui {
             pane_layout: PaneLayout::default(),
             split_orientation: crate::pane::SplitOrientation::default(),
             restored_ratios: None,
+            pending_pane_close: None,
             color_scale_orientation: ColorScaleOrientation::default(),
             map_pane_geo: HashMap::new(),
             volume_empty_states: HashMap::new(),

@@ -675,6 +675,34 @@ impl RenderDispatcher {
         true
     }
 
+    /// **Let go of every per-pane store from slot `from` upward.**
+    ///
+    /// The answer to `GuiAction::PaneClosed`. `PaneId` is a slot position, so
+    /// closing a pane renumbers the ones above it — and both stores here are
+    /// keyed on position: [`pane_render`](Self::pane_render) by index, and
+    /// `last_overlay_dispatch` by `(pane index, layer)`. Neither can see the
+    /// renumber happen, so `pane_render[from]`'s cached raster, its
+    /// `last_rendered` dedupe and any render still running for it would all be
+    /// applied to whichever pane has just taken that number.
+    ///
+    /// This drops rather than shifts, matching the UI side: `abandon_results`
+    /// makes the outstanding renders unwanted, the entries go, and
+    /// [`Self::ensure_pane_count`] grows the vector back with fresh state on
+    /// the next frame. Stable pane ids are the fix that would let this shift
+    /// instead, and they are much larger than this.
+    pub fn forget_panes_from(&mut self, from: usize) {
+        for prs in self.pane_render.iter_mut().skip(from) {
+            prs.last_rendered = None;
+            prs.cached_render = None;
+            prs.render_finished();
+            // Paired with the line above: see `results_wanted`.
+            prs.abandon_results();
+        }
+        self.pane_render.truncate(from);
+        self.last_overlay_dispatch
+            .retain(|(pane_idx, _), _| *pane_idx < from);
+    }
+
     /// Ensure the pane_render vec has at least `count` entries.
     pub fn ensure_pane_count(&mut self, count: usize) {
         while self.pane_render.len() < count {

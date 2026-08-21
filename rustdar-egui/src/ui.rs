@@ -1183,6 +1183,127 @@ impl Gui {
         self.pane_layout.pane_count == count
     }
 
+    /// Ask for pane `idx` to be closed. Applied at the end of the frame — see
+    /// [`Gui::apply_pending_pane_close`] — because the active pane is
+    /// `mem::take`n out of the vector while the inspector and the layers panel
+    /// draw, and removing a slot underneath that would restore the taken pane
+    /// into the wrong one.
+    pub(crate) fn request_pane_close(&mut self, idx: PaneId) {
+        self.pending_pane_close = Some(idx);
+    }
+
+    /// **Close one specific pane, and let go of everything keyed on the
+    /// indices that just moved.**
+    ///
+    /// `PaneId` is a slot position, so closing pane *n* renumbers every pane
+    /// above it. Stable ids decoupled from position are the real fix; this is
+    /// the pragmatic one — renumber, and drop the in-flight work for `idx` and
+    /// above rather than try to follow it.
+    ///
+    /// What that covers, and why each one is here:
+    ///
+    /// * **`actions`** — every action this frame already queued naming a pane
+    ///   at or above `idx`. They were addressed to panes that no longer sit
+    ///   there. Matched through [`GuiAction::pane_idx`], which is exhaustive
+    ///   so a future variant cannot escape it.
+    /// * **The app's per-pane stores**, through two actions, because they are
+    ///   the app's and this crate cannot reach them:
+    ///   [`GuiAction::ReleaseVolume`] for every *old* index from `idx` up, for
+    ///   the volume store's index-keyed refcount and the GPU resources it
+    ///   names; and [`GuiAction::PaneClosed`] for the positional render state
+    ///   and the `(pane, layer)`-keyed overlay dispatch records.
+    /// * **`map_pane_geo` and `volume_empty_states`**, both `HashMap<usize,_>`
+    ///   over pane indices. Rebuilt every frame, cleared here anyway so no
+    ///   reader between now and the next `render_panes` sees the wrong pane's
+    ///   answer.
+    /// * **Each moved pane's `render_in_flight` marks.** The dispatch that set
+    ///   one is recorded under the pane's *old* index, so its raster will
+    ///   never reach the pane now standing there; without clearing the mark
+    ///   the pane would never ask again.
+    /// * **Each moved pane's `rendered_for`.** It is what the level-triggered
+    ///   [`GuiAction::PrepareVolume`] dedupes on, and the volume it names has
+    ///   just been released above.
+    /// * **The pending appliers** that carry a `PaneId`, and the pill row's
+    ///   reveal state plus its popovers, whose egui `Id`s are salted on the
+    ///   pane index — a popover left open on old pane 3 would reopen on
+    ///   whichever pane lands at 3.
+    ///
+    /// Returns whether a pane was closed. The last pane is never closed: a
+    /// window with no pane has nothing to show.
+    pub(crate) fn close_pane(
+        &mut self,
+        ctx: &egui::Context,
+        idx: PaneId,
+        actions: &mut Vec<GuiAction>,
+    ) -> bool {
+        let old_count = self.visible_pane_count();
+        if old_count <= 1 || idx >= old_count || idx >= self.panes.len() {
+            return false;
+        }
+
+        actions.retain(|action| action.pane_idx().is_none_or(|at| at < idx));
+        for stale in idx..old_count {
+            actions.push(GuiAction::ReleaseVolume { pane_idx: stale });
+        }
+        actions.push(GuiAction::PaneClosed { pane_idx: idx });
+
+        self.panes.remove(idx);
+
+        self.map_pane_geo.clear();
+        self.volume_empty_states.clear();
+        self.pill_revealed = None;
+        for stale in idx..old_count {
+            pills::close_pane_popovers(ctx, stale);
+        }
+        if self.pending_pane_view.is_some_and(|(at, _)| at >= idx) {
+            self.pending_pane_view = None;
+        }
+        if self
+            .pending_section_line
+            .as_ref()
+            .is_some_and(|(at, _)| *at >= idx)
+        {
+            self.pending_section_line = None;
+        }
+        if self
+            .pending_region
+            .as_ref()
+            .is_some_and(|(at, _)| *at >= idx)
+        {
+            self.pending_region = None;
+        }
+        if self
+            .pending_section_edit
+            .as_ref()
+            .is_some_and(|(at, _)| *at >= idx)
+        {
+            self.pending_section_edit = None;
+        }
+
+        for pane in self.panes.iter_mut().skip(idx) {
+            for cache in pane.overlay_textures.values_mut() {
+                cache.render_in_flight = false;
+            }
+            if let Some(volume) = pane.volume_mut() {
+                volume.rendered_for = None;
+            }
+        }
+
+        let new_count = old_count - 1;
+        // **The neighbour, not pane 0.** Closing the pane you are looking at
+        // moves you to the one that slid into its place — or, if it was the
+        // last, to the one before it. Closing any other pane leaves you on the
+        // pane you were on, under its new number.
+        self.active_pane = match self.active_pane {
+            at if at < idx => at,
+            at if at == idx => idx.min(new_count - 1),
+            at => at - 1,
+        };
+        self.pane_layout =
+            PaneLayout::for_count(new_count, self.layout.width, self.split_orientation);
+        true
+    }
+
     /// **Take the user's split preference and re-lay the grid to it now.**
     ///
     /// Applied here rather than waiting for the next frame's
@@ -1444,6 +1565,15 @@ impl Gui {
     #[cfg(test)]
     pub(crate) fn split_options_for_test(&self) -> &[SplitOptionProbe] {
         &self.probes.last_split_options
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_active_pane_for_test(&mut self, idx: PaneId) {
+        assert!(
+            idx < self.pane_layout.pane_count,
+            "no pane {idx} to activate"
+        );
+        self.active_pane = idx;
     }
 
     #[cfg(test)]

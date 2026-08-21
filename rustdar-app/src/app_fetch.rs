@@ -618,6 +618,13 @@ impl super::App {
             GuiAction::ReleaseVolume { pane_idx } => {
                 self.handle_release_volume(pane_idx);
             }
+            GuiAction::PaneClosed { pane_idx } => {
+                // The UI has renumbered. Everything this side keys on a pane
+                // *position* at or above the closed one describes a different
+                // pane now, and a render already running for one of those
+                // indices would land on whichever pane took its number.
+                self.render.forget_panes_from(pane_idx);
+            }
             GuiAction::FetchOverlay { .. } | GuiAction::RefreshOverlay { .. } => {
                 self.handle_overlay_action(action)
             }
