@@ -1045,6 +1045,60 @@ fn a_low_accuracy_fix_does_not_spend_the_provisional_site() {
     assert_eq!(opening_site(&app), "KDLH");
 }
 
+/// The upgrade asks **pane 0** whether the move would be a no-op and then moves the
+/// **active** pane. With one pane those are the same pane; with two they need not be, and
+/// the short-circuit then answers about a pane nobody was going to move — so the pane the
+/// switch names never moves, and `site_is_provisional` is spent regardless, so no later fix
+/// retries it.
+#[test]
+fn a_fix_moves_the_active_pane_even_when_pane_zero_is_already_there() {
+    use rustdar_egui::UI_CONFIG_KEY;
+    use rustdar_kv::KvStore;
+
+    let mut bridge = TestBridge::desktop().with_timezone("America/Chicago");
+    let fixes = bridge.gps_channel();
+    let mut app = headless(bridge);
+    assert!(
+        app.site_is_provisional,
+        "precondition: the timezone guess must still be the one a fix may refine",
+    );
+
+    // Pane 0 sits on the radar the fix is about to name; the active pane does not.
+    let store = MemoryKvStore::default();
+    store
+        .store(
+            UI_CONFIG_KEY,
+            r#"{"pane_count":2,"active_pane":1,"site":"KDLH",
+                "panes":[{"site":"KDLH"},{"site":"KLOT"}]}"#,
+        )
+        .expect("the memory store always accepts a write");
+    assert!(
+        app.gui.load_ui_config(&store),
+        "the two-pane fixture config did not parse"
+    );
+    app.render.ensure_pane_count(2);
+    assert_eq!(
+        (app.gui.active_pane_idx(), opening_site(&app)),
+        (1, "KDLH".to_string()),
+        "precondition: pane 0 on the fix's radar, and the active pane elsewhere",
+    );
+
+    fixes
+        .send(rustdar_location::Fix {
+            accuracy_m: Some(25.0),
+            ..rustdar_location::Fix::from_device_position(46.7867, -92.1005)
+        })
+        .unwrap();
+    app.poll_platform_state();
+
+    assert_eq!(
+        app.gui.pane(1).expect("the fixture built two panes").site(),
+        "KDLH",
+        "the fix refined nothing: the no-op check asked pane 0, which was \
+         already there, so the pane the switch names never moved",
+    );
+}
+
 // ── The location permission gate, from the App's side ───────────────
 // `rustdar_location::gate` owns the state machine and tests it against a clock it controls.
 

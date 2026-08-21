@@ -614,14 +614,22 @@ impl super::App {
         };
         // Still a guess either way, so a later location fix may refine it.
         self.site_is_provisional = true;
-        if self.gui.pane(0).is_some_and(|pane| pane.site() == site) {
+        // The pane asked has to be the pane opened: a hint that checks pane 0 and switches
+        // the active pane skips the move whenever those differ, and the hint is already
+        // spent by then.
+        let pane_idx = self.gui.active_pane_idx();
+        if self
+            .gui
+            .pane(pane_idx)
+            .is_some_and(|pane| pane.site() == site)
+        {
             return;
         }
         log::info!("opening on {site}, nearest to timezone {zone}");
         self.handle_gui_action(
             crate::app::GuiAction::SwitchRadarSite {
                 site: site.to_string(),
-                pane_idx: self.gui.active_pane_idx(),
+                pane_idx,
             },
             None,
         );
