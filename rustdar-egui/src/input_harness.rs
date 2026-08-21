@@ -674,24 +674,18 @@ impl InputHarness {
             .map(|state| state.rect())
     }
 
-    /// Close the inspector the user's way — its own ⟩ collapse button on the
-    /// hosts that draw one. The sheet host draws none (M7's sheet-header
-    /// polish: the back-chain is the close there), so on Compact this walks
-    /// the same back press a phone user would; the page beneath survives
-    /// either way. A no-op when it is closed.
+    /// Close the inspector the user's way — its own `×`, which every host
+    /// draws, the sheet included. A no-op when it is closed.
     pub(crate) fn close_inspector(&mut self) {
         let probe = self.inspector();
         if !probe.open {
             return;
         }
-        if probe.collapse == egui::Rect::NOTHING {
-            assert!(
-                self.gui.dismiss_top_layer(),
-                "the inspector page was open, so a back press must pop it"
-            );
-        } else {
-            self.mouse_click(probe.collapse.center());
-        }
+        assert!(
+            probe.close.is_positive(),
+            "the open inspector drew no × to close it with"
+        );
+        self.mouse_click(probe.close.center());
         self.warm_up();
         assert!(
             !self.inspector().open,

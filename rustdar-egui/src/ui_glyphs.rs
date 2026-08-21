@@ -40,14 +40,11 @@ pub(crate) const ICON_GLYPHS: &[(char, &str)] = &[
     ('\u{2297}', "unlinked from shared time (the Sync pill)"),
     (
         '\u{d7}',
-        "close / deselect / dismiss (icon); times in grid sizes and \
-         vertical exaggeration (text)",
+        "close / dismiss (icon) - and nothing else, so a control spelling \
+         it always closes; times in grid sizes and vertical exaggeration (text)",
     ),
     ('\u{2039}', "collapse the stack leftward"),
-    (
-        '\u{203a}',
-        "collapse the inspector rightward; crumb and row chevrons",
-    ),
+    ('\u{203a}', "crumb and row chevrons"),
     ('\u{2316}', "pointer readout position marker"),
     ('\u{21ba}', "rotate the section line counter-clockwise"),
 ];
