@@ -50,6 +50,8 @@ impl Gui {
             self.menu_open = false;
         }
 
+        self.expire_site_query(ctx);
+
         self.enforce_fade_invariants(ctx);
 
         let mut root_ui = egui::Ui::new(

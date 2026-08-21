@@ -184,6 +184,11 @@ pub struct Gui {
     pub(super) catalog_saving: bool,
     /// The site list's search text — the inspector body and the site pill's
     /// popover filter through the one field, as they render the one list.
+    ///
+    /// **Session-only, and cleared at the end of the gesture that used it**: a
+    /// filter is a gesture in progress, not a preference, and a stale one
+    /// reads as a broken list on the next open. See
+    /// [`Self::clear_site_query`].
     pub(super) site_query: String,
     /// Which pass each autofocusing search field last drew on.
     ///

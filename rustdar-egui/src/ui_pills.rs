@@ -982,6 +982,41 @@ impl super::Gui {
         }
     }
 
+    /// **Forget the site filter.** The one string is shared by every pane and
+    /// both routes, so a query that outlives its gesture greets the next open
+    /// as a list with most of the network missing from it.
+    pub(super) fn clear_site_query(&mut self) {
+        self.site_query.clear();
+    }
+
+    /// Drop the site filter once no surface that hosts it is drawing any more.
+    ///
+    /// The explicit [`Self::clear_site_query`] calls cover the pick; this
+    /// covers every other way out — Escape, a click outside the popover, the
+    /// inspector switching to another body, the sheet page changing — without
+    /// naming any of them. Spelled against the pass counter rather than
+    /// against each host's open flag: the field has two hosts today, and a
+    /// rule written per host is one a third host silently escapes.
+    ///
+    /// Runs before the frame draws, so the passes recorded are the previous
+    /// frame's.
+    pub(super) fn expire_site_query(&mut self, ctx: &egui::Context) {
+        if self.site_query.is_empty() {
+            return;
+        }
+        let pass = ctx.cumulative_pass_nr();
+        let hosted = self.search_focus_pass.iter().any(|(field, last)| {
+            matches!(
+                field,
+                super::state::SearchField::SitePopover(_)
+                    | super::state::SearchField::InspectorSite
+            ) && *last + 1 >= pass
+        });
+        if !hosted {
+            self.clear_site_query();
+        }
+    }
+
     /// Give `search` the keyboard on the pass its surface opens, and on no
     /// other.
     ///
@@ -1311,6 +1346,7 @@ impl super::Gui {
                         site: picked,
                         pane_idx: idx,
                     });
+                    self.clear_site_query();
                     ui.close_kind(egui::UiKind::Menu);
                 } else if outcome.picked_current {
                     // The row is already the answer, so there is nothing to
@@ -1318,6 +1354,7 @@ impl super::Gui {
                     // and leaves the picker up reads as a dead control.
                     // Dismissing is the honest response, and deliberately not
                     // a refresh: refresh lives in the menu.
+                    self.clear_site_query();
                     ui.close_kind(egui::UiKind::Menu);
                 }
             });
