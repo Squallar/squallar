@@ -23,6 +23,7 @@
     {
       "center": null,
       "cross_section": null,
+      "group": 0,
       "kind": "Map",
       "layer_link": true,
       "layer_slots": [

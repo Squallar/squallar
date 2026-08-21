@@ -124,8 +124,17 @@ fn a_legacy_global_off_seeds_every_restored_panes_links_off() {
 /// M11-4. **A config with no legacy globals — one this build wrote, or an old one
 /// that simply never mentioned them — loads with every pane linked, and the legacy
 /// fields are never written again.**
+///
+/// Extended at WO-SYNCGROUP with the group half of the same claim: a file
+/// written before groups existed names no group, and every one of its panes
+/// must come back **in group A**, not out of every group. That is the whole
+/// migration — one group holding everybody is exactly what three per-pane
+/// booleans with no group described — and it is why there is no `migrate.rs`
+/// step and no `CONFIG_VERSION` bump for the field.
 #[test]
 fn absent_legacy_globals_mean_linked_and_are_never_rewritten() {
+    use crate::pane::GroupId;
+
     let store = MemoryKvStore::default();
     store
         .store(
@@ -142,7 +151,20 @@ fn absent_legacy_globals_mean_linked_and_are_never_rewritten() {
             pane.viewport_link && pane.layer_link && pane.time_link,
             "pane {idx}: absent legacy fields must load as all-linked"
         );
+        assert_eq!(
+            pane.group,
+            Some(GroupId::FIRST),
+            "pane {idx}: a file that names no group must load as one group \
+             holding every pane - anything else changes what an old config \
+             means"
+        );
     }
+    // Behaviour, not just the field: the two panes reach each other.
+    assert!(
+        restored.panes_layer_linked(0, 1) && restored.panes_time_linked(0, 1),
+        "the migrated panes must actually sync with one another, which is \
+         what the flags alone used to say"
+    );
 
     let json = restored.ui_config_json().expect("serializable");
     assert!(
@@ -152,6 +174,67 @@ fn absent_legacy_globals_mean_linked_and_are_never_rewritten() {
     assert!(
         json.contains("\"viewport_link\"") && json.contains("\"layer_link\""),
         "the per-pane links are the persisted state now"
+    );
+    assert!(
+        json.contains("\"group\""),
+        "and the group is persisted beside them, or the next reopen loses \
+         which panes were together"
+    );
+}
+
+/// **A pane's group survives a save and a load, including the pane that is in
+/// no group at all** — the state `#[serde(default)]` alone would silently
+/// convert back into group A on every restart.
+#[test]
+fn the_group_round_trips_including_the_pane_that_is_in_none() {
+    use crate::pane::GroupId;
+
+    let second = GroupId::from_index(1).expect("a layout can hold six groups");
+    let store = MemoryKvStore::default();
+    let mut gui = crate::Gui::new();
+    gui.set_pane_count_for_test(3);
+    gui.pane_mut(1).expect("pane 1").group = Some(second);
+    gui.pane_mut(2).expect("pane 2").group = None;
+    gui.save_ui_config(&store);
+
+    let mut restored = crate::Gui::new();
+    restored.set_pane_count_for_test(3);
+    assert!(restored.load_ui_config(&store));
+    assert_eq!(
+        restored.pane(0).expect("pane 0").group,
+        Some(GroupId::FIRST),
+    );
+    assert_eq!(restored.pane(1).expect("pane 1").group, Some(second));
+    assert_eq!(
+        restored.pane(2).expect("pane 2").group,
+        None,
+        "the pane in no group came back in one - a reopen that re-links what \
+         the user unlinked is not 1:1"
+    );
+    assert!(
+        !restored.panes_share_group(0, 1) && !restored.panes_share_group(0, 2),
+        "and the restored panes must not reach each other"
+    );
+}
+
+/// A group index no layout can reach — a file from a build with more panes,
+/// or a hand-edited one — loads as no group rather than panicking on the
+/// palette's bounds.
+#[test]
+fn a_group_index_this_build_has_no_letter_for_loads_as_no_group() {
+    let store = MemoryKvStore::default();
+    store
+        .store(
+            UI_CONFIG_KEY,
+            r#"{"pane_count":1,"panes":[{"site":"KMPX","group":250}]}"#,
+        )
+        .unwrap();
+    let mut restored = crate::Gui::new();
+    assert!(restored.load_ui_config(&store));
+    assert_eq!(
+        restored.pane(0).expect("pane 0").group,
+        None,
+        "an unreachable index must degrade to no group"
     );
 }
 

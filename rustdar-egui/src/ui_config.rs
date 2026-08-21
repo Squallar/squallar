@@ -58,6 +58,16 @@ struct PaneConfig {
     /// Time step size in seconds (0 = single scan mode).
     #[serde(default = "default_time_step")]
     time_step_secs: i64,
+    /// **Which link group this pane belongs to**, as the group's index;
+    /// `null` for a pane in no group at all.
+    ///
+    /// The default is deliberately not `Option`'s — an absent key must read
+    /// as [`crate::pane::GroupId::FIRST`], not as "no group", because every
+    /// config written before groups existed described one group holding every
+    /// pane. That is the whole migration: no `migrate.rs` step, no version
+    /// bump, and the flags beside it keep their meaning unchanged.
+    #[serde(default = "default_group")]
+    group: Option<u8>,
     /// Whether this pane follows shared time (plan §3.7). Defaults **true**.
     #[serde(default = "default_true")]
     time_link: bool,
@@ -440,12 +450,20 @@ fn default_true() -> bool {
     true
 }
 
+/// A pane whose config names no group is a pane from before groups existed,
+/// and every such pane was in the one group the flags described. See
+/// [`PaneConfig::group`].
+fn default_group() -> Option<u8> {
+    Some(crate::pane::GroupId::FIRST.index())
+}
+
 impl Default for PaneConfig {
     fn default() -> Self {
         Self {
             layers: BTreeMap::new(),
             spc_day: OutlookDay::Day1,
             time_step_secs: 600,
+            group: default_group(),
             time_link: true,
             viewport_link: true,
             layer_link: true,
@@ -963,6 +981,7 @@ impl super::Gui {
                     layers: BTreeMap::new(),
                     spc_day: OutlookDay::Day1,
                     time_step_secs: pane.time.step.as_secs(),
+                    group: pane.group.map(crate::pane::GroupId::index),
                     time_link: pane.time_link,
                     viewport_link: pane.viewport_link,
                     layer_link: pane.layer_link,
@@ -1260,6 +1279,7 @@ impl super::Gui {
             let pc = config.panes.get(i);
             let Some(pc) = pc else {
                 pane.time.step = crate::pane::TimeStep::from_secs(config.time_step_secs);
+                pane.group = Some(crate::pane::GroupId::FIRST);
                 pane.viewport_link = config.viewport_sync;
                 pane.layer_link = config.sync_layers;
                 pane.time_link = config.sync_layers;
@@ -1273,6 +1293,12 @@ impl super::Gui {
                 pane.set_site(pane_site);
             }
             pane.time.step = crate::pane::TimeStep::from_secs(pc.time_step_secs);
+            // **Downstream of the legacy fold, not a replacement for it.** The
+            // retired globals still seed the flags below; the group only says
+            // which panes those flags are scoped to, and a file that names no
+            // group says "all of them" through `default_group`. An index no
+            // layout can reach reads as no group rather than as a panic.
+            pane.group = pc.group.and_then(crate::pane::GroupId::from_index);
             pane.time_link = pc.time_link && config.sync_layers;
             pane.viewport_link = pc.viewport_link && config.viewport_sync;
             pane.layer_link = pc.layer_link && config.sync_layers;
