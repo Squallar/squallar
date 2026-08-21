@@ -27,10 +27,16 @@ const HEADER_ALLOWANCE: f32 = 40.0;
 /// `ui_glyphs.rs`).
 const COLLAPSE_LABEL: &str = "\u{2039}";
 
-/// The Add-layer buttons' label — one button above the rows and one below
-///, both opening the catalog: the list can be taller than the
-/// panel, and "add" is wanted at whichever end the scroll left the user.
-const ADD_LAYER_LABEL: &str = "+ Add layer";
+/// The catalog buttons' label — one above the rows and one below, both opening
+/// the same catalog: the list can be taller than the panel, and the way in is
+/// wanted at whichever end the scroll left the user.
+///
+/// It says "show", not "add", because nothing is ever added. Every pane holds
+/// a slot for every registered layer for as long as it exists (`pane.rs`,
+/// `layer_glue.rs`) — that always-full list is what makes adding a source one
+/// crate's work — so the rows below are the whole inventory and the catalog
+/// only turns one of them on.
+const ADD_LAYER_LABEL: &str = "+ Show a layer";
 
 /// The layer-less body's route to where the pane's real controls live (plan
 /// the plan): a pane that draws no map layers has no rows, and a panel that were
@@ -103,10 +109,10 @@ pub(crate) struct StackProbe {
     pub collapse: egui::Rect,
     /// Whether the stack was on screen this frame.
     pub open: bool,
-    /// The `+ Add layer` button above the rows — [`egui::Rect::NOTHING`] for
+    /// The `+ Show a layer` button above the rows — [`egui::Rect::NOTHING`] for
     /// a pane that draws no map layers, which has no rows to add to.
     pub add_top: egui::Rect,
-    /// The `+ Add layer` button below the rows, on the same terms.
+    /// The `+ Show a layer` button below the rows, on the same terms.
     pub add_bottom: egui::Rect,
     /// The rows, top row first — draw order reversed.
     pub rows: Vec<StackRowProbe>,
@@ -319,8 +325,8 @@ impl super::Gui {
         // and whose colour scale goes onto its glass
         // (`PaneState::draws_map_layers`). A cross-section draws none of them
         // and is the one kind left with nothing to list: no rows, and no
-        // Add-layer buttons, because the catalog adds map layers and this pane
-        // has no map to add them to. What its body has instead (the M8 fix — a
+        // catalog buttons, because the catalog shows map layers and this pane
+        // has no map to show them on. What its body has instead (the M8 fix — a
         // bare one-liner read as a broken panel): the explained absence as a
         // padded caption, and the one action that *does* apply — the pane's own
         // properties, where a section pane's real controls live.
@@ -392,6 +398,14 @@ impl super::Gui {
                     egui::Sense::click(),
                 );
                 row_rects.push(row_rect);
+                // The catalog's other half: applying a tile selects the layer
+                // in the inspector, and this brings its row into view, so the
+                // two surfaces visibly name the same thing. One-shot — a
+                // standing target would fight every scroll the user makes.
+                if self.stack_scroll_to.as_ref() == Some(kind) {
+                    self.stack_scroll_to = None;
+                    row.scroll_to_me(Some(egui::Align::Center));
+                }
                 let lifting = self.stack_drag.as_ref() == Some(kind);
 
                 // Hover and selection read as the whole row, in the stock

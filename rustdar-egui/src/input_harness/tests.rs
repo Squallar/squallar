@@ -8537,6 +8537,65 @@ fn an_overlay_tile_enables_the_layer_and_selects_it() {
     );
 }
 
+/// **A catalog tile brings its stack row into view** — the other half of
+/// "nothing is ever added".
+///
+/// Every pane holds a row for every registered layer, always, so a tile turns
+/// one on rather than creating one. That only reads as true if the row it
+/// refers to is where the user can see it when the modal closes; otherwise the
+/// visible result of "Show a layer" is a panel that did not obviously change.
+#[test]
+fn a_catalog_tile_scrolls_the_stack_to_the_row_it_turned_on() {
+    // Short enough that the stack cannot draw its whole inventory at once.
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 460.0));
+    h.open_layers();
+
+    let panel = h.layers_panel_rect().expect("the stack was just opened");
+    // Out of the *panel*, not off the screen: a scrolled-past row still lays
+    // out at a screen coordinate, it is simply outside the viewport that
+    // clips it.
+    let off_screen = |h: &InputHarness| {
+        h.stack_row(&known::SPC_OUTLOOK).is_some_and(|row| {
+            h.layers_panel_rect()
+                .is_none_or(|panel| !panel.contains(row.rect.center()))
+        })
+    };
+    // Drive the list to the far end from the target row, and insist it got
+    // there — without this precondition the assertion below cannot fail.
+    let scrolled = h.scroll_until(panel.center(), egui::vec2(0.0, 120.0), 60, off_screen)
+        || h.scroll_until(panel.center(), egui::vec2(0.0, -120.0), 60, off_screen);
+    assert!(
+        scrolled,
+        "the stack drew its whole inventory on a 460 pt screen, so this test \
+         cannot tell a scroll from a no-op"
+    );
+
+    h.open_catalog();
+    assert!(
+        off_screen(&h),
+        "opening the catalog must not have scrolled the stack on its own"
+    );
+    let tile = h
+        .catalog_tile(crate::ui::CatalogGroup::Layers, "SPC Outlooks")
+        .expect("the overlays group offers SPC Outlooks");
+    h.mouse_click(tile.rect.center());
+    // Real frames with real dt: egui animates a `scroll_to_me`, and
+    // `warm_up`'s three zero-dt frames would never let the animation run.
+    h.frames_for(30, 1.0 / 60.0);
+
+    let row = h
+        .stack_row(&known::SPC_OUTLOOK)
+        .expect("the layer the tile turned on still has its row");
+    let panel = h.layers_panel_rect().expect("the stack is still open");
+    assert!(
+        panel.contains(row.rect.center()),
+        "the tile left its row outside the panel: row {:?}, panel {panel:?} - \
+         the catalog and the stack must visibly name the same thing",
+        row.rect
+    );
+    assert!(row.selected, "and the row it scrolled to reads as selected");
+}
+
 /// 67c. **An HRRR tile enables the model layer and sets the parameter through the
 /// handler's own control route.**
 #[test]
@@ -11712,7 +11771,7 @@ fn a_layerless_stack_body_offers_the_caption_and_pane_properties() {
     assert_eq!(
         stack.add_top,
         egui::Rect::NOTHING,
-        "no Add-layer button: the catalog adds map layers"
+        "no catalog button: the catalog shows map layers"
     );
     assert_ne!(
         stack.non_map_note,

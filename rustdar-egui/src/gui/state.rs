@@ -156,9 +156,9 @@ pub struct Gui {
     /// would read differently, or `None` when nothing it drew restates the
     /// clock.
     pub(super) status_bar_tick: Option<std::time::Duration>,
-    /// Whether the Add-layer catalog is open. Session-only, like every other
-    /// open-surface flag; opened by the stack's two `+ Add layer` buttons and
-    /// closed by applying a tile, the `✕`, the backdrop, or
+    /// Whether the layer catalog is open. Session-only, like every other
+    /// open-surface flag; opened by the stack's two `+ Show a layer` buttons
+    /// and closed by applying a tile, the `✕`, the backdrop, or
     /// [`Self::dismiss_top_layer`].
     pub(super) catalog_open: bool,
     /// The catalog's search text. Session-only: a filter is a gesture in
@@ -174,6 +174,10 @@ pub struct Gui {
     pub(super) site_query: String,
     /// The stack row being drag-reordered by its grip, if one is in flight.
     pub(super) stack_drag: Option<rustdar_source::id::LayerId>,
+    /// A layer whose stack row the next stack pass should scroll into view,
+    /// then forget. Written when the catalog turns a layer on, so the row the
+    /// tile refers to is on screen when the modal closes.
+    pub(super) stack_scroll_to: Option<rustdar_source::id::LayerId>,
     /// The pane whose pill row a first touch tap revealed, if any.
     pub(super) pill_revealed: Option<PaneId>,
     /// How many pill rows the previous pills pass drew. The rows' areas are
@@ -437,6 +441,7 @@ impl Gui {
             catalog_saving: false,
             site_query: String::new(),
             stack_drag: None,
+            stack_scroll_to: None,
             pill_revealed: None,
             pills_drawn_last_frame: 0,
             pills_raise_pending: false,

@@ -1,4 +1,4 @@
-//! The Add-layer catalog: one modal over everything, four groups, one search.
+//! The layer catalog: one modal over everything, four groups, one search.
 
 use crate::actions::GuiAction;
 use rustdar_overlays::render::controls::{ControlEffect, ControlUpdate, ControlValue};
@@ -19,6 +19,14 @@ const CATALOG_WIDTH: f32 = 520.0;
 const HEADER_ALLOWANCE: f32 = 160.0;
 
 const CLOSE_LABEL: &str = "\u{d7}";
+
+/// The modal's heading, and the sheet page's title — one string, so the two
+/// hosts cannot come to say different things.
+///
+/// Not "Add layer": a pane's stack already holds a row for every registered
+/// layer, so a tile here turns one on rather than creating anything. Naming
+/// the act "add" made the stack below read as an incomplete list.
+pub(crate) const CATALOG_HEADING: &str = "Show a layer";
 
 /// The save tile's label. Drawn only while the search box is empty: the
 /// search is for *finding* tiles, and a save offer matching the query "save"
@@ -268,7 +276,7 @@ impl super::Gui {
                 }
 
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new("Add layer").strong());
+                    ui.label(egui::RichText::new(CATALOG_HEADING).strong());
                     // A deliberate exception to the id doctrine, shared with
                     // `catalog_scroll` below and `sheet_feature_scroll`
                     // (`ui_sheet.rs`): the salts are stable, but the parent
@@ -546,14 +554,20 @@ impl super::Gui {
         }
     }
 
-    /// Enable `kind` on the active pane and select it in the inspector —
-    /// what clicking an overlay tile means.
+    /// Show `kind` on the active pane and select it in the inspector — what
+    /// clicking an overlay tile means.
+    ///
+    /// Nothing is created: the pane's row for `kind` was already in the stack
+    /// below, with its eye off. So the tile also scrolls that row into view —
+    /// otherwise the modal closes and the only visible result is a row the
+    /// user may have to hunt for.
     fn catalog_apply_overlay(&mut self, kind: LayerId, actions: &mut Vec<GuiAction>) {
         let idx = self.active_pane;
         let mut pane = std::mem::take(&mut self.panes[idx]);
         self.set_pane_overlay_with_fetch(&mut pane, idx, &kind, true, actions);
         self.panes[idx] = pane;
         self.propagate_layer_sync();
+        self.stack_scroll_to = Some(kind.clone());
         self.select_layer(kind);
     }
 

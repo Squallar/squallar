@@ -518,7 +518,7 @@ impl super::Gui {
                 .map(|(title, _)| title)
                 .unwrap_or_default(),
             SheetPage::Time => "Set Time".to_owned(),
-            SheetPage::Catalog => "Add layer".to_owned(),
+            SheetPage::Catalog => super::catalog::CATALOG_HEADING.to_owned(),
             SheetPage::Menu => "Menu".to_owned(),
             SheetPage::Inspector => "Inspector".to_owned(),
             SheetPage::Layers => "Layers".to_owned(),
