@@ -2116,11 +2116,11 @@ fn a_volume_no_pane_is_showing_is_dropped() {
             info: scan_info_for("KTLX"),
         });
     for site in ["KTLX", "KOUN"] {
-        app.scan_data.insert(
+        app.volumes.install_still(
             site.to_string(),
             (Arc::new(empty_scan()), Default::default()),
         );
-        app.base_scans.insert(
+        app.volumes.install_base(
             site.to_string(),
             (
                 Arc::new(empty_scan()),
@@ -2142,20 +2142,20 @@ fn a_volume_no_pane_is_showing_is_dropped() {
     app.evict_unshown_scans();
 
     assert!(
-        app.scan_data.contains_key("KTLX"),
+        app.volumes.holds_still("KTLX"),
         "the volume the pane is drawing from was evicted",
     );
     assert!(
-        !app.scan_data.contains_key("KOUN"),
+        !app.volumes.holds_still("KOUN"),
         "a radar no pane is on is still holding its whole decoded volume",
     );
     assert!(
-        app.base_scans.contains_key("KTLX"),
+        app.volumes.holds_base("KTLX"),
         "the base volume the site's whole-volume panes build from was \
              evicted, so none of them can ever be handed one",
     );
     assert!(
-        !app.base_scans.contains_key("KOUN"),
+        !app.volumes.holds_base("KOUN"),
         "a radar no pane is on is still holding its whole decoded base \
              volume; nothing else in this crate ever removes one",
     );
@@ -2182,14 +2182,19 @@ fn an_evicted_volume_is_handed_over_rather_than_freed_on_the_frame() {
          per-radial buffers, which is the cost `offload::discard` exists to \
          move: {body}"
     );
-    // All three holders, named individually: a hand-over that covered `scan_data` and left
-    // the other two on `retain` would look closed here while leaving most of the teardown
-    // on the frame.
-    for map in ["scan_data", "base_scans", "latest_cached_scans"] {
+    // All three holders, named individually: a hand-over that covered one of them and
+    // left the other two on `retain` would look closed here while leaving most of the
+    // teardown on the frame. The first two are the inventory's, which takes them out
+    // owned under its own names; the third is still a bare map on the `App`.
+    for holder in [
+        "self.volumes.evict_still(&unshown)",
+        "self.volumes.evict_base(&unshown)",
+        "evicted(&mut self.latest_cached_scans, &unshown)",
+    ] {
         assert!(
-            body.contains(&format!("evicted(&mut self.{map}, &unshown)")),
-            "{map}'s evictions are not handed over, so that map's volumes are \
-             still freed on the frame: {body}"
+            body.contains(holder),
+            "`{holder}` is not in the eviction pass, so that holder's volumes \
+             are still freed on the frame: {body}"
         );
     }
     // The extractions above prove the values come out owned; this proves where they go.
@@ -2260,11 +2265,11 @@ fn the_volume_a_switching_pane_is_still_drawing_survives() {
             info: scan_info_for("KTLX"),
         });
     app.gui.pane_mut(0).unwrap().set_site("KOUN".to_string());
-    app.scan_data.insert(
+    app.volumes.install_still(
         "KTLX".to_string(),
         (Arc::new(empty_scan()), Default::default()),
     );
-    app.base_scans.insert(
+    app.volumes.install_base(
         "KTLX".to_string(),
         (
             Arc::new(empty_scan()),
@@ -2276,12 +2281,12 @@ fn the_volume_a_switching_pane_is_still_drawing_survives() {
     app.evict_unshown_scans();
 
     assert!(
-        app.scan_data.contains_key("KTLX"),
+        app.volumes.holds_still("KTLX"),
         "the pane's own scan info still names KTLX, which is what the \
              render path looks the volume up by",
     );
     assert!(
-        app.base_scans.contains_key("KTLX"),
+        app.volumes.holds_base("KTLX"),
         "the base volume was pulled out from under a 3D pane that is \
              still building from it",
     );
@@ -2322,7 +2327,7 @@ fn a_discarded_scan_result_still_takes_down_the_wait_it_belonged_to() {
     app.poll_data_channels();
 
     assert!(
-        app.gui.pane(0).unwrap().scan_info.is_none() && app.scan_data.is_empty(),
+        app.gui.pane(0).unwrap().scan_info.is_none() && app.volumes.holds_no_still(),
         "precondition: the superseded result was applied rather than \
              discarded, so nothing here is about the discard path",
     );

@@ -284,7 +284,7 @@ fn volume_stating(id: &[u8; 4], lat: f32, lon: f32) -> nexrad_model::data::Scan 
 /// and decoded and never rasterised, because the position it states reaches
 /// the site table one line *after* the `ScanInfo` that has to name the radar
 /// is built — so the info said `UNKNOWN`, and `dispatch_pane_renders` looks
-/// the volume up in a `scan_data` keyed by the site.
+/// the volume up in a still store keyed by the site.
 #[test]
 fn a_volume_that_places_its_own_radar_names_it_in_the_same_breath() {
     const TAUGHT: &str = "ZZQJ";
@@ -310,7 +310,7 @@ fn a_volume_that_places_its_own_radar_names_it_in_the_same_breath() {
         info.site.name, TAUGHT,
         "the volume's own position reached the table in this same call, so the \
          info it produced must be able to name the radar; UNKNOWN is not a key \
-         `scan_data` holds and the picture is never made",
+         the still store holds and the picture is never made",
     );
 }
 
@@ -354,7 +354,7 @@ fn the_catalogue_landing_draws_the_volume_the_launch_could_not_place() {
             site: BLIND.to_string(),
             info,
         });
-    app.scan_data.insert(
+    app.volumes.install_still(
         BLIND.to_string(),
         (
             scan,

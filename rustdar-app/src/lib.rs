@@ -37,3 +37,4 @@ pub(crate) mod test_sites;
 /// The `Ready` volume fixture the app-side store/release tests stand a pane on.
 #[cfg(test)]
 pub(crate) mod volume_fixture;
+pub(crate) mod volume_inventory;

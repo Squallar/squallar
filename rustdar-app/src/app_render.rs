@@ -393,10 +393,9 @@ impl super::App {
         {
             return;
         }
-        let Some((data, declared)) = self.scan_data.get(inputs.scan_site) else {
+        let Some((data, declared)) = self.volumes.still_for(inputs.scan_site) else {
             return;
         };
-        let (data, declared) = (std::sync::Arc::clone(data), std::sync::Arc::clone(declared));
         self.render.spawn_speculative_render(
             site,
             product,
@@ -590,7 +589,7 @@ impl super::App {
         // ...and the volumes already on screen were named against the table
         // this call just replaced. One decoded before its radar was in it
         // carries UNKNOWN, and `dispatch_pane_renders` looks the volume up
-        // under that name in a `scan_data` keyed by the site -- so the render
+        // under that name in a still store keyed by the site -- so the render
         // was skipped, silently, and nothing else revisits it. This arrival is
         // what un-skips it, which is a re-trigger and not a retry.
         let replaced = self.gui.place_shown_volumes_against_the_table();
@@ -942,10 +941,9 @@ impl super::App {
             // The same stores and the same names the dispatch reads: the key
             // is the pane's site, the volume is looked up under the
             // scan_info's, and the coordinates are the scan_info's.
-            let Some((data, _declared)) = self.scan_data.get(scan_info.site.name) else {
+            let Some((data, _declared)) = self.volumes.still_for(scan_info.site.name) else {
                 continue;
             };
-            let data = std::sync::Arc::clone(data);
             let (lat, lon) = (scan_info.site.lat, scan_info.site.lon);
             let (key, storm_motion, env_heights) =
                 self.render
@@ -1069,10 +1067,11 @@ impl super::App {
                             self.channels.render_sender.clone(),
                             self.window.clone(),
                         );
-                    } else if let Some((data, declared)) = self.scan_data.get(scan_info.site.name) {
-                        // Cloned out of the map before the dispatcher is
-                        // borrowed mutably; both are refcounts.
-                        let (data, declared) = (Arc::clone(data), Arc::clone(declared));
+                    } else if let Some((data, declared)) =
+                        self.volumes.still_for(scan_info.site.name)
+                    {
+                        // Handed back as refcounts, so the dispatcher below can be
+                        // borrowed mutably in the same statement.
                         self.render.spawn_level2_render(
                             pane_idx,
                             &params,
@@ -1131,10 +1130,7 @@ impl super::App {
             };
             let (lat, lon) = (scan_info.site.lat, scan_info.site.lon);
 
-            let base = self
-                .base_scans
-                .get(site.as_str())
-                .map(|(scan, declared, _)| (Arc::clone(scan), Arc::clone(declared)));
+            let base = self.volumes.base_for(site.as_str());
             let overlay = self.chunk_feeds.snapshot(site.as_str());
 
             if let Some(reason) = section_source_refusal(

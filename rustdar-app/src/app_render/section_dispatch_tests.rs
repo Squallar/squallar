@@ -198,8 +198,8 @@ fn app_with_section(product: RadarProduct, scan: Arc<Scan>) -> crate::app::App {
             },
         });
     app.render.ensure_pane_count(1);
-    app.base_scans
-        .insert(SITE.to_owned(), (scan, Default::default(), volume_time()));
+    app.volumes
+        .install_base(SITE.to_owned(), (scan, Default::default(), volume_time()));
     app
 }
 
@@ -306,8 +306,8 @@ fn a_volume_with_no_sealed_sweep_yet_is_named_rather_than_blamed_on_the_product(
 #[test]
 fn an_empty_live_volume_labels_the_pane_and_keeps_it_asking() {
     let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
-    app.base_scans.clear();
-    app.base_scans.insert(
+    app.volumes.forget_all_bases();
+    app.volumes.install_base(
         SITE.to_owned(),
         (
             volume_of(0, vec![one_cut()]),
@@ -340,7 +340,7 @@ fn an_empty_live_volume_labels_the_pane_and_keeps_it_asking() {
 #[test]
 fn a_transient_section_refusal_keeps_the_pane_asking() {
     let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
-    app.base_scans.clear();
+    app.volumes.forget_all_bases();
 
     app.dispatch_section_renders();
 
@@ -543,7 +543,7 @@ fn a_section_with_no_volume_is_told_it_is_waiting() {
 fn a_dispatch_for_a_pane_that_does_not_exist_refuses_instead_of_panicking() {
     let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
     let target = app.section_target_for_pane(0).expect("aimed with a volume");
-    let data = Arc::clone(&app.base_scans.get(SITE).expect("the site has a volume").0);
+    let data = app.volumes.base_for(SITE).expect("the site has a volume").0;
     assert_eq!(app.render.pane_render.len(), 1, "precondition");
 
     let dispatched = app.render.spawn_section_render(
@@ -600,7 +600,7 @@ fn a_volume_with_nothing_to_cut_is_named_rather_than_waited_on() {
         "the state has a name but no explanation: {message:?}",
     );
 
-    app.base_scans.insert(
+    app.volumes.install_base(
         SITE.to_owned(),
         (
             velocity_volume(vec![one_cut()]),
@@ -1106,7 +1106,7 @@ fn a_live_volume_that_is_still_filling_re_cuts_as_it_fills() {
         .expect("the pane is aimed and has a volume");
     assert_ne!(before.ladder, 0, "the fixture volume's ladder resolves");
 
-    app.base_scans.insert(
+    app.volumes.install_base(
         SITE.to_owned(),
         (volume_of(4, cuts_for(4)), Default::default(), volume_time()),
     );
@@ -1188,7 +1188,7 @@ fn a_seal_that_changes_no_chosen_rung_does_not_move_the_section_key() {
     let before = app.section_target_for_pane(0).expect("aimed");
     assert_ne!(before.ladder, 0, "precondition: the ladder resolves");
 
-    app.base_scans.insert(
+    app.volumes.install_base(
         SITE.to_owned(),
         (with_doppler_half(), Default::default(), volume_time()),
     );
@@ -1204,7 +1204,7 @@ fn a_seal_that_changes_no_chosen_rung_does_not_move_the_section_key() {
         .unwrap()
         .set_selected_product(rustdar_radar::fields::known::VELOCITY);
     let vel_after = app.section_target_for_pane(0).expect("aimed at velocity");
-    app.base_scans.insert(
+    app.volumes.install_base(
         SITE.to_owned(),
         (surveillance_only(), Default::default(), volume_time()),
     );

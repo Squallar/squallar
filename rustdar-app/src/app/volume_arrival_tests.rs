@@ -363,7 +363,7 @@ fn an_eager_build_marks_the_pane_and_the_trigger_quiesces() {
         SITE,
         &rustdar_radar::fields::known::REFLECTIVITY,
     );
-    app.base_scans.insert(
+    app.volumes.install_base(
         SITE.to_owned(),
         (crate::volume_fixture::ready_scan(), Arc::default(), at(6)),
     );
@@ -435,7 +435,7 @@ fn the_draw_time_ask_attaches_to_the_build_the_arrival_opened() {
         SITE,
         &rustdar_radar::fields::known::REFLECTIVITY,
     );
-    app.base_scans.insert(
+    app.volumes.install_base(
         SITE.to_owned(),
         (crate::volume_fixture::ready_scan(), Arc::default(), at(6)),
     );
@@ -480,7 +480,7 @@ fn a_busy_render_slot_leaves_the_ask_to_the_draw_time_trigger() {
         SITE,
         &rustdar_radar::fields::known::REFLECTIVITY,
     );
-    app.base_scans.insert(
+    app.volumes.install_base(
         SITE.to_owned(),
         (crate::volume_fixture::ready_scan(), Arc::default(), at(6)),
     );
@@ -548,7 +548,7 @@ fn the_frame_pump_runs_the_arrival_dispatch() {
         SITE,
         &rustdar_radar::fields::known::REFLECTIVITY,
     );
-    app.base_scans.insert(
+    app.volumes.install_base(
         SITE.to_owned(),
         (crate::volume_fixture::ready_scan(), Arc::default(), at(6)),
     );

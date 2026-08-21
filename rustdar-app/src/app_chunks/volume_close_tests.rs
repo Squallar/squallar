@@ -165,8 +165,8 @@ fn a_completed_volume_re_renders_every_whole_volume_pane() {
                  the pane re-renders straight back into it"
         );
         assert_eq!(
-            app.scan_data
-                .get("KTLX")
+            app.volumes
+                .still_for("KTLX")
                 .map(|(scan, _)| scan.sweeps().len())
                 .unwrap_or(0),
             5,
@@ -292,15 +292,15 @@ fn a_volume_complete_only_for_its_selection_stays_out_of_the_loop_cache() {
 fn a_whole_closed_volume_becomes_the_merge_base() {
     let mut app = app_showing_a_drawn_volume(RadarProduct::Reflectivity);
     assert!(
-        !app.base_scans.contains_key("KTLX"),
+        !app.volumes.holds_base("KTLX"),
         "precondition: no base yet, so the write below is this round's"
     );
 
     app.apply_chunk_outcome("KTLX", &closing_round_of(5, true));
     let based = app
-        .base_scans
-        .get("KTLX")
-        .map(|(scan, _, _)| scan.sweeps().len());
+        .volumes
+        .base_for("KTLX")
+        .map(|(scan, _)| scan.sweeps().len());
     assert_eq!(
         based,
         Some(5),
@@ -311,7 +311,7 @@ fn a_whole_closed_volume_becomes_the_merge_base() {
     let mut short = app_showing_a_drawn_volume(RadarProduct::Reflectivity);
     short.apply_chunk_outcome("KTLX", &closing_round_of(1, false));
     assert!(
-        !short.base_scans.contains_key("KTLX"),
+        !short.volumes.holds_base("KTLX"),
         "a volume that closed short of whole was installed as the merge \
              base; every consumer now stands on a ladder missing cuts"
     );
@@ -433,7 +433,7 @@ fn an_incomplete_closed_volume_is_not_applied() {
     app.apply_chunk_outcome("KTLX", &outcome);
 
     assert!(
-        !app.scan_data.contains_key("KTLX"),
+        !app.volumes.holds_still("KTLX"),
         "a volume that closed short was installed anyway"
     );
     assert_eq!(
