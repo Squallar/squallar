@@ -88,7 +88,7 @@ fn complete(sweeps: u8, whole: bool) -> VolumeProgress {
 
 /// A round that closed a whole `sweeps`-cut volume and rolled to the next,
 /// exactly as `ChunkPoller::roll` reports one.
-fn closing_round(sweeps: u8) -> PollOutcome {
+pub(super) fn closing_round(sweeps: u8) -> PollOutcome {
     closing_round_of(sweeps, true)
 }
 

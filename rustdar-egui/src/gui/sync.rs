@@ -22,6 +22,27 @@ impl Gui {
         }
     }
 
+    /// **The panes a time-shaped change made *by pane `src`* reaches** — the
+    /// visible time-linked panes when `src` is itself linked, or `src` alone
+    /// when it is not.
+    ///
+    /// [`Self::time_sync_targets`] answers the same question about the
+    /// *active* pane and is what the frame's own fan-outs use. This one takes
+    /// its source as an argument, because an archive volume lands frames
+    /// after the navigation that asked for it and the pane that asked is not
+    /// necessarily the one active by then. It is the time-side twin of
+    /// [`Gui::layer_sync_targets`], and deliberately spelled the same way.
+    pub(crate) fn time_sync_targets_for(&self, src: usize) -> Vec<usize> {
+        let count = self.visible_pane_count();
+        if count > 1 && self.pane_time_linked(src) {
+            (0..count)
+                .filter(|&idx| idx == src || self.pane_time_linked(idx))
+                .collect()
+        } else {
+            vec![src]
+        }
+    }
+
     /// [`Self::time_sync_targets`] narrowed to the panes a loop can feed —
     /// the fan-out for every loop action.
     pub(super) fn loop_sync_targets(&self) -> Vec<usize> {

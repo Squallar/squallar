@@ -1,4 +1,6 @@
-use crate::channels::{Level3Response, OverlayRenderResponse, ScanData, ScanResponse};
+use crate::channels::{
+    FetchRequester, Level3Response, OverlayRenderResponse, ScanData, ScanResponse,
+};
 use crate::render_dispatch::RenderGuard;
 use chrono::NaiveDateTime;
 use chrono::TimeZone;
@@ -374,8 +376,18 @@ impl super::App {
     }
 
     /// Spawn an async radar data fetch on the background runtime.
-    pub fn spawn_fetch(&mut self, site: String, timestamp: NaiveDateTime) {
-        let generation = self.render.next_fetch_generation(&site);
+    ///
+    /// `requester` rides the whole way to the decode landing, because the
+    /// landing is where it is needed: it decides both which panes may take
+    /// the volume and which later request supersedes this one. See
+    /// [`FetchRequester`].
+    pub fn spawn_fetch(
+        &mut self,
+        site: String,
+        timestamp: NaiveDateTime,
+        requester: FetchRequester,
+    ) {
+        let generation = self.render.next_scan_generation(&site, requester);
         let window = self.window.clone();
         let sender = self.channels.scan_sender.clone();
         self.spawn_detached(async move {
@@ -389,6 +401,7 @@ impl super::App {
                     let _ = sender.send(ScanResponse {
                         generation,
                         site,
+                        requester,
                         result: Err(err),
                         is_auto_poll: false,
                     });
@@ -418,6 +431,7 @@ impl super::App {
                 Some(ScanResponse {
                     generation,
                     site,
+                    requester,
                     result,
                     is_auto_poll: false,
                 })
@@ -732,7 +746,11 @@ impl super::App {
                     radar_config.timestamp
                 );
                 let utc_timestamp = Self::local_to_utc(radar_config.timestamp);
-                self.spawn_fetch(radar_config.site, utc_timestamp);
+                // Not addressed to a pane: `RadarConfig` carries no pane index
+                // — the Set Time dialog, the menu and the status bar all build
+                // it from `active_pane_fetch_config` — so the volume is the
+                // site's and every pane on it takes it, exactly as before.
+                self.spawn_fetch(radar_config.site, utc_timestamp, FetchRequester::Site);
             }
             GuiAction::CheckForNewScans(radar_config) => {
                 // The chunk feed delivers this site's volume cut by cut, minutes
@@ -773,6 +791,10 @@ impl super::App {
                                 Some(crate::channels::ScanResponse {
                                     generation,
                                     site: site.clone(),
+                                    // The auto-poll is about the site, not a
+                                    // pane, and keeps the site-wide audience
+                                    // and the site-wide supersede rule.
+                                    requester: FetchRequester::Site,
                                     result: Ok(crate::channels::ScanData {
                                         scan: volume.scan,
                                         declared_nyquist: volume.declared_nyquist,
@@ -852,7 +874,11 @@ impl super::App {
                 }
 
                 let utc_timestamp = Self::local_to_utc(timestamp);
-                self.spawn_fetch(site, utc_timestamp);
+                // Site-wide on purpose: the switch has just moved every pane
+                // in the layer group onto this site and cleared their scan
+                // info, so the volume belongs to all of them and not to the
+                // one that was clicked.
+                self.spawn_fetch(site, utc_timestamp, FetchRequester::Site);
             }
             _ => unreachable!(),
         }
@@ -1374,7 +1400,7 @@ impl super::App {
         self.gui.apply(GuiEvent::SelectedTime(local_ts));
         self.gui.apply(GuiEvent::Fetching(true));
 
-        self.spawn_fetch(site, target);
+        self.spawn_fetch(site, target, FetchRequester::Pane(pane_idx));
     }
 
     /// Navigate to the next or previous adjacent scan on AWS.
@@ -1388,7 +1414,8 @@ impl super::App {
         self.manual_nav_pending = true;
         self.gui.apply(GuiEvent::Fetching(true));
 
-        let generation = self.render.next_fetch_generation(&site);
+        let requester = FetchRequester::Pane(pane_idx);
+        let generation = self.render.next_scan_generation(&site, requester);
 
         let window = self.window.clone();
         let sender = self.channels.scan_sender.clone();
@@ -1413,6 +1440,7 @@ impl super::App {
                         Some(crate::channels::ScanResponse {
                             generation,
                             site,
+                            requester,
                             result,
                             is_auto_poll: false,
                         })
@@ -1424,6 +1452,7 @@ impl super::App {
                     let _ = sender.send(crate::channels::ScanResponse {
                         generation,
                         site,
+                        requester,
                         result: Err(err),
                         is_auto_poll: false,
                     });
@@ -1468,8 +1497,11 @@ impl super::App {
             let local_ts =
                 chrono::TimeZone::from_utc_datetime(&chrono::Local, &timestamp).naive_local();
             self.gui.apply(GuiEvent::SelectedTime(local_ts));
-            self.gui.apply(GuiEvent::ScanInfoForSite {
+            // Addressed, like every other navigation: this pane asked to go
+            // live, and a same-site pane parked in the archive is not asking.
+            self.gui.apply(GuiEvent::ScanInfoForTimeGroup {
                 site: pane_site.clone(),
+                requester: pane_idx,
                 info: scan_info,
             });
             self.gui.clear_loading_site_for_site(&pane_site);
@@ -1495,7 +1527,7 @@ impl super::App {
         self.gui.apply(GuiEvent::Fetching(true));
 
         let utc_timestamp = Self::local_to_utc(now);
-        self.spawn_fetch(pane_site, utc_timestamp);
+        self.spawn_fetch(pane_site, utc_timestamp, FetchRequester::Pane(pane_idx));
     }
 
     /// **Take delivery of one loop frame's archive object** and hand its
@@ -1775,6 +1807,27 @@ impl super::App {
         for (pane_idx, lookback_secs) in to_reinit {
             self.handle_enable_loop(pane_idx, lookback_secs);
         }
+    }
+}
+
+/// **Which shell event a landed volume is**, from who asked for it.
+///
+/// A free function rather than a method because the choice is a pure function
+/// of the requester: the audience is resolved inside the UI layer, at
+/// `Gui::apply`, where the pane links live. The app layer names the requester
+/// and nothing else.
+pub(crate) fn scan_info_delivery(
+    site: String,
+    requester: FetchRequester,
+    info: rustdar_radar::types::ScanInfo,
+) -> GuiEvent {
+    match requester {
+        FetchRequester::Pane(requester) => GuiEvent::ScanInfoForTimeGroup {
+            site,
+            requester,
+            info,
+        },
+        FetchRequester::Site => GuiEvent::ScanInfoForSite { site, info },
     }
 }
 

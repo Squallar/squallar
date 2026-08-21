@@ -8,7 +8,7 @@ use rustdar_radar::srm::StormMotionSample;
 use rustdar_radar::types::{RadarProduct, RenderView};
 
 use crate::WindowRef;
-use crate::channels::RenderResponse;
+use crate::channels::{FetchRequester, RenderResponse};
 use crate::render_key::{RenderKey, elevation_key, render_cache_key};
 use rustdar_device_profile::budget::Budgets;
 
@@ -270,7 +270,24 @@ pub struct RenderDispatcher {
     /// Generation counter to discard stale render results after a **full** reset.
     pub render_generation: u64,
     /// Per-site fetch generation counters to discard stale fetch results.
+    ///
+    /// Monotone per site and bumped by **every** fetch, whoever asked: it is
+    /// what the site-shaped arrivals — the Level III objects, the sounding,
+    /// the melting layer, the storm motion, a chunk round — measure their own
+    /// staleness against, and "anything newer for this site" is the right
+    /// rule for all of them.
     pub fetch_generations: HashMap<String, u64>,
+    /// The generation each **pane's own** scan request was issued at, by
+    /// `(site, pane index)`.
+    ///
+    /// A volume a pane navigated to is superseded only by that pane's next
+    /// navigation, never by a same-site sibling's — see
+    /// [`FetchRequester`](crate::channels::FetchRequester). An entry missing
+    /// here is an orphan reply and is discarded, which is also how a closed
+    /// pane's in-flight fetch is dropped: [`Self::forget_panes_from`] removes
+    /// the record rather than leaving it to land on whichever pane took the
+    /// index.
+    pub scan_requests: HashMap<(String, usize), u64>,
     /// Shared counter for concurrent background render threads.
     pub renders_in_flight: Arc<AtomicUsize>,
     /// Cache of the latest render output per (site, product, elevation_tenths), shared
@@ -510,6 +527,7 @@ impl RenderDispatcher {
             storm_motion: HashMap::new(),
             render_generation: 0,
             fetch_generations: HashMap::new(),
+            scan_requests: HashMap::new(),
             // Owned here so there is exactly one render budget counter in the process.
             renders_in_flight: Arc::new(AtomicUsize::new(0)),
             render_cache: RenderCache::new(
@@ -701,6 +719,13 @@ impl RenderDispatcher {
         self.pane_render.truncate(from);
         self.last_overlay_dispatch
             .retain(|(pane_idx, _), _| *pane_idx < from);
+        // The third positional store, and the one that is not a raster: a scan
+        // fetch already in flight for one of these indices would otherwise be
+        // delivered to whichever pane took the number, at a moment that pane
+        // never navigated to. Dropping the record makes the reply an orphan,
+        // which `is_scan_stale` discards.
+        self.scan_requests
+            .retain(|(_, pane_idx), _| *pane_idx < from);
     }
 
     /// Ensure the pane_render vec has at least `count` entries.
@@ -826,6 +851,39 @@ impl RenderDispatcher {
 
     pub fn is_fetch_stale(&self, site: &str, generation: u64) -> bool {
         self.fetch_generations.get(site).copied().unwrap_or(0) > generation
+    }
+
+    /// [`Self::next_fetch_generation`] for a **scan** fetch, which also
+    /// records the generation under the requester so the reply can be judged
+    /// against that pane's own next request rather than the site's.
+    pub fn next_scan_generation(&mut self, site: &str, requester: FetchRequester) -> u64 {
+        let generation = self.next_fetch_generation(site);
+        if let FetchRequester::Pane(pane_idx) = requester {
+            self.scan_requests
+                .insert((site.to_string(), pane_idx), generation);
+        }
+        generation
+    }
+
+    /// Whether a landed scan has been superseded.
+    ///
+    /// **The two requesters get different rules, and that is the point.** A
+    /// site-wide fetch keeps the site-wide one: anything newer for the site,
+    /// including a pane's navigation, beats a stale auto-poll. A pane's own
+    /// fetch is beaten only by that pane's next one, so two same-site panes
+    /// can each have a fetch in flight — which is what the site-wide rule
+    /// made impossible, and what re-keying the volume store alone did not fix.
+    pub fn is_scan_stale(&self, site: &str, requester: FetchRequester, generation: u64) -> bool {
+        match requester {
+            FetchRequester::Site => self.is_fetch_stale(site, generation),
+            // `is_none_or`, not `is_some_and`: no record means the pane that
+            // asked has been closed (or never asked), and an unaddressed reply
+            // must not land on whichever pane now holds the index.
+            FetchRequester::Pane(pane_idx) => self
+                .scan_requests
+                .get(&(site.to_string(), pane_idx))
+                .is_none_or(|latest| *latest > generation),
+        }
     }
 
     /// Check if a render generation is stale.

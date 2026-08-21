@@ -49,7 +49,43 @@ pub struct FrameInputs<'a> {
 /// at E5/E8.
 pub enum GuiEvent {
     /// A complete volume's scan info, for all panes viewing the site.
+    ///
+    /// **The site-wide fan-out, and the live feed's variant.** Every pane on
+    /// the site takes it, which is right for a volume nobody asked for in
+    /// particular: the real-time chunk feed's closed volumes, the archive
+    /// auto-poll, and the refetch a retired feed falls back to. An archive
+    /// volume a *pane* navigated to is [`GuiEvent::ScanInfoForTimeGroup`]
+    /// instead — see there for why the two cannot be one event.
     ScanInfoForSite { site: String, info: ScanInfo },
+    /// **A volume the real-time chunk feed completed**, for every pane on the
+    /// site that is *following* live.
+    ///
+    /// The site-wide fan-out narrowed by the one thing that separates the feed
+    /// from a wholesale replacement of the site's data: a pane parked in the
+    /// archive is not watching for it. `UNLINK_NOTE`'s two clauses are both
+    /// about that pane — it holds its moment when parked, and follows new
+    /// scans when live — and this event is the producer of the second, so it
+    /// must not be the one that breaks the first.
+    LiveScanInfoForSite { site: String, info: ScanInfo },
+    /// **The archive volume one pane asked for**, delivered to that pane and
+    /// the panes that share its clock — never to a same-site pane parked at
+    /// its own moment.
+    ///
+    /// `UNLINK_NOTE` promises exactly this: "Parked in the archive it holds
+    /// its moment; still live, it still follows new scans." The two clauses
+    /// are two different audiences, which is why the shell has two events and
+    /// not one with a flag. `requester` is the pane index the fetch was
+    /// spawned for, carried back through `ScanResponse`; the group is
+    /// resolved here, at delivery, so a link toggled while the fetch was in
+    /// flight is honoured.
+    ///
+    /// A pane in the group but on **another site** is skipped: the volume is
+    /// this site's, and shared time never means shared data.
+    ScanInfoForTimeGroup {
+        site: String,
+        requester: usize,
+        info: ScanInfo,
+    },
     /// MERGE semantics, NOT replace — former `apply_chunk_scan_info` doc
     /// (partial volumes union products/elevations; no spinner/backoff touch).
     ChunkScanInfo { site: String, info: ScanInfo },

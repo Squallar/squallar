@@ -1283,7 +1283,7 @@ impl App {
         while let Ok(scan_resp) = self.channels.scan_receiver.try_recv() {
             if self
                 .render
-                .is_fetch_stale(&scan_resp.site, scan_resp.generation)
+                .is_scan_stale(&scan_resp.site, scan_resp.requester, scan_resp.generation)
             {
                 log::debug!(
                     "Discarding stale scan result for {} (gen {})",
@@ -1293,6 +1293,7 @@ impl App {
                 self.gui.apply(GuiEvent::Fetching(false));
                 self.gui.clear_loading_site_for_site(&scan_resp.site);
             } else {
+                let requester = scan_resp.requester;
                 match scan_resp.result {
                     Ok(scan_data) => {
                         // The archive path is the only one that can *learn*: a downloaded
@@ -1373,10 +1374,11 @@ impl App {
                                 (Arc::clone(&scan_arc), Arc::clone(&declared_nyquist)),
                             );
                             rustdar_worker::offload::discard_each("capped-still", forced);
-                            self.gui.apply(GuiEvent::ScanInfoForSite {
-                                site: site.clone(),
-                                info: scan_info,
-                            });
+                            self.gui.apply(fetch::scan_info_delivery(
+                                site.clone(),
+                                requester,
+                                scan_info,
+                            ));
                             self.gui.clear_loading_site_for_site(&site);
                             self.render.reset_panes_for_site(&site, &self.gui);
                             self.spawn_level3_fetches(&site);
@@ -2235,3 +2237,7 @@ mod volume_layer_tests;
 /// The arrival path: a 3D pane's volume built on the frame it lands.
 #[cfg(test)]
 mod volume_arrival_tests;
+
+/// Archive delivery is addressed to the pane that asked, not broadcast.
+#[cfg(test)]
+mod time_group_delivery_tests;
