@@ -340,6 +340,90 @@ fn the_first_records_coverage_pattern_wins_through_the_parallel_decode() {
     );
 }
 
+/// **The network dispatch in [`decode_bytes`] is transparent: both arms produce
+/// what the single call produced.**
+///
+/// The fixture is the same synthetic Archive II volume as
+/// `the_first_records_coverage_pattern_wins_through_the_parallel_decode`, built
+/// twice with two different identifiers in the header's ICAO field. **It is not
+/// a TDWR volume and this is not a TDWR decode test** — the framing is
+/// WSR-88D's in both builds; the identifier exists only to select the arm.
+/// A real `_V08` volume is spike item 1 and is deliberately absent.
+#[test]
+fn both_network_arms_decode_a_volume_to_the_same_answer() {
+    const FRAME: usize = 2432;
+
+    fn message_5_record(vcp_number: u16) -> Vec<u8> {
+        let mut frame = vec![0u8; FRAME];
+        frame[0..4].copy_from_slice(&((FRAME - 4) as u32).to_be_bytes());
+        frame[12..14].copy_from_slice(&11u16.to_be_bytes());
+        frame[15] = 5;
+        frame[16..18].copy_from_slice(&1u16.to_be_bytes());
+        frame[24..26].copy_from_slice(&1u16.to_be_bytes());
+        frame[26..28].copy_from_slice(&1u16.to_be_bytes());
+        let vcp = 28;
+        frame[vcp..vcp + 2].copy_from_slice(&11u16.to_be_bytes());
+        frame[vcp + 2..vcp + 4].copy_from_slice(&2u16.to_be_bytes());
+        frame[vcp + 4..vcp + 6].copy_from_slice(&vcp_number.to_be_bytes());
+        frame[vcp + 6..vcp + 8].copy_from_slice(&0u16.to_be_bytes());
+        frame[vcp + 8] = 1;
+        frame[vcp + 10] = 2;
+        frame[vcp + 11] = 2;
+        frame
+    }
+
+    let bytes_for = |icao: &[u8; 4]| {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"AR2V0006.");
+        bytes.extend_from_slice(b"001");
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(icao);
+        assert_eq!(bytes.len(), 24, "the Archive II header is 24 bytes");
+        bytes.extend_from_slice(&message_5_record(21));
+        bytes
+    };
+
+    // Non-triviality: the two identifiers must actually classify differently,
+    // or the walk below runs one arm twice and cannot fail.
+    assert_eq!(RadarNetwork::of_id("KTLX"), RadarNetwork::Wsr88d);
+    assert_eq!(RadarNetwork::of_id("TPBI"), RadarNetwork::Tdwr);
+
+    // And the header the dispatch reads really does carry them, or the match
+    // would be classifying the empty string on both arms.
+    for icao in [b"KTLX", b"TPBI"] {
+        let bytes = bytes_for(icao);
+        let file = nexrad_data::volume::File::new(bytes.clone());
+        assert_eq!(
+            file.header().and_then(|h| h.icao_of_radar()).as_deref(),
+            Some(std::str::from_utf8(icao).expect("ascii")),
+            "the dispatch reads this field; if it is empty the test is vacuous",
+        );
+
+        let through_the_dispatch = decode_bytes(bytes.clone()).expect("the volume decodes");
+        let direct = decoded(&file).expect("the volume decodes");
+
+        assert_eq!(
+            through_the_dispatch.scan.coverage_pattern_number().number(),
+            direct.scan.coverage_pattern_number().number(),
+            "the {} arm changed the answer",
+            std::str::from_utf8(icao).expect("ascii"),
+        );
+        assert_eq!(
+            through_the_dispatch.declared_nyquist,
+            direct.declared_nyquist,
+            "the {} arm changed the declared Nyquist table",
+            std::str::from_utf8(icao).expect("ascii"),
+        );
+        assert_eq!(
+            through_the_dispatch.scan.sweeps().len(),
+            direct.scan.sweeps().len(),
+            "the {} arm changed the sweep count",
+            std::str::from_utf8(icao).expect("ascii"),
+        );
+    }
+}
+
 // -- live ---------------------------------------------------------------
 //
 // Run with:
