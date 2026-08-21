@@ -3763,6 +3763,114 @@ fn a_stack_row_click_opens_that_layers_options_in_the_inspector() {
     assert!(!h.inspector().open, "\u{d7} must close the inspector");
 }
 
+/// 89b. **Closing the inspector never rewrites what you come back to** — every
+///     close route, at both hosts, leaves the selection where the user left it.
+///
+/// A back press used to reset `inspector_sel` to App › Settings, and so did
+/// `clear_sheet_pages` (the sheet's ×, the bar items' second tap, and the
+/// map-click fade at every width), while the crumb's own close kept it. The
+/// same panel therefore reopened on two different bodies depending on which
+/// control shut it. There is one close now (W1) and the distinction that
+/// justified the reset went with it.
+#[test]
+fn closing_the_inspector_preserves_the_selection_on_every_route() {
+    let layer = crate::ui::InspectorSelection::Layer(known::NWS_ALERTS);
+
+    // Reopen the wide inspector without naming a body: the ⚙ toggle is the one
+    // route that only flips the panel's visibility.
+    fn reopen(h: &mut InputHarness) -> Option<crate::ui::InspectorSelection> {
+        let toggle = h.top_bar().inspector_toggle;
+        assert!(!toggle.1, "precondition: the inspector is shut");
+        h.mouse_click(toggle.0.center());
+        h.warm_up();
+        assert!(h.inspector().open, "the ⚙ toggle did not reopen the panel");
+        h.inspector().mode
+    }
+
+    // Route 1: the back press, wide branch.
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.open_layer_in_inspector(&known::NWS_ALERTS);
+    assert_eq!(
+        h.inspector().mode,
+        Some(layer.clone()),
+        "precondition: the layer body is up"
+    );
+    assert!(h.gui_mut().dismiss_top_layer(), "the press closes it");
+    h.warm_up();
+    assert!(!h.inspector().open, "precondition: it really closed");
+    assert_eq!(
+        reopen(&mut h),
+        Some(layer.clone()),
+        "the back press rewrote the selection"
+    );
+
+    // Route 2: the crumb's own ×, which never reset it and still must not.
+    let close = h.inspector().close;
+    h.mouse_click(close.center());
+    h.warm_up();
+    assert!(!h.inspector().open, "precondition: the × closed it");
+    assert_eq!(
+        reopen(&mut h),
+        Some(layer.clone()),
+        "the × lost the selection"
+    );
+
+    // Route 3: `clear_sheet_pages`, reached at this width by the map-click
+    // fade — the route that closes every panel in state, not just in paint.
+    let spot = h.map_center();
+    h.mouse_click(spot);
+    h.warm_up();
+    if !h.faded() {
+        h.mouse_click(spot);
+        h.warm_up();
+    }
+    assert!(h.faded(), "precondition: the bare-map tap faded the chrome");
+    assert!(
+        !h.inspector().open,
+        "precondition: the fade closed the panel for real"
+    );
+    assert!(h.gui_mut().dismiss_top_layer(), "the press unfades");
+    h.warm_up();
+    assert_eq!(
+        reopen(&mut h),
+        Some(layer.clone()),
+        "the fade's close rewrote the selection"
+    );
+
+    // Route 4: the Compact branch of the back press, and the sheet's own ×.
+    // The phone offers no reopen that does not also name a body, so the
+    // selection itself is the instrument here — see
+    // `Gui::inspector_selection_for_test`.
+    let routes: [(&str, fn(&mut InputHarness)); 2] = [
+        ("the phone back press", |h| {
+            assert!(h.gui_mut().dismiss_top_layer(), "back pops the page");
+        }),
+        ("the sheet's ×", |h| {
+            let close = h.sheet().close;
+            assert!(close.is_positive(), "the sheet draws its own ×");
+            h.mouse_click(close.center());
+        }),
+    ];
+    for (name, close) in routes {
+        let mut h = phone();
+        h.open_layer_in_inspector(&known::NWS_ALERTS);
+        assert_eq!(
+            h.sheet().page,
+            Some(crate::ui::SheetPage::Inspector),
+            "precondition: the layer body is the sheet's page"
+        );
+        assert_eq!(h.inspector().mode, Some(layer.clone()));
+        close(&mut h);
+        h.warm_up();
+        assert!(!h.inspector().open, "{name}: the panel did not close");
+        assert_eq!(
+            h.gui_mut().inspector_selection_for_test(),
+            &layer,
+            "{name} rewrote the selection"
+        );
+    }
+}
+
 /// 90. **The ⚙ toggle and the menu's Settings… entry both reach the settings
 ///     body.**
 #[test]

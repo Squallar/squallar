@@ -216,10 +216,7 @@ impl Gui {
                     sheet::SheetPage::Time => self.time_dialog.show = false,
                     sheet::SheetPage::Catalog => self.catalog_open = false,
                     sheet::SheetPage::Menu => self.menu_open = false,
-                    sheet::SheetPage::Inspector => {
-                        self.insp_open = false;
-                        self.inspector_sel = InspectorSelection::AppSettings;
-                    }
+                    sheet::SheetPage::Inspector => self.insp_open = false,
                     sheet::SheetPage::Layers => self.drawer_open = false,
                 }
                 return true;
@@ -244,7 +241,6 @@ impl Gui {
             }
             if self.insp_open {
                 self.insp_open = false;
-                self.inspector_sel = InspectorSelection::AppSettings;
                 return true;
             }
             if self.drawer_open {

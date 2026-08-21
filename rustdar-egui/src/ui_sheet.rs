@@ -229,7 +229,6 @@ impl super::Gui {
         self.catalog_open = false;
         self.menu_open = false;
         self.insp_open = false;
-        self.inspector_sel = InspectorSelection::AppSettings;
         self.drawer_open = false;
     }
 
