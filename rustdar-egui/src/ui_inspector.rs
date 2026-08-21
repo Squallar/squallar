@@ -423,12 +423,11 @@ impl super::Gui {
                     .id_salt("site_query")
                     .hint_text("Search radar sites"),
             );
+            self.focus_search_on_open(ui, super::state::SearchField::InspectorSite, &search);
             #[cfg(test)]
             {
                 probe.site_search = search.rect;
             }
-            #[cfg(not(test))]
-            let _ = search;
 
             // The pane the body is editing is `mem::take`n out of the vector
             // while this runs, so the sections are assembled around the hole:
@@ -460,6 +459,9 @@ impl super::Gui {
                     pane_idx: self.active_pane,
                 });
             }
+            // `picked_current` is deliberately ignored on this route: the
+            // inspector body is not a popover, there is nothing to dismiss,
+            // and the site search is one control among many in it.
         });
     }
 }

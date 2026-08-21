@@ -292,12 +292,11 @@ impl super::Gui {
                             .id_salt("catalog_search")
                             .hint_text("Search"),
                     );
+                    self.focus_search_on_open(ui, super::state::SearchField::Catalog, &search);
                     #[cfg(test)]
                     {
                         probe.search = search.rect;
                     }
-                    #[cfg(not(test))]
-                    let _ = search;
                 });
             });
         });

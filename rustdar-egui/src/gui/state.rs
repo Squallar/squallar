@@ -185,6 +185,14 @@ pub struct Gui {
     /// The site list's search text — the inspector body and the site pill's
     /// popover filter through the one field, as they render the one list.
     pub(super) site_query: String,
+    /// Which pass each autofocusing search field last drew on.
+    ///
+    /// A field that did not draw on the *previous* pass is opening now, and
+    /// that is the one pass it takes keyboard focus. A standing
+    /// `request_focus` would take focus back from whatever the user reached
+    /// for next; asking for it every frame is the defect, not the ask.
+    /// Session-only bookkeeping — see [`Self::focus_search_on_open`].
+    pub(super) search_focus_pass: std::collections::HashMap<SearchField, u64>,
     /// The user's starred radar sites, bare ICAO identifiers, in the order
     /// they were starred.
     ///
@@ -353,6 +361,21 @@ pub struct Gui {
     pub(super) probes: FrameProbes,
 }
 
+/// A search field the chrome focuses on the pass its surface opens.
+///
+/// One variant per *surface*, not per widget: the site search is one string
+/// ([`Gui::site_query`]) rendered by two hosts, and each host opens and closes
+/// on its own, so each owns its own grab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum SearchField {
+    /// One pane's site pill popover.
+    SitePopover(PaneId),
+    /// The inspector's Pane-properties site search.
+    InspectorSite,
+    /// The layer catalog's search, in the modal and the sheet page alike.
+    Catalog,
+}
+
 /// A storm motion vector the user may substitute for the RPG's.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -463,6 +486,7 @@ impl Gui {
             catalog_save_name: String::new(),
             catalog_saving: false,
             site_query: String::new(),
+            search_focus_pass: std::collections::HashMap::new(),
             favorite_sites: Vec::new(),
             stack_drag: None,
             stack_scroll_to: None,

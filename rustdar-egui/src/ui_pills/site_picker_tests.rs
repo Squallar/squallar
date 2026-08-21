@@ -1,4 +1,5 @@
-//! The site picker's shortcut sections and its ranked search — W12 to W17.
+//! The site picker's shortcut sections, its ranked search, and what a click
+//! on an open picker does — W12 through W20.
 //!
 //! A dedicated file rather than another block in `input_harness/tests.rs`:
 //! everything here is about one body, `pills::site_list_ui`, and the probes it
@@ -471,5 +472,108 @@ fn the_caption_counts_radars_rather_than_rows() {
         "precondition: the sections did repeat a row, so the count and the \
          paint really do differ — {} rows against {total} radars",
         rows(&h).len(),
+    );
+}
+
+// -- W19 / W20: focus on open, and the current row closes --------------------
+
+/// **The picker takes the keyboard when it opens**, and types straight into
+/// the filter.
+#[test]
+fn opening_the_site_popover_focuses_its_search() {
+    let mut h = InputHarness::with_screen(WIDE);
+    h.close_layers();
+    let pill = h
+        .pill(0, crate::ui::PillKind::Site)
+        .expect("pane 0 draws a site pill")
+        .1;
+    h.mouse_click(pill.center());
+    h.frame();
+    h.warm_up();
+    assert!(
+        h.pill_popover().is_some(),
+        "precondition: the popover is open",
+    );
+
+    // No click on the field: typing alone must reach it.
+    h.type_text("kmkx");
+    h.warm_up();
+    let popover = h.pill_popover().expect("the popover is still open");
+    let shown: Vec<&str> = popover
+        .rows
+        .iter()
+        .map(|(site, ..)| site.as_str())
+        .collect();
+    assert_eq!(
+        shown,
+        vec!["KMKX"],
+        "typing on the frame after the open must have filtered the list",
+    );
+}
+
+/// **The grab is once per open, not every frame** — a standing
+/// `request_focus` would take the keyboard back from anything else.
+#[test]
+fn the_search_does_not_take_focus_back_once_it_is_open() {
+    let mut h = InputHarness::with_screen(WIDE);
+    h.open_pane_props();
+    assert!(
+        h.ctx().memory(|m| m.focused()).is_some(),
+        "precondition: the body's search took focus on open",
+    );
+
+    // Take the focus away by hand and give the body two more passes. A
+    // standing `request_focus` would have it back; a once-per-open grab
+    // leaves it where the user put it.
+    let held = h
+        .ctx()
+        .memory(|m| m.focused())
+        .expect("precondition: something is focused");
+    h.ctx().memory_mut(|m| m.surrender_focus(held));
+    h.warm_up();
+    h.warm_up();
+
+    assert!(
+        h.ctx().memory(|m| m.focused()).is_none(),
+        "the search field took the keyboard back on a later pass",
+    );
+}
+
+/// **Clicking the row that is already current dismisses the picker.**
+///
+/// It is deliberately not a refresh: refresh lives in the menu, and this row
+/// must not grow a second meaning.
+#[test]
+fn clicking_the_current_site_closes_the_popover_without_asking_for_anything() {
+    let mut h = InputHarness::with_screen(WIDE);
+    h.close_layers();
+    let pill = h
+        .pill(0, crate::ui::PillKind::Site)
+        .expect("pane 0 draws a site pill")
+        .1;
+    h.mouse_click(pill.center());
+    h.frame();
+    h.warm_up();
+
+    let popover = h.pill_popover().expect("the site popover is open");
+    let current = popover
+        .site_rows
+        .iter()
+        .find(|row| row.is_current)
+        .expect("the pane's own site is highlighted");
+    assert_eq!(current.site, "KTLX");
+
+    h.mouse_click(current.rect.center());
+    h.warm_up();
+
+    assert!(
+        h.pill_popover().is_none(),
+        "the highlighted row must dismiss the picker",
+    );
+    assert!(
+        !h.last_actions()
+            .iter()
+            .any(|a| matches!(a, crate::actions::GuiAction::SwitchRadarSite { .. })),
+        "and must not ask for anything: it is already the answer",
     );
 }
