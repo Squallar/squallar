@@ -6,8 +6,8 @@ nexrad-level3/src/model/header.rs	219	217
 nexrad-level3/src/model/radial.rs	86	85
 nexrad-level3/src/model/symbology.rs	5	5
 rustdar-app/src/app.rs	1321	998
-rustdar-app/src/app_chunks.rs	216	120
-rustdar-app/src/app_fetch.rs	1371	951
+rustdar-app/src/app_chunks.rs	216	129
+rustdar-app/src/app_fetch.rs	1371	961
 rustdar-app/src/app_render.rs	2384	1732
 rustdar-app/src/app_state.rs	72	0
 rustdar-app/src/budget_arms.rs	17	17
@@ -30,6 +30,7 @@ rustdar-device-profile/src/budget.rs	220	184
 rustdar-device-profile/src/constants.rs	23	23
 rustdar-device-profile/src/mobile_cfg.rs	19	19
 rustdar-device-profile/src/quality.rs	84	83
+rustdar-egui/src/acceptance_fake_source.rs	286	281
 rustdar-egui/src/actions.rs	63	26
 rustdar-egui/src/field_facts.rs	32	26
 rustdar-egui/src/gui/frame.rs	330	317
@@ -127,7 +128,7 @@ rustdar-overlays/src/render/geo.rs	108	104
 rustdar-overlays/src/render/handlers/alert.rs	1039	967
 rustdar-overlays/src/render/handlers/colorscale.rs	73	55
 rustdar-overlays/src/render/handlers/discussion.rs	373	269
-rustdar-overlays/src/render/handlers/fake.rs	453	393
+rustdar-overlays/src/render/handlers/fake.rs	453	423
 rustdar-overlays/src/render/handlers/glm.rs	764	660
 rustdar-overlays/src/render/handlers/labels.rs	73	55
 rustdar-overlays/src/render/handlers/location.rs	73	55
@@ -155,7 +156,7 @@ rustdar-radar/src/beam.rs	33	33
 rustdar-radar/src/catalogue.rs	149	137
 rustdar-radar/src/chunk_feed.rs	271	257
 rustdar-radar/src/chunk_notify.rs	340	309
-rustdar-radar/src/chunks.rs	975	702
+rustdar-radar/src/chunks.rs	975	710
 rustdar-radar/src/current.rs	117	116
 rustdar-radar/src/derive.rs	311	294
 rustdar-radar/src/dpprep.rs	1022	956
@@ -169,7 +170,7 @@ rustdar-radar/src/hover.rs	49	49
 rustdar-radar/src/jobs.rs	594	558
 rustdar-radar/src/kdp.rs	247	203
 rustdar-radar/src/l3_values.rs	282	281
-rustdar-radar/src/level3.rs	188	115
+rustdar-radar/src/level3.rs	188	132
 rustdar-radar/src/loop_downloads.rs	736	717
 rustdar-radar/src/loop_geometry.rs	7	7
 rustdar-radar/src/nrot.rs	3227	3168
@@ -181,7 +182,7 @@ rustdar-radar/src/render/polar.rs	264	260
 rustdar-radar/src/render_input.rs	663	633
 rustdar-radar/src/sampler.rs	573	553
 rustdar-radar/src/sampler/seam_fixture.rs	178	167
-rustdar-radar/src/scan.rs	374	219
+rustdar-radar/src/scan.rs	374	220
 rustdar-radar/src/site_position.rs	81	81
 rustdar-radar/src/sites.rs	636	636
 rustdar-radar/src/sounding.rs	234	207
@@ -244,6 +245,7 @@ rustdar/src/kv.rs	250	234
 rustdar/src/main.rs	6	0
 rustdar/src/network_security_config.rs	140	137
 rustdar/src/platform.rs	82	0
+rustdar/src/release_artifact_features.rs	167	158
 rustdar/src/run.rs	33	0
 vendor/bzip2-rs/src/bitreader.rs	91	88
 vendor/bzip2-rs/src/crc.rs	28	28
