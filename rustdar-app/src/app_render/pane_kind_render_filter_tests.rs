@@ -236,6 +236,7 @@ fn active_loop(timestamps: &[chrono::NaiveDateTime]) -> LayerTimeState {
         3600,
         &RadarSite {
             name: SITE,
+            network: rustdar_radar::sites::RadarNetwork::of_id(SITE),
             lat: 35.33,
             lon: -97.27,
             heights: None,

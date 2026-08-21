@@ -195,6 +195,7 @@ const SITE: &str = "KTLX";
 fn site(name: &'static str, lat: f64, lon: f64) -> RadarSite {
     RadarSite {
         name,
+        network: rustdar_radar::sites::RadarNetwork::of_id(name),
         lat,
         lon,
         heights: None,

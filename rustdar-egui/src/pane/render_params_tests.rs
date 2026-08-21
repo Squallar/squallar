@@ -8,6 +8,7 @@ fn pane_listing(products: &[(FieldId, &[f32])]) -> PaneState {
     pane.scan_info = Some(ScanInfo {
         site: RadarSite {
             name: "KTLX",
+            network: rustdar_radar::sites::RadarNetwork::of_id("KTLX"),
             lat: 35.33,
             lon: -97.27,
             heights: None,
@@ -103,6 +104,7 @@ fn the_data_time_on_screen_follows_the_loop_when_one_is_running() {
         600,
         &RadarSite {
             name: "KTLX",
+            network: rustdar_radar::sites::RadarNetwork::of_id("KTLX"),
             lat: 35.33,
             lon: -97.27,
             heights: None,

@@ -22,6 +22,7 @@ fn ts(minute: u32) -> chrono::NaiveDateTime {
 fn site() -> rustdar_radar::sites::RadarSite {
     rustdar_radar::sites::RadarSite {
         name: "KTLX",
+        network: rustdar_radar::sites::RadarNetwork::of_id("KTLX"),
         lat: 35.33,
         lon: -97.27,
         heights: None,

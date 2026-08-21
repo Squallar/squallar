@@ -20,6 +20,7 @@ macro_rules! resolve {
 fn site() -> RadarSite {
     RadarSite {
         name: "KTLX",
+        network: rustdar_radar::sites::RadarNetwork::of_id("KTLX"),
         lat: 35.3,
         lon: -97.3,
         heights: None,

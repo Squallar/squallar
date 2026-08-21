@@ -1356,6 +1356,7 @@ fn a_scan() -> rustdar_radar::types::ScanInfo {
     rustdar_radar::types::ScanInfo {
         site: rustdar_radar::sites::RadarSite {
             name: "KTLX",
+            network: rustdar_radar::sites::RadarNetwork::of_id("KTLX"),
             lat: 35.3,
             lon: -97.3,
             heights: None,
