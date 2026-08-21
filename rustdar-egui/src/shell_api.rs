@@ -4,7 +4,6 @@
 //! out-direction, `GuiAction`, already had this shape and lives in
 //! [`crate::actions`]. The re-verbed `GuiAction` lands here at E5.
 
-use crate::actions::RadarConfig;
 use rustdar_radar::types::ScanInfo;
 
 /// One frame's facts, composed by the App from state it already owns, applied
@@ -60,15 +59,18 @@ pub enum GuiEvent {
     Fetching(bool),
     /// A fetch failed: the message, spinner down, archive backoff advanced.
     Error(String),
-    /// The radar config, with the Set Time dialog's strings kept in sync.
-    RadarConfig(RadarConfig),
-    /// The time the shell has navigated to, with no claim about the site.
+    /// The time the shell has navigated to, and **the only thing about a
+    /// scan the shell pushes**: a site belongs to a pane, and the shell sets
+    /// it by writing that pane.
     ///
-    /// [`GuiEvent::RadarConfig`] carries both, and exactly one of its senders
-    /// means both: `SwitchRadarSite`, which moves the app-wide site. The rest
-    /// were reading the global site back out of the `Gui` and handing it
-    /// straight back unchanged, so that the timestamp had something to travel
-    /// in -- which reads like three more writers of a field that has one.
+    /// It replaced `GuiEvent::RadarConfig`, which carried a site beside the
+    /// timestamp for one writer — `SwitchRadarSite` — that already writes
+    /// every moving pane's site itself. With no app-wide site left for the
+    /// second half to land in, the two variants said the same thing and one
+    /// of them went.
+    ///
+    /// Applying it re-renders the Set Time dialog's two strings from the time
+    /// still selected, so a half-typed edit does not survive a navigation.
     SelectedTime(chrono::NaiveDateTime),
     /// Live/historic viewing mode for one pane.
     ViewingLiveForPane { pane_idx: usize, live: bool },

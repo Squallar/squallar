@@ -8,7 +8,6 @@ use super::probes::FrameProbes;
 use super::*;
 
 pub struct Gui {
-    pub(super) radar: RadarState,
     /// **What each layer says it is doing**, re-stated each frame by the App.
     ///
     /// Opaque by construction (WO-E8c): an entry is a [`LayerId`] and the
@@ -368,11 +367,12 @@ impl Gui {
     pub fn new() -> Self {
         // The same two defaults the radar config used to carry, now taken
         // from it one last time so the opening site and the opening time are
-        // still declared in exactly one place.
+        // still declared in exactly one place. The site goes straight into
+        // the one pane a fresh `Gui` has: there is no app-wide site for it to
+        // sit in.
         let RadarConfig { site, timestamp } = RadarConfig::default();
 
         let mut gui = Self {
-            radar: RadarState { site },
             liveness: Vec::new(),
             time_dialog: TimeDialogState {
                 timestamp,
@@ -393,7 +393,7 @@ impl Gui {
             // `default()` is the overlay crate's own set, and radar is a
             // separate source crate. See `crate::sources`.
             overlays: OverlayRegistry::with_handlers(crate::sources::all()),
-            panes: vec![PaneState::new()],
+            panes: vec![PaneState::with_site(site)],
             active_pane: 0,
             pane_layout: PaneLayout::default(),
             color_scale_orientation: ColorScaleOrientation::default(),

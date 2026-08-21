@@ -19,8 +19,9 @@
 # as the flake-quarantine policy -- the app's own backoff machinery is part of
 # what is exercised. A pass that fails twice fails the leg.
 #
-# The scene is pinned by seeding localStorage with site KTLX BEFORE any app
-# script runs (browsers would otherwise pick different default sites).
+# The scene is pinned by seeding localStorage with a PANE on KTLX before any
+# app script runs (browsers would otherwise pick different default sites).
+# There is no app-wide site to seed since WO-SITE: a pane carries its own.
 #
 # Adapted from the 2026-08-18 measurement rig's run_smoke.sh; this copy is the
 # permanent CI gate. Paths derive from the script location (this file lives at
@@ -53,9 +54,16 @@ BROWSERS="${RIG_BROWSERS:-chromium firefox}"
 EXPECT_TIMEOUT="${RIG_EXPECT_TIMEOUT:-180}"
 PY=python3
 
-# UiConfig is #[serde(default)], so a site-only config parses; the value is
-# the app's own persisted shape under its real localStorage key.
-SEED_LS='{"rustdar.ui": "{\"site\":\"KTLX\"}"}'
+# UiConfig is #[serde(default)], so a config this partial parses; the key is
+# the app's own real localStorage key. The site rides in a PANE, because that
+# is the only place a site lives -- the app-wide `site` key was retired at
+# WO-SITE, and a config carrying one seeds nothing now.
+#
+# Written in the OLDEST config shape on purpose: no `config_version` reads as
+# version 1, so the seed walks the whole migration chain up to whatever this
+# build speaks. The rig then needs no edit when CONFIG_VERSION moves, and the
+# chain is exercised on every Tier-2 run.
+SEED_LS='{"rustdar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\"}]}"}'
 
 SKIP_BUILD=0
 for arg in "$@"; do

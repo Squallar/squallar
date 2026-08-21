@@ -99,8 +99,10 @@ fn a_current_config_reaches_its_save_fixpoint_in_one_round_trip() {
     // implied by the fixpoint below. This file is the corpus's multi-pane
     // divergent-site/product fixture, and WO-E6b's shape transform builds one
     // radar slot per pane out of exactly these three values: a migration that
-    // collapsed them onto the top-level `site`, or onto pane 0's, would still
-    // reach a fixpoint while showing both panes the same picture.
+    // collapsed them onto pane 0's — or, before WO-SITE retired it, onto the
+    // top-level `site` — would still reach a fixpoint while showing both
+    // panes the same picture. The v4 → v5 seed is the live version of that
+    // hazard: it must fill a gap and never overwrite.
     let selection = |g: &Gui, i| {
         let p = g.pane(i).expect("the restored layout has both panes");
         (
@@ -156,7 +158,6 @@ fn a_future_builds_config_survives_a_session_with_every_unknown_intact() {
     // selection lives. The file's top-level site is a DIFFERENT one on
     // purpose: reading "KTLX" here can only have come from the slot.
     let pane = gui.pane(0).expect("pane 0");
-    assert_eq!(gui.radar.site, "KGRR", "premise: the globals differ");
     assert_eq!(pane.site(), "KTLX", "the radar slot's site is the pane's");
     assert_eq!(
         pane.selected_product(),
@@ -195,6 +196,17 @@ fn a_future_builds_config_survives_a_session_with_every_unknown_intact() {
         v["hologram_mode"],
         serde_json::json!({ "depth": 3 }),
         "an unknown top-level field survives to the file",
+    );
+    // The file's top-level `site` is a DIFFERENT one from the slot's on
+    // purpose, and this build does not know the key at all: WO-SITE retired
+    // it, and this version is far enough ahead that no migration step reaches
+    // it. So it is baggage, and baggage rides through. The row it replaces
+    // asserted this same value as the live *global* site, which no longer
+    // exists.
+    assert_eq!(
+        v["site"], "KGRR",
+        "the retired top-level `site` a newer file still carries was dropped \
+         on the save, which is a downgrade eating a setting",
     );
     assert_eq!(
         v["panes"][0]["particle_engine"], "on",
@@ -271,7 +283,9 @@ fn a_corrupt_pane_costs_that_pane_its_settings_and_nothing_else() {
     assert_eq!(
         p1.site(),
         "KTLX",
-        "the corrupt pane's site is the global fallback, as a default pane's is",
+        "the corrupt pane is on whatever startup picked, as a pane the \
+         salvage reset to defaults in place is — the file's opinion about it \
+         was reset with the rest of it",
     );
 
     let p2 = gui.pane(2).expect("pane 2");
@@ -1373,41 +1387,36 @@ fn a_handler_is_told_the_site_this_pane_is_on_now() {
     );
 }
 
-/// **The top-level `site` key is the persisted GLOBAL site, and it is the
-/// seed a pane that names no site of its own is opened on.**
+/// **Navigating in time says nothing about any pane's site.**
 ///
-/// WO-E8d's order calls this half of the radar config dead post-E6. It is
-/// dead to *fetching* — every fetch path substitutes the pane's own site —
-/// and it is not dead to the file, which is why the field survived that land.
-/// This is the gate that says so, because a doc comment saying "load-bearing"
-/// is prose and prose is not evidence.
+/// Was `navigating_in_time_leaves_the_global_site_alone`, whose subject was
+/// the one app-wide site. That site is gone (WO-SITE) and the property it
+/// stood for is not: a clock move must not reach a pane's radar selection,
+/// and there are now as many selections to leave alone as there are panes.
 ///
-/// Both halves were unpinned: a tamper writing the ACTIVE PANE's site into
-/// the key instead of the global was **green** across both packages. The
-/// corpus fixtures could not tell the arms apart because in every one of them
-/// the global and the pane already agree — so this test makes them disagree.
-///
-/// Navigating in time says nothing about the site.
-///
-/// `GuiEvent::RadarConfig` carries a site and a timestamp, and exactly one of
-/// its senders means both: `SwitchRadarSite`. Three others were reading the
-/// global site out of the `Gui` and handing it straight back so the timestamp
-/// had something to travel in, which made a field with one writer look like it
-/// had four. They send `SelectedTime` now, and this is what stops the site
-/// creeping back into it.
+/// `GuiEvent::RadarConfig` carried a site beside the timestamp for exactly
+/// one sender that meant both, `SwitchRadarSite` — which writes every moving
+/// pane's site itself. With nothing app-wide for the second half to land in
+/// the variant went, and `SelectedTime` is the only navigation event left.
+/// This is what stops a site creeping back into it.
 #[test]
-fn navigating_in_time_leaves_the_global_site_alone() {
+fn navigating_in_time_leaves_every_panes_site_alone() {
     let mut gui = Gui::new();
-    gui.apply(crate::shell_api::GuiEvent::RadarConfig(
-        crate::actions::RadarConfig {
-            site: "KDMX".to_string(),
-            timestamp: gui.selected_timestamp(),
-        },
-    ));
-    let before = gui.global_site().to_string();
+    gui.set_pane_count_for_test(2);
+    gui.pane_mut(0)
+        .expect("pane 0")
+        .set_site("KDMX".to_string());
+    gui.pane_mut(1)
+        .expect("pane 1")
+        .set_site("KGRR".to_string());
+    let before: Vec<String> = (0..2)
+        .map(|i| gui.pane(i).expect("pane").site().to_string())
+        .collect();
     assert_eq!(
-        before, "KDMX",
-        "precondition: the global site is what we set"
+        before,
+        vec!["KDMX".to_string(), "KGRR".to_string()],
+        "precondition: the two panes must be on different sites, or a walk \
+         that collapsed them onto one would still read green"
     );
 
     let moved = gui
@@ -1422,61 +1431,256 @@ fn navigating_in_time_leaves_the_global_site_alone() {
         "precondition: the event must actually move the clock, or the \
          assertion below is about nothing"
     );
+    let after: Vec<String> = (0..2)
+        .map(|i| gui.pane(i).expect("pane").site().to_string())
+        .collect();
     assert_eq!(
-        gui.global_site(),
-        before,
-        "navigating in time moved the app-wide site. Only an explicit site \
+        after, before,
+        "navigating in time moved a pane's site. Only an explicit site \
          switch may do that",
     );
 }
 
-/// The load half is not hypothetical: the Tier-2 browser rig pins its scene
-/// by seeding `{"site":"KTLX"}` and nothing else, and reaches pane 0 through
-/// exactly this path.
+/// **The file names no app-wide site: every site in it belongs to a pane.**
+///
+/// The save half of `the_persisted_site_is_the_global_one_and_it_seeds_a_pane_that_names_none`,
+/// with its assertion inverted by the ruling that retired the global. That
+/// row pinned the top-level `site` key as the *global* one, written from
+/// `Gui::radar.site` and disagreeing with the active pane on purpose. There
+/// is no such key and no such field; what has to be pinned instead is that
+/// neither came back, and that each pane's own site still round-trips.
+///
+/// Both halves were unpinned before that row existed and both are pinned
+/// here: the corpus fixtures cannot tell the arms apart on their own, because
+/// in every one of them the panes agree — so this test makes them disagree.
 #[test]
-fn the_persisted_site_is_the_global_one_and_it_seeds_a_pane_that_names_none() {
-    // ---- save side: the global and the active pane disagree on purpose.
+fn the_save_names_no_app_wide_site_and_each_pane_carries_its_own() {
     let mut gui = Gui::new();
-    gui.apply(crate::shell_api::GuiEvent::RadarConfig(
-        crate::actions::RadarConfig {
-            site: "KDMX".to_string(),
-            timestamp: gui.selected_timestamp(),
-        },
-    ));
+    gui.set_pane_count_for_test(2);
     gui.pane_mut(0)
-        .expect("a fresh Gui has one pane")
+        .expect("pane 0")
         .set_site("KGRR".to_string());
+    gui.pane_mut(1)
+        .expect("pane 1")
+        .set_site("KDMX".to_string());
     assert_ne!(
-        gui.global_site(),
         gui.pane(0).expect("pane 0").site(),
+        gui.pane(1).expect("pane 1").site(),
         "premise: the two must disagree, or this test could pass off either",
     );
 
     let saved = gui.ui_config_json().expect("serializable");
     let v: serde_json::Value = serde_json::from_str(&saved).expect("valid JSON");
-    assert_eq!(
-        v["site"].as_str(),
-        Some("KDMX"),
-        "the top-level key took the active pane's site instead of the global \
-         one, which changes what a multi-pane session persists: {saved}",
+    assert!(
+        v.get("site").is_none(),
+        "the save wrote a top-level `site` key. There is no app-wide site to \
+         write, and a build that reads one would hand every siteless pane a \
+         radar the user never chose: {saved}",
     );
 
-    // ---- load side: that key is what a pane naming no site opens on.
-    let seeded = format!(
-        r#"{{"config_version":{},"pane_count":1,"site":"KDMX","panes":[{{}}]}}"#,
-        super::migrate::CONFIG_VERSION,
+    // The panes' own answers, in their own slots, still distinct.
+    let slot_site = |pane: &serde_json::Value| -> Option<String> {
+        pane["layer_slots"]
+            .as_array()?
+            .iter()
+            .find(|slot| slot["id"] == "Radar")?["config"]["site"]
+            .as_str()
+            .map(str::to_owned)
+    };
+    let panes = v["panes"].as_array().expect("the save writes a pane list");
+    assert_eq!(
+        panes.len(),
+        2,
+        "premise: both panes must be on the wire: {saved}"
     );
+    assert_eq!(
+        (slot_site(&panes[0]), slot_site(&panes[1])),
+        (Some("KGRR".to_string()), Some("KDMX".to_string())),
+        "the panes' own sites did not survive to the file: {saved}",
+    );
+
+    // ---- and back, still distinct.
     let mut fresh = Gui::new();
     assert!(
-        fresh.load_ui_config(&store_with(&seeded)),
+        fresh.load_ui_config(&store_with(&saved)),
+        "the file this build just wrote must load"
+    );
+    assert_eq!(
+        (
+            fresh.pane(0).expect("pane 0").site().to_string(),
+            fresh.pane(1).expect("pane 1").site().to_string()
+        ),
+        ("KGRR".to_string(), "KDMX".to_string()),
+        "reopening collapsed the two panes onto one site",
+    );
+}
+
+/// **A pane the file counted but never described opens on the first pane the
+/// file does name — and a pane it DID describe keeps what the description
+/// came to, even when that is nothing.**
+///
+/// The load half of `the_persisted_site_is_the_global_one_and_it_seeds_a_pane_that_names_none`.
+/// That row's seed was the top-level `site` key. The key is gone; the gap it
+/// filled is not, and the file's own first answer is the nearest honest
+/// substitute — but only for the gap. The two shapes that used to share the
+/// global's fallback are split here on purpose and pinned apart, because
+/// running them together is what would let a refused site silently become a
+/// neighbour's radar:
+///
+///   * pane 2 — **counted, never described**. Nothing is known about it, so
+///     it opens on the file's first site.
+///   * pane 1 — **described, and the description named no site**. The file
+///     had an opinion about this pane; it just did not name a radar. It opens
+///     on whatever startup picked, exactly as it did when a refused value
+///     left the global empty too.
+#[test]
+fn a_pane_the_file_never_described_opens_on_the_first_pane_it_did() {
+    let seeded = format!(
+        r#"{{"config_version":{},"pane_count":3,"panes":[{{"layer_slots":[{{"id":"Radar","config":{{"site":"KDMX"}}}}]}},{{}}]}}"#,
+        super::migrate::CONFIG_VERSION,
+    );
+    let startup = Gui::new().pane(0).expect("pane 0").site().to_string();
+    assert_ne!(
+        startup, "KDMX",
+        "premise: startup's own site must differ from the file's, or every \
+         assertion below could pass off either",
+    );
+
+    let mut gui = Gui::new();
+    assert!(
+        gui.load_ui_config(&store_with(&seeded)),
         "the file must load"
     );
     assert_eq!(
-        fresh.pane(0).expect("pane 0").site(),
+        gui.pane(0).expect("pane 0").site(),
         "KDMX",
-        "a pane that named no site of its own was not opened on the file's \
-         global site, so the key is write-only and the rig's scene seed is a \
-         coincidence",
+        "premise: the one pane that names a site must have taken it, or the \
+         two assertions below are about nothing",
+    );
+    assert_eq!(
+        gui.pane(2).expect("pane 2").site(),
+        "KDMX",
+        "a pane the file counted but never described was left on a \
+         compiled-in default instead of the site the file is plainly about",
+    );
+    assert_eq!(
+        gui.pane(1).expect("pane 1").site(),
+        startup,
+        "a pane the file DESCRIBED, whose description named no site, \
+         borrowed a neighbour's radar. A described pane is not a gap",
+    );
+}
+
+/// **A file naming a site and no panes at all still lands it on a pane.**
+///
+/// The shape the Tier-2 browser rig seeded its scene with until WO-SITE, and
+/// the shape a hand-written config takes: one top-level `site`, no `panes`.
+/// The v4 → v5 step has to invent somewhere for the value to go, or the key
+/// it removes takes the user's radar with it — and it would do so silently,
+/// because a build that no longer reads the key cannot notice it was there.
+#[test]
+fn a_site_with_no_pane_to_land_in_still_reaches_the_panes() {
+    let startup = Gui::new().pane(0).expect("pane 0").site().to_string();
+    assert_ne!(
+        startup, "KDMX",
+        "premise: startup's own site must differ, or this test passes on a \
+         migration that did nothing at all",
+    );
+
+    let mut gui = Gui::new();
+    assert!(
+        gui.load_ui_config(&store_with(r#"{"pane_count":2,"site":"KDMX"}"#)),
+        "the file must load"
+    );
+    assert_eq!(
+        gui.pane(0).expect("pane 0").site(),
+        "KDMX",
+        "the root site had no pane to land in and was dropped",
+    );
+    assert_eq!(
+        gui.pane(1).expect("pane 1").site(),
+        "KDMX",
+        "the second pane the file counted did not reach the site either",
+    );
+    let saved = gui.ui_config_json().expect("serializable");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&saved)
+            .expect("valid JSON")
+            .get("site")
+            .is_none(),
+        "the root key came back on the save: {saved}",
+    );
+}
+
+/// **The v4 → v5 migration hands the root site to the panes that name none,
+/// leaves the panes that do alone, and takes the key with it.**
+///
+/// The one upgrade path off the app-wide site. A file written before WO-SITE
+/// carries the user's choice in a key this build no longer reads at all — so
+/// a step that failed to move it would not fail loudly, it would silently
+/// reopen the session on a radar the user never chose.
+#[test]
+fn the_root_site_migration_seeds_only_the_panes_that_name_none() {
+    let store = store_with(include_str!("fixtures/root_site_v4.json"));
+    let mut gui = Gui::new();
+    assert!(gui.load_ui_config(&store), "the v4 file must load");
+
+    assert_eq!(
+        gui.pane_count(),
+        2,
+        "precondition: the fixture must really have two panes"
+    );
+    assert_eq!(
+        gui.pane(0).expect("pane 0").site(),
+        "KOUN",
+        "the pane that named its OWN site was overwritten by the root one -- \
+         the seed must only fill a gap",
+    );
+    assert_eq!(
+        gui.pane(1).expect("pane 1").site(),
+        "KTLX",
+        "the pane that named no site did not take the root site, so an \
+         upgrade drops the user's radar",
+    );
+    // The pane that named its own site kept its other slot members too: the
+    // step edits one member and must not rewrite the slot.
+    assert_eq!(
+        gui.pane(0).expect("pane 0").selected_elevation(),
+        1.5,
+        "the seed rewrote a slot instead of filling one member of it",
+    );
+
+    // ---- the key is gone, and the file is a fixpoint from here.
+    let save1 = gui.ui_config_json().expect("serializable");
+    let v1: serde_json::Value = serde_json::from_str(&save1).expect("valid JSON");
+    assert!(
+        v1.get("site").is_none(),
+        "the migrated file still carries a root `site`: {save1}",
+    );
+    assert_eq!(
+        v1["config_version"],
+        u64::from(super::migrate::CONFIG_VERSION),
+        "the save must describe itself as this build's format",
+    );
+
+    let mut gui2 = Gui::new();
+    assert!(
+        gui2.load_ui_config(&store_with(&save1)),
+        "the file this build just wrote must load"
+    );
+    let save2 = gui2.ui_config_json().expect("serializable");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&save1).expect("JSON"),
+        serde_json::from_str::<serde_json::Value>(&save2).expect("JSON"),
+        "save-load-save moved the file: reopening would not be 1:1",
+    );
+    assert_eq!(
+        (
+            gui2.pane(0).expect("pane 0").site().to_string(),
+            gui2.pane(1).expect("pane 1").site().to_string()
+        ),
+        ("KOUN".to_string(), "KTLX".to_string()),
+        "the reload did not keep each pane on its own site",
     );
 }
 

@@ -5515,8 +5515,14 @@ fn fetched_site(actions: &[crate::actions::GuiAction]) -> Option<String> {
 }
 
 /// 37. **Refresh fetches the site the active pane is viewing.**
+///
+/// Was `refresh_fetches_the_active_panes_site_not_the_global_one`. The
+/// property is unchanged; its contrast partner is not, because the global it
+/// named no longer exists (WO-SITE). The site that could wrongly be fetched
+/// instead is now **another pane's**, so the fixture is two panes on
+/// different radars with the second one active.
 #[test]
-fn refresh_fetches_the_active_panes_site_not_the_global_one() {
+fn refresh_fetches_the_active_panes_site_not_another_panes() {
     let mut h = InputHarness::with_screen(egui::vec2(800.0, 900.0));
     assert_eq!(
         h.width_class(),
@@ -5525,26 +5531,40 @@ fn refresh_fetches_the_active_panes_site_not_the_global_one() {
          of them"
     );
 
-    // The global site, written through the one door that sets it — the
-    // active pane stays on KTLX, so the two disagree.
-    let config = crate::actions::RadarConfig {
-        site: "KDMX".to_owned(),
-        timestamp: h.gui_mut().selected_timestamp(),
-    };
+    h.set_pane_count(2);
     h.gui_mut()
-        .apply(crate::shell_api::GuiEvent::RadarConfig(config));
+        .pane_mut(0)
+        .expect("pane 0")
+        .set_site("KDMX".to_owned());
+    h.gui_mut()
+        .pane_mut(1)
+        .expect("pane 1")
+        .set_site("KTLX".to_owned());
+    h.mouse_click(h.pane_rects()[1].center());
     h.warm_up();
+    assert_eq!(
+        h.active_pane_index(),
+        1,
+        "precondition: the second pane must be the active one"
+    );
     assert_eq!(
         h.gui_mut().active_pane().site(),
         "KTLX",
-        "precondition: the active pane and the global config must disagree"
+        "precondition: the active pane must be the one set to KTLX"
+    );
+    assert_eq!(
+        h.gui_mut().pane(0).expect("pane 0").site(),
+        "KDMX",
+        "precondition: the two panes must disagree, or this test could pass \
+         off either one"
     );
 
     h.mouse_click(h.status_bar().refresh.center());
     assert_eq!(
         fetched_site(h.last_actions()).as_deref(),
         Some("KTLX"),
-        "the status-bar Refresh fetched the global site, not the active pane's"
+        "the status-bar Refresh fetched another pane's site, not the active \
+         pane's"
     );
 
     h.open_menu();
@@ -5552,39 +5572,57 @@ fn refresh_fetches_the_active_panes_site_not_the_global_one() {
     assert_eq!(
         fetched_site(h.last_actions()).as_deref(),
         Some("KTLX"),
-        "the menu's Refresh fetched the global site, not the active pane's"
+        "the menu's Refresh fetched another pane's site, not the active \
+         pane's"
     );
 }
 
-/// 37b. **The Set Time dialog fetches the persisted GLOBAL site, not the
-/// active pane's** — the exact opposite of the Refresh above, which is why
-/// both are pinned: the two controls read different sites on purpose.
+/// 37b. **The Set Time dialog fetches the ACTIVE PANE's site**, the same
+/// answer as the Refresh above.
 ///
-/// Added at WO-E8d, where the selected timestamp moved out of the radar
-/// config and beside the dialog that edits it. Rebuilding this action from
-/// `active_pane_fetch_config()` is the natural-looking edit, and **nothing in
-/// the workspace would have caught it**: a probe that made this arm read the
-/// active pane came back green across all 3,673 rows before this test
-/// existed.
+/// **This row's assertion is inverted from the one it replaces**, and that is
+/// the point of it. Was `the_time_dialogs_ok_fetches_the_global_site_not_the_active_panes`:
+/// added at WO-E8d to pin that this one control deliberately read the
+/// persisted global rather than the pane in front of the user, so the two
+/// controls disagreed on purpose. WO-SITE retires the global on the ruling
+/// that nothing is app-wide, and this dialog belongs to a pane like every
+/// other control. The two controls now agree, and both stay pinned because
+/// a pane's site is the only site there is to get wrong.
+///
+/// The fixture keeps its teeth: two panes on different radars, the active one
+/// second, so an arm that reached for any other pane reads red.
 #[test]
-fn the_time_dialogs_ok_fetches_the_global_site_not_the_active_panes() {
+fn the_time_dialogs_ok_fetches_the_active_panes_site() {
     let mut h = InputHarness::with_screen(egui::vec2(800.0, 900.0));
 
-    // The global site, written through the one door that sets it.
-    let config = crate::actions::RadarConfig {
-        site: "KDMX".to_owned(),
-        timestamp: h.gui_mut().selected_timestamp(),
-    };
+    h.set_pane_count(2);
     h.gui_mut()
-        .apply(crate::shell_api::GuiEvent::RadarConfig(config));
+        .pane_mut(0)
+        .expect("pane 0")
+        .set_site("KDMX".to_owned());
+    h.gui_mut()
+        .pane_mut(1)
+        .expect("pane 1")
+        .set_site("KTLX".to_owned());
+    h.mouse_click(h.pane_rects()[1].center());
     h.gui_mut().set_time_dialog_open_for_test(true);
     h.warm_up();
 
     assert_eq!(
+        h.active_pane_index(),
+        1,
+        "precondition: the second pane must be the active one"
+    );
+    assert_eq!(
         h.gui_mut().active_pane().site(),
         "KTLX",
-        "precondition: the active pane and the global site must disagree, or \
-         this test could pass off either one"
+        "precondition: the active pane must be the one set to KTLX"
+    );
+    assert_eq!(
+        h.gui_mut().pane(0).expect("pane 0").site(),
+        "KDMX",
+        "precondition: the two panes must disagree, or this test could pass \
+         off either one"
     );
     assert!(
         h.text_painted_in(h.screen_rect(), "Select Time"),
@@ -5601,9 +5639,8 @@ fn the_time_dialogs_ok_fetches_the_global_site_not_the_active_panes() {
 
     assert_eq!(
         fetched_site(h.last_actions()).as_deref(),
-        Some("KDMX"),
-        "the Set Time dialog fetched a site that is not the global one it has \
-         always fetched"
+        Some("KTLX"),
+        "the Set Time dialog fetched a site that is not the active pane's"
     );
 }
 
@@ -5626,13 +5663,8 @@ fn the_time_dialog_shows_the_time_the_shell_last_selected() {
         .expect("a real date")
         .and_hms_opt(21, 7, 33)
         .expect("a real time");
-    let site = h.gui_mut().global_site().to_string();
-    h.gui_mut().apply(crate::shell_api::GuiEvent::RadarConfig(
-        crate::actions::RadarConfig {
-            site,
-            timestamp: picked,
-        },
-    ));
+    h.gui_mut()
+        .apply(crate::shell_api::GuiEvent::SelectedTime(picked));
     h.gui_mut().set_time_dialog_open_for_test(true);
     h.warm_up();
 
@@ -13186,19 +13218,19 @@ fn radar_control_rect(h: &mut InputHarness, label: &str) -> egui::Rect {
 #[test]
 fn the_radar_layers_refresh_button_asks_the_shell_for_this_panes_scan() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
-    // A site the persisted global does NOT carry, so an action naming it
-    // can only have come from the pane.
+    // A site no pane carries by default, so an action naming it can only
+    // have come from the pane set here.
+    assert_ne!(
+        h.gui_mut().pane(0).expect("pane 0").site(),
+        "KGRR",
+        "precondition: a fresh pane must not already be on this site, or the \
+         assertion below could pass off the default",
+    );
     h.gui_mut()
         .pane_mut(0)
         .expect("pane 0")
         .set_site("KGRR".to_string());
     h.warm_up();
-    assert_ne!(
-        h.gui_mut().global_site(),
-        "KGRR",
-        "precondition: the shared config must not already name this site, or \
-         the assertion below could pass off the global",
-    );
 
     h.open_layer_in_inspector(&known::RADAR);
     let button = radar_control_rect(&mut h, rustdar_radar::source::REFRESH_LABEL);
