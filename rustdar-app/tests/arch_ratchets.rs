@@ -29,6 +29,13 @@
 //! measurement; `1e94ce59` then shed three and left them, which is the defect
 //! this note now exists to make visible rather than to absorb.
 //!
+//! Rows 1a/1b moved DOWN one at WO-SYNCGROUP (2026-08-21, base `510e8690`),
+//! which replaced the loop-start barrier's two unary time-link reads with one
+//! pair-wise read. **The shed is discharged, not the arrears**: that land
+//! measured 178/173 against ceilings of 181/176, so two occurrences of slack
+//! from earlier lands are still there and still spendable. Re-measure before
+//! trusting the gap.
+//!
 //! **Snapshot: re-measured at WO-ARREARS, 2026-08-21, base `178ab361`**, by
 //! the walker below (not by the `rg` column, which is documentation — see the
 //! note after the table). The `was` column is the previous literal, kept so it
@@ -36,8 +43,8 @@
 //!
 //! ```text
 //!  #   metric                                        value  was  command (run from the workspace root)
-//!  1a  App-pokes-Gui occurrences, rustdar-app          181  184  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' | wc -l
-//!  1b  ... excluding test-named paths                  176  179  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' -g '!*tests*' | wc -l
+//!  1a  App-pokes-Gui occurrences, rustdar-app          180  181  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' | wc -l
+//!  1b  ... excluding test-named paths                  175  176  rg -o 'self\.''gui\.' rustdar-app --glob '*.rs' -g '!*tests*' | wc -l
 //!  1c  ... that are setter pushes  [TARGET 0, HELD]      0    -  rg -o 'self\.''gui\.''set_' rustdar-app --glob '*.rs' | wc -l
 //!  2a  Gui setter fns in rustdar-egui/src/ui.rs          0    0  rg -o 'pub fn ''set_' rustdar-egui/src/ui.rs | wc -l
 //!  2b  ... over every inherent `impl Gui` block          1    1  see GUI_IMPL_SETTER_MAX — the walk, not a one-file grep
@@ -228,7 +235,7 @@ const INVENTORY_FIELD: &str = concat!("volumes: ", "crate::volume_inventory::");
 /// standing at all**: it would be new evasion, and this doc is the record that
 /// the two here were found, measured and left deliberately rather than
 /// overlooked.
-const SELF_GUI_MAX: usize = 181;
+const SELF_GUI_MAX: usize = 180;
 /// Row 1b — the same needle outside test-named paths.
 ///
 /// Everything on [`SELF_GUI_MAX`] applies here: permanent, falls only, sits on
@@ -238,7 +245,7 @@ const SELF_GUI_MAX: usize = 181;
 /// row is the one that matters for behaviour — the other counts the suites
 /// that exercise the coupling as well, and a suite is allowed to name what it
 /// tests.
-const SELF_GUI_NON_TEST_MAX: usize = 176;
+const SELF_GUI_NON_TEST_MAX: usize = 175;
 /// Row 2a — **`ui.rs`'s own `impl Gui` block, and only that file**.
 ///
 /// **0 since WO-E8b**, which is where the plan said it would land. The last

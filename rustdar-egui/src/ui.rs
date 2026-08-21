@@ -1466,7 +1466,9 @@ impl Gui {
     }
 
     #[cfg(test)]
-    pub(crate) fn pane_borders_for_test(&self) -> &[(usize, egui::Rect, bool)] {
+    pub(crate) fn pane_borders_for_test(
+        &self,
+    ) -> &[(usize, egui::Rect, crate::ui::map::PaneBorderMarks)] {
         &self.probes.last_pane_borders
     }
 
@@ -1842,13 +1844,14 @@ impl Gui {
     }
 
     /// The panes a layer-wide change on pane `src` reaches: the visible
-    /// layer-linked panes when `src` is itself linked, or `src` alone when it
-    /// is not.
+    /// layer-linked panes **in `src`'s own group** when `src` is itself
+    /// linked, or `src` alone when it is not. A pane in no group reaches
+    /// nobody, whatever its flag says.
     pub fn layer_sync_targets(&self, src: usize) -> Vec<usize> {
         let count = self.visible_pane_count();
         if count > 1 && self.pane_layer_linked(src) {
             (0..count)
-                .filter(|&idx| idx == src || self.pane_layer_linked(idx))
+                .filter(|&idx| idx == src || self.panes_layer_linked(src, idx))
                 .collect()
         } else {
             vec![src]
@@ -1856,14 +1859,22 @@ impl Gui {
     }
 
     /// Whether one overlay render may serve several panes: every visible pane
-    /// that draws ground is viewport-linked *and* layer-linked. One pane out of
-    /// either group and nothing is grouped — the dedup key carries no geo
-    /// bounds and a shared texture would land on a pane whose map is elsewhere.
+    /// that draws ground is viewport-linked *and* layer-linked, **and they are
+    /// all in one link group**. One pane out of any of the three and nothing
+    /// is grouped — the dedup key carries no geo bounds and a shared texture
+    /// would land on a pane whose map is elsewhere, which two groups
+    /// guarantee it is.
     pub fn overlay_renders_groupable(&self) -> bool {
-        (0..self.visible_pane_count()).all(|idx| {
+        let mut ground =
+            (0..self.visible_pane_count()).filter(|&idx| self.panes[idx].draws_ground());
+        let Some(first) = ground.next() else {
+            return true;
+        };
+        let linked = |idx: usize| {
             let pane = &self.panes[idx];
-            !pane.draws_ground() || (pane.viewport_link && pane.layer_link)
-        })
+            pane.viewport_link && pane.layer_link && pane.group.is_some()
+        };
+        linked(first) && ground.all(|idx| linked(idx) && self.panes_share_group(first, idx))
     }
 
     /// **The time on display**, which every navigation the shell drives reads
@@ -2040,6 +2051,9 @@ impl Gui {
 
 #[cfg(test)]
 mod chunk_scan_info_tests;
+
+#[cfg(test)]
+mod link_group_tests;
 
 #[cfg(test)]
 mod pane_slice_tests;

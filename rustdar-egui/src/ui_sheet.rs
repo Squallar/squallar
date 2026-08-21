@@ -707,7 +707,7 @@ impl super::Gui {
                 }
             };
             self.panes[self.active_pane] = pane;
-            self.propagate_layer_sync();
+            self.propagate_pane_sync();
             // And the body directly over the sheet — the third link of the
             // scrim → sheet → body chain.
             ctx.set_sublayer(

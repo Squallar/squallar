@@ -572,7 +572,7 @@ impl super::Gui {
         let mut pane = std::mem::take(&mut self.panes[idx]);
         self.set_pane_overlay_with_fetch(&mut pane, idx, &kind, true, actions);
         self.panes[idx] = pane;
-        self.propagate_layer_sync();
+        self.propagate_pane_sync();
         self.stack_scroll_to = Some(kind.clone());
         self.select_layer(kind);
     }
@@ -669,7 +669,7 @@ impl super::Gui {
             }
         }
 
-        self.propagate_layer_sync();
+        self.propagate_pane_sync();
         self.select_layer(owner.clone());
     }
 
@@ -734,7 +734,7 @@ impl super::Gui {
             self.panes[idx] = pane;
         }
 
-        self.propagate_layer_sync();
+        self.propagate_pane_sync();
     }
 }
 

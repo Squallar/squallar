@@ -258,7 +258,7 @@ fn the_layer_sync_fan_out_releases_a_hidden_linked_panes_texture() {
         );
     }
 
-    gui.propagate_layer_sync();
+    gui.propagate_pane_sync();
 
     for idx in [1, 2] {
         let target = gui.pane(idx).expect("fixture pane");

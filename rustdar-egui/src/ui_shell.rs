@@ -212,8 +212,8 @@ impl super::Gui {
         // shared subject, not part of the subject, and propagating it would
         // convert every sibling the moment one pane became a 3D view — from a
         // setting called "Sync Layers". The reasoning is written out on
-        // `propagate_layer_sync` itself.
-        self.propagate_layer_sync();
+        // `propagate_pane_sync` itself.
+        self.propagate_pane_sync();
     }
 
     /// The stack rows' status lines, one per layer in the pane's own order —
