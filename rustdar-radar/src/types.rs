@@ -452,14 +452,16 @@ fn discover_product_elevations(scan: &Scan, site: &RadarSite) -> HashMap<RadarPr
         );
     }
 
-    // Level III objects are made by an RPG, and only the WSR-88D network has
-    // one. A TDWR is served by the Supplemental Product Generator, which
-    // publishes its own short list and none of the four objects
-    // [`RadarProduct::level3_products`] names.
-    if site.is_wsr88d() {
-        for l3_product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
-            product_elevations.entry(*l3_product).or_default();
-        }
+    // The one claim with no volume to learn it from: a Level III object exists
+    // for a network or it does not, and the volume in hand says nothing either
+    // way. The registry states it per product — see
+    // `RadarProductSpec::available_networks` for the measurement behind each
+    // row — and this is the only place that claim is applied.
+    for l3_product in RadarProduct::all()
+        .iter()
+        .filter(|p| p.is_level3() && p.available_for(site.network))
+    {
+        product_elevations.entry(*l3_product).or_default();
     }
 
     product_elevations
@@ -696,6 +698,17 @@ impl RadarProduct {
 
     pub fn is_level3(&self) -> bool {
         crate::product_spec::spec(*self).is_level3
+    }
+
+    /// Whether `network`'s data can produce this product.
+    ///
+    /// A stated fact per registration, never inherited — see
+    /// `RadarProductSpec::available_networks` for the three reasons a product
+    /// is WSR-88D-only and for what actually consults this.
+    pub fn available_for(&self, network: crate::sites::RadarNetwork) -> bool {
+        crate::product_spec::spec(*self)
+            .available_networks
+            .contains(&network)
     }
 
     /// The AWIPS product IDs to fetch for this product. These key the
