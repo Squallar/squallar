@@ -122,9 +122,15 @@ pub struct Gui {
     pub(super) insp_scroll_reset: bool,
     /// What the inspector's body is about while it is open — and what it will
     /// be about when next opened. Session-only, defaults to
-    /// [`InspectorSelection::AppSettings`]; a dismissal resets it there (see
-    /// [`Self::dismiss_top_layer`]), while the ⟩ collapse deliberately keeps
-    /// it, because a collapse is not a deselection.
+    /// [`InspectorSelection::AppSettings`].
+    ///
+    /// **No close route rewrites it.** Closing and reopening returns the body
+    /// you left. There used to be two closes — the crumb's `›`, which kept the
+    /// selection, and a dismissal, which reset it to App › Settings — and the
+    /// difference was defended as "a collapse is not a deselection". The panel
+    /// has one close now (`ui_inspector.rs`) and deselection is the crumb's
+    /// job, so the distinction has nothing left to name: a close that silently
+    /// re-aims the panel is a close that loses the user's place.
     pub(super) inspector_sel: InspectorSelection,
     /// Whether the floating timeline transport is collapsed to its 🕐 chip.
     pub(super) timeline_collapsed: bool,

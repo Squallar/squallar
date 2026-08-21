@@ -1445,6 +1445,18 @@ impl Gui {
         &self.probes.last_inspector
     }
 
+    /// What the inspector would open on next — the field, not the paint.
+    ///
+    /// The probe reports the body that *drew*, which needs the panel open. The
+    /// Compact hosts offer no route that reopens the inspector without also
+    /// asserting a body (every bottom-bar item and every stack row names one),
+    /// so the pin that a close leaves the selection alone has nothing else to
+    /// read there.
+    #[cfg(test)]
+    pub(crate) fn inspector_selection_for_test(&self) -> &InspectorSelection {
+        &self.inspector_sel
+    }
+
     #[cfg(test)]
     pub(crate) fn catalog_for_test(&self) -> &CatalogProbe {
         &self.probes.last_catalog

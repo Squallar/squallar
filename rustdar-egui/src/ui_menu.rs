@@ -627,7 +627,7 @@ mod tests {
     fn a_back_press_closes_one_open_layer_at_a_time() {
         let mut gui = Gui::new();
         gui.drawer_open = true;
-        // A non-default selection, so the reset-on-dismiss is observable.
+        // A non-default selection, so a close that rewrote it would show.
         gui.select_layer(known::NWS_ALERTS);
         gui.time_dialog.show = true;
         gui.overlays.selected_overlays = vec![std::sync::Arc::new(StubOverlayItem)];
@@ -656,9 +656,9 @@ mod tests {
         assert!(!gui.insp_open, "the inspector did not close");
         assert_eq!(
             gui.inspector_sel,
-            crate::ui::InspectorSelection::AppSettings,
-            "a dismissal must reset the selection to App \u{203a} Settings \
-             (plan \u{a7}3.4), not leave the layer lying in wait"
+            crate::ui::InspectorSelection::Layer(known::NWS_ALERTS),
+            "a dismissal must LEAVE the selection alone: the panel has one \
+             close now, and reopening returns the body the user was reading"
         );
         assert!(gui.drawer_open, "the drawer went with it");
 
