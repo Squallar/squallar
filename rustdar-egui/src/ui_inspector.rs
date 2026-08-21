@@ -358,7 +358,8 @@ impl super::Gui {
         if self.pane_layout.pane_count > 1 {
             ui.add_space(6.0);
             ui.separator();
-            let outcome = super::pills::sync_section_ui(ui, pane);
+            let in_use = self.groups_in_use();
+            let outcome = super::pills::sync_section_ui(ui, pane, &in_use);
             #[cfg(test)]
             {
                 probe.sync_rows = outcome.rows.clone();
