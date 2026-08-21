@@ -6,6 +6,7 @@
     ]
   ],
   "config_version": 5,
+  "favorite_sites": [],
   "heading_source": "Auto",
   "loop_lookback_secs": 3600,
   "loop_speed_fps": 5.0,
