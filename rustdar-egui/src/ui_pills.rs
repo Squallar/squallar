@@ -35,31 +35,54 @@ const LINK_POPOVER_WIDTH: f32 = 260.0;
 /// The site list's height, in the inspector body and the popover alike.
 const SITE_LIST_HEIGHT: f32 = 150.0;
 
-/// The Sync pill's text while all three of this pane's links are on.
-const SYNC_PILL_LINKED: &str = "Sync";
+/// **The Sync pill's text, group and all.** The pill used to collapse three
+/// booleans into one bit and keep the detail in a hover, which a touch device
+/// never shows — so the group letter is on the pill face itself and the
+/// unlinked mark rides in front of it.
+///
+/// `Sync A` — every link this pane offers is on, inside group A.
+/// `\u{2297} Sync A` — in group A, opted out of at least one dimension.
+/// `\u{2297} Solo` — in no group at all; the flags reach nobody.
+pub(super) const SYNC_PILL_SOLO: &str = "\u{2297} Solo";
 
-/// The Sync pill's text while **any** of this pane's three links is off.
-const SYNC_PILL_UNLINKED: &str = "\u{2297} Sync";
+fn sync_pill_label(group: Option<crate::pane::GroupId>, fully_linked: bool) -> String {
+    match group {
+        None => SYNC_PILL_SOLO.to_owned(),
+        Some(group) if fully_linked => format!("Sync {}", group.letter()),
+        Some(group) => format!("\u{2297} Sync {}", group.letter()),
+    }
+}
+
+/// The group row's label — the section's first row, because which panes this
+/// pane is with is the question the three toggles are answers *within*.
+pub(super) const SYNC_GROUP_OPTION: &str = "Group";
+
+/// What the group row offers in place of a letter: out of every group.
+pub(super) const SYNC_GROUP_SOLO: &str = "Solo";
 
 /// The Sync popover's three toggles.
 pub(super) const SYNC_VIEWPORT_OPTION: &str = "Sync viewport";
 pub(super) const SYNC_LAYERS_OPTION: &str = "Sync layers";
 pub(super) const SYNC_TIME_OPTION: &str = "Sync time";
 
-/// The two action rows under the toggles — the ways home. The first copies
-/// this pane's viewport everywhere and touches no link; the second is that
-/// copy plus every link on every visible pane turned back on.
+/// The three action rows under the toggles. The first copies this pane's
+/// viewport to every map pane and touches no link — the one group-blind row,
+/// and the only way back to one view once the panes have split. The other two
+/// are inverses of each other and stay inside this pane's group.
 pub(super) const SYNC_MATCH_ALL: &str = "Match all panes to this view";
-pub(super) const SYNC_RELINK_ALL: &str = "Re-link all here";
+pub(super) const SYNC_RELINK_ALL: &str = "Re-link this group here";
+pub(super) const SYNC_UNLINK_ALL: &str = "Unlink this group";
 
-/// The sync section's five row labels in draw order.
+/// The sync section's row labels in draw order.
 #[cfg(test)]
-pub(crate) const SYNC_SECTION_LABELS: [&str; 5] = [
+pub(crate) const SYNC_SECTION_LABELS: [&str; 7] = [
+    SYNC_GROUP_OPTION,
     SYNC_VIEWPORT_OPTION,
     SYNC_LAYERS_OPTION,
     SYNC_TIME_OPTION,
     SYNC_MATCH_ALL,
     SYNC_RELINK_ALL,
+    SYNC_UNLINK_ALL,
 ];
 
 /// What unlinking time really does — the section's caption. Shared time
@@ -81,9 +104,12 @@ pub(crate) const NO_VIEWPORT_LINK_NOTE: &str = "Viewport sync is for map \
     shows the map again.";
 
 /// The layers toggle's hover — what "layers" covers here, so off is not
-/// mistaken for the eye toggles alone.
+/// mistaken for the eye toggles alone, and what it does **not** cover: the
+/// clock. Time sync used to ride inside the layer guard, so this note was
+/// true about layers and silently false about the clock.
 const LAYER_LINK_NOTE: &str = "Off keeps this pane's site, product, tilt and \
-    layers its own; linked panes keep converging without it.";
+    layers its own; linked panes keep converging without it. The clock is \
+    not part of this - \"Sync time\" alone decides that.";
 
 /// The match-all action's hover: the copy, and the promise that it is only
 /// the copy.
@@ -91,9 +117,20 @@ const MATCH_ALL_NOTE: &str = "Copy this pane's zoom and centre to every map \
     pane. Links stay as they are.";
 
 /// The re-link action's hover: the same copy, plus the three links turned
-/// back on everywhere.
-const RELINK_ALL_NOTE: &str = "Copy this view to every map pane and turn \
-    viewport, layer and time sync back on for every pane.";
+/// back on — inside this pane's group, which is as far as any link reaches.
+const RELINK_ALL_NOTE: &str = "Copy this view to every map pane in this \
+    group and turn viewport, layer and time sync back on for all of them.";
+
+/// The bulk unlink's hover — the inverse of the row above it, and the gesture
+/// the section has never had.
+const UNLINK_ALL_NOTE: &str = "Turn viewport, layer and time sync off for \
+    every pane in this group. They keep the group; nothing follows anything \
+    until a link goes back on.";
+
+/// The group row's hover: what a group is, said where the choice is made.
+const GROUP_ROW_NOTE: &str = "Panes in one group sync with each other and \
+    with nobody else. Solo takes this pane out of every group. The pane's \
+    border carries the group's colour and letter.";
 
 /// The three pictures a pane can show, as the pickers offer them.
 const PANE_VIEW_OPTIONS: [(RenderView, &str); 3] = [
@@ -822,22 +859,72 @@ pub(super) fn kind_list_ui(ui: &mut egui::Ui, current: RenderView) -> PickOutcom
 }
 
 /// What one pass of [`sync_section_ui`] produced: which action row was
-/// clicked, whether the layer link was just turned **on**, and — for the
-/// probes — the rows as drawn.
+/// clicked, whether the pane was moved to another group, whether the layer
+/// link was just turned **on**, and — for the probes — the rows as drawn.
 #[derive(Default)]
 pub(crate) struct SyncSectionOutcome {
     pub layer_relinked: bool,
     pub match_all: bool,
     pub relink_all: bool,
+    pub unlink_all: bool,
+    /// `Some(group)` when the group row was clicked — including
+    /// `Some(None)`, which is the pane leaving every group. `None` is "the
+    /// row was not touched", which is why this is not a bare `Option<GroupId>`.
+    pub move_to_group: Option<Option<crate::pane::GroupId>>,
     #[cfg(test)]
     pub rows: Vec<(String, egui::Rect, bool)>,
 }
 
-/// **The** per-pane sync section: the three link checkboxes — all
-/// honestly per-pane, writing `pane`'s own fields — and the two action rows.
+/// The group row: one segmented button per group a layout can hold, then
+/// Solo. **The point of the section, drawn first** — the three toggles below
+/// are opt-outs *within* whichever of these is chosen, and a reader who never
+/// sees this row is reading three booleans with no subject again.
+///
+/// `in_use` is the groups that already have a pane in them; a group nobody is
+/// in is still offered — that is how a second group ever comes to exist — but
+/// drawn weak, so "which letters mean something right now" is legible.
+fn group_row_ui(
+    ui: &mut egui::Ui,
+    current: Option<crate::pane::GroupId>,
+    in_use: &[crate::pane::GroupId],
+    outcome: &mut SyncSectionOutcome,
+) -> egui::Rect {
+    use crate::pane::GroupId;
+    let response = ui
+        .horizontal_wrapped(|ui| {
+            ui.label(SYNC_GROUP_OPTION);
+            for group in GroupId::all() {
+                let letter = group.letter().to_string();
+                let text = if in_use.contains(&group) {
+                    egui::RichText::new(letter).color(group.accent())
+                } else {
+                    egui::RichText::new(letter).weak()
+                };
+                if ui
+                    .add(egui::Button::selectable(current == Some(group), text))
+                    .clicked()
+                {
+                    outcome.move_to_group = Some(Some(group));
+                }
+            }
+            if ui
+                .add(egui::Button::selectable(current.is_none(), SYNC_GROUP_SOLO))
+                .clicked()
+            {
+                outcome.move_to_group = Some(None);
+            }
+        })
+        .response;
+    response.on_hover_text(GROUP_ROW_NOTE).rect
+}
+
+/// **The** per-pane sync section: the group this pane belongs to, the three
+/// link checkboxes — all honestly per-pane, writing `pane`'s own fields — and
+/// the three action rows.
 pub(super) fn sync_section_ui(
     ui: &mut egui::Ui,
     pane: &mut crate::pane::PaneState,
+    groups_in_use: &[crate::pane::GroupId],
 ) -> SyncSectionOutcome {
     let mut outcome = SyncSectionOutcome::default();
     #[cfg(test)]
@@ -845,6 +932,17 @@ pub(super) fn sync_section_ui(
                 label: &str,
                 rect: egui::Rect,
                 was: bool| rows.push((label.to_owned(), rect, was));
+
+    let group_rect = group_row_ui(ui, pane.group, groups_in_use, &mut outcome);
+    #[cfg(test)]
+    push(
+        &mut outcome.rows,
+        SYNC_GROUP_OPTION,
+        group_rect,
+        pane.group.is_some(),
+    );
+    #[cfg(not(test))]
+    let _ = group_rect;
 
     if pane.shares_viewport() {
         #[cfg(test)]
@@ -895,18 +993,43 @@ pub(super) fn sync_section_ui(
     }
     #[cfg(test)]
     push(&mut outcome.rows, SYNC_RELINK_ALL, row.rect, false);
+    let row = ui.button(SYNC_UNLINK_ALL).on_hover_text(UNLINK_ALL_NOTE);
+    if row.clicked() {
+        outcome.unlink_all = true;
+    }
+    #[cfg(test)]
+    push(&mut outcome.rows, SYNC_UNLINK_ALL, row.rect, false);
 
     outcome
 }
 
-/// The Sync pill's hover: plain "Sync options" while every link this pane
-/// offers is on, and the unlinked dimensions named while any is off.
+/// The Sync pill's hover: which group this pane is in and who else is in it,
+/// then the unlinked dimensions if any are off. The pill face already carries
+/// the group letter, so the hover is the part a touch device can do without —
+/// company and detail, never the identity itself.
 fn sync_pill_hover(
+    group: Option<crate::pane::GroupId>,
+    with: &[PaneId],
     shares_viewport: bool,
     viewport_link: bool,
     layer_link: bool,
     time_link: bool,
 ) -> String {
+    let mut text = match group {
+        None => "In no group - this pane syncs with nobody".to_owned(),
+        Some(group) if with.is_empty() => {
+            format!("Group {} - the only pane in it", group.letter())
+        }
+        Some(group) => format!(
+            "Group {} - with pane{} {}",
+            group.letter(),
+            if with.len() > 1 { "s" } else { "" },
+            with.iter()
+                .map(|idx| (idx + 1).to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    };
     let mut off = Vec::new();
     if shares_viewport && !viewport_link {
         off.push("viewport");
@@ -917,11 +1040,10 @@ fn sync_pill_hover(
     if !time_link {
         off.push("time");
     }
-    if off.is_empty() {
-        "Sync options".to_owned()
-    } else {
-        format!("Sync options - unlinked: {}", off.join(", "))
+    if !off.is_empty() {
+        text.push_str(&format!(". Unlinked: {}", off.join(", ")));
     }
+    text
 }
 
 impl super::Gui {
@@ -1104,6 +1226,12 @@ impl super::Gui {
         chrome: f32,
         actions: &mut Vec<GuiAction>,
     ) {
+        let group = self.panes[idx].group;
+        // Who else is in it, for the hover. Read here rather than inside the
+        // closure below, which already holds `self.panes[idx]` borrowed.
+        let group_company: Vec<PaneId> = (0..self.visible_pane_count())
+            .filter(|&other| other != idx && self.panes_share_group(idx, other))
+            .collect();
         let (site, kind, product, shares_viewport, links, line_absent, tilt, products, elevations) = {
             let pane = &self.panes[idx];
             let (_, tilt) = pane
@@ -1242,27 +1370,19 @@ impl super::Gui {
                         let (viewport_link, layer_link, time_link) = links;
                         let all_linked =
                             (!shares_viewport || viewport_link) && layer_link && time_link;
-                        let label = if all_linked {
-                            SYNC_PILL_LINKED
-                        } else {
-                            SYNC_PILL_UNLINKED
-                        };
-                        let pill = ui.button(label).on_hover_text(sync_pill_hover(
+                        let label = sync_pill_label(group, all_linked);
+                        let pill = ui.button(label.as_str()).on_hover_text(sync_pill_hover(
+                            group,
+                            &group_company,
                             shares_viewport,
                             viewport_link,
                             layer_link,
                             time_link,
                         ));
                         #[cfg(test)]
-                        probe
-                            .pills
-                            .push((PillKind::Link, label.to_owned(), pill.rect));
-                        if pill.clicked() {
-                            if swallow {
-                                self.pill_revealed = Some(idx);
-                            } else {
-                                self.active_pane = idx;
-                            }
+                        probe.pills.push((PillKind::Link, label, pill.rect));
+                        if pill.clicked() && swallow {
+                            self.pill_revealed = Some(idx);
                         }
                         if !swallow {
                             self.sync_pill_popover(&pill, idx);
@@ -1398,7 +1518,7 @@ impl super::Gui {
                         pane.set_selected_product(picked);
                         pane.set_selected_elevation(0.0);
                     }
-                    self.propagate_layer_sync();
+                    self.propagate_pane_sync();
                     ui.close_kind(egui::UiKind::Menu);
                 }
             });
@@ -1433,7 +1553,7 @@ impl super::Gui {
                 if let Some(angle) = outcome.picked {
                     self.active_pane = idx;
                     self.panes[idx].set_selected_elevation(angle);
-                    self.propagate_layer_sync();
+                    self.propagate_pane_sync();
                     ui.close_kind(egui::UiKind::Menu);
                 }
             });
@@ -1441,19 +1561,29 @@ impl super::Gui {
     }
 
     /// The Sync popover: [`sync_section_ui`] over this pane. Checkboxes
-    /// keep the popover up.
+    /// keep the popover up — this is the one popover that deliberately
+    /// survives a click inside it, because flipping three links one after
+    /// another is the gesture.
+    ///
+    /// **Opening it does not make this the active pane**, and that is a
+    /// change: every other pill activates on click, and this one did too, so
+    /// merely looking at pane 3's links moved the source of every fan-out in
+    /// the app onto pane 3. Inspection is not selection. The row that
+    /// deliberately *is* a selection still activates — `relink_all` names
+    /// this pane as the group's new source, and says so on its face.
     fn sync_pill_popover(&mut self, pill: &egui::Response, idx: PaneId) {
         let shown = egui::Popup::menu(pill)
             .id(pill_popup_id(idx, PillKind::Link))
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
                 ui.set_max_width(LINK_POPOVER_WIDTH);
+                let in_use = self.groups_in_use();
                 let mut pane = std::mem::take(&mut self.panes[idx]);
-                let outcome = sync_section_ui(ui, &mut pane);
+                let outcome = sync_section_ui(ui, &mut pane, &in_use);
                 self.apply_sync_outcome(&outcome, &mut pane, idx);
                 self.panes[idx] = pane;
-                if outcome.layer_relinked || outcome.relink_all {
-                    self.propagate_layer_sync();
+                if outcome.layer_relinked || outcome.relink_all || outcome.move_to_group.is_some() {
+                    self.propagate_pane_sync();
                 }
                 if outcome.match_all || outcome.relink_all {
                     ui.close_kind(egui::UiKind::Menu);

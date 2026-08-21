@@ -2520,7 +2520,7 @@ fn a_menu_toggle_propagates_to_the_other_panes_when_sync_is_on() {
     assert!(
         !h.layers_panel_on_screen(),
         "precondition: the layers panel must NOT be on screen, or its own \
-             `propagate_layer_sync` masks the arm under test"
+             `propagate_pane_sync` masks the arm under test"
     );
 
     h.set_overlay_on_pane(0, &known::RADAR_SITES, false);
@@ -8329,13 +8329,15 @@ fn an_unlinked_pane_is_excluded_from_shared_nav_and_loop_fan_out() {
             .map(|(label, _, _)| label.clone())
             .collect::<Vec<_>>(),
         vec![
+            "Group".to_owned(),
             "Sync viewport".to_owned(),
             "Sync layers".to_owned(),
             "Sync time".to_owned(),
             "Match all panes to this view".to_owned(),
-            "Re-link all here".to_owned(),
+            "Re-link this group here".to_owned(),
+            "Unlink this group".to_owned(),
         ],
-        "the Pane-properties sync section must carry the popover's five rows"
+        "the Pane-properties sync section must carry the popover's rows"
     );
 
     let time_row = |h: &mut InputHarness| {
@@ -9277,6 +9279,18 @@ fn the_product_and_tilt_pill_popovers_write_the_pane() {
     );
 }
 
+/// One sync row out of a popover probe, by its label. **By label, never by
+/// index**: the section's row list is the thing these tests are about, so a
+/// row added to it must not silently move every click one row down.
+fn popover_row(popover: &crate::ui::PillPopoverProbe, label: &str) -> egui::Rect {
+    popover
+        .rows
+        .iter()
+        .find(|(drawn, _, _)| drawn == label)
+        .unwrap_or_else(|| panic!("the popover drew no {label:?} row: {:?}", popover.rows))
+        .1
+}
+
 /// 73f. **The Sync pill's popover is the per-pane five-row section: the three link
 /// checkboxes flip this pane's own fields, the two action rows ride under them, and
 /// the honest unlink sentence is on screen.**
@@ -9289,7 +9303,10 @@ fn the_sync_pill_popover_flips_all_three_per_pane_links() {
     );
 
     let (label, pill) = h.pill(0, PillKind::Link).expect("a Sync pill");
-    assert_eq!(label, "Sync", "a fresh pane's pill reads plain Sync");
+    assert_eq!(
+        label, "Sync A",
+        "a fresh pane's pill reads Sync and names the group it is in"
+    );
     h.mouse_click(pill.center());
     h.frame(); // the popup's debut frame only registers it
     let popover = h.pill_popover().expect("the popover opened");
@@ -9300,13 +9317,15 @@ fn the_sync_pill_popover_flips_all_three_per_pane_links() {
             .map(|(label, _, _)| label.as_str())
             .collect::<Vec<_>>(),
         vec![
+            "Group",
             "Sync viewport",
             "Sync layers",
             "Sync time",
             "Match all panes to this view",
-            "Re-link all here",
+            "Re-link this group here",
+            "Unlink this group",
         ],
-        "the five-row per-pane section's honest labels"
+        "the per-pane section's honest labels, group first"
     );
     assert!(
         h.painted_text_strings()
@@ -9315,7 +9334,7 @@ fn the_sync_pill_popover_flips_all_three_per_pane_links() {
         "the popover must carry the honest unlink caption"
     );
 
-    h.mouse_click(popover.rows[0].1.center());
+    h.mouse_click(popover_row(&popover, "Sync viewport").center());
     h.frame();
     {
         let gui = h.gui_mut();
@@ -9330,12 +9349,13 @@ fn the_sync_pill_popover_flips_all_three_per_pane_links() {
     }
     let (label, _) = h.pill(0, PillKind::Link).expect("still drawn");
     assert_eq!(
-        label, "\u{2297} Sync",
-        "the pill must mark an unlinked viewport distinctly"
+        label, "\u{2297} Sync A",
+        "the pill must mark an unlinked viewport distinctly, without losing \
+         the group it is still in"
     );
 
     let popover = h.pill_popover().expect("the popover stays up for toggles");
-    h.mouse_click(popover.rows[1].1.center());
+    h.mouse_click(popover_row(&popover, "Sync layers").center());
     h.frame();
     {
         let gui = h.gui_mut();
@@ -9350,7 +9370,7 @@ fn the_sync_pill_popover_flips_all_three_per_pane_links() {
     }
 
     let popover = h.pill_popover().expect("still up");
-    h.mouse_click(popover.rows[2].1.center());
+    h.mouse_click(popover_row(&popover, "Sync time").center());
     h.warm_up();
     {
         let gui = h.gui_mut();
@@ -9365,7 +9385,7 @@ fn the_sync_pill_popover_flips_all_three_per_pane_links() {
     }
     let (label, _) = h.pill(0, PillKind::Link).expect("still drawn");
     assert_eq!(
-        label, "\u{2297} Sync",
+        label, "\u{2297} Sync A",
         "the pill must keep marking the unlinked state distinctly"
     );
 }
@@ -9404,7 +9424,8 @@ fn a_3d_pane_is_offered_no_viewport_link_at_either_route() {
         rows
     }
 
-    let [viewport, layers, time, _, _] = crate::ui::SYNC_SECTION_LABELS.map(ToOwned::to_owned);
+    let [_group, viewport, layers, time, _, _, _] =
+        crate::ui::SYNC_SECTION_LABELS.map(ToOwned::to_owned);
 
     let mut h = pill_harness();
 
@@ -9443,7 +9464,7 @@ fn a_3d_pane_is_offered_no_viewport_link_at_either_route() {
 
     let (label, _) = h.pill(0, PillKind::Link).expect("still drawn");
     assert_eq!(
-        label, "Sync",
+        label, "Sync A",
         "the pill marked a 3D pane unlinked over a viewport link it is not \
          offered and does not take part in"
     );
@@ -9500,7 +9521,7 @@ fn the_sync_popover_action_rows_match_and_relink_the_grid() {
     h.frame(); // the popup's debut frame only registers it
     let popover = h.pill_popover().expect("the popover opened");
     assert_eq!(popover.pane_idx, 1, "precondition: pane 1's popover");
-    h.mouse_click(popover.rows[3].1.center());
+    h.mouse_click(popover_row(&popover, "Match all panes to this view").center());
     h.frame();
     {
         let gui = h.gui_mut();
@@ -9528,7 +9549,7 @@ fn the_sync_popover_action_rows_match_and_relink_the_grid() {
     h.mouse_click(pill.center());
     h.frame();
     let popover = h.pill_popover().expect("the popover opened");
-    h.mouse_click(popover.rows[4].1.center());
+    h.mouse_click(popover_row(&popover, "Re-link this group here").center());
     h.frame();
     {
         let gui = h.gui_mut();
@@ -12273,9 +12294,9 @@ fn every_pane_border_lies_inside_its_pane_at_every_position() {
         let borders = h.pane_borders();
         assert_eq!(borders.len(), 6, "every pane draws its border");
         let rects = h.pane_rects();
-        for &(idx, painted, active) in &borders {
+        for &(idx, painted, marks) in &borders {
             assert_eq!(
-                active,
+                marks.is_active,
                 idx == target,
                 "pane {idx}'s border misreports the active highlight"
             );

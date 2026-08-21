@@ -39,7 +39,11 @@ pub(crate) const ICON_GLYPHS: &[(char, &str)] = &[
     ('\u{1f441}', "layer visibility eye (stack rows)"),
     ('\u{2605}', "a favorited radar site (site list rows)"),
     ('\u{2606}', "an unfavorited radar site (site list rows)"),
-    ('\u{2297}', "unlinked from shared time (the Sync pill)"),
+    (
+        '\u{2297}',
+        "opted out of at least one of a link group's dimensions, or in no \
+         group at all (the Sync pill)",
+    ),
     (
         '\u{d7}',
         "close / dismiss (icon) - and nothing else, so a control spelling \
