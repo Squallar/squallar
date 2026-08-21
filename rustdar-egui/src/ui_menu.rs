@@ -292,7 +292,7 @@ impl super::Gui {
             }
             MenuEvent::Toggled(MenuToggle::Overlay(kind), on) => {
                 self.set_active_pane_overlay(&kind, on);
-                self.propagate_layer_sync();
+                self.propagate_pane_sync();
             }
             MenuEvent::Toggled(MenuToggle::AutoPoll, on) => self.set_auto_poll_enabled(on),
             MenuEvent::Toggled(MenuToggle::LiveChunks, on) => self.apply_layer_control(

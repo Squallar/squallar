@@ -938,7 +938,7 @@ fn a_layer_link_sync_moves_the_stack_and_leaves_every_pane_on_its_own_clock() {
         "precondition: and they hold different numbers of them",
     );
 
-    gui.propagate_layer_sync();
+    gui.propagate_pane_sync();
 
     assert!(
         !gui.panes[1].is_overlay_enabled(&known::NWS_ALERTS),

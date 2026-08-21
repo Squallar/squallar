@@ -371,7 +371,7 @@ fn an_unregistered_field_is_refused_by_name_rather_than_resolved_to_the_default_
          field, which is what this test exists to refuse",
     );
     let asks_before = painter.seen.lock().unwrap().len();
-    // Both panes: `propagate_layer_sync` copies the ACTIVE pane's field onto
+    // Both panes: `propagate_pane_sync` copies the ACTIVE pane's field onto
     // every linked pane every frame, so setting only the 3D pane's would be
     // undone before the next paint — measured, not assumed.
     for idx in [0, 1] {
@@ -446,7 +446,7 @@ fn the_pane_captions_the_picture_the_painter_says_it_drew() {
 fn a_product_with_no_vertical_structure_is_refused_by_name() {
     let (mut h, painter) = volume_harness(StubVolumePainter::painting());
     // On every pane, not just the 3D one: the layer links default on and
-    // `propagate_layer_sync` copies the *active* pane's product to the
+    // `propagate_pane_sync` copies the *active* pane's product to the
     // rest, so writing it to pane 1 alone is undone on the next frame by
     // pane 0.
     for pane in h.gui_mut().panes_mut() {
@@ -2072,7 +2072,7 @@ fn the_colour_scale_does_not_print_through_the_volume_alpha_button() {
 
     for (product, prefs) in legends {
         // On every pane, not just the 3D one: the layer links default on and
-        // `propagate_layer_sync` copies the *active* pane's product to the
+        // `propagate_pane_sync` copies the *active* pane's product to the
         // rest, so writing it to pane 0 alone is undone on the next frame.
         for pane in h.gui_mut().panes_mut() {
             pane.set_selected_product(product.clone());
@@ -2648,7 +2648,7 @@ fn the_3d_walk_gates_on_the_selection_the_pane_has_now() {
         "fixture precondition: the new field must be renderable in 3D, or a \
          stale read and a refusal look the same",
     );
-    // Both panes: `propagate_layer_sync` copies the ACTIVE pane's field onto
+    // Both panes: `propagate_pane_sync` copies the ACTIVE pane's field onto
     // every linked pane every frame.
     for idx in [0, 1] {
         h.gui_mut()
@@ -2735,7 +2735,7 @@ fn a_3d_pane_with_its_only_3d_layer_off_says_which_to_turn_on() {
 /// **This test exists because its two-pane sibling could not fail.** Removing
 /// the 3D arm's own hydrate left
 /// `the_3d_walk_gates_on_the_selection_the_pane_has_now` green, and following
-/// that one step found why: `propagate_layer_sync` copies the ACTIVE pane's
+/// that one step found why: `propagate_pane_sync` copies the ACTIVE pane's
 /// whole slot list — configs included — onto every layer-linked pane, and in
 /// a two-pane fixture the active pane is a plan-view one whose own draw path
 /// runs the hydrate. So the 3D pane was reading a member some *other* pane

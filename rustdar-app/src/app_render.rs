@@ -2067,7 +2067,7 @@ impl super::App {
                 for sibling_idx in 0..self.gui.pane_count() {
                     if sibling_idx == origin_pane
                         || self.gui.pane_has_no_plan_view(sibling_idx)
-                        || !self.gui.pane_layer_linked(sibling_idx)
+                        || !self.gui.panes_layer_linked(origin_pane, sibling_idx)
                     {
                         continue;
                     }
@@ -2171,18 +2171,20 @@ impl super::App {
             return;
         }
 
-        // The linked group starts as one: a time-linked ready pane waits
-        // while any time-linked looping pane is still catching up. Unlinked
-        // panes sit outside both halves of that sentence.
-        let hold_linked = multi
-            && not_ready_panes
-                .iter()
-                .any(|&idx| self.gui.pane_time_linked(idx));
+        // A link group starts as one: a time-linked ready pane waits while a
+        // pane it shares a group with is still catching up. Unlinked panes,
+        // and panes in another group, sit outside both halves of that
+        // sentence — so the wait is asked per pane rather than once for the
+        // whole layout.
 
         // Start the startable panes with the same instant and frame position
         let now = web_time::Instant::now();
         for idx in ready_panes {
-            if hold_linked && self.gui.pane_time_linked(idx) {
+            if multi
+                && not_ready_panes
+                    .iter()
+                    .any(|&waiting| self.gui.panes_time_linked(idx, waiting))
+            {
                 continue;
             }
             let pane = self.gui.pane_mut(idx).unwrap();
@@ -2586,7 +2588,7 @@ impl super::App {
                     if linked
                         && let Some((src_pane, src_frame)) = find_section_donor(
                             (0..pane_count)
-                                .filter(|&i| self.gui.pane_layer_linked(i))
+                                .filter(|&i| self.gui.panes_layer_linked(pane_idx, i))
                                 .filter_map(|i| self.gui.pane(i).map(|p| (i, p.loop_state()))),
                             pane_idx,
                             frame.timestamp,
@@ -2617,7 +2619,7 @@ impl super::App {
                         && section_already_queued(
                             to_cut
                                 .iter()
-                                .filter(|r| self.gui.pane_layer_linked(r.pane_idx)),
+                                .filter(|r| self.gui.panes_layer_linked(pane_idx, r.pane_idx)),
                             frame.timestamp,
                             &target,
                             &key,
@@ -2648,7 +2650,7 @@ impl super::App {
                 if linked {
                     let donor = find_donor(
                         (0..pane_count)
-                            .filter(|&i| self.gui.pane_layer_linked(i))
+                            .filter(|&i| self.gui.panes_layer_linked(pane_idx, i))
                             .filter_map(|i| self.gui.pane(i).map(|p| (i, p.loop_state()))),
                         pane_idx,
                         frame.timestamp,
@@ -2674,7 +2676,7 @@ impl super::App {
                             && render_already_queued(
                                 to_render
                                     .iter()
-                                    .filter(|r| self.gui.pane_layer_linked(r.pane_idx)),
+                                    .filter(|r| self.gui.panes_layer_linked(pane_idx, r.pane_idx)),
                                 frame.timestamp,
                                 &target,
                                 snapped,
@@ -2925,7 +2927,7 @@ impl super::App {
             for sibling_idx in 0..self.gui.pane_count() {
                 if sibling_idx == origin_pane
                     || self.gui.pane_cannot_loop(sibling_idx)
-                    || !self.gui.pane_layer_linked(sibling_idx)
+                    || !self.gui.panes_layer_linked(origin_pane, sibling_idx)
                 {
                     continue;
                 }
