@@ -3841,7 +3841,9 @@ fn closing_the_inspector_preserves_the_selection_on_every_route() {
     // The phone offers no reopen that does not also name a body, so the
     // selection itself is the instrument here — see
     // `Gui::inspector_selection_for_test`.
-    let routes: [(&str, fn(&mut InputHarness)); 2] = [
+    /// One close route: what to call it, and how to perform it.
+    type Route = (&'static str, fn(&mut InputHarness));
+    let routes: [Route; 2] = [
         ("the phone back press", |h| {
             assert!(h.gui_mut().dismiss_top_layer(), "back pops the page");
         }),
