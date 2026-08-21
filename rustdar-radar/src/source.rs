@@ -240,7 +240,35 @@ impl Default for RadarSource {
 /// builds `vertical` as `derive::volume_slot(p).is_some()`, and
 /// `vertical_agrees_with_volume_slot` is the pin that keeps the two the same
 /// fact. An override would be a second copy of a table that already exists.
-impl rustdar_source::volume::VolumeCapable for RadarSource {}
+impl rustdar_source::volume::VolumeCapable for RadarSource {
+    /// **Radar's resample, shaped where radar's vocabulary lives.**
+    ///
+    /// Two things the frontend cannot name meet here: the
+    /// [`VoxelRequest`](crate::voxel::VoxelRequest) that says what box to
+    /// sample, and the [`VoxelJob`](crate::jobs::VoxelJob) envelope the worker
+    /// row is keyed by. Before WO-M14b-2 both were built in the app, which had
+    /// to know that a radar volume is resampled at all.
+    ///
+    /// **The payload comes back opaque and is downcast here.** The app
+    /// extracted it by calling this crate's own extractor, so the concrete
+    /// type is `RenderInput` — but it travelled as `dyn Any`, and a payload
+    /// of another shape is a `None` rather than a panic. That is what makes
+    /// the handover generic: the frontend carries a source's data without a
+    /// name for it.
+    fn volume_job(
+        &self,
+        ctx: rustdar_source::volume::VolumeJobContext,
+    ) -> Option<rustdar_source::job::DescribedJob> {
+        let request = crate::voxel::request_for(&ctx)?;
+        let input = ctx
+            .payload
+            .downcast::<crate::render_input::RenderInput>()
+            .ok()?;
+        Some(rustdar_source::job::DescribedJob::new(
+            crate::jobs::VoxelJob { input, request },
+        ))
+    }
+}
 
 impl SourceHandler for RadarSource {
     fn id(&self) -> LayerId {

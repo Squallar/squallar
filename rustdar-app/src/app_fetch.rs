@@ -174,6 +174,31 @@ impl super::App {
         })
     }
 
+    /// **Ask `layer` to shape the job that builds `ctx`'s volume.**
+    ///
+    /// The frontend has paid for the payload and resolved the ground; what
+    /// comes back is the layer's own work order, in a type this side cannot
+    /// look inside. Nothing here matches on an id and nothing here names a
+    /// request, a moment or an envelope — a second 3D source arrives as an
+    /// `impl` and this function does not change.
+    ///
+    /// `None` on a layer this build does not have, one with no 3D half, or one
+    /// that cannot shape a job from what it was handed. **Lives beside
+    /// [`Self::volume_layer_refusal`]** for the reason stated there: the
+    /// registry-facing helpers are this file's, and `app.rs` is the file the
+    /// App-pokes-Gui ratchet is driving to zero.
+    pub(super) fn volume_job(
+        &self,
+        layer: &rustdar_source::id::LayerId,
+        ctx: rustdar_source::volume::VolumeJobContext,
+    ) -> Option<rustdar_source::job::DescribedJob> {
+        self.gui
+            .overlays
+            .handler_by_id(layer)?
+            .volume()?
+            .volume_job(ctx)
+    }
+
     /// Spawn a listing task a layer built, and land its answer on the one
     /// source arrival path as [`SourceEvent::Frames`].
     fn spawn_frame_list_task(&self, task: rustdar_overlays::render::overlay_state::FetchTask) {

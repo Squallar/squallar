@@ -27,8 +27,9 @@
 //! shape of the widening is decided by the first real mesh source, not
 //! guessed at by the first volume one.
 
-use rustdar_geo::GeoBounds;
+use rustdar_geo::{GeoBounds, GeoPoint};
 
+use crate::job::DescribedJob;
 use crate::product::FieldId;
 
 /// The palette index meaning "nothing was measured here", and simultaneously
@@ -65,6 +66,20 @@ pub struct VolumeDims {
 }
 
 impl VolumeDims {
+    /// A cell budget stated as a triple, read as `[nx, ny, nz]`.
+    ///
+    /// The one place that ordering is written down. A budget travels as a
+    /// bare `[u32; 3]` from the device profile that resolves it to the source
+    /// that spends it, and two copies of this cast are two chances to swap an
+    /// axis.
+    pub const fn of_cells(cells: [u32; 3]) -> Self {
+        Self {
+            nx: cells[0] as usize,
+            ny: cells[1] as usize,
+            nz: cells[2] as usize,
+        }
+    }
+
     /// Total cells — the length of [`VolumeGrid::indices`].
     pub const fn cells(self) -> usize {
         self.nx * self.ny * self.nz
@@ -278,11 +293,15 @@ pub struct VolumeParts {
 /// stack for the first one that says yes — so the 3D view has no idea which
 /// of its layers is radar, which is the whole point of the seam.
 ///
-/// **Minimal on purpose, and the remainder is named.** The job-shaping half —
-/// the request the builder is handed and the job envelope it comes back in —
-/// moves behind this trait at WO-M14b-2. Today the one member is the question
-/// the pane's walk asks and the dispatcher re-asks on the far side of the
-/// action channel: can this layer build a volume *of this field*.
+/// **Two members, and they are the two halves of the seam.** [`builds`] is the
+/// question the pane's walk asks and the dispatcher re-asks on the far side of
+/// the action channel: can this layer build a volume *of this field*.
+/// [`volume_job`] is the answer to "then shape the work" — the request the
+/// builder is handed and the envelope it travels in, both of which are the
+/// source's own vocabulary and neither of which the frontend can name.
+///
+/// [`builds`]: VolumeCapable::builds
+/// [`volume_job`]: VolumeCapable::volume_job
 pub trait VolumeCapable {
     /// Whether this layer can build a volume of `field`.
     ///
@@ -300,6 +319,60 @@ pub trait VolumeCapable {
     fn builds(&self, field: &crate::product::ProductSpec) -> bool {
         field.vertical
     }
+
+    /// **The job that resamples `ctx` into a [`VolumeGrid`]**, or `None` when
+    /// this layer cannot shape one from what it was handed.
+    ///
+    /// **Required, no default.** A defaulted `None` would let a layer answer
+    /// [`SourceHandler::volume`](crate::handler::SourceHandler::volume) with
+    /// `Some`, pass every gate the pane's walk and the dispatcher apply, and
+    /// then silently build nothing — a 3D pane waiting for ever on a layer
+    /// that said yes. Declaring the volume half and shaping its job are one
+    /// statement.
+    ///
+    /// **What `None` means here** is "this payload is not one I can resample":
+    /// a field this build has no row for, or a payload of another layer's
+    /// type. It is a refusal the caller shows, not a reason to retry.
+    fn volume_job(&self, ctx: VolumeJobContext) -> Option<DescribedJob>;
+}
+
+/// **Everything a layer needs to shape its own volume job, and nothing that
+/// says which layer it is.**
+///
+/// The frontend has already decided *what* to build and has already paid for
+/// the payload; this is the handover. Every member is either substrate
+/// vocabulary or a plain number, so the struct can be filled in by a frontend
+/// that cannot name one type in the job it is about to receive.
+pub struct VolumeJobContext {
+    /// **The payload the frontend extracted, opaque.**
+    ///
+    /// The frontend holds a source's own decoded volume — it built it by
+    /// calling that source's extractor — but it hands it back without
+    /// interpreting it, and the implementor downcasts to its own type.
+    /// A payload of the wrong type is a `None` from
+    /// [`VolumeCapable::volume_job`], never a panic.
+    ///
+    /// **`Send` because the job it becomes crosses a thread**: every
+    /// [`JobInput`](crate::job::JobInput) is `Send + Sync`, and an input that
+    /// could not cross could not be offloaded.
+    pub payload: Box<dyn std::any::Any + Send>,
+    /// Which field to resample. The same id the pane's walk matched against
+    /// this layer's own registered rows.
+    pub field: FieldId,
+    /// Where the box is centred — a picked region's centre, or the fallback
+    /// the frontend resolved when no region is picked.
+    pub centre: GeoPoint,
+    /// Half the box's east–west and north–south extent, km, or `None` to
+    /// leave the width to the builder, which is the only side of this seam
+    /// that holds the data the reach comes from.
+    pub half_extent_km: Option<(f64, f64)>,
+    /// The cell budget this device affords, as `[nx, ny, nz]`. **How to spend
+    /// it across the axes is the source's arithmetic, not the frontend's** —
+    /// hence the budget rather than a finished shape.
+    pub cells: [u32; 3],
+    /// The largest 3D texture axis this device will hold. The ceiling the
+    /// spend above may not cross.
+    pub max_axis: u32,
 }
 
 /// A resampled Cartesian volume, ready to become one 3D texture and one 1D

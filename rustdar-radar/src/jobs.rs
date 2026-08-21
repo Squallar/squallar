@@ -1003,4 +1003,89 @@ mod tests {
             );
         }
     }
+
+    // ── The envelope the layer itself shapes (WO-M14b-2) ────────────────
+
+    /// The context the frontend hands over for `input`, over the default box
+    /// about the site. Built with the substrate's own vocabulary and nothing
+    /// else — which is the whole point: the caller of `volume_job` cannot name
+    /// one type in what it gets back.
+    fn a_handover(input: RenderInput) -> rustdar_source::volume::VolumeJobContext {
+        rustdar_source::volume::VolumeJobContext {
+            payload: Box::new(input),
+            field: crate::fields::known::REFLECTIVITY,
+            centre: rustdar_geo::GeoPoint {
+                lat: 35.0,
+                lon: -97.0,
+            },
+            half_extent_km: None,
+            cells: [128, 128, 32],
+            max_axis: 2048,
+        }
+    }
+
+    /// **What a layer hands back IS the voxel row's own input**, request and
+    /// payload together.
+    ///
+    /// The dispatch side receives a `DescribedJob` and puts it in an envelope
+    /// without looking inside; the only thing that makes that safe is that the
+    /// row keyed by this input type is the row that will run it. So the pin is
+    /// the downcast the funnel itself performs, and then the round trip
+    /// through that row's codec — the same harness every other row is held to.
+    #[test]
+    fn the_job_a_radar_layer_shapes_is_the_voxel_row_it_will_be_run_by() {
+        use rustdar_source::volume::VolumeCapable;
+
+        let input = a_volume_input();
+        let described = crate::source::RadarSource::new()
+            .volume_job(a_handover(input.clone()))
+            .expect("radar shapes a job for a field it registers");
+        let job = described
+            .downcast_ref::<VoxelJob>()
+            .expect("the voxels row owns VoxelJob, and the funnel finds the row by this type");
+        assert_eq!(
+            job.request,
+            crate::voxel::request_for(&a_handover(a_volume_input()))
+                .expect("the same context shapes the same request"),
+            "the envelope carries the request the context names",
+        );
+        assert_eq!(
+            *job.input, input,
+            "the payload the frontend extracted is what travels, unaltered",
+        );
+        assert_round_trips_passing_geo_through(&JOB_CODECS[4], &described);
+    }
+
+    /// **A payload of another layer's shape is refused, never unwrapped.**
+    ///
+    /// The handover is `dyn Any` precisely so the frontend can carry a
+    /// source's data without a name for it — which means nothing upstream can
+    /// be trusted to have got the type right, and a wrong one has to be a
+    /// `None` rather than a panic in the middle of a frame.
+    #[test]
+    fn a_payload_of_another_shape_is_refused_rather_than_unwrapped() {
+        use rustdar_source::volume::VolumeCapable;
+
+        let mut ctx = a_handover(a_volume_input());
+        ctx.payload = Box::new(String::from("not a volume"));
+        assert!(crate::source::RadarSource::new().volume_job(ctx).is_none());
+        // Control: the identical call with the right payload does shape one,
+        // so the `None` above is about the payload and nothing else.
+        assert!(
+            crate::source::RadarSource::new()
+                .volume_job(a_handover(a_volume_input()))
+                .is_some(),
+        );
+    }
+
+    /// **A field this build has no product for shapes no job**, and it is
+    /// refused before the payload is even looked at.
+    #[test]
+    fn an_unregistered_field_shapes_no_job() {
+        use rustdar_source::volume::VolumeCapable;
+
+        let mut ctx = a_handover(a_volume_input());
+        ctx.field = rustdar_source::product::FieldId::from_static("NotAFieldThisBuildHas");
+        assert!(crate::source::RadarSource::new().volume_job(ctx).is_none());
+    }
 }

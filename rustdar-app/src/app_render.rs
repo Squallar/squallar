@@ -2770,7 +2770,19 @@ impl super::App {
                     // on marching whatever has already landed.
                     continue;
                 }
-                match self.prepare_volume(req.pane_idx, &req.target, Hold::Set) {
+                // **A remainder, named rather than papered over.** This whole
+                // pass is radar's loop — the view is a `rustdar_radar` enum,
+                // the anchor is a radar geometry and the frames are radar
+                // scans — so the layer to ask is not in doubt and is not
+                // derived from anything generic. The pane's own 3D walk is
+                // what will name it when the loop path itself goes
+                // source-agnostic; that is not WO-M14b-2's.
+                match self.prepare_volume(
+                    req.pane_idx,
+                    &req.target,
+                    Hold::Set,
+                    &rustdar_source::id::known::RADAR,
+                ) {
                     // A build was started, or a refusal was decided. Either
                     // way the store now answers for this target.
                     crate::app::VolumePrepare::Served => dispatched += 1,
