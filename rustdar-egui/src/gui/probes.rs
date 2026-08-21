@@ -30,6 +30,9 @@ pub(in crate::ui) struct FrameProbes {
     pub last_volume_arms: Vec<map::VolumeArmProbe>,
     /// The pane-count buttons the picker actually drew last frame.
     pub last_pane_options: Vec<PaneOptionProbe>,
+    /// The split-orientation buttons beside them, likewise. Empty when the
+    /// picker drew none.
+    pub last_split_options: Vec<SplitOptionProbe>,
     /// The excluded rects `render_panes` was actually handed.
     pub last_map_excluded_rects: Vec<egui::Rect>,
     /// The pane borders the last frame painted: pane index, the stroke's
@@ -78,6 +81,7 @@ impl Default for FrameProbes {
             last_pane_content: Vec::new(),
             last_volume_arms: Vec::new(),
             last_pane_options: Vec::new(),
+            last_split_options: Vec::new(),
             last_map_excluded_rects: Vec::new(),
             last_pane_borders: Vec::new(),
             last_section_tracks: Vec::new(),

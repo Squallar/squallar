@@ -2035,9 +2035,13 @@ fn a_click_on_a_cell_no_pane_occupies_leaves_the_active_pane_alone() {
     h.claim_pane_count(4);
     let panel = h.map_panel_rect();
 
-    let ghost = crate::pane::PaneLayout::for_count(4)
-        .pane_rect(3, panel)
-        .center();
+    let ghost = crate::pane::PaneLayout::for_count(
+        4,
+        crate::ui_layout::WidthClass::Expanded,
+        crate::pane::SplitOrientation::Auto,
+    )
+    .pane_rect(3, panel)
+    .center();
     assert!(
         h.pane_rects().iter().all(|r| !r.contains(ghost)),
         "precondition: the click lands outside every pane the frame drew"

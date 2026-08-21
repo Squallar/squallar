@@ -2375,6 +2375,24 @@ impl Default for PaneState {
     }
 }
 
+/// **How a multi-pane window splits when the count leaves a choice.**
+///
+/// The default is [`Auto`](Self::Auto), which asks the width class: two panes
+/// side by side is right on a desktop and two useless slivers on a phone. The
+/// other two are the user's override and they hold at every width — the
+/// default must not be a rule.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitOrientation {
+    /// Let the width class choose. See [`PaneLayout::for_count`].
+    #[default]
+    Auto,
+    /// One pane per row, stacked, whatever the width.
+    Rows,
+    /// One row, every pane a column, whatever the width.
+    Columns,
+}
+
 pub struct PaneLayout {
     /// Number of active panes (1-6 desktop, 1-4 mobile).
     pub pane_count: usize,
@@ -2385,10 +2403,28 @@ pub struct PaneLayout {
     row_ratios: Vec<f32>,
     /// Width ratios for columns in each row (each row's ratios sum to 1.0).
     col_ratios: Vec<Vec<f32>>,
+    /// The width class this grid was chosen at, so [`PaneLayout::reflow`] can
+    /// tell a real width change from a frame that merely re-asked.
+    width: crate::ui_layout::WidthClass,
+    /// The preference this grid was chosen under, likewise.
+    orientation: SplitOrientation,
 }
 
 const MIN_RATIO: f32 = 0.15;
+/// How far a persisted run of ratios may sit from summing to 1.0 and still be
+/// believed. Wide enough for an `f32` round-tripping through JSON's decimal
+/// text, narrow enough that a run which does not add up is refused.
+const RATIO_SUM_TOLERANCE: f32 = 1e-3;
 const DIVIDER_HALF_WIDTH: f32 = 4.0;
+
+/// Whether `ratios` is a believable run of `wanted` divider positions: the
+/// right arity, every entry finite and at least [`MIN_RATIO`], and the whole
+/// run summing to 1.0.
+fn ratios_valid(ratios: &[f32], wanted: usize) -> bool {
+    ratios.len() == wanted
+        && ratios.iter().all(|r| r.is_finite() && *r >= MIN_RATIO)
+        && (ratios.iter().sum::<f32>() - 1.0).abs() <= RATIO_SUM_TOLERANCE
+}
 
 /// Height/width ratio at which the color scale bars *take up* the horizontal
 /// (bottom-edge) orientation, having been vertical.
@@ -2431,27 +2467,29 @@ impl ColorScaleOrientation {
 
 impl Default for PaneLayout {
     fn default() -> Self {
-        Self::for_count(1)
+        Self::for_count(
+            1,
+            crate::ui_layout::WidthClass::Expanded,
+            SplitOrientation::Auto,
+        )
     }
 }
 
 impl PaneLayout {
     /// Create a layout for the given pane count, clamped to
-    /// `1..=`[`MAX_PANES_DESKTOP`].
-    pub fn for_count(count: usize) -> Self {
+    /// `1..=`[`MAX_PANES_DESKTOP`], for the room there is and the split the
+    /// user asked for.
+    ///
+    /// **The width is a runtime argument, never a `cfg`.** One binary resizes
+    /// from a phone-shaped window to a desktop one and back within a session,
+    /// and the grid has to follow; [`PaneLayout::reflow`] is what re-asks.
+    pub(crate) fn for_count(
+        count: usize,
+        width: crate::ui_layout::WidthClass,
+        orientation: SplitOrientation,
+    ) -> Self {
         let count = count.clamp(1, MAX_PANES_DESKTOP);
-        let grid = match count {
-            1 => vec![1],
-            2 => vec![2],
-            3 => vec![2, 1],
-            4 => vec![2, 2],
-            5 => vec![3, 2],
-            6 => vec![3, 3],
-            // Unreachable after the clamp above. Left as a total match rather
-            // than a panic: a layout is not worth crashing over, and the clamp
-            // is what makes this arm dead.
-            _ => vec![1],
-        };
+        let grid = Self::grid_for(count, width, orientation);
         let num_rows = grid.len();
         let row_ratios = vec![1.0 / num_rows as f32; num_rows];
         let col_ratios = grid
@@ -2463,7 +2501,116 @@ impl PaneLayout {
             grid,
             row_ratios,
             col_ratios,
+            width,
+            orientation,
         }
+    }
+
+    /// Which grid `count` already-clamped panes get.
+    fn grid_for(
+        count: usize,
+        width: crate::ui_layout::WidthClass,
+        orientation: SplitOrientation,
+    ) -> Vec<usize> {
+        match orientation {
+            SplitOrientation::Rows => return vec![1; count],
+            SplitOrientation::Columns => return vec![count],
+            SplitOrientation::Auto => {}
+        }
+
+        // **The compact table, and the only row that differs is 2.**
+        //
+        // `2 => [1, 1]`: two columns of a sub-600pt window are under 300pt
+        // wide against roughly 600pt of map height. A plan view is a circle,
+        // so what a pane can show is set by its *minor* axis — under 300pt
+        // side by side against about 300pt each when stacked, and the stacked
+        // pair spends its chrome (pill row, scale bars) on the axis it has to
+        // spare rather than the one that is binding.
+        //
+        // `3 => [2, 1]`, the same as the wide table, and this is the
+        // deliberate part. Three stacked strips give every pane a ~200pt minor
+        // axis and the ~40pt of pill row and bottom margin comes straight off
+        // it, leaving ~165pt of usable circle each. `[2, 1]` gives the top
+        // pair a ~195pt minor axis with the chrome falling on their ~310pt
+        // height instead, and hands the bottom pane the full ~310pt. Two of
+        // the three panes come out ahead and the third comes out far ahead.
+        // Nothing about three-across applies: `[2, 1]` is never three columns.
+        //
+        // `4 => [2, 2]`, unchanged: splitting both axes once is the best a
+        // squarish window can do for four circles at any width.
+        //
+        // 5 and 6 are unreachable on a compact width through the picker —
+        // `WidthClass::max_panes` offers `MAX_PANES_MOBILE` — but a config
+        // naming them still loads. They get the wide table rather than a
+        // compact arrangement nobody has argued for.
+        if width == crate::ui_layout::WidthClass::Compact && count == 2 {
+            return vec![1, 1];
+        }
+
+        match count {
+            1 => vec![1],
+            2 => vec![2],
+            3 => vec![2, 1],
+            4 => vec![2, 2],
+            5 => vec![3, 2],
+            6 => vec![3, 3],
+            // Unreachable after the clamp above. Left as a total match rather
+            // than a panic: a layout is not worth crashing over, and the clamp
+            // is what makes this arm dead.
+            _ => vec![1],
+        }
+    }
+
+    /// Re-ask the grid for the room there now is and the split now preferred,
+    /// and report whether the grid moved.
+    ///
+    /// A width change that leaves the grid alone keeps the dragged dividers:
+    /// the ratios are the user's, and only a different arity invalidates them.
+    pub(crate) fn reflow(
+        &mut self,
+        width: crate::ui_layout::WidthClass,
+        orientation: SplitOrientation,
+    ) -> bool {
+        if self.width == width && self.orientation == orientation {
+            return false;
+        }
+        let grid = Self::grid_for(self.pane_count, width, orientation);
+        if grid == self.grid {
+            self.width = width;
+            self.orientation = orientation;
+            return false;
+        }
+        *self = Self::for_count(self.pane_count, width, orientation);
+        true
+    }
+
+    /// The dragged divider positions, for persistence.
+    pub(crate) fn ratios(&self) -> (&[f32], &[Vec<f32>]) {
+        (&self.row_ratios, &self.col_ratios)
+    }
+
+    /// **Take divider positions from outside — a config file — or refuse
+    /// them.** Nothing here trusts the caller: the arity has to match the grid
+    /// this layout actually has, every ratio has to be at least [`MIN_RATIO`],
+    /// and every run has to sum to 1.0. A file failing any of it leaves the
+    /// [`Self::for_count`] defaults in place rather than producing a
+    /// zero-height pane.
+    ///
+    /// Returns whether the ratios were adopted.
+    pub(crate) fn adopt_ratios(&mut self, rows: &[f32], cols: &[Vec<f32>]) -> bool {
+        if !ratios_valid(rows, self.grid.len()) || cols.len() != self.grid.len() {
+            return false;
+        }
+        if !cols
+            .iter()
+            .zip(self.grid.iter())
+            .all(|(run, &wanted)| ratios_valid(run, wanted))
+        {
+            return false;
+        }
+        self.row_ratios = rows.to_vec();
+        self.col_ratios = cols.to_vec();
+        true
     }
 
     pub fn grid(&self) -> &[usize] {
@@ -2579,6 +2726,10 @@ fn drag_divider(
         ui.ctx().set_cursor_icon(cursor);
     }
 }
+
+/// Which grid a pane count gets, and what a config file may say about it.
+#[cfg(test)]
+mod split_tests;
 
 #[cfg(test)]
 mod render_params_tests;

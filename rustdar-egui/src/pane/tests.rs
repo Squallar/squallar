@@ -122,7 +122,11 @@ fn color_scale_orientation_ignores_a_degenerate_panel() {
 fn a_pane_count_past_the_grid_table_is_clamped_rather_than_flattened() {
     let screen = panel(1600.0, 900.0);
     for count in [MAX_PANES_DESKTOP + 1, 12, usize::MAX] {
-        let layout = PaneLayout::for_count(count);
+        let layout = PaneLayout::for_count(
+            count,
+            crate::ui_layout::WidthClass::Expanded,
+            SplitOrientation::Auto,
+        );
         assert_eq!(
             layout.pane_count, MAX_PANES_DESKTOP,
             "{count} panes must land on the largest layout that has a grid"
@@ -146,10 +150,22 @@ fn a_pane_count_past_the_grid_table_is_clamped_rather_than_flattened() {
         }
     }
 
-    assert_eq!(PaneLayout::for_count(0).pane_count, 1);
+    assert_eq!(
+        PaneLayout::for_count(
+            0,
+            crate::ui_layout::WidthClass::Expanded,
+            SplitOrientation::Auto
+        )
+        .pane_count,
+        1
+    );
 
     for count in 1..=MAX_PANES_DESKTOP {
-        let layout = PaneLayout::for_count(count);
+        let layout = PaneLayout::for_count(
+            count,
+            crate::ui_layout::WidthClass::Expanded,
+            SplitOrientation::Auto,
+        );
         assert_eq!(
             layout.grid().iter().sum::<usize>(),
             count,

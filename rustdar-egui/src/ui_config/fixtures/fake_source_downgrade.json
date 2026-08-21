@@ -1,5 +1,10 @@
 {
   "active_pane": 0,
+  "col_ratios": [
+    [
+      1.0
+    ]
+  ],
   "config_version": 5,
   "heading_source": "Auto",
   "loop_lookback_secs": 3600,
@@ -156,10 +161,14 @@
     "timezone": "Local"
   },
   "presets": [],
+  "row_ratios": [
+    1.0
+  ],
   "serial_config": {
     "baud_rate": 0,
     "port_path": null
   },
+  "split_orientation": "auto",
   "srv_fallback": "MeanWind",
   "storm_motion_override": {
     "direction_deg": 240.0,

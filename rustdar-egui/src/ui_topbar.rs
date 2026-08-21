@@ -26,6 +26,32 @@ const PANE_LABEL: &str = "Pane:";
 const PANES_TIGHT_LABEL: &str = "Panes";
 const PANE_TIGHT_LABEL: &str = "Pane";
 
+/// **The split-orientation segments, as text rather than pictograms.** The
+/// obvious glyphs for this — ▤ U+25A4 and ▥ U+25A5 — are in neither family
+/// egui bundles (checked against `Fonts::has_glyph`, which is what
+/// `ui_glyphs`' coverage test walks), and a tofu box is worse than a word.
+/// Roomy and tight spellings, the same pairing the captions above use.
+const SPLIT_LABELS: [(crate::pane::SplitOrientation, &str, &str, &str); 3] = [
+    (
+        crate::pane::SplitOrientation::Auto,
+        "Auto",
+        "A",
+        "Split the panes to suit the window's width",
+    ),
+    (
+        crate::pane::SplitOrientation::Rows,
+        "Rows",
+        "R",
+        "Stack the panes in rows, at every width",
+    ),
+    (
+        crate::pane::SplitOrientation::Columns,
+        "Cols",
+        "C",
+        "Sit the panes side by side, at every width",
+    ),
+];
+
 /// Item spacing in the roomy form — and the unit [`roomy_run_width`] charges per
 /// element, so the measure and the layout cannot drift apart.
 const ROOMY_ITEM_SPACING: f32 = 8.0;
@@ -360,6 +386,29 @@ impl super::Gui {
             }
         }
 
+        // **Only with a split to orient.** One pane has no divider, so the
+        // three buttons would be an option the window cannot express.
+        if self.pane_layout.pane_count > 1 {
+            for (orientation, roomy_label, tight_label, hover) in SPLIT_LABELS {
+                let selected = self.split_orientation == orientation;
+                let label = if roomy { roomy_label } else { tight_label };
+                let button = ui
+                    .add(egui::Button::selectable(selected, label))
+                    .on_hover_text(hover);
+                #[cfg(test)]
+                self.probes
+                    .last_split_options
+                    .push(super::SplitOptionProbe {
+                        orientation,
+                        selected,
+                        rect: button.rect,
+                    });
+                if button.clicked() && !selected {
+                    self.set_split_orientation(orientation);
+                }
+            }
+        }
+
         if self.pane_layout.pane_count > 1 {
             if roomy {
                 ui.label(PANE_LABEL);
@@ -406,6 +455,9 @@ fn roomy_run_width(ui: &egui::Ui, pane_count: usize) -> f32 {
         widths.push(text(&button_font, &format!("{count}")) + button_pad);
     }
     if pane_count > 1 {
+        for (_, roomy_label, _, _) in SPLIT_LABELS {
+            widths.push(text(&button_font, roomy_label) + button_pad);
+        }
         widths.push(text(&body, PANE_LABEL));
         for i in 0..pane_count {
             widths.push(text(&button_font, &format!("{}", i + 1)) + button_pad);
