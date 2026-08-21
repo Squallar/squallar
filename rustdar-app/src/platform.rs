@@ -154,8 +154,32 @@ pub trait PlatformBridge {
     fn query_insets(&self) -> Option<(f32, f32, f32, f32)>;
 
     /// Handle the back button press. Returns `true` if the platform consumed
-    /// the event (e.g. Android moveTaskToBack), `false` if the app should exit.
+    /// the event (e.g. Android moveTaskToBack), `false` if it did not — see
+    /// [`exits_on_unhandled_back`](Self::exits_on_unhandled_back) for what
+    /// happens then.
     fn handle_back(&self) -> bool;
+
+    /// Whether a back press with nothing open, that the platform did not take,
+    /// should quit the app.
+    ///
+    /// `false` here, and no bridge that ships answers otherwise: with nothing
+    /// open, Escape and the browser's Back are **inert**. They used to quit,
+    /// with no confirmation, from a key that sits one row above the one that
+    /// leaves a text field — and quitting is still reachable from the menu and
+    /// the window's close button, which are the two routes a user takes on
+    /// purpose. Android is unaffected either way: its bridge takes the press in
+    /// [`handle_back`](Self::handle_back) and minimises.
+    ///
+    /// It lives on the trait rather than behind a `cfg` because it is a
+    /// property of the platform, and a `cfg(target_arch)` may select a value, a
+    /// dependency or a type alias but never fork behaviour inside a function
+    /// body. A platform whose only way out is the back button says so here and
+    /// the resolver keeps one shape. Nothing in this tree is such a platform
+    /// today, so what exercises the `true` arm is the test double — that is the
+    /// hook staying honest, not evidence that some platform quits.
+    fn exits_on_unhandled_back(&self) -> bool {
+        false
+    }
 
     /// Take a back press the platform delivered outside the window's input queue.
     ///
