@@ -8761,6 +8761,47 @@ fn the_data_and_live_rows_share_state_with_the_menu_toggles() {
     );
 }
 
+/// **The Lookback and Speed sliders say they reach every pane** — the one
+/// thing about them that was never on screen.
+///
+/// `set_loop_span_secs` and `set_loop_speed_fps` write every pane, unlinked
+/// ones included, while the transport two rows down honours the links. The
+/// asymmetry is deliberate (one window, one number) and unchanged here; the
+/// pin is that the sliders now say so, and that a pane with its time link off
+/// still takes the number.
+#[test]
+fn the_loop_tuning_sliders_say_they_apply_to_every_pane() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.mouse_click(h.timeline().expander.center());
+    h.warm_up();
+
+    let row2 = h.timeline().row2.expect("the expander must open row 2");
+    assert!(
+        row2.tuning_scope.contains("every pane"),
+        "the sliders must name their reach; drew {:?}",
+        row2.tuning_scope
+    );
+    assert!(
+        h.text_painted_in(h.screen_rect(), &row2.tuning_scope),
+        "the caption is a probe string that never reached the glass"
+    );
+    let caption_below_sliders = row2.lookback.bottom() <= row2.speed.bottom() + 1.0;
+    assert!(
+        caption_below_sliders,
+        "the two sliders share a row, so one caption serves both"
+    );
+
+    // And the claim is true: an unlinked pane takes the number anyway.
+    h.set_pane_count(2);
+    h.gui_mut().pane_mut(1).expect("pane 1 exists").time_link = false;
+    h.gui_mut().set_loop_span_secs(900);
+    assert_eq!(
+        h.gui_mut().pane(1).expect("pane 1 exists").time.span_secs,
+        900,
+        "the caption would be a lie: the unlinked pane did not take the span"
+    );
+}
+
 /// **Row 2's closing caption states this platform's frame budget and the unlink
 /// hint** (§5.9 carried into M4) — the number is the frontend's push
 /// (`set_loop_frame_budget`), never a guess from the width.
