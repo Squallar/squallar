@@ -2320,7 +2320,8 @@ fn the_loop_caches_evictions_are_handed_over_and_the_sweep_is_called() {
             .count(),
         3,
         "one of the loop's three holders frees its evictions where it evicted \
-         them — on the frame thread, 47–69 MiB apiece for a volume, a decoded \
+         them — on the frame thread, ~47 MiB median and 58.3 MiB worst case for a \
+         volume (measured, `volume_inventory`), a decoded \
          message plus its own bytes for an object, a day's bucket keys for a \
          listing: {body}"
     );
