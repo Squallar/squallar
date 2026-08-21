@@ -79,8 +79,12 @@ enum BackPress {
     Dismissed,
     /// Nothing was open and the platform took the press — Android minimises.
     PlatformHandled,
-    /// Nothing was open and nothing took it: leave.
+    /// Nothing was open, nothing took it, and this platform says an unhandled
+    /// back leaves — see [`PlatformBridge::exits_on_unhandled_back`].
     Exit,
+    /// Nothing was open, nothing took it, and this platform does not quit on a
+    /// back press: the press does nothing at all. Desktop and web.
+    Ignored,
 }
 
 pub struct App {
@@ -1956,12 +1960,16 @@ impl App {
     fn back_out(&mut self, event_loop: &ActiveEventLoop) {
         match Self::resolve_back_press(&mut self.gui, self.platform.as_ref()) {
             BackPress::Dismissed => notify_redraw(&self.window),
-            BackPress::PlatformHandled => {}
+            BackPress::PlatformHandled | BackPress::Ignored => {}
             BackPress::Exit => self.request_exit(Some(event_loop)),
         }
     }
 
     /// Resolve one press of Escape or back.
+    ///
+    /// The last line is the platform's to answer, not this function's: with
+    /// nothing open and nothing taking the press, quitting is a platform
+    /// property, asked through the bridge rather than forked on a `cfg` here.
     fn resolve_back_press(gui: &mut Gui, platform: &dyn PlatformBridge) -> BackPress {
         if gui.dismiss_top_layer() {
             return BackPress::Dismissed;
@@ -1969,7 +1977,10 @@ impl App {
         if platform.handle_back() {
             return BackPress::PlatformHandled;
         }
-        BackPress::Exit
+        if platform.exits_on_unhandled_back() {
+            return BackPress::Exit;
+        }
+        BackPress::Ignored
     }
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop) {

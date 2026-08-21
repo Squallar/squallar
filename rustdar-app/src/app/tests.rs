@@ -722,21 +722,65 @@ fn no_bridge_invents_a_back_press() {
 }
 
 /// The same press on a platform with no back handler: Escape on the desktop and the
-/// browser's back.
+/// browser's back. It closes what is open and then does **nothing** — it used to quit the
+/// app outright, unconfirmed, from a key pressed to leave a text field.
 #[test]
-fn escape_with_nothing_open_still_exits() {
+fn escape_with_nothing_open_does_not_quit() {
+    for (name, platform) in [
+        ("desktop", TestBridge::desktop()),
+        // The browser's Back and GoBack arrive as the same press (`input.rs`), and its
+        // bridge takes neither, so the web build reaches this line too.
+        ("web", TestBridge::web()),
+    ] {
+        let mut gui = Gui::new();
+        gui.open_settings();
+
+        assert_eq!(
+            App::resolve_back_press(&mut gui, &platform),
+            BackPress::Dismissed,
+            "{name}: escape must close the window rather than quit, same as back"
+        );
+        assert_eq!(
+            App::resolve_back_press(&mut gui, &platform),
+            BackPress::Ignored,
+            "{name}: a second press, with nothing left open, quit the app"
+        );
+        assert_eq!(
+            App::resolve_back_press(&mut gui, &platform),
+            BackPress::Ignored,
+            "{name}: and it stays inert — the first inert press did not arm anything"
+        );
+    }
+}
+
+/// The exit route is not deleted, only unclaimed: a platform that says an unhandled back
+/// leaves still gets `Exit`, and it says so through the bridge, not a `cfg` in the
+/// resolver. Nothing that ships answers `true` — see the trait — so this is what keeps the
+/// arm reachable.
+#[test]
+fn a_platform_that_asks_to_quit_on_back_still_does() {
     let mut gui = Gui::new();
-    let platform = TestBridge::desktop();
+    let platform = TestBridge::desktop().that_quits_on_unhandled_back();
     gui.open_settings();
 
     assert_eq!(
         App::resolve_back_press(&mut gui, &platform),
         BackPress::Dismissed,
-        "escape must close the window rather than quit, same as back"
+        "the opt-in must not skip the dismissal it is behind",
     );
     assert_eq!(
         App::resolve_back_press(&mut gui, &platform),
-        BackPress::Exit
+        BackPress::Exit,
+    );
+
+    // And the platform that takes the press wins over the opt-in: Android minimises even
+    // where both are set, because the press never reaches the last line.
+    let mut gui = Gui::new();
+    let minimising = minimising_bridge().that_quits_on_unhandled_back();
+    assert_eq!(
+        App::resolve_back_press(&mut gui, &minimising),
+        BackPress::PlatformHandled,
+        "the platform consumed the press and the app quit anyway",
     );
 }
 
@@ -2573,8 +2617,8 @@ fn the_injected_callbacks_reach_the_bridge() {
     BACK_PRESS_REACHED_THE_HANDLER.store(false, Ordering::Relaxed);
     assert_eq!(
         App::resolve_back_press(&mut app.gui, app.platform.as_ref()),
-        BackPress::Exit,
-        "precondition: with no handler installed, back quits",
+        BackPress::Ignored,
+        "precondition: with no handler installed, back reaches nothing",
     );
 
     app.set_back_handler(record_back_press);

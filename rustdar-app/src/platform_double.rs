@@ -100,6 +100,9 @@ pub(crate) struct TestBridge {
     store: Rc<MemoryKvStore>,
     /// Installed by `set_back_handler`.
     back_handler: Option<fn()>,
+    /// What `exits_on_unhandled_back` answers. `false` on every bridge that
+    /// ships — see the trait — so the `true` arm has no other way to be reached.
+    exits_on_unhandled_back: bool,
     /// Injected, as Android injects it.
     back_press_taker: Option<fn() -> bool>,
     /// Injected, as Android injects it: the read is a JNI call.
@@ -137,6 +140,7 @@ impl TestBridge {
             zone_cache_dir: None,
             store: Rc::new(MemoryKvStore::default()),
             back_handler: None,
+            exits_on_unhandled_back: false,
             back_press_taker: None,
             insets_querier: None,
             theme_detector: None,
@@ -187,12 +191,23 @@ impl TestBridge {
 
     /// `WebPlatform`: `localStorage` from the first frame with no directory involved,
     /// no filesystem for the zone cache, no back handler.
-    #[allow(dead_code)]
     pub(crate) fn web() -> Self {
         Self {
             store_availability: StoreAvailability::Always,
             ..Self::bare()
         }
+    }
+
+    /// A platform that quits when a back press finds nothing to close.
+    ///
+    /// No shipped bridge is one, deliberately (see
+    /// [`PlatformBridge::exits_on_unhandled_back`]). This exists so the arm that
+    /// serves one is reachable at all: without it the `Exit` resolution has no
+    /// caller and the dispatch that quits is unexercised, which is a worse state
+    /// than an opt-in nobody has taken.
+    pub(crate) fn that_quits_on_unhandled_back(mut self) -> Self {
+        self.exits_on_unhandled_back = true;
+        self
     }
 
     /// Every predictive-back claim the app has pushed, in order. Taken before the
@@ -298,6 +313,10 @@ impl PlatformBridge for TestBridge {
         } else {
             false
         }
+    }
+
+    fn exits_on_unhandled_back(&self) -> bool {
+        self.exits_on_unhandled_back
     }
 
     fn poll_back_press(&mut self) -> bool {
