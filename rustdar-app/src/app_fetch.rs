@@ -1118,8 +1118,17 @@ impl super::App {
                     ),
                 );
             }
-            // Everything else: the five non-texture layers, and any id no handler is
-            // registered for.
+            // **Everything else — and it is NOT "the five non-texture layers".**
+            // Four of those five never reach this match at all: `Metar`
+            // (PerFramePoint), `CityLabels` (Tile), `UserLocation` and
+            // `ColorScale` (PerFrameDirect) are refused by the `render_mode`
+            // guard at the top of this function, which is also the
+            // unregistered-id exit. What lands here is a layer that DOES
+            // declare `RenderMode::Texture` and is not one of the seven above:
+            // `Radar`, whose raster is its own pipeline's and never this
+            // dispatch's — which is exactly why WO-M13a had to refuse radar by
+            // name at the arrival gate — plus the fake source when its feature
+            // is on.
             _ => {
                 log::warn!(
                     "spawn_overlay_render reached the dispatch with a layer it \

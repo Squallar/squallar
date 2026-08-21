@@ -1929,7 +1929,10 @@ fn overlay_reply_via_wire(
 }
 
 /// **The parity gate for the alert render**, the sites gate's shape on the
-/// kind whose inline rasterization was the measured 224 ms gesture-end stall.
+/// kind whose inline rasterization was a 224 ms gesture-end stall against a
+/// 289.5 ms p50 gesture frame — measured in-browser on `main@ebe0ad3b`
+/// (2026-08-12 web-baseline campaign), before this module's slices moved that
+/// raster off the wasm frame thread.
 #[test]
 fn the_alerts_render_is_byte_identical_direct_and_via_the_wire() {
     let JobRequest { geometry, job } = an_overlay_alerts_job();

@@ -325,6 +325,22 @@ impl OverlayTextureCache {
 
 /// Whether a zoom that has drifted [`ZOOM_REBUILD_BAND`] from the texture's own
 /// may be re-rasterized while the gesture is still moving.
+///
+/// **On wasm this is a policy hold, not a physical necessity.** The reason
+/// originally written here — that the raster would run inline on the frame
+/// thread — has been false since the overlay-worker slices landed 2026-08-14;
+/// see `rustdar_worker::offload`'s own module doc, where the only inline
+/// execution left on wasm is the fallback for a thread that has no sink.
+/// A dispatched overlay raster goes to the worker.
+///
+/// **The re-enable is measured-affordable, and flipping it is not this
+/// function's decision to record.** Measured 2026-08-18 on the A9 one-way
+/// settle: worker raster 23.2 ms off-thread, delivery 5.3 ms between frames,
+/// banding <= 5.2 ms/frame, cadence unbroken. But re-enabling mid-gesture
+/// rebuilds is the A9 compositor verdict's own stated re-open trigger, so the
+/// flip needs its own order and its own A9 re-run. Until one is done, the
+/// `false` stands as a deliberate hold on gesture-time work, and the settle
+/// arm is what bounds the resulting softness in time.
 fn mid_gesture_rerender_allowed() -> bool {
     !cfg!(target_arch = "wasm32")
 }

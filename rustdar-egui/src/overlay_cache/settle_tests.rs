@@ -202,14 +202,15 @@ fn the_mid_gesture_band_is_platform_policy_and_the_settle_is_not() {
     );
 
     // wasm arm: the same crossing, mid-gesture, dispatches nothing — the
-    // raster would run inline on the frame thread.
+    // policy hold on gesture-time raster work (see
+    // `mid_gesture_rerender_allowed`).
     let mut wasm = satisfied_cache(&ctx);
     assert!(
         !wasm
             .needs_rerender_with_policy(TOKEN, past_band, T0 + 0.008, &viewport(), &plan(), false,),
         "with the mid-gesture band disallowed, a band crossing still \
-         dispatched mid-gesture: an inline raster on the frame thread in the \
-         middle of the user's zoom",
+         dispatched mid-gesture: a full-size raster asked for in the middle \
+         of the user's zoom, on the arm that holds that work back",
     );
 
     // ...and the settle recovers it: the same cache, still past the band,
@@ -231,6 +232,8 @@ fn the_mid_gesture_band_is_platform_policy_and_the_settle_is_not() {
 /// The host build allows the mid-gesture band. The wasm side of this `cfg!` is
 /// deliberately not claimed by any test: it is covered by the
 /// `wasm32-unknown-unknown` type-check gate and by review of the one-line body.
+/// What that arm *is* — a policy hold rather than a physical necessity — is on
+/// `mid_gesture_rerender_allowed` itself.
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn the_host_arm_of_the_band_policy_allows_mid_gesture_rerenders() {
@@ -254,10 +257,10 @@ fn the_band_policy_keys_on_the_wasm_target() {
     let body = &body[..body.find('}').expect("the function body ends")];
     assert!(
         body.contains(r#"!cfg!(target_arch = "wasm32")"#),
-        "the mid-gesture band policy no longer keys on the wasm target: on \
-         wasm the overlay raster runs inline on the frame thread, so a \
-         mid-gesture re-render trades interaction latency for resolution \
-         there, and the host tests cannot catch this regression",
+        "the mid-gesture band policy no longer keys on the wasm target. That \
+         arm is a deliberate hold on gesture-time raster work, not a \
+         consequence of where the raster runs, and the host tests cannot \
+         catch its loss",
     );
 }
 
