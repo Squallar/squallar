@@ -31,6 +31,7 @@ fn the_bucket_decides_which_radars_exist_and_the_nws_decides_where() {
                 lat_udeg: 35_333_340,
                 lon_udeg: -97_277_500,
                 elevation_m: 370,
+                network: Some(RadarNetwork::Wsr88d),
             }),
         ),
         (
@@ -135,6 +136,7 @@ fn a_station_is_placed_only_when_the_record_is_complete_and_in_metres() {
             lat_udeg: 41_320_280,
             lon_udeg: -96_366_830,
             elevation_m: 350,
+            network: Some(RadarNetwork::Wsr88d),
         }),
         "GeoJSON coordinates are [lon, lat]; a swap puts Omaha in the \
          Indian Ocean",
@@ -204,6 +206,77 @@ fn a_cache_written_under_the_old_field_name_still_loads() {
     assert!(
         back.contains("TPBI"),
         "and the rest of the blob survives with it",
+    );
+}
+
+/// A cache written before the network field existed still loads, and loads
+/// with the network unknown rather than guessed.
+#[test]
+fn a_cache_written_before_the_network_was_learned_loads_without_one() {
+    let old =
+        r#"{"KTLX":{"lat_udeg":35333340,"lon_udeg":-97277500,"elevation_m":370},"TPBI":null}"#;
+    let back: SiteCatalogue = serde_json::from_str(old).expect("an old cache still parses");
+
+    assert_eq!(
+        back.position("KTLX").map(|p| p.elevation_m),
+        Some(370),
+        "the position is what a cache is for and it survives untouched",
+    );
+    assert_eq!(
+        back.network("KTLX"),
+        None,
+        "a cache that never carried a network must not invent one",
+    );
+    assert!(
+        back.contains("TPBI"),
+        "and the rest of the blob survives with it",
+    );
+
+    // The control: the same blob WITH the field parses it, so the `None` above
+    // is the cache's silence and not a field this type cannot read at all.
+    let new =
+        r#"{"KTLX":{"lat_udeg":35333340,"lon_udeg":-97277500,"elevation_m":370,"network":"Tdwr"}}"#;
+    let back: SiteCatalogue = serde_json::from_str(new).expect("a new cache parses");
+    assert_eq!(back.network("KTLX"), Some(RadarNetwork::Tdwr));
+}
+
+/// **The API is the authority on which network a radar is on; the prefix rule
+/// is the offline approximation of it.** Where the station record states a type
+/// this build recognises, the two must agree.
+#[test]
+fn the_prefix_rule_agrees_with_the_api_on_every_placed_station() {
+    let placed = positions();
+
+    let mut checked = 0;
+    let mut seen: Vec<RadarNetwork> = Vec::new();
+    for (id, position) in &placed {
+        let Some(stated) = position.network else {
+            continue;
+        };
+        checked += 1;
+        if !seen.contains(&stated) {
+            seen.push(stated);
+        }
+        assert_eq!(
+            RadarNetwork::of_id(id),
+            stated,
+            "the station record says {id} is {stated:?} and the identifier rule \
+             disagrees -- update of_id's exception list, then re-record the \
+             fixture: the API is the authority on network, the prefix rule is \
+             the offline approximation",
+        );
+    }
+
+    // Non-triviality: a fixture that stated one network, or none, would make
+    // the walk above pass without comparing anything. Nine is the fixture's
+    // whole placed population -- three of its twelve stations are the
+    // incomplete records `a_station_is_placed_only_when_the_record_is_complete_and_in_metres`
+    // exists for, and an unplaced station has no row to carry a network.
+    assert_eq!(checked, 9, "the fixture's placed population moved");
+    assert_eq!(
+        seen.len(),
+        2,
+        "the fixture must state both networks or the walk cannot fail: {seen:?}",
     );
 }
 

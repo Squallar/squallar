@@ -8,6 +8,7 @@ fn placed(lat_udeg: i32) -> CataloguePosition {
         lat_udeg,
         lon_udeg: -97_000_000,
         elevation_m: 400,
+        network: None,
     }
 }
 
