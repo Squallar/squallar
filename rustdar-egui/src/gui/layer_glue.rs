@@ -517,6 +517,49 @@ impl Gui {
     /// the shell drains, so success and failure reach the layer here rather
     /// than through `apply_fetch_result` — the arrival carries a decoded
     /// volume, not this layer's own payload.
+    /// The error banner this layer is owed, or `None` if it has none or the
+    /// user has already dismissed this very failure.
+    ///
+    /// The message comes off the layer's own retry ledger, which is where
+    /// `record_fetch_failure` put it — there is no second copy anywhere. What
+    /// the shell holds instead is which *occurrence* was dismissed, keyed on
+    /// [`FetchRetry::last_failure`], so an identical message failing again
+    /// brings the banner back rather than staying hidden.
+    ///
+    /// Generic in `id`, and deliberately: only the radar layer draws a banner
+    /// today, because only radar has one, but nothing here knows that. Widening
+    /// the surface to every unhealthy layer is a product decision and one call
+    /// site, not a rewrite.
+    pub(super) fn layer_error(&self, id: &LayerId) -> Option<String> {
+        let retry = self.overlays.handler_by_id(id)?.retry()?;
+        let message = match retry.health() {
+            rustdar_overlays::fetch_policy::FetchHealth::Failing { message, .. }
+            | rustdar_overlays::fetch_policy::FetchHealth::Broken { message } => message.clone(),
+            // Neither is a failure the user is asked to acknowledge.
+            rustdar_overlays::fetch_policy::FetchHealth::Ok
+            | rustdar_overlays::fetch_policy::FetchHealth::Absent => return None,
+        };
+        // A failing ledger always carries an instant; `None` here would mean
+        // the two disagreed, and an unacknowledgeable banner is worse than no
+        // banner, so say nothing rather than draw something undismissable.
+        let landed = retry.last_failure()?;
+        (self.dismissed_errors.get(id) != Some(&landed)).then_some(message)
+    }
+
+    /// Remember that the failure this layer is reporting *right now* was
+    /// dismissed. A later, different failure has a later instant and is not
+    /// covered by this.
+    pub(super) fn dismiss_layer_error(&mut self, id: &LayerId) {
+        let landed = self
+            .overlays
+            .handler_by_id(id)
+            .and_then(|h| h.retry())
+            .and_then(|r| r.last_failure());
+        if let Some(landed) = landed {
+            self.dismissed_errors.insert(id.clone(), landed);
+        }
+    }
+
     pub(super) fn end_radar_round(&mut self, outcome: RoundOutcome<'_>) {
         let id = crate::radar_layer::POLL_LAYER;
         // Both doors end the round themselves, which is why neither arm

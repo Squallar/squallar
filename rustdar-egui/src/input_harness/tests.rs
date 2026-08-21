@@ -5342,6 +5342,36 @@ fn crossing_a_breakpoint_re_keys_nothing() {
     );
 }
 
+/// 34b-bis. **A delivered round takes the error banner down with it.**
+///
+/// The banner reads the layer's own retry ledger now rather than a copy of the
+/// message the shell kept until someone dismissed it, so it says "this layer is
+/// failing" rather than "this layer failed once". A successful round resets the
+/// ledger and the banner goes with it.
+///
+/// That is a behaviour change and this is where it is written down: the error
+/// used to outlive the condition and sit over freshly delivered radar until the
+/// user clicked the cross.
+#[test]
+fn a_delivered_round_takes_the_error_banner_down_with_it() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.gui_mut()
+        .apply(crate::shell_api::GuiEvent::Error("boom".to_owned()));
+    h.warm_up();
+    assert!(
+        h.painted_text_strings().iter().any(|t| t == "boom"),
+        "precondition: the error must be on screen before the scan, or this \
+         test cannot see it leave"
+    );
+
+    h.load_scan("KTLX");
+    assert!(
+        !h.painted_text_strings().iter().any(|t| t == "boom"),
+        "a scan arrived and the failure banner stayed up. It is a view of the \
+         layer's health, and the layer is not failing any more"
+    );
+}
+
 /// 34c. **An error on screen keeps its id while the row moves around it.**
 #[test]
 fn an_error_on_screen_keeps_its_id_while_the_row_changes_around_it() {
@@ -5363,15 +5393,23 @@ fn an_error_on_screen_keeps_its_id_while_the_row_changes_around_it() {
     );
 
     h.clear_id_changes();
-    h.load_scan("KTLX");
+    // The fetch ends without a delivery. It used to be `load_scan`, which is a
+    // *successful* round -- and since the banner became a view of the layer's
+    // own health rather than a second copy of the message, a success clears it,
+    // so the error would not have been on screen to keep an id. What this test
+    // is about is unchanged: something to the left of the error changes width,
+    // and the error's slot must not be re-keyed by it.
+    h.gui_mut()
+        .apply(crate::shell_api::GuiEvent::Fetching(false));
+    h.warm_up();
     assert!(
         h.status_bar().poll_chip.is_some(),
-        "precondition: the scan must have cleared the fetch, or nothing to \
-             the left of the error changed"
+        "precondition: the fetch must have ended, or nothing to the left of \
+             the error changed"
     );
     assert!(
         h.painted_text_strings().iter().any(|t| t == "boom"),
-        "precondition: the error must still be on screen after the scan"
+        "precondition: the error must still be on screen after the fetch ended"
     );
     assert_eq!(
         h.id_changes(),

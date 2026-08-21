@@ -327,6 +327,18 @@ impl FetchRetry {
         &self.health
     }
 
+    /// When the failure now on [`health`](Self::health) landed.
+    ///
+    /// This is the *occurrence* identity, and it is the reason a dismissible
+    /// error banner does not need a dismissed state on [`FetchHealth`]: a
+    /// dismissal keyed on this instant hides the failure the user dismissed
+    /// and not the next one, even when the next one carries a byte-identical
+    /// message. `None` for [`FetchHealth::Ok`] and [`FetchHealth::Absent`],
+    /// neither of which is a failure a user is asked to acknowledge.
+    pub fn last_failure(&self) -> Option<web_time::Instant> {
+        self.last_failure
+    }
+
     /// How much of the last answer that arrived is on the map.
     pub fn coverage(&self) -> &DataCompleteness {
         &self.coverage

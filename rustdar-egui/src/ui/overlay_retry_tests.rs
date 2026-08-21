@@ -458,3 +458,77 @@ fn the_wake_and_the_poll_agree_on_a_failing_layer() {
         gui.overlays.rewind_retry(&KIND, Duration::from_secs(secs));
     }
 }
+
+/// A dismissal covers the failure it was clicked on, and not the next one.
+///
+/// This is what keying on [`FetchRetry::last_failure`] buys, and the reason the
+/// shell does not need a dismissed state on `FetchHealth` or a second copy of
+/// the message: two failures can carry byte-identical words, and the user
+/// dismissing the first must not silence the second.
+#[test]
+fn a_dismissal_covers_one_failure_and_not_the_next() {
+    const RADAR: rustdar_source::id::LayerId = crate::radar_layer::POLL_LAYER;
+    let mut gui = Gui::new();
+
+    gui.apply(crate::shell_api::GuiEvent::Error("boom".to_owned()));
+    assert_eq!(
+        gui.layer_error(&RADAR).as_deref(),
+        Some("boom"),
+        "precondition: a failed round must put its message on the layer's ledger, \
+         or there is no banner for a dismissal to cover"
+    );
+
+    gui.dismiss_layer_error(&RADAR);
+    assert_eq!(
+        gui.layer_error(&RADAR),
+        None,
+        "the dismissed failure is still being reported"
+    );
+
+    // The same words again, and a different occurrence.
+    gui.apply(crate::shell_api::GuiEvent::Error("boom".to_owned()));
+    assert_eq!(
+        gui.layer_error(&RADAR).as_deref(),
+        Some("boom"),
+        "a second failure carrying the same message stayed hidden behind the \
+         first one's dismissal. The dismissal is keyed on the instant the \
+         failure landed for exactly this reason; keying it on the message, or \
+         on a bare `dismissed` flag, is what this asserts against"
+    );
+}
+
+/// A layer that is not failing has no banner, dismissed or otherwise.
+///
+/// The floor under the test above: if `layer_error` answered `Some` whatever
+/// the ledger said, the dismissal assertions would be measuring nothing.
+///
+/// Held by two lines rather than one, and no single-line tamper reddens it:
+/// substituting a message for the `Ok`/`Absent` arm leaves this green, because
+/// a ledger that is not failing carries no `last_failure` instant and the `?`
+/// below the match filters it anyway. That is defence in depth rather than a
+/// gap -- both guards are correct -- but a reader looking for the one line that
+/// makes this true should look at the instant, not at the health match.
+#[test]
+fn a_healthy_layer_reports_no_error() {
+    const RADAR: rustdar_source::id::LayerId = crate::radar_layer::POLL_LAYER;
+    let mut gui = Gui::new();
+    assert_eq!(
+        gui.layer_error(&RADAR),
+        None,
+        "a layer that has never failed is reporting an error"
+    );
+
+    gui.apply(crate::shell_api::GuiEvent::Error("boom".to_owned()));
+    assert!(
+        gui.layer_error(&RADAR).is_some(),
+        "precondition: now failing"
+    );
+
+    // A delivered round resets the ledger, and the banner is a view of it.
+    gui.end_radar_round(RoundOutcome::Delivered);
+    assert_eq!(
+        gui.layer_error(&RADAR),
+        None,
+        "a delivered round left the failure banner up"
+    );
+}
