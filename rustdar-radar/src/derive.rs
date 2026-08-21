@@ -26,12 +26,31 @@
 //!   recombined 1° × 0.25 km geometry. The 2D map's KDP stays the Level III
 //!   product; this exists for the vertical views.
 //!
-//! Derivation runs inside the section/voxel jobs: per sealed sweep for a live
-//! volume, per request for a section whose line moves. NROT is the heavy one.
-//! [`prepare`] memoizes the derived scans in a process-local three-entry LRU
-//! keyed by [`DeriveKey`]; native invalidation is owned by the App's
-//! volume-eviction pass through [`retain_volumes`], and on wasm the worker is
-//! bounded by the LRU capacity plus the `sealed_sweeps` re-keying.
+//! # Who derives, and what is shared
+//!
+//! **Two consumers come through here and share one memo.** The section job
+//! ([`crate::xsect`]) and the 3D volume job ([`crate::voxel`]) both call
+//! [`prepare`], which memoizes the derived scans in a process-local LRU of
+//! [`DERIVE_MEMO_CAPACITY`] entries keyed by [`DeriveKey`] — volume start
+//! clock, sealed sweep count, radar position, product, the resolved motion
+//! bits and fallback rung, and a digest of the declared Nyquist. Native
+//! invalidation is owned by the App's volume-eviction pass through
+//! [`retain_volumes`]; on wasm the worker is bounded by the LRU capacity plus
+//! the `sealed_sweeps` re-keying.
+//!
+//! **It is a cache, never eager.** Nothing is derived until a consumer asks
+//! for it; the memo only stops the *second* ask for the same identity paying
+//! again. A derivation for a volume nobody samples is never run.
+//!
+//! **The 2D plan-view render does NOT come through here**, and this doc used
+//! to be silent about that. `render_nrot_to_image`, the SRV image path and the
+//! Level II KDP image path in [`crate::render`] call
+//! [`crate::nrot::compute_nrot_grid_with_profile`],
+//! [`crate::srv::compute_srv_grid`] and [`crate::kdp::compute_kdp`] directly,
+//! per sweep, and share none of this memo. They want an RGBA image, not a
+//! sampleable synthetic scan, so they never build one — which is why they are
+//! outside [`prepare`] rather than a duplication of it. NROT is the heavy one
+//! on both paths.
 
 use std::sync::{Arc, LazyLock, Mutex};
 
