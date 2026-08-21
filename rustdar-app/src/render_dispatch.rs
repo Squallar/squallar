@@ -306,6 +306,21 @@ pub struct RenderDispatcher {
     pub(crate) plan_view_extractions: std::cell::Cell<u32>,
     /// Whether an adjacent-tilt pre-render is out.
     speculative_in_flight: bool,
+    /// **The last overlay raster asked for per `(pane, layer)`** — written by
+    /// every dispatch, from either path, in `spawn_overlay_render`.
+    ///
+    /// Its `data_generation` is **stale by definition**: it is the token the
+    /// picture on the glass was keyed at, and the whole point is to compare it
+    /// against one recomputed *now*. Its geometry is the opposite — it is the
+    /// viewport, texture plan and zoom the draw loop last agreed for this
+    /// pane, and an arrival re-uses it unchanged rather than inventing one
+    /// outside a layout pass.
+    ///
+    /// Never garbage-collected: an entry is overwritten by the next dispatch
+    /// and made inert by the eligibility checks the arrival path applies
+    /// (WO-M13a).
+    last_overlay_dispatch:
+        HashMap<(usize, rustdar_source::id::LayerId), crate::app::fetch::OverlayRenderRequest>,
 }
 
 /// The identity of one plan-view extraction — **today's tuple, exactly the
@@ -513,6 +528,7 @@ impl RenderDispatcher {
             #[cfg(test)]
             plan_view_extractions: std::cell::Cell::new(0),
             speculative_in_flight: false,
+            last_overlay_dispatch: HashMap::new(),
         }
     }
 
@@ -835,6 +851,36 @@ pub struct RenderParams {
 }
 
 impl RenderDispatcher {
+    /// Record what this pane was last asked to rasterize for `id`.
+    pub(crate) fn record_overlay_dispatch(
+        &mut self,
+        pane_idx: usize,
+        id: &rustdar_source::id::LayerId,
+        req: crate::app::fetch::OverlayRenderRequest,
+    ) {
+        self.last_overlay_dispatch
+            .insert((pane_idx, id.clone()), req);
+    }
+
+    /// Every pane holding a record for `id`, with what it was asked for.
+    ///
+    /// Sorted by pane index so the arrival walk is deterministic — a `HashMap`
+    /// iteration order would make the dispatch order of two panes' rasters an
+    /// artefact of the hasher.
+    pub(crate) fn overlay_record_holders(
+        &self,
+        id: &rustdar_source::id::LayerId,
+    ) -> Vec<(usize, crate::app::fetch::OverlayRenderRequest)> {
+        let mut held: Vec<(usize, crate::app::fetch::OverlayRenderRequest)> = self
+            .last_overlay_dispatch
+            .iter()
+            .filter(|((_, held_id), _)| held_id == id)
+            .map(|((pane_idx, _), req)| (*pane_idx, req.clone()))
+            .collect();
+        held.sort_by_key(|(pane_idx, _)| *pane_idx);
+        held
+    }
+
     /// The Level III object for `site` closest to `elevation`, out of the objects
     /// `product` names.
     fn nearest_tilt(
