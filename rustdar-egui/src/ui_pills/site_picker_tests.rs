@@ -1,5 +1,5 @@
-//! The site picker's shortcut sections, its ranked search, and what a click
-//! on an open picker does — W12 through W20.
+//! The site picker's shortcut sections, its ranking, and the two clicks a row
+//! carries — W12 through W20.
 //!
 //! A dedicated file rather than another block in `input_harness/tests.rs`:
 //! everything here is about one body, `pills::site_list_ui`, and the probes it
@@ -575,5 +575,63 @@ fn clicking_the_current_site_closes_the_popover_without_asking_for_anything() {
             .iter()
             .any(|a| matches!(a, crate::actions::GuiAction::SwitchRadarSite { .. })),
         "and must not ask for anything: it is already the answer",
+    );
+}
+
+// -- W18: the filter stops persisting ---------------------------------------
+
+/// **A picked site leaves the next open unfiltered.**
+#[test]
+fn picking_a_site_forgets_the_filter_that_found_it() {
+    let mut h = InputHarness::with_screen(WIDE);
+    h.open_pane_props();
+    search_for(&mut h, "kmkx");
+    assert_eq!(
+        h.inspector().site_rows.len(),
+        1,
+        "precondition: the filter narrowed the list",
+    );
+
+    let row = group_row(&h, "KMKX");
+    h.mouse_click(row.rect.center());
+    h.warm_up();
+
+    assert!(
+        h.gui().site_query.is_empty(),
+        "the pick must clear the filter; it still reads {:?}",
+        h.gui().site_query,
+    );
+    let total = rustdar_radar::sites::radars().len() + rustdar_radar::sites::unplaced().len();
+    assert_eq!(
+        h.inspector().site_rows.len(),
+        total,
+        "and the list must be whole again",
+    );
+}
+
+/// **Closing the picker forgets the filter too** — Escape, a click outside,
+/// any way out. Nothing here names a route: the rule is that no surface
+/// hosting the field is drawing any more.
+#[test]
+fn closing_the_picker_forgets_the_filter() {
+    let mut h = InputHarness::with_screen(WIDE);
+    h.open_pane_props();
+    search_for(&mut h, "kmkx");
+    assert_eq!(h.gui().site_query, "kmkx", "precondition: a filter is set");
+
+    h.close_inspector();
+    h.warm_up();
+    assert!(
+        h.gui().site_query.is_empty(),
+        "the filter outlived its picker; it still reads {:?}",
+        h.gui().site_query,
+    );
+
+    h.open_pane_props();
+    let total = rustdar_radar::sites::radars().len() + rustdar_radar::sites::unplaced().len();
+    assert_eq!(
+        h.inspector().site_rows.len(),
+        total,
+        "the next open must be unfiltered",
     );
 }

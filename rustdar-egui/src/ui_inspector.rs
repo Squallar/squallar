@@ -458,6 +458,7 @@ impl super::Gui {
                     site: picked,
                     pane_idx: self.active_pane,
                 });
+                self.clear_site_query();
             }
             // `picked_current` is deliberately ignored on this route: the
             // inspector body is not a popover, there is nothing to dismiss,
