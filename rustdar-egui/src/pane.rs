@@ -1895,6 +1895,86 @@ impl PaneState {
         Err(NO_VOLUME_LAYER.to_owned())
     }
 
+    /// **Which volume this pane's 3D view is about**, given what the site's
+    /// merge currently holds.
+    ///
+    /// A pane on the live feed is about the *newest* data in the merge: that
+    /// stamp advances with every sealed sweep, which is what makes the 3D view
+    /// rebuild in step with the map beside it. A pane that has navigated back
+    /// to an older scan is about **that** scan, and the site's new arrivals are
+    /// not its business — which is why an arrival cannot drag a navigated pane
+    /// forward in time.
+    ///
+    /// `None` while the site has no merged volume at all; the pane says the
+    /// first download is in flight rather than drawing an empty box.
+    ///
+    /// The second half of the pair is when the complete base volume under the
+    /// merge began, which only the caption reads. It rides along rather than
+    /// getting its own accessor because it is the *same* two-branch choice:
+    /// splitting it would be two spellings of one decision, free to disagree.
+    pub fn volume_stamp(
+        &self,
+        current: Option<crate::radar_layer::CurrentVolumeStamp>,
+    ) -> Option<(VolumeStamp, Option<NaiveDateTime>)> {
+        let navigated = (!self.viewing_live)
+            .then(|| self.scan_info.as_ref().map(|info| info.timestamp))
+            .flatten();
+        current.map(|current| match navigated {
+            Some(collected) => (
+                VolumeStamp {
+                    site: self.site.clone(),
+                    collected,
+                },
+                Some(collected),
+            ),
+            None => (
+                VolumeStamp {
+                    site: self.site.clone(),
+                    collected: current.newest,
+                },
+                current.base_started,
+            ),
+        })
+    }
+
+    /// **The grid a 3D pane showing `field` at `stamp` is about.**
+    ///
+    /// The three things that identify a volume in the store, put together in
+    /// one place: the draw-time level-trigger and the arrival-path eager
+    /// dispatch (WO-M14c) both name a volume for the same pane, and if they
+    /// could spell it differently they would build one grid twice under two
+    /// keys instead of the second asker attaching to the first.
+    pub fn volume_target_for(&self, field: &FieldId, stamp: VolumeStamp) -> VolumeTarget {
+        VolumeTarget {
+            volume: stamp,
+            product: field.clone(),
+            region: self.volume().and_then(|volume| volume.region),
+        }
+    }
+
+    /// **Whether this pane still needs `target` built** — the level-trigger's
+    /// own condition, asked by the arrival path too.
+    ///
+    /// Three refusals, each about a pane that is not owed this build:
+    ///
+    /// * a pane **not in Volume mode** is owed no volume at all. Building one
+    ///   for it would be speculation about a mode it might switch to, which is
+    ///   the boundary WO-M14c is drawn at: the arrival path moves the *same*
+    ///   work earlier and never invents new work;
+    /// * a pane **playing a 3D loop** is showing its playhead's own frame
+    ///   grid, so the live volume it would otherwise ask for is a grid nothing
+    ///   would put on screen;
+    /// * a pane **already rendered for this exact target** has nothing to ask
+    ///   for. This is the off-switch that makes the level-trigger quiesce once
+    ///   an eager build has landed, and it is why [`Self::volume_target_for`]
+    ///   must produce the same key on both paths.
+    pub fn volume_build_due(&self, target: &VolumeTarget) -> bool {
+        self.active_volume_frame().is_none()
+            && self
+                .volume()
+                .is_some_and(|volume| volume.rendered_for.as_ref() != Some(target))
+    }
+
     pub fn set_overlay_enabled(&mut self, id: LayerId, enabled: bool) {
         match self.slot_mut(&id) {
             Some(slot) => slot.enabled = enabled,
@@ -2510,6 +2590,10 @@ mod section_loop_tests;
 /// Which layer a 3D pane asks for a grid, and what it says when none can.
 #[cfg(test)]
 mod volume_ask_tests;
+
+/// Which volume a 3D pane is about, and whether it still needs building.
+#[cfg(test)]
+mod volume_due_tests;
 
 #[cfg(test)]
 mod tests;

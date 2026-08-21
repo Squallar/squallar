@@ -199,6 +199,89 @@ impl super::App {
             .volume_job(ctx)
     }
 
+    /// **The 3D asks a just-arrived volume answers** — one per pane that is
+    /// *already* in Volume mode and about the volume that just landed.
+    ///
+    /// This is WO-M14c, and its whole content is a **moment**: the ask each of
+    /// these panes would make from the draw loop some frames later, made now,
+    /// at the pump row where the volume installs. Nothing here is new work.
+    /// The level-trigger in the 3D arm stays exactly where it is as the
+    /// fallback, and the store's `Building` entry makes the two converge —
+    /// whichever asks second attaches to the build the first opened.
+    ///
+    /// **What gets nothing, and it is the boundary rather than an oversight:**
+    ///
+    /// * every pane not in Volume mode. No likely-next-product build, no
+    ///   guess at a mode a pane might switch to. That refusal is **not**
+    ///   spelled here: it is one of the three
+    ///   [`rustdar_egui::pane::PaneState::volume_build_due`] holds, so the
+    ///   arrival path and the draw-time level-trigger state the boundary once
+    ///   between them rather than twice. A plan-view pane on the arriving
+    ///   site is walked and then refused, which costs one hydrate per arrival
+    ///   and buys one definition;
+    /// * every pane past the layout's visible count, which is the same
+    ///   denominator [`super::App::release_hidden_pane_volumes`] uses — a
+    ///   hidden pane's grid is being *given back*, not built;
+    /// * every pane whose own volume is not this arrival: another site, or a
+    ///   navigated pane whose stamp is the scan it stepped back to;
+    /// * every pane already rendered for the target, or playing a 3D loop —
+    ///   the other two `volume_build_due` holds;
+    /// * every pane at all when there is no painter, because a build nothing
+    ///   can draw is the speculation this order refuses. The 3D arm returns
+    ///   its empty state before reaching the level-trigger in exactly that
+    ///   case, so this keeps the eager set a subset of the draw-time set.
+    ///
+    /// The **hydrate** is not optional: a handler answers `current_field` out
+    /// of its own slot, and for the layer whose selection the pane owns the
+    /// slot is only current once the pane has published it. The 3D arm runs
+    /// the same hydrate immediately before its own walk.
+    ///
+    /// **Lives here rather than in `app.rs`** for the reason
+    /// [`Self::volume_layer_refusal`] states: this file owns the
+    /// registry-facing helpers, and `app.rs` is one slot under the ceiling the
+    /// App-pokes-Gui ratchet is driving to zero.
+    pub(super) fn arrived_volume_asks(
+        &mut self,
+        arrived: &std::collections::HashMap<String, rustdar_egui::CurrentVolumeStamp>,
+    ) -> Vec<(
+        usize,
+        rustdar_source::id::LayerId,
+        rustdar_egui::pane::VolumeTarget,
+    )> {
+        if arrived.is_empty() || self.volume_painter.is_none() {
+            return Vec::new();
+        }
+        let visible = self.gui.panes().len();
+        let (panes, overlays) = self.gui.panes_and_overlays_mut();
+        let mut asks = Vec::new();
+        for (pane_idx, pane) in panes.iter_mut().take(visible).enumerate() {
+            let Some(current) = arrived.get(pane.site()) else {
+                continue;
+            };
+            let current = *current;
+            let Some((stamp, _)) = pane.volume_stamp(Some(current)) else {
+                continue;
+            };
+            // A navigated pane's stamp is the scan it stepped back to, which
+            // this arrival is not. Stated as a comparison rather than as a
+            // `viewing_live` read so the one place that decides which volume a
+            // pane is about stays `volume_stamp`.
+            if stamp.collected != current.newest {
+                continue;
+            }
+            pane.hydrate_layer_states(overlays, pane_idx);
+            let Ok(ask) = pane.volume_ask(overlays, pane_idx) else {
+                continue;
+            };
+            let target = pane.volume_target_for(&ask.field, stamp);
+            if !pane.volume_build_due(&target) {
+                continue;
+            }
+            asks.push((pane_idx, ask.layer, target));
+        }
+        asks
+    }
+
     /// Spawn a listing task a layer built, and land its answer on the one
     /// source arrival path as [`SourceEvent::Frames`].
     fn spawn_frame_list_task(&self, task: rustdar_overlays::render::overlay_state::FetchTask) {
