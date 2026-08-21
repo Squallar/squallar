@@ -148,6 +148,12 @@ pub struct App {
     render: RenderDispatcher,
     platform: Box<dyn PlatformBridge>,
     texture_counter: u32,
+    /// A rendering state has been built and the rasters it dropped have not
+    /// been put back yet. Set where the state is created, spent inside the
+    /// frame — see `App::setup_egui_frame`, and
+    /// [`restore_cached_render`](Self::restore_cached_render) for why the
+    /// restore cannot run at the moment the state is built.
+    restore_pending: bool,
     cached_dark_theme: Option<bool>,
     /// The last predictive-back claim pushed to the platform, so the push is
     /// edge-triggered. `false` at construction because nothing is open on the
@@ -434,6 +440,7 @@ impl App {
             render,
             platform,
             texture_counter: 0,
+            restore_pending: false,
             cached_dark_theme: None,
             back_claimed: false,
             exit_requested: false,
@@ -569,6 +576,9 @@ impl App {
         if self.render.any_render_in_flight()
             || self.gui.any_loop_active()
             || self.gui.any_raster_held()
+            // A restore that deferred itself has to be brought back by
+            // something; nothing else in this list speaks for it.
+            || self.restore_pending
             || self.chunk_feeds.any_in_flight()
             || self.chunk_notify.handshake_pending()
             || rustdar_worker::offload::has_deferred_drops()
@@ -662,11 +672,11 @@ impl App {
                 ))
             });
             if let Some(state) = new_state {
-                let ctx = state.egui_renderer.context().clone();
                 self.render
                     .set_raster_side_ceiling_px(state.raster_side_ceiling_px);
                 self.state = Some(state);
-                self.restore_cached_render(&ctx);
+                // Armed here, run from inside the frame. See the field.
+                self.restore_pending = true;
                 self.install_volume_bridge();
             }
         }
@@ -679,11 +689,11 @@ impl App {
             match rx.try_recv() {
                 Ok(state) => {
                     self.pending_state = None;
-                    let ctx = state.egui_renderer.context().clone();
                     self.render
                         .set_raster_side_ceiling_px(state.raster_side_ceiling_px);
                     self.state = Some(state);
-                    self.restore_cached_render(&ctx);
+                    // Armed here, run from inside the frame. See the field.
+                    self.restore_pending = true;
                     self.install_volume_bridge();
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
