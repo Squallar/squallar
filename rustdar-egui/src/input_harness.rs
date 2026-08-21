@@ -1345,8 +1345,8 @@ impl InputHarness {
     }
 
     /// The pane borders the last frame painted: pane index, the stroke's
-    /// painted bounds, and whether it was the active highlight.
-    pub(crate) fn pane_borders(&self) -> Vec<(usize, egui::Rect, bool)> {
+    /// painted bounds, and what the border encodes about links.
+    pub(crate) fn pane_borders(&self) -> Vec<(usize, egui::Rect, crate::ui::map::PaneBorderMarks)> {
         self.gui.pane_borders_for_test().to_vec()
     }
 
@@ -1563,6 +1563,32 @@ impl InputHarness {
     /// Every rect painted during the last frame, in paint order.
     pub(crate) fn painted_rects(&self) -> &[egui::Rect] {
         &self.last_rects
+    }
+
+    /// The fill of each of [`Self::painted_rects`], in the same order.
+    pub(crate) fn painted_fills(&self) -> &[egui::Color32] {
+        &self.last_rect_fills
+    }
+
+    /// Where `text` was painted inside `rect`, if it was.
+    pub(crate) fn text_rect_in(&self, rect: egui::Rect, text: &str) -> Option<egui::Rect> {
+        self.last_texts
+            .iter()
+            .find(|(bounds, painted)| painted == text && rect.contains(bounds.center()))
+            .map(|(bounds, _)| *bounds)
+    }
+
+    /// **Take the OS theme the app has no override for.** `features.md` says
+    /// there is no in-app theme switch, so both are reachable and neither is
+    /// opt-in — which is why anything the app paints for itself has to be
+    /// checked in both.
+    pub(crate) fn set_os_theme(&mut self, dark: bool) {
+        self.ctx.set_theme(if dark {
+            egui::ThemePreference::Dark
+        } else {
+            egui::ThemePreference::Light
+        });
+        self.warm_up();
     }
 
     /// Rects that came back under a different widget id between passes, since

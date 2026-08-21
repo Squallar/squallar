@@ -36,8 +36,9 @@ pub(in crate::ui) struct FrameProbes {
     /// The excluded rects `render_panes` was actually handed.
     pub last_map_excluded_rects: Vec<egui::Rect>,
     /// The pane borders the last frame painted: pane index, the stroke's
-    /// painted bounds, and whether it was the active highlight.
-    pub last_pane_borders: Vec<(usize, egui::Rect, bool)>,
+    /// painted bounds, and everything the border encodes — active, group and
+    /// partial membership.
+    pub last_pane_borders: Vec<(usize, egui::Rect, crate::ui::map::PaneBorderMarks)>,
     /// The section tracks the last frame painted over map panes: map pane,
     /// section pane, and the painted A and B endpoints.
     pub last_section_tracks: Vec<(usize, usize, egui::Pos2, egui::Pos2)>,

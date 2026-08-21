@@ -450,11 +450,16 @@ impl super::Gui {
                     self.panes[pane_idx] = pane;
 
                     if pane_count > 1 {
-                        let painted = draw_pane_border(ui, pane_rect, is_active);
+                        let marks = PaneBorderMarks {
+                            is_active,
+                            group: self.panes[pane_idx].group,
+                            partial: self.panes[pane_idx].partial_member(),
+                        };
+                        let painted = draw_pane_border(ui, pane_rect, marks);
                         #[cfg(test)]
                         self.probes
                             .last_pane_borders
-                            .push((pane_idx, painted, is_active));
+                            .push((pane_idx, painted, marks));
                         #[cfg(not(test))]
                         let _ = painted;
                     }
@@ -1979,15 +1984,59 @@ fn paint_section_handles(
     }
 }
 
-/// Draw a border around a pane rect, highlighted when active. Returns the
-/// painted stroke's bounds, for the M8 containment pin.
-fn draw_pane_border(ui: &mut egui::Ui, pane_rect: egui::Rect, is_active: bool) -> egui::Rect {
-    let border_color = if is_active {
+/// The group accent bar's thickness, logical pixels.
+const GROUP_BAR_HEIGHT: f32 = 3.0;
+
+/// One dash of a partial member's accent bar, and the gap after it.
+const GROUP_DASH: f32 = 9.0;
+const GROUP_DASH_GAP: f32 = 6.0;
+
+/// The group tab's box, at the accent bar's right end.
+const GROUP_TAB_WIDTH: f32 = 17.0;
+const GROUP_TAB_HEIGHT: f32 = 14.0;
+const GROUP_TAB_FONT: f32 = 10.0;
+
+/// **What a pane's border has to say about its links**, beside whether it is
+/// the active one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PaneBorderMarks {
+    pub is_active: bool,
+    /// The group this pane belongs to, or `None` for a pane in no group —
+    /// which paints no accent at all, because "with nobody" is the absence of
+    /// a group and not a seventh colour.
+    pub group: Option<crate::pane::GroupId>,
+    /// In a group, opted out of at least one dimension. Marked by **breaking
+    /// the accent bar into dashes**, not by a second colour: a hue difference
+    /// is exactly what a theme, a projector or a colour-blind reader can
+    /// collapse, and a solid line against a broken one survives all three.
+    pub partial: bool,
+}
+
+/// Draw a border around a pane rect: the stroke says whether this is the
+/// active pane, and the accent along its top edge says which link group it
+/// belongs to. Returns the painted stroke's bounds, for the M8 containment
+/// pin.
+///
+/// **The two channels are deliberately separate.** Active/inactive keeps the
+/// blue-2px / grey-1px vocabulary it has always had, so nothing about
+/// selection changes; the group is an addition beside it, drawn inside the
+/// stroke and above the pill row's 8px inset, where nothing else paints.
+///
+/// The accent is drawn on its own dark backing rather than in a theme colour,
+/// because it sits on map tiles: the background under it has nothing to do
+/// with the app theme, so the same pixels are correct in both. See
+/// [`crate::pane::GroupId::accent`].
+fn draw_pane_border(
+    ui: &mut egui::Ui,
+    pane_rect: egui::Rect,
+    marks: PaneBorderMarks,
+) -> egui::Rect {
+    let border_color = if marks.is_active {
         egui::Color32::from_rgb(60, 140, 255)
     } else {
         egui::Color32::from_rgba_unmultiplied(128, 128, 128, 100)
     };
-    let stroke_width = if is_active { 2.0 } else { 1.0 };
+    let stroke_width = if marks.is_active { 2.0 } else { 1.0 };
     let kind = egui::StrokeKind::Inside;
     ui.painter().rect_stroke(
         pane_rect,
@@ -1995,11 +2044,74 @@ fn draw_pane_border(ui: &mut egui::Ui, pane_rect: egui::Rect, is_active: bool) -
         egui::Stroke::new(stroke_width, border_color),
         kind,
     );
+    if let Some(group) = marks.group {
+        draw_group_accent(ui.painter(), pane_rect, stroke_width, group, marks.partial);
+    }
     match kind {
         egui::StrokeKind::Inside => pane_rect,
         egui::StrokeKind::Middle => pane_rect.expand(stroke_width / 2.0),
         egui::StrokeKind::Outside => pane_rect.expand(stroke_width),
     }
+}
+
+/// The group half of [`draw_pane_border`]: the accent bar across the top edge
+/// — solid for a full member, dashed for a partial one — and the lettered tab
+/// at its right end, which is what names the group for a reader who cannot
+/// tell the hues apart.
+fn draw_group_accent(
+    painter: &egui::Painter,
+    pane_rect: egui::Rect,
+    inset: f32,
+    group: crate::pane::GroupId,
+    partial: bool,
+) {
+    let accent = group.accent();
+    // The backing: one dark pixel of margin under everything the accent
+    // paints, so a pale hue over a pale tile still has an edge.
+    let backing = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
+    let top = pane_rect.top() + inset;
+    let left = pane_rect.left() + inset;
+    let right = pane_rect.right() - inset;
+    if right - left < GROUP_TAB_WIDTH + 2.0 {
+        return;
+    }
+
+    let bar = egui::Rect::from_min_max(
+        egui::pos2(left, top),
+        egui::pos2(right, top + GROUP_BAR_HEIGHT),
+    );
+    painter.rect_filled(bar.expand(1.0), 0.0, backing);
+    if partial {
+        let mut x = bar.left();
+        while x < bar.right() {
+            let end = (x + GROUP_DASH).min(bar.right());
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(x, bar.top()), egui::pos2(end, bar.bottom())),
+                0.0,
+                accent,
+            );
+            x = end + GROUP_DASH_GAP;
+        }
+    } else {
+        painter.rect_filled(bar, 0.0, accent);
+    }
+
+    // The tab hangs off the bar's right end: the pill row starts 8px in from
+    // the pane's left, and the colour scale's title sits ~16px down its right
+    // edge, so this band is the one place on a pane nothing else claims.
+    let tab = egui::Rect::from_min_max(
+        egui::pos2(right - GROUP_TAB_WIDTH, bar.bottom()),
+        egui::pos2(right, bar.bottom() + GROUP_TAB_HEIGHT),
+    );
+    painter.rect_filled(tab.expand(1.0), 2.0, backing);
+    painter.rect_filled(tab, 2.0, accent);
+    painter.text(
+        tab.center(),
+        egui::Align2::CENTER_CENTER,
+        group.letter(),
+        egui::FontId::proportional(GROUP_TAB_FONT),
+        group.accent_ink(),
+    );
 }
 
 /// What a hover needs to know about where it is, in the world rather than on
