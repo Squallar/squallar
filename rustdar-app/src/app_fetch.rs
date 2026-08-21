@@ -4,7 +4,6 @@ use chrono::NaiveDateTime;
 use chrono::TimeZone;
 use rustdar_device_profile::constants::LOOP_IMAGE_SIZE;
 use rustdar_egui::actions::GuiAction;
-use rustdar_egui::actions::RadarConfig;
 use rustdar_egui::radar_layer;
 use rustdar_egui::shell_api::GuiEvent;
 use rustdar_overlays::render::overlay_state::{OverlayFetchResult, SourceEvent};
@@ -790,11 +789,14 @@ impl super::App {
             GuiAction::SwitchRadarSite { site, pane_idx } => {
                 log::info!("Switch radar site requested: pane {} -> {}", pane_idx, site);
 
-                let new_config = RadarConfig {
-                    site: site.clone(),
-                    timestamp: self.gui.selected_timestamp(),
-                };
-                self.gui.apply(GuiEvent::RadarConfig(new_config.clone()));
+                // The clock does not move; applying it re-renders the Set
+                // Time dialog's strings from the time still selected, which is
+                // what `GuiEvent::RadarConfig` did here beside writing the
+                // app-wide site. There is no app-wide site left to write --
+                // the panes below carry their own -- so only this half
+                // remains.
+                let timestamp = self.gui.selected_timestamp();
+                self.gui.apply(GuiEvent::SelectedTime(timestamp));
 
                 // The linked group moves together; an unlinked pane moves alone.
                 let moving = self.gui.layer_sync_targets(pane_idx);
@@ -842,7 +844,7 @@ impl super::App {
                     }
                 }
 
-                let utc_timestamp = Self::local_to_utc(new_config.timestamp);
+                let utc_timestamp = Self::local_to_utc(timestamp);
                 self.spawn_fetch(site, utc_timestamp);
             }
             _ => unreachable!(),

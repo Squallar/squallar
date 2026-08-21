@@ -220,34 +220,6 @@ pub(crate) enum InspectorSelection {
     Layer(LayerId),
 }
 
-/// **What is left of the radar shell state after WO-E8d**, and why each half
-/// is still here rather than in the radar layer.
-///
-/// `fetching` and the selected timestamp left: the first was a second copy of
-/// the layer's own in-flight flag, the second belongs beside the dialog that
-/// edits it ([`TimeDialogState::timestamp`]).
-///
-/// **`site`** is the persisted *global* site — the fallback a pane with no
-/// site of its own is opened on, and the one the Set Time dialog fetches
-/// against. WO-E8d's order called this half dead because no fetch path reads
-/// it (every one substitutes the pane's own site). That is true of fetching
-/// and false of the file: `ui_config` writes it as the top-level `site` key
-/// and reads it back as the seed at two places, and the Tier-2 browser rig
-/// pins its scene by seeding exactly that key. Deriving it from the panes
-/// instead would change what a multi-pane session persists and would hollow
-/// three tests whose premise is that a global exists to be wrongly used.
-///
-/// It is the last radar-specific field on this struct. `error_message` used to
-/// sit beside it, on the reasoning that the DISMISSAL is presentation state
-/// with nowhere to live because `FetchHealth` carries no dismissed state and no
-/// occurrence identity. The first half was right and the second was wrong:
-/// [`FetchRetry::last_failure`] is that identity, and the banner now reads its
-/// message straight off the layer's own ledger and keys the dismissal on the
-/// instant. See [`Gui::layer_error`].
-pub(super) struct RadarState {
-    pub site: String,
-}
-
 /// Time editing dialog state.
 pub(super) struct TimeDialogState {
     /// **The time on display**, and the value the two strings below are a
@@ -575,9 +547,9 @@ pub(crate) fn is_master_control(item: &ControlItem) -> bool {
 
 impl Gui {
     /// The config a radar fetch on the active pane's behalf must use: the
-    /// time on display, against the **active pane's own site** — never the
-    /// persisted global one, which is only a fallback for a pane that names
-    /// no site.
+    /// time on display, against the **active pane's own site**. There is no
+    /// other site it could use: a pane owns its site, and no app-wide one
+    /// exists to fall back to.
     pub(super) fn active_pane_fetch_config(&self) -> RadarConfig {
         RadarConfig {
             site: self.active_pane().site().to_string(),
@@ -668,12 +640,6 @@ impl Gui {
                 // message against the layer's own retry ledger, which is where
                 // the banner reads it from. There is no second copy to keep.
                 self.end_radar_round(RoundOutcome::Failed(&error));
-            }
-            // Set the radar config, keeping the Set Time dialog's strings in
-            // sync with it.
-            GuiEvent::RadarConfig(config) => {
-                self.radar.site = config.site;
-                self.time_dialog.select(config.timestamp);
             }
             GuiEvent::SelectedTime(timestamp) => self.time_dialog.select(timestamp),
             GuiEvent::ViewingLiveForPane { pane_idx, live } => {
@@ -795,14 +761,14 @@ impl Gui {
                         if let Some(pane) = self.panes.get_mut(self.active_pane) {
                             pane.viewing_live = false;
                         }
-                        // **The persisted global site, not the active pane's.**
-                        // That is what this button has always fetched, and the
-                        // two differ whenever a pane has been switched away
-                        // from the global.
-                        action = Some(GuiAction::FetchRadarScan(RadarConfig {
-                            site: self.radar.site.clone(),
-                            timestamp,
-                        }));
+                        // **The active pane's own site.** There is no
+                        // app-wide site to fetch against any more: a pane
+                        // carries its own, and the dialog belongs to the pane
+                        // in front of the user. This arm used to fetch the
+                        // persisted global instead, which is the opposite
+                        // answer whenever a pane had been switched away from
+                        // it -- see `the_time_dialogs_ok_fetches_the_active_panes_site`.
+                        action = Some(GuiAction::FetchRadarScan(self.active_pane_fetch_config()));
                     }
                     self.time_dialog.show = false;
                 }
@@ -1662,14 +1628,6 @@ impl Gui {
     /// before it writes a new one.
     pub fn selected_timestamp(&self) -> chrono::NaiveDateTime {
         self.time_dialog.timestamp
-    }
-
-    /// **The persisted global site**: the fallback a pane that names no site
-    /// of its own is opened on, and what the Set Time dialog fetches against.
-    /// A fetch on a pane's behalf uses [`Self::active_pane_fetch_config`]
-    /// instead — these two disagree whenever a pane has been switched.
-    pub fn global_site(&self) -> &str {
-        &self.radar.site
     }
 
     pub fn clear_loading_site_for_site(&mut self, site: &str) {

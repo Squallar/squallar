@@ -1,7 +1,7 @@
 //! Stepwise config-format migrations, applied to the raw JSON tree before
 //! `UiConfig` ever sees it.
 
-pub(crate) const CONFIG_VERSION: u32 = 4;
+pub(crate) const CONFIG_VERSION: u32 = 5;
 
 /// The version a file with no `config_version` key speaks: every config
 /// written before the field existed. A constant fact about history — this
@@ -20,6 +20,7 @@ const MIGRATIONS: &[Migration] = &[
     (1, split_gps_config),
     (2, panes_take_layer_slots),
     (3, radar_takes_its_settings),
+    (4, panes_take_the_root_site),
 ];
 
 /// v1 → v2: the `gps_config` container split — the serial half (`port_path`,
@@ -241,6 +242,86 @@ fn radar_takes_its_settings(value: &mut serde_json::Value) {
     let radar = radar.as_object_mut().expect("shape checked above");
     for (key, moved) in carried {
         radar.entry(key).or_insert(moved);
+    }
+}
+
+/// v4 → v5: **the root `site` reaches the panes, and the key goes.**
+///
+/// There was one app-wide site: the key every save wrote, and the seed a pane
+/// naming none of its own was opened on. A pane owns its site now, so the
+/// value has to reach the panes before the key can go — otherwise an upgrade
+/// would open every such pane on a radar the user never chose.
+///
+/// **A pane that already names a site is not touched.** Its own answer
+/// outranks the root's, which is the whole point of the key going away; the
+/// seed only fills a gap. The value is carried **verbatim**, into the same
+/// radar-slot member [`panes_take_layer_slots`] writes, so a spelling this
+/// build could not read is handed to the tolerant reader that has always
+/// fielded it rather than being coerced or dropped here.
+///
+/// **The key goes whether or not a pane took it**, so a build that no longer
+/// reads it cannot rewrite it forever as an unknown it is preserving. A file
+/// that never had one is left untouched: nothing to seed, nothing to remove.
+fn panes_take_the_root_site(value: &mut serde_json::Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    let Some(site) = root.remove("site") else {
+        return;
+    };
+    // **The site must have somewhere to land.** A file naming a root site and
+    // no panes at all is not hypothetical — it is the shape the Tier-2 rig
+    // seeded its scene with until this land, and the shape a hand-written
+    // config takes. Dropping the key without placing it would reopen that
+    // session on a compiled-in default. One entry is enough: the load seeds
+    // every pane the file counts but never describes from the first pane it
+    // does.
+    if !root.get("panes").is_some_and(serde_json::Value::is_array) {
+        root.insert("panes".to_string(), serde_json::Value::Array(Vec::new()));
+    }
+    let Some(panes) = root
+        .get_mut("panes")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    if panes.is_empty() {
+        panes.push(serde_json::json!({}));
+    }
+    for pane in panes {
+        let Some(pane) = pane.as_object_mut() else {
+            continue;
+        };
+        let slots = pane
+            .entry("layer_slots".to_string())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        let Some(slots) = slots.as_array_mut() else {
+            continue;
+        };
+        if !slots
+            .iter()
+            .any(|slot| slot.get("id").and_then(serde_json::Value::as_str) == Some(RADAR_ID))
+        {
+            slots.push(serde_json::json!({ "id": RADAR_ID }));
+        }
+        let Some(radar) = slots
+            .iter_mut()
+            .find(|slot| slot.get("id").and_then(serde_json::Value::as_str) == Some(RADAR_ID))
+        else {
+            continue;
+        };
+        let Some(radar) = radar.as_object_mut() else {
+            continue;
+        };
+        let config = radar
+            .entry("config".to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let Some(config) = config.as_object_mut() else {
+            continue;
+        };
+        config
+            .entry("site".to_string())
+            .or_insert_with(|| site.clone());
     }
 }
 

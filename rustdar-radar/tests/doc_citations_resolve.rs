@@ -119,6 +119,50 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          cannot arise now — there is no derivation and no quantum — and names \
          the stronger property's test in the same sentence.",
     ),
+    // ── WO-SITE: the app-wide site, and the four rows that named it ─────
+    //
+    // The one-for-one mapping, kept here rather than only in a land message,
+    // because this is the file that will notice when it rots. Each successor
+    // names its predecessor in its own doc; the predecessors are gone because
+    // the app-wide site they were about is gone.
+    (
+        "rustdar-egui/src/ui_config/fixture_tests.rs",
+        "navigating_in_time_leaves_the_global_site_alone",
+        "→ `navigating_in_time_leaves_every_panes_site_alone`. Same property, \
+         wider subject: the clock must not reach a radar selection, and there \
+         are now as many selections as panes rather than one app-wide one.",
+    ),
+    (
+        "rustdar-egui/src/ui_config/fixture_tests.rs",
+        "the_persisted_site_is_the_global_one_and_it_seeds_a_pane_that_names_none",
+        "→ `the_save_names_no_app_wide_site_and_each_pane_carries_its_own` \
+         (save half, **assertion inverted**: it pinned the top-level `site` \
+         key as the global one, and the successor pins that no such key is \
+         written) and → \
+         `a_pane_the_file_never_described_opens_on_the_first_pane_it_did` \
+         (load half: the seed for a pane the file says nothing about is the \
+         file's own first site, not the retired key). Cited from both \
+         successors.",
+    ),
+    (
+        "rustdar-egui/src/input_harness/tests.rs",
+        "refresh_fetches_the_active_panes_site_not_the_global_one",
+        "→ `refresh_fetches_the_active_panes_site_not_another_panes`. The \
+         property is unchanged; only its contrast partner moved, because the \
+         global it named no longer exists and another pane's site is now the \
+         site that could wrongly be fetched.",
+    ),
+    (
+        "rustdar-egui/src/input_harness/tests.rs",
+        "the_time_dialogs_ok_fetches_the_global_site_not_the_active_panes",
+        "→ `the_time_dialogs_ok_fetches_the_active_panes_site`. **READ THIS \
+         ONE.** The successor asserts the OPPOSITE of the predecessor, and \
+         deliberately: the old row pinned that this single control fetched \
+         the persisted global rather than the pane in front of the user. The \
+         ruling that nothing is app-wide retires the global, so the dialog \
+         fetches its pane like every other control. An authorised behaviour \
+         change, not a rename.",
+    ),
 ];
 
 /// Directory names the walk never descends into.

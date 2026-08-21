@@ -1,6 +1,6 @@
 {
   "active_pane": 0,
-  "config_version": 4,
+  "config_version": 5,
   "heading_source": "Auto",
   "loop_lookback_secs": 3600,
   "loop_speed_fps": 5.0,
@@ -160,7 +160,6 @@
     "baud_rate": 0,
     "port_path": null
   },
-  "site": "KTLX",
   "srv_fallback": "MeanWind",
   "storm_motion_override": {
     "direction_deg": 240.0,

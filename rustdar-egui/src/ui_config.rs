@@ -490,8 +490,6 @@ struct UiConfig {
     // them through `serialize_state`/`deserialize_state` like every other
     // handler's settings. The migration is what an older file walks up
     // through; nothing reads them here any more.
-    #[serde(deserialize_with = "site_or_default")]
-    site: String,
     loop_lookback_secs: u64,
     loop_speed_fps: f32,
     time_step_secs: i64,
@@ -871,7 +869,6 @@ impl Default for UiConfig {
             active_pane: 0,
             viewport_sync: true,
             sync_layers: true,
-            site: "KTLX".to_string(),
             loop_lookback_secs: 3600,
             loop_speed_fps: 5.0,
             time_step_secs: 600,
@@ -950,7 +947,6 @@ impl super::Gui {
             active_pane: self.active_pane,
             viewport_sync: true,
             sync_layers: true,
-            site: self.radar.site.clone(),
             loop_lookback_secs: self.loop_lookback_secs,
             loop_speed_fps: fps,
             time_step_secs: self.panes.first().map_or(600, |p| p.time.step.as_secs()),
@@ -1069,13 +1065,45 @@ impl super::Gui {
         };
 
         let count = config.pane_count.clamp(1, WidthClass::max_panes_absolute());
+        // **A pane the file COUNTED BUT NEVER DESCRIBED opens on the first
+        // pane the file does name.** The seed used to be the top-level `site`
+        // key; there is no app-wide site any more, and the nearest honest
+        // substitute for a pane the file says nothing at all about is the
+        // file's own first answer rather than a compiled-in default the user
+        // never chose.
+        //
+        // **Only that shape.** A pane whose entry names a site this build
+        // refuses — a hand-edited identifier no radar could have, or a pane
+        // the salvage reset to defaults in place — is not a gap: the file had
+        // an opinion about it and the opinion was rejected. Those keep
+        // whatever startup picked, exactly as they did when the refused value
+        // left the global empty too. Borrowing a neighbour's radar there
+        // would invent a choice the user never made.
+        //
+        // No save this build makes reaches the seed at all: every pane is
+        // written, so `panes` is never shorter than `pane_count`.
+        let described_site = config
+            .panes
+            .iter()
+            .map(PaneConfig::site)
+            .find(|site| !site.is_empty());
         while self.panes.len() < count {
-            let site = config
-                .panes
-                .get(self.panes.len())
-                .map(PaneConfig::site)
-                .unwrap_or_else(|| config.site.clone());
-            self.panes.push(PaneState::with_site(site));
+            let pane = match config.panes.get(self.panes.len()) {
+                // Described. Its own answer, and where the description named
+                // no site, a fresh pane's — which is exactly what a described
+                // pane already in the vector comes to, since the loop below
+                // leaves one that named none alone.
+                Some(pc) => match pc.site() {
+                    site if site.is_empty() => PaneState::new(),
+                    site => PaneState::with_site(site),
+                },
+                // Counted but never described: the gap.
+                None => match described_site.clone() {
+                    Some(site) => PaneState::with_site(site),
+                    None => PaneState::new(),
+                },
+            };
+            self.panes.push(pane);
         }
         self.pane_layout = PaneLayout::for_count(count);
         self.active_pane = if config.active_pane < count {
@@ -1083,10 +1111,6 @@ impl super::Gui {
         } else {
             0
         };
-
-        if !config.site.is_empty() {
-            self.radar.site = config.site.clone();
-        }
 
         // The file's numbers are the pane's numbers: the two settings are
         // persisted once and every pane's posture carries the same value, so a
@@ -1182,8 +1206,6 @@ impl super::Gui {
             let pane_site = pc.site();
             if !pane_site.is_empty() {
                 pane.set_site(pane_site);
-            } else if !config.site.is_empty() {
-                pane.set_site(config.site.clone());
             }
             pane.time.step = crate::pane::TimeStep::from_secs(pc.time_step_secs);
             pane.time_link = pc.time_link && config.sync_layers;
@@ -1249,8 +1271,9 @@ impl super::Gui {
     }
 
     /// Point every pane at `site`, for a first run with no stored config.
+    /// **Every pane, and nothing else** — there is no app-wide site for this
+    /// to write beside them.
     pub fn set_initial_site(&mut self, site: &str) {
-        self.radar.site = site.to_string();
         for pane in &mut self.panes {
             pane.set_site(site.to_string());
         }

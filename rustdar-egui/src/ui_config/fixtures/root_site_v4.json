@@ -1,0 +1,29 @@
+{
+  "config_version": 4,
+  "pane_count": 2,
+  "active_pane": 0,
+  "site": "KTLX",
+  "loop_lookback_secs": 3600,
+  "loop_speed_fps": 5.0,
+  "time_step_secs": 600,
+  "panes": [
+    {
+      "time_step_secs": 600,
+      "layer_slots": [
+        {
+          "id": "Radar",
+          "enabled": true,
+          "config": { "site": "KOUN", "product": "Reflectivity", "elevation": 1.5 }
+        },
+        { "id": "NwsAlerts", "enabled": true }
+      ]
+    },
+    {
+      "time_step_secs": 600,
+      "layer_slots": [
+        { "id": "Radar", "enabled": true, "config": { "product": "Velocity" } },
+        { "id": "Metar", "enabled": false }
+      ]
+    }
+  ]
+}
