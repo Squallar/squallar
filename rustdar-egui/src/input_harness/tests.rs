@@ -10965,6 +10965,80 @@ fn a_back_press_walks_the_full_wide_chain_in_order() {
     );
 }
 
+/// Put a Volume Alpha editor on screen, open, on a pane that is not the
+/// active one — the arm's harder half, since the chain must still find it.
+fn open_alpha_editor(h: &mut InputHarness) {
+    h.set_pane_count(2);
+    h.make_pane_volume(1);
+    h.gui_mut()
+        .pane_mut(1)
+        .expect("pane 1 exists")
+        .volume_mut()
+        .expect("pane 1 is a 3D pane")
+        .alpha_editor_open = true;
+    h.warm_up();
+}
+
+/// Whether pane `idx`'s Volume Alpha editor is open.
+fn alpha_editor_open(h: &mut InputHarness, idx: usize) -> bool {
+    h.gui_mut()
+        .pane(idx)
+        .expect("the pane exists")
+        .volume()
+        .expect("the pane is a 3D pane")
+        .alpha_editor_open
+}
+
+/// **The Volume Alpha editor is on the dismiss chain** — Escape and Android
+/// back close it, at both widths, and it yields to the modal above it.
+///
+/// `ui_fade.rs` already counted the editor as an open surface, so the fade
+/// invariant knew about it while the back chain did not: a window on screen
+/// that Escape could not reach.
+#[test]
+fn a_back_press_closes_the_volume_alpha_editor() {
+    for (name, mut h) in [
+        ("wide", InputHarness::with_screen(egui::vec2(1400.0, 900.0))),
+        ("phone", phone()),
+    ] {
+        open_alpha_editor(&mut h);
+        assert!(
+            alpha_editor_open(&mut h, 1),
+            "{name}: precondition: the editor is open"
+        );
+        assert!(
+            h.gui_mut().back_would_dismiss(),
+            "{name}: the predicate does not see the open editor"
+        );
+        assert!(h.gui_mut().dismiss_top_layer(), "{name}: the press acts");
+        h.warm_up();
+        assert!(
+            !alpha_editor_open(&mut h, 1),
+            "{name}: the press did not close the editor"
+        );
+        assert!(
+            !h.gui_mut().dismiss_top_layer(),
+            "{name}: one press closed one thing, and there was nothing under it"
+        );
+    }
+
+    // The modal above it goes first: one layer per press, in order.
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    open_alpha_editor(&mut h);
+    h.gui_mut().set_catalog_open_for_test(true);
+    h.warm_up();
+    assert!(h.gui_mut().dismiss_top_layer(), "the catalog is on top");
+    h.warm_up();
+    assert!(!h.catalog().open, "press 1 closes the catalog");
+    assert!(
+        alpha_editor_open(&mut h, 1),
+        "press 1 took the editor under the catalog with it"
+    );
+    assert!(h.gui_mut().dismiss_top_layer(), "the editor is next");
+    h.warm_up();
+    assert!(!alpha_editor_open(&mut h, 1), "press 2 closes the editor");
+}
+
 /// 65c. **The predicate and the act never disagree** — `back_would_dismiss()`
 ///     answers, for every state the chain above walks, exactly what
 ///     `dismiss_top_layer()` then does.
@@ -11086,13 +11160,14 @@ fn back_would_dismiss_agrees_with_dismiss_top_layer_in_every_ui_state() {
     // a `dismiss_top_layer` that closed the drawer. Measured — inverting the
     // drawer arm left the stacked walk GREEN. So each arm is also raised on its
     // own, where nothing below it can answer in its place.
-    let arms: [Rung; 7] = [
+    let arms: [Rung; 8] = [
         ("the catalog alone", |h| {
             h.gui_mut().set_catalog_open_for_test(true)
         }),
         ("the feature popup alone", |h| {
             h.gui_mut().overlays.selected_overlays = vec![std::sync::Arc::new(SheetStubFeature)]
         }),
+        ("the Volume Alpha editor alone", open_alpha_editor),
         ("the time dialog alone", |h| {
             h.gui_mut().set_time_dialog_open_for_test(true)
         }),
@@ -11195,6 +11270,30 @@ fn back_would_dismiss_agrees_with_dismiss_top_layer_in_every_ui_state() {
         had_not += 1;
     }
 
+    // The Volume Alpha editor on the phone, which is not a sheet page: the
+    // Compact branch carries its own arm below the sheet block, and the loop
+    // above cannot reach it.
+    let mut h = phone();
+    h.warm_up();
+    assert!(!paired(
+        &mut h,
+        "a fresh phone screen, before the editor is opened"
+    ));
+    had_not += 1;
+    open_alpha_editor(&mut h);
+    h.warm_up();
+    assert!(paired(
+        &mut h,
+        "the Volume Alpha editor alone, on the phone"
+    ));
+    had += 1;
+    h.warm_up();
+    assert!(!paired(
+        &mut h,
+        "the Volume Alpha editor alone, on the phone, after it was dismissed"
+    ));
+    had_not += 1;
+
     // The fade on its own, which no setter reaches — it is a click.
     let mut h = InputHarness::with_screen(egui::vec2(800.0, 1200.0));
     h.mouse_click(h.map_center());
@@ -11226,11 +11325,11 @@ fn back_would_dismiss_agrees_with_dismiss_top_layer_in_every_ui_state() {
     // would agree with a predicate that always answers `false`, and this test
     // would pass while proving nothing.
     assert!(
-        had >= 28,
+        had >= 30,
         "only {had} of the walked states had something for a press to close;          the matrix has stopped exercising the chain"
     );
     assert!(
-        had_not >= 31,
+        had_not >= 35,
         "only {had_not} of the walked states had nothing to close; a pair that          always answers `true` would survive this walk"
     );
 }
