@@ -675,6 +675,7 @@ impl Gui {
                 self.radar.site = config.site;
                 self.time_dialog.select(config.timestamp);
             }
+            GuiEvent::SelectedTime(timestamp) => self.time_dialog.select(timestamp),
             GuiEvent::ViewingLiveForPane { pane_idx, live } => {
                 if let Some(pane) = self.panes.get_mut(pane_idx) {
                     pane.viewing_live = live;

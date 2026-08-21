@@ -62,6 +62,14 @@ pub enum GuiEvent {
     Error(String),
     /// The radar config, with the Set Time dialog's strings kept in sync.
     RadarConfig(RadarConfig),
+    /// The time the shell has navigated to, with no claim about the site.
+    ///
+    /// [`GuiEvent::RadarConfig`] carries both, and exactly one of its senders
+    /// means both: `SwitchRadarSite`, which moves the app-wide site. The rest
+    /// were reading the global site back out of the `Gui` and handing it
+    /// straight back unchanged, so that the timestamp had something to travel
+    /// in -- which reads like three more writers of a field that has one.
+    SelectedTime(chrono::NaiveDateTime),
     /// Live/historic viewing mode for one pane.
     ViewingLiveForPane { pane_idx: usize, live: bool },
     /// Install what can draw 3D panes, or take it away.

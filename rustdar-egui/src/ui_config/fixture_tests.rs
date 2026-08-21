@@ -1387,6 +1387,49 @@ fn a_handler_is_told_the_site_this_pane_is_on_now() {
 /// corpus fixtures could not tell the arms apart because in every one of them
 /// the global and the pane already agree — so this test makes them disagree.
 ///
+/// Navigating in time says nothing about the site.
+///
+/// `GuiEvent::RadarConfig` carries a site and a timestamp, and exactly one of
+/// its senders means both: `SwitchRadarSite`. Three others were reading the
+/// global site out of the `Gui` and handing it straight back so the timestamp
+/// had something to travel in, which made a field with one writer look like it
+/// had four. They send `SelectedTime` now, and this is what stops the site
+/// creeping back into it.
+#[test]
+fn navigating_in_time_leaves_the_global_site_alone() {
+    let mut gui = Gui::new();
+    gui.apply(crate::shell_api::GuiEvent::RadarConfig(
+        crate::actions::RadarConfig {
+            site: "KDMX".to_string(),
+            timestamp: gui.selected_timestamp(),
+        },
+    ));
+    let before = gui.global_site().to_string();
+    assert_eq!(
+        before, "KDMX",
+        "precondition: the global site is what we set"
+    );
+
+    let moved = gui
+        .selected_timestamp()
+        .checked_sub_signed(chrono::Duration::hours(3))
+        .expect("representable");
+    gui.apply(crate::shell_api::GuiEvent::SelectedTime(moved));
+
+    assert_eq!(
+        gui.selected_timestamp(),
+        moved,
+        "precondition: the event must actually move the clock, or the \
+         assertion below is about nothing"
+    );
+    assert_eq!(
+        gui.global_site(),
+        before,
+        "navigating in time moved the app-wide site. Only an explicit site \
+         switch may do that",
+    );
+}
+
 /// The load half is not hypothetical: the Tier-2 browser rig pins its scene
 /// by seeding `{"site":"KTLX"}` and nothing else, and reaches pane 0 through
 /// exactly this path.
