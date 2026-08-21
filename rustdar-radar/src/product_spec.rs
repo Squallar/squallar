@@ -2,6 +2,7 @@
 //! field explicit.
 
 use crate::level3::VolumePick;
+use crate::sites::RadarNetwork;
 use crate::types::{MomentSlot, RadarProduct};
 use rustdar_units::Quantity;
 
@@ -60,6 +61,30 @@ pub(crate) struct RadarProductSpec {
     pub(crate) tilted: bool,
     /// The unit domain the product's values live in.
     pub(crate) quantity: Quantity,
+    /// The networks whose data can produce this product, stated per row.
+    ///
+    /// **No default and no wildcard**: availability is a fact about an
+    /// instrument, so every registration says it. Three reasons a row is
+    /// `Wsr88d`-only, all measured:
+    ///
+    /// * **Level III** — the object is made by an RPG and only the WSR-88D
+    ///   network has one. A TDWR is served by the Supplemental Product
+    ///   Generator, whose short list contains none of the four AWIPS codes this
+    ///   app fetches (`N0K`, `EET`, `DVL`, `DPR`), checked 2026-08-11 against
+    ///   `PIT`, `OKC`, `MIA` and `DCA`.
+    /// * **Dual-pol moments** — a TDWR is single-pol, so ΦDP, ρHV and Z<sub>DR</sub>
+    ///   are not in its radials at all.
+    /// * **Dual-pol derived** — hydrometeor classification reads ΦDP and ρHV,
+    ///   so it cannot exist where they do not.
+    ///
+    /// The eight that remain are the eight a terminal radar can draw.
+    ///
+    /// **Only the Level III arm of `discover_product_elevations` consults
+    /// this.** The dual-pol rows are stated because they are true, not because
+    /// anything reads them: the volume already excludes those moments by not
+    /// carrying them, and duplicating that exclusion here would be a second
+    /// implementation of one rule.
+    pub(crate) available_networks: &'static [RadarNetwork],
 }
 
 /// The registration for `p`.
@@ -81,6 +106,7 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             domain_suffix: " dBZ",
             tilted: true,
             quantity: Quantity::Unitless { label: "dBZ" },
+            available_networks: &[RadarNetwork::Wsr88d, RadarNetwork::Tdwr],
         },
         RadarProduct::Velocity => RadarProductSpec {
             code: "vel",
@@ -98,6 +124,7 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             domain_suffix: " m/s",
             tilted: true,
             quantity: Quantity::SpeedMps,
+            available_networks: &[RadarNetwork::Wsr88d, RadarNetwork::Tdwr],
         },
         RadarProduct::SpectrumWidth => RadarProductSpec {
             code: "sw",
@@ -115,6 +142,7 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             domain_suffix: " m/s",
             tilted: true,
             quantity: Quantity::SpeedMps,
+            available_networks: &[RadarNetwork::Wsr88d, RadarNetwork::Tdwr],
         },
         RadarProduct::DifferentialPhase => RadarProductSpec {
             code: "phi",
@@ -132,6 +160,7 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             domain_suffix: "\u{b0}",
             tilted: true,
             quantity: Quantity::Unitless { label: "\u{00b0}" },
+            available_networks: &[RadarNetwork::Wsr88d],
         },
         RadarProduct::CorrelationCoefficient => RadarProductSpec {
             code: "rho",
@@ -149,6 +178,7 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             domain_suffix: "",
             tilted: true,
             quantity: Quantity::Unitless { label: "CC" },
+            available_networks: &[RadarNetwork::Wsr88d],
         },
         RadarProduct::DifferentialReflectivity => RadarProductSpec {
             code: "zdr",
@@ -166,6 +196,7 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             domain_suffix: " dB",
             tilted: true,
             quantity: Quantity::Unitless { label: "dB" },
+            available_networks: &[RadarNetwork::Wsr88d],
         },
         RadarProduct::StormRelativeVelocity => RadarProductSpec {
             code: "srv",
@@ -186,6 +217,7 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             domain_suffix: " m/s",
             tilted: true,
             quantity: Quantity::SpeedMps,
+            available_networks: &[RadarNetwork::Wsr88d, RadarNetwork::Tdwr],
         },
         RadarProduct::SpecificDifferentialPhase => RadarProductSpec {
             code: "kdp",
@@ -205,6 +237,7 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             quantity: Quantity::Unitless {
                 label: "\u{00b0}/km",
             },
+            available_networks: &[RadarNetwork::Wsr88d],
         },
         RadarProduct::EchoTops => RadarProductSpec {
             code: "eet",
@@ -222,6 +255,7 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             domain_suffix: "",
             tilted: false,
             quantity: Quantity::HeightKft,
+            available_networks: &[RadarNetwork::Wsr88d],
         },
         RadarProduct::EchoTopsInterpolated => RadarProductSpec {
             code: "eti",
@@ -242,6 +276,7 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             domain_suffix: "",
             tilted: false,
             quantity: Quantity::HeightKft,
+            available_networks: &[RadarNetwork::Wsr88d, RadarNetwork::Tdwr],
         },
         RadarProduct::VerticallyIntegratedLiquid => RadarProductSpec {
             code: "vil",
@@ -261,6 +296,7 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             quantity: Quantity::Unitless {
                 label: "kg/m\u{00b2}",
             },
+            available_networks: &[RadarNetwork::Wsr88d],
         },
         RadarProduct::VilDensity => RadarProductSpec {
             code: "vild",
@@ -283,6 +319,7 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             quantity: Quantity::Unitless {
                 label: "g/m\u{00b3}",
             },
+            available_networks: &[RadarNetwork::Wsr88d],
         },
         RadarProduct::ProbabilityOfSevereHail => RadarProductSpec {
             code: "posh",
@@ -302,6 +339,7 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             domain_suffix: "",
             tilted: false,
             quantity: Quantity::Unitless { label: "%" },
+            available_networks: &[RadarNetwork::Wsr88d, RadarNetwork::Tdwr],
         },
         RadarProduct::MaxExpectedHailSize => RadarProductSpec {
             code: "mehs",
@@ -321,6 +359,7 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             domain_suffix: "",
             tilted: false,
             quantity: Quantity::HailSizeIn,
+            available_networks: &[RadarNetwork::Wsr88d, RadarNetwork::Tdwr],
         },
         RadarProduct::HydrometeorClassification => RadarProductSpec {
             code: "hhc",
@@ -343,6 +382,7 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             domain_suffix: "",
             tilted: true,
             quantity: Quantity::Unitless { label: "HHC" },
+            available_networks: &[RadarNetwork::Wsr88d],
         },
         RadarProduct::PrecipitationRate => RadarProductSpec {
             code: "dpr",
@@ -363,6 +403,7 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             domain_suffix: "",
             tilted: false,
             quantity: Quantity::PrecipRateInPerHr,
+            available_networks: &[RadarNetwork::Wsr88d],
         },
         RadarProduct::NormalizedRotation => RadarProductSpec {
             code: "nrot",
@@ -383,6 +424,7 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
             domain_suffix: "",
             tilted: true,
             quantity: Quantity::Unitless { label: "NROT" },
+            available_networks: &[RadarNetwork::Wsr88d, RadarNetwork::Tdwr],
         },
     }
 }
@@ -390,6 +432,66 @@ pub(crate) const fn spec(p: RadarProduct) -> RadarProductSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Every registration answers for every network, and WSR-88D is
+    /// true for all seventeen — the behaviour-neutrality pin.**
+    ///
+    /// The walk is over `RadarProduct::all()`, so a product added without an
+    /// `available_networks` row cannot compile, and one added with an empty row
+    /// fails here rather than quietly becoming unavailable everywhere.
+    #[test]
+    fn every_product_states_its_availability_and_wsr88d_gets_all_of_them() {
+        let all = RadarProduct::all();
+        assert_eq!(all.len(), 17, "the registry's size moved");
+
+        for product in all {
+            let networks = spec(*product).available_networks;
+            assert!(
+                !networks.is_empty(),
+                "{product:?} states no network at all, so it is available nowhere",
+            );
+            assert!(
+                product.available_for(RadarNetwork::Wsr88d),
+                "{product:?} left the WSR-88D network -- this campaign's seam is \
+                 behaviour-neutral for WSR-88D and that is a pin, not a preference",
+            );
+        }
+    }
+
+    /// **The eight a terminal radar can draw**, as a literal list checked
+    /// against the registry — the second spelling, so neither side can rot
+    /// alone. Nine products are WSR-88D-only: five Level III objects a TDWR's
+    /// generator does not publish, three dual-pol moments a single-pol radar
+    /// does not measure, and the classification derived from two of them.
+    #[test]
+    fn a_terminal_radar_offers_the_eight_it_can_draw() {
+        const TDWR_CAN_DRAW: [&str; 8] = ["ref", "vel", "sw", "srv", "eti", "posh", "mehs", "nrot"];
+
+        let offered: Vec<&str> = RadarProduct::all()
+            .iter()
+            .filter(|p| p.available_for(RadarNetwork::Tdwr))
+            .map(|p| p.code())
+            .collect();
+
+        assert_eq!(offered, TDWR_CAN_DRAW, "the terminal radar's list moved");
+
+        // The nine that are not, split by the reason each is excluded, so a
+        // row moving between reasons is visible rather than absorbed.
+        let withheld: Vec<&str> = RadarProduct::all()
+            .iter()
+            .filter(|p| !p.available_for(RadarNetwork::Tdwr))
+            .map(|p| p.code())
+            .collect();
+        assert_eq!(withheld.len(), 9, "{withheld:?}");
+        assert_eq!(
+            RadarProduct::all()
+                .iter()
+                .filter(|p| p.is_level3() && !p.available_for(RadarNetwork::Tdwr))
+                .count(),
+            5,
+            "the five Level III objects are the half the L3 arm applies",
+        );
+    }
     use rustdar_units::{HailSizeUnit, HeightUnit, PrecipRateUnit, SpeedUnit, UserPreferences};
     use std::collections::HashSet;
 
