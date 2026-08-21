@@ -15,6 +15,7 @@ const TILT: f32 = 0.5;
 fn site() -> RadarSite {
     RadarSite {
         name: SITE,
+        network: rustdar_radar::sites::RadarNetwork::of_id(SITE),
         lat: 35.33306,
         lon: -97.2775,
         heights: None,

@@ -85,12 +85,69 @@ pub enum SiteHeights {
     GroundOnly { ground_ft: i32 },
 }
 
+/// Which radar network an identifier names.
+///
+/// **This classifies an IDENTIFIER, not a compiled list.** The `T` prefix rule
+/// below is a function of four bytes; it is deliberately *not* a table of the
+/// 45 terminal radars, because a binary that carries a list of the network is
+/// a binary whose list is wrong for the rest of its life. The site table
+/// itself stays learned — `SiteTable` starts empty and answers `None` until a
+/// decoded volume or the fetched catalogue says otherwise — and this enum adds
+/// nothing to it. The count "45" describes the network as it stood when it was
+/// last counted; it does not describe this build, and no code reads it.
+///
+/// The identifier rule is an offline approximation of a fact the API states:
+/// `api.weather.gov/radar/stations` gives a `stationType` per station, and the
+/// prefix is what this crate can answer without it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum RadarNetwork {
+    /// The WSR-88D network: dual-pol moments, 0.5° radials, and every Level III
+    /// code this app fetches.
+    Wsr88d,
+    /// The Terminal Doppler Weather Radar network: single-pol, 1.0° radials,
+    /// and legacy Level III codes this app does not fetch.
+    Tdwr,
+}
+
+impl RadarNetwork {
+    /// The network an ICAO identifier names.
+    ///
+    /// The `T` prefix identifies the TDWRs, with one exception a naive
+    /// `starts_with('T')` gets wrong: `TJUA` is San Juan's WSR-88D. Anything
+    /// that is not a terminal identifier — including an empty string and
+    /// [`UNKNOWN_SITE_NAME`] — is [`Wsr88d`](Self::Wsr88d), which is exactly
+    /// what the tree answered before this enum existed.
+    ///
+    /// A `const fn` so a `const` site fixture can call it; the rule is spelled
+    /// over bytes for that reason alone, and
+    /// `of_id_is_the_prefix_rule_it_replaced` holds it byte-for-byte against
+    /// the `starts_with('T') && != "TJUA"` expression it was moved from.
+    pub const fn of_id(site: &str) -> Self {
+        let bytes = site.as_bytes();
+        if bytes.is_empty() || bytes[0] != b'T' {
+            return Self::Wsr88d;
+        }
+        if bytes.len() == 4 && bytes[1] == b'J' && bytes[2] == b'U' && bytes[3] == b'A' {
+            return Self::Wsr88d;
+        }
+        Self::Tdwr
+    }
+}
+
 /// `PartialEq` because [`extended`] compares the row a fix would produce
 /// against the row already in the table, and builds nothing when they are
 /// equal.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RadarSite {
     pub name: &'static str,
+    /// Which network this radar belongs to.
+    ///
+    /// Always [`RadarNetwork::of_id`] of [`name`](Self::name) — there is no
+    /// other legal source, and `every_row_carries_the_network_its_name_implies`
+    /// says so as a test. Equal names therefore imply equal networks, which is
+    /// why adding this field leaves the derived `PartialEq` above meaning
+    /// exactly what it meant before.
+    pub network: RadarNetwork,
     pub lat: f64,
     pub lon: f64,
     /// The heights this row records, or `None` if it records none.
@@ -339,6 +396,7 @@ impl SiteFix {
                 elevation_m,
             } => Some(RadarSite {
                 name,
+                network: RadarNetwork::of_id(name),
                 lat: crate::site_position::degrees_from_micro(lat_udeg),
                 lon: crate::site_position::degrees_from_micro(lon_udeg),
                 heights: known.or(Some({
@@ -610,14 +668,14 @@ impl RadarSite {
     /// the four codes [`crate::level3`] fetches — checked 2026-08-11 by listing
     /// that bucket for `PIT`, `OKC`, `MIA` and `DCA`. See [`is_tdwr_id`].
     pub fn is_tdwr(&self) -> bool {
-        is_tdwr_id(self.name)
+        matches!(self.network, RadarNetwork::Tdwr)
     }
 
     /// Whether this site is a WSR-88D — the network with dual-pol moments,
     /// 0.5° radials, and every Level III code this app fetches. The question
     /// to ask before offering anything that needs one.
     pub fn is_wsr88d(&self) -> bool {
-        !self.is_tdwr()
+        matches!(self.network, RadarNetwork::Wsr88d)
     }
 
     /// Whether this site runs an operational scan an ordinary viewer can rely on.
@@ -633,12 +691,12 @@ impl RadarSite {
 
 /// Whether an identifier names a Terminal Doppler Weather Radar.
 ///
-/// The `T` prefix identifies the TDWRs — 45 of them when the network was last
-/// counted — with one exception a naive `starts_with('T')` gets wrong: `TJUA`
-/// is San Juan's WSR-88D. A free function over a bare `&str`, because a radar
-/// this process knows of and cannot place has no row to ask.
+/// The rule itself lives on [`RadarNetwork::of_id`]; this is the boolean
+/// spelling of it. A free function over a bare `&str`, because a radar this
+/// process knows of and cannot place has no row to ask — `TPBI` is the case,
+/// and [`SiteTable::static_name`] is how the unplaced members reach here.
 pub fn is_tdwr_id(site: &str) -> bool {
-    site.starts_with('T') && site != "TJUA"
+    matches!(RadarNetwork::of_id(site), RadarNetwork::Tdwr)
 }
 
 /// Whether an identifier is made of the bytes identifier handling assumes:
@@ -1016,6 +1074,94 @@ mod tests {
             (30..=115).contains(&gap),
             "{gap} ft is not a tower — the nominal has left the range of real \
              ones and a catalogue-placed site is no longer plausibly placed",
+        );
+    }
+
+    // -- the network an identifier names -----------------------------------
+
+    /// The rule [`RadarNetwork::of_id`] was moved from, kept here as an
+    /// independent oracle: this is the expression `is_tdwr_id` carried before
+    /// the enum existed, byte-for-byte.
+    fn the_prefix_rule_as_it_was_written(site: &str) -> bool {
+        site.starts_with('T') && site != "TJUA"
+    }
+
+    #[test]
+    fn of_id_is_the_prefix_rule_it_replaced() {
+        // Real identifiers, the exception, the near-misses that would fool a
+        // length-blind or a prefix-blind spelling, and the degenerate inputs a
+        // hand-edited config can produce.
+        let ids = [
+            "KTLX", "KOUN", "KMPX", "KCRI", "PABC", "TJUA", "TPBI", "TOKC", "TDCA", "TMIA", "T",
+            "TJ", "TJU", "TJUAX", "TJUB", "tjua", "tTLX", "UNKNOWN", "", " ", "XTJUA",
+        ];
+        for id in ids {
+            let expected = the_prefix_rule_as_it_was_written(id);
+            assert_eq!(
+                RadarNetwork::of_id(id) == RadarNetwork::Tdwr,
+                expected,
+                "of_id disagrees with the rule it was moved from, on {id:?}",
+            );
+            assert_eq!(is_tdwr_id(id), expected, "the delegate drifted, on {id:?}");
+        }
+        // The oracle has to separate the two answers, or the loop above is a
+        // walk over one constant.
+        assert!(ids.iter().any(|id| the_prefix_rule_as_it_was_written(id)));
+        assert!(ids.iter().any(|id| !the_prefix_rule_as_it_was_written(id)));
+    }
+
+    /// The serde spellings are persisted by [`crate::catalogue`]'s position
+    /// cache, so they are a wire format, not an implementation detail.
+    #[test]
+    fn the_networks_serde_spellings_are_pinned() {
+        for (network, spelling) in [
+            (RadarNetwork::Wsr88d, "\"Wsr88d\""),
+            (RadarNetwork::Tdwr, "\"Tdwr\""),
+        ] {
+            let json = serde_json::to_string(&network).expect("a unit variant serializes");
+            assert_eq!(json, spelling, "the spelling on the wire moved");
+            assert_eq!(
+                serde_json::from_str::<RadarNetwork>(&json).expect("and reads back"),
+                network,
+            );
+        }
+    }
+
+    /// Every row's network is a function of its name and of nothing else —
+    /// which is what makes the derived `PartialEq` on [`RadarSite`] mean the
+    /// same thing it meant before the field existed.
+    #[test]
+    fn every_row_carries_the_network_its_name_implies() {
+        let table = build_table([
+            ("ZZZA", learned(-30_000_000, -140_000_000, 100, 20)),
+            ("TZZB", learned_single_height(-10_000_000, -140_000_000, 60)),
+            ("ZZZC", network(-20_000_000, -140_000_000, 400)),
+            ("TZZD", network(-40_000_000, -140_000_000, 400)),
+            ("TJUA", network(18_000_000, -66_000_000, 100)),
+            ("TZZE", SiteFix::Unplaced),
+        ]);
+
+        for row in table.rows() {
+            assert_eq!(
+                row.network,
+                RadarNetwork::of_id(row.name),
+                "{} carries a network its name does not imply",
+                row.name,
+            );
+            assert_eq!(row.is_tdwr(), is_tdwr_id(row.name), "{}", row.name);
+            assert_eq!(row.is_wsr88d(), !row.is_tdwr(), "{}", row.name);
+        }
+
+        // Both answers appear, so the walk above cannot pass by agreeing with
+        // one constant. `TJUA` is here because it is the one identifier that
+        // makes the two spellings of the rule differ.
+        let networks: Vec<RadarNetwork> = table.rows().iter().map(|r| r.network).collect();
+        assert!(networks.contains(&RadarNetwork::Wsr88d), "{networks:?}");
+        assert!(networks.contains(&RadarNetwork::Tdwr), "{networks:?}");
+        assert_eq!(
+            table.get("TJUA").expect("a placed row").network,
+            RadarNetwork::Wsr88d,
+            "the exception is the whole reason the rule is not `starts_with`",
         );
     }
 

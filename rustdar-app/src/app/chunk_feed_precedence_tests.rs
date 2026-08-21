@@ -48,6 +48,7 @@ fn app_showing(shown: chrono::NaiveDateTime) -> App {
             site_position: None,
             site: rustdar_radar::sites::RadarSite {
                 name: "KTLX",
+                network: rustdar_radar::sites::RadarNetwork::of_id("KTLX"),
                 lat: 35.3,
                 lon: -97.3,
                 heights: None,
@@ -688,6 +689,7 @@ fn add_live_pane(app: &mut App, shown: chrono::NaiveDateTime) {
             site_position: None,
             site: rustdar_radar::sites::RadarSite {
                 name: "KTLX",
+                network: rustdar_radar::sites::RadarNetwork::of_id("KTLX"),
                 lat: 35.3,
                 lon: -97.3,
                 heights: None,

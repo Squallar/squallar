@@ -325,6 +325,7 @@ fn pane_with_volume(site: &str) -> rustdar_egui::pane::PaneState {
             .cloned()
             .unwrap_or(rustdar_radar::sites::RadarSite {
                 name: "KMPX",
+                network: rustdar_radar::sites::RadarNetwork::of_id("KMPX"),
                 lat: 44.849,
                 lon: -93.565,
                 heights: None,

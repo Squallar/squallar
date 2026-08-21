@@ -85,6 +85,7 @@ fn loop_on(ctx: &egui::Context, site: &'static str, textured: &[usize]) -> Layer
         3600,
         &RadarSite {
             name: site,
+            network: rustdar_radar::sites::RadarNetwork::of_id(site),
             lat: 35.0,
             lon: -97.0,
             heights: None,

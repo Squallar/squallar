@@ -156,6 +156,7 @@ impl SitePosition {
     ) -> RadarSite {
         RadarSite {
             name,
+            network: crate::sites::RadarNetwork::of_id(name),
             lat: self.lat(),
             lon: self.lon(),
             heights: Some(self.heights_over(table_heights)),

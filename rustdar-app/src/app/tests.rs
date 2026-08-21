@@ -3199,6 +3199,7 @@ fn a_listing_that_arrives_on_the_source_path_builds_the_loop_waiting_for_it() {
     /// test mean one thing alone and another beside its neighbours.
     const SITE: rustdar_radar::sites::RadarSite = rustdar_radar::sites::RadarSite {
         name: "KTLX",
+        network: rustdar_radar::sites::RadarNetwork::of_id("KTLX"),
         lat: 35.33,
         lon: -97.27,
         heights: None,
@@ -3354,6 +3355,7 @@ fn a_hidden_panes_loop_is_still_built_from_the_site_it_is_on_now() {
     /// test mean one thing alone and another beside its neighbours.
     const KOUN: rustdar_radar::sites::RadarSite = rustdar_radar::sites::RadarSite {
         name: "KOUN",
+        network: rustdar_radar::sites::RadarNetwork::of_id("KOUN"),
         lat: 35.23,
         lon: -97.46,
         heights: None,
@@ -3462,6 +3464,7 @@ fn a_listing_for_one_site_leaves_another_sites_pane_waiting() {
 
     const KOUN: rustdar_radar::sites::RadarSite = rustdar_radar::sites::RadarSite {
         name: "KOUN",
+        network: rustdar_radar::sites::RadarNetwork::of_id("KOUN"),
         lat: 35.23,
         lon: -97.46,
         heights: None,
@@ -3543,6 +3546,7 @@ fn a_listing_over_one_window_does_not_build_a_loop_asking_about_another() {
 
     const SITE: rustdar_radar::sites::RadarSite = rustdar_radar::sites::RadarSite {
         name: "KTLX",
+        network: rustdar_radar::sites::RadarNetwork::of_id("KTLX"),
         lat: 35.33,
         lon: -97.27,
         heights: None,

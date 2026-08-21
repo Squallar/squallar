@@ -412,6 +412,7 @@ fn gui_on_tilt(
         site_position: None,
         site: RadarSite {
             name: "KOUN",
+            network: rustdar_radar::sites::RadarNetwork::of_id("KOUN"),
             lat: 35.2,
             lon: -97.4,
             heights: None,

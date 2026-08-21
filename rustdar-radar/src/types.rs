@@ -337,11 +337,15 @@ impl ScanInfo {
                     "no position for radar site '{site}': it is in no table row, \
                      its volume states none, and nothing was learned for it",
                 );
-                RadarSite {
-                    name: known_name.unwrap_or(crate::sites::UNKNOWN_SITE_NAME),
-                    lat: 0.0,
-                    lon: 0.0,
-                    heights: None,
+                {
+                    let name = known_name.unwrap_or(crate::sites::UNKNOWN_SITE_NAME);
+                    RadarSite {
+                        name,
+                        network: crate::sites::RadarNetwork::of_id(name),
+                        lat: 0.0,
+                        lon: 0.0,
+                        heights: None,
+                    }
                 }
             }
         };
