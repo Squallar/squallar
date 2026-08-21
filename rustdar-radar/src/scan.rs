@@ -1,6 +1,7 @@
 use chrono::{Duration, NaiveDateTime, NaiveTime};
 
 use crate::archive::Identifier;
+use crate::sites::RadarNetwork;
 use nexrad_model::data::Scan;
 
 /// Errors from locating, downloading or decoding an archive scan.
@@ -239,8 +240,50 @@ fn fold_contributions(
 /// [`decoded`] over a [`nexrad_data::volume::File`] built from `bytes`, which is
 /// the same walk every download below ends in — one pass, both the `Scan` and
 /// the declared Nyquist table, off the same decompressed records.
+///
+/// # The seam
+///
+/// **This is the one place a volume's network chooses how it is decoded**, and
+/// today both arms choose the same routine. It is named rather than implied
+/// because of what sits behind it: **anything that produces a [`DecodedScan`]
+/// inherits the entire downstream pipeline** — render, derive, voxel, xsect,
+/// hover and the loop paths, every one of them digest-pinned and none of them
+/// asking which instrument the volume came off. A working TDWR decoder is
+/// therefore *one function* away from the whole application once
+/// [`crate::sites::RadarNetwork`]'s spike list closes; nothing above this line
+/// has to learn a second source.
+///
+/// The classification is [`RadarNetwork::of_id`] over the volume header's ICAO.
+/// A file with no header, or a header with no ICAO, classifies as
+/// [`RadarNetwork::Wsr88d`] — which is what this function answered before the
+/// match existed, and is why adding it changes no behaviour.
+///
+/// **What is pinned and what is not**, because the difference matters to
+/// whoever fills the arm in. `both_network_arms_decode_a_volume_to_the_same_answer`
+/// pins that *each arm decodes*, and `of_id_is_the_prefix_rule_it_replaced` pins
+/// the rule. Nothing pins that this function applies that rule *to the header*:
+/// with both arms calling one routine the choice is unobservable from outside,
+/// and hardcoding either arm passes every test in the tree — measured, not
+/// assumed. That remainder closes itself the moment the arms diverge, and it is
+/// left open rather than answered with a log-capture harness built for one
+/// `debug!` line.
 pub fn decode_bytes(bytes: Vec<u8>) -> Result<DecodedScan> {
-    decoded(&nexrad_data::volume::File::new(bytes))
+    let file = nexrad_data::volume::File::new(bytes);
+    let icao = file.header().and_then(|h| h.icao_of_radar());
+    match RadarNetwork::of_id(icao.as_deref().unwrap_or("")) {
+        RadarNetwork::Wsr88d => decoded(&file),
+        RadarNetwork::Tdwr => {
+            // Once per volume, never per radial. The plug-in point for a real
+            // TDWR decoder is this arm; what it has to fix first is the spike
+            // list on `RadarNetwork`, item 1 above all.
+            log::debug!(
+                "decoding a TDWR volume ({}): WSR-88D framing routine; Message-31 \
+                 padding defect stands (features.md, TDWR entry)",
+                icao.as_deref().unwrap_or("no ICAO"),
+            );
+            decoded(&file)
+        }
+    }
 }
 
 pub(crate) async fn list_files(site: &str, date: &chrono::NaiveDate) -> Result<Vec<Identifier>> {

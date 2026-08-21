@@ -102,6 +102,48 @@ pub enum SiteHeights {
 /// including the ones no station record places.
 /// `the_prefix_rule_agrees_with_the_api_on_every_placed_station` is what keeps
 /// the two from drifting apart in silence.
+///
+/// # What is network-scoped in this crate
+///
+/// **TDWR volumes do not ship.** The picker offers terminal radars and the
+/// archive holds their volumes, but what comes back does not draw as a sweep —
+/// see `features.md`'s TDWR entry. This list is the map an implementor follows,
+/// written so nobody has to rediscover it:
+///
+/// * **Decoder** — [`crate::scan::decode_bytes`] is the one dispatch point, and
+///   both arms call the same routine today. Everything downstream of a
+///   `DecodedScan` is network-agnostic and digest-pinned.
+/// * **VCP semantics** — `ScanInfo`'s `vcp_number`, the live cut-merge in
+///   [`crate::current`] and the chunk assembly in [`crate::chunks`] are all
+///   written against WSR-88D coverage patterns.
+/// * **Product availability** — the crate-internal `product_spec` registry
+///   states which products a network can serve; the Level III arm of
+///   `discover_product_elevations` is where that claim is applied.
+/// * **Height datum** — [`SiteHeights::FeedhornOnly`] is what a TDWR's single
+///   reported height becomes, and which datum that figure is on is **not
+///   settled** (one volume, `TORD`, and it is consistent with both readings).
+///   [`NOMINAL_TOWER_M`]'s argument is WSR-88D-only by construction.
+/// * **Nyquist** — every TDWR volume declares `nyquist_velocity = 0`, which
+///   [`crate::nyquist::DeclaredNyquist::declare`] refuses (a fold limit must be
+///   finite and positive), so a TDWR velocity field falls to the estimator.
+///   Dealiasing for the network is an open question, measured over 22 volumes
+///   at 10 sites.
+/// * **Radial geometry** — 1.0° radials rather than 0.5°; Doppler cuts to
+///   ~89 km (592 gates of 150 m, read off `TPIT`) beside one surveillance cut
+///   to ~417 km (1,390 of 300 m).
+/// * **Level III** — legacy single-pol codes only (`TZL`, `TZ0`-`TZ2`,
+///   `TV0`-`TV2`, `NCR`, `NHI`, `NMD`); not one of the four codes this app
+///   fetches exists for a terminal radar, checked 2026-08-11 against `PIT`,
+///   `OKC`, `MIA` and `DCA`.
+/// * **Picker** — the site list groups by network and reads this value.
+///
+/// # The spike, post-campaign — see the register
+///
+/// 1. vendored Message-31 padding fix vs real `_V08` volumes;
+/// 2. `DeclaredNyquist`-refuses-zero dealiasing story;
+/// 3. height-table applicability (a TDWR reports one height twice);
+/// 4. meaningful moments at 417 km / legacy L3 codes;
+/// 5. end-to-end app path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum RadarNetwork {
     /// The WSR-88D network: dual-pol moments, 0.5° radials, and every Level III
