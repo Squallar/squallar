@@ -1502,7 +1502,7 @@ impl Gui {
         self.time_dialog.show = open;
     }
 
-    /// Open or close the Add-layer catalog directly, for fixtures.
+    /// Open or close the layer catalog directly, for fixtures.
     #[cfg(test)]
     pub(crate) fn set_catalog_open_for_test(&mut self, open: bool) {
         self.catalog_open = open;

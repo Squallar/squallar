@@ -791,7 +791,7 @@ impl InputHarness {
         self.gui.ui_faded_for_test()
     }
 
-    /// What the last frame's Add-layer catalog drew.
+    /// What the last frame's layer catalog drew.
     pub(crate) fn catalog(&self) -> crate::ui::CatalogProbe {
         self.gui.catalog_for_test().clone()
     }
@@ -809,8 +809,8 @@ impl InputHarness {
             .find(|tile| tile.group == group && tile.label == label)
     }
 
-    /// Open the Add-layer catalog the user's way: the stack's top
-    /// `+ Add layer` button. Asserts it really opened.
+    /// Open the layer catalog the user's way: the stack's top
+    /// `+ Show a layer` button. Asserts it really opened.
     pub(crate) fn open_catalog(&mut self) {
         if self.catalog().open {
             return;
@@ -819,13 +819,13 @@ impl InputHarness {
         let add = self.stack().add_top;
         assert!(
             add.is_positive(),
-            "the stack drew no Add-layer button to open the catalog with"
+            "the stack drew no catalog button to open the catalog with"
         );
         self.mouse_click(add.center());
         self.warm_up();
         assert!(
             self.catalog().open,
-            "clicking + Add layer did not open the catalog"
+            "clicking + Show a layer did not open the catalog"
         );
     }
 
