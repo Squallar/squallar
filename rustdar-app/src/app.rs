@@ -135,26 +135,10 @@ pub struct App {
     loop_pool_state: crate::loop_pool::LoopPoolState,
     /// Whether [`Self::loop_pool`] is already the answer for this machine.
     loop_pool_sized: bool,
-    /// The decoded Level II volume each pane's static render draws from, by site.
-    scan_data: std::collections::HashMap<
-        String,
-        (
-            Arc<nexrad_model::data::Scan>,
-            Arc<rustdar_radar::nyquist::DeclaredNyquist>,
-        ),
-    >,
-    /// The most recent **complete** volume for each site, with the time its first radial
-    /// was collected — the base of the current merged volume
-    /// ([`rustdar_radar::current::resolve`]) that sections, the 3D view and every other
-    /// whole-volume reader stand on.
-    base_scans: HashMap<
-        String,
-        (
-            Arc<nexrad_model::data::Scan>,
-            Arc<rustdar_radar::nyquist::DeclaredNyquist>,
-            chrono::NaiveDateTime,
-        ),
-    >,
+    /// The site-keyed decoded volumes: what each pane's static render draws, and
+    /// each site's merge base. One owner, asked by name rather than indexed —
+    /// see [`crate::volume_inventory`].
+    pub(crate) volumes: crate::volume_inventory::VolumeInventory,
     input: InputHandler,
     channels: ChannelHub,
     render: RenderDispatcher,
@@ -440,8 +424,7 @@ impl App {
                 crate::loop_pool::LoopFrameModel::from_budgets(&budgets),
             ),
             loop_pool_sized: loop_pool_memo.is_some(),
-            scan_data: std::collections::HashMap::new(),
-            base_scans: HashMap::new(),
+            volumes: crate::volume_inventory::VolumeInventory::default(),
             input,
             channels,
             render,
@@ -903,9 +886,8 @@ impl App {
             .is_some_and(|stamp| stamp.newest == target.volume.collected);
         let navigated = !live
             && self
-                .base_scans
-                .get(&target.volume.site)
-                .is_some_and(|(_, _, held)| *held == target.volume.collected);
+                .volumes
+                .base_is_from(&target.volume.site, target.volume.collected);
         if !live
             && !navigated
             && !self
@@ -1104,10 +1086,7 @@ impl App {
         self.volume_extractions
             .set(self.volume_extractions.get() + 1);
         let radar = rustdar_radar::sites::get_radar_site(site)?;
-        let base = self
-            .base_scans
-            .get(site)
-            .map(|(scan, declared, _)| (Arc::clone(scan), Arc::clone(declared)));
+        let base = self.volumes.base_for(site);
         let overlay = merge_live
             .then(|| self.chunk_feeds.snapshot(site))
             .flatten();
@@ -1143,10 +1122,7 @@ impl App {
         site: &str,
         product: rustdar_radar::types::RadarProduct,
     ) -> Option<u64> {
-        let base = self
-            .base_scans
-            .get(site)
-            .map(|(scan, declared, _)| (Arc::clone(scan), Arc::clone(declared)));
+        let base = self.volumes.base_for(site);
         let overlay = self.chunk_feeds.snapshot(site);
         rustdar_radar::current::resolve(
             base.as_ref()
@@ -1161,12 +1137,7 @@ impl App {
     /// The stamp of `site`'s current merged volume: the newest data time (its identity,
     /// advanced by every sealed sweep) and the base volume's start where one contributes.
     fn current_volume_stamp(&mut self, site: &str) -> Option<rustdar_egui::CurrentVolumeStamp> {
-        let base = self
-            .base_scans
-            .get(site)
-            .map(|(scan, declared, collected)| {
-                (Arc::clone(scan), Arc::clone(declared), *collected)
-            });
+        let base = self.volumes.base_with_time(site);
         let overlay = self.chunk_feeds.snapshot(site);
         let current = rustdar_radar::current::resolve(
             base.as_ref()
@@ -1331,12 +1302,10 @@ impl App {
                             && fetch::latest_scan_time_for_site(self.gui.panes(), &site)
                                 .is_some_and(|shown| timestamp <= shown);
 
-                        let advances_the_base = self
-                            .base_scans
-                            .get(&site)
-                            .is_none_or(|(_, _, held)| scan_info.timestamp > *held);
+                        let advances_the_base =
+                            self.volumes.base_advances_to(&site, scan_info.timestamp);
                         if advances_the_base || !feed_is_ahead {
-                            self.base_scans.insert(
+                            self.volumes.install_base(
                                 site.clone(),
                                 (
                                     Arc::clone(&scan_arc),
@@ -1380,7 +1349,7 @@ impl App {
                             self.gui.clear_loading_site_for_site(&site);
                         } else {
                             log::info!("Received scan data from background thread");
-                            self.scan_data.insert(
+                            self.volumes.install_still(
                                 site.clone(),
                                 (Arc::clone(&scan_arc), Arc::clone(&declared_nyquist)),
                             );
@@ -1513,7 +1482,7 @@ impl App {
     /// moment WO-M14c dispatches a 3D build at, and it is derivable only here,
     /// where the previous stamp is still in hand to compare against.
     fn publish_base_volumes(&mut self) -> HashMap<String, rustdar_egui::CurrentVolumeStamp> {
-        let mut sites: Vec<String> = self.base_scans.keys().cloned().collect();
+        let mut sites: Vec<String> = self.volumes.sites_with_base().map(str::to_owned).collect();
         for site in self.gui.live_sites() {
             if !sites.contains(&site) {
                 sites.push(site);
@@ -1604,13 +1573,10 @@ impl App {
         // thousands of per-radial buffers, and the walk that returns them is the frame-
         // thread cost `offload::discard` exists to move.
         let unshown = |site: &String| !shown.iter().any(|shown| *shown == site);
-        rustdar_worker::offload::discard_each(
-            "evicted-scan",
-            evicted(&mut self.scan_data, &unshown),
-        );
+        rustdar_worker::offload::discard_each("evicted-scan", self.volumes.evict_still(&unshown));
         rustdar_worker::offload::discard_each(
             "evicted-base-volume",
-            evicted(&mut self.base_scans, &unshown),
+            self.volumes.evict_base(&unshown),
         );
         rustdar_worker::offload::discard_each(
             "evicted-cached-volume",
@@ -1619,10 +1585,8 @@ impl App {
         self.render.retain_extracts(|key| !unshown(&key.site));
         self.evict_unneeded_loop_scans();
         rustdar_radar::derive::retain_volumes(
-            self.scan_data
-                .values()
-                .map(|(scan, _)| scan.as_ref())
-                .chain(self.base_scans.values().map(|(scan, _, _)| scan.as_ref()))
+            self.volumes
+                .resident()
                 .chain(
                     self.latest_cached_scans
                         .values()
@@ -1745,7 +1709,7 @@ impl App {
         // that just taught it where this radar is. On an install with no cached
         // catalogue that table was empty, so the volume that supplies the position
         // is the one whose info cannot name its own radar -- and `UNKNOWN` is not a
-        // key `scan_data` holds, so the picture is never made.
+        // key the still store holds, so the picture is never made.
         info.place_against_the_table(site);
         info
     }

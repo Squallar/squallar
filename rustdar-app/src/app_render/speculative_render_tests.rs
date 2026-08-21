@@ -166,7 +166,7 @@ fn aim(app: &mut crate::app::App, product: RadarProduct, elevation: f32) {
                 status: String::new(),
             },
         });
-    app.scan_data.insert(
+    app.volumes.install_still(
         SITE.to_string(),
         (
             sample_scan(),

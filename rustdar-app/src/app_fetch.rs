@@ -1448,8 +1448,8 @@ impl super::App {
                 pane_site,
                 timestamp
             );
-            self.scan_data
-                .insert(pane_site.clone(), (scan_arc, declared));
+            self.volumes
+                .install_still(pane_site.clone(), (scan_arc, declared));
 
             let local_ts =
                 chrono::TimeZone::from_utc_datetime(&chrono::Local, &timestamp).naive_local();

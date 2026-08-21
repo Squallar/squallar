@@ -25,7 +25,7 @@ pub(crate) fn ready_grid() -> VolumeEntry {
 
 /// The two-sweep reflectivity volume [`ready_grid`] is resampled from —
 /// exposed because the tests whose subject is a volume *arriving* need the
-/// scan itself in `base_scans`, and a second fixture volume beside this one
+/// scan itself as a merge base, and a second fixture volume beside this one
 /// could drift from it silently.
 pub(crate) fn ready_scan() -> Arc<nexrad_model::data::Scan> {
     use nexrad_model::data::{

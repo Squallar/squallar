@@ -130,7 +130,7 @@ fn an_archive_volume_older_than_the_feed_does_not_replace_it() {
         "Refresh walked the display back to the previous archive volume"
     );
     assert!(
-        !app.scan_data.contains_key("KTLX"),
+        !app.volumes.holds_still("KTLX"),
         "and it replaced the volume the panes render from"
     );
 }
@@ -165,7 +165,7 @@ fn an_archive_volume_newer_than_the_feed_is_applied() {
     app.poll_data_channels();
 
     assert!(
-        app.scan_data.contains_key("KTLX"),
+        app.volumes.holds_still("KTLX"),
         "a newer archive volume was refused"
     );
 }
@@ -181,7 +181,7 @@ fn without_a_feed_the_archive_is_applied_unconditionally() {
     app.poll_data_channels();
 
     assert!(
-        app.scan_data.contains_key("KTLX"),
+        app.volumes.holds_still("KTLX"),
         "the fallback cannot restore a site if an older archive volume is \
              refused when no feed is running"
     );
@@ -374,7 +374,7 @@ fn the_pane_and_the_resampler_agree_about_the_stand_in_box() {
     );
 }
 
-/// **The 3D build reads `base_scans` and never `scan_data`.**
+/// **The 3D build reads the merge base and never the still store.**
 fn stamped_scan(minute: u32) -> nexrad_model::data::Scan {
     use nexrad_model::data::{
         ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan,
@@ -461,7 +461,7 @@ fn the_3d_build_reads_the_base_volume_and_not_the_live_snapshot() {
     };
 
     let mut live_only = headless(TestBridge::desktop());
-    live_only.scan_data.insert(
+    live_only.volumes.install_still(
         "KTLX".to_string(),
         (Arc::new(stamped_scan(10)), Default::default()),
     );
@@ -472,7 +472,7 @@ fn the_3d_build_reads_the_base_volume_and_not_the_live_snapshot() {
     );
 
     let mut based = headless(TestBridge::desktop());
-    based.base_scans.insert(
+    based.volumes.install_base(
         "KTLX".to_string(),
         (Arc::new(stamped_scan(10)), Default::default(), at(10)),
     );
@@ -499,7 +499,7 @@ fn a_full_budget_refuses_the_3d_ask_before_paying_the_extraction() {
         region: None,
     };
     let mut app = headless(TestBridge::desktop());
-    app.base_scans.insert(
+    app.volumes.install_base(
         "KTLX".to_string(),
         (Arc::new(stamped_scan(10)), Default::default(), at(10)),
     );
@@ -554,7 +554,7 @@ fn a_3d_pane_is_not_handed_a_volume_other_than_the_one_it_asked_for() {
     };
 
     let mut app = headless(TestBridge::desktop());
-    app.base_scans.insert(
+    app.volumes.install_base(
         "KTLX".to_string(),
         (Arc::new(stamped_scan(15)), Default::default(), at(15)),
     );
@@ -570,13 +570,13 @@ fn a_3d_pane_is_not_handed_a_volume_other_than_the_one_it_asked_for() {
 /// two that decline to display it.
 #[test]
 fn every_archive_path_offers_its_volume_to_the_3d_pane() {
-    let collected = |app: &App| app.base_scans.get("KTLX").map(|(_, _, at)| *at);
+    let collected = |app: &App| app.volumes.base_collected_at("KTLX");
 
     let mut shown = app_showing(at(10));
     send_archive(&shown, at(15));
     shown.poll_data_channels();
     assert!(
-        shown.scan_data.contains_key("KTLX"),
+        shown.volumes.holds_still("KTLX"),
         "precondition: this is the arm that puts the volume on screen",
     );
     assert_eq!(collected(&shown), Some(at(15)));
@@ -586,7 +586,7 @@ fn every_archive_path_offers_its_volume_to_the_3d_pane() {
     send_archive(&behind, at(5));
     behind.poll_data_channels();
     assert!(
-        !behind.scan_data.contains_key("KTLX"),
+        !behind.volumes.holds_still("KTLX"),
         "precondition: this is the `feed_is_ahead` arm",
     );
     assert_eq!(
@@ -601,7 +601,7 @@ fn every_archive_path_offers_its_volume_to_the_3d_pane() {
     send_auto_poll_archive(&historic, at(15));
     historic.poll_data_channels();
     assert!(
-        !historic.scan_data.contains_key("KTLX"),
+        !historic.volumes.holds_still("KTLX"),
         "precondition: this is the auto-poll-while-historic arm",
     );
     assert_eq!(collected(&historic), Some(at(15)));
@@ -610,10 +610,10 @@ fn every_archive_path_offers_its_volume_to_the_3d_pane() {
 /// **A Refresh in the pre-publication window must not walk the base back.**
 #[test]
 fn a_refresh_in_the_pre_publication_window_does_not_walk_the_base_back() {
-    let based = |app: &App| app.base_scans.get("KTLX").map(|(_, _, at)| *at);
+    let based = |app: &App| app.volumes.base_collected_at("KTLX");
     let mut app = app_showing(at(10));
     app.chunk_feeds.ensure("KTLX");
-    app.base_scans.insert(
+    app.volumes.install_base(
         "KTLX".to_string(),
         (Arc::new(stamped_scan(10)), Default::default(), at(10)),
     );
@@ -747,7 +747,7 @@ fn a_manual_navigation_outranks_the_feed_guard() {
         "the applied navigation must clear its pending flag"
     );
     assert!(
-        app.scan_data.contains_key("KTLX"),
+        app.volumes.holds_still("KTLX"),
         "the navigated volume must become the site's displayed scan"
     );
 }
@@ -1092,7 +1092,7 @@ fn volume_target(collected: chrono::NaiveDateTime) -> rustdar_egui::pane::Volume
 #[test]
 fn a_navigated_3d_pane_is_served_the_volume_it_names() {
     let mut app = headless(TestBridge::desktop());
-    app.base_scans.insert(
+    app.volumes.install_base(
         "KTLX".to_string(),
         (Arc::new(spanning_scan(10, 14)), Default::default(), at(10)),
     );
@@ -1523,7 +1523,7 @@ fn a_capable_layer_that_cannot_shape_a_job_is_refused_rather_than_left_pending()
     handlers.push(Box::new(RefusingVolumeLayer));
     app.gui.overlays =
         rustdar_overlays::render::overlay_state::OverlayRegistry::with_handlers(handlers);
-    app.base_scans.insert(
+    app.volumes.install_base(
         "KTLX".to_string(),
         (Arc::new(stamped_scan(10)), Default::default(), at(10)),
     );
@@ -1697,7 +1697,7 @@ fn the_volume_the_frontend_extracted_is_what_the_layer_is_handed() {
         region: None,
     };
     let mut app = headless(TestBridge::desktop());
-    app.base_scans.insert(
+    app.volumes.install_base(
         "KTLX".to_string(),
         (Arc::new(stamped_scan(10)), Default::default(), at(10)),
     );

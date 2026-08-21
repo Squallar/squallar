@@ -178,7 +178,7 @@ fn point_at(
                 status: String::new(),
             },
         });
-    app.scan_data.insert(
+    app.volumes.install_still(
         site.to_string(),
         (
             sample_scan(),

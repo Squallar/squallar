@@ -346,7 +346,7 @@ its own instrument (the crate-wide walk in `arch_ratchets.rs`; the
 whitespace-collapsed per-file scrape in `gui_seam_ratchet_tests.rs` — they are
 different instruments and one's number is never the other's).
 
-### 6.1 `rustdar-app/tests/arch_ratchets.rs` — 9 tests
+### 6.1 `rustdar-app/tests/arch_ratchets.rs` — 10 tests
 
 | Test | Constant | Ceiling | What it counts |
 |---|---|---|---|
@@ -363,12 +363,13 @@ different instruments and one's number is never the other's).
 | `the_loop_frame_arms_stay_radars_own_vocabulary` | `LOOP_FRAME_ARMS_MAX` | 8 | the loop frame's closed arms and their two cache aliases |
 | | `LOOP_FRAME_ARMS_NON_TEST_MAX` | 2 | the same, outside tests |
 | `the_ingest_phase_has_exactly_one_production_caller` | `INGEST_CALLERS_NON_TEST` | 1 | `self.poll_data_channels(` outside test paths — the frame pump's `Ingest` phase, whose once-per-frame property WO-M13b measured and registered as unpinned |
+| `the_site_keyed_volume_stores_have_one_owner` | — | 0 / 0 | the two site-keyed decoded-volume store names as fields of `pub struct App`, with the third such store (deliberately left on the `App`) and the `volumes` field as two presence controls read from the same extracted block |
 
 Run it by target name — a filter matching zero tests is a failed run, not a
 pass:
 
 ```bash
-cargo test -p rustdar-app --test arch_ratchets   # 9/9
+cargo test -p rustdar-app --test arch_ratchets   # 10/10
 ```
 
 ### 6.2 `rustdar-app/src/app/gui_seam_ratchet_tests.rs` — the per-file coupling ceilings

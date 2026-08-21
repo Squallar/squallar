@@ -139,6 +139,16 @@ const LOOP_FRAME_ARMS: [&str; 3] = [
 /// and both counts below mean nothing.
 const LOOP_MANAGER_DEF: &str = concat!("struct LoopDownload", "Manager");
 
+/// Row 12 — the two site-keyed decoded-volume stores WO-VOLINV moved off the
+/// `App` and behind one owner. Split, per this file's needle hygiene.
+const STILL_STORE: &str = concat!("scan", "_data");
+const BASE_STORE: &str = concat!("base", "_scans");
+/// The third decoded-volume store, deliberately LEFT on the `App` — row 12's
+/// presence control. It is out of that order's scope on purpose.
+const KEPT_STORE: &str = concat!("latest_cached", "_scans");
+/// The owner the first two moved behind — row 12's second presence control.
+const INVENTORY_FIELD: &str = concat!("volumes: ", "crate::volume_inventory::");
+
 // --------------------------------------------------------------------------- Ceilings
 // — at-land measurements (see the table above).
 
@@ -527,6 +537,26 @@ fn gui_impl_blocks(files: &[(PathBuf, String)]) -> Vec<(PathBuf, String)> {
         }
     }
     blocks
+}
+
+/// The field list of `pub struct App`, from its header to the `}` that closes
+/// it at column 0.
+///
+/// Lines, not a parser, on the same rustfmt assumption [`gui_impl_blocks`]
+/// takes: the struct is a top-level item, so it opens at column 0 and closes at
+/// the next line that is exactly `}`. An extent that over- or under-ran would
+/// be caught by row 12's two presence controls, which are read from this same
+/// returned block rather than from the whole file.
+fn struct_app_block(text: &str) -> String {
+    let start = text
+        .find(APP_ANCHOR)
+        .expect("the App struct header is gone from app.rs");
+    let lines: Vec<&str> = text[start..].lines().skip(1).collect();
+    let end = lines
+        .iter()
+        .position(|l| *l == "}")
+        .expect("the App struct block never closes at column 0");
+    lines[..end].join("\n")
 }
 
 /// Mirrors ripgrep's `-g '!*tests*'`: a path is test-side when any component
@@ -937,4 +967,54 @@ fn the_ingest_phase_has_exactly_one_production_caller() {
          site is genuinely wanted, it is a frame-pump change and this pin is \
          where it gets argued.",
     );
+}
+
+/// Row 12 — **the site-keyed decoded volumes have exactly one owner.**
+///
+/// Two raw maps used to sit on the `App`, indexed at every call site. WO-VOLINV
+/// put both behind `VolumeInventory`, which answers named questions instead, so
+/// a caller asks what a site's still render draws or what its merge base is
+/// rather than reaching into a map. The pin is that neither name comes back as
+/// a field: a store re-added beside the inventory is two owners again, and the
+/// defect that shape produces is a write that lands in one of them and a read
+/// that goes to the other.
+///
+/// **What is deliberately not pinned here.** The loop cache is keyed
+/// `(site, timestamp)` rather than by site alone and is blocked on a separate
+/// seam question; the third site-keyed store stayed on the `App` with it. That
+/// store is therefore the presence control — it must still be declared, or the
+/// block extractor is reading an empty extent and every zero below is vacuous.
+#[test]
+fn the_site_keyed_volume_stores_have_one_owner() {
+    let app_rs = Path::new(ROOT).join("rustdar-app/src/app.rs");
+    let text = anchored_file(&app_rs, APP_ANCHOR);
+    let block = struct_app_block(&text);
+
+    // Both controls read the SAME extracted block the zeros below are read
+    // from, so an extent that came back empty fails here rather than passing
+    // two zeros over nothing.
+    assert!(
+        block.contains(KEPT_STORE),
+        "presence control: the `App` field list no longer declares the third \
+         decoded-volume store, so the extractor is reading the wrong extent \
+         and the zeros below hold over nothing."
+    );
+    assert!(
+        block.contains(INVENTORY_FIELD),
+        "presence control: the `App` field list no longer declares the volume \
+         inventory, so the two stores below have no owner to have moved to — \
+         re-anchor this ratchet in the land that changed it."
+    );
+
+    for needle in [STILL_STORE, BASE_STORE] {
+        let n = block.matches(needle).count();
+        assert_eq!(
+            n, 0,
+            "the `App` declares `{needle}` again ({n} occurrence(s)) where the \
+             pin is ZERO. The site-keyed decoded volumes have one owner, asked \
+             by name; a raw map beside it is a second owner, and the shape's \
+             own defect is a write that lands in one store while the read goes \
+             to the other. Never raise this without a written plan amendment."
+        );
+    }
 }

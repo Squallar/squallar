@@ -177,8 +177,8 @@ fn point_at(
                 status: String::new(),
             },
         });
-    app.scan_data
-        .insert(site.to_string(), (sample_scan(fill), declared()));
+    app.volumes
+        .install_still(site.to_string(), (sample_scan(fill), declared()));
 }
 
 /// Drain the (native, asynchronous) arrival-time extraction until `want` payloads are
@@ -350,8 +350,8 @@ fn a_second_arrival_never_serves_the_previous_snapshots_payload() {
     wait_for_extracts(&mut app, 1);
 
     // The next round of the live feed: same volume identity, more data.
-    app.scan_data
-        .insert(SITE.to_string(), (sample_scan(90), declared()));
+    app.volumes
+        .install_still(SITE.to_string(), (sample_scan(90), declared()));
     app.refresh_extract_cache_for_site(SITE);
     assert_eq!(
         app.render.extract_cache_len(),

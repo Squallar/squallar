@@ -256,8 +256,8 @@ impl super::App {
             return;
         }
 
-        self.scan_data
-            .insert(site.to_string(), (Arc::clone(&scan), Arc::clone(&declared)));
+        self.volumes
+            .install_still(site.to_string(), (Arc::clone(&scan), Arc::clone(&declared)));
 
         if let Some((closed, _)) = completed {
             // A whole closed volume is the same volume the archive will publish
@@ -265,7 +265,7 @@ impl super::App {
             if closed.progress.whole_volume_complete {
                 // Without the closed volume's declarations the worker's velocity
                 // fold guard is back on estimates.
-                self.base_scans.insert(
+                self.volumes.install_base(
                     site.to_string(),
                     (Arc::clone(&scan), Arc::clone(&declared), timestamp),
                 );

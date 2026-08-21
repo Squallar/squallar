@@ -136,10 +136,10 @@ fn app_showing_site() -> crate::app::App {
             },
         });
     app.render.ensure_pane_count(1);
-    app.scan_data
-        .insert(SITE.to_string(), (sample_scan(), declared()));
-    app.base_scans
-        .insert(SITE.to_string(), (sample_scan(), declared(), volume_time()));
+    app.volumes
+        .install_still(SITE.to_string(), (sample_scan(), declared()));
+    app.volumes
+        .install_base(SITE.to_string(), (sample_scan(), declared(), volume_time()));
     app.loop_mgr
         .cache_scan(SITE, volume_time(), (sample_scan(), declared()));
     app

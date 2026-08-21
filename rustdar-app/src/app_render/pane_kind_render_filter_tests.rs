@@ -611,11 +611,11 @@ fn a_whole_volume_pane_keeps_the_volume_it_is_sampling() {
     ] {
         let mut app = app_on_site();
         app.gui.pane_mut(0).unwrap().set_view(kind);
-        app.scan_data.insert(
+        app.volumes.install_still(
             SITE.to_string(),
             (Arc::new(empty_scan()), Default::default()),
         );
-        app.scan_data.insert(
+        app.volumes.install_still(
             "KOUN".to_string(),
             (Arc::new(empty_scan()), Default::default()),
         );
@@ -623,11 +623,11 @@ fn a_whole_volume_pane_keeps_the_volume_it_is_sampling() {
         app.evict_unshown_scans();
 
         assert!(
-            app.scan_data.contains_key(SITE),
+            app.volumes.holds_still(SITE),
             "{kind:?}: the volume this pane is cutting from was evicted"
         );
         assert!(
-            !app.scan_data.contains_key("KOUN"),
+            !app.volumes.holds_still("KOUN"),
             "precondition: eviction must still be happening at all, or the \
                  assertion above holds for a pass that dropped nothing"
         );
