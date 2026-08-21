@@ -89,8 +89,17 @@ pub enum GuiAction {
     /// Level-triggered: re-emitted every frame until the grid lands, so the
     /// handler must dedupe on the target before it builds (150–200 ms at the
     /// desktop shape, measured) — safe only while that handler is synchronous.
+    ///
+    /// `layer` is **which of the pane's layers is being asked**, resolved by
+    /// the pane's own top-down walk over its stack. It rides on the action
+    /// rather than on [`crate::pane::VolumeTarget`] for two reasons: the target
+    /// is the *grid's* identity and the key the volume store holds it under, so
+    /// two layers asking for one grid must share an entry rather than fragment
+    /// it; and putting it here leaves the store's key, its refcount and the
+    /// level-trigger's `rendered_for` comparison untouched.
     PrepareVolume {
         pane_idx: usize,
+        layer: rustdar_source::id::LayerId,
         target: crate::pane::VolumeTarget,
     },
     ReleaseVolume {
@@ -196,14 +205,19 @@ impl std::fmt::Display for GuiAction {
             GuiAction::OpenLocationSettings => {
                 write!(f, "Open the system location settings")
             }
-            GuiAction::PrepareVolume { pane_idx, target } => {
+            GuiAction::PrepareVolume {
+                pane_idx,
+                layer,
+                target,
+            } => {
                 write!(
                     f,
-                    "Prepare {} volume for pane {} from {} at {}",
+                    "Prepare {} volume for pane {} from {} at {}, from the {} layer",
                     crate::field_facts::code(&target.product),
                     pane_idx,
                     target.volume.site,
                     target.volume.collected,
+                    layer.as_str(),
                 )
             }
             GuiAction::ReleaseVolume { pane_idx } => {

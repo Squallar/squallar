@@ -19,7 +19,7 @@ use crate::fetch_policy::{
 };
 use crate::id::LayerId;
 use crate::job::{DescribedJob, JobCodec};
-use crate::product::ProductSpec;
+use crate::product::{FieldId, ProductSpec};
 use crate::time::{FrameListing, FrameStamp, TimeAxis};
 
 /// Not `rustdar_radar::LegendScale`: duplicated here to avoid the dependency.
@@ -702,6 +702,45 @@ pub trait SourceHandler: Send {
     /// naming a single one of them.
     fn products(&self) -> &'static [ProductSpec] {
         &[]
+    }
+
+    /// **Which of this layer's [`products`](Self::products) `pane` is showing
+    /// right now**, or `None` from a layer that offers no choice.
+    ///
+    /// **Answered from this layer's OWN per-pane state** — the slot config it
+    /// already reads everything else out of, or the control named by
+    /// [`field_control_id`](Self::field_control_id). Never by reaching up into
+    /// the pane's own selection field: a handler cannot see one, and a layer
+    /// that could would be answering for its neighbours as well as itself.
+    ///
+    /// The caller is a pane deciding *which layer to ask for a picture* — the
+    /// 3D walk asks it of every volume-capable slot in the stack, top down —
+    /// so an answer that is stale by a frame selects the wrong field, not
+    /// merely a late one. A layer answering from its slot config therefore
+    /// depends on that config being kept current, which is what
+    /// `publish_radar_selection` exists to do for the one layer whose
+    /// selection the pane owns.
+    ///
+    /// Defaulted to `None`, which is also the honest answer from a layer with
+    /// one picture and nothing to choose between.
+    fn current_field(&self, pane: &PaneRef<'_>) -> Option<FieldId> {
+        let _ = pane;
+        None
+    }
+
+    /// **This layer's 3D half, if it has one.**
+    ///
+    /// `Some` from a layer that can build a
+    /// [`VolumeGrid`](crate::volume::VolumeGrid); `None` — the default, and
+    /// eleven of this build's twelve layers take it — from a flat one.
+    ///
+    /// A pane in Volume mode walks its stack for the first enabled slot that
+    /// answers `Some` here and whose [`current_field`](Self::current_field)
+    /// that layer can build, rather than naming a layer. That is the whole
+    /// seam: adding a second 3D source is an implementation on its own
+    /// handler and no arm anywhere above it.
+    fn volume(&self) -> Option<&dyn crate::volume::VolumeCapable> {
+        None
     }
 
     /// The id of the control that selects which of this layer's

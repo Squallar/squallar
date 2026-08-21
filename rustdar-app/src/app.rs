@@ -825,7 +825,37 @@ impl App {
         )
     }
 
-    fn handle_prepare_volume(&mut self, pane_idx: usize, target: rustdar_egui::pane::VolumeTarget) {
+    /// **Resolve the layer the ask names, then ask that layer for a volume.**
+    ///
+    /// The pane walked its own stack and sent the layer it landed on; this end
+    /// resolves that name to a handler and asks the handler for its 3D half.
+    /// Nothing here matches on an id, which is the point: a second 3D source
+    /// arrives as an `impl` on its own handler and this function does not
+    /// change.
+    ///
+    /// **Re-asked rather than trusted.** The walk ran on the pane, the ask
+    /// crossed the action channel, and the pane can have been re-stacked or
+    /// the layer switched off in between. A layer with no 3D half — or one
+    /// that does not build the field the target names — is refused *into the
+    /// store*, in a sentence fit for the middle of a pane, and the refusal
+    /// counts as served so the level-trigger quiesces instead of re-asking
+    /// every frame.
+    fn handle_prepare_volume(
+        &mut self,
+        pane_idx: usize,
+        layer: &rustdar_source::id::LayerId,
+        target: rustdar_egui::pane::VolumeTarget,
+    ) {
+        if let Some(why) = self.volume_layer_refusal(layer, &target) {
+            self.volume_store.insert_held(
+                pane_idx,
+                target.clone(),
+                rustdar_volumetric::bridge::VolumeEntry::Refused(why),
+                rustdar_volumetric::bridge::Hold::Single,
+            );
+            self.mark_volume_rendered(pane_idx, &target);
+            return;
+        }
         if self.prepare_volume(pane_idx, &target, rustdar_volumetric::bridge::Hold::Single)
             == VolumePrepare::Served
         {
@@ -2027,3 +2057,7 @@ mod tests;
 
 #[cfg(test)]
 mod theme_flip_tests;
+
+/// The far end of the 3D ask: the layer it names, resolved.
+#[cfg(test)]
+mod volume_layer_tests;

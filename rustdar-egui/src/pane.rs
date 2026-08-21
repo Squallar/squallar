@@ -26,6 +26,29 @@ pub use content::{
 
 const DEFAULT_PANE_ZOOM: f64 = 4.0;
 
+/// **What a 3D pane resolved to ask for**: which of its layers, and which of
+/// that layer's fields.
+///
+/// The layer id travels with the ask so the dispatcher on the far side of the
+/// action channel can resolve the same handler this walk chose, without
+/// re-running the walk against a pane that may have moved in between.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VolumeAsk {
+    /// The layer that will build the grid.
+    pub layer: LayerId,
+    /// The field the grid is of — that layer's *current* field, as the layer
+    /// itself reports it.
+    pub field: FieldId,
+}
+
+/// What a pane says when nothing in its stack can build a volume **and there
+/// is nothing to switch on either** — the build has no 3D source at all.
+///
+/// Distinct from [`crate::ui::VOLUME_EMPTY_STATE`], which is the pane saying
+/// its own 3D machinery is missing (no volume pane state, no painter). This
+/// one is about the *stack*.
+pub const NO_VOLUME_LAYER: &str = "No layer in this pane can build a 3D volume.";
+
 pub type PaneId = usize;
 
 #[derive(Clone)]
@@ -1774,6 +1797,104 @@ impl PaneState {
         self.slot(id).is_some_and(|slot| slot.enabled)
     }
 
+    /// **Which of this pane's layers a 3D view asks for a grid, or why none of
+    /// them can give one.**
+    ///
+    /// The stack is walked **top down** — [`Self::layers`] runs bottom to top,
+    /// so this reads it in reverse — and the first slot that is *enabled*,
+    /// whose handler answers `SourceHandler::volume` with a 3D half, and whose
+    /// own `SourceHandler::current_field` that half says it
+    /// `VolumeCapable::builds`, is the answer. Topmost wins for the same reason it wins everywhere else
+    /// in a stack: it is the layer drawn over the others, so it is the one the
+    /// pane is *about*.
+    ///
+    /// Every question here is asked **of a handler**, never answered by
+    /// matching on an id: this is the seam that stops a 3D pane knowing which
+    /// of its layers is radar.
+    ///
+    /// `Err` carries the sentence the pane paints instead of a picture — never
+    /// a blank pane and never a hidden one. It names the layer and the field
+    /// wherever it can, because "3D is unavailable" is not a thing a reader
+    /// can act on and "Velocity Dealiased on Radar has no vertical structure"
+    /// is.
+    ///
+    /// **Hydrate first.** A handler answers `current_field` out of its own
+    /// slot, and for the layer whose selection the *pane* owns, the slot is
+    /// only current after [`Self::hydrate_layer_states`] has published it.
+    /// Every other caller that asks a handler about a pane already runs that
+    /// hydrate; a caller of this that does not would read the selection this
+    /// pane had when its file was opened.
+    pub fn volume_ask(
+        &self,
+        registry: &rustdar_overlays::render::overlay_state::OverlayRegistry,
+        pane_idx: usize,
+    ) -> Result<VolumeAsk, String> {
+        let view = self.view(pane_idx);
+        // The best refusal this walk found on its way down: an enabled 3D
+        // layer whose field has no third dimension is a more useful thing to
+        // say than "no layer qualified", and the topmost such layer is the
+        // one the reader is looking at.
+        let mut wrong_field: Option<(String, String)> = None;
+        // A layer whose own current field is not one of its own registered
+        // rows. Structurally unreachable through a pane — the constructor
+        // starts on a registered id, the load path resolves an unknown one to
+        // the default, and the catalogue only ever writes registered ids — but
+        // it is a state the type system permits, and a pane that painted
+        // nothing rather than saying so would be the silent half of it.
+        let mut unregistered: Option<(String, String)> = None;
+        let mut switched_off: Vec<&str> = Vec::new();
+        for slot in self.layers.iter().rev() {
+            let Some(handler) = registry.handler_by_id(&slot.id) else {
+                continue;
+            };
+            let Some(volume) = handler.volume() else {
+                continue;
+            };
+            if !slot.enabled {
+                switched_off.push(handler.display_name());
+                continue;
+            }
+            let pane = view.layer(&slot.id);
+            let Some(field) = handler.current_field(&pane) else {
+                continue;
+            };
+            let Some(spec) = handler.products().iter().find(|spec| spec.id == field) else {
+                if unregistered.is_none() {
+                    unregistered =
+                        Some((handler.display_name().to_owned(), field.as_str().to_owned()));
+                }
+                continue;
+            };
+            if volume.builds(spec) {
+                return Ok(VolumeAsk {
+                    layer: slot.id.clone(),
+                    field,
+                });
+            }
+            if wrong_field.is_none() {
+                wrong_field = Some((handler.display_name().to_owned(), spec.name.to_owned()));
+            }
+        }
+        if let Some((layer, field)) = wrong_field {
+            return Err(format!(
+                "{field} has no vertical structure to render in 3D - pick a field {layer} \
+                 measures or derives tilt by tilt",
+            ));
+        }
+        if let Some((layer, field)) = unregistered {
+            return Err(format!(
+                "{layer} has no field called {field} in this build - pick one it does.",
+            ));
+        }
+        if !switched_off.is_empty() {
+            return Err(format!(
+                "Turn on {} in this pane to build a 3D volume.",
+                switched_off.join(" or "),
+            ));
+        }
+        Err(NO_VOLUME_LAYER.to_owned())
+    }
+
     pub fn set_overlay_enabled(&mut self, id: LayerId, enabled: bool) {
         match self.slot_mut(&id) {
             Some(slot) => slot.enabled = enabled,
@@ -2385,6 +2506,10 @@ mod render_params_tests;
 /// The section loop's identity and the plan-view/section collision it closes.
 #[cfg(test)]
 mod section_loop_tests;
+
+/// Which layer a 3D pane asks for a grid, and what it says when none can.
+#[cfg(test)]
+mod volume_ask_tests;
 
 #[cfg(test)]
 mod tests;

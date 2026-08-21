@@ -123,6 +123,57 @@ impl super::App {
         Some(f(overlays, &pane_ref))
     }
 
+    /// **Why `layer` cannot build `target`, or `None` if it can.**
+    ///
+    /// A question about the layer and the field, and deliberately **not**
+    /// about the pane: the pane index an ask carries is the volume store's
+    /// holder id, which routinely names a holder the `Gui`'s own pane vector
+    /// has no entry for. Asking through a pane view would refuse those asks by
+    /// finding no pane, which is a silent way of never serving them.
+    ///
+    /// **Lives here rather than beside its caller** for two reasons that
+    /// agree: this file already owns the other registry-facing helper,
+    /// [`Self::with_layer_pane`], and `app.rs` was on the per-file ceiling
+    /// `gui_seam_ratchet_tests` holds over App-pokes-Gui field accesses.
+    /// Landing the one registry read there would have spent that file's last
+    /// slot on a helper that has a better home anyway.
+    pub(super) fn volume_layer_refusal(
+        &self,
+        layer: &rustdar_source::id::LayerId,
+        target: &rustdar_egui::pane::VolumeTarget,
+    ) -> Option<String> {
+        let Some(handler) = self.gui.overlays.handler_by_id(layer) else {
+            return Some(format!(
+                "This build has no {} layer to build a 3D volume with.",
+                layer.as_str(),
+            ));
+        };
+        let Some(volume) = handler.volume() else {
+            return Some(format!(
+                "{} does not build 3D volumes.",
+                handler.display_name(),
+            ));
+        };
+        let Some(spec) = handler
+            .products()
+            .iter()
+            .find(|spec| spec.id == target.product)
+        else {
+            return Some(format!(
+                "{} does not publish a field called {}.",
+                handler.display_name(),
+                target.product.as_str(),
+            ));
+        };
+        (!volume.builds(spec)).then(|| {
+            format!(
+                "{} has no vertical structure for {} to render in 3D.",
+                spec.name,
+                handler.display_name(),
+            )
+        })
+    }
+
     /// Spawn a listing task a layer built, and land its answer on the one
     /// source arrival path as [`SourceEvent::Frames`].
     fn spawn_frame_list_task(&self, task: rustdar_overlays::render::overlay_state::FetchTask) {
@@ -444,8 +495,12 @@ impl super::App {
             GuiAction::Exit => {
                 self.request_exit(event_loop);
             }
-            GuiAction::PrepareVolume { pane_idx, target } => {
-                self.handle_prepare_volume(pane_idx, target);
+            GuiAction::PrepareVolume {
+                pane_idx,
+                layer,
+                target,
+            } => {
+                self.handle_prepare_volume(pane_idx, &layer, target);
             }
             GuiAction::ReleaseVolume { pane_idx } => {
                 self.handle_release_volume(pane_idx);

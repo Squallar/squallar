@@ -270,6 +270,38 @@ pub struct VolumeParts {
     pub widest_level_gap_deg: f64,
 }
 
+/// **A layer that can build a [`VolumeGrid`].**
+///
+/// [`SourceHandler::volume`](crate::handler::SourceHandler::volume) is how a
+/// layer answers "have I a 3D half at all", and this is what it answers
+/// *with*. A pane in Volume mode finds the layer to ask by walking its own
+/// stack for the first one that says yes — so the 3D view has no idea which
+/// of its layers is radar, which is the whole point of the seam.
+///
+/// **Minimal on purpose, and the remainder is named.** The job-shaping half —
+/// the request the builder is handed and the job envelope it comes back in —
+/// moves behind this trait at WO-M14b-2. Today the one member is the question
+/// the pane's walk asks and the dispatcher re-asks on the far side of the
+/// action channel: can this layer build a volume *of this field*.
+pub trait VolumeCapable {
+    /// Whether this layer can build a volume of `field`.
+    ///
+    /// **Defaulted to the field's own registered
+    /// [`vertical`](crate::product::ProductSpec::vertical)** — the fact that
+    /// already says whether a field has a third dimension to render. A layer
+    /// whose 3D answer is exactly "every field of mine with vertical extent"
+    /// writes nothing here; one whose answer is *narrower* than its own
+    /// registry rows overrides, and the override is the place that says why.
+    ///
+    /// Takes the whole [`ProductSpec`](crate::product::ProductSpec) rather
+    /// than a [`FieldId`]: the caller has already resolved the row, and
+    /// handing the id back would make every implementor look it up again in a
+    /// table only it can see.
+    fn builds(&self, field: &crate::product::ProductSpec) -> bool {
+        field.vertical
+    }
+}
+
 /// A resampled Cartesian volume, ready to become one 3D texture and one 1D
 /// colour table.
 #[derive(Clone)]

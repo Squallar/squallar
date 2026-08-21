@@ -334,6 +334,15 @@ impl super::Gui {
                         }
                         RenderView::Volume => {
                             self.record_pane_content(pane_idx, RenderView::Volume, pane_rect);
+                            // The hydrate every caller runs before asking a
+                            // handler about a pane, and this arm is about to
+                            // ask twelve of them. It is also where the pane
+                            // publishes its own selection into the slot the
+                            // layer that owns it reads back, so without it the
+                            // walk below would gate on the selection this pane
+                            // had when its config file was opened.
+                            pane.hydrate_layer_states(&self.overlays, pane_idx);
+                            let volume_ask = pane.volume_ask(&self.overlays, pane_idx);
                             let volume_response = child_ui.interact(
                                 pane_rect,
                                 child_ui.id().with(("volume_orbit", pane_idx)),
@@ -400,6 +409,7 @@ impl super::Gui {
                                 &mut actions,
                                 &mut self.volume_alpha,
                                 &self.volume_iso,
+                                &volume_ask,
                                 #[cfg(test)]
                                 &mut self.probes.last_alpha_buttons,
                             );
@@ -1145,6 +1155,7 @@ fn render_volume_pane(
     actions: &mut Vec<GuiAction>,
     alpha_curves: &mut crate::volume_alpha::AlphaCurves,
     iso_thresholds: &crate::volume_iso::IsoThresholds,
+    volume_ask: &Result<crate::pane::VolumeAsk, String>,
     #[cfg(test)] alpha_buttons: &mut Vec<(usize, egui::Rect)>,
 ) -> Option<String> {
     let outcome = volume_pane_outcome(
@@ -1161,6 +1172,7 @@ fn render_volume_pane(
         actions,
         alpha_curves,
         iso_thresholds,
+        volume_ask,
     );
     if let Some(why) = outcome.empty.as_deref() {
         paint_pane_empty_state(ui, pane_rect, why);
@@ -1218,6 +1230,10 @@ fn volume_pane_outcome(
     actions: &mut Vec<GuiAction>,
     alpha_curves: &crate::volume_alpha::AlphaCurves,
     iso_thresholds: &crate::volume_iso::IsoThresholds,
+    // Which of this pane's layers will build the grid and of which field, or
+    // the sentence to paint instead. Resolved by `PaneState::volume_ask` one
+    // level up, where the layer registry is in scope.
+    volume_ask: &Result<crate::pane::VolumeAsk, String>,
 ) -> VolumeOutcome {
     use crate::pane::{OrbitDelta, VolumeStamp, VolumeTarget};
     use crate::volume_view::{VolumeFrameState, VolumePaint};
@@ -1268,7 +1284,6 @@ fn volume_pane_outcome(
     delta.zoom_factor = crate::ui_region::zoom_camera(ui.ctx(), response);
 
     let site_code = pane.site().to_string();
-    let product = pane.selected_product();
     let loop_grid = pane.active_volume_frame().cloned();
     let navigated = (!pane.viewing_live)
         .then(|| pane.scan_info.as_ref().map(|info| info.timestamp))
@@ -1307,17 +1322,17 @@ fn volume_pane_outcome(
              lands, then updates tilt by tilt as new sweeps arrive.",
         ));
     };
-    // The gate is the field's own registered fact, not a second reading of the
-    // derive table: `vertical` IS `volume_slot(p).is_some()`, pinned as such
-    // where the projection is built.
-    let facts = crate::field_facts::facts(&product);
-    if !facts.vertical {
-        return VolumeOutcome::empty_state(format!(
-            "{} has no vertical structure to render in 3D - pick a moment the radar measures \
-             or derives tilt by tilt",
-            facts.name,
-        ));
-    }
+    // **The gate is a layer's own answer, not this pane's guess.** The walk
+    // that produced it asked every enabled slot in turn whether it has a 3D
+    // half and whether that half builds the field the slot itself says it is
+    // showing; nothing here matched on an id, and nothing here read the derive
+    // table. A pane with no qualifying slot gets the sentence the walk wrote,
+    // which names the layer and the field.
+    let ask = match volume_ask {
+        Ok(ask) => ask,
+        Err(why) => return VolumeOutcome::empty_state(why.clone()),
+    };
+    let product = ask.field.clone();
 
     let live_target = VolumeTarget {
         volume: volume_stamp,
@@ -1332,6 +1347,7 @@ fn volume_pane_outcome(
     if !from_loop && already_rendered.as_ref() != Some(&target) {
         actions.push(GuiAction::PrepareVolume {
             pane_idx,
+            layer: ask.layer.clone(),
             target: target.clone(),
         });
     }
