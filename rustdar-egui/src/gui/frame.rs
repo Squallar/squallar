@@ -175,6 +175,31 @@ impl Gui {
         }
     }
 
+    /// The pane whose Volume Alpha editor a back press would close, or `None`
+    /// when no visible pane has one open.
+    ///
+    /// The active pane first, because that is the one the user is working in;
+    /// otherwise the lowest-numbered pane holding one. The fallback is not
+    /// decoration — the editor is a floating window per pane, the fade already
+    /// treats *every* pane's as an open surface (`ui_fade.rs`), and a window on
+    /// screen that Escape cannot reach is the defect this arm exists to fix.
+    ///
+    /// One function, read by both halves of the paired truth below, so the two
+    /// cannot drift on this arm at all.
+    fn alpha_editor_pane(&self) -> Option<usize> {
+        let open = |idx: usize| {
+            self.panes
+                .get(idx)
+                .and_then(PaneState::volume)
+                .is_some_and(|volume| volume.alpha_editor_open)
+        };
+        let visible = self.pane_layout.pane_count;
+        if self.active_pane < visible && open(self.active_pane) {
+            return Some(self.active_pane);
+        }
+        (0..visible).find(|&idx| open(idx))
+    }
+
     /// Close the topmost thing the user has open, and say whether there was one.
     ///
     /// Paired with [`back_would_dismiss`](Self::back_would_dismiss), which
@@ -221,6 +246,14 @@ impl Gui {
                 }
                 return true;
             }
+            // Below the sheet, not above it: the sheet, its scrim and its
+            // hosted bodies are `Order::Foreground` and the editor is a plain
+            // `egui::Window`, so while a page is up the editor is *under* it
+            // and cannot be the top layer.
+            if let Some(idx) = self.alpha_editor_pane() {
+                self.close_alpha_editor(idx);
+                return true;
+            }
         } else {
             if self.catalog_open {
                 self.catalog_open = false;
@@ -229,6 +262,12 @@ impl Gui {
             if !self.overlays.selected_overlays.is_empty() {
                 self.overlays.selected_overlays.clear();
                 self.overlays.selected_overlay_page = 0;
+                return true;
+            }
+            // Beside the feature popup: both are transient surfaces the user
+            // summoned onto the map, and both yield to the modal above them.
+            if let Some(idx) = self.alpha_editor_pane() {
+                self.close_alpha_editor(idx);
                 return true;
             }
             if self.time_dialog.show {
@@ -259,6 +298,14 @@ impl Gui {
         false
     }
 
+    /// Shut one pane's Volume Alpha editor — the act half of the arm
+    /// [`alpha_editor_pane`](Self::alpha_editor_pane) chooses.
+    fn close_alpha_editor(&mut self, idx: usize) {
+        if let Some(volume) = self.panes[idx].volume_mut() {
+            volume.alpha_editor_open = false;
+        }
+    }
+
     /// Whether [`dismiss_top_layer`](Self::dismiss_top_layer) would close
     /// something — the same chain, read-only.
     ///
@@ -280,11 +327,17 @@ impl Gui {
             if self.top_sheet_page().is_some() {
                 return true;
             }
+            if self.alpha_editor_pane().is_some() {
+                return true;
+            }
         } else {
             if self.catalog_open {
                 return true;
             }
             if !self.overlays.selected_overlays.is_empty() {
+                return true;
+            }
+            if self.alpha_editor_pane().is_some() {
                 return true;
             }
             if self.time_dialog.show {
