@@ -18,6 +18,9 @@ pub mod android;
 pub mod kv;
 /// Test-only. See the module docs for why it lives in this crate.
 pub mod network_security_config;
+/// Test-only. Mounted here because this package's executable is the one the
+/// desktop rows of `build.yaml` upload.
+pub mod release_artifact_features;
 // This crate turns rustdar-location's `os-providers` feature on for exactly the
 // targets that mount a bridge with one; Android reaches its own location
 // service over JNI from the `android` module and never enables it.

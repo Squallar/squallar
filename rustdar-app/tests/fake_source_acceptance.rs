@@ -256,6 +256,7 @@ const NAME_NEEDLES: &[&str] = &[
 /// | `rustdar-egui/src/ui_map_pane/as_of_token_tests.rs` | 1 | one `cfg!` term in a layer-count assertion |
 /// | `rustdar-app/src/app_fetch/as_of_dispatch_tests.rs` | 1 | one `cfg!` term in a layer-count assertion |
 /// | `rustdar-app/src/channels.rs` | 1 | a comment recording that the fake needed **no** channel — the receiver count did not move |
+/// | `rustdar/src/release_artifact_features.rs` | 2 | **added by WO-FAKESHIP, consciously re-pinned**: the `TEST_ONLY_FEATURES` needle list of the gate that keeps this feature out of a shipped binary, and the one doc line saying what the needle names. This row is the cost of the *fix*, not of the layer, and it is the reason the row exists at all — `--all-features` on the four desktop artifact rows shipped this layer to every desktop user. The file names none of [`TYPE_NEEDLES`]; it was written naming one and this suite caught it |
 ///
 /// **Every one of these is a TEST-side count term or a reserved spelling.**
 /// Not one is production behaviour: no crate above `rustdar-overlays` branches
@@ -269,6 +270,7 @@ const FOOTPRINT_OUTSIDE: &[(&str, usize)] = &[
     ("rustdar-egui/src/ui_map_pane/as_of_token_tests.rs", 1),
     ("rustdar-app/src/app_fetch/as_of_dispatch_tests.rs", 1),
     ("rustdar-app/src/channels.rs", 1),
+    ("rustdar/src/release_artifact_features.rs", 2),
 ];
 
 /// **The registration sites inside `rustdar-overlays`, in lines.**

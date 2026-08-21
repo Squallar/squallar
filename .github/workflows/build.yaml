@@ -33,9 +33,61 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # `--all-features` on the desktop rows only: it enables
-          # rustdar-nmea-serial/serial, which links IOKit. It also enables
-          # rustdar/jni-typecheck, so these rows type-check the JNI layer.
+          # An EXPLICIT feature list on the desktop rows, never `--all-features`.
+          # These rows do two jobs with one command: they are the cross-target
+          # compile coverage, and the executable each one's `artifact:` delivers
+          # -- bare, or wrapped in the macOS rows' signed .app -- is the file a
+          # person downloads and runs. `--all-features` therefore put every
+          # feature in the workspace into a shipped executable, and cargo offers
+          # no way for a feature to opt out of it.
+          #
+          # It did exactly that. `--all-features` enabled
+          # rustdar-overlays/fake-source, so every desktop download registered a
+          # thirteenth layer called "Fake Source", drew it, and wrote its id into
+          # the user's config. Read out of the binary, not inferred: the same bin
+          # built both ways in one tree carries `FakeSourceHandler` 129 times,
+          # "Fake Source" once and `overlay/fake` 3 times under `--all-features`,
+          # and zero of each under the list below, with "Reflectivity" found 11
+          # times in both as the control that the scan reads something.
+          #
+          # It also overrode the workspace's deliberate
+          # `nexrad-data = { default-features = false }` and compiled that
+          # crate's AWS polling arm into the binary. Measured, so the claim is no
+          # larger than the fact: the resolved PACKAGE set is identical either
+          # way (470), and reqwest, rustls, tokio and rayon are in the graph
+          # regardless -- reqwest arrives through `walkers`. What
+          # `--all-features` added was feature surface on packages already
+          # present, not new dependencies.
+          #
+          # `rustdar/jni-typecheck` is the one thing these rows want that the
+          # manifests do not already give them. It widens the
+          # `cfg(target_os = "android")` module gate so the JNI bodies
+          # type-check on the host, and forwards to
+          # rustdar-location/jni-typecheck.
+          #
+          # The serial/IOKit half needs no flag and never did: rustdar's own
+          # `[target.'cfg(not(any(android, ios)))'.dependencies]` block turns on
+          # rustdar-nmea-serial/serial, rustdar-egui/gps-serial and
+          # rustdar-location/serial for exactly these targets. Measured --
+          # `cargo tree -p rustdar --target aarch64-apple-darwin -i io-kit-sys`
+          # prints serialport with no feature flag at all, and prints nothing at
+          # all for aarch64-apple-ios. The comment this replaces credited
+          # `--all-features` for the IOKit link; measuring it is what showed the
+          # credit was misplaced.
+          #
+          # What the list gives up against `--all-features`, from
+          # `cargo metadata --filter-platform`: 18 resolved features -- the
+          # fake-source family (3), nexrad-data's aws arm with bzip2-rs/rayon
+          # (9), and 6 transitive tokio features under them. clippy.yaml still
+          # runs `--all-features` on the host, so what is given up is
+          # cross-target compile coverage of those arms, not coverage.
+          #
+          # `rustdar/src/release_artifact_features.rs` holds this as a test: it
+          # parses this matrix and, for every row carrying an `artifact:` key,
+          # asserts that the feature SET the row's command requests contains no
+          # test-only feature. `--all-features` fails it because it expands to
+          # every feature the member manifests declare -- the property, not the
+          # spelling.
           #
           # `--release` on every row whose artifact a person can run, and folded
           # into the command that already provides the compile coverage rather
@@ -48,8 +100,8 @@ jobs:
           # instead of 12 GB, and the uploaded file is 27.5 MB instead of 602 MB
           # on four rows every run. The cost is CPU -- about 3.4x warm, since
           # 21 test binaries nobody runs are linked under fat LTO.
-          # `--all-targets --all-features` is unchanged, so the coverage is the
-          # same set of crates and the same set of features as before.
+          # `--all-targets` is unchanged, so the crate coverage is the same set
+          # of crates as before; the feature coverage is the list above.
           #
           # Until this said `--release`, every desktop download was workspace
           # code at `opt-level = 0` with debug assertions on.
@@ -59,7 +111,7 @@ jobs:
           # code at 2349 ms per Level II frame against 160-190 ms.
           - name: linux-x86_64
             target: x86_64-unknown-linux-gnu
-            cmd: cargo build --release --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu
+            cmd: cargo build --release --workspace --all-targets --features rustdar/jni-typecheck --target x86_64-unknown-linux-gnu
             artifact: target/x86_64-unknown-linux-gnu/release/rustdar
           # The artifact is a signed .app in a zip, not the bare executable.
           # Three reasons, and none of them is polish: arm64 macOS refuses to
@@ -72,18 +124,18 @@ jobs:
             target: aarch64-apple-darwin
             package: macos
             macos_arch: aarch64
-            cmd: cargo build --release --workspace --all-targets --all-features --target aarch64-apple-darwin
+            cmd: cargo build --release --workspace --all-targets --features rustdar/jni-typecheck --target aarch64-apple-darwin
             artifact: packaging/macos/build/aarch64-apple-darwin/rustdar.app.zip
           - name: macos-x86_64
             target: x86_64-apple-darwin
             package: macos
             macos_arch: x86_64
-            cmd: cargo build --release --workspace --all-targets --all-features --target x86_64-apple-darwin
+            cmd: cargo build --release --workspace --all-targets --features rustdar/jni-typecheck --target x86_64-apple-darwin
             artifact: packaging/macos/build/x86_64-apple-darwin/rustdar.app.zip
           # gnullvm, not MSVC: MSVC is the one family the image does not carry.
           - name: windows-x86_64
             target: x86_64-pc-windows-gnullvm
-            cmd: cargo build --release --workspace --all-targets --all-features --target x86_64-pc-windows-gnullvm
+            cmd: cargo build --release --workspace --all-targets --features rustdar/jni-typecheck --target x86_64-pc-windows-gnullvm
             artifact: target/x86_64-pc-windows-gnullvm/release/rustdar.exe
 
           # A real link, not a `check`. `rustdar --lib` as a staticlib
