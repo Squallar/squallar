@@ -1,10 +1,12 @@
-//! The site picker's three shortcut sections — W12 through W15.
+//! The site picker's shortcut sections and its ranked search — W12 to W17.
 //!
 //! A dedicated file rather than another block in `input_harness/tests.rs`:
 //! everything here is about one body, `pills::site_list_ui`, and the probes it
 //! fills.
 
-use super::{FAVORITES_HEADING, IN_USE_HEADING, NEARBY_HEADING, SiteSection};
+use super::{
+    FAVORITES_HEADING, IN_USE_HEADING, MatchRank, NEARBY_HEADING, SiteSection, match_rank,
+};
 use crate::input_harness::InputHarness;
 
 /// A screen wide enough for the Expanded chrome, where the inspector is a
@@ -41,6 +43,15 @@ fn group_row(h: &InputHarness, site: &str) -> super::SiteRowProbe {
         .into_iter()
         .find(|row| row.site == site && matches!(row.section, SiteSection::Network(_)))
         .unwrap_or_else(|| panic!("{site} was not drawn in a network group"))
+}
+
+/// Type `query` into the inspector's site search, replacing whatever is there.
+fn search_for(h: &mut InputHarness, query: &str) {
+    let field = h.inspector().site_search;
+    h.mouse_click(field.center());
+    h.key_press(egui::Key::A);
+    h.type_text(query);
+    h.warm_up();
 }
 
 // -- W12: the sections exist, and are absent when they have nothing ---------
@@ -346,5 +357,119 @@ fn nearby_appears_only_with_a_fix_and_reads_in_the_users_unit() {
             .iter()
             .all(|row| row.note.as_deref().is_some_and(|n| n.ends_with(" mi"))),
         "the rows must follow the preference: {miles:?}",
+    );
+}
+
+// -- W17: place names, and the ranking ---------------------------------------
+
+/// The four rungs, on the one function that is the sort key.
+#[test]
+fn the_rank_puts_the_identifier_ahead_of_the_place() {
+    assert_eq!(match_rank("KMKX", "KMKX"), Some(MatchRank::ExactId));
+    assert_eq!(match_rank("KMKX", "KM"), Some(MatchRank::IdPrefix));
+    // The three-letter short form is why the substring rung survives.
+    assert_eq!(match_rank("KMKX", "MKX"), Some(MatchRank::IdSubstring));
+    assert_eq!(match_rank("KMKX", "MILWAUKEE"), Some(MatchRank::Place));
+    assert_eq!(match_rank("KMKX", "PORTLAND"), None);
+    // An empty query is not a filter, and every row lands on one rung so the
+    // sort below it is the identity.
+    assert_eq!(match_rank("KMKX", ""), match_rank("KTLX", ""));
+
+    // The rungs are ordered best-first, which is what `sort_by_key` reads.
+    let mut rungs = [
+        MatchRank::Place,
+        MatchRank::IdSubstring,
+        MatchRank::ExactId,
+        MatchRank::IdPrefix,
+    ];
+    rungs.sort();
+    assert_eq!(
+        rungs,
+        [
+            MatchRank::ExactId,
+            MatchRank::IdPrefix,
+            MatchRank::IdSubstring,
+            MatchRank::Place,
+        ],
+    );
+}
+
+/// **"Milwaukee" finds `KMKX`.** The station record publishes one free-text
+/// name per station and it is matched whole.
+#[test]
+fn a_place_name_finds_its_radar_and_the_row_says_why() {
+    let mut h = InputHarness::with_screen(WIDE);
+    h.open_pane_props();
+    search_for(&mut h, "milwaukee");
+
+    let inventory: Vec<String> = h
+        .inspector()
+        .site_rows
+        .into_iter()
+        .map(|(site, ..)| site)
+        .collect();
+    assert_eq!(
+        inventory,
+        vec!["KMKX".to_owned()],
+        "the place name must reach the radar and nothing else",
+    );
+    assert_eq!(
+        group_row(&h, "KMKX").label,
+        "KMKX - Milwaukee",
+        "and the row must say what matched, or the result is inexplicable",
+    );
+}
+
+/// **The list is a ranking now, not a filter.**
+///
+/// `IN` reaches `KINX` through its identifier and `KTLX` (Twin Lakes) and
+/// `KMPX` (Minneapolis) through their places. The identifier match must sort
+/// above both — and `KTLX` is the *first* row of the fixture table, so an
+/// unranked filter would put it first.
+#[test]
+fn an_identifier_match_outranks_a_place_match_that_comes_earlier_in_the_table() {
+    let mut h = InputHarness::with_screen(WIDE);
+    h.open_pane_props();
+    search_for(&mut h, "in");
+
+    let shown: Vec<String> = h
+        .inspector()
+        .site_rows
+        .into_iter()
+        .map(|(site, ..)| site)
+        .collect();
+    assert!(
+        shown.contains(&"KINX".to_owned())
+            && shown.contains(&"KTLX".to_owned())
+            && shown.contains(&"KMPX".to_owned()),
+        "precondition: the query must mix an id match with two place matches; \
+         drew {shown:?}",
+    );
+    assert_eq!(
+        shown.first().map(String::as_str),
+        Some("KINX"),
+        "the identifier match must lead; drew {shown:?}",
+    );
+}
+
+/// **The caption names its denominator.** Both halves are radars, because the
+/// sections repeat rows and a row count would disagree with the ratio.
+#[test]
+fn the_caption_counts_radars_rather_than_rows() {
+    let mut h = InputHarness::with_screen(WIDE);
+    h.gui_mut().favorite_sites = vec!["KMKX".to_owned()];
+    h.open_pane_props();
+
+    let total = rustdar_radar::sites::radars().len() + rustdar_radar::sites::unplaced().len();
+    let caption = h.inspector().site_caption;
+    assert!(
+        caption.starts_with(&format!("{total} of {total} radars")),
+        "drew {caption:?}",
+    );
+    assert!(
+        rows(&h).len() > total,
+        "precondition: the sections did repeat a row, so the count and the \
+         paint really do differ — {} rows against {total} radars",
+        rows(&h).len(),
     );
 }

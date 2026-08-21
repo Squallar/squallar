@@ -338,6 +338,33 @@ fn install_radars() {
         // list's second inventory is exercised by the ordinary harness rather
         // than only by a test that goes looking for it. `KCRI` is a real one.
         rustdar_radar::sites::resolve([("KCRI", SiteFix::Unplaced)]);
+        // The places the station record publishes for a handful of the rows
+        // above, so the place-name search and the place-bearing row label are
+        // exercised by the ordinary harness rather than only where a test
+        // installs one. Real names, verbatim: the feed publishes one free-text
+        // field per station and there is no state to split off.
+        //
+        // `SiteFix::Network` ranks BELOW `Learned`, so not one position moves
+        // — the fixes above keep every row. Only `places` gains entries.
+        const PLACES: [(&str, i32, i32, i32, &str); 4] = [
+            ("KTLX", 35_333_060, -97_277_500, 370, "Twin Lakes"),
+            ("KINX", 36_175_000, -95_565_000, 204, "Tulsa"),
+            ("KMPX", 44_849_000, -93_566_000, 288, "Minneapolis"),
+            ("KMKX", 42_967_000, -88_550_000, 292, "Milwaukee"),
+        ];
+        rustdar_radar::sites::resolve(PLACES.map(
+            |(name, lat_udeg, lon_udeg, elevation_m, place)| {
+                (
+                    name,
+                    SiteFix::Network {
+                        lat_udeg,
+                        lon_udeg,
+                        elevation_m,
+                        place: Some(place),
+                    },
+                )
+            },
+        ));
     });
 }
 
