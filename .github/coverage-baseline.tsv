@@ -7,7 +7,7 @@ nexrad-level3/src/model/radial.rs	86	85
 nexrad-level3/src/model/symbology.rs	5	5
 rustdar-app/src/app.rs	1321	998
 rustdar-app/src/app_chunks.rs	216	129
-rustdar-app/src/app_fetch.rs	1371	986
+rustdar-app/src/app_fetch.rs	1371	969
 rustdar-app/src/app_render.rs	2384	1732
 rustdar-app/src/app_state.rs	72	0
 rustdar-app/src/budget_arms.rs	17	17
@@ -152,7 +152,7 @@ rustdar-overlays/src/types.rs	24	24
 rustdar-radar/src/archive.rs	249	222
 rustdar-radar/src/azimuth.rs	191	191
 rustdar-radar/src/beam.rs	33	33
-rustdar-radar/src/catalogue.rs	149	134
+rustdar-radar/src/catalogue.rs	149	137
 rustdar-radar/src/chunk_feed.rs	271	257
 rustdar-radar/src/chunk_notify.rs	340	309
 rustdar-radar/src/chunks.rs	975	710
@@ -169,7 +169,7 @@ rustdar-radar/src/hover.rs	49	49
 rustdar-radar/src/jobs.rs	594	558
 rustdar-radar/src/kdp.rs	247	203
 rustdar-radar/src/l3_values.rs	282	281
-rustdar-radar/src/level3.rs	188	134
+rustdar-radar/src/level3.rs	188	118
 rustdar-radar/src/loop_downloads.rs	736	717
 rustdar-radar/src/loop_geometry.rs	7	7
 rustdar-radar/src/nrot.rs	3227	3168
@@ -204,7 +204,7 @@ rustdar-source/src/handler.rs	319	201
 rustdar-source/src/id.rs	46	46
 rustdar-source/src/job.rs	184	157
 rustdar-source/src/liveness.rs	39	39
-rustdar-source/src/origins.rs	204	204
+rustdar-source/src/origins.rs	225	225
 rustdar-source/src/product.rs	12	12
 rustdar-source/src/time.rs	7	7
 rustdar-source/src/tls.rs	32	32
@@ -242,7 +242,7 @@ rustdar/src/android/task_to_back.rs	15	0
 rustdar/src/android/theme.rs	25	0
 rustdar/src/kv.rs	250	234
 rustdar/src/main.rs	6	0
-rustdar/src/network_security_config.rs	150	147
+rustdar/src/network_security_config.rs	140	137
 rustdar/src/platform.rs	82	0
 rustdar/src/run.rs	33	0
 vendor/bzip2-rs/src/bitreader.rs	91	88
