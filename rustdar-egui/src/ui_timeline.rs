@@ -187,6 +187,14 @@ impl Default for TimelineProbe {
     }
 }
 
+/// What the Lookback and Speed sliders say about their reach.
+///
+/// `set_loop_span_secs` and `set_loop_speed_fps` write **every** pane,
+/// including fully unlinked ones — one window, one number — while sitting in
+/// the same row as a transport that respects the links. The behaviour is
+/// defensible and unchanged; the silence was not.
+const TUNING_SCOPE_CAPTION: &str = "Lookback and Speed apply to every pane, linked or not.";
+
 /// Row 2 of the probe: the loop tuning as drawn. The transport rects are
 /// [`egui::Rect::NOTHING`] and the texts empty while no loop is active — the
 /// row draws its tuning sliders unconditionally and its frame transport only
@@ -196,6 +204,8 @@ impl Default for TimelineProbe {
 pub(crate) struct TimelineRow2Probe {
     pub lookback: egui::Rect,
     pub speed: egui::Rect,
+    /// The caption under the two sliders, naming what they reach.
+    pub tuning_scope: String,
     pub prev: egui::Rect,
     pub play: egui::Rect,
     pub next: egui::Rect,
@@ -215,6 +225,7 @@ impl Default for TimelineRow2Probe {
         Self {
             lookback: egui::Rect::NOTHING,
             speed: egui::Rect::NOTHING,
+            tuning_scope: String::new(),
             prev: egui::Rect::NOTHING,
             play: egui::Rect::NOTHING,
             next: egui::Rect::NOTHING,
@@ -830,6 +841,11 @@ impl super::Gui {
             #[cfg(not(test))]
             let _ = speed;
         });
+        ui.label(egui::RichText::new(TUNING_SCOPE_CAPTION).small().weak());
+        #[cfg(test)]
+        {
+            row2.tuning_scope = TUNING_SCOPE_CAPTION.to_owned();
+        }
 
         if loop_active {
             let ls = self.panes[pane_idx].loop_state();

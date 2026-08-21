@@ -38,6 +38,9 @@ impl Gui {
     /// posture carries a copy — so it is written to every pane, not to the
     /// sync group: the one number has always applied to the whole window,
     /// linked or not.
+    ///
+    /// The slider says so, in `ui_timeline.rs`'s `TUNING_SCOPE_CAPTION` —
+    /// narrow this to the group and that caption becomes a lie.
     pub(crate) fn set_loop_span_secs(&mut self, secs: u64) {
         self.loop_lookback_secs = secs;
         for pane in &mut self.panes {
