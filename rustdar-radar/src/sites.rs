@@ -98,7 +98,10 @@ pub enum SiteHeights {
 ///
 /// The identifier rule is an offline approximation of a fact the API states:
 /// `api.weather.gov/radar/stations` gives a `stationType` per station, and the
-/// prefix is what this crate can answer without it.
+/// prefix is what this crate can answer without it — for every identifier,
+/// including the ones no station record places.
+/// `the_prefix_rule_agrees_with_the_api_on_every_placed_station` is what keeps
+/// the two from drifting apart in silence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum RadarNetwork {
     /// The WSR-88D network: dual-pol moments, 0.5° radials, and every Level III

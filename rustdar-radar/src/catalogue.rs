@@ -23,7 +23,7 @@
 //! and the NWS does not is real, and is recorded here as a member with no
 //! position of its own — see [`SiteCatalogue`].
 
-use crate::sites::SiteFix;
+use crate::sites::{RadarNetwork, SiteFix};
 use crate::sources::DataSources;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -49,6 +49,29 @@ pub struct CataloguePosition {
     /// under the tower for a WSR-88D, not the feedhorn.
     #[serde(alias = "feedhorn_m")]
     pub elevation_m: i32,
+    /// Which network the station record says this radar belongs to, or `None`
+    /// where it says nothing this build recognises.
+    ///
+    /// **The API is the authority here and the identifier rule is the offline
+    /// approximation of it** — [`RadarNetwork::of_id`] answers for every
+    /// identifier, including the ones no station record places, and
+    /// `the_prefix_rule_agrees_with_the_api_on_every_placed_station` is what
+    /// keeps the two from drifting apart in silence.
+    ///
+    /// **The `Option` is what makes an old cache load, not the attribute.**
+    /// [`SiteCatalogue`] is `#[serde(transparent)]` over a bare map and is
+    /// persisted as a cache; appending a field leaves every key already in the
+    /// blob where it was, a cache written before this field existed loads with
+    /// `None` here, and a cache written *after* it loads into an older build
+    /// with the field ignored and dropped on that build's next write. Both
+    /// directions are lossless for the positions, which is all a cache is for.
+    ///
+    /// `#[serde(default)]` is redundant beside an `Option` and is kept only to
+    /// state the intent — **measured**: removing it leaves
+    /// `a_cache_written_before_the_network_was_learned_loads_without_one`
+    /// green, and making the field required is what turns it red.
+    #[serde(default)]
+    pub network: Option<RadarNetwork>,
 }
 
 /// Every radar the live archive carries, with a position where one is
@@ -85,6 +108,21 @@ impl SiteCatalogue {
     /// cannot place it.
     pub fn position(&self, id: &str) -> Option<CataloguePosition> {
         self.sites.get(id).copied().flatten()
+    }
+
+    /// Which network this catalogue says `id` is on, or `None` where it does
+    /// not carry `id`, cannot place it, or was written before the station
+    /// record's type was read.
+    ///
+    /// A **placed** row is the only one that can carry this: an identifier the
+    /// bucket lists and the NWS does not has no station record to have stated a
+    /// type. [`RadarNetwork::of_id`] is what answers for those.
+    pub fn network(&self, id: &str) -> Option<RadarNetwork> {
+        self.sites
+            .get(id)
+            .copied()
+            .flatten()
+            .and_then(|p| p.network)
     }
 
     /// How many radars this catalogue carries, placed or not.
@@ -219,6 +257,11 @@ struct Geometry {
 struct StationProperties {
     id: String,
     elevation: Option<Quantity>,
+    /// `"WSR-88D"`, `"TDWR"`, or something this build does not recognise —
+    /// the API carries profilers too. Never a reason to skip a station: an
+    /// unrecognised type leaves the network unknown and the position good.
+    #[serde(rename = "stationType", default)]
+    station_type: Option<String>,
 }
 
 /// A JSON-LD quantity: `{"unitCode": "wmoUnit:m", "value": 386.7}`.
@@ -258,12 +301,18 @@ pub(crate) fn parse_stations(body: &str) -> BTreeMap<String, CataloguePosition> 
             if lat == 0.0 && lon == 0.0 {
                 return None;
             }
+            let network = match station.properties.station_type.as_deref() {
+                Some("WSR-88D") => Some(RadarNetwork::Wsr88d),
+                Some("TDWR") => Some(RadarNetwork::Tdwr),
+                _ => None,
+            };
             Some((
                 station.properties.id,
                 CataloguePosition {
                     lat_udeg: crate::site_position::micro_from_degrees(lat),
                     lon_udeg: crate::site_position::micro_from_degrees(lon),
                     elevation_m: elevation_m.round() as i32,
+                    network,
                 },
             ))
         })

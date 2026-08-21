@@ -23,6 +23,7 @@ fn fetched() -> SiteCatalogue {
             lat_udeg: -30_000_000,
             lon_udeg: -140_000_000,
             elevation_m: 400,
+            network: None,
         },
     );
     SiteCatalogue::union([ARRIVAL.to_string(), UNPLACEABLE.to_string()], &positions)
@@ -38,6 +39,7 @@ fn catalogue_naming(id: &str, lat_udeg: i32) -> SiteCatalogue {
             lat_udeg,
             lon_udeg: -141_000_000,
             elevation_m: 400,
+            network: None,
         },
     );
     SiteCatalogue::union([id.to_string()], &positions)
