@@ -104,8 +104,10 @@ features = [
 # and routes through the browser's `fetch()`.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # The single declaration of every network origin rustdar reads from; the test
-# derives the service worker's never-cache hostnames from it.
-rustdar-radar = { workspace = true }
+# derives the service worker's never-cache hostnames from it. Named at the
+# substrate rather than through `rustdar_radar::sources`, which is a re-export
+# of exactly this module.
+rustdar-source = { workspace = true }
 serde_json = { workspace = true }
 
 # For `tests/tier1_wasm.rs` -- the Tier-1 browser gate, run in a real browser

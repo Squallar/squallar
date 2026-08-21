@@ -74,7 +74,7 @@ fn parse_domains(xml: &str) -> Vec<DomainRule> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustdar_radar::sources::DataSources;
+    use rustdar_source::origins::DataSources;
     use std::collections::BTreeSet;
     use walkers::sources::TileSource;
 
@@ -99,20 +99,14 @@ mod tests {
         let s = DataSources::production();
         let mut hosts = BTreeSet::new();
 
-        for bucket in [
-            &s.level2_bucket,
-            &s.level2_chunks_bucket,
-            &s.level3_bucket,
-            &s.hrrr_bucket,
-            &s.goes_east_bucket,
-            &s.goes_west_bucket,
-        ] {
-            hosts.insert(host_of(&s.s3_object_url(bucket, "k")));
+        // The one enumeration of the data origins, shared with the service
+        // worker's deny-list pair. Restating it here is what let the two drift.
+        for url in s.origin_urls() {
+            hosts.insert(host_of(&url));
         }
 
-        for base in [&s.nws_api_base, &s.spc_base, &s.iem_base, &s.sounding_base] {
-            hosts.insert(host_of(base));
-        }
+        // Tiles are this walker's own addition: they are not data origins, and
+        // `sw.js` handles them by regex and caches them on purpose.
 
         // `tile_url` picks a subdomain from `x % 4`, so walk all four.
         for style in [

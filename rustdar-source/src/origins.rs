@@ -92,6 +92,46 @@ impl DataSources {
         }
     }
 
+    /// **Every DATA origin this application reads from, as URLs — the one
+    /// enumeration of the set.**
+    ///
+    /// Six bucket-object URLs (addressed through [`s3_base`](Self::s3_base), so
+    /// a test pointing that field at a mock server moves these with it) and the
+    /// four API bases. Callers that want hostnames take the host of each.
+    ///
+    /// It exists because two walkers used to restate this list independently —
+    /// Android's `network_security_config` coverage pair and the service
+    /// worker's never-cache declaration — which is precisely the drift they
+    /// were written to catch. One list, two consumers.
+    ///
+    /// **Tile hosts are deliberately absent.** A basemap tile is cacheable and
+    /// is meant to be cached; `sw.js` routes it by regex to a cache with a size
+    /// cap, and it must never appear in a never-cache deny list. The Android
+    /// config *does* need the tile subdomains, so that walker adds them itself
+    /// — the difference is real, and keeping it out of the shared enumeration
+    /// is what stops the reverse pin demanding tile hosts in `sw.js`.
+    pub fn origin_urls(&self) -> Vec<String> {
+        let buckets = [
+            &self.level2_bucket,
+            &self.level2_chunks_bucket,
+            &self.level3_bucket,
+            &self.hrrr_bucket,
+            &self.goes_east_bucket,
+            &self.goes_west_bucket,
+        ];
+        let bases = [
+            &self.nws_api_base,
+            &self.spc_base,
+            &self.iem_base,
+            &self.sounding_base,
+        ];
+        buckets
+            .into_iter()
+            .map(|bucket| self.s3_object_url(bucket, "k"))
+            .chain(bases.into_iter().map(|base| base.to_string()))
+            .collect()
+    }
+
     /// Every METAR fetch goes through here, so the origin's recorded rule is the
     /// rule the request obeys.
     pub fn metar_client(&self, timeout: std::time::Duration) -> reqwest::ClientBuilder {

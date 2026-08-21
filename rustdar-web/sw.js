@@ -121,10 +121,15 @@ const SHELL_VERSION_PROBES = [
 ];
 
 /*
- * Every origin `rustdar_radar::sources::DataSources::production()` reads from.
- * Belt and braces on top of default-deny, but `tests/pwa_assets.rs` pins the set
- * against the Rust declaration, so a new data source cannot be added without
- * someone reading this file.
+ * Every origin `rustdar_source::origins::DataSources::production()` reads from,
+ * and nothing else. Belt and braces on top of default-deny, but
+ * `tests/pwa_assets.rs` pins the set against the Rust declaration in BOTH
+ * directions -- every origin appears here, and every entry here is an origin --
+ * so a new data source cannot be added without someone reading this file, and a
+ * retired one cannot linger in the list once it is gone from `DataSources`.
+ *
+ * Basemap tiles are NOT here on purpose: they are cached deliberately, by
+ * `BASEMAP_HOST` and its own route below.
  */
 const NEVER_CACHE_HOSTS = new Set([
   "unidata-nexrad-level2.s3.amazonaws.com",
