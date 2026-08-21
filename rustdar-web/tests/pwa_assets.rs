@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use rustdar_radar::sources::DataSources;
+use rustdar_source::origins::DataSources;
 
 const MANIFEST: &str = include_str!("../manifest.webmanifest");
 const SERVICE_WORKER: &str = include_str!("../sw.js");
@@ -336,22 +336,11 @@ fn the_worker_states_every_production_data_origin_in_its_deny_list() {
         "NEVER_CACHE_HOSTS in sw.js parsed as empty"
     );
 
-    let s = DataSources::production();
-    let origins = [
-        &s.level2_bucket,
-        &s.level2_chunks_bucket,
-        &s.level3_bucket,
-        &s.hrrr_bucket,
-        &s.goes_east_bucket,
-        &s.goes_west_bucket,
-        &s.nws_api_base,
-        &s.spc_base,
-        &s.iem_base,
-        &s.sounding_base,
-    ];
-
-    for origin in origins {
-        let host = host_of(origin);
+    // The one enumeration, shared with `network_security_config`'s coverage
+    // pair. Both walkers restated it independently until WO-M15.6 — which is
+    // exactly the drift they exist to catch.
+    for origin in DataSources::production().origin_urls() {
+        let host = host_of(&origin);
         assert!(
             denied.contains(&host),
             "{host} is a production data origin but is not in NEVER_CACHE_HOSTS \
@@ -359,6 +348,47 @@ fn the_worker_states_every_production_data_origin_in_its_deny_list() {
              cached today, but the list is what states the policy."
         );
     }
+}
+
+/// **The second direction, which the worker's deny list did not have.**
+///
+/// The Android config is pinned both ways —
+/// `every_live_origin_is_covered_by_the_network_security_config` and
+/// `the_network_security_config_lists_nothing_unused`. `sw.js` had only the
+/// first, so an origin removed from `DataSources` would linger in the deny list
+/// for as long as nobody happened to read it. One-directional pins have hidden
+/// the case they existed for three times on this campaign.
+///
+/// **Tile hosts are not expected here and must never be.** A basemap tile is
+/// cached on purpose, by the `BASEMAP_HOST` regex and its own cache route; the
+/// shared enumeration is data origins only, so this test does not demand them.
+#[test]
+fn the_worker_deny_list_names_nothing_that_is_not_a_data_origin() {
+    let denied = js_string_list(SERVICE_WORKER, "const NEVER_CACHE_HOSTS = new Set([");
+    assert!(
+        !denied.is_empty(),
+        "NEVER_CACHE_HOSTS in sw.js parsed as empty"
+    );
+
+    let live: BTreeSet<String> = DataSources::production()
+        .origin_urls()
+        .iter()
+        .map(|origin| host_of(origin))
+        .collect();
+    // Non-triviality: an empty expectation would make every entry unused and
+    // an empty deny list would make the walk vacuous.
+    assert_eq!(
+        live.len(),
+        10,
+        "the data-origin enumeration moved: {live:?}"
+    );
+
+    let unused: Vec<&String> = denied.iter().filter(|host| !live.contains(*host)).collect();
+    assert!(
+        unused.is_empty(),
+        "NEVER_CACHE_HOSTS in rustdar-web/sw.js names hosts no DataSources \
+         origin resolves to; drop them or update DataSources: {unused:?}"
+    );
 }
 
 #[test]

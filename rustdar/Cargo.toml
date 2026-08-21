@@ -56,7 +56,9 @@ env_logger = "=0.11.11"
 
 [dev-dependencies]
 # Both only for src/network_security_config.rs, which is `#[cfg(test)]`.
-rustdar-radar = { workspace = true }
+# The origins are named at the substrate rather than through
+# `rustdar_radar::sources`, which is a re-export of exactly this module.
+rustdar-source = { workspace = true }
 walkers = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]

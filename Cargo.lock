@@ -4184,7 +4184,7 @@ dependencies = [
  "rustdar-kv",
  "rustdar-location",
  "rustdar-nmea-serial",
- "rustdar-radar",
+ "rustdar-source",
  "rustls-platform-verifier",
  "walkers",
  "winit",
