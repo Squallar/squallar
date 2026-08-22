@@ -1528,16 +1528,41 @@ impl super::App {
 
     /// Navigate by a relative time step (seconds). Positive = forward, negative = backward.
     fn handle_navigate_time(&mut self, pane_idx: usize, step_secs: i64) {
-        let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
+        // One reach for the pane and the registry both: the transport's own
+        // axis decides below whether "past now" means "live".
+        let (panes, overlays) = self.gui.panes_and_overlays_mut();
+        let Some(pane) = panes.get(pane_idx) else {
+            return;
+        };
+        let Some(scan_info) = pane.scan_info.as_ref() else {
             return;
         };
         let site = scan_info.site.name.to_string();
         let current_utc = scan_info.timestamp;
+        // Read off the registry by id, never off a `match` on the id (WI-10):
+        // whether stamps later than the wall clock are expected is the
+        // layer's own declaration.
+        let transport_extends_future =
+            overlays
+                .handler_by_id(pane.transport_layer())
+                .is_some_and(|h| {
+                    matches!(
+                        h.time_axis(),
+                        rustdar_source::time::TimeAxis::FrameSeries {
+                            extends_future: true,
+                            ..
+                        }
+                    )
+                });
 
         let target = current_utc + chrono::Duration::seconds(step_secs);
         let now_utc = chrono::Utc::now().naive_utc();
 
-        let (target, is_live) = if step_secs > 0 && target >= now_utc {
+        // On a transport that extends into the future, a forward step past
+        // `now` names a forecast instant: neither clamped back to the wall
+        // clock nor reported as live — `viewing_live` means the *selection*
+        // follows live data, not "the picture depicts now".
+        let (target, is_live) = if step_secs > 0 && target >= now_utc && !transport_extends_future {
             (now_utc, true)
         } else {
             (target, false)

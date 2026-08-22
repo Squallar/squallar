@@ -1764,15 +1764,40 @@ impl PaneState {
         self.overlay_cache(id).and_then(|c| c.current())
     }
 
-    /// When the data behind the image *currently on screen* was collected.
+    /// When the data behind the image *currently on screen* was collected —
+    /// or, for a forecast frame, when it is *valid*: the transport playhead's
+    /// own stamp, which for a frame past the wall clock is the valid time.
+    ///
+    /// **Transport-addressed** (WI-9). It read `loop_state()` — radar's slot
+    /// by definition — so a pane looping a forecast reported no time of its
+    /// own and the chip fell through to another pane's clock.
     pub fn data_time_on_screen(&self) -> Option<NaiveDateTime> {
-        if self.loop_state().is_active() {
+        if self.transport_state().is_active() {
             // `playhead_stamp`, not the index: a clock before every frame the
             // loop holds names no frame, and captioning the oldest one would
             // date the picture hours off what is actually on screen.
-            return self.loop_state().playhead_stamp();
+            return self.transport_state().playhead_stamp();
         }
         self.data_time
+    }
+
+    /// **Whether this pane depicts a forecast instant** — its playhead stamp
+    /// sits after the wall clock (WI-10). The playhead is the pane's own
+    /// clock when it is parked, else the stamp its timeline presents (a
+    /// forecast transport under a live clock presents its newest frame).
+    ///
+    /// **Not the negation of [`Self::viewing_live`]**, which is about the
+    /// *selection* following live data — a pane parked on a forecast frame
+    /// still follows its live site (the chunk feed and auto-poll keep
+    /// running). This is about the *instant depicted*, which is the question
+    /// the scrubber's resting position and the forward-step enable actually
+    /// ask.
+    pub fn depicts_future(&self, now: NaiveDateTime) -> bool {
+        let depicted = match self.time.mode {
+            TimeMode::AsOf(t) => Some(t),
+            TimeMode::Live => self.data_time_on_screen(),
+        };
+        depicted.is_some_and(|t| t > now)
     }
 
     /// What the radar image on screen depicts, **when that is not what this pane

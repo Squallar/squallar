@@ -100,11 +100,24 @@ impl Gui {
 
     /// [`Self::time_sync_targets`] narrowed to the panes a loop can feed —
     /// the fan-out for every loop action.
+    ///
+    /// **Narrowed to the source pane's transport layer** (WI-12): the frame
+    /// indices these actions carry are indices into the *active* pane's
+    /// transport timeline, so a linked pane whose transport addresses a
+    /// different layer is not a target — seeking a radar pane to a forecast
+    /// index parks it on whichever scan happens to sit at that offset.
     pub(super) fn loop_sync_targets(&self) -> Vec<usize> {
+        let src_transport = self
+            .panes
+            .get(self.active_pane)
+            .map(PaneState::transport_layer);
         self.time_sync_targets()
             .into_iter()
             .filter(|&idx| {
-                idx == self.active_pane || self.panes.get(idx).is_none_or(PaneState::can_loop)
+                idx == self.active_pane
+                    || self.panes.get(idx).is_none_or(|pane| {
+                        pane.can_loop() && Some(pane.transport_layer()) == src_transport
+                    })
             })
             .collect()
     }

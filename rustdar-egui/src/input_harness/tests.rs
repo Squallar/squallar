@@ -14700,3 +14700,217 @@ fn the_loop_rail_breaks_where_the_frames_straddle_now() {
         );
     }
 }
+
+// -- WI-9 / WI-10: the transport tells the truth about a forecast pane ----
+
+/// **The chip names the forecast pane's own valid time, and says `forecast`**
+/// (WI-9) — read off the timestamp the transport really painted, on a
+/// two-pane layout built to expose the old fallthrough: pane 0 loops a
+/// forecast parked on f06, pane 1 sits on live radar with a fresh stamp of
+/// its own. `data_time_on_screen` used to read radar's slot by definition, so
+/// pane 0 reported no time and the chip borrowed pane 1's clock — captioned
+/// `live`, over a picture of five and a half hours from now.
+#[test]
+fn the_chip_names_a_forecast_loops_own_valid_time_and_says_forecast() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(2);
+    h.set_overlay_on_pane(0, &known::MODEL_DATA, true);
+    h.set_overlay_on_pane(0, &known::RADAR, false);
+    h.frames_for(FADE_SETTLED_FRAMES, 0.1);
+    assert_eq!(
+        *h.gui_mut().pane(0).expect("pane 0").transport_layer(),
+        known::MODEL_DATA,
+        "precondition: pane 0's transport must address the forecast layer"
+    );
+
+    let now = chrono::Utc::now().naive_utc();
+    // f00 half an hour old, hourly frames: f06 is five and a half hours out.
+    let valid = |f_hour: i64| now + chrono::Duration::hours(f_hour) - chrono::Duration::minutes(30);
+    let neighbour_stamp = now - chrono::Duration::minutes(3);
+    {
+        let gui = h.gui_mut();
+        gui.preferences.timezone = rustdar_units::TimezonePreference::Utc;
+        let pane1 = gui.pane_mut(1).expect("pane 1");
+        pane1.data_time = Some(neighbour_stamp);
+        assert!(pane1.viewing_live, "precondition: pane 1 follows live");
+        let pane0 = gui.pane_mut(0).expect("pane 0");
+        let ts = pane0.transport_state_mut();
+        ts.phase = crate::pane::LoopPhase::Paused;
+        ts.frames = (0..=18)
+            .map(|f_hour| crate::pane::LoopFrame {
+                timestamp: valid(f_hour),
+                image: None,
+                render_in_flight: false,
+                render_failed: false,
+            })
+            .collect();
+        assert!(
+            pane0.park_on_transport_frame(6),
+            "precondition: f06 exists to park on"
+        );
+    }
+    h.frames_for(2, 0.1);
+
+    let stamp = h.timeline().timestamp.1.clone();
+    // Expected from the stamp this test wrote, formatted independently of the
+    // chip's own path (the preference was pinned to UTC above).
+    let expected = format!("{} UTC", valid(6).format("%H:%M:%S"));
+    assert!(
+        stamp.contains(&expected),
+        "the transport stamp reads {stamp:?}, not pane 0's own f06 valid \
+         time {expected:?}"
+    );
+    assert!(
+        stamp.contains("forecast"),
+        "a stamp five and a half hours from now must be captioned \
+         `forecast`, got {stamp:?}"
+    );
+    let neighbour = format!("{} UTC", neighbour_stamp.format("%H:%M:%S"));
+    assert!(
+        !stamp.contains(&neighbour),
+        "the chip borrowed pane 1's clock ({neighbour:?}) over the forecast \
+         pane's own: {stamp:?}"
+    );
+}
+
+/// **A pane parked on a forecast frame keeps its forward step, rests its
+/// handle on the instant it depicts, and keeps its site in the chunk feed**
+/// (WI-10).
+///
+/// `viewing_live` means the *selection* follows live data, and it stays true
+/// here — which is exactly why the two widget reads must ask
+/// `depicts_future` instead. The `live_sites` assertion is the control: a
+/// "fix" that cleared `viewing_live` on a future-depicting pane would green
+/// the two widget reads and drop the pane's site from the chunk feed, and
+/// this test is built to red on that.
+#[test]
+fn a_pane_parked_on_a_forecast_frame_keeps_forward_step_and_its_chunk_feed() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    on_a_forecast_pane(&mut h);
+
+    let now = chrono::Utc::now().naive_utc();
+    {
+        let pane = h.gui_mut().pane_mut(0).expect("pane 0");
+        assert!(pane.viewing_live, "precondition: the pane follows live");
+        // Park on f12 by the clock: the posture is untouched, the instant
+        // depicted is twelve hours out.
+        pane.set_time_mode(crate::pane::TimeMode::AsOf(
+            now + chrono::Duration::hours(12),
+        ));
+        assert!(
+            pane.viewing_live,
+            "precondition: parking the clock must not clear the live posture"
+        );
+    }
+    h.frames_for(2, 0.1);
+
+    assert!(
+        h.timeline().fwd.1,
+        "forward-step is disabled on a pane parked twelve hours short of its \
+         horizon — `viewing_live` misread as `depicts now`"
+    );
+
+    let frac = h
+        .timeline()
+        .scrub_frac
+        .expect("precondition: the archive rail is up (no loop is running)");
+    assert!(
+        frac > crate::ui::NOW_SPLIT + 0.01,
+        "the handle rests at {frac:.3}, at or left of the now boundary \
+         ({:.2}) — hours left of the instant the pane depicts",
+        crate::ui::NOW_SPLIT,
+    );
+    assert!(
+        frac < 0.99,
+        "the handle rests at {frac:.3}, the far right edge — f12 is not the \
+         end of the horizon"
+    );
+
+    assert!(
+        h.gui_mut().live_sites().iter().any(|s| s == "KTLX"),
+        "the pane's site left the chunk feed: the fix cleared `viewing_live` \
+         instead of asking the right question"
+    );
+}
+
+// -- WI-12: loop sync respects the transport layer ------------------------
+
+/// **A seek on a forecast transport reaches only the panes on that
+/// transport** (WI-12) — driven through the loop rail itself, read off the
+/// actions the widget really emitted. Pane 1 is radar, time-linked, same
+/// group: without the transport filter it takes the same
+/// [`GuiAction::SeekLoopFrame`] index, which on a radar timeline is whichever
+/// scan happens to sit at that offset.
+#[test]
+fn a_seek_on_a_forecast_transport_does_not_reach_a_linked_radar_pane() {
+    use crate::actions::GuiAction;
+
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(2);
+    h.load_scan("KTLX");
+    h.set_overlay_on_pane(0, &known::MODEL_DATA, true);
+    h.set_overlay_on_pane(0, &known::RADAR, false);
+    h.frames_for(FADE_SETTLED_FRAMES, 0.1);
+    {
+        let gui = h.gui_mut();
+        assert_eq!(
+            *gui.pane(0).expect("pane 0").transport_layer(),
+            known::MODEL_DATA,
+            "precondition: pane 0's transport is the forecast layer"
+        );
+        assert_eq!(
+            *gui.pane(1).expect("pane 1").transport_layer(),
+            known::RADAR,
+            "precondition: pane 1's transport is radar"
+        );
+        assert!(
+            gui.panes_time_linked(0, 1),
+            "precondition: the two panes share time"
+        );
+        let now = chrono::Utc::now().naive_utc();
+        let pane0 = gui.pane_mut(0).expect("pane 0");
+        let ts = pane0.transport_state_mut();
+        ts.phase = crate::pane::LoopPhase::Paused;
+        ts.frames = (0..=18)
+            .map(|f_hour| crate::pane::LoopFrame {
+                timestamp: now + chrono::Duration::hours(f_hour) - chrono::Duration::minutes(30),
+                image: None,
+                render_in_flight: false,
+                render_failed: false,
+            })
+            .collect();
+        pane0.park_on_transport_frame(0);
+    }
+    h.frames_for(2, 0.1);
+    assert!(
+        h.widget_id_probes()
+            .iter()
+            .any(|(name, _)| *name == "timeline_scrubber_loop"),
+        "precondition: the frame-index rail is up on pane 0's loop"
+    );
+
+    let scrub = h.timeline().scrubber;
+    let target = egui::pos2(scrub.left() + 0.8 * scrub.width(), scrub.center().y);
+    h.mouse_press(target);
+    h.frame();
+    h.mouse_release(target);
+    h.frame();
+
+    let seeks: Vec<usize> = h
+        .last_actions()
+        .iter()
+        .filter_map(|a| match a {
+            GuiAction::SeekLoopFrame { pane_idx, .. } => Some(*pane_idx),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        seeks.contains(&0),
+        "non-vacuity: the press on the rail seeked nothing at all"
+    );
+    assert!(
+        !seeks.contains(&1),
+        "the seek fanned out to the linked radar pane, which would park it \
+         on whichever scan sits at a forecast index: {seeks:?}"
+    );
+}
