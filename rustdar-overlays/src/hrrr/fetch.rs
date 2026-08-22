@@ -192,6 +192,194 @@ fn previous_run(date: NaiveDate, hour: u8) -> (NaiveDate, u8) {
 }
 
 // ---------------------------------------------------------------------------
+// The analysis-axis listing
+// ---------------------------------------------------------------------------
+
+/// The run times the bucket really carries over `range`, from the `wrfsfcf00`
+/// keys of `hrrr.YYYYMMDD/conus/`.
+///
+/// **Listed, never constructed.** The run cycle is hourly and utterly regular,
+/// so a run time *could* be computed — and would then claim runs the archive
+/// does not have. The archive begins at `hrrr.20140730` and has gaps; a
+/// constructed list turns each of them into a frame that fetches a 404 and
+/// stalls a loop on it.
+///
+/// `f00` and not every key: one listing of a day's `conus/` prefix returns
+/// every forecast hour of every cycle, and the analysis axis wants one frame
+/// per run. The forecast axis needs no listing at all.
+///
+/// The window is walked one UTC day at a time because the key prefix is the
+/// day; a 24-hour scrub therefore costs one or two LISTs, not one per frame.
+pub async fn list_analysis_runs(
+    client: &reqwest::Client,
+    sources: &DataSources,
+    range: (NaiveDateTime, NaiveDateTime),
+) -> Result<Vec<NaiveDateTime>, FetchError> {
+    let (start, end) = range;
+    if end < start {
+        return Ok(Vec::new());
+    }
+    let mut runs: Vec<NaiveDateTime> = Vec::new();
+    let mut day = start.date();
+    let mut days = 0;
+    loop {
+        for run in list_runs_for_day(client, sources, day).await? {
+            if run >= start && run <= end && !runs.contains(&run) {
+                runs.push(run);
+            }
+        }
+        days += 1;
+        if day >= end.date() {
+            break;
+        }
+        if days >= MAX_LISTED_DAYS {
+            // The prefix is the day and the archive is twelve years deep, so a
+            // window nobody bounded is a walk of four thousand LISTs. The
+            // caller's own window is the intended bound; this is the one that
+            // holds when it is wrong.
+            log::warn!(
+                "HRRR: analysis listing stopped at {MAX_LISTED_DAYS} days; \
+                 the window {start} .. {end} is longer than any loop asks for",
+            );
+            break;
+        }
+        day += chrono::Duration::days(1);
+    }
+    runs.sort_unstable();
+    Ok(runs)
+}
+
+/// How many UTC day prefixes one analysis listing will walk. A loop window is
+/// hours and archive scrubbing is days; eight is generous for both and finite
+/// against a range that was never bounded.
+const MAX_LISTED_DAYS: usize = 8;
+
+// The archive is `hrrr.20140730` forward: a cap that is not smaller than it
+// bounds nothing. A build failure and not a runtime assertion, because both
+// sides are constants and a test comparing them is a check that cannot fail.
+const _: () = assert!(MAX_LISTED_DAYS < 4383);
+
+/// One UTC day's `hrrr.YYYYMMDD/conus/` prefix, paginated.
+///
+/// A day of CONUS keys is ~800 objects and S3 pages at 1000, so this is
+/// usually one request — but the continuation is followed rather than assumed
+/// away, and a repeated or missing token stops the walk instead of spinning on
+/// the identical first page.
+async fn list_runs_for_day(
+    client: &reqwest::Client,
+    sources: &DataSources,
+    day: NaiveDate,
+) -> Result<Vec<NaiveDateTime>, FetchError> {
+    let prefix = format!("hrrr.{}/conus/", day.format("%Y%m%d"));
+    let mut runs = Vec::new();
+    let mut continuation: Option<String> = None;
+    loop {
+        let mut url = format!(
+            "{}/?list-type=2&prefix={prefix}",
+            sources.s3_bucket_url(&sources.hrrr_bucket),
+        );
+        if let Some(token) = &continuation {
+            url.push_str("&continuation-token=");
+            url.push_str(&urlencoded(token));
+        }
+
+        let resp =
+            client.get(&url).send().await.map_err(|e| {
+                FetchError::from_transport(&e, format!("S3 list request failed: {e}"))
+            })?;
+        if !resp.status().is_success() {
+            // `IsBroken`: a bucket listing is not published on a schedule, so a
+            // 404 here means the bucket is gone or renamed, not that the day
+            // has not landed yet.
+            return Err(FetchError::from_status(
+                resp.status(),
+                NotFound::IsBroken,
+                format!("S3 returned HTTP {}", resp.status()),
+            ));
+        }
+        let body = resp.text().await.map_err(|e| {
+            FetchError::from_transport(&e, format!("Failed to read S3 list response: {e}"))
+        })?;
+
+        let doc = roxmltree::Document::parse(&body)
+            .map_err(|e| FetchError::transient(format!("Failed to parse S3 XML: {e}")))?;
+        for node in doc.descendants() {
+            if node.tag_name().name() == "Key"
+                && let Some(key) = node.text()
+                && let Some(run) = run_of_analysis_key(key)
+            {
+                runs.push(run);
+            }
+        }
+
+        let truncated = doc
+            .descendants()
+            .find(|n| n.tag_name().name() == "IsTruncated")
+            .and_then(|n| n.text())
+            .is_some_and(|t| t == "true");
+        if !truncated {
+            break;
+        }
+        let next = doc
+            .descendants()
+            .find(|n| n.tag_name().name() == "NextContinuationToken")
+            .and_then(|n| n.text())
+            .filter(|t| !t.is_empty())
+            .map(str::to_string);
+        let Some(next) = next else {
+            log::warn!("HRRR: S3 truncated '{prefix}' with no continuation token");
+            break;
+        };
+        if continuation.as_deref() == Some(next.as_str()) {
+            log::warn!("HRRR: S3 repeated its continuation token for '{prefix}'");
+            break;
+        }
+        continuation = Some(next);
+    }
+    Ok(runs)
+}
+
+/// The run time an **analysis** key names, or `None` for anything else in the
+/// prefix.
+///
+/// `hrrr.20260820/conus/hrrr.t14z.wrfsfcf00.grib2` -> 2026-08-20 14:00. The
+/// `.idx` sidecars, the sub-hourly `wrfsubh` files and every f01+ key are all
+/// in the same prefix and all answer `None` — the match is on the whole
+/// filename, not on a substring, so `wrfsfcf00.grib2.idx` does not read as an
+/// analysis grid.
+pub fn run_of_analysis_key(key: &str) -> Option<NaiveDateTime> {
+    let (dir, file) = key.rsplit_once('/')?;
+    let day = dir.strip_suffix("/conus")?.rsplit_once("hrrr.")?.1;
+    // The length check is load-bearing: `%Y%m%d` accepts `2026082` and reads
+    // it as 2026-08-02, so a truncated prefix would come back as a real run
+    // three weeks from where the key says.
+    if day.len() != 8 || !day.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let date = NaiveDate::parse_from_str(day, "%Y%m%d").ok()?;
+    let hour = file
+        .strip_prefix("hrrr.t")?
+        .strip_suffix("z.wrfsfcf00.grib2")?;
+    let hour: u32 = hour.parse().ok()?;
+    date.and_hms_opt(hour, 0, 0)
+}
+
+/// Percent-encode an S3 continuation token for a query string. Tokens are
+/// base64 and routinely carry `+`, `/` and `=`.
+fn urlencoded(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // GRIB2 decoding
 // ---------------------------------------------------------------------------
 

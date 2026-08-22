@@ -10,36 +10,140 @@ use crate::render::controls::{
 };
 use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
-    FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayLegend, OverlayState,
-    RasterizeContext, RenderMode, Signed,
+    FetchConfig, FetchPayload, FetchTask, FrameListingResult, OverlayHandler, OverlayLegend,
+    OverlayState, RasterizeContext, RenderMode, Signed,
 };
 use crate::render::rasterize;
+use chrono::Timelike;
 use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
 use rustdar_source::time::{FrameListing, FrameStamp, TimeAxis};
 
-/// How many parameters' grids stay resident at once.
+/// **The one identity of a decoded HRRR grid**: which field, off which run, at
+/// which forecast hour.
 ///
-/// Sized by the pane count, not by a memory target: six panes can sit on six
-/// different parameters, and below the pane count a miss costs a **picture**,
-/// not a refetch — `prepare_job` answers `None` and the pane goes on drawing its
-/// last texture with nothing that will re-ask. So the cap is
-/// `rustdar_egui::pane::MAX_PANES_DESKTOP` = 6, spelled rather than imported
-/// because the dependency cannot run back.
-///
-/// `HrrrGridData::values` is 1,905,141 `f32` — **7.62 MB** per resident grid —
-/// plus **30.5 MB** of coordinates on the [`GridCoords::Explicit`] arm, which no
-/// HRRR fetch reaches.
-///
-/// [`GridCoords::Explicit`]: crate::hrrr::GridCoords::Explicit
-const MODEL_GRID_CACHE_ENTRIES: usize = 6;
+/// The parameter alone was the key until the layer supplied frames, and the
+/// cache was documented as run-blind — which was exactly right while every
+/// fetch asked for the latest run at the parameter's own floor, and is exactly
+/// wrong now that a scrub asks for f00 and f18 of the same run, or the same
+/// hour of two runs, and expects two pictures.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct GridKey {
+    pub param: ModelParameter,
+    pub run: chrono::NaiveDateTime,
+    pub f_hour: u8,
+}
 
-// At a cap of 1, an insert of a parameter that is not the selected one protects
-// both the arrival and the pin and the cache settles at two entries for ever.
-// Two is where the eviction loop is guaranteed a victim.
-const _: () = assert!(MODEL_GRID_CACHE_ENTRIES >= 2);
+impl GridKey {
+    /// The key a decoded grid files itself under — read off the grid, never
+    /// spelled beside it, so a fetch whose hour was clamped up to the
+    /// parameter's floor cannot be filed under the hour it asked for.
+    fn of(grid: &HrrrGridData) -> Self {
+        Self {
+            param: grid.parameter,
+            run: grid.ref_time,
+            f_hour: grid.forecast_hour,
+        }
+    }
+}
 
-/// The resident grids, bounded and evicted least-recently-touched first.
+/// What one resident grid really costs, in bytes.
+///
+/// `values` is the whole figure in practice — 1,905,141 `f32` = **7,620,564
+/// bytes** on the CONUS grid — but the `Explicit` coordinate arm is counted
+/// too rather than assumed away: it is 30.5 MB at that size, four times the
+/// values, and it is what a non-Lambert HRRR-shaped source would arrive on.
+fn grid_bytes(grid: &HrrrGridData) -> usize {
+    let coords = match &grid.coords {
+        crate::hrrr::GridCoords::Explicit { lats, lons } => {
+            (lats.len() + lons.len()) * std::mem::size_of::<f64>()
+        }
+        // Closed forms: the whole grid is its scalars, already counted by the
+        // `size_of` below.
+        crate::hrrr::GridCoords::Lambert(_) | crate::hrrr::GridCoords::Regular { .. } => 0,
+    };
+    std::mem::size_of::<HrrrGridData>() + grid.values.len() * std::mem::size_of::<f32>() + coords
+}
+
+/// **How many bytes of decoded grid this target keeps resident**, across every
+/// pane.
+///
+/// A *byte* budget and not an entry count, because [`GridKey`] carries a run
+/// and a forecast hour: a 24-hour scrub over six panes names 144 distinct
+/// grids, which an entry cap of six counts as "six" and a byte budget counts
+/// as 1.1 GB. The cap it replaces was sized by the pane count and said nothing
+/// at all about memory.
+///
+/// At 7,620,564 bytes per CONUS grid the three arms buy:
+///
+/// | target | budget | grids | pane cap |
+/// |---|---|---|---|
+/// | wasm32 | 96 MiB | 13 | 6 |
+/// | mobile | 192 MiB | 26 | 4 |
+/// | desktop | 512 MiB | 70 | 6 |
+///
+/// **Never below the pane count.** Below it a pane loses its grid to another
+/// pane's arrival, and it fails *silently*: `prepare_job` answers `None` and
+/// the pane goes on drawing its last texture with nothing that will re-ask.
+/// `the_byte_budget_holds_at_least_one_grid_per_pane` holds that floor on all
+/// three arms from a host test, which is why each is a named constant rather
+/// than only a `cfg` arm.
+///
+/// **Spelled here rather than read from `rustdar-device-profile`**, where the
+/// rest of this application's budgets live. That crate declares
+/// `rustdar-radar`, so an overlays → device-profile edge puts the whole radar
+/// pipeline back into every overlay handler's compile graph — the edge
+/// `rustdar-source/tests/charter.rs::the_overlays_to_radar_edge_stays_cut`
+/// exists to keep cut, and which today leaves this crate standing on exactly
+/// `{rustdar-geo, rustdar-source, rustdar-units}`. It is also why the pane cap
+/// below is spelled and not imported from `rustdar-egui`.
+pub const WASM_MODEL_GRID_BUDGET_BYTES: usize = 96 * 1024 * 1024;
+pub const MOBILE_MODEL_GRID_BUDGET_BYTES: usize = 192 * 1024 * 1024;
+pub const DESKTOP_MODEL_GRID_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+
+/// The pane cap the budget is measured against. Spelled, for the reason above;
+/// `rustdar_device_profile::budget::MAX_PANES_DESKTOP` = 6 and
+/// `MAX_PANES_MOBILE` = 4 are the definitions.
+pub const MAX_PANES_DESKTOP: usize = 6;
+pub const MAX_PANES_MOBILE: usize = 4;
+
+/// What one CONUS grid costs, as [`grid_bytes`] counts it: 1799 × 1059 =
+/// 1,905,141 `f32`, on a `Lambert` coordinate arm that adds nothing. Measured
+/// 2026-08-21; `the_conus_figure_is_what_grid_bytes_counts` is what keeps it
+/// from drifting away from the function.
+pub const HRRR_CONUS_GRID_BYTES: usize = 1799 * 1059 * 4;
+
+/// **The floor, as a build failure.** A budget below one grid per pane starves
+/// a pane *silently* — `prepare_job` answers `None` and it goes on drawing its
+/// last texture — so it is caught here rather than in a test somebody has to
+/// have run on the right target.
+const _: () = {
+    assert!(WASM_MODEL_GRID_BUDGET_BYTES / HRRR_CONUS_GRID_BYTES >= MAX_PANES_DESKTOP);
+    assert!(MOBILE_MODEL_GRID_BUDGET_BYTES / HRRR_CONUS_GRID_BYTES >= MAX_PANES_MOBILE);
+    assert!(DESKTOP_MODEL_GRID_BUDGET_BYTES / HRRR_CONUS_GRID_BYTES >= MAX_PANES_DESKTOP);
+};
+
+// The device class, spelled as its rule rather than as the `mobile` cfg:
+// cargo scopes a build script's cfgs to the crate that declares it, so
+// `cfg(mobile)` is unset everywhere outside `rustdar-device-profile`, and a
+// `#[cfg(mobile)]` written here would be silently false on a handheld. The
+// rule is `rustdar-device-profile/src/mobile_cfg.rs::is_mobile_target` —
+// `target_os` in {android, ios}. Selecting a value, never forking behaviour.
+#[cfg(target_arch = "wasm32")]
+const MODEL_GRID_BUDGET_BYTES: usize = WASM_MODEL_GRID_BUDGET_BYTES;
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(target_os = "android", target_os = "ios")
+))]
+const MODEL_GRID_BUDGET_BYTES: usize = MOBILE_MODEL_GRID_BUDGET_BYTES;
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(any(target_os = "android", target_os = "ios"))
+))]
+const MODEL_GRID_BUDGET_BYTES: usize = DESKTOP_MODEL_GRID_BUDGET_BYTES;
+
+/// The resident grids, bounded by bytes and evicted least-recently-touched
+/// first.
 ///
 /// An entries map plus a recency list holding exactly the keys of `entries`,
 /// oldest use first; both private so no caller can desynchronise them. The list
@@ -47,73 +151,110 @@ const _: () = assert!(MODEL_GRID_CACHE_ENTRIES >= 2);
 /// method of [`OverlayHandler`], and a lookup that did not count as a use would
 /// let the pane on screen age out.
 struct ModelGridCache {
-    entries: HashMap<ModelParameter, Arc<HrrrGridData>>,
-    recency: RefCell<Vec<ModelParameter>>,
+    entries: HashMap<GridKey, Arc<HrrrGridData>>,
+    recency: RefCell<Vec<GridKey>>,
+    /// Sum of [`grid_bytes`] over `entries`, maintained on every insert and
+    /// eviction rather than recomputed: an eviction loop that re-walked the
+    /// map would be O(n²) in the resident set.
+    bytes: usize,
+    /// The ceiling `bytes` is held under. A field and not the constant so a
+    /// test can state a budget in whole grids of its own fixture size — the
+    /// production value is [`MODEL_GRID_BUDGET_BYTES`].
+    budget: usize,
 }
 
 impl ModelGridCache {
     fn new() -> Self {
+        Self::with_budget(MODEL_GRID_BUDGET_BYTES)
+    }
+
+    fn with_budget(budget: usize) -> Self {
         Self {
             entries: HashMap::new(),
             recency: RefCell::new(Vec::new()),
+            bytes: 0,
+            budget,
         }
     }
 
-    fn touch(&self, param: ModelParameter) {
+    fn touch(&self, key: GridKey) {
         let mut recency = self.recency.borrow_mut();
-        if let Some(pos) = recency.iter().position(|p| *p == param) {
+        if let Some(pos) = recency.iter().position(|k| *k == key) {
             recency.remove(pos);
-            recency.push(param);
+            recency.push(key);
         }
     }
 
-    fn get(&self, param: ModelParameter) -> Option<&Arc<HrrrGridData>> {
-        let grid = self.entries.get(&param)?;
-        self.touch(param);
+    fn get(&self, key: GridKey) -> Option<&Arc<HrrrGridData>> {
+        let grid = self.entries.get(&key)?;
+        self.touch(key);
         Some(grid)
     }
 
-    /// Whether `param`'s grid is resident, marking it most-recently-used.
+    /// Whether `key`'s grid is resident, marking it most-recently-used.
     ///
     /// Every read counts as a use, including the bare predicate: which accessor
     /// a caller reached for is not a fact about what the user is looking at.
-    fn contains(&self, param: ModelParameter) -> bool {
-        self.get(param).is_some()
+    fn contains(&self, key: GridKey) -> bool {
+        self.get(key).is_some()
+    }
+
+    /// **The most recently used resident grid of `param`**, whatever run and
+    /// hour it is off.
+    ///
+    /// The fallback for a pane that has not been parked on a frame — which is
+    /// every pane until a clock moves it. Not a use of its own: it is a search
+    /// over keys, and the caller reads the answer back through [`Self::get`].
+    fn latest_of(&self, param: ModelParameter) -> Option<GridKey> {
+        self.recency
+            .borrow()
+            .iter()
+            .rev()
+            .find(|key| key.param == param)
+            .copied()
     }
 
     /// Neither the entry going in nor anything in `pinned` is ever evicted.
     ///
-    /// `pinned` is the **union** of every pane's selected parameter, not one
-    /// pane's: this cache is shared by every pane, and evicting what another
-    /// pane is showing to make room is the cross-pane collision the pane state
-    /// exists to prevent. That all visible parameters stay resident comes from
-    /// the cap being at least the pane count; the pin is what makes it hold
-    /// when an arrival lands mid-cycle.
-    fn insert(
-        &mut self,
-        param: ModelParameter,
-        grid: Arc<HrrrGridData>,
-        pinned: &[ModelParameter],
-    ) {
-        if self.entries.insert(param, grid).is_some() {
-            // A re-fetch of a resident parameter replaces its own key. Nothing
-            // in this cache is keyed by run.
-            self.touch(param);
-        } else {
-            self.recency.borrow_mut().push(param);
+    /// `pinned` is the **union** of every pane's current key, not one pane's:
+    /// this cache is shared by every pane, and evicting what another pane is
+    /// showing to make room is the cross-pane collision the pane state exists
+    /// to prevent. The budget being at least one grid per pane is what makes
+    /// the union fit; the pin is what makes it hold when an arrival lands
+    /// mid-cycle.
+    ///
+    /// An arrival that alone exceeds the budget is still installed: the loop
+    /// stops when it runs out of unpinned victims, because a pane with no grid
+    /// draws nothing and has nothing to re-ask.
+    fn insert(&mut self, key: GridKey, grid: Arc<HrrrGridData>, pinned: &[GridKey]) {
+        let cost = grid_bytes(&grid);
+        match self.entries.insert(key, grid) {
+            // A re-fetch of a resident key replaces its own entry — same
+            // parameter, same run, same forecast hour. Another run of the same
+            // parameter is a different key and lands beside it.
+            Some(old) => {
+                self.bytes = self.bytes - grid_bytes(&old) + cost;
+                self.touch(key);
+            }
+            None => {
+                self.bytes += cost;
+                self.recency.borrow_mut().push(key);
+            }
         }
-        while self.entries.len() > MODEL_GRID_CACHE_ENTRIES {
+        while self.bytes > self.budget {
             let victim = {
                 let mut recency = self.recency.borrow_mut();
                 let Some(pos) = recency
                     .iter()
-                    .position(|p| *p != param && !pinned.contains(p))
+                    .position(|k| *k != key && !pinned.contains(k))
                 else {
                     break;
                 };
                 recency.remove(pos)
             };
-            self.entries.remove(&victim);
+            if let Some(grid) = self.entries.remove(&victim) {
+                self.bytes -= grid_bytes(&grid);
+            }
         }
     }
 
@@ -123,20 +264,144 @@ impl ModelGridCache {
     }
 
     #[cfg(test)]
-    fn is_resident(&self, param: ModelParameter) -> bool {
-        self.entries.contains_key(&param)
+    fn is_resident(&self, key: GridKey) -> bool {
+        self.entries.contains_key(&key)
     }
 
+    /// The eviction order, projected to parameters: the suite that asks about
+    /// it predates the run and the forecast hour being in the key, and is
+    /// asking about *order* rather than about identity.
     #[cfg(test)]
-    fn recency_order(&self) -> Vec<ModelParameter> {
-        self.recency.borrow().clone()
+    fn recency_params(&self) -> Vec<ModelParameter> {
+        self.recency.borrow().iter().map(|k| k.param).collect()
     }
 }
 
+/// **Which way time runs for this pane's model layer.**
+///
+/// One run's forecast hours, or one hour of many runs — two different sets of
+/// frames over the same archive, and the pane picks one. They are not two
+/// spellings of the same axis: `Forecast` is a closed form of the run and
+/// needs no network at all, `Analysis` is a bucket listing.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum ModelAxis {
+    /// f`min`..=f`horizon` of **one** run. See [`forecast_horizon`].
+    #[default]
+    Forecast,
+    /// f00 of **many** runs — the analysis hour, walking backwards through the
+    /// archive.
+    Analysis,
+}
+
+impl ModelAxis {
+    /// The persisted spelling. Saved config is matched on this, so it is not a
+    /// display string and must not be reworded.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelAxis::Forecast => "forecast",
+            ModelAxis::Analysis => "analysis",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ModelAxis::Forecast => "Forecast hours",
+            ModelAxis::Analysis => "Past runs",
+        }
+    }
+
+    /// `None` for anything this build does not name — a saved config from a
+    /// later version keeps its pane on the default rather than failing to load.
+    pub fn parse(text: &str) -> Option<Self> {
+        [ModelAxis::Forecast, ModelAxis::Analysis]
+            .into_iter()
+            .find(|axis| axis.as_str() == text)
+    }
+
+    pub fn all() -> [ModelAxis; 2] {
+        [ModelAxis::Forecast, ModelAxis::Analysis]
+    }
+}
+
+/// **The last forecast hour a run publishes.**
+///
+/// Measured against the live archive on 2026-08-21: f00–f48 on the 00/06/12/18Z
+/// cycles, f00–f18 on every other hour, `.idx` present for every hour, archive
+/// back to `hrrr.20140730`. Taken from the run's *hour*, not from a table of
+/// dates: the cycle is what decides, and it has been the same cycle since the
+/// bucket opened.
+pub fn forecast_horizon(run: chrono::NaiveDateTime) -> u8 {
+    use chrono::Timelike;
+    if run.hour().is_multiple_of(6) { 48 } else { 18 }
+}
+
+/// **How far past its run one `Analysis`-axis frame is valid.**
+///
+/// Zero for fourteen of the sixteen parameters, and one hour for the two
+/// windowed UH maxima: the run's `f00` record for those is identically zero
+/// over a zero-length window, which is why
+/// [`ModelParameter::min_forecast_hour`] is a floor and not a preference. The
+/// bucket listing itself is still of `f00` *keys* — that is what proves a run
+/// exists — but the frame this axis offers is the earliest one the field
+/// actually publishes.
+fn analysis_offset(param: ModelParameter) -> chrono::Duration {
+    chrono::Duration::hours(i64::from(param.min_forecast_hour()))
+}
+
+/// **What a frame listing was dispatched for**, captured at the dispatch and
+/// handed straight back to `apply_frame_listing`.
+///
+/// The arriving `PaneRef` is a `PaneRef::across` union whose config is null by
+/// construction, so reading the pane back for the run or the axis files the
+/// answer under whatever the pane happens to hold *now* — which after a run
+/// roll or an axis flip is a different scope, silently. `RadarListing` is the
+/// same shape for the same reason.
+struct ModelListing {
+    param: ModelParameter,
+    run: chrono::NaiveDateTime,
+    axis: ModelAxis,
+    range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+    /// The run times the listing named. Empty for a `Forecast` listing, whose
+    /// frames are a closed form of `run` that `list_frames` already computes.
+    runs: Vec<chrono::NaiveDateTime>,
+}
+
+/// The three fields a listing is filed under. `ModelListing` carries these
+/// plus its payload; this is the key half alone, so a lookup does not have to
+/// own one.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct ModelScope {
+    param: ModelParameter,
+    run: chrono::NaiveDateTime,
+    axis: ModelAxis,
+}
+
+impl ModelListing {
+    fn scope(&self) -> ModelScope {
+        ModelScope {
+            param: self.param,
+            run: self.run,
+            axis: self.axis,
+        }
+    }
+}
+
+/// One loop frame's grid on its way back from [`OverlayHandler::fetch_frame`].
+///
+/// A type of its own and **not** `HrrrFetchResult`: the two arrive through two
+/// different doors — `apply_fetch_result` for the live round, `apply_frame`
+/// for a frame — and a shared payload type is how a frame ends up calling
+/// `set_data` and moving the live picture.
+struct ModelFrameFetch {
+    key: GridKey,
+    grid: Option<HrrrGridData>,
+}
+
 /// **The whole per-pane state of the model layer**: whether this pane draws
-/// it, and which parameter it is showing. Both were fields of the handler,
-/// which is why two panes could never sit on two HRRR parameters — the config
-/// swap re-installed one pane's before every read and called that independence.
+/// it, which parameter it is showing, which way its time axis runs and which
+/// frame it is parked on. All of it was fields of the handler once, which is
+/// why two panes could never sit on two HRRR parameters — the config swap
+/// re-installed one pane's before every read and called that independence.
 ///
 /// The grid cache is **not** here: a decoded HRRR grid is megabytes and is the
 /// same grid whichever pane asked for it, so it stays one shared cache and the
@@ -145,6 +410,16 @@ impl ModelGridCache {
 pub(crate) struct ModelPaneState {
     pub enabled: bool,
     pub selected_param: ModelParameter,
+    pub axis: ModelAxis,
+    /// **The (run, forecast hour) this pane is showing**, or `None` for a pane
+    /// that has not been parked on a frame — every pane until a clock moves
+    /// one, which is the whole of this build until Phase C lands the
+    /// transport.
+    ///
+    /// `None` is not "no picture": it resolves to the most recently used
+    /// resident grid of `selected_param`, which is exactly what the
+    /// parameter-keyed cache used to answer.
+    pub selected_frame: Option<(chrono::NaiveDateTime, u8)>,
 }
 
 impl ModelPaneState {
@@ -154,6 +429,8 @@ impl ModelPaneState {
         Self {
             enabled,
             selected_param: ModelParameter::SurfaceBasedCin,
+            axis: ModelAxis::default(),
+            selected_frame: None,
         }
     }
 }
@@ -165,6 +442,14 @@ pub(crate) struct ModelDataHandler {
     /// answer prefers [`PaneRef::state`] when there is one.
     pub defaults: ModelPaneState,
     cached_grids: ModelGridCache,
+    /// The run times an **analysis** listing named, filed under the scope it
+    /// was dispatched for. A `Forecast` scope never appears here: its frames
+    /// are a closed form of the run.
+    frame_listings: HashMap<ModelScope, Vec<chrono::NaiveDateTime>>,
+    /// The windows a listing really covered, per scope — what makes
+    /// `list_frames` able to say `complete` about an analysis window without
+    /// mistaking "I found none" for "none exist".
+    covered: HashMap<ModelScope, Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime)>>,
     pub last_error: Option<String>,
 }
 
@@ -174,6 +459,8 @@ impl ModelDataHandler {
             state: OverlayState::new(),
             defaults: ModelPaneState::new(false),
             cached_grids: ModelGridCache::new(),
+            frame_listings: HashMap::new(),
+            covered: HashMap::new(),
             last_error: None,
         }
     }
@@ -193,20 +480,133 @@ impl ModelDataHandler {
         }
     }
 
-    /// **Every parameter some pane is showing**, deduplicated — what the
-    /// shared cache must not evict. The union, per [`PaneRef::all_as`]; the
-    /// registry's own copy stands in when no pane answered at all.
-    fn pinned_params(&self, pane: &PaneRef<'_>) -> Vec<ModelParameter> {
-        let mut pinned: Vec<ModelParameter> = Vec::new();
+    /// **The grid key this pane's picture is**, or `None` when nothing of its
+    /// parameter is resident and it has not been parked on a frame.
+    ///
+    /// A parked pane names its own `(run, hour)` whether or not that grid is
+    /// resident — a key for a grid that has not landed is what makes
+    /// `has_data` false and the fetch happen. An unparked pane falls back to
+    /// the most recently used resident grid of its parameter, which is exactly
+    /// what the parameter-keyed cache used to answer.
+    fn key_of(&self, view: &ModelPaneState) -> Option<GridKey> {
+        match view.selected_frame {
+            Some((run, f_hour)) => Some(GridKey {
+                param: view.selected_param,
+                run,
+                f_hour,
+            }),
+            None => self.cached_grids.latest_of(view.selected_param),
+        }
+    }
+
+    /// This pane's resident grid, marking it most-recently-used.
+    fn grid_of(&self, pane: &PaneRef<'_>) -> Option<&Arc<HrrrGridData>> {
+        self.cached_grids.get(self.key_of(self.view(pane))?)
+    }
+
+    /// **Every grid some pane is showing**, deduplicated — what the shared
+    /// cache must not evict. The union, per [`PaneRef::all_as`]; the registry's
+    /// own copy stands in when no pane answered at all.
+    fn pinned_keys(&self, pane: &PaneRef<'_>) -> Vec<GridKey> {
+        let mut pinned: Vec<GridKey> = Vec::new();
+        let mut any_pane = false;
         for state in pane.all_as::<ModelPaneState>() {
-            if !pinned.contains(&state.selected_param) {
-                pinned.push(state.selected_param);
+            any_pane = true;
+            if let Some(key) = self.key_of(state)
+                && !pinned.contains(&key)
+            {
+                pinned.push(key);
             }
         }
-        if pinned.is_empty() {
-            pinned.push(self.defaults.selected_param);
+        if !any_pane
+            && let Some(key) = self.key_of(&self.defaults)
+            && !pinned.contains(&key)
+        {
+            pinned.push(key);
         }
         pinned
+    }
+
+    /// **The run this pane's frames belong to**, or `None` before anything has
+    /// told it: the run it is parked on, else the run of its most recent
+    /// resident grid.
+    ///
+    /// Deliberately does **not** fall back to `latest_available_run()`. That
+    /// reads the wall clock, and `list_frames` is a synchronous read every
+    /// frame may make — a clock in it would walk the whole frame list forward
+    /// under a parked pane. "I do not know yet" is the honest answer, and the
+    /// first fetch settles it.
+    fn run_of(&self, view: &ModelPaneState) -> Option<chrono::NaiveDateTime> {
+        view.selected_frame.map(|(run, _)| run).or_else(|| {
+            self.cached_grids
+                .latest_of(view.selected_param)
+                .map(|k| k.run)
+        })
+    }
+
+    fn scope_of(&self, view: &ModelPaneState) -> Option<ModelScope> {
+        Some(ModelScope {
+            param: view.selected_param,
+            run: self.run_of(view)?,
+            axis: view.axis,
+        })
+    }
+
+    /// **The forecast hours of one run, as a closed form.** No listing, no
+    /// network: the floor is the parameter's own, the horizon is the run
+    /// cycle's, and every hour between them is published with an `.idx`.
+    fn forecast_stamps(param: ModelParameter, run: chrono::NaiveDateTime) -> Vec<FrameStamp> {
+        (param.min_forecast_hour()..=forecast_horizon(run))
+            .map(|f_hour| FrameStamp {
+                valid: run + chrono::Duration::hours(i64::from(f_hour)),
+                run: Some(run),
+            })
+            .collect()
+    }
+
+    /// Whether a listing has covered the whole of `range` for `scope`.
+    fn covers(
+        &self,
+        scope: &ModelScope,
+        range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+    ) -> bool {
+        self.covered
+            .get(scope)
+            .is_some_and(|windows| windows.iter().any(|w| w.0 <= range.0 && range.1 <= w.1))
+    }
+
+    /// **The `(run, forecast hour)` a stamp names for this pane**, or `None`
+    /// when no listing named it.
+    ///
+    /// `f_hour = (valid - run).num_hours()` — the inverse of
+    /// [`HrrrGridData::valid_time`], which is the only arithmetic either
+    /// direction of this axis uses.
+    fn frame_target(&self, view: &ModelPaneState, stamp: &FrameStamp) -> Option<GridKey> {
+        let run = stamp.run?;
+        let hours = (stamp.valid - run).num_hours();
+        let f_hour = u8::try_from(hours).ok()?;
+        if f_hour < view.selected_param.min_forecast_hour() {
+            return None;
+        }
+        let scope = self.scope_of(view)?;
+        let named = match view.axis {
+            // The set is the closed form, so "did a listing name it" is
+            // answered by arithmetic rather than by a map.
+            ModelAxis::Forecast => run == scope.run && f_hour <= forecast_horizon(run),
+            // The analysis axis is f00 of a listed run, and nothing else.
+            ModelAxis::Analysis => {
+                f_hour == view.selected_param.min_forecast_hour()
+                    && self
+                        .frame_listings
+                        .get(&scope)
+                        .is_some_and(|runs| runs.contains(&run))
+            }
+        };
+        named.then_some(GridKey {
+            param: view.selected_param,
+            run,
+            f_hour,
+        })
     }
 }
 
@@ -269,48 +669,277 @@ impl OverlayHandler for ModelDataHandler {
         }
     }
 
-    /// **The frames this pane is holding**, which for this layer is its own
-    /// selected parameter's resident grid: zero or one stamp, `valid` the
-    /// grid's valid time and `run` its reference time.
+    /// **The frames this pane is holding**: every resident grid of its own
+    /// parameter that sits on its own axis — one run's forecast hours, or the
+    /// analysis hour of many runs. `valid` is the grid's valid time and `run`
+    /// its reference time.
     ///
-    /// This pane's parameter and not the cache's whole contents: the other
-    /// resident grids belong to other panes' parameters, and pooling them here
-    /// would offer this pane frames it cannot draw.
+    /// This pane's scope and not the cache's whole contents: the other
+    /// resident grids belong to other panes' parameters and runs, and pooling
+    /// them here would offer this pane frames it cannot draw.
     fn frames_resident(&self, pane: &PaneRef<'_>) -> Vec<FrameStamp> {
-        self.cached_grids
-            .get(self.view(pane).selected_param)
-            .map(|grid| {
-                vec![FrameStamp {
-                    valid: grid.valid_time(),
-                    run: Some(grid.ref_time),
-                }]
+        let view = self.view(pane);
+        let Some(scope) = self.scope_of(view) else {
+            return Vec::new();
+        };
+        let mut frames: Vec<FrameStamp> = self
+            .cached_grids
+            .entries
+            .iter()
+            .filter(|(key, _)| {
+                key.param == scope.param
+                    && match scope.axis {
+                        ModelAxis::Forecast => key.run == scope.run,
+                        ModelAxis::Analysis => key.f_hour == scope.param.min_forecast_hour(),
+                    }
             })
-            .unwrap_or_default()
+            .map(|(_, grid)| FrameStamp {
+                valid: grid.valid_time(),
+                run: Some(grid.ref_time),
+            })
+            .collect();
+        frames.sort_by_key(|stamp| stamp.valid);
+        frames
     }
 
-    /// [`Self::frames_resident`] clipped to `range`, and **never
-    /// `complete`**: there is no HRRR archive listing in this build, so the
-    /// honest answer is "at least these", forever. `create_frame_list_task`
-    /// keeps the trait's `None` until something exists to fetch.
+    /// **What frames exist over `range`, per axis.**
+    ///
+    /// `Forecast` is a closed form of the run — `min_forecast_hour` to the
+    /// cycle's horizon, every hour published with an `.idx` — so it is
+    /// `complete` on arithmetic alone and never needs a round trip to say so.
+    /// `Analysis` is a bucket listing, and is `complete` only where one has
+    /// landed covering the whole window: "I found none" is not "none exist".
+    ///
+    /// Both answer empty before anything has named this pane's run. A synchronous
+    /// read must not reach for the wall clock — see [`Self::run_of`].
     fn list_frames(
         &self,
         _ctx: &FetchConfig,
         pane: &PaneRef<'_>,
         range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
     ) -> FrameListing {
-        let mut frames = self.frames_resident(pane);
+        let view = self.view(pane);
+        let Some(scope) = self.scope_of(view) else {
+            return FrameListing::empty(range);
+        };
+        let (mut frames, complete) = match scope.axis {
+            ModelAxis::Forecast => (Self::forecast_stamps(scope.param, scope.run), true),
+            ModelAxis::Analysis => (
+                self.frame_listings
+                    .get(&scope)
+                    .map(|runs| {
+                        runs.iter()
+                            .map(|run| FrameStamp {
+                                valid: *run + analysis_offset(scope.param),
+                                run: Some(*run),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                self.covers(&scope, range),
+            ),
+        };
         frames.retain(|stamp| range.0 <= stamp.valid && stamp.valid <= range.1);
         frames.sort_by_key(|stamp| stamp.valid);
         FrameListing {
             range,
             frames,
-            complete: false,
+            complete,
         }
     }
 
-    /// A no-op: this layer's residency is the LRU grid cache's business
-    /// (`MODEL_GRID_CACHE_ENTRIES`, evicting by use), and a second eviction
-    /// authority would fight it.
+    /// **The listing that fills [`Self::list_frames`]**, scoped by the
+    /// `(parameter, run, axis)` captured HERE, at dispatch.
+    ///
+    /// The `Forecast` arm performs **no network round trip at all**: the set
+    /// is a closed form of the run, so the future is ready the moment it is
+    /// built. It is still a task rather than a `None` because the driver above
+    /// builds a loop out of the *arrival*, and a layer that answers `None`
+    /// never gets one.
+    ///
+    /// The `Analysis` arm lists `hrrr.YYYYMMDD/conus/` for every UTC day the
+    /// window touches and keeps the `f00` keys — the analysis grid of each run.
+    fn create_frame_list_task(
+        &self,
+        ctx: &FetchConfig,
+        pane: &PaneRef<'_>,
+        range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+    ) -> Option<FetchTask> {
+        let view = self.view(pane);
+        // Captured at dispatch and carried in the scope. The `PaneRef` that
+        // arrives with the answer is a `PaneRef::across` union whose config is
+        // null by construction, so reading any of these three back on arrival
+        // files the listing under whatever the pane holds by then.
+        let scope = self.scope_of(view)?;
+        let ModelScope { param, run, axis } = scope;
+
+        if axis == ModelAxis::Forecast {
+            let frames = Self::forecast_stamps(param, run);
+            return Some(FrameListingResult::task(known::MODEL_DATA, async move {
+                FrameListingResult {
+                    listing: FrameListing {
+                        range,
+                        frames: frames
+                            .into_iter()
+                            .filter(|s| range.0 <= s.valid && s.valid <= range.1)
+                            .collect(),
+                        complete: true,
+                    },
+                    scope: Box::new(ModelListing {
+                        param,
+                        run,
+                        axis,
+                        range,
+                        runs: Vec::new(),
+                    }),
+                }
+            }));
+        }
+
+        let client = ctx.client.clone();
+        let sources = ctx.sources.clone();
+        Some(FrameListingResult::task(known::MODEL_DATA, async move {
+            let (runs, complete) =
+                match crate::hrrr::fetch::list_analysis_runs(&client, &sources, range).await {
+                    Ok(runs) => {
+                        log::info!("Model: found {} HRRR analysis runs in range", runs.len());
+                        (runs, true)
+                    }
+                    Err(e) => {
+                        // An empty list is how a failed listing reaches the
+                        // pane, and `complete: false` is how it stays honest
+                        // about why.
+                        log::error!("Model: HRRR analysis listing failed: {e:?}");
+                        (Vec::new(), false)
+                    }
+                };
+            let frames = runs
+                .iter()
+                .map(|run| FrameStamp {
+                    valid: *run + analysis_offset(param),
+                    run: Some(*run),
+                })
+                .collect();
+            FrameListingResult {
+                listing: FrameListing {
+                    range,
+                    frames,
+                    complete,
+                },
+                scope: Box::new(ModelListing {
+                    param,
+                    run,
+                    axis,
+                    range,
+                    runs,
+                }),
+            }
+        }))
+    }
+
+    /// **The one door to a frame's grid.**
+    ///
+    /// `None` when no listing named that stamp for this pane — which is also
+    /// the answer for a pane whose loop is being rebuilt on another run or
+    /// another axis while its old queue drains.
+    fn fetch_frame(
+        &self,
+        ctx: &FetchConfig,
+        pane: &PaneRef<'_>,
+        stamp: &FrameStamp,
+    ) -> Option<FetchTask> {
+        let view = self.view(pane);
+        let key = self.frame_target(view, stamp)?;
+        let client = ctx.client.clone();
+        let sources = ctx.sources.clone();
+        let GridKey { param, run, f_hour } = key;
+        let run_pair = (run.date(), run.hour() as u8);
+        Some(FetchTask {
+            kind: known::MODEL_DATA,
+            future: Box::pin(async move {
+                let result = if param.is_composite() {
+                    crate::hrrr::fetch::fetch_composite_hrrr_data(
+                        &client, &sources, &param, run_pair, f_hour,
+                    )
+                    .await
+                } else {
+                    crate::hrrr::fetch::fetch_hrrr_data(&client, &sources, &param, run_pair, f_hour)
+                        .await
+                };
+                let grid = match result.0 {
+                    Ok(grid) => Some(grid),
+                    Err(e) => {
+                        log::error!(
+                            "Model frame fetch failed for {param:?} {run} f{f_hour:02}: {e:?}"
+                        );
+                        None
+                    }
+                };
+                Box::new(ModelFrameFetch { key, grid }) as FetchPayload
+            }),
+        })
+    }
+
+    /// File a listing under the scope it was **dispatched for**, from the
+    /// scope payload and never from the pane: the `PaneRef` an arrival carries
+    /// is the union across panes and its config is null by construction.
+    ///
+    /// A `Forecast` listing teaches this handler nothing — its frames are the
+    /// closed form [`Self::list_frames`] already computes — so only the run
+    /// times of an `Analysis` listing are kept, and coverage only where the
+    /// listing really covered the window.
+    fn apply_frame_listing(
+        &mut self,
+        listing: FrameListing,
+        scope: FetchPayload,
+        _pane: &PaneRef<'_>,
+    ) {
+        let Ok(scope) = scope.downcast::<ModelListing>() else {
+            log::error!("a frame listing reached the model layer under another layer's scope");
+            return;
+        };
+        let key = scope.scope();
+        // Nothing is filed for a forecast listing, not even its coverage:
+        // `list_frames` answers that axis from arithmetic and never reads
+        // either map, so a row here would be state nothing consults and a
+        // window pushed per loop rebuild for the length of a session.
+        if scope.axis == ModelAxis::Forecast {
+            return;
+        }
+        let known = self.frame_listings.entry(key).or_default();
+        for run in &scope.runs {
+            if !known.contains(run) {
+                known.push(*run);
+            }
+        }
+        known.sort_unstable();
+        // Coverage is recorded only for a listing that really covered the
+        // window. A failure arrives empty so the pane can retire its loop, and
+        // must not leave `list_frames` claiming the window is settled.
+        if listing.complete && !self.covers(&key, scope.range) {
+            self.covered.entry(key).or_default().push(scope.range);
+        }
+    }
+
+    /// Install one frame's grid under the key its fetch was dispatched for.
+    ///
+    /// The key comes back on the payload rather than being recomputed from
+    /// `stamp` and the pane, for the same reason the listing's scope does.
+    fn apply_frame(&mut self, _stamp: FrameStamp, data: FetchPayload, pane: &PaneRef<'_>) {
+        let Ok(frame) = data.downcast::<ModelFrameFetch>() else {
+            log::error!("a frame reached the model layer under another layer's payload");
+            return;
+        };
+        let Some(grid) = frame.grid else {
+            return;
+        };
+        let pinned = self.pinned_keys(pane);
+        self.cached_grids.insert(frame.key, Arc::new(grid), &pinned);
+    }
+
+    /// A no-op: this layer's residency is the grid cache's business
+    /// ([`MODEL_GRID_BUDGET_BYTES`], evicting by use under a byte budget), and
+    /// a second eviction authority would fight it.
     fn retain_frames(&mut self, _pane: &PaneRef<'_>, _keep: &[FrameStamp]) {}
 
     fn is_enabled(&self, pane: &PaneRef<'_>) -> bool {
@@ -339,11 +968,19 @@ impl OverlayHandler for ModelDataHandler {
     /// is one raster for both, which is this layer's shape of the cross-pane
     /// collision the pane state exists to prevent.
     fn content_signature(&self, pane: &PaneRef<'_>) -> u64 {
-        self.data_generation() ^ (self.view(pane).selected_param as u64 + 1).rotate_left(32)
+        let view = self.view(pane);
+        // The **frame** is in the token as well as the parameter: two panes on
+        // one parameter at two forecast hours are two different pictures, and
+        // one token for both is one raster for both.
+        let frame = self.key_of(view).map_or(0, |key| {
+            (key.run.and_utc().timestamp() as u64).rotate_left(16) ^ (u64::from(key.f_hour) + 1)
+        });
+        self.data_generation() ^ (view.selected_param as u64 + 1).rotate_left(32) ^ frame
     }
 
     fn has_data(&self, pane: &PaneRef<'_>) -> bool {
-        self.cached_grids.contains(self.view(pane).selected_param)
+        self.key_of(self.view(pane))
+            .is_some_and(|key| self.cached_grids.contains(key))
     }
 
     fn is_fetching(&self) -> bool {
@@ -402,14 +1039,17 @@ impl OverlayHandler for ModelDataHandler {
                 if let Some(notice) = grid.blank_notice() {
                     log::warn!("HRRR {}: {notice}", grid.parameter.short_name());
                 }
-                let param = grid.parameter;
+                // Read off the grid, not off the request: the fetch clamps a
+                // requested hour up to the parameter's floor, so the hour that
+                // arrived is the only one this may be filed under.
+                let key = GridKey::of(&grid);
                 let arc = Arc::new(grid);
-                // The pin is every parameter SOME pane is showing, which is
-                // what every read path below keys on; an arrival must never
-                // blank one. The arrival carries no pane of its own — the
-                // union across panes is the whole answer here.
-                let pinned = self.pinned_params(pane);
-                self.cached_grids.insert(param, arc.clone(), &pinned);
+                // The pin is every grid SOME pane is showing, which is what
+                // every read path below keys on; an arrival must never blank
+                // one. The arrival carries no pane of its own — the union
+                // across panes is the whole answer here.
+                let pinned = self.pinned_keys(pane);
+                self.cached_grids.insert(key, arc.clone(), &pinned);
                 self.state.set_data(Some(arc));
                 self.last_error = None;
             }
@@ -433,7 +1073,7 @@ impl OverlayHandler for ModelDataHandler {
     }
 
     fn hover_value_at(&self, lat: f64, lon: f64, pane: &PaneRef<'_>) -> Option<String> {
-        let grid = self.cached_grids.get(self.view(pane).selected_param)?;
+        let grid = self.grid_of(pane)?;
         if !grid.bounds.contains_point(lat, lon) {
             return None;
         }
@@ -478,10 +1118,7 @@ impl OverlayHandler for ModelDataHandler {
     /// the resident grid, so describing the job costs a refcount and the values
     /// memcpy happens only in the web encoder that knows the texture's bounds.
     fn prepare_job(&self, _ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
-        let grid = self
-            .cached_grids
-            .get(self.view(pane).selected_param)?
-            .clone();
+        let grid = self.grid_of(pane)?.clone();
         Some(DescribedJob::new(rasterize::GriddedInput::Whole(grid)))
     }
 
@@ -494,13 +1131,20 @@ impl OverlayHandler for ModelDataHandler {
     fn create_fetch_tasks(&self, ctx: &FetchConfig, pane: &PaneRef<'_>) -> Vec<FetchTask> {
         let client = ctx.client.clone();
         let sources = ctx.sources.clone();
-        let param = self.view(pane).selected_param;
+        let view = self.view(pane);
+        let param = view.selected_param;
         // The run and the forecast hour are chosen here, at the dispatch, not
-        // inside the fetch: the handler is where a scrubbed hour will come from
-        // once the layer supplies frames. Until then this is the latest run at
-        // the parameter's own floor — the behaviour the fetch used to hardcode.
-        let run = crate::hrrr::fetch::latest_available_run();
-        let f_hour = param.min_forecast_hour();
+        // inside the fetch. A pane parked on a frame asks for **that** frame —
+        // which is what makes a reopen 1:1 rather than snapping the pane back
+        // to the live hour. An unparked pane asks for the latest run at the
+        // parameter's own floor, the behaviour the fetch used to hardcode.
+        let (run, f_hour) = match view.selected_frame {
+            Some((run, f_hour)) => ((run.date(), run.hour() as u8), f_hour),
+            None => (
+                crate::hrrr::fetch::latest_available_run(),
+                param.min_forecast_hour(),
+            ),
+        };
         vec![FetchTask {
             kind: known::MODEL_DATA,
             future: Box::pin(async move {
@@ -520,7 +1164,7 @@ impl OverlayHandler for ModelDataHandler {
 
     fn controls(&self, pane: &PaneRef<'_>) -> Vec<ControlItem> {
         let view = self.view(pane);
-        let grid = self.cached_grids.get(view.selected_param);
+        let grid = self.grid_of(pane);
 
         // f01+ must show its *valid* time and F-hour: a 0-1 h maximum labelled
         // with the run time alone reads as an analysis valid now.
@@ -550,6 +1194,19 @@ impl OverlayHandler for ModelDataHandler {
                 .map(|p| (p.as_str().into(), p.display_name().into()))
                 .collect(),
             selected: view.selected_param.as_str().into(),
+        });
+
+        // Which way this pane's time axis runs. Beside the parameter and not
+        // behind the transport: it selects which frames exist, which is a
+        // question about the layer, not about the playhead.
+        items.push(ControlItem::Dropdown {
+            id: "axis",
+            label: "Time axis".into(),
+            options: ModelAxis::all()
+                .iter()
+                .map(|a| (a.as_str().into(), a.label().into()))
+                .collect(),
+            selected: view.axis.as_str().into(),
         });
 
         items.push(ControlItem::ButtonRow {
@@ -582,7 +1239,7 @@ impl OverlayHandler for ModelDataHandler {
             });
         }
 
-        if let Some(grid) = self.cached_grids.get(view.selected_param) {
+        if let Some(grid) = self.grid_of(pane) {
             // Windowed fields are maxima over a period, not instantaneous
             // readings; "UH2-5 at 04:00z" alone reads as a snapshot.
             if grid.forecast_hour > 0 && view.selected_param.is_windowed() {
@@ -623,12 +1280,37 @@ impl OverlayHandler for ModelDataHandler {
                     let new_param: ModelParameter = val.parse().unwrap();
                     if new_param != self.view(&pane.as_ref()).selected_param {
                         self.edit(pane, |state| state.selected_param = new_param);
-                        if self.cached_grids.contains(new_param) {
+                        if self.has_data(&pane.as_ref()) {
                             self.state.data_generation = self.state.data_generation.wrapping_add(1);
                             return ControlEffect::None;
                         }
                         return ControlEffect::Fetch;
                     }
+                }
+                ControlEffect::None
+            }
+            "axis" => {
+                if let ControlValue::String(ref val) = update.value
+                    && let Some(new_axis) = ModelAxis::parse(val)
+                    && new_axis != self.view(&pane.as_ref()).axis
+                {
+                    self.edit(pane, |state| {
+                        state.axis = new_axis;
+                        // The analysis axis carries one hour per run, so a pane
+                        // parked at f18 is parked on a frame this axis does not
+                        // contain; the run it is on is kept.
+                        if new_axis == ModelAxis::Analysis
+                            && let Some((run, _)) = state.selected_frame
+                        {
+                            state.selected_frame =
+                                Some((run, state.selected_param.min_forecast_hour()));
+                        }
+                    });
+                    if self.has_data(&pane.as_ref()) {
+                        self.state.data_generation = self.state.data_generation.wrapping_add(1);
+                        return ControlEffect::None;
+                    }
+                    return ControlEffect::Fetch;
                 }
                 ControlEffect::None
             }
@@ -662,20 +1344,63 @@ impl OverlayHandler for ModelDataHandler {
         {
             state.selected_param = param;
         }
+        if let Some(axis) = value
+            .get("axis")
+            .and_then(|v| v.as_str())
+            .and_then(ModelAxis::parse)
+        {
+            state.axis = axis;
+        }
+        // Both halves or neither: a run with no hour is not a frame, and a
+        // pane restored onto half a frame would draw the wrong hour rather
+        // than nothing.
+        if let Some(run) = value
+            .get("run")
+            .and_then(|v| v.as_str())
+            .and_then(parse_run)
+            && let Some(f_hour) = value
+                .get("forecast_hour")
+                .and_then(|v| v.as_u64())
+                .and_then(|h| u8::try_from(h).ok())
+        {
+            state.selected_frame = Some((run, f_hour));
+        }
         Some(Box::new(state))
     }
 
-    /// **Byte-identical to `serialize_state`** — same members, same order,
-    /// same values. The corpus is what says so.
+    /// **Every field of [`ModelPaneState`]**, which is what makes reopen 1:1:
+    /// the pane comes back on its parameter, its axis and the frame it was
+    /// left parked on. A pane that was never parked writes neither `run` nor
+    /// `forecast_hour` and reads back as `None` — the same absence, not a
+    /// stamp of the moment it was saved.
     fn serialize_pane_state(&self, state: &dyn std::any::Any) -> serde_json::Value {
         let Some(state) = state.downcast_ref::<ModelPaneState>() else {
             return serde_json::Value::Null;
         };
-        serde_json::json!({
+        let mut out = serde_json::json!({
             "enabled": state.enabled,
             "parameter": state.selected_param.as_str(),
-        })
+            "axis": state.axis.as_str(),
+        });
+        if let Some((run, f_hour)) = state.selected_frame
+            && let Some(map) = out.as_object_mut()
+        {
+            map.insert("run".into(), serde_json::json!(format_run(run)));
+            map.insert("forecast_hour".into(), serde_json::json!(f_hour));
+        }
+        out
     }
+}
+
+/// The saved spelling of a run time. Second-resolution ISO 8601 with no zone —
+/// every HRRR run is UTC on the hour, and a `Z` nothing reads back is noise.
+/// Written and parsed here so the two can only ever move together.
+fn format_run(run: chrono::NaiveDateTime) -> String {
+    run.format("%Y-%m-%dT%H:%M:%S").to_string()
+}
+
+fn parse_run(text: &str) -> Option<chrono::NaiveDateTime> {
+    chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S").ok()
 }
 
 #[cfg(test)]
@@ -715,7 +1440,7 @@ mod tests {
     }
 
     fn handler(parameter: ModelParameter, values: Vec<f32>) -> ModelDataHandler {
-        let mut h = ModelDataHandler::new();
+        let mut h = new_handler();
         h.defaults.enabled = true;
         h.defaults.selected_param = parameter;
         h.apply_fetch_result(
@@ -869,7 +1594,7 @@ mod tests {
             visible_points,
             value_range,
         };
-        let mut h = ModelDataHandler::new();
+        let mut h = new_handler();
         h.defaults.enabled = true;
         h.defaults.selected_param = parameter;
         h.apply_fetch_result(Box::new(HrrrFetchResult(Ok(g))), &PaneRef::across(&[]));
@@ -925,14 +1650,14 @@ mod tests {
     #[test]
     fn hover_is_silent_before_any_data_arrives() {
         assert_eq!(
-            ModelDataHandler::new().hover_value_at(35.0, -97.0, &PaneRef::bare(0)),
+            new_handler().hover_value_at(35.0, -97.0, &PaneRef::bare(0)),
             None
         );
     }
 
     #[test]
     fn a_fetch_error_is_reported_in_the_controls() {
-        let mut h = ModelDataHandler::new();
+        let mut h = new_handler();
         h.defaults.enabled = true;
         h.defaults.selected_param = ModelParameter::MaxUH2to5km;
         h.apply_fetch_result(
@@ -951,7 +1676,7 @@ mod tests {
 
     #[test]
     fn a_successful_fetch_clears_a_previous_error() {
-        let mut h = ModelDataHandler::new();
+        let mut h = new_handler();
         h.defaults.enabled = true;
         h.defaults.selected_param = ModelParameter::MaxUH2to5km;
         h.apply_fetch_result(
@@ -972,23 +1697,59 @@ mod tests {
         assert!(!lines.iter().any(|l| l.contains("HTTP 500")), "{lines:?}");
     }
 
+    /// **How many fixture grids these tests' cache holds.**
+    ///
+    /// The suite below predates the byte budget and is about eviction *order*,
+    /// which is unchanged: it wants a cache that fills at a known count. So it
+    /// states the count and [`test_budget`] converts it into the bytes the
+    /// production cache is really bounded by — six one-point grids, not six
+    /// entries.
+    const CACHE_ENTRIES: usize = 6;
+
+    // At a cap of 1, an insert of a key that is not the selected one protects
+    // both the arrival and the pin and the cache settles at two entries for
+    // ever. Two is where the eviction loop is guaranteed a victim.
+    const _: () = assert!(CACHE_ENTRIES >= 2);
+
+    /// [`CACHE_ENTRIES`] fixture grids' worth of bytes.
+    fn test_budget() -> usize {
+        CACHE_ENTRIES * grid_bytes(&grid(ModelParameter::all()[0], vec![300.0]))
+    }
+
+    /// A handler whose cache holds exactly [`CACHE_ENTRIES`] fixture grids.
+    fn new_handler() -> ModelDataHandler {
+        let mut h = ModelDataHandler::new();
+        h.cached_grids = ModelGridCache::with_budget(test_budget());
+        h
+    }
+
+    /// The key a fixture grid of `param` files itself under: the fixture run,
+    /// at the parameter's own floor.
+    fn key(param: ModelParameter) -> GridKey {
+        GridKey {
+            param,
+            run: run_time(),
+            f_hour: param.min_forecast_hour(),
+        }
+    }
+
     /// The parameters these tests fill the cache with, in fetch order: exactly
     /// enough to fill it, plus one more to overflow it. Taken from
-    /// [`ModelParameter::all`] so the set follows [`MODEL_GRID_CACHE_ENTRIES`].
+    /// [`ModelParameter::all`] so the set follows [`CACHE_ENTRIES`].
     fn fill_order() -> &'static [ModelParameter] {
-        let need = MODEL_GRID_CACHE_ENTRIES + 1;
+        let need = CACHE_ENTRIES + 1;
         let all = ModelParameter::all();
         assert!(
             all.len() >= need,
             "these tests need {need} distinct parameters to overflow a cache of \
-             {MODEL_GRID_CACHE_ENTRIES}, and there are {}",
+             {CACHE_ENTRIES}, and there are {}",
             all.len(),
         );
         &all[..need]
     }
 
     fn resident_order() -> &'static [ModelParameter] {
-        &fill_order()[..MODEL_GRID_CACHE_ENTRIES]
+        &fill_order()[..CACHE_ENTRIES]
     }
 
     fn oldest() -> ModelParameter {
@@ -1000,7 +1761,7 @@ mod tests {
     }
 
     fn overflow() -> ModelParameter {
-        fill_order()[MODEL_GRID_CACHE_ENTRIES]
+        fill_order()[CACHE_ENTRIES]
     }
 
     fn deliver(h: &mut ModelDataHandler, parameter: ModelParameter) {
@@ -1029,7 +1790,7 @@ mod tests {
     }
 
     fn full_cache() -> ModelDataHandler {
-        let mut h = ModelDataHandler::new();
+        let mut h = new_handler();
         h.defaults.enabled = true;
         for &p in resident_order() {
             h.defaults.selected_param = p;
@@ -1037,11 +1798,11 @@ mod tests {
         }
         assert_eq!(
             h.cached_grids.len(),
-            MODEL_GRID_CACHE_ENTRIES,
+            CACHE_ENTRIES,
             "the fixture must be full before a test evicts from it",
         );
         assert_eq!(
-            h.cached_grids.recency_order(),
+            h.cached_grids.recency_params(),
             resident_order().to_vec(),
             "fixture recency, oldest first",
         );
@@ -1058,7 +1819,7 @@ mod tests {
         const MAX_PANES_DESKTOP: usize = 6;
         let panes = &ModelParameter::all()[..MAX_PANES_DESKTOP];
 
-        let mut h = ModelDataHandler::new();
+        let mut h = new_handler();
         h.defaults.enabled = true;
         for &p in panes {
             h.defaults.selected_param = p;
@@ -1093,17 +1854,17 @@ mod tests {
         deliver(&mut h, overflow());
 
         assert!(
-            !h.cached_grids.is_resident(oldest()),
+            !h.cached_grids.is_resident(key(oldest())),
             "the least recently touched grid survived an overflowing insert",
         );
         for &p in &fill_order()[1..] {
             assert!(
-                h.cached_grids.is_resident(p),
+                h.cached_grids.is_resident(key(p)),
                 "{p:?} must still be resident"
             );
         }
-        assert_eq!(h.cached_grids.len(), MODEL_GRID_CACHE_ENTRIES);
-        assert_eq!(h.cached_grids.recency_order(), fill_order()[1..].to_vec());
+        assert_eq!(h.cached_grids.len(), CACHE_ENTRIES);
+        assert_eq!(h.cached_grids.recency_params(), fill_order()[1..].to_vec());
     }
 
     /// Cycling the whole Parameter dropdown is the gesture that grew this map to
@@ -1111,12 +1872,12 @@ mod tests {
     /// satisfied by a cache holding nothing.
     #[test]
     fn cycling_every_parameter_leaves_exactly_the_cap_resident() {
-        let mut h = ModelDataHandler::new();
+        let mut h = new_handler();
         h.defaults.enabled = true;
         for (i, p) in ModelParameter::all().iter().enumerate() {
             h.defaults.selected_param = *p;
             deliver(&mut h, *p);
-            let expected = (i + 1).min(MODEL_GRID_CACHE_ENTRIES);
+            let expected = (i + 1).min(CACHE_ENTRIES);
             assert_eq!(
                 h.cached_grids.len(),
                 expected,
@@ -1125,17 +1886,17 @@ mod tests {
                 ModelParameter::all().len(),
             );
             assert!(
-                h.cached_grids.is_resident(*p),
+                h.cached_grids.is_resident(key(*p)),
                 "the parameter just fetched is the one on screen: {p:?}",
             );
             assert_eq!(
-                h.cached_grids.recency_order().len(),
+                h.cached_grids.recency_params().len(),
                 expected,
                 "the recency list must hold exactly the keys of the map",
             );
         }
-        let tail = &ModelParameter::all()[ModelParameter::all().len() - MODEL_GRID_CACHE_ENTRIES..];
-        assert_eq!(h.cached_grids.recency_order(), tail.to_vec());
+        let tail = &ModelParameter::all()[ModelParameter::all().len() - CACHE_ENTRIES..];
+        assert_eq!(h.cached_grids.recency_params(), tail.to_vec());
     }
 
     /// Every `&self` reader of a grid must count as a use, or the parameter on
@@ -1147,16 +1908,16 @@ mod tests {
         // The fixture requirement, stated so that lowering the cap fails the
         // build rather than quietly walking fewer parameters than it claims.
         const _: () = assert!(
-            MODEL_GRID_CACHE_ENTRIES >= 3,
+            CACHE_ENTRIES >= 3,
             "this test walks three distinct parameters through the cache",
         );
         let mut h = full_cache();
 
         fn counted_as_a_use(h: &ModelDataHandler, read: ModelParameter, path: &str) {
-            let order = h.cached_grids.recency_order();
+            let order = h.cached_grids.recency_params();
             assert_eq!(
                 order.len(),
-                MODEL_GRID_CACHE_ENTRIES,
+                CACHE_ENTRIES,
                 "{path}: the recency list must still hold every key, got {order:?}",
             );
             assert_eq!(
@@ -1166,7 +1927,7 @@ mod tests {
             );
         }
 
-        let p = h.cached_grids.recency_order()[0];
+        let p = h.cached_grids.recency_params()[0];
         h.defaults.selected_param = p;
         assert!(
             h.hover_value_at(35.0, -97.0, &PaneRef::bare(0)).is_some(),
@@ -1174,7 +1935,7 @@ mod tests {
         );
         counted_as_a_use(&h, p, "hover_value_at");
 
-        let p = h.cached_grids.recency_order()[0];
+        let p = h.cached_grids.recency_params()[0];
         h.defaults.selected_param = p;
         assert!(
             h.prepare_job(&rasterize_ctx(), &PaneRef::bare(0)).is_some(),
@@ -1182,7 +1943,7 @@ mod tests {
         );
         counted_as_a_use(&h, p, "prepare_job");
 
-        let p = h.cached_grids.recency_order()[0];
+        let p = h.cached_grids.recency_params()[0];
         h.defaults.selected_param = p;
         assert_ne!(
             toggle_label(&h),
@@ -1192,12 +1953,12 @@ mod tests {
         );
         counted_as_a_use(&h, p, "controls");
 
-        let p = h.cached_grids.recency_order()[0];
+        let p = h.cached_grids.recency_params()[0];
         h.defaults.selected_param = p;
         assert!(h.has_data(&PaneRef::bare(0)), "{p:?} is resident");
         counted_as_a_use(&h, p, "has_data");
 
-        let p = h.cached_grids.recency_order()[0];
+        let p = h.cached_grids.recency_params()[0];
         assert_ne!(
             p, h.defaults.selected_param,
             "the dropdown branch runs only on a change"
@@ -1232,14 +1993,14 @@ mod tests {
         deliver(&mut h, overflow());
 
         assert!(
-            h.cached_grids.is_resident(oldest()),
+            h.cached_grids.is_resident(key(oldest())),
             "the hovered grid was evicted anyway",
         );
         assert!(
-            !h.cached_grids.is_resident(next_oldest()),
+            !h.cached_grids.is_resident(key(next_oldest())),
             "the oldest use is what must go",
         );
-        assert_eq!(h.cached_grids.len(), MODEL_GRID_CACHE_ENTRIES);
+        assert_eq!(h.cached_grids.len(), CACHE_ENTRIES);
     }
 
     /// The parameter the pane is showing is pinned, even when it is the oldest
@@ -1250,7 +2011,7 @@ mod tests {
         let mut h = full_cache();
         h.defaults.selected_param = oldest();
         assert_eq!(
-            h.cached_grids.recency_order(),
+            h.cached_grids.recency_params(),
             resident_order().to_vec(),
             "a bare assignment must not count as a use",
         );
@@ -1259,37 +2020,44 @@ mod tests {
         deliver(&mut h, overflow());
 
         assert!(
-            h.cached_grids.is_resident(oldest()),
+            h.cached_grids.is_resident(key(oldest())),
             "the parameter on screen was evicted under the user",
         );
         assert!(
-            !h.cached_grids.is_resident(next_oldest()),
+            !h.cached_grids.is_resident(key(next_oldest())),
             "the eviction must still happen, one entry along",
         );
-        assert!(h.cached_grids.is_resident(overflow()));
-        assert_eq!(h.cached_grids.len(), MODEL_GRID_CACHE_ENTRIES);
+        assert!(h.cached_grids.is_resident(key(overflow())));
+        assert_eq!(h.cached_grids.len(), CACHE_ENTRIES);
     }
 
-    /// A re-fetch replaces its own key rather than adding one, so a superseded
-    /// run costs nothing and evicts nobody — the cache carries no run identity.
+    /// **A re-fetch replaces its own RUN**, not merely its own parameter.
+    ///
+    /// Deliberately updated at S2 2.5, not re-pointed: the key was the
+    /// parameter alone and the cache was documented as carrying no run
+    /// identity, so *any* re-fetch of a parameter replaced its entry. It now
+    /// replaces only the entry of the same `(parameter, run, forecast hour)` —
+    /// which is what a plain re-fetch is — and a fetch of another run of the
+    /// same parameter lands **beside** it. Both halves are asserted; the
+    /// second is what fails if the run silently left the key again.
     #[test]
-    fn a_refetch_of_a_resident_parameter_replaces_its_own_key() {
+    fn a_refetch_of_a_resident_parameter_replaces_its_own_run() {
         let mut h = full_cache();
         h.defaults.selected_param = oldest();
         deliver(&mut h, oldest());
 
         assert_eq!(
             h.cached_grids.len(),
-            MODEL_GRID_CACHE_ENTRIES,
+            CACHE_ENTRIES,
             "a re-fetch must not grow the map",
         );
         for &p in resident_order() {
             assert!(
-                h.cached_grids.is_resident(p),
+                h.cached_grids.is_resident(key(p)),
                 "{p:?} must still be resident"
             );
         }
-        let order = h.cached_grids.recency_order();
+        let order = h.cached_grids.recency_params();
         assert_eq!(
             order.last(),
             Some(&oldest()),
@@ -1300,8 +2068,254 @@ mod tests {
             Some(&next_oldest()),
             "and the one behind it becomes the oldest, order is {order:?}",
         );
+
+        // The other half: a different run of the same parameter is a
+        // different picture and must not overwrite this one.
+        let later = run_time() + chrono::Duration::hours(1);
+        let mut grid = grid(oldest(), vec![300.0]);
+        grid.ref_time = later;
+        h.apply_fetch_result(Box::new(HrrrFetchResult(Ok(grid))), &PaneRef::across(&[]));
+        assert!(
+            h.cached_grids.is_resident(GridKey {
+                run: later,
+                ..key(oldest())
+            }),
+            "the newer run is not resident at all",
+        );
+        assert!(
+            h.cached_grids.is_resident(key(oldest())),
+            "a second run of one parameter overwrote the first — the cache is \
+             run-blind again, and a scrub between two runs would refetch every \
+             step",
+        );
     }
 
+    /// **Two forecast hours of one parameter are two resident grids.**
+    ///
+    /// The case the parameter-keyed cache could not express at all: a scrub
+    /// from f00 to f06 held one entry that each arrival overwrote, so stepping
+    /// back cost a refetch every time.
+    ///
+    /// Non-vacuity: the two grids are asserted to hold **different values**,
+    /// so a cache that kept one entry and answered it for both keys fails.
+    #[test]
+    fn two_forecast_hours_of_one_parameter_are_both_resident() {
+        let param = ModelParameter::SurfaceBasedCape;
+        let mut h = new_handler();
+        h.defaults.enabled = true;
+        h.defaults.selected_param = param;
+
+        for (f_hour, value) in [(0u8, 11.0f32), (6, 22.0)] {
+            let mut g = grid(param, vec![value]);
+            g.forecast_hour = f_hour;
+            h.apply_fetch_result(Box::new(HrrrFetchResult(Ok(g))), &PaneRef::across(&[]));
+        }
+
+        for (f_hour, value) in [(0u8, 11.0f32), (6, 22.0)] {
+            let resident = h
+                .cached_grids
+                .get(GridKey {
+                    param,
+                    run: run_time(),
+                    f_hour,
+                })
+                .unwrap_or_else(|| panic!("f{f_hour:02} is not resident"));
+            assert_eq!(
+                resident.values,
+                vec![value],
+                "f{f_hour:02} answered another hour's grid, so the two keys \
+                 share one entry",
+            );
+        }
+        assert_eq!(h.cached_grids.len(), 2, "two hours, two entries");
+    }
+
+    /// **A pinned key is never the victim, even past the budget.**
+    ///
+    /// The union of the panes' current keys is what must survive; a pane whose
+    /// grid is taken away fails *silently* — `prepare_job` answers `None` and
+    /// it goes on drawing its last texture with nothing that will re-ask.
+    ///
+    /// Non-triviality floor: the budget is set to **one** grid and six panes
+    /// are pinned, so every insert after the first is over budget and the
+    /// eviction loop runs on every one of them. A cache that evicted pinned
+    /// keys would be down to one entry by the end.
+    #[test]
+    fn the_cache_never_evicts_a_pinned_key() {
+        let params = &ModelParameter::all()[..CACHE_ENTRIES];
+        let states: Vec<FetchPayload> = params.iter().map(|p| pane_state(*p)).collect();
+        let peers: Vec<&dyn std::any::Any> =
+            states.iter().map(|s| &**s as &dyn std::any::Any).collect();
+
+        let mut h = new_handler();
+        h.cached_grids = ModelGridCache::with_budget(grid_bytes(&grid(params[0], vec![300.0])));
+        for p in params {
+            h.apply_fetch_result(
+                Box::new(HrrrFetchResult(Ok(grid(*p, vec![300.0])))),
+                &PaneRef::across(&peers),
+            );
+        }
+
+        assert!(
+            h.cached_grids.len() > 1,
+            "premise: the budget really is smaller than the pinned set, or \
+             nothing here was ever over budget",
+        );
+        for p in params {
+            assert!(
+                h.cached_grids.is_resident(key(*p)),
+                "{p:?} is pinned by a pane and was evicted anyway",
+            );
+        }
+        assert_eq!(h.cached_grids.len(), CACHE_ENTRIES);
+
+        // And an UNpinned key still goes, or "never evicts a pinned key" is
+        // true of a cache that never evicts anything.
+        let spare = overflow();
+        h.apply_fetch_result(
+            Box::new(HrrrFetchResult(Ok(grid(spare, vec![300.0])))),
+            &PaneRef::across(&peers),
+        );
+        h.apply_fetch_result(
+            Box::new(HrrrFetchResult(Ok(grid(spare, vec![300.0])))),
+            &PaneRef::across(&peers),
+        );
+        assert_eq!(
+            h.cached_grids.len(),
+            CACHE_ENTRIES + 1,
+            "the unpinned arrival should be the only thing above the pinned \
+             set, and the next one should take its place",
+        );
+    }
+
+    /// **The byte budget holds at least one grid per pane, on every target.**
+    ///
+    /// The floor a byte budget can cross that an entry cap could not: below it
+    /// a full pane layout starves, and it starves silently. Asserted for all
+    /// three arms from a host test — a `cfg`'d figure checked only on the
+    /// target that selects it is a figure nobody checked.
+    ///
+    /// The **denominator** is what makes this non-vacuous, so it is checked
+    /// rather than assumed: [`HRRR_CONUS_GRID_BYTES`] is asserted to be what
+    /// [`grid_bytes`] really counts for a CONUS-shaped grid, computed from a
+    /// one-point fixture rather than allocating 7.6 MB.
+    #[test]
+    fn the_byte_budget_holds_at_least_one_grid_per_pane() {
+        // What `grid_bytes` charges for a grid of `n` points on the arm HRRR
+        // actually decodes on — read out of the function, not restated.
+        let one = grid_bytes(&grid(ModelParameter::all()[0], vec![0.0]));
+        let two = grid_bytes(&grid(ModelParameter::all()[0], vec![0.0, 0.0]));
+        let per_point = two - one;
+        assert_eq!(
+            per_point,
+            std::mem::size_of::<f32>() + 2 * std::mem::size_of::<f64>(),
+            "the fixture's Explicit coordinates cost a point too; if this \
+             moved, the CONUS figure below is measuring something else",
+        );
+        // The production arm is Lambert, whose coordinates are closed forms.
+        let conus =
+            crate::hrrr::lambert::LambertGrid::from_parts(crate::hrrr::lambert::LambertGridParts {
+                a: 6_371_229.0,
+                e: 0.0,
+                n: 0.615_661_5,
+                big_f: 1.5,
+                rho0: 1.0,
+                lon0: -97.5,
+                x0: 0.0,
+                y0: 0.0,
+                dx: 3000.0,
+                dy: 3000.0,
+                ni: 1799,
+                nj: 1059,
+                i_consecutive: true,
+                alternating: false,
+                wraps_longitude: false,
+            });
+        let mut conus_grid = grid(ModelParameter::all()[0], vec![0.0]);
+        conus_grid.coords =
+            crate::hrrr::GridCoords::Lambert(conus.expect("the CONUS parts are a real grid"));
+        conus_grid.values = vec![0.0; 1799 * 1059];
+        assert_eq!(
+            grid_bytes(&conus_grid) - std::mem::size_of::<HrrrGridData>(),
+            HRRR_CONUS_GRID_BYTES,
+            "HRRR_CONUS_GRID_BYTES is not what grid_bytes charges for a CONUS \
+             grid, so every budget below is divided by the wrong number",
+        );
+
+        for (name, budget, panes) in [
+            ("wasm32", WASM_MODEL_GRID_BUDGET_BYTES, MAX_PANES_DESKTOP),
+            ("mobile", MOBILE_MODEL_GRID_BUDGET_BYTES, MAX_PANES_MOBILE),
+            (
+                "desktop",
+                DESKTOP_MODEL_GRID_BUDGET_BYTES,
+                MAX_PANES_DESKTOP,
+            ),
+        ] {
+            let grids = budget / HRRR_CONUS_GRID_BYTES;
+            assert!(
+                grids >= panes,
+                "{name} budgets {budget} bytes = {grids} CONUS grids for \
+                 {panes} panes. Below one grid per pane a pane loses its grid \
+                 to another pane's arrival and there is no symptom: \
+                 `prepare_job` answers None and it keeps drawing the last \
+                 texture.",
+            );
+        }
+        assert_eq!(
+            (
+                WASM_MODEL_GRID_BUDGET_BYTES / HRRR_CONUS_GRID_BYTES,
+                MOBILE_MODEL_GRID_BUDGET_BYTES / HRRR_CONUS_GRID_BYTES,
+                DESKTOP_MODEL_GRID_BUDGET_BYTES / HRRR_CONUS_GRID_BYTES,
+            ),
+            (13, 26, 70),
+            "the figures the module doc states",
+        );
+    }
+
+    /// The budget is bytes and not entries: a cache holding one CONUS grid's
+    /// worth is emptied by a single grid four times the size, and holds many
+    /// small ones.
+    ///
+    /// This is the property an entry cap cannot express, so it is the one
+    /// worth a test of its own.
+    #[test]
+    fn the_budget_counts_bytes_and_not_entries() {
+        let param = ModelParameter::all()[0];
+        // Big enough that `size_of::<HrrrGridData>()` — a fixed ~200 bytes
+        // charged once per entry — does not blur the four-to-one ratio below.
+        const POINTS: usize = 10_000;
+        let small = grid_bytes(&grid(param, vec![0.0; POINTS]));
+        let mut cache = ModelGridCache::with_budget(small * 4);
+
+        for f_hour in 0..4u8 {
+            cache.insert(
+                GridKey {
+                    param,
+                    run: run_time(),
+                    f_hour,
+                },
+                Arc::new(grid(param, vec![0.0; POINTS])),
+                &[],
+            );
+        }
+        assert_eq!(cache.len(), 4, "four small grids fit");
+
+        // One grid of the same COUNT but four times the bytes takes the lot.
+        cache.insert(
+            GridKey {
+                param,
+                run: run_time(),
+                f_hour: 9,
+            },
+            Arc::new(grid(param, vec![0.0; POINTS * 4])),
+            &[],
+        );
+        assert_eq!(
+            cache.len(),
+            1,
+            "an entry cap would have kept four; a byte budget keeps what fits",
+        );
+    }
     /// Eviction costs one refetch when the user returns, and the toggle is where
     /// that has to happen. The counterpart is asserted too.
     #[test]
@@ -1356,6 +2370,7 @@ mod tests {
         Box::new(ModelPaneState {
             enabled: true,
             selected_param: param,
+            ..ModelPaneState::new(true)
         })
     }
 
@@ -1373,7 +2388,7 @@ mod tests {
         let right = ModelParameter::all()[1];
         assert_ne!(left, right, "premise: two distinct parameters");
 
-        let mut h = ModelDataHandler::new();
+        let mut h = new_handler();
         // Both grids resident, so a difference in the answers is a difference
         // in the selection and not in what happens to be cached.
         deliver(&mut h, left);
@@ -1459,7 +2474,7 @@ mod tests {
     fn two_panes_on_two_parameters_do_not_share_a_cache_token() {
         let left = ModelParameter::all()[0];
         let right = ModelParameter::all()[1];
-        let h = ModelDataHandler::new();
+        let h = new_handler();
         let a = pane_state(left);
         let b = pane_state(right);
         let same = pane_state(left);
@@ -1498,7 +2513,7 @@ mod tests {
         let pinned_a = oldest();
         let pinned_b = next_oldest();
         assert_eq!(
-            h.cached_grids.recency_order()[..2],
+            h.cached_grids.recency_params()[..2],
             [pinned_a, pinned_b],
             "premise: both pinned parameters are the next two to be evicted",
         );
@@ -1512,22 +2527,18 @@ mod tests {
         );
 
         assert!(
-            h.cached_grids.is_resident(pinned_a),
+            h.cached_grids.is_resident(key(pinned_a)),
             "pane 0's grid was evicted by another pane's arrival",
         );
         assert!(
-            h.cached_grids.is_resident(pinned_b),
+            h.cached_grids.is_resident(key(pinned_b)),
             "pane 1's grid was evicted by another pane's arrival",
         );
         assert!(
-            h.cached_grids.is_resident(overflow()),
+            h.cached_grids.is_resident(key(overflow())),
             "premise: the arriving grid is resident",
         );
-        assert_eq!(
-            h.cached_grids.len(),
-            MODEL_GRID_CACHE_ENTRIES,
-            "the cap still holds",
-        );
+        assert_eq!(h.cached_grids.len(), CACHE_ENTRIES, "the cap still holds",);
     }
 
     // ── The frame axis (WO-M11) ───────────────────────────────────────────
@@ -1554,7 +2565,7 @@ mod tests {
     }
 
     fn seeded(parameter: ModelParameter, fh: u8) -> ModelDataHandler {
-        let mut h = ModelDataHandler::new();
+        let mut h = new_handler();
         h.defaults.enabled = true;
         h.defaults.selected_param = parameter;
         h.apply_fetch_result(
@@ -1602,35 +2613,49 @@ mod tests {
         );
     }
 
-    /// **The listing is the resident set clipped to the window, and it is
-    /// NEVER complete** — there is no HRRR archive listing in this build, so
-    /// "these are all of them" would be a claim nothing checked.
+    /// **The forecast listing is the run's own hours clipped to the window,
+    /// and it IS complete.**
+    ///
+    /// Deliberately updated at S2 2.6, not merely re-pointed. It used to
+    /// assert `!complete` on the grounds that "there is no HRRR archive
+    /// listing in this build" — which was true of the *analysis* axis and
+    /// never true of this one: the forecast hours of a run are
+    /// `min_forecast_hour..=horizon`, published with an `.idx` each, so
+    /// "these are all of them" is arithmetic rather than a claim nothing
+    /// checked.
     #[test]
-    fn the_listing_clips_to_its_window_and_never_claims_completeness() {
+    fn the_forecast_listing_clips_to_its_window_and_is_complete() {
         let h = seeded(ModelParameter::SurfaceBasedCape, 2);
-        let valid = run_time() + chrono::Duration::hours(2);
+        let run = run_time();
+        // RUN_HOUR is 3 — an off-cycle run, so 18 hours and not 48.
+        assert_eq!(forecast_horizon(run), 18, "premise: an off-cycle run");
         let inside = (
-            valid - chrono::Duration::hours(1),
-            valid + chrono::Duration::hours(1),
+            run + chrono::Duration::hours(1),
+            run + chrono::Duration::hours(3),
         );
         let before = (
-            valid - chrono::Duration::hours(4),
-            valid - chrono::Duration::hours(1),
+            run - chrono::Duration::hours(4),
+            run - chrono::Duration::hours(1),
         );
 
         let listing = h.list_frames(&fetch_cfg(), &PaneRef::bare(0), inside);
         assert_eq!(listing.range, inside, "the window is echoed back");
         assert_eq!(
             listing.frames,
-            vec![FrameStamp {
-                valid,
-                run: Some(run_time()),
-            }],
+            (1..=3)
+                .map(|f| FrameStamp {
+                    valid: run + chrono::Duration::hours(f),
+                    run: Some(run),
+                })
+                .collect::<Vec<_>>(),
+            "the forecast axis offers every hour of the run in the window, \
+             not only the one hour that happens to be resident",
         );
         assert!(
-            !listing.complete,
-            "the listing claimed to be every frame that exists, which nothing \
-             in this build could know",
+            listing.complete,
+            "the forecast hours of a run are a closed form; an incomplete \
+             listing here makes the transport keep asking for a set nothing \
+             will ever add to",
         );
 
         assert!(
@@ -1642,11 +2667,517 @@ mod tests {
         );
     }
 
+    /// A listing over the whole horizon is exactly the hours the archive
+    /// publishes — the floor at one end, the cycle's horizon at the other.
+    ///
+    /// Non-vacuity: the two cycles are asserted to differ, so a horizon
+    /// function that ignored its argument fails.
+    #[test]
+    fn the_forecast_listing_is_the_runs_own_published_hours() {
+        let whole = |run: chrono::NaiveDateTime| {
+            let mut h = new_handler();
+            h.defaults.enabled = true;
+            h.defaults.selected_param = ModelParameter::SurfaceBasedCape;
+            h.defaults.selected_frame = Some((run, 0));
+            h.list_frames(
+                &fetch_cfg(),
+                &PaneRef::bare(0),
+                (run, run + chrono::Duration::days(4)),
+            )
+            .frames
+            .len()
+        };
+        let cycle = chrono::NaiveDate::from_ymd_opt(2026, 8, 20)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let off_cycle = cycle + chrono::Duration::hours(1);
+        assert_eq!(whole(cycle), 49, "f00..=f48 on a 12Z run");
+        assert_eq!(whole(off_cycle), 19, "f00..=f18 on a 13Z run");
+        assert_ne!(
+            whole(cycle),
+            whole(off_cycle),
+            "the horizon does not read its run, so every cycle would offer \
+             the same frames",
+        );
+    }
+
+    /// **The horizon is the RUN's own cycle**, not the wall clock and not a
+    /// constant. Measured against the live archive 2026-08-21: f00–f48 on
+    /// 00/06/12/18Z, f00–f18 off-cycle.
+    ///
+    /// Every hour of the day is walked, so a rule that happened to be right
+    /// for the four synoptic hours and wrong for one other cannot pass.
+    #[test]
+    fn the_forecast_horizon_is_the_runs_own_cycle() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 8, 20).unwrap();
+        for hour in 0..24u32 {
+            let run = day.and_hms_opt(hour, 0, 0).unwrap();
+            let expected = if matches!(hour, 0 | 6 | 12 | 18) {
+                48
+            } else {
+                18
+            };
+            assert_eq!(forecast_horizon(run), expected, "{hour:02}Z");
+        }
+    }
+
+    /// **The forecast axis answers `complete` without a network round trip.**
+    ///
+    /// The task built for it is a ready future: nothing in its body reaches
+    /// for the client, and it resolves on a bare `block_on` with no runtime
+    /// I/O driver at all — which is the executable form of "needs no network".
+    /// A task that issued a request would hang or fail here rather than
+    /// answering.
+    #[test]
+    fn a_forecast_listing_is_complete_without_a_network_round_trip() {
+        let h = seeded(ModelParameter::SurfaceBasedCape, 2);
+        let run = run_time();
+        let range = (run, run + chrono::Duration::hours(6));
+        let task = h
+            .create_frame_list_task(&fetch_cfg(), &PaneRef::bare(0), range)
+            .expect("a pane that knows its run has a listing to build");
+        assert_eq!(task.kind, known::MODEL_DATA);
+
+        let payload = futures::executor::block_on(task.future);
+        let result = payload
+            .downcast::<FrameListingResult>()
+            .expect("built through FrameListingResult::task");
+        assert!(
+            result.listing.complete,
+            "the forecast listing must claim completeness — the set is known \
+             exactly",
+        );
+        assert_eq!(
+            result.listing.frames.len(),
+            7,
+            "f00..=f06 of the run, clipped to the window: {:?}",
+            result.listing.frames,
+        );
+        let scope = result
+            .scope
+            .downcast::<ModelListing>()
+            .expect("the scope is this layer's own");
+        assert_eq!(scope.axis, ModelAxis::Forecast);
+        assert_eq!(scope.run, run);
+        assert!(
+            scope.runs.is_empty(),
+            "a forecast listing names no runs of its own; its frames are a \
+             closed form of the one it was dispatched for",
+        );
+    }
+
+    /// **The analysis axis is incomplete until a bucket listing lands**, and
+    /// then complete only over the window that listing really covered.
+    ///
+    /// Three states asserted, not one: before any listing, after a listing
+    /// that failed (empty, `complete: false`), and after one that answered.
+    /// The middle state is the one that matters — "I found none" must not read
+    /// as "none exist".
+    #[test]
+    fn an_analysis_listing_is_incomplete_until_the_bucket_answers() {
+        let run = run_time();
+        let range = (run - chrono::Duration::hours(3), run);
+        let mut h = seeded(ModelParameter::SurfaceBasedCape, 0);
+        h.defaults.axis = ModelAxis::Analysis;
+
+        let before = h.list_frames(&fetch_cfg(), &PaneRef::bare(0), range);
+        assert!(
+            !before.complete,
+            "the analysis axis claimed completeness with no listing at all",
+        );
+        assert!(before.frames.is_empty(), "{:?}", before.frames);
+
+        let scope = || ModelListing {
+            param: ModelParameter::SurfaceBasedCape,
+            run,
+            axis: ModelAxis::Analysis,
+            range,
+            runs: Vec::new(),
+        };
+        // A listing that failed: empty, and honest about why.
+        h.apply_frame_listing(
+            FrameListing {
+                range,
+                frames: Vec::new(),
+                complete: false,
+            },
+            Box::new(scope()),
+            &PaneRef::across(&[]),
+        );
+        let failed = h.list_frames(&fetch_cfg(), &PaneRef::bare(0), range);
+        assert!(
+            !failed.complete,
+            "an empty listing that failed was recorded as coverage, so \
+             `list_frames` now claims the window is settled and no retry ever \
+             happens",
+        );
+
+        // And one that answered.
+        let runs: Vec<_> = (1..=3)
+            .map(|back| run - chrono::Duration::hours(back))
+            .collect();
+        h.apply_frame_listing(
+            FrameListing {
+                range,
+                frames: Vec::new(),
+                complete: true,
+            },
+            Box::new(ModelListing {
+                runs: runs.clone(),
+                ..scope()
+            }),
+            &PaneRef::across(&[]),
+        );
+        let answered = h.list_frames(&fetch_cfg(), &PaneRef::bare(0), range);
+        assert!(answered.complete, "a covering listing landed");
+        let mut expected = runs.clone();
+        expected.sort_unstable();
+        assert_eq!(
+            answered.frames,
+            expected
+                .iter()
+                .map(|r| FrameStamp {
+                    valid: *r,
+                    run: Some(*r),
+                })
+                .collect::<Vec<_>>(),
+            "the analysis axis offers one frame per listed run",
+        );
+    }
+
+    /// **A listing files under the scope it was DISPATCHED for, never the
+    /// pane's current one.**
+    ///
+    /// The round trip is uncancellable and the pane can roll onto a new run
+    /// while it is in the air; the `PaneRef` that arrives with it is a
+    /// `PaneRef::across` union whose config is null by construction, so a
+    /// handler that read the run back off the pane would file the old run's
+    /// listing under the new run — silently, and with no symptom but a frame
+    /// list that is one run wrong.
+    ///
+    /// Both directions are asserted: the dispatched run is covered, and the
+    /// pane's current run is **not**. The second is what fails if the scope is
+    /// ignored; the first is what fails if it is filed nowhere at all.
+    #[test]
+    fn a_listing_files_under_the_run_it_was_dispatched_for_not_the_panes_current_run() {
+        let dispatched = run_time();
+        let rolled = dispatched + chrono::Duration::hours(1);
+        assert_ne!(dispatched, rolled, "premise: two runs");
+        let range = (dispatched - chrono::Duration::hours(3), dispatched);
+
+        let mut h = new_handler();
+        h.defaults.enabled = true;
+        h.defaults.selected_param = ModelParameter::SurfaceBasedCape;
+        h.defaults.axis = ModelAxis::Analysis;
+        // The pane has already rolled on by the time the answer lands.
+        h.defaults.selected_frame = Some((rolled, 0));
+
+        h.apply_frame_listing(
+            FrameListing {
+                range,
+                frames: Vec::new(),
+                complete: true,
+            },
+            Box::new(ModelListing {
+                param: ModelParameter::SurfaceBasedCape,
+                run: dispatched,
+                axis: ModelAxis::Analysis,
+                range,
+                runs: vec![dispatched - chrono::Duration::hours(1)],
+            }),
+            &PaneRef::across(&[]),
+        );
+
+        let ask = |h: &ModelDataHandler, run: chrono::NaiveDateTime| {
+            let mut probe = new_handler();
+            probe.defaults = h.defaults.clone();
+            probe.defaults.selected_frame = Some((run, 0));
+            probe.frame_listings = h.frame_listings.clone();
+            probe.covered = h.covered.clone();
+            probe.list_frames(&fetch_cfg(), &PaneRef::bare(0), range)
+        };
+
+        assert!(
+            ask(&h, dispatched).complete,
+            "the listing was filed under neither run, so it was filed nowhere",
+        );
+        assert!(
+            !ask(&h, rolled).complete,
+            "the listing was filed under the run the PANE holds rather than \
+             the run it was dispatched for — every frame it names belongs to \
+             another run",
+        );
+        assert!(
+            !ask(&h, rolled)
+                .frames
+                .iter()
+                .any(|f| f.run == Some(dispatched - chrono::Duration::hours(1))),
+            "the rolled pane was offered the dispatched run's frames",
+        );
+    }
+
+    /// A stamp no listing named gets no fetch — the same answer radar gives a
+    /// pane whose loop is being rebuilt while the old queue drains.
+    ///
+    /// Non-vacuity: the neighbouring stamp that *is* named answers `Some`, so
+    /// a `fetch_frame` that refused everything fails this.
+    #[test]
+    fn a_stamp_no_listing_named_is_not_fetched() {
+        let h = seeded(ModelParameter::SurfaceBasedCape, 2);
+        let run = run_time();
+        let named = FrameStamp {
+            valid: run + chrono::Duration::hours(6),
+            run: Some(run),
+        };
+        assert!(
+            h.fetch_frame(&fetch_cfg(), &PaneRef::bare(0), &named)
+                .is_some(),
+            "premise: f06 of this pane's own run is a frame it can fetch",
+        );
+
+        for (stamp, why) in [
+            (
+                FrameStamp {
+                    valid: run + chrono::Duration::hours(19),
+                    run: Some(run),
+                },
+                "past the horizon of an off-cycle run",
+            ),
+            (
+                FrameStamp {
+                    valid: run + chrono::Duration::hours(2),
+                    run: Some(run + chrono::Duration::hours(1)),
+                },
+                "off another run than the one this pane is on",
+            ),
+            (
+                FrameStamp {
+                    valid: run + chrono::Duration::hours(2),
+                    run: None,
+                },
+                "carrying no run at all",
+            ),
+            (
+                FrameStamp {
+                    valid: run - chrono::Duration::hours(1),
+                    run: Some(run),
+                },
+                "before its own run",
+            ),
+        ] {
+            assert!(
+                h.fetch_frame(&fetch_cfg(), &PaneRef::bare(0), &stamp)
+                    .is_none(),
+                "a stamp {why} was accepted for fetch",
+            );
+        }
+    }
+
+    /// **`f_hour = (valid - run).num_hours()`** — the inverse of
+    /// [`HrrrGridData::valid_time`], and the whole of the stamp arithmetic.
+    #[test]
+    fn a_stamp_maps_back_to_its_parameter_run_and_forecast_hour() {
+        let h = seeded(ModelParameter::SurfaceBasedCape, 0);
+        let run = run_time();
+        for f_hour in [0u8, 1, 6, 18] {
+            let stamp = FrameStamp {
+                valid: run + chrono::Duration::hours(i64::from(f_hour)),
+                run: Some(run),
+            };
+            assert_eq!(
+                h.frame_target(&h.defaults, &stamp),
+                Some(GridKey {
+                    param: ModelParameter::SurfaceBasedCape,
+                    run,
+                    f_hour,
+                }),
+                "f{f_hour:02}",
+            );
+        }
+    }
+
+    /// A frame installs under the key its own fetch was dispatched for, and
+    /// leaves the live picture alone.
+    #[test]
+    fn an_arriving_frame_installs_under_its_own_key() {
+        let mut h = seeded(ModelParameter::SurfaceBasedCape, 0);
+        let generation = h.data_generation();
+        let target = GridKey {
+            param: ModelParameter::SurfaceBasedCape,
+            run: run_time(),
+            f_hour: 9,
+        };
+        assert!(
+            !h.cached_grids.is_resident(target),
+            "premise: f09 is not resident yet",
+        );
+
+        h.apply_frame(
+            FrameStamp {
+                valid: run_time() + chrono::Duration::hours(9),
+                run: Some(run_time()),
+            },
+            Box::new(ModelFrameFetch {
+                key: target,
+                grid: Some(grid_at_fh(ModelParameter::SurfaceBasedCape, 9)),
+            }),
+            &PaneRef::across(&[]),
+        );
+
+        assert!(h.cached_grids.is_resident(target), "the frame is resident");
+        assert_eq!(
+            h.data_generation(),
+            generation,
+            "a frame arrival moved the LIVE picture's generation, which is \
+             what `apply_fetch_result` is for",
+        );
+    }
+
+    /// A frame whose fetch failed installs nothing rather than a hole.
+    #[test]
+    fn a_failed_frame_installs_nothing() {
+        let mut h = seeded(ModelParameter::SurfaceBasedCape, 0);
+        let before = h.cached_grids.len();
+        h.apply_frame(
+            FrameStamp {
+                valid: run_time() + chrono::Duration::hours(9),
+                run: Some(run_time()),
+            },
+            Box::new(ModelFrameFetch {
+                key: GridKey {
+                    param: ModelParameter::SurfaceBasedCape,
+                    run: run_time(),
+                    f_hour: 9,
+                },
+                grid: None,
+            }),
+            &PaneRef::across(&[]),
+        );
+        assert_eq!(h.cached_grids.len(), before);
+    }
+
+    /// **The axis is a control and it persists.** Reopen is exactly 1:1.
+    #[test]
+    fn the_axis_survives_a_control_round_trip_and_a_reopen() {
+        let mut h = new_handler();
+        let mut state = h.create_pane_state(true).expect("a pane state");
+        fn axis_of(state: &FetchPayload) -> ModelAxis {
+            state
+                .downcast_ref::<ModelPaneState>()
+                .expect("this layer's own state")
+                .axis
+        }
+        assert_eq!(axis_of(&state), ModelAxis::Forecast, "the default");
+
+        h.apply_control(
+            &ControlUpdate {
+                id: "axis",
+                value: ControlValue::String("analysis".into()),
+            },
+            &mut PaneMut {
+                pane_idx: 0,
+                state: Some(&mut *state),
+                peers: &[],
+            },
+        );
+        assert_eq!(axis_of(&state), ModelAxis::Analysis, "the control took");
+
+        let json = h.serialize_pane_state(&*state);
+        assert_eq!(
+            json["axis"],
+            serde_json::json!("analysis"),
+            "the axis did not reach the file: {json}",
+        );
+        let back = h
+            .deserialize_pane_state(json, true)
+            .expect("the saved state reloads");
+        assert_eq!(
+            axis_of(&back),
+            ModelAxis::Analysis,
+            "the pane came back on the forecast axis it was not left on",
+        );
+    }
+
+    /// The dropdown itself: both axes offered, the pane's own selected.
+    #[test]
+    fn the_axis_dropdown_offers_both_axes() {
+        let mut h = new_handler();
+        h.defaults.axis = ModelAxis::Analysis;
+        let dropdown = controls_of(&h)
+            .into_iter()
+            .find_map(|item| match item {
+                ControlItem::Dropdown {
+                    id: "axis",
+                    options,
+                    selected,
+                    ..
+                } => Some((options, selected)),
+                _ => None,
+            })
+            .expect("the model layer offers an axis dropdown");
+        assert_eq!(
+            dropdown
+                .0
+                .iter()
+                .map(|(v, _)| v.clone())
+                .collect::<Vec<_>>(),
+            vec!["forecast".to_string(), "analysis".to_string()],
+        );
+        assert_eq!(dropdown.1, "analysis", "the pane's own axis is selected");
+    }
+
+    /// **The parked frame persists too** — the pane comes back on the run and
+    /// the forecast hour it was left on, not on the live hour.
+    ///
+    /// Non-vacuity: the two halves are asserted individually, so a save that
+    /// wrote the run and dropped the hour fails rather than reading as a
+    /// round trip of a `None`.
+    #[test]
+    fn a_parked_frame_survives_a_reopen() {
+        let h = new_handler();
+        let mut state = h.create_pane_state(true).expect("a pane state");
+        let run = run_time();
+        state
+            .downcast_mut::<ModelPaneState>()
+            .expect("this layer's own state")
+            .selected_frame = Some((run, 12));
+
+        let json = h.serialize_pane_state(&*state);
+        assert_eq!(json["run"], serde_json::json!("2026-07-25T03:00:00"));
+        assert_eq!(json["forecast_hour"], serde_json::json!(12));
+
+        let back = h
+            .deserialize_pane_state(json, true)
+            .expect("the saved state reloads");
+        assert_eq!(
+            back.downcast_ref::<ModelPaneState>()
+                .expect("this layer's own state")
+                .selected_frame,
+            Some((run, 12)),
+            "the pane did not come back on the frame it was left on",
+        );
+
+        // And a pane that was never parked comes back unparked rather than
+        // stamped with the moment it was saved.
+        let fresh = h.create_pane_state(true).expect("a pane state");
+        let json = h.serialize_pane_state(&*fresh);
+        assert!(json.get("run").is_none(), "{json}");
+        assert_eq!(
+            h.deserialize_pane_state(json, true)
+                .expect("reloads")
+                .downcast_ref::<ModelPaneState>()
+                .expect("this layer's own state")
+                .selected_frame,
+            None,
+        );
+    }
+
     /// The axis itself: hourly cycles that run **ahead** of the wall clock.
     #[test]
     fn the_model_layer_declares_an_hourly_forecast_axis() {
         assert_eq!(
-            ModelDataHandler::new().time_axis(),
+            new_handler().time_axis(),
             TimeAxis::FrameSeries {
                 typical_step: std::time::Duration::from_secs(3600),
                 extends_future: true,
