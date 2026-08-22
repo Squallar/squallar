@@ -1074,7 +1074,7 @@ const GOLDEN: &[(&str, usize, usize, u64, &str)] = &[
 #[test]
 fn real_granule_unpacks_to_the_values_the_c_netcdf_library_produced() {
     let bytes = std::fs::read(REAL_GRANULE).expect("read the committed GLM granule");
-    let g = super::h5::Granule::open(&bytes).expect("open the granule");
+    let g = rustdar_netcdf::Granule::open(&bytes).expect("open the granule");
 
     for (name, len, missing, hash, units) in GOLDEN {
         let v = g
@@ -1101,10 +1101,10 @@ fn real_granule_unpacks_to_the_values_the_c_netcdf_library_produced() {
 /// with a `scale_factor`, or the golden test checks an unused code path.
 #[test]
 fn the_real_granule_still_exercises_packed_unsigned_shorts() {
-    use super::cf::VarType;
+    use rustdar_netcdf::VarType;
 
     let bytes = std::fs::read(REAL_GRANULE).expect("read the committed GLM granule");
-    let g = super::h5::Granule::open(&bytes).expect("open the granule");
+    let g = rustdar_netcdf::Granule::open(&bytes).expect("open the granule");
 
     for name in ["flash_energy", "flash_area", "event_lat", "event_lon"] {
         let v = g.raw_var(name).unwrap().unwrap();

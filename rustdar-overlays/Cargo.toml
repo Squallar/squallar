@@ -32,16 +32,9 @@ grib = { version = "=0.17.1", default-features = false, features = [
 ] }
 rustdar-units = { workspace = true }
 futures = "=0.3.34"
-# GOES GLM granules. GLM L2 LCFA files are NetCDF4, i.e. plain HDF5 (every
-# netCDF variable is an HDF5 dataset in the root group), so `glm::h5` reads them
-# without a netCDF layer. Pure Rust; no `-sys` crate, unlike `netcdf`.
-# Defaults are deliberately ON here (`std`, `checksum`, `deflate`) and must not
-# be hoisted into `[workspace.dependencies]`: Cargo silently ignores a member's
-# `default-features = false` when the workspace entry leaves defaults on. GLM L2
-# LCFA granules are deflate-compressed, so dropping `deflate` takes the lightning
-# overlay dark. Do NOT enable `fast-deflate` either: it selects `flate2/zlib-ng`,
-# which is C and breaks wasm32/iOS cross-compilation.
-hdf5-pure = "=0.38.0"
+# NetCDF4 reading and CF unpacking for the GLM and GMGSI granules, both of
+# which are NetCDF4. A Band 0 leaf with no first-party dependencies of its own.
+rustdar-netcdf = { workspace = true }
 log = { workspace = true }
 # `json` only, NOT `default`: reqwest's `default-tls` aliases `rustls` with
 # aws-lc-rs, pulling `aws-lc-sys` in. TLS backend comes from the workspace pin.
@@ -58,6 +51,13 @@ rustdar-geo = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tiny-skia = "=0.12.0"
+
+[dev-dependencies]
+# Test fixtures only: `glm::tests` and `gmgsi::decode::tests` write HDF5 files
+# with `FileBuilder` to feed the decoders. Shipped code in this crate reaches
+# HDF5 exclusively through `rustdar-netcdf`, which owns the pin and the
+# feature rationale -- keep the two versions equal.
+hdf5-pure = "=0.38.0"
 
 # Must stay target-gated: tokio rejects `fs` on wasm ("Only features
 # sync,macros,io-util,rt,time are supported on wasm") -- a hard build failure.

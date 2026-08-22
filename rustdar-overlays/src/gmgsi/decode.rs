@@ -1,10 +1,10 @@
 //! A GMGSI granule into the gridded substrate.
 //!
-//! Reads through [`crate::glm::h5`] and [`crate::glm::cf`] — the NetCDF4 and
-//! CF-convention layers, which are not GLM's own — and produces a
+//! Reads through [`rustdar_netcdf`] — the NetCDF4 and CF-convention layer,
+//! which knows nothing about satellites — and produces a
 //! [`ResidentGrid`] on [`GridCoords::Separable`]. Nothing here re-implements a
 //! CF rule; `_FillValue` reaches the raster as a NaN because
-//! [`crate::glm::cf::unpack`] marked it missing, not because this file compared
+//! [`rustdar_netcdf::cf`] marked it missing, not because this file compared
 //! against `-9999`.
 
 use rustdar_geo::GeoBounds;
@@ -40,8 +40,24 @@ const SEPARABLE_EPS: f64 = 1e-6;
 /// on the same few columns.
 const SEPARABLE_PROBE_STRIDE: usize = 97;
 
-pub fn decode(bytes: &[u8], channel: GmgsiChannel) -> Result<GmgsiGrid, String> {
-    let granule = crate::glm::h5::Granule::open(bytes)?;
+/// Rows held resident at once while streaming a coordinate variable.
+///
+/// The latitude axis is column 0 of *every* row, so it cannot be narrowed to a
+/// window — but it can be blocked, which bounds peak residency at
+/// `ROW_BLOCK * ni` elements rather than `nj * ni`. On the reference granule
+/// that is roughly 20 MB against 240 MB.
+///
+/// Not coprime with anything and not required to be: this only decides how the
+/// same rows are grouped, never which ones are read.
+const ROW_BLOCK: usize = 256;
+
+/// Decode a granule, **taking its bytes**.
+///
+/// By value on purpose: the reader needs an owned buffer, a GMGSI body is
+/// 7.5 MB, and taking it here means `Granule::from_vec` can adopt the
+/// allocation instead of `Granule::open` copying it.
+pub fn decode(bytes: Vec<u8>, channel: GmgsiChannel) -> Result<GmgsiGrid, String> {
+    let granule = rustdar_netcdf::Granule::from_vec(bytes)?;
 
     let shape = granule
         .shape("data")?
@@ -64,8 +80,17 @@ pub fn decode(bytes: &[u8], channel: GmgsiChannel) -> Result<GmgsiGrid, String> 
     let lat_axis = axis_from_2d(&granule, "lat", nj, ni, Axis::Row)?;
     let lon_axis = axis_from_2d(&granule, "lon", nj, ni, Axis::Column)?;
 
+    // Read straight into the raster form. A missing point is NaN, which
+    // `render::gridded::color_for` already paints as fully transparent through
+    // its non-finite guard; encoding it as any in-domain number would paint it
+    // as that number.
+    //
+    // `read_unpacked_f32` rather than `read_unpacked` because the `Option`
+    // form of this variable is 240 MB against 60 MB -- see
+    // `rustdar_netcdf::cf::UnpackedF32`. The old path built the 240 MB and then
+    // converted it, so peak was 300 MB for a 60 MB payload.
     let data = granule
-        .read_unpacked("data")?
+        .read_unpacked_f32("data")?
         .ok_or_else(|| "GMGSI granule has no `data` variable".to_string())?;
     if data.values.len() != ni * nj {
         return Err(format!(
@@ -75,14 +100,7 @@ pub fn decode(bytes: &[u8], channel: GmgsiChannel) -> Result<GmgsiGrid, String> 
             data.values.len()
         ));
     }
-    // A missing point becomes NaN, which `render::gridded::color_for` already
-    // paints as fully transparent through its non-finite guard. Encoding it as
-    // any in-domain number would paint it as that number.
-    let values: Vec<f32> = data
-        .values
-        .iter()
-        .map(|v| v.map_or(f32::NAN, |v| v as f32))
-        .collect();
+    let values = data.values;
 
     let bounds = bounds_of(&lat_axis, &lon_axis);
     let valid_time = granule
@@ -118,7 +136,7 @@ enum Axis {
 /// grid does not misplace one point — it misplaces the whole raster along one
 /// dimension, and it does so silently, because every method still answers.
 fn axis_from_2d(
-    granule: &crate::glm::h5::Granule,
+    granule: &rustdar_netcdf::Granule,
     name: &str,
     nj: usize,
     ni: usize,
@@ -132,43 +150,109 @@ fn axis_from_2d(
             "GMGSI `{name}` has shape {shape:?}; expected ({nj}, {ni}) to match `data`"
         ));
     }
+    match axis {
+        Axis::Row => row_axis(granule, name, nj, ni),
+        Axis::Column => column_axis(granule, name, nj, ni),
+    }
+}
+
+/// Rows `[start, start + count)` of a 2-D variable, `ni` wide, row-major.
+fn rows_of(
+    granule: &rustdar_netcdf::Granule,
+    name: &str,
+    start: usize,
+    count: usize,
+    ni: usize,
+) -> Result<Vec<Option<f64>>, String> {
     let var = granule
-        .read_unpacked(name)?
+        .read_unpacked_rows(name, start as u64, count as u64)?
         .ok_or_else(|| format!("GMGSI granule has no `{name}` variable"))?;
-    if var.values.len() != ni * nj {
+    if var.values.len() != count * ni {
         return Err(format!(
-            "GMGSI `{name}` declares {nj} x {ni} but {} values were read",
+            "GMGSI `{name}` rows {start}..{} declare {count} x {ni} but {} values were read",
+            start + count,
             var.values.len()
         ));
     }
-    let at = |j: usize, i: usize| -> Result<f64, String> {
-        var.values[j * ni + i].ok_or_else(|| format!("GMGSI `{name}` is missing at ({j}, {i})"))
-    };
+    Ok(var.values)
+}
 
-    let (len, stride_len) = match axis {
-        Axis::Row => (nj, ni),
-        Axis::Column => (ni, nj),
-    };
-    let mut out = Vec::with_capacity(len);
-    for k in 0..len {
-        out.push(match axis {
-            Axis::Row => at(k, 0)?,
-            Axis::Column => at(0, k)?,
-        });
+fn present(v: Option<f64>, name: &str, j: usize, i: usize) -> Result<f64, String> {
+    v.ok_or_else(|| format!("GMGSI `{name}` is missing at ({j}, {i})"))
+}
+
+fn not_separable(name: &str, k: usize, v: f64, on_axis: f64) -> String {
+    format!(
+        "GMGSI `{name}` is not separable: entry {k} reads {v} off-axis \
+         against {on_axis} on it"
+    )
+}
+
+/// The axis that varies **down** the rows: column 0 of every row.
+///
+/// Every row is needed, so this streams in blocks rather than windowing —
+/// peak residency is [`ROW_BLOCK`] rows instead of the whole variable. The
+/// separability probe runs inside the block that carries its row, which visits
+/// the same `(k, s)` pairs in the same order as a whole-variable walk.
+fn row_axis(
+    granule: &rustdar_netcdf::Granule,
+    name: &str,
+    nj: usize,
+    ni: usize,
+) -> Result<Vec<f64>, String> {
+    let mut out: Vec<f64> = Vec::with_capacity(nj);
+    for start in (0..nj).step_by(ROW_BLOCK) {
+        let count = ROW_BLOCK.min(nj - start);
+        let block = rows_of(granule, name, start, count, ni)?;
+        for r in 0..count {
+            out.push(present(block[r * ni], name, start + r, 0)?);
+        }
+        // Probe the columns of every row in this block that the stride lands
+        // on. `(0..nj).step_by(S)` is exactly `k % S == 0`.
+        for r in 0..count {
+            let k = start + r;
+            if !k.is_multiple_of(SEPARABLE_PROBE_STRIDE) {
+                continue;
+            }
+            for s in (0..ni).step_by(SEPARABLE_PROBE_STRIDE) {
+                let v = present(block[r * ni + s], name, k, s)?;
+                if (v - out[k]).abs() > SEPARABLE_EPS {
+                    return Err(not_separable(name, k, v, out[k]));
+                }
+            }
+        }
     }
-    // Probe the other dimension: every entry must repeat the axis value.
-    for k in (0..len).step_by(SEPARABLE_PROBE_STRIDE) {
-        for s in (0..stride_len).step_by(SEPARABLE_PROBE_STRIDE) {
-            let v = match axis {
-                Axis::Row => at(k, s)?,
-                Axis::Column => at(s, k)?,
-            };
+    Ok(out)
+}
+
+/// The axis that varies **along** the columns: row 0, and nothing else.
+///
+/// This is the case the row window was worth adding for — one row of a
+/// 15,000,000-element variable instead of all of it. Only the probe rows are
+/// read beyond that, and there are `nj / SEPARABLE_PROBE_STRIDE` of them; they
+/// are collected first so the comparison keeps its original column-outer order.
+fn column_axis(
+    granule: &rustdar_netcdf::Granule,
+    name: &str,
+    nj: usize,
+    ni: usize,
+) -> Result<Vec<f64>, String> {
+    let first = rows_of(granule, name, 0, 1, ni)?;
+    let mut out: Vec<f64> = Vec::with_capacity(ni);
+    for (k, v) in first.iter().enumerate() {
+        out.push(present(*v, name, 0, k)?);
+    }
+
+    let probes: Vec<(usize, Vec<Option<f64>>)> = (0..nj)
+        .step_by(SEPARABLE_PROBE_STRIDE)
+        .map(|s| rows_of(granule, name, s, 1, ni).map(|row| (s, row)))
+        .collect::<Result<_, _>>()?;
+
+    for k in (0..ni).step_by(SEPARABLE_PROBE_STRIDE) {
+        for (s, row) in &probes {
+            let v = present(row[k], name, *s, k)?;
             if (v - out[k]).abs() > SEPARABLE_EPS {
-                return Err(format!(
-                    "GMGSI `{name}` is not separable: entry {k} reads {v} off-axis \
-                     against {} on it",
-                    out[k]
-                ));
+                return Err(not_separable(name, k, v, out[k]));
             }
         }
     }

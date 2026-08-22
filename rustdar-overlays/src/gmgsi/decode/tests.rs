@@ -37,7 +37,7 @@ const FILL_ROW: usize = 1000;
 const FILL_COL: usize = 1000;
 
 fn grid() -> GmgsiGrid {
-    decode(GRANULE, GmgsiChannel::LongwaveIr).expect("the committed granule decodes")
+    decode(GRANULE.to_vec(), GmgsiChannel::LongwaveIr).expect("the committed granule decodes")
 }
 
 fn axes(g: &GmgsiGrid) -> (&[f64], &[f64]) {
@@ -490,7 +490,7 @@ fn a_non_separable_granule_is_refused() {
         // Latitude tilts along the row: not separable.
         (lat + 5.0 * i as f32 / nx as f32, -100.0 + 0.1 * i as f32)
     });
-    let err = decode(&bytes, GmgsiChannel::LongwaveIr).expect_err("a tilted grid is refused");
+    let err = decode(bytes, GmgsiChannel::LongwaveIr).expect_err("a tilted grid is refused");
     assert!(err.contains("not separable"), "error was {err:?}");
 }
 
@@ -501,7 +501,7 @@ fn a_separable_synthetic_granule_decodes() {
     let bytes = synthetic_granule(|j, i, ny, _nx| {
         (40.0 - 10.0 * j as f32 / ny as f32, -100.0 + 0.1 * i as f32)
     });
-    let g = decode(&bytes, GmgsiChannel::LongwaveIr).expect("a separable grid decodes");
+    let g = decode(bytes, GmgsiChannel::LongwaveIr).expect("a separable grid decodes");
     assert_eq!((g.grid.nj, g.grid.ni), (SYN_NY, SYN_NX));
 }
 

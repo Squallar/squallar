@@ -140,7 +140,7 @@ pub async fn fetch_latest(
         let bytes = resp.bytes().await.map_err(|e| {
             FetchError::from_transport(&e, format!("GMGSI granule body read failed: {e}"))
         })?;
-        return super::decode::decode(&bytes, channel).map_err(FetchError::transient);
+        return super::decode::decode(bytes.into(), channel).map_err(FetchError::transient);
     }
     Err(last.unwrap_or_else(|| {
         FetchError::transient(format!(

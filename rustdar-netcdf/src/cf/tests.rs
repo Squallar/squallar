@@ -184,7 +184,7 @@ fn float_var_file(values: &[f32], units: Option<&str>) -> Vec<u8> {
 }
 
 fn read_v(bytes: &[u8]) -> UnpackedVar {
-    super::super::h5::Granule::open(bytes)
+    crate::h5::Granule::open(bytes)
         .expect("open")
         .read_unpacked("v")
         .expect("read")
@@ -423,4 +423,249 @@ fn non_finite_unpacked_values_are_missing_not_published() {
         Some("degrees_north"),
     ));
     assert_eq!(raw.values, vec![Some(1.5), None, None, None]);
+}
+
+// ── The two representations of the same values ───────────────────────────
+
+/// How many bytes one element costs, read off a *real* returned value rather
+/// than off a type spelled in the assertion.
+///
+/// The indirection is the point: a revert of [`UnpackedF32::values`] to the
+/// `Option` form has to move this number, so the size floor below cannot pass
+/// vacuously.
+fn element_bytes<T>(_: &[T]) -> usize {
+    std::mem::size_of::<T>()
+}
+
+fn raw_of(bytes: &[u8]) -> RawVar {
+    crate::h5::Granule::open(bytes)
+        .expect("open")
+        .raw_var("v")
+        .expect("read")
+        .expect("variable present")
+}
+
+/// `Option<f64>` is 16 bytes per element, because `f64` has no spare bit
+/// pattern for a discriminant to hide in; `f32` is 4. For a column of a few
+/// hundred records that is nothing. For a raster it is the whole cost.
+///
+/// **Denominator**: one variable of 15,000,000 elements, *values only*. Neither
+/// figure counts the `units` string or the `Vec` header — those are per
+/// variable, not per element, and identical in both forms.
+#[test]
+fn the_raster_form_costs_a_quarter_of_the_option_form() {
+    const N: usize = 15_000_000;
+
+    let raw = raw_of(&short_var_file(&ShortVar {
+        values: &[1, 2, 3],
+        ..Default::default()
+    }));
+    let option_bytes = element_bytes(&unpack(&raw, "v").values);
+    let raster_bytes = element_bytes(&unpack_f32(&raw, "v").values);
+
+    assert_eq!(option_bytes, 16, "Option<f64> is 16 bytes per element");
+    assert_eq!(raster_bytes, 4, "f32 is 4 bytes per element");
+
+    let option_total = option_bytes * N;
+    let raster_total = raster_bytes * N;
+    assert_eq!(option_total, 240_000_000, "the Option form at 15,000,000");
+    assert_eq!(raster_total, 60_000_000, "the raster form at 15,000,000");
+    assert!(
+        raster_total * 4 <= option_total,
+        "the raster form must stay at least 4x cheaper: {raster_total} vs {option_total}"
+    );
+}
+
+/// The cheap form is the same arithmetic, not a second implementation of it.
+///
+/// One `Packing` serves both, and this is what says so from the outside: every
+/// element agrees, missing for missing and value for value, across packed
+/// unsigned shorts, a `_FillValue`, a `valid_range` and plain floats.
+#[test]
+fn the_two_representations_agree_element_for_element() {
+    let cases: Vec<Vec<u8>> = vec![
+        short_var_file(&ShortVar {
+            values: &[-13585, -13546, 11048],
+            unsigned: true,
+            scale: Some(0.00203128),
+            offset: Some(-66.56),
+            ..Default::default()
+        }),
+        short_var_file(&ShortVar {
+            values: &[5, -1, 7],
+            unsigned: true,
+            fill: Some(-1),
+            ..Default::default()
+        }),
+        short_var_file(&ShortVar {
+            values: &[0, -3, 10],
+            unsigned: true,
+            valid_range: Some(vec![0, -6]),
+            ..Default::default()
+        }),
+        float_var_file(&[1.5, -2.25, 0.0], Some("degrees_north")),
+    ];
+
+    for (n, bytes) in cases.iter().enumerate() {
+        let raw = raw_of(bytes);
+        let opt = unpack(&raw, "v");
+        let f32s = unpack_f32(&raw, "v");
+
+        assert_eq!(opt.units, f32s.units, "case {n}: units");
+        assert_eq!(opt.values.len(), f32s.values.len(), "case {n}: length");
+        for (i, (o, f)) in opt.values.iter().zip(f32s.values.iter()).enumerate() {
+            match o {
+                None => assert!(f.is_nan(), "case {n} element {i}: missing must be NaN"),
+                Some(v) => assert_eq!(
+                    *f, *v as f32,
+                    "case {n} element {i}: present values must match"
+                ),
+            }
+        }
+    }
+}
+
+/// `NaN` is an unambiguous "missing" marker in [`UnpackedF32`] only because no
+/// *present* value can be `NaN`.
+///
+/// [`unpack`] already reports a non-finite unpacked value as missing — see
+/// [`non_finite_unpacked_values_are_missing_not_published`] — so the two facts
+/// have to be checked together, on the same inputs, in both representations.
+#[test]
+fn a_non_finite_unpacked_value_is_missing_in_both_representations() {
+    // Arithmetic that overflows: 100 * inf == inf, 0 * inf == NaN.
+    let overflowed = raw_of(&short_var_file(&ShortVar {
+        values: &[100, 0],
+        unsigned: true,
+        scale: Some(f32::INFINITY),
+        ..Default::default()
+    }));
+    assert_eq!(unpack(&overflowed, "v").values, vec![None, None]);
+    assert!(
+        unpack_f32(&overflowed, "v")
+            .values
+            .iter()
+            .all(|v| v.is_nan()),
+        "an overflowed value must be NaN in the raster form, not inf"
+    );
+
+    // `float` storage holding non-finite bytes, with no arithmetic to blame.
+    let stored = raw_of(&float_var_file(
+        &[1.5, f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
+        Some("degrees_north"),
+    ));
+    let values = unpack_f32(&stored, "v").values;
+    assert_eq!(values[0], 1.5, "the one finite value survives");
+    assert!(
+        values[1..].iter().all(|v| v.is_nan()),
+        "stored inf must arrive as NaN, never as inf: {values:?}"
+    );
+}
+
+// ── Row-windowed reads ───────────────────────────────────────────────────
+
+/// Rows and columns of the 2-D fixture below.
+const WIN_ROWS: usize = 6;
+const WIN_COLS: usize = 4;
+
+/// A 2-D `f32` variable whose value encodes its own position: `j * 100 + i`.
+///
+/// Position-encoded so that a window landing on the wrong rows is a wrong
+/// *value*, not merely a wrong length — a length check alone passes for any
+/// window of the right size.
+fn grid_var_file() -> Vec<u8> {
+    let mut values = vec![0f32; WIN_ROWS * WIN_COLS];
+    for j in 0..WIN_ROWS {
+        for i in 0..WIN_COLS {
+            values[j * WIN_COLS + i] = (j * 100 + i) as f32;
+        }
+    }
+    let mut w = hdf5_pure::FileBuilder::new();
+    let b = w.create_dataset("v");
+    b.with_f32_data(&values)
+        .with_shape(&[WIN_ROWS as u64, WIN_COLS as u64]);
+    w.finish().expect("write the 2-D fixture")
+}
+
+/// A window reads its own rows and only its own rows.
+///
+/// This is the whole point of the windowed read: extracting one row of a 2-D
+/// coordinate variable must not cost the entire variable.
+#[test]
+fn a_row_window_reads_only_the_rows_it_names() {
+    let bytes = grid_var_file();
+    let file = crate::h5::Granule::open(&bytes).expect("open");
+
+    let whole = file
+        .read_unpacked("v")
+        .expect("read")
+        .expect("variable present");
+    assert_eq!(whole.values.len(), WIN_ROWS * WIN_COLS);
+
+    // Row 0 alone — what a "constant down each column" axis needs.
+    let first = file
+        .read_unpacked_rows("v", 0, 1)
+        .expect("read")
+        .expect("variable present");
+    assert_eq!(
+        first.values,
+        (0..WIN_COLS).map(|i| Some(i as f64)).collect::<Vec<_>>(),
+        "row 0 must be exactly row 0"
+    );
+
+    // A window in the middle, where an off-by-one would still be the right size.
+    let middle = file
+        .read_unpacked_rows("v", 2, 3)
+        .expect("read")
+        .expect("variable present");
+    let expected: Vec<Option<f64>> = (2..5)
+        .flat_map(|j| (0..WIN_COLS).map(move |i| Some((j * 100 + i) as f64)))
+        .collect();
+    assert_eq!(middle.values, expected, "rows 2..5, in order");
+
+    // And the windowed reads agree with the corresponding slice of the whole.
+    assert_eq!(middle.values, whole.values[2 * WIN_COLS..5 * WIN_COLS]);
+}
+
+/// A window running past the last row yields the rows that exist.
+///
+/// Clamping rather than erroring is `hdf5_pure`'s own behaviour, and the count
+/// check in `raw_var_span` has to mirror it — otherwise a caller streaming
+/// fixed-size windows to the end of a variable gets a spurious "declares N
+/// elements but M were read".
+#[test]
+fn a_row_window_past_the_end_clamps_instead_of_failing() {
+    let bytes = grid_var_file();
+    let file = crate::h5::Granule::open(&bytes).expect("open");
+
+    // Straddling the end: two rows exist of the four asked for.
+    let straddling = file
+        .read_unpacked_rows("v", (WIN_ROWS - 2) as u64, 4)
+        .expect("a straddling window is not an error")
+        .expect("variable present");
+    assert_eq!(straddling.values.len(), 2 * WIN_COLS);
+
+    // Entirely past the end: empty, still not an error.
+    let past = file
+        .read_unpacked_rows("v", WIN_ROWS as u64 + 5, 2)
+        .expect("a window past the end is not an error")
+        .expect("variable present");
+    assert!(past.values.is_empty(), "got {:?}", past.values);
+}
+
+/// The two savings compose: a window, in the cheap representation.
+#[test]
+fn a_row_window_reads_into_the_raster_form_too() {
+    let bytes = grid_var_file();
+    let file = crate::h5::Granule::open(&bytes).expect("open");
+
+    let row = file
+        .read_unpacked_rows_f32("v", 3, 1)
+        .expect("read")
+        .expect("variable present");
+    assert_eq!(
+        row.values,
+        (0..WIN_COLS).map(|i| (300 + i) as f32).collect::<Vec<_>>()
+    );
+    assert_eq!(element_bytes(&row.values), 4);
 }

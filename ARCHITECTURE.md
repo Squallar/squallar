@@ -17,9 +17,9 @@ architecture or features change.
 ## 1. The crate graph
 
 Cargo workspace, `resolver = "2"`, edition 2024, toolchain `stable`
-(`rust-toolchain.toml`; edition 2024 needs 1.85+). Twenty members: sixteen
-first-party `rustdar-*` crates, the `nexrad-level3` decoder, and three vendored
-crates.io crates.
+(`rust-toolchain.toml`; edition 2024 needs 1.85+). Twenty-one members:
+seventeen first-party `rustdar-*` crates, the `nexrad-level3` decoder, and three
+vendored crates.io crates.
 
 Read the graph bottom-up. Nothing in a lower band may depend on a higher one.
 
@@ -32,6 +32,7 @@ Read the graph bottom-up. Nothing in a lower band may depend on a higher one.
 | `rustdar-kv` | Small named blobs across sessions. `KvStore` is `load`, `store`, `store_now` and deliberately nothing more. |
 | `rustdar-nmea-serial` | NMEA parser and serial-port reader behind the `serial` feature (off on wasm and iOS). |
 | `nexrad-level3` | Level III product decoder — WMO headers, zlib/BZ2, radial packets. Byte slices in, model types out; no network, no filesystem. |
+| `rustdar-netcdf` | NetCDF4-over-HDF5 reading and CF-convention unpacking (`_Unsigned`, `_FillValue`, `valid_range`, `scale_factor`, CF time units). Knows the format; knows nothing about satellites or lightning. Two shapes for a decoded variable — `Vec<Option<f64>>` for records, `Vec<f32>`/NaN for rasters — plus row-windowed reads. |
 
 **Band 1 — the substrate.** `rustdar-source` stands on `rustdar-geo` and
 `rustdar-units` and nothing else. It holds contract and vocabulary only: the
@@ -60,7 +61,7 @@ dispatch, app state) above all of them; and the two entry crates on top —
 `rustdar` (desktop/Android/iOS binary and `rustdar_native` lib) and
 `rustdar-web` (browser).
 
-**The direction is enforced, not merely intended.** Nine crates carry a
+**The direction is enforced, not merely intended.** Ten crates carry a
 `tests/charter.rs` that reads `cargo metadata --no-deps --format-version 1` and
 asserts against **declared** dependencies, so no feature selection can mask what
 they see. Each charter has a `the_dependency_ceiling_holds` test with an
@@ -78,6 +79,7 @@ and most add a direction test:
 | `rustdar-kv/tests/charter.rs` | `the_contract_is_three_methods_and_nothing_more` |
 | `rustdar-location/tests/charter.rs` | `the_feature_fences_map_the_arms`, `the_facade_stands_on_the_provider_and_not_the_reverse` |
 | `rustdar-nmea-serial/tests/charter.rs` | ceiling only |
+| `rustdar-netcdf/tests/charter.rs` | `the_crate_is_a_band_zero_leaf`, `the_format_layer_sits_under_the_data_crate` |
 
 **One cycle looks like a cycle and is not.** `rustdar-volumetric` declares a
 normal dependency on `rustdar-gpu`; `rustdar-gpu` declares `rustdar-volumetric`

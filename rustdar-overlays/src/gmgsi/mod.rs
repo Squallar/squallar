@@ -3,7 +3,7 @@
 //! Four channels, blended hourly from every geostationary imager in orbit
 //! (`Meteosat9,Meteosat10,G19,H-9,G18` in the reference granule), onto one
 //! 3000 x 5000 global grid. NetCDF4, i.e. HDF5, read through
-//! [`crate::glm::h5`] and unpacked through [`crate::glm::cf`] — those two
+//! [`rustdar_netcdf::h5`] and unpacked through [`rustdar_netcdf::cf`] — those two
 //! modules are the NetCDF4/CF standard and not GLM's own, and this source is
 //! their second consumer.
 //!
@@ -118,7 +118,7 @@
 //! attributes and one real sample per channel. The file is also written by
 //! `hdf5_pure::FileBuilder` rather than by NOAA's netCDF-4.7.0 writer, so the
 //! netCDF dimension-scale linkage (`DIMENSION_LIST`, `_Netcdf4Coordinates`) is
-//! absent; nothing here reads it, because [`crate::glm::h5`] addresses datasets
+//! absent; nothing here reads it, because [`rustdar_netcdf::h5`] addresses datasets
 //! by name. That the reader handles NOAA's *actual* bytes — chunked, shuffled,
 //! deflate-5 — was verified by hand against all eight granules above and is
 //! **not** re-run by any test in this tree.
