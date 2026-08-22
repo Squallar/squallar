@@ -304,6 +304,7 @@ fn data_sources_has_the_fields_the_worker_was_written_against() {
         "hrrr_bucket",
         "goes_east_bucket",
         "goes_west_bucket",
+        "mrms_bucket",
         "nws_api_base",
         "spc_base",
         "iem_base",
@@ -379,7 +380,7 @@ fn the_worker_deny_list_names_nothing_that_is_not_a_data_origin() {
     // an empty deny list would make the walk vacuous.
     assert_eq!(
         live.len(),
-        10,
+        11,
         "the data-origin enumeration moved: {live:?}"
     );
 

@@ -51,6 +51,7 @@ pub mod known {
     pub const MODEL_DATA: LayerId = LayerId::from_static("ModelData");
     pub const SPC_OUTLOOK: LayerId = LayerId::from_static("SpcOutlook");
     pub const SPC_FIRE_OUTLOOK: LayerId = LayerId::from_static("SpcFireOutlook");
+    pub const MRMS: LayerId = LayerId::from_static("Mrms");
     pub const RADAR: LayerId = LayerId::from_static("Radar");
     pub const SPC_DISCUSSIONS: LayerId = LayerId::from_static("SpcDiscussions");
     pub const NWS_ALERTS: LayerId = LayerId::from_static("NwsAlerts");
@@ -80,9 +81,9 @@ pub mod known {
 /// `SourceHandler::draw_order_weight`, composed by
 /// `rustdar_egui::sources::default_draw_order` and pinned by
 /// `draw_order_weights_encode_the_default_draw_order`. `SpcFireOutlook` draws
-/// third from the bottom (weight 25) and is appended here regardless, because
-/// append-only wins.
-pub const LAYER_ID_LEDGER: [&str; 14] = [
+/// third from the bottom (weight 25) and `Mrms` second (weight 15); both are
+/// appended here regardless, because append-only wins.
+pub const LAYER_ID_LEDGER: [&str; 15] = [
     "ModelData",
     "SpcOutlook",
     "Radar",
@@ -96,6 +97,7 @@ pub const LAYER_ID_LEDGER: [&str; 14] = [
     "UserLocation",
     "ColorScale",
     "SpcFireOutlook",
+    "Mrms",
     // Registered only when `rustdar-overlays/fake-source` is on, listed here
     // unconditionally: the ledger is append-only and names every spelling ever
     // claimed, including ones this build does not register. The `cfg` lives in
@@ -124,6 +126,7 @@ mod tests {
             known::USER_LOCATION,
             known::COLOR_SCALE,
             known::SPC_FIRE_OUTLOOK,
+            known::MRMS,
             known::FAKE_SOURCE,
         ];
         assert_eq!(known_ids.len(), LAYER_ID_LEDGER.len());

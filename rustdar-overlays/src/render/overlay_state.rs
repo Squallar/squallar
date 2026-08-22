@@ -631,10 +631,10 @@ mod retry_ledger_tests {
             );
         }
         assert_eq!(
-            checked, 6,
-            "the six auto-polling handlers that shared the defect must all \
-             still be covered; a new one is not exempt, and a removed one \
-             should be removed from this count deliberately",
+            checked, 7,
+            "the seven auto-polling handlers must all still be covered; a new \
+             one is not exempt, and a removed one should be removed from this \
+             count deliberately",
         );
     }
 
@@ -665,8 +665,8 @@ mod retry_ledger_tests {
             .collect();
         assert_eq!(
             kinds.len(),
-            8,
-            "the eight fetching handlers must all be covered",
+            9,
+            "the nine fetching handlers must all be covered",
         );
 
         for kind in kinds {

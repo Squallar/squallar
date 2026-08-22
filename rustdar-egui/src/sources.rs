@@ -31,13 +31,13 @@ pub fn all() -> Vec<Box<dyn SourceHandler>> {
 /// The `cfg!` term is the fake source, which is registered only under
 /// `rustdar-overlays/fake-source`.
 #[cfg(test)]
-pub(crate) const REGISTERED_LAYER_COUNT: usize = 13 + cfg!(feature = "fake-source") as usize;
+pub(crate) const REGISTERED_LAYER_COUNT: usize = 14 + cfg!(feature = "fake-source") as usize;
 
 /// **How many FIELDS this build registers — the same hand-kept discipline as
 /// [`REGISTERED_LAYER_COUNT`], one level down.**
 ///
-/// Radar's seventeen products plus the model's sixteen parameters, plus the
-/// fake source's one when its feature is on.
+/// Radar's seventeen products plus the model's sixteen parameters and MRMS's
+/// two, plus the fake source's one when its feature is on.
 ///
 /// **Never derive this from `fields()`, `products()` or any registration.**
 /// WO-E9d land 2 made the catalogue's tiles *and* the parity walk's expected
@@ -49,7 +49,8 @@ pub(crate) const REGISTERED_LAYER_COUNT: usize = 13 + cfg!(feature = "fake-sourc
 /// recurs verbatim for fields; this constant is the independent second spelling
 /// that keeps the walk's field floor able to fail.
 #[cfg(test)]
-pub(crate) const REGISTERED_FIELD_COUNT: usize = 17 + 16 + cfg!(feature = "fake-source") as usize;
+pub(crate) const REGISTERED_FIELD_COUNT: usize =
+    17 + 16 + 2 + cfg!(feature = "fake-source") as usize;
 
 /// The default draw order, bottom to top — every registered layer's id sorted
 /// by `SourceHandler::draw_order_weight`.
@@ -123,10 +124,10 @@ mod retry_ledger_tests {
         );
         assert_eq!(
             checked.len(),
-            7,
-            "the app's auto-polling layers are overlays' six plus radar; a new \
-             one is not exempt and a removed one should be removed from this \
-             count deliberately: {checked:?}",
+            8,
+            "the app's auto-polling layers are overlays' seven plus radar; a \
+             new one is not exempt and a removed one should be removed from \
+             this count deliberately: {checked:?}",
         );
     }
 }
@@ -223,15 +224,15 @@ mod controls_parity_tests {
     /// options. A handler whose disabled tree shrank stranded its
     /// sub-options exactly when a user goes looking for why a layer is off
     /// or what it will show once on (the M9.1 user report), so each of the
-    /// thirteen is pinned by name.
+    /// fourteen is pinned by name.
     #[test]
     fn every_handlers_control_tree_is_identical_hidden_and_shown() {
         let mut registry = OverlayRegistry::with_handlers(all());
         let kinds: Vec<LayerId> = registry.handlers().map(|h| h.id()).collect();
         assert_eq!(
             kinds.len(),
-            13 + cfg!(feature = "fake-source") as usize,
-            "the registry carries all thirteen handlers - fourteen with the \
+            14 + cfg!(feature = "fake-source") as usize,
+            "the registry carries all fourteen handlers - fifteen with the \
              fake source registered - and the walk below must cover every one"
         );
         let ctx = PaneRef::bare(0);
@@ -257,8 +258,9 @@ mod state_key_tests {
     /// **literal** list — the self-verifying-inventory discipline: the live
     /// set is checked against it below, so neither side can rot alone.
     #[cfg(not(feature = "fake-source"))]
-    const STATE_KEYS: [&str; 13] = [
+    const STATE_KEYS: [&str; 14] = [
         "ModelData",
+        "Mrms",
         "SpcOutlook",
         "SpcFireOutlook",
         "SpcDiscussions",
@@ -273,12 +275,13 @@ mod state_key_tests {
         "ColorScale",
     ];
 
-    /// The same thirteen plus the fake source's own key. **A second definition
+    /// The same fourteen plus the fake source's own key. **A second definition
     /// rather than a `#[cfg]`'d element**, because `#[cfg]` on an array element
     /// is not stable.
     #[cfg(feature = "fake-source")]
-    const STATE_KEYS: [&str; 14] = [
+    const STATE_KEYS: [&str; 15] = [
         "ModelData",
+        "Mrms",
         "SpcOutlook",
         "SpcFireOutlook",
         "SpcDiscussions",
@@ -296,7 +299,7 @@ mod state_key_tests {
 
     /// **The tripwire on the bytes saved handler state is filed under.**
     #[test]
-    fn handler_state_keys_are_the_thirteen_names_saved_configs_file_state_under() {
+    fn handler_state_keys_are_the_fourteen_names_saved_configs_file_state_under() {
         let handlers = all();
         assert_eq!(
             handlers.len(),
@@ -313,7 +316,7 @@ mod state_key_tests {
         pinned.sort_unstable();
         assert_eq!(
             live, pinned,
-            "the registered ids are no longer exactly the thirteen names saved \
+            "the registered ids are no longer exactly the fourteen names saved \
              configs file handler state under — a rename or a retirement \
              orphans every user's saved state for that layer",
         );
@@ -399,6 +402,7 @@ mod registry_identity_tests {
         #[allow(unused_mut)]
         let mut expected: Vec<&str> = vec![
             "ModelData",
+            "Mrms",
             "SpcOutlook",
             "SpcFireOutlook",
             "Radar",
@@ -422,7 +426,7 @@ mod registry_identity_tests {
         );
     }
 
-    /// **Every layer's time axis, pinned by name over the composed thirteen.**
+    /// **Every layer's time axis, pinned by name over the composed fourteen.**
     ///
     /// Written as the whole map rather than as "the non-Live ones", so a new
     /// layer cannot join without this list saying what it does with the clock,
@@ -430,8 +434,14 @@ mod registry_identity_tests {
     /// lightning are the two `EventLifetime` layers (items with validity
     /// windows); radar and the model are the two `FrameSeries` layers — radar
     /// on the ~5-minute volume cadence and never ahead of the clock, the model
-    /// on hourly runs that are — and the other nine draw the latest thing
-    /// they fetched.
+    /// on hourly runs that are — and the other ten draw the latest thing they
+    /// fetched.
+    ///
+    /// **MRMS is `Live` on purpose**, though it publishes stamped granules
+    /// every two minutes and could be a third `FrameSeries` layer. A third
+    /// changes which layer a pane's clock follows, and
+    /// `radar_takes_the_clock_wherever_it_is_drawn` below says that must be
+    /// ruled on rather than absorbed. It has not been.
     ///
     /// **Radar's row moved deliberately at WO-E7b** (was `Live`), which is
     /// what gives a radar pane a time-primary layer for its clock to walk;
@@ -452,6 +462,7 @@ mod registry_identity_tests {
         #[allow(unused_mut)]
         let mut expected: Vec<(&str, TimeAxis)> = vec![
             ("ModelData", hourly_forecast),
+            ("Mrms", TimeAxis::Live),
             ("SpcOutlook", TimeAxis::Live),
             ("SpcFireOutlook", TimeAxis::Live),
             ("Radar", volume_cadence),
@@ -717,6 +728,11 @@ mod field_registry_tests {
             Some(16),
             "the model group's size moved",
         );
+        assert_eq!(
+            counts.get("MRMS national mosaic").copied(),
+            Some(2),
+            "the MRMS group's size moved",
+        );
         #[cfg(feature = "fake-source")]
         assert_eq!(
             counts.get("Fake").copied(),
@@ -725,7 +741,7 @@ mod field_registry_tests {
         );
         assert_eq!(
             counts.len(),
-            2 + cfg!(feature = "fake-source") as usize,
+            3 + cfg!(feature = "fake-source") as usize,
             "an unexpected group appeared: {counts:?}",
         );
     }

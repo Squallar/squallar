@@ -73,7 +73,7 @@ way — but the recorded evidence no longer reproduces.
 | NEXRAD Level 2 (archive)          | ✅      | US + territories                | open    | ✅ Free — AWS Open Data `unidata-nexrad-level2`                                                                                                           |
 | NEXRAD Level 2 real-time chunks   | ✅      | US + territories                | open    | ✅ Free — AWS Open Data `unidata-nexrad-level2-chunks`; ~55 pieces per volume, each landing seconds after collection                                      |
 | NEXRAD Level 3                    | ✅      | US + territories                | open    | ✅ Free — AWS Open Data `unidata-nexrad-level3` (SRM tilts 1–3 discontinued upstream)                                                                     |
-| MRMS (Multi-Radar/Multi-Sensor)   | ❌      | CONUS, AK, HI, Guam, Caribbean  | open    | ✅ Free — AWS Open Data `noaa-mrms-pds`, `us-east-1`. GRIB2, gzipped. **See the verified detail below.**                                                  |
+| MRMS (Multi-Radar/Multi-Sensor)   | ✅      | CONUS shipped; AK, HI, Guam, Caribbean available | open    | ✅ Free — AWS Open Data `noaa-mrms-pds`, `us-east-1`. GRIB2, gzipped. **See the verified detail below.**                                                  |
 | MRMS via NCEP                     | ❌      | same                            | blocked | ✅ Free — `mrms.ncep.noaa.gov/2D/`. No `ACAO`. The bucket above is the same data and is `open`; prefer it.                                                |
 | NOAA Enterprise Rain Rate (RRQPE) | ❌      | **70°N – 60°S**, all longitudes | open    | ✅ Free — AWS Open Data `noaa-enterprise-rainrate-pds`. Satellite QPE; the precipitation answer outside ground-radar coverage                             |
 | Rain Viewer v2 tiles              | ❌      | varies by provider              | open    | ⚠️ Attribution required — `api.rainviewer.com/public/weather-maps.json`. Free, no key; see the terms below. A self-hosted LibreWXR serves the same shape |
@@ -92,6 +92,29 @@ Read off the bucket on 2026-08-21, not from documentation:
   3500 × 7000 at 0.01°. Simpler than HRRR, which is template 3.30 (Lambert
   conformal) and needed `hrrr::lambert` written by hand.
 - **Data representation template 5.41 — PNG.** Not 5.3, and not JPEG 2000.
+- **Section 6 `bitmap_indicator = 255` — there is no bitmap.** Missing data is
+  in-band, and **the reserved values are per product**, measured over whole
+  granules rather than read from documentation:
+
+  | Product | Reserved | Share of a 24.5 M-point granule |
+  |---|---|---|
+  | `MergedReflectivityQCComposite_00.50` | −999 no coverage, −99 below threshold | 34.0 % and 61.2 % |
+  | `PrecipRate_00.00` | **−3** no coverage; **no −999, no −99 at all** | 34.4 % |
+
+  Taking the composite's set for the rate leaves a third of that mosaic
+  reporting **−3 mm/h** as a measurement. A blanket "negative means missing"
+  rule fixes the rate and breaks the composite, which carries 8 045 genuine
+  returns below 0 dBZ — 347 of them at exactly −3.0. The table lives in
+  `MrmsProduct::missing_codes`; both granules are committed to
+  `rustdar-overlays/testdata/` because a suite built on one of them declared
+  the other correct.
+- **Timestamps are not clock-aligned** — `000039`, `000242`, `000442`, `000641`
+  across one observed hour — so a key is never constructed from a rounded wall
+  clock. Every fetch lists a day prefix.
+- **`CONUS_5KM/` is dead**, stopping ~2021-02-24. It is still in the listing and
+  reads like a cheaper CONUS. It is not.
+- Retained back to **2020-10-14**; a granule is ~1.3 MB gzipped and decodes to
+  **98 MB** of `f32`, which is why the layer's cache is byte-budgeted.
 
 **That last line means MRMS needs no new decoder feature at all.** The `grib`
 pin already enables `png-unpack-with-png-crate`, and `flate2` already handles
@@ -398,7 +421,7 @@ endpoint is trivial.
 | GRIB2 — DRT 5.3 (complex + spatial diff), 5.41 (PNG) | `grib` 0.17.1, `default-features = false`                       |
 | HDF5 / NetCDF4                                       | `hdf5-pure` (`glm::h5`)                                         |
 | GeoJSON / JSON                                       | `serde_json`                                                    |
-| XML (S3 `ListObjectsV2`)                             | `xml` crate (`archive.rs`)                                      |
+| XML (S3 `ListObjectsV2`)                             | `xml` crate (`archive.rs`); `roxmltree` in `glm::fetch`, `mrms::fetch` |
 | XML / RSS (SPC mesoscale discussions)                | `roxmltree`                                                     |
 | CSV (SPC storm reports)                              | hand-parsed, `spc::reports::fetch_csv`                          |
 | zlib / deflate / gzip                                | `flate2`                                                        |
@@ -409,7 +432,7 @@ three of the four biggest new sources need **nothing new at all**:
 
 | Source                      | Decoder needed                                                                               |
 | --------------------------- | -------------------------------------------------------------------------------------------- |
-| MRMS                        | **None.** gzip + GRIB2 DRT 5.41, both already enabled.                                       |
+| ~~MRMS~~ (**shipped**)      | **None**, as predicted. gzip + GRIB2 DRT 5.41, both already enabled.                         |
 | RRQPE                       | **None.** NetCDF4/HDF5 via `hdf5-pure`, plain 0.02° lat/lon grid.                            |
 | GMGSI                       | **None.** NetCDF4/HDF5 via `hdf5-pure`, plain lat/lon grid.                                  |
 | GOES ABI imagery            | Fixed-grid (geostationary perspective) → Mercator reprojection. The reader already exists.   |

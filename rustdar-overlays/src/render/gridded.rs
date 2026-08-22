@@ -15,6 +15,31 @@ use std::sync::LazyLock;
 
 use rustdar_source::product::{FieldId, LegendScale};
 
+/// A whole decoded grid in hand, with **no source's own enum in it**.
+///
+/// [`GriddedInput::Resident`] carries this by `Arc`, so a source that holds its
+/// grid whole and windows at encode — the posture MRMS and HRRR both take —
+/// describes a job for the cost of a refcount. Everything
+/// [`rasterize_gridded`] needs is here and nothing else is: the raster resolves
+/// `field` through [`field_paint`] and refuses what that does not answer, which
+/// is why a second gridded source needs no arm in the rasterizer, the codec or
+/// the wire.
+///
+/// [`GriddedInput::Resident`]: crate::render::rasterize::GriddedInput::Resident
+/// [`rasterize_gridded`]: crate::render::rasterize::rasterize_gridded
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResidentGrid {
+    /// The field being drawn, as its registering source's own `ProductSpec`
+    /// spells it — never a string parsed back from somewhere.
+    pub field: FieldId,
+    /// Points along a parallel, and along a meridian. `values` is row-major in
+    /// these: point `(i, j)` is `values[j * ni + i]`.
+    pub ni: usize,
+    pub nj: usize,
+    pub coords: crate::hrrr::GridCoords,
+    pub values: Vec<f32>,
+}
+
 /// The alpha every gridded overlay paints at. HRRR's eleven ramps all use it,
 /// and a raster drawn under the radar layer wants to be seen through.
 const ALPHA: u8 = 160;
@@ -128,7 +153,39 @@ pub fn paints_over_scale(scale: &LegendScale, value: f32) -> bool {
 }
 
 /// Every gridded field this build can paint, in registration order.
-static PAINTS: LazyLock<Vec<FieldPaint>> = LazyLock::new(register_model_fields);
+///
+/// One `extend` per gridded source. The order is the wire's tie-break for
+/// nothing at all — lookup is by `FieldId` — but it is the order the catalogue
+/// lists groups in.
+static PAINTS: LazyLock<Vec<FieldPaint>> = LazyLock::new(|| {
+    let mut paints = register_model_fields();
+    paints.extend(register_mrms_fields());
+    paints
+});
+
+/// MRMS's products, each through [`FieldPaint::over_scale`].
+///
+/// **This is the case that function was written for**, and the two conditions
+/// it states both hold here where they do not hold for the model's sixteen:
+///
+/// * the scales are stated in the units the grid carries — dBZ and mm/h, with
+///   no `convert_for_display` between the value and the bar (pinned by
+///   `mrms::fields::tests::no_product_converts_for_display`);
+/// * the ramp fades out below its first stop and clamps above its last, which
+///   is exactly [`color_for`]'s posture.
+///
+/// It is also why MRMS does not reach for `rustdar-radar`'s reflectivity
+/// palette: the overlays→radar edge is cut, and `mrms::fields` registers its own
+/// bar rather than crossing it.
+fn register_mrms_fields() -> Vec<FieldPaint> {
+    crate::mrms::MrmsProduct::all()
+        .iter()
+        .map(|&p| {
+            let spec = crate::mrms::fields::spec(p);
+            FieldPaint::over_scale(&spec.id, spec.scale)
+        })
+        .collect()
+}
 
 /// The model's sixteen, each keeping its **own** ramp rather than taking
 /// [`color_for`] over its registered scale.
