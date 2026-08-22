@@ -1269,3 +1269,124 @@ fn two_frame_fetches_share_one_gate_and_the_second_waits_for_the_first() {
         );
     });
 }
+
+// -- The live bucket (network; `#[ignore]`d exactly as `live_mrms` is) -------
+
+/// **The whole frame chain against the real `noaa-gmgsi-pds` bucket**: the
+/// REAL `create_frame_list_task` future run to completion, its listing filed
+/// through `apply_frame_listing`, the newest frame fetched through the REAL
+/// `fetch_frame` GET, staged through `apply_frame`, and a frame-addressed job
+/// described off the staged granule. WB-11 landed with none of this having
+/// touched the network; this is that verification.
+///
+/// `cargo test -p rustdar-overlays --lib -- --ignored --nocapture live_gmgsi`
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test]
+#[ignore = "hits the live noaa-gmgsi-pds S3 bucket"]
+async fn live_gmgsi_frame_chain_lists_fetches_and_stages() {
+    let client = rustdar_source::tls::client(
+        rustdar_source::tls::USER_AGENT,
+        std::time::Duration::from_secs(120),
+    )
+    .build()
+    .expect("a client with a crypto provider installed");
+    let config = FetchConfig {
+        client,
+        zone_cache_dir: None,
+        sources: rustdar_source::origins::DataSources::production(),
+        viewport: None,
+        as_of: chrono::Utc::now().naive_utc(),
+        depicted_span_secs: None,
+    };
+    let mut h = GmgsiHandler::new();
+    h.defaults.enabled = true;
+    let pane = PaneRef::across(&[]);
+    let channel = h.view(&pane).selected_channel;
+
+    // A recent 3-hour window, exactly as `handle_enable_loop` would ask it:
+    // anchored on the wall clock. The newest 1-2 hours may legitimately list
+    // empty (the blend lands ~40 minutes after its hour).
+    let now = chrono::Utc::now().naive_utc();
+    let range = (now - chrono::Duration::hours(3), now);
+
+    let task = h
+        .create_frame_list_task(&config, &pane, range)
+        .expect("the layer builds a listing task");
+    let payload = task.future.await;
+    let result = payload
+        .downcast::<FrameListingResult>()
+        .expect("the frame-list payload");
+    let n = result.listing.frames.len();
+    println!(
+        "live LIST over {}..{}: {n} frames, complete={}, stamps {:?}",
+        range.0,
+        range.1,
+        result.listing.complete,
+        result
+            .listing
+            .frames
+            .iter()
+            .map(|f| f.valid)
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        n >= 2,
+        "a 3-hour window must list at least 2 {} granules even with the \
+         newest 1-2 hours lagging; the live LIST found {n}",
+        channel.display_name(),
+    );
+
+    h.apply_frame_listing(result.listing, result.scope, &pane);
+    let listed = h.list_frames(&config, &pane, range);
+    assert_eq!(
+        listed.frames.len(),
+        n,
+        "the filed listing must read back whole through list_frames",
+    );
+
+    // The newest listed frame, through the real GET and decode.
+    let stamp = *listed.frames.last().expect("n >= 2");
+    let task = h
+        .fetch_frame(&config, &pane, &stamp)
+        .expect("a listed stamp yields a fetch task");
+    let payload = task.future.await;
+    h.apply_frame(stamp, payload, &pane);
+    assert!(
+        h.frames_resident(&pane).contains(&stamp),
+        "the fetched granule for {} did not stage: the live GET or the \
+         netcdf decode failed (see the error log above)",
+        stamp.valid,
+    );
+
+    // A frame-addressed job describes the staged granule at the mosaic's
+    // full shape.
+    let ctx = RasterizeContext {
+        frame: Some(stamp),
+        ..rctx()
+    };
+    let job = h
+        .prepare_job(&ctx, &pane)
+        .expect("a staged frame describes a job");
+    let input = job
+        .downcast_ref::<rasterize::GriddedInput>()
+        .expect("the gridded carry");
+    let rasterize::GriddedInput::Resident(grid) = input else {
+        panic!("GMGSI must describe a Resident carry, not {input:?}");
+    };
+    // 4999, not the 5000 this module's own prose says: the `lon` axis of the
+    // shipped granule is 4999 columns wide (`crate::gmgsi` records the same
+    // figure two paragraphs from the one that rounds it up), and the decoder
+    // reports the shape it read rather than the shape the doc claims.
+    assert_eq!(
+        (grid.ni, grid.nj),
+        (4999, 3000),
+        "the live granule must decode to the full global mosaic",
+    );
+    println!(
+        "live GET + decode OK: {} valid {} described at {}x{}",
+        channel.display_name(),
+        stamp.valid,
+        grid.ni,
+        grid.nj,
+    );
+}

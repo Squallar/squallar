@@ -1462,6 +1462,11 @@ impl App {
         // The layers this drain installed data for, deduplicated: two rounds of
         // the same layer in one pass are one re-ask, not two.
         let mut arrived: Vec<rustdar_source::id::LayerId> = Vec::new();
+        // The loop-frame fetches this drain took delivery of, collected for
+        // the same reason `listed` is: `gui` is bound for the whole drain and
+        // the mark lives on the dispatcher. Cleared below whether or not the
+        // fetch carried a granule — see `clear_loop_frame_fetch`.
+        let mut answered: Vec<(rustdar_source::id::LayerId, chrono::NaiveDateTime)> = Vec::new();
         // Bound once for the whole drain, not per arrival.
         let gui = &mut self.gui;
         while let Ok(event) = self.channels.overlay_fetch_receiver.try_recv() {
@@ -1515,6 +1520,7 @@ impl App {
                     gui.deliver_frame_listing(&id, listing, scope);
                 }
                 SourceEvent::FrameReady { id, stamp, data } => {
+                    answered.push((id.clone(), stamp.valid));
                     // Radar's frames are held by the loop cache this crate
                     // owns, so its bytes are taken below and decoded through
                     // the funnel; every other layer's go to the handler.
@@ -1528,6 +1534,9 @@ impl App {
                     }
                 }
             }
+        }
+        for (id, valid) in answered {
+            self.render.clear_loop_frame_fetch(&id, valid);
         }
         self.loop_listings_arrived.extend(listed);
         for fetch in archives {
