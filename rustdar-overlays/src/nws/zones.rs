@@ -10,6 +10,7 @@ use rustdar_geo::GeoPolygon;
 
 use super::alert::NwsAlert;
 use super::colors::alert_color;
+use super::zone_pack::{self, Kind, ZonePack};
 
 #[cfg(not(target_arch = "wasm32"))]
 const CACHE_TTL_SECS: u64 = 365 * 24 * 3600;
@@ -180,8 +181,10 @@ pub fn distinct_zone_urls(alerts: &[NwsAlert]) -> Vec<String> {
 }
 
 /// Fills in `features` for alerts that carry only `affectedZones`, and reports
-/// what it managed. URLs are deduplicated. Without `cache_dir` this is 1000+
-/// requests on every launch.
+/// what it managed. URLs are deduplicated.
+///
+/// Resolves against the installed zone pack first — see
+/// [`resolve_zone_geometries_from`], which is this without the global.
 ///
 /// An alert whose zones did not resolve keeps its place in the list with an
 /// empty feature vector; no stand-in geometry is ever produced for it.
@@ -189,6 +192,21 @@ pub async fn resolve_zone_geometries(
     client: &reqwest::Client,
     alerts: &mut [NwsAlert],
     cache_dir: Option<&Path>,
+) -> ZoneResolution {
+    // Bound before borrowing: `installed()` hands back an `Arc` that would
+    // otherwise be a temporary dropped at the end of this expression.
+    let pack = zone_pack::installed();
+    resolve_zone_geometries_from(client, alerts, cache_dir, pack.as_deref()).await
+}
+
+/// [`resolve_zone_geometries`] with the pack passed rather than read off the
+/// process-wide slot, so a test states which pack it is resolving against
+/// instead of inheriting whatever another test in the binary installed.
+pub async fn resolve_zone_geometries_from(
+    client: &reqwest::Client,
+    alerts: &mut [NwsAlert],
+    cache_dir: Option<&Path>,
+    pack: Option<&ZonePack>,
 ) -> ZoneResolution {
     let needed_urls = distinct_zone_urls(alerts);
     let mut resolution = ZoneResolution {
@@ -203,13 +221,25 @@ pub async fn resolve_zone_geometries(
 
     let mut zone_cache: HashMap<String, Vec<GeoPolygon>> = HashMap::new();
     let mut urls_to_fetch: Vec<String> = Vec::new();
+    let mut from_pack = 0usize;
+    let mut from_disk = 0usize;
 
     for url in &needed_urls {
+        // The pack before anything else: it is one already-resident file with
+        // no syscall and no request per zone, and it is the only source web has
+        // at all. A miss here is routine — the pack is one published edition
+        // and the alerts feed still names ids that edition retired.
+        if let Some(polys) = pack.and_then(|pack| zone_geometry_from_pack(pack, url)) {
+            from_pack += 1;
+            zone_cache.insert(url.clone(), polys);
+            continue;
+        }
         let cached = match cache_dir {
             Some(dir) => read_cached_zone(dir, url).await,
             None => None,
         };
         if let Some(polys) = cached {
+            from_disk += 1;
             zone_cache.insert(url.clone(), polys);
         } else {
             urls_to_fetch.push(url.clone());
@@ -217,8 +247,7 @@ pub async fn resolve_zone_geometries(
     }
 
     log::info!(
-        "Zone geometries: {} cached, {} to fetch",
-        zone_cache.len(),
+        "Zone geometries: {from_pack} from the pack, {from_disk} cached, {} to fetch",
         urls_to_fetch.len(),
     );
 
@@ -406,6 +435,36 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// `https://api.weather.gov/zones/county/TXC113` → `(County, "TXC113")`, the
+/// pair the pack's index is keyed on.
+///
+/// The same `(kind, id)` pair [`zone_cache_key`] spells as a filename, typed:
+/// `FLC087` alone names four different geometries, and a lookup that dropped
+/// the kind would answer one of them for all four.
+///
+/// `None` if the URL does not end in `<kind>/<id>` with a kind the pack knows,
+/// which leaves that zone on the HTTP path rather than guessing at it.
+fn zone_kind_and_id(url: &str) -> Option<(Kind, &str)> {
+    let trimmed = url.trim_end_matches('/');
+    let mut segments = trimmed.rsplit('/');
+    let id = segments.next().filter(|s| !s.is_empty())?;
+    let kind = Kind::from_url_segment(segments.next()?)?;
+    Some((kind, id))
+}
+
+/// One zone out of the pack, or `None` to carry on to the cache and the
+/// network.
+///
+/// The emptiness filter is not paranoia about the reader: it is the difference
+/// between a zone that resolved and one that resolved to nothing drawable. A
+/// `Some(vec![])` here would be counted as resolved and paint no area, which is
+/// exactly the silent under-draw `ZoneResolution` exists to make visible.
+fn zone_geometry_from_pack(pack: &ZonePack, url: &str) -> Option<Vec<GeoPolygon>> {
+    let (kind, id) = zone_kind_and_id(url)?;
+    pack.get(kind, id)
+        .filter(|polygons| polygons.iter().any(|polygon| !polygon.is_empty()))
+}
+
 /// `https://api.weather.gov/zones/county/TXC113` → `"county_TXC113"`: the kind
 /// must stay in the key, since the same id exists under several zone kinds.
 #[cfg(not(target_arch = "wasm32"))]
@@ -505,12 +564,27 @@ mod tests {
     /// Serve canned responses by path from a loopback socket, forever. An
     /// unrouted path answers 500, so a test states only what it wants to succeed.
     fn serve(routes: HashMap<String, (u16, String)>) -> String {
+        serve_counting(routes).0
+    }
+
+    /// [`serve`], plus the count of requests it has actually been asked for.
+    ///
+    /// The instrument the pack's whole reason for existing is measured on. It
+    /// counts accepted connections, and every response closes, so it is a count
+    /// of requests — including the ones that 500, so a route that is not there
+    /// still registers as having been asked for.
+    fn serve_counting(
+        routes: HashMap<String, (u16, String)>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
         std::thread::spawn(move || {
             use std::io::{Read, Write};
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
+                counter.fetch_add(1, Ordering::Relaxed);
                 let mut scratch = [0u8; 4096];
                 let read = stream.read(&mut scratch).unwrap_or(0);
                 let request = String::from_utf8_lossy(&scratch[..read]);
@@ -528,7 +602,7 @@ mod tests {
                 let _ = stream.flush();
             }
         });
-        format!("http://127.0.0.1:{port}")
+        (format!("http://127.0.0.1:{port}"), requests)
     }
 
     /// `tls::init()` is required even for a cleartext URL: with
@@ -897,5 +971,332 @@ mod tests {
         ));
         assert_eq!(resolution, ZoneResolution::default());
         assert_eq!(resolution.completeness().status_mark(), None);
+    }
+
+    // ── the pack ─────────────────────────────────────────────────────────
+    //
+    // The pack is built here by `zone_pack::write`, the same encoder
+    // `tools/nws-zone-pack` calls, and the geometry it carries is deliberately
+    // nowhere near the geometry the loopback origin serves — so every assertion
+    // below can say *which source answered*, not merely that something did.
+
+    use crate::nws::zone_pack::{self, Coding, Kind, PackedZone, ZonePack};
+
+    /// A square the origin never serves: the origin's zones sit at lon -97..-96
+    /// and these at -100..-99, so one look at a drawn vertex says where it came
+    /// from.
+    fn packed_square(lat: f64) -> Vec<GeoPolygon> {
+        vec![vec![vec![
+            (lat, -100.0),
+            (lat, -99.0),
+            (lat + 1.0, -99.0),
+            (lat + 1.0, -100.0),
+            (lat, -100.0),
+        ]]]
+    }
+
+    fn pack_of(zones: &[(Kind, &str, f64)]) -> ZonePack {
+        let mut entries: Vec<PackedZone> = zones
+            .iter()
+            .map(|&(kind, ugc, lat)| {
+                (
+                    zone_pack::key(kind, ugc).expect("a six-character UGC"),
+                    packed_square(lat),
+                )
+            })
+            .collect();
+        entries.sort_by_key(|(key, _)| *key);
+        ZonePack::open(zone_pack::write(&entries, Coding::Varint, 5, 0.005))
+            .expect("a pack of real squares must open")
+    }
+
+    /// Every drawn vertex, so a test can assert which origin the shape came
+    /// from rather than only that a shape arrived.
+    fn drawn_vertices(alert: &NwsAlert) -> Vec<(f64, f64)> {
+        alert
+            .features
+            .iter()
+            .flat_map(|feature| feature.polygons.iter())
+            .flat_map(|polygon| polygon.iter())
+            .flat_map(|ring| ring.iter().copied())
+            .collect()
+    }
+
+    /// **The point of the whole exercise, measured.** Three zones that are in
+    /// the pack draw without the origin being asked once — and the origin is
+    /// sitting there able to answer, so a resolver that ignored the pack would
+    /// pass every other assertion here and fail only this count.
+    #[test]
+    fn a_zone_in_the_pack_draws_without_one_request() {
+        let (base, requests) = serve_counting(
+            (0..3)
+                .map(|i| {
+                    (
+                        format!("/zones/county/OKC{i:03}"),
+                        (200, zone_body(35.0 + f64::from(i))),
+                    )
+                })
+                .collect(),
+        );
+        let pack = pack_of(&[
+            (Kind::County, "OKC000", 35.0),
+            (Kind::County, "OKC001", 36.0),
+            (Kind::County, "OKC002", 37.0),
+        ]);
+        let mut alerts = vec![zone_alert(
+            "a",
+            (0..3)
+                .map(|i| format!("{base}/zones/county/OKC{i:03}"))
+                .collect(),
+        )];
+
+        let resolution = runtime().block_on(resolve_zone_geometries_from(
+            &loopback_client(),
+            &mut alerts,
+            None,
+            Some(&pack),
+        ));
+
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            0,
+            "the origin was asked for a zone the pack already carries",
+        );
+        assert_eq!(alerts[0].features.len(), 3, "all three must still draw");
+        assert_eq!(
+            (resolution.zones_resolved, resolution.zones_requested),
+            (3, 3)
+        );
+        assert_eq!(resolution.alerts_complete, 1);
+        assert!(resolution.completeness().is_complete());
+
+        let vertices = drawn_vertices(&alerts[0]);
+        assert_eq!(vertices.len(), 15, "three squares of five points");
+        assert!(
+            vertices.iter().all(|&(_, lon)| lon <= -99.0),
+            "the shapes drawn are not the pack's: {vertices:?}",
+        );
+    }
+
+    /// **The other half, and the one that keeps the fallback honest.** 0.70% of
+    /// live ids miss the shipped edition — pure retirement — and every one of
+    /// them must still resolve. A pack that swallowed its misses would turn a
+    /// retired id into an alert that draws nothing.
+    #[test]
+    fn a_zone_absent_from_the_pack_still_resolves_over_http() {
+        let (base, requests) = serve_counting(HashMap::from([
+            ("/zones/county/OKC000".to_string(), (200, zone_body(35.0))),
+            ("/zones/county/OKC001".to_string(), (200, zone_body(36.0))),
+        ]));
+        // Only the first is in the pack; the second is the retired id.
+        let pack = pack_of(&[(Kind::County, "OKC000", 35.0)]);
+        let mut alerts = vec![zone_alert(
+            "a",
+            vec![
+                format!("{base}/zones/county/OKC000"),
+                format!("{base}/zones/county/OKC001"),
+            ],
+        )];
+
+        let resolution = runtime().block_on(resolve_zone_geometries_from(
+            &loopback_client(),
+            &mut alerts,
+            None,
+            Some(&pack),
+        ));
+
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            1,
+            "exactly the one zone the pack does not carry may be fetched",
+        );
+        assert_eq!(alerts[0].features.len(), 2, "both zones must draw");
+        assert_eq!(resolution.alerts_complete, 1);
+        assert_eq!(resolution.alerts_partial, 0);
+        assert!(
+            resolution.completeness().is_complete(),
+            "a fetched tail is not an incomplete round",
+        );
+
+        let vertices = drawn_vertices(&alerts[0]);
+        let from_pack = vertices.iter().filter(|&&(_, lon)| lon <= -99.0).count();
+        let from_origin = vertices.iter().filter(|&&(_, lon)| lon >= -97.0).count();
+        assert_eq!(
+            (from_pack, from_origin),
+            (5, 5),
+            "one square from each source: {vertices:?}",
+        );
+    }
+
+    /// The join is on the **pair**. `FLC087` under `fire` is a different shape
+    /// from `FLC087` under `county`, and a resolver keyed on the bare id would
+    /// answer the county's shape for the fire zone: a real, filled, correctly
+    /// coloured polygon in the wrong place.
+    #[test]
+    fn the_pack_is_joined_on_kind_and_ugc_not_on_the_ugc_alone() {
+        let (base, requests) = serve_counting(HashMap::from([(
+            "/zones/fire/FLC087".to_string(),
+            (200, zone_body(24.0)),
+        )]));
+        let pack = pack_of(&[(Kind::County, "FLC087", 40.0), (Kind::Fire, "FLC087", 25.0)]);
+        let mut alerts = vec![zone_alert("a", vec![format!("{base}/zones/fire/FLC087")])];
+
+        runtime().block_on(resolve_zone_geometries_from(
+            &loopback_client(),
+            &mut alerts,
+            None,
+            Some(&pack),
+        ));
+
+        assert_eq!(requests.load(Ordering::Relaxed), 0, "it is in the pack");
+        let vertices = drawn_vertices(&alerts[0]);
+        assert!(
+            vertices
+                .iter()
+                .all(|&(lat, _)| (25.0..=26.0).contains(&lat)),
+            "the fire zone drew the county zone's shape: {vertices:?}",
+        );
+    }
+
+    /// ...and when only the *other* kind is present, the pack must miss rather
+    /// than answer with the shape it does have.
+    #[test]
+    fn a_ugc_present_under_another_kind_is_a_miss_and_goes_to_the_origin() {
+        let (base, requests) = serve_counting(HashMap::from([(
+            "/zones/fire/FLC087".to_string(),
+            (200, zone_body(24.0)),
+        )]));
+        let pack = pack_of(&[(Kind::County, "FLC087", 40.0)]);
+        let mut alerts = vec![zone_alert("a", vec![format!("{base}/zones/fire/FLC087")])];
+
+        let resolution = runtime().block_on(resolve_zone_geometries_from(
+            &loopback_client(),
+            &mut alerts,
+            None,
+            Some(&pack),
+        ));
+
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            1,
+            "the county shape must not stand in for the fire zone",
+        );
+        assert_eq!(resolution.zones_resolved, 1);
+        let vertices = drawn_vertices(&alerts[0]);
+        assert!(
+            vertices
+                .iter()
+                .all(|&(lat, _)| (24.0..=25.0).contains(&lat)),
+            "the origin's answer is what must be drawn: {vertices:?}",
+        );
+    }
+
+    /// A URL whose kind segment the pack does not know stays on the HTTP path.
+    /// Guessing a kind is how a zone gets the wrong shape.
+    #[test]
+    fn an_unrecognised_zone_kind_is_left_to_the_origin() {
+        assert_eq!(
+            zone_kind_and_id("https://api.weather.gov/zones/county/TXC113"),
+            Some((Kind::County, "TXC113")),
+            "the control: the shape every zone URL has",
+        );
+        assert_eq!(
+            zone_kind_and_id("https://api.weather.gov/zones/county/TXC113/"),
+            Some((Kind::County, "TXC113")),
+            "a trailing slash is not a different zone",
+        );
+        for odd in [
+            "https://api.weather.gov/zones/coastal/TXZ213",
+            "https://api.weather.gov/zones/TXC113",
+            "TXC113",
+            "",
+        ] {
+            assert_eq!(
+                zone_kind_and_id(odd),
+                None,
+                "{odd:?} must be left to the origin, not guessed at",
+            );
+        }
+
+        let (base, requests) = serve_counting(HashMap::from([(
+            "/zones/coastal/TXZ213".to_string(),
+            (200, zone_body(28.0)),
+        )]));
+        let pack = pack_of(&[(Kind::Forecast, "TXZ213", 40.0)]);
+        let mut alerts = vec![zone_alert(
+            "a",
+            vec![format!("{base}/zones/coastal/TXZ213")],
+        )];
+
+        runtime().block_on(resolve_zone_geometries_from(
+            &loopback_client(),
+            &mut alerts,
+            None,
+            Some(&pack),
+        ));
+
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        let vertices = drawn_vertices(&alerts[0]);
+        assert!(
+            vertices
+                .iter()
+                .all(|&(lat, _)| (28.0..=29.0).contains(&lat)),
+            "an unknown kind must not be resolved out of the forecast set: {vertices:?}",
+        );
+    }
+
+    /// The control for every count above: with no pack installed, the same
+    /// round is the fan-out this work exists to remove. Without this, a
+    /// resolver that never issued a request at all would read as a triumph.
+    #[test]
+    fn without_a_pack_the_same_round_is_one_request_per_zone() {
+        let routes: HashMap<String, (u16, String)> = (0..12)
+            .map(|i| {
+                (
+                    format!("/zones/county/OKC{i:03}"),
+                    (200, zone_body(35.0 + f64::from(i))),
+                )
+            })
+            .collect();
+        let (base, requests) = serve_counting(routes);
+        let urls: Vec<String> = (0..12)
+            .map(|i| format!("{base}/zones/county/OKC{i:03}"))
+            .collect();
+
+        let mut alerts = vec![zone_alert("a", urls.clone())];
+        let without = runtime().block_on(resolve_zone_geometries_from(
+            &loopback_client(),
+            &mut alerts,
+            None,
+            None,
+        ));
+        let fanned_out = requests.swap(0, Ordering::Relaxed);
+
+        let pack = pack_of(
+            &(0..12)
+                .map(|i| (Kind::County, format!("OKC{i:03}"), 35.0 + f64::from(i)))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|(kind, ugc, lat)| (*kind, ugc.as_str(), *lat))
+                .collect::<Vec<_>>(),
+        );
+        let mut alerts = vec![zone_alert("a", urls)];
+        let with = runtime().block_on(resolve_zone_geometries_from(
+            &loopback_client(),
+            &mut alerts,
+            None,
+            Some(&pack),
+        ));
+
+        assert_eq!(
+            (fanned_out, requests.load(Ordering::Relaxed)),
+            (12, 0),
+            "twelve zones cost twelve requests without the pack and none with it",
+        );
+        assert_eq!(
+            (without.zones_resolved, with.zones_resolved),
+            (12, 12),
+            "and both rounds resolved the same twelve zones",
+        );
     }
 }
