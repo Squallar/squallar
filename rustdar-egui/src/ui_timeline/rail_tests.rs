@@ -6,8 +6,10 @@
 //! in are the transport's own, read off the real widget at two screen sizes.
 
 use super::{
-    LIVE_SNAP_MAX_FUTURE_SHARE, LIVE_SNAP_PX, NOW_SPLIT, RailRegions, RailSide, slider_travel_px,
+    LIVE_SNAP_MAX_FUTURE_SHARE, LIVE_SNAP_PX, NOW_SPLIT, RailRegions, RailSide, loop_rail_split,
+    slider_travel_px,
 };
+use crate::pane::LoopFrame;
 
 /// The travel a 1400 x 900 screen gives the rail, measured off
 /// `h.timeline().scrubber` (a 488.0 pt rect less 5.40 pt per end). Any window
@@ -317,4 +319,166 @@ fn the_travel_is_the_rect_less_one_handle_inset_per_end() {
         slider_travel_px(rect, egui::style::HandleShape::Circle)
             < slider_travel_px(rect, rectangular),
     );
+}
+
+// -- WI-11b: the loop rail's break ---------------------------------------
+
+/// A fixed instant, so nothing below depends on when it is run.
+fn fixed_now() -> chrono::NaiveDateTime {
+    chrono::DateTime::from_timestamp(1_760_000_000, 0)
+        .expect("a fixed instant")
+        .naive_utc()
+}
+
+/// A loop of `total` frames `step` seconds apart, the `past` oldest of them
+/// at or before `now` - **and the last of those landing exactly on `now`**,
+/// so the tie rule is exercised by construction rather than by a case bolted
+/// on beside it.
+fn straddling_loop(
+    now: chrono::NaiveDateTime,
+    total: usize,
+    past: usize,
+    step: i64,
+) -> Vec<LoopFrame> {
+    (0..total)
+        .map(|i| LoopFrame {
+            timestamp: now + chrono::Duration::seconds((i as i64 - (past as i64 - 1)) * step),
+            image: None,
+            render_in_flight: false,
+            render_failed: false,
+        })
+        .collect()
+}
+
+/// **The loop rail breaks where the frames straddle `now`, and every frame's
+/// handle sits clear of the break.**
+///
+/// The break is not a constant here and must not be: a loop's frames are
+/// evenly spaced whatever their stamps are, so the colour says which frames
+/// are observed and which are forecast, one frame at a time. A pinned
+/// [`NOW_SPLIT`] would call the first six frames of an f00-f48 run history.
+///
+/// The expected position is written from the two straddling frames' own
+/// handle positions - the midpoint of `(past-1)/(total-1)` and
+/// `past/(total-1)` - rather than by re-spelling the closed form the function
+/// under test uses, so the two cannot agree by construction.
+#[test]
+fn the_loop_break_sits_between_the_frames_that_straddle_now() {
+    const TOTAL: usize = 9;
+    const PAST: usize = 5;
+    const STEP: i64 = 300;
+    let now = fixed_now();
+    let frames = straddling_loop(now, TOTAL, PAST, STEP);
+    let spacing = 1.0 / (TOTAL - 1) as f32;
+
+    let last_past = (PAST - 1) as f32 * spacing;
+    let first_future = PAST as f32 * spacing;
+    let expected = 0.5 * (last_past + first_future);
+
+    let split = loop_rail_split(&frames, now).expect("frames straddling now carry a break");
+    assert!(
+        (split - expected).abs() < 1e-5,
+        "the break is at {split:.4} of the travel, which is frame {:.2}; the \
+         frames straddling now are {} at {last_past:.4} and {} at \
+         {first_future:.4}, so it belongs at {expected:.4}. A break pinned at \
+         a fixed fraction sits at NOW_SPLIT = {NOW_SPLIT:.4}, which is frame \
+         {:.2} of {TOTAL}",
+        split / spacing,
+        PAST - 1,
+        PAST,
+        NOW_SPLIT / spacing,
+    );
+
+    // **Why the midpoint and not either frame's own position.** Both the
+    // trailing edge of the last past frame and the leading edge of the first
+    // forecast frame would put one handle exactly on the boundary, and it is
+    // the boundary frame whose side the reader most needs to read off.
+    for (i, frame) in frames.iter().enumerate() {
+        let at = i as f32 * spacing;
+        assert!(
+            (at - split).abs() > 1e-3,
+            "frame {i}'s handle sits on the break at {split:.4}, so its \
+             colour says nothing about which side it is on"
+        );
+        assert_eq!(
+            at < split,
+            frame.timestamp <= now,
+            "frame {i} is at {at:.4} of the travel and stamped {}, which the \
+             break at {split:.4} puts on the wrong side",
+            frame.timestamp,
+        );
+    }
+
+    // **The tie at `now` is history.** Frame PAST-1 is stamped exactly `now`
+    // and lies left of the break; a `<` there would drag the break one whole
+    // frame left.
+    assert_eq!(frames[PAST - 1].timestamp, now);
+    assert!(
+        split > last_past,
+        "the frame stamped exactly now is at {last_past:.4} and the break is \
+         at {split:.4}, so a frame valid at this instant is being called \
+         forecast"
+    );
+
+    // **The break tracks the frames.** One more frame falling behind the wall
+    // clock moves it exactly one frame's width right, and nothing else.
+    let rolled =
+        loop_rail_split(&frames, now + chrono::Duration::seconds(STEP)).expect("still straddling");
+    assert!(
+        (rolled - (split + spacing)).abs() < 1e-5,
+        "the clock passing one more frame moved the break from {split:.4} to \
+         {rolled:.4}; one frame's width is {spacing:.4}"
+    );
+}
+
+/// **The three ends of the range**, each of which the paint has to answer
+/// differently - and the all-history one is the common case, because every
+/// radar loop is it.
+#[test]
+fn a_loop_with_nothing_to_break_has_no_break() {
+    const STEP: i64 = 300;
+    let now = fixed_now();
+
+    assert_eq!(
+        loop_rail_split(&[], now),
+        None,
+        "an empty loop drew a break across frames it does not have"
+    );
+
+    // Every frame at or before now - a radar loop. No break, and so no
+    // two-colour path and no change to the bar at all.
+    for total in [1, 2, 9] {
+        assert_eq!(
+            loop_rail_split(&straddling_loop(now, total, total, STEP), now),
+            None,
+            "a {total}-frame loop with no forecast frame in it drew a break"
+        );
+    }
+
+    // Every frame after now - f00..f48 of a run published ahead of the clock.
+    // The break is the rail's left edge: no past region, and emphatically not
+    // a fixed fraction, which would call most of the run history.
+    for total in [1, 2, 9] {
+        assert_eq!(
+            loop_rail_split(&straddling_loop(now, total, 0, STEP), now),
+            Some(0.0),
+            "a {total}-frame loop with no history in it did not put the break \
+             at the far left"
+        );
+    }
+
+    // And the break is strictly inside the rail whenever both regions have a
+    // frame in them, at every count, so neither end case leaks into the
+    // straddling one.
+    for total in 2..=12 {
+        for past in 1..total {
+            let split = loop_rail_split(&straddling_loop(now, total, past, STEP), now)
+                .expect("a straddling loop has a break");
+            assert!(
+                split > 0.0 && split < 1.0,
+                "{past} of {total} frames in history put the break at \
+                 {split:.4}, which is off the rail"
+            );
+        }
+    }
 }
