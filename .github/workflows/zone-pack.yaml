@@ -1,0 +1,273 @@
+name: Zone Pack
+
+# `rustdar-web/zones.pack` is committed, not built on every deploy: producing it
+# costs ~100 MB of shapefile downloads off weather.gov and a minute of RDP, and
+# it changes three or four times a year. This workflow is what keeps the
+# committed copy honest.
+#
+# Three things it does, and one it deliberately does not:
+#
+#   1. Asks whether the NWS has published a zone edition newer than the six
+#      `DATASETS` pins (`.github/scripts/nws-zone-editions.py`). If so it FAILS,
+#      naming the new edition. It does not open a PR that re-pins anything.
+#   2. Otherwise rebuilds the pack from the pinned editions and commits it if the
+#      bytes moved -- which is the case that matters when the converter itself
+#      changes, or when a PR bumps `DATASETS` by hand.
+#   3. On a schedule, checks both of the above and commits nothing.
+#
+# What it never does is bump `published_records`. Each `DATASETS` row carries the
+# record count weather.gov prints beside the download, and the converter asserts
+# it three independent ways: the `.shx` index length, the `.shp` record loop, and
+# the `.dbf` row count. That is a control on the parser, and its whole value is
+# that the number came from somewhere the parser cannot reach. A job that read
+# the new counts out of the new files and wrote them into the table would leave
+# the assertion comparing the parser against itself -- three ways of agreeing,
+# zero ways of being wrong. So a new edition is a red build and a human edit, on
+# purpose. `nws-zone-editions.py` prints the fix in its failure message.
+#
+# Not driven by Renovate, and not for want of trying: a `customDatasource` needs
+# its versions ordered, and no Renovate versioning scheme orders AWIPS `DDMMMYY`
+# names. `z_16ap26` (16 April 2026) is newer than `z_18mr25` (18 March 2025) and
+# `loose`, `semver` and `regex` all read the leading `18 > 16` and rank them the
+# wrong way round, so the rule would never fire and nothing would say so. The
+# directory index that would have made a listing datasource possible answers
+# HTTP 500 as well. The date arithmetic lives in the script instead, where it can
+# be run. See the script's module docstring for both checks and when they were made.
+
+on:
+  workflow_dispatch:
+  # Monthly. The shapefiles move three or four times a year, so anything faster
+  # is just a scrape of a page that has not changed.
+  schedule:
+    - cron: '23 7 5 * *'
+  # A PR that touches the converter or its pins gets the regenerated pack
+  # committed onto its own branch, so the artifact and the code that produced it
+  # are reviewed together instead of in two PRs a week apart.
+  pull_request:
+    paths:
+      - 'tools/nws-zone-pack/**'
+      - '.github/workflows/zone-pack.yaml'
+      - '.github/scripts/nws-zone-editions.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.ref }}'
+  # Never cancel: a cancelled run can leave the pack half-written on the branch.
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    name: Rebuild the committed zone pack
+    runs-on: ubuntu-24.04
+    permissions:
+      # The commit-back below.
+      contents: write
+      # The summary comment on a PR run.
+      pull-requests: write
+    steps:
+      - name: Generate GitHub App Token
+        # Fork PRs run without secrets, so minting would fail here before
+        # anything was checked. Skip the mint for them; checkout below falls back
+        # to the default GITHUB_TOKEN, and the commit-back step is skipped on
+        # fork PRs anyway. Note this condition reads `github.*` only -- the
+        # `secrets` context is not available in a step-level `if:`.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          client-id: ${{ secrets.AUTO_COMMIT_APP_ID }}
+          private-key: ${{ secrets.AUTO_COMMIT_APP_KEY }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # A skipped mint step yields an empty string, so `||` selects the
+          # default token on fork PRs.
+          token: ${{ steps.app-token.outputs.token || github.token }}
+          # `pull_request` checks out the detached PR merge ref by default, which
+          # is not a branch: a commit made on it goes nowhere. This is the lesson
+          # clippy.yaml learned by skipping the event entirely; here the whole
+          # point is to commit onto the PR's branch, so name the head ref.
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+
+      # Which of the three events may write. A scheduled run is a detector and
+      # nothing else: it runs on the default branch, and a pack that changed
+      # without anybody asking is a thing to look at, not a thing to land.
+      - name: Decide whether this run may commit
+        id: mode
+        # Through `env`, not interpolated into the script: a `${{ }}` carrying a
+        # value from the event payload is expanded before the shell ever sees it.
+        env:
+          EVENT: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "schedule" ]; then
+            echo "commit=false" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT" = "pull_request" ] && [ "$HEAD_REPO" != "$THIS_REPO" ]; then
+            # A fork PR has no push credentials and should not have any.
+            echo "commit=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "commit=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The gate. Fails the run if weather.gov advertises a newer edition than
+      # `DATASETS` pins, and refuses to report "up to date" if its own extraction
+      # matched nothing.
+      - name: Check for a newer published zone edition
+        run: python3 .github/scripts/nws-zone-editions.py --urls "$RUNNER_TEMP/zone-pack-urls.txt"
+
+      # Out of the workspace on purpose: ~100 MB of zips and their unpacked
+      # contents inside the checkout would be swept up by the commit step, which
+      # is why that step also names its `file_pattern` explicitly.
+      - name: Download the six pinned shapefile datasets
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/zoneshp"
+          mkdir -p "$root"
+          while read -r name url; do
+            [ -n "$name" ] || continue
+            # `--fail` is the backstop signal: once the NWS withdraws an edition
+            # the URL 404s, and this stops rather than unpacking an error page.
+            curl -sS --fail --retry 3 --retry-delay 5 -o "$root/$name.zip" "$url" </dev/null
+            # The zips carry `<name>.shp` and friends at the top level; the
+            # converter wants `<root>/<name>/<name>.shp`.
+            unzip -q -o -d "$root/$name" "$root/$name.zip"
+            test -f "$root/$name/$name.shp" || { echo "::error::$name.zip did not contain $name.shp"; exit 1; }
+            rm -f "$root/$name.zip"
+          done < "$RUNNER_TEMP/zone-pack-urls.txt"
+          du -sh "$root"
+
+      - name: Install Rust
+        run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: zone-pack
+          # The converter is its own workspace (see its Cargo.toml) and is not a
+          # member of the root one, so it needs naming here or nothing about it
+          # is cached. It has no committed Cargo.lock, so no `--locked` below.
+          workspaces: 'tools/nws-zone-pack'
+      - name: Build the converter
+        run: cargo build --release --manifest-path tools/nws-zone-pack/Cargo.toml
+
+      - name: Regenerate the pack
+        id: regen
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/zone-pack.log"
+          if ! tools/nws-zone-pack/target/release/nws-zone-pack \
+                "$RUNNER_TEMP/zoneshp" "$RUNNER_TEMP/zones.pack" 2>&1 | tee "$log"; then
+            if grep -q 'weather.gov publishes' "$log"; then
+              echo "::error::A dataset's record count no longer matches its \`published_records\` pin."
+              echo "::error::That pin is the count weather.gov prints beside the download, and it is"
+              echo "::error::deliberately NOT automated: it is asserted against the .shx index, the"
+              echo "::error::.shp record loop and the .dbf row count, and its value is that it came"
+              echo "::error::from outside the parser. A bot that copied the new number out of the new"
+              echo "::error::file would leave three checks agreeing with each other and nothing"
+              echo "::error::checking the parse."
+              echo "::error::"
+              echo "::error::Fix by hand in tools/nws-zone-pack/src/main.rs, reading the counts off"
+              echo "::error::the product page for each dataset, then re-run this workflow."
+            fi
+            exit 1
+          fi
+          if cmp -s "$RUNNER_TEMP/zones.pack" rustdar-web/zones.pack; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "ok: the regenerated pack is byte-identical to the committed one"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            cp "$RUNNER_TEMP/zones.pack" rustdar-web/zones.pack
+          fi
+          {
+            echo "sha256=$(sha256sum rustdar-web/zones.pack | cut -d' ' -f1)"
+            echo "bytes=$(stat -c%s rustdar-web/zones.pack)"
+          } >> "$GITHUB_OUTPUT"
+
+      # The converter's own tables -- fidelity ladder, size ladder, anomalies --
+      # are the provenance for whatever this run produced. Kept whether or not
+      # anything changed, so a "no change" run is still evidenced.
+      - name: Upload the converter's run log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zone-pack-log
+          path: ${{ runner.temp }}/zone-pack.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Summarise
+        if: always()
+        env:
+          CHANGED: ${{ steps.regen.outputs.changed }}
+          SHA256: ${{ steps.regen.outputs.sha256 }}
+          BYTES: ${{ steps.regen.outputs.bytes }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### zones.pack"
+            echo
+            echo "- changed: \`${CHANGED:-(the run did not get that far)}\`"
+            echo "- sha256: \`${SHA256:-}\`"
+            echo "- bytes: \`${BYTES:-}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # A scheduled run must not commit, so a pack that moved on its own is
+      # reported rather than landed. Nothing about the six pinned editions
+      # changed, so this means the converter or one of its path dependencies
+      # produces different bytes than the committed artifact was built from.
+      - name: A scheduled run found the pack out of date
+        if: steps.mode.outputs.commit != 'true' && steps.regen.outputs.changed == 'true'
+        env:
+          SHA256: ${{ steps.regen.outputs.sha256 }}
+        run: |
+          echo "::error::The pack rebuilt from the same six pinned editions does not match"
+          echo "::error::rustdar-web/zones.pack (new sha256 $SHA256)."
+          echo "::error::Nothing upstream moved, so the converter or one of its path"
+          echo "::error::dependencies did. Run this workflow manually to land the new bytes."
+          exit 1
+
+      - name: Commit the refreshed pack
+        if: steps.mode.outputs.commit == 'true' && steps.regen.outputs.changed == 'true'
+        uses: stefanzweifel/git-auto-commit-action@4a55954c782fc1ea30b9056cd3e7a2b40ca8887d # v7.2.0
+        with:
+          # Named, not the default `.`: the run leaves nothing else behind in the
+          # checkout today, and this makes sure that stays true if it ever does.
+          file_pattern: rustdar-web/zones.pack
+          commit_message: 'chore(overlays): refresh the committed NWS zone pack'
+          # The identity `.github/renovate.json` lists under `gitIgnoredAuthors`,
+          # so a commit pushed onto a Renovate branch does not make Renovate treat
+          # the branch as human-edited and stop maintaining it.
+          commit_user_name: usa-reddragon-auto-commit[bot]
+          commit_user_email: 234130638+github-actions[bot]@users.noreply.github.com
+          commit_author: "usa-reddragon-auto-commit[bot] <234130638+github-actions[bot]@users.noreply.github.com>"
+
+      # Says on the PR what landed on it, because the commit itself is a 3.9 MB
+      # binary whose diff shows nothing at all.
+      - name: Comment on the PR
+        if: github.event_name == 'pull_request' && steps.mode.outputs.commit == 'true' && steps.regen.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA256: ${{ steps.regen.outputs.sha256 }}
+          BYTES: ${{ steps.regen.outputs.bytes }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Rebuilt \`rustdar-web/zones.pack\` from the six editions this branch pins."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| sha256 | \`$SHA256\` |"
+            echo "| bytes | \`$BYTES\` |"
+            echo
+            echo "<details><summary>converter output</summary>"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/zone-pack.log"
+            echo '```'
+            echo
+            echo "</details>"
+          } > "$RUNNER_TEMP/comment.md"
+          gh pr comment "$PR" --body-file "$RUNNER_TEMP/comment.md"
