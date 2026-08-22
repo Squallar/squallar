@@ -26,7 +26,43 @@ pub const DESKTOP_RASTER_SIDE_CEILING: usize = 8192;
 
 pub const MOBILE_RASTER_SIDE_CEILING: usize = MOBILE_LONG_RANGE_IMAGE_SIZE;
 
+/// What a browser gets before its adapter has answered: the WebGL2 2D
+/// guarantee, which is also the side this build already draws.
 pub const WASM_RASTER_SIDE_CEILING: usize = WASM_LONG_RANGE_IMAGE_SIZE;
+
+/// **What a browser on a real driver earns**, once its adapter has reported
+/// desktop-class ceilings — [`crate::budget::Promotion::Ceiling`].
+///
+/// Measured 2026-08-22 by `.github/browser-rig/run_gpu_arm.sh --also-software`,
+/// one invocation, one build, four legs, each naming its adapter:
+///
+/// | browser | adapter | `MAX_TEXTURE_SIZE` | `MAX_3D_TEXTURE_SIZE` |
+/// |---|---|---:|---:|
+/// | Firefox 153 | llvmpipe (Mesa), Xvfb | 16384 | **2048** |
+/// | Firefox 153 | NVIDIA GeForce GTX 980, or similar | 32768 | **16384** |
+/// | Chromium 151 | SwiftShader via ANGLE | 8192 | **2048** |
+/// | Chromium 151 | RTX 3090 via ANGLE | 32768 | **16384** |
+///
+/// **The 3D cap is what separates them, not the 2D one.** llvmpipe reports
+/// 16384 in 2D — it clears `DESKTOP_CLASS_REPORT`'s 2D bar outright — and is
+/// held at the floor only because both software rasterisers, two different
+/// implementations, agree on 2048 in 3D. Agreement across two rasterisers is
+/// what reads as a platform limit rather than an artifact, and it is why
+/// `DeviceProfile::reported_promotion` conjoins the two axes.
+///
+/// The rung is the **mobile** tier's ceiling and not the desktop tier's, on
+/// the same argument the grid-cell promotion is made on: the worst a misread
+/// can do is hand a handheld browser a budget handheld hardware already runs.
+/// The desktop tier's 8192 is not offered — the only figure priced for that
+/// step is native and multi-threaded (see [`DESKTOP_RASTER_SIDE_CEILING`]),
+/// and the web build rasterises on one thread.
+///
+/// **This is a ceiling, not a size.** `rustdar_radar::types::raster_side_px`
+/// returns `IMAGE_SIZE.min(ceiling)` for every sweep reaching
+/// [`rustdar_radar::types::BASE_EXTENT_KM`] or less, so an ordinary tilt draws
+/// 2048 here exactly as it did before. Only a sweep past 230 km whose own
+/// gates carry the detail reaches past it.
+pub const WASM_RASTER_SIDE_CEILING_PROMOTED: usize = MOBILE_RASTER_SIDE_CEILING;
 
 /// Bytes one raster of `side` costs on the host: its RGBA and its `f32` value
 /// grid, four bytes each per pixel.
@@ -56,7 +92,13 @@ pub fn raster_side_from_rgba_len(rgba_len: usize) -> Option<usize> {
     }
     let pixels = rgba_len / 4;
     let side = pixels.isqrt();
-    let ceiling = crate::budget::BudgetLimits::for_target().raster_side_ceiling_px;
+    // The bracket's **ceiling**, not the rung this build resolved: a promoted
+    // browser really does produce rasters at the top of the bracket, and
+    // reading the floor here would refuse to convert every one of them —
+    // silently, since the caller only sees `None`.
+    let ceiling = crate::budget::BudgetLimits::for_target()
+        .raster_side_ceiling_px
+        .ceiling;
     (side * side == pixels && side >= LOOP_IMAGE_SIZE && side <= ceiling).then_some(side)
 }
 
@@ -391,6 +433,10 @@ const _: () = const {
     assert!(WASM_RASTER_SIDE_CEILING >= WASM_LONG_RANGE_IMAGE_SIZE);
     assert!(MOBILE_RASTER_SIDE_CEILING >= MOBILE_LONG_RANGE_IMAGE_SIZE);
     assert!(DESKTOP_RASTER_SIDE_CEILING >= DESKTOP_LONG_RANGE_IMAGE_SIZE);
+    // A promoted rung below the rung it promotes from is a bracket the
+    // resolver would silently hold at the floor, so the promotion would read
+    // as present and resolve as absent.
+    assert!(WASM_RASTER_SIDE_CEILING_PROMOTED >= WASM_RASTER_SIDE_CEILING);
     // A ceiling over the largest texture the class can hold is every render
     // failing to upload.
     assert!(LONG_RANGE_IMAGE_SIZE >= rustdar_radar::types::IMAGE_SIZE);

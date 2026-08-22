@@ -741,10 +741,12 @@ impl App {
     /// Build the volume pipelines on the device that has just appeared and hand the `Gui`
     /// something that can draw a 3D pane.
     fn update_device_profile(&mut self, class: rustdar_device_profile::quality::DeviceClass) {
-        let Some(state) = self.state.as_ref() else {
+        // Scoped, and deliberately: the adapter's report is read out here and
+        // the borrow released, so the re-derived raster ceiling below can be
+        // written back into the same `AppState`.
+        let Some(limits) = self.state.as_ref().map(|state| state.device.limits()) else {
             return;
         };
-        let limits = state.device.limits();
         self.device_profile.class = class;
         self.device_profile.adapter = rustdar_device_profile::budget::AdapterCeilings {
             max_texture_dimension_2d: limits.max_texture_dimension_2d,
@@ -764,6 +766,30 @@ impl App {
             );
         }
         self.budgets = resolved;
+
+        // **The raster ceiling is re-derived here, not only in `AppState::new`.**
+        // `AppState` computed it from the budgets this build resolved before it
+        // had met an adapter — `Promotion::Floor` on every target, because
+        // `DeviceProfile::for_target` carries the WebGL2 guarantee. The adapter
+        // has now answered, and on a browser that is the only thing that ever
+        // separates a workstation GPU from a blocklisted driver. Without this
+        // the web bracket's promotion would resolve correctly and reach
+        // nothing: the dispatcher would keep offering the floor for the whole
+        // life of the process.
+        let reported = limits.max_texture_dimension_2d;
+        let promoted_side = resolved.raster_side_for_adapter(reported);
+        if let Some(state) = self.state.as_mut()
+            && state.raster_side_ceiling_px != promoted_side
+        {
+            log::info!(
+                "plan views may now reach {promoted_side} px, up from {}: a {class:?} adapter \
+                 reporting {reported} px 2D textures resolved to {:?}",
+                state.raster_side_ceiling_px,
+                resolved.promotion,
+            );
+            state.raster_side_ceiling_px = promoted_side;
+            self.render.set_raster_side_ceiling_px(promoted_side);
+        }
     }
 
     fn install_volume_bridge(&mut self) {
