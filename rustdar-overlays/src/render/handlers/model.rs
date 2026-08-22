@@ -3141,6 +3141,7 @@ mod tests {
             sources: rustdar_source::origins::DataSources::default(),
             viewport: None,
             as_of: chrono::Utc::now().naive_utc(),
+            depicted_span_secs: None,
         }
     }
 

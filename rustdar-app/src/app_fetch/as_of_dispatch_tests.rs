@@ -165,6 +165,91 @@ fn a_live_panes_fetch_keeps_the_wall_clock_for_every_layer() {
     }
 }
 
+/// **The span half, under the same two predicates as the instant half.**
+///
+/// A pane on `AsOf` — parked or *playing a loop* — hands `as_of` one sampled
+/// instant of a clock that sweeps the whole timeline span between polls. The
+/// span is what lets an `EventLifetime` source retain the window the pane can
+/// depict rather than the sample: GLM anchored on the sample alone lit a
+/// two-hour loop on one frame.
+///
+/// **Floor — `span_for_every_layer`: drop the `EventLifetime` test from
+/// `depicted_span_for_layer`.** Every non-event layer then reads `Some(7200)`
+/// where it must read `None`, and the count assertion is what refuses a
+/// `depicted_span_for_layer` that answers the span unconditionally.
+#[test]
+fn a_pane_on_a_loops_clock_hands_its_span_to_the_as_of_dependent_layers_only() {
+    let mut gui = Gui::new();
+    let span_secs = 7200;
+    {
+        let pane = gui.pane_mut(0).expect("pane 0");
+        pane.time.span_secs = span_secs;
+        // What a playing loop writes every tick: the frame it landed on.
+        pane.set_time_mode(TimeMode::AsOf(ts(10)));
+    }
+    let clock = ts(30);
+
+    let layers = declared(&gui);
+    let event_count = layers
+        .iter()
+        .filter(|(_, axis)| matches!(axis, TimeAxis::EventLifetime))
+        .count();
+    assert!(
+        event_count >= 2 && event_count < layers.len(),
+        "non-triviality floor: both sides of the distinction must be \
+         occupied, or \"only\" is not a claim. {event_count} of {} declare \
+         EventLifetime",
+        layers.len(),
+    );
+
+    let mut spanned = 0;
+    for (id, axis) in &layers {
+        let want = if matches!(axis, TimeAxis::EventLifetime) {
+            Some(span_secs)
+        } else {
+            None
+        };
+        let config = fetch_config_for_layer(&gui, 0, id, base_config(clock));
+        assert_eq!(
+            config.depicted_span_secs,
+            want,
+            "{} declares {axis:?}: its poll must carry {want:?}",
+            id.as_str(),
+        );
+        if config.depicted_span_secs.is_some() {
+            spanned += 1;
+        }
+    }
+    assert_eq!(
+        spanned, event_count,
+        "exactly the as-of-dependent layers may widen their poll",
+    );
+}
+
+/// The parity clause for the span, and the reason "always widen" cannot pass:
+/// a live pane's poll carries no span at all, so every quantity inside
+/// `fetch_glm_flashes` is byte-for-byte what it was.
+#[test]
+fn a_live_panes_fetch_carries_no_span_for_any_layer() {
+    let mut gui = Gui::new();
+    gui.pane_mut(0).expect("pane 0").time.span_secs = 7200;
+    gui.pane_mut(0)
+        .expect("pane 0")
+        .set_time_mode(TimeMode::Live);
+    let clock = ts(30);
+
+    let layers = declared(&gui);
+    assert_eq!(layers.len(), 15, "the walk below must cover every layer");
+    for (id, _) in &layers {
+        assert_eq!(
+            fetch_config_for_layer(&gui, 0, id, base_config(clock)).depicted_span_secs,
+            None,
+            "{} would widen a live pane's poll",
+            id.as_str(),
+        );
+    }
+}
+
 fn base_config(
     clock: chrono::NaiveDateTime,
 ) -> rustdar_overlays::render::overlay_state::FetchConfig {
@@ -177,5 +262,6 @@ fn base_config(
         sources: rustdar_radar::sources::DataSources::production(),
         viewport: None,
         as_of: clock,
+        depicted_span_secs: None,
     }
 }

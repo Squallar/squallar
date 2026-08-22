@@ -662,6 +662,7 @@ fn fetch_config() -> FetchConfig {
         sources: rustdar_source::origins::DataSources::default(),
         viewport: None,
         as_of: chrono::Utc::now().naive_utc(),
+        depicted_span_secs: None,
     }
 }
 
@@ -1071,6 +1072,7 @@ fn two_frame_fetches_share_one_gate_and_the_second_waits_for_the_first() {
         },
         viewport: None,
         as_of: chrono::Utc::now().naive_utc(),
+        depicted_span_secs: None,
     };
     let pane = PaneRef::across(&[]);
     let mut a = h
