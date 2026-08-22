@@ -346,7 +346,7 @@ fn a_level3_loops_batch_settles_on_its_pairings_not_on_volumes() {
              would then be switched off with everything it needs in hand",
     );
     assert!(
-        !settle_loop_phase(&mgr, 0, &mut ls, test_loop_allocation().plan_view_frames),
+        !settle_radar_loop_phase(&mgr, 0, &mut ls, test_loop_allocation().plan_view_frames),
         "so the loop must be left in Rendering, waiting on its renders",
     );
     assert_eq!(ls.phase, LoopPhase::Rendering);
@@ -369,7 +369,7 @@ fn a_level3_loops_batch_settles_on_its_pairings_not_on_volumes() {
         &ls,
         test_loop_allocation().plan_view_frames
     ));
-    assert!(!settle_loop_phase(
+    assert!(!settle_radar_loop_phase(
         &mgr,
         0,
         &mut ls,
@@ -385,7 +385,7 @@ fn a_pairing_in_flight_keeps_the_loop_from_being_abandoned() {
     let mut mgr = LoopDownloadManager::new();
     mgr.mark_l3_in_flight(SITE, codes(L3)[0], ts(0));
 
-    assert!(!settle_loop_phase(
+    assert!(!settle_radar_loop_phase(
         &mgr,
         0,
         &mut ls,
@@ -397,7 +397,7 @@ fn a_pairing_in_flight_keeps_the_loop_from_being_abandoned() {
     mgr.set_plan(0, plan(3));
     mgr.plan_downloads_for(0, L3);
     assert!(!mgr.is_pane_done(0), "pairings are still owed");
-    assert!(!settle_loop_phase(
+    assert!(!settle_radar_loop_phase(
         &mgr,
         0,
         &mut ls,
@@ -418,7 +418,7 @@ fn a_level3_loop_that_is_all_gaps_is_switched_off() {
     }
 
     assert!(
-        settle_loop_phase(&mgr, 0, &mut ls, test_loop_allocation().plan_view_frames),
+        settle_radar_loop_phase(&mgr, 0, &mut ls, test_loop_allocation().plan_view_frames),
         "the caller has to release this pane's loop state",
     );
     assert!(!ls.is_active());

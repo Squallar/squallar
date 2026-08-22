@@ -2105,8 +2105,43 @@ impl super::App {
         let mut abandoned = Vec::new();
         let loop_mgr = &self.loop_mgr;
         for (pidx, p) in self.gui.panes_mut().iter_mut().enumerate() {
-            let budget = loop_render_budget(allocation, p.loop_state(), &budgets);
-            if settle_loop_phase(loop_mgr, pidx, p.loop_state_mut(), budget) {
+            let mut released = false;
+            // Asked of every layer that is animating, not of the radar slot by
+            // name (WI-2) — pinned by
+            // `the_readiness_walk_settles_every_animating_layer_not_only_radar`.
+            for slot in p.animating_layers_mut() {
+                let budget = loop_render_budget(allocation, &slot.time, &budgets);
+                let settled = if slot.id == rustdar_source::id::known::RADAR {
+                    // Radar answers both questions out of its own bookkeeping.
+                    settle_radar_loop_phase(loop_mgr, pidx, &mut slot.time, budget)
+                } else {
+                    // Every other layer, until it brings its own residency
+                    // oracle (WI-5 supplies the frames, WI-7 judges them):
+                    //
+                    // *settled* is the generic reading of the render set — a
+                    // frame counts once it has an image or has stopped being
+                    // rendered. That is `render_set_settled`'s own contract
+                    // with a `scan_available` that admits it knows of no
+                    // further data.
+                    //
+                    // *still arriving* is `true`, and deliberately not
+                    // `false`. It is the only thing standing between a loop
+                    // with nothing yet to show and `*ls = new()`, so a layer
+                    // that cannot answer must not be read as "nothing more is
+                    // coming" — that reading is what destroyed a loading model
+                    // timeline before this item.
+                    settle_loop_phase(
+                        pidx,
+                        &mut slot.time,
+                        |ls| ls.render_set_settled(budget, |_| false),
+                        |_| true,
+                    )
+                };
+                if settled {
+                    released = true;
+                }
+            }
+            if released {
                 abandoned.push(pidx);
             }
         }
@@ -3039,34 +3074,94 @@ pub(super) fn median_step_secs(times: &[chrono::NaiveDateTime]) -> Option<u32> {
 
 /// Move a loop that is still `Rendering` on to whatever its frames have settled
 /// into, returning `true` if the loop was switched off.
+///
+/// **Layer-agnostic (WI-2).** Both questions this asks about a loop's *data*
+/// are the owning layer's to answer, so both arrive as closures and nothing in
+/// this body names radar:
+///
+/// - `batch_settled` — has every frame this loop intends to render reached a
+///   verdict, and has the layer finished dispatching for this pane? Radar
+///   answers it from its `LoopDownloadManager`; see [`radar_batch_settled`].
+/// - `still_arriving` — is any frame's data on its way? This is the gate that
+///   stands between a loop with nothing to show and its own destruction.
+///
+/// The second one is why this could not be retargeted by moving the accessors
+/// alone. It used to read a NEXRAD site straight out of `ls.anchor`, and
+/// `radar_layer::site` answers `""` — not a panic — for a timeline with no
+/// radar geometry. Nothing is ever in flight for `""`, so a non-radar loop
+/// whose frames were still loading fell through to the `*ls = new()` below and
+/// had its timeline wiped while its data was in the air. Pinned by
+/// `a_model_loop_whose_frames_are_still_arriving_is_not_destroyed`.
 fn settle_loop_phase(
-    loop_mgr: &rustdar_radar::loop_downloads::LoopDownloadManager,
     pane_idx: usize,
     ls: &mut rustdar_egui::pane::LayerTimeState,
-    budget: usize,
+    batch_settled: impl Fn(&rustdar_egui::pane::LayerTimeState) -> bool,
+    still_arriving: impl Fn(&rustdar_egui::pane::LayerTimeState) -> bool,
 ) -> bool {
     if !ls.is_active() || ls.is_render_ready() || ls.frames.is_empty() {
         return false;
     }
-    // `is_pane_done` means "dispatched", not "arrived" — see below.
-    if !loop_batch_settled(loop_mgr, ls, budget) || !loop_mgr.is_pane_done(pane_idx) {
+    if !batch_settled(ls) {
         return false;
     }
     if ls.frames.iter().any(|f| f.image.is_some()) {
         ls.phase = rustdar_egui::pane::LoopPhase::Ready;
         return false;
     }
-    if let Some(product) = loop_product(ls)
-        && ls
-            .frames
-            .iter()
-            .any(|f| loop_mgr.frame_data_in_flight(radar_layer::site(ls), product, &f.timestamp))
-    {
+    if still_arriving(ls) {
         return false;
     }
     log::warn!("Loop: no frame on pane {pane_idx} could be rendered; leaving loop mode");
     *ls = rustdar_egui::pane::LayerTimeState::new();
     true
+}
+
+/// Radar's answer to [`settle_loop_phase`]'s `batch_settled`: every frame it
+/// means to render has a verdict **and** its downloads have all been
+/// dispatched. `is_pane_done` means "dispatched", not "arrived" — the arrival
+/// question is [`radar_still_arriving`].
+fn radar_batch_settled(
+    loop_mgr: &rustdar_radar::loop_downloads::LoopDownloadManager,
+    pane_idx: usize,
+    ls: &rustdar_egui::pane::LayerTimeState,
+    budget: usize,
+) -> bool {
+    loop_batch_settled(loop_mgr, ls, budget) && loop_mgr.is_pane_done(pane_idx)
+}
+
+/// Radar's answer to [`settle_loop_phase`]'s `still_arriving`: whether any
+/// frame of `ls` is waiting on a volume or a Level III pairing that is already
+/// on the wire. This is the one call that reads `ls`'s NEXRAD site, and it is
+/// reached only from the radar arm.
+fn radar_still_arriving(
+    loop_mgr: &rustdar_radar::loop_downloads::LoopDownloadManager,
+    ls: &rustdar_egui::pane::LayerTimeState,
+) -> bool {
+    let Some(product) = loop_product(ls) else {
+        return false;
+    };
+    ls.frames
+        .iter()
+        .any(|f| loop_mgr.frame_data_in_flight(radar_layer::site(ls), product, &f.timestamp))
+}
+
+/// **The radar arm of the readiness walk**, and the whole of it: this is what
+/// `update_loop_readiness` calls for a radar slot, so the suites that call it
+/// exercise production's own pair of closures rather than a second pair
+/// written to agree with them. Two spellings of this wiring would be free to
+/// drift, and the tests would keep passing while they did.
+fn settle_radar_loop_phase(
+    loop_mgr: &rustdar_radar::loop_downloads::LoopDownloadManager,
+    pane_idx: usize,
+    ls: &mut rustdar_egui::pane::LayerTimeState,
+    budget: usize,
+) -> bool {
+    settle_loop_phase(
+        pane_idx,
+        ls,
+        |ls| radar_batch_settled(loop_mgr, pane_idx, ls, budget),
+        |ls| radar_still_arriving(loop_mgr, ls),
+    )
 }
 
 /// The frame image a finished loop render describes.
