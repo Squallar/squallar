@@ -1107,6 +1107,20 @@ impl InputHarness {
             .collect()
     }
 
+    /// Every line segment the last frame painted inside `rect`, with the
+    /// stroke each was painted with — [`Self::painted_segments_in`] without a
+    /// colour to look for.
+    pub(crate) fn all_segments_in(
+        &self,
+        rect: egui::Rect,
+    ) -> Vec<(egui::Pos2, egui::Pos2, egui::Stroke)> {
+        self.last_segments
+            .iter()
+            .filter(|(a, b, _)| rect.contains(*a) && rect.contains(*b))
+            .copied()
+            .collect()
+    }
+
     /// Whether `needle` was painted anywhere inside `rect`.
     pub(crate) fn text_painted_in(&self, rect: egui::Rect, needle: &str) -> bool {
         self.last_texts
@@ -1747,6 +1761,30 @@ impl InputHarness {
     /// — the floor the transport's buttons are held to.
     pub(crate) fn interact_size(&self) -> egui::Vec2 {
         self.ctx.global_style().spacing.interact_size
+    }
+
+    /// The handle shape the live style draws sliders with — what
+    /// `ui_timeline::slider_travel_px` needs to say where the rail's travel
+    /// begins and ends.
+    pub(crate) fn handle_shape(&self) -> egui::style::HandleShape {
+        self.ctx.global_style().visuals.handle_shape
+    }
+
+    /// The trough colour the live style paints an untouched slider's rail
+    /// with, read from the same context the frame was painted from.
+    pub(crate) fn inactive_bg_fill(&self) -> egui::Color32 {
+        self.ctx.global_style().visuals.widgets.inactive.bg_fill
+    }
+
+    /// How tall the live style makes a slider's rail band.
+    pub(crate) fn slider_rail_height(&self) -> f32 {
+        self.ctx.global_style().spacing.slider_rail_height
+    }
+
+    /// Forget the actions seen so far, so a second gesture in one test is
+    /// read on its own rather than against the first one's leftovers.
+    pub(crate) fn clear_actions(&mut self) {
+        self.last_actions.clear();
     }
 
     /// The style's selection background fill — the colour a

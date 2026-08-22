@@ -227,6 +227,12 @@ impl Gui {
         pane.hydrate_layer_states(overlays, idx);
         pane.set_layer_enabled(overlays, idx, kind, on);
         pane.adopt_handler_state(overlays);
+        // The enabled set just moved, so the transport may have moved with
+        // it — the same call `Gui::write_pane_overlay` makes. Without it this
+        // door leaves a pane in a state the real one cannot produce, and a
+        // test through it would be checking a configuration that does not
+        // exist.
+        pane.refresh_transport(overlays);
     }
 
     /// The [`ControlItem`] tree `kind`'s handler is currently offering — the
