@@ -31,7 +31,7 @@ use rustdar_overlays::render::geo::simplify_ring;
 use rustdar_overlays::types::SIMPLIFY_EPSILON;
 
 /// The corpus at one fidelity: every zone, keyed and sorted, ready to encode.
-type Zones = Vec<([u8; 7], Vec<GeoPolygon>)>;
+type Zones = Vec<pack::PackedZone>;
 
 /// How a dataset's UGC is spelled. None of the six carries a ready-made
 /// `(kind, ugc)`; three carry the pieces and three carry an id column, one of
@@ -263,7 +263,10 @@ fn run(args: &[String]) {
                 bad_ugc.push((ds.dir.to_string(), ugc.clone()));
                 continue;
             }
-            let k = pack::key(ds.kind, &ugc);
+            let Some(k) = pack::key(ds.kind, &ugc) else {
+                bad_ugc.push((ds.dir.to_string(), ugc.clone()));
+                continue;
+            };
             let polys = rings::to_polygons(&rec.rings, &mut ring_stats);
             let entry = raw.entry(k).or_default();
             if !entry.is_empty() {
@@ -437,13 +440,13 @@ fn run(args: &[String]) {
             );
 
             // ── the round-trip control, on every single cell of the table ──
-            let p = pack::Pack::open(&bytes).unwrap_or_else(|| {
+            let p = pack::ZonePack::open(bytes.clone()).unwrap_or_else(|why| {
                 die(&format!(
-                    "{label}/{name}: the writer produced a pack the reader rejects"
+                    "{label}/{name}: the writer produced a pack the reader rejects ({why})"
                 ))
             });
             assert_eq!(
-                p.zone_count,
+                p.zone_count(),
                 zones.len(),
                 "{label}/{name}: zone count changed"
             );
@@ -458,8 +461,17 @@ fn run(args: &[String]) {
             let mut worst_dev = 0.0f64;
             let mut checked = 0usize;
             for (i, (k, want)) in zones.iter().enumerate() {
-                assert_eq!(&p.key_at(i), k, "{label}/{name}: index key {i} moved");
-                let got = p.get(k).unwrap_or_else(|| {
+                assert_eq!(
+                    p.key_at(i).as_ref(),
+                    Some(k),
+                    "{label}/{name}: key {i} moved"
+                );
+                // Through the binary search, not through `at(i)`: the index is
+                // what a lookup goes via, and a mis-sorted index would still
+                // answer correctly by position.
+                let kind = Kind::from_byte(k[0])
+                    .unwrap_or_else(|| die(&format!("{label}/{name}: key {i} has no kind")));
+                let got = p.get(kind, &key_ugc(k)).unwrap_or_else(|| {
                     die(&format!(
                         "{label}/{name}: {} not found by binary search",
                         key_str(k)
@@ -611,14 +623,14 @@ fn bbox_iou(a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)) -> f64 {
 
 fn compare_cache(cache_dir: &Path, pack_path: &Path) {
     let bytes = read_file(pack_path);
-    let p = pack::Pack::open(&bytes).unwrap_or_else(|| die("pack is not readable"));
+    let p = pack::ZonePack::open(bytes).unwrap_or_else(|why| die(&format!("pack: {why}")));
     println!("== pack vs the app's on-disk zone cache ==");
     println!(
         "  pack: {} zones, coding {}, built at epsilon {} ({}the app's own)",
-        p.zone_count,
-        p.coding.label(),
-        p.epsilon,
-        if (p.epsilon - SIMPLIFY_EPSILON).abs() < 1e-12 {
+        p.zone_count(),
+        p.coding().label(),
+        p.epsilon(),
+        if (p.epsilon() - SIMPLIFY_EPSILON).abs() < 1e-12 {
             ""
         } else {
             "NOT "
@@ -670,7 +682,7 @@ fn compare_cache(cache_dir: &Path, pack_path: &Path) {
 
         let e = per_kind.entry(kind.label()).or_insert((0, 0));
         e.0 += 1;
-        match p.get(&pack::key(kind, ugc)) {
+        match p.get(kind, ugc) {
             None => missing.push(format!("{kind_s}/{ugc}")),
             Some(mine) => {
                 e.1 += 1;
