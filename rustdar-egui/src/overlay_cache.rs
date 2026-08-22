@@ -155,6 +155,7 @@ pub fn plan_overlay_texture(
 // ── Texture cache ────────────────────────────────────────────────────────
 
 /// Radar-specific metadata stored alongside the overlay texture.
+#[derive(Clone)]
 pub struct RadarTextureMeta {
     /// The gates behind these pixels, for the hover readout — see
     /// [`rustdar_radar::hover::HoverSource`]. It replaced a `side²` `f32` grid
@@ -186,6 +187,11 @@ pub struct RadarTextureMeta {
 }
 
 /// A rendered overlay texture and the geo bounds it covers.
+///
+/// `Clone` because a loop frame holds one: [`crate::pane::LoopFrameImage::Overlay`]
+/// is a whole placed raster, and cloning it is a refcount on the texture handle
+/// plus the small placement record beside it.
+#[derive(Clone)]
 pub struct OverlayTextureData {
     pub texture: egui::TextureHandle,
     pub placed: PlacedRaster,

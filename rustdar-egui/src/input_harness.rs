@@ -195,6 +195,11 @@ pub(crate) struct PaintedImage {
     pub uv_at_top_left: egui::Pos2,
     /// The texture coordinate at [`rect`](Self::rect)'s bottom-right corner.
     pub uv_at_bottom_right: egui::Pos2,
+    /// **Which texture was sampled.** The identity, not the geometry: two
+    /// frames of one loop paint the same rect from different pictures, so a
+    /// test that reads only [`rect`](Self::rect) cannot tell a moving playhead
+    /// from a stuck one.
+    pub texture: egui::TextureId,
 }
 
 /// Read a textured quad's geometry back off the mesh `Painter::image` built.
@@ -223,6 +228,7 @@ fn painted_image(mesh: &egui::epaint::Mesh) -> Option<PaintedImage> {
         rect,
         uv_at_top_left: uv_at(rect.min)?,
         uv_at_bottom_right: uv_at(rect.max)?,
+        texture: mesh.texture_id,
     })
 }
 
@@ -2297,3 +2303,8 @@ mod pane_layout_tests;
 
 #[cfg(test)]
 mod tests;
+
+/// Which picture a non-radar textured layer puts on the map — the WI-6 draw
+/// fork, read off the frame that was really painted.
+#[cfg(test)]
+mod loop_overlay_draw_tests;

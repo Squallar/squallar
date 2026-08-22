@@ -503,7 +503,7 @@ fn every_view_can_loop_and_each_frame_is_its_own_shape() {
             RenderView::PlanView,
         ),
     ] {
-        assert_eq!(image.view(), view);
+        assert_eq!(image.view(), Some(view));
         assert_eq!(
             image.volume().is_some(),
             view == RenderView::Volume,

@@ -50,6 +50,10 @@ pub(super) fn render_cross_section(
     let product = pane.selected_product();
     let site = pane.scan_info.as_ref().map(|s| (s.site.lat, s.site.lon));
 
+    // **Radar-addressed, and it stays that way** (WI-1 left this site for WI-6
+    // to judge). A section pane draws radar's cross-section and nothing else —
+    // `LoopFrameImage` has no non-radar section shape — so the loop this pane
+    // animates is radar's by construction.
     let looping = pane.loop_state().is_active();
     let (state, line) = {
         let Some(state) = pane.cross_section() else {

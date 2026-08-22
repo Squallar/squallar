@@ -2252,8 +2252,18 @@ impl super::App {
                     // says it holds no data for it and nothing is being
                     // rendered. The `scan_available` half is the layer's own
                     // `frames_resident`, which is why a frame whose data HAS
-                    // landed does not read as settled: it is owed a texture,
-                    // and that texture arrives with the draw fork (WI-6).
+                    // landed does not read as settled: it is owed a texture.
+                    //
+                    // **Nothing produces that texture yet, and this is where
+                    // it shows.** WI-6 landed the far end - a frame can hold
+                    // an `Overlay` picture and the map paints it - but no
+                    // production path builds one: `spawn_overlay_render`
+                    // rasterizes whichever grid the pane's own selection names
+                    // (`prepare_job` -> `grid_of`), never a named stamp, and
+                    // `OverlayRenderResponse` carries no stamp to file one
+                    // under. Until a frame-addressed rasterize exists, a
+                    // non-radar loop with every grid resident stays in
+                    // `Rendering` and its map goes empty rather than stale.
                     //
                     // *still arriving* is `true`, and deliberately not
                     // `false`. It is the only thing standing between a loop
