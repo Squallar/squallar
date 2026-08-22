@@ -13,7 +13,8 @@
 use rustdar_device_profile::budget::{Budgets, Promotion};
 use rustdar_device_profile::constants::{
     LOOP_IMAGE_SIZE, LOOP_POOL_CEILING_BYTES, LOOP_POOL_DWELL_FRAMES, LOOP_POOL_FLOOR_BYTES,
-    LOOP_POOL_HYSTERESIS, MAX_LOOP_RENDER_BUDGET, MIN_LOOP_FRAMES_PER_PANE, VOLUME_GRID_CELLS,
+    LOOP_POOL_HYSTERESIS, MAX_LOOP_RENDER_BUDGET, MIN_LOOP_FRAMES_PER_PANE, RENDER_HEIGHT,
+    RENDER_WIDTH, VOLUME_GRID_CELLS,
 };
 use rustdar_device_profile::quality::DeviceClass;
 use rustdar_kv::KvStore;
@@ -56,6 +57,46 @@ impl LoopPoolLimits {
     }
 }
 
+/// **Bytes one overlay loop frame costs on a class whose textures stop at
+/// `raster_side_ceiling_px`, before any pane has measured its own.**
+///
+/// An overlay frame has no fixed side the way a radar loop frame does. It is
+/// the pane's own raster, planned from the pane rect and the overdraw margin
+/// by [`plan_overlay_texture`], so the device-class figure is that same
+/// planner run on this class's own default window
+/// ([`RENDER_WIDTH`] × [`RENDER_HEIGHT`]) at one physical pixel per point —
+/// the largest pane a single-pane layout gives. The model prices an overlay
+/// loop with the arithmetic that will really plan it rather than with a radar
+/// frame's side, and a pane that has rasterized once is priced off the texture
+/// it is actually drawing with instead (`app_render::overlay_frame_bytes`).
+///
+/// Measured, this build, against a radar plan-view frame on the same arm:
+///
+/// | arm | limit | plan | overlay | radar plan-view |
+/// |---|---:|---|---:|---:|
+/// | wasm | 2048 | 2048×1152 | **9.44 MB** | 4 MiB |
+/// | mobile | 4096 | 2880×1620 | **18.66 MB** | 16 MiB |
+/// | desktop | 8192 | 2880×1620 | **18.66 MB** | 16 MiB |
+///
+/// The wasm row is smaller than the other two because a 1920-point width is
+/// already 94% of a 2048 texture limit, so the overdraw is clamped to 0.033
+/// there rather than the 0.25 the other two afford.
+///
+/// [`plan_overlay_texture`]: rustdar_egui::overlay_cache::plan_overlay_texture
+/// [`RENDER_WIDTH`]: rustdar_device_profile::constants::RENDER_WIDTH
+/// [`RENDER_HEIGHT`]: rustdar_device_profile::constants::RENDER_HEIGHT
+pub fn nominal_overlay_frame_bytes(raster_side_ceiling_px: usize) -> usize {
+    let plan = rustdar_egui::overlay_cache::plan_overlay_texture(
+        egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(RENDER_WIDTH as f32, RENDER_HEIGHT as f32),
+        ),
+        u32::try_from(raster_side_ceiling_px).unwrap_or(u32::MAX),
+        1.0,
+    );
+    plan.width as usize * plan.height as usize * 4
+}
+
 /// What one loop frame costs on this device class, and how many the dispatcher
 /// will ever texture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,8 +107,15 @@ pub struct LoopFrameModel {
     pub section: usize,
     /// One resident voxel grid with its mips and its colour table.
     pub grid: usize,
+    /// **One frame of a loop of any layer that is not radar** — a model field,
+    /// a satellite band — which is a rasterized overlay texture and not one of
+    /// radar's three shapes. See [`nominal_overlay_frame_bytes`].
+    pub overlay: usize,
     /// This class's `MAX_LOOP_RENDER_BUDGET`: no share buys more frames
-    /// than the dispatcher would texture.
+    /// than the dispatcher would texture. **Radar's own figure**: it is what
+    /// `loop_span_secs` costs at the fastest radar measured, so it is not
+    /// applied to an overlay loop, whose cadence is its layer's (an HRRR run
+    /// is hourly, and 48 h of it is 49 frames).
     pub render_budget: usize,
 }
 
@@ -80,6 +128,9 @@ impl LoopFrameModel {
             section: rustdar_radar::xsect::SECTION_WIDTH * rustdar_radar::xsect::SECTION_HEIGHT * 4,
             grid: rustdar_volumetric::raymarch::resident_grid_bytes(VOLUME_GRID_CELLS)
                 .unwrap_or(usize::MAX),
+            overlay: nominal_overlay_frame_bytes(
+                rustdar_device_profile::budget::BudgetLimits::for_target().raster_side_ceiling_px,
+            ),
             render_budget: MAX_LOOP_RENDER_BUDGET,
         }
     }
@@ -95,7 +146,18 @@ impl LoopFrameModel {
             // overflow).
             grid: rustdar_volumetric::raymarch::resident_grid_bytes(budgets.grid_cells)
                 .unwrap_or(usize::MAX),
+            overlay: nominal_overlay_frame_bytes(budgets.raster_side_ceiling_px),
             render_budget: budgets.loop_render_budget,
+        }
+    }
+
+    /// **What one frame of a radar loop of `view` costs.** The three arms are
+    /// radar's own shapes; every other layer's frame is [`Self::overlay`].
+    pub fn bytes_for(&self, view: RenderView) -> usize {
+        match view {
+            RenderView::PlanView => self.plan_view,
+            RenderView::CrossSection => self.section,
+            RenderView::Volume => self.grid,
         }
     }
 }
@@ -110,12 +172,24 @@ pub struct LoopDemand {
     /// **Distinct volume loop keys**, not panes. Two 3D panes on one volume are
     /// one entry here, because they are one resident set in one store.
     pub volume_sets: usize,
+    /// **Panes looping a layer that is not radar, and no radar loop of their
+    /// own.**
+    ///
+    /// A share is a *pane's* slice, not a layer's: a pane already counted by
+    /// one of the three arms above is not counted again for the model field it
+    /// is animating beside its radar, because `app_render::layer_share`
+    /// divides that one share across every layer the pane animates. This arm
+    /// exists for the pane those three cannot see at all — a radar-off pane
+    /// looping a forecast or a satellite band, which before WB-7 asked the
+    /// pool for nothing and was then handed a share sized as though it were
+    /// the only thing running.
+    pub overlay_loops: usize,
 }
 
 impl LoopDemand {
     /// How many ways the pool is split.
     pub fn shares(&self) -> usize {
-        self.plan_view_loops + self.section_loops + self.volume_sets
+        self.plan_view_loops + self.section_loops + self.volume_sets + self.overlay_loops
     }
 
     /// Fold one more loop of `view` in, deduplicating 3D loops by `key`.
@@ -130,6 +204,12 @@ impl LoopDemand {
                 }
             }
         }
+    }
+
+    /// Fold in one pane whose loops are all a layer other than radar's.
+    /// See [`Self::overlay_loops`] for why it is per pane and not per layer.
+    pub fn add_overlay_pane(&mut self) {
+        self.overlay_loops += 1;
     }
 }
 
@@ -146,6 +226,17 @@ pub struct LoopAllocation {
     /// Resident grids **one** 3D loop may keep, which for that kind is also its
     /// whole frame list. See [`Self::volume_reserve_bytes`].
     pub volume_frames: usize,
+    /// Textured frames a loop of a **non-radar** layer may keep, at the device
+    /// class's nominal overlay frame ([`LoopFrameModel::overlay`]). A pane that
+    /// has already rasterized the layer is priced off the texture it is really
+    /// drawing with — [`Self::frames_at`] takes that measurement — and this is
+    /// the pool's own answer before one exists.
+    ///
+    /// Unlike the three radar arms it is **not** capped by
+    /// [`LoopFrameModel::render_budget`]: that figure is what radar's
+    /// `loop_span_secs` costs at the fastest radar measured, and an overlay
+    /// loop's cadence is its own layer's.
+    pub overlay_frames: usize,
     /// The distinct 3D loops this allocation was computed for.
     pub volume_sets: usize,
 }
@@ -170,6 +261,25 @@ impl LoopAllocation {
         demand.plan_view_loops * self.plan_view_frames * model.plan_view
             + demand.section_loops * self.section_frames * model.section
             + demand.volume_sets * self.volume_frames * model.grid
+            + demand.overlay_loops * self.overlay_frames * model.overlay
+    }
+
+    /// **Frames one share buys at a measured `frame_bytes` apiece** — the count
+    /// a layer gets when it is the only thing its pane animates.
+    ///
+    /// Floored at [`MIN_LOOP_FRAMES_PER_PANE`], deliberately and in the open:
+    /// two frames is where a loop stops being a loop, and it is the same floor
+    /// [`LoopPool::plan`] applies to every other arm. **On a share that does
+    /// not buy two frames the floor wins and the byte bound is exceeded** — one
+    /// frame over, by construction, and stating it is the alternative to an
+    /// animation that cannot animate.
+    ///
+    /// [`MIN_LOOP_FRAMES_PER_PANE`]: rustdar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE
+    pub fn frames_at(&self, frame_bytes: usize) -> usize {
+        self.share_bytes
+            .checked_div(frame_bytes)
+            .unwrap_or(MIN_LOOP_FRAMES_PER_PANE)
+            .max(MIN_LOOP_FRAMES_PER_PANE)
     }
 }
 
@@ -243,13 +353,20 @@ impl LoopPool {
                 .clamp(MIN_LOOP_FRAMES_PER_PANE, cap)
         };
         let volume_frames = frames(share_bytes.saturating_sub(model.grid), model.grid);
-        LoopAllocation {
+        let mut allocation = LoopAllocation {
             share_bytes,
             plan_view_frames: frames(share_bytes, model.plan_view),
             section_frames: frames(share_bytes, model.section),
             volume_frames,
+            overlay_frames: MIN_LOOP_FRAMES_PER_PANE,
             volume_sets: demand.volume_sets,
-        }
+        };
+        // Bytes and the floor, and no `render_budget` — see
+        // `LoopAllocation::overlay_frames`. Through `frames_at` rather than
+        // spelled again here, so the pool's own answer and a pane's measured
+        // one cannot come out of two different divisions.
+        allocation.overlay_frames = allocation.frames_at(model.overlay);
+        allocation
     }
 }
 

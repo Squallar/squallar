@@ -1851,7 +1851,7 @@ impl super::App {
                         let frame_bytes = overlay_frame_bytes(pane, &layer, &budgets);
                         let ls = pane.time_state_mut(&layer);
                         let Some(stamps) = build_loop_frames(ls, frames, |_| {
-                            overlay_frames_held(allocation, frame_bytes, animating)
+                            layer_share(allocation, None, frame_bytes, animating)
                         }) else {
                             log::warn!(
                                 "Loop: {} listed no frames in the requested window for \
@@ -2521,6 +2521,18 @@ impl super::App {
         for pane in self.gui.panes() {
             let ls = pane.loop_state();
             if !ls.is_active() {
+                // **A pane looping something other than radar is a share
+                // too.** Radar's timeline is the only one the three arms below
+                // can see, so before WB-7 a radar-off pane running a forecast
+                // or a satellite loop asked the pool for nothing — and was
+                // then handed `share_bytes` sized as though it were the only
+                // loop in the application, twice over with two such panes. A
+                // pane whose radar IS looping is already counted below, and
+                // `layer_share` divides that one share across the layers it
+                // animates rather than the pane asking twice.
+                if pane.animating_layers().next().is_some() {
+                    demand.add_overlay_pane();
+                }
                 continue;
             }
             let already = if ls.view == rustdar_radar::types::RenderView::Volume {
@@ -2630,31 +2642,26 @@ impl super::App {
     /// # What bounds it, and what that costs
     ///
     /// **The byte share, re-derived every pass and applied to what is already
-    /// held before anything more is asked for.** `overlay_frames_held` divides
-    /// this pane's slice of the loop pool by what one of *this layer's* frames
+    /// held before anything more is asked for.** [`layer_share`] divides this
+    /// pane's slice of the loop pool by what one of *this layer's* frames
     /// really costs on *this* pane, measured off the live raster
-    /// (`overlay_frame_bytes`). At 1280x960 points and 1x that is a 1920x1440
+    /// (`overlay_frame_bytes`) and priced by [`LoopFrameModel`]'s `overlay` arm
+    /// before one exists. At 1280x960 points and 1x that is a 1920x1440
     /// texture = **11.06 MB per frame**; at 2x it is 44.24 MB. The wasm pool
     /// floor is 56 MiB for the whole application, so on wasm at floor with one
     /// animating layer this buys **5 frames of the 1280x960 pane** and two
     /// animating layers buy 2 each — the `MIN_LOOP_FRAMES_PER_PANE` floor,
-    /// which `overlay_frames_held` documents itself as exceeding the byte
-    /// bound to honour.
+    /// which [`layer_share`] documents itself as exceeding the byte bound to
+    /// honour.
     ///
     /// WI-5 already sampled the frame *list* to that figure when the listing
-    /// landed. This re-derives it because **every input moves**: the window can
-    /// be resized (the texture is planned off the pane rect, so `frame_bytes`
-    /// grows with it), `LoopPool` re-plans the allocation at runtime, and a
-    /// second layer can start animating. So the eviction below is not
-    /// belt-and-braces — it is the only thing that gives bytes back when the
-    /// share shrinks under a list that was sized against a larger one.
-    ///
-    /// **These frames are still invisible to `LoopPool`**: `LoopFrameModel` has
-    /// no `overlay` arm and `layer_share` divides frame *count* rather than
-    /// bytes, so the pool cannot price an overlay loop. That is WB-7. Until it
-    /// lands, this is a cap applied where the bytes are spent instead of where
-    /// they are planned, and it is deliberately the same figure WI-5 sampled
-    /// with so the two cannot disagree.
+    /// landed, through the same call. This re-derives it because **every input
+    /// moves**: the window can be resized (the texture is planned off the pane
+    /// rect, so `frame_bytes` grows with it), `LoopPool` re-plans the
+    /// allocation at runtime, and a second layer can start animating. So the
+    /// eviction below is not belt-and-braces — it is the only thing that gives
+    /// bytes back when the share shrinks under a list that was sized against a
+    /// larger one.
     ///
     /// # What it will not do
     ///
@@ -2704,8 +2711,9 @@ impl super::App {
                     {
                         continue;
                     }
-                    let held = overlay_frames_held(
+                    let held = layer_share(
                         allocation,
+                        None,
                         overlay_frame_bytes(pane, &id, &budgets),
                         animating,
                     );
@@ -3479,13 +3487,13 @@ fn build_loop_frames(
 /// rather than assumed — the figure moves with the window.
 ///
 /// Before the first raster there is no measurement to take, and the fallback
-/// is the radar loop frame's own figure. That is an under-estimate on a large
-/// pane, and it is the honest one available: it is the only per-frame cost
-/// this build's budgets carry. **The permanent home for this is
-/// `LoopFrameModel`, which has no `overlay` arm** (plan-view, section and grid
-/// are all radar shapes); until it does, the pool cannot size itself for an
-/// overlay loop and this is a cap applied at the point of spending rather
-/// than at the point of planning.
+/// is **[`LoopFrameModel`]'s own `overlay` arm** — the same planner run on this
+/// class's default window, which is what lets [`LoopPool`] price an overlay
+/// loop it has never seen rasterized. It is not the radar loop frame's figure,
+/// which was this fallback until WB-7 and is a different shape on every arm
+/// (4 MiB against 9.44 MB on wasm, 16 MiB against 18.66 MB native).
+///
+/// [`LoopPool`]: crate::loop_pool::LoopPool
 fn overlay_frame_bytes(
     pane: &rustdar_egui::pane::PaneState,
     layer: &rustdar_source::id::LayerId,
@@ -3495,37 +3503,7 @@ fn overlay_frame_bytes(
         .and_then(rustdar_egui::overlay_cache::OverlayTextureCache::current)
         .map(|texture| texture.width as usize * texture.height as usize * 4)
         .filter(|bytes| *bytes > 0)
-        .unwrap_or_else(|| budgets.loop_frame_bytes())
-}
-
-/// **Frames a non-radar layer's loop may hold on this pane: a byte division,
-/// not a count.**
-///
-/// `layer_share` divides the *count* equally across a pane's animating
-/// layers, which is right only while every layer's frame costs the same. It
-/// does not: a radar loop frame is `LOOP_IMAGE_SIZE`² x 4 and an overlay frame
-/// is the pane's own raster. So the count this layer gets is its share of the
-/// pool **in bytes** divided by what one of its frames really costs, and the
-/// result is what the frame list is sampled down to.
-///
-/// Floored at [`MIN_LOOP_FRAMES_PER_PANE`], deliberately and in the open: two
-/// frames is where a loop stops being a loop, and the same floor is what
-/// `LoopPool::plan` applies to every other arm. **On an arm whose share does
-/// not buy two frames the floor wins and the byte bound is exceeded** — one
-/// frame over, by construction, and stating it is the alternative to an
-/// animation that cannot animate.
-///
-/// [`MIN_LOOP_FRAMES_PER_PANE`]: rustdar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE
-pub(super) fn overlay_frames_held(
-    allocation: LoopAllocation,
-    frame_bytes: usize,
-    animating: usize,
-) -> usize {
-    let share = allocation.share_bytes / animating.max(1);
-    share
-        .checked_div(frame_bytes)
-        .unwrap_or(rustdar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE)
-        .max(rustdar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE)
+        .unwrap_or_else(|| LoopFrameModel::from_budgets(budgets).overlay)
 }
 
 /// **A non-radar layer's answer to [`settle_loop_phase`]'s `scan_available`**:
@@ -3568,8 +3546,14 @@ fn accept_scan_listing(
     // *resident* one and is far lower, because for that kind the frame list and
     // the resident set are one thing — see `loop_frames_held`.
     let total = scans.len();
+    let model = LoopFrameModel::from_budgets(budgets);
     let Some(scans) = build_loop_frames(ls, scans, |ls| {
-        layer_share(loop_frames_held(allocation, ls, budgets), animating)
+        layer_share(
+            allocation,
+            Some(loop_frames_held(allocation, ls, budgets)),
+            model.bytes_for(ls.view),
+            animating,
+        )
     }) else {
         log::warn!("Loop: no {site} scans in the requested window; leaving loop mode");
         *ls = rustdar_egui::pane::LayerTimeState::new();
@@ -4012,25 +3996,62 @@ pub(super) fn loop_frames_held(
     }
 }
 
-/// **One animating layer's share of the pane's frame budget.**
+/// **One animating layer's share of the pane's loop allowance — divided in
+/// BYTES, not in frame count.**
 ///
-/// The cap is a whole-pane number — it is a texture-memory allowance, and a
-/// pane animating radar and a model field at once spends it twice. So it
-/// divides, with a **floor of two frames per layer**: one frame is a still
-/// picture, and a layer that cannot hold two cannot animate at all, so the
-/// floor is where the budget stops being divisible rather than a cushion.
+/// The pool's allowance is bytes, and a pane animating two layers spends it
+/// twice. Splitting the *count* equally is right only while every animating
+/// layer's frame costs the same, and they do not: a radar plan-view frame is
+/// `LOOP_IMAGE_SIZE`² × 4 (4 MiB on wasm, 16 MiB native) and a model or
+/// satellite frame is the pane's own raster. So each animating layer takes an
+/// equal slice of `share_bytes` and converts it at **its own** price. A pane
+/// animating a 4 MiB layer beside a 16 MiB one holds them **4:1**, and the two
+/// together fit the share — where an equal count split would hold 5:1 of the
+/// bytes it was given.
 ///
-/// **A pane animating one layer gets the budget untouched.** Not
-/// `budget / 1` clamped — the one-layer case returns before the floor is
-/// applied, so a view whose own allowance is legitimately below two (a 3D
-/// loop on a small pool) is not silently raised to two by a division that did
-/// not happen. That is what makes this a no-op on every pane in the build
-/// today, and it is pinned as one.
-pub(super) fn layer_share(budget: usize, animating: usize) -> usize {
-    if animating <= 1 {
-        return budget;
+/// `count_cap` is what this layer may hold on top of what the bytes allow:
+///
+/// * **`Some(n)` — radar.** `n` is [`loop_frames_held`], a *frame-list* length
+///   (downloaded scans), of which only the render set is ever textured. **A
+///   pane animating radar alone therefore gets `n` exactly, untouched, on
+///   every arm** — the bytes have nothing to say about a list nobody is
+///   texturing, and this land moves no radar-only count anywhere. It is when a
+///   second layer starts animating that the pane's texture bytes become the
+///   binding term and cap the list at what it can afford to show.
+/// * **`None` — every other layer**, whose frame list *is* its textured set
+///   (`build_loop_frames` sizes it from this, and the dispatch evicts to it).
+///   Bytes are the only bound, plus the floor.
+///
+/// The **floor of [`MIN_LOOP_FRAMES_PER_PANE`]** applies to every divided
+/// answer: one frame is a still picture, and a layer that cannot hold two
+/// cannot animate at all, so the floor is where the allowance stops being
+/// divisible rather than a cushion. **On a share that does not buy two frames
+/// the floor wins and the byte bound is exceeded** — one frame over, by
+/// construction, which is the alternative to an animation that cannot animate.
+/// It is not applied to the undivided radar answer: a view whose own allowance
+/// is legitimately below two is not silently raised by a division that did not
+/// happen.
+///
+/// [`MIN_LOOP_FRAMES_PER_PANE`]: rustdar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE
+pub(super) fn layer_share(
+    allocation: LoopAllocation,
+    count_cap: Option<usize>,
+    frame_bytes: usize,
+    animating: usize,
+) -> usize {
+    if let Some(cap) = count_cap
+        && animating <= 1
+    {
+        return cap;
     }
-    (budget / animating).max(2)
+    // A frame that costs nothing is a model built wrong; the floor answers
+    // rather than a division by zero.
+    let by_bytes = (allocation.share_bytes / animating.max(1))
+        .checked_div(frame_bytes)
+        .unwrap_or(rustdar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE);
+    by_bytes
+        .min(count_cap.unwrap_or(usize::MAX))
+        .max(rustdar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE)
 }
 
 /// [`accept_scan_listing`] under a name the sibling test modules can reach —

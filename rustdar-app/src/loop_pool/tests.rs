@@ -29,6 +29,7 @@ fn model(
     loop_image_size: usize,
     section_width: usize,
     grid: [u32; 3],
+    raster_side_ceiling: usize,
     render_budget: usize,
 ) -> LoopFrameModel {
     LoopFrameModel {
@@ -36,6 +37,7 @@ fn model(
         section: section_width * (section_width / 2) * 4,
         grid: rustdar_volumetric::raymarch::resident_grid_bytes(grid)
             .expect("a shipped grid shape"),
+        overlay: crate::loop_pool::nominal_overlay_frame_bytes(raster_side_ceiling),
         render_budget,
     }
 }
@@ -48,6 +50,7 @@ fn arms() -> [Arm; 3] {
                 WASM_LOOP_IMAGE_SIZE,
                 WASM_SECTION_WIDTH,
                 WASM_VOLUME_GRID_CELLS,
+                rustdar_device_profile::constants::WASM_RASTER_SIDE_CEILING,
                 WASM_MAX_LOOP_RENDER_BUDGET,
             ),
             limits: LoopPoolLimits {
@@ -63,6 +66,7 @@ fn arms() -> [Arm; 3] {
                 MOBILE_LOOP_IMAGE_SIZE,
                 NATIVE_SECTION_WIDTH,
                 MOBILE_VOLUME_GRID_CELLS,
+                rustdar_device_profile::constants::MOBILE_RASTER_SIDE_CEILING,
                 MOBILE_MAX_LOOP_RENDER_BUDGET,
             ),
             limits: LoopPoolLimits {
@@ -78,6 +82,7 @@ fn arms() -> [Arm; 3] {
                 DESKTOP_LOOP_IMAGE_SIZE,
                 NATIVE_SECTION_WIDTH,
                 DESKTOP_VOLUME_GRID_CELLS,
+                rustdar_device_profile::constants::DESKTOP_RASTER_SIDE_CEILING,
                 DESKTOP_MAX_LOOP_RENDER_BUDGET,
             ),
             limits: LoopPoolLimits {
@@ -100,6 +105,7 @@ fn reachable_demands(max_panes: usize) -> Vec<LoopDemand> {
                     plan_view_loops,
                     section_loops,
                     volume_sets,
+                    ..LoopDemand::default()
                 });
             }
         }
@@ -332,6 +338,7 @@ fn no_share_buys_more_frames_than_the_dispatcher_textures() {
                 plan_view_loops: 1,
                 section_loops: 1,
                 volume_sets: 1,
+                ..LoopDemand::default()
             },
         );
         for frames in [
@@ -469,6 +476,7 @@ fn a_pane_that_flickers_inside_the_dwell_changes_nothing() {
         DESKTOP_LOOP_IMAGE_SIZE,
         NATIVE_SECTION_WIDTH,
         DESKTOP_VOLUME_GRID_CELLS,
+        rustdar_device_profile::constants::DESKTOP_RASTER_SIDE_CEILING,
         30,
     );
     let limits = LoopPoolLimits {
@@ -521,6 +529,7 @@ fn a_growth_has_to_clear_the_dead_band_but_a_shrink_does_not() {
         DESKTOP_LOOP_IMAGE_SIZE,
         NATIVE_SECTION_WIDTH,
         DESKTOP_VOLUME_GRID_CELLS,
+        rustdar_device_profile::constants::DESKTOP_RASTER_SIDE_CEILING,
         30,
     );
     let limits = LoopPoolLimits {
@@ -605,15 +614,24 @@ fn the_demand_counts_each_view_in_its_own_column() {
     demand.add(RenderView::PlanView, false);
     demand.add(RenderView::CrossSection, false);
     demand.add(RenderView::Volume, false);
+    // The fourth column is not a view at all: it is the pane whose loops are
+    // all some layer other than radar's, which the three above cannot see.
+    demand.add_overlay_pane();
     assert_eq!(
         demand,
         LoopDemand {
             plan_view_loops: 1,
             section_loops: 1,
             volume_sets: 1,
+            overlay_loops: 1,
         },
     );
-    assert_eq!(demand.shares(), 3);
+    assert_eq!(
+        demand.shares(),
+        4,
+        "an overlay-only pane is a way the pool is split; before WB-7 it was \
+         invisible here and was handed a share sized as though it were alone",
+    );
     assert_eq!(LoopDemand::default().shares(), 0);
 }
 
@@ -636,6 +654,70 @@ fn an_empty_demand_is_the_single_loop_answer() {
         // And no 3D reserve at all, which is what lets the caller floor the store's bound
         // at the live-grid figure instead of at zero.
         assert_eq!(empty.volume_reserve_bytes(), 0, "{}", arm.name);
+    }
+}
+
+/// **What an overlay loop frame costs on each arm, pinned to its arithmetic and
+/// not to the function that computes it.**
+///
+/// `LoopFrameModel::overlay` is the one price in the model that is not a fixed
+/// side: it is the pane's own raster, so the class figure is
+/// `plan_overlay_texture` run on the class's default window
+/// (`RENDER_WIDTH` × `RENDER_HEIGHT` = 1920 × 1080 points) at 1x against that
+/// class's `raster_side_ceiling_px`. The numbers below are that arithmetic
+/// written out:
+///
+/// * **mobile and desktop** afford the whole `OVERDRAW_FRACTION` of 0.25, so
+///   1920 × 1.5 = 2880 and 1080 × 1.5 = 1620 → 2880 × 1620 × 4 =
+///   **18,662,400 B**, against a 4096 and an 8192 limit respectively;
+/// * **wasm** is clamped by WebGL2's 2048: a 1920-point width is already 94% of
+///   it, so the affordable overdraw is (2048/1920 − 1)/2 = 0.0333 and the plan
+///   is 2048 × 1152 × 4 = **9,437,184 B**.
+///
+/// **The second block is the load-bearing one.** Before WB-7 an overlay frame
+/// was priced as a radar plan-view frame — `Budgets::loop_frame_bytes()` — and
+/// every consumer of the overlay arm reads it back off the model, so a suite
+/// that only compared the model with itself would pass with the two identical.
+/// The two figures are 4 MiB against 9.44 MB on wasm and 16 MiB against
+/// 18.66 MB on both native arms, and they must stay different numbers.
+///
+/// **Floor — `price_the_overlay_as_radar`: make `LoopFrameModel::from_budgets`
+/// and `for_target` answer `budgets.loop_frame_bytes()`.** Both blocks red on
+/// all three arms. Applied and observed — and the whole rest of the suite
+/// stayed green under it, which is why this test exists.
+#[test]
+fn an_overlay_frame_is_priced_by_the_planner_and_is_not_a_radar_frame() {
+    use crate::loop_pool::nominal_overlay_frame_bytes;
+    use rustdar_device_profile::constants::{
+        DESKTOP_RASTER_SIDE_CEILING, MOBILE_RASTER_SIDE_CEILING, WASM_RASTER_SIDE_CEILING,
+    };
+
+    assert_eq!(
+        nominal_overlay_frame_bytes(DESKTOP_RASTER_SIDE_CEILING),
+        2880 * 1620 * 4,
+        "desktop: 1920x1080 points at the full 0.25 overdraw is 2880x1620",
+    );
+    assert_eq!(
+        nominal_overlay_frame_bytes(MOBILE_RASTER_SIDE_CEILING),
+        2880 * 1620 * 4,
+        "mobile: a 4096 limit affords the full overdraw too",
+    );
+    assert_eq!(
+        nominal_overlay_frame_bytes(WASM_RASTER_SIDE_CEILING),
+        2048 * 1152 * 4,
+        "wasm: the 2048 WebGL2 limit binds the width and cuts the overdraw to \
+         0.0333",
+    );
+
+    for arm in arms() {
+        assert_ne!(
+            arm.model.overlay, arm.model.plan_view,
+            "{}: an overlay loop frame is priced as a radar plan-view frame \
+             ({} B). That is what the fallback did before WB-7, and it is the \
+             one substitution every other assertion in this crate survives, \
+             because they all read the price back off this same field.",
+            arm.name, arm.model.plan_view,
+        );
     }
 }
 
@@ -669,6 +751,7 @@ mod budget_agreement {
                 plan_view: arm.loop_frame_bytes(),
                 section: arm.section_frame_bytes(),
                 grid: volume_bytes(&arm),
+                overlay: crate::loop_pool::nominal_overlay_frame_bytes(arm.raster_side_ceiling_px),
                 render_budget: arm.loop_render_budget,
             };
             let limits = LoopPoolLimits {
@@ -684,6 +767,7 @@ mod budget_agreement {
                                 plan_view_loops,
                                 section_loops,
                                 volume_sets,
+                                ..LoopDemand::default()
                             };
                             let allocation = pool.plan(model, demand);
                             // What `setup_egui_frame` hands `enforce_budget`.

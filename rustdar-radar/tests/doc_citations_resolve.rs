@@ -90,6 +90,34 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          The paragraphs establishing that the offset is site-adaptable cannot \
          avoid naming it. A spec identifier, not a test.",
     ),
+    // ── Named source MUTATIONS, which are not tests ─────────────────────
+    //
+    // A floor states the edit that turns its assertion red, and gives that
+    // edit a name so the report and the doc are talking about the same thing.
+    // The name is a label for a hand-applied source change, never a `fn` —
+    // most in this tree happen to be four segments and slip under
+    // `MIN_SEGMENTS`; these are the ones that do not, and they are no
+    // different in kind. Shortening a label to duck the threshold would hide
+    // the class rather than record it.
+    (
+        "rustdar-app/src/app_render/loop_overlay_render_tests.rs",
+        "price_the_overlay_as_radar",
+        "WB-7 floor: make `overlay_frame_bytes` answer \
+         `LoopFrameModel::plan_view` instead of the pane's measured texture. \
+         A mutation, not a test.",
+    ),
+    (
+        "rustdar-app/src/app_render/loop_supply_tests.rs",
+        "price_the_overlay_as_radar",
+        "The same WB-7 mutation, named in the suite whose expected counts move \
+         under it (32 frames become 36).",
+    ),
+    (
+        "rustdar-app/src/loop_pool/tests.rs",
+        "price_the_overlay_as_radar",
+        "The same WB-7 mutation at its source: `LoopFrameModel`'s `overlay` \
+         arm answering `Budgets::loop_frame_bytes()`.",
+    ),
     // ── Prose that narrates a deletion ──────────────────────────────────
     (
         "rustdar-volumetric/src/volume_bridge/tests.rs",

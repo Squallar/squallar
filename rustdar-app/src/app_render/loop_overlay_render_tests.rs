@@ -320,6 +320,41 @@ fn frame_textures(app: &crate::app::App) -> Vec<Option<egui::TextureId>> {
         .collect()
 }
 
+/// The site radar loops on when this suite makes a pane animate two layers.
+fn radar_site() -> rustdar_radar::sites::RadarSite {
+    rustdar_radar::sites::RadarSite {
+        name: "KTLX",
+        network: rustdar_radar::sites::RadarNetwork::of_id("KTLX"),
+        lat: 35.33,
+        lon: -97.27,
+        heights: None,
+    }
+}
+
+/// Deliver the pane's **live** raster — the one `overlay_frame_bytes` measures
+/// — at `side`×`side` texels, so what one loop frame of this layer costs on
+/// this pane is a number the test chose rather than one it inherited.
+fn deliver_live_raster(app: &mut crate::app::App, ctx: &egui::Context, side: usize) {
+    let image = Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+        [side, side],
+        &vec![7u8; side * side * 4],
+    ));
+    app.channels
+        .overlay_render_sender
+        .send(crate::channels::OverlayRenderResponse {
+            image: Some(image),
+            geo_bounds: bounds(),
+            overlay_kind: known::MODEL_DATA,
+            generation: 5,
+            pane_indices: vec![0],
+            zoom: 32,
+            hit_map: None,
+            frame: None,
+        })
+        .expect("the receiver lives on the App");
+    app.poll_overlay_render_results(ctx);
+}
+
 /// Deliver one finished raster for `stamp`, with a picture nothing else shares.
 fn deliver_raster(app: &mut crate::app::App, ctx: &egui::Context, stamp: FrameStamp, shade: u8) {
     let image = Arc::new(egui::ColorImage::from_rgba_unmultiplied(
@@ -484,7 +519,7 @@ fn a_forecast_loops_frames_each_get_their_own_picture_end_to_end() {
 /// the bound bites when the share moves under a frame list that was built for a
 /// larger one.
 ///
-/// WI-5 sampled the frame *list* to `overlay_frames_held` when the listing
+/// WI-5 sampled the frame *list* to `layer_share`'s answer when the listing
 /// landed. That figure is not stable: the pane can be resized (an overlay
 /// frame's texture is planned off the pane rect, so its cost grows with it),
 /// `LoopPool` re-plans the allocation at runtime, and a second layer can start
@@ -492,21 +527,20 @@ fn a_forecast_loops_frames_each_get_their_own_picture_end_to_end() {
 /// what the share no longer covers **before** asking for more.
 ///
 /// The denominators, stated: `overlay_frame_bytes` reads the pane's own live
-/// raster — here a 1x1 texture, 4 bytes — and falls back to
-/// `Budgets::loop_frame_bytes()` before one exists. `overlay_frames_held`
-/// divides the pane's `share_bytes` by that and floors at
+/// raster and falls back to `LoopFrameModel::overlay` — the class's own
+/// overlay frame, 2880x1620x4 = **18.66 MB** on this arm — before one exists.
+/// `layer_share` divides the pane's `share_bytes` by that and floors at
 /// `MIN_LOOP_FRAMES_PER_PANE`. On a real 1280x960-**point** pane at 1x the
 /// figure is 1920x1440x4 = **11.06 MB per frame**, so the 56 MiB wasm pool
 /// floor buys **5** such frames for the whole application and two animating
-/// layers buy **2** each — the floor, which `overlay_frames_held` documents
-/// itself as exceeding the byte bound to honour.
+/// layers buy **2** each — the floor, which `layer_share` documents itself as
+/// exceeding the byte bound to honour.
 ///
 /// **The arrangement is the one that makes the bound non-vacuous.** WI-5 sizes
-/// the frame list from `Budgets::loop_frame_bytes()` — the radar figure — because
-/// before the first raster there is nothing to measure. The moment a real
-/// overlay raster lands, `overlay_frame_bytes` reads it instead, and on a large
-/// pane it is bigger. The list is then longer than the share pays for, and
-/// nothing but this dispatch gives the difference back.
+/// the frame list from whatever the price is when the listing lands. The moment
+/// a real overlay raster lands, `overlay_frame_bytes` reads it instead, and on
+/// a large pane it is bigger. The list is then longer than the share pays for,
+/// and nothing but this dispatch gives the difference back.
 ///
 /// **Floor 1 — `unbounded_dispatch`:** delete the eviction and take the whole
 /// frame list as the budget. Every frame is then kept, and the byte assertion
@@ -534,9 +568,9 @@ fn the_dispatch_holds_no_more_frames_than_the_pane_s_byte_share_buys() {
     let budgets = app.budgets;
     let animating = app.gui.pane(0).expect("pane 0").animating_layers().count();
     // The figure WI-5 built the list under: no raster has landed, so
-    // `overlay_frame_bytes` falls back to the radar loop frame's own cost.
-    let fallback_bytes = budgets.loop_frame_bytes();
-    let held_at_build = overlay_frames_held(allocation, fallback_bytes, animating);
+    // `overlay_frame_bytes` falls back to the model's own `overlay` arm.
+    let fallback_bytes = LoopFrameModel::from_budgets(&budgets).overlay;
+    let held_at_build = layer_share(allocation, None, fallback_bytes, animating);
     let built = frame_stamps(&app).len();
     assert_eq!(
         built,
@@ -617,7 +651,7 @@ fn the_dispatch_holds_no_more_frames_than_the_pane_s_byte_share_buys() {
         &known::MODEL_DATA,
         &budgets,
     );
-    let held_now = overlay_frames_held(allocation, frame_bytes, animating_now);
+    let held_now = layer_share(allocation, None, frame_bytes, animating_now);
     assert!(
         held_now < built,
         "premise: the second animating layer must have made the built list \
@@ -638,10 +672,7 @@ fn the_dispatch_holds_no_more_frames_than_the_pane_s_byte_share_buys() {
         held_now,
         "the pane is holding {textured} textures where its share buys \
          {held_now}: {} B held against {} B — the pane's {} B of pool share \
-         divided {animating_now} ways — at {frame_bytes} B a frame. None of \
-         this is visible to `LoopPool`: `LoopFrameModel` still has no \
-         `overlay` arm and `layer_share` divides frame COUNT rather than bytes \
-         (WB-7), so nothing else in the build would ever notice.",
+         divided {animating_now} ways — at {frame_bytes} B a frame.",
         textured * frame_bytes,
         allocation.share_bytes / animating_now,
         allocation.share_bytes,
@@ -656,6 +687,222 @@ fn the_dispatch_holds_no_more_frames_than_the_pane_s_byte_share_buys() {
         *taken.lock().expect("no poisoned lock"),
         0,
         "and nothing reached the funnel",
+    );
+}
+
+/// **WB-7: a pane animating a 16 MiB radar frame and a 4 MiB overlay frame
+/// holds them 1:4, and the two together fit the one share.**
+///
+/// This is the wiring proof for the byte division, driven through the two real
+/// listing arrivals on one real pane rather than through the divider. Before
+/// WB-7 there was no arrangement in which the two answers could disagree:
+/// `layer_share` divided radar's *count* and a separate `overlay_frames_held`
+/// divided the overlay's *bytes*, two authorities that never met, and
+/// `LoopFrameModel` had no price for an overlay frame at all.
+///
+/// **Every figure with its denominator**, desktop, pool at its floor:
+///
+/// * the pane's share is the whole pool, **576 MiB**, because one pane is
+///   looping (`LoopDemand::default()` on a fresh `App`);
+/// * a radar plan-view loop frame is `LOOP_IMAGE_SIZE`² × 4 = **16 MiB**;
+/// * this pane's model raster is arranged at 1024×1024 texels = **4 MiB**,
+///   read back off the pane's own live texture by `overlay_frame_bytes` — a
+///   quarter of a radar frame, exactly;
+/// * two animating layers, so each takes **288 MiB**;
+/// * radar holds **18** frames (288 MiB / 16 MiB, under its 60-frame list cap)
+///   and the model holds **72** (288 MiB / 4 MiB);
+/// * **72 = 18 × 4**, and 18 × 16 MiB + 72 × 4 MiB = **576 MiB**, the pool
+///   floor exactly.
+///
+/// **Floor — `divide_the_count`: restore `(whole_pane / animating).max(2)`.**
+/// Radar's list comes out at 30 (60 / 2) and the model's at 72 (144 / 2), so
+/// the 4:1 assertion reds at 2.4:1 — and the two together charge 768 MiB
+/// against a 576 MiB floor, so the byte assertion reds too. Applied and
+/// observed.
+///
+/// **Floor — `price_the_overlay_as_radar`: make `overlay_frame_bytes` ignore
+/// the pane's measured texture and answer `LoopFrameModel::plan_view`.** The
+/// model's list comes out at 18 rather than 72 and both the ratio and the
+/// counts-differ assertion red. Applied and observed.
+///
+/// The counts-differ assertion is there on its own account: it is what an
+/// equal split cannot satisfy, so the ratio cannot be met by two numbers that
+/// are the same.
+#[test]
+fn a_pane_animating_two_layers_divides_its_bytes_and_not_its_frame_count() {
+    let ctx = egui::Context::default();
+    let taken = Arc::new(Mutex::new(0usize));
+    let _guard = rustdar_worker::offload::install_test_worker(Box::new(TakeAll {
+        taken: Arc::clone(&taken),
+    }));
+
+    // Hourly, and far more than either share buys.
+    let listed: Vec<chrono::NaiveDateTime> = (0..120).map(ts).collect();
+    let (mut app, _asked) = app_with_frames(listed.clone());
+
+    // Radar starts animating on the same pane, so both layers are competing
+    // for one share when either listing lands.
+    *app.gui
+        .pane_mut(0)
+        .expect("the fixture built a pane")
+        .loop_state_mut() = rustdar_egui::radar_layer::begin_loop(
+        24 * 3600,
+        &radar_site(),
+        rustdar_radar::types::RenderView::PlanView,
+    );
+
+    // The pane's own live model raster, at a size chosen to be exactly a
+    // quarter of a radar loop frame. `overlay_frame_bytes` measures this
+    // rather than assuming anything, and the pane has to be drawing the layer
+    // for a live raster to reach its cache at all.
+    app.gui
+        .pane_mut(0)
+        .expect("pane 0")
+        .set_overlay_enabled(known::MODEL_DATA, true);
+    app.spawn_overlay_render(vec![0], known::MODEL_DATA, a_render_request(), None);
+    deliver_live_raster(&mut app, &ctx, 1024);
+
+    let budgets = app.budgets;
+    let allocation = app.loop_allocation();
+    let radar_bytes = LoopFrameModel::from_budgets(&budgets).plan_view;
+    let overlay_bytes = overlay_frame_bytes(
+        app.gui.pane(0).expect("pane 0"),
+        &known::MODEL_DATA,
+        &budgets,
+    );
+    assert_eq!(
+        overlay_bytes * 4,
+        radar_bytes,
+        "premise: the pane's measured model frame ({overlay_bytes} B) must be \
+         exactly a quarter of a radar loop frame ({radar_bytes} B), or the \
+         ratio below is not the one this test claims to read",
+    );
+    // The model's frame list, through the production arrival. `build_loop`
+    // arms the model timeline before it sends the listing, so both layers are
+    // animating by the time the arrival divides the share.
+    build_loop(&mut app, (listed[0], listed[listed.len() - 1]));
+    let overlay_held = frame_stamps(&app).len();
+    assert_eq!(
+        app.gui.pane(0).expect("pane 0").animating_layers().count(),
+        2,
+        "premise: two animating layers, or there was no division to read",
+    );
+
+    // Radar's, through `accept_scan_listing` — the same function the
+    // production caller runs, under its test-facing name.
+    let scans: Vec<chrono::NaiveDateTime> = (0..200)
+        .map(|i| ts(0) + chrono::Duration::minutes(i * 4))
+        .collect();
+    let animating = app.gui.pane(0).expect("pane 0").animating_layers().count();
+    let pane = app.gui.pane_mut(0).expect("pane 0");
+    crate::app::render::accept_scan_listing_for_test(
+        allocation,
+        &budgets,
+        pane.loop_state_mut(),
+        "KTLX",
+        scans.clone(),
+        animating,
+    );
+    let radar_held = pane.loop_state().frames.len();
+
+    assert!(
+        radar_held < scans.len() && overlay_held < listed.len(),
+        "premise: both listings must be longer than the share buys, or \
+         neither list is telling us what the divider said — radar \
+         {radar_held} of {} and model {overlay_held} of {}",
+        scans.len(),
+        listed.len(),
+    );
+    assert_ne!(
+        radar_held, overlay_held,
+        "the two layers came out at the same frame count, so the pane split \
+         its allowance by count and not by bytes — {radar_held} frames at \
+         {radar_bytes} B beside {overlay_held} at {overlay_bytes} B",
+    );
+    assert_eq!(
+        overlay_held,
+        radar_held * 4,
+        "a layer whose frames cost a quarter as much must hold four times as \
+         many: radar {radar_held} × {radar_bytes} B against model \
+         {overlay_held} × {overlay_bytes} B, out of {} B of share divided \
+         {animating} ways",
+        allocation.share_bytes,
+    );
+    let spent = radar_held * radar_bytes + overlay_held * overlay_bytes;
+    assert!(
+        spent <= rustdar_device_profile::constants::LOOP_POOL_FLOOR_BYTES,
+        "the pane's two loops charge {spent} B against a pool floor of {} B — \
+         the whole point of dividing is that the two together fit",
+        rustdar_device_profile::constants::LOOP_POOL_FLOOR_BYTES,
+    );
+    assert!(
+        radar_held >= rustdar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE
+            && overlay_held >= rustdar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE,
+        "the byte bound starved a layer below the floor, and a layer that \
+         cannot hold two frames cannot animate at all",
+    );
+}
+
+/// **WB-7: a pane looping a layer that is not radar is a share of the pool.**
+///
+/// `loop_demand` reads each pane's *radar* timeline, so before WB-7 a radar-off
+/// pane running a forecast or a satellite loop counted for nothing — and
+/// `LoopPool::plan` divides by `shares().max(1)`, so a pool nobody claimed was
+/// handed **whole** to every pane that had not claimed it. Two such panes each
+/// believed they had the entire application's loop bytes.
+///
+/// **Floor — `forget_the_overlay_pane`: delete the `add_overlay_pane` branch.**
+/// `shares()` goes to 0 and both assertions red. Applied and observed.
+#[test]
+fn a_radar_off_pane_looping_a_model_layer_is_a_share_of_the_pool() {
+    let taken = Arc::new(Mutex::new(0usize));
+    let _guard = rustdar_worker::offload::install_test_worker(Box::new(TakeAll {
+        taken: Arc::clone(&taken),
+    }));
+
+    let (mut app, _asked) = app_with_frames(vec![ts(0), ts(1), ts(2)]);
+    build_loop(&mut app, (ts(0), ts(2)));
+
+    let pane = app.gui.pane(0).expect("pane 0");
+    assert!(
+        !pane.loop_state().is_active(),
+        "premise: radar is NOT looping on this pane — that is the whole case",
+    );
+    assert_eq!(
+        pane.animating_layers().count(),
+        1,
+        "premise: exactly one layer, and it is not radar's",
+    );
+
+    let demand = app.loop_demand();
+    assert_eq!(
+        demand.overlay_loops, 1,
+        "the pane's model loop did not reach the pool's demand at all",
+    );
+    assert_eq!(
+        demand.shares(),
+        1,
+        "a pane looping a model field is one way the pool is split; at 0 the \
+         `shares().max(1)` in `LoopPool::plan` hands it the whole pool and a \
+         second such pane gets the whole pool again",
+    );
+
+    // The byte consequence, on the pool's own arithmetic: a second such pane
+    // halves what each of them may hold.
+    let budgets = app.budgets;
+    let model = LoopFrameModel::from_budgets(&budgets);
+    let pool = crate::loop_pool::LoopPool::new(
+        budgets.loop_pool_floor_bytes,
+        crate::loop_pool::LoopPoolLimits::from_budgets(&budgets),
+    );
+    let two = crate::loop_pool::LoopDemand {
+        overlay_loops: 2,
+        ..Default::default()
+    };
+    assert_eq!(
+        pool.plan(model, two).share_bytes * 2,
+        pool.plan(model, demand).share_bytes,
+        "two panes looping a model field must divide the pool between them",
     );
 }
 
