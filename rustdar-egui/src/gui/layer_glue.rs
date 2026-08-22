@@ -141,11 +141,22 @@ impl Gui {
         }
     }
 
-    /// **Give every pane a slot for every registered layer.** A saved stack
-    /// names only the layers the writing build had, so the ones this build
-    /// serves and the file never mentioned join here — each at the position
-    /// its `draw_order_weight` puts it in, which is the reconcile the flat
-    /// `draw_order` used to get on its own.
+    /// **Offer every pane every registered layer, and let each pane's stack
+    /// decide.** A saved stack names the layers that pane was curated to hold,
+    /// so the ones this build serves that the file never mentioned are offered
+    /// here — each at the position its `draw_order_weight` puts it in, which is
+    /// the reconcile the flat `draw_order` used to get on its own.
+    ///
+    /// **This used to be the completeness guarantee, and it is not one any
+    /// more.** Until WO-SITE-CURATE it gave every pane a slot for every
+    /// registered handler unconditionally, which is what made a pane's stack a
+    /// projection of the build's catalogue: nothing could be added, because
+    /// everything was already there, and nothing could be removed, because the
+    /// next call put it back. The offer now goes through
+    /// [`LayerStack::admits`](crate::pane::LayerStack::admits) — a layer joins
+    /// only if it ships enabled and this pane has not removed it — so a newly
+    /// registered source still lands on a fresh pane if it ships on, still
+    /// reaches the catalogue either way, and never overrides a curation.
     ///
     /// The joined slot takes the **layer's own default**, and nothing else:
     /// it used to take `is_enabled` off the registry, and to copy the
@@ -191,6 +202,17 @@ impl Gui {
             overlays, panes, ..
         } = self;
         panes[idx].hydrate_layer_states(overlays, idx);
+    }
+
+    /// Put `kind` in pane `idx`'s stack, as the catalog's tile does — for the
+    /// tests whose subject is a long list rather than the act of adding, which
+    /// take the chrome's own route (`InputHarness::add_layer_from_catalog`).
+    #[cfg(test)]
+    pub(crate) fn add_layer_on_pane_for_test(&mut self, idx: usize, kind: &LayerId) -> bool {
+        let Self {
+            overlays, panes, ..
+        } = self;
+        panes[idx].add_layer(overlays, kind)
     }
 
     /// Set one pane's overlay state, writing the config as well as the enabled map

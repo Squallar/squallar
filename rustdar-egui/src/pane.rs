@@ -16,6 +16,10 @@ use rustdar_radar::fields as radar_fields;
 #[path = "pane_content.rs"]
 mod content;
 
+/// The pane's own layer list, split from the build's catalogue.
+mod layer_stack;
+pub use layer_stack::{LayerStack, RemovedLayer};
+
 pub use content::{
     BASE_HALF_WIDTH_KM, CrossSectionPane, DEFAULT_VERTICAL_EXAGGERATION, MAX_EYE_DISTANCE,
     MAX_VERTICAL_EXAGGERATION, MIN_EYE_DISTANCE, MIN_VERTICAL_EXAGGERATION, MapPane, MapRender,
@@ -490,6 +494,8 @@ pub struct PaneConfigBaggage {
     /// `layer_slots` entries that are not slot objects at all, verbatim,
     /// re-appended after the slots on save.
     pub layer_slots: Vec<serde_json::Value>,
+    /// The same, for `removed_layers`.
+    pub removed_layers: Vec<serde_json::Value>,
     /// Whole pane-level fields this build does not know.
     pub fields: serde_json::Map<String, serde_json::Value>,
 }
@@ -831,11 +837,18 @@ pub struct PaneState {
     /// [`LayerId`]. Only texture overlay kinds (SPC, NWS, discussions) have
     /// cache entries; entries are created lazily.
     pub overlay_textures: HashMap<LayerId, OverlayTextureCache>,
-    /// **This pane's layer stack: one [`LayerSlot`] per layer, bottom to top.**
-    /// The vector's order is the draw order; each slot carries its own enabled
-    /// flag and its own saved config. Replaces the three parallel containers
-    /// `draw_order` / `enabled_overlays` / `overlay_configs` (WO-E6b).
-    pub layers: Vec<LayerSlot>,
+    /// **This pane's curated layer stack: one [`LayerSlot`] per layer the pane
+    /// draws, bottom to top.** The list's order is the draw order; each slot
+    /// carries its own enabled flag and its own saved config. Replaces the
+    /// three parallel containers `draw_order` / `enabled_overlays` /
+    /// `overlay_configs` (WO-E6b).
+    ///
+    /// **A [`LayerStack`], not a `Vec<LayerSlot>`, and not the registry.** The
+    /// registry is what this *build* can draw; this is what this *pane* draws,
+    /// and the two are reconciled by [`LayerStack::admits`] rather than by the
+    /// stack being re-derived from the catalogue. See that module's own note
+    /// for why a complete projection was the wrong shape.
+    pub layers: LayerStack,
     /// Config-file content addressed to a build that is not this one — see
     /// [`PaneConfigBaggage`]. Written by `load_ui_config`, read only by
     /// `ui_config_json`, and never acted on in between.
@@ -1406,7 +1419,7 @@ impl PaneState {
             // the handlers through `initialize_pane_enabled` — which every
             // site that makes a pane calls, because the flags always needed
             // that seeding and now the order comes with them.
-            layers: Vec::new(),
+            layers: LayerStack::default(),
             config_baggage: PaneConfigBaggage::default(),
             time: PaneTimePosture::default(),
             transport: known::RADAR,
@@ -1982,7 +1995,7 @@ impl PaneState {
     /// disabled slots; slots `order` omits keep their relative order at the
     /// end, so a partial list can never silently drop a layer.
     pub fn set_draw_order(&mut self, order: &[LayerId]) {
-        let mut remaining = std::mem::take(&mut self.layers);
+        let mut remaining = self.layers.take_slots();
         let mut reordered: Vec<LayerSlot> = Vec::with_capacity(remaining.len());
         for id in order {
             match remaining.iter().position(|slot| slot.id == *id) {
@@ -1991,32 +2004,141 @@ impl PaneState {
             }
         }
         reordered.append(&mut remaining);
-        self.layers = reordered;
+        self.layers.set_slots(reordered);
     }
 
-    /// Give this pane a slot for every `id` it lacks one for, inserted at the
-    /// position `weight_of` puts it in among the slots that already have
-    /// weights — the reconcile a saved order gets when the build serves a
-    /// layer the file never named.
+    /// **Offer this pane every registered layer, and let the stack decide
+    /// which it takes.**
+    ///
+    /// `wanted` is `(id, draw_order_weight, default_enabled)` for every handler
+    /// the registry serves; a layer joins only if [`LayerStack::admits`] says
+    /// so, at the position `weight_of` puts it in among the slots that already
+    /// have weights.
+    ///
+    /// **The name is now a promise this call does not keep, and that is the
+    /// point.** It used to fill in every hole, which is what made a pane's
+    /// stack a complete projection of the build's catalogue; a layer that ships
+    /// off now waits in the catalogue, and one the user removed never comes
+    /// back. The reconcile a saved order still gets — a layer this build serves
+    /// that the file never named landing at its weight position rather than on
+    /// top — is unchanged for the layers that do join.
     pub fn insert_missing_slots(
         &mut self,
         wanted: &[(LayerId, u32, bool)],
         weight_of: &dyn Fn(&LayerId) -> Option<u32>,
     ) {
-        for (id, weight, enabled) in wanted {
-            if self.layers.iter().any(|slot| slot.id == *id) {
+        for (id, weight, default_on) in wanted {
+            if !self.layers.admits(id, *default_on) {
                 continue;
             }
-            let pos = self
-                .layers
-                .iter()
-                .position(|slot| weight_of(&slot.id).is_some_and(|w| w > *weight));
-            let slot = LayerSlot::new(id.clone(), *enabled);
-            match pos {
-                Some(pos) => self.layers.insert(pos, slot),
-                None => self.layers.push(slot),
-            }
+            self.insert_slot_at_weight(LayerSlot::new(id.clone(), *default_on), *weight, weight_of);
         }
+    }
+
+    /// Put `slot` in at the position `weight` earns it: above every slot whose
+    /// own weight is lower, below the first that is higher, and on top of the
+    /// stack when nothing above it has a weight at all (a stack of ids from a
+    /// newer build).
+    fn insert_slot_at_weight(
+        &mut self,
+        slot: LayerSlot,
+        weight: u32,
+        weight_of: &dyn Fn(&LayerId) -> Option<u32>,
+    ) {
+        let pos = self
+            .layers
+            .iter()
+            .position(|held| weight_of(&held.id).is_some_and(|w| w > weight));
+        match pos {
+            Some(pos) => self.layers.insert(pos, slot),
+            None => self.layers.push(slot),
+        }
+    }
+
+    /// **Whether `id` may be curated out of this pane, and why not when it may
+    /// not** — the sentence the stack row's disabled trash can shows on hover.
+    ///
+    /// **One id is named, and it is named because the pane already names it.**
+    /// The radar slot is not just another layer here: its `config` is where
+    /// this pane keeps its own site, product, elevation and live-chunk switch
+    /// ([`RADAR_SLOT_PANE_KEYS`], which exist precisely because that slot has
+    /// two owners), its [`LayerTimeState`] is what [`Self::loop_state`]
+    /// returns, and [`Self::overlay_texture_releasable`] exempts its texture by
+    /// name. Removing it would not hide a picture, it would delete the pane's
+    /// whole selection. So a radar pane keeps its radar layer, and the control
+    /// says so rather than being absent or silently doing nothing.
+    ///
+    /// Everything else is removable, the colour scale included: it is a legend
+    /// drawn over the map with no pane state hanging off it, the eye already
+    /// hides it, and a user who wants the screen back should be able to have
+    /// it.
+    pub fn layer_removal_refusal(&self, id: &LayerId) -> Option<&'static str> {
+        (*id == known::RADAR).then_some(
+            "The radar layer holds this pane's site, product and tilt - hide \
+             it with the eye instead",
+        )
+    }
+
+    /// **Curate `id` out of this pane's stack.**
+    ///
+    /// Not a disable: the slot leaves the list, so every question that reads
+    /// the stack — [`Self::is_overlay_enabled`], the draw loop's per-layer
+    /// gate, `Gui::any_pane_has_overlay_enabled` and the poll term hanging off
+    /// it — answers "no" structurally rather than by a flag someone has to
+    /// remember to write. What the layer held goes with it: the slot carries
+    /// its own [`LayerTimeState`] (frames, playhead, `rendered_for` render
+    /// marks) and dropping the slot drops all of it, and the texture cache is
+    /// released through the very call the disable path ends with
+    /// ([`Self::release_disabled_overlay_textures`], whose predicate already
+    /// reads "no slot" as releasable), then dropped outright so an unused cache
+    /// entry does not outlive the layer.
+    ///
+    /// Returns `false`, changing nothing, for a layer this pane does not hold
+    /// or may not remove.
+    pub fn remove_layer(&mut self, id: &LayerId) -> bool {
+        if self.layer_removal_refusal(id).is_some() {
+            return false;
+        }
+        if self.layers.take_out(id).is_none() {
+            return false;
+        }
+        self.release_disabled_overlay_textures();
+        self.overlay_textures.remove(id);
+        true
+    }
+
+    /// **Curate `id` into this pane's stack**, at its own draw-order weight,
+    /// with whatever configuration it held when it last left.
+    ///
+    /// The other half of [`Self::remove_layer`], and the catalogue's real
+    /// "add". A layer already in the stack is left exactly where it is —
+    /// adding twice is not a reorder — and answers `false`.
+    pub fn add_layer(
+        &mut self,
+        registry: &rustdar_overlays::render::overlay_state::OverlayRegistry,
+        id: &LayerId,
+    ) -> bool {
+        if self.layers.holds(id) {
+            return false;
+        }
+        let Some(handler) = registry.handler_by_id(id) else {
+            // An id no handler serves has no weight to sort by and nothing to
+            // draw; the catalogue cannot offer one, and neither can this.
+            return false;
+        };
+        let weight = handler.draw_order_weight();
+        let weights: HashMap<LayerId, u32> = registry
+            .handlers()
+            .map(|h| (h.id(), h.draw_order_weight()))
+            .collect();
+        let mut slot = LayerSlot::new(id.clone(), true);
+        // The settings it left with, not a fresh default: a removal the user
+        // undoes should cost them nothing. `Null` for a layer that saved
+        // nothing, which is the same "ask the handler" an absent slot has
+        // always meant.
+        slot.config = self.layers.saved_config_of_removed(id);
+        self.insert_slot_at_weight(slot, weight, &|id| weights.get(id).copied());
+        true
     }
 
     pub fn is_overlay_enabled(&self, id: &LayerId) -> bool {
@@ -2201,12 +2323,27 @@ impl PaneState {
                 .is_some_and(|volume| volume.rendered_for.as_ref() != Some(target))
     }
 
+    /// Turn `id` on or off in this pane's stack.
+    ///
+    /// **Turning a layer this pane does not hold ON adds it**, at the top —
+    /// switching a layer on is an explicit ask for it, and a slotless layer has
+    /// no place in the draw order to be toggled into. (The catalogue takes the
+    /// better route and calls [`Self::add_layer`], which lands the slot at its
+    /// own draw-order weight.)
+    ///
+    /// **Turning a layer this pane does not hold OFF does nothing**, and that
+    /// asymmetry is load-bearing since the stack became curated: a pane that
+    /// has removed a layer already draws it in no sense at all, and minting a
+    /// disabled slot to record the fact would hand the layer straight back as a
+    /// row. `apply_preset` is the caller this matters to — it walks the whole
+    /// registry writing `on` for the layers its preset names and `off` for
+    /// every other one, and the old unconditional push would have resurrected
+    /// every removed layer in the pane the preset was applied to.
     pub fn set_overlay_enabled(&mut self, id: LayerId, enabled: bool) {
         match self.slot_mut(&id) {
             Some(slot) => slot.enabled = enabled,
-            // A layer with no slot has no place in the draw order either, so
-            // it joins at the top rather than being toggled into invisibility.
-            None => self.layers.push(LayerSlot::new(id, enabled)),
+            None if enabled => self.layers.push(LayerSlot::new(id, true)),
+            None => {}
         }
     }
 
@@ -2228,14 +2365,20 @@ impl PaneState {
     /// configs and leaves every pane where it was on the clock. Before the
     /// timeline lived on the slot it was a separate field this call could not
     /// reach, and that behaviour is what is preserved here.
-    pub fn adopt_layers(&mut self, layers: &[LayerSlot]) {
+    pub fn adopt_layers(&mut self, layers: &LayerStack) {
         let mut mine: Vec<(LayerId, LayerTimeState)> = self
             .layers
-            .drain(..)
+            .take_slots()
+            .into_iter()
             .map(|slot| (slot.id, slot.time))
             .collect();
-        self.layers = layers.to_vec();
-        for slot in &mut self.layers {
+        // **The whole stack, tombstones included.** A linked group shares one
+        // layer arrangement, and a curation is part of the arrangement: a copy
+        // that brought the slots but not the removals would let the
+        // destination pane's next reconcile hand back every layer the user
+        // just removed from the group.
+        self.layers.adopt(layers);
+        for slot in self.layers.iter_mut() {
             if let Some(pos) = mine.iter().position(|(id, _)| *id == slot.id) {
                 slot.time = mine.remove(pos).1;
             }
@@ -2380,7 +2523,24 @@ impl PaneState {
         id: &LayerId,
         enabled: bool,
     ) {
+        if !self.layers.holds(id) {
+            // **Switching a layer this pane does not hold ON adds it**, at its
+            // own draw-order weight and with whatever it held when it last
+            // left — [`Self::add_layer`] is the one door for that, so the
+            // catalogue's tile, the inspector's Show toggle and this all land
+            // the slot in the same place. Switching one OFF does nothing:
+            // there is nothing to hide, and minting a disabled slot to say so
+            // would put a removed layer back in the list as a row.
+            if enabled {
+                self.add_layer(registry, id);
+            } else {
+                return;
+            }
+        }
         let Some(slot) = self.layers.iter_mut().find(|slot| slot.id == *id) else {
+            // Unreachable through `add_layer` above, which only declines an id
+            // no handler serves — and this pane holds no slot for one of those
+            // either.
             self.set_overlay_enabled(id.clone(), enabled);
             return;
         };
@@ -2445,11 +2605,15 @@ impl PaneState {
                 merge_radar_slot(&mut slot.config, &fresh);
             }
         }
-        // A registered handler this pane has no slot for at all: it joins the
-        // stack, exactly as the old `extend` gave it a map entry.
+        // A registered handler this pane has no slot for: it is *offered* the
+        // stack, which takes it only if [`LayerStack::admits`] agrees — a
+        // default-on layer this pane has never removed. A layer that ships off
+        // waits in the catalogue and one the user removed stays removed, so the
+        // save that follows this call can no longer quietly re-complete a stack
+        // the user curated.
         let missing: Vec<(LayerId, u32, bool)> = registry
             .handlers()
-            .filter(|h| !self.layers.iter().any(|slot| slot.id == h.id()))
+            .filter(|h| self.layers.admits(&h.id(), h.default_enabled()))
             .map(|h| (h.id(), h.draw_order_weight(), h.default_enabled()))
             .collect();
         if !missing.is_empty() {
