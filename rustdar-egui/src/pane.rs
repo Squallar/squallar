@@ -497,6 +497,18 @@ pub struct LayerTimeState {
     /// The window this layer's frames were listed for, in seconds — the extent
     /// the arrival path slides as newer frames land.
     pub span_secs: u64,
+    /// **The exact window the in-flight listing was asked over**, recorded at
+    /// dispatch and compared whole when a listing lands. [`Self::span_secs`]
+    /// alone cannot tell two asks apart: a deep-scrub refill's window is by
+    /// construction the same width as a live enable's, anchored somewhere
+    /// else entirely, and matching on the width filed one pane's era into
+    /// another pane's loop. Every producer echoes the range it was dispatched
+    /// with verbatim, so the comparison is exact equality, not tolerance.
+    ///
+    /// Meaningful while [`Self::phase`] is [`LoopPhase::FetchingScanList`];
+    /// after the listing is accepted it is only the record of the last ask,
+    /// and the arrival path stops consulting it.
+    pub asked_range: Option<(NaiveDateTime, NaiveDateTime)>,
     /// **What the source answered when asked which frames exist.** `None`
     /// until a listing has been accepted through the contract; the frames the
     /// pane actually holds are [`Self::frames`], and this is the answer they
@@ -953,6 +965,7 @@ impl LayerTimeState {
             playhead_qualifies: true,
             frames: Vec::new(),
             span_secs: 0,
+            asked_range: None,
             listing: None,
             sampled: None,
             cadence_secs: None,

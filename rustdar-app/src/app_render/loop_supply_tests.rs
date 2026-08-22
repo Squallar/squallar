@@ -233,6 +233,9 @@ fn awaiting_listing(
         rustdar_radar::types::RenderView::PlanView,
         Box::new(()),
     );
+    // What the production dispatch records beside the phase: the window the
+    // ask covered, which is what the arrival is matched on.
+    pane.time_state_mut(&supply_id()).asked_range = Some(range);
     assert_eq!(
         pane.time_state(&supply_id()).phase,
         rustdar_egui::pane::LoopPhase::FetchingScanList,
@@ -700,6 +703,7 @@ fn the_radar_arm_produces_the_same_loop_it_always_did() {
             },
             rustdar_radar::types::RenderView::PlanView,
         );
+        pane.loop_state_mut().asked_range = Some(range);
     }
 
     app.channels
@@ -860,5 +864,173 @@ fn enabling_a_forecast_loop_through_the_action_ends_with_frames_on_the_pane() {
         (window.1 - window.0).num_seconds() as u64,
         "and the recorded span is the window that was listed for, which is \
          the thing the arrival matches on",
+    );
+}
+
+// ── The window, not its width ─────────────────────────────────────────────
+
+/// **Two panes, one layer, equal spans, two eras — each pane ends with its
+/// own window's frames, whichever listing lands first.**
+///
+/// The reachable wrong picture: pane 0 loops the latest hour; pane 1 was
+/// refilled over an hour of 1997 after a deep scrub. Both wait in
+/// `FetchingScanList` and both windows are 3600 s wide, so a match on the
+/// width alone answers whichever pane it reaches first with whichever listing
+/// lands first — pane 0 presents 1997's frames as the latest hour, or pane 1
+/// presents 2024's as 1997. A confidently wrong picture, not a missing one.
+/// What separates them is the exact window each pane recorded when it asked
+/// (`asked_range`), which every producer echoes verbatim.
+///
+/// Driven through the production arrival path (`SourceEvent::Frames` in, the
+/// registry's own `list_frames` back out), in both delivery orders.
+///
+/// **Floor, run and observed:** revert the `waiting` filter in
+/// `accept_loop_scan_listings` to `span_secs` and the first listing to land
+/// builds BOTH panes — the archive-first order fails with pane 0 holding
+/// `1997-06-15` stamps where `2024-01-01` ones were asked, and the
+/// modern-first order fails pane 1 the mirrored way. Make the filter match
+/// nothing instead and both panes sit empty in `FetchingScanList`, which the
+/// phase assertion names.
+fn each_loop_ask_gets_its_own_era(modern_listing_first: bool) {
+    // Two anchors 27 years apart, one span. Four frames inside each hour,
+    // every one carrying its own era on its face.
+    let hour_before = |anchor: chrono::NaiveDateTime| {
+        let range = (anchor - chrono::Duration::seconds(3600), anchor);
+        let frames: Vec<chrono::NaiveDateTime> = (0..4)
+            .rev()
+            .map(|i| anchor - chrono::Duration::minutes(15 * i))
+            .collect();
+        (range, frames)
+    };
+    let (modern_range, modern) = hour_before(ts(12 * 60));
+    let archive_anchor = chrono::NaiveDate::from_ymd_opt(1997, 6, 15)
+        .unwrap()
+        .and_hms_opt(7, 0, 0)
+        .unwrap();
+    let (archive_range, archive) = hour_before(archive_anchor);
+    assert_eq!(
+        modern_range.1 - modern_range.0,
+        archive_range.1 - archive_range.0,
+        "premise: the two windows must be exactly one width, or the width \
+         could be what separates them and this test is about nothing",
+    );
+
+    // One layer holding both eras, as the real archive does.
+    let mut listed = archive.clone();
+    listed.extend(modern.iter().copied());
+    let asked: Arc<Mutex<Asked>> = Default::default();
+    let mut app = crate::app::tests::n_pane_app(2, "KTLX");
+    app.gui.overlays = OverlayRegistry::with_handlers(vec![Box::new(SupplyLayer {
+        id: supply_id(),
+        listed,
+        resident: Vec::new(),
+        asked: Arc::clone(&asked),
+    })]);
+    awaiting_listing(&mut app, 0, modern_range);
+    awaiting_listing(&mut app, 1, archive_range);
+
+    let deliveries = if modern_listing_first {
+        [
+            (modern_range, modern.clone()),
+            (archive_range, archive.clone()),
+        ]
+    } else {
+        [
+            (archive_range, archive.clone()),
+            (modern_range, modern.clone()),
+        ]
+    };
+    for (range, frames) in deliveries {
+        deliver(&mut app, range, frames);
+    }
+
+    for (pane_idx, expected, range) in [
+        (0usize, &modern, modern_range),
+        (1, &archive, archive_range),
+    ] {
+        let ls = app
+            .gui
+            .pane(pane_idx)
+            .expect("the fixture built two panes")
+            .time_state(&supply_id());
+        assert_eq!(
+            ls.phase,
+            rustdar_egui::pane::LoopPhase::Rendering,
+            "pane {pane_idx} must have been built by its own listing — a \
+             loop still fetching here means the arrival matched nothing",
+        );
+        assert_eq!(
+            &ls.frames.iter().map(|f| f.timestamp).collect::<Vec<_>>(),
+            expected,
+            "pane {pane_idx} asked about {}..{} and holds another era's \
+             stamps: one pane's window was answered with the other's listing",
+            range.0,
+            range.1,
+        );
+    }
+}
+
+#[test]
+fn two_loop_asks_with_equal_spans_each_get_their_own_era_modern_listing_first() {
+    each_loop_ask_gets_its_own_era(true);
+}
+
+#[test]
+fn two_loop_asks_with_equal_spans_each_get_their_own_era_archive_listing_first() {
+    each_loop_ask_gets_its_own_era(false);
+}
+
+/// **A re-enable a second later is answered by its own ask, not its
+/// predecessor's.** Two enables of the "same" window issued a second apart
+/// have different `now` anchors, so their ranges differ by a second at both
+/// ends. The stale ask's listing finds no waiting pane — its replacement is
+/// already in the air — and the pane keeps waiting; the current ask's listing
+/// is what builds the loop. Refusing the stale answer loses nothing: the
+/// fresh one was dispatched at re-enable and lands on its heels.
+///
+/// The other half of the crossed-wires floor: a matcher that answers nobody
+/// fails here at the final phase assertion, so "match the window" cannot be
+/// weakened to "match nothing".
+#[test]
+fn a_re_enabled_loop_is_answered_by_its_own_latest_ask() {
+    let listed: Vec<chrono::NaiveDateTime> = (1..=4).map(|i| ts(-10 * i)).rev().collect();
+    let (mut app, _asked) = app_with_supply(listed.clone(), Vec::new());
+    let first = (ts(0) - chrono::Duration::seconds(3600), ts(0));
+    let second = (
+        first.0 + chrono::Duration::seconds(1),
+        first.1 + chrono::Duration::seconds(1),
+    );
+    awaiting_listing(&mut app, 0, first);
+    // The re-enable, one second later: the recorded ask moves with it.
+    awaiting_listing(&mut app, 0, second);
+
+    // The stale ask's answer lands first, as it will whenever the listings
+    // come back in dispatch order.
+    deliver(&mut app, first, listed.clone());
+    {
+        let ls = app.gui.pane(0).expect("a pane").time_state(&supply_id());
+        assert!(
+            ls.frames.is_empty(),
+            "the superseded ask's listing built the loop over an anchor the \
+             pane no longer asks about; its replacement is in the air",
+        );
+        assert_eq!(
+            ls.phase,
+            rustdar_egui::pane::LoopPhase::FetchingScanList,
+            "and the pane is still waiting on the ask it actually holds",
+        );
+    }
+
+    deliver(&mut app, second, listed.clone());
+    let ls = app.gui.pane(0).expect("a pane").time_state(&supply_id());
+    assert_eq!(
+        ls.frames.iter().map(|f| f.timestamp).collect::<Vec<_>>(),
+        listed,
+        "the loop's own latest ask must build it",
+    );
+    assert_eq!(
+        ls.phase,
+        rustdar_egui::pane::LoopPhase::Rendering,
+        "a loop whose own listing landed is building, not fetching",
     );
 }

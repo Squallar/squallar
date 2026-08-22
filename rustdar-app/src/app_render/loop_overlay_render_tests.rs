@@ -278,6 +278,9 @@ pub(super) fn build_loop(
         rustdar_radar::types::RenderView::PlanView,
         Box::new(()),
     );
+    // What the production dispatch records beside the phase: the window the
+    // ask covered, which is what the arrival is matched on.
+    pane.time_state_mut(&known::MODEL_DATA).asked_range = Some(range);
     app.channels
         .overlay_fetch_sender
         .send(SourceEvent::Frames {
