@@ -525,6 +525,9 @@ pub(crate) struct TimelineProbe {
     pub loop_toggle: (egui::Rect, bool),
     /// The scrubber slider.
     pub scrubber: egui::Rect,
+    /// The fraction of the archive rail the handle was drawn at this frame —
+    /// `None` while the loop (frame-index) rail is up instead.
+    pub scrub_frac: Option<f32>,
     /// The timestamp button, and the text it showed.
     pub timestamp: (egui::Rect, String),
     /// The age chip's text — empty when there is no data time to age.
@@ -550,6 +553,7 @@ impl Default for TimelineProbe {
             step_dropdown: egui::Rect::NOTHING,
             loop_toggle: (egui::Rect::NOTHING, false),
             scrubber: egui::Rect::NOTHING,
+            scrub_frac: None,
             timestamp: (egui::Rect::NOTHING, String::new()),
             age_text: String::new(),
             expander: egui::Rect::NOTHING,
@@ -570,6 +574,25 @@ impl Default for TimelineProbe {
 /// layer's own window, and `Gui::tuning_scope_caption` adds that figure when
 /// the two differ.
 const TUNING_SCOPE_CAPTION: &str = "Lookback and Speed apply to every pane, linked or not.";
+
+/// The word the time chip prints beside its stamp, for the pane that supplied
+/// it (WI-9). Three-way, and the stamp outranks the posture: a stamp after the
+/// wall clock is a **forecast** whatever [`PaneState::viewing_live`] says —
+/// a pane parked on a forecast frame still follows its live site, and calling
+/// that picture "live" is the misreading this word exists to close.
+fn chip_word(
+    pane: &crate::pane::PaneState,
+    t: Option<chrono::NaiveDateTime>,
+    now: chrono::NaiveDateTime,
+) -> &'static str {
+    if t.is_some_and(|t| t > now) {
+        "forecast"
+    } else if pane.viewing_live {
+        "live"
+    } else {
+        "archive"
+    }
+}
 
 /// `secs` as a window a reader can hold: whole hours where it is whole hours,
 /// minutes otherwise.
@@ -748,12 +771,9 @@ impl super::Gui {
                 super::shell::chrome_frame(&ctx.global_style()).show(ui, |ui| {
                     super::fade::dim(ui, opacity);
                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                    let (_, live) = self.chip_time_source();
-                    let chip = ui.button(format!(
-                        "\u{23f1} {} - {}",
-                        self.active_time_label(),
-                        if live { "live" } else { "archive" }
-                    ));
+                    let (_, word) = self.chip_time_source();
+                    let chip =
+                        ui.button(format!("\u{23f1} {} - {}", self.active_time_label(), word));
                     if chip.clicked() {
                         self.timeline_collapsed = false;
                     }
@@ -769,23 +789,33 @@ impl super::Gui {
         let _ = area;
     }
 
-    /// The time the chips describe, and whether its source pane is live —
+    /// The time the chips describe, and the word that annotates it —
     /// with the fallback that keeps a non-map active pane honest (the
     /// first-run `--:--:--` finding): the active pane's on-screen time,
     /// else the static [`PaneState::data_time`] it carries whatever its
-    /// kind, else the freshest visible pane's on-screen time. The
-    /// live/archive flag travels with whichever pane supplied the time, so
-    /// the annotation describes the time actually shown.
-    pub(super) fn chip_time_source(&self) -> (Option<chrono::NaiveDateTime>, bool) {
+    /// kind, else the freshest visible pane's on-screen time. The word
+    /// travels with whichever pane supplied the time, so the annotation
+    /// describes the time actually shown.
+    ///
+    /// **The fallback runs only for a pane with no transport timeline**
+    /// (WI-9). A pane whose transport is active owns its answer even while
+    /// the playhead has no frame to name — borrowing another pane's clock
+    /// there is how a forecast loop got captioned with a neighbour's radar
+    /// stamp.
+    pub(super) fn chip_time_source(&self) -> (Option<chrono::NaiveDateTime>, &'static str) {
+        let now = chrono::Utc::now().naive_utc();
         let active = &self.panes[self.active_pane];
-        if let Some(t) = active.data_time_on_screen().or(active.data_time) {
-            return (Some(t), active.viewing_live);
+        let own = active.data_time_on_screen().or(active.data_time);
+        if own.is_some() || active.transport_state().is_active() {
+            return (own, chip_word(active, own, now));
         }
         self.panes()
             .iter()
-            .filter_map(|pane| pane.data_time_on_screen().map(|t| (t, pane.viewing_live)))
-            .max_by_key(|&(t, _)| t)
-            .map_or((None, active.viewing_live), |(t, live)| (Some(t), live))
+            .filter_map(|pane| pane.data_time_on_screen().map(|t| (t, pane)))
+            .max_by(|a, b| a.0.cmp(&b.0))
+            .map_or((None, chip_word(active, None, now)), |(t, pane)| {
+                (Some(t), chip_word(pane, Some(t), now))
+            })
     }
 
     /// The time of [`Self::chip_time_source`], as the timestamp button, the
@@ -800,17 +830,13 @@ impl super::Gui {
 
     /// Row 1: the always-on transport.
     fn render_timeline_row1(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
-        let (source_time, source_live) = self.chip_time_source();
+        let (source_time, source_word) = self.chip_time_source();
         let age_text = source_time
             .map(|collected| {
                 super::statusbar::format_product_age(chrono::Utc::now().naive_utc() - collected)
             })
             .unwrap_or_default();
-        let stamp_text = format!(
-            "{} - {}",
-            self.active_time_label(),
-            if source_live { "live" } else { "archive" }
-        );
+        let stamp_text = format!("{} - {}", self.active_time_label(), source_word);
 
         let narrow = !self.timeline_row1_fits(ui, &stamp_text, &age_text);
 
@@ -930,6 +956,11 @@ impl super::Gui {
     ) {
         let pane_idx = self.active_pane;
         let viewing_live = self.panes[pane_idx].viewing_live;
+        // The forward-step's real question (WI-10): is there anywhere forward
+        // of here? At the live edge there is not; parked on a forecast frame
+        // there is — whatever `viewing_live` says about the selection posture.
+        let at_live_edge =
+            viewing_live && !self.panes[pane_idx].depicts_future(chrono::Utc::now().naive_utc());
 
         let live_button = if viewing_live {
             egui::Button::new("\u{23fa} Live")
@@ -967,11 +998,11 @@ impl super::Gui {
         }
 
         let fwd = ui
-            .add_enabled(!viewing_live, egui::Button::new("\u{23f5}"))
+            .add_enabled(!at_live_edge, egui::Button::new("\u{23f5}"))
             .on_hover_text("Forward one step");
         #[cfg(test)]
         {
-            self.probes.last_timeline.fwd = (fwd.rect, !viewing_live);
+            self.probes.last_timeline.fwd = (fwd.rect, !at_live_edge);
         }
         if fwd.clicked() {
             match step {
@@ -1125,10 +1156,22 @@ impl super::Gui {
 
         let regions = self.rail_regions(pane_idx);
         let now = chrono::Utc::now().naive_utc();
-        let resting = if self.panes[pane_idx].viewing_live {
+        // `viewing_live` alone is the wrong question here (WI-10): a pane
+        // parked on a forecast frame still follows its live site, and resting
+        // the handle on the `now` boundary would paint it hours left of the
+        // instant the pane depicts.
+        let pane = &self.panes[pane_idx];
+        let resting = if pane.viewing_live && !pane.depicts_future(now) {
             regions.split
         } else {
-            match self.panes[pane_idx].data_time_on_screen() {
+            // What the handle marks is the instant on screen. A forecast park
+            // has no collected stamp there, so the clock is the mark; anywhere
+            // else the data stamp stays the honest position.
+            let marked = match pane.time.mode {
+                TimeMode::AsOf(t) if t > now => Some(t),
+                _ => pane.data_time_on_screen(),
+            };
+            match marked {
                 Some(t) => regions.frac_of_offset((t - now).num_seconds() as f32),
                 None => regions.split,
             }
@@ -1145,6 +1188,7 @@ impl super::Gui {
                 .widget_id_probes
                 .push(("timeline_scrubber", scrub.id));
             self.probes.last_timeline.scrubber = scrub.rect;
+            self.probes.last_timeline.scrub_frac = Some(frac);
         }
         let travel_px = slider_travel_px(scrub.rect, ui.style().visuals.handle_shape);
         if scrub.drag_stopped() {
