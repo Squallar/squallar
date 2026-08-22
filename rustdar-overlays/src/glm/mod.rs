@@ -7,14 +7,7 @@
 
 use rustdar_source::origins::DataSources;
 
-// `cf` and `h5` are NOT GLM-specific and are named from outside `glm::`:
-// `cf` is the CF-convention unpacking standard and `h5` is NetCDF4-over-HDF5
-// access. `crate::gmgsi` reads its granules through both. They stay here only
-// because this is where they were first needed; the module path is the one
-// thing about them that still says "GLM".
-pub(crate) mod cf;
 pub mod fetch;
-pub(crate) mod h5;
 #[cfg(test)]
 mod tests;
 

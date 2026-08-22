@@ -4323,6 +4323,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustdar-netcdf"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hdf5-pure",
+ "log",
+ "serde_json",
+]
+
+[[package]]
 name = "rustdar-nmea-serial"
 version = "0.1.0"
 dependencies = [
@@ -4347,6 +4357,7 @@ dependencies = [
  "reqwest 0.13.4",
  "roxmltree 0.21.1",
  "rustdar-geo",
+ "rustdar-netcdf",
  "rustdar-source",
  "rustdar-units",
  "serde",

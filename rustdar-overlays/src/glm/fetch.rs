@@ -8,12 +8,12 @@ use std::collections::HashMap;
 use chrono::{NaiveDateTime, TimeDelta, Utc};
 use rustdar_source::origins::DataSources;
 
-use super::cf;
 use super::{
     DeadFeed, FetchFailures, GLM_MIN_TIME_WINDOW_SECS, GlmDataLevel, GlmFetchOutcome, GlmFlash,
     GlmSatellite, LevelFailure, RecordDrops, WindowGap,
 };
 use crate::fetch_policy::{FetchError, NotFound};
+use rustdar_netcdf::cf;
 
 #[derive(Clone)]
 struct CachedGranule {
@@ -616,9 +616,9 @@ pub(crate) trait VarSource {
     fn time_coverage_start(&self) -> Option<String>;
 }
 
-impl VarSource for super::h5::Granule {
+impl VarSource for rustdar_netcdf::Granule {
     fn read_unpacked(&self, name: &str) -> Result<Option<cf::UnpackedVar>, String> {
-        super::h5::Granule::read_unpacked(self, name)
+        rustdar_netcdf::Granule::read_unpacked(self, name)
     }
     fn time_coverage_start(&self) -> Option<String> {
         self.global_str("time_coverage_start")
@@ -630,7 +630,7 @@ pub(crate) fn parse_glm_netcdf(
     satellite: GlmSatellite,
     levels: &[GlmDataLevel],
 ) -> Result<GranuleParse, String> {
-    let file = super::h5::Granule::open(data)?;
+    let file = rustdar_netcdf::Granule::open(data)?;
     parse_with_source(&file, satellite, levels)
 }
 

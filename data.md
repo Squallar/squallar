@@ -130,7 +130,7 @@ the map by the client. A national mosaic is a different data model.
   reflectivity — a different quantity with its own colour table, not a drop-in.
   Verified from a granule: 18000 × 6501 `short` values, `scale_factor` 0.1,
   units `mm/h`, on a plain 0.02° lat/lon grid running exactly 70°N to 60°S.
-  Delivered as **NetCDF4, which is HDF5** — the same container `glm::h5`
+  Delivered as **NetCDF4, which is HDF5** — the same container `rustdar-netcdf`
   already reads with `hdf5-pure`. Sub-prefixes are `BLEND/` plus per-satellite
   `G16/`, `G18/`, `G19/`, `Himawari-9/`; `BLEND` is the global one. New
   granules every 10 minutes.
@@ -401,7 +401,7 @@ them.
 
 ### The ABI decoder is closer than the ❌ suggests
 
-GLM L2 LCFA is NetCDF4, which is HDF5, and `glm::h5` already reads it with
+GLM L2 LCFA is NetCDF4, which is HDF5, and `rustdar-netcdf` already reads it with
 `hdf5-pure`. ABI L2 CMI is NetCDF4 too, and so — verified above — are GMGSI and
 RRQPE. The container is solved for all four. What ABI alone still needs is the
 GOES fixed-grid (geostationary perspective) → Mercator reprojection. GMGSI and
@@ -454,7 +454,7 @@ endpoint is trivial.
 | NEXRAD Level II (LDM records, Msg 31)                | `vendor/nexrad-decode`, `vendor/nexrad-data`, `vendor/bzip2-rs` |
 | NEXRAD Level III (WMO, zlib/BZ2, radial packets)     | `nexrad-level3`                                                 |
 | GRIB2 — DRT 5.3 (complex + spatial diff), 5.41 (PNG) | `grib` 0.17.1, `default-features = false`                       |
-| HDF5 / NetCDF4                                       | `hdf5-pure` (`glm::h5`)                                         |
+| HDF5 / NetCDF4                                       | `hdf5-pure` (`rustdar-netcdf`)                                         |
 | GeoJSON / JSON                                       | `serde_json`                                                    |
 | XML (S3 `ListObjectsV2`)                             | `xml` crate (`archive.rs`); `roxmltree` in `glm::fetch`, `mrms::fetch` |
 | XML / RSS (SPC mesoscale discussions)                | `roxmltree`                                                     |

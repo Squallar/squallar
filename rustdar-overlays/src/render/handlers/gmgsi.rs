@@ -452,7 +452,7 @@ impl OverlayHandler for GmgsiHandler {
     /// longitude, finer than a tooltip needs.
     ///
     /// **A `_FillValue` point answers `None`**, because
-    /// [`crate::glm::cf::unpack`] marked it missing and [`crate::gmgsi::decode`]
+    /// [`rustdar_netcdf::cf::unpack`] marked it missing and [`crate::gmgsi::decode`]
     /// carried that through as a `NaN`. The guard is
     /// [`GridCoords::cell_span_degrees`], which is *local* on this grid — the
     /// rows span 0.029 degrees at the equator and 0.068 at the top — so one

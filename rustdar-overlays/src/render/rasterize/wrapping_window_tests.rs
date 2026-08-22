@@ -52,7 +52,8 @@ fn gmgsi() -> (GridCoords, GeoBounds) {
         include_bytes!(
             "../../../testdata/\
              GLOBCOMPLIR_v3r0_blend_s202506011200000_e202506011209599_c202506011234579.nc"
-        ),
+        )
+        .to_vec(),
         crate::gmgsi::GmgsiChannel::LongwaveIr,
     )
     .expect("the committed granule decodes");
@@ -197,7 +198,8 @@ fn the_granules_own_picture_does_not_move() {
         include_bytes!(
             "../../../testdata/\
              GLOBCOMPLIR_v3r0_blend_s202506011200000_e202506011209599_c202506011234579.nc"
-        ),
+        )
+        .to_vec(),
         crate::gmgsi::GmgsiChannel::LongwaveIr,
     )
     .expect("the committed granule decodes");

@@ -10,6 +10,7 @@ members = [
     "rustdar-web",
     "rustdar-egui",
     "rustdar-radar",
+    "rustdar-netcdf",
     "rustdar-overlays",
     "rustdar-source",
     "rustdar-geo",
@@ -53,6 +54,7 @@ rustdar-egui = { path = "rustdar-egui" }
 rustdar-geo = { path = "rustdar-geo" }
 rustdar-gpu = { path = "rustdar-gpu" }
 rustdar-kv = { path = "rustdar-kv" }
+rustdar-netcdf = { path = "rustdar-netcdf" }
 rustdar-overlays = { path = "rustdar-overlays" }
 rustdar-radar = { path = "rustdar-radar" }
 rustdar-source = { path = "rustdar-source" }
