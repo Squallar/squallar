@@ -31,12 +31,26 @@ const COLLAPSE_LABEL: &str = "\u{2039}";
 /// the same catalog: the list can be taller than the panel, and the way in is
 /// wanted at whichever end the scroll left the user.
 ///
-/// It says "show", not "add", because nothing is ever added. Every pane holds
-/// a slot for every registered layer for as long as it exists (`pane.rs`,
-/// `layer_glue.rs`) — that always-full list is what makes adding a source one
-/// crate's work — so the rows below are the whole inventory and the catalog
-/// only turns one of them on.
-const ADD_LAYER_LABEL: &str = "+ Show a layer";
+/// **It says "add" again, and now it is true.** W21 renamed it to "show"
+/// because at the time nothing was ever added: every pane held a slot for every
+/// registered layer for as long as it existed, so the rows below were the whole
+/// inventory and the catalog could only turn one of them on. The rename was the
+/// honest description of a broken shape, not a fix for it. The stack is a
+/// curated list now (`pane/layer_stack.rs`), the catalog's tiles really do
+/// insert a row, and the label goes back to naming what the button does.
+pub(crate) const ADD_LAYER_LABEL: &str = "+ Add layer";
+
+/// The per-row remove control's glyph: a wastebasket, U+1F5D1.
+///
+/// **Probed, not assumed** (`ui_glyphs.rs` and the coverage test that walks
+/// it): egui's bundled proportional family carries this one, and carries
+/// *none* of U+2716, U+2715, U+2296, U+232B or U+2326 — the ASCII-adjacent
+/// marks a reader reaches for first are exactly the ones that would have drawn
+/// a tofu box. U+00D7 does exist there and is deliberately not used: it is the
+/// app's close/dismiss glyph and nothing else, and a destructive control
+/// wearing the dismissal glyph is the defect the catalog's preset delete was
+/// already written to avoid.
+const REMOVE_LABEL: &str = "\u{1f5d1}";
 
 /// The layer-less body's route to where the pane's real controls live (plan
 /// the plan): a pane that draws no map layers has no rows, and a panel that were
@@ -62,8 +76,8 @@ const GRIP_DOT_SPACING: f32 = 5.0;
 /// on the wider widths the panel *is* visibly the desktop's, and the line
 /// would restate the screen.
 const SHEET_HELPER_CAPTION: &str = "The same layer stack as on a desktop: \
-    rows select a layer, \u{1f441} hides it, dragging the grip sets what \
-    draws over what.";
+    rows select a layer, \u{1f441} hides it, \u{1f5d1} takes it out of this \
+    pane, dragging the grip sets what draws over what.";
 
 /// One row the stack actually drew, as it was drawn. Reported by the
 /// renderer, never rebuilt by a test — see `ui_menu::DrawnMenuLeaf` for the
@@ -81,6 +95,13 @@ pub(crate) struct StackRowProbe {
     pub eye: egui::Rect,
     /// The enabled state the eye was drawn showing.
     pub eye_on: bool,
+    /// The 🗑 remove control — drawn on every row, so the answer to "can this
+    /// layer be removed" is visible rather than inferred from an absence.
+    pub remove: egui::Rect,
+    /// Whether the remove control was drawn live. `false` is a structural
+    /// layer's greyed can, whose hover says why (see
+    /// [`PaneState::layer_removal_refusal`](crate::pane::PaneState::layer_removal_refusal)).
+    pub remove_enabled: bool,
     /// The drag grip — the reorder affordance, and the only part of the row
     /// that senses a drag (a swipe on the body scrolls).
     pub handle: egui::Rect,
@@ -109,10 +130,10 @@ pub(crate) struct StackProbe {
     pub collapse: egui::Rect,
     /// Whether the stack was on screen this frame.
     pub open: bool,
-    /// The `+ Show a layer` button above the rows — [`egui::Rect::NOTHING`] for
+    /// The `+ Add layer` button above the rows — [`egui::Rect::NOTHING`] for
     /// a pane that draws no map layers, which has no rows to add to.
     pub add_top: egui::Rect,
-    /// The `+ Show a layer` button below the rows, on the same terms.
+    /// The `+ Add layer` button below the rows, on the same terms.
     pub add_bottom: egui::Rect,
     /// The rows, top row first — draw order reversed.
     pub rows: Vec<StackRowProbe>,
@@ -365,6 +386,11 @@ impl super::Gui {
         let order: Vec<LayerId> = pane.draw_order().rev().cloned().collect();
         let mut row_rects: Vec<egui::Rect> = Vec::with_capacity(order.len());
         let mut drag_released = false;
+        // Deferred to after the walk, and it has to be: the rows the loop
+        // reports feed `resolve_stack_drag`, which pairs `row_rects` with
+        // `order` positionally, and a list that lost an entry halfway through
+        // would land a drag on the wrong layer.
+        let mut removing: Option<LayerId> = None;
 
         for kind in order.iter() {
             // Keyed on the layer, not the position, so a row's widget state
@@ -514,6 +540,34 @@ impl super::Gui {
                     self.set_pane_overlay_with_fetch(pane, idx, kind, !enabled, actions);
                 }
 
+                // The 🗑 remove control. The eye beside it hides the layer;
+                // this takes it out of the pane's stack, which is a different
+                // act and is why the two are not one control with a long
+                // press. **Drawn on every row, live or not**: a layer the pane
+                // cannot give up gets a greyed can whose hover says why, rather
+                // than no control at all — an absent affordance reads as an
+                // oversight, and one that silently does nothing is worse than
+                // both.
+                let refusal = pane.layer_removal_refusal(kind);
+                let remove = ui
+                    .add_enabled(
+                        refusal.is_none(),
+                        egui::Button::new(egui::RichText::new(REMOVE_LABEL).small().color(
+                            if refusal.is_none() {
+                                ui.visuals().weak_text_color()
+                            } else {
+                                ui.visuals().widgets.noninteractive.fg_stroke.color
+                            },
+                        ))
+                        .frame(false)
+                        .min_size(egui::vec2(20.0, 0.0)),
+                    )
+                    .on_hover_text(format!("Remove {name} from this pane"))
+                    .on_disabled_hover_text(refusal.unwrap_or_default());
+                if remove.clicked() {
+                    removing = Some(kind.clone());
+                }
+
                 // A trailing `›` on the drawer and sheet hosts:
                 // there a row click *pushes* the inspector over this list,
                 // and the chevron says so. The desktop sidebar, where the
@@ -587,6 +641,8 @@ impl super::Gui {
                     rect: row_rect,
                     eye: eye.rect,
                     eye_on: enabled,
+                    remove: remove.rect,
+                    remove_enabled: refusal.is_none(),
                     handle: handle.rect,
                     name: name_rect,
                     status_line: status.clone(),
@@ -622,6 +678,43 @@ impl super::Gui {
         }
 
         self.resolve_stack_drag(ui, &order, &row_rects, drag_released, pane);
+
+        if let Some(kind) = removing {
+            self.remove_layer_from_pane(pane, &kind);
+        }
+    }
+
+    /// **Take a layer out of the active pane's stack**, and leave nothing
+    /// pointing at it.
+    ///
+    /// The pane's own [`PaneState::remove_layer`] is what drops the slot and
+    /// releases the textures; what it cannot see is the chrome still pointing
+    /// at the layer — the inspector's selection, which would otherwise render a
+    /// body for a layer this pane no longer holds, and the two one-shot targets
+    /// (`stack_scroll_to`, `stack_drag`) that name a row by id.
+    ///
+    /// **No sync fan-out here, deliberately**, and on the same terms as the eye
+    /// beside it: this runs against the `mem::take`n pane the host is holding,
+    /// so `propagate_pane_sync` would read the vector's placeholder. The frame
+    /// that puts the pane back is what carries the edit to the linked group,
+    /// exactly as it does for a visibility toggle.
+    ///
+    /// The inspector is **redirected, not closed**: `select_pane_props` would
+    /// force the panel open on a host where the user had it shut, so the
+    /// selection moves and the open/closed posture is left exactly as it was.
+    pub(super) fn remove_layer_from_pane(&mut self, pane: &mut PaneState, kind: &LayerId) {
+        if !pane.remove_layer(kind) {
+            return;
+        }
+        if self.inspector_sel == InspectorSelection::Layer(kind.clone()) {
+            self.inspector_sel = InspectorSelection::PaneProps;
+        }
+        if self.stack_scroll_to.as_ref() == Some(kind) {
+            self.stack_scroll_to = None;
+        }
+        if self.stack_drag.as_ref() == Some(kind) {
+            self.stack_drag = None;
+        }
     }
 
     /// Advance or land the grip drag, once the frame's row rects are known.

@@ -23,10 +23,12 @@ const CLOSE_LABEL: &str = "\u{d7}";
 /// The modal's heading, and the sheet page's title — one string, so the two
 /// hosts cannot come to say different things.
 ///
-/// Not "Add layer": a pane's stack already holds a row for every registered
-/// layer, so a tile here turns one on rather than creating anything. Naming
-/// the act "add" made the stack below read as an incomplete list.
-pub(crate) const CATALOG_HEADING: &str = "Show a layer";
+/// **"Add layer" again, and now the word is earned.** W21 renamed this to
+/// "Show a layer" because a pane's stack held a row for every registered layer,
+/// so a tile could only turn one on. A stack is curated now, a tile for a layer
+/// the pane does not hold really does insert a row at its draw-order weight,
+/// and the heading says so.
+pub(crate) const CATALOG_HEADING: &str = "Add layer";
 
 /// The saved-preset delete control's label.
 const DELETE_LABEL: &str = "Delete";
@@ -346,9 +348,36 @@ impl super::Gui {
             ui.add_space(6.0);
             ui.label(egui::RichText::new(format!("Overlays ({})", overlays.len())).strong());
             ui.horizontal_wrapped(|ui| {
+                // **Every registered layer, held or not, and the two are told
+                // apart on the tile rather than by omission.**
+                //
+                // Filtering the held ones out is the obvious reading of "offer
+                // what is not in the stack", and it is the wrong one here for a
+                // reason worth writing down: this list is the *catalogue*, the
+                // one surface that answers "what can this build draw", and the
+                // parity walk's anti-shrink floor
+                // (`REGISTERED_LAYER_COUNT`) is what stops a composition that
+                // quietly lost a source crate from being met by a catalogue
+                // that quietly lost its tile. A list whose length is a function
+                // of the active pane's curation cannot carry that floor. So the
+                // inventory stays complete — which is also what keeps "a new
+                // source lights up the catalogue" unconditional — and a held
+                // layer's tile is drawn weak and says so on hover.
+                let held: Vec<LayerId> = self.active_pane().draw_order_vec();
                 for kind in overlays {
                     let name = self.overlays.display_name(&kind).to_owned();
-                    let tile = ui.button(name.as_str());
+                    let in_stack = held.contains(&kind);
+                    let tile = ui
+                        .button(if in_stack {
+                            egui::RichText::new(name.as_str()).weak()
+                        } else {
+                            egui::RichText::new(name.as_str())
+                        })
+                        .on_hover_text(if in_stack {
+                            format!("{name} is already in this pane - show it")
+                        } else {
+                            format!("Add {name} to this pane")
+                        });
                     #[cfg(test)]
                     probe.tiles.push(CatalogTileProbe {
                         group: CatalogGroup::Layers,
@@ -560,16 +589,23 @@ impl super::Gui {
         }
     }
 
-    /// Show `kind` on the active pane and select it in the inspector — what
-    /// clicking an overlay tile means.
+    /// **Put `kind` in the active pane's stack**, show it, and select it in the
+    /// inspector — what clicking an overlay tile means.
     ///
-    /// Nothing is created: the pane's row for `kind` was already in the stack
-    /// below, with its eye off. So the tile also scrolls that row into view —
-    /// otherwise the modal closes and the only visible result is a row the
-    /// user may have to hunt for.
+    /// The add is real: a layer the pane does not hold gains a slot at its own
+    /// `draw_order_weight`, carrying whatever configuration it held the last
+    /// time it was removed from this pane, and its tombstone is cleared so no
+    /// later reconcile takes it away again. A layer the pane already holds is
+    /// left exactly where the user put it and is only switched on — adding
+    /// twice must not silently reorder a stack.
+    ///
+    /// Either way the tile scrolls the row into view: the modal closes on
+    /// click, and without it the only visible result is a row somewhere in a
+    /// list the user may have to hunt through.
     fn catalog_apply_overlay(&mut self, kind: LayerId, actions: &mut Vec<GuiAction>) {
         let idx = self.active_pane;
         let mut pane = std::mem::take(&mut self.panes[idx]);
+        pane.add_layer(&self.overlays, &kind);
         self.set_pane_overlay_with_fetch(&mut pane, idx, &kind, true, actions);
         self.panes[idx] = pane;
         self.propagate_pane_sync();
@@ -605,6 +641,11 @@ impl super::Gui {
         match control {
             Some(control_id) => {
                 let mut pane = std::mem::take(&mut self.panes[idx]);
+                // The stack is curated, so "turn the owning layer on" is two
+                // acts now: put it in the pane if it is not there, then show
+                // it. A field tile for a layer the user removed must bring the
+                // layer back with it, or the click draws nothing.
+                pane.add_layer(&self.overlays, owner);
                 self.set_pane_overlay_with_fetch(&mut pane, idx, owner, true, actions);
 
                 // Through `apply_control` rather than a field write, so the
@@ -658,6 +699,7 @@ impl super::Gui {
                 let Self {
                     overlays, panes, ..
                 } = self;
+                panes[idx].add_layer(overlays, owner);
                 Self::write_pane_overlay(overlays, idx, &mut panes[idx], owner, true);
                 let pane = &mut self.panes[idx];
                 if pane.selected_product() != spec.id {
@@ -729,6 +771,19 @@ impl super::Gui {
             let mut pane = std::mem::take(&mut self.panes[idx]);
             for kind in self.overlays.default_draw_order() {
                 let on = preset.overlays.known.contains(&kind);
+                // A preset names the layers it wants shown, so it **adds**
+                // them: applying "Aviation" to a pane the user removed METAR
+                // from has to bring METAR back, or the preset silently
+                // delivers less than it names.
+                //
+                // It does **not** remove the layers it omits, and that
+                // asymmetry is on purpose. A preset is a set of layers to show,
+                // not a curation: `off` has always meant "hidden here", the
+                // pane keeps the row and its settings, and one preset click
+                // cannot throw away a stack the user built.
+                if on {
+                    pane.add_layer(&self.overlays, &kind);
+                }
                 self.set_pane_overlay_with_fetch(&mut pane, idx, &kind, on, actions);
             }
             self.panes[idx] = pane;
