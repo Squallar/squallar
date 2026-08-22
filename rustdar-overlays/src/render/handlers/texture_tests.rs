@@ -228,7 +228,13 @@ fn glm_fixture() -> crate::glm::GlmFlash {
         lon: -98.0,
         energy: None,
         area: None,
-        time: chrono::Utc::now().naive_utc(),
+        // **A minute in the past, not `now`.** A flash later than the
+        // depicted instant is culled, and a bare `Utc::now()` here races the
+        // clock `rctx()` captured: whichever is read second wins, so the
+        // fixture drew or did not draw by microseconds. A real granule is
+        // always behind the picture; this fixture is too. Well inside the
+        // 600 s window every caller uses.
+        time: chrono::Utc::now().naive_utc() - chrono::TimeDelta::seconds(60),
         satellite: GlmSatellite::GoesEast,
         level: GlmDataLevel::Flash,
     }

@@ -1055,6 +1055,7 @@ mod tests {
             zone_cache_dir: None,
             sources: rustdar_source::origins::DataSources::production(),
             viewport: None,
+            as_of: chrono::Utc::now().naive_utc(),
         };
         for day in [FireDay::Day1, FireDay::Day5] {
             for hazards in 1..=FireHazard::all().len() {

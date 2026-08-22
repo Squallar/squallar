@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{NaiveDateTime, TimeDelta, Utc};
+use chrono::{NaiveDateTime, TimeDelta};
 use rustdar_source::origins::DataSources;
 
 use super::{
@@ -57,17 +57,22 @@ impl GlmCache {
     }
 }
 
-fn cache_granules(cache: &mut GlmCache, entries: Vec<(String, Vec<GlmFlash>)>, now: NaiveDateTime) {
+fn cache_granules(
+    cache: &mut GlmCache,
+    entries: Vec<(String, Vec<GlmFlash>)>,
+    as_of: NaiveDateTime,
+) {
     for (key, flashes) in entries {
-        let granule_start = granule_start_of(&key, now);
+        let granule_start = granule_start_of(&key, as_of);
         cache.insert(key, granule_start, flashes);
     }
 }
 
 /// The instant a granule is aged against, from the S3 key it was listed under;
-/// `now` on the fallback, so an undatable granule expires one window out.
-fn granule_start_of(key: &str, now: NaiveDateTime) -> NaiveDateTime {
-    parse_filename_start_time(key).unwrap_or(now)
+/// the depicted instant on the fallback, so an undatable granule expires one
+/// window out of the picture that asked for it.
+fn granule_start_of(key: &str, as_of: NaiveDateTime) -> NaiveDateTime {
+    parse_filename_start_time(key).unwrap_or(as_of)
 }
 
 pub async fn fetch_glm_flashes(
@@ -77,6 +82,7 @@ pub async fn fetch_glm_flashes(
     time_window_secs: f64,
     levels: &[GlmDataLevel],
     cache: &mut GlmCache,
+    as_of: NaiveDateTime,
 ) -> Result<GlmFetchOutcome, FetchError> {
     // The zero-object warning below assumes the queried range is wide enough to
     // always cover an already-published granule.
@@ -87,11 +93,16 @@ pub async fn fetch_glm_flashes(
          the zero-object check report a live feed as dead.",
     );
 
-    let now = Utc::now().naive_utc();
+    // **The depicted instant, never the wall clock.** `list_glm_files` is
+    // addressed by `{year}/{doy}/{hour}`, so a window ending at `as_of` asks
+    // the archive for the hour the picture is of; on a live pane `as_of` *is*
+    // the wall clock and the request is the one it always was.
     let window = TimeDelta::milliseconds((time_window_secs * 1000.0) as i64);
-    let start = now - window;
+    let start = as_of - window;
     let cutoff = start;
 
+    // Anchored on the depicted instant for the same reason: a wall-clock
+    // cutoff evicts exactly the granules a scrubbed pane is displaying.
     cache.evict_before(cutoff);
 
     let mut acc = PollAccumulator::default();
@@ -104,7 +115,7 @@ pub async fn fetch_glm_flashes(
 
     for &sat in satellites {
         let bucket = sat.bucket(sources);
-        let listing = match list_glm_files(client, sources, bucket, start, now).await {
+        let listing = match list_glm_files(client, sources, bucket, start, as_of).await {
             Ok(listing) => listing,
             Err(e) => {
                 log::warn!("GLM: {} listing failed: {e}", sat.display_name());
@@ -160,11 +171,11 @@ pub async fn fetch_glm_flashes(
         ));
     }
 
-    cache_granules(cache, std::mem::take(&mut acc.entries), now);
+    cache_granules(cache, std::mem::take(&mut acc.entries), as_of);
 
     // Still keyed on `satellites`, not `queried`: a satellite whose listing
     // failed still has earlier granules in window.
-    let filtered = flashes_in_window(cache, satellites, cutoff, now);
+    let filtered = flashes_in_window(cache, satellites, cutoff, as_of);
 
     log::info!(
         "GLM: {} flashes in {:.0}s window",
@@ -186,17 +197,17 @@ pub async fn fetch_glm_flashes(
 /// Select the cached flashes inside this poll's window, from the satellites it
 /// was asked for — the per-flash half of a two-stage narrowing
 /// ([`GlmCache::evict_before`] does the per-granule half). Both bounds are
-/// inclusive: `now` is sampled once per poll and a granule's last flashes can be
-/// stamped after it.
+/// inclusive: `as_of` is sampled once per poll and a granule's last flashes can
+/// be stamped after it.
 fn flashes_in_window(
     cache: &GlmCache,
     satellites: &[GlmSatellite],
     cutoff: NaiveDateTime,
-    now: NaiveDateTime,
+    as_of: NaiveDateTime,
 ) -> Vec<GlmFlash> {
     cache
         .all_flashes()
-        .filter(|f| satellites.contains(&f.satellite) && f.time >= cutoff && f.time <= now)
+        .filter(|f| satellites.contains(&f.satellite) && f.time >= cutoff && f.time <= as_of)
         .cloned()
         .collect()
 }

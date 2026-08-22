@@ -837,6 +837,11 @@ impl OverlayHandler for GlmHandler {
         let time_window_secs = view.time_window_secs;
         let levels = view.active_levels();
         let cache = Arc::clone(&self.cache);
+        // **The instant the pane depicts**, which is what picks the archive
+        // hour: GLM's S3 listing is addressed by `{year}/{doy}/{hour}`, so a
+        // scrubbed pane reaches years back for free. On a live pane this is
+        // the wall clock and the request is unchanged.
+        let as_of = ctx.as_of;
         vec![FetchTask {
             kind: known::LIGHTNING,
             future: Box::pin(async move {
@@ -852,6 +857,7 @@ impl OverlayHandler for GlmHandler {
                     time_window_secs,
                     &levels,
                     &mut local_cache,
+                    as_of,
                 )
                 .await;
                 {

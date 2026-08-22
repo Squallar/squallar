@@ -1,4 +1,5 @@
 use super::*;
+use chrono::Utc;
 
 /// Only groups and flashes carry area coverage in the L2 LCFA product.
 #[test]
@@ -1163,16 +1164,33 @@ fn http_response(status_line: &str, body: &str) -> String {
 const STALE_GRANULE: &str =
     "GLM-L2-LCFA/2020/001/00/OR_GLM-L2-LCFA_G18_s20200010000000_e20200010000200_c20200010000210.nc";
 
+/// Every request line the mock bucket was sent, in arrival order.
+type RecordedRequests = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
 fn s3_serving(responses: Vec<(&'static str, String)>) -> DataSources {
+    s3_recording(responses).0
+}
+
+/// [`s3_serving`], plus the request lines - so a test can assert **what was
+/// asked for**, not only what came back.
+fn s3_recording(responses: Vec<(&'static str, String)>) -> (DataSources, RecordedRequests) {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let port = listener.local_addr().expect("local addr").port();
+    let seen: RecordedRequests = Default::default();
+    let recorder = std::sync::Arc::clone(&seen);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
             let mut scratch = [0u8; 4096];
             let read = stream.read(&mut scratch).unwrap_or(0);
             let request = String::from_utf8_lossy(&scratch[..read]).to_string();
+            if let Some(line) = request.lines().next() {
+                recorder
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(line.to_string());
+            }
             let response = responses
                 .iter()
                 .find(|(bucket, _)| request.contains(&format!("/{bucket}/")))
@@ -1182,12 +1200,13 @@ fn s3_serving(responses: Vec<(&'static str, String)>) -> DataSources {
             let _ = stream.flush();
         }
     });
-    DataSources {
+    let sources = DataSources {
         goes_east_bucket: "east".into(),
         goes_west_bucket: "west".into(),
         s3_base: format!("http://127.0.0.1:{port}/{{bucket}}").into(),
         ..DataSources::production()
-    }
+    };
+    (sources, seen)
 }
 
 /// A cleartext-capable client: `tls::client` sets `https_only`, which a
@@ -1218,7 +1237,16 @@ fn cached_flash(cache: &mut GlmCache, key: &str, satellite: GlmSatellite) {
     );
 }
 
+/// A live pane's poll: the depicted instant is the wall clock.
 fn poll(sources: &DataSources, cache: &mut GlmCache) -> Result<GlmFetchOutcome, FetchError> {
+    poll_as_of(sources, cache, Utc::now().naive_utc())
+}
+
+fn poll_as_of(
+    sources: &DataSources,
+    cache: &mut GlmCache,
+    as_of: NaiveDateTime,
+) -> Result<GlmFetchOutcome, FetchError> {
     let client = loopback_client();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1231,6 +1259,7 @@ fn poll(sources: &DataSources, cache: &mut GlmCache) -> Result<GlmFetchOutcome, 
         GLM_MIN_TIME_WINDOW_SECS,
         &[GlmDataLevel::Flash],
         cache,
+        as_of,
     ))
 }
 
@@ -1420,5 +1449,219 @@ fn the_ascii_ranges_a_real_key_carries_still_parse() {
     assert_eq!(
         start.format("%Y-%m-%d %H:%M:%S").to_string(),
         "2026-07-24 12:00:00"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The depicted instant picks the archive.
+//
+// GLM is a `TimeAxis::EventLifetime` layer: its picture is "the strikes of the
+// last N seconds **as of T**". `list_glm_files` has always been addressed by
+// `{year}/{doy}/{hour}`, so once the poll takes T rather than the wall clock,
+// the whole published archive is reachable. These are end-to-end over the
+// loopback bucket: they assert the request that went out and the flashes that
+// came back, not an intermediate figure.
+
+/// 2020-06-15 07:30:00 UTC. Day 167 of a leap year; the prefix below is spelled
+/// out rather than derived, so a wrong `%j` cannot agree with itself.
+fn archive_instant() -> NaiveDateTime {
+    chrono::NaiveDate::from_ymd_opt(2020, 6, 15)
+        .unwrap()
+        .and_hms_opt(7, 30, 0)
+        .unwrap()
+}
+
+const ARCHIVE_PREFIX: &str = "GLM-L2-LCFA/2020/167/07/";
+
+/// A granule starting 07:29:30 - inside the 60 s window ending at
+/// [`archive_instant`], and under [`ARCHIVE_PREFIX`].
+const ARCHIVE_GRANULE: &str = "GLM-L2-LCFA/2020/167/07/\
+     OR_GLM-L2-LCFA_G19_s20201670729300_e20201670729400_c20201670729410.nc";
+
+fn seed_flash(cache: &mut GlmCache, key: &str, time: NaiveDateTime) {
+    cache.insert(
+        key.to_string(),
+        time,
+        vec![GlmFlash {
+            lat: 35.0,
+            lon: -97.0,
+            energy: Some(1.0),
+            area: Some(1.0),
+            time,
+            satellite: GlmSatellite::GoesEast,
+            level: GlmDataLevel::Flash,
+        }],
+    );
+}
+
+fn request_paths(seen: &RecordedRequests) -> Vec<String> {
+    seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// A scrubbed pane asks the archive for the hour it depicts, and keeps the
+/// flashes it is showing.
+///
+/// Three things at once, because they are one behaviour and a hand-armed test
+/// of any one of them passes while the other two are broken:
+///
+/// 1. the **listing prefix** is the depicted hour, not the current one;
+/// 2. the listing's `start`/`end` bounds moved with it - a granule inside the
+///    depicted window is accepted, so the round reports no window gap;
+/// 3. **retention** is anchored on the depicted instant, so the granule the
+///    pane is displaying survives eviction and comes back in `flashes`.
+#[test]
+fn a_scrubbed_poll_reaches_the_archive_hour_it_depicts_and_keeps_it() {
+    let (sources, seen) = s3_recording(vec![
+        (
+            "east",
+            http_response("200 OK", &listing_xml(ARCHIVE_GRANULE)),
+        ),
+        (
+            "west",
+            http_response("200 OK", &listing_xml(ARCHIVE_GRANULE)),
+        ),
+    ]);
+
+    // Already held, so the round downloads nothing: what is under test is
+    // which hour was asked for and what survived, not the parse path.
+    let mut cache = GlmCache::default();
+    seed_flash(
+        &mut cache,
+        ARCHIVE_GRANULE,
+        archive_instant() - TimeDelta::seconds(25),
+    );
+
+    let outcome =
+        poll_as_of(&sources, &mut cache, archive_instant()).expect("both listings answered");
+
+    let paths = request_paths(&seen);
+    assert_eq!(
+        paths.len(),
+        2,
+        "one listing per satellite and no downloads: {paths:?}",
+    );
+    assert!(
+        paths.iter().all(|p| p.contains(ARCHIVE_PREFIX)),
+        "the poll depicts 2020-06-15 07:30 UTC, so it must list \
+         {ARCHIVE_PREFIX}; it asked for {paths:?}",
+    );
+    let this_year = Utc::now().naive_utc().format("/%Y/").to_string();
+    assert!(
+        !paths.iter().any(|p| p.contains(&this_year)),
+        "the wall clock leaked into a scrubbed poll: {paths:?}",
+    );
+
+    assert!(
+        outcome.window_gaps.is_empty(),
+        "the archive granule sits inside the depicted window, so the listing \
+         bounds moved with the prefix; a gap here means only the prefix did",
+    );
+    assert!(outcome.dead_feeds.is_empty());
+
+    let times: Vec<NaiveDateTime> = outcome.flashes.iter().map(|f| f.time).collect();
+    assert_eq!(
+        times,
+        vec![archive_instant() - TimeDelta::seconds(25)],
+        "the scrubbed pane's own flash was evicted or filtered away; this is \
+         the round that shows an empty sky over a storm five years ago",
+    );
+}
+
+/// The other half of the same behaviour, and the reason "cull everything" or
+/// "fetch nothing" cannot pass: a **live** poll is what it always was. It asks
+/// for the current hour, it keeps the flashes inside its own window, and it
+/// drops the five-year-old granule sitting beside them.
+#[test]
+fn a_live_poll_still_asks_for_the_current_hour_and_evicts_the_archive() {
+    let now = Utc::now().naive_utc();
+    let live_key = fresh_granule_key(now);
+    let (sources, seen) = s3_recording(vec![
+        ("east", http_response("200 OK", &listing_xml(&live_key))),
+        ("west", http_response("200 OK", &listing_xml(&live_key))),
+    ]);
+
+    let mut cache = GlmCache::default();
+    seed_flash(&mut cache, &live_key, now - TimeDelta::seconds(10));
+    seed_flash(
+        &mut cache,
+        ARCHIVE_GRANULE,
+        archive_instant() - TimeDelta::seconds(25),
+    );
+
+    let outcome = poll(&sources, &mut cache).expect("both listings answered");
+
+    let paths = request_paths(&seen);
+    let current = now.format("GLM-L2-LCFA/%Y/%j/%H/").to_string();
+    assert!(
+        paths.iter().all(|p| p.contains(&current)),
+        "a live pane must still list {current}; it asked for {paths:?}",
+    );
+    assert!(
+        !paths.iter().any(|p| p.contains(ARCHIVE_PREFIX)),
+        "a live pane reached into the archive: {paths:?}",
+    );
+
+    let times: Vec<NaiveDateTime> = outcome.flashes.iter().map(|f| f.time).collect();
+    assert_eq!(
+        times,
+        vec![now - TimeDelta::seconds(10)],
+        "a live pane's window is unchanged: the 10 s flash is in it and the \
+         2020 granule is not",
+    );
+    assert!(
+        !cache.contains_key(ARCHIVE_GRANULE),
+        "a live poll must still evict what has aged out, or the cache grows \
+         without bound",
+    );
+    assert!(outcome.window_gaps.is_empty());
+    assert!(outcome.dead_feeds.is_empty());
+}
+
+/// The handler seam, end to end: what a pane depicts reaches the bucket.
+///
+/// `create_fetch_tasks` is where the depicted instant crosses from the render
+/// context into the poll, and the task it returns is an opaque future - so this
+/// runs the future against the loopback bucket and reads the prefix off the
+/// wire rather than off an intermediate value.
+#[test]
+fn the_handlers_fetch_task_carries_the_depicted_instant_to_the_bucket() {
+    use crate::render::overlay_state::{FetchConfig, OverlayHandler, PaneRef};
+
+    let (sources, seen) = s3_recording(vec![
+        (
+            "east",
+            http_response("200 OK", &listing_xml(ARCHIVE_GRANULE)),
+        ),
+        (
+            "west",
+            http_response("200 OK", &listing_xml(ARCHIVE_GRANULE)),
+        ),
+    ]);
+    let handler = crate::render::handlers::glm::GlmHandler::new();
+    let config = FetchConfig {
+        client: loopback_client(),
+        zone_cache_dir: None,
+        sources,
+        viewport: None,
+        as_of: archive_instant(),
+    };
+
+    let mut tasks = handler.create_fetch_tasks(&config, &PaneRef::bare(0));
+    assert_eq!(tasks.len(), 1, "GLM builds exactly one poll task");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(tasks.remove(0).future);
+
+    let paths = request_paths(&seen);
+    assert!(
+        !paths.is_empty(),
+        "the task reached no bucket at all, so nothing below is a measurement",
+    );
+    assert!(
+        paths.iter().all(|p| p.contains(ARCHIVE_PREFIX)),
+        "the handler was given a render context depicting 2020-06-15 07:30 UTC \
+         and must list {ARCHIVE_PREFIX}; it asked for {paths:?}",
     );
 }

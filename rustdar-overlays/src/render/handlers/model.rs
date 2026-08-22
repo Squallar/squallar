@@ -3001,6 +3001,7 @@ mod tests {
             zone_cache_dir: None,
             sources: rustdar_source::origins::DataSources::default(),
             viewport: None,
+            as_of: chrono::Utc::now().naive_utc(),
         }
     }
 
