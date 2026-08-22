@@ -191,6 +191,14 @@ fn walk_layer_controls(h: &mut InputHarness, width: WidthClass) {
          this build — a rename would otherwise retire that leg in silence, \
          leaving every handler walked shown and none walked hidden",
     );
+    // **Two steps, since the stack became a curated list.** The hidden leg
+    // needs a layer that is IN the pane's stack and switched OFF; the handler
+    // it uses ships disabled, so a fresh pane does not hold it at all and
+    // "switch it off" is now a no-op on a layer with no row. Adding it first is
+    // what makes the off meaningful — and it has to be the pane API rather than
+    // `open_layer_in_inspector`'s catalogue route, because that route turns the
+    // layer ON, which is the one thing this leg must not be.
+    h.add_layer_to_pane(0, &HIDDEN_WALK_HANDLER);
     h.set_overlay_on_pane(0, &HIDDEN_WALK_HANDLER, false);
     for handler in &registered {
         if *handler == HIDDEN_WALK_HANDLER {

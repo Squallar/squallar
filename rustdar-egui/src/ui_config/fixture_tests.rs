@@ -437,12 +437,54 @@ fn an_unknown_draw_order_id_survives_in_place_and_is_skipped_at_draw() {
         "no handler serves MysteryLayer — the draw loop skips it by this exact \
          predicate",
     );
-    // The registered ids the file omitted joined at their weight positions.
-    assert_eq!(
-        order.len(),
-        16 + cfg!(feature = "fake-source") as usize,
-        "all fifteen registered layers plus the unknown id — sixteen \
-         registered where the fake source is on: {order:?}",
+    // **The registered ids the file omitted joined at their weight positions —
+    // the ones that are entitled to.**
+    //
+    // This assertion changed value at WO-SITE-CURATE, and it changed because
+    // the behaviour did: a pane's stack used to be completed from the registry
+    // on every load, so a file naming two layers came back holding all
+    // fourteen. It is a curated list now, and the reconcile offers a pane only
+    // the layers that ship enabled (`LayerStack::admits`), so a layer that
+    // ships off waits in the catalogue instead of arriving as a row nobody
+    // asked for. What is checked here is that rule rather than a count, because
+    // a count is what a rule change silently re-points.
+    let joined_or_saved = |id: &rustdar_source::id::LayerId| order.contains(id);
+    for id in [
+        known::NWS_ALERTS,
+        known::SPC_DISCUSSIONS,
+        known::CITY_LABELS,
+        known::USER_LOCATION,
+        known::COLOR_SCALE,
+    ] {
+        assert!(
+            joined_or_saved(&id),
+            "{id:?} ships enabled, so a file that never named it must still \
+             get a row for it: {order:?}",
+        );
+    }
+    for id in [known::SPC_OUTLOOK, known::LIGHTNING, known::METAR] {
+        assert!(
+            !joined_or_saved(&id),
+            "{id:?} ships disabled and this file never named it, so it \
+             belongs in the catalogue, not in the pane's stack: {order:?}",
+        );
+    }
+    // The non-triviality floor under both halves: neither set may be the whole
+    // list, or "only the default-on ones joined" is not a distinguishable
+    // claim.
+    // The size a *complete projection* of the registry would have had: the
+    // fifteen registered layers plus the unknown id, sixteen registered where
+    // the fake source is on. The same hand-kept literal this assertion carried
+    // before the rule changed, and still hand-kept rather than read off
+    // `handlers()` — a floor derived from the thing it floors compares the
+    // reconcile against itself and cannot fail.
+    let whole_inventory = 16 + cfg!(feature = "fake-source") as usize;
+    assert!(
+        order.len() > 2 && order.len() < whole_inventory,
+        "the file named two layers; a stack of {whole_inventory} would mean \
+         the old complete-projection reconcile is back and a stack of 2 would \
+         mean nothing joined at all - either makes the two loops above \
+         vacuous: {order:?}",
     );
 
     // Direction 2 (save): written back in place, as a slot.
