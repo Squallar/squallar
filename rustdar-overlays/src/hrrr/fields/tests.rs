@@ -48,7 +48,14 @@ fn no_model_parameter_is_vertical_or_tilted() {
     }
 }
 
-/// Every scale has stops, spans a finite non-empty range, and is a ramp.
+/// Every scale has stops and spans a finite non-empty range.
+///
+/// **`is_gradient` moved out of here** when the reflectivity fields landed: it
+/// is no longer the same answer for every parameter, so a blanket assertion
+/// would have had to be deleted rather than tightened. It is now pinned per
+/// parameter by [`the_reflectivity_bars_are_banded_and_the_others_are_not`] and
+/// against the ramp itself by
+/// [`a_banded_bar_paints_one_flat_colour_across_its_band`].
 #[test]
 fn every_scale_is_a_finite_non_empty_ramp() {
     for &p in ModelParameter::all() {
@@ -56,10 +63,6 @@ fn every_scale_is_a_finite_non_empty_ramp() {
         assert!(
             !s.scale.thresholds.is_empty(),
             "{p:?}'s colour bar has no stops",
-        );
-        assert!(
-            s.scale.is_gradient,
-            "{p:?} declares banded colour, but `color_for_value` interpolates",
         );
         let (lo, hi) = s.value_domain;
         assert!(
@@ -96,4 +99,93 @@ fn every_scales_stops_ascend() {
             );
         }
     }
+}
+
+/// The five reflectivity fields draw **bands**; the two that are not
+/// reflectivity draw a wash. A literal table rather than a re-derivation of
+/// [`ModelParameter::is_banded`]: the point is to state what each of the seven
+/// bars looks like, so that flipping the predicate is a red test and not a
+/// silently different picture.
+#[test]
+fn the_reflectivity_bars_are_banded_and_the_others_are_not() {
+    for (param, is_gradient) in [
+        (ModelParameter::CompositeReflectivity, false),
+        (ModelParameter::Reflectivity1km, false),
+        (ModelParameter::Reflectivity4km, false),
+        (ModelParameter::ReflectivityM10C, false),
+        (ModelParameter::MaxReflectivity, false),
+        (ModelParameter::EchoTop, true),
+        (ModelParameter::VerticallyIntegratedLiquid, true),
+    ] {
+        let bar = |g: bool| if g { "a wash" } else { "bands" };
+        assert_eq!(
+            spec(param).scale.is_gradient,
+            is_gradient,
+            "{param:?}'s bar draws as {} and should draw as {}",
+            bar(spec(param).scale.is_gradient),
+            bar(is_gradient),
+        );
+    }
+
+    // Floor: a pre-existing parameter still declares a wash, so "band every
+    // bar" fails here rather than satisfying the table above.
+    assert!(
+        spec(ModelParameter::SurfaceBasedCape).scale.is_gradient,
+        "CAPE's ramp interpolates, so its bar must still be a wash — without \
+         this, the table above passes for a build that banded everything",
+    );
+    // And the count, so "band nothing" is red too.
+    let banded = ModelParameter::all()
+        .iter()
+        .filter(|p| !spec(**p).scale.is_gradient)
+        .count();
+    assert_eq!(banded, 5, "exactly the five reflectivity fields are banded");
+}
+
+/// The declaration and the raster must agree. `is_gradient: false` beside a ramp
+/// that interpolates is a legend explaining a picture that is not on screen, and
+/// nothing else in the tree compares the two.
+#[test]
+fn a_banded_bar_paints_one_flat_colour_across_its_band() {
+    let p = ModelParameter::CompositeReflectivity;
+    assert!(!spec(p).scale.is_gradient, "the premise");
+
+    // Two readings inside the 45-50 dBZ band paint the same colour...
+    assert_eq!(p.color_for_value(45.0), p.color_for_value(49.9));
+    // ...and the next band is a different colour, so "one colour for
+    // everything" is not what the equality above would accept.
+    assert_ne!(p.color_for_value(49.9), p.color_for_value(50.0));
+
+    // The control: a wash does move between its stops, so the equality is a
+    // property of banding rather than of how close the two probes are.
+    let vil = ModelParameter::VerticallyIntegratedLiquid;
+    assert!(spec(vil).scale.is_gradient, "the premise");
+    assert_ne!(
+        vil.color_for_value(5.0),
+        vil.color_for_value(9.9),
+        "VIL is a wash: two readings inside one interval must differ",
+    );
+}
+
+/// The forecast composite and the observed mosaic are read side by side, so the
+/// same dBZ must be the same colour on both. The two stop tables are deliberate
+/// copies — `rustdar-overlays` cannot reach `rustdar-radar`'s palette, and
+/// `crate::mrms::fields` states its own — and nothing but this holds them equal.
+#[test]
+fn the_two_reflectivity_ladders_agree() {
+    let hrrr = spec(ModelParameter::CompositeReflectivity).scale;
+    let mrms = crate::mrms::fields::spec(crate::mrms::MrmsProduct::ReflectivityComposite).scale;
+    assert_eq!(
+        hrrr.thresholds, mrms.thresholds,
+        "the two dBZ ladders have drifted apart",
+    );
+    assert!(
+        hrrr.thresholds.len() >= 10,
+        "a ladder of {} stops is too short for this comparison to mean much",
+        hrrr.thresholds.len(),
+    );
+    assert_eq!(
+        hrrr.is_gradient, mrms.is_gradient,
+        "one dBZ bar draws bands and the other a wash",
+    );
 }

@@ -193,7 +193,7 @@ model uses, there is a pure-Rust path to it.
 | Temperature, dewpoint, wind (upper air)              | ❌      | ✅ Derived from public models above                                                       |
 | CAPE, CIN, SRH (Storm Relative Helicity), bulk shear | ✅      | ✅ HRRR: SB/ML/MU CAPE, SB/ML CIN, lifted index, 0–1 km and 0–3 km SRH, 0–6 km bulk shear |
 | Updraft helicity                                     | ✅      | ✅ HRRR: 0–2 km and 2–5 km maxima, from f01 (the f00 record is identically zero)          |
-| Simulated reflectivity                               | ❌      | ✅ Derived from public models above                                                       |
+| Simulated reflectivity                               | ✅      | ✅ HRRR: `REFC`, `REFD` at 1 km / 4 km / −10 °C, `MAXREF`, plus `RETOP` and `VIL`         |
 | Precipitation (QPF), snow, ice                       | ❌      | ✅ Derived from public models above                                                       |
 | 500 mb heights/vorticity, jet stream, thickness      | ❌      | ✅ Derived from public models above (250 mb `UGRD`/`VGRD` is the usual jet-stream pair)   |
 | Precipitable water (PWAT)                            | ✅      | ✅ HRRR                                                                                   |

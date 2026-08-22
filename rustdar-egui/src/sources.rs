@@ -36,8 +36,8 @@ pub(crate) const REGISTERED_LAYER_COUNT: usize = 14 + cfg!(feature = "fake-sourc
 /// **How many FIELDS this build registers — the same hand-kept discipline as
 /// [`REGISTERED_LAYER_COUNT`], one level down.**
 ///
-/// Radar's seventeen products plus the model's sixteen parameters and MRMS's
-/// two, plus the fake source's one when its feature is on.
+/// Radar's seventeen products plus the model's twenty-three parameters and
+/// MRMS's two, plus the fake source's one when its feature is on.
 ///
 /// **Never derive this from `fields()`, `products()` or any registration.**
 /// WO-E9d land 2 made the catalogue's tiles *and* the parity walk's expected
@@ -50,7 +50,7 @@ pub(crate) const REGISTERED_LAYER_COUNT: usize = 14 + cfg!(feature = "fake-sourc
 /// that keeps the walk's field floor able to fail.
 #[cfg(test)]
 pub(crate) const REGISTERED_FIELD_COUNT: usize =
-    17 + 16 + 2 + cfg!(feature = "fake-source") as usize;
+    17 + 23 + 2 + cfg!(feature = "fake-source") as usize;
 
 /// The default draw order, bottom to top — every registered layer's id sorted
 /// by `SourceHandler::draw_order_weight`.
@@ -639,8 +639,9 @@ mod field_registry_tests {
             fields.len(),
             super::REGISTERED_FIELD_COUNT,
             "the composed field count moved (radar's seventeen products plus \
-             the model's sixteen parameters, plus the fake's one where it is \
-             registered); re-cut this pin in the land that changed it",
+             the model's twenty-three parameters and MRMS's two, plus the \
+             fake's one where it is registered); re-cut this pin in the land \
+             that changed it",
         );
 
         let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
@@ -725,7 +726,7 @@ mod field_registry_tests {
         );
         assert_eq!(
             counts.get("HRRR parameters").copied(),
-            Some(16),
+            Some(23),
             "the model group's size moved",
         );
         assert_eq!(
