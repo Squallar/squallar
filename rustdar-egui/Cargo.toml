@@ -18,12 +18,6 @@ edition.workspace = true
 # the two gates now agree because they are the same kind of gate.
 gps-serial = ["rustdar-nmea-serial/serial"]
 
-# Forwarding only: turns on `rustdar-overlays/fake-source` so this crate's suite
-# runs against a registry of thirteen layers instead of twelve. Off by default,
-# so plain `cargo test -p rustdar-egui` is the twelve-layer arm and
-# `--features fake-source` is the thirteen-layer one.
-fake-source = ["rustdar-overlays/fake-source"]
-
 [dependencies]
 web-time = { workspace = true }
 rustdar-geo = { workspace = true }

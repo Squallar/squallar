@@ -3719,6 +3719,80 @@ fn the_pane_paints_every_enabled_kind_in_draw_order_on_one_paint_list() {
     }
 }
 
+/// **A texture layer with a landed raster paints a quad the layer-off scene
+/// does not.**
+///
+/// The complement of
+/// [`the_pane_paints_every_enabled_kind_in_draw_order_on_one_paint_list`],
+/// which reads the pane's *dispatch* record: a layer holding no texture is in
+/// that record too, so the paint order alone cannot say anything reached the
+/// screen. This counts the textured quads the pane actually painted, and the
+/// middle reading is what makes it a statement about the raster rather than
+/// about enabling the layer — enabling alone must not be what adds the quad.
+///
+/// Ported from the deleted `fake-source` acceptance suite, which was the only
+/// place this leg existed, and re-pointed at a real layer.
+#[test]
+fn a_texture_layer_paints_a_quad_only_once_its_raster_has_landed() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.warm_up();
+    let pane_rect = h.pane_rects()[0];
+
+    // The alert layer is on by default, so the layer-off reading is taken by
+    // switching it off rather than by assuming it starts there.
+    h.gui_mut()
+        .set_overlay_on_pane_for_test(0, &known::NWS_ALERTS, false);
+    h.warm_up();
+    assert!(
+        !h.overlay_enabled_on(0, &known::NWS_ALERTS),
+        "fixture: the layer did not switch off, so the reading below is not a \
+         layer-off reading",
+    );
+    assert!(
+        !h.paint_order(0)
+            .iter()
+            .any(|(id, _)| *id == known::NWS_ALERTS),
+        "the layer is off and the pane still painted it",
+    );
+    let off = h.painted_images_in(pane_rect).len();
+
+    h.gui_mut().enable_overlay_for_test(&known::NWS_ALERTS);
+    h.warm_up();
+    assert!(
+        h.paint_order(0)
+            .iter()
+            .any(|(id, _)| *id == known::NWS_ALERTS),
+        "the layer is enabled and the pane's paint order does not contain it",
+    );
+    let enabled_no_raster = h.painted_images_in(pane_rect).len();
+
+    // The raster lands: real data in, then the cache stood up exactly as the
+    // frame's own render request asked for it.
+    let ground = h.ground_at(0, pane_rect.center());
+    ingest_alerts(
+        &mut h,
+        vec![alert_over("a", "Tornado Warning", ground.y(), ground.x())],
+    );
+    h.warm_up();
+    settle_overlay_cache(&mut h, &known::NWS_ALERTS);
+    h.warm_up();
+    let with_raster = h.painted_images_in(pane_rect).len();
+
+    assert!(
+        with_raster > enabled_no_raster,
+        "the layer's overlay cache holds a texture and the pane painted no \
+         more textured quads than it did holding none ({enabled_no_raster} \
+         then {with_raster}) - the layer is in the draw order and nothing \
+         draws its raster",
+    );
+    assert_eq!(
+        enabled_no_raster, off,
+        "enabling the layer painted a quad before any raster landed \
+         ({off} then {enabled_no_raster}), so the count above cannot \
+         distinguish a landed raster from a toggled checkbox",
+    );
+}
+
 /// 89. **A stack row click selects that layer in the inspector, which opens
 ///     itself.**
 #[test]

@@ -1,7 +1,7 @@
 //! Layer identity as an open string: [`LayerId`]. The shipped values below are
-//! the **exact bytes sitting in every user's config file today**; the
-//! fourteenth is a reservation, registered only under
-//! `rustdar-overlays/fake-source`.
+//! the **exact bytes sitting in every user's config file today**. Fifteen of
+//! the sixteen are registered by this build; the sixteenth, `"FakeSource"`, is
+//! a **retired reservation** that nothing registers — see [`known::FAKE_SOURCE`].
 
 use std::borrow::Cow;
 
@@ -63,10 +63,16 @@ pub mod known {
     pub const RADAR_SITES: LayerId = LayerId::from_static("RadarSites");
     pub const USER_LOCATION: LayerId = LayerId::from_static("UserLocation");
     pub const COLOR_SCALE: LayerId = LayerId::from_static("ColorScale");
-    /// The proof layer `rustdar-overlays`' `fake-source` feature registers.
-    /// The const is unconditional — a ledger row is a *reservation* of a
-    /// spelling, and reserving one under a `cfg` would let a build that has
-    /// the feature off hand the same string to something else.
+    /// **A retired reservation: nothing registers this layer.**
+    ///
+    /// It was the test-only proof layer behind `rustdar-overlays`'
+    /// `fake-source` feature, deleted in full on 2026-08-22. The spelling is
+    /// kept because it **reached users**: every `--all-features` desktop
+    /// artifact built between 2026-08-20 and 2026-08-21 registered the layer
+    /// and persisted this id into the config file it wrote. Those files are
+    /// still on disk, and a future layer handed the same string would inherit
+    /// their slot state. A ledger row reserves a spelling forever; retiring
+    /// the layer does not retire the reservation.
     pub const FAKE_SOURCE: LayerId = LayerId::from_static("FakeSource");
 }
 
@@ -101,10 +107,11 @@ pub const LAYER_ID_LEDGER: [&str; 16] = [
     "SpcFireOutlook",
     "Mrms",
     "Gmgsi",
-    // Registered only when `rustdar-overlays/fake-source` is on, listed here
-    // unconditionally: the ledger is append-only and names every spelling ever
-    // claimed, including ones this build does not register. The `cfg` lives in
-    // the consuming tests' expected sets, never in this table.
+    // **Retired: nothing registers this layer** (see `known::FAKE_SOURCE`).
+    // The row stays because the ledger is append-only and names every spelling
+    // ever claimed, including ones no build registers any more — that is what
+    // stops a future layer being handed a string already sitting in somebody's
+    // config file.
     "FakeSource",
 ];
 

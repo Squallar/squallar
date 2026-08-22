@@ -1164,11 +1164,10 @@ impl super::App {
             // `ColorScale` (PerFrameDirect) are refused by the `render_mode`
             // guard at the top of this function, which is also the
             // unregistered-id exit. What lands here is a layer that DOES
-            // declare `RenderMode::Texture` and is not one of the seven above:
+            // declare `RenderMode::Texture` and is not one of the ten above:
             // `Radar`, whose raster is its own pipeline's and never this
             // dispatch's — which is exactly why WO-M13a had to refuse radar by
-            // name at the arrival gate — plus the fake source when its feature
-            // is on.
+            // name at the arrival gate.
             _ => {
                 log::warn!(
                     "spawn_overlay_render reached the dispatch with a layer it \

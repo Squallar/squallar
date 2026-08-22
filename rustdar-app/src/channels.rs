@@ -360,7 +360,8 @@ pub struct SiteCatalogueResponse {
 /// shapes for itself through `VolumeCapable` (WO-M14b-2). Those three pairs are
 /// seams rather than plumbing, and the count is the evidence: the hub has gone
 /// **18 pairs at WO-E3 → 17 since WO-M12b** and has never once gone up — the
-/// whole-source `FakeSource` added at WO-E9b needed no row here.
+/// three whole sources added since (SPC Fire Weather, MRMS, GMGSI) needed no
+/// row here.
 /// `the_channel_hub_only_ever_shrinks` refuses any pair whose base name is not
 /// already on its pinned list, which is what makes this paragraph a test and
 /// not an intention.

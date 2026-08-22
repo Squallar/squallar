@@ -18,14 +18,19 @@
 //! `--all-features`.
 //!
 //! That is not hypothetical. Until WO-FAKESHIP those four rows passed
-//! `--all-features`, which turned on the overlays crate's synthetic
-//! thirteenth layer — the one that exists only to prove a source needs nothing
-//! but the seams. **Every desktop download registered it, drew it, and
-//! persisted its id into the user's config.** Read out of the built
-//! executable's strings, not inferred: the same binary built both ways in one
-//! tree carries the layer's handler symbol 129 times under `--all-features`
-//! and zero times under the list this row now passes. The web arm was never
-//! affected — `wasm-pack … --release` takes default features.
+//! `--all-features`, which turned on the overlays crate's synthetic proof
+//! layer — the one that existed only to show a source needs nothing but the
+//! seams. **Every desktop download registered it, drew it, and persisted its
+//! id into the user's config.** Read out of the built executable's strings,
+//! not inferred: the same binary built both ways in one tree carried the
+//! layer's handler symbol 129 times under `--all-features` and zero times
+//! under the list this row now passes. The web arm was never affected —
+//! `wasm-pack … --release` takes default features.
+//!
+//! **The fake source itself was deleted on 2026-08-22**, so that particular
+//! feature no longer exists to be enabled. The history is kept because the
+//! *shape* of the defect is what this gate refuses, and the shape outlived
+//! the feature: `test-support` below is the same class, live today.
 //!
 //! # What is asserted, and what is not
 //!
@@ -54,7 +59,7 @@
 //! ```
 //!
 //! So `--all-targets`, not `--all-features`, puts `test-support` in the shipped
-//! binary — it did so before WO-FAKESHIP and it still does. It is far milder
+//! binary — it did so before WO-FAKESHIP and it still does. It was far milder
 //! than the fake source (three state-forcing methods, no registered layer, no
 //! catalogue row, nothing written to a config) but it is **the same class of
 //! defect**, and the only fix is to stop building the artifact with the command
@@ -89,9 +94,6 @@ const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
 
 /// Features that exist to serve a test and must never reach a shipped binary.
 ///
-/// * `fake-source` — the synthetic thirteenth layer, whose whole purpose is to
-///   prove a source needs nothing but the seams. A user has no use for it and
-///   its id would be written into their config.
 /// * `test-support` — `rustdar-radar`'s state-forcing hooks
 ///   (`force_retire_at`, `force_serving`, `backdate_handshake`). Its own doc
 ///   says "never enabled by a normal dependency"; `rustdar-app`'s *dev*
@@ -104,7 +106,7 @@ const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
 /// Matched on the segment after the last `/`, so a namespaced `package/name`
 /// entry and a bare `name` are the same needle.
 #[cfg(test)]
-const TEST_ONLY_FEATURES: &[&str] = &["fake-source", "test-support"];
+const TEST_ONLY_FEATURES: &[&str] = &["test-support"];
 
 /// The desktop rows whose artifact is a runnable executable. Named, so a
 /// renamed key or a re-shaped matrix fails loudly instead of passing on an
