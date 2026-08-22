@@ -868,6 +868,30 @@ impl OverlayHandler for ModelDataHandler {
         }
     }
 
+    /// **This pane's run decides how far forward the rail reaches** — f48 on a
+    /// 00/06/12/18Z cycle, f18 on every other hour. See [`forecast_horizon`].
+    ///
+    /// Zero on the `Analysis` axis, which lists the f00 of past runs and so
+    /// never reaches past the wall clock, even though [`Self::time_axis`]
+    /// declares `extends_future` for the layer as a whole.
+    ///
+    /// The fallback matters: [`Self::run_of`] answers `None` until this pane
+    /// has a selection or the cache has a grid, which is exactly the state a
+    /// pane is in when its loop is first switched on. Answering zero there
+    /// would give the loop a backward-only range and no forecast frame would
+    /// survive the clip in [`Self::create_frame_list_task`].
+    fn frame_horizon(&self, pane: &PaneRef<'_>) -> chrono::Duration {
+        let view = self.view(pane);
+        if view.axis != ModelAxis::Forecast {
+            return chrono::Duration::zero();
+        }
+        let now = chrono::Utc::now().naive_utc();
+        let run = self.run_of(view).unwrap_or_else(|| latest_run_at(now));
+        // Measured from the wall clock rather than from the run, so the range
+        // still covers f48 of a run whose f00 is already hours old.
+        chrono::Duration::hours(i64::from(forecast_horizon(run)))
+    }
+
     /// **The frames this pane is holding**: every resident grid of its own
     /// parameter that sits on its own axis — one run's forecast hours, or the
     /// analysis hour of many runs. `valid` is the grid's valid time and `run`

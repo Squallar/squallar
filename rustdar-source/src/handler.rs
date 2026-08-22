@@ -829,6 +829,27 @@ pub trait SourceHandler: Send {
         TimeAxis::Live
     }
 
+    /// **How far past the wall clock this layer's frames reach, in this pane.**
+    ///
+    /// Zero for every layer whose stamps are all history — which is every
+    /// layer whose [`Self::time_axis`] does not declare `extends_future`, and
+    /// also a forecast layer whose current selection happens to name a past
+    /// set. A caller reads the axis to decide whether the rail reaches forward
+    /// at all, and reads this to decide how far.
+    ///
+    /// **Pane-scoped because the horizon belongs to the run, not to the
+    /// layer**: the same HRRR layer reaches 48 hours off a 00/06/12/18Z cycle
+    /// and 18 off every other hour, so nothing above can hold this as a
+    /// constant beside the id.
+    ///
+    /// An upper bound on the range a loop should ask for, not a promise of a
+    /// frame at the end of it — [`Self::create_frame_list_task`] clips its own
+    /// stamps to the range it is handed.
+    fn frame_horizon(&self, pane: &PaneRef<'_>) -> chrono::Duration {
+        let _ = pane;
+        chrono::Duration::zero()
+    }
+
     /// **What frames this layer could show over `range`, as it already knows
     /// it.** A synchronous query over handler-owned state — it **never**
     /// performs I/O; [`Self::create_frame_list_task`] is the fetch that fills
