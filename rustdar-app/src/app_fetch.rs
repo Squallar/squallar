@@ -1070,12 +1070,14 @@ impl super::App {
         let window = self.window.clone();
 
         match &id {
-            // **The seven described kinds** — the three polygon kinds, the two
+            // **The eight described kinds** — the four polygon kinds, the two
             // hit-map kinds, the model grid and, since WO-M10c, the site
             // table. The list is a coincidence of "answers `prepare_job`",
             // pinned in `texture_tests`; `RadarSites` joined it when the
-            // handler gained a pane to read its site from.
+            // handler gained a pane to read its site from, and
+            // `SpcFireOutlook` when the fire weather layer landed.
             id if *id == known::SPC_OUTLOOK
+                || *id == known::SPC_FIRE_OUTLOOK
                 || *id == known::SPC_DISCUSSIONS
                 || *id == known::NWS_ALERTS
                 || *id == known::STORM_REPORTS

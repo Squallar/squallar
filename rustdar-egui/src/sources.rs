@@ -31,7 +31,7 @@ pub fn all() -> Vec<Box<dyn SourceHandler>> {
 /// The `cfg!` term is the fake source, which is registered only under
 /// `rustdar-overlays/fake-source`.
 #[cfg(test)]
-pub(crate) const REGISTERED_LAYER_COUNT: usize = 12 + cfg!(feature = "fake-source") as usize;
+pub(crate) const REGISTERED_LAYER_COUNT: usize = 13 + cfg!(feature = "fake-source") as usize;
 
 /// **How many FIELDS this build registers — the same hand-kept discipline as
 /// [`REGISTERED_LAYER_COUNT`], one level down.**
@@ -223,15 +223,15 @@ mod controls_parity_tests {
     /// options. A handler whose disabled tree shrank stranded its
     /// sub-options exactly when a user goes looking for why a layer is off
     /// or what it will show once on (the M9.1 user report), so each of the
-    /// twelve is pinned by name.
+    /// thirteen is pinned by name.
     #[test]
     fn every_handlers_control_tree_is_identical_hidden_and_shown() {
         let mut registry = OverlayRegistry::with_handlers(all());
         let kinds: Vec<LayerId> = registry.handlers().map(|h| h.id()).collect();
         assert_eq!(
             kinds.len(),
-            12 + cfg!(feature = "fake-source") as usize,
-            "the registry carries all twelve handlers - thirteen with the \
+            13 + cfg!(feature = "fake-source") as usize,
+            "the registry carries all thirteen handlers - fourteen with the \
              fake source registered - and the walk below must cover every one"
         );
         let ctx = PaneRef::bare(0);
@@ -257,9 +257,10 @@ mod state_key_tests {
     /// **literal** list — the self-verifying-inventory discipline: the live
     /// set is checked against it below, so neither side can rot alone.
     #[cfg(not(feature = "fake-source"))]
-    const STATE_KEYS: [&str; 12] = [
+    const STATE_KEYS: [&str; 13] = [
         "ModelData",
         "SpcOutlook",
+        "SpcFireOutlook",
         "SpcDiscussions",
         "NwsAlerts",
         "StormReports",
@@ -272,13 +273,14 @@ mod state_key_tests {
         "ColorScale",
     ];
 
-    /// The same twelve plus the fake source's own key. **A second definition
+    /// The same thirteen plus the fake source's own key. **A second definition
     /// rather than a `#[cfg]`'d element**, because `#[cfg]` on an array element
     /// is not stable.
     #[cfg(feature = "fake-source")]
-    const STATE_KEYS: [&str; 13] = [
+    const STATE_KEYS: [&str; 14] = [
         "ModelData",
         "SpcOutlook",
+        "SpcFireOutlook",
         "SpcDiscussions",
         "NwsAlerts",
         "StormReports",
@@ -294,7 +296,7 @@ mod state_key_tests {
 
     /// **The tripwire on the bytes saved handler state is filed under.**
     #[test]
-    fn handler_state_keys_are_the_twelve_names_saved_configs_file_state_under() {
+    fn handler_state_keys_are_the_thirteen_names_saved_configs_file_state_under() {
         let handlers = all();
         assert_eq!(
             handlers.len(),
@@ -311,7 +313,7 @@ mod state_key_tests {
         pinned.sort_unstable();
         assert_eq!(
             live, pinned,
-            "the registered ids are no longer exactly the twelve names saved \
+            "the registered ids are no longer exactly the thirteen names saved \
              configs file handler state under — a rename or a retirement \
              orphans every user's saved state for that layer",
         );
@@ -398,6 +400,7 @@ mod registry_identity_tests {
         let mut expected: Vec<&str> = vec![
             "ModelData",
             "SpcOutlook",
+            "SpcFireOutlook",
             "Radar",
             "SpcDiscussions",
             "NwsAlerts",
@@ -419,7 +422,7 @@ mod registry_identity_tests {
         );
     }
 
-    /// **Every layer's time axis, pinned by name over the composed twelve.**
+    /// **Every layer's time axis, pinned by name over the composed thirteen.**
     ///
     /// Written as the whole map rather than as "the non-Live ones", so a new
     /// layer cannot join without this list saying what it does with the clock,
@@ -427,7 +430,7 @@ mod registry_identity_tests {
     /// lightning are the two `EventLifetime` layers (items with validity
     /// windows); radar and the model are the two `FrameSeries` layers — radar
     /// on the ~5-minute volume cadence and never ahead of the clock, the model
-    /// on hourly runs that are — and the other eight draw the latest thing
+    /// on hourly runs that are — and the other nine draw the latest thing
     /// they fetched.
     ///
     /// **Radar's row moved deliberately at WO-E7b** (was `Live`), which is
@@ -450,6 +453,7 @@ mod registry_identity_tests {
         let mut expected: Vec<(&str, TimeAxis)> = vec![
             ("ModelData", hourly_forecast),
             ("SpcOutlook", TimeAxis::Live),
+            ("SpcFireOutlook", TimeAxis::Live),
             ("Radar", volume_cadence),
             ("SpcDiscussions", TimeAxis::Live),
             ("NwsAlerts", TimeAxis::EventLifetime),

@@ -186,7 +186,7 @@ fetches.
 | Storm reports (prelim & filtered) | Overlay | ✅          | ✅       | ✅       |
 | SPC mesoanalysis parameters       | ❌       | ❌          | ✅       | ❌       |
 | Significant hail/tornado probs    | ❌       | ❌          | ✅       | ✅       |
-| Fire weather outlooks             | ❌       | ❌          | ❌       | ❌       |
+| Fire weather outlooks (Day 1–8)   | ❌       | ❌          | ❌       | ✅       |
 
 Rustdar's watch and warning geometry comes from the NWS Alerts API, which is
 county/zone-shaped; the SPC watch parallelograms themselves are not fetched.

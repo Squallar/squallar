@@ -1,6 +1,7 @@
 //! Layer identity as an open string: [`LayerId`]. The shipped values below are
-//! the **exact bytes sitting in every user's config file today**; the thirteenth
-//! is a reservation, registered only under `rustdar-overlays/fake-source`.
+//! the **exact bytes sitting in every user's config file today**; the
+//! fourteenth is a reservation, registered only under
+//! `rustdar-overlays/fake-source`.
 
 use std::borrow::Cow;
 
@@ -49,6 +50,7 @@ pub mod known {
 
     pub const MODEL_DATA: LayerId = LayerId::from_static("ModelData");
     pub const SPC_OUTLOOK: LayerId = LayerId::from_static("SpcOutlook");
+    pub const SPC_FIRE_OUTLOOK: LayerId = LayerId::from_static("SpcFireOutlook");
     pub const RADAR: LayerId = LayerId::from_static("Radar");
     pub const SPC_DISCUSSIONS: LayerId = LayerId::from_static("SpcDiscussions");
     pub const NWS_ALERTS: LayerId = LayerId::from_static("NwsAlerts");
@@ -66,12 +68,21 @@ pub mod known {
     pub const FAKE_SOURCE: LayerId = LayerId::from_static("FakeSource");
 }
 
-/// Every layer id ever registered, in the default draw order — bottom to top.
+/// Every layer id ever registered.
 ///
 /// **APPEND-ONLY.** These strings are persisted in user config files. Renaming
 /// a layer requires a config migration step plus a load-time alias for the old
 /// spelling — never an edit to an existing row.
-pub const LAYER_ID_LEDGER: [&str; 13] = [
+///
+/// The first twelve rows happen to be the historical default draw order,
+/// bottom to top; **that is a coincidence of when they were added and nothing
+/// reads it.** The draw order is a pure function of
+/// `SourceHandler::draw_order_weight`, composed by
+/// `rustdar_egui::sources::default_draw_order` and pinned by
+/// `draw_order_weights_encode_the_default_draw_order`. `SpcFireOutlook` draws
+/// third from the bottom (weight 25) and is appended here regardless, because
+/// append-only wins.
+pub const LAYER_ID_LEDGER: [&str; 14] = [
     "ModelData",
     "SpcOutlook",
     "Radar",
@@ -84,6 +95,7 @@ pub const LAYER_ID_LEDGER: [&str; 13] = [
     "RadarSites",
     "UserLocation",
     "ColorScale",
+    "SpcFireOutlook",
     // Registered only when `rustdar-overlays/fake-source` is on, listed here
     // unconditionally: the ledger is append-only and names every spelling ever
     // claimed, including ones this build does not register. The `cfg` lives in
@@ -111,6 +123,7 @@ mod tests {
             known::RADAR_SITES,
             known::USER_LOCATION,
             known::COLOR_SCALE,
+            known::SPC_FIRE_OUTLOOK,
             known::FAKE_SOURCE,
         ];
         assert_eq!(known_ids.len(), LAYER_ID_LEDGER.len());

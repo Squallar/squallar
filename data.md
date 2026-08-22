@@ -188,7 +188,7 @@ Every ✅ in this table is a CONUS value, because every one of them is HRRR.
 | Mesoscale Discussions (MDs)            | ✅       | CONUS  | simple only | ✅ Free — SPC RSS feed                                                                                                       |
 | Watches (Tornado/Severe Tstorm)        | Partial | CONUS  | open        | ✅ Free — arrive through the NWS Alerts API as county/zone geometry; the SPC watch parallelograms themselves are not fetched |
 | Storm Reports (preliminary & filtered) | ✅       | CONUS  | simple only | ✅ Free — SPC CSV files                                                                                                      |
-| Fire Weather Outlooks                  | ❌       | CONUS  | simple only | ✅ Free — SPC GeoJSON endpoints                                                                                              |
+| Fire Weather Outlooks (Day 1–8)        | ✅       | CONUS  | simple only | ✅ Free — SPC GeoJSON endpoints; 28 paths, all `200` when probed 2026-08-21                                                  |
 | SPC Mesoanalysis graphics              | ❌       | CONUS  | simple only | ✅ Free — SPC website (raster images)                                                                                        |
 | Precipitation Discussions              | ❌       | CONUS  | blocked     | ✅ Free — WPC website (`www.wpc.ncep.noaa.gov`, no `ACAO`)                                                                   |
 | Sounding data / SPC skew-T parameters  | ❌       | CONUS  | blocked     | ✅ Free — University of Wyoming (`weather.uwyo.edu`, no `ACAO`)                                                              |

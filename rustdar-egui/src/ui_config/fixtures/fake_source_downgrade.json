@@ -45,6 +45,14 @@
         },
         {
           "config": {
+            "enabled_hazards": [],
+            "selected_day": "Day1"
+          },
+          "enabled": false,
+          "id": "SpcFireOutlook"
+        },
+        {
+          "config": {
             "elevation": 0.0,
             "enabled": true,
             "live_chunks": true,
