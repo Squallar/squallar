@@ -835,10 +835,17 @@ jobs:
       # Python's `mimetypes`, whose *built-in* table -- not `/etc/mime.types`,
       # which the runner may or may not carry -- has mapped `.wasm` to
       # `application/wasm` since CPython 3.8, and `.webmanifest` to
-      # `application/manifest+json` for as long. Every extension this tree ships
-      # is covered, so `sync` alone is correct. Verified against the 3.8, 3.10,
+      # `application/manifest+json` for as long. Verified against the 3.8, 3.10,
       # 3.11, 3.12 and 3.13 stdlib sources; the CLI bundles its own interpreter,
       # so the runner's `python3` is irrelevant.
+      #
+      # One extension is deliberately NOT in that table: `.pack`. `mimetypes`
+      # returns nothing for it, the CLI sends no `Content-Type`, and S3 stores it
+      # as `binary/octet-stream` -- which is right. `zone_pack_source::read_url`
+      # takes the response as raw `bytes()` and parses a magic number, so nothing
+      # sniffs the header, and inventing a media type here would be a string this
+      # tree has to keep in step with nothing. Every other extension staged is
+      # covered, so `sync` alone is still correct.
       #
       # `--delete` prunes what a previous deploy left. It never deletes a file
       # the new deploy replaces: `rustdar_web.js` and `rustdar_web_bg.wasm` keep
