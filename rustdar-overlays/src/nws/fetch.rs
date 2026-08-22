@@ -72,6 +72,10 @@ pub async fn fetch_active_alerts(
 
     let mut alerts = parse_alerts(&json);
 
+    // Once per session, on this fetch task rather than anywhere near a frame,
+    // and never fatal: without a pack the round is what it always was.
+    super::zone_pack_source::ensure_installed(client, zone_cache_dir).await;
+
     // Many alerts carry zone references instead of geometry. A zone that will
     // not resolve is **not** an error for the round; it is carried back beside
     // the alerts, which is what lets the layer draw what it has and still say
