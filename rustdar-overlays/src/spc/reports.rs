@@ -24,8 +24,14 @@ impl StormReportKind {
 #[derive(Debug, Clone)]
 pub struct StormReport {
     pub kind: StormReportKind,
-    /// HHMM UTC, e.g. "1339".
+    /// HHMM UTC, e.g. "1339" — display truth, kept verbatim.
     pub time: String,
+    /// **Parsed at parse time, never at raster time**: the instant this
+    /// report happened, derived from `time` by [`report_instant`]'s 12Z-12Z
+    /// convective-day rule. `None` when `time` does not name a real clock
+    /// reading; a `None` is never dropped for want of a readable time — the
+    /// same rule as [`NwsAlert::valid_from`](crate::nws::alert::NwsAlert).
+    pub valid: Option<chrono::NaiveDateTime>,
     /// Unit depends on `kind`: tornado = F/EF number; hail = hundredths of an
     /// inch (100 = 1.00"); wind = knots. `None` for the feed's "UNK".
     pub magnitude: Option<f64>,
@@ -35,6 +41,42 @@ pub struct StormReport {
     pub lat: f64,
     pub lon: f64,
     pub comments: String,
+}
+
+/// **The instant an HHMM in `today_*.csv` names, given the wall clock at
+/// fetch.**
+///
+/// The CSV is one **convective day**: a window running 12Z to 12Z the next
+/// calendar day. The date half of the instant is therefore derived, never the
+/// fetch date itself: the file's window opened at 12Z on
+/// `(anchor - 12h).date()`, an HHMM of 12:00 or later happened on that
+/// calendar date, and an HHMM before 12:00 happened on the calendar date
+/// **after** it. Stamping the fetch date onto every row would file each
+/// post-midnight report ("0230") a full day early — the pinned rollover case
+/// below.
+///
+/// `anchor` is the wall clock at fetch — the only instant that says which
+/// convective day `today_*.csv` currently is. Never a scrubbed `as_of`: the
+/// file fetched is always the current one regardless of what a pane depicts.
+///
+/// `None` for anything that is not four ASCII digits naming a real clock
+/// reading; the caller keeps the raw string for display.
+pub fn report_instant(hhmm: &str, anchor: chrono::NaiveDateTime) -> Option<chrono::NaiveDateTime> {
+    if hhmm.len() != 4 || !hhmm.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (hh, mm) = hhmm.split_at(2);
+    let hour: u32 = hh.parse().ok()?;
+    let minute: u32 = mm.parse().ok()?;
+    let window_opened = (anchor - chrono::Duration::hours(12)).date();
+    let date = if hour >= 12 {
+        window_opened
+    } else {
+        window_opened.succ_opt()?
+    };
+    // `and_hms_opt` refuses hour > 23 / minute > 59, so "2461" is rejected
+    // here rather than wrapped into a fictitious instant.
+    date.and_hms_opt(hour, minute, 0)
 }
 
 /// Origin must come from
@@ -85,9 +127,12 @@ impl StormReportRound {
 }
 
 /// `client` must be the preflight-safe [`crate::spc::fetch::spc_client`].
+/// `anchor` is the wall clock at fetch, which dates every row's HHMM — see
+/// [`report_instant`].
 pub async fn fetch_storm_reports(
     client: &reqwest::Client,
     sources: &rustdar_source::origins::DataSources,
+    anchor: chrono::NaiveDateTime,
 ) -> Result<StormReportRound, FetchError> {
     log::info!("Fetching SPC storm reports");
 
@@ -96,16 +141,19 @@ pub async fn fetch_storm_reports(
             client,
             &report_url(sources, StormReportKind::Tornado),
             StormReportKind::Tornado,
+            anchor,
         ),
         fetch_csv(
             client,
             &report_url(sources, StormReportKind::Hail),
             StormReportKind::Hail,
+            anchor,
         ),
         fetch_csv(
             client,
             &report_url(sources, StormReportKind::Wind),
             StormReportKind::Wind,
+            anchor,
         ),
     )
     .await;
@@ -162,6 +210,7 @@ async fn fetch_csv(
     client: &reqwest::Client,
     url: &str,
     kind: StormReportKind,
+    anchor: chrono::NaiveDateTime,
 ) -> Result<Vec<StormReport>, FetchError> {
     let response = client.get(url).send().await.map_err(|e| {
         FetchError::from_transport(&e, format!("HTTP request failed for {url}: {e}"))
@@ -179,12 +228,16 @@ async fn fetch_csv(
         FetchError::from_transport(&e, format!("Failed to read response body: {e}"))
     })?;
 
-    parse_csv(&text, kind).map_err(FetchError::transient)
+    parse_csv(&text, kind, anchor).map_err(FetchError::transient)
 }
 
 /// `Time,{F_Scale|Size|Speed},Location,County,State,Lat,Lon,Comments`, lat/lon
 /// in decimal degrees. Comments may contain commas, hence `splitn(8, ',')`.
-fn parse_csv(text: &str, kind: StormReportKind) -> Result<Vec<StormReport>, String> {
+fn parse_csv(
+    text: &str,
+    kind: StormReportKind,
+    anchor: chrono::NaiveDateTime,
+) -> Result<Vec<StormReport>, String> {
     let mut reports = Vec::new();
 
     for (i, line) in text.lines().enumerate() {
@@ -231,9 +284,11 @@ fn parse_csv(text: &str, kind: StormReportKind) -> Result<Vec<StormReport>, Stri
             s => s.parse::<f64>().ok(),
         };
 
+        let valid = report_instant(&time, anchor);
         reports.push(StormReport {
             kind,
             time,
+            valid,
             magnitude,
             location,
             county,
@@ -245,4 +300,76 @@ fn parse_csv(text: &str, kind: StormReportKind) -> Result<Vec<StormReport>, Stri
     }
 
     Ok(reports)
+}
+
+#[cfg(test)]
+mod convective_day_tests {
+    use super::report_instant;
+
+    fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(y, mo, d)
+            .unwrap()
+            .and_hms_opt(h, mi, 0)
+            .unwrap()
+    }
+
+    /// An afternoon HHMM lands on the calendar date the window opened on.
+    #[test]
+    fn an_afternoon_report_lands_on_the_date_the_window_opened() {
+        assert_eq!(
+            report_instant("1339", at(2026, 8, 22, 18, 0)),
+            Some(at(2026, 8, 22, 13, 39)),
+        );
+    }
+
+    /// **The 12Z-rollover pin.** "0230" in a file whose window opened at 12Z
+    /// on the 22nd happened on the 23rd: the convective day runs 12Z->12Z, so
+    /// every HHMM before 12:00 is on the calendar date AFTER the one the
+    /// window opened on. Stamping the fetch date instead files it a day early.
+    #[test]
+    fn a_small_hours_report_lands_on_the_next_calendar_date() {
+        assert_eq!(
+            report_instant("0230", at(2026, 8, 22, 18, 0)),
+            Some(at(2026, 8, 23, 2, 30)),
+        );
+    }
+
+    /// The same convective day, fetched after midnight: the anchor's calendar
+    /// date has already moved to the 23rd, but the window still opened at 12Z
+    /// on the 22nd — so an afternoon HHMM still dates to the 22nd, and a
+    /// small-hours one to the 23rd. Deriving the date from `anchor.date()`
+    /// (instead of `anchor - 12h`) shears every afternoon report forward a
+    /// day here.
+    #[test]
+    fn a_post_midnight_fetch_still_dates_the_afternoon_to_yesterday() {
+        let anchor = at(2026, 8, 23, 5, 0);
+        assert_eq!(
+            report_instant("1339", anchor),
+            Some(at(2026, 8, 22, 13, 39)),
+        );
+        assert_eq!(report_instant("0230", anchor), Some(at(2026, 8, 23, 2, 30)));
+    }
+
+    /// The boundary is exactly 12:00: "1200" opened the window, "1159" is the
+    /// last minute before it closes — a day apart.
+    #[test]
+    fn the_boundary_splits_at_exactly_twelve_z() {
+        let anchor = at(2026, 8, 22, 18, 0);
+        assert_eq!(report_instant("1200", anchor), Some(at(2026, 8, 22, 12, 0)));
+        assert_eq!(
+            report_instant("1159", anchor),
+            Some(at(2026, 8, 23, 11, 59))
+        );
+    }
+
+    /// Junk stays `None` rather than becoming a fictitious instant: too
+    /// short, non-digit (including multi-byte, which must not panic), and
+    /// four digits that are not a clock reading.
+    #[test]
+    fn junk_times_parse_to_none_not_to_a_fictitious_instant() {
+        let anchor = at(2026, 8, 22, 18, 0);
+        for junk in ["12", "12345", "1é2", "éé", "🌀", "2461", "1260", ""] {
+            assert_eq!(report_instant(junk, anchor), None, "{junk:?}");
+        }
+    }
 }

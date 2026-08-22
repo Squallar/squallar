@@ -404,12 +404,16 @@ mod registry_identity_tests {
     ///
     /// Written as the whole map rather than as "the non-Live ones", so a new
     /// layer cannot join without this list saying what it does with the clock,
-    /// and a layer that quietly changes arm is a named diff. Alerts and
-    /// lightning are the two `EventLifetime` layers (items with validity
-    /// windows); radar, the model and GMGSI are the three `FrameSeries` layers
-    /// — radar on the ~5-minute volume cadence and never ahead of the clock,
-    /// the model on hourly runs that are, GMGSI on the hourly global blend
-    /// that is not — and the other ten draw the latest thing they fetched.
+    /// and a layer that quietly changes arm is a named diff. Five layers are
+    /// `EventLifetime` (items or issuances with validity windows): alerts and
+    /// lightning from the start, and — WB-2/4/5 — storm reports (a point
+    /// event's instant, under the 12Z convective-day rule), the two SPC
+    /// outlook layers (`valid`/`expire` windows; the fire layer has **no
+    /// archive to reach**, the convective one an archive not yet wired).
+    /// Radar, the model and GMGSI are the three `FrameSeries` layers — radar
+    /// on the ~5-minute volume cadence and never ahead of the clock, the
+    /// model on hourly runs that are, GMGSI on the hourly global blend that
+    /// is not — and the other seven draw the latest thing they fetched.
     ///
     /// **MRMS is `Live` on purpose**, though it publishes a stamped granule
     /// every two minutes and could be a fourth `FrameSeries` layer. A layer
@@ -445,12 +449,12 @@ mod registry_identity_tests {
             ("Gmgsi", hourly_mosaic),
             ("ModelData", hourly_forecast),
             ("Mrms", TimeAxis::Live),
-            ("SpcOutlook", TimeAxis::Live),
-            ("SpcFireOutlook", TimeAxis::Live),
+            ("SpcOutlook", TimeAxis::EventLifetime),
+            ("SpcFireOutlook", TimeAxis::EventLifetime),
             ("Radar", volume_cadence),
             ("SpcDiscussions", TimeAxis::Live),
             ("NwsAlerts", TimeAxis::EventLifetime),
-            ("StormReports", TimeAxis::Live),
+            ("StormReports", TimeAxis::EventLifetime),
             ("Lightning", TimeAxis::EventLifetime),
             ("Metar", TimeAxis::Live),
             ("CityLabels", TimeAxis::Live),
@@ -549,11 +553,12 @@ mod registry_identity_tests {
         );
     }
 
-    /// The as-of quantum, for the two layers that read the depicted instant.
-    /// Lightning's is a second because its fade ramp is sub-minute; everything
-    /// else takes the trait's minute, which is the resolution NWS lifetimes
-    /// are published at. Consumed at WO-E7c, pinned here so it cannot drift
-    /// unnoticed in the meantime.
+    /// The as-of quantum, for the layers that read the depicted instant —
+    /// five since WB-2/4/5. Lightning's is a second because its fade ramp is
+    /// sub-minute; everything else takes the trait's minute, which is the
+    /// resolution NWS lifetimes are published at (and coarser than any storm
+    /// report or outlook boundary needs). Consumed at WO-E7c, pinned here so
+    /// it cannot drift unnoticed in the meantime.
     #[test]
     fn the_as_of_quantum_is_a_second_only_where_the_picture_moves_that_fast() {
         for handler in all() {

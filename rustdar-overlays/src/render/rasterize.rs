@@ -610,6 +610,12 @@ pub struct ReportPaint {
     pub kind: StormReportKind,
     pub lat: f64,
     pub lon: f64,
+    /// The instant the report happened ([`StormReport::valid`]), for the
+    /// as-of cull below; `None` draws at every instant — a report is never
+    /// dropped for want of a readable time.
+    ///
+    /// [`StormReport::valid`]: crate::spc::reports::StormReport::valid
+    pub valid: Option<chrono::NaiveDateTime>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -618,6 +624,11 @@ pub struct ReportsInput {
     pub zoom: f64,
     pub is_dark: bool,
     pub device_scale: f32,
+    /// The instant the picture **depicts**, captured at dispatch
+    /// (`RasterizeContext::as_of`) and carried on the wire — the worker culls
+    /// against this and never against a clock of its own, the same rule as
+    /// [`GlmStrikesInput::now`].
+    pub as_of: chrono::NaiveDateTime,
 }
 
 rustdar_source::impl_job_input!(ReportsInput);
@@ -635,6 +646,7 @@ pub fn rasterize_storm_reports(
         zoom,
         is_dark,
         device_scale,
+        as_of,
     } = input;
     let (zoom, is_dark) = (*zoom, *is_dark);
     let scale = sane_device_scale(*device_scale);
@@ -668,6 +680,18 @@ pub fn rasterize_storm_reports(
     let mut hit_cells = HitCells::new(width, height);
 
     for (idx, report) in reports.iter().enumerate() {
+        // **A report later than the depicted instant has not happened yet**
+        // (`TimeAxis::EventLifetime`): the picture at `as_of` is which of
+        // today's reports have already happened. The cull lives HERE and not
+        // in `paint_input`, because a row's position is its hit-map id
+        // (`HitMap::from_cells`): dropping rows at the handler would renumber
+        // every row after the gap and hand hovers to the wrong reports. A
+        // culled row travels, draws nothing and records no cells — absent
+        // from the picture, aligned in the map. `None` passes: a report is
+        // never dropped for want of a readable time.
+        if report.valid.is_some_and(|valid| valid > *as_of) {
+            continue;
+        }
         // Into the viewport's frame first — see `rasterize_radar_sites`.
         let lon = mb.nearest_lon(report.lon);
         let (px, py) = mb.project(report.lat, lon, w, h);

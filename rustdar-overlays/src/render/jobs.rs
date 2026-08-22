@@ -332,11 +332,22 @@ impl JobSpec for ReportsJob {
         out.extend_from_slice(&reports.zoom.to_le_bytes());
         out.push(u8::from(reports.is_dark));
         out.extend_from_slice(&reports.device_scale.to_le_bytes());
+        // The depicted instant, on the wire (WB-2): the worker culls
+        // not-yet-happened reports against this and never against a clock of
+        // its own — the same rule as GLM's `now`.
+        encode_datetime(out, &reports.as_of);
         out.extend_from_slice(&(reports.reports.len() as u32).to_le_bytes());
         for report in &reports.reports {
             out.push(StormReportKindWire(report.kind).wire_code());
             out.extend_from_slice(&report.lat.to_le_bytes());
             out.extend_from_slice(&report.lon.to_le_bytes());
+            match report.valid {
+                None => out.push(0),
+                Some(valid) => {
+                    out.push(1);
+                    encode_datetime(out, &valid);
+                }
+            }
         }
     }
 
@@ -344,6 +355,7 @@ impl JobSpec for ReportsJob {
         let zoom = r.f64()?;
         let is_dark = flag(r.u8()?)?;
         let device_scale = r.f32()?;
+        let as_of = decode_datetime(r)?;
         let count = r.u32()? as usize;
         let mut reports = Vec::new();
         for _ in 0..count {
@@ -351,6 +363,11 @@ impl JobSpec for ReportsJob {
                 kind: StormReportKindWire::from_wire_code(r.u8()?)?.0,
                 lat: r.f64()?,
                 lon: r.f64()?,
+                valid: match r.u8()? {
+                    0 => None,
+                    1 => Some(decode_datetime(r)?),
+                    _ => return None,
+                },
             });
         }
         Some((
@@ -359,6 +376,7 @@ impl JobSpec for ReportsJob {
                 zoom,
                 is_dark,
                 device_scale,
+                as_of,
             },
             geo,
         ))
@@ -1348,25 +1366,30 @@ mod tests {
     fn the_reports_row_round_trips_in_order() {
         let job = DescribedJob::new(ReportsInput {
             reports: vec![
+                // Both wire arms of `valid`: dated rows and an undated one.
                 ReportPaint {
                     kind: StormReportKind::Wind,
                     lat: 35.5,
                     lon: -97.5,
+                    valid: Some(ts(1_755_216_000, 0)),
                 },
                 ReportPaint {
                     kind: StormReportKind::Tornado,
                     lat: 35.25,
                     lon: -97.75,
+                    valid: None,
                 },
                 ReportPaint {
                     kind: StormReportKind::Hail,
                     lat: 36.0,
                     lon: -96.5,
+                    valid: Some(ts(1_755_219_600, 0)),
                 },
             ],
             zoom: 6.0,
             is_dark: false,
             device_scale: 1.0,
+            as_of: ts(1_755_220_000, 0),
         });
         assert_round_trips(&JOB_CODECS[4], &job);
     }

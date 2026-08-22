@@ -33,9 +33,27 @@ impl crate::fetch_policy::FetchRound for NwsAlertFetchResult {
     type Shape = crate::fetch_policy::Assembled;
 }
 
+/// How long an item outlives the **earlier** of its `valid_until` and its
+/// departure from the feed, in hours, before eviction (WB-4): the depth of
+/// backward scrub over expired alerts. A full convective day covers any
+/// within-session scrub the timeline offers while bounding the retained set
+/// to roughly one day of national issuance. The eviction clock is the wall
+/// clock at each poll, never `as_of`.
+const RETAINED_HOURS: i64 = 24;
+
 #[derive(Debug)]
 pub(crate) struct AlertItem {
     pub alert: NwsAlert,
+    /// When this alert left the active feed — the wall clock of the first
+    /// poll that no longer carried it — or `None` while the feed still does
+    /// (WB-4). The closest observable stand-in for a cancellation time.
+    ///
+    /// **A departed item is history**: it draws only at a depicted instant
+    /// before its departure, and every other surface — counts, clicks,
+    /// signature, status line — sees the active feed exactly as wholesale
+    /// replacement showed it. That containment is what keeps a live pane
+    /// byte-identical while retention exists.
+    pub departed: Option<chrono::NaiveDateTime>,
 }
 
 impl OverlayItem for AlertItem {
@@ -110,6 +128,7 @@ impl OverlayItem for AlertItem {
                 label: "Hide from map".into(),
                 target: Arc::new(AlertItem {
                     alert: alert.clone(),
+                    departed: self.departed,
                 }),
                 kind: PopupActionKind::HideFromMap,
             }],
@@ -189,11 +208,16 @@ impl NwsAlertHandler {
         }
     }
 
-    /// Whether this alert would paint **in this pane**: category on there and
-    /// not hidden anywhere. The one filter, so count, signature, status line
-    /// and clickable set cannot drift.
+    /// Whether this alert would paint **in this pane**: in the active feed,
+    /// category on there and not hidden anywhere. The one filter, so count,
+    /// signature, status line and clickable set cannot drift.
+    ///
+    /// `departed.is_none()` first: a retained item that left the feed exists
+    /// only for the as-of paint path ([`Self::paint_input`]) and must be
+    /// invisible to every surface this predicate feeds.
     fn is_drawn(&self, view: &AlertPaneState, item: &AlertItem) -> bool {
-        view.enabled_categories.contains(&item.alert.category)
+        item.departed.is_none()
+            && view.enabled_categories.contains(&item.alert.category)
             && !self.hidden_alerts.contains(&item.alert.id)
     }
 
@@ -247,6 +271,12 @@ impl NwsAlertHandler {
                 .filter(|i| {
                     i.alert.valid_from.is_none_or(|from| from <= ctx.as_of)
                         && i.alert.valid_until.is_none_or(|until| ctx.as_of < until)
+                        // A departed item is history (WB-4): visible only
+                        // before the poll that lost it. On a live pane
+                        // `as_of` is the wall clock, which is never before a
+                        // past departure — so the live rows are exactly the
+                        // active feed's rows and the bytes are unchanged.
+                        && i.departed.is_none_or(|gone| ctx.as_of < gone)
                 })
                 .map(|i| rasterize::AlertPaint {
                     id: i.alert.id.clone(),
@@ -339,7 +369,10 @@ impl OverlayHandler for NwsAlertHandler {
     /// are true at the depicted instant — the definition of
     /// [`TimeAxis::EventLifetime`]. The as-of filter is in
     /// [`Self::paint_input`]; the quantum is the trait's 60 s default, which
-    /// is the resolution NWS lifetimes are actually published at.
+    /// is the resolution NWS lifetimes are actually published at. Backward
+    /// reach is session-held retention, not an archive: [`AlertItem::departed`]
+    /// keeps an alert that left the feed drawable at instants inside its
+    /// window, for `RETAINED_HOURS` past its end.
     fn time_axis(&self) -> TimeAxis {
         TimeAxis::EventLifetime
     }
@@ -457,7 +490,13 @@ impl OverlayHandler for NwsAlertHandler {
     }
 
     fn item_count(&self, _pane: &PaneRef<'_>) -> usize {
-        self.state.data.len()
+        // The active feed only: retained history (WB-4) is invisible to
+        // every surface but an as-of paint.
+        self.state
+            .data
+            .iter()
+            .filter(|i| i.departed.is_none())
+            .count()
     }
 
     /// The alerts a click can land on, each borrowing its own polygons —
@@ -497,12 +536,51 @@ impl OverlayHandler for NwsAlertHandler {
             Ok(fetched) => {
                 let crate::nws::fetch::ActiveAlerts { alerts, zones } = fetched;
                 log::info!("Received {} NWS alerts", alerts.len());
+                let now = chrono::Utc::now().naive_utc();
                 let current_ids: HashSet<String> = alerts.iter().map(|a| a.id.clone()).collect();
-                self.hidden_alerts.retain(|id| current_ids.contains(id));
-                let items = alerts
+                // **Merge, not wholesale replace (WB-4).** The active feed
+                // first, in feed order — on a live pane these are the only
+                // rows that paint, so the live bytes are the bytes wholesale
+                // replacement produced. An id that reappears takes its fresh
+                // copy (zone geometry included) and stops being departed.
+                let mut items: Vec<Arc<AlertItem>> = alerts
                     .into_iter()
-                    .map(|alert| Arc::new(AlertItem { alert }))
+                    .map(|alert| {
+                        Arc::new(AlertItem {
+                            alert,
+                            departed: None,
+                        })
+                    })
                     .collect();
+                // Then the history: an alert that left the feed — expired or
+                // cancelled between polls — keeps drawing at instants inside
+                // its window, so backward scrub shows the warnings in force
+                // then. Marked with the poll that lost it, and EVICTED
+                // `RETAINED_HOURS` past the earlier of that mark and its own
+                // `valid_until` — bounded retention, never "keep forever".
+                for old in std::mem::take(&mut self.state.data) {
+                    if current_ids.contains(&old.alert.id) {
+                        continue;
+                    }
+                    let departed = old.departed.unwrap_or(now);
+                    let end = old.alert.valid_until.map_or(departed, |u| u.min(departed));
+                    if now - end >= chrono::Duration::hours(RETAINED_HOURS) {
+                        continue;
+                    }
+                    items.push(if old.departed.is_some() {
+                        old
+                    } else {
+                        Arc::new(AlertItem {
+                            alert: old.alert.clone(),
+                            departed: Some(departed),
+                        })
+                    });
+                }
+                // Pruned against what is RETAINED, not against the feed: a
+                // dismissed alert must stay dismissed while scrub can still
+                // reach it, and is forgotten only when its item is evicted.
+                self.hidden_alerts
+                    .retain(|id| items.iter().any(|i| i.alert.id == *id));
                 // The coverage report travels with the data it describes: a
                 // round that placed 85 of 297 warnings keeps its fresh clock.
                 self.state
@@ -1027,6 +1105,7 @@ mod tests {
         let grid = |alert: &NwsAlert| -> Vec<(String, String)> {
             AlertItem {
                 alert: alert.clone(),
+                departed: None,
             }
             .popup_content(&prefs)
             .sections
@@ -1686,5 +1765,130 @@ mod tests {
                  so one picture has more than one byte string",
             );
         }
+    }
+
+    // ── Retention (WB-4) ──────────────────────────────────────────────────
+    //
+    // These fixtures date their windows off the REAL wall clock, because the
+    // departure mark and the eviction clock are `chrono::Utc::now()` inside
+    // `apply_fetch_result` — a pinned calendar date would sit a day or more
+    // past `RETAINED_HOURS` and be evicted at the first merge.
+
+    /// `alert()` with a parsed window at an offset from now, in hours.
+    fn windowed_alert(id: &str, from_hours_ago: i64, until_hours_ago: i64) -> NwsAlert {
+        let now = chrono::Utc::now().naive_utc();
+        let mut a = alert(id, "Tornado Warning");
+        a.valid_from = Some(now - chrono::Duration::hours(from_hours_ago));
+        a.valid_until = Some(now - chrono::Duration::hours(until_hours_ago));
+        a
+    }
+
+    /// **The WB-4 floor: an alert that left the active feed still draws at an
+    /// instant inside its window.** Under wholesale replacement the second
+    /// poll erased it and backward scrub showed an empty map where a warning
+    /// had been in force.
+    ///
+    /// The other half of the same test: at the LIVE instant the departed
+    /// alert is gone — departure caps its visibility, so a cancelled warning
+    /// does not linger on a live pane until its printed expiry.
+    #[test]
+    fn an_alert_that_left_the_feed_still_draws_inside_its_window() {
+        // In force from 2 h ago until 1 h from now; departs on the second poll.
+        let mut h = handler_with(vec![
+            windowed_alert("urn:departing", 2, -1),
+            windowed_alert("urn:staying", 2, -1),
+        ]);
+        h.apply_fetch_result(
+            whole(vec![windowed_alert("urn:staying", 2, -1)]),
+            &PaneRef::across(&[]),
+        );
+        let now = chrono::Utc::now().naive_utc();
+
+        let an_hour_ago = now - chrono::Duration::hours(1);
+        assert_eq!(
+            rows_at(&h, an_hour_ago),
+            vec!["urn:staying".to_owned(), "urn:departing".to_owned()],
+            "an instant inside the departed alert's window must still show \
+             it (feed rows first, retained history after)",
+        );
+        assert_eq!(
+            rows_at(&h, now),
+            vec!["urn:staying".to_owned()],
+            "at the live instant the departed alert must be gone - departure \
+             caps its window",
+        );
+        assert_eq!(
+            h.item_count(&PaneRef::bare(0)),
+            1,
+            "every surface but the as-of paint sees only the active feed",
+        );
+        assert_eq!(h.drawn_count(&h.defaults), 1);
+    }
+
+    /// **The control that makes retention bounded**: an alert whose window
+    /// closed more than `RETAINED_HOURS` ago is GONE from the handler
+    /// entirely — so "retain everything forever" fails here, and the floor
+    /// above fails under wholesale replacement. One eviction, one retention,
+    /// same merge.
+    #[test]
+    fn an_alert_a_day_past_its_window_is_evicted_a_recent_one_is_kept() {
+        let mut h = handler_with(vec![
+            windowed_alert("urn:stale", 30, 25),  // ended 25 h ago
+            windowed_alert("urn:recent", 30, 23), // ended 23 h ago
+            windowed_alert("urn:staying", 2, -1),
+        ]);
+        h.apply_fetch_result(
+            whole(vec![windowed_alert("urn:staying", 2, -1)]),
+            &PaneRef::across(&[]),
+        );
+
+        assert!(
+            h.state.data.iter().all(|i| i.alert.id != "urn:stale"),
+            "an alert {RETAINED_HOURS} h past its window must be evicted, \
+             not retained forever",
+        );
+        assert!(
+            h.state.data.iter().any(|i| i.alert.id == "urn:recent"),
+            "an alert still inside the retention margin must survive the \
+             same merge - otherwise this eviction test would also pass by \
+             evicting everything",
+        );
+        let inside_recent_window = chrono::Utc::now().naive_utc() - chrono::Duration::hours(24);
+        assert_eq!(
+            rows_at(&h, inside_recent_window),
+            vec!["urn:recent".to_owned()],
+            "and still draw at an instant inside its own window",
+        );
+    }
+
+    /// **The cross-cutting non-triviality: a LIVE pane is byte-identical.**
+    /// A handler that lived through a departure paints, at the live instant,
+    /// the same wire bytes as a handler that only ever saw the current feed —
+    /// which is the wholesale-replacement picture. Compared over the encoded
+    /// job (length and digest of the real bytes), not over a re-statement of
+    /// the filter.
+    #[test]
+    fn a_live_pane_paints_the_bytes_wholesale_replacement_painted() {
+        let mut with_history = handler_with(vec![
+            windowed_alert("urn:staying", 2, -1),
+            windowed_alert("urn:departing", 2, -1),
+        ]);
+        with_history.apply_fetch_result(
+            whole(vec![windowed_alert("urn:staying", 2, -1)]),
+            &PaneRef::across(&[]),
+        );
+        let feed_only = handler_with(vec![windowed_alert("urn:staying", 2, -1)]);
+
+        let now = chrono::Utc::now().naive_utc();
+        assert_eq!(
+            rows_at(&with_history, now),
+            vec!["urn:staying".to_owned()],
+            "non-triviality floor: the live picture has a row in it",
+        );
+        assert_eq!(
+            encoded_job(&with_history, now),
+            encoded_job(&feed_only, now),
+            "retention leaked into the live pane's bytes",
+        );
     }
 }

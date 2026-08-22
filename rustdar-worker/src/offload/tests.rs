@@ -510,20 +510,26 @@ pub(super) fn an_overlay_reports_job() -> JobRequest {
         },
         job: DescribedJob::new(ReportsInput {
             reports: vec![
+                // Dated an hour before the fixture clock: already happened,
+                // so it draws — and the instant rides the wire (WB-2).
                 ReportPaint {
                     kind: StormReportKind::Tornado,
                     lat: 35.33,
                     lon: -97.28,
+                    valid: Some(glm_fixture_now() - chrono::Duration::hours(1)),
                 },
+                // Undated: the `None` wire arm, drawn at every instant.
                 ReportPaint {
                     kind: StormReportKind::Hail,
                     lat: 36.2,
                     lon: -98.5,
+                    valid: None,
                 },
                 ReportPaint {
                     kind: StormReportKind::Wind,
                     lat: 33.8,
                     lon: -96.7,
+                    valid: Some(glm_fixture_now() - chrono::Duration::hours(2)),
                 },
                 // Far outside the box: the cull path, and an id the cells must
                 // therefore never record.
@@ -531,11 +537,22 @@ pub(super) fn an_overlay_reports_job() -> JobRequest {
                     kind: StormReportKind::Tornado,
                     lat: 10.0,
                     lon: -150.0,
+                    valid: None,
+                },
+                // In the box but an hour PAST the depicted instant: the as-of
+                // cull, exercised through the wire — no ink, no cells.
+                ReportPaint {
+                    kind: StormReportKind::Hail,
+                    lat: 35.8,
+                    lon: -97.9,
+                    valid: Some(glm_fixture_now() + chrono::Duration::hours(1)),
                 },
             ],
             zoom: 6.5,
             is_dark: false,
             device_scale: 1.0,
+            // The fixture's clock, a literal — same rule as GLM's `now`.
+            as_of: glm_fixture_now(),
         }),
     }
 }
@@ -2295,6 +2312,7 @@ fn a_seeded_reports_registry() -> rustdar_overlays::render::overlay_state::Overl
     let report = |kind, lat, lon| StormReport {
         kind,
         time: "2015".into(),
+        valid: None,
         magnitude: None,
         location: "NORMAN".into(),
         county: "CLEVELAND".into(),
@@ -2798,11 +2816,11 @@ fn a_malformed_reports_job_is_refused_rather_than_misread() {
     let bytes = job.to_bytes();
 
     // Offsets: envelope 45 (code 1 + width 4 + height 4 + bounds 32 + ceiling
-    // 4), zoom 45..53, is_dark 53, device_scale 54..58, count 58..62, first
-    // row's kind byte 62.
+    // 4), zoom 45..53, is_dark 53, device_scale 54..58, as_of 58..70 (the
+    // 12-byte datetime WB-2 added), count 70..74, first row's kind byte 74.
     let mut rekinded = bytes.clone();
-    assert_eq!(rekinded[62], 0, "premise: row 0 travels as tornado, code 0");
-    rekinded[62] = 2;
+    assert_eq!(rekinded[74], 0, "premise: row 0 travels as tornado, code 0");
+    rekinded[74] = 2;
     match JobRequest::from_bytes(&rekinded) {
         Some(JobRequest { job, .. }) => {
             let reports = job
@@ -2811,14 +2829,14 @@ fn a_malformed_reports_job_is_refused_rather_than_misread() {
             assert_eq!(
                 reports.reports[0].kind,
                 rustdar_overlays::spc::reports::StormReportKind::Wind,
-                "byte 62 is not the first row's kind; the refusal below \
+                "byte 74 is not the first row's kind; the refusal below \
                  would be about some other field",
             );
         }
         other => panic!("the rekinded control failed to decode: {other:?}"),
     }
     let mut bad_kind = bytes.clone();
-    bad_kind[62] = 3;
+    bad_kind[74] = 3;
     assert_eq!(
         JobRequest::from_bytes(&bad_kind),
         None,

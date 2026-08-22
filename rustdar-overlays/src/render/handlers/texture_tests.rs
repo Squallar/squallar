@@ -210,6 +210,7 @@ fn report_fixture() -> crate::spc::reports::StormReport {
     StormReport {
         kind: StormReportKind::Hail,
         time: "2015".into(),
+        valid: None,
         magnitude: Some(175.0),
         location: "NORMAN".into(),
         county: "CLEVELAND".into(),
@@ -622,10 +623,12 @@ fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
             kind: report.kind,
             lat: report.lat,
             lon: report.lon,
+            valid: report.valid,
         }],
         zoom: 7.0,
         is_dark: false,
         device_scale: 1.0,
+        as_of: now,
     };
 
     assert_eq!(

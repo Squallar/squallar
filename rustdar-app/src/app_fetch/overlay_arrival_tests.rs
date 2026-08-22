@@ -150,6 +150,7 @@ fn a_reports_round(n: usize) -> rustdar_overlays::render::overlay_state::FetchPa
         .map(|i| StormReport {
             kind: StormReportKind::Tornado,
             time: format!("20{i:02}"),
+            valid: None,
             magnitude: None,
             location: "NORMAN".into(),
             county: "CLEVELAND".into(),
@@ -533,6 +534,38 @@ fn an_arrival_is_refused_by_a_pane_the_layout_is_not_showing() {
     );
 }
 
+/// `an_alert_round` whose windows closed past the retention margin (WB-4):
+/// the next poll that no longer carries these EVICTS them rather than
+/// retaining them for backward scrub — which is what it now takes for an
+/// empty feed to really empty the layer.
+fn an_evictable_alert_round(n: usize) -> rustdar_overlays::render::overlay_state::FetchPayload {
+    let now = chrono::Utc::now().naive_utc();
+    let alerts = (0..n)
+        .map(|i| rustdar_overlays::nws::alert::NwsAlert {
+            id: format!("urn:test:{i}"),
+            event: "Tornado Warning".into(),
+            category: rustdar_overlays::nws::alert::AlertCategory::Warning,
+            severity: "Severe".parse().unwrap(),
+            urgency: "Immediate".parse().unwrap(),
+            certainty: "Observed".parse().unwrap(),
+            headline: None,
+            description: String::new(),
+            instruction: None,
+            area_desc: String::new(),
+            sender_name: String::new(),
+            effective: String::new(),
+            expires: String::new(),
+            onset: None,
+            ends: None,
+            valid_from: Some(now - chrono::Duration::hours(30)),
+            valid_until: Some(now - chrono::Duration::hours(25)),
+            affected_zones: Vec::new(),
+            features: Arc::new(vec![a_feature("T")]),
+        })
+        .collect();
+    rustdar_overlays::render::overlay_state::OverlayRegistry::nws_alerts_payload(alerts)
+}
+
 #[test]
 fn an_arrival_that_empties_the_layer_dispatches_nothing() {
     let taken = Arc::new(Mutex::new(0usize));
@@ -540,7 +573,11 @@ fn an_arrival_that_empties_the_layer_dispatches_nothing() {
         taken: Arc::clone(&taken),
     }));
     let id = known::NWS_ALERTS;
-    let mut app = seeded(&id, an_alert_round(2));
+    // Long-expired windows, deliberately: under WB-4 retention an alert that
+    // merely LEFT the feed is kept for backward scrub and the layer still
+    // has data — the genuinely-emptied layer this test is about now requires
+    // the departing alerts to be past eviction.
+    let mut app = seeded(&id, an_evictable_alert_round(2));
     record_a_dispatch(&mut app, 0, &id, A_STALE_TOKEN);
     let before = *taken.lock().unwrap();
 
