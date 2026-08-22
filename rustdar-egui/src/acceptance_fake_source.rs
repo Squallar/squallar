@@ -367,20 +367,17 @@ fn one_clock_walks_two_cadences_and_each_layer_lands_on_its_own_stamps() {
     // One clock, walked across the window in a step that is a multiple of
     // neither grid, so the two playheads are repeatedly asked to disagree.
     //
-    // `expected` is `LayerTimeState::settle_playhead`'s own rule stated
-    // independently: the latest stamp at or before the clock, floored to the
-    // oldest when the clock sits before every stamp this layer holds — which
-    // it does at the start of the window, because the fake's grid is
-    // epoch-aligned and the window's start is not on it.
+    // `expected` is `TimeAxis::FrameSeries`'s own rule stated independently:
+    // the latest stamp at or before the clock, and NOTHING when the clock sits
+    // before every stamp this layer holds — which it does at the start of the
+    // window, because the fake's grid is epoch-aligned and the window's start
+    // is not on it. Radar's grid starts at `base`, so radar always qualifies;
+    // that asymmetry is the point, and it is the mixed-span case in miniature.
     let expected = |stamps: &[chrono::NaiveDateTime], t: chrono::NaiveDateTime| {
-        stamps
-            .iter()
-            .rev()
-            .find(|s| **s <= t)
-            .copied()
-            .unwrap_or(stamps[0])
+        stamps.iter().rev().find(|s| **s <= t).copied()
     };
     let mut disagreements = 0;
+    let mut fake_blank = 0;
     let mut fake_distinct = std::collections::BTreeSet::new();
     let mut radar_distinct = std::collections::BTreeSet::new();
     for tick in 0..60 {
@@ -390,14 +387,11 @@ fn one_clock_walks_two_cadences_and_each_layer_lands_on_its_own_stamps() {
             .set_time_mode(TimeMode::AsOf(clock));
 
         let pane = gui.pane(0).expect("pane 0");
-        let fake_shown = pane
-            .time_state(&fake)
-            .playhead_stamp()
-            .expect("the fake holds frames");
-        let radar_shown = pane
-            .time_state(&known::RADAR)
-            .playhead_stamp()
-            .expect("radar holds frames");
+        let fake_shown = pane.time_state(&fake).playhead_stamp();
+        let radar_shown = pane.time_state(&known::RADAR).playhead_stamp();
+        if fake_shown.is_none() {
+            fake_blank += 1;
+        }
 
         assert_eq!(
             fake_shown,
@@ -415,8 +409,10 @@ fn one_clock_walks_two_cadences_and_each_layer_lands_on_its_own_stamps() {
         if fake_shown != radar_shown {
             disagreements += 1;
         }
-        fake_distinct.insert(fake_shown);
-        radar_distinct.insert(radar_shown);
+        // Only real stamps count toward "a playhead moved" — otherwise a layer
+        // that answered `None` throughout would inflate its own floor.
+        fake_distinct.extend(fake_shown);
+        radar_distinct.extend(radar_shown);
     }
 
     // The floors. Without these the whole loop is satisfied by two layers
@@ -433,6 +429,20 @@ fn one_clock_walks_two_cadences_and_each_layer_lands_on_its_own_stamps() {
          radar {} distinct) - the clock is not reaching the layers",
         fake_distinct.len(),
         radar_distinct.len(),
+    );
+    // The mixed-span floor, both halves. The fake really did answer "nothing
+    // qualifies" at least once — so the walk above exercised the empty answer
+    // rather than merely tolerating it — and it did NOT answer that always,
+    // which would be a silently blank layer passing as a fixed contract.
+    assert!(
+        fake_blank > 0,
+        "the fake qualified at all 60 clock positions, so this walk never \
+         reached the case the contract is about",
+    );
+    assert!(
+        fake_blank < 60,
+        "the fake answered `None` at every one of 60 clock positions - a \
+         blanket blank passes the contract and draws an empty map",
     );
 }
 
