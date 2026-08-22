@@ -15,6 +15,21 @@
 //!
 //! `<unpacked-shapefile-dir>` holds one subdirectory per dataset, each with the
 //! `.shp`/`.shx`/`.dbf` triple as the zip ships them.
+//!
+//! # Where the output goes
+//!
+//! `<output.pack>` is what the app consumes, under the one name
+//! `rustdar_overlays::nws::zone_pack::PACK_FILE_NAME` declares:
+//!
+//! - **Web**: next to `index.html` in the deploy. `sw.js` routes it by that
+//!   name into a cache of its own, outside the all-or-nothing shell install.
+//! - **Native, iOS, Android**: beside the zone cache directory —
+//!   `~/.cache/rustdar/zones.pack` for a cache at `~/.cache/rustdar/zones`.
+//!
+//! Nowhere is also fine. A pack that is absent, stale or unreadable is a
+//! supported state: `zone_pack::installed()` answers `None` and every zone
+//! resolves over HTTP exactly as it did before the pack existed. The only thing
+//! at stake is the request count.
 
 mod dbf;
 mod pack;
