@@ -54,7 +54,7 @@ fn described_label(job: &rustdar_source::job::DescribedJob) -> &'static str {
         "overlay/reports"
     } else if job.downcast_ref::<rz::GlmStrikesInput>().is_some() {
         "overlay/glm"
-    } else if job.downcast_ref::<rz::ModelDataInput>().is_some() {
+    } else if job.downcast_ref::<rz::GriddedInput>().is_some() {
         "overlay/model"
     } else {
         panic!("the dispatch described an input no codec row claims: {job:?}")

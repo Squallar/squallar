@@ -175,12 +175,11 @@ fn exactly_one_submessage(count: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// The longitude envelope `rasterize_model_data`'s frame handling has actually
-/// been shown correct for.
+/// The longitude envelope HRRR declares to [`check_domain_longitude`].
 ///
 /// HRRR CONUS measures -134.0955..-60.9172, corner-verified against real GRIB2
 /// section 3 in `hrrr::lambert::tests`. This is that with margin either side.
-const VALIDATED_DOMAIN_LON: std::ops::RangeInclusive<f64> = -140.0..=-50.0;
+pub const HRRR_DOMAIN_LON: std::ops::RangeInclusive<f64> = -140.0..=-50.0;
 
 /// Marks [`check_domain_longitude`]'s refusal so [`classify_parse_error`] can
 /// tell it apart from a genuine decode failure.
@@ -195,9 +194,19 @@ fn classify_parse_error(message: String) -> FetchError {
     }
 }
 
-/// Refuse a model domain whose longitude the renderer has never been shown to
+/// Refuse a gridded domain whose longitude the renderer has never been shown to
 /// place correctly — and say what decision the refusal is asking for.
-fn check_domain_longitude(bounds: &GeoBounds) -> Result<(), String> {
+///
+/// `domain` is the **source's own** declared envelope, and `source` names it in
+/// the refusal. It was a module constant until the substrate became shared: one
+/// envelope covering every gridded source would have to be the union, which is
+/// the widest claim nobody measured rather than the narrowest each source can
+/// actually stand behind.
+pub(crate) fn check_domain_longitude(
+    bounds: &GeoBounds,
+    domain: &std::ops::RangeInclusive<f64>,
+    source: &str,
+) -> Result<(), String> {
     // `min > max` and not just `!is_finite`: the bounds walk above seeds
     // `min_lon` at `f64::MAX` and `max_lon` at `f64::MIN`, and both of those
     // *are* finite, so a grid whose coordinates could not be walked arrives
@@ -210,15 +219,13 @@ fn check_domain_longitude(bounds: &GeoBounds) -> Result<(), String> {
             bounds.min_lon, bounds.max_lon
         ));
     }
-    if VALIDATED_DOMAIN_LON.contains(&bounds.min_lon)
-        && VALIDATED_DOMAIN_LON.contains(&bounds.max_lon)
-    {
+    if domain.contains(&bounds.min_lon) && domain.contains(&bounds.max_lon) {
         return Ok(());
     }
     Err(format!(
-        "{DOMAIN_REFUSAL_MARK}: spans longitude {:.4}..{:.4}, outside the \
-         {:.1}..{:.1} envelope the renderer's longitude handling has been \
-         validated for (HRRR CONUS is -134.0955..-60.9172).\n\
+        "{DOMAIN_REFUSAL_MARK}: {source} spans longitude {:.4}..{:.4}, outside \
+         the {:.1}..{:.1} envelope it declares (HRRR CONUS is \
+         -134.0955..-60.9172).\n\
          \n\
          This is not a decode failure - the grid decoded fine. The parse side \
          folds longitude into [-180,180] (`lambert::normalize_longitude_degrees`) \
@@ -234,21 +241,31 @@ fn check_domain_longitude(bounds: &GeoBounds) -> Result<(), String> {
          said which this domain needs:\n\
          \x20 * a rigid whole-grid shift - exact only if the domain does not \
          straddle the antimeridian;\n\
-         \x20 * a per-point shift - tears cells, because `rasterize_model_data` \
+         \x20 * a per-point shift - tears cells, because `rasterize_gridded` \
          sizes every cell from its neighbours' pixel spacing, so two adjacent \
          points shifted differently stretch one cell across the texture;\n\
          \x20 * `GridCoords::wraps_longitude` - guards the index window, not \
          this, and measures `false` for a seam-parked grid.\n\
          \n\
-         Whoever added this domain is the person who can choose between them. \
-         The measurement, the instrument (`seam_probe.rs`) and the reasoning \
-         are in `campaigns/overlays/t17/` on the `campaign-harness` branch. \
-         Widen VALIDATED_DOMAIN_LON only together with the repair the new \
-         domain's shape calls for.",
+         THE DECISION THIS TEXT ASKED FOR HAS BEEN TAKEN, AND IT IS ONLY HALF \
+         OF ONE. The envelope is no longer a module constant shared by every \
+         gridded source: each source passes its own, so widening one source's \
+         claim can no longer widen another's by accident. HRRR declares \
+         `HRRR_DOMAIN_LON` (-140..-50), unchanged and still the only envelope \
+         the seam measurement was taken under.\n\
+         \n\
+         What was NOT decided is the repair itself. A source that declares a \
+         domain reaching the antimeridian - a global satellite composite is \
+         the obvious one - still needs one of the three candidates above \
+         chosen and built, and declaring a wider envelope without it buys a \
+         blank layer rather than a drawn one. Whoever adds that source is the \
+         person who can choose. The measurement, the instrument \
+         (`seam_probe.rs`) and the reasoning are in `campaigns/overlays/t17/` \
+         on the `campaign-harness` branch.",
         bounds.min_lon,
         bounds.max_lon,
-        VALIDATED_DOMAIN_LON.start(),
-        VALIDATED_DOMAIN_LON.end(),
+        domain.start(),
+        domain.end(),
     ))
 }
 
@@ -314,9 +331,9 @@ fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, Stri
     let Some(bounds) = GeoBounds::from_points((0..coords.len()).map_while(|i| coords.at(i))) else {
         return Err("GRIB2 grid decoded no coordinates".into());
     };
-    check_domain_longitude(&bounds)?;
+    check_domain_longitude(&bounds, &HRRR_DOMAIN_LON, "HRRR")?;
 
-    let (visible_points, value_range) = super::summarize_values(&values, param);
+    let (visible_points, value_range) = super::summarize_values(&values, |v| param.paints(v));
 
     Ok(HrrrGridData {
         parameter: param,
@@ -574,7 +591,7 @@ async fn try_fetch_composite(
 
     // Recomputed from the merged magnitudes: each component's own summary says
     // nothing about the vector magnitude the user sees.
-    let (visible_points, value_range) = super::summarize_values(&values, *param);
+    let (visible_points, value_range) = super::summarize_values(&values, |v| param.paints(v));
 
     Ok(HrrrGridData {
         parameter: *param,

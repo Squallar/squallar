@@ -95,7 +95,7 @@ impl HitMap {
 
 /// Which of the two RGBA conventions a rasterizer's bytes are written in;
 /// picking the wrong one shifts every translucent colour. tiny-skia output is
-/// [`Self::Premultiplied`], [`rasterize_model_data`] is [`Self::Straight`].
+/// [`Self::Premultiplied`], [`rasterize_gridded`] is [`Self::Straight`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AlphaMode {
     Premultiplied,
@@ -1237,7 +1237,7 @@ fn grow_bounds(bounds: &GeoBounds, lon_pad: f64, merc_pad: f64) -> GeoBounds {
     }
 }
 
-/// Which grid points [`rasterize_model_data`] must project: the whole grid
+/// Which grid points [`rasterize_gridded`] must project: the whole grid
 /// unless the coordinates can name a narrower window — see
 /// [`crate::hrrr::GridCoords::index_bounds`].
 ///
@@ -1296,24 +1296,28 @@ fn projection_window(
     }
 }
 
-/// What [`rasterize_model_data`] reads. The HRRR values vector is 1,905,141
+/// What [`rasterize_gridded`] reads. The HRRR values vector is 1,905,141
 /// `f32` — **7.62 MB** — and the raster only reads the points inside its own
 /// [`projection_window`], so this is an enum over how much of the grid is in
 /// hand: [`Self::Whole`] carries it by `Arc`, [`Self::Window`] carries the
 /// window and exactly its values (the wire).
 #[derive(Debug, Clone, PartialEq)]
-pub enum ModelDataInput {
+pub enum GriddedInput {
     Whole(std::sync::Arc<HrrrGridData>),
-    Window(ModelWindow),
+    Window(GridWindow),
 }
 
-rustdar_source::impl_job_input!(ModelDataInput);
+rustdar_source::impl_job_input!(GriddedInput);
 
-/// The wire form of a model-grid raster: the grid's shape and coordinates,
-/// the [`IndexWindow`] its values were cut to, and those values alone.
+/// The wire form of a gridded raster: the field's identity, the grid's shape
+/// and coordinates, the [`IndexWindow`] its values were cut to, and those
+/// values alone.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ModelWindow {
-    pub parameter: crate::hrrr::ModelParameter,
+pub struct GridWindow {
+    /// **A field identity, not a source's own enum.** The raster resolves it
+    /// through [`crate::render::gridded::field_paint`] and refuses what that
+    /// does not answer, so a second gridded source needs no arm here.
+    pub field: rustdar_source::product::FieldId,
     /// The **full grid's** shape, which `win` and `coords` index against.
     pub ni: usize,
     pub nj: usize,
@@ -1325,11 +1329,13 @@ pub struct ModelWindow {
     pub values: Vec<f32>,
 }
 
-impl ModelDataInput {
-    pub fn parameter(&self) -> crate::hrrr::ModelParameter {
+impl GriddedInput {
+    /// The field being drawn. The whole-grid arm reads it off the model's own
+    /// registration, which is where the persisted spelling already lives.
+    pub fn field(&self) -> &rustdar_source::product::FieldId {
         match self {
-            Self::Whole(grid) => grid.parameter,
-            Self::Window(window) => window.parameter,
+            Self::Whole(grid) => &crate::hrrr::fields::spec(grid.parameter).id,
+            Self::Window(window) => &window.field,
         }
     }
 
@@ -1413,8 +1419,8 @@ impl ModelDataInput {
 
 /// Writes pixels directly rather than through tiny-skia: one filled rectangle
 /// per grid point, sized from its neighbour spacing.
-pub fn rasterize_model_data(
-    input: &ModelDataInput,
+pub fn rasterize_gridded(
+    input: &GriddedInput,
     bounds: &GeoBounds,
     width: u32,
     height: u32,
@@ -1422,10 +1428,9 @@ pub fn rasterize_model_data(
     let size = (width * height * 4) as usize;
     let mut rgba = vec![0u8; size];
     let (ni, nj) = input.shape();
-    let parameter = input.parameter();
     let coords = input.coords();
 
-    let empty = matches!(input, ModelDataInput::Whole(grid) if grid.values.is_empty());
+    let empty = matches!(input, GriddedInput::Whole(grid) if grid.values.is_empty());
     if empty || width == 0 || height == 0 || ni == 0 || nj == 0 {
         return RasterizeOutput {
             rgba,
@@ -1433,6 +1438,17 @@ pub fn rasterize_model_data(
             alpha: AlphaMode::Straight,
         };
     }
+
+    // Resolved once, outside the cell loop, and **refused** rather than
+    // defaulted: a field this build does not register is a newer build's, and
+    // painting it through some other field's colours would be a silent misread.
+    let Some(paint) = crate::render::gridded::field_paint(input.field()) else {
+        return RasterizeOutput {
+            rgba,
+            hit_cells: None,
+            alpha: AlphaMode::Straight,
+        };
+    };
 
     let mb = MercatorBounds::from_geo(bounds);
     let w = width as f32;
@@ -1469,7 +1485,7 @@ pub fn rasterize_model_data(
             let Some(value) = input.value_at(i, j) else {
                 continue;
             };
-            let color = parameter.color_for_value(value);
+            let color = paint.color_for_value(value);
             if color[3] == 0 {
                 continue;
             }

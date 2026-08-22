@@ -16,8 +16,8 @@ use rustdar_source::job::DescribedJob;
 use super::sources;
 use crate::render::overlay_state::{FetchPayload, OverlayHandler, RasterizeContext, RenderMode};
 use crate::render::rasterize::{
-    self, AlphaMode, ModelDataInput, RadarSiteInfo, RasterizeOutput, rasterize_glm_strikes,
-    rasterize_model_data, rasterize_nws_alerts, rasterize_radar_sites, rasterize_spc_discussions,
+    self, AlphaMode, GriddedInput, RadarSiteInfo, RasterizeOutput, rasterize_glm_strikes,
+    rasterize_gridded, rasterize_nws_alerts, rasterize_radar_sites, rasterize_spc_discussions,
     rasterize_spc_outlooks, rasterize_storm_reports,
 };
 use crate::types::{HatchPattern, OverlayFeature};
@@ -102,8 +102,8 @@ fn run_described(
         )
     } else if let Some(input) = job.downcast_ref::<rasterize::GlmStrikesInput>() {
         (known::LIGHTNING, rasterize_glm_strikes(input, bounds, w, h))
-    } else if let Some(input) = job.downcast_ref::<ModelDataInput>() {
-        (known::MODEL_DATA, rasterize_model_data(input, bounds, w, h))
+    } else if let Some(input) = job.downcast_ref::<GriddedInput>() {
+        (known::MODEL_DATA, rasterize_gridded(input, bounds, w, h))
     } else if let Some(input) = job.downcast_ref::<rasterize::SitesInput>() {
         (
             known::RADAR_SITES,
@@ -233,7 +233,8 @@ fn cin_grid() -> crate::hrrr::HrrrGridData {
             lons.push(BOUNDS.min_lon + (BOUNDS.max_lon - BOUNDS.min_lon) * (i as f64 / 3.0));
         }
     }
-    let (visible_points, value_range) = crate::hrrr::summarize_values(&values, parameter);
+    let (visible_points, value_range) =
+        crate::hrrr::summarize_values(&values, |v| parameter.paints(v));
     HrrrGridData {
         parameter,
         values,
@@ -251,8 +252,8 @@ fn cin_grid() -> crate::hrrr::HrrrGridData {
     }
 }
 
-fn whole(grid: crate::hrrr::HrrrGridData) -> ModelDataInput {
-    ModelDataInput::Whole(std::sync::Arc::new(grid))
+fn whole(grid: crate::hrrr::HrrrGridData) -> GriddedInput {
+    GriddedInput::Whole(std::sync::Arc::new(grid))
 }
 
 fn site_fixtures() -> rasterize::SitesInput {
@@ -501,7 +502,7 @@ fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
 /// empty buffer and must still name the convention its drawing path does.
 ///
 /// A zero-sided texture is the one branch reachable without a failed allocation
-/// — `Pixmap::new` refuses it. `rasterize_model_data` has two of its own: an
+/// — `Pixmap::new` refuses it. `rasterize_gridded` has two of its own: an
 /// empty grid, and a grid whose projection window misses the texture.
 #[test]
 fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
@@ -548,7 +549,7 @@ fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
     let mut empty = cin_grid();
     empty.values.clear();
     assert_eq!(
-        rasterize_model_data(&whole(empty), &BOUNDS, W, H).alpha,
+        rasterize_gridded(&whole(empty), &BOUNDS, W, H).alpha,
         AlphaMode::Straight,
     );
 
@@ -562,7 +563,7 @@ fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
         max_lon: -34.0,
     };
     assert_eq!(
-        rasterize_model_data(&whole(lambert), &atlantic, W, H).alpha,
+        rasterize_gridded(&whole(lambert), &atlantic, W, H).alpha,
         AlphaMode::Straight,
     );
 }

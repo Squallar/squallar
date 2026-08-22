@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use super::{AlertPaint, AlertsInput, AlphaMode, rasterize_model_data, rasterize_nws_alerts};
+use super::{AlertPaint, AlertsInput, AlphaMode, rasterize_gridded, rasterize_nws_alerts};
 use crate::hrrr::{HrrrGridData, ModelParameter};
 use crate::nws::alert::AlertCategory;
 use crate::types::{HatchPattern, OverlayFeature};
@@ -105,7 +105,7 @@ fn the_polygon_rasterizers_hand_over_premultiplied_pixels() {
     );
 }
 
-/// **The trap.** `rasterize_model_data` never went through tiny-skia and never
+/// **The trap.** `rasterize_gridded` never went through tiny-skia and never
 /// called the un-premultiply, so it was already writing straight alpha while
 /// every neighbour wrote premultiplied. One global choice of egui constructor is
 /// wrong about one of them whichever way it is made.
@@ -114,8 +114,8 @@ fn the_polygon_rasterizers_hand_over_premultiplied_pixels() {
 /// channel *above* alpha, which premultiplied RGBA cannot represent.
 #[test]
 fn model_data_hands_over_straight_alpha() {
-    let out = rasterize_model_data(
-        &super::ModelDataInput::Whole(std::sync::Arc::new(cape_grid())),
+    let out = rasterize_gridded(
+        &super::GriddedInput::Whole(std::sync::Arc::new(cape_grid())),
         &BOUNDS,
         W,
         H,
@@ -123,7 +123,7 @@ fn model_data_hands_over_straight_alpha() {
     assert_eq!(
         out.alpha,
         AlphaMode::Straight,
-        "rasterize_model_data has been declared premultiplied. It writes \
+        "rasterize_gridded has been declared premultiplied. It writes \
          `parameter.color_for_value` bytes into the buffer directly — the \
          palette's own straight RGBA — so declaring it premultiplied darkens \
          every HRRR pixel by its own alpha.",
@@ -156,7 +156,8 @@ fn cape_grid() -> HrrrGridData {
             lons.push(BOUNDS.min_lon + (BOUNDS.max_lon - BOUNDS.min_lon) * (i as f64 / 3.0));
         }
     }
-    let (visible_points, value_range) = crate::hrrr::summarize_values(&values, parameter);
+    let (visible_points, value_range) =
+        crate::hrrr::summarize_values(&values, |v| parameter.paints(v));
     HrrrGridData {
         parameter,
         values,

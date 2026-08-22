@@ -14,9 +14,9 @@ use rustdar_source::job::{EncodeCtx, JobCodec, JobCost, JobGeometry, JobOutCodec
 use rustdar_source::wire::Reader;
 
 use crate::render::rasterize::{
-    AlertsInput, AlphaMode, DiscussionsInput, GlmStrikesInput, HitCells, ModelDataInput,
+    AlertsInput, AlphaMode, DiscussionsInput, GlmStrikesInput, GriddedInput, HitCells,
     OutlooksInput, RasterizeOutput, ReportsInput, SitesInput, rasterize_glm_strikes,
-    rasterize_model_data, rasterize_nws_alerts, rasterize_radar_sites, rasterize_spc_discussions,
+    rasterize_gridded, rasterize_nws_alerts, rasterize_radar_sites, rasterize_spc_discussions,
     rasterize_spc_outlooks, rasterize_storm_reports,
 };
 
@@ -36,7 +36,7 @@ pub static JOB_CODECS: &[JobCodec] = &[
     JobCodec::of::<DiscussionsJob>(),
     JobCodec::of::<ReportsJob>(),
     JobCodec::of::<GlmJob>(),
-    JobCodec::of::<ModelJob>(),
+    JobCodec::of::<GriddedJob>(),
 ];
 
 /// The same seven, plus the fake source's own row. See the note above for why
@@ -49,7 +49,7 @@ pub static JOB_CODECS: &[JobCodec] = &[
     JobCodec::of::<DiscussionsJob>(),
     JobCodec::of::<ReportsJob>(),
     JobCodec::of::<GlmJob>(),
-    JobCodec::of::<ModelJob>(),
+    JobCodec::of::<GriddedJob>(),
     JobCodec::of::<FakeJob>(),
 ];
 
@@ -568,20 +568,21 @@ impl JobOutCodec for GlmJob {
 /// grid is **cut to its projection window at encode time**, the one moment
 /// that knows what ground the texture covers, so what travels is the
 /// window's values rather than 7.62 MB of grid per gesture-settle re-render.
-pub struct ModelJob;
+pub struct GriddedJob;
 
-impl JobSpec for ModelJob {
-    type In = ModelDataInput;
+impl JobSpec for GriddedJob {
+    type In = GriddedInput;
     type Out = RasterizeOutput;
     const LABEL: &'static str = "overlay/model";
     const COST: JobCost = JobCost::Raster;
 
-    fn encode(input: &ModelDataInput, ctx: &EncodeCtx, out: &mut Vec<u8>) {
-        // The window cut. Scalars first as everywhere: the parameter (its
-        // stable `as_str` identifier — the same exhaustive pair the persisted
-        // pane config round-trips through), the grid shape, the coordinates,
-        // the window, and then the window's values as the one bulk block.
-        encode_str(out, input.parameter().as_str());
+    fn encode(input: &GriddedInput, ctx: &EncodeCtx, out: &mut Vec<u8>) {
+        // The window cut. Scalars first as everywhere: the field's identity
+        // (its `FieldId`, which for a model parameter is byte-identical to the
+        // `as_str` code the persisted pane config already round-trips), the
+        // grid shape, the coordinates, the window, and then the window's values
+        // as the one bulk block.
+        encode_str(out, input.field().as_str());
         let (ni, nj) = input.shape();
         out.extend_from_slice(&(ni as u32).to_le_bytes());
         out.extend_from_slice(&(nj as u32).to_le_bytes());
@@ -599,16 +600,15 @@ impl JobSpec for ModelJob {
         input.for_each_window_row(&win, |row| encode_f32s(out, row));
     }
 
-    fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(ModelDataInput, JobGeometry)> {
-        use crate::render::rasterize::{IndexWindow, ModelWindow};
-        // `FromStr` for the parameter is deliberately total — persisted
-        // pane state must never panic a restore — so an unknown code
-        // parses to a *default*. On this boundary that leniency would be
-        // a misread (a build's new parameter silently rasterized as
-        // CIN), so the code is believed only if it names itself back.
+    fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(GriddedInput, JobGeometry)> {
+        use crate::render::rasterize::{GridWindow, IndexWindow};
+        // The field code is believed only if this build **registers** it —
+        // `field_paint` answering is exactly the condition under which
+        // `rasterize_gridded` can paint it. A code this build does not know is
+        // a newer build's field, and defaulting it would rasterize one field's
+        // values through another's colours with nothing to say so.
         let code = decode_str(r)?;
-        let parameter: crate::hrrr::ModelParameter = code.parse().ok()?;
-        (parameter.as_str() == code).then_some(())?;
+        let field = crate::render::gridded::paint_for_code(&code)?.id.clone();
         let ni = r.u32()? as usize;
         let nj = r.u32()? as usize;
         let coords = decode_grid_coords(r)?;
@@ -631,8 +631,8 @@ impl JobSpec for ModelJob {
         // buffer shorter than the area claims before anything allocates.
         let values = decode_f32s(r, win.area())?;
         Some((
-            ModelDataInput::Window(ModelWindow {
-                parameter,
+            GriddedInput::Window(GridWindow {
+                field,
                 ni,
                 nj,
                 coords,
@@ -643,17 +643,12 @@ impl JobSpec for ModelJob {
         ))
     }
 
-    fn run(input: &ModelDataInput, geo: &JobGeometry) -> Option<RasterizeOutput> {
-        Some(rasterize_model_data(
-            input,
-            &geo.bounds,
-            geo.width,
-            geo.height,
-        ))
+    fn run(input: &GriddedInput, geo: &JobGeometry) -> Option<RasterizeOutput> {
+        Some(rasterize_gridded(input, &geo.bounds, geo.width, geo.height))
     }
 }
 
-impl JobOutCodec for ModelJob {
+impl JobOutCodec for GriddedJob {
     fn encode_out(v: RasterizeOutput, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
         encode_raster_reply(v, head);
     }
@@ -800,6 +795,10 @@ fn decode_f32s(r: &mut Reader, count: usize) -> Option<Vec<f32>> {
 const GRID_COORDS_LAMBERT: u8 = 1;
 /// Grid-coordinate tag: materialised per-point arrays; no proper-subset window is possible.
 const GRID_COORDS_EXPLICIT: u8 = 2;
+/// Grid-coordinate tag: a regular lat/lon grid's seven scalars. **Appended, not
+/// inserted** — the two tags above keep their numbers, so a payload written
+/// before this arm existed decodes unchanged.
+const GRID_COORDS_REGULAR: u8 = 3;
 
 fn encode_grid_coords(out: &mut Vec<u8>, coords: &crate::hrrr::GridCoords) {
     use crate::hrrr::GridCoords;
@@ -827,6 +826,23 @@ fn encode_grid_coords(out: &mut Vec<u8>, coords: &crate::hrrr::GridCoords) {
             out.push(u8::from(parts.alternating));
             out.push(u8::from(parts.wraps_longitude));
         }
+        GridCoords::Regular {
+            lat0,
+            lon0,
+            dlat,
+            dlon,
+            ni,
+            nj,
+            scan_mode,
+        } => {
+            out.push(GRID_COORDS_REGULAR);
+            for v in [lat0, lon0, dlat, dlon] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.extend_from_slice(&(*ni as u32).to_le_bytes());
+            out.extend_from_slice(&(*nj as u32).to_le_bytes());
+            out.push(*scan_mode);
+        }
         GridCoords::Explicit { lats, lons } => {
             out.push(GRID_COORDS_EXPLICIT);
             // Two counts, not one: the two arrays are allowed to disagree in
@@ -846,9 +862,10 @@ fn encode_grid_coords(out: &mut Vec<u8>, coords: &crate::hrrr::GridCoords) {
 
 /// The inverse of [`encode_grid_coords`]. `None` for a tag this build does
 /// not have, constants `LambertGrid::from_parts` refuses (non-finite, a
-/// degenerate cone), a flag byte outside `{0, 1}`, or a buffer shorter than
-/// its own counts claim — each checked by `take` before any allocation is
-/// sized from a count.
+/// degenerate cone), a regular grid with an empty shape or a non-finite or
+/// zero step, a flag byte outside `{0, 1}`, or a buffer shorter than its own
+/// counts claim — each checked by `take` before any allocation is sized from
+/// a count.
 fn decode_grid_coords(r: &mut Reader) -> Option<crate::hrrr::GridCoords> {
     use crate::hrrr::GridCoords;
     use crate::hrrr::lambert::{LambertGrid, LambertGridParts};
@@ -877,6 +894,40 @@ fn decode_grid_coords(r: &mut Reader) -> Option<crate::hrrr::GridCoords> {
                 wraps_longitude: flag(r.u8()?)?,
             };
             Some(GridCoords::Lambert(LambertGrid::from_parts(parts)?))
+        }
+        GRID_COORDS_REGULAR => {
+            let mut scalars = [0.0f64; 4];
+            for v in &mut scalars {
+                *v = r.f64()?;
+            }
+            let [lat0, lon0, dlat, dlon] = scalars;
+            let (ni, nj) = (r.u32()? as usize, r.u32()? as usize);
+            let scan_mode = r.u8()?;
+            // Refused, not clamped — the same posture the window edges above
+            // take. An empty shape or a step that is not a finite non-zero
+            // number is a layout this build never writes, and every method on
+            // the arm divides by the steps: a clamped zero would silently place
+            // every point of the grid at its origin.
+            if ni == 0
+                || nj == 0
+                || !lat0.is_finite()
+                || !lon0.is_finite()
+                || !dlat.is_finite()
+                || !dlon.is_finite()
+                || dlat == 0.0
+                || dlon == 0.0
+            {
+                return None;
+            }
+            Some(GridCoords::Regular {
+                lat0,
+                lon0,
+                dlat,
+                dlon,
+                ni,
+                nj,
+                scan_mode,
+            })
         }
         GRID_COORDS_EXPLICIT => {
             let lat_count = r.u32()? as usize;
@@ -1156,7 +1207,7 @@ mod tests {
     use super::*;
     use crate::nws::alert::AlertCategory;
     use crate::render::rasterize::{
-        AlertPaint, DiscussionPaint, FlashPaint, IndexWindow, ModelWindow, RadarSiteInfo,
+        AlertPaint, DiscussionPaint, FlashPaint, GridWindow, IndexWindow, RadarSiteInfo,
         ReportPaint,
     };
     use crate::spc::discussion::MdType;
@@ -1429,8 +1480,10 @@ mod tests {
 
     #[test]
     fn the_model_row_round_trips_an_explicit_grid_window() {
-        let job = DescribedJob::new(ModelDataInput::Window(ModelWindow {
-            parameter: crate::hrrr::ModelParameter::SurfaceBasedCape,
+        let job = DescribedJob::new(GriddedInput::Window(GridWindow {
+            field: crate::hrrr::fields::spec(crate::hrrr::ModelParameter::SurfaceBasedCape)
+                .id
+                .clone(),
             ni: 4,
             nj: 3,
             coords: crate::hrrr::GridCoords::Explicit {
@@ -1469,8 +1522,10 @@ mod tests {
                 wraps_longitude: false,
             })
             .expect("valid literal constants");
-        let job = DescribedJob::new(ModelDataInput::Window(ModelWindow {
-            parameter: crate::hrrr::ModelParameter::MixedLayerCin,
+        let job = DescribedJob::new(GriddedInput::Window(GridWindow {
+            field: crate::hrrr::fields::spec(crate::hrrr::ModelParameter::MixedLayerCin)
+                .id
+                .clone(),
             ni: 4,
             nj: 3,
             coords: crate::hrrr::GridCoords::Lambert(grid),
@@ -1483,6 +1538,84 @@ mod tests {
             values: vec![-25.0, -50.0, 0.0, -12.5, -75.0, -100.0, -6.25, -3.0],
         }));
         assert_round_trips(&JOB_CODECS[6], &job);
+    }
+
+    /// The regular arm travels as its seven scalars and nothing else — the whole
+    /// point of the arm — and comes back as the same grid.
+    #[test]
+    fn a_regular_grid_coords_round_trips() {
+        for scan_mode in [0b0100_0000u8, 0b0110_0000, 0b0101_0000] {
+            let job = DescribedJob::new(GriddedInput::Window(GridWindow {
+                field: crate::hrrr::fields::spec(crate::hrrr::ModelParameter::SurfaceBasedCape)
+                    .id
+                    .clone(),
+                ni: 4,
+                nj: 3,
+                coords: crate::hrrr::GridCoords::Regular {
+                    lat0: 54.995,
+                    lon0: -129.995,
+                    dlat: -0.01,
+                    dlon: 0.01,
+                    ni: 4,
+                    nj: 3,
+                    scan_mode,
+                },
+                win: IndexWindow {
+                    i0: 1,
+                    i1: 3,
+                    j0: 0,
+                    j1: 2,
+                },
+                values: vec![100.0, 250.0, 500.0, 1250.0],
+            }));
+            assert_round_trips(&JOB_CODECS[6], &job);
+        }
+    }
+
+    /// A regular grid this build would never write is **refused, not clamped**:
+    /// every method on the arm divides by the steps, so a zero step silently
+    /// stacks the whole grid on its own origin, and an empty shape indexes a
+    /// lattice with no points.
+    #[test]
+    fn a_regular_grid_with_a_degenerate_shape_or_step_is_refused() {
+        let honest = |scalars: [f64; 4], ni: u32, nj: u32| {
+            let mut bytes = vec![super::GRID_COORDS_REGULAR];
+            for v in scalars {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            bytes.extend_from_slice(&ni.to_le_bytes());
+            bytes.extend_from_slice(&nj.to_le_bytes());
+            bytes.push(0b0100_0000);
+            bytes
+        };
+        // Control: the well-formed spelling of exactly these bytes decodes, so
+        // every refusal below is the value and not the framing.
+        let good = honest([54.995, -129.995, -0.01, 0.01], 4, 3);
+        assert!(
+            super::decode_grid_coords(&mut Reader::new(&good)).is_some(),
+            "the control must decode, or the refusals prove nothing",
+        );
+
+        for (what, bytes) in [
+            ("ni == 0", honest([54.995, -129.995, -0.01, 0.01], 0, 3)),
+            ("nj == 0", honest([54.995, -129.995, -0.01, 0.01], 4, 0)),
+            ("dlat == 0", honest([54.995, -129.995, 0.0, 0.01], 4, 3)),
+            ("dlon == 0", honest([54.995, -129.995, -0.01, 0.0], 4, 3)),
+            (
+                "dlon is NaN",
+                honest([54.995, -129.995, -0.01, f64::NAN], 4, 3),
+            ),
+            (
+                "lat0 is infinite",
+                honest([f64::INFINITY, -129.995, -0.01, 0.01], 4, 3),
+            ),
+            ("a short buffer", good[..good.len() - 1].to_vec()),
+        ] {
+            assert!(
+                super::decode_grid_coords(&mut Reader::new(&bytes)).is_none(),
+                "{what} was accepted rather than refused",
+            );
+        }
     }
 
     fn assert_reply_round_trips(row: &JobCodec, rgba: Vec<u8>, hit_cells: Option<HitCells>) {

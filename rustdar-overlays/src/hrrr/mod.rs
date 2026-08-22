@@ -313,6 +313,42 @@ impl ModelParameter {
         }
     }
 
+    /// Whether `value` (raw GRIB2 units) lands anywhere visible on this
+    /// parameter's ramp, answered **without evaluating it**.
+    ///
+    /// `color_for_value(v)[3] != 0` holds for exactly the same values, pinned by
+    /// `a_visibility_test_agrees_with_every_ramp`. It exists because
+    /// [`summarize_values`] runs once per grid point on the fetch path — 1.9 M
+    /// for HRRR — and a colour dispatch per point is the wrong shape for a
+    /// question with a one-comparison answer.
+    ///
+    /// The three postures below are the ramps' own, not a simplification:
+    /// CIN/LI/VIS are transparent *above* their last stop, temperature is
+    /// transparent nowhere (both its ends are opaque clamps), and the rest are
+    /// transparent *below* their first stop.
+    pub fn paints(&self, value: f32) -> bool {
+        if !value.is_finite() {
+            return false;
+        }
+        match self {
+            ModelParameter::SurfaceBasedCin | ModelParameter::MixedLayerCin => value <= -25.0,
+            ModelParameter::SurfaceBasedCape
+            | ModelParameter::MixedLayerCape
+            | ModelParameter::MostUnstableCape => value >= 250.0,
+            ModelParameter::LiftedIndex => value <= 0.0,
+            ModelParameter::Srh1km | ModelParameter::Srh3km => value >= 50.0,
+            ModelParameter::MaxUH2to5km => value >= 25.0,
+            ModelParameter::MaxUH0to2km => value >= 10.0,
+            ModelParameter::BulkShear6km | ModelParameter::SurfaceWindGust => {
+                self.convert_for_display(value) >= 10.0
+            }
+            ModelParameter::PrecipitableWater => self.convert_for_display(value) >= 0.75,
+            ModelParameter::Temperature2m => true,
+            ModelParameter::Dewpoint2m => self.convert_for_display(value) >= 30.0,
+            ModelParameter::Visibility => self.convert_for_display(value) <= 10.0,
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             ModelParameter::SurfaceBasedCin => "sbcin",
@@ -850,13 +886,87 @@ fn lerp_color(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
 #[derive(Debug, Clone, PartialEq)]
 pub enum GridCoords {
     Lambert(lambert::LambertGrid),
-    Explicit { lats: Vec<f64>, lons: Vec<f64> },
+    /// A plate-carrée grid stated by its first point and its two steps.
+    ///
+    /// Every method below is a closed form, so the whole grid is these seven
+    /// scalars — ~64 bytes whether it is HRRR's 1.9 M points or MRMS's 24.5 M,
+    /// where [`Self::Explicit`] would be 30.5 MB and 392 MB respectively. It is
+    /// also the arm that lets [`Self::index_bounds`] and
+    /// [`Self::cell_span_degrees`] answer at all: `Explicit` returns `None` from
+    /// both, which sends `crate::render::rasterize`'s projection window back to
+    /// the full grid.
+    Regular {
+        /// The first point's latitude — the scanning origin, not the south edge.
+        lat0: f64,
+        /// The first point's longitude — the scanning origin, not the west edge.
+        lon0: f64,
+        /// **Signed** steps: the `-i` / `-j` scanning-mode bits live in the sign
+        /// here rather than in a flag this arm would have to re-read.
+        dlat: f64,
+        dlon: f64,
+        ni: usize,
+        nj: usize,
+        /// GRIB2 section 3 scanning mode, as the octet. Only `0b0010_0000`
+        /// (j-consecutive) and `0b0001_0000` (alternating rows) are read; the
+        /// two direction bits are already in the signs of the steps.
+        scan_mode: u8,
+    },
+    Explicit {
+        lats: Vec<f64>,
+        lons: Vec<f64>,
+    },
+}
+
+/// Scanning-mode bit: adjacent points are consecutive in `j`, not `i`.
+pub const SCAN_J_CONSECUTIVE: u8 = 0b0010_0000;
+/// Scanning-mode bit: alternate rows scan in the opposite direction.
+pub const SCAN_ALTERNATING: u8 = 0b0001_0000;
+
+/// The `(i, j)` a regular grid's scan puts at `index`, or `None` past its end.
+/// Mirrors [`lambert::LambertGrid`]'s own `ij_at`, which is driven by grib's
+/// `GridPointIndex::ij` — the order the decoded values arrive in.
+fn regular_ij_at(index: usize, ni: usize, nj: usize, scan_mode: u8) -> Option<(usize, usize)> {
+    let j_consecutive = scan_mode & SCAN_J_CONSECUTIVE != 0;
+    let (major_len, minor_len) = if j_consecutive { (ni, nj) } else { (nj, ni) };
+    if minor_len == 0 {
+        return None;
+    }
+    let major = index / minor_len;
+    if major >= major_len {
+        return None;
+    }
+    let mut minor = index % minor_len;
+    if scan_mode & SCAN_ALTERNATING != 0 && major % 2 == 1 {
+        minor = minor_len - minor - 1;
+    }
+    Some(if j_consecutive {
+        (major, minor)
+    } else {
+        (minor, major)
+    })
+}
+
+/// Inverse of [`regular_ij_at`], for an `(i, j)` already known to be in range.
+fn regular_index_of(i: usize, j: usize, ni: usize, nj: usize, scan_mode: u8) -> usize {
+    let j_consecutive = scan_mode & SCAN_J_CONSECUTIVE != 0;
+    let (major, minor, minor_len) = if j_consecutive {
+        (i, j, nj)
+    } else {
+        (j, i, ni)
+    };
+    let minor = if scan_mode & SCAN_ALTERNATING != 0 && major % 2 == 1 {
+        minor_len - minor - 1
+    } else {
+        minor
+    };
+    major * minor_len + minor
 }
 
 impl GridCoords {
     pub fn len(&self) -> usize {
         match self {
             GridCoords::Lambert(g) => g.len(),
+            GridCoords::Regular { ni, nj, .. } => ni * nj,
             GridCoords::Explicit { lats, lons } => lats.len().min(lons.len()),
         }
     }
@@ -868,14 +978,27 @@ impl GridCoords {
     pub fn at(&self, index: usize) -> Option<(f64, f64)> {
         match self {
             GridCoords::Lambert(g) => g.latlon_at(index),
+            GridCoords::Regular {
+                lat0,
+                lon0,
+                dlat,
+                dlon,
+                ni,
+                nj,
+                scan_mode,
+            } => {
+                let (i, j) = regular_ij_at(index, *ni, *nj, *scan_mode)?;
+                Some((lat0 + j as f64 * dlat, lon0 + i as f64 * dlon))
+            }
             GridCoords::Explicit { lats, lons } => Some((*lats.get(index)?, *lons.get(index)?)),
         }
     }
 
     /// Fractional `(i_min, i_max, j_min, j_max)` bounding every grid point inside
     /// `bounds`, or `None` when there is no cheaper answer than all. Only the
-    /// Lambert case answers, and `ni`/`nj` are the *caller's* grid shape, so a
-    /// shape that does not match is refused rather than answered wrongly.
+    /// Lambert and regular cases answer, and `ni`/`nj` are the *caller's* grid
+    /// shape, so a shape that does not match is refused rather than answered
+    /// wrongly.
     pub fn index_bounds(
         &self,
         bounds: &GeoBounds,
@@ -889,15 +1012,54 @@ impl GridCoords {
                 bounds.min_lon,
                 bounds.max_lon,
             ),
+            // The same three conditions the Lambert arm's `is_row_major` states,
+            // for the same reason: the caller steps `index ± 1` and `index ± ni`
+            // for the four neighbours, which is `j * ni + i` only when the scan
+            // is i-consecutive, non-alternating, and of this very shape.
+            GridCoords::Regular {
+                lat0,
+                lon0,
+                dlat,
+                dlon,
+                ni: gni,
+                nj: gnj,
+                scan_mode,
+            } => {
+                if *scan_mode & (SCAN_J_CONSECUTIVE | SCAN_ALTERNATING) != 0
+                    || *gni != ni
+                    || *gnj != nj
+                    || *dlat == 0.0
+                    || *dlon == 0.0
+                    || bounds.min_lat > bounds.max_lat
+                    || bounds.min_lon > bounds.max_lon
+                {
+                    return None;
+                }
+                let (ia, ib) = (
+                    (bounds.min_lon - lon0) / dlon,
+                    (bounds.max_lon - lon0) / dlon,
+                );
+                let (ja, jb) = (
+                    (bounds.min_lat - lat0) / dlat,
+                    (bounds.max_lat - lat0) / dlat,
+                );
+                // A negative step reverses the ordering, hence the min/max pairs.
+                let out = (ia.min(ib), ia.max(ib), ja.min(jb), ja.max(jb));
+                (out.0.is_finite() && out.1.is_finite() && out.2.is_finite() && out.3.is_finite())
+                    .then_some(out)
+            }
             _ => None,
         }
     }
 
     /// Upper bound on how many degrees one grid cell spans near `lat` — see
-    /// [`lambert::LambertGrid::cell_span_degrees`].
+    /// [`lambert::LambertGrid::cell_span_degrees`]. A regular grid's cell is
+    /// already stated in degrees, so the bound is the larger step and `lat` does
+    /// not enter it.
     pub fn cell_span_degrees(&self, lat: f64) -> Option<f64> {
         match self {
             GridCoords::Lambert(g) => Some(g.cell_span_degrees(lat)),
+            GridCoords::Regular { dlat, dlon, .. } => Some(dlat.abs().max(dlon.abs())),
             GridCoords::Explicit { .. } => None,
         }
     }
@@ -907,16 +1069,37 @@ impl GridCoords {
     pub fn wraps_longitude(&self) -> bool {
         match self {
             GridCoords::Lambert(g) => g.wraps_longitude(),
+            GridCoords::Regular { dlon, ni, .. } => (*ni as f64 * dlon).abs() >= 360.0,
             GridCoords::Explicit { .. } => false,
         }
     }
 
     /// Index of the grid point nearest `(lat, lon)`, or `None` when the grid does
-    /// not cover it. O(1) for a Lambert grid — the flat scan it replaces ran over
-    /// all 1.9 M points on every hover frame.
+    /// not cover it. O(1) for a Lambert or regular grid — the flat scan it
+    /// replaces ran over all 1.9 M points on every hover frame.
     pub fn nearest(&self, lat: f64, lon: f64) -> Option<usize> {
         match self {
             GridCoords::Lambert(g) => g.nearest(lat, lon),
+            GridCoords::Regular {
+                lat0,
+                lon0,
+                dlat,
+                dlon,
+                ni,
+                nj,
+                scan_mode,
+            } => {
+                let fi = ((lon - lon0) / dlon).round();
+                let fj = ((lat - lat0) / dlat).round();
+                if !(fi.is_finite() && fj.is_finite()) || fi < 0.0 || fj < 0.0 {
+                    return None;
+                }
+                let (i, j) = (fi as usize, fj as usize);
+                if i >= *ni || j >= *nj {
+                    return None;
+                }
+                Some(regular_index_of(i, j, *ni, *nj, *scan_mode))
+            }
             GridCoords::Explicit { lats, lons } => {
                 let mut best = None;
                 let mut best_d2 = f64::MAX;
@@ -984,16 +1167,26 @@ impl HrrrGridData {
     }
 }
 
-/// One pass for the render-coverage summary on [`HrrrGridData`]. Non-finite
+/// One pass for the render-coverage summary on a gridded field. Non-finite
 /// points are missing data, not readings — excluded from both figures.
-pub fn summarize_values(values: &[f32], param: ModelParameter) -> (usize, Option<(f32, f32)>) {
+///
+/// `paints` answers "does this value paint anything", and takes a **predicate
+/// rather than a colour**: this runs once per grid point on the fetch path
+/// (1.9 M for HRRR, 24.5 M for a CONUS composite), where evaluating a ramp only
+/// to look at its alpha is the wrong shape. [`ModelParameter::paints`] is the
+/// model's, and `a_visibility_test_agrees_with_every_ramp` is what keeps the two
+/// answers the same.
+pub fn summarize_values(
+    values: &[f32],
+    paints: impl Fn(f32) -> bool,
+) -> (usize, Option<(f32, f32)>) {
     let mut visible = 0usize;
     let mut range: Option<(f32, f32)> = None;
     for &v in values {
         if !v.is_finite() {
             continue;
         }
-        if param.color_for_value(v)[3] != 0 {
+        if paints(v) {
             visible += 1;
         }
         range = Some(match range {
@@ -1021,7 +1214,7 @@ mod tests {
 
     fn grid(param: ModelParameter, values: Vec<f32>) -> HrrrGridData {
         let n = values.len();
-        let (visible_points, value_range) = summarize_values(&values, param);
+        let (visible_points, value_range) = summarize_values(&values, |v| param.paints(v));
         HrrrGridData {
             parameter: param,
             values,
@@ -1089,7 +1282,7 @@ mod tests {
     #[test]
     fn summarize_values_ignores_non_finite_points() {
         let values = vec![f32::NAN, 100.0, f32::INFINITY, 200.0];
-        let (visible, range) = summarize_values(&values, ModelParameter::MaxUH2to5km);
+        let (visible, range) = summarize_values(&values, |v| ModelParameter::MaxUH2to5km.paints(v));
         assert_eq!(visible, 2, "NaN/inf must never count as painted points");
         assert_eq!(range, Some((100.0, 200.0)));
     }
@@ -1197,5 +1390,285 @@ mod tests {
             assert_eq!(p.format_value(f32::NAN), "", "{}", p.display_name());
             assert_eq!(p.format_value(f32::INFINITY), "", "{}", p.display_name());
         }
+    }
+
+    // ── GridCoords::Regular ────────────────────────────────────────────
+
+    /// MRMS's own shape at a hundredth of the scale: a north-down scan, so
+    /// `dlat` is negative and `dlon` positive.
+    fn regular(ni: usize, nj: usize, scan_mode: u8) -> GridCoords {
+        GridCoords::Regular {
+            lat0: 54.995,
+            lon0: -129.995,
+            dlat: -0.01,
+            dlon: 0.01,
+            ni,
+            nj,
+            scan_mode,
+        }
+    }
+
+    /// An `Explicit` grid built by walking the same parameters — the form the
+    /// regular arm exists to avoid materialising.
+    fn materialise(coords: &GridCoords) -> GridCoords {
+        let (mut lats, mut lons) = (Vec::new(), Vec::new());
+        for k in 0..coords.len() {
+            let (lat, lon) = coords.at(k).expect("in range");
+            lats.push(lat);
+            lons.push(lon);
+        }
+        GridCoords::Explicit { lats, lons }
+    }
+
+    /// **The parity, with its non-vacuity floor.** Every point of a regular grid
+    /// is the point its materialised form holds, at exact `f64` equality — the
+    /// analytic arm is the same grid, not an approximation of it.
+    #[test]
+    fn a_regular_grid_indexes_the_same_points_as_its_materialised_form() {
+        for scan_mode in [0b0100_0000u8, 0b0110_0000, 0b0101_0000, 0b0111_0000] {
+            let coords = regular(151, 97, scan_mode);
+            assert!(
+                coords.len() > 10_000,
+                "a grid of {} points is small enough that a zero-size grid \
+                 would pass this test trivially",
+                coords.len(),
+            );
+            // The materialised form is built *through* `at`, so this pins the
+            // storage question rather than the formula. The formula's own
+            // floors are the corner readings below and the `nearest` inverse.
+            let explicit = materialise(&coords);
+            assert_eq!(explicit.len(), coords.len());
+            for k in 0..coords.len() {
+                assert_eq!(
+                    coords.at(k),
+                    explicit.at(k),
+                    "point {k}, mode {scan_mode:b}"
+                );
+            }
+            assert_eq!(coords.at(coords.len()), None, "past the end is no point");
+        }
+
+        // The formula itself, read off the corners of the default i-consecutive
+        // scan: point 0 is the origin, point 1 steps in longitude, point `ni`
+        // steps in latitude.
+        let coords = regular(151, 97, 0b0100_0000);
+        assert_eq!(coords.at(0), Some((54.995, -129.995)));
+        let (lat, lon) = coords.at(1).expect("in range");
+        assert!((lon - (-129.985)).abs() < 1e-12, "{lon}");
+        assert!((lat - 54.995).abs() < 1e-12, "{lat}");
+        let (lat, lon) = coords.at(151).expect("in range");
+        assert!((lat - 54.985).abs() < 1e-12, "{lat}");
+        assert!((lon - (-129.995)).abs() < 1e-12, "{lon}");
+    }
+
+    /// `nearest` is `at` run backwards, for every point of the grid and for a
+    /// probe nudged off each lattice point.
+    #[test]
+    fn a_regular_grid_nearest_is_the_inverse_of_at() {
+        for scan_mode in [0b0100_0000u8, 0b0110_0000, 0b0101_0000] {
+            let coords = regular(151, 97, scan_mode);
+            assert!(coords.len() > 10_000);
+            for k in 0..coords.len() {
+                let (lat, lon) = coords.at(k).expect("in range");
+                assert_eq!(coords.nearest(lat, lon), Some(k), "point {k}");
+                // A third of a cell off in both directions still rounds home.
+                assert_eq!(
+                    coords.nearest(lat - 0.01 / 3.0, lon + 0.01 / 3.0),
+                    Some(k),
+                    "point {k} nudged",
+                );
+            }
+        }
+        let coords = regular(151, 97, 0b0100_0000);
+        assert_eq!(coords.nearest(54.995 + 0.02, -129.995), None, "north of it");
+        assert_eq!(coords.nearest(54.995, -129.995 - 0.02), None, "west of it");
+        assert_eq!(coords.nearest(0.0, 0.0), None, "nowhere near it");
+        assert_eq!(coords.nearest(f64::NAN, -129.0), None);
+    }
+
+    /// `index_bounds` answers for the shape it was built with and refuses every
+    /// other, exactly as the Lambert arm's `is_row_major` guard does. A grid
+    /// answering for a shape it does not have would place the window's four
+    /// edges against a different lattice.
+    #[test]
+    fn a_regular_grid_refuses_a_shape_it_was_not_built_with() {
+        let coords = regular(151, 97, 0b0100_0000);
+        let bounds = GeoBounds {
+            min_lat: 54.0,
+            max_lat: 54.5,
+            min_lon: -129.5,
+            max_lon: -129.0,
+        };
+        let answer = coords
+            .index_bounds(&bounds, 151, 97)
+            .expect("its own shape is answered");
+        // 0.5 degrees at a 0.01 step is fifty cells each way.
+        assert!((answer.1 - answer.0 - 50.0).abs() < 1e-6, "{answer:?}");
+        assert!((answer.3 - answer.2 - 50.0).abs() < 1e-6, "{answer:?}");
+
+        for (ni, nj) in [(150, 97), (151, 96), (97, 151), (0, 0)] {
+            assert_eq!(
+                coords.index_bounds(&bounds, ni, nj),
+                None,
+                "answered for {ni}x{nj}, which is not the shape it holds",
+            );
+        }
+        // A scan whose flat index is not `j * ni + i` is refused for the same
+        // reason, even at the right shape.
+        for scan_mode in [0b0110_0000u8, 0b0101_0000, 0b0111_0000] {
+            assert_eq!(
+                regular(151, 97, scan_mode).index_bounds(&bounds, 151, 97),
+                None,
+                "mode {scan_mode:b} is not row-major",
+            );
+        }
+        // An inverted box is refused rather than answered upside down.
+        assert_eq!(
+            coords.index_bounds(
+                &GeoBounds {
+                    min_lat: 54.5,
+                    max_lat: 54.0,
+                    min_lon: -129.0,
+                    max_lon: -129.5,
+                },
+                151,
+                97,
+            ),
+            None,
+        );
+    }
+
+    /// The two window inputs `Explicit` cannot answer, which is the whole reason
+    /// this arm exists.
+    #[test]
+    fn a_regular_grid_answers_the_two_questions_explicit_cannot() {
+        let coords = regular(151, 97, 0b0100_0000);
+        assert_eq!(coords.cell_span_degrees(45.0), Some(0.01));
+        assert_eq!(
+            coords.cell_span_degrees(89.0),
+            coords.cell_span_degrees(0.0),
+            "a degree grid's cell is degrees; latitude does not enter it",
+        );
+        assert!(!coords.wraps_longitude());
+        assert_eq!(materialise(&coords).cell_span_degrees(45.0), None);
+
+        // A grid that goes all the way round does wrap, and one a cell short
+        // does not — the boundary, from both sides.
+        let round = GridCoords::Regular {
+            lat0: 0.0,
+            lon0: -180.0,
+            dlat: 0.1,
+            dlon: 0.1,
+            ni: 3600,
+            nj: 10,
+            scan_mode: 0b0100_0000,
+        };
+        assert!(round.wraps_longitude());
+        assert!(
+            !GridCoords::Regular {
+                lat0: 0.0,
+                lon0: -180.0,
+                dlat: 0.1,
+                dlon: 0.1,
+                ni: 3599,
+                nj: 10,
+                scan_mode: 0b0100_0000,
+            }
+            .wraps_longitude(),
+        );
+    }
+
+    // ── The visibility short-circuit ───────────────────────────────────
+
+    /// `paints` is what `summarize_values` asks instead of building a colour,
+    /// so the two must answer the same everywhere — including at every stop of
+    /// every ramp, where an off-by-one comparison would live.
+    #[test]
+    fn a_visibility_test_agrees_with_every_ramp() {
+        for &p in ModelParameter::all() {
+            let mut probes: Vec<f32> = vec![
+                f32::NAN,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                0.0,
+                -0.0,
+                f32::MIN,
+                f32::MAX,
+            ];
+            // Every stop, exactly, and either side of it — in the ramp's own
+            // units carried back to the raw ones the grid states, by bisecting
+            // `convert_for_display` rather than restating its arithmetic.
+            for (stop, _) in p.legend_thresholds() {
+                for scale in [1.0f32, 0.999_999, 1.000_001] {
+                    let display = stop * scale;
+                    probes.push(display);
+                    let (mut lo, mut hi) = (-1.0e6f32, 1.0e6f32);
+                    for _ in 0..200 {
+                        let mid = 0.5 * (lo + hi);
+                        if p.convert_for_display(mid) < display {
+                            lo = mid;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    probes.push(lo);
+                    probes.push(hi);
+                }
+            }
+            let mut v = -1500.0f32;
+            while v <= 20_000.0 {
+                probes.push(v);
+                v += if v.abs() < 1200.0 { 0.5 } else { 11.0 };
+            }
+
+            let mut seen = (false, false);
+            for probe in probes {
+                let painted = p.color_for_value(probe)[3] != 0;
+                assert_eq!(
+                    p.paints(probe),
+                    painted,
+                    "{p:?} at {probe}: the short-circuit and the ramp disagree",
+                );
+                if painted {
+                    seen.0 = true;
+                } else {
+                    seen.1 = true;
+                }
+            }
+            assert_eq!(
+                seen,
+                (true, true),
+                "{p:?}: the sweep produced only one answer, so the agreement \
+                 above is vacuous",
+            );
+        }
+    }
+
+    /// `summarize_values` asks its predicate once per **finite** point and
+    /// never builds a colour: it runs over 1.9 M points on the fetch path.
+    #[test]
+    fn summarize_is_linear_in_points() {
+        use std::cell::Cell;
+        let calls = Cell::new(0usize);
+        let values = vec![1.0, f32::NAN, 2.0, f32::INFINITY, 3.0, f32::NEG_INFINITY];
+        let (visible, range) = summarize_values(&values, |v| {
+            calls.set(calls.get() + 1);
+            v > 1.5
+        });
+        assert_eq!(
+            calls.get(),
+            3,
+            "the predicate ran {} times over three finite points",
+            calls.get(),
+        );
+        assert_eq!(visible, 2);
+        assert_eq!(range, Some((1.0, 3.0)));
+
+        // The floor: the count above would also read three if the predicate's
+        // answer were ignored, so pin that a different answer moves the tally.
+        let (all, _) = summarize_values(&values, |_| true);
+        assert_eq!(all, 3);
+        let (none, _) = summarize_values(&values, |_| false);
+        assert_eq!(none, 0);
     }
 }

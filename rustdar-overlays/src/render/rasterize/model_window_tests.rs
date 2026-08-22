@@ -25,13 +25,13 @@ const H: u32 = 128;
 
 /// The window form the encoder ships: the computed window and exactly its
 /// values, cut with the same accessors `offload`'s encoder uses.
-fn window_form(grid: &HrrrGridData, bounds: &GeoBounds, w: u32, h: u32) -> ModelWindow {
-    let input = ModelDataInput::Whole(Arc::new(grid.clone()));
+fn window_form(grid: &HrrrGridData, bounds: &GeoBounds, w: u32, h: u32) -> GridWindow {
+    let input = GriddedInput::Whole(Arc::new(grid.clone()));
     let win = input.window_for(bounds, w, h);
     let mut values = Vec::with_capacity(win.area());
     input.for_each_window_row(&win, |row| values.extend_from_slice(row));
-    ModelWindow {
-        parameter: grid.parameter,
+    GridWindow {
+        field: crate::hrrr::fields::spec(grid.parameter).id.clone(),
         ni: grid.ni,
         nj: grid.nj,
         coords: grid.coords.clone(),
@@ -50,7 +50,7 @@ fn painted(rgba: &[u8]) -> usize {
 #[test]
 fn the_windowed_values_paint_exactly_what_the_whole_grid_paints() {
     let (grid, bounds) = fixture();
-    let whole = ModelDataInput::Whole(Arc::new(grid.clone()));
+    let whole = GriddedInput::Whole(Arc::new(grid.clone()));
     let window = window_form(&grid, &bounds, W, H);
 
     // Non-triviality floors. A window covering the whole grid would make
@@ -73,7 +73,7 @@ fn the_windowed_values_paint_exactly_what_the_whole_grid_paints() {
         "the cut carries exactly the window's values",
     );
 
-    let direct = rasterize_model_data(&whole, &bounds, W, H);
+    let direct = rasterize_gridded(&whole, &bounds, W, H);
     assert!(
         painted(&direct.rgba) > 100,
         "the fixture painted {} pixels; the equality below would be \
@@ -81,7 +81,7 @@ fn the_windowed_values_paint_exactly_what_the_whole_grid_paints() {
         painted(&direct.rgba),
     );
 
-    let via_window = rasterize_model_data(&ModelDataInput::Window(window), &bounds, W, H);
+    let via_window = rasterize_gridded(&GriddedInput::Window(window), &bounds, W, H);
     assert_eq!(
         direct.rgba, via_window.rgba,
         "the window form paints a different picture from the whole grid: \
@@ -98,13 +98,8 @@ fn the_windowed_values_paint_exactly_what_the_whole_grid_paints() {
 #[test]
 fn a_value_outside_the_window_is_dead_and_one_inside_is_not() {
     let (grid, bounds) = fixture();
-    let win = ModelDataInput::Whole(Arc::new(grid.clone())).window_for(&bounds, W, H);
-    let reference = rasterize_model_data(
-        &ModelDataInput::Whole(Arc::new(grid.clone())),
-        &bounds,
-        W,
-        H,
-    );
+    let win = GriddedInput::Whole(Arc::new(grid.clone())).window_for(&bounds, W, H);
+    let reference = rasterize_gridded(&GriddedInput::Whole(Arc::new(grid.clone())), &bounds, W, H);
     assert!(painted(&reference.rgba) > 100, "fixture floor");
 
     // A point the window excludes. `win` is a proper subset (pinned above),
@@ -117,8 +112,7 @@ fn a_value_outside_the_window_is_dead_and_one_inside_is_not() {
     );
     let mut outside = grid.clone();
     outside.values[0] = 4000.0;
-    let moved_outside =
-        rasterize_model_data(&ModelDataInput::Whole(Arc::new(outside)), &bounds, W, H);
+    let moved_outside = rasterize_gridded(&GriddedInput::Whole(Arc::new(outside)), &bounds, W, H);
     assert_eq!(
         reference.rgba, moved_outside.rgba,
         "a value outside the projection window changed the picture — the \
@@ -133,8 +127,8 @@ fn a_value_outside_the_window_is_dead_and_one_inside_is_not() {
     let (ci, cj) = ((draw.i0 + draw.i1) / 2, (draw.j0 + draw.j1) / 2);
     let mut inside = grid.clone();
     inside.values[cj * grid.ni + ci] = 4000.0;
-    let moved_inside = rasterize_model_data(
-        &ModelDataInput::Window(window_form(&inside, &bounds, W, H)),
+    let moved_inside = rasterize_gridded(
+        &GriddedInput::Window(window_form(&inside, &bounds, W, H)),
         &bounds,
         W,
         H,
@@ -152,12 +146,7 @@ fn a_value_outside_the_window_is_dead_and_one_inside_is_not() {
 fn a_window_one_ring_too_tight_changes_the_picture() {
     let (grid, bounds) = fixture();
     let honest = window_form(&grid, &bounds, W, H);
-    let direct = rasterize_model_data(
-        &ModelDataInput::Whole(Arc::new(grid.clone())),
-        &bounds,
-        W,
-        H,
-    );
+    let direct = rasterize_gridded(&GriddedInput::Whole(Arc::new(grid.clone())), &bounds, W, H);
 
     let tight_win = IndexWindow {
         i0: honest.win.i0 + 1,
@@ -165,11 +154,11 @@ fn a_window_one_ring_too_tight_changes_the_picture() {
         j0: honest.win.j0 + 1,
         j1: honest.win.j1 - 1,
     };
-    let input = ModelDataInput::Whole(Arc::new(grid.clone()));
+    let input = GriddedInput::Whole(Arc::new(grid.clone()));
     let mut tight_values = Vec::with_capacity(tight_win.area());
     input.for_each_window_row(&tight_win, |row| tight_values.extend_from_slice(row));
-    let tight = rasterize_model_data(
-        &ModelDataInput::Window(ModelWindow {
+    let tight = rasterize_gridded(
+        &GriddedInput::Window(GridWindow {
             win: tight_win,
             values: tight_values,
             ..honest
@@ -205,13 +194,13 @@ fn an_empty_window_is_a_blank_raster_on_both_forms() {
     );
     assert!(window.values.is_empty());
 
-    let whole = rasterize_model_data(
-        &ModelDataInput::Whole(Arc::new(grid.clone())),
+    let whole = rasterize_gridded(
+        &GriddedInput::Whole(Arc::new(grid.clone())),
         &atlantic,
         W,
         H,
     );
-    let windowed = rasterize_model_data(&ModelDataInput::Window(window), &atlantic, W, H);
+    let windowed = rasterize_gridded(&GriddedInput::Window(window), &atlantic, W, H);
     assert_eq!(whole.rgba, windowed.rgba);
     assert_eq!(painted(&whole.rgba), 0);
 }
