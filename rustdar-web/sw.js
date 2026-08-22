@@ -67,6 +67,7 @@ const ROOT = new URL("./", self.location.href);
 const META_CACHE = `rustdar-meta-v${SW_VERSION}`;
 const TILE_CACHE = `rustdar-basemap-v${SW_VERSION}`;
 const SHELL_PREFIX = `rustdar-shell-v${SW_VERSION}-`;
+const ASSET_CACHE = `rustdar-assets-v${SW_VERSION}`;
 
 /* Synthetic keys for the meta and client-pin records; nothing is served from them. */
 const META_KEY = new URL("__rustdar_sw_meta__", ROOT).href;
@@ -104,6 +105,24 @@ const SHELL_PATHS = [
 
 const SHELL_URLS = SHELL_PATHS.map((p) => new URL(p, ROOT).href);
 const SHELL_URL_SET = new Set(SHELL_URLS);
+
+/*
+ * Same-origin data assets: cached, but deliberately NOT part of the shell.
+ *
+ * `SHELL_PATHS` is precached with `cache.addAll`, which is all-or-nothing, so
+ * one multi-megabyte entry that fails to fetch would take offline support for
+ * the whole app down with it. These are fetched on demand by the app, cached on
+ * the way past, and served from cache afterwards. A miss costs the app requests
+ * to api.weather.gov and nothing else -- `nws::zone_pack_source` treats an
+ * absent pack as a supported state.
+ *
+ * They also live in a cache of their own rather than the shell's, so a deploy
+ * does not re-download them: the shell is refetched whenever the validator
+ * token moves, which is every push to main, and the pack changes only when the
+ * NWS publishes a new zone edition.
+ */
+const ASSET_PATHS = ["zones.pack"];
+const ASSET_URL_SET = new Set(ASSET_PATHS.map((p) => new URL(p, ROOT).href));
 
 /*
  * The assets whose HTTP validators stand in for "which deploy is this". Two,
@@ -198,6 +217,10 @@ function isShellAsset(url) {
   return SHELL_URL_SET.has(url.origin + url.pathname);
 }
 
+function isDataAsset(url) {
+  return ASSET_URL_SET.has(url.origin + url.pathname);
+}
+
 /**
  * Classify one request. The whole caching policy is this function.
  *
@@ -205,6 +228,7 @@ function isShellAsset(url) {
  *   "network"  - the worker must not touch it. No `respondWith`, no cache.
  *   "navigate" - a top-level navigation; answer from the cached shell index.
  *   "shell"    - a named app-shell asset.
+ *   "asset"    - a named same-origin data asset, cached outside the shell.
  *   "tile"     - a CartoDB basemap tile.
  *
  * Takes a plain `{url, method, mode}` rather than a `Request` so it is callable
@@ -248,6 +272,7 @@ function routeFor({ url, method = "GET", mode = "no-cors" }) {
   if (u.origin === ROOT.origin && u.pathname.startsWith(ROOT.pathname)) {
     if (mode === "navigate") return "navigate";
     if (isShellAsset(u)) return "shell";
+    if (isDataAsset(u)) return "asset";
   }
 
   // Default deny.
@@ -473,7 +498,11 @@ async function installShell(token, name = shellCacheName(token)) {
  * knows a live page's generation is in use.
  */
 async function cachesToKeep(newShellName) {
-  const keep = new Set([META_CACHE, TILE_CACHE, newShellName]);
+  // ASSET_CACHE is kept for the reason it exists: `purgeCaches` deletes every
+  // `rustdar-` cache not named here, so leaving it out would re-download the
+  // zone pack on every deploy -- which is exactly the cost a cache outside the
+  // shell was chosen to avoid.
+  const keep = new Set([META_CACHE, TILE_CACHE, ASSET_CACHE, newShellName]);
   for (const name of clientShells.values()) keep.add(name);
   for (const name of Object.values(await readPins())) keep.add(name);
   return keep;
@@ -695,6 +724,31 @@ async function cacheTile(cache, request, response) {
  * stale is safe here in a way it never would be for weather data: the worst
  * outcome is last month's rendering of the same coastline.
  */
+/*
+ * Cache-first, and that is the whole policy: these assets are content the NWS
+ * republishes on a schedule of months, and the app asks for one once per
+ * session. No revalidation, because a HEAD per session on a file that changes
+ * quarterly costs more than it saves; a new edition arrives with a deploy that
+ * bumps SW_VERSION, or by the app fetching a URL this cache has never seen.
+ *
+ * A failure rejects, exactly as an uncontrolled fetch would, so the app sees an
+ * ordinary network error and falls back to resolving zones over HTTP.
+ */
+async function serveAsset(event) {
+  const cache = await caches.open(ASSET_CACHE);
+  const hit = await cache.match(event.request);
+  if (hit) return hit;
+
+  const response = await fetch(event.request);
+  // `put` on a partial or opaque response would poison the cache with
+  // something the app cannot parse, and a rejected pack is a silent
+  // fallback to the fan-out this asset exists to remove.
+  if (response && response.ok && response.status === 200) {
+    await cache.put(event.request, response.clone());
+  }
+  return response;
+}
+
 async function serveTile(event) {
   const cache = await caches.open(TILE_CACHE);
   const hit = await cache.match(event.request);
@@ -790,6 +844,9 @@ self.addEventListener("fetch", (event) => {
     case "shell":
       event.respondWith(serveShell(event.request, event.clientId));
       return;
+    case "asset":
+      event.respondWith(serveAsset(event));
+      return;
     case "tile":
       event.respondWith(serveTile(event));
       return;
@@ -825,6 +882,9 @@ self.addEventListener("message", (event) => {
 self.__rustdarSwInternals = {
   ROOT,
   SHELL_URLS,
+  ASSET_PATHS,
+  ASSET_CACHE,
+  isDataAsset,
   NEVER_CACHE_HOSTS,
   TILE_CACHE,
   TILE_CACHE_MAX,
