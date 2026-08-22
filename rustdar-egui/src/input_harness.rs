@@ -728,6 +728,17 @@ impl InputHarness {
         // as the right slide-over on Medium, and as the sheet's Inspector
         // page over its Layers page on Compact.
         self.close_inspector();
+        // **A layer the active pane does not hold has no row, and the user's
+        // route to it is the catalogue.** Since the stack became a curated
+        // list, a registered layer that ships disabled is not in a fresh
+        // pane's stack at all, so "scroll to its row" is not a walk that can
+        // start — the tile that puts the row there is the step before it. Taken
+        // through the catalogue rather than through the pane API on purpose:
+        // it makes the parity walk prove, for every registered layer at every
+        // width, that the catalogue's add really lands a row.
+        if self.stack_row(kind).is_none() {
+            self.add_layer_from_catalog(kind);
+        }
         self.open_layers();
         // Scroll inside the panel wherever its host put it — the sheet's
         // body sits in the lower half of a phone screen, so a fixed
@@ -852,8 +863,60 @@ impl InputHarness {
         self.warm_up();
         assert!(
             self.catalog().open,
-            "clicking + Show a layer did not open the catalog"
+            "clicking {} did not open the catalog",
+            crate::ui::ADD_LAYER_LABEL,
         );
+    }
+
+    /// **Put `kind` in the active pane's stack the user's way**: open the
+    /// catalog, click its tile, and assert a row appeared for it.
+    ///
+    /// The real route, not `PaneState::add_layer` — a helper that reached
+    /// past the chrome would let the chrome's own add rot untested while every
+    /// caller of this went on passing.
+    pub(crate) fn add_layer_from_catalog(&mut self, kind: &LayerId) {
+        let name = self.overlay_display_name(kind).to_owned();
+        self.open_catalog();
+        let tile = self
+            .catalog_tile(crate::ui::CatalogGroup::Layers, &name)
+            .unwrap_or_else(|| panic!("the catalog drew no Overlays tile for {kind:?} ({name:?})"));
+        self.mouse_click(tile.rect.center());
+        self.warm_up();
+        assert!(
+            self.gui
+                .pane(self.active_pane_index())
+                .is_some_and(|pane| { pane.draw_order().any(|held| held == kind) }),
+            "the catalog's {name:?} tile did not put {kind:?} in the active \
+             pane's stack",
+        );
+    }
+
+    /// Put `kind` in pane `idx`'s stack without going through the chrome — for
+    /// the callers that need a layer *present but off*, which the catalog's
+    /// tile cannot produce because it switches what it adds on.
+    pub(crate) fn add_layer_to_pane(&mut self, idx: usize, kind: &LayerId) {
+        self.gui.add_layer_on_pane_for_test(idx, kind);
+        self.warm_up();
+    }
+
+    /// **Fill the active pane's stack with every registered layer**, through
+    /// the same door the catalog uses.
+    ///
+    /// For the tests whose subject is a *long* list — the panel's scroll, its
+    /// height against the bottom clearance, the id stability of a scrolled
+    /// body. A curated stack starts at the handful of layers that ship
+    /// enabled, which is short enough that a panel need not scroll at all, and
+    /// a scroll test on a list that fits is a test that cannot fail. This is
+    /// what those tests reach for instead of the old always-complete stack,
+    /// and it is a state a user can really be in: everything in the catalog,
+    /// added.
+    pub(crate) fn fill_stack(&mut self) {
+        let idx = self.active_pane_index();
+        let every: Vec<LayerId> = self.gui.overlays.handlers().map(|h| h.id()).collect();
+        for id in &every {
+            self.gui.add_layer_on_pane_for_test(idx, id);
+        }
+        self.warm_up();
     }
 
     /// Put the layers panel on screen the user's way: the top bar's Layers

@@ -32,6 +32,11 @@ mod input_harness;
 #[cfg(test)]
 mod parity_walk;
 
+/// Layer-stack curation through the chrome: the trash can, the catalog's add,
+/// and the removal that survives a reopen.
+#[cfg(test)]
+mod layer_curation_tests;
+
 /// The chrome's glyph inventory and the coverage tests over egui's bundled fonts.
 #[cfg(test)]
 mod ui_glyphs;

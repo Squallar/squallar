@@ -2061,6 +2061,12 @@ fn a_click_on_a_cell_no_pane_occupies_leaves_the_active_pane_alone() {
 #[test]
 fn crossing_a_breakpoint_does_not_move_any_widget_id() {
     let mut h = InputHarness::with_screen(egui::vec2(1200.0, 500.0));
+    // **A stack the user has filled from the catalog.** A curated stack
+    // starts at the handful of layers that ship enabled, and this test's
+    // subject is a LONG list - the panel's scroll, its clamped height, the
+    // ids a scrolled body keeps. Built the way a user builds one, rather
+    // than relied on as a property of the build's layer count.
+    h.fill_stack();
     h.set_drawer_open(true);
     h.gui_mut().open_settings();
     h.warm_up();
@@ -2758,6 +2764,12 @@ fn the_pane_picker_offers_fewer_panes_on_a_phone_than_on_a_desktop() {
 #[test]
 fn the_layers_toggle_hides_and_restores_the_expanded_sidebar_with_its_state() {
     let mut h = InputHarness::with_screen(egui::vec2(1200.0, 500.0));
+    // **A stack the user has filled from the catalog.** A curated stack
+    // starts at the handful of layers that ship enabled, and this test's
+    // subject is a LONG list - the panel's scroll, its clamped height, the
+    // ids a scrolled body keeps. Built the way a user builds one, rather
+    // than relied on as a property of the build's layer count.
+    h.fill_stack();
     assert_eq!(
         h.width_class(),
         crate::ui_layout::WidthClass::Expanded,
@@ -3378,6 +3390,10 @@ fn an_eye_toggle_loads_the_active_panes_config_before_saving_it() {
 
     h.set_overlay_on_pane(0, &known::CITY_LABELS, true);
     h.set_overlay_on_pane(1, &known::CITY_LABELS, false);
+    // The layer ships disabled, so a curated stack does not hold it: it is
+    // added first, then hidden, which is the "in the stack, eye off" state the
+    // toggle below needs a row for.
+    h.add_layer_to_pane(0, &known::RADAR_SITES);
     h.set_overlay_on_pane(0, &known::RADAR_SITES, false);
     h.warm_up();
 
@@ -3406,6 +3422,11 @@ fn an_eye_toggle_propagates_over_the_layer_link_mask() {
         h.all_layer_linked(),
         "precondition: every pane's layer link defaults on"
     );
+    // The layer ships disabled, so neither curated stack holds it: both panes
+    // are given it, then both are hidden - the "in the stack, eye off" state
+    // on each end of the link that the fan-out below is about.
+    h.add_layer_to_pane(0, &known::RADAR_SITES);
+    h.add_layer_to_pane(1, &known::RADAR_SITES);
     h.set_overlay_on_pane(0, &known::RADAR_SITES, false);
     h.set_overlay_on_pane(1, &known::RADAR_SITES, false);
     h.warm_up();
@@ -3470,8 +3491,13 @@ fn an_eye_toggle_propagates_over_the_layer_link_mask() {
 #[test]
 fn enabling_a_dataless_layer_fetches_it() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    // Outlooks ship disabled, so a curated stack does not hold one: the layer
+    // is added and hidden, which is the state this test's subject - the eye
+    // turning a *dataless* layer on - needs a row in.
+    h.add_layer_to_pane(0, &known::SPC_OUTLOOK);
+    h.set_overlay_on_pane(0, &known::SPC_OUTLOOK, false);
     let row = h.stack_row(&known::SPC_OUTLOOK).expect("row drawn");
-    assert!(!row.eye_on, "precondition: outlooks default off");
+    assert!(!row.eye_on, "precondition: the row is drawn hidden");
     h.mouse_click(row.eye.center());
     assert!(
         h.last_actions().iter().any(|a| matches!(
@@ -3988,6 +4014,12 @@ fn the_auto_poll_chip_pins_its_off_text_and_hover() {
 #[test]
 fn the_stack_regains_its_height_after_a_shrink_and_regrow() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    // **A stack the user has filled from the catalog.** A curated stack
+    // starts at the handful of layers that ship enabled, and this test's
+    // subject is a LONG list - the panel's scroll, its clamped height, the
+    // ids a scrolled body keeps. Built the way a user builds one, rather
+    // than relied on as a property of the build's layer count.
+    h.fill_stack();
     let before = h.stack().rect.height();
     assert!(
         before > 300.0,
@@ -5416,6 +5448,12 @@ fn a_scan_arriving_moves_no_widget_id() {
 #[test]
 fn crossing_a_breakpoint_re_keys_nothing() {
     let mut h = InputHarness::with_screen(egui::vec2(750.0, 480.0));
+    // **A stack the user has filled from the catalog.** A curated stack
+    // starts at the handful of layers that ship enabled, and this test's
+    // subject is a LONG list - the panel's scroll, its clamped height, the
+    // ids a scrolled body keeps. Built the way a user builds one, rather
+    // than relied on as a property of the build's layer count.
+    h.fill_stack();
     h.set_drawer_open(true);
     h.gui_mut().open_settings();
     h.load_scan("KTLX");
@@ -6756,6 +6794,12 @@ fn converting_the_active_pane_keeps_the_sidebars_widget_ids() {
 #[test]
 fn converting_a_pane_moves_no_widget_id() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 500.0));
+    // **A stack the user has filled from the catalog.** A curated stack
+    // starts at the handful of layers that ship enabled, and this test's
+    // subject is a LONG list - the panel's scroll, its clamped height, the
+    // ids a scrolled body keeps. Built the way a user builds one, rather
+    // than relied on as a property of the build's layer count.
+    h.fill_stack();
     h.set_pane_count(3);
     h.load_scan("KTLX");
 
@@ -8603,6 +8647,12 @@ fn an_overlay_tile_enables_the_layer_and_selects_it() {
 fn a_catalog_tile_scrolls_the_stack_to_the_row_it_turned_on() {
     // Short enough that the stack cannot draw its whole inventory at once.
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 460.0));
+    // **A stack the user has filled from the catalog.** A curated stack
+    // starts at the handful of layers that ship enabled, and this test's
+    // subject is a LONG list - the panel's scroll, its clamped height, the
+    // ids a scrolled body keeps. Built the way a user builds one, rather
+    // than relied on as a property of the build's layer count.
+    h.fill_stack();
     h.open_layers();
 
     let panel = h.layers_panel_rect().expect("the stack was just opened");
@@ -9828,6 +9878,12 @@ fn a_preset_apply_queues_one_fetch_per_kind() {
 #[test]
 fn a_pane_growth_keeps_the_open_stack_above_the_pill_rows() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    // **A stack the user has filled from the catalog.** A curated stack
+    // starts at the handful of layers that ship enabled, and this test's
+    // subject is a LONG list - the panel's scroll, its clamped height, the
+    // ids a scrolled body keeps. Built the way a user builds one, rather
+    // than relied on as a property of the build's layer count.
+    h.fill_stack();
     h.set_pane_count(2);
     h.open_layers();
     h.warm_up();
@@ -12008,6 +12064,12 @@ fn assert_single_line_chip(h: &InputHarness, chip: egui::Rect) {
 #[test]
 fn layer_rows_are_full_width_click_targets() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    // **A stack the user has filled from the catalog.** A curated stack
+    // starts at the handful of layers that ship enabled, and this test's
+    // subject is a LONG list - the panel's scroll, its clamped height, the
+    // ids a scrolled body keeps. Built the way a user builds one, rather
+    // than relied on as a property of the build's layer count.
+    h.fill_stack();
     h.open_layers();
     let stack = h.stack();
     assert!(
@@ -12112,6 +12174,12 @@ fn in_pane_text_stays_inside_its_pane_and_clear_of_the_pill_rows() {
 #[test]
 fn a_mouse_drag_on_a_panel_body_scrolls_it() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 420.0));
+    // **A stack the user has filled from the catalog.** A curated stack
+    // starts at the handful of layers that ship enabled, and this test's
+    // subject is a LONG list - the panel's scroll, its clamped height, the
+    // ids a scrolled body keeps. Built the way a user builds one, rather
+    // than relied on as a property of the build's layer count.
+    h.fill_stack();
     h.warm_up();
     let scroll_id = h
         .widget_id_probes()
@@ -12149,6 +12217,12 @@ fn a_mouse_drag_on_a_panel_body_scrolls_it() {
 #[test]
 fn stack_row_text_is_vertically_centred() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    // **A stack the user has filled from the catalog.** A curated stack
+    // starts at the handful of layers that ship enabled, and this test's
+    // subject is a LONG list - the panel's scroll, its clamped height, the
+    // ids a scrolled body keeps. Built the way a user builds one, rather
+    // than relied on as a property of the build's layer count.
+    h.fill_stack();
     h.warm_up();
     let rows = h.stack().rows;
     assert!(rows.len() >= 10, "precondition: the stack draws its rows");
