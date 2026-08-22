@@ -32,7 +32,45 @@ pub const OVERDRAW_FRACTION: f32 = 0.25;
 
 /// When the accumulated pan exceeds this fraction of the overdraw margin,
 /// a fresh render is triggered so the texture stays ahead of the viewport.
-const PAN_REBUILD_THRESHOLD: f32 = 0.7;
+///
+/// The rest of the band — `1 - PAN_REBUILD_THRESHOLD` of it — is the cover: the
+/// ground the pane still has to draw on while the replacement rasterises and
+/// uploads. Splitting the band in half is what makes that cover longest **in
+/// the only sense that matters, the pan speed the pane can sustain without
+/// running off its own texture.**
+///
+/// Both directions cost something, which is why the optimum is interior. Above
+/// a half, the cover is simply too short: each texture is dispatched late and
+/// the viewport outruns it. Below a half, the trigger stops being the binding
+/// constraint — dispatch is gated by the previous raster's arrival instead
+/// ([`OverlayTextureCache::render_in_flight`] admits one at a time) — so the
+/// extra rebuilds buy no speed, and because each fires earlier it is rasterised
+/// for a viewport further behind and lands staler.
+///
+/// Swept 2026-08-22 against this module's own [`pan_exceeds_coverage`] and
+/// [`OverlayTexturePlan::coverage`], on a 60 Hz loop reproducing the dispatch
+/// path (one in-flight raster per pane and layer, `held` consulted by the
+/// trigger at raster arrival, `current` replaced only once every upload band has
+/// landed). Sustainable pan, viewports/second, desktop 1920×1080 at full
+/// overdraw, raster 11.66 ms and a two-frame banded upload:
+///
+/// | threshold | 0.7 | 0.6 | 0.55 | **0.5** | 0.45 | 0.4 | 0.3 |
+/// |-----------|-----|-----|------|---------|------|-----|-----|
+/// | max vp/s  | 1.50| 1.67| 1.88 | **2.14**| 2.14 |2.00 |1.50 |
+///
+/// The peak is a plateau over 0.45–0.5 and 0.5 is its cheap end: same speed as
+/// 0.45 for 11% fewer rebuilds per viewport panned. It costs no memory at all —
+/// the band is [`OVERDRAW_FRACTION`], which this does not touch.
+///
+/// **Two things this constant cannot reach.** Delivery, not raster, is most of
+/// the latency it is dividing the band against — 33.3 ms of banded upload
+/// against 11.66 ms of raster, and with delivery removed entirely the same
+/// sweep sustains 15 vp/s rather than 2.14. And where the adapter has clamped
+/// the overdraw away the band is what shrinks, not this: `pan_exceeds_coverage`
+/// measures the band off the texture's real bounds, so a WebGL2 pane at the
+/// 2048 floor divides 0.033 of a viewport here and one at 2× device pixels
+/// divides zero, where no threshold whatsoever buys cover.
+const PAN_REBUILD_THRESHOLD: f32 = 0.5;
 
 /// Latitude beyond which Web Mercator stops being finite. Bounds are clamped to it
 /// rather than allowed to run to the pole.
