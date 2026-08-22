@@ -13994,6 +13994,70 @@ fn applying_a_preset_that_names_an_unregistered_field_leaves_the_pane_alone() {
 /// is the colour and not a stage of an animation.
 const FADE_SETTLED_FRAMES: usize = 30;
 
+/// The floor under the forecast fill's channel spread — `max(r,g,b) -
+/// min(r,g,b)` — the pin that reds a slide back to grey-on-grey. Measured at
+/// the 0.45 accent mix: 50 in light, 58 in dark.
+const FUTURE_MIN_CHROMA: i32 = 24;
+
+/// The floor under the widest per-channel gap between the two regions'
+/// fills. The floor it replaces was 8, on the red channel alone — the
+/// grey-on-grey palette's own margin, which the user vetoed as too subtle.
+/// Measured at the 0.45 accent mix: 39 in light, 31 in dark.
+const FILL_MIN_SEPARATION: i32 = 24;
+
+/// **The palette floors on a two-colour rail, in whichever theme is up** —
+/// shared by the archive rail and the loop rail, which paint through one
+/// expression and must not drift apart. Three pins, each with a regression
+/// it reds:
+///
+/// 1. the forecast fill is *colour*, not a second grey — its widest channel
+///    clears its narrowest by [`FUTURE_MIN_CHROMA`]. The grey-on-grey
+///    palette the user vetoed had no such pin;
+/// 2. the two regions are mutually visible — some channel separates them by
+///    [`FILL_MIN_SEPARATION`];
+/// 3. the fill is derived from the live theme — every channel sits between
+///    the past fill's and this theme's own `selection.bg_fill`, so a pair
+///    hard-coded for the light theme reds the dark arm and the other way
+///    round.
+fn assert_forecast_fill_is_this_themes_accent_tint(
+    theme: &str,
+    past_fill: egui::Color32,
+    future_fill: egui::Color32,
+    accent: egui::Color32,
+) {
+    let rgb = |c: egui::Color32| [i32::from(c.r()), i32::from(c.g()), i32::from(c.b())];
+    let (past, future, accent) = (rgb(past_fill), rgb(future_fill), rgb(accent));
+
+    let chroma =
+        future.iter().max().expect("3 channels") - future.iter().min().expect("3 channels");
+    assert!(
+        chroma >= FUTURE_MIN_CHROMA,
+        "{theme}: the forecast fill {future:?} spreads its channels by \
+         {chroma} of 255, which is grey, not the colour the user asked for"
+    );
+
+    let separation = (0..3)
+        .map(|i| (past[i] - future[i]).abs())
+        .max()
+        .expect("3 channels");
+    assert!(
+        separation >= FILL_MIN_SEPARATION,
+        "{theme}: the regions {past:?} and {future:?} sit {separation} of \
+         255 apart at their widest channel, which is not a denotation a \
+         reader can see"
+    );
+
+    for i in 0..3 {
+        let (lo, hi) = (past[i].min(accent[i]), past[i].max(accent[i]));
+        assert!(
+            (lo..=hi).contains(&future[i]),
+            "{theme}: channel {i} of the forecast fill {future:?} is outside \
+             [{lo}, {hi}] - not a mix of this theme's trough {past:?} and \
+             accent {accent:?}, so the fill is not coming from the live theme"
+        );
+    }
+}
+
 /// Put pane 0 on a forecast transport: the model layer on, radar off. Radar
 /// outranks the model in the draw order, so a pane carrying both has a radar
 /// transport and a past-only rail — which is itself the subject of
@@ -14174,8 +14238,8 @@ fn the_forecast_rail_paints_two_colours_meeting_at_now() {
 
         // Mutually distinguishable, and derived from this theme's own
         // Visuals: the past is the trough colour it has always been, the
-        // future is that colour carried toward this theme's window fill, and
-        // the boundary is this theme's active stroke.
+        // future is that colour carried toward this theme's accent, and the
+        // boundary is this theme's active stroke.
         assert_eq!(
             past_fill,
             h.inactive_bg_fill(),
@@ -14194,11 +14258,11 @@ fn the_forecast_rail_paints_two_colours_meeting_at_now() {
             stroke.color, future_fill,
             "{theme}: the boundary is invisible against the forecast region"
         );
-        let separation = i32::from(past_fill.r()) - i32::from(future_fill.r());
-        assert!(
-            separation.abs() >= 8,
-            "{theme}: the two regions differ by {separation} of 255, which is \
-             not a denotation a reader can see"
+        assert_forecast_fill_is_this_themes_accent_tint(
+            theme,
+            past_fill,
+            future_fill,
+            h.selection_bg_fill(),
         );
     }
 }
@@ -14207,9 +14271,9 @@ fn the_forecast_rail_paints_two_colours_meeting_at_now() {
 ///
 /// The light and dark arms above would both pass on a hard-coded pair chosen
 /// to satisfy whichever ran first; what rules that out is that the pair
-/// itself moves with the theme, and moves in opposite directions — the
-/// forecast region recedes toward a *lighter* background in one and a
-/// *darker* one in the other.
+/// itself moves with the theme: each arm's forecast fill is a mix of that
+/// theme's own trough and that theme's own accent, and the two themes'
+/// accents are different colours, so one pair cannot satisfy both arms.
 #[test]
 fn the_rails_two_colours_come_from_the_live_theme() {
     let mut arms = Vec::new();
@@ -14225,25 +14289,29 @@ fn the_rails_two_colours_come_from_the_live_theme() {
             .map(|(_, fill)| fill)
             .collect();
         assert_eq!(bands.len(), 2);
-        arms.push((bands[0], bands[1]));
+        arms.push((bands[0], bands[1], h.selection_bg_fill()));
     }
-    let (light_past, light_future) = arms[0];
-    let (dark_past, dark_future) = arms[1];
+    let (light_past, light_future, light_accent) = arms[0];
+    let (dark_past, dark_future, dark_accent) = arms[1];
     assert_ne!(
         light_past, dark_past,
         "the past region is the same colour in both themes, so it is not \
          coming from the theme"
     );
     assert_ne!(light_future, dark_future);
-    assert!(
-        light_future.r() > light_past.r() && dark_future.r() < dark_past.r(),
-        "the forecast region must recede toward each theme's own window \
-         fill - lighter in light ({} -> {}), darker in dark ({} -> {})",
-        light_past.r(),
-        light_future.r(),
-        dark_past.r(),
-        dark_future.r(),
+    assert_ne!(
+        light_accent, dark_accent,
+        "precondition: the two themes' accents differ, or a tint checked \
+         against either accent could not tell a hard-coded pair from a \
+         derived one"
     );
+    assert_forecast_fill_is_this_themes_accent_tint(
+        "light",
+        light_past,
+        light_future,
+        light_accent,
+    );
+    assert_forecast_fill_is_this_themes_accent_tint("dark", dark_past, dark_future, dark_accent);
 }
 
 /// **The break is a change of colour, not a change of widget** — one press
@@ -14634,22 +14702,11 @@ fn the_loop_rail_breaks_where_the_frames_straddle_now() {
             stroke.color, future_fill,
             "{theme}: the boundary is invisible against the forecast region"
         );
-        let separation = i32::from(past_fill.r()) - i32::from(future_fill.r());
-        assert!(
-            separation.abs() >= 8,
-            "{theme}: the loop rail's regions differ by {separation} of 255, \
-             which is not a denotation a reader can see"
-        );
-        // The direction is this theme's: the forecast region recedes toward
-        // the window fill, which is lighter in one theme and darker in the
-        // other. A hard-coded pair cannot be right in both.
-        assert_eq!(
-            future_fill.r() > past_fill.r(),
-            !dark,
-            "{theme}: the forecast region must recede toward this theme's own \
-             window fill ({} -> {})",
-            past_fill.r(),
-            future_fill.r(),
+        assert_forecast_fill_is_this_themes_accent_tint(
+            theme,
+            past_fill,
+            future_fill,
+            h.selection_bg_fill(),
         );
 
         // -- 2. the break tracks the frames ------------------------------
