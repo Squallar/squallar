@@ -1,6 +1,7 @@
 pub mod controls;
 pub mod draw;
 pub mod geo;
+pub mod gridded;
 // `pub` so the frontend's described-job dispatch tests can name the three
 // polygon kinds' fetch-result types — see `handlers`'s own module comment.
 pub mod handlers;

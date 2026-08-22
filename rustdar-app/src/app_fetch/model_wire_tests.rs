@@ -62,7 +62,7 @@ fn a_seedable_grid() -> rustdar_overlays::hrrr::HrrrGridData {
         }
     }
     let (visible_points, value_range) =
-        rustdar_overlays::hrrr::summarize_values(&values, parameter);
+        rustdar_overlays::hrrr::summarize_values(&values, |v| parameter.paints(v));
     HrrrGridData {
         parameter,
         values,
@@ -141,14 +141,14 @@ fn the_model_dispatch_is_a_described_job_of_the_whole_grid() {
         (64, 48),
         "the plan's own dimensions"
     );
-    let Some(model) = job.downcast_ref::<rustdar_overlays::render::rasterize::ModelDataInput>()
+    let Some(model) = job.downcast_ref::<rustdar_overlays::render::rasterize::GriddedInput>()
     else {
         panic!("the model dispatch described some other kind's input: {job:?}");
     };
     assert!(
         matches!(
             model,
-            rustdar_overlays::render::rasterize::ModelDataInput::Whole(_)
+            rustdar_overlays::render::rasterize::GriddedInput::Whole(_)
         ),
         "the dispatch pre-cut the grid on the frame thread; the `Whole` \
          carry exists so the memcpy happens only where bytes must be built",

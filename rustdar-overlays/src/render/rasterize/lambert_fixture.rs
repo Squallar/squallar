@@ -32,7 +32,7 @@ pub(crate) fn lambert_grid_stepped(
     let values: Vec<f32> = (0..ni * nj)
         .map(|k| ((k % 4001) + (k / ni.max(1)) % 997) as f32)
         .collect();
-    let (visible_points, value_range) = summarize_values(&values, parameter);
+    let (visible_points, value_range) = summarize_values(&values, |v| parameter.paints(v));
 
     let mut bounds = GeoBounds {
         min_lat: f64::MAX,

@@ -1180,7 +1180,7 @@ fn two_panes_hold_different_hrrr_parameters_through_every_read_and_a_reopen() {
             }
         }
         let (visible_points, value_range) =
-            rustdar_overlays::hrrr::summarize_values(&values, parameter);
+            rustdar_overlays::hrrr::summarize_values(&values, |v| parameter.paints(v));
         HrrrGridData {
             parameter,
             values,

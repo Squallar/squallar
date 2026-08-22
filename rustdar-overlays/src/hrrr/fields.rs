@@ -21,6 +21,13 @@ pub const GROUP: &str = "HRRR parameters";
 /// `is_gradient` is `true` for all sixteen: every one of the eleven colour
 /// functions [`ModelParameter::color_for_value`] dispatches to interpolates
 /// between its stops with `lerp_color`, so the bar is a ramp, not bands.
+///
+/// **This is what the legend draws, not what the raster paints through.** Six
+/// of the sixteen state their stops in *display* units while the grid carries
+/// raw GRIB2 values, and the ramps have three different postures outside their
+/// stops that a `LegendScale` cannot express — so the raster resolves a
+/// parameter's own ramp instead, through
+/// [`crate::render::gridded::field_paint`], which records both reasons.
 static SCALES: LazyLock<Vec<LegendScale>> = LazyLock::new(|| {
     ModelParameter::all()
         .iter()

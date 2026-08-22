@@ -4,14 +4,14 @@ use super::lambert_fixture::{
 };
 use super::*;
 
-fn rasterize_model_data(
+fn rasterize_gridded(
     grid: &HrrrGridData,
     bounds: &GeoBounds,
     width: u32,
     height: u32,
 ) -> RasterizeOutput {
-    super::rasterize_model_data(
-        &ModelDataInput::Whole(std::sync::Arc::new(grid.clone())),
+    super::rasterize_gridded(
+        &GriddedInput::Whole(std::sync::Arc::new(grid.clone())),
         bounds,
         width,
         height,
@@ -75,8 +75,8 @@ fn the_window_paints_exactly_what_projecting_every_point_paints() {
     for &(label, fx, fy, bw, bh) in BOXES {
         let bounds = box_over(&lambert.bounds, fx, fy, bw, bh);
         for &side in SIDES {
-            let windowed = rasterize_model_data(&lambert, &bounds, side, side);
-            let reference = rasterize_model_data(&every_point, &bounds, side, side);
+            let windowed = rasterize_gridded(&lambert, &bounds, side, side);
+            let reference = rasterize_gridded(&every_point, &bounds, side, side);
             assert_eq!(
                 windowed.rgba, reference.rgba,
                 "{label} at {side}x{side}: the window changed the picture",
@@ -96,8 +96,8 @@ fn the_window_survives_a_non_square_texture() {
         let bounds = box_over(&lambert.bounds, fx, fy, bw, bh);
         for &(w, h) in &[(320u32, 24u32), (24, 320), (200, 3)] {
             assert_eq!(
-                rasterize_model_data(&lambert, &bounds, w, h).rgba,
-                rasterize_model_data(&every_point, &bounds, w, h).rgba,
+                rasterize_gridded(&lambert, &bounds, w, h).rgba,
+                rasterize_gridded(&every_point, &bounds, w, h).rgba,
                 "{label} at {w}x{h}",
             );
         }
@@ -140,8 +140,8 @@ fn a_scan_order_the_neighbour_walk_does_not_match_is_not_narrowed() {
             "scanning mode {mode:#010b}: got {window:?}",
         );
         assert_eq!(
-            rasterize_model_data(&grid, &bounds, 128, 128).rgba,
-            rasterize_model_data(&materialised(&grid), &bounds, 128, 128).rgba,
+            rasterize_gridded(&grid, &bounds, 128, 128).rgba,
+            rasterize_gridded(&materialised(&grid), &bounds, 128, 128).rgba,
             "scanning mode {mode:#010b}",
         );
     }
@@ -224,8 +224,8 @@ fn the_window_survives_a_randomised_sweep_of_viewports() {
             narrowed += 1;
         }
         assert_eq!(
-            rasterize_model_data(&lambert, &bounds, w, h).rgba,
-            rasterize_model_data(&every_point, &bounds, w, h).rgba,
+            rasterize_gridded(&lambert, &bounds, w, h).rgba,
+            rasterize_gridded(&every_point, &bounds, w, h).rgba,
             "case {case}: box ({fx:.3}, {fy:.3}) x ({bw:.3}, {bh:.3}) at {w}x{h}",
         );
     }
@@ -253,8 +253,8 @@ fn the_window_survives_a_viewport_smaller_than_one_grid_cell() {
                 let bounds = box_of_cells(&lambert, i, j, cells, offset);
                 for &(w, h) in &[(64u32, 64u32), (512, 512), (385, 3), (3, 385), (1, 1)] {
                     assert_eq!(
-                        rasterize_model_data(&lambert, &bounds, w, h).rgba,
-                        rasterize_model_data(&every_point, &bounds, w, h).rgba,
+                        rasterize_gridded(&lambert, &bounds, w, h).rgba,
+                        rasterize_gridded(&every_point, &bounds, w, h).rgba,
                         "{cells} cells around ({i}, {j}) offset {offset:?} at {w}x{h}",
                     );
                 }
@@ -289,8 +289,8 @@ fn the_window_survives_a_texture_running_past_the_antimeridian() {
         };
         for &side in &[64u32, 512] {
             assert_eq!(
-                rasterize_model_data(&lambert, &bounds, side, side).rgba,
-                rasterize_model_data(&every_point, &bounds, side, side).rgba,
+                rasterize_gridded(&lambert, &bounds, side, side).rgba,
+                rasterize_gridded(&every_point, &bounds, side, side).rgba,
                 "longitude {min_lon}..{max_lon} at {side}x{side}",
             );
         }
@@ -370,8 +370,8 @@ fn a_grid_that_wraps_the_globe_is_not_narrowed() {
                 continue;
             }
             assert_eq!(
-                rasterize_model_data(&grid, &bounds, w, h).rgba,
-                rasterize_model_data(&every_point, &bounds, w, h).rgba,
+                rasterize_gridded(&grid, &bounds, w, h).rgba,
+                rasterize_gridded(&every_point, &bounds, w, h).rgba,
                 "{label} case {case}: {bounds:?} at {w}x{h}",
             );
         }
@@ -427,8 +427,8 @@ fn a_grid_sitting_across_the_projection_seam_is_not_narrowed() {
             }
             let (w, h) = (1 + (next() * 180.0) as u32, 1 + (next() * 180.0) as u32);
             assert_eq!(
-                rasterize_model_data(&grid, &bounds, w, h).rgba,
-                rasterize_model_data(&every_point, &bounds, w, h).rgba,
+                rasterize_gridded(&grid, &bounds, w, h).rgba,
+                rasterize_gridded(&every_point, &bounds, w, h).rgba,
                 "anchor {anchor} case {case}: {bounds:?} at {w}x{h}",
             );
         }
@@ -458,8 +458,8 @@ fn the_window_is_invisible_at_full_hrrr_scale() {
     ];
     for (bounds, what) in cases {
         assert_eq!(
-            rasterize_model_data(&lambert, &bounds, 512, 512).rgba,
-            rasterize_model_data(&every_point, &bounds, 512, 512).rgba,
+            rasterize_gridded(&lambert, &bounds, 512, 512).rgba,
+            rasterize_gridded(&every_point, &bounds, 512, 512).rgba,
             "{what}",
         );
     }

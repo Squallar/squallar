@@ -474,7 +474,7 @@ impl OverlayHandler for ModelDataHandler {
         })
     }
 
-    /// The [`Whole`](rasterize::ModelDataInput::Whole) carry: an `Arc` clone of
+    /// The [`Whole`](rasterize::GriddedInput::Whole) carry: an `Arc` clone of
     /// the resident grid, so describing the job costs a refcount and the values
     /// memcpy happens only in the web encoder that knows the texture's bounds.
     fn prepare_job(&self, _ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
@@ -482,7 +482,7 @@ impl OverlayHandler for ModelDataHandler {
             .cached_grids
             .get(self.view(pane).selected_param)?
             .clone();
-        Some(DescribedJob::new(rasterize::ModelDataInput::Whole(grid)))
+        Some(DescribedJob::new(rasterize::GriddedInput::Whole(grid)))
     }
 
     fn job_codec(&self) -> Option<&'static JobCodec> {
@@ -677,7 +677,8 @@ mod tests {
 
     fn grid(parameter: ModelParameter, values: Vec<f32>) -> HrrrGridData {
         let n = values.len();
-        let (visible_points, value_range) = crate::hrrr::summarize_values(&values, parameter);
+        let (visible_points, value_range) =
+            crate::hrrr::summarize_values(&values, |v| parameter.paints(v));
         HrrrGridData {
             parameter,
             values,
@@ -833,7 +834,8 @@ mod tests {
     fn hover_handler() -> ModelDataHandler {
         let parameter = ModelParameter::SurfaceBasedCape;
         let values = vec![300.0, 1200.0, 2600.0, 4100.0];
-        let (visible_points, value_range) = crate::hrrr::summarize_values(&values, parameter);
+        let (visible_points, value_range) =
+            crate::hrrr::summarize_values(&values, |v| parameter.paints(v));
         let g = HrrrGridData {
             parameter,
             values,

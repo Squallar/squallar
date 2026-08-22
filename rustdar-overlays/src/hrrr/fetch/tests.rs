@@ -835,10 +835,10 @@ fn the_conus_domain_the_app_actually_fetches_is_accepted() {
         max_lon: -60.9172,
     };
     assert!(
-        check_domain_longitude(&conus).is_ok(),
+        check_domain_longitude(&conus, &HRRR_DOMAIN_LON, "HRRR").is_ok(),
         "the only domain the app fetches must not be refused"
     );
-    assert!(conus.min_lon - *VALIDATED_DOMAIN_LON.start() > 5.0);
+    assert!(conus.min_lon - *HRRR_DOMAIN_LON.start() > 5.0);
     assert!(180.0 - conus.min_lon.abs() > 40.0);
 }
 
@@ -852,7 +852,8 @@ fn an_east_hemisphere_domain_is_refused() {
         min_lon: 173.4773,
         max_lon: 176.7655,
     };
-    let err = check_domain_longitude(&seam_parked).expect_err("must refuse");
+    let err =
+        check_domain_longitude(&seam_parked, &HRRR_DOMAIN_LON, "HRRR").expect_err("must refuse");
     assert!(
         err.contains("173.4773"),
         "the message must name the extent it saw"
@@ -867,17 +868,21 @@ fn a_straddling_domain_is_refused() {
         min_lon: -179.8,
         max_lon: 179.6,
     };
-    assert!(check_domain_longitude(&straddling).is_err());
+    assert!(check_domain_longitude(&straddling, &HRRR_DOMAIN_LON, "HRRR").is_err());
 }
 
 #[test]
 fn the_refusal_names_the_decision_and_where_the_evidence_is() {
-    let err = check_domain_longitude(&GeoBounds {
-        min_lat: 50.0,
-        max_lat: 55.0,
-        min_lon: 170.0,
-        max_lon: 178.0,
-    })
+    let err = check_domain_longitude(
+        &GeoBounds {
+            min_lat: 50.0,
+            max_lat: 55.0,
+            min_lon: 170.0,
+            max_lon: 178.0,
+        },
+        &HRRR_DOMAIN_LON,
+        "HRRR",
+    )
     .expect_err("must refuse");
 
     for owed in [
@@ -888,7 +893,7 @@ fn the_refusal_names_the_decision_and_where_the_evidence_is() {
         "wraps_longitude",
         "neighbours' pixel spacing",
         "campaigns/overlays/t17/",
-        "VALIDATED_DOMAIN_LON",
+        "HRRR_DOMAIN_LON",
     ] {
         assert!(
             err.contains(owed),
@@ -902,12 +907,16 @@ fn the_refusal_names_the_decision_and_where_the_evidence_is() {
 /// alone passes it through to a domain message quoting a 309-digit longitude.
 #[test]
 fn an_unwalkable_extent_is_refused_as_itself() {
-    let err = check_domain_longitude(&GeoBounds {
-        min_lat: 0.0,
-        max_lat: 0.0,
-        min_lon: f64::MAX,
-        max_lon: f64::MIN,
-    })
+    let err = check_domain_longitude(
+        &GeoBounds {
+            min_lat: 0.0,
+            max_lat: 0.0,
+            min_lon: f64::MAX,
+            max_lon: f64::MIN,
+        },
+        &HRRR_DOMAIN_LON,
+        "HRRR",
+    )
     .expect_err("must refuse");
     assert!(
         err.contains("inverted"),
@@ -954,12 +963,16 @@ fn parse_grib2_refuses_a_domain_outside_the_validated_envelope() {
 /// `DOMAIN_REFUSAL_MARK` coupling from both ends.
 #[test]
 fn the_domain_refusal_is_classified_permanent() {
-    let refusal = check_domain_longitude(&GeoBounds {
-        min_lat: 50.0,
-        max_lat: 55.0,
-        min_lon: 170.0,
-        max_lon: 178.0,
-    })
+    let refusal = check_domain_longitude(
+        &GeoBounds {
+            min_lat: 50.0,
+            max_lat: 55.0,
+            min_lon: 170.0,
+            max_lon: 178.0,
+        },
+        &HRRR_DOMAIN_LON,
+        "HRRR",
+    )
     .expect_err("must refuse");
     assert!(
         refusal.contains(DOMAIN_REFUSAL_MARK),
@@ -975,15 +988,105 @@ fn the_domain_refusal_is_classified_permanent() {
         classify_parse_error("Lambert grid point count mismatch: 7 declared".to_string()).failure,
         FetchFailure::Transient,
     );
-    let unwalkable = check_domain_longitude(&GeoBounds {
-        min_lat: 0.0,
-        max_lat: 0.0,
-        min_lon: f64::MAX,
-        max_lon: f64::MIN,
-    })
+    let unwalkable = check_domain_longitude(
+        &GeoBounds {
+            min_lat: 0.0,
+            max_lat: 0.0,
+            min_lon: f64::MAX,
+            max_lon: f64::MIN,
+        },
+        &HRRR_DOMAIN_LON,
+        "HRRR",
+    )
     .expect_err("must refuse");
     assert_eq!(
         classify_parse_error(unwalkable).failure,
         FetchFailure::Transient,
+    );
+}
+
+/// The envelope is the **source's**, not the module's: a source that declares a
+/// global domain is accepted at longitudes HRRR's own envelope refuses.
+///
+/// This is the half of the T17 decision that was taken. It does not claim the
+/// antimeridian *renders* correctly — see the refusal text, which still asks
+/// for that repair — only that the envelope stopped being one shared constant
+/// whose widening would silently widen HRRR's claim too.
+#[test]
+fn a_global_domain_is_accepted_when_the_source_declares_one() {
+    let global = -180.0..=180.0;
+    let pacific = GeoBounds {
+        min_lat: 30.0,
+        max_lat: 33.0,
+        min_lon: 173.4773,
+        max_lon: 176.7655,
+    };
+    assert!(
+        check_domain_longitude(&pacific, &HRRR_DOMAIN_LON, "HRRR").is_err(),
+        "premise: HRRR's own envelope refuses this extent, so the acceptance \
+         below is the declared domain doing the work",
+    );
+    assert!(
+        check_domain_longitude(&pacific, &global, "test/global").is_ok(),
+        "a source declaring -180..180 must not be refused inside it",
+    );
+    assert!(
+        check_domain_longitude(
+            &GeoBounds {
+                min_lat: 0.0,
+                max_lat: 1.0,
+                min_lon: -180.0,
+                max_lon: 180.0,
+            },
+            &global,
+            "test/global",
+        )
+        .is_ok(),
+        "the declared ends are inclusive",
+    );
+}
+
+/// A declared domain is a claim, not an exemption: outside its own ends the
+/// source is refused exactly as HRRR is, and the refusal names *it*.
+#[test]
+fn a_source_is_still_refused_outside_its_own_declared_domain() {
+    let narrow = -100.0..=-90.0;
+    let err = check_domain_longitude(
+        &GeoBounds {
+            min_lat: 30.0,
+            max_lat: 40.0,
+            min_lon: -110.0,
+            max_lon: -95.0,
+        },
+        &narrow,
+        "test/narrow",
+    )
+    .expect_err("outside its own declared ends, a source is refused");
+    assert!(
+        err.contains("test/narrow"),
+        "the refusal must name the source that declared the envelope; it said:\n{err}"
+    );
+    assert!(
+        err.contains("-100.0..-90.0"),
+        "the refusal must quote the declared envelope, not some other one; it said:\n{err}"
+    );
+    assert!(
+        err.contains(DOMAIN_REFUSAL_MARK),
+        "a narrower source's refusal is still permanent; it said:\n{err}"
+    );
+    // Control: inside the same narrow envelope the very same check passes, so
+    // the refusal above is the extent and not the envelope's mere presence.
+    assert!(
+        check_domain_longitude(
+            &GeoBounds {
+                min_lat: 30.0,
+                max_lat: 40.0,
+                min_lon: -99.0,
+                max_lon: -95.0,
+            },
+            &narrow,
+            "test/narrow",
+        )
+        .is_ok(),
     );
 }

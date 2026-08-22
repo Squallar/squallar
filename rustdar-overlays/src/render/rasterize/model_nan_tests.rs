@@ -10,7 +10,8 @@ const BOUNDS: GeoBounds = GeoBounds {
 
 /// 2x2 over `BOUNDS`, summarised the way the fetch path does.
 fn grid(parameter: ModelParameter, values: Vec<f32>) -> HrrrGridData {
-    let (visible_points, value_range) = crate::hrrr::summarize_values(&values, parameter);
+    let (visible_points, value_range) =
+        crate::hrrr::summarize_values(&values, |v| parameter.paints(v));
     HrrrGridData {
         parameter,
         values,
@@ -32,8 +33,8 @@ fn grid(parameter: ModelParameter, values: Vec<f32>) -> HrrrGridData {
 }
 
 fn painted_pixels(grid: &HrrrGridData) -> usize {
-    let input = ModelDataInput::Whole(std::sync::Arc::new(grid.clone()));
-    let out = rasterize_model_data(&input, &BOUNDS, 64, 64);
+    let input = GriddedInput::Whole(std::sync::Arc::new(grid.clone()));
+    let out = rasterize_gridded(&input, &BOUNDS, 64, 64);
     out.rgba.chunks_exact(4).filter(|px| px[3] > 0).count()
 }
 
@@ -126,8 +127,8 @@ fn a_grid_shape_mismatch_does_not_paint_padded_points() {
     // Claim 4x4 while supplying only 4 coordinates and 4 values.
     g.ni = 4;
     g.nj = 4;
-    let out = rasterize_model_data(
-        &ModelDataInput::Whole(std::sync::Arc::new(g)),
+    let out = rasterize_gridded(
+        &GriddedInput::Whole(std::sync::Arc::new(g)),
         &BOUNDS,
         64,
         64,

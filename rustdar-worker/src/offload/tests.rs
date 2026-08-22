@@ -632,7 +632,7 @@ fn a_model_grid() -> rustdar_overlays::hrrr::HrrrGridData {
     let geometry = rustdar_overlays::hrrr::lambert::LambertGrid::from_parts(a_lambert_parts())
         .expect("the fixture constants are the ones a real template produced");
     let (visible_points, value_range) =
-        rustdar_overlays::hrrr::summarize_values(&values, parameter);
+        rustdar_overlays::hrrr::summarize_values(&values, |v| parameter.paints(v));
     HrrrGridData {
         parameter,
         values,
@@ -654,7 +654,7 @@ fn a_model_grid() -> rustdar_overlays::hrrr::HrrrGridData {
 
 /// The model overlay job as the **dispatch** builds it.
 pub(super) fn an_overlay_model_whole_job() -> JobRequest {
-    use rustdar_overlays::render::rasterize::ModelDataInput;
+    use rustdar_overlays::render::rasterize::GriddedInput;
     JobRequest {
         geometry: JobGeometry {
             width: 96,
@@ -662,14 +662,14 @@ pub(super) fn an_overlay_model_whole_job() -> JobRequest {
             bounds: a_model_viewport(),
             side_ceiling_px: 0,
         },
-        job: DescribedJob::new(ModelDataInput::Whole(std::sync::Arc::new(a_model_grid()))),
+        job: DescribedJob::new(GriddedInput::Whole(std::sync::Arc::new(a_model_grid()))),
     }
 }
 
 /// The model overlay job in its **wire form** — the window carry the decoder
 /// produces.
 pub(super) fn an_overlay_model_job() -> JobRequest {
-    use rustdar_overlays::render::rasterize::{IndexWindow, ModelDataInput, ModelWindow};
+    use rustdar_overlays::render::rasterize::{GridWindow, GriddedInput, IndexWindow};
     let lambert = rustdar_overlays::hrrr::lambert::LambertGrid::from_parts(a_lambert_parts())
         .expect("the fixture constants are the ones a real template produced");
     JobRequest {
@@ -679,8 +679,12 @@ pub(super) fn an_overlay_model_job() -> JobRequest {
             bounds: a_model_viewport(),
             side_ceiling_px: 0,
         },
-        job: DescribedJob::new(ModelDataInput::Window(ModelWindow {
-            parameter: rustdar_overlays::hrrr::ModelParameter::SurfaceBasedCape,
+        job: DescribedJob::new(GriddedInput::Window(GridWindow {
+            field: rustdar_overlays::hrrr::fields::spec(
+                rustdar_overlays::hrrr::ModelParameter::SurfaceBasedCape,
+            )
+            .id
+            .clone(),
             ni: 60,
             nj: 44,
             coords: rustdar_overlays::hrrr::GridCoords::Lambert(lambert),
@@ -2930,11 +2934,11 @@ fn a_malformed_glm_job_is_refused_rather_than_misread() {
 /// and the one whose wire form is a *cut* of its input rather than a copy.
 #[test]
 fn the_model_render_is_byte_identical_direct_and_via_the_wire() {
-    use rustdar_overlays::render::rasterize::ModelDataInput;
+    use rustdar_overlays::render::rasterize::GriddedInput;
     let JobRequest { geometry, job } = an_overlay_model_whole_job();
     let (width, height, bounds) = (geometry.width, geometry.height, geometry.bounds);
     let model = job
-        .downcast_ref::<ModelDataInput>()
+        .downcast_ref::<GriddedInput>()
         .expect("the fixture is a model job");
 
     let grid_points = {
@@ -2951,7 +2955,7 @@ fn the_model_render_is_byte_identical_direct_and_via_the_wire() {
     );
 
     let direct =
-        rustdar_overlays::render::rasterize::rasterize_model_data(model, &bounds, width, height);
+        rustdar_overlays::render::rasterize::rasterize_gridded(model, &bounds, width, height);
     assert_eq!(
         direct.alpha,
         rustdar_overlays::render::rasterize::AlphaMode::Straight,
@@ -3002,7 +3006,7 @@ fn the_model_render_is_byte_identical_direct_and_via_the_wire() {
     moved.values[cj * moved.ni + ci] = 4000.0;
     let repainted = overlay_raster_via_wire(&JobRequest {
         geometry,
-        job: DescribedJob::new(ModelDataInput::Whole(std::sync::Arc::new(moved))),
+        job: DescribedJob::new(GriddedInput::Whole(std::sync::Arc::new(moved))),
     });
     assert_ne!(
         repainted, via_wire,
@@ -3014,26 +3018,28 @@ fn the_model_render_is_byte_identical_direct_and_via_the_wire() {
 /// The whole-grid carry **canonicalises** to its window on the wire.
 #[test]
 fn the_whole_model_grid_encodes_as_exactly_its_window() {
-    use rustdar_overlays::render::rasterize::{ModelDataInput, ModelWindow};
+    use rustdar_overlays::render::rasterize::{GridWindow, GriddedInput};
     let whole = an_overlay_model_whole_job();
     let bytes = whole.to_bytes();
     let decoded = JobRequest::from_bytes(&bytes).expect("the whole-grid job encodes decodably");
 
     let JobRequest { geometry, job } = &decoded;
     let model = job
-        .downcast_ref::<ModelDataInput>()
+        .downcast_ref::<GriddedInput>()
         .unwrap_or_else(|| panic!("the model job decoded as something else: {decoded:?}"));
 
     // The expected window form, built by the same accessors the encoder uses.
     let grid = a_model_grid();
-    let source = ModelDataInput::Whole(std::sync::Arc::new(grid.clone()));
+    let source = GriddedInput::Whole(std::sync::Arc::new(grid.clone()));
     let win = source.window_for(&geometry.bounds, geometry.width, geometry.height);
     let mut values = Vec::with_capacity(win.area());
     source.for_each_window_row(&win, |row| values.extend_from_slice(row));
     assert_eq!(
         *model,
-        ModelDataInput::Window(ModelWindow {
-            parameter: grid.parameter,
+        GriddedInput::Window(GridWindow {
+            field: rustdar_overlays::hrrr::fields::spec(grid.parameter)
+                .id
+                .clone(),
             ni: grid.ni,
             nj: grid.nj,
             coords: grid.coords.clone(),
@@ -3056,36 +3062,35 @@ fn the_whole_model_grid_encodes_as_exactly_its_window() {
 /// control proving it landed on the byte this test believes it did.
 #[test]
 fn a_malformed_model_job_is_refused_rather_than_misread() {
-    use rustdar_overlays::hrrr::ModelParameter;
     let job = an_overlay_model_job();
     assert_refuses_cuts_and_trailing(&job);
     let bytes = job.to_bytes();
 
     let decoded_model = |bytes: &[u8]| match JobRequest::from_bytes(bytes) {
         Some(JobRequest { job, .. }) => job
-            .downcast_ref::<rustdar_overlays::render::rasterize::ModelDataInput>()
+            .downcast_ref::<rustdar_overlays::render::rasterize::GriddedInput>()
             .cloned(),
         _ => None,
     };
 
-    // The parameter string. Control first: "sbcape" rewritten to "mlcape".
+    // The field code. Control first: "sbcape" rewritten to "mlcape".
     let mut reparam = bytes.clone();
     reparam[47] = b'm';
     reparam[48] = b'l';
     let model = decoded_model(&reparam).expect("the reparam control decodes");
     assert_eq!(
-        model.parameter(),
-        ModelParameter::MixedLayerCape,
-        "bytes 47..53 are not the parameter string; the refusals below would \
+        model.field().as_str(),
+        "mlcape",
+        "bytes 47..53 are not the field code; the refusals below would \
          be about some other field",
     );
-    // A code no build ships refuses (valid UTF-8, unknown parameter)…
+    // A code no build ships refuses (valid UTF-8, unregistered field)…
     let mut unknown = bytes.clone();
     unknown[47] = b'z';
     assert_eq!(
         JobRequest::from_bytes(&unknown),
         None,
-        "parameter \"zbcape\" is a build this one is not",
+        "field \"zbcape\" is a build this one is not",
     );
     // …and so does a byte no UTF-8 string contains.
     let mut not_utf8 = bytes.clone();
@@ -3153,7 +3158,7 @@ fn a_malformed_model_job_is_refused_rather_than_misread() {
     shifted[157..161].copy_from_slice(&(i1 + 1).to_le_bytes());
     let model = decoded_model(&shifted).expect("the shifted control decodes");
     match &model {
-        rustdar_overlays::render::rasterize::ModelDataInput::Window(w) => {
+        rustdar_overlays::render::rasterize::GriddedInput::Window(w) => {
             assert_eq!(
                 (w.win.i0, w.win.i1),
                 (15, 21),
@@ -3185,7 +3190,7 @@ fn a_malformed_model_job_is_refused_rather_than_misread() {
     revalued[169..173].copy_from_slice(&123.5f32.to_le_bytes());
     let model = decoded_model(&revalued).expect("the revalued control decodes");
     match &model {
-        rustdar_overlays::render::rasterize::ModelDataInput::Window(w) => {
+        rustdar_overlays::render::rasterize::GriddedInput::Window(w) => {
             assert_eq!(w.values[0], 123.5, "bytes 169..173 are not value 0");
         }
         other => panic!("the wire only ever decodes the window form, got {other:?}"),
