@@ -54,6 +54,34 @@ impl<'a> Reader<'a> {
         Some(i64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
 
+    /// LEB128, read through [`Reader::u8`] so it inherits the bounds check and
+    /// the `None`-on-short-buffer policy.
+    ///
+    /// Capped at ten groups because a `u64` cannot need more: an unterminated
+    /// run of continuation bytes would otherwise walk to the end of the buffer
+    /// and answer with whatever the low bits happened to be. The tenth group
+    /// contributes only bit 63, so a value with junk in its upper bits is
+    /// truncated rather than refused — every caller here is a length or a
+    /// delta, and every length is bounded again through [`Reader::bounded`].
+    pub fn uvarint(&mut self) -> Option<u64> {
+        let mut value: u64 = 0;
+        for group in 0..10 {
+            let byte = self.u8()?;
+            value |= u64::from(byte & 0x7F) << (7 * group);
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    /// A zigzag-coded signed varint: `n` is stored as `(n << 1) ^ (n >> 63)`,
+    /// so a small negative delta costs one byte rather than ten.
+    pub fn zigzag(&mut self) -> Option<i64> {
+        let raw = self.uvarint()?;
+        Some(((raw >> 1) as i64) ^ -((raw & 1) as i64))
+    }
+
     /// `count` as a capacity, refused if the buffer cannot possibly hold that
     /// many items of `min_size` bytes each: it keeps a corrupt length from
     /// reserving gigabytes. A decoded volume nests three counted lists —
@@ -116,5 +144,102 @@ mod tests {
              empty tail is a legitimate value on this wire",
         );
         assert!(r.at_end());
+    }
+
+    /// LEB128 written out by hand, so the test does not check the reader
+    /// against itself.
+    fn leb128(mut v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        while v >= 0x80 {
+            out.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+        out
+    }
+
+    #[test]
+    fn uvarint_reads_every_group_width_and_leaves_the_cursor_after_it() {
+        // One value per group count, plus the boundaries either side of each.
+        let mut cases: Vec<u64> = vec![0, 1, 0x7F, 0x80, 0x3FFF, 0x4000, u64::MAX];
+        for shift in 1..64 {
+            cases.push(1u64 << shift);
+        }
+
+        for want in cases {
+            let bytes = leb128(want);
+            // A sentinel behind the varint: a reader that consumed one byte too
+            // many or too few would take the wrong value here.
+            let mut buf = bytes.clone();
+            buf.push(0xA5);
+            let mut r = Reader::new(&buf);
+            assert_eq!(r.uvarint(), Some(want), "{want} as {bytes:?}");
+            assert_eq!(
+                r.u8(),
+                Some(0xA5),
+                "{want}: the cursor did not stop at the end of the varint",
+            );
+            assert!(r.at_end());
+        }
+    }
+
+    #[test]
+    fn zigzag_round_trips_both_signs_and_costs_one_byte_near_zero() {
+        let put = |v: i64| leb128(((v << 1) ^ (v >> 63)) as u64);
+
+        for want in [0i64, -1, 1, -63, 63, -64, 64, i64::MIN, i64::MAX] {
+            let mut buf = put(want);
+            buf.push(0xA5);
+            let mut r = Reader::new(&buf);
+            assert_eq!(r.zigzag(), Some(want), "{want}");
+            assert_eq!(r.u8(), Some(0xA5), "{want}: the cursor overran");
+        }
+
+        // The reason the coding exists at all: a delta of -1 must not cost the
+        // ten bytes a two's-complement -1 would.
+        assert_eq!(put(-1).len(), 1, "a small negative delta is one byte");
+        assert_eq!(put(1).len(), 1);
+    }
+
+    #[test]
+    fn an_unterminated_varint_stops_rather_than_walking_the_buffer() {
+        // Every byte a continuation: there is no terminator to find.
+        let runaway = vec![0xFFu8; 4096];
+        let mut r = Reader::new(&runaway);
+        assert_eq!(
+            r.uvarint(),
+            None,
+            "a run of continuation bytes must be refused, not truncated into a value",
+        );
+        assert_eq!(
+            r.rest().len(),
+            4096 - 10,
+            "and it must give up after ten groups, not at the end of the buffer",
+        );
+
+        // Truncated mid-varint: the continuation bit promises a byte the buffer
+        // does not have.
+        let mut r = Reader::new(&[0x80u8]);
+        assert_eq!(r.uvarint(), None);
+        let mut r = Reader::new(&[] as &[u8]);
+        assert_eq!(r.uvarint(), None);
+        assert_eq!(r.zigzag(), None);
+    }
+
+    /// A corrupt length is what `bounded` exists for, and a varint length is
+    /// the cheapest possible lie: three bytes can ask for two million items.
+    #[test]
+    fn a_varint_length_still_has_to_pass_bounded() {
+        let mut buf = leb128(2_000_000);
+        buf.extend_from_slice(&[0u8; 8]);
+        let mut r = Reader::new(&buf);
+        let count = r.uvarint().expect("the length itself reads");
+        assert_eq!(count, 2_000_000);
+        assert_eq!(
+            r.bounded(count as u32, 2),
+            None,
+            "eight bytes cannot hold two million two-byte items",
+        );
+        assert_eq!(r.bounded(4, 2), Some(4), "the control: four of them fit");
     }
 }
