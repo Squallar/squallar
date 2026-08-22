@@ -37,10 +37,60 @@ pub struct GlmCache {
     entries: HashMap<String, CachedGranule>,
 }
 
+/// Ceiling on flashes retained across a depicted span, enforced by
+/// [`GlmCache::evict_oldest_over`] and **only under a span posture** — a live
+/// pane's window is bounded by [`super::GLM_MAX_TIME_WINDOW_SECS`] alone, as
+/// it always was.
+///
+/// The denominator: `250_000 × size_of::<GlmFlash>()`, measured by
+/// `a_spanned_poll_caps_what_it_retains_and_drops_its_oldest_hours_first` as
+/// **12 000 000 bytes at 48 bytes a row** — the whole cost, since `GlmFlash`
+/// owns nothing on the heap. Every raster job ships at most this many rows.
+///
+/// **How much *time* 250 000 rows covers is not measured here**, and it is a
+/// function of the level and the weather rather than of this constant. The one
+/// figure the tree carries is [`RecordDrops`]'s: 1584507 records over 105
+/// granules with all three levels on, ~15k rows per 20 s granule, at which the
+/// cap holds ~16 granules. The shipped default is groups and flashes with
+/// events off ([`GlmDataLevel`]), for which no per-granule count has been
+/// measured — do not infer one from the all-levels figure. What *is*
+/// guaranteed is that eviction is oldest-first, so a loop that overflows the
+/// cap keeps its **newest** hours lit rather than its oldest.
+pub const MAX_RETAINED_FLASHES: usize = 250_000;
+
 impl GlmCache {
     pub fn evict_before(&mut self, cutoff: NaiveDateTime) {
         self.entries
             .retain(|_key, granule| granule.newest >= cutoff);
+    }
+
+    pub fn flash_count(&self) -> usize {
+        self.entries.values().map(|g| g.flashes.len()).sum()
+    }
+
+    /// Drop whole granules, oldest first, until at most `cap` flashes remain
+    /// — the byte bound on span retention (see [`MAX_RETAINED_FLASHES`]).
+    /// Whole granules so [`Self::contains_key`] stays the download planner's
+    /// truth: a half-kept granule would be "cached" and never refetched.
+    pub fn evict_oldest_over(&mut self, cap: usize) {
+        let mut total = self.flash_count();
+        if total <= cap {
+            return;
+        }
+        let mut by_age: Vec<(NaiveDateTime, String)> = self
+            .entries
+            .iter()
+            .map(|(key, granule)| (granule.newest, key.clone()))
+            .collect();
+        by_age.sort();
+        for (_, key) in by_age {
+            if total <= cap {
+                break;
+            }
+            if let Some(granule) = self.entries.remove(&key) {
+                total -= granule.flashes.len();
+            }
+        }
     }
 
     pub fn all_flashes(&self) -> impl Iterator<Item = &GlmFlash> {
@@ -75,6 +125,21 @@ fn granule_start_of(key: &str, as_of: NaiveDateTime) -> NaiveDateTime {
     parse_filename_start_time(key).unwrap_or(as_of)
 }
 
+/// **What the pane depicts**, as one argument: the instant a poll sampled, and
+/// how far the pane's clock can sweep from it before the next poll.
+///
+/// One struct rather than two parameters because they are never meaningful
+/// apart — a span with no instant names nothing — and because the pair is what
+/// a *loop* is: `as_of` moves every tick and `span_secs` does not.
+#[derive(Clone, Copy, Debug)]
+pub struct DepictedWindow {
+    /// The instant the picture is of. On a live pane this is the wall clock.
+    pub as_of: NaiveDateTime,
+    /// [`rustdar_source::handler::FetchConfig::depicted_span_secs`] — `None` on
+    /// a live pane, where the pane depicts one moving instant and nothing else.
+    pub span_secs: Option<u64>,
+}
+
 pub async fn fetch_glm_flashes(
     client: &reqwest::Client,
     sources: &DataSources,
@@ -82,8 +147,12 @@ pub async fn fetch_glm_flashes(
     time_window_secs: f64,
     levels: &[GlmDataLevel],
     cache: &mut GlmCache,
-    as_of: NaiveDateTime,
+    depicted: DepictedWindow,
 ) -> Result<GlmFetchOutcome, FetchError> {
+    let DepictedWindow {
+        as_of,
+        span_secs: depicted_span_secs,
+    } = depicted;
     // The zero-object warning below assumes the queried range is wide enough to
     // always cover an already-published granule.
     debug_assert!(
@@ -98,11 +167,26 @@ pub async fn fetch_glm_flashes(
     // the archive for the hour the picture is of; on a live pane `as_of` *is*
     // the wall clock and the request is the one it always was.
     let window = TimeDelta::milliseconds((time_window_secs * 1000.0) as i64);
-    let start = as_of - window;
+    // **The pane's whole depicted span, not the poll's sampled instant.**
+    // Under a loop (or a parked scrub) `as_of` is one sample of a clock that
+    // sweeps `span` between polls, so the listing reaches back over the span
+    // the pane can depict and eviction is anchored on the span's own edge —
+    // anchoring both on the sample is what lit a two-hour loop on a single
+    // frame, each poll evicting every other frame's granules. `None` is a
+    // live pane: span zero, and every quantity below is byte-for-byte what
+    // it always was.
+    let span = TimeDelta::seconds(depicted_span_secs.unwrap_or(0) as i64);
+    let start = as_of - window - span;
     let cutoff = start;
+    // Frames *ahead* of the sampled instant are still inside the loop:
+    // granules a previous poll fetched for them must survive this one, and
+    // their flashes must stay in the returned set. Bounded by the span — the
+    // loop's newest frame is at most `span` past any instant inside it. Zero
+    // on a live pane, where the future is empty anyway.
+    let horizon = as_of + span;
 
-    // Anchored on the depicted instant for the same reason: a wall-clock
-    // cutoff evicts exactly the granules a scrubbed pane is displaying.
+    // Anchored on the depicted span for the same reason: an instant-anchored
+    // cutoff evicts exactly the granules the pane's other frames display.
     cache.evict_before(cutoff);
 
     let mut acc = PollAccumulator::default();
@@ -173,9 +257,20 @@ pub async fn fetch_glm_flashes(
 
     cache_granules(cache, std::mem::take(&mut acc.entries), as_of);
 
+    // The byte bound on span retention, **only under a span posture**: a live
+    // pane's cache is bounded by its window exactly as it always was, while a
+    // span could otherwise hold a day of storm at Event level. Oldest first,
+    // so an overflowing loop keeps its newest hours lit.
+    if !span.is_zero() {
+        cache.evict_oldest_over(MAX_RETAINED_FLASHES);
+    }
+
     // Still keyed on `satellites`, not `queried`: a satellite whose listing
-    // failed still has earlier granules in window.
-    let filtered = flashes_in_window(cache, satellites, cutoff, as_of);
+    // failed still has earlier granules in window. The upper bound is the
+    // span's `horizon`, not the sampled instant: the raster culls per depicted
+    // frame, so returning the whole retained span is what lets every frame of
+    // a loop draw its own window from one delivery.
+    let filtered = flashes_in_window(cache, satellites, cutoff, horizon);
 
     log::info!(
         "GLM: {} flashes in {:.0}s window",
@@ -194,20 +289,27 @@ pub async fn fetch_glm_flashes(
     ))
 }
 
-/// Select the cached flashes inside this poll's window, from the satellites it
-/// was asked for — the per-flash half of a two-stage narrowing
+/// Select the cached flashes inside this poll's retention window, from the
+/// satellites it was asked for — the per-flash half of a two-stage narrowing
 /// ([`GlmCache::evict_before`] does the per-granule half). Both bounds are
-/// inclusive: `as_of` is sampled once per poll and a granule's last flashes can
-/// be stamped after it.
+/// inclusive: the bounds are sampled once per poll and a granule's last
+/// flashes can be stamped after its start.
+///
+/// `horizon` is `as_of` itself on a live pane; under a depicted span it is
+/// `as_of + span`, so frames *ahead* of the sampled instant keep their
+/// flashes. **Culling to each frame's own window is the rasterizer's job**
+/// (`rasterize_glm_strikes` drops a flash later than its depicted instant, and
+/// one older than the fade window) — this set is what any frame of the span
+/// may draw from, not what one frame shows.
 fn flashes_in_window(
     cache: &GlmCache,
     satellites: &[GlmSatellite],
     cutoff: NaiveDateTime,
-    as_of: NaiveDateTime,
+    horizon: NaiveDateTime,
 ) -> Vec<GlmFlash> {
     cache
         .all_flashes()
-        .filter(|f| satellites.contains(&f.satellite) && f.time >= cutoff && f.time <= as_of)
+        .filter(|f| satellites.contains(&f.satellite) && f.time >= cutoff && f.time <= horizon)
         .cloned()
         .collect()
 }

@@ -1019,6 +1019,22 @@ pub struct FetchConfig {
     ///
     /// [`TimeAxis`]: crate::time::TimeAxis
     pub as_of: chrono::NaiveDateTime,
+    /// **How far back the pane can depict without another fetch, in seconds
+    /// — `None` on a live pane.**
+    ///
+    /// The pane's timeline span (`PaneTimePosture::span_secs`), present
+    /// exactly when [`Self::as_of`] was narrowed to a depicted instant: a
+    /// parked scrub and a playing loop are the same posture, and under a loop
+    /// `as_of` is one *sampled* instant of a clock that sweeps the whole span
+    /// between polls. A [`TimeAxis::EventLifetime`] source whose archive is
+    /// addressable by time reads this to fetch and retain the **window** the
+    /// pane depicts rather than the instant one poll happened to sample —
+    /// retention anchored on the sampled instant is what lit a two-hour GLM
+    /// loop on a single frame. `None` leaves the fetch byte-for-byte what a
+    /// live pane's always was.
+    ///
+    /// [`TimeAxis::EventLifetime`]: crate::time::TimeAxis::EventLifetime
+    pub depicted_span_secs: Option<u64>,
 }
 
 /// `Copy` so a rasterizer takes the whole thing rather than three loose scalars.

@@ -105,6 +105,9 @@ impl super::App {
             // frame path, whose picture is a named frame and not a function of
             // an instant.
             as_of: chrono::Utc::now().naive_utc(),
+            // `None` for the same reason `as_of` is the wall clock: only the
+            // pane-and-layer-aware dispatch knows a depicted window exists.
+            depicted_span_secs: None,
         }
     }
 
@@ -2461,7 +2464,37 @@ fn fetch_config_for_layer(
     mut config: rustdar_overlays::render::overlay_state::FetchConfig,
 ) -> rustdar_overlays::render::overlay_state::FetchConfig {
     config.as_of = as_of_for_layer(gui, pane_idx, id, config.as_of);
+    config.depicted_span_secs = depicted_span_for_layer(gui, pane_idx, id);
     config
+}
+
+/// **The span half of [`as_of_for_layer`], under the same two predicates.**
+///
+/// A pane on [`TimeMode::AsOf`] — parked or playing a loop — hands `as_of`
+/// one *sampled* instant of a clock that sweeps its whole timeline span
+/// between polls; the span is what lets an [`TimeAxis::EventLifetime`] source
+/// retain the **window** the pane depicts instead of the sample (GLM lit a
+/// two-hour loop on a single frame). `None` everywhere `as_of` keeps the wall
+/// clock — a live pane, an absent pane, any other time axis — so those
+/// configs stay byte-for-byte what they always were.
+///
+/// [`TimeMode::AsOf`]: rustdar_egui::pane::TimeMode::AsOf
+/// [`TimeAxis::EventLifetime`]: rustdar_source::time::TimeAxis::EventLifetime
+fn depicted_span_for_layer(
+    gui: &rustdar_egui::Gui,
+    pane_idx: usize,
+    id: &rustdar_source::id::LayerId,
+) -> Option<u64> {
+    let pane = gui.pane(pane_idx)?;
+    pane.time.mode.as_of()?;
+    let event_lifetime = gui.overlays.handlers().any(|handler| {
+        handler.id() == *id
+            && matches!(
+                handler.time_axis(),
+                rustdar_source::time::TimeAxis::EventLifetime
+            )
+    });
+    event_lifetime.then_some(pane.time.span_secs)
 }
 
 /// Add a frame at `timestamp` to `ls` if the loop is active, is on `site`, and does

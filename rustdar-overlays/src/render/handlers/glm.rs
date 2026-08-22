@@ -841,7 +841,15 @@ impl OverlayHandler for GlmHandler {
         // hour: GLM's S3 listing is addressed by `{year}/{doy}/{hour}`, so a
         // scrubbed pane reaches years back for free. On a live pane this is
         // the wall clock and the request is unchanged.
-        let as_of = ctx.as_of;
+        //
+        // And with it, how far the pane's timeline reaches around it — a
+        // loop's clock sweeps the whole span between polls, so the fetch
+        // covers the span, not the sample. `None` on a live pane: nothing
+        // widens.
+        let depicted = crate::glm::fetch::DepictedWindow {
+            as_of: ctx.as_of,
+            span_secs: ctx.depicted_span_secs,
+        };
         vec![FetchTask {
             kind: known::LIGHTNING,
             future: Box::pin(async move {
@@ -857,7 +865,7 @@ impl OverlayHandler for GlmHandler {
                     time_window_secs,
                     &levels,
                     &mut local_cache,
-                    as_of,
+                    depicted,
                 )
                 .await;
                 {

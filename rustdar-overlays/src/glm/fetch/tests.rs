@@ -1247,6 +1247,17 @@ fn poll_as_of(
     cache: &mut GlmCache,
     as_of: NaiveDateTime,
 ) -> Result<GlmFetchOutcome, FetchError> {
+    poll_spanned(sources, cache, as_of, None)
+}
+
+/// [`poll_as_of`] under a depicted span — what a poll dispatched from a
+/// looping (or parked) pane carries.
+fn poll_spanned(
+    sources: &DataSources,
+    cache: &mut GlmCache,
+    as_of: NaiveDateTime,
+    depicted_span_secs: Option<u64>,
+) -> Result<GlmFetchOutcome, FetchError> {
     let client = loopback_client();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1259,7 +1270,10 @@ fn poll_as_of(
         GLM_MIN_TIME_WINDOW_SECS,
         &[GlmDataLevel::Flash],
         cache,
-        as_of,
+        DepictedWindow {
+            as_of,
+            span_secs: depicted_span_secs,
+        },
     ))
 }
 
@@ -1571,6 +1585,15 @@ fn a_scrubbed_poll_reaches_the_archive_hour_it_depicts_and_keeps_it() {
 /// "fetch nothing" cannot pass: a **live** poll is what it always was. It asks
 /// for the current hour, it keeps the flashes inside its own window, and it
 /// drops the five-year-old granule sitting beside them.
+///
+/// The clock is sampled **once** and handed to the poll, rather than sampled
+/// here and again inside it: a live pane's `as_of` *is* one `Utc::now()`, and
+/// two samples straddle the second (and the hour) that the prefixes below are
+/// derived from. The prefix assertion is over the hours the live window
+/// `[now - GLM_MIN_TIME_WINDOW_SECS, now]` actually covers, which is **two**
+/// for the first 60 s of every hour — asserting the single current hour read
+/// green for 98.3% of the wall clock and red for the rest, and did fail here
+/// once, at 22:00Z on 2026-08-22.
 #[test]
 fn a_live_poll_still_asks_for_the_current_hour_and_evicts_the_archive() {
     let now = Utc::now().naive_utc();
@@ -1588,13 +1611,22 @@ fn a_live_poll_still_asks_for_the_current_hour_and_evicts_the_archive() {
         archive_instant() - TimeDelta::seconds(25),
     );
 
-    let outcome = poll(&sources, &mut cache).expect("both listings answered");
+    let outcome = poll_as_of(&sources, &mut cache, now).expect("both listings answered");
 
     let paths = request_paths(&seen);
     let current = now.format("GLM-L2-LCFA/%Y/%j/%H/").to_string();
+    let window_start = now - TimeDelta::seconds(GLM_MIN_TIME_WINDOW_SECS as i64);
+    let opened_in = window_start.format("GLM-L2-LCFA/%Y/%j/%H/").to_string();
     assert!(
-        paths.iter().all(|p| p.contains(&current)),
+        paths.iter().any(|p| p.contains(&current)),
         "a live pane must still list {current}; it asked for {paths:?}",
+    );
+    assert!(
+        paths
+            .iter()
+            .all(|p| p.contains(&current) || p.contains(&opened_in)),
+        "the live poll listed an hour its own window does not cover — it \
+         covers {opened_in} and {current}; it asked for {paths:?}",
     );
     assert!(
         !paths.iter().any(|p| p.contains(ARCHIVE_PREFIX)),
@@ -1644,6 +1676,7 @@ fn the_handlers_fetch_task_carries_the_depicted_instant_to_the_bucket() {
         sources,
         viewport: None,
         as_of: archive_instant(),
+        depicted_span_secs: None,
     };
 
     let mut tasks = handler.create_fetch_tasks(&config, &PaneRef::bare(0));
@@ -1663,5 +1696,323 @@ fn the_handlers_fetch_task_carries_the_depicted_instant_to_the_bucket() {
         paths.iter().all(|p| p.contains(ARCHIVE_PREFIX)),
         "the handler was given a render context depicting 2020-06-15 07:30 UTC \
          and must list {ARCHIVE_PREFIX}; it asked for {paths:?}",
+    );
+}
+
+// ── The loop hazard: one data slot swept by a moving clock ──────────────────
+
+/// A granule key under the hour prefix of `start`, whose `_s` field is `start`.
+fn granule_key(start: NaiveDateTime) -> String {
+    format!(
+        "GLM-L2-LCFA/{}/OR_GLM-L2-LCFA_G19_s{}0_e{}0_c{}0.nc",
+        start.format("%Y/%j/%H"),
+        start.format("%Y%j%H%M%S"),
+        (start + TimeDelta::seconds(20)).format("%Y%j%H%M%S"),
+        (start + TimeDelta::seconds(21)).format("%Y%j%H%M%S"),
+    )
+}
+
+fn loop_flash_at(lat: f64, lon: f64, time: NaiveDateTime) -> GlmFlash {
+    GlmFlash {
+        lat,
+        lon,
+        energy: Some(1.0e-14),
+        area: Some(128.0),
+        time,
+        satellite: GlmSatellite::GoesEast,
+        level: GlmDataLevel::Flash,
+    }
+}
+
+/// Whether the handler's raster at the depicted instant `as_of` lights any
+/// pixel inside `bounds` — the whole paint path: `prepare_job` describes the
+/// job exactly as the dispatch would, and `rasterize_glm_strikes` is the
+/// worker's own body.
+fn strikes_visible(
+    handler: &crate::render::handlers::glm::GlmHandler,
+    as_of: NaiveDateTime,
+    bounds: &rustdar_geo::GeoBounds,
+) -> bool {
+    use crate::render::overlay_state::{OverlayHandler, PaneRef, RasterizeContext};
+    let job = handler
+        .prepare_job(
+            &RasterizeContext {
+                is_dark: false,
+                zoom: 6.0,
+                device_scale: 1.0,
+                // The wall clock is deliberately NOT the depicted instant:
+                // the ages must be measured from `as_of`.
+                now: as_of + TimeDelta::hours(30),
+                as_of,
+                frame: None,
+            },
+            &PaneRef::bare(0),
+        )
+        .expect("flashes are resident, so the layer describes a job");
+    let input = job
+        .downcast_ref::<crate::render::rasterize::GlmStrikesInput>()
+        .expect("the GLM row");
+    let out = crate::render::rasterize::rasterize_glm_strikes(input, bounds, 64, 64);
+    out.rgba.iter().any(|&b| b != 0)
+}
+
+/// **The visual E2E's bug: a pane looping frames across more than one hour
+/// with GLM on lit strikes on a single frame, mismatched from the frame
+/// under it.**
+///
+/// The loop's clock sweeps `TimeMode::AsOf(frame.valid)`; the poll samples
+/// that clock every 20 s; and the fetch anchored BOTH its granule listing and
+/// its cache eviction on the one sampled instant. So whichever hour the last
+/// poll happened to sample is the only hour whose strikes are resident, and
+/// every other frame of the loop draws an empty sky.
+///
+/// The loop here is two hours of 2-min frames; the poll is taken while the
+/// playhead is on the last frame (07:40:30). Each frame must draw the flashes
+/// of ITS OWN window: the 06:10:30 frame its 06:10:10 flash, the 07:40:30
+/// frame its 07:40:10 flash — and neither frame the other's.
+#[test]
+fn a_loop_sweeping_two_hours_draws_each_frames_own_strikes_not_the_polls() {
+    use crate::render::overlay_state::{FetchConfig, OverlayHandler, PaneRef};
+
+    let day = chrono::NaiveDate::from_ymd_opt(2020, 6, 15).unwrap();
+    let frame_early = day.and_hms_opt(6, 10, 30).unwrap();
+    let frame_late = day.and_hms_opt(7, 40, 30).unwrap();
+    let g_early = granule_key(day.and_hms_opt(6, 10, 0).unwrap());
+    let g_late = granule_key(day.and_hms_opt(7, 40, 0).unwrap());
+    let flash_early = loop_flash_at(35.0, -97.0, day.and_hms_opt(6, 10, 10).unwrap());
+    let flash_late = loop_flash_at(30.0, -85.0, day.and_hms_opt(7, 40, 10).unwrap());
+
+    // Both hours' granules are already parsed and resident, exactly as they
+    // are after the loop's earlier polls have seen both hours: what is under
+    // test is what a poll KEEPS and what the listing reaches, not the parser.
+    let listing = http_response(
+        "200 OK",
+        &format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <Name>bucket</Name><IsTruncated>false</IsTruncated>\
+             <Contents><Key>{g_early}</Key><Size>1</Size></Contents>\
+             <Contents><Key>{g_late}</Key><Size>1</Size></Contents>\
+             </ListBucketResult>"
+        ),
+    );
+    let (sources, seen) = s3_recording(vec![("east", listing.clone()), ("west", listing)]);
+
+    let mut handler = crate::render::handlers::glm::GlmHandler::new();
+    handler.defaults.enabled = true;
+    {
+        let mut cache = handler.cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.insert(
+            g_early.clone(),
+            day.and_hms_opt(6, 10, 0).unwrap(),
+            vec![flash_early.clone()],
+        );
+        cache.insert(
+            g_late.clone(),
+            day.and_hms_opt(7, 40, 0).unwrap(),
+            vec![flash_late.clone()],
+        );
+    }
+
+    // The poll the loop's 20 s cadence lands while the playhead is on the
+    // LAST frame — `fetch_config_for_layer` hands it that frame's instant.
+    let config = FetchConfig {
+        client: loopback_client(),
+        zone_cache_dir: None,
+        sources,
+        viewport: None,
+        as_of: frame_late,
+        // What `fetch_config_for_layer` hands a pane whose Lookback is two
+        // hours: the loop's clock sweeps that span between polls.
+        depicted_span_secs: Some(7200),
+    };
+    let mut tasks = handler.create_fetch_tasks(&config, &PaneRef::bare(0));
+    assert_eq!(tasks.len(), 1, "GLM builds exactly one poll task");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let payload = runtime.block_on(tasks.remove(0).future);
+    handler.apply_fetch_result(payload, &PaneRef::bare(0));
+
+    let around_early = rustdar_geo::GeoBounds {
+        min_lat: 34.0,
+        max_lat: 36.0,
+        min_lon: -98.0,
+        max_lon: -96.0,
+    };
+    let around_late = rustdar_geo::GeoBounds {
+        min_lat: 29.0,
+        max_lat: 31.0,
+        min_lon: -86.0,
+        max_lon: -84.0,
+    };
+
+    assert!(
+        strikes_visible(&handler, frame_early, &around_early),
+        "the frame at 06:10:30 draws no strikes although a flash struck at \
+         06:10:10, 20 s inside its 300 s window: the poll at 07:40:30 evicted \
+         every granule outside its own window, so of the whole two-hour loop \
+         only the frames near 07:40:30 light up",
+    );
+    assert!(
+        !strikes_visible(&handler, frame_early, &around_late),
+        "the frame at 06:10:30 draws the 07:40:10 strike, which has not \
+         happened yet at that instant — retention must widen what is HELD, \
+         never what a frame DRAWS",
+    );
+    assert!(
+        strikes_visible(&handler, frame_late, &around_late),
+        "the frame at 07:40:30 draws no strikes although a flash struck at \
+         07:40:10, 20 s inside its 300 s window",
+    );
+    assert!(
+        !strikes_visible(&handler, frame_late, &around_early),
+        "the frame at 07:40:30 draws the 06:10:10 strike, 5420 s outside its \
+         300 s window — the fade ramp must stay relative to the depicted \
+         instant",
+    );
+
+    // The listing must have reached the EARLY frame's hour, not only the
+    // poll's own: the loop's span is two hours, and a listing pinned to the
+    // sampled instant is what leaves every other hour's sky empty.
+    let paths = request_paths(&seen);
+    assert!(
+        paths.iter().any(|p| p.contains("GLM-L2-LCFA/2020/167/06/")),
+        "the poll at 07:40:30 never listed the 06Z hour the loop's early \
+         frames depict — the fetch follows one sampled instant, so the loop \
+         lights up only around the frame the last poll happened to land on; \
+         it asked for {paths:?}",
+    );
+
+    // ── The other direction: the poll lands while the playhead is EARLY ──
+    //
+    // Every remaining frame of the loop is then *ahead* of the sampled
+    // instant, and a delivered set bounded above by that instant leaves all
+    // of them dark until the playhead catches up — the same single-frame
+    // symptom, mirrored. `horizon` is what carries them, and the frame's own
+    // cull is still what decides that the early frame does not draw the late
+    // strike.
+    let config_early = FetchConfig {
+        as_of: frame_early,
+        ..config
+    };
+    let mut tasks = handler.create_fetch_tasks(&config_early, &PaneRef::bare(0));
+    assert_eq!(tasks.len(), 1, "GLM builds exactly one poll task");
+    let payload = runtime.block_on(tasks.remove(0).future);
+    handler.apply_fetch_result(payload, &PaneRef::bare(0));
+
+    assert!(
+        strikes_visible(&handler, frame_late, &around_late),
+        "the poll sampled 06:10:30 and the 07:40:30 frame went dark: flashes \
+         later than the sampled instant are still inside the loop, and a \
+         delivery cut off at the sample blanks every frame ahead of the \
+         playhead until it arrives there",
+    );
+    assert!(
+        strikes_visible(&handler, frame_early, &around_early),
+        "the sampled frame lost its own strike",
+    );
+    assert!(
+        !strikes_visible(&handler, frame_early, &around_late),
+        "widening what is HELD must never widen what a frame DRAWS: the \
+         06:10:30 frame drew a strike from 07:40:10",
+    );
+}
+
+/// **The retention bound, with its denominator.**
+///
+/// Span retention is what fixed the single-frame loop, and unbounded it is a
+/// new defect: with all three levels on, [`RecordDrops`]'s measurement is
+/// 1584507 records over 105 granules — ~15k rows per 20 s granule — so a span
+/// alone could hold a day of storm in one `Arc<Mutex>`.
+/// [`MAX_RETAINED_FLASHES`] caps the count and
+/// [`GlmCache::evict_oldest_over`] enforces it **oldest granule first**, so an
+/// overflowing loop keeps its newest hours lit rather than its oldest.
+///
+/// The bound is a *count*; the byte figure the failure prints is that count
+/// times `size_of::<GlmFlash>()`, which is the whole per-flash cost —
+/// `GlmFlash` owns nothing on the heap, so there is no second term.
+///
+/// **Floor — `retain_everything_forever`: delete the `evict_oldest_over` call
+/// from [`fetch_glm_flashes`]** (or widen the cap to `usize::MAX`). The count
+/// assertion then reads the 320000 seeded flashes against a 250000 cap.
+#[test]
+fn a_spanned_poll_caps_what_it_retains_and_drops_its_oldest_hours_first() {
+    const PER_GRANULE: usize = 80_000;
+    let day = chrono::NaiveDate::from_ymd_opt(2020, 6, 15).unwrap();
+    let as_of = day.and_hms_opt(8, 0, 0).unwrap();
+    let span_secs: u64 = 7200;
+
+    // Four granules inside the span, oldest first. The cap sits between three
+    // granules' worth (240000) and four (320000), so exactly one must go and
+    // *which* one is the whole claim.
+    let starts = [
+        day.and_hms_opt(6, 10, 0).unwrap(),
+        day.and_hms_opt(6, 40, 0).unwrap(),
+        day.and_hms_opt(7, 10, 0).unwrap(),
+        day.and_hms_opt(7, 40, 0).unwrap(),
+    ];
+    let keys: Vec<String> = starts.iter().copied().map(granule_key).collect();
+
+    let mut cache = GlmCache::default();
+    for (key, start) in keys.iter().zip(starts) {
+        let flashes: Vec<GlmFlash> = (0..PER_GRANULE)
+            .map(|i| loop_flash_at(35.0, -97.0, start + TimeDelta::milliseconds(i as i64)))
+            .collect();
+        cache.insert(key.clone(), start, flashes);
+    }
+
+    let seeded = cache.flash_count();
+    assert_eq!(
+        seeded,
+        PER_GRANULE * starts.len(),
+        "premise: the seed is what the arithmetic below assumes",
+    );
+    assert!(
+        seeded > MAX_RETAINED_FLASHES,
+        "non-triviality floor: a seed at or under the cap makes every \
+         assertion below pass without eviction ever running. Seeded {seeded}, \
+         cap {MAX_RETAINED_FLASHES}",
+    );
+
+    // The listing names a granule the cache already holds, so nothing is
+    // downloaded and what is measured is retention alone.
+    let listing = http_response("200 OK", &listing_xml(&keys[0]));
+    let sources = s3_serving(vec![("east", listing.clone()), ("west", listing)]);
+
+    let outcome =
+        poll_spanned(&sources, &mut cache, as_of, Some(span_secs)).expect("both listings answered");
+
+    let kept = cache.flash_count();
+    assert!(
+        kept <= MAX_RETAINED_FLASHES,
+        "a spanned poll retained {kept} flashes against a cap of \
+         {MAX_RETAINED_FLASHES} — {} bytes at size_of::<GlmFlash>() = {}, \
+         which is the bound this cache is allowed to cost per pane",
+        MAX_RETAINED_FLASHES * std::mem::size_of::<GlmFlash>(),
+        std::mem::size_of::<GlmFlash>(),
+    );
+    assert_eq!(
+        kept,
+        PER_GRANULE * 3,
+        "eviction is whole-granule: a half-kept granule still answers \
+         `contains_key`, so the download planner would never refetch it",
+    );
+    assert!(
+        !cache.contains_key(&keys[0]),
+        "the OLDEST granule survived the cap. Oldest-first is what keeps an \
+         overflowing loop's newest hours lit rather than its oldest",
+    );
+    for key in &keys[1..] {
+        assert!(
+            cache.contains_key(key),
+            "a granule newer than the evicted one was dropped too: {key}",
+        );
+    }
+    assert_eq!(
+        outcome.flashes.len(),
+        PER_GRANULE * 3,
+        "the delivered set is what survived the cap, not what was seeded",
     );
 }
