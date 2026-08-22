@@ -1856,3 +1856,169 @@ fn the_windowed_reflectivity_parameter_reaches_the_maximum_record() {
         .collect();
     assert_eq!(maxref, vec!["0-1 hour max fcst"], "MAXREF's only record");
 }
+// ---------------------------------------------------------------------------
+// The committed REFC record: real S3 bytes through the production decode
+// ---------------------------------------------------------------------------
+
+/// One real HRRR record, byte for byte as `noaa-hrrr-bdp-pds` serves it — the
+/// only place in the tree where the production GRIB2 decode runs over bytes
+/// NCEP actually encoded rather than bytes a test built.
+///
+/// # Provenance
+///
+/// `https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.20260820/conus/hrrr.t00z.wrfsfcf01.grib2`,
+/// range `bytes=0-256088` (256 089 bytes), fetched 2026-08-21. That is the
+/// whole first message of the file whose `.idx` sidecar is committed beside it
+/// as `F01_IDX`: line 1 reads
+/// `1:0:d=2026082000:REFC:entire atmosphere:1 hour fcst:` and line 2 starts at
+/// offset 256089, so the range is exactly the record the index names — the
+/// same subsetting arithmetic `fetch_record` performs. sha256
+/// `fc7fb2bfcd32b580512222610582a2a24c61c1a902d46d3c2ab631be6331f0cb`.
+///
+/// GDT 3.30 (Lambert conformal), DRT 5.3 (complex packing with spatial
+/// differencing — the operational S3 encoding named in `Cargo.toml`'s feature
+/// note), no bitmap, 1 905 141 declared points.
+const REFC_RECORD: &[u8] =
+    include_bytes!("../../../testdata/hrrr.20260820.t00z.wrfsfcf01.refc.grib2");
+
+/// Decoded once for the whole file, through `parse_grib2` — the function the
+/// fetch path hands its ranged bytes to, entered exactly where production
+/// enters it. `Arc` because the raster test below carries the grid the same
+/// way `prepare_job` does.
+static REFC_GRID: std::sync::LazyLock<std::sync::Arc<HrrrGridData>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Arc::new(
+            parse_grib2(REFC_RECORD, ModelParameter::CompositeReflectivity, 1)
+                .expect("the committed REFC record decodes through the production path"),
+        )
+    });
+
+#[test]
+fn the_committed_refc_record_is_the_hrrr_conus_grid() {
+    let grid = &**REFC_GRID;
+    assert_eq!(
+        (grid.ni, grid.nj),
+        (1799, 1059),
+        "real bytes must declare the same domain lambert::tests pins from section 3",
+    );
+    assert_eq!(grid.values.len(), 1_905_141);
+    assert_eq!(grid.coords.len(), grid.values.len());
+    assert!(
+        matches!(grid.coords, GridCoords::Lambert(_)),
+        "template 3.30 must take the lazy Lambert path on real bytes too",
+    );
+    assert_eq!(grid.ref_time.to_string(), "2026-08-20 00:00:00");
+    assert_eq!(grid.forecast_hour, 1);
+    assert!(
+        grid.bounds.min_lat < 25.0 && grid.bounds.max_lat > 47.0,
+        "bounds {:?} do not span CONUS",
+        grid.bounds,
+    );
+}
+
+#[test]
+fn the_committed_refc_record_carries_real_weather() {
+    let grid = &**REFC_GRID;
+    let finite = grid.values.iter().filter(|v| v.is_finite()).count();
+    assert_eq!(
+        finite, 1_905_141,
+        "section 6 declares no bitmap, so every point is a reading",
+    );
+    let (lo, hi) = grid
+        .value_range
+        .expect("a grid with finite points has a range");
+    assert!(
+        (-35.0..=80.0).contains(&lo) && (-35.0..=80.0).contains(&hi),
+        "REFC outside plausible dBZ: observed {lo}..{hi} over {finite} finite points",
+    );
+    assert!(
+        lo < hi,
+        "decoded as a constant field ({lo} at every one of {finite} points)",
+    );
+    assert!(
+        grid.visible_points > 0,
+        "August storm season at 00Z with echoes >= 5 dBZ nowhere in CONUS: \
+         {} of {finite} points paint, range {lo}..{hi}",
+        grid.visible_points,
+    );
+}
+
+/// **Pins from the first green run** (2026-08-22, grib 0.17.1): the values
+/// below were read off the first successful decode of the committed record and
+/// asserted ever since — the tree's pinned-digest idiom, sized down to six
+/// points. They are not independently derived; what they catch is *drift*: any
+/// future change to the decoder's scale, reference or spatial-differencing
+/// handling moves them, and a moved value here is a bug in the decoder, not a
+/// pin to re-record.
+#[test]
+fn refc_values_hold_the_pins_from_the_first_green_run() {
+    const PINS: [(usize, f32); 6] = [
+        (0, -10.0),         // first point: clear-air floor
+        (561_714, 70.3125), // one west of the peak
+        (561_715, 73.8125), // the grid's strongest echo (31.624 N, 112.421 W)
+        (563_514, 64.25),   // one row north of the peak
+        (1_200_000, -4.5),  // weak negative dBZ, not the clear-air constant
+        (1_905_140, -10.0), // last point
+    ];
+    for (index, expected) in PINS {
+        let got = REFC_GRID.values[index];
+        assert!(
+            got == expected,
+            "values[{index}] moved: decoder produced {got:?}, pin is {expected:?} \
+             — decoder drift; fix the decoder rather than the pin",
+        );
+    }
+}
+
+/// The decoded grid through the production rasterizer, carried exactly as the
+/// worker carries it: `GriddedInput::Whole` — what the model handler's
+/// `prepare_job` describes and `render/jobs.rs` hands to `rasterize_gridded`.
+///
+/// The viewport is state-sized around the grid's own strongest echo rather
+/// than full CONUS: the projection window it cuts is ~40x cheaper, and a
+/// full-CONUS raster in a debug test spends its time projecting 1.9 M points
+/// to prove nothing this box does not. The zero arm then moves the window off
+/// the domain entirely.
+#[test]
+fn the_real_refc_grid_paints_through_the_production_rasterizer() {
+    use crate::render::rasterize::{GriddedInput, rasterize_gridded};
+
+    let grid = REFC_GRID.clone();
+    let (max_index, _) = grid
+        .values
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .expect("1.9 M points");
+    let (lat, lon) = grid.coords.at(max_index).expect("max index is on the grid");
+    let bounds = GeoBounds {
+        min_lat: lat - 2.0,
+        max_lat: lat + 2.0,
+        min_lon: lon - 2.5,
+        max_lon: lon + 2.5,
+    };
+
+    let out = rasterize_gridded(&GriddedInput::Whole(grid.clone()), &bounds, 256, 256);
+    let painted = out.rgba.chunks_exact(4).filter(|px| px[3] != 0).count();
+    assert!(
+        painted > 0,
+        "a window centred on the grid's strongest echo painted 0 of {} pixels",
+        256 * 256,
+    );
+
+    // Off the domain: the same grid, a window over open Atlantic. Every pixel
+    // must stay untouched — painted here would mean the projection window
+    // leaked past the grid's edge.
+    let atlantic = GeoBounds {
+        min_lat: 25.0,
+        max_lat: 35.0,
+        min_lon: -40.0,
+        max_lon: -30.0,
+    };
+    let off = rasterize_gridded(&GriddedInput::Whole(grid), &atlantic, 256, 256);
+    let stray = off.rgba.chunks_exact(4).filter(|px| px[3] != 0).count();
+    assert_eq!(
+        stray, 0,
+        "a viewport that excludes the whole grid painted {stray} pixels",
+    );
+}
