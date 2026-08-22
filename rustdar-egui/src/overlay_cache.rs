@@ -72,6 +72,34 @@ pub const OVERDRAW_FRACTION: f32 = 0.25;
 /// divides zero, where no threshold whatsoever buys cover.
 const PAN_REBUILD_THRESHOLD: f32 = 0.5;
 
+/// How far past the coverage trigger the viewport has to be before the picture
+/// on screen counts as having run out of margin, in texels of that picture.
+///
+/// One texel is the smallest pan that can change the replacement: below it every
+/// feature falls in the texel it already occupies, so the raster dispatched for
+/// the new viewport is the raster already on screen, paid for again at full size.
+///
+/// **Texels rather than a fraction of the band, because the band can be zero.**
+/// Where the adapter has clamped the overdraw away — a pane at the WebGL2 2048
+/// floor at 2x device pixels — [`pan_exceeds_coverage`] reduces to four *strict*
+/// inequalities against the exact viewport the texture was rasterised for, and
+/// any nonzero motion trips them: a viewport wobbling by 1e-9 of a degree
+/// dispatched full-size rasters continuously. A deadband priced in band is zero
+/// exactly there, which is the case with nothing else protecting it. A texel is
+/// ground per texture pixel, and exists whatever the band is.
+const COVERAGE_DEADBAND_TEXELS: f64 = 1.0;
+
+/// Ceiling on [`COVERAGE_DEADBAND_TEXELS`] once it is converted to ground, as a
+/// fraction of the viewport span on that axis.
+///
+/// Nothing else bounds how coarse a texel is, and a deadband is ground a rebuild
+/// is withheld over. This is that bound: never more than a thousandth of a
+/// viewport of pan. It binds on no texture the app plans — the WebGL2 floor is
+/// 2048 texels across a viewport at zero overdraw, so one texel there is half
+/// this, and every wider texture is finer still — only on a picture whose
+/// resolution against its own ground is degenerate.
+const COVERAGE_DEADBAND_VIEWPORT_CEILING: f64 = 1.0 / 1024.0;
+
 /// Latitude beyond which Web Mercator stops being finite. Bounds are clamped to it
 /// rather than allowed to run to the pole.
 const MERCATOR_LAT_LIMIT: f64 = rustdar_geo::MERCATOR_LAT_LIMIT_DEG;
@@ -400,14 +428,21 @@ impl OverlayTextureCache {
         // itself still checks is in `coverage_dispatch_tests`.
         let displayed = self.current.as_ref().unwrap_or(tex);
 
-        // **What is on screen has run out of margin.** While it still has
-        // some, nothing is dispatched, whatever a picture the viewer cannot
-        // see yet may have run out of. The two disagree wherever a pan
-        // reverses: the hold was rasterised for a viewport the map has already
-        // left, so it can be the one short of margin while the picture being
-        // drawn still has room, and dispatching there throws away an upload the
-        // viewer had no need of.
-        if !pan_exceeds_coverage(&displayed.placed.geo, viewport_bounds) {
+        // **What is on screen has run out of margin**, by at least a texel of
+        // itself. While it still has some, nothing is dispatched, whatever a
+        // picture the viewer cannot see yet may have run out of. The two
+        // disagree wherever a pan reverses: the hold was rasterised for a
+        // viewport the map has already left, so it can be the one short of
+        // margin while the picture being drawn still has room, and dispatching
+        // there throws away an upload the viewer had no need of.
+        //
+        // The deadband is on this arm and not the next because it is a statement
+        // about what the *viewer* could see change — see
+        // [`COVERAGE_DEADBAND_TEXELS`] — and this is the arm reading the picture
+        // the viewer is looking at. It governs the whole rule from here: the
+        // three arms are ANDed, and a deadbanded `true` implies the undeadbanded
+        // one, so nothing below can re-admit what this withheld.
+        if !pan_exceeds_coverage_visibly(displayed, viewport_bounds) {
             return false;
         }
 
@@ -459,9 +494,61 @@ fn mid_gesture_rerender_allowed() -> bool {
     !cfg!(target_arch = "wasm32")
 }
 
+/// [`pan_exceeds_coverage`] asked of the picture on screen, deadbanded by
+/// [`COVERAGE_DEADBAND_TEXELS`] of that picture's own texels.
+fn pan_exceeds_coverage_visibly(texture: &OverlayTextureData, viewport_bounds: &GeoBounds) -> bool {
+    let (deadband_lat, deadband_lon) = coverage_deadband(texture, viewport_bounds);
+    pan_exceeds_coverage_beyond(
+        &texture.placed.geo,
+        viewport_bounds,
+        deadband_lat,
+        deadband_lon,
+    )
+}
+
+/// The deadband in degrees, per axis, for `texture` judged against `viewport`.
+/// See [`COVERAGE_DEADBAND_TEXELS`] and [`COVERAGE_DEADBAND_VIEWPORT_CEILING`].
+fn coverage_deadband(texture: &OverlayTextureData, viewport: &GeoBounds) -> (f64, f64) {
+    // A picture with no pixels on an axis has no texel to be smaller than, and
+    // is not one to withhold a rebuild for.
+    let deadband = |ground: f64, texels: u32, viewport_span: f64| {
+        if texels == 0 {
+            return 0.0;
+        }
+        (ground.abs() * COVERAGE_DEADBAND_TEXELS / texels as f64)
+            .min(viewport_span.abs() * COVERAGE_DEADBAND_VIEWPORT_CEILING)
+    };
+    let geo = &texture.placed.geo;
+    (
+        deadband(
+            geo.max_lat - geo.min_lat,
+            texture.height,
+            viewport.max_lat - viewport.min_lat,
+        ),
+        deadband(
+            geo.max_lon - geo.min_lon,
+            texture.width,
+            viewport.max_lon - viewport.min_lon,
+        ),
+    )
+}
+
 /// Returns `true` if the viewport has panned far enough outside the texture's
 /// geo bounds that a re-render is warranted (PAN_REBUILD_THRESHOLD of margin).
 fn pan_exceeds_coverage(texture_bounds: &GeoBounds, viewport_bounds: &GeoBounds) -> bool {
+    pan_exceeds_coverage_beyond(texture_bounds, viewport_bounds, 0.0, 0.0)
+}
+
+/// [`pan_exceeds_coverage`] with the trigger moved `deadband_lat` / `deadband_lon`
+/// degrees later on every edge. A deadband wider than the margin puts the trigger
+/// *outside* the texture's own bounds, which is what makes it mean anything at
+/// zero overdraw, where the margin is zero and the bounds are the viewport.
+fn pan_exceeds_coverage_beyond(
+    texture_bounds: &GeoBounds,
+    viewport_bounds: &GeoBounds,
+    deadband_lat: f64,
+    deadband_lon: f64,
+) -> bool {
     // The part of the viewport that is on the map at all.
     let view_min_lat = viewport_bounds.min_lat.max(-MERCATOR_LAT_LIMIT);
     let view_max_lat = viewport_bounds.max_lat.min(MERCATOR_LAT_LIMIT);
@@ -479,8 +566,8 @@ fn pan_exceeds_coverage(texture_bounds: &GeoBounds, viewport_bounds: &GeoBounds)
     // Crossing into it is what triggers the rebuild, leaving the rest of the band
     // to cover the viewport while the new texture rasterises.
     let headroom = 1.0 - PAN_REBUILD_THRESHOLD as f64;
-    let margin_lat = band_lat * headroom;
-    let margin_lon = band_lon * headroom;
+    let margin_lat = band_lat * headroom - deadband_lat;
+    let margin_lon = band_lon * headroom - deadband_lon;
 
     // An edge already at the projection's limit has no band to consume, and
     // asking it for one is what spun for ever.
@@ -627,6 +714,11 @@ mod settle_tests;
 /// dispatch may throw away.
 #[cfg(test)]
 mod coverage_dispatch_tests;
+
+/// The deadband on the coverage trigger: a pan too small to move a texel must
+/// not re-rasterise the overlay, and must not be able to stall one either.
+#[cfg(test)]
+mod deadband_tests;
 
 #[cfg(test)]
 mod geo_click_tests;
