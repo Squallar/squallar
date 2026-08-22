@@ -9,7 +9,14 @@ headless session, navigates to the served app, waits for boot (the app removes
 into it on failure), then measures and records:
 
   * canvas #rustdar-canvas presence + client/buffer size + dpr
-  * WebGL renderer probe (software vs hardware) + WebGPU availability
+  * WebGL renderer probe (software vs hardware) and the caps the wasm budget
+    cascade is allowed to promote against: MAX_TEXTURE_SIZE,
+    MAX_3D_TEXTURE_SIZE, MAX_RENDERBUFFER_SIZE, hardwareConcurrency,
+    deviceMemory
+  * WebGPU probed by actually calling requestAdapter() (adapter presence,
+    info, limits, features). `!!navigator.gpu` alone is not a capability test
+  * cross-origin isolation: self.crossOriginIsolated, SharedArrayBuffer
+    presence, and the service-worker registration list
   * requestAnimationFrame delta stats over N frames (p50/p90/p95/p99/max),
     sampled twice: right after settle, and again after a data window
   * viewport + canvas-element screenshots, saved as PNG and analysed with a
@@ -21,7 +28,10 @@ into it on failure), then measures and records:
     the run unless the console ring shows a worker attach AND a "took N ms
     off the frame" job reply; --expect-doctored-respawn fails it unless the
     doctored-token refusal is followed >=1000 ms later by a clean attach
-    (pair with serve.py --doctor-first-worker)
+    (pair with serve.py --doctor-first-worker);
+    --expect-service-worker fails it unless a real registration is present
+    (pair with serve.py --no-block-sw); --expect-cross-origin-isolated fails
+    it unless self.crossOriginIsolated is true (pair with serve.py --coep)
 
 Timing primitive for the instrumented app: poll_global_json() polls a window
 global (dot-path) until it holds a JSON-serialisable value -- the future
@@ -581,8 +591,12 @@ var out = {
   dpr: window.devicePixelRatio,
   inner: [window.innerWidth, window.innerHeight],
   visibility: document.visibilityState,
-  webgpu: !!navigator.gpu,
-  online: navigator.onLine
+  online: navigator.onLine,
+  hardware_concurrency: navigator.hardwareConcurrency || null,
+  device_memory: navigator.deviceMemory || null,
+  cross_origin_isolated: (typeof self.crossOriginIsolated === 'boolean')
+                           ? self.crossOriginIsolated : null,
+  shared_array_buffer: (typeof SharedArrayBuffer !== 'undefined')
 };
 try {
   var c = document.createElement('canvas');
@@ -590,18 +604,110 @@ try {
   var gl = c.getContext('webgl2') || c.getContext('webgl');
   if (!gl) { out.webgl = null; }
   else {
-    out.webgl = (typeof WebGL2RenderingContext !== 'undefined' &&
-                 gl instanceof WebGL2RenderingContext) ? 'webgl2' : 'webgl1';
+    var is2 = (typeof WebGL2RenderingContext !== 'undefined' &&
+               gl instanceof WebGL2RenderingContext);
+    out.webgl = is2 ? 'webgl2' : 'webgl1';
     var dbg = gl.getExtension('WEBGL_debug_renderer_info');
     out.gl_vendor = String(dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL)
                                : gl.getParameter(gl.VENDOR));
     out.gl_renderer = String(dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)
                                  : gl.getParameter(gl.RENDERER));
+    // The cap the wasm budget cascade is allowed to promote against. wgpu's
+    // downlevel_webgl2_defaults().using_resolution(adapter) copies
+    // max_texture_dimension_2d verbatim from here, so this number -- not any
+    // constant in the tree -- is what the adapter actually offers.
+    out.max_texture_size = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    out.max_renderbuffer_size = gl.getParameter(gl.MAX_RENDERBUFFER_SIZE);
+    // MAX_3D_TEXTURE_SIZE is WebGL2-only; on a webgl1 context the enum is
+    // undefined and getParameter would throw an INVALID_ENUM.
+    out.max_3d_texture_size = is2 ? gl.getParameter(gl.MAX_3D_TEXTURE_SIZE)
+                                  : null;
     var lose = gl.getExtension('WEBGL_lose_context');
     if (lose) lose.loseContext();
   }
 } catch (e) { out.webgl = 'probe error: ' + String(e); }
 return out;
+"""
+
+# WebGPU, probed for real. `!!navigator.gpu` is NOT a capability test: measured
+# 2026-08-22, Chromium 151 on SwiftShader exposes navigator.gpu while
+# requestAdapter() resolves to null -- the old boolean field read true on a
+# machine with no usable WebGPU adapter and could not fail. What decides is
+# whether an adapter comes back, and (for WS1/WS4) what limits it carries:
+# WebGPU's default maxTextureDimension2D is 8192 where Firefox's WebGL2
+# reports 32768, so a naive WebGPU switch can LOWER the cap.
+WEBGPU_PROBE = """
+var done = arguments[arguments.length - 1];
+var out = { gpu_object: !!navigator.gpu, adapter: null };
+if (!navigator.gpu) { done(out); return; }
+var settled = false;
+var finish = function (o) { if (!settled) { settled = true; done(o); } };
+setTimeout(function () {
+  out.adapter = null; out.error = 'requestAdapter timed out after 15000 ms';
+  finish(out);
+}, 15000);
+try {
+  navigator.gpu.requestAdapter().then(function (a) {
+    out.adapter = !!a;
+    if (a) {
+      try {
+        var info = a.info || {};
+        out.adapter_info = { vendor: info.vendor, architecture: info.architecture,
+                             device: info.device, description: info.description };
+      } catch (e) { out.adapter_info = 'info error: ' + String(e); }
+      try {
+        var L = a.limits || {};
+        out.adapter_limits = {
+          maxTextureDimension2D: L.maxTextureDimension2D,
+          maxTextureDimension3D: L.maxTextureDimension3D,
+          maxBufferSize: L.maxBufferSize,
+          maxStorageBufferBindingSize: L.maxStorageBufferBindingSize
+        };
+      } catch (e) { out.adapter_limits = 'limits error: ' + String(e); }
+      try {
+        var f = [];
+        a.features.forEach(function (x) { f.push(x); });
+        out.adapter_features = f.sort();
+      } catch (e) { out.adapter_features = 'features error: ' + String(e); }
+    }
+    finish(out);
+  }, function (e) {
+    out.adapter = false; out.error = String(e); finish(out);
+  });
+} catch (e) { out.adapter = false; out.error = String(e); finish(out); }
+"""
+
+# Service-worker state. The Tier-2 default blocks registration (serve.py's
+# prelude rejects register(); --no-block-sw lets the real one through), so
+# `blocked_by_rig` is the first thing to read here: a "no registration" line
+# means nothing when the rig itself refused. Under COEP this is load-bearing --
+# Chrome will not register a worker for an isolated client unless the worker
+# script response carries a matching COEP header.
+SW_PROBE = """
+var done = arguments[arguments.length - 1];
+var out = {
+  supported: !!navigator.serviceWorker,
+  blocked_by_rig: !!(window.__rig && window.__rig.block_sw),
+  controller: null, registrations: null
+};
+if (!navigator.serviceWorker) { done(out); return; }
+out.controller = navigator.serviceWorker.controller
+  ? String(navigator.serviceWorker.controller.scriptURL) : null;
+var settled = false;
+var finish = function () { if (!settled) { settled = true; done(out); } };
+setTimeout(function () { out.error = 'getRegistrations timed out'; finish(); },
+           15000);
+navigator.serviceWorker.getRegistrations().then(function (rs) {
+  out.registrations = rs.map(function (r) {
+    var w = r.active || r.installing || r.waiting;
+    return { scope: String(r.scope),
+             script: w ? String(w.scriptURL) : null,
+             state: w ? String(w.state) : null,
+             active: !!r.active, installing: !!r.installing,
+             waiting: !!r.waiting };
+  });
+  finish();
+}, function (e) { out.error = String(e); finish(); });
 """
 
 RAF_SCRIPT = """
@@ -638,7 +744,8 @@ try {
 
 RESOURCES_PROBE = """
 var rs = performance.getEntriesByType('resource');
-var out = { count: rs.length, fetchxhr: 0, other: 0, hosts: {} };
+var out = { count: rs.length, fetchxhr: 0, other: 0, hosts: {},
+            status_unknown: 0, failed: [] };
 for (var i = 0; i < rs.length; i++) {
   var r = rs[i];
   if (r.initiatorType === 'fetch' || r.initiatorType === 'xmlhttprequest')
@@ -648,6 +755,18 @@ for (var i = 0; i < rs.length; i++) {
     var h = new URL(r.name).host;
     out.hosts[h] = (out.hosts[h] || 0) + 1;
   } catch (e) {}
+  // responseStatus is 0 for a request that never produced a response --
+  // which is what a COEP block looks like from the page's side. It is also 0
+  // when the browser does not implement the field at all, so count those
+  // separately rather than reporting a fleet of phantom failures.
+  var st = r.responseStatus;
+  if (typeof st !== 'number') out.status_unknown++;
+  else if (st === 0 || st >= 400) {
+    if (out.failed.length < 40)
+      out.failed.push({ u: r.name.length > 160 ? '...' + r.name.slice(-157)
+                                               : r.name,
+                        t: r.initiatorType, status: st });
+  }
 }
 out.recent = rs.slice(-10).map(function (r) {
   return { u: r.name.length > 120 ? '...' + r.name.slice(-117) : r.name,
@@ -1159,11 +1278,21 @@ def run_smoke(args):
         result["canvas_ok"] = canvas_ok
 
         result["env"] = session.execute(ENV_PROBE)
+        try:
+            result["env"]["webgpu"] = session.execute_async(WEBGPU_PROBE)
+        except (WebDriverError, TypeError) as e:
+            result["env"]["webgpu"] = {"probe_error": str(e)}
+        env0 = result["env"] or {}
+        wg = env0.get("webgpu") or {}
         stage("env-probe",
-              webgl=(result["env"] or {}).get("webgl"),
-              renderer=(result["env"] or {}).get("gl_renderer"),
-              webgpu=(result["env"] or {}).get("webgpu"),
-              visibility=(result["env"] or {}).get("visibility"))
+              webgl=env0.get("webgl"),
+              renderer=env0.get("gl_renderer"),
+              max_texture_size=env0.get("max_texture_size"),
+              max_3d_texture_size=env0.get("max_3d_texture_size"),
+              webgpu_object=wg.get("gpu_object"),
+              webgpu_adapter=wg.get("adapter"),
+              cross_origin_isolated=env0.get("cross_origin_isolated"),
+              visibility=env0.get("visibility"))
         result["nav_timing"] = session.execute(NAV_TIMING_PROBE)
 
         if args.poll_global:
@@ -1204,7 +1333,19 @@ def run_smoke(args):
         time.sleep(args.data_window / 2)
         result["resources"] = session.execute(RESOURCES_PROBE)
         stage("resources", count=(result["resources"] or {}).get("count"),
-              hosts=list(((result["resources"] or {}).get("hosts") or {}))[:6])
+              hosts=list(((result["resources"] or {}).get("hosts") or {}))[:6],
+              failed=len((result["resources"] or {}).get("failed") or []))
+
+        # Late on purpose: registration, install and activation all have to
+        # finish first, and the data window has just paid for that time.
+        try:
+            result["service_worker"] = session.execute_async(SW_PROBE)
+        except (WebDriverError, TypeError) as e:
+            result["service_worker"] = {"probe_error": str(e)}
+        sw = result["service_worker"] or {}
+        stage("service-worker", blocked_by_rig=sw.get("blocked_by_rig"),
+              controller=sw.get("controller"),
+              registrations=len(sw.get("registrations") or []))
 
         if not args.no_second_raf:
             stage("raf-later", frames=args.frames)
@@ -1268,11 +1409,40 @@ def run_smoke(args):
         dr = result.get("doctored_respawn")
         worker_ok = ((wrt is None or bool(wrt.get("ok")))
                      and (dr is None or bool(dr.get("ok"))))
+
+        # Isolation assertions (opt-in). Both are written so that they FAIL
+        # when the thing they name is absent -- an isolation proof that cannot
+        # come back false proves nothing.
+        sw_reg = [r for r in (sw.get("registrations") or [])
+                  if r.get("active") or r.get("waiting") or r.get("installing")]
+        sw_ok = None
+        if args.expect_service_worker:
+            if sw.get("blocked_by_rig"):
+                sw_ok = False
+                result["service_worker"]["expect_error"] = (
+                    "--expect-service-worker with the rig's own SW block still "
+                    "on; pass serve.py --no-block-sw")
+            else:
+                sw_ok = bool(sw_reg)
+                if not sw_ok:
+                    result["service_worker"]["expect_error"] = (
+                        "no service-worker registration after the data window")
+        coi = env0.get("cross_origin_isolated")
+        coi_ok = None
+        if args.expect_cross_origin_isolated:
+            coi_ok = (coi is True)
+
         result["pass"] = (booted and canvas_ok and raf_ok
                           and canvas_blank is not True and not panics
-                          and worker_ok)
+                          and worker_ok
+                          and sw_ok is not False and coi_ok is not False)
         result["verdict"] = {
             "booted": booted, "canvas_ok": canvas_ok, "raf_ok": raf_ok,
+            "service_worker_ok": sw_ok,
+            "cross_origin_isolated": coi,
+            "cross_origin_isolated_ok": coi_ok,
+            "resource_failures": len((result.get("resources") or {})
+                                     .get("failed") or []),
             "rig_error_count": len(rig_errors),
             "panic_count": len(panics),
             "first_panic": (str(panics[0].get("msg"))[:300] if panics else None),
@@ -1341,9 +1511,46 @@ def run_smoke(args):
           % (tag, result.get("pass"), v.get("booted"),
              b.get("clientWidth"), b.get("clientHeight"),
              b.get("bufferWidth"), b.get("bufferHeight"), env.get("dpr")))
-    print("[%s] SUMMARY gl=%s renderer=%r webgpu=%s visibility=%s"
-          % (tag, env.get("webgl"), env.get("gl_renderer"), env.get("webgpu"),
+    wg = env.get("webgpu") or {}
+    if wg.get("probe_error"):
+        webgpu_s = "probe error: %s" % str(wg["probe_error"])[:80]
+    elif not wg.get("gpu_object"):
+        webgpu_s = "no navigator.gpu"
+    elif wg.get("adapter"):
+        webgpu_s = "adapter %s (maxTex2D=%s)" % (
+            (wg.get("adapter_info") or {}).get("description")
+            or (wg.get("adapter_info") or {}).get("vendor") or "?",
+            (wg.get("adapter_limits") or {}).get("maxTextureDimension2D"))
+    else:
+        webgpu_s = "navigator.gpu present but requestAdapter -> null%s" % (
+            ("; " + str(wg["error"])[:80]) if wg.get("error") else "")
+    print("[%s] SUMMARY gl=%s renderer=%r visibility=%s"
+          % (tag, env.get("webgl"), env.get("gl_renderer"),
              env.get("visibility")))
+    print("[%s] SUMMARY max_texture=%s max_3d_texture=%s max_renderbuffer=%s "
+          "cores=%s device_memory=%s"
+          % (tag, env.get("max_texture_size"), env.get("max_3d_texture_size"),
+             env.get("max_renderbuffer_size"),
+             env.get("hardware_concurrency"), env.get("device_memory")))
+    print("[%s] SUMMARY webgpu: %s" % (tag, webgpu_s))
+    swr = result.get("service_worker") or {}
+    print("[%s] SUMMARY isolation: crossOriginIsolated=%s SharedArrayBuffer=%s "
+          "sw_blocked_by_rig=%s sw_registrations=%s"
+          % (tag, env.get("cross_origin_isolated"),
+             env.get("shared_array_buffer"), swr.get("blocked_by_rig"),
+             len(swr.get("registrations") or [])))
+    for r in (swr.get("registrations") or []):
+        print("[%s] SUMMARY   sw %s scope=%s state=%s"
+              % (tag, r.get("script"), r.get("scope"), r.get("state")))
+    if swr.get("expect_error"):
+        print("[%s] SUMMARY   sw EXPECT FAILED: %s" % (tag, swr["expect_error"]))
+    res = result.get("resources") or {}
+    print("[%s] SUMMARY resources=%s hosts=%s failed=%s status_unknown=%s"
+          % (tag, res.get("count"), len(res.get("hosts") or {}),
+             len(res.get("failed") or []), res.get("status_unknown")))
+    for f in (res.get("failed") or [])[:10]:
+        print("[%s] SUMMARY   resource status=%s %s"
+              % (tag, f.get("status"), f.get("u")))
     print("[%s] SUMMARY raf warm : %s" % (tag, fr(rw)))
     if rl:
         print("[%s] SUMMARY raf later: %s" % (tag, fr(rl)))
@@ -1407,6 +1614,13 @@ def main(argv=None):
                     help="fail unless the console shows the doctored-token "
                          "refusal and then, >=1000 ms later, a clean attach "
                          "(Tier-2 m5; pair with serve.py --doctor-first-worker)")
+    ap.add_argument("--expect-service-worker", action="store_true",
+                    help="fail the run unless a real service-worker "
+                         "registration is present after the data window "
+                         "(needs serve.py --no-block-sw)")
+    ap.add_argument("--expect-cross-origin-isolated", action="store_true",
+                    help="fail the run unless self.crossOriginIsolated is "
+                         "true (pair with serve.py --coep)")
     ap.add_argument("--expect-timeout", type=float, default=180.0,
                     help="seconds for the worker-wire assertions (default "
                          "180; Tier 2 runs against LIVE network, so the first "
