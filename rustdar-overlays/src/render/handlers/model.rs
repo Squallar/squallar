@@ -335,6 +335,122 @@ pub fn forecast_horizon(run: chrono::NaiveDateTime) -> u8 {
     if run.hour().is_multiple_of(6) { 48 } else { 18 }
 }
 
+/// **How many past runs the run control lists** below `Latest`, newest first.
+/// Twelve spans two whole synoptic cycles, so the 48-hour horizon of the most
+/// recent 00/06/12/18Z run is always reachable from the menu.
+const RUN_CHOICES: u8 = 12;
+
+/// **The furthest back a run choice can be spelled at all**, in hours before
+/// the latest run.
+///
+/// A bound on the vocabulary, not on the archive: a run is saved as a
+/// *relative* choice, so a pane left parked further back than this comes back
+/// on `Latest` rather than on an offset nothing can express.
+const MAX_RUN_OFFSET: u8 = 48;
+
+/// The run control's unpinned value: **`Latest`**, which is
+/// `selected_frame == None` — the run is read off the clock at each fetch
+/// rather than frozen at the moment the choice was made.
+const RUN_LATEST: &str = "";
+
+/// The stem every pinned run token is built on: `latest`, `latest-1`, ... The
+/// offset is in hours, because hours are what the HRRR cycle is.
+const RUN_STEM: &str = "latest";
+
+/// [`crate::hrrr::fetch::run_for`] as an instant. `run_for` answers
+/// `(date, hour)` because that is what a bucket key is spelled from; a
+/// selection is an instant.
+fn latest_run_at(now: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
+    let (date, hour) = crate::hrrr::fetch::run_for(now);
+    date.and_hms_opt(u32::from(hour), 0, 0)
+        .expect("run_for reports a wall-clock hour")
+}
+
+/// The forecast-hour control's value for hour `f_hour`.
+///
+/// `f06`, not `6`: a dropdown's option *values* must not be strings the rest
+/// of the frame also paints, or
+/// `a_dropdown_shows_its_option_label_not_the_raw_value` cannot tell a raw id
+/// leaking into the list from any other widget that happens to draw `0`.
+fn f_hour_token(f_hour: u8) -> String {
+    format!("f{f_hour:02}")
+}
+
+fn parse_f_hour(text: &str) -> Option<u8> {
+    text.strip_prefix('f')?.parse().ok()
+}
+
+/// The token for the run `back` hours before the latest one.
+fn run_token(back: u8) -> String {
+    if back == 0 {
+        RUN_STEM.to_string()
+    } else {
+        format!("{RUN_STEM}-{back}")
+    }
+}
+
+/// **A run as a relative choice**, or `None` when it lies further back than
+/// the vocabulary reaches — or ahead of the latest run, which only a clock
+/// that went backwards produces.
+fn encode_run_choice(run: chrono::NaiveDateTime, now: chrono::NaiveDateTime) -> Option<String> {
+    let back = u8::try_from((latest_run_at(now) - run).num_hours()).ok()?;
+    (back <= MAX_RUN_OFFSET).then(|| run_token(back))
+}
+
+/// **A relative choice as a run**, against the clock that is reading it.
+///
+/// `None` for `Latest`, for a token this build does not spell, and — the
+/// point of the whole encoding — for an **absolute** instant, which is what
+/// the build before this one saved. A config closed on Friday with 18Z picked
+/// would otherwise reopen on Monday three days into the past, with nothing but
+/// a small label to say so. It reopens on `Latest` instead.
+fn decode_run_choice(text: &str, now: chrono::NaiveDateTime) -> Option<chrono::NaiveDateTime> {
+    let back: u8 = match text.strip_prefix(RUN_STEM)? {
+        "" => 0,
+        rest => rest.strip_prefix('-')?.parse().ok()?,
+    };
+    (back <= MAX_RUN_OFFSET).then(|| latest_run_at(now) - chrono::Duration::hours(i64::from(back)))
+}
+
+/// **What a resident grid is, in one phrase**: its valid time and forecast
+/// hour, or its run time alone for an analysis.
+///
+/// One function because two surfaces say it — the layer's toggle label in the
+/// options panel and the stack row over the map — and a user comparing the two
+/// must not be reading two renderings of one grid. Built from the **grid**,
+/// never from the selection: a pane whose pick has not landed is not drawing
+/// it.
+fn frame_label(grid: &HrrrGridData) -> String {
+    // f01+ must show its *valid* time and F-hour: a 0-1 h maximum labelled
+    // with the run time alone reads as an analysis valid now.
+    if grid.forecast_hour > 0 {
+        format!(
+            "{} F{:02}",
+            grid.valid_time().format("%H:%Mz"),
+            grid.forecast_hour,
+        )
+    } else {
+        grid.ref_time.format("%H:%Mz").to_string()
+    }
+}
+
+/// **The `(run, forecast hour)` a fetch will ask for**, chosen here at the
+/// dispatch and not inside the fetch.
+///
+/// A pane parked on a frame asks for **that** frame — which is what makes a
+/// reopen 1:1 rather than snapping the pane back to the live hour. An unparked
+/// pane asks for the latest run at the parameter's own floor, the behaviour
+/// the fetch used to hardcode.
+fn fetch_frame(view: &ModelPaneState) -> ((chrono::NaiveDate, u8), u8) {
+    match view.selected_frame {
+        Some((run, f_hour)) => ((run.date(), run.hour() as u8), f_hour),
+        None => (
+            crate::hrrr::fetch::latest_available_run(),
+            view.selected_param.min_forecast_hour(),
+        ),
+    }
+}
+
 /// **How far past its run one `Analysis`-axis frame is valid.**
 ///
 /// Zero for fourteen of the sixteen parameters, and one hour for the two
@@ -412,9 +528,9 @@ pub(crate) struct ModelPaneState {
     pub selected_param: ModelParameter,
     pub axis: ModelAxis,
     /// **The (run, forecast hour) this pane is showing**, or `None` for a pane
-    /// that has not been parked on a frame — every pane until a clock moves
-    /// one, which is the whole of this build until Phase C lands the
-    /// transport.
+    /// that has not been parked on a frame. Written by the `run` and `f_hour`
+    /// controls, and restored from the saved config; a clock will write it too
+    /// once the transport lands.
     ///
     /// `None` is not "no picture": it resolves to the most recently used
     /// resident grid of `selected_param`, which is exactly what the
@@ -607,6 +723,18 @@ impl ModelDataHandler {
             run,
             f_hour,
         })
+    }
+
+    /// **What a change of frame costs.** Nothing when the grid is already
+    /// resident — [`Self::content_signature`] carries the frame, so the raster
+    /// re-dispatches on its own — and a fetch when it is not. The shape the
+    /// parameter and axis arms already use.
+    fn frame_changed(&mut self, pane: &mut PaneMut<'_>) -> ControlEffect {
+        if self.has_data(&pane.as_ref()) {
+            self.state.data_generation = self.state.data_generation.wrapping_add(1);
+            return ControlEffect::None;
+        }
+        ControlEffect::Fetch
     }
 }
 
@@ -950,12 +1078,24 @@ impl OverlayHandler for ModelDataHandler {
         self.edit(pane, |state| state.enabled = enabled);
     }
 
+    /// **The stack row over the map**: this pane's field, and the frame it is
+    /// drawing.
+    ///
+    /// The frame half is what puts a forecast hour on the pane itself rather
+    /// than behind the options panel. It comes off the **resident** grid, the
+    /// same source as the toggle label: a pane whose pick has not landed names
+    /// its field and stops, instead of promising a picture that is not on the
+    /// glass.
     fn status_line(&self, pane: &PaneRef<'_>) -> Option<String> {
         let view = self.view(pane);
         if !view.enabled {
             return None;
         }
-        Some(view.selected_param.display_name().to_owned())
+        let name = view.selected_param.display_name();
+        Some(match self.grid_of(pane) {
+            Some(grid) => format!("{name} - {}", frame_label(grid)),
+            None => name.to_owned(),
+        })
     }
 
     fn data_generation(&self) -> u64 {
@@ -1133,18 +1273,7 @@ impl OverlayHandler for ModelDataHandler {
         let sources = ctx.sources.clone();
         let view = self.view(pane);
         let param = view.selected_param;
-        // The run and the forecast hour are chosen here, at the dispatch, not
-        // inside the fetch. A pane parked on a frame asks for **that** frame —
-        // which is what makes a reopen 1:1 rather than snapping the pane back
-        // to the live hour. An unparked pane asks for the latest run at the
-        // parameter's own floor, the behaviour the fetch used to hardcode.
-        let (run, f_hour) = match view.selected_frame {
-            Some((run, f_hour)) => ((run.date(), run.hour() as u8), f_hour),
-            None => (
-                crate::hrrr::fetch::latest_available_run(),
-                param.min_forecast_hour(),
-            ),
-        };
+        let (run, f_hour) = fetch_frame(view);
         vec![FetchTask {
             kind: known::MODEL_DATA,
             future: Box::pin(async move {
@@ -1166,15 +1295,8 @@ impl OverlayHandler for ModelDataHandler {
         let view = self.view(pane);
         let grid = self.grid_of(pane);
 
-        // f01+ must show its *valid* time and F-hour: a 0-1 h maximum labelled
-        // with the run time alone reads as an analysis valid now.
         let label = match grid {
-            Some(g) if g.forecast_hour > 0 => format!(
-                "Model Data ({} F{:02})",
-                g.valid_time().format("%H:%Mz"),
-                g.forecast_hour,
-            ),
-            Some(g) => format!("Model Data ({})", g.ref_time.format("%H:%Mz")),
+            Some(g) => format!("Model Data ({})", frame_label(g)),
             None => "Model Data".to_string(),
         };
 
@@ -1207,6 +1329,75 @@ impl OverlayHandler for ModelDataHandler {
                 .map(|a| (a.as_str().into(), a.label().into()))
                 .collect(),
             selected: view.axis.as_str().into(),
+        });
+
+        // **The run and the forecast hour** — the two halves of the frame this
+        // pane draws, and the whole of "show me f06" without a transport.
+        //
+        // The option *values* are relative tokens and the *labels* are
+        // absolute times: the token is what persists (a saved instant reopens
+        // days stale), and a time is what a user is actually picking.
+        let now = chrono::Utc::now().naive_utc();
+        let latest = latest_run_at(now);
+        let picked_run = view.selected_frame.map(|(run, _)| run);
+        // The menu reaches twelve runs back, and further when this pane's own
+        // run has aged past that: a pane must always be able to read its own
+        // selection out of its own control.
+        let deepest = picked_run
+            .and_then(|run| u8::try_from((latest - run).num_hours()).ok())
+            .filter(|back| *back <= MAX_RUN_OFFSET)
+            .map_or(RUN_CHOICES, |back| back.max(RUN_CHOICES));
+        let mut run_options = vec![(RUN_LATEST.to_string(), "Latest".to_string())];
+        run_options.extend((0..=deepest).map(|back| {
+            let run = latest - chrono::Duration::hours(i64::from(back));
+            // The date only when it is not the latest run's, so a twelve-hour
+            // menu that crosses midnight does not offer two "23:00z".
+            let when = if run.date() == latest.date() {
+                run.format("%H:%Mz").to_string()
+            } else {
+                run.format("%m/%d %H:%Mz").to_string()
+            };
+            (
+                run_token(back),
+                // Each run states its own reach: 48 hours off a 00/06/12/18Z
+                // cycle and 18 off every other one.
+                format!("{when} (f00-f{})", forecast_horizon(run)),
+            )
+        }));
+        items.push(ControlItem::Dropdown {
+            id: "run",
+            label: "Model run".into(),
+            options: run_options,
+            selected: picked_run
+                .and_then(|run| encode_run_choice(run, now))
+                .unwrap_or_else(|| RUN_LATEST.to_string()),
+        });
+
+        // The horizon is the RUN's, not the layer's, so this list is rebuilt
+        // whenever the run above changes.
+        let run = picked_run.unwrap_or(latest);
+        let floor = view.selected_param.min_forecast_hour();
+        let horizon = forecast_horizon(run);
+        items.push(ControlItem::Dropdown {
+            id: "f_hour",
+            label: "Forecast hour".into(),
+            options: (floor..=horizon)
+                .map(|f_hour| {
+                    let valid = run + chrono::Duration::hours(i64::from(f_hour));
+                    (
+                        f_hour_token(f_hour),
+                        format!("F{f_hour:02} ({})", valid.format("%H:%Mz")),
+                    )
+                })
+                .collect(),
+            // The floor is not a preference: both MXUPHL maxima publish an
+            // identically zero f00 over a zero-length window, so an unparked
+            // pane of one of them is already drawing f01 and must say so.
+            selected: f_hour_token(
+                view.selected_frame
+                    .map_or(floor, |(_, f_hour)| f_hour)
+                    .clamp(floor, horizon),
+            ),
         });
 
         items.push(ControlItem::ButtonRow {
@@ -1314,6 +1505,51 @@ impl OverlayHandler for ModelDataHandler {
                 }
                 ControlEffect::None
             }
+            // **The run this pane is parked on.** `Latest` unparks it, which
+            // is the `None` arm of the fetch — byte for byte the behaviour of
+            // every build before this control existed.
+            "run" => {
+                if let ControlValue::String(ref val) = update.value {
+                    let now = chrono::Utc::now().naive_utc();
+                    let (floor, current) = {
+                        let view = self.view(&pane.as_ref());
+                        (view.selected_param.min_forecast_hour(), view.selected_frame)
+                    };
+                    let frame = decode_run_choice(val, now).map(|run| {
+                        // The horizon belongs to the run, so an f36 pick
+                        // carried onto an off-cycle run has to come down to
+                        // f18 — and up to the parameter's floor, never below.
+                        let f_hour = current.map_or(floor, |(_, f_hour)| f_hour);
+                        (run, f_hour.clamp(floor, forecast_horizon(run)))
+                    });
+                    if frame != current {
+                        self.edit(pane, |state| state.selected_frame = frame);
+                        return self.frame_changed(pane);
+                    }
+                }
+                ControlEffect::None
+            }
+            // **The forecast hour.** Picking one parks the pane on a definite
+            // run: left following the cycle, the picture under the selection
+            // would change every time a new run published.
+            "f_hour" => {
+                if let ControlValue::String(ref val) = update.value
+                    && let Some(picked) = parse_f_hour(val)
+                {
+                    let now = chrono::Utc::now().naive_utc();
+                    let (floor, current) = {
+                        let view = self.view(&pane.as_ref());
+                        (view.selected_param.min_forecast_hour(), view.selected_frame)
+                    };
+                    let run = current.map_or_else(|| latest_run_at(now), |(run, _)| run);
+                    let frame = Some((run, picked.clamp(floor, forecast_horizon(run))));
+                    if frame != current {
+                        self.edit(pane, |state| state.selected_frame = frame);
+                        return self.frame_changed(pane);
+                    }
+                }
+                ControlEffect::None
+            }
             "refresh" => ControlEffect::Fetch,
             _ => ControlEffect::None,
         }
@@ -1354,16 +1590,25 @@ impl OverlayHandler for ModelDataHandler {
         // Both halves or neither: a run with no hour is not a frame, and a
         // pane restored onto half a frame would draw the wrong hour rather
         // than nothing.
+        //
+        // The run half is a **relative** choice resolved against the clock
+        // reading it, so an absolute instant left by an older build resolves
+        // to nothing and the pane comes back on `Latest`.
         if let Some(run) = value
             .get("run")
             .and_then(|v| v.as_str())
-            .and_then(parse_run)
+            .and_then(|s| decode_run_choice(s, chrono::Utc::now().naive_utc()))
             && let Some(f_hour) = value
                 .get("forecast_hour")
                 .and_then(|v| v.as_u64())
                 .and_then(|h| u8::try_from(h).ok())
         {
-            state.selected_frame = Some((run, f_hour));
+            // The saved hour was picked against the saved run's horizon, and
+            // the run this offset resolves to now may be an off-cycle one with
+            // 18 hours instead of 48. Clamped rather than dropped: the
+            // furthest hour that exists is nearer the intent than no frame.
+            let floor = state.selected_param.min_forecast_hour();
+            state.selected_frame = Some((run, f_hour.clamp(floor, forecast_horizon(run))));
         }
         Some(Box::new(state))
     }
@@ -1373,6 +1618,12 @@ impl OverlayHandler for ModelDataHandler {
     /// left parked on. A pane that was never parked writes neither `run` nor
     /// `forecast_hour` and reads back as `None` — the same absence, not a
     /// stamp of the moment it was saved.
+    ///
+    /// The run is written as a **relative** choice (`latest`, `latest-3`) and
+    /// not as an instant. Closing on Friday with 18Z picked and reopening on
+    /// Monday must not restore a three-day-old forecast whose only clue is a
+    /// small label; a run too far back to be spelled relatively drops both
+    /// halves, and the pane reopens on `Latest`.
     fn serialize_pane_state(&self, state: &dyn std::any::Any) -> serde_json::Value {
         let Some(state) = state.downcast_ref::<ModelPaneState>() else {
             return serde_json::Value::Null;
@@ -1383,24 +1634,14 @@ impl OverlayHandler for ModelDataHandler {
             "axis": state.axis.as_str(),
         });
         if let Some((run, f_hour)) = state.selected_frame
+            && let Some(choice) = encode_run_choice(run, chrono::Utc::now().naive_utc())
             && let Some(map) = out.as_object_mut()
         {
-            map.insert("run".into(), serde_json::json!(format_run(run)));
+            map.insert("run".into(), serde_json::json!(choice));
             map.insert("forecast_hour".into(), serde_json::json!(f_hour));
         }
         out
     }
-}
-
-/// The saved spelling of a run time. Second-resolution ISO 8601 with no zone —
-/// every HRRR run is UTC on the hour, and a `Z` nothing reads back is noise.
-/// Written and parsed here so the two can only ever move together.
-fn format_run(run: chrono::NaiveDateTime) -> String {
-    run.format("%Y-%m-%dT%H:%M:%S").to_string()
-}
-
-fn parse_run(text: &str) -> Option<chrono::NaiveDateTime> {
-    chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S").ok()
 }
 
 #[cfg(test)]
@@ -2433,14 +2674,17 @@ mod tests {
             ..PaneRef::bare(1)
         };
 
+        // The row is the field and the frame on the glass; both panes hold
+        // the same fixture run, so only the field half may differ here.
+        let row_of = |name: &str| format!("{name} - {}", run_time().format("%H:%Mz"));
         assert_eq!(
             h.status_line(&pane_a).as_deref(),
-            Some(left.display_name()),
+            Some(row_of(left.display_name()).as_str()),
             "pane 0's parameter",
         );
         assert_eq!(
             h.status_line(&pane_b).as_deref(),
-            Some(right.display_name()),
+            Some(row_of(right.display_name()).as_str()),
             "pane 1's parameter",
         );
         assert_ne!(
@@ -3137,14 +3381,18 @@ mod tests {
     fn a_parked_frame_survives_a_reopen() {
         let h = new_handler();
         let mut state = h.create_pane_state(true).expect("a pane state");
-        let run = run_time();
+        // The latest run, because the saved form is a RELATIVE choice: the
+        // fixture run is weeks old and no offset can spell it (which is its
+        // own test, `a_stale_absolute_run_does_not_survive_a_restart`).
+        let before = chrono::Utc::now().naive_utc();
+        let run = latest_run_at(before);
         state
             .downcast_mut::<ModelPaneState>()
             .expect("this layer's own state")
             .selected_frame = Some((run, 12));
 
         let json = h.serialize_pane_state(&*state);
-        assert_eq!(json["run"], serde_json::json!("2026-07-25T03:00:00"));
+        assert_eq!(json["run"], serde_json::json!(run_token(0)));
         assert_eq!(json["forecast_hour"], serde_json::json!(12));
 
         let back = h
@@ -3156,6 +3404,11 @@ mod tests {
                 .selected_frame,
             Some((run, 12)),
             "the pane did not come back on the frame it was left on",
+        );
+        assert_eq!(
+            latest_run_at(before),
+            latest_run_at(chrono::Utc::now().naive_utc()),
+            "premise: the HRRR cycle did not roll while this test ran",
         );
 
         // And a pane that was never parked comes back unparked rather than
@@ -3171,6 +3424,533 @@ mod tests {
                 .selected_frame,
             None,
         );
+    }
+
+    // ── Stage A: the run and forecast-hour controls ──────────────────────
+
+    /// The fixture grid, at a run and forecast hour of the caller's choosing —
+    /// what [`grid`] cannot do, since it always files itself at the fixture
+    /// run and the parameter's floor.
+    fn grid_at(parameter: ModelParameter, run: chrono::NaiveDateTime, f_hour: u8) -> HrrrGridData {
+        HrrrGridData {
+            ref_time: run,
+            forecast_hour: f_hour,
+            ..grid(parameter, vec![300.0])
+        }
+    }
+
+    /// A control edit through the pane's real state, the way the inspector
+    /// makes one — never a field write.
+    fn pick(
+        h: &mut ModelDataHandler,
+        state: &mut FetchPayload,
+        id: &'static str,
+        value: &str,
+    ) -> ControlEffect {
+        h.apply_control(
+            &ControlUpdate {
+                id,
+                value: ControlValue::String(value.to_owned()),
+            },
+            &mut PaneMut {
+                pane_idx: 0,
+                state: Some(&mut **state),
+                peers: &[],
+            },
+        )
+    }
+
+    fn frame_of(state: &FetchPayload) -> Option<(chrono::NaiveDateTime, u8)> {
+        state
+            .downcast_ref::<ModelPaneState>()
+            .expect("this layer's own state")
+            .selected_frame
+    }
+
+    fn view_of(state: &FetchPayload) -> &ModelPaneState {
+        state
+            .downcast_ref::<ModelPaneState>()
+            .expect("this layer's own state")
+    }
+
+    fn dropdown_of(
+        h: &ModelDataHandler,
+        state: &FetchPayload,
+        want: &str,
+    ) -> (Vec<(String, String)>, String) {
+        h.controls(&PaneRef {
+            state: Some(&**state),
+            ..PaneRef::bare(0)
+        })
+        .into_iter()
+        .find_map(|item| match item {
+            ControlItem::Dropdown {
+                id,
+                options,
+                selected,
+                ..
+            } if id == want => Some((options, selected)),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the model layer offers no {want:?} dropdown"))
+    }
+
+    /// **The user's ask, end to end**: pick a run, pick a forecast hour, and
+    /// the layer fetches *that* grid and rasterizes *that* grid.
+    ///
+    /// Every step goes through `apply_control` on the pane's own state, so
+    /// nothing here is reachable by writing `selected_frame` by hand — which
+    /// is exactly the gap this stage closed: the field existed and the fetch
+    /// honoured it, and no control ever wrote it.
+    ///
+    /// **Non-vacuity floors**, in order: three different picks produce three
+    /// distinct grid keys *and* three distinct fetch URLs (a control that
+    /// ignored its value would collapse all three); and driving both controls
+    /// back to `Latest`/floor reproduces the old `None` arm exactly.
+    #[test]
+    fn picking_a_run_and_an_hour_fetches_exactly_that_grid() {
+        // Not composite and not windowed: one GRIB URL per frame, floor f00.
+        let param = ModelParameter::SurfaceBasedCape;
+        assert!(!param.is_composite(), "premise: one URL per frame");
+        assert_eq!(param.min_forecast_hour(), 0, "premise: an f00 floor");
+
+        let before = chrono::Utc::now().naive_utc();
+        let latest = latest_run_at(before);
+        let sources = rustdar_source::origins::DataSources::default();
+
+        let mut h = new_handler();
+        let mut state = pane_state(param);
+        assert_eq!(frame_of(&state), None, "premise: the pane starts unparked");
+
+        let mut keys = Vec::new();
+        let mut urls = Vec::new();
+        // Each hour differs from the floor the run pick lands on, so every
+        // pick below is a real change and every effect is a real fetch.
+        for (token, back, hour) in [
+            ("latest", 0u8, 3u8),
+            ("latest-2", 2, 6),
+            ("latest-5", 5, 12),
+        ] {
+            assert!(
+                matches!(pick(&mut h, &mut state, "run", token), ControlEffect::Fetch),
+                "{token}: nothing of that run is resident, so the pick must fetch",
+            );
+            assert!(
+                matches!(
+                    pick(&mut h, &mut state, "f_hour", &f_hour_token(hour)),
+                    ControlEffect::Fetch
+                ),
+                "{token} F{hour}: that hour is not resident either",
+            );
+
+            let run = latest - chrono::Duration::hours(i64::from(back));
+            assert_eq!(
+                frame_of(&state),
+                Some((run, hour)),
+                "the pane parked on something other than what was picked",
+            );
+
+            // The dispatch's own choice, off the same function `create_fetch_tasks`
+            // reads — not a re-derivation of it.
+            let ((date, run_hour), f_hour) = fetch_frame(view_of(&state));
+            assert_eq!(
+                (date, run_hour, f_hour),
+                (run.date(), run.hour() as u8, hour),
+                "the fetch would ask for a frame nobody picked",
+            );
+            keys.push(
+                h.key_of(view_of(&state))
+                    .expect("a parked pane names its grid"),
+            );
+            urls.push(sources.hrrr_grib_url(&date, run_hour, f_hour));
+        }
+
+        // Floor one: three picks, three grids, three objects in the bucket.
+        for (i, j) in [(0, 1), (0, 2), (1, 2)] {
+            assert_ne!(keys[i], keys[j], "picks {i} and {j} share one grid key");
+            assert_ne!(urls[i], urls[j], "picks {i} and {j} fetch one URL");
+        }
+
+        // The grid the last pick asked for arrives, and the raster draws it.
+        let (run, hour) = (latest - chrono::Duration::hours(5), 12u8);
+        h.apply_fetch_result(
+            Box::new(HrrrFetchResult(Ok(grid_at(param, run, hour)))),
+            &PaneRef::across(&[]),
+        );
+        let pane = PaneRef {
+            state: Some(&*state),
+            ..PaneRef::bare(0)
+        };
+        assert_eq!(
+            h.key_of(view_of(&state)),
+            Some(GridKey {
+                param,
+                run,
+                f_hour: hour
+            }),
+            "the arrival is filed under a key the pane does not name",
+        );
+        let job = h
+            .prepare_job(&rasterize_ctx(), &pane)
+            .expect("the picked grid is resident, so the pane has a job");
+        let drawn = match job
+            .downcast_ref::<rasterize::GriddedInput>()
+            .expect("the model layer describes a gridded job")
+        {
+            rasterize::GriddedInput::Whole(grid) => grid.clone(),
+            other => panic!("the model layer carries the whole grid: {other:?}"),
+        };
+        assert_eq!(
+            (drawn.ref_time, drawn.forecast_hour),
+            (run, hour),
+            "the raster names a different grid than the pane picked",
+        );
+
+        // Floor two: back to `Latest` at the floor is the old `None` arm,
+        // which is what every build before these controls did.
+        assert!(matches!(
+            pick(&mut h, &mut state, "run", ""),
+            ControlEffect::Fetch | ControlEffect::None
+        ));
+        assert_eq!(
+            frame_of(&state),
+            None,
+            "`Latest` must unpark the pane, not pin it to this instant",
+        );
+        assert_eq!(
+            fetch_frame(view_of(&state)),
+            (
+                crate::hrrr::fetch::latest_available_run(),
+                param.min_forecast_hour()
+            ),
+            "an unparked pane must fetch exactly what the old `None` arm did",
+        );
+        assert_eq!(
+            latest_run_at(before),
+            latest_run_at(chrono::Utc::now().naive_utc()),
+            "premise: the HRRR cycle did not roll while this test ran",
+        );
+    }
+
+    /// **The pane itself says which forecast hour is on the glass** — the
+    /// stack row over the map, not a line behind the options panel.
+    ///
+    /// **Non-vacuity floor**: the phrase is built from the **resident** grid,
+    /// never from the dropdown. A pane parked on f12 with only f06 resident is
+    /// drawing neither, and must claim neither — the mutation this kills is
+    /// "read the label off `selected_frame`", which would have the row promise
+    /// F12 with nothing behind it.
+    #[test]
+    fn the_pane_states_the_forecast_hour_it_is_drawing() {
+        let param = ModelParameter::SurfaceBasedCape;
+        let run = latest_run_at(chrono::Utc::now().naive_utc());
+        let mut h = new_handler();
+        let mut state = pane_state(param);
+
+        pick(&mut h, &mut state, "run", "latest");
+        pick(&mut h, &mut state, "f_hour", &f_hour_token(6));
+        h.apply_fetch_result(
+            Box::new(HrrrFetchResult(Ok(grid_at(param, run, 6)))),
+            &PaneRef::across(&[]),
+        );
+        fn row(h: &ModelDataHandler, state: &FetchPayload) -> String {
+            h.status_line(&PaneRef {
+                state: Some(&**state),
+                ..PaneRef::bare(0)
+            })
+            .expect("an enabled model layer has a stack row")
+        }
+
+        let line = row(&h, &state);
+        assert!(
+            line.contains("F06"),
+            "the pane does not say its hour: {line}"
+        );
+        assert!(
+            line.contains(
+                &(run + chrono::Duration::hours(6))
+                    .format("%H:%Mz")
+                    .to_string()
+            ),
+            "the pane does not say its valid time: {line}",
+        );
+        assert!(
+            line.contains(param.display_name()),
+            "the pane stopped saying its field: {line}",
+        );
+
+        // Floor: the pick moves to f12 and nothing of f12 is resident.
+        pick(&mut h, &mut state, "f_hour", &f_hour_token(12));
+        assert_eq!(
+            frame_of(&state),
+            Some((run, 12)),
+            "premise: the pick landed"
+        );
+        let line = row(&h, &state);
+        assert!(
+            !line.contains("F12"),
+            "the row is reading the dropdown, not the glass: {line}",
+        );
+        assert!(
+            !line.contains("F06"),
+            "the row is naming a grid this pane is no longer showing: {line}",
+        );
+        assert_eq!(
+            line,
+            param.display_name(),
+            "with nothing resident the row is the field and nothing else",
+        );
+
+        // And it moves when the resident grid does, so the F06 above was not
+        // a constant.
+        h.apply_fetch_result(
+            Box::new(HrrrFetchResult(Ok(grid_at(param, run, 12)))),
+            &PaneRef::across(&[]),
+        );
+        assert!(row(&h, &state).contains("F12"), "{}", row(&h, &state));
+    }
+
+    /// **A run saved as an instant does not come back.**
+    ///
+    /// The saved form is a relative choice, so an absolute instant — what
+    /// every build before this one wrote — resolves to nothing and the pane
+    /// reopens on `Latest`. Closing on Friday with 18Z picked must not reopen
+    /// on Monday showing a three-day-old forecast whose only clue is a small
+    /// label.
+    ///
+    /// **Non-vacuity floor**: a *fresh* run survives the identical round trip
+    /// unchanged, so "always reset" does not pass; and a run too far back to
+    /// be spelled relatively drops **both** halves rather than half a frame.
+    #[test]
+    fn a_stale_absolute_run_does_not_survive_a_restart() {
+        let h = new_handler();
+        let param = ModelParameter::SurfaceBasedCape;
+        let saved = |run: serde_json::Value| {
+            serde_json::json!({
+                "enabled": true,
+                "parameter": param.as_str(),
+                "axis": "forecast",
+                "run": run,
+                "forecast_hour": 6,
+            })
+        };
+        let restored = |value: serde_json::Value| {
+            frame_of(
+                &h.deserialize_pane_state(value, true)
+                    .expect("the saved state reloads"),
+            )
+        };
+
+        assert_eq!(
+            restored(saved(serde_json::json!("2026-07-25T03:00:00"))),
+            None,
+            "an absolute instant left by an older build must not be restored",
+        );
+
+        // Floor: the relative spelling of the same shape DOES come back.
+        let before = chrono::Utc::now().naive_utc();
+        assert_eq!(
+            restored(saved(serde_json::json!("latest-2"))),
+            Some((latest_run_at(before) - chrono::Duration::hours(2), 6)),
+            "a fresh relative choice must survive, or `None` above is just \
+             'always reset'",
+        );
+
+        // And the encoding itself, at a fixed clock: a run that has aged past
+        // the vocabulary cannot be written, so both halves leave the file.
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 21)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        let latest = latest_run_at(now);
+        assert_eq!(latest.format("%H:%M").to_string(), "12:00", "premise");
+        assert_eq!(encode_run_choice(latest, now).as_deref(), Some("latest"));
+        assert_eq!(
+            encode_run_choice(latest - chrono::Duration::hours(3), now).as_deref(),
+            Some("latest-3"),
+        );
+        assert_eq!(
+            encode_run_choice(latest - chrono::Duration::days(3), now),
+            None,
+            "72 hours is past MAX_RUN_OFFSET and has no relative spelling",
+        );
+        assert_eq!(
+            decode_run_choice("latest-3", now),
+            Some(latest - chrono::Duration::hours(3))
+        );
+        assert_eq!(decode_run_choice("", now), None, "`Latest` is not a run");
+        assert_eq!(
+            decode_run_choice("2026-08-21T12:00:00", now),
+            None,
+            "an instant is not a choice",
+        );
+
+        let mut state = h.create_pane_state(true).expect("a pane state");
+        state
+            .downcast_mut::<ModelPaneState>()
+            .expect("this layer's own state")
+            .selected_frame = Some((before - chrono::Duration::days(3), 6));
+        let json = h.serialize_pane_state(&*state);
+        assert!(json.get("run").is_none(), "{json}");
+        assert!(
+            json.get("forecast_hour").is_none(),
+            "both halves or neither: {json}",
+        );
+        assert_eq!(
+            latest_run_at(before),
+            latest_run_at(chrono::Utc::now().naive_utc()),
+            "premise: the HRRR cycle did not roll while this test ran",
+        );
+    }
+
+    /// The run menu: `Latest`, then the latest run and twelve before it, each
+    /// stating its own reach.
+    #[test]
+    fn the_run_menu_offers_latest_and_the_runs_behind_it() {
+        let h = new_handler();
+        let state = pane_state(ModelParameter::SurfaceBasedCape);
+        let (options, selected) = dropdown_of(&h, &state, "run");
+        assert_eq!(
+            options.len(),
+            usize::from(RUN_CHOICES) + 2,
+            "`Latest` plus {RUN_CHOICES} + 1 runs: {options:?}",
+        );
+        assert_eq!(options[0], (String::new(), "Latest".to_string()));
+        assert_eq!(options[1].0, "latest");
+        assert_eq!(options[2].0, "latest-1");
+        assert_eq!(selected, "", "an unparked pane sits on Latest");
+        // Every label states the run's reach, which is the run's own and not
+        // the layer's.
+        let reaches: Vec<&str> = options[1..]
+            .iter()
+            .map(|(_, label)| {
+                if label.contains("f00-f48") {
+                    "48"
+                } else {
+                    "18"
+                }
+            })
+            .collect();
+        assert!(
+            reaches.contains(&"48") && reaches.contains(&"18"),
+            "thirteen consecutive runs span both cycles: {options:?}",
+        );
+    }
+
+    /// The forecast-hour list is the run's whole horizon — 49 entries on a
+    /// synoptic run, 19 off-cycle — and it is rebuilt when the run changes.
+    ///
+    /// **Non-vacuity floor**: the two counts are asserted against runs picked
+    /// through the control, so a list that ignored the run would fail one.
+    #[test]
+    fn a_forecast_hour_list_spans_the_runs_own_horizon() {
+        let mut h = new_handler();
+        let mut state = pane_state(ModelParameter::SurfaceBasedCape);
+        let latest = latest_run_at(chrono::Utc::now().naive_utc());
+
+        let mut seen: Vec<usize> = Vec::new();
+        for back in 0..6u8 {
+            pick(&mut h, &mut state, "run", &run_token(back));
+            let run = latest - chrono::Duration::hours(i64::from(back));
+            let (options, _) = dropdown_of(&h, &state, "f_hour");
+            assert_eq!(
+                options.len(),
+                usize::from(forecast_horizon(run)) + 1,
+                "the list must be the run's horizon, run {run}: {}",
+                options.len(),
+            );
+            seen.push(options.len());
+            assert_eq!(options[0].0, "f00");
+            assert!(options[0].1.starts_with("F00 ("), "{:?}", options[0]);
+        }
+        assert!(
+            seen.contains(&49) && seen.contains(&19),
+            "six consecutive runs contain a synoptic one and an off-cycle \
+             one, so both lengths must appear: {seen:?}",
+        );
+    }
+
+    /// The two `MXUPHL` maxima publish an identically zero f00 over a
+    /// zero-length window, so their floor is f01. The control clamps **up**
+    /// to it and never down.
+    #[test]
+    fn a_forecast_hour_never_falls_below_the_parameters_floor() {
+        let param = ModelParameter::MaxUH2to5km;
+        assert_eq!(param.min_forecast_hour(), 1, "premise");
+        let mut h = new_handler();
+        let mut state = pane_state(param);
+
+        let (options, selected) = dropdown_of(&h, &state, "f_hour");
+        assert_eq!(
+            options[0].0, "f01",
+            "the list starts at the floor: {options:?}"
+        );
+        assert_eq!(selected, "f01", "an unparked pane already draws f01");
+
+        pick(&mut h, &mut state, "run", "latest");
+        pick(&mut h, &mut state, "f_hour", &f_hour_token(0));
+        assert_eq!(
+            frame_of(&state).map(|(_, f_hour)| f_hour),
+            Some(1),
+            "f00 must be raised to the floor, not accepted",
+        );
+        pick(&mut h, &mut state, "f_hour", &f_hour_token(18));
+        assert_eq!(
+            frame_of(&state).map(|(_, f_hour)| f_hour),
+            Some(18),
+            "the clamp only ever raises: f18 must stay f18",
+        );
+
+        // And a floor parameter never fetches below its floor either.
+        assert_eq!(fetch_frame(view_of(&state)).1, 18);
+    }
+
+    /// An hour picked against a 48-hour run comes back onto whatever run the
+    /// offset now names, which may only reach 18 — so the restored hour is
+    /// clamped down to a frame that exists rather than to a 404.
+    #[test]
+    fn a_restored_hour_cannot_outrun_the_run_it_lands_on() {
+        let h = new_handler();
+        let param = ModelParameter::SurfaceBasedCape;
+        let now = chrono::Utc::now().naive_utc();
+        let mut off_cycle = 0u8;
+        while forecast_horizon(latest_run_at(now) - chrono::Duration::hours(i64::from(off_cycle)))
+            != 18
+        {
+            off_cycle += 1;
+            assert!(off_cycle < 6, "one of six consecutive runs is off-cycle");
+        }
+        let restored = h
+            .deserialize_pane_state(
+                serde_json::json!({
+                    "enabled": true,
+                    "parameter": param.as_str(),
+                    "axis": "forecast",
+                    "run": run_token(off_cycle),
+                    "forecast_hour": 36,
+                }),
+                true,
+            )
+            .expect("reloads");
+        assert_eq!(
+            frame_of(&restored).map(|(_, f_hour)| f_hour),
+            Some(18),
+            "f36 does not exist on an 18-hour run",
+        );
+        // Floor: an hour the run does carry is restored untouched.
+        let restored = h
+            .deserialize_pane_state(
+                serde_json::json!({
+                    "enabled": true,
+                    "parameter": param.as_str(),
+                    "axis": "forecast",
+                    "run": run_token(off_cycle),
+                    "forecast_hour": 12,
+                }),
+                true,
+            )
+            .expect("reloads");
+        assert_eq!(frame_of(&restored).map(|(_, f_hour)| f_hour), Some(12));
     }
 
     /// The axis itself: hourly cycles that run **ahead** of the wall clock.
