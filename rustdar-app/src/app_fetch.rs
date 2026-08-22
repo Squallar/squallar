@@ -1070,13 +1070,13 @@ impl super::App {
         let window = self.window.clone();
 
         match &id {
-            // **The nine described kinds** — the four polygon kinds, the two
-            // hit-map kinds, the two gridded rasters and, since WO-M10c, the
+            // **The ten described kinds** — the four polygon kinds, the two
+            // hit-map kinds, the three gridded rasters and, since WO-M10c, the
             // site table. The list is a coincidence of "answers `prepare_job`",
             // pinned in `texture_tests`; `RadarSites` joined it when the
             // handler gained a pane to read its site from, `SpcFireOutlook`
-            // when the fire weather layer landed, and `Mrms` with the national
-            // mosaic.
+            // when the fire weather layer landed, `Mrms` with the national
+            // mosaic and `Gmgsi` with the global one.
             id if *id == known::SPC_OUTLOOK
                 || *id == known::SPC_FIRE_OUTLOOK
                 || *id == known::SPC_DISCUSSIONS
@@ -1085,6 +1085,7 @@ impl super::App {
                 || *id == known::LIGHTNING
                 || *id == known::MODEL_DATA
                 || *id == known::MRMS
+                || *id == known::GMGSI
                 || *id == known::RADAR_SITES =>
             {
                 let clock = chrono::Utc::now().naive_utc();

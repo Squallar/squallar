@@ -799,6 +799,9 @@ const GRID_COORDS_EXPLICIT: u8 = 2;
 /// inserted** — the two tags above keep their numbers, so a payload written
 /// before this arm existed decodes unchanged.
 const GRID_COORDS_REGULAR: u8 = 3;
+/// Grid-coordinate tag: one axis per dimension. **Appended, not inserted** —
+/// the three tags above keep their numbers.
+const GRID_COORDS_SEPARABLE: u8 = 4;
 
 fn encode_grid_coords(out: &mut Vec<u8>, coords: &crate::hrrr::GridCoords) {
     use crate::hrrr::GridCoords;
@@ -854,6 +857,20 @@ fn encode_grid_coords(out: &mut Vec<u8>, coords: &crate::hrrr::GridCoords) {
             }
             out.extend_from_slice(&(lons.len() as u32).to_le_bytes());
             for v in lons {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        GridCoords::Separable { lat_axis, lon_axis } => {
+            out.push(GRID_COORDS_SEPARABLE);
+            // Two counts for the same reason the explicit arm writes two: the
+            // axes are independent lengths, and here they are the grid's two
+            // dimensions, so one count could not describe the shape at all.
+            out.extend_from_slice(&(lat_axis.len() as u32).to_le_bytes());
+            for v in lat_axis {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.extend_from_slice(&(lon_axis.len() as u32).to_le_bytes());
+            for v in lon_axis {
                 out.extend_from_slice(&v.to_le_bytes());
             }
         }
@@ -935,6 +952,13 @@ fn decode_grid_coords(r: &mut Reader) -> Option<crate::hrrr::GridCoords> {
             let lon_count = r.u32()? as usize;
             let lons = decode_f64s(r, lon_count)?;
             Some(GridCoords::Explicit { lats, lons })
+        }
+        GRID_COORDS_SEPARABLE => {
+            let lat_count = r.u32()? as usize;
+            let lat_axis = decode_f64s(r, lat_count)?;
+            let lon_count = r.u32()? as usize;
+            let lon_axis = decode_f64s(r, lon_count)?;
+            Some(GridCoords::Separable { lat_axis, lon_axis })
         }
         _ => None,
     }
@@ -1570,6 +1594,75 @@ mod tests {
             }));
             assert_round_trips(&JOB_CODECS[6], &job);
         }
+    }
+
+    /// The separable arm travels as its two axes and comes back as the same
+    /// grid — **in the same order**.
+    ///
+    /// The two axes have deliberately different lengths and disjoint value
+    /// ranges here, so an encoder or decoder that swapped them could not
+    /// produce an equal grid and could not even produce a well-shaped one.
+    #[test]
+    fn a_separable_grid_coords_round_trips() {
+        let coords = crate::hrrr::GridCoords::Separable {
+            lat_axis: vec![55.0, 54.5, 53.0],
+            lon_axis: vec![-129.995, -129.0, -128.5, -120.25],
+        };
+        let job = DescribedJob::new(GriddedInput::Window(GridWindow {
+            field: crate::hrrr::fields::spec(crate::hrrr::ModelParameter::SurfaceBasedCape)
+                .id
+                .clone(),
+            ni: 4,
+            nj: 3,
+            coords: coords.clone(),
+            win: IndexWindow {
+                i0: 1,
+                i1: 3,
+                j0: 0,
+                j1: 2,
+            },
+            values: vec![100.0, 250.0, 500.0, 1250.0],
+        }));
+        assert_round_trips(&JOB_CODECS[6], &job);
+
+        // And directly, so the assertion names the axes rather than trusting
+        // the whole job's equality to notice a swap.
+        let mut bytes = Vec::new();
+        super::encode_grid_coords(&mut bytes, &coords);
+        assert_eq!(bytes[0], super::GRID_COORDS_SEPARABLE);
+        let back = super::decode_grid_coords(&mut Reader::new(&bytes))
+            .expect("the arm this build writes decodes");
+        let crate::hrrr::GridCoords::Separable { lat_axis, lon_axis } = back else {
+            panic!("tag 4 must decode as Separable");
+        };
+        assert_eq!(lat_axis, vec![55.0, 54.5, 53.0]);
+        assert_eq!(lon_axis, vec![-129.995, -129.0, -128.5, -120.25]);
+    }
+
+    /// Tag 4 is **appended**: the three tags below it keep their numbers, so a
+    /// payload written before this arm existed still decodes as what it was.
+    #[test]
+    fn the_separable_tag_is_appended_and_displaces_no_older_tag() {
+        assert_eq!(super::GRID_COORDS_LAMBERT, 1);
+        assert_eq!(super::GRID_COORDS_EXPLICIT, 2);
+        assert_eq!(super::GRID_COORDS_REGULAR, 3);
+        assert_eq!(super::GRID_COORDS_SEPARABLE, 4);
+
+        // An explicit payload — tag 2 — is unchanged by tag 4 existing.
+        let explicit = crate::hrrr::GridCoords::Explicit {
+            lats: vec![30.0, 30.5],
+            lons: vec![-99.0, -98.5],
+        };
+        let mut bytes = Vec::new();
+        super::encode_grid_coords(&mut bytes, &explicit);
+        assert_eq!(bytes[0], super::GRID_COORDS_EXPLICIT);
+        assert_eq!(
+            super::decode_grid_coords(&mut Reader::new(&bytes)),
+            Some(explicit)
+        );
+
+        // A tag this build does not have is refused, not defaulted.
+        assert!(super::decode_grid_coords(&mut Reader::new(&[5u8])).is_none());
     }
 
     /// A regular grid this build would never write is **refused, not clamped**:

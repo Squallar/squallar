@@ -160,8 +160,31 @@ pub fn paints_over_scale(scale: &LegendScale, value: f32) -> bool {
 static PAINTS: LazyLock<Vec<FieldPaint>> = LazyLock::new(|| {
     let mut paints = register_model_fields();
     paints.extend(register_mrms_fields());
+    paints.extend(register_gmgsi_fields());
     paints
 });
+
+/// GMGSI's four channels, each through [`FieldPaint::over_scale`].
+///
+/// The two conditions that function states both hold, and neither is a
+/// coincidence of the ramp being grey:
+///
+/// * the scales are stated in the units the grid carries — 0-255 counts, with
+///   no conversion between the value and the bar, because a count is
+///   `Quantity::Unitless` and converts to itself;
+/// * the ramps fade out below their first stop and clamp above their last,
+///   which is exactly [`color_for`]'s posture. The first stop sits at count 0,
+///   so the only value that comes out transparent is a `_FillValue` the CF
+///   layer already turned into a `NaN`.
+fn register_gmgsi_fields() -> Vec<FieldPaint> {
+    crate::gmgsi::GmgsiChannel::all()
+        .iter()
+        .map(|&c| {
+            let spec = crate::gmgsi::fields::spec(c);
+            FieldPaint::over_scale(&spec.id, spec.scale)
+        })
+        .collect()
+}
 
 /// MRMS's products, each through [`FieldPaint::over_scale`].
 ///

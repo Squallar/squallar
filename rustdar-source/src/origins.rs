@@ -48,13 +48,18 @@ pub struct DataSources {
     /// MRMS national mosaic products. Keys are
     /// `CONUS/{product}/{YYYYMMDD}/MRMS_{product}_{YYYYMMDD}-{HHMMSS}.grib2.gz`.
     pub mrms_bucket: Source,
+    /// GMGSI global geostationary mosaic. Keys are
+    /// `GMGSI_{LW,SW,VIS,WV}/{YYYY}/{MM}/{DD}/{HH}/GLOBCOMP*_v3r0_blend_s*_e*_c*.nc`.
+    /// The trailing creation stamp is unpredictable, so the key is always
+    /// listed and never constructed.
+    pub gmgsi_bucket: Source,
     /// NWS public API: active alerts and zone geometry.
     pub nws_api_base: Source,
     /// Storm Prediction Center: outlooks, mesoscale discussions, storm reports.
     pub spc_base: Source,
     /// Iowa Environmental Mesonet: current ASOS/METAR observations.
     pub iem_base: Source,
-    /// Where the seven bucket fields above are addressed — the one definition of
+    /// Where the eight bucket fields above are addressed — the one definition of
     /// the S3 URL shape, with `{bucket}` substituted by [`Self::s3_bucket_url`].
     pub s3_base: Source,
     /// Open-Meteo forecast API: environmental sounding heights (0 °C and
@@ -86,6 +91,7 @@ impl DataSources {
             goes_east_bucket: Cow::Borrowed("noaa-goes19"),
             goes_west_bucket: Cow::Borrowed("noaa-goes18"),
             mrms_bucket: Cow::Borrowed("noaa-mrms-pds"),
+            gmgsi_bucket: Cow::Borrowed("noaa-gmgsi-pds"),
             nws_api_base: Cow::Borrowed("https://api.weather.gov"),
             spc_base: Cow::Borrowed("https://www.spc.noaa.gov"),
             iem_base: Cow::Borrowed("https://mesonet.agron.iastate.edu"),
@@ -99,7 +105,7 @@ impl DataSources {
     /// **Every DATA origin this application reads from, as URLs — the one
     /// enumeration of the set.**
     ///
-    /// Seven bucket-object URLs (addressed through [`s3_base`](Self::s3_base),
+    /// Eight bucket-object URLs (addressed through [`s3_base`](Self::s3_base),
     /// so a test pointing that field at a mock server moves these with it) and
     /// the four API bases. Callers that want hostnames take the host of each.
     ///
@@ -123,6 +129,7 @@ impl DataSources {
             &self.goes_east_bucket,
             &self.goes_west_bucket,
             &self.mrms_bucket,
+            &self.gmgsi_bucket,
         ];
         let bases = [
             &self.nws_api_base,
@@ -237,6 +244,17 @@ impl DataSources {
     /// URL of one MRMS granule.
     pub fn mrms_object_url(&self, product: &str, stamp: &chrono::NaiveDateTime) -> String {
         self.s3_object_url(&self.mrms_bucket, &Self::mrms_key(product, stamp))
+    }
+
+    /// The hour directory holding one GMGSI channel's granule.
+    ///
+    /// An hour prefix and not a day one: each hour holds a single object, so
+    /// listing the hour is one request that returns one key. There is no
+    /// `gmgsi_key` counterpart on purpose -- the object name ends in a
+    /// creation timestamp (`_c202506011234579`) that no clock can predict, so
+    /// the key must come off a listing.
+    pub fn gmgsi_hour_prefix(channel_prefix: &str, stamp: &chrono::NaiveDateTime) -> String {
+        format!("{channel_prefix}/{}/", stamp.format("%Y/%m/%d/%H"))
     }
 
     /// Current ASOS observations for one US state, as JSON.
