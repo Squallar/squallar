@@ -104,6 +104,31 @@ struct PaneConfig {
     /// the type mismatch and salvage it to defaults.
     #[serde(default)]
     layer_slots: SlotList,
+    /// **The layers this pane has been curated to exclude**, with the config
+    /// each held when it left.
+    ///
+    /// The tombstone list behind
+    /// [`LayerStack`](crate::pane::LayerStack). Since a stack stopped being a
+    /// complete projection of the registry, a layer's *absence* from
+    /// [`Self::layer_slots`] no longer says anything on its own — a build that
+    /// serves a layer the file never named cannot tell "written by a build
+    /// without it" from "removed by the user" — so the removal is written down
+    /// rather than inferred, and this is where.
+    ///
+    /// **Additive, and no [`migrate::CONFIG_VERSION`] bump.** `#[serde(default)]`
+    /// reads an absent key as "nothing removed", which is exactly what every
+    /// file written before curation existed meant, so an existing config loads
+    /// to the same stack it loads to today. `skip_serializing_if` keeps the key
+    /// off the wire entirely until a user removes something, so a pane that has
+    /// never been curated writes byte-for-byte what it wrote before — including
+    /// the downgrade fixture, whose whole job is to be that byte capture.
+    ///
+    /// A [`SlotList`], not a bare id list, for two reasons: the config that
+    /// rides along with the id is what makes re-adding restore settings instead
+    /// of resetting them, and the type already carries an unknown half, so a
+    /// tombstone written by a newer build survives a session under this one.
+    #[serde(default, skip_serializing_if = "SlotList::is_empty")]
+    removed_layers: SlotList,
     /// Map zoom level, as `walkers::MapMemory` reports it.
     #[serde(default)]
     zoom: Option<f64>,
@@ -223,6 +248,15 @@ struct SlotConfig {
 pub(crate) struct SlotList {
     known: Vec<SlotConfig>,
     unknown: Vec<serde_json::Value>,
+}
+
+impl SlotList {
+    /// Whether the list would serialize to `[]` — the test
+    /// `skip_serializing_if` on `removed_layers` reads, so a pane that has
+    /// removed nothing writes no key at all.
+    fn is_empty(&self) -> bool {
+        self.known.is_empty() && self.unknown.is_empty()
+    }
 }
 
 impl Serialize for SlotList {
@@ -495,6 +529,7 @@ impl Default for PaneConfig {
             layer_link: true,
             transport: default_transport(),
             layer_slots: SlotList::default(),
+            removed_layers: SlotList::default(),
             zoom: None,
             center: None,
             kind: PaneKindConfig::Map,
@@ -939,6 +974,29 @@ fn pane_slot_list(pane: &PaneState, global_live_chunks: bool) -> SlotList {
     }
 }
 
+/// A pane's tombstones as the file carries them: the id each removal names,
+/// and the configuration it left with, so the next re-add restores settings
+/// rather than resetting them.
+///
+/// `enabled` is deliberately never written: a removed layer's flag is not a
+/// fact about anything, and writing one would put a second, contradictable
+/// answer beside the slot list's.
+fn pane_removed_list(pane: &PaneState) -> SlotList {
+    SlotList {
+        known: pane
+            .layers
+            .removed()
+            .iter()
+            .map(|gone| SlotConfig {
+                id: layer_key(&gone.id),
+                enabled: None,
+                config: gone.config.clone(),
+            })
+            .collect(),
+        unknown: pane.config_baggage.removed_layers.clone(),
+    }
+}
+
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
@@ -1014,6 +1072,7 @@ impl super::Gui {
                     layer_link: pane.layer_link,
                     transport: pane.transport_layer().clone(),
                     layer_slots: pane_slot_list(pane, global_live_chunks),
+                    removed_layers: pane_removed_list(pane),
                     unknown: pane.config_baggage.fields.clone(),
                     zoom: pane
                         .map_memory
@@ -1334,9 +1393,23 @@ impl super::Gui {
             pane.set_content(restore_content(i, pc, count));
             pane.config_baggage = crate::pane::PaneConfigBaggage {
                 layer_slots: pc.layer_slots.unknown.clone(),
+                removed_layers: pc.removed_layers.unknown.clone(),
                 fields: pc.unknown.clone(),
             };
-            pane.layers = pc
+            // The tombstones first: a file that names the same id in both lists
+            // is a file that contradicts itself, and the slot list wins — a
+            // layer visibly in the stack is not removed from it — which is what
+            // `LayerStack::set_slots` enforces below.
+            let removed: Vec<crate::pane::RemovedLayer> = pc
+                .removed_layers
+                .known
+                .iter()
+                .map(|slot| crate::pane::RemovedLayer {
+                    id: LayerId::new(slot.id.clone()),
+                    config: slot.config.clone(),
+                })
+                .collect();
+            let slots: Vec<crate::pane::LayerSlot> = pc
                 .layer_slots
                 .known
                 .iter()
@@ -1361,6 +1434,8 @@ impl super::Gui {
                     }
                 })
                 .collect();
+            pane.layers = crate::pane::LayerStack::from_parts(Vec::new(), removed);
+            pane.layers.set_slots(slots);
             let unregistered: Vec<&str> = pane
                 .layers
                 .iter()
