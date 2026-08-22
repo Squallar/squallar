@@ -65,6 +65,71 @@ fn loop_interval(fps: f32) -> std::time::Duration {
     std::time::Duration::from_secs_f32(1.0 / fps)
 }
 
+/// **Where a starting loop parks its clock**, or `None` for "the newest frame
+/// there is" — see `App::sync_loop_playback_start`, its one caller.
+///
+/// # Why the answer is not always the last frame
+///
+/// [`rustdar_source::time::TimeAxis::FrameSeries`] under
+/// [`rustdar_egui::pane::TimeMode::Live`] is `frames.len() - 1`. For radar,
+/// and for every other rail whose stamps are all history, that frame is *now*
+/// and starting there is exactly right. For a rail that declares
+/// `extends_future` the same frame is its **horizon** — the HRRR CONUS one is
+/// 48 h out — so `Live` starts the loop on a picture of the day after tomorrow
+/// and leaves the pane's clock there.
+///
+/// So a forward-reaching rail parks on the frame `FrameSeries` names at the
+/// wall clock: the latest one valid at or before `now`, read through
+/// [`rustdar_egui::pane::LayerTimeState::qualifying_frame_at`] so this cannot
+/// become a second spelling of that contract. A list lying entirely ahead of
+/// the wall clock — a run whose analysis hour has already been evicted —
+/// qualifies nothing, and then the earliest frame held is the nearest thing to
+/// now there is.
+///
+/// # Radar keeps `TimeMode::Live`, and that is not the same as `len() - 1`
+///
+/// The tempting simplification is to park every loop on an index and drop the
+/// `Live` arm. It is wrong: `Live` is a **pane clock mode**, not a frame
+/// number, and three things read the mode rather than the playhead —
+/// `as_of_term` (`ui_map_pane.rs`) has a `Live` fast path returning `0`, so an
+/// `AsOf` clock mints a fresh raster token for every `EventLifetime` layer on
+/// the pane; `TimeMode::as_of` answers `None` under `Live`, which is what the
+/// per-layer `as_of` fallback keys on; and `settle_playheads` under `Live`
+/// puts **each** layer on its own newest frame, where `AsOf(t)` puts every
+/// layer on the latest frame at or before one layer's `t`. Parking radar on
+/// its last frame would change all three.
+///
+/// # The declaration is read off the registry, never off the id
+///
+/// Whether stamps later than the wall clock are expected is the layer's own
+/// answer, the same way `begin_loop_for_pane` asks it. A `match` on the layer
+/// id here would be a second authority to keep in step.
+fn loop_start_frame(
+    pane: &rustdar_egui::pane::PaneState,
+    overlays: &rustdar_overlays::render::overlay_state::OverlayRegistry,
+    now: chrono::NaiveDateTime,
+) -> Option<usize> {
+    let extends_future = overlays
+        .handler_by_id(pane.transport_layer())
+        .is_some_and(|handler| {
+            matches!(
+                handler.time_axis(),
+                rustdar_source::time::TimeAxis::FrameSeries {
+                    extends_future: true,
+                    ..
+                }
+            )
+        });
+    if !extends_future {
+        return None;
+    }
+    let ls = pane.transport_state();
+    Some(
+        ls.qualifying_frame_at(rustdar_egui::pane::TimeMode::AsOf(now))
+            .unwrap_or(0),
+    )
+}
+
 /// The plan-view rasters one pass has already put on the GPU, so the second
 /// pane showing one of them is handed the *texture* rather than a second copy
 /// of the picture.
@@ -2407,8 +2472,14 @@ impl super::App {
         let pane_count = self.gui.pane_count();
         let multi = pane_count > 1;
 
-        // Collect readiness status for all panes with active loops
-        let mut ready_panes: Vec<usize> = Vec::new();
+        // One wall-clock reading for the whole pass, so two panes parking on
+        // "the frame at now" cannot be anchored a tick apart.
+        let wall = chrono::Utc::now().naive_utc();
+
+        // Each ready pane, with where its loop must park when it starts:
+        // `Some(index)` for a rail that reaches into the future, `None` for
+        // "the newest there is". See `loop_start_frame`.
+        let mut ready_panes: Vec<(usize, Option<usize>)> = Vec::new();
         let mut not_ready_panes: Vec<usize> = Vec::new();
         // The slice walk, not `0..pane_count` with a `pane(idx)` inside it:
         // proven to visit the same panes (WI-0, pinned by
@@ -2416,7 +2487,13 @@ impl super::App {
         // fewer reach through the seam. `pane_cannot_loop(idx)` was
         // `pane(idx).is_some_and(|p| !p.can_loop())`, so an index with no pane
         // fell through it and was dropped by the very next line either way.
-        for (idx, pane) in self.gui.panes().iter().enumerate() {
+        //
+        // **The registry rides along** rather than being reached for
+        // separately: where a starting loop parks is read off the transport
+        // layer's own `time_axis`, and this is the visible slice `panes()`
+        // hands out with the registry beside it — the same set, one reach.
+        let (panes, overlays) = self.gui.visible_panes_and_overlays_mut();
+        for (idx, pane) in panes.iter().enumerate() {
             if !pane.can_loop() {
                 continue;
             }
@@ -2428,7 +2505,7 @@ impl super::App {
                 continue; // Already started (may be paused by user)
             }
             if ls.is_render_ready() {
-                ready_panes.push(idx);
+                ready_panes.push((idx, loop_start_frame(pane, overlays, wall)));
             } else {
                 not_ready_panes.push(idx);
             }
@@ -2446,7 +2523,7 @@ impl super::App {
 
         // Start the startable panes with the same instant and frame position
         let now = web_time::Instant::now();
-        for idx in ready_panes {
+        for (idx, park) in ready_panes {
             if multi
                 && not_ready_panes
                     .iter()
@@ -2458,10 +2535,18 @@ impl super::App {
             let ls = pane.transport_state_mut();
             ls.phase = rustdar_egui::pane::LoopPhase::Playing;
             ls.last_advance = Some(now);
-            // Align all panes to the last frame so they start from the same
-            // position — said as a clock rather than as an index: `Live` is
-            // "the newest there is", which is the same frame on every pane.
-            pane.set_time_mode(rustdar_egui::pane::TimeMode::Live);
+            match park {
+                // A forecast rail's newest frame is its horizon — up to 48 h
+                // ahead — so `Live` starts the loop on the wrong picture and
+                // parks the pane's clock in the future.
+                Some(index) => {
+                    pane.park_on_transport_frame(index);
+                }
+                // Align all panes to the last frame so they start from the same
+                // position — said as a clock rather than as an index: `Live` is
+                // "the newest there is", which is the same frame on every pane.
+                None => pane.set_time_mode(rustdar_egui::pane::TimeMode::Live),
+            }
         }
     }
 
@@ -2474,13 +2559,16 @@ impl super::App {
             // of — see `Gui::set_loop_speed_fps`.
             let interval = loop_interval(pane.time.speed_fps);
             let mode = pane.time.mode;
-            // The pane's time-primary layer — the topmost one animating — is
-            // whose stamps the clock walks. On a radar pane that is radar,
-            // which sits above the model in the draw order.
-            let Some(id) = pane.clock_layer().cloned() else {
-                continue;
-            };
-            let ls = pane.time_state_mut(&id);
+            // **The pane's decision, not a derivation off what happens to be
+            // running.** This read `clock_layer()` — the topmost *active*
+            // slot — every tick, so the layer whose stamps the clock walked
+            // could change underneath a running loop: a radar loop retiring
+            // mid-playback (its phase falls to `Inactive`, or another layer
+            // starts animating above it) moved the tick onto a different
+            // layer's frames without the transport ever having moved.
+            // `transport_layer()` is what the ∞ toggle armed and what the
+            // scrubber addresses, so it is the one the tick must walk.
+            let ls = pane.transport_state();
             if !ls.is_active() || !ls.is_playing() || ls.frames.is_empty() {
                 continue;
             }
@@ -2491,7 +2579,6 @@ impl super::App {
                 .unwrap_or(true);
 
             if should_advance {
-                ls.last_advance = Some(now);
                 // Skip to the next frame that has a rendered texture, and move
                 // the pane's CLOCK onto that frame's stamp rather than the
                 // playhead onto its index: the playhead is derived from the
@@ -2502,6 +2589,10 @@ impl super::App {
                     .map(|offset| (from + offset) % num_frames)
                     .find(|&candidate| ls.frames[candidate].image.is_some())
                     .map(|candidate| ls.frames[candidate].timestamp);
+                // The slot is known to exist — an absent one reads back the
+                // pane's `Inactive` orphan and was dropped above — so this
+                // cannot be the write that materialises an empty timeline.
+                pane.transport_state_mut().last_advance = Some(now);
                 if let Some(stamp) = landed {
                     pane.set_time_mode(rustdar_egui::pane::TimeMode::AsOf(stamp));
                 }
@@ -4266,6 +4357,12 @@ mod loop_supply_tests;
 #[path = "app_render/loop_overlay_render_tests.rs"]
 #[cfg(test)]
 mod loop_overlay_render_tests;
+
+/// Playback on the transport layer: the gate, the start frame, the flip and
+/// radar's unchanged tick.
+#[path = "app_render/loop_playback_transport_tests.rs"]
+#[cfg(test)]
+mod loop_playback_transport_tests;
 
 /// The cross-section loop's dispatch, placement and frame-thread pacing.
 #[path = "app_render/loop_section_tests.rs"]

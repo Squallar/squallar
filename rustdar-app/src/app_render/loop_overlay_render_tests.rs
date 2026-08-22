@@ -42,7 +42,7 @@ use rustdar_overlays::render::overlay_state::{
 /// The run every stamp in this suite belongs to. Named, because carrying it is
 /// half of what the dispatch is for: two model runs both publish a frame valid
 /// at the same instant, and a `LoopFrame` holds only the instant.
-fn run() -> chrono::NaiveDateTime {
+pub(super) fn run() -> chrono::NaiveDateTime {
     chrono::NaiveDate::from_ymd_opt(2026, 7, 25)
         .unwrap()
         .and_hms_opt(3, 0, 0)
@@ -72,7 +72,7 @@ fn bounds() -> GeoBounds {
 
 /// What the layer double was asked, in call order.
 #[derive(Default)]
-struct Asked {
+pub(super) struct Asked {
     /// One entry per `prepare_job`, holding that dispatch's `ctx.frame`.
     /// `None` is a live raster — the pane's own picture.
     prepared: Vec<Option<FrameStamp>>,
@@ -253,7 +253,9 @@ fn a_render_request() -> crate::app::fetch::OverlayRenderRequest {
 
 /// A one-pane app whose model slot is the double, with `listed` frames on
 /// offer.
-fn app_with_frames(listed: Vec<chrono::NaiveDateTime>) -> (crate::app::App, Arc<Mutex<Asked>>) {
+pub(super) fn app_with_frames(
+    listed: Vec<chrono::NaiveDateTime>,
+) -> (crate::app::App, Arc<Mutex<Asked>>) {
     let asked: Arc<Mutex<Asked>> = Default::default();
     let mut app = crate::app::tests::headless(crate::platform_double::TestBridge::desktop());
     app.gui.overlays = OverlayRegistry::with_handlers(vec![Box::new(FrameLayer {
@@ -265,7 +267,10 @@ fn app_with_frames(listed: Vec<chrono::NaiveDateTime>) -> (crate::app::App, Arc<
 
 /// Put pane 0's model layer into a loop waiting on a listing over `range`, then
 /// answer it on the one production arrival path.
-fn build_loop(app: &mut crate::app::App, range: (chrono::NaiveDateTime, chrono::NaiveDateTime)) {
+pub(super) fn build_loop(
+    app: &mut crate::app::App,
+    range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+) {
     let pane = app.gui.pane_mut(0).expect("the fixture built a pane");
     pane.set_transport_layer(known::MODEL_DATA);
     *pane.time_state_mut(&known::MODEL_DATA) = rustdar_egui::pane::LayerTimeState::begin(
@@ -290,7 +295,7 @@ fn build_loop(app: &mut crate::app::App, range: (chrono::NaiveDateTime, chrono::
 }
 
 /// The stamps the frame list ended up holding, oldest first.
-fn frame_stamps(app: &crate::app::App) -> Vec<chrono::NaiveDateTime> {
+pub(super) fn frame_stamps(app: &crate::app::App) -> Vec<chrono::NaiveDateTime> {
     app.gui
         .pane(0)
         .expect("pane 0")
@@ -356,7 +361,12 @@ fn deliver_live_raster(app: &mut crate::app::App, ctx: &egui::Context, side: usi
 }
 
 /// Deliver one finished raster for `stamp`, with a picture nothing else shares.
-fn deliver_raster(app: &mut crate::app::App, ctx: &egui::Context, stamp: FrameStamp, shade: u8) {
+pub(super) fn deliver_raster(
+    app: &mut crate::app::App,
+    ctx: &egui::Context,
+    stamp: FrameStamp,
+    shade: u8,
+) {
     let image = Arc::new(egui::ColorImage::from_rgba_unmultiplied(
         [1, 1],
         &[shade, shade, shade, 255],
