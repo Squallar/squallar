@@ -169,7 +169,7 @@ fn cape_grid() -> HrrrGridData {
             .unwrap()
             .and_hms_opt(3, 0, 0)
             .unwrap(),
-        forecast_hour: parameter.forecast_hour(),
+        forecast_hour: parameter.min_forecast_hour(),
         visible_points,
         value_range,
     }

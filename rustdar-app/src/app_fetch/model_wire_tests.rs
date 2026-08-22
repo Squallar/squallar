@@ -79,7 +79,7 @@ fn a_seedable_grid() -> rustdar_overlays::hrrr::HrrrGridData {
             .unwrap()
             .and_hms_opt(12, 0, 0)
             .unwrap(),
-        forecast_hour: parameter.forecast_hour(),
+        forecast_hour: parameter.min_forecast_hour(),
         visible_points,
         value_range,
     }
