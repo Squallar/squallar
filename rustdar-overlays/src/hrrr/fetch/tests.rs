@@ -23,6 +23,14 @@ fn records() -> Vec<IdxRecord> {
     parse_idx(SAMPLE_IDX)
 }
 
+/// A whole `.idx` sidecar as S3 serves it —
+/// `hrrr.20260820/conus/hrrr.t00z.wrfsfcf01.grib2.idx`, HTTP 200, 10 171 bytes,
+/// fetched 2026-08-21. Committed rather than fetched at test time because the
+/// bucket holds a rolling window and this file will be gone; the properties it
+/// pins (which `(var, level)` pairs repeat, and what NCEP writes in the
+/// forecast field at f01) are the ones the selection depends on.
+const F01_IDX: &str = include_str!("../../../testdata/hrrr.20260820.t00z.wrfsfcf01.grib2.idx");
+
 #[test]
 fn an_idx_line_splits_into_number_offset_var_and_level() {
     let r = records();
@@ -53,7 +61,7 @@ fn a_blank_or_malformed_idx_line_is_skipped_not_fatal() {
 
 #[test]
 fn a_byte_range_ends_one_byte_before_the_next_record() {
-    let (start, end) = byte_range(&records(), "CIN", "surface").unwrap();
+    let (start, end) = byte_range(&records(), "CIN", "surface", None).unwrap();
     assert_eq!(start, 63_976_324);
     assert_eq!(end, Some(64_861_904));
     assert_eq!(end.unwrap() - start + 1, 64_861_905 - 63_976_324);
@@ -63,7 +71,7 @@ fn a_byte_range_ends_one_byte_before_the_next_record() {
 fn a_byte_range_does_not_overlap_the_following_record() {
     let r = records();
     for pair in r.windows(2) {
-        let (_, end) = byte_range(&r, &pair[0].var, &pair[0].level).unwrap();
+        let (_, end) = byte_range(&r, &pair[0].var, &pair[0].level, None).unwrap();
         assert_eq!(
             end,
             Some(pair[1].offset - 1),
@@ -78,7 +86,7 @@ fn a_byte_range_does_not_overlap_the_following_record() {
 
 #[test]
 fn the_final_records_range_is_open_ended() {
-    let (start, end) = byte_range(&records(), "CIN", "180-0 mb above ground").unwrap();
+    let (start, end) = byte_range(&records(), "CIN", "180-0 mb above ground", None).unwrap();
     assert_eq!(start, 99_500_000);
     assert_eq!(end, None, "nothing in the index bounds the last record");
 }
@@ -88,22 +96,36 @@ fn the_final_records_range_is_open_ended() {
 #[test]
 fn a_record_is_selected_by_variable_and_level_together() {
     let r = records();
-    assert_eq!(byte_range(&r, "CIN", "surface").unwrap().0, 63_976_324);
     assert_eq!(
-        byte_range(&r, "CIN", "180-0 mb above ground").unwrap().0,
+        byte_range(&r, "CIN", "surface", None).unwrap().0,
+        63_976_324
+    );
+    assert_eq!(
+        byte_range(&r, "CIN", "180-0 mb above ground", None)
+            .unwrap()
+            .0,
         99_500_000,
     );
-    assert_eq!(byte_range(&r, "CAPE", "surface").unwrap().0, 63_110_198);
     assert_eq!(
-        byte_range(&r, "CAPE", "180-0 mb above ground").unwrap().0,
+        byte_range(&r, "CAPE", "surface", None).unwrap().0,
+        63_110_198
+    );
+    assert_eq!(
+        byte_range(&r, "CAPE", "180-0 mb above ground", None)
+            .unwrap()
+            .0,
         99_000_000,
     );
     assert_eq!(
-        byte_range(&r, "HLCY", "3000-0 m above ground").unwrap().0,
+        byte_range(&r, "HLCY", "3000-0 m above ground", None)
+            .unwrap()
+            .0,
         94_635_452,
     );
     assert_eq!(
-        byte_range(&r, "HLCY", "1000-0 m above ground").unwrap().0,
+        byte_range(&r, "HLCY", "1000-0 m above ground", None)
+            .unwrap()
+            .0,
         95_300_000,
     );
 }
@@ -111,9 +133,16 @@ fn a_record_is_selected_by_variable_and_level_together() {
 #[test]
 fn an_unmatched_variable_or_level_yields_no_range() {
     let r = records();
-    assert_eq!(byte_range(&r, "CIN", "2000-5000 m above ground"), None);
-    assert_eq!(byte_range(&r, "NOSUCH", "surface"), None);
-    assert_eq!(byte_range(&r, "CIN", "Surface"), None, "matching is exact");
+    assert_eq!(
+        byte_range(&r, "CIN", "2000-5000 m above ground", None),
+        None
+    );
+    assert_eq!(byte_range(&r, "NOSUCH", "surface", None), None);
+    assert_eq!(
+        byte_range(&r, "CIN", "Surface", None),
+        None,
+        "matching is exact"
+    );
 }
 
 /// There is no rule to infer: HRRR orders layer bounds inconsistently between
@@ -215,13 +244,72 @@ fn no_two_parameters_select_the_same_index_record() {
 fn uh_requests_a_forecast_hour_with_a_nonzero_window() {
     for param in [ModelParameter::MaxUH2to5km, ModelParameter::MaxUH0to2km] {
         assert!(
-            param.forecast_hour() > 0,
+            param.min_forecast_hour() > 0,
             "{} must not come from f00: its accumulation window there has \
                  zero length and the field is constant 0.0",
             param.display_name(),
         );
         assert!(param.is_windowed());
     }
+}
+
+/// The floor's whole job: whatever hour a caller asks for, a windowed
+/// parameter never reaches the network at f00, where its window has zero length
+/// and the field is a constant 0.0 that draws as an empty map with no error.
+#[test]
+fn a_windowed_parameter_never_requests_f00() {
+    let date = NaiveDate::from_ymd_opt(2026, 8, 20).unwrap();
+
+    // Non-vacuity floor: some parameter must actually have a non-zero floor, or
+    // "never f00" is satisfied by an empty set of windowed parameters.
+    assert!(
+        ModelParameter::all().iter().any(|p| p.is_windowed()),
+        "there must be a windowed parameter for this to be about",
+    );
+
+    for param in ModelParameter::all() {
+        for requested in 0..=48u8 {
+            let effective = effective_forecast_hour(param, requested);
+            assert!(
+                effective >= requested,
+                "{} at f{requested:02}: the floor may only raise, never lower",
+                param.display_name(),
+            );
+            assert!(effective >= param.min_forecast_hour());
+            if param.is_windowed() {
+                assert_ne!(
+                    effective,
+                    0,
+                    "{} must never be requested at f00",
+                    param.display_name(),
+                );
+            }
+        }
+        // It is a floor, not a constant: every hour above it passes through
+        // untouched, which is what makes a forecast scrub possible at all.
+        for requested in 1..=48u8 {
+            assert_eq!(
+                effective_forecast_hour(param, requested),
+                requested,
+                "{} at f{requested:02} must not be moved",
+                param.display_name(),
+            );
+        }
+    }
+
+    // And the raise reaches both things that name the hour on the wire: the
+    // object key, and the record qualifier inside it.
+    let uh = ModelParameter::MaxUH2to5km;
+    let raised = effective_forecast_hour(&uh, 0);
+    assert_eq!(raised, 1);
+    assert!(DataSources::hrrr_key(&date, 0, raised).contains("wrfsfcf01.grib2"));
+    assert_eq!(record_forecast(&uh, raised), "0-1 hour max fcst");
+    assert_eq!(
+        record_forecast(&uh, 0),
+        "0-0 day max fcst",
+        "the record the floor exists to avoid must still be nameable, or this \
+         test would be asserting that f00 does not exist",
+    );
 }
 
 #[test]
@@ -231,7 +319,7 @@ fn non_windowed_parameters_still_come_from_the_analysis() {
             continue;
         }
         assert_eq!(
-            param.forecast_hour(),
+            param.min_forecast_hour(),
             0,
             "{} is instantaneous and should come from f00",
             param.display_name(),
@@ -415,7 +503,7 @@ fn a_synthetic_lambert_message_decodes_through_the_real_parse_path() {
         "SECT3_NUM_POINTS_OFFSET must land on section 3's declared count",
     );
 
-    let grid = parse_grib2(&bytes, ModelParameter::SurfaceBasedCin)
+    let grid = parse_grib2(&bytes, ModelParameter::SurfaceBasedCin, 0)
         .expect("the synthetic message must decode end to end");
     assert_eq!((grid.ni, grid.nj), (3, 2));
     assert_eq!(grid.values.len(), SYNTHETIC_POINTS as usize);
@@ -459,7 +547,7 @@ fn a_declared_point_count_that_disagrees_with_the_grid_is_refused() {
     assert!(err.contains("7 declared"), "{err}");
     assert!(err.contains("6 computed"), "{err}");
 
-    let err = parse_grib2(&bad, ModelParameter::SurfaceBasedCin)
+    let err = parse_grib2(&bad, ModelParameter::SurfaceBasedCin, 0)
         .expect_err("parse_grib2 must refuse it too");
     assert!(err.contains("Lambert grid point count mismatch"), "{err}");
 }
@@ -467,6 +555,14 @@ fn a_declared_point_count_that_disagrees_with_the_grid_is_refused() {
 /// Four verbatim lines from `hrrr.t14z.wrfsfcf01.grib2.idx` where `(var, level)`
 /// repeats: taking record 8 where a caller wanted record 44 swaps an
 /// instantaneous field for a windowed maximum with no error.
+///
+/// **This documents the unqualified path, which is now a deliberate opt-out
+/// rather than the only behaviour available.** The two offsets below are the
+/// ones this test has always asserted and they have not moved — `None` still
+/// resolves to the lowest-numbered `(var, level)` hit, still silently. What
+/// changed is that production no longer takes it: see
+/// [`a_forecast_qualifier_selects_between_duplicate_var_level_pairs`] for the
+/// path it takes instead, over the same two repeated pairs in a real index.
 #[test]
 fn a_repeated_var_and_level_resolves_to_the_lowest_numbered_record() {
     const AMBIGUOUS: &str = "\
@@ -481,12 +577,151 @@ fn a_repeated_var_and_level_resolves_to_the_lowest_numbered_record() {
     assert_eq!(records[0].forecast, "1 hour fcst");
     assert_eq!(records[1].forecast, "0-1 hour max fcst");
 
-    let (start, _) = byte_range(&records, "REFD", "263 K level").unwrap();
+    let (start, _) = byte_range(&records, "REFD", "263 K level", None).unwrap();
     assert_eq!(start, 2_668_643, "the first match must win, i.e. record 8");
-    let (start, _) = byte_range(&records, "WEASD", "surface").unwrap();
+    let (start, _) = byte_range(&records, "WEASD", "surface", None).unwrap();
     assert_eq!(
         start, 42_378_051,
         "the first match must win, i.e. record 68"
+    );
+
+    // The half that is new: the same two pairs, qualified, reach the record the
+    // positional tie-break skipped. Without this the fix would be untested by
+    // the very fixture that motivated it.
+    let (start, _) =
+        byte_range(&records, "REFD", "263 K level", Some("0-1 hour max fcst")).unwrap();
+    assert_eq!(start, 27_615_521, "record 44, the one position 0 hid");
+    let (start, _) = byte_range(&records, "WEASD", "surface", Some("0-1 hour acc fcst")).unwrap();
+    assert_eq!(start, 58_942_796, "record 85, the one position 0 hid");
+}
+
+/// A whole real index — 170 records of `hrrr.20260820/conus/hrrr.t00z.
+/// wrfsfcf01.grib2.idx`, fetched 2026-08-21 and committed verbatim — rather
+/// than four hand-picked lines, so the selection is exercised against NCEP's
+/// actual record ordering and its actual forecast vocabulary.
+#[test]
+fn a_forecast_qualifier_selects_between_duplicate_var_level_pairs() {
+    let records = parse_idx(F01_IDX);
+    assert_eq!(records.len(), 170, "every fixture line must parse");
+
+    // Non-vacuity floor: the fixture has to *contain* the ambiguity, or every
+    // assertion below passes for the wrong reason. These are the only two pairs
+    // that repeat in this file, and each repeats exactly twice.
+    let repeats: Vec<(&str, &str)> = records
+        .iter()
+        .filter(|r| {
+            records
+                .iter()
+                .filter(|o| o.var == r.var && o.level == r.level)
+                .count()
+                > 1
+        })
+        .map(|r| (r.var.as_str(), r.level.as_str()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    assert_eq!(
+        repeats,
+        vec![("REFD", "263 K level"), ("WEASD", "surface")],
+        "the fixture must carry the duplicates this function exists to resolve",
+    );
+
+    // Every distinct qualifier resolves to a *different* record, and to the one
+    // whose number the index actually gives it.
+    for (var, level, forecast, number) in [
+        ("REFD", "263 K level", "1 hour fcst", 8),
+        ("REFD", "263 K level", "0-1 hour max fcst", 44),
+        ("WEASD", "surface", "1 hour fcst", 68),
+        ("WEASD", "surface", "0-1 hour acc fcst", 85),
+    ] {
+        let want = records
+            .iter()
+            .find(|r| r.number == number)
+            .unwrap_or_else(|| panic!("record {number} must exist in the fixture"));
+        let (start, _) = byte_range(&records, var, level, Some(forecast))
+            .unwrap_or_else(|| panic!("{var}:{level}:{forecast} must resolve"));
+        assert_eq!(
+            start, want.offset,
+            "{var}:{level}:{forecast} must land on record {number}",
+        );
+    }
+
+    // The unqualified call cannot tell those four apart: it answers the same
+    // offset for both members of each pair. This is the assertion that makes
+    // the four above mean something rather than merely agree with themselves.
+    for (var, level) in [("REFD", "263 K level"), ("WEASD", "surface")] {
+        let unqualified = byte_range(&records, var, level, None).unwrap().0;
+        let qualified: Vec<u64> = records
+            .iter()
+            .filter(|r| r.var == var && r.level == level)
+            .map(|r| {
+                byte_range(&records, var, level, Some(&r.forecast))
+                    .unwrap()
+                    .0
+            })
+            .collect();
+        assert_eq!(qualified.len(), 2);
+        assert_ne!(qualified[0], qualified[1], "{var}:{level}");
+        assert!(
+            qualified.contains(&unqualified),
+            "{var}:{level}: the unqualified answer must still be one of them",
+        );
+    }
+
+    // A qualifier that names no record refuses rather than falling back to the
+    // positional hit — a silent fallback would be the original bug wearing the
+    // new signature.
+    assert_eq!(
+        byte_range(&records, "REFD", "263 K level", Some("0-1 hour acc fcst")),
+        None,
+        "a qualifier that matches nothing must not degrade to the first hit",
+    );
+}
+
+/// The qualifier production builds, against the real index it must match. Its
+/// grammar is NCEP's, not ours, and getting it wrong fails the fetch outright
+/// now that the match is exact — so it is pinned against the file.
+#[test]
+fn the_forecast_qualifier_names_the_record_the_index_actually_carries() {
+    let records = parse_idx(F01_IDX);
+
+    for param in ModelParameter::all() {
+        let pairs = param
+            .composite_parts()
+            .unwrap_or_else(|| vec![(param.grib_var(), param.grib_level())]);
+        let forecast = record_forecast(param, 1);
+        for (var, level) in pairs {
+            let hit = records
+                .iter()
+                .find(|r| r.var == var && r.level == level && r.forecast == forecast);
+            assert!(
+                hit.is_some(),
+                "{} wants `{var}:{level}:{forecast}` at f01, which this index \
+                 does not carry; candidates: {:?}",
+                param.display_name(),
+                records
+                    .iter()
+                    .filter(|r| r.var == var && r.level == level)
+                    .map(|r| &r.forecast)
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    // The f00 wording is `day`, not `hour`, and is not derivable from the
+    // hourly form — the one place this grammar is genuinely irregular.
+    assert_eq!(record_forecast(&ModelParameter::SurfaceBasedCin, 0), "anl");
+    assert_eq!(
+        record_forecast(&ModelParameter::MaxUH2to5km, 0),
+        "0-0 day max fcst",
+    );
+    assert_eq!(
+        record_forecast(&ModelParameter::MaxUH2to5km, 18),
+        "17-18 hour max fcst",
+    );
+    assert_eq!(
+        record_forecast(&ModelParameter::SurfaceBasedCin, 18),
+        "18 hour fcst",
     );
 }
 
@@ -511,20 +746,83 @@ fn the_previous_run_rolls_back_over_midnight() {
     );
 }
 
+/// Every instant here is fixed. `latest_available_run` used to read `Utc::now()`
+/// inside itself, which left a test nothing to check the answer against except
+/// the same clock — a comparison that agrees no matter what the offset is.
+#[test]
+fn run_for_is_two_hours_behind_the_clock() {
+    let at = |y, m, d, h, min| {
+        NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(h, min, 0)
+            .unwrap()
+    };
+    let day = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).unwrap();
+
+    // Mid-day: two whole hours back, minutes discarded rather than rounded.
+    assert_eq!(run_for(at(2026, 8, 20, 14, 0)), (day(2026, 8, 20), 12));
+    assert_eq!(run_for(at(2026, 8, 20, 14, 59)), (day(2026, 8, 20), 12));
+    assert_eq!(run_for(at(2026, 8, 20, 15, 0)), (day(2026, 8, 20), 13));
+
+    // Back over midnight — the case that produces run hour 0, and so the case
+    // `previous_run`'s u8 guard exists for.
+    assert_eq!(run_for(at(2026, 8, 20, 1, 30)), (day(2026, 8, 19), 23));
+    assert_eq!(run_for(at(2026, 8, 20, 0, 0)), (day(2026, 8, 19), 22));
+    assert_eq!(run_for(at(2026, 8, 20, 2, 0)), (day(2026, 8, 20), 0));
+
+    // Back over a month boundary, and over a leap day.
+    assert_eq!(run_for(at(2026, 9, 1, 0, 15)), (day(2026, 8, 31), 22));
+    assert_eq!(run_for(at(2024, 3, 1, 1, 0)), (day(2024, 2, 29), 23));
+
+    // The property, over a full day at minute granularity rather than at the
+    // eight points above: the answer is always exactly two hours behind.
+    let start = at(2026, 8, 20, 0, 0);
+    for minutes in 0..(24 * 60) {
+        let now = start + chrono::Duration::minutes(minutes);
+        let expected = now - chrono::Duration::hours(2);
+        assert_eq!(
+            run_for(now),
+            (expected.date(), expected.time().hour() as u8),
+            "run_for({now}) must be the 2 h-old instant's date and hour",
+        );
+    }
+
+    // The wrapper must be `run_for` against the clock and nothing else. Bracket
+    // the call rather than compare against a second clock read: the two reads
+    // straddle an hour boundary once an hour otherwise, which is a flake, not a
+    // finding. `before`/`after` are at most microseconds apart, so this admits
+    // exactly one or two candidate runs and rejects any other offset.
+    let before = Utc::now().naive_utc();
+    let live = latest_available_run();
+    let after = Utc::now().naive_utc();
+    assert!(
+        live == run_for(before) || live == run_for(after),
+        "latest_available_run gave {live:?}, which is neither run_for({before}) \
+         = {:?} nor run_for({after}) = {:?}",
+        run_for(before),
+        run_for(after),
+    );
+}
+
 /// The forecast hour must reach the object key; if it does not, the UH fix
 /// silently reverts to the constant-zero f00 record.
 #[test]
 fn the_object_key_carries_the_parameters_forecast_hour() {
     let date = NaiveDate::from_ymd_opt(2026, 7, 25).unwrap();
-    let key = |p: ModelParameter| DataSources::hrrr_key(&date, 3, p.forecast_hour());
+    let key = |p: ModelParameter| DataSources::hrrr_key(&date, 3, p.min_forecast_hour());
     assert!(key(ModelParameter::MaxUH2to5km).contains("wrfsfcf01.grib2"));
     assert!(key(ModelParameter::MaxUH0to2km).contains("wrfsfcf01.grib2"));
     assert!(key(ModelParameter::SurfaceBasedCin).contains("wrfsfcf00.grib2"));
 }
 
 /// The invariant the whole selection rests on, and a property of NCEP's index
-/// rather than of rustdar's code: [`byte_range`] takes the first `(var, level)`
-/// hit, which is only safe while no requested pair repeats.
+/// rather than of rustdar's code: the `(var, level, forecast)` triple
+/// [`byte_range`] is given must name exactly one record. One match too few is a
+/// loud fetch failure; two is a silent wrong-field read.
+///
+/// Walks more than the two hours the parameters' floors sit at, because the
+/// forecast qualifier's grammar changes with the hour and f01 is the only hour
+/// the committed fixture covers.
 ///
 /// `cargo test -p rustdar-overlays -- --ignored --nocapture live_every_parameter`
 #[tokio::test]
@@ -534,7 +832,7 @@ async fn live_every_parameter_selects_exactly_one_record() {
     let sources = DataSources::production();
     let (date, hour) = latest_available_run();
 
-    for forecast_hour in [0u8, 1] {
+    for forecast_hour in [0u8, 1, 2, 6, 18] {
         let url = sources.hrrr_idx_url(&date, hour, forecast_hour);
         let text = match client
             .get(&url)
@@ -581,27 +879,31 @@ async fn live_every_parameter_selects_exactly_one_record() {
         );
 
         for param in ModelParameter::all() {
-            if param.forecast_hour() != forecast_hour {
+            // The hour the fetch would really use, so a windowed parameter is
+            // checked at f01 rather than at the f00 it can never ask for.
+            if effective_forecast_hour(param, forecast_hour) != forecast_hour {
                 continue;
             }
+            let forecast = record_forecast(param, forecast_hour);
             let pairs = param
                 .composite_parts()
                 .unwrap_or_else(|| vec![(param.grib_var(), param.grib_level())]);
             for (var, level) in pairs {
                 let matches = records
                     .iter()
-                    .filter(|r| r.var == var && r.level == level)
+                    .filter(|r| r.var == var && r.level == level && r.forecast == forecast)
                     .collect::<Vec<_>>();
                 assert_eq!(
                     matches.len(),
                     1,
-                    "{} selects {} record(s) for {var}:{level} in f{forecast_hour:02} — \
-                         byte_range takes the first, so this is a silent wrong-field read; \
-                         match on IdxRecord::forecast as well. Candidates: {:?}",
+                    "{} selects {} record(s) for {var}:{level}:{forecast} in \
+                         f{forecast_hour:02} — 0 is a fetch failure, 2 is a silent \
+                         wrong-field read. Same (var, level) at any qualifier: {:?}",
                     param.display_name(),
                     matches.len(),
-                    matches
+                    records
                         .iter()
+                        .filter(|r| r.var == var && r.level == level)
                         .map(|r| (r.number, &r.forecast))
                         .collect::<Vec<_>>(),
                 );
@@ -618,14 +920,17 @@ async fn live_every_parameter_selects_exactly_one_record() {
 async fn live_hrrr_fetches_and_decodes_from_s3() {
     let client = hrrr_client().expect("client");
     let sources = DataSources::production();
+    let run = latest_available_run();
 
+    // f00 for the instantaneous fields; the windowed one is raised to f01 by
+    // the floor rather than by this list, which is the point of the floor.
     for param in [
         ModelParameter::SurfaceBasedCape,
         ModelParameter::MixedLayerCin,
         ModelParameter::PrecipitableWater,
         ModelParameter::MaxUH2to5km,
     ] {
-        let grid = match fetch_hrrr_data(&client, &sources, &param).await.0 {
+        let grid = match fetch_hrrr_data(&client, &sources, &param, run, 0).await.0 {
             Ok(g) => g,
             Err(e) => panic!("{} fetch failed: {e}", param.display_name()),
         };
@@ -680,7 +985,10 @@ async fn live_hrrr_composite_merges_two_ranged_records() {
     let sources = DataSources::production();
     let param = ModelParameter::BulkShear6km;
 
-    let grid = match fetch_composite_hrrr_data(&client, &sources, &param).await.0 {
+    let grid = match fetch_composite_hrrr_data(&client, &sources, &param, latest_available_run(), 0)
+        .await
+        .0
+    {
         Ok(g) => g,
         Err(e) => panic!("bulk shear fetch failed: {e}"),
     };
@@ -700,22 +1008,31 @@ async fn live_parse_grib2_refuses_more_than_one_submessage() {
     let sources = DataSources::production();
     let (date, hour) = latest_available_run();
 
-    let one = match fetch_record(&client, &sources, date, hour, 0, "CIN", "surface").await {
+    let one = match fetch_record(&client, &sources, (date, hour), 0, "CIN", "surface", "anl").await
+    {
         Ok(b) => b,
         Err(_) => {
             let (prev_date, prev_hour) = previous_run(date, hour);
-            fetch_record(&client, &sources, prev_date, prev_hour, 0, "CIN", "surface")
-                .await
-                .expect("CIN fetch")
+            fetch_record(
+                &client,
+                &sources,
+                (prev_date, prev_hour),
+                0,
+                "CIN",
+                "surface",
+                "anl",
+            )
+            .await
+            .expect("CIN fetch")
         }
     };
 
-    let single = parse_grib2(&one, ModelParameter::SurfaceBasedCin);
+    let single = parse_grib2(&one, ModelParameter::SurfaceBasedCin, 0);
     assert!(single.is_ok(), "a single record must decode: {single:?}");
 
     let mut two = one.clone();
     two.extend_from_slice(&one);
-    let err = parse_grib2(&two, ModelParameter::SurfaceBasedCin)
+    let err = parse_grib2(&two, ModelParameter::SurfaceBasedCin, 0)
         .expect_err("two records must be refused, not silently truncated");
     println!("two-record error: {err}");
     assert!(
@@ -735,15 +1052,24 @@ async fn live_a_ranged_record_is_a_small_fraction_of_the_file() {
 
     // `match`, not `.or(..await)`: `Result::or` takes its argument by value, so
     // the fallback future was awaited unconditionally.
-    let bytes = match fetch_record(&client, &sources, date, hour, 0, "CIN", "surface").await {
-        Ok(b) => b,
-        Err(_) => {
-            let (prev_date, prev_hour) = previous_run(date, hour);
-            fetch_record(&client, &sources, prev_date, prev_hour, 0, "CIN", "surface")
+    let bytes =
+        match fetch_record(&client, &sources, (date, hour), 0, "CIN", "surface", "anl").await {
+            Ok(b) => b,
+            Err(_) => {
+                let (prev_date, prev_hour) = previous_run(date, hour);
+                fetch_record(
+                    &client,
+                    &sources,
+                    (prev_date, prev_hour),
+                    0,
+                    "CIN",
+                    "surface",
+                    "anl",
+                )
                 .await
                 .expect("CIN fetch")
-        }
-    };
+            }
+        };
 
     println!("surface CIN record: {} bytes", bytes.len());
     // Operational record ~1.03 MB. Bounded clear of a whole file (~130 MB).
@@ -936,12 +1262,12 @@ fn an_unwalkable_extent_is_refused_as_itself() {
 fn parse_grib2_refuses_a_domain_outside_the_validated_envelope() {
     let conus = synthetic_lambert_grib2(SYNTHETIC_POINTS);
     assert!(
-        parse_grib2(&conus, ModelParameter::SurfaceBasedCin).is_ok(),
+        parse_grib2(&conus, ModelParameter::SurfaceBasedCin, 0).is_ok(),
         "the CONUS spelling must still decode, or this test proves nothing"
     );
 
     let pacific = synthetic_lambert_grib2_at(SYNTHETIC_POINTS, 179_000_000);
-    let err = parse_grib2(&pacific, ModelParameter::SurfaceBasedCin)
+    let err = parse_grib2(&pacific, ModelParameter::SurfaceBasedCin, 0)
         .expect_err("a domain at 179 E must be refused by parse_grib2 itself");
 
     assert!(

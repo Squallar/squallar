@@ -1197,7 +1197,7 @@ fn two_panes_hold_different_hrrr_parameters_through_every_read_and_a_reopen() {
                 .unwrap()
                 .and_hms_opt(12, 0, 0)
                 .unwrap(),
-            forecast_hour: parameter.forecast_hour(),
+            forecast_hour: parameter.min_forecast_hour(),
             visible_points,
             value_range,
         }

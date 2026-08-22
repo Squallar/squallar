@@ -1,9 +1,10 @@
 //! HRRR model data fetch and types.
 //!
 //! Fields are byte-ranged out of the `noaa-hrrr-bdp-pds` S3 bucket; see
-//! [`fetch`]. Most parameters are instantaneous and come from f00 (the
-//! analysis). The updraft-helicity parameters are accumulations and cannot —
-//! see [`ModelParameter::forecast_hour`].
+//! [`fetch`]. Every parameter is published at every forecast hour the run
+//! carries, so the hour a fetch asks for is the caller's choice; a parameter
+//! only declares how low it may go. The updraft-helicity parameters cannot go
+//! to f00 — see [`ModelParameter::min_forecast_hour`].
 
 pub mod fetch;
 pub mod fields;
@@ -74,14 +75,21 @@ impl ModelParameter {
         ]
     }
 
-    /// Which forecast hour of the run to fetch this parameter from. f00, the
-    /// analysis, for every instantaneous field.
+    /// The **lowest** forecast hour of a run this parameter may be fetched
+    /// from. f00, the analysis, for every instantaneous field.
+    ///
+    /// A floor rather than a value: every parameter is published at every
+    /// forecast hour the run carries (f00-f18, or f00-f48 on 00/06/12/18Z), so
+    /// the hour is the caller's to choose and this only says how low it may go.
+    /// Callers clamp the requested hour *up* to it.
+    ///
     /// **`MXUPHL` at f00 is identically 0.0 everywhere**: it is a maximum over
     /// the forecast period, and at f00 that period has zero length. f01 is the
     /// first hour with a real window (`0-1 hour max fcst`), which is why
     /// [`HrrrGridData::forecast_hour`] reaches the UI: a 0-1 h maximum must not
-    /// be presented as the analysis.
-    pub fn forecast_hour(&self) -> u8 {
+    /// be presented as the analysis. [`Self::is_windowed`] is that reason
+    /// stated on its own, and the two must agree.
+    pub fn min_forecast_hour(&self) -> u8 {
         match self {
             ModelParameter::MaxUH2to5km | ModelParameter::MaxUH0to2km => 1,
             _ => 0,
@@ -1128,8 +1136,9 @@ pub struct HrrrGridData {
     pub nj: usize,
     pub bounds: GeoBounds,
     pub ref_time: chrono::NaiveDateTime,
-    /// Forecast hour this grid came from. 0 is the analysis; see
-    /// [`ModelParameter::forecast_hour`] for why UH is not 0.
+    /// Forecast hour this grid was fetched at — the hour the caller asked for,
+    /// clamped up to [`ModelParameter::min_forecast_hour`]. 0 is the analysis;
+    /// see that method for why UH can never read 0 here.
     pub forecast_hour: u8,
     /// How many grid points map to a non-transparent colour; computed once at
     /// parse time. See [`HrrrGridData::blank_notice`].
@@ -1234,7 +1243,7 @@ mod tests {
                 .unwrap()
                 .and_hms_opt(3, 0, 0)
                 .unwrap(),
-            forecast_hour: param.forecast_hour(),
+            forecast_hour: param.min_forecast_hour(),
             visible_points,
             value_range,
         }

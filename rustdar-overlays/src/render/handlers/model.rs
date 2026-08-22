@@ -495,13 +495,23 @@ impl OverlayHandler for ModelDataHandler {
         let client = ctx.client.clone();
         let sources = ctx.sources.clone();
         let param = self.view(pane).selected_param;
+        // The run and the forecast hour are chosen here, at the dispatch, not
+        // inside the fetch: the handler is where a scrubbed hour will come from
+        // once the layer supplies frames. Until then this is the latest run at
+        // the parameter's own floor — the behaviour the fetch used to hardcode.
+        let run = crate::hrrr::fetch::latest_available_run();
+        let f_hour = param.min_forecast_hour();
         vec![FetchTask {
             kind: known::MODEL_DATA,
             future: Box::pin(async move {
                 let result = if param.is_composite() {
-                    crate::hrrr::fetch::fetch_composite_hrrr_data(&client, &sources, &param).await
+                    crate::hrrr::fetch::fetch_composite_hrrr_data(
+                        &client, &sources, &param, run, f_hour,
+                    )
+                    .await
                 } else {
-                    crate::hrrr::fetch::fetch_hrrr_data(&client, &sources, &param).await
+                    crate::hrrr::fetch::fetch_hrrr_data(&client, &sources, &param, run, f_hour)
+                        .await
                 };
                 Box::new(result) as FetchPayload
             }),
@@ -698,7 +708,7 @@ mod tests {
                 .unwrap()
                 .and_hms_opt(RUN_HOUR, 0, 0)
                 .unwrap(),
-            forecast_hour: parameter.forecast_hour(),
+            forecast_hour: parameter.min_forecast_hour(),
             visible_points,
             value_range,
         }
@@ -855,7 +865,7 @@ mod tests {
                 .unwrap()
                 .and_hms_opt(RUN_HOUR, 0, 0)
                 .unwrap(),
-            forecast_hour: parameter.forecast_hour(),
+            forecast_hour: parameter.min_forecast_hour(),
             visible_points,
             value_range,
         };
@@ -1536,7 +1546,7 @@ mod tests {
     }
 
     /// A grid at an explicit forecast hour, so the stamp arithmetic is pinned
-    /// against a number `ModelParameter::forecast_hour` does not supply.
+    /// against a number `ModelParameter::min_forecast_hour` does not supply.
     fn grid_at_fh(parameter: ModelParameter, fh: u8) -> HrrrGridData {
         let mut g = grid(parameter, vec![10.0]);
         g.forecast_hour = fh;

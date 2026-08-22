@@ -78,35 +78,104 @@ pub fn parse_idx(text: &str) -> Vec<IdxRecord> {
 /// different levels and two `CIN`s, and `surface` appears on dozens of
 /// variables.
 ///
-/// **`(var, level)` is not unique**, and the tie-break is positional (first,
-/// i.e. lowest-numbered, match). A real `wrfsfcf01` index repeats two pairs,
-/// distinguished only by the forecast description this function ignores:
+/// **`(var, level)` is not unique.** A real index repeats it, and the repeats
+/// are distinguished only by the forecast description — an instantaneous
+/// reading against a maximum or an accumulation over the hour that ends there:
 ///
 /// ```text
 ///  8:…:REFD:263 K level:1 hour fcst:        44:…:REFD:263 K level:0-1 hour max fcst:
 /// 68:…:WEASD:surface:1 hour fcst:           85:…:WEASD:surface:0-1 hour acc fcst:
 /// ```
-pub fn byte_range(records: &[IdxRecord], var: &str, level: &str) -> Option<(u64, Option<u64>)> {
-    let idx = records
-        .iter()
-        .position(|r| r.var == var && r.level == level)?;
+///
+/// So `forecast` completes the key. `(var, level, forecast)` **is** unique:
+/// measured over f00, f01, f02, f06, f18, f24 and f48 of `hrrr.20260820` 00Z,
+/// no triple repeats in any of the seven indexes. Passing `None` keeps the old
+/// positional tie-break — the first, i.e. lowest-numbered, `(var, level)` hit —
+/// which is a wrong-field read with no error whenever the pair is one of the
+/// repeated ones, and is why production never passes `None`.
+pub fn byte_range(
+    records: &[IdxRecord],
+    var: &str,
+    level: &str,
+    forecast: Option<&str>,
+) -> Option<(u64, Option<u64>)> {
+    let idx = records.iter().position(|r| {
+        r.var == var && r.level == level && forecast.is_none_or(|want| r.forecast == want)
+    })?;
     let start = records[idx].offset;
+    // The *file's* next record, not the next matching one: the range must stop
+    // where the bytes stop, and a qualified match is still delimited by whatever
+    // physically follows it.
     let end = records.get(idx + 1).map(|next| next.offset - 1);
     Some((start, end))
+}
+
+/// The `.idx` forecast description `param`'s record carries in the `f{hour}`
+/// file — the third component of the key [`byte_range`] selects on.
+///
+/// Measured across the published range of one 00Z run (`hrrr.20260820`, f00,
+/// f01, f02, f06, f18, f24, f48), the grammar is exactly two shapes:
+///
+/// | | f00 | f`h`, h ≥ 1 |
+/// |---|---|---|
+/// | instantaneous | `anl` | `{h} hour fcst` |
+/// | windowed maximum | `0-0 day max fcst` | `{h-1}-{h} hour max fcst` |
+///
+/// Note f00's `day` rather than `hour`: the zero-length window NCEP writes for
+/// the analysis is not the same wording as the hourly ones, so it cannot be
+/// derived from the `h ≥ 1` form.
+///
+/// `max` is not a claim about aggregation in general — the same index carries
+/// `acc` (`APCP`, `WEASD`), `ave` and `min` records — it is that both windowed
+/// parameters rustdar registers are `MXUPHL` maxima. A windowed parameter with
+/// another aggregation must give this function a per-parameter word rather than
+/// loosen the match: the uniqueness of the triple is the whole point.
+pub fn record_forecast(param: &ModelParameter, forecast_hour: u8) -> String {
+    match (param.is_windowed(), forecast_hour) {
+        (false, 0) => "anl".to_string(),
+        (false, h) => format!("{h} hour fcst"),
+        (true, 0) => "0-0 day max fcst".to_string(),
+        (true, h) => format!("{}-{h} hour max fcst", h - 1),
+    }
+}
+
+/// The forecast hour a fetch will actually use: `requested`, raised to
+/// [`ModelParameter::min_forecast_hour`] if it falls below it.
+///
+/// A floor is applied here, at the one place a requested hour enters the fetch,
+/// rather than being enforced by every caller: the caller that forgets does not
+/// get an error, it gets a windowed field over a zero-length window — a grid of
+/// exactly 0.0 that draws as an empty map. Only ever raises, never lowers, so a
+/// scrub to f18 stays f18 for every parameter.
+///
+/// Its only production callers are [`fetch_hrrr_data`] and
+/// [`fetch_composite_hrrr_data`], the two doors into this module. Nothing
+/// enforces that, so a third door has to remember to apply it.
+pub fn effective_forecast_hour(param: &ModelParameter, requested: u8) -> u8 {
+    requested.max(param.min_forecast_hour())
 }
 
 // ---------------------------------------------------------------------------
 // Run selection
 // ---------------------------------------------------------------------------
 
-/// Determine the most recent HRRR run hour that should be available.
+/// The most recent HRRR run that should be published as of `now` (UTC).
 ///
 /// HRRR appears on S3 ~45-90 min after the run time. Two hours back is a safe
 /// default, and `fetch_hrrr_data` falls back another hour on failure.
-fn latest_available_run() -> (NaiveDate, u8) {
-    let now = Utc::now().naive_utc();
+///
+/// Pure, and split out of [`latest_available_run`] so the offset can be pinned
+/// at fixed instants. Reading `Utc::now()` inside the only entry point left a
+/// test no choice but to recompute the answer from the same clock, which is a
+/// check that cannot fail.
+pub fn run_for(now: NaiveDateTime) -> (NaiveDate, u8) {
     let safe_time = now - chrono::Duration::hours(2);
     (safe_time.date(), safe_time.time().hour() as u8)
+}
+
+/// [`run_for`] against the wall clock. The one place the clock is read.
+pub fn latest_available_run() -> (NaiveDate, u8) {
+    run_for(Utc::now().naive_utc())
 }
 
 /// The run one hour before this one, rolling back over midnight.
@@ -270,7 +339,16 @@ pub(crate) fn check_domain_longitude(
 }
 
 /// Parse GRIB2 bytes into `HrrrGridData`.
-fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, String> {
+///
+/// `forecast_hour` is the hour the bytes were *requested* at, not one the
+/// parameter implies: since the forecast hour became a floor rather than a
+/// value ([`ModelParameter::min_forecast_hour`]) the same parameter decodes at
+/// many hours, and `valid_time()` is `ref_time + forecast_hour`.
+fn parse_grib2(
+    bytes: &[u8],
+    param: ModelParameter,
+    forecast_hour: u8,
+) -> Result<HrrrGridData, String> {
     let grib2 = grib::from_reader(std::io::Cursor::new(bytes))
         .map_err(|e| format!("GRIB2 parse error: {e}"))?;
 
@@ -343,7 +421,7 @@ fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, Stri
         nj,
         bounds,
         ref_time,
-        forecast_hour: param.forecast_hour(),
+        forecast_hour,
         visible_points,
         value_range,
     })
@@ -354,15 +432,19 @@ fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, Stri
 // ---------------------------------------------------------------------------
 
 /// Fetch one GRIB2 record: index, locate, range-request.
+///
+/// `run` is `(date, run_hour)` in one argument rather than two so the record
+/// key stays under the argument ceiling now that `forecast` is part of it.
 async fn fetch_record(
     client: &reqwest::Client,
     sources: &DataSources,
-    date: NaiveDate,
-    run_hour: u8,
+    run: (NaiveDate, u8),
     forecast_hour: u8,
     var: &str,
     level: &str,
+    forecast: &str,
 ) -> Result<Vec<u8>, FetchError> {
+    let (date, run_hour) = run;
     let idx_url = sources.hrrr_idx_url(&date, run_hour, forecast_hour);
     // `IsRoutine`: the bucket holds a rolling window of runs and each run's
     // files land over several minutes, so a 404 here is "that run is not up
@@ -395,9 +477,12 @@ async fn fetch_record(
         )));
     }
 
-    let (start, end) = byte_range(&records, var, level).ok_or_else(|| {
+    // Named in full, `forecast` included: the qualifier is what makes the key
+    // unique, so a miss on it is the likeliest way this ever fails and the
+    // message has to say which of the three components was not found.
+    let (start, end) = byte_range(&records, var, level, Some(forecast)).ok_or_else(|| {
         FetchError::transient(format!(
-            "no `{var}:{level}` record in {idx_url} ({} records)",
+            "no `{var}:{level}:{forecast}` record in {idx_url} ({} records)",
             records.len()
         ))
     })?;
@@ -440,15 +525,22 @@ async fn fetch_record(
     Ok(bytes.to_vec())
 }
 
-/// Fetch HRRR model data for the given parameter.
+/// Fetch HRRR model data for the given parameter, from `run` at `f_hour`.
+///
+/// `f_hour` is clamped up to [`ModelParameter::min_forecast_hour`]: a windowed
+/// parameter at f00 is a maximum over a zero-length window, identically 0.0
+/// everywhere, and asking for it is always a mistake rather than a choice.
 pub async fn fetch_hrrr_data(
     client: &reqwest::Client,
     sources: &DataSources,
     param: &ModelParameter,
+    run: (NaiveDate, u8),
+    f_hour: u8,
 ) -> HrrrFetchResult {
-    let (date, hour) = latest_available_run();
+    let (date, hour) = run;
+    let f_hour = effective_forecast_hour(param, f_hour);
 
-    let first = match try_fetch(client, sources, param, date, hour).await {
+    let first = match try_fetch(client, sources, param, date, hour, f_hour).await {
         Ok(data) => return HrrrFetchResult(Ok(data)),
         Err(e) => {
             log::warn!("HRRR fetch for {date} {hour:02}z failed: {e}, trying previous hour");
@@ -456,9 +548,12 @@ pub async fn fetch_hrrr_data(
         }
     };
 
+    // The previous *run*, at the same forecast hour: the fallback trades an
+    // hour of valid time for a run that is certainly published, which is the
+    // ladder this function has always climbed.
     let (prev_date, prev_hour) = previous_run(date, hour);
 
-    match try_fetch(client, sources, param, prev_date, prev_hour).await {
+    match try_fetch(client, sources, param, prev_date, prev_hour, f_hour).await {
         Ok(data) => HrrrFetchResult(Ok(data)),
         Err(e) => {
             log::error!("HRRR fallback fetch also failed: {e}");
@@ -479,27 +574,28 @@ fn round_verdict(parts: [FetchError; 2], context: &str) -> FetchError {
     round
 }
 
-/// Attempt a single HRRR fetch for a specific run.
+/// Attempt a single HRRR fetch for a specific run and forecast hour.
 async fn try_fetch(
     client: &reqwest::Client,
     sources: &DataSources,
     param: &ModelParameter,
     date: NaiveDate,
     hour: u8,
+    f_hour: u8,
 ) -> Result<HrrrGridData, FetchError> {
     let bytes = fetch_record(
         client,
         sources,
-        date,
-        hour,
-        param.forecast_hour(),
+        (date, hour),
+        f_hour,
         param.grib_var(),
         param.grib_level(),
+        &record_forecast(param, f_hour),
     )
     .await?;
     // A decode failure is transient by the module's own rule: a truncated body
     // and a changed product encoding are indistinguishable from one sample.
-    parse_grib2(&bytes, *param).map_err(classify_parse_error)
+    parse_grib2(&bytes, *param, f_hour).map_err(classify_parse_error)
 }
 
 /// Fetch a composite HRRR parameter (e.g. bulk shear) that requires
@@ -508,15 +604,19 @@ pub async fn fetch_composite_hrrr_data(
     client: &reqwest::Client,
     sources: &DataSources,
     param: &ModelParameter,
+    run: (NaiveDate, u8),
+    f_hour: u8,
 ) -> HrrrFetchResult {
     let parts = match param.composite_parts() {
         Some(p) => p,
-        None => return fetch_hrrr_data(client, sources, param).await,
+        None => return fetch_hrrr_data(client, sources, param, run, f_hour).await,
     };
 
-    let (date, hour) = latest_available_run();
+    let (date, hour) = run;
+    let f_hour = effective_forecast_hour(param, f_hour);
 
-    let first = match try_fetch_composite(client, sources, param, &parts, date, hour).await {
+    let first = match try_fetch_composite(client, sources, param, &parts, date, hour, f_hour).await
+    {
         Ok(data) => return HrrrFetchResult(Ok(data)),
         Err(e) => {
             log::warn!(
@@ -528,7 +628,7 @@ pub async fn fetch_composite_hrrr_data(
 
     let (prev_date, prev_hour) = previous_run(date, hour);
 
-    match try_fetch_composite(client, sources, param, &parts, prev_date, prev_hour).await {
+    match try_fetch_composite(client, sources, param, &parts, prev_date, prev_hour, f_hour).await {
         Ok(data) => HrrrFetchResult(Ok(data)),
         Err(e) => {
             log::error!("HRRR composite fallback fetch also failed: {e}");
@@ -540,7 +640,7 @@ pub async fn fetch_composite_hrrr_data(
     }
 }
 
-/// Attempt a composite HRRR fetch for a specific run.
+/// Attempt a composite HRRR fetch for a specific run and forecast hour.
 async fn try_fetch_composite(
     client: &reqwest::Client,
     sources: &DataSources,
@@ -548,21 +648,15 @@ async fn try_fetch_composite(
     parts: &[(&str, &str)],
     date: NaiveDate,
     hour: u8,
+    f_hour: u8,
 ) -> Result<HrrrGridData, FetchError> {
     let mut grids: Vec<HrrrGridData> = Vec::with_capacity(parts.len());
+    let forecast = record_forecast(param, f_hour);
 
     for (var, level) in parts {
-        let bytes = fetch_record(
-            client,
-            sources,
-            date,
-            hour,
-            param.forecast_hour(),
-            var,
-            level,
-        )
-        .await?;
-        grids.push(parse_grib2(&bytes, *param).map_err(classify_parse_error)?);
+        let bytes =
+            fetch_record(client, sources, (date, hour), f_hour, var, level, &forecast).await?;
+        grids.push(parse_grib2(&bytes, *param, f_hour).map_err(classify_parse_error)?);
     }
 
     if grids.len() < 2 {
