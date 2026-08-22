@@ -118,6 +118,13 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "The same WB-7 mutation at its source: `LoopFrameModel`'s `overlay` \
          arm answering `Budgets::loop_frame_bytes()`.",
     ),
+    (
+        "rustdar-device-profile/src/budget/tests.rs",
+        "promote_on_the_2d_cap_alone",
+        "WS1 floor: drop the `max_texture_dimension_3d` conjunct from \
+         `DeviceProfile::reported_promotion`, so a software rasteriser \
+         reporting 16384 in 2D promotes on that alone. A mutation, not a test.",
+    ),
     // ── Prose that narrates a deletion ──────────────────────────────────
     (
         "rustdar-volumetric/src/volume_bridge/tests.rs",
