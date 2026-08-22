@@ -7,7 +7,7 @@ nexrad-level3/src/model/radial.rs	86	85
 nexrad-level3/src/model/symbology.rs	5	5
 rustdar-app/src/app.rs	1344	1011
 rustdar-app/src/app_chunks.rs	219	123
-rustdar-app/src/app_fetch.rs	1425	1060
+rustdar-app/src/app_fetch.rs	1425	1048
 rustdar-app/src/app_render.rs	2553	1924
 rustdar-app/src/app_state.rs	72	0
 rustdar-app/src/budget_arms.rs	17	17
