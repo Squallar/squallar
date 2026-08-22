@@ -119,7 +119,7 @@ iana-time-zone = "=0.1.65"
 flate2 = "=1.1.9"
 
 jni = "=0.22.4"
-log = "=0.4.33"
+log = "=0.4.34"
 
 pollster = "=1.0.1"
 serde = { version = "=1.0.229", features = ["derive"] }
