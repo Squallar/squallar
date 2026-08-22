@@ -36,10 +36,13 @@ rustdar-device-profile = { workspace = true }
 #
 # `std` and `wgsl` are the target-independent half and are what egui-wgpu itself
 # asks for. The backends are per target, below. There is no `webgpu` on any
-# target: `rustdar_app::app` pins `Backends::GL` on wasm32 and Firefox has
-# no stable WebGPU, so compiling that backend would only add an untested second
-# rendering path -- and, until the workspace pin was fixed, a duplicate set of
-# WebGPU bindings that broke `wasm-bindgen` outright.
+# target: `rustdar_app::app` pins `Backends::GL` on wasm32, and Firefox -- which
+# governs here -- ships stable WebGPU only on Windows (141, 2025-07-22) and macOS
+# (145 on Apple Silicon, 147 elsewhere). Linux and Android are still unshipped,
+# which is the platform this is developed and gated on, so compiling that backend
+# would only add an untested second rendering path -- and, until the workspace
+# pin was fixed, a duplicate set of WebGPU bindings that broke `wasm-bindgen`
+# outright.
 wgpu = { workspace = true, features = ["std", "wgsl"] }
 
 # `parking_lot` swaps wgpu's internal locks for parking_lot's. It only buys
