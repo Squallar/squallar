@@ -331,8 +331,11 @@ pub struct BudgetLimits {
     pub max_panes: Bracket,
     pub app_texture_ceiling_bytes: Bracket,
     /// The largest side a static plan-view raster may reach on this class,
-    /// however much the adapter offers.
-    pub raster_side_ceiling_px: usize,
+    /// however much the adapter offers. A bracket rather than one number
+    /// because a browser's class is not a `cfg`: the same wasm build runs on a
+    /// blocklisted driver and on a workstation GPU, and only the adapter's own
+    /// report separates them.
+    pub raster_side_ceiling_px: Bracket,
 }
 
 impl BudgetLimits {
@@ -375,8 +378,24 @@ impl BudgetLimits {
         render_cache_entries: Bracket::pinned(constants::NON_MOBILE_MAX_RENDER_CACHE_ENTRIES),
         quality_ceiling: QualityBracket::pinned(crate::quality::WASM_PLATFORM_CEILING),
         max_panes: Bracket::pinned(MAX_PANES_DESKTOP),
+        // Pinned, and it is the app ceiling's own arithmetic that pins it:
+        // `app_texture_bytes` here is the loop pool ceiling plus the volume
+        // loop plus six offscreens, none of which this adapter measurement
+        // speaks to, and `check_invariants` holds the ceiling within 1.25x of
+        // that sum. Raising this alone would fail that test; raising it
+        // together with a term would be raising a term nothing measured.
         app_texture_ceiling_bytes: Bracket::pinned(constants::WASM_APP_TEXTURE_BUDGET_BYTES),
-        raster_side_ceiling_px: constants::WASM_RASTER_SIDE_CEILING,
+        // **The second promotion a browser can earn.** See
+        // `WASM_RASTER_SIDE_CEILING_PROMOTED` for the four-leg adapter
+        // measurement and for why the 3D cap is the axis that separates a
+        // software rasteriser from a driver. The floor is untouched, so every
+        // adapter that does not clear `DESKTOP_CLASS_REPORT` — llvmpipe and
+        // SwiftShader both, as measured — resolves exactly what it resolved
+        // before.
+        raster_side_ceiling_px: Bracket::new(
+            constants::WASM_RASTER_SIDE_CEILING,
+            constants::WASM_RASTER_SIDE_CEILING_PROMOTED,
+        ),
     };
 
     /// The mobile bracket — native Android and iOS.
@@ -406,7 +425,7 @@ impl BudgetLimits {
         quality_ceiling: QualityBracket::pinned(crate::quality::MOBILE_PLATFORM_CEILING),
         max_panes: Bracket::pinned(MAX_PANES_MOBILE),
         app_texture_ceiling_bytes: Bracket::pinned(constants::MOBILE_APP_TEXTURE_BUDGET_BYTES),
-        raster_side_ceiling_px: constants::MOBILE_RASTER_SIDE_CEILING,
+        raster_side_ceiling_px: Bracket::pinned(constants::MOBILE_RASTER_SIDE_CEILING),
     };
 
     /// The desktop bracket.
@@ -453,7 +472,7 @@ impl BudgetLimits {
             constants::DESKTOP_APP_TEXTURE_BUDGET_BYTES,
             constants::DESKTOP_APP_TEXTURE_CEILING_BYTES,
         ),
-        raster_side_ceiling_px: constants::DESKTOP_RASTER_SIDE_CEILING,
+        raster_side_ceiling_px: Bracket::pinned(constants::DESKTOP_RASTER_SIDE_CEILING),
     };
 
     /// The bracket this build compiled.
@@ -636,6 +655,7 @@ pub fn resolve(profile: &DeviceProfile) -> Budgets {
         app_texture_ceiling_bytes: limits.app_texture_ceiling_bytes.at(promotion),
         raster_side_ceiling_px: limits
             .raster_side_ceiling_px
+            .at(promotion)
             .max(limits.long_range_image_side_px.floor),
     };
     demote(&mut budgets, limits, profile.steps_back());

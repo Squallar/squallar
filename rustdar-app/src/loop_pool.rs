@@ -129,7 +129,13 @@ impl LoopFrameModel {
             grid: rustdar_volumetric::raymarch::resident_grid_bytes(VOLUME_GRID_CELLS)
                 .unwrap_or(usize::MAX),
             overlay: nominal_overlay_frame_bytes(
-                rustdar_device_profile::budget::BudgetLimits::for_target().raster_side_ceiling_px,
+                // The floor: this is the unpromoted model, the one
+                // `the_compiled_model_is_one_of_the_named_arms` matches
+                // against the three shipped arms. A promoted device is priced
+                // through `from_budgets` off its resolved figure instead.
+                rustdar_device_profile::budget::BudgetLimits::for_target()
+                    .raster_side_ceiling_px
+                    .floor,
             ),
             render_budget: MAX_LOOP_RENDER_BUDGET,
         }

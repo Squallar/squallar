@@ -343,6 +343,17 @@ fn check_invariants(profile: &DeviceProfile, from: &str) {
         b.raster_side_ceiling_px,
         b.long_range_image_side_px,
     );
+    // And never above its own bracket. `demote` walks this one *down* past the
+    // floor to `long_range_image_side_px.floor`, so only the top is checked.
+    assert!(
+        b.raster_side_ceiling_px <= limits.raster_side_ceiling_px.ceiling,
+        "{from} / {}: a {} px raster ceiling is over the {} px the bracket \
+         allows — a ceiling above the largest texture the class can hold is \
+         every upload failing",
+        b.name,
+        b.raster_side_ceiling_px,
+        limits.raster_side_ceiling_px.ceiling,
+    );
 
     // A device is never asked for an axis it did not say it could hold, and
     // never for more cells than the budget every allocation was sized against.
@@ -728,6 +739,7 @@ fn the_mobile_bracket_promotes_nothing_until_somebody_measures_aarch64() {
     assert!(pinned(limits.offscreen_bytes));
     assert!(pinned(limits.volume_texture_bytes));
     assert!(pinned(limits.app_texture_ceiling_bytes));
+    assert!(pinned(limits.raster_side_ceiling_px));
     assert_eq!(limits.grid_cells.floor, limits.grid_cells.ceiling);
     for class in CLASSES {
         let profile = DeviceProfile {
@@ -834,5 +846,177 @@ fn no_number_of_back_offs_takes_a_machine_below_its_bracket_floor() {
                 );
             }
         }
+    }
+}
+
+/// **A browser on a real driver draws a long-range sweep at twice the side a
+/// browser on a software rasteriser does — and the software one keeps every
+/// number it had.**
+///
+/// The rows are the four legs of
+/// `.github/browser-rig/run_gpu_arm.sh --also-software`, run 2026-08-22 on one
+/// build in one invocation, each naming the adapter that answered. Nothing here
+/// is averaged across browsers or across arms: two browsers are two targets and
+/// two arms are two machines. Firefox governs, so it is first.
+///
+/// | browser | adapter | `MAX_TEXTURE_SIZE` | `MAX_3D_TEXTURE_SIZE` |
+/// |---|---|---:|---:|
+/// | Firefox 153 | llvmpipe (Mesa), Xvfb | 16384 | 2048 |
+/// | Firefox 153 | NVIDIA GeForce GTX 980, or similar | 32768 | 16384 |
+/// | Chromium 151 | SwiftShader via ANGLE | 8192 | 2048 |
+/// | Chromium 151 | RTX 3090 via ANGLE | 32768 | 16384 |
+///
+/// **The llvmpipe row is the one that earns the test.** It reports 16384 in 2D,
+/// which clears [`DESKTOP_CLASS_REPORT`]'s 2D bar outright; a rule keyed on the
+/// 2D cap alone would promote a software rasteriser. What holds it down is the
+/// 3D cap, where two unrelated rasterisers independently answer 2048. A real
+/// user reaches these figures through a blocklisted driver, not only through a
+/// CI browser.
+///
+/// **Floor — `promote_on_the_2d_cap_alone`: drop the `max_texture_dimension_3d`
+/// conjunct from `DeviceProfile::reported_promotion`.** The two software rows
+/// then resolve 4096 and the software-unchanged block goes red on the Firefox
+/// row while staying green on the Chromium one — which is why both software
+/// adapters are here and why the assertion is per row rather than over the pair.
+#[test]
+fn a_real_driver_earns_a_wider_long_range_raster_and_a_software_one_keeps_its_own() {
+    // (leg, 2D cap, 3D cap, driver-backed).
+    const MEASURED: [(&str, u32, u32, bool); 4] = [
+        ("firefox / llvmpipe, or similar (Mesa)", 16384, 2048, false),
+        (
+            "firefox / NVIDIA GeForce GTX 980, or similar",
+            32768,
+            16384,
+            true,
+        ),
+        (
+            "chromium / SwiftShader (Subzero) via ANGLE",
+            8192,
+            2048,
+            false,
+        ),
+        (
+            "chromium / NVIDIA GeForce RTX 3090 via ANGLE",
+            32768,
+            16384,
+            true,
+        ),
+    ];
+
+    // The bracket has somewhere to go. Without this the whole test passes on a
+    // pinned axis by asserting the floor against itself, four times.
+    let bracket = BudgetLimits::WASM.raster_side_ceiling_px;
+    assert!(
+        bracket.ceiling > bracket.floor,
+        "the web raster ceiling is pinned at {}, so nothing below can fail",
+        bracket.floor,
+    );
+
+    let shipped = resolve(&shipped_profile(BudgetLimits::WASM));
+    let mut hardware_sides = Vec::new();
+
+    for (leg, two_d, three_d, driver_backed) in MEASURED {
+        let profile = DeviceProfile {
+            // What wgpu reports through WebGL2 on **every** browser, driver or
+            // not: `DeviceType::Other`. It is why the adapter's own numbers are
+            // the only signal there is here.
+            class: DeviceClass::Unknown,
+            adapter: AdapterCeilings {
+                max_texture_dimension_2d: two_d,
+                max_texture_dimension_3d: three_d,
+            },
+            ..shipped_profile(BudgetLimits::WASM)
+        };
+        check_invariants(&profile, leg);
+        let b = resolve(&profile);
+        let side = b.raster_side_for_adapter(two_d);
+
+        if driver_backed {
+            assert_eq!(b.promotion, Promotion::Ceiling, "{leg}");
+            assert_eq!(
+                side,
+                crate::constants::WASM_RASTER_SIDE_CEILING_PROMOTED,
+                "{leg}: a driver reporting {two_d} px 2D and {three_d} px 3D \
+                 textures was held at the ceiling a phone browser gets",
+            );
+            hardware_sides.push(side);
+        } else {
+            assert_eq!(b.promotion, Promotion::Floor, "{leg}");
+            assert_eq!(
+                side,
+                crate::constants::WASM_RASTER_SIDE_CEILING,
+                "{leg}: a software rasteriser was handed a raster wider than \
+                 the one it renders today — this is the arm a blocklisted \
+                 driver lands a real user on",
+            );
+            // Not the raster axis alone: no field moved for this adapter.
+            assert_eq!(
+                b, shipped,
+                "{leg}: a software rasteriser resolved something other than \
+                 the shipped wasm32 configuration",
+            );
+        }
+    }
+
+    // The two outcomes are actually different numbers, said once and plainly.
+    assert_eq!(
+        hardware_sides.len(),
+        2,
+        "both hardware legs must be exercised"
+    );
+    for side in hardware_sides {
+        assert!(
+            side > shipped.raster_side_ceiling_px,
+            "the promoted side {side} is not above the {} px floor, so the \
+             promotion fires and changes nothing",
+            shipped.raster_side_ceiling_px,
+        );
+    }
+}
+
+/// **The ceiling a browser can earn is a ceiling on a *long-range* sweep, and
+/// nothing else moves.**
+///
+/// `rustdar_radar::types::raster_side_px` returns `IMAGE_SIZE.min(ceiling)` at
+/// or inside [`rustdar_radar::types::BASE_EXTENT_KM`], so promoting this axis
+/// must leave every ordinary tilt drawing exactly what it drew. That is the
+/// half of the claim that bounds the cost — a browser rasterises on one thread,
+/// and a blanket raise would be paid on every sweep rather than on the few that
+/// carry the gates for it.
+#[test]
+fn the_promoted_ceiling_is_spent_on_long_range_sweeps_and_on_nothing_else() {
+    use rustdar_radar::types::{BASE_EXTENT_KM, IMAGE_SIZE, raster_side_px};
+
+    let promoted = resolve(&DeviceProfile {
+        adapter: AdapterCeilings {
+            max_texture_dimension_2d: 32768,
+            max_texture_dimension_3d: 16384,
+        },
+        ..shipped_profile(BudgetLimits::WASM)
+    });
+    let floor = resolve(&shipped_profile(BudgetLimits::WASM));
+    let (wide, narrow) = (
+        promoted.raster_side_for_adapter(32768),
+        floor.raster_side_for_adapter(2048),
+    );
+    assert!(wide > narrow, "the arms under test are the same arm");
+
+    // A gate spacing fine enough that the data never binds first, so what is
+    // being read is the extent branch and not the Nyquist term.
+    let dense_km = 0.05;
+    for extent_km in [50.0, 150.0, BASE_EXTENT_KM] {
+        assert_eq!(
+            raster_side_px(extent_km, wide, dense_km),
+            raster_side_px(extent_km, narrow, dense_km),
+            "a {extent_km} km sweep drew differently on a promoted browser, \
+             and every sweep at or inside {BASE_EXTENT_KM} km must not",
+        );
+        assert_eq!(raster_side_px(extent_km, wide, dense_km), IMAGE_SIZE);
+    }
+    // Past the base extent it is the ceiling that binds, and there the two arms
+    // must part.
+    for extent_km in [300.0, 460.0] {
+        assert_eq!(raster_side_px(extent_km, wide, dense_km), wide);
+        assert_eq!(raster_side_px(extent_km, narrow, dense_km), narrow);
     }
 }

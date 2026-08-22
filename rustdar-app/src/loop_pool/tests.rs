@@ -937,9 +937,16 @@ mod budget_agreement {
             "a desktop integrated GPU: promoted by nothing it reports, because \
              what it reports is capacity and what holds it back is fill rate",
         );
+        // **The raster column moved from 2048 to 4096 at WS1**, and it is the
+        // only figure in this table that did. It is not a re-point: the web
+        // arm's `raster_side_ceiling_px` stopped being pinned, on the four-leg
+        // adapter measurement recorded at
+        // `constants::WASM_RASTER_SIDE_CEILING_PROMOTED`. The row below it —
+        // a browser at the WebGL2 guarantee — is unmoved, which is the half
+        // that says the software path did not come with it.
         assert_eq!(
             row(w, DeviceClass::Unknown, 16384, 16384),
-            (Promotion::Ceiling, 3_538_944, 5, 192, 2048),
+            (Promotion::Ceiling, 3_538_944, 5, 192, 4096),
             "Firefox 153 on the RTX 3090, at what it will actually allocate",
         );
         assert_eq!(
