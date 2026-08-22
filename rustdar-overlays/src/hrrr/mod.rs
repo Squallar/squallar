@@ -3,8 +3,9 @@
 //! Fields are byte-ranged out of the `noaa-hrrr-bdp-pds` S3 bucket; see
 //! [`fetch`]. Every parameter is published at every forecast hour the run
 //! carries, so the hour a fetch asks for is the caller's choice; a parameter
-//! only declares how low it may go. The updraft-helicity parameters cannot go
-//! to f00 — see [`ModelParameter::min_forecast_hour`].
+//! only declares how low it may go. The windowed maxima — updraft helicity,
+//! `MAXREF` and the −10 °C reflectivity maximum — cannot go to f00; see
+//! [`ModelParameter::min_forecast_hour`].
 
 pub mod fetch;
 pub mod fields;
@@ -51,6 +52,27 @@ pub enum ModelParameter {
 
     /// Surface Visibility (GRIB m → display mi).
     Visibility,
+
+    // ── Storm-scale fields ────────────────────────────────────────────
+    //
+    // The forecast analogues of what rustdar already draws from radar.
+    // Appended after `Visibility` so no existing parameter's `sort_order`
+    // moves: that number is the catalogue's row order rather than an identity,
+    // but a shift would reshuffle every user's field list for no reason.
+    /// Composite Reflectivity, whole column (dBZ).
+    CompositeReflectivity,
+    /// Reflectivity 1 km above ground (dBZ).
+    Reflectivity1km,
+    /// Reflectivity 4 km above ground (dBZ).
+    Reflectivity4km,
+    /// Reflectivity on the −10 °C isotherm, hourly maximum (dBZ).
+    ReflectivityM10C,
+    /// 1 km Reflectivity, hourly maximum (dBZ).
+    MaxReflectivity,
+    /// Echo Top height (GRIB m → display kft).
+    EchoTop,
+    /// Vertically Integrated Liquid (kg/m²).
+    VerticallyIntegratedLiquid,
 }
 
 impl ModelParameter {
@@ -72,6 +94,13 @@ impl ModelParameter {
             ModelParameter::Temperature2m,
             ModelParameter::Dewpoint2m,
             ModelParameter::Visibility,
+            ModelParameter::CompositeReflectivity,
+            ModelParameter::Reflectivity1km,
+            ModelParameter::Reflectivity4km,
+            ModelParameter::ReflectivityM10C,
+            ModelParameter::MaxReflectivity,
+            ModelParameter::EchoTop,
+            ModelParameter::VerticallyIntegratedLiquid,
         ]
     }
 
@@ -83,23 +112,63 @@ impl ModelParameter {
     /// the hour is the caller's to choose and this only says how low it may go.
     /// Callers clamp the requested hour *up* to it.
     ///
-    /// **`MXUPHL` at f00 is identically 0.0 everywhere**: it is a maximum over
-    /// the forecast period, and at f00 that period has zero length. f01 is the
-    /// first hour with a real window (`0-1 hour max fcst`), which is why
-    /// [`HrrrGridData::forecast_hour`] reaches the UI: a 0-1 h maximum must not
-    /// be presented as the analysis. [`Self::is_windowed`] is that reason
-    /// stated on its own, and the two must agree.
+    /// **A windowed maximum at f00 is identically 0.0 everywhere**: it is a
+    /// maximum over the forecast period, and at f00 that period has zero
+    /// length. f01 is the first hour with a real window (`0-1 hour max fcst`),
+    /// which is why [`HrrrGridData::forecast_hour`] reaches the UI: a 0-1 h
+    /// maximum must not be presented as the analysis. [`Self::is_windowed`] is
+    /// that reason stated on its own, and the two must agree —
+    /// `a_windowed_parameter_never_requests_f00` is what holds them together.
     pub fn min_forecast_hour(&self) -> u8 {
         match self {
-            ModelParameter::MaxUH2to5km | ModelParameter::MaxUH0to2km => 1,
+            ModelParameter::MaxUH2to5km
+            | ModelParameter::MaxUH0to2km
+            | ModelParameter::ReflectivityM10C
+            | ModelParameter::MaxReflectivity => 1,
             _ => 0,
         }
     }
 
+    /// Whether this parameter's record is a maximum over the hour ending at the
+    /// forecast time rather than an instantaneous reading — the third component
+    /// of the key [`fetch::byte_range`] selects on, via
+    /// [`fetch::record_forecast`].
+    ///
+    /// **`REFC`, `REFD` and `MAXREF` are not interchangeable here.** `REFD` at
+    /// `263 K level` is published *twice* in every index, once instantaneous
+    /// and once as the hourly maximum, and only this flag tells them apart;
+    /// `MAXREF` is published *only* as a maximum; and the 1 km / 4 km `REFD`
+    /// records and `REFC` are instantaneous only, so marking one of them
+    /// windowed selects no record at all rather than the wrong one.
     pub fn is_windowed(&self) -> bool {
         matches!(
             self,
-            ModelParameter::MaxUH2to5km | ModelParameter::MaxUH0to2km
+            ModelParameter::MaxUH2to5km
+                | ModelParameter::MaxUH0to2km
+                | ModelParameter::ReflectivityM10C
+                | ModelParameter::MaxReflectivity
+        )
+    }
+
+    /// Whether this parameter's colour bar is read as **bands** rather than as
+    /// a continuous ramp.
+    ///
+    /// Reflectivity is: the number a reader takes off a dBZ bar is the band's
+    /// floor, and a colour interpolated between 45 and 50 dBZ names no band.
+    /// Everything else here is a continuous quantity whose bar is a wash.
+    ///
+    /// [`Self::color_for_value`] and `fields::spec(..).scale.is_gradient` must
+    /// state the same thing — the raster paints through the former and the
+    /// legend draws the latter, so a disagreement is a legend explaining a
+    /// picture that is not on screen.
+    pub fn is_banded(&self) -> bool {
+        matches!(
+            self,
+            ModelParameter::CompositeReflectivity
+                | ModelParameter::Reflectivity1km
+                | ModelParameter::Reflectivity4km
+                | ModelParameter::ReflectivityM10C
+                | ModelParameter::MaxReflectivity
         )
     }
 
@@ -135,6 +204,13 @@ impl ModelParameter {
             ModelParameter::Temperature2m => "TMP",
             ModelParameter::Dewpoint2m => "DPT",
             ModelParameter::Visibility => "VIS",
+            ModelParameter::CompositeReflectivity => "REFC",
+            ModelParameter::Reflectivity1km
+            | ModelParameter::Reflectivity4km
+            | ModelParameter::ReflectivityM10C => "REFD",
+            ModelParameter::MaxReflectivity => "MAXREF",
+            ModelParameter::EchoTop => "RETOP",
+            ModelParameter::VerticallyIntegratedLiquid => "VIL",
             ModelParameter::BulkShear6km => {
                 panic!("BulkShear6km is composite - use composite_parts()")
             }
@@ -162,6 +238,22 @@ impl ModelParameter {
             ModelParameter::MaxUH0to2km => "2000-0 m above ground",
             ModelParameter::PrecipitableWater => "entire atmosphere (considered as a single layer)",
             ModelParameter::Temperature2m | ModelParameter::Dewpoint2m => "2 m above ground",
+            // `REFC` and `VIL` spell it `entire atmosphere` bare, where `PWAT`
+            // above spells it `entire atmosphere (considered as a single
+            // layer)`. Both are in the same index and the match is literal, so
+            // neither may be "normalised" into the other.
+            ModelParameter::CompositeReflectivity | ModelParameter::VerticallyIntegratedLiquid => {
+                "entire atmosphere"
+            }
+            ModelParameter::Reflectivity1km | ModelParameter::MaxReflectivity => {
+                "1000 m above ground"
+            }
+            ModelParameter::Reflectivity4km => "4000 m above ground",
+            // The −10 °C isotherm, named by its absolute temperature. This is
+            // the one level a rustdar parameter selects that repeats in the
+            // index, and [`Self::is_windowed`] is what picks between the two.
+            ModelParameter::ReflectivityM10C => "263 K level",
+            ModelParameter::EchoTop => "cloud top",
             ModelParameter::BulkShear6km => {
                 panic!("BulkShear6km is composite - use composite_parts()")
             }
@@ -186,6 +278,13 @@ impl ModelParameter {
             ModelParameter::Temperature2m => "2m Temperature",
             ModelParameter::Dewpoint2m => "2m Dewpoint",
             ModelParameter::Visibility => "Visibility",
+            ModelParameter::CompositeReflectivity => "Composite Reflectivity",
+            ModelParameter::Reflectivity1km => "1 km Reflectivity",
+            ModelParameter::Reflectivity4km => "4 km Reflectivity",
+            ModelParameter::ReflectivityM10C => "-10 \u{b0}C Reflectivity",
+            ModelParameter::MaxReflectivity => "Max Reflectivity",
+            ModelParameter::EchoTop => "Echo Top",
+            ModelParameter::VerticallyIntegratedLiquid => "Vertically Integrated Liquid",
         }
     }
 
@@ -207,6 +306,13 @@ impl ModelParameter {
             ModelParameter::Temperature2m => "T2m",
             ModelParameter::Dewpoint2m => "Td2m",
             ModelParameter::Visibility => "VIS",
+            ModelParameter::CompositeReflectivity => "REFC",
+            ModelParameter::Reflectivity1km => "REF1",
+            ModelParameter::Reflectivity4km => "REF4",
+            ModelParameter::ReflectivityM10C => "REF-10C",
+            ModelParameter::MaxReflectivity => "MAXREF",
+            ModelParameter::EchoTop => "ETOP",
+            ModelParameter::VerticallyIntegratedLiquid => "VIL",
         }
     }
 
@@ -226,12 +332,21 @@ impl ModelParameter {
             ModelParameter::PrecipitableWater => "in",
             ModelParameter::Temperature2m | ModelParameter::Dewpoint2m => "°F",
             ModelParameter::Visibility => "mi",
+            ModelParameter::CompositeReflectivity
+            | ModelParameter::Reflectivity1km
+            | ModelParameter::Reflectivity4km
+            | ModelParameter::ReflectivityM10C
+            | ModelParameter::MaxReflectivity => "dBZ",
+            ModelParameter::EchoTop => "kft",
+            ModelParameter::VerticallyIntegratedLiquid => "kg/m\u{b2}",
         }
     }
 
-    /// Convert a raw GRIB2 value to display units: identity for CIN/CAPE/SRH/UH,
-    /// m/s → kt, K → °F, kg/m² → in, m → mi, and K → °C for LFTX (a temperature
-    /// differential, so the number is already °C).
+    /// Convert a raw GRIB2 value to display units: identity for
+    /// CIN/CAPE/SRH/UH, for the five reflectivity fields (already dBZ) and for
+    /// VIL (already kg/m²); m/s → kt, K → °F, kg/m² → in, m → mi, m → kft for
+    /// the echo top, and K → °C for LFTX (a temperature differential, so the
+    /// number is already °C).
     pub fn convert_for_display(&self, value: f32) -> f32 {
         match self {
             ModelParameter::SurfaceBasedCin
@@ -242,7 +357,14 @@ impl ModelParameter {
             | ModelParameter::Srh1km
             | ModelParameter::Srh3km
             | ModelParameter::MaxUH2to5km
-            | ModelParameter::MaxUH0to2km => value,
+            | ModelParameter::MaxUH0to2km
+            // dBZ and kg/m² are the units the grid already carries.
+            | ModelParameter::CompositeReflectivity
+            | ModelParameter::Reflectivity1km
+            | ModelParameter::Reflectivity4km
+            | ModelParameter::ReflectivityM10C
+            | ModelParameter::MaxReflectivity
+            | ModelParameter::VerticallyIntegratedLiquid => value,
             // LFTX is a temperature *difference* so K ≡ °C.
             ModelParameter::LiftedIndex => value,
             ModelParameter::BulkShear6km | ModelParameter::SurfaceWindGust => value * 1.94384,
@@ -251,6 +373,8 @@ impl ModelParameter {
                 value * 9.0 / 5.0 - 459.67
             }
             ModelParameter::Visibility => value / 1609.344,
+            // `RETOP` is metres; a storm top is read in kilofeet.
+            ModelParameter::EchoTop => value / 304.8,
         }
     }
 
@@ -280,10 +404,17 @@ impl ModelParameter {
             | ModelParameter::BulkShear6km
             | ModelParameter::SurfaceWindGust
             | ModelParameter::Temperature2m
-            | ModelParameter::Dewpoint2m => {
+            | ModelParameter::Dewpoint2m
+            | ModelParameter::CompositeReflectivity
+            | ModelParameter::Reflectivity1km
+            | ModelParameter::Reflectivity4km
+            | ModelParameter::ReflectivityM10C
+            | ModelParameter::MaxReflectivity => {
                 format!("{:.0} {}", display, self.unit_label())
             }
-            ModelParameter::LiftedIndex => {
+            ModelParameter::LiftedIndex
+            | ModelParameter::EchoTop
+            | ModelParameter::VerticallyIntegratedLiquid => {
                 format!("{:.1} {}", display, self.unit_label())
             }
             ModelParameter::PrecipitableWater | ModelParameter::Visibility => {
@@ -294,9 +425,12 @@ impl ModelParameter {
 
     /// Map a raw GRIB2 value to an RGBA color for rendering.
     ///
-    /// The NaN guard is load-bearing: every ramp below is a descending `if`
-    /// chain ending in an unguarded `else` and NaN fails every comparison, so a
-    /// missing point would paint the *most extreme* colour on the scale.
+    /// The NaN guard is load-bearing: the eleven hand-written ramps below are
+    /// descending `if` chains ending in an unguarded `else` and NaN fails every
+    /// comparison, so a missing point would paint the *most extreme* colour on
+    /// the scale. The three storm-scale ramps walk a stop table instead and
+    /// answer transparent for a NaN on their own — a property of the walk, not
+    /// a reason to drop the guard the other eleven still need.
     pub fn color_for_value(&self, value: f32) -> [u8; 4] {
         if !value.is_finite() {
             return [0, 0, 0, 0];
@@ -318,6 +452,13 @@ impl ModelParameter {
             ModelParameter::Temperature2m => temperature_color(self.convert_for_display(value)),
             ModelParameter::Dewpoint2m => dewpoint_color(self.convert_for_display(value)),
             ModelParameter::Visibility => visibility_color(self.convert_for_display(value)),
+            ModelParameter::CompositeReflectivity
+            | ModelParameter::Reflectivity1km
+            | ModelParameter::Reflectivity4km
+            | ModelParameter::ReflectivityM10C
+            | ModelParameter::MaxReflectivity => reflectivity_color(value),
+            ModelParameter::EchoTop => echo_top_color(self.convert_for_display(value)),
+            ModelParameter::VerticallyIntegratedLiquid => vil_color(value),
         }
     }
 
@@ -354,6 +495,13 @@ impl ModelParameter {
             ModelParameter::Temperature2m => true,
             ModelParameter::Dewpoint2m => self.convert_for_display(value) >= 30.0,
             ModelParameter::Visibility => self.convert_for_display(value) <= 10.0,
+            ModelParameter::CompositeReflectivity
+            | ModelParameter::Reflectivity1km
+            | ModelParameter::Reflectivity4km
+            | ModelParameter::ReflectivityM10C
+            | ModelParameter::MaxReflectivity => value >= REFLECTIVITY_BANDS[0].0,
+            ModelParameter::EchoTop => self.convert_for_display(value) >= ECHO_TOP_STOPS[0].0,
+            ModelParameter::VerticallyIntegratedLiquid => value >= VIL_STOPS[0].0,
         }
     }
 
@@ -375,6 +523,13 @@ impl ModelParameter {
             ModelParameter::Temperature2m => "t2m",
             ModelParameter::Dewpoint2m => "td2m",
             ModelParameter::Visibility => "vis",
+            ModelParameter::CompositeReflectivity => "refc",
+            ModelParameter::Reflectivity1km => "refd1",
+            ModelParameter::Reflectivity4km => "refd4",
+            ModelParameter::ReflectivityM10C => "refdm10",
+            ModelParameter::MaxReflectivity => "maxref",
+            ModelParameter::EchoTop => "retop",
+            ModelParameter::VerticallyIntegratedLiquid => "vil",
         }
     }
 
@@ -489,6 +644,17 @@ impl ModelParameter {
                     (10.0, [144, 238, 144]),
                 ]
             }
+            // The three storm-scale bars hand back the same tables their ramps
+            // walk rather than restating them: the legend and the raster are
+            // the same picture, so a stop moved in one moves in both.
+            ModelParameter::CompositeReflectivity
+            | ModelParameter::Reflectivity1km
+            | ModelParameter::Reflectivity4km
+            | ModelParameter::ReflectivityM10C
+            | ModelParameter::MaxReflectivity => REFLECTIVITY_BANDS.to_vec(),
+            // Echo-top stops in kft (display units).
+            ModelParameter::EchoTop => ECHO_TOP_STOPS.to_vec(),
+            ModelParameter::VerticallyIntegratedLiquid => VIL_STOPS.to_vec(),
         }
     }
 }
@@ -516,6 +682,13 @@ impl std::str::FromStr for ModelParameter {
             "t2m" => ModelParameter::Temperature2m,
             "td2m" => ModelParameter::Dewpoint2m,
             "vis" => ModelParameter::Visibility,
+            "refc" => ModelParameter::CompositeReflectivity,
+            "refd1" => ModelParameter::Reflectivity1km,
+            "refd4" => ModelParameter::Reflectivity4km,
+            "refdm10" => ModelParameter::ReflectivityM10C,
+            "maxref" => ModelParameter::MaxReflectivity,
+            "retop" => ModelParameter::EchoTop,
+            "vil" => ModelParameter::VerticallyIntegratedLiquid,
             // Deliberately infallible — this parses persisted UI config — but audible.
             other => {
                 log::warn!(
@@ -527,6 +700,123 @@ impl std::str::FromStr for ModelParameter {
             }
         })
     }
+}
+
+/// The classic NWS reflectivity ladder in **5 dBZ bands**, from 5 dBZ up.
+///
+/// **Deliberately a second copy of `crate::mrms::fields::REFLECTIVITY`'s stop
+/// table rather than a reference to it.** The two are the same ladder because a
+/// reader comparing MRMS's observed mosaic against HRRR's forecast composite
+/// must read the same colour off the same dBZ — `the_two_reflectivity_ladders_
+/// agree` is what holds them equal — but the HRRR parameters resolve their
+/// *own* ramp instead of the generic one over a `LegendScale`
+/// (`render::gridded::register_model_fields` records why), so this table has to
+/// exist in a form `color_for_value` can walk.
+///
+/// **The first stop is the transparency floor.** Clear air in a forecast grid
+/// is a small positive or negative dBZ rather than a missing value, so a bar
+/// starting at 0 would paint the whole CONUS domain.
+const REFLECTIVITY_BANDS: [(f32, [u8; 3]); 15] = [
+    (5.0, [0x40, 0xe8, 0xe3]),
+    (10.0, [0x26, 0xa4, 0xfa]),
+    (15.0, [0x0a, 0x2f, 0xc0]),
+    (20.0, [0x00, 0xff, 0x00]),
+    (25.0, [0x00, 0xc8, 0x00]),
+    (30.0, [0x00, 0x90, 0x00]),
+    (35.0, [0xff, 0xff, 0x00]),
+    (40.0, [0xe7, 0xc0, 0x00]),
+    (45.0, [0xff, 0x90, 0x00]),
+    (50.0, [0xff, 0x00, 0x00]),
+    (55.0, [0xd6, 0x00, 0x00]),
+    (60.0, [0xc0, 0x00, 0x00]),
+    (65.0, [0xff, 0x00, 0xff]),
+    (70.0, [0x99, 0x55, 0xc9]),
+    (75.0, [0xff, 0xff, 0xff]),
+];
+
+/// Echo-top stops in **kft**, the unit [`ModelParameter::convert_for_display`]
+/// hands the ramp — `RETOP` itself is metres.
+///
+/// A continuous ramp and not bands: a storm top is a height, read off the bar
+/// by where it sits between two labels, and 34 kft is a different answer from
+/// 30 kft rather than a different category. 5 kft is the floor because a
+/// "cloud top" below it is fair-weather cumulus over the whole domain.
+const ECHO_TOP_STOPS: [(f32, [u8; 3]); 7] = [
+    (5.0, [0x20, 0x50, 0x90]),
+    (10.0, [0x20, 0xa0, 0xd0]),
+    (20.0, [0x00, 0xc0, 0x60]),
+    (30.0, [0xe0, 0xe0, 0x00]),
+    (40.0, [0xff, 0x90, 0x00]),
+    (50.0, [0xe0, 0x20, 0x20]),
+    (60.0, [0xff, 0x00, 0xff]),
+];
+
+/// VIL stops in **kg/m²**, the unit the grid already carries.
+///
+/// Continuous for the same reason the echo top is: liquid water content is a
+/// magnitude, and the reading that matters — the hail signature above roughly
+/// 30 — is found by watching a wash brighten, not by counting bands.
+const VIL_STOPS: [(f32, [u8; 3]); 8] = [
+    (0.5, [0x00, 0x60, 0xc0]),
+    (2.0, [0x00, 0xa0, 0xf0]),
+    (5.0, [0x00, 0xc0, 0x60]),
+    (10.0, [0xc0, 0xe0, 0x00]),
+    (20.0, [0xff, 0xd0, 0x00]),
+    (30.0, [0xff, 0x80, 0x00]),
+    (50.0, [0xe0, 0x20, 0x20]),
+    (70.0, [0xff, 0x00, 0xff]),
+];
+
+/// The band `value` falls in, flat: the colour of the highest stop at or below
+/// it, transparent below the first, and the last stop's colour above it.
+///
+/// `stops` ascends. A NaN answers `None` from the search — every `>=` is false
+/// — so this needs no separate guard, though [`ModelParameter::color_for_value`]
+/// keeps one for the ramps that do.
+fn banded_color(stops: &[(f32, [u8; 3])], value: f32) -> [u8; 4] {
+    const ALPHA: u8 = 160;
+    match stops.iter().rev().find(|&&(floor, _)| value >= floor) {
+        Some(&(_, [r, g, b])) => [r, g, b, ALPHA],
+        None => [0, 0, 0, 0],
+    }
+}
+
+/// `value` interpolated between the two stops bracketing it, transparent below
+/// the first and clamped to the last stop's colour above it.
+///
+/// `stops` ascends and has at least two entries. A NaN fails every `>=` and
+/// falls out transparent.
+fn gradient_color(stops: &[(f32, [u8; 3])], value: f32) -> [u8; 4] {
+    const ALPHA: u8 = 160;
+    let Some(k) = stops.iter().rposition(|&(floor, _)| value >= floor) else {
+        return [0, 0, 0, 0];
+    };
+    let (lo_value, lo) = stops[k];
+    let Some(&(hi_value, hi)) = stops.get(k + 1) else {
+        return [lo[0], lo[1], lo[2], ALPHA];
+    };
+    let t = ((value - lo_value) / (hi_value - lo_value)).clamp(0.0, 1.0);
+    lerp_color(
+        [lo[0], lo[1], lo[2], ALPHA],
+        [hi[0], hi[1], hi[2], ALPHA],
+        t,
+    )
+}
+
+/// Reflectivity in dBZ — the grid's own unit, so nothing converts between the
+/// value and the bar. Banded: see [`REFLECTIVITY_BANDS`].
+fn reflectivity_color(dbz: f32) -> [u8; 4] {
+    banded_color(&REFLECTIVITY_BANDS, dbz)
+}
+
+/// Echo top in kft (display units).
+fn echo_top_color(kft: f32) -> [u8; 4] {
+    gradient_color(&ECHO_TOP_STOPS, kft)
+}
+
+/// VIL in kg/m² (the grid's own unit).
+fn vil_color(kg_per_m2: f32) -> [u8; 4] {
+    gradient_color(&VIL_STOPS, kg_per_m2)
 }
 
 /// Color scale for CIN (Convective Inhibition).

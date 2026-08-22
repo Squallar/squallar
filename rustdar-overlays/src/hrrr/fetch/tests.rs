@@ -188,6 +188,33 @@ const IDX_RECORDS: &[(ModelParameter, &str, &str)] = &[
     (ModelParameter::Temperature2m, "TMP", "2 m above ground"),
     (ModelParameter::Dewpoint2m, "DPT", "2 m above ground"),
     (ModelParameter::Visibility, "VIS", "surface"),
+    (
+        ModelParameter::CompositeReflectivity,
+        "REFC",
+        "entire atmosphere",
+    ),
+    (
+        ModelParameter::Reflectivity1km,
+        "REFD",
+        "1000 m above ground",
+    ),
+    (
+        ModelParameter::Reflectivity4km,
+        "REFD",
+        "4000 m above ground",
+    ),
+    (ModelParameter::ReflectivityM10C, "REFD", "263 K level"),
+    (
+        ModelParameter::MaxReflectivity,
+        "MAXREF",
+        "1000 m above ground",
+    ),
+    (ModelParameter::EchoTop, "RETOP", "cloud top"),
+    (
+        ModelParameter::VerticallyIntegratedLiquid,
+        "VIL",
+        "entire atmosphere",
+    ),
 ];
 
 #[test]
@@ -1668,4 +1695,164 @@ fn s3_serving_counted(
         },
         served,
     )
+}
+
+/// The delegated walk in
+/// [`the_forecast_qualifier_names_the_record_the_index_actually_carries`] proves
+/// every parameter finds **a** record. It cannot prove no two find the **same**
+/// one, and that is the mutation with no symptom: swap `grib_level` between
+/// `Reflectivity1km` and `Reflectivity4km` and both still resolve, so every pane
+/// labelled "1 km Reflectivity" draws the 4 km field for ever.
+///
+/// So this resolves the whole roster the way production does — parameter →
+/// [`record_forecast`] → [`byte_range`] — and asserts the offsets that come back
+/// are pairwise distinct.
+#[test]
+fn every_parameter_resolves_to_its_own_record() {
+    let records = parse_idx(F01_IDX);
+    assert_eq!(records.len(), 170, "every fixture line must parse");
+    let fixture_offsets: std::collections::HashSet<u64> =
+        records.iter().map(|r| r.offset).collect();
+
+    // One row per record selected. The composite parameter selects two, which
+    // is why this is not a map keyed by parameter.
+    let mut rows: Vec<(ModelParameter, &'static str, &'static str, u64)> = Vec::new();
+    for param in ModelParameter::all() {
+        let parts = param
+            .composite_parts()
+            .unwrap_or_else(|| vec![(param.grib_var(), param.grib_level())]);
+        let forecast = record_forecast(param, 1);
+        for (var, level) in parts {
+            let (start, _) =
+                byte_range(&records, var, level, Some(&forecast)).unwrap_or_else(|| {
+                    panic!(
+                        "{} wants `{var}:{level}:{forecast}` at f01, which this \
+                         index does not carry",
+                        param.display_name(),
+                    )
+                });
+            rows.push((*param, var, level, start));
+        }
+    }
+
+    // Floor, first half: the walk really covered every parameter. Without it,
+    // "pairwise distinct" is satisfied by resolving one.
+    let covered: std::collections::HashSet<ModelParameter> = rows.iter().map(|r| r.0).collect();
+    assert_eq!(
+        covered.len(),
+        ModelParameter::all().len(),
+        "the walk resolved {} of {} parameters",
+        covered.len(),
+        ModelParameter::all().len(),
+    );
+
+    // Floor, second half: every offset asserted below is one the committed
+    // fixture actually carries, rather than a number this test invented.
+    for &(param, var, level, offset) in &rows {
+        assert!(
+            fixture_offsets.contains(&offset),
+            "{} resolved `{var}:{level}` to offset {offset}, which is in no \
+             record of the fixture",
+            param.display_name(),
+        );
+    }
+
+    // The property the delegated walk cannot see.
+    let mut seen: std::collections::HashMap<u64, (ModelParameter, &str, &str)> =
+        std::collections::HashMap::new();
+    for &(param, var, level, offset) in &rows {
+        if let Some((other, other_var, other_level)) = seen.insert(offset, (param, var, level)) {
+            panic!(
+                "{} (`{var}:{level}`) and {} (`{other_var}:{other_level}`) both \
+                 resolve to offset {offset}: one of them is drawing the other's \
+                 field under its own label",
+                param.display_name(),
+                other.display_name(),
+            );
+        }
+    }
+
+    // The seven storm-scale fields against the offsets this index gives them.
+    // A swapped level moves these numbers even where it leaves the walk green.
+    for (param, want) in [
+        (ModelParameter::CompositeReflectivity, 0u64),
+        (ModelParameter::Reflectivity1km, 2_206_555),
+        (ModelParameter::Reflectivity4km, 2_360_908),
+        (ModelParameter::ReflectivityM10C, 28_180_670),
+        (ModelParameter::MaxReflectivity, 28_022_373),
+        (ModelParameter::EchoTop, 256_089),
+        (ModelParameter::VerticallyIntegratedLiquid, 666_199),
+    ] {
+        let got = rows
+            .iter()
+            .find(|r| r.0 == param)
+            .unwrap_or_else(|| panic!("{} was not walked", param.display_name()))
+            .3;
+        assert_eq!(
+            got,
+            want,
+            "{} resolved to offset {got}, not {want}",
+            param.display_name(),
+        );
+    }
+}
+
+/// `REFD:263 K level` is published twice in every index and the two records are
+/// a different picture: an instantaneous −10 °C reflectivity against the maximum
+/// over the hour. [`ModelParameter::is_windowed`] is the only thing that picks.
+///
+/// **Routed through the parameter on purpose.**
+/// [`a_forecast_qualifier_selects_between_duplicate_var_level_pairs`] already
+/// pins record 44 at the [`byte_range`] level with its own floor; restating that
+/// here would be a copy of a green test that passes whether or not
+/// `ReflectivityM10C` exists.
+#[test]
+fn the_windowed_reflectivity_parameter_reaches_the_maximum_record() {
+    let records = parse_idx(F01_IDX);
+    let p = ModelParameter::ReflectivityM10C;
+    assert!(p.is_windowed());
+
+    let forecast = record_forecast(&p, 1);
+    assert_eq!(forecast, "0-1 hour max fcst");
+    let (start, _) = byte_range(&records, p.grib_var(), p.grib_level(), Some(&forecast))
+        .expect("the windowed −10 °C reflectivity must resolve");
+    assert_eq!(start, 28_180_670, "record 44, the hourly maximum");
+
+    // The twin it must not be. Same (var, level), other qualifier, different
+    // record — so the assertion above is about the qualifier and not about
+    // `REFD:263 K level` having only one home.
+    let (instant, _) = byte_range(&records, p.grib_var(), p.grib_level(), Some("1 hour fcst"))
+        .expect("the instantaneous record must also exist");
+    assert_eq!(instant, 2_503_813, "record 8");
+    assert_ne!(start, instant);
+
+    // Floor: the qualifier a *windowed* `Reflectivity1km` would ask for names
+    // no record at all. That is what makes "mark everything windowed" a red
+    // test rather than a silently wider net.
+    let one_km = ModelParameter::Reflectivity1km;
+    assert!(!one_km.is_windowed());
+    let if_windowed = record_forecast(&ModelParameter::MaxReflectivity, 1);
+    assert_eq!(
+        if_windowed, forecast,
+        "the mutation's qualifier, not a new one"
+    );
+    assert_eq!(
+        byte_range(
+            &records,
+            one_km.grib_var(),
+            one_km.grib_level(),
+            Some(&if_windowed),
+        ),
+        None,
+        "`REFD:1000 m above ground` has no hourly-maximum record",
+    );
+
+    // And why `MaxReflectivity` needs no arm of its own here: `MAXREF` is
+    // published only as a maximum, so the delegated walk already covers it.
+    let maxref: Vec<&str> = records
+        .iter()
+        .filter(|r| r.var == "MAXREF")
+        .map(|r| r.forecast.as_str())
+        .collect();
+    assert_eq!(maxref, vec!["0-1 hour max fcst"], "MAXREF's only record");
 }
