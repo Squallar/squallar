@@ -33,6 +33,7 @@ use crate::spc::firewx::{
 };
 use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
+use rustdar_source::time::TimeAxis;
 
 /// One published file: a day, a hazard, and which of that hazard's two forms.
 /// Days 1-2 publish only the categorical form, so the third member is constant
@@ -426,12 +427,25 @@ impl SpcFireOutlookHandler {
 
     /// Every enabled file's features, concatenated in the order they will be
     /// painted.
-    fn features_in_paint_order(&self, view: &FirePaneState) -> Vec<crate::types::OverlayFeature> {
+    /// Every selected file's features, in paint order — for the files whose
+    /// issuance is **in force at `as_of`** (WB-5, [`TimeAxis::EventLifetime`]):
+    /// the same two-`Option` window filter as the convective handler, against
+    /// `valid`/`expire` parsed once at fetch, a missing side passing.
+    fn features_in_paint_order(
+        &self,
+        view: &FirePaneState,
+        as_of: chrono::NaiveDateTime,
+    ) -> Vec<crate::types::OverlayFeature> {
         let mut scope = Vec::new();
         view.extend_scope(&mut scope);
         let mut features = Vec::new();
         for key in scope {
             if let Some(outlook) = self.state.data.get(&key) {
+                if !(outlook.valid.is_none_or(|valid| valid <= as_of)
+                    && outlook.expire.is_none_or(|expire| as_of < expire))
+                {
+                    continue;
+                }
                 features.extend(outlook.features.iter().cloned());
             }
         }
@@ -443,7 +457,7 @@ impl SpcFireOutlookHandler {
         ctx: &RasterizeContext,
         view: &FirePaneState,
     ) -> Option<rasterize::OutlooksInput> {
-        let features = self.features_in_paint_order(view);
+        let features = self.features_in_paint_order(view, ctx.as_of);
         if features.is_empty() {
             return None;
         }
@@ -549,6 +563,21 @@ impl OverlayHandler for SpcFireOutlookHandler {
 
     fn render_mode(&self) -> RenderMode {
         RenderMode::Texture
+    }
+
+    /// A fire outlook is an issuance with a validity window, and the picture
+    /// at `as_of` is which held issuances are in force then (WB-5) — filtered
+    /// in [`Self::features_in_paint_order`], the same arm as the convective
+    /// handler.
+    ///
+    /// Only the **current** issuance is ever held, and here that is the whole
+    /// story: SPC publishes **no fire-weather GeoJSON archive** (probed
+    /// 2026-08-22 — 404 under `products/fire_wx/{year}/...`,
+    /// `products/fire_wx/archive/...` and `products/exper/fire_wx/archive/...`),
+    /// so a scrubbed instant outside the held windows draws nothing and no
+    /// archive fetch can exist to fill it.
+    fn time_axis(&self) -> TimeAxis {
+        TimeAxis::EventLifetime
     }
 
     /// **False, and it is a fact rather than an omission.** The only
@@ -1538,7 +1567,7 @@ mod tests {
         }
 
         let order: Vec<String> = handler
-            .features_in_paint_order(&handler.defaults)
+            .features_in_paint_order(&handler.defaults, chrono::Utc::now().naive_utc())
             .into_iter()
             .map(|f| f.label)
             .collect();
@@ -1867,5 +1896,117 @@ mod tests {
             .expect("the fire layer's own state type");
         assert_eq!(off.selected_day, FireDay::Day6);
         assert!(off.enabled_hazards.is_empty());
+    }
+
+    // ── The as-of window (WB-5) ───────────────────────────────────────────
+
+    fn at(d: u32, h: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 8, d)
+            .unwrap()
+            .and_hms_opt(h, 0, 0)
+            .unwrap()
+    }
+
+    fn paint_ctx(as_of: chrono::NaiveDateTime) -> RasterizeContext {
+        RasterizeContext {
+            is_dark: false,
+            zoom: 6.0,
+            device_scale: 1.0,
+            now: as_of,
+            as_of,
+            frame: None,
+        }
+    }
+
+    /// A Day-1 handler holding one issuance of the day's first file, with the
+    /// given window.
+    fn day1_with_window(
+        valid: Option<chrono::NaiveDateTime>,
+        expire: Option<chrono::NaiveDateTime>,
+    ) -> SpcFireOutlookHandler {
+        let mut handler = SpcFireOutlookHandler::new();
+        handler.defaults = FirePaneState::new(true);
+        let &(hazard, product) = products_for(FireDay::Day1)
+            .first()
+            .expect("day 1 publishes at least one file");
+        let feature = crate::types::OverlayFeature {
+            polygons: vec![vec![vec![(35.0, -102.0), (35.5, -102.0), (35.5, -101.5)]]],
+            fill_rgba: [255, 120, 0, 80],
+            stroke_rgba: [255, 120, 0, 255],
+            label: "ELEV".into(),
+            label2: String::new(),
+            hatch: crate::types::HatchPattern::None,
+            geo_bounds: None,
+        };
+        handler.state.data.insert(
+            (FireDay::Day1, hazard, product),
+            SpcFireOutlook {
+                day: FireDay::Day1,
+                hazard,
+                product,
+                valid,
+                expire,
+                features: vec![feature],
+            },
+        );
+        handler
+    }
+
+    fn labels_at(handler: &SpcFireOutlookHandler, as_of: chrono::NaiveDateTime) -> Vec<String> {
+        handler
+            .paint_input(&paint_ctx(as_of), &handler.defaults)
+            .map(|input| input.features.into_iter().map(|f| f.label).collect())
+            .unwrap_or_default()
+    }
+
+    /// **The WB-5 floor for the fire layer.** The same 0/1/0/0 walk as the
+    /// convective handler's — and since there is NO fire-weather GeoJSON
+    /// archive (probed 2026-08-22, 404 on every candidate prefix), the two
+    /// empty readings outside the held window are the whole truth of a
+    /// scrubbed pane there, not a gap an archive fetch will later fill.
+    #[test]
+    fn a_fire_outlook_draws_only_while_its_issuance_is_in_force() {
+        let handler = day1_with_window(Some(at(22, 12)), Some(at(23, 12)));
+
+        assert_eq!(
+            labels_at(&handler, at(22, 11)),
+            Vec::<String>::new(),
+            "before `valid` the issuance is not yet in force",
+        );
+        assert_eq!(
+            labels_at(&handler, at(22, 20)),
+            vec!["ELEV".to_owned()],
+            "inside the window it draws",
+        );
+        assert_eq!(
+            labels_at(&handler, at(23, 18)),
+            Vec::<String>::new(),
+            "an instant past the window draws nothing - there is no archive \
+             to reach for, and a lapsed issuance must not stand in",
+        );
+    }
+
+    /// **The cross-cutting non-triviality: a LIVE pane is byte-identical** —
+    /// same statement as the convective handler's, over this handler's own
+    /// paint input.
+    #[test]
+    fn a_live_pane_paints_the_unwindowed_picture() {
+        let now = chrono::Utc::now().naive_utc();
+        let windowed = day1_with_window(
+            Some(now - chrono::Duration::hours(6)),
+            Some(now + chrono::Duration::hours(6)),
+        );
+        let unwindowed = day1_with_window(None, None);
+        let live = windowed.paint_input(&paint_ctx(now), &windowed.defaults);
+        assert!(
+            live.as_ref()
+                .is_some_and(|input| !input.features.is_empty()),
+            "non-triviality floor: the live picture has features in it",
+        );
+        assert_eq!(
+            live,
+            unwindowed.paint_input(&paint_ctx(now), &unwindowed.defaults),
+            "the as-of window leaked into the live pane's paint input",
+        );
     }
 }

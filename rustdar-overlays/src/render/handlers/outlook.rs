@@ -16,6 +16,7 @@ use crate::render::rasterize;
 use crate::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
 use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
+use rustdar_source::time::TimeAxis;
 
 pub struct SpcOutlookFetchResult {
     pub day: OutlookDay,
@@ -404,10 +405,18 @@ impl SpcOutlookHandler {
     }
 
     /// Every enabled product's features, concatenated in the order they will be
-    /// painted.
+    /// painted — for the products whose issuance is **in force at `as_of`**.
+    ///
+    /// The as-of filter (WB-5, [`TimeAxis::EventLifetime`]): two `Option`
+    /// comparisons against `valid`/`expire`, parsed once at fetch. A side
+    /// that did not parse passes on that side — an issuance is never dropped
+    /// for want of a readable time (the `NwsAlert` rule). The `expire` half
+    /// is what keeps a later instant from wearing an outlook that has lapsed;
+    /// a `valid`-only filter would draw every held issuance forever forward.
     fn features_in_paint_order(
         &self,
         view: &OutlookPaneState,
+        as_of: chrono::NaiveDateTime,
     ) -> Vec<crate::types::OverlayFeature> {
         let day = view.selected_day;
         let mut features = Vec::new();
@@ -416,6 +425,11 @@ impl SpcOutlookHandler {
                 continue;
             }
             if let Some(outlook) = self.state.data.get(&(day, product)) {
+                if !(outlook.valid.is_none_or(|valid| valid <= as_of)
+                    && outlook.expire.is_none_or(|expire| as_of < expire))
+                {
+                    continue;
+                }
                 features.extend(outlook.features.iter().cloned());
             }
         }
@@ -427,7 +441,7 @@ impl SpcOutlookHandler {
         ctx: &RasterizeContext,
         view: &OutlookPaneState,
     ) -> Option<rasterize::OutlooksInput> {
-        let features = self.features_in_paint_order(view);
+        let features = self.features_in_paint_order(view, ctx.as_of);
         if features.is_empty() {
             return None;
         }
@@ -490,6 +504,24 @@ impl OverlayHandler for SpcOutlookHandler {
 
     fn render_mode(&self) -> RenderMode {
         RenderMode::Texture
+    }
+
+    /// An outlook is an issuance with a validity window (`valid`/`expire`,
+    /// parsed at fetch), and the picture at `as_of` is which held issuances
+    /// are in force then (WB-5) — filtered in
+    /// [`Self::features_in_paint_order`]. Under this arm the day-1/2/3
+    /// selector reads as a *horizon* control: the clock, not the dropdown,
+    /// decides whether the selected day's issuance is in force at the
+    /// depicted instant.
+    ///
+    /// Only the **current** issuance per product is held. SPC's convective
+    /// GeoJSON archive is real
+    /// (`products/outlook/archive/{year}/day1otlk_{date}_{time}_{product}.lyr.geojson`),
+    /// so a fetch-follows-clock supply in the GLM shape is possible — it is
+    /// not wired yet, and a scrubbed instant outside the held windows draws
+    /// nothing rather than guessing.
+    fn time_axis(&self) -> TimeAxis {
+        TimeAxis::EventLifetime
     }
 
     fn theme_sensitive(&self) -> bool {
@@ -1195,7 +1227,7 @@ mod tests {
         }
 
         let order: Vec<String> = handler
-            .features_in_paint_order(&handler.defaults)
+            .features_in_paint_order(&handler.defaults, chrono::Utc::now().naive_utc())
             .into_iter()
             .map(|f| f.label)
             .collect();
@@ -1968,6 +2000,119 @@ mod tests {
             h.state.retry.failures() > 0,
             "the layer came off the retry ledger while pane 1's selection was \
              still failing",
+        );
+    }
+
+    // ── The as-of window (WB-5) ───────────────────────────────────────────
+
+    fn at(d: u32, h: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 8, d)
+            .unwrap()
+            .and_hms_opt(h, 0, 0)
+            .unwrap()
+    }
+
+    fn paint_ctx(as_of: chrono::NaiveDateTime) -> RasterizeContext {
+        RasterizeContext {
+            is_dark: false,
+            zoom: 6.0,
+            device_scale: 1.0,
+            now: as_of,
+            as_of,
+            frame: None,
+        }
+    }
+
+    /// A Day-1 categorical handler holding one issuance with the given window.
+    fn day1_with_window(
+        valid: Option<chrono::NaiveDateTime>,
+        expire: Option<chrono::NaiveDateTime>,
+    ) -> SpcOutlookHandler {
+        let mut handler = SpcOutlookHandler::new();
+        handler.defaults = OutlookPaneState::new(true);
+        let feature = crate::types::OverlayFeature {
+            polygons: vec![vec![vec![(35.0, -97.0), (35.5, -97.0), (35.5, -96.5)]]],
+            fill_rgba: [255, 0, 0, 80],
+            stroke_rgba: [255, 0, 0, 255],
+            label: "SLGT".into(),
+            label2: String::new(),
+            hatch: crate::types::HatchPattern::None,
+            geo_bounds: None,
+        };
+        handler.state.data.insert(
+            (OutlookDay::Day1, OutlookProduct::Categorical),
+            SpcOutlook {
+                day: OutlookDay::Day1,
+                product: OutlookProduct::Categorical,
+                valid,
+                expire,
+                features: vec![feature],
+            },
+        );
+        handler
+    }
+
+    fn labels_at(handler: &SpcOutlookHandler, as_of: chrono::NaiveDateTime) -> Vec<String> {
+        handler
+            .paint_input(&paint_ctx(as_of), &handler.defaults)
+            .map(|input| input.features.into_iter().map(|f| f.label).collect())
+            .unwrap_or_default()
+    }
+
+    /// **The WB-5 floor, both halves.** An issuance valid 13Z->12Z draws at
+    /// no instant before its `valid`, at every instant inside the window, and
+    /// at no instant from `expire` on. The last reading — a LATER instant —
+    /// is the half a `valid`-only filter passes: dropping the `expire`
+    /// comparison keeps 18Z green and turns both day-2 readings red.
+    #[test]
+    fn an_outlook_draws_only_while_its_issuance_is_in_force() {
+        let handler = day1_with_window(Some(at(22, 13)), Some(at(23, 12)));
+
+        assert_eq!(
+            labels_at(&handler, at(22, 11)),
+            Vec::<String>::new(),
+            "before `valid` the issuance is not yet in force",
+        );
+        assert_eq!(
+            labels_at(&handler, at(22, 18)),
+            vec!["SLGT".to_owned()],
+            "inside the window it draws",
+        );
+        assert_eq!(
+            labels_at(&handler, at(23, 12)),
+            Vec::<String>::new(),
+            "`expire` is exclusive: the expiry instant is the first without it",
+        );
+        assert_eq!(
+            labels_at(&handler, at(23, 18)),
+            Vec::<String>::new(),
+            "an instant PAST the window must not wear a lapsed outlook - the \
+             reading a valid-only filter gets wrong",
+        );
+    }
+
+    /// **The cross-cutting non-triviality: a LIVE pane is byte-identical.**
+    /// At the live instant, an issuance whose window contains now paints the
+    /// same input as one with no parsed window at all — which is the
+    /// pre-WB-5 picture, since the fields were previously popup-only.
+    #[test]
+    fn a_live_pane_paints_the_unwindowed_picture() {
+        let now = chrono::Utc::now().naive_utc();
+        let windowed = day1_with_window(
+            Some(now - chrono::Duration::hours(6)),
+            Some(now + chrono::Duration::hours(6)),
+        );
+        let unwindowed = day1_with_window(None, None);
+        let live = windowed.paint_input(&paint_ctx(now), &windowed.defaults);
+        assert!(
+            live.as_ref()
+                .is_some_and(|input| !input.features.is_empty()),
+            "non-triviality floor: the live picture has features in it",
+        );
+        assert_eq!(
+            live,
+            unwindowed.paint_input(&paint_ctx(now), &unwindowed.defaults),
+            "the as-of window leaked into the live pane's paint input",
         );
     }
 }

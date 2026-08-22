@@ -32,7 +32,10 @@ pub const WIRE_FRAMING_ROWS: &[&str] = &[
     "overlay/alerts | 763 | 0x9a307969466bc79a",
     "overlay/outlooks | 560 | 0x01fc75ae56a219d4",
     "overlay/discussions | 267 | 0x6a6da1ea1f7fc09c",
-    "overlay/reports | 130 | 0x8baff87efe9934bf",
+    // Re-pinned at WB-2: `ReportsInput` gained `as_of` and per-row `valid`,
+    // the depicted instant and each report's own — the storm-reports as-of
+    // cull rides the wire.
+    "overlay/reports | 200 | 0x8b8cebdb5011dbc0",
     "overlay/glm | 243 | 0xf628cffc30d313df",
     "overlay/model | 265 | 0x01f0be29a2ccb24f",
 ];

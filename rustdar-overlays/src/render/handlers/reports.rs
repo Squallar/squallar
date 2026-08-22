@@ -17,6 +17,7 @@ use crate::render::rasterize;
 use crate::spc::reports::{StormReport, StormReportKind, StormReportRound};
 use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
+use rustdar_source::time::TimeAxis;
 
 // `pub`, not `pub(crate)`: the described-job dispatch tests in `rustdar-app`
 // and the hit-map zip tests in `rustdar-worker` construct this payload type.
@@ -155,6 +156,10 @@ impl StormReportsHandler {
             return None;
         }
         Some(rasterize::ReportsInput {
+            // **Every row travels, even one later than `as_of`** — the as-of
+            // cull is the rasterizer's, because a row's position is its
+            // hit-map id. Filtering here would desynchronize the map from
+            // [`Self::hit_items`], which has no instant to filter by.
             reports: self
                 .state
                 .data
@@ -163,11 +168,15 @@ impl StormReportsHandler {
                     kind: i.report.kind,
                     lat: i.report.lat,
                     lon: i.report.lon,
+                    valid: i.report.valid,
                 })
                 .collect(),
             zoom: ctx.zoom,
             is_dark: ctx.is_dark,
             device_scale: ctx.device_scale,
+            // The **depicted** instant, which on a live pane is the wall
+            // clock — the same field GLM sends as `now`.
+            as_of: ctx.as_of,
         })
     }
 }
@@ -189,6 +198,19 @@ impl OverlayHandler for StormReportsHandler {
 
     fn render_mode(&self) -> RenderMode {
         RenderMode::Texture
+    }
+
+    /// A report is a point event with an instant (WB-2): the picture at
+    /// `as_of` is which of today's reports have **already happened**, so a
+    /// scrubbed pane shows the reports that existed then and none from later
+    /// in the day. The filter itself rides the wire and runs in the
+    /// rasterizer ([`rasterize::rasterize_storm_reports`]), where rows and
+    /// hit-map ids are minted together — see the cull's own comment for why
+    /// it cannot live in [`Self::paint_input`]. No archive fetch: the whole
+    /// convective day is already in memory, so scrubbing within it needs
+    /// nothing from the network.
+    fn time_axis(&self) -> TimeAxis {
+        TimeAxis::EventLifetime
     }
 
     /// `is_dark` rides into the described job (`StormReportsInput`) and picks
@@ -338,7 +360,14 @@ impl OverlayHandler for StormReportsHandler {
         vec![FetchTask {
             kind: known::STORM_REPORTS,
             future: Box::pin(async move {
-                let result = crate::spc::reports::fetch_storm_reports(&client, &sources).await;
+                // The anchor is the WALL CLOCK, never `ctx.as_of`: the file
+                // fetched is always the current `today_*.csv`, and only the
+                // present says which convective day that file is. A scrubbed
+                // pane's `as_of` crossing 12Z would re-date every row of a
+                // file that has not changed.
+                let anchor = chrono::Utc::now().naive_utc();
+                let result =
+                    crate::spc::reports::fetch_storm_reports(&client, &sources, anchor).await;
                 Box::new(StormReportsFetchResult(result)) as FetchPayload
             }),
         }]
@@ -444,6 +473,7 @@ mod tests {
             report: StormReport {
                 kind: StormReportKind::Hail,
                 time: "2015".into(),
+                valid: None,
                 // 175 hundredths — golf ball, the SPC feed's own encoding.
                 magnitude: Some(175.0),
                 location: "NORMAN".into(),
@@ -493,6 +523,7 @@ mod tests {
                     report: StormReport {
                         kind: StormReportKind::Tornado,
                         time: time.into(),
+                        valid: None,
                         magnitude: None,
                         location: "NORMAN".into(),
                         county: "CLEVELAND".into(),
@@ -529,6 +560,7 @@ mod tests {
             report: StormReport {
                 kind: StormReportKind::Tornado,
                 time: "2015".into(),
+                valid: None,
                 magnitude: None,
                 location: "NORMAN".into(),
                 county: "CLEVELAND".into(),
@@ -613,7 +645,11 @@ mod round_tests {
             .build()
             .expect("test runtime");
         let sources = spc_serving(responses);
-        let result = runtime.block_on(fetch_storm_reports(&client, &sources));
+        let result = runtime.block_on(fetch_storm_reports(
+            &client,
+            &sources,
+            chrono::Utc::now().naive_utc(),
+        ));
 
         let kind = known::STORM_REPORTS;
         let mut registry = OverlayRegistry::default();
@@ -720,6 +756,146 @@ mod round_tests {
         assert!(
             !line.contains("incomplete"),
             "nothing arrived to be incomplete about: {line}",
+        );
+    }
+}
+
+/// **WB-2: the pane clock reaches the reports raster.** End-to-end through the
+/// real rasterizer — what the worker receives and what it puts on the glass —
+/// never a re-statement of the handler's own filter (there is none: the cull
+/// is the rasterizer's, so rows and hit-map ids stay aligned).
+#[cfg(test)]
+mod as_of_tests {
+    use super::*;
+
+    fn at(h: u32, m: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 8, 22)
+            .unwrap()
+            .and_hms_opt(h, m, 0)
+            .unwrap()
+    }
+
+    fn handler_with_report(valid: Option<chrono::NaiveDateTime>) -> StormReportsHandler {
+        let mut handler = StormReportsHandler::new();
+        handler.apply_fetch_result(
+            Box::new(StormReportsFetchResult(Ok(StormReportRound {
+                reports: vec![StormReport {
+                    kind: StormReportKind::Tornado,
+                    time: "2130".into(),
+                    valid,
+                    magnitude: None,
+                    location: "NORMAN".into(),
+                    county: "CLEVELAND".into(),
+                    state: "OK".into(),
+                    lat: 35.0,
+                    lon: -97.5,
+                    comments: String::new(),
+                }],
+                failed_kinds: Vec::new(),
+            }))),
+            &PaneRef::bare(0),
+        );
+        handler
+    }
+
+    fn ctx(as_of: chrono::NaiveDateTime) -> RasterizeContext {
+        RasterizeContext {
+            is_dark: false,
+            zoom: 6.5,
+            device_scale: 1.0,
+            now: as_of,
+            as_of,
+            frame: None,
+        }
+    }
+
+    /// The raster the handler's input really produces at `as_of`: whether any
+    /// ink landed, how many distinct reports the hit map records, and how
+    /// many rows travelled.
+    fn rendered(
+        handler: &StormReportsHandler,
+        as_of: chrono::NaiveDateTime,
+    ) -> (bool, usize, usize) {
+        let input = handler.paint_input(&ctx(as_of)).expect("data is present");
+        let bounds = rustdar_geo::GeoBounds {
+            min_lat: 33.0,
+            max_lat: 37.0,
+            min_lon: -99.0,
+            max_lon: -96.0,
+        };
+        let out = rasterize::rasterize_storm_reports(&input, &bounds, 96, 64);
+        let inked = out.rgba.iter().any(|&b| b != 0);
+        let ids: std::collections::HashSet<u32> = out
+            .hit_cells
+            .expect("the reports rasterizer builds cells")
+            .cells
+            .values()
+            .flatten()
+            .copied()
+            .collect();
+        (inked, ids.len(), input.reports.len())
+    }
+
+    /// **The floor's assertion: absent before its time.** A 21:30 report puts
+    /// zero reports on the glass at 21:29 and one at 21:31 — ink and hit map
+    /// both. The row still TRAVELS in both cases: the cull is the
+    /// rasterizer's, so the hit-map alignment invariant (`items.len() ==
+    /// input.reports.len()`) holds while the picture changes.
+    #[test]
+    fn a_report_is_absent_before_its_instant_and_present_from_it() {
+        let handler = handler_with_report(Some(at(21, 30)));
+
+        let (inked, hits, rows) = rendered(&handler, at(21, 29));
+        assert_eq!(rows, 1, "the row must travel even while culled");
+        assert!(
+            !inked,
+            "a 21:30 report put ink on the glass at 21:29 - it has not \
+             happened yet",
+        );
+        assert_eq!(hits, 0, "and the hit map must not offer it to a hover");
+
+        let (inked, hits, rows) = rendered(&handler, at(21, 31));
+        assert_eq!(rows, 1);
+        assert!(inked, "one minute after its instant the report must draw");
+        assert_eq!(hits, 1, "and be hoverable");
+    }
+
+    /// **The cross-cutting non-triviality: a live pane is byte-identical.**
+    /// On a live pane `as_of` is the wall clock and every already-fetched
+    /// report has already happened, so the cull passes every row — the rgba
+    /// is byte-for-byte the rgba of the same input with no instants at all
+    /// (the pre-WB-2 picture).
+    #[test]
+    fn a_live_pane_draws_byte_identical_to_the_unclocked_picture() {
+        let now = at(23, 0);
+        let dated = handler_with_report(Some(at(21, 30)));
+        let undated = handler_with_report(None);
+        let bounds = rustdar_geo::GeoBounds {
+            min_lat: 33.0,
+            max_lat: 37.0,
+            min_lon: -99.0,
+            max_lon: -96.0,
+        };
+        let a = rasterize::rasterize_storm_reports(
+            &dated.paint_input(&ctx(now)).expect("data"),
+            &bounds,
+            96,
+            64,
+        );
+        let b = rasterize::rasterize_storm_reports(
+            &undated.paint_input(&ctx(now)).expect("data"),
+            &bounds,
+            96,
+            64,
+        );
+        assert!(
+            a.rgba.iter().any(|&px| px != 0),
+            "non-triviality floor: the compared picture must have ink in it",
+        );
+        assert_eq!(
+            a.rgba, b.rgba,
+            "a live pane's reports raster gained an as-of dependence it must \
+             not have",
         );
     }
 }

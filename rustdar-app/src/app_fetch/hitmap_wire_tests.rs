@@ -107,6 +107,7 @@ fn seed(app: &mut crate::app::App, id: &LayerId) {
             let report = |report_kind, lat, lon| StormReport {
                 kind: report_kind,
                 time: "2015".into(),
+                valid: None,
                 magnitude: None,
                 location: "NORMAN".into(),
                 county: "CLEVELAND".into(),
