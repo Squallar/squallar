@@ -61,11 +61,18 @@ const CHIP_INSET: f32 = 8.0;
 pub(crate) const NOW_SPLIT: f32 = 0.70;
 
 /// How far the forecast region's fill is carried from the past region's
-/// toward the window's own background, in [`egui::Color32::lerp_to_gamma`].
-/// The one knob over both themes: light moves 230 -> 239 and dark 60 -> 43,
-/// each toward its own `window_fill`, so the future is the half that recedes
-/// into the page either way.
-const FUTURE_TOWARD_WINDOW: f32 = 0.5;
+/// toward the theme's accent — `selection.bg_fill` — in
+/// [`egui::Color32::lerp_to_gamma`]. The single number to tune if the tint
+/// should read stronger or softer.
+///
+/// The accent replaced `window_fill` after the user vetoed the grey-on-grey
+/// palette by eye: a mix toward the window moved the light theme 9 of 255,
+/// which is grey and darker grey, not colour. The one knob over both themes:
+/// light carries (230,230,230) to (191,221,241) and dark (60,60,60) to
+/// (33,74,91) — a blue-tinted forecast region against an unchanged grey past
+/// in either stock theme, still read off the live `Visuals` rather than
+/// hard-coded.
+const FUTURE_TOWARD_ACCENT: f32 = 0.45;
 
 /// **How near the `now` boundary a release has to land to mean "back to
 /// live"**, in points — a distance, where the rule it replaces was a fraction
@@ -332,12 +339,13 @@ fn paint_split_rail(
     let rail_height = ui.spacing().slider_rail_height;
     let corner_radius = ui.visuals().widgets.inactive.corner_radius;
     // The past keeps today's trough exactly. The future is that colour
-    // carried halfway to the window's own background, so it recedes into the
-    // page in whichever theme is up: 230 -> 239 in light, 60 -> 43 in dark.
-    // One expression, both themes, read off the live `Visuals` rather than
-    // from a pair of hard-coded colours that would be right in one of them.
+    // carried toward the theme's own accent, so it reads as colour against
+    // the grey past in whichever theme is up: (230,230,230) -> (191,221,241)
+    // in light, (60,60,60) -> (33,74,91) in dark. One expression, both
+    // themes, read off the live `Visuals` rather than from a pair of
+    // hard-coded colours that would be right in one of them.
     let past_fill = ui.visuals().widgets.inactive.bg_fill;
-    let future_fill = past_fill.lerp_to_gamma(ui.visuals().window_fill, FUTURE_TOWARD_WINDOW);
+    let future_fill = past_fill.lerp_to_gamma(ui.visuals().selection.bg_fill, FUTURE_TOWARD_ACCENT);
     let boundary_color = ui.visuals().widgets.active.fg_stroke.color;
 
     let past_slot = ui.painter().add(egui::Shape::Noop);
