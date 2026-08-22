@@ -16,7 +16,7 @@ permissions:
 concurrency:
   group: '${{ github.workflow }} @ ${{ github.ref }}'
   # Never cancel on main: bots push several times an hour, and a cancelled run
-  # never reaches `deploy-pages`.
+  # never reaches the deploy jobs.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
@@ -255,9 +255,12 @@ jobs:
           # `cargo check` is not a web gate either: binding generation is a step
           # cargo never runs, and that is where the wgpu
           # `duplicate string enums: GpuFilterMode` break surfaced.
+          # `web_dist` marks the one row that stages a publishable `dist/`. It
+          # is not named for a host: the tree is uploaded once, and whichever
+          # deploy job wants it downloads it.
           - name: web-wasm32
             target: wasm32-unknown-unknown
-            pages: true
+            web_dist: true
             cmd: |
               apt-get update -qq
               apt-get install -y -qq --no-install-recommends python3
@@ -712,10 +715,21 @@ jobs:
       # Uploaded on every run so a pull request proves the artifact assembles.
       # `deploy-pages` publishes this one; nothing is rebuilt there.
       - name: Upload Pages artifact
-        if: matrix.pages
+        if: matrix.web_dist
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: dist
+
+      # The same tree again, in its plain form. `upload-pages-artifact` wraps
+      # `dist` in a tarball that only `actions/deploy-pages` knows how to unpack,
+      # so `deploy-cloudfront` cannot read it -- it needs the files.
+      - name: Upload web dist
+        if: matrix.web_dist
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: web-dist
+          path: dist
+          if-no-files-found: error
 
   # The one required status check. `needs` on a matrix job aggregates every row,
   # and with `fail-fast: false` it is `success` only if all of them were --
@@ -733,6 +747,82 @@ jobs:
         run: |
           echo "build matrix: $RESULT"
           test "$RESULT" = success || { echo "::error::the build matrix concluded '$RESULT'."; exit 1; }
+
+  # The production web deploy: S3 behind CloudFront at https://rustdar.mcswain.dev/.
+  #
+  # `push` to `main` only, for the same reason `deploy-pages` is: `id-token: write`
+  # mints an OIDC token that assumes an AWS role with write access to the live
+  # site, and `pull_request` runs for forks.
+  #
+  # Nothing is rebuilt here. `web-wasm32` staged and gated `dist/`; this job
+  # downloads exactly those bytes.
+  #
+  # The distribution's response-headers policy -- not this workflow, and not any
+  # per-object metadata -- is what sends `Cross-Origin-Opener-Policy`,
+  # `Cross-Origin-Embedder-Policy` and `Cache-Control`. `aws s3 sync` writes no
+  # `Cache-Control` of its own, so the policy is unopposed. COOP/COEP are load
+  # bearing: without them `SharedArrayBuffer` is unavailable and the worker wire
+  # does not come up.
+  deploy-cloudfront:
+    name: Deploy web build to CloudFront
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [build-success]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # Required by aws-actions/configure-aws-credentials to mint the OIDC token.
+      id-token: write
+    # Not the workflow-level group, which cancels in progress. A cancelled sync
+    # leaves the bucket holding half of two deploys; queue instead.
+    concurrency:
+      group: cloudfront
+      cancel-in-progress: false
+    steps:
+      - name: Download the staged web build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: web-dist
+          path: dist
+
+      # `s3 sync --delete` against an empty local tree would empty the bucket,
+      # and a download that silently produced nothing is exactly how that
+      # happens. Check before the credentials exist, not after.
+      - name: Refuse to sync an empty tree
+        run: |
+          test -f dist/index.html || { echo "::error::dist/index.html is missing; the artifact did not unpack"; exit 1; }
+          test -f dist/pkg/rustdar_web_bg.wasm || { echo "::error::dist/pkg/rustdar_web_bg.wasm is missing; the artifact is not a web build"; exit 1; }
+          n=$(find dist -type f | wc -l)
+          test "$n" -ge 8 || { echo "::error::dist holds $n file(s); the shell alone is ten"; exit 1; }
+          echo "ok: $n file(s) staged"
+          find dist -type f | sort | sed 's/^/  /'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::803205869942:role/github-actions-rustdar
+          aws-region: us-east-1
+
+      # No second pass to fix up `Content-Type`. The AWS CLI takes it from
+      # Python's `mimetypes`, whose *built-in* table -- not `/etc/mime.types`,
+      # which the runner may or may not carry -- has mapped `.wasm` to
+      # `application/wasm` since CPython 3.8, and `.webmanifest` to
+      # `application/manifest+json` for as long. Every extension this tree ships
+      # is covered, so `sync` alone is correct. Verified against the 3.8, 3.10,
+      # 3.11, 3.12 and 3.13 stdlib sources; the CLI bundles its own interpreter,
+      # so the runner's `python3` is irrelevant.
+      #
+      # `--delete` prunes what a previous deploy left. It never deletes a file
+      # the new deploy replaces: `rustdar_web.js` and `rustdar_web_bg.wasm` keep
+      # their names across builds, so those are overwrites, not delete-then-add.
+      - name: Sync to S3
+        run: aws s3 sync --delete dist/ s3://rustdar.mcswain.dev/
+
+      # Whole-distribution, not a path list. The shell's filenames are stable,
+      # so a targeted invalidation would have to name every one of them, and
+      # missing one serves a mixed shell. AWS gives 1000 free invalidation paths
+      # a month and `/*` counts as one.
+      - name: Invalidate the CloudFront cache
+        run: aws cloudfront create-invalidation --distribution-id E2GQ1TB8D9TCQB --paths "/*"
 
   # `push` to `main` only: `pull_request` runs for forks, and `pages: write` /
   # `id-token: write` must not be reachable from an untrusted branch. A failed
