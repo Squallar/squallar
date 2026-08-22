@@ -119,7 +119,7 @@ serde_json = { workspace = true }
 # the train that satisfies the `=0.2.126` pin above, and the workflow's
 # `cargo tree -i wasm-bindgen` gate is what keeps that single-versioned.
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-wasm-bindgen-test = "0.3"
+wasm-bindgen-test = "=0.3.76"
 # For the first-egui-frame test; same pinned copy the app links.
 egui = { workspace = true }
 # For the JobRequest transfer test: the described envelope is constructed the
