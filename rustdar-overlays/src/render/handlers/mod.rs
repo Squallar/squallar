@@ -7,6 +7,7 @@ mod colorscale;
 pub mod discussion;
 #[cfg(feature = "fake-source")]
 pub mod fake;
+pub mod firewx;
 mod glm;
 mod labels;
 mod location;
@@ -21,8 +22,9 @@ mod texture_tests;
 
 use super::overlay_state::OverlayHandler;
 
-/// **This crate's layer registrations — eleven rows, and the only place they
-/// are named**; twelve under `fake-source`, which nothing that ships enables.
+/// **This crate's layer registrations — twelve rows, and the only place they
+/// are named**; thirteen under `fake-source`, which nothing that ships
+/// enables.
 ///
 /// Radar is not here: it lives in `rustdar_radar::sources`, and the app's whole
 /// layer set is `rustdar_egui::sources::all`. Adding an overlay means one row
@@ -32,6 +34,7 @@ pub fn sources() -> Vec<Box<dyn OverlayHandler>> {
     let mut rows: Vec<Box<dyn OverlayHandler>> = vec![
         Box::new(model::ModelDataHandler::new()),
         Box::new(outlook::SpcOutlookHandler::new()),
+        Box::new(firewx::SpcFireOutlookHandler::new()),
         Box::new(discussion::SpcDiscussionHandler::new()),
         Box::new(alert::NwsAlertHandler::new()),
         Box::new(reports::StormReportsHandler::new()),
@@ -43,7 +46,7 @@ pub fn sources() -> Vec<Box<dyn OverlayHandler>> {
         Box::new(colorscale::ColorScaleHandler::new()),
     ];
     // ONE registration line, appended: the count this adds is the `1` every
-    // `12 + cfg!(feature = "fake-source") as usize` pin downstream is written
+    // `13 + cfg!(feature = "fake-source") as usize` pin downstream is written
     // against.
     #[cfg(feature = "fake-source")]
     rows.push(Box::new(fake::FakeSourceHandler::new()));
@@ -61,7 +64,7 @@ pub fn sources() -> Vec<Box<dyn OverlayHandler>> {
 mod round_delivery_tests {
     /// Every handler file, whether or not it fetches today: the one that
     /// reintroduces this is by definition the one nobody has read yet.
-    const HANDLER_SOURCES: [(&str, &str); 12] = [
+    const HANDLER_SOURCES: [(&str, &str); 13] = [
         ("alert", include_str!("alert.rs")),
         ("colorscale", include_str!("colorscale.rs")),
         ("discussion", include_str!("discussion.rs")),
@@ -69,6 +72,7 @@ mod round_delivery_tests {
         // the module is compiled, and a source that is only checked in one
         // feature arm is a source nobody checked in the other.
         ("fake", include_str!("fake.rs")),
+        ("firewx", include_str!("firewx.rs")),
         ("glm", include_str!("glm.rs")),
         ("labels", include_str!("labels.rs")),
         ("location", include_str!("location.rs")),
@@ -144,15 +148,14 @@ mod round_delivery_tests {
                  delivery of its round some other way",
             );
         }
-        // **Eight since WO-M10c**, and the eighth is the odd one: `sites`
-        // builds no fetch task at all, but the frontend installs the radar
-        // table through the same arrival door, so it takes delivery of a
-        // round like the seven that do fetch. A handler that started or
-        // stopped taking delivery must be accounted for here rather than
-        // silently skipped.
+        // **Nine**, of which `sites` is the odd one: it builds no fetch task
+        // at all, but the frontend installs the radar table through the same
+        // arrival door, so it takes delivery of a round like the eight that do
+        // fetch. A handler that started or stopped taking delivery must be
+        // accounted for here rather than silently skipped.
         assert_eq!(
-            checked, 8,
-            "eight handlers take delivery of a round; a handler that started \
+            checked, 9,
+            "nine handlers take delivery of a round; a handler that started \
              or stopped must be accounted for here rather than silently \
              skipped",
         );

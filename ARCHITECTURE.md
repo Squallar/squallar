@@ -258,8 +258,8 @@ inside the screen rect. A control may be **disabled with a stated reason**; it
 may not be absent. Run the walk in both feature arms:
 
 ```bash
-cargo test -p rustdar-egui parity_walk                    # 3/3, twelve layers
-cargo test -p rustdar-egui --features fake-source parity_walk   # 3/3, thirteen
+cargo test -p rustdar-egui parity_walk                    # 3/3, thirteen layers
+cargo test -p rustdar-egui --features fake-source parity_walk   # 3/3, fourteen
 ```
 
 **The web target is measured, never inferred.** A scaled or extrapolated figure
@@ -317,9 +317,9 @@ the registry against itself and cannot fail.
 **The executable form of this checklist is the fake source.**
 `rustdar-overlays/src/render/handlers/fake.rs`, behind the `fake-source`
 feature (forwarded by `rustdar-egui/fake-source` and `rustdar-app/fake-source`,
-and enabled by nothing that ships), is a thirteenth layer that exists only so a
+and enabled by nothing that ships), is a fourteenth layer that exists only so a
 test build can watch a source arrive through the seams. Every count-pin
-downstream is written as `12 + cfg!(feature = "fake-source") as usize`, and
+downstream is written as `13 + cfg!(feature = "fake-source") as usize`, and
 `sources()` adds exactly one appended registration line under that cfg. If a new
 source needs an arm anywhere the fake source does not have one, the seam is
 incomplete — fix the seam, not the call site.

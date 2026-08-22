@@ -665,8 +665,8 @@ mod retry_ledger_tests {
             .collect();
         assert_eq!(
             kinds.len(),
-            7,
-            "the seven fetching handlers must all be covered",
+            8,
+            "the eight fetching handlers must all be covered",
         );
 
         for kind in kinds {

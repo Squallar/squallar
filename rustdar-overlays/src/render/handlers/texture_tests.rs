@@ -77,6 +77,28 @@ fn run_fake(
     None
 }
 
+/// **The one sanctioned case of two layers sharing a raster input variant.**
+///
+/// SPC's fire-weather outlooks are the same thing on the wire as the
+/// convective ones — a feature list in SPC's own inline `stroke`/`fill` — so
+/// `SpcFireOutlook` describes an `OutlooksInput` and rides the
+/// `overlay/outlooks` codec row rather than adding a byte-identical second
+/// wire form. Both walks below read the relation from here, so the sharing is
+/// stated once and neither walk can quietly grow a second case: any other
+/// layer whose input names a foreign owner still fails
+/// `every_texture_handler_declares_the_convention_its_own_bytes_are_in`.
+///
+/// **What that costs, stated:** a fire raster is labelled `overlay/outlooks`
+/// in the worker's timing log, so the two layers are not distinguishable
+/// there.
+pub(super) fn raster_input_owner(id: &LayerId) -> LayerId {
+    if *id == known::SPC_FIRE_OUTLOOK {
+        known::SPC_OUTLOOK
+    } else {
+        id.clone()
+    }
+}
+
 fn run_described(
     job: &DescribedJob,
     bounds: &GeoBounds,
@@ -187,6 +209,18 @@ fn outlook_fixture() -> crate::spc::outlook::SpcOutlook {
     }
 }
 
+fn fire_outlook_fixture() -> crate::spc::firewx::SpcFireOutlook {
+    use crate::spc::firewx::{FireDay, FireHazard, FireProduct, SpcFireOutlook};
+    SpcFireOutlook {
+        day: FireDay::Day1,
+        hazard: FireHazard::DryThunderstorm,
+        product: FireProduct::Categorical,
+        valid: None,
+        expire: None,
+        features: vec![feature()],
+    }
+}
+
 fn report_fixture() -> crate::spc::reports::StormReport {
     use crate::spc::reports::{StormReport, StormReportKind};
     StormReport {
@@ -277,6 +311,7 @@ fn site_fixtures() -> rasterize::SitesInput {
 pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
     use crate::glm::{GlmFetchOutcome, GlmFetchResult};
     use crate::hrrr::HrrrFetchResult;
+    use crate::spc::firewx::{FireDay, FireHazard, FireProduct};
     use crate::spc::outlook::{OutlookDay, OutlookProduct};
 
     // Outlook's "enabled" *is* its product set, and the set is what its data is
@@ -318,6 +353,12 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
             day: OutlookDay::Day1,
             product: OutlookProduct::Categorical,
             result: Ok(outlook_fixture()),
+        }),
+        id if *id == known::SPC_FIRE_OUTLOOK => Box::new(super::firewx::SpcFireFetchResult {
+            day: FireDay::Day1,
+            hazard: FireHazard::DryThunderstorm,
+            product: FireProduct::Categorical,
+            result: Ok(fire_outlook_fixture()),
         }),
         id if *id == known::STORM_REPORTS => Box::new(super::reports::StormReportsFetchResult(Ok(
             crate::spc::reports::StormReportRound {
@@ -454,7 +495,8 @@ fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
             });
         let (named, out) = run_described(&input, &BOUNDS, W, H);
         assert_eq!(
-            named, id,
+            named,
+            raster_input_owner(&id),
             "{name}'s `prepare_job` answered another layer's input variant, \
              so a worker would rasterize the wrong layer under its panes",
         );
@@ -476,16 +518,17 @@ fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
         }
         checked += 1;
     }
-    // **Seven since WO-M10c.** The seventh is `RadarSites`, which used to be
-    // rasterized by a dispatch arm of its own in `app_fetch` — the handler
-    // could not see which site its pane was on, so it had no `prepare_job` to
-    // be walked through. It has a pane now, the arm is gone, and the "seven
-    // described kinds" list in `spawn_overlay_render` is this same seven.
+    // **Seven since WO-M10c, eight since the fire weather layer.** The
+    // seventh was `RadarSites`, which used to be rasterized by a dispatch arm
+    // of its own in `app_fetch` — the handler could not see which site its
+    // pane was on, so it had no `prepare_job` to be walked through. It has a
+    // pane now, the arm is gone, and the "eight described kinds" list in
+    // `spawn_overlay_render` is this same eight.
     assert_eq!(
         checked,
-        7 + cfg!(feature = "fake-source") as usize,
-        "the seven texture handlers that rasterize through `prepare_job` \
-         must all be covered — eight with the fake source registered; a new \
+        8 + cfg!(feature = "fake-source") as usize,
+        "the eight texture handlers that rasterize through `prepare_job` \
+         must all be covered — nine with the fake source registered; a new \
          one is not exempt, and a removed one should be removed from this \
          count deliberately",
     );
@@ -652,9 +695,9 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
     }
     assert_eq!(
         checked,
-        7 + cfg!(feature = "fake-source") as usize,
-        "the seven texture handlers that rasterize through `prepare_job` \
-         must all be covered — eight with the fake source registered",
+        8 + cfg!(feature = "fake-source") as usize,
+        "the eight texture handlers that rasterize through `prepare_job` \
+         must all be covered — nine with the fake source registered",
     );
 }
 
@@ -784,8 +827,8 @@ fn every_texture_kind_rasterizes_as_a_described_job() {
     }
     assert_eq!(
         described,
-        7 + cfg!(feature = "fake-source") as usize,
-        "the three polygon kinds, the two hit-map kinds, the model grid and \
+        8 + cfg!(feature = "fake-source") as usize,
+        "the four polygon kinds, the two hit-map kinds, the model grid and \
          the site table must all have been walked seeded — plus the fake \
          source where it is registered; a kind that stopped seeding is a kind \
          whose described job was never tested",
@@ -860,23 +903,32 @@ fn a_hit_map_kinds_items_align_with_its_described_rows() {
 }
 
 /// **The registry pairing gate, bidirectional.** Every texture handler that
-/// rasterizes through the job boundary owns exactly one row of
-/// [`crate::render::jobs::JOB_CODECS`], claimed exactly once, none unclaimed.
+/// rasterizes through the job boundary names exactly one row of
+/// [`crate::render::jobs::JOB_CODECS`], every row is named by some handler,
+/// and no handler names a row the literal table below does not give it.
 ///
 /// The kind → label pairing is spelled literally rather than derived, so a
 /// *swapped* pair of registrations is caught by name. `RadarSites` claims its
 /// row while its `prepare_job` stays `None`: the row states how the bytes cross,
 /// not who builds them.
+///
+/// **A row may be named by two handlers only where [`raster_input_owner`] says
+/// they build the same input**, which today is exactly `SpcFireOutlook`
+/// sharing the convective outlooks' row. Read from that one function rather
+/// than allowed here, so the sharing is a single statement rather than a
+/// loosened assertion: two layers that describe *different* inputs under one
+/// label still fail, which is the mispairing this gate was built for.
 #[test]
 fn every_texture_handler_owns_exactly_one_codec_row() {
     use crate::render::jobs::JOB_CODECS;
 
     // Deliberately spelled out. Do not regenerate this from the registry.
     #[cfg(not(feature = "fake-source"))]
-    let expected: [(LayerId, &str); 7] = [
+    let expected: [(LayerId, &str); 8] = [
         (known::RADAR_SITES, "overlay/sites"),
         (known::NWS_ALERTS, "overlay/alerts"),
         (known::SPC_OUTLOOK, "overlay/outlooks"),
+        (known::SPC_FIRE_OUTLOOK, "overlay/outlooks"),
         (known::SPC_DISCUSSIONS, "overlay/discussions"),
         (known::STORM_REPORTS, "overlay/reports"),
         (known::LIGHTNING, "overlay/glm"),
@@ -885,10 +937,11 @@ fn every_texture_handler_owns_exactly_one_codec_row() {
     // Two `#[cfg]`'d definitions for the same reason `JOB_CODECS` has two:
     // `#[cfg]` on an array element is not stable.
     #[cfg(feature = "fake-source")]
-    let expected: [(LayerId, &str); 8] = [
+    let expected: [(LayerId, &str); 9] = [
         (known::RADAR_SITES, "overlay/sites"),
         (known::NWS_ALERTS, "overlay/alerts"),
         (known::SPC_OUTLOOK, "overlay/outlooks"),
+        (known::SPC_FIRE_OUTLOOK, "overlay/outlooks"),
         (known::SPC_DISCUSSIONS, "overlay/discussions"),
         (known::STORM_REPORTS, "overlay/reports"),
         (known::LIGHTNING, "overlay/glm"),
@@ -896,7 +949,7 @@ fn every_texture_handler_owns_exactly_one_codec_row() {
         (known::FAKE_SOURCE, crate::render::jobs::FAKE_LABEL),
     ];
 
-    let mut claimed: Vec<&'static str> = Vec::new();
+    let mut claimed: Vec<(LayerId, &'static str)> = Vec::new();
     for handler in sources() {
         let id = handler.id();
         let name = id.as_str();
@@ -935,19 +988,25 @@ fn every_texture_handler_owns_exactly_one_codec_row() {
              was slow",
             row.label,
         );
-        assert!(
-            !claimed.contains(&row.label),
-            "{name}'s row {:?} is already claimed by another handler; a \
-             row claimed twice means two layers believe they own one wire \
-             form",
-            row.label,
-        );
-        claimed.push(row.label);
+        if let Some((other, _)) = claimed.iter().find(|(_, label)| *label == row.label) {
+            // The only sanctioned duplicate: the two layers build the SAME
+            // input, so one wire form is one wire form.
+            let shared = raster_input_owner(&id) == *other || raster_input_owner(other) == id;
+            assert!(
+                shared,
+                "{name}'s row {:?} is already claimed by {}; a row claimed \
+                 twice means two layers believe they own one wire form, \
+                 unless `raster_input_owner` says they build the same input",
+                row.label,
+                other.as_str(),
+            );
+        }
+        claimed.push((id.clone(), row.label));
     }
 
     for row in JOB_CODECS {
         assert!(
-            claimed.contains(&row.label),
+            claimed.iter().any(|(_, label)| *label == row.label),
             "the row labelled {:?} is claimed by no handler: a codec with \
              no owner is dead weight today and a mis-registration trap the \
              day someone reuses it",
@@ -956,8 +1015,17 @@ fn every_texture_handler_owns_exactly_one_codec_row() {
     }
     assert_eq!(
         claimed.len(),
+        expected.len(),
+        "the claimed pairs and the literal table disagree in size — a \
+         handler stopped claiming, or claimed twice",
+    );
+    let mut distinct: Vec<&str> = claimed.iter().map(|(_, label)| *label).collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
         JOB_CODECS.len(),
-        "the claimed set and the registry disagree in size even though \
-         every row is claimed — a duplicate slipped through",
+        "the distinct claimed labels and the registry disagree in size even \
+         though every row is claimed — a duplicate slipped through",
     );
 }
