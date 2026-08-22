@@ -6,6 +6,9 @@
 use super::*;
 use crate::nws::zone_pack::{Coding, Kind, PackedZone, ZonePack};
 
+/// A UGC no other test in this binary uses. The installed pack is
+/// process-wide, so an id shared with another test's fixture would let this one
+/// answer a lookup that test arranged to have fail.
 fn drawable_pack_bytes() -> Vec<u8> {
     let square = vec![vec![vec![
         (35.0, -97.0),
@@ -15,7 +18,7 @@ fn drawable_pack_bytes() -> Vec<u8> {
         (35.0, -97.0),
     ]]];
     let entries: Vec<PackedZone> =
-        vec![(zone_pack::key(Kind::County, "OKC001").expect("key"), square)];
+        vec![(zone_pack::key(Kind::County, "ZZC999").expect("key"), square)];
     zone_pack::write(&entries, Coding::Varint, 5, 0.005)
 }
 
@@ -108,7 +111,7 @@ fn a_file_source_installs_a_real_pack_and_a_missing_one_is_not_an_error() {
     assert!(
         zone_pack::installed()
             .expect("installed")
-            .get(Kind::County, "OKC001")
+            .get(Kind::County, "ZZC999")
             .is_some(),
         "the loaded pack must be the one a lookup now goes through",
     );
