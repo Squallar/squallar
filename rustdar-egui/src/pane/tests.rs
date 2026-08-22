@@ -1770,3 +1770,121 @@ fn the_caption_reads_the_timeline_of_the_layer_the_clock_walks() {
     let bare = PaneState::new();
     assert_eq!(bare.clock_layer(), None);
 }
+
+/// **The model loop cap covers a forecast horizon by sampling, and the radar
+/// texture cap it must not borrow really is 14.**
+///
+/// The overlays-side sibling
+/// `the_model_loop_cap_leaves_a_grid_for_every_other_pane` pins what the byte
+/// budget allows — exactly 8, 23 and 65 grids for a looping pane. It cannot ask
+/// the next two questions: `rustdar-overlays` may not see
+/// `rustdar-device-profile` (that crate declares `rustdar-radar`, and the
+/// overlays → radar edge is charter-cut) and does not own the sampler. This
+/// crate sees both, so they are asked here.
+///
+/// **One** — the 14 that sibling spells by hand, because the charter denies it
+/// the import, is the real `WASM_MAX_LOOP_FRAMES`. Without this its 6.0 %
+/// overrun could go stale with nothing going red.
+///
+/// **Two** — the frame counts the model doc's table states are what
+/// [`listing_sample_indices`] really returns. It is **not** a fixed stride:
+/// handed more hours than the cap it returns *exactly* the cap, anchored on
+/// both the first forecast hour and the last.
+///
+/// The 8/23/65 below are the sibling's figures, restated because the import is
+/// forbidden; they are pinned exactly there, so a budget change reddens that
+/// test rather than passing quietly here.
+#[test]
+fn the_model_loop_cap_covers_a_forecast_horizon_by_sampling() {
+    use rustdar_device_profile::constants::{
+        DESKTOP_MAX_LOOP_FRAMES, MOBILE_MAX_LOOP_FRAMES, WASM_MAX_LOOP_FRAMES,
+    };
+
+    // One. The collision, checked against the definition rather than against a
+    // number retyped into a doc comment.
+    assert_eq!(
+        WASM_MAX_LOOP_FRAMES, 14,
+        "`model.rs` spells this 14 by hand, because the charter denies it the \
+         import, and computes a 6.0 % budget overrun from it. It has moved, so \
+         that arithmetic is now stale.",
+    );
+
+    // The byte-budget caps, clamped by the device's own frame cap. Both bind
+    // somewhere, which is why both are here: the budget binds on wasm, the
+    // frame cap on mobile and desktop.
+    for (name, budget_cap, frame_cap, expect) in [
+        ("wasm32", 8usize, WASM_MAX_LOOP_FRAMES, 8usize),
+        ("mobile", 23, MOBILE_MAX_LOOP_FRAMES, 20),
+        ("desktop", 65, DESKTOP_MAX_LOOP_FRAMES, 60),
+    ] {
+        assert_eq!(
+            budget_cap.min(frame_cap),
+            expect,
+            "{name}: min(byte-budget cap {budget_cap}, device frame cap \
+             {frame_cap}) is {}, not the {expect} the model doc's sampling \
+             table is computed from",
+            budget_cap.min(frame_cap),
+        );
+    }
+
+    // Two. What each clamped cap yields over the two horizons the plan names.
+    // A horizon of H hours is H + 1 forecast hours, hour 0 included.
+    for (name, cap, hours, frames) in [
+        ("wasm", 8usize, 19usize, 8usize),
+        ("wasm", 8, 49, 8),
+        ("mobile", 20, 19, 19),
+        ("mobile", 20, 49, 20),
+        ("desktop", 60, 19, 19),
+        ("desktop", 60, 49, 49),
+    ] {
+        let horizon = hours - 1;
+        let picked: Vec<usize> =
+            listing_sample_indices(hours, cap).unwrap_or_else(|| (0..hours).collect());
+        assert_eq!(
+            picked.len(),
+            frames,
+            "{name} at a cap of {cap} draws {} of the {hours} forecast hours \
+             across a {horizon} h horizon, not the {frames} the model doc \
+             states",
+            picked.len(),
+        );
+        assert!(
+            picked.len() <= cap,
+            "{name}: {} frames over a cap of {cap}. Every frame is a resident \
+             CONUS grid, so this is an overrun of the model byte budget.",
+            picked.len(),
+        );
+        assert_eq!(
+            (picked[0], picked[picked.len() - 1]),
+            (0, horizon),
+            "{name} at a cap of {cap} must span the whole {horizon} h horizon: \
+             a loop that stops short presents a partial forecast as the answer",
+        );
+        // The step is the two integers around the ideal spacing and nothing
+        // wider, or the walk reads as a stutter rather than as a loop.
+        let steps: Vec<usize> = picked.windows(2).map(|w| w[1] - w[0]).collect();
+        let (lo, hi) = (
+            steps.iter().copied().min().unwrap_or(1),
+            steps.iter().copied().max().unwrap_or(1),
+        );
+        assert!(
+            hi - lo <= 1,
+            "{name} at a cap of {cap} over {hours} hours steps between {lo} and \
+             {hi} hours",
+        );
+    }
+
+    // Non-triviality: the sampler decimates on the rows that are supposed to
+    // decimate and declines on the rows that are not. Without this the whole
+    // table could be satisfied by listings that happened to fit.
+    assert!(
+        listing_sample_indices(19, 8).is_some() && listing_sample_indices(49, 8).is_some(),
+        "the wasm rows are supposed to exercise decimation; if the sampler \
+         declines them, they prove nothing",
+    );
+    assert!(
+        listing_sample_indices(49, 60).is_none() && listing_sample_indices(19, 20).is_none(),
+        "the desktop rows and mobile's 18 h row are supposed to be \
+         undecimated, so a decimating sampler would be checked nowhere",
+    );
+}

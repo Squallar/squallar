@@ -129,6 +129,71 @@ const _: () = {
     assert!(DESKTOP_MODEL_GRID_BUDGET_BYTES / HRRR_CONUS_GRID_BYTES >= MAX_PANES_DESKTOP);
 };
 
+/// **How many frames a model loop may hold — computed from the byte budget,
+/// never borrowed from the radar one.**
+///
+/// `budget / HRRR_CONUS_GRID_BYTES` is everything the arm can hold at once.
+/// Every other pane still needs its own grid, so a looping pane gets that less
+/// `max_panes - 1`. Denominator throughout: one CONUS grid = 7,620,564 B =
+/// 7.268 MiB.
+///
+/// **The collision this exists to prevent.**
+/// `rustdar_device_profile::constants::WASM_MAX_LOOP_FRAMES` is 14. It is a cap
+/// on radar *textures*, sized against a pool this module does not spend from,
+/// and it is the obvious thing to reach for. Held as model grids those 14
+/// frames cost 14 × 7,620,564 = 106,687,896 B = **101.75 MiB against a 96 MiB
+/// pool — 6.0 % over, with zero grids left for any other pane.** The floor
+/// above does not catch it: one grid per pane and N grids in one pane are
+/// different questions, and it only asks the first. The overrun is silent in
+/// exactly the way described above — `prepare_job` answers `None` and the pane
+/// goes on drawing its last texture.
+///
+/// | arm | budget | grids | reserved | this cap | after the caller's clamp |
+/// |---|---:|---:|---:|---:|---:|
+/// | wasm32 | 96 MiB | 13 | 5 | **8** | 8 — `WASM_MAX_LOOP_FRAMES` = 14 never binds |
+/// | mobile | 192 MiB | 26 | 3 | **23** | 20 — `MOBILE_MAX_LOOP_FRAMES` |
+/// | desktop | 512 MiB | 70 | 5 | **65** | 60 — `DESKTOP_MAX_LOOP_FRAMES` |
+///
+/// This function answers the middle column only. The clamp is the caller's,
+/// because the constants it clamps against live in `rustdar-device-profile`,
+/// which this crate may not see — the reason is at
+/// [`WASM_MODEL_GRID_BUDGET_BYTES`]. `rustdar-egui` sees both, so that is
+/// where the two are checked against each other:
+/// `the_model_loop_cap_covers_a_forecast_horizon_by_sampling`.
+///
+/// **What the clamped caps buy.** The loop covers a horizon by sampling with
+/// `rustdar_egui::pane::listing_sample_indices` — existing machinery, and
+/// *not* a fixed stride. Handed more hours than it may hold it returns exactly
+/// the cap, anchored on both the first hour and the last, with the step
+/// alternating between the two integers around the ideal spacing:
+///
+/// | arm | clamped cap | 18 h (19 hours) | 48 h (49 hours) |
+/// |---|---:|---|---|
+/// | wasm | 8 | 8 frames, steps 2–3 h | 8 frames, steps 6–7 h |
+/// | mobile | 20 | all 19, step 1 h | 20 frames, steps 2–3 h |
+/// | desktop | 60 | all 19, step 1 h | all 49, step 1 h |
+///
+/// `the_model_loop_cap_leaves_a_grid_for_every_other_pane` holds the caps;
+/// the sampling table is held where the sampler lives, by
+/// `the_model_loop_cap_covers_a_forecast_horizon_by_sampling`.
+pub const fn model_loop_frame_cap(budget: usize, max_panes: usize) -> usize {
+    // Saturating on both sides. A zero-pane arm is not a thing, but a `pub
+    // const fn` that panics when handed one is worse than a cap of zero.
+    (budget / HRRR_CONUS_GRID_BYTES).saturating_sub(max_panes.saturating_sub(1))
+}
+
+/// **The loop floor, as a build failure.** An arm whose budget can no longer
+/// hold a four-frame loop beside a full pane layout has stopped being able to
+/// loop, and it stops in the same silent way: no frame arrives, the last
+/// texture stays on the glass. Four is where a loop stops reading as motion at
+/// all. Today the arms clear it by 2×, 5.75× and 16.25×, so this fires on a
+/// real regression rather than on rounding.
+const _: () = {
+    assert!(model_loop_frame_cap(WASM_MODEL_GRID_BUDGET_BYTES, MAX_PANES_DESKTOP) >= 4);
+    assert!(model_loop_frame_cap(MOBILE_MODEL_GRID_BUDGET_BYTES, MAX_PANES_MOBILE) >= 4);
+    assert!(model_loop_frame_cap(DESKTOP_MODEL_GRID_BUDGET_BYTES, MAX_PANES_DESKTOP) >= 4);
+};
+
 // The device class, spelled as its rule rather than as the `mobile` cfg:
 // cargo scopes a build script's cfgs to the crate that declares it, so
 // `cfg(mobile)` is unset everywhere outside `rustdar-device-profile`, and a
@@ -2516,6 +2581,115 @@ mod tests {
             ),
             (13, 26, 70),
             "the figures the module doc states",
+        );
+    }
+
+    /// **A looping pane leaves a grid for every other pane.**
+    ///
+    /// The sibling above asks whether every pane gets *one* grid. A loop makes
+    /// that a different question — whether one pane may hold N grids while the
+    /// others still get theirs — and the two do not imply each other. The wasm
+    /// arm passes the sibling and, at the radar loop cap it would otherwise
+    /// borrow, fails this one by 6.0 % with nothing left over at all.
+    ///
+    /// Every figure names its denominator: one CONUS grid is
+    /// [`HRRR_CONUS_GRID_BYTES`] = 7,620,564 B = 7.268 MiB, which the sibling
+    /// proves is what [`grid_bytes`] really charges rather than assuming it.
+    #[test]
+    fn the_model_loop_cap_leaves_a_grid_for_every_other_pane() {
+        const GRID: usize = HRRR_CONUS_GRID_BYTES;
+        // The radar *texture* cap, spelled and not imported for the reason at
+        // [`WASM_MODEL_GRID_BUDGET_BYTES`]; the definition is
+        // `rustdar_device_profile::constants::WASM_MAX_LOOP_FRAMES`, and
+        // `the_model_loop_cap_covers_a_forecast_horizon_by_sampling` is what
+        // stops this spelling from drifting away from it.
+        const BORROWED_RADAR_CAP: usize = 14;
+
+        // The defect, stated as arithmetic. Borrowing the radar cap overruns
+        // the wasm model pool outright, before a single other pane is served,
+        // and it overruns silently. Every term is a constant, so this is
+        // checked at build time — a runtime assert would be a weaker check of
+        // exactly the same thing.
+        const {
+            assert!(
+                BORROWED_RADAR_CAP * GRID > WASM_MODEL_GRID_BUDGET_BYTES,
+                "14 radar loop frames held as CONUS model grids cost \
+                 14 × 7,620,564 = 106,687,896 B = 101.75 MiB against a 96 MiB \
+                 wasm model pool. If that now fits, the reason \
+                 `model_loop_frame_cap` is computed rather than borrowed has \
+                 gone away.",
+            );
+        }
+
+        for (name, budget, panes, expect) in [
+            (
+                "wasm32",
+                WASM_MODEL_GRID_BUDGET_BYTES,
+                MAX_PANES_DESKTOP,
+                8usize,
+            ),
+            (
+                "mobile",
+                MOBILE_MODEL_GRID_BUDGET_BYTES,
+                MAX_PANES_MOBILE,
+                23,
+            ),
+            (
+                "desktop",
+                DESKTOP_MODEL_GRID_BUDGET_BYTES,
+                MAX_PANES_DESKTOP,
+                65,
+            ),
+        ] {
+            let grids = budget / GRID;
+            let cap = model_loop_frame_cap(budget, panes);
+            assert_eq!(
+                cap,
+                expect,
+                "{name}: {budget} B / {GRID} B per CONUS grid = {grids} grids, \
+                 less {} reserved for the other {} of {panes} panes, is a loop \
+                 cap of {} — not the {expect} the module doc states",
+                panes - 1,
+                panes - 1,
+                cap,
+            );
+            // The reservation is the whole point: the loop plus one grid for
+            // every pane that is not looping is exactly what the arm holds.
+            assert_eq!(
+                cap + (panes - 1),
+                grids,
+                "{name}: a loop of {cap} beside {} single-grid panes is {} \
+                 grids, but the arm holds {grids} ({budget} B / {GRID} B)",
+                panes - 1,
+                cap + (panes - 1),
+            );
+            assert!(
+                cap * GRID <= budget,
+                "{name}: {cap} frames × {GRID} B = {} B against a {budget} B \
+                 pool. Over the pool `prepare_job` answers None and the pane \
+                 goes on drawing its last texture with nothing to re-ask.",
+                cap * GRID,
+            );
+        }
+
+        // Non-triviality: an implementation that returns a constant, or one
+        // that ignores its `max_panes`, has to disagree with one of these.
+        let (wasm, mobile, desktop) = (
+            model_loop_frame_cap(WASM_MODEL_GRID_BUDGET_BYTES, MAX_PANES_DESKTOP),
+            model_loop_frame_cap(MOBILE_MODEL_GRID_BUDGET_BYTES, MAX_PANES_MOBILE),
+            model_loop_frame_cap(DESKTOP_MODEL_GRID_BUDGET_BYTES, MAX_PANES_DESKTOP),
+        );
+        assert!(
+            wasm < mobile && mobile < desktop,
+            "the three arms must not agree, or a constant-returning cap would \
+             pass: got wasm {wasm}, mobile {mobile}, desktop {desktop}",
+        );
+        assert!(
+            wasm < WASM_MODEL_GRID_BUDGET_BYTES / GRID,
+            "the wasm cap {wasm} is the arm's whole capacity of {} grids, so \
+             nothing was reserved for the other {} panes",
+            WASM_MODEL_GRID_BUDGET_BYTES / GRID,
+            MAX_PANES_DESKTOP - 1,
         );
     }
 
