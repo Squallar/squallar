@@ -1,13 +1,20 @@
 //! The crate's charter, held as tests: a dependency ceiling and the graph
 //! shape it exists to create.
 //!
-//! Both read `cargo metadata --no-deps --format-version 1`, whose
+//! All read `cargo metadata --no-deps --format-version 1`, whose
 //! `packages[].dependencies` are *declared* dependencies, so no feature
 //! selection can mask what these assert. One name may appear once per kind,
 //! so entries are judged per `(kind, name)`.
+//!
+//! The absence rules are **graph** rules, not name rules. Asking only whether
+//! one manifest spells another crate's name proves nothing about what the
+//! compiler is handed: an indirect route restores the whole of the forbidden
+//! crate while the direct-edge question still answers "no". The absence tests
+//! below therefore walk the transitive closure, and each carries a control
+//! that fails if the walk stops recursing.
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -56,6 +63,113 @@ fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, S
             (kind, name)
         })
         .collect()
+}
+
+/// Every hop between workspace members, as `member -> {(kind, member)}`.
+///
+/// Edges pointing outside the workspace are dropped. That loses nothing for a
+/// first-party target: a registry crate cannot name a path dependency, so no
+/// route from one workspace member to another can leave the workspace and come
+/// back. For a *third-party* target (the GUI rule below) the walk is exact only
+/// for routes whose last hop leaves a workspace member — which is every route
+/// this workspace controls.
+fn member_graph(meta: &serde_json::Value) -> BTreeMap<String, BTreeSet<(String, String)>> {
+    let packages = meta["packages"]
+        .as_array()
+        .expect("metadata carries a packages array");
+    let members: BTreeSet<&str> = packages.iter().filter_map(|p| p["name"].as_str()).collect();
+    packages
+        .iter()
+        .map(|p| {
+            let name = p["name"]
+                .as_str()
+                .expect("a package has a name")
+                .to_string();
+            let edges = p["dependencies"]
+                .as_array()
+                .expect("a package carries a dependencies array")
+                .iter()
+                .filter_map(|d| {
+                    let dep = d["name"].as_str().expect("a dependency has a name");
+                    members.contains(dep).then(|| {
+                        (
+                            d["kind"].as_str().unwrap_or("normal").to_string(),
+                            dep.to_string(),
+                        )
+                    })
+                })
+                .collect();
+            (name, edges)
+        })
+        .collect()
+}
+
+/// Every workspace member reachable from `root`, mapped to the route that
+/// reaches it. `root` itself is never a key.
+///
+/// `first_hop_kinds` selects which of `root`'s own edges may be entered.
+/// **Every hop after the first must be `normal`**, because Cargo does not make
+/// dev- and build-dependencies transitive: a crate pulled into the closure
+/// brings only *its* normal dependencies with it. Passing `["normal"]` therefore
+/// asks what the shipped library compiles against; adding `dev`/`build` asks
+/// what any target of `root` compiles against.
+///
+/// Breadth-first, so a route is one of the shortest, and `normal` is entered
+/// before the other kinds so a reported first hop understates nothing.
+///
+/// **Where this function's own control lives**: every caller asserts its
+/// closure is non-empty, but only `the_overlays_to_radar_edge_stays_cut`
+/// asserts that the walk *recurses* — it requires a route of more than one hop
+/// to a crate reachable no other way. That one control covers all three
+/// callers, because they share this function; if it is ever moved, it does not
+/// become optional.
+fn reachable_from(
+    graph: &BTreeMap<String, BTreeSet<(String, String)>>,
+    root: &str,
+    first_hop_kinds: &[&str],
+) -> BTreeMap<String, Vec<(String, String)>> {
+    assert!(
+        graph.contains_key(root),
+        "`{root}` is not a workspace member, so this walk would silently \
+         report an empty closure",
+    );
+    let mut routes: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    let mut queue: VecDeque<String> = VecDeque::from([root.to_string()]);
+    while let Some(node) = queue.pop_front() {
+        let here = routes.get(&node).cloned().unwrap_or_default();
+        let Some(edges) = graph.get(&node) else {
+            continue;
+        };
+        // `normal` sorts after `build` and `dev`, so walk it first by hand.
+        let ordered = edges
+            .iter()
+            .filter(|(kind, _)| kind == "normal")
+            .chain(edges.iter().filter(|(kind, _)| kind != "normal"));
+        for (kind, dep) in ordered {
+            let permitted = if node == root {
+                first_hop_kinds.contains(&kind.as_str())
+            } else {
+                kind == "normal"
+            };
+            if !permitted || dep == root || routes.contains_key(dep) {
+                continue;
+            }
+            let mut route = here.clone();
+            route.push((kind.clone(), dep.clone()));
+            routes.insert(dep.clone(), route);
+            queue.push_back(dep.clone());
+        }
+    }
+    routes
+}
+
+/// A route rendered for a failure message: `a -> (normal) b -> (dev) c`.
+fn render_route(root: &str, route: &[(String, String)]) -> String {
+    let mut out = root.to_string();
+    for (kind, name) in route {
+        out.push_str(&format!(" -> ({kind}) {name}"));
+    }
+    out
 }
 
 /// The substrate stays a substrate: its dependency set may not grow past the
@@ -108,6 +222,34 @@ fn the_dependency_ceiling_holds() {
         "rustdar-source no longer declares reqwest — either the crate changed \
          shape or this test is reading the wrong package: {deps:?}",
     );
+
+    // The ceiling above is an allow-list over *declared* edges, so an
+    // allow-listed crate that itself grew a first-party dependency would raise
+    // the substrate without moving a single line of this list. The first-party
+    // half of the ceiling is therefore also asserted over the closure. It is
+    // deliberately only the first-party half: the third-party closure of
+    // reqwest is not a thing this workspace decides.
+    let closure = reachable_from(
+        &member_graph(&meta),
+        "rustdar-source",
+        &["normal", "dev", "build"],
+    );
+    let outside: Vec<_> = closure
+        .keys()
+        .filter(|name| !NORMAL_CEILING.contains(&name.as_str()))
+        .collect();
+    assert!(
+        outside.is_empty(),
+        "rustdar-source reaches the workspace members {outside:?}, which are \
+         outside the charter ceiling even though nothing in its own manifest \
+         names them. The substrate is contract/vocabulary only, and it is what \
+         it *compiles*, not what it spells.",
+    );
+    assert!(
+        closure.contains_key("rustdar-geo"),
+        "the closure of rustdar-source is missing rustdar-geo, so the check \
+         above is reading nothing: {closure:?}",
+    );
 }
 
 /// **Neither layer crate declares a GUI dependency, of any kind.**
@@ -121,10 +263,19 @@ fn the_dependency_ceiling_holds() {
 ///
 /// The floor is the falsifiability half: both crates must declare *something*,
 /// or "declares no egui" is true of an empty list.
+///
+/// Graph-shaped for the same reason the radar cut is: a layer crate that picks
+/// up `rustdar-egui` has the toolkit in its build whether or not its own
+/// manifest ever spells `egui`. So the needles are checked against each root
+/// **and every workspace member in its closure**, which is where a real
+/// regression would come from — `rustdar-egui` is the crate that declares
+/// `egui`, and the day either layer crate reaches it, this goes red.
 #[test]
 fn no_layer_crate_declares_a_gui_dependency() {
     const GUI_CRATES: &[&str] = &["egui", "eframe", "epaint", "emath", "egui-winit"];
     let meta = metadata();
+    let graph = member_graph(&meta);
+
     for package in ["rustdar-overlays", "rustdar-source"] {
         let deps = declared_deps(&meta, package);
         assert!(
@@ -132,37 +283,141 @@ fn no_layer_crate_declares_a_gui_dependency() {
             "{package} declares no dependencies at all, so every absence below \
              is the reader's and not the manifest's",
         );
-        let gui: Vec<_> = deps
-            .iter()
-            .filter(|(_, name)| GUI_CRATES.contains(&name.as_str()))
-            .collect();
+        let closure = reachable_from(&graph, package, &["normal", "dev", "build"]);
         assert!(
-            gui.is_empty(),
-            "{package} declares {gui:?}. These crates are the layer contract \
-             and the vocabulary under it; a handler that can name the toolkit \
-             can draw, and then the seam is no longer the only way in. \
-             Anything genuinely shared belongs on the trait or in \
-             rustdar-source's own types.",
+            closure.contains_key("rustdar-geo"),
+            "the closure of {package} does not contain rustdar-geo, so every \
+             absence below is the walk's and not the manifest's: {:?}",
+            closure.keys().collect::<Vec<_>>(),
         );
+
+        for member in std::iter::once(package.to_string()).chain(closure.keys().cloned()) {
+            let gui: Vec<_> = declared_deps(&meta, &member)
+                .into_iter()
+                .filter(|(_, name)| GUI_CRATES.contains(&name.as_str()))
+                .collect();
+            let route = if member == package {
+                package.to_string()
+            } else {
+                render_route(package, &closure[&member])
+            };
+            assert!(
+                gui.is_empty(),
+                "{member} declares {gui:?}, and {package} reaches it:\n    \
+                 {route}\nThese crates are the layer contract and the \
+                 vocabulary under it; a handler that can name the toolkit can \
+                 draw, and then the seam is no longer the only way in. \
+                 Anything genuinely shared belongs on the trait or in \
+                 rustdar-source's own types.",
+            );
+        }
     }
+
+    // Presence control on the needles themselves: a renamed or dropped GUI
+    // crate would leave every absence above trivially true. rustdar-egui is
+    // outside both closures and must still declare one of these names.
+    let toolkit: Vec<_> = declared_deps(&meta, "rustdar-egui")
+        .into_iter()
+        .filter(|(_, name)| GUI_CRATES.contains(&name.as_str()))
+        .collect();
+    assert!(
+        !toolkit.is_empty(),
+        "rustdar-egui declares none of {GUI_CRATES:?}, so the needle list has \
+         rotted and the absences above prove nothing",
+    );
 }
 
-/// rustdar-overlays declares NO dependency on rustdar-radar, of any kind. The
-/// second half is the presence control that keeps the first falsifiable.
+/// **The two data crates cannot reach each other by any route.**
+///
+/// Both directions, though the name records the one that matters: the test as
+/// written only ever asked the overlays side, so rustdar-radar could have
+/// declared rustdar-overlays with nothing going red.
+///
+/// Not "rustdar-overlays does not name rustdar-radar" — that is the question
+/// this test used to ask, and it was the wrong one. A name check is
+/// direct-edge-only, so `rustdar-overlays -> X -> rustdar-radar` restores the
+/// entire nexrad pipeline into every overlay handler while the check reads
+/// green. The route is not hypothetical: `rustdar-device-profile` declares
+/// `rustdar-radar`, so a single new edge from the overlays side to the device
+/// profile would have been enough.
+///
+/// Two closures, because their severities differ. The `normal`-only one is what
+/// the shipped library compiles against and is the charter proper. The
+/// any-kind one adds rustdar-overlays' own dev- and build-dependencies: a route
+/// that opens only there does not put radar code in the shipped overlay, but it
+/// does put it in front of the compiler, and the rule this test replaced
+/// forbade it, so it stays forbidden.
+///
+/// The controls are the point. Three of them: the closure is non-empty and
+/// holds a crate rustdar-overlays really does stand on; a walk from `rustdar`
+/// must *find* rustdar-radar by a route of more than one hop, which only a
+/// walk that recurses can do; and both directions of the rustdar-source floor.
 #[test]
 fn the_overlays_to_radar_edge_stays_cut() {
     let meta = metadata();
+    let graph = member_graph(&meta);
+
+    // Both directions. The charter sentence is "they do not know about each
+    // other", and until this test grew its second arm only the overlays side
+    // was ever asserted — rustdar-radar was free to declare rustdar-overlays
+    // with nothing going red.
+    for (from, to) in [
+        ("rustdar-overlays", "rustdar-radar"),
+        ("rustdar-radar", "rustdar-overlays"),
+    ] {
+        let shipped = reachable_from(&graph, from, &["normal"]);
+        assert!(
+            !shipped.contains_key(to),
+            "{to} is reachable from {from}:\n    {}\nEvery {from} handler now \
+             compiles against the whole of {to}. That edge is the one the layer \
+             split exists to remove; anything both sides need belongs in \
+             rustdar-source instead.",
+            render_route(from, &shipped[to]),
+        );
+
+        let any_kind = reachable_from(&graph, from, &["normal", "dev", "build"]);
+        assert!(
+            !any_kind.contains_key(to),
+            "{to} is reachable from {from} through one of {from}'s own dev- or \
+             build-dependencies:\n    {}\nThis does not ship inside {from}, but \
+             its test and build targets compile {to}, and the charter forbids \
+             the edge in every kind.",
+            render_route(from, &any_kind[to]),
+        );
+
+        // Falsifiability floor: the closure is a real closure, not an empty set.
+        assert!(
+            shipped.contains_key("rustdar-source"),
+            "the closure of {from} does not contain rustdar-source, so the \
+             absence above is the walk's and not the manifest's: {:?}",
+            shipped.keys().collect::<Vec<_>>(),
+        );
+    }
+
+    // Transitivity control: `rustdar` names none of the pipeline crates, and
+    // reaches rustdar-radar only through rustdar-app. A walk that read direct
+    // edges alone — the bug this test was written to close — finds nothing
+    // here, so this assertion is exactly the one the old check failed.
+    let entry = reachable_from(&graph, "rustdar", &["normal", "dev", "build"]);
+    let indirect = entry
+        .get("rustdar-radar")
+        .expect("rustdar reaches rustdar-radar through rustdar-app");
+    assert!(
+        indirect.len() > 1,
+        "the walk reached rustdar-radar from rustdar in one hop ({indirect:?}), \
+         so it is reading declared edges rather than the closure",
+    );
+    assert!(
+        !declared_deps(&meta, "rustdar")
+            .iter()
+            .any(|(_, name)| name == "rustdar-radar"),
+        "rustdar now declares rustdar-radar directly, which retires this \
+         control — point it at another crate that is reachable only \
+         indirectly, do not delete it",
+    );
 
     let overlays = declared_deps(&meta, "rustdar-overlays");
     let radar = declared_deps(&meta, "rustdar-radar");
-
-    assert!(
-        !overlays.iter().any(|(_, name)| name == "rustdar-radar"),
-        "rustdar-overlays declares rustdar-radar again ({overlays:?}). That \
-         edge is what forced every overlay handler to compile against the \
-         whole radar pipeline; anything both sides need belongs in \
-         rustdar-source instead.",
-    );
     assert!(
         overlays
             .iter()
