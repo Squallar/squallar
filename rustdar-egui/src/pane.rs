@@ -1881,6 +1881,20 @@ impl PaneState {
         self.layers.iter().filter(|slot| slot.time.is_active())
     }
 
+    /// [`Self::animating_layers`], to write — the set the readiness pass walks
+    /// so that settling a loop is asked of every layer that is running one,
+    /// not of the radar slot by name (WI-2).
+    ///
+    /// It yields only slots that already exist, which is the one behavioural
+    /// difference from the radar-addressed walk it replaced:
+    /// [`Self::time_state_mut`] *creates* a slot for a layer the pane has
+    /// never heard of, so reading the radar timeline every frame materialised
+    /// an empty radar slot on every pane. An absent slot is inactive and had
+    /// nothing to settle either way.
+    pub fn animating_layers_mut(&mut self) -> impl Iterator<Item = &mut LayerSlot> {
+        self.layers.iter_mut().filter(|slot| slot.time.is_active())
+    }
+
     /// **Whether this pane's clock is running.** Asked of the pane, answered
     /// by the time-primary layer's [`LoopPhase`], which stays the one
     /// authority: a `playing` stored beside it would be a second truth to

@@ -360,7 +360,7 @@ fn a_loop_no_frame_of_which_can_render_is_switched_off() {
     let mgr = LoopDownloadManager::new();
 
     assert!(
-        settle_loop_phase(&mgr, 0, &mut ls, test_loop_allocation().plan_view_frames),
+        settle_radar_loop_phase(&mgr, 0, &mut ls, test_loop_allocation().plan_view_frames),
         "the caller has to release this pane's loop state"
     );
     assert!(!ls.is_active());
@@ -373,7 +373,7 @@ fn a_loop_still_waiting_on_its_scans_is_left_alone() {
     let mut mgr = LoopDownloadManager::new();
     mgr.mark_in_flight("KTLX", ts(0));
 
-    assert!(!settle_loop_phase(
+    assert!(!settle_radar_loop_phase(
         &mgr,
         0,
         &mut ls,
@@ -389,7 +389,7 @@ fn a_loop_still_waiting_on_its_scans_is_left_alone() {
             queue: [ts(1)].into_iter().collect(),
         },
     );
-    assert!(!settle_loop_phase(
+    assert!(!settle_radar_loop_phase(
         &mgr,
         0,
         &mut ls,
@@ -406,13 +406,116 @@ fn a_loop_with_something_to_show_is_promoted_rather_than_abandoned() {
     ls.frames[2].render_failed = true;
     let mgr = LoopDownloadManager::new();
 
-    assert!(!settle_loop_phase(
+    assert!(!settle_radar_loop_phase(
         &mgr,
         0,
         &mut ls,
         test_loop_allocation().plan_view_frames
     ));
     assert_eq!(ls.phase, LoopPhase::Ready);
+}
+
+// ── The settle mechanism is layer-agnostic (WI-2) ─────────────────────────
+//
+// A model layer's timeline is a `LayerTimeState` like radar's with the two
+// radar-shaped halves absent: no `LoopGeometry` in `anchor`, so nothing can
+// read a NEXRAD site out of it, and no `RenderTarget` in `rendered_for`, so
+// nothing can read a `RadarProduct` out of it either.
+
+/// `loop_on`'s timeline stripped of exactly those two halves.
+///
+/// The frames still carry radar's image variant, because it is the only one
+/// that exists at this work item — `LoopFrameImage::Overlay` arrives with the
+/// draw fork (WI-6). Nothing under test here looks inside an image.
+fn model_shaped_loop(ctx: &egui::Context, textured: &[usize]) -> LayerTimeState {
+    let mut ls = loop_on(ctx, "KTLX", textured);
+    ls.anchor = None;
+    ls.rendered_for = None;
+    ls
+}
+
+/// The acceptance of WI-2: a loop with no radar geometry reaches `Ready`.
+///
+/// Before this item the mechanism could not get here at all. `loop_batch_settled`
+/// asks `loop_product` for a `RadarProduct` and answers "nothing has settled"
+/// without one, so a model timeline was pinned in `Rendering` for good — and a
+/// loop that never leaves `Rendering` is a loop whose Play button never enables.
+#[test]
+fn a_loop_with_no_radar_geometry_still_reaches_ready() {
+    let ctx = egui::Context::default();
+    let mut ls = model_shaped_loop(&ctx, &[1]);
+
+    assert!(ls.anchor.is_none(), "precondition: no radar geometry");
+    assert_eq!(
+        rustdar_egui::radar_layer::site(&ls),
+        "",
+        "precondition: and reading a site out of it answers the empty string \
+         rather than refusing — which is what made the gate below dangerous"
+    );
+
+    assert!(
+        !settle_loop_phase(0, &mut ls, |_| true, |_| false),
+        "a loop with a frame to show is promoted, not switched off"
+    );
+    assert_eq!(ls.phase, LoopPhase::Ready);
+}
+
+/// **The correctness pin of WI-2.** A non-radar loop whose frames are still
+/// loading must survive the readiness pass with its timeline intact.
+///
+/// This is the failure `radar_layer::site` in the generic path produced, and it
+/// is worse than a stall: the site read answers `""`, nothing is ever in flight
+/// for `""`, so `settle_loop_phase` fell through to `*ls = LayerTimeState::new()`
+/// and **destroyed a working loop while its data was on the wire**. The
+/// assertion is therefore about the surviving state, not about a call.
+#[test]
+fn a_model_loop_whose_frames_are_still_arriving_is_not_destroyed() {
+    let ctx = egui::Context::default();
+    let mut ls = model_shaped_loop(&ctx, &[]);
+    let frames_before = ls.frames.len();
+    assert!(
+        frames_before > 0 && ls.frames.iter().all(|f| f.image.is_none()),
+        "precondition: a timeline that has everything still to fetch"
+    );
+
+    // The layer says its data is still coming. What is asserted is the state
+    // that survives the call, in that order deliberately: the damage this pins
+    // is a wiped timeline, so the timeline is what gets read first.
+    let switched_off = settle_loop_phase(0, &mut ls, |_| true, |_| true);
+
+    assert_eq!(
+        ls.frames.len(),
+        frames_before,
+        "the loop's frames must survive a pass made while they are still loading"
+    );
+    assert!(ls.is_active(), "and so must the loop itself");
+    assert_eq!(ls.phase, LoopPhase::Rendering, "still working");
+    assert!(!switched_off, "so the caller is never told to release it");
+}
+
+/// Non-triviality: radar's `still_arriving` closure is answered by the download
+/// manager and keyed to the loop's own site, so a closure that ignored its
+/// argument could not stand in for it.
+#[test]
+fn the_radar_arm_reads_its_arrivals_from_the_download_manager() {
+    let ctx = egui::Context::default();
+    let ktlx = loop_on(&ctx, "KTLX", &[]);
+    let koun = loop_on(&ctx, "KOUN", &[]);
+    let mut mgr = LoopDownloadManager::new();
+
+    assert!(
+        !radar_still_arriving(&mgr, &ktlx),
+        "nothing is on the wire yet"
+    );
+    mgr.mark_in_flight("KTLX", ts(0));
+    assert!(
+        radar_still_arriving(&mgr, &ktlx),
+        "the manager is what says a volume is in flight"
+    );
+    assert!(
+        !radar_still_arriving(&mgr, &koun),
+        "and another site's download is not this loop's"
+    );
 }
 
 #[test]
@@ -1055,5 +1158,57 @@ fn hovering_a_looping_pane_reads_a_value_out_of_the_frames_own_volume() {
     assert_eq!(
         orphan.hover.read(90.0, 20.0),
         rustdar_radar::hover::Reading::NotResident,
+    );
+}
+
+// ── The readiness walk itself (WI-2) ──────────────────────────────────────
+
+/// **The claim WI-2 exists to make**, asserted through the real walk rather
+/// than through a direct `settle_loop_phase` call: `update_loop_readiness`
+/// settles *every* animating layer on a pane, not radar's slot by name.
+///
+/// Both halves matter and neither may be dropped. A walk narrowed to
+/// `known::RADAR` leaves the model layer stuck in `Rendering` forever — which
+/// is the hard-wire this item removes — and a walk narrowed to everything
+/// *but* radar is the same defect mirrored, so radar's own slot is asserted on
+/// the same pane in the same pass.
+#[test]
+fn the_readiness_walk_settles_every_animating_layer_not_only_radar() {
+    let ctx = egui::Context::default();
+    let mut app = crate::app::tests::headless(crate::platform_double::TestBridge::desktop());
+
+    let pane = app.gui.pane_mut(0).expect("a pane exists");
+    *pane.time_state_mut(&rustdar_source::id::known::RADAR) = loop_on(&ctx, "KTLX", &[1]);
+    *pane.time_state_mut(&rustdar_source::id::known::MODEL_DATA) = model_shaped_loop(&ctx, &[1]);
+
+    let pane = app.gui.pane(0).unwrap();
+    assert_eq!(
+        pane.time_state(&rustdar_source::id::known::MODEL_DATA)
+            .phase,
+        LoopPhase::Rendering,
+        "precondition: the model layer is animating and has not settled"
+    );
+    assert_eq!(
+        pane.animating_layers().count(),
+        2,
+        "precondition: the pane really is running two loops, so the walk has \
+         something to choose wrongly between"
+    );
+
+    app.update_loop_readiness();
+
+    let pane = app.gui.pane(0).unwrap();
+    assert_eq!(
+        pane.time_state(&rustdar_source::id::known::MODEL_DATA)
+            .phase,
+        LoopPhase::Ready,
+        "the model layer has a frame to show, so the walk must settle it — a \
+         loop left in Rendering is a loop whose Play button never enables"
+    );
+    assert!(
+        pane.time_state(&rustdar_source::id::known::RADAR)
+            .is_render_ready(),
+        "and radar's own slot is still settled by the same pass (it goes on to \
+         Playing, because the transport addresses it and playback then starts)"
     );
 }
