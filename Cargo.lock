@@ -4448,6 +4448,7 @@ dependencies = [
  "rustdar-geo",
  "rustdar-kv",
  "rustdar-location",
+ "rustdar-overlays",
  "rustdar-radar",
  "rustdar-source",
  "rustdar-worker",

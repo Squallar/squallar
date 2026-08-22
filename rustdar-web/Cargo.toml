@@ -51,6 +51,12 @@ log = { workspace = true }
 # wasm-bindgen into the graph at all.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 rustdar-app = { workspace = true }
+# `nws::zone_pack_source`, to name where the NWS zone pack is served from --
+# only the browser knows the origin the app was served from, so only this crate
+# can resolve the asset URL. Named directly rather than gated behind a
+# re-export: the crate is already in this package's graph via rustdar-app, so
+# the line adds no compiled package.
+rustdar-overlays = { workspace = true }
 # The job engine: `worker` runs `execute_encoded`, `worker_port` feeds the
 # funnel, and `worker_protocol` folds `wire_identity`'s digest into the build
 # token (extracted from rustdar-app at WO-RW).
@@ -75,6 +81,10 @@ features = [
     "Element",
     "HtmlCanvasElement",
     "Storage",
+    # `Location::href`, which is how the zone pack's asset URL is resolved
+    # against the page: the deploy is served from `/rustdar/` on Pages and from
+    # `/` elsewhere, and the pack sits beside index.html in both.
+    "Location",
     "Navigator",
     # Theme detection. Enabled transitively by winit today, but web-sys features
     # are additive across the graph and relying on that would mean this crate

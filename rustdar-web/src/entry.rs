@@ -27,6 +27,12 @@ pub fn start() -> Result<(), JsValue> {
 
     log::info!("rustdar starting (wasm32, WebGL2)");
 
+    // Before the app, because the first alerts round is what consumes it. Not
+    // fatal and not awaited: the asset is fetched later, on the fetch task, and
+    // a browser that will not name its own location simply resolves zones the
+    // way it did before the pack existed.
+    name_the_zone_pack();
+
     let canvas = canvas_by_id(CANVAS_ID)?;
 
     let event_loop =
@@ -46,6 +52,30 @@ pub fn start() -> Result<(), JsValue> {
 
     event_loop.spawn_app(app);
     Ok(())
+}
+
+/// Point zone resolution at the pack served beside `index.html`.
+///
+/// The URL has to be built here because only the browser knows it: the app is
+/// served from `/rustdar/` on Pages and from `/` on CloudFront and on a local
+/// `http.server`, and the pack sits next to the page in all three.
+/// [`asset_url`](rustdar_overlays::nws::zone_pack_source::asset_url) does the
+/// resolving and is tested on the host; this is the two lines that cannot be.
+fn name_the_zone_pack() {
+    use rustdar_overlays::nws::zone_pack::PACK_FILE_NAME;
+    use rustdar_overlays::nws::zone_pack_source::{PackSource, asset_url, use_source};
+
+    let Some(href) = web_sys::window().and_then(|window| window.location().href().ok()) else {
+        log::info!("No document location; NWS zones will resolve over HTTP");
+        return;
+    };
+    match asset_url(&href, PACK_FILE_NAME) {
+        Some(url) => {
+            log::info!("NWS zone pack will be fetched from {url}");
+            use_source(PackSource::Url(url));
+        }
+        None => log::info!("{href} names no directory to fetch {PACK_FILE_NAME} from"),
+    }
 }
 
 /// Fetched by id rather than created here: the canvas has to be sized by CSS

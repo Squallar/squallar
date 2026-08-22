@@ -454,6 +454,58 @@ fn the_worker_precaches_the_manifest_and_both_halves_of_the_wasm_bundle() {
     );
 }
 
+/// The zone pack is the one large same-origin asset the app fetches, and the
+/// two lists it could be named in mean opposite things.
+///
+/// `ASSET_PATHS` is routed and cached on demand; `SHELL_PATHS` is precached
+/// with all-or-nothing `cache.addAll`. Moving the pack into the shell list
+/// would mean a pack that 404s — which is the normal state of a deploy that has
+/// not run the converter — takes offline support for the whole app with it.
+#[test]
+fn the_zone_pack_is_a_routed_asset_and_never_part_of_the_all_or_nothing_shell() {
+    let assets = js_string_list(SERVICE_WORKER, "const ASSET_PATHS = [");
+    let shell = js_string_list(SERVICE_WORKER, "const SHELL_PATHS = [");
+    assert!(!assets.is_empty(), "ASSET_PATHS in sw.js parsed as empty");
+
+    let pack = zone_pack_file_name();
+    assert!(
+        assets.iter().any(|path| *path == pack),
+        "sw.js does not route {pack:?}, so every session would re-download it \
+         and no offline session would have it at all",
+    );
+    assert!(
+        !shell.iter().any(|path| *path == pack),
+        "sw.js precaches {pack:?} in the all-or-nothing shell install. A pack \
+         that does not fetch is a supported state for the app, and must never \
+         be able to cost it offline support.",
+    );
+    for path in &assets {
+        assert!(
+            !path.starts_with('/') && !path.contains("://"),
+            "asset path {path:?} is not relative to the deploy directory",
+        );
+    }
+}
+
+/// `PACK_FILE_NAME` as `rustdar-overlays` declares it, read out of the source
+/// rather than linked: that crate is not in this test's graph, and a literal
+/// here would be a second declaration for the first to drift from.
+fn zone_pack_file_name() -> String {
+    let workspace = web_dir()
+        .parent()
+        .expect("rustdar-web sits in the workspace")
+        .to_path_buf();
+    let source = std::fs::read_to_string(workspace.join("rustdar-overlays/src/nws/zone_pack.rs"))
+        .expect("rustdar-overlays declares the pack's file name");
+    let marker = "pub const PACK_FILE_NAME: &str = \"";
+    let start = source
+        .find(marker)
+        .expect("zone_pack.rs no longer declares PACK_FILE_NAME")
+        + marker.len();
+    let end = start + source[start..].find('"').expect("unterminated literal");
+    source[start..end].to_string()
+}
+
 /// The rasterization worker keeps a ~160-190 ms Level II frame off the main
 /// thread, and every way of losing it is silent.
 #[test]

@@ -864,6 +864,98 @@ describe("updates: a degraded version probe is visible and escapable", () => {
 });
 
 // ===========================================================================
+describe("assets: the zone pack is cached, and never at the shell's expense", () => {
+  // =========================================================================
+
+  const PACK_URL = `${ORIGIN}zones.pack`;
+
+  /** Serve a pack of `body` and fetch it once through the worker. */
+  async function fetchPack(worker, body = "NWSZPK...") {
+    worker.network.serve(
+      PACK_URL,
+      () => new Response(body, { status: 200, headers: { "content-type": "application/octet-stream" } }),
+    );
+    return worker.fetch(new Request(PACK_URL));
+  }
+
+  it("routes the pack to its own cache and not to the shell", async () => {
+    const worker = await bootWorker();
+    const { routeFor, SHELL_URLS, ASSET_PATHS } = worker.internals;
+
+    assert.equal(routeFor({ url: PACK_URL }), "asset");
+    assert.ok(ASSET_PATHS.includes("zones.pack"), "the pack must be a declared asset");
+
+    // The whole reason it is a separate route: `SHELL_PATHS` is installed with
+    // `cache.addAll`, which is all-or-nothing, so a multi-megabyte entry that
+    // failed to fetch would take offline support for the entire app with it.
+    assert.ok(
+      !SHELL_URLS.includes(PACK_URL),
+      "the pack is in the all-or-nothing shell install; one bad fetch would " +
+        "cost the app its offline support",
+    );
+
+    // The rule is confined the same way the shell rule is.
+    assert.equal(routeFor({ url: "https://rustdar.example/zones.pack" }), "network");
+    assert.equal(routeFor({ url: `${ORIGIN}zones.pack`, method: "POST" }), "network");
+  });
+
+  it("serves the second request from cache without touching the network", async () => {
+    const worker = await bootWorker();
+    const first = await fetchPack(worker);
+    assert.equal(first.handled, true, "the worker must be in the pack's request path");
+    assert.equal(await (await first.response).text(), "NWSZPK...");
+
+    const before = worker.network.log.length;
+    const second = await worker.fetch(new Request(PACK_URL));
+    assert.equal(await (await second.response).text(), "NWSZPK...");
+    assert.equal(
+      worker.network.log.length,
+      before,
+      "the pack was refetched; one download per session is the entire point",
+    );
+  });
+
+  it("keeps the pack across a deploy, which the shell deliberately does not", async () => {
+    let worker = await bootWorker({ tag: "A" });
+    await fetchPack(worker);
+    assert.ok(worker.caches.countEntries((n) => n.startsWith("rustdar-assets-")) > 0);
+
+    // A new deploy: the validator token moves, the shell is refetched whole,
+    // and `purgeCaches` deletes every `rustdar-` cache not named in
+    // `cachesToKeep`. The pack changes when the NWS publishes a new zone
+    // edition, not when rustdar ships, so it must survive.
+    publishDeploy(worker.network, ORIGIN, "B");
+    await worker.message({ type: "rustdar:check-update" });
+    worker = await restartWorker(worker);
+
+    const before = worker.network.log.length;
+    const after = await worker.fetch(new Request(PACK_URL));
+    assert.equal(await (await after.response).text(), "NWSZPK...");
+    assert.equal(
+      worker.network.log.length,
+      before,
+      "the deploy purged the pack; every push to main would re-download it",
+    );
+  });
+
+  it("does not cache a failed fetch, so a bad pack is not made permanent", async () => {
+    const worker = await bootWorker();
+    worker.network.serve(PACK_URL, () => new Response("nope", { status: 404 }));
+    const missed = await worker.fetch(new Request(PACK_URL));
+    assert.equal((await missed.response).status, 404);
+    assert.equal(
+      worker.caches.countEntries((n) => n.startsWith("rustdar-assets-")),
+      0,
+      "a 404 was written to the asset cache and would be served forever",
+    );
+
+    // And the app recovers on the next session, because nothing was stored.
+    const found = await fetchPack(worker);
+    assert.equal(await (await found.response).text(), "NWSZPK...");
+  });
+});
+
+// ===========================================================================
 describe("tiles: the basemap cache stays bounded", () => {
   // =========================================================================
 
