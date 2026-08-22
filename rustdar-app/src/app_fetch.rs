@@ -656,7 +656,7 @@ impl super::App {
             }
             GuiAction::ToggleLoopPlayback { pane_idx } => {
                 if let Some(pane) = self.gui.pane_mut(pane_idx) {
-                    let ls = pane.loop_state_mut();
+                    let ls = pane.transport_state_mut();
                     match ls.phase {
                         rustdar_egui::pane::LoopPhase::Playing => {
                             ls.phase = rustdar_egui::pane::LoopPhase::Paused;
@@ -672,7 +672,7 @@ impl super::App {
             }
             GuiAction::StepLoopFrame { pane_idx, forward } => {
                 if let Some(pane) = self.gui.pane_mut(pane_idx) {
-                    let ls = pane.loop_state_mut();
+                    let ls = pane.transport_state_mut();
                     let next = (!ls.frames.is_empty()).then(|| {
                         let current = ls.current_frame();
                         if forward {
@@ -684,7 +684,7 @@ impl super::App {
                         }
                     });
                     if let Some(next) = next {
-                        pane.park_on_loop_frame(next);
+                        pane.park_on_transport_frame(next);
                     }
                 }
             }
@@ -693,7 +693,7 @@ impl super::App {
                 frame_index,
             } => {
                 if let Some(pane) = self.gui.pane_mut(pane_idx) {
-                    pane.park_on_loop_frame(frame_index);
+                    pane.park_on_transport_frame(frame_index);
                 }
             }
             GuiAction::NavigateTime {

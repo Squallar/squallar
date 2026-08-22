@@ -77,6 +77,20 @@ struct PaneConfig {
     /// Whether this pane's layer state belongs to the linked group.
     #[serde(default = "default_true")]
     layer_link: bool,
+    /// **Which layer this pane's loop transport addresses** — the timeline
+    /// the ∞ toggle and the transport buttons move. An absent key reads as
+    /// [`known::RADAR`], which is what every config written before the field
+    /// existed described: radar was the only layer the transport could
+    /// address. See [`crate::pane::PaneState::transport_layer`].
+    ///
+    /// **Written only when it is not radar.** A key whose absence and whose
+    /// default say the same thing must not appear in a file that never moved
+    /// it: a saved config is asserted to come back byte-for-byte under a
+    /// build that cannot serve one of its layers, and a new key on every pane
+    /// would break that reopen for every user who never asked for a model
+    /// transport.
+    #[serde(default = "default_transport", skip_serializing_if = "is_radar")]
+    transport: LayerId,
     /// **This pane's layer stack, bottom to top** — the v3 shape. One entry
     /// per layer, each carrying its own id, enabled flag and saved config;
     /// the list's order IS the draw order. Replaces v2's three parallel
@@ -457,6 +471,18 @@ fn default_group() -> Option<u8> {
     Some(crate::pane::GroupId::FIRST.index())
 }
 
+/// A pane whose config names no transport layer is a pane from before the
+/// transport could address anything but radar. See [`PaneConfig::transport`].
+fn default_transport() -> LayerId {
+    known::RADAR
+}
+
+/// Whether a transport layer is the one an absent key already means. See
+/// [`PaneConfig::transport`].
+fn is_radar(id: &LayerId) -> bool {
+    *id == known::RADAR
+}
+
 impl Default for PaneConfig {
     fn default() -> Self {
         Self {
@@ -467,6 +493,7 @@ impl Default for PaneConfig {
             time_link: true,
             viewport_link: true,
             layer_link: true,
+            transport: default_transport(),
             layer_slots: SlotList::default(),
             zoom: None,
             center: None,
@@ -985,6 +1012,7 @@ impl super::Gui {
                     time_link: pane.time_link,
                     viewport_link: pane.viewport_link,
                     layer_link: pane.layer_link,
+                    transport: pane.transport_layer().clone(),
                     layer_slots: pane_slot_list(pane, global_live_chunks),
                     unknown: pane.config_baggage.fields.clone(),
                     zoom: pane
@@ -1302,6 +1330,7 @@ impl super::Gui {
             pane.time_link = pc.time_link && config.sync_layers;
             pane.viewport_link = pc.viewport_link && config.viewport_sync;
             pane.layer_link = pc.layer_link && config.sync_layers;
+            pane.set_transport_layer(pc.transport.clone());
             pane.set_content(restore_content(i, pc, count));
             pane.config_baggage = crate::pane::PaneConfigBaggage {
                 layer_slots: pc.layer_slots.unknown.clone(),

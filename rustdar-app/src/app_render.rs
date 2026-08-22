@@ -2144,7 +2144,7 @@ impl super::App {
             let Some(pane) = self.gui.pane(idx) else {
                 continue;
             };
-            let ls = pane.loop_state();
+            let ls = pane.transport_state();
             if !ls.is_active() {
                 continue;
             }
@@ -2179,7 +2179,7 @@ impl super::App {
                 continue;
             }
             let pane = self.gui.pane_mut(idx).unwrap();
-            let ls = pane.loop_state_mut();
+            let ls = pane.transport_state_mut();
             ls.phase = rustdar_egui::pane::LoopPhase::Playing;
             ls.last_advance = Some(now);
             // Align all panes to the last frame so they start from the same
