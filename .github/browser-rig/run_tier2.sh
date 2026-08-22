@@ -53,6 +53,14 @@
 #
 # Without --expect-cross-origin-isolated the run proves nothing: a browser
 # that ignored the headers looks exactly like one that honoured them.
+#
+# ADAPTER: this gate is the rig's SOFTWARE arm, deliberately and permanently.
+# Chromium runs on SwiftShader and Firefox on Xvfb -> Mesa llvmpipe, so it is
+# deterministic and runs on a CI box with no GPU. Every cap it reports
+# (MAX_TEXTURE_SIZE and friends) therefore describes a software rasteriser and
+# must never be promoted into a budget. The real-driver figures come from
+# run_gpu_arm.sh, which is a measurement arm and not a gate. The two are never
+# merged; each prints its arm and renderer beside every cap it quotes.
 
 set -u -o pipefail   # not -e: attempt every leg and still summarise
 
@@ -296,8 +304,17 @@ for tag in sys.argv[2:]:
     else:
         webgpu = "object-but-no-adapter"
     sw = r.get("service_worker") or {}
-    print("%-18s   caps max_texture=%s max_3d=%s cores=%s webgpu=%s"
-          % ("", env.get("max_texture_size"), env.get("max_3d_texture_size"),
+    # The caps are properties of the ADAPTER, and this gate runs the SOFTWARE
+    # arm, so they describe SwiftShader / llvmpipe and not the machine. Name
+    # the arm and the renderer on the same line as the numbers -- a cap quoted
+    # without its adapter is how a budget gets sized for a rasteriser.
+    ad = r.get("adapter") or {}
+    print("%-18s   arm=%s adapter=%s (%s)"
+          % ("", r.get("arm", "software"), ad.get("class", "?"),
+             ad.get("renderer") or env.get("gl_renderer") or "?"))
+    print("%-18s   caps [%s] max_texture=%s max_3d=%s cores=%s webgpu=%s"
+          % ("", ad.get("renderer") or env.get("gl_renderer") or "?",
+             env.get("max_texture_size"), env.get("max_3d_texture_size"),
              env.get("hardware_concurrency"), webgpu))
     print("%-18s   isolation crossOriginIsolated=%s SAB=%s sw_blocked=%s "
           "sw_regs=%s resource_failures=%s"
