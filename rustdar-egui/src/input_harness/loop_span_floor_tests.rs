@@ -17,10 +17,14 @@ use rustdar_source::id::{LayerId, known};
 
 /// The hourly layer. A **real, registered** layer rather than a fixture: its
 /// `time_axis` declares a 3600 s step in the shipping build, so what is
-/// asserted below is what a user gets. Satellite is the layer the requirement
-/// names, but GMGSI is still `TimeAxis::Live` and implements no frame contract
-/// (WB-10/WB-11), so it cannot yet be looped over any window at all.
+/// asserted below is what a user gets.
 const HOURLY: LayerId = known::MODEL_DATA;
+
+/// **The layer the requirement actually named** — satellite imagery, hourly,
+/// looping. `TimeAxis::FrameSeries` with the whole frame contract behind it
+/// since WB-11; before that it was `Live` and could not be looped over any
+/// window at all.
+const SATELLITE: LayerId = known::GMGSI;
 
 /// The Lookback slider's own default, in seconds — `PaneTimePosture::default`
 /// and the config file's default are the same number.
@@ -191,5 +195,103 @@ fn the_tuning_caption_names_the_window_a_layer_with_its_own_floor_gets() {
     assert!(
         h.text_painted_in(h.screen_rect(), &row2.tuning_scope),
         "the caption is a probe string that never reached the glass"
+    );
+}
+
+/// **The span floor is what makes the satellite layer a loop at all** (WB-11).
+///
+/// GMGSI publishes one blended mosaic an hour, so the Lookback slider's own
+/// default of 3600 s buys **two** frames on it — a before-and-after. Its
+/// `min_loop_frames` of 13 is what turns that into a twelve-hour, thirteen-
+/// frame window, and this reads that window off the `EnableLoop` the infinity
+/// button really emitted rather than off `loop_span_secs_for`, which is the
+/// thing under test.
+///
+/// Radar in the same harness is the non-triviality control: its window is the
+/// slider's number to the second, so what is asserted is a floor and not a
+/// global widening.
+///
+/// **Floor — `no_satellite_floor`:** `Gmgsi::min_loop_frames` -> 0. Observed
+/// red: the window came back 3600 s — the slider's number, two hourly frames —
+/// instead of 43,200 s, so one global span was deciding both layers again.
+#[test]
+fn the_satellite_layer_loops_over_twelve_hours_and_radar_over_the_sliders() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+
+    let radar_window = enable_loop_window(&mut h);
+    assert_eq!(
+        radar_window, SLIDER_DEFAULT,
+        "control: radar is unaffected by the satellite layer's floor"
+    );
+
+    draw(&mut h, &SATELLITE, true);
+    draw(&mut h, &known::RADAR, false);
+    assert_eq!(
+        h.gui_mut().pane(0).expect("pane 0").transport_layer(),
+        &SATELLITE,
+        "precondition: GMGSI is a FrameSeries layer, so with radar off it is \
+         what the pane's transport addresses. Before WB-11 it was `Live` and \
+         this pane had no transport at all"
+    );
+
+    let satellite_window = enable_loop_window(&mut h);
+    assert_eq!(
+        satellite_window, 43_200,
+        "thirteen hourly mosaics is twelve hours end to end"
+    );
+    assert_eq!(
+        frames(satellite_window, 3600),
+        13,
+        "the window in the unit that matters: {} s at an hourly cadence",
+        satellite_window,
+    );
+    assert_eq!(
+        frames(SLIDER_DEFAULT, 3600),
+        2,
+        "and what the slider alone would have bought, which is not a loop"
+    );
+    assert_ne!(
+        satellite_window, radar_window,
+        "both layers were listed over the SAME window, so one global span is \
+         still deciding whatever the floor computes"
+    );
+
+    // The slider still governs above the floor, and nothing new persists.
+    h.gui_mut().set_loop_span_secs(86_400);
+    assert_eq!(
+        enable_loop_window(&mut h),
+        86_400,
+        "dragging Lookback past the floor must widen satellite too"
+    );
+}
+
+/// **The two hourly layers do not collide.** GMGSI's weight is 5 and the
+/// model's is 10, so a pane drawing both keeps the model as its transport —
+/// which is the whole of the WB-11 draw-order ruling, read at the pane rather
+/// than at the registry.
+///
+/// **Floor — `satellite_on_top`:** `Gmgsi::draw_order_weight` -> 20. Observed
+/// red: the transport moved to GMGSI on a pane that draws the model, which is
+/// the "must be ruled on, not absorbed" case.
+#[test]
+fn a_pane_drawing_both_hourly_layers_keeps_the_model_as_its_transport() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+    draw(&mut h, &SATELLITE, true);
+    draw(&mut h, &HOURLY, true);
+    draw(&mut h, &known::RADAR, false);
+
+    assert_eq!(
+        h.gui_mut().pane(0).expect("pane 0").transport_layer(),
+        &HOURLY,
+        "GMGSI is the lowest-weight layer registered, so it takes a pane's \
+         clock from nothing"
+    );
+    // And radar still outranks both.
+    draw(&mut h, &known::RADAR, true);
+    assert_eq!(
+        h.gui_mut().pane(0).expect("pane 0").transport_layer(),
+        &known::RADAR,
     );
 }

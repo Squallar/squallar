@@ -226,9 +226,28 @@ fn the_layer_declares_the_weight_and_the_clock_it_was_registered_with() {
         Some(600),
         "the blend lands 34 to 42 minutes after the hour it covers"
     );
-    assert!(
-        matches!(h.time_axis(), rustdar_source::time::TimeAxis::Live),
-        "a third FrameSeries layer needs a ruling; this one is Live",
+    assert_eq!(
+        h.time_axis(),
+        rustdar_source::time::TimeAxis::FrameSeries {
+            typical_step: std::time::Duration::from_secs(3600),
+            extends_future: false,
+        },
+        "the hourly blend, stopping at the wall clock",
+    );
+    assert_eq!(
+        h.min_loop_frames(),
+        13,
+        "thirteen hourly mosaics, matching what the model layer declares"
+    );
+    assert_eq!(
+        h.min_loop_span_secs(),
+        43_200,
+        "twelve hours: thirteen frames is twelve hourly steps end to end"
+    );
+    assert_eq!(
+        h.frame_horizon(&PaneRef::across(&[])),
+        chrono::Duration::zero(),
+        "a mosaic exists for an hour that has happened and for no other"
     );
     assert_eq!(h.render_mode(), RenderMode::Texture);
     assert_eq!(
@@ -563,4 +582,688 @@ fn a_fill_value_point_reports_no_reading() {
 fn a_point_outside_the_mosaic_reports_no_reading() {
     let h = handler_with(GmgsiChannel::LongwaveIr, vec![82.0; 8]);
     assert_eq!(h.hover_value_at(-60.0, 140.0, &PaneRef::across(&[])), None);
+}
+
+// -- The frame contract (WB-11) ---------------------------------------------
+
+/// Midnight of the fixture's day, so every hour below is `hour(k)`.
+fn hour(k: i64) -> chrono::NaiveDateTime {
+    chrono::NaiveDate::from_ymd_opt(2025, 6, 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        + chrono::Duration::hours(k)
+}
+
+/// A granule for `hour(k)` whose **values name the hour**, so two frames' grids
+/// can never be mistaken for one another however they are compared.
+fn granule_at(channel: GmgsiChannel, k: i64, n: usize) -> GmgsiGrid {
+    let mut g = grid_of(channel, vec![k as f32; n]);
+    g.valid_time = hour(k);
+    g
+}
+
+/// The object key a listing would have found for `hour(k)` — unpredictable in
+/// production (`_c` is the creation stamp), arbitrary here.
+fn object_key(channel: GmgsiChannel, k: i64) -> String {
+    format!(
+        "{}/{}/{}_v3r0_blend_s{}00000_e{}09599_c{}34579.nc",
+        channel.prefix(),
+        hour(k).format("%Y/%m/%d/%H"),
+        channel.object_stem(),
+        hour(k).format("%Y%m%d%H"),
+        hour(k).format("%Y%m%d%H"),
+        hour(k).format("%Y%m%d%H"),
+    )
+}
+
+/// Hand the handler the listing its own `create_frame_list_task` would have
+/// produced for hours `0..count`, on the one production door.
+fn file_listing(h: &mut GmgsiHandler, channel: GmgsiChannel, count: i64, complete: bool) {
+    let range = (hour(0), hour(count - 1));
+    let keys: Vec<(chrono::NaiveDateTime, String)> = (0..count)
+        .map(|k| (hour(k), object_key(channel, k)))
+        .collect();
+    h.apply_frame_listing(
+        FrameListing {
+            range,
+            frames: keys
+                .iter()
+                .map(|(valid, _)| FrameStamp {
+                    valid: *valid,
+                    run: None,
+                })
+                .collect(),
+            complete,
+        },
+        Box::new(GmgsiListing {
+            channel,
+            range,
+            keys,
+            complete,
+        }),
+        &PaneRef::across(&[]),
+    );
+}
+
+/// Deliver one frame's granule on the one production door.
+fn file_frame(h: &mut GmgsiHandler, channel: GmgsiChannel, k: i64, n: usize) {
+    h.apply_frame(
+        FrameStamp {
+            valid: hour(k),
+            run: None,
+        },
+        Box::new(GmgsiFrameFetch {
+            channel,
+            valid: hour(k),
+            grid: Some(granule_at(channel, k, n)),
+        }),
+        &PaneRef::across(&[]),
+    );
+}
+
+fn frame_ctx(k: i64) -> RasterizeContext {
+    RasterizeContext {
+        frame: Some(FrameStamp {
+            valid: hour(k),
+            run: None,
+        }),
+        ..rctx()
+    }
+}
+
+/// The values the job describes, so a raster's identity can be read without
+/// comparing 60 MB by hand.
+fn job_values(job: &DescribedJob) -> Vec<f32> {
+    let input = job
+        .downcast_ref::<rasterize::GriddedInput>()
+        .expect("the gridded carry");
+    let rasterize::GriddedInput::Resident(grid) = input else {
+        panic!("GMGSI must describe a Resident carry, not {input:?}");
+    };
+    grid.values.clone()
+}
+
+/// A `FetchConfig` with nothing behind it: every test here stops before the
+/// network, and the two methods that take one read only `client`/`sources` to
+/// clone into a future nothing polls.
+///
+/// `tls::client` and not `reqwest::Client::new()`: the bare constructor panics
+/// for want of a crypto provider, and it only *happens* to work in a whole-lib
+/// run because some earlier test installed one. That is a filtered run reading
+/// green off another test's side effect.
+fn fetch_config() -> FetchConfig {
+    FetchConfig {
+        client: rustdar_source::tls::client(
+            rustdar_source::tls::USER_AGENT,
+            std::time::Duration::from_secs(1),
+        )
+        .build()
+        .expect("a client with a crypto provider installed"),
+        zone_cache_dir: None,
+        sources: rustdar_source::origins::DataSources::default(),
+        viewport: None,
+        as_of: chrono::Utc::now().naive_utc(),
+    }
+}
+
+/// **The correctness pin of the whole item.** A named frame is rasterized from
+/// **that frame's** granule; the live dispatch is untouched; and a frame whose
+/// granule is not staged describes nothing rather than the pane's picture.
+///
+/// Values, not `Arc::ptr_eq`: the failure this guards is every frame receiving
+/// the *same* picture, and a pointer test can be satisfied by the wrong shared
+/// granule.
+///
+/// **Floor — `ignore_the_frame`:** delete the `ctx.frame` arm of `prepare_job`
+/// so it always reads the live cache.
+#[test]
+fn a_named_frame_is_rasterized_from_that_frames_granule_and_not_the_panes() {
+    let channel = GmgsiChannel::LongwaveIr;
+    // The live picture is a granule NO frame shares, so a fallback to it is
+    // visible rather than coincidentally right.
+    let mut h = handler_with(channel, vec![7.0; 8]);
+    file_listing(&mut h, channel, 13, true);
+    // A staging area with room for both, so what is asserted is the LOOKUP and
+    // not the eviction policy, which has its own test below.
+    h.frame_grids = GmgsiFrameCache::new(4 * 8 * 4);
+    file_frame(&mut h, channel, 3, 8);
+    file_frame(&mut h, channel, 9, 8);
+
+    let pane = PaneRef::across(&[]);
+    let at = |k: i64| {
+        job_values(
+            &h.prepare_job(&frame_ctx(k), &pane)
+                .expect("a staged frame describes a job"),
+        )
+    };
+    assert_eq!(
+        at(3),
+        vec![3.0f32; 8],
+        "the frame at 03z was drawn from another hour's granule"
+    );
+    assert_eq!(
+        at(9),
+        vec![9.0f32; 8],
+        "the frame at 09z was drawn from another hour's granule"
+    );
+    assert_ne!(
+        at(3),
+        at(9),
+        "two frames of one loop described the SAME picture; every frame of the \
+         loop would be the same image and nothing else in the build detects it"
+    );
+
+    // The live dispatch is unmoved: `frame: None` still describes the pane's
+    // own selection, which is what every non-looping pane does.
+    assert_eq!(
+        job_values(&h.prepare_job(&rctx(), &pane).expect("the live picture")),
+        vec![7.0f32; 8],
+    );
+
+    // And a listed frame with no granule staged describes NOTHING, rather than
+    // handing this hour the live picture under another hour's label.
+    assert!(
+        h.prepare_job(&frame_ctx(5), &pane).is_none(),
+        "an unstaged frame fell back to the pane's picture: one hour's \
+         satellite image presented, unlabelled, as another's"
+    );
+}
+
+/// **Residency does not grow with the frame count.**
+///
+/// Thirteen frames are listed, thirteen granules are delivered one after
+/// another exactly as the serialised fetch delivers them, and the layer never
+/// holds more than the staging budget buys — one mosaic.
+///
+/// The byte arithmetic, with its denominator: **one mosaic is
+/// `3000 * 5000 * 4` = 60,000,000 B (57.22 MiB)**, so thirteen resident would
+/// be 780,000,000 B — against a 96 MiB wasm model pool and a 56 MiB wasm loop
+/// pool, 14x and 15x over. The loop's own storage is thirteen *textures* at
+/// 11.06 MB for a 1280x960-point pane, which is a different budget in a
+/// different crate.
+///
+/// **Floor — `stage_every_frame`:** delete the eviction loop in
+/// `GmgsiFrameCache::insert`.
+#[test]
+fn the_layer_stages_one_granule_however_many_frames_the_loop_holds() {
+    let channel = GmgsiChannel::LongwaveIr;
+    // Room for exactly one 8-value grid: the shipped ratio, at a size a test
+    // can reach.
+    let mut h = GmgsiHandler::with_frame_budget(4 * 8);
+    h.defaults.enabled = true;
+    h.defaults.selected_channel = channel;
+    file_listing(&mut h, channel, 13, true);
+
+    let pane = PaneRef::across(&[]);
+    let ctx = fetch_config();
+    assert_eq!(
+        h.list_frames(&ctx, &pane, (hour(0), hour(12))).frames.len(),
+        13,
+        "premise: the listing must have named thirteen frames, or there is no \
+         frame count for residency to fail to track"
+    );
+
+    for k in 0..13 {
+        file_frame(&mut h, channel, k, 8);
+        assert_eq!(
+            h.frame_grids.len(),
+            1,
+            "after {} granules the layer holds {}. One mosaic is \
+             3000 x 5000 x 4 = {GLOBAL_GRID_BYTES} B, so {} resident is {} B, \
+             against a 96 MiB model pool and a 56 MiB loop pool on wasm. A \
+             loop holds textures, not grids.",
+            k + 1,
+            h.frame_grids.len(),
+            h.frame_grids.len(),
+            h.frame_grids.len() * GLOBAL_GRID_BYTES,
+        );
+        assert_eq!(
+            h.frames_resident(&pane),
+            vec![FrameStamp {
+                valid: hour(k),
+                run: None
+            }],
+            "the one staged granule must be the one that just landed"
+        );
+    }
+
+    // The shipped arithmetic the fixture stands in for.
+    assert_eq!(
+        FRAME_STAGING_BYTES, GLOBAL_GRID_BYTES,
+        "one mosaic stages at a time on every arm"
+    );
+    assert_eq!(
+        13 * GLOBAL_GRID_BYTES,
+        780_000_000,
+        "thirteen resident granules, spelled out"
+    );
+}
+
+/// **One granule at a time is enough for the pipeline to advance**, which is
+/// the claim the staging budget rests on.
+///
+/// Each arrival is described into a job before the next lands — the order the
+/// pump imposes, since the fetches are serialised and the pump runs between
+/// them — and the job keeps its own refcount, so the picture survives the
+/// eviction the very next arrival causes.
+///
+/// **Floor — `describe_after_the_flood`:** move the `prepare_job` calls below
+/// the loop that delivers all thirteen granules.
+#[test]
+fn a_granule_evicted_after_its_job_is_described_still_paints_that_frame() {
+    let channel = GmgsiChannel::LongwaveIr;
+    let mut h = GmgsiHandler::with_frame_budget(4 * 8);
+    h.defaults.enabled = true;
+    h.defaults.selected_channel = channel;
+    file_listing(&mut h, channel, 13, true);
+    let pane = PaneRef::across(&[]);
+
+    let mut described: Vec<Vec<f32>> = Vec::new();
+    for k in 0..13 {
+        file_frame(&mut h, channel, k, 8);
+        let job = h
+            .prepare_job(&frame_ctx(k), &pane)
+            .expect("the granule that just landed is the one staged");
+        described.push(job_values(&job));
+    }
+
+    assert_eq!(
+        described,
+        (0..13).map(|k| vec![k as f32; 8]).collect::<Vec<_>>(),
+        "thirteen frames must have described thirteen different pictures"
+    );
+    assert_eq!(
+        h.frame_grids.len(),
+        1,
+        "and one granule was resident the whole way through"
+    );
+}
+
+/// A fetch asks for one granule by the key its listing found: **1 GET, no
+/// second LIST** — and declines a stamp nothing listed, or one already staged.
+#[test]
+fn a_frame_fetch_is_declined_where_there_is_no_key_and_where_the_granule_is_held() {
+    let channel = GmgsiChannel::LongwaveIr;
+    let mut h = GmgsiHandler::with_frame_budget(4 * 8);
+    h.defaults.enabled = true;
+    h.defaults.selected_channel = channel;
+    let pane = PaneRef::across(&[]);
+    let ctx = fetch_config();
+    let ask = |h: &GmgsiHandler, k: i64| {
+        h.fetch_frame(
+            &ctx,
+            &pane,
+            &FrameStamp {
+                valid: hour(k),
+                run: None,
+            },
+        )
+        .is_some()
+    };
+
+    assert!(
+        !ask(&h, 3),
+        "nothing has been listed, so there is no key to GET and no way to \
+         invent one"
+    );
+    file_listing(&mut h, channel, 13, true);
+    assert!(ask(&h, 3), "a listed hour is one GET away");
+    assert!(
+        !ask(&h, 99),
+        "an hour outside every listing is declined rather than guessed at"
+    );
+    file_frame(&mut h, channel, 3, 8);
+    assert!(!ask(&h, 3), "a staged granule is not fetched twice");
+}
+
+/// The listing's cost is **1 LIST per hour**, and it is bounded: past
+/// `MAX_FRAME_LIST_REQUESTS` the hours are sampled with both ends kept, so the
+/// window still spans the same ground.
+///
+/// The widest window the Lookback slider can name is 1440 minutes, which is 25
+/// hours, so the bound does not bind on anything a user can ask for today —
+/// which is exactly why it is asserted against a range no slider produces.
+#[test]
+fn a_frame_listing_costs_one_request_per_hour_and_is_bounded() {
+    use crate::gmgsi::fetch::{MAX_FRAME_LIST_REQUESTS, hours_in_range};
+
+    // The floor window: thirteen frames, thirteen requests.
+    let twelve_hours = hours_in_range((hour(0), hour(12)));
+    assert_eq!(twelve_hours.len(), 13);
+    assert_eq!(twelve_hours.first(), Some(&hour(0)));
+    assert_eq!(twelve_hours.last(), Some(&hour(12)));
+
+    // The slider's own ceiling, which must not be sampled — and the constant
+    // half in a const block, where a violated bound is a build failure.
+    assert_eq!(hours_in_range((hour(0), hour(24))).len(), 25);
+    const _: () = assert!(25 <= MAX_FRAME_LIST_REQUESTS);
+
+    // A window nothing can ask for today: bounded, and both ends kept.
+    let wide = hours_in_range((hour(0), hour(400)));
+    assert_eq!(
+        wide.len(),
+        MAX_FRAME_LIST_REQUESTS,
+        "a 401-hour window would be 401 LIST requests unbounded"
+    );
+    assert_eq!(wide.first(), Some(&hour(0)));
+    assert_eq!(wide.last(), Some(&hour(400)));
+    assert!(
+        wide.windows(2).all(|w| w[0] < w[1]),
+        "the sampled hours must stay in order and hold no duplicate"
+    );
+
+    // Partial hours at either end name granules outside the window.
+    assert_eq!(
+        hours_in_range((hour(0) + chrono::Duration::minutes(1), hour(2))),
+        vec![hour(1), hour(2)],
+        "an hour whose granule is stamped before the window's start is not in it"
+    );
+    assert!(hours_in_range((hour(5), hour(4))).is_empty());
+}
+
+/// `list_frames` says `complete` only where a listing that really covered the
+/// window landed. A sampled or failed one leaves the answer readable as "at
+/// least these", which is what it is.
+#[test]
+fn an_incomplete_listing_never_settles_the_window() {
+    let channel = GmgsiChannel::LongwaveIr;
+    let mut h = GmgsiHandler::new();
+    h.defaults.enabled = true;
+    h.defaults.selected_channel = channel;
+    let pane = PaneRef::across(&[]);
+    let ctx = fetch_config();
+
+    file_listing(&mut h, channel, 13, false);
+    let listed = h.list_frames(&ctx, &pane, (hour(0), hour(12)));
+    assert_eq!(listed.frames.len(), 13, "the keys are filed either way");
+    assert!(
+        !listed.complete,
+        "an incomplete listing must not claim the window is settled"
+    );
+
+    file_listing(&mut h, channel, 13, true);
+    assert!(h.list_frames(&ctx, &pane, (hour(0), hour(12))).complete);
+    // A window wider than anything covered is still open.
+    assert!(!h.list_frames(&ctx, &pane, (hour(0), hour(20))).complete);
+}
+
+/// Frames are scoped to the pane's own channel: another band's granule is not
+/// a frame this pane can draw, and offering it would paint the wrong band.
+#[test]
+fn one_channels_frames_are_not_offered_to_a_pane_on_another() {
+    let mut h = GmgsiHandler::with_frame_budget(4 * 8 * 4);
+    h.defaults.enabled = true;
+    h.defaults.selected_channel = GmgsiChannel::LongwaveIr;
+    file_listing(&mut h, GmgsiChannel::LongwaveIr, 13, true);
+    file_listing(&mut h, GmgsiChannel::WaterVapor, 13, true);
+    file_frame(&mut h, GmgsiChannel::LongwaveIr, 3, 8);
+    file_frame(&mut h, GmgsiChannel::WaterVapor, 4, 8);
+
+    let lw = pane_state(GmgsiChannel::LongwaveIr);
+    let wv = pane_state(GmgsiChannel::WaterVapor);
+    let pane_lw = PaneRef {
+        state: Some(&*lw),
+        ..PaneRef::bare(0)
+    };
+    let pane_wv = PaneRef {
+        state: Some(&*wv),
+        ..PaneRef::bare(1)
+    };
+    assert_eq!(
+        h.frames_resident(&pane_lw),
+        vec![FrameStamp {
+            valid: hour(3),
+            run: None
+        }],
+    );
+    assert_eq!(
+        h.frames_resident(&pane_wv),
+        vec![FrameStamp {
+            valid: hour(4),
+            run: None
+        }],
+    );
+    assert_eq!(
+        h.frame_grids.len(),
+        2,
+        "both are staged; what differs is which pane is offered which"
+    );
+}
+
+/// `retain_frames` is the eviction door, and it drops this pane's channel
+/// alone. **Nothing above calls it yet**, which is why it is driven here.
+#[test]
+fn retain_frames_drops_this_channels_unkept_granules_and_no_others() {
+    let mut h = GmgsiHandler::with_frame_budget(4 * 8 * 8);
+    h.defaults.enabled = true;
+    h.defaults.selected_channel = GmgsiChannel::LongwaveIr;
+    file_listing(&mut h, GmgsiChannel::LongwaveIr, 13, true);
+    for k in 0..3 {
+        file_frame(&mut h, GmgsiChannel::LongwaveIr, k, 8);
+    }
+    file_frame(&mut h, GmgsiChannel::WaterVapor, 7, 8);
+    assert_eq!(h.frame_grids.len(), 4, "premise: four granules are staged");
+
+    h.retain_frames(
+        &PaneRef::across(&[]),
+        &[FrameStamp {
+            valid: hour(1),
+            run: None,
+        }],
+    );
+    assert_eq!(
+        h.frames_resident(&PaneRef::across(&[])),
+        vec![FrameStamp {
+            valid: hour(1),
+            run: None
+        }],
+    );
+    assert_eq!(
+        h.frame_grids.len(),
+        2,
+        "the other channel's granule belongs to another pane and is untouched"
+    );
+}
+
+/// **The gate serialises, and it releases.** [`GmgsiHandler::fetch_frame`]'s
+/// doc claims the whole render set may be dispatched at once while only one
+/// granule is ever in flight; this is the floor under that claim — the cache
+/// half ("one granule *resident*") has its own test above, and without this
+/// one the in-flight half had none: removing the gate left every suite green
+/// while thirteen concurrent fetches would hold thirteen 60 MB decodes
+/// (~780 MB) before any cache saw one.
+///
+/// Two fetch tasks are driven by hand inside one thread — `futures::poll!`
+/// with `yield_now` turns between, so "the second gets N chances" is a poll
+/// count and never a wall clock — against a loopback server that records
+/// every request line and **holds hour 0's response open** until told:
+///
+/// 1. A is polled until its GET is on the wire, then parked mid-response;
+/// 2. B is polled 50,000 times and must not issue its GET — the gate holds it;
+/// 3. the server releases, A completes, and B **does** proceed — so a gate
+///    that never releases (a guard held across an `.await` that never
+///    resolves) fails here, not just the mutation that removes it.
+///
+/// The bodies are not granules; both fetches complete as `grid: None`, which
+/// exercises exactly what this test is about — the wire, not the decode.
+///
+/// **Floor — `no_gate`:** `let _one_at_a_time = gate.lock().await;` ->
+/// `let _one_at_a_time = ();`. Observed red at step 2: both request lines
+/// recorded while hour 0 was still held open.
+#[test]
+fn two_frame_fetches_share_one_gate_and_the_second_waits_for_the_first() {
+    use std::io::{Read, Write};
+    use std::sync::Mutex;
+
+    // -- A loopback bucket that records request lines and holds hour 0 -----
+    // Not `glm`'s `s3_recording`: that mock answers each request before
+    // reading the next, and a serialisation test needs the first response
+    // withheld while a second connection is accepted — so each connection
+    // gets its own thread, and hour 0's waits on the channel.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("local addr").port();
+    let seen: Arc<Mutex<Vec<String>>> = Default::default();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = Arc::new(Mutex::new(held));
+    let recorder = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let recorder = Arc::clone(&recorder);
+            let held = Arc::clone(&held);
+            std::thread::spawn(move || {
+                let mut scratch = [0u8; 4096];
+                let read = stream.read(&mut scratch).unwrap_or(0);
+                let request = String::from_utf8_lossy(&scratch[..read]).to_string();
+                let line = request.lines().next().unwrap_or("").to_string();
+                let hold = line.contains("/2025/06/01/00/");
+                recorder
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(line);
+                if hold {
+                    let _ = held.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                }
+                let body = "not a granule; the decode failing is fine here";
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    )
+                    .as_bytes(),
+                );
+            });
+        }
+    });
+
+    let channel = GmgsiChannel::LongwaveIr;
+    let mut h = GmgsiHandler::new();
+    h.defaults.enabled = true;
+    h.defaults.selected_channel = channel;
+    file_listing(&mut h, channel, 2, true);
+
+    // `tls::client` sets `https_only`, which a loopback URL cannot satisfy;
+    // `tls::init` is still required because reqwest is pinned to
+    // `rustls-no-provider`. Timeout wide enough that a loaded machine cannot
+    // time the held response out mid-test.
+    rustdar_source::tls::init();
+    let cfg = FetchConfig {
+        client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("a cleartext loopback client"),
+        zone_cache_dir: None,
+        sources: rustdar_source::origins::DataSources {
+            gmgsi_bucket: "gmgsi".into(),
+            s3_base: format!("http://127.0.0.1:{port}/{{bucket}}").into(),
+            ..rustdar_source::origins::DataSources::production()
+        },
+        viewport: None,
+        as_of: chrono::Utc::now().naive_utc(),
+    };
+    let pane = PaneRef::across(&[]);
+    let mut a = h
+        .fetch_frame(
+            &cfg,
+            &pane,
+            &FrameStamp {
+                valid: hour(0),
+                run: None,
+            },
+        )
+        .expect("hour 0 is listed")
+        .future;
+    let mut b = h
+        .fetch_frame(
+            &cfg,
+            &pane,
+            &FrameStamp {
+                valid: hour(1),
+                run: None,
+            },
+        )
+        .expect("hour 1 is listed")
+        .future;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    rt.block_on(async move {
+        let gets = |seen: &Arc<Mutex<Vec<String>>>| -> usize {
+            seen.lock().unwrap_or_else(|e| e.into_inner()).len()
+        };
+
+        // 1. A acquires the gate and puts its GET on the wire, where the
+        // server holds it. The cap is a poll count, not a clock.
+        let mut turns = 0usize;
+        while gets(&seen) == 0 {
+            assert!(turns < 200_000, "the first fetch never issued its GET");
+            assert!(
+                futures::poll!(a.as_mut()).is_pending(),
+                "hour 0 completed while the server was holding its response",
+            );
+            tokio::task::yield_now().await;
+            turns += 1;
+        }
+
+        // 2. Fifty thousand chances for B while A is mid-flight. On the
+        // gated build it parks on the lock and its GET never goes out; on
+        // the ungated one it connects within a few driver turns and
+        // completes, which the count below turns red.
+        for _ in 0..50_000 {
+            if futures::poll!(b.as_mut()).is_ready() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let in_flight = gets(&seen); // a local, never asserted under the lock
+        assert_eq!(
+            in_flight, 1,
+            "the second frame's GET was issued while the first granule was \
+             still in flight ({in_flight} request lines recorded). Unserialised, \
+             a thirteen-frame render set holds thirteen 60 MB decodes at once, \
+             ~780 MB in flight before any cache can evict anything.",
+        );
+
+        // 3. Release the held response; A completes and drops the guard.
+        release.send(()).expect("the server thread is alive");
+        let mut turns = 0usize;
+        loop {
+            if futures::poll!(a.as_mut()).is_ready() {
+                break;
+            }
+            assert!(
+                turns < 200_000,
+                "the held fetch never completed after release"
+            );
+            tokio::task::yield_now().await;
+            turns += 1;
+        }
+
+        // 4. Non-triviality: B now proceeds. A gate that serialises by never
+        // releasing — a guard held across an await that never resolves —
+        // starves every later frame and fails here.
+        let mut turns = 0usize;
+        loop {
+            if futures::poll!(b.as_mut()).is_ready() {
+                break;
+            }
+            assert!(
+                turns < 200_000,
+                "the gate never released: the second frame's fetch is starved \
+                 after the first completed",
+            );
+            tokio::task::yield_now().await;
+            turns += 1;
+        }
+
+        let lines = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(lines.len(), 2, "one GET per frame, no relisting: {lines:?}");
+        assert!(
+            lines[0].contains("/2025/06/01/00/") && lines[1].contains("/2025/06/01/01/"),
+            "the two GETs must be the two listed keys in dispatch order: {lines:?}",
+        );
+    });
 }
