@@ -29,6 +29,14 @@
       "layer_slots": [
         {
           "config": {
+            "channel": "GmgsiLongwaveIr",
+            "enabled": false
+          },
+          "enabled": false,
+          "id": "Gmgsi"
+        },
+        {
+          "config": {
             "enabled": false,
             "parameter": "sbcin"
           },

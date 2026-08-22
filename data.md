@@ -294,7 +294,7 @@ colour recipe and the cadence.
 
 | Data Source                   | Status | Domain              | CORS    | Public Access                                                                                                         |
 | ----------------------------- | ------ | ------------------- | ------- | --------------------------------------------------------------------------------------------------------------------- |
-| NOAA GMGSI global mosaic      | ❌      | **72.7°N – 72.7°S** | open    | ✅ Free — AWS Open Data `noaa-gmgsi-pds`. **See the verified detail below.**                                           |
+| NOAA GMGSI global mosaic      | ✅      | **72.7°N – 72.7°S** | open    | ✅ Free — AWS Open Data `noaa-gmgsi-pds`. Four channels shipped. **See the verified detail below.**                    |
 | CIRA GeoColor, GOES East/West | ❌      | Americas            | open    | ✅ Free — NASA GIBS **WMS**. Layers verified present: `GOES-East_ABI_GeoColor`, `GOES-West_ABI_GeoColor`               |
 | MTG GeoColour + MSG / IODC    | ❌      | Europe / Indian     | open    | ✅ Free of charge — EUMETView **WMS**. Verified present: `mtg_fd:rgb_geocolour`, plus `msg_fes:*` and `msg_iodc:*`     |
 | Himawari via CIRA SLIDER      | ❌      | W Pacific           | blocked | ⚠️ No published licence — slippy tiles at `slider.cira.colostate.edu`. No `ACAO` either; use `noaa-himawari9` instead |
@@ -304,30 +304,64 @@ colour recipe and the cadence.
 The three NOAA pages describing GMGSI **disagree with each other**: the AWS
 registry says global at ~8 km, NOAA VLab says 71°N–71°S at 8 km, and the OSPO
 product page says 60°N–60°S at ~3 km. None of them matches what the bucket
-contains. Measured from a 2026-08-01 granule with `ncdump`:
+contains.
 
-- Grid **3000 × 4999**, with explicit 2-D `lat`/`lon` arrays.
-- Latitude runs **+72.71541° to −72.73677°**. Longitude covers the full ±180°.
-- 360° / 4999 columns = 0.072°, i.e. **~8 km at the equator** — the registry's
-  figure, not OSPO's.
-- Values are `float`, `units = "K"`, `long_name = "0-255 Brightness Temperature"`,
-  with a `dqf` quality byte alongside. Hourly.
-- **NetCDF4, i.e. HDF5** — verified by magic bytes, `\x89HDF\r\n\x1a\n`,
-  identical to a GLM L2 LCFA granule.
-- The granule **declares its own extent**, corroborating the measurement:
-  `geospatial_lat_max = 72.7154f`, `geospatial_lat_min = -72.7368f`,
-  `geospatial_lat_resolution = geospatial_lon_resolution = 0.0722f`.
-- `platform = "Meteosat10,G18,Meteosat9,H-9,G19"`,
+**Re-measured 2026-08-22 against the shipping decoder**, on the four
+2025-06-01 12:00 UTC granules. Several figures previously recorded here came
+from the *retired* product and have been corrected; see the two-generations
+note below.
+
+- Grid **3000 × 5000** = 15,000,000 points, matching
+  `quality_information:total_number_retrievals = 15000000`. (The 3000 × 4999
+  recorded here earlier is the legacy granule, which is a `ncks -d xc,0,4998`
+  crop of the same field.)
+- Latitude runs **+72.71541° to −72.73677°**; longitude covers the full turn.
+- **The grid is separable but NOT a plain lat/lon grid.** Latitude depends only
+  on the row and longitude only on the column — verified exactly, deviation 0.0
+  — but the latitude axis is uniform in **Mercator y**, not in latitude. Rows
+  step −14.52°, −24.41°, −33.86°, −33.83°, −24.36° per 500 rows, a 2.3×
+  spread, while Mercator y steps a constant −0.628397 to within 1e−6.
+- **The declared attributes cannot rebuild either axis.**
+  `geospatial_lat_resolution = geospatial_lon_resolution = 0.0722`, where the
+  longitude array steps **0.0720089** (measured across the 4998 steps from
+  column 1 to column 4999) — 0.955° of accumulated drift. Interpolating the
+  declared corners linearly puts row 500 at 48.4653° where the array says
+  **58.19307°**, off by **9.73°**. Both axes must be read from the arrays.
+- **`lat` and `lon` are two-dimensional `(yc, xc)`** — 15,000,000 floats each,
+  60 MB apiece — not the 1-D axes the separability would allow.
+- **The longitude axis is not monotonic.** Column 0 holds `+179.99962` and
+  column 1 `−179.92838`: the grid starts a hair west of the antimeridian and
+  every longitude is already wrapped into [−180, 180]. `geospatial_lon_min` /
+  `_max` are the axis *extremes*, i.e. columns 1 and 0, not its first and last.
+- **Values are 0–255 integer counts, not Kelvin**, despite `units = "K"`.
+  `long_name = "0-255 Brightness Temperature"` is the honest attribute: over all
+  15,000,000 samples every value is an integer in `0..=255`, none fractional,
+  none outside. Measured equator readings at (row 1499, column 2500), 12 UTC:
+  **LW 82, SW 65, VIS 118, WV 166**. A Kelvin-scaled ramp renders the layer
+  entirely blank. Higher count is colder, so the greyscale ascends.
+- `_FillValue = -9999` and it **never occurs in a healthy granule** — 0 of
+  15,000,000 on all four channels, with
+  `percentage_optimal_retrievals = 100`.
+- **NetCDF4, i.e. HDF5** — chunked `(1, 793, 1322)`, SHUFFLE + DEFLATE level 5.
+  `hdf5-pure` reads all of that; verified against the real NOAA bytes.
+- `platform = "Meteosat9,Meteosat10,G19,H-9,G18"`,
   `instrument = "MSG-SEVIRI,GOES-ABI,Himawari-AHI"`, `processing_level = "Level 3"`.
   The `source` attribute lists the actual inputs, and **MSG-IODC is among them**.
 - **Cadence is hourly, but each granule is a 10-minute window**:
-  `time_coverage_start = "2026-08-01T00:00:00Z"`,
-  `time_coverage_end = "2026-08-01T00:09:59Z"`. It is a snapshot published
-  hourly, not an hourly composite.
-- **Four live channels**, each naming itself in its `summary` attribute:
-  `GMGSI_LW/` → `GLOBCOMPLIR`, "longwave infrared"; `GMGSI_SW/` → `GLOBCOMPSIR`,
-  "shortwave infrared"; `GMGSI_VIS/` → "VISIBLE"; `GMGSI_WV/` → "mid-wave
-  infrared (water vapor)". All four carry `units = "K"`.
+  `time_coverage_start` → `time_coverage_end` spans `00:00:00Z` to `00:09:59Z`.
+  It is a snapshot published hourly, not an hourly composite.
+- **The object name cannot be constructed.** It ends in the blend's creation
+  stamp — `_c202506011234579` — which trailed the observation by 34 to 42
+  minutes and by a different amount per channel. The key is always listed.
+
+#### Two product generations shared the bucket
+
+Until mid-2025 each hour also carried a legacy McIDAS-derived granule named
+`GLOBCOMP{LIR,SIR,VIS,WV}_nc.YYYYMMDDHH`: 4999 columns, `units = "none"`, no
+`geospatial_*`, no `quality_information`, no `dqf`. **It is no longer
+produced** — listing `GMGSI_LW/2026/08/20/12/` returns the `v3r0_blend` object
+alone. Rustdar reads the `v3r0_blend` product and skips the legacy name when a
+historical hour offers both.
 
 ### GMGSI_SSR is discontinued — do not plan on it
 
@@ -349,9 +383,10 @@ The fifth prefix, `GMGSI_SSR/`, is dead. Established on 2026-08-21:
 Whatever `SSR` stood for, the operational answer is settled: it ended in June
 2025 and nothing should be built on it.
 
-**GMGSI is the cheapest global cloud layer available**: already merged, already
-on a lat/lon grid, and in a container `hdf5-pure` already reads. No
-per-satellite navigation, no disk reprojection, no new dependency.
+**GMGSI was the cheapest global cloud layer available**, and it shipped: already
+merged, already on a separable grid, and in a container `hdf5-pure` already
+reads. No per-satellite navigation, no disk reprojection, no new dependency —
+the only new geometry is `GridCoords::Separable`, one axis per dimension.
 
 ### GeoColor is a recipe, not a file
 
@@ -434,7 +469,7 @@ three of the four biggest new sources need **nothing new at all**:
 | --------------------------- | -------------------------------------------------------------------------------------------- |
 | ~~MRMS~~ (**shipped**)      | **None**, as predicted. gzip + GRIB2 DRT 5.41, both already enabled.                         |
 | RRQPE                       | **None.** NetCDF4/HDF5 via `hdf5-pure`, plain 0.02° lat/lon grid.                            |
-| GMGSI                       | **None.** NetCDF4/HDF5 via `hdf5-pure`, plain lat/lon grid.                                  |
+| ~~GMGSI~~ (**shipped**)     | **None**, as predicted. NetCDF4/HDF5 via `hdf5-pure`. Not a plain lat/lon grid, though: separable, uniform in Mercator y. |
 | GOES ABI imagery            | Fixed-grid (geostationary perspective) → Mercator reprojection. The reader already exists.   |
 | GIBS / EUMETView GeoColor   | A WMS `GetMap` client. New — nothing in the tree speaks WMS.                                 |
 | SLIDER / Rain Viewer tiles  | Small. `walkers` already fetches slippy tiles; this is the same shape at a weather layer.    |

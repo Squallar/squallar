@@ -139,6 +139,7 @@ const NEVER_CACHE_HOSTS = new Set([
   "noaa-goes19.s3.amazonaws.com",
   "noaa-goes18.s3.amazonaws.com",
   "noaa-mrms-pds.s3.amazonaws.com",
+  "noaa-gmgsi-pds.s3.amazonaws.com",
   "api.weather.gov",
   "www.spc.noaa.gov",
   "mesonet.agron.iastate.edu",

@@ -43,7 +43,7 @@ fn a_live_panes_cache_token_is_untouched_by_the_as_of_term() {
     let ids: Vec<LayerId> = gui.overlays.handlers().map(|h| h.id()).collect();
     assert_eq!(
         ids.len(),
-        14 + cfg!(feature = "fake-source") as usize,
+        15 + cfg!(feature = "fake-source") as usize,
         "the walk below must cover every layer",
     );
     assert!(

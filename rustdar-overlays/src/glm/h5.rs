@@ -42,6 +42,23 @@ impl Granule {
         }
     }
 
+    /// The variable's declared dimensions, or `Ok(None)` when it is absent.
+    ///
+    /// GLM never needed this — every L2 LCFA variable is a flat list whose only
+    /// dimension is its own count. A gridded granule does: GMGSI declares
+    /// `data(time, yc, xc)` and `lat(yc, xc)`, and the row length is the one
+    /// fact that turns a flat read back into a raster.
+    pub(crate) fn shape(&self, name: &str) -> Result<Option<Vec<u64>>, String> {
+        if !self.datasets.contains(name) {
+            return Ok(None);
+        }
+        self.file
+            .dataset(name)
+            .and_then(|d| d.shape())
+            .map(Some)
+            .map_err(|e| format!("Failed to read the shape of {name}: {e}"))
+    }
+
     /// Returns `Ok(None)` when the variable is absent from the file, which is
     /// not the same as "present but all-missing": the L2 LCFA product has no
     /// `event_area` variable at all.

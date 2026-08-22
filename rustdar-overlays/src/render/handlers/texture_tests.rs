@@ -80,30 +80,32 @@ fn run_fake(
 /// **The sanctioned cases of two layers sharing one raster input variant**, and
 /// the only place they are named.
 ///
-/// Two today, and they are the same shape for two different reasons:
+/// Three today, and the last two are the same statement made twice:
 ///
 /// * `SpcFireOutlook` → `SpcOutlook`. SPC's fire-weather outlooks are the same
 ///   thing on the wire as the convective ones — a feature list in SPC's own
 ///   inline `stroke`/`fill` — so the fire layer describes an `OutlooksInput`
 ///   rather than adding a byte-identical second wire form.
-/// * `Mrms` → `ModelData`. `GriddedInput` carries a **`FieldId`**, not either
-///   source's own enum, which is exactly what the gridded substrate was built
-///   for: "a second gridded source needs no arm here". MRMS describes a
-///   `GriddedInput::Resident` and rides `overlay/model`, so it adds no codec
-///   row and moves no wire digest.
+/// * `Mrms` → `ModelData` and `Gmgsi` → `ModelData`. `GriddedInput` carries a
+///   **`FieldId`**, not any source's own enum, which is exactly what the
+///   gridded substrate was built for: "a second gridded source needs no arm
+///   here". Both describe a `GriddedInput::Resident` and ride `overlay/model`,
+///   so neither adds a codec row and neither moves a wire digest. That the
+///   *third* gridded source cost the same nothing the second did is the claim
+///   this row is the evidence for.
 ///
 /// Both walks below read the relation from here, so each sharing is stated once
-/// and neither walk can quietly grow a third case: any other layer whose input
+/// and neither walk can quietly grow a fourth case: any other layer whose input
 /// names a foreign owner still fails
 /// `every_texture_handler_declares_the_convention_its_own_bytes_are_in`.
 ///
 /// **What that costs, stated:** a fire raster is labelled `overlay/outlooks`
-/// and an MRMS raster `overlay/model` in the worker's timing log, so neither
-/// pair is distinguishable there.
+/// and both an MRMS and a GMGSI raster `overlay/model` in the worker's timing
+/// log, so neither group is distinguishable there.
 pub(super) fn raster_input_owner(id: &LayerId) -> LayerId {
     if *id == known::SPC_FIRE_OUTLOOK {
         known::SPC_OUTLOOK
-    } else if *id == known::MRMS {
+    } else if *id == known::MRMS || *id == known::GMGSI {
         known::MODEL_DATA
     } else {
         id.clone()
@@ -341,6 +343,49 @@ fn mrms_grid() -> crate::mrms::MrmsGrid {
     }
 }
 
+/// A uniform count-255 mosaic over [`BOUNDS`] on a 4 x 4 **separable** grid.
+///
+/// The separable arm and not `Regular`: that is the arm the real granule
+/// decodes to — its latitude axis is uniform in Mercator y, not in latitude —
+/// and it is the arm whose `index_bounds` lets `projection_window` cut the grid
+/// at all.
+///
+/// **255 and not a mid-domain count**, which every cell would paint just as
+/// well: `every_texture_handler_declares_the_convention_its_own_bytes_are_in`
+/// separates straight alpha from premultiplied by finding a pixel whose colour
+/// channel exceeds its alpha, and `gridded::ALPHA` is 160 where mid-greyscale
+/// is ~0x8c. A grey fixture would make that walk vacuous for this layer.
+fn gmgsi_grid() -> crate::gmgsi::decode::GmgsiGrid {
+    use crate::gmgsi::GmgsiChannel;
+    let channel = GmgsiChannel::LongwaveIr;
+    let (ni, nj) = (4usize, 4usize);
+    let spec = crate::gmgsi::fields::spec(channel);
+    let step = |lo: f64, hi: f64, n: usize, k: usize| lo + (hi - lo) * k as f64 / (n - 1) as f64;
+    crate::gmgsi::decode::GmgsiGrid {
+        channel,
+        grid: crate::render::gridded::ResidentGrid {
+            field: spec.id.clone(),
+            ni,
+            nj,
+            coords: crate::hrrr::GridCoords::Separable {
+                // Descending, as the granule's own axis runs north to south.
+                lat_axis: (0..nj)
+                    .map(|j| step(BOUNDS.max_lat, BOUNDS.min_lat, nj, j))
+                    .collect(),
+                lon_axis: (0..ni)
+                    .map(|i| step(BOUNDS.min_lon, BOUNDS.max_lon, ni, i))
+                    .collect(),
+            },
+            values: vec![255.0f32; ni * nj],
+        },
+        bounds: BOUNDS,
+        valid_time: chrono::NaiveDate::from_ymd_opt(2025, 6, 1)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap(),
+    }
+}
+
 fn site_fixtures() -> rasterize::SitesInput {
     rasterize::SitesInput {
         sites: vec![RadarSiteInfo {
@@ -457,6 +502,7 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
         }))),
         id if *id == known::MODEL_DATA => Box::new(HrrrFetchResult(Ok(cin_grid()))),
         id if *id == known::MRMS => Box::new(crate::mrms::MrmsFetchResult(Ok(mrms_grid()))),
+        id if *id == known::GMGSI => Box::new(crate::gmgsi::GmgsiFetchResult(Ok(gmgsi_grid()))),
         // **Seeded like every other kind since WO-M10c**: the site table is
         // installed through the arrival door by the shell that owns it, so
         // this layer has data of its own and answers `prepare_job` from it.
@@ -571,16 +617,17 @@ fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
         checked += 1;
     }
     // **Seven since WO-M10c, eight since the fire weather layer, nine since
-    // the MRMS mosaic.** The seventh was `RadarSites`, which used to be
-    // rasterized by a dispatch arm of its own in `app_fetch` — the handler
-    // could not see which site its pane was on, so it had no `prepare_job` to
-    // be walked through. It has a pane now, the arm is gone, and the "nine
-    // described kinds" list in `spawn_overlay_render` is this same nine.
+    // the MRMS mosaic, ten since the GMGSI one.** The seventh was
+    // `RadarSites`, which used to be rasterized by a dispatch arm of its own
+    // in `app_fetch` — the handler could not see which site its pane was on,
+    // so it had no `prepare_job` to be walked through. It has a pane now, the
+    // arm is gone, and the "ten described kinds" list in
+    // `spawn_overlay_render` is this same ten.
     assert_eq!(
         checked,
-        9 + cfg!(feature = "fake-source") as usize,
-        "the nine texture handlers that rasterize through `prepare_job` \
-         must all be covered — ten with the fake source registered; a new \
+        10 + cfg!(feature = "fake-source") as usize,
+        "the ten texture handlers that rasterize through `prepare_job` \
+         must all be covered — eleven with the fake source registered; a new \
          one is not exempt, and a removed one should be removed from this \
          count deliberately",
     );
@@ -747,9 +794,9 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
     }
     assert_eq!(
         checked,
-        9 + cfg!(feature = "fake-source") as usize,
-        "the nine texture handlers that rasterize through `prepare_job` \
-         must all be covered — ten with the fake source registered",
+        10 + cfg!(feature = "fake-source") as usize,
+        "the ten texture handlers that rasterize through `prepare_job` \
+         must all be covered — eleven with the fake source registered",
     );
 }
 
@@ -879,8 +926,8 @@ fn every_texture_kind_rasterizes_as_a_described_job() {
     }
     assert_eq!(
         described,
-        9 + cfg!(feature = "fake-source") as usize,
-        "the four polygon kinds, the two hit-map kinds, the two gridded \
+        10 + cfg!(feature = "fake-source") as usize,
+        "the four polygon kinds, the two hit-map kinds, the three gridded \
          rasters and the site table must all have been walked seeded — plus \
          the fake source where it is registered; a kind that stopped seeding \
          is a kind whose described job was never tested",
@@ -964,33 +1011,19 @@ fn a_hit_map_kinds_items_align_with_its_described_rows() {
 /// row while its `prepare_job` stays `None`: the row states how the bytes cross,
 /// not who builds them.
 ///
-/// **A row may be named by two handlers only where [`raster_input_owner`] says
-/// they build the same input**, which today is `SpcFireOutlook` sharing the
-/// convective outlooks' row and `Mrms` sharing the gridded raster's. Read
-/// from that one function rather than allowed here, so each sharing is a
-/// single statement rather than a loosened assertion: two layers that
-/// describe *different* inputs under one label still fail, which is the
-/// mispairing this gate was built for.
+/// **A row may be named by more than one handler only where
+/// [`raster_input_owner`] says they build the same input**, which today is
+/// `SpcFireOutlook` sharing the convective outlooks' row and `Mrms` and
+/// `Gmgsi` sharing the gridded raster's. Read from that one function rather
+/// than allowed here, so each sharing is a single statement rather than a
+/// loosened assertion: two layers that describe *different* inputs under one
+/// label still fail, which is the mispairing this gate was built for.
 #[test]
 fn every_texture_handler_owns_exactly_one_codec_row() {
     use crate::render::jobs::JOB_CODECS;
 
     // Deliberately spelled out. Do not regenerate this from the registry.
     #[cfg(not(feature = "fake-source"))]
-    let expected: [(LayerId, &str); 9] = [
-        (known::RADAR_SITES, "overlay/sites"),
-        (known::NWS_ALERTS, "overlay/alerts"),
-        (known::SPC_OUTLOOK, "overlay/outlooks"),
-        (known::SPC_FIRE_OUTLOOK, "overlay/outlooks"),
-        (known::SPC_DISCUSSIONS, "overlay/discussions"),
-        (known::STORM_REPORTS, "overlay/reports"),
-        (known::LIGHTNING, "overlay/glm"),
-        (known::MODEL_DATA, "overlay/model"),
-        (known::MRMS, "overlay/model"),
-    ];
-    // Two `#[cfg]`'d definitions for the same reason `JOB_CODECS` has two:
-    // `#[cfg]` on an array element is not stable.
-    #[cfg(feature = "fake-source")]
     let expected: [(LayerId, &str); 10] = [
         (known::RADAR_SITES, "overlay/sites"),
         (known::NWS_ALERTS, "overlay/alerts"),
@@ -1001,6 +1034,22 @@ fn every_texture_handler_owns_exactly_one_codec_row() {
         (known::LIGHTNING, "overlay/glm"),
         (known::MODEL_DATA, "overlay/model"),
         (known::MRMS, "overlay/model"),
+        (known::GMGSI, "overlay/model"),
+    ];
+    // Two `#[cfg]`'d definitions for the same reason `JOB_CODECS` has two:
+    // `#[cfg]` on an array element is not stable.
+    #[cfg(feature = "fake-source")]
+    let expected: [(LayerId, &str); 11] = [
+        (known::RADAR_SITES, "overlay/sites"),
+        (known::NWS_ALERTS, "overlay/alerts"),
+        (known::SPC_OUTLOOK, "overlay/outlooks"),
+        (known::SPC_FIRE_OUTLOOK, "overlay/outlooks"),
+        (known::SPC_DISCUSSIONS, "overlay/discussions"),
+        (known::STORM_REPORTS, "overlay/reports"),
+        (known::LIGHTNING, "overlay/glm"),
+        (known::MODEL_DATA, "overlay/model"),
+        (known::MRMS, "overlay/model"),
+        (known::GMGSI, "overlay/model"),
         (known::FAKE_SOURCE, crate::render::jobs::FAKE_LABEL),
     ];
 
@@ -1046,7 +1095,12 @@ fn every_texture_handler_owns_exactly_one_codec_row() {
         if let Some((other, _)) = claimed.iter().find(|(_, label)| *label == row.label) {
             // The only sanctioned duplicate: the two layers build the SAME
             // input, so one wire form is one wire form.
-            let shared = raster_input_owner(&id) == *other || raster_input_owner(other) == id;
+            // Canonical owners, not a pairwise test: three layers now
+            // share `overlay/model`, and `Gmgsi` against the row's FIRST
+            // claimer is `ModelData == ModelData` only when both sides are
+            // resolved. A layer that builds a different input still resolves
+            // to itself and still fails.
+            let shared = raster_input_owner(&id) == raster_input_owner(other);
             assert!(
                 shared,
                 "{name}'s row {:?} is already claimed by {}; a row claimed \

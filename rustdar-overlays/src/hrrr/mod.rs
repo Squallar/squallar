@@ -1213,6 +1213,150 @@ pub enum GridCoords {
         lats: Vec<f64>,
         lons: Vec<f64>,
     },
+    /// A grid whose two coordinates are **separable**: every point's latitude
+    /// depends only on its row and every point's longitude only on its column,
+    /// so the whole geometry is one axis per dimension rather than one pair per
+    /// point.
+    ///
+    /// **Point ordering is row-major with longitude fastest**: `index` is
+    /// `row * lon_axis.len() + column`, so `at(0)` is the first row's first
+    /// column, `at(1)` steps one column, and `at(lon_axis.len())` steps one
+    /// row. [`Self::Regular`] carries a `scan_mode` octet because a GRIB
+    /// section 3 does not fix its ordering; this arm fixes it here instead,
+    /// because its source — a NetCDF4 granule whose data variable is declared
+    /// `(time, yc, xc)` — states the ordering in the file's own dimension list
+    /// and offers no octet to carry it.
+    ///
+    /// **The axes are read, never rebuilt.** GMGSI's latitude axis is uniform
+    /// in *Mercator y*, not in latitude: its rows step `-14.52°` near the top
+    /// of the grid and `-33.86°` in the middle, a 2.3x spread, while
+    /// `rustdar_geo::lat_rad_to_mercator_y` of the same rows steps a constant
+    /// `-0.628397` to within 1e-6. A uniform latitude axis through the declared
+    /// corners is 9.73° wrong by row 500. Neither is the longitude step the
+    /// declared `geospatial_lon_resolution`: that says `0.0722` where the array
+    /// steps `0.0720089`.
+    ///
+    /// The two field names differ from [`Self::Explicit`]'s `lats`/`lons` on
+    /// purpose. Those are per-*point* parallel arrays, one entry per grid
+    /// point; these are per-*axis*, and the tests that compare the two arms
+    /// would read either name as plausible.
+    ///
+    /// Costs one `f64` per row plus one per column — 64 KB for GMGSI's
+    /// 3000 x 5000 grid, where [`Self::Explicit`] would be 240 MB.
+    Separable {
+        lat_axis: Vec<f64>,
+        lon_axis: Vec<f64>,
+    },
+}
+
+/// Whether `axis` is strictly monotonic, and ascending if so.
+///
+/// `None` for an axis that reverses anywhere, which is not a malformed grid:
+/// GMGSI's longitude axis holds `+179.99961` at column 0 and `-179.92838` at
+/// column 1, because the grid starts a hair west of the antimeridian and the
+/// file states every longitude already wrapped into `[-180, 180]`. Only the
+/// bracketing search below needs the ordering, and it answers "the whole axis"
+/// rather than a wrong window when it cannot have it.
+fn axis_is_ascending(axis: &[f64]) -> Option<bool> {
+    let (first, last) = (*axis.first()?, *axis.last()?);
+    if axis.len() < 2 || !first.is_finite() || !last.is_finite() {
+        return None;
+    }
+    let ascending = last > first;
+    let ordered = axis
+        .windows(2)
+        .all(|w| w[1].is_finite() && if ascending { w[1] > w[0] } else { w[1] < w[0] });
+    ordered.then_some(ascending)
+}
+
+/// The fractional index interval of `axis` covering `[lo, hi]`, clamped to the
+/// axis, or the whole axis when the axis is not strictly monotonic.
+fn axis_bracket(axis: &[f64], lo: f64, hi: f64) -> (f64, f64) {
+    let whole = (0.0, axis.len().saturating_sub(1) as f64);
+    let Some(ascending) = axis_is_ascending(axis) else {
+        return whole;
+    };
+    // Fractional position of `v` on the axis, by binary search plus a linear
+    // interpolation inside the bracketing cell. Returned unclamped so a value
+    // off the end yields an empty rather than a full window.
+    let position = |v: f64| -> f64 {
+        let cmp = |probe: &f64| {
+            if ascending {
+                probe.partial_cmp(&v).unwrap_or(std::cmp::Ordering::Equal)
+            } else {
+                v.partial_cmp(probe).unwrap_or(std::cmp::Ordering::Equal)
+            }
+        };
+        match axis.binary_search_by(cmp) {
+            Ok(i) => i as f64,
+            Err(0) => 0.0,
+            Err(i) if i >= axis.len() => (axis.len() - 1) as f64,
+            Err(i) => {
+                let (a, b) = (axis[i - 1], axis[i]);
+                let t = if b == a { 0.0 } else { (v - a) / (b - a) };
+                (i - 1) as f64 + t
+            }
+        }
+    };
+    let (a, b) = (position(lo), position(hi));
+    (a.min(b), a.max(b))
+}
+
+/// Index of the entry of `axis` nearest `v`, comparing with `distance`.
+fn nearest_on_axis(axis: &[f64], v: f64, distance: impl Fn(f64, f64) -> f64) -> Option<usize> {
+    let mut best = None;
+    let mut best_d = f64::MAX;
+    for (i, &a) in axis.iter().enumerate() {
+        let d = distance(a, v);
+        if d < best_d {
+            best_d = d;
+            best = Some(i);
+        }
+    }
+    best
+}
+
+/// Shortest angular separation between two longitudes, in degrees.
+fn longitude_distance(a: f64, b: f64) -> f64 {
+    let d = (a - b).abs() % 360.0;
+    d.min(360.0 - d)
+}
+
+/// Degrees of longitude between the axis's extreme columns.
+fn separable_lon_span(lon_axis: &[f64]) -> f64 {
+    if lon_axis.len() < 2 {
+        return 0.0;
+    }
+    lon_axis.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b))
+        - lon_axis.iter().fold(f64::INFINITY, |a, &b| a.min(b))
+}
+
+/// The widest column of the axis, in degrees.
+///
+/// The **widest** and not the mean, because the only consumer
+/// ([`GridCoords::cell_span_degrees`]) is a pad that must never under-cover a
+/// cell. On GMGSI the mean taken from the span is 0.0720000 where the widest
+/// real column is 0.0720215, and a pad below the true width crops the raster.
+///
+/// Differences of half a turn or more are skipped: an axis that wraps holds one
+/// enormous difference at the seam (GMGSI's is -359.928°), which is precisely
+/// the figure an unguarded maximum would return.
+fn separable_lon_step(lon_axis: &[f64]) -> f64 {
+    if lon_axis.len() < 2 {
+        return 0.0;
+    }
+    let widest = lon_axis
+        .windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .filter(|d| d.is_finite() && *d < 180.0)
+        .fold(0.0f64, f64::max);
+    if widest > 0.0 {
+        widest
+    } else {
+        // Every step was a seam or non-finite: fall back to the mean, which at
+        // least has the right order of magnitude.
+        separable_lon_span(lon_axis) / (lon_axis.len() - 1) as f64
+    }
 }
 
 /// Scanning-mode bit: adjacent points are consecutive in `j`, not `i`.
@@ -1266,6 +1410,7 @@ impl GridCoords {
             GridCoords::Lambert(g) => g.len(),
             GridCoords::Regular { ni, nj, .. } => ni * nj,
             GridCoords::Explicit { lats, lons } => lats.len().min(lons.len()),
+            GridCoords::Separable { lat_axis, lon_axis } => lat_axis.len() * lon_axis.len(),
         }
     }
 
@@ -1289,6 +1434,14 @@ impl GridCoords {
                 Some((lat0 + j as f64 * dlat, lon0 + i as f64 * dlon))
             }
             GridCoords::Explicit { lats, lons } => Some((*lats.get(index)?, *lons.get(index)?)),
+            // Row-major, longitude fastest -- see the variant's own doc.
+            GridCoords::Separable { lat_axis, lon_axis } => {
+                let nx = lon_axis.len();
+                if nx == 0 {
+                    return None;
+                }
+                Some((*lat_axis.get(index / nx)?, *lon_axis.get(index % nx)?))
+            }
         }
     }
 
@@ -1346,6 +1499,26 @@ impl GridCoords {
                 (out.0.is_finite() && out.1.is_finite() && out.2.is_finite() && out.3.is_finite())
                     .then_some(out)
             }
+            // The same row-major precondition the two arms above state, for the
+            // same reason: the caller steps `index ± 1` and `index ± ni`, which
+            // is this arm's ordering only at this arm's own shape.
+            GridCoords::Separable { lat_axis, lon_axis } => {
+                if lon_axis.len() != ni
+                    || lat_axis.len() != nj
+                    || bounds.min_lat > bounds.max_lat
+                    || bounds.min_lon > bounds.max_lon
+                {
+                    return None;
+                }
+                // Per axis, and independently: GMGSI's latitude axis brackets
+                // to a few rows out of 3000 while its longitude axis is not
+                // monotonic and answers "all 5000". A window that is merely
+                // *not narrower* than the truth is correct; one that is
+                // narrower silently crops the raster.
+                let (j_min, j_max) = axis_bracket(lat_axis, bounds.min_lat, bounds.max_lat);
+                let (i_min, i_max) = axis_bracket(lon_axis, bounds.min_lon, bounds.max_lon);
+                Some((i_min, i_max, j_min, j_max))
+            }
             _ => None,
         }
     }
@@ -1359,6 +1532,21 @@ impl GridCoords {
             GridCoords::Lambert(g) => Some(g.cell_span_degrees(lat)),
             GridCoords::Regular { dlat, dlon, .. } => Some(dlat.abs().max(dlon.abs())),
             GridCoords::Explicit { .. } => None,
+            // The latitude step is *local*: GMGSI's rows span 0.029° at the
+            // equator and 0.068° at the top of the grid, so a single global
+            // figure would under-cover one end or over-cover the other.
+            GridCoords::Separable { lat_axis, lon_axis } => {
+                let dlat = nearest_on_axis(lat_axis, lat, |a, b| (a - b).abs())
+                    .map(|j| {
+                        let lo = j.saturating_sub(1);
+                        let hi = (j + 1).min(lat_axis.len() - 1);
+                        (lat_axis[lo] - lat_axis[j])
+                            .abs()
+                            .max((lat_axis[hi] - lat_axis[j]).abs())
+                    })
+                    .unwrap_or(0.0);
+                Some(dlat.max(separable_lon_step(lon_axis)))
+            }
         }
     }
 
@@ -1369,6 +1557,13 @@ impl GridCoords {
             GridCoords::Lambert(g) => g.wraps_longitude(),
             GridCoords::Regular { dlon, ni, .. } => (*ni as f64 * dlon).abs() >= 360.0,
             GridCoords::Explicit { .. } => false,
+            // True when the axis covers the whole turn to within one cell.
+            // GMGSI spans 359.928° in 5000 columns of 0.0720089°, so the seam
+            // between its last column and its first is one ordinary cell wide
+            // and the raster must be allowed to close across it.
+            GridCoords::Separable { lon_axis, .. } => {
+                separable_lon_span(lon_axis) + 2.0 * separable_lon_step(lon_axis) >= 360.0
+            }
         }
     }
 
@@ -1410,6 +1605,15 @@ impl GridCoords {
                     }
                 }
                 best
+            }
+            // One scan per axis rather than one over the product: 8,000 probes
+            // where `Explicit` at GMGSI's size would be 15,000,000. Longitude
+            // is compared the short way round so a query just east of the
+            // antimeridian finds column 0 rather than the far side of the grid.
+            GridCoords::Separable { lat_axis, lon_axis } => {
+                let j = nearest_on_axis(lat_axis, lat, |a, b| (a - b).abs())?;
+                let i = nearest_on_axis(lon_axis, lon, longitude_distance)?;
+                Some(j * lon_axis.len() + i)
             }
         }
     }

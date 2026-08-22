@@ -440,8 +440,8 @@ fn an_unknown_draw_order_id_survives_in_place_and_is_skipped_at_draw() {
     // The registered ids the file omitted joined at their weight positions.
     assert_eq!(
         order.len(),
-        15 + cfg!(feature = "fake-source") as usize,
-        "all fourteen registered layers plus the unknown id — fifteen \
+        16 + cfg!(feature = "fake-source") as usize,
+        "all fifteen registered layers plus the unknown id — sixteen \
          registered where the fake source is on: {order:?}",
     );
 

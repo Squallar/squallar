@@ -44,6 +44,7 @@ itself — see `data.md`, which records the measurements and the probe recipe.
 | 3D volumetric rendering                       | ✅       | ❌          | Partial |
 | Vertical cross-sections                       | ✅       | ❌          | ✅       |
 | MRMS national mosaic (CREF, precip rate)      | ✅       | ✅          | ❌       |
+| Global satellite mosaic (GMGSI, 4 channels)   | ✅       | ❌          | ❌       |
 | Satellite QPE (precip beyond radar range)     | ❌       | ❓          | ❌       |
 | Third-party tile ingest (Rain Viewer et al.)  | ❌       | ❓          | ❌       |
 | VAD wind profiles                             | ✅       | ❓          | ❌       |
@@ -111,6 +112,18 @@ Notes on the Rustdar column:
   than borrowed from the radar palette — that edge is cut and enforced.
   **CONUS only**; the bucket also carries Alaska, Hawaii, Guam and the
   Caribbean, each of which is a variant and a longitude envelope away.
+- **Global satellite imagery** ships: the `Gmgsi` layer draws NOAA's Global
+  Mosaic of Geostationary Satellite Imagery — longwave IR, shortwave IR,
+  visible and water vapour — from `noaa-gmgsi-pds`, hourly, on a 3000 x 5000
+  global grid blended from MSG, GOES and Himawari. It cost no new dependency:
+  the granules are NetCDF4, so they go through the same `hdf5-pure` reader and
+  the same CF-convention unpacking the GLM lightning layer already used. The
+  one new piece of geometry is `GridCoords::Separable` — one axis per
+  dimension, because the grid is uniform in Mercator y rather than in latitude
+  and its declared resolution attribute is wrong by 9.7 degrees mid-grid.
+  **The values are 0-255 counts, not Kelvin**, despite what `units` says; the
+  colour bars in `rustdar-overlays/src/gmgsi/fields.rs` are stated in counts,
+  and a test pins that a Kelvin-scaled ramp would paint nothing at all.
 - **Multi-radar compositing**, **satellite QPE** and **third-party tile ingest**
   remain three ❌ rows and three different projects, not one feature spelled
   three ways. Everything else drawn today is *per site*: one volume, one raster,
