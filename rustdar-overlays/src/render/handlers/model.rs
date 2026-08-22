@@ -1368,8 +1368,32 @@ impl OverlayHandler for ModelDataHandler {
     /// The [`Whole`](rasterize::GriddedInput::Whole) carry: an `Arc` clone of
     /// the resident grid, so describing the job costs a refcount and the values
     /// memcpy happens only in the web encoder that knows the texture's bounds.
-    fn prepare_job(&self, _ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
-        let grid = self.grid_of(pane)?.clone();
+    ///
+    /// **The frame [`RasterizeContext::frame`] names wins over the pane's own
+    /// selection**, and that is what lets a loop be filled: a loop wants
+    /// several of this layer's frames on screen over one second, each raster
+    /// is exactly one of them, and the pane's `selected_frame` can only ever
+    /// say one thing at a time. `None` is the live dispatch and reads
+    /// [`Self::grid_of`] exactly as it did before the field existed.
+    ///
+    /// **Selected through [`Self::frame_target`], which is the same resolver
+    /// [`Self::fetch_frame`] uses** — so the grid a frame is rasterized from
+    /// is the grid that frame's fetch asked for, and the two cannot disagree
+    /// about which `(run, forecast hour)` an instant names on this axis.
+    ///
+    /// A named frame whose grid is **not resident describes no job at all**,
+    /// rather than falling back to the pane's picture. The fallback is another
+    /// instant's forecast, and filing it into this frame is exactly the defect
+    /// the draw fork exists to prevent — one hour's forecast presented,
+    /// unlabelled, as another's.
+    fn prepare_job(&self, ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
+        let grid = match ctx.frame {
+            Some(stamp) => self
+                .cached_grids
+                .get(self.frame_target(self.view(pane), &stamp)?)?,
+            None => self.grid_of(pane)?,
+        }
+        .clone();
         Some(DescribedJob::new(rasterize::GriddedInput::Whole(grid)))
     }
 
@@ -2134,6 +2158,7 @@ mod tests {
             device_scale: 1.0,
             now: clock,
             as_of: clock,
+            frame: None,
         }
     }
 
@@ -2159,6 +2184,104 @@ mod tests {
             "fixture recency, oldest first",
         );
         h
+    }
+
+    /// One fixture grid of `param` at forecast hour `f_hour`, carrying `value`
+    /// as its single point so the grid a job describes can be named by reading
+    /// one number back out of it.
+    fn valued_grid_at_hour(param: ModelParameter, f_hour: u8, value: f32) -> HrrrGridData {
+        let mut g = grid(param, vec![value]);
+        g.forecast_hour = f_hour;
+        g
+    }
+
+    /// The single value of the grid a described job is carrying.
+    fn job_value(job: &DescribedJob) -> f32 {
+        let Some(rasterize::GriddedInput::Whole(grid)) = job.downcast_ref() else {
+            panic!("the model layer described a job of another kind");
+        };
+        grid.values[0]
+    }
+
+    /// **WI-6b's central claim: the raster is of the frame the context names,
+    /// not of the frame the pane has selected.**
+    ///
+    /// A loop wants several of this layer's frames on screen inside one second.
+    /// `ModelPaneState::selected_frame` can only ever say one thing, so without
+    /// this every frame of a forecast loop would receive the *same* picture —
+    /// whichever hour the pane happens to be parked on — and each would be
+    /// captioned with its own stamp. That is a lie on the glass, not a missing
+    /// feature, and it is the reason `RasterizeContext::frame` exists.
+    ///
+    /// **Floor: give `prepare_job` back its `_ctx` and let it read `grid_of`
+    /// unconditionally.** Both asks then answer 1.0 and the third assertion
+    /// below fails naming the value it got — pinned as a value comparison and
+    /// not as `is_some()`, because a presence check passes on exactly the
+    /// defect this test exists for.
+    #[test]
+    fn a_named_frame_is_rasterized_from_that_frames_grid_and_not_the_panes() {
+        let param = ModelParameter::SurfaceBasedCape;
+        let run = run_time();
+        // Two hours of one run, resident together — which is the state a loop
+        // puts the cache in, and the state a single-frame pane never reaches.
+        let mut h = new_handler();
+        h.defaults.enabled = true;
+        h.defaults.selected_param = param;
+        h.defaults.axis = ModelAxis::Forecast;
+        for (f_hour, value) in [(0u8, 1.0f32), (1, 2.0)] {
+            h.cached_grids.insert(
+                GridKey { param, run, f_hour },
+                Arc::new(valued_grid_at_hour(param, f_hour, value)),
+                &[],
+            );
+        }
+        // The pane itself is parked on f00 — the "current selection" the
+        // dispatch used to be forced to rasterize.
+        h.defaults.selected_frame = Some((run, 0));
+
+        let live = h
+            .prepare_job(&rasterize_ctx(), &PaneRef::bare(0))
+            .expect("the pane's own grid is resident");
+        assert_eq!(
+            job_value(&live),
+            1.0,
+            "control: a dispatch that names no frame must still rasterize the \
+             pane's own selection, byte for byte as it did before \
+             `RasterizeContext::frame` existed",
+        );
+
+        let ask = |f_hour: u8| {
+            let ctx = RasterizeContext {
+                frame: Some(FrameStamp {
+                    valid: run + chrono::Duration::hours(i64::from(f_hour)),
+                    run: Some(run),
+                }),
+                ..rasterize_ctx()
+            };
+            h.prepare_job(&ctx, &PaneRef::bare(0))
+        };
+
+        assert_eq!(
+            job_value(&ask(0).expect("f00 is resident")),
+            1.0,
+            "the frame at f00 was not rasterized from f00's grid",
+        );
+        assert_eq!(
+            job_value(&ask(1).expect("f01 is resident")),
+            2.0,
+            "THE claim: the frame at f01 was rasterized from the pane's own \
+             selection (f00) instead of from f01's grid. Every frame of a \
+             forecast loop would carry the same picture under a different \
+             caption.",
+        );
+
+        // A frame whose grid has not landed describes nothing at all. The
+        // alternative is the pane's current picture filed into another
+        // instant's frame, which is the defect the draw fork exists to stop.
+        assert!(
+            ask(2).is_none(),
+            "a frame with no resident grid fell back to the pane's picture",
+        );
     }
 
     /// A full desktop layout is six unlinked panes, each free to select its own

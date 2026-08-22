@@ -1363,6 +1363,18 @@ impl LayerTimeState {
         true
     }
 
+    /// **The frame that depicts `valid`**, by stamp rather than by index.
+    ///
+    /// The one door a raster arriving from the wire files itself through: a
+    /// render is dispatched for a *stamp* and comes back one or more frames
+    /// later, by which time the index it was dispatched at may name another
+    /// frame — the list is rebuilt whenever the loop is re-listed or capped,
+    /// and `cap_frames` re-samples it outright. Two frames never share a
+    /// `timestamp`, so the stamp is the identity that survives.
+    pub fn frame_at_stamp_mut(&mut self, valid: NaiveDateTime) -> Option<&mut LoopFrame> {
+        self.frames.iter_mut().find(|f| f.timestamp == valid)
+    }
+
     /// Drop textures outside the intended render set once more than `budget` frames
     /// are textured, capping loop memory.
     pub fn evict_textures_outside_render_set(&mut self, budget: usize) {

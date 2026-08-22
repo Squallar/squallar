@@ -253,6 +253,7 @@ const EXPECTED_ROWS: &[(&str, PumpPhase)] = &[
     ("dispatch_pane_renders", PumpPhase::Dispatch),
     ("dispatch_section_renders", PumpPhase::Dispatch),
     ("dispatch_loop_renders", PumpPhase::Dispatch),
+    ("dispatch_overlay_loop_renders", PumpPhase::Dispatch),
 ];
 
 #[test]

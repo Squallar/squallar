@@ -1280,7 +1280,10 @@ impl App {
                     pane_indices.len()
                 );
             }
-            self.spawn_overlay_render(pane_indices, id, req);
+            // `None`: this is the pane's live raster, whichever path
+            // noticed it was stale. A loop frame's dispatch is
+            // `dispatch_overlay_loop_renders`, and it names its frame.
+            self.spawn_overlay_render(pane_indices, id, req, None);
         }
     }
 

@@ -948,6 +948,23 @@ impl RenderDispatcher {
             .insert((pane_idx, id.clone()), req);
     }
 
+    /// **What this pane's live raster of `id` was last asked for**, or `None`
+    /// before one has ever been dispatched.
+    ///
+    /// The geometry a loop frame's raster reuses (WI-6b): the pane is already
+    /// drawing this layer at this viewport, and a loop frame is that same
+    /// raster held rather than replaced. Reading it back is also what makes
+    /// the loop dispatch wait — a layer with no record has never been sized
+    /// for this pane, and inventing a viewport for it here would rasterize
+    /// the wrong ground.
+    pub(crate) fn overlay_record(
+        &self,
+        pane_idx: usize,
+        id: &rustdar_source::id::LayerId,
+    ) -> Option<&crate::app::fetch::OverlayRenderRequest> {
+        self.last_overlay_dispatch.get(&(pane_idx, id.clone()))
+    }
+
     /// Every pane holding a record for `id`, with what it was asked for.
     ///
     /// Sorted by pane index so the arrival walk is deterministic — a `HashMap`

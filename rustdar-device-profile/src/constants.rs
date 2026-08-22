@@ -135,6 +135,24 @@ pub const DESKTOP_MAX_LOOP_FRAMES: usize = 60;
 /// rather than against a device class's memory — hence not a cfg cascade.
 pub const MAX_LOOP_SECTION_CUTS_PER_FRAME: usize = 1;
 
+/// How many non-radar loop frames may be *dispatched* in one pass.
+///
+/// Not a memory bound — that is the pane's byte share of the loop pool, which
+/// `overlay_frames_held` divides and `dispatch_overlay_loop_renders` re-derives
+/// every pass. This is a **burst** bound, and it is against the job funnel
+/// rather than against the frame thread: an overlay raster is offloaded, but it
+/// shares that funnel with the live radar and overlay rasters an interacting
+/// user is waiting on. A desktop pool affords tens of frames, and switching a
+/// forecast loop on would otherwise queue every one of them at once — a
+/// measured CONUS HRRR rasterize is 133 ms median, so thirty of them is several
+/// seconds of pool ahead of the next thing the user asks for.
+///
+/// Four, not one: unlike a section cut this costs the frame thread nothing, and
+/// a loop that fills four frames a pass is showable in a fraction of a second
+/// while still leaving the funnel room. Interaction stays realtime; the data
+/// arrives when it arrives.
+pub const MAX_OVERLAY_LOOP_RENDERS_PER_PASS: usize = 4;
+
 /// How long a frame keeps *starting* frees of what
 /// rustdar-worker's `offload::discard` handed it. It paces; it does not bound
 /// the frame — `drain_deferred_drops` checks the clock *after* each free, so a

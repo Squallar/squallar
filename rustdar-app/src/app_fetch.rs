@@ -1018,11 +1018,27 @@ impl super::App {
     }
 
     /// Spawn a background thread to rasterize overlay polygons via tiny-skia.
+    ///
+    /// **`frame` is the whole of the loop half** (WI-6b). `None` is the pane's
+    /// live raster and every statement below behaves as it did before the
+    /// parameter existed; `Some(stamp)` is one frame of an animating layer's
+    /// loop, and it changes exactly three things:
+    ///
+    /// * the in-flight mark goes on **that frame**, not on the pane's overlay
+    ///   cache — a loop dispatches several rasters of one layer at once, and
+    ///   one shared bool cannot say which of them are out;
+    /// * **no dispatch record is written**. The record is what
+    ///   [`Self::arrived_overlay_asks`] re-asks the *live* raster from, and a
+    ///   loop frame's geometry is not the live raster's question;
+    /// * the stamp rides the context out to the handler and the response back,
+    ///   so `prepare_job` rasterizes that frame and the arrival files itself to
+    ///   it.
     pub(super) fn spawn_overlay_render(
         &mut self,
         pane_indices: Vec<usize>,
         id: LayerId,
         req: OverlayRenderRequest,
+        frame: Option<rustdar_source::time::FrameStamp>,
     ) {
         use rustdar_egui::overlay_cache::ZOOM_QUANTIZATION_FACTOR;
 
@@ -1053,22 +1069,31 @@ impl super::App {
 
         for &pidx in &pane_indices {
             if let Some(pane) = self.gui.pane_mut(pidx) {
-                pane.overlay_cache_mut(&id).render_in_flight = true;
+                match frame {
+                    Some(stamp) => {
+                        if let Some(f) = pane.time_state_mut(&id).frame_at_stamp_mut(stamp.valid) {
+                            f.render_in_flight = true;
+                        }
+                    }
+                    None => pane.overlay_cache_mut(&id).render_in_flight = true,
+                }
             }
             // **The record, written here and nowhere else** — beside the mark, so
             // "this pane has a raster of this layer out" and "this is what it was
             // asked for" are set by the same statement and cannot disagree. Both
             // paths reach this function, so both write it; the arrival path reads
             // it back for the geometry alone (WO-M13a).
-            self.render
-                .record_overlay_dispatch(pidx, &id, record.clone());
+            if frame.is_none() {
+                self.render
+                    .record_overlay_dispatch(pidx, &id, record.clone());
+            }
         }
 
         let render_bounds = texture.coverage(&geo_bounds);
 
         let first_pane_idx = pane_indices[0];
         if self.gui.pane(first_pane_idx).is_none() {
-            self.clear_overlay_render_marks(&pane_indices, &id);
+            self.clear_overlay_render_marks(&pane_indices, &id, frame);
             return;
         }
 
@@ -1114,6 +1139,9 @@ impl super::App {
                     // clock to the layers whose picture is a function of it,
                     // and `now` is left alone either way.
                     as_of: as_of_for_layer(&self.gui, first_pane_idx, id, clock),
+                    // The frame this raster IS, straight through to the
+                    // handler — see the parameter's own note above.
+                    frame,
                 };
                 // **The real pane, with its siblings.** `PaneView` and not
                 // `layer_ref`: the site table reads the radar slot's `"site"`
@@ -1132,7 +1160,7 @@ impl super::App {
                     job.zip(row).map(|(job, row)| (job, id_map, row))
                 };
                 let Some((job, id_map, row)) = built else {
-                    self.clear_overlay_render_marks(&pane_indices, id);
+                    self.clear_overlay_render_marks(&pane_indices, id, frame);
                     return;
                 };
                 let geometry = rustdar_source::job::JobGeometry {
@@ -1158,6 +1186,10 @@ impl super::App {
                             pane_indices,
                             zoom,
                             hit_map: None,
+                            // Echoed back so the arrival can find the frame
+                            // that asked; `None` keeps every live raster on
+                            // the path it was already on.
+                            frame,
                         },
                         sender,
                         window,
@@ -1180,7 +1212,7 @@ impl super::App {
                      cannot rasterize: {}",
                     id.as_str()
                 );
-                self.clear_overlay_render_marks(&pane_indices, &id);
+                self.clear_overlay_render_marks(&pane_indices, &id, frame);
             }
         }
     }
@@ -1319,12 +1351,30 @@ impl super::App {
     /// Undo the in-flight marks [`spawn_overlay_render`](Self::spawn_overlay_render)
     /// set on its target panes.
     ///
+    /// **`frame` must be the same value the dispatch was given**, because the
+    /// two put the mark in two different places. A loop frame abandoned here
+    /// and not un-marked is a frame nothing ever asks for again — the dispatch
+    /// declines it on `render_in_flight` for the life of the loop — and the
+    /// pane goes on animating with a hole in it.
+    ///
     /// (See [`as_of_for_layer`] for the depicted instant this dispatch hands
     /// the rasterizer.)
-    fn clear_overlay_render_marks(&mut self, pane_indices: &[usize], id: &LayerId) {
+    fn clear_overlay_render_marks(
+        &mut self,
+        pane_indices: &[usize],
+        id: &LayerId,
+        frame: Option<rustdar_source::time::FrameStamp>,
+    ) {
         for &pidx in pane_indices {
             if let Some(pane) = self.gui.pane_mut(pidx) {
-                pane.overlay_cache_mut(id).render_in_flight = false;
+                match frame {
+                    Some(stamp) => {
+                        if let Some(f) = pane.time_state_mut(id).frame_at_stamp_mut(stamp.valid) {
+                            f.render_in_flight = false;
+                        }
+                    }
+                    None => pane.overlay_cache_mut(id).render_in_flight = false,
+                }
             }
         }
     }
