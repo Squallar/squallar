@@ -253,6 +253,66 @@ const _: () = assert!(GRID_CACHE_BYTES >= CONUS_GRID_BYTES);
 const _: () = assert!(GRID_CACHE_BYTES.is_multiple_of(CONUS_GRID_BYTES));
 const _: () = assert!(CONUS_GRID_BYTES == 98_000_000);
 
+/// **How many bytes of loop-frame granule may stage at once: one mosaic, on
+/// every arm.**
+///
+/// Not a per-arm cascade, because the figure is not a guess about the device —
+/// it is what the pipeline needs. A loop frame's storage is its **texture**,
+/// held by the pane; the granule is a 98,000,000 B staging buffer a frame
+/// passes through on its way to one. A described job takes its own refcount on
+/// the raster, so the slot is free again the moment `prepare_job` has run, and
+/// the handler's frame gate admits one fetch at a time so nothing else can ask
+/// for the slot in the meantime.
+///
+/// The gate matters even more here than at GMGSI: one MRMS decode **peaks at
+/// ~147 MB transient** (`decode`'s own arithmetic — grib's PNG stage holds the
+/// whole 49 MB image buffer while the 98 MB values vector fills), so N
+/// concurrent frame fetches would hold N x 147 MB inside the futures before
+/// any cache saw a byte. Thirty unthrottled fetches — one slider-default hour
+/// at the ~2-minute cadence — would be ~4.4 GB in flight.
+pub const FRAME_STAGING_BYTES: usize = CONUS_GRID_BYTES;
+
+// The pipeline advances one granule at a time, so a staging area under one
+// grid settles empty and no frame is ever rasterized. Same reason the live
+// cache carries the same floor, and the same reason it is a **build** failure.
+const _: () = assert!(FRAME_STAGING_BYTES >= CONUS_GRID_BYTES);
+
+/// **What one frame listing found**, carried back to `apply_frame_listing` as
+/// its scope.
+///
+/// The product is captured at dispatch, not read back off the arriving pane:
+/// the `PaneRef` a listing lands with is the union across panes and its config
+/// is null by construction, so a listing taken for the composite would
+/// otherwise be filed under whatever product the pane holds by then.
+///
+/// `keys` is the whole of what the listing bought — a stamp and the object
+/// name carrying it — because MRMS **timestamps are not clock-aligned**
+/// (`000039`, `000242`, `000442`), so a stamp cannot be rounded back into a
+/// key and a frame fetched later would otherwise re-list its day.
+///
+/// **Public so a test can drive the real handler**, for the reason
+/// `gmgsi::GmgsiListing` states: a double cannot catch a layer that files its
+/// frames wrongly.
+pub struct MrmsListing {
+    pub product: MrmsProduct,
+    pub range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+    pub keys: Vec<(chrono::NaiveDateTime, String)>,
+    /// Whether the days listed were every day the range touches, all answered.
+    pub complete: bool,
+}
+
+/// **One loop frame's granule**, as its fetch hands it back.
+///
+/// `product` and `valid` come off the dispatch rather than off the decoded
+/// granule for the reason [`MrmsListing`] states, and `grid: None` is a fetch
+/// that failed: the frame is left without a picture rather than being given
+/// another stamp's.
+pub struct MrmsFrameFetch {
+    pub product: MrmsProduct,
+    pub valid: chrono::NaiveDateTime,
+    pub grid: Option<MrmsGrid>,
+}
+
 /// One decoded MRMS mosaic.
 ///
 /// The grid itself is behind an `Arc` because that is what `prepare_job` hands

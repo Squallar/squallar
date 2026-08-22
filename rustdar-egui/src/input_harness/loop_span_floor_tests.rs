@@ -266,6 +266,56 @@ fn the_satellite_layer_loops_over_twelve_hours_and_radar_over_the_sliders() {
     );
 }
 
+/// **The national mosaic needs no floor, and gets none** (WB-10).
+///
+/// The inverse of the satellite case, asserted rather than assumed: at MRMS's
+/// 120 s cadence the Lookback slider's default hour is already 31 frames — a
+/// real loop — so `Mrms::min_loop_frames` stays the trait's 0 and the window
+/// the ∞ button emits is the slider's number **to the second**. A floor wide
+/// enough to bind here (anything past 31 frames) would widen every MRMS
+/// pane's rail for nothing; one narrower is dead code.
+///
+/// Radar's window in the same harness doubles as the control that nothing
+/// global widened, and the tuning caption stays the base string — no floor
+/// binds, so there is no quantity to show.
+///
+/// **Floor — `a_floor_that_binds`:** `Mrms::min_loop_frames` -> 361 (twelve
+/// hours of 120 s frames). Red: the emitted window becomes 43,200 s, not the
+/// slider's 3600.
+#[test]
+fn the_mosaic_loops_over_the_sliders_own_window_with_no_floor() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+
+    let radar_window = enable_loop_window(&mut h);
+    assert_eq!(radar_window, SLIDER_DEFAULT, "control: radar on the slider");
+
+    draw(&mut h, &known::MRMS, true);
+    draw(&mut h, &known::RADAR, false);
+    assert_eq!(
+        h.gui_mut().pane(0).expect("pane 0").transport_layer(),
+        &known::MRMS,
+        "precondition: MRMS is a FrameSeries layer since WB-10, so with \
+         radar off it is what the pane's transport addresses"
+    );
+
+    let mosaic_window = enable_loop_window(&mut h);
+    assert_eq!(
+        mosaic_window, SLIDER_DEFAULT,
+        "MRMS declares no min_loop_frames, so the slider's number reaches \
+         the loop to the second"
+    );
+    assert_eq!(
+        frames(mosaic_window, 120),
+        31,
+        "and the slider's default hour is already {} frames at the 2-minute \
+         cadence — a real loop with no floor's help, which is why declaring \
+         one would only ever widen the rail",
+        frames(mosaic_window, 120),
+    );
+    assert!(frames(mosaic_window, 120) >= MIN_LOOP_FRAMES_PER_PANE * 4);
+}
+
 /// **The two hourly layers do not collide.** GMGSI's weight is 5 and the
 /// model's is 10, so a pane drawing both keeps the model as its transport —
 /// which is the whole of the WB-11 draw-order ruling, read at the pane rather

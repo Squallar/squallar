@@ -4375,6 +4375,12 @@ mod loop_playback_transport_tests;
 #[cfg(test)]
 mod gmgsi_loop_tests;
 
+/// The national mosaic loop (WB-10), end to end against the **real** MRMS
+/// handler rather than a double — and the clock ruling, read at the pane.
+#[path = "app_render/mrms_loop_tests.rs"]
+#[cfg(test)]
+mod mrms_loop_tests;
+
 /// The cross-section loop's dispatch, placement and frame-thread pacing.
 #[path = "app_render/loop_section_tests.rs"]
 #[cfg(test)]
