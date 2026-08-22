@@ -1,6 +1,7 @@
 use crate::site_position::SitePosition;
 use rustdar_geo::EARTH_RADIUS_KM;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, RwLock};
 
 /// Which height above mean sea level a caller means.
@@ -725,6 +726,35 @@ fn empty_table() -> &'static SiteTable {
 /// The table this process resolved, or `None` until something resolves one.
 static RESOLVED: RwLock<Option<&'static SiteTable>> = RwLock::new(None);
 
+/// How many times [`resolve`] has actually replaced the table.
+///
+/// **A copy of the table is a copy of a moving thing**, and the copies live in
+/// other crates: `rustdar-overlays` may not name this one (WO-M3's edge cut),
+/// so the site layer draws from rows the shell hands it rather than from
+/// [`radars()`]. A copy taken before a resolution is a copy of the table
+/// *before* it — and the layer that took it has no way to notice, because
+/// nothing about the rows it holds says which table they came from. This is
+/// that "which": read it beside the rows, compare it later, and a copy that
+/// has fallen behind says so.
+///
+/// Starts at `0`, which is the empty table every process boots on, and is
+/// bumped only when a resolution genuinely stores something new — a `resolve`
+/// whose fixes change nothing leaves it alone, so a holder that re-reads on
+/// every move does not re-read on every call.
+static TABLE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Which table [`table()`] would answer with right now — see
+/// [`TABLE_GENERATION`].
+///
+/// **Read this BEFORE the rows, never after.** A resolution landing between
+/// the two reads then leaves the reader recording a generation older than the
+/// rows it holds, which costs one redundant re-read; the other order would
+/// leave it recording a generation newer than its rows and miss the update
+/// forever.
+pub fn table_generation() -> u64 {
+    TABLE_GENERATION.load(Ordering::Acquire)
+}
+
 /// The table every lookup in this module reads. Falls back to [`empty_table`]
 /// rather than panicking when nothing has resolved yet.
 pub fn table() -> &'static SiteTable {
@@ -766,6 +796,9 @@ where
     match extended(current, fixes) {
         Some(extended) => {
             *resolved = Some(extended);
+            // Bumped under the same write lock that stores the table, so a
+            // reader can never see the new rows behind the old generation.
+            TABLE_GENERATION.fetch_add(1, Ordering::AcqRel);
             extended
         }
         None => current,

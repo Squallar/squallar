@@ -332,11 +332,18 @@ impl Gui {
     /// The table lives in `rustdar-radar`, which `rustdar-overlays` must not
     /// name (WO-M3's edge cut), so the shell that already reads it for the
     /// per-frame site labels installs the rows through the ordinary arrival
-    /// door. Re-run whenever the table moves — a catalogue landing
-    /// mid-session places radars this call did not have — which is why the
-    /// App calls it again from `adopt_the_first_catalogue`.
+    /// door.
+    ///
+    /// **Nothing has to remember to re-run this.**
+    /// [`Self::republish_radar_sites_if_the_table_moved`] does, once a frame,
+    /// off the table's own generation — which is what keeps the layer's copy
+    /// and the labels' `sites::radars()` describing the same network.
     pub fn publish_radar_sites(&mut self) {
         use rustdar_overlays::render::handlers::sites::{RadarSitesFetchResult, SiteRow};
+        // Read BEFORE the rows: see `sites::table_generation`. A resolution
+        // landing between the two lines costs one redundant re-read next
+        // frame; the other order would miss it forever.
+        self.published_sites_generation = rustdar_radar::sites::table_generation();
         let rows: Vec<SiteRow> = rustdar_radar::sites::radars()
             .iter()
             .map(|site| SiteRow {
@@ -351,6 +358,38 @@ impl Gui {
                 data: Box::new(RadarSitesFetchResult(rows)),
             },
         );
+    }
+
+    /// **Retake the site layer's copy of the table when the table has moved**,
+    /// and say whether it did.
+    ///
+    /// The site markers are a raster of rows the layer holds; the site labels
+    /// beside them are drawn per frame straight out of
+    /// [`rustdar_radar::sites::radars`]. Two readers of one table, and only
+    /// one of them is a copy — so every resolution the copy does not hear
+    /// about is a frame where the labels describe a network the markers do
+    /// not. Boot is the worst case and the ordinary one: `App::new` builds
+    /// the [`Gui`] *before* it resolves the table, so the copy taken in
+    /// `Gui::new` is of the empty table, the layer answers `has_data` false,
+    /// no raster is ever asked for, and the map draws labels with no markers
+    /// under them.
+    ///
+    /// Run from the per-frame drive rather than beside each `sites::resolve`,
+    /// because there are four of those in three files (startup, the first
+    /// catalogue, a position learned from a volume, and Android's late config
+    /// directory) and a fifth would be written without this one. Costs one
+    /// acquire load of an uncontended atomic per frame when nothing moved.
+    ///
+    /// Bumps the render generation too: the sites cache token is
+    /// `radar_sites_render_gen` and nothing else, so new rows alone would not
+    /// unseat a raster already on the glass.
+    pub fn republish_radar_sites_if_the_table_moved(&mut self) -> bool {
+        if self.published_sites_generation == rustdar_radar::sites::table_generation() {
+            return false;
+        }
+        self.publish_radar_sites();
+        self.bump_all_radar_sites_gen();
+        true
     }
 
     /// **Re-place every pane's volume against the site table as it stands.**

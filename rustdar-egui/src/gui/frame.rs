@@ -12,6 +12,10 @@ impl Gui {
             self.storm_motion_editing = false;
         }
 
+        // Before anything draws: the site layer holds a *copy* of the table,
+        // and this is where it hears that the table moved.
+        self.republish_radar_sites_if_the_table_moved();
+
         self.check_auto_polls(&mut actions);
 
         self.layout = LayoutCtx::resolve(ctx, &mut self.modality, self.safe_area_insets);

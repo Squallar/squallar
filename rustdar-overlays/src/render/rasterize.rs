@@ -1624,3 +1624,6 @@ mod wrapping_window_tests;
 
 #[cfg(test)]
 mod device_scale_tests;
+
+#[cfg(test)]
+mod sites_marker_tests;

@@ -359,6 +359,10 @@ pub struct Gui {
     /// these, so a kind this build serves is described by its handler and
     /// one it does not is handed back exactly as it arrived.
     pub(super) overlay_states_baggage: serde_json::Map<String, serde_json::Value>,
+    /// Which site table [`Self::publish_radar_sites`] last copied — see
+    /// [`rustdar_radar::sites::table_generation`]. Compared once per frame;
+    /// when it has moved, the layer's copy is retaken.
+    pub(super) published_sites_generation: u64,
     /// Every record of what the last frame drew, for the input harness —
     /// the thirty test-only probe fields collapsed into one. See
     /// [`FrameProbes`].
@@ -533,13 +537,18 @@ impl Gui {
             volume_iso: crate::volume_iso::IsoThresholds::default(),
             config_unknown_fields: serde_json::Map::new(),
             overlay_states_baggage: serde_json::Map::new(),
+            published_sites_generation: 0,
             #[cfg(test)]
             probes: FrameProbes::default(),
         };
         gui.initialize_pane_enabled();
         // The site layer draws from its own copy of the table; without this it
         // has no rows and answers `has_data` false, which is a map with no
-        // site markers on it.
+        // site markers on it. **A seed, not the whole story** — a Gui is
+        // routinely built before anything has resolved a table (`App::new`
+        // does exactly that), so the copy taken here is often of nothing.
+        // What makes it right in the end is the per-frame re-read in
+        // [`Self::republish_radar_sites_if_the_table_moved`].
         gui.publish_radar_sites();
         gui
     }
