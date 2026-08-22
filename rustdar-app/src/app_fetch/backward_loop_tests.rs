@@ -420,6 +420,15 @@ fn radars_backward_loop_arms_the_same_shape_it_always_did() {
     assert_eq!(rustdar_egui::radar_layer::coords(ls), (35.33, -97.27));
     assert_eq!(ls.phase, rustdar_egui::pane::LoopPhase::FetchingScanList);
     assert_eq!(ls.span_secs, LOOKBACK, "the window it was listed for");
+    assert_eq!(
+        ls.asked_range,
+        Some((
+            scan_at - chrono::Duration::seconds(LOOKBACK as i64),
+            scan_at
+        )),
+        "and the very window it asked, recorded whole — what the arrival is \
+         matched on",
+    );
     assert_eq!(ls.view, rustdar_radar::types::RenderView::PlanView);
     assert!(ls.frames.is_empty());
     assert_eq!(ls.current_frame(), 0);

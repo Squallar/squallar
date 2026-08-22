@@ -1495,6 +1495,12 @@ impl super::App {
             // own reading, so a refill's wait is measured the same way a fresh
             // loop's is.
             ls.listing_since = Some(now);
+            // The window this refill asked over, which is what the arrival is
+            // matched on. It is the same width as the window it replaces —
+            // `refill_range` is one span wide by construction — anchored at
+            // the scrub target, which is exactly why the width alone cannot
+            // say whose answer a landing listing is.
+            ls.asked_range = Some(ask.range);
             dispatch.push((idx, task));
         }
         for idx in forget {
@@ -2307,6 +2313,11 @@ fn begin_loop_for_pane(
             // against.
             None => rustdar_egui::pane::LayerTimeState::begin(span_secs, view, Box::new(())),
         };
+        // **The ask itself, not just its width.** The arrival path matches a
+        // landing listing to this pane on the exact window recorded here;
+        // `span_secs` cannot tell this ask from a deep-scrub refill's, whose
+        // window is the same width anchored in another era.
+        panes[pane_idx].transport_state_mut().asked_range = Some((start, end));
 
         return Some(LoopScanRequest { layer, start, end });
     }
@@ -2351,6 +2362,8 @@ fn begin_loop_for_pane(
     // timeline to land on rather than being dropped as a silent no-op.
     *panes[pane_idx].transport_state_mut() =
         rustdar_egui::pane::LayerTimeState::begin(span_secs, view, Box::new(()));
+    // The ask itself, recorded whole — see the backward arm.
+    panes[pane_idx].transport_state_mut().asked_range = Some((start, end));
 
     Some(LoopScanRequest { layer, start, end })
 }

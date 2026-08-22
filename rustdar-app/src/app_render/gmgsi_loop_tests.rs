@@ -177,6 +177,9 @@ fn build_loop(app: &mut crate::app::App) {
         rustdar_radar::types::RenderView::PlanView,
         Box::new(()),
     );
+    // What the production dispatch records beside the phase: the window the
+    // ask covered, which is what the arrival is matched on.
+    pane.time_state_mut(&known::GMGSI).asked_range = Some(window());
 
     let keys: Vec<(chrono::NaiveDateTime, String)> = (0..FRAMES)
         .map(|k| {

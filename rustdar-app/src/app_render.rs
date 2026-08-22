@@ -1867,21 +1867,26 @@ impl super::App {
         let budgets = self.budgets;
         let config = self.fetch_config();
         for LoopListingArrival { layer, site, range } in arrived {
-            let span_secs = (range.1 - range.0).num_seconds();
             let mut built: Vec<(usize, FramePlan, rustdar_radar::types::RadarProduct)> = Vec::new();
             let mut owed: Vec<(usize, Vec<rustdar_source::time::FrameStamp>)> = Vec::new();
             {
                 let (panes, overlays) = self.gui.panes_and_overlays_mut();
                 for (pane_idx, pane) in panes.iter_mut().enumerate() {
                     // Only a pane still waiting for a listing over this very
-                    // window, **on the layer the listing is for**: two panes
-                    // looping one site with two spans ask two questions, and
-                    // neither may be answered with the other's.
+                    // window, **on the layer the listing is for** — the
+                    // window itself, not its width. Two panes looping one
+                    // layer with equal spans and different anchors (a live
+                    // enable beside a deep-scrub refill) ask two questions,
+                    // and answering either with the other's listing presents
+                    // one era's frames as the other — a confidently wrong
+                    // picture, not a missing one. Every producer echoes the
+                    // range it was dispatched with verbatim, so the recorded
+                    // ask matches its own answer exactly and nobody else's.
                     let waiting = {
                         let ls = pane.time_state(&layer);
                         ls.is_active()
                             && ls.phase == rustdar_egui::pane::LoopPhase::FetchingScanList
-                            && ls.span_secs as i64 == span_secs
+                            && ls.asked_range == Some(range)
                     };
                     if !waiting {
                         continue;

@@ -371,16 +371,19 @@ fn six_hundred_passes_over_one_hole_issue_one_request() {
 }
 
 /// The handoff: a refilled loop is back in the phase `accept_loop_scan_listings`
-/// looks for, over the span it asked for, so the listing that lands is the one
-/// that builds its frames.
+/// looks for, with the very window it asked for recorded, so the listing that
+/// lands is the one that builds its frames.
 ///
 /// Pinned because the acceptance path is not this item's — it matches a landed
-/// listing on `(phase, span_secs, site)` and nothing else, and a refill that
+/// listing on `(phase, asked window, site)` and nothing else, and a refill that
 /// left any of the three wrong would ask a question whose answer is dropped.
+/// The window is the whole range and not its width: a refill's window is the
+/// same width as the live window it replaces, anchored at the scrub target,
+/// and width-matching filed one pane's era into another pane's loop.
 #[test]
 fn a_refilled_loop_waits_in_the_phase_the_listing_path_looks_for() {
     let id = known::RADAR;
-    let (mut app, _seen) = app_looping(&id, &[60, 70, 80]);
+    let (mut app, seen) = app_looping(&id, &[60, 70, 80]);
     app.gui
         .pane_mut(0)
         .expect("one pane")
@@ -396,9 +399,15 @@ fn a_refilled_loop_waits_in_the_phase_the_listing_path_looks_for() {
         rustdar_egui::pane::LoopPhase::FetchingScanList,
         "a refilling loop waits in the listing phase",
     );
+    assert_eq!(ls.span_secs, SPAN, "over the span it asked for",);
+    let asked = recorded(&seen);
+    assert_eq!(asked.len(), 1, "one refill, one question: {asked:?}");
     assert_eq!(
-        ls.span_secs, SPAN,
-        "over the span it asked for, which is how the arrival is matched to it",
+        ls.asked_range,
+        Some(asked[0]),
+        "recording the very window it put on the wire, which is how the \
+         arrival is matched to it — the width alone cannot tell this ask \
+         from the live window it replaced",
     );
     assert!(
         ls.frames.is_empty(),

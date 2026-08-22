@@ -3347,6 +3347,7 @@ fn a_listing_that_arrives_on_the_source_path_builds_the_loop_waiting_for_it() {
         &SITE,
         rustdar_radar::types::RenderView::PlanView,
     );
+    pane.loop_state_mut().asked_range = Some(range);
     assert_eq!(
         pane.loop_state().phase,
         rustdar_egui::pane::LoopPhase::FetchingScanList,
@@ -3530,6 +3531,7 @@ fn a_hidden_panes_loop_is_still_built_from_the_site_it_is_on_now() {
         &KOUN,
         rustdar_radar::types::RenderView::PlanView,
     );
+    pane.loop_state_mut().asked_range = Some(range);
     assert_eq!(
         pane.loop_state().phase,
         rustdar_egui::pane::LoopPhase::FetchingScanList,
@@ -3612,6 +3614,9 @@ fn a_listing_for_one_site_leaves_another_sites_pane_waiting() {
         &KOUN,
         rustdar_radar::types::RenderView::PlanView,
     );
+    // The very window the listing below covers, so the refusal observed is
+    // the SITE guard's and not the window match's.
+    pane.loop_state_mut().asked_range = Some(range);
 
     // KTLX's listing, arriving while the only pane is on KOUN.
     let scans = vec![(
@@ -3663,7 +3668,7 @@ fn a_listing_for_one_site_leaves_another_sites_pane_waiting() {
 ///
 /// The arrival names no pane, so what selects the panes a listing builds is
 /// the window it covered. Same site on both, so the site guard cannot be what
-/// separates them — only the span can.
+/// separates them — only the recorded ask can.
 #[test]
 fn a_listing_over_one_window_does_not_build_a_loop_asking_about_another() {
     use rustdar_overlays::render::overlay_state::SourceEvent;
@@ -3697,6 +3702,7 @@ fn a_listing_over_one_window_does_not_build_a_loop_asking_about_another() {
             &SITE,
             rustdar_radar::types::RenderView::PlanView,
         );
+        pane.loop_state_mut().asked_range = Some((at(-((span_secs / 60) as i64)), at(0)));
     }
 
     let range = (at(-10), at(0));
