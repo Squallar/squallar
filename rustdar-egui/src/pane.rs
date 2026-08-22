@@ -844,6 +844,20 @@ pub struct PaneState {
     /// pane's own posture, shared by every layer it draws — the layers keep
     /// their own [`LayerTimeState`] on their slots.
     pub time: PaneTimePosture,
+    /// **Which layer this pane's loop transport addresses** — the timeline the
+    /// ∞ toggle, the play/step/seek buttons and the scrubber all move.
+    ///
+    /// Deliberately a *stored* choice rather than a derived one, and
+    /// deliberately separate from [`Self::clock_layer`]: the transport has to
+    /// keep answering the same layer while that layer's loop is being torn
+    /// down or built up, which is exactly when "the topmost animating layer"
+    /// is `None` or is briefly somebody else. It is re-derived only when the
+    /// pane's enabled set changes — see [`Self::refresh_transport`].
+    ///
+    /// Persisted. Default [`known::RADAR`], which is what makes every config
+    /// written before the field existed load unchanged: radar was the only
+    /// layer the transport could address.
+    transport: LayerId,
     /// The answer [`Self::loop_state`] gives a pane that has no radar slot to
     /// keep one on: inactive, empty, and never written. A pane the `Gui` owns
     /// has been through `initialize_pane_enabled` and has the slot, so this is
@@ -1395,6 +1409,7 @@ impl PaneState {
             layers: Vec::new(),
             config_baggage: PaneConfigBaggage::default(),
             time: PaneTimePosture::default(),
+            transport: known::RADAR,
             orphan_time: LayerTimeState::new(),
             loading_site: None,
             radar_sites_render_gen: 0,
@@ -1850,6 +1865,101 @@ impl PaneState {
     /// [`Self::loop_state`], to write.
     pub fn loop_state_mut(&mut self) -> &mut LayerTimeState {
         self.time_state_mut(&known::RADAR)
+    }
+
+    /// **The layer this pane's loop transport addresses** — see
+    /// [`Self::transport`](#structfield.transport). Radar until something
+    /// moves it, which is what makes every caller below identical to the
+    /// radar-addressed [`Self::loop_state`] on a radar pane.
+    pub fn transport_layer(&self) -> &LayerId {
+        &self.transport
+    }
+
+    /// Address the transport at `id`. The config loader's door — restoring a
+    /// saved choice is the one write that is not a re-derivation, because the
+    /// file already holds the answer [`Self::refresh_transport`] would
+    /// recompute.
+    pub fn set_transport_layer(&mut self, id: LayerId) {
+        self.transport = id;
+    }
+
+    /// **The transport layer's timeline in this pane** — what the ∞ toggle,
+    /// the transport buttons and the scrubber all read.
+    ///
+    /// Not the same accessor as [`Self::loop_state`], and deliberately so:
+    /// that one is radar's own timeline, which the arrival path, the render
+    /// dispatcher and the scan cache go on addressing by name because their
+    /// payloads are radar's.
+    /// Every one of the three goes through [`Self::transport_layer`] rather
+    /// than reading the field, so there is exactly one place that decides
+    /// which layer this pane's transport is about.
+    pub fn transport_state(&self) -> &LayerTimeState {
+        self.time_state(self.transport_layer())
+    }
+
+    /// [`Self::transport_state`], to write.
+    pub fn transport_state_mut(&mut self) -> &mut LayerTimeState {
+        let id = self.transport_layer().clone();
+        self.time_state_mut(&id)
+    }
+
+    /// [`Self::park_on_frame`] on the transport layer — what the scrubber and
+    /// the frame-step buttons do.
+    pub fn park_on_transport_frame(&mut self, index: usize) -> bool {
+        let id = self.transport_layer().clone();
+        self.park_on_frame(&id, index)
+    }
+
+    /// **The layer the transport *should* address**: this pane's topmost
+    /// enabled layer that comes in stamped frames, or `None` when it has
+    /// none.
+    ///
+    /// The slot list runs bottom to top, so the last match is the topmost —
+    /// the same reading [`Self::clock_layer`] makes, narrowed by what the
+    /// handlers *declare* rather than by what happens to be running. Needs
+    /// the registry, so it is asked with one rather than stored.
+    pub fn topmost_frame_series_layer<'a>(
+        &'a self,
+        overlays: &rustdar_overlays::render::overlay_state::OverlayRegistry,
+    ) -> Option<&'a LayerId> {
+        self.layers
+            .iter()
+            .rev()
+            .filter(|slot| slot.enabled)
+            .map(|slot| &slot.id)
+            .find(|id| {
+                overlays.handlers().any(|handler| {
+                    handler.id() == **id
+                        && matches!(
+                            handler.time_axis(),
+                            rustdar_source::time::TimeAxis::FrameSeries { .. }
+                        )
+                })
+            })
+    }
+
+    /// **Re-derive which layer the transport addresses.** Called wherever the
+    /// pane's enabled set moves, and by the ∞ toggle before it starts a loop.
+    ///
+    /// Two things it refuses to do, both for the same reason — the transport
+    /// must never be left addressing a timeline nobody can drive:
+    ///
+    /// - A pane with no frame-series layer at all keeps the layer it had,
+    ///   rather than losing its transport to an empty answer.
+    /// - A **running** loop keeps its transport. Ticking some other layer in
+    ///   the stack is not a request to abandon the loop already playing, and
+    ///   handing the controls to an idle layer mid-loop would leave the ∞
+    ///   button reading "off" over frames still arriving.
+    pub fn refresh_transport(
+        &mut self,
+        overlays: &rustdar_overlays::render::overlay_state::OverlayRegistry,
+    ) {
+        if self.transport_state().is_active() {
+            return;
+        }
+        if let Some(id) = self.topmost_frame_series_layer(overlays).cloned() {
+            self.transport = id;
+        }
     }
 
     pub fn slot_mut(&mut self, id: &LayerId) -> Option<&mut LayerSlot> {
@@ -2861,6 +2971,10 @@ mod volume_ask_tests;
 /// Which volume a 3D pane is about, and whether it still needs building.
 #[cfg(test)]
 mod volume_due_tests;
+
+/// Which layer the loop transport addresses, and what a config says about it.
+#[cfg(test)]
+mod transport_addressing_tests;
 
 #[cfg(test)]
 mod tests;

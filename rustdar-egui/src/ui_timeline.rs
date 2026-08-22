@@ -638,7 +638,7 @@ impl super::Gui {
         }
 
         let can_loop = self.panes[pane_idx].can_loop();
-        let loop_active = self.panes[pane_idx].loop_state().is_active();
+        let loop_active = self.panes[pane_idx].transport_state().is_active();
         let loop_toggle = ui
             .add_enabled(
                 can_loop,
@@ -658,6 +658,13 @@ impl super::Gui {
                 }
             } else {
                 for pane_idx in self.loop_sync_targets() {
+                    // Which layer this loop is OF, asked at the moment it is
+                    // started rather than inherited from whatever the pane
+                    // last addressed — see `PaneState::refresh_transport`.
+                    let Self {
+                        overlays, panes, ..
+                    } = self;
+                    panes[pane_idx].refresh_transport(overlays);
                     actions.push(GuiAction::EnableLoop {
                         pane_idx,
                         // The pane's own window, which carries the one number
@@ -680,7 +687,7 @@ impl super::Gui {
         ui.spacing_mut().slider_width =
             (ui.available_width() - ui.spacing().item_spacing.x).max(60.0);
 
-        let loop_state = self.panes[pane_idx].loop_state();
+        let loop_state = self.panes[pane_idx].transport_state();
         let loop_frames = loop_state
             .is_active()
             .then_some(loop_state.frames.len())
@@ -689,7 +696,7 @@ impl super::Gui {
         if let Some(total) = loop_frames {
             let seek = ui
                 .push_id("scrub_loop", |ui| {
-                    let mut frame_idx = self.panes[pane_idx].loop_state().current_frame();
+                    let mut frame_idx = self.panes[pane_idx].transport_state().current_frame();
                     let seek = ui
                         .add(egui::Slider::new(&mut frame_idx, 0..=(total - 1)).show_value(false));
                     if seek.changed() {
@@ -789,7 +796,7 @@ impl super::Gui {
     /// Row 2: the loop tuning, shown behind `⋯`.
     fn render_timeline_row2(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
         let pane_idx = self.active_pane;
-        let loop_active = self.panes[pane_idx].loop_state().is_active();
+        let loop_active = self.panes[pane_idx].transport_state().is_active();
         #[cfg(test)]
         let mut row2 = TimelineRow2Probe::default();
 
@@ -848,7 +855,7 @@ impl super::Gui {
         }
 
         if loop_active {
-            let ls = self.panes[pane_idx].loop_state();
+            let ls = self.panes[pane_idx].transport_state();
             let rendered = ls.frames.iter().filter(|f| f.image.is_some()).count();
             let total = ls.frames.len();
             let rendering = total > 0 && !ls.is_render_ready();

@@ -1029,6 +1029,9 @@ impl Gui {
         pane.set_layer_enabled(overlays, pane_idx, kind, on);
         pane.adopt_handler_state(overlays);
         pane.release_disabled_overlay_textures();
+        // The enabled set just moved, so which layer the transport addresses
+        // may have moved with it — see `PaneState::refresh_transport`.
+        pane.refresh_transport(overlays);
     }
 
     fn set_active_pane_overlay(&mut self, kind: &LayerId, on: bool) {
@@ -1821,20 +1824,16 @@ impl Gui {
     /// animating nothing, which is exactly the pane the step picker has to
     /// decide about.
     ///
+    /// Presence is [`PaneState::topmost_frame_series_layer`] having an answer
+    /// — the same walk the loop transport picks its layer with, so the step
+    /// picker and the transport cannot disagree about which panes have frames.
+    ///
     /// [`PaneState::clock_layer`]: crate::pane::PaneState::clock_layer
+    /// [`PaneState::topmost_frame_series_layer`]: crate::pane::PaneState::topmost_frame_series_layer
     pub fn pane_has_frame_series_layer(&self, idx: usize) -> bool {
-        let Some(pane) = self.panes.get(idx) else {
-            return false;
-        };
-        pane.layers.iter().filter(|slot| slot.enabled).any(|slot| {
-            self.overlays.handlers().any(|handler| {
-                handler.id() == slot.id
-                    && matches!(
-                        handler.time_axis(),
-                        rustdar_source::time::TimeAxis::FrameSeries { .. }
-                    )
-            })
-        })
+        self.panes
+            .get(idx)
+            .is_some_and(|pane| pane.topmost_frame_series_layer(&self.overlays).is_some())
     }
 
     /// Whether pane `idx` follows shared time — the loop playback
@@ -1986,7 +1985,7 @@ impl Gui {
             .iter()
             .take(self.pane_layout.pane_count)
             .any(|p| {
-                let ls = p.loop_state();
+                let ls = p.transport_state();
                 ls.is_active()
                     && (ls.is_playing()
                         || ls.is_fetching()
