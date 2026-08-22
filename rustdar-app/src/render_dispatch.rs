@@ -338,6 +338,22 @@ pub struct RenderDispatcher {
     /// (WO-M13a).
     last_overlay_dispatch:
         HashMap<(usize, rustdar_source::id::LayerId), crate::app::fetch::OverlayRenderRequest>,
+    /// **The loop-frame granules a non-radar layer has been asked for and has
+    /// not answered yet**, as `(layer, the instant the frame depicts)`.
+    ///
+    /// Not keyed by pane: a layer's frame store is application-wide — GMGSI's
+    /// staging area holds one granule for every pane at once — so two panes
+    /// looping the same layer over the same hour are waiting on **one** fetch,
+    /// and keying this by pane would put a second copy of a 7.4 MB object on
+    /// the wire for the same granule.
+    ///
+    /// This exists because a loop frame's fetch is otherwise dispatched once
+    /// and never again, while the granule it delivers is staged one at a time
+    /// and evicted by the next arrival. A frame whose granule passed through
+    /// unrasterized had no way back, and the loop sat in `Rendering` for ever
+    /// with nothing on the glass and nothing in flight.
+    loop_frame_fetches:
+        std::collections::HashSet<(rustdar_source::id::LayerId, chrono::NaiveDateTime)>,
 }
 
 /// The identity of one plan-view extraction — **today's tuple, exactly the
@@ -547,6 +563,7 @@ impl RenderDispatcher {
             plan_view_extractions: std::cell::Cell::new(0),
             speculative_in_flight: false,
             last_overlay_dispatch: HashMap::new(),
+            loop_frame_fetches: std::collections::HashSet::new(),
         }
     }
 
@@ -963,6 +980,40 @@ impl RenderDispatcher {
         id: &rustdar_source::id::LayerId,
     ) -> Option<&crate::app::fetch::OverlayRenderRequest> {
         self.last_overlay_dispatch.get(&(pane_idx, id.clone()))
+    }
+
+    /// **Whether `id`'s granule for `valid` is already on the wire.**
+    ///
+    /// The guard on the re-ask in `dispatch_overlay_loop_renders`: that pass
+    /// runs every frame, so without it a frame owed its data would put a fetch
+    /// on the wire sixty times a second.
+    pub(crate) fn loop_frame_fetch_in_flight(
+        &self,
+        id: &rustdar_source::id::LayerId,
+        valid: chrono::NaiveDateTime,
+    ) -> bool {
+        self.loop_frame_fetches.contains(&(id.clone(), valid))
+    }
+
+    /// Record that `id`'s granule for `valid` has been asked for.
+    pub(crate) fn mark_loop_frame_fetch(
+        &mut self,
+        id: &rustdar_source::id::LayerId,
+        valid: chrono::NaiveDateTime,
+    ) {
+        self.loop_frame_fetches.insert((id.clone(), valid));
+    }
+
+    /// **Clear the mark, whatever the fetch answered.** A fetch that failed
+    /// stages nothing, and the frame it was for is owed its data exactly as
+    /// much as before — the retry is what makes a transient failure survivable
+    /// rather than terminal for that frame.
+    pub(crate) fn clear_loop_frame_fetch(
+        &mut self,
+        id: &rustdar_source::id::LayerId,
+        valid: chrono::NaiveDateTime,
+    ) {
+        self.loop_frame_fetches.remove(&(id.clone(), valid));
     }
 
     /// Every pane holding a record for `id`, with what it was asked for.

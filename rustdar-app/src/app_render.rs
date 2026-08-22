@@ -2040,6 +2040,10 @@ impl super::App {
             tasks.len(),
         );
         for (stamp, task) in tasks {
+            // Marked here as well as in `refetch_owed_loop_frames`, so the
+            // every-frame pass does not put a second copy of a granule already
+            // travelling on the wire.
+            self.render.mark_loop_frame_fetch(layer, stamp.valid);
             self.spawn_frame_fetch_task(stamp, task);
         }
     }
@@ -2785,6 +2789,12 @@ impl super::App {
             rustdar_source::id::LayerId,
             rustdar_source::time::FrameStamp,
         )> = Vec::new();
+        // Frames whose **granule** is missing, as `(pane, layer, instant)`.
+        // Filled by the same walk and spent below, after the render asks: a
+        // frame that can be drawn now is worth more than one that has to
+        // travel first.
+        let mut owed_data: Vec<(usize, rustdar_source::id::LayerId, chrono::NaiveDateTime)> =
+            Vec::new();
         {
             let (panes, overlays) = self.gui.visible_panes_and_overlays_mut();
             for (pane_idx, pane) in panes.iter_mut().enumerate() {
@@ -2843,6 +2853,15 @@ impl super::App {
                         // a `LoopFrame` carries only the instant.
                         let Some(stamp) = resident.iter().find(|s| s.valid == frame.timestamp)
                         else {
+                            // **Owed its data, not its picture.** The layer is
+                            // not holding this frame's granule: either it has
+                            // never been fetched, or it was staged, passed
+                            // through the one-granule staging area and was
+                            // evicted by the next arrival before anything
+                            // described a job off it. Both are the same
+                            // question — ask again — and neither used to be
+                            // asked at all.
+                            owed_data.push((pane_idx, id.clone(), frame.timestamp));
                             continue;
                         };
                         asks.push((pane_idx, id.clone(), *stamp));
@@ -2860,6 +2879,65 @@ impl super::App {
                 stamp.valid,
             );
             self.spawn_overlay_render(vec![pane_idx], id, req, Some(stamp));
+        }
+        self.refetch_owed_loop_frames(owed_data);
+    }
+
+    /// **Put the granules the loop is still missing back on the wire.**
+    ///
+    /// The other half of the frame supply, and the half that did not exist:
+    /// `accept_loop_scan_listings` dispatched one fetch per frame the instant
+    /// its listing landed and **never asked again**, while a layer that stages
+    /// one granule at a time evicts each arrival as the next lands. A granule
+    /// that reached the staging area at a moment its pane could not rasterize
+    /// it was therefore gone for good, and its frame stayed blank for the life
+    /// of the loop.
+    ///
+    /// Two guards, and both are load-bearing because this runs every frame:
+    ///
+    /// * **the pane's own geometry record.** A pane that has never rasterized
+    ///   this layer cannot turn a granule into a picture — `spawn_overlay_render`
+    ///   would have nothing to size the raster with, which is why the render
+    ///   asks above are dropped for it. Fetching for it would be the same
+    ///   bytes discarded on a loop; the ask waits until the pane can spend it.
+    /// * **[`crate::render_dispatch::RenderDispatcher::loop_frame_fetch_in_flight`]**,
+    ///   so a frame owed its data asks once rather than once per frame. This
+    ///   half is not an optimisation. A frame stays owed for as long as its
+    ///   granule is travelling, and this pass runs in every `Dispatch` phase,
+    ///   so without the mark a thirteen-frame loop puts thirteen 7.4 MB GETs
+    ///   on the wire *per frame of the pump* for the whole time it is loading
+    ///   normally — measured at 130 asks across 10 passes by
+    ///   `a_frame_owed_its_granule_is_asked_for_once_however_many_passes_run`,
+    ///   which is the floor that stands under it.
+    ///
+    /// The layer still has the last word: `fetch_frame` answers `None` for a
+    /// stamp no listing of its own named and for one it already holds.
+    fn refetch_owed_loop_frames(
+        &mut self,
+        owed: Vec<(usize, rustdar_source::id::LayerId, chrono::NaiveDateTime)>,
+    ) {
+        let config = self.fetch_config();
+        for (pane_idx, id, valid) in owed {
+            if self.render.overlay_record(pane_idx, &id).is_none()
+                || self.render.loop_frame_fetch_in_flight(&id, valid)
+            {
+                continue;
+            }
+            let stamp = rustdar_source::time::FrameStamp { valid, run: None };
+            let task = self
+                .with_layer_pane(pane_idx, &id, |overlays, pane_ref| {
+                    overlays.fetch_frame(&id, &config, pane_ref, &stamp)
+                })
+                .flatten();
+            let Some(task) = task else {
+                continue;
+            };
+            log::info!(
+                "Loop: re-asked {} for the granule at {valid} (pane {pane_idx})",
+                id.as_str(),
+            );
+            self.render.mark_loop_frame_fetch(&id, valid);
+            self.spawn_frame_fetch_task(stamp, task);
         }
     }
 
