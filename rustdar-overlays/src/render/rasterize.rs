@@ -1304,6 +1304,11 @@ fn projection_window(
 #[derive(Debug, Clone, PartialEq)]
 pub enum GriddedInput {
     Whole(std::sync::Arc<HrrrGridData>),
+    /// A whole grid held by a source that carries **no source-specific enum**
+    /// into the raster — the shape a second gridded source registers in. Same
+    /// posture as [`Self::Whole`] (hold it all, cut at encode), without the
+    /// model's own type in the signature.
+    Resident(std::sync::Arc<crate::render::gridded::ResidentGrid>),
     Window(GridWindow),
 }
 
@@ -1335,6 +1340,7 @@ impl GriddedInput {
     pub fn field(&self) -> &rustdar_source::product::FieldId {
         match self {
             Self::Whole(grid) => &crate::hrrr::fields::spec(grid.parameter).id,
+            Self::Resident(grid) => &grid.field,
             Self::Window(window) => &window.field,
         }
     }
@@ -1342,6 +1348,7 @@ impl GriddedInput {
     pub fn shape(&self) -> (usize, usize) {
         match self {
             Self::Whole(grid) => (grid.ni, grid.nj),
+            Self::Resident(grid) => (grid.ni, grid.nj),
             Self::Window(window) => (window.ni, window.nj),
         }
     }
@@ -1349,7 +1356,21 @@ impl GriddedInput {
     pub fn coords(&self) -> &crate::hrrr::GridCoords {
         match self {
             Self::Whole(grid) => &grid.coords,
+            Self::Resident(grid) => &grid.coords,
             Self::Window(window) => &window.coords,
+        }
+    }
+
+    /// The values of a grid held **whole**, with the row stride they are
+    /// indexed by — `None` for the windowed arm, which carries only a cut.
+    ///
+    /// The two whole arms differ in nothing the raster reads, so the readers
+    /// below take this rather than repeating an arm each.
+    fn whole_values(&self) -> Option<(&[f32], usize)> {
+        match self {
+            Self::Whole(grid) => Some((&grid.values, grid.ni)),
+            Self::Resident(grid) => Some((&grid.values, grid.ni)),
+            Self::Window(_) => None,
         }
     }
 
@@ -1358,27 +1379,28 @@ impl GriddedInput {
     pub fn window_for(&self, bounds: &GeoBounds, width: u32, height: u32) -> IndexWindow {
         let (ni, nj) = self.shape();
         match self {
-            Self::Whole(grid) => projection_window(&grid.coords, ni, nj, bounds, width, height),
             Self::Window(window) => window.win.clamped(ni, nj),
+            _ => projection_window(self.coords(), ni, nj, bounds, width, height),
         }
     }
 
     /// The value at grid point `(i, j)`, or `None` where there is none to read
     /// — past a short values vector, or outside the carried window.
     fn value_at(&self, i: usize, j: usize) -> Option<f32> {
-        match self {
-            Self::Whole(grid) => grid.values.get(j * grid.ni + i).copied(),
-            Self::Window(window) => {
-                let win = &window.win;
-                if i < win.i0 || i >= win.i1 || j < win.j0 || j >= win.j1 {
-                    return None;
-                }
-                window
-                    .values
-                    .get((j - win.j0) * (win.i1 - win.i0) + (i - win.i0))
-                    .copied()
-            }
+        if let Some((values, stride)) = self.whole_values() {
+            return values.get(j * stride + i).copied();
         }
+        let Self::Window(window) = self else {
+            return None;
+        };
+        let win = &window.win;
+        if i < win.i0 || i >= win.i1 || j < win.j0 || j >= win.j1 {
+            return None;
+        }
+        window
+            .values
+            .get((j - win.j0) * (win.i1 - win.i0) + (i - win.i0))
+            .copied()
     }
 
     /// One row of `win`'s values, exactly as the wire writes them; the whole
@@ -1388,31 +1410,29 @@ impl GriddedInput {
         if win.is_empty() {
             return;
         }
-        match self {
-            Self::Whole(grid) => {
-                let mut padded: Vec<f32> = Vec::new();
-                for j in win.j0..win.j1 {
-                    let start = j * grid.ni + win.i0;
-                    let end = j * grid.ni + win.i1;
-                    if end <= grid.values.len() {
-                        f(&grid.values[start..end]);
-                    } else {
-                        padded.clear();
-                        padded.extend(
-                            (start..end).map(|k| grid.values.get(k).copied().unwrap_or(f32::NAN)),
-                        );
-                        f(&padded);
-                    }
+        if let Some((values, stride)) = self.whole_values() {
+            let mut padded: Vec<f32> = Vec::new();
+            for j in win.j0..win.j1 {
+                let start = j * stride + win.i0;
+                let end = j * stride + win.i1;
+                if end <= values.len() {
+                    f(&values[start..end]);
+                } else {
+                    padded.clear();
+                    padded.extend((start..end).map(|k| values.get(k).copied().unwrap_or(f32::NAN)));
+                    f(&padded);
                 }
             }
-            Self::Window(window) => {
-                let carried = &window.win;
-                let row_w = carried.i1 - carried.i0;
-                for j in win.j0..win.j1 {
-                    let row = (j - carried.j0) * row_w;
-                    f(&window.values[row + (win.i0 - carried.i0)..row + (win.i1 - carried.i0)]);
-                }
-            }
+            return;
+        }
+        let Self::Window(window) = self else {
+            return;
+        };
+        let carried = &window.win;
+        let row_w = carried.i1 - carried.i0;
+        for j in win.j0..win.j1 {
+            let row = (j - carried.j0) * row_w;
+            f(&window.values[row + (win.i0 - carried.i0)..row + (win.i1 - carried.i0)]);
         }
     }
 }
@@ -1430,7 +1450,7 @@ pub fn rasterize_gridded(
     let (ni, nj) = input.shape();
     let coords = input.coords();
 
-    let empty = matches!(input, GriddedInput::Whole(grid) if grid.values.is_empty());
+    let empty = input.whole_values().is_some_and(|(v, _)| v.is_empty());
     if empty || width == 0 || height == 0 || ni == 0 || nj == 0 {
         return RasterizeOutput {
             rgba,

@@ -37,6 +37,14 @@
         },
         {
           "config": {
+            "enabled": false,
+            "product": "mrms_reflectivity"
+          },
+          "enabled": false,
+          "id": "Mrms"
+        },
+        {
+          "config": {
             "enabled_products": [],
             "selected_day": "Day1"
           },

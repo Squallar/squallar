@@ -45,14 +45,17 @@ pub struct DataSources {
     pub goes_east_bucket: Source,
     /// GOES-West (currently GOES-18) granules, for GLM lightning.
     pub goes_west_bucket: Source,
+    /// MRMS national mosaic products. Keys are
+    /// `CONUS/{product}/{YYYYMMDD}/MRMS_{product}_{YYYYMMDD}-{HHMMSS}.grib2.gz`.
+    pub mrms_bucket: Source,
     /// NWS public API: active alerts and zone geometry.
     pub nws_api_base: Source,
     /// Storm Prediction Center: outlooks, mesoscale discussions, storm reports.
     pub spc_base: Source,
     /// Iowa Environmental Mesonet: current ASOS/METAR observations.
     pub iem_base: Source,
-    /// Where the six bucket fields above are addressed — the one definition of the
-    /// S3 URL shape, with `{bucket}` substituted by [`Self::s3_bucket_url`].
+    /// Where the seven bucket fields above are addressed — the one definition of
+    /// the S3 URL shape, with `{bucket}` substituted by [`Self::s3_bucket_url`].
     pub s3_base: Source,
     /// Open-Meteo forecast API: environmental sounding heights (0 °C and
     /// −20 °C levels) per radar site. See `rustdar_radar::sounding`.
@@ -82,6 +85,7 @@ impl DataSources {
             hrrr_bucket: Cow::Borrowed("noaa-hrrr-bdp-pds"),
             goes_east_bucket: Cow::Borrowed("noaa-goes19"),
             goes_west_bucket: Cow::Borrowed("noaa-goes18"),
+            mrms_bucket: Cow::Borrowed("noaa-mrms-pds"),
             nws_api_base: Cow::Borrowed("https://api.weather.gov"),
             spc_base: Cow::Borrowed("https://www.spc.noaa.gov"),
             iem_base: Cow::Borrowed("https://mesonet.agron.iastate.edu"),
@@ -95,9 +99,9 @@ impl DataSources {
     /// **Every DATA origin this application reads from, as URLs — the one
     /// enumeration of the set.**
     ///
-    /// Six bucket-object URLs (addressed through [`s3_base`](Self::s3_base), so
-    /// a test pointing that field at a mock server moves these with it) and the
-    /// four API bases. Callers that want hostnames take the host of each.
+    /// Seven bucket-object URLs (addressed through [`s3_base`](Self::s3_base),
+    /// so a test pointing that field at a mock server moves these with it) and
+    /// the four API bases. Callers that want hostnames take the host of each.
     ///
     /// It exists because two walkers used to restate this list independently —
     /// Android's `network_security_config` coverage pair and the service
@@ -118,6 +122,7 @@ impl DataSources {
             &self.hrrr_bucket,
             &self.goes_east_bucket,
             &self.goes_west_bucket,
+            &self.mrms_bucket,
         ];
         let bases = [
             &self.nws_api_base,
@@ -200,6 +205,38 @@ impl DataSources {
         forecast_hour: u8,
     ) -> String {
         format!("{}.idx", self.hrrr_grib_url(date, run_hour, forecast_hour))
+    }
+
+    /// The day directory holding one MRMS product's files.
+    ///
+    /// `CONUS/` and not `CONUS_5KM/`: the 5 km prefix exists in the bucket but
+    /// **stops at ~2021-02-24**, so a reader who finds it while listing is
+    /// looking at a dead product rather than a cheaper one.
+    pub fn mrms_day_prefix(product: &str, date: &chrono::NaiveDate) -> String {
+        format!("CONUS/{product}/{}/", date.format("%Y%m%d"))
+    }
+
+    /// The object key for one MRMS granule.
+    ///
+    /// The day directory is taken from `stamp` rather than passed separately:
+    /// every key in the bucket files under the date its own timestamp carries,
+    /// and two parameters could disagree.
+    ///
+    /// **Timestamps are not clock-aligned** — `000039`, `000242`, `000442`,
+    /// `000641` across one observed hour — so this builds a key from a stamp
+    /// somebody already read off a listing. Nothing may round a wall clock into
+    /// it and expect an object to be there; see `mrms::fetch::latest_key`.
+    pub fn mrms_key(product: &str, stamp: &chrono::NaiveDateTime) -> String {
+        format!(
+            "{}MRMS_{product}_{}.grib2.gz",
+            Self::mrms_day_prefix(product, &stamp.date()),
+            stamp.format("%Y%m%d-%H%M%S"),
+        )
+    }
+
+    /// URL of one MRMS granule.
+    pub fn mrms_object_url(&self, product: &str, stamp: &chrono::NaiveDateTime) -> String {
+        self.s3_object_url(&self.mrms_bucket, &Self::mrms_key(product, stamp))
     }
 
     /// Current ASOS observations for one US state, as JSON.
@@ -376,6 +413,40 @@ mod tests {
             DataSources::hrrr_key(&date(), 14, 1),
             "hrrr.20260725/conus/hrrr.t14z.wrfsfcf01.grib2",
         );
+    }
+
+    /// The MRMS key layout, transcribed from a live listing on 2026-08-21.
+    #[test]
+    fn the_mrms_key_names_a_product_and_a_stamp() {
+        let stamp = NaiveDate::from_ymd_opt(2026, 8, 21)
+            .unwrap()
+            .and_hms_opt(0, 0, 39)
+            .unwrap();
+        assert_eq!(
+            DataSources::mrms_key("MergedReflectivityQCComposite_00.50", &stamp),
+            "CONUS/MergedReflectivityQCComposite_00.50/20260821/\
+             MRMS_MergedReflectivityQCComposite_00.50_20260821-000039.grib2.gz",
+        );
+        // The key lives under its own stamp's day, so the prefix a listing
+        // walks and the key it hands back cannot name two different days.
+        assert!(
+            DataSources::mrms_key("PrecipRate_00.00", &stamp).starts_with(
+                &DataSources::mrms_day_prefix("PrecipRate_00.00", &stamp.date())
+            ),
+        );
+        // Zero-padded throughout: S3 prefix matching is bytewise, and the
+        // seconds field is what makes these keys sort by time at all.
+        let january = NaiveDate::from_ymd_opt(2026, 1, 5)
+            .unwrap()
+            .and_hms_opt(1, 2, 3)
+            .unwrap();
+        assert_eq!(
+            DataSources::mrms_key("PrecipRate_00.00", &january),
+            "CONUS/PrecipRate_00.00/20260105/MRMS_PrecipRate_00.00_20260105-010203.grib2.gz",
+        );
+        // Never `CONUS_5KM`: that prefix exists in the bucket and stops at
+        // ~2021-02-24, so addressing it would read a four-year-old mosaic.
+        assert!(!DataSources::mrms_day_prefix("PrecipRate_00.00", &january.date()).contains("5KM"),);
     }
 
     /// The index URL must be the GRIB URL plus `.idx` — a separate object.

@@ -2,6 +2,7 @@ pub mod fetch_policy;
 pub mod glm;
 pub mod hrrr;
 pub mod metar;
+pub mod mrms;
 pub mod nws;
 pub mod render;
 pub mod spc;

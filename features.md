@@ -43,7 +43,7 @@ itself — see `data.md`, which records the measurements and the probe recipe.
 | Storm-relative velocity                       | ✅       | ✅          | ✅       |
 | 3D volumetric rendering                       | ✅       | ❌          | Partial |
 | Vertical cross-sections                       | ✅       | ❌          | ✅       |
-| MRMS national mosaic                          | ❌       | ✅          | ❌       |
+| MRMS national mosaic (CREF, precip rate)      | ✅       | ✅          | ❌       |
 | Satellite QPE (precip beyond radar range)     | ❌       | ❓          | ❌       |
 | Third-party tile ingest (Rain Viewer et al.)  | ❌       | ❓          | ❌       |
 | VAD wind profiles                             | ✅       | ❓          | ❌       |
@@ -100,15 +100,21 @@ Notes on the Rustdar column:
   mobile, 12 web (`rustdar-device-profile/src/constants.rs`).
 - **Archive radar playback** — `rustdar-radar/src/archive.rs`, over the full
   public NEXRAD Level 2 archive rather than a rolling window.
-- **MRMS national mosaic**, **multi-radar compositing**, **satellite QPE** and
-  **third-party tile ingest** are four ❌ rows and four different projects, not
-  one feature spelled four ways. Everything drawn today is *per site*: one
-  volume, one raster, stacked by the client. **MRMS is the cheap one, and
-  cheaper than it looks**: the bucket was inspected on 2026-08-21 and its files
-  are gzipped GRIB2 on grid template 3.0 (plain lat/lon, 3500 × 7000 at 0.01°)
-  with data representation template **5.41 — PNG**, which `flate2` and the
-  already-enabled `png-unpack-with-png-crate` decode today. No new dependency,
-  no new feature flag. Compositing our own site renders is the expensive path:
+- **MRMS national mosaic** ships: the `Mrms` layer draws
+  `MergedReflectivityQCComposite_00.50` and `PrecipRate_00.00` from
+  `noaa-mrms-pds`, polling on the product's own ~2-minute cadence. It cost no
+  new dependency and no new feature flag, exactly as the 2026-08-21 bucket
+  inspection predicted: gzipped GRIB2 on grid template 3.0 (plain lat/lon,
+  7000 × 3500 at 0.01°) with data representation template **5.41 — PNG**, which
+  `flate2` and the already-enabled `png-unpack-with-png-crate` decode. The
+  layer's own colour bars are in `rustdar-overlays/src/mrms/fields.rs` rather
+  than borrowed from the radar palette — that edge is cut and enforced.
+  **CONUS only**; the bucket also carries Alaska, Hawaii, Guam and the
+  Caribbean, each of which is a variant and a longitude envelope away.
+- **Multi-radar compositing**, **satellite QPE** and **third-party tile ingest**
+  remain three ❌ rows and three different projects, not one feature spelled
+  three ways. Everything else drawn today is *per site*: one volume, one raster,
+  stacked by the client. Compositing our own site renders is the expensive path:
   it means reproducing overlap resolution, beam-height weighting, terrain
   blockage and edge feathering. Satellite QPE (NOAA Enterprise Rain Rate) is the
   *coverage* answer where no ground radar reaches — verified 18000 × 6501 at

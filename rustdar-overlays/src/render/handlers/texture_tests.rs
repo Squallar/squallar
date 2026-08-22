@@ -77,23 +77,34 @@ fn run_fake(
     None
 }
 
-/// **The one sanctioned case of two layers sharing a raster input variant.**
+/// **The sanctioned cases of two layers sharing one raster input variant**, and
+/// the only place they are named.
 ///
-/// SPC's fire-weather outlooks are the same thing on the wire as the
-/// convective ones — a feature list in SPC's own inline `stroke`/`fill` — so
-/// `SpcFireOutlook` describes an `OutlooksInput` and rides the
-/// `overlay/outlooks` codec row rather than adding a byte-identical second
-/// wire form. Both walks below read the relation from here, so the sharing is
-/// stated once and neither walk can quietly grow a second case: any other
-/// layer whose input names a foreign owner still fails
+/// Two today, and they are the same shape for two different reasons:
+///
+/// * `SpcFireOutlook` → `SpcOutlook`. SPC's fire-weather outlooks are the same
+///   thing on the wire as the convective ones — a feature list in SPC's own
+///   inline `stroke`/`fill` — so the fire layer describes an `OutlooksInput`
+///   rather than adding a byte-identical second wire form.
+/// * `Mrms` → `ModelData`. `GriddedInput` carries a **`FieldId`**, not either
+///   source's own enum, which is exactly what the gridded substrate was built
+///   for: "a second gridded source needs no arm here". MRMS describes a
+///   `GriddedInput::Resident` and rides `overlay/model`, so it adds no codec
+///   row and moves no wire digest.
+///
+/// Both walks below read the relation from here, so each sharing is stated once
+/// and neither walk can quietly grow a third case: any other layer whose input
+/// names a foreign owner still fails
 /// `every_texture_handler_declares_the_convention_its_own_bytes_are_in`.
 ///
 /// **What that costs, stated:** a fire raster is labelled `overlay/outlooks`
-/// in the worker's timing log, so the two layers are not distinguishable
-/// there.
+/// and an MRMS raster `overlay/model` in the worker's timing log, so neither
+/// pair is distinguishable there.
 pub(super) fn raster_input_owner(id: &LayerId) -> LayerId {
     if *id == known::SPC_FIRE_OUTLOOK {
         known::SPC_OUTLOOK
+    } else if *id == known::MRMS {
+        known::MODEL_DATA
     } else {
         id.clone()
     }
@@ -290,6 +301,46 @@ fn whole(grid: crate::hrrr::HrrrGridData) -> GriddedInput {
     GriddedInput::Whole(std::sync::Arc::new(grid))
 }
 
+/// Uniform 45 dBZ over [`BOUNDS`] on a 4 × 4 regular grid — the composite's own
+/// band, so this fixture draws.
+///
+/// The **regular** coords arm, not `Explicit`: that is the arm the real product
+/// decodes to, and the arm that lets `projection_window` cut the grid at all.
+fn mrms_grid() -> crate::mrms::MrmsGrid {
+    use crate::mrms::{MrmsGrid, MrmsProduct};
+    let product = MrmsProduct::ReflectivityComposite;
+    let (ni, nj) = (4usize, 4usize);
+    let values = vec![45.0f32; ni * nj];
+    let spec = crate::mrms::fields::spec(product);
+    let paint = crate::render::gridded::field_paint(&spec.id).expect("registered");
+    let (visible_points, value_range) = crate::hrrr::summarize_values(&values, |v| paint.paints(v));
+    MrmsGrid {
+        product,
+        grid: std::sync::Arc::new(crate::render::gridded::ResidentGrid {
+            field: spec.id.clone(),
+            ni,
+            nj,
+            coords: crate::hrrr::GridCoords::Regular {
+                lat0: BOUNDS.max_lat,
+                lon0: BOUNDS.min_lon,
+                dlat: (BOUNDS.min_lat - BOUNDS.max_lat) / (nj - 1) as f64,
+                dlon: (BOUNDS.max_lon - BOUNDS.min_lon) / (ni - 1) as f64,
+                ni,
+                nj,
+                scan_mode: 0,
+            },
+            values,
+        }),
+        bounds: BOUNDS,
+        valid: chrono::NaiveDate::from_ymd_opt(2026, 8, 21)
+            .unwrap()
+            .and_hms_opt(0, 0, 39)
+            .unwrap(),
+        visible_points,
+        value_range,
+    }
+}
+
 fn site_fixtures() -> rasterize::SitesInput {
     rasterize::SitesInput {
         sites: vec![RadarSiteInfo {
@@ -405,6 +456,7 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
             record_drops: crate::glm::RecordDrops::default(),
         }))),
         id if *id == known::MODEL_DATA => Box::new(HrrrFetchResult(Ok(cin_grid()))),
+        id if *id == known::MRMS => Box::new(crate::mrms::MrmsFetchResult(Ok(mrms_grid()))),
         // **Seeded like every other kind since WO-M10c**: the site table is
         // installed through the arrival door by the shell that owns it, so
         // this layer has data of its own and answers `prepare_job` from it.
@@ -518,17 +570,17 @@ fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
         }
         checked += 1;
     }
-    // **Seven since WO-M10c, eight since the fire weather layer.** The
-    // seventh was `RadarSites`, which used to be rasterized by a dispatch arm
-    // of its own in `app_fetch` — the handler could not see which site its
-    // pane was on, so it had no `prepare_job` to be walked through. It has a
-    // pane now, the arm is gone, and the "eight described kinds" list in
-    // `spawn_overlay_render` is this same eight.
+    // **Seven since WO-M10c, eight since the fire weather layer, nine since
+    // the MRMS mosaic.** The seventh was `RadarSites`, which used to be
+    // rasterized by a dispatch arm of its own in `app_fetch` — the handler
+    // could not see which site its pane was on, so it had no `prepare_job` to
+    // be walked through. It has a pane now, the arm is gone, and the "nine
+    // described kinds" list in `spawn_overlay_render` is this same nine.
     assert_eq!(
         checked,
-        8 + cfg!(feature = "fake-source") as usize,
-        "the eight texture handlers that rasterize through `prepare_job` \
-         must all be covered — nine with the fake source registered; a new \
+        9 + cfg!(feature = "fake-source") as usize,
+        "the nine texture handlers that rasterize through `prepare_job` \
+         must all be covered — ten with the fake source registered; a new \
          one is not exempt, and a removed one should be removed from this \
          count deliberately",
     );
@@ -695,9 +747,9 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
     }
     assert_eq!(
         checked,
-        8 + cfg!(feature = "fake-source") as usize,
-        "the eight texture handlers that rasterize through `prepare_job` \
-         must all be covered — nine with the fake source registered",
+        9 + cfg!(feature = "fake-source") as usize,
+        "the nine texture handlers that rasterize through `prepare_job` \
+         must all be covered — ten with the fake source registered",
     );
 }
 
@@ -827,11 +879,11 @@ fn every_texture_kind_rasterizes_as_a_described_job() {
     }
     assert_eq!(
         described,
-        8 + cfg!(feature = "fake-source") as usize,
-        "the four polygon kinds, the two hit-map kinds, the model grid and \
-         the site table must all have been walked seeded — plus the fake \
-         source where it is registered; a kind that stopped seeding is a kind \
-         whose described job was never tested",
+        9 + cfg!(feature = "fake-source") as usize,
+        "the four polygon kinds, the two hit-map kinds, the two gridded \
+         rasters and the site table must all have been walked seeded — plus \
+         the fake source where it is registered; a kind that stopped seeding \
+         is a kind whose described job was never tested",
     );
 }
 
@@ -913,30 +965,18 @@ fn a_hit_map_kinds_items_align_with_its_described_rows() {
 /// not who builds them.
 ///
 /// **A row may be named by two handlers only where [`raster_input_owner`] says
-/// they build the same input**, which today is exactly `SpcFireOutlook`
-/// sharing the convective outlooks' row. Read from that one function rather
-/// than allowed here, so the sharing is a single statement rather than a
-/// loosened assertion: two layers that describe *different* inputs under one
-/// label still fail, which is the mispairing this gate was built for.
+/// they build the same input**, which today is `SpcFireOutlook` sharing the
+/// convective outlooks' row and `Mrms` sharing the gridded raster's. Read
+/// from that one function rather than allowed here, so each sharing is a
+/// single statement rather than a loosened assertion: two layers that
+/// describe *different* inputs under one label still fail, which is the
+/// mispairing this gate was built for.
 #[test]
 fn every_texture_handler_owns_exactly_one_codec_row() {
     use crate::render::jobs::JOB_CODECS;
 
     // Deliberately spelled out. Do not regenerate this from the registry.
     #[cfg(not(feature = "fake-source"))]
-    let expected: [(LayerId, &str); 8] = [
-        (known::RADAR_SITES, "overlay/sites"),
-        (known::NWS_ALERTS, "overlay/alerts"),
-        (known::SPC_OUTLOOK, "overlay/outlooks"),
-        (known::SPC_FIRE_OUTLOOK, "overlay/outlooks"),
-        (known::SPC_DISCUSSIONS, "overlay/discussions"),
-        (known::STORM_REPORTS, "overlay/reports"),
-        (known::LIGHTNING, "overlay/glm"),
-        (known::MODEL_DATA, "overlay/model"),
-    ];
-    // Two `#[cfg]`'d definitions for the same reason `JOB_CODECS` has two:
-    // `#[cfg]` on an array element is not stable.
-    #[cfg(feature = "fake-source")]
     let expected: [(LayerId, &str); 9] = [
         (known::RADAR_SITES, "overlay/sites"),
         (known::NWS_ALERTS, "overlay/alerts"),
@@ -946,6 +986,21 @@ fn every_texture_handler_owns_exactly_one_codec_row() {
         (known::STORM_REPORTS, "overlay/reports"),
         (known::LIGHTNING, "overlay/glm"),
         (known::MODEL_DATA, "overlay/model"),
+        (known::MRMS, "overlay/model"),
+    ];
+    // Two `#[cfg]`'d definitions for the same reason `JOB_CODECS` has two:
+    // `#[cfg]` on an array element is not stable.
+    #[cfg(feature = "fake-source")]
+    let expected: [(LayerId, &str); 10] = [
+        (known::RADAR_SITES, "overlay/sites"),
+        (known::NWS_ALERTS, "overlay/alerts"),
+        (known::SPC_OUTLOOK, "overlay/outlooks"),
+        (known::SPC_FIRE_OUTLOOK, "overlay/outlooks"),
+        (known::SPC_DISCUSSIONS, "overlay/discussions"),
+        (known::STORM_REPORTS, "overlay/reports"),
+        (known::LIGHTNING, "overlay/glm"),
+        (known::MODEL_DATA, "overlay/model"),
+        (known::MRMS, "overlay/model"),
         (known::FAKE_SOURCE, crate::render::jobs::FAKE_LABEL),
     ];
 
