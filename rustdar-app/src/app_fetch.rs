@@ -1324,42 +1324,39 @@ impl super::App {
         }
     }
 
-    /// Enable radar loop for a pane: initializes loop state and spawns
-    /// an async task to list available scans in the lookback window.
+    /// Enable a loop for a pane: initializes the transport layer's timeline and
+    /// spawns an async task to list the frames its range covers.
     fn handle_enable_loop(&mut self, pane_idx: usize, lookback_secs: u64) {
+        // One clock reading for both halves of the range, so a forward-reaching
+        // rail's past and future cannot be anchored a tick apart.
+        let now = chrono::Utc::now().naive_utc();
+        let (panes, overlays) = self.gui.panes_and_overlays_mut();
         let Some(request) = begin_loop_for_pane(
-            self.gui.panes_mut(),
+            panes,
+            overlays,
             &mut self.loop_mgr,
             pane_idx,
+            now,
             lookback_secs,
         ) else {
             return;
         };
-        let LoopScanRequest { site, start, end } = request;
+        let LoopScanRequest { layer, start, end } = request;
 
         // **The layer lists its own archive.** The identifiers the listing
-        // yields stay with it — nothing here holds one — and the site it was
+        // yields stay with it — nothing here holds one — and the scope it was
         // listed for is captured inside the task, at dispatch, not read back
         // off the pane when it lands.
         let config = self.fetch_config();
         let task = self
-            .with_layer_pane(
-                pane_idx,
-                &rustdar_source::id::known::RADAR,
-                |overlays, pane_ref| {
-                    overlays.create_frame_list_task(
-                        &rustdar_source::id::known::RADAR,
-                        &config,
-                        pane_ref,
-                        (start, end),
-                    )
-                },
-            )
+            .with_layer_pane(pane_idx, &layer, |overlays, pane_ref| {
+                overlays.create_frame_list_task(&layer, &config, pane_ref, (start, end))
+            })
             .flatten();
         let Some(task) = task else {
             log::warn!(
-                "Loop: the radar layer could not build a {site} scan listing for pane \
-                 {pane_idx}; leaving loop mode",
+                "Loop: {} could not build a frame listing for pane {pane_idx}; leaving loop mode",
+                layer.as_str(),
             );
             self.handle_disable_loop(pane_idx);
             return;
@@ -2022,45 +2019,115 @@ fn loop_section_image(rgba: &[u8]) -> Option<egui::ColorImage> {
     ))
 }
 
-/// The scan listing a freshly-built loop needs, and the site it must be requested
-/// for.
+/// The frame listing a freshly-built loop needs, and the layer it must be
+/// requested from.
 pub(super) struct LoopScanRequest {
-    site: String,
+    layer: rustdar_source::id::LayerId,
     start: NaiveDateTime,
     end: NaiveDateTime,
 }
 
-/// Build `pane_idx`'s loop state and return the scan listing it now needs, or
-/// `None` if that pane has no scan loaded to anchor a loop on.
+/// Build `pane_idx`'s loop state and return the frame listing it now needs, or
+/// `None` if that pane cannot carry a loop.
+///
+/// **Two arms, chosen by the transport layer's own time axis.** A layer whose
+/// stamps are all history anchors the range on the pane's current scan and
+/// reaches backward from it. A layer that declares `extends_future` anchors on
+/// the wall clock and reaches forward to its own horizon, so the one rail
+/// carries both the past region and the forecast.
+///
+/// **A radar scan is a precondition of the backward arm only.** It used to gate
+/// the whole function, which meant a pane with no radar data got no loop at all
+/// no matter which layer its transport addressed — and a model-only pane
+/// legitimately has no scan.
 fn begin_loop_for_pane(
     panes: &mut [rustdar_egui::pane::PaneState],
+    overlays: &mut rustdar_overlays::render::overlay_state::OverlayRegistry,
     loop_mgr: &mut rustdar_radar::loop_downloads::LoopDownloadManager,
     pane_idx: usize,
+    now: NaiveDateTime,
     lookback_secs: u64,
 ) -> Option<LoopScanRequest> {
-    let scan_info = panes.get(pane_idx)?.scan_info.as_ref()?;
-    // The whole site value, so the loop's render-target code and the coordinates
-    // it projects with cannot come from different sites.
-    let radar_site = scan_info.site.clone();
-    // The loop ends at this pane's current scan, not at wall clock, so it covers
-    // where the pane is actually looking.
-    let end = scan_info.timestamp;
+    // The layer this pane's transport addresses, which is the only thing that
+    // decides which arm below runs.
+    let layer = panes.get(pane_idx)?.transport_layer().clone();
+    // Read off the registry by id, never off a `match` on the id: whether
+    // stamps later than the wall clock are expected is the layer's own
+    // declaration, and a shell that re-spelled it would be a second answer.
+    let extends_future = overlays.handler_by_id(&layer).is_some_and(|h| {
+        matches!(
+            h.time_axis(),
+            rustdar_source::time::TimeAxis::FrameSeries {
+                extends_future: true,
+                ..
+            }
+        )
+    });
 
-    // Drop the previous listing's undispatched downloads; they were queued for the
-    // loop this call is replacing.
+    if !extends_future {
+        // ── Backward-only ────────────────────────────────────────────────
+        // A pane with no scan loaded has nothing to anchor this arm on.
+        let scan_info = panes.get(pane_idx)?.scan_info.as_ref()?;
+        // The whole site value, so the loop's render-target code and the
+        // coordinates it projects with cannot come from different sites.
+        let radar_site = scan_info.site.clone();
+        // The loop ends at this pane's current scan, not at wall clock, so it
+        // covers where the pane is actually looking.
+        let end = scan_info.timestamp;
+
+        // Drop the previous listing's undispatched downloads; they were queued
+        // for the loop this call is replacing.
+        loop_mgr.remove_pending(pane_idx);
+
+        // The view the pane is drawing, which is what a loop's frames are
+        // pictures of.
+        let view = panes[pane_idx].render_view();
+        if !view.can_loop() {
+            return None;
+        }
+        *panes[pane_idx].loop_state_mut() =
+            radar_layer::begin_loop(lookback_secs, &radar_site, view);
+
+        return Some(LoopScanRequest {
+            layer,
+            start: end - chrono::Duration::seconds(lookback_secs as i64),
+            end,
+        });
+    }
+
+    // ── Forward-reaching ─────────────────────────────────────────────────
     loop_mgr.remove_pending(pane_idx);
-
-    // The view the pane is drawing, which is what a loop's frames are pictures of.
     let view = panes[pane_idx].render_view();
     if !view.can_loop() {
         return None;
     }
-    *panes[pane_idx].loop_state_mut() = radar_layer::begin_loop(lookback_secs, &radar_site, view);
+
+    // **How far past the wall clock, asked of the layer for this pane.** The
+    // horizon belongs to the run rather than to the layer — the same HRRR
+    // layer reaches 48 hours off a synoptic cycle and 18 off every other hour
+    // — so it cannot be a constant held up here beside the id.
+    panes[pane_idx].hydrate_layer_states(overlays, pane_idx);
+    let pane_view = panes[pane_idx].view(pane_idx);
+    let horizon = overlays
+        .handler_by_id(&layer)
+        .map_or_else(chrono::Duration::zero, |h| {
+            h.frame_horizon(&pane_view.layer(&layer))
+        });
+    drop(pane_view);
+
+    // The anchor is the layer's own once WI-5 supplies its frames; until then
+    // the phase is what matters, so the listing that lands has an active
+    // timeline to land on rather than being dropped as a silent no-op.
+    *panes[pane_idx].transport_state_mut() =
+        rustdar_egui::pane::LayerTimeState::begin(lookback_secs, view, Box::new(()));
 
     Some(LoopScanRequest {
-        site: radar_site.name.to_string(),
-        start: end - chrono::Duration::seconds(lookback_secs as i64),
-        end,
+        layer,
+        // Anchored on the wall clock, not on a scan: the past region and the
+        // forecast are two halves of one rail, and a forecast layer's "now" is
+        // not some radar volume's timestamp.
+        start: now - chrono::Duration::seconds(lookback_secs as i64),
+        end: now + horizon,
     })
 }
 
@@ -2227,6 +2294,10 @@ mod loop_raster_ceiling_tests;
 #[path = "app_fetch/loop_pane_tests.rs"]
 #[cfg(test)]
 mod loop_pane_tests;
+
+#[path = "app_fetch/forward_range_tests.rs"]
+#[cfg(test)]
+mod forward_range_tests;
 
 #[path = "app_fetch/melting_layer_dispatch_tests.rs"]
 #[cfg(test)]

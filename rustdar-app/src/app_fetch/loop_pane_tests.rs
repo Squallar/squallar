@@ -3,6 +3,7 @@ use rustdar_egui::pane::PaneState;
 use rustdar_radar::loop_downloads::LoopDownloadManager;
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::{RadarProduct, ScanInfo};
+use rustdar_source::id::known;
 
 fn ts(minute: u32) -> NaiveDateTime {
     chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
@@ -62,6 +63,14 @@ fn pane_looping_on(site: RadarSite, lookback_secs: u64, frames: &[u32]) -> PaneS
     pane
 }
 
+/// The live registry, so the axis `begin_loop_for_pane` branches on is the one
+/// radar really declares (`extends_future: false`) rather than a stand-in.
+fn registry() -> rustdar_overlays::render::overlay_state::OverlayRegistry {
+    rustdar_overlays::render::overlay_state::OverlayRegistry::with_handlers(
+        rustdar_egui::sources::all(),
+    )
+}
+
 fn allocation() -> crate::loop_pool::LoopAllocation {
     crate::app::render::test_loop_allocation()
 }
@@ -89,6 +98,7 @@ fn a_loop_is_built_from_its_own_panes_scan_not_the_active_panes() {
         pane_showing(site("KOUN", 35.23, -97.46), ts(25)),
     ];
     let mut mgr = LoopDownloadManager::new();
+    let mut reg = registry();
 
     assert_eq!(
         panes[1].site(),
@@ -96,10 +106,12 @@ fn a_loop_is_built_from_its_own_panes_scan_not_the_active_panes() {
         "precondition: pane 1's live site has already moved"
     );
 
-    let req = begin_loop_for_pane(&mut panes, &mut mgr, 1, 600).expect("pane 1 has a scan");
+    let req = begin_loop_for_pane(&mut panes, &mut reg, &mut mgr, 1, ts(0), 600)
+        .expect("pane 1 has a scan");
 
     assert_eq!(
-        req.site, "KOUN",
+        req.layer,
+        known::RADAR,
         "the listing must be requested for pane 1's loaded scan's site"
     );
     assert_eq!(
@@ -117,8 +129,9 @@ fn a_loop_is_built_from_its_own_panes_scan_not_the_active_panes() {
 
     assert!(!panes[0].loop_state().is_active());
 
-    let req = begin_loop_for_pane(&mut panes, &mut mgr, 0, 600).expect("pane 0 has a scan");
-    assert_eq!(req.site, "KTLX");
+    let req = begin_loop_for_pane(&mut panes, &mut reg, &mut mgr, 0, ts(0), 600)
+        .expect("pane 0 has a scan");
+    assert_eq!(req.layer, known::RADAR);
     assert_eq!(req.end, ts(10));
 }
 
@@ -130,11 +143,12 @@ fn a_pane_with_no_scan_yields_no_loop() {
     ];
     panes[1].scan_info = None;
     let mut mgr = LoopDownloadManager::new();
+    let mut reg = registry();
 
-    assert!(begin_loop_for_pane(&mut panes, &mut mgr, 1, 600).is_none());
+    assert!(begin_loop_for_pane(&mut panes, &mut reg, &mut mgr, 1, ts(0), 600).is_none());
     assert!(!panes[1].loop_state().is_active(), "no loop was started");
     assert!(
-        begin_loop_for_pane(&mut panes, &mut mgr, 7, 600).is_none(),
+        begin_loop_for_pane(&mut panes, &mut reg, &mut mgr, 7, ts(0), 600).is_none(),
         "and neither does a pane that does not exist"
     );
 }
@@ -187,6 +201,7 @@ fn one_sites_current_scan_is_the_newest_pane_showing_it() {
 fn beginning_a_loop_clears_the_panes_pending_downloads() {
     let mut panes = [pane_showing(site("KTLX", 35.33, -97.27), ts(10))];
     let mut mgr = LoopDownloadManager::new();
+    let mut reg = registry();
     mgr.insert_pending(
         0,
         rustdar_radar::loop_downloads::PendingDownloads {
@@ -196,7 +211,7 @@ fn beginning_a_loop_clears_the_panes_pending_downloads() {
     );
     assert!(!mgr.is_pane_done(0), "precondition: pane 0 has work queued");
 
-    begin_loop_for_pane(&mut panes, &mut mgr, 0, 600).expect("pane 0 has a scan");
+    begin_loop_for_pane(&mut panes, &mut reg, &mut mgr, 0, ts(0), 600).expect("pane 0 has a scan");
 
     assert!(
         mgr.is_pane_done(0),
