@@ -1280,9 +1280,12 @@ fn two_panes_hold_different_hrrr_parameters_through_every_read_and_a_reopen() {
             parameter.as_str(),
             "pane {idx}'s controls offer another pane's parameter",
         );
+        // The row states the field AND the frame on the glass (Stage A);
+        // both panes hold the same 12:00z fixture run, so the field half is
+        // the only one that may differ between them here.
         assert_eq!(
             gui.overlays.status_line(&kind, &view).as_deref(),
-            Some(parameter.display_name()),
+            Some(format!("{} - 12:00z", parameter.display_name()).as_str()),
             "pane {idx}'s status line",
         );
         assert_eq!(
