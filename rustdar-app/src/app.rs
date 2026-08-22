@@ -169,12 +169,12 @@ pub struct App {
     pending_state: Option<std::sync::mpsc::Receiver<app_state::AppState>>,
     http_client: reqwest::Client,
     loop_mgr: LoopDownloadManager,
-    /// **Radar frame listings that landed this frame**, as `(site, window)`.
+    /// **Frame listings that landed this frame**, one entry per arrival.
     ///
     /// The arrival is drained in `Ingest` and the loops waiting on it are
     /// built in `Apply` — the phase the listing channel's own drain ran in —
     /// so re-pointing the supply did not move when a listing becomes a plan.
-    loop_listings_arrived: Vec<(String, (chrono::NaiveDateTime, chrono::NaiveDateTime))>,
+    loop_listings_arrived: Vec<render::LoopListingArrival>,
     /// Per-site real-time chunk feeds.
     chunk_feeds: rustdar_radar::chunk_feed::ChunkFeedManager,
     /// Push notification of new chunks.
@@ -1422,7 +1422,7 @@ impl App {
         // in place: the decode needs the whole `App`, and `gui` is bound once
         // for the whole drain. The decode is offloaded either way, so nothing
         // observable turns on where in this pass it is dispatched.
-        let mut listed: Vec<(String, (chrono::NaiveDateTime, chrono::NaiveDateTime))> = Vec::new();
+        let mut listed: Vec<render::LoopListingArrival> = Vec::new();
         let mut archives: Vec<rustdar_radar::source::RadarFrameFetch> = Vec::new();
         // The layers this drain installed data for, deduplicated: two rounds of
         // the same layer in one pass are one re-ask, not two.
@@ -1452,11 +1452,30 @@ impl App {
                     // the `PaneRef` union — name no site by contract, and this
                     // crate is radar's own frontend. The site is read here and
                     // the scope is handed on whole.
-                    if id == rustdar_source::id::known::RADAR
-                        && let Some(radar) =
-                            scope.downcast_ref::<rustdar_radar::source::RadarListing>()
-                    {
-                        listed.push((radar.site.clone(), radar.range));
+                    //
+                    // **Every layer's listing is recorded, radar's carrying
+                    // the extra half.** The loop builder needs the window to
+                    // find the panes that asked for it, and that window is
+                    // generic; the site is what radar's own arm additionally
+                    // matches on, so it rides along as `Some` for radar and
+                    // is absent for everyone else. A radar listing under a
+                    // scope that is not radar's is still recorded for nobody,
+                    // exactly as before.
+                    let radar = scope.downcast_ref::<rustdar_radar::source::RadarListing>();
+                    if id == rustdar_source::id::known::RADAR {
+                        if let Some(radar) = radar {
+                            listed.push(render::LoopListingArrival {
+                                layer: id.clone(),
+                                site: Some(radar.site.clone()),
+                                range: radar.range,
+                            });
+                        }
+                    } else {
+                        listed.push(render::LoopListingArrival {
+                            layer: id.clone(),
+                            site: None,
+                            range: listing.range,
+                        });
                     }
                     gui.deliver_frame_listing(&id, listing, scope);
                 }

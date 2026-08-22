@@ -2192,7 +2192,7 @@ pub(super) fn empty_scan() -> nexrad_model::data::Scan {
 }
 
 /// The scan info a pane holds while it is drawing `site`'s volume.
-fn scan_info_for(site: &str) -> ScanInfo {
+pub(crate) fn scan_info_for(site: &str) -> ScanInfo {
     ScanInfo::from_scan(
         &empty_scan(),
         site,

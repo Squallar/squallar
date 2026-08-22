@@ -2114,20 +2114,28 @@ fn begin_loop_for_pane(
         });
     drop(pane_view);
 
-    // The anchor is the layer's own once WI-5 supplies its frames; until then
+    // Anchored on the wall clock, not on a scan: the past region and the
+    // forecast are two halves of one rail, and a forecast layer's "now" is
+    // not some radar volume's timestamp.
+    let start = now - chrono::Duration::seconds(lookback_secs as i64);
+    let end = now + horizon;
+
+    // **The window the listing is asked for, not the lookback** (WI-5).
+    // `span_secs` is documented as "the window this layer's frames were listed
+    // for", and it is what the arrival path matches a landing listing against
+    // a waiting pane with. On this arm the window reaches past `now`, so
+    // recording the lookback alone would leave every forecast listing matching
+    // no pane and being dropped in silence. The backward arm's two figures are
+    // the same number, which is why the bug could not show there.
+    let span_secs = (end - start).num_seconds().max(0) as u64;
+
+    // The anchor is the layer's own once it has one to put here; until then
     // the phase is what matters, so the listing that lands has an active
     // timeline to land on rather than being dropped as a silent no-op.
     *panes[pane_idx].transport_state_mut() =
-        rustdar_egui::pane::LayerTimeState::begin(lookback_secs, view, Box::new(()));
+        rustdar_egui::pane::LayerTimeState::begin(span_secs, view, Box::new(()));
 
-    Some(LoopScanRequest {
-        layer,
-        // Anchored on the wall clock, not on a scan: the past region and the
-        // forecast are two halves of one rail, and a forecast layer's "now" is
-        // not some radar volume's timestamp.
-        start: now - chrono::Duration::seconds(lookback_secs as i64),
-        end: now + horizon,
-    })
+    Some(LoopScanRequest { layer, start, end })
 }
 
 /// Append a frame for a scan polled from `site` at `timestamp` to every active
