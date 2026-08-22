@@ -1302,6 +1302,55 @@ fn axis_bracket(axis: &[f64], lo: f64, hi: f64) -> (f64, f64) {
     (a.min(b), a.max(b))
 }
 
+/// The fractional column interval of a *longitude* axis covering `[lo, hi]`.
+///
+/// An axis that does not close the globe is [`axis_bracket`]'s own case: its
+/// values and the box's are on one scale and the search is arithmetic.
+///
+/// An axis that closes the globe is not. Its values and the box's are angles,
+/// and the two need not be folded the same way — GMGSI's axis holds
+/// `+179.99961` at column 0 beside `-179.92838` at column 1, while `walkers`
+/// hands out box longitudes running past ±180 at low zoom. So each endpoint is
+/// located **angularly**, by the column nearest it the short way round.
+///
+/// The columns of such an axis sweep east once around, so the columns covering
+/// `[lo, hi]` are one contiguous run unless the box walks over the axis's own
+/// end — and that is exactly the two endpoints landing out of index order. A
+/// box that does walk over it covers two disjoint runs, and the honest single
+/// interval is then the whole axis: not narrower than the truth, which is what
+/// the window contract asks for.
+fn lon_axis_bracket(axis: &[f64], lo: f64, hi: f64) -> (f64, f64) {
+    let whole = (0.0, axis.len().saturating_sub(1) as f64);
+    // The wrap test of `GridCoords::wraps_longitude`'s `Separable` arm, asked
+    // of the axis itself: below it the arithmetic search is the right one.
+    if separable_lon_span(axis) + 2.0 * separable_lon_step(axis) < 360.0 {
+        return axis_bracket(axis, lo, hi);
+    }
+    // At most one backward step, so the axis really does sweep east once
+    // around; and a box spanning a whole turn covers every column whatever the
+    // endpoints say. Any other shape is one this reasoning does not describe.
+    if axis.len() < 2
+        || !(lo.is_finite() && hi.is_finite())
+        || hi - lo >= 360.0
+        || axis.iter().any(|v| !v.is_finite())
+        || axis.windows(2).filter(|w| w[1] <= w[0]).count() > 1
+    {
+        return whole;
+    }
+    let (Some(a), Some(b)) = (
+        nearest_on_axis(axis, lo, longitude_distance),
+        nearest_on_axis(axis, hi, longitude_distance),
+    ) else {
+        return whole;
+    };
+    if a > b {
+        return whole;
+    }
+    // `nearest_on_axis` rounds to the closer column, so the box's own edge sits
+    // up to half a cell outside it at either end.
+    (a as f64 - 0.5, b as f64 + 0.5)
+}
+
 /// Index of the entry of `axis` nearest `v`, comparing with `distance`.
 fn nearest_on_axis(axis: &[f64], v: f64, distance: impl Fn(f64, f64) -> f64) -> Option<usize> {
     let mut best = None;
@@ -1494,8 +1543,19 @@ impl GridCoords {
                     (bounds.min_lat - lat0) / dlat,
                     (bounds.max_lat - lat0) / dlat,
                 );
+                // A grid that closes the globe has no single linear column for
+                // a longitude: `(lon - lon0) / dlon` is a whole turn out for
+                // any box stated on the far side of `lon0`, and lands
+                // *negative*, which crops to an empty window rather than a wide
+                // one. Its rows are still parallels, so only the column pair
+                // goes wide and the latitude bracket answers as ever.
+                let (i_lo, i_hi) = if self.wraps_longitude() {
+                    (0.0, gni.saturating_sub(1) as f64)
+                } else {
+                    (ia.min(ib), ia.max(ib))
+                };
                 // A negative step reverses the ordering, hence the min/max pairs.
-                let out = (ia.min(ib), ia.max(ib), ja.min(jb), ja.max(jb));
+                let out = (i_lo, i_hi, ja.min(jb), ja.max(jb));
                 (out.0.is_finite() && out.1.is_finite() && out.2.is_finite() && out.3.is_finite())
                     .then_some(out)
             }
@@ -1510,13 +1570,13 @@ impl GridCoords {
                 {
                     return None;
                 }
-                // Per axis, and independently: GMGSI's latitude axis brackets
-                // to a few rows out of 3000 while its longitude axis is not
-                // monotonic and answers "all 5000". A window that is merely
-                // *not narrower* than the truth is correct; one that is
-                // narrower silently crops the raster.
+                // Per axis, and independently. The latitude axis is a plain
+                // monotonic search; the longitude axis may close the globe, and
+                // then neither its values nor the box's are on one scale. A
+                // window that is merely *not narrower* than the truth is
+                // correct; one that is narrower silently crops the raster.
                 let (j_min, j_max) = axis_bracket(lat_axis, bounds.min_lat, bounds.max_lat);
-                let (i_min, i_max) = axis_bracket(lon_axis, bounds.min_lon, bounds.max_lon);
+                let (i_min, i_max) = lon_axis_bracket(lon_axis, bounds.min_lon, bounds.max_lon);
                 Some((i_min, i_max, j_min, j_max))
             }
             _ => None,
@@ -1564,6 +1624,27 @@ impl GridCoords {
             GridCoords::Separable { lon_axis, .. } => {
                 separable_lon_span(lon_axis) + 2.0 * separable_lon_step(lon_axis) >= 360.0
             }
+        }
+    }
+
+    /// Whether a row of this grid is a **parallel** — every point of row `j` at
+    /// one latitude, fixed by `j` alone and by nothing the longitude axis does.
+    ///
+    /// This is what decides whether [`Self::wraps_longitude`] costs the row
+    /// axis as well as the column axis. On the two separable arms it does not:
+    /// a longitude discontinuity cannot reach a latitude that longitude is no
+    /// input to, so their rows bracket whatever the columns do.
+    ///
+    /// On [`Self::Lambert`] it does, and the difference is not cosmetic.
+    /// A Lambert row is not a parallel, both indices are axes of the projection
+    /// *plane*, and `lambert::LambertGrid::detect_longitude_wrap` reports a
+    /// discontinuity found stepping along **either** of them — so a wrapping
+    /// Lambert grid has no usable window on either axis and must decline both.
+    /// [`Self::Explicit`] has no axis structure at all to bracket.
+    pub fn rows_are_parallels(&self) -> bool {
+        match self {
+            GridCoords::Regular { .. } | GridCoords::Separable { .. } => true,
+            GridCoords::Lambert(_) | GridCoords::Explicit { .. } => false,
         }
     }
 
