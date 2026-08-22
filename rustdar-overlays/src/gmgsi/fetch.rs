@@ -56,7 +56,7 @@ pub(crate) fn listing_attempts(now: NaiveDateTime) -> Vec<NaiveDateTime> {
 /// hour, not an error. Objects that are not the `v3r0_blend` product are
 /// skipped rather than taken: the retired legacy granule shared these prefixes
 /// until mid-2025 and a historical query can still meet one.
-async fn list_hour(
+pub(crate) async fn list_hour(
     client: &reqwest::Client,
     sources: &DataSources,
     channel: GmgsiChannel,
@@ -123,24 +123,15 @@ pub async fn fetch_latest(
                 continue;
             }
         };
-        let url = sources.s3_object_url(&sources.gmgsi_bucket, &key);
-        let resp = client.get(&url).send().await.map_err(|e| {
-            FetchError::from_transport(&e, format!("GMGSI granule request failed: {e}"))
-        })?;
-        if !resp.status().is_success() {
-            // The key came off a listing, so a 404 here is a race with a
+        match fetch_key(client, sources, channel, &key).await {
+            Ok(grid) => return Ok(grid),
+            // The key came off a listing, so a failure here is a race with a
             // lifecycle rule rather than "not up yet": try the next hour.
-            last = Some(FetchError::from_status(
-                resp.status(),
-                NotFound::IsBroken,
-                format!("GMGSI granule {key} returned HTTP {}", resp.status()),
-            ));
-            continue;
+            Err(e) => {
+                last = Some(e);
+                continue;
+            }
         }
-        let bytes = resp.bytes().await.map_err(|e| {
-            FetchError::from_transport(&e, format!("GMGSI granule body read failed: {e}"))
-        })?;
-        return super::decode::decode(bytes.into(), channel).map_err(FetchError::transient);
     }
     Err(last.unwrap_or_else(|| {
         FetchError::transient(format!(
@@ -148,6 +139,145 @@ pub async fn fetch_latest(
             channel.display_name()
         ))
     }))
+}
+
+/// **One granule, by the key a listing already found**, decoded.
+///
+/// The GET half of [`fetch_latest`], named so the frame path can reuse it: a
+/// loop frame's key came off [`list_frame_keys`] and must not be re-listed to
+/// be fetched.
+pub async fn fetch_key(
+    client: &reqwest::Client,
+    sources: &DataSources,
+    channel: GmgsiChannel,
+    key: &str,
+) -> Result<GmgsiGrid, FetchError> {
+    let url = sources.s3_object_url(&sources.gmgsi_bucket, key);
+    let resp = client.get(&url).send().await.map_err(|e| {
+        FetchError::from_transport(&e, format!("GMGSI granule request failed: {e}"))
+    })?;
+    if !resp.status().is_success() {
+        return Err(FetchError::from_status(
+            resp.status(),
+            NotFound::IsBroken,
+            format!("GMGSI granule {key} returned HTTP {}", resp.status()),
+        ));
+    }
+    let bytes = resp.bytes().await.map_err(|e| {
+        FetchError::from_transport(&e, format!("GMGSI granule body read failed: {e}"))
+    })?;
+    super::decode::decode(bytes.into(), channel).map_err(FetchError::transient)
+}
+
+/// **The most hour prefixes one frame listing will ever request.**
+///
+/// A ceiling on request *count*, not on the window: past it the hours are
+/// evenly sampled with both ends kept, so a wider window still spans the same
+/// ground with fewer frames inside it, and the listing says `complete: false`.
+///
+/// Twenty-six is one more than the widest window the Lookback slider can name
+/// — `ui_timeline` runs it to 1440 minutes, i.e. 24 hours, which touches 25
+/// hour prefixes — so it does not bind on any window a user can ask for today.
+/// It exists because a listing costs **1 LIST per hour** and nothing else in
+/// the pipeline bounds that: [`DataSources::gmgsi_hour_prefix`] has no
+/// `gmgsi_key` counterpart, so a key cannot be constructed and every frame's
+/// object has to be found.
+pub(crate) const MAX_FRAME_LIST_REQUESTS: usize = 26;
+
+/// Hour prefixes listed at once. Each response is one XML document naming one
+/// object, so this bounds sockets rather than bytes.
+const FRAME_LIST_CONCURRENCY: usize = 6;
+
+/// The top-of-hour instants inside `range`, at most
+/// [`MAX_FRAME_LIST_REQUESTS`] of them, **endpoint-anchored** when there are
+/// more hours than that.
+///
+/// An hour `H`'s granule depicts `H`, so an hour belongs to the window exactly
+/// when `H` itself does — the partial hours at either end name granules whose
+/// stamps sit outside it and would be clipped away by the caller anyway.
+pub(crate) fn hours_in_range(range: (NaiveDateTime, NaiveDateTime)) -> Vec<NaiveDateTime> {
+    let top = |t: NaiveDateTime| {
+        t.with_minute(0)
+            .and_then(|t| t.with_second(0))
+            .and_then(|t| t.with_nanosecond(0))
+            .unwrap_or(t)
+    };
+    let last = top(range.1);
+    let mut first = top(range.0);
+    if first < range.0 {
+        first += chrono::Duration::hours(1);
+    }
+    if last < first {
+        return Vec::new();
+    }
+    let n = (last - first).num_hours() as usize + 1;
+    if n <= MAX_FRAME_LIST_REQUESTS {
+        return (0..n)
+            .map(|k| first + chrono::Duration::hours(k as i64))
+            .collect();
+    }
+    // Both ends exact: index 0 and index `n - 1` are always produced, so the
+    // ground the window covers is unchanged and only its resolution falls.
+    let m = MAX_FRAME_LIST_REQUESTS;
+    (0..m)
+        .map(|k| first + chrono::Duration::hours((k * (n - 1) / (m - 1)) as i64))
+        .collect()
+}
+
+/// **Every granule of `channel` inside `range`, as `(valid hour, object key)`,
+/// with whether that is known to be all of them.**
+///
+/// The key is carried rather than the hour alone because there is nothing to
+/// carry it back from: the object name ends in an unpredictable creation
+/// stamp, so a frame fetched later would otherwise have to list its hour a
+/// second time. **1 LIST per hour here, 1 GET per frame later.**
+///
+/// An hour with no object is an ordinary absence — the current hour has not
+/// landed yet, or the feed stalled — and does not make the answer incomplete.
+/// A listing that *errored* does, and so does a range wider than
+/// [`MAX_FRAME_LIST_REQUESTS`] hours.
+pub async fn list_frame_keys(
+    client: &reqwest::Client,
+    sources: &DataSources,
+    channel: GmgsiChannel,
+    range: (NaiveDateTime, NaiveDateTime),
+) -> (Vec<(NaiveDateTime, String)>, bool) {
+    use futures::StreamExt;
+
+    let hours = hours_in_range(range);
+    let asked = hours.len();
+    let sampled = match (hours.first(), hours.last()) {
+        (Some(first), Some(last)) => (*last - *first).num_hours() as usize + 1 != asked,
+        _ => false,
+    };
+    let answers = futures::stream::iter(
+        hours
+            .into_iter()
+            .map(|hour| async move { (hour, list_hour(client, sources, channel, hour).await) }),
+    )
+    .buffered(FRAME_LIST_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut keys: Vec<(NaiveDateTime, String)> = Vec::new();
+    let mut every_hour_answered = true;
+    for (hour, answer) in answers {
+        match answer {
+            Ok(Some(key)) => keys.push((hour, key)),
+            Ok(None) => {}
+            Err(e) => {
+                every_hour_answered = false;
+                log::warn!("GMGSI listing of {hour} failed: {e:?}");
+            }
+        }
+    }
+    keys.sort_by_key(|a| a.0);
+    log::info!(
+        "GMGSI {}: listed {asked} hours, found {} granules",
+        channel.display_name(),
+        keys.len(),
+    );
+    (keys, every_hour_answered && !sampled)
 }
 
 #[cfg(test)]

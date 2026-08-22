@@ -4364,6 +4364,12 @@ mod loop_overlay_render_tests;
 #[cfg(test)]
 mod loop_playback_transport_tests;
 
+/// The satellite loop (WB-11), end to end against the **real** GMGSI handler
+/// rather than a double.
+#[path = "app_render/gmgsi_loop_tests.rs"]
+#[cfg(test)]
+mod gmgsi_loop_tests;
+
 /// The cross-section loop's dispatch, placement and frame-thread pacing.
 #[path = "app_render/loop_section_tests.rs"]
 #[cfg(test)]

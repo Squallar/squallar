@@ -17,18 +17,43 @@
 //! does. `texture_tests::raster_input_owner` is where that sharing is stated,
 //! and `rustdar-worker`'s `WIRE_FRAMING_ROWS` is untouched by this layer.
 //!
-//! `TimeAxis::Live`, by taking the trait's default. GMGSI publishes a stamped
-//! granule every hour and *could* be a frame series, but `sources.rs`'s
-//! `radar_takes_the_clock_wherever_it_is_drawn` says a third `FrameSeries`
-//! layer changes which layer a pane's clock follows and must be **ruled on, not
-//! absorbed**. This layer draws the latest thing it fetched.
+//! # The clock, and the frames
+//!
+//! `TimeAxis::FrameSeries` at an hourly step, reaching no further forward than
+//! the wall clock. The ruling `radar_takes_the_clock_wherever_it_is_drawn`
+//! demanded before a third frame-series layer could register is made in that
+//! test and rests on this layer's own `draw_order_weight`: **5 is the lowest
+//! weight any layer claims**, so on a pane that also draws radar (30) or the
+//! model (10) the transport does not move, and GMGSI takes a pane's clock only
+//! where it is the sole frame-series layer enabled.
+//!
+//! # Grids are a staging area; the loop holds textures
+//!
+//! One mosaic is 3000 x 5000 `f32` = 60 MB, and [`GRID_CACHE_BYTES`] holds one
+//! to four of them. A thirteen-frame loop is therefore **not** thirteen
+//! granules: a loop frame is a rasterized *texture*, held by the pane, and a
+//! granule is what one frame passes through on its way to becoming one.
+//!
+//! So exactly **one granule has to be resident at a time** for the pipeline to
+//! advance — arrive, be described into a job (which takes its own refcount on
+//! the raster, so the cache may drop it the instant after), be drawn. That is
+//! why [`FRAME_STAGING_BYTES`] is one grid on every arm and why the frame
+//! fetches are **serialised** through [`GmgsiHandler::frame_gate`]: thirteen
+//! concurrent decodes would put 780 MB in flight before any cache saw them,
+//! and no eviction policy can undo that.
+//!
+//! When a granule is evicted before its job is described — possible only if a
+//! second granule lands inside one frame of the pump — that frame is left
+//! **without** a picture until the next listing. It is never given another
+//! hour's, which is the failure the frame-addressed `prepare_job` exists to
+//! prevent.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::fetch_policy::Whole;
-use crate::gmgsi::{GmgsiChannel, GmgsiFetchResult};
+use crate::gmgsi::{GmgsiChannel, GmgsiFetchResult, GmgsiFrameFetch, GmgsiListing};
 use crate::render::controls::{
     ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue,
 };
@@ -39,8 +64,10 @@ use crate::render::overlay_state::{
 };
 use crate::render::rasterize;
 use rustdar_geo::GeoBounds;
+use rustdar_source::handler::{FrameListingResult, TaskFuture};
 use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
+use rustdar_source::time::{FrameListing, FrameStamp, TimeAxis};
 
 /// One mosaic's values, in bytes: 3000 x 5000 `f32` = **60 MB**.
 ///
@@ -85,6 +112,141 @@ pub const GRID_CACHE_BYTES: usize = 4 * GLOBAL_GRID_BYTES;
 const _: () = assert!(GRID_CACHE_BYTES >= GLOBAL_GRID_BYTES);
 const _: () = assert!(GRID_CACHE_BYTES.is_multiple_of(GLOBAL_GRID_BYTES));
 const _: () = assert!(GLOBAL_GRID_BYTES == 60_000_000);
+
+/// **How many bytes of loop-frame granule may stage at once: one mosaic, on
+/// every arm.**
+///
+/// Not a per-arm cascade, because the figure is not a guess about the device —
+/// it is what the pipeline needs. A loop frame's storage is its **texture**
+/// (11.06 MB for a 1280x960-point pane at 1x, held by the pane, priced by
+/// `overlay_frame_bytes`); the granule is a 60 MB staging buffer a frame
+/// passes through on its way to one. A described job takes its own refcount on
+/// the raster, so the slot is free again the moment `prepare_job` has run, and
+/// [`GmgsiHandler::frame_gate`] admits one fetch at a time so nothing else can
+/// ask for the slot in the meantime.
+///
+/// **Thirteen resident granules would be 780 MB** against a 96 MiB wasm model
+/// pool and a 56 MiB wasm loop pool — 14x and 15x over. A grid-holding loop is
+/// not a smaller version of this design, it is an infeasible one.
+pub const FRAME_STAGING_BYTES: usize = GLOBAL_GRID_BYTES;
+
+// The pipeline advances one granule at a time, so a staging area under one
+// grid settles empty and no frame is ever rasterized. Same reason the live
+// cache carries the same floor, and the same reason it is a **build** failure.
+const _: () = assert!(FRAME_STAGING_BYTES >= GLOBAL_GRID_BYTES);
+
+/// **One frame's granule at a time, application-wide.**
+///
+/// `dispatch_loop_frame_fetches` puts the whole render set on the wire in one
+/// pass and states in as many words that it has **no throttle** — radar's
+/// concurrency lives in its download manager, which this layer does not use.
+/// Thirteen unthrottled GMGSI fetches would hold thirteen 7.5 MB bodies and
+/// thirteen 60 MB decoded rasters at once, inside the futures, before any
+/// cache could evict anything.
+///
+/// Serialising costs almost no wall time: the bytes are the bottleneck either
+/// way (13 granules is ~97 MB whether they arrive together or in turn), and
+/// FIFO fairness means they arrive in render-set order, which is playhead
+/// outward.
+type FrameGate = Arc<futures::lock::Mutex<()>>;
+
+/// A staged loop-frame granule's identity: **the channel and the hour it
+/// depicts**.
+///
+/// No run, and none is invented on the way back out either: GMGSI is observed
+/// data with no cycle behind it, so [`FrameStamp::run`] is `None` in every
+/// stamp this layer names and in every stamp it is asked about. The frame list
+/// above carries only an instant and reconstructs `FrameStamp { valid, run:
+/// None }` where a layer's own stamp is missing — which resolves here, by
+/// construction, rather than by luck.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct FrameKey {
+    channel: GmgsiChannel,
+    valid: chrono::NaiveDateTime,
+}
+
+/// The staged loop-frame granules, bounded by **bytes** and evicted
+/// least-recently-used first.
+///
+/// Deliberately **not** [`GmgsiGridCache`]: that one is keyed by channel and
+/// holds the pane's live picture, so thirteen hours of one channel would
+/// overwrite each other in it and the pinned live granule would fight the
+/// loop for its only slot. Two stores, two purposes, two budgets, and the
+/// live one is unchanged by this item.
+struct GmgsiFrameCache {
+    entries: HashMap<FrameKey, GmgsiGranule>,
+    recency: RefCell<Vec<FrameKey>>,
+    /// Injected for the same reason [`GmgsiGridCache::budget`] is: the shipped
+    /// budget is one 60 MB mosaic and no test can afford to overflow it.
+    budget: usize,
+}
+
+impl GmgsiFrameCache {
+    fn new(budget: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            recency: RefCell::new(Vec::new()),
+            budget,
+        }
+    }
+
+    fn touch(&self, key: FrameKey) {
+        let mut recency = self.recency.borrow_mut();
+        if let Some(pos) = recency.iter().position(|k| *k == key) {
+            recency.remove(pos);
+            recency.push(key);
+        }
+    }
+
+    fn get(&self, key: FrameKey) -> Option<&GmgsiGranule> {
+        let granule = self.entries.get(&key)?;
+        self.touch(key);
+        Some(granule)
+    }
+
+    fn resident_bytes(&self) -> usize {
+        self.entries.values().map(|g| g.resident_bytes()).sum()
+    }
+
+    /// **Nothing is pinned.** A staged granule that is evicted before its job
+    /// is described costs one frame its picture until the next listing; a
+    /// staged granule that is *kept* past the budget costs 60 MB on an arm
+    /// that has already said it cannot spare it. The live cache makes the
+    /// opposite trade because a pane with no live granule has nothing that
+    /// will re-ask.
+    fn insert(&mut self, key: FrameKey, granule: GmgsiGranule) {
+        if self.entries.insert(key, granule).is_some() {
+            self.touch(key);
+        } else {
+            self.recency.borrow_mut().push(key);
+        }
+        while self.resident_bytes() > self.budget {
+            let victim = {
+                let mut recency = self.recency.borrow_mut();
+                let Some(pos) = recency.iter().position(|k| *k != key) else {
+                    // The arrival alone is left and it is over budget by
+                    // itself: keeping it is what lets the pipeline advance at
+                    // all, and the floor above makes this unreachable in the
+                    // shipped configuration.
+                    break;
+                };
+                recency.remove(pos)
+            };
+            self.entries.remove(&victim);
+        }
+    }
+
+    /// Drop everything but `keep` — the [`OverlayHandler::retain_frames`] door.
+    fn retain(&mut self, keep: impl Fn(FrameKey) -> bool) {
+        self.entries.retain(|key, _| keep(*key));
+        self.recency.borrow_mut().retain(|key| keep(*key));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
 
 /// One decoded channel, as the layer holds it.
 ///
@@ -228,6 +390,17 @@ pub(crate) struct GmgsiHandler {
     pub defaults: GmgsiPaneState,
     cached_grids: GmgsiGridCache,
     pub last_error: Option<String>,
+    /// **What object each listed hour holds**, per channel — the whole of what
+    /// a listing bought. `list_frames` reads its keys and `fetch_frame` reads
+    /// its values, so a frame costs 1 LIST at listing time and 1 GET at fetch
+    /// time rather than 2 round trips each.
+    frame_keys: HashMap<GmgsiChannel, std::collections::BTreeMap<chrono::NaiveDateTime, String>>,
+    /// Windows a **complete** listing has covered, per channel. A listing that
+    /// errored or was sampled leaves no row, so `list_frames` goes on saying
+    /// "at least these" for that window.
+    covered: HashMap<GmgsiChannel, Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime)>>,
+    frame_grids: GmgsiFrameCache,
+    frame_gate: FrameGate,
 }
 
 impl GmgsiHandler {
@@ -237,7 +410,36 @@ impl GmgsiHandler {
             defaults: GmgsiPaneState::new(false),
             cached_grids: GmgsiGridCache::new(GRID_CACHE_BYTES),
             last_error: None,
+            frame_keys: HashMap::new(),
+            covered: HashMap::new(),
+            frame_grids: GmgsiFrameCache::new(FRAME_STAGING_BYTES),
+            frame_gate: Arc::new(futures::lock::Mutex::new(())),
         }
+    }
+
+    /// The shipped handler with its staging area sized to `bytes` instead of
+    /// [`FRAME_STAGING_BYTES`].
+    ///
+    /// The same reason [`GmgsiGridCache::budget`] is injected: the shipped
+    /// figure is one 60 MB mosaic, no test can build one, and an eviction
+    /// policy that is never overflowed is a policy nothing has checked.
+    #[cfg(test)]
+    fn with_frame_budget(bytes: usize) -> Self {
+        Self {
+            frame_grids: GmgsiFrameCache::new(bytes),
+            ..Self::new()
+        }
+    }
+
+    /// Whether a complete listing of this channel has already covered `range`.
+    fn covers(
+        &self,
+        channel: GmgsiChannel,
+        range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+    ) -> bool {
+        self.covered
+            .get(&channel)
+            .is_some_and(|windows| windows.iter().any(|w| w.0 <= range.0 && range.1 <= w.1))
     }
 
     fn view<'a>(&'a self, pane: &PaneRef<'a>) -> &'a GmgsiPaneState {
@@ -397,6 +599,254 @@ impl OverlayHandler for GmgsiHandler {
         Vec::new() // Gridded, not feature-based; hover uses `hover_value_at`.
     }
 
+    // -- Time ---------------------------------------------------------------
+
+    /// One blended mosaic per hour, stamped with the hour it depicts, and
+    /// never one for an hour that has not happened: discrete frames that stop
+    /// at the wall clock.
+    fn time_axis(&self) -> TimeAxis {
+        TimeAxis::FrameSeries {
+            typical_step: std::time::Duration::from_secs(3600),
+            extends_future: false,
+        }
+    }
+
+    /// **Thirteen hourly mosaics — half a day of cloud, which is the shortest
+    /// window a global satellite loop says anything with.**
+    ///
+    /// The same number the model layer declares, for the same arithmetic: at
+    /// this layer's hourly step it is a twelve-hour window, `n - 1` steps end
+    /// to end. Without it the Lookback slider's own default of 3600 s buys
+    /// **two** frames here while buying a dozen radar volumes, and two frames
+    /// is a before-and-after rather than a loop.
+    ///
+    /// A floor and not the window: drag Lookback past twelve hours and this
+    /// layer widens with everything else.
+    fn min_loop_frames(&self) -> usize {
+        13
+    }
+
+    /// **The hours this channel's listings have found inside `range`.**
+    ///
+    /// Synchronous and I/O-free: it reads the keys
+    /// [`Self::create_frame_list_task`] filed and nothing else. Every stamp
+    /// carries `run: None` — GMGSI is observed, there is no cycle behind it.
+    ///
+    /// `complete` only where a listing that really covered this window landed:
+    /// a failed or sampled listing leaves the answer readable as "at least
+    /// these", which is what it is.
+    fn list_frames(
+        &self,
+        _ctx: &FetchConfig,
+        pane: &PaneRef<'_>,
+        range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+    ) -> FrameListing {
+        let channel = self.view(pane).selected_channel;
+        let frames: Vec<FrameStamp> = self
+            .frame_keys
+            .get(&channel)
+            .map(|keys| {
+                keys.range(range.0..=range.1)
+                    .map(|(valid, _)| FrameStamp {
+                        valid: *valid,
+                        run: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        FrameListing {
+            range,
+            frames,
+            complete: self.covers(channel, range),
+        }
+    }
+
+    /// **1 LIST per hour in the window**, bounded by
+    /// [`crate::gmgsi::fetch::MAX_FRAME_LIST_REQUESTS`], six in flight.
+    ///
+    /// There is no cheaper form. Every object name ends in a creation stamp
+    /// that trails its hour by 34 to 42 minutes and by a different amount per
+    /// channel, so no clock can build a key and
+    /// [`rustdar_source::origins::DataSources`] deliberately publishes no
+    /// `gmgsi_key`. A thirteen-frame window is therefore **13 LISTs now and 13
+    /// GETs later** — the LISTs return one XML document naming one object
+    /// each, and the GETs are the 7.5 MB granules.
+    ///
+    /// The channel is captured here, at dispatch, and travels in the scope.
+    fn create_frame_list_task(
+        &self,
+        ctx: &FetchConfig,
+        pane: &PaneRef<'_>,
+        range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+    ) -> Option<FetchTask> {
+        let channel = self.view(pane).selected_channel;
+        let client = ctx.client.clone();
+        let sources = ctx.sources.clone();
+        Some(FrameListingResult::task(known::GMGSI, async move {
+            let (keys, complete) =
+                crate::gmgsi::fetch::list_frame_keys(&client, &sources, channel, range).await;
+            FrameListingResult {
+                listing: FrameListing {
+                    range,
+                    frames: keys
+                        .iter()
+                        .map(|(valid, _)| FrameStamp {
+                            valid: *valid,
+                            run: None,
+                        })
+                        .collect(),
+                    complete,
+                },
+                scope: Box::new(GmgsiListing {
+                    channel,
+                    range,
+                    keys,
+                    complete,
+                }),
+            }
+        }))
+    }
+
+    /// **One GET, on the key a listing already found**, behind
+    /// [`FrameGate`].
+    ///
+    /// `None` for a stamp no listing of this channel named, and `None` for one
+    /// already staged — both are the contract's own answers, and neither is a
+    /// throttle. The throttle is inside the task: it takes the gate before it
+    /// touches the network, so the whole render set may be dispatched at once
+    /// (which it is — `dispatch_loop_frame_fetches` has no throttle of its
+    /// own) while only one 60 MB decode exists at a time.
+    fn fetch_frame(
+        &self,
+        ctx: &FetchConfig,
+        pane: &PaneRef<'_>,
+        stamp: &FrameStamp,
+    ) -> Option<FetchTask> {
+        let channel = self.view(pane).selected_channel;
+        let key = FrameKey {
+            channel,
+            valid: stamp.valid,
+        };
+        if self.frame_grids.entries.contains_key(&key) {
+            return None;
+        }
+        let object = self.frame_keys.get(&channel)?.get(&stamp.valid)?.clone();
+        let client = ctx.client.clone();
+        let sources = ctx.sources.clone();
+        let gate = Arc::clone(&self.frame_gate);
+        let valid = stamp.valid;
+        let future: TaskFuture = Box::pin(async move {
+            let _one_at_a_time = gate.lock().await;
+            let grid = match crate::gmgsi::fetch::fetch_key(&client, &sources, channel, &object)
+                .await
+            {
+                Ok(grid) => Some(grid),
+                Err(e) => {
+                    log::error!("GMGSI frame fetch failed for {channel:?} valid {valid}: {e:?}");
+                    None
+                }
+            };
+            Box::new(GmgsiFrameFetch {
+                channel,
+                valid,
+                grid,
+            }) as FetchPayload
+        });
+        Some(FetchTask {
+            kind: known::GMGSI,
+            future,
+        })
+    }
+
+    /// **The staged granules of this pane's own channel** — at most one, by
+    /// [`FRAME_STAGING_BYTES`], however many frames the loop holds.
+    ///
+    /// This pane's channel and not the whole store: another pane's Water
+    /// Vapour granule is not a frame this pane can draw, and offering it would
+    /// have the dispatch describe a job that paints the wrong band.
+    fn frames_resident(&self, pane: &PaneRef<'_>) -> Vec<FrameStamp> {
+        let channel = self.view(pane).selected_channel;
+        let mut frames: Vec<FrameStamp> = self
+            .frame_grids
+            .entries
+            .keys()
+            .filter(|key| key.channel == channel)
+            .map(|key| FrameStamp {
+                valid: key.valid,
+                run: None,
+            })
+            .collect();
+        frames.sort_by_key(|stamp| stamp.valid);
+        frames
+    }
+
+    /// Drop every staged granule not in `keep`, matching on the hour alone —
+    /// a caller's stamps carry the `run: None` this layer names, and a stamp
+    /// rebuilt from a bare instant carries it too.
+    ///
+    /// **Nothing above calls this yet** (the one production frame-eviction
+    /// authority is still the byte budget inside each layer), so it is exercised
+    /// by this layer's own suite rather than by the loop.
+    fn retain_frames(&mut self, pane: &PaneRef<'_>, keep: &[FrameStamp]) {
+        let channel = self.view(pane).selected_channel;
+        self.frame_grids.retain(|key| {
+            key.channel != channel || keep.iter().any(|stamp| stamp.valid == key.valid)
+        });
+    }
+
+    /// File a listing under the channel it was **dispatched for**, never the
+    /// one the arriving pane holds: a `PaneRef` on this path is the union
+    /// across panes and its config is null by construction.
+    fn apply_frame_listing(
+        &mut self,
+        _listing: FrameListing,
+        scope: FetchPayload,
+        _pane: &PaneRef<'_>,
+    ) {
+        let Ok(scope) = scope.downcast::<GmgsiListing>() else {
+            log::error!("a frame listing reached the GMGSI layer under another layer's scope");
+            return;
+        };
+        let keys = self.frame_keys.entry(scope.channel).or_default();
+        for (valid, object) in scope.keys {
+            keys.insert(valid, object);
+        }
+        // Coverage only for a listing that really covered the window: a failed
+        // or sampled one must not leave `list_frames` claiming it is settled.
+        if scope.complete && !self.covers(scope.channel, scope.range) {
+            self.covered
+                .entry(scope.channel)
+                .or_default()
+                .push(scope.range);
+        }
+    }
+
+    /// Stage one frame's granule under the `(channel, hour)` its fetch was
+    /// dispatched for. A failed fetch stages nothing and the frame keeps no
+    /// picture.
+    fn apply_frame(&mut self, _stamp: FrameStamp, data: FetchPayload, _pane: &PaneRef<'_>) {
+        let Ok(frame) = data.downcast::<GmgsiFrameFetch>() else {
+            log::error!("a frame reached the GMGSI layer under another layer's payload");
+            return;
+        };
+        let GmgsiFrameFetch {
+            channel,
+            valid,
+            grid,
+        } = *frame;
+        let Some(granule) = grid else {
+            return;
+        };
+        self.frame_grids.insert(
+            FrameKey { channel, valid },
+            GmgsiGranule {
+                grid: Arc::new(granule.grid),
+                bounds: granule.bounds,
+                valid_time: granule.valid_time,
+            },
+        );
+    }
+
     fn apply_fetch_result(&mut self, result: FetchPayload, pane: &PaneRef<'_>) {
         let Some(fetch) = self.state.downcast_round::<GmgsiFetchResult>(result) else {
             log::error!("GMGSI handler received unexpected fetch result type");
@@ -513,8 +963,30 @@ impl OverlayHandler for GmgsiHandler {
     /// of the resident raster, so describing the job costs a refcount and the
     /// 60 MB never moves. The values memcpy happens only in the web encoder,
     /// which knows the texture's bounds and writes the window's rows alone.
-    fn prepare_job(&self, _ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
-        let granule = self.cached_grids.get(self.view(pane).selected_channel)?;
+    ///
+    /// **A named frame is drawn from that frame's own granule.** `ctx.frame` is
+    /// read before the pane's selection, and the lookup goes to the staging
+    /// store keyed by the hour the stamp names — never to the live cache,
+    /// which holds one granule per channel and would hand every frame of a
+    /// loop the same picture.
+    ///
+    /// A named frame whose granule is not staged **describes no job at all**
+    /// rather than falling back to the pane's own picture. That fallback is
+    /// one hour's satellite image presented, unlabelled, as another's, and it
+    /// is the exact defect the frame-addressed dispatch exists to prevent.
+    ///
+    /// The refcount is also what frees the staging slot: the job owns the
+    /// raster from here, so the store may evict the entry on the very next
+    /// arrival without the raster going anywhere.
+    fn prepare_job(&self, ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
+        let channel = self.view(pane).selected_channel;
+        let granule = match ctx.frame {
+            Some(stamp) => self.frame_grids.get(FrameKey {
+                channel,
+                valid: stamp.valid,
+            })?,
+            None => self.cached_grids.get(channel)?,
+        };
         Some(DescribedJob::new(rasterize::GriddedInput::Resident(
             Arc::clone(&granule.grid),
         )))

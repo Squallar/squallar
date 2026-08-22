@@ -222,6 +222,42 @@ impl crate::fetch_policy::FetchRound for GmgsiFetchResult {
     type Shape = crate::fetch_policy::Whole;
 }
 
+/// **What one frame listing found**, carried back to `apply_frame_listing` as
+/// its scope.
+///
+/// The channel is captured at dispatch, not read back off the arriving pane:
+/// the `PaneRef` a listing lands with is the union across panes and its config
+/// is null by construction, so a listing taken for Longwave IR would otherwise
+/// be filed under whatever channel the pane holds by then.
+///
+/// `keys` is the whole of what the listing bought — an hour and the object
+/// name under it — because the name ends in an unpredictable creation stamp
+/// and cannot be rebuilt from the hour.
+///
+/// **Public so a test can drive the real handler.** Every other frame payload
+/// in this tree is private, which is why `loop_overlay_render_tests` had to
+/// stand a double in the layer's place; a double cannot catch a layer that
+/// files its frames wrongly.
+pub struct GmgsiListing {
+    pub channel: GmgsiChannel,
+    pub range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+    pub keys: Vec<(chrono::NaiveDateTime, String)>,
+    /// Whether the hours listed were every hour in `range`.
+    pub complete: bool,
+}
+
+/// **One loop frame's granule**, as its fetch hands it back.
+///
+/// `channel` and `valid` come off the dispatch rather than off the decoded
+/// granule for the reason [`GmgsiListing`] states, and `grid: None` is a fetch
+/// that failed: the frame is left without a picture rather than being given
+/// another hour's.
+pub struct GmgsiFrameFetch {
+    pub channel: GmgsiChannel,
+    pub valid: chrono::NaiveDateTime,
+    pub grid: Option<decode::GmgsiGrid>,
+}
+
 /// Spelled as the trait and not as an inherent `from_str`, which is both this
 /// tree's convention (see `MrmsProduct`) and what stops clippy's
 /// `should_implement_trait` from firing.

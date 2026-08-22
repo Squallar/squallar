@@ -406,16 +406,17 @@ mod registry_identity_tests {
     /// layer cannot join without this list saying what it does with the clock,
     /// and a layer that quietly changes arm is a named diff. Alerts and
     /// lightning are the two `EventLifetime` layers (items with validity
-    /// windows); radar and the model are the two `FrameSeries` layers — radar
-    /// on the ~5-minute volume cadence and never ahead of the clock, the model
-    /// on hourly runs that are — and the other eleven draw the latest thing
-    /// they fetched.
+    /// windows); radar, the model and GMGSI are the three `FrameSeries` layers
+    /// — radar on the ~5-minute volume cadence and never ahead of the clock,
+    /// the model on hourly runs that are, GMGSI on the hourly global blend
+    /// that is not — and the other ten draw the latest thing they fetched.
     ///
-    /// **MRMS and GMGSI are `Live` on purpose**, though both publish stamped
-    /// granules — MRMS every two minutes, GMGSI every hour — and either could
-    /// be a third `FrameSeries` layer. A third changes which layer a pane's
-    /// clock follows, and `radar_takes_the_clock_wherever_it_is_drawn` below
-    /// says that must be ruled on rather than absorbed. It has not been.
+    /// **MRMS is `Live` on purpose**, though it publishes a stamped granule
+    /// every two minutes and could be a fourth `FrameSeries` layer. A layer
+    /// joining that set changes which layer a pane's clock can follow, and
+    /// `radar_takes_the_clock_wherever_it_is_drawn` below says that must be
+    /// ruled on rather than absorbed. GMGSI's ruling was made at WB-11 and is
+    /// written there; MRMS's has not been.
     ///
     /// **Radar's row moved deliberately at WO-E7b** (was `Live`), which is
     /// what gives a radar pane a time-primary layer for its clock to walk;
@@ -433,8 +434,15 @@ mod registry_identity_tests {
             typical_step: std::time::Duration::from_secs(300),
             extends_future: false,
         };
+        // The same hourly step the model declares, with the other half
+        // inverted: a blended mosaic exists for an hour that has happened and
+        // for no other.
+        let hourly_mosaic = TimeAxis::FrameSeries {
+            typical_step: std::time::Duration::from_secs(3600),
+            extends_future: false,
+        };
         let expected: Vec<(&str, TimeAxis)> = vec![
-            ("Gmgsi", TimeAxis::Live),
+            ("Gmgsi", hourly_mosaic),
             ("ModelData", hourly_forecast),
             ("Mrms", TimeAxis::Live),
             ("SpcOutlook", TimeAxis::Live),
@@ -477,11 +485,30 @@ mod registry_identity_tests {
     /// knowing which layer is radar.
     ///
     /// The time-primary layer is the topmost enabled `FrameSeries` layer in
-    /// the draw order. Two layers declare `FrameSeries`, and radar's weight
-    /// (30) puts it above the model's (10), so radar is time-primary on any
-    /// pane that draws it and the model takes over only where radar is off.
-    /// This is the fact WO-E7b's clock rests on; it is a **coincidence of two
-    /// independent declarations**, so it is pinned rather than assumed.
+    /// the draw order. Three layers declare `FrameSeries`, and radar's weight
+    /// (30) puts it above the model's (10) and GMGSI's (5), so radar is
+    /// time-primary on any pane that draws it and the others take over only
+    /// where it is off. This is the fact WO-E7b's clock rests on; it is a
+    /// **coincidence of independent declarations**, so it is pinned rather
+    /// than assumed.
+    ///
+    /// # The WB-11 ruling
+    ///
+    /// GMGSI joined this set, and the ruling this pin demanded is: **it joins
+    /// at the bottom and therefore takes no pane's clock away from anything.**
+    /// Weight 5 is the lowest any registered layer claims — the global cloud
+    /// mosaic is the backdrop the rest of the map is read against — so on any
+    /// pane that also draws radar or the model the transport is unmoved, and
+    /// GMGSI is time-primary only where it is the sole frame-series layer
+    /// enabled. That is exactly the pane the user asked for when they asked
+    /// for satellite imagery to participate in the loop, and it is why GMGSI
+    /// was the safer of the two standing candidates to land first.
+    ///
+    /// **MRMS was the other, and its ruling is still open.** Its weight is 15,
+    /// which sits *above* the model's 10: registering it as a frame series
+    /// would take the clock off a model loop on any pane drawing both, which
+    /// is a change to what an existing pane does rather than an addition. The
+    /// assertion below refuses a fourth for that reason.
     #[test]
     fn radar_takes_the_clock_wherever_it_is_drawn() {
         use rustdar_source::time::TimeAxis;
@@ -493,28 +520,32 @@ mod registry_identity_tests {
             .collect();
         assert_eq!(
             framed.len(),
-            2,
-            "exactly two layers come in stamped frames; a third joining changes \
-             which one a pane's clock follows and must be ruled on, not \
-             absorbed. MRMS and GMGSI are the two standing candidates — both \
-             publish stamped granules and both declare `Live` — and that \
-             ruling has not been made. Registering a third `FrameSeries` layer \
-             without making it is what this pin refuses.",
+            3,
+            "exactly three layers come in stamped frames; a fourth joining \
+             changes which one a pane's clock follows and must be ruled on, \
+             not absorbed. MRMS is the standing candidate -- it publishes a \
+             stamped granule every two minutes and declares `Live` -- and its \
+             weight of 15 puts it ABOVE the model's 10, so registering it \
+             would move an existing pane's transport rather than only offer a \
+             new one. Registering a fourth `FrameSeries` layer without making \
+             that ruling is what this pin refuses.",
         );
         framed.sort_by_key(|(_, weight)| *weight);
         // The topmost frame-series layer is what a pane's clock walks.
         assert_eq!(
             framed.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
-            ["ModelData", "Radar"],
-            "radar is the topmost frame-series layer in the draw order and the \
-             model is below it, so radar is what a pane's clock walks",
+            ["Gmgsi", "ModelData", "Radar"],
+            "radar is the topmost frame-series layer in the draw order, the \
+             model is below it and GMGSI is below both, so radar is what a \
+             pane's clock walks and GMGSI takes it from nothing",
         );
         assert!(
-            framed[0].1 < framed[1].1,
-            "precondition: the two weights actually differ ({} vs {}), so \
+            framed[0].1 < framed[1].1 && framed[1].1 < framed[2].1,
+            "precondition: the three weights actually differ ({}, {}, {}), so \
              \"topmost\" is a fact and not a tie broken by registration order",
             framed[0].1,
             framed[1].1,
+            framed[2].1,
         );
     }
 
