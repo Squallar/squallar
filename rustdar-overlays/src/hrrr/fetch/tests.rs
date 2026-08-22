@@ -1416,3 +1416,256 @@ fn a_source_is_still_refused_outside_its_own_declared_domain() {
         .is_ok(),
     );
 }
+
+// ---------------------------------------------------------------------------
+// The analysis-axis listing (S2 2.6)
+// ---------------------------------------------------------------------------
+
+/// **Only an analysis GRIB2 key is a run**, and every other key in the same
+/// prefix answers `None`.
+///
+/// The rejections are the point: `hrrr.YYYYMMDD/conus/` carries the `.idx`
+/// sidecar of every hour, all 48 forecast hours, and the sub-hourly `wrfsubh`
+/// and `wrfnat` families. A substring match on `wrfsfcf00` would read the
+/// sidecar as a run and offer a frame whose fetch downloads 9 KB of text.
+#[test]
+fn only_an_analysis_grib2_key_names_a_run() {
+    assert_eq!(
+        run_of_analysis_key("hrrr.20260820/conus/hrrr.t14z.wrfsfcf00.grib2"),
+        Some(
+            NaiveDate::from_ymd_opt(2026, 8, 20)
+                .unwrap()
+                .and_hms_opt(14, 0, 0)
+                .unwrap()
+        ),
+    );
+    assert_eq!(
+        run_of_analysis_key("hrrr.20140730/conus/hrrr.t00z.wrfsfcf00.grib2"),
+        Some(
+            NaiveDate::from_ymd_opt(2014, 7, 30)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+        ),
+        "the archive begins at hrrr.20140730",
+    );
+
+    for key in [
+        "hrrr.20260820/conus/hrrr.t14z.wrfsfcf00.grib2.idx",
+        "hrrr.20260820/conus/hrrr.t14z.wrfsfcf01.grib2",
+        "hrrr.20260820/conus/hrrr.t14z.wrfsfcf48.grib2",
+        "hrrr.20260820/conus/hrrr.t14z.wrfsubhf00.grib2",
+        "hrrr.20260820/conus/hrrr.t14z.wrfnatf00.grib2",
+        "hrrr.20260820/alaska/hrrr.t14z.wrfsfcf00.grib2",
+        "hrrr.20260820/hrrr.t14z.wrfsfcf00.grib2",
+        "hrrr.2026082/conus/hrrr.t14z.wrfsfcf00.grib2",
+        "hrrr.20260820/conus/hrrr.t99z.wrfsfcf00.grib2",
+        "",
+    ] {
+        assert_eq!(
+            run_of_analysis_key(key),
+            None,
+            "`{key}` was read as an analysis run",
+        );
+    }
+}
+
+/// The listing keeps the runs the bucket really carries, in order, clipped to
+/// the window — and **only** those: a run the archive is missing must not
+/// appear, which is the whole reason this lists rather than computes.
+///
+/// Non-vacuity: the served day carries a gap (no 12Z) and a key of every
+/// rejected family, so a walk that constructed the hourly cycle or matched on
+/// a substring answers a different set.
+#[test]
+fn the_analysis_listing_keeps_the_runs_the_bucket_carries() {
+    let day = NaiveDate::from_ymd_opt(2026, 8, 20).unwrap();
+    let mut keys: Vec<String> = Vec::new();
+    for hour in [10u32, 11, 13, 14] {
+        keys.push(format!(
+            "hrrr.20260820/conus/hrrr.t{hour:02}z.wrfsfcf00.grib2"
+        ));
+        keys.push(format!(
+            "hrrr.20260820/conus/hrrr.t{hour:02}z.wrfsfcf00.grib2.idx"
+        ));
+        keys.push(format!(
+            "hrrr.20260820/conus/hrrr.t{hour:02}z.wrfsfcf06.grib2"
+        ));
+    }
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Name>b</Name><IsTruncated>false</IsTruncated>{}</ListBucketResult>",
+        keys.iter()
+            .map(|k| format!("<Contents><Key>{k}</Key></Contents>"))
+            .collect::<String>(),
+    );
+
+    let sources = s3_serving(body);
+    let range = (
+        day.and_hms_opt(11, 0, 0).unwrap(),
+        day.and_hms_opt(14, 0, 0).unwrap(),
+    );
+    let runs = listing_runtime().block_on(list_analysis_runs(&loopback_client(), &sources, range));
+    assert_eq!(
+        runs.expect("the loopback bucket answers"),
+        [11u32, 13, 14]
+            .map(|h| day.and_hms_opt(h, 0, 0).unwrap())
+            .to_vec(),
+        "the listing must be the analysis keys inside the window, ascending, \
+         with 12Z absent because the bucket does not carry it",
+    );
+}
+
+/// A listing S3 refuses is an error, not an empty day: an empty `Ok` would
+/// reach `apply_frame_listing` as a covering listing and settle the window on
+/// "no runs exist".
+#[test]
+fn a_refused_listing_is_an_error_and_not_an_empty_day() {
+    let sources = s3_serving_status("404 Not Found", "<Error/>");
+    let day = NaiveDate::from_ymd_opt(2026, 8, 20).unwrap();
+    let range = (
+        day.and_hms_opt(0, 0, 0).unwrap(),
+        day.and_hms_opt(1, 0, 0).unwrap(),
+    );
+    let out = listing_runtime().block_on(list_analysis_runs(&loopback_client(), &sources, range));
+    let err = out.expect_err("a 404 on the listing is not an empty day");
+    assert!(err.message.contains("404"), "{}", err.message);
+}
+
+/// A window spanning UTC midnight lists both day prefixes. One LIST per day,
+/// not one per frame.
+#[test]
+fn a_window_across_midnight_lists_both_days() {
+    let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Name>b</Name><IsTruncated>false</IsTruncated>\
+         <Contents><Key>hrrr.20260820/conus/hrrr.t23z.wrfsfcf00.grib2</Key></Contents>\
+         <Contents><Key>hrrr.20260821/conus/hrrr.t00z.wrfsfcf00.grib2</Key></Contents>\
+         </ListBucketResult>"
+        .to_string();
+    let sources = s3_serving(body);
+    let range = (
+        NaiveDate::from_ymd_opt(2026, 8, 20)
+            .unwrap()
+            .and_hms_opt(23, 0, 0)
+            .unwrap(),
+        NaiveDate::from_ymd_opt(2026, 8, 21)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap(),
+    );
+    let runs = listing_runtime()
+        .block_on(list_analysis_runs(&loopback_client(), &sources, range))
+        .expect("the loopback bucket answers");
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert!(runs[0] < runs[1], "ascending: {runs:?}");
+}
+
+/// The day walk is bounded: a window nobody bounded must not become four
+/// thousand LISTs against a twelve-year archive.
+///
+/// Non-vacuity: the loopback server **counts** the requests it answered, so
+/// an unbounded walk fails here rather than merely taking 4383 round trips and
+/// passing. `MAX_LISTED_DAYS` is a const assert away from the archive's depth,
+/// so the comparison itself is not restated as a runtime check clippy can see
+/// through.
+#[test]
+fn an_unbounded_window_stops_at_the_day_cap() {
+    let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Name>b</Name><IsTruncated>false</IsTruncated>\
+         <Contents><Key>hrrr.20260820/conus/hrrr.t00z.wrfsfcf00.grib2</Key></Contents>\
+         <Contents><Key>hrrr.20260821/conus/hrrr.t00z.wrfsfcf00.grib2</Key></Contents>\
+         <Contents><Key>hrrr.20260822/conus/hrrr.t00z.wrfsfcf00.grib2</Key></Contents>\
+         <Contents><Key>hrrr.20260823/conus/hrrr.t00z.wrfsfcf00.grib2</Key></Contents>\
+         <Contents><Key>hrrr.20260824/conus/hrrr.t00z.wrfsfcf00.grib2</Key></Contents>\
+         <Contents><Key>hrrr.20260825/conus/hrrr.t00z.wrfsfcf00.grib2</Key></Contents>\
+         <Contents><Key>hrrr.20260826/conus/hrrr.t00z.wrfsfcf00.grib2</Key></Contents>\
+         <Contents><Key>hrrr.20260827/conus/hrrr.t00z.wrfsfcf00.grib2</Key></Contents>\
+         <Contents><Key>hrrr.20260828/conus/hrrr.t00z.wrfsfcf00.grib2</Key></Contents>\
+         </ListBucketResult>"
+        .to_string();
+    let (sources, served) = s3_serving_counted("200 OK", &body);
+    let start = NaiveDate::from_ymd_opt(2026, 8, 20)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap();
+    let runs = listing_runtime()
+        .block_on(list_analysis_runs(
+            &loopback_client(),
+            &sources,
+            (start, start + chrono::Duration::days(365 * 12)),
+        ))
+        .expect("the loopback bucket answers");
+    assert_eq!(
+        served.load(std::sync::atomic::Ordering::SeqCst),
+        MAX_LISTED_DAYS,
+        "the walk issued one LIST per day of a twelve-year window",
+    );
+    // Every prefix serves the same nine keys, so the dedupe leaves nine.
+    assert_eq!(runs.len(), 9, "{runs:?}");
+}
+
+fn listing_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime")
+}
+
+/// A cleartext-capable client: `tls::client` sets `https_only`, which a
+/// loopback URL cannot satisfy, and `tls::init` is still required because
+/// `reqwest` is pinned to `rustls-no-provider`.
+fn loopback_client() -> reqwest::Client {
+    rustdar_source::tls::init();
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .expect("client")
+}
+
+fn s3_serving(body: String) -> DataSources {
+    s3_serving_counted("200 OK", &body).0
+}
+
+fn s3_serving_status(status_line: &'static str, body: &str) -> DataSources {
+    s3_serving_counted(status_line, body).0
+}
+
+/// A loopback S3 serving one canned response, **and the count of requests it
+/// answered** — the only way to assert that a walk was bounded rather than
+/// merely slow.
+fn s3_serving_counted(
+    status_line: &'static str,
+    body: &str,
+) -> (DataSources, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{Read, Write};
+    let response = format!(
+        "HTTP/1.1 {status_line}\r\nContent-Type: application/xml\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
+    );
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = served.clone();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("local addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut scratch = [0u8; 4096];
+            let _ = stream.read(&mut scratch);
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (
+        DataSources {
+            hrrr_bucket: "hrrr".into(),
+            s3_base: format!("http://127.0.0.1:{port}/{{bucket}}").into(),
+            ..DataSources::production()
+        },
+        served,
+    )
+}
