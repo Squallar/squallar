@@ -829,6 +829,44 @@ pub trait SourceHandler: Send {
         TimeAxis::Live
     }
 
+    /// **The fewest frames a loop of this layer is worth building.**
+    ///
+    /// A *count*, because that is what makes a loop a loop: how many pictures
+    /// it cycles. The seconds it costs are this layer's own
+    /// [`TimeAxis::FrameSeries::typical_step`], and the conversion is
+    /// [`Self::min_loop_span_secs`] — nothing above holds a window beside an
+    /// id.
+    ///
+    /// **One global window cannot serve two cadences.** The timeline's
+    /// Lookback slider names one number for the whole application; sixty
+    /// minutes of it is a dozen radar volumes and *two* hourly satellite
+    /// images. A layer whose frames are an hour apart declares here how wide
+    /// its own window has to be before it is a loop at all.
+    ///
+    /// Zero — the default, and radar's answer — means the window is exactly
+    /// the one the slider names, to the second.
+    fn min_loop_frames(&self) -> usize {
+        0
+    }
+
+    /// **The narrowest window this layer's loop may be listed over**, in
+    /// seconds: [`Self::min_loop_frames`] frames of [`Self::time_axis`]'s own
+    /// step, which is `n - 1` steps end to end.
+    ///
+    /// A *floor*, never the window itself — a caller takes the wider of this
+    /// and whatever the user set, so widening the slider still widens every
+    /// layer. Zero whenever the layer declares no minimum or has no step to
+    /// multiply, and a layer answering zero is therefore untouched by the
+    /// whole mechanism.
+    fn min_loop_span_secs(&self) -> u64 {
+        match (self.time_axis(), self.min_loop_frames()) {
+            (TimeAxis::FrameSeries { typical_step, .. }, frames) if frames > 1 => {
+                typical_step.as_secs().saturating_mul(frames as u64 - 1)
+            }
+            _ => 0,
+        }
+    }
+
     /// **How far past the wall clock this layer's frames reach, in this pane.**
     ///
     /// Zero for every layer whose stamps are all history — which is every
