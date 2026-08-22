@@ -125,6 +125,17 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          `DeviceProfile::reported_promotion`, so a software rasteriser \
          reporting 16384 in 2D promotes on that alone. A mutation, not a test.",
     ),
+    (
+        "rustdar-overlays/src/glm/fetch/tests.rs",
+        "every_pane_is_a_span",
+        "GLM live-identity floor: make `span` default to the loop span rather \
+         than zero (`depicted_span_secs.unwrap_or(3600)`) in \
+         `fetch_glm_flashes`, so a live pane widens like a looping one. A \
+         mutation, not a test. Its three sibling labels in the same file \
+         (`list_to_the_sample`, `list_from_the_sample`, \
+         `horizon_beyond_the_span`) are four segments and slip under \
+         `MIN_SEGMENTS`; this one is five and is no different in kind.",
+    ),
     // ── Prose that narrates a deletion ──────────────────────────────────
     (
         "rustdar-volumetric/src/volume_bridge/tests.rs",

@@ -2016,3 +2016,677 @@ fn a_spanned_poll_caps_what_it_retains_and_drops_its_oldest_hours_first() {
         "the delivered set is what survived the cap, not what was seeded",
     );
 }
+
+// ── The listing's own reach: a poll covers the span in BOTH directions ──────
+
+/// A mock bucket that answers **per prefix and per object**: a `list-type=2`
+/// request returns exactly the seeded keys under the prefix it was asked for,
+/// and an object request returns that granule's own bytes.
+///
+/// [`s3_recording`] cannot stand in for this. It answers *every* prefix with
+/// one identical canned listing, so a listing that never reached an hour and
+/// one that did come back identical, and it serves no objects at all, so
+/// nothing downstream of the listing runs. Every test below turns on what a
+/// poll actually *downloads*, which needs both.
+///
+/// One granule set for both buckets: the callers here query one satellite, and
+/// which satellite a key belongs to is not what is under test.
+fn s3_archive(granules: Vec<(String, Vec<u8>)>) -> (DataSources, RecordedRequests) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("local addr").port();
+    let seen: RecordedRequests = Default::default();
+    let recorder = std::sync::Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut scratch = [0u8; 8192];
+            let read = stream.read(&mut scratch).unwrap_or(0);
+            let request = String::from_utf8_lossy(&scratch[..read]).to_string();
+            let line = request.lines().next().unwrap_or("").to_string();
+            recorder
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(line.clone());
+            let _ = stream.write_all(&archive_reply(&line, &granules));
+            let _ = stream.flush();
+        }
+    });
+    let sources = DataSources {
+        goes_east_bucket: "east".into(),
+        goes_west_bucket: "west".into(),
+        s3_base: format!("http://127.0.0.1:{port}/{{bucket}}").into(),
+        ..DataSources::production()
+    };
+    (sources, seen)
+}
+
+/// The one route table [`s3_archive`] serves: a request line carrying
+/// `prefix=` is a listing, anything else addresses an object.
+fn archive_reply(line: &str, granules: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let path = line.split_whitespace().nth(1).unwrap_or("");
+    if let Some(rest) = path.split("prefix=").nth(1) {
+        let prefix = rest.split('&').next().unwrap_or("");
+        let mut body = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <Name>bucket</Name><IsTruncated>false</IsTruncated>",
+        );
+        for key in granules
+            .iter()
+            .map(|(k, _)| k)
+            .filter(|k| k.starts_with(prefix))
+        {
+            body.push_str(&format!(
+                "<Contents><Key>{key}</Key><Size>1</Size></Contents>"
+            ));
+        }
+        body.push_str("</ListBucketResult>");
+        return http_response("200 OK", &body).into_bytes();
+    }
+    match granules.iter().find(|(k, _)| path.ends_with(k.as_str())) {
+        Some((_, bytes)) => {
+            let mut out = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len(),
+            )
+            .into_bytes();
+            out.extend_from_slice(bytes);
+            out
+        }
+        None => http_response("404 Not Found", "<Error/>").into_bytes(),
+    }
+}
+
+/// One flash at `lat`/`lon`, 10 s into the granule starting at `start` — the
+/// shape [`synthetic_glm_file`] writes, with the epoch and the position under
+/// the caller's control so a bucket can carry a distinguishable granule per
+/// frame. No `units` on the time offset, so it unpacks as seconds since
+/// `time_coverage_start`.
+fn one_flash_granule(start: NaiveDateTime, lat: f32, lon: f32) -> Vec<u8> {
+    let mut file = hdf5_pure::FileBuilder::new();
+    file.set_attr(
+        "time_coverage_start",
+        hdf5_pure::AttrValue::String(format!("{}Z", start.format("%Y-%m-%dT%H:%M:%S.0"))),
+    );
+    {
+        let mut put = |name: &str, value: f32, units: Option<&str>| {
+            let var = file.create_dataset(name);
+            var.with_f32_data(&[value]);
+            if let Some(u) = units {
+                var.set_attr("units", hdf5_pure::AttrValue::String(u.into()));
+            }
+        };
+        put("flash_lat", lat, None);
+        put("flash_lon", lon, None);
+        put("flash_energy", 1.0e-14, Some("J"));
+        put("flash_area", 128.0, Some("km2"));
+        put("flash_time_offset_of_first_event", 10.0, None);
+    }
+    file.finish().expect("write granule")
+}
+
+/// **The loop the user was watching**: the Lookback slider's default span
+/// (`PaneTimePosture::default().span_secs`), at the GLM window's own default
+/// (`GlmPaneState::new`), stepped so consecutive frames never share a flash.
+const SWEEP_SPAN_SECS: u64 = 3600;
+const SWEEP_WINDOW_SECS: f64 = 300.0;
+const SWEEP_STEP_SECS: i64 = 300;
+/// Both endpoints included: `3600 / 300 + 1`.
+const SWEEP_FRAMES: usize = 13;
+
+/// The loop's frames, oldest first. `frames[0]` is the oldest the pane can
+/// depict and `frames[SWEEP_FRAMES - 1]` the newest; a poll's `as_of` is one
+/// sample of a clock sweeping between them.
+fn sweep_frames() -> Vec<NaiveDateTime> {
+    let newest = chrono::NaiveDate::from_ymd_opt(2020, 6, 15)
+        .unwrap()
+        .and_hms_opt(8, 0, 0)
+        .unwrap();
+    (0..SWEEP_FRAMES)
+        .map(|i| newest - TimeDelta::seconds(SWEEP_STEP_SECS * (SWEEP_FRAMES - 1 - i) as i64))
+        .collect()
+}
+
+/// Frame `i`'s own granule starts 30 s before it, so its single flash lands
+/// 20 s inside that frame's 300 s window — and 320 s outside the previous
+/// frame's, which is what makes "frame `i` is lit" mean "granule `i` arrived".
+fn sweep_granule_start(frame: NaiveDateTime) -> NaiveDateTime {
+    frame - TimeDelta::seconds(30)
+}
+
+/// Frame `i`'s flash sits at a longitude no other frame's box contains, so a
+/// lit box is that frame's own strike and never a neighbour's.
+fn sweep_lon(i: usize) -> f32 {
+    -110.0 + 4.0 * i as f32
+}
+
+fn sweep_bounds(i: usize) -> rustdar_geo::GeoBounds {
+    rustdar_geo::GeoBounds {
+        min_lat: 34.0,
+        max_lat: 36.0,
+        min_lon: sweep_lon(i) as f64 - 1.0,
+        max_lon: sweep_lon(i) as f64 + 1.0,
+    }
+}
+
+/// One granule per frame, and nothing else in the bucket.
+fn sweep_bucket() -> Vec<(String, Vec<u8>)> {
+    sweep_frames()
+        .into_iter()
+        .enumerate()
+        .map(|(i, frame)| {
+            let start = sweep_granule_start(frame);
+            (
+                granule_key(start),
+                one_flash_granule(start, 35.0, sweep_lon(i)),
+            )
+        })
+        .collect()
+}
+
+/// A handler on one satellite and the flash level alone: two satellites would
+/// double every request without changing what is under test, and the group
+/// level has no columns in [`one_flash_granule`].
+fn sweep_handler() -> crate::render::handlers::glm::GlmHandler {
+    let mut handler = crate::render::handlers::glm::GlmHandler::new();
+    handler.defaults.enabled = true;
+    handler.defaults.satellite = crate::render::handlers::glm::SatelliteSelection::East;
+    handler.defaults.show_groups = false;
+    handler.defaults.show_flashes = true;
+    handler.defaults.time_window_secs = SWEEP_WINDOW_SECS;
+    handler
+}
+
+/// One poll of the loop, dispatched exactly as `fetch_config_for_layer` would
+/// while the pane's clock reads `as_of`.
+fn sweep_poll(
+    handler: &mut crate::render::handlers::glm::GlmHandler,
+    sources: &DataSources,
+    as_of: NaiveDateTime,
+) {
+    use crate::render::overlay_state::{FetchConfig, OverlayHandler, PaneRef};
+    let config = FetchConfig {
+        client: loopback_client(),
+        zone_cache_dir: None,
+        sources: sources.clone(),
+        viewport: None,
+        as_of,
+        depicted_span_secs: Some(SWEEP_SPAN_SECS),
+    };
+    let mut tasks = handler.create_fetch_tasks(&config, &PaneRef::bare(0));
+    assert_eq!(tasks.len(), 1, "GLM builds exactly one poll task");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let payload = runtime.block_on(tasks.remove(0).future);
+    handler.apply_fetch_result(payload, &PaneRef::bare(0));
+}
+
+/// Whether the handler's raster at `as_of` lights any pixel inside `bounds` —
+/// [`strikes_visible`]'s body, minus its `expect`: a round that delivered
+/// nothing describes no job, and "nothing to draw" is the blank frame this
+/// suite counts, not a panic.
+fn frame_lit(
+    handler: &crate::render::handlers::glm::GlmHandler,
+    as_of: NaiveDateTime,
+    bounds: &rustdar_geo::GeoBounds,
+) -> bool {
+    use crate::render::overlay_state::{OverlayHandler, PaneRef, RasterizeContext};
+    let Some(job) = handler.prepare_job(
+        &RasterizeContext {
+            is_dark: false,
+            zoom: 6.0,
+            device_scale: 1.0,
+            now: as_of + TimeDelta::hours(30),
+            as_of,
+            frame: None,
+        },
+        &PaneRef::bare(0),
+    ) else {
+        return false;
+    };
+    let input = job
+        .downcast_ref::<crate::render::rasterize::GlmStrikesInput>()
+        .expect("the GLM row");
+    let out = crate::render::rasterize::rasterize_glm_strikes(input, bounds, 64, 64);
+    out.rgba.iter().any(|&b| b != 0)
+}
+
+/// Which frames of the sweep drew their own strike — the count the user's
+/// report is about, one row per frame the loop asks for.
+fn lit_frames(handler: &crate::render::handlers::glm::GlmHandler) -> Vec<usize> {
+    sweep_frames()
+        .into_iter()
+        .enumerate()
+        .filter(|&(i, frame)| frame_lit(handler, frame, &sweep_bounds(i)))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The listing requests of a recorded round, in arrival order.
+fn list_paths(seen: &RecordedRequests) -> Vec<String> {
+    request_paths(seen)
+        .into_iter()
+        .filter(|p| p.contains("list-type=2"))
+        .collect()
+}
+
+/// **The user's second report, as a test.** *"GLM flashes still don't show up
+/// properly across a loop — just a single frame at the beginning (or end, hard
+/// to tell) has them, the rest are blank."*
+///
+/// The span-aware poll widened `start` and the retention cutoff, but the
+/// listing still ENDED at the sampled instant. So a poll landing while the
+/// playhead sits on the loop's oldest frame lists
+/// `[oldest - window - span, oldest]` — a range entirely *behind* the loop —
+/// and downloads exactly the one granule the sample itself sits in. Retention
+/// cannot rescue that: there is nothing held to retain.
+///
+/// Nor does the loop heal itself between polls. `GlmHandler::auto_poll_interval`
+/// is 20 s; a loop at the default 5 fps sweeps these 13 frames in 2.6 s, so the
+/// playhead crosses the whole span seven times per poll and the sky it shows is
+/// whichever single instant the last poll happened to sample.
+///
+/// **Floor — `list_to_the_sample`: put `as_of` back as `list_glm_files`'s
+/// `end` argument in [`fetch_glm_flashes`].** The count assertion then reads
+/// 1 of 13.
+#[test]
+fn a_poll_landing_on_the_loops_oldest_frame_still_fills_the_whole_sweep() {
+    let (sources, seen) = s3_archive(sweep_bucket());
+    let mut handler = sweep_handler();
+    let frames = sweep_frames();
+
+    sweep_poll(&mut handler, &sources, frames[0]);
+
+    let lit = lit_frames(&handler);
+    assert_eq!(
+        lit.len(),
+        SWEEP_FRAMES,
+        "GLM flashes still don't show up properly across a loop — just a \
+         single frame at the beginning (or end, hard to tell) has them, the \
+         rest are blank: {} of {SWEEP_FRAMES} frames drew strikes. Lit frames \
+         were {lit:?} of 0..{SWEEP_FRAMES}; the poll sampled the loop's \
+         OLDEST frame ({}), and a listing bounded above by the sample reaches \
+         no granule any later frame depicts.",
+        lit.len(),
+        frames[0],
+    );
+
+    // Non-triviality: "fetch the whole span" must not become "every frame
+    // draws every strike". The newest frame's flash is 3600 s after the
+    // oldest frame's 300 s window closes.
+    assert!(
+        !frame_lit(&handler, frames[0], &sweep_bounds(SWEEP_FRAMES - 1)),
+        "the oldest frame drew the newest frame's strike, which has not \
+         happened yet at that instant — widening what is HELD must never \
+         widen what a frame DRAWS",
+    );
+    assert!(
+        !frame_lit(&handler, frames[SWEEP_FRAMES - 1], &sweep_bounds(0)),
+        "the newest frame drew the oldest frame's strike, 3600 s outside its \
+         300 s window",
+    );
+
+    // The hours the sweep needs, and no more: `[oldest - 300 - 3600,
+    // oldest + 3600]` is 05:55–08:00Z on 2020-06-15, four UTC hours.
+    let paths = list_paths(&seen);
+    assert_eq!(
+        paths.len(),
+        4,
+        "a poll at {} over a {SWEEP_SPAN_SECS}s span and a \
+         {SWEEP_WINDOW_SECS}s window covers 05:55–08:00Z = 4 UTC hours, so 4 \
+         LIST requests per satellite; it made {}: {paths:?}",
+        frames[0],
+        paths.len(),
+    );
+    for hour in [
+        "/2020/167/05/",
+        "/2020/167/06/",
+        "/2020/167/07/",
+        "/2020/167/08/",
+    ] {
+        assert!(
+            paths.iter().any(|p| p.contains(hour)),
+            "the listing never reached {hour}; it asked for {paths:?}",
+        );
+    }
+}
+
+/// The mirror, and the direction that already worked: the poll lands while the
+/// playhead is on the loop's NEWEST frame. Every other frame is then *behind*
+/// the sample, which `start = as_of - window - span` already reached — so this
+/// is a pin on what must not regress while the listing's upper bound moves,
+/// not a second reading of the same defect.
+///
+/// **Floor — `list_from_the_sample`: drop the `- span` term from `start` in
+/// [`fetch_glm_flashes`].** The count assertion then reads 1 of 13.
+#[test]
+fn a_poll_landing_on_the_loops_newest_frame_still_fills_the_whole_sweep() {
+    let (sources, seen) = s3_archive(sweep_bucket());
+    let mut handler = sweep_handler();
+    let frames = sweep_frames();
+
+    sweep_poll(&mut handler, &sources, frames[SWEEP_FRAMES - 1]);
+
+    let lit = lit_frames(&handler);
+    assert_eq!(
+        lit.len(),
+        SWEEP_FRAMES,
+        "the poll sampled the loop's NEWEST frame ({}) and only {} of \
+         {SWEEP_FRAMES} frames drew strikes — lit frames {lit:?} of \
+         0..{SWEEP_FRAMES}. Reaching BACK over the span is the half that \
+         already worked; a loop lit at one end is the user's report mirrored.",
+        frames[SWEEP_FRAMES - 1],
+        lit.len(),
+    );
+
+    // `[newest - 300 - 3600, newest + 3600]` is 06:55–09:00Z: four UTC hours
+    // again, shifted by one. The count is a property of the span, not of
+    // where inside it the poll landed.
+    let paths = list_paths(&seen);
+    assert_eq!(
+        paths.len(),
+        4,
+        "06:55–09:00Z is 4 UTC hours, so 4 LIST requests per satellite; it \
+         made {}: {paths:?}",
+        paths.len(),
+    );
+}
+
+/// **A live pane is byte-for-byte the pane it always was.** `span_secs: None`
+/// makes `span` zero, so `horizon == as_of` and the listing's upper bound is
+/// the sampled instant exactly as before this fix.
+///
+/// The bucket carries a granule in the NEXT hour, 40 minutes after the live
+/// pane's instant. A live poll must not list that hour, must not download it,
+/// and must not return its flash — the guard against "just widen everything",
+/// which is the cheapest wrong fix here.
+///
+/// **Floor — `every_pane_is_a_span`: make `span` default to the loop span
+/// rather than zero (`depicted_span_secs.unwrap_or(3600)`) in
+/// [`fetch_glm_flashes`].** Observed: the LIST count reads 3, not 1, and the
+/// hours it asked for are 06Z, 07Z and 08Z.
+#[test]
+fn a_live_polls_listing_range_and_returned_set_are_unchanged() {
+    let day = chrono::NaiveDate::from_ymd_opt(2020, 6, 15).unwrap();
+    let as_of = day.and_hms_opt(7, 30, 0).unwrap();
+    let in_window = day.and_hms_opt(7, 29, 30).unwrap();
+    let next_hour = day.and_hms_opt(8, 10, 0).unwrap();
+
+    let (sources, seen) = s3_archive(vec![
+        (
+            granule_key(in_window),
+            one_flash_granule(in_window, 35.0, -97.0),
+        ),
+        (
+            granule_key(next_hour),
+            one_flash_granule(next_hour, 30.0, -85.0),
+        ),
+    ]);
+
+    let mut cache = GlmCache::default();
+    let client = loopback_client();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let outcome = runtime
+        .block_on(fetch_glm_flashes(
+            &client,
+            &sources,
+            &[GlmSatellite::GoesEast],
+            SWEEP_WINDOW_SECS,
+            &[GlmDataLevel::Flash],
+            &mut cache,
+            DepictedWindow {
+                as_of,
+                span_secs: None,
+            },
+        ))
+        .expect("the listing answered");
+
+    let paths = list_paths(&seen);
+    assert_eq!(
+        paths.len(),
+        1,
+        "a live poll's range is `[as_of - window, as_of]` = 07:25–07:30Z, one \
+         UTC hour, so one LIST request per satellite; it made {}: {paths:?}",
+        paths.len(),
+    );
+    assert!(
+        paths[0].contains("/2020/167/07/"),
+        "the live hour is 07Z: {paths:?}",
+    );
+    assert!(
+        !paths.iter().any(|p| p.contains("/2020/167/08/")),
+        "a live pane listed an hour AHEAD of its own instant: {paths:?}",
+    );
+
+    let times: Vec<NaiveDateTime> = outcome.flashes.iter().map(|f| f.time).collect();
+    assert_eq!(
+        times,
+        vec![in_window + TimeDelta::seconds(10)],
+        "a live poll's returned set is the flashes inside `[as_of - window, \
+         as_of]` and nothing else",
+    );
+    let downloads: Vec<String> = request_paths(&seen)
+        .into_iter()
+        .filter(|p| p.contains(".nc"))
+        .collect();
+    assert_eq!(
+        downloads.len(),
+        1,
+        "a live poll downloaded a granule outside its own window: \
+         {downloads:?}",
+    );
+}
+
+/// **What one poll costs in LIST requests, with its denominator.**
+///
+/// The listing is addressed by `{year}/{doy}/{hour}`, so the cost is the count
+/// of distinct UTC hours `[as_of - window - span, as_of + span]` touches — a
+/// *listing* count, not a download count: [`plan_downloads`] still gates every
+/// GET against the cache, so a wider listing re-downloads nothing already
+/// held.
+///
+/// Per satellite, per 20 s poll (`GlmHandler::auto_poll_interval`):
+///
+/// | posture | span | window | hours | before this fix |
+/// |---|---|---|---|---|
+/// | default Lookback, mid-hour | 3600 | 300 | 3 | 2 |
+/// | default Lookback, just past the hour | 3600 | 300 | 4 | 3 |
+/// | widest Lookback (24 h) at the widest window | 86400 | 1800 | 50 | 26 |
+/// | live | — | 300 | 1–2 | 1–2 |
+///
+/// Both satellites doubles every row: 6–8 LIST per poll at the default
+/// posture, which at one poll per 20 s is 0.3–0.4 LIST/s.
+///
+/// **Floor — `horizon_beyond_the_span`: widen the listing's upper bound past
+/// the span (`let horizon = as_of + span + span;`) in [`fetch_glm_flashes`].**
+/// Observed: every span row reads one hour higher (3→4, 4→5, 50→74) while both
+/// live rows hold, which is what makes this table a cost bound rather than a
+/// transcript.
+#[test]
+fn one_polls_listing_cost_is_the_hours_the_span_touches() {
+    let day = chrono::NaiveDate::from_ymd_opt(2020, 6, 15).unwrap();
+    let mid_hour = day.and_hms_opt(7, 40, 0).unwrap();
+    let past_the_hour = day.and_hms_opt(7, 0, 30).unwrap();
+
+    let mut measured: Vec<(&str, usize, usize)> = Vec::new();
+    for (label, as_of, span, window, expected) in [
+        (
+            "default Lookback, mid-hour: 06:35–08:40Z",
+            mid_hour,
+            Some(SWEEP_SPAN_SECS),
+            SWEEP_WINDOW_SECS,
+            3usize,
+        ),
+        (
+            "default Lookback, just past the hour: 05:55:30–08:00:30Z",
+            past_the_hour,
+            Some(SWEEP_SPAN_SECS),
+            SWEEP_WINDOW_SECS,
+            4,
+        ),
+        (
+            "widest Lookback at the widest window: 06-14 11:30Z – 06-16 12:00Z",
+            day.and_hms_opt(12, 0, 0).unwrap(),
+            Some(86_400),
+            crate::glm::GLM_MAX_TIME_WINDOW_SECS,
+            50,
+        ),
+        ("live, mid-hour", mid_hour, None, SWEEP_WINDOW_SECS, 1),
+        (
+            "live, just past the hour",
+            past_the_hour,
+            None,
+            SWEEP_WINDOW_SECS,
+            2,
+        ),
+    ] {
+        measured.push((label, lists_issued(as_of, span, window), expected));
+    }
+
+    // Every row measured before any is asserted: a widening moves the whole
+    // table, and a report naming only the first row that moved understates it.
+    let table: Vec<String> = measured
+        .iter()
+        .map(|(label, counted, expected)| format!("  {label}: {counted} (want {expected})"))
+        .collect();
+    let wrong: Vec<&str> = measured
+        .iter()
+        .filter(|(_, counted, expected)| counted != expected)
+        .map(|(label, _, _)| *label)
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "LIST requests per poll, per ONE satellite — both satellites doubles \
+         every row, and the poll repeats every 20 s \
+         (`GlmHandler::auto_poll_interval`). {} of {} rows moved \
+         ({wrong:?}):\n{}",
+        wrong.len(),
+        measured.len(),
+        table.join("\n"),
+    );
+}
+
+/// One poll of one satellite against an EMPTY bucket, returning how many LIST
+/// requests it issued. Empty because a listing that names no key downloads
+/// nothing, so every recorded request is a listing.
+fn lists_issued(as_of: NaiveDateTime, span_secs: Option<u64>, window_secs: f64) -> usize {
+    let (sources, seen) = s3_archive(Vec::new());
+    let mut cache = GlmCache::default();
+    let client = loopback_client();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime
+        .block_on(fetch_glm_flashes(
+            &client,
+            &sources,
+            &[GlmSatellite::GoesEast],
+            window_secs,
+            &[GlmDataLevel::Flash],
+            &mut cache,
+            DepictedWindow { as_of, span_secs },
+        ))
+        .expect("the listing answered");
+    list_paths(&seen).len()
+}
+
+/// **The forward reach against the real bucket.** Everything above is a mock:
+/// nothing else in this suite can catch a prefix the live archive does not
+/// publish, or a forward hour S3 answers differently.
+///
+/// `as_of` is placed five minutes before an hour boundary, so `as_of + span`
+/// lands in the NEXT UTC hour — a genuinely different `{year}/{doy}/{hour}`
+/// prefix, which only a listing bounded by `horizon` ever asks for. Four hours
+/// back, so the archive is settled.
+///
+/// `cargo test -p rustdar-overlays -- --ignored --nocapture live_glm`
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test]
+#[ignore = "hits the live noaa-goes19 GLM S3 bucket"]
+async fn live_glm_listing_reaches_the_hour_ahead_of_the_sample() {
+    use chrono::Timelike;
+    const LIVE_SPAN_SECS: u64 = 600;
+
+    let client = rustdar_source::tls::client(
+        rustdar_source::tls::USER_AGENT,
+        std::time::Duration::from_secs(120),
+    )
+    .build()
+    .expect("client");
+    let sources = DataSources::production();
+
+    let hour = (Utc::now().naive_utc() - TimeDelta::hours(4))
+        .with_minute(0)
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))
+        .expect("truncate to the hour");
+    let as_of = hour - TimeDelta::seconds(300);
+    let horizon = as_of + TimeDelta::seconds(LIVE_SPAN_SECS as i64);
+    assert_ne!(
+        as_of.hour(),
+        horizon.hour(),
+        "the premise: {as_of} + {LIVE_SPAN_SECS}s must cross into the next \
+         UTC hour ({horizon}), or this proves nothing about the forward \
+         prefix",
+    );
+
+    let mut cache = GlmCache::default();
+    let outcome = fetch_glm_flashes(
+        &client,
+        &sources,
+        &[GlmSatellite::GoesEast],
+        GLM_MIN_TIME_WINDOW_SECS,
+        &[GlmDataLevel::Flash],
+        &mut cache,
+        DepictedWindow {
+            as_of,
+            span_secs: Some(LIVE_SPAN_SECS),
+        },
+    )
+    .await
+    .expect("the live listing answered");
+
+    let before = outcome.flashes.iter().filter(|f| f.time < as_of).count();
+    let after = outcome.flashes.iter().filter(|f| f.time > as_of).count();
+    let next_hour = outcome.flashes.iter().filter(|f| f.time >= hour).count();
+    let seen_span: Option<(NaiveDateTime, NaiveDateTime)> = outcome
+        .flashes
+        .iter()
+        .map(|f| f.time)
+        .min()
+        .zip(outcome.flashes.iter().map(|f| f.time).max());
+    println!(
+        "live GLM: as_of {as_of}, horizon {horizon}\n  {} flashes returned: \
+         {before} before as_of, {after} after, {next_hour} in the {:02}Z \
+         hour\n  observed span {seen_span:?}\n  {} flashes held in cache",
+        outcome.flashes.len(),
+        hour.hour(),
+        cache.flash_count(),
+    );
+
+    assert!(
+        before > 0,
+        "the live poll reached nothing behind the sample, so the window \
+         itself is broken and the forward assertion below would prove nothing",
+    );
+    assert!(
+        after > 0,
+        "the live poll returned no flash later than the sampled instant, so \
+         every frame of a real loop ahead of the playhead is blank",
+    );
+    assert!(
+        next_hour > 0,
+        "the live poll never reached the {:02}Z prefix — the hour \
+         `as_of + span` lands in. A listing bounded by the sample stops one \
+         hour short of the loop's newest frames.",
+        hour.hour(),
+    );
+}

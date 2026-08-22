@@ -163,9 +163,10 @@ pub async fn fetch_glm_flashes(
     );
 
     // **The depicted instant, never the wall clock.** `list_glm_files` is
-    // addressed by `{year}/{doy}/{hour}`, so a window ending at `as_of` asks
-    // the archive for the hour the picture is of; on a live pane `as_of` *is*
-    // the wall clock and the request is the one it always was.
+    // addressed by `{year}/{doy}/{hour}`, so a range anchored on `as_of` asks
+    // the archive for the hours the picture is of; on a live pane `as_of` *is*
+    // the wall clock, the span is zero, and the request is the one it always
+    // was.
     let window = TimeDelta::milliseconds((time_window_secs * 1000.0) as i64);
     // **The pane's whole depicted span, not the poll's sampled instant.**
     // Under a loop (or a parked scrub) `as_of` is one sample of a clock that
@@ -178,11 +179,19 @@ pub async fn fetch_glm_flashes(
     let span = TimeDelta::seconds(depicted_span_secs.unwrap_or(0) as i64);
     let start = as_of - window - span;
     let cutoff = start;
-    // Frames *ahead* of the sampled instant are still inside the loop:
-    // granules a previous poll fetched for them must survive this one, and
-    // their flashes must stay in the returned set. Bounded by the span — the
-    // loop's newest frame is at most `span` past any instant inside it. Zero
-    // on a live pane, where the future is empty anyway.
+    // Frames *ahead* of the sampled instant are still inside the loop: the
+    // listing has to reach them, granules a previous poll fetched for them
+    // must survive this one, and their flashes must stay in the returned set.
+    // Bounded by the span — the loop's newest frame is at most `span` past any
+    // instant inside it. Zero on a live pane, where the future is empty
+    // anyway.
+    //
+    // **The listing's upper bound, not only retention's.** A listing that
+    // stopped at the sample downloaded nothing ahead of it, so a poll landing
+    // while the playhead sat on the loop's OLDEST frame covered
+    // `[oldest - window - span, oldest]` — entirely *behind* the loop — and
+    // exactly one frame of the sweep had strikes. Retention alone cannot fix
+    // that: there is nothing held to retain.
     let horizon = as_of + span;
 
     // Anchored on the depicted span for the same reason: an instant-anchored
@@ -199,7 +208,7 @@ pub async fn fetch_glm_flashes(
 
     for &sat in satellites {
         let bucket = sat.bucket(sources);
-        let listing = match list_glm_files(client, sources, bucket, start, as_of).await {
+        let listing = match list_glm_files(client, sources, bucket, start, horizon).await {
             Ok(listing) => listing,
             Err(e) => {
                 log::warn!("GLM: {} listing failed: {e}", sat.display_name());
