@@ -1363,10 +1363,17 @@ impl super::App {
         self.spawn_frame_list_task(task);
     }
 
-    /// Disable radar loop for a pane: resets to single-frame mode.
+    /// Disable a pane's loop: resets its transport layer to single-frame mode.
+    ///
+    /// **The mirror of [`Self::handle_enable_loop`], and addressed the same
+    /// way** (WI-4b). It used to reset radar's slot by name, which on a pane
+    /// whose transport had moved cleared a timeline nobody had armed and left
+    /// the running one running — while the ∞ button, which reads
+    /// `transport_state().is_active()`, stayed lit and re-emitted this same
+    /// action on the next click.
     fn handle_disable_loop(&mut self, pane_idx: usize) {
         if let Some(pane) = self.gui.pane_mut(pane_idx) {
-            *pane.loop_state_mut() = rustdar_egui::pane::LayerTimeState::new();
+            *pane.transport_state_mut() = rustdar_egui::pane::LayerTimeState::new();
         }
         self.loop_mgr.remove_pending(pane_idx);
         if pane_idx < self.render.pane_render.len() {
@@ -2030,15 +2037,20 @@ pub(super) struct LoopScanRequest {
 /// `None` if that pane cannot carry a loop.
 ///
 /// **Two arms, chosen by the transport layer's own time axis.** A layer whose
-/// stamps are all history anchors the range on the pane's current scan and
-/// reaches backward from it. A layer that declares `extends_future` anchors on
-/// the wall clock and reaches forward to its own horizon, so the one rail
-/// carries both the past region and the forecast.
+/// stamps are all history reaches backward; a layer that declares
+/// `extends_future` anchors on the wall clock and reaches forward to its own
+/// horizon, so the one rail carries both the past region and the forecast.
 ///
-/// **A radar scan is a precondition of the backward arm only.** It used to gate
+/// **Either arm arms the transport layer's own timeline** (WI-4b). Radar is
+/// one past-only layer among several, distinguished only by having a site to
+/// end its range at and a geometry to anchor its frames on; on a radar pane
+/// the transport addresses radar and the slot written is radar's own, byte for
+/// byte what it always was.
+///
+/// **A radar scan is a precondition of the radar arm only.** It used to gate
 /// the whole function, which meant a pane with no radar data got no loop at all
-/// no matter which layer its transport addressed — and a model-only pane
-/// legitimately has no scan.
+/// no matter which layer its transport addressed — and a satellite-only or
+/// model-only pane legitimately has no scan.
 fn begin_loop_for_pane(
     panes: &mut [rustdar_egui::pane::PaneState],
     overlays: &mut rustdar_overlays::render::overlay_state::OverlayRegistry,
@@ -2065,14 +2077,26 @@ fn begin_loop_for_pane(
 
     if !extends_future {
         // ── Backward-only ────────────────────────────────────────────────
-        // A pane with no scan loaded has nothing to anchor this arm on.
-        let scan_info = panes.get(pane_idx)?.scan_info.as_ref()?;
-        // The whole site value, so the loop's render-target code and the
-        // coordinates it projects with cannot come from different sites.
-        let radar_site = scan_info.site.clone();
+        // **Where the range ends, and what the timeline is anchored on** —
+        // the whole of what the two backward shapes differ by. Radar's range
+        // ends at the scan the pane is showing, so a pane holding none has
+        // nothing to anchor on; every other past-only layer ends at the wall
+        // clock and needs no scan at all.
+        let radar_anchor = match panes.get(pane_idx)?.scan_info.as_ref() {
+            // The whole site value, so the loop's render-target code and the
+            // coordinates it projects with cannot come from different sites.
+            Some(scan) if layer == known::RADAR => Some((scan.site.clone(), scan.timestamp)),
+            // **The gate, in the arm it belongs to.** It used to sit at the
+            // top of the function, so a pane with no radar data got no loop
+            // at all no matter which layer its transport addressed.
+            None if layer == known::RADAR => return None,
+            _ => None,
+        };
         // The loop ends at this pane's current scan, not at wall clock, so it
-        // covers where the pane is actually looking.
-        let end = scan_info.timestamp;
+        // covers where the pane is actually looking. A layer with no scan to
+        // end at ends at the wall clock, which is the reading its own stamps
+        // are against.
+        let end = radar_anchor.as_ref().map_or(now, |(_, stamp)| *stamp);
 
         // Drop the previous listing's undispatched downloads; they were queued
         // for the loop this call is replacing.
@@ -2084,14 +2108,31 @@ fn begin_loop_for_pane(
         if !view.can_loop() {
             return None;
         }
-        *panes[pane_idx].loop_state_mut() =
-            radar_layer::begin_loop(lookback_secs, &radar_site, view);
 
-        return Some(LoopScanRequest {
-            layer,
-            start: end - chrono::Duration::seconds(lookback_secs as i64),
-            end,
-        });
+        let start = end - chrono::Duration::seconds(lookback_secs as i64);
+        // **The window the listing is asked for, not the lookback** — read
+        // off the range, exactly as the forward arm reads it, so the two arms
+        // cannot drift the way WI-4's did. On a backward range the two are
+        // the same number; that is why the bug could not show here.
+        let span_secs = (end - start).num_seconds().max(0) as u64;
+
+        // **The transport layer's own timeline, not radar's slot.** These are
+        // the same slot whenever `layer` is radar — `transport_state_mut`
+        // resolves through `transport_layer`, which is what `layer` was read
+        // from — so radar arms exactly what it always did. A past-only
+        // non-radar layer used to arm radar's timeline here, with a radar
+        // geometry anchor, and then its own slot sat inactive while nothing
+        // supplied it.
+        *panes[pane_idx].transport_state_mut() = match &radar_anchor {
+            Some((site, _)) => radar_layer::begin_loop(span_secs, site, view),
+            // The placeholder anchor the forward arm uses. A layer with no
+            // geometry reads `""` back through `radar_layer::site` rather
+            // than panicking, which is the answer the arrival filter compares
+            // against.
+            None => rustdar_egui::pane::LayerTimeState::begin(span_secs, view, Box::new(())),
+        };
+
+        return Some(LoopScanRequest { layer, start, end });
     }
 
     // ── Forward-reaching ─────────────────────────────────────────────────
@@ -2305,6 +2346,10 @@ mod loop_pane_tests;
 #[path = "app_fetch/forward_range_tests.rs"]
 #[cfg(test)]
 mod forward_range_tests;
+
+#[path = "app_fetch/backward_loop_tests.rs"]
+#[cfg(test)]
+mod backward_loop_tests;
 
 #[path = "app_fetch/melting_layer_dispatch_tests.rs"]
 #[cfg(test)]
