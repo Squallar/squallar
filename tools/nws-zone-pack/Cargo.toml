@@ -1,0 +1,45 @@
+# An offline measurement instrument, and deliberately NOT a member of the
+# rustdar workspace.
+#
+# `[workspace]` below makes this directory its own workspace root. That is the
+# whole point: `cargo build/test/clippy --workspace` at the repo root does not
+# select it, CI never compiles it, and it adds nothing to any shipped binary.
+# It still depends on the real app crates by path, so the simplifier it
+# measures is the one the app runs, not a copy of it.
+#
+# If this ever becomes a build-time step that produces a shipped artifact, it
+# should move to a harness branch or a release job -- see the report. Do not
+# add it to the root `members` list without that decision being made first.
+[workspace]
+
+[package]
+name = "nws-zone-pack"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# The geo vocabulary: `GeoPolygon = Vec<GeoPolygonRing>`, `GeoPolygonRing =
+# Vec<(f64, f64)>`, ring 0 exterior and the rest holes. Zero dependencies of
+# its own.
+rustdar-geo = { path = "../../rustdar-geo" }
+# `render::geo::simplify_ring` and `types::SIMPLIFY_EPSILON`. The app applies
+# exactly this to every zone on ingest, including the area-preserving epsilon
+# halving that keeps a sub-tolerance atoll on the map; measuring anything else
+# would be measuring a different pipeline.
+rustdar-overlays = { path = "../../rustdar-overlays" }
+# `wire::Reader`, the workspace's bounds-checked, `Option`-returning cursor.
+# The pack reader is built on it so the format is readable through the
+# vocabulary the app already speaks.
+rustdar-source = { path = "../../rustdar-source" }
+# Gzip, for the "on the wire" column of the size table. Same pin as the
+# workspace uses.
+flate2 = "=1.1.9"
+# `--compare-cache` only: the app's on-disk zone cache is JSON, and comparing
+# the pack against it is how "the shapefile draws the same shape the app draws
+# today" stops being an assumption. Same pin as the workspace uses.
+serde_json = "=1.0.151"
+
+[profile.release]
+opt-level = 3
+debug = false
