@@ -14434,3 +14434,269 @@ fn a_pane_with_no_radar_scan_still_moves_when_it_is_scrubbed() {
         "a pane with no scan asked for a radar volume to step from"
     );
 }
+
+// -- WI-11b: the same two colours on the loop rail ------------------------
+//
+// While a loop is running the bar on screen is the frame-index slider, not
+// the archive rail, so the user's sentence is only honoured in that state if
+// this bar breaks too. Its split rule is a different one: the frames are
+// evenly spaced, so there is no change of scale to signal and the break goes
+// where the frames straddle `now`. Every position below is read off what the
+// widget really painted.
+
+/// Frames `step` seconds apart, the `past` oldest of them at or before the
+/// wall clock, offset by half a step so that no frame sits within half a step
+/// of `now`. The count must not depend on how long the harness takes to reach
+/// the render.
+fn loop_frames_straddling_now(total: usize, past: usize, step: i64) -> Vec<crate::pane::LoopFrame> {
+    let now = chrono::Utc::now().naive_utc();
+    (0..total)
+        .map(|i| crate::pane::LoopFrame {
+            timestamp: now + chrono::Duration::seconds((i as i64 - past as i64) * step + step / 2),
+            image: None,
+            render_in_flight: false,
+            render_failed: false,
+        })
+        .collect()
+}
+
+/// Put pane 0 on a running loop of `total` frames, the `past` oldest of them
+/// history. `past == total` is the radar case and the one that must not move.
+fn on_a_running_loop(h: &mut InputHarness, total: usize, past: usize, step: i64) {
+    let pane = h.gui_mut().pane_mut(0).expect("pane 0");
+    *pane.loop_state_mut() = crate::radar_layer::begin_loop(
+        3600,
+        rustdar_radar::sites::get_radar_site("KTLX").expect("KTLX"),
+        rustdar_radar::types::RenderView::PlanView,
+    );
+    pane.loop_state_mut().phase = crate::pane::LoopPhase::Playing;
+    pane.loop_state_mut().frames = loop_frames_straddling_now(total, past, step);
+    pane.park_on_loop_frame(0);
+    h.frames_for(FADE_SETTLED_FRAMES, 0.1);
+    assert!(
+        h.widget_id_probes()
+            .iter()
+            .any(|(name, _)| *name == "timeline_scrubber_loop"),
+        "precondition: a running loop must put the frame-index rail on the \
+         row, or nothing below is about the loop rail at all"
+    );
+}
+
+/// The rail bands the last frame painted inside `scrub`: the shapes at the
+/// slider's own rail geometry, with their fills, in paint order, which is
+/// past then future. A region of no width is not a band, so a rail with only
+/// one region reports one.
+fn loop_rail_bands(h: &InputHarness, scrub: egui::Rect) -> Vec<(egui::Rect, egui::Color32)> {
+    let rail_height = h.slider_rail_height();
+    rail_rects(h, scrub)
+        .into_iter()
+        .filter(|(r, _)| (r.height() - rail_height).abs() < 0.01 && r.width() > 0.0)
+        .collect()
+}
+
+/// **A radar loop's rail is the one bar it always was.**
+///
+/// Every frame of a radar loop is history, so there is no break to draw and
+/// the two-colour path is never entered: one rail-band rect, at egui's own
+/// geometry, in egui's own trough colour, with nothing over it and no
+/// boundary across it. This is the common case - it is what a radar user sees
+/// every time they press the loop button - and it is the one WI-11b must not
+/// disturb.
+#[test]
+fn a_radar_loop_rail_is_the_one_bar_it_always_was() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+    on_a_running_loop(&mut h, 9, 9, 300);
+
+    let scrub = h.timeline().scrubber;
+    assert!(scrub.is_positive(), "precondition: the loop rail is drawn");
+    let rail_height = h.slider_rail_height();
+    let expected = egui::Rect::from_min_max(
+        egui::pos2(scrub.left(), scrub.center().y - rail_height / 2.0),
+        egui::pos2(scrub.right(), scrub.center().y + rail_height / 2.0),
+    );
+
+    let bands = loop_rail_bands(&h, scrub);
+    assert_eq!(
+        bands.len(),
+        1,
+        "a loop with no forecast frame in it painted {} rail-band rects, not \
+         the one egui's own slider paints: {bands:?}",
+        bands.len(),
+    );
+    let (rect, fill) = bands[0];
+    assert!(
+        (rect.left() - expected.left()).abs() < 0.01
+            && (rect.right() - expected.right()).abs() < 0.01,
+        "the loop rail spans {rect:?}, where egui's own spans {expected:?}"
+    );
+    assert_eq!(
+        fill,
+        h.inactive_bg_fill(),
+        "the loop rail is not the trough colour any more, so a radar loop no \
+         longer looks the way it did"
+    );
+    assert!(
+        h.all_segments_in(scrub.expand(2.0)).is_empty(),
+        "a boundary was drawn across a loop rail that has no boundary to draw"
+    );
+}
+
+/// **The loop rail carries the same two colours, broken where the frames
+/// straddle `now`** - in both themes, and the break moves with the frames.
+///
+/// Four things at once, because hand-arming each of them separately is how
+/// this campaign has previously shipped an item whose tests all passed over
+/// absent behaviour:
+///
+/// 1. the break lands between the two frames that straddle the wall clock,
+///    at a position written here from those frames' own handle positions;
+/// 2. one more frame falling behind the clock moves it right by exactly one
+///    frame's width, and nothing else moves;
+/// 3. a loop whose every frame is forecast has no past region at all;
+/// 4. the two fills are mutually visible and come from the live `Visuals`,
+///    so a pair hard-coded for one theme reds the other arm.
+#[test]
+fn the_loop_rail_breaks_where_the_frames_straddle_now() {
+    const TOTAL: usize = 9;
+    const PAST: usize = 5;
+    const STEP: i64 = 300;
+    let spacing = 1.0 / (TOTAL - 1) as f32;
+    // The two frames that straddle now, as fractions of the slider's travel,
+    // and the point midway between them. Written from the frame indices, not
+    // from `loop_rail_split`.
+    let straddle_break = 0.5 * ((PAST - 1) as f32 * spacing + PAST as f32 * spacing);
+
+    for dark in [false, true] {
+        let theme = if dark { "dark" } else { "light" };
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.set_os_theme(dark);
+        h.load_scan("KTLX");
+        on_a_running_loop(&mut h, TOTAL, PAST, STEP);
+
+        // -- 1. the break is between the straddling frames ---------------
+        let scrub = h.timeline().scrubber;
+        let boundary_x = break_x(&h, scrub, straddle_break);
+        let bands = loop_rail_bands(&h, scrub);
+        assert_eq!(
+            bands.len(),
+            2,
+            "{theme}: the loop rail is {} bands, not the two the user asked \
+             for: {bands:?}",
+            bands.len(),
+        );
+        let (past_rect, past_fill) = bands[0];
+        let (future_rect, future_fill) = bands[1];
+        assert!(
+            (past_rect.left() - scrub.left()).abs() < 0.01
+                && (past_rect.right() - boundary_x).abs() < 0.05
+                && (future_rect.left() - boundary_x).abs() < 0.05
+                && (future_rect.right() - scrub.right()).abs() < 0.01,
+            "{theme}: the loop rail's regions are {past_rect:?} and \
+             {future_rect:?}. They must meet at {boundary_x:.2}, midway \
+             between frame {} and frame {PAST} of {TOTAL}. A break pinned at \
+             a fixed 0.70 would sit at {:.2}",
+            PAST - 1,
+            break_x(&h, scrub, crate::ui::NOW_SPLIT),
+        );
+        let segments = h.all_segments_in(scrub.expand(2.0));
+        assert_eq!(
+            segments.len(),
+            1,
+            "{theme}: {} boundary strokes across the loop rail, not one: \
+             {segments:?}",
+            segments.len(),
+        );
+        let (a, b, stroke) = segments[0];
+        assert!(
+            (a.x - boundary_x).abs() < 0.05 && (b.x - boundary_x).abs() < 0.05,
+            "{theme}: the loop rail's boundary is at {a:?}-{b:?}, not at \
+             {boundary_x:.2}"
+        );
+
+        // -- 4. the colours are visible and this theme's own --------------
+        assert_eq!(
+            past_fill,
+            h.inactive_bg_fill(),
+            "{theme}: the loop rail's past region is no longer today's trough"
+        );
+        assert_ne!(
+            past_fill, future_fill,
+            "{theme}: the loop rail's two regions are the same colour, so \
+             there is no denotation between observed and forecast frames at \
+             all"
+        );
+        assert_ne!(
+            stroke.color, past_fill,
+            "{theme}: the boundary is invisible"
+        );
+        assert_ne!(
+            stroke.color, future_fill,
+            "{theme}: the boundary is invisible against the forecast region"
+        );
+        let separation = i32::from(past_fill.r()) - i32::from(future_fill.r());
+        assert!(
+            separation.abs() >= 8,
+            "{theme}: the loop rail's regions differ by {separation} of 255, \
+             which is not a denotation a reader can see"
+        );
+        // The direction is this theme's: the forecast region recedes toward
+        // the window fill, which is lighter in one theme and darker in the
+        // other. A hard-coded pair cannot be right in both.
+        assert_eq!(
+            future_fill.r() > past_fill.r(),
+            !dark,
+            "{theme}: the forecast region must recede toward this theme's own \
+             window fill ({} -> {})",
+            past_fill.r(),
+            future_fill.r(),
+        );
+
+        // -- 2. the break tracks the frames ------------------------------
+        // Every frame one step earlier is what the wall clock passing one
+        // more frame looks like from the rail.
+        {
+            let pane = h.gui_mut().pane_mut(0).expect("pane 0");
+            for frame in &mut pane.loop_state_mut().frames {
+                frame.timestamp -= chrono::Duration::seconds(STEP);
+            }
+        }
+        h.frames_for(2, 0.1);
+        let scrub = h.timeline().scrubber;
+        let rolled = loop_rail_bands(&h, scrub);
+        assert_eq!(rolled.len(), 2, "{theme}: the rolled loop is {rolled:?}");
+        let moved = rolled[0].0.right() - boundary_x;
+        let one_frame = spacing * crate::ui::slider_travel_px(scrub, h.handle_shape());
+        assert!(
+            (moved - one_frame).abs() < 0.1,
+            "{theme}: the clock passing one more frame moved the break \
+             {moved:.2} pt, from {boundary_x:.2} to {:.2}. One frame's width \
+             is {one_frame:.2} pt",
+            rolled[0].0.right(),
+        );
+
+        // -- 3. a loop that is all forecast has no past region ------------
+        on_a_running_loop(&mut h, TOTAL, 0, STEP);
+        let scrub = h.timeline().scrubber;
+        let all_future = loop_rail_bands(&h, scrub);
+        assert_eq!(
+            all_future.len(),
+            1,
+            "{theme}: a loop whose every frame is forecast painted {} \
+             regions, not the one: {all_future:?}",
+            all_future.len(),
+        );
+        let (rect, fill) = all_future[0];
+        assert_eq!(
+            fill, future_fill,
+            "{theme}: a loop whose every frame is forecast painted its rail \
+             in the past colour"
+        );
+        assert!(
+            (rect.left() - scrub.left()).abs() < 0.01
+                && (rect.right() - scrub.right()).abs() < 0.01,
+            "{theme}: the forecast region covers {rect:?}, not the whole rail \
+             {scrub:?} - the break is not at the far left"
+        );
+    }
+}

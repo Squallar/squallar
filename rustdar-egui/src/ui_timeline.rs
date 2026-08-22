@@ -245,11 +245,65 @@ pub(crate) fn slider_travel_px(rect: egui::Rect, handle_shape: egui::style::Hand
     (rect.width() - 2.0 * slider_end_inset(rect, handle_shape)).max(0.0)
 }
 
-/// **One bar, two colours inside it, meeting at `now`** — the archive rail.
+/// **Where a loop rail's past/future break sits, as a fraction of the
+/// slider's travel** — `None` when there is no break to draw.
+///
+/// **A loop rail is not the archive rail and does not split at
+/// [`NOW_SPLIT`].** Its frames are evenly spaced whatever their stamps are,
+/// so there is no change of seconds per pixel to signal; the colour there
+/// says the simpler, per-frame thing — *which of these frames are observed
+/// and which are forecast*. So the break goes where the frames straddle the
+/// wall clock. A fixed fraction would paint the first 70% of an f00-f48 run
+/// as history, which is a lie about every frame it covers.
+///
+/// **It sits midway between the two frames that straddle `now`.** An
+/// `egui::Slider` over `0..=total-1` puts frame `i`'s handle at `i/(total-1)`
+/// of the travel: the frames are *positions*, not cells, so "the trailing
+/// edge of the last past frame" and "the leading edge of the first future
+/// frame" are the same point, and that point is the midpoint between the two
+/// handle positions. Putting the break on either frame's own position instead
+/// would leave that frame's handle sitting astride the boundary — and that is
+/// exactly the frame whose side the reader most needs to read off.
+///
+/// The three ends of the range, in the order they are decided:
+/// - **no frames, or every frame at or before `now`** — `None`. A radar loop
+///   is always the latter, so it never enters the two-colour path at all and
+///   its rail stays the shape set it has always painted.
+/// - **every frame after `now`** — `0.0`: the break is the rail's own left
+///   edge and there is no past region at all.
+/// - otherwise the midpoint above, which is strictly inside `(0, 1)`.
+///
+/// **The tie is that `valid <= now` is past** — the same `<=` as
+/// [`RailRegions::side_of`] and as `LayerTimeState::qualifying_frame_at`, read
+/// here as a `partition_point` over stamps the loop already keeps in
+/// ascending order, which is the ordering that same lookup depends on.
+///
+/// **The break moves as the cycle rolls**, and that is the accepted cost: it
+/// is a statement about these frames against this instant, so a refetch or a
+/// resample lands it somewhere else. A landmark that held still while the
+/// frames under it changed side would be the wrong landmark.
+pub(crate) fn loop_rail_split(frames: &[LoopFrame], now: chrono::NaiveDateTime) -> Option<f32> {
+    let total = frames.len();
+    let past = frames.partition_point(|frame| frame.timestamp <= now);
+    if past == total {
+        // Every frame is history — and the empty loop, where `0 == 0`.
+        return None;
+    }
+    if past == 0 {
+        return Some(0.0);
+    }
+    // `total >= 2` here: `1 <= past < total`.
+    Some((past as f32 - 0.5) / (total - 1) as f32)
+}
+
+/// **One bar, two colours inside it, meeting at `now`.**
 ///
 /// One `egui::Slider`: one id, one hit target, one continuous drag surface
 /// that a press in either region can cross without letting go. The regions
-/// are paint, not widgets.
+/// are paint, not widgets. Both rails come through here — the archive rail,
+/// where `split` is [`NOW_SPLIT`], and the loop rail, where it is
+/// [`loop_rail_split`] — so the two forms cannot drift apart in colour,
+/// geometry or layering.
 ///
 /// **Why the fills go under the slider rather than over it.** egui paints a
 /// slider as rail, then handle, and the handle's radius is larger than the
@@ -261,20 +315,19 @@ pub(crate) fn slider_travel_px(rect: egui::Rect, handle_shape: egui::style::Hand
 /// travel, its handle or its hit rect. The zero-height rail rect it still
 /// emits covers no pixels.
 ///
-/// **A pane with no forecast region does not come through here at all**: it
-/// takes the untouched widget, with no reserved slots and no style edit, so
-/// its rail is the shape set it has always painted.
-fn paint_two_colour_rail(
+/// **A rail with no break does not come through here at all**: `split` is
+/// `None`, and it takes the untouched widget, with no reserved slots and no
+/// style edit, so its rail is the shape set it has always painted. That is
+/// what keeps a radar pane — archive rail and loop rail both — pixel for
+/// pixel what it was.
+fn paint_split_rail(
     ui: &mut egui::Ui,
-    regions: RailRegions,
-    frac: &mut f32,
+    split: Option<f32>,
+    add_slider: impl FnOnce(&mut egui::Ui) -> egui::Response,
 ) -> egui::Response {
-    let slider = |frac: &mut f32, ui: &mut egui::Ui| {
-        ui.add(egui::Slider::new(frac, 0.0..=1.0).show_value(false))
+    let Some(split) = split else {
+        return add_slider(ui);
     };
-    if !regions.has_future() {
-        return slider(frac, ui);
-    }
 
     let rail_height = ui.spacing().slider_rail_height;
     let corner_radius = ui.visuals().widgets.inactive.corner_radius;
@@ -291,7 +344,11 @@ fn paint_two_colour_rail(
     let future_slot = ui.painter().add(egui::Shape::Noop);
     let boundary_slot = ui.painter().add(egui::Shape::Noop);
     ui.spacing_mut().slider_rail_height = 0.0;
-    let response = slider(frac, ui);
+    let response = add_slider(ui);
+    // Put the style back: the loop rail is added inline beside the transport
+    // buttons and the frame stamp, so the zero must not outlive the widget it
+    // was for.
+    ui.spacing_mut().slider_rail_height = rail_height;
 
     let rect = response.rect;
     let rail = egui::Rect::from_min_max(
@@ -301,28 +358,40 @@ fn paint_two_colour_rail(
     // Where the handle sits when it reads `now` — the value position, not the
     // rect's own fraction, so the colour break and the handle land on the
     // same pixel.
+    //
+    // **At either extreme the break is the rail's own edge**, not the
+    // handle's end cap. A loop whose every frame is forecast splits at `0.0`,
+    // and carrying the cap's 5.4 pt in the past colour would draw a past
+    // region onto a rail that has no past frame on it.
     let handle_shape = ui.style().visuals.handle_shape;
-    let break_x = rect.left()
-        + slider_end_inset(rect, handle_shape)
-        + regions.split * slider_travel_px(rect, handle_shape);
+    let break_x = if split <= 0.0 {
+        rect.left()
+    } else if split >= 1.0 {
+        rect.right()
+    } else {
+        rect.left()
+            + slider_end_inset(rect, handle_shape)
+            + split * slider_travel_px(rect, handle_shape)
+    };
 
+    // A region with no width is not painted at all: on a loop whose every
+    // frame is forecast the break is the rail's left edge, and "no past
+    // region" has to be true of the shape set and not only of the pixels.
     let painter = ui.painter();
-    painter.set(
-        past_slot,
-        egui::epaint::RectShape::filled(
-            egui::Rect::from_min_max(rail.min, egui::pos2(break_x, rail.max.y)),
-            corner_radius,
-            past_fill,
-        ),
-    );
-    painter.set(
-        future_slot,
-        egui::epaint::RectShape::filled(
-            egui::Rect::from_min_max(egui::pos2(break_x, rail.min.y), rail.max),
-            corner_radius,
-            future_fill,
-        ),
-    );
+    let past_rect = egui::Rect::from_min_max(rail.min, egui::pos2(break_x, rail.max.y));
+    if past_rect.width() > 0.0 {
+        painter.set(
+            past_slot,
+            egui::epaint::RectShape::filled(past_rect, corner_radius, past_fill),
+        );
+    }
+    let future_rect = egui::Rect::from_min_max(egui::pos2(break_x, rail.min.y), rail.max);
+    if future_rect.width() > 0.0 {
+        painter.set(
+            future_slot,
+            egui::epaint::RectShape::filled(future_rect, corner_radius, future_fill),
+        );
+    }
     painter.set(
         boundary_slot,
         egui::Shape::LineSegment {
@@ -334,6 +403,18 @@ fn paint_two_colour_rail(
         },
     );
     response
+}
+
+/// The archive rail's call into [`paint_split_rail`]: `now` sits at
+/// [`RailRegions::split`], and a pane with no forecast region has no break.
+fn paint_two_colour_rail(
+    ui: &mut egui::Ui,
+    regions: RailRegions,
+    frac: &mut f32,
+) -> egui::Response {
+    paint_split_rail(ui, regions.has_future().then_some(regions.split), |ui| {
+        ui.add(egui::Slider::new(frac, 0.0..=1.0).show_value(false))
+    })
 }
 
 /// Slider width for the row-2 tuning sliders — modest, so lookback and speed
@@ -1005,11 +1086,20 @@ impl super::Gui {
             .filter(|&total| total > 0);
 
         if let Some(total) = loop_frames {
+            // The same bar in the same two colours as the archive form, split
+            // on the rule a frame-index rail carries: where the frames
+            // straddle `now`. A loop with no forecast frame in it - every
+            // radar loop - answers `None` and paints exactly what it did.
+            let split = loop_rail_split(
+                &self.panes[pane_idx].transport_state().frames,
+                chrono::Utc::now().naive_utc(),
+            );
             let seek = ui
                 .push_id("scrub_loop", |ui| {
                     let mut frame_idx = self.panes[pane_idx].transport_state().current_frame();
-                    let seek = ui
-                        .add(egui::Slider::new(&mut frame_idx, 0..=(total - 1)).show_value(false));
+                    let seek = paint_split_rail(ui, split, |ui| {
+                        ui.add(egui::Slider::new(&mut frame_idx, 0..=(total - 1)).show_value(false))
+                    });
                     if seek.changed() {
                         for pane_idx in self.loop_sync_targets() {
                             actions.push(GuiAction::SeekLoopFrame {
@@ -1288,6 +1378,7 @@ impl super::Gui {
             // nearest frame is where the handle belongs.
             let current_frame = ls.current_frame();
             let frame_time = ls.playhead_stamp();
+            let frame_split = loop_rail_split(&ls.frames, chrono::Utc::now().naive_utc());
 
             if fetching {
                 ui.horizontal(|ui| {
@@ -1349,8 +1440,12 @@ impl super::Gui {
 
                     ui.spacing_mut().slider_width = (ui.available_width() * 0.5).clamp(60.0, 240.0);
                     let mut frame_idx = current_frame;
-                    let seek = ui
-                        .add(egui::Slider::new(&mut frame_idx, 0..=(total - 1)).show_value(false));
+                    // Row 2's seek is the same frame-index rail as row 1's,
+                    // and the two are on screen together whenever the
+                    // expander is open, so it carries the same break.
+                    let seek = paint_split_rail(ui, frame_split, |ui| {
+                        ui.add(egui::Slider::new(&mut frame_idx, 0..=(total - 1)).show_value(false))
+                    });
                     #[cfg(test)]
                     {
                         row2.seek = seek.rect;
