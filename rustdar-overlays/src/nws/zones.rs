@@ -640,6 +640,13 @@ mod tests {
         }
     }
 
+    /// Spelled out at every call, because the alternative reads the
+    /// process-wide slot — and a pack another test in this binary installed
+    /// would silently resolve a zone this one arranged to fail. That is not
+    /// hypothetical: it turned two of the tests below red the first time the
+    /// whole suite ran together.
+    const NO_PACK: Option<&ZonePack> = None;
+
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -663,10 +670,11 @@ mod tests {
             .collect();
         let mut alerts = vec![zone_alert("a", urls)];
 
-        let resolution = runtime().block_on(resolve_zone_geometries(
+        let resolution = runtime().block_on(resolve_zone_geometries_from(
             &loopback_client(),
             &mut alerts,
             None,
+            NO_PACK,
         ));
 
         assert_eq!(alerts[0].features.len(), 3, "all three counties must draw");
@@ -704,10 +712,11 @@ mod tests {
             ],
         )];
 
-        let resolution = runtime().block_on(resolve_zone_geometries(
+        let resolution = runtime().block_on(resolve_zone_geometries_from(
             &loopback_client(),
             &mut alerts,
             None,
+            NO_PACK,
         ));
 
         assert!(
@@ -760,10 +769,11 @@ mod tests {
                 .collect(),
         )];
 
-        let resolution = runtime().block_on(resolve_zone_geometries(
+        let resolution = runtime().block_on(resolve_zone_geometries_from(
             &loopback_client(),
             &mut alerts,
             None,
+            NO_PACK,
         ));
 
         assert_eq!(
@@ -804,10 +814,11 @@ mod tests {
             zone_alert("b", vec![format!("{base}/zones/county/OKC001")]),
         ];
 
-        let resolution = runtime().block_on(resolve_zone_geometries(
+        let resolution = runtime().block_on(resolve_zone_geometries_from(
             &loopback_client(),
             &mut alerts,
             None,
+            NO_PACK,
         ));
 
         assert_eq!(resolution.alerts_complete, 1);
@@ -831,10 +842,11 @@ mod tests {
         ));
         let mut alerts = vec![inline];
 
-        let resolution = runtime().block_on(resolve_zone_geometries(
+        let resolution = runtime().block_on(resolve_zone_geometries_from(
             &loopback_client(),
             &mut alerts,
             None,
+            NO_PACK,
         ));
 
         assert_eq!(
@@ -853,10 +865,11 @@ mod tests {
         )]));
         let mut alerts = vec![zone_alert("a", vec![format!("{base}/zones/county/OKC000")])];
 
-        let resolution = runtime().block_on(resolve_zone_geometries(
+        let resolution = runtime().block_on(resolve_zone_geometries_from(
             &loopback_client(),
             &mut alerts,
             None,
+            NO_PACK,
         ));
 
         assert_eq!(resolution.failures, vec![(ZoneFailure::NoBoundary, 1)]);
@@ -964,10 +977,11 @@ mod tests {
     #[test]
     fn a_round_with_no_zone_alerts_reports_nothing() {
         let mut alerts: Vec<NwsAlert> = Vec::new();
-        let resolution = runtime().block_on(resolve_zone_geometries(
+        let resolution = runtime().block_on(resolve_zone_geometries_from(
             &loopback_client(),
             &mut alerts,
             None,
+            NO_PACK,
         ));
         assert_eq!(resolution, ZoneResolution::default());
         assert_eq!(resolution.completeness().status_mark(), None);
