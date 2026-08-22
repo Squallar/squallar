@@ -109,8 +109,9 @@ pub const MAX_PANES_MOBILE: usize = 4;
 
 /// What one CONUS grid costs, as [`grid_bytes`] counts it: 1799 × 1059 =
 /// 1,905,141 `f32`, on a `Lambert` coordinate arm that adds nothing. Measured
-/// 2026-08-21; `the_conus_figure_is_what_grid_bytes_counts` is what keeps it
-/// from drifting away from the function.
+/// 2026-08-21; the opening assertion of
+/// `the_byte_budget_holds_at_least_one_grid_per_pane` is what keeps it from
+/// drifting away from the function.
 pub const HRRR_CONUS_GRID_BYTES: usize = 1799 * 1059 * 4;
 
 /// **The floor, as a build failure.** A budget below one grid per pane starves
