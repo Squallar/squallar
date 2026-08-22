@@ -53,6 +53,8 @@ fn deliver(app: &mut crate::app::App, ctx: &egui::Context, pane_indices: Vec<usi
             pane_indices,
             zoom: 32,
             hit_map: None,
+            // The pane's live raster, not a loop frame's.
+            frame: None,
         })
         .expect("the receiver lives on the App");
     app.poll_overlay_render_results(ctx);

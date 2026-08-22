@@ -1434,6 +1434,7 @@ fn two_panes_hold_different_hrrr_parameters_through_every_read_and_a_reopen() {
         device_scale: 1.0,
         now: clock,
         as_of: clock,
+        frame: None,
     };
     let mut tokens = Vec::new();
     for (idx, parameter) in [(0usize, left), (1usize, right)] {
@@ -1942,6 +1943,7 @@ fn the_you_are_here_marker_follows_the_site_the_pane_moved_to() {
                     device_scale: 1.0,
                     now,
                     as_of: now,
+                    frame: None,
                 },
                 &view.layer(&known::RADAR_SITES),
             )

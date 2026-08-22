@@ -1039,6 +1039,27 @@ pub struct RasterizeContext {
     /// A [`TimeAxis::EventLifetime`] layer filters on this and never on
     /// `now`; a [`TimeAxis::Live`] layer ignores it.
     pub as_of: chrono::NaiveDateTime,
+    /// **The one frame this raster is being made for**, or `None` for the
+    /// pane's own live picture.
+    ///
+    /// A [`TimeAxis::FrameSeries`] layer's picture is *one named frame*, and a
+    /// loop wants several of them at once — so the dispatch that fills a loop
+    /// says which frame each raster is, and [`SourceHandler::prepare_job`]
+    /// reads it instead of the pane's current selection. `None` is the live
+    /// dispatch and every handler must then behave exactly as it did before
+    /// this field existed.
+    ///
+    /// **Not [`Self::as_of`], and the difference is not cosmetic.** `as_of` is
+    /// a bare instant: it cannot name the run a forecast frame came from, and
+    /// [`FrameStamp`] carries `run` precisely because two runs both publish a
+    /// grid valid at the same instant. `as_of` is also the *pane's* depicted
+    /// instant — on a live pane it is the wall clock — so a handler selecting
+    /// its grid from it would change what a pane that is not looping at all
+    /// draws.
+    ///
+    /// [`TimeAxis::FrameSeries`]: crate::time::TimeAxis::FrameSeries
+    /// [`FrameStamp`]: crate::time::FrameStamp
+    pub frame: Option<crate::time::FrameStamp>,
 }
 
 // `Send` on native because `tokio::spawn` requires `Send + 'static`; not on

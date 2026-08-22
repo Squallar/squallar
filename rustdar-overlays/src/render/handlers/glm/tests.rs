@@ -1586,6 +1586,7 @@ fn the_glm_job_ages_flashes_from_the_depicted_instant_not_the_wall_clock() {
                 device_scale: 1.0,
                 now: wall,
                 as_of: depicted,
+                frame: None,
             },
             &PaneRef::bare(0),
         )

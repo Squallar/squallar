@@ -198,6 +198,16 @@ pub(super) const FRAME_PUMP: &[DrainEntry] = &[
         drains: &[],
         run: super::render::pump_dispatch_loop_renders,
     },
+    // Radar's loop fills itself from volumes it owns; every other animating
+    // layer's frame is a texture, and this is what asks for one. After
+    // `dispatch_loop_renders` for the same reason that one is last: it spends
+    // the loop byte allowance, and it measures what is left.
+    DrainEntry {
+        name: "dispatch_overlay_loop_renders",
+        phase: PumpPhase::Dispatch,
+        drains: &[],
+        run: super::render::pump_dispatch_overlay_loop_renders,
+    },
 ];
 
 fn pump_poll_scan_results(app: &mut App, _ctx: Option<&egui::Context>) {

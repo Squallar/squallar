@@ -4,7 +4,7 @@ use crate::render_dispatch::CachedPaneRender;
 use egui_wgpu::wgpu;
 use rustdar_device_profile::constants::{
     DEFAULT_LOOP_SPEED_FPS, MAX_LOOP_SECTION_CUTS_PER_FRAME, MAX_LOOP_SPEED_FPS,
-    MAX_LOOP_VOLUME_BUILDS_PER_FRAME, MIN_LOOP_SPEED_FPS,
+    MAX_LOOP_VOLUME_BUILDS_PER_FRAME, MAX_OVERLAY_LOOP_RENDERS_PER_PASS, MIN_LOOP_SPEED_FPS,
 };
 use rustdar_egui::actions::GuiAction;
 use rustdar_egui::pane::{BroadcastSweep, ELEVATION_TOLERANCE, RenderTarget};
@@ -842,6 +842,16 @@ impl super::App {
         while let Ok(mut resp) = self.channels.overlay_render_receiver.try_recv() {
             let id = resp.overlay_kind.clone();
 
+            // **One loop frame's raster, filed on the frame that asked** — the
+            // whole of the WI-6b arrival, taken before the live path's
+            // bookkeeping because none of it applies: the in-flight mark this
+            // answers is the frame's, not the pane's, and this raster is not a
+            // candidate for the pane's overlay cache at all.
+            if let Some(stamp) = resp.frame {
+                self.file_overlay_loop_frame(ctx, &id, stamp, resp);
+                continue;
+            }
+
             // Narrow the result to the panes that still draw this layer, and do
             // it **before the upload**.
             let gui = &mut self.gui;
@@ -894,6 +904,73 @@ impl super::App {
                 } else {
                     cache.hold(data, None);
                 }
+            }
+        }
+    }
+
+    /// **File one loop frame's finished raster** (WI-6b).
+    ///
+    /// **Found by stamp, never by the index it was dispatched at.** A render is
+    /// in the air for frames at a time, and the list underneath it can be
+    /// re-listed or re-sampled (`cap_frames`) while it flies; the index would
+    /// then name a different instant. Two frames never share a timestamp, so
+    /// the stamp is the identity that survives — see
+    /// `LayerTimeState::frame_at_stamp_mut`.
+    ///
+    /// **One upload per response, and that is the picture's identity.** Two
+    /// frames at two stamps are two responses carrying two `ColorImage`s and
+    /// therefore two distinct `TextureHandle`s. Nothing here can hand two
+    /// frames the same handle, which is the last thing
+    /// `a_forecast_loops_frames_each_get_their_own_picture_end_to_end` asserts.
+    ///
+    /// A response with no picture retires the frame the same way radar's does:
+    /// `render_failed` is terminal, and it is what lets `render_set_settled`
+    /// promote a loop out of `Rendering` instead of hanging there for a frame
+    /// that will never arrive.
+    fn file_overlay_loop_frame(
+        &mut self,
+        ctx: &egui::Context,
+        id: &rustdar_source::id::LayerId,
+        stamp: rustdar_source::time::FrameStamp,
+        resp: crate::channels::OverlayRenderResponse,
+    ) {
+        let uploaded = resp.image.map(|image| {
+            self.texture_counter += 1;
+            let [width, height] = image.size;
+            let name = format!("overlay_loop_{}", self.texture_counter);
+            let texture = ctx.load_texture(name, image, egui::TextureOptions::LINEAR);
+            (texture, width as u32, height as u32)
+        });
+        for pane_idx in resp.pane_indices {
+            let Some(pane) = self.gui.pane_mut(pane_idx) else {
+                continue;
+            };
+            let Some(frame) = pane.time_state_mut(id).frame_at_stamp_mut(stamp.valid) else {
+                // The loop was rebuilt or torn down while this flew. Nothing to
+                // file it to, and nothing to un-mark either.
+                continue;
+            };
+            frame.render_in_flight = false;
+            match &uploaded {
+                Some((texture, width, height)) => {
+                    frame.image = Some(rustdar_egui::pane::LoopFrameImage::Overlay(
+                        rustdar_egui::overlay_cache::OverlayTextureData {
+                            texture: texture.clone(),
+                            placed: rustdar_geo::PlacedRaster::of(resp.geo_bounds),
+                            data_generation: resp.generation,
+                            render_zoom: resp.zoom,
+                            width: *width,
+                            height: *height,
+                            // Radar's hover payload and radar's hit map: an
+                            // overlay loop frame is a picture and nothing else.
+                            // Hovers are answered by the live layer state,
+                            // which is not what a frame holds.
+                            radar_meta: None,
+                            hit_map: None,
+                        },
+                    ));
+                }
+                None => frame.render_failed = true,
             }
         }
     }
@@ -1749,16 +1826,23 @@ impl super::App {
                     // animating, and it is counted HERE - where the budget is
                     // consumed - not pushed down with it.
                     let animating = pane.animating_layers().count();
-                    let frames: Vec<chrono::NaiveDateTime> = {
+                    // **The listed stamps whole, not just their instants.**
+                    // `FrameStamp::run` is what tells two runs' grids for the
+                    // same valid time apart, and the model layer's
+                    // `frame_target` — the resolver behind both `fetch_frame`
+                    // and the frame-addressed `prepare_job` — answers `None`
+                    // without it. A `LoopFrame` carries only a timestamp, so
+                    // the run has to be carried alongside rather than read
+                    // back off the frame list.
+                    let listed: Vec<rustdar_source::time::FrameStamp> = {
                         let view = pane.view(pane_idx);
                         let pane_ref = view.layer(&layer);
                         overlays
                             .list_frames(&layer, &config, &pane_ref, range)
                             .frames
-                            .iter()
-                            .map(|frame| frame.valid)
-                            .collect()
                     };
+                    let frames: Vec<chrono::NaiveDateTime> =
+                        listed.iter().map(|frame| frame.valid).collect();
                     let Some(site) = site.as_deref() else {
                         // -- Every layer but radar --------------------------
                         // The cap is a byte division rather than radar's
@@ -1791,9 +1875,17 @@ impl super::App {
                             pane_idx,
                             ls.render_set_indices(budget)
                                 .into_iter()
-                                .map(|idx| rustdar_source::time::FrameStamp {
-                                    valid: ls.frames[idx].timestamp,
-                                    run: None,
+                                .map(|idx| {
+                                    let valid = ls.frames[idx].timestamp;
+                                    // The stamp the LAYER named, carried back
+                                    // whole — see `listed` above. The
+                                    // reconstruction is the fallback for a
+                                    // layer whose sampling dropped the row,
+                                    // which cannot happen while the frames come
+                                    // from `listed` itself.
+                                    listed.iter().copied().find(|f| f.valid == valid).unwrap_or(
+                                        rustdar_source::time::FrameStamp { valid, run: None },
+                                    )
                                 })
                                 .collect(),
                         ));
@@ -2254,16 +2346,16 @@ impl super::App {
                     // `frames_resident`, which is why a frame whose data HAS
                     // landed does not read as settled: it is owed a texture.
                     //
-                    // **Nothing produces that texture yet, and this is where
-                    // it shows.** WI-6 landed the far end - a frame can hold
-                    // an `Overlay` picture and the map paints it - but no
-                    // production path builds one: `spawn_overlay_render`
-                    // rasterizes whichever grid the pane's own selection names
-                    // (`prepare_job` -> `grid_of`), never a named stamp, and
-                    // `OverlayRenderResponse` carries no stamp to file one
-                    // under. Until a frame-addressed rasterize exists, a
-                    // non-radar loop with every grid resident stays in
-                    // `Rendering` and its map goes empty rather than stale.
+                    // **What produces that texture is
+                    // `dispatch_overlay_loop_renders`** (WI-6b), which runs in
+                    // `Dispatch` after this pass has read the phase: a frame
+                    // whose data is resident and whose picture is missing is
+                    // exactly what it asks for, carrying the stamp so
+                    // `prepare_job` rasterizes that frame rather than the
+                    // pane's current selection. Until that answer lands the
+                    // frame is owed a texture and this reads unsettled, which
+                    // is why a loop still filling stays in `Rendering` and its
+                    // map goes empty rather than stale.
                     //
                     // *still arriving* is `true`, and deliberately not
                     // `false`. It is the only thing standing between a loop
@@ -2318,13 +2410,16 @@ impl super::App {
         // Collect readiness status for all panes with active loops
         let mut ready_panes: Vec<usize> = Vec::new();
         let mut not_ready_panes: Vec<usize> = Vec::new();
-        for idx in 0..pane_count {
-            if self.gui.pane_cannot_loop(idx) {
+        // The slice walk, not `0..pane_count` with a `pane(idx)` inside it:
+        // proven to visit the same panes (WI-0, pinned by
+        // `the_index_walk_and_the_slice_walk_visit_the_same_panes`) and one
+        // fewer reach through the seam. `pane_cannot_loop(idx)` was
+        // `pane(idx).is_some_and(|p| !p.can_loop())`, so an index with no pane
+        // fell through it and was dropped by the very next line either way.
+        for (idx, pane) in self.gui.panes().iter().enumerate() {
+            if !pane.can_loop() {
                 continue;
             }
-            let Some(pane) = self.gui.pane(idx) else {
-                continue;
-            };
             let ls = pane.transport_state();
             if !ls.is_active() {
                 continue;
@@ -2522,6 +2617,148 @@ impl super::App {
         crate::budget_memo::remember_steps(self.platform.kv().as_deref(), stepped);
     }
 
+    /// **One raster per loop frame of a non-radar layer that has none** — the
+    /// producer for [`LoopFrameImage::Overlay`] (WI-6b).
+    ///
+    /// [`LoopFrameImage::Overlay`]: rustdar_egui::pane::LoopFrameImage::Overlay
+    ///
+    /// Radar's loop fills itself from decoded volumes it owns; every other
+    /// animating layer's frame is a texture, and the only thing that makes one
+    /// is `spawn_overlay_render`. This walks the frames that are missing one
+    /// and asks for exactly those.
+    ///
+    /// # What bounds it, and what that costs
+    ///
+    /// **The byte share, re-derived every pass and applied to what is already
+    /// held before anything more is asked for.** `overlay_frames_held` divides
+    /// this pane's slice of the loop pool by what one of *this layer's* frames
+    /// really costs on *this* pane, measured off the live raster
+    /// (`overlay_frame_bytes`). At 1280x960 points and 1x that is a 1920x1440
+    /// texture = **11.06 MB per frame**; at 2x it is 44.24 MB. The wasm pool
+    /// floor is 56 MiB for the whole application, so on wasm at floor with one
+    /// animating layer this buys **5 frames of the 1280x960 pane** and two
+    /// animating layers buy 2 each — the `MIN_LOOP_FRAMES_PER_PANE` floor,
+    /// which `overlay_frames_held` documents itself as exceeding the byte
+    /// bound to honour.
+    ///
+    /// WI-5 already sampled the frame *list* to that figure when the listing
+    /// landed. This re-derives it because **every input moves**: the window can
+    /// be resized (the texture is planned off the pane rect, so `frame_bytes`
+    /// grows with it), `LoopPool` re-plans the allocation at runtime, and a
+    /// second layer can start animating. So the eviction below is not
+    /// belt-and-braces — it is the only thing that gives bytes back when the
+    /// share shrinks under a list that was sized against a larger one.
+    ///
+    /// **These frames are still invisible to `LoopPool`**: `LoopFrameModel` has
+    /// no `overlay` arm and `layer_share` divides frame *count* rather than
+    /// bytes, so the pool cannot price an overlay loop. That is WB-7. Until it
+    /// lands, this is a cap applied where the bytes are spent instead of where
+    /// they are planned, and it is deliberately the same figure WI-5 sampled
+    /// with so the two cannot disagree.
+    ///
+    /// # What it will not do
+    ///
+    /// * **Rasterize a frame whose data is not resident.** The layer's own
+    ///   `frames_resident` is the oracle, and the stamp it answers with — run
+    ///   included — is what the dispatch carries. A frame whose grid has not
+    ///   landed is left alone for a later pass; asking anyway would file the
+    ///   pane's *current* picture into it, which is the whole defect the draw
+    ///   fork exists to prevent.
+    /// * **Invent a viewport.** The geometry comes off the record of this
+    ///   pane's own live raster of this layer. A layer that has never
+    ///   rasterized here has no record and is skipped.
+    /// * **Land on the frame thread.** `spawn_overlay_render` is the same
+    ///   off-thread funnel the live raster goes through. A CONUS HRRR
+    ///   rasterize measured 133 ms median against a 200 ms loop interval, and
+    ///   the cost is projection-bound: the output texture's size is nearly
+    ///   free and the *window* is everything.
+    fn dispatch_overlay_loop_renders(&mut self) {
+        let allocation = self.loop_allocation();
+        let budgets = self.budgets;
+        // Collected before anything is dispatched: `spawn_overlay_render`
+        // takes `&mut self` and the walk below holds the pane slice.
+        let mut asks: Vec<(
+            usize,
+            rustdar_source::id::LayerId,
+            rustdar_source::time::FrameStamp,
+        )> = Vec::new();
+        {
+            let (panes, overlays) = self.gui.visible_panes_and_overlays_mut();
+            for (pane_idx, pane) in panes.iter_mut().enumerate() {
+                // The whole-pane share divides across every layer that is
+                // animating, radar included — the same denominator WI-5 built
+                // the frame list under.
+                let animating = pane.animating_layers().count();
+                let ids: Vec<rustdar_source::id::LayerId> = pane
+                    .animating_layers()
+                    .filter(|slot| slot.id != rustdar_source::id::known::RADAR)
+                    .map(|slot| slot.id.clone())
+                    .collect();
+                if ids.is_empty() {
+                    continue;
+                }
+                pane.hydrate_layer_states(overlays, pane_idx);
+                for id in ids {
+                    if overlays.render_mode(&id)
+                        != Some(rustdar_overlays::render::overlay_state::RenderMode::Texture)
+                    {
+                        continue;
+                    }
+                    let held = overlay_frames_held(
+                        allocation,
+                        overlay_frame_bytes(pane, &id, &budgets),
+                        animating,
+                    );
+                    // Give bytes back before asking for more — see the note on
+                    // the share moving under a list that is already built.
+                    pane.time_state_mut(&id)
+                        .evict_textures_outside_render_set(held);
+                    let resident = {
+                        let view = pane.view(pane_idx);
+                        overlays.frames_resident(&id, &view.layer(&id))
+                    };
+                    let ls = pane.time_state(&id);
+                    if ls.frames.is_empty() {
+                        continue;
+                    }
+                    for idx in ls.render_set_indices(held) {
+                        if asks.len() >= MAX_OVERLAY_LOOP_RENDERS_PER_PASS {
+                            // Out of funnel budget for this pass. Left alone,
+                            // not retired: the next pass asks again, and the
+                            // playhead-outward order means the frames nearest
+                            // the playhead were taken first.
+                            break;
+                        }
+                        let frame = &ls.frames[idx];
+                        if frame.image.is_some() || frame.render_in_flight || frame.render_failed {
+                            continue;
+                        }
+                        // The layer's own stamp, not one rebuilt from the
+                        // frame's timestamp: `FrameStamp::run` is what
+                        // separates two runs' grids for the same instant, and
+                        // a `LoopFrame` carries only the instant.
+                        let Some(stamp) = resident.iter().find(|s| s.valid == frame.timestamp)
+                        else {
+                            continue;
+                        };
+                        asks.push((pane_idx, id.clone(), *stamp));
+                    }
+                }
+            }
+        }
+        for (pane_idx, id, stamp) in asks {
+            let Some(req) = self.render.overlay_record(pane_idx, &id).cloned() else {
+                continue;
+            };
+            log::debug!(
+                "Loop: pane {pane_idx} asked {} for the frame at {}",
+                id.as_str(),
+                stamp.valid,
+            );
+            self.spawn_overlay_render(vec![pane_idx], id, req, Some(stamp));
+        }
+    }
+
     fn dispatch_loop_renders(&mut self) {
         let allocation = self.observe_loop_demand();
         let budgets = self.budgets;
@@ -2535,15 +2772,26 @@ impl super::App {
         // Panes whose loop is no longer active and whose download queue is
         // therefore serving nobody. Collected for the same borrow reason.
         let mut retire_queues: Vec<usize> = Vec::new();
+        // Panes that cannot loop at all. Separate from `retire_queues` because
+        // that one also releases a 3D loop's resident grid set, and a pane
+        // that was never able to loop has none to release — the index walk
+        // this replaced called `remove_pending` and nothing else for them.
+        let mut drop_pending: Vec<usize> = Vec::new();
         let motion_override = self.render.storm_motion_override_kt();
-        for pane_idx in 0..self.gui.pane_count() {
-            if self.gui.pane_cannot_loop(pane_idx) {
-                self.loop_mgr.remove_pending(pane_idx);
+        let srv_fallback = self.render.srv_fallback();
+        // The slice walk, not `0..pane_count` with a `pane_mut(idx)` inside it:
+        // proven to visit the same panes (WI-0, pinned by
+        // `the_index_walk_and_the_slice_walk_visit_the_same_panes`) and two
+        // fewer reaches through the seam. `pane_cannot_loop(idx)` was
+        // `pane(idx).is_some_and(|p| !p.can_loop())`, so an index naming no
+        // pane was false there and then dropped by `pane_mut` on the next
+        // line — it never reached `remove_pending`, and it still does not.
+        let panes = self.gui.panes_mut();
+        for (pane_idx, pane) in panes.iter_mut().enumerate() {
+            if !pane.can_loop() {
+                drop_pending.push(pane_idx);
                 continue;
             }
-            let Some(pane) = self.gui.pane_mut(pane_idx) else {
-                continue;
-            };
             let Some(product) = rustdar_radar::fields::product_for(&pane.selected_product()) else {
                 continue;
             };
@@ -2554,7 +2802,7 @@ impl super::App {
                     (product == rustdar_radar::types::RadarProduct::StormRelativeVelocity)
                         .then_some(motion_override)
                         .flatten(),
-                    self.render.srv_fallback(),
+                    srv_fallback,
                 )
             });
             // The volume half of the key, for a 3D loop: the ground the frames
@@ -2567,7 +2815,7 @@ impl super::App {
                     (product == rustdar_radar::types::RadarProduct::StormRelativeVelocity)
                         .then_some(motion_override)
                         .flatten(),
-                    self.render.srv_fallback(),
+                    srv_fallback,
                 )
             });
             let ls = pane.loop_state_mut();
@@ -2609,6 +2857,9 @@ impl super::App {
 
             // Evict textures from frames far from the playhead to cap memory usage.
             ls.evict_textures_outside_render_set(loop_render_budget(allocation, ls, &budgets));
+        }
+        for pane_idx in drop_pending {
+            self.loop_mgr.remove_pending(pane_idx);
         }
         for pane_idx in retire_queues {
             self.loop_mgr.remove_pending(pane_idx);
@@ -3285,7 +3536,9 @@ pub(super) fn overlay_frames_held(
 /// created and a loop reads as finished before a byte of it has landed. The
 /// layer's own `frames_resident` is the answer, and it is asked of the layer
 /// rather than derived from the frame: a frame's `image` is a *texture*, and
-/// no layer but radar puts one there until the draw fork lands (WI-6).
+/// what puts one there for a non-radar layer is
+/// `App::dispatch_overlay_loop_renders` (WI-6b), which reads this same
+/// residency answer before it asks for a raster at all.
 ///
 /// The stamp comparison is on `valid` alone. `FrameStamp::run` is the
 /// reference time a forecast frame came from — two runs can hold the same
@@ -3986,6 +4239,13 @@ mod loop_dispatch_tests;
 #[cfg(test)]
 mod loop_supply_tests;
 
+/// The producer for a non-radar loop's pictures (WI-6b): one raster per frame
+/// at that frame's own stamp, filed back onto the frame that asked, bounded by
+/// the pane's byte share.
+#[path = "app_render/loop_overlay_render_tests.rs"]
+#[cfg(test)]
+mod loop_overlay_render_tests;
+
 /// The cross-section loop's dispatch, placement and frame-thread pacing.
 #[path = "app_render/loop_section_tests.rs"]
 #[cfg(test)]
@@ -4166,4 +4426,11 @@ pub(super) fn pump_dispatch_section_renders(app: &mut super::App, _ctx: Option<&
 
 pub(super) fn pump_dispatch_loop_renders(app: &mut super::App, _ctx: Option<&egui::Context>) {
     app.dispatch_loop_renders();
+}
+
+pub(super) fn pump_dispatch_overlay_loop_renders(
+    app: &mut super::App,
+    _ctx: Option<&egui::Context>,
+) {
+    app.dispatch_overlay_loop_renders();
 }

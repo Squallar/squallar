@@ -9,10 +9,10 @@
 //! 3. The settle verdict for that layer is the layer's own `frames_resident`,
 //!    not the `|_| false` placeholder WI-2 left behind.
 //!
-//! **Nothing here claims a forecast loop animates.** No layer but radar can
-//! put an image on a `LoopFrame` until the draw fork lands (WI-6), so a loop
-//! built here reaches `Rendering` and stops there. That is the honest state
-//! and it is asserted as such.
+//! **Nothing here claims a forecast loop animates.** This item stops at the
+//! frame list; what puts a picture on one is WI-6's draw fork and WI-6b's
+//! producer, pinned in `loop_overlay_render_tests`. A loop built here reaches
+//! `Rendering` and stops there, and that is asserted as such.
 
 use super::*;
 use rustdar_source::handler::{FetchPayload, PaneRef};
@@ -520,9 +520,9 @@ fn two_animating_layers_each_get_half_the_bytes() {
 /// the point.**
 ///
 /// A frame whose data the layer is holding is **not** settled: it is owed a
-/// texture, and nothing but radar can make one until the draw fork lands
-/// (WI-6). A frame the layer holds nothing for, with nothing being rendered,
-/// **is** settled — there is no more to wait for.
+/// texture, and `dispatch_overlay_loop_renders` (WI-6b) is what makes one. A
+/// frame the layer holds nothing for, with nothing being rendered, **is**
+/// settled — there is no more to wait for.
 ///
 /// Asserted through `update_loop_readiness` and on the phase it leaves behind,
 /// because the phase is the only thing the two answers differ on: one loop,

@@ -158,6 +158,21 @@ pub struct OverlayRenderResponse {
     pub pane_indices: Vec<usize>,
     pub zoom: i32,
     pub hit_map: Option<HitMap>,
+    /// **Which loop frame asked for this raster**, or `None` for the pane's
+    /// live picture.
+    ///
+    /// Echoed straight back off `RasterizeContext::frame`, because a loop
+    /// dispatches several rasters of one layer at once and every other field
+    /// here is identical across them: the layer, the pane, the geometry and
+    /// the zoom are all the same, and without this there is nothing on the
+    /// message that says which of the frames it belongs to.
+    ///
+    /// Filed by **stamp** and never by index — see
+    /// [`LayerTimeState::frame_at_stamp_mut`]. A render is in the air for
+    /// frames at a time and the list can be re-sampled underneath it.
+    ///
+    /// [`LayerTimeState::frame_at_stamp_mut`]: rustdar_egui::pane::LayerTimeState::frame_at_stamp_mut
+    pub frame: Option<rustdar_source::time::FrameStamp>,
 }
 
 pub struct LoopScanDownloadResponse {

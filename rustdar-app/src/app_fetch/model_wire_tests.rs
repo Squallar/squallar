@@ -124,7 +124,7 @@ fn the_model_dispatch_is_a_described_job_of_the_whole_grid() {
 
     let mut app = crate::app::tests::n_pane_app(1, "KTLX");
     seed(&mut app);
-    app.spawn_overlay_render(vec![0], known::MODEL_DATA, a_render_request());
+    app.spawn_overlay_render(vec![0], known::MODEL_DATA, a_render_request(), None);
 
     let posted = taken.lock().unwrap();
     assert_eq!(
@@ -190,7 +190,7 @@ fn a_dead_worker_unwedges_a_model_pane() {
 
     let mut app = crate::app::tests::n_pane_app(1, "KTLX");
     seed(&mut app);
-    app.spawn_overlay_render(vec![0], known::MODEL_DATA, a_render_request());
+    app.spawn_overlay_render(vec![0], known::MODEL_DATA, a_render_request(), None);
     assert_eq!(
         taken.lock().unwrap().len(),
         1,

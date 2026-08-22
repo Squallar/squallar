@@ -196,7 +196,7 @@ fn each_polygon_kind_dispatches_as_a_described_job_of_its_own_input() {
     ] {
         seed(&mut app, &kind);
         let before = taken.lock().unwrap().len();
-        app.spawn_overlay_render(vec![0], kind.clone(), a_render_request());
+        app.spawn_overlay_render(vec![0], kind.clone(), a_render_request(), None);
 
         let posted = taken.lock().unwrap();
         assert_eq!(
@@ -247,7 +247,7 @@ fn a_dead_worker_unwedges_an_alert_pane() {
 
     let mut app = crate::app::tests::n_pane_app(1, "KTLX");
     seed(&mut app, &known::NWS_ALERTS);
-    app.spawn_overlay_render(vec![0], known::NWS_ALERTS, a_render_request());
+    app.spawn_overlay_render(vec![0], known::NWS_ALERTS, a_render_request(), None);
     assert_eq!(
         taken.lock().unwrap().len(),
         1,

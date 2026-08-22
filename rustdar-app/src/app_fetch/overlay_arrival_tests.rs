@@ -244,7 +244,7 @@ fn seeded(
 /// For the counting-sink cases only: that sink takes the job and answers
 /// nothing, so there is no reply to wait for.
 fn record_a_dispatch(app: &mut crate::app::App, idx: usize, id: &LayerId, token: u64) {
-    app.spawn_overlay_render(vec![idx], id.clone(), a_recorded_request(token));
+    app.spawn_overlay_render(vec![idx], id.clone(), a_recorded_request(token), None);
     set_in_flight(app, idx, id, false);
 }
 
@@ -261,7 +261,7 @@ fn record_a_dispatch_and_take_its_reply(
     id: &LayerId,
     token: u64,
 ) {
-    app.spawn_overlay_render(vec![idx], id.clone(), a_recorded_request(token));
+    app.spawn_overlay_render(vec![idx], id.clone(), a_recorded_request(token), None);
     let seed = app
         .channels
         .overlay_render_receiver

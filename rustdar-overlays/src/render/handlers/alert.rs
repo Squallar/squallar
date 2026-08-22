@@ -1416,6 +1416,7 @@ mod tests {
             device_scale: 1.0,
             now: clock,
             as_of: clock,
+            frame: None,
         }
     }
 

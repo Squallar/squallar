@@ -87,11 +87,16 @@ fn no_production_file_pushes_through_a_gui_setter() {
 /// `.gui;` binding — the construct the message below forbids by name. WO-ARREARS
 /// **compile-proved neither is borrow-forced** (a direct reach builds with no
 /// diagnostic) and measured what they hide: `app.rs` reads 37 here and is
-/// really 41, `app_render.rs` reads 102 and is really 103. Shedding them puts
-/// both files above their ceilings, so the shed needs a land that can also
+/// really 41, `app_render.rs` reads 101 here and is really 102. Shedding them
+/// puts both files above their ceilings, so the shed needs a land that can also
 /// shed the difference. The full record, including the crate-wide figure, is
 /// on `arch_ratchets.rs`'s `SELF_GUI_MAX`. It is recorded here too because
 /// **this is the scrape those two bindings defeat**.
+///
+/// `app_render.rs` fell 102 -> 101 at WI-6b, which needed two reaches for the
+/// overlay loop's dispatch and its arrival and paid for them with three: the
+/// index-plus-`pane(idx)` walks in `sync_loop_playback_start` and
+/// `dispatch_loop_renders` became slice walks, on WI-0's proof.
 #[test]
 fn the_gui_coupling_only_ever_shrinks() {
     // Presence control: the scrape reads real, current source. Without it every
@@ -104,7 +109,7 @@ fn the_gui_coupling_only_ever_shrinks() {
     for (name, source, ceiling) in [
         ("app.rs", APP, 37),
         ("app_fetch.rs", APP_FETCH, 42),
-        ("app_render.rs", APP_RENDER, 102),
+        ("app_render.rs", APP_RENDER, 101),
         ("app_chunks.rs", APP_CHUNKS, 13),
     ] {
         let n = collapsed(source).matches(SELF_GUI).count();

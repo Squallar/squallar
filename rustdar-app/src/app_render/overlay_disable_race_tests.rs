@@ -71,6 +71,8 @@ fn deliver(app: &mut crate::app::App, ctx: &egui::Context) {
             pane_indices: vec![0],
             zoom: 32,
             hit_map: None,
+            // The pane's live raster, not a loop frame's.
+            frame: None,
         })
         .expect("the receiver lives on the App");
     app.poll_overlay_render_results(ctx);
@@ -196,6 +198,8 @@ fn a_failed_render_clears_the_in_flight_mark_and_touches_nothing() {
             pane_indices: vec![0],
             zoom: 32,
             hit_map: None,
+            // The pane's live raster, not a loop frame's.
+            frame: None,
         })
         .expect("the receiver lives on the App");
     app.poll_overlay_render_results(&ctx);

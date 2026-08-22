@@ -193,7 +193,7 @@ fn each_hit_map_kind_dispatches_as_a_described_job_of_its_own_input() {
     for kind in [known::STORM_REPORTS, known::LIGHTNING] {
         seed(&mut app, &kind);
         let before = taken.lock().unwrap().len();
-        app.spawn_overlay_render(vec![0], kind.clone(), a_render_request());
+        app.spawn_overlay_render(vec![0], kind.clone(), a_render_request(), None);
 
         let posted = taken.lock().unwrap();
         assert_eq!(
@@ -249,7 +249,7 @@ fn a_delivered_hit_map_resolves_clicks_to_the_dispatched_items() {
             .expect("a seeded hit-map kind captures items");
         assert_eq!(items.len(), 2, "premise: two rows seeded");
 
-        app.spawn_overlay_render(vec![0], kind.clone(), a_render_request());
+        app.spawn_overlay_render(vec![0], kind.clone(), a_render_request(), None);
         let resp = app
             .channels
             .overlay_render_receiver
@@ -334,6 +334,8 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
             pane_indices: vec![0],
             zoom: 32,
             hit_map: None,
+            // The pane's live raster, not a loop frame's.
+            frame: None,
         };
         crate::app::App::overlay_job_deliver(
             "test-deliver",
@@ -456,7 +458,7 @@ fn a_dead_worker_unwedges_a_reports_pane() {
 
     let mut app = crate::app::tests::n_pane_app(1, "KTLX");
     seed(&mut app, &known::STORM_REPORTS);
-    app.spawn_overlay_render(vec![0], known::STORM_REPORTS, a_render_request());
+    app.spawn_overlay_render(vec![0], known::STORM_REPORTS, a_render_request(), None);
     assert_eq!(
         taken.lock().unwrap().len(),
         1,

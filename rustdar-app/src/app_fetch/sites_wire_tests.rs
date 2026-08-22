@@ -60,7 +60,7 @@ fn the_sites_dispatch_is_a_described_job_and_a_dead_worker_unwedges_it() {
     }));
 
     let mut app = crate::app::tests::n_pane_app(1, "KTLX");
-    app.spawn_overlay_render(vec![0], known::RADAR_SITES, a_render_request());
+    app.spawn_overlay_render(vec![0], known::RADAR_SITES, a_render_request(), None);
 
     {
         let posted = taken.lock().unwrap();

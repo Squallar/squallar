@@ -211,6 +211,7 @@ fn rctx() -> RasterizeContext {
         zoom: 7.0,
         now: clock,
         as_of: clock,
+        frame: None,
     }
 }
 

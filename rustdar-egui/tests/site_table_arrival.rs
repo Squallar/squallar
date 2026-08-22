@@ -83,6 +83,7 @@ fn rows_the_layer_would_draw(gui: &Gui) -> Vec<String> {
         device_scale: 1.0,
         now: chrono::Utc::now().naive_utc(),
         as_of: chrono::Utc::now().naive_utc(),
+        frame: None,
     };
     let Some(job) = gui.overlays.prepare_job(
         &known::RADAR_SITES,
