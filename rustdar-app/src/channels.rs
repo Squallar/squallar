@@ -142,11 +142,18 @@ pub struct OverlayRenderResponse {
     /// Already in egui's pixel layout, and already an `Arc`, for the reason
     /// [`RenderedImage::image`] gives — and at the larger of the two sizes: an
     /// overlay texture is planned against the viewport plus overdraw, so it scales
-    /// with the window. At `OVERDRAW_FRACTION` 1.0 a 1920×1080 pane planned
-    /// 5760×3240, 71.2 MiB of `Color32`, whose unmultiply measured 45.5 ms best /
-    /// 47.6 ms median on a 7950X — two fifths of it first-touch paging, since both
-    /// buffers are above glibc's `DEFAULT_MMAP_THRESHOLD_MAX` and so are their own
-    /// `mmap`/`munmap`.
+    /// with the window. At `OVERDRAW_FRACTION` 0.25 a 1920×1080 pane plans
+    /// 2880×1620, 17.8 MiB of `Color32`; a 4K pane plans 5760×3240, 71.2 MiB.
+    ///
+    /// **Nothing on this path divides by alpha.** The polygon rasterisers hand
+    /// over tiny-skia's own premultiplied bytes unconverted — pinned by
+    /// `rustdar_overlays::render::rasterize::alpha_tests` — and
+    /// `App::overlay_job_deliver` wraps them in
+    /// `ColorImage::from_rgba_premultiplied`, which reads that layout rather
+    /// than converting it. The straight-to-premultiplied pass in
+    /// `offload::execute` is left for the gridded rasterisers, the only ones
+    /// still declaring `AlphaMode::Straight`, and runs inside the job rather
+    /// than at delivery.
     ///
     /// `None` is a render that failed, and it must still be sent: this message is
     /// the only thing that clears the named panes' `render_in_flight` marks.

@@ -282,10 +282,15 @@ browser gate proves:
 Measure both separately and never merge the figures.
 
 **WebGL2, never WebGPU.** `rustdar_app::app` pins `Backends::GL` on wasm32 and
-the `webgpu` wgpu feature is deliberately absent on every target — Firefox has
-no stable WebGPU, so compiling it would only add an untested second rendering
-path. `rustdar-gpu/Cargo.toml` is the one feature-chooser for the whole graph;
-read its comments before touching wgpu features anywhere.
+the `webgpu` wgpu feature is deliberately absent on every target. Firefox ships
+stable WebGPU on Windows (141, 2025-07-22) and macOS (145 on Apple Silicon /
+macOS 26+, 147 on all versions); **Linux and Android are still unshipped**, with
+Mozilla expecting Linux during 2026 (W3C gpuweb Implementation Status). Firefox
+governs here and the primary desktop target is Linux, so compiling the backend
+would add an untested second rendering path for a subset of one browser's
+platforms. `rustdar-gpu/Cargo.toml` is the one
+feature-chooser for the whole graph; read its comments before touching wgpu
+features anywhere.
 
 **Generation counters guard against stale results.** `RenderDispatch`
 (`rustdar-app/src/render_dispatch.rs`) keeps a per-site `fetch_generations` map
