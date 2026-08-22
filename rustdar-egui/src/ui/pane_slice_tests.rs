@@ -41,6 +41,139 @@ fn the_pane_slices_never_outrun_the_vector() {
     assert_eq!(gui.panes_mut().len(), 1);
 }
 
+/// **The pin under the pane-loop conversions in `rustdar-app`'s `app_render.rs`.**
+///
+/// Those loops walked `0..gui.pane_count()` and dropped every index whose
+/// `pane`/`pane_mut` answered `None`; they now walk `panes()`/`panes_mut()`
+/// straight. The two forms are interchangeable only if they visit the **same
+/// panes in the same order**, and that is a property of `visible_pane_count`'s
+/// clamp rather than of either accessor alone — so it is asserted here instead
+/// of argued in a comment. Nothing else in the tree checks it: the neighbours
+/// above pin slice *lengths* and no-panic behaviour, which both traversals
+/// satisfy for reasons that have nothing to do with agreeing with each other.
+///
+/// Both skew directions are covered. Production only ever produces the second
+/// one — `set_pane_count` and `load_ui_config` grow the vector before they move
+/// the layout — and the first is the case the clamp exists for.
+#[test]
+fn the_index_walk_and_the_slice_walk_visit_the_same_panes() {
+    /// Both traversals, over all four accessors, identifying panes by a field
+    /// that survives the walk rather than by address.
+    fn walks(gui: &mut Gui) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+        let by_index: Vec<String> = (0..gui.pane_count())
+            .filter_map(|idx| gui.pane(idx))
+            .map(|pane| pane.site().to_string())
+            .collect();
+        let by_slice: Vec<String> = gui
+            .panes()
+            .iter()
+            .map(|pane| pane.site().to_string())
+            .collect();
+
+        let mut by_index_mut: Vec<String> = Vec::new();
+        for idx in 0..gui.pane_count() {
+            if let Some(pane) = gui.pane_mut(idx) {
+                by_index_mut.push(pane.site().to_string());
+            }
+        }
+        let by_slice_mut: Vec<String> = gui
+            .panes_mut()
+            .iter_mut()
+            .map(|pane| pane.site().to_string())
+            .collect();
+
+        (by_index, by_slice, by_index_mut, by_slice_mut)
+    }
+
+    // Direction 1: the layout claims more panes than the vector holds. This is
+    // the case `visible_pane_count`'s `.min` exists for.
+    let mut claimed = Gui::new();
+    claimed.set_pane_count_for_test(2);
+    for (idx, pane) in claimed.panes_mut().iter_mut().enumerate() {
+        pane.set_site(format!("CLAIM{idx}"));
+    }
+    claimed.claim_pane_count_for_test(4);
+    assert_eq!(
+        claimed.pane_count(),
+        4,
+        "precondition: the layout claims four panes"
+    );
+    assert_eq!(
+        claimed.panes().len(),
+        2,
+        "precondition: the vector holds two, so the claim really does outrun it"
+    );
+
+    let (index, slice, index_mut, slice_mut) = walks(&mut claimed);
+    assert_eq!(
+        index, slice,
+        "the index walk and the slice walk visit different panes when the \
+         layout outruns the vector"
+    );
+    assert_eq!(
+        index_mut, slice_mut,
+        "`pane_mut` by index and `panes_mut` visit different panes when the \
+         layout outruns the vector"
+    );
+    assert_eq!(
+        index, index_mut,
+        "the shared and mutable index walks disagree"
+    );
+    assert_eq!(index, ["CLAIM0", "CLAIM1"]);
+    let claimed_len = index.len();
+
+    // Direction 2: the vector holds more panes than the layout shows — what a
+    // split-down leaves behind, and the direction production actually produces.
+    let mut shrunk = Gui::new();
+    shrunk.set_pane_count_for_test(4);
+    for (idx, pane) in shrunk.panes_mut().iter_mut().enumerate() {
+        pane.set_site(format!("SHRINK{idx}"));
+    }
+    shrunk.set_pane_count_for_test(3);
+    assert_eq!(
+        shrunk.pane_count(),
+        3,
+        "precondition: the layout shows three panes"
+    );
+    assert_eq!(
+        shrunk.pane(3).map(|pane| pane.site()),
+        Some("SHRINK3"),
+        "precondition: the fourth pane is still in the vector, reachable by index"
+    );
+
+    let (index, slice, index_mut, slice_mut) = walks(&mut shrunk);
+    assert_eq!(
+        index, slice,
+        "the index walk and the slice walk visit different panes when the \
+         vector outruns the layout"
+    );
+    assert_eq!(
+        index_mut, slice_mut,
+        "`pane_mut` by index and `panes_mut` visit different panes when the \
+         vector outruns the layout"
+    );
+    assert_eq!(
+        index, index_mut,
+        "the shared and mutable index walks disagree"
+    );
+    assert_eq!(index, ["SHRINK0", "SHRINK1", "SHRINK2"]);
+    let shrunk_len = index.len();
+
+    // Non-triviality. A `Gui` holding no panes satisfies every assertion above
+    // vacuously, and two directions of equal length would let one hard-coded
+    // bound stand in for the clamp being correct in either.
+    assert!(
+        claimed_len > 0 && shrunk_len > 0,
+        "both directions must visit at least one pane, or the equality above \
+         is between two empty vectors: {claimed_len}, {shrunk_len}"
+    );
+    assert_ne!(
+        claimed_len, shrunk_len,
+        "the two skew directions must land on different lengths, or a single \
+         fixed bound satisfies both and the clamp is never exercised"
+    );
+}
+
 /// The rects a test clicks are the rects the frame drew, so the helper that
 /// produces them takes the visible slice's bound too. With the raw count it
 /// handed back a rect per *claimed* pane, and a test clicking the last of them
