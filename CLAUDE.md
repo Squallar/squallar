@@ -6,12 +6,22 @@ short list of things that will bite you.
 
 ## Adding a data source
 
-One crate's work: implement `SourceHandler` in `rustdar-overlays` (or `rustdar-radar` for a
-radar network) and register it. Nothing above should need an arm for it. The claim is
-executable — `cargo test -p rustdar-app --test fake_source_acceptance` proves a source
-lights up catalogue, parity walk, draw, its own time axis, config round-trip and the worker
-wire with zero edits outside its crate. If your change makes that test need an edit
-elsewhere, the architecture regressed.
+Mostly one crate's work: implement `SourceHandler` in `rustdar-overlays` (or
+`rustdar-radar` for a radar network) and register it. `ARCHITECTURE.md` §5 is the
+checklist.
+
+**No test proves this any more.** The `fake-source` acceptance suite that asserted "zero
+edits outside its crate" was deleted with the layer it tested on 2026-08-22, and nothing
+replaced it as a gate. What carries the claim now is evidence: three real sources landed in
+August 2026 — SPC Fire Weather (`23df4d92`), MRMS (`4cf3dd7f`), GMGSI (`93e8606d`) — each
+keeping its behaviour inside its own crate. Evidence, not a gate.
+
+And the claim was always narrower than it read: every texture layer that renders through
+the job funnel needs one arm in `App::spawn_overlay_render`
+(`rustdar-app/src/app_fetch.rs`), and all three real sources added a line to it. The fake
+was exempt only because it fell into that match's fallback branch and was never dispatched
+through it. Budget for the registration tax plus that one row; a *new kind* of arm is what
+means the architecture regressed.
 
 ## Rules that fail the build if you break them
 

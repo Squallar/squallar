@@ -27,17 +27,14 @@ pub fn all() -> Vec<Box<dyn SourceHandler>> {
 /// anything else that moves when a registration moves.** A floor computed from
 /// the thing it is meant to floor compares the registry against itself and
 /// cannot fail — the shape that cost this campaign an entire class of pins.
-///
-/// The `cfg!` term is the fake source, which is registered only under
-/// `rustdar-overlays/fake-source`.
 #[cfg(test)]
-pub(crate) const REGISTERED_LAYER_COUNT: usize = 15 + cfg!(feature = "fake-source") as usize;
+pub(crate) const REGISTERED_LAYER_COUNT: usize = 15;
 
 /// **How many FIELDS this build registers — the same hand-kept discipline as
 /// [`REGISTERED_LAYER_COUNT`], one level down.**
 ///
 /// Radar's seventeen products plus the model's twenty-three parameters, MRMS's
-/// two and GMGSI's four, plus the fake source's one when its feature is on.
+/// two and GMGSI's four.
 ///
 /// **Each source is its own summand and stays one**, never folded into a
 /// running total: the sum is the audit trail of which registration each field
@@ -53,8 +50,7 @@ pub(crate) const REGISTERED_LAYER_COUNT: usize = 15 + cfg!(feature = "fake-sourc
 /// recurs verbatim for fields; this constant is the independent second spelling
 /// that keeps the walk's field floor able to fail.
 #[cfg(test)]
-pub(crate) const REGISTERED_FIELD_COUNT: usize =
-    17 + 23 + 2 + 4 + cfg!(feature = "fake-source") as usize;
+pub(crate) const REGISTERED_FIELD_COUNT: usize = 17 + 23 + 2 + 4;
 
 /// The default draw order, bottom to top — every registered layer's id sorted
 /// by `SourceHandler::draw_order_weight`.
@@ -235,9 +231,9 @@ mod controls_parity_tests {
         let kinds: Vec<LayerId> = registry.handlers().map(|h| h.id()).collect();
         assert_eq!(
             kinds.len(),
-            15 + cfg!(feature = "fake-source") as usize,
-            "the registry carries all fifteen handlers - sixteen with the \
-             fake source registered - and the walk below must cover every one"
+            15,
+            "the registry carries all fifteen handlers, and the walk below \
+             must cover every one"
         );
         let ctx = PaneRef::bare(0);
         for kind in kinds {
@@ -261,7 +257,6 @@ mod state_key_tests {
     /// Every name saved handler state has ever been filed under, as a
     /// **literal** list — the self-verifying-inventory discipline: the live
     /// set is checked against it below, so neither side can rot alone.
-    #[cfg(not(feature = "fake-source"))]
     const STATE_KEYS: [&str; 15] = [
         "Gmgsi",
         "ModelData",
@@ -278,29 +273,6 @@ mod state_key_tests {
         "RadarSites",
         "UserLocation",
         "ColorScale",
-    ];
-
-    /// The same fifteen plus the fake source's own key. **A second definition
-    /// rather than a `#[cfg]`'d element**, because `#[cfg]` on an array element
-    /// is not stable.
-    #[cfg(feature = "fake-source")]
-    const STATE_KEYS: [&str; 16] = [
-        "Gmgsi",
-        "ModelData",
-        "Mrms",
-        "SpcOutlook",
-        "SpcFireOutlook",
-        "SpcDiscussions",
-        "NwsAlerts",
-        "StormReports",
-        "Lightning",
-        "Metar",
-        "Radar",
-        "CityLabels",
-        "RadarSites",
-        "UserLocation",
-        "ColorScale",
-        "FakeSource",
     ];
 
     /// **The tripwire on the bytes saved handler state is filed under.**
@@ -370,9 +342,9 @@ mod registry_identity_tests {
     /// **The other half of the rebuilt anti-shrink floor**, and asserted in
     /// ONE direction on purpose: every registered id is in the ledger, never
     /// the reverse. The ledger is append-only and may legitimately name a
-    /// spelling this build does not register — a retired layer, or the fake
-    /// source with its feature off — so the reverse would be a gate that fails
-    /// on correct behaviour.
+    /// spelling nothing registers — `"FakeSource"` is exactly that, a retired
+    /// reservation — so the reverse would be a gate that fails on correct
+    /// behaviour.
     #[test]
     fn every_handlers_id_sits_in_the_ledger() {
         for h in &all() {
@@ -405,8 +377,7 @@ mod registry_identity_tests {
             .iter()
             .map(|h| h.id().as_str().to_string())
             .collect();
-        #[allow(unused_mut)]
-        let mut expected: Vec<&str> = vec![
+        let expected: Vec<&str> = vec![
             "Gmgsi",
             "ModelData",
             "Mrms",
@@ -423,10 +394,6 @@ mod registry_identity_tests {
             "UserLocation",
             "ColorScale",
         ];
-        // Topmost where it is registered, which is deliberate: the fake exists
-        // to be seen, and a proof layer under everything else proves less.
-        #[cfg(feature = "fake-source")]
-        expected.push("FakeSource");
         assert_eq!(
             ids, expected,
             "the weight order drifted from the historical default draw order",
@@ -466,8 +433,7 @@ mod registry_identity_tests {
             typical_step: std::time::Duration::from_secs(300),
             extends_future: false,
         };
-        #[allow(unused_mut)]
-        let mut expected: Vec<(&str, TimeAxis)> = vec![
+        let expected: Vec<(&str, TimeAxis)> = vec![
             ("Gmgsi", TimeAxis::Live),
             ("ModelData", hourly_forecast),
             ("Mrms", TimeAxis::Live),
@@ -484,16 +450,6 @@ mod registry_identity_tests {
             ("UserLocation", TimeAxis::Live),
             ("ColorScale", TimeAxis::Live),
         ];
-        // The fake's step is deliberately neither of the two shipped cadences
-        // — that is the whole reason it declares one.
-        #[cfg(feature = "fake-source")]
-        expected.push((
-            "FakeSource",
-            TimeAxis::FrameSeries {
-                typical_step: std::time::Duration::from_secs(420),
-                extends_future: false,
-            },
-        ));
 
         let mut actual: Vec<(String, TimeAxis)> = all()
             .iter()
@@ -537,39 +493,21 @@ mod registry_identity_tests {
             .collect();
         assert_eq!(
             framed.len(),
-            2 + cfg!(feature = "fake-source") as usize,
+            2,
             "exactly two layers come in stamped frames; a third joining changes \
              which one a pane's clock follows and must be ruled on, not \
-             absorbed. The fake source IS such a third, and this is where that \
-             ruling is written down: it declares a deliberately alien cadence \
-             and sits topmost, so a build that registers it hands it the clock \
-             on purpose — which is the property WO-E10.3 exercises.",
+             absorbed. MRMS and GMGSI are the two standing candidates — both \
+             publish stamped granules and both declare `Live` — and that \
+             ruling has not been made. Registering a third `FrameSeries` layer \
+             without making it is what this pin refuses.",
         );
         framed.sort_by_key(|(_, weight)| *weight);
         // The topmost frame-series layer is what a pane's clock walks.
-        let expected_topmost = if cfg!(feature = "fake-source") {
-            "FakeSource"
-        } else {
-            "Radar"
-        };
         assert_eq!(
-            framed.last().map(|(id, _)| id.as_str()),
-            Some(expected_topmost),
-            "the topmost frame-series layer in the draw order is what a pane's \
-             clock walks",
-        );
-        // Radar above the model holds in BOTH arms: it is the shipped fact,
-        // and the fake must not be able to disturb their relative order.
-        let shipped: Vec<&str> = framed
-            .iter()
-            .map(|(id, _)| id.as_str())
-            .filter(|id| *id != "FakeSource")
-            .collect();
-        assert_eq!(
-            shipped,
+            framed.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
             ["ModelData", "Radar"],
-            "of the layers this app ships, radar is the topmost frame-series \
-             one and the model is below it",
+            "radar is the topmost frame-series layer in the draw order and the \
+             model is below it, so radar is what a pane's clock walks",
         );
         assert!(
             framed[0].1 < framed[1].1,
@@ -648,8 +586,7 @@ mod field_registry_tests {
             super::REGISTERED_FIELD_COUNT,
             "the composed field count moved (radar's seventeen products plus \
              the model's twenty-three parameters, MRMS's two and GMGSI's \
-             four, plus the fake's one where it is registered); re-cut this \
-             pin in the land that changed it",
+             four); re-cut this pin in the land that changed it",
         );
 
         let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
@@ -747,16 +684,6 @@ mod field_registry_tests {
             Some(4),
             "the GMGSI group's size moved",
         );
-        #[cfg(feature = "fake-source")]
-        assert_eq!(
-            counts.get("Fake").copied(),
-            Some(1),
-            "the fake source's group is registered and holds its one field",
-        );
-        assert_eq!(
-            counts.len(),
-            4 + cfg!(feature = "fake-source") as usize,
-            "an unexpected group appeared: {counts:?}",
-        );
+        assert_eq!(counts.len(), 4, "an unexpected group appeared: {counts:?}",);
     }
 }

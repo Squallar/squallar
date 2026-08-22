@@ -258,6 +258,129 @@ fn a_future_builds_config_survives_a_session_with_every_unknown_intact() {
     );
 }
 
+/// **A build reading a file that names a layer it does not register hands the
+/// whole file back byte-for-byte, and keeps doing so across a session.**
+///
+/// The downgrade mechanism, and the reason it needs a *synthetic* id: no real
+/// source can be an unregistered one. `"RetiredExample"` stands in for a layer
+/// a newer build wrote and this one has never heard of — the case a user with
+/// two builds actually hits.
+///
+/// This test arrived with the `fake-source` acceptance suite, which used that
+/// layer's id as the unknown. The layer was deleted on 2026-08-22; the
+/// mechanism was not, so the fixture was re-cut with a plain synthetic id.
+///
+/// **What this adds over its two neighbours.**
+/// [`a_future_builds_config_survives_a_session_with_every_unknown_intact`]
+/// checks unknown *members* one by one, and
+/// [`an_unknown_draw_order_id_survives_in_place_and_is_skipped_at_draw`]
+/// checks position. Only this one asserts the WHOLE file is unchanged, and
+/// only this one carries the unknown slot through a live mutation.
+#[test]
+fn a_config_naming_an_unregistered_layer_is_written_back_byte_preserved() {
+    const FIXTURE: &str = include_str!("fixtures/retired_layer_downgrade.json");
+    /// The id no handler serves.
+    const RETIRED_ID: &str = "RetiredExample";
+    /// A config member of the unknown slot, named once. Arbitrary to this
+    /// build by construction — it cannot regenerate a key it cannot name.
+    const RETIRED_CONFIG_MEMBER: &str = "cool";
+
+    /// Pane 0's layer slot with `id`, out of a saved config.
+    fn slot_named(config: &serde_json::Value, id: &str) -> Option<serde_json::Value> {
+        config["panes"][0]["layer_slots"]
+            .as_array()?
+            .iter()
+            .find(|slot| slot["id"].as_str() == Some(id))
+            .cloned()
+    }
+
+    let store = store_with(FIXTURE);
+    let original: serde_json::Value =
+        serde_json::from_str(FIXTURE).expect("the fixture is valid JSON");
+    let saved_slot = slot_named(&original, RETIRED_ID)
+        .expect("precondition: the fixture carries a slot for the unregistered layer");
+    assert!(
+        saved_slot["config"]
+            .as_object()
+            .is_some_and(|config| !config.is_empty()),
+        "precondition: the unknown slot carries a non-empty config, or \
+         \"preserved\" below is a statement about an empty object",
+    );
+    assert_eq!(
+        saved_slot["config"]["tint"], RETIRED_CONFIG_MEMBER,
+        "precondition: the slot carries a member this build cannot name, so \
+         what is preserved below is content it could not have regenerated",
+    );
+
+    let mut gui = Gui::new();
+    assert!(gui.load_ui_config(&store), "the fixture must load");
+
+    // No handler serves it — the predicate the draw loop skips on, and the
+    // reason the slot is unknown rather than merely disabled.
+    let retired = rustdar_source::id::LayerId::new(RETIRED_ID);
+    assert!(
+        gui.overlays.handler_by_id(&retired).is_none(),
+        "some handler registers {RETIRED_ID}, so this is not the downgrade case",
+    );
+
+    // Direction 1: retained IN the live stack, at the position the file gave
+    // it — mid-list, between Radar and SpcDiscussions, not swept to the end.
+    let live_order: Vec<String> = gui
+        .pane(0)
+        .expect("pane 0")
+        .draw_order_vec()
+        .iter()
+        .map(|id| id.as_str().to_owned())
+        .collect();
+    let file_order: Vec<String> = original["panes"][0]["layer_slots"]
+        .as_array()
+        .expect("layer_slots is a list")
+        .iter()
+        .map(|e| e["id"].as_str().expect("every slot names an id").to_owned())
+        .collect();
+    let at = file_order
+        .iter()
+        .position(|id| id == RETIRED_ID)
+        .expect("asserted present above");
+    assert!(
+        at > 0 && at + 1 < file_order.len(),
+        "precondition: the unknown slot sits mid-list in the fixture, or \
+         \"kept its position\" is satisfied by appending to the tail",
+    );
+    assert_eq!(
+        live_order, file_order,
+        "the loaded stack is not the file's stack - an unknown id must keep \
+         its saved position, and nothing else may move around it",
+    );
+
+    // Direction 2: written back, in place, with its config intact.
+    let saved = gui.ui_config_json().expect("serializable");
+    let round_tripped: serde_json::Value = serde_json::from_str(&saved).expect("valid JSON");
+    assert_eq!(
+        slot_named(&round_tripped, RETIRED_ID).as_ref(),
+        Some(&saved_slot),
+        "the unknown slot did not come back preserved: a build without the \
+         layer rewrote a layer it cannot serve",
+    );
+    assert_eq!(
+        round_tripped, original,
+        "the whole file moved under a build that has no arm for one of its \
+         layers - the reopen is not 1:1 for the user who has both builds",
+    );
+
+    // And it survives a session, not only a load: a layer toggle overwrites
+    // every registered layer's slot state, which is where an unknown one is
+    // most easily dropped.
+    gui.set_overlay_on_pane_for_test(0, &known::CITY_LABELS, true);
+    let after: serde_json::Value =
+        serde_json::from_str(&gui.ui_config_json().expect("serializable")).expect("valid JSON");
+    assert_eq!(
+        slot_named(&after, RETIRED_ID).as_ref(),
+        Some(&saved_slot),
+        "a layer toggle dropped or rewrote the unknown slot",
+    );
+}
+
 /// One unreadable pane costs exactly that pane, restored to defaults **in
 /// its own position** — never dropped, because a pane is a position in a
 /// layout and dropping one renumbers every pane after it.
@@ -473,12 +596,11 @@ fn an_unknown_draw_order_id_survives_in_place_and_is_skipped_at_draw() {
     // list, or "only the default-on ones joined" is not a distinguishable
     // claim.
     // The size a *complete projection* of the registry would have had: the
-    // fifteen registered layers plus the unknown id, sixteen registered where
-    // the fake source is on. The same hand-kept literal this assertion carried
-    // before the rule changed, and still hand-kept rather than read off
-    // `handlers()` — a floor derived from the thing it floors compares the
-    // reconcile against itself and cannot fail.
-    let whole_inventory = 16 + cfg!(feature = "fake-source") as usize;
+    // fifteen registered layers plus the unknown id. The same hand-kept literal
+    // this assertion carried before the rule changed, and still hand-kept
+    // rather than read off `handlers()` — a floor derived from the thing it
+    // floors compares the reconcile against itself and cannot fail.
+    let whole_inventory = 16;
     assert!(
         order.len() > 2 && order.len() < whole_inventory,
         "the file named two layers; a stack of {whole_inventory} would mean \

@@ -41,14 +41,17 @@ jobs:
           # feature in the workspace into a shipped executable, and cargo offers
           # no way for a feature to opt out of it.
           #
-          # It did exactly that. `--all-features` enabled
-          # rustdar-overlays/fake-source, so every desktop download registered a
-          # thirteenth layer called "Fake Source", drew it, and wrote its id into
-          # the user's config. Read out of the binary, not inferred: the same bin
-          # built both ways in one tree carries `FakeSourceHandler` 129 times,
-          # "Fake Source" once and `overlay/fake` 3 times under `--all-features`,
-          # and zero of each under the list below, with "Reflectivity" found 11
-          # times in both as the control that the scan reads something.
+          # It did exactly that. `--all-features` enabled the overlays crate's
+          # test-only `fake-source`, so every desktop download registered a layer
+          # called "Fake Source", drew it, and wrote its id into the user's
+          # config. Read out of the binary, not inferred: the same bin built both
+          # ways in one tree carried `FakeSourceHandler` 129 times, "Fake Source"
+          # once and `overlay/fake` 3 times under `--all-features`, and zero of
+          # each under the list below, with "Reflectivity" found 11 times in both
+          # as the control that the scan reads something. That layer and its
+          # feature were deleted on 2026-08-22, so this particular arm is gone --
+          # but the reason for the explicit list is not, and the next paragraph
+          # is why.
           #
           # It also overrode the workspace's deliberate
           # `nexrad-data = { default-features = false }` and compiled that
@@ -75,10 +78,14 @@ jobs:
           # `--all-features` for the IOKit link; measuring it is what showed the
           # credit was misplaced.
           #
-          # What the list gives up against `--all-features`, from
-          # `cargo metadata --filter-platform`: 18 resolved features -- the
-          # fake-source family (3), nexrad-data's aws arm with bzip2-rs/rayon
-          # (9), and 6 transitive tokio features under them. clippy.yaml still
+          # What the list gives up against `--all-features`, measured with
+          # `cargo metadata --filter-platform` while `fake-source` still existed:
+          # 18 resolved features -- the fake-source family (3, since deleted),
+          # nexrad-data's aws arm with bzip2-rs/rayon (9), and 6 transitive tokio
+          # features under them. The aws arm is the live half, and it is the
+          # reason this list stays: `--all-features` overrode the workspace's
+          # deliberate `default-features = false` on nexrad-data. clippy.yaml
+          # still
           # runs `--all-features` on the host, so what is given up is
           # cross-target compile coverage of those arms, not coverage.
           #

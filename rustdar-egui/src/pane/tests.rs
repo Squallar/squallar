@@ -1645,6 +1645,84 @@ fn the_clock_moves_the_playhead_and_two_layers_land_on_one_instant() {
         TimeMode::AsOf(ts(2)),
         "and the clock did not move"
     );
+
+    // **The walk, and its non-vacuity floor.** One clock stepped across the
+    // whole window rather than sampled at one instant: at every step each
+    // layer must sit on the latest stamp of its OWN list at or before the
+    // clock. The property is restated here from the frame lists, never read
+    // back off the thing under test.
+    //
+    // The floor is the point. Two layers that had quietly been put on one
+    // cadence would satisfy every equality above and below by showing the same
+    // stamp twice, so the walk must find instants where they disagree.
+    //
+    // Ported from the deleted `fake-source` acceptance suite's alien-cadence
+    // criterion, re-pointed at the two layers that really declare
+    // `TimeAxis::FrameSeries` — radar on the volume cadence, the model hourly.
+    //
+    // **The model's grid is re-seeded to start LATE on purpose**, which is the
+    // mixed-span case WI-3's contract is about: at the head of the window the
+    // clock sits before every stamp the model holds, so it must answer
+    // `None` — draw nothing — rather than floor onto its oldest frame. Radar's
+    // grid starts at the window's head, so radar always qualifies, and that
+    // asymmetry is what makes the walk exercise both halves of the contract.
+    let mut late = timeline_at_minutes(6);
+    late.frames.retain(|f| f.timestamp >= ts(2));
+    *pane.time_state_mut(&known::MODEL_DATA) = late;
+
+    const STEPS: u32 = 6;
+    let mut disagreed = 0;
+    let mut model_blank = 0;
+    for minute in 0..STEPS {
+        pane.set_time_mode(TimeMode::AsOf(ts(minute)));
+        let mut shown = Vec::new();
+        for layer in [&known::RADAR, &known::MODEL_DATA] {
+            let state = pane.time_state(layer);
+            // The rule restated from the frame list, never read back off the
+            // thing under test: the latest stamp at or before the clock, and
+            // nothing at all when the layer holds none.
+            let want = state
+                .frames
+                .iter()
+                .map(|f| f.timestamp)
+                .filter(|t| *t <= ts(minute))
+                .max();
+            assert_eq!(
+                state.playhead_stamp(),
+                want,
+                "{layer:?} at minute {minute}: a layer shows the latest stamp \
+                 of its OWN list at or before the pane's clock, and draws \
+                 nothing when it holds none",
+            );
+            shown.push(want);
+        }
+        if shown[1].is_none() {
+            model_blank += 1;
+        }
+        if shown[0] != shown[1] {
+            disagreed += 1;
+        }
+    }
+    assert!(
+        disagreed >= 2,
+        "the two layers showed the same instant at every step of the walk \
+         ({disagreed} disagreements), so the walk cannot tell one clock over \
+         two cadences from one clock over two copies of one cadence",
+    );
+    // The mixed-span floor, both halves: the late layer really did answer
+    // "nothing qualifies" at least once, so the walk reached the case the
+    // contract is about — and it did not answer that always, which would be a
+    // silently blank layer passing as a fixed contract.
+    assert!(
+        model_blank > 0,
+        "the model qualified at all {STEPS} clock positions, so this walk \
+         never reached the empty answer WI-3's contract is about",
+    );
+    assert!(
+        model_blank < STEPS,
+        "the model answered `None` at every one of {STEPS} clock positions - a \
+         blanket blank satisfies the contract and draws an empty map",
+    );
 }
 
 /// **The time-primary layer is the topmost animating one**, read off the draw

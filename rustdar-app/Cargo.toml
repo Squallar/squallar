@@ -12,12 +12,6 @@ edition.workspace = true
 # concrete PlatformBridge. Those live in the rustdar crate, which depends on
 # this crate. Adding a dependency back on it would be a cycle.
 
-[features]
-# Forwarding only -- see the note on `rustdar-egui`'s entry of the same name.
-# Both hops are named because this crate depends on `rustdar-overlays` directly
-# as well as through the UI crate.
-fake-source = ["rustdar-egui/fake-source", "rustdar-overlays/fake-source"]
-
 [dependencies]
 web-time = { workspace = true }
 rustdar-egui = { workspace = true }

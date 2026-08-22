@@ -3,17 +3,6 @@ name = "rustdar-overlays"
 version.workspace = true
 edition.workspace = true
 
-[features]
-# The fake source: a thirteenth layer that exists only so a test build can watch
-# the UI draw a source nothing above it has an arm for.
-#
-# A cargo feature rather than `cfg(test)` **on purpose**: `cfg(test)` is
-# crate-local, so a fake behind it would be invisible to `rustdar-egui` and
-# `rustdar-app`'s test builds -- which are the crates whose product-blindness it
-# exists to demonstrate. Nothing that ships turns this on; `cargo tree -e normal`
-# on the app must never show it.
-fake-source = []
-
 [dependencies]
 web-time = { workspace = true }
 chrono = { workspace = true }

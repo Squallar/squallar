@@ -257,11 +257,11 @@ and *drawn* through the real chrome on every width class. Enforced by
 `..._on_a_medium_screen`, `..._on_an_expanded_screen` — which drives the real
 input harness and records an item as reachable only when its centre lands
 inside the screen rect. A control may be **disabled with a stated reason**; it
-may not be absent. Run the walk in both feature arms:
+may not be absent. The walk derives its layer and field inventories from the
+live registry, so a registered layer is walked by construction:
 
 ```bash
 cargo test -p rustdar-egui parity_walk                    # 3/3, fifteen layers
-cargo test -p rustdar-egui --features fake-source parity_walk   # 3/3, sixteen
 ```
 
 **The web target is measured, never inferred.** A scaled or extrapolated figure
@@ -316,15 +316,33 @@ Then bump the two hand-kept second spellings in `rustdar-egui/src/sources.rs`:
 `LAYER_ID_LEDGER::len()`** — a floor computed from the thing it floors compares
 the registry against itself and cannot fail.
 
-**The executable form of this checklist is the fake source.**
-`rustdar-overlays/src/render/handlers/fake.rs`, behind the `fake-source`
-feature (forwarded by `rustdar-egui/fake-source` and `rustdar-app/fake-source`,
-and enabled by nothing that ships), is a sixteenth layer that exists only so a
-test build can watch a source arrive through the seams. Every count-pin
-downstream is written as `15 + cfg!(feature = "fake-source") as usize`, and
-`sources()` adds exactly one appended registration line under that cfg. If a new
-source needs an arm anywhere the fake source does not have one, the seam is
-incomplete — fix the seam, not the call site.
+**Nothing proves this checklist by construction.** Until 2026-08-22 a
+test-only `fake-source` layer carried an acceptance suite
+(`rustdar-app/tests/fake_source_acceptance.rs` and the UI half in
+`rustdar-egui`) whose footprint pins asserted, file by file, that a new source
+cost no edit outside `rustdar-overlays`. The layer and the suite were deleted
+together and **no gate replaced them**. The checklist above is now design
+intent held by review.
+
+What is left is evidence rather than a gate, and it is weaker than the deleted
+suite claimed. Three real sources landed in August 2026 — SPC Fire Weather
+Outlooks (`23df4d92`), the MRMS national mosaic (`4cf3dd7f`) and the GMGSI
+global mosaic (`93e8606d`). Each kept all of its *behaviour* inside
+`rustdar-overlays`, added no channel, and — because both gridded layers ride
+`GriddedInput` — added no codec row. That is real evidence the seams hold.
+
+**Be precise about what the fake ever proved.** A texture layer that renders
+through the job funnel needs one arm outside its own crate: the described-kinds
+match in `App::spawn_overlay_render` (`rustdar-app/src/app_fetch.rs`), which
+names every such layer by `known::` const. All three real sources above added a
+line to it. The fake escaped that arm only because it fell into the match's
+fallback branch — a build that registered it logged
+`spawn_overlay_render reached the dispatch with a layer it cannot rasterize`
+and drew nothing through the funnel; its draw test wrote a texture straight
+into the pane's overlay cache instead. So "zero edits outside its crate" held
+for the fake and has never held for a real texture source. Treat a *new kind*
+of arm as the signal that a seam is incomplete; the registration tax and the
+`spawn_overlay_render` row are the known, expected cost.
 
 Radar registers itself: `rustdar_radar::source::sources()`, chained by
 `rustdar_egui::sources::all()`. A new source **never adds a channel** — the
