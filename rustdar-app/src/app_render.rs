@@ -1702,10 +1702,20 @@ impl super::App {
     /// (throttled).
     ///
     /// The frames come from the layer, not from the arrival: the listing is
-    /// filed by `apply_frame_listing` under the site it was listed for, and
+    /// filed by `apply_frame_listing` under the scope it was listed for, and
     /// this reads it back through `list_frames` scoped to each pane's own
-    /// site. A pane on another site therefore sees nothing of it, which is
-    /// what keeps two sites' stamps out of one list.
+    /// selection. A pane on another site therefore sees nothing of a radar
+    /// listing, which is what keeps two sites' stamps out of one list.
+    ///
+    /// **Two arms, and the arrival says which** (WI-5). Radar's builds a
+    /// `FramePlan` and hands it to the download manager, which owns its
+    /// volumes and its Level III pairings. Every other layer owns its own
+    /// residency, so its arm asks the layer for one task per frame it means
+    /// to hold and puts them on the wire; the answers land through
+    /// `apply_frame` on the arrival path that already exists.
+    ///
+    /// The two arms share the frame list itself - [`build_loop_frames`] - so
+    /// they cannot sample, order or park differently.
     pub(super) fn accept_loop_scan_listings(&mut self) {
         let arrived = std::mem::take(&mut self.loop_listings_arrived);
         if arrived.is_empty() {
@@ -1714,56 +1724,95 @@ impl super::App {
         let allocation = self.loop_allocation();
         let budgets = self.budgets;
         let config = self.fetch_config();
-        for (site, range) in arrived {
+        for LoopListingArrival { layer, site, range } in arrived {
             let span_secs = (range.1 - range.0).num_seconds();
             let mut built: Vec<(usize, FramePlan, rustdar_radar::types::RadarProduct)> = Vec::new();
+            let mut owed: Vec<(usize, Vec<rustdar_source::time::FrameStamp>)> = Vec::new();
             {
                 let (panes, overlays) = self.gui.panes_and_overlays_mut();
                 for (pane_idx, pane) in panes.iter_mut().enumerate() {
                     // Only a pane still waiting for a listing over this very
-                    // window: two panes looping one site with two spans ask
-                    // two questions, and neither may be answered with the
-                    // other's.
-                    if !pane.loop_state().is_active()
-                        || pane.loop_state().phase
-                            != rustdar_egui::pane::LoopPhase::FetchingScanList
-                        || pane.loop_state().span_secs as i64 != span_secs
-                    {
+                    // window, **on the layer the listing is for**: two panes
+                    // looping one site with two spans ask two questions, and
+                    // neither may be answered with the other's.
+                    let waiting = {
+                        let ls = pane.time_state(&layer);
+                        ls.is_active()
+                            && ls.phase == rustdar_egui::pane::LoopPhase::FetchingScanList
+                            && ls.span_secs as i64 == span_secs
+                    };
+                    if !waiting {
                         continue;
                     }
                     pane.hydrate_layer_states(overlays, pane_idx);
-                    let Some(product) =
-                        rustdar_radar::fields::product_for(&pane.selected_product())
-                    else {
-                        continue;
-                    };
                     // The whole-pane cap divides across the layers this pane is
-                    // animating, and it is counted HERE — where the budget is
-                    // consumed — not pushed down with it.
+                    // animating, and it is counted HERE - where the budget is
+                    // consumed - not pushed down with it.
                     let animating = pane.animating_layers().count();
                     let frames: Vec<chrono::NaiveDateTime> = {
                         let view = pane.view(pane_idx);
-                        let pane_ref = view.layer(&rustdar_source::id::known::RADAR);
+                        let pane_ref = view.layer(&layer);
                         overlays
-                            .list_frames(
-                                &rustdar_source::id::known::RADAR,
-                                &config,
-                                &pane_ref,
-                                range,
-                            )
+                            .list_frames(&layer, &config, &pane_ref, range)
                             .frames
                             .iter()
                             .map(|frame| frame.valid)
                             .collect()
                     };
+                    let Some(site) = site.as_deref() else {
+                        // -- Every layer but radar --------------------------
+                        // The cap is a byte division rather than radar's
+                        // count, because an overlay frame is not a radar
+                        // frame's size.
+                        let frame_bytes = overlay_frame_bytes(pane, &layer, &budgets);
+                        let ls = pane.time_state_mut(&layer);
+                        let Some(stamps) = build_loop_frames(ls, frames, |_| {
+                            overlay_frames_held(allocation, frame_bytes, animating)
+                        }) else {
+                            log::warn!(
+                                "Loop: {} listed no frames in the requested window for \
+                                 pane {pane_idx}; leaving loop mode",
+                                layer.as_str(),
+                            );
+                            *ls = rustdar_egui::pane::LayerTimeState::new();
+                            continue;
+                        };
+                        log::info!(
+                            "Loop: populated {} {} frames for pane {pane_idx}",
+                            stamps.len(),
+                            layer.as_str(),
+                        );
+                        // The whole frame list, in render-set order: it was
+                        // already capped to what the pane's byte share buys,
+                        // so every frame it holds is a frame it means to make
+                        // resident, and the order is the playhead outward.
+                        let budget = ls.frames.len();
+                        owed.push((
+                            pane_idx,
+                            ls.render_set_indices(budget)
+                                .into_iter()
+                                .map(|idx| rustdar_source::time::FrameStamp {
+                                    valid: ls.frames[idx].timestamp,
+                                    run: None,
+                                })
+                                .collect(),
+                        ));
+                        continue;
+                    };
+                    // -- Radar ------------------------------------------------
+                    let Some(product) =
+                        rustdar_radar::fields::product_for(&pane.selected_product())
+                    else {
+                        continue;
+                    };
                     // Whether this listing is still wanted, and what it makes of the
-                    // frame list, is decided in one place — including refusing a
+                    // frame list, is decided in one place - including refusing a
                     // listing for a site the pane's loop has since moved off.
                     let Some(plan) = accept_scan_listing(
                         allocation,
                         &budgets,
                         pane.loop_state_mut(),
-                        &site,
+                        site,
                         frames,
                         animating,
                     ) else {
@@ -1779,7 +1828,7 @@ impl super::App {
                     plan.site,
                     pane_idx
                 );
-                // Store the frame plan — with the site it was listed for — then derive
+                // Store the frame plan - with the site it was listed for - then derive
                 // the queue for whichever datasource this pane's product reads and
                 // dispatch the first batch.
                 self.loop_mgr.set_plan(pane_idx, plan);
@@ -1787,6 +1836,49 @@ impl super::App {
                 self.dispatch_pending_loop_downloads(pane_idx);
                 self.dispatch_pending_loop_l3_pairings(pane_idx);
             }
+            for (pane_idx, stamps) in owed {
+                self.dispatch_loop_frame_fetches(pane_idx, &layer, &config, stamps);
+            }
+        }
+    }
+
+    /// **Ask `layer` for every frame `pane_idx` owes, and put the tasks it
+    /// answers on the wire.**
+    ///
+    /// The layer may decline any of them - `fetch_frame` answers `None` for a
+    /// stamp it already holds, and for one no listing of its own named - and a
+    /// declined frame is simply not fetched rather than being retried here.
+    ///
+    /// **No throttle.** Radar's queue is rate-limited by
+    /// `concurrent_loop_downloads` through its download manager; this dispatches
+    /// the whole render set at once, which is bounded only by the byte cap the
+    /// frame list was built under.
+    fn dispatch_loop_frame_fetches(
+        &mut self,
+        pane_idx: usize,
+        layer: &rustdar_source::id::LayerId,
+        config: &rustdar_overlays::render::overlay_state::FetchConfig,
+        stamps: Vec<rustdar_source::time::FrameStamp>,
+    ) {
+        let tasks = self
+            .with_layer_pane(pane_idx, layer, |overlays, pane_ref| {
+                stamps
+                    .into_iter()
+                    .filter_map(|stamp| {
+                        overlays
+                            .fetch_frame(layer, config, pane_ref, &stamp)
+                            .map(|task| (stamp, task))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        log::info!(
+            "Loop: {} dispatched {} frame fetches for pane {pane_idx}",
+            layer.as_str(),
+            tasks.len(),
+        );
+        for (stamp, task) in tasks {
+            self.spawn_frame_fetch_task(stamp, task);
         }
     }
 
@@ -2104,10 +2196,47 @@ impl super::App {
         let budgets = self.budgets;
         let mut abandoned = Vec::new();
         let loop_mgr = &self.loop_mgr;
-        for (pidx, p) in self.gui.panes_mut().iter_mut().enumerate() {
+        // The visible slice, exactly as `panes_mut()` gives it - the registry
+        // rides along because the residency question below is the layer's to
+        // answer, and a handler needs the pane it is being asked about.
+        let (panes, overlays) = self.gui.visible_panes_and_overlays_mut();
+        for (pidx, p) in panes.iter_mut().enumerate() {
             let mut released = false;
+            // **The residency read, taken before the mutable walk.** Each
+            // non-radar animating layer is asked which of its frames it is
+            // holding; the answers are owned stamps, so the walk below can
+            // borrow the pane mutably while still consulting them.
+            //
+            // **Nothing happens here on a pane animating radar alone**, which
+            // is every pane in this build: no hydrate, no ask, no allocation.
+            // This runs once per frame per pane, and `hydrate_layer_states`
+            // is not free - it republishes the pane's radar selection into its
+            // slot - so it is asked for only when there is something to ask
+            // it about.
+            let ids: Vec<rustdar_source::id::LayerId> = p
+                .animating_layers()
+                .filter(|slot| slot.id != rustdar_source::id::known::RADAR)
+                .map(|slot| slot.id.clone())
+                .collect();
+            let resident: Vec<(rustdar_source::id::LayerId, Vec<chrono::NaiveDateTime>)> =
+                if ids.is_empty() {
+                    Vec::new()
+                } else {
+                    p.hydrate_layer_states(overlays, pidx);
+                    let view = p.view(pidx);
+                    ids.into_iter()
+                        .map(|id| {
+                            let stamps = overlays
+                                .frames_resident(&id, &view.layer(&id))
+                                .into_iter()
+                                .map(|stamp| stamp.valid)
+                                .collect();
+                            (id, stamps)
+                        })
+                        .collect()
+                };
             // Asked of every layer that is animating, not of the radar slot by
-            // name (WI-2) — pinned by
+            // name (WI-2) - pinned by
             // `the_readiness_walk_settles_every_animating_layer_not_only_radar`.
             for slot in p.animating_layers_mut() {
                 let budget = loop_render_budget(allocation, &slot.time, &budgets);
@@ -2115,25 +2244,32 @@ impl super::App {
                     // Radar answers both questions out of its own bookkeeping.
                     settle_radar_loop_phase(loop_mgr, pidx, &mut slot.time, budget)
                 } else {
-                    // Every other layer, until it brings its own residency
-                    // oracle (WI-5 supplies the frames, WI-7 judges them):
+                    // Every other layer (WI-5 supplies the residency oracle,
+                    // WI-7 the loading state):
                     //
-                    // *settled* is the generic reading of the render set — a
-                    // frame counts once it has an image or has stopped being
-                    // rendered. That is `render_set_settled`'s own contract
-                    // with a `scan_available` that admits it knows of no
-                    // further data.
+                    // *settled* is the generic reading of the render set - a
+                    // frame counts once it has an image, or once the layer
+                    // says it holds no data for it and nothing is being
+                    // rendered. The `scan_available` half is the layer's own
+                    // `frames_resident`, which is why a frame whose data HAS
+                    // landed does not read as settled: it is owed a texture,
+                    // and that texture arrives with the draw fork (WI-6).
                     //
                     // *still arriving* is `true`, and deliberately not
                     // `false`. It is the only thing standing between a loop
                     // with nothing yet to show and `*ls = new()`, so a layer
                     // that cannot answer must not be read as "nothing more is
-                    // coming" — that reading is what destroyed a loading model
-                    // timeline before this item.
+                    // coming" - that reading is what destroyed a loading model
+                    // timeline before WI-2.
+                    let held = resident
+                        .iter()
+                        .find(|(id, _)| *id == slot.id)
+                        .map(|(_, stamps)| stamps.as_slice())
+                        .unwrap_or_default();
                     settle_loop_phase(
                         pidx,
                         &mut slot.time,
-                        |ls| ls.render_set_settled(budget, |_| false),
+                        |ls| ls.render_set_settled(budget, frames_are_resident(held)),
                         |_| true,
                     )
                 };
@@ -3000,6 +3136,157 @@ fn section_source_refusal(
     Some(rustdar_egui::pane::SectionUnavailable::AwaitingVolume)
 }
 
+/// **One frame listing that landed**, and what the loop builder has to match
+/// it against a pane with.
+///
+/// `site` is radar's own extra half — the NEXRAD site the listing was taken
+/// for — and is `None` for every other layer, whose frames are addressed by
+/// the layer id and the window alone.
+pub(crate) struct LoopListingArrival {
+    pub(crate) layer: rustdar_source::id::LayerId,
+    pub(crate) site: Option<String>,
+    pub(crate) range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+}
+
+/// **A listing becomes this layer's frame list**, sampled to `held` and with
+/// the two recorded decisions the timeline caption reads back.
+///
+/// The layer-agnostic half of [`accept_scan_listing`], and literally the same
+/// code: radar calls it after its own site check and the two arms cannot
+/// sample, order or park differently.
+///
+/// Returns the stamps that became frames, or `None` when the listing named
+/// nothing — a loop with no frames is not a loop, and the caller switches it
+/// off.
+///
+/// **`held` is a closure, and the order is the reason.** A 3D loop's cap is
+/// `frames_for_span`, which reads the layer's own `cadence_secs` — recorded
+/// here, off this very listing. Taking the cap as a number would let a caller
+/// compute it against the *previous* cadence (`None` on a fresh timeline,
+/// which answers the whole render budget), and the 3D frame list would come
+/// out at the budget instead of at the span. Pinned by
+/// `a_slow_site_shortens_a_3d_loops_list_without_shortening_its_span`.
+fn build_loop_frames(
+    ls: &mut rustdar_egui::pane::LayerTimeState,
+    stamps: Vec<chrono::NaiveDateTime>,
+    held: impl FnOnce(&rustdar_egui::pane::LayerTimeState) -> usize,
+) -> Option<Vec<chrono::NaiveDateTime>> {
+    if stamps.is_empty() {
+        return None;
+    }
+    // The source's own cadence, read off the listing *before* the sampling
+    // below throws stamps away. Once sampled there is no way back to it, and
+    // it is what the timeline caption needs to tell "every frame" from "one in
+    // five".
+    ls.cadence_secs = median_step_secs(&stamps);
+
+    // Cap the frame list by evenly sampling the listing — endpoint-anchored,
+    // so the window's two ends survive whatever the cap is.
+    let held = held(ls);
+    let total = stamps.len();
+    let sample = rustdar_egui::pane::listing_sample_indices(total, held);
+    ls.sampled = Some(sample.is_some());
+    let stamps: Vec<chrono::NaiveDateTime> = match sample {
+        Some(indices) => indices.into_iter().map(|i| stamps[i]).collect(),
+        None => stamps,
+    };
+
+    ls.phase = rustdar_egui::pane::LoopPhase::Rendering;
+    // Oldest-first, matching the listing order.
+    ls.frames = stamps
+        .iter()
+        .map(|ts| rustdar_egui::pane::LoopFrame {
+            timestamp: *ts,
+            image: None,
+            render_in_flight: false,
+            render_failed: false,
+        })
+        .collect();
+    // A freshly built loop is parked on its newest frame; the pane's own
+    // clock takes over at the next settle.
+    ls.settle_playhead(rustdar_egui::pane::TimeMode::Live);
+    Some(stamps)
+}
+
+/// **Bytes one frame of `layer` costs on this pane** — measured, not scaled.
+///
+/// The pane is already drawing this layer at the current viewport, so the
+/// texture on screen is the size a loop frame of it would be: the overlay
+/// raster is planned from the pane rect and the overdraw margin, and a loop
+/// frame is that same raster held instead of replaced. A 1280x960-**point**
+/// pane measures 1920x1440 texels = 11.06 MB, which is why this is read
+/// rather than assumed — the figure moves with the window.
+///
+/// Before the first raster there is no measurement to take, and the fallback
+/// is the radar loop frame's own figure. That is an under-estimate on a large
+/// pane, and it is the honest one available: it is the only per-frame cost
+/// this build's budgets carry. **The permanent home for this is
+/// `LoopFrameModel`, which has no `overlay` arm** (plan-view, section and grid
+/// are all radar shapes); until it does, the pool cannot size itself for an
+/// overlay loop and this is a cap applied at the point of spending rather
+/// than at the point of planning.
+fn overlay_frame_bytes(
+    pane: &rustdar_egui::pane::PaneState,
+    layer: &rustdar_source::id::LayerId,
+    budgets: &rustdar_device_profile::budget::Budgets,
+) -> usize {
+    pane.overlay_cache(layer)
+        .and_then(rustdar_egui::overlay_cache::OverlayTextureCache::current)
+        .map(|texture| texture.width as usize * texture.height as usize * 4)
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or_else(|| budgets.loop_frame_bytes())
+}
+
+/// **Frames a non-radar layer's loop may hold on this pane: a byte division,
+/// not a count.**
+///
+/// `layer_share` divides the *count* equally across a pane's animating
+/// layers, which is right only while every layer's frame costs the same. It
+/// does not: a radar loop frame is `LOOP_IMAGE_SIZE`² x 4 and an overlay frame
+/// is the pane's own raster. So the count this layer gets is its share of the
+/// pool **in bytes** divided by what one of its frames really costs, and the
+/// result is what the frame list is sampled down to.
+///
+/// Floored at [`MIN_LOOP_FRAMES_PER_PANE`], deliberately and in the open: two
+/// frames is where a loop stops being a loop, and the same floor is what
+/// `LoopPool::plan` applies to every other arm. **On an arm whose share does
+/// not buy two frames the floor wins and the byte bound is exceeded** — one
+/// frame over, by construction, and stating it is the alternative to an
+/// animation that cannot animate.
+///
+/// [`MIN_LOOP_FRAMES_PER_PANE`]: rustdar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE
+pub(super) fn overlay_frames_held(
+    allocation: LoopAllocation,
+    frame_bytes: usize,
+    animating: usize,
+) -> usize {
+    let share = allocation.share_bytes / animating.max(1);
+    share
+        .checked_div(frame_bytes)
+        .unwrap_or(rustdar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE)
+        .max(rustdar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE)
+}
+
+/// **A non-radar layer's answer to [`settle_loop_phase`]'s `scan_available`**:
+/// whether the layer is holding this frame's data.
+///
+/// This is the oracle WI-2 left as `|_| false`. That placeholder said "no data
+/// exists for any frame", under which every frame settles the instant it is
+/// created and a loop reads as finished before a byte of it has landed. The
+/// layer's own `frames_resident` is the answer, and it is asked of the layer
+/// rather than derived from the frame: a frame's `image` is a *texture*, and
+/// no layer but radar puts one there until the draw fork lands (WI-6).
+///
+/// The stamp comparison is on `valid` alone. `FrameStamp::run` is the
+/// reference time a forecast frame came from — two runs can hold the same
+/// valid hour — and a loop's frames are addressed by the instant they depict,
+/// which is what the pane's clock names.
+fn frames_are_resident(
+    resident: &[chrono::NaiveDateTime],
+) -> impl Fn(&rustdar_egui::pane::LoopFrame) -> bool + '_ {
+    move |frame| resident.contains(&frame.timestamp)
+}
+
 /// Take a scan listing for `site` into `ls`'s frame list, returning the downloads
 /// it now owes.
 fn accept_scan_listing(
@@ -3014,46 +3301,23 @@ fn accept_scan_listing(
         return None;
     }
 
-    if scans.is_empty() {
-        log::warn!("Loop: no {site} scans in the requested window; leaving loop mode");
-        *ls = rustdar_egui::pane::LayerTimeState::new();
-        return None;
-    }
-
-    // The site's own cadence, read off the listing *before* the sampling below
-    // throws scans away. Once sampled there is no way back to it, and it is what
-    // the timeline caption needs to tell "every scan" from "one in five".
-    ls.cadence_secs = median_step_secs(&scans);
-
     // Cap the downloads by evenly sampling the listing. A 3D loop's cap is its
     // *resident* one and is far lower, because for that kind the frame list and
     // the resident set are one thing — see `loop_frames_held`.
-    let held = layer_share(loop_frames_held(allocation, ls, budgets), animating);
     let total = scans.len();
-    let sample = rustdar_egui::pane::listing_sample_indices(total, held);
-    ls.sampled = Some(sample.is_some());
-    let scans = match sample {
-        Some(indices) => {
-            log::info!("Loop: sampled {total} down to {held} frames for {site}");
-            indices.into_iter().map(|i| scans[i]).collect()
-        }
-        None => scans,
+    let Some(scans) = build_loop_frames(ls, scans, |ls| {
+        layer_share(loop_frames_held(allocation, ls, budgets), animating)
+    }) else {
+        log::warn!("Loop: no {site} scans in the requested window; leaving loop mode");
+        *ls = rustdar_egui::pane::LayerTimeState::new();
+        return None;
     };
-
-    ls.phase = rustdar_egui::pane::LoopPhase::Rendering;
-    // Oldest-first, matching the scan listing order.
-    ls.frames = scans
-        .iter()
-        .map(|ts| rustdar_egui::pane::LoopFrame {
-            timestamp: *ts,
-            image: None,
-            render_in_flight: false,
-            render_failed: false,
-        })
-        .collect();
-    // A freshly built loop is parked on its newest frame; the pane's own
-    // clock takes over at the next settle.
-    ls.settle_playhead(rustdar_egui::pane::TimeMode::Live);
+    if ls.sampled == Some(true) {
+        log::info!(
+            "Loop: sampled {total} down to {} frames for {site}",
+            scans.len()
+        );
+    }
 
     Some(FramePlan::new(site.to_string(), scans))
 }
@@ -3704,6 +3968,13 @@ mod first_launch_tests;
 #[path = "app_render/loop_dispatch_tests.rs"]
 #[cfg(test)]
 mod loop_dispatch_tests;
+
+/// Frame supply and residency for a non-radar transport layer (WI-5): a
+/// listing becoming a frame list, the byte cap it is sampled to, the fetches
+/// it owes, and the layer's own answer to what it is holding.
+#[path = "app_render/loop_supply_tests.rs"]
+#[cfg(test)]
+mod loop_supply_tests;
 
 /// The cross-section loop's dispatch, placement and frame-thread pacing.
 #[path = "app_render/loop_section_tests.rs"]

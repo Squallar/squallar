@@ -1190,6 +1190,20 @@ impl Gui {
         &mut self.panes[..count]
     }
 
+    /// [`Self::panes_mut`] with the registry beside it, for a caller that has
+    /// to ask a handler about the pane it is walking.
+    ///
+    /// **Not [`Self::panes_and_overlays_mut`]**, and the difference is the
+    /// whole reason this exists: that one hands out *every* pane, which is
+    /// what the arrival path wants — a listing lands for a pane whether or
+    /// not the layout is currently showing it. A per-frame walk wants the
+    /// visible slice, and reaching for the wider door would silently widen
+    /// the walk.
+    pub fn visible_panes_and_overlays_mut(&mut self) -> (&mut [PaneState], &mut OverlayRegistry) {
+        let count = self.pane_layout.pane_count.min(self.panes.len());
+        (&mut self.panes[..count], &mut self.overlays)
+    }
+
     /// `pane_count` clamped to what the vector actually holds. The two are kept in
     /// step by every path that changes the layout, but slicing past the end would
     /// panic, and no pane update is worth a crash.

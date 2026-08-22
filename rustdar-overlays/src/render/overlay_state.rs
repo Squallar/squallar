@@ -423,6 +423,16 @@ impl OverlayRegistry {
         )
     }
 
+    /// [`OverlayHandler::frames_resident`] for `id` — which of this layer's
+    /// frames the pane already holds data for. A layer with no handler holds
+    /// nothing, and that is not the same statement as "nothing is coming":
+    /// the caller that turns this into a settle verdict pairs it with the
+    /// layer's own arrival question.
+    pub fn frames_resident(&self, id: &LayerId, pane: &PaneRef<'_>) -> Vec<FrameStamp> {
+        self.handler(id)
+            .map_or_else(Vec::new, |h| h.frames_resident(pane))
+    }
+
     /// [`OverlayHandler::create_frame_list_task`] for `id`.
     pub fn create_frame_list_task(
         &self,
