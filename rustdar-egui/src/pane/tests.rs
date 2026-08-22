@@ -1551,8 +1551,8 @@ fn the_frame_shown_is_the_latest_one_at_or_before_the_panes_clock() {
         (
             TimeMode::AsOf(ts(0) - chrono::Duration::seconds(1)),
             0,
-            "a clock before every frame floors to the oldest held, because an \
-             index into the frame list is what the pane renders through",
+            "a clock before every frame gives the render set a centre to grow \
+             from - `frame_at` is residency, and 0 is the nearest frame",
         ),
     ];
 
@@ -1570,6 +1570,23 @@ fn the_frame_shown_is_the_latest_one_at_or_before_the_panes_clock() {
     for (mode, want, why) in cases {
         assert_eq!(timeline.frame_at(mode), want, "{why}");
     }
+
+    // And the presentational half of the same six clocks: identical to
+    // `frame_at` everywhere a frame qualifies, and `None` where none does.
+    for (mode, want, why) in cases.iter().take(5) {
+        assert_eq!(
+            timeline.qualifying_frame_at(*mode),
+            Some(*want),
+            "a qualifying clock must present the frame `frame_at` names: {why}",
+        );
+    }
+    assert_eq!(
+        timeline.qualifying_frame_at(TimeMode::AsOf(ts(0) - chrono::Duration::seconds(1))),
+        None,
+        "a clock before every frame presents NOTHING - `TimeAxis::FrameSeries` \
+         draws nothing when no frame qualifies, and frame 0 is valid AFTER the \
+         instant asked about",
+    );
 }
 
 /// A timeline holding nothing answers `0` rather than panicking or naming a
@@ -1713,14 +1730,173 @@ fn eviction_keeps_the_pane_on_the_moment_it_was_parked_at() {
         "which is index 1 now, not the 2 it was",
     );
 
-    // And when the clock falls off the front entirely, it floors rather than
-    // dangling: an index must name a frame that exists.
+    // And when the clock falls off the front entirely, the layer stops
+    // answering rather than answering with a frame from after the instant
+    // asked about. The index still names a frame that exists — the render set
+    // needs a centre — but nothing is presented from it.
     pane.time_state_mut(&known::RADAR)
         .frames
         .retain(|f| f.timestamp >= ts(3));
     pane.settle_playheads();
-    assert_eq!(pane.time_state(&known::RADAR).current_frame(), 0);
-    assert_eq!(pane.time_state(&known::RADAR).playhead_stamp(), Some(ts(3)));
+    assert_eq!(
+        pane.time_state(&known::RADAR).current_frame(),
+        0,
+        "residency still has a centre, and the nearest frame is index 0",
+    );
+    assert_eq!(
+        pane.time_state(&known::RADAR).playhead_stamp(),
+        None,
+        "the pane is parked at 2 minutes and the oldest frame it still holds \
+         is 3 - naming ts(3) here would caption a frame valid AFTER the \
+         depicted instant as the picture at it",
+    );
+    assert_eq!(
+        pane.time_state(&known::RADAR).qualifying_frame(),
+        None,
+        "but no frame qualifies at the 2-minute clock, so none is presented",
+    );
+    assert!(
+        pane.active_image().is_none(),
+        "and nothing is drawn - this is the mixed-span bug in miniature",
+    );
+}
+
+/// **A layer with nothing valid yet shows nothing, and says nothing.**
+///
+/// `TimeAxis::FrameSeries` is explicit that nothing is drawn when no frame
+/// qualifies, and this is the case a pane of mixed spans produces the moment
+/// it exists: scrub to a clock inside the long layer's window but before the
+/// short layer's, and the short layer has no frame valid at that instant. The
+/// answer is an empty picture, not the oldest frame it happens to hold — that
+/// frame is valid *after* the depicted instant, and presenting it dates the
+/// map wrong with nothing on screen to say so.
+///
+/// Three floors, because "draw nothing" is easy to get trivially right:
+///
+/// 1. a second layer that *does* have a qualifying frame still resolves — a
+///    blanket blank would replace one wrong answer with an empty map;
+/// 2. texture residency is unaffected — the render set still centres on the
+///    nearest frame, because a scrub forward needs exactly those;
+/// 3. a settled render set does not manufacture a picture. If the presented
+///    frame were `frame_at(..).unwrap_or(0)` in disguise, `active_image`
+///    would be `Some` here.
+#[test]
+fn a_layer_whose_frames_all_postdate_the_clock_draws_nothing() {
+    let ctx = egui::Context::default();
+    let mut pane = PaneState::new();
+
+    // The short-span layer: four textured frames, all at or after 5 minutes.
+    let mut radar = loop_with_frames(0, 0);
+    radar.frames = (5..9)
+        .map(|i| LoopFrame {
+            timestamp: ts(i),
+            image: Some(dummy_texture(&ctx)),
+            render_in_flight: false,
+            render_failed: false,
+        })
+        .collect();
+    *pane.time_state_mut(&known::RADAR) = radar;
+
+    // The long-span layer, holding a frame at the clock itself.
+    let mut model = loop_with_frames(0, 0);
+    model.frames = [ts(0), ts(4)]
+        .into_iter()
+        .map(|timestamp| LoopFrame {
+            timestamp,
+            image: None,
+            render_in_flight: false,
+            render_failed: false,
+        })
+        .collect();
+    *pane.time_state_mut(&known::MODEL_DATA) = model;
+
+    // The pane's clock sits before every frame radar holds, inside model's.
+    pane.set_time_mode(TimeMode::AsOf(ts(0)));
+
+    // ── The behaviour under test ──────────────────────────────────────────
+    // The stamp first, deliberately: when this floor fires, the failure names
+    // the instant that was fabricated (`Some(00:05:00)` against a clock at
+    // 00:00), which no unrelated breakage produces.
+    assert_eq!(
+        pane.time_state(&known::RADAR).playhead_stamp(),
+        None,
+        "the clock is at ts(0) and the oldest radar frame is ts(5); naming a \
+         stamp here presents a frame valid AFTER the depicted instant",
+    );
+    assert_eq!(
+        pane.time_state(&known::RADAR).qualifying_frame(),
+        None,
+        "no radar frame is valid at the depicted instant, so none is named",
+    );
+    assert!(
+        pane.active_image().is_none(),
+        "and nothing is drawn, though every frame carries a texture",
+    );
+    assert_eq!(
+        pane.data_time_on_screen(),
+        None,
+        "the caption says nothing rather than dating the map at ts(5)",
+    );
+
+    // ── Floor 1: a qualifying layer still resolves ────────────────────────
+    assert_eq!(
+        pane.time_state(&known::MODEL_DATA).qualifying_frame(),
+        Some(0),
+        "the layer that DOES have a frame at the clock still names it - a \
+         blanket 'draw nothing' would pass every assertion above and leave \
+         the whole map blank",
+    );
+    assert_eq!(
+        pane.time_state(&known::MODEL_DATA).playhead_stamp(),
+        Some(ts(0)),
+        "and names its real stamp",
+    );
+
+    // ── Floor 2: residency is untouched, and centred on the NEAREST frame ─
+    let radar = pane.time_state(&known::RADAR);
+    assert_eq!(
+        radar.current_frame(),
+        0,
+        "the render set keeps a centre even though nothing is presented",
+    );
+    assert_eq!(
+        radar.render_set_indices(2),
+        vec![0, 1],
+        "and it is the two NEAREST frames - ts(5) and ts(6) are what a scrub \
+         forward reaches first",
+    );
+
+    // ── Floor 3: settled textures do not manufacture a picture ────────────
+    assert!(
+        radar.render_set_settled(2, all_scans_available),
+        "precondition: the render set really is fully textured",
+    );
+    assert!(
+        pane.active_image().is_none(),
+        "a settled render set is a statement about TEXTURES, not about what \
+         the clock names: readiness must not put a frame on screen that the \
+         depicted instant does not select",
+    );
+
+    // Eviction keeps the nearest frames and drops the far ones - it must not
+    // read the absent playhead as 'keep nothing' or 'keep everything'.
+    pane.time_state_mut(&known::RADAR)
+        .evict_textures_outside_render_set(2);
+    let kept: Vec<usize> = pane
+        .time_state(&known::RADAR)
+        .frames
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.image.is_some())
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        kept,
+        vec![0, 1],
+        "the two nearest frames kept their textures and the far two lost \
+         theirs; a non-qualifying playhead must not evict the wrong set",
+    );
+    assert!(pane.active_image().is_none(), "and still nothing is drawn",);
 }
 
 /// **WO-E7d: the loop caption describes the layer the clock walks.** The

@@ -438,7 +438,34 @@ pub struct LayerTimeState {
     /// at or before the instant the pane depicts. This field is written by
     /// [`Self::settle_playhead`] and by nothing else, so no caller can park
     /// the picture on a frame the pane's own clock does not name.
+    ///
+    /// **It is the nearest frame, not necessarily a qualifying one** — when the
+    /// clock sits before everything this layer holds it reads 0, and
+    /// [`Self::playhead_qualifies`] is what says so.
     current_frame: usize,
+    /// **Whether [`Self::current_frame`] is the frame the pane's clock names,
+    /// or merely the nearest one to it.** False when the clock sits before
+    /// every frame this layer holds — routine on a pane whose layers have
+    /// different spans: scrub to 06Z on a pane holding a day of satellite and
+    /// 45 minutes of radar, and radar has nothing valid to show.
+    ///
+    /// **The two readings of the playhead part here, and they are different
+    /// questions:**
+    ///
+    /// - *What is presented* — [`Self::playhead_stamp`] and the pane's picture
+    ///   accessors, which go through [`Self::qualifying_frame`] and answer
+    ///   `None` when this is false. `TimeAxis::FrameSeries` says nothing is
+    ///   drawn when no frame qualifies, and a frame valid *after* the depicted
+    ///   instant is a fabrication, not a fallback.
+    /// - *What is kept textured* — [`Self::render_set_indices`] and the
+    ///   eviction and readiness built on it, which stay centred on
+    ///   [`Self::current_frame`] whatever this says. Frame 0 is the correct
+    ///   centre when the clock precedes everything: those are the nearest
+    ///   frames, and so the ones a scrub forward needs first.
+    ///
+    /// True on a fresh state so that a directly-parked index is an answer; the
+    /// clock's own verdict replaces it at the next [`Self::settle_playhead`].
+    playhead_qualifies: bool,
     pub frames: Vec<LoopFrame>,
     /// The window this layer's frames were listed for, in seconds — the extent
     /// the arrival path slides as newer frames land.
@@ -896,6 +923,7 @@ impl LayerTimeState {
         Self {
             phase: LoopPhase::Inactive,
             current_frame: 0,
+            playhead_qualifies: true,
             frames: Vec::new(),
             span_secs: 0,
             listing: None,
@@ -951,31 +979,66 @@ impl LayerTimeState {
     /// before `T`; under [`TimeMode::Live`] it is the newest frame there is.
     ///
     /// When no frame qualifies — the clock sits before the oldest frame this
-    /// layer still holds, which is what eviction leaves behind — the playhead
-    /// floors to the oldest rather than dangling: an index into `frames` must
-    /// name a frame that exists, because it is what the pane renders through.
+    /// layer still holds, which both eviction and a pane of mixed spans
+    /// produce — this records *that there is no answer*
+    /// ([`Self::playhead_qualifies`]) and parks the index on the nearest
+    /// frame. The layer then presents nothing, while the render set still has
+    /// a centre to grow from.
     pub fn settle_playhead(&mut self, mode: TimeMode) {
-        self.current_frame = self.frame_at(mode);
+        let qualifying = self.qualifying_frame_at(mode);
+        self.playhead_qualifies = qualifying.is_some();
+        // NOT a fallback for the presented frame — `playhead_qualifies` is
+        // already false here, so nothing is drawn and no stamp is named. This
+        // index only has to be somewhere sensible for texture residency to
+        // walk outward from, and the nearest frame is exactly that.
+        self.current_frame = qualifying.unwrap_or(0);
     }
 
-    /// [`Self::settle_playhead`]'s answer, without writing it.
-    pub fn frame_at(&self, mode: TimeMode) -> usize {
+    /// **The contract's own answer**, without writing it: the latest frame
+    /// stamped at or before the depicted instant, `None` when none is. Under
+    /// [`TimeMode::Live`] it is the newest frame there is, and `None` only for
+    /// a layer holding no frames.
+    ///
+    /// This is `rustdar_source::time::TimeAxis::FrameSeries`'s rule verbatim,
+    /// including *nothing is drawn when no frame qualifies*.
+    pub fn qualifying_frame_at(&self, mode: TimeMode) -> Option<usize> {
         if self.frames.is_empty() {
-            return 0;
+            return None;
         }
         match mode {
-            TimeMode::Live => self.frames.len() - 1,
+            TimeMode::Live => Some(self.frames.len() - 1),
             TimeMode::AsOf(t) => self
                 .frames
                 .partition_point(|frame| frame.timestamp <= t)
-                .saturating_sub(1),
+                .checked_sub(1),
         }
     }
 
-    /// The stamp of the frame the playhead is on, or `None` for a layer
-    /// holding no frames.
+    /// **The render set's centre** — [`Self::qualifying_frame_at`] floored to
+    /// the nearest frame held, `0` for a layer holding none.
+    ///
+    /// **Not what the layer presents.** When the clock sits before every frame
+    /// this names frame 0 while the layer draws nothing; 0 is the right answer
+    /// for *which textures to hold* and the wrong one for *what to show*, and
+    /// the callers that want the latter ask [`Self::qualifying_frame`].
+    pub fn frame_at(&self, mode: TimeMode) -> usize {
+        self.qualifying_frame_at(mode).unwrap_or(0)
+    }
+
+    /// **The frame this layer presents**: [`Self::current_frame`] when the
+    /// pane's clock actually names it, `None` when no frame qualifies. Every
+    /// read that ends up on screen goes through here.
+    pub fn qualifying_frame(&self) -> Option<usize> {
+        self.playhead_qualifies.then_some(self.current_frame)
+    }
+
+    /// The stamp of the frame the playhead is on — `None` for a layer holding
+    /// no frames, and `None` when the pane's clock precedes every frame it
+    /// holds, because then there is no frame to name.
     pub fn playhead_stamp(&self) -> Option<NaiveDateTime> {
-        self.frames.get(self.current_frame).map(|f| f.timestamp)
+        self.frames
+            .get(self.qualifying_frame()?)
+            .map(|f| f.timestamp)
     }
 
     pub fn is_playing(&self) -> bool {
@@ -1618,20 +1681,19 @@ impl PaneState {
     /// kind. One lookup, so the two accessors above cannot walk to different
     /// frames.
     fn active_loop_image(&self) -> Option<&LoopFrameImage> {
-        self.loop_state()
-            .frames
-            .get(self.loop_state().current_frame())
+        let ls = self.loop_state();
+        ls.frames
+            .get(ls.qualifying_frame()?)
             .and_then(|f| f.image.as_ref())
     }
 
     /// When the data behind the image *currently on screen* was collected.
     pub fn data_time_on_screen(&self) -> Option<NaiveDateTime> {
         if self.loop_state().is_active() {
-            return self
-                .loop_state()
-                .frames
-                .get(self.loop_state().current_frame())
-                .map(|f| f.timestamp);
+            // `playhead_stamp`, not the index: a clock before every frame the
+            // loop holds names no frame, and captioning the oldest one would
+            // date the picture hours off what is actually on screen.
+            return self.loop_state().playhead_stamp();
         }
         self.data_time
     }

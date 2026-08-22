@@ -861,8 +861,12 @@ impl super::Gui {
             let rendering = total > 0 && !ls.is_render_ready();
             let playing = ls.is_playing();
             let fetching = ls.is_fetching();
+            // Two different questions off one playhead: the CAPTION says what
+            // is on screen, so it is `None` when the clock names no frame; the
+            // SLIDER below needs a handle position in `0..total`, and the
+            // nearest frame is where the handle belongs.
             let current_frame = ls.current_frame();
-            let frame_time = ls.frames.get(current_frame).map(|f| f.timestamp);
+            let frame_time = ls.playhead_stamp();
 
             if fetching {
                 ui.horizontal(|ui| {
