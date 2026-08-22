@@ -46,7 +46,7 @@ tiny-skia = "=0.12.0"
 # with `FileBuilder` to feed the decoders. Shipped code in this crate reaches
 # HDF5 exclusively through `rustdar-netcdf`, which owns the pin and the
 # feature rationale -- keep the two versions equal.
-hdf5-pure = "=0.38.0"
+hdf5-pure = "=0.39.0"
 
 # Must stay target-gated: tokio rejects `fs` on wasm ("Only features
 # sync,macros,io-util,rt,time are supported on wasm") -- a hard build failure.
