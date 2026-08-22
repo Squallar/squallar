@@ -3,7 +3,7 @@ use crate::legend_ramp;
 use crate::overlay_cache::{
     current_quantized_zoom, draw_overlay_texture, plan_overlay_texture, viewport_geo_bounds,
 };
-use crate::pane::{PaneState, RadarImageData, TimeMode};
+use crate::pane::{LoopLoading, PaneState, RadarImageData, TimeMode};
 use crate::point_painter::EguiPointPainter;
 use rustdar_overlays::render::draw::{DrawPointContext, HoverContext};
 use rustdar_overlays::render::overlay_state::{
@@ -304,7 +304,7 @@ pub(super) fn render_pane_map_content(
         // The deferred stale-image notice, submitted after every kind so
         // nothing in `draw_order` can paint over it. Glass: a floor strip does
         // not draw it — `Gui::draw_volume_glass` does instead.
-        if let Some((on_screen, elevation)) = pending_notice
+        if let Some((on_screen, elevation)) = &pending_notice
             && ctx.surfaces.paints(Surface::Glass)
         {
             let notice_painter = ui.painter().with_clip_rect(ctx.pane_rect);
@@ -314,8 +314,8 @@ pub(super) fn render_pane_map_content(
                 // The pill row's measured clearance, not the one-row
                 // constant: a narrow pane wraps the row.
                 crate::ui::pills::pill_row_clearance(ui.ctx(), ctx.pane_idx),
-                &on_screen,
-                elevation,
+                on_screen,
+                *elevation,
             );
         }
 
@@ -331,6 +331,31 @@ pub(super) fn render_pane_map_content(
                 crate::ui::pills::pill_row_clearance(ui.ctx(), ctx.pane_idx),
                 source,
             );
+        }
+
+        // The loading state (WI-7). While a loop's data is on its way the
+        // pane paints NOTHING for that layer (WI-6), and this plate is what
+        // makes the nothing legible: the quantity — which frame is owed, or
+        // how long the frame listing has been out — never an apology. Same
+        // slot as the two notices above and yielded to them, so the plates
+        // cannot stack.
+        if pending_notice.is_none()
+            && melting_layer_caveat.is_none()
+            && ctx.surfaces.paints(Surface::Glass)
+            && let Some(loading) = ctx.pane.loop_loading(web_time::Instant::now())
+        {
+            let notice_painter = ui.painter().with_clip_rect(ctx.pane_rect);
+            draw_top_notice(
+                &notice_painter,
+                ctx.pane_rect,
+                crate::ui::pills::pill_row_clearance(ui.ctx(), ctx.pane_idx),
+                loop_loading_notice(loading),
+            );
+            // The wait count ticks and the frames land without any input;
+            // keep a slow heartbeat while the plate is up so both reach the
+            // glass. It dies with the plate.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs(1));
         }
 
         if !selected.is_empty() {
@@ -1352,6 +1377,20 @@ pub(super) fn draw_melting_layer_notice(
     source: MeltingLayerSource,
 ) {
     draw_top_notice(painter, pane_rect, top_margin, melting_layer_notice(source));
+}
+
+/// What a pane says while a loop's data is on its way (WI-7) — the quantity,
+/// never an apology: which frame of how many is owed a picture, or how long
+/// the frame listing has been out. No icon, like the melting-layer notice.
+fn loop_loading_notice(loading: LoopLoading) -> String {
+    match loading {
+        LoopLoading::Listing { waited } => {
+            format!("loading frames - {}s", waited.as_secs())
+        }
+        LoopLoading::Frame { index, total } => {
+            format!("frame {} of {} loading", index + 1, total)
+        }
+    }
 }
 
 /// The rounded plate every top-of-pane notice is drawn on. Non-blocking: the

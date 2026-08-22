@@ -15,9 +15,9 @@ use rustdar_source::id::{LayerId, known};
 /// The forecast layer this work item exists for. Registered in every build and
 /// `RenderMode::Texture`, so the generic arm of `render_map_pane` is what draws
 /// it — which is the arm under test.
-const LAYER: LayerId = known::MODEL_DATA;
+pub(super) const LAYER: LayerId = known::MODEL_DATA;
 
-fn ts(minutes: i64) -> chrono::NaiveDateTime {
+pub(super) fn ts(minutes: i64) -> chrono::NaiveDateTime {
     chrono::NaiveDate::from_ymd_opt(2026, 8, 22)
         .unwrap()
         .and_hms_opt(12, 0, 0)
@@ -31,7 +31,7 @@ fn ts(minutes: i64) -> chrono::NaiveDateTime {
 /// the quad really does land inside the pane rect — a raster placed off-screen
 /// is dropped by `draw_overlay_texture` and every assertion below would then
 /// pass over an empty list.
-fn raster(h: &InputHarness, name: &str) -> OverlayTextureData {
+pub(super) fn raster(h: &InputHarness, name: &str) -> OverlayTextureData {
     let rect = h.pane_rects()[0];
     let nw = h.ground_at(0, rect.min);
     let se = h.ground_at(0, rect.max);
@@ -58,7 +58,7 @@ fn raster(h: &InputHarness, name: &str) -> OverlayTextureData {
 }
 
 /// Which textures the last frame painted inside pane 0.
-fn painted(h: &InputHarness) -> Vec<egui::TextureId> {
+pub(super) fn painted(h: &InputHarness) -> Vec<egui::TextureId> {
     h.painted_images_in(h.pane_rects()[0])
         .iter()
         .map(|image: &PaintedImage| image.texture)
@@ -73,7 +73,7 @@ fn painted(h: &InputHarness) -> Vec<egui::TextureId> {
 /// stands for the instant the layer last rasterized for the map, and leaving it
 /// on the glass while the playhead sits elsewhere is the defect this item
 /// closes.
-fn model_loop(h: &mut InputHarness) -> (egui::TextureId, Vec<egui::TextureId>) {
+pub(super) fn model_loop(h: &mut InputHarness) -> (egui::TextureId, Vec<egui::TextureId>) {
     h.gui_mut().enable_overlay_for_test(&LAYER);
     h.warm_up();
 
@@ -104,7 +104,7 @@ fn model_loop(h: &mut InputHarness) -> (egui::TextureId, Vec<egui::TextureId>) {
 }
 
 /// Move pane 0's clock to `at` and run a frame.
-fn scrub_to(h: &mut InputHarness, at: chrono::NaiveDateTime) {
+pub(super) fn scrub_to(h: &mut InputHarness, at: chrono::NaiveDateTime) {
     h.gui_mut().panes_mut()[0].set_time_mode(TimeMode::AsOf(at));
     h.warm_up();
 }

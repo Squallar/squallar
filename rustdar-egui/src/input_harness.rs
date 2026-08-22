@@ -2347,6 +2347,11 @@ mod tests;
 #[cfg(test)]
 mod loop_overlay_draw_tests;
 
+/// **The loading state** (WI-7): the quantity a pane shows while a loop's
+/// data is on its way, read off the painted glass.
+#[cfg(test)]
+mod loop_loading_tests;
+
 /// **A layer's own loop window** (WB-6): the one Lookback number, raised to the
 /// floor the addressed layer declares, read off the action the ∞ button emits.
 #[cfg(test)]

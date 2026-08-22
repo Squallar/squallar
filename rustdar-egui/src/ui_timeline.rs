@@ -1425,9 +1425,17 @@ impl super::Gui {
             let frame_split = loop_rail_split(&ls.frames, chrono::Utc::now().naive_utc());
 
             if fetching {
+                // With how long the listing has been out (WI-7) — the one
+                // quantity this phase owns, so a deep-scrub refill reads as
+                // in progress rather than stuck. The spinner keeps the
+                // repaint alive, so the count ticks.
+                let waited = ls
+                    .listing_wait(web_time::Instant::now())
+                    .unwrap_or_default()
+                    .as_secs();
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("Loading scan list...");
+                    ui.label(format!("Loading scan list... {waited}s"));
                 });
             } else if total == 0 {
                 ui.label("No frames found");

@@ -444,6 +444,21 @@ pub enum LoopPhase {
     Paused,
 }
 
+/// What a pane's animation is waiting on (WI-7) — the legible form of a blank
+/// the loop machinery is about to fill. Both arms carry the quantity a reader
+/// can hold, because that is all the notice may say: an animating layer with a
+/// frame owed paints NOTHING for it (WI-6), and the caption is what makes that
+/// nothing distinguishable from "there is no data here".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopLoading {
+    /// A frame listing is in flight; how long it has been out
+    /// ([`LayerTimeState::listing_wait`]).
+    Listing { waited: std::time::Duration },
+    /// The playhead's own frame has no picture yet: which frame (0-based) of
+    /// how many held.
+    Frame { index: usize, total: usize },
+}
+
 /// **One layer's own place on the timeline, in one pane.**
 ///
 /// Everything a layer knows about the frames it can show and which of them it
@@ -2008,6 +2023,44 @@ impl PaneState {
     /// nothing to settle either way.
     pub fn animating_layers_mut(&mut self) -> impl Iterator<Item = &mut LayerSlot> {
         self.layers.iter_mut().filter(|slot| slot.time.is_active())
+    }
+
+    /// **What this pane's animation is waiting on**, or `None` when nothing —
+    /// the question the map's loading notice asks (WI-7).
+    ///
+    /// A listing in flight outranks a frame owed a picture: a refill after a
+    /// deep scrub restamps [`LayerTimeState::listing_since`] while old frames
+    /// may still be held, and "the listing is out" is the truer statement of
+    /// the two.
+    ///
+    /// The frame arm claims *loading* only while something is actually coming:
+    /// the frame's render is in flight, or the layer's batch has not settled
+    /// ([`LayerTimeState::is_render_ready`] false, so renders are still being
+    /// dispatched). A frame that failed, or sits empty in a settled batch
+    /// because its scan holds no data, is WI-6's honest nothing — not loading.
+    pub fn loop_loading(&self, now: web_time::Instant) -> Option<LoopLoading> {
+        for slot in self.animating_layers() {
+            if let Some(waited) = slot.time.listing_wait(now) {
+                return Some(LoopLoading::Listing { waited });
+            }
+        }
+        for slot in self.animating_layers() {
+            let ls = &slot.time;
+            let Some(index) = ls.qualifying_frame() else {
+                continue;
+            };
+            let Some(frame) = ls.frames.get(index) else {
+                continue;
+            };
+            let coming = frame.render_in_flight || !ls.is_render_ready();
+            if frame.image.is_none() && !frame.render_failed && coming {
+                return Some(LoopLoading::Frame {
+                    index,
+                    total: ls.frames.len(),
+                });
+            }
+        }
+        None
     }
 
     /// **Whether this pane's clock is running.** Asked of the pane, answered
