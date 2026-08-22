@@ -915,10 +915,7 @@ impl super::App {
         }
         self.volume_store
             .evict_product(&rustdar_radar::fields::known::STORM_RELATIVE_VELOCITY);
-        for pane_idx in 0..self.gui.pane_count() {
-            let Some(pane) = self.gui.pane_mut(pane_idx) else {
-                continue;
-            };
+        for pane in self.gui.panes_mut() {
             if pane.selected_product() != rustdar_radar::fields::known::STORM_RELATIVE_VELOCITY {
                 continue;
             }
@@ -935,10 +932,7 @@ impl super::App {
     /// Move `RenderInput::extract` to volume arrival for `site`:
     pub(super) fn refresh_extract_cache_for_site(&mut self, site: &str) {
         self.render.retain_extracts(|key| key.site != site);
-        for pane_idx in 0..self.gui.pane_count() {
-            let Some(pane) = self.gui.pane(pane_idx) else {
-                continue;
-            };
+        for pane in self.gui.panes() {
             if !pane.is_map() || pane.site() != site {
                 continue;
             }
@@ -2109,11 +2103,8 @@ impl super::App {
         let allocation = self.loop_allocation();
         let budgets = self.budgets;
         let mut abandoned = Vec::new();
-        for pidx in 0..self.gui.pane_count() {
-            let loop_mgr = &self.loop_mgr;
-            let Some(p) = self.gui.pane_mut(pidx) else {
-                continue;
-            };
+        let loop_mgr = &self.loop_mgr;
+        for (pidx, p) in self.gui.panes_mut().iter_mut().enumerate() {
             let budget = loop_render_budget(allocation, p.loop_state(), &budgets);
             if settle_loop_phase(loop_mgr, pidx, p.loop_state_mut(), budget) {
                 abandoned.push(pidx);
@@ -2202,10 +2193,7 @@ impl super::App {
     fn advance_loop_playback(&mut self) {
         let now = web_time::Instant::now();
 
-        for pane_idx in 0..self.gui.pane_count() {
-            let Some(pane) = self.gui.pane_mut(pane_idx) else {
-                continue;
-            };
+        for pane in self.gui.panes_mut() {
             // The pane's own posture, which every pane carries the same copy
             // of — see `Gui::set_loop_speed_fps`.
             let interval = loop_interval(pane.time.speed_fps);
@@ -2254,10 +2242,7 @@ impl super::App {
             rustdar_radar::types::RadarProduct,
             Option<rustdar_egui::pane::VolumeLoopKey>,
         )> = Vec::new();
-        for pane_idx in 0..self.gui.pane_count() {
-            let Some(pane) = self.gui.pane(pane_idx) else {
-                continue;
-            };
+        for pane in self.gui.panes() {
             let ls = pane.loop_state();
             if !ls.is_active() {
                 continue;

@@ -87,7 +87,7 @@ fn no_production_file_pushes_through_a_gui_setter() {
 /// `.gui;` binding — the construct the message below forbids by name. WO-ARREARS
 /// **compile-proved neither is borrow-forced** (a direct reach builds with no
 /// diagnostic) and measured what they hide: `app.rs` reads 37 here and is
-/// really 41, `app_render.rs` reads 108 and is really 109. Shedding them puts
+/// really 41, `app_render.rs` reads 102 and is really 103. Shedding them puts
 /// both files above their ceilings, so the shed needs a land that can also
 /// shed the difference. The full record, including the crate-wide figure, is
 /// on `arch_ratchets.rs`'s `SELF_GUI_MAX`. It is recorded here too because
@@ -104,7 +104,7 @@ fn the_gui_coupling_only_ever_shrinks() {
     for (name, source, ceiling) in [
         ("app.rs", APP, 37),
         ("app_fetch.rs", APP_FETCH, 42),
-        ("app_render.rs", APP_RENDER, 108),
+        ("app_render.rs", APP_RENDER, 102),
         ("app_chunks.rs", APP_CHUNKS, 13),
     ] {
         let n = collapsed(source).matches(SELF_GUI).count();
