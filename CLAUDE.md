@@ -60,7 +60,7 @@ worker wire, doctored-token respawn). It does **not** cover frame time or mobile
 - `cargo test -p rustdar-app arch_ratchets` selects **zero tests**. Spell it
   `--test arch_ratchets`.
 - The loop pin-list roster is `cargo test -p rustdar-app --lib -- --list | grep -E "loop_|frame_build_order"`.
-  **The `--lib` is load-bearing** (186 rows with it, 187 without).
+  **The `--lib` is load-bearing** (189 rows with it, 190 without).
 - A filtered test run is not self-contained: some tests share process-global state. Run a
   clean-tree control before believing a filtered red or green.
 - A zero-line `git diff` over a path that does not exist is not a proof. Show the path is

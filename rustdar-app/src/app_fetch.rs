@@ -2344,7 +2344,14 @@ fn append_polled_frame_to_loops(
         // animating — the budget is a texture-memory allowance and a pane
         // animating two things spends it twice.
         let held = super::render::layer_share(
-            super::render::loop_frames_held(allocation, pane.loop_state(), budgets),
+            allocation,
+            Some(super::render::loop_frames_held(
+                allocation,
+                pane.loop_state(),
+                budgets,
+            )),
+            crate::loop_pool::LoopFrameModel::from_budgets(budgets)
+                .bytes_for(pane.loop_state().view),
             pane.animating_layers().count(),
         );
         // Read before the timeline is borrowed mutably: the window this

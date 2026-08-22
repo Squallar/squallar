@@ -1,11 +1,15 @@
 //! **WO-E7d: the share is actually WIRED, not just computed.**
 //!
 //! `layer_share` is pinned directly beside it, but a correct divider that
-//! nothing calls divides nothing. Today every pane animates exactly one layer,
-//! so removing either call site changes no observable behaviour — which means
-//! the wiring has no coverage from the existing suites at all. These build the
-//! two-animating-layer pane the build cannot make yet and check that the cap
-//! the append path enforces is the divided one.
+//! nothing calls divides nothing. Removing either call site changes nothing
+//! observable on a pane animating one layer, which is most of them — so the
+//! wiring has no coverage from the existing suites at all. These build the
+//! two-animating-layer pane and check that the cap the append path enforces is
+//! the divided one.
+//!
+//! **WB-7 turned the division from a count into bytes**, so the two arms below
+//! are read back off `layer_share` itself rather than spelled as `cap` and
+//! `cap / 2`. What each is on this build is stated on [`radar_share`].
 
 use super::append_polled_frame_to_loops;
 use rustdar_egui::pane::{LayerTimeState, PaneState};
@@ -47,6 +51,22 @@ fn pane_animating(extra: &[rustdar_source::id::LayerId]) -> PaneState {
     pane
 }
 
+/// The two arms the divider gives radar here: the whole frame list when radar
+/// is the only thing the pane animates, and what its equal slice of the pane's
+/// pool **bytes** buys when a second layer animates beside it. Desktop, at the
+/// pool floor: **60** (`MAX_LOOP_FRAMES` — a list length, which the texture
+/// bytes do not bound) against **18** (576 MiB of share, halved, at 16 MiB a
+/// frame), where the count division this replaced gave 30.
+fn radar_share(animating: usize) -> usize {
+    let budgets = crate::app::render::test_budgets();
+    crate::app::render::layer_share(
+        crate::app::render::test_loop_allocation(),
+        Some(budgets.loop_frames_held),
+        crate::loop_pool::LoopFrameModel::from_budgets(&budgets).plan_view,
+        animating,
+    )
+}
+
 fn fill(pane: &mut PaneState, minutes: u32) {
     let allocation = crate::app::render::test_loop_allocation();
     let budgets = crate::app::render::test_budgets();
@@ -62,14 +82,13 @@ fn fill(pane: &mut PaneState, minutes: u32) {
 /// from the same fill, so neither can pass on a number chosen here.
 #[test]
 fn a_pane_animating_two_layers_splits_the_frame_cap_between_them() {
-    let budgets = crate::app::render::test_budgets();
-    let whole = crate::app::render::layer_share(budgets.loop_frames_held, 1);
-    let halved = crate::app::render::layer_share(budgets.loop_frames_held, 2);
+    let whole = radar_share(1);
+    let halved = radar_share(2);
     assert!(
         halved < whole,
-        "precondition: this build's cap ({whole}) is big enough that halving \
-         it is a different number, or the test below cannot tell the two \
-         arms apart",
+        "precondition: this build's cap ({whole}) is big enough that dividing \
+         it is a different number ({halved}), or the test below cannot tell \
+         the two arms apart",
     );
 
     let mut alone = pane_animating(&[]);
@@ -95,8 +114,8 @@ fn a_pane_animating_two_layers_splits_the_frame_cap_between_them() {
     assert_eq!(
         shared.loop_state().frames.len(),
         halved,
-        "and a pane animating two fills to half of it - the append path reads \
-         the divided share, not the whole cap",
+        "and a pane animating two fills to what its byte slice buys - the \
+         append path reads the divided share, not the whole cap",
     );
 }
 
@@ -114,9 +133,9 @@ fn a_pane_animating_two_layers_splits_the_frame_cap_between_them() {
 fn a_listing_is_sampled_down_to_the_share_not_to_the_whole_cap() {
     let allocation = crate::app::render::test_loop_allocation();
     let budgets = crate::app::render::test_budgets();
-    let whole = crate::app::render::layer_share(budgets.loop_frames_held, 1);
-    let halved = crate::app::render::layer_share(budgets.loop_frames_held, 2);
-    assert!(halved < whole, "precondition: halving the cap is visible");
+    let whole = radar_share(1);
+    let halved = radar_share(2);
+    assert!(halved < whole, "precondition: dividing the cap is visible");
 
     let scans: Vec<chrono::NaiveDateTime> = (0..200).map(ts).collect();
 

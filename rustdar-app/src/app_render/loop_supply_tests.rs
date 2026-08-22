@@ -381,15 +381,43 @@ fn the_transport_state_and_the_radar_state_are_not_the_same_loop() {
 
 // ── 2. Sampling, and the memory contract as a test ────────────────────────
 
+/// **What one frame of this suite's layer costs before it has rasterized**:
+/// `LoopFrameModel`'s `overlay` arm, which is `overlay_frame_bytes`'s fallback
+/// on a headless pane. It is the device class's default window planned by
+/// `plan_overlay_texture` — 2880x1620x4 = **18.66 MB** on the desktop and
+/// mobile arms, 2048x1152x4 = **9.44 MB** on wasm — and **not** the radar
+/// loop frame's 16 MiB / 4 MiB, which is what this fallback was before WB-7.
+fn overlay_bytes() -> usize {
+    LoopFrameModel::from_budgets(&test_budgets()).overlay
+}
+
+/// Whether [`overlay_bytes`] is still a different number from the radar loop
+/// frame it was before WB-7 — 18.66 MB against 16 MiB on this arm, 9.44 MB
+/// against 4 MiB on wasm. The suite's expected counts are all derived from
+/// `overlay_bytes`, so this is the one thing here that a build pricing an
+/// overlay frame as a radar frame would fail.
+fn held_is_priced_as_an_overlay(frame_bytes: usize) -> bool {
+    frame_bytes != test_budgets().loop_frame_bytes()
+}
+
 /// **The memory contract, asserted rather than written down**: a loop's frame
 /// list times what one frame costs never exceeds the pool share the pane is
 /// holding them in.
 ///
 /// The denominator is stated: `allocation.share_bytes` for a single loop on
 /// this build's own resolved budgets, and `overlay_frame_bytes`'s fallback —
-/// this build's radar loop-frame size — because a headless pane has never
-/// rasterized and so has no texture to measure. A real pane measures its own,
-/// which is larger (a 1280x960-**point** pane is 1920x1440 texels = 11.06 MB).
+/// [`overlay_bytes`], the **class's own overlay frame** — because a headless
+/// pane has never rasterized and so has no texture to measure. A real pane
+/// measures its own (a 1280x960-**point** pane is 1920x1440 texels =
+/// 11.06 MB).
+///
+/// **Floor — `price_the_overlay_as_radar`: make `overlay_frame_bytes` fall
+/// back to `budgets.loop_frame_bytes()`, as it did before WB-7.** The frame
+/// list comes out at 36 on this arm instead of 32 (denominator: the desktop
+/// pool floor, 576 MiB of share, one animating layer, 16 MiB per radar frame
+/// against 18.66 MB per overlay frame) and the count assertion reds. That is
+/// the whole of gap (a): a model frame priced as a radar frame is a model
+/// frame the pool cannot see.
 ///
 /// **Floor: remove the `listing_sample_indices` call from `build_loop_frames`**
 /// — the count assertion reads the whole listing and the byte assertion goes
@@ -397,9 +425,16 @@ fn the_transport_state_and_the_radar_state_are_not_the_same_loop() {
 #[test]
 fn a_long_listing_is_sampled_to_what_the_panes_byte_share_buys() {
     let allocation = test_loop_allocation();
-    let budgets = test_budgets();
-    let frame_bytes = budgets.loop_frame_bytes();
-    let held = overlay_frames_held(allocation, frame_bytes, 1);
+    let frame_bytes = overlay_bytes();
+    assert!(
+        held_is_priced_as_an_overlay(frame_bytes),
+        "precondition: the price this list is built at ({frame_bytes} B) is \
+         the radar loop frame's ({} B). Every figure below reads the overlay \
+         price back off the same model, so with the two equal this whole \
+         suite passes for a build that cannot see an overlay frame at all.",
+        test_budgets().loop_frame_bytes(),
+    );
+    let held = layer_share(allocation, None, frame_bytes, 1);
     assert!(
         held >= 2,
         "precondition: the share must buy a loop at all, and it bought {held}",
@@ -454,7 +489,7 @@ fn a_long_listing_is_sampled_to_what_the_panes_byte_share_buys() {
 #[test]
 fn sampled_says_whether_the_listing_had_to_be_thinned() {
     let allocation = test_loop_allocation();
-    let held = overlay_frames_held(allocation, test_budgets().loop_frame_bytes(), 1);
+    let held = layer_share(allocation, None, overlay_bytes(), 1);
 
     for (count, expected) in [(held / 2, false), (held * 3, true)] {
         let listed: Vec<_> = (0..count as i64).map(|i| ts(i * 60)).collect();
@@ -482,27 +517,27 @@ fn sampled_says_whether_the_listing_had_to_be_thinned() {
 fn a_share_too_small_for_two_frames_still_gets_two() {
     let allocation = test_loop_allocation();
     assert_eq!(
-        overlay_frames_held(allocation, allocation.share_bytes * 4, 1),
+        layer_share(allocation, None, allocation.share_bytes * 4, 1),
         rustdar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE,
         "the floor is where the budget stops being divisible, and it is the \
          one place the byte bound is knowingly exceeded",
     );
     assert_eq!(
-        overlay_frames_held(allocation, 0, 1),
+        layer_share(allocation, None, 0, 1),
         rustdar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE,
         "a frame that costs nothing is a model built wrong, and it must not \
          become an unbounded loop",
     );
 }
 
-/// Two animating layers halve each other's **bytes**, so the frame counts fall
-/// even though `layer_share` — which divides counts — was never asked.
+/// Two animating layers halve each other's **bytes**, and the two of them
+/// together still fit the one share.
 #[test]
 fn two_animating_layers_each_get_half_the_bytes() {
     let allocation = test_loop_allocation();
-    let bytes = test_budgets().loop_frame_bytes();
-    let one = overlay_frames_held(allocation, bytes, 1);
-    let two = overlay_frames_held(allocation, bytes, 2);
+    let bytes = overlay_bytes();
+    let one = layer_share(allocation, None, bytes, 1);
+    let two = layer_share(allocation, None, bytes, 2);
     assert!(
         two < one,
         "a pane animating two layers spends its share twice: {one} frames \
@@ -700,12 +735,12 @@ fn the_radar_arm_produces_the_same_loop_it_always_did() {
     app.poll_overlay_fetch_results();
     app.accept_loop_scan_listings();
 
+    let allocation = app.loop_allocation();
+    let ls_for_cap = app.gui.pane(0).expect("a pane").loop_state();
     let held = layer_share(
-        loop_frames_held(
-            app.loop_allocation(),
-            app.gui.pane(0).expect("a pane").loop_state(),
-            &app.budgets,
-        ),
+        allocation,
+        Some(loop_frames_held(allocation, ls_for_cap, &app.budgets)),
+        LoopFrameModel::from_budgets(&app.budgets).bytes_for(ls_for_cap.view),
         1,
     );
     let expected: Vec<_> = rustdar_egui::pane::listing_sample_indices(scans.len(), held)
