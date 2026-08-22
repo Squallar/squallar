@@ -975,8 +975,11 @@ impl LayerTimeState {
         Self {
             phase: LoopPhase::FetchingScanList,
             span_secs,
-            // The one place `FetchingScanList` is written, so the one place the
-            // clock on that phase starts. See [`Self::listing_since`].
+            // Where a loop first enters `FetchingScanList`, and so where the
+            // clock on that phase starts. See [`Self::listing_since`]. The
+            // shell re-enters the phase when a scrub lands outside the window
+            // it listed (`App::refill_unserved_loop_windows`) and restamps
+            // this there, for the same reason.
             listing_since: Some(web_time::Instant::now()),
             anchor: Some(anchor),
             view,

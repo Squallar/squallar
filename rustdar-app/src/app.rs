@@ -175,6 +175,11 @@ pub struct App {
     /// built in `Apply` — the phase the listing channel's own drain ran in —
     /// so re-pointing the supply did not move when a listing becomes a plan.
     loop_listings_arrived: Vec<render::LoopListingArrival>,
+    /// **What each pane's clock has been asking for that its loop cannot
+    /// answer**, so that a drag through many instants is one question and a
+    /// pane parked on a hole asks once rather than every frame. See
+    /// [`crate::loop_refill`].
+    loop_refill: crate::loop_refill::LoopRefillWatch,
     /// Per-site real-time chunk feeds.
     chunk_feeds: rustdar_radar::chunk_feed::ChunkFeedManager,
     /// Push notification of new chunks.
@@ -464,6 +469,7 @@ impl App {
             pending_state: None,
             loop_mgr: LoopDownloadManager::new(),
             loop_listings_arrived: Vec::new(),
+            loop_refill: Default::default(),
             chunk_feeds: rustdar_radar::chunk_feed::ChunkFeedManager::new(),
             chunk_notify: rustdar_radar::chunk_notify::ChunkNotifier::new(),
             latest_cached_scans: HashMap::new(),

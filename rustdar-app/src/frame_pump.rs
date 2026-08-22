@@ -169,6 +169,15 @@ pub(super) const FRAME_PUMP: &[DrainEntry] = &[
         drains: &[],
         run: super::render::pump_advance_loop_playback,
     },
+    // First in `Dispatch`, and the edge is load-bearing: a refill clears the
+    // window it is replacing, so running it ahead of the render dispatchers
+    // stops them spending a budget on frames that are about to be dropped.
+    DrainEntry {
+        name: "refill_unserved_loop_windows",
+        phase: PumpPhase::Dispatch,
+        drains: &[],
+        run: pump_refill_unserved_loop_windows,
+    },
     // Advance before dispatch: the dispatchers measure a budget that is not being spent on
     // stale panes.
     DrainEntry {
@@ -193,6 +202,13 @@ pub(super) const FRAME_PUMP: &[DrainEntry] = &[
 
 fn pump_poll_scan_results(app: &mut App, _ctx: Option<&egui::Context>) {
     app.poll_scan_results();
+}
+
+/// The frame's own clock is read here and handed down, so the settle the
+/// refill measures is the pump's frame boundary and not a second reading
+/// taken inside the walk.
+fn pump_refill_unserved_loop_windows(app: &mut App, _ctx: Option<&egui::Context>) {
+    app.refill_unserved_loop_windows(web_time::Instant::now());
 }
 
 fn pump_poll_chunk_results(app: &mut App, _ctx: Option<&egui::Context>) {

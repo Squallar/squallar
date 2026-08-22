@@ -249,6 +249,7 @@ const EXPECTED_ROWS: &[(&str, PumpPhase)] = &[
     ("poll_loop_section_results", PumpPhase::Apply),
     ("poll_extract_results", PumpPhase::Apply),
     ("advance_loop_playback", PumpPhase::Advance),
+    ("refill_unserved_loop_windows", PumpPhase::Dispatch),
     ("dispatch_pane_renders", PumpPhase::Dispatch),
     ("dispatch_section_renders", PumpPhase::Dispatch),
     ("dispatch_loop_renders", PumpPhase::Dispatch),

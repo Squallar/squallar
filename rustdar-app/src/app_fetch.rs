@@ -1369,6 +1369,95 @@ impl super::App {
         self.spawn_frame_list_task(task);
     }
 
+    /// **Ask for the instant the clock names, when the loop's own window does
+    /// not reach it.**
+    ///
+    /// The other half of WI-3. That land made a `FrameSeries` layer draw
+    /// nothing when the pane's clock sits before every frame it holds, which is
+    /// right — a frame valid *after* the moment asked about is a fabrication,
+    /// not a fallback — but a loop's frames came from one listing captured at
+    /// enable time and nothing ever widened it, so the blank was permanent
+    /// rather than the pause before an answer. Scrub to 06Z on a pane whose
+    /// oldest frame is 09Z and the data exists at the source; nothing went to
+    /// get it.
+    ///
+    /// **This is the trigger, not the supply.** Which instants are unserved,
+    /// how long a clock must be still to count as a question and how wide a
+    /// window to ask for all live in [`crate::loop_refill`]; what a landed
+    /// listing becomes is `accept_loop_scan_listings`, unchanged. The dispatch
+    /// between them is this function, and it is the same
+    /// `create_frame_list_task` call `handle_enable_loop` makes.
+    ///
+    /// **The pane keeps drawing nothing while the ask is in the air.** The
+    /// frames are cleared, which is what puts the loop back into
+    /// `FetchingScanList` for the acceptance path to find, and which loses
+    /// nothing: the unserved instant is always earlier than the oldest frame
+    /// held, so the window asked for cannot overlap the one being dropped.
+    /// Reinstating the nearest frame here "while we fetch" would look right on
+    /// screen and be the exact bug WI-3 removed.
+    ///
+    /// Every pane, not the visible slice — the same walk
+    /// `accept_loop_scan_listings` makes, for the same reason: a loop is a
+    /// pane's own property and does not stop being supplied because the layout
+    /// currently hides it.
+    pub(super) fn refill_unserved_loop_windows(&mut self, now: web_time::Instant) {
+        let config = self.fetch_config();
+        let watch = &mut self.loop_refill;
+        let (panes, overlays) = self.gui.panes_and_overlays_mut();
+        let mut dispatch = Vec::new();
+        let mut forget = Vec::new();
+        for ask in watch.settled_asks(panes, now) {
+            let idx = ask.pane_idx;
+            // The real pane, hydrated first — see `with_layer_pane`, whose
+            // construction this is; it cannot be called here because the
+            // registry and the panes are already borrowed together.
+            panes[idx].hydrate_layer_states(overlays, idx);
+            let task = {
+                let view = panes[idx].view(idx);
+                let pane_ref = view.layer(&ask.layer);
+                overlays.create_frame_list_task(&ask.layer, &config, &pane_ref, ask.range)
+            };
+            let Some(task) = task else {
+                log::warn!(
+                    "Loop: {} could not list {}..{} for pane {idx}; that instant \
+                     stays blank",
+                    ask.layer.as_str(),
+                    ask.range.0,
+                    ask.range.1,
+                );
+                // Nothing went out, so nothing was asked: let the next settle
+                // try again rather than recording a question that was never put.
+                forget.push(idx);
+                continue;
+            };
+            log::info!(
+                "Loop: pane {idx} is parked at {} with no frame for it; asking {} \
+                 for {}..{}",
+                ask.range.1,
+                ask.layer.as_str(),
+                ask.range.0,
+                ask.range.1,
+            );
+            let ls = panes[idx].transport_state_mut();
+            ls.frames.clear();
+            ls.phase = rustdar_egui::pane::LoopPhase::FetchingScanList;
+            // The clock on the phase starts where the phase does — the frame's
+            // own reading, so a refill's wait is measured the same way a fresh
+            // loop's is.
+            ls.listing_since = Some(now);
+            dispatch.push((idx, task));
+        }
+        for idx in forget {
+            self.loop_refill.forget(idx);
+        }
+        for (idx, task) in dispatch {
+            // The downloads queued for the window being replaced are for frames
+            // this loop no longer has.
+            self.loop_mgr.remove_pending(idx);
+            self.spawn_frame_list_task(task);
+        }
+    }
+
     /// Disable a pane's loop: resets its transport layer to single-frame mode.
     ///
     /// **The mirror of [`Self::handle_enable_loop`], and addressed the same
@@ -1809,15 +1898,21 @@ impl super::App {
     }
 
     /// Re-initialize radar loops on all panes that have an active loop.
+    ///
+    /// The visible slice, walked once rather than indexed: `panes()` yields
+    /// `..min(pane_count, panes.len())` and the index loop this replaced
+    /// visited `0..pane_count` and found `None` past the end, so the set is
+    /// identical — WI-0's proof, applied again. One reach where there were
+    /// two, which is the headroom the refill dispatch above spends.
     pub(super) fn reinit_active_loops(&mut self) {
-        let mut to_reinit = Vec::new();
-        for pane_idx in 0..self.gui.pane_count() {
-            if let Some(pane) = self.gui.pane_mut(pane_idx)
-                && pane.loop_state().is_active()
-            {
-                to_reinit.push((pane_idx, pane.loop_state().span_secs));
-            }
-        }
+        let to_reinit: Vec<(usize, u64)> = self
+            .gui
+            .panes()
+            .iter()
+            .enumerate()
+            .filter(|(_, pane)| pane.loop_state().is_active())
+            .map(|(pane_idx, pane)| (pane_idx, pane.loop_state().span_secs))
+            .collect();
         for (pane_idx, lookback_secs) in to_reinit {
             self.handle_enable_loop(pane_idx, lookback_secs);
         }
@@ -2376,6 +2471,10 @@ mod forward_range_tests;
 #[path = "app_fetch/backward_loop_tests.rs"]
 #[cfg(test)]
 mod backward_loop_tests;
+
+#[path = "app_fetch/loop_refill_dispatch_tests.rs"]
+#[cfg(test)]
+mod loop_refill_dispatch_tests;
 
 #[path = "app_fetch/melting_layer_dispatch_tests.rs"]
 #[cfg(test)]
