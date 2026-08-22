@@ -217,6 +217,12 @@ pub struct OverlayTextureCache {
     /// Currently displayed texture (if any) — **whole**, always.
     current: Option<OverlayTextureData>,
     held: Option<HeldOverlayTexture>,
+    /// Whether a picture that was still crossing to the GPU has already been
+    /// thrown away since the last one reached the screen. Cleared the moment
+    /// [`Self::held`] empties by any route; see the coverage arm of
+    /// [`Self::needs_rerender_with_policy`], which is the only thing that reads
+    /// it and the only dispatch it brakes.
+    hold_superseded: bool,
     pub render_in_flight: bool,
     /// The zoom [`Self::needs_rerender`] was asked about last time, which is
     /// how it notices the zoom moving and re-stamps [`Self::zoom_still_since`].
@@ -238,6 +244,7 @@ impl OverlayTextureCache {
         Self {
             current: None,
             held: None,
+            hold_superseded: false,
             render_in_flight: false,
             last_seen_zoom: None,
             zoom_still_since: f64::NEG_INFINITY,
@@ -251,11 +258,15 @@ impl OverlayTextureCache {
     /// Put `data` on screen now, and let go of anything being held.
     pub fn show(&mut self, data: OverlayTextureData) {
         self.held = None;
+        self.hold_superseded = false;
         self.current = Some(data);
     }
 
     /// Hold `data` until its pixels have all reached the GPU.
     pub fn hold(&mut self, data: OverlayTextureData, data_time: Option<chrono::NaiveDateTime>) {
+        // Replacing a hold discards an upload that had already started, and the
+        // coverage arm is not allowed to do that twice running.
+        self.hold_superseded |= self.held.is_some();
         self.held = Some(HeldOverlayTexture { data, data_time });
     }
 
@@ -275,6 +286,7 @@ impl OverlayTextureCache {
         if !delivered(self.held.as_ref()?.data.texture.id()) {
             return None;
         }
+        self.hold_superseded = false;
         self.held.take()
     }
 
@@ -282,11 +294,13 @@ impl OverlayTextureCache {
     pub fn clear(&mut self) {
         self.current = None;
         self.held = None;
+        self.hold_superseded = false;
     }
 
     /// Let go of a held picture without showing it.
     pub fn release_hold(&mut self) {
         self.held = None;
+        self.hold_superseded = false;
     }
 
     pub fn zoom_is_stale(&self, zoom: f64) -> bool {
@@ -335,7 +349,10 @@ impl OverlayTextureCache {
         let settled = now >= self.zoom_still_since + SETTLE_REPAINT_DELAY.as_secs_f64();
 
         // The newest picture this cache has — see the doc note. A held picture
-        // outranks the one on screen: it is what a dispatch would supersede.
+        // outranks the one on screen for every question below about *what the
+        // next picture should be*: it is what a dispatch would supersede. The
+        // coverage arm at the end asks a different question and takes a
+        // different picture; see there.
         let Some(tex) = self
             .held
             .as_ref()
@@ -363,7 +380,60 @@ impl OverlayTextureCache {
         if settled && tex.render_zoom != quantize_zoom(zoom) {
             return true;
         }
-        pan_exceeds_coverage(&tex.placed.geo, viewport_bounds)
+
+        // ── Coverage ────────────────────────────────────────────────────────
+        //
+        // Everything above asks what the *next* picture should be, and takes
+        // the held one because that is what a dispatch would supersede.
+        // Coverage is not that question. It asks whether the pane is about to
+        // run off the edge of what it is **drawing**, and what it is drawing is
+        // `current` until [`Self::take_held_if_delivered`] has seen every band
+        // land — 2 frames on a device with a staging ring and 3 without.
+        //
+        // Three things have to hold before a raster is worth asking for. All
+        // three were swept together on the 60 Hz dispatch loop this module's
+        // `PAN_REBUILD_THRESHOLD` note describes, extended to supersede a hold
+        // the way [`Self::hold`] really does — five pipeline shapes (raster 0-2
+        // frames x upload 2-5) against nine thresholds — and the three of them
+        // together change no sustainable pan speed anywhere on that grid, in
+        // either direction, at any threshold at or above 0.3. What the tree
+        // itself still checks is in `coverage_dispatch_tests`.
+        let displayed = self.current.as_ref().unwrap_or(tex);
+
+        // **What is on screen has run out of margin.** While it still has
+        // some, nothing is dispatched, whatever a picture the viewer cannot
+        // see yet may have run out of. The two disagree wherever a pan
+        // reverses: the hold was rasterised for a viewport the map has already
+        // left, so it can be the one short of margin while the picture being
+        // drawn still has room, and dispatching there throws away an upload the
+        // viewer had no need of.
+        if !pan_exceeds_coverage(&displayed.placed.geo, viewport_bounds) {
+            return false;
+        }
+
+        // **And so has the newest picture**, or the hold already answers this:
+        // it was rasterised for a later viewport than the one on screen, and it
+        // is what will *be* on screen once its last band lands. When nothing is
+        // held these two are the same texture and this is one test asked twice.
+        if !pan_exceeds_coverage(&tex.placed.geo, viewport_bounds) {
+            return false;
+        }
+
+        // **And this pane has not already thrown one away.** [`Self::hold`]
+        // replaces rather than queues, so a coverage dispatch made against a
+        // pending hold discards a whole upload — and its replacement is
+        // discarded in turn by the next one. Past roughly 2.3x the sustainable
+        // pan that closes into a loop with no exit, and the loop is the fling:
+        // over the 600 counted frames of
+        // `coverage_dispatch_tests::a_fling_the_pipeline_cannot_follow_still_puts_pictures_on_screen`,
+        // the unbraked rule spent 300 full-size rasters, threw away all 300
+        // mid-upload, promoted **none**, and left the pane drawing the picture
+        // it had when the fling started.
+        //
+        // This is the only arm braked. A hold that is stale in *content* is
+        // still superseded, by the arms above, however many have been
+        // superseded before it.
+        !(self.hold_superseded && self.held.is_some())
     }
 }
 
@@ -552,6 +622,11 @@ mod hold_tests;
 /// answered.
 #[cfg(test)]
 mod settle_tests;
+
+/// Whose picture the coverage question is asked of, and what a coverage
+/// dispatch may throw away.
+#[cfg(test)]
+mod coverage_dispatch_tests;
 
 #[cfg(test)]
 mod geo_click_tests;
