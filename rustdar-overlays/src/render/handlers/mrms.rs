@@ -13,19 +13,47 @@
 //!   `overlay/model` codec row rather than adding a byte-identical second wire
 //!   form. `texture_tests::raster_input_owner` is where that sharing is stated.
 //!
-//! `TimeAxis::Live`, deliberately. MRMS publishes stamped granules every two
-//! minutes and *could* be a frame series, but exactly two layers declare
-//! `FrameSeries` today and `sources.rs`'s
-//! `radar_takes_the_clock_wherever_it_is_drawn` says in as many words that a
-//! third changes which layer a pane's clock follows and must be **ruled on,
-//! not absorbed**. This layer draws the latest thing it fetched.
+//! # The clock, and the frames (WB-10)
+//!
+//! `TimeAxis::FrameSeries` at a ~two-minute step, reaching no further forward
+//! than the wall clock. MRMS held `TimeAxis::Live` until the ruling
+//! `radar_takes_the_clock_wherever_it_is_drawn` demanded was made; it is made
+//! now, and it is recorded in that pin: **the weight order stands.** MRMS
+//! joins the frame-series set at its existing weight of 15 — above the model
+//! (10) and GMGSI (5), below radar (30) — and therefore takes the clock on
+//! any radar-off pane that also shows the model or the satellite. MRMS *is*
+//! observed radar, a mosaic of the same physics, so on a pane without
+//! single-site radar it is the most radar-like clock available, and its
+//! two-minute cadence is the finest scrub grain of the non-radar layers.
+//!
+//! **No `min_loop_frames` floor, stated rather than omitted.** GMGSI and the
+//! model declare 13 because their frames are an hour apart and the Lookback
+//! slider's default hour would buy two. At MRMS's 120 s cadence that same
+//! default hour is already ~30 frames, so the slider's own spans yield real
+//! loops everywhere and the layer takes the trait's 0. A floor under 31
+//! frames would be dead code at the default span; one past it would *widen*
+//! every MRMS pane's rail for no reason. Neither buys anything.
+//!
+//! # Grids are a staging area; the loop holds textures
+//!
+//! The same design as [`super::gmgsi`], at a heavier weight: one CONUS grid
+//! is 98,000,000 B and one decode peaks ~147 MB transient, so
+//! [`crate::mrms::FRAME_STAGING_BYTES`] stages **one** granule on every arm
+//! and [`MrmsHandler::frame_gate`] serialises the frame fetches. A loop frame
+//! is a rasterized *texture* held by the pane; the granule is what one frame
+//! passes through on its way to becoming one, and `prepare_job` reads
+//! `ctx.frame` before the pane's selection so an unstaged frame describes
+//! **no job** rather than another stamp's picture.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::fetch_policy::Whole;
-use crate::mrms::{GRID_CACHE_BYTES, MrmsFetchResult, MrmsGrid, MrmsProduct};
+use crate::mrms::{
+    FRAME_STAGING_BYTES, GRID_CACHE_BYTES, MrmsFetchResult, MrmsFrameFetch, MrmsGrid, MrmsListing,
+    MrmsProduct,
+};
 use crate::render::controls::{
     ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue,
 };
@@ -34,8 +62,119 @@ use crate::render::overlay_state::{
     PaneRef, RasterizeContext, RenderMode, Signed, Surface,
 };
 use crate::render::rasterize;
+use rustdar_source::handler::{FrameListingResult, TaskFuture};
 use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
+use rustdar_source::time::{FrameListing, FrameStamp, TimeAxis};
+
+/// **One frame's granule at a time, application-wide** — the same shape as
+/// GMGSI's gate, needed harder here: `dispatch_loop_frame_fetches` has no
+/// throttle of its own, and one MRMS decode peaks ~147 MB transient (49 MB
+/// PNG image buffer + the 98 MB values vector, `crate::mrms::decode`'s own
+/// arithmetic). Thirty unthrottled fetches — one slider-default hour at the
+/// ~2-minute cadence — would hold ~4.4 GB in flight before any cache saw a
+/// byte.
+///
+/// Serialising costs almost no wall time: the bytes are the bottleneck either
+/// way, and FIFO fairness means granules arrive in render-set order, which is
+/// playhead outward.
+type FrameGate = Arc<futures::lock::Mutex<()>>;
+
+/// A staged loop-frame granule's identity: **the product and the stamp it
+/// depicts**.
+///
+/// No run, and none is invented on the way back out either: MRMS is observed
+/// data with no cycle behind it, so [`FrameStamp::run`] is `None` in every
+/// stamp this layer names and in every stamp it is asked about. The stamp
+/// carries the granule's own non-clock-aligned seconds (`000039`, `000242`),
+/// exactly as the listing read them off the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FrameKey {
+    product: MrmsProduct,
+    valid: chrono::NaiveDateTime,
+}
+
+/// The staged loop-frame granules, bounded by **bytes** and evicted
+/// least-recently-used first.
+///
+/// Deliberately **not** [`MrmsGridCache`]: that one is keyed by product and
+/// holds the pane's live picture, so thirty stamps of one product would
+/// overwrite each other in it and the pinned live granule would fight the
+/// loop for its slot. Two stores, two purposes, two budgets, and the live one
+/// is unchanged by this item.
+struct MrmsFrameCache {
+    entries: HashMap<FrameKey, MrmsGrid>,
+    recency: RefCell<Vec<FrameKey>>,
+    /// Injected for the same reason [`MrmsGridCache::budget`] is: the shipped
+    /// budget is one 98 MB mosaic and no test can afford to overflow it.
+    budget: usize,
+}
+
+impl MrmsFrameCache {
+    fn new(budget: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            recency: RefCell::new(Vec::new()),
+            budget,
+        }
+    }
+
+    fn touch(&self, key: FrameKey) {
+        let mut recency = self.recency.borrow_mut();
+        if let Some(pos) = recency.iter().position(|k| *k == key) {
+            recency.remove(pos);
+            recency.push(key);
+        }
+    }
+
+    fn get(&self, key: FrameKey) -> Option<&MrmsGrid> {
+        let grid = self.entries.get(&key)?;
+        self.touch(key);
+        Some(grid)
+    }
+
+    fn resident_bytes(&self) -> usize {
+        self.entries.values().map(|g| g.resident_bytes()).sum()
+    }
+
+    /// **Nothing is pinned.** A staged granule evicted before its job is
+    /// described costs one frame its picture until the next listing; a staged
+    /// granule *kept* past the budget costs 98 MB on an arm that has already
+    /// said it cannot spare it. The live cache makes the opposite trade
+    /// because a pane with no live granule has nothing that will re-ask.
+    fn insert(&mut self, key: FrameKey, grid: MrmsGrid) {
+        if self.entries.insert(key, grid).is_some() {
+            self.touch(key);
+        } else {
+            self.recency.borrow_mut().push(key);
+        }
+        while self.resident_bytes() > self.budget {
+            let victim = {
+                let mut recency = self.recency.borrow_mut();
+                let Some(pos) = recency.iter().position(|k| *k != key) else {
+                    // The arrival alone is left and it is over budget by
+                    // itself: keeping it is what lets the pipeline advance at
+                    // all, and the build-time floor makes this unreachable in
+                    // the shipped configuration.
+                    break;
+                };
+                recency.remove(pos)
+            };
+            self.entries.remove(&victim);
+        }
+    }
+
+    /// Drop everything but `keep` — the [`OverlayHandler::retain_frames`] door.
+    fn retain(&mut self, keep: impl Fn(FrameKey) -> bool) {
+        self.entries.retain(|key, _| keep(*key));
+        self.recency.borrow_mut().retain(|key| keep(*key));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
 
 /// The resident mosaics, bounded by **bytes** and evicted least-recently-used
 /// first.
@@ -162,6 +301,17 @@ pub(crate) struct MrmsHandler {
     pub defaults: MrmsPaneState,
     cached_grids: MrmsGridCache,
     pub last_error: Option<String>,
+    /// **What object each listed stamp holds**, per product — the whole of
+    /// what a listing bought. `list_frames` reads its keys and `fetch_frame`
+    /// reads its values, so a frame costs a share of 1 day-LIST at listing
+    /// time and 1 GET at fetch time rather than 2 round trips each.
+    frame_keys: HashMap<MrmsProduct, std::collections::BTreeMap<chrono::NaiveDateTime, String>>,
+    /// Windows a **complete** listing has covered, per product. A listing that
+    /// errored or was sampled leaves no row, so `list_frames` goes on saying
+    /// "at least these" for that window.
+    covered: HashMap<MrmsProduct, Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime)>>,
+    frame_grids: MrmsFrameCache,
+    frame_gate: FrameGate,
 }
 
 impl MrmsHandler {
@@ -171,7 +321,35 @@ impl MrmsHandler {
             defaults: MrmsPaneState::new(false),
             cached_grids: MrmsGridCache::new(GRID_CACHE_BYTES),
             last_error: None,
+            frame_keys: HashMap::new(),
+            covered: HashMap::new(),
+            frame_grids: MrmsFrameCache::new(FRAME_STAGING_BYTES),
+            frame_gate: Arc::new(futures::lock::Mutex::new(())),
         }
+    }
+
+    /// The shipped handler with its staging area sized to `bytes` instead of
+    /// [`FRAME_STAGING_BYTES`], for the reason [`MrmsGridCache::budget`] is
+    /// injected: the shipped figure is one 98 MB mosaic, no test can build
+    /// one, and an eviction policy that is never overflowed is a policy
+    /// nothing has checked.
+    #[cfg(test)]
+    fn with_frame_budget(bytes: usize) -> Self {
+        Self {
+            frame_grids: MrmsFrameCache::new(bytes),
+            ..Self::new()
+        }
+    }
+
+    /// Whether a complete listing of this product has already covered `range`.
+    fn covers(
+        &self,
+        product: MrmsProduct,
+        range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+    ) -> bool {
+        self.covered
+            .get(&product)
+            .is_some_and(|windows| windows.iter().any(|w| w.0 <= range.0 && range.1 <= w.1))
     }
 
     fn view<'a>(&'a self, pane: &PaneRef<'a>) -> &'a MrmsPaneState {
@@ -238,6 +416,12 @@ impl OverlayHandler for MrmsHandler {
     /// **15**: above the model's 10 and below the outlooks' 20. A national
     /// mosaic covers a model field and is covered by the risk polygons drawn
     /// over both.
+    ///
+    /// Since WB-10 this weight is also half of the clock ruling: the transport
+    /// is the topmost enabled `FrameSeries` layer with **zero special cases**,
+    /// so 15 is what makes MRMS the clock of a radar-off pane that also shows
+    /// the model or the satellite. `radar_takes_the_clock_wherever_it_is_drawn`
+    /// pins the ordering and records why.
     fn draw_order_weight(&self) -> u32 {
         15
     }
@@ -329,6 +513,239 @@ impl OverlayHandler for MrmsHandler {
         Vec::new() // Gridded, not feature-based; hover uses `hover_value_at`.
     }
 
+    // -- Time -----------------------------------------------------------------
+
+    /// One national mosaic every ~two minutes, stamped with the instant it
+    /// depicts, and never one for an instant that has not happened: discrete
+    /// frames that stop at the wall clock.
+    ///
+    /// `typical_step` is nominal — the real stamps are not clock-aligned and
+    /// occasionally skip a beat — which is exactly what a *typical* step is
+    /// for. **No `min_loop_frames` accompanies it**: at this cadence the
+    /// Lookback slider's default hour is already ~30 frames, so the slider's
+    /// own spans yield real loops and a floor would widen every MRMS pane's
+    /// rail for nothing.
+    fn time_axis(&self) -> TimeAxis {
+        TimeAxis::FrameSeries {
+            typical_step: std::time::Duration::from_secs(120),
+            extends_future: false,
+        }
+    }
+
+    /// **The stamps this product's listings have found inside `range`.**
+    ///
+    /// Synchronous and I/O-free: it reads the keys
+    /// [`Self::create_frame_list_task`] filed and nothing else. Every stamp
+    /// carries `run: None` — MRMS is observed, there is no cycle behind it.
+    ///
+    /// `complete` only where a listing that really covered this window landed:
+    /// a failed or sampled listing leaves the answer readable as "at least
+    /// these", which is what it is.
+    fn list_frames(
+        &self,
+        _ctx: &FetchConfig,
+        pane: &PaneRef<'_>,
+        range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+    ) -> FrameListing {
+        let product = self.view(pane).selected_product;
+        let frames: Vec<FrameStamp> = self
+            .frame_keys
+            .get(&product)
+            .map(|keys| {
+                keys.range(range.0..=range.1)
+                    .map(|(valid, _)| FrameStamp {
+                        valid: *valid,
+                        run: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        FrameListing {
+            range,
+            frames,
+            complete: self.covers(product, range),
+        }
+    }
+
+    /// **1 LIST per UTC day the window touches** — at most two for any window
+    /// the Lookback slider can name, bounded at
+    /// [`crate::mrms::fetch::MAX_FRAME_LIST_REQUESTS`].
+    ///
+    /// Cheaper per frame than GMGSI's listing, and the reason is worth
+    /// keeping straight: GMGSI's object names end in an unpredictable creation
+    /// stamp, so every frame's object must be found with its own hour LIST.
+    /// An MRMS key is a pure function of its own timestamp, so **one day
+    /// prefix LIST names the whole day's ~720 stamps in one page**, and the
+    /// GETs later are ~1.3 MB gzipped apiece. The archive is real and deep —
+    /// the day prefixes reach back to 2020-10-14 — so any window the rail can
+    /// name is listable.
+    ///
+    /// The product is captured here, at dispatch, and travels in the scope.
+    fn create_frame_list_task(
+        &self,
+        ctx: &FetchConfig,
+        pane: &PaneRef<'_>,
+        range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+    ) -> Option<FetchTask> {
+        let product = self.view(pane).selected_product;
+        let client = ctx.client.clone();
+        let sources = ctx.sources.clone();
+        Some(FrameListingResult::task(known::MRMS, async move {
+            let (keys, complete) =
+                crate::mrms::fetch::list_frame_keys(&client, &sources, product, range).await;
+            FrameListingResult {
+                listing: FrameListing {
+                    range,
+                    frames: keys
+                        .iter()
+                        .map(|(valid, _)| FrameStamp {
+                            valid: *valid,
+                            run: None,
+                        })
+                        .collect(),
+                    complete,
+                },
+                scope: Box::new(MrmsListing {
+                    product,
+                    range,
+                    keys,
+                    complete,
+                }),
+            }
+        }))
+    }
+
+    /// **One GET, on the key a listing already found**, behind [`FrameGate`].
+    ///
+    /// `None` for a stamp no listing of this product named, and `None` for one
+    /// already staged — both are the contract's own answers, and neither is a
+    /// throttle. The throttle is inside the task: it takes the gate before it
+    /// touches the network, so the whole render set may be dispatched at once
+    /// (which it is — `dispatch_loop_frame_fetches` has no throttle of its
+    /// own) while only one ~147 MB-peak decode exists at a time.
+    fn fetch_frame(
+        &self,
+        ctx: &FetchConfig,
+        pane: &PaneRef<'_>,
+        stamp: &FrameStamp,
+    ) -> Option<FetchTask> {
+        let product = self.view(pane).selected_product;
+        let key = FrameKey {
+            product,
+            valid: stamp.valid,
+        };
+        if self.frame_grids.entries.contains_key(&key) {
+            return None;
+        }
+        let object = self.frame_keys.get(&product)?.get(&stamp.valid)?.clone();
+        let client = ctx.client.clone();
+        let sources = ctx.sources.clone();
+        let gate = Arc::clone(&self.frame_gate);
+        let valid = stamp.valid;
+        let future: TaskFuture = Box::pin(async move {
+            let _one_at_a_time = gate.lock().await;
+            let grid =
+                match crate::mrms::fetch::fetch_key(&client, &sources, product, &object).await {
+                    Ok(grid) => Some(grid),
+                    Err(e) => {
+                        log::error!("MRMS frame fetch failed for {product:?} valid {valid}: {e:?}");
+                        None
+                    }
+                };
+            Box::new(MrmsFrameFetch {
+                product,
+                valid,
+                grid,
+            }) as FetchPayload
+        });
+        Some(FetchTask {
+            kind: known::MRMS,
+            future,
+        })
+    }
+
+    /// **The staged granules of this pane's own product** — at most one, by
+    /// [`FRAME_STAGING_BYTES`], however many frames the loop holds.
+    ///
+    /// This pane's product and not the whole store: another pane's rate
+    /// granule is not a frame this pane can draw, and offering it would have
+    /// the dispatch describe a job that paints the wrong field.
+    fn frames_resident(&self, pane: &PaneRef<'_>) -> Vec<FrameStamp> {
+        let product = self.view(pane).selected_product;
+        let mut frames: Vec<FrameStamp> = self
+            .frame_grids
+            .entries
+            .keys()
+            .filter(|key| key.product == product)
+            .map(|key| FrameStamp {
+                valid: key.valid,
+                run: None,
+            })
+            .collect();
+        frames.sort_by_key(|stamp| stamp.valid);
+        frames
+    }
+
+    /// Drop every staged granule not in `keep`, matching on the stamp alone —
+    /// a caller's stamps carry the `run: None` this layer names, and a stamp
+    /// rebuilt from a bare instant carries it too.
+    ///
+    /// **Nothing above calls this yet** (the one production frame-eviction
+    /// authority is still the byte budget inside each layer), so it is
+    /// exercised by this layer's own suite rather than by the loop.
+    fn retain_frames(&mut self, pane: &PaneRef<'_>, keep: &[FrameStamp]) {
+        let product = self.view(pane).selected_product;
+        self.frame_grids.retain(|key| {
+            key.product != product || keep.iter().any(|stamp| stamp.valid == key.valid)
+        });
+    }
+
+    /// File a listing under the product it was **dispatched for**, never the
+    /// one the arriving pane holds: a `PaneRef` on this path is the union
+    /// across panes and its config is null by construction.
+    fn apply_frame_listing(
+        &mut self,
+        _listing: FrameListing,
+        scope: FetchPayload,
+        _pane: &PaneRef<'_>,
+    ) {
+        let Ok(scope) = scope.downcast::<MrmsListing>() else {
+            log::error!("a frame listing reached the MRMS layer under another layer's scope");
+            return;
+        };
+        let keys = self.frame_keys.entry(scope.product).or_default();
+        for (valid, object) in scope.keys {
+            keys.insert(valid, object);
+        }
+        // Coverage only for a listing that really covered the window: a failed
+        // or sampled one must not leave `list_frames` claiming it is settled.
+        if scope.complete && !self.covers(scope.product, scope.range) {
+            self.covered
+                .entry(scope.product)
+                .or_default()
+                .push(scope.range);
+        }
+    }
+
+    /// Stage one frame's granule under the `(product, stamp)` its fetch was
+    /// dispatched for. A failed fetch stages nothing and the frame keeps no
+    /// picture.
+    fn apply_frame(&mut self, _stamp: FrameStamp, data: FetchPayload, _pane: &PaneRef<'_>) {
+        let Ok(frame) = data.downcast::<MrmsFrameFetch>() else {
+            log::error!("a frame reached the MRMS layer under another layer's payload");
+            return;
+        };
+        let MrmsFrameFetch {
+            product,
+            valid,
+            grid,
+        } = *frame;
+        let Some(grid) = grid else {
+            return;
+        };
+        self.frame_grids.insert(FrameKey { product, valid }, grid);
+    }
+
     fn apply_fetch_result(&mut self, result: FetchPayload, pane: &PaneRef<'_>) {
         let Some(fetch) = self.state.downcast_round::<MrmsFetchResult>(result) else {
             log::error!("MRMS handler received unexpected fetch result type");
@@ -418,8 +835,29 @@ impl OverlayHandler for MrmsHandler {
     /// of the resident mosaic, so describing the job costs a refcount and the
     /// 98 MB never moves. The values memcpy happens only in the web encoder,
     /// which knows the texture's bounds and writes the window's rows alone.
-    fn prepare_job(&self, _ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
-        let grid = self.cached_grids.get(self.view(pane).selected_product)?;
+    ///
+    /// **A named frame is drawn from that frame's own granule.** `ctx.frame`
+    /// is read before the pane's selection, and the lookup goes to the staging
+    /// store keyed by the stamp — never to the live cache, which holds one
+    /// granule per product and would hand every frame of a loop the same
+    /// picture. A named frame whose granule is not staged **describes no job
+    /// at all** rather than falling back to the pane's own picture: that
+    /// fallback is one instant's mosaic presented, unlabelled, as another's,
+    /// and it is the exact defect the frame-addressed dispatch exists to
+    /// prevent.
+    ///
+    /// The refcount is also what frees the staging slot: the job owns the
+    /// raster from here, so the store may evict the entry on the very next
+    /// arrival without the raster going anywhere.
+    fn prepare_job(&self, ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
+        let product = self.view(pane).selected_product;
+        let grid: &MrmsGrid = match ctx.frame {
+            Some(stamp) => self.frame_grids.get(FrameKey {
+                product,
+                valid: stamp.valid,
+            })?,
+            None => self.cached_grids.get(product)?,
+        };
         Some(DescribedJob::new(rasterize::GriddedInput::Resident(
             Arc::clone(&grid.grid),
         )))

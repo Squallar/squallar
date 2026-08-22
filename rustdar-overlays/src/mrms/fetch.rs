@@ -224,30 +224,8 @@ async fn fetch_latest_inner(
     product: MrmsProduct,
 ) -> Result<MrmsGrid, FetchError> {
     let key = latest_key(client, sources, product).await?;
-    let url = sources.s3_object_url(&sources.mrms_bucket, &key);
-    log::info!("Fetching MRMS {} from {url}", product.as_str());
-
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| FetchError::from_transport(&e, format!("MRMS request failed: {e}")))?;
-    if !resp.status().is_success() {
-        // `IsRoutine`: the key came out of a listing, so a 404 here means the
-        // object was expired or replaced between the two requests — normal, and
-        // the next poll two minutes later will name a different key.
-        return Err(FetchError::from_status(
-            resp.status(),
-            NotFound::IsRoutine,
-            format!("MRMS {key}: HTTP {}", resp.status()),
-        ));
-    }
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| FetchError::from_transport(&e, format!("MRMS body read failed: {e}")))?;
-
-    decode_body(&body, product)
+    log::info!("Fetching MRMS {} key {key}", product.as_str());
+    fetch_key(client, sources, product, &key).await
 }
 
 /// gunzip and decode, with the domain refusal kept **permanent** and everything
@@ -263,6 +241,148 @@ pub(crate) fn decode_body(body: &[u8], product: MrmsProduct) -> Result<MrmsGrid,
             FetchError::transient(message)
         }
     })
+}
+
+/// **The most day prefixes one frame listing will ever request.**
+///
+/// A ceiling on request *count*, not on the window: past it the days are
+/// evenly sampled with both ends kept, so a wider window still spans the same
+/// ground with fewer days listed inside it, and the listing says
+/// `complete: false`.
+///
+/// Four is double the widest window the Lookback slider can name — 1440
+/// minutes touches at most **two** UTC day prefixes — so it does not bind on
+/// any window a user can ask for today. Where GMGSI's counterpart is 26, this
+/// is 4, because the unit of listing is different: an MRMS day prefix answers
+/// every stamp of its ~720-granule day in **one** request (S3 pages at 1000),
+/// where a GMGSI hour prefix answers one.
+pub(crate) const MAX_FRAME_LIST_REQUESTS: usize = 4;
+
+/// The UTC days whose prefixes cover `range`, at most
+/// [`MAX_FRAME_LIST_REQUESTS`] of them, **endpoint-anchored** when there are
+/// more days than that.
+pub(crate) fn days_in_range(range: (NaiveDateTime, NaiveDateTime)) -> Vec<NaiveDate> {
+    let (first, last) = (range.0.date(), range.1.date());
+    if last < first {
+        return Vec::new();
+    }
+    let n = (last - first).num_days() as usize + 1;
+    if n <= MAX_FRAME_LIST_REQUESTS {
+        return (0..n).map(|k| first + Duration::days(k as i64)).collect();
+    }
+    // Both ends exact: index 0 and index `n - 1` are always produced, so the
+    // ground the window covers is unchanged and only its resolution falls.
+    let m = MAX_FRAME_LIST_REQUESTS;
+    (0..m)
+        .map(|k| first + Duration::days((k * (n - 1) / (m - 1)) as i64))
+        .collect()
+}
+
+/// The valid time an MRMS object key carries in its own name —
+/// `..._YYYYMMDD-HHMMSS.grib2.gz` — or `None` for a key that is not one.
+///
+/// Read off the key rather than off GRIB2 section 1 because at listing time
+/// there are no GRIB2 bytes: the stamp is what a frame is *addressed* by, and
+/// the granule's own section-1 time is what the live path reports once the
+/// bytes arrive.
+pub(crate) fn key_valid_time(key: &str) -> Option<NaiveDateTime> {
+    let name = key.rsplit('/').next()?;
+    let stem = name.strip_suffix(".grib2.gz")?;
+    let (_, stamp) = stem.rsplit_once('_')?;
+    NaiveDateTime::parse_from_str(stamp, "%Y%m%d-%H%M%S").ok()
+}
+
+/// **Every granule of `product` inside `range`, as `(valid stamp, object
+/// key)`, with whether that is known to be all of them.**
+///
+/// The cost, with its denominator: **1 LIST per UTC day the window touches**
+/// — at most two for any window the Lookback slider can name, ~90 KB of XML
+/// each — and **1 GET per frame later**, ~1.3 MB gzipped apiece. Per frame
+/// that is *cheaper* than GMGSI, whose unpredictable creation stamps force 1
+/// LIST per hour; MRMS keys are pure functions of their own timestamp, so one
+/// day listing names the whole day's ~720 stamps at once. At the slider's
+/// default hour a loop is one LIST and ~30 GETs (~40 MB), serialised by the
+/// handler's frame gate.
+///
+/// The key is carried rather than the stamp alone because **timestamps are
+/// not clock-aligned** (`000039`, `000242`, `000442`): a stamp cannot be
+/// rounded back into a key, so a frame fetched later would otherwise have to
+/// re-list its day.
+///
+/// A day with no keys is an ordinary absence and does not make the answer
+/// incomplete. A listing that *errored* does, and so does a range wider than
+/// [`MAX_FRAME_LIST_REQUESTS`] days.
+pub async fn list_frame_keys(
+    client: &reqwest::Client,
+    sources: &DataSources,
+    product: MrmsProduct,
+    range: (NaiveDateTime, NaiveDateTime),
+) -> (Vec<(NaiveDateTime, String)>, bool) {
+    let days = days_in_range(range);
+    let sampled = match (days.first(), days.last()) {
+        (Some(first), Some(last)) => (*last - *first).num_days() as usize + 1 != days.len(),
+        _ => false,
+    };
+    let mut keys: Vec<(NaiveDateTime, String)> = Vec::new();
+    let mut every_day_answered = true;
+    for day in days {
+        // The first day's listing is bounded to the window's own start — the
+        // same `start-after` economy the live poll uses, ~1 KB against ~90 KB.
+        let start_after =
+            (day == range.0.date() && range.0.time() != chrono::NaiveTime::MIN).then_some(range.0);
+        match list_day(client, sources, product, day, start_after).await {
+            Ok(listed) => {
+                keys.extend(listed.into_iter().filter_map(|key| {
+                    let valid = key_valid_time(&key)?;
+                    (range.0 <= valid && valid <= range.1).then_some((valid, key))
+                }));
+            }
+            Err(e) => {
+                every_day_answered = false;
+                log::warn!("MRMS frame listing of {day} failed: {e:?}");
+            }
+        }
+    }
+    keys.sort_by_key(|(valid, _)| *valid);
+    keys.dedup_by(|a, b| a.0 == b.0);
+    log::info!(
+        "MRMS {}: listed {} frames in the window",
+        product.as_str(),
+        keys.len(),
+    );
+    (keys, every_day_answered && !sampled)
+}
+
+/// **One granule, by the key a listing already found**, decoded.
+///
+/// The GET half of [`fetch_latest`], for the frame path: a loop frame's key
+/// came off [`list_frame_keys`] and must not be re-listed to be fetched.
+pub async fn fetch_key(
+    client: &reqwest::Client,
+    sources: &DataSources,
+    product: MrmsProduct,
+    key: &str,
+) -> Result<MrmsGrid, FetchError> {
+    let url = sources.s3_object_url(&sources.mrms_bucket, key);
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| FetchError::from_transport(&e, format!("MRMS request failed: {e}")))?;
+    if !resp.status().is_success() {
+        // `IsRoutine`: the key came out of a listing, so a 404 here means the
+        // object was expired or replaced between the two requests.
+        return Err(FetchError::from_status(
+            resp.status(),
+            NotFound::IsRoutine,
+            format!("MRMS {key}: HTTP {}", resp.status()),
+        ));
+    }
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| FetchError::from_transport(&e, format!("MRMS body read failed: {e}")))?;
+    decode_body(&body, product)
 }
 
 #[cfg(test)]
@@ -346,6 +466,55 @@ mod tests {
         assert!(!encoded.contains('='), "{encoded}");
         assert!(!encoded.contains('+'), "{encoded}");
         assert!(encoded.contains("%2F") && encoded.contains("%3D"));
+    }
+
+    /// **A frame listing costs 1 LIST per UTC day the window touches, and it
+    /// is bounded.** The widest window the Lookback slider can name is 1440
+    /// minutes, which touches at most two day prefixes — asserted as a const
+    /// so a bound that started binding on a real window is a build failure.
+    #[test]
+    fn a_frame_listing_costs_one_request_per_day_and_is_bounded() {
+        let day = |d: u32| NaiveDate::from_ymd_opt(2026, 8, d).unwrap();
+        let mid = |d: u32| day(d).and_hms_opt(12, 0, 0).unwrap();
+
+        // The slider's own ceiling: 24 h crossing midnight is two days.
+        assert_eq!(days_in_range((mid(20), mid(21))), vec![day(20), day(21)]);
+        const _: () = assert!(2 <= MAX_FRAME_LIST_REQUESTS);
+
+        // A window inside one day is one request.
+        assert_eq!(
+            days_in_range((mid(20), day(20).and_hms_opt(18, 0, 0).unwrap())),
+            vec![day(20)],
+        );
+
+        // A window nothing can ask for today: bounded, both ends kept, in
+        // order, no duplicates.
+        let wide = days_in_range((mid(1), mid(29)));
+        assert_eq!(
+            wide.len(),
+            MAX_FRAME_LIST_REQUESTS,
+            "a 29-day window would be 29 LIST requests unbounded"
+        );
+        assert_eq!(wide.first(), Some(&day(1)));
+        assert_eq!(wide.last(), Some(&day(29)));
+        assert!(wide.windows(2).all(|w| w[0] < w[1]));
+
+        assert!(days_in_range((mid(21), mid(20))).is_empty());
+    }
+
+    /// The stamp a key carries in its own name round-trips through the same
+    /// helper production keys are built with — including the non-clock-aligned
+    /// seconds that make the stamp unreconstructable from a wall clock.
+    #[test]
+    fn a_keys_own_stamp_is_what_the_listing_files_it_under() {
+        let stamp = at(2026, 8, 21, 0, 2) + Duration::seconds(42); // 000242
+        let key = DataSources::mrms_key("MergedReflectivityQCComposite_00.50", &stamp);
+        assert_eq!(key_valid_time(&key), Some(stamp));
+
+        // Not a granule key: no stamp to file under, so it is skipped rather
+        // than misfiled.
+        assert_eq!(key_valid_time("CONUS/PrecipRate_00.00/20260821/"), None);
+        assert_eq!(key_valid_time("MRMS_notastamp.grib2.gz"), None);
     }
 
     /// Garbage in must not decode to a plausible mosaic.
