@@ -1261,8 +1261,18 @@ fn projection_window(
 
     // A grid with a longitude discontinuity — anti-meridian or the cone's own
     // seam — has an `i` neighbour most of a turn away, so the "0.55 of a cell"
-    // reach stops describing it.
-    if coords.wraps_longitude() {
+    // reach stops describing it. On a Lambert grid that costs the `j` axis too:
+    // a row is not a parallel, both indices are axes of the projection plane,
+    // and `detect_longitude_wrap` reports a break found stepping along *either*
+    // of them, so neither axis has a window left. Measured, not argued: with
+    // only `i` widened and `j` narrowed, both wrapping-Lambert suites below
+    // still fail.
+    //
+    // Where the rows *are* parallels the wrap reaches one axis only, and
+    // `index_bounds` answers each on its own terms: the latitude bracket
+    // always, and the column pair when the box does not walk over the axis's
+    // own end. GMGSI is 15,000,000 points and this is the whole of its window.
+    if coords.wraps_longitude() && !coords.rows_are_parallels() {
         return full;
     }
 
@@ -1275,7 +1285,18 @@ fn projection_window(
     let mb = MercatorBounds::from_geo(bounds);
     let lon_pad = CELL_REACH * cell_deg
         + PIXEL_REACH * (bounds.max_lon - bounds.min_lon) / width.max(1) as f64;
-    let merc_pad = CELL_REACH * cell_deg.to_radians()
+    // A cell `cell_deg` **degrees** tall is `cell_deg / cos(lat)` of Mercator
+    // **y**, and the two agree only at the equator. Spending the pad as though
+    // they were the same reaches `cos(lat)` of the way it means to: 0.71 at
+    // 45 N, 0.31 at 72 N — GMGSI's own top row — and `low`/`high` below only
+    // hand back one index of slack, so past about 65 N the shortfall is more
+    // than a whole cell and a row that paints is left unprojected.
+    let merc_scale = edge_lat
+        .min(MAX_MERCATOR_LAT)
+        .to_radians()
+        .cos()
+        .max(f64::MIN_POSITIVE);
+    let merc_pad = CELL_REACH * cell_deg.to_radians() / merc_scale
         + PIXEL_REACH * (mb.merc_y_max - mb.merc_y_min) / height.max(1) as f64;
 
     let grown = grow_bounds(bounds, lon_pad, merc_pad);
@@ -1597,6 +1618,9 @@ mod model_window_tests;
 
 #[cfg(test)]
 mod projection_window_tests;
+
+#[cfg(test)]
+mod wrapping_window_tests;
 
 #[cfg(test)]
 mod device_scale_tests;

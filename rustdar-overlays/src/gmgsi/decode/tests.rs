@@ -227,7 +227,7 @@ fn wraps_longitude_is_true_for_a_global_mosaic() {
 /// A too-narrow window silently crops the raster, so the assertion is that the
 /// bracket **contains** the truth, not that it equals some recorded number.
 #[test]
-fn index_bounds_brackets_the_latitude_axis() {
+fn index_bounds_brackets_both_axes_of_the_granule() {
     let g = grid();
     let bounds = rustdar_geo::GeoBounds {
         min_lat: 30.0,
@@ -241,7 +241,7 @@ fn index_bounds_brackets_the_latitude_axis() {
         .index_bounds(&bounds, NX, NY)
         .expect("a separable grid of its own shape answers");
 
-    let (lat_axis, _) = axes(&g);
+    let (lat_axis, lon_axis) = axes(&g);
     // Every row inside the box must be inside the bracket.
     for (j, &lat) in lat_axis.iter().enumerate() {
         if (30.0..=40.0).contains(&lat) {
@@ -256,8 +256,54 @@ fn index_bounds_brackets_the_latitude_axis() {
         j_max - j_min < 400.0,
         "the latitude bracket {j_min}..{j_max} saved nothing"
     );
-    // The longitude axis is not monotonic, so the honest answer is all of it.
-    assert_eq!((i_min, i_max), (0.0, (NX - 1) as f64));
+
+    // The same two claims for the longitude axis. It is not monotonic — the
+    // granule begins a hair west of the antimeridian, so column 0 holds the
+    // maximum — and this box sits nowhere near that fold, so the columns
+    // covering it are one contiguous run and the bracket names it.
+    for (i, &lon) in lon_axis.iter().enumerate() {
+        if (-100.0..=-90.0).contains(&lon) {
+            assert!(
+                (i as f64) >= i_min - 1.0 && (i as f64) <= i_max + 1.0,
+                "column {i} at {lon} fell outside the bracket {i_min}..{i_max}"
+            );
+        }
+    }
+    assert!(
+        i_max - i_min < 200.0,
+        "the longitude bracket {i_min}..{i_max} saved nothing"
+    );
+}
+
+/// The other half of the longitude axis's two cases: a box that **does** walk
+/// over the granule's fold covers two disjoint runs of columns, and one
+/// interval that is not narrower than the truth is then the whole axis.
+///
+/// Its rows are parallels either way, so the latitude bracket must still be a
+/// real saving here — that is the narrowing a seam-crossing view keeps.
+#[test]
+fn index_bounds_widens_only_the_columns_across_the_granules_fold() {
+    let g = grid();
+    let bounds = rustdar_geo::GeoBounds {
+        min_lat: 30.0,
+        max_lat: 40.0,
+        min_lon: 179.0,
+        max_lon: 181.0,
+    };
+    let (i_min, i_max, j_min, j_max) = g
+        .grid
+        .coords
+        .index_bounds(&bounds, NX, NY)
+        .expect("a separable grid of its own shape answers");
+    assert_eq!(
+        (i_min, i_max),
+        (0.0, (NX - 1) as f64),
+        "a box across the fold has no single column interval but all of them",
+    );
+    assert!(
+        j_max - j_min < 400.0,
+        "the latitude bracket {j_min}..{j_max} went wide with the columns"
+    );
 }
 
 #[test]
