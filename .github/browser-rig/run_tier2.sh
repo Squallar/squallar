@@ -41,6 +41,18 @@
 #   RIG_BROWSERS      "chromium firefox" (default), or a subset
 #   RIG_EXPECT_TIMEOUT  seconds for the worker-wire assertions (default 180)
 #   RIG_DRIVE_EXTRA   extra args appended to every drive.py call
+#   RIG_SERVE_EXTRA   extra args appended to every serve.py launch
+#
+# The cross-origin-isolation proof (WS3a) is these two together -- serve the
+# isolation headers AND let the real service worker through, then assert both
+# sides rather than trusting the header was honoured:
+#
+#   RIG_SERVE_EXTRA="--coep --no-block-sw" \
+#   RIG_DRIVE_EXTRA="--expect-cross-origin-isolated --expect-service-worker" \
+#     run_tier2.sh --skip-build
+#
+# Without --expect-cross-origin-isolated the run proves nothing: a browser
+# that ignored the headers looks exactly like one that honoured them.
 
 set -u -o pipefail   # not -e: attempt every leg and still summarise
 
@@ -80,6 +92,12 @@ if [ -z "${RIG_GECKODRIVER:-}" ]; then
   }
 fi
 GECKODRIVER="$RIG_GECKODRIVER"
+
+SERVE_EXTRA=()
+if [ -n "${RIG_SERVE_EXTRA:-}" ]; then
+  # shellcheck disable=SC2206
+  SERVE_EXTRA+=($RIG_SERVE_EXTRA)
+fi
 
 mkdir -p "$OUT_DIR"
 
@@ -143,7 +161,8 @@ start_server() {
   "$PY" "$RIG_DIR/serve.py" --dir "$WEB_DIR" --port 0 \
       --log "$OUT_DIR/serve.log" \
       --seed-local-storage "$SEED_LS" \
-      "$@" > "$ready_file" 2>> "$OUT_DIR/serve.stderr" &
+      "$@" ${SERVE_EXTRA[@]+"${SERVE_EXTRA[@]}"} \
+      > "$ready_file" 2>> "$OUT_DIR/serve.stderr" &
   SERVER_PID=$!
   PORT=""
   local _tag _base
@@ -173,6 +192,12 @@ EXTRA=()
 if [ -n "${RIG_DRIVE_EXTRA:-}" ]; then
   # shellcheck disable=SC2206
   EXTRA+=($RIG_DRIVE_EXTRA)
+fi
+if [ ${#SERVE_EXTRA[@]} -gt 0 ]; then
+  echo "serve.py extra args: ${SERVE_EXTRA[*]}"
+fi
+if [ ${#EXTRA[@]} -gt 0 ]; then
+  echo "drive.py extra args: ${EXTRA[*]}"
 fi
 
 # run_pass <browser> <tag> <doctored 0|1>: one server + one drive.py run.
@@ -258,6 +283,32 @@ for tag in sys.argv[2:]:
              (sh.get("canvas") or {}).get("blank"),
              v.get("rig_error_count"), v.get("panic_count"),
              tri(wrt), tri(dr)))
+    wg = env.get("webgpu") or {}
+    if wg.get("gpu_object") is None and not wg.get("probe_error"):
+        webgpu = "-"
+    elif wg.get("probe_error"):
+        webgpu = "probe-error"
+    elif not wg.get("gpu_object"):
+        webgpu = "absent"
+    elif wg.get("adapter"):
+        webgpu = "adapter(maxTex2D=%s)" % (
+            (wg.get("adapter_limits") or {}).get("maxTextureDimension2D"))
+    else:
+        webgpu = "object-but-no-adapter"
+    sw = r.get("service_worker") or {}
+    print("%-18s   caps max_texture=%s max_3d=%s cores=%s webgpu=%s"
+          % ("", env.get("max_texture_size"), env.get("max_3d_texture_size"),
+             env.get("hardware_concurrency"), webgpu))
+    print("%-18s   isolation crossOriginIsolated=%s SAB=%s sw_blocked=%s "
+          "sw_regs=%s resource_failures=%s"
+          % ("", env.get("cross_origin_isolated"),
+             env.get("shared_array_buffer"), sw.get("blocked_by_rig"),
+             len(sw.get("registrations") or []),
+             len((r.get("resources") or {}).get("failed") or [])))
+    if sw.get("expect_error"):
+        print("%-18s   sw EXPECT FAILED: %s" % ("", sw["expect_error"]))
+    for f in ((r.get("resources") or {}).get("failed") or [])[:8]:
+        print("%-18s   resource status=%s %s" % ("", f.get("status"), f.get("u")))
     if dr and dr.get("ok"):
         print("%-18s   respawn attach %.0f ms after the doctored refusal"
               % ("", dr.get("delta_ms", -1)))
