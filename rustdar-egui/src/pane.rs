@@ -181,6 +181,15 @@ pub enum LoopFrameImage {
     Section(SectionImageData),
     /// A **resident voxel grid**, named rather than held.
     Volume(VolumeFrameGrid),
+    /// **One non-radar layer's frame**: a placed raster, whole.
+    ///
+    /// It carries its own [`PlacedRaster`](rustdar_geo::PlacedRaster), so the
+    /// painter puts it back on the ground under any pan or zoom without
+    /// re-rasterizing — the same way a radar loop frame is placed and never
+    /// rebuilt. A loop's frames are rasterized once and thereafter only
+    /// re-placed; zooming past their resolution makes them soft, and that is
+    /// the whole of it.
+    Overlay(crate::overlay_cache::OverlayTextureData),
 }
 
 /// The resident grid one 3D loop frame marches, named by what built it.
@@ -193,34 +202,52 @@ pub struct VolumeFrameGrid {
 }
 
 impl LoopFrameImage {
-    /// Which view this picture is, so a consumer that holds one can be checked
-    /// against the loop it is about to be placed in.
-    pub fn view(&self) -> RenderView {
+    /// Which render view produced this picture, so a consumer that holds one
+    /// can be checked against the loop it is about to be placed in.
+    ///
+    /// **`None` for [`Self::Overlay`], and that is the point.** `RenderView` is
+    /// radar's own vocabulary — which of radar's three pipelines cut these
+    /// pixels — and an overlay frame was cut by none of them. Answering
+    /// `PlanView` here would let a finished *radar* render satisfy the
+    /// `self.view == RenderView::PlanView` gate on an overlay timeline and be
+    /// filed into an overlay frame; pinned by
+    /// `an_overlay_frame_is_not_a_radar_render_view`.
+    pub fn view(&self) -> Option<RenderView> {
         match self {
-            Self::PlanView(_) => RenderView::PlanView,
-            Self::Section(_) => RenderView::CrossSection,
-            Self::Volume(_) => RenderView::Volume,
+            Self::PlanView(_) => Some(RenderView::PlanView),
+            Self::Section(_) => Some(RenderView::CrossSection),
+            Self::Volume(_) => Some(RenderView::Volume),
+            Self::Overlay(_) => None,
         }
     }
 
     pub fn plan_view(&self) -> Option<&RadarImageData> {
         match self {
             Self::PlanView(image) => Some(image),
-            Self::Section(_) | Self::Volume(_) => None,
+            Self::Section(_) | Self::Volume(_) | Self::Overlay(_) => None,
         }
     }
 
     pub fn section(&self) -> Option<&SectionImageData> {
         match self {
             Self::Section(image) => Some(image),
-            Self::PlanView(_) | Self::Volume(_) => None,
+            Self::PlanView(_) | Self::Volume(_) | Self::Overlay(_) => None,
         }
     }
 
     pub fn volume(&self) -> Option<&VolumeFrameGrid> {
         match self {
             Self::Volume(grid) => Some(grid),
-            Self::PlanView(_) | Self::Section(_) => None,
+            Self::PlanView(_) | Self::Section(_) | Self::Overlay(_) => None,
+        }
+    }
+
+    /// The placed raster one non-radar loop frame holds, or `None` for any of
+    /// radar's three shapes.
+    pub fn overlay(&self) -> Option<&crate::overlay_cache::OverlayTextureData> {
+        match self {
+            Self::Overlay(image) => Some(image),
+            Self::PlanView(_) | Self::Section(_) | Self::Volume(_) => None,
         }
     }
 }
@@ -1685,6 +1712,41 @@ impl PaneState {
         ls.frames
             .get(ls.qualifying_frame()?)
             .and_then(|f| f.image.as_ref())
+    }
+
+    /// **The raster layer `id` puts on the map this frame** — the draw fork
+    /// every non-radar textured layer is painted through (WI-6).
+    ///
+    /// Two sources, and the layer's own timeline picks:
+    ///
+    /// * **animating** — the frame under *this layer's* playhead, and nothing
+    ///   else. A frame with no picture yet, and a clock sitting before every
+    ///   frame the layer holds, both answer `None`: the pane draws nothing
+    ///   rather than the last raster that happened to be lying around. That
+    ///   fallback is the whole defect this fork exists to close — an hour-old
+    ///   forecast left on the glass, unlabelled, reading as the answer.
+    /// * **not animating** — the layer's live raster, exactly as before.
+    ///
+    /// **Addressed at `id`, not at the transport**, which mirrors radar's own
+    /// arm ([`Self::active_image`] reads [`Self::loop_state`]). Every layer's
+    /// playhead is settled from the pane clock by [`Self::settle_playheads`],
+    /// so a second animating layer that is not the transport still has a frame
+    /// to name — and gating on the transport would leave exactly that layer
+    /// painting the stale live raster this fork removes.
+    pub fn overlay_texture_on_screen(
+        &self,
+        id: &LayerId,
+    ) -> Option<&crate::overlay_cache::OverlayTextureData> {
+        let ls = self.time_state(id);
+        if ls.is_active() {
+            return ls
+                .frames
+                .get(ls.qualifying_frame()?)?
+                .image
+                .as_ref()
+                .and_then(LoopFrameImage::overlay);
+        }
+        self.overlay_cache(id).and_then(|c| c.current())
     }
 
     /// When the data behind the image *currently on screen* was collected.

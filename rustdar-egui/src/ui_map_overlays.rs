@@ -1,4 +1,4 @@
-use crate::overlay_cache::{OverlayTextureCache, draw_overlay_texture, geo_point_in_feature};
+use crate::overlay_cache::{OverlayTextureData, draw_overlay_texture, geo_point_in_feature};
 use crate::tile_source::HttpsTiles;
 use rustdar_geo::{lat_to_tile_y, lon_to_tile_x, tile_to_lat, tile_to_lon};
 use rustdar_overlays::render::overlay_state::{ClickableItem, OverlayItem};
@@ -61,13 +61,20 @@ impl<'a> OverlayDrawContext<'a> {
     }
 
     /// Draw a single overlay layer: texture, labels, and click detection.
+    ///
+    /// **The raster arrives resolved, not as a cache to read.** Which picture
+    /// this layer shows is the pane's fork
+    /// ([`PaneState::overlay_texture_on_screen`](crate::pane::PaneState::overlay_texture_on_screen)):
+    /// a loop frame while the layer is animating, its live raster otherwise.
+    /// Hit-testing below reads the same value, so what is clicked is always
+    /// what was painted.
     pub fn draw_overlay<'i>(
         &self,
-        texture: Option<&OverlayTextureCache>,
+        texture: Option<&OverlayTextureData>,
         labels: &[OverlayLabel],
         items: impl FnOnce() -> Vec<ClickableItem<'i>>,
     ) -> Vec<Arc<dyn OverlayItem>> {
-        if let Some(tex) = texture.and_then(|c| c.current()) {
+        if let Some(tex) = texture {
             draw_overlay_texture(self.ui.painter(), self.projector, tex, self.screen_rect);
         }
 
@@ -98,7 +105,7 @@ impl<'a> OverlayDrawContext<'a> {
         };
 
         // If a hit buffer is available, use it for pixel-perfect detection.
-        if let Some(tex) = texture.and_then(|c| c.current())
+        if let Some(tex) = texture
             && let Some(ref hit_map) = tex.hit_map
         {
             let rect = crate::overlay_cache::placed_rect(self.projector, &tex.placed);

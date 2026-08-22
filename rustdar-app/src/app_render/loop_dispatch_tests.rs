@@ -424,9 +424,9 @@ fn a_loop_with_something_to_show_is_promoted_rather_than_abandoned() {
 
 /// `loop_on`'s timeline stripped of exactly those two halves.
 ///
-/// The frames still carry radar's image variant, because it is the only one
-/// that exists at this work item — `LoopFrameImage::Overlay` arrives with the
-/// draw fork (WI-6). Nothing under test here looks inside an image.
+/// The frames still carry radar's image variant. `LoopFrameImage::Overlay`
+/// exists since the draw fork (WI-6), but nothing under test here looks inside
+/// an image, so the cheaper fixture stands.
 fn model_shaped_loop(ctx: &egui::Context, textured: &[usize]) -> LayerTimeState {
     let mut ls = loop_on(ctx, "KTLX", textured);
     ls.anchor = None;
