@@ -117,11 +117,42 @@ impl Gui {
     ///
     /// The slider says so, in `ui_timeline.rs`'s `TUNING_SCOPE_CAPTION` —
     /// narrow this to the group and that caption becomes a lie.
+    ///
+    /// **This is the setting, not the window a loop is listed over.** That is
+    /// [`Self::loop_span_secs_for`], which raises this to the addressed
+    /// layer's own floor. The two are the same number for radar and for every
+    /// layer that declares no minimum.
     pub(crate) fn set_loop_span_secs(&mut self, secs: u64) {
         self.loop_lookback_secs = secs;
         for pane in &mut self.panes {
             pane.time.span_secs = secs;
         }
+    }
+
+    /// **The window `pane_idx`'s loop is actually listed over**: the setting,
+    /// raised to the floor the pane's *transport* layer declares.
+    ///
+    /// One global number cannot serve two cadences. Sixty minutes is a dozen
+    /// radar volumes and two hourly frames, so the layer whose frames are an
+    /// hour apart says how wide its own window has to be —
+    /// `SourceHandler::min_loop_span_secs`, read off the registry by id and
+    /// never re-spelled here as a `match`.
+    ///
+    /// **A floor, so the slider still governs.** Drag Lookback past a layer's
+    /// minimum and that layer widens with everything else; the floor only ever
+    /// stops a window being too narrow to be a loop.
+    ///
+    /// Derived on every read rather than stored: nothing new persists, and the
+    /// setting the file holds is still the one the slider shows.
+    pub(crate) fn loop_span_secs_for(&self, pane_idx: usize) -> u64 {
+        let Some(pane) = self.panes.get(pane_idx) else {
+            return self.loop_lookback_secs;
+        };
+        pane.time.span_secs.max(
+            self.overlays
+                .handler_by_id(pane.transport_layer())
+                .map_or(0, |h| h.min_loop_span_secs()),
+        )
     }
 
     /// [`Self::set_loop_span_secs`] for the playback rate, and for the same

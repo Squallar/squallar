@@ -868,6 +868,22 @@ impl OverlayHandler for ModelDataHandler {
         }
     }
 
+    /// **Thirteen hourly grids — half a day, and a loop rather than a
+    /// before-and-after.**
+    ///
+    /// The Lookback slider's own default is 3600 s, which at
+    /// [`Self::time_axis`]'s hourly step is *two* frames: the shortest thing
+    /// that is a sequence at all. Radar reads the same 3600 s as a dozen
+    /// volumes, which is why the number cannot be one number.
+    ///
+    /// It is the backward half this is about. The `Forecast` axis already
+    /// reaches 18 to 48 hours forward through [`Self::frame_horizon`]; the
+    /// `Analysis` axis reaches nowhere forward at all and is nothing *but*
+    /// this window.
+    fn min_loop_frames(&self) -> usize {
+        13
+    }
+
     /// **This pane's run decides how far forward the rail reaches** — f48 on a
     /// 00/06/12/18Z cycle, f18 on every other hour. See [`forecast_horizon`].
     ///

@@ -2308,3 +2308,8 @@ mod tests;
 /// fork, read off the frame that was really painted.
 #[cfg(test)]
 mod loop_overlay_draw_tests;
+
+/// **A layer's own loop window** (WB-6): the one Lookback number, raised to the
+/// floor the addressed layer declares, read off the action the ∞ button emits.
+#[cfg(test)]
+mod loop_span_floor_tests;

@@ -193,7 +193,23 @@ impl Default for TimelineProbe {
 /// including fully unlinked ones — one window, one number — while sitting in
 /// the same row as a transport that respects the links. The behaviour is
 /// defensible and unchanged; the silence was not.
+///
+/// True of the **setting**. What a loop is listed over is the addressed
+/// layer's own window, and `Gui::tuning_scope_caption` adds that figure when
+/// the two differ.
 const TUNING_SCOPE_CAPTION: &str = "Lookback and Speed apply to every pane, linked or not.";
+
+/// `secs` as a window a reader can hold: whole hours where it is whole hours,
+/// minutes otherwise.
+fn humanise_window(secs: u64) -> String {
+    if secs >= 3600 && secs.is_multiple_of(3600) {
+        format!("{} h", secs / 3600)
+    } else if secs >= 60 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{secs} s")
+    }
+}
 
 /// Row 2 of the probe: the loop tuning as drawn. The transport rects are
 /// [`egui::Rect::NOTHING`] and the texts empty while no loop is active — the
@@ -667,9 +683,13 @@ impl super::Gui {
                     panes[pane_idx].refresh_transport(overlays);
                     actions.push(GuiAction::EnableLoop {
                         pane_idx,
-                        // The pane's own window, which carries the one number
-                        // the file holds — see `Gui::set_loop_span_secs`.
-                        lookback_secs: self.panes[pane_idx].time.span_secs,
+                        // The window this pane's transport layer is actually
+                        // looped over: the one number the file holds, raised
+                        // to that layer's own floor — see
+                        // `Gui::loop_span_secs_for`. Asked *after*
+                        // `refresh_transport`, because the floor is the
+                        // addressed layer's and the address was just decided.
+                        lookback_secs: self.loop_span_secs_for(pane_idx),
                     });
                 }
             }
@@ -793,6 +813,50 @@ impl super::Gui {
         }
     }
 
+    /// **What the Lookback and Speed sliders reach, and — when they are not
+    /// the last word — the window this pane's loop actually gets.**
+    ///
+    /// [`TUNING_SCOPE_CAPTION`] describes the setting, which is still one
+    /// number written to every pane. A layer whose frames are an hour apart
+    /// declares a floor under that number (`Gui::loop_span_secs_for`), so on a
+    /// pane addressing such a layer the slider is no longer the whole answer
+    /// and the caption says what the answer is.
+    ///
+    /// **The quantity, never an apology.** The reader cannot act on "the
+    /// slider is approximate"; they can read "Model Data loops 12 h - 13
+    /// frames, 1 h apart" and know exactly what they are about to watch. The
+    /// sentence appears only where the floor actually binds, so a radar pane's
+    /// caption is the string it always was, character for character.
+    fn tuning_scope_caption(&self, pane_idx: usize) -> String {
+        let base = TUNING_SCOPE_CAPTION.to_owned();
+        let Some(pane) = self.panes.get(pane_idx) else {
+            return base;
+        };
+        let window = self.loop_span_secs_for(pane_idx);
+        if window <= pane.time.span_secs {
+            return base;
+        }
+        let Some(handler) = self.overlays.handler_by_id(pane.transport_layer()) else {
+            return base;
+        };
+        let step = match handler.time_axis() {
+            rustdar_source::time::TimeAxis::FrameSeries { typical_step, .. } => {
+                typical_step.as_secs()
+            }
+            _ => return base,
+        };
+        if step == 0 {
+            return base;
+        }
+        format!(
+            "{base} {} loops {} - {} frames, {} apart.",
+            handler.display_name(),
+            humanise_window(window),
+            window / step + 1,
+            humanise_window(step),
+        )
+    }
+
     /// Row 2: the loop tuning, shown behind `⋯`.
     fn render_timeline_row2(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
         let pane_idx = self.active_pane;
@@ -824,7 +888,7 @@ impl super::Gui {
                         for pane_idx in self.loop_sync_targets() {
                             actions.push(GuiAction::EnableLoop {
                                 pane_idx,
-                                lookback_secs: self.panes[pane_idx].time.span_secs,
+                                lookback_secs: self.loop_span_secs_for(pane_idx),
                             });
                         }
                     }
@@ -848,10 +912,11 @@ impl super::Gui {
             #[cfg(not(test))]
             let _ = speed;
         });
-        ui.label(egui::RichText::new(TUNING_SCOPE_CAPTION).small().weak());
+        let scope_caption = self.tuning_scope_caption(pane_idx);
+        ui.label(egui::RichText::new(&scope_caption).small().weak());
         #[cfg(test)]
         {
-            row2.tuning_scope = TUNING_SCOPE_CAPTION.to_owned();
+            row2.tuning_scope = scope_caption;
         }
 
         if loop_active {
