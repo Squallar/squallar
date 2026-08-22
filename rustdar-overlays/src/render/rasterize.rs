@@ -883,7 +883,17 @@ pub fn rasterize_glm_strikes(
             continue;
         }
 
-        let age_secs = (*now - flash.time).num_milliseconds().max(0) as f64 / 1000.0;
+        // **A flash later than the depicted instant has not happened yet.**
+        // A cull and not a clamp. The clamp this replaces - `.max(0)` on the
+        // age - read a future flash as age *zero*, which is the peak of
+        // `time_decay_color`'s ramp, so a scrubbed pane drew tomorrow's
+        // strikes at full brightness beside today's. Nothing survives the
+        // clamp to guard: this subtraction is exact integer arithmetic on two
+        // `NaiveDateTime`s, so past the cull it cannot be negative.
+        if flash.time > *now {
+            continue;
+        }
+        let age_secs = (*now - flash.time).num_milliseconds() as f64 / 1000.0;
         if age_secs > *time_window_secs {
             continue;
         }
@@ -1603,6 +1613,9 @@ mod dateline_tests;
 
 #[cfg(test)]
 mod glm_energy_tests;
+
+#[cfg(test)]
+mod glm_time_tests;
 
 #[cfg(test)]
 mod hole_tests;

@@ -99,6 +99,12 @@ impl super::App {
             zone_cache_dir: self.platform.zone_cache_dir().map(|p| p.to_path_buf()),
             sources: rustdar_radar::sources::DataSources::production(),
             viewport: self.last_viewport,
+            // The wall clock, which is what a live pane depicts. The dispatch
+            // that knows *which pane and which layer* narrows it to the
+            // depicted instant — see `fetch_overlay`; every other caller is a
+            // frame path, whose picture is a named frame and not a function of
+            // an instant.
+            as_of: chrono::Utc::now().naive_utc(),
         }
     }
 
@@ -897,7 +903,7 @@ impl super::App {
 
     /// Fetch overlay data for the given kind, resolving parameters from current state.
     fn fetch_overlay(&mut self, kind: rustdar_source::id::LayerId, pane_idx: usize) {
-        let config = self.fetch_config();
+        let config = fetch_config_for_layer(&self.gui, pane_idx, &kind, self.fetch_config());
 
         let tasks = self.with_layer_pane(pane_idx, &kind.clone(), |overlays, pane_ref| {
             let tasks = overlays.create_fetch_tasks(&kind, &config, pane_ref);
@@ -2246,6 +2252,26 @@ fn as_of_for_layer(
             )
     });
     if event_lifetime { instant } else { fallback }
+}
+
+/// [`App::fetch_config`]'s context, with `as_of` narrowed to what this pane
+/// depicts for this layer.
+///
+/// **The fetch half of [`as_of_for_layer`], and the same registry lookup with
+/// no layer named.** A `TimeAxis::EventLifetime` source whose archive is
+/// addressable by time reads `FetchConfig::as_of` to pick *which* objects to
+/// ask for, so a scrubbed pane polls the past — GLM's S3 listing is keyed
+/// `{year}/{doy}/{hour}`, so this is what reaches the archive at all. On a live
+/// pane, and for every other arm, the wall clock the context was built with
+/// survives untouched and the request is byte-for-byte the one it always was.
+fn fetch_config_for_layer(
+    gui: &rustdar_egui::Gui,
+    pane_idx: usize,
+    id: &rustdar_source::id::LayerId,
+    mut config: rustdar_overlays::render::overlay_state::FetchConfig,
+) -> rustdar_overlays::render::overlay_state::FetchConfig {
+    config.as_of = as_of_for_layer(gui, pane_idx, id, config.as_of);
+    config
 }
 
 /// Add a frame at `timestamp` to `ls` if the loop is active, is on `site`, and does

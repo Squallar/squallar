@@ -1060,6 +1060,7 @@ mod tests {
             zone_cache_dir: None,
             sources: rustdar_source::origins::DataSources::default(),
             viewport: None,
+            as_of: chrono::Utc::now().naive_utc(),
         };
         assert_eq!(
             handler.create_fetch_tasks(&ctx, &PaneRef::bare(0)).len(),
@@ -1818,6 +1819,7 @@ mod tests {
             zone_cache_dir: None,
             sources: rustdar_source::origins::DataSources::production(),
             viewport: None,
+            as_of: chrono::Utc::now().naive_utc(),
         };
         for products in 1..=OutlookDay::Day1.products().len() {
             let mut h = SpcOutlookHandler::new();

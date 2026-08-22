@@ -6,7 +6,11 @@ pub mod alert;
 mod colorscale;
 pub mod discussion;
 pub mod firewx;
-mod glm;
+// `pub(crate)` for one reason: the GLM poll's own test module drives
+// `GlmHandler::create_fetch_tasks` against a loopback bucket, which is the only
+// place the depicted instant is observed crossing from the render context into
+// the fetch. Narrower than the `pub` rows above; nothing outside this crate.
+pub(crate) mod glm;
 mod gmgsi;
 mod labels;
 mod location;

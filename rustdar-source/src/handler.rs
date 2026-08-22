@@ -967,6 +967,20 @@ pub struct FetchConfig {
     /// `None` before the first frame is rendered. METAR must scope to this —
     /// the whole-country IEM form is 54 MB ungzipped.
     pub viewport: Option<rustdar_geo::GeoBounds>,
+    /// The instant the fetch is **for**, UTC — the wall clock on a live pane,
+    /// the scrub instant on a scrubbed one. The same quantity
+    /// [`RasterizeContext::as_of`] carries down the paint path, on the fetch
+    /// path.
+    ///
+    /// A [`TimeAxis::EventLifetime`] source whose archive is addressable by
+    /// time reads this to choose *which* archive objects to ask for, so a
+    /// scrubbed pane fetches the past rather than the present. A `Live` source
+    /// ignores it by contract, and a `FrameSeries` source names its frames
+    /// through [`SourceHandler::create_frame_list_task`] instead — for both,
+    /// the caller leaves this equal to the wall clock and no bytes move.
+    ///
+    /// [`TimeAxis`]: crate::time::TimeAxis
+    pub as_of: chrono::NaiveDateTime,
 }
 
 /// `Copy` so a rasterizer takes the whole thing rather than three loose scalars.

@@ -5,7 +5,7 @@
 //! keeps the wall clock — including every layer on a live pane, which is what
 //! makes WO-M11's dark parity permanent instead of provisional.
 
-use super::as_of_for_layer;
+use super::{as_of_for_layer, fetch_config_for_layer};
 use rustdar_egui::Gui;
 use rustdar_egui::pane::TimeMode;
 use rustdar_source::id::LayerId;
@@ -102,4 +102,80 @@ fn a_pane_that_is_not_there_falls_back_to_the_wall_clock() {
         as_of_for_layer(&gui, 999, &rustdar_source::id::known::NWS_ALERTS, clock),
         clock,
     );
+}
+
+/// **The fetch context carries the same instant the paint context does.**
+///
+/// This is the seam the GLM archive rides on: `list_glm_files` is addressed by
+/// `{year}/{doy}/{hour}`, so a poll built with the wall clock can only ever
+/// reach the current hour no matter what the pane depicts. Read off each
+/// layer's declared arm, so nothing here names a layer.
+#[test]
+fn a_scrubbed_panes_fetch_is_built_for_the_instant_it_depicts() {
+    let mut gui = Gui::new();
+    let scrub = ts(10);
+    let clock = ts(30);
+    gui.pane_mut(0)
+        .expect("pane 0")
+        .set_time_mode(TimeMode::AsOf(scrub));
+
+    let layers = declared(&gui);
+    let (event, rest): (Vec<_>, Vec<_>) = layers
+        .iter()
+        .partition(|(_, axis)| matches!(axis, TimeAxis::EventLifetime));
+    assert!(
+        !event.is_empty() && !rest.is_empty(),
+        "non-triviality floor: both sides of the distinction must be occupied",
+    );
+
+    for (id, axis) in &layers {
+        let want = if matches!(axis, TimeAxis::EventLifetime) {
+            scrub
+        } else {
+            clock
+        };
+        let config = fetch_config_for_layer(&gui, 0, id, base_config(clock));
+        assert_eq!(
+            config.as_of,
+            want,
+            "{} declares {axis:?}: its poll must be built for {want}",
+            id.as_str(),
+        );
+    }
+}
+
+/// The other side: a live pane's poll is the one it always was, for every
+/// layer — so "fetch the archive" cannot be reached by fetching the archive
+/// always.
+#[test]
+fn a_live_panes_fetch_keeps_the_wall_clock_for_every_layer() {
+    let mut gui = Gui::new();
+    gui.pane_mut(0)
+        .expect("pane 0")
+        .set_time_mode(TimeMode::Live);
+    let clock = ts(30);
+
+    for (id, _) in declared(&gui) {
+        assert_eq!(
+            fetch_config_for_layer(&gui, 0, &id, base_config(clock)).as_of,
+            clock,
+            "{} would poll a live pane for some other instant",
+            id.as_str(),
+        );
+    }
+}
+
+fn base_config(
+    clock: chrono::NaiveDateTime,
+) -> rustdar_overlays::render::overlay_state::FetchConfig {
+    rustdar_overlays::render::overlay_state::FetchConfig {
+        client: {
+            rustdar_source::tls::init();
+            reqwest::Client::new()
+        },
+        zone_cache_dir: None,
+        sources: rustdar_radar::sources::DataSources::production(),
+        viewport: None,
+        as_of: clock,
+    }
 }
