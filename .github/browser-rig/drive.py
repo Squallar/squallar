@@ -38,7 +38,27 @@ global (dot-path) until it holds a JSON-serialisable value -- the future
 instrumented build exposes richer stats via such a global, and
 `--poll-global NAME` wires it from the CLI.
 
-Exit codes: 0 pass, 2 measured failure (boot/canvas/rAF), 1 unexpected error.
+Two arms, selected with --arm, NEVER merged:
+
+  software  (default) the CI arm and the one every pinned Tier-2 figure was
+            taken on. Chromium --disable-gpu + SwiftShader, Firefox on a
+            rig-owned Xvfb -> Mesa llvmpipe. Deterministic by construction and
+            needs no GPU, which is why CI can run it.
+  hardware  the real-driver measurement arm. Drops the software flags and
+            points both browsers at the machine's own X display, so both reach
+            the actual driver. It is a measurement arm, not a gate: it needs a
+            GPU and a logged-in session, and it puts a window on the desktop.
+            Pair it with --require-hardware, which refuses to report a figure
+            taken on a renderer that turned out to be software after all.
+
+Every cap in the env probe is a property of the ADAPTER, not of the browser
+(MAX_TEXTURE_SIZE measured 8192 on SwiftShader and 16384 on llvmpipe for the
+same two browsers). So the arm and the classified adapter are recorded in the
+artifact and reprinted on every summary line that carries a cap or a frame
+time.
+
+Exit codes: 0 pass, 2 measured failure (boot/canvas/rAF/adapter), 1 unexpected
+error.
 
 Typical use (see run_smoke.sh for the orchestrated version):
   python3 drive.py --browser chromium --url http://127.0.0.1:8611/index-rig.html \
@@ -396,10 +416,9 @@ def pick_chromium_binary(driver_path, preferred=None):
             "version_match": _major(best[1]) == driver_major}
 
 
-CHROMIUM_ARGS = [
-    "--headless=new",          # per task; chromium 151 accepts it
-    "--disable-gpu",           # deterministic software path in headless
-    "--enable-unsafe-swiftshader",  # Chrome 137+: SwiftShader WebGL needs this
+CHROMIUM_HEADLESS_ARG = "--headless=new"   # per task; chromium 151 accepts it
+
+CHROMIUM_BASE_ARGS = [
     "--no-sandbox",            # this rig runs inside a sandboxed shell already
     "--disable-dev-shm-usage",
     "--force-device-scale-factor=1",
@@ -420,17 +439,219 @@ CHROMIUM_ARGS = [
     "--disable-features=Translate,OptimizationHints",
 ]
 
+# The SOFTWARE arm. This is what CI runs and what every pinned Tier-2 figure
+# was taken on: no GPU, SwiftShader WebGL, deterministic by construction.
+# CI runners have no GPU, so this arm may never be made conditional on one.
+CHROMIUM_SOFTWARE_ARGS = [
+    "--disable-gpu",           # deterministic software path in headless
+    "--enable-unsafe-swiftshader",  # Chrome 137+: SwiftShader WebGL needs this
+]
 
-def chromium_capabilities(binary, window, headless=True, extra_args=()):
-    args = list(CHROMIUM_ARGS) + ["--window-size=%d,%d" % window] + list(extra_args)
-    if not headless:
-        args = [a for a in args if not a.startswith("--headless")]
+# The HARDWARE arm. Lifted from the a9 compositor harness
+# (`harness/a9-close:webperf/chrome.mjs`, `gpuFlags()`), which is the recipe
+# that reached this box's RTX 3090 from a browser. Two things make it work and
+# both are load-bearing:
+#
+#   * `--enable-unsafe-swiftshader` is deliberately ABSENT. Since Chrome 137 a
+#     page that cannot get hardware WebGL gets NO WebGL2 context rather than a
+#     silent software one -- so this arm fails loudly instead of quietly
+#     re-measuring SwiftShader under a "hardware" label.
+#   * ANGLE's passthrough to the native EGL/GLES driver (`--use-angle=gl-egl`)
+#     is what finds the driver. The GPU sandbox cannot open the DRM render
+#     node here and a GPU process that cannot do that falls back to software.
+CHROMIUM_HARDWARE_ARGS = [
+    "--enable-gpu",
+    "--ignore-gpu-blocklist",
+    "--enable-gpu-rasterization",
+    "--disable-gpu-sandbox",
+    "--use-gl=angle",
+    "--use-angle=gl-egl",
+]
+
+# Headless chromium has no window system, so ozone must be told so explicitly;
+# with it, ANGLE still reaches the driver over EGL/GBM. Only for the hardware
+# arm: the software arm's --disable-gpu makes the question moot.
+#
+# MEASURED 2026-08-22 (`--arm hardware --display none`): this path reaches the
+# same RTX 3090 as the headed one, with identical caps (32768 / 16384 / 32768)
+# and slightly tighter frame timing (p50 16.70 vs 16.40 ms, p99 16.90 vs 18.40).
+# So the hardware arm does NOT actually require a logged-in desktop for
+# chromium -- only firefox needs the display. A GPU-equipped CI runner could
+# take chromium hardware figures with no session at all.
+CHROMIUM_HEADLESS_OZONE_ARGS = ["--ozone-platform=headless"]
+
+# The software arm's full flag list in its original order, which is what
+# CHROMIUM_ARGS meant before the split. Kept so that arm=software is not just
+# the same SET of flags as before but the same LIST.
+CHROMIUM_ARGS = ([CHROMIUM_HEADLESS_ARG] + CHROMIUM_SOFTWARE_ARGS
+                 + CHROMIUM_BASE_ARGS)
+
+# Substrings that mean "this renderer is not a GPU". Same list the a9 harness
+# refused to measure on (`SOFTWARE_MARKERS` in webperf/chrome.mjs), plus
+# lavapipe (Mesa's software Vulkan, which this repo's GPU CI lane uses).
+SOFTWARE_RENDERER_MARKERS = (
+    "swiftshader",
+    "llvmpipe",
+    "lavapipe",
+    "softpipe",
+    "software rasterizer",
+    "google inc. (google)",   # chromium's vendor/renderer pair for SwiftShader
+    "mesa offscreen",
+    "microsoft basic render",
+)
+
+
+def classify_adapter(env):
+    """Name the adapter behind a set of ENV_PROBE readings.
+
+    Every cap in that probe is a property of the ADAPTER, not of the browser:
+    MAX_TEXTURE_SIZE was 8192 on SwiftShader and 16384 on llvmpipe for the
+    same two browsers. A figure quoted without this classification beside it
+    is not interpretable, so the rig computes it once and prints it on every
+    line that carries a cap.
+
+    The class is the trustworthy part; the renderer STRING is not an
+    identifier. Firefox sanitises WEBGL_debug_renderer_info to a coarse
+    bucket -- on this box's RTX 3090 it answers "NVIDIA GeForce GTX 980, or
+    similar", exactly as it answers "llvmpipe, or similar" for Mesa. Chromium
+    hands back the real device. So `hardware` vs `software` may be quoted;
+    the device name may not, unless chromium said it."""
+    env = env or {}
+    webgl = env.get("webgl")
+    renderer = env.get("gl_renderer")
+    vendor = env.get("gl_vendor")
+    out = {"renderer": renderer, "vendor": vendor, "webgl": webgl}
+    if not webgl or (isinstance(webgl, str) and webgl.startswith("probe error")):
+        out["class"] = "none"
+        out["why"] = ("no WebGL context: %s" % webgl) if webgl else "no WebGL context"
+        return out
+    haystack = ("%s %s" % (vendor, renderer)).lower()
+    hit = next((m for m in SOFTWARE_RENDERER_MARKERS if m in haystack), None)
+    if hit:
+        out["class"] = "software"
+        out["marker"] = hit
+        return out
+    out["class"] = "hardware"
+    return out
+
+
+def adapter_label(adapter):
+    """One short field for summary lines: `hardware:NVIDIA GeForce RTX 3090`."""
+    adapter = adapter or {}
+    cls = adapter.get("class", "unknown")
+    if cls == "none":
+        return "none(%s)" % adapter.get("why", "?")
+    return "%s:%s" % (cls, adapter.get("renderer") or "?")
+
+
+def resolve_host_display(explicit=None):
+    """Find the machine's REAL X display, and the cookie that opens it.
+
+    The software arm's Xvfb is a display too, so "there is a display" was
+    never the question -- the question is whether the display is backed by a
+    driver. This returns the host session's, which on this box is Xwayland
+    on :0 in front of an RTX 3090.
+
+    Returns {"display": ":0", "xauthority": path|None, "source": str} or
+    {"display": None, "why": str}.
+
+    An explicit request is honoured or refused, never quietly replaced: a
+    `--display :7` that silently became :0 would report a figure from a
+    display the caller did not ask for. `--display none` asks for no display
+    at all, which is how the GPU-less-desktop case (chromium headless over
+    ANGLE/EGL) is reached deliberately."""
+    if explicit == "none":
+        return {"display": None, "why": "disabled by --display none"}
+    if explicit:
+        num = explicit.split(":")[-1].split(".")[0]
+        if num.isdigit() and os.path.exists("/tmp/.X11-unix/X%s" % num):
+            return {"display": ":%s" % num, "xauthority": _find_xauth(),
+                    "source": "--display"}
+        return {"display": None,
+                "why": "requested display %r has no socket in /tmp/.X11-unix"
+                       % explicit}
+    cands = []
+    if os.environ.get("RIG_DISPLAY"):
+        cands.append((os.environ["RIG_DISPLAY"], "RIG_DISPLAY"))
+    if os.environ.get("DISPLAY"):
+        cands.append((os.environ["DISPLAY"], "DISPLAY"))
+    cands.append((":0", "default :0"))
+    chosen = source = None
+    for disp, src in cands:
+        num = disp.split(":")[-1].split(".")[0]
+        if not num.isdigit():
+            continue
+        if os.path.exists("/tmp/.X11-unix/X%s" % num):
+            chosen, source = ":%s" % num, src
+            break
+    if chosen is None:
+        return {"display": None,
+                "why": "no X socket in /tmp/.X11-unix for any of %s"
+                       % ", ".join(d for d, _ in cands)}
+    return {"display": chosen, "xauthority": _find_xauth(), "source": source}
+
+
+def _find_xauth():
+    """The cookie for the host display.
+
+    A host display is nearly always MIT-MAGIC-COOKIE-protected, and a browser
+    launched without the cookie dies with "Invalid MIT-MAGIC-COOKIE-1 key" --
+    which reads exactly like "there is no display on this box", and is how a
+    machine with an RTX 3090 came to be described as unable to reach one."""
+    for cand in _xauth_candidates():
+        if cand and os.path.isfile(cand) and os.access(cand, os.R_OK):
+            return cand
+    return None
+
+
+def _xauth_candidates():
+    yield os.environ.get("XAUTHORITY")
+    run_dir = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    try:
+        entries = sorted(
+            (os.path.join(run_dir, n) for n in os.listdir(run_dir)
+             if n.startswith("xauth")),
+            key=lambda p: os.path.getmtime(p), reverse=True)
+    except OSError:
+        entries = []
+    for e in entries:
+        yield e
+    yield os.path.expanduser("~/.Xauthority")
+
+
+def chromium_capabilities(binary, window, headless=True, extra_args=(),
+                          arm="software"):
+    args = [CHROMIUM_HEADLESS_ARG] if headless else []
+    args += (CHROMIUM_SOFTWARE_ARGS if arm == "software"
+             else CHROMIUM_HARDWARE_ARGS)
+    if arm == "hardware" and headless:
+        args += CHROMIUM_HEADLESS_OZONE_ARGS
+    args += CHROMIUM_BASE_ARGS
+    args += ["--window-size=%d,%d" % window] + list(extra_args)
     return {"capabilities": {"alwaysMatch": {
         "browserName": "chrome",
         "acceptInsecureCerts": True,
         "goog:chromeOptions": {"binary": binary, "args": args},
         "goog:loggingPrefs": {"browser": "ALL"},
     }}}
+
+
+# Firefox on the hardware arm. Firefox decides its GL provider from the
+# graphics blocklist, and a blocklisted driver is answered with llvmpipe --
+# which is a successful-looking run on the wrong adapter. These two override
+# that decision, and WebRender is named so compositing is on the GPU as well
+# as the WebGL context.
+#
+# MEASURED, and stated because the opposite is the easy thing to assume: on
+# this box they are NOT what makes the hardware arm work. A control on
+# 2026-08-22 ran the same firefox 153 on :0 with this dict emptied and got the
+# identical reading (NVIDIA, 32768 / 16384) -- the real display alone reaches
+# the driver here. They are kept for a box whose driver IS blocklisted, and
+# --require-hardware, not these prefs, is what makes the arm able to fail.
+FIREFOX_HARDWARE_PREFS = {
+    "webgl.force-enabled": True,
+    "gfx.webrender.all": True,
+}
 
 
 def firefox_capabilities(binary, window, headless=True, extra_prefs=None):
@@ -464,14 +685,27 @@ def firefox_capabilities(binary, window, headless=True, extra_prefs=None):
 
 def launch(browser, out_dir, tag, driver_path=None, binary=None,
            window=(1280, 900), headless=True, tmp_root=None,
-           ff_prefs=None, extra_env=None, ff_mode="auto"):
+           ff_prefs=None, extra_env=None, ff_mode="auto", arm="software",
+           display=None, chromium_args=()):
     """Start the right driver binary + create a session.
     Returns (DriverProcess, Session, info_dict).
 
+    arm:
+      software  the CI arm, unchanged and deterministic: chromium on
+                SwiftShader, firefox on a rig-owned Xvfb -> Mesa llvmpipe.
+                Runs anywhere, including a GPU-less CI runner.
+      hardware  the real-driver arm: the software flags are dropped and the
+                browsers are pointed at the machine's own display, so both
+                reach the actual GPU. Needs a GPU and a session; it is a
+                MEASUREMENT arm, never a gate.
+
     ff_mode (firefox only):
-      auto      xvfb when Xvfb exists, else headless (default)
+      auto      host display on the hardware arm; xvfb when Xvfb exists on
+                the software arm; else headless
+      host      real firefox on the machine's own X display -> the real
+                driver. A window appears on the user's desktop.
       xvfb      real firefox on a rig-owned Xvfb display -> WebGL2 works
-                (llvmpipe); the ONLY mode in which the app can render here
+                (llvmpipe); the ONLY software mode in which the app renders
       headless  firefox -headless: boots and runs JS/rAF/network, but WebGL
                 context creation fails on this box, so the app panics at
                 surface creation and paints nothing (proven; see gotchas)"""
@@ -499,12 +733,33 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
             os.makedirs(tmp_root, exist_ok=True)
             env["TMPDIR"] = tmp_root
 
+    # The hardware arm needs a display with a driver behind it. Chromium can
+    # also reach the driver headless (ANGLE over EGL/GBM), so a display is
+    # optional there and mandatory for firefox, whose headless widget backend
+    # has no GL provider on this box at all.
+    host = None
+    if arm == "hardware":
+        host = resolve_host_display(display)
+
     if browser == "chromium":
         driver_path = driver_path or DEFAULT_CHROMEDRIVER
         pick = pick_chromium_binary(driver_path, preferred=binary)
-        caps = chromium_capabilities(pick["binary"], window, headless)
+        chrome_headless = headless
+        if arm == "hardware" and host and host.get("display"):
+            # Headed on the real display: the same surface path a user gets,
+            # and the only way the two browsers are measured on the same
+            # window system.
+            chrome_headless = False
+            env["DISPLAY"] = host["display"]
+            if host.get("xauthority"):
+                env["XAUTHORITY"] = host["xauthority"]
+        caps = chromium_capabilities(pick["binary"], window, chrome_headless,
+                                     extra_args=chromium_args, arm=arm)
         argv = [driver_path, "--port=%d" % port, "--log-level=INFO"]
         info = dict(pick)
+        info["gpu_mode"] = ("headed-host-display" if not chrome_headless
+                            else ("headless-angle-egl" if arm == "hardware"
+                                  else "headless-swiftshader"))
     elif browser == "firefox":
         driver_path = driver_path or (shutil.which("geckodriver")
                                       or DEFAULT_GECKODRIVER)
@@ -513,12 +768,30 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
         info = {"binary": binary, "browser_version": _version_of(binary),
                 "driver_version": _version_of(driver_path)}
         mode = ff_mode
-        if not headless:
+        if mode == "auto" and arm == "hardware":
+            mode = "host"
+        elif not headless:
             mode = "headed"                      # caller brings the display
         elif mode == "auto":
             mode = "xvfb" if shutil.which("Xvfb") else "headless"
         info["ff_mode"] = mode
-        if mode == "xvfb":
+        if mode == "host":
+            if not host:
+                host = resolve_host_display(display)
+            if not host.get("display"):
+                raise WebDriverError(
+                    "ff_mode=host needs the machine's own X display: %s"
+                    % host.get("why"))
+            env["DISPLAY"] = host["display"]
+            if host.get("xauthority"):
+                env["XAUTHORITY"] = host["xauthority"]
+            env.pop("MOZ_HEADLESS", None)
+            info["host_display"] = dict(host)
+            prefs = dict(FIREFOX_HARDWARE_PREFS)
+            prefs.update(ff_prefs or {})
+            caps = firefox_capabilities(binary, window, headless=False,
+                                        extra_prefs=prefs)
+        elif mode == "xvfb":
             xvfb = XvfbProcess(out_dir, tag,
                                screen=(window[0] + 400, window[1] + 150))
             aux_procs.append(xvfb)
@@ -536,6 +809,12 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
     else:
         raise ValueError("browser must be chromium or firefox")
     info["driver_path"] = driver_path
+    info["arm"] = arm
+    if host is not None:
+        info["host_display"] = dict(host)
+    if browser == "chromium":
+        info["chromium_args"] = (caps["capabilities"]["alwaysMatch"]
+                                 ["goog:chromeOptions"]["args"])
     if tmp_note:
         info["tmp_note"] = tmp_note
     if extra_env:
@@ -633,9 +912,18 @@ return out;
 # 2026-08-22, Chromium 151 on SwiftShader exposes navigator.gpu while
 # requestAdapter() resolves to null -- the old boolean field read true on a
 # machine with no usable WebGPU adapter and could not fail. What decides is
-# whether an adapter comes back, and (for WS1/WS4) what limits it carries:
-# WebGPU's default maxTextureDimension2D is 8192 where Firefox's WebGL2
-# reports 32768, so a naive WebGPU switch can LOWER the cap.
+# whether an adapter comes back, and what limits it carries.
+#
+# The limits are the reason this probe records more than a boolean. Measured
+# 2026-08-22 on this box's RTX 3090, hardware arm, WebGL2 vs WebGPU on the SAME
+# adapter (see run_gpu_arm.sh for how to reproduce each):
+#
+#   firefox 153  WebGL2 32768 / 16384   WebGPU 32767 / 16384  (pref-gated)
+#   chromium 151 WebGL2 32768 / 16384   WebGPU 16384 /  2048  (vulkan ANGLE)
+#
+# i.e. on Chromium a WebGPU switch HALVES the 2D cap and cuts the 3D cap by 8x
+# against the WebGL2 the same GPU already offers. A promotion keyed on
+# max_texture_dimension_2d must therefore name its API as well as its adapter.
 WEBGPU_PROBE = """
 var done = arguments[arguments.length - 1];
 var out = { gpu_object: !!navigator.gpu, adapter: null };
@@ -1218,6 +1506,10 @@ def run_smoke(args):
 
     result = {
         "tag": tag, "browser": args.browser, "url": args.url,
+        # First field after the tag on purpose. Every cap below is a property
+        # of the adapter this arm reached, and a reader who does not know
+        # which arm ran cannot use any of them.
+        "arm": args.arm,
         "invocation": sys.argv, "started_utc": time.strftime(
             "%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "stages": [], "gotchas": [],
@@ -1240,7 +1532,8 @@ def run_smoke(args):
             args.browser, out_dir, tag, driver_path=args.driver,
             binary=args.binary, window=window, headless=not args.headed,
             tmp_root=tmp_root, ff_prefs=parse_kv(args.ff_pref, json_values=True),
-            extra_env=parse_kv(args.env), ff_mode=args.ff_mode)
+            extra_env=parse_kv(args.env), ff_mode=args.ff_mode, arm=args.arm,
+            display=args.display, chromium_args=args.chromium_arg)
         result["binary"] = info
         caps = session.caps
         result["session"] = {
@@ -1284,7 +1577,10 @@ def run_smoke(args):
             result["env"]["webgpu"] = {"probe_error": str(e)}
         env0 = result["env"] or {}
         wg = env0.get("webgpu") or {}
+        result["adapter"] = classify_adapter(env0)
         stage("env-probe",
+              arm=args.arm,
+              adapter=adapter_label(result["adapter"]),
               webgl=env0.get("webgl"),
               renderer=env0.get("gl_renderer"),
               max_texture_size=env0.get("max_texture_size"),
@@ -1432,11 +1728,31 @@ def run_smoke(args):
         if args.expect_cross_origin_isolated:
             coi_ok = (coi is True)
 
+        # The hardware arm's own non-triviality floor. Without it the arm
+        # cannot fail: a chromium that quietly fell back to SwiftShader looks
+        # exactly like one that reached the driver, and re-labelling the same
+        # software figures "hardware" is the precise defect this arm exists to
+        # correct. Same refusal as the a9 harness's assertHardwareRenderer.
+        adapter = result.get("adapter") or {}
+        hw_ok = None
+        if args.require_hardware:
+            hw_ok = (adapter.get("class") == "hardware")
+            if not hw_ok:
+                result["gotchas"].append(
+                    "--require-hardware: adapter is %s (renderer %r); "
+                    "fix the GPU flags rather than reporting this figure"
+                    % (adapter_label(adapter), adapter.get("renderer")))
+
         result["pass"] = (booted and canvas_ok and raf_ok
                           and canvas_blank is not True and not panics
                           and worker_ok
-                          and sw_ok is not False and coi_ok is not False)
+                          and sw_ok is not False and coi_ok is not False
+                          and hw_ok is not False)
         result["verdict"] = {
+            "arm": args.arm,
+            "adapter_class": adapter.get("class"),
+            "adapter_renderer": adapter.get("renderer"),
+            "hardware_ok": hw_ok,
             "booted": booted, "canvas_ok": canvas_ok, "raf_ok": raf_ok,
             "service_worker_ok": sw_ok,
             "cross_origin_isolated": coi,
@@ -1507,6 +1823,20 @@ def run_smoke(args):
         return ("n=%d p50=%.2f p90=%.2f p95=%.2f p99=%.2f max=%.2f mean=%.2f ms"
                 % (d["n"], d["p50"], d["p90"], d["p95"], d["p99"], d["max"],
                    d["mean"]))
+    adapter = result.get("adapter") or classify_adapter(env)
+    alabel = adapter_label(adapter)
+    # The arm and the adapter lead every summary, and are repeated on each
+    # line that carries a cap or a frame time. A figure whose adapter is
+    # unknown is worse than no figure: it gets quoted.
+    binfo = result.get("binary") or {}
+    print("[%s] SUMMARY arm=%s adapter=%s (%s) via %s"
+          % (tag, result.get("arm"), alabel, adapter.get("vendor"),
+             binfo.get("gpu_mode") or binfo.get("ff_mode") or "?"))
+    hd = binfo.get("host_display") or {}
+    if hd:
+        print("[%s] SUMMARY display=%s (%s) xauthority=%s"
+              % (tag, hd.get("display") or "none", hd.get("source")
+                 or hd.get("why"), hd.get("xauthority")))
     print("[%s] SUMMARY pass=%s booted=%s canvas=%sx%s (buffer %sx%s) dpr=%s"
           % (tag, result.get("pass"), v.get("booted"),
              b.get("clientWidth"), b.get("clientHeight"),
@@ -1527,12 +1857,16 @@ def run_smoke(args):
     print("[%s] SUMMARY gl=%s renderer=%r visibility=%s"
           % (tag, env.get("webgl"), env.get("gl_renderer"),
              env.get("visibility")))
-    print("[%s] SUMMARY max_texture=%s max_3d_texture=%s max_renderbuffer=%s "
-          "cores=%s device_memory=%s"
-          % (tag, env.get("max_texture_size"), env.get("max_3d_texture_size"),
+    print("[%s] SUMMARY [%s] max_texture=%s max_3d_texture=%s "
+          "max_renderbuffer=%s cores=%s device_memory=%s"
+          % (tag, alabel,
+             env.get("max_texture_size"), env.get("max_3d_texture_size"),
              env.get("max_renderbuffer_size"),
              env.get("hardware_concurrency"), env.get("device_memory")))
-    print("[%s] SUMMARY webgpu: %s" % (tag, webgpu_s))
+    print("[%s] SUMMARY [%s] webgpu: %s" % (tag, alabel, webgpu_s))
+    if v.get("hardware_ok") is False:
+        print("[%s] SUMMARY HARDWARE ARM FAILED: adapter is %s, not a GPU"
+              % (tag, alabel))
     swr = result.get("service_worker") or {}
     print("[%s] SUMMARY isolation: crossOriginIsolated=%s SharedArrayBuffer=%s "
           "sw_blocked_by_rig=%s sw_registrations=%s"
@@ -1551,9 +1885,9 @@ def run_smoke(args):
     for f in (res.get("failed") or [])[:10]:
         print("[%s] SUMMARY   resource status=%s %s"
               % (tag, f.get("status"), f.get("u")))
-    print("[%s] SUMMARY raf warm : %s" % (tag, fr(rw)))
+    print("[%s] SUMMARY [%s] raf warm : %s" % (tag, alabel, fr(rw)))
     if rl:
-        print("[%s] SUMMARY raf later: %s" % (tag, fr(rl)))
+        print("[%s] SUMMARY [%s] raf later: %s" % (tag, alabel, fr(rl)))
     sh = result.get("screenshots") or {}
     for which in ("page", "canvas"):
         s = sh.get(which) or {}
@@ -1633,13 +1967,49 @@ def main(argv=None):
                          "system TMPDIR; must be <60 chars for chromium -- "
                          "chrome's singleton socket hits the 107-byte "
                          "sun_path limit under deep paths)")
-    ap.add_argument("--ff-mode", choices=("auto", "xvfb", "headless"),
+    ap.add_argument("--arm", choices=("software", "hardware"),
+                    default="software",
+                    help="which adapter to measure. software (default, and "
+                         "what CI runs): chromium on SwiftShader, firefox on "
+                         "a rig-owned Xvfb -> llvmpipe; deterministic and "
+                         "GPU-free. hardware: the software flags are dropped "
+                         "and both browsers are pointed at the machine's own "
+                         "display, so they reach the real driver. The arm is "
+                         "recorded in the artifact and printed on every "
+                         "summary line that carries a cap")
+    ap.add_argument("--require-hardware", action="store_true",
+                    help="fail the run unless the WebGL renderer is a real "
+                         "GPU (pair with --arm hardware). Without it the "
+                         "hardware arm cannot fail: a silent SwiftShader "
+                         "fallback reads exactly like a driver")
+    ap.add_argument("--display", default=None,
+                    help="X display for --arm hardware (default: $RIG_DISPLAY, "
+                         "then $DISPLAY, then :0, first one with a live "
+                         "socket). The cookie is found automatically under "
+                         "$XDG_RUNTIME_DIR; without it a real display reports "
+                         "as no display at all. An explicit value is honoured "
+                         "or refused, never quietly replaced. `none` asks for "
+                         "no display: chromium then reaches the driver "
+                         "headless over ANGLE/EGL (measured identical caps), "
+                         "firefox cannot and the run fails")
+    ap.add_argument("--ff-mode", choices=("auto", "host", "xvfb", "headless"),
                     default="auto",
-                    help="firefox display mode: xvfb = real firefox on a "
-                         "rig-owned virtual display (WebGL2 works, default "
-                         "when Xvfb exists); headless = firefox -headless "
-                         "(NO WebGL on this box: the app boots but panics at "
-                         "surface creation and paints nothing)")
+                    help="firefox display mode: host = the machine's own X "
+                         "display, i.e. the real driver (default on --arm "
+                         "hardware); xvfb = real firefox on a rig-owned "
+                         "virtual display (llvmpipe; WebGL2 works, default on "
+                         "--arm software when Xvfb exists); headless = "
+                         "firefox -headless (NO WebGL on this box: the app "
+                         "boots but panics at surface creation and paints "
+                         "nothing)")
+    ap.add_argument("--chromium-arg", action="append", default=[],
+                    help="extra chromium command-line flag, appended after "
+                         "the arm's own; repeatable. The counterpart of "
+                         "--ff-pref, and how a capability question is asked "
+                         "without editing the rig -- e.g. WebGPU on this box "
+                         "needs --enable-unsafe-webgpu plus a Vulkan ANGLE "
+                         "backend, and the answer differs from the default "
+                         "hardware arm's")
     ap.add_argument("--ff-pref", action="append", default=[],
                     help="extra firefox pref, key=value (value parsed as "
                          "JSON when possible); repeatable")
