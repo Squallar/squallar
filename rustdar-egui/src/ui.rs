@@ -57,6 +57,10 @@ mod statusbar;
 mod timeline;
 #[cfg(test)]
 pub(crate) use timeline::TimelineProbe;
+/// The archive rail's geometry, for the tests that drive it through the real
+/// widget: where the travel begins and ends, and where `now` sits on it.
+#[cfg(test)]
+pub(crate) use timeline::{NOW_SPLIT, slider_end_inset, slider_travel_px};
 #[path = "ui_topbar.rs"]
 mod topbar;
 /// The top bar's layout floor — margins plus one interact row.

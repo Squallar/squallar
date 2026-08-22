@@ -41,9 +41,300 @@ const SIDE_INSET: f32 = 24.0;
 /// The collapsed chip's inset from the map's bottom-right corner.
 const CHIP_INSET: f32 = 8.0;
 
-/// The archive scrubber's live threshold: releasing at or past this fraction
-/// of the rail means "back to live", not "an archive moment very near now".
-const SCRUB_LIVE_THRESHOLD: f32 = 0.99;
+/// **Where `now` sits on the archive rail, as a fraction of its travel, on a
+/// pane whose transport layer reaches past the wall clock.** Chosen by the
+/// user from measured options; `1.0` on every pane with no forecast timeline,
+/// which is what makes a radar-only rail the one it has always been.
+///
+/// **A constant, and each side carries its own seconds per pixel.** One
+/// linear axis over `span_secs + horizon` hands the past `P/(P+F)` of the
+/// travel: 5.26% of it at an 18 h horizon and 2.04% at 48 h, which is 3.45
+/// and 8.92 minutes per pixel against radar volumes 259-517 s apart. Archive
+/// scrubbing would stop existing the moment a model layer was switched on,
+/// with no user action on the scrubber at all. A fixed split costs the past
+/// exactly `1/NOW_SPLIT` = 1.4286x whatever the horizon is.
+///
+/// **The two colours are that scale break made visible.** A rail painted one
+/// colour with a hidden change of scale inside it would be a lie; the colour
+/// break is where the seconds-per-pixel changes, so the landmark the reader
+/// steers by and the thing they must know are the same mark.
+pub(crate) const NOW_SPLIT: f32 = 0.70;
+
+/// How far the forecast region's fill is carried from the past region's
+/// toward the window's own background, in [`egui::Color32::lerp_to_gamma`].
+/// The one knob over both themes: light moves 230 -> 239 and dark 60 -> 43,
+/// each toward its own `window_fill`, so the future is the half that recedes
+/// into the page either way.
+const FUTURE_TOWARD_WINDOW: f32 = 0.5;
+
+/// **How near the `now` boundary a release has to land to mean "back to
+/// live"**, in points — a distance, where the rule it replaces was a fraction
+/// (`0.99`) of a rail that is 477 px at any window 904 px or wider and 77 px
+/// at a 480 px one. That is 4.8 px of live zone on the wide rail and 0.8 px on
+/// the narrow one, which is not reachable with a mouse.
+const LIVE_SNAP_PX: f32 = 6.0;
+
+/// **The ceiling on [`LIVE_SNAP_PX`], as a share of the forecast region.**
+///
+/// A distance that is 1.26% of a 477 px rail is 7.8% of a 77 px one, and
+/// 25.9% of that rail's 23.15 px forecast half: a quarter of the region a
+/// user is aiming at would answer "live" instead. On a rail with a forecast
+/// half the snap zone is capped here, so the zone can eat a tenth of the
+/// forecast region and never more. On a rail without one there is no forecast
+/// region to protect and the plain distance stands.
+const LIVE_SNAP_MAX_FUTURE_SHARE: f32 = 0.10;
+
+/// Which side of `now` an instant falls on, and so which region of the
+/// archive rail carries it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RailSide {
+    /// At or before the wall clock. **The tie is here**, not in `Future`.
+    Past,
+    /// Later than the wall clock.
+    Future,
+}
+
+/// **The archive rail's two regions, and the scale each of them carries.**
+///
+/// One bar and one drag surface: this is not two rails, it is the mapping
+/// between a fraction of one rail's travel and an instant. `split` is the
+/// fraction at which `now` sits — [`NOW_SPLIT`] on a pane whose transport
+/// layer reaches past the wall clock, `1.0` on every other pane, and at `1.0`
+/// every expression below reduces to the single linear past rail the
+/// scrubber has always been.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RailRegions {
+    /// The fraction of the travel at which `now` sits.
+    pub split: f32,
+    /// How much history the past region covers, in seconds. Always positive.
+    pub past_secs: f32,
+    /// How far forward the forecast region reaches, in seconds; `0.0` when
+    /// there is no forecast region at all.
+    pub future_secs: f32,
+    /// The transport layer's own frame step, in seconds — the grid a release
+    /// in the forecast region is quantised onto. `0` when the layer declares
+    /// no step, and then nothing is quantised.
+    pub step_secs: i64,
+}
+
+impl RailRegions {
+    /// A rail with no forecast region: the whole travel is `past_secs` of
+    /// history, which is the rail every pane had before WI-11.
+    pub(crate) fn past_only(past_secs: f32) -> Self {
+        Self {
+            split: 1.0,
+            past_secs: past_secs.max(1.0),
+            future_secs: 0.0,
+            step_secs: 0,
+        }
+    }
+
+    /// Whether this rail has a forecast region at all — the one condition
+    /// under which anything about the scrubber differs from what it was.
+    pub(crate) fn has_future(&self) -> bool {
+        self.split < 1.0 && self.future_secs > 0.0
+    }
+
+    /// **Which region carries `valid`.** The tie goes to the past: `valid ==
+    /// now` is history, the same `<=` the frame lookup uses, so a forecast
+    /// frame crosses the boundary at the instant its valid time arrives and
+    /// is never briefly in neither region.
+    pub(crate) fn side_of(
+        &self,
+        valid: chrono::NaiveDateTime,
+        now: chrono::NaiveDateTime,
+    ) -> RailSide {
+        if valid <= now {
+            RailSide::Past
+        } else {
+            RailSide::Future
+        }
+    }
+
+    /// **The instant a release at `frac` names, as seconds either side of
+    /// `now`** — negative into history, positive into the forecast.
+    ///
+    /// Each side divides its own seconds by its own share of the travel,
+    /// which is the whole point of the split: the past keeps `past_secs`
+    /// across `split` of the rail whatever the horizon does.
+    pub(crate) fn offset_secs(&self, frac: f32) -> f32 {
+        let frac = frac.clamp(0.0, 1.0);
+        if frac <= self.split || !self.has_future() {
+            // `split` is never 0.0: `past_only` pins it at 1.0 and the
+            // forecast form at `NOW_SPLIT`.
+            -self.past_secs * (1.0 - frac / self.split)
+        } else {
+            self.future_secs * (frac - self.split) / (1.0 - self.split)
+        }
+    }
+
+    /// [`Self::offset_secs`] inverted — where on the travel an instant
+    /// `offset_secs` either side of `now` rests. Clamped into the rail, so a
+    /// clock older than the window pins at the left end rather than running
+    /// off it.
+    pub(crate) fn frac_of_offset(&self, offset_secs: f32) -> f32 {
+        if offset_secs <= 0.0 || !self.has_future() {
+            self.split * (1.0 + offset_secs / self.past_secs).clamp(0.0, 1.0)
+        } else {
+            self.split + (1.0 - self.split) * (offset_secs / self.future_secs).clamp(0.0, 1.0)
+        }
+    }
+
+    /// **How wide the live zone around the `now` boundary is**, in points,
+    /// over a rail whose travel is `travel_px`. See [`LIVE_SNAP_PX`] and
+    /// [`LIVE_SNAP_MAX_FUTURE_SHARE`].
+    pub(crate) fn live_snap_px(&self, travel_px: f32) -> f32 {
+        let future_px = (1.0 - self.split) * travel_px;
+        if future_px <= 0.0 {
+            return LIVE_SNAP_PX;
+        }
+        LIVE_SNAP_PX.min(LIVE_SNAP_MAX_FUTURE_SHARE * future_px)
+    }
+
+    /// Whether a release at `frac` means "back to live" rather than an
+    /// instant. Symmetric about the boundary, so on a rail with no forecast
+    /// region — where the boundary is the right end — only its left half is
+    /// reachable and the rule reads exactly as the old right-end one did.
+    pub(crate) fn is_live_release(&self, frac: f32, travel_px: f32) -> bool {
+        ((frac.clamp(0.0, 1.0) - self.split) * travel_px).abs() <= self.live_snap_px(travel_px)
+    }
+
+    /// **Quantise a forecast instant onto the transport layer's frame grid.**
+    ///
+    /// A 48 h horizon over the forecast region's 143 px is 2.92 px per frame,
+    /// so a pixel-accurate pick is not a thing a hand can do; a release in
+    /// the forecast region lands on the nearest stamp instead. The grid is
+    /// the layer's own [`rustdar_source::time::TimeAxis`] step, anchored on
+    /// the epoch, which is where an hourly model's valid times are. It names
+    /// a grid, not a promise that a frame exists on it — the same bound
+    /// `SourceHandler::frame_horizon` carries.
+    pub(crate) fn snap_future(&self, target: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
+        if self.step_secs <= 0 {
+            return target;
+        }
+        let secs = target.and_utc().timestamp();
+        let step = self.step_secs;
+        let rounded = (secs as f64 / step as f64).round() as i64 * step;
+        chrono::DateTime::from_timestamp(rounded, 0).map_or(target, |dt| dt.naive_utc())
+    }
+}
+
+/// **What `egui::Slider` shortens its travel by at each end**, so the handle
+/// stays inside the rect it was given.
+///
+/// `rect.height() / 2.5`, then narrowed by the aspect ratio when the style
+/// draws a rectangular handle — which the default style does, at 0.75. On the
+/// transport's 18.0 pt rail that is 7.2 x 0.75 = **5.40 pt per end**, and it
+/// is read from the style rather than assumed because a circular handle
+/// shortens by the full 7.2.
+pub(crate) fn slider_end_inset(rect: egui::Rect, handle_shape: egui::style::HandleShape) -> f32 {
+    let radius = rect.height() / 2.5;
+    match handle_shape {
+        egui::style::HandleShape::Circle => radius,
+        egui::style::HandleShape::Rect { aspect_ratio } => radius * aspect_ratio,
+    }
+}
+
+/// **How far a slider's handle actually travels inside `rect`** — the
+/// distance the `0.0..=1.0` fraction is spread over, and the denominator of
+/// every figure in seconds or frames per pixel.
+///
+/// Not the rect's width: [`slider_end_inset`] comes off each end, turning the
+/// transport's 488.0 pt rail rect into **477.2 pt of travel**.
+pub(crate) fn slider_travel_px(rect: egui::Rect, handle_shape: egui::style::HandleShape) -> f32 {
+    (rect.width() - 2.0 * slider_end_inset(rect, handle_shape)).max(0.0)
+}
+
+/// **One bar, two colours inside it, meeting at `now`** — the archive rail.
+///
+/// One `egui::Slider`: one id, one hit target, one continuous drag surface
+/// that a press in either region can cross without letting go. The regions
+/// are paint, not widgets.
+///
+/// **Why the fills go under the slider rather than over it.** egui paints a
+/// slider as rail, then handle, and the handle's radius is larger than the
+/// rail is tall — so a fill laid over the rail would bury the handle wherever
+/// the two met. The two fills are added to slots reserved *before* the widget
+/// and filled in after it, which puts them under both; egui's own one-colour
+/// rail is collapsed to nothing by zeroing `slider_rail_height`, a number the
+/// widget uses for that rail and for nothing else — not for its size, its
+/// travel, its handle or its hit rect. The zero-height rail rect it still
+/// emits covers no pixels.
+///
+/// **A pane with no forecast region does not come through here at all**: it
+/// takes the untouched widget, with no reserved slots and no style edit, so
+/// its rail is the shape set it has always painted.
+fn paint_two_colour_rail(
+    ui: &mut egui::Ui,
+    regions: RailRegions,
+    frac: &mut f32,
+) -> egui::Response {
+    let slider = |frac: &mut f32, ui: &mut egui::Ui| {
+        ui.add(egui::Slider::new(frac, 0.0..=1.0).show_value(false))
+    };
+    if !regions.has_future() {
+        return slider(frac, ui);
+    }
+
+    let rail_height = ui.spacing().slider_rail_height;
+    let corner_radius = ui.visuals().widgets.inactive.corner_radius;
+    // The past keeps today's trough exactly. The future is that colour
+    // carried halfway to the window's own background, so it recedes into the
+    // page in whichever theme is up: 230 -> 239 in light, 60 -> 43 in dark.
+    // One expression, both themes, read off the live `Visuals` rather than
+    // from a pair of hard-coded colours that would be right in one of them.
+    let past_fill = ui.visuals().widgets.inactive.bg_fill;
+    let future_fill = past_fill.lerp_to_gamma(ui.visuals().window_fill, FUTURE_TOWARD_WINDOW);
+    let boundary_color = ui.visuals().widgets.active.fg_stroke.color;
+
+    let past_slot = ui.painter().add(egui::Shape::Noop);
+    let future_slot = ui.painter().add(egui::Shape::Noop);
+    let boundary_slot = ui.painter().add(egui::Shape::Noop);
+    ui.spacing_mut().slider_rail_height = 0.0;
+    let response = slider(frac, ui);
+
+    let rect = response.rect;
+    let rail = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), rect.center().y - rail_height / 2.0),
+        egui::pos2(rect.right(), rect.center().y + rail_height / 2.0),
+    );
+    // Where the handle sits when it reads `now` — the value position, not the
+    // rect's own fraction, so the colour break and the handle land on the
+    // same pixel.
+    let handle_shape = ui.style().visuals.handle_shape;
+    let break_x = rect.left()
+        + slider_end_inset(rect, handle_shape)
+        + regions.split * slider_travel_px(rect, handle_shape);
+
+    let painter = ui.painter();
+    painter.set(
+        past_slot,
+        egui::epaint::RectShape::filled(
+            egui::Rect::from_min_max(rail.min, egui::pos2(break_x, rail.max.y)),
+            corner_radius,
+            past_fill,
+        ),
+    );
+    painter.set(
+        future_slot,
+        egui::epaint::RectShape::filled(
+            egui::Rect::from_min_max(egui::pos2(break_x, rail.min.y), rail.max),
+            corner_radius,
+            future_fill,
+        ),
+    );
+    painter.set(
+        boundary_slot,
+        egui::Shape::LineSegment {
+            points: [
+                egui::pos2(break_x, rail.top()),
+                egui::pos2(break_x, rail.bottom()),
+            ],
+            stroke: egui::Stroke::new(1.0, boundary_color),
+        },
+    );
+    response
+}
 
 /// Slider width for the row-2 tuning sliders — modest, so lookback and speed
 /// share a row.
@@ -742,22 +1033,20 @@ impl super::Gui {
             return;
         }
 
-        let lookback_secs = self.panes[pane_idx].time.span_secs.max(1) as f32;
+        let regions = self.rail_regions(pane_idx);
+        let now = chrono::Utc::now().naive_utc();
         let resting = if self.panes[pane_idx].viewing_live {
-            1.0
+            regions.split
         } else {
             match self.panes[pane_idx].data_time_on_screen() {
-                Some(t) => {
-                    let age = (chrono::Utc::now().naive_utc() - t).num_seconds() as f32;
-                    (1.0 - age / lookback_secs).clamp(0.0, 1.0)
-                }
-                None => 1.0,
+                Some(t) => regions.frac_of_offset((t - now).num_seconds() as f32),
+                None => regions.split,
             }
         };
         let mut frac = self.timeline_scrub.unwrap_or(resting);
         let scrub = ui
             .push_id("scrub_archive", |ui| {
-                ui.add(egui::Slider::new(&mut frac, 0.0..=1.0).show_value(false))
+                paint_two_colour_rail(ui, regions, &mut frac)
             })
             .inner;
         #[cfg(test)]
@@ -767,48 +1056,115 @@ impl super::Gui {
                 .push(("timeline_scrubber", scrub.id));
             self.probes.last_timeline.scrubber = scrub.rect;
         }
+        let travel_px = slider_travel_px(scrub.rect, ui.style().visuals.handle_shape);
         if scrub.drag_stopped() {
             self.timeline_scrub = None;
-            self.commit_archive_scrub(frac, lookback_secs, actions);
+            self.commit_archive_scrub(frac, regions, travel_px, actions);
         } else if scrub.dragged() {
             self.timeline_scrub = Some(frac);
         } else if scrub.changed() {
             self.timeline_scrub = None;
-            self.commit_archive_scrub(frac, lookback_secs, actions);
+            self.commit_archive_scrub(frac, regions, travel_px, actions);
         } else {
             self.timeline_scrub = None;
         }
     }
 
-    /// Commit a scrub position: the right end means live, anywhere else means
-    /// the archive moment that fraction of the lookback window names. One
-    /// function for the release and the keyboard nudge, so the two routes
-    /// cannot drift.
+    /// **The two regions this pane's archive rail carries** — the past window
+    /// it has always had, and the forecast region a transport layer reaching
+    /// past the wall clock adds to it.
+    ///
+    /// **Both halves ask the transport layer, and nothing else asks anything.**
+    /// The past is `Gui::loop_span_secs_for` — the Lookback setting raised
+    /// to the floor that layer declares, which is the same window its loop is
+    /// listed over, so turning the loop off no longer lands the clock outside
+    /// the rail that has to show it. The forecast is
+    /// `SourceHandler::frame_horizon`, read off the registry by id rather
+    /// than re-spelled here as a `match` on the id.
+    ///
+    /// A layer whose axis does not declare `extends_future`, one the registry
+    /// does not serve, or a forecast layer whose current selection happens to
+    /// reach nowhere forward all get [`RailRegions::past_only`] — and with it
+    /// the rail this scrubber had before WI-11, to the pixel.
+    fn rail_regions(&self, pane_idx: usize) -> RailRegions {
+        let past_only = RailRegions::past_only(self.loop_span_secs_for(pane_idx).max(1) as f32);
+        let Some(pane) = self.panes.get(pane_idx) else {
+            return past_only;
+        };
+        let id = pane.transport_layer().clone();
+        let Some(handler) = self.overlays.handler_by_id(&id) else {
+            return past_only;
+        };
+        let rustdar_source::time::TimeAxis::FrameSeries {
+            typical_step,
+            extends_future: true,
+        } = handler.time_axis()
+        else {
+            return past_only;
+        };
+        let view = pane.view(pane_idx);
+        let horizon = handler.frame_horizon(&view.layer(&id)).num_seconds();
+        if horizon <= 0 {
+            return past_only;
+        }
+        RailRegions {
+            split: NOW_SPLIT,
+            past_secs: past_only.past_secs,
+            future_secs: horizon as f32,
+            step_secs: typical_step.as_secs() as i64,
+        }
+    }
+
+    /// **Commit a scrub position**: near the `now` boundary means live,
+    /// anywhere else means the instant that point of the rail names — history
+    /// left of the boundary, forecast right of it. One function for the
+    /// release and the keyboard nudge, so the two routes cannot drift.
+    ///
+    /// **The clock write is layer-agnostic and unconditional**, which is what
+    /// lets a pane carrying no radar be scrubbed at all. It used to sit
+    /// behind radar's `scan_info`, so every clock-aware layer on a radar-less
+    /// pane — alerts, storm reports, outlooks, a model loop — was frozen at
+    /// whatever instant it started on no matter where the rail was dragged.
     fn commit_archive_scrub(
         &mut self,
         frac: f32,
-        lookback_secs: f32,
+        regions: RailRegions,
+        travel_px: f32,
         actions: &mut Vec<GuiAction>,
     ) {
         let pane_idx = self.active_pane;
-        if frac >= SCRUB_LIVE_THRESHOLD {
+        if regions.is_live_release(frac, travel_px) {
             actions.push(GuiAction::JumpToLive { pane_idx });
-        } else if let Some(scan_time) = self.panes[pane_idx]
-            .scan_info
-            .as_ref()
-            .map(|info| info.timestamp)
+            return;
+        }
+        let now = chrono::Utc::now().naive_utc();
+        let released = now + chrono::Duration::seconds(regions.offset_secs(frac) as i64);
+        // The forecast region quantises its release and the past region does
+        // not: 2.92 px per frame at a 48 h horizon is not a distance a hand
+        // resolves, while a past instant is a genuine free choice.
+        let target = match regions.side_of(released, now) {
+            RailSide::Past => released,
+            RailSide::Future => regions.snap_future(released),
+        };
+        self.panes[pane_idx].viewing_live = false;
+        // The release names an INSTANT, so say so: the pane's clock moves to
+        // it and every layer on the pane is shown at that moment.
+        self.panes[pane_idx].set_time_mode(TimeMode::AsOf(target));
+        // Radar's half of the same answer, and only radar's. A released
+        // instant later than the wall clock has no volume to fetch, and
+        // asking for one would have `handle_navigate_time` clamp the target
+        // back to now and report the pane live again while its clock names a
+        // forecast hour — a pane claiming to be live over a picture of the
+        // future.
+        if regions.side_of(target, now) == RailSide::Past
+            && let Some(scan_time) = self.panes[pane_idx]
+                .scan_info
+                .as_ref()
+                .map(|info| info.timestamp)
         {
-            let now = chrono::Utc::now().naive_utc();
-            let target = now - chrono::Duration::seconds((lookback_secs * (1.0 - frac)) as i64);
-            let step_secs = (target - scan_time).num_seconds();
-            self.panes[pane_idx].viewing_live = false;
-            // The release names an INSTANT, so say so: the pane's clock moves
-            // to it and every layer on the pane is shown at that moment. The
-            // scan fetch below is radar's half of the same answer.
-            self.panes[pane_idx].set_time_mode(TimeMode::AsOf(target));
             actions.push(GuiAction::NavigateTime {
                 pane_idx,
-                step_secs,
+                step_secs: (target - scan_time).num_seconds(),
             });
         }
     }
@@ -1098,3 +1454,8 @@ impl super::Gui {
 #[path = "ui_timeline/tests.rs"]
 #[cfg(test)]
 mod tests;
+
+/// The archive rail's two regions, and the rules that hang off the split.
+#[path = "ui_timeline/rail_tests.rs"]
+#[cfg(test)]
+mod rail_tests;

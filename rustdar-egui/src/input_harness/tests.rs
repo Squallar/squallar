@@ -4759,7 +4759,18 @@ fn scrubbing_the_archive_commits_once_on_release_and_drops_live() {
     );
 }
 
-/// **Scrubbing to the right end restores live** (plan §3.7).
+/// **Scrubbing to the right end restores live** (plan §3.7) — **on a pane
+/// with no forecast timeline, which is the only kind of pane this still
+/// holds for.**
+///
+/// WI-11 moved the live zone from "the last 1% of the rail" to "within
+/// `LIVE_SNAP_PX` of the `now` boundary". On this pane those are the same
+/// place, because `NOW_SPLIT` is `1.0` and `now` *is* the right end; on a
+/// pane whose transport reaches forward the right end names the far edge of
+/// the forecast horizon and answering live there would answer a question the
+/// user did not ask. That case is
+/// `the_live_zone_sits_at_now_and_not_at_the_far_end`, and it asserts the
+/// opposite of this deliberately.
 #[test]
 fn scrubbing_to_the_right_end_restores_live() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -13969,5 +13980,457 @@ fn applying_a_preset_that_names_an_unregistered_field_leaves_the_pane_alone() {
         (h.gui_mut().pane(0).expect("pane 0").selected_elevation() - 2.5).abs() < 0.01,
         "the rest of the preset must still apply — otherwise this test would \
          pass on a preset that was never applied at all",
+    );
+}
+
+// ── WI-11: the two-colour time scrubber ──────────────────────────────────
+//
+// The rail's arithmetic is pinned in `ui_timeline/rail_tests.rs`. Everything
+// below drives the real widget and reads what it really painted and really
+// emitted, because this campaign has twice landed an item whose hand-armed
+// tests all passed while the behaviour was absent.
+
+/// Long enough for the chrome fade to settle, so a colour read off the paint
+/// is the colour and not a stage of an animation.
+const FADE_SETTLED_FRAMES: usize = 30;
+
+/// Put pane 0 on a forecast transport: the model layer on, radar off. Radar
+/// outranks the model in the draw order, so a pane carrying both has a radar
+/// transport and a past-only rail — which is itself the subject of
+/// `a_radar_only_rail_is_the_one_bar_it_always_was`.
+fn on_a_forecast_pane(h: &mut InputHarness) {
+    h.load_scan("KTLX");
+    h.set_overlay_on_pane(0, &known::MODEL_DATA, true);
+    h.set_overlay_on_pane(0, &known::RADAR, false);
+    h.frames_for(FADE_SETTLED_FRAMES, 0.1);
+    assert_eq!(
+        *h.gui_mut().pane(0).expect("pane 0").transport_layer(),
+        known::MODEL_DATA,
+        "precondition: the transport must address the forecast layer, or \
+         nothing below is about a forecast rail at all"
+    );
+}
+
+/// Every rect the last frame painted inside the scrubber that covers any
+/// pixels at all, with its fill.
+fn rail_rects(h: &InputHarness, scrub: egui::Rect) -> Vec<(egui::Rect, egui::Color32)> {
+    h.painted_rects()
+        .iter()
+        .copied()
+        .zip(h.painted_fills().iter().copied())
+        .filter(|(r, _)| scrub.expand(1.0).contains_rect(*r) && r.height() > 0.0)
+        .collect()
+}
+
+/// Where a fraction of the rail's travel sits, **read this frame**.
+///
+/// Row 1 is laid out from the timestamp's own galley, so committing a scrub
+/// can change that text and move the rail under a position captured before
+/// the gesture. Every position below is resolved immediately before it is
+/// used, which is the difference between driving the widget and driving a
+/// snapshot of where it once was.
+fn rail_x(h: &InputHarness, frac: f32) -> egui::Pos2 {
+    let scrub = h.timeline().scrubber;
+    let shape = h.handle_shape();
+    egui::pos2(
+        scrub.left()
+            + crate::ui::slider_end_inset(scrub, shape)
+            + frac * crate::ui::slider_travel_px(scrub, shape),
+        scrub.center().y,
+    )
+}
+
+/// Press at `from`, drag to `to` and let go, one frame apart, re-resolving
+/// each position against the rail as it is at that moment.
+fn drag_rail(h: &mut InputHarness, from: f32, to: f32) {
+    let start = rail_x(h, from);
+    h.mouse_press(start);
+    h.frame_after(0.05);
+    let end = rail_x(h, to);
+    h.mouse_move(end);
+    h.frame_after(0.05);
+    let end = rail_x(h, to);
+    h.mouse_move(end);
+    h.frame_after(0.05);
+    h.mouse_release(end);
+    h.frame_after(0.05);
+}
+
+/// Where the colour break sits on `scrub`, from the widget's own geometry.
+fn break_x(h: &InputHarness, scrub: egui::Rect, split: f32) -> f32 {
+    let shape = h.handle_shape();
+    scrub.left()
+        + crate::ui::slider_end_inset(scrub, shape)
+        + split * crate::ui::slider_travel_px(scrub, shape)
+}
+
+/// **A pane with no forecast timeline paints the one bar it always painted.**
+///
+/// Not "close enough": one rail-band rect, at egui's own rail geometry, in
+/// egui's own trough colour, with no second fill over it and no boundary
+/// drawn across it. `NOW_SPLIT` is `1.0` on such a pane and the two-colour
+/// path is not entered at all, which is what makes this a promise about the
+/// shape set and not about a resemblance.
+#[test]
+fn a_radar_only_rail_is_the_one_bar_it_always_was() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.load_scan("KTLX");
+    h.frames_for(FADE_SETTLED_FRAMES, 0.1);
+    let scrub = h.timeline().scrubber;
+    assert!(scrub.is_positive(), "precondition: the scrubber is drawn");
+
+    let trough = h.inactive_bg_fill();
+    let rail_height = h.slider_rail_height();
+    let expected = egui::Rect::from_min_max(
+        egui::pos2(scrub.left(), scrub.center().y - rail_height / 2.0),
+        egui::pos2(scrub.right(), scrub.center().y + rail_height / 2.0),
+    );
+
+    let rail: Vec<_> = rail_rects(&h, scrub)
+        .into_iter()
+        .filter(|(r, _)| (r.height() - rail_height).abs() < 0.01)
+        .collect();
+    assert_eq!(
+        rail.len(),
+        1,
+        "a pane with no forecast timeline painted {} rail-band rects, not \
+         the one egui's own slider paints: {rail:?}",
+        rail.len(),
+    );
+    let (rect, fill) = rail[0];
+    assert!(
+        (rect.left() - expected.left()).abs() < 0.01
+            && (rect.right() - expected.right()).abs() < 0.01,
+        "the rail spans {rect:?}, where egui's own spans {expected:?}"
+    );
+    assert_eq!(
+        fill, trough,
+        "the rail is not the trough colour any more, so a radar-only pane no \
+         longer looks the way it did"
+    );
+    assert!(
+        h.all_segments_in(scrub.expand(2.0)).is_empty(),
+        "a boundary was drawn across a rail that has no boundary to draw"
+    );
+}
+
+/// **One bar, two colours inside it, meeting at `now`** — in whichever theme
+/// is up.
+///
+/// The two fills and the boundary are read off the live `Visuals` by one
+/// expression, so this walks both: a pair of colours hard-coded for the light
+/// theme reds the dark arm and the other way round. The break's position is
+/// asserted against the widget's own travel, because the whole point of the
+/// colour is to mark where the seconds per pixel changes.
+#[test]
+fn the_forecast_rail_paints_two_colours_meeting_at_now() {
+    for dark in [false, true] {
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.set_os_theme(dark);
+        on_a_forecast_pane(&mut h);
+        let theme = if dark { "dark" } else { "light" };
+
+        let scrub = h.timeline().scrubber;
+        let rail_height = h.slider_rail_height();
+        let split = crate::ui::NOW_SPLIT;
+        let boundary_x = break_x(&h, scrub, split);
+
+        let bands: Vec<_> = rail_rects(&h, scrub)
+            .into_iter()
+            .filter(|(r, _)| (r.height() - rail_height).abs() < 0.01)
+            .collect();
+        assert_eq!(
+            bands.len(),
+            2,
+            "{theme}: the rail is {} bands, not the two the user asked for: \
+             {bands:?}",
+            bands.len(),
+        );
+        let (past_rect, past_fill) = bands[0];
+        let (future_rect, future_fill) = bands[1];
+
+        assert!(
+            (past_rect.left() - scrub.left()).abs() < 0.01
+                && (past_rect.right() - boundary_x).abs() < 0.05
+                && (future_rect.left() - boundary_x).abs() < 0.05
+                && (future_rect.right() - scrub.right()).abs() < 0.01,
+            "{theme}: the two regions are {past_rect:?} and {future_rect:?}, \
+             which do not meet at {boundary_x:.2} and cover the rail exactly \
+             once"
+        );
+
+        let segments = h.all_segments_in(scrub.expand(2.0));
+        assert_eq!(
+            segments.len(),
+            1,
+            "{theme}: {} boundary strokes, not one: {segments:?}",
+            segments.len(),
+        );
+        let (a, b, stroke) = segments[0];
+        assert!(
+            (a.x - boundary_x).abs() < 0.05 && (b.x - boundary_x).abs() < 0.05,
+            "{theme}: the boundary is at {a:?}-{b:?}, not at {boundary_x:.2}"
+        );
+
+        // Mutually distinguishable, and derived from this theme's own
+        // Visuals: the past is the trough colour it has always been, the
+        // future is that colour carried toward this theme's window fill, and
+        // the boundary is this theme's active stroke.
+        assert_eq!(
+            past_fill,
+            h.inactive_bg_fill(),
+            "{theme}: the past region is no longer today's trough"
+        );
+        assert_ne!(
+            past_fill, future_fill,
+            "{theme}: the two regions are the same colour, so there is no \
+             denotation between past and future at all"
+        );
+        assert_ne!(
+            stroke.color, past_fill,
+            "{theme}: the boundary is invisible"
+        );
+        assert_ne!(
+            stroke.color, future_fill,
+            "{theme}: the boundary is invisible against the forecast region"
+        );
+        let separation = i32::from(past_fill.r()) - i32::from(future_fill.r());
+        assert!(
+            separation.abs() >= 8,
+            "{theme}: the two regions differ by {separation} of 255, which is \
+             not a denotation a reader can see"
+        );
+    }
+}
+
+/// **The two fills are read from the theme, not written into the code.**
+///
+/// The light and dark arms above would both pass on a hard-coded pair chosen
+/// to satisfy whichever ran first; what rules that out is that the pair
+/// itself moves with the theme, and moves in opposite directions — the
+/// forecast region recedes toward a *lighter* background in one and a
+/// *darker* one in the other.
+#[test]
+fn the_rails_two_colours_come_from_the_live_theme() {
+    let mut arms = Vec::new();
+    for dark in [false, true] {
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.set_os_theme(dark);
+        on_a_forecast_pane(&mut h);
+        let scrub = h.timeline().scrubber;
+        let rail_height = h.slider_rail_height();
+        let bands: Vec<_> = rail_rects(&h, scrub)
+            .into_iter()
+            .filter(|(r, _)| (r.height() - rail_height).abs() < 0.01)
+            .map(|(_, fill)| fill)
+            .collect();
+        assert_eq!(bands.len(), 2);
+        arms.push((bands[0], bands[1]));
+    }
+    let (light_past, light_future) = arms[0];
+    let (dark_past, dark_future) = arms[1];
+    assert_ne!(
+        light_past, dark_past,
+        "the past region is the same colour in both themes, so it is not \
+         coming from the theme"
+    );
+    assert_ne!(light_future, dark_future);
+    assert!(
+        light_future.r() > light_past.r() && dark_future.r() < dark_past.r(),
+        "the forecast region must recede toward each theme's own window \
+         fill - lighter in light ({} -> {}), darker in dark ({} -> {})",
+        light_past.r(),
+        light_future.r(),
+        dark_past.r(),
+        dark_future.r(),
+    );
+}
+
+/// **The break is a change of colour, not a change of widget** — one press
+/// crosses it in either direction and commits once.
+///
+/// Two rails would clamp a drag at the region it started in: dragging right
+/// out of the past could never name a forecast instant, and dragging left out
+/// of the forecast could only ever name `now`. Both directions are walked,
+/// because either half alone passes on one of the two rails.
+#[test]
+fn a_drag_crosses_the_colour_break_in_one_hit_target() {
+    use crate::actions::GuiAction;
+
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    on_a_forecast_pane(&mut h);
+    let split = crate::ui::NOW_SPLIT;
+    let past_centre = split / 2.0;
+    let future_centre = split + (1.0 - split) / 2.0;
+
+    // ── Past to forecast ─────────────────────────────────────────────────
+    let before = chrono::Utc::now().naive_utc();
+    h.mouse_press(rail_x(&h, past_centre));
+    h.frame_after(0.05);
+    h.mouse_move(rail_x(&h, future_centre));
+    h.frame_after(0.05);
+    assert!(
+        !h.last_actions().iter().any(|a| matches!(
+            a,
+            GuiAction::NavigateTime { .. } | GuiAction::JumpToLive { .. }
+        )),
+        "the scrub committed mid-drag, which is a fetch per drag frame"
+    );
+    let end = rail_x(&h, future_centre);
+    h.mouse_move(end);
+    h.frame_after(0.05);
+    h.mouse_release(end);
+    h.frame_after(0.05);
+
+    assert!(
+        !h.last_actions()
+            .iter()
+            .any(|a| matches!(a, GuiAction::JumpToLive { .. })),
+        "a release in the middle of the forecast region answered live"
+    );
+    let mode = h.gui_mut().pane(0).expect("pane 0").time.mode;
+    let crate::pane::TimeMode::AsOf(landed) = mode else {
+        panic!("the release left the pane's clock at {mode:?}, not on the instant it named");
+    };
+    let ahead = (landed - before).num_seconds();
+    // The forecast half is 30% of the travel over the run's whole horizon, so
+    // its centre is about half the horizon out. Bounded on both sides, so a
+    // release that never left the past and one that ran off the end both red.
+    assert!(
+        (6 * 3600..=27 * 3600).contains(&ahead),
+        "the drag out of the past region landed {} h from now, which is not \
+         the middle of an 18-to-48 h horizon. A rail split into two widgets \
+         would clamp here at the past region's own right end",
+        ahead / 3600,
+    );
+
+    // ── Forecast back to past ────────────────────────────────────────────
+    h.clear_actions();
+    drag_rail(&mut h, future_centre, past_centre);
+
+    let navigations: Vec<i64> = h
+        .last_actions()
+        .iter()
+        .filter_map(|a| match a {
+            GuiAction::NavigateTime {
+                pane_idx: 0,
+                step_secs,
+            } => Some(*step_secs),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        navigations.len(),
+        1,
+        "the drag out of the forecast region committed {} times, not once",
+        navigations.len(),
+    );
+    let mode = h.gui_mut().pane(0).expect("pane 0").time.mode;
+    let crate::pane::TimeMode::AsOf(landed) = mode else {
+        panic!("the return leg left the pane's clock at {mode:?}");
+    };
+    let behind = (chrono::Utc::now().naive_utc() - landed).num_seconds();
+    assert!(
+        behind > 0,
+        "the drag out of the forecast region landed {behind} s behind now, so \
+         it never crossed back"
+    );
+}
+
+/// **The live zone sits at `now`, which is no longer the right end** — and it
+/// is checked at the two widths the rail actually has.
+///
+/// The rule it replaces was a fraction of the rail (`0.99`), which is 4.8 pt
+/// of live zone on the wide rail and 0.8 pt on the narrow one. This is a
+/// deliberate change of behaviour at **both** widths, and on a pane with a
+/// forecast region it moves the zone off the end entirely: the far right is a
+/// forecast instant now, and answering "live" there would be answering a
+/// question the user did not ask.
+#[test]
+fn the_live_zone_sits_at_now_and_not_at_the_far_end() {
+    use crate::actions::GuiAction;
+
+    for screen in [egui::vec2(1400.0, 900.0), egui::vec2(480.0, 800.0)] {
+        let mut h = InputHarness::with_screen(screen);
+        on_a_forecast_pane(&mut h);
+        if !h.timeline().scrubber.is_positive() {
+            continue;
+        }
+        let shape = h.handle_shape();
+        let travel = crate::ui::slider_travel_px(h.timeline().scrubber, shape);
+        let split = crate::ui::NOW_SPLIT;
+
+        // The far end names the end of the horizon, not live.
+        h.clear_actions();
+        drag_rail(&mut h, 0.5, 1.0);
+        assert!(
+            !h.last_actions()
+                .iter()
+                .any(|a| matches!(a, GuiAction::JumpToLive { .. })),
+            "travel {travel:.1} pt: the far end of a rail with a forecast \
+             region answered live"
+        );
+        // Non-vacuity: that release really did commit, so the negative above
+        // is about where it landed and not about nothing having happened.
+        let mode = h.gui_mut().pane(0).expect("pane 0").time.mode;
+        let crate::pane::TimeMode::AsOf(landed) = mode else {
+            panic!("travel {travel:.1} pt: the far end committed nothing at all");
+        };
+        assert!(
+            landed > chrono::Utc::now().naive_utc(),
+            "travel {travel:.1} pt: the far end named {landed}, which is not \
+             a forecast instant"
+        );
+
+        // The boundary does.
+        h.clear_actions();
+        drag_rail(&mut h, 0.2, split);
+        assert!(
+            h.last_actions()
+                .iter()
+                .any(|a| matches!(a, GuiAction::JumpToLive { pane_idx: 0 })),
+            "travel {travel:.1} pt: releasing on the now boundary did not \
+             restore live"
+        );
+    }
+}
+
+/// **A pane carrying no radar can be scrubbed.**
+///
+/// The clock write used to sit behind radar's `scan_info`, so a pane with the
+/// radar layer off moved nothing at all when its rail was dragged — every
+/// clock-aware layer on it stayed at the instant it started on. The write is
+/// layer-agnostic now, and radar's fetch is the half that stayed conditional.
+#[test]
+fn a_pane_with_no_radar_scan_still_moves_when_it_is_scrubbed() {
+    use crate::actions::GuiAction;
+
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_overlay_on_pane(0, &known::MODEL_DATA, true);
+    h.set_overlay_on_pane(0, &known::RADAR, false);
+    h.frames_for(FADE_SETTLED_FRAMES, 0.1);
+    assert!(
+        h.gui_mut().pane(0).expect("pane 0").scan_info.is_none(),
+        "precondition: this pane has never held a radar scan"
+    );
+    let before = h.gui_mut().pane(0).expect("pane 0").time.mode;
+
+    drag_rail(&mut h, 0.6, 0.2);
+
+    let after = h.gui_mut().pane(0).expect("pane 0").time.mode;
+    assert_ne!(
+        before, after,
+        "a pane with no radar scan did not move when its rail was dragged: \
+         the clock write is still behind radar's scan"
+    );
+    assert!(
+        matches!(after, crate::pane::TimeMode::AsOf(_)),
+        "the release left the clock at {after:?} rather than on an instant"
+    );
+    assert!(
+        !h.last_actions()
+            .iter()
+            .any(|a| matches!(a, GuiAction::NavigateTime { .. })),
+        "a pane with no scan asked for a radar volume to step from"
     );
 }
