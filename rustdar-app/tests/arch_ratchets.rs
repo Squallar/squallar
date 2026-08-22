@@ -216,36 +216,36 @@ const INVENTORY_FIELD: &str = concat!("volumes: ", "crate::volume_inventory::");
 ///
 /// # Why they are still here, and what it costs
 ///
-/// Shedding both makes this walk read **186** (measured: the walker's own
-/// failure message with both shed), against the 181 it reads with them in
-/// place. That is five above this ceiling, and above both values it has
-/// carried since WO-E9e — 185, then 184. It is *not* above every value in this
+/// Shedding both makes this walk read **178** (measured: the walker's own
+/// failure message with both shed), against the 173 it reads with them in
+/// place. That is five above this ceiling, and above every value it has
+/// carried since WO-E9e. It is *not* above every value in this
 /// constant's history: the pin has read 204, 192, 191 and 188 earlier in the
-/// campaign, and 186 would have fitted under any of those. That headroom was
+/// campaign, and 178 would have fitted under any of those. That headroom was
 /// spent down deliberately and is not available to reclaim, which is the whole
 /// point of a ratchet. So the shed cannot be landed together with the honest
 /// number — it would need a **raise**, which requires a written plan amendment
 /// and which WO-ARREARS refused to take on its own authority. The per-file scrape moves the same
-/// way: `app.rs` 37 -> 41 and `app_render.rs` 108 -> 109.
+/// way: `app.rs` 37 -> 41 and `app_render.rs` 102 -> 103.
 ///
 /// So the debt is **recorded, not absorbed**: the coupling this crate really
-/// has is 186, this walk sees 181, and the difference is those five reaches.
+/// has is 178, this walk sees 173, and the difference is those five reaches.
 /// The land that sheds them is the land that must also shed five real reaches
 /// — or carry the amendment that says otherwise. **A third such binding has no
 /// standing at all**: it would be new evasion, and this doc is the record that
 /// the two here were found, measured and left deliberately rather than
 /// overlooked.
-const SELF_GUI_MAX: usize = 180;
+const SELF_GUI_MAX: usize = 173;
 /// Row 1b — the same needle outside test-named paths.
 ///
 /// Everything on [`SELF_GUI_MAX`] applies here: permanent, falls only, sits on
 /// its measurement, same two sheds, same forbidden re-spelling — and the same
 /// recorded debt, because **both hidden bindings are in production files**, so
-/// all five of them are missing from this count too (176 seen, 181 real). This
+/// all five of them are missing from this count too (168 seen, 173 real). This
 /// row is the one that matters for behaviour — the other counts the suites
 /// that exercise the coupling as well, and a suite is allowed to name what it
 /// tests.
-const SELF_GUI_NON_TEST_MAX: usize = 175;
+const SELF_GUI_NON_TEST_MAX: usize = 168;
 /// Row 2a — **`ui.rs`'s own `impl Gui` block, and only that file**.
 ///
 /// **0 since WO-E8b**, which is where the plan said it would land. The last
