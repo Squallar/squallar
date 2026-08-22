@@ -21,7 +21,7 @@ mod shell;
 #[path = "ui_stack.rs"]
 mod ui_stack;
 #[cfg(test)]
-pub(crate) use ui_stack::{StackProbe, StackRowProbe};
+pub(crate) use ui_stack::{ADD_LAYER_LABEL, StackProbe, StackRowProbe};
 #[path = "ui_inspector.rs"]
 mod ui_inspector;
 #[cfg(test)]

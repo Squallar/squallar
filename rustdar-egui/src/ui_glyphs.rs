@@ -37,6 +37,15 @@ pub(crate) const ICON_GLYPHS: &[(char, &str)] = &[
         "refresh (status bar, layer bodies); rotate the line clockwise",
     ),
     ('\u{1f441}', "layer visibility eye (stack rows)"),
+    (
+        '\u{1f5d1}',
+        "remove this layer from this pane's stack (stack rows) - and nothing \
+         else, so a control spelling it always curates rather than dismisses. \
+         Probed against the bundled proportional family before it was chosen: \
+         the ASCII-range fallbacks a reader would reach for first (U+2716, \
+         U+2296, U+232B) are all absent from it, and U+00D7 is spoken for by \
+         close/dismiss",
+    ),
     ('\u{2605}', "a favorited radar site (site list rows)"),
     ('\u{2606}', "an unfavorited radar site (site list rows)"),
     (
