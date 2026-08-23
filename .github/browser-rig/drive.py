@@ -1096,19 +1096,31 @@ return {
 WORKER_SIGNAL_PROBE = r"""
 var C = window.__rig_console || [];
 var attached = [], different = [], off_frame = [], rayon = [];
-var off_re = /took \d+ ms off the frame/;
+var by_kind = {};
+var off_re = /([A-Za-z0-9_-]+) took (\d+) ms off the frame/;
 var rayon_re = /rayon: (\d+) threads/;
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
   if (m.indexOf("rasterization worker attached") !== -1) attached.push(C[i].t);
   if (m.indexOf("rasterization worker is a different build") !== -1)
     different.push(C[i].t);
-  if (off_re.test(m)) off_frame.push(C[i].t);
+  var om = off_re.exec(m);
+  if (om) {
+    off_frame.push(C[i].t);
+    // Kept PER KIND. `deliver_job_reply` logs this line for every offloaded
+    // job -- alerts, discussions and zone work as well as radar decode and
+    // render -- and those are different workloads with different costs. One
+    // median over the union would be a number describing no job in
+    // particular, and would move when the mix moved.
+    var k = om[1];
+    (by_kind[k] = by_kind[k] || []).push(parseInt(om[2], 10));
+  }
   var rm = rayon_re.exec(m);
   if (rm) rayon.push(parseInt(rm[1], 10));
 }
 return { attached: attached, different: different, off_frame: off_frame,
-         rayon_threads: rayon, console_total: C.length };
+         off_frame_by_kind: by_kind, rayon_threads: rayon,
+         console_total: C.length };
 """
 
 # Which backend the APP settled on, read out of its own startup log.
@@ -1767,6 +1779,33 @@ def run_smoke(args):
               hosts=list(((result["resources"] or {}).get("hosts") or {}))[:6],
               failed=len((result["resources"] or {}).get("failed") or []))
 
+        # Rasterization wall time, as the app itself reports it: the `N` in
+        # offload::deliver_job_reply's "<kind> took <N> ms off the frame". Read
+        # here, after the data window, because that is when the most job
+        # replies have accumulated in the console ring.
+        #
+        # This is the app's OWN timing of the offloaded job, not a wall-clock
+        # difference this rig computes, and it is the figure a rayon pool is
+        # supposed to move. Reported per browser and never pooled across them:
+        # Chromium runs SwiftShader here and Firefox runs Xvfb/llvmpipe, and a
+        # median over both would describe neither.
+        _sig = session.execute(WORKER_SIGNAL_PROBE) or {}
+        _kinds = {}
+        for _k, _vals in (_sig.get("off_frame_by_kind") or {}).items():
+            _ms = sorted(n for n in _vals if isinstance(n, int))
+            if not _ms:
+                continue
+            _kinds[_k] = {"n": len(_ms), "samples": _ms, "min": _ms[0],
+                          "median": _ms[len(_ms) // 2], "max": _ms[-1]}
+        result["rasterization_ms"] = {
+            "by_kind": _kinds,
+            "rayon_threads": (max(_sig.get("rayon_threads") or [0]) or None),
+        }
+        stage("rasterization",
+              rayon_threads=result["rasterization_ms"]["rayon_threads"],
+              **{k: "n=%d med=%d" % (v["n"], v["median"])
+                 for k, v in _kinds.items()})
+
         # Late on purpose: registration, install and activation all have to
         # finish first, and the data window has just paid for that time.
         try:
@@ -2065,6 +2104,15 @@ def run_smoke(args):
         print("[%s] SUMMARY rayon pool: %s (%s threads, wanted >=%s)"
               % (tag, "OK" if rp.get("ok") else "FAILED",
                  rp.get("threads"), rp.get("minimum")))
+    rm = result.get("rasterization_ms")
+    if rm and rm.get("by_kind"):
+        # One line per KIND, never a pooled figure: see the probe.
+        for kind in sorted(rm["by_kind"]):
+            k = rm["by_kind"][kind]
+            print("[%s] SUMMARY off-the-frame %s: n=%d min=%d median=%d "
+                  "max=%d ms (rayon %s threads)"
+                  % (tag, kind, k["n"], k["min"], k["median"], k["max"],
+                     rm.get("rayon_threads")))
     return exit_code
 
 
