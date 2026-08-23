@@ -442,7 +442,7 @@ fn poll_plan_separates_window_size_from_work_to_do() {
     }
 
     let mut tally = PollTally::default();
-    let new_keys = plan_downloads(&keys, &cache, &live_round(), TimeDelta::zero(), &mut tally);
+    let new_keys = plan_downloads(&keys, &cache, &live_round(), &mut tally);
     assert_eq!(
         tally.in_window, 12,
         "the window still contains every listed file, cached or not"
@@ -450,13 +450,7 @@ fn poll_plan_separates_window_size_from_work_to_do() {
     assert_eq!(new_keys.len(), 3, "only the uncached ones need downloading");
 
     let other: Vec<String> = (0..4).map(|i| format!("w{i}.nc")).collect();
-    plan_downloads(
-        &other,
-        &GlmCache::default(),
-        &live_round(),
-        TimeDelta::zero(),
-        &mut tally,
-    );
+    plan_downloads(&other, &GlmCache::default(), &live_round(), &mut tally);
     assert_eq!(tally.in_window, 16);
 
     let mut cache = GlmCache::default();
@@ -464,7 +458,7 @@ fn poll_plan_separates_window_size_from_work_to_do() {
         cache.insert(key.clone(), t0(), Vec::new());
     }
     let mut tally = PollTally::default();
-    let new_keys = plan_downloads(&keys, &cache, &live_round(), TimeDelta::zero(), &mut tally);
+    let new_keys = plan_downloads(&keys, &cache, &live_round(), &mut tally);
     assert_eq!(new_keys.len(), 1);
     let report =
         summarize_failures(tally.in_window, vec!["k11.nc: boom".into()]).expect("one failure");
@@ -665,14 +659,7 @@ fn a_quiet_granule_is_downloaded_once_not_once_per_poll() {
     let mut cache = GlmCache::default();
     let mut tally = PollTally::default();
     assert_eq!(
-        plan_downloads(
-            &listing,
-            &cache,
-            &live_round(),
-            TimeDelta::zero(),
-            &mut tally
-        )
-        .len(),
+        plan_downloads(&listing, &cache, &round_covering(start), &mut tally).len(),
         1,
         "an uncached granule must be downloaded once"
     );
@@ -687,14 +674,7 @@ fn a_quiet_granule_is_downloaded_once_not_once_per_poll() {
         cache.evict_before(cutoff);
         let mut tally = PollTally::default();
         assert!(
-            plan_downloads(
-                &listing,
-                &cache,
-                &live_round(),
-                TimeDelta::zero(),
-                &mut tally
-            )
-            .is_empty(),
+            plan_downloads(&listing, &cache, &round_covering(start), &mut tally).is_empty(),
             "poll {poll}: a granule already downloaded and found empty was \
                  re-queued — this is the every-poll re-fetch, back"
         );
@@ -1287,14 +1267,10 @@ fn poll_spanned(
         &client,
         sources,
         &[GlmSatellite::GoesEast, GlmSatellite::GoesWest],
-        GLM_MIN_TIME_WINDOW_SECS,
         &[GlmDataLevel::Flash],
         cache,
-        DepictedWindow {
-            as_of,
-            span_secs: depicted_span_secs,
-            frames: Vec::new(),
-        },
+        as_of,
+        span_residency(as_of, depicted_span_secs, GLM_MIN_TIME_WINDOW_SECS),
     ))
 }
 
@@ -1529,14 +1505,50 @@ fn seed_flash(cache: &mut GlmCache, key: &str, time: NaiveDateTime) {
     );
 }
 
-/// A round that names no depicted frames — a live pane, where every listed
-/// key passes the download filter exactly as it did before the filter existed.
-fn live_round() -> DepictedWindow {
-    DepictedWindow {
-        as_of: wall_clock_unlike_keys(),
-        span_secs: None,
-        frames: Vec::new(),
-    }
+/// **The residency a round with no depicted frames produces** — the span
+/// posture, whose stops are the whole interval `as_of ± span` sampled at the
+/// layer's own window, so the per-stop asks touch and `Residency::over`
+/// coalesces them into the one unbroken range the span really is.
+///
+/// This is `GlmHandler::depicted_stops` fed through
+/// `SourceHandler::residency_for`, stated as its value because that method is
+/// the handler's own. The equality is pinned end to end by
+/// [`a_poll_landing_on_the_loops_oldest_frame_still_fills_the_whole_sweep`],
+/// which dispatches through `create_fetch_tasks` and counts the archive hours
+/// the real derivation reaches.
+fn span_residency(as_of: NaiveDateTime, span_secs: Option<u64>, window_secs: f64) -> Residency {
+    let span = TimeDelta::seconds(span_secs.unwrap_or(0) as i64);
+    let window = TimeDelta::milliseconds((window_secs * 1000.0) as i64);
+    Residency::over([(as_of - span - window, as_of + span)])
+}
+
+/// The listed ranges of a live round — a pane depicting one moving instant.
+/// Its `as_of` is deliberately nowhere near the fixture keys, which is fine
+/// for keys that carry no readable stamp: an undatable granule always passes
+/// the download filter.
+fn live_round() -> Vec<(NaiveDateTime, NaiveDateTime)> {
+    listed_ranges(&span_residency(
+        wall_clock_unlike_keys(),
+        None,
+        GLM_MIN_TIME_WINDOW_SECS,
+    ))
+}
+
+/// [`live_round`] sampled just after `granule` — a round whose own listing
+/// would have returned that granule.
+///
+/// `list_glm_files` clips its keys to the range it was asked over, so this is
+/// the only kind of round `plan_downloads` is ever handed a **datable** key
+/// under. Before WO-T3.11 a round naming no frames matched every key
+/// unconditionally, so a fixture could hand it a key from another era; the
+/// answer is identical in production either way, and stating the round the key
+/// belongs to is what keeps that true here.
+fn round_covering(granule: NaiveDateTime) -> Vec<(NaiveDateTime, NaiveDateTime)> {
+    listed_ranges(&span_residency(
+        granule + TimeDelta::seconds(1),
+        None,
+        GLM_MIN_TIME_WINDOW_SECS,
+    ))
 }
 
 fn request_paths(seen: &RecordedRequests) -> Vec<String> {
@@ -2624,14 +2636,10 @@ fn a_live_polls_listing_range_and_returned_set_are_unchanged() {
             &client,
             &sources,
             &[GlmSatellite::GoesEast],
-            SWEEP_WINDOW_SECS,
             &[GlmDataLevel::Flash],
             &mut cache,
-            DepictedWindow {
-                as_of,
-                span_secs: None,
-                frames: Vec::new(),
-            },
+            as_of,
+            span_residency(as_of, None, SWEEP_WINDOW_SECS),
         ))
         .expect("the listing answered");
 
@@ -2776,14 +2784,10 @@ fn lists_issued(as_of: NaiveDateTime, span_secs: Option<u64>, window_secs: f64) 
             &client,
             &sources,
             &[GlmSatellite::GoesEast],
-            window_secs,
             &[GlmDataLevel::Flash],
             &mut cache,
-            DepictedWindow {
-                as_of,
-                span_secs,
-                frames: Vec::new(),
-            },
+            as_of,
+            span_residency(as_of, span_secs, window_secs),
         ))
         .expect("the listing answered");
     list_paths(&seen).len()
@@ -2834,14 +2838,10 @@ async fn live_glm_listing_reaches_the_hour_ahead_of_the_sample() {
         &client,
         &sources,
         &[GlmSatellite::GoesEast],
-        GLM_MIN_TIME_WINDOW_SECS,
         &[GlmDataLevel::Flash],
         &mut cache,
-        DepictedWindow {
-            as_of,
-            span_secs: Some(LIVE_SPAN_SECS),
-            frames: Vec::new(),
-        },
+        as_of,
+        span_residency(as_of, Some(LIVE_SPAN_SECS), GLM_MIN_TIME_WINDOW_SECS),
     )
     .await
     .expect("the live listing answered");
@@ -2880,5 +2880,80 @@ async fn live_glm_listing_reaches_the_hour_ahead_of_the_sample() {
          `as_of + span` lands in. A listing bounded by the sample stops one \
          hour short of the loop's newest frames.",
         hour.hour(),
+    );
+}
+
+/// **WO-T3.11: the layer's own window is subtracted exactly once** on the way
+/// from the stops a pane can make to the objects a poll asks for.
+///
+/// The defect this closes is a *shape*, not a number. `fetch_glm_flashes` used
+/// to be handed `(as_of, span, frames)` and derive `start`/`cutoff`/`horizon`
+/// itself, subtracting `time_window_secs` down there — while the app measured
+/// the pane's reach up in `depicted_reach_for_layer` and had to use
+/// `Residency::extent` rather than `residency_for` **precisely so the window
+/// was not subtracted twice**. Two authorities on one loop is what lit a
+/// twelve-hour sweep on a single frame, three times.
+///
+/// There is one subtraction now and it is `residency_for`'s. Everything below
+/// is read off that answer:
+///
+/// * the eviction cutoff is the residency's own oldest instant, carrying **no**
+///   [`GRANULE_SPAN`] — residency states which *flashes* must be held;
+/// * the listing reaches one `GRANULE_SPAN` further back, because a granule
+///   straddling a window's opening carries flashes inside it, and that is a
+///   statement about S3 objects which the caller applies itself.
+///
+/// The `assert_ne!` names the value a second subtraction would produce, so
+/// "subtracted once" is a claim this test can fail rather than a restatement
+/// of the code.
+#[test]
+fn the_layers_window_is_subtracted_once_between_the_stops_and_the_listing() {
+    use crate::render::overlay_state::PaneRef;
+    use rustdar_source::handler::SourceHandler;
+
+    let handler = sweep_handler();
+    let window = TimeDelta::milliseconds((SWEEP_WINDOW_SECS * 1000.0) as i64);
+    let stops = sweep_frames();
+    let oldest = stops[0];
+
+    let residency = handler.residency_for(&PaneRef::bare(0), &stops);
+    let listed = listed_ranges(&residency);
+
+    assert_eq!(
+        residency
+            .extent()
+            .expect("thirteen stops name a residency")
+            .0,
+        oldest - window,
+        "the residency reaches somewhere other than one window behind its \
+         oldest stop, which is the eviction cutoff and the flash filter's own \
+         lower bound",
+    );
+    assert_eq!(
+        listed
+            .first()
+            .expect("a non-empty residency lists ranges")
+            .0,
+        oldest - window - GRANULE_SPAN,
+        "the listing does not reach the granule straddling the oldest \
+         window's opening",
+    );
+    assert_ne!(
+        listed
+            .first()
+            .expect("a non-empty residency lists ranges")
+            .0,
+        oldest - window - window - GRANULE_SPAN,
+        "the window was subtracted twice — once by `residency_for` and once \
+         again downstream, which is the two-authorities shape this refactor \
+         removed",
+    );
+
+    // Non-triviality: the two subtractions have to be distinguishable, so the
+    // window must be neither zero nor equal to the granule span.
+    assert!(
+        window > TimeDelta::zero() && window != GRANULE_SPAN,
+        "fixture: a {SWEEP_WINDOW_SECS}s window makes the assertions above \
+         indistinguishable from each other",
     );
 }
