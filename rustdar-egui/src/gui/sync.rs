@@ -145,15 +145,12 @@ impl Gui {
     /// **The window `pane_idx`'s loop is actually listed over**: the setting,
     /// raised to the floor the pane's *transport* layer declares.
     ///
-    /// One global number cannot serve two cadences. Sixty minutes is a dozen
-    /// radar volumes and two hourly frames, so the layer whose frames are an
-    /// hour apart says how wide its own window has to be —
-    /// `SourceHandler::min_loop_span_secs`, read off the registry by id and
-    /// never re-spelled here as a `match`.
-    ///
-    /// **A floor, so the slider still governs.** Drag Lookback past a layer's
-    /// minimum and that layer widens with everything else; the floor only ever
-    /// stops a window being too narrow to be a loop.
+    /// This is [`crate::pane::PaneState::loop_span_secs`] resolved by index,
+    /// and the `max` itself lives there — the app layer arms loops from
+    /// outside this crate and would otherwise need a second spelling of it,
+    /// which is the two-authorities-on-one-window defect the time contract
+    /// exists to remove (WO-T3.9). Only the out-of-range fallback is this
+    /// function's own.
     ///
     /// Derived on every read rather than stored: nothing new persists, and the
     /// setting the file holds is still the one the slider shows.
@@ -161,11 +158,7 @@ impl Gui {
         let Some(pane) = self.panes.get(pane_idx) else {
             return self.loop_lookback_secs;
         };
-        pane.time.span_secs.max(
-            self.overlays
-                .handler_by_id(pane.transport_layer())
-                .map_or(0, |h| h.min_loop_span_secs()),
-        )
+        pane.loop_span_secs(&self.overlays)
     }
 
     /// [`Self::set_loop_span_secs`] for the playback rate, and for the same
