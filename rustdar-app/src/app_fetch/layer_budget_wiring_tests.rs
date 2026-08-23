@@ -72,7 +72,14 @@ fn fill(pane: &mut PaneState, minutes: u32) {
     let budgets = crate::app::render::test_budgets();
     for minute in 0..minutes {
         let mut panes = [std::mem::take(pane)];
-        append_polled_frame_to_loops(&mut panes, "KTLX", ts(minute), allocation, &budgets);
+        append_polled_frame_to_loops(
+            &mut panes,
+            &rustdar_overlays::render::overlay_state::OverlayRegistry::with_handlers(Vec::new()),
+            "KTLX",
+            ts(minute),
+            allocation,
+            &budgets,
+        );
         *pane = panes.into_iter().next().expect("one pane");
     }
 }
