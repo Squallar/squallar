@@ -3,10 +3,10 @@
 
 //! The wgpu boundary of rustdar.
 //!
-//! The one egui/wgpu renderer every target — desktop, web (wasm32 + WebGL2),
-//! Android and iOS — draws through: frame prepare/submit ([`egui_renderer`]),
-//! the banded texture upload path, the pane mirror, the staging ring
-//! ([`staging_ring`]), and the device-request policy ([`device`]).
+//! The one egui/wgpu renderer every target — desktop, web (wasm32, WebGPU with
+//! a WebGL2 fallback), Android and iOS — draws through: frame prepare/submit
+//! ([`egui_renderer`]), the banded texture upload path, the pane mirror, the
+//! staging ring ([`staging_ring`]), and the device-request policy ([`device`]).
 
 /// The device-request policy: which surface format, which limits, which
 /// present mode.
@@ -49,13 +49,28 @@ const _: () = {
 /// aliases, so this is the real compiled-in set. The `wgpu` manifest entry
 /// carries this crate's per-target backend selection and is imported nowhere
 /// else, so naming `::wgpu::` here is what keeps it from looking dead.
+///
+/// This asserts the configuration this build INTENDS, in both directions:
+/// wasm32 must carry WebGPU and WebGL2 together, and no other target may carry
+/// WebGPU at all.
 const _: () = {
     let enabled = ::wgpu::Instance::enabled_backend_features();
 
+    // The browser wants BOTH, and neither is optional. WebGPU alone would strand
+    // every browser that has no usable WebGPU adapter — which on the platform
+    // this is gated on is every one of them, since Firefox has not shipped it on
+    // Linux. WebGL2 alone would strand the adapters WebGL2 has given up on: a
+    // Chromium whose driver is blocklisted answers WebGL2 with SwiftShader.
+    // `rustdar_app::app::create_instance` is what chooses between them at
+    // startup, and it can only choose from what is compiled in.
+    #[cfg(target_arch = "wasm32")]
     assert!(
-        !enabled.contains(::wgpu::Backends::BROWSER_WEBGPU),
-        "wgpu's `webgpu` feature is enabled. This build targets WebGL2 because \
-         Firefox has no stable WebGPU; something re-enabled `wgpu/default`."
+        enabled.contains(::wgpu::Backends::BROWSER_WEBGPU),
+        "no WebGPU backend compiled in - wgpu's `webgpu` feature is off. The \
+         browser build asks for it alongside WebGL2 and falls back when no \
+         adapter answers; without it there is nothing to fall back FROM, and \
+         a blocklisted-driver Chromium stays on SwiftShader. See the wasm32 \
+         target section of this crate's Cargo.toml."
     );
 
     // Only reachable when `web` is on and `webgl` is not: dropping `webgl` alone
@@ -64,8 +79,21 @@ const _: () = {
     assert!(
         enabled.contains(::wgpu::Backends::GL),
         "no WebGL2 backend compiled in - wgpu's `webgl` feature is off. Note \
-         that `gles` does not cover the browser. See the wasm32 target section \
-         of this crate's Cargo.toml."
+         that `gles` does not cover the browser. It is also what actually runs \
+         on Firefox/Linux today, WebGPU being unshipped there. See the wasm32 \
+         target section of this crate's Cargo.toml."
+    );
+
+    // Native has no browser API to bind, so `webgpu` there is a feature nothing
+    // could dispatch through: `wgpu`'s own `cfg(webgpu)` alias is wasm32-only.
+    // Requesting it anywhere but the wasm32 section means `wgpu/default` came
+    // back.
+    #[cfg(not(target_arch = "wasm32"))]
+    assert!(
+        !enabled.contains(::wgpu::Backends::BROWSER_WEBGPU),
+        "wgpu's `webgpu` feature reached a native target, where there is no \
+         browser to reach. See the per-target wgpu feature sections of this \
+         crate's Cargo.toml."
     );
 
     #[cfg(not(target_arch = "wasm32"))]

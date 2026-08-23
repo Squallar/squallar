@@ -291,7 +291,7 @@ pub trait PlatformBridge {
 
     /// Hand the bridge the handle its own background threads wake the loop with.
     ///
-    /// Called once from `App::with_instance`, before any window exists — which is
+    /// Called once from `App::new`, before any window exists — which is
     /// why [`RedrawWaker`] is a slot rather than a window.
     fn set_redraw_waker(&mut self, _waker: RedrawWaker) {}
 

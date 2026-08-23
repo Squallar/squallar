@@ -51,15 +51,48 @@ fn instance_descriptor() -> wgpu::InstanceDescriptor {
 }
 
 /// The backend choice itself, parameterised so both arms run from one binary.
+///
+/// The browser asks for **both** browser APIs. Which of the two it ends up on
+/// is not decided here — see [`create_instance`], where it has to be decided,
+/// and why asking for both is not the same as getting the better one.
 fn backends_for(web: bool, base: wgpu::InstanceDescriptor) -> wgpu::InstanceDescriptor {
     if web {
         wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::GL,
+            backends: wgpu::Backends::BROWSER_WEBGPU.union(wgpu::Backends::GL),
             ..base
         }
     } else {
         base
     }
+}
+
+/// The wgpu instance this build renders through.
+///
+/// Async, and it has to be: **WebGPU support cannot be decided synchronously.**
+/// `Instance::new` binds the WebGPU context whenever `navigator.gpu` merely
+/// *exists*, and a browser that exposes that object can still answer
+/// `requestAdapter()` with null. Chromium 151 does exactly that on its default
+/// path, measured 2026-08-22 on both rig arms — headless on SwiftShader and
+/// headed on an RTX 3090 — so this is the ordinary case and not a corner of it.
+/// Once the instance is built there is no second
+/// chance, because `create_surface` on the WebGPU backend calls
+/// `canvas.getContext("webgpu")`, and a canvas that has answered one
+/// `getContext` never answers another with a different id. A single instance
+/// widened to `BROWSER_WEBGPU | GL` would therefore not fall back at all; it
+/// would find no adapter, on precisely the browsers WebGL2 still serves.
+///
+/// wgpu's own detecting constructor is what resolves it: it issues the adapter
+/// request first and drops `BROWSER_WEBGPU` from the mask when it comes back
+/// empty, leaving the WebGL2 half of what [`backends_for`] asked for. On
+/// Firefox/Linux — which governs here, and where WebGPU is still unshipped —
+/// that is every run, and what renders is the WebGL2 path this build already
+/// had.
+///
+/// On every native target the probe is `false` at compile time (wgpu's
+/// `cfg(webgpu)` alias is wasm32-only), so this is `Instance::new` with one
+/// extra `await`, and `WGPU_BACKEND` still decides.
+async fn create_instance() -> wgpu::Instance {
+    egui_wgpu::wgpu::util::new_instance_with_webgpu_detection(instance_descriptor()).await
 }
 
 /// Request a redraw if a window handle is available.
@@ -88,7 +121,6 @@ enum BackPress {
 }
 
 pub struct App {
-    instance: wgpu::Instance,
     state: Option<app_state::AppState>,
     window: Option<WindowRef>,
     gui: Gui,
@@ -347,20 +379,13 @@ pub(crate) fn evicted<V>(
 
 impl App {
     /// Build the application around a caller-supplied platform bridge.
+    ///
+    /// No wgpu instance is built here. The browser's cannot be — deciding
+    /// between its two rendering APIs takes an `await`, see [`create_instance`]
+    /// — and once one target has to defer it, both do: the instance is built
+    /// where the surface is, in
+    /// [`initialize_rendering_state`](Self::initialize_rendering_state).
     pub fn new(platform: Box<dyn PlatformBridge>, location: LocationFacade) -> Self {
-        Self::with_instance(
-            egui_wgpu::wgpu::Instance::new(instance_descriptor()),
-            platform,
-            location,
-        )
-    }
-
-    /// Everything [`new`](Self::new) does once the wgpu instance exists.
-    fn with_instance(
-        instance: wgpu::Instance,
-        platform: Box<dyn PlatformBridge>,
-        location: LocationFacade,
-    ) -> Self {
         let input = InputHandler::new();
         let channels = ChannelHub::new();
         let mut device_profile = rustdar_device_profile::budget::DeviceProfile::for_target();
@@ -417,7 +442,6 @@ impl App {
         }
 
         let mut app = Self {
-            instance,
             state: None,
             window: None,
             gui,
@@ -499,19 +523,26 @@ impl App {
         self.redraw_waker.clone()
     }
 
-    /// Create surface and initialize AppState for a given window and dimensions.
+    /// Create the instance and surface and initialize AppState for a given
+    /// window and dimensions.
+    ///
+    /// The instance is built here rather than at construction because on the
+    /// browser the choice between WebGPU and WebGL2 is an `await` — and it has
+    /// to be made before this function touches the canvas, since the surface is
+    /// what binds one of the two to it for good. [`create_instance`] carries
+    /// the mechanism.
     async fn initialize_rendering_state(
-        instance: &wgpu::Instance,
         budgets: rustdar_device_profile::budget::Budgets,
         window: &WindowRef,
         width: u32,
         height: u32,
     ) -> app_state::AppState {
+        let instance = create_instance().await;
         let surface = instance
             .create_surface(window.clone())
             .expect("Failed to create surface!");
 
-        app_state::AppState::new(instance, &budgets, surface, window, width, height).await
+        app_state::AppState::new(&instance, &budgets, surface, window, width, height).await
     }
 
     fn handle_resized(&mut self, width: u32, height: u32) {
@@ -670,7 +701,6 @@ impl App {
             let new_state = self.window.as_ref().map(|window| {
                 let size = window.inner_size();
                 pollster::block_on(Self::initialize_rendering_state(
-                    &self.instance,
                     self.budgets,
                     window,
                     size.width.max(1),
@@ -719,12 +749,10 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.pending_state = Some(rx);
 
-        let instance = self.instance.clone();
         let budgets = self.budgets;
         let redraw_target = self.window.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let state = Self::initialize_rendering_state(
-                &instance,
                 budgets,
                 &window,
                 size.width.max(1),

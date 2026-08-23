@@ -1,13 +1,17 @@
 #![warn(clippy::all)]
 #![forbid(unsafe_code)]
 
-//! rustdar in the browser: wasm32 + WebGL2.
+//! rustdar in the browser: wasm32, WebGPU with a WebGL2 fallback.
 //!
 //! The entry point, the concrete [`PlatformBridge`] and the capabilities that
 //! bridge exposes. Everything visible on the page belongs to `rustdar-app`.
 //!
-//! WebGL2, not WebGPU: Firefox has no stable WebGPU. `rustdar_app::app` pins
-//! `Backends::GL` on wasm32.
+//! `rustdar_app::app` asks for `BROWSER_WEBGPU | GL` on wasm32 and lets wgpu's
+//! detecting constructor settle it with a real `requestAdapter()`. On
+//! Firefox/Linux — the browser that governs here — WebGPU is still unshipped, so
+//! what actually renders is WebGL2, exactly as before. What WebGPU adds is
+//! reach, not speed: a Chromium whose driver is blocklisted answers WebGL2 with
+//! SwiftShader. The startup log names the backend that answered.
 //!
 //! ```text
 //! cd rustdar-web

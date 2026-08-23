@@ -25,7 +25,10 @@ pub fn start() -> Result<(), JsValue> {
     console_log::init_with_level(log::Level::Info)
         .map_err(|e| JsValue::from_str(&format!("logger init failed: {e}")))?;
 
-    log::info!("rustdar starting (wasm32, WebGL2)");
+    // Which of the two browser APIs this run gets is not known yet — it takes a
+    // `requestAdapter()`, and the app makes that call when it builds its wgpu
+    // instance. `rustdar_app::app_state` logs the answer.
+    log::info!("rustdar starting (wasm32; WebGPU or WebGL2, decided at adapter request)");
 
     // Before the app, because the first alerts round is what consumes it. Not
     // fatal and not awaited: the asset is fetched later, on the fetch task, and
@@ -40,7 +43,7 @@ pub fn start() -> Result<(), JsValue> {
     event_loop.set_control_flow(ControlFlow::Wait);
 
     // Started before the app so the handshake is in flight while the event loop and
-    // WebGL context come up. It never blocks.
+    // the rendering context come up. It never blocks.
     crate::worker_port::attach();
 
     // `WebBackend::new` starts a *permission query*, which prompts nobody; the

@@ -13,10 +13,11 @@ edition.workspace = true
 [dependencies]
 egui = { workspace = true }
 # Defaults are off at the workspace level, because egui-wgpu's `default` set
-# contains `wgpu/default` -- and that contains `webgpu`, which this build must
-# never enable (see the workspace `wgpu` pin). Its other two default entries are
-# genuinely wanted, but both are dead outside one target, so they are requested
-# from the target sections below rather than everywhere:
+# contains `wgpu/default` -- and that would put `webgpu` on every target, where
+# this build wants it on wasm32 alone (see the wasm32 section below). Its other
+# two default entries are genuinely wanted, but both are dead outside one
+# target, so they are requested from the target sections below rather than
+# everywhere:
 # `macos-window-resize-jitter-fix` is read only under
 # `cfg(all(target_os = "macos", feature = ...))`, and
 # `fragile-send-sync-non-atomic-wasm` only under `cfg(target_arch = "wasm32")`.
@@ -32,17 +33,12 @@ rustdar-device-profile = { workspace = true }
 # Every `wgpu::` value in this crate comes through `egui_wgpu::wgpu`, the
 # re-export. This entry is not there to be imported from; it exists to *choose
 # wgpu's features*, which egui-wgpu cannot express (it offers only the blanket
-# `wgpu/default`, and that drags in `webgpu`).
+# `wgpu/default`, and that turns every backend on everywhere).
 #
 # `std` and `wgsl` are the target-independent half and are what egui-wgpu itself
-# asks for. The backends are per target, below. There is no `webgpu` on any
-# target: `rustdar_app::app` pins `Backends::GL` on wasm32, and Firefox -- which
-# governs here -- ships stable WebGPU only on Windows (141, 2025-07-22) and macOS
-# (145 on Apple Silicon, 147 elsewhere). Linux and Android are still unshipped,
-# which is the platform this is developed and gated on, so compiling that backend
-# would only add an untested second rendering path -- and, until the workspace
-# pin was fixed, a duplicate set of WebGPU bindings that broke `wasm-bindgen`
-# outright.
+# asks for. The backends are per target, below; `webgpu` appears in the wasm32
+# section and nowhere else, because no native target has a browser API to
+# compile.
 wgpu = { workspace = true, features = ["std", "wgsl"] }
 
 # `parking_lot` swaps wgpu's internal locks for parking_lot's. It only buys
@@ -95,16 +91,54 @@ wgpu = { workspace = true, features = ["metal"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 egui-winit = { workspace = true, features = ["links"] }
-# The whole browser backend set: WebGL2 and nothing else.
+# The whole browser backend set: WebGPU and WebGL2, both compiled in.
 #
 # `webgl` is what `Backends::GL` resolves to on wasm32; the native `gles` feature
 # explicitly excludes the browser, so this is not a duplicate of the section
-# above. `webgpu` is absent on purpose and must stay absent.
+# above. `webgpu` is the WebGPU backend, and it is here for ADAPTER COVERAGE
+# rather than for throughput: it recovers nothing on the one measured platform
+# loss (WebGL2 has no `MAPPABLE_PRIMARY_BUFFERS`, so uploads run at 2.1 GB/s
+# against 24.7 native, and that mechanism is native-only in wgpu by
+# construction). What it reaches is a browser that has NO WebGL2 to give.
+#
+# Measured 2026-08-22 on this box, one browser, one configuration, with
+# `run_gpu_arm.sh`: Chromium 151 under `--use-angle=vulkan --enable-unsafe-webgpu`
+# has no WebGL context at all, and its WebGPU adapter is the NVIDIA one. Before
+# this feature the app booted there and painted nothing -- canvas buffer 300x150,
+# one distinct pixel, 2 rig errors. With it the app selects `BrowserWebGpu`,
+# configures 1248x714 and paints 2020 distinct pixels with no rig errors. That is
+# the whole of the claim; the rig's SOFTWARE arm, where Chromium runs headless on
+# SwiftShader at MAX_TEXTURE_SIZE 8192, is a different reading and is NOT
+# evidence for it.
+#
+# Both are compiled because asking for both is not the same as getting the
+# better one: wgpu binds a browser API when the INSTANCE is built, not when an
+# adapter is found, and a browser that merely exposes `navigator.gpu` can still
+# answer `requestAdapter()` with null. `App::create_instance` is what settles it
+# -- through wgpu's detecting constructor, which runs that adapter request first
+# and falls back to the WebGL2 half of the mask when it comes back empty.
+#
+# Firefox governs here and ships stable WebGPU on Windows (141, 2025-07-22) and
+# macOS (145 on Apple Silicon, 147 elsewhere); Linux and Android are still
+# unshipped, with Mozilla expecting Linux during 2026 (W3C gpuweb Implementation
+# Status). So on the platform this is developed and gated on, this feature does
+# nothing at all today -- Firefox/Linux exposes no `navigator.gpu` for the
+# detection to find, and every rig leg measured selects `Gl`. Keeping that true
+# is the fallback's whole job. With the pref forced on
+# (`--ff-pref dom.webgpu.enabled=true`) the same build selects `BrowserWebGpu`
+# and reaches 32767 px 2D textures against WebGL2's 32768, which is what says
+# the second path works rather than merely compiles.
+#
+# `rustdar-gpu/src/lib.rs` asserts at COMPILE TIME that both backends really are
+# in the build; the workspace pin resolves one `wasm-bindgen` (0.2.126) and one
+# `web-sys` (0.3.103), and wgpu's WebGPU backend carries its own `webgpu_sys`
+# bindings rather than web-sys's, so the binding duplication that once broke
+# `wasm-bindgen` outright does not recur -- `cargo tree -d` is the check.
 #
 # `fragile-send-sync-non-atomic-wasm` makes egui-wgpu's `CallbackResources` the
 # concurrent `TypeMap` and wgpu's handles `Send + Sync` on a target that has no
 # threads to be unsound about. Without it the browser build stops compiling.
-wgpu = { workspace = true, features = ["webgl"] }
+wgpu = { workspace = true, features = ["webgl", "webgpu"] }
 egui-wgpu = { workspace = true, features = ["fragile-send-sync-non-atomic-wasm"] }
 
 [dev-dependencies]

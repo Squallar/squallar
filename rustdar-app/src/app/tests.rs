@@ -15,15 +15,21 @@ fn bounds() -> GeoBounds {
     }
 }
 
-/// The browser build asks for WebGL2, and for nothing else.
+/// The browser build asks for both browser APIs, and for no native one.
+///
+/// Asking is all this function does. Which of the two the build ends up on is
+/// `create_instance`'s answer and cannot be reached from a host test — it turns
+/// on a `requestAdapter()` the browser has to run.
 #[test]
-fn the_browser_build_asks_for_webgl2_and_refuses_webgpu() {
-    // A base that is deliberately *not* GL, so "the browser arm restricts to GL" cannot be
-    // satisfied by the base already being GL.
+fn the_browser_build_asks_for_webgpu_and_webgl2_and_no_native_backend() {
+    // A base that is deliberately *neither*, so "the browser arm restricts to the two
+    // browser backends" cannot be satisfied by the base already being them.
     let base = |backends| wgpu::InstanceDescriptor {
         backends,
         ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
     };
+
+    let browser = wgpu::Backends::BROWSER_WEBGPU.union(wgpu::Backends::GL);
 
     for offered in [
         wgpu::Backends::all(),
@@ -34,12 +40,21 @@ fn the_browser_build_asks_for_webgl2_and_refuses_webgpu() {
     ] {
         let web = backends_for(true, base(offered)).backends;
         assert_eq!(
-            web,
-            wgpu::Backends::GL,
-            "offered {offered:?}, the browser build asked for {web:?} \
-                 rather than WebGL2 alone"
+            web, browser,
+            "offered {offered:?}, the browser build asked for {web:?} rather \
+                 than WebGPU and WebGL2 together"
         );
-        assert!(!web.contains(wgpu::Backends::BROWSER_WEBGPU));
+        // Both halves are load-bearing and neither is the other's spare: without
+        // `BROWSER_WEBGPU` a blocklisted-driver Chromium is stuck on SwiftShader,
+        // and without `GL` Firefox/Linux — which governs here — has no renderer
+        // at all until Mozilla ships WebGPU there.
+        assert!(web.contains(wgpu::Backends::BROWSER_WEBGPU));
+        assert!(web.contains(wgpu::Backends::GL));
+        // And nothing that could never run in a browser rode along.
+        assert!(
+            web.difference(browser).is_empty(),
+            "web mask carries {web:?}"
+        );
 
         // Native is deliberately unrestricted: it passes the base through untouched, which
         // is what keeps `WGPU_BACKEND` working.
@@ -56,6 +71,38 @@ fn the_browser_build_asks_for_webgl2_and_refuses_webgpu() {
         )
         .backends,
         wgpu::Backends::all().with_env()
+    );
+}
+
+/// The browser's two APIs are chosen between by the DETECTING constructor, not
+/// by `Instance::new`.
+///
+/// Scraped, because the difference is invisible to a host `cargo test` and
+/// silent in a browser: `Instance::new` commits to WebGPU on the mere presence
+/// of `navigator.gpu`, so a build that called it would bind the canvas to a
+/// context whose `requestAdapter()` may then return null — and a canvas bound
+/// once cannot be rebound. The fallback would be gone with nothing red.
+#[test]
+fn the_instance_is_built_by_the_detecting_constructor() {
+    let source = include_str!("../app.rs");
+    let (code, _) = source
+        .split_once("#[cfg(test)]")
+        .expect("app.rs no longer has a test module");
+
+    let n = code.matches("new_instance_with_webgpu_detection(").count();
+    assert_eq!(
+        n, 1,
+        "expected exactly one `new_instance_with_webgpu_detection(` in app.rs, \
+         found {n}. It is the only constructor that decides between the two \
+         browser APIs by asking for an adapter rather than by looking for \
+         `navigator.gpu`."
+    );
+    assert!(
+        !code.contains("wgpu::Instance::new("),
+        "app.rs builds a wgpu instance with `Instance::new`. On wasm32 that \
+         binds the WebGPU context whenever `navigator.gpu` exists, including on \
+         the browsers where `requestAdapter()` then answers null — and the \
+         surface it creates afterwards is what makes the choice permanent."
     );
 }
 
@@ -784,18 +831,17 @@ fn a_platform_that_asks_to_quit_on_back_still_does() {
     );
 }
 
-/// An `App` with no GPU behind it, wired the way `App::new` wires one.
+/// An `App` with no GPU behind it.
+///
+/// `App::new` is the whole of it now: it builds no wgpu instance, so there is
+/// no longer an empty-backends one to pass in. What keeps this headless is that
+/// nothing here gives the app a window, and the instance is built beside the
+/// surface — `initialize_rendering_state` is the only thing that asks for
+/// either.
 pub(super) fn headless(mut platform: TestBridge) -> App {
     crate::test_sites::install();
     let location = rustdar_location::LocationFacade::new(Box::new(platform.location_provider()));
-    App::with_instance(
-        egui_wgpu::wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::empty(),
-            ..instance_descriptor()
-        }),
-        Box::new(platform),
-        location,
-    )
+    App::new(Box::new(platform), location)
 }
 
 /// A loop speed no default produces, so finding it can only mean the stored config was
