@@ -52,6 +52,8 @@
 #   RIG_SERVE_EXTRA   extra args appended to every serve.py launch
 #   RIG_EXPECT_RAYON_THREADS  minimum worker rayon threads (default 2; 0 to
 #                     report without gating)
+#   RIG_EXPECT_ZERO_COPY  1 (default) to fail a leg whose replies were copied
+#                     out of the worker's memory; 0 to report without gating
 #
 # WS3b made cross-origin isolation part of the DEFAULT posture: serve.py is
 # launched with --coep on every pass, because the shipped app needs a
@@ -93,6 +95,10 @@ EXPECT_TIMEOUT="${RIG_EXPECT_TIMEOUT:-180}"
 # Set to 0 to report the pool without gating on it -- for bisecting a browser
 # that will not build one, never as a way past a red leg.
 EXPECT_RAYON_THREADS="${RIG_EXPECT_RAYON_THREADS:-2}"
+# WS3c. On by default because the copying wire is a real fallback that keeps
+# working -- a leg that quietly took it looks identical to every other Tier-2
+# assertion, which is the same hole --expect-rayon-threads was added to close.
+EXPECT_ZERO_COPY="${RIG_EXPECT_ZERO_COPY:-1}"
 PY=python3
 
 # UiConfig is #[serde(default)], so a config this partial parses; the key is
@@ -260,6 +266,12 @@ run_pass() {
   # hardwareConcurrency-derived and so is a property of the box, while 2 is
   # the smallest number that cannot be the fallback.
   drive_args+=(--expect-rayon-threads "$EXPECT_RAYON_THREADS")
+  # WS3c: the replies really arrived as views into the worker's own
+  # SharedArrayBuffer rather than as copies of it. The negative control is
+  # this same run with serve.py's --coep dropped from SERVE_EXTRA.
+  if [ "$EXPECT_ZERO_COPY" -eq 1 ]; then
+    drive_args+=(--expect-zero-copy-replies)
+  fi
   if [ "$doctored" -eq 1 ]; then
     server_args+=(--doctor-first-worker)
     drive_args+=(--expect-doctored-respawn)
