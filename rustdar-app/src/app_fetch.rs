@@ -1629,19 +1629,45 @@ impl super::App {
         }
     }
 
+    /// **Move `pane_idx`'s time selection to `instant`** — the one door every
+    /// navigation goes through.
+    ///
+    /// The pane's posture, its clock and the Set Time dialog are one gesture;
+    /// they used to be two `Gui::apply` pushes here with the clock missing
+    /// entirely, which is why a step on a pane holding no radar scan moved
+    /// nothing (WO-T3.10). See [`GuiEvent::PaneTimeSelected`].
+    fn select_instant(&mut self, pane_idx: usize, instant: NaiveDateTime, live: bool) {
+        self.manual_nav_pending = true;
+        self.gui.apply(GuiEvent::PaneTimeSelected {
+            pane_idx,
+            instant,
+            live,
+        });
+    }
+
     /// Navigate by a relative time step (seconds). Positive = forward, negative = backward.
+    ///
+    /// **It used to early-return on `pane.scan_info`**, so the step buttons did
+    /// nothing at all on a satellite-only or model-only pane — while the step
+    /// dropdown offers `TimeStep::OneFrame` to any pane carrying a frame-series
+    /// layer. The instant to step *from* now comes from [`nav_instant`], and
+    /// the radar fetch below is radar's own half rather than the gate on the
+    /// whole function.
     fn handle_navigate_time(&mut self, pane_idx: usize, step_secs: i64) {
+        let now_utc = chrono::Utc::now().naive_utc();
         // One reach for the pane and the registry both: the transport's own
         // axis decides below whether "past now" means "live".
         let (panes, overlays) = self.gui.panes_and_overlays_mut();
         let Some(pane) = panes.get(pane_idx) else {
             return;
         };
-        let Some(scan_info) = pane.scan_info.as_ref() else {
-            return;
-        };
-        let site = scan_info.site.name.to_string();
-        let current_utc = scan_info.timestamp;
+        let current_utc = nav_instant(pane, now_utc);
+        // **Radar's fetch, under radar's own predicate.** A pane that draws no
+        // radar and holds no scan is asking for its own layers to move, and a
+        // volume nothing on it would paint is speculation; a radar pane that
+        // has not loaded one yet used to get no navigation at all.
+        let fetch_radar = pane.is_overlay_enabled(&known::RADAR) || pane.scan_info.is_some();
+        let site = pane.site().to_string();
         // Read off the registry by id, never off a `match` on the id (WI-10):
         // whether stamps later than the wall clock are expected is the
         // layer's own declaration.
@@ -1659,7 +1685,6 @@ impl super::App {
                 });
 
         let target = current_utc + chrono::Duration::seconds(step_secs);
-        let now_utc = chrono::Utc::now().naive_utc();
 
         // On a transport that extends into the future, a forward step past
         // `now` names a forecast instant: neither clamped back to the wall
@@ -1671,26 +1696,39 @@ impl super::App {
             (target, false)
         };
 
-        self.gui.apply(GuiEvent::ViewingLiveForPane {
-            pane_idx,
-            live: is_live,
-        });
-        self.manual_nav_pending = true;
+        self.select_instant(pane_idx, target, is_live);
 
-        let local_ts = chrono::TimeZone::from_utc_datetime(&chrono::Local, &target).naive_local();
-        self.gui.apply(GuiEvent::SelectedTime(local_ts));
-        self.gui.apply(GuiEvent::Fetching(true));
-
-        self.spawn_fetch(site, target, FetchRequester::Pane(pane_idx));
+        if fetch_radar {
+            self.gui.apply(GuiEvent::Fetching(true));
+            self.spawn_fetch(site, target, FetchRequester::Pane(pane_idx));
+        }
     }
 
-    /// Navigate to the next or previous adjacent scan on AWS.
+    /// **One frame back or forward on whatever this pane's transport is.**
+    ///
+    /// Radar's answer is an archive walk — `fetch_adjacent_scan` asks S3 for
+    /// the volume next to this one — and every other transport already knows
+    /// its own stamps, so it names the neighbouring one and the clock moves
+    /// there. [`one_scan_step`] is that choice; it read `pane.scan_info` and
+    /// returned early without one, so this did nothing at all on a
+    /// satellite-only or model-only pane (WO-T3.10).
     fn handle_navigate_one_scan(&mut self, pane_idx: usize, forward: bool) {
-        let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
-            return;
+        let now_utc = chrono::Utc::now().naive_utc();
+        let step = {
+            let (panes, overlays) = self.gui.panes_and_overlays_mut();
+            one_scan_step(panes, overlays, pane_idx, forward, now_utc)
         };
-        let site = scan_info.site.name.to_string();
-        let current_utc = scan_info.timestamp;
+        let (site, current_utc) = match step {
+            // Not radar's: the transport named the stamp itself, out of the
+            // frames it holds or the ones its handler is resident for, and
+            // there is nothing to go and get.
+            Some(OneScanStep::Frame(instant)) => {
+                self.select_instant(pane_idx, instant, false);
+                return;
+            }
+            Some(OneScanStep::RadarArchive { site, from }) => (site, from),
+            None => return,
+        };
 
         self.manual_nav_pending = true;
         self.gui.apply(GuiEvent::Fetching(true));
@@ -1746,16 +1784,24 @@ impl super::App {
     /// Jump back to live mode: apply any cached auto-poll scan, or fetch latest.
     fn handle_jump_to_live(&mut self, pane_idx: usize) {
         // The pane's site decides everything below — which cached scan is applied,
-        // which site the fallback fetch names.
-        let Some(pane_site) = self.gui.pane(pane_idx).map(|p| p.site().to_string()) else {
+        // which site the fallback fetch names — and whether a radar volume is
+        // worth going for at all. Both off one reach.
+        let Some((pane_site, fetch_radar)) = self.gui.pane(pane_idx).map(|p| {
+            (
+                p.site().to_string(),
+                p.is_overlay_enabled(&known::RADAR) || p.scan_info.is_some(),
+            )
+        }) else {
             return;
         };
 
-        self.gui.apply(GuiEvent::ViewingLiveForPane {
-            pane_idx,
-            live: true,
-        });
-        self.manual_nav_pending = true;
+        let now = chrono::Local::now().naive_local();
+        let now_utc = Self::local_to_utc(now);
+        // **Live is an instant like any other**, and the pane's clock is part
+        // of it. This used to push `viewing_live` alone, so a scrubbed pane
+        // pressing Live kept `TimeMode::AsOf` and every layer that reads the
+        // clock stayed in the past under a live-looking button (WO-T3.10).
+        self.select_instant(pane_idx, now_utc, true);
 
         if let Some((scan_arc, declared, scan_info, timestamp)) =
             self.latest_cached_scans.remove(&pane_site)
@@ -1803,12 +1849,19 @@ impl super::App {
             return;
         }
 
-        let now = chrono::Local::now().naive_local();
-        self.gui.apply(GuiEvent::SelectedTime(now));
-        self.gui.apply(GuiEvent::Fetching(true));
+        if !fetch_radar {
+            // **Nothing is coming to re-arm on.** A pane that draws no radar
+            // gets no scan arrival, and `App::reinit_active_loops` is reached
+            // from the cached branch above and from that arrival — so a
+            // satellite-only pane's loops would keep the window they were
+            // armed over while its clock says live.
+            self.manual_nav_pending = false;
+            self.reinit_active_loops();
+            return;
+        }
 
-        let utc_timestamp = Self::local_to_utc(now);
-        self.spawn_fetch(pane_site, utc_timestamp, FetchRequester::Pane(pane_idx));
+        self.gui.apply(GuiEvent::Fetching(true));
+        self.spawn_fetch(pane_site, now_utc, FetchRequester::Pane(pane_idx));
     }
 
     /// **Take delivery of one loop frame's archive object** and hand its
@@ -2120,6 +2173,112 @@ impl super::App {
             .collect();
         for (pane_idx, lookback_secs) in to_reinit {
             self.handle_enable_loop(pane_idx, lookback_secs);
+        }
+    }
+}
+
+/// **The instant a navigation steps from**, for a pane that may hold no radar
+/// scan at all.
+///
+/// The order is not arbitrary, and `scan_info` comes first **because the
+/// scrubber's arithmetic depends on it**: `render_scrubber_release` computes
+/// `step_secs` as `target - scan_info.timestamp` and then leaves
+/// `handle_navigate_time` to add it back, so a pane holding a scan must keep
+/// that scan as the base or a released instant lands somewhere else. It is
+/// also the figure the old early-return used, which is what makes every pane
+/// that got past that return byte-identical here.
+///
+/// After it:
+///
+/// * [`PaneState::data_time_on_screen`] — the transport playhead's stamp on a
+///   looping pane, the raster on screen otherwise. This is the answer for a
+///   pane whose transport is a satellite or the model;
+/// * the pane's own clock, for a pane parked with nothing drawn yet;
+/// * `now`, so a live pane with no data at all still steps from somewhere
+///   rather than refusing.
+///
+/// [`PaneState::data_time_on_screen`]: rustdar_egui::pane::PaneState::data_time_on_screen
+fn nav_instant(pane: &rustdar_egui::pane::PaneState, now: NaiveDateTime) -> NaiveDateTime {
+    pane.scan_info
+        .as_ref()
+        .map(|info| info.timestamp)
+        .or_else(|| pane.data_time_on_screen())
+        .or_else(|| pane.time.mode.as_of())
+        .unwrap_or(now)
+}
+
+/// What a one-frame step resolves to — see [`one_scan_step`].
+enum OneScanStep {
+    /// Radar's archive walk: the site to ask, and the volume to ask next to.
+    RadarArchive { site: String, from: NaiveDateTime },
+    /// A stamp the transport already knows; nothing has to be fetched to name
+    /// it.
+    Frame(NaiveDateTime),
+}
+
+/// **Which neighbour a one-frame step names**, or `None` when there is none.
+///
+/// **The radar arm is an id check, and it is the same named open item
+/// `arm_layer_loop` carries.** Radar is the only layer whose neighbouring
+/// picture is an *archive object to go and fetch* rather than a stamp it
+/// already knows: its decoded volumes live above its handler, so
+/// `frames_resident` is empty by its own written contract and `latest_at`
+/// answers only from listings a non-looping pane has never asked for. No
+/// contract method expresses "this layer's neighbour is a fetch", so the
+/// check stays until one does.
+///
+/// Every other transport is asked in its own vocabulary: the frames its
+/// timeline holds when it is animating, and otherwise the stamps its handler
+/// reports resident. Both are ascending, so the neighbour is the first stamp
+/// past `current` in the direction asked for.
+fn one_scan_step(
+    panes: &mut [rustdar_egui::pane::PaneState],
+    overlays: &mut rustdar_overlays::render::overlay_state::OverlayRegistry,
+    pane_idx: usize,
+    forward: bool,
+    now: NaiveDateTime,
+) -> Option<OneScanStep> {
+    let pane = panes.get_mut(pane_idx)?;
+    let transport = pane.transport_layer().clone();
+    let current = nav_instant(pane, now);
+    if transport == known::RADAR {
+        let scan = pane.scan_info.as_ref()?;
+        return Some(OneScanStep::RadarArchive {
+            site: scan.site.name.to_string(),
+            from: scan.timestamp,
+        });
+    }
+    let mut stamps: Vec<NaiveDateTime> = pane
+        .time_state(&transport)
+        .frames
+        .iter()
+        .map(|frame| frame.timestamp)
+        .collect();
+    if stamps.is_empty() {
+        // Hydrated before the handler is asked anything about this pane, as
+        // everywhere else.
+        pane.hydrate_layer_states(overlays, pane_idx);
+        let view = pane.view(pane_idx);
+        stamps = overlays
+            .frames_resident(&transport, &view.layer(&transport))
+            .into_iter()
+            .map(|stamp| stamp.valid)
+            .collect();
+    }
+    let neighbour = if forward {
+        stamps.into_iter().find(|stamp| *stamp > current)
+    } else {
+        stamps.into_iter().rev().find(|stamp| *stamp < current)
+    };
+    match neighbour {
+        Some(stamp) => Some(OneScanStep::Frame(stamp)),
+        None => {
+            log::info!(
+                "Step: {} knows no frame {} {current} on pane {pane_idx}",
+                transport.as_str(),
+                if forward { "after" } else { "before" },
+            );
+            None
         }
     }
 }
@@ -3216,3 +3375,8 @@ mod satellite_loop_append_tests;
 #[path = "app_fetch/reinit_active_tests.rs"]
 #[cfg(test)]
 mod reinit_active_tests;
+
+/// **WO-T3.10** — the step buttons move a pane that holds no radar scan.
+#[path = "app_fetch/step_button_tests.rs"]
+#[cfg(test)]
+mod step_button_tests;
