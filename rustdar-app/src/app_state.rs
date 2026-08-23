@@ -42,6 +42,21 @@ impl AppState {
             .await
             .expect("Failed to find an appropriate adapter");
 
+        // **Which backend answered**, said out loud once. On the browser this is
+        // the only place the WebGPU/WebGL2 outcome is observable: the choice is
+        // made inside `create_instance` by a `requestAdapter()` nothing else
+        // sees, and the two APIs render the same picture at different ceilings.
+        // The rig reads this line to say which one it measured.
+        let info = adapter.get_info();
+        log::info!(
+            "wgpu selected the {:?} backend: {} ({:?}), driver {} {}",
+            info.backend,
+            info.name,
+            info.device_type,
+            info.driver,
+            info.driver_info,
+        );
+
         // One feature, asked for only where the adapter already has it — the caller
         // computes the mask so the staging-ring coupling stays out of the device fn.
         let features = adapter.features() & rustdar_gpu::staging_ring::STAGING_RING_FEATURE;
@@ -59,13 +74,21 @@ impl AppState {
         let swapchain_capabilities = surface.get_capabilities(&adapter);
         let swapchain_format = rustdar_gpu::device::select_surface_format(&swapchain_capabilities);
 
+        // `device.limits()` and not `adapter.limits()`: what the device got is
+        // what was REQUESTED, and on WebGPU those differ by default — its
+        // `maxTextureDimension2D` default is 8192 where a real adapter offers
+        // far more. `rustdar_gpu::device::device_limits` asks for the adapter's
+        // own resolution rather than accepting the default, so these agree; the
+        // adapter's figure is logged beside it so a regression to the default
+        // shows up as two different numbers rather than as a quiet halving.
         let max_surface_dimension = device.limits().max_texture_dimension_2d;
         let raster_side_ceiling_px = budgets.raster_side_for_adapter(max_surface_dimension);
         log::info!(
             "plan views may reach {raster_side_ceiling_px} px: this device reports \
-             {max_surface_dimension} px 2D textures, and a raster is bounded by the \
-             smaller of half that, the {} px ceiling this build was measured to, and \
-             what the sweep's own gates carry",
+             {max_surface_dimension} px 2D textures (the {} px adapter offered), and a \
+             raster is bounded by the smaller of half that, the {} px ceiling this build \
+             was measured to, and what the sweep's own gates carry",
+            adapter.limits().max_texture_dimension_2d,
             budgets.raster_side_ceiling_px,
         );
 

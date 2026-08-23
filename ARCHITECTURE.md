@@ -3,8 +3,8 @@
 Rustdar is a cross-platform NEXRAD weather radar viewer. It fetches Level II
 and Level III volumes and a dozen weather overlays, rasterises them, and draws
 them on a map on desktop (Linux/macOS/Windows), Android, iOS and in the browser
-as a wasm32 + WebGL2 PWA. The GUI is **egui**; the renderer is **wgpu**;
-windowing is **winit**.
+as a wasm32 PWA (WebGPU, falling back to WebGL2). The GUI is **egui**; the
+renderer is **wgpu**; windowing is **winit**.
 
 This file describes the **shape** of the workspace and the rules that hold it
 in that shape. It is written from the tree, and every structural claim below
@@ -281,16 +281,61 @@ browser gate proves:
 **"Web" is two targets.** Firefox is first-class and governs over Chrome.
 Measure both separately and never merge the figures.
 
-**WebGL2, never WebGPU.** `rustdar_app::app` pins `Backends::GL` on wasm32 and
-the `webgpu` wgpu feature is deliberately absent on every target. Firefox ships
-stable WebGPU on Windows (141, 2025-07-22) and macOS (145 on Apple Silicon /
-macOS 26+, 147 on all versions); **Linux and Android are still unshipped**, with
-Mozilla expecting Linux during 2026 (W3C gpuweb Implementation Status). Firefox
-governs here and the primary desktop target is Linux, so compiling the backend
-would add an untested second rendering path for a subset of one browser's
-platforms. `rustdar-gpu/Cargo.toml` is the one
-feature-chooser for the whole graph; read its comments before touching wgpu
-features anywhere.
+**WebGPU, falling back to WebGL2.** `rustdar_app::app` asks for
+`Backends::BROWSER_WEBGPU | GL` on wasm32; `rustdar-gpu/Cargo.toml` compiles
+both browser backends, and neither is optional. This is about **adapter
+coverage, not throughput** — WebGPU recovers nothing on the one measured
+platform loss (WebGL2 has no `MAPPABLE_PRIMARY_BUFFERS`, so uploads run at
+2.1 GB/s against 24.7 native, and that mechanism is native-only in wgpu by
+construction). What it reaches is a browser with **no WebGL2 to give**.
+
+Measured 2026-08-22 with `run_gpu_arm.sh`, one box, one browser, one
+configuration — Chromium 151 under `--use-angle=vulkan --enable-unsafe-webgpu`,
+which has no WebGL context at all:
+
+| build | selected backend | canvas | distinct px | rig errors |
+| --- | --- | --- | --- | --- |
+| before (`Backends::GL`) | none — no adapter found | 300×150, unconfigured | 1 | 2 |
+| after | `BrowserWebGpu` | 1248×714 | 2020 | 0 |
+
+Everything else measured selects `Gl` and is unchanged: Firefox/Linux on a real
+driver (32768 px), Firefox on Xvfb/llvmpipe (16384), Chromium headless on
+SwiftShader (8192), Chromium headed on the RTX 3090 (32768). Do not quote a cap
+without its arm and its renderer.
+
+> **Asking for both is not choosing between them.** wgpu binds a browser API
+> when the *instance* is built, not when an adapter is found: `Instance::new`
+> takes the WebGPU context whenever `navigator.gpu` merely *exists*, and a
+> browser that exposes that object can still answer `requestAdapter()` with
+> null. And the choice is permanent once a surface exists — `create_surface` on
+> the WebGPU backend calls `canvas.getContext("webgpu")`, and a canvas that has
+> answered one `getContext` never answers another with a different id. So the
+> instance is built by wgpu's **detecting** constructor, which issues the
+> adapter request first and drops `BROWSER_WEBGPU` from the mask when it comes
+> back empty. `App::create_instance` carries the mechanism; that is also why
+> `App::new` builds no instance at all — the decision needs an `await`.
+
+**Limits are requested, not accepted.** A WebGPU device gets
+`max_texture_dimension_2d` 8192 unless it asks for more, which is *below*
+Firefox's WebGL2 32768. `rustdar_gpu::device::device_limits` starts from the
+WebGL2 downlevel floor and lifts the resolution to the adapter's own report on
+both browser APIs, so enabling WebGPU cannot lower the ceiling.
+
+Firefox governs here and ships stable WebGPU on Windows (141, 2025-07-22) and
+macOS (145 on Apple Silicon / macOS 26+, 147 on all versions); **Linux and
+Android are still unshipped**, with Mozilla expecting Linux during 2026 (W3C
+gpuweb Implementation Status). On the platform this is developed and gated on
+the feature therefore does nothing at all: Firefox/Linux exposes no
+`navigator.gpu` for the detection to find, and every Tier-2 leg selects `Gl`.
+Keeping that true is the fallback's whole job, and the rig checks it by reading
+the backend the app logs at startup rather than by assuming. With the pref
+forced on (`--ff-pref dom.webgpu.enabled=true`) the same build selects
+`BrowserWebGpu` and reaches 32767 px 2D textures against WebGL2's 32768 — a
+one-texel difference, and the evidence that the second path runs rather than
+merely compiles. It does double the paths under test:
+`rustdar-gpu/Cargo.toml` is the one feature-chooser for the whole graph, and
+`rustdar-gpu/src/lib.rs` fails the build if either browser backend goes missing.
+Read those comments before touching wgpu features anywhere.
 
 **Generation counters guard against stale results.** `RenderDispatch`
 (`rustdar-app/src/render_dispatch.rs`) keeps a per-site `fetch_generations` map

@@ -105,7 +105,7 @@ fn a_static_render_takes_the_ceiling_the_device_reported_and_no_other() {
 /// Two figures come off the same adapter report, and they differ:
 ///
 /// * `AppState::new` runs `budgets.raster_side_for_adapter(..)` against the
-///   budgets `App::with_instance` resolved from `DeviceProfile::for_target()` —
+///   budgets `App::new` resolved from `DeviceProfile::for_target()` —
 ///   which carries `AdapterCeilings::WEBGL2_GUARANTEE` and so resolves
 ///   `Promotion::Floor` on every target, browser or not;
 /// * `update_device_profile` re-resolves against the adapter that has since
@@ -145,7 +145,7 @@ fn the_ceiling_app_state_computes_first_is_not_the_one_a_promoted_browser_is_owe
             adapter,
             ..DeviceProfile::for_target()
         };
-        // What `App::with_instance` had, and so what `AppState::new` spent.
+        // What `App::new` had, and so what `AppState::new` spent.
         let before = resolve(&web(AdapterCeilings::WEBGL2_GUARANTEE));
         let pre_adapter = before.raster_side_for_adapter(two_d);
 

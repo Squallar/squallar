@@ -39,6 +39,21 @@ fn preferred_surface_format(formats: &[wgpu::TextureFormat], web: bool) -> wgpu:
 /// wgpu's limit set, and requesting the adapter's limits verbatim there fails
 /// the device request outright, so the web arm starts from the WebGL2 downlevel
 /// defaults and lifts *only* the resolution back to what the adapter reports.
+///
+/// **The resolution is requested, not accepted**, and on WebGPU that is the
+/// difference between two ceilings rather than a formality: a device gets
+/// `Limits::default()`'s `max_texture_dimension_2d` of 8192 unless it asks for
+/// more, and Firefox's WebGL2 reports 32768 on a real driver here. Taking the
+/// default would have lowered the cap on the browser that governs, on the run
+/// that added WebGPU. `using_resolution` copies the 1D/2D/3D trio verbatim from
+/// the adapter, so what is asked for is what the adapter said it has — and
+/// `the_web_arm_asks_for_a_resolution_no_default_would_have_given` pins that it
+/// is above the default rather than merely equal to it.
+///
+/// The rest of the set stays at the WebGL2 floor on both browser APIs. That is
+/// deliberate: it is not a WebGPU limitation, it is what keeps one web
+/// behaviour instead of two. Nothing on the web path uses a storage buffer or a
+/// compute pass to lose by it.
 pub fn device_limits(adapter: wgpu::Limits, web: bool) -> wgpu::Limits {
     if web {
         wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter)
@@ -206,6 +221,39 @@ mod tests {
             floor.max_compute_workgroup_size_x
         );
         assert_eq!(asked.max_bind_groups, floor.max_bind_groups);
+    }
+
+    /// The one figure the web arm lifts is lifted *above* what a device gets for
+    /// free, on the adapter shapes both browser APIs actually report.
+    ///
+    /// The equality above is not enough on its own: `using_resolution(adapter)`
+    /// and "accept `Limits::default()`" agree exactly when the adapter reports
+    /// 8192, and that is Chromium-on-SwiftShader's number. A pin taken there
+    /// would pass with the request removed.
+    #[test]
+    fn the_web_arm_asks_for_a_resolution_no_default_would_have_given() {
+        // What a WebGPU device is handed when nothing asks for more.
+        let webgpu_default = wgpu::Limits::default().max_texture_dimension_2d;
+        assert_eq!(webgpu_default, 8192, "wgpu's default 2D ceiling moved");
+
+        // Measured 2026-08-22 on this box: Firefox's WebGL2 on a real driver.
+        // Chromium's WebGL2 there is SwiftShader and reports the default itself,
+        // which is exactly why it cannot be the fixture.
+        const FIREFOX_REAL_DRIVER: u32 = 32768;
+
+        let adapter = wgpu::Limits {
+            max_texture_dimension_2d: FIREFOX_REAL_DRIVER,
+            ..wgpu::Limits::default()
+        };
+        let asked = device_limits(adapter, true);
+        assert_eq!(asked.max_texture_dimension_2d, FIREFOX_REAL_DRIVER);
+        assert!(
+            asked.max_texture_dimension_2d > webgpu_default,
+            "the web arm asked for {} px, which is what a device gets without \
+             asking. The adapter's resolution is no longer being requested, and \
+             every browser above the default silently lost the difference.",
+            asked.max_texture_dimension_2d,
+        );
     }
 
     #[test]
