@@ -31,6 +31,7 @@
 //! resolves over HTTP exactly as it did before the pack existed. The only thing
 //! at stake is the request count.
 
+mod area;
 mod dbf;
 mod pack;
 mod rings;
@@ -192,6 +193,30 @@ fn run(args: &[String]) {
                     .map(String::as_str)
                     .unwrap_or_else(|| die("--compare-cache <cache-dir> <pack>")),
             ),
+        );
+        return;
+    }
+
+    // `--wkt-pairs <cache-dir> <pack> <every-nth>`: the same zone pairs
+    // `--compare-cache` measures, emitted as WKT next to this program's own
+    // area figures, one tab-separated row per zone. It is the control for the
+    // area sweep: GDAL/GEOS can recompute every row's intersection and union
+    // from the identical geometry, and a sweep that agrees with an unrelated
+    // implementation on thousands of real coastlines is not merely
+    // self-consistent. Reads the cache off disk; fetches nothing.
+    if root.to_str() == Some("--wkt-pairs") {
+        wkt_pairs(
+            Path::new(
+                args.get(2)
+                    .map(String::as_str)
+                    .unwrap_or_else(|| die("--wkt-pairs <cache-dir> <pack> <every-nth>")),
+            ),
+            Path::new(
+                args.get(3)
+                    .map(String::as_str)
+                    .unwrap_or_else(|| die("--wkt-pairs <cache-dir> <pack> <every-nth>")),
+            ),
+            args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1),
         );
         return;
     }
@@ -652,63 +677,29 @@ fn compare_cache(cache_dir: &Path, pack_path: &Path) {
         },
     );
 
-    let entries =
-        std::fs::read_dir(cache_dir).unwrap_or_else(|e| die(&format!("{cache_dir:?}: {e}")));
-    let mut seen = 0usize;
-    let mut missing: Vec<String> = Vec::new();
-    let mut unreadable = 0usize;
-    let mut cache_v = 0usize;
-    let mut pack_v = 0usize;
+    let Matched {
+        pairs,
+        seen,
+        unreadable,
+        mut missing,
+        per_kind,
+    } = read_pairs(cache_dir, &p);
+
+    let cache_v: usize = pairs
+        .iter()
+        .map(|q| q.cache.iter().flatten().map(Vec::len).sum::<usize>())
+        .sum();
+    let pack_v: usize = pairs
+        .iter()
+        .map(|q| q.pack.iter().flatten().map(Vec::len).sum::<usize>())
+        .sum();
     let mut ious: Vec<f64> = Vec::new();
     let mut named_ious: Vec<(f64, String)> = Vec::new();
-    let mut per_kind: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
-
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(stem) = name.strip_suffix(".json") else {
-            continue;
-        };
-        // `county_TXC113` -> (county, TXC113), the cache's own file naming.
-        let Some((kind_s, ugc)) = stem.split_once('_') else {
-            continue;
-        };
-        let kind = match kind_s {
-            "forecast" => Kind::Forecast,
-            "county" => Kind::County,
-            "fire" => Kind::Fire,
-            _ => continue,
-        };
-        seen += 1;
-        let Ok(text) = std::fs::read_to_string(entry.path()) else {
-            unreadable += 1;
-            continue;
-        };
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
-            unreadable += 1;
-            continue;
-        };
-        let Some(polys) = json
-            .get("polygons")
-            .and_then(|v| serde_json::from_value::<Vec<GeoPolygon>>(v.clone()).ok())
-        else {
-            unreadable += 1;
-            continue;
-        };
-
-        let e = per_kind.entry(kind.label()).or_insert((0, 0));
-        e.0 += 1;
-        match p.get(kind, ugc) {
-            None => missing.push(format!("{kind_s}/{ugc}")),
-            Some(mine) => {
-                e.1 += 1;
-                cache_v += polys.iter().flatten().map(Vec::len).sum::<usize>();
-                pack_v += mine.iter().flatten().map(Vec::len).sum::<usize>();
-                if let (Some(a), Some(b)) = (bbox(&polys), bbox(&mine)) {
-                    let iou = bbox_iou(a, b);
-                    ious.push(iou);
-                    named_ious.push((iou, format!("{kind_s}/{ugc}")));
-                }
-            }
+    for q in &pairs {
+        if let (Some(a), Some(b)) = (bbox(&q.cache), bbox(&q.pack)) {
+            let iou = bbox_iou(a, b);
+            ious.push(iou);
+            named_ious.push((iou, q.name.clone()));
         }
     }
 
@@ -743,10 +734,328 @@ fn compare_cache(cache_dir: &Path, pack_path: &Path) {
         ious.iter().filter(|v| **v < 0.50).count(),
     );
     named_ious.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("no NaN in an IoU"));
-    println!("  the worst-agreeing zones:");
+    println!("  the worst-agreeing zones by box:");
     for (iou, name) in named_ious.iter().take(10) {
         println!("    {iou:.4}  {name}");
     }
+
+    report_area_iou(&pairs, &named_ious);
+}
+
+/// One zone seen from both origins, held whole so the area sweep can have it.
+struct Pair {
+    name: String,
+    cache: Vec<GeoPolygon>,
+    pack: Vec<GeoPolygon>,
+}
+
+/// Everything one pass over the cache directory establishes.
+struct Matched {
+    /// Zones the cache and the pack both carry, geometry and all.
+    pairs: Vec<Pair>,
+    /// Cache files that named a zone kind this comparison understands.
+    seen: usize,
+    unreadable: usize,
+    /// Cache ids with no pack entry — counted, and excluded from every figure
+    /// downstream, because there is no second shape to compare them against.
+    missing: Vec<String>,
+    per_kind: BTreeMap<&'static str, (usize, usize)>,
+}
+
+/// Every zone the cache and the pack both carry, read once. The geometry is
+/// kept rather than reduced on the way past: the area sweep needs it a second
+/// time and re-reading seven thousand JSON files would be the slow half of this
+/// program.
+fn read_pairs(cache_dir: &Path, p: &pack::ZonePack) -> Matched {
+    let entries =
+        std::fs::read_dir(cache_dir).unwrap_or_else(|e| die(&format!("{cache_dir:?}: {e}")));
+    let mut out = Matched {
+        pairs: Vec::new(),
+        seen: 0,
+        unreadable: 0,
+        missing: Vec::new(),
+        per_kind: BTreeMap::new(),
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(stem) = name.strip_suffix(".json") else {
+            continue;
+        };
+        // `county_TXC113` -> (county, TXC113), the cache's own file naming.
+        let Some((kind_s, ugc)) = stem.split_once('_') else {
+            continue;
+        };
+        let kind = match kind_s {
+            "forecast" => Kind::Forecast,
+            "county" => Kind::County,
+            "fire" => Kind::Fire,
+            _ => continue,
+        };
+        out.seen += 1;
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            out.unreadable += 1;
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+            out.unreadable += 1;
+            continue;
+        };
+        let Some(polys) = json
+            .get("polygons")
+            .and_then(|v| serde_json::from_value::<Vec<GeoPolygon>>(v.clone()).ok())
+        else {
+            out.unreadable += 1;
+            continue;
+        };
+
+        let e = out.per_kind.entry(kind.label()).or_insert((0, 0));
+        e.0 += 1;
+        match p.get(kind, ugc) {
+            None => out.missing.push(format!("{kind_s}/{ugc}")),
+            Some(mine) => {
+                e.1 += 1;
+                out.pairs.push(Pair {
+                    name: format!("{kind_s}/{ugc}"),
+                    cache: polys,
+                    pack: mine,
+                });
+            }
+        }
+    }
+    // `read_dir` order is the filesystem's, which is neither stable nor sorted;
+    // an `--wkt-pairs` sample of "every nth" would otherwise mean a different
+    // set of zones on a different machine.
+    out.pairs.sort_by(|x, y| x.name.cmp(&y.name));
+    out
+}
+
+/// One tab-separated row per zone: `name`, this program's own `area(cache)`,
+/// `area(pack)` and `area(∩)` in square degrees, then the two geometries as
+/// WKT in the very plane those three numbers were measured in.
+///
+/// Nothing here interprets anything. The row exists so a second, unrelated
+/// geometry library can recompute columns 2-4 from columns 5-6 and disagree.
+fn wkt_pairs(cache_dir: &Path, pack_path: &Path, every_nth: usize) {
+    let bytes = read_file(pack_path);
+    let p = pack::ZonePack::open(bytes).unwrap_or_else(|why| die(&format!("pack: {why}")));
+    let m = read_pairs(cache_dir, &p);
+    let step = every_nth.max(1);
+    for pair in m.pairs.iter().step_by(step) {
+        let a = area::areas(&pair.cache, &pair.pack);
+        let (wa, wb, wrapped) = area::wkt_pair(&pair.cache, &pair.pack);
+        println!(
+            "{}\t{:.17e}\t{:.17e}\t{:.17e}\t{}\t{wa}\t{wb}",
+            pair.name,
+            a.a,
+            a.b,
+            a.inter,
+            if wrapped { "lifted" } else { "plain" },
+        );
+    }
+}
+
+/// The area half of the comparison: same population, same quantiles, so the two
+/// blocks can be read against each other line for line.
+fn report_area_iou(pairs: &[Pair], box_ious: &[(f64, String)]) {
+    let by_box: BTreeMap<&str, f64> = box_ious
+        .iter()
+        .map(|(v, name)| (name.as_str(), *v))
+        .collect();
+    let mut rows: Vec<(f64, &Pair, area::Areas)> = Vec::new();
+    let mut degenerate: Vec<&str> = Vec::new();
+    let mut wrapped: Vec<&str> = Vec::new();
+    for pair in pairs {
+        let m = area::areas(&pair.cache, &pair.pack);
+        if m.wrapped {
+            wrapped.push(&pair.name);
+        }
+        match m.iou() {
+            Some(iou) => rows.push((iou, pair, m)),
+            None => degenerate.push(&pair.name),
+        }
+    }
+    rows.sort_by(|x, y| x.0.partial_cmp(&y.0).expect("no NaN in an IoU"));
+
+    let n = rows.len();
+    let pct = |q: f64| {
+        rows.get(((n as f64 - 1.0) * q) as usize)
+            .map(|r| r.0)
+            .unwrap_or(0.0)
+    };
+    println!(
+        "  polygon-area IoU over {n} matched zones: min {:.4}, p1 {:.4}, p50 {:.4}, mean {:.4}",
+        rows.first().map(|r| r.0).unwrap_or(0.0),
+        pct(0.01),
+        pct(0.50),
+        rows.iter().map(|r| r.0).sum::<f64>() / n.max(1) as f64,
+    );
+    println!(
+        "  zones under 0.90 area IoU: {}   under 0.50: {}",
+        rows.iter().filter(|r| r.0 < 0.90).count(),
+        rows.iter().filter(|r| r.0 < 0.50).count(),
+    );
+    println!(
+        "  zones whose area could not be measured (both operands enclose nothing): {} {}",
+        degenerate.len(),
+        degenerate.join(" "),
+    );
+    println!(
+        "  zones the antimeridian lift fired on: {} {}",
+        wrapped.len(),
+        wrapped.join(" "),
+    );
+
+    // The whole-corpus symmetric difference, which is the figure that answers
+    // "how much of the map changes if the origin is swapped" without letting a
+    // per-zone ratio on a tiny zone dominate it.
+    let cache_area: f64 = rows.iter().map(|r| r.2.a).sum();
+    let pack_area: f64 = rows.iter().map(|r| r.2.b).sum();
+    let inter: f64 = rows.iter().map(|r| r.2.inter).sum();
+    println!(
+        "  summed over those {n} zones (square degrees): cache {cache_area:.4}, pack \
+         {pack_area:.4}, intersection {inter:.4}",
+    );
+    println!(
+        "    cache-only {:.4} ({:.4}% of cache), pack-only {:.4} ({:.4}% of pack)",
+        cache_area - inter,
+        100.0 * (cache_area - inter) / cache_area.max(f64::MIN_POSITIVE),
+        pack_area - inter,
+        100.0 * (pack_area - inter) / pack_area.max(f64::MIN_POSITIVE),
+    );
+
+    // Whole polygons one origin carries that the other does not touch at all —
+    // islands, cays, marsh fragments — separated from the same landmass drawn
+    // to a different fidelity, over the whole matched population rather than
+    // over the handful of zones printed below.
+    let mut cache_orphan_zones = 0usize;
+    let mut cache_orphan_polys = 0usize;
+    let mut cache_orphan_area = 0.0f64;
+    let mut pack_orphan_zones = 0usize;
+    let mut pack_orphan_polys = 0usize;
+    let mut pack_orphan_area = 0.0f64;
+    for (_, pair, _) in &rows {
+        let (cn, ca) = orphans(&pair.cache, &pair.pack);
+        let (pn, pa) = orphans(&pair.pack, &pair.cache);
+        if cn > 0 {
+            cache_orphan_zones += 1;
+        }
+        if pn > 0 {
+            pack_orphan_zones += 1;
+        }
+        cache_orphan_polys += cn;
+        cache_orphan_area += ca;
+        pack_orphan_polys += pn;
+        pack_orphan_area += pa;
+    }
+    println!(
+        "  whole polygons one origin has and the other does not touch, over those {n} zones:\n    \
+         cache-only {cache_orphan_polys} polygon(s) across {cache_orphan_zones} zone(s), \
+         {cache_orphan_area:.4} sq deg\n    pack-only  {pack_orphan_polys} polygon(s) across \
+         {pack_orphan_zones} zone(s), {pack_orphan_area:.4} sq deg",
+    );
+
+    // The cross-tab is the point of the exercise: every zone either instrument
+    // called a disagreement, with what the other one said about it. A zone the
+    // box condemns and the area clears is a zone whose *box* moved — an
+    // offshore cay, a spit — while its drawn pixels did not.
+    let mut flagged: Vec<(&str, f64, f64)> = rows
+        .iter()
+        .filter_map(|(iou, pair, _)| {
+            let b = by_box.get(pair.name.as_str()).copied()?;
+            (b < 0.90 || *iou < 0.90).then_some((pair.name.as_str(), b, *iou))
+        })
+        .collect();
+    flagged.sort_by(|x, y| x.1.partial_cmp(&y.1).expect("no NaN in an IoU"));
+    println!(
+        "  every zone either instrument put under 0.90, of the {n} matched: {} in all",
+        flagged.len(),
+    );
+    println!("      box     area    zone              verdict");
+    for (name, b, a) in &flagged {
+        let verdict = match (b < &0.90, a < &0.90) {
+            (true, false) => "box only - the box moved, the drawn area did not",
+            (true, true) => "both",
+            (false, true) => "area only - the box hid a real difference",
+            (false, false) => unreachable!("filtered above"),
+        };
+        println!("    {b:.4}  {a:.4}  {name:<16}  {verdict}");
+    }
+
+    println!("  the worst-agreeing zones by area, and where the difference sits:");
+    for (iou, pair, m) in rows.iter().take(20) {
+        let lat = bbox(&pair.cache).map(|b| (b.0 + b.2) / 2.0).unwrap_or(0.0);
+        let km2 = |v: f64| area::sq_deg_to_sq_km(v, lat);
+        // A polygon of one origin that the other origin does not cover *at all*
+        // is an island one side carries and the other drops; a polygon that
+        // overlaps is the same landmass drawn to a different fidelity. The two
+        // are different findings and must not be summed together.
+        let (c_lost, c_lost_area) = orphans(&pair.cache, &pair.pack);
+        let (p_lost, p_lost_area) = orphans(&pair.pack, &pair.cache);
+        println!(
+            "    {iou:.4}  {:<16} cache {:.1} km2 in {} poly, pack {:.1} km2 in {} poly; \
+             cache-only {:.1} km2, pack-only {:.1} km2",
+            pair.name,
+            km2(m.a),
+            pair.cache.len(),
+            km2(m.b),
+            pair.pack.len(),
+            km2(m.a_only()),
+            km2(m.b_only()),
+        );
+        println!(
+            "            {c_lost} cache polygon(s) the pack does not touch ({:.2} km2); \
+             {p_lost} pack polygon(s) the cache does not touch ({:.2} km2)",
+            km2(c_lost_area),
+            km2(p_lost_area),
+        );
+    }
+}
+
+/// Polygons of `mine` that `theirs` does not overlap by a single square degree,
+/// and their total area. Whole landmasses one origin has and the other lacks —
+/// a different finding from the same landmass drawn at a different fidelity,
+/// and never to be summed with it.
+///
+/// The boxes prefilter: a polygon whose box misses every box on the other side
+/// cannot overlap anything there, and saying so costs a comparison rather than
+/// a sweep. Only the survivors are swept, and only against the polygons whose
+/// boxes they actually meet.
+///
+/// The prefilter reads raw longitude, which the antimeridian defeats: a polygon
+/// at 179 and one at -179 are neighbours whose boxes do not meet, and dropping
+/// the second would invent an orphan. So on a pair that straddles it, the
+/// prefilter is switched off and every polygon is swept. That is slower on
+/// three zones and wrong on none.
+fn orphans(mine: &[GeoPolygon], theirs: &[GeoPolygon]) -> (usize, f64) {
+    let straddles = bbox(mine)
+        .zip(bbox(theirs))
+        .is_some_and(|(a, b)| a.3.max(b.3) - a.1.min(b.1) > 180.0);
+    let boxes: Vec<Option<(f64, f64, f64, f64)>> = theirs
+        .iter()
+        .map(|p| bbox(std::slice::from_ref(p)))
+        .collect();
+    let overlaps = |a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)| {
+        a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
+    };
+    let mut count = 0;
+    let mut lost = 0.0;
+    for poly in mine {
+        let Some(mine_box) = bbox(std::slice::from_ref(poly)) else {
+            continue;
+        };
+        let near: Vec<GeoPolygon> = theirs
+            .iter()
+            .zip(&boxes)
+            .filter(|(_, b)| straddles || b.is_some_and(|b| overlaps(mine_box, b)))
+            .map(|(p, _)| p.clone())
+            .collect();
+        let m = area::areas(std::slice::from_ref(poly), &near);
+        if m.inter == 0.0 && m.a > 0.0 {
+            count += 1;
+            lost += m.a;
+        }
+    }
+    (count, lost)
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
