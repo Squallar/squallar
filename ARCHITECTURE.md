@@ -189,6 +189,67 @@ pins it.
   `rustdar_overlays::render::handlers::sources()` with
   `rustdar_radar::source::sources()`. That is the only composition.
 
+#### 3.4.1 When a fact becomes a contract method, and when it stays an id check
+
+This rule was enforced consistently for a year before it was written down. It
+lived in six scattered comments, and the cost of that was a design round in
+which the rule had to be reconstructed from them before a question could be
+answered. Cite this section instead of re-deriving it.
+
+**A fact becomes a contract method** when it is a *declaration about the layer's
+own data* that the shell would otherwise re-spell. The re-spelling is the harm:
+it creates a second authority to keep in step. `loop_start_frame`
+(`rustdar-app/src/app_render.rs`) states it plainly — *"Whether stamps later
+than the wall clock are expected is the layer's own answer… A `match` on the
+layer id here would be a second authority to keep in step."* The same sentence
+appears at `arm_layer_loop`, `rail_regions` (`ui_timeline.rs`),
+`loop_span_secs_for` (`gui/sync.rs`) and `comes_in_stamped_frames` (`pane.rs`).
+`time_axis`, `frame_horizon`, `min_loop_frames`, `latest_at` and `residency_for`
+are all this shape.
+
+**A `match` on a concrete layer id stays** when the thing it names is one of:
+
+* **(a) pane state the shell owns and the handler cannot see.** `scan_info` is a
+  public field on `PaneState`, written by five different `Gui` events, and two
+  panes on one site may legitimately hold different volumes. It is not reachable
+  through `PaneRef`. `layer_removal_refusal` (`pane.rs`) names the radar id for
+  the same reason: *"the radar slot is not just another layer here: its `config`
+  is where this pane keeps its own site, product, elevation and live-chunk
+  switch."*
+* **(b) storage that still lives above the handler.** `RadarSource`'s
+  `frames_resident`, `retain_frames` and `apply_frame` are **written-out honest
+  empties with a named work item (WO-M12d)**, never silent defaults — and a
+  conformance walk over them must *name radar explicitly* rather than let an
+  empty answer read as agreement. The residency and render-dispatch forks in
+  `app_render.rs`, and `App::evict_unneeded_loop_scans`, are the same case.
+
+**Worked example — `window_end`, proposed and declined 2026-08-23.**
+`arm_layer_loop` ends radar's backward window at the displayed volume's
+timestamp rather than at the wall clock, and no contract method expresses that.
+Adding `FrameSource::window_end` was rejected on four grounds, recorded here so
+it is not re-proposed without new facts:
+
+1. **It would delete no id check.** The surviving arm yields *two* values — the
+   site, which is the timeline's geometry anchor, and the timestamp. A
+   `window_end` takes the timestamp only; the arm stays for the site. The
+   `None if layer == RADAR => return None` arm is a **geometry** refusal (without
+   a scan the timeline gets a placeholder anchor, `radar_layer::site` answers
+   `""`, and the loop sits in `FetchingScanList` for ever drawing nothing), so it
+   stays too. Fourteen implementors would change and nothing would be removed.
+2. **Radar could not answer honestly** — criterion (a) above.
+3. **The conformance law would be vacuous.** Three of the four framed layers
+   answer `now`; the one that differs cannot answer at all. That is exactly what
+   `time_contract_tests.rs`'s floors exist to reject.
+4. `frame_horizon` **is** the forward half of this idea, and the asymmetry is
+   real — but an asymmetry is not itself a defect.
+
+What would change the ruling: a **second** layer whose window ends at something
+other than `now`, or `scan_info` becoming reachable through `PaneRef`. Note the
+genuinely unexpressed fact next door — GMGSI's newest frame is structurally ~40
+minutes behind the wall clock (measured 34–42) and MRMS's ~2 minutes — which is a
+declaration about the layer's own data and would make a **non-vacuous** method.
+That is a different question from this one.
+
 ### 3.5 `JobCodec` / the job funnel
 
 * **Owner**: `rustdar-source/src/job.rs` (`JobInput`, `JobOut`, `DescribedJob`,
