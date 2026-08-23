@@ -1709,7 +1709,9 @@ impl PaneState {
             return true;
         }
         map.render = render;
-        *self.loop_state_mut() = LayerTimeState::new();
+        // **Every timeline the pane armed, not radar's slot** (WO-T3.6) — see
+        // the ruling on [`Self::set_content`], which this shares.
+        self.stop_every_layer_loop();
         true
     }
 
@@ -1743,11 +1745,28 @@ impl PaneState {
 
     /// Replace this pane's per-kind content wholesale, as the config loader does
     /// when it has both the kind and the state in hand.
+    ///
+    /// **A view change stops every timeline the pane armed** (WO-T3.6), not
+    /// radar's slot — and [`Self::set_map_render`] takes the same treatment.
+    /// The two switches are different (plan↔volume keeps the ground the raster
+    /// is placed on; map↔section throws it away entirely), and the *pictures*
+    /// therefore differ in whether they survive: a radar frame is a render
+    /// keyed to the view, while an overlay frame is a georeferenced ground
+    /// raster that a plan view and a volume would both draw. **The ruling is
+    /// that both switches stop everything anyway**, because what the pane
+    /// cannot do is keep half a loop: playback runs off
+    /// `transport_state()`, so clearing radar's slot on a radar-transport pane
+    /// stops the clock every other layer's playhead is derived from, and a
+    /// surviving satellite loop then freezes on the last instant the clock
+    /// held — a stale frame presented as the live picture, which is the defect
+    /// [`Self::stop_every_layer_loop`] exists to name. Keeping view-independent
+    /// overlay loops across a plan↔volume toggle is a real optimisation, but it
+    /// needs the transport to survive with them and is a separate item.
     pub fn set_content(&mut self, content: PaneContent) {
         let previous = self.render_view();
         self.content = content;
         if self.render_view() != previous || !self.render_view().can_loop() {
-            *self.loop_state_mut() = LayerTimeState::new();
+            self.stop_every_layer_loop();
         }
     }
 

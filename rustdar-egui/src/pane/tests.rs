@@ -402,6 +402,97 @@ fn retarget_reacts_to_an_elevation_change() {
     ));
 }
 
+/// Arm `ids` on a fresh plan-view map pane, each with its own frames — the
+/// state a pane reaches once the ∞ toggle has armed every frame-series layer
+/// it carries, not just the transport.
+fn pane_animating(ids: &[LayerId]) -> PaneState {
+    let mut pane = PaneState::new();
+    for (n, id) in ids.iter().enumerate() {
+        // Different lengths per layer, so an assertion below cannot pass by
+        // reading one layer's timeline through another's name.
+        *pane.time_state_mut(id) = loop_with_frames(2 + n, 0);
+    }
+    pane
+}
+
+/// Which of `ids` still hold a timeline.
+fn still_animating(pane: &PaneState, ids: &[LayerId]) -> Vec<LayerId> {
+    ids.iter()
+        .filter(|id| pane.time_state(id).is_active() || !pane.time_state(id).frames.is_empty())
+        .cloned()
+        .collect()
+}
+
+/// **WO-T3.6 — a view change stops every timeline the pane armed.**
+///
+/// `set_map_render` and `set_content` reset `loop_state_mut()`, which is
+/// radar's slot by name, so a satellite or model loop on the same pane survived
+/// a plan↔volume or map↔section switch and kept its frames — while playback
+/// runs off `transport_state()`, whose radar timeline had just been torn down.
+/// The surviving loop froze on the last instant the pane clock held and
+/// presented it as the live picture.
+///
+/// **Floors** — (a) a pane animating only radar is torn down exactly as before,
+/// so the widening is not paid for by narrowing; (b) a call that is *not* a view
+/// change leaves every timeline alone, so "stop everything" is not the answer to
+/// every call.
+#[test]
+fn a_view_change_stops_every_timeline_the_pane_armed() {
+    let armed = [known::RADAR, known::GMGSI, known::MODEL_DATA];
+
+    // (b) The no-op: same render, and nothing is torn down.
+    let mut unchanged = pane_animating(&armed);
+    assert!(unchanged.set_map_render(MapRender::Plan));
+    assert_eq!(
+        still_animating(&unchanged, &armed),
+        armed.to_vec(),
+        "a call that did not change the view tore down timelines anyway",
+    );
+
+    // `set_map_render`: plan → volume, on a pane animating three layers.
+    let mut ladder = pane_animating(&armed);
+    assert_eq!(
+        still_animating(&ladder, &armed),
+        armed.to_vec(),
+        "precondition: three timelines armed on one pane",
+    );
+    ladder.set_map_render(MapRender::Volume);
+    assert_eq!(
+        still_animating(&ladder, &armed),
+        Vec::<LayerId>::new(),
+        "a plan→volume switch left a timeline running against a view it was not \
+         built for, with nothing left to move its clock",
+    );
+
+    // `set_content`: map → cross-section, the other switch.
+    let mut section = pane_animating(&armed);
+    section.set_kind(PaneKind::CrossSection);
+    assert_eq!(
+        still_animating(&section, &armed),
+        Vec::<LayerId>::new(),
+        "a map→section switch left a timeline running on a pane that draws no \
+         map ground for it at all",
+    );
+
+    // (a) The floor: radar alone, both switches, unchanged from before.
+    for switch in ["set_map_render", "set_content"] {
+        let mut radar_only = pane_animating(&[known::RADAR]);
+        assert!(
+            radar_only.loop_state().is_active(),
+            "precondition: {switch}"
+        );
+        if switch == "set_map_render" {
+            radar_only.set_map_render(MapRender::Volume);
+        } else {
+            radar_only.set_kind(PaneKind::CrossSection);
+        }
+        assert!(
+            !radar_only.loop_state().is_active() && radar_only.loop_state().frames.is_empty(),
+            "{switch} stopped reaching radar's own timeline",
+        );
+    }
+}
+
 /// The four products whose plan view is the same picture at every tilt, named here
 /// rather than derived: naming them is what makes this a test of the predicate
 /// rather than a restatement of it.
