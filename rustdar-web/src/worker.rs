@@ -150,6 +150,10 @@ fn post_result(
     proto::set_field(&message, proto::TAILS, &JsValue::NULL);
     proto::set_loan(&message, crate::shared_loan::NO_LOAN);
 
+    // Tracked out here so the post's failure arm can discharge it. A loan whose
+    // message never left is one the page will never send a `RELEASE` for, and
+    // it would hold a whole reply -- MiB of raster -- until this worker died.
+    let mut lent = crate::shared_loan::NO_LOAN;
     if let Some((kind, head, tails)) = result {
         proto::set_field(
             &message,
@@ -166,6 +170,7 @@ fn post_result(
         let views = match crate::shared_loan::lend(buffers) {
             Ok((loan, views)) => {
                 proto::set_loan(&message, loan);
+                lent = loan;
                 views
             }
             Err(buffers) => {
@@ -186,5 +191,9 @@ fn post_result(
         proto::set_field(&message, proto::OUT, &views.get(0));
         proto::set_field(&message, proto::TAILS, &views.slice(1, views.length()));
     }
-    scope.post_message_with_transfer(&message, &transfer)
+    let posted = scope.post_message_with_transfer(&message, &transfer);
+    if posted.is_err() {
+        crate::shared_loan::release(lent);
+    }
+    posted
 }
