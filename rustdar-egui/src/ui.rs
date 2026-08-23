@@ -1903,10 +1903,31 @@ impl Gui {
         self.time_dialog.timestamp
     }
 
+    /// Take down the site-switch spinner on every pane showing `site`.
+    ///
+    /// **Edge-triggered, and it has to be.** The cache token for
+    /// [`known::RADAR_SITES`] is `radar_sites_render_gen` and nothing else, so
+    /// a bump here is a full-size site raster dispatched, rasterized, uploaded
+    /// and promoted. This is called on **every sealed cut of the live chunk
+    /// feed** (`App::apply_chunk_outcome`, both arms) as well as on every scan
+    /// result and every failed fetch — a cadence of seconds, all day, on a
+    /// pane whose spinner has been down since the switch completed. Bumping
+    /// unconditionally spent one whole picture per call for a picture that was
+    /// byte-identical.
+    ///
+    /// Measured on the Tier-2 rig before this guard, one leg of ~40 s on a
+    /// live feed: `overlay/sites` ran **13 to 16 times** per leg against
+    /// `overlay/alerts`' 2 to 3, on a scene where the site table never moved.
+    ///
+    /// The same discipline the theme path already keeps — see
+    /// `a_theme_change_invalidates_the_site_labels_exactly_once` — and the
+    /// same one `scan_info_learning_position` keeps for a volume restating a
+    /// position it already taught.
     pub fn clear_loading_site_for_site(&mut self, site: &str) {
         for pane in &mut self.panes {
-            if pane.site() == site {
-                pane.loading_site = None;
+            // `take`, so the clear and the test of whether there was anything
+            // to clear are one statement and cannot disagree.
+            if pane.site() == site && pane.loading_site.take().is_some() {
                 pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
             }
         }
