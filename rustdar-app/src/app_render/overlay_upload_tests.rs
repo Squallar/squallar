@@ -39,6 +39,19 @@ fn n_pane_app(n: usize) -> crate::app::App {
 }
 
 fn deliver(app: &mut crate::app::App, ctx: &egui::Context, pane_indices: Vec<usize>) {
+    // **The mark a real dispatch leaves**, and these fixtures have to leave it
+    // too. `poll_overlay_render_results` accepts a raster only while the cache
+    // is still waiting for that very dispatch — the stale-result policy on
+    // `RendersInFlight::retire` — so a reply posted against no mark at all
+    // exercises that path instead of the one under test here. Every reply below
+    // is the answer to a dispatch, so every one gets its ticket.
+    for &idx in &pane_indices {
+        if let Some(pane) = app.gui.pane_mut(idx) {
+            pane.overlay_cache_mut(&known::NWS_ALERTS).renders.record(
+                rustdar_egui::overlay_cache::RenderTicket::whole(7, bounds()),
+            );
+        }
+    }
     let image = Arc::new(egui::ColorImage::from_rgba_unmultiplied(
         [W as usize, H as usize],
         &rasterizer_output(),

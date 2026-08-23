@@ -722,6 +722,7 @@ impl Gui {
         self.safe_area_insets = inputs.safe_area_insets;
         self.supports_exit = inputs.supports_exit;
         self.loop_frame_budget = inputs.loop_frame_budget;
+        self.concurrent_renders = inputs.concurrent_renders;
         self.location_settings_available = inputs.location_settings_available;
         let (permission, active) = inputs.location;
         self.location_permission = permission;
@@ -1285,10 +1286,12 @@ impl Gui {
     ///   over pane indices. Rebuilt every frame, cleared here anyway so no
     ///   reader between now and the next `render_panes` sees the wrong pane's
     ///   answer.
-    /// * **Each moved pane's `render_in_flight` marks.** The dispatch that set
-    ///   one is recorded under the pane's *old* index, so its raster will
-    ///   never reach the pane now standing there; without clearing the mark
-    ///   the pane would never ask again.
+    /// * **Each moved pane's in-flight marks**, abandoned whole. The dispatch
+    ///   that set one is recorded under the pane's *old* index, so its raster
+    ///   is not this pane's; without abandoning the mark the pane would never
+    ///   ask again. And the raster still on its way is now refused on arrival
+    ///   rather than filed to whichever pane took the index — see
+    ///   [`crate::overlay_cache::RendersInFlight::retire`].
     /// * **Each moved pane's `rendered_for`.** It is what the level-triggered
     ///   [`GuiAction::PrepareVolume`] dedupes on, and the volume it names has
     ///   just been released above.
@@ -1351,7 +1354,7 @@ impl Gui {
 
         for pane in self.panes.iter_mut().skip(idx) {
             for cache in pane.overlay_textures.values_mut() {
-                cache.render_in_flight = false;
+                cache.renders.abandon_all();
             }
             if let Some(volume) = pane.volume_mut() {
                 volume.rendered_for = None;
@@ -2042,7 +2045,7 @@ impl Gui {
             }
             for cache in pane.overlay_textures.values_mut() {
                 cache.clear();
-                cache.render_in_flight = false;
+                cache.renders.abandon_all();
             }
             // And whatever the pane's *kind* holds — today, a section pane's
             // raster. This is the only place a pane-held handle is released when

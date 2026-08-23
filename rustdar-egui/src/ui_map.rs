@@ -77,6 +77,9 @@ impl super::Gui {
 
         let pane_count = self.visible_pane_count();
         let modality = self.layout.modality;
+        // One read for every pane this frame draws: the figure is the
+        // device's, not the pane's.
+        let overlay_render_limit = self.concurrent_renders;
         let tile_zoom_biases: Vec<u8> = (0..pane_count)
             .map(|idx| self.tile_zoom_bias_for_pane(idx))
             .collect();
@@ -267,6 +270,7 @@ impl super::Gui {
                                                 user_fix: user_fix.clone(),
                                                 label_tiles: &mut label_tiles,
                                                 tile_zoom_bias,
+                                                overlay_render_limit,
                                                 actions: &mut actions,
                                                 pane_rect,
                                                 surfaces: pane_render::PaneSurfaces::GroundAndGlass,
@@ -951,6 +955,8 @@ impl super::Gui {
         } = floor;
         use walkers::Map;
 
+        let overlay_render_limit = self.concurrent_renders;
+
         let (strip, tiles) = (strip?, tiles?);
         let mut map_memory = map_memory;
         let map_memory = &mut map_memory;
@@ -988,6 +994,7 @@ impl super::Gui {
                     user_fix,
                     label_tiles,
                     tile_zoom_bias,
+                    overlay_render_limit,
                     actions,
                     pane_rect: strip,
                     surfaces: pane_render::PaneSurfaces::GroundOnly,

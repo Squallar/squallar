@@ -33,6 +33,19 @@ fn deliver(
     seed: u8,
     pane_indices: Vec<usize>,
 ) {
+    // **The mark a real dispatch leaves**, and these fixtures have to leave it
+    // too. `poll_overlay_render_results` accepts a raster only while the cache
+    // is still waiting for that very dispatch — the stale-result policy on
+    // `RendersInFlight::retire` — so a reply posted against no mark at all
+    // exercises that path instead of the one under test here. Every reply below
+    // is the answer to a dispatch, so every one gets its ticket.
+    for &idx in &pane_indices {
+        if let Some(pane) = app.gui.pane_mut(idx) {
+            pane.overlay_cache_mut(&KIND).renders.record(
+                rustdar_egui::overlay_cache::RenderTicket::whole(generation, bounds()),
+            );
+        }
+    }
     app.channels
         .overlay_render_sender
         .send(crate::channels::OverlayRenderResponse {

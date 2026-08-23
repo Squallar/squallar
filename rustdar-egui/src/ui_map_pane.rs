@@ -1,7 +1,8 @@
 use crate::actions::GuiAction;
 use crate::legend_ramp;
 use crate::overlay_cache::{
-    current_quantized_zoom, draw_overlay_texture, plan_overlay_texture, viewport_geo_bounds,
+    RenderSlot, current_quantized_zoom, draw_overlay_texture, plan_overlay_texture,
+    viewport_geo_bounds,
 };
 use crate::pane::{LoopLoading, PaneState, RadarImageData, TimeMode};
 use crate::point_painter::EguiPointPainter;
@@ -57,6 +58,10 @@ pub(super) struct PaneRenderCtx<'a> {
     /// tile layers should fetch — see
     /// [`draw_tile_layer`](super::super::map_overlays::draw_tile_layer).
     pub tile_zoom_bias: u8,
+    /// How many overlay rasters this pane and layer may have crossing at once —
+    /// the device's `Budgets::concurrent_renders`. See
+    /// [`crate::overlay_cache::RendersInFlight::admits`].
+    pub overlay_render_limit: usize,
     pub actions: &'a mut Vec<GuiAction>,
     pub pane_rect: egui::Rect,
     /// Which halves of the pane's content this pass is for. See
@@ -438,7 +443,11 @@ pub(super) fn render_pane_map_content(
             let stale = enabled
                 && has_data
                 && cache.needs_rerender(token, zoom, now, &viewport_bounds, &tex_plan);
-            if stale && !cache.render_in_flight {
+            if stale
+                && cache
+                    .renders
+                    .admits(RenderSlot::WHOLE, ctx.overlay_render_limit)
+            {
                 ctx.actions.push(GuiAction::RenderOverlay {
                     pane_idx: ctx.pane_idx,
                     overlay_kind: id.clone(),

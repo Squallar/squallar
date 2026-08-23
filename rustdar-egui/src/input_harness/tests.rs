@@ -13395,7 +13395,16 @@ fn a_settle_frame_lost_to_an_in_flight_render_is_not_a_settle_lost() {
 
     h.gui_mut().panes_mut()[0]
         .overlay_cache_mut(&known::NWS_ALERTS)
-        .render_in_flight = true;
+        .renders
+        .record(crate::overlay_cache::RenderTicket::whole(
+            0,
+            rustdar_geo::GeoBounds {
+                min_lat: 34.0,
+                max_lat: 36.0,
+                min_lon: -98.0,
+                max_lon: -96.0,
+            },
+        ));
     h.frame_after(crate::overlay_cache::SETTLE_REPAINT_DELAY.as_secs_f64() + 0.01);
     assert_eq!(
         rasterizes_requested(&h, &known::NWS_ALERTS),
@@ -13406,7 +13415,8 @@ fn a_settle_frame_lost_to_an_in_flight_render_is_not_a_settle_lost() {
 
     h.gui_mut().panes_mut()[0]
         .overlay_cache_mut(&known::NWS_ALERTS)
-        .render_in_flight = false;
+        .renders
+        .abandon_all();
     h.frame_after(1.0 / 120.0);
     assert_eq!(
         rasterizes_requested(&h, &known::NWS_ALERTS),

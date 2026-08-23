@@ -238,6 +238,10 @@ impl super::App {
                 safe_area_insets: self.safe_area_insets,
                 supports_exit: self.supports_exit,
                 loop_frame_budget: self.loop_frame_budget,
+                // Off the dispatcher, which resolved it from `Budgets` at
+                // startup and is what every other background render on this
+                // device is admitted against.
+                concurrent_renders: self.render.concurrent_renders(),
                 location_settings_available: self.location_settings_available,
                 // Read off the gate each frame; the gate is the owner and
                 // `poll_platform_state` already redraws on a change.
@@ -917,6 +921,12 @@ impl super::App {
                 continue;
             }
 
+            // The dispatch this answers, rebuilt from the two terms the
+            // response echoes — see `RenderTicket`. A pane whose cache is no
+            // longer waiting for *this* raster does not get it.
+            let ticket =
+                rustdar_egui::overlay_cache::RenderTicket::whole(resp.generation, resp.geo_bounds);
+
             // Narrow the result to the panes that still draw this layer, and do
             // it **before the upload**.
             let gui = &mut self.gui;
@@ -925,8 +935,15 @@ impl super::App {
                     return false;
                 };
                 let wanted = !pane.overlay_texture_is_releasable(&id);
-                pane.overlay_cache_mut(&id).render_in_flight = false;
-                wanted
+                // **Retired for every pane, kept for some.** The mark is this
+                // pane's bookkeeping and has to come off whether or not the
+                // picture is wanted; `still_asked` is the separate question of
+                // whether the cache is waiting for this very dispatch. A
+                // `false` there is a raster for a viewport the pane has moved
+                // past, or one whose mark was abandoned while it flew: it is
+                // dropped here, before the upload below, rather than held.
+                let still_asked = pane.overlay_cache_mut(&id).renders.retire(&ticket);
+                wanted && still_asked
             });
             if resp.pane_indices.is_empty() {
                 continue;

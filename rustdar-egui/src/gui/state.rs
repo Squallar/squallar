@@ -281,6 +281,11 @@ pub struct Gui {
     /// dependency points the other way), and the timeline's row-2 caption
     /// wants to state the platform's real budget rather than a guess.
     pub(super) loop_frame_budget: usize,
+    /// This device's `Budgets::concurrent_renders`, pushed in by the frontend —
+    /// see [`crate::shell_api::FrameInputs::concurrent_renders`]. Bounds how
+    /// many overlay rasters one pane and layer may have out; see
+    /// [`crate::overlay_cache::RendersInFlight`].
+    pub(super) concurrent_renders: usize,
     /// Whether the top bar's ☰ dropdown was open on the last frame it drew.
     pub(super) menu_popup_open: bool,
     /// A dismiss was consumed against the open dropdown; the top bar honours
@@ -515,6 +520,10 @@ impl Gui {
             // The desktop arm of `constants::MAX_LOOP_FRAMES`; the frontend
             // pushes the real target's value at startup.
             loop_frame_budget: 60,
+            // The compile-time arm of the same axis, so a `Gui` nobody has
+            // pushed facts into behaves like this target rather than like a
+            // device with no render budget at all.
+            concurrent_renders: rustdar_device_profile::constants::MAX_CONCURRENT_RENDERS,
             menu_popup_open: false,
             menu_popup_close_requested: false,
             menu_open: false,

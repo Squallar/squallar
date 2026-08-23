@@ -970,7 +970,8 @@ fn a_pane_that_is_not_looping_dispatches_nothing_and_describes_its_own_picture()
             .pane_mut(0)
             .expect("pane 0")
             .overlay_cache_mut(&known::MODEL_DATA)
-            .render_in_flight,
+            .renders
+            .holds(rustdar_egui::overlay_cache::RenderSlot::WHOLE),
         "the live dispatch stopped marking the pane's overlay cache in flight, \
          so the draw loop would ask for the same raster on every frame",
     );

@@ -15,6 +15,16 @@ pub struct FrameInputs<'a> {
     pub supports_exit: bool,
     /// This build's loop frame cap, for the timeline's row-2 caption.
     pub loop_frame_budget: usize,
+    /// **How many overlay rasters one pane and layer may have crossing at
+    /// once** — the device's `Budgets::concurrent_renders`, which is the same
+    /// figure every other background render on this device is spent against
+    /// and is read off the resolved budgets rather than a `cfg`.
+    ///
+    /// Composed here rather than read from `rustdar_device_profile` inside this
+    /// crate for the reason [`Self::loop_frame_budget`] is: the resolved value
+    /// is the App's, and a browser's is not a `cfg` — the same wasm build gets
+    /// a different number on a blocklisted driver than on a workstation GPU.
+    pub concurrent_renders: usize,
     /// Whether this platform has a location settings page to offer.
     pub location_settings_available: bool,
     /// What the platform location service is doing: (permission, active).

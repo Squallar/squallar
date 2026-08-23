@@ -1059,6 +1059,15 @@ impl super::App {
             return;
         }
 
+        // The ground the raster is asked to cover, and — with the token — the
+        // identity the response echoes back. Resolved before the marks are set
+        // so the mark and the thing that will retire it are the same value:
+        // every pane in `pane_indices` is being sent *one* request, so one
+        // ticket names all of their marks at once.
+        let render_bounds = texture.coverage(&geo_bounds);
+        let ticket =
+            rustdar_egui::overlay_cache::RenderTicket::whole(data_generation, render_bounds);
+
         if self.gui.overlays.render_mode(&id)
             != Some(rustdar_overlays::render::overlay_state::RenderMode::Texture)
         {
@@ -1079,7 +1088,7 @@ impl super::App {
                             f.render_in_flight = true;
                         }
                     }
-                    None => pane.overlay_cache_mut(&id).render_in_flight = true,
+                    None => pane.overlay_cache_mut(&id).renders.record(ticket),
                 }
             }
             // **The record, written here and nowhere else** — beside the mark, so
@@ -1093,11 +1102,9 @@ impl super::App {
             }
         }
 
-        let render_bounds = texture.coverage(&geo_bounds);
-
         let first_pane_idx = pane_indices[0];
         if self.gui.pane(first_pane_idx).is_none() {
-            self.clear_overlay_render_marks(&pane_indices, &id, frame);
+            self.clear_overlay_render_marks(&pane_indices, &id, frame, &ticket);
             return;
         }
 
@@ -1164,7 +1171,7 @@ impl super::App {
                     job.zip(row).map(|(job, row)| (job, id_map, row))
                 };
                 let Some((job, id_map, row)) = built else {
-                    self.clear_overlay_render_marks(&pane_indices, id, frame);
+                    self.clear_overlay_render_marks(&pane_indices, id, frame, &ticket);
                     return;
                 };
                 let geometry = rustdar_source::job::JobGeometry {
@@ -1216,7 +1223,7 @@ impl super::App {
                      cannot rasterize: {}",
                     id.as_str()
                 );
-                self.clear_overlay_render_marks(&pane_indices, &id, frame);
+                self.clear_overlay_render_marks(&pane_indices, &id, frame, &ticket);
             }
         }
     }
@@ -1230,7 +1237,7 @@ impl super::App {
     /// dispatcher — every ask returned here goes through
     /// [`App::dispatch_overlay_renders`] and then
     /// [`Self::spawn_overlay_render`], the same two functions the action path
-    /// uses, because that is where the `render_in_flight` marks are owned.
+    /// uses, because that is where the in-flight marks are owned.
     ///
     /// **The token is recomputed, never read back.** The recorded
     /// `data_generation` is what the picture on the glass was keyed at, so it
@@ -1274,6 +1281,9 @@ impl super::App {
         // The theme the dispatch would rasterize at, and the same term the draw
         // loop mixes into its token.
         let is_dark = self.cached_dark_theme.unwrap_or(false);
+        // Read before `gui` is borrowed, off the dispatcher that resolved it
+        // from `Budgets`. The same figure the draw loop's gate is handed.
+        let render_limit = self.render.concurrent_renders();
         // The panes the layout is showing, from the same slice `render_panes`
         // draws. A record outlives its pane going hidden, and a raster for a
         // pane nobody paints is the speculation this path refuses.
@@ -1298,7 +1308,11 @@ impl super::App {
             // Not a dedupe: a second ask under an outstanding one would take a
             // render slot for a picture the first is already drawing, and the
             // draw loop declines on the same flag.
-            if pane.overlay_cache_mut(&id).render_in_flight {
+            if !pane
+                .overlay_cache_mut(&id)
+                .renders
+                .admits(rustdar_egui::overlay_cache::RenderSlot::WHOLE, render_limit)
+            {
                 continue;
             }
             // **No hydrate here, and that is measured rather than assumed.**
@@ -1368,6 +1382,7 @@ impl super::App {
         pane_indices: &[usize],
         id: &LayerId,
         frame: Option<rustdar_source::time::FrameStamp>,
+        ticket: &rustdar_egui::overlay_cache::RenderTicket,
     ) {
         for &pidx in pane_indices {
             if let Some(pane) = self.gui.pane_mut(pidx) {
@@ -1377,7 +1392,16 @@ impl super::App {
                             f.render_in_flight = false;
                         }
                     }
-                    None => pane.overlay_cache_mut(id).render_in_flight = false,
+                    // **The ticket, not the slot.** Retiring the slot outright
+                    // would drop whatever mark is standing there, and by the
+                    // time an abandoned dispatch is undone the pane may already
+                    // have a *live* one out — this runs after the marks are
+                    // set, and the pane it names can have been re-dispatched by
+                    // an arrival in between. `retire` refuses a ticket that is
+                    // not the one outstanding, which is exactly that case.
+                    None => {
+                        pane.overlay_cache_mut(id).renders.retire(ticket);
+                    }
                 }
             }
         }

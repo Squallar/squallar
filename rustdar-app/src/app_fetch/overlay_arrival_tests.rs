@@ -208,15 +208,30 @@ fn in_flight(app: &mut crate::app::App, idx: usize, id: &LayerId) -> bool {
         .pane_mut(idx)
         .expect("the fixture's pane")
         .overlay_cache_mut(id)
-        .render_in_flight
+        .renders
+        .holds(rustdar_egui::overlay_cache::RenderSlot::WHOLE)
 }
 
+/// Put a raster in flight for `idx`'s whole picture, or take the mark away.
+///
+/// The `true` arm records a ticket for the fixture's own recorded geometry: a
+/// mark names a dispatch now, and what these tests ask of it is only whether
+/// *something* is out, which is what gates the next ask.
 fn set_in_flight(app: &mut crate::app::App, idx: usize, id: &LayerId, v: bool) {
-    app.gui
+    let renders = &mut app
+        .gui
         .pane_mut(idx)
         .expect("the fixture's pane")
         .overlay_cache_mut(id)
-        .render_in_flight = v;
+        .renders;
+    if v {
+        renders.record(rustdar_egui::overlay_cache::RenderTicket::whole(
+            A_STALE_TOKEN,
+            RECORDED_PLAN.coverage(&RECORDED_BOUNDS),
+        ));
+    } else {
+        renders.abandon_all();
+    }
 }
 
 /// A dark two-pane app on KTLX with `id` on in pane 0 and one round of data
