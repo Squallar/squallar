@@ -11,7 +11,7 @@ use super::*;
 use crate::app::App;
 use rustdar_source::handler::{FetchTask, FrameListingResult, PaneRef};
 use rustdar_source::id::{LayerId, known};
-use rustdar_source::time::{FrameListing, TimeAxis};
+use rustdar_source::time::{FrameListing, FrameSource, FrameStamp, TimeAxis};
 use std::sync::{Arc, Mutex};
 
 /// The ranges a layer was asked to list, captured **synchronously inside**
@@ -26,6 +26,80 @@ struct RangeRecorder {
     extends_future: bool,
     horizon: chrono::Duration,
     seen: Ranges,
+}
+
+impl FrameSource for RangeRecorder {
+    /// This double answers no stamps at all: it exists to record the ranges
+    /// the shell asks it to list, and every one of the six methods below that
+    /// would name a frame is deliberately empty so a range that arrives can
+    /// only have come from the shell's own arithmetic.
+    fn latest_at(&self, _pane: &PaneRef<'_>, _t: NaiveDateTime) -> Option<FrameStamp> {
+        None
+    }
+
+    fn list_frames(
+        &self,
+        _ctx: &rustdar_overlays::render::overlay_state::FetchConfig,
+        _pane: &PaneRef<'_>,
+        range: (NaiveDateTime, NaiveDateTime),
+    ) -> FrameListing {
+        FrameListing::empty(range)
+    }
+
+    fn fetch_frame(
+        &self,
+        _ctx: &rustdar_overlays::render::overlay_state::FetchConfig,
+        _pane: &PaneRef<'_>,
+        _stamp: &FrameStamp,
+    ) -> Option<FetchTask> {
+        None
+    }
+
+    fn frames_resident(&self, _pane: &PaneRef<'_>) -> Vec<FrameStamp> {
+        Vec::new()
+    }
+
+    fn retain_frames(&mut self, _pane: &PaneRef<'_>, _keep: &[FrameStamp]) {}
+
+    fn apply_frame_listing(
+        &mut self,
+        _listing: FrameListing,
+        _scope: rustdar_overlays::render::overlay_state::FetchPayload,
+        _pane: &PaneRef<'_>,
+    ) {
+    }
+
+    fn apply_frame(
+        &mut self,
+        _stamp: FrameStamp,
+        _data: rustdar_overlays::render::overlay_state::FetchPayload,
+        _pane: &PaneRef<'_>,
+    ) {
+    }
+
+    fn frame_horizon(&self, _pane: &PaneRef<'_>) -> chrono::Duration {
+        self.horizon
+    }
+
+    fn create_frame_list_task(
+        &self,
+        _ctx: &rustdar_overlays::render::overlay_state::FetchConfig,
+        _pane: &PaneRef<'_>,
+        range: (NaiveDateTime, NaiveDateTime),
+    ) -> Option<FetchTask> {
+        self.seen.lock().expect("no poisoned lock").push(range);
+        let id = self.id.clone();
+        Some(FrameListingResult::task(id, async move {
+            FrameListingResult {
+                listing: FrameListing {
+                    range,
+                    frames: Vec::new(),
+                    complete: true,
+                },
+                scope: Box::new(()),
+            }
+        }))
+    }
 }
 
 impl rustdar_overlays::render::overlay_state::OverlayHandler for RangeRecorder {
@@ -79,28 +153,14 @@ impl rustdar_overlays::render::overlay_state::OverlayHandler for RangeRecorder {
         }
     }
 
-    fn frame_horizon(&self, _pane: &PaneRef<'_>) -> chrono::Duration {
-        self.horizon
+    /// This layer comes in stamped frames, and answers every one of
+    /// [`FrameSource`]'s methods below.
+    fn frames(&self) -> Option<&dyn FrameSource> {
+        Some(self)
     }
 
-    fn create_frame_list_task(
-        &self,
-        _ctx: &rustdar_overlays::render::overlay_state::FetchConfig,
-        _pane: &PaneRef<'_>,
-        range: (NaiveDateTime, NaiveDateTime),
-    ) -> Option<FetchTask> {
-        self.seen.lock().expect("no poisoned lock").push(range);
-        let id = self.id.clone();
-        Some(FrameListingResult::task(id, async move {
-            FrameListingResult {
-                listing: FrameListing {
-                    range,
-                    frames: Vec::new(),
-                    complete: true,
-                },
-                scope: Box::new(()),
-            }
-        }))
+    fn frames_mut(&mut self) -> Option<&mut dyn FrameSource> {
+        Some(self)
     }
 }
 

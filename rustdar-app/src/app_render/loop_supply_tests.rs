@@ -17,7 +17,7 @@
 use super::*;
 use rustdar_source::handler::{FetchPayload, PaneRef};
 use rustdar_source::id::LayerId;
-use rustdar_source::time::{FrameListing, FrameStamp};
+use rustdar_source::time::{FrameListing, FrameSource, FrameStamp};
 use std::sync::{Arc, Mutex};
 
 use rustdar_overlays::render::overlay_state::{
@@ -55,49 +55,36 @@ struct SupplyLayer {
     asked: Arc<Mutex<Asked>>,
 }
 
-impl OverlayHandler for SupplyLayer {
-    fn id(&self) -> LayerId {
-        self.id.clone()
+impl FrameSource for SupplyLayer {
+    /// The newest stamp this layer has listed at or before `t`, over the whole
+    /// set and unclipped — the same rule `list_frames` narrows to a window.
+    fn latest_at(&self, _pane: &PaneRef<'_>, t: chrono::NaiveDateTime) -> Option<FrameStamp> {
+        let mut stamps: Vec<FrameStamp> = self
+            .listed
+            .iter()
+            .map(|valid| FrameStamp {
+                valid: *valid,
+                run: None,
+            })
+            .collect();
+        stamps.sort_by_key(|stamp| stamp.valid);
+        rustdar_source::time::newest_at_or_before(&stamps, t)
     }
-    fn surface(&self) -> Surface {
-        Surface::Ground
-    }
-    fn draw_order_weight(&self) -> u32 {
-        999
-    }
-    fn display_name(&self) -> &str {
-        "Supply"
-    }
-    fn render_mode(&self) -> RenderMode {
-        RenderMode::Texture
-    }
-    fn data_generation(&self) -> u64 {
-        0
-    }
-    fn has_data(&self, _pane: &PaneRef<'_>) -> bool {
-        true
-    }
-    fn is_fetching(&self) -> bool {
-        false
-    }
-    fn set_fetching(&mut self, _f: bool, _pane: &PaneRef<'_>) {}
-    fn fetch_time(&self) -> Option<web_time::Instant> {
-        None
-    }
-    fn apply_fetch_result(&mut self, _result: FetchPayload, _pane: &PaneRef<'_>) {}
-    fn retain_selections(
-        &self,
-        _selections: &mut Vec<Arc<dyn rustdar_overlays::render::overlay_state::OverlayItem>>,
+
+    /// Residency is a fixture field here, set at construction, so nothing may
+    /// change it behind the suite's back: eviction and delivery are both
+    /// no-ops and the resident set is exactly what the test declared.
+    fn retain_frames(&mut self, _pane: &PaneRef<'_>, _keep: &[FrameStamp]) {}
+
+    fn apply_frame_listing(
+        &mut self,
+        _listing: FrameListing,
+        _scope: FetchPayload,
         _pane: &PaneRef<'_>,
     ) {
     }
 
-    fn time_axis(&self) -> rustdar_source::time::TimeAxis {
-        rustdar_source::time::TimeAxis::FrameSeries {
-            typical_step: std::time::Duration::from_secs(3600),
-            extends_future: true,
-        }
-    }
+    fn apply_frame(&mut self, _stamp: FrameStamp, _data: FetchPayload, _pane: &PaneRef<'_>) {}
 
     /// Every stamp this layer knows about, clipped to the window it was asked
     /// for — the same shape the model layer's closed-form `Forecast` arm has.
@@ -190,6 +177,60 @@ impl OverlayHandler for SupplyLayer {
             kind: self.id.clone(),
             future: Box::pin(async move { Box::new(()) as FetchPayload }),
         })
+    }
+}
+
+impl OverlayHandler for SupplyLayer {
+    fn id(&self) -> LayerId {
+        self.id.clone()
+    }
+    fn surface(&self) -> Surface {
+        Surface::Ground
+    }
+    fn draw_order_weight(&self) -> u32 {
+        999
+    }
+    fn display_name(&self) -> &str {
+        "Supply"
+    }
+    fn render_mode(&self) -> RenderMode {
+        RenderMode::Texture
+    }
+    fn data_generation(&self) -> u64 {
+        0
+    }
+    fn has_data(&self, _pane: &PaneRef<'_>) -> bool {
+        true
+    }
+    fn is_fetching(&self) -> bool {
+        false
+    }
+    fn set_fetching(&mut self, _f: bool, _pane: &PaneRef<'_>) {}
+    fn fetch_time(&self) -> Option<web_time::Instant> {
+        None
+    }
+    fn apply_fetch_result(&mut self, _result: FetchPayload, _pane: &PaneRef<'_>) {}
+    fn retain_selections(
+        &self,
+        _selections: &mut Vec<Arc<dyn rustdar_overlays::render::overlay_state::OverlayItem>>,
+        _pane: &PaneRef<'_>,
+    ) {
+    }
+
+    fn time_axis(&self) -> rustdar_source::time::TimeAxis {
+        rustdar_source::time::TimeAxis::FrameSeries {
+            typical_step: std::time::Duration::from_secs(3600),
+            extends_future: true,
+        }
+    }
+    /// This layer comes in stamped frames, and answers every one of
+    /// [`FrameSource`]'s methods below.
+    fn frames(&self) -> Option<&dyn FrameSource> {
+        Some(self)
+    }
+
+    fn frames_mut(&mut self) -> Option<&mut dyn FrameSource> {
+        Some(self)
     }
 }
 

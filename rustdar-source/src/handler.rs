@@ -20,7 +20,7 @@ use crate::fetch_policy::{
 use crate::id::LayerId;
 use crate::job::{DescribedJob, JobCodec};
 use crate::product::{FieldId, ProductSpec};
-use crate::time::{FrameListing, FrameStamp, TimeAxis};
+use crate::time::{FrameListing, FrameSource, FrameStamp, TimeAxis};
 
 /// Not `rustdar_radar::LegendScale`: duplicated here to avoid the dependency.
 pub struct OverlayLegend {
@@ -819,9 +819,11 @@ pub trait SourceHandler: Send {
     //
     // How this layer relates to the clock. `time_axis` is the whole
     // declaration: every presentation rule is derived from the arm, written
-    // on [`TimeAxis`] itself. The rest of this block is the frame supply a
-    // [`TimeAxis::FrameSeries`] layer answers through; the other two arms
-    // take the defaults and never see a frame.
+    // on [`TimeAxis`] itself. What is left here is what every arm answers —
+    // the axis, the loop floor and the as-of quantum. The frame *supply* is
+    // not: it moved to `FrameSource`, reached through `frames`/`frames_mut`,
+    // where its nine methods have no default bodies and a `FrameSeries` layer
+    // must therefore write every one of them.
 
     /// This layer's relationship to the clock — see [`TimeAxis`] for the
     /// rules each arm derives.
@@ -867,102 +869,6 @@ pub trait SourceHandler: Send {
         }
     }
 
-    /// **How far past the wall clock this layer's frames reach, in this pane.**
-    ///
-    /// Zero for every layer whose stamps are all history — which is every
-    /// layer whose [`Self::time_axis`] does not declare `extends_future`, and
-    /// also a forecast layer whose current selection happens to name a past
-    /// set. A caller reads the axis to decide whether the rail reaches forward
-    /// at all, and reads this to decide how far.
-    ///
-    /// **Pane-scoped because the horizon belongs to the run, not to the
-    /// layer**: the same HRRR layer reaches 48 hours off a 00/06/12/18Z cycle
-    /// and 18 off every other hour, so nothing above can hold this as a
-    /// constant beside the id.
-    ///
-    /// An upper bound on the range a loop should ask for, not a promise of a
-    /// frame at the end of it — [`Self::create_frame_list_task`] clips its own
-    /// stamps to the range it is handed.
-    fn frame_horizon(&self, pane: &PaneRef<'_>) -> chrono::Duration {
-        let _ = pane;
-        chrono::Duration::zero()
-    }
-
-    /// **What frames this layer could show over `range`, as it already knows
-    /// it.** A synchronous query over handler-owned state — it **never**
-    /// performs I/O; [`Self::create_frame_list_task`] is the fetch that fills
-    /// that state in.
-    ///
-    /// Pane-scoped because frames are per-slot: two panes on two radar sites
-    /// hold two frame sets, and a [`FrameStamp`] carries no site, so an
-    /// unscoped answer would pool them into one bogus list.
-    fn list_frames(
-        &self,
-        ctx: &FetchConfig,
-        pane: &PaneRef<'_>,
-        range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
-    ) -> FrameListing {
-        let _ = (ctx, pane);
-        FrameListing::empty(range)
-    }
-
-    /// **The async supply for [`Self::list_frames`]** — the listing fetch that
-    /// teaches this handler what frames exist. Lands as
-    /// [`SourceEvent::Frames`]; `None` from a layer with no listing to fetch.
-    ///
-    /// Build the task through [`FrameListingResult::task`]: the scope this
-    /// listing will be filed under is **captured here, at dispatch**, and
-    /// travels with the round trip rather than being read back off a pane
-    /// that may have moved by the time it lands.
-    fn create_frame_list_task(
-        &self,
-        ctx: &FetchConfig,
-        pane: &PaneRef<'_>,
-        range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
-    ) -> Option<FetchTask> {
-        let _ = (ctx, pane, range);
-        None
-    }
-
-    /// **The async supply for one frame's data.** Lands as
-    /// [`SourceEvent::FrameReady`]; `None` when this handler cannot fetch that
-    /// stamp (or already holds it).
-    fn fetch_frame(
-        &self,
-        ctx: &FetchConfig,
-        pane: &PaneRef<'_>,
-        stamp: &FrameStamp,
-    ) -> Option<FetchTask> {
-        let _ = (ctx, pane, stamp);
-        None
-    }
-
-    /// The stamps this handler is **holding data for** in this pane, ready to
-    /// draw without a fetch. A subset of what [`Self::list_frames`] names.
-    ///
-    /// The frame cache is the **handler's own**: nothing above keeps a parallel
-    /// map of frames, so nothing above can disagree with this answer.
-    ///
-    /// **Not yet true of the radar layer**, which is the only implementor of
-    /// this surface today: the decoded volumes and the paired Level III
-    /// objects its frames are made of are held ABOVE it, so it takes the
-    /// default here and answers with none while the frames exist. It becomes
-    /// true when those two caches move behind the handler — WO-M12d — and the
-    /// claim above is a statement about the contract, not about the tree,
-    /// until then.
-    fn frames_resident(&self, pane: &PaneRef<'_>) -> Vec<FrameStamp> {
-        let _ = pane;
-        Vec::new()
-    }
-
-    /// Drop every resident frame **not** in `keep`. The one eviction door, so
-    /// the budget that decides what to keep lives above and the storage stays
-    /// below — with the same caveat [`Self::frames_resident`] carries: radar's
-    /// storage is still above, so radar still evicts its own.
-    fn retain_frames(&mut self, pane: &PaneRef<'_>, keep: &[FrameStamp]) {
-        let _ = (pane, keep);
-    }
-
     /// **Cache-key quantum for [`TimeAxis::EventLifetime`] as-of
     /// rasterization** — how coarsely the depicted instant is rounded before
     /// it enters a texture cache key, so a scrubbing pane re-uses rasters
@@ -975,25 +881,44 @@ pub trait SourceHandler: Send {
         std::time::Duration::from_secs(60)
     }
 
-    /// **Take delivery of a frame listing this handler asked for**, with the
-    /// `scope` its own [`Self::create_frame_list_task`] captured at dispatch.
+    /// **This layer's frame supply, if it has one.**
     ///
-    /// The scope is this handler's own type and nothing above reads it. It is
-    /// how the listing is *filed*: `listing` names no site, so a handler two
-    /// panes on two sites both ask of would otherwise pool two sites' stamps
-    /// into one list.
-    fn apply_frame_listing(
-        &mut self,
-        listing: FrameListing,
-        scope: FetchPayload,
-        pane: &PaneRef<'_>,
-    ) {
-        let _ = (listing, scope, pane);
+    /// `Some` from a [`TimeAxis::FrameSeries`] layer; `None` — the default,
+    /// and eleven of this build's fifteen layers take it — from one whose
+    /// picture is not a named frame.
+    ///
+    /// The same accessor shape as [`Self::volume`], and for the same reason.
+    /// [`FrameSource`] carries nine methods with **no default bodies**, so a
+    /// framed layer cannot declare half a supply; routing them through an
+    /// accessor is what keeps the other eleven layers from having to write
+    /// nine trivial ones. A `None` here is the layer saying it has no frames
+    /// at all, which is a different statement from "I have frames and know
+    /// nothing about them" — the statement the old defaults made on every
+    /// layer's behalf, silently.
+    ///
+    /// [`Self::time_axis`] and this method are **paired**, and the walk that
+    /// asserts the pairing lives above this crate: `FrameSeries` with no
+    /// supply, and a supply on a layer that never declared the axis, are both
+    /// defects.
+    fn frames(&self) -> Option<&dyn FrameSource> {
+        None
     }
 
-    /// Take delivery of one frame's data.
-    fn apply_frame(&mut self, stamp: FrameStamp, data: FetchPayload, pane: &PaneRef<'_>) {
-        let _ = (stamp, data, pane);
+    /// The `&mut` half of [`Self::frames`], for the three supply methods that
+    /// take delivery ([`FrameSource::apply_frame_listing`],
+    /// [`FrameSource::apply_frame`]) or evict
+    /// ([`FrameSource::retain_frames`]).
+    ///
+    /// Two accessors rather than one because [`Self::volume`]'s read-only
+    /// shape does not stretch: a frame supply is asked questions *and* handed
+    /// arrivals, and a single `&mut` accessor would force every read through a
+    /// mutable borrow of the whole handler.
+    ///
+    /// A layer answering `Some` from [`Self::frames`] answers `Some` here too
+    /// — they are the same object seen through two borrows, never two
+    /// different opinions about whether this layer comes in frames.
+    fn frames_mut(&mut self) -> Option<&mut dyn FrameSource> {
+        None
     }
 }
 
@@ -1014,7 +939,7 @@ pub struct FetchConfig {
     /// time reads this to choose *which* archive objects to ask for, so a
     /// scrubbed pane fetches the past rather than the present. A `Live` source
     /// ignores it by contract, and a `FrameSeries` source names its frames
-    /// through [`SourceHandler::create_frame_list_task`] instead — for both,
+    /// through [`crate::time::FrameSource::create_frame_list_task`] instead — for both,
     /// the caller leaves this equal to the wall clock and no bytes move.
     ///
     /// [`TimeAxis`]: crate::time::TimeAxis
@@ -1123,7 +1048,7 @@ pub struct FetchTask {
 /// [`SourceEvent::Frames`], so the driver that spawns the task never has to
 /// invent either one.
 ///
-/// [`SourceHandler::create_frame_list_task`] returns an ordinary
+/// [`crate::time::FrameSource::create_frame_list_task`] returns an ordinary
 /// [`FetchTask`], so build it through [`Self::task`] and read it back through
 /// [`Self::event`]; a payload that did not come through `task` is a
 /// programming error at the handler, and `event` says so by answering `None`
@@ -1133,7 +1058,7 @@ pub struct FrameListingResult {
     /// about. Names no site.
     pub listing: FrameListing,
     /// The source's own half, captured at dispatch and handed straight back
-    /// to [`SourceHandler::apply_frame_listing`].
+    /// to [`crate::time::FrameSource::apply_frame_listing`].
     pub scope: FetchPayload,
 }
 
@@ -1229,7 +1154,7 @@ pub enum SourceEvent {
     /// Today's payload, unchanged — a whole fetch round for a layer.
     Data(OverlayFetchResult),
     /// What frames a layer can show, in answer to
-    /// [`SourceHandler::create_frame_list_task`], with the **scope** that
+    /// [`crate::time::FrameSource::create_frame_list_task`], with the **scope** that
     /// question was asked in.
     ///
     /// `listing` is the generic half every reader understands and it names no
@@ -1246,7 +1171,7 @@ pub enum SourceEvent {
         listing: FrameListing,
         scope: FetchPayload,
     },
-    /// One frame's data, in answer to [`SourceHandler::fetch_frame`].
+    /// One frame's data, in answer to [`crate::time::FrameSource::fetch_frame`].
     FrameReady {
         id: LayerId,
         stamp: FrameStamp,

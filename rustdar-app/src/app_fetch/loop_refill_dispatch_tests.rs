@@ -15,7 +15,7 @@ use super::*;
 use crate::app::App;
 use rustdar_source::handler::{FetchTask, FrameListingResult, PaneRef};
 use rustdar_source::id::{LayerId, known};
-use rustdar_source::time::{FrameListing, TimeAxis};
+use rustdar_source::time::{FrameListing, FrameSource, FrameStamp, TimeAxis};
 use std::sync::{Arc, Mutex};
 
 type Ranges = Arc<Mutex<Vec<(NaiveDateTime, NaiveDateTime)>>>;
@@ -76,6 +76,72 @@ impl rustdar_overlays::render::overlay_state::OverlayHandler for RangeRecorder {
             typical_step: std::time::Duration::from_secs(300),
             extends_future: false,
         }
+    }
+
+    /// This layer comes in stamped frames, and answers every one of
+    /// [`FrameSource`]'s methods.
+    fn frames(&self) -> Option<&dyn FrameSource> {
+        Some(self)
+    }
+
+    fn frames_mut(&mut self) -> Option<&mut dyn FrameSource> {
+        Some(self)
+    }
+}
+
+impl FrameSource for RangeRecorder {
+    /// This double answers no stamps at all: it exists to record the ranges
+    /// the shell asks it to list, and a range that arrives can therefore only
+    /// have come from the shell's own arithmetic rather than from anything
+    /// this layer offered it.
+    fn latest_at(&self, _pane: &PaneRef<'_>, _t: NaiveDateTime) -> Option<FrameStamp> {
+        None
+    }
+
+    fn list_frames(
+        &self,
+        _ctx: &rustdar_overlays::render::overlay_state::FetchConfig,
+        _pane: &PaneRef<'_>,
+        range: (NaiveDateTime, NaiveDateTime),
+    ) -> FrameListing {
+        FrameListing::empty(range)
+    }
+
+    fn fetch_frame(
+        &self,
+        _ctx: &rustdar_overlays::render::overlay_state::FetchConfig,
+        _pane: &PaneRef<'_>,
+        _stamp: &FrameStamp,
+    ) -> Option<FetchTask> {
+        None
+    }
+
+    fn frames_resident(&self, _pane: &PaneRef<'_>) -> Vec<FrameStamp> {
+        Vec::new()
+    }
+
+    fn retain_frames(&mut self, _pane: &PaneRef<'_>, _keep: &[FrameStamp]) {}
+
+    fn apply_frame_listing(
+        &mut self,
+        _listing: FrameListing,
+        _scope: rustdar_overlays::render::overlay_state::FetchPayload,
+        _pane: &PaneRef<'_>,
+    ) {
+    }
+
+    fn apply_frame(
+        &mut self,
+        _stamp: FrameStamp,
+        _data: rustdar_overlays::render::overlay_state::FetchPayload,
+        _pane: &PaneRef<'_>,
+    ) {
+    }
+
+    /// All history: this layer's stamps never reach past the wall clock, which
+    /// is the same fact its axis states as `extends_future: false`.
+    fn frame_horizon(&self, _pane: &PaneRef<'_>) -> chrono::Duration {
+        chrono::Duration::zero()
     }
 
     fn create_frame_list_task(

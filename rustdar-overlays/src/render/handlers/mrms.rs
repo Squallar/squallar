@@ -65,7 +65,7 @@ use crate::render::rasterize;
 use rustdar_source::handler::{FrameListingResult, TaskFuture};
 use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
-use rustdar_source::time::{FrameListing, FrameStamp, TimeAxis};
+use rustdar_source::time::{FrameListing, FrameSource, FrameStamp, TimeAxis};
 
 /// **One frame's granule at a time, application-wide** — the same shape as
 /// GMGSI's gate, needed harder here: `dispatch_loop_frame_fetches` has no
@@ -164,7 +164,7 @@ impl MrmsFrameCache {
         }
     }
 
-    /// Drop everything but `keep` — the [`OverlayHandler::retain_frames`] door.
+    /// Drop everything but `keep` — the [`FrameSource::retain_frames`] door.
     fn retain(&mut self, keep: impl Fn(FrameKey) -> bool) {
         self.entries.retain(|key, _| keep(*key));
         self.recency.borrow_mut().retain(|key| keep(*key));
@@ -379,168 +379,53 @@ impl MrmsHandler {
     }
 }
 
-impl OverlayHandler for MrmsHandler {
-    /// The MRMS products this layer offers, projected into the substrate's read
-    /// contract by [`crate::mrms::fields`].
-    fn products(&self) -> &'static [rustdar_source::product::ProductSpec] {
-        crate::mrms::fields::products()
-    }
-
-    /// The product dropdown: its option values are the products' `as_str()`
-    /// spellings, which are exactly the `FieldId`s [`crate::mrms::fields`]
-    /// registers, so a catalogue tile's id goes straight through
-    /// `apply_control`.
-    fn field_control_id(&self) -> Option<&'static str> {
-        Some("product")
-    }
-
-    /// **This pane's own product**, projected through its registry row — never
-    /// spelled as a fresh string, so the id can only ever be one this layer
-    /// publishes.
-    fn current_field(&self, pane: &PaneRef<'_>) -> Option<rustdar_source::product::FieldId> {
-        Some(
-            crate::mrms::fields::spec(self.view(pane).selected_product)
-                .id
-                .clone(),
-        )
-    }
-
-    fn id(&self) -> LayerId {
-        known::MRMS
-    }
-
-    fn surface(&self) -> Surface {
-        Surface::Ground
-    }
-
-    /// **15**: above the model's 10 and below the outlooks' 20. A national
-    /// mosaic covers a model field and is covered by the risk polygons drawn
-    /// over both.
+impl FrameSource for MrmsHandler {
+    /// **The newest mosaic of this pane's product at or before `t`.**
     ///
-    /// Since WB-10 this weight is also half of the clock ruling: the transport
-    /// is the topmost enabled `FrameSeries` layer with **zero special cases**,
-    /// so 15 is what makes MRMS the clock of a radar-off pane that also shows
-    /// the model or the satellite. `radar_takes_the_clock_wherever_it_is_drawn`
-    /// pins the ordering and records why.
-    fn draw_order_weight(&self) -> u32 {
-        15
-    }
-
-    fn display_name(&self) -> &str {
-        "MRMS Mosaic"
-    }
-
-    fn render_mode(&self) -> RenderMode {
-        RenderMode::Texture
-    }
-
-    /// Nothing here is hatched or theme-coloured: the bar is the product's own
-    /// and reads the same on either background.
-    fn theme_sensitive(&self) -> bool {
-        false
-    }
-
-    fn is_enabled(&self, pane: &PaneRef<'_>) -> bool {
-        self.view(pane).enabled
-    }
-
-    fn set_enabled(&mut self, enabled: bool, pane: &mut PaneMut<'_>) {
-        self.edit(pane, |state| state.enabled = enabled);
-    }
-
-    fn status_line(&self, pane: &PaneRef<'_>) -> Option<String> {
-        let view = self.view(pane);
-        if !view.enabled {
-            return None;
-        }
-        Some(view.selected_product.display_name().to_owned())
-    }
-
-    fn data_generation(&self) -> u64 {
-        self.state.data_generation
-    }
-
-    /// **The selected product is in the token**, not just the fetch counter:
-    /// the render dispatch groups panes by this, and one token for two products
-    /// is one raster for both.
-    fn content_signature(&self, pane: &PaneRef<'_>) -> u64 {
-        self.data_generation() ^ (self.view(pane).selected_product as u64 + 1).rotate_left(32)
-    }
-
-    fn has_data(&self, pane: &PaneRef<'_>) -> bool {
-        self.cached_grids.contains(self.view(pane).selected_product)
-    }
-
-    fn is_fetching(&self) -> bool {
-        self.state.fetching
-    }
-
-    fn set_fetching(&mut self, fetching: bool, _pane: &PaneRef<'_>) {
-        self.state.fetching = fetching;
-    }
-
-    fn retry(&self) -> Option<&crate::fetch_policy::FetchRetry> {
-        Some(&self.state.retry)
-    }
-
-    fn retry_mut(&mut self) -> Option<&mut crate::fetch_policy::FetchRetry> {
-        Some(&mut self.state.retry)
-    }
-
-    fn fetch_time(&self) -> Option<web_time::Instant> {
-        self.state.fetch_time
-    }
-
-    fn item_count(&self, _pane: &PaneRef<'_>) -> usize {
-        self.state
-            .data
-            .as_ref()
-            .map(|d| d.grid.values.len())
-            .unwrap_or(0)
-    }
-
-    /// **120 s**, matching the mosaic's own ~2-minute publish cadence. Faster
-    /// would list a prefix that has not changed; slower would draw a mosaic
-    /// older than the radar beside it.
-    fn auto_poll_interval(&self) -> Option<u64> {
-        Some(120)
-    }
-
-    fn clickable_items<'a>(
-        &'a self,
-        _pane: &PaneRef<'_>,
-    ) -> Vec<crate::render::overlay_state::ClickableItem<'a>> {
-        Vec::new() // Gridded, not feature-based; hover uses `hover_value_at`.
-    }
-
-    // -- Time -----------------------------------------------------------------
-
-    /// One national mosaic every ~two minutes, stamped with the instant it
-    /// depicts, and never one for an instant that has not happened: discrete
-    /// frames that stop at the wall clock.
+    /// A mosaic depicts its own stamp and nothing depicts the ~two minutes
+    /// after it, so every instant until the next one is drawn by carrying it
+    /// forward — which is what this answers, over the whole key store and with
+    /// no window to clip it at.
     ///
-    /// `typical_step` is nominal — the real stamps are not clock-aligned and
-    /// occasionally skip a beat — which is exactly what a *typical* step is
-    /// for. **No `min_loop_frames` accompanies it**: at this cadence the
-    /// Lookback slider's default hour is already ~30 frames, so the slider's
-    /// own spans yield real loops and a floor would widen every MRMS pane's
-    /// rail for nothing.
-    fn time_axis(&self) -> TimeAxis {
-        TimeAxis::FrameSeries {
-            typical_step: std::time::Duration::from_secs(120),
-            extends_future: false,
-        }
+    /// `run: None`: MRMS is observed and there is no cycle behind it.
+    fn latest_at(
+        &self,
+        pane: &PaneRef<'_>,
+        t: chrono::NaiveDateTime,
+    ) -> Option<rustdar_source::time::FrameStamp> {
+        let product = self.view(pane).selected_product;
+        let stamps: Vec<FrameStamp> = self
+            .frame_keys
+            .get(&product)?
+            .keys()
+            .map(|valid| FrameStamp {
+                valid: *valid,
+                run: None,
+            })
+            .collect();
+        rustdar_source::time::newest_at_or_before(&stamps, t)
     }
 
-    /// **The stamps this product's listings have found inside `range`.**
+    /// **The stamps this product's listings have found for `range`** — every
+    /// one inside it, and **the newest one at or before its start**.
     ///
     /// Synchronous and I/O-free: it reads the keys
     /// [`Self::create_frame_list_task`] filed and nothing else. Every stamp
     /// carries `run: None` — MRMS is observed, there is no cycle behind it.
     ///
+    /// **The leading mosaic is [`Self::latest_at`]'s answer**, the same shape
+    /// the satellite layer takes and for the same reason: a window opened
+    /// between two mosaics has clock in front of its first listed stamp, and
+    /// the only picture those stops can be drawn from is the mosaic the window
+    /// opened after. Clipping at `range.0` dropped it. The gap it left here is
+    /// bounded by this layer's ~2-minute cadence rather than by an hour, which
+    /// is why it was never the report the satellite layer's identical clip
+    /// produced — not why it was not the same defect.
+    ///
     /// `complete` only where a listing that really covered this window landed:
     /// a failed or sampled listing leaves the answer readable as "at least
-    /// these", which is what it is.
+    /// these", which is what it is. It is a claim about the window, and
+    /// carrying one earlier mosaic in does not widen it.
     fn list_frames(
         &self,
         _ctx: &FetchConfig,
@@ -548,18 +433,21 @@ impl OverlayHandler for MrmsHandler {
         range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
     ) -> FrameListing {
         let product = self.view(pane).selected_product;
-        let frames: Vec<FrameStamp> = self
+        let inside = self
             .frame_keys
             .get(&product)
-            .map(|keys| {
-                keys.range(range.0..=range.1)
-                    .map(|(valid, _)| FrameStamp {
-                        valid: *valid,
-                        run: None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+            .into_iter()
+            .flat_map(|keys| keys.range(range.0..=range.1))
+            .filter(|(valid, _)| **valid > range.0)
+            .map(|(valid, _)| FrameStamp {
+                valid: *valid,
+                run: None,
+            });
+        let frames: Vec<FrameStamp> = self
+            .latest_at(pane, range.0)
+            .into_iter()
+            .chain(inside)
+            .collect();
         FrameListing {
             range,
             frames,
@@ -744,6 +632,179 @@ impl OverlayHandler for MrmsHandler {
             return;
         };
         self.frame_grids.insert(FrameKey { product, valid }, grid);
+    }
+
+    /// **Zero, and it is a decision rather than an omission.** A national
+    /// mosaic is made *from* observations, so none exists for an instant that
+    /// has not happened — the same fact [`OverlayHandler::time_axis`] states
+    /// as `extends_future: false`. The rail must not offer this layer a stop
+    /// past the wall clock.
+    fn frame_horizon(&self, _pane: &PaneRef<'_>) -> chrono::Duration {
+        chrono::Duration::zero()
+    }
+}
+
+impl OverlayHandler for MrmsHandler {
+    /// The MRMS products this layer offers, projected into the substrate's read
+    /// contract by [`crate::mrms::fields`].
+    fn products(&self) -> &'static [rustdar_source::product::ProductSpec] {
+        crate::mrms::fields::products()
+    }
+
+    /// The product dropdown: its option values are the products' `as_str()`
+    /// spellings, which are exactly the `FieldId`s [`crate::mrms::fields`]
+    /// registers, so a catalogue tile's id goes straight through
+    /// `apply_control`.
+    fn field_control_id(&self) -> Option<&'static str> {
+        Some("product")
+    }
+
+    /// **This pane's own product**, projected through its registry row — never
+    /// spelled as a fresh string, so the id can only ever be one this layer
+    /// publishes.
+    fn current_field(&self, pane: &PaneRef<'_>) -> Option<rustdar_source::product::FieldId> {
+        Some(
+            crate::mrms::fields::spec(self.view(pane).selected_product)
+                .id
+                .clone(),
+        )
+    }
+
+    fn id(&self) -> LayerId {
+        known::MRMS
+    }
+
+    fn surface(&self) -> Surface {
+        Surface::Ground
+    }
+
+    /// **15**: above the model's 10 and below the outlooks' 20. A national
+    /// mosaic covers a model field and is covered by the risk polygons drawn
+    /// over both.
+    ///
+    /// Since WB-10 this weight is also half of the clock ruling: the transport
+    /// is the topmost enabled `FrameSeries` layer with **zero special cases**,
+    /// so 15 is what makes MRMS the clock of a radar-off pane that also shows
+    /// the model or the satellite. `radar_takes_the_clock_wherever_it_is_drawn`
+    /// pins the ordering and records why.
+    fn draw_order_weight(&self) -> u32 {
+        15
+    }
+
+    fn display_name(&self) -> &str {
+        "MRMS Mosaic"
+    }
+
+    fn render_mode(&self) -> RenderMode {
+        RenderMode::Texture
+    }
+
+    /// Nothing here is hatched or theme-coloured: the bar is the product's own
+    /// and reads the same on either background.
+    fn theme_sensitive(&self) -> bool {
+        false
+    }
+
+    fn is_enabled(&self, pane: &PaneRef<'_>) -> bool {
+        self.view(pane).enabled
+    }
+
+    fn set_enabled(&mut self, enabled: bool, pane: &mut PaneMut<'_>) {
+        self.edit(pane, |state| state.enabled = enabled);
+    }
+
+    fn status_line(&self, pane: &PaneRef<'_>) -> Option<String> {
+        let view = self.view(pane);
+        if !view.enabled {
+            return None;
+        }
+        Some(view.selected_product.display_name().to_owned())
+    }
+
+    fn data_generation(&self) -> u64 {
+        self.state.data_generation
+    }
+
+    /// **The selected product is in the token**, not just the fetch counter:
+    /// the render dispatch groups panes by this, and one token for two products
+    /// is one raster for both.
+    fn content_signature(&self, pane: &PaneRef<'_>) -> u64 {
+        self.data_generation() ^ (self.view(pane).selected_product as u64 + 1).rotate_left(32)
+    }
+
+    fn has_data(&self, pane: &PaneRef<'_>) -> bool {
+        self.cached_grids.contains(self.view(pane).selected_product)
+    }
+
+    fn is_fetching(&self) -> bool {
+        self.state.fetching
+    }
+
+    fn set_fetching(&mut self, fetching: bool, _pane: &PaneRef<'_>) {
+        self.state.fetching = fetching;
+    }
+
+    fn retry(&self) -> Option<&crate::fetch_policy::FetchRetry> {
+        Some(&self.state.retry)
+    }
+
+    fn retry_mut(&mut self) -> Option<&mut crate::fetch_policy::FetchRetry> {
+        Some(&mut self.state.retry)
+    }
+
+    fn fetch_time(&self) -> Option<web_time::Instant> {
+        self.state.fetch_time
+    }
+
+    fn item_count(&self, _pane: &PaneRef<'_>) -> usize {
+        self.state
+            .data
+            .as_ref()
+            .map(|d| d.grid.values.len())
+            .unwrap_or(0)
+    }
+
+    /// **120 s**, matching the mosaic's own ~2-minute publish cadence. Faster
+    /// would list a prefix that has not changed; slower would draw a mosaic
+    /// older than the radar beside it.
+    fn auto_poll_interval(&self) -> Option<u64> {
+        Some(120)
+    }
+
+    fn clickable_items<'a>(
+        &'a self,
+        _pane: &PaneRef<'_>,
+    ) -> Vec<crate::render::overlay_state::ClickableItem<'a>> {
+        Vec::new() // Gridded, not feature-based; hover uses `hover_value_at`.
+    }
+
+    // -- Time -----------------------------------------------------------------
+
+    /// One national mosaic every ~two minutes, stamped with the instant it
+    /// depicts, and never one for an instant that has not happened: discrete
+    /// frames that stop at the wall clock.
+    ///
+    /// `typical_step` is nominal — the real stamps are not clock-aligned and
+    /// occasionally skip a beat — which is exactly what a *typical* step is
+    /// for. **No `min_loop_frames` accompanies it**: at this cadence the
+    /// Lookback slider's default hour is already ~30 frames, so the slider's
+    /// own spans yield real loops and a floor would widen every MRMS pane's
+    /// rail for nothing.
+    fn time_axis(&self) -> TimeAxis {
+        TimeAxis::FrameSeries {
+            typical_step: std::time::Duration::from_secs(120),
+            extends_future: false,
+        }
+    }
+
+    /// This layer comes in stamped frames, and answers every one of
+    /// [`FrameSource`]'s methods below.
+    fn frames(&self) -> Option<&dyn FrameSource> {
+        Some(self)
+    }
+
+    fn frames_mut(&mut self) -> Option<&mut dyn FrameSource> {
+        Some(self)
     }
 
     fn apply_fetch_result(&mut self, result: FetchPayload, pane: &PaneRef<'_>) {
