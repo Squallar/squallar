@@ -180,6 +180,66 @@ fn an_id_that_was_never_filed_has_not_been_delivered() {
     assert!(!uploads.is_delivered(egui::TextureId::User(3)));
 }
 
+/// **A renderer that has been shown nothing says so, rather than saying zero
+/// bytes.**
+///
+/// The distinction is the whole point of `UploadTotals::deltas`: a byte total
+/// of zero is what an idle renderer reports and also what one whose upload path
+/// had stopped moving bytes would report, and a gate that read only the bytes
+/// could not tell them apart.
+#[test]
+fn a_renderer_that_has_uploaded_nothing_says_so_rather_than_saying_zero_bytes() {
+    let uploads = TextureUploads::without_device();
+    let totals = uploads.totals();
+    assert_eq!(
+        totals.deltas, 0,
+        "the floor is what distinguishes the cases"
+    );
+    assert_eq!(totals.bytes(), 0);
+    assert_eq!(totals.banded_bytes(), 0);
+    assert_eq!(totals, UploadTotals::default());
+}
+
+/// **The report is asked for once a frame and answers `None` on a frame that
+/// moved nothing**, which is what keeps the line off an idle frame without
+/// anything having to remember whether it was logged.
+#[test]
+fn an_idle_frame_is_told_there_is_nothing_new_to_report() {
+    let mut uploads = TextureUploads::without_device();
+    assert_eq!(
+        uploads.totals_if_moved(),
+        None,
+        "a renderer that has never uploaded anything offered a line to write",
+    );
+
+    // The only thing a device-less fixture can move is the ledger itself; move
+    // it the way `drain` does and check the report follows.
+    uploads.note_band_for_test(4096, true);
+    let first = uploads
+        .totals_if_moved()
+        .expect("a band moved and the ledger offered no line");
+    assert_eq!(first.bands, 1);
+    assert_eq!(first.staged_bytes, 4096);
+    assert_eq!(
+        uploads.totals_if_moved(),
+        None,
+        "the same totals were offered twice, so an idle frame would keep \
+         writing the line it already wrote",
+    );
+
+    uploads.note_band_for_test(2048, false);
+    let second = uploads
+        .totals_if_moved()
+        .expect("a second band moved and the ledger offered no line");
+    assert_eq!(second.bands, 2);
+    assert_eq!(second.blocking_bytes, 2048);
+    assert_eq!(
+        second.bytes(),
+        4096 + 2048,
+        "the two routes did not add up to what crossed",
+    );
+}
+
 /// A freed id stops being delivered, which is what bounds the set.
 #[test]
 fn freeing_an_id_takes_it_back_out_of_the_delivered_set() {

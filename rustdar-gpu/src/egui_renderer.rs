@@ -423,6 +423,20 @@ impl EguiRenderer {
     }
 
     /// Whether every texel egui handed over for `id` has reached the GPU.
+    /// What this renderer's texture uploads have moved, when anything has moved
+    /// since the last time this was asked. See
+    /// [`texture_upload::UploadTotals`], which also says what its denominator
+    /// is — **every** texture delta egui hands this renderer, not only the
+    /// overlay rasters.
+    pub fn upload_totals_if_moved(&mut self) -> Option<texture_upload::UploadTotals> {
+        self.uploads.totals_if_moved()
+    }
+
+    /// What this renderer's texture uploads have moved, asked unconditionally.
+    pub fn upload_totals(&self) -> texture_upload::UploadTotals {
+        self.uploads.totals()
+    }
+
     /// See [`texture_upload::TextureUploads::is_delivered`].
     pub fn is_delivered(&self, id: egui::TextureId) -> bool {
         self.uploads.is_delivered(id)

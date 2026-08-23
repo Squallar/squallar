@@ -147,3 +147,105 @@ fn four_panes_share_one_overlay_texture() {
         );
     }
 }
+
+/// Post a reply nothing is waiting for. `RendersInFlight::retire` answers
+/// stale, `retain` empties the pane list, and the picture is thrown away
+/// **before** `Context::load_texture` — the drop arm of the arrival path.
+fn deliver_unmarked(app: &mut crate::app::App, ctx: &egui::Context, pane_indices: Vec<usize>) {
+    let image = Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+        [W as usize, H as usize],
+        &rasterizer_output(),
+    ));
+    app.channels
+        .overlay_render_sender
+        .send(crate::channels::OverlayRenderResponse {
+            image: Some(image),
+            geo_bounds: bounds(),
+            overlay_kind: known::NWS_ALERTS,
+            generation: 7,
+            pane_indices,
+            zoom: 32,
+            hit_map: None,
+            frame: None,
+        })
+        .expect("the receiver lives on the App");
+    app.poll_overlay_render_results(ctx);
+}
+
+/// **The raster ledger's counters move on the real arrival path, and every
+/// arrival lands on exactly one side of the upload branch.**
+///
+/// Two arms, deliberately: a reply the cache is still waiting for, which
+/// becomes a picture, and a reply it is not, which is thrown away before the
+/// upload. Without the second the byte figure would be an assertion that
+/// *something* was counted rather than that the right thing was, and a path
+/// that had stopped dropping anything — counting every stale raster's bytes as
+/// uploaded — would pass.
+///
+/// **The deltas are `>=` and the balance is `==`, and that is not laziness.**
+/// The counters are process-global `static`s and this binary runs its tests in
+/// parallel, so another test's arrival can land between two readings here; a
+/// `==` on a delta would be asserting the harness's scheduling. The two things
+/// that survive that are asserted instead: a monotone counter can only be
+/// pushed *up* by a concurrent test, so a delta that must grow still fails if
+/// this path stopped counting; and `arrivals_balance` is a process-wide
+/// identity, so it holds under any interleaving and breaks the moment any
+/// arrival anywhere takes a third exit. The *exact* per-event figures are
+/// pinned where nothing is shared — `UploadTotals` is per renderer, see
+/// `the_upload_ledger_counts_every_byte_of_a_banded_raster_once`, and each
+/// Tier-2 browser leg is a fresh process.
+#[test]
+fn every_arrival_is_either_a_picture_or_a_drop() {
+    use rustdar_egui::overlay_cache::ledger;
+    let ctx = egui::Context::default();
+    let mut app = n_pane_app(1);
+    let _ = drain_uploads(&ctx);
+
+    let before = ledger::totals();
+
+    deliver(&mut app, &ctx, vec![0]);
+    let uploaded = placed(&mut app, 0);
+    let after_picture = ledger::totals();
+
+    assert!(
+        after_picture.arrived > before.arrived,
+        "a reply crossed the receiver and the ledger recorded no arrival",
+    );
+    assert!(
+        after_picture.pictures > before.pictures,
+        "the pixels reached `load_texture` and the ledger recorded no picture",
+    );
+    assert!(
+        after_picture.picture_bytes >= before.picture_bytes + u64::from(W * H * 4),
+        "a {W}x{H} RGBA picture was uploaded and the byte figure grew by less \
+         than its {} bytes, so it is not counting the picture's own size",
+        W * H * 4,
+    );
+    assert!(
+        after_picture.on_screen() > before.on_screen(),
+        "the picture went on screen and neither route counted it",
+    );
+
+    deliver_unmarked(&mut app, &ctx, vec![0]);
+    let after_drop = ledger::totals();
+
+    assert_eq!(
+        placed(&mut app, 0),
+        uploaded,
+        "the pane took a raster it had not asked for, so this arm is not \
+         exercising the drop it says it is",
+    );
+    assert!(
+        after_drop.dropped > after_picture.dropped,
+        "a stale raster was thrown away before the upload and the ledger \
+         recorded no drop, so its rasterized bytes are invisible",
+    );
+    assert!(
+        after_drop.arrivals_balance(),
+        "{} arrivals against {} pictures and {} drops: an arrival left the \
+         path by an exit neither counter names",
+        after_drop.arrived,
+        after_drop.pictures,
+        after_drop.dropped,
+    );
+}

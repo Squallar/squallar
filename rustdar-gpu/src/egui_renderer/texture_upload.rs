@@ -64,6 +64,78 @@ pub const DMA_BANDS_PER_FRAME: usize = crate::staging_ring::STAGING_RING_DEPTH;
 /// rather than a pane that never draws.
 const DECLINE_PATIENCE: u32 = 4;
 
+/// What this renderer's texture uploads have actually moved.
+///
+/// **Product telemetry, not a campaign instrument.** It is always on, it has no
+/// feature gate and no debug arm, and every field is a `u64` add on a path that
+/// was already touching the same cache line. The renderer owns one, so the
+/// numbers are scoped to a device and an adapter rather than to a process — the
+/// scope every other figure this module quotes is already in.
+///
+/// # Denominator
+///
+/// **Every texture delta egui hands this renderer**, not only the overlay
+/// rasters: the font atlas, the basemap tiles, the legend ramps and the cross
+/// sections are all in here. That is deliberate — this is the sink, and what it
+/// counts is what the device actually paid for. The overlay-attributable slice
+/// is a different instrument with a different denominator; see
+/// `rustdar_egui::overlay_cache::ledger`.
+///
+/// # Why a zero here is readable
+///
+/// [`Self::deltas`] is the non-vacuity floor. Every byte figure below is zero
+/// on a renderer that has been shown nothing, and zero is also what an upload
+/// path that had silently stopped moving bytes would read; the two are only
+/// distinguishable because a delta that was *filed* is counted whatever route
+/// it then took. `deltas == 0` is "egui handed this renderer nothing";
+/// `deltas > 0 && bytes() == 0` is a sink that stopped working. A gate that
+/// reads the byte total without reading this one cannot tell them apart —
+/// the lesson `worker_port::account` records for the reply transport.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UploadTotals {
+    /// Texture deltas filed, by any route. See the type's own note: this is
+    /// what makes a zero byte count readable.
+    pub deltas: u64,
+    /// Bytes handed straight to `Renderer::update_texture` — every delta at or
+    /// under [`UPLOAD_BAND_BYTES`] for an id this module does not own. Whole
+    /// on the frame's own queue, so they are on the GPU before anything draws
+    /// them.
+    pub unbanded_bytes: u64,
+    /// Bands [`TextureUploads::drain`] moved. The non-vacuity partner of the
+    /// two banded byte figures the way [`Self::deltas`] is of all of them: a
+    /// raster filed as bands but never drained shows `bands == 0` with the
+    /// delta counted.
+    pub bands: u64,
+    /// Of the banded bytes, those the copy engine pulled out of a staging slot
+    /// (see [`crate::staging_ring`]). Measured 24.7 GB/s against the BAR
+    /// window's 2.1 GB/s, and they cost the frame a memcpy rather than a
+    /// blocking host write.
+    pub staged_bytes: u64,
+    /// Of the banded bytes, those `write_texture` pushed through the BAR window
+    /// on the frame thread — a device with no ring, or a band that ran out of
+    /// [`DECLINE_PATIENCE`]. **This is the figure that is frame time**, and a
+    /// device with a ring is supposed to keep it near zero.
+    pub blocking_bytes: u64,
+}
+
+impl UploadTotals {
+    /// Every byte this renderer has put on the GPU, by any route.
+    pub fn bytes(&self) -> u64 {
+        self.unbanded_bytes + self.staged_bytes + self.blocking_bytes
+    }
+
+    /// Bytes that crossed as bands rather than whole.
+    pub fn banded_bytes(&self) -> u64 {
+        self.staged_bytes + self.blocking_bytes
+    }
+
+    /// How far along this ledger is, as one number, so a caller can tell
+    /// "nothing has happened since I last looked" in a single compare.
+    fn progress(&self) -> u64 {
+        self.deltas + self.bands
+    }
+}
+
 /// egui's texture deltas, moved across in bounded bands.
 pub struct TextureUploads {
     /// Built **eagerly**, at construction, on a device that can have one: the
@@ -87,6 +159,11 @@ pub struct TextureUploads {
     /// banded it" would be a hold that never ends. [`Self::free`] takes an id
     /// out as egui retires it, so this holds one key per live texture.
     delivered: HashSet<egui::TextureId>,
+    /// What this renderer has actually moved. See [`UploadTotals`].
+    totals: UploadTotals,
+    /// [`UploadTotals::progress`] at the last line [`Self::report`] logged, so
+    /// a frame that moved nothing costs one `u64` compare and says nothing.
+    reported: u64,
 }
 
 /// What is left of one texture's upload.
@@ -122,6 +199,8 @@ impl TextureUploads {
             owned: HashMap::new(),
             pending: VecDeque::new(),
             delivered: HashSet::new(),
+            totals: UploadTotals::default(),
+            reported: 0,
         }
     }
 
@@ -134,6 +213,8 @@ impl TextureUploads {
             owned: HashMap::new(),
             pending: VecDeque::new(),
             delivered: HashSet::new(),
+            totals: UploadTotals::default(),
+            reported: 0,
         }
     }
 
@@ -172,6 +253,10 @@ impl TextureUploads {
         delta: &egui::epaint::ImageDelta,
     ) {
         let egui::epaint::ImageData::Color(image) = &delta.image;
+        // Counted here rather than on either arm below, so that it counts the
+        // same thing whatever route the delta then takes. See [`UploadTotals`]:
+        // this is what makes a zero byte total readable.
+        self.totals.deltas += 1;
         // A queued band counts as ownership even before the drain allocates:
         // until then the renderer holds only the 1×1 stand-in.
         let mine = self.owned.contains_key(&id) || self.pending.iter().any(|band| band.id == id);
@@ -180,6 +265,7 @@ impl TextureUploads {
         // band go through `update_texture` untouched.
         if !mine && image.as_raw().len() <= UPLOAD_BAND_BYTES {
             renderer.update_texture(device, queue, id, delta);
+            self.totals.unbanded_bytes += image.as_raw().len() as u64;
             // Whole, on this frame's queue, before anything can draw it.
             self.delivered.insert(id);
             return;
@@ -328,6 +414,17 @@ impl TextureUploads {
             };
 
             if moved {
+                // Counted where the bytes move, and split by the route that
+                // moved them: `staged` cost the frame a memcpy, the other arm
+                // cost it a blocking host write. Two `u64` adds, no branch of
+                // their own.
+                self.totals.bands += 1;
+                let bytes = plan.bytes() as u64;
+                if staged {
+                    self.totals.staged_bytes += bytes;
+                } else {
+                    self.totals.blocking_bytes += bytes;
+                }
                 band.done += plan.rows;
                 band.declined = 0;
                 let done = band.done >= plan.height;
@@ -441,9 +538,49 @@ impl TextureUploads {
         self.delivered.insert(id);
     }
 
+    /// Record a moved band the way [`Self::drain`] does, with no device to
+    /// move it with — for the host test of the report's cadence. The real
+    /// arithmetic on a real adapter is
+    /// `the_upload_ledger_counts_every_byte_of_a_banded_raster_once`.
+    #[cfg(test)]
+    pub fn note_band_for_test(&mut self, bytes: u64, staged: bool) {
+        self.totals.bands += 1;
+        if staged {
+            self.totals.staged_bytes += bytes;
+        } else {
+            self.totals.blocking_bytes += bytes;
+        }
+    }
+
     /// The texture this module allocated for `id`, if it owns one.
     pub fn texture(&self, id: egui::TextureId) -> Option<&wgpu::Texture> {
         self.owned.get(&id)
+    }
+
+    /// What this renderer has moved since it was built. See [`UploadTotals`].
+    pub fn totals(&self) -> UploadTotals {
+        self.totals
+    }
+
+    /// [`Self::totals`], but only when something has moved since the last time
+    /// this was asked — so a caller can report the line on a frame that
+    /// uploaded something and stay silent on one that did not.
+    ///
+    /// **This crate cannot report the line itself**: `rustdar-gpu` declares no
+    /// `log` dependency and has never held a `log::` call. The counters
+    /// therefore live where the bytes move and the sentence lives where a
+    /// logger exists, which is the same split
+    /// `rustdar_volumetric::degrade::note_surface_loss_with_volume` already
+    /// uses for the surface-loss count.
+    ///
+    /// An idle frame costs one `u64` add and one compare.
+    pub fn totals_if_moved(&mut self) -> Option<UploadTotals> {
+        let progress = self.totals.progress();
+        if progress == self.reported {
+            return None;
+        }
+        self.reported = progress;
+        Some(self.totals)
     }
 }
 

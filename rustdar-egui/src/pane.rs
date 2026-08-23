@@ -3016,6 +3016,11 @@ impl PaneState {
                 continue;
             }
             if let Some(held) = cache.take_held_if_delivered(&delivered) {
+                // A promotion, counted where one happens rather than inside
+                // `show`: `show` is also how a first picture reaches the
+                // screen, and the two are different events. See
+                // [`crate::overlay_cache::ledger`].
+                crate::overlay_cache::ledger::note_promoted();
                 cache.show(held.data);
             }
         }
