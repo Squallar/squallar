@@ -57,41 +57,61 @@ impl LoopPoolLimits {
     }
 }
 
-/// **Bytes one overlay loop frame costs on a class whose textures stop at
-/// `raster_side_ceiling_px`, before any pane has measured its own.**
+/// **Bytes one overlay loop frame costs, before any pane has measured its
+/// own.**
 ///
 /// An overlay frame has no fixed side the way a radar loop frame does. It is
 /// the pane's own raster, planned from the pane rect and the overdraw margin
-/// by [`plan_overlay_texture`], so the device-class figure is that same
-/// planner run on this class's own default window
-/// ([`RENDER_WIDTH`] × [`RENDER_HEIGHT`]) at one physical pixel per point —
-/// the largest pane a single-pane layout gives. The model prices an overlay
-/// loop with the arithmetic that will really plan it rather than with a radar
-/// frame's side, and a pane that has rasterized once is priced off the texture
-/// it is actually drawing with instead (`app_render::overlay_frame_bytes`).
+/// by [`plan_overlay_texture`], so the pre-measurement figure is that same
+/// planner run on the default window ([`RENDER_WIDTH`] × [`RENDER_HEIGHT`]) —
+/// the largest pane a single-pane layout gives. Those two are **physical
+/// pixels**, and the planner's own input is `screen_rect × pixels_per_point`,
+/// also physical pixels, so a density of 1.0 here is the whole window and not
+/// a 1x assumption about the display. A pane that has rasterized once is
+/// priced off the texture it is actually drawing with instead
+/// (`app_render::overlay_frame_bytes`).
 ///
-/// Measured, this build, against a radar plan-view frame on the same arm:
+/// 1920 × 1.5 = 2880 and 1080 × 1.5 = 1620 at the full `OVERDRAW_FRACTION`, so
+/// a frame is **18,662,400 B (18.66 MB)** — against a radar plan-view frame's
+/// 4 MiB on wasm and 16 MiB on both native arms.
 ///
-/// | arm | limit | plan | overlay | radar plan-view |
-/// |---|---:|---|---:|---:|
-/// | wasm | 2048 | 2048×1152 | **9.44 MB** | 4 MiB |
-/// | mobile | 4096 | 2880×1620 | **18.66 MB** | 16 MiB |
-/// | desktop | 8192 | 2880×1620 | **18.66 MB** | 16 MiB |
+/// **No device-class ceiling is applied, and that is the correction.** The
+/// planner's only clamp is `InputState::max_texture_side`, which
+/// `EguiRenderer::new` fills from `device.limits().max_texture_dimension_2d`;
+/// on the web `rustdar_gpu::device::device_limits` is
+/// `downlevel_webgl2_defaults().using_resolution(adapter)`, and
+/// `using_resolution` copies the adapter's 2D resolution **verbatim**. Nothing
+/// on the overlay path is ever held to `raster_side_ceiling_px` — that is the
+/// cap on *static plan-view radar* rasters, which must upload on every browser
+/// — and WebGL2's 2048 is a guarantee the adapter is at **least** that, not a
+/// cap that it is at most that. Firefox reports 32768 on a real driver.
 ///
-/// The wasm row is smaller than the other two because a 1920-point width is
-/// already 94% of a 2048 texture limit, so the overdraw is clamped to 0.033
-/// there rather than the 0.25 the other two afford.
+/// Planning this against the wasm arm's 2048 was therefore a **1.98×
+/// under-price on every browser whose adapter clears 2880 px**, which is every
+/// browser on a real driver and both software rasterisers besides:
+/// 2048×1152×4 = 9,437,184 B charged for a texture that is really 18,662,400 B.
+/// The two native arms were already right, because 4096 and 8192 both afford
+/// the whole margin and clamp nothing.
+///
+/// An adapter that really does stop at 2048 is now over-priced by that same
+/// factor. That costs it loop frames rather than over-committing its memory,
+/// and it is the only side of the error a budget resolved without probing the
+/// machine may be on.
 ///
 /// [`plan_overlay_texture`]: rustdar_egui::overlay_cache::plan_overlay_texture
+/// [`OVERDRAW_FRACTION`]: rustdar_egui::overlay_cache::OVERDRAW_FRACTION
 /// [`RENDER_WIDTH`]: rustdar_device_profile::constants::RENDER_WIDTH
 /// [`RENDER_HEIGHT`]: rustdar_device_profile::constants::RENDER_HEIGHT
-pub fn nominal_overlay_frame_bytes(raster_side_ceiling_px: usize) -> usize {
+pub fn nominal_overlay_frame_bytes() -> usize {
     let plan = rustdar_egui::overlay_cache::plan_overlay_texture(
         egui::Rect::from_min_size(
             egui::Pos2::ZERO,
             egui::vec2(RENDER_WIDTH as f32, RENDER_HEIGHT as f32),
         ),
-        u32::try_from(raster_side_ceiling_px).unwrap_or(u32::MAX),
+        // Not a class ceiling. The largest side any adapter could impose, so
+        // the margin is the full `OVERDRAW_FRACTION` and the answer is the
+        // maximum over every adapter rather than one adapter's.
+        u32::MAX,
         1.0,
     );
     plan.width as usize * plan.height as usize * 4
@@ -128,15 +148,7 @@ impl LoopFrameModel {
             section: rustdar_radar::xsect::SECTION_WIDTH * rustdar_radar::xsect::SECTION_HEIGHT * 4,
             grid: rustdar_volumetric::raymarch::resident_grid_bytes(VOLUME_GRID_CELLS)
                 .unwrap_or(usize::MAX),
-            overlay: nominal_overlay_frame_bytes(
-                // The floor: this is the unpromoted model, the one
-                // `the_compiled_model_is_one_of_the_named_arms` matches
-                // against the three shipped arms. A promoted device is priced
-                // through `from_budgets` off its resolved figure instead.
-                rustdar_device_profile::budget::BudgetLimits::for_target()
-                    .raster_side_ceiling_px
-                    .floor,
-            ),
+            overlay: nominal_overlay_frame_bytes(),
             render_budget: MAX_LOOP_RENDER_BUDGET,
         }
     }
@@ -152,7 +164,7 @@ impl LoopFrameModel {
             // overflow).
             grid: rustdar_volumetric::raymarch::resident_grid_bytes(budgets.grid_cells)
                 .unwrap_or(usize::MAX),
-            overlay: nominal_overlay_frame_bytes(budgets.raster_side_ceiling_px),
+            overlay: nominal_overlay_frame_bytes(),
             render_budget: budgets.loop_render_budget,
         }
     }

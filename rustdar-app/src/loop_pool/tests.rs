@@ -29,7 +29,6 @@ fn model(
     loop_image_size: usize,
     section_width: usize,
     grid: [u32; 3],
-    raster_side_ceiling: usize,
     render_budget: usize,
 ) -> LoopFrameModel {
     LoopFrameModel {
@@ -37,7 +36,7 @@ fn model(
         section: section_width * (section_width / 2) * 4,
         grid: rustdar_volumetric::raymarch::resident_grid_bytes(grid)
             .expect("a shipped grid shape"),
-        overlay: crate::loop_pool::nominal_overlay_frame_bytes(raster_side_ceiling),
+        overlay: crate::loop_pool::nominal_overlay_frame_bytes(),
         render_budget,
     }
 }
@@ -50,7 +49,6 @@ fn arms() -> [Arm; 3] {
                 WASM_LOOP_IMAGE_SIZE,
                 WASM_SECTION_WIDTH,
                 WASM_VOLUME_GRID_CELLS,
-                rustdar_device_profile::constants::WASM_RASTER_SIDE_CEILING,
                 WASM_MAX_LOOP_RENDER_BUDGET,
             ),
             limits: LoopPoolLimits {
@@ -66,7 +64,6 @@ fn arms() -> [Arm; 3] {
                 MOBILE_LOOP_IMAGE_SIZE,
                 NATIVE_SECTION_WIDTH,
                 MOBILE_VOLUME_GRID_CELLS,
-                rustdar_device_profile::constants::MOBILE_RASTER_SIDE_CEILING,
                 MOBILE_MAX_LOOP_RENDER_BUDGET,
             ),
             limits: LoopPoolLimits {
@@ -82,7 +79,6 @@ fn arms() -> [Arm; 3] {
                 DESKTOP_LOOP_IMAGE_SIZE,
                 NATIVE_SECTION_WIDTH,
                 DESKTOP_VOLUME_GRID_CELLS,
-                rustdar_device_profile::constants::DESKTOP_RASTER_SIDE_CEILING,
                 DESKTOP_MAX_LOOP_RENDER_BUDGET,
             ),
             limits: LoopPoolLimits {
@@ -476,7 +472,6 @@ fn a_pane_that_flickers_inside_the_dwell_changes_nothing() {
         DESKTOP_LOOP_IMAGE_SIZE,
         NATIVE_SECTION_WIDTH,
         DESKTOP_VOLUME_GRID_CELLS,
-        rustdar_device_profile::constants::DESKTOP_RASTER_SIDE_CEILING,
         30,
     );
     let limits = LoopPoolLimits {
@@ -529,7 +524,6 @@ fn a_growth_has_to_clear_the_dead_band_but_a_shrink_does_not() {
         DESKTOP_LOOP_IMAGE_SIZE,
         NATIVE_SECTION_WIDTH,
         DESKTOP_VOLUME_GRID_CELLS,
-        rustdar_device_profile::constants::DESKTOP_RASTER_SIDE_CEILING,
         30,
     );
     let limits = LoopPoolLimits {
@@ -657,29 +651,33 @@ fn an_empty_demand_is_the_single_loop_answer() {
     }
 }
 
-/// **What an overlay loop frame costs on each arm, pinned to its arithmetic and
-/// not to the function that computes it.**
+/// **What an overlay loop frame costs, pinned to its arithmetic and not to the
+/// function that computes it.**
 ///
 /// `LoopFrameModel::overlay` is the one price in the model that is not a fixed
-/// side: it is the pane's own raster, so the class figure is
-/// `plan_overlay_texture` run on the class's default window
-/// (`RENDER_WIDTH` × `RENDER_HEIGHT` = 1920 × 1080 points) at 1x against that
-/// class's `raster_side_ceiling_px`. The numbers below are that arithmetic
-/// written out:
+/// side: it is the pane's own raster, so the figure is `plan_overlay_texture`
+/// run on the default window (`RENDER_WIDTH` × `RENDER_HEIGHT` = 1920 × 1080
+/// **physical pixels**) with **no class ceiling applied** — see
+/// `nominal_overlay_frame_bytes` for why the overlay planner is bounded by the
+/// adapter's own `max_texture_side` and never by `raster_side_ceiling_px`. The
+/// whole `OVERDRAW_FRACTION` of 0.25 is afforded, so 1920 × 1.5 = 2880 and
+/// 1080 × 1.5 = 1620 → 2880 × 1620 × 4 = **18,662,400 B**, on every arm.
 ///
-/// * **mobile and desktop** afford the whole `OVERDRAW_FRACTION` of 0.25, so
-///   1920 × 1.5 = 2880 and 1080 × 1.5 = 1620 → 2880 × 1620 × 4 =
-///   **18,662,400 B**, against a 4096 and an 8192 limit respectively;
-/// * **wasm** is clamped by WebGL2's 2048: a 1920-point width is already 94% of
-///   it, so the affordable overdraw is (2048/1920 − 1)/2 = 0.0333 and the plan
-///   is 2048 × 1152 × 4 = **9,437,184 B**.
+/// **The figure no longer varies by arm, so pinning it per arm would be one
+/// assertion written three times.** The two regressions it has to catch are
+/// named as values instead, which is the whole point of the test:
 ///
-/// **The second block is the load-bearing one.** Before WB-7 an overlay frame
-/// was priced as a radar plan-view frame — `Budgets::loop_frame_bytes()` — and
-/// every consumer of the overlay arm reads it back off the model, so a suite
-/// that only compared the model with itself would pass with the two identical.
-/// The two figures are 4 MiB against 9.44 MB on wasm and 16 MiB against
-/// 18.66 MB on both native arms, and they must stay different numbers.
+/// * **A class ceiling put back.** Planning against the wasm arm's 2048 gives
+///   2048 × 1152 × 4 = 9,437,184 B, and that was the defect: a 1.98×
+///   under-price on every browser whose adapter clears 2880 px, which is every
+///   browser on a real driver. The wrong answer is asserted against by name
+///   rather than left to be unreachable.
+/// * **An overlay priced as radar.** Before WB-7 an overlay frame was priced as
+///   a radar plan-view frame — `Budgets::loop_frame_bytes()` — and every
+///   consumer of the overlay arm reads it back off the model, so a suite that
+///   only compared the model with itself would pass with the two identical. The
+///   figures are 4 MiB on wasm and 16 MiB on both native arms against
+///   18.66 MB, and they must stay different numbers.
 ///
 /// **Floor — `price_the_overlay_as_radar`: make `LoopFrameModel::from_budgets`
 /// and `for_target` answer `budgets.loop_frame_bytes()`.** Both blocks red on
@@ -688,25 +686,20 @@ fn an_empty_demand_is_the_single_loop_answer() {
 #[test]
 fn an_overlay_frame_is_priced_by_the_planner_and_is_not_a_radar_frame() {
     use crate::loop_pool::nominal_overlay_frame_bytes;
-    use rustdar_device_profile::constants::{
-        DESKTOP_RASTER_SIDE_CEILING, MOBILE_RASTER_SIDE_CEILING, WASM_RASTER_SIDE_CEILING,
-    };
 
     assert_eq!(
-        nominal_overlay_frame_bytes(DESKTOP_RASTER_SIDE_CEILING),
+        nominal_overlay_frame_bytes(),
         2880 * 1620 * 4,
-        "desktop: 1920x1080 points at the full 0.25 overdraw is 2880x1620",
+        "1920x1080 physical pixels at the full 0.25 overdraw is 2880x1620",
     );
-    assert_eq!(
-        nominal_overlay_frame_bytes(MOBILE_RASTER_SIDE_CEILING),
-        2880 * 1620 * 4,
-        "mobile: a 4096 limit affords the full overdraw too",
-    );
-    assert_eq!(
-        nominal_overlay_frame_bytes(WASM_RASTER_SIDE_CEILING),
+    assert_ne!(
+        nominal_overlay_frame_bytes(),
         2048 * 1152 * 4,
-        "wasm: the 2048 WebGL2 limit binds the width and cuts the overdraw to \
-         0.0333",
+        "an overlay frame is being planned against a 2048 texture limit again. \
+         WebGL2's 2048 is a guarantee the adapter accepts at least that, not a \
+         cap that it accepts at most that, and `device_limits` copies the \
+         adapter's own resolution verbatim — so this under-prices by 1.98x \
+         every browser whose adapter clears 2880 px",
     );
 
     for arm in arms() {
@@ -751,7 +744,7 @@ mod budget_agreement {
                 plan_view: arm.loop_frame_bytes(),
                 section: arm.section_frame_bytes(),
                 grid: volume_bytes(&arm),
-                overlay: crate::loop_pool::nominal_overlay_frame_bytes(arm.raster_side_ceiling_px),
+                overlay: crate::loop_pool::nominal_overlay_frame_bytes(),
                 render_budget: arm.loop_render_budget,
             };
             let limits = LoopPoolLimits {
