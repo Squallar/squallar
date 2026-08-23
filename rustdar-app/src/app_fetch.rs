@@ -2819,12 +2819,53 @@ pub(super) fn fetch_config_for_layer(
     mut config: rustdar_overlays::render::overlay_state::FetchConfig,
 ) -> rustdar_overlays::render::overlay_state::FetchConfig {
     config.as_of = as_of_for_layer(gui, pane_idx, id, config.as_of);
-    config.depicted_span_secs = depicted_span_for_layer(gui, pane_idx, id);
+    config.depicted_span_secs = depicted_reach_for_layer(gui, pane_idx, id);
     config.depicted_frames = depicted_frames_for_layer(gui, pane_idx, id);
     config
 }
 
-/// **The span half of [`as_of_for_layer`], under the same two predicates.**
+/// **The instants this pane's clock can stop on**, ascending — the frames its
+/// transport holds, and the instant it depicts. Empty on a live pane.
+///
+/// **And, when the transport holds no frames yet, the edges of the window it
+/// was ARMED over.** That is the whole of what this fixes. Between
+/// `handle_enable_loop` and the transport's listing landing, and on any
+/// `AsOf` pane whose loop is still being built, the frame list is empty — and
+/// the span read there used to be `PaneTimePosture::span_secs`, the Lookback
+/// slider. A satellite transport raises the window its loop is listed over to
+/// its own `SourceHandler::min_loop_span_secs` floor through
+/// `Gui::loop_span_secs_for`, so the slider reads one hour while the loop is
+/// armed over twelve, and a poll in that window was told one hour for a
+/// twelve-hour loop. `LayerTimeState::span_secs` is the width the listing was
+/// actually asked over, which is the raised figure.
+///
+/// A pane with no loop armed has no raised figure and no frames, and its own
+/// posture is the reach — a parked scrub, where the slider genuinely is the
+/// answer.
+fn depicted_stops(pane: &rustdar_egui::pane::PaneState) -> Vec<chrono::NaiveDateTime> {
+    let Some(instant) = pane.time.mode.as_of() else {
+        return Vec::new();
+    };
+    let ls = pane.transport_state();
+    if !ls.frames.is_empty() {
+        let mut stops: Vec<chrono::NaiveDateTime> =
+            ls.frames.iter().map(|frame| frame.timestamp).collect();
+        stops.push(instant);
+        stops.sort_unstable();
+        stops.dedup();
+        return stops;
+    }
+    let span = if ls.is_active() {
+        ls.span_secs
+    } else {
+        pane.time.span_secs
+    };
+    vec![instant - chrono::Duration::seconds(span as i64), instant]
+}
+
+/// **The span half of [`as_of_for_layer`], under the same two predicates** —
+/// how wide the window this pane depicts is, measured over the instants its
+/// clock can stop on rather than over the Lookback slider.
 ///
 /// A pane on [`TimeMode::AsOf`] — parked or playing a loop — hands `as_of`
 /// one *sampled* instant of a clock that sweeps its whole timeline span
@@ -2834,15 +2875,22 @@ pub(super) fn fetch_config_for_layer(
 /// clock — a live pane, an absent pane, any other time axis — so those
 /// configs stay byte-for-byte what they always were.
 ///
+/// **The reach is [`depicted_stops`]'s extent**, which is where the defect
+/// this replaced lived: it read `PaneTimePosture::span_secs`, and that is the
+/// slider rather than the window the loop was armed over. `Residency` measures
+/// the extent because a set of stops is what it is a type for — a caller
+/// wanting the outermost instants of a stop set asks it, so there is one
+/// expression of "how far does this reach" and not a hand-written min/max
+/// beside it.
+///
 /// [`TimeMode::AsOf`]: rustdar_egui::pane::TimeMode::AsOf
 /// [`TimeAxis::EventLifetime`]: rustdar_source::time::TimeAxis::EventLifetime
-fn depicted_span_for_layer(
+fn depicted_reach_for_layer(
     gui: &rustdar_egui::Gui,
     pane_idx: usize,
     id: &rustdar_source::id::LayerId,
 ) -> Option<u64> {
     let pane = gui.pane(pane_idx)?;
-    pane.time.mode.as_of()?;
     let event_lifetime = gui.overlays.handlers().any(|handler| {
         handler.id() == *id
             && matches!(
@@ -2850,14 +2898,21 @@ fn depicted_span_for_layer(
                 rustdar_source::time::TimeAxis::EventLifetime
             )
     });
-    event_lifetime.then_some(pane.time.span_secs)
+    if !event_lifetime {
+        return None;
+    }
+    let stops = depicted_stops(pane);
+    let (oldest, newest) =
+        rustdar_source::time::Residency::over(stops.into_iter().map(|stop| (stop, stop)))
+            .extent()?;
+    Some((newest - oldest).num_seconds().max(0) as u64)
 }
 
 /// **The instants half of [`as_of_for_layer`], under the same two predicates**:
 /// the frames this pane's transport holds, which are the only instants a
 /// playing loop ever stops on.
 ///
-/// [`depicted_span_for_layer`] answers *how wide*; this answers *where*, and
+/// [`depicted_reach_for_layer`] answers *how wide*; this answers *where*, and
 /// the two are different numbers the moment a loop's frames sit further apart
 /// than an [`TimeAxis::EventLifetime`] layer's own window. The Lookback slider
 /// names one span for the whole application, and a layer whose frames are an

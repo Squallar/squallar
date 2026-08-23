@@ -174,9 +174,13 @@ fn a_live_panes_fetch_keeps_the_wall_clock_for_every_layer() {
 /// two-hour loop on one frame.
 ///
 /// **Floor — `span_for_every_layer`: drop the `EventLifetime` test from
-/// `depicted_span_for_layer`.** Every non-event layer then reads `Some(7200)`
+/// `depicted_reach_for_layer`.** Every non-event layer then reads `Some(7200)`
 /// where it must read `None`, and the count assertion is what refuses a
-/// `depicted_span_for_layer` that answers the span unconditionally.
+/// `depicted_reach_for_layer` that answers the span unconditionally.
+///
+/// This pane has **no loop armed**, so the reach is its own posture — the
+/// Lookback slider — and the figure is unchanged by the loop-window read that
+/// `a_poll_before_the_first_listing_asks_for_the_loops_window` pins.
 #[test]
 fn a_pane_on_a_loops_clock_hands_its_span_to_the_as_of_dependent_layers_only() {
     let mut gui = Gui::new();
@@ -367,5 +371,97 @@ fn base_config(
         as_of: clock,
         depicted_span_secs: None,
         depicted_frames: Vec::new(),
+    }
+}
+
+/// **The acceptance for the loop's own window.** A poll landing between
+/// `handle_enable_loop` and the transport's listing is told the window the
+/// loop was **armed** over, not the Lookback slider.
+///
+/// The slider names one span for the whole application; a transport layer
+/// raises the window its loop is listed over to its own `min_loop_span_secs`
+/// floor through `Gui::loop_span_secs_for`, so a satellite loop is armed over
+/// twelve hours while the slider still reads one. `depicted_frames` is empty
+/// in this window — the listing has not landed — so `DepictedWindow` falls
+/// through to the span, and the span was the slider's hour. A GLM poll was
+/// told 1 h for a 12 h loop, and `cache.evict_before(cutoff)` was anchored an
+/// eleven hours too late.
+#[test]
+fn a_poll_before_the_first_listing_asks_for_the_loops_window() {
+    const SLIDER: u64 = 3600;
+    const ARMED: u64 = 12 * 3600;
+
+    let mut gui = Gui::new();
+    let transport = LayerId::new("test/satellite-transport");
+    {
+        let pane = gui.pane_mut(0).expect("pane 0");
+        pane.time.span_secs = SLIDER;
+        pane.set_transport_layer(transport.clone());
+        let ls = pane.transport_state_mut();
+        // The state `arm_layer_loop` leaves behind: the window is recorded,
+        // the listing is in the air, and no frame has been built yet.
+        ls.phase = rustdar_egui::pane::LoopPhase::FetchingScanList;
+        ls.span_secs = ARMED;
+        pane.set_time_mode(TimeMode::AsOf(ts(30)));
+        assert!(
+            pane.transport_state().frames.is_empty(),
+            "premise: this is the window before the first listing lands, so \
+             `depicted_frames` cannot answer and the span is what is read",
+        );
+    }
+    let clock = ts(45);
+
+    let events: Vec<LayerId> = declared(&gui)
+        .into_iter()
+        .filter(|(_, axis)| matches!(axis, TimeAxis::EventLifetime))
+        .map(|(id, _)| id)
+        .collect();
+    assert!(
+        events.len() >= 2,
+        "non-triviality: the claim is about the as-of-dependent layers, and \
+         there must be some",
+    );
+    for id in &events {
+        assert_eq!(
+            fetch_config_for_layer(&gui, 0, id, base_config(clock)).depicted_span_secs,
+            Some(ARMED),
+            "{} was told the slider's {SLIDER}s for a loop armed over {ARMED}s",
+            id.as_str(),
+        );
+    }
+}
+
+/// **The floor.** A pane with **no** loop armed still reads exactly what it
+/// read before — its own posture — so "always take the timeline's span" cannot
+/// pass the acceptance above.
+///
+/// An inactive timeline's `span_secs` is whatever the last loop left in it, and
+/// a pane that has never looped reads zero: taking it unconditionally would
+/// silently narrow a parked scrub's poll to nothing.
+#[test]
+fn a_parked_pane_with_no_loop_still_asks_for_its_own_span() {
+    const SLIDER: u64 = 7200;
+
+    let mut gui = Gui::new();
+    {
+        let pane = gui.pane_mut(0).expect("pane 0");
+        pane.time.span_secs = SLIDER;
+        // A timeline left behind by a loop that has been switched off: the
+        // width is still recorded and must NOT be read.
+        let ls = pane.transport_state_mut();
+        ls.phase = rustdar_egui::pane::LoopPhase::Inactive;
+        ls.span_secs = 12 * 3600;
+        pane.set_time_mode(TimeMode::AsOf(ts(30)));
+    }
+    let clock = ts(45);
+
+    for (id, axis) in declared(&gui) {
+        let want = matches!(axis, TimeAxis::EventLifetime).then_some(SLIDER);
+        assert_eq!(
+            fetch_config_for_layer(&gui, 0, &id, base_config(clock)).depicted_span_secs,
+            want,
+            "{} on a pane with no loop must read its own posture",
+            id.as_str(),
+        );
     }
 }
