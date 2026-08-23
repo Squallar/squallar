@@ -1103,6 +1103,81 @@ return { attached: attached, different: different, off_frame: off_frame,
          console_total: C.length };
 """
 
+# Which backend the APP settled on, read out of its own startup log.
+#
+# This is the only observable answer, and it is not the same question the
+# WEBGPU_PROBE below asks. That one says what the BROWSER can do; this says what
+# the build DID -- the choice is made inside `App::create_instance` by a
+# `requestAdapter()` nothing page-side repeats, and once made, WebGPU and WebGL2
+# draw the same picture at different ceilings. A run that quotes a cap without
+# naming the API that produced it is quoting an adapter it did not identify.
+#
+# Two lines, both `log::info!` from `rustdar_app::app_state`:
+#   backend  -- "wgpu selected the <Backend> backend: <name> (<DeviceType>), ..."
+#   ceiling  -- "plan views may reach <N> px: this device reports <M> px 2D
+#               textures (the <A> px adapter offered), ..."
+# The second is what shows the limit was REQUESTED rather than accepted: device
+# and adapter figures agreeing is the property, and on WebGPU the default would
+# be 8192 regardless of what the adapter offered.
+APP_BACKEND_PROBE = r"""
+var C = window.__rig_console || [];
+var backend = null, ceiling = null;
+for (var i = 0; i < C.length; i++) {
+  var m = String(C[i].msg || "");
+  if (m.indexOf("wgpu selected the ") !== -1) backend = m;
+  if (m.indexOf("plan views may reach ") !== -1) ceiling = m;
+}
+return { backend: backend, raster_ceiling: ceiling, console_total: C.length };
+"""
+
+
+def wait_app_backend(session, timeout=60.0, interval=0.5):
+    """The app's own backend AND ceiling lines, polled until both appear.
+
+    Polled rather than read once because the renderer is stood up
+    asynchronously: `booted` is reported before `AppState::new` has met an
+    adapter. BOTH lines are waited for, not just the first: `request_device`
+    sits between them and on the WebGPU backend it is a JS promise, so a probe
+    that stops at the backend line lands in the gap and reports a null ceiling
+    perhaps half the time. Measured: one chromium WebGPU leg answered at
+    `console_total` 12 with the ceiling still unlogged.
+
+    A miss is not fatal -- what is found is reported and what is not is `null`,
+    so a cap then carries no API name. That is worse than a slow answer and
+    still not a failure of the leg."""
+    t0 = time.monotonic()
+    found = {}
+    while time.monotonic() - t0 < timeout:
+        last = session.execute(APP_BACKEND_PROBE) or {}
+        # Accumulated across polls: the ring evicts, and a line seen once is
+        # seen.
+        for key in ("backend", "raster_ceiling"):
+            if not found.get(key) and last.get(key):
+                found[key] = last[key]
+        found["console_total"] = last.get("console_total")
+        if found.get("backend") and found.get("raster_ceiling"):
+            found["waited_s"] = round(time.monotonic() - t0, 2)
+            return found
+        time.sleep(interval)
+    found["waited_s"] = round(time.monotonic() - t0, 2)
+    missing = [k for k in ("backend", "raster_ceiling") if not found.get(k)]
+    found["error"] = ("the app never logged %s within %.0fs"
+                      % (" and ".join(missing), timeout))
+    return found
+
+
+def app_backend_name(app):
+    """`Gl`, `BrowserWebGpu`, ... out of the app's own log line, or None."""
+    line = (app or {}).get("backend") or ""
+    head = "wgpu selected the "
+    i = line.find(head)
+    if i < 0:
+        return None
+    rest = line[i + len(head):]
+    j = rest.find(" backend")
+    return rest[:j] if j > 0 else None
+
+
 GLOBAL_PROBE = """
 var parts = String(arguments[0]).split('.');
 var o = window;
@@ -1591,6 +1666,14 @@ def run_smoke(args):
               visibility=env0.get("visibility"))
         result["nav_timing"] = session.execute(NAV_TIMING_PROBE)
 
+        # Early, and before the 180 s worker-wire waits: serve.py's console ring
+        # holds 1200 entries and a live-network leg can push a startup line out
+        # of it.
+        stage("app-backend-wait")
+        result["app_backend"] = wait_app_backend(session)
+        stage("app-backend", backend=app_backend_name(result["app_backend"]),
+              waited=result["app_backend"].get("waited_s"))
+
         if args.poll_global:
             stage("poll-global", name=args.poll_global)
             try:
@@ -1864,6 +1947,13 @@ def run_smoke(args):
              env.get("max_renderbuffer_size"),
              env.get("hardware_concurrency"), env.get("device_memory")))
     print("[%s] SUMMARY [%s] webgpu: %s" % (tag, alabel, webgpu_s))
+    app = result.get("app_backend") or {}
+    print("[%s] SUMMARY [%s] app selected backend=%s"
+          % (tag, alabel, app_backend_name(app) or ("UNKNOWN: %s"
+             % (app.get("error") or "not logged"))))
+    for key in ("backend", "raster_ceiling"):
+        if app.get(key):
+            print("[%s] SUMMARY [%s]   %s" % (tag, alabel, app[key]))
     if v.get("hardware_ok") is False:
         print("[%s] SUMMARY HARDWARE ARM FAILED: adapter is %s, not a GPU"
               % (tag, alabel))

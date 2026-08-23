@@ -40,6 +40,14 @@
 #   RIG_FRAMES        rAF deltas per sample (default 120)
 #   RIG_BROWSERS      "chromium firefox" (default), or a subset
 #   RIG_EXPECT_TIMEOUT  seconds for the worker-wire assertions (default 180)
+#
+# BACKEND: each leg prints the backend the APP selected, scraped from its own
+# `wgpu selected the <Backend> backend` startup line. That is a different fact
+# from the `webgpu=` cap line beside it: the latter says what the browser
+# offers, the former what the build took. Since WS4 the build asks for
+# `BROWSER_WEBGPU | GL` and wgpu's detecting constructor settles it with a real
+# requestAdapter(), so a browser that exposes `navigator.gpu` and answers null
+# reports `webgpu=object-but-no-adapter` and `app selected backend=Gl`.
 #   RIG_DRIVE_EXTRA   extra args appended to every drive.py call
 #   RIG_SERVE_EXTRA   extra args appended to every serve.py launch
 #
@@ -316,6 +324,21 @@ for tag in sys.argv[2:]:
           % ("", ad.get("renderer") or env.get("gl_renderer") or "?",
              env.get("max_texture_size"), env.get("max_3d_texture_size"),
              env.get("hardware_concurrency"), webgpu))
+    # WHICH API the app ended up on, from its own startup log. `webgpu=` above
+    # is what the BROWSER offers; this is what the BUILD took. They differ on
+    # every browser where requestAdapter() answers null.
+    app = r.get("app_backend") or {}
+    line = app.get("backend") or ""
+    head = "wgpu selected the "
+    i = line.find(head)
+    sel = "UNKNOWN"
+    if i >= 0:
+        rest = line[i + len(head):]
+        j = rest.find(" backend")
+        sel = rest[:j] if j > 0 else rest
+    print("%-18s   app selected backend=%s" % ("", sel))
+    if app.get("raster_ceiling"):
+        print("%-18s   %s" % ("", app["raster_ceiling"]))
     print("%-18s   isolation crossOriginIsolated=%s SAB=%s sw_blocked=%s "
           "sw_regs=%s resource_failures=%s"
           % ("", env.get("cross_origin_isolated"),
