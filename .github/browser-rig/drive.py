@@ -1104,6 +1104,19 @@ var rayon_re = /rayon: (\d+) threads/;
 // TOTALS, so the newest line is the whole answer and an older one is a prefix
 // of it. Scanning forward and overwriting is what makes that true.
 var transport_re = /transport: (\d+) replies, (\d+) B out with (\d+) B copied out of the worker, (\d+) B in with (\d+) B copied out of this page/;
+// The two raster-telemetry lines, written once a frame by
+// `App::report_raster_telemetry` and only on a frame where something moved.
+// Running totals, so the LAST match wins here for the same reason it does for
+// `transport` above.
+//
+// They are kept SEPARATE and are never added, because their denominators are
+// different: `rasters` is the whole-picture overlay dispatch only, `uploads` is
+// every texture delta the renderer was shown -- font atlas, basemap tiles and
+// radar included. A single "bytes uploaded" figure over the union would
+// describe neither, and would move when the mix moved.
+var rasters_re = /overlay rasters: (\d+) dispatched, (\d+) arrived, (\d+) pictures of (\d+) B, (\d+) shown, (\d+) promoted, (\d+) dropped, (\d+) superseded/;
+var uploads_re = /texture uploads: (\d+) deltas, (\d+) B to the GPU, (\d+) B unbanded, (\d+) bands, (\d+) B staged, (\d+) B blocking/;
+var rasters = null, uploads = null;
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
   if (m.indexOf("rasterization worker attached") !== -1) attached.push(C[i].t);
@@ -1128,10 +1141,27 @@ for (var i = 0; i < C.length; i++) {
                         out_copied: parseInt(tm[3], 10),
                         in_moved: parseInt(tm[4], 10),
                         in_copied: parseInt(tm[5], 10) };
+  var rm2 = rasters_re.exec(m);
+  if (rm2) rasters = { dispatched: parseInt(rm2[1], 10),
+                       arrived: parseInt(rm2[2], 10),
+                       pictures: parseInt(rm2[3], 10),
+                       picture_bytes: parseInt(rm2[4], 10),
+                       shown: parseInt(rm2[5], 10),
+                       promoted: parseInt(rm2[6], 10),
+                       dropped: parseInt(rm2[7], 10),
+                       superseded: parseInt(rm2[8], 10) };
+  var um = uploads_re.exec(m);
+  if (um) uploads = { deltas: parseInt(um[1], 10),
+                      bytes: parseInt(um[2], 10),
+                      unbanded_bytes: parseInt(um[3], 10),
+                      bands: parseInt(um[4], 10),
+                      staged_bytes: parseInt(um[5], 10),
+                      blocking_bytes: parseInt(um[6], 10) };
 }
 return { attached: attached, different: different, off_frame: off_frame,
          off_frame_by_kind: by_kind, rayon_threads: rayon,
-         transport: transport, console_total: C.length };
+         transport: transport, rasters: rasters, uploads: uploads,
+         console_total: C.length };
 """
 
 # Which backend the APP settled on, read out of its own startup log.
@@ -1382,6 +1412,94 @@ def wait_zero_copy_replies(session, timeout=180.0, interval=2.0):
                  "every other Tier-2 assertion)" % (timeout, best),
     })
     return out
+
+
+def wait_overlay_rasters(session, timeout=180.0, interval=2.0):
+    """WS2 baseline: the whole-picture overlay path really ran in THIS browser.
+
+    Until this existed nothing in the rig read the overlay pipeline at all: a
+    4/4 PASS said the build was unbroken and said nothing whatever about
+    overlay uploads. Every tile-grid figure produced for WS2 so far is a policy
+    simulation over a model of this path, and this is what makes the real thing
+    observable per browser.
+
+    Five conjuncts, and each can fail on its own. That is the point: a gate
+    with one conjunct on a byte total goes green on a page that never enabled a
+    texture layer, because `0 B` is what both the working-but-idle and the
+    never-ran cases report. The lesson is WS3b's (a worker that fell back to
+    one thread still attached, still answered jobs, and passed every assertion
+    the rig had) and WS3c's (`out_copied == 0` needs `out_moved > 0` beside
+    it).
+
+      * `dispatched > 0`   -- something asked for an overlay raster. THE
+                              FLOOR. Zero means no enabled texture layer had
+                              data, and every figure below is then trivially
+                              zero for a reason that is not about uploads.
+      * `pictures > 0`     -- rasters came back and their pixels were handed
+                              to egui. `dispatched > 0` with this at zero is a
+                              dispatch whose answers never arrive.
+      * `picture_bytes > 0`-- and the pictures had pixels in them.
+      * `shown + promoted > 0` -- and at least one reached the screen. A page
+                              that uploaded and then dropped everything fails
+                              here and passes the three above.
+      * `arrived == pictures + dropped` -- the arrival balance, an identity
+                              over the path rather than a threshold. It breaks
+                              the moment an arrival leaves by an exit neither
+                              counter names, which is how a byte figure
+                              quietly starts describing a subset.
+
+    NEGATIVE CONTROL, and it is a real configuration rather than a tamper: the
+    every-texture-layer-off seed written out beside `SEED_LS` in run_tier2.sh
+    -- the state a user who cleared their layer stack is in. `dispatched`
+    reaches 0, this goes red, and every other Tier-2 assertion stays green,
+    which is precisely the hole it closes.
+
+    **It is NOT "remove the seeded layer".** That was the first control tried
+    and it does not work: `NwsAlerts` and `SpcDiscussions` are on by default
+    and are both texture layers, so with `RadarSites` gone they still rasterize
+    whenever the live feeds have anything in them. Measured 2026-08-22 with the
+    key removed, chromium still reached 2 dispatched / 2 pictures /
+    16512000 B. Which is also why the seed exists at all -- not to supply the
+    only texture overlay, but to supply the only one that does not depend on
+    the weather.
+
+    Accumulates across polls the way `wait_rayon_pool` and
+    `wait_zero_copy_replies` do: the page-side console ring evicts, the totals
+    are cumulative, and the newest line seen at any poll is the whole answer.
+    """
+    t0 = time.monotonic()
+    best = None
+    while time.monotonic() - t0 < timeout:
+        sig = session.execute(WORKER_SIGNAL_PROBE) or {}
+        seen = sig.get("rasters")
+        if isinstance(seen, dict) and isinstance(seen.get("dispatched"), int):
+            if best is None or seen["dispatched"] >= best["dispatched"]:
+                best = seen
+        if best is not None and _overlay_rasters_ok(best):
+            out = dict(best)
+            out.update({"ok": True, "waited_s": round(time.monotonic() - t0, 2)})
+            return out
+        time.sleep(interval)
+    out = dict(best or {})
+    out.update({
+        "ok": False,
+        "waited_s": round(time.monotonic() - t0, 2),
+        "error": "the overlay raster path did not complete within %.0fs: %s "
+                 "(wanted dispatched>0, pictures>0, picture_bytes>0, "
+                 "shown+promoted>0, and arrived==pictures+dropped; a page that "
+                 "seeded no texture overlay reports every one of these as 0 "
+                 "and passes every other Tier-2 assertion)" % (timeout, best),
+    })
+    return out
+
+
+def _overlay_rasters_ok(r):
+    """The five conjuncts of `wait_overlay_rasters`, over one reading."""
+    return (r.get("dispatched", 0) > 0
+            and r.get("pictures", 0) > 0
+            and r.get("picture_bytes", 0) > 0
+            and (r.get("shown", 0) + r.get("promoted", 0)) > 0
+            and r.get("arrived", -1) == r.get("pictures", 0) + r.get("dropped", 0))
 
 
 def wait_doctored_respawn(session, timeout=180.0, respawn_grace=30.0,
@@ -1831,6 +1949,11 @@ def run_smoke(args):
             result["zero_copy"] = wait_zero_copy_replies(
                 session, timeout=args.expect_timeout)
             stage("zero-copy-done", **result["zero_copy"])
+        if args.expect_overlay_rasters:
+            stage("overlay-rasters-wait", timeout=args.expect_timeout)
+            result["overlay_rasters"] = wait_overlay_rasters(
+                session, timeout=args.expect_timeout)
+            stage("overlay-rasters-done", **result["overlay_rasters"])
 
         stage("settle", seconds=args.settle)
         time.sleep(args.settle)
@@ -1885,6 +2008,24 @@ def run_smoke(args):
         result["transport_bytes"] = _sig.get("transport")
         if result["transport_bytes"]:
             stage("transport", **result["transport_bytes"])
+
+        # **The WS2 baseline**, read at the END of the data window so it covers
+        # the whole leg rather than the moment a gate happened to be satisfied.
+        # Reported unconditionally, like `transport_bytes` and
+        # `rasterization_ms`: a measurement round wants the numbers when
+        # nothing is gating on them, and `null` says the line was never
+        # written -- which is "the path never ran", not "zero bytes".
+        #
+        # Two records, never one. `overlay_raster_totals` is the whole-picture
+        # overlay dispatch alone; `texture_upload_totals` is every texture
+        # delta this renderer was shown, radar and font atlas included. They
+        # answer different questions and are never summed.
+        result["overlay_raster_totals"] = _sig.get("rasters")
+        if result["overlay_raster_totals"]:
+            stage("overlay-rasters", **result["overlay_raster_totals"])
+        result["texture_upload_totals"] = _sig.get("uploads")
+        if result["texture_upload_totals"]:
+            stage("texture-uploads", **result["texture_upload_totals"])
 
         # Late on purpose: registration, install and activation all have to
         # finish first, and the data window has just paid for that time.
@@ -1959,10 +2100,12 @@ def run_smoke(args):
         dr = result.get("doctored_respawn")
         rp = result.get("rayon_pool")
         zc = result.get("zero_copy")
+        ovr = result.get("overlay_rasters")
         worker_ok = ((wrt is None or bool(wrt.get("ok")))
                      and (dr is None or bool(dr.get("ok")))
                      and (rp is None or bool(rp.get("ok")))
-                     and (zc is None or bool(zc.get("ok"))))
+                     and (zc is None or bool(zc.get("ok")))
+                     and (ovr is None or bool(ovr.get("ok"))))
 
         # Isolation assertions (opt-in). Both are written so that they FAIL
         # when the thing they name is absent -- an isolation proof that cannot
@@ -2028,9 +2171,14 @@ def run_smoke(args):
                                     else bool(dr.get("ok"))),
             "rayon_pool_ok": (None if rp is None else bool(rp.get("ok"))),
             "zero_copy_replies_ok": (None if zc is None else bool(zc.get("ok"))),
+            "overlay_rasters_ok": (None if ovr is None else bool(ovr.get("ok"))),
             # Same rule as `rayon_threads` below: reported whether or not
             # anything gated on it, because this IS the WS3c measurement.
             "transport_bytes": result.get("transport_bytes"),
+            # And the WS2 baseline, on the same terms. Two records with two
+            # denominators; see where they are collected.
+            "overlay_raster_totals": result.get("overlay_raster_totals"),
+            "texture_upload_totals": result.get("texture_upload_totals"),
             # Reported unconditionally, not only under --expect-rayon-threads:
             # a measurement run wants the number even when nothing is gating
             # on it, and `null` distinguishes "never observed" from "one".
@@ -2203,6 +2351,30 @@ def run_smoke(args):
               "out of the worker, %s B in with %s B copied out of the page"
               % (tag, tb.get("replies"), tb.get("out_moved"),
                  tb.get("out_copied"), tb.get("in_moved"), tb.get("in_copied")))
+    ovr = result.get("overlay_rasters")
+    if ovr is not None:
+        print("[%s] SUMMARY overlay rasters: %s%s"
+              % (tag, "OK" if ovr.get("ok") else "FAILED",
+                 "" if ovr.get("ok") else "; " + str(ovr.get("error"))))
+    # The WS2 baseline, printed whether or not it was gated, and per browser --
+    # never pooled, for the same reason the per-kind medians are not.
+    ort = result.get("overlay_raster_totals")
+    if ort:
+        print("[%s] SUMMARY overlay raster totals [whole-picture overlay "
+              "dispatch only]: %s dispatched, %s arrived, %s pictures of %s B, "
+              "%s shown, %s promoted, %s dropped, %s superseded"
+              % (tag, ort.get("dispatched"), ort.get("arrived"),
+                 ort.get("pictures"), ort.get("picture_bytes"),
+                 ort.get("shown"), ort.get("promoted"), ort.get("dropped"),
+                 ort.get("superseded")))
+    tut = result.get("texture_upload_totals")
+    if tut:
+        print("[%s] SUMMARY texture upload totals [EVERY egui texture on this "
+              "renderer, radar and font atlas included]: %s deltas, %s B to "
+              "the GPU, %s B unbanded, %s bands, %s B staged, %s B blocking"
+              % (tag, tut.get("deltas"), tut.get("bytes"),
+                 tut.get("unbanded_bytes"), tut.get("bands"),
+                 tut.get("staged_bytes"), tut.get("blocking_bytes")))
     rm = result.get("rasterization_ms")
     if rm and rm.get("by_kind"):
         # One line per KIND, never a pooled figure: see the probe.
@@ -2263,6 +2435,17 @@ def main(argv=None):
                          "WITHOUT --coep -- with no cross-origin isolation "
                          "every message takes the copying wire and this must "
                          "go red")
+    ap.add_argument("--expect-overlay-rasters", action="store_true",
+                    help="fail unless the whole-picture overlay path actually "
+                         "ran in this browser (WS2 baseline): dispatched>0, "
+                         "pictures>0, picture_bytes>0, shown+promoted>0, and "
+                         "arrived==pictures+dropped, within --expect-timeout. "
+                         "Needs a texture overlay in the scene -- run_tier2.sh "
+                         "seeds RadarSites, the one that needs no network, so "
+                         "the gate does not depend on the weather. NEGATIVE "
+                         "CONTROL: the every-layer-off seed written out beside "
+                         "SEED_LS; dropping RadarSites alone is NOT a control, "
+                         "the two default-on texture overlays cover for it")
     ap.add_argument("--expect-doctored-respawn", action="store_true",
                     help="fail unless the console shows the doctored-token "
                          "refusal and then, >=1000 ms later, a clean attach "

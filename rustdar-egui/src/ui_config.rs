@@ -1754,6 +1754,13 @@ mod presets_config_tests;
 #[cfg(test)]
 mod fixture_tests;
 
+/// The browser rig's own scene seed, parsed by the config it is written for:
+/// the site survives the migration chain and the layer it switches on really
+/// rasterizes to a texture.
+#[path = "ui_config/rig_seed_tests.rs"]
+#[cfg(test)]
+mod rig_seed_tests;
+
 #[path = "ui_config/tests.rs"]
 #[cfg(test)]
 mod tests;
