@@ -54,6 +54,18 @@
 #                     report without gating)
 #   RIG_EXPECT_ZERO_COPY  1 (default) to fail a leg whose replies were copied
 #                     out of the worker's memory; 0 to report without gating
+#   RIG_EXPECT_OVERLAY_RASTERS  1 (default) to fail a leg where the
+#                     whole-picture overlay path never completed; 0 to report
+#                     the totals without gating
+#
+# WS2 BASELINE: every leg prints two raster figures, and they are never added
+# together because their denominators differ. `overlay rasters` is the
+# whole-picture overlay dispatch alone -- radar's own pipeline and the loop
+# frames are not in it. `texture uploads` is what the device was then made to
+# move for EVERY egui texture, radar, basemap tiles and font atlas included.
+# These are the numbers a world-anchored tile grid will be judged against, so
+# they are reported whether or not anything gated on them, per browser, and
+# never pooled across browsers.
 #
 # WS3b made cross-origin isolation part of the DEFAULT posture: serve.py is
 # launched with --coep on every pass, because the shipped app needs a
@@ -109,8 +121,55 @@ PY=python3
 # Written in the OLDEST config shape on purpose: no `config_version` reads as
 # version 1, so the seed walks the whole migration chain up to whatever this
 # build speaks. The rig then needs no edit when CONFIG_VERSION moves, and the
-# chain is exercised on every Tier-2 run.
-SEED_LS='{"rustdar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\"}]}"}'
+# chain is exercised on every Tier-2 run. `enabled_overlays` is the v2 pane key
+# that the `panes_take_layer_slots` rung consumes into `layer_slots`, so
+# seeding a layer through it keeps that property.
+#
+# ---------------------------------------------------------------------------
+# WHY A TEXTURE OVERLAY IS SEEDED (WS2)
+#
+# **Not** because the scene had none. It had two: `NwsAlerts` and
+# `SpcDiscussions` ship `default_enabled() == true`, so
+# `Gui::initialize_pane_enabled` puts them on every fresh pane, and both
+# rasterize to a texture. What the scene had was two texture overlays whose
+# rasters depend on the WEATHER -- an hour with no active mesoscale discussion
+# and no alert in the pane's viewport produces no raster at all. MEASURED here
+# 2026-08-22, both browsers, with this key removed: chromium still reached 2
+# dispatched / 2 pictures / 16512000 B off the default layers alone. So the
+# gate below would have been green on a stormy afternoon and red on a quiet
+# one, which is not a gate.
+#
+# `RadarSites` is what makes it deterministic. It is the one texture layer
+# that needs NO network: the site table is compiled into rustdar-radar and
+# `publish_radar_sites` pushes it through the ordinary arrival door at boot, so
+# `has_data` is true on the first frame on a CI box with no weather at all.
+# It also ships `default_enabled() == false`, so seeding it is a real choice
+# rather than a restatement of the default -- pinned by
+# `the_seeded_layer_is_one_a_fresh_pane_would_not_have`.
+#
+# THE NEGATIVE CONTROL IS NOT "REMOVE THIS KEY". That was tried and it does not
+# work, for the reason above. The control that does is every texture layer
+# switched explicitly OFF -- a real configuration, and the one a user who
+# cleared their layer stack is in:
+#
+#   enabled_overlays: {"RadarSites":false,"NwsAlerts":false,"SpcDiscussions":false,
+#                      "SpcOutlook":false,"SpcFireOutlook":false,"StormReports":false,
+#                      "Lightning":false,"ModelData":false,"Mrms":false,"Gmgsi":false}
+#
+# `false` and not omission is load-bearing: an omitted `enabled` means "ask the
+# handler", which is how the two default-on layers came back the first time.
+#
+# RUN 2026-08-22, both browsers, that exact seed: --expect-overlay-rasters
+# FAILED on every leg and every quarantine retry (4/4 firefox attempts,
+# chromium likewise) with the line never written at all, while worker
+# round-trip, rayon pool and zero-copy replies stayed OK on every one of them.
+# That is the property -- this assertion can go red, it goes red for the reason
+# it names, and it disturbs nothing else.
+SEED_LS='{"rustdar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"enabled_overlays\":{\"RadarSites\":true}}]}"}'
+
+# Set to 0 to report the overlay raster totals without gating on them -- for a
+# measurement round, never as a way past a red leg.
+EXPECT_OVERLAY_RASTERS="${RIG_EXPECT_OVERLAY_RASTERS:-1}"
 
 SKIP_BUILD=0
 for arg in "$@"; do
@@ -272,6 +331,13 @@ run_pass() {
   if [ "$EXPECT_ZERO_COPY" -eq 1 ]; then
     drive_args+=(--expect-zero-copy-replies)
   fi
+  # WS2: the whole-picture overlay path really ran in this browser. The
+  # negative control is the every-layer-off seed described beside SEED_LS
+  # above -- NOT merely dropping the seeded layer, which the two default-on
+  # texture overlays cover for.
+  if [ "$EXPECT_OVERLAY_RASTERS" -eq 1 ]; then
+    drive_args+=(--expect-overlay-rasters)
+  fi
   if [ "$doctored" -eq 1 ]; then
     server_args+=(--doctor-first-worker)
     drive_args+=(--expect-doctored-respawn)
@@ -398,6 +464,34 @@ for tag in sys.argv[2:]:
     if dr and dr.get("ok"):
         print("%-18s   respawn attach %.0f ms after the doctored refusal"
               % ("", dr.get("delta_ms", -1)))
+    # WS2 baseline. TWO lines with TWO denominators, never added: the first is
+    # the whole-picture overlay dispatch alone, the second is every texture
+    # delta this renderer was shown (radar, basemap tiles and font atlas
+    # included). A single "bytes uploaded" over the union would describe
+    # neither. `-` means the line was never written, i.e. the path never ran,
+    # which is a different fact from zero bytes.
+    ort = r.get("overlay_raster_totals")
+    if ort:
+        print("%-18s   overlay rasters [overlay dispatch only] "
+              "%s dispatched -> %s arrived -> %s pictures / %s B; "
+              "%s shown, %s promoted, %s dropped, %s superseded"
+              % ("", ort.get("dispatched"), ort.get("arrived"),
+                 ort.get("pictures"), ort.get("picture_bytes"),
+                 ort.get("shown"), ort.get("promoted"), ort.get("dropped"),
+                 ort.get("superseded")))
+    else:
+        print("%-18s   overlay rasters - (the line was never written: no "
+              "overlay raster ever moved)" % "")
+    tut = r.get("texture_upload_totals")
+    if tut:
+        print("%-18s   texture uploads [EVERY egui texture] %s deltas, %s B "
+              "to the GPU (%s B unbanded; %s bands, %s B staged, %s B "
+              "blocking the frame)"
+              % ("", tut.get("deltas"), tut.get("bytes"),
+                 tut.get("unbanded_bytes"), tut.get("bands"),
+                 tut.get("staged_bytes"), tut.get("blocking_bytes")))
+    else:
+        print("%-18s   texture uploads - (the line was never written)" % "")
     for d in (wrt, dr):
         if d and not d.get("ok"):
             print("%-18s   %s" % ("", d.get("error")))

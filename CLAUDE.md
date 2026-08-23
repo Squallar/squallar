@@ -53,7 +53,15 @@ means the architecture regressed.
 
 Firefox is first-class and governs over Chrome. "Web" is two targets — measure both, never
 merge the figures. The behavioural gate is `.github/browser-rig/run_tier2.sh` (boot, canvas,
-worker wire, doctored-token respawn). It does **not** cover frame time or mobile.
+worker wire, doctored-token respawn, and the whole-picture overlay raster path). It does
+**not** cover frame time or mobile.
+
+Every leg also prints two raster figures, and **they have different denominators and are
+never added**: `overlay rasters` is the overlay texture dispatch alone (radar's own
+pipeline and the loop frames are not in it), `texture uploads` is every egui texture the
+renderer was shown. Both are running totals off the app's own always-on counters
+(`rustdar_egui::overlay_cache::ledger`, `rustdar_gpu`'s `UploadTotals`), reported whether
+or not anything gates on them.
 
 ## Instrument gotchas that read as green
 
