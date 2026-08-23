@@ -43,8 +43,8 @@ Read the graph bottom-up. Nothing in a lower band may depend on a higher one.
 `Reader`/`Writer`, and the TLS provider selection.
 
 **Contract and vocabulary — plus the values two bands both have to agree on.**
-`REFLECTIVITY_STOPS` (`product.rs`) is the first of those and the rule it sets
-is narrow. Until 2026-08-23 a colour ramp was held to belong to the crate that
+`REFLECTIVITY_SHARED_STOPS` (`product.rs`) is the first of those and the rule it
+sets is narrow. Until 2026-08-23 a colour ramp was held to belong to the crate that
 published the field, and reflectivity was drawn through three separate tables:
 `rustdar-radar`'s, MRMS's and HRRR's. The two overlay tables were pinned equal
 to each other; the radar one was pinned to nothing, and it had drifted about one
@@ -59,6 +59,20 @@ per-layer decision, and the three dBZ layers genuinely disagree about it (a
 radar tilt is a wash, a mosaic and a forecast composite are bands). What may
 move down here is the shared *value*, not the presentation, and only once a
 second band needs it.
+
+**And what comes down is the agreement, which is allowed to be narrower than the
+whole thing.** The dBZ ladders agree from 0 through 70 and part above it: radar
+draws a hail band to 95 dBZ that MRMS and HRRR do not, because their grids do
+not produce values up there and a bar advertising a range its own raster cannot
+reach is worse than a divergence. So the substrate holds a shared core, a
+per-layer tail, and `REFLECTIVITY_DIVERGENCE_DBZ` naming the one value with two
+colours — not one table every layer slices. A layer names the ladder it draws
+(`REFLECTIVITY_RADAR_STOPS`, `REFLECTIVITY_OVERLAY_STOPS`); nothing outside
+`product.rs` builds a bar from the core alone. **A value moved down here must be
+one the bands really do agree on, and where they stop agreeing is part of what
+gets written down.** `REFLECTIVITY_ALPHA` is a second such value — one opacity
+for the same quantity on every layer that draws it, scoped to that field and not
+to either crate's own translucency constant.
 
 **Band 2 — the data crates.** `rustdar-radar` and `rustdar-overlays` each stand
 on the substrate. **They do not know about each other**: the

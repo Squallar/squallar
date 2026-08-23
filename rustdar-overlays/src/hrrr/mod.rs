@@ -703,8 +703,16 @@ impl std::str::FromStr for ModelParameter {
 }
 
 /// The dBZ ladder in **5 dBZ bands**, from 5 dBZ up:
-/// [`rustdar_source::product::REFLECTIVITY_STOPS`] sliced at
-/// [`rustdar_source::product::REFLECTIVITY_OVERLAY_FLOOR`].
+/// [`rustdar_source::product::REFLECTIVITY_OVERLAY_STOPS`], which MRMS's mosaic
+/// draws too.
+///
+/// **It ends at 75 dBZ where a radar tilt's ladder runs to 95, on purpose.**
+/// The three layers share
+/// [`rustdar_source::product::REFLECTIVITY_SHARED_STOPS`] through 70; above
+/// that radar draws a hail band and this bar does not, because a forecast
+/// composite is a model diagnostic and does not produce values up there. See
+/// [`rustdar_source::product::REFLECTIVITY_DIVERGENCE_DBZ`] for the one dBZ
+/// that carries two colours.
 ///
 /// **This doc used to say the table was "deliberately a second copy" of
 /// `crate::mrms::fields::REFLECTIVITY`'s stops, held equal only by a test.**
@@ -723,31 +731,13 @@ impl std::str::FromStr for ModelParameter {
 /// starting at 0 would paint the whole CONUS domain. That is why the slice
 /// starts at the overlay floor and not at the table's own 0 dBZ stop, which
 /// exists for radar's 3D transfer table.
-const REFLECTIVITY_BANDS: [(f32, [u8; 3]); 15] = reflectivity_bands();
-
-/// [`REFLECTIVITY_BANDS`], as a `const fn` because a slice cannot be spelled as
-/// a fixed-size array in a `const` initialiser without one. The length is
-/// checked by the compiler: a stop added below 5 dBZ changes
-/// `REFLECTIVITY_STOPS.len() - REFLECTIVITY_OVERLAY_FLOOR` and this stops
-/// building.
-const fn reflectivity_bands() -> [(f32, [u8; 3]); 15] {
-    use rustdar_source::product::{REFLECTIVITY_OVERLAY_FLOOR, REFLECTIVITY_STOPS};
-    // Evaluated at compile time, because the caller is a `const`. Without it a
-    // stop added at the TOP of the substrate's table would be dropped here in
-    // silence — the loop below would copy the first fifteen and stop.
-    assert!(
-        REFLECTIVITY_STOPS.len() - REFLECTIVITY_OVERLAY_FLOOR == 15,
-        "the substrate's reflectivity ladder no longer has fifteen stops above \
-         the overlay floor; widen this array to match it",
-    );
-    let mut out = [(0.0, [0u8; 3]); 15];
-    let mut i = 0;
-    while i < out.len() {
-        out[i] = REFLECTIVITY_STOPS[REFLECTIVITY_OVERLAY_FLOOR + i];
-        i += 1;
-    }
-    out
-}
+/// The slicing and capping this file used to do itself now happens once in the
+/// substrate, so this is a plain alias rather than a `const fn`: what the
+/// parameters' ramps need is a fixed-size array `color_for_value` can walk, and
+/// `REFLECTIVITY_OVERLAY_STOPS` already is one. A stop added or removed on
+/// either side of the divergence changes its length and stops this building.
+const REFLECTIVITY_BANDS: [(f32, [u8; 3]); 15] =
+    rustdar_source::product::REFLECTIVITY_OVERLAY_STOPS;
 
 /// Echo-top stops in **kft**, the unit [`ModelParameter::convert_for_display`]
 /// hands the ramp — `RETOP` itself is metres.

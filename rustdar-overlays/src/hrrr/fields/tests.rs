@@ -168,58 +168,134 @@ fn a_banded_bar_paints_one_flat_colour_across_its_band() {
 }
 
 /// The forecast composite and the observed mosaic are read side by side, so the
-/// same dBZ must be the same colour on both.
+/// same dBZ must be the same colour on both — **and the same colour a radar
+/// tilt paints it, through 70 dBZ and no further.**
 ///
 /// **This was `the_two_reflectivity_ladders_agree`, and two was the wrong
 /// number.** It held HRRR's copy equal to MRMS's while a third table in
 /// `rustdar-radar` — the one a radar tilt is drawn through, in the same pane —
 /// sat about one 5 dBZ band away through the green-to-red region with nothing
-/// comparing it to either. The third ladder is the substrate's
-/// `rustdar_source::product::REFLECTIVITY_STOPS`, which both of these now slice
-/// and which `rustdar-radar` takes whole; comparing the two overlay bars
-/// against it is what makes the radar bar part of the same claim, from a crate
-/// that may not name `rustdar-radar`.
+/// comparing it to either. The shared colours are the substrate's
+/// `rustdar_source::product::REFLECTIVITY_SHARED_STOPS`, which both of these
+/// draw from the overlay floor up and which `rustdar-radar` draws whole;
+/// comparing the two overlay bars against it is what makes the radar bar part
+/// of the same claim, from a crate that may not name `rustdar-radar`.
+///
+/// **The agreement is bounded at 70 on purpose, and this test says both
+/// halves.** Above 70 radar shows a hail band — 75 sky-blue climbing to 95 —
+/// and these two bars cap at 75 white, because a mosaic and a forecast grid do
+/// not produce values up there and a bar advertising a range its raster cannot
+/// reach is the worse lie. So an accidental **re-convergence** (someone
+/// re-capping radar at 75 white, which is exactly what `e6091e47` did) reddens
+/// on the divergence assertion below, and an accidental **widening** — a stop
+/// drifting anywhere at or below 70, or either overlay bar growing a tail —
+/// reddens on the agreement assertion. Neither direction passes.
 ///
 /// The radar end of it is pinned twice more, because this crate cannot see it:
-/// `rustdar_radar::palette::tests::the_reflectivity_ladder_is_the_substrates`
+/// `rustdar_radar::palette::tests::the_reflectivity_ladder_is_the_substrates_radar_one`
 /// from below, and
 /// `rustdar_egui::ui::map::pane_render::legend_ladder_tests::
-/// every_layer_that_draws_dbz_paints_the_same_ladder`
+/// every_layer_that_draws_dbz_paints_the_same_ladder_through_seventy`
 /// from the one crate that can hold all three at once.
 #[test]
-fn the_three_reflectivity_ladders_agree() {
+fn the_three_reflectivity_ladders_agree_through_seventy() {
+    use rustdar_source::product::{
+        REFLECTIVITY_DIVERGENCE_DBZ, REFLECTIVITY_OVERLAY_CAP, REFLECTIVITY_OVERLAY_FLOOR,
+        REFLECTIVITY_OVERLAY_STOPS, REFLECTIVITY_RADAR_STOPS, REFLECTIVITY_SHARED_STOPS,
+    };
+
     let hrrr = spec(ModelParameter::CompositeReflectivity).scale;
     let mrms = crate::mrms::fields::spec(crate::mrms::MrmsProduct::ReflectivityComposite).scale;
-    let canonical = rustdar_source::product::REFLECTIVITY_STOPS
-        [rustdar_source::product::REFLECTIVITY_OVERLAY_FLOOR..]
-        .to_vec();
+    let shared: Vec<(f32, [u8; 3])> =
+        REFLECTIVITY_SHARED_STOPS[REFLECTIVITY_OVERLAY_FLOOR..].to_vec();
 
+    // ── the agreement: every stop at or below 70 dBZ, on all three ──
     for (layer, ladder) in [("HRRR", &hrrr.thresholds), ("MRMS", &mrms.thresholds)] {
+        let through_seventy: Vec<(f32, [u8; 3])> = ladder
+            .iter()
+            .copied()
+            .filter(|&(dbz, _)| dbz < REFLECTIVITY_DIVERGENCE_DBZ)
+            .collect();
         assert_eq!(
-            *ladder, canonical,
-            "{layer}'s dBZ ladder is no longer the substrate's table from the \
-             overlay floor up",
+            through_seventy, shared,
+            "{layer}'s dBZ ladder is no longer the shared table from the \
+             overlay floor through 70",
         );
     }
     assert_eq!(
         hrrr.thresholds, mrms.thresholds,
-        "the two dBZ ladders have drifted apart",
+        "the two overlay dBZ ladders have drifted apart",
+    );
+    let radar_through_seventy: Vec<(f32, [u8; 3])> = REFLECTIVITY_RADAR_STOPS
+        .iter()
+        .copied()
+        .filter(|&(dbz, _)| dbz < REFLECTIVITY_DIVERGENCE_DBZ)
+        .skip(REFLECTIVITY_OVERLAY_FLOOR)
+        .collect();
+    assert_eq!(
+        radar_through_seventy, shared,
+        "the ladder a radar tilt draws is no longer the shared table through \
+         70 dBZ, which is the drift this whole arrangement exists to stop",
     );
     assert!(
-        hrrr.thresholds.len() >= 10,
-        "a ladder of {} stops is too short for this comparison to mean much",
-        hrrr.thresholds.len(),
+        shared.len() >= 10,
+        "a shared core of {} stops is too short for this comparison to mean \
+         much",
+        shared.len(),
     );
     assert_eq!(
         hrrr.is_gradient, mrms.is_gradient,
         "one dBZ bar draws bands and the other a wash",
     );
 
-    // The control: the comparison is against a *sliced* table, not the whole
-    // one, so a slicer that forgot the floor cannot pass by accident.
+    // ── the divergence: 75 dBZ, two colours, deliberately ──
+    let overlay_top = *REFLECTIVITY_OVERLAY_STOPS
+        .last()
+        .expect("the overlay ladder is non-empty");
+    assert_eq!(
+        overlay_top, REFLECTIVITY_OVERLAY_CAP,
+        "the overlay bars must end at their own cap",
+    );
+    assert_eq!(
+        overlay_top.0, REFLECTIVITY_DIVERGENCE_DBZ,
+        "the overlay bars must stop at the dBZ the layers part at, not climb \
+         past it into a range no mosaic or forecast grid produces",
+    );
+    let radar_at_divergence = REFLECTIVITY_RADAR_STOPS
+        .iter()
+        .find(|&&(dbz, _)| dbz == REFLECTIVITY_DIVERGENCE_DBZ)
+        .copied()
+        .expect("radar's ladder has a stop at the divergence");
     assert_ne!(
-        canonical.len(),
-        rustdar_source::product::REFLECTIVITY_STOPS.len(),
-        "the overlay slice must be shorter than the ladder radar draws",
+        radar_at_divergence.1, overlay_top.1,
+        "the ladders have re-converged at {REFLECTIVITY_DIVERGENCE_DBZ} dBZ. A \
+         tilt shows the hail band there (sky-blue, climbing to 95) and these \
+         two bars cap white; making them equal again is what silently painted \
+         every hail core one flat colour in `e6091e47`.",
+    );
+    assert!(
+        REFLECTIVITY_RADAR_STOPS
+            .iter()
+            .any(|&(dbz, _)| dbz > REFLECTIVITY_DIVERGENCE_DBZ),
+        "radar's ladder must keep climbing above the divergence, or the \
+         divergence is a repaint of one stop rather than a band",
+    );
+    for (layer, ladder) in [("HRRR", &hrrr.thresholds), ("MRMS", &mrms.thresholds)] {
+        assert!(
+            !ladder
+                .iter()
+                .any(|&(dbz, _)| dbz > REFLECTIVITY_DIVERGENCE_DBZ),
+            "{layer}'s bar has grown a stop above {REFLECTIVITY_DIVERGENCE_DBZ} \
+             dBZ. The divergence is meant to be one-sided: radar has the hail \
+             band because a tilt reaches it, and these grids do not.",
+        );
+    }
+
+    // The control: the overlay ladders are genuinely shorter than radar's, so a
+    // slicer that forgot the floor or the cap cannot pass by accident.
+    assert_ne!(
+        REFLECTIVITY_OVERLAY_STOPS.len(),
+        REFLECTIVITY_RADAR_STOPS.len(),
+        "the overlay ladder must be shorter than the one radar draws",
     );
 }

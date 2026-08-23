@@ -2259,13 +2259,16 @@ mod tests {
     /// `ed5a1f9b` and pasted in, not derived from the new code, so a formula
     /// that is consistently wrong in both spellings cannot pass.
     ///
-    /// **One field's row is no longer that capture.** Reflectivity's ticks —
-    /// the same string in all three sets, dBZ having no unit choice — read
-    /// `0|2.5|5|7.5|10|…|75|80|85|90|95` until the three dBZ ladders were
-    /// unified on `rustdar_source::product::REFLECTIVITY_STOPS`. That table has
-    /// no 7.5 dBZ stop, its 5 and 10 coming from the ladder the overlay layers
-    /// draw, and it ends at 75 where radar's own ran to 95. Those labels moved
-    /// because the bar did; every other row is still the `ed5a1f9b` reading.
+    /// **One field's row is no longer that capture, and it has moved twice.**
+    /// Reflectivity's ticks — the same string in all three sets, dBZ having no
+    /// unit choice — read `0|2.5|5|7.5|10|…|75|80|85|90|95` at `ed5a1f9b`. The
+    /// 2026-08-23 unification of the three dBZ ladders took the low end to the
+    /// one the overlay layers draw, which has no 7.5 dBZ stop, and `e6091e47`
+    /// also capped the bar at 75; restoring radar's hail band put `80|85|90|95`
+    /// back. So the row now reads the `ed5a1f9b` capture with its 7.5 gone and
+    /// its tail returned — `0|2.5|5|10|…|70|75|80|85|90|95`. Both moves are the
+    /// bar's, not this formatter's; every other row is still the `ed5a1f9b`
+    /// reading untouched.
     #[test]
     fn every_tick_and_unit_string_is_what_it_was_before_the_field_ids() {
         let sets: [(&str, UserPreferences); 3] = [
@@ -2293,7 +2296,7 @@ mod tests {
             (
                 "default",
                 "Reflectivity",
-                "0|2.5|5|10|15|20|25|30|35|40|45|50|55|60|65|70|75",
+                "0|2.5|5|10|15|20|25|30|35|40|45|50|55|60|65|70|75|80|85|90|95",
                 "dBZ",
             ),
             (
@@ -2390,7 +2393,7 @@ mod tests {
             (
                 "metric",
                 "Reflectivity",
-                "0|2.5|5|10|15|20|25|30|35|40|45|50|55|60|65|70|75",
+                "0|2.5|5|10|15|20|25|30|35|40|45|50|55|60|65|70|75|80|85|90|95",
                 "dBZ",
             ),
             (
@@ -2482,7 +2485,7 @@ mod tests {
             (
                 "mm",
                 "Reflectivity",
-                "0|2.5|5|10|15|20|25|30|35|40|45|50|55|60|65|70|75",
+                "0|2.5|5|10|15|20|25|30|35|40|45|50|55|60|65|70|75|80|85|90|95",
                 "dBZ",
             ),
             (
@@ -3016,33 +3019,110 @@ mod legend_ladder_tests {
         );
     }
 
-    /// **The one place all three dBZ ladders are visible at once.**
+    /// **The one place all three dBZ ladders are visible at once**, and the one
+    /// place the agreement and the divergence can both be stated against the
+    /// real bars rather than against the substrate's tables.
     ///
     /// `rustdar-overlays` may not name `rustdar-radar` — the charter cuts that
-    /// edge — so the agreement is pinned there against the substrate's table
-    /// and here against the radar palette itself. This is the test that would
-    /// have caught the original defect: the same dBZ read one colour on a radar
-    /// tilt and a different one on the MRMS mosaic drawn in the same pane.
+    /// edge — so the agreement is pinned there against the substrate and here
+    /// against the radar palette itself. This is the test that would have
+    /// caught the original defect: the same dBZ read one colour on a radar tilt
+    /// and a different one on the MRMS mosaic drawn in the same pane.
+    ///
+    /// **It is bounded at 70 dBZ, and both bounds are asserted.** Above 70 the
+    /// layers part on purpose — radar carries the hail band up to 95 and the two
+    /// gridded bars cap at 75 white, because their grids do not reach up there.
+    /// So a re-convergence at 75 (which is what `e6091e47` shipped, painting
+    /// every hail core one flat white on a tilt) reddens on the divergence
+    /// half, and any drift at or below 70, or a tail growing on an overlay bar,
+    /// reddens on the agreement half.
     #[test]
-    fn every_layer_that_draws_dbz_paints_the_same_ladder() {
+    fn every_layer_that_draws_dbz_paints_the_same_ladder_through_seventy() {
+        use rustdar_source::product::{
+            REFLECTIVITY_DIVERGENCE_DBZ, REFLECTIVITY_OVERLAY_FLOOR, REFLECTIVITY_RADAR_STOPS,
+        };
+
         let radar = crate::field_facts::facts(&radar_fields::known::REFLECTIVITY).scale;
         let mrms = rustdar_overlays::mrms::fields::spec(MrmsProduct::ReflectivityComposite).scale;
         let hrrr =
             rustdar_overlays::hrrr::fields::spec(ModelParameter::CompositeReflectivity).scale;
 
-        let floor = rustdar_source::product::REFLECTIVITY_OVERLAY_FLOOR;
         assert_eq!(
             radar.thresholds,
-            rustdar_source::product::REFLECTIVITY_STOPS.to_vec(),
-            "the radar bar is not the substrate's whole ladder",
+            REFLECTIVITY_RADAR_STOPS.to_vec(),
+            "the radar bar is not the substrate's radar ladder",
         );
+
+        // ── agreement, through 70 dBZ ──
+        let below_divergence = |stops: &[(f32, [u8; 3])]| -> Vec<(f32, [u8; 3])> {
+            stops
+                .iter()
+                .copied()
+                .filter(|&(dbz, _)| dbz < REFLECTIVITY_DIVERGENCE_DBZ)
+                .collect()
+        };
+        let radar_shared = below_divergence(&radar.thresholds);
         for (layer, scale) in [("MRMS", mrms), ("HRRR", hrrr)] {
             assert_eq!(
-                scale.thresholds,
-                radar.thresholds[floor..].to_vec(),
-                "{layer}'s dBZ ladder is not the radar bar's, from 5 dBZ up",
+                below_divergence(&scale.thresholds),
+                radar_shared[REFLECTIVITY_OVERLAY_FLOOR..].to_vec(),
+                "{layer}'s dBZ ladder is not the radar bar's from 5 dBZ through \
+                 70",
             );
         }
+        assert!(
+            radar_shared.len() >= 12,
+            "a shared core of {} stops is too short for this to mean much",
+            radar_shared.len(),
+        );
+
+        // ── divergence, at and above 75 dBZ ──
+        let at_divergence = |scale: &rustdar_source::product::LegendScale| {
+            scale
+                .thresholds
+                .iter()
+                .find(|&&(dbz, _)| dbz == REFLECTIVITY_DIVERGENCE_DBZ)
+                .copied()
+                .unwrap_or_else(|| {
+                    panic!("every dBZ bar carries a {REFLECTIVITY_DIVERGENCE_DBZ} stop")
+                })
+        };
+        let radar_top = at_divergence(radar);
+        for (layer, scale) in [("MRMS", mrms), ("HRRR", hrrr)] {
+            assert_ne!(
+                at_divergence(scale).1,
+                radar_top.1,
+                "{layer}'s bar has re-converged with the radar bar at \
+                 {REFLECTIVITY_DIVERGENCE_DBZ} dBZ. The two are meant to \
+                 differ: a tilt shows the hail band and a gridded composite \
+                 does not produce values there.",
+            );
+            assert_eq!(
+                scale.max_value, REFLECTIVITY_DIVERGENCE_DBZ,
+                "{layer}'s bar must stop where the layers part, not advertise a \
+                 range its raster cannot reach",
+            );
+        }
+        assert_eq!(
+            radar.max_value, 95.0,
+            "the radar bar must run to the top of the hail band; a 75 here is \
+             the regression this test was re-scoped for",
+        );
+        assert!(
+            radar
+                .thresholds
+                .iter()
+                .filter(|&&(dbz, _)| dbz >= REFLECTIVITY_DIVERGENCE_DBZ)
+                .count()
+                >= 5,
+            "the radar bar's hail band is not a band; it has {} stops at or \
+             above {REFLECTIVITY_DIVERGENCE_DBZ} dBZ",
+            radar
+                .thresholds
+                .iter()
+                .filter(|&&(dbz, _)| dbz >= REFLECTIVITY_DIVERGENCE_DBZ)
+                .count(),
+        );
 
         // Banding is the per-layer decision, and it is genuinely different
         // here — which is what stops the equality above from being a claim
@@ -3052,6 +3132,97 @@ mod legend_ladder_tests {
         assert!(
             !hrrr.is_gradient,
             "the forecast composite is drawn as bands"
+        );
+    }
+
+    /// **The acceptance for the alpha unification: the two paths hand back the
+    /// same opacity at the same dBZ.**
+    ///
+    /// Radar painted dBZ through `rustdar-radar`'s `TRANSPARENCY` (180) and the
+    /// gridded overlays through `render::gridded`'s `ALPHA` (160), so a tilt and
+    /// the MRMS mosaic enabled on one pane drew the same quantity at two
+    /// opacities with nothing comparing them. 160 is the survivor —
+    /// `rustdar_source::product::REFLECTIVITY_ALPHA` records why that one and
+    /// not a third number.
+    ///
+    /// **This asks the two painters, not the two constants.** A test that
+    /// compared `REFLECTIVITY_ALPHA` against a literal would pass while either
+    /// path stopped reading it; this one walks real dBZ through
+    /// `rustdar_radar::get_color_for_value` and through the `FieldPaint` the
+    /// rasterizer actually resolves for the mosaic, and compares the alpha byte
+    /// they return. It is also this crate's job because nothing lower can see
+    /// both: the overlays→radar edge is cut.
+    ///
+    /// HRRR's composite is in it too — it resolves its own ramp rather than the
+    /// generic one over a `LegendScale`, so it is a third painter and not a
+    /// second reader of the same code.
+    #[test]
+    fn a_tilt_and_a_mosaic_paint_the_same_dbz_at_the_same_opacity() {
+        let expected = rustdar_source::product::REFLECTIVITY_ALPHA;
+        // Resolved through the field id, the way `render_radar_color_ramp`
+        // resolves what it bakes a bar from. The `arch_ratchets` row that holds
+        // the radar product enum out of this crate is at 0 and may only fall,
+        // so the enum is never spelled here — only carried.
+        let dbz_id = radar_fields::known::REFLECTIVITY;
+        let tilt_dbz =
+            radar_fields::product_for(&dbz_id).expect("the radar crate registers reflectivity");
+        let mrms_paint = rustdar_overlays::render::gridded::field_paint(
+            &rustdar_overlays::mrms::fields::spec(MrmsProduct::ReflectivityComposite).id,
+        )
+        .expect("the mosaic's dBZ field is registered for painting");
+        let hrrr_paint = rustdar_overlays::render::gridded::field_paint(
+            &rustdar_overlays::hrrr::fields::spec(ModelParameter::CompositeReflectivity).id,
+        )
+        .expect("the forecast composite's dBZ field is registered for painting");
+
+        // Every 0.5 dBZ from the overlays' floor to the top of their bars: the
+        // whole range in which all three layers paint something.
+        let mut probes = 0usize;
+        let mut dbz = 5.0f32;
+        while dbz <= 75.0 {
+            let tilt = get_color_for_value(tilt_dbz, dbz).3;
+            let mosaic = mrms_paint.color_for_value(dbz)[3];
+            let forecast = hrrr_paint.color_for_value(dbz)[3];
+            assert_eq!(
+                (tilt, mosaic, forecast),
+                (expected, expected, expected),
+                "at {dbz} dBZ a tilt, the mosaic and the forecast composite \
+                 paint at three different opacities. They are the same \
+                 quantity and can be drawn in the same pane; \
+                 REFLECTIVITY_ALPHA is the one number they all read.",
+            );
+            probes += 1;
+            dbz += 0.5;
+        }
+        // precondition: the sweep is a sweep.
+        assert_eq!(probes, 141);
+
+        // The floor that stops this passing on three transparent answers: every
+        // layer really paints in this range.
+        assert!(
+            [
+                get_color_for_value(tilt_dbz, 40.0).3,
+                mrms_paint.color_for_value(40.0)[3],
+                hrrr_paint.color_for_value(40.0)[3],
+            ]
+            .iter()
+            .all(|&a| a > 0),
+            "precondition: a 40 dBZ core must be opaque on all three layers, or \
+             the agreement above is an agreement about nothing",
+        );
+
+        // And the control: this is not a claim that everything paints at 160.
+        let rho_id = radar_fields::known::CORRELATION_COEFFICIENT;
+        let rho = radar_fields::product_for(&rho_id)
+            .expect("the radar crate registers the correlation coefficient");
+        // The radar crate's other scales keep their own TRANSPARENCY, which is
+        // what makes the reflectivity arm a deliberate exception rather than a
+        // crate-wide edit.
+        assert_ne!(
+            get_color_for_value(rho, 0.95).3,
+            expected,
+            "ρHV now paints at the dBZ alpha too, so the unification leaked out \
+             of the field it was scoped to",
         );
     }
 }
