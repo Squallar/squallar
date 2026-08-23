@@ -42,6 +42,24 @@ Read the graph bottom-up. Nothing in a lower band may depend on a higher one.
 `VolumeCapable` and the volume types, the fetch-policy retry ladder, the wire
 `Reader`/`Writer`, and the TLS provider selection.
 
+**Contract and vocabulary — plus the values two bands both have to agree on.**
+`REFLECTIVITY_STOPS` (`product.rs`) is the first of those and the rule it sets
+is narrow. Until 2026-08-23 a colour ramp was held to belong to the crate that
+published the field, and reflectivity was drawn through three separate tables:
+`rustdar-radar`'s, MRMS's and HRRR's. The two overlay tables were pinned equal
+to each other; the radar one was pinned to nothing, and it had drifted about one
+5 dBZ band through the green-to-red region — the same storm read 45 dBZ red on a
+tilt and orange on the mosaic beside it, in the same pane, with every gate
+green. The stops moved here because the rule below already covers them: this is
+a thing both data crates need, and the edge between them is cut.
+
+**A ramp only one source publishes still lives with that source**, and *how* a
+ramp is painted stays with the source too — `LegendScale::is_gradient` is a
+per-layer decision, and the three dBZ layers genuinely disagree about it (a
+radar tilt is a wash, a mosaic and a forecast composite are bands). What may
+move down here is the shared *value*, not the presentation, and only once a
+second band needs it.
+
 **Band 2 — the data crates.** `rustdar-radar` and `rustdar-overlays` each stand
 on the substrate. **They do not know about each other**: the
 overlays→radar edge is cut, and anything both sides need lives in

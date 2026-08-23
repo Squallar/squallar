@@ -1,16 +1,26 @@
 //! The MRMS products projected into the substrate's read contract:
 //! [`rustdar_source::product::ProductSpec`].
 //!
-//! **This crate cannot reuse `rustdar-radar`'s palette, and that is a rule
-//! rather than an oversight.** The overlays→radar edge is cut and pinned by
-//! `rustdar-source/tests/charter.rs::the_overlays_to_radar_edge_stays_cut`; a
-//! shared colour table would have to move into `rustdar-source`, which is
-//! contract and vocabulary only. Duplicating a reflectivity ramp is the correct
-//! cost of the band; a band violation is not.
+//! **This crate still cannot reuse `rustdar-radar`'s palette — the
+//! overlays→radar edge is cut and pinned by
+//! `rustdar-source/tests/charter.rs::the_overlays_to_radar_edge_stays_cut`.
+//! What changed is where the reflectivity ladder lives.**
 //!
-//! The stops below are the classic NWS reflectivity ladder in **5 dBZ bands**,
-//! `is_gradient: false` because reflectivity is read as bands and not as a
-//! continuous ramp — the number a reader takes off the bar is the band's floor.
+//! This doc used to end "duplicating a reflectivity ramp is the correct cost of
+//! the band". It was wrong about the cost. The duplicate drifted: radar's copy
+//! sat roughly one 5 dBZ band off this one through the green-to-red region, so
+//! a storm read 45 dBZ red on a tilt and orange on the mosaic beside it, and
+//! nothing failed. The stops now live in `rustdar-source` — which is what the
+//! charter's own failure message asks for, "anything both sides need lives in
+//! `rustdar-source` instead" — and this file slices them. Cutting an edge says
+//! the two crates may not reach each other; it never said the value had to be
+//! written twice.
+//!
+//! The stops are [`rustdar_source::product::REFLECTIVITY_STOPS`] from 5 dBZ up,
+//! in **5 dBZ bands**. `is_gradient: false` because reflectivity is read as
+//! bands here and not as a continuous ramp — the number a reader takes off the
+//! bar is the band's floor. **That flag stays this crate's own decision**: the
+//! same ladder is drawn as a wash on a radar tilt, which is a continuous field.
 //!
 //! A composite is a column maximum, so it has no tilt and no vertical extent:
 //! `vertical: false`, `tilted: false`.
@@ -25,7 +35,9 @@ use super::MrmsProduct;
 /// The group label every MRMS product files under.
 pub const GROUP: &str = "MRMS national mosaic";
 
-/// Reflectivity in dBZ, in 5 dBZ bands from 5 up.
+/// Reflectivity in dBZ, in 5 dBZ bands from 5 up:
+/// [`rustdar_source::product::REFLECTIVITY_STOPS`] sliced at
+/// [`rustdar_source::product::REFLECTIVITY_OVERLAY_FLOOR`].
 ///
 /// **The first stop is load-bearing beyond ergonomics.**
 /// [`crate::render::gridded::color_for`] paints nothing below it, so clear air,
@@ -35,26 +47,14 @@ pub const GROUP: &str = "MRMS national mosaic";
 /// `to_reading`'s own doc records the tamper check.
 ///
 /// **A bar whose first stop went below −99 would change that**, and the person
-/// registering it would be editing this file rather than the decoder. Say so
-/// here, where they will be looking.
+/// registering it is now editing the substrate's table or the floor index
+/// rather than this file — which is why
+/// `product::tests::the_reflectivity_ladder_ascends_and_its_overlay_floor_is_five_dbz`
+/// asserts the floor still names 5 dBZ. Say so here, where they will be
+/// looking.
 static REFLECTIVITY: LazyLock<LegendScale> = LazyLock::new(|| {
-    let thresholds = vec![
-        (5.0f32, [0x40u8, 0xe8, 0xe3]),
-        (10.0, [0x26, 0xa4, 0xfa]),
-        (15.0, [0x0a, 0x2f, 0xc0]),
-        (20.0, [0x00, 0xff, 0x00]),
-        (25.0, [0x00, 0xc8, 0x00]),
-        (30.0, [0x00, 0x90, 0x00]),
-        (35.0, [0xff, 0xff, 0x00]),
-        (40.0, [0xe7, 0xc0, 0x00]),
-        (45.0, [0xff, 0x90, 0x00]),
-        (50.0, [0xff, 0x00, 0x00]),
-        (55.0, [0xd6, 0x00, 0x00]),
-        (60.0, [0xc0, 0x00, 0x00]),
-        (65.0, [0xff, 0x00, 0xff]),
-        (70.0, [0x99, 0x55, 0xc9]),
-        (75.0, [0xff, 0xff, 0xff]),
-    ];
+    use rustdar_source::product::{REFLECTIVITY_OVERLAY_FLOOR, REFLECTIVITY_STOPS};
+    let thresholds = REFLECTIVITY_STOPS[REFLECTIVITY_OVERLAY_FLOOR..].to_vec();
     let min_value = thresholds.first().map_or(0.0, |e| e.0);
     let max_value = thresholds.last().map_or(1.0, |e| e.0);
     LegendScale {
@@ -209,6 +209,10 @@ mod tests {
 
     /// Reflectivity's first stop is above zero, which is what makes clear air
     /// transparent even for a value that survived the NaN mapping.
+    ///
+    /// The stops are the substrate's now, so this is a statement about the
+    /// *slice*: a table that grew a stop at the low end without the floor index
+    /// moving with it would drop this bar's floor and paint the domain.
     #[test]
     fn the_reflectivity_bar_starts_above_clear_air() {
         assert!(REFLECTIVITY.thresholds[0].0 >= 5.0);

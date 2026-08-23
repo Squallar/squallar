@@ -1879,9 +1879,9 @@ fn render_overlay_color_scales(
             continue;
         }
 
-        // Always gradient for overlay legends — one image over a ramp baked
-        // once per legend signature. See `crate::legend_ramp`.
-        let thresholds = &legend.items.thresholds;
+        // One image over a ramp baked once per legend signature, and the ramp
+        // is sampled through `overlay_bar_color_at` — which is what makes a
+        // banded scale draw bands. See `crate::legend_ramp`.
         painter.image(
             legend_ramp::ramp(
                 painter.ctx(),
@@ -1889,10 +1889,7 @@ fn render_overlay_color_scales(
                 legend.signature,
                 "legend_ramp_overlay",
                 horizontal,
-                |t| {
-                    let [r, g, b] = interpolate_legend_color(thresholds, min_val + t * range);
-                    [r, g, b, 255]
-                },
+                overlay_ramp_sampler(&legend.items),
             )
             .id(),
             bar_rect,
@@ -1905,8 +1902,25 @@ fn render_overlay_color_scales(
 
         let tick_text = memoized_overlay_ticks(painter.ctx(), id, &legend);
         let mut label_positions: Vec<(f32, &str)> = Vec::new();
-        for (&(val, _), text) in legend.items.thresholds.iter().zip(tick_text.iter()) {
-            let t = (val - min_val) / range;
+        let stop_count = legend.items.thresholds.len();
+        for ((i, &(val, _)), text) in legend
+            .items
+            .thresholds
+            .iter()
+            .enumerate()
+            .zip(tick_text.iter())
+        {
+            // A banded bar's blocks are equal-width, one per stop — the same
+            // convention the radar bar's discrete scales draw under — so the
+            // label for stop `i` goes at the foot of block `i`, not at where
+            // its *value* falls. Placing it by value on a banded bar puts every
+            // label a fraction of a block off and squeezes the top band to
+            // nothing.
+            let t = if legend.items.is_gradient {
+                (val - min_val) / range
+            } else {
+                band_start_fraction(i, stop_count)
+            };
             let pixel_pos = if horizontal {
                 bar_rect.left() + t * bar_rect.width()
             } else {
@@ -1969,6 +1983,68 @@ fn render_overlay_color_scales(
                 title_font,
             );
         }
+    }
+}
+
+/// Where the `i`-th of `n` bands begins, as a fraction of a banded bar's length.
+///
+/// One function for both halves of such a bar — the colour
+/// [`overlay_bar_color_at`] returns and the tick written beside it — so the
+/// blocks and the labels cannot drift apart.
+fn band_start_fraction(i: usize, n: usize) -> f32 {
+    if n == 0 {
+        return 0.0;
+    }
+    i as f32 / n as f32
+}
+
+/// The colour an overlay colour bar shows `t` of the way along its length.
+///
+/// **This is the fix for a bar that lied about its own raster.** The overlay
+/// bars were baked through `interpolate_legend_color` unconditionally, under a
+/// comment reading "always gradient for overlay legends", while the rasters
+/// under them were painted by [`rustdar_source::product::LegendScale`]'s
+/// `is_gradient` — so the MRMS mosaic drew fifteen flat dBZ bands and the bar
+/// beside it drew a continuous wash the picture contained nowhere.
+///
+/// A banded bar is `n` equal blocks, one per stop, which is the convention the
+/// radar bar's own discrete scales already draw under. Equal blocks rather than
+/// blocks the width of each stop's value interval: the top stop's interval is
+/// unbounded above and the bar is not, so laying the bands out on the value
+/// axis would shrink the highest band to a single texel — on MRMS, the 75 dBZ
+/// white would never appear on the bar at all.
+///
+/// Pinned by
+/// [`legend_ladder_tests::an_overlay_legend_bands_when_its_scale_says_bands`],
+/// whose floor is that a genuinely gradient overlay scale still draws a wash.
+fn overlay_bar_color_at(items: &OverlayLegend, t: f32) -> [u8; 3] {
+    let thresholds = &items.thresholds;
+    if thresholds.is_empty() {
+        return [0, 0, 0];
+    }
+    if items.is_gradient {
+        let range = items.max_value - items.min_value;
+        return interpolate_legend_color(thresholds, items.min_value + t * range);
+    }
+    let n = thresholds.len();
+    // A scan over the block feet rather than `(t * n) as usize`, so the block a
+    // texel lands in is decided by the same fractions the labels are placed at
+    // instead of by a second, independently-rounded formula.
+    let block = (0..n)
+        .take_while(|&i| band_start_fraction(i, n) <= t)
+        .last()
+        .unwrap_or(0);
+    thresholds[block].1
+}
+
+/// The closure an overlay bar's ramp is baked through. Split out so what the
+/// painter samples and what
+/// [`legend_ladder_tests::an_overlay_legend_bands_when_its_scale_says_bands`]
+/// probes are the same function and not two spellings of one intention.
+fn overlay_ramp_sampler(items: &OverlayLegend) -> impl Fn(f32) -> [u8; 4] + '_ {
+    move |t| {
+        let [r, g, b] = overlay_bar_color_at(items, t);
+        [r, g, b, 255]
     }
 }
 
@@ -2182,6 +2258,14 @@ mod tests {
     /// enum's `unit_label`. The expectations below were **measured** at
     /// `ed5a1f9b` and pasted in, not derived from the new code, so a formula
     /// that is consistently wrong in both spellings cannot pass.
+    ///
+    /// **One field's row is no longer that capture.** Reflectivity's ticks —
+    /// the same string in all three sets, dBZ having no unit choice — read
+    /// `0|2.5|5|7.5|10|…|75|80|85|90|95` until the three dBZ ladders were
+    /// unified on `rustdar_source::product::REFLECTIVITY_STOPS`. That table has
+    /// no 7.5 dBZ stop, its 5 and 10 coming from the ladder the overlay layers
+    /// draw, and it ends at 75 where radar's own ran to 95. Those labels moved
+    /// because the bar did; every other row is still the `ed5a1f9b` reading.
     #[test]
     fn every_tick_and_unit_string_is_what_it_was_before_the_field_ids() {
         let sets: [(&str, UserPreferences); 3] = [
@@ -2209,7 +2293,7 @@ mod tests {
             (
                 "default",
                 "Reflectivity",
-                "0|2.5|5|7.5|10|15|20|25|30|35|40|45|50|55|60|65|70|75|80|85|90|95",
+                "0|2.5|5|10|15|20|25|30|35|40|45|50|55|60|65|70|75",
                 "dBZ",
             ),
             (
@@ -2306,7 +2390,7 @@ mod tests {
             (
                 "metric",
                 "Reflectivity",
-                "0|2.5|5|7.5|10|15|20|25|30|35|40|45|50|55|60|65|70|75|80|85|90|95",
+                "0|2.5|5|10|15|20|25|30|35|40|45|50|55|60|65|70|75",
                 "dBZ",
             ),
             (
@@ -2398,7 +2482,7 @@ mod tests {
             (
                 "mm",
                 "Reflectivity",
-                "0|2.5|5|7.5|10|15|20|25|30|35|40|45|50|55|60|65|70|75|80|85|90|95",
+                "0|2.5|5|10|15|20|25|30|35|40|45|50|55|60|65|70|75",
                 "dBZ",
             ),
             (
@@ -2828,6 +2912,147 @@ mod tests {
         let names: Vec<&str> = after.iter().map(|v| v.site.name).collect();
         assert!(names.contains(&"ZZZY"), "got {names:?}");
         assert!(names.contains(&"ZZZX"));
+    }
+}
+
+#[cfg(test)]
+mod legend_ladder_tests {
+    use super::*;
+    use rustdar_overlays::hrrr::ModelParameter;
+    use rustdar_overlays::mrms::MrmsProduct;
+
+    fn legend_of(scale: &rustdar_source::product::LegendScale) -> OverlayLegend {
+        OverlayLegend {
+            thresholds: scale.thresholds.clone(),
+            is_gradient: scale.is_gradient,
+            min_value: scale.min_value,
+            max_value: scale.max_value,
+            unit_label: "dBZ",
+        }
+    }
+
+    fn mrms_reflectivity() -> OverlayLegend {
+        legend_of(rustdar_overlays::mrms::fields::spec(MrmsProduct::ReflectivityComposite).scale)
+    }
+
+    /// **The acceptance for the overlay bar that drew a wash over a banded
+    /// raster.** `render_overlay_color_scales` baked every overlay ramp through
+    /// `interpolate_legend_color` regardless of the scale's own `is_gradient`,
+    /// so MRMS's mosaic painted fifteen flat dBZ bands while the bar beside it
+    /// painted a continuous gradient.
+    ///
+    /// Probed through [`overlay_ramp_sampler`], which is the closure the
+    /// painter hands `legend_ramp::ramp` — not a re-derivation of what it ought
+    /// to do.
+    #[test]
+    fn an_overlay_legend_bands_when_its_scale_says_bands() {
+        let mrms = mrms_reflectivity();
+        assert!(!mrms.is_gradient, "precondition: MRMS's dBZ bar is banded");
+        let n = mrms.thresholds.len();
+        assert!(
+            n >= 10,
+            "precondition: {n} stops is too few to read bands off"
+        );
+
+        let sample = overlay_ramp_sampler(&mrms);
+
+        // Inside one block the colour does not move...
+        for i in 0..n {
+            let lo = band_start_fraction(i, n);
+            let hi = band_start_fraction(i + 1, n);
+            let inner = [
+                lo + (hi - lo) * 0.1,
+                lo + (hi - lo) * 0.5,
+                hi - (hi - lo) * 0.05,
+            ];
+            for t in inner {
+                assert_eq!(
+                    sample(t),
+                    sample(lo),
+                    "band {i} of {n} is not flat: t={t} differs from its own foot",
+                );
+            }
+            assert_eq!(
+                sample(lo),
+                [
+                    mrms.thresholds[i].1[0],
+                    mrms.thresholds[i].1[1],
+                    mrms.thresholds[i].1[2],
+                    255,
+                ],
+                "band {i} does not show stop {i}'s own colour",
+            );
+        }
+
+        // ...and it does move across every boundary, so "one colour for the
+        // whole bar" is not what the flatness above would accept.
+        for i in 1..n {
+            let foot = band_start_fraction(i, n);
+            assert_ne!(
+                sample(foot - 1.0 / 4096.0),
+                sample(foot),
+                "the bar does not change colour at the foot of band {i}",
+            );
+        }
+
+        // The floor: a genuinely gradient overlay scale still draws a wash, so
+        // the fix is not "everything is bands now".
+        let precip = legend_of(rustdar_overlays::mrms::fields::spec(MrmsProduct::PrecipRate).scale);
+        assert!(
+            precip.is_gradient,
+            "precondition: MRMS precip rate is a continuous ramp",
+        );
+        let wash = overlay_ramp_sampler(&precip);
+        let moved = (0..64u8)
+            .filter(|&i| {
+                let t = f32::from(i) / 64.0;
+                wash(t) != wash(t + 1.0 / 128.0)
+            })
+            .count();
+        assert!(
+            moved > 40,
+            "a gradient overlay bar must keep moving between its stops; it \
+             changed at only {moved} of 64 probes",
+        );
+    }
+
+    /// **The one place all three dBZ ladders are visible at once.**
+    ///
+    /// `rustdar-overlays` may not name `rustdar-radar` — the charter cuts that
+    /// edge — so the agreement is pinned there against the substrate's table
+    /// and here against the radar palette itself. This is the test that would
+    /// have caught the original defect: the same dBZ read one colour on a radar
+    /// tilt and a different one on the MRMS mosaic drawn in the same pane.
+    #[test]
+    fn every_layer_that_draws_dbz_paints_the_same_ladder() {
+        let radar = crate::field_facts::facts(&radar_fields::known::REFLECTIVITY).scale;
+        let mrms = rustdar_overlays::mrms::fields::spec(MrmsProduct::ReflectivityComposite).scale;
+        let hrrr =
+            rustdar_overlays::hrrr::fields::spec(ModelParameter::CompositeReflectivity).scale;
+
+        let floor = rustdar_source::product::REFLECTIVITY_OVERLAY_FLOOR;
+        assert_eq!(
+            radar.thresholds,
+            rustdar_source::product::REFLECTIVITY_STOPS.to_vec(),
+            "the radar bar is not the substrate's whole ladder",
+        );
+        for (layer, scale) in [("MRMS", mrms), ("HRRR", hrrr)] {
+            assert_eq!(
+                scale.thresholds,
+                radar.thresholds[floor..].to_vec(),
+                "{layer}'s dBZ ladder is not the radar bar's, from 5 dBZ up",
+            );
+        }
+
+        // Banding is the per-layer decision, and it is genuinely different
+        // here — which is what stops the equality above from being a claim
+        // that the three layers are the same object.
+        assert!(radar.is_gradient, "a radar tilt is drawn as a wash");
+        assert!(!mrms.is_gradient, "the mosaic is drawn as bands");
+        assert!(
+            !hrrr.is_gradient,
+            "the forecast composite is drawn as bands"
+        );
     }
 }
 

@@ -2270,7 +2270,15 @@ fn the_half_edge_costs_of_both_encodings_are_measured_per_moment() {
     assert_eq!(
         rows,
         vec![
-            ("ref", 16.25, 32.352),
+            // `ref`'s out-of-band figure read 32.352 until the three dBZ
+            // ladders were unified on `rustdar_source::product::
+            // REFLECTIVITY_STOPS`, which caps reflectivity's legend at 75 dBZ
+            // where radar's own table used to run to 95. The rejected
+            // encoding's ramp is the *legend's* range, so a shorter legend
+            // moves this column and nothing else: the shipped column, which
+            // reads `value_range_for`'s data levels, did not move for any
+            // moment.
+            ("ref", 16.25, 32.333),
             ("vel", -17.0, -3.119),
             ("sw", 1.875, 1.985),
             ("zdr", -3.219, -0.258),

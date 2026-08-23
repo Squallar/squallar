@@ -165,6 +165,15 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          cannot arise now — there is no derivation and no quantum — and names \
          the stronger property's test in the same sentence.",
     ),
+    (
+        "rustdar-overlays/src/hrrr/fields/tests.rs",
+        "the_two_reflectivity_ladders_agree",
+        "The successor is `the_three_reflectivity_ladders_agree`, three lines \
+         below in the same doc, and the paragraph's whole subject is that two \
+         was the wrong number: a third dBZ ladder in `rustdar-radar` had \
+         drifted with nothing comparing it. The old name is what a reader \
+         greps for.",
+    ),
     // ── WO-SITE: the app-wide site, and the four rows that named it ─────
     //
     // The one-for-one mapping, kept here rather than only in a land message,
