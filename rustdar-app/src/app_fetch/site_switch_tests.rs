@@ -783,3 +783,130 @@ fn a_pane_that_did_not_change_radar_keeps_its_3d_grid() {
          will rebuild a grid it is already holding",
     );
 }
+
+/// A pane animating `ids`, each with its own frame list, on `site`.
+///
+/// Different lengths per layer so an assertion below cannot pass by reading
+/// one layer's timeline through another's name.
+fn pane_animating(app: &mut crate::app::App, site: &str, ids: &[LayerId]) {
+    let pane = app.gui.pane_mut(0).expect("a fresh Gui has one pane");
+    pane.set_site(site.to_string());
+    for (n, id) in ids.iter().enumerate() {
+        let ls = pane.time_state_mut(id);
+        ls.phase = rustdar_egui::pane::LoopPhase::Ready;
+        ls.span_secs = 3600;
+        ls.frames = (0..2 + n)
+            .map(|i| rustdar_egui::pane::LoopFrame {
+                timestamp: at(i as u32),
+                image: None,
+                render_in_flight: false,
+                render_failed: false,
+            })
+            .collect();
+    }
+}
+
+/// Which of `ids` still hold a timeline — active, or holding frames.
+fn still_animating(app: &crate::app::App, ids: &[LayerId]) -> Vec<LayerId> {
+    let pane = app.gui.pane(0).expect("a fresh Gui has one pane");
+    ids.iter()
+        .filter(|id| pane.time_state(id).is_active() || !pane.time_state(id).frames.is_empty())
+        .cloned()
+        .collect()
+}
+
+/// **WO-T3.8 — a site change stops every timeline the pane armed.**
+///
+/// `GuiAction::SwitchRadarSite` reset radar's slot by name, so a satellite,
+/// MRMS or model loop on the same pane survived the switch **still playing**.
+/// On a pane whose transport was radar that left every other layer's playhead
+/// deriving off a clock nothing moves any more — the frozen frame presented as
+/// the live picture. The mirror in `handle_disable_loop` was widened to
+/// `stop_every_layer_loop()` by `5ef52be5`; this one was not.
+///
+/// **The satellite-only floor, ruled deliberately: it stops too.** A pane
+/// carrying no radar timeline at all has a loop a site change genuinely does
+/// not invalidate — the viewport does not move, and a GMGSI raster is
+/// georeferenced ground. It is stopped anyway, and the reasons are written at
+/// the site: a site change re-aims the pane and clears everything else it
+/// holds about what it is looking at; whether a loop *could* survive would
+/// otherwise depend on which layer happens to be topmost; and the mirror this
+/// widening copies stops everything. The cost — a twelve-hour loop rebuilt for
+/// an action that invalidated none of it — is named there rather than
+/// absorbed.
+///
+/// **Floors** — (a) a pane whose site did **not** move keeps every timeline,
+/// so "stop everything" is not the answer to every switch; (b) a pane
+/// animating only radar is torn down exactly as before, so the widening is not
+/// paid for by narrowing.
+#[test]
+fn a_site_change_stops_every_timeline_the_pane_armed() {
+    let armed = [known::RADAR, known::GMGSI, known::MODEL_DATA];
+
+    // (a) The no-op: switching to the site the pane is already on.
+    let mut unchanged = headless(TestBridge::desktop());
+    pane_animating(&mut unchanged, WSR88D, &armed);
+    switch_to(&mut unchanged, WSR88D);
+    assert_eq!(
+        still_animating(&unchanged, &armed),
+        armed.to_vec(),
+        "a switch that did not move the pane tore down its timelines anyway",
+    );
+
+    // The bug: three timelines armed, the site moves, and only radar's went.
+    let mut mixed = headless(TestBridge::desktop());
+    pane_animating(&mut mixed, WSR88D, &armed);
+    assert_eq!(
+        still_animating(&mixed, &armed),
+        armed.to_vec(),
+        "precondition: three timelines armed on one pane",
+    );
+    switch_to(&mut mixed, TDWR);
+    assert_eq!(
+        still_animating(&mixed, &armed),
+        Vec::<LayerId>::new(),
+        "a satellite or model loop survived a site change still playing, on a \
+         pane whose radar timeline — the one the transport reads — had just \
+         been torn down",
+    );
+
+    // The ruling, pinned: a pane with no radar timeline at all, whose loop the
+    // site change does not invalidate, stops too.
+    let satellite_only = [known::GMGSI];
+    let mut satellite = headless(TestBridge::desktop());
+    pane_animating(&mut satellite, WSR88D, &satellite_only);
+    satellite
+        .gui
+        .pane_mut(0)
+        .expect("pane 0")
+        .set_transport_layer(known::GMGSI);
+    assert!(
+        !satellite
+            .gui
+            .pane(0)
+            .unwrap()
+            .time_state(&known::RADAR)
+            .is_active(),
+        "precondition: this pane arms no radar timeline, so the ruling below \
+         is about the case a site change really does not invalidate",
+    );
+    switch_to(&mut satellite, TDWR);
+    assert_eq!(
+        still_animating(&satellite, &satellite_only),
+        Vec::<LayerId>::new(),
+        "the ruling is that a site change re-aims the pane and its time state \
+         goes with it — see the reasons at the site; if this is being changed \
+         to a keep, change them there rather than deleting this",
+    );
+
+    // (b) The floor: radar alone, torn down exactly as before.
+    let radar_only = [known::RADAR];
+    let mut radar = headless(TestBridge::desktop());
+    pane_animating(&mut radar, WSR88D, &radar_only);
+    switch_to(&mut radar, TDWR);
+    assert_eq!(
+        still_animating(&radar, &radar_only),
+        Vec::<LayerId>::new(),
+        "the widening stopped reaching radar's own timeline",
+    );
+}

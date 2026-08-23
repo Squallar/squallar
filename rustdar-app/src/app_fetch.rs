@@ -832,17 +832,53 @@ impl super::App {
                             // The loop is the same judgement as the scan above and
                             // belongs behind the same guard.
                             //
-                            // **Radar-addressed, named — and that is WO-T3.8's
-                            // bug, not a keep.** A satellite or model loop has
-                            // nothing to do with the radar site and survives
-                            // this switch still playing. The mirror in
-                            // `handle_disable_loop` was widened to
-                            // `stop_every_layer_loop()`; this one was not.
-                            // WO-T3.7 re-spelled the read and deliberately left
-                            // what it does alone, so the widening lands as its
-                            // own measured change.
-                            *pane.time_state_mut(&known::RADAR) =
-                                rustdar_egui::pane::LayerTimeState::new();
+                            // **Every timeline the pane armed, not radar's
+                            // slot** (WO-T3.8) — the widening `5ef52be5` gave
+                            // `handle_disable_loop` and this mirror did not
+                            // get. It used to reset radar's slot by name, so a
+                            // satellite or model loop survived the switch still
+                            // playing; on a pane whose transport was radar that
+                            // left a loop running with nothing to move its
+                            // clock, which is the frozen-frame defect
+                            // `stop_every_layer_loop` exists to name.
+                            //
+                            // **The ruling on the satellite-only pane, whose
+                            // loop a site change really does not invalidate:
+                            // it stops too.** Three reasons, in order of
+                            // weight:
+                            //
+                            // 1. A site change is the one action that re-aims
+                            //    the pane, and everything else it holds about
+                            //    *what it is looking at* is cleared three
+                            //    lines above — `scan_info`, `data_time`, the
+                            //    section picture, its volume hold and its
+                            //    pending frame downloads. A surviving loop
+                            //    would be the only piece of time state that
+                            //    outlives the re-aim, which is the shape of a
+                            //    half-torn-down pane rather than a
+                            //    preservation.
+                            // 2. Whether the loop *could* survive depends on
+                            //    which layer happens to be topmost, because
+                            //    playback runs off `transport_state()`. A rule
+                            //    that keeps the loop only when the transport is
+                            //    not radar tears down different amounts of
+                            //    state on two panes that look identical, and
+                            //    the user cannot predict which they have.
+                            // 3. `handle_disable_loop` is this site's mirror
+                            //    and stops everything. Widening this one to the
+                            //    same call is the change; carving an exception
+                            //    into it re-creates the split.
+                            //
+                            // **The cost, named rather than absorbed:** a
+                            // satellite-only pane loses a twelve-hour loop to
+                            // an action that did not invalidate a frame of it.
+                            // The fix if that proves wrong in the running app
+                            // is the one `PaneState::set_content` already
+                            // defers — let view-independent overlay loops
+                            // survive *with their transport*, covering the
+                            // view switches and this one together — and not an
+                            // exception here.
+                            pane.stop_every_layer_loop();
                         }
                         pane.loading_site = Some(site.clone());
                         pane.set_site(site.clone());
