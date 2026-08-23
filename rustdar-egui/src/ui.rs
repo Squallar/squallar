@@ -2039,9 +2039,19 @@ impl Gui {
         for pane in &mut self.panes {
             pane.loading_site = None;
             pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
-            for frame in &mut pane.loop_state_mut().frames {
-                frame.image = None;
-                frame.render_in_flight = false;
+            // **Every timeline the pane is animating, not radar's slot**
+            // (WO-T3.5). A non-radar frame's picture is
+            // `LoopFrameImage::Overlay`, holding a `TextureHandle` minted by
+            // the device that is going away; reaching only the radar slot left
+            // every other animating layer's frames pointing at handles the
+            // dead device owned. The generic walk over `overlay_textures`
+            // below has always been right about the live cache — this is the
+            // same statement about the frames.
+            for slot in pane.animating_layers_mut() {
+                for frame in &mut slot.time.frames {
+                    frame.image = None;
+                    frame.render_in_flight = false;
+                }
             }
             for cache in pane.overlay_textures.values_mut() {
                 cache.clear();
