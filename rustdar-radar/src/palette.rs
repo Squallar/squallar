@@ -160,34 +160,44 @@ fn nrot_lookup(nrot: f32) -> (u8, u8, u8, u8) {
 // Color scale tables
 // ————————————————————————————————————————————————————————————————————
 
-/// Reflectivity (dBZ). Gradient regions 0-10 dBZ approximated with discrete steps.
-static REFLECTIVITY: ColorScale = &(
-    &[
-        (0.0, (0, 0, 0)),
-        (2.5, (64, 64, 64)),
-        (5.0, (128, 128, 128)),
-        (7.5, (64, 114, 164)),
-        (10.0, (100, 150, 255)),
-        (15.0, (0, 100, 255)),
-        (20.0, (0, 50, 200)),
-        (25.0, (0, 255, 0)),
-        (30.0, (0, 200, 0)),
-        (35.0, (255, 255, 0)),
-        (40.0, (255, 165, 0)),
-        (45.0, (255, 0, 0)),
-        (50.0, (200, 0, 0)),
-        (55.0, (255, 192, 203)),
-        (60.0, (255, 105, 180)),
-        (65.0, (128, 0, 128)),
-        (70.0, (75, 0, 130)),
-        (75.0, (135, 206, 235)), // hail
-        (80.0, (173, 216, 230)),
-        (85.0, (255, 140, 0)),
-        (90.0, (255, 69, 0)),
-        (95.0, (255, 255, 255)),
-    ],
-    true,
-);
+/// The stop list of this file's tables, in the substrate's `[u8; 3]` spelling.
+///
+/// `const fn` rather than a second hand-written copy: the whole point of
+/// [`rustdar_source::product::REFLECTIVITY_STOPS`] is that no layer keeps its
+/// own transcription of it, and a runtime conversion would put the ladder
+/// behind a `LazyLock` that `scale_color` would have to look through on every
+/// gate.
+const fn as_rgb_tuples<const N: usize>(stops: [(f32, [u8; 3]); N]) -> [(f32, (u8, u8, u8)); N] {
+    let mut out = [(0.0, (0u8, 0u8, 0u8)); N];
+    let mut i = 0;
+    while i < N {
+        let (value, [r, g, b]) = stops[i];
+        out[i] = (value, (r, g, b));
+        i += 1;
+    }
+    out
+}
+
+/// [`REFLECTIVITY`]'s stops, which are the substrate's and not this file's.
+static REFLECTIVITY_STOPS: [(f32, (u8, u8, u8)); 17] =
+    as_rgb_tuples(rustdar_source::product::REFLECTIVITY_STOPS);
+
+/// Reflectivity (dBZ), **0 to 75, from
+/// [`rustdar_source::product::REFLECTIVITY_STOPS`]** — the one ladder radar,
+/// MRMS and HRRR all paint dBZ through. Radar takes the whole table; the two
+/// overlay layers take it from 5 dBZ up.
+///
+/// **The stops are no longer this crate's to choose, but the banding still is,
+/// and it stays a gradient here.** A tilt is a continuous field read as a wash,
+/// and the flag is not cosmetic: it derives the `LutFilter` baked into the
+/// volume wire payload, so flipping it is a `FORMAT_VERSION` change. See
+/// `voxel::tests::the_table_filter_is_nearest_only_for_a_non_gradient_scale`.
+///
+/// The low end is still a grey ramp discretised into steps; what changed is
+/// that 5 dBZ onward is now the overlays' ladder rather than a second one
+/// offset from it by roughly a band. Pinned against the substrate by
+/// [`tests::the_reflectivity_ladder_is_the_substrates`].
+static REFLECTIVITY: ColorScale = &(&REFLECTIVITY_STOPS, true);
 
 /// Velocity outbound / positive (mph thresholds).
 static VELOCITY_OUTBOUND: ColorScale = &(
@@ -490,9 +500,17 @@ static NROT_ANTICYCLONIC: ColorScale = &(
 ///
 /// **Defined in the substrate** (`rustdar_source::product::LegendScale`) since
 /// WO-E9a, because `ProductSpec::scale` names it and that table sits below
-/// every source crate. The values are still built here — the palette tables
-/// above are the physics — and this re-export keeps every consumer's spelling
+/// every source crate. This re-export keeps every consumer's spelling
 /// unchanged.
+///
+/// **This doc used to add that "the palette tables above are the physics" — the
+/// type moved down, the values stayed.** That is still true of fifteen of the
+/// seventeen scales in this file and false of one. Reflectivity is drawn by
+/// three layers at once, and while each kept its own table they drifted: radar's
+/// sat roughly one 5 dBZ band off the mosaic's through the green-to-red region.
+/// Its stops now come from `rustdar_source::product::REFLECTIVITY_STOPS` (see
+/// [`REFLECTIVITY`]). Everything else here is still this crate's — a moment no
+/// other layer publishes has no second table to agree with.
 pub use rustdar_source::product::LegendScale;
 
 fn extract_scale(scale: ColorScale) -> LegendScale {
@@ -1029,6 +1047,75 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Radar's dBZ ladder is the substrate's, whole, and still a gradient.
+    ///
+    /// The stops are `rustdar_source::product::REFLECTIVITY_STOPS` verbatim —
+    /// that is the point of the move — so what this can say is that the slice
+    /// is the *whole* table and that nothing re-spelled a stop on the way
+    /// through [`as_rgb_tuples`]. The `is_gradient` half is the one that must
+    /// not drift: it derives the `LutFilter` baked into the volume wire
+    /// payload, so a flip here is a `FORMAT_VERSION` change and not a palette
+    /// edit.
+    #[test]
+    fn the_reflectivity_ladder_is_the_substrates() {
+        let scale = get_legend_scale(RadarProduct::Reflectivity);
+        assert_eq!(
+            scale.thresholds,
+            rustdar_source::product::REFLECTIVITY_STOPS.to_vec(),
+            "radar's dBZ ladder is no longer the substrate's table",
+        );
+        assert_eq!(
+            scale.min_value, 0.0,
+            "radar takes the ladder from 0 dBZ, not from the overlays' floor",
+        );
+        assert_eq!(scale.max_value, 75.0);
+        assert!(
+            scale.is_gradient,
+            "a tilt is drawn as a wash, and the flag is baked into the volume \
+             wire payload's LutFilter — flipping it is a FORMAT_VERSION change",
+        );
+    }
+
+    /// The interpolated space, not just the stops: a gradient can *reach* a
+    /// colour no stop equals.
+    ///
+    /// `the_range_folded_colour_is_unreachable_through_any_products_scale`
+    /// already sweeps 60 001 values per product through
+    /// [`get_color_for_value`], which covers the blended answers on the
+    /// hundredth. This walks **every** segment at a step three orders finer, so
+    /// a crossing narrower than a hundredth of a dBZ cannot hide between two
+    /// probes: 200 000 steps across a 5 dBZ segment move the fastest channel by
+    /// about 0.0013 of a level, which cannot skip a colour.
+    ///
+    /// **Measured margin, so a future stop edit knows how much room it has.**
+    /// Exactly one segment of the unified ladder has all three of its channel
+    /// intervals bracketing (178, 102, 204) at all — 70 to 75 dBZ, the violet
+    /// (153, 85, 201) climbing to white — and the closest any blend on it comes
+    /// is (166, 106, 207), a squared distance of 169. Every other segment is
+    /// ruled out by a single channel never passing through the target's value,
+    /// so no convex blend of its ends can equal it.
+    #[test]
+    fn no_blend_between_two_reflectivity_stops_lands_on_the_range_folded_purple() {
+        let mut probes = 0usize;
+        for segment in REFLECTIVITY_STOPS.windows(2) {
+            let (lo, _) = segment[0];
+            let (hi, _) = segment[1];
+            let steps = 200_000i32;
+            for step in 0..=steps {
+                let value = lo + (hi - lo) * (step as f32 / steps as f32);
+                assert_ne!(
+                    get_color_for_value(RadarProduct::Reflectivity, value),
+                    RANGE_FOLDED,
+                    "reflectivity blends into the range-folded purple at {value} \
+                     dBZ, between the {lo} and {hi} stops",
+                );
+                probes += 1;
+            }
+        }
+        // precondition: every segment of the ladder really was walked.
+        assert_eq!(probes, (REFLECTIVITY_STOPS.len() - 1) * 200_001);
     }
 
     #[test]

@@ -168,13 +168,39 @@ fn a_banded_bar_paints_one_flat_colour_across_its_band() {
 }
 
 /// The forecast composite and the observed mosaic are read side by side, so the
-/// same dBZ must be the same colour on both. The two stop tables are deliberate
-/// copies — `rustdar-overlays` cannot reach `rustdar-radar`'s palette, and
-/// `crate::mrms::fields` states its own — and nothing but this holds them equal.
+/// same dBZ must be the same colour on both.
+///
+/// **This was `the_two_reflectivity_ladders_agree`, and two was the wrong
+/// number.** It held HRRR's copy equal to MRMS's while a third table in
+/// `rustdar-radar` — the one a radar tilt is drawn through, in the same pane —
+/// sat about one 5 dBZ band away through the green-to-red region with nothing
+/// comparing it to either. The third ladder is the substrate's
+/// `rustdar_source::product::REFLECTIVITY_STOPS`, which both of these now slice
+/// and which `rustdar-radar` takes whole; comparing the two overlay bars
+/// against it is what makes the radar bar part of the same claim, from a crate
+/// that may not name `rustdar-radar`.
+///
+/// The radar end of it is pinned twice more, because this crate cannot see it:
+/// `rustdar_radar::palette::tests::the_reflectivity_ladder_is_the_substrates`
+/// from below, and
+/// `rustdar_egui::ui::map::pane_render::legend_ladder_tests::
+/// every_layer_that_draws_dbz_paints_the_same_ladder`
+/// from the one crate that can hold all three at once.
 #[test]
-fn the_two_reflectivity_ladders_agree() {
+fn the_three_reflectivity_ladders_agree() {
     let hrrr = spec(ModelParameter::CompositeReflectivity).scale;
     let mrms = crate::mrms::fields::spec(crate::mrms::MrmsProduct::ReflectivityComposite).scale;
+    let canonical = rustdar_source::product::REFLECTIVITY_STOPS
+        [rustdar_source::product::REFLECTIVITY_OVERLAY_FLOOR..]
+        .to_vec();
+
+    for (layer, ladder) in [("HRRR", &hrrr.thresholds), ("MRMS", &mrms.thresholds)] {
+        assert_eq!(
+            *ladder, canonical,
+            "{layer}'s dBZ ladder is no longer the substrate's table from the \
+             overlay floor up",
+        );
+    }
     assert_eq!(
         hrrr.thresholds, mrms.thresholds,
         "the two dBZ ladders have drifted apart",
@@ -187,5 +213,13 @@ fn the_two_reflectivity_ladders_agree() {
     assert_eq!(
         hrrr.is_gradient, mrms.is_gradient,
         "one dBZ bar draws bands and the other a wash",
+    );
+
+    // The control: the comparison is against a *sliced* table, not the whole
+    // one, so a slicer that forgot the floor cannot pass by accident.
+    assert_ne!(
+        canonical.len(),
+        rustdar_source::product::REFLECTIVITY_STOPS.len(),
+        "the overlay slice must be shorter than the ladder radar draws",
     );
 }

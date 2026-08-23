@@ -702,37 +702,52 @@ impl std::str::FromStr for ModelParameter {
     }
 }
 
-/// The classic NWS reflectivity ladder in **5 dBZ bands**, from 5 dBZ up.
+/// The dBZ ladder in **5 dBZ bands**, from 5 dBZ up:
+/// [`rustdar_source::product::REFLECTIVITY_STOPS`] sliced at
+/// [`rustdar_source::product::REFLECTIVITY_OVERLAY_FLOOR`].
 ///
-/// **Deliberately a second copy of `crate::mrms::fields::REFLECTIVITY`'s stop
-/// table rather than a reference to it.** The two are the same ladder because a
-/// reader comparing MRMS's observed mosaic against HRRR's forecast composite
-/// must read the same colour off the same dBZ — `the_two_reflectivity_ladders_
-/// agree` is what holds them equal — but the HRRR parameters resolve their
-/// *own* ramp instead of the generic one over a `LegendScale`
+/// **This doc used to say the table was "deliberately a second copy" of
+/// `crate::mrms::fields::REFLECTIVITY`'s stops, held equal only by a test.**
+/// The copies that mattered were three, not two: `rustdar-radar` kept a third,
+/// no test compared it to either of these, and it had drifted about one 5 dBZ
+/// band through the green-to-red region. The stops are now one `const` in the
+/// substrate and every layer slices it. What survives of the old reasoning is
+/// the *shape* this file needs them in: the HRRR parameters resolve their own
+/// ramp instead of the generic one over a `LegendScale`
 /// (`render::gridded::register_model_fields` records why), so this table has to
-/// exist in a form `color_for_value` can walk.
+/// exist as an array `color_for_value` can walk — which is a slice of the
+/// substrate's array, not a transcription of it.
 ///
 /// **The first stop is the transparency floor.** Clear air in a forecast grid
 /// is a small positive or negative dBZ rather than a missing value, so a bar
-/// starting at 0 would paint the whole CONUS domain.
-const REFLECTIVITY_BANDS: [(f32, [u8; 3]); 15] = [
-    (5.0, [0x40, 0xe8, 0xe3]),
-    (10.0, [0x26, 0xa4, 0xfa]),
-    (15.0, [0x0a, 0x2f, 0xc0]),
-    (20.0, [0x00, 0xff, 0x00]),
-    (25.0, [0x00, 0xc8, 0x00]),
-    (30.0, [0x00, 0x90, 0x00]),
-    (35.0, [0xff, 0xff, 0x00]),
-    (40.0, [0xe7, 0xc0, 0x00]),
-    (45.0, [0xff, 0x90, 0x00]),
-    (50.0, [0xff, 0x00, 0x00]),
-    (55.0, [0xd6, 0x00, 0x00]),
-    (60.0, [0xc0, 0x00, 0x00]),
-    (65.0, [0xff, 0x00, 0xff]),
-    (70.0, [0x99, 0x55, 0xc9]),
-    (75.0, [0xff, 0xff, 0xff]),
-];
+/// starting at 0 would paint the whole CONUS domain. That is why the slice
+/// starts at the overlay floor and not at the table's own 0 dBZ stop, which
+/// exists for radar's 3D transfer table.
+const REFLECTIVITY_BANDS: [(f32, [u8; 3]); 15] = reflectivity_bands();
+
+/// [`REFLECTIVITY_BANDS`], as a `const fn` because a slice cannot be spelled as
+/// a fixed-size array in a `const` initialiser without one. The length is
+/// checked by the compiler: a stop added below 5 dBZ changes
+/// `REFLECTIVITY_STOPS.len() - REFLECTIVITY_OVERLAY_FLOOR` and this stops
+/// building.
+const fn reflectivity_bands() -> [(f32, [u8; 3]); 15] {
+    use rustdar_source::product::{REFLECTIVITY_OVERLAY_FLOOR, REFLECTIVITY_STOPS};
+    // Evaluated at compile time, because the caller is a `const`. Without it a
+    // stop added at the TOP of the substrate's table would be dropped here in
+    // silence — the loop below would copy the first fifteen and stop.
+    assert!(
+        REFLECTIVITY_STOPS.len() - REFLECTIVITY_OVERLAY_FLOOR == 15,
+        "the substrate's reflectivity ladder no longer has fifteen stops above \
+         the overlay floor; widen this array to match it",
+    );
+    let mut out = [(0.0, [0u8; 3]); 15];
+    let mut i = 0;
+    while i < out.len() {
+        out[i] = REFLECTIVITY_STOPS[REFLECTIVITY_OVERLAY_FLOOR + i];
+        i += 1;
+    }
+    out
+}
 
 /// Echo-top stops in **kft**, the unit [`ModelParameter::convert_for_display`]
 /// hands the ramp — `RETOP` itself is metres.
