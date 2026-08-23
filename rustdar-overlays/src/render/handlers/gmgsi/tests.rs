@@ -705,6 +705,7 @@ fn fetch_config() -> FetchConfig {
         viewport: None,
         as_of: chrono::Utc::now().naive_utc(),
         depicted_span_secs: None,
+        depicted_frames: Vec::new(),
     }
 }
 
@@ -1163,6 +1164,7 @@ fn two_frame_fetches_share_one_gate_and_the_second_waits_for_the_first() {
         viewport: None,
         as_of: chrono::Utc::now().naive_utc(),
         depicted_span_secs: None,
+        depicted_frames: Vec::new(),
     };
     let pane = PaneRef::across(&[]);
     let mut a = h
@@ -1297,6 +1299,7 @@ async fn live_gmgsi_frame_chain_lists_fetches_and_stages() {
         viewport: None,
         as_of: chrono::Utc::now().naive_utc(),
         depicted_span_secs: None,
+        depicted_frames: Vec::new(),
     };
     let mut h = GmgsiHandler::new();
     h.defaults.enabled = true;

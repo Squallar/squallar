@@ -1086,6 +1086,7 @@ mod tests {
             viewport: None,
             as_of: chrono::Utc::now().naive_utc(),
             depicted_span_secs: None,
+            depicted_frames: Vec::new(),
         };
         for day in [FireDay::Day1, FireDay::Day5] {
             for hazards in 1..=FireHazard::all().len() {

@@ -108,6 +108,7 @@ impl super::App {
             // `None` for the same reason `as_of` is the wall clock: only the
             // pane-and-layer-aware dispatch knows a depicted window exists.
             depicted_span_secs: None,
+            depicted_frames: Vec::new(),
         }
     }
 
@@ -2457,7 +2458,7 @@ fn as_of_for_layer(
 /// `{year}/{doy}/{hour}`, so this is what reaches the archive at all. On a live
 /// pane, and for every other arm, the wall clock the context was built with
 /// survives untouched and the request is byte-for-byte the one it always was.
-fn fetch_config_for_layer(
+pub(super) fn fetch_config_for_layer(
     gui: &rustdar_egui::Gui,
     pane_idx: usize,
     id: &rustdar_source::id::LayerId,
@@ -2465,6 +2466,7 @@ fn fetch_config_for_layer(
 ) -> rustdar_overlays::render::overlay_state::FetchConfig {
     config.as_of = as_of_for_layer(gui, pane_idx, id, config.as_of);
     config.depicted_span_secs = depicted_span_for_layer(gui, pane_idx, id);
+    config.depicted_frames = depicted_frames_for_layer(gui, pane_idx, id);
     config
 }
 
@@ -2495,6 +2497,59 @@ fn depicted_span_for_layer(
             )
     });
     event_lifetime.then_some(pane.time.span_secs)
+}
+
+/// **The instants half of [`as_of_for_layer`], under the same two predicates**:
+/// the frames this pane's transport holds, which are the only instants a
+/// playing loop ever stops on.
+///
+/// [`depicted_span_for_layer`] answers *how wide*; this answers *where*, and
+/// the two are different numbers the moment a loop's frames sit further apart
+/// than an [`TimeAxis::EventLifetime`] layer's own window. The Lookback slider
+/// names one span for the whole application, and a layer whose frames are an
+/// hour apart raises the window its loop is listed over to its own floor
+/// (`Gui::loop_span_secs_for`, `SourceHandler::min_loop_span_secs`): a
+/// thirteen-frame satellite loop is listed over **twelve hours** while the
+/// slider still reads one. A poll told only the slider's hour reaches one
+/// frame of the thirteen and every other frame draws nothing — the user's
+/// "GLM only works on the first frame of a loop" — and a poll told the twelve
+/// hours instead would ask the archive for 24 hours of 20-second granules.
+/// The frames are what makes it neither: thirteen windows, 65 minutes of
+/// archive.
+///
+/// Empty everywhere `as_of` keeps the wall clock, and empty for a pane whose
+/// transport holds no frames, so every such config stays byte-for-byte what it
+/// always was.
+///
+/// [`TimeAxis::EventLifetime`]: rustdar_source::time::TimeAxis::EventLifetime
+fn depicted_frames_for_layer(
+    gui: &rustdar_egui::Gui,
+    pane_idx: usize,
+    id: &rustdar_source::id::LayerId,
+) -> Vec<chrono::NaiveDateTime> {
+    let Some(pane) = gui.pane(pane_idx) else {
+        return Vec::new();
+    };
+    if pane.time.mode.as_of().is_none() {
+        return Vec::new();
+    }
+    let event_lifetime = gui.overlays.handlers().any(|handler| {
+        handler.id() == *id
+            && matches!(
+                handler.time_axis(),
+                rustdar_source::time::TimeAxis::EventLifetime
+            )
+    });
+    if !event_lifetime {
+        return Vec::new();
+    }
+    // **The transport's timeline, not radar's slot** — the layer whose stamps
+    // this pane's clock walks is the one whose frames it can stop on.
+    pane.transport_state()
+        .frames
+        .iter()
+        .map(|frame| frame.timestamp)
+        .collect()
 }
 
 /// Add a frame at `timestamp` to `ls` if the loop is active, is on `site`, and does

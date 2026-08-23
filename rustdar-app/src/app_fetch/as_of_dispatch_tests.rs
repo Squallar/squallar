@@ -250,6 +250,109 @@ fn a_live_panes_fetch_carries_no_span_for_any_layer() {
     }
 }
 
+/// **The instants half, under the same two predicates as the span half.**
+///
+/// The span says how *wide* the pane's timeline is; the frames say *where*
+/// inside it the clock can stop, and the two are different numbers whenever a
+/// layer raises the window its loop is listed over above the Lookback setting
+/// (`SourceHandler::min_loop_span_secs`). A poll told only the setting reaches
+/// one frame of a satellite loop's thirteen.
+///
+/// **Floor — `frames_for_everyone`: drop the `EventLifetime` test from
+/// `depicted_frames_for_layer`.** Every non-event layer then carries the
+/// transport's stamps where it must carry none, and the count assertion is
+/// what refuses it.
+#[test]
+fn a_pane_on_a_loops_clock_names_its_frames_to_the_as_of_dependent_layers_only() {
+    let mut gui = Gui::new();
+    let stamps: Vec<chrono::NaiveDateTime> = (0..4).map(|k| ts(10 + k * 5)).collect();
+    {
+        let pane = gui.pane_mut(0).expect("pane 0");
+        let mut timeline = rustdar_egui::pane::LayerTimeState::new();
+        timeline.phase = rustdar_egui::pane::LoopPhase::Playing;
+        timeline.frames = stamps
+            .iter()
+            .map(|at| rustdar_egui::pane::LoopFrame {
+                timestamp: *at,
+                image: None,
+                render_in_flight: false,
+                render_failed: false,
+            })
+            .collect();
+        *pane.transport_state_mut() = timeline;
+        pane.set_time_mode(TimeMode::AsOf(stamps[0]));
+    }
+    let clock = ts(30);
+
+    let layers = declared(&gui);
+    let event_count = layers
+        .iter()
+        .filter(|(_, axis)| matches!(axis, TimeAxis::EventLifetime))
+        .count();
+    assert!(
+        event_count >= 2 && event_count < layers.len(),
+        "non-triviality floor: both sides of the distinction must be \
+         occupied, or \"only\" is not a claim. {event_count} of {} declare \
+         EventLifetime",
+        layers.len(),
+    );
+
+    let mut named = 0;
+    for (id, axis) in &layers {
+        let want: Vec<chrono::NaiveDateTime> = if matches!(axis, TimeAxis::EventLifetime) {
+            stamps.clone()
+        } else {
+            Vec::new()
+        };
+        let config = fetch_config_for_layer(&gui, 0, id, base_config(clock));
+        assert_eq!(
+            config.depicted_frames,
+            want,
+            "{} declares {axis:?}: its poll must name {} instants",
+            id.as_str(),
+            want.len(),
+        );
+        if !config.depicted_frames.is_empty() {
+            named += 1;
+        }
+    }
+    assert_eq!(
+        named, event_count,
+        "exactly the as-of-dependent layers may be told where the clock stops",
+    );
+}
+
+/// The parity clause: a live pane's poll names no instant at all, so every
+/// quantity inside `fetch_glm_flashes` stays the one it always was.
+#[test]
+fn a_live_panes_fetch_names_no_frames_for_any_layer() {
+    let mut gui = Gui::new();
+    {
+        let pane = gui.pane_mut(0).expect("pane 0");
+        let mut timeline = rustdar_egui::pane::LayerTimeState::new();
+        timeline.phase = rustdar_egui::pane::LoopPhase::Playing;
+        timeline.frames = vec![rustdar_egui::pane::LoopFrame {
+            timestamp: ts(10),
+            image: None,
+            render_in_flight: false,
+            render_failed: false,
+        }];
+        *pane.transport_state_mut() = timeline;
+        pane.set_time_mode(TimeMode::Live);
+    }
+    let clock = ts(30);
+
+    for (id, _) in declared(&gui) {
+        assert!(
+            fetch_config_for_layer(&gui, 0, &id, base_config(clock))
+                .depicted_frames
+                .is_empty(),
+            "{} would tell a live pane's poll where a clock stops",
+            id.as_str(),
+        );
+    }
+}
+
 fn base_config(
     clock: chrono::NaiveDateTime,
 ) -> rustdar_overlays::render::overlay_state::FetchConfig {
@@ -263,5 +366,6 @@ fn base_config(
         viewport: None,
         as_of: clock,
         depicted_span_secs: None,
+        depicted_frames: Vec::new(),
     }
 }

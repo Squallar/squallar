@@ -4459,6 +4459,11 @@ mod gmgsi_loop_tests;
 #[cfg(test)]
 mod mrms_loop_tests;
 
+/// What a GLM loop puts on the glass, frame by frame.
+#[path = "app_render/glm_loop_draw_tests.rs"]
+#[cfg(test)]
+mod glm_loop_draw_tests;
+
 /// The cross-section loop's dispatch, placement and frame-thread pacing.
 #[path = "app_render/loop_section_tests.rs"]
 #[cfg(test)]

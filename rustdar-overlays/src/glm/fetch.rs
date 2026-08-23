@@ -125,19 +125,33 @@ fn granule_start_of(key: &str, as_of: NaiveDateTime) -> NaiveDateTime {
     parse_filename_start_time(key).unwrap_or(as_of)
 }
 
-/// **What the pane depicts**, as one argument: the instant a poll sampled, and
-/// how far the pane's clock can sweep from it before the next poll.
+/// **What the pane depicts**, as one argument: the instant a poll sampled, how
+/// far the pane's clock can sweep from it before the next poll, and — when the
+/// pane is looping — the instants it can actually stop on.
 ///
-/// One struct rather than two parameters because they are never meaningful
-/// apart — a span with no instant names nothing — and because the pair is what
-/// a *loop* is: `as_of` moves every tick and `span_secs` does not.
-#[derive(Clone, Copy, Debug)]
+/// One struct rather than three parameters because they are never meaningful
+/// apart — a span with no instant names nothing — and because the set of them
+/// is what a *loop* is: `as_of` moves every tick and the other two do not.
+#[derive(Clone, Debug)]
 pub struct DepictedWindow {
     /// The instant the picture is of. On a live pane this is the wall clock.
     pub as_of: NaiveDateTime,
     /// [`rustdar_source::handler::FetchConfig::depicted_span_secs`] — `None` on
     /// a live pane, where the pane depicts one moving instant and nothing else.
     pub span_secs: Option<u64>,
+    /// [`rustdar_source::handler::FetchConfig::depicted_frames`] — the instants
+    /// the pane's loop can stop on, empty on a live pane or a loop with no
+    /// frames yet.
+    ///
+    /// **The span says how wide, this says where.** A twelve-hour satellite
+    /// loop of thirteen hourly frames depicts thirteen `time_window_secs`
+    /// slices, 65 minutes of archive in all; the span alone would have this
+    /// round list and download the whole twelve hours object by object, and a
+    /// span narrower than the loop leaves every frame outside it blank. Where
+    /// this is non-empty it decides both the range asked for and which of the
+    /// listed granules are worth downloading; where it is empty every quantity
+    /// below is byte-for-byte what it was.
+    pub frames: Vec<NaiveDateTime>,
 }
 
 pub async fn fetch_glm_flashes(
@@ -152,7 +166,8 @@ pub async fn fetch_glm_flashes(
     let DepictedWindow {
         as_of,
         span_secs: depicted_span_secs,
-    } = depicted;
+        ..
+    } = depicted.clone();
     // The zero-object warning below assumes the queried range is wide enough to
     // always cover an already-published granule.
     debug_assert!(
@@ -193,6 +208,20 @@ pub async fn fetch_glm_flashes(
     // exactly one frame of the sweep had strikes. Retention alone cannot fix
     // that: there is nothing held to retain.
     let horizon = as_of + span;
+
+    // **Where the pane can stop, not just how far it reaches.** A loop's
+    // frames are the only instants it ever draws, and once they are further
+    // apart than `window` the extent between them is archive nothing depicts.
+    // Reading the range off the frames is what makes a twelve-hour loop cost
+    // its thirteen windows instead of its twelve hours — and what stops a
+    // span narrower than the loop (the Lookback slider's own hour against a
+    // satellite layer's twelve-hour floor) leaving every frame outside it
+    // blank. Empty is a live pane or a loop with no frames yet, and then all
+    // three quantities are the span-anchored ones above, unchanged.
+    let (start, cutoff, horizon) = match depicted.depicted_bounds(window) {
+        Some((oldest, newest)) => (oldest, oldest, newest),
+        None => (start, cutoff, horizon),
+    };
 
     // Anchored on the depicted span for the same reason: an instant-anchored
     // cutoff evicts exactly the granules the pane's other frames display.
@@ -235,7 +264,7 @@ pub async fn fetch_glm_flashes(
             });
         }
 
-        let new_keys = plan_downloads(&listing.keys, cache, &mut tally);
+        let new_keys = plan_downloads(&listing.keys, cache, &depicted, window, &mut tally);
 
         if new_keys.is_empty() {
             continue;
@@ -270,7 +299,7 @@ pub async fn fetch_glm_flashes(
     // pane's cache is bounded by its window exactly as it always was, while a
     // span could otherwise hold a day of storm at Event level. Oldest first,
     // so an overflowing loop keeps its newest hours lit.
-    if !span.is_zero() {
+    if !span.is_zero() || depicted.depicted_bounds(window).is_some() {
         cache.evict_oldest_over(MAX_RETAINED_FLASHES);
     }
 
@@ -384,12 +413,80 @@ struct PollTally {
 
 /// The tally counts every listed key, not the returned ones: a download-count
 /// denominator makes one persistent failure look like a total outage.
-fn plan_downloads<'a>(keys: &'a [String], cache: &GlmCache, tally: &mut PollTally) -> Vec<&'a str> {
+fn plan_downloads<'a>(
+    keys: &'a [String],
+    cache: &GlmCache,
+    depicted: &DepictedWindow,
+    window: TimeDelta,
+    tally: &mut PollTally,
+) -> Vec<&'a str> {
     tally.in_window += keys.len();
     keys.iter()
+        .filter(|k| depicted.covers(k.as_str(), window))
         .filter(|k| !cache.contains_key(k.as_str()))
         .map(|k| k.as_str())
         .collect()
+}
+
+/// How much of a granule's content can start before the key's own timestamp
+/// does — GLM publishes a granule every 20 s, and the key names the start of
+/// the 20 s it covers. Doubled, so a listing that skips one publication (the
+/// 40 s gap seen 4 times in 4289 measured granules) still keeps the granule
+/// whose content reaches into a window's opening.
+const GRANULE_SPAN: TimeDelta = TimeDelta::seconds(40);
+
+impl DepictedWindow {
+    /// **The windows this pane actually draws**: each instant it can stop on,
+    /// back one `window`, widened by [`GRANULE_SPAN`] so the granule
+    /// straddling a window's opening is kept rather than missed.
+    ///
+    /// Empty for a round that names no frames — a live pane, and a parked
+    /// scrub with no loop armed — which is what makes both readers below fall
+    /// back to the span-anchored quantities.
+    ///
+    /// [`Self::as_of`] joins the set unconditionally: a parked scrub can sit
+    /// *between* two frames, and the instant on the pane's own clock is
+    /// depicted whether or not a frame is stamped at it.
+    fn depicted_windows(&self, window: TimeDelta) -> Vec<(NaiveDateTime, NaiveDateTime)> {
+        if self.frames.is_empty() {
+            return Vec::new();
+        }
+        std::iter::once(self.as_of)
+            .chain(self.frames.iter().copied())
+            .map(|at| (at - window - GRANULE_SPAN, at))
+            .collect()
+    }
+
+    /// The outermost instants any depicted window touches — what the listing
+    /// is asked over and what retention is anchored on. `None` where no frames
+    /// are named, which is the span-anchored round.
+    fn depicted_bounds(&self, window: TimeDelta) -> Option<(NaiveDateTime, NaiveDateTime)> {
+        let windows = self.depicted_windows(window);
+        let oldest = windows.iter().map(|(from, _)| *from).min()?;
+        let newest = windows.iter().map(|(_, to)| *to).max()?;
+        Some((oldest, newest))
+    }
+
+    /// Whether `key`'s granule falls in any depicted window — the download
+    /// filter, and the whole of what keeps a twelve-hour loop costing its
+    /// thirteen windows instead of its twelve hours.
+    ///
+    /// The test is on the granule's own **start**, which is all a key carries.
+    /// A key whose start cannot be read passes: an undatable granule is not
+    /// evidence that nothing is depicted there, and the flash filter
+    /// downstream is what decides its rows.
+    fn covers(&self, key: &str, window: TimeDelta) -> bool {
+        let windows = self.depicted_windows(window);
+        if windows.is_empty() {
+            return true;
+        }
+        let Some(start) = parse_filename_start_time(key) else {
+            return true;
+        };
+        windows
+            .iter()
+            .any(|&(from, to)| start >= from && start <= to)
+    }
 }
 
 struct GlmListing {

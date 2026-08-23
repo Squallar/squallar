@@ -1035,6 +1035,27 @@ pub struct FetchConfig {
     ///
     /// [`TimeAxis::EventLifetime`]: crate::time::TimeAxis::EventLifetime
     pub depicted_span_secs: Option<u64>,
+    /// **The instants this pane can actually put on the glass** — the frames
+    /// its transport layer holds, plus [`Self::as_of`] itself. Empty on a live
+    /// pane, and empty on a pane whose loop has no frames yet.
+    ///
+    /// [`Self::depicted_span_secs`] says how *wide* the pane's timeline is;
+    /// this says which slices of it are ever drawn, and the two stop being the
+    /// same question the moment a loop's frames are further apart than an
+    /// [`TimeAxis::EventLifetime`] layer's own window. A thirteen-frame
+    /// satellite loop is **twelve hours** wide and depicts thirteen 300 s
+    /// windows inside it — 65 minutes of archive, not 24 hours of it. A source
+    /// given only the span must therefore either under-reach (the Lookback
+    /// slider's one hour of that twelve, which is one frame lit and twelve
+    /// blank) or ask the archive for the whole extent object by object.
+    ///
+    /// Ordering is not promised and duplicates are allowed: a reader takes the
+    /// set. Empty means "no depicted frames to speak of", and a reader falls
+    /// back to [`Self::depicted_span_secs`] — which is a parked scrub with no
+    /// loop armed, where the span *is* the reach.
+    ///
+    /// [`TimeAxis::EventLifetime`]: crate::time::TimeAxis::EventLifetime
+    pub depicted_frames: Vec<chrono::NaiveDateTime>,
 }
 
 /// `Copy` so a rasterizer takes the whole thing rather than three loose scalars.

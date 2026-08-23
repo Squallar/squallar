@@ -442,7 +442,7 @@ fn poll_plan_separates_window_size_from_work_to_do() {
     }
 
     let mut tally = PollTally::default();
-    let new_keys = plan_downloads(&keys, &cache, &mut tally);
+    let new_keys = plan_downloads(&keys, &cache, &live_round(), TimeDelta::zero(), &mut tally);
     assert_eq!(
         tally.in_window, 12,
         "the window still contains every listed file, cached or not"
@@ -450,7 +450,13 @@ fn poll_plan_separates_window_size_from_work_to_do() {
     assert_eq!(new_keys.len(), 3, "only the uncached ones need downloading");
 
     let other: Vec<String> = (0..4).map(|i| format!("w{i}.nc")).collect();
-    plan_downloads(&other, &GlmCache::default(), &mut tally);
+    plan_downloads(
+        &other,
+        &GlmCache::default(),
+        &live_round(),
+        TimeDelta::zero(),
+        &mut tally,
+    );
     assert_eq!(tally.in_window, 16);
 
     let mut cache = GlmCache::default();
@@ -458,7 +464,7 @@ fn poll_plan_separates_window_size_from_work_to_do() {
         cache.insert(key.clone(), t0(), Vec::new());
     }
     let mut tally = PollTally::default();
-    let new_keys = plan_downloads(&keys, &cache, &mut tally);
+    let new_keys = plan_downloads(&keys, &cache, &live_round(), TimeDelta::zero(), &mut tally);
     assert_eq!(new_keys.len(), 1);
     let report =
         summarize_failures(tally.in_window, vec!["k11.nc: boom".into()]).expect("one failure");
@@ -659,7 +665,14 @@ fn a_quiet_granule_is_downloaded_once_not_once_per_poll() {
     let mut cache = GlmCache::default();
     let mut tally = PollTally::default();
     assert_eq!(
-        plan_downloads(&listing, &cache, &mut tally).len(),
+        plan_downloads(
+            &listing,
+            &cache,
+            &live_round(),
+            TimeDelta::zero(),
+            &mut tally
+        )
+        .len(),
         1,
         "an uncached granule must be downloaded once"
     );
@@ -674,7 +687,14 @@ fn a_quiet_granule_is_downloaded_once_not_once_per_poll() {
         cache.evict_before(cutoff);
         let mut tally = PollTally::default();
         assert!(
-            plan_downloads(&listing, &cache, &mut tally).is_empty(),
+            plan_downloads(
+                &listing,
+                &cache,
+                &live_round(),
+                TimeDelta::zero(),
+                &mut tally
+            )
+            .is_empty(),
             "poll {poll}: a granule already downloaded and found empty was \
                  re-queued — this is the every-poll re-fetch, back"
         );
@@ -1273,6 +1293,7 @@ fn poll_spanned(
         DepictedWindow {
             as_of,
             span_secs: depicted_span_secs,
+            frames: Vec::new(),
         },
     ))
 }
@@ -1508,6 +1529,16 @@ fn seed_flash(cache: &mut GlmCache, key: &str, time: NaiveDateTime) {
     );
 }
 
+/// A round that names no depicted frames — a live pane, where every listed
+/// key passes the download filter exactly as it did before the filter existed.
+fn live_round() -> DepictedWindow {
+    DepictedWindow {
+        as_of: wall_clock_unlike_keys(),
+        span_secs: None,
+        frames: Vec::new(),
+    }
+}
+
 fn request_paths(seen: &RecordedRequests) -> Vec<String> {
     seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
@@ -1677,6 +1708,7 @@ fn the_handlers_fetch_task_carries_the_depicted_instant_to_the_bucket() {
         viewport: None,
         as_of: archive_instant(),
         depicted_span_secs: None,
+        depicted_frames: Vec::new(),
     };
 
     let mut tasks = handler.create_fetch_tasks(&config, &PaneRef::bare(0));
@@ -1825,6 +1857,7 @@ fn a_loop_sweeping_two_hours_draws_each_frames_own_strikes_not_the_polls() {
         // What `fetch_config_for_layer` hands a pane whose Lookback is two
         // hours: the loop's clock sweeps that span between polls.
         depicted_span_secs: Some(7200),
+        depicted_frames: Vec::new(),
     };
     let mut tasks = handler.create_fetch_tasks(&config, &PaneRef::bare(0));
     assert_eq!(tasks.len(), 1, "GLM builds exactly one poll task");
@@ -2214,6 +2247,7 @@ fn sweep_poll(
         viewport: None,
         as_of,
         depicted_span_secs: Some(SWEEP_SPAN_SECS),
+        depicted_frames: Vec::new(),
     };
     let mut tasks = handler.create_fetch_tasks(&config, &PaneRef::bare(0));
     assert_eq!(tasks.len(), 1, "GLM builds exactly one poll task");
@@ -2396,6 +2430,158 @@ fn a_poll_landing_on_the_loops_newest_frame_still_fills_the_whole_sweep() {
     );
 }
 
+// ── A loop wider than the slider that named it ───────────────────────────
+
+/// **The satellite-shaped loop**, and the shape the sweep above is not: a
+/// layer declaring `min_loop_frames() = 13` at an hourly step is listed over
+/// **twelve hours** while the Lookback slider still reads one, so a poll told
+/// only [`SWEEP_SPAN_SECS`] reaches one frame of the thirteen.
+const WIDE_STEP_SECS: i64 = 3600;
+
+/// The thirteen instants such a loop can stop on, oldest first.
+fn wide_frames() -> Vec<NaiveDateTime> {
+    let newest = chrono::NaiveDate::from_ymd_opt(2020, 6, 15)
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
+        .unwrap();
+    (0..SWEEP_FRAMES)
+        .map(|i| newest - TimeDelta::seconds(WIDE_STEP_SECS * (SWEEP_FRAMES - 1 - i) as i64))
+        .collect()
+}
+
+/// Frame `i`'s own granule, plus a **decoy** half an hour later — inside the
+/// loop's twelve-hour extent and inside no frame's 300 s window. The decoy is
+/// what tells "asked for the loop's windows" apart from "asked for the loop's
+/// extent, object by object": both light every frame, and only one of them is
+/// affordable.
+fn wide_bucket() -> Vec<(String, Vec<u8>)> {
+    let mut objects = Vec::new();
+    for (i, frame) in wide_frames().into_iter().enumerate() {
+        let start = sweep_granule_start(frame);
+        objects.push((
+            granule_key(start),
+            one_flash_granule(start, 35.0, sweep_lon(i)),
+        ));
+        let decoy = frame + TimeDelta::seconds(WIDE_STEP_SECS / 2);
+        objects.push((
+            granule_key(decoy),
+            one_flash_granule(decoy, 35.0, sweep_lon(i)),
+        ));
+    }
+    objects
+}
+
+/// Every decoy key in [`wide_bucket`] — the granules a round that asked for
+/// the extent would have downloaded and a round that asked for the windows
+/// must not.
+fn wide_decoy_keys() -> Vec<String> {
+    wide_frames()
+        .into_iter()
+        .map(|frame| granule_key(frame + TimeDelta::seconds(WIDE_STEP_SECS / 2)))
+        .collect()
+}
+
+/// One poll of such a loop: the Lookback slider's span, and the frames the
+/// pane can actually stop on beside it.
+fn wide_poll(
+    handler: &mut crate::render::handlers::glm::GlmHandler,
+    sources: &DataSources,
+    as_of: NaiveDateTime,
+) {
+    use crate::render::overlay_state::{FetchConfig, OverlayHandler, PaneRef};
+    let config = FetchConfig {
+        client: loopback_client(),
+        zone_cache_dir: None,
+        sources: sources.clone(),
+        viewport: None,
+        as_of,
+        depicted_span_secs: Some(SWEEP_SPAN_SECS),
+        depicted_frames: wide_frames(),
+    };
+    let mut tasks = handler.create_fetch_tasks(&config, &PaneRef::bare(0));
+    assert_eq!(tasks.len(), 1, "GLM builds exactly one poll task");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let payload = runtime.block_on(tasks.remove(0).future);
+    handler.apply_fetch_result(payload, &PaneRef::bare(0));
+}
+
+/// **A loop wider than the span it was told is lit by its frames, and costs
+/// its frames.**
+///
+/// The sweep above holds where the loop's window and the Lookback setting are
+/// the same number. A satellite loop's are not, and the span alone then
+/// reaches one frame of thirteen — the user's *"only works on the first frame
+/// of a loop"*. Naming the depicted instants is what closes it without asking
+/// the archive for the whole twelve hours: **thirteen 300 s windows, not 24
+/// hours of 20-second granules.**
+///
+/// **Floor — `windows_are_the_extent`: make `DepictedWindow::covers` return
+/// `true` unconditionally.** Every decoy is downloaded and the second
+/// assertion reads 13.
+#[test]
+fn a_loop_wider_than_its_span_is_lit_by_the_frames_it_names() {
+    let (sources, seen) = s3_archive(wide_bucket());
+    let mut handler = sweep_handler();
+    let frames = wide_frames();
+
+    wide_poll(&mut handler, &sources, frames[0]);
+
+    let lit: Vec<usize> = frames
+        .iter()
+        .enumerate()
+        .filter(|&(i, frame)| frame_lit(&handler, *frame, &sweep_bounds(i)))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        lit.len(),
+        SWEEP_FRAMES,
+        "GLM still only works on the first frame of a loop: {} of \
+         {SWEEP_FRAMES} frames drew strikes, lit frames {lit:?}. The loop is \
+         twelve hours wide and the span it was told is {SWEEP_SPAN_SECS}s, so \
+         the instants it names are the only thing that can reach the other \
+         frames.",
+        lit.len(),
+    );
+
+    // The cost claim, and the reason the fix is not "hand it the twelve
+    // hours": a granule inside the loop's extent but inside no frame's window
+    // is listed and left alone.
+    let asked = request_paths(&seen);
+    let decoys = wide_decoy_keys();
+    let downloaded = decoys
+        .iter()
+        .filter(|key| asked.iter().any(|line| line.contains(key.as_str())))
+        .count();
+    assert_eq!(
+        downloaded,
+        0,
+        "{downloaded} of {} granules inside the loop's extent but inside no \
+         frame's window were downloaded. A round that asks for the extent \
+         object by object asks for 24 hours of 20-second granules.",
+        decoys.len(),
+    );
+
+    // Non-triviality: the decoys have to be reachable, or "none downloaded" is
+    // a statement about an empty bucket.
+    assert_eq!(
+        decoys.len(),
+        SWEEP_FRAMES,
+        "fixture: one decoy per frame, or the count above proves nothing",
+    );
+    assert!(
+        !frame_lit(
+            &handler,
+            frames[0] + TimeDelta::seconds(WIDE_STEP_SECS / 2),
+            &sweep_bounds(0)
+        ),
+        "fixture: the decoy's own instant draws nothing, so it really was \
+         never downloaded rather than downloaded and culled",
+    );
+}
+
 /// **A live pane is byte-for-byte the pane it always was.** `span_secs: None`
 /// makes `span` zero, so `horizon == as_of` and the listing's upper bound is
 /// the sampled instant exactly as before this fix.
@@ -2444,6 +2630,7 @@ fn a_live_polls_listing_range_and_returned_set_are_unchanged() {
             DepictedWindow {
                 as_of,
                 span_secs: None,
+                frames: Vec::new(),
             },
         ))
         .expect("the listing answered");
@@ -2592,7 +2779,11 @@ fn lists_issued(as_of: NaiveDateTime, span_secs: Option<u64>, window_secs: f64) 
             window_secs,
             &[GlmDataLevel::Flash],
             &mut cache,
-            DepictedWindow { as_of, span_secs },
+            DepictedWindow {
+                as_of,
+                span_secs,
+                frames: Vec::new(),
+            },
         ))
         .expect("the listing answered");
     list_paths(&seen).len()
@@ -2649,6 +2840,7 @@ async fn live_glm_listing_reaches_the_hour_ahead_of_the_sample() {
         DepictedWindow {
             as_of,
             span_secs: Some(LIVE_SPAN_SECS),
+            frames: Vec::new(),
         },
     )
     .await
