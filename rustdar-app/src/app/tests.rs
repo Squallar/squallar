@@ -3227,6 +3227,65 @@ impl rustdar_overlays::render::overlay_state::OverlayHandler for FrameRecorder {
         _pane: &rustdar_source::handler::PaneRef<'_>,
     ) {
     }
+    fn frames(&self) -> Option<&dyn rustdar_source::time::FrameSource> {
+        Some(self)
+    }
+    fn frames_mut(&mut self) -> Option<&mut dyn rustdar_source::time::FrameSource> {
+        Some(self)
+    }
+}
+
+/// **The two arrival doors are what this double is for**; the other seven are
+/// written out and empty, because the suite's whole claim is that an arriving
+/// listing and an arriving frame each reach *a handler*. A supply that
+/// answered anything would give the drain a second way to be satisfied.
+impl rustdar_source::time::FrameSource for FrameRecorder {
+    fn latest_at(
+        &self,
+        _pane: &rustdar_source::handler::PaneRef<'_>,
+        _t: chrono::NaiveDateTime,
+    ) -> Option<rustdar_source::time::FrameStamp> {
+        None
+    }
+    fn list_frames(
+        &self,
+        _ctx: &rustdar_overlays::render::overlay_state::FetchConfig,
+        _pane: &rustdar_source::handler::PaneRef<'_>,
+        range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+    ) -> rustdar_source::time::FrameListing {
+        rustdar_source::time::FrameListing::empty(range)
+    }
+    fn create_frame_list_task(
+        &self,
+        _ctx: &rustdar_overlays::render::overlay_state::FetchConfig,
+        _pane: &rustdar_source::handler::PaneRef<'_>,
+        _range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+    ) -> Option<rustdar_overlays::render::overlay_state::FetchTask> {
+        None
+    }
+    fn fetch_frame(
+        &self,
+        _ctx: &rustdar_overlays::render::overlay_state::FetchConfig,
+        _pane: &rustdar_source::handler::PaneRef<'_>,
+        _stamp: &rustdar_source::time::FrameStamp,
+    ) -> Option<rustdar_overlays::render::overlay_state::FetchTask> {
+        None
+    }
+    fn frames_resident(
+        &self,
+        _pane: &rustdar_source::handler::PaneRef<'_>,
+    ) -> Vec<rustdar_source::time::FrameStamp> {
+        Vec::new()
+    }
+    fn retain_frames(
+        &mut self,
+        _pane: &rustdar_source::handler::PaneRef<'_>,
+        _keep: &[rustdar_source::time::FrameStamp],
+    ) {
+    }
+    fn frame_horizon(&self, _pane: &rustdar_source::handler::PaneRef<'_>) -> chrono::Duration {
+        chrono::Duration::zero()
+    }
     fn apply_frame_listing(
         &mut self,
         listing: rustdar_source::time::FrameListing,

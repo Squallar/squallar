@@ -32,7 +32,7 @@ use rustdar_geo::GeoBounds;
 use rustdar_source::handler::{FetchPayload, PaneRef};
 use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::DescribedJob;
-use rustdar_source::time::{FrameListing, FrameStamp};
+use rustdar_source::time::{FrameListing, FrameSource, FrameStamp};
 use std::sync::{Arc, Mutex};
 
 use rustdar_overlays::render::overlay_state::{
@@ -91,48 +91,45 @@ struct FrameLayer {
     asked: Arc<Mutex<Asked>>,
 }
 
-impl OverlayHandler for FrameLayer {
-    fn id(&self) -> LayerId {
-        known::MODEL_DATA
+impl FrameSource for FrameLayer {
+    /// The newest listed stamp at or before `t`, carrying the run every stamp
+    /// this double names — the half WI-5's `fetch_frame` assertion is about.
+    fn latest_at(&self, _pane: &PaneRef<'_>, t: chrono::NaiveDateTime) -> Option<FrameStamp> {
+        let mut stamps: Vec<FrameStamp> = self
+            .listed
+            .iter()
+            .map(|valid| FrameStamp {
+                valid: *valid,
+                run: Some(run()),
+            })
+            .collect();
+        stamps.sort_by_key(|stamp| stamp.valid);
+        rustdar_source::time::newest_at_or_before(&stamps, t)
     }
-    fn surface(&self) -> Surface {
-        Surface::Ground
-    }
-    fn draw_order_weight(&self) -> u32 {
-        999
-    }
-    fn display_name(&self) -> &str {
-        "Frames"
-    }
-    fn render_mode(&self) -> RenderMode {
-        RenderMode::Texture
-    }
-    fn data_generation(&self) -> u64 {
-        0
-    }
-    fn has_data(&self, _pane: &PaneRef<'_>) -> bool {
-        true
-    }
-    fn is_fetching(&self) -> bool {
-        false
-    }
-    fn set_fetching(&mut self, _f: bool, _pane: &PaneRef<'_>) {}
-    fn fetch_time(&self) -> Option<web_time::Instant> {
-        None
-    }
-    fn apply_fetch_result(&mut self, _result: FetchPayload, _pane: &PaneRef<'_>) {}
-    fn retain_selections(
-        &self,
-        _selections: &mut Vec<Arc<dyn rustdar_overlays::render::overlay_state::OverlayItem>>,
+
+    /// Residency here is "everything it listed", arranged rather than driven,
+    /// so nothing may evict it and no arrival may add to it.
+    fn retain_frames(&mut self, _pane: &PaneRef<'_>, _keep: &[FrameStamp]) {}
+
+    fn apply_frame_listing(
+        &mut self,
+        _listing: FrameListing,
+        _scope: FetchPayload,
         _pane: &PaneRef<'_>,
     ) {
     }
 
-    fn time_axis(&self) -> rustdar_source::time::TimeAxis {
-        rustdar_source::time::TimeAxis::FrameSeries {
-            typical_step: std::time::Duration::from_secs(3600),
-            extends_future: true,
-        }
+    fn apply_frame(&mut self, _stamp: FrameStamp, _data: FetchPayload, _pane: &PaneRef<'_>) {}
+
+    /// **No listing round trip.** This suite arranges its frames directly; a
+    /// task here would be a second, competing source of them.
+    fn create_frame_list_task(
+        &self,
+        _ctx: &FetchConfig,
+        _pane: &PaneRef<'_>,
+        _range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+    ) -> Option<FetchTask> {
+        None
     }
 
     fn frame_horizon(&self, _pane: &PaneRef<'_>) -> chrono::Duration {
@@ -187,6 +184,60 @@ impl OverlayHandler for FrameLayer {
             kind: known::MODEL_DATA,
             future: Box::pin(async move { Box::new(()) as FetchPayload }),
         })
+    }
+}
+
+impl OverlayHandler for FrameLayer {
+    fn id(&self) -> LayerId {
+        known::MODEL_DATA
+    }
+    fn surface(&self) -> Surface {
+        Surface::Ground
+    }
+    fn draw_order_weight(&self) -> u32 {
+        999
+    }
+    fn display_name(&self) -> &str {
+        "Frames"
+    }
+    fn render_mode(&self) -> RenderMode {
+        RenderMode::Texture
+    }
+    fn data_generation(&self) -> u64 {
+        0
+    }
+    fn has_data(&self, _pane: &PaneRef<'_>) -> bool {
+        true
+    }
+    fn is_fetching(&self) -> bool {
+        false
+    }
+    fn set_fetching(&mut self, _f: bool, _pane: &PaneRef<'_>) {}
+    fn fetch_time(&self) -> Option<web_time::Instant> {
+        None
+    }
+    fn apply_fetch_result(&mut self, _result: FetchPayload, _pane: &PaneRef<'_>) {}
+    fn retain_selections(
+        &self,
+        _selections: &mut Vec<Arc<dyn rustdar_overlays::render::overlay_state::OverlayItem>>,
+        _pane: &PaneRef<'_>,
+    ) {
+    }
+
+    fn time_axis(&self) -> rustdar_source::time::TimeAxis {
+        rustdar_source::time::TimeAxis::FrameSeries {
+            typical_step: std::time::Duration::from_secs(3600),
+            extends_future: true,
+        }
+    }
+    /// This layer comes in stamped frames, and answers every one of
+    /// [`FrameSource`]'s methods below.
+    fn frames(&self) -> Option<&dyn FrameSource> {
+        Some(self)
+    }
+
+    fn frames_mut(&mut self) -> Option<&mut dyn FrameSource> {
+        Some(self)
     }
 
     /// **The instrument.** The dispatch's whole claim is that a loop frame's

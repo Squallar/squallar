@@ -17,7 +17,7 @@ use crate::render::rasterize;
 use chrono::Timelike;
 use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
-use rustdar_source::time::{FrameListing, FrameStamp, TimeAxis};
+use rustdar_source::time::{FrameListing, FrameSource, FrameStamp, TimeAxis};
 
 /// **The one identity of a decoded HRRR grid**: which field, off which run, at
 /// which forecast hour.
@@ -573,7 +573,7 @@ impl ModelListing {
     }
 }
 
-/// One loop frame's grid on its way back from [`OverlayHandler::fetch_frame`].
+/// One loop frame's grid on its way back from [`FrameSource::fetch_frame`].
 ///
 /// A type of its own and **not** `HrrrFetchResult`: the two arrive through two
 /// different doors — `apply_fetch_result` for the live round, `apply_frame`
@@ -751,6 +751,31 @@ impl ModelDataHandler {
             .collect()
     }
 
+    /// **Every stamp a scope names, unclipped by any window** — the closed
+    /// form on the `Forecast` axis, the filed run times on `Analysis`.
+    ///
+    /// One expression, because two of them would be two answers to "what can
+    /// this pane draw": `list_frames` narrows this to a range and
+    /// `latest_at` picks one out of it, and neither may disagree with the
+    /// other about what the set is.
+    fn stamps_of(&self, scope: &ModelScope) -> Vec<FrameStamp> {
+        match scope.axis {
+            ModelAxis::Forecast => Self::forecast_stamps(scope.param, scope.run),
+            ModelAxis::Analysis => self
+                .frame_listings
+                .get(scope)
+                .map(|runs| {
+                    runs.iter()
+                        .map(|run| FrameStamp {
+                            valid: *run + analysis_offset(scope.param),
+                            run: Some(*run),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
     /// Whether a listing has covered the whole of `range` for `scope`.
     fn covers(
         &self,
@@ -809,81 +834,7 @@ impl ModelDataHandler {
     }
 }
 
-impl OverlayHandler for ModelDataHandler {
-    /// The sixteen HRRR parameters this layer offers, projected into the
-    /// substrate's read contract by [`crate::hrrr::fields`].
-    fn products(&self) -> &'static [rustdar_source::product::ProductSpec] {
-        crate::hrrr::fields::products()
-    }
-
-    /// The parameter dropdown: its option values are the parameters'
-    /// `as_str()` spellings, which are exactly the `FieldId`s
-    /// [`crate::hrrr::fields`] registers, so a catalogue tile's id can be sent
-    /// straight through `apply_control`.
-    fn field_control_id(&self) -> Option<&'static str> {
-        Some("parameter")
-    }
-
-    /// **The parameter this pane's dropdown is on**, taken from this layer's
-    /// own per-pane state and projected through its registry row — never
-    /// spelled as a fresh string, so the id can only ever be one
-    /// [`crate::hrrr::fields`] registers.
-    ///
-    /// This layer is not [`SourceHandler::volume`]-capable, so the 3D walk
-    /// stops before it asks; the answer is here because "which field is this
-    /// pane showing" is a question about a layer with fields, not a question
-    /// about 3D.
-    fn current_field(&self, pane: &PaneRef<'_>) -> Option<rustdar_source::product::FieldId> {
-        Some(
-            crate::hrrr::fields::spec(self.view(pane).selected_param)
-                .id
-                .clone(),
-        )
-    }
-    fn id(&self) -> LayerId {
-        known::MODEL_DATA
-    }
-    fn surface(&self) -> Surface {
-        Surface::Ground
-    }
-    fn draw_order_weight(&self) -> u32 {
-        10
-    }
-
-    fn display_name(&self) -> &str {
-        "Model Data"
-    }
-
-    fn render_mode(&self) -> RenderMode {
-        RenderMode::Texture
-    }
-
-    /// HRRR is a run-based forecast: hourly cycles, each carrying grids valid
-    /// at the run time plus a forecast hour — discrete stamped frames, and the
-    /// stamps run **ahead** of the wall clock.
-    fn time_axis(&self) -> TimeAxis {
-        TimeAxis::FrameSeries {
-            typical_step: std::time::Duration::from_secs(3600),
-            extends_future: true,
-        }
-    }
-
-    /// **Thirteen hourly grids — half a day, and a loop rather than a
-    /// before-and-after.**
-    ///
-    /// The Lookback slider's own default is 3600 s, which at
-    /// [`Self::time_axis`]'s hourly step is *two* frames: the shortest thing
-    /// that is a sequence at all. Radar reads the same 3600 s as a dozen
-    /// volumes, which is why the number cannot be one number.
-    ///
-    /// It is the backward half this is about. The `Forecast` axis already
-    /// reaches 18 to 48 hours forward through [`Self::frame_horizon`]; the
-    /// `Analysis` axis reaches nowhere forward at all and is nothing *but*
-    /// this window.
-    fn min_loop_frames(&self) -> usize {
-        13
-    }
-
+impl FrameSource for ModelDataHandler {
     /// **This pane's run decides how far forward the rail reaches** — f48 on a
     /// 00/06/12/18Z cycle, f18 on every other hour. See [`forecast_horizon`].
     ///
@@ -941,6 +892,28 @@ impl OverlayHandler for ModelDataHandler {
         frames
     }
 
+    /// **The newest grid this pane's scope reaches at or before `t`**, over
+    /// every stamp the scope names and with no window to clip it at.
+    ///
+    /// `run` is carried, and here it is load-bearing rather than decorative:
+    /// on the `Analysis` axis two runs' f00 grids are two different pictures,
+    /// and on `Forecast` the whole set belongs to one run whose identity is
+    /// what tells a forecast frame from the analysis of the hour it depicts.
+    ///
+    /// `None` before anything has named this pane's run — the state a pane is
+    /// in when its loop is first switched on. A synchronous read must not
+    /// reach for the wall clock; see [`Self::run_of`].
+    fn latest_at(
+        &self,
+        pane: &PaneRef<'_>,
+        t: chrono::NaiveDateTime,
+    ) -> Option<rustdar_source::time::FrameStamp> {
+        let scope = self.scope_of(self.view(pane))?;
+        let mut frames = self.stamps_of(&scope);
+        frames.sort_by_key(|stamp| stamp.valid);
+        rustdar_source::time::newest_at_or_before(&frames, t)
+    }
+
     /// **What frames exist over `range`, per axis.**
     ///
     /// `Forecast` is a closed form of the run — `min_forecast_hour` to the
@@ -962,21 +935,8 @@ impl OverlayHandler for ModelDataHandler {
             return FrameListing::empty(range);
         };
         let (mut frames, complete) = match scope.axis {
-            ModelAxis::Forecast => (Self::forecast_stamps(scope.param, scope.run), true),
-            ModelAxis::Analysis => (
-                self.frame_listings
-                    .get(&scope)
-                    .map(|runs| {
-                        runs.iter()
-                            .map(|run| FrameStamp {
-                                valid: *run + analysis_offset(scope.param),
-                                run: Some(*run),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                self.covers(&scope, range),
-            ),
+            ModelAxis::Forecast => (self.stamps_of(&scope), true),
+            ModelAxis::Analysis => (self.stamps_of(&scope), self.covers(&scope, range)),
         };
         frames.retain(|stamp| range.0 <= stamp.valid && stamp.valid <= range.1);
         frames.sort_by_key(|stamp| stamp.valid);
@@ -1180,6 +1140,92 @@ impl OverlayHandler for ModelDataHandler {
     /// ([`MODEL_GRID_BUDGET_BYTES`], evicting by use under a byte budget), and
     /// a second eviction authority would fight it.
     fn retain_frames(&mut self, _pane: &PaneRef<'_>, _keep: &[FrameStamp]) {}
+}
+
+impl OverlayHandler for ModelDataHandler {
+    /// The sixteen HRRR parameters this layer offers, projected into the
+    /// substrate's read contract by [`crate::hrrr::fields`].
+    fn products(&self) -> &'static [rustdar_source::product::ProductSpec] {
+        crate::hrrr::fields::products()
+    }
+
+    /// The parameter dropdown: its option values are the parameters'
+    /// `as_str()` spellings, which are exactly the `FieldId`s
+    /// [`crate::hrrr::fields`] registers, so a catalogue tile's id can be sent
+    /// straight through `apply_control`.
+    fn field_control_id(&self) -> Option<&'static str> {
+        Some("parameter")
+    }
+
+    /// **The parameter this pane's dropdown is on**, taken from this layer's
+    /// own per-pane state and projected through its registry row — never
+    /// spelled as a fresh string, so the id can only ever be one
+    /// [`crate::hrrr::fields`] registers.
+    ///
+    /// This layer is not [`SourceHandler::volume`]-capable, so the 3D walk
+    /// stops before it asks; the answer is here because "which field is this
+    /// pane showing" is a question about a layer with fields, not a question
+    /// about 3D.
+    fn current_field(&self, pane: &PaneRef<'_>) -> Option<rustdar_source::product::FieldId> {
+        Some(
+            crate::hrrr::fields::spec(self.view(pane).selected_param)
+                .id
+                .clone(),
+        )
+    }
+    fn id(&self) -> LayerId {
+        known::MODEL_DATA
+    }
+    fn surface(&self) -> Surface {
+        Surface::Ground
+    }
+    fn draw_order_weight(&self) -> u32 {
+        10
+    }
+
+    fn display_name(&self) -> &str {
+        "Model Data"
+    }
+
+    fn render_mode(&self) -> RenderMode {
+        RenderMode::Texture
+    }
+
+    /// HRRR is a run-based forecast: hourly cycles, each carrying grids valid
+    /// at the run time plus a forecast hour — discrete stamped frames, and the
+    /// stamps run **ahead** of the wall clock.
+    fn time_axis(&self) -> TimeAxis {
+        TimeAxis::FrameSeries {
+            typical_step: std::time::Duration::from_secs(3600),
+            extends_future: true,
+        }
+    }
+
+    /// **Thirteen hourly grids — half a day, and a loop rather than a
+    /// before-and-after.**
+    ///
+    /// The Lookback slider's own default is 3600 s, which at
+    /// [`Self::time_axis`]'s hourly step is *two* frames: the shortest thing
+    /// that is a sequence at all. Radar reads the same 3600 s as a dozen
+    /// volumes, which is why the number cannot be one number.
+    ///
+    /// It is the backward half this is about. The `Forecast` axis already
+    /// reaches 18 to 48 hours forward through [`Self::frame_horizon`]; the
+    /// `Analysis` axis reaches nowhere forward at all and is nothing *but*
+    /// this window.
+    fn min_loop_frames(&self) -> usize {
+        13
+    }
+
+    /// This layer comes in stamped frames, and answers every one of
+    /// [`FrameSource`]'s methods below.
+    fn frames(&self) -> Option<&dyn FrameSource> {
+        Some(self)
+    }
+
+    fn frames_mut(&mut self) -> Option<&mut dyn FrameSource> {
+        Some(self)
+    }
 
     fn is_enabled(&self, pane: &PaneRef<'_>) -> bool {
         self.view(pane).enabled

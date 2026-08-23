@@ -17,7 +17,7 @@ use rustdar_source::handler::{
 };
 use rustdar_source::id::{LayerId, known};
 use rustdar_source::product::ProductSpec;
-use rustdar_source::time::{FrameListing, FrameStamp};
+use rustdar_source::time::{FrameListing, FrameSource, FrameStamp};
 
 /// **The radar layer's registration — one row, and the only one this crate
 /// has.**
@@ -125,18 +125,18 @@ pub struct RadarSource {
     /// radar's data about another's coordinates, undetectably.
     ///
     /// Identifiers are radar-private — nothing above this layer holds one —
-    /// which is what makes [`SourceHandler::fetch_frame`] the only door to a
+    /// which is what makes [`FrameSource::fetch_frame`] the only door to a
     /// frame's bytes.
     listings: HashMap<(String, NaiveDateTime), Identifier>,
     /// The windows each site has a **covering** listing for, so
-    /// [`SourceHandler::list_frames`] can say `complete` about a window
+    /// [`FrameSource::list_frames`] can say `complete` about a window
     /// rather than about whatever it happens to hold.
     ///
     /// Merged rather than replaced: two panes looping one site with two
     /// windows must not evict each other's frames. Nothing prunes this
     /// within a session — a listed site-day is ~288 stamps and one identifier
     /// each — and the eviction door for it is
-    /// [`SourceHandler::retain_frames`], which this layer does not yet
+    /// [`FrameSource::retain_frames`], which this layer does not yet
     /// answer.
     covered: HashMap<String, Vec<(NaiveDateTime, NaiveDateTime)>>,
     /// **Whether the archive poll runs at all** — the ☰ menu's "Auto-poll" and
@@ -270,66 +270,44 @@ impl rustdar_source::volume::VolumeCapable for RadarSource {
     }
 }
 
-impl SourceHandler for RadarSource {
-    fn id(&self) -> LayerId {
-        known::RADAR
-    }
-    fn surface(&self) -> Surface {
-        Surface::Ground
-    }
-    fn draw_order_weight(&self) -> u32 {
-        30
-    }
-    fn display_name(&self) -> &str {
-        "Radar"
-    }
-    /// The seventeen moments and derivations this crate renders, projected into
-    /// the substrate's read contract by [`crate::fields`].
-    fn products(&self) -> &'static [ProductSpec] {
-        crate::fields::products()
-    }
-    /// **The field this pane has selected**, read out of the slot config
-    /// `publish_radar_selection` keeps current — the same door
-    /// [`Self::site_of`] reads the pane's site through, and the same
-    /// staleness argument applies to both.
+/// **Radar's frame supply — and it is the one implementation whose storage is
+/// not all below it.**
+///
+/// The listing half is whole: `list_frames`, `create_frame_list_task`,
+/// `fetch_frame` and `apply_frame_listing` all live here, each scoped by the
+/// SITE, which the stamps themselves never carry. The *residency* half is not:
+/// a listed volume's decoded scan and its paired Level III objects are held by
+/// the app layer above this crate, so `frames_resident`, `retain_frames` and
+/// `apply_frame` answer the honest empty and say why in their own bodies.
+/// WO-M12d is the move that makes them real; until it lands, a caller reading
+/// residency off this layer is reading a true "I hold none", not a true
+/// "nothing is held".
+impl FrameSource for RadarSource {
+    /// **The newest volume this pane's site has listed at or before `t`.**
     ///
-    /// `None` on a pane whose slots have never been hydrated, on a
-    /// `PaneRef::across` union (whose config is null by construction), and on
-    /// a member this build cannot read as a field id. A caller that gets
-    /// `None` has not learned that the pane is showing nothing — it has
-    /// learned that this layer cannot say, which is why the 3D walk treats it
-    /// as "not this slot" rather than as a refusal.
-    fn current_field(&self, pane: &PaneRef<'_>) -> Option<rustdar_source::product::FieldId> {
-        serde_json::from_value(pane.config.get("product")?.clone()).ok()
+    /// Scoped by site and by nothing else: two sites routinely share a
+    /// timestamp, and answering across them once rendered one radar's data
+    /// about another's coordinates. `run: None` — a volume is observed and has
+    /// no cycle behind it.
+    ///
+    /// Answered from the **listings**, which is the same set `list_frames`
+    /// reads. It is deliberately not answered from what is decoded and
+    /// resident: this says what the layer could draw at `t`, and the residency
+    /// question is the separate one this layer cannot yet answer at all.
+    fn latest_at(&self, pane: &PaneRef<'_>, t: NaiveDateTime) -> Option<FrameStamp> {
+        let site = Self::site_of(pane)?;
+        let mut frames: Vec<FrameStamp> = self
+            .listings
+            .keys()
+            .filter(|(listed, _)| listed == site)
+            .map(|(_, valid)| FrameStamp {
+                valid: *valid,
+                run: None,
+            })
+            .collect();
+        frames.sort_by_key(|frame| frame.valid);
+        rustdar_source::time::newest_at_or_before(&frames, t)
     }
-
-    /// Radar is this build's one 3D source.
-    fn volume(&self) -> Option<&dyn rustdar_source::volume::VolumeCapable> {
-        Some(self)
-    }
-
-    fn render_mode(&self) -> RenderMode {
-        RenderMode::Texture
-    }
-    /// Discrete stamped volumes, never ahead of the wall clock. The nominal
-    /// step is the WSR-88D precipitation cadence; the measured truth for a
-    /// window is the loop's own `cadence_secs`, which this never overrides.
-    fn time_axis(&self) -> rustdar_source::time::TimeAxis {
-        rustdar_source::time::TimeAxis::FrameSeries {
-            typical_step: std::time::Duration::from_secs(300),
-            extends_future: false,
-        }
-    }
-    fn default_enabled(&self) -> bool {
-        true
-    }
-
-    // ── Frame supply (WO-M12b) ────────────────────────────────────────
-    //
-    // The three doors a `FrameSeries` layer answers through. `list_frames` is
-    // the synchronous read, `create_frame_list_task` the listing that fills
-    // it, `fetch_frame` the one route to a frame's bytes. Every one of them
-    // is scoped by the SITE, which the stamps themselves never carry.
 
     /// The volumes this site has listed inside `range`, ascending.
     ///
@@ -472,6 +450,127 @@ impl SourceHandler for RadarSource {
         if listing.complete {
             self.covered.entry(site).or_default().push(range);
         }
+    }
+
+    /// **Empty, always — and that is a true statement about this layer, not
+    /// about the frames.**
+    ///
+    /// A radar frame's data is a decoded [`crate::scan::Scan`] plus the
+    /// Level III objects paired with it, and both caches sit in the app layer
+    /// **above** this crate rather than behind this trait. This layer holds
+    /// only the archive identifiers a listing found, which are what a frame
+    /// can be fetched *with*, not the frame itself. So there is nothing here
+    /// to report as resident, and reporting the listed stamps instead would be
+    /// a lie a caller cannot detect: it would say "ready to draw without a
+    /// fetch" of a volume that has not been downloaded.
+    ///
+    /// **This body is why this trait has no defaults.** Under the old surface
+    /// this exact answer was *inherited*, and the contract's own doc had to
+    /// carry a paragraph saying the claim it made was not true of the one
+    /// layer implementing it. Written out, the gap is a reviewable line of
+    /// code with a name on it (WO-M12d) instead of a silence.
+    ///
+    /// A conformance walk over this method must therefore **name radar
+    /// explicitly** rather than let an empty answer read as agreement.
+    fn frames_resident(&self, _pane: &PaneRef<'_>) -> Vec<FrameStamp> {
+        Vec::new()
+    }
+
+    /// **A no-op, for the reason [`Self::frames_resident`] gives**: this layer
+    /// holds no frame data, so there is nothing here for an eviction door to
+    /// drop. Radar's frame caches are evicted by the app layer that owns them.
+    ///
+    /// Not "eviction is unnecessary" — the caches are real and they are
+    /// evicted; the door is simply not this one yet.
+    fn retain_frames(&mut self, _pane: &PaneRef<'_>, _keep: &[FrameStamp]) {}
+
+    /// **Never called, and the arrival path is why.**
+    ///
+    /// [`Self::fetch_frame`] answers with an undecoded archive
+    /// ([`RadarFrameFetch`]), and the app layer intercepts that payload on the
+    /// `FrameReady` arrival before the registry forwards it: the bytes go
+    /// through the worker funnel to be decoded, and the decoded volume lands
+    /// in the cache this layer cannot see. Every other layer's frame reaches
+    /// its handler through this method.
+    ///
+    /// It is written out rather than inherited so that the interception is a
+    /// stated fact of this layer instead of a silent asymmetry in the caller.
+    /// It becomes real with [`Self::frames_resident`], at WO-M12d.
+    fn apply_frame(&mut self, _stamp: FrameStamp, _data: FetchPayload, _pane: &PaneRef<'_>) {}
+
+    /// **Zero, and it is a decision rather than an omission.** A volume
+    /// records a scan that happened, so none exists for an instant that has
+    /// not: the same fact [`SourceHandler::time_axis`] states as
+    /// `extends_future: false`. The rail must not offer this layer a stop past
+    /// the wall clock.
+    fn frame_horizon(&self, _pane: &PaneRef<'_>) -> chrono::Duration {
+        chrono::Duration::zero()
+    }
+}
+
+impl SourceHandler for RadarSource {
+    fn id(&self) -> LayerId {
+        known::RADAR
+    }
+    fn surface(&self) -> Surface {
+        Surface::Ground
+    }
+    fn draw_order_weight(&self) -> u32 {
+        30
+    }
+    fn display_name(&self) -> &str {
+        "Radar"
+    }
+    /// The seventeen moments and derivations this crate renders, projected into
+    /// the substrate's read contract by [`crate::fields`].
+    fn products(&self) -> &'static [ProductSpec] {
+        crate::fields::products()
+    }
+    /// **The field this pane has selected**, read out of the slot config
+    /// `publish_radar_selection` keeps current — the same door
+    /// [`Self::site_of`] reads the pane's site through, and the same
+    /// staleness argument applies to both.
+    ///
+    /// `None` on a pane whose slots have never been hydrated, on a
+    /// `PaneRef::across` union (whose config is null by construction), and on
+    /// a member this build cannot read as a field id. A caller that gets
+    /// `None` has not learned that the pane is showing nothing — it has
+    /// learned that this layer cannot say, which is why the 3D walk treats it
+    /// as "not this slot" rather than as a refusal.
+    fn current_field(&self, pane: &PaneRef<'_>) -> Option<rustdar_source::product::FieldId> {
+        serde_json::from_value(pane.config.get("product")?.clone()).ok()
+    }
+
+    /// Radar is this build's one 3D source.
+    fn volume(&self) -> Option<&dyn rustdar_source::volume::VolumeCapable> {
+        Some(self)
+    }
+
+    /// This layer comes in stamped volumes, and answers every one of
+    /// [`FrameSource`]'s methods — including the three whose honest answer is
+    /// empty because its frame storage is still above this crate.
+    fn frames(&self) -> Option<&dyn FrameSource> {
+        Some(self)
+    }
+
+    fn frames_mut(&mut self) -> Option<&mut dyn FrameSource> {
+        Some(self)
+    }
+
+    fn render_mode(&self) -> RenderMode {
+        RenderMode::Texture
+    }
+    /// Discrete stamped volumes, never ahead of the wall clock. The nominal
+    /// step is the WSR-88D precipitation cadence; the measured truth for a
+    /// window is the loop's own `cadence_secs`, which this never overrides.
+    fn time_axis(&self) -> rustdar_source::time::TimeAxis {
+        rustdar_source::time::TimeAxis::FrameSeries {
+            typical_step: std::time::Duration::from_secs(300),
+            extends_future: false,
+        }
+    }
+    fn default_enabled(&self) -> bool {
+        true
     }
     fn is_enabled(&self, pane: &PaneRef<'_>) -> bool {
         PaneToggle::is_on(pane, self.enabled)

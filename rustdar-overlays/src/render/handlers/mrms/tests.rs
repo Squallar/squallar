@@ -1183,3 +1183,126 @@ fn two_frame_fetches_share_one_gate_and_the_second_waits_for_the_first() {
         );
     });
 }
+
+/// **`latest_at` answers `FrameSeries`'s rule here too**, over a known listing
+/// of thirty ~2-minute mosaics.
+///
+/// Same three edges as the satellite layer's pin of the same name, because it
+/// is the same rule and there is one implementation of it.
+///
+/// **Floor** — the `t`-exactly-on-a-stamp case is asserted for every one of
+/// the thirty stamps, and asserted to be that stamp rather than its
+/// predecessor.
+#[test]
+fn latest_at_answers_the_frame_series_rule() {
+    let product = MrmsProduct::ReflectivityComposite;
+    let mut h = MrmsHandler::new();
+    h.defaults.enabled = true;
+    h.defaults.selected_product = product;
+    let pane = PaneRef::across(&[]);
+    file_listing(&mut h, product, 30, true);
+
+    assert_eq!(
+        h.latest_at(&pane, t(0) - chrono::Duration::seconds(1)),
+        None,
+        "one second before the oldest mosaic there is nothing to draw, and \
+         the oldest mosaic is not it",
+    );
+    assert_eq!(
+        h.latest_at(&pane, t(29) + chrono::Duration::hours(1)),
+        Some(FrameStamp {
+            valid: t(29),
+            run: None,
+        }),
+        "an hour past the newest mosaic still draws the newest: nothing later \
+         depicts anything",
+    );
+    for k in 0..30 {
+        assert_eq!(
+            h.latest_at(&pane, t(k)),
+            Some(FrameStamp {
+                valid: t(k),
+                run: None,
+            }),
+            "the clock standing exactly on mosaic {k} draws mosaic {k}, never \
+             mosaic {}",
+            k - 1,
+        );
+    }
+    assert_eq!(
+        h.latest_at(&pane, t(7) + chrono::Duration::seconds(1)),
+        Some(FrameStamp {
+            valid: t(7),
+            run: None,
+        }),
+        "one second after a mosaic's stamp is still drawn from that mosaic",
+    );
+}
+
+/// **The satellite layer's blank leading frame, in the mosaic layer's own
+/// window** — the identical clip, found by the contract rather than by a user.
+///
+/// `list_frames` clipped at `range.0`, so a window opened between two mosaics
+/// came back without the one every stop in front of its first listed stamp is
+/// drawn from. It never produced a report because this layer's cadence is
+/// ~2 minutes rather than an hour, so the blank leading step was gone before
+/// anyone could see it — a smaller instance of the same defect, not a
+/// different one.
+///
+/// **Floors.** (a) A window opened exactly on a stamp reaches nothing extra —
+/// it is the newest earlier mosaic, not a blanket step of slack. (b) Only one
+/// earlier mosaic comes in, never the tail behind it. (c) The trailing edge is
+/// untouched.
+#[test]
+fn a_listing_carries_the_mosaic_the_window_opened_after() {
+    let product = MrmsProduct::ReflectivityComposite;
+    let mut h = MrmsHandler::new();
+    h.defaults.enabled = true;
+    h.defaults.selected_product = product;
+    let pane = PaneRef::across(&[]);
+    let ctx = fetch_config();
+    file_listing(&mut h, product, 30, true);
+
+    let valid = |range| {
+        h.list_frames(&ctx, &pane, range)
+            .frames
+            .into_iter()
+            .map(|f| f.valid)
+            .collect::<Vec<_>>()
+    };
+
+    // The stamps are 121 s apart, so a window opened one second after mosaic
+    // 3 has 120 s of clock in front of mosaic 4.
+    let one_second = chrono::Duration::seconds(1);
+    assert_eq!(
+        valid((t(3) + one_second, t(5))),
+        vec![t(3), t(4), t(5)],
+        "a window opened a second after mosaic 3 is drawn from mosaic 3 until \
+         mosaic 4 lands, so mosaic 3 is the oldest frame it can be answered \
+         with",
+    );
+
+    // Floor (a): opened exactly on a stamp, nothing extra.
+    assert_eq!(
+        valid((t(3), t(5))),
+        vec![t(3), t(4), t(5)],
+        "a window opened exactly on a mosaic already holds its own oldest \
+         frame and must not reach behind it",
+    );
+
+    // Floor (b): one mosaic earlier, not the tail.
+    assert_eq!(
+        valid((t(28) + one_second, t(29))),
+        vec![t(28), t(29)],
+        "the newest earlier mosaic comes in, not every mosaic before the \
+         window",
+    );
+
+    // Floor (c): the trailing edge is unchanged.
+    assert_eq!(
+        valid((t(3), t(5) + one_second)),
+        vec![t(3), t(4), t(5)],
+        "mosaic 6 depicts an instant later than anything the window reaches, \
+         so it is not one of its frames",
+    );
+}

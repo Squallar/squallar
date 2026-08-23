@@ -214,7 +214,7 @@ impl RailRegions {
     /// the layer's own [`rustdar_source::time::TimeAxis`] step, anchored on
     /// the epoch, which is where an hourly model's valid times are. It names
     /// a grid, not a promise that a frame exists on it — the same bound
-    /// `SourceHandler::frame_horizon` carries.
+    /// `FrameSource::frame_horizon` carries.
     pub(crate) fn snap_future(&self, target: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
         if self.step_secs <= 0 {
             return target;
@@ -1221,13 +1221,14 @@ impl super::Gui {
     /// to the floor that layer declares, which is the same window its loop is
     /// listed over, so turning the loop off no longer lands the clock outside
     /// the rail that has to show it. The forecast is
-    /// `SourceHandler::frame_horizon`, read off the registry by id rather
+    /// `FrameSource::frame_horizon`, read off the registry by id rather
     /// than re-spelled here as a `match` on the id.
     ///
-    /// A layer whose axis does not declare `extends_future`, one the registry
-    /// does not serve, or a forecast layer whose current selection happens to
-    /// reach nowhere forward all get [`RailRegions::past_only`] — and with it
-    /// the rail this scrubber had before WI-11, to the pixel.
+    /// A layer whose axis does not declare `extends_future`, one that supplies
+    /// no frames at all, one the registry does not serve, or a forecast layer
+    /// whose current selection happens to reach nowhere forward all get
+    /// [`RailRegions::past_only`] — and with it the rail this scrubber had
+    /// before WI-11, to the pixel.
     fn rail_regions(&self, pane_idx: usize) -> RailRegions {
         let past_only = RailRegions::past_only(self.loop_span_secs_for(pane_idx).max(1) as f32);
         let Some(pane) = self.panes.get(pane_idx) else {
@@ -1244,8 +1245,11 @@ impl super::Gui {
         else {
             return past_only;
         };
+        let Some(frames) = handler.frames() else {
+            return past_only;
+        };
         let view = pane.view(pane_idx);
-        let horizon = handler.frame_horizon(&view.layer(&id)).num_seconds();
+        let horizon = frames.frame_horizon(&view.layer(&id)).num_seconds();
         if horizon <= 0 {
             return past_only;
         }

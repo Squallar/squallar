@@ -17,14 +17,15 @@
 //! 2. Radar's armed shape is unchanged, field for field.
 //! 3. Disabling addresses the same layer enabling did.
 //!
-//! The subject is a **backward-reaching `FrameSeries` test layer**, not MRMS
-//! or GMGSI: both are still `TimeAxis::Live` and implement none of the frame
-//! contract, and converting them is a later item.
+//! The subject is a **backward-reaching `FrameSeries` test layer** rather than
+//! MRMS or GMGSI, which were still `TimeAxis::Live` when this was written.
+//! Both declare `FrameSeries` and supply frames now; the double stays because
+//! it records the ranges it is asked about, which neither real layer does.
 
 use super::*;
 use crate::app::App;
 use rustdar_source::handler::{FetchPayload, FetchTask, FrameListingResult, PaneRef};
-use rustdar_source::time::{FrameListing, FrameStamp, TimeAxis};
+use rustdar_source::time::{FrameListing, FrameSource, FrameStamp, TimeAxis};
 use std::sync::{Arc, Mutex};
 
 use rustdar_overlays::render::overlay_state::{
@@ -51,46 +52,33 @@ struct PastLayer {
     asked: Arc<Mutex<Asked>>,
 }
 
-impl OverlayHandler for PastLayer {
-    fn id(&self) -> LayerId {
-        self.id.clone()
+impl FrameSource for PastLayer {
+    fn latest_at(&self, _pane: &PaneRef<'_>, t: NaiveDateTime) -> Option<FrameStamp> {
+        let mut stamps: Vec<FrameStamp> = self
+            .listed
+            .iter()
+            .map(|valid| FrameStamp {
+                valid: *valid,
+                run: None,
+            })
+            .collect();
+        stamps.sort_by_key(|stamp| stamp.valid);
+        rustdar_source::time::newest_at_or_before(&stamps, t)
     }
-    fn surface(&self) -> Surface {
-        Surface::Ground
-    }
-    fn draw_order_weight(&self) -> u32 {
-        999
-    }
-    fn display_name(&self) -> &str {
-        "Past"
-    }
-    fn render_mode(&self) -> RenderMode {
-        RenderMode::Texture
-    }
-    fn data_generation(&self) -> u64 {
-        0
-    }
-    fn has_data(&self, _pane: &PaneRef<'_>) -> bool {
-        true
-    }
-    fn is_fetching(&self) -> bool {
-        false
-    }
-    fn set_fetching(&mut self, _f: bool, _pane: &PaneRef<'_>) {}
-    fn fetch_time(&self) -> Option<web_time::Instant> {
-        None
-    }
-    fn apply_fetch_result(&mut self, _result: FetchPayload, _pane: &PaneRef<'_>) {}
-    fn retain_selections(&self, _sel: &mut Vec<Arc<dyn OverlayItem>>, _pane: &PaneRef<'_>) {}
 
-    /// **The declaration the arm is chosen on.** Satellite's and MRMS's shape:
-    /// stamped frames, none of them later than now.
-    fn time_axis(&self) -> TimeAxis {
-        TimeAxis::FrameSeries {
-            typical_step: std::time::Duration::from_secs(3600),
-            extends_future: false,
-        }
+    /// This double stages nothing, so there is nothing to evict and nothing to
+    /// take delivery of — it exists to record the ranges it is *asked* about.
+    fn retain_frames(&mut self, _pane: &PaneRef<'_>, _keep: &[FrameStamp]) {}
+
+    fn apply_frame_listing(
+        &mut self,
+        _listing: FrameListing,
+        _scope: FetchPayload,
+        _pane: &PaneRef<'_>,
+    ) {
     }
+
+    fn apply_frame(&mut self, _stamp: FrameStamp, _data: FetchPayload, _pane: &PaneRef<'_>) {}
 
     /// **Non-zero on purpose.** A backward layer is never asked for this, so
     /// a range that reaches 18 hours past the wall clock is proof the forward
@@ -155,6 +143,58 @@ impl OverlayHandler for PastLayer {
         _stamp: &FrameStamp,
     ) -> Option<FetchTask> {
         None
+    }
+}
+
+impl OverlayHandler for PastLayer {
+    fn id(&self) -> LayerId {
+        self.id.clone()
+    }
+    fn surface(&self) -> Surface {
+        Surface::Ground
+    }
+    fn draw_order_weight(&self) -> u32 {
+        999
+    }
+    fn display_name(&self) -> &str {
+        "Past"
+    }
+    fn render_mode(&self) -> RenderMode {
+        RenderMode::Texture
+    }
+    fn data_generation(&self) -> u64 {
+        0
+    }
+    fn has_data(&self, _pane: &PaneRef<'_>) -> bool {
+        true
+    }
+    fn is_fetching(&self) -> bool {
+        false
+    }
+    fn set_fetching(&mut self, _f: bool, _pane: &PaneRef<'_>) {}
+    fn fetch_time(&self) -> Option<web_time::Instant> {
+        None
+    }
+    fn apply_fetch_result(&mut self, _result: FetchPayload, _pane: &PaneRef<'_>) {}
+    fn retain_selections(&self, _sel: &mut Vec<Arc<dyn OverlayItem>>, _pane: &PaneRef<'_>) {}
+
+    /// **The declaration the arm is chosen on.** Satellite's and MRMS's shape:
+    /// stamped frames, none of them later than now.
+    fn time_axis(&self) -> TimeAxis {
+        TimeAxis::FrameSeries {
+            typical_step: std::time::Duration::from_secs(3600),
+            extends_future: false,
+        }
+    }
+
+    /// This layer comes in stamped frames, and answers every one of
+    /// [`FrameSource`]'s methods below.
+    fn frames(&self) -> Option<&dyn FrameSource> {
+        Some(self)
+    }
+
+    fn frames_mut(&mut self) -> Option<&mut dyn FrameSource> {
+        Some(self)
     }
 }
 

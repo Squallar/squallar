@@ -67,7 +67,7 @@ use rustdar_geo::GeoBounds;
 use rustdar_source::handler::{FrameListingResult, TaskFuture};
 use rustdar_source::id::{LayerId, known};
 use rustdar_source::job::{DescribedJob, JobCodec};
-use rustdar_source::time::{FrameListing, FrameStamp, TimeAxis};
+use rustdar_source::time::{FrameListing, FrameSource, FrameStamp, TimeAxis};
 
 /// One mosaic's values, in bytes: 3000 x 5000 `f32` = **60 MB**.
 ///
@@ -236,7 +236,7 @@ impl GmgsiFrameCache {
         }
     }
 
-    /// Drop everything but `keep` — the [`OverlayHandler::retain_frames`] door.
+    /// Drop everything but `keep` — the [`FrameSource::retain_frames`] door.
     fn retain(&mut self, keep: impl Fn(FrameKey) -> bool) {
         self.entries.retain(|key, _| keep(*key));
         self.recency.borrow_mut().retain(|key| keep(*key));
@@ -469,161 +469,31 @@ impl GmgsiHandler {
     }
 }
 
-impl OverlayHandler for GmgsiHandler {
-    /// The GMGSI channels this layer offers, projected into the substrate's
-    /// read contract by [`crate::gmgsi::fields`].
-    fn products(&self) -> &'static [rustdar_source::product::ProductSpec] {
-        crate::gmgsi::fields::products()
-    }
-
-    /// The channel dropdown: its option values are the channels' `as_str()`
-    /// spellings, which are exactly the `FieldId`s [`crate::gmgsi::fields`]
-    /// registers, so a catalogue tile's id goes straight through
-    /// `apply_control`.
-    fn field_control_id(&self) -> Option<&'static str> {
-        Some("channel")
-    }
-
-    /// **This pane's own channel**, projected through its registry row — never
-    /// spelled as a fresh string, so the id can only ever be one this layer
-    /// publishes.
-    fn current_field(&self, pane: &PaneRef<'_>) -> Option<rustdar_source::product::FieldId> {
-        Some(
-            crate::gmgsi::fields::spec(self.view(pane).selected_channel)
-                .id
-                .clone(),
-        )
-    }
-
-    fn id(&self) -> LayerId {
-        known::GMGSI
-    }
-
-    fn surface(&self) -> Surface {
-        Surface::Ground
-    }
-
-    /// **5**: below the model's 10, and the lowest weight any layer claims. A
-    /// global cloud mosaic is the backdrop everything else is read against, so
-    /// nothing draws under it.
-    fn draw_order_weight(&self) -> u32 {
-        5
-    }
-
-    fn display_name(&self) -> &str {
-        "Global Satellite"
-    }
-
-    fn render_mode(&self) -> RenderMode {
-        RenderMode::Texture
-    }
-
-    /// Nothing here is hatched or theme-coloured: the bar is the channel's own
-    /// greyscale and reads the same on either background.
-    fn theme_sensitive(&self) -> bool {
-        false
-    }
-
-    fn is_enabled(&self, pane: &PaneRef<'_>) -> bool {
-        self.view(pane).enabled
-    }
-
-    fn set_enabled(&mut self, enabled: bool, pane: &mut PaneMut<'_>) {
-        self.edit(pane, |state| state.enabled = enabled);
-    }
-
-    fn status_line(&self, pane: &PaneRef<'_>) -> Option<String> {
-        let view = self.view(pane);
-        if !view.enabled {
-            return None;
-        }
-        Some(view.selected_channel.display_name().to_owned())
-    }
-
-    fn data_generation(&self) -> u64 {
-        self.state.data_generation
-    }
-
-    /// **The selected channel is in the token**, not just the fetch counter:
-    /// the render dispatch groups panes by this, and one token for two channels
-    /// is one raster for both.
-    fn content_signature(&self, pane: &PaneRef<'_>) -> u64 {
-        self.data_generation() ^ (self.view(pane).selected_channel as u64 + 1).rotate_left(32)
-    }
-
-    fn has_data(&self, pane: &PaneRef<'_>) -> bool {
-        self.cached_grids.contains(self.view(pane).selected_channel)
-    }
-
-    fn is_fetching(&self) -> bool {
-        self.state.fetching
-    }
-
-    fn set_fetching(&mut self, fetching: bool, _pane: &PaneRef<'_>) {
-        self.state.fetching = fetching;
-    }
-
-    fn retry(&self) -> Option<&crate::fetch_policy::FetchRetry> {
-        Some(&self.state.retry)
-    }
-
-    fn retry_mut(&mut self) -> Option<&mut crate::fetch_policy::FetchRetry> {
-        Some(&mut self.state.retry)
-    }
-
-    fn fetch_time(&self) -> Option<web_time::Instant> {
-        self.state.fetch_time
-    }
-
-    fn item_count(&self, _pane: &PaneRef<'_>) -> usize {
-        self.state
-            .data
-            .as_ref()
-            .map(|grid| grid.values.len())
-            .unwrap_or(0)
-    }
-
-    /// **600 s.** The blend is hourly and lands 34 to 42 minutes after the hour
-    /// it covers (`crate::gmgsi::fetch`), so the arrival instant is not
-    /// predictable to better than ten minutes. Polling on the hour would show
-    /// an hour-old picture for most of every hour; polling faster would list a
-    /// prefix that cannot have changed.
-    fn auto_poll_interval(&self) -> Option<u64> {
-        Some(600)
-    }
-
-    fn clickable_items<'a>(
-        &'a self,
-        _pane: &PaneRef<'_>,
-    ) -> Vec<crate::render::overlay_state::ClickableItem<'a>> {
-        Vec::new() // Gridded, not feature-based; hover uses `hover_value_at`.
-    }
-
-    // -- Time ---------------------------------------------------------------
-
-    /// One blended mosaic per hour, stamped with the hour it depicts, and
-    /// never one for an hour that has not happened: discrete frames that stop
-    /// at the wall clock.
-    fn time_axis(&self) -> TimeAxis {
-        TimeAxis::FrameSeries {
-            typical_step: std::time::Duration::from_secs(3600),
-            extends_future: false,
-        }
-    }
-
-    /// **Thirteen hourly mosaics — half a day of cloud, which is the shortest
-    /// window a global satellite loop says anything with.**
+impl FrameSource for GmgsiHandler {
+    /// **The newest granule of this pane's channel at or before `t`.**
     ///
-    /// The same number the model layer declares, for the same arithmetic: at
-    /// this layer's hourly step it is a twelve-hour window, `n - 1` steps end
-    /// to end. Without it the Lookback slider's own default of 3600 s buys
-    /// **two** frames here while buying a dozen radar volumes, and two frames
-    /// is a before-and-after rather than a loop.
+    /// An hour `H`'s granule depicts `H` and nothing depicts the minutes after
+    /// it, so every instant in `H..H+1h` is drawn by carrying `H` forward —
+    /// which is what this answers, over the whole key store and with no window
+    /// to clip it at.
     ///
-    /// A floor and not the window: drag Lookback past twelve hours and this
-    /// layer widens with everything else.
-    fn min_loop_frames(&self) -> usize {
-        13
+    /// `run: None`: GMGSI is observed and there is no cycle behind it.
+    fn latest_at(
+        &self,
+        pane: &PaneRef<'_>,
+        t: chrono::NaiveDateTime,
+    ) -> Option<rustdar_source::time::FrameStamp> {
+        let channel = self.view(pane).selected_channel;
+        let stamps: Vec<FrameStamp> = self
+            .frame_keys
+            .get(&channel)?
+            .keys()
+            .map(|valid| FrameStamp {
+                valid: *valid,
+                run: None,
+            })
+            .collect();
+        rustdar_source::time::newest_at_or_before(&stamps, t)
     }
 
     /// **The granules this channel's listings have found for `range`** — every
@@ -633,20 +503,22 @@ impl OverlayHandler for GmgsiHandler {
     /// [`Self::create_frame_list_task`] filed and nothing else. Every stamp
     /// carries `run: None` — GMGSI is observed, there is no cycle behind it.
     ///
-    /// **Why the answer reaches one granule earlier than the window.** An
-    /// hour `H`'s granule depicts `H` and nothing depicts the minutes after
-    /// it, so every instant in `H..H+1h` is drawn by carrying `H` forward. A
-    /// window opened at `HH:MM` therefore has `60 - MM` minutes of clock in
-    /// front of its first *whole* hour, and the only picture any of them can
-    /// be drawn from is the granule for the hour the window opened inside —
-    /// which is earlier than `range.0`. Clipping it away left those stops with
-    /// no frame at all: a loop enabled at any minute but `:00` opened on a
-    /// blank satellite layer, and the caller had nothing to carry forward
-    /// because nothing was offered. [`crate::gmgsi::fetch::hours_in_range`]
-    /// lists that hour; this is what hands it on.
+    /// **Why the answer reaches one granule earlier than the window.** A
+    /// window opened at `HH:MM` has `60 - MM` minutes of clock in front of its
+    /// first *whole* hour, and the only picture any of them can be drawn from
+    /// is the granule for the hour the window opened inside — which is earlier
+    /// than `range.0`. Clipping it away left those stops with no frame at all:
+    /// a loop enabled at any minute but `:00` opened on a blank satellite
+    /// layer, and the caller had nothing to carry forward because nothing was
+    /// offered. [`crate::gmgsi::fetch::hours_in_range`] lists that hour; this
+    /// is what hands it on.
     ///
-    /// One granule, not the whole tail: `next_back` takes the newest earlier
-    /// key, so a window that opens exactly on the hour reaches nothing extra.
+    /// **The leading granule is [`Self::latest_at`]'s answer, not a second
+    /// derivation of it.** That is the whole shape of the fix: the rule "what
+    /// would this layer draw at `T`" has one implementation, and a window is
+    /// that answer at its own start plus the stamps that follow. One granule,
+    /// never the whole tail, and a window that opens exactly on the hour
+    /// reaches nothing extra — the granule at `range.0` is inside it already.
     ///
     /// `complete` only where a listing that really covered this window landed:
     /// a failed or sampled listing leaves the answer readable as "at least
@@ -659,22 +531,21 @@ impl OverlayHandler for GmgsiHandler {
         range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
     ) -> FrameListing {
         let channel = self.view(pane).selected_channel;
-        let frames: Vec<FrameStamp> = self
+        let inside = self
             .frame_keys
             .get(&channel)
-            .map(|keys| {
-                let from = keys
-                    .range(..=range.0)
-                    .next_back()
-                    .map_or(range.0, |(valid, _)| *valid);
-                keys.range(from..=range.1)
-                    .map(|(valid, _)| FrameStamp {
-                        valid: *valid,
-                        run: None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+            .into_iter()
+            .flat_map(|keys| keys.range(range.0..=range.1))
+            .filter(|(valid, _)| **valid > range.0)
+            .map(|(valid, _)| FrameStamp {
+                valid: *valid,
+                run: None,
+            });
+        let frames: Vec<FrameStamp> = self
+            .latest_at(pane, range.0)
+            .into_iter()
+            .chain(inside)
+            .collect();
         FrameListing {
             range,
             frames,
@@ -866,6 +737,183 @@ impl OverlayHandler for GmgsiHandler {
                 valid_time: granule.valid_time,
             },
         );
+    }
+
+    /// **Zero, and it is a decision rather than an omission.** A blended
+    /// mosaic is made *from* observations, so no granule exists for an hour
+    /// that has not happened — which is the same fact
+    /// [`OverlayHandler::time_axis`] states as `extends_future: false`. The
+    /// rail must not offer this layer a stop past the wall clock.
+    fn frame_horizon(&self, _pane: &PaneRef<'_>) -> chrono::Duration {
+        chrono::Duration::zero()
+    }
+}
+
+impl OverlayHandler for GmgsiHandler {
+    /// The GMGSI channels this layer offers, projected into the substrate's
+    /// read contract by [`crate::gmgsi::fields`].
+    fn products(&self) -> &'static [rustdar_source::product::ProductSpec] {
+        crate::gmgsi::fields::products()
+    }
+
+    /// The channel dropdown: its option values are the channels' `as_str()`
+    /// spellings, which are exactly the `FieldId`s [`crate::gmgsi::fields`]
+    /// registers, so a catalogue tile's id goes straight through
+    /// `apply_control`.
+    fn field_control_id(&self) -> Option<&'static str> {
+        Some("channel")
+    }
+
+    /// **This pane's own channel**, projected through its registry row — never
+    /// spelled as a fresh string, so the id can only ever be one this layer
+    /// publishes.
+    fn current_field(&self, pane: &PaneRef<'_>) -> Option<rustdar_source::product::FieldId> {
+        Some(
+            crate::gmgsi::fields::spec(self.view(pane).selected_channel)
+                .id
+                .clone(),
+        )
+    }
+
+    fn id(&self) -> LayerId {
+        known::GMGSI
+    }
+
+    fn surface(&self) -> Surface {
+        Surface::Ground
+    }
+
+    /// **5**: below the model's 10, and the lowest weight any layer claims. A
+    /// global cloud mosaic is the backdrop everything else is read against, so
+    /// nothing draws under it.
+    fn draw_order_weight(&self) -> u32 {
+        5
+    }
+
+    fn display_name(&self) -> &str {
+        "Global Satellite"
+    }
+
+    fn render_mode(&self) -> RenderMode {
+        RenderMode::Texture
+    }
+
+    /// Nothing here is hatched or theme-coloured: the bar is the channel's own
+    /// greyscale and reads the same on either background.
+    fn theme_sensitive(&self) -> bool {
+        false
+    }
+
+    fn is_enabled(&self, pane: &PaneRef<'_>) -> bool {
+        self.view(pane).enabled
+    }
+
+    fn set_enabled(&mut self, enabled: bool, pane: &mut PaneMut<'_>) {
+        self.edit(pane, |state| state.enabled = enabled);
+    }
+
+    fn status_line(&self, pane: &PaneRef<'_>) -> Option<String> {
+        let view = self.view(pane);
+        if !view.enabled {
+            return None;
+        }
+        Some(view.selected_channel.display_name().to_owned())
+    }
+
+    fn data_generation(&self) -> u64 {
+        self.state.data_generation
+    }
+
+    /// **The selected channel is in the token**, not just the fetch counter:
+    /// the render dispatch groups panes by this, and one token for two channels
+    /// is one raster for both.
+    fn content_signature(&self, pane: &PaneRef<'_>) -> u64 {
+        self.data_generation() ^ (self.view(pane).selected_channel as u64 + 1).rotate_left(32)
+    }
+
+    fn has_data(&self, pane: &PaneRef<'_>) -> bool {
+        self.cached_grids.contains(self.view(pane).selected_channel)
+    }
+
+    fn is_fetching(&self) -> bool {
+        self.state.fetching
+    }
+
+    fn set_fetching(&mut self, fetching: bool, _pane: &PaneRef<'_>) {
+        self.state.fetching = fetching;
+    }
+
+    fn retry(&self) -> Option<&crate::fetch_policy::FetchRetry> {
+        Some(&self.state.retry)
+    }
+
+    fn retry_mut(&mut self) -> Option<&mut crate::fetch_policy::FetchRetry> {
+        Some(&mut self.state.retry)
+    }
+
+    fn fetch_time(&self) -> Option<web_time::Instant> {
+        self.state.fetch_time
+    }
+
+    fn item_count(&self, _pane: &PaneRef<'_>) -> usize {
+        self.state
+            .data
+            .as_ref()
+            .map(|grid| grid.values.len())
+            .unwrap_or(0)
+    }
+
+    /// **600 s.** The blend is hourly and lands 34 to 42 minutes after the hour
+    /// it covers (`crate::gmgsi::fetch`), so the arrival instant is not
+    /// predictable to better than ten minutes. Polling on the hour would show
+    /// an hour-old picture for most of every hour; polling faster would list a
+    /// prefix that cannot have changed.
+    fn auto_poll_interval(&self) -> Option<u64> {
+        Some(600)
+    }
+
+    fn clickable_items<'a>(
+        &'a self,
+        _pane: &PaneRef<'_>,
+    ) -> Vec<crate::render::overlay_state::ClickableItem<'a>> {
+        Vec::new() // Gridded, not feature-based; hover uses `hover_value_at`.
+    }
+
+    // -- Time ---------------------------------------------------------------
+
+    /// One blended mosaic per hour, stamped with the hour it depicts, and
+    /// never one for an hour that has not happened: discrete frames that stop
+    /// at the wall clock.
+    fn time_axis(&self) -> TimeAxis {
+        TimeAxis::FrameSeries {
+            typical_step: std::time::Duration::from_secs(3600),
+            extends_future: false,
+        }
+    }
+
+    /// **Thirteen hourly mosaics — half a day of cloud, which is the shortest
+    /// window a global satellite loop says anything with.**
+    ///
+    /// The same number the model layer declares, for the same arithmetic: at
+    /// this layer's hourly step it is a twelve-hour window, `n - 1` steps end
+    /// to end. Without it the Lookback slider's own default of 3600 s buys
+    /// **two** frames here while buying a dozen radar volumes, and two frames
+    /// is a before-and-after rather than a loop.
+    ///
+    /// A floor and not the window: drag Lookback past twelve hours and this
+    /// layer widens with everything else.
+    fn min_loop_frames(&self) -> usize {
+        13
+    }
+
+    /// This layer comes in stamped frames, and answers every one of
+    /// [`FrameSource`]'s methods below.
+    fn frames(&self) -> Option<&dyn FrameSource> {
+        Some(self)
+    }
+
+    fn frames_mut(&mut self) -> Option<&mut dyn FrameSource> {
+        Some(self)
     }
 
     fn apply_fetch_result(&mut self, result: FetchPayload, pane: &PaneRef<'_>) {

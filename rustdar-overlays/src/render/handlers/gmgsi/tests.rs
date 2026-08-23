@@ -1496,3 +1496,102 @@ async fn live_gmgsi_frame_chain_lists_fetches_and_stages() {
         grid.nj,
     );
 }
+
+/// **`latest_at` answers `FrameSeries`'s rule, at its three edges** — over a
+/// known listing of thirteen hourly granules, `hour(0)` through `hour(12)`.
+///
+/// The rule is stated on `TimeAxis::FrameSeries`: the frame shown at `T` is
+/// the latest whose `valid <= T`, and nothing is drawn when none qualifies.
+/// Until now it existed as prose here and as an implementation in the caller
+/// above; this is the layer that owns the frames answering it itself.
+///
+/// **Floor** — the `t`-exactly-on-a-stamp case is asserted for **every** one
+/// of the thirteen granules, and asserted to be that granule rather than its
+/// predecessor. An off-by-one in the partition point (`<` where `<=` belongs)
+/// is the likely defect and it is invisible to a sweep that only samples
+/// between stamps.
+#[test]
+fn latest_at_answers_the_frame_series_rule() {
+    let channel = GmgsiChannel::LongwaveIr;
+    let mut h = GmgsiHandler::new();
+    h.defaults.enabled = true;
+    h.defaults.selected_channel = channel;
+    let pane = PaneRef::across(&[]);
+    file_listing(&mut h, channel, 13, true);
+
+    // Edge 1: before every stamp. The layer draws nothing at all — not the
+    // oldest granule it happens to hold.
+    assert_eq!(
+        h.latest_at(&pane, hour(0) - chrono::Duration::seconds(1)),
+        None,
+        "an instant one second before the oldest granule has no frame to be \
+         drawn from, and the oldest granule is not it",
+    );
+
+    // Edge 2: after every stamp. The newest, carried forward.
+    assert_eq!(
+        h.latest_at(&pane, hour(12) + chrono::Duration::hours(5)),
+        Some(FrameStamp {
+            valid: hour(12),
+            run: None,
+        }),
+        "five hours past the newest granule still draws the newest granule: \
+         nothing later depicts anything",
+    );
+
+    // Edge 3 — THE FLOOR. Exactly on a stamp answers THAT stamp.
+    for k in 0..13 {
+        assert_eq!(
+            h.latest_at(&pane, hour(k)),
+            Some(FrameStamp {
+                valid: hour(k),
+                run: None,
+            }),
+            "the clock standing exactly on hour {k}'s granule draws hour {k}, \
+             never hour {}",
+            k - 1,
+        );
+    }
+
+    // Between two stamps, the earlier one is carried forward — the property
+    // the three edges are the boundary conditions of.
+    assert_eq!(
+        h.latest_at(&pane, hour(7) + chrono::Duration::minutes(59)),
+        Some(FrameStamp {
+            valid: hour(7),
+            run: None,
+        }),
+        "07:59 is drawn from hour 7's granule; hour 8's depicts an instant \
+         the clock has not reached",
+    );
+}
+
+/// **A pane whose channel has no listing has no answer**, at any instant —
+/// the state every satellite pane is in before its first listing lands, and
+/// the one a sweep meets first.
+///
+/// The floor for the test above: without this, a `latest_at` that answered
+/// `None` unconditionally would still pass three edges out of four.
+#[test]
+fn latest_at_is_scoped_to_the_panes_own_channel() {
+    let mut h = GmgsiHandler::new();
+    h.defaults.enabled = true;
+    h.defaults.selected_channel = GmgsiChannel::LongwaveIr;
+    file_listing(&mut h, GmgsiChannel::LongwaveIr, 13, true);
+
+    let long_wave = PaneRef::across(&[]);
+    assert!(
+        h.latest_at(&long_wave, hour(6)).is_some(),
+        "premise: the listed channel does answer, so a `None` below is about \
+         the channel and not about the fixture",
+    );
+
+    h.defaults.selected_channel = GmgsiChannel::WaterVapor;
+    let water_vapour = PaneRef::across(&[]);
+    assert_eq!(
+        h.latest_at(&water_vapour, hour(6)),
+        None,
+        "another band's granule is not a frame this pane can draw, so a pane \
+         on an unlisted channel has nothing to answer with",
+    );
+}

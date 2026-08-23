@@ -7,7 +7,7 @@ use rustdar_source::id::LayerId;
 use rustdar_source::id::known;
 use rustdar_source::job::{DescribedJob, JobCodec};
 use rustdar_source::product::{FieldId, ProductSpec};
-use rustdar_source::time::{FrameListing, FrameStamp};
+use rustdar_source::time::{FrameListing, FrameSource, FrameStamp};
 use rustdar_units::UserPreferences;
 
 #[cfg(test)]
@@ -361,8 +361,8 @@ impl OverlayRegistry {
         scope: FetchPayload,
         pane: &PaneRef<'_>,
     ) {
-        if let Some(handler) = self.handler_mut(id) {
-            handler.apply_frame_listing(listing, scope, pane);
+        if let Some(frames) = self.handler_mut(id).and_then(|h| h.frames_mut()) {
+            frames.apply_frame_listing(listing, scope, pane);
         }
     }
 
@@ -375,8 +375,8 @@ impl OverlayRegistry {
         data: FetchPayload,
         pane: &PaneRef<'_>,
     ) {
-        if let Some(handler) = self.handler_mut(id) {
-            handler.apply_frame(stamp, data, pane);
+        if let Some(frames) = self.handler_mut(id).and_then(|h| h.frames_mut()) {
+            frames.apply_frame(stamp, data, pane);
         }
     }
 
@@ -407,9 +407,31 @@ impl OverlayRegistry {
             .map_or_else(Vec::new, |h| h.create_fetch_tasks(ctx, pane))
     }
 
-    /// [`OverlayHandler::list_frames`] for `id` — the synchronous read over
-    /// what that layer already knows, never a fetch. A layer with no handler
-    /// knows nothing, which is [`FrameListing::empty`].
+    /// **This layer's frame supply**, or `None` for an id this build does not
+    /// register **and** for one whose layer does not come in stamped frames.
+    ///
+    /// The two are one answer on purpose: everything below routes through this
+    /// and treats both as "no frames", which is what makes a frame question
+    /// safe to ask of any id.
+    pub fn frames(&self, id: &LayerId) -> Option<&dyn FrameSource> {
+        self.handler(id).and_then(|h| h.frames())
+    }
+
+    /// [`FrameSource::latest_at`] for `id` — what this layer would draw at
+    /// `t`. `None` from a layer with no frames, and `None` from a framed layer
+    /// that knows of none at or before `t`.
+    pub fn latest_at(
+        &self,
+        id: &LayerId,
+        pane: &PaneRef<'_>,
+        t: chrono::NaiveDateTime,
+    ) -> Option<FrameStamp> {
+        self.frames(id)?.latest_at(pane, t)
+    }
+
+    /// [`FrameSource::list_frames`] for `id` — the synchronous read over
+    /// what that layer already knows, never a fetch. A layer with no frame
+    /// supply knows nothing, which is [`FrameListing::empty`].
     pub fn list_frames(
         &self,
         id: &LayerId,
@@ -417,23 +439,38 @@ impl OverlayRegistry {
         pane: &PaneRef<'_>,
         range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
     ) -> FrameListing {
-        self.handler(id).map_or_else(
+        self.frames(id).map_or_else(
             || FrameListing::empty(range),
-            |h| h.list_frames(ctx, pane, range),
+            |f| f.list_frames(ctx, pane, range),
         )
     }
 
-    /// [`OverlayHandler::frames_resident`] for `id` — which of this layer's
-    /// frames the pane already holds data for. A layer with no handler holds
-    /// nothing, and that is not the same statement as "nothing is coming":
-    /// the caller that turns this into a settle verdict pairs it with the
-    /// layer's own arrival question.
+    /// [`FrameSource::frames_resident`] for `id` — which of this layer's
+    /// frames the pane already holds data for. A layer with no frame supply
+    /// holds nothing, and that is not the same statement as "nothing is
+    /// coming": the caller that turns this into a settle verdict pairs it with
+    /// the layer's own arrival question.
     pub fn frames_resident(&self, id: &LayerId, pane: &PaneRef<'_>) -> Vec<FrameStamp> {
-        self.handler(id)
-            .map_or_else(Vec::new, |h| h.frames_resident(pane))
+        self.frames(id)
+            .map_or_else(Vec::new, |f| f.frames_resident(pane))
     }
 
-    /// [`OverlayHandler::create_frame_list_task`] for `id`.
+    /// [`FrameSource::retain_frames`] for `id` — the one eviction door into a
+    /// layer's own frame store.
+    ///
+    /// **No production caller yet**, and that is a stated open item rather than
+    /// an oversight: non-radar frame residency is still governed by the byte
+    /// budget inside each handler, which knows nothing about the pane's window.
+    /// Wiring the window to this door is its own work order. The forwarder
+    /// exists because the door does: a trait method the registry cannot reach
+    /// is a door with no corridor to it.
+    pub fn retain_frames(&mut self, id: &LayerId, pane: &PaneRef<'_>, keep: &[FrameStamp]) {
+        if let Some(frames) = self.handler_mut(id).and_then(|h| h.frames_mut()) {
+            frames.retain_frames(pane, keep);
+        }
+    }
+
+    /// [`FrameSource::create_frame_list_task`] for `id`.
     pub fn create_frame_list_task(
         &self,
         id: &LayerId,
@@ -441,11 +478,11 @@ impl OverlayRegistry {
         pane: &PaneRef<'_>,
         range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
     ) -> Option<FetchTask> {
-        self.handler(id)
-            .and_then(|h| h.create_frame_list_task(ctx, pane, range))
+        self.frames(id)
+            .and_then(|f| f.create_frame_list_task(ctx, pane, range))
     }
 
-    /// [`OverlayHandler::fetch_frame`] for `id`.
+    /// [`FrameSource::fetch_frame`] for `id`.
     pub fn fetch_frame(
         &self,
         id: &LayerId,
@@ -453,8 +490,8 @@ impl OverlayRegistry {
         pane: &PaneRef<'_>,
         stamp: &FrameStamp,
     ) -> Option<FetchTask> {
-        self.handler(id)
-            .and_then(|h| h.fetch_frame(ctx, pane, stamp))
+        self.frames(id)
+            .and_then(|f| f.fetch_frame(ctx, pane, stamp))
     }
 
     /// The handler's own options, with its fetch health prepended.

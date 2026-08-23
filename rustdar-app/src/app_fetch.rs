@@ -1762,7 +1762,7 @@ impl super::App {
     /// decode to the job funnel.
     ///
     /// The bytes arrive on the one source path, from the task
-    /// `SourceHandler::fetch_frame` built; the decode is dispatched here, from
+    /// `FrameSource::fetch_frame` built; the decode is dispatched here, from
     /// the arrival, so it is scheduled beside every other offloaded job rather
     /// than inside a network task.
     ///
@@ -2517,9 +2517,9 @@ fn arm_layer_loop(
     panes[pane_idx].hydrate_layer_states(overlays, pane_idx);
     let pane_view = panes[pane_idx].view(pane_idx);
     let horizon = overlays
-        .handler_by_id(&layer)
-        .map_or_else(chrono::Duration::zero, |h| {
-            h.frame_horizon(&pane_view.layer(&layer))
+        .frames(&layer)
+        .map_or_else(chrono::Duration::zero, |f| {
+            f.frame_horizon(&pane_view.layer(&layer))
         });
     drop(pane_view);
 
