@@ -88,9 +88,31 @@ pub const OVERDRAW_FRACTION: f32 = 0.25;
 /// has clamped the overdraw away the band is what shrinks, not this:
 /// `pan_exceeds_coverage` measures the band off the texture's real bounds, so a
 /// WebGL2 pane at the 2048 floor divides 0.033 of a viewport here and one at 2×
-/// device pixels divides zero, where no threshold whatsoever buys cover — see
-/// [`COVERAGE_DEADBAND_TEXELS`], which is what protects that case, and which
-/// changes no cell of the table above.
+/// device pixels divides zero. **Measured, no threshold recovers that case and
+/// none comes close**: the 2048-clamped 1920×1080 pane is dry on 71.4% of
+/// frames at 0.3 and 80.6% at 0.7, and on every value between, against 0% at
+/// full overdraw — a 9-point spread across the whole sweep and dry-free
+/// nowhere in it. See [`COVERAGE_DEADBAND_TEXELS`], which is what protects that
+/// case from spending rasters it cannot use, and which changes no cell of the
+/// table above.
+///
+/// **Refused 2026-08-22: keying this on the upload depth** (proposed as a
+/// function of the uploader's bands-per-frame). Re-swept on the real gate at a
+/// real plan — the 1920×1080 pane at full overdraw, 2880×1620 texels, the same
+/// 56 speeds, 33600 counted frames per depth — the dry minimum moves
+/// *non-monotonically* with depth: every threshold from 0.3 to 0.6 is dry-free
+/// at a one-frame upload, 0.3 to 0.5 at two, 0.40–0.425 is best at three (5.95%
+/// against this value's 9.52%), and this value is the exact minimum again at
+/// four (26.43%, where 0.40 costs 29.91%). A rule that has to fall and then
+/// rise with its own argument is a four-entry table fitted to one rig.
+///
+/// Depth is also not the ring. It is `ceil(bytes / UPLOAD_BAND_BYTES)` over
+/// bands-per-frame, so it moves with the plan as much as with the staging ring
+/// — 18.66 MB a picture is two frames on the same ring that gives one frame at
+/// 9.44 MB — so keying on the ring alone keys on half the argument. And the
+/// ring's depth lives in `rustdar-gpu`, which this geometry predicate has no
+/// reach into and must not grow one for at most 3.6 points of dry frames on one
+/// depth of four, bought at 16.6% more uploaded bytes per viewport panned.
 const PAN_REBUILD_THRESHOLD: f32 = 0.5;
 
 /// How far past the coverage trigger the viewport has to be before the picture
