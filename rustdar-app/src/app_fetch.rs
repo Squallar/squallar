@@ -1407,44 +1407,53 @@ impl super::App {
         }
     }
 
-    /// Enable a loop for a pane: initializes the transport layer's timeline and
-    /// spawns an async task to list the frames its range covers.
+    /// Enable a loop for a pane: initializes **every** frame-series layer's
+    /// timeline and spawns an async task to list the frames each one's range
+    /// covers.
+    ///
+    /// One listing per layer, because a pane's loop is one clock over several
+    /// timelines — see [`begin_loop_for_pane`], which is where the reported
+    /// "the satellite never changes during a loop" was.
+    ///
+    /// **A layer that cannot produce a listing is dropped, not fatal — unless
+    /// it is the transport.** The transport is the timeline playback walks, so
+    /// losing it means the pane has no loop; losing a second layer means that
+    /// layer goes back to drawing live, which is what it did before it was
+    /// armed.
     fn handle_enable_loop(&mut self, pane_idx: usize, lookback_secs: u64) {
         // One clock reading for both halves of the range, so a forward-reaching
         // rail's past and future cannot be anchored a tick apart.
         let now = chrono::Utc::now().naive_utc();
+        // Taken before the pane borrow, because the arming below builds each
+        // layer's listing task inside it — see `begin_loop_for_pane`.
+        let config = self.fetch_config();
         let (panes, overlays) = self.gui.panes_and_overlays_mut();
-        let Some(request) = begin_loop_for_pane(
+        let dispatch = begin_loop_for_pane(
             panes,
             overlays,
             &mut self.loop_mgr,
+            &config,
             pane_idx,
             now,
             lookback_secs,
-        ) else {
-            return;
-        };
-        let LoopScanRequest { layer, start, end } = request;
-
-        // **The layer lists its own archive.** The identifiers the listing
-        // yields stay with it — nothing here holds one — and the scope it was
-        // listed for is captured inside the task, at dispatch, not read back
-        // off the pane when it lands.
-        let config = self.fetch_config();
-        let task = self
-            .with_layer_pane(pane_idx, &layer, |overlays, pane_ref| {
-                overlays.create_frame_list_task(&layer, &config, pane_ref, (start, end))
-            })
-            .flatten();
-        let Some(task) = task else {
-            log::warn!(
-                "Loop: {} could not build a frame listing for pane {pane_idx}; leaving loop mode",
-                layer.as_str(),
-            );
-            self.handle_disable_loop(pane_idx);
-            return;
-        };
-        self.spawn_frame_list_task(task);
+        );
+        match dispatch {
+            // Nothing was armed and nothing was running: the same silent
+            // return this made before it armed more than one layer.
+            LoopScanDispatch::NoLoop => {}
+            LoopScanDispatch::TransportUnlistable => {
+                log::warn!(
+                    "Loop: pane {pane_idx}'s transport could not build a frame \
+                     listing; leaving loop mode",
+                );
+                self.handle_disable_loop(pane_idx);
+            }
+            LoopScanDispatch::Armed(tasks) => {
+                for task in tasks {
+                    self.spawn_frame_list_task(task);
+                }
+            }
+        }
     }
 
     /// **Ask for the instant the clock names, when the loop's own window does
@@ -1542,17 +1551,24 @@ impl super::App {
         }
     }
 
-    /// Disable a pane's loop: resets its transport layer to single-frame mode.
+    /// Disable a pane's loop: resets **every layer it armed** to single-frame
+    /// mode.
     ///
-    /// **The mirror of [`Self::handle_enable_loop`], and addressed the same
-    /// way** (WI-4b). It used to reset radar's slot by name, which on a pane
+    /// **The mirror of [`Self::handle_enable_loop`], and it has to reach as
+    /// far** (WI-4b). It used to reset radar's slot by name, which on a pane
     /// whose transport had moved cleared a timeline nobody had armed and left
     /// the running one running — while the ∞ button, which reads
     /// `transport_state().is_active()`, stayed lit and re-emitted this same
-    /// action on the next click.
+    /// action on the next click. It then reset the transport's slot alone,
+    /// which was the whole answer only while a pane armed one timeline.
     fn handle_disable_loop(&mut self, pane_idx: usize) {
         if let Some(pane) = self.gui.pane_mut(pane_idx) {
-            *pane.transport_state_mut() = rustdar_egui::pane::LayerTimeState::new();
+            // **Every timeline the pane armed, not the transport's alone.**
+            // `handle_enable_loop` arms one per frame-series layer, so
+            // clearing the transport would leave the others holding frames
+            // and settling their playheads off a clock nothing moves — a
+            // frozen instant presented as the live picture.
+            pane.stop_every_layer_loop();
         }
         self.loop_mgr.remove_pending(pane_idx);
         if pane_idx < self.render.pane_render.len() {
@@ -2237,41 +2253,186 @@ fn loop_section_image(rgba: &[u8]) -> Option<egui::ColorImage> {
 
 /// The frame listing a freshly-built loop needs, and the layer it must be
 /// requested from.
-pub(super) struct LoopScanRequest {
+struct LoopScanRequest {
     layer: rustdar_source::id::LayerId,
     start: NaiveDateTime,
     end: NaiveDateTime,
 }
 
-/// Build `pane_idx`'s loop state and return the frame listing it now needs, or
-/// `None` if that pane cannot carry a loop.
+/// What [`begin_loop_for_pane`] did, and what the caller therefore owes.
 ///
-/// **Two arms, chosen by the transport layer's own time axis.** A layer whose
-/// stamps are all history reaches backward; a layer that declares
-/// `extends_future` anchors on the wall clock and reaches forward to its own
-/// horizon, so the one rail carries both the past region and the forecast.
+/// Three outcomes and not an `Option<Vec<_>>`, because "this pane cannot loop"
+/// and "this pane's transport could not be listed" are answered differently:
+/// the first armed nothing and there is nothing to retire, the second is a
+/// half-built loop the caller has to take back down.
+pub(super) enum LoopScanDispatch {
+    /// The pane cannot carry a loop at all — no such pane, or a view that does
+    /// not animate. **Nothing was armed.**
+    NoLoop,
+    /// The transport layer could not produce a frame listing, so the pane has
+    /// no timeline for playback to walk. **Nothing was armed**, and any loop
+    /// that was already running is the caller's to retire.
+    TransportUnlistable,
+    /// One listing task per layer armed, the transport's first. Every layer
+    /// named here is holding an active timeline waiting for its answer.
+    Armed(Vec<rustdar_source::handler::FetchTask>),
+}
+
+/// **Build `pane_idx`'s loop and return the listing every layer of it now
+/// needs** — one request per layer, empty where that pane cannot carry a loop
+/// at all.
 ///
-/// **Either arm arms the transport layer's own timeline** (WI-4b). Radar is
-/// one past-only layer among several, distinguished only by having a site to
-/// end its range at and a geometry to anchor its frames on; on a radar pane
-/// the transport addresses radar and the slot written is radar's own, byte for
+/// **A pane's loop is not one timeline.** A pane draws radar *and* a satellite
+/// mosaic *and* a model field; each arrives in its own stamped frames at its
+/// own cadence, and each needs its own list before its picture can move when
+/// the pane's clock does. This armed only the layer the transport addressed,
+/// so every other frame-series layer on the pane sat `Inactive` for the whole
+/// playback: no frames, so [`PaneState::overlay_texture_on_screen`] fell
+/// through to that layer's live raster and painted one instant, unlabelled and
+/// unchanging, under a loop that was otherwise running correctly. That is the
+/// reported *"I did a 600 min loop and the GMGSI never changes during it"* —
+/// the satellite layer's weight is the lowest any layer claims, so a pane
+/// drawing radar over it addresses radar and never armed the satellite at all.
+///
+/// **One window for every layer, and it is the transport's.** Each layer is
+/// listed over the range the transport was listed over rather than over its
+/// own `min_loop_span_secs` floor: the pane's clock only ever walks the
+/// transport's frames, so a frame outside that window is one nothing can ever
+/// name.
+///
+/// **The transport still decides whether the pane loops.** A layer that cannot
+/// be armed, or whose handler cannot build a listing task, is left alone and
+/// goes on drawing live; a *transport* that cannot means the pane has no loop,
+/// and nothing at all is armed — otherwise the pane would hold frames with no
+/// transport to walk them.
+///
+/// **Each layer's listing task is built here, inside the pane borrow, and only
+/// after that layer is armed.** A layer is never left holding an active
+/// timeline waiting for an answer nobody asked for, which is the shape of a
+/// silent partial success: `FetchingScanList` for ever, drawing nothing.
+///
+/// [`PaneState::overlay_texture_on_screen`]: rustdar_egui::pane::PaneState::overlay_texture_on_screen
+fn begin_loop_for_pane(
+    panes: &mut [rustdar_egui::pane::PaneState],
+    overlays: &mut rustdar_overlays::render::overlay_state::OverlayRegistry,
+    loop_mgr: &mut rustdar_radar::loop_downloads::LoopDownloadManager,
+    config: &rustdar_overlays::render::overlay_state::FetchConfig,
+    pane_idx: usize,
+    now: NaiveDateTime,
+    lookback_secs: u64,
+) -> LoopScanDispatch {
+    let Some(pane) = panes.get(pane_idx) else {
+        return LoopScanDispatch::NoLoop;
+    };
+    // The view the pane is drawing, which is what a loop's frames are pictures
+    // of — asked once for the whole pane, because every layer on it is drawn
+    // into the same view.
+    if !pane.render_view().can_loop() {
+        return LoopScanDispatch::NoLoop;
+    }
+    let transport = pane.transport_layer().clone();
+    // Every enabled layer that comes in stamped frames, the transport first:
+    // it is the one whose failure retires the whole loop, so it is answered
+    // before anything else is armed.
+    let mut layers = vec![transport.clone()];
+    layers.extend(
+        pane.frame_series_layers(overlays)
+            .into_iter()
+            .filter(|id| *id != transport),
+    );
+
+    // Drop the previous listing's undispatched downloads; they were queued for
+    // the loop this call is replacing. Once for the pane, not once per layer.
+    loop_mgr.remove_pending(pane_idx);
+
+    let mut tasks = Vec::new();
+    // The window the transport derived, handed to every layer after it. See
+    // `arm_layer_loop`'s `over`.
+    let mut window = None;
+    for layer in layers {
+        let mut armed = None;
+        if let Some(request) = arm_layer_loop(
+            panes,
+            overlays,
+            pane_idx,
+            now,
+            lookback_secs,
+            &layer,
+            window,
+        ) {
+            let LoopScanRequest { layer, start, end } = request;
+            window = Some((start, end));
+            // **The layer lists its own archive.** The identifiers the listing
+            // yields stay with it — nothing here holds one — and the scope it
+            // was listed for is captured inside the task, at dispatch, not
+            // read back off the pane when it lands.
+            //
+            // `Self::with_layer_pane`'s own construction, inlined because the
+            // panes and the registry are already borrowed together here.
+            panes[pane_idx].hydrate_layer_states(overlays, pane_idx);
+            let view = panes[pane_idx].view(pane_idx);
+            armed =
+                overlays.create_frame_list_task(&layer, config, &view.layer(&layer), (start, end));
+            drop(view);
+            if armed.is_none() {
+                // Armed with nothing coming for it. Put the slot back rather
+                // than leave it in `FetchingScanList` for ever, drawing
+                // nothing while it waits for an answer nobody asked for.
+                *panes[pane_idx].time_state_mut(&layer) = rustdar_egui::pane::LayerTimeState::new();
+            }
+        }
+        match armed {
+            Some(task) => tasks.push(task),
+            None if layer == transport => return LoopScanDispatch::TransportUnlistable,
+            // A second layer that cannot be listed draws live, exactly as it
+            // did before this pane looped at all.
+            None => log::warn!(
+                "Loop: {} could not be armed for pane {pane_idx}; it draws \
+                 live while the rest of the pane loops",
+                layer.as_str(),
+            ),
+        }
+    }
+    LoopScanDispatch::Armed(tasks)
+}
+
+/// **Arm `layer`'s own timeline on `pane_idx` and say what listing it now
+/// needs**, or `None` where this layer cannot be armed.
+///
+/// **Two arms, chosen by the layer's own time axis.** A layer whose stamps are
+/// all history reaches backward; a layer that declares `extends_future`
+/// anchors on the wall clock and reaches forward to its own horizon, so the
+/// one rail carries both the past region and the forecast.
+///
+/// **Either arm arms that layer's own timeline** (WI-4b). Radar is one
+/// past-only layer among several, distinguished only by having a site to end
+/// its range at and a geometry to anchor its frames on; on a radar pane the
+/// transport addresses radar and the slot written is radar's own, byte for
 /// byte what it always was.
 ///
 /// **A radar scan is a precondition of the radar arm only.** It used to gate
 /// the whole function, which meant a pane with no radar data got no loop at all
 /// no matter which layer its transport addressed — and a satellite-only or
 /// model-only pane legitimately has no scan.
-fn begin_loop_for_pane(
+///
+/// **`over` is the window a layer is handed instead of the one it would reach
+/// for.** The transport derives its own and every layer after it takes that
+/// one, because a pane has one clock: the clock only ever names instants the
+/// transport holds frames for, so a layer listed anywhere else is listed for
+/// instants nothing can ever stop on. It is a forecast layer beside a
+/// past-only transport that makes this load-bearing rather than cosmetic —
+/// its own arm reaches `now + frame_horizon`, which is eighteen hours of
+/// model grids fetched for a rail that ends at the wall clock.
+fn arm_layer_loop(
     panes: &mut [rustdar_egui::pane::PaneState],
     overlays: &mut rustdar_overlays::render::overlay_state::OverlayRegistry,
-    loop_mgr: &mut rustdar_radar::loop_downloads::LoopDownloadManager,
     pane_idx: usize,
     now: NaiveDateTime,
     lookback_secs: u64,
+    layer: &rustdar_source::id::LayerId,
+    over: Option<(NaiveDateTime, NaiveDateTime)>,
 ) -> Option<LoopScanRequest> {
-    // The layer this pane's transport addresses, which is the only thing that
-    // decides which arm below runs.
-    let layer = panes.get(pane_idx)?.transport_layer().clone();
+    let layer = layer.clone();
     // Read off the registry by id, never off a `match` on the id: whether
     // stamps later than the wall clock are expected is the layer's own
     // declaration, and a shell that re-spelled it would be a second answer.
@@ -2308,32 +2469,28 @@ fn begin_loop_for_pane(
         // are against.
         let end = radar_anchor.as_ref().map_or(now, |(_, stamp)| *stamp);
 
-        // Drop the previous listing's undispatched downloads; they were queued
-        // for the loop this call is replacing.
-        loop_mgr.remove_pending(pane_idx);
-
         // The view the pane is drawing, which is what a loop's frames are
-        // pictures of.
+        // pictures of. The `can_loop` gate on it is the caller's, taken once
+        // for the pane rather than once per layer.
         let view = panes[pane_idx].render_view();
-        if !view.can_loop() {
-            return None;
-        }
 
         let start = end - chrono::Duration::seconds(lookback_secs as i64);
+        // **A layer that was handed a window takes it.** See the parameter's
+        // own note: one pane, one clock, one window.
+        let (start, end) = over.unwrap_or((start, end));
         // **The window the listing is asked for, not the lookback** — read
         // off the range, exactly as the forward arm reads it, so the two arms
         // cannot drift the way WI-4's did. On a backward range the two are
         // the same number; that is why the bug could not show here.
         let span_secs = (end - start).num_seconds().max(0) as u64;
 
-        // **The transport layer's own timeline, not radar's slot.** These are
-        // the same slot whenever `layer` is radar — `transport_state_mut`
-        // resolves through `transport_layer`, which is what `layer` was read
-        // from — so radar arms exactly what it always did. A past-only
-        // non-radar layer used to arm radar's timeline here, with a radar
-        // geometry anchor, and then its own slot sat inactive while nothing
-        // supplied it.
-        *panes[pane_idx].transport_state_mut() = match &radar_anchor {
+        // **This layer's own timeline, not radar's slot and not the
+        // transport's.** They are the same slot whenever `layer` is the
+        // transport, so a radar pane arms exactly what it always did. A
+        // past-only non-radar layer used to arm radar's timeline here, with a
+        // radar geometry anchor, and then its own slot sat inactive while
+        // nothing supplied it.
+        *panes[pane_idx].time_state_mut(&layer) = match &radar_anchor {
             Some((site, _)) => radar_layer::begin_loop(span_secs, site, view),
             // The placeholder anchor the forward arm uses. A layer with no
             // geometry reads `""` back through `radar_layer::site` rather
@@ -2345,17 +2502,13 @@ fn begin_loop_for_pane(
         // landing listing to this pane on the exact window recorded here;
         // `span_secs` cannot tell this ask from a deep-scrub refill's, whose
         // window is the same width anchored in another era.
-        panes[pane_idx].transport_state_mut().asked_range = Some((start, end));
+        panes[pane_idx].time_state_mut(&layer).asked_range = Some((start, end));
 
         return Some(LoopScanRequest { layer, start, end });
     }
 
     // ── Forward-reaching ─────────────────────────────────────────────────
-    loop_mgr.remove_pending(pane_idx);
     let view = panes[pane_idx].render_view();
-    if !view.can_loop() {
-        return None;
-    }
 
     // **How far past the wall clock, asked of the layer for this pane.** The
     // horizon belongs to the run rather than to the layer — the same HRRR
@@ -2375,6 +2528,9 @@ fn begin_loop_for_pane(
     // not some radar volume's timestamp.
     let start = now - chrono::Duration::seconds(lookback_secs as i64);
     let end = now + horizon;
+    // As above: a handed window wins over the one this layer would have
+    // reached for on its own.
+    let (start, end) = over.unwrap_or((start, end));
 
     // **The window the listing is asked for, not the lookback** (WI-5).
     // `span_secs` is documented as "the window this layer's frames were listed
@@ -2388,10 +2544,10 @@ fn begin_loop_for_pane(
     // The anchor is the layer's own once it has one to put here; until then
     // the phase is what matters, so the listing that lands has an active
     // timeline to land on rather than being dropped as a silent no-op.
-    *panes[pane_idx].transport_state_mut() =
+    *panes[pane_idx].time_state_mut(&layer) =
         rustdar_egui::pane::LayerTimeState::begin(span_secs, view, Box::new(()));
     // The ask itself, recorded whole — see the backward arm.
-    panes[pane_idx].transport_state_mut().asked_range = Some((start, end));
+    panes[pane_idx].time_state_mut(&layer).asked_range = Some((start, end));
 
     Some(LoopScanRequest { layer, start, end })
 }

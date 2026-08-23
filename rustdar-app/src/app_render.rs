@@ -102,7 +102,7 @@ fn loop_interval(fps: f32) -> std::time::Duration {
 /// # The declaration is read off the registry, never off the id
 ///
 /// Whether stamps later than the wall clock are expected is the layer's own
-/// answer, the same way `begin_loop_for_pane` asks it. A `match` on the layer
+/// answer, the same way `arm_layer_loop` asks it. A `match` on the layer
 /// id here would be a second authority to keep in step.
 fn loop_start_frame(
     pane: &rustdar_egui::pane::PaneState,
@@ -4463,6 +4463,11 @@ mod loop_overlay_render_tests;
 #[path = "app_render/loop_playback_transport_tests.rs"]
 #[cfg(test)]
 mod loop_playback_transport_tests;
+
+/// What the satellite layer puts on the glass under another layer's transport.
+#[path = "app_render/satellite_loop_draw_tests.rs"]
+#[cfg(test)]
+mod satellite_loop_draw_tests;
 
 /// The satellite loop (WB-11), end to end against the **real** GMGSI handler
 /// rather than a double.

@@ -801,7 +801,8 @@ fn the_radar_arm_produces_the_same_loop_it_always_did() {
 /// that was asked for, which is what its own doc comment always said it was.
 ///
 /// **Floor: put `lookback_secs` back in the `begin` call** in
-/// `begin_loop_for_pane`'s forward arm and the frame-list assertion reads
+/// `arm_layer_loop`'s forward arm (the per-layer half `begin_loop_for_pane`
+/// now calls once per frame-series layer) and the frame-list assertion reads
 /// empty.
 #[test]
 fn enabling_a_forecast_loop_through_the_action_ends_with_frames_on_the_pane() {

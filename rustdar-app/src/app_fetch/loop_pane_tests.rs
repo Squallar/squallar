@@ -71,6 +71,23 @@ fn registry() -> rustdar_overlays::render::overlay_state::OverlayRegistry {
     )
 }
 
+/// A fetch context with a client that goes nowhere: the listing tasks
+/// `begin_loop_for_pane` builds are never spawned here, only counted.
+fn a_fetch_config() -> rustdar_overlays::render::overlay_state::FetchConfig {
+    rustdar_overlays::render::overlay_state::FetchConfig {
+        client: {
+            rustdar_source::tls::init();
+            reqwest::Client::new()
+        },
+        zone_cache_dir: None,
+        sources: rustdar_radar::sources::DataSources::production(),
+        viewport: None,
+        as_of: ts(0),
+        depicted_span_secs: None,
+        depicted_frames: Vec::new(),
+    }
+}
+
 fn allocation() -> crate::loop_pool::LoopAllocation {
     crate::app::render::test_loop_allocation()
 }
@@ -97,7 +114,6 @@ fn a_loop_is_built_from_its_own_panes_scan_not_the_active_panes() {
         pane_showing(site("KTLX", 35.33, -97.27), ts(10)),
         pane_showing(site("KOUN", 35.23, -97.46), ts(25)),
     ];
-    let mut mgr = LoopDownloadManager::new();
     let mut reg = registry();
 
     assert_eq!(
@@ -106,7 +122,7 @@ fn a_loop_is_built_from_its_own_panes_scan_not_the_active_panes() {
         "precondition: pane 1's live site has already moved"
     );
 
-    let req = begin_loop_for_pane(&mut panes, &mut reg, &mut mgr, 1, ts(0), 600)
+    let req = arm_layer_loop(&mut panes, &mut reg, 1, ts(0), 600, &known::RADAR, None)
         .expect("pane 1 has a scan");
 
     assert_eq!(
@@ -129,7 +145,7 @@ fn a_loop_is_built_from_its_own_panes_scan_not_the_active_panes() {
 
     assert!(!panes[0].loop_state().is_active());
 
-    let req = begin_loop_for_pane(&mut panes, &mut reg, &mut mgr, 0, ts(0), 600)
+    let req = arm_layer_loop(&mut panes, &mut reg, 0, ts(0), 600, &known::RADAR, None)
         .expect("pane 0 has a scan");
     assert_eq!(req.layer, known::RADAR);
     assert_eq!(req.end, ts(10));
@@ -142,14 +158,68 @@ fn a_pane_with_no_scan_yields_no_loop() {
         pane_showing(site("KOUN", 35.23, -97.46), ts(25)),
     ];
     panes[1].scan_info = None;
-    let mut mgr = LoopDownloadManager::new();
     let mut reg = registry();
 
-    assert!(begin_loop_for_pane(&mut panes, &mut reg, &mut mgr, 1, ts(0), 600).is_none());
+    assert!(arm_layer_loop(&mut panes, &mut reg, 1, ts(0), 600, &known::RADAR, None).is_none());
     assert!(!panes[1].loop_state().is_active(), "no loop was started");
     assert!(
-        begin_loop_for_pane(&mut panes, &mut reg, &mut mgr, 7, ts(0), 600).is_none(),
+        arm_layer_loop(&mut panes, &mut reg, 7, ts(0), 600, &known::RADAR, None).is_none(),
         "and neither does a pane that does not exist"
+    );
+}
+
+/// **A layer handed a window takes it, whatever its own arm would have
+/// reached for.**
+///
+/// The contract that makes a pane's several timelines one loop: the transport
+/// derives the window and every layer after it is listed over that same one,
+/// because the pane's clock can only ever name instants the transport holds
+/// frames for. Radar is the subject because its own arm is the one that would
+/// disagree loudest — it ends at the scan the pane is showing (`ts(10)` here),
+/// not at the handed range.
+///
+/// **Floor — `own_window`:** drop the `over.unwrap_or(...)` from the backward
+/// arm and the two assertions read `ts(4)`/`ts(10)`, the range radar computed
+/// for itself.
+#[test]
+fn a_layer_handed_a_window_is_listed_over_that_window() {
+    let mut panes = [pane_showing(site("KTLX", 35.33, -97.27), ts(10))];
+    let mut reg = registry();
+
+    let own = arm_layer_loop(&mut panes, &mut reg, 0, ts(0), 600, &known::RADAR, None)
+        .expect("pane 0 has a scan");
+    assert_eq!(
+        (own.start, own.end),
+        (ts(0), ts(10)),
+        "premise: left to itself, radar ends its range at the pane's own scan",
+    );
+
+    let handed = arm_layer_loop(
+        &mut panes,
+        &mut reg,
+        0,
+        ts(0),
+        600,
+        &known::RADAR,
+        Some((ts(100), ts(160))),
+    )
+    .expect("pane 0 has a scan");
+    assert_eq!(
+        (handed.start, handed.end),
+        (ts(100), ts(160)),
+        "the handed window must win: a layer listed over its own range instead \
+         holds frames at instants the pane's clock can never stop on",
+    );
+    assert_eq!(
+        panes[0].loop_state().span_secs,
+        (ts(160) - ts(100)).num_seconds() as u64,
+        "and the span it records is the handed window's, which is what the \
+         arrival path matches a landing listing against",
+    );
+    assert_eq!(
+        panes[0].loop_state().asked_range,
+        Some((ts(100), ts(160))),
+        "as is the ask it recorded",
     );
 }
 
@@ -211,7 +281,21 @@ fn beginning_a_loop_clears_the_panes_pending_downloads() {
     );
     assert!(!mgr.is_pane_done(0), "precondition: pane 0 has work queued");
 
-    begin_loop_for_pane(&mut panes, &mut reg, &mut mgr, 0, ts(0), 600).expect("pane 0 has a scan");
+    assert!(
+        matches!(
+            begin_loop_for_pane(
+                &mut panes,
+                &mut reg,
+                &mut mgr,
+                &a_fetch_config(),
+                0,
+                ts(0),
+                600,
+            ),
+            LoopScanDispatch::Armed(_),
+        ),
+        "pane 0 has a scan",
+    );
 
     assert!(
         mgr.is_pane_done(0),
