@@ -485,3 +485,95 @@ fn a_refilled_loop_waits_in_the_phase_the_listing_path_looks_for() {
         "and its wait is stamped, as a freshly enabled loop's is",
     );
 }
+
+/// **The acceptance on the wire.** A pane animating two layers, scrubbed
+/// before both windows, puts a listing request out for **each** of them, and
+/// each layer's own timeline is the one left waiting for its answer.
+///
+/// The rule is pinned next door; this is the half that can only be seen at the
+/// dispatch, because filing every ask into `transport_state_mut` compiles,
+/// reads green against the rule, and clears the transport once per secondary
+/// while every secondary goes on holding frames stamped after the clock.
+#[test]
+fn a_deep_scrub_refills_every_animating_layer_not_just_the_transport() {
+    use rustdar_overlays::render::overlay_state::OverlayRegistry;
+
+    let transport = LayerId::new("test/transport");
+    let secondary = LayerId::new("test/secondary");
+    // The satellite-under-radar shape: the secondary's window is twelve times
+    // the transport's, so an ask built from the transport's span is visibly
+    // the wrong one rather than accidentally the same number.
+    const WIDE: u64 = SPAN * 12;
+
+    let mut app = crate::app::tests::n_pane_app(1, "KTLX");
+    let transport_seen: Ranges = Default::default();
+    let secondary_seen: Ranges = Default::default();
+    app.gui.overlays = OverlayRegistry::with_handlers(vec![
+        Box::new(RangeRecorder {
+            id: transport.clone(),
+            seen: Arc::clone(&transport_seen),
+        }),
+        Box::new(RangeRecorder {
+            id: secondary.clone(),
+            seen: Arc::clone(&secondary_seen),
+        }),
+    ]);
+    {
+        let pane = app.gui.pane_mut(0).expect("the fixture has one pane");
+        pane.set_transport_layer(transport.clone());
+        let ls = pane.time_state_mut(&transport);
+        ls.phase = rustdar_egui::pane::LoopPhase::Ready;
+        ls.span_secs = SPAN;
+        ls.frames = [60i64, 70, 80].into_iter().map(frame).collect();
+        let ls = pane.time_state_mut(&secondary);
+        ls.phase = rustdar_egui::pane::LoopPhase::Ready;
+        ls.span_secs = WIDE;
+        ls.frames = [60i64, 120, 180].into_iter().map(frame).collect();
+        pane.set_time_mode(rustdar_egui::pane::TimeMode::AsOf(ts(30)));
+        assert_eq!(
+            pane.time_state(&secondary)
+                .qualifying_frame_at(pane.time.mode),
+            None,
+            "premise: the secondary draws nothing at 12:30 either",
+        );
+    }
+
+    let t0 = web_time::Instant::now();
+    app.refill_unserved_loop_windows(t0);
+    app.refill_unserved_loop_windows(t0 + settled());
+
+    let secondary_asks = recorded(&secondary_seen);
+    assert_eq!(
+        secondary_asks,
+        vec![(ts(30) - chrono::Duration::seconds(WIDE as i64), ts(30))],
+        "the secondary went blank and nothing ever asked for its window",
+    );
+    let transport_asks = recorded(&transport_seen);
+    assert_eq!(
+        transport_asks,
+        vec![(ts(30) - chrono::Duration::seconds(SPAN as i64), ts(30))],
+        "and the transport must not be traded away for it",
+    );
+
+    let pane = app.gui.pane(0).expect("one pane");
+    for (id, span) in [(&transport, SPAN), (&secondary, WIDE)] {
+        let ls = pane.time_state(id);
+        assert_eq!(
+            ls.phase,
+            rustdar_egui::pane::LoopPhase::FetchingScanList,
+            "{} waits for its own answer in its own timeline",
+            id.as_str(),
+        );
+        assert_eq!(
+            ls.asked_range,
+            Some((ts(30) - chrono::Duration::seconds(span as i64), ts(30))),
+            "{} records the window IT was asked over",
+            id.as_str(),
+        );
+        assert!(
+            ls.frames.is_empty(),
+            "{} dropped the frames stamped after the clock",
+            id.as_str(),
+        );
+    }
+}
