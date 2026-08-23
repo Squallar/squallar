@@ -4,7 +4,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use egui_wgpu::wgpu;
-use rustdar_gpu::egui_renderer::texture_upload::TextureUploads;
+use rustdar_gpu::egui_renderer::texture_upload::{TextureUploads, UPLOAD_BAND_BYTES};
 use rustdar_gpu::staging_ring::STAGING_RING_FEATURE;
 
 /// The odd, multi-band shape. See the module note.
@@ -136,6 +136,78 @@ fn run_to_completion(
     frames + 1
 }
 
+/// **Every byte of the raster is counted once, on the route that carried it.**
+///
+/// This is the exact half of the raster telemetry. `UploadTotals` lives on the
+/// renderer rather than in a `static`, so nothing else in the process can move
+/// it and the figures below can be `==` rather than `>=` — which is what the
+/// process-global overlay ledger cannot do, and why
+/// `every_arrival_is_either_a_picture_or_a_drop` asserts an identity and a
+/// direction instead.
+///
+/// Four things, and the first is the non-vacuity floor:
+///
+/// * `deltas` is positive. Without it `staged_bytes == 0` on the no-ring arm
+///   would be satisfied by an upload path that had done nothing at all, which
+///   is the shape of every vacuous check this campaign has caught.
+/// * the banded total is the raster's own size, **exactly once** — a band
+///   counted twice or a partial band counted whole both fail here;
+/// * more than one band moved, or the byte figure is not a banded one;
+/// * every byte took the route this arm asked for, so the two arms of
+///   [`every_texel_lands`] must disagree about the split while agreeing about
+///   the total. A counter that were a constant, or that ignored `staged`,
+///   would pass one arm and fail the other.
+fn the_upload_ledger_counts_every_byte_of_a_banded_raster_once(
+    uploads: &TextureUploads,
+    deltas: usize,
+    with_ring: bool,
+) {
+    let totals = uploads.totals();
+    assert!(
+        totals.deltas > 0,
+        "the ledger saw no delta at all, so every byte figure below is zero for \
+         a reason that has nothing to do with what this test is checking",
+    );
+    assert_eq!(
+        totals.deltas, deltas as u64,
+        "egui handed over {deltas} deltas and the ledger counted {}",
+        totals.deltas,
+    );
+    assert_eq!(
+        totals.banded_bytes(),
+        (SIDE * SIDE * 4) as u64,
+        "a {SIDE}px RGBA raster is {} B and the ledger says {} B crossed as \
+         bands (staged {} + blocking {})",
+        SIDE * SIDE * 4,
+        totals.banded_bytes(),
+        totals.staged_bytes,
+        totals.blocking_bytes,
+    );
+    assert!(
+        totals.bands > 1,
+        "{} band(s) moved a raster of {} B against a {UPLOAD_BAND_BYTES} B band \
+         budget, so nothing here was banded",
+        totals.bands,
+        SIDE * SIDE * 4,
+    );
+    if with_ring {
+        assert_eq!(
+            totals.blocking_bytes, 0,
+            "{} B went through `write_texture` on a device with a ring; that is \
+             frame thread, and it is what the ring exists to avoid",
+            totals.blocking_bytes,
+        );
+        assert!(totals.staged_bytes > 0);
+    } else {
+        assert_eq!(
+            totals.staged_bytes, 0,
+            "{} B were reported staged on a device with no ring",
+            totals.staged_bytes,
+        );
+        assert_eq!(totals.blocking_bytes, totals.banded_bytes());
+    }
+}
+
 /// Both routes put every texel exactly where a single `write_texture` would.
 fn every_texel_lands(with_ring: bool) {
     let Some((device, queue, has_ring)) = device(with_ring) else {
@@ -194,6 +266,12 @@ fn every_texel_lands(with_ring: bool) {
         "a {SIDE}px raster finished in one frame, so the {} bytes it carries did \
          not exceed a frame's budget and nothing here was exercised",
         SIDE * SIDE * 4,
+    );
+
+    the_upload_ledger_counts_every_byte_of_a_banded_raster_once(
+        &uploads,
+        delta.set.len(),
+        with_ring,
     );
 
     let texture = uploads

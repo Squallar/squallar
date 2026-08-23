@@ -159,6 +159,49 @@ impl PlanViewUploads {
     }
 }
 
+/// The `overlay rasters:` running-total line.
+///
+/// **A free function, and built as a `String`, so that a test can read it.**
+/// The Tier-2 rig scrapes this sentence out of the browser's console with a
+/// regex, and the two are in different languages in different directories: an
+/// extra space here is not a compile error, is not a test failure anywhere
+/// else, and turns the rig's whole overlay reading into `null` — which reads
+/// as "the path never ran". `the_rig_reads_the_lines_the_app_actually_writes`
+/// is what stops that, and it can only exist because this is a value rather
+/// than an argument to `log::info!`.
+///
+/// Never called on a frame that moved nothing; see
+/// [`super::App::report_raster_telemetry`].
+fn overlay_raster_line(t: &rustdar_egui::overlay_cache::ledger::Totals) -> String {
+    format!(
+        "overlay rasters: {} dispatched, {} arrived, {} pictures of {} B, \
+         {} shown, {} promoted, {} dropped, {} superseded",
+        t.dispatched,
+        t.arrived,
+        t.pictures,
+        t.picture_bytes,
+        t.shown,
+        t.promoted,
+        t.dropped,
+        t.superseded,
+    )
+}
+
+/// The `texture uploads:` running-total line. See [`overlay_raster_line`] for
+/// why this is a value.
+fn texture_upload_line(u: &rustdar_gpu::egui_renderer::texture_upload::UploadTotals) -> String {
+    format!(
+        "texture uploads: {} deltas, {} B to the GPU, {} B unbanded, \
+         {} bands, {} B staged, {} B blocking",
+        u.deltas,
+        u.bytes(),
+        u.unbanded_bytes,
+        u.bands,
+        u.staged_bytes,
+        u.blocking_bytes,
+    )
+}
+
 impl super::App {
     /// Set up and run the egui UI pass.
     pub(super) fn setup_egui_frame(&mut self) -> ([u32; 2], Vec<GuiAction>) {
@@ -201,6 +244,9 @@ impl super::App {
         // raster whose last band landed on the previous frame goes on screen in
         // *this* frame's paint list rather than the next one. See the callee.
         self.promote_uploaded_rasters();
+        // After the promote, so a picture that reached the screen this frame is
+        // in the line this frame writes rather than the next one's.
+        self.report_raster_telemetry();
 
         self.run_frame_pump(PumpPhase::Apply, Some(&ctx));
         self.run_frame_pump(PumpPhase::Advance, Some(&ctx));
@@ -615,6 +661,51 @@ impl super::App {
             .promote_held_rasters(|id| renderer.is_delivered(id));
     }
 
+    /// **Say what the raster pipeline has spent, on a frame where it spent
+    /// something.**
+    ///
+    /// Two lines, never one, because they have two different denominators and
+    /// adding them would describe neither:
+    ///
+    /// * `overlay rasters:` is the whole-picture overlay dispatch — the ten
+    ///   layer kinds [`App::spawn_overlay_render`] rasterizes. Radar's own
+    ///   pipeline and the loop frames are not in it. See
+    ///   [`rustdar_egui::overlay_cache::ledger`].
+    /// * `texture uploads:` is what this device was then made to move, for
+    ///   **every** texture egui holds — the font atlas, the basemap tiles and
+    ///   radar included. See
+    ///   [`rustdar_gpu::egui_renderer::texture_upload::UploadTotals`].
+    ///
+    /// Running totals rather than per-event deltas, so **one** line is the
+    /// whole answer: the browser's console is a ring that evicts, and a reader
+    /// that had to sum it would be summing whatever survived. That is the same
+    /// reason `rustdar_web`'s `worker_port` reports the transport this way.
+    ///
+    /// `info` and not `debug` is load-bearing on the browser target, where
+    /// `console_log` is initialised at `Level::Info` and a `debug!` line is
+    /// invisible to the Tier-2 rig.
+    ///
+    /// # What this costs the frame
+    ///
+    /// On a frame that moved nothing: eight relaxed loads and a failed
+    /// compare-exchange for the first ledger, one `u64` add and one compare for
+    /// the second, and no formatting at all — both `*_if_moved` calls answer
+    /// `None` and the `format_args!` is never built. Nothing here allocates or
+    /// takes a lock. The increments themselves are one `fetch_add` each, at
+    /// sites that run per dispatched raster, per arriving raster and per moved
+    /// band — never in the per-pane-per-layer walks, which are the hot ones.
+    fn report_raster_telemetry(&mut self) {
+        if let Some(t) = rustdar_egui::overlay_cache::ledger::totals_if_moved() {
+            log::info!("{}", overlay_raster_line(&t));
+        }
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        if let Some(u) = state.egui_renderer.upload_totals_if_moved() {
+            log::info!("{}", texture_upload_line(&u));
+        }
+    }
+
     /// Promote every held raster, as the frame after the last band lands does.
     #[cfg(test)]
     pub(super) fn deliver_held_rasters(&mut self) {
@@ -921,6 +1012,15 @@ impl super::App {
                 continue;
             }
 
+            // **Counted here and not at the top of the loop**, so that
+            // `ledger::Totals::arrivals_balance` is an identity rather than a
+            // hope: a loop frame takes the arm above and is neither a picture
+            // in a pane's overlay cache nor a drop from one, so counting it as
+            // an arrival would make the balance false for a reason that is not
+            // a defect. Everything past this line ends in exactly one of
+            // `note_picture` or `note_dropped`.
+            rustdar_egui::overlay_cache::ledger::note_arrived();
+
             // The dispatch this answers, rebuilt from the two terms the
             // response echoes — see `RenderTicket`. A pane whose cache is no
             // longer waiting for *this* raster does not get it.
@@ -946,10 +1046,19 @@ impl super::App {
                 wanted && still_asked
             });
             if resp.pane_indices.is_empty() {
+                // Rasterized and thrown away: every pane had moved past this
+                // dispatch or stopped drawing the layer. The bytes never reach
+                // the GPU, which is what makes this worth counting separately
+                // from the ones that do.
+                rustdar_egui::overlay_cache::ledger::note_dropped();
                 continue;
             }
 
             let Some(image) = resp.image else {
+                // A render that produced no picture. Still an arrival, and
+                // still not a picture, so it is a drop for the balance's
+                // purposes.
+                rustdar_egui::overlay_cache::ledger::note_dropped();
                 continue;
             };
 
@@ -961,6 +1070,12 @@ impl super::App {
             let tex_name = format!("overlay_{}", self.texture_counter);
             let texture =
                 ctx.load_texture(tex_name, Arc::clone(&image), egui::TextureOptions::LINEAR);
+            // **Once per response, never once per pane.** This one handle is
+            // cloned to every pane below, so the pixels cross once however many
+            // panes asked; counting inside that loop would multiply the byte
+            // figure by the pane count. `as_raw()` is the picture's own buffer,
+            // so this is the real size rather than `w * h * 4` restated.
+            rustdar_egui::overlay_cache::ledger::note_picture(image.as_raw().len() as u64);
 
             // Every pane still named here wants the picture: the retain above is
             // what decided that, and it also cleared every in-flight mark.
@@ -982,8 +1097,16 @@ impl super::App {
                     hit_map: resp.hit_map.clone(),
                 };
                 if cache.current().is_none() {
+                    rustdar_egui::overlay_cache::ledger::note_shown();
                     cache.show(data);
                 } else {
+                    // A hold replaces rather than queues, so handing one to a
+                    // cache that is already holding throws away an upload that
+                    // had started. Asked before the call because `hold` is what
+                    // clears the answer.
+                    if cache.is_holding() {
+                        rustdar_egui::overlay_cache::ledger::note_superseded();
+                    }
                     cache.hold(data, None);
                 }
             }
@@ -4391,6 +4514,12 @@ fn render_already_queued<'a>(
             && (r.snapped - snapped).abs() <= ELEVATION_TOLERANCE
     })
 }
+
+/// The two running-total sentences, against the browser rig's own probes for
+/// them — read out of `drive.py` rather than restated.
+#[path = "app_render/raster_telemetry_line_tests.rs"]
+#[cfg(test)]
+mod raster_telemetry_line_tests;
 
 /// The order one frame is assembled in.
 #[path = "app_render/declared_nyquist_dispatch_tests.rs"]

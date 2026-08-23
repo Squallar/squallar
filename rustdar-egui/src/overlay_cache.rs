@@ -224,6 +224,10 @@ pub fn plan_overlay_texture(
     }
 }
 
+/// What the whole-picture overlay pipeline has actually spent: rasters asked
+/// for, pictures uploaded and bytes with them, and the ones thrown away.
+pub mod ledger;
+
 // ── How many rasters may be crossing at once ─────────────────────────────
 
 /// Which of a layer's pictures a raster is on its way to, as an index the
@@ -320,9 +324,12 @@ impl RenderTicket {
 ///
 /// A raster in flight is a raster's bytes in flight, so the transient cost of
 /// one cache is `outstanding x plan bytes`, and [`Self::len`] is the counted
-/// quantity that bounds it. Nothing here measures bytes — there is no
-/// producer-side byte counter anywhere in the tree — so this is arithmetic over
-/// a quantity tests do check, not a measured figure.
+/// quantity that bounds it. Nothing *here* measures bytes, so the product below
+/// is arithmetic over a quantity tests check rather than a measured figure —
+/// but the bytes themselves are now counted, at the two places they are really
+/// spent: [`ledger::Totals::picture_bytes`] is what this pipeline hands to
+/// egui, and `rustdar_gpu::egui_renderer::texture_upload::UploadTotals` is what
+/// the device is then made to move. Neither is this product.
 ///
 /// **For every layer the tree draws today the bound is one raster, at every
 /// budget**, because a layer that draws one picture has one destination and
@@ -388,6 +395,11 @@ impl RendersInFlight {
     /// discarded rather than held. So this can never grow the outstanding set
     /// past one entry per destination, however it is called.
     pub fn record(&mut self, ticket: RenderTicket) {
+        // Counted here and not at the dispatch that calls it, because this is
+        // the mark itself: a dispatch that returned before marking has not
+        // asked for a raster, and one that marked twice for a slot really did
+        // spend two. One relaxed `fetch_add`; see [`ledger`].
+        ledger::note_dispatched();
         match self.out.iter_mut().find(|t| t.slot == ticket.slot) {
             Some(slot) => *slot = ticket,
             None => self.out.push(ticket),
@@ -983,3 +995,8 @@ mod geo_click_tests;
 
 #[cfg(test)]
 mod texture_budget_tests;
+
+/// What a reading of the raster ledger licenses: the non-vacuity floor, the
+/// arrival balance, and the two routes to the screen.
+#[cfg(test)]
+mod ledger_tests;
