@@ -444,6 +444,25 @@ pub enum LoopPhase {
     Paused,
 }
 
+/// **One press of the loop transport**, as a value.
+///
+/// The three controls — play/pause, step, and the scrubber — are one question
+/// asked three ways: *move the layer this pane's transport addresses*. Naming
+/// them here rather than acting them out in the shell keeps the phase machine,
+/// the wrap-around and the "park the whole pane's clock on that frame" rule in
+/// the layer that owns [`LayerTimeState`], and leaves the shell with one door
+/// into the `Gui` instead of three (WO-T3.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportCommand {
+    /// Play if paused or ready, pause if playing; nothing at all from a phase
+    /// that is not one of those three.
+    TogglePlayback,
+    /// One frame on, wrapping at either end of the frame list.
+    Step { forward: bool },
+    /// Straight to the frame at this index; nothing if it names no frame.
+    Seek(usize),
+}
+
 /// What a pane's animation is waiting on (WI-7) — the legible form of a blank
 /// the loop machinery is about to fill. Both arms carry the quantity a reader
 /// can hold, because that is all the notice may say: an animating layer with a
@@ -952,7 +971,7 @@ pub struct PaneState {
     /// written before the field existed load unchanged: radar was the only
     /// layer the transport could address.
     transport: LayerId,
-    /// The answer [`Self::loop_state`] gives a pane that has no radar slot to
+    /// The answer [`Self::time_state`] gives a pane that has no slot to
     /// keep one on: inactive, empty, and never written. A pane the `Gui` owns
     /// has been through `initialize_pane_enabled` and has the slot, so this is
     /// what a bare [`PaneState`] answers before it is seeded.
@@ -1789,8 +1808,20 @@ impl PaneState {
     /// Whichever picture the loop's playhead is on, before it is narrowed to a
     /// kind. One lookup, so the two accessors above cannot walk to different
     /// frames.
+    ///
+    /// **Radar-addressed on purpose, and it stays that way** (WO-T3.7). The
+    /// three accessors above narrow to [`LoopFrameImage::plan_view`],
+    /// [`LoopFrameImage::section`] and [`LoopFrameImage::volume`], every one of
+    /// which is a radar picture; the non-radar arm is
+    /// [`LoopFrameImage::Overlay`] and [`LoopFrameImage::view`] answers `None`
+    /// for it precisely so a radar read cannot land in an overlay frame. A
+    /// transport-addressed lookup here would hand radar's draw a satellite or
+    /// model timeline — pinned by
+    /// `radars_picture_is_read_off_radars_timeline_not_the_transports`. Every
+    /// other layer's raster is [`Self::overlay_texture_on_screen`], which is
+    /// layer-addressed.
     fn active_loop_image(&self) -> Option<&LoopFrameImage> {
-        let ls = self.loop_state();
+        let ls = self.time_state(&known::RADAR);
         ls.frames
             .get(ls.qualifying_frame()?)
             .and_then(|f| f.image.as_ref())
@@ -1810,7 +1841,7 @@ impl PaneState {
     /// * **not animating** — the layer's live raster, exactly as before.
     ///
     /// **Addressed at `id`, not at the transport**, which mirrors radar's own
-    /// arm ([`Self::active_image`] reads [`Self::loop_state`]). Every layer's
+    /// arm ([`Self::active_image`] reads `time_state(&known::RADAR)`). Every layer's
     /// playhead is settled from the pane clock by [`Self::settle_playheads`],
     /// so a second animating layer that is not the transport still has a frame
     /// to name — and gating on the transport would leave exactly that layer
@@ -1835,7 +1866,7 @@ impl PaneState {
     /// or, for a forecast frame, when it is *valid*: the transport playhead's
     /// own stamp, which for a frame past the wall clock is the valid time.
     ///
-    /// **Transport-addressed** (WI-9). It read `loop_state()` — radar's slot
+    /// **Transport-addressed** (WI-9). It read radar's slot
     /// by definition — so a pane looping a forecast reported no time of its
     /// own and the chip fell through to another pane's clock.
     pub fn data_time_on_screen(&self) -> Option<NaiveDateTime> {
@@ -1871,7 +1902,11 @@ impl PaneState {
     /// has selected** — the product and sweep the pixels really are, so a caller
     /// can say so.
     pub fn stale_image_on_screen(&self) -> Option<(FieldId, f32)> {
-        if self.loop_state().is_active() {
+        // **Radar-addressed, named** (WO-T3.7): the question is about radar's
+        // own pixels and the cache read below is `known::RADAR`'s. Asking the
+        // transport would let a satellite loop suppress radar's staleness
+        // notice, or raise one over a pane whose radar is not looping at all.
+        if self.time_state(&known::RADAR).is_active() {
             return None;
         }
         let meta = self
@@ -1902,7 +1937,9 @@ impl PaneState {
         if self.selected_product() != radar_fields::known::VELOCITY || !self.is_map() {
             return None;
         }
-        if self.loop_state().is_active() {
+        // Radar-addressed, named — see [`Self::stale_image_on_screen`]. A
+        // Nyquist velocity is a property of a radar cut and of nothing else.
+        if self.time_state(&known::RADAR).is_active() {
             // No product gate here, and none is needed: `retarget_renders`
             // drops every frame texture the moment the selection moves, so a
             // looping pane cannot hold a frame depicting anything else.
@@ -1926,7 +1963,8 @@ impl PaneState {
         {
             return None;
         }
-        if self.loop_state().is_active() {
+        // Radar-addressed, named — see [`Self::stale_image_on_screen`].
+        if self.time_state(&known::RADAR).is_active() {
             return self
                 .active_image()
                 .and_then(|frame| frame.melting_layer_source);
@@ -1948,7 +1986,8 @@ impl PaneState {
         {
             return None;
         }
-        if self.loop_state().is_active() {
+        // Radar-addressed, named — see [`Self::stale_image_on_screen`].
+        if self.time_state(&known::RADAR).is_active() {
             return self.active_image().and_then(|frame| frame.storm_motion);
         }
         if self.stale_image_on_screen().is_some() {
@@ -2146,27 +2185,26 @@ impl PaneState {
         true
     }
 
-    /// [`Self::park_on_frame`] on the radar layer — the loop the transport
-    /// means by "this pane's loop".
-    pub fn park_on_loop_frame(&mut self, index: usize) -> bool {
-        self.park_on_frame(&known::RADAR, index)
-    }
-
-    /// **The radar layer's timeline in this pane** — what the loop transport,
-    /// the dispatcher and the arrival path all mean by "this pane's loop".
-    pub fn loop_state(&self) -> &LayerTimeState {
-        self.time_state(&known::RADAR)
-    }
-
-    /// [`Self::loop_state`], to write.
-    pub fn loop_state_mut(&mut self) -> &mut LayerTimeState {
-        self.time_state_mut(&known::RADAR)
-    }
+    // **`loop_state()`, `loop_state_mut()` and `park_on_loop_frame()` were
+    // here, and WO-T3.7 deleted them.** All three were
+    // `time_state(&known::RADAR)` under a name that claimed to be "this pane's
+    // loop". That name was true while a pane had one timeline; since a pane
+    // holds one per animating frame-series layer it is a false claim, and its
+    // callers were split between it and [`Self::transport_state`] with no rule
+    // for which a site meant.
+    //
+    // What replaced them, per site: [`Self::transport_state`] where the site
+    // means "whatever the controls are driving", [`Self::time_state`] where it
+    // means one named layer, and `time_state(&known::RADAR)` **spelled out**
+    // where it really is radar's own timeline — so that reading the code shows
+    // which of the three a site meant instead of hiding all three behind one
+    // word. Each surviving radar read says beside it why radar is the right
+    // address, so the next reader does not have to re-litigate it.
 
     /// **The layer this pane's loop transport addresses** — see
     /// [`Self::transport`](#structfield.transport). Radar until something
-    /// moves it, which is what makes every caller below identical to the
-    /// radar-addressed [`Self::loop_state`] on a radar pane.
+    /// moves it, which is what makes every caller below identical to a
+    /// `time_state(&known::RADAR)` read on a radar pane.
     pub fn transport_layer(&self) -> &LayerId {
         &self.transport
     }
@@ -2182,10 +2220,10 @@ impl PaneState {
     /// **The transport layer's timeline in this pane** — what the ∞ toggle,
     /// the transport buttons and the scrubber all read.
     ///
-    /// Not the same accessor as [`Self::loop_state`], and deliberately so:
-    /// that one is radar's own timeline, which the arrival path, the render
-    /// dispatcher and the scan cache go on addressing by name because their
-    /// payloads are radar's.
+    /// Not the same thing as `time_state(&known::RADAR)`, and deliberately
+    /// so: that one is radar's own timeline, which the arrival path, the
+    /// render dispatcher and the scan cache go on addressing by name because
+    /// their payloads are radar's.
     /// Every one of the three goes through [`Self::transport_layer`] rather
     /// than reading the field, so there is exactly one place that decides
     /// which layer this pane's transport is about.
@@ -2204,6 +2242,49 @@ impl PaneState {
     pub fn park_on_transport_frame(&mut self, index: usize) -> bool {
         let id = self.transport_layer().clone();
         self.park_on_frame(&id, index)
+    }
+
+    /// **Act one press of the loop transport** — see [`TransportCommand`].
+    ///
+    /// Transport-addressed throughout: every arm moves whichever timeline
+    /// [`Self::transport_layer`] names, which is the one the buttons under the
+    /// pane are labelled for. It is radar's only when radar is what the
+    /// transport is addressing.
+    pub fn drive_transport(&mut self, command: TransportCommand) {
+        match command {
+            TransportCommand::TogglePlayback => {
+                let ls = self.transport_state_mut();
+                match ls.phase {
+                    LoopPhase::Playing => {
+                        ls.phase = LoopPhase::Paused;
+                    }
+                    LoopPhase::Ready | LoopPhase::Paused => {
+                        ls.phase = LoopPhase::Playing;
+                        ls.last_advance = Some(web_time::Instant::now());
+                    }
+                    _ => {}
+                }
+            }
+            TransportCommand::Step { forward } => {
+                let ls = self.transport_state_mut();
+                let next = (!ls.frames.is_empty()).then(|| {
+                    let current = ls.current_frame();
+                    if forward {
+                        (current + 1) % ls.frames.len()
+                    } else if current == 0 {
+                        ls.frames.len() - 1
+                    } else {
+                        current - 1
+                    }
+                });
+                if let Some(next) = next {
+                    self.park_on_transport_frame(next);
+                }
+            }
+            TransportCommand::Seek(index) => {
+                self.park_on_transport_frame(index);
+            }
+        }
     }
 
     /// **The layer the transport *should* address**: this pane's topmost
@@ -2377,8 +2458,9 @@ impl PaneState {
     /// The radar slot is not just another layer here: its `config` is where
     /// this pane keeps its own site, product, elevation and live-chunk switch
     /// ([`RADAR_SLOT_PANE_KEYS`], which exist precisely because that slot has
-    /// two owners), its [`LayerTimeState`] is what [`Self::loop_state`]
-    /// returns, and [`Self::overlay_texture_releasable`] exempts its texture by
+    /// two owners), its [`LayerTimeState`] is the one the render dispatcher
+    /// and the scan cache address by name, and
+    /// [`Self::overlay_texture_releasable`] exempts its texture by
     /// name. Removing it would not hide a picture, it would delete the pane's
     /// whole selection. So a radar pane keeps its radar layer, and the control
     /// says so rather than being absent or silently doing nothing.

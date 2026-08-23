@@ -425,7 +425,7 @@ fn still_animating(pane: &PaneState, ids: &[LayerId]) -> Vec<LayerId> {
 
 /// **WO-T3.6 — a view change stops every timeline the pane armed.**
 ///
-/// `set_map_render` and `set_content` reset `loop_state_mut()`, which is
+/// `set_map_render` and `set_content` reset radar's slot by name, which is
 /// radar's slot by name, so a satellite or model loop on the same pane survived
 /// a plan↔volume or map↔section switch and kept its frames — while playback
 /// runs off `transport_state()`, whose radar timeline had just been torn down.
@@ -478,7 +478,7 @@ fn a_view_change_stops_every_timeline_the_pane_armed() {
     for switch in ["set_map_render", "set_content"] {
         let mut radar_only = pane_animating(&[known::RADAR]);
         assert!(
-            radar_only.loop_state().is_active(),
+            radar_only.time_state(&known::RADAR).is_active(),
             "precondition: {switch}"
         );
         if switch == "set_map_render" {
@@ -487,7 +487,8 @@ fn a_view_change_stops_every_timeline_the_pane_armed() {
             radar_only.set_kind(PaneKind::CrossSection);
         }
         assert!(
-            !radar_only.loop_state().is_active() && radar_only.loop_state().frames.is_empty(),
+            !radar_only.time_state(&known::RADAR).is_active()
+                && radar_only.time_state(&known::RADAR).frames.is_empty(),
             "{switch} stopped reaching radar's own timeline",
         );
     }
@@ -1311,9 +1312,11 @@ fn a_looping_pane_reports_the_playing_frames_fold_limit() {
         "precondition: a still pane says what its own static render declared",
     );
 
-    *pane.loop_state_mut() = loop_with_frames(3, 1);
-    pane.loop_state_mut().frames[0].image = Some(plan_view_folding_at(&ctx, Some(31.0)));
-    pane.loop_state_mut().frames[1].image = Some(plan_view_folding_at(&ctx, Some(22.14)));
+    *pane.time_state_mut(&known::RADAR) = loop_with_frames(3, 1);
+    pane.time_state_mut(&known::RADAR).frames[0].image =
+        Some(plan_view_folding_at(&ctx, Some(31.0)));
+    pane.time_state_mut(&known::RADAR).frames[1].image =
+        Some(plan_view_folding_at(&ctx, Some(22.14)));
     assert_eq!(
         pane.displayed_nyquist_ms(),
         Some(22.14),
@@ -1321,13 +1324,13 @@ fn a_looping_pane_reports_the_playing_frames_fold_limit() {
          on the glass",
     );
 
-    pane.loop_state_mut().current_frame = 0;
+    pane.time_state_mut(&known::RADAR).current_frame = 0;
     assert_eq!(pane.displayed_nyquist_ms(), Some(31.0));
 
-    pane.loop_state_mut().frames[0].image = Some(plan_view_folding_at(&ctx, None));
+    pane.time_state_mut(&known::RADAR).frames[0].image = Some(plan_view_folding_at(&ctx, None));
     assert_eq!(pane.displayed_nyquist_ms(), None);
 
-    pane.loop_state_mut().current_frame = 2;
+    pane.time_state_mut(&known::RADAR).current_frame = 2;
     assert_eq!(pane.displayed_nyquist_ms(), None);
 }
 
@@ -1417,18 +1420,19 @@ fn a_looping_classification_pane_reports_the_playing_frames_layer() {
 
     let ctx = egui::Context::default();
     let mut pane = classification_pane(&ctx, Some(MeltingLayerSource::Rpg));
-    *pane.loop_state_mut() = loop_with_frames(3, 1);
-    pane.loop_state_mut().frames[1].image = Some(LoopFrameImage::PlanView(RadarImageData {
-        melting_layer_source: Some(MeltingLayerSource::FleetDefault),
-        ..dummy_plan_view(&ctx)
-    }));
+    *pane.time_state_mut(&known::RADAR) = loop_with_frames(3, 1);
+    pane.time_state_mut(&known::RADAR).frames[1].image =
+        Some(LoopFrameImage::PlanView(RadarImageData {
+            melting_layer_source: Some(MeltingLayerSource::FleetDefault),
+            ..dummy_plan_view(&ctx)
+        }));
     assert_eq!(
         pane.displayed_melting_layer_source(),
         Some(MeltingLayerSource::FleetDefault),
         "the loop reported the static render's layer, not the frame on the glass",
     );
 
-    pane.loop_state_mut().current_frame = 2;
+    pane.time_state_mut(&known::RADAR).current_frame = 2;
     assert_eq!(pane.displayed_melting_layer_source(), None);
 }
 
@@ -1501,18 +1505,19 @@ fn a_looping_storm_relative_pane_reports_the_playing_frames_vector() {
 
     let ctx = egui::Context::default();
     let mut pane = storm_relative_pane(&ctx, Some(StormMotionSource::RpgScitAverage));
-    *pane.loop_state_mut() = loop_with_frames(3, 1);
-    pane.loop_state_mut().frames[1].image = Some(LoopFrameImage::PlanView(RadarImageData {
-        storm_motion: Some(srm_vector(StormMotionSource::BunkersRightMover)),
-        ..dummy_plan_view(&ctx)
-    }));
+    *pane.time_state_mut(&known::RADAR) = loop_with_frames(3, 1);
+    pane.time_state_mut(&known::RADAR).frames[1].image =
+        Some(LoopFrameImage::PlanView(RadarImageData {
+            storm_motion: Some(srm_vector(StormMotionSource::BunkersRightMover)),
+            ..dummy_plan_view(&ctx)
+        }));
     assert_eq!(
         pane.displayed_storm_motion(),
         Some(srm_vector(StormMotionSource::BunkersRightMover)),
         "the loop reported the static render's vector, not the frame on the glass",
     );
 
-    pane.loop_state_mut().current_frame = 2;
+    pane.time_state_mut(&known::RADAR).current_frame = 2;
     assert_eq!(pane.displayed_storm_motion(), None);
 }
 
@@ -1544,11 +1549,11 @@ fn one_scan_is_the_zero_the_config_file_has_always_written() {
 #[test]
 fn two_layers_in_one_pane_keep_two_timelines() {
     let mut pane = PaneState::with_site(SITE.to_string());
-    pane.loop_state_mut().current_frame = 3;
+    pane.time_state_mut(&known::RADAR).current_frame = 3;
     pane.time_state_mut(&known::MODEL_DATA).current_frame = 7;
 
     assert_eq!(
-        pane.loop_state().current_frame,
+        pane.time_state(&known::RADAR).current_frame,
         3,
         "the radar layer kept its own playhead",
     );
@@ -1575,21 +1580,21 @@ fn a_pane_with_no_slot_for_a_layer_answers_with_an_empty_timeline() {
         pane.layers.is_empty(),
         "precondition: a fresh pane carries no slots at all",
     );
-    assert!(!pane.loop_state().is_active());
-    assert!(pane.loop_state().frames.is_empty());
+    assert!(!pane.time_state(&known::RADAR).is_active());
+    assert!(pane.time_state(&known::RADAR).frames.is_empty());
     assert!(
         pane.slot(&known::RADAR).is_none(),
         "and reading did not create one",
     );
 
-    pane.loop_state_mut().phase = LoopPhase::Playing;
+    pane.time_state_mut(&known::RADAR).phase = LoopPhase::Playing;
 
     assert!(
         pane.slot(&known::RADAR).is_some(),
         "writing the timeline gave the layer a slot to keep it on",
     );
     assert!(
-        pane.loop_state().is_active(),
+        pane.time_state(&known::RADAR).is_active(),
         "and the write landed where the read looks",
     );
 }
@@ -1720,7 +1725,7 @@ fn the_clock_moves_the_playhead_and_two_layers_land_on_one_instant() {
     );
 
     // Said by index instead, on radar's frame 2, which is 2 minutes.
-    assert!(pane.park_on_loop_frame(2), "frame 2 exists");
+    assert!(pane.park_on_frame(&known::RADAR, 2), "frame 2 exists");
     assert_eq!(
         pane.time.mode,
         TimeMode::AsOf(ts(2)),
@@ -1728,7 +1733,7 @@ fn the_clock_moves_the_playhead_and_two_layers_land_on_one_instant() {
     );
     assert_eq!(pane.time_state(&known::MODEL_DATA).current_frame(), 0);
     assert!(
-        !pane.park_on_loop_frame(99),
+        !pane.park_on_frame(&known::RADAR, 99),
         "an index naming no frame moves nothing",
     );
     assert_eq!(
@@ -1880,7 +1885,10 @@ fn the_clock_follows_the_topmost_animating_layer() {
 fn eviction_keeps_the_pane_on_the_moment_it_was_parked_at() {
     let mut pane = PaneState::new();
     *pane.time_state_mut(&known::RADAR) = timeline_at_minutes(5);
-    assert!(pane.park_on_loop_frame(2), "parked on the 2-minute frame");
+    assert!(
+        pane.park_on_frame(&known::RADAR, 2),
+        "parked on the 2-minute frame"
+    );
 
     // The two oldest frames age out of the window.
     pane.time_state_mut(&known::RADAR)

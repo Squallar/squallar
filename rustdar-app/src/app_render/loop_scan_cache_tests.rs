@@ -4,6 +4,7 @@ use crate::platform_double::TestBridge;
 use crate::test_keys;
 use rustdar_egui::pane::LoopPhase;
 use rustdar_radar::types::{RadarProduct, RenderView};
+use rustdar_source::id::known;
 
 const SITE: &str = "KTLX";
 
@@ -33,15 +34,15 @@ fn begin_loop(app: &mut crate::app::App, lookback_secs: u64) {
         .expect("KTLX is in the resolved site table")
         .clone();
     let pane = app.gui.pane_mut(0).expect("a fresh Gui has one pane");
-    *pane.loop_state_mut() =
+    *pane.time_state_mut(&known::RADAR) =
         rustdar_egui::radar_layer::begin_loop(lookback_secs, &site, RenderView::PlanView);
     assert_eq!(
-        pane.loop_state().phase,
+        pane.time_state(&known::RADAR).phase,
         LoopPhase::FetchingScanList,
         "precondition: a freshly built loop is waiting on its listing",
     );
     assert!(
-        pane.loop_state().listing_since.is_some(),
+        pane.time_state(&known::RADAR).listing_since.is_some(),
         "precondition: entering the fetching phase starts the clock on the \
          grace exemption",
     );
@@ -50,10 +51,10 @@ fn begin_loop(app: &mut crate::app::App, lookback_secs: u64) {
 fn age_listing(app: &mut crate::app::App, secs: u64) {
     let pane = app.gui.pane_mut(0).expect("a fresh Gui has one pane");
     let since = pane
-        .loop_state()
+        .time_state(&known::RADAR)
         .listing_since
         .expect("the loop is fetching, so it has a clock");
-    pane.loop_state_mut().listing_since = Some(
+    pane.time_state_mut(&known::RADAR).listing_since = Some(
         since
             .checked_sub(std::time::Duration::from_secs(secs))
             .expect("the monotonic clock's origin is younger than the grace bound, which needs a host booted seconds ago"),
@@ -65,10 +66,17 @@ fn install_listing(app: &mut crate::app::App, minutes: &[u32]) {
     let budgets = test_budgets();
     let scans: Vec<_> = minutes.iter().map(|&minute| at(minute)).collect();
     let pane = app.gui.pane_mut(0).expect("a fresh Gui has one pane");
-    accept_scan_listing(allocation, &budgets, pane.loop_state_mut(), SITE, scans, 1)
-        .expect("a non-empty listing for this loop's own site is accepted");
+    accept_scan_listing(
+        allocation,
+        &budgets,
+        pane.time_state_mut(&known::RADAR),
+        SITE,
+        scans,
+        1,
+    )
+    .expect("a non-empty listing for this loop's own site is accepted");
     assert_eq!(
-        pane.loop_state().frames.len(),
+        pane.time_state(&known::RADAR).frames.len(),
         minutes.len(),
         "precondition: the listing became frames without being sampled",
     );
@@ -140,7 +148,7 @@ fn frames(app: &crate::app::App) -> Vec<chrono::NaiveDateTime> {
     app.gui
         .pane(0)
         .expect("a fresh Gui has one pane")
-        .loop_state()
+        .time_state(&known::RADAR)
         .frames
         .iter()
         .map(|frame| frame.timestamp)
@@ -166,7 +174,7 @@ fn polled_volumes_no_loop_asked_for_are_not_kept() {
         !app.gui
             .pane(0)
             .expect("a fresh Gui has one pane")
-            .loop_state()
+            .time_state(&known::RADAR)
             .is_active(),
         "precondition: no loop names any of these volumes",
     );
@@ -321,7 +329,7 @@ fn the_volume_a_pane_is_viewing_survives_with_no_loop_naming_it() {
         !app.gui
             .pane(0)
             .expect("a fresh Gui has one pane")
-            .loop_state()
+            .time_state(&known::RADAR)
             .is_active(),
         "precondition: no loop names anything, so only the pane's own view can \
          keep an entry",
@@ -371,7 +379,7 @@ fn a_listing_that_never_returns_stops_exempting_its_site() {
         app.gui
             .pane(0)
             .expect("a fresh Gui has one pane")
-            .loop_state()
+            .time_state(&known::RADAR)
             .is_fetching(),
         "precondition: nothing moved the phase — this is the stuck listing, not \
          a loop that quietly finished",
@@ -447,7 +455,7 @@ fn paired_objects_no_live_frame_names_are_not_kept() {
         !app.gui
             .pane(0)
             .expect("a fresh Gui has one pane")
-            .loop_state()
+            .time_state(&known::RADAR)
             .is_active(),
         "precondition: no loop names any of these volumes",
     );
@@ -632,5 +640,108 @@ fn a_retired_frame_is_not_re_paired_after_the_window_moves() {
         1,
         "the queue still owes pairings for frames the window retired, so each \
          is fetched again and evicted by the very next sweep",
+    );
+}
+
+/// Run the sweep over a pane whose radar loop holds minutes 0/4/8, with the
+/// transport optionally moved off radar first, and answer which of those
+/// minutes still has its decoded volume afterwards.
+///
+/// `driven_by` is the layer the pane's transport addresses. `None` leaves it
+/// where a fresh pane puts it, which is radar.
+fn volumes_surviving_the_sweep(driven_by: Option<rustdar_source::id::LayerId>) -> Vec<u32> {
+    const HELD: [u32; 3] = [0, 4, 8];
+
+    let mut app = app_on_site();
+    begin_loop(&mut app, 3600);
+    install_listing(&mut app, &HELD);
+    for minute in HELD {
+        app.loop_mgr.cache_scan(SITE, at(minute), volume());
+    }
+
+    if let Some(id) = driven_by {
+        let pane = app.gui.pane_mut(0).expect("a fresh Gui has one pane");
+        // A *running* second timeline, because that is the reachable state:
+        // `PaneState::refresh_transport` returns early while the transport's
+        // own loop is active, so a pane that armed a satellite loop and then
+        // enabled radar keeps the controls on the satellite while radar
+        // animates underneath.
+        pane.set_transport_layer(id.clone());
+        let other = pane.time_state_mut(&id);
+        other.phase = LoopPhase::Playing;
+        other.span_secs = 43_200;
+        // A stamp of its own, nowhere near radar's, so a keep-set built from
+        // this timeline cannot accidentally name radar's volumes.
+        other.frames = vec![rustdar_egui::pane::LoopFrame {
+            timestamp: at(500),
+            image: None,
+            render_in_flight: false,
+            render_failed: false,
+        }];
+        assert!(
+            !std::ptr::eq(pane.transport_state(), pane.time_state(&known::RADAR)),
+            "precondition: the transport really addresses another timeline, or \
+             the two reads are one object and the case is vacuous",
+        );
+        assert!(
+            pane.time_state(&known::RADAR).is_active(),
+            "precondition: radar is still animating — the whole point is that \
+             its volumes are needed while something else holds the controls",
+        );
+    }
+
+    app.evict_unshown_scans();
+
+    HELD.into_iter()
+        .filter(|minute| app.loop_mgr.get_cached(SITE, &at(*minute)).is_some())
+        .collect()
+}
+
+/// **The eviction keep-set is keyed off radar's own timeline, never off the
+/// transport's.**
+///
+/// `App::evict_unneeded_loop_scans` retains four radar-only holders —
+/// `retain_plan_frames`, `retain_scans`, `retain_l3` and `retain_l3_keys` —
+/// and every one of them is keyed by NEXRAD site. The site comes from
+/// `radar_layer::site(ls)`, which reads the geometry anchor **only a radar
+/// timeline carries**: a satellite, MRMS or model timeline's anchor is
+/// `Box::new(())` and answers `""`.
+///
+/// So a transport-addressed read here does not merely retain the wrong set —
+/// it files the whole keep-set under the empty site, `keep(SITE, ts)` answers
+/// false for every entry, and **the volumes the pane is actually playing are
+/// evicted on the next sweep** and re-downloaded on the pass after it.
+///
+/// **Reachable, not contrived** — see `volumes_surviving_the_sweep`.
+///
+/// **The floor is the first case**, and it is the common configuration: with
+/// radar driving, the two reads are the same object and the keep-set is
+/// identical either way. Without it, a test that only ran the moved-transport
+/// case could pass because the fixture retained nothing in either arm.
+///
+/// WO-T3.7 wrote the reason for this keep into `app.rs` as a comment.
+/// Retargeting the read at the transport passed all 668 tests in the crate, so
+/// the comment was prose with no gate under it; this is the gate.
+#[test]
+fn the_eviction_keep_set_is_keyed_off_radars_timeline_not_the_transports() {
+    let radar_driving = volumes_surviving_the_sweep(None);
+    assert_eq!(
+        radar_driving,
+        vec![0, 4, 8],
+        "floor: with radar driving the transport, every minute the loop names \
+         keeps its volume — if this arm retains nothing the comparison below \
+         is satisfied by two empty sets",
+    );
+
+    let satellite_driving = volumes_surviving_the_sweep(Some(known::GMGSI));
+    assert_eq!(
+        satellite_driving, radar_driving,
+        "a pane whose transport sits on a satellite loop while radar animates \
+         underneath lost the volumes of the frames radar is playing. The \
+         keep-set is built from `radar_layer::site(ls)`, which answers \"\" for \
+         any timeline but radar's, so reading anything other than \
+         `time_state(&known::RADAR)` here files every frame under the empty \
+         site and evicts the real one's volumes — which the loop then \
+         re-downloads on every pass",
     );
 }

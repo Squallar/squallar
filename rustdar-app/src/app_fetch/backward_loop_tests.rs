@@ -2,7 +2,7 @@
 //!
 //! WI-4 made the *forward* arm address the pane's transport layer. The
 //! backward arm was left as it was — it wrote `radar_layer::begin_loop` into
-//! `loop_state_mut()`, which is radar's slot by definition, and gated the
+//! radar's slot by name (then spelled `loop_state_mut()`), and gated the
 //! whole function on the pane holding a radar scan. So a satellite- or
 //! MRMS-shaped layer (`extends_future: false`) armed **radar's** timeline with
 //! a radar geometry anchor, its own slot stayed inactive, and the supply arm
@@ -284,7 +284,7 @@ fn a_scan_at(timestamp: NaiveDateTime) -> rustdar_radar::types::ScanInfo {
 /// mode that hid in WI-4's forward arm for a whole work item.
 ///
 /// **Floors, each run and observed:**
-/// - Point the write back at `loop_state_mut()` and the "armed the transport
+/// - Point the write back at `time_state_mut(&known::RADAR)` and the "armed the transport
 ///   layer" assertion reads inactive.
 /// - Restore the `scan_info` early return at the top of the function and no
 ///   listing is asked for at all.
@@ -331,7 +331,7 @@ fn enabling_a_past_only_non_radar_loop_lands_frames_on_that_layers_timeline() {
             "and it is waiting on the listing it just asked for",
         );
         assert!(
-            !pane.loop_state().is_active(),
+            !pane.time_state(&known::RADAR).is_active(),
             "radar's slot was armed for a layer that is not radar",
         );
         assert!(
@@ -463,7 +463,7 @@ fn radars_backward_loop_arms_the_same_shape_it_always_did() {
     );
 
     let pane = app.gui.pane(0).expect("the fixture built one pane");
-    let ls = pane.loop_state();
+    let ls = pane.time_state(&known::RADAR);
     assert!(
         std::ptr::eq(ls, pane.transport_state()),
         "on a radar pane the two accessors are one slot, which is why writing \
@@ -542,7 +542,7 @@ fn a_radar_pane_with_no_scan_still_arms_nothing() {
         !app.gui
             .pane(0)
             .expect("the fixture built one pane")
-            .loop_state()
+            .time_state(&known::RADAR)
             .is_active(),
     );
 }
@@ -551,7 +551,7 @@ fn a_radar_pane_with_no_scan_still_arms_nothing() {
 
 /// **Turning a loop off stops every timeline turning it on armed.**
 ///
-/// `handle_disable_loop` used to reset `loop_state_mut()` by name. On a pane
+/// `handle_disable_loop` used to reset radar's slot by name. On a pane
 /// whose transport had moved that cleared a timeline nobody had armed and left
 /// the running one running — and the ∞ button reads
 /// `transport_state().is_active()`, so it stayed lit and re-emitted this same
@@ -571,8 +571,9 @@ fn a_radar_pane_with_no_scan_still_arms_nothing() {
 /// The radar slot is armed here as well, so the test can tell "cleared the
 /// transport" from "cleared nothing but the slot it was named after".
 ///
-/// **Floor, run and observed:** put `loop_state_mut()` back in
-/// `handle_disable_loop` and the transport layer is still active.
+/// **Floor, run and observed:** put `*pane.time_state_mut(&known::RADAR) =
+/// LayerTimeState::new()` back in `handle_disable_loop` and the transport
+/// layer is still active.
 #[test]
 fn disabling_a_loop_stops_every_timeline_the_pane_armed() {
     let now = chrono::Utc::now().naive_utc();
@@ -586,7 +587,7 @@ fn disabling_a_loop_stops_every_timeline_the_pane_armed() {
         pane.set_transport_layer(past_id());
         // A radar loop running beside it, so "reset the transport" and "reset
         // everything" are distinguishable answers.
-        *pane.loop_state_mut() = rustdar_egui::radar_layer::begin_loop(
+        *pane.time_state_mut(&known::RADAR) = rustdar_egui::radar_layer::begin_loop(
             600,
             &rustdar_radar::sites::RadarSite {
                 name: "KOUN",
@@ -623,7 +624,7 @@ fn disabling_a_loop_stops_every_timeline_the_pane_armed() {
         "the ∞ button reads this, so the loop the user turned off is still on",
     );
     assert!(
-        !pane.loop_state().is_active(),
+        !pane.time_state(&known::RADAR).is_active(),
         "radar's timeline is still running under a stopped transport: its \
          playhead now settles off a clock nothing moves, so the pane paints \
          one frozen radar frame with no loop to explain it",

@@ -636,9 +636,9 @@ fn converting_a_pane_tears_down_its_loop_and_nothing_else() {
             pane.set_selected_elevation(1.5);
             pane.viewing_live = false;
             pane.time.step = crate::pane::TimeStep::from_secs(1800);
-            pane.loop_state_mut().phase = LoopPhase::Playing;
+            pane.time_state_mut(&known::RADAR).phase = LoopPhase::Playing;
             assert!(
-                pane.loop_state().is_active(),
+                pane.time_state(&known::RADAR).is_active(),
                 "precondition: the loop must be running, or there is nothing \
                      to tear down"
             );
@@ -648,7 +648,7 @@ fn converting_a_pane_tears_down_its_loop_and_nothing_else() {
 
         let pane = gui.pane(0).unwrap();
         assert!(
-            !pane.loop_state().is_active(),
+            !pane.time_state(&known::RADAR).is_active(),
             "{view:?}: the loop survived, so it will hold every other pane's \
                  loop back and never finish"
         );
@@ -661,7 +661,7 @@ fn converting_a_pane_tears_down_its_loop_and_nothing_else() {
         gui.pane_mut(0)
             .unwrap()
             .set_view(rustdar_radar::types::RenderView::PlanView);
-        assert!(!gui.pane(0).unwrap().loop_state().is_active());
+        assert!(!gui.pane(0).unwrap().time_state(&known::RADAR).is_active());
     }
 }
 
@@ -736,7 +736,7 @@ fn a_loop_on_a_hidden_pane_stops_holding_the_event_loop_awake() {
 
     let mut gui = Gui::new();
     gui.set_pane_count_for_test(2);
-    gui.pane_mut(1).unwrap().loop_state_mut().phase = LoopPhase::Playing;
+    gui.pane_mut(1).unwrap().time_state_mut(&known::RADAR).phase = LoopPhase::Playing;
     assert!(
         gui.any_loop_active(),
         "precondition: a loop is playing on a pane that is on screen"
@@ -745,7 +745,7 @@ fn a_loop_on_a_hidden_pane_stops_holding_the_event_loop_awake() {
     gui.set_pane_count_for_test(1);
 
     assert!(
-        gui.pane(1).unwrap().loop_state().is_active(),
+        gui.pane(1).unwrap().time_state(&known::RADAR).is_active(),
         "precondition: the hidden pane kept its loop, which is what makes \
              this worth guarding"
     );
@@ -1093,7 +1093,7 @@ fn arm_with_picture(
 
 /// **WO-T3.5 — a device loss drops every animating layer's frame textures.**
 ///
-/// The reset walked `loop_state_mut()`, which is radar's slot by name, so a
+/// The reset walked radar's slot by name, so a
 /// satellite or model loop on the same pane came out of a surface loss still
 /// holding `LoopFrameImage::Overlay` handles minted by the dead device — while
 /// the three lines below it already released the *live* cache of those very
@@ -1185,22 +1185,22 @@ fn a_layer_link_sync_moves_the_stack_and_leaves_every_pane_on_its_own_clock() {
     // playheads, so neither assertion below can pass on a coincidence.
     for (idx, pane) in gui.panes.iter_mut().enumerate().take(2) {
         pane.layer_link = true;
-        let ls = pane.loop_state_mut();
+        let ls = pane.time_state_mut(&known::RADAR);
         ls.phase = crate::pane::LoopPhase::Playing;
         ls.frames = (0..(4 + idx as i64 * 2)).map(loop_frame).collect();
-        pane.park_on_loop_frame(1 + idx * 4);
+        pane.park_on_frame(&known::RADAR, 1 + idx * 4);
     }
     // The sync has work to do: the two stacks disagree about a layer.
     gui.panes[0].set_overlay_enabled(known::NWS_ALERTS, false);
     gui.panes[1].set_overlay_enabled(known::NWS_ALERTS, true);
     assert_ne!(
-        gui.panes[0].loop_state().current_frame(),
-        gui.panes[1].loop_state().current_frame(),
+        gui.panes[0].time_state(&known::RADAR).current_frame(),
+        gui.panes[1].time_state(&known::RADAR).current_frame(),
         "precondition: the two panes are on different frames",
     );
     assert_ne!(
-        gui.panes[0].loop_state().frames.len(),
-        gui.panes[1].loop_state().frames.len(),
+        gui.panes[0].time_state(&known::RADAR).frames.len(),
+        gui.panes[1].time_state(&known::RADAR).frames.len(),
         "precondition: and they hold different numbers of them",
     );
 
@@ -1211,17 +1211,17 @@ fn a_layer_link_sync_moves_the_stack_and_leaves_every_pane_on_its_own_clock() {
         "precondition: the sync ran and moved the stack at all",
     );
     assert_eq!(
-        gui.panes[1].loop_state().current_frame(),
+        gui.panes[1].time_state(&known::RADAR).current_frame(),
         5,
         "pane 1 was moved to the active pane's playhead by a stack copy",
     );
     assert_eq!(
-        gui.panes[1].loop_state().frames.len(),
+        gui.panes[1].time_state(&known::RADAR).frames.len(),
         6,
         "pane 1's own frames were replaced by the active pane's",
     );
     assert_eq!(
-        gui.panes[0].loop_state().current_frame(),
+        gui.panes[0].time_state(&known::RADAR).current_frame(),
         1,
         "and the active pane is where it was",
     );

@@ -305,8 +305,8 @@ fn the_first_loop_dispatch_pass_skips_only_the_panes_that_cannot_loop() {
                     .expect("only a section pane is aimed")
                     .line = Some(section_line());
             }
-            *pane.loop_state_mut() = active_loop(&[volume_time()]);
-            pane.loop_state_mut().view = kind;
+            *pane.time_state_mut(&known::RADAR) = active_loop(&[volume_time()]);
+            pane.time_state_mut(&known::RADAR).view = kind;
             pane.set_selected_product(rustdar_radar::fields::spec(moved_to).id.clone());
             pane.set_selected_elevation(0.0);
         }
@@ -317,7 +317,7 @@ fn the_first_loop_dispatch_pass_skips_only_the_panes_that_cannot_loop() {
             .gui
             .pane(0)
             .unwrap()
-            .loop_state()
+            .time_state(&known::RADAR)
             .rendered_for
             .as_ref()
             .and_then(|target| {
@@ -377,14 +377,14 @@ fn the_second_loop_dispatch_pass_judges_every_pane_that_can_loop() {
                     .expect("only a section pane is aimed")
                     .line = Some(section_line());
             }
-            *pane.loop_state_mut() = active_loop(&[volume_time()]);
-            pane.loop_state_mut().view = kind;
+            *pane.time_state_mut(&known::RADAR) = active_loop(&[volume_time()]);
+            pane.time_state_mut(&known::RADAR).view = kind;
         }
 
         app.dispatch_loop_renders();
 
         assert_eq!(
-            app.gui.pane(0).unwrap().loop_state().frames[0].render_failed,
+            app.gui.pane(0).unwrap().time_state(&known::RADAR).frames[0].render_failed,
             expected_failed,
             "{label}: the second dispatch pass judged a frame belonging to a \
                  pane it must not have looked at — or skipped one it must have"
@@ -406,12 +406,16 @@ fn a_pane_that_cannot_loop_cannot_hold_another_panes_loop_back() {
     );
 
     {
-        let ls = app.gui.pane_mut(0).unwrap().loop_state_mut();
+        let ls = app.gui.pane_mut(0).unwrap().time_state_mut(&known::RADAR);
         *ls = active_loop(&[volume_time()]);
         ls.phase = LoopPhase::Ready;
     }
     assert!(
-        app.gui.pane(0).unwrap().loop_state().is_render_ready(),
+        app.gui
+            .pane(0)
+            .unwrap()
+            .time_state(&known::RADAR)
+            .is_render_ready(),
         "precondition: the map pane's loop must be ready, or nothing can be \
              observed being held back"
     );
@@ -419,14 +423,18 @@ fn a_pane_that_cannot_loop_cannot_hold_another_panes_loop_back() {
     {
         let pane = app.gui.pane_mut(1).unwrap();
         pane.set_view(rustdar_radar::types::RenderView::CrossSection);
-        *pane.loop_state_mut() = active_loop(&[volume_time()]);
+        *pane.time_state_mut(&known::RADAR) = active_loop(&[volume_time()]);
     }
     assert!(
         !app.gui.pane(1).unwrap().can_loop(),
         "precondition: the second pane must be one nothing renders frames              for, or there is no hazard to observe"
     );
     assert!(
-        !app.gui.pane(1).unwrap().loop_state().is_render_ready(),
+        !app.gui
+            .pane(1)
+            .unwrap()
+            .time_state(&known::RADAR)
+            .is_render_ready(),
         "precondition: the converted pane must be un-ready, which is the \
              whole hazard"
     );
@@ -434,7 +442,7 @@ fn a_pane_that_cannot_loop_cannot_hold_another_panes_loop_back() {
     app.sync_loop_playback_start();
 
     assert_eq!(
-        app.gui.pane(0).unwrap().loop_state().phase,
+        app.gui.pane(0).unwrap().time_state(&known::RADAR).phase,
         LoopPhase::Playing,
         "the map pane's loop never started: a pane nothing renders frames for \
              was counted as a looping pane that had not caught up yet, so with \
@@ -445,7 +453,7 @@ fn a_pane_that_cannot_loop_cannot_hold_another_panes_loop_back() {
 #[test]
 fn the_loop_frame_broadcast_skips_a_pane_with_no_plan_view() {
     let textured = |app: &mut crate::app::App, idx: usize| {
-        app.gui.pane(idx).unwrap().loop_state().frames[0]
+        app.gui.pane(idx).unwrap().time_state(&known::RADAR).frames[0]
             .image
             .is_some()
     };
@@ -469,22 +477,22 @@ fn the_loop_frame_broadcast_skips_a_pane_with_no_plan_view() {
             super::loop_dispatch_tests::volume_with_sweeps(&[TILT]),
         );
         for idx in 0..2 {
-            let ls = app.gui.pane_mut(idx).unwrap().loop_state_mut();
+            let ls = app.gui.pane_mut(idx).unwrap().time_state_mut(&known::RADAR);
             *ls = active_loop(&[volume_time()]);
             ls.frames[0].render_in_flight = true;
         }
         if let Some(kind) = kind {
             let pane = app.gui.pane_mut(1).unwrap();
             pane.set_view(kind);
-            *pane.loop_state_mut() = active_loop(&[volume_time()]);
-            pane.loop_state_mut().frames[0].render_in_flight = true;
+            *pane.time_state_mut(&known::RADAR) = active_loop(&[volume_time()]);
+            pane.time_state_mut(&known::RADAR).frames[0].render_in_flight = true;
         }
 
         let target = app
             .gui
             .pane(0)
             .unwrap()
-            .loop_state()
+            .time_state(&known::RADAR)
             .rendered_for
             .clone()
             .expect("the fixture loop is keyed");
@@ -574,7 +582,7 @@ fn converting_a_pane_tears_its_loop_down_on_both_sides() {
         rustdar_radar::types::RenderView::Volume,
     ] {
         let mut app = app_on_site();
-        *app.gui.pane_mut(0).unwrap().loop_state_mut() = active_loop(&[volume_time()]);
+        *app.gui.pane_mut(0).unwrap().time_state_mut(&known::RADAR) = active_loop(&[volume_time()]);
         app.loop_mgr = LoopDownloadManager::new();
         app.loop_mgr.set_plan(
             0,
@@ -585,12 +593,22 @@ fn converting_a_pane_tears_its_loop_down_on_both_sides() {
             app.loop_mgr.pending_pane_indices().contains(&0),
             "precondition: the pane must own a download queue to be relieved of"
         );
-        assert!(app.gui.pane(0).unwrap().loop_state().is_active());
+        assert!(
+            app.gui
+                .pane(0)
+                .unwrap()
+                .time_state(&known::RADAR)
+                .is_active()
+        );
 
         app.gui.pane_mut(0).unwrap().set_view(kind);
 
         assert!(
-            !app.gui.pane(0).unwrap().loop_state().is_active(),
+            !app.gui
+                .pane(0)
+                .unwrap()
+                .time_state(&known::RADAR)
+                .is_active(),
             "{kind:?}: the loop survived the conversion, so it will read \
                  \"Rendering\" for ever with no transport drawn to cancel it"
         );

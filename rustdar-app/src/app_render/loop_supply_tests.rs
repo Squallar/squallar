@@ -418,7 +418,7 @@ fn the_transport_state_and_the_radar_state_are_not_the_same_loop() {
         "the transport addresses the layer the listing was for",
     );
     assert!(
-        pane.loop_state().frames.is_empty(),
+        pane.time_state(&known::RADAR).frames.is_empty(),
         "and radar's own timeline was not touched by another layer's listing",
     );
 }
@@ -733,7 +733,7 @@ fn the_radar_arm_produces_the_same_loop_it_always_did() {
     {
         let pane = app.gui.pane_mut(0).expect("the fixture built one pane");
         pane.scan_info = Some(crate::app::tests::scan_info_for("KTLX"));
-        *pane.loop_state_mut() = rustdar_egui::radar_layer::begin_loop(
+        *pane.time_state_mut(&known::RADAR) = rustdar_egui::radar_layer::begin_loop(
             span_secs,
             &rustdar_radar::sites::RadarSite {
                 name: "KTLX",
@@ -744,7 +744,7 @@ fn the_radar_arm_produces_the_same_loop_it_always_did() {
             },
             rustdar_radar::types::RenderView::PlanView,
         );
-        pane.loop_state_mut().asked_range = Some(range);
+        pane.time_state_mut(&known::RADAR).asked_range = Some(range);
     }
 
     app.channels
@@ -781,7 +781,7 @@ fn the_radar_arm_produces_the_same_loop_it_always_did() {
     app.accept_loop_scan_listings();
 
     let allocation = app.loop_allocation();
-    let ls_for_cap = app.gui.pane(0).expect("a pane").loop_state();
+    let ls_for_cap = app.gui.pane(0).expect("a pane").time_state(&known::RADAR);
     let held = layer_share(
         allocation,
         Some(loop_frames_held(allocation, ls_for_cap, &app.budgets)),
@@ -795,7 +795,7 @@ fn the_radar_arm_produces_the_same_loop_it_always_did() {
         .collect();
 
     let pane = app.gui.pane(0).expect("the fixture built one pane");
-    let ls = pane.loop_state();
+    let ls = pane.time_state(&known::RADAR);
     assert_eq!(
         ls.frames.iter().map(|f| f.timestamp).collect::<Vec<_>>(),
         expected,

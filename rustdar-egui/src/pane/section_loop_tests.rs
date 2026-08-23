@@ -557,17 +557,18 @@ fn a_section_pane_cannot_loop_until_it_has_a_line() {
 #[test]
 fn converting_between_two_looping_kinds_tears_the_loop_down() {
     let mut pane = PaneState::new();
-    *pane.loop_state_mut() = crate::radar_layer::begin_loop(3600, &site(), RenderView::PlanView);
-    assert!(pane.loop_state().is_active());
+    *pane.time_state_mut(&known::RADAR) =
+        crate::radar_layer::begin_loop(3600, &site(), RenderView::PlanView);
+    assert!(pane.time_state(&known::RADAR).is_active());
 
     pane.set_kind(PaneKind::CrossSection);
     assert!(
-        !pane.loop_state().is_active(),
+        !pane.time_state(&known::RADAR).is_active(),
         "a map pane's plan-view frames survived the conversion to a section \
          pane, which would animate a list nothing can refill while holding \
          MAX_LOOP_RENDER_BUDGET textures alive to do it"
     );
-    assert_eq!(pane.loop_state().view, RenderView::PlanView);
+    assert_eq!(pane.time_state(&known::RADAR).view, RenderView::PlanView);
 }
 
 /// `active_image` and `active_section_image` read the same frame and each
@@ -577,9 +578,9 @@ fn converting_between_two_looping_kinds_tears_the_loop_down() {
 fn the_playhead_answers_only_for_the_shape_it_holds() {
     let ctx = egui::Context::default();
     let mut pane = PaneState::new();
-    *pane.loop_state_mut() = loop_in(RenderView::CrossSection, 3);
-    pane.loop_state_mut().current_frame = 1;
-    pane.loop_state_mut().frames[1].image = Some(section_picture(&ctx, 5));
+    *pane.time_state_mut(&known::RADAR) = loop_in(RenderView::CrossSection, 3);
+    pane.time_state_mut(&known::RADAR).current_frame = 1;
+    pane.time_state_mut(&known::RADAR).frames[1].image = Some(section_picture(&ctx, 5));
 
     assert!(
         pane.active_image().is_none(),
@@ -591,7 +592,7 @@ fn the_playhead_answers_only_for_the_shape_it_holds() {
         "the section painter was not handed the frame on the playhead"
     );
 
-    pane.loop_state_mut().frames[1].image = Some(plan_view_picture(&ctx));
+    pane.time_state_mut(&known::RADAR).frames[1].image = Some(plan_view_picture(&ctx));
     assert!(pane.active_image().is_some());
     assert!(
         pane.active_section_image().is_none(),

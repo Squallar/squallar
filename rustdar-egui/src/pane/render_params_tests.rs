@@ -100,7 +100,7 @@ fn the_data_time_on_screen_follows_the_loop_when_one_is_running() {
     pane.data_time = Some(volume);
     assert_eq!(pane.data_time_on_screen(), Some(volume), "no loop running");
 
-    *pane.loop_state_mut() = crate::radar_layer::begin_loop(
+    *pane.time_state_mut(&known::RADAR) = crate::radar_layer::begin_loop(
         600,
         &RadarSite {
             name: "KTLX",
@@ -117,7 +117,7 @@ fn the_data_time_on_screen_follows_the_loop_when_one_is_running() {
         "a loop with no frames yet has nothing on screen to date",
     );
 
-    pane.loop_state_mut().frames = vec![LoopFrame {
+    pane.time_state_mut(&known::RADAR).frames = vec![LoopFrame {
         timestamp: frame,
         image: None,
         render_in_flight: false,

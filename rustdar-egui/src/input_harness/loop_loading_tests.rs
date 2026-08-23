@@ -14,6 +14,7 @@
 use super::InputHarness;
 use super::loop_overlay_draw_tests::{LAYER, model_loop, painted, raster, scrub_to, ts};
 use crate::pane::{LoopFrame, LoopFrameImage, LoopPhase};
+use rustdar_source::id::known;
 
 /// The lowercase loading captions pane 0's glass shows this frame. The two
 /// notice spellings are lowercase by design; the transport's own lines
@@ -175,7 +176,7 @@ fn radars_rendering_line_is_unchanged_beside_the_new_notice() {
 
     {
         let pane = &mut h.gui_mut().panes_mut()[0];
-        let ls = pane.loop_state_mut();
+        let ls = pane.time_state_mut(&known::RADAR);
         ls.phase = LoopPhase::Rendering;
         ls.frames = (0..3)
             .map(|i| LoopFrame {
@@ -240,7 +241,7 @@ fn the_transports_listing_line_carries_the_wait() {
     h.warm_up();
 
     {
-        let ls = h.gui_mut().panes_mut()[0].loop_state_mut();
+        let ls = h.gui_mut().panes_mut()[0].time_state_mut(&known::RADAR);
         ls.phase = LoopPhase::FetchingScanList;
         ls.listing_since = Some(web_time::Instant::now());
     }

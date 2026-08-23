@@ -10,6 +10,7 @@ use rustdar_egui::actions::GuiAction;
 use rustdar_egui::pane::{BroadcastSweep, ELEVATION_TOLERANCE, RenderTarget};
 use rustdar_egui::radar_layer;
 use rustdar_radar::loop_downloads::{FramePlan, L3FrameState, PendingDownloads, PendingL3Pairings};
+use rustdar_source::id::known;
 // Test-only since WO-M12d: production loop dispatch holds a frame's payload
 // only as radar's own described job. What still names the arms is the suites'
 // own inspection of `frame_data` below.
@@ -18,6 +19,30 @@ use rustdar_radar::loop_downloads::LoopFrameData;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+// **Why every loop read in this file is `time_state(&known::RADAR)`, spelled
+// out rather than hidden behind an accessor (WO-T3.7).**
+//
+// The render funnel below is radar's own vocabulary from end to end, and the
+// reads are radar-addressed because their payloads are:
+//
+// * a plan-view render is identified by `RenderTarget` — site, product and
+//   elevation — and `retarget_renders` drops every frame texture the moment
+//   that triple moves. No non-radar layer has a `RenderTarget`;
+// * `LoopFrameImage::view()` answers `None` for the `Overlay` arm precisely so
+//   a radar render cannot land in an overlay frame, and the dedup, the donor
+//   search and the dispatch stamp all key off `ls.rendered_for`;
+// * the section and volume arms key off `SectionLoopKey` / `VolumeLoopKey`,
+//   both of which are cut out of a decoded NEXRAD volume;
+// * `radar_layer::coords(ls)` reads the geometry anchor only a radar timeline
+//   carries — a satellite or model timeline answers the origin.
+//
+// A transport-addressed read here would offer radar's texture to whatever layer
+// happened to own the controls. The overlay loop's own dispatch is
+// `dispatch_overlay_loop_renders`, which is layer-addressed, and the two are
+// deliberately separate funnels. The residency and settle forks are the third
+// case: they exclude radar because radar's storage lives above the handler
+// until WO-M12d lands.
 
 /// What a speculative dispatch needs from the delivered result's own pane
 /// — copied OUT of `poll_render_results`' one origin-pane read,
@@ -2195,7 +2220,7 @@ impl super::App {
                     let Some(plan) = accept_scan_listing(
                         allocation,
                         &budgets,
-                        pane.loop_state_mut(),
+                        pane.time_state_mut(&known::RADAR),
                         site,
                         frames,
                         animating,
@@ -2520,8 +2545,11 @@ impl super::App {
             };
 
             let counter = &mut self.texture_counter;
-            let Some(texture) =
-                accept_render_result(pane.loop_state_mut(), &mut rr, gates, |color_image| {
+            let Some(texture) = accept_render_result(
+                pane.time_state_mut(&known::RADAR),
+                &mut rr,
+                gates,
+                |color_image| {
                     *counter += 1;
                     // `color_image` is the only copy of this frame's pixels on this
                     // thread — the renderer's RGBA buffer was dropped on the worker —
@@ -2531,8 +2559,8 @@ impl super::App {
                         color_image,
                         egui::TextureOptions::NEAREST,
                     )
-                })
-            else {
+                },
+            ) else {
                 continue;
             };
 
@@ -2545,10 +2573,15 @@ impl super::App {
                     {
                         continue;
                     }
-                    let Some(sibling_loop) = self.gui.pane(sibling_idx).map(|p| p.loop_state())
-                    else {
+                    let Some(sibling_pane) = self.gui.pane(sibling_idx) else {
                         continue;
                     };
+                    // **Radar-addressed, named.** The broadcast carries a radar
+                    // plan-view texture keyed by `RenderTarget`
+                    // (site+product+elevation), so the only frame list it can
+                    // land in is radar's. Reading the sibling's *transport*
+                    // here would offer a radar picture to a satellite timeline.
+                    let sibling_loop = sibling_pane.time_state(&known::RADAR);
                     if !sibling_loop.is_rendered_for(&rr.target) {
                         continue;
                     }
@@ -2557,11 +2590,10 @@ impl super::App {
                     let Some(sibling) = self.gui.pane_mut(sibling_idx) else {
                         continue;
                     };
-                    let Some(sframe) = sibling.loop_state_mut().frame_accepting_broadcast_mut(
-                        rr.timestamp,
-                        &rr.target,
-                        sweep,
-                    ) else {
+                    let Some(sframe) = sibling
+                        .time_state_mut(&known::RADAR)
+                        .frame_accepting_broadcast_mut(rr.timestamp, &rr.target, sweep)
+                    else {
                         continue;
                     };
                     // If the sibling had its own render running for this frame it is now
@@ -2841,7 +2873,7 @@ impl super::App {
             Option<rustdar_egui::pane::VolumeLoopKey>,
         )> = Vec::new();
         for pane in self.gui.panes() {
-            let ls = pane.loop_state();
+            let ls = pane.time_state(&known::RADAR);
             if !ls.is_active() {
                 // **A pane looping something other than radar is a share
                 // too.** Radar's timeline is the only one the three arms below
@@ -3222,7 +3254,7 @@ impl super::App {
                     srv_fallback,
                 )
             });
-            let ls = pane.loop_state_mut();
+            let ls = pane.time_state_mut(&known::RADAR);
             if !ls.is_active() {
                 retire_queues.push(pane_idx);
                 continue;
@@ -3328,7 +3360,7 @@ impl super::App {
             let Some(pane) = self.gui.pane(pane_idx) else {
                 continue;
             };
-            let ls = pane.loop_state();
+            let ls = pane.time_state(&known::RADAR);
             if !ls.is_active() || ls.frames.is_empty() {
                 continue;
             }
@@ -3410,7 +3442,9 @@ impl super::App {
                         && let Some((src_pane, src_frame)) = find_section_donor(
                             (0..pane_count)
                                 .filter(|&i| self.gui.panes_layer_linked(pane_idx, i))
-                                .filter_map(|i| self.gui.pane(i).map(|p| (i, p.loop_state()))),
+                                .filter_map(|i| {
+                                    self.gui.pane(i).map(|p| (i, p.time_state(&known::RADAR)))
+                                }),
                             pane_idx,
                             frame.timestamp,
                             &target,
@@ -3472,7 +3506,9 @@ impl super::App {
                     let donor = find_donor(
                         (0..pane_count)
                             .filter(|&i| self.gui.panes_layer_linked(pane_idx, i))
-                            .filter_map(|i| self.gui.pane(i).map(|p| (i, p.loop_state()))),
+                            .filter_map(|i| {
+                                self.gui.pane(i).map(|p| (i, p.time_state(&known::RADAR)))
+                            }),
                         pane_idx,
                         frame.timestamp,
                         &target,
@@ -3526,7 +3562,7 @@ impl super::App {
         // Retire frames that cannot be rendered at the selected product/elevation
         for (pane_idx, frame_idx) in to_mark_failed {
             if let Some(pane) = self.gui.pane_mut(pane_idx)
-                && let Some(frame) = pane.loop_state_mut().frames.get_mut(frame_idx)
+                && let Some(frame) = pane.time_state_mut(&known::RADAR).frames.get_mut(frame_idx)
             {
                 frame.render_failed = true;
             }
@@ -3540,7 +3576,7 @@ impl super::App {
                 let Some(src) = self.gui.pane(req.src_pane) else {
                     continue;
                 };
-                let Some(sframe) = src.loop_state().frames.get(req.src_frame) else {
+                let Some(sframe) = src.time_state(&known::RADAR).frames.get(req.src_frame) else {
                     continue;
                 };
                 let Some(image) = sframe.image.clone() else {
@@ -3551,7 +3587,11 @@ impl super::App {
             let Some(dest) = self.gui.pane_mut(req.dest_pane) else {
                 continue;
             };
-            if let Some(dframe) = dest.loop_state_mut().frames.get_mut(req.dest_frame) {
+            if let Some(dframe) = dest
+                .time_state_mut(&known::RADAR)
+                .frames
+                .get_mut(req.dest_frame)
+            {
                 dframe.image = Some(cloned);
             }
         }
@@ -3585,7 +3625,7 @@ impl super::App {
             );
 
             if spawned && let Some(pane) = self.gui.pane_mut(req.pane_idx) {
-                pane.loop_state_mut().frames[req.frame_idx].render_in_flight = true;
+                pane.time_state_mut(&known::RADAR).frames[req.frame_idx].render_in_flight = true;
             }
         }
 
@@ -3602,7 +3642,10 @@ impl super::App {
                 })
             else {
                 if let Some(pane) = self.gui.pane_mut(req.pane_idx)
-                    && let Some(frame) = pane.loop_state_mut().frames.get_mut(req.frame_idx)
+                    && let Some(frame) = pane
+                        .time_state_mut(&known::RADAR)
+                        .frames
+                        .get_mut(req.frame_idx)
                 {
                     frame.render_failed = true;
                 }
@@ -3612,7 +3655,8 @@ impl super::App {
             match self.spawn_loop_section_render(req, scan, declared) {
                 crate::render_dispatch::SectionDispatch::Dispatched => {
                     if let Some(pane) = self.gui.pane_mut(pane_idx)
-                        && let Some(frame) = pane.loop_state_mut().frames.get_mut(frame_idx)
+                        && let Some(frame) =
+                            pane.time_state_mut(&known::RADAR).frames.get_mut(frame_idx)
                     {
                         frame.render_in_flight = true;
                     }
@@ -3621,7 +3665,8 @@ impl super::App {
                 crate::render_dispatch::SectionDispatch::Busy => {}
                 crate::render_dispatch::SectionDispatch::NoPayload => {
                     if let Some(pane) = self.gui.pane_mut(pane_idx)
-                        && let Some(frame) = pane.loop_state_mut().frames.get_mut(frame_idx)
+                        && let Some(frame) =
+                            pane.time_state_mut(&known::RADAR).frames.get_mut(frame_idx)
                     {
                         frame.render_failed = true;
                     }
@@ -3692,7 +3737,11 @@ impl super::App {
             let Some(pane) = self.gui.pane_mut(req.pane_idx) else {
                 continue;
             };
-            let Some(frame) = pane.loop_state_mut().frames.get_mut(req.frame_idx) else {
+            let Some(frame) = pane
+                .time_state_mut(&known::RADAR)
+                .frames
+                .get_mut(req.frame_idx)
+            else {
                 continue;
             };
             match found.entry {
@@ -3730,7 +3779,7 @@ impl super::App {
 
             let counter = &mut self.texture_counter;
             let Some(placed) =
-                accept_section_result(pane.loop_state_mut(), &mut sr, |color_image| {
+                accept_section_result(pane.time_state_mut(&known::RADAR), &mut sr, |color_image| {
                     *counter += 1;
                     ctx.load_texture(
                         format!("loop_section_{counter}"),
@@ -3760,7 +3809,7 @@ impl super::App {
                     continue;
                 };
                 let Some(sframe) = sibling
-                    .loop_state_mut()
+                    .time_state_mut(&known::RADAR)
                     .frame_accepting_section_broadcast_mut(
                         sr.timestamp,
                         &sr.target,

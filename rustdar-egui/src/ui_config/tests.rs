@@ -1,6 +1,7 @@
 use crate::UI_CONFIG_KEY;
 use rustdar_kv::{KvStore, MemoryKvStore};
 use rustdar_radar::fields as radar_fields;
+use rustdar_source::id::known;
 
 /// Settings the user changed must come back after a save/load cycle.
 #[test]
@@ -1096,9 +1097,17 @@ fn a_restored_non_map_pane_has_no_running_loop() {
         .unwrap();
 
     let mut restored = crate::Gui::new();
-    restored.pane_mut(0).unwrap().loop_state_mut().phase = LoopPhase::Playing;
+    restored
+        .pane_mut(0)
+        .unwrap()
+        .time_state_mut(&known::RADAR)
+        .phase = LoopPhase::Playing;
     assert!(
-        restored.pane(0).unwrap().loop_state().is_active(),
+        restored
+            .pane(0)
+            .unwrap()
+            .time_state(&known::RADAR)
+            .is_active(),
         "precondition: the loop must be running before the load"
     );
 
@@ -1109,7 +1118,11 @@ fn a_restored_non_map_pane_has_no_running_loop() {
         rustdar_radar::types::RenderView::Volume
     );
     assert!(
-        !restored.pane(0).unwrap().loop_state().is_active(),
+        !restored
+            .pane(0)
+            .unwrap()
+            .time_state(&known::RADAR)
+            .is_active(),
         "a restored 3D pane came back with a loop nothing will ever render \
              frames for, which holds every other pane's loop back too"
     );

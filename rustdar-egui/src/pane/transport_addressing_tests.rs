@@ -1,11 +1,13 @@
 //! **Which layer the loop transport addresses.**
 //!
-//! `loop_state`/`loop_state_mut`/`park_on_loop_frame` resolve to radar by
-//! definition and go on doing so — they are radar's own timeline, which the
-//! arrival path and the render dispatcher address by name. What moves is the
-//! *transport*: the ∞ toggle, the play/step/seek buttons and the scrubber,
-//! which read [`PaneState::transport_state`] and can therefore land on a
-//! model layer.
+//! `time_state(&known::RADAR)` is radar's own timeline and goes on being
+//! addressed by name — the arrival path and the render dispatcher carry
+//! radar's payloads and mean exactly that slot. (Until WO-T3.7 the same read
+//! was spelled `loop_state()`, a name that claimed to be "this pane's loop"
+//! and stopped being true the moment a pane held one timeline per animating
+//! layer.) What moves is the *transport*: the ∞ toggle, the play/step/seek
+//! buttons and the scrubber, which read [`PaneState::transport_state`] and can
+//! therefore land on a model layer.
 //!
 //! The trap these tests are shaped around: [`PaneState::time_state`] answers a
 //! missing slot with the pane's orphan state, so a pane with no model slot
@@ -81,8 +83,8 @@ fn the_transport_state_and_the_radar_loop_state_are_different_timelines() {
     let pane = gui.pane(0).expect("pane 0");
     assert!(
         pane.slot(&known::RADAR).is_some(),
-        "precondition: radar has a REAL slot, so `loop_state` is not the \
-         orphan state and the difference below is not vacuous"
+        "precondition: radar has a REAL slot, so the radar read below is not \
+         the orphan state and the difference is not vacuous"
     );
     assert!(
         pane.slot(&known::MODEL_DATA).is_some(),
@@ -90,7 +92,7 @@ fn the_transport_state_and_the_radar_loop_state_are_different_timelines() {
     );
 
     let transport = pane.transport_state();
-    let radar = pane.loop_state();
+    let radar = pane.time_state(&known::RADAR);
     assert_eq!(transport.phase, LoopPhase::Ready);
     assert_eq!(radar.phase, LoopPhase::Inactive);
     assert_eq!(transport.span_secs, 64_800);
@@ -222,5 +224,95 @@ fn an_untouched_config_round_trips_to_radar() {
     assert_eq!(
         restored.pane(0).expect("pane 0").transport_layer(),
         &known::RADAR,
+    );
+}
+
+/// A plan-view loop frame carrying `nyquist_ms` as its fingerprint, so the
+/// assertion below can say *which* timeline was read rather than merely that
+/// something was.
+fn plan_view_folding_at(ctx: &egui::Context, nyquist_ms: f64) -> LoopFrameImage {
+    let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
+    LoopFrameImage::PlanView(RadarImageData {
+        texture: ctx.load_texture("plan", image, egui::TextureOptions::NEAREST),
+        lat: 35.33,
+        lon: -97.28,
+        max_range_km: 230.0,
+        placed: rustdar_radar::types::ImageBounds::from_radar_site(35.33, -97.28, 230.0).into(),
+        nyquist_ms: Some(nyquist_ms),
+        melting_layer_source: None,
+        storm_motion: None,
+        hover: std::sync::Arc::new(rustdar_radar::hover::HoverSource::empty()),
+    })
+}
+
+/// One frame, stamped, holding `image`.
+fn one_frame(image: LoopFrameImage) -> Vec<LoopFrame> {
+    vec![LoopFrame {
+        timestamp: chrono::NaiveDate::from_ymd_opt(2026, 8, 22)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap(),
+        image: Some(image),
+        render_in_flight: false,
+        render_failed: false,
+    }]
+}
+
+/// **Radar's picture is read off radar's own timeline, never off whichever
+/// layer holds the transport.**
+///
+/// The keep WO-T3.7 spelled out at `PaneState::active_loop_image`, held as a
+/// test instead of as a doc line — the shed re-spelled ~30 reads, and a doc
+/// saying "this one is radar's on purpose" is prose, not evidence. Retargeting
+/// that read at the transport passed every suite in the tree before this
+/// existed.
+///
+/// **The state is reachable, not a contrivance:**
+/// [`PaneState::refresh_transport`] refuses to move the transport out from
+/// under a **running** loop, so a pane that armed a model loop and then started
+/// radar keeps the controls on the model while radar animates.
+/// `set_transport_layer` is the config loader's own door and is used here to
+/// reach that state in one line.
+///
+/// **The fixture is deliberately more forgiving than production.** A real model
+/// frame holds [`LoopFrameImage::Overlay`], and [`LoopFrameImage::plan_view`]
+/// answers `None` for that arm — so a transport-addressed read would fail by
+/// returning nothing at all. Giving the model timeline a *plan-view* frame
+/// instead means the read has to actively prefer radar's number rather than
+/// merely trip over the other arm.
+#[test]
+fn radars_picture_is_read_off_radars_timeline_not_the_transports() {
+    let ctx = egui::Context::default();
+    let mut gui = Gui::new();
+    toggle(&mut gui, &known::RADAR, true);
+    toggle(&mut gui, &known::MODEL_DATA, true);
+    animate(&mut gui, &known::MODEL_DATA, LoopPhase::Playing, 64_800);
+    animate(&mut gui, &known::RADAR, LoopPhase::Playing, 3_600);
+    {
+        let pane = gui.pane_mut(0).expect("pane 0");
+        pane.set_transport_layer(known::MODEL_DATA);
+        pane.time_state_mut(&known::MODEL_DATA).frames =
+            one_frame(plan_view_folding_at(&ctx, 12.0));
+        pane.time_state_mut(&known::RADAR).frames = one_frame(plan_view_folding_at(&ctx, 31.5));
+    }
+
+    let pane = gui.pane(0).expect("pane 0");
+    assert_eq!(
+        pane.transport_layer(),
+        &known::MODEL_DATA,
+        "precondition: the transport is NOT radar, or the two reads are the \
+         same object and the assertion below is vacuous",
+    );
+    assert!(
+        pane.time_state(&known::MODEL_DATA)
+            .qualifying_frame()
+            .is_some(),
+        "precondition: the transport's own timeline really has a frame under \
+         its playhead, so a transport-addressed read would find one",
+    );
+    assert_eq!(
+        pane.active_image().and_then(|img| img.nyquist_ms),
+        Some(31.5),
+        "radar's own frame (31.5), not the transport's (12.0)",
     );
 }

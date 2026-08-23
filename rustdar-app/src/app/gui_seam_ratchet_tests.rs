@@ -86,8 +86,8 @@ fn no_production_file_pushes_through_a_gui_setter() {
 /// `app.rs` and `app_render.rs` each contain one `let gui = &mut self` +
 /// `.gui;` binding — the construct the message below forbids by name. WO-ARREARS
 /// **compile-proved neither is borrow-forced** (a direct reach builds with no
-/// diagnostic) and measured what they hide: `app.rs` reads 37 here and is
-/// really 41, `app_render.rs` reads 101 here and is really 102. Shedding them
+/// diagnostic) and measured what they hide: `app.rs` reads 36 here and is
+/// really 40, `app_render.rs` reads 101 here and is really 102. Shedding them
 /// puts both files above their ceilings, so the shed needs a land that can also
 /// shed the difference. The full record, including the crate-wide figure, is
 /// on `arch_ratchets.rs`'s `SELF_GUI_MAX`. It is recorded here too because
@@ -97,6 +97,31 @@ fn no_production_file_pushes_through_a_gui_setter() {
 /// overlay loop's dispatch and its arrival and paid for them with three: the
 /// index-plus-`pane(idx)` walks in `sync_loop_playback_start` and
 /// `dispatch_loop_renders` became slice walks, on WI-0's proof.
+///
+/// # WO-T3.7 — the loop-state shed, and what it actually paid
+///
+/// `app.rs` 37 -> 36 and `app_fetch.rs` 42 -> 40, measured with this scrape.
+/// Two sheds, both of them loop-state addressing:
+///
+/// * `App::evict_unneeded_loop_scans` walked `0..pane_count()` and looked each
+///   pane up again; the index was never read inside the body, so it became a
+///   `panes()` slice walk on WI-0's proof — the same move WI-6b made twice.
+/// * play/pause, step and seek each had their own `pane_mut(pane_idx)` in the
+///   action match, and two of them spelled the phase machine and the
+///   wrap-around out in the shell. Both belong to whoever owns
+///   `LayerTimeState`, so they moved to `PaneState::drive_transport` behind one
+///   `TransportCommand`, and three reaches became one.
+///
+/// `app_render.rs` and `app_chunks.rs` did not move and their ceilings did not
+/// either. **Neither hidden binding was touched**, so the two figures above
+/// still under-report by four and one respectively.
+///
+/// **This scrape caught something the crate-wide walk could not.** Re-spelling
+/// `loop_state()` as `time_state(&known::RADAR)` is longer, and rustfmt wrapped
+/// one `self.``gui.pane(sibling_idx)` in `app_render.rs` across three lines.
+/// The raw crate-wide count fell by one for no change in coupling at all; this
+/// collapsed scrape stayed at 101 and said so. The site was restructured to
+/// keep the reach on one line rather than bank a figure a line break produced.
 #[test]
 fn the_gui_coupling_only_ever_shrinks() {
     // Presence control: the scrape reads real, current source. Without it every
@@ -107,8 +132,8 @@ fn the_gui_coupling_only_ever_shrinks() {
          reading the source these ceilings exist to measure",
     );
     for (name, source, ceiling) in [
-        ("app.rs", APP, 37),
-        ("app_fetch.rs", APP_FETCH, 42),
+        ("app.rs", APP, 36),
+        ("app_fetch.rs", APP_FETCH, 40),
         ("app_render.rs", APP_RENDER, 101),
         ("app_chunks.rs", APP_CHUNKS, 13),
     ] {

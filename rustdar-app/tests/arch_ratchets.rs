@@ -226,26 +226,51 @@ const INVENTORY_FIELD: &str = concat!("volumes: ", "crate::volume_inventory::");
 /// point of a ratchet. So the shed cannot be landed together with the honest
 /// number — it would need a **raise**, which requires a written plan amendment
 /// and which WO-ARREARS refused to take on its own authority. The per-file scrape moves the same
-/// way: `app.rs` 37 -> 41 and `app_render.rs` 102 -> 103.
+/// way: `app.rs` 36 -> 40 and `app_render.rs` 101 -> 102.
 ///
 /// So the debt is **recorded, not absorbed**: the coupling this crate really
-/// has is 178, this walk sees 173, and the difference is those five reaches.
-/// The land that sheds them is the land that must also shed five real reaches
-/// — or carry the amendment that says otherwise. **A third such binding has no
-/// standing at all**: it would be new evasion, and this doc is the record that
-/// the two here were found, measured and left deliberately rather than
-/// overlooked.
-const SELF_GUI_MAX: usize = 173;
+/// has is five above whatever this walk sees, and the difference is those five
+/// reaches. The land that sheds them is the land that must also shed five real
+/// reaches — or carry the amendment that says otherwise. **A third such binding
+/// has no standing at all**: it would be new evasion, and this doc is the
+/// record that the two here were found, measured and left deliberately rather
+/// than overlooked.
+///
+/// # 173 -> 168 at WO-T3.7, and only three of the five are that land's
+///
+/// The loop-state shed took `App::evict_unneeded_loop_scans`' index walk down
+/// to a `panes()` slice walk (-1) and collapsed play/pause, step and seek into
+/// one `PaneState::drive_transport` door (-2). The other **two** were
+/// **arrears**: `9c120fc2` already measured 171 total and 166 non-test against
+/// 173 and 168 before this land touched anything, so earlier work had shed
+/// without lowering — the failure WO-ARREARS recorded, recurring. Sitting the
+/// constant back on its measurement is what a ratchet is for, so both are
+/// absorbed here rather than left standing.
+///
+/// **One near-miss worth naming, because it would have banked a fake unit.**
+/// Re-spelling `loop_state()` as `time_state(&known::RADAR)` is longer, and
+/// rustfmt wrapped one `self.``gui.pane(sibling_idx)` in `app_render.rs` across
+/// three lines — which **this raw walk cannot see** and the collapsed per-file
+/// scrape can. The figure below fell by one for no change in coupling at all.
+/// The site was restructured to keep the reach on one line; what is pinned here
+/// is measured after that. **A ceiling lowered onto a line wrap is a ceiling
+/// that has stopped binding**, and `app/gui_seam_ratchet_tests.rs` is what
+/// caught it.
+const SELF_GUI_MAX: usize = 168;
 /// Row 1b — the same needle outside test-named paths.
 ///
 /// Everything on [`SELF_GUI_MAX`] applies here: permanent, falls only, sits on
 /// its measurement, same two sheds, same forbidden re-spelling — and the same
 /// recorded debt, because **both hidden bindings are in production files**, so
-/// all five of them are missing from this count too (168 seen, 173 real). This
+/// all five of them are missing from this count too (163 seen, 168 real). This
 /// row is the one that matters for behaviour — the other counts the suites
 /// that exercise the coupling as well, and a suite is allowed to name what it
 /// tests.
-const SELF_GUI_NON_TEST_MAX: usize = 168;
+///
+/// 168 -> 163 at WO-T3.7 alongside its twin: all three sheds and both arrears
+/// were in production files, so this row moved by exactly what
+/// [`SELF_GUI_MAX`] did.
+const SELF_GUI_NON_TEST_MAX: usize = 163;
 /// Row 2a — **`ui.rs`'s own `impl Gui` block, and only that file**.
 ///
 /// **0 since WO-E8b**, which is where the plan said it would land. The last

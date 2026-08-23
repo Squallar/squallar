@@ -212,7 +212,7 @@ fn a_pane_playing_a_3d_loop_is_not_due_a_live_build() {
         render_failed: false,
     }];
     loop_state.current_frame = 0;
-    *pane.loop_state_mut() = loop_state;
+    *pane.time_state_mut(&known::RADAR) = loop_state;
     assert!(
         pane.active_volume_frame().is_some(),
         "fixture precondition: the playhead really is on a resident grid",

@@ -6,6 +6,7 @@ use chrono::NaiveDateTime;
 use chrono::TimeZone;
 use rustdar_device_profile::constants::LOOP_IMAGE_SIZE;
 use rustdar_egui::actions::GuiAction;
+use rustdar_egui::pane::TransportCommand;
 use rustdar_egui::radar_layer;
 use rustdar_egui::shell_api::GuiEvent;
 use rustdar_overlays::render::overlay_state::{OverlayFetchResult, SourceEvent};
@@ -665,46 +666,16 @@ impl super::App {
                 self.handle_disable_loop(pane_idx);
             }
             GuiAction::ToggleLoopPlayback { pane_idx } => {
-                if let Some(pane) = self.gui.pane_mut(pane_idx) {
-                    let ls = pane.transport_state_mut();
-                    match ls.phase {
-                        rustdar_egui::pane::LoopPhase::Playing => {
-                            ls.phase = rustdar_egui::pane::LoopPhase::Paused;
-                        }
-                        rustdar_egui::pane::LoopPhase::Ready
-                        | rustdar_egui::pane::LoopPhase::Paused => {
-                            ls.phase = rustdar_egui::pane::LoopPhase::Playing;
-                            ls.last_advance = Some(web_time::Instant::now());
-                        }
-                        _ => {}
-                    }
-                }
+                self.drive_transport(pane_idx, TransportCommand::TogglePlayback);
             }
             GuiAction::StepLoopFrame { pane_idx, forward } => {
-                if let Some(pane) = self.gui.pane_mut(pane_idx) {
-                    let ls = pane.transport_state_mut();
-                    let next = (!ls.frames.is_empty()).then(|| {
-                        let current = ls.current_frame();
-                        if forward {
-                            (current + 1) % ls.frames.len()
-                        } else if current == 0 {
-                            ls.frames.len() - 1
-                        } else {
-                            current - 1
-                        }
-                    });
-                    if let Some(next) = next {
-                        pane.park_on_transport_frame(next);
-                    }
-                }
+                self.drive_transport(pane_idx, TransportCommand::Step { forward });
             }
             GuiAction::SeekLoopFrame {
                 pane_idx,
                 frame_index,
             } => {
-                if let Some(pane) = self.gui.pane_mut(pane_idx) {
-                    pane.park_on_transport_frame(frame_index);
-                }
+                self.drive_transport(pane_idx, TransportCommand::Seek(frame_index));
             }
             GuiAction::NavigateTime {
                 pane_idx,
@@ -860,7 +831,18 @@ impl super::App {
                             }
                             // The loop is the same judgement as the scan above and
                             // belongs behind the same guard.
-                            *pane.loop_state_mut() = rustdar_egui::pane::LayerTimeState::new();
+                            //
+                            // **Radar-addressed, named — and that is WO-T3.8's
+                            // bug, not a keep.** A satellite or model loop has
+                            // nothing to do with the radar site and survives
+                            // this switch still playing. The mirror in
+                            // `handle_disable_loop` was widened to
+                            // `stop_every_layer_loop()`; this one was not.
+                            // WO-T3.7 re-spelled the read and deliberately left
+                            // what it does alone, so the widening lands as its
+                            // own measured change.
+                            *pane.time_state_mut(&known::RADAR) =
+                                rustdar_egui::pane::LayerTimeState::new();
                         }
                         pane.loading_site = Some(site.clone());
                         pane.set_site(site.clone());
@@ -1583,6 +1565,23 @@ impl super::App {
         }
     }
 
+    /// **The one door the loop transport reaches the panes through** — play,
+    /// pause, step and seek alike.
+    ///
+    /// Play/pause, step and seek each had their own
+    /// `if let Some(pane) = self.``gui.pane_mut(pane_idx)` in the action match,
+    /// and the two that were not one-liners spelled the phase machine and the
+    /// wrap-around out in the shell. Both belong to whoever owns
+    /// [`rustdar_egui::pane::LayerTimeState`], so they moved to
+    /// [`rustdar_egui::pane::PaneState::drive_transport`] behind one
+    /// [`TransportCommand`] and the three reaches became this one — WO-T3.7's
+    /// shed, and the `app_fetch.rs` half of what paid for it.
+    fn drive_transport(&mut self, pane_idx: usize, command: TransportCommand) {
+        if let Some(pane) = self.gui.pane_mut(pane_idx) {
+            pane.drive_transport(command);
+        }
+    }
+
     /// Navigate by a relative time step (seconds). Positive = forward, negative = backward.
     fn handle_navigate_time(&mut self, pane_idx: usize, step_secs: i64) {
         // One reach for the pane and the registry both: the transport's own
@@ -2046,8 +2045,14 @@ impl super::App {
             .panes()
             .iter()
             .enumerate()
-            .filter(|(_, pane)| pane.loop_state().is_active())
-            .map(|(pane_idx, pane)| (pane_idx, pane.loop_state().span_secs))
+            // **Radar-addressed, named — and, like the site switch above,
+            // that is WO-T3.9's bug rather than a keep.** A pane whose
+            // transport is GMGSI, MRMS or the model has an inactive radar slot
+            // and is skipped here entirely, so jump-to-live and scan arrivals
+            // never slide its window forward. WO-T3.7 re-spelled the read and
+            // changed nothing about which panes it selects.
+            .filter(|(_, pane)| pane.time_state(&known::RADAR).is_active())
+            .map(|(pane_idx, pane)| (pane_idx, pane.time_state(&known::RADAR).span_secs))
             .collect();
         for (pane_idx, lookback_secs) in to_reinit {
             self.handle_enable_loop(pane_idx, lookback_secs);
@@ -2612,7 +2617,7 @@ fn armed_start(
 /// published stamps at the same time.**
 ///
 /// **A poll is the tick, not the payload.** All four reads here used to be
-/// `pane.loop_state()`, radar's slot, and the append itself was gated on
+/// radar's slot by name, and the append itself was gated on
 /// `radar_layer::site(ls) != site`. A non-radar timeline's anchor is
 /// `Box::new(())`, so `radar_layer::site` answers `""` and that guard rejected
 /// unconditionally: **a satellite, MRMS or model loop never gained a frame
