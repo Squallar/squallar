@@ -2485,9 +2485,15 @@ fn arm_layer_loop(
         // for the pane rather than once per layer.
         let view = panes[pane_idx].render_view();
 
+        // **The lookback, then the layer's own answer for it.** The window a
+        // lookback names has a first stop of its own, and the frame that stop
+        // is drawn from can sit earlier than the window — see
+        // [`armed_start`].
         let start = end - chrono::Duration::seconds(lookback_secs as i64);
+        let start = armed_start(panes, overlays, pane_idx, &layer, (start, end));
         // **A layer that was handed a window takes it.** See the parameter's
-        // own note: one pane, one clock, one window.
+        // own note: one pane, one clock, one window. A handed window is a
+        // decision already taken and is not re-derived here.
         let (start, end) = over.unwrap_or((start, end));
         // **The window the listing is asked for, not the lookback** — read
         // off the range, exactly as the forward arm reads it, so the two arms
@@ -2539,6 +2545,8 @@ fn arm_layer_loop(
     // not some radar volume's timestamp.
     let start = now - chrono::Duration::seconds(lookback_secs as i64);
     let end = now + horizon;
+    // The same ask the backward arm makes, over this arm's own edges.
+    let start = armed_start(panes, overlays, pane_idx, &layer, (start, end));
     // As above: a handed window wins over the one this layer would have
     // reached for on its own.
     let (start, end) = over.unwrap_or((start, end));
@@ -2561,6 +2569,42 @@ fn arm_layer_loop(
     panes[pane_idx].time_state_mut(&layer).asked_range = Some((start, end));
 
     Some(LoopScanRequest { layer, start, end })
+}
+
+/// **Where an armed window really begins** — the lookback's own edge, or the
+/// earlier instant this layer says it must hold to draw that edge.
+///
+/// A window `[start, end]` names `start` as a stop, and the picture that stop
+/// is drawn from is the frame at or before it — **earlier than the window**
+/// whenever the layer's steps are coarser than the lookback happened to land.
+/// A listing clipped at its own start therefore names no frame for the first
+/// step of the sweep, which is the leading-partial-step defect the same
+/// contract method fixes in `loop_refill`.
+///
+/// It can only widen: `Residency::extent` is compared with the lookback's edge
+/// and the earlier wins, so a layer that knows nothing back there — every
+/// layer on a pane arming its first loop — gets the window the lookback names,
+/// unchanged. `end` is never touched, so nothing here reaches past the horizon
+/// the layer declared.
+fn armed_start(
+    panes: &mut [rustdar_egui::pane::PaneState],
+    overlays: &rustdar_overlays::render::overlay_state::OverlayRegistry,
+    pane_idx: usize,
+    layer: &rustdar_source::id::LayerId,
+    window: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+) -> chrono::NaiveDateTime {
+    let (start, end) = window;
+    let Some(pane) = panes.get_mut(pane_idx) else {
+        return start;
+    };
+    // Hydrated before the handler is asked anything about this pane, as
+    // everywhere else.
+    pane.hydrate_layer_states(overlays, pane_idx);
+    let view = pane.view(pane_idx);
+    overlays
+        .residency_for(layer, &view.layer(layer), &[start, end])
+        .extent()
+        .map_or(start, |(held, _)| held.min(start))
 }
 
 /// Append a frame for a scan polled from `site` at `timestamp` to every active
