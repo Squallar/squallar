@@ -626,15 +626,32 @@ impl OverlayHandler for GmgsiHandler {
         13
     }
 
-    /// **The hours this channel's listings have found inside `range`.**
+    /// **The granules this channel's listings have found for `range`** — every
+    /// one inside it, and **the newest one at or before its start**.
     ///
     /// Synchronous and I/O-free: it reads the keys
     /// [`Self::create_frame_list_task`] filed and nothing else. Every stamp
     /// carries `run: None` — GMGSI is observed, there is no cycle behind it.
     ///
+    /// **Why the answer reaches one granule earlier than the window.** An
+    /// hour `H`'s granule depicts `H` and nothing depicts the minutes after
+    /// it, so every instant in `H..H+1h` is drawn by carrying `H` forward. A
+    /// window opened at `HH:MM` therefore has `60 - MM` minutes of clock in
+    /// front of its first *whole* hour, and the only picture any of them can
+    /// be drawn from is the granule for the hour the window opened inside —
+    /// which is earlier than `range.0`. Clipping it away left those stops with
+    /// no frame at all: a loop enabled at any minute but `:00` opened on a
+    /// blank satellite layer, and the caller had nothing to carry forward
+    /// because nothing was offered. [`crate::gmgsi::fetch::hours_in_range`]
+    /// lists that hour; this is what hands it on.
+    ///
+    /// One granule, not the whole tail: `next_back` takes the newest earlier
+    /// key, so a window that opens exactly on the hour reaches nothing extra.
+    ///
     /// `complete` only where a listing that really covered this window landed:
     /// a failed or sampled listing leaves the answer readable as "at least
-    /// these", which is what it is.
+    /// these", which is what it is. It is a claim about the window, and
+    /// carrying one earlier granule in does not widen it.
     fn list_frames(
         &self,
         _ctx: &FetchConfig,
@@ -646,7 +663,11 @@ impl OverlayHandler for GmgsiHandler {
             .frame_keys
             .get(&channel)
             .map(|keys| {
-                keys.range(range.0..=range.1)
+                let from = keys
+                    .range(..=range.0)
+                    .next_back()
+                    .map_or(range.0, |(valid, _)| *valid);
+                keys.range(from..=range.1)
                     .map(|(valid, _)| FrameStamp {
                         valid: *valid,
                         run: None,
