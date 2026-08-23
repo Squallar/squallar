@@ -1493,7 +1493,7 @@ impl super::App {
         let (panes, overlays) = self.gui.panes_and_overlays_mut();
         let mut dispatch = Vec::new();
         let mut forget = Vec::new();
-        for ask in watch.settled_asks(panes, now) {
+        for ask in watch.settled_asks(panes, overlays, now) {
             let idx = ask.pane_idx;
             // The real pane, hydrated first — see `with_layer_pane`, whose
             // construction this is; it cannot be called here because the
@@ -1525,7 +1525,13 @@ impl super::App {
                 ask.range.0,
                 ask.range.1,
             );
-            let ls = panes[idx].transport_state_mut();
+            // **The layer the ask names, not the transport's slot.** One
+            // settled instant produces one ask per layer it is a hole in, and
+            // filing all of them into the transport's timeline would clear the
+            // transport once per secondary and leave every secondary holding
+            // frames stamped after the clock — the blank this walk exists to
+            // end.
+            let ls = panes[idx].time_state_mut(&ask.layer);
             ls.frames.clear();
             ls.phase = rustdar_egui::pane::LoopPhase::FetchingScanList;
             // The clock on the phase starts where the phase does — the frame's
@@ -1533,10 +1539,11 @@ impl super::App {
             // loop's is.
             ls.listing_since = Some(now);
             // The window this refill asked over, which is what the arrival is
-            // matched on. It is the same width as the window it replaces —
-            // `refill_range` is one span wide by construction — anchored at
-            // the scrub target, which is exactly why the width alone cannot
-            // say whose answer a landing listing is.
+            // matched on. It is at least as wide as the window it replaces —
+            // `refill_range` is one span, widened only by what the layer's own
+            // `residency_for` reaches back to — anchored at the scrub target,
+            // which is exactly why the width alone cannot say whose answer a
+            // landing listing is.
             ls.asked_range = Some(ask.range);
             dispatch.push((idx, task));
         }

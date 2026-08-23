@@ -7,7 +7,7 @@ use rustdar_source::id::LayerId;
 use rustdar_source::id::known;
 use rustdar_source::job::{DescribedJob, JobCodec};
 use rustdar_source::product::{FieldId, ProductSpec};
-use rustdar_source::time::{FrameListing, FrameSource, FrameStamp};
+use rustdar_source::time::{FrameListing, FrameSource, FrameStamp, Residency};
 use rustdar_units::UserPreferences;
 
 #[cfg(test)]
@@ -405,6 +405,30 @@ impl OverlayRegistry {
     ) -> Vec<FetchTask> {
         self.handler(id)
             .map_or_else(Vec::new, |h| h.create_fetch_tasks(ctx, pane))
+    }
+
+    /// [`SourceHandler::residency_for`] for `id` — what that layer must be
+    /// holding to draw `stops`, or [`Residency::none`] for an id this build
+    /// does not register.
+    ///
+    /// **Not on the frame forwarder above**, and the same reason the trait
+    /// method is not on [`FrameSource`]: the layer this question was written
+    /// for is [`TimeAxis::EventLifetime`] and has no frames at all. An
+    /// unregistered id and a [`TimeAxis::Live`] layer answer the same empty
+    /// [`Residency`], which is the correct answer for both — neither is
+    /// obliged to hold any slice of source time by any set of stops.
+    ///
+    /// [`SourceHandler::residency_for`]: rustdar_source::handler::SourceHandler::residency_for
+    /// [`TimeAxis::EventLifetime`]: rustdar_source::time::TimeAxis::EventLifetime
+    /// [`TimeAxis::Live`]: rustdar_source::time::TimeAxis::Live
+    pub fn residency_for(
+        &self,
+        id: &LayerId,
+        pane: &PaneRef<'_>,
+        stops: &[chrono::NaiveDateTime],
+    ) -> Residency {
+        self.handler(id)
+            .map_or_else(Residency::none, |h| h.residency_for(pane, stops))
     }
 
     /// **This layer's frame supply**, or `None` for an id this build does not
