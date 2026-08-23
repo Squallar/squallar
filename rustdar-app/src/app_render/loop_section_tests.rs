@@ -536,3 +536,258 @@ fn axes() -> rustdar_radar::xsect::SectionAxes {
         top_declared_cut_deg: 0.5,
     }
 }
+
+// ---------------------------------------------------------------------------
+// **Which timeline the section half of the funnel addresses** (WO-T3.8).
+//
+// A section cut is keyed by `SectionLoopKey` + `RenderTarget`, both cut out of
+// a decoded NEXRAD volume, so every read in the section arms is radar's own
+// timeline by construction. WO-T3.7 wrote that down and found nothing enforced
+// it: retargeting the cut dispatch, the result acceptance, the broadcast or
+// the donor search at `transport_state()` passed the whole tree.
+//
+// **The reachable state they fork on**: `PaneState::refresh_transport` returns
+// early while the transport's own loop is active, so arming a GMGSI loop and
+// *then* enabling radar leaves the controls on the satellite while radar
+// animates underneath. Every pin below runs twice — radar driving, which is
+// the floor and is asserted against a literal, then the satellite driving.
+
+/// Arm a running satellite loop on `pane_idx` and hand it the transport.
+///
+/// The satellite's own frame is stamped hours away from anything radar
+/// carries, so a lookup made against it cannot land on radar's answer by
+/// accident — and it is a real frame, so a mis-addressed *write* lands
+/// somewhere rather than being swallowed by an empty list.
+fn a_satellite_loop_takes_the_transport(app: &mut crate::app::App, pane_idx: usize) {
+    let pane = app
+        .gui
+        .pane_mut(pane_idx)
+        .expect("the fixture built a pane");
+    let mut sat = rustdar_egui::pane::LayerTimeState::new();
+    sat.phase = LoopPhase::Playing;
+    sat.span_secs = 43_200;
+    sat.frames = vec![LoopFrame {
+        timestamp: ts(0) - chrono::Duration::hours(10),
+        image: None,
+        render_in_flight: false,
+        render_failed: false,
+    }];
+    *pane.time_state_mut(&known::GMGSI) = sat;
+    pane.set_transport_layer(known::GMGSI);
+
+    assert!(
+        !std::ptr::eq(pane.transport_state(), pane.time_state(&known::RADAR)),
+        "precondition: the transport really addresses another timeline, or the \
+         two reads are one object and the case is vacuous",
+    );
+    assert!(
+        pane.transport_state().is_active(),
+        "precondition: the satellite loop is genuinely running",
+    );
+    assert!(
+        pane.transport_state().section_key().is_none(),
+        "precondition: the satellite timeline carries no section key — it is \
+         not a radar timeline and cannot have one",
+    );
+}
+
+/// Two layer-linked, aimed cross-section panes running the same section loop
+/// over `minutes`, and no volumes cached.
+fn two_section_panes(minutes: &[u32]) -> crate::app::App {
+    let mut app = crate::app::tests::two_pane_app(SITE, SITE);
+    app.render.ensure_pane_count(2);
+    app.loop_mgr = LoopDownloadManager::new();
+    for idx in 0..2 {
+        let pane = app.gui.pane_mut(idx).expect("the fixture built two panes");
+        pane.set_site(SITE.to_string());
+        pane.set_selected_product(PRODUCT_ID);
+        pane.set_selected_elevation(TILT);
+        pane.set_kind(PaneKind::CrossSection);
+        pane.cross_section_mut().expect("a section pane").line = Some(line());
+
+        let mut ls = rustdar_egui::radar_layer::begin_loop(3600, &site(), RenderView::CrossSection);
+        ls.phase = LoopPhase::Rendering;
+        ls.frames = minutes
+            .iter()
+            .map(|&m| LoopFrame {
+                timestamp: ts(m),
+                image: None,
+                render_in_flight: false,
+                render_failed: false,
+            })
+            .collect();
+        ls.retarget_renders_for(&PRODUCT_ID, TILT, Some(key()));
+        *pane.time_state_mut(&known::RADAR) = ls;
+    }
+    assert!(
+        app.gui.pane_layer_linked(0) && app.gui.pane_layer_linked(1),
+        "precondition: both panes are layer-linked, or neither the donor \
+         search nor the broadcast ever runs",
+    );
+    app
+}
+
+/// Run one dispatch pass over a section loop whose frame has a cuttable
+/// volume, and answer whether radar's own frame was marked in flight.
+fn radars_section_frame_goes_in_flight(park_on_the_satellite: bool) -> bool {
+    let mut app = app_with_section_loop(&[0]);
+    app.loop_mgr
+        .cache_scan(SITE, ts(0), (volume(), Default::default()));
+    if park_on_the_satellite {
+        a_satellite_loop_takes_the_transport(&mut app, 0);
+    }
+
+    app.dispatch_loop_renders();
+
+    app.gui.pane(0).unwrap().time_state(&known::RADAR).frames[0].render_in_flight
+}
+
+/// **A dispatched cut marks the frame it is for in radar's own list.**
+///
+/// The mark is what stops the very next pass cutting the same frame again —
+/// and a cut is a whole-volume extraction on the frame thread, the most
+/// expensive thing the loop does. A transport-addressed write puts the mark on
+/// a timeline that is not the one the dispatcher reads, so **every pass
+/// re-cuts the same frame** and the section loop never advances past it.
+#[test]
+fn a_dispatched_cut_marks_radars_own_frame_not_the_transports() {
+    assert!(
+        radars_section_frame_goes_in_flight(false),
+        "floor: with radar driving, a frame with a cuttable volume is \
+         dispatched and marked — if this arm marked nothing the assertion \
+         below would be satisfied by two unmarked frames",
+    );
+    assert!(
+        radars_section_frame_goes_in_flight(true),
+        "a cross-section cut was dispatched for a frame that was never marked \
+         in flight, because the pane's transport sat on a satellite loop: the \
+         next pass sees an unmarked frame with no picture and extracts the \
+         whole volume all over again, on the frame thread, for ever",
+    );
+}
+
+/// Deliver one finished cut for pane 0 into two layer-linked section panes and
+/// answer whether each pane's radar frame ended up holding a section picture.
+fn frames_holding_a_cut(park_on_the_satellite: bool) -> (bool, bool) {
+    let ctx = egui::Context::default();
+    let mut app = two_section_panes(&[0]);
+    app.loop_mgr
+        .cache_scan(SITE, ts(0), (volume(), Default::default()));
+    let FrameSection::At(ladder) = frame_section(&app.loop_mgr, &target(), ts(0)) else {
+        panic!(
+            "precondition: the cached volume must resolve a ladder, or the \
+                broadcast has no ladder to agree with"
+        );
+    };
+    for idx in 0..2 {
+        app.gui
+            .pane_mut(idx)
+            .unwrap()
+            .time_state_mut(&known::RADAR)
+            .frames[0]
+            .render_in_flight = true;
+    }
+    if park_on_the_satellite {
+        a_satellite_loop_takes_the_transport(&mut app, 0);
+        a_satellite_loop_takes_the_transport(&mut app, 1);
+    }
+
+    app.channels
+        .loop_section_sender
+        .send(section_response(&ctx, ladder))
+        .expect("the receiver lives on the App");
+    app.poll_loop_section_results(&ctx);
+
+    let holds = |app: &crate::app::App, idx: usize| {
+        app.gui.pane(idx).unwrap().time_state(&known::RADAR).frames[0]
+            .image
+            .is_some()
+    };
+    (holds(&app, 0), holds(&app, 1))
+}
+
+/// **A finished cut lands in radar's own frame list on the pane that asked for
+/// it, and in radar's own frame list on every sibling it is broadcast to.**
+///
+/// A `SectionImageData` is a slice through a decoded NEXRAD volume; no other
+/// layer's timeline has a frame that could hold one. A transport-addressed
+/// read at either site drops the cut on the floor: the frame stays blank,
+/// `render_in_flight` is never cleared, and the pane waits for a
+/// cross-section that has already been computed and thrown away.
+#[test]
+fn a_finished_cut_lands_in_radars_own_frames_not_the_transports() {
+    let radar_driving = frames_holding_a_cut(false);
+    assert_eq!(
+        radar_driving,
+        (true, true),
+        "floor: with radar driving, the cut lands on its own pane and is \
+         broadcast to the linked sibling — if neither took it the comparison \
+         below would be satisfied by two blank panes",
+    );
+
+    let satellite_driving = frames_holding_a_cut(true);
+    assert_eq!(
+        satellite_driving, radar_driving,
+        "a finished cross-section was thrown away because the panes' \
+         transports sat on satellite loops: it matched no frame on a timeline \
+         that holds no section key, so both panes go on showing \"Cutting the \
+         cross-section…\" over a cut that is already done",
+    );
+}
+
+/// Run one dispatch pass over two linked section panes where pane 0 already
+/// holds a cut of the ladder its volume resolves now, and answer whether pane
+/// 1 took the donor's picture instead of extracting the volume again.
+fn a_section_donor_is_cloned(park_on_the_satellite: bool) -> bool {
+    let ctx = egui::Context::default();
+    let mut app = two_section_panes(&[0]);
+    app.loop_mgr
+        .cache_scan(SITE, ts(0), (volume(), Default::default()));
+    let FrameSection::At(ladder) = frame_section(&app.loop_mgr, &target(), ts(0)) else {
+        panic!(
+            "precondition: the cached volume must resolve a ladder, or no \
+                donor can ever match it"
+        );
+    };
+    app.gui
+        .pane_mut(0)
+        .unwrap()
+        .time_state_mut(&known::RADAR)
+        .frames[0]
+        .image = Some(section_picture(&ctx, ladder));
+    if park_on_the_satellite {
+        a_satellite_loop_takes_the_transport(&mut app, 0);
+        a_satellite_loop_takes_the_transport(&mut app, 1);
+    }
+
+    app.dispatch_loop_renders();
+
+    app.gui.pane(1).unwrap().time_state(&known::RADAR).frames[0]
+        .image
+        .is_some()
+}
+
+/// **The section donor search reads every sibling's radar frame list, never
+/// its transport.**
+///
+/// A satellite timeline holds no `RenderTarget` and no `SectionLoopKey`, so a
+/// transport-addressed search finds nobody: the receiving pane **extracts the
+/// whole volume again** for a cut that is finished and on screen beside it —
+/// the single most expensive thing this loop does, paid twice, on the frame
+/// thread.
+#[test]
+fn a_section_donor_is_found_in_radars_own_frame_lists() {
+    assert!(
+        a_section_donor_is_cloned(false),
+        "floor: with radar driving, a linked sibling's finished cut is cloned \
+         into the pane that has none — if this arm cloned nothing the \
+         assertion below would be satisfied by two blank frames",
+    );
+    assert!(
+        a_section_donor_is_cloned(true),
+        "the linked-pane cut clone stopped happening because the transports \
+         sat on satellite loops: a second pane cutting the identical line, \
+         product and tilt re-extracts the whole volume on the frame thread \
+         instead of taking the raster already finished beside it",
+    );
+}

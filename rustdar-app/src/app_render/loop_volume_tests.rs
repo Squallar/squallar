@@ -717,3 +717,92 @@ fn a_slow_site_shortens_a_3d_loops_list_without_shortening_its_span() {
     );
     assert_eq!(plan.frames.len(), MAX_LOOP_FRAMES.min(40));
 }
+
+// ---------------------------------------------------------------------------
+// **Which timeline the residency pass names its grids on** (WO-T3.8).
+
+/// Arm a running satellite loop on pane 0 and hand it the transport.
+///
+/// **Reachable, not contrived**: `PaneState::refresh_transport` returns early
+/// while the transport's own loop is active, so a pane that armed a GMGSI loop
+/// and then enabled radar keeps the controls on the satellite while radar
+/// animates underneath.
+///
+/// The satellite gets a **real frame** of its own, stamped hours away from
+/// anything radar carries, so a mis-addressed write lands somewhere visible
+/// rather than being swallowed by an empty list.
+fn a_satellite_loop_takes_the_transport(app: &mut crate::app::App) {
+    let pane = app.gui.pane_mut(0).expect("pane 0");
+    let mut sat = LayerTimeState::new();
+    sat.phase = LoopPhase::Playing;
+    sat.span_secs = 43_200;
+    sat.frames = vec![LoopFrame {
+        timestamp: ts(0) - chrono::Duration::hours(10),
+        image: None,
+        render_in_flight: false,
+        render_failed: false,
+    }];
+    *pane.time_state_mut(&known::GMGSI) = sat;
+    pane.set_transport_layer(known::GMGSI);
+
+    assert!(
+        !std::ptr::eq(pane.transport_state(), pane.time_state(&known::RADAR)),
+        "precondition: the transport really addresses another timeline, or the \
+         two reads are one object and the case is vacuous",
+    );
+    assert!(
+        pane.transport_state().is_active(),
+        "precondition: the satellite loop is genuinely running",
+    );
+    assert!(
+        pane.transport_state().volume_key().is_none(),
+        "precondition: the satellite timeline carries no volume key — it is \
+         not a radar timeline and cannot have one",
+    );
+}
+
+/// Run the residency pass over a 3D loop whose one volume has nothing to
+/// resample, with the transport optionally parked on a satellite loop, and
+/// answer whether radar's own frame took the refusal.
+fn radars_volume_frame_is_retired(park_on_the_satellite: bool) -> bool {
+    let mut app = app_with_volume_loop(&[0]);
+    if park_on_the_satellite {
+        a_satellite_loop_takes_the_transport(&mut app);
+    }
+
+    dispatch_until_settled(&mut app, 1);
+
+    app.gui
+        .pane(0)
+        .expect("pane 0")
+        .time_state(&known::RADAR)
+        .frames[0]
+        .render_failed
+}
+
+/// **The residency pass names each grid — or each refusal — on radar's own
+/// frame, never on the transport's.**
+///
+/// `make_volume_frames_resident` walks `LoopVolumeRequest`s the dispatch pass
+/// built out of radar's frame list, so `req.frame_idx` is an index **into that
+/// list**. A transport-addressed write applies it to a different list
+/// entirely: the satellite's frame is stamped with a `VolumeFrameGrid` that
+/// has nothing to do with it, and radar's frame is left neither named nor
+/// retired — so readiness waits on it for ever and the 3D loop never settles
+/// out of `Rendering`.
+#[test]
+fn the_residency_pass_names_radars_own_frames_not_the_transports() {
+    assert!(
+        radars_volume_frame_is_retired(false),
+        "floor: with radar driving, a volume with nothing to resample retires \
+         its own frame — if this arm retired nothing the assertion below would \
+         be satisfied by two un-retired frames",
+    );
+    assert!(
+        radars_volume_frame_is_retired(true),
+        "the 3D loop's verdict was written onto the wrong timeline because the \
+         pane's transport sat on a satellite loop: radar's frame is left \
+         neither named nor retired, so readiness waits on a build that will \
+         never answer and the loop sits in Rendering for the session",
+    );
+}

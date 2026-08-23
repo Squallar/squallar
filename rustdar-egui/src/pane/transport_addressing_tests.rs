@@ -316,3 +316,304 @@ fn radars_picture_is_read_off_radars_timeline_not_the_transports() {
         "radar's own frame (31.5), not the transport's (12.0)",
     );
 }
+
+// ---------------------------------------------------------------------------
+// **The static half of the fork: a satellite loop running over a radar image
+// that is NOT looping.** (WO-T3.8)
+//
+// The four reads below — `stale_image_on_screen` and the three legend
+// annotations under it — all ask `time_state(&known::RADAR).is_active()` to
+// decide between *radar's playing frame* and *radar's last static render*.
+// Retargeting any of them at the transport answers "yes, a loop is running"
+// about a timeline that is not radar's, takes the loop branch, and finds
+// nothing there: `active_image` is radar-addressed, radar is not looping, so
+// it answers `None` and the annotation is simply lost.
+//
+// **Reachable by exactly the door the two WO-T3.7 pins use.**
+// `PaneState::refresh_transport` returns early while the transport's own loop
+// is active, so a pane that armed a GMGSI loop and *then* enabled radar keeps
+// the controls on the satellite. Radar not looping is the ordinary case on
+// such a pane: it draws its live scan out of the overlay cache.
+
+/// A pane drawing a **static** radar render — the picture the overlay cache
+/// holds after a plain (non-looping) scan — described by the facts a render
+/// carries about itself and nothing else can recompute.
+///
+/// `meta_product` is what the *pixels* are; `selected` is what the pane is
+/// asking for. Equal means the image on the glass matches the selection;
+/// different is what [`PaneState::stale_image_on_screen`] exists to report.
+///
+/// Both slots are opened through the **production door** — the same
+/// `Gui::write_pane_overlay` a layer row's tick makes — so neither read below
+/// can be the pane's orphan state.
+fn pane_showing_a_static_radar_render(
+    ctx: &egui::Context,
+    selected: &FieldId,
+    meta_product: &FieldId,
+    nyquist_ms: Option<f64>,
+    melting_layer_source: Option<rustdar_radar::hca::MeltingLayerSource>,
+    storm_motion: Option<rustdar_radar::srv::SrvMotion>,
+) -> PaneState {
+    use crate::overlay_cache::{OverlayTextureData, RadarTextureMeta};
+
+    let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
+    let mut gui = Gui::new();
+    toggle(&mut gui, &known::RADAR, true);
+    toggle(&mut gui, &known::GMGSI, true);
+    let mut pane = std::mem::take(gui.pane_mut(0).expect("pane 0"));
+    pane.set_selected_product(selected.clone());
+    pane.overlay_cache_mut(&known::RADAR)
+        .show(OverlayTextureData {
+            texture: ctx.load_texture("static-scan", image, egui::TextureOptions::NEAREST),
+            placed: rustdar_geo::PlacedRaster::of(rustdar_geo::GeoBounds {
+                min_lat: 34.0,
+                max_lat: 36.0,
+                min_lon: -98.0,
+                max_lon: -96.0,
+            }),
+            data_generation: 0,
+            render_zoom: 0,
+            width: 1,
+            height: 1,
+            radar_meta: Some(RadarTextureMeta {
+                hover: std::sync::Arc::new(rustdar_radar::hover::HoverSource::empty()),
+                lat: 35.0,
+                lon: -97.0,
+                max_range_km: 100.0,
+                nyquist_ms,
+                melting_layer_source,
+                storm_motion,
+                product: meta_product.clone(),
+                elevation: 0.5,
+            }),
+            hit_map: None,
+        });
+    pane
+}
+
+/// Arm a **satellite** loop on `pane` and hand it the transport, leaving
+/// radar's own timeline idle.
+///
+/// The satellite frame is stamped hours away from anything radar carries, so
+/// a transport-addressed read cannot land on radar's answer by accident.
+fn a_satellite_loop_takes_the_transport(pane: &mut PaneState) {
+    {
+        let sat = pane.time_state_mut(&known::GMGSI);
+        sat.phase = LoopPhase::Playing;
+        sat.span_secs = 43_200;
+        sat.frames = vec![LoopFrame {
+            timestamp: chrono::NaiveDate::from_ymd_opt(2026, 8, 22)
+                .unwrap()
+                .and_hms_opt(6, 0, 0)
+                .unwrap(),
+            image: None,
+            render_in_flight: false,
+            render_failed: false,
+        }];
+    }
+    pane.set_transport_layer(known::GMGSI);
+
+    assert!(
+        pane.slot(&known::RADAR).is_some(),
+        "precondition: radar has a REAL slot, so the radar-addressed reads \
+         below are not the pane's orphan state",
+    );
+    assert!(
+        pane.slot(&known::GMGSI).is_some(),
+        "precondition: the satellite has a REAL slot of its own",
+    );
+    assert!(
+        !std::ptr::eq(pane.transport_state(), pane.time_state(&known::RADAR)),
+        "precondition: the transport really addresses another timeline, or the \
+         two reads are one object and every assertion below is vacuous",
+    );
+    assert!(
+        pane.transport_state().is_active(),
+        "precondition: the satellite loop is genuinely running, so a \
+         transport-addressed `is_active()` reads TRUE",
+    );
+    assert!(
+        !pane.time_state(&known::RADAR).is_active(),
+        "precondition: radar is NOT looping — the whole fork is which of the \
+         two timelines answers that question",
+    );
+}
+
+/// **The staleness notice is read off radar's own timeline, never off
+/// whichever layer holds the transport.**
+///
+/// `stale_image_on_screen` answers `None` for a *looping* pane, because a
+/// looping pane's frame textures are dropped the moment the selection moves
+/// and therefore cannot be stale. Retargeting that gate at the transport lets
+/// a running satellite loop answer it: the notice is suppressed and the pane
+/// goes on presenting **reflectivity pixels labelled as velocity**, silently
+/// — the exact confidently-wrong picture the notice exists to prevent.
+///
+/// **The floor is the first arm**, asserted against a literal rather than
+/// against the other arm, so "both answered `None`" cannot satisfy this.
+#[test]
+fn radars_staleness_notice_is_read_off_radars_timeline_not_the_transports() {
+    let ctx = egui::Context::default();
+
+    let radar_driving = pane_showing_a_static_radar_render(
+        &ctx,
+        &radar_fields::known::VELOCITY,
+        &radar_fields::known::REFLECTIVITY,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(
+        radar_driving.stale_image_on_screen(),
+        Some((radar_fields::known::REFLECTIVITY, 0.5)),
+        "floor: a pane asking for velocity over reflectivity pixels disowns \
+         them — if this arm already answered None the assertion below would be \
+         satisfied by two Nones",
+    );
+
+    let mut satellite_driving = pane_showing_a_static_radar_render(
+        &ctx,
+        &radar_fields::known::VELOCITY,
+        &radar_fields::known::REFLECTIVITY,
+        None,
+        None,
+        None,
+    );
+    a_satellite_loop_takes_the_transport(&mut satellite_driving);
+
+    assert_eq!(
+        satellite_driving.stale_image_on_screen(),
+        Some((radar_fields::known::REFLECTIVITY, 0.5)),
+        "a pane whose transport sits on a satellite loop stopped disowning the \
+         radar pixels on its own glass: the notice is gone and reflectivity is \
+         now presented, unlabelled, as the velocity the pane is asking for",
+    );
+}
+
+/// **The three legend annotations are read off radar's own timeline, never off
+/// whichever layer holds the transport.**
+///
+/// `displayed_nyquist_ms`, `displayed_melting_layer_source` and
+/// `displayed_storm_motion` each fork on the same question, and each takes
+/// `active_image()` — radar's playing frame — when the answer is yes.
+/// Retargeting the gate at a running satellite loop takes that branch over a
+/// radar timeline holding no frames at all, so `active_image()` answers `None`
+/// and **the annotation vanishes from the legend**: the velocity ramp stops
+/// saying where it folds, the classification stops saying what melting layer
+/// it stood on, and the storm-relative field stops saying what vector it was
+/// shifted by.
+///
+/// Cosmetic but real — the fold limit is what tells a reader whether the
+/// couplet in front of them is aliased.
+///
+/// **Each arm's floor is a literal**, taken on a radar-driven pane first.
+#[test]
+fn the_legend_annotations_are_read_off_radars_timeline_not_the_transports() {
+    use rustdar_radar::hca::MeltingLayerSource;
+
+    let ctx = egui::Context::default();
+
+    // -- Nyquist -----------------------------------------------------------
+    let radar_driving = pane_showing_a_static_radar_render(
+        &ctx,
+        &radar_fields::known::VELOCITY,
+        &radar_fields::known::VELOCITY,
+        Some(26.42),
+        None,
+        None,
+    );
+    assert_eq!(
+        radar_driving.displayed_nyquist_ms(),
+        Some(26.42),
+        "floor: a still velocity pane reports the fold limit its own cut \
+         declared",
+    );
+    let mut satellite_driving = pane_showing_a_static_radar_render(
+        &ctx,
+        &radar_fields::known::VELOCITY,
+        &radar_fields::known::VELOCITY,
+        Some(26.42),
+        None,
+        None,
+    );
+    a_satellite_loop_takes_the_transport(&mut satellite_driving);
+    assert_eq!(
+        satellite_driving.displayed_nyquist_ms(),
+        Some(26.42),
+        "the velocity ramp lost its fold limit because a satellite loop \
+         happened to be playing: the legend no longer says past what speed the \
+         sign wraps, so an aliased couplet reads as a real one",
+    );
+
+    // -- Melting layer -----------------------------------------------------
+    let radar_driving = pane_showing_a_static_radar_render(
+        &ctx,
+        &radar_fields::known::HYDROMETEOR_CLASSIFICATION,
+        &radar_fields::known::HYDROMETEOR_CLASSIFICATION,
+        None,
+        Some(MeltingLayerSource::FleetDefault),
+        None,
+    );
+    assert_eq!(
+        radar_driving.displayed_melting_layer_source(),
+        Some(MeltingLayerSource::FleetDefault),
+        "floor: a still classification pane reports the melting layer its own \
+         pixels stood on",
+    );
+    let mut satellite_driving = pane_showing_a_static_radar_render(
+        &ctx,
+        &radar_fields::known::HYDROMETEOR_CLASSIFICATION,
+        &radar_fields::known::HYDROMETEOR_CLASSIFICATION,
+        None,
+        Some(MeltingLayerSource::FleetDefault),
+        None,
+    );
+    a_satellite_loop_takes_the_transport(&mut satellite_driving);
+    assert_eq!(
+        satellite_driving.displayed_melting_layer_source(),
+        Some(MeltingLayerSource::FleetDefault),
+        "the classification lost the caveat that nobody measured its melting \
+         layer, because a satellite loop happened to be playing — an \
+         unqualified guess is now drawn as a measurement",
+    );
+
+    // -- Storm motion ------------------------------------------------------
+    let motion = rustdar_radar::srv::SrvMotion {
+        speed_kt: 38.2,
+        direction_deg: 224.6,
+        source: rustdar_radar::srv::StormMotionSource::BunkersRightMover,
+    };
+    let radar_driving = pane_showing_a_static_radar_render(
+        &ctx,
+        &radar_fields::known::STORM_RELATIVE_VELOCITY,
+        &radar_fields::known::STORM_RELATIVE_VELOCITY,
+        None,
+        None,
+        Some(motion),
+    );
+    assert_eq!(
+        radar_driving.displayed_storm_motion().map(|m| m.speed_kt),
+        Some(38.2),
+        "floor: a still storm-relative pane reports the vector its own pixels \
+         were shifted by",
+    );
+    let mut satellite_driving = pane_showing_a_static_radar_render(
+        &ctx,
+        &radar_fields::known::STORM_RELATIVE_VELOCITY,
+        &radar_fields::known::STORM_RELATIVE_VELOCITY,
+        None,
+        None,
+        Some(motion),
+    );
+    a_satellite_loop_takes_the_transport(&mut satellite_driving);
+    assert_eq!(
+        satellite_driving
+            .displayed_storm_motion()
+            .map(|m| m.speed_kt),
+        Some(38.2),
+        "the storm-relative field lost the vector it was shifted by, because a \
+         satellite loop happened to be playing: the legend no longer says what \
+         motion was subtracted, and every velocity on the glass is \
+         unattributable",
+    );
+}
