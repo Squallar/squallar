@@ -256,7 +256,24 @@ const INVENTORY_FIELD: &str = concat!("volumes: ", "crate::volume_inventory::");
 /// is measured after that. **A ceiling lowered onto a line wrap is a ceiling
 /// that has stopped binding**, and `app/gui_seam_ratchet_tests.rs` is what
 /// caught it.
-const SELF_GUI_MAX: usize = 168;
+///
+/// # 168 -> 167 at WO-T3.9, and the shed is bigger than the number
+///
+/// `reinit_active_loops` moved from `self.``gui.panes()` to
+/// `self.``gui.panes_and_overlays_mut()` — one reach either way, but the old
+/// spelling was **wrapped across three lines** by WO-T3.7's own re-spelling and
+/// so was invisible to this raw walk while the collapsed scrape counted it.
+/// Unhiding it costs this row +1 for no change in coupling at all, which is the
+/// same measurement artefact the paragraph above names, running the other way.
+///
+/// Paid for, and over-paid, by the **second** honest shed: `arrived_volume_asks`
+/// and the loop-raster dispatch each read the layout's denominator with
+/// `panes()` and then took the wider `panes_and_overlays_mut` door, spelling
+/// the all-panes-versus-visible-panes distinction out by hand. Both now ask
+/// `Gui::visible_panes_and_overlays_mut` for the slice they actually walk (-2).
+/// Net -1 here and **-2 on the collapsed per-file scrape**, which is the figure
+/// that describes the coupling: `app_fetch.rs` 40 -> 38.
+const SELF_GUI_MAX: usize = 167;
 /// Row 1b — the same needle outside test-named paths.
 ///
 /// Everything on [`SELF_GUI_MAX`] applies here: permanent, falls only, sits on
@@ -270,7 +287,10 @@ const SELF_GUI_MAX: usize = 168;
 /// 168 -> 163 at WO-T3.7 alongside its twin: all three sheds and both arrears
 /// were in production files, so this row moved by exactly what
 /// [`SELF_GUI_MAX`] did.
-const SELF_GUI_NON_TEST_MAX: usize = 163;
+///
+/// 163 -> 162 at WO-T3.9, and again by exactly what [`SELF_GUI_MAX`] moved:
+/// every site in that land is a production file.
+const SELF_GUI_NON_TEST_MAX: usize = 162;
 /// Row 2a — **`ui.rs`'s own `impl Gui` block, and only that file**.
 ///
 /// **0 since WO-E8b**, which is where the plan said it would land. The last

@@ -122,6 +122,23 @@ fn no_production_file_pushes_through_a_gui_setter() {
 /// The raw crate-wide count fell by one for no change in coupling at all; this
 /// collapsed scrape stayed at 101 and said so. The site was restructured to
 /// keep the reach on one line rather than bank a figure a line break produced.
+///
+/// # WO-T3.9 — `app_fetch.rs` 40 -> 38, on the *other* honest shed
+///
+/// `arrived_volume_asks` and the loop-raster dispatch each read the layout's
+/// denominator with `panes()` and then took the wider `panes_and_overlays_mut`
+/// door, re-deriving the all-panes-versus-visible-panes distinction by hand
+/// one line apart. Both now ask `Gui::visible_panes_and_overlays_mut` for the
+/// slice they actually walk — the same slice `panes()` yielded, since both
+/// clamp on `pane_count.min(panes.len())` — and the hand-spelled `take(visible)`
+/// and `pane_idx >= visible` go with it.
+///
+/// **The crate-wide walk moved by only one for the same land**, and the
+/// asymmetry is the artefact named above running backwards: WO-T3.7's
+/// re-spelling had wrapped `reinit_active_loops`' reach across three lines,
+/// where the raw walk could not see it and this scrape could. WO-T3.9 put that
+/// reach back on one line, so the raw row paid +1 for no change in coupling
+/// while this scrape — the one that describes the coupling — fell by two.
 #[test]
 fn the_gui_coupling_only_ever_shrinks() {
     // Presence control: the scrape reads real, current source. Without it every
@@ -133,7 +150,7 @@ fn the_gui_coupling_only_ever_shrinks() {
     );
     for (name, source, ceiling) in [
         ("app.rs", APP, 36),
-        ("app_fetch.rs", APP_FETCH, 40),
+        ("app_fetch.rs", APP_FETCH, 38),
         ("app_render.rs", APP_RENDER, 101),
         ("app_chunks.rs", APP_CHUNKS, 13),
     ] {

@@ -2347,6 +2347,39 @@ impl PaneState {
         }
     }
 
+    /// **The window a loop on this pane is actually listed over**: the
+    /// Lookback setting this pane carries, raised to the floor its
+    /// [`Self::transport_layer`] declares.
+    ///
+    /// One global number cannot serve two cadences. Sixty minutes is a dozen
+    /// radar volumes and two hourly frames, so the layer whose frames are an
+    /// hour apart says how wide its own window has to be —
+    /// `SourceHandler::min_loop_span_secs`, read off the registry by id and
+    /// never re-spelled here as a `match`.
+    ///
+    /// **A floor, so the slider still governs.** Drag Lookback past a layer's
+    /// minimum and that layer widens with everything else; the floor only ever
+    /// stops a window being too narrow to be a loop.
+    ///
+    /// **The one derivation of this number.** `Gui::loop_span_secs_for` is
+    /// this, resolved by index; the app layer reaches it here because
+    /// `Gui`'s door is crate-private and a second spelling of the `max` is
+    /// exactly the two-authorities defect the whole time contract exists to
+    /// remove. It is **not** [`LayerTimeState::span_secs`], which is the width
+    /// a listing was recorded as having been asked over — that figure carries
+    /// whatever `armed_start` widened the window by and grows every time it is
+    /// fed back in.
+    pub fn loop_span_secs(
+        &self,
+        overlays: &rustdar_overlays::render::overlay_state::OverlayRegistry,
+    ) -> u64 {
+        self.time.span_secs.max(
+            overlays
+                .handler_by_id(self.transport_layer())
+                .map_or(0, |h| h.min_loop_span_secs()),
+        )
+    }
+
     /// **Re-derive which layer the transport addresses.** Called wherever the
     /// pane's enabled set moves, and by the ∞ toggle before it starts a loop.
     ///

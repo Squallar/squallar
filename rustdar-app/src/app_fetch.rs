@@ -269,10 +269,18 @@ impl super::App {
         if arrived.is_empty() || self.volume_painter.is_none() {
             return Vec::new();
         }
-        let visible = self.gui.panes().len();
-        let (panes, overlays) = self.gui.panes_and_overlays_mut();
+        // **The visible slice and the registry in one reach.** This used to
+        // read the layout's denominator through `panes()` and then take the
+        // wider door, spelling the all-panes-versus-visible-panes distinction
+        // out here — the second of the two sheds the coupling ratchet names,
+        // and the one that has already produced a bug.
+        // `Gui::visible_panes_and_overlays_mut` slices on
+        // `pane_count.min(panes.len())`, which is `visible_pane_count()` and
+        // therefore exactly the slice `panes()` yielded, so the walked set is
+        // identical.
+        let (panes, overlays) = self.gui.visible_panes_and_overlays_mut();
         let mut asks = Vec::new();
-        for (pane_idx, pane) in panes.iter_mut().take(visible).enumerate() {
+        for (pane_idx, pane) in panes.iter_mut().enumerate() {
             let Some(current) = arrived.get(pane.site()) else {
                 continue;
             };
@@ -1304,14 +1312,16 @@ impl super::App {
         let render_limit = self.render.concurrent_renders();
         // The panes the layout is showing, from the same slice `render_panes`
         // draws. A record outlives its pane going hidden, and a raster for a
-        // pane nobody paints is the speculation this path refuses.
-        let visible = self.gui.panes().len();
-        let (panes, overlays) = self.gui.panes_and_overlays_mut();
+        // pane nobody paints is the speculation this path refuses — so the
+        // slice itself is what is asked for, rather than the wider door plus a
+        // hand-spelled `pane_idx >= visible` guard beside it. See
+        // `arrived_volume_asks` for why that spelling is a shed and not a
+        // rename.
+        let (panes, overlays) = self.gui.visible_panes_and_overlays_mut();
 
         for (pane_idx, id, recorded) in holders {
-            if pane_idx >= visible {
-                continue;
-            }
+            // Past the visible slice is `None` here, which is the refusal the
+            // separate count guard used to make one line earlier.
             let Some(pane) = panes.get_mut(pane_idx) else {
                 continue;
             };
@@ -1337,7 +1347,8 @@ impl super::App {
             // The only caller is the `SourceEvent::Data` drain, and
             // `Gui::deliver_overlay_fetch` goes through `across_panes`, which
             // hydrates every pane up to `pane_layout.pane_count` — the same
-            // set `visible` above admits — one statement before this runs. A
+            // set the visible slice above admits — one statement before this
+            // runs. A
             // hydrate here was written, tampered, and came back green because
             // of that; it is gone rather than kept as a line no test can fail.
             // If a second caller ever reaches this function from somewhere the
@@ -2068,27 +2079,44 @@ impl super::App {
         append_polled_frame_to_loops(panes, overlays, site, timestamp, allocation, &budgets);
     }
 
-    /// Re-initialize radar loops on all panes that have an active loop.
+    /// **Re-arm every pane that is animating anything**, over the window its
+    /// own transport asks for — what jump-to-live and a scan arrival do to
+    /// slide a running loop forward.
     ///
     /// The visible slice, walked once rather than indexed: `panes()` yields
     /// `..min(pane_count, panes.len())` and the index loop this replaced
     /// visited `0..pane_count` and found `None` past the end, so the set is
-    /// identical — WI-0's proof, applied again. One reach where there were
-    /// two, which is the headroom the refill dispatch above spends.
+    /// identical — WI-0's proof, applied again.
+    ///
+    /// **Wrong twice before WO-T3.9, and the two halves are independent.**
+    ///
+    /// *Which panes.* The filter was `time_state(&known::RADAR).is_active()`,
+    /// so a pane whose transport is GMGSI, MRMS or the model has an inactive
+    /// radar slot and was skipped **entirely**: its window never slid forward,
+    /// on either caller. `handle_enable_loop` re-arms every frame-series layer
+    /// the pane carries, so the question this filter is really asking is
+    /// whether the pane is animating *anything*.
+    ///
+    /// *How wide.* The width came from `LayerTimeState::span_secs`, which is
+    /// the width a listing was **recorded** as having been asked over — the
+    /// figure `armed_start` may have widened past the lookback, and one that
+    /// therefore grows every time it is fed back in here. What
+    /// `handle_enable_loop` is fed everywhere else is
+    /// `Gui::loop_span_secs_for`, the Lookback setting raised to the
+    /// transport's own floor, and `PaneState::loop_span_secs` is that same
+    /// derivation asked of the pane the registry is already borrowed beside.
+    /// The two agree for radar, whose `min_loop_span_secs()` is 0 and whose
+    /// residency widens nothing, which is why the defect could not show there.
     pub(super) fn reinit_active_loops(&mut self) {
-        let to_reinit: Vec<(usize, u64)> = self
-            .gui
-            .panes()
+        // One reach for the pane list and the registry both — the span below
+        // is the transport layer's own declaration, read off the registry by
+        // id rather than re-spelled here.
+        let (panes, overlays) = self.gui.panes_and_overlays_mut();
+        let to_reinit: Vec<(usize, u64)> = panes
             .iter()
             .enumerate()
-            // **Radar-addressed, named — and, like the site switch above,
-            // that is WO-T3.9's bug rather than a keep.** A pane whose
-            // transport is GMGSI, MRMS or the model has an inactive radar slot
-            // and is skipped here entirely, so jump-to-live and scan arrivals
-            // never slide its window forward. WO-T3.7 re-spelled the read and
-            // changed nothing about which panes it selects.
-            .filter(|(_, pane)| pane.time_state(&known::RADAR).is_active())
-            .map(|(pane_idx, pane)| (pane_idx, pane.time_state(&known::RADAR).span_secs))
+            .filter(|(_, pane)| pane.animating_layers().next().is_some())
+            .map(|(pane_idx, pane)| (pane_idx, pane.loop_span_secs(overlays)))
             .collect();
         for (pane_idx, lookback_secs) in to_reinit {
             self.handle_enable_loop(pane_idx, lookback_secs);
@@ -3182,3 +3210,9 @@ mod overlay_arrival_tests;
 #[cfg(test)]
 #[path = "app_fetch/satellite_loop_append_tests.rs"]
 mod satellite_loop_append_tests;
+
+/// **WO-T3.9** — which panes a re-arm selects, and how wide it makes their
+/// windows.
+#[path = "app_fetch/reinit_active_tests.rs"]
+#[cfg(test)]
+mod reinit_active_tests;
