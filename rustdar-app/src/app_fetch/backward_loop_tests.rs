@@ -187,6 +187,19 @@ impl OverlayHandler for PastLayer {
         }
     }
 
+    /// **The frame-series answer, through the one `<=` in the workspace.** A
+    /// double that inherited `Residency::none()` here would make every
+    /// residency-routed decision below read as "the layer said nothing", which
+    /// is the one answer that cannot distinguish a working route from a
+    /// deleted one.
+    fn residency_for(
+        &self,
+        pane: &PaneRef<'_>,
+        stops: &[NaiveDateTime],
+    ) -> rustdar_source::time::Residency {
+        rustdar_source::time::frame_residency(self, pane, stops)
+    }
+
     /// This layer comes in stamped frames, and answers every one of
     /// [`FrameSource`]'s methods below.
     fn frames(&self) -> Option<&dyn FrameSource> {
@@ -621,5 +634,107 @@ fn disabling_a_loop_stops_every_timeline_the_pane_armed() {
         pane.animating_layers()
             .map(|s| s.id.clone())
             .collect::<Vec<_>>(),
+    );
+}
+
+// ── 4. The armed window is the layer's own ────────────────────────────────
+
+/// **The acceptance.** The window a loop is armed over reaches back to the
+/// frame its own first stop is drawn from, which the lookback alone cannot
+/// name.
+///
+/// A layer whose steps are coarser than where the lookback lands has no frame
+/// stamped inside the window's leading partial step — the picture that step is
+/// drawn from is the granule *before* the window. A listing clipped at the
+/// lookback's edge names none, and the first step of the sweep is blank. The
+/// layer is the only thing that knows this, and `residency_for` is where it
+/// says so.
+#[test]
+fn an_armed_window_is_the_one_the_layer_asked_for() {
+    let now = chrono::Utc::now().naive_utc();
+    // One granule an hour before the lookback's own edge, and one inside the
+    // window. The first is what the window's first stop is drawn from.
+    let behind = now - chrono::Duration::seconds(LOOKBACK as i64) - chrono::Duration::hours(1);
+    let inside = now - chrono::Duration::minutes(10);
+    let (mut app, asked) = app_with_past(vec![behind, inside]);
+    app.gui
+        .pane_mut(0)
+        .expect("the fixture built one pane")
+        .set_transport_layer(past_id());
+
+    app.handle_gui_action(
+        GuiAction::EnableLoop {
+            pane_idx: 0,
+            lookback_secs: LOOKBACK,
+        },
+        None,
+    );
+
+    let listed = asked.lock().expect("no poisoned lock").listed_for.clone();
+    assert_eq!(listed.len(), 1, "one arm, one listing: {listed:?}");
+    let (start, end) = listed[0];
+    assert_eq!(
+        start,
+        behind,
+        "the window must reach the granule its own first stop is drawn from, \
+         and stopped {} short",
+        start - behind,
+    );
+    assert!(
+        end >= inside,
+        "and it still ends where the lookback said, not at the granule",
+    );
+    // The pane records the ask it made, or the listing that lands matches
+    // nothing.
+    assert_eq!(
+        app.gui
+            .pane(0)
+            .expect("one pane")
+            .transport_state()
+            .asked_range,
+        Some((start, end)),
+        "the recorded window and the window asked for are one quantity",
+    );
+}
+
+/// **The floor.** A layer that knows nothing before the lookback's edge is
+/// armed over exactly the lookback, to the second — so "always widen" cannot
+/// pass the acceptance above, and a radar pane arming its first loop is
+/// untouched.
+#[test]
+fn a_layer_with_nothing_behind_the_lookback_is_armed_over_the_lookback() {
+    let now = chrono::Utc::now().naive_utc();
+    // Everything this layer knows sits well inside the window.
+    let listed: Vec<NaiveDateTime> = (1..=3)
+        .map(|i| now - chrono::Duration::minutes(i * 10))
+        .rev()
+        .collect();
+    let (mut app, asked) = app_with_past(listed);
+    app.gui
+        .pane_mut(0)
+        .expect("the fixture built one pane")
+        .set_transport_layer(past_id());
+
+    let before = chrono::Utc::now().naive_utc();
+    app.handle_gui_action(
+        GuiAction::EnableLoop {
+            pane_idx: 0,
+            lookback_secs: LOOKBACK,
+        },
+        None,
+    );
+    let after = chrono::Utc::now().naive_utc();
+
+    let listed_for = asked.lock().expect("no poisoned lock").listed_for.clone();
+    assert_eq!(listed_for.len(), 1, "one arm, one listing: {listed_for:?}");
+    let (start, end) = listed_for[0];
+    assert_eq!(
+        (end - start).num_seconds(),
+        LOOKBACK as i64,
+        "the window is exactly the lookback wide",
+    );
+    assert!(
+        end >= before && end <= after,
+        "and it ends at the wall clock this arm was taken on",
     );
 }
