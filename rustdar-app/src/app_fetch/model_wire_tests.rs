@@ -110,7 +110,8 @@ fn in_flight(app: &mut crate::app::App) -> bool {
         .pane_mut(0)
         .expect("pane 0")
         .overlay_cache_mut(&known::MODEL_DATA)
-        .render_in_flight
+        .renders
+        .holds(rustdar_egui::overlay_cache::RenderSlot::WHOLE)
 }
 
 /// The dispatch posts **one described job** carrying the model input — the grid whole,

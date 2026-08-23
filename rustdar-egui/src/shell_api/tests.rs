@@ -50,6 +50,7 @@ fn every_frame_input_surfaces_and_persists() {
         safe_area_insets: (11.0, 22.0, 33.0, 44.0),
         supports_exit: false,
         loop_frame_budget: 7,
+        concurrent_renders: 5,
         location_settings_available: true,
         location: (rustdar_location::LocationPermission::Denied, false),
         gps: Some((rustdar_location::Fix::from_lat_lon(12.5, -34.25), gps_at)),
@@ -122,6 +123,11 @@ fn every_frame_input_surfaces_and_persists() {
             2,
             "floor_tile_zoom_bias did not survive frame {frame}"
         );
+        assert_eq!(
+            gui.concurrent_renders_for_test(),
+            5,
+            "concurrent_renders did not survive frame {frame}"
+        );
     }
 }
 
@@ -135,6 +141,7 @@ fn a_none_gps_clears_the_fix() {
         safe_area_insets: (0.0, 0.0, 0.0, 0.0),
         supports_exit: true,
         loop_frame_budget: 60,
+        concurrent_renders: 1,
         location_settings_available: false,
         location: (rustdar_location::LocationPermission::Granted, true),
         gps: Some((
@@ -158,6 +165,7 @@ fn a_none_gps_clears_the_fix() {
         safe_area_insets: (0.0, 0.0, 0.0, 0.0),
         supports_exit: true,
         loop_frame_budget: 60,
+        concurrent_renders: 1,
         location_settings_available: false,
         user_heading: None,
         catalogue_pending: false,

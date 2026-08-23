@@ -178,7 +178,8 @@ fn in_flight(app: &mut crate::app::App, id: &LayerId) -> bool {
         .pane_mut(0)
         .expect("pane 0")
         .overlay_cache_mut(id)
-        .render_in_flight
+        .renders
+        .holds(rustdar_egui::overlay_cache::RenderSlot::WHOLE)
 }
 
 #[test]

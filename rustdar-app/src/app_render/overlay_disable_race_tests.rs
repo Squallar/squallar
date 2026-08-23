@@ -51,7 +51,16 @@ fn app_awaiting_a_render(ctx: &egui::Context) -> (crate::app::App, egui::Texture
         radar_meta: None,
         hit_map: None,
     });
-    cache.render_in_flight = true;
+    // **The ticket the `deliver` below answers**, not an anonymous mark: the
+    // arrival accepts a raster only while the cache is still waiting for that
+    // very dispatch, so a fixture whose mark named something else would have
+    // the result dropped for a reason neither test is about.
+    cache
+        .renders
+        .record(rustdar_egui::overlay_cache::RenderTicket::whole(
+            9,
+            bounds(),
+        ));
     (app, id)
 }
 
@@ -95,7 +104,8 @@ fn in_flight(app: &mut crate::app::App) -> bool {
         .pane_mut(0)
         .expect("pane 0")
         .overlay_cache_mut(&KIND)
-        .render_in_flight
+        .renders
+        .holds(rustdar_egui::overlay_cache::RenderSlot::WHOLE)
 }
 
 /// **The race.** A render dispatched before the layer was switched off lands

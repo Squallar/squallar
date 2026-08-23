@@ -1314,9 +1314,9 @@ impl App {
     /// [`Self::process_gui_actions`]; a data arrival reaches it through
     /// [`fetch::App::arrived_overlay_asks`]. Both get the same grouping, the
     /// same dedupe and the same `spawn_overlay_render` — which is what owns
-    /// the `render_in_flight` marks, and is why neither path may call
-    /// `offload_job` on its own: an unmarked dispatch is dispatched again on
-    /// the next frame.
+    /// the in-flight marks, and is why neither path may call `offload_job` on
+    /// its own: an unmarked dispatch is dispatched again on the next frame, and
+    /// its answer is refused as stale when it lands.
     fn dispatch_overlay_renders(
         &mut self,
         overlay_renders: Vec<(usize, LayerId, fetch::OverlayRenderRequest)>,

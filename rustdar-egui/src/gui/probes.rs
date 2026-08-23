@@ -121,6 +121,10 @@ impl Gui {
     pub(crate) fn floor_tile_zoom_bias_for_test(&self) -> u8 {
         self.floor_tile_zoom_bias
     }
+
+    pub(crate) fn concurrent_renders_for_test(&self) -> usize {
+        self.concurrent_renders
+    }
 }
 
 /// What one pass over a control tree drew. A no-op outside tests, like

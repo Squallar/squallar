@@ -156,7 +156,10 @@ pub struct OverlayRenderResponse {
     /// than at delivery.
     ///
     /// `None` is a render that failed, and it must still be sent: this message is
-    /// the only thing that clears the named panes' `render_in_flight` marks.
+    /// the only thing that retires the named panes' in-flight marks. It carries
+    /// the two terms those marks are keyed on — `generation` and `geo_bounds` —
+    /// so a failure retires the dispatch it answers and no other; see
+    /// `rustdar_egui::overlay_cache::RenderTicket`.
     pub image: Option<Arc<egui::ColorImage>>,
     pub geo_bounds: GeoBounds,
     /// Which layer this raster is for, carried back to find each pane's cache.

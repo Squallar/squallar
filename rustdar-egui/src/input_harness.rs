@@ -152,6 +152,7 @@ struct FrameFactsForTest {
     safe_area_insets: (f32, f32, f32, f32),
     supports_exit: bool,
     loop_frame_budget: usize,
+    concurrent_renders: usize,
     location_settings_available: bool,
     location: (rustdar_location::LocationPermission, bool),
     gps: Option<(rustdar_location::Fix, web_time::Instant)>,
@@ -172,6 +173,7 @@ impl Default for FrameFactsForTest {
             // is the identity.
             supports_exit: true,
             loop_frame_budget: 60,
+            concurrent_renders: rustdar_device_profile::constants::MAX_CONCURRENT_RENDERS,
             location_settings_available: false,
             location: (rustdar_location::LocationPermission::default(), false),
             gps: None,
@@ -456,6 +458,7 @@ impl InputHarness {
             safe_area_insets: self.facts.safe_area_insets,
             supports_exit: self.facts.supports_exit,
             loop_frame_budget: self.facts.loop_frame_budget,
+            concurrent_renders: self.facts.concurrent_renders,
             location_settings_available: self.facts.location_settings_available,
             location: self.facts.location,
             gps: self.facts.gps.clone(),

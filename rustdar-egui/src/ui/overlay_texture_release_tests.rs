@@ -26,6 +26,12 @@ const ZOOM: f64 = 7.0;
 /// mismatch.
 const TOKEN: u64 = 4242;
 
+/// A whole-picture dispatch for this fixture's own viewport — what the app
+/// would have recorded when it asked for the raster.
+fn a_ticket() -> crate::overlay_cache::RenderTicket {
+    crate::overlay_cache::RenderTicket::whole(TOKEN, viewport())
+}
+
 /// The viewport the fixture texture was rendered for.
 fn viewport() -> GeoBounds {
     GeoBounds {
@@ -188,7 +194,8 @@ fn the_release_leaves_a_render_already_in_flight_marked() {
     gui.pane_mut(0)
         .expect("pane 0")
         .overlay_cache_mut(&KIND)
-        .render_in_flight = true;
+        .renders
+        .record(a_ticket());
 
     toggle(&mut gui, false);
     toggle(&mut gui, true);
@@ -198,7 +205,8 @@ fn the_release_leaves_a_render_already_in_flight_marked() {
             .expect("pane 0")
             .overlay_cache(&KIND)
             .expect("the cache entry survives; only its pixels go")
-            .render_in_flight,
+            .renders
+            .holds(crate::overlay_cache::RenderSlot::WHOLE),
         "the release cleared the in-flight mark, so this off/on pair has opened \
          the dispatch gate on a render that is still coming: the pane will \
          rasterize and upload the same content twice",

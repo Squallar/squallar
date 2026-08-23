@@ -79,7 +79,7 @@ fn a_texture(ctx: &egui::Context) -> egui::TextureHandle {
 /// dispatch what it asks for, draw, then move this frame's upload bands.
 ///
 /// Everything here is counted, never timed: the clock is the frame index.
-struct PanRig {
+pub(super) struct PanRig {
     cache: OverlayTextureCache,
     texture: egui::TextureHandle,
     /// Degrees of longitude the viewport moves per frame. One viewport is one
@@ -89,23 +89,49 @@ struct PanRig {
     raster_frames: u32,
     /// Frames a banded upload takes: 2 with a staging ring, 3 without.
     upload_frames: u32,
-    /// The dispatch the app would have marked `render_in_flight` for, and the
-    /// viewport it was rasterised for.
-    in_flight: Option<(u32, GeoBounds)>,
+    /// Every raster on its way back: the frame it lands on, and the viewport it
+    /// was rasterised for. The *mark* itself lives in the cache, exactly as the
+    /// app's does; this is the wire the app cannot see.
+    ///
+    /// **A list and not one slot**, because a wire that can only hold one
+    /// raster cannot express the thing the gate exists to refuse. With a single
+    /// slot, a second admitted dispatch silently overwrites the first and the
+    /// rig reads identically whether or not
+    /// [`RendersInFlight::admits`] keeps its per-destination conjunct — which
+    /// is a check that cannot fail.
+    in_flight: Vec<(u32, GeoBounds)>,
+    /// The device budget this rig admits dispatches against — what the draw
+    /// loop passes [`RendersInFlight::admits`]. A whole-picture layer has one
+    /// destination, so every value of this must produce the same run; see
+    /// `concurrency_tests`.
+    limit: usize,
     bands_left: u32,
     pub dispatches: u32,
     pub promotions: u32,
     pub superseded: u32,
+    /// Rasters that came back for a dispatch the cache had already moved past,
+    /// and were dropped rather than held — the stale-result policy firing.
+    pub discarded: u32,
     /// Frames on which the pane had nothing covering the viewport to draw.
     pub dry: u32,
     pub counted: u32,
 }
 
 /// Frames run before anything is counted, so a cold cache is not a dry read.
-const WARMUP: u32 = 20;
+pub(super) const WARMUP: u32 = 20;
 
 impl PanRig {
     fn new(ctx: &egui::Context, step: f64, upload_frames: u32) -> Self {
+        Self::at_limit(ctx, step, upload_frames, 1)
+    }
+
+    /// [`Self::new`] with the device's `concurrent_renders` as a parameter.
+    pub(super) fn at_limit(
+        ctx: &egui::Context,
+        step: f64,
+        upload_frames: u32,
+        limit: usize,
+    ) -> Self {
         let texture = a_texture(ctx);
         let mut cache = OverlayTextureCache::new();
         cache.show(data_for(&texture, &viewport_at(0.0)));
@@ -115,17 +141,29 @@ impl PanRig {
             step,
             raster_frames: 1,
             upload_frames,
-            in_flight: None,
+            in_flight: Vec::new(),
+            limit,
             bands_left: 0,
             dispatches: 0,
             promotions: 0,
             superseded: 0,
+            discarded: 0,
             dry: 0,
             counted: 0,
         }
     }
 
-    fn run(&mut self, frames: u32) {
+    /// Frames the rasterizer itself takes, before the upload starts. At one —
+    /// the default, and what the published sweep was run at — a raster is never
+    /// still outstanding when the gate is next asked, so the admission bound is
+    /// never consulted with anything in flight. Two is the shallowest pipeline
+    /// where it is.
+    pub(super) fn with_raster_frames(mut self, frames: u32) -> Self {
+        self.raster_frames = frames;
+        self
+    }
+
+    pub(super) fn run(&mut self, frames: u32) {
         for f in 0..frames {
             let vp = viewport_at(f as f64 * self.step);
 
@@ -138,9 +176,29 @@ impl PanRig {
                 }
             }
 
-            if let Some((arrives, dispatched_for)) = self.in_flight
-                && f >= arrives
-            {
+            let mut landed: Vec<GeoBounds> = Vec::new();
+            self.in_flight.retain(|(arrives, dispatched_for)| {
+                if f >= *arrives {
+                    landed.push(*dispatched_for);
+                    false
+                } else {
+                    true
+                }
+            });
+            for dispatched_for in landed {
+                // The app's own arrival test: a raster is filed only while the
+                // cache is still waiting for that very dispatch. A second
+                // dispatch for the same destination replaced this one's ticket,
+                // so this raster is dropped before it can throw away an upload.
+                if !self.cache.renders.retire(&RenderTicket::whole(
+                    TOKEN,
+                    plan().coverage(&dispatched_for),
+                )) {
+                    if f >= WARMUP {
+                        self.discarded += 1;
+                    }
+                    continue;
+                }
                 let data = data_for(&self.texture, &dispatched_for);
                 if self.cache.current().is_none() {
                     self.cache.show(data);
@@ -151,7 +209,6 @@ impl PanRig {
                     self.cache.hold(data, None);
                     self.bands_left = self.upload_frames;
                 }
-                self.in_flight = None;
             }
 
             // The gate is asked every frame the overlay is live, exactly as
@@ -159,8 +216,11 @@ impl PanRig {
             // in-flight mark.
             let now = T0 + f as f64 / 60.0;
             let needs = self.cache.needs_rerender(TOKEN, ZOOM, now, &vp, &plan());
-            if needs && self.in_flight.is_none() {
-                self.in_flight = Some((f + self.raster_frames, vp));
+            if needs && self.cache.renders.admits(RenderSlot::WHOLE, self.limit) {
+                self.cache
+                    .renders
+                    .record(RenderTicket::whole(TOKEN, plan().coverage(&vp)));
+                self.in_flight.push((f + self.raster_frames, vp));
                 if f >= WARMUP {
                     self.dispatches += 1;
                 }

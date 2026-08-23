@@ -46,7 +46,8 @@ fn in_flight(app: &mut crate::app::App) -> bool {
         .pane_mut(0)
         .expect("pane 0")
         .overlay_cache_mut(&known::RADAR_SITES)
-        .render_in_flight
+        .renders
+        .holds(rustdar_egui::overlay_cache::RenderSlot::WHOLE)
 }
 
 /// The dispatch posts a described overlay job to the installed sink — it does not run a

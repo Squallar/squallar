@@ -38,8 +38,9 @@ pub const OVERDRAW_FRACTION: f32 = 0.25;
 /// uploads. Both directions cost something. Above a half the cover is too
 /// short: each texture is dispatched late and the viewport outruns it. Below a
 /// half the trigger stops being the binding constraint — dispatch is gated by
-/// the previous raster's arrival ([`OverlayTextureCache::render_in_flight`]
-/// admits one at a time), and once the trigger is standing at every promotion
+/// the previous raster's arrival ([`RendersInFlight`] admits one raster per
+/// destination, and a whole-picture layer has one destination), and once the
+/// trigger is standing at every promotion
 /// the next dispatch supersedes a hold and the brake at the end of
 /// [`OverlayTextureCache::needs_rerender_with_policy`] suppresses the one after
 /// it — so the extra rebuilds buy no cover and eventually cost some.
@@ -223,6 +224,210 @@ pub fn plan_overlay_texture(
     }
 }
 
+// ── How many rasters may be crossing at once ─────────────────────────────
+
+/// Which of a layer's pictures a raster is on its way to, as an index the
+/// layer assigns to its own destinations.
+///
+/// **Concurrency is over destinations, and never depth within one.** A
+/// destination is a [`held`](OverlayTextureCache::hold) slot, and
+/// [`OverlayTextureCache::hold`] *replaces* rather than queues: two rasters in
+/// flight for the same destination cannot both reach the screen, because the
+/// second's arrival throws away the first's upload before its last band lands.
+/// Past roughly 2.3x the sustainable pan that closes into a loop with no exit —
+/// the freeze
+/// `coverage_dispatch_tests::a_fling_the_pipeline_cannot_follow_still_puts_pictures_on_screen`
+/// pins, where the unbraked rule spent 300 full-size rasters, threw away all
+/// 300 mid-upload and promoted none. Admission therefore allows **one raster
+/// per destination**, and the device budget bounds how many *destinations* may
+/// be outstanding at once.
+///
+/// Today a texture layer draws one picture and so has exactly one destination.
+/// That is not a limitation this type imposes, and it is why raising the budget
+/// changes nothing about what this crate dispatches: a one-destination cache
+/// admits one raster at every limit. A tile grid has one destination per tile,
+/// and that is what the budget is here to bound.
+///
+/// **An index and not an enum**, because the destinations a layer has are the
+/// layer's own vocabulary — a grid's are its cells — and because a type that
+/// can only name one destination makes the bound below untestable: nothing
+/// could ever be refused by it, which is a check that cannot fail.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct RenderSlot(u32);
+
+impl RenderSlot {
+    /// The layer's whole picture — the only destination a texture layer names
+    /// today, and the identity a one-picture layer keeps forever.
+    pub const WHOLE: Self = Self(0);
+
+    /// The `n`th of a layer's destinations. `nth(0)` is [`Self::WHOLE`].
+    pub const fn nth(n: u32) -> Self {
+        Self(n)
+    }
+
+    /// The index the layer assigned.
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+}
+
+/// The identity of one dispatched raster: where it is going, and what it was
+/// asked for.
+///
+/// **Every term is already on the wire.** `generation` is the render request's
+/// `data_generation` and `bounds` is the expanded ground it was asked to cover;
+/// the response echoes both, so an arrival can name the dispatch it answers
+/// without a second channel — and a grouped dispatch, which is one request sent
+/// to several panes, gives every one of those panes the same ticket by
+/// construction.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct RenderTicket {
+    /// Which of this layer's pictures the raster is for.
+    pub slot: RenderSlot,
+    /// The cache token the raster was asked at.
+    pub generation: u64,
+    /// The ground the raster was asked to cover — the *expanded* bounds the
+    /// response carries back, not the viewport they were expanded from.
+    pub bounds: GeoBounds,
+}
+
+impl RenderTicket {
+    /// The ticket for a dispatch of the layer's whole picture — the only
+    /// destination a texture layer has today. See [`RenderSlot`].
+    pub fn whole(generation: u64, bounds: GeoBounds) -> Self {
+        Self::for_slot(RenderSlot::WHOLE, generation, bounds)
+    }
+
+    /// The ticket for a dispatch of one named destination.
+    pub fn for_slot(slot: RenderSlot, generation: u64, bounds: GeoBounds) -> Self {
+        Self {
+            slot,
+            generation,
+            bounds,
+        }
+    }
+}
+
+/// The rasters one [`OverlayTextureCache`] has outstanding.
+///
+/// This is the bounded form of what used to be a single `bool`. The `bool`
+/// admitted exactly one dispatch per pane and layer whatever the device could
+/// afford; this admits one per destination, up to the device's
+/// `Budgets::concurrent_renders` — the same axis every other background render
+/// on this device is already spent against.
+///
+/// # What it costs in memory
+///
+/// A raster in flight is a raster's bytes in flight, so the transient cost of
+/// one cache is `outstanding x plan bytes`, and [`Self::len`] is the counted
+/// quantity that bounds it. Nothing here measures bytes — there is no
+/// producer-side byte counter anywhere in the tree — so this is arithmetic over
+/// a quantity tests do check, not a measured figure.
+///
+/// **For every layer the tree draws today the bound is one raster, at every
+/// budget**, because a layer that draws one picture has one destination and
+/// [`Self::admits`] refuses a second for it: `concurrency_tests::
+/// one_destination_admits_one_raster_at_every_budget` is that property. So
+/// raising `concurrent_renders` cannot raise what any shipped layer holds. At
+/// the 1920x1080 desktop pane's 2880x1620 plan that is 18.66 MB per pane and
+/// layer with a raster out, exactly as before this type existed.
+///
+/// **A layer with more than one destination is bounded by the budget**, and the
+/// aggregate is `panes x texture layers x budget x plan bytes` — which the
+/// budget alone does not bound, and which a grid must price against its own
+/// cell rather than against a whole picture: a 512-pixel RGBA cell is 1.05 MB,
+/// an eighteenth of the whole-picture plan above, so six of them outstanding
+/// cost a third of one picture.
+///
+/// The loop pool is a separate account and this does not touch it:
+/// [`crate::pane::LoopFrameImage::Overlay`] holds a whole
+/// [`OverlayTextureData`] per frame and is bounded by the pool's byte share,
+/// not by anything here.
+#[derive(Clone, Debug, Default)]
+pub struct RendersInFlight {
+    /// One entry per destination with a raster out — never two for the same
+    /// [`RenderSlot`]. A `Vec` and not a map because the bound is
+    /// `MAX_CONCURRENT_RENDERS`, which is 1, 3 or 6: scanning six tickets is
+    /// cheaper than hashing one.
+    out: Vec<RenderTicket>,
+}
+
+impl RendersInFlight {
+    /// Whether this cache is waiting for anything at all.
+    pub fn is_empty(&self) -> bool {
+        self.out.is_empty()
+    }
+
+    /// How many destinations have a raster out.
+    pub fn len(&self) -> usize {
+        self.out.len()
+    }
+
+    /// Whether `slot` already has a raster on its way.
+    pub fn holds(&self, slot: RenderSlot) -> bool {
+        self.out.iter().any(|t| t.slot == slot)
+    }
+
+    /// Whether a raster may be dispatched for `slot` with at most `limit`
+    /// destinations outstanding.
+    ///
+    /// Both conjuncts matter and they refuse different things. The first is the
+    /// livelock guard — see [`RenderSlot`] — and holds at every limit. The
+    /// second is the device budget.
+    pub fn admits(&self, slot: RenderSlot, limit: usize) -> bool {
+        !self.holds(slot) && self.out.len() < limit
+    }
+
+    /// Mark a raster as dispatched for `ticket.slot`.
+    ///
+    /// **Insert-or-replace, not push.** The dispatch paths mark
+    /// unconditionally, because an unmarked dispatch is dispatched again on the
+    /// next frame; a caller that marks for a slot already carrying one
+    /// therefore ends up with the *newer* ticket recorded, which is what makes
+    /// the older raster's arrival read as stale at [`Self::retire`] and be
+    /// discarded rather than held. So this can never grow the outstanding set
+    /// past one entry per destination, however it is called.
+    pub fn record(&mut self, ticket: RenderTicket) {
+        match self.out.iter_mut().find(|t| t.slot == ticket.slot) {
+            Some(slot) => *slot = ticket,
+            None => self.out.push(ticket),
+        }
+    }
+
+    /// Retire the dispatch `ticket` names, and say whether this cache was still
+    /// waiting for **that** raster.
+    ///
+    /// `false` means the result is stale and the caller must discard it rather
+    /// than hold it: either the mark was abandoned while the raster flew — the
+    /// pane closed, the layer was switched off, the renderer was rebuilt — or
+    /// this destination has since been dispatched for a viewport the raster
+    /// does not answer. A stale arrival leaves the newer ticket alone: it is a
+    /// live dispatch, and retiring it here would let the destination be
+    /// dispatched for twice over.
+    ///
+    /// This is the whole stale-result policy: **the cache accepts a raster only
+    /// while it is still the one the cache asked for.**
+    pub fn retire(&mut self, ticket: &RenderTicket) -> bool {
+        let Some(at) = self.out.iter().position(|t| t.slot == ticket.slot) else {
+            return false;
+        };
+        if self.out[at] != *ticket {
+            return false;
+        }
+        self.out.remove(at);
+        true
+    }
+
+    /// Forget every outstanding dispatch, whatever it was asked for.
+    ///
+    /// For the moments where the answer cannot arrive at all: the pane moved to
+    /// another index, or the egui context that would hold the pixels is gone.
+    /// Whatever is still flying reads as stale at [`Self::retire`].
+    pub fn abandon_all(&mut self) {
+        self.out.clear();
+    }
+}
+
 // ── Texture cache ────────────────────────────────────────────────────────
 
 /// Radar-specific metadata stored alongside the overlay texture.
@@ -294,7 +499,11 @@ pub struct OverlayTextureCache {
     /// [`Self::needs_rerender_with_policy`], which is the only thing that reads
     /// it and the only dispatch it brakes.
     hold_superseded: bool,
-    pub render_in_flight: bool,
+    /// The rasters this pane has asked for and not yet been answered, bounded
+    /// by the device's `Budgets::concurrent_renders`. Replaced a `bool` that
+    /// admitted exactly one dispatch per pane and layer whatever the device
+    /// could afford; see [`RendersInFlight`] and [`RenderSlot`].
+    pub renders: RendersInFlight,
     /// The zoom [`Self::needs_rerender`] was asked about last time, which is
     /// how it notices the zoom moving and re-stamps [`Self::zoom_still_since`].
     last_seen_zoom: Option<f64>,
@@ -316,7 +525,7 @@ impl OverlayTextureCache {
             current: None,
             held: None,
             hold_superseded: false,
-            render_in_flight: false,
+            renders: RendersInFlight::default(),
             last_seen_zoom: None,
             zoom_still_since: f64::NEG_INFINITY,
         }
@@ -760,6 +969,12 @@ mod coverage_dispatch_tests;
 
 /// The deadband on the coverage trigger: a pan too small to move a texel must
 /// not re-rasterise the overlay, and must not be able to stall one either.
+/// How many rasters may be crossing at once: what the bound admits, what it
+/// refuses, and what a result that arrives for a dispatch the cache has moved
+/// past is worth.
+#[cfg(test)]
+mod concurrency_tests;
+
 #[cfg(test)]
 mod deadband_tests;
 
