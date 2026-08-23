@@ -849,6 +849,11 @@ impl OverlayHandler for GlmHandler {
         let depicted = crate::glm::fetch::DepictedWindow {
             as_of: ctx.as_of,
             span_secs: ctx.depicted_span_secs,
+            // And *where* inside that span the pane can stop. A loop whose
+            // frames are further apart than this layer's window depicts a
+            // handful of slices of a wide extent, and the span alone cannot
+            // say which — see `DepictedWindow::frames`.
+            frames: ctx.depicted_frames.clone(),
         };
         vec![FetchTask {
             kind: known::LIGHTNING,

@@ -766,6 +766,7 @@ mod tests {
             viewport: None,
             as_of: chrono::Utc::now().naive_utc(),
             depicted_span_secs: None,
+            depicted_frames: Vec::new(),
         }
     }
 

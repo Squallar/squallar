@@ -1094,6 +1094,7 @@ mod tests {
             viewport: None,
             as_of: chrono::Utc::now().naive_utc(),
             depicted_span_secs: None,
+            depicted_frames: Vec::new(),
         };
         assert_eq!(
             handler.create_fetch_tasks(&ctx, &PaneRef::bare(0)).len(),
@@ -1854,6 +1855,7 @@ mod tests {
             viewport: None,
             as_of: chrono::Utc::now().naive_utc(),
             depicted_span_secs: None,
+            depicted_frames: Vec::new(),
         };
         for products in 1..=OutlookDay::Day1.products().len() {
             let mut h = SpcOutlookHandler::new();
