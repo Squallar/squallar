@@ -20,12 +20,10 @@
 //! otherwise running perfectly, for the whole playback. Not blank, not wrong,
 //! never changing.
 //!
-//! Measured on this fixture before the fix: **1 of 11 distinct pictures** —
-//! and the one was `None`, the satellite layer holding no loop frames at all
-//! while the mosaic transport swept all eleven of its own. The denominator is
-//! the transport's own frame count and moves by one with the minute the run
-//! starts on (the last half-hour stamp falls past `now` for part of every
-//! hour), which is why every message below prints it rather than naming it.
+//! Measured on this fixture: **0 of 13 distinct pictures** — the satellite
+//! layer holding no loop frames at all while the mosaic transport swept all
+//! thirteen of its own. The denominator is the transport's own frame count,
+//! which is why every message below prints it rather than naming it.
 //!
 //! # What is driven and what is arranged
 //!
@@ -181,20 +179,28 @@ fn a_render_request() -> crate::app::fetch::OverlayRenderRequest {
     }
 }
 
-/// The whole hours inside `range` — the instants a real GMGSI listing of that
-/// window would have found, one blended mosaic per hour.
+/// The whole hour `at` sits in.
+fn top_of_hour(at: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
+    at.with_minute(0)
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))
+        .expect("a whole hour exists")
+}
+
+/// The hours a real GMGSI listing of `range` would have found, one blended
+/// mosaic per hour — **`hours_in_range`'s own shape, both edges rounding
+/// down.**
+///
+/// The hour a window *starts inside* is in the list: its granule depicts that
+/// hour and is the only picture the window's first minutes can be drawn from.
+/// Copying the leading round-up this fixture used to carry is what made it
+/// blind to the blank leading frame — the satellite's oldest granule landed
+/// after the transport's oldest stamp and nothing painted there.
 fn hours_inside(
     range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
 ) -> Vec<chrono::NaiveDateTime> {
     let (lo, hi) = range;
-    let mut at = lo
-        .with_minute(0)
-        .and_then(|t| t.with_second(0))
-        .and_then(|t| t.with_nanosecond(0))
-        .expect("a whole hour exists");
-    if at < lo {
-        at += chrono::Duration::hours(1);
-    }
+    let mut at = top_of_hour(lo);
     let mut hours = Vec::new();
     while at <= hi {
         hours.push(at);
@@ -203,14 +209,29 @@ fn hours_inside(
     hours
 }
 
-/// **The instants the transport's own listing names inside `range`**: half
-/// past each of the satellite's hours, and never on one.
+/// **The instants the transport's own listing names inside `range`**: an
+/// hourly rail anchored on the **window's own start**, and never on a whole
+/// hour.
 ///
-/// Off the hour on purpose. Each mosaic frame therefore settles the satellite
-/// playhead onto exactly one hour — `qualifying_frame_at` takes the newest
-/// frame at or before the clock — and a full sweep of the transport visits a
-/// different satellite hour every tick. Equal cadences would make the two
-/// timelines the same list and would prove nothing about the settling.
+/// Two properties, and the fixture is blind to a different defect without
+/// each.
+///
+/// **It starts where the window starts.** Real MRMS lists 2-minute objects
+/// from `range.0` (`rustdar_overlays::render::handlers::mrms`), so the pane's
+/// clock stops on instants inside the window's first partial hour — instants
+/// *earlier* than any whole hour in it. Those stops are where the satellite
+/// has to carry an earlier granule forward, and they are the ones the user saw
+/// blank. A rail that began at the first whole hour instead could never reach
+/// them, which is what the "half past each of the satellite's hours" rail did.
+/// The two-minute nudge only matters in the one minute of every hour where the
+/// wall clock would put `range.0` exactly on the hour; every other start is
+/// already inside one.
+///
+/// **It is off the satellite's grid.** Each mosaic stamp therefore settles the
+/// satellite playhead onto exactly one hour — `qualifying_frame_at` takes the
+/// newest frame at or before the clock — and a full sweep visits a different
+/// satellite hour every tick. Equal cadences *on the same grid* would make the
+/// two timelines one list and would prove nothing about the settling.
 ///
 /// **Derived from the window it was asked for, like the satellite's.** A
 /// bucket answers the range it was given; answering a *later* ask with an
@@ -220,11 +241,15 @@ fn hours_inside(
 fn mosaic_stamps(
     range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
 ) -> Vec<chrono::NaiveDateTime> {
-    hours_inside(range)
-        .into_iter()
-        .map(|h| h + chrono::Duration::minutes(30))
-        .filter(|t| *t <= range.1)
-        .collect()
+    let mut at = range
+        .0
+        .max(top_of_hour(range.0) + chrono::Duration::minutes(2));
+    let mut stamps = Vec::new();
+    while at <= range.1 {
+        stamps.push(at);
+        at += chrono::Duration::hours(1);
+    }
+    stamps
 }
 
 /// Which step of the fixture's own timeline `at` is, counted in whole hours
@@ -448,51 +473,45 @@ fn a_pane_drawing_satellite_under_a_mosaic() -> crate::app::App {
     app
 }
 
-/// **The acceptance.** Enable a twelve-hour loop on a pane drawing the
-/// satellite layer under another layer's transport, fill it through the real
-/// supply, then play it and read — every tick — what
-/// `overlay_texture_on_screen` hands the painter for the satellite layer and
-/// which raster that handle is.
+/// **Everything one full sweep of that pane put on the glass**, tick by tick.
 ///
-/// Three things, and the first is the user's sentence:
+/// Both acceptances below are questions about the same run. Driving it twice
+/// would pay for a second six-hundred-pump fill through the real renderer to
+/// ask a second question about a picture already taken.
+struct Sweep {
+    /// The window the pane's clock was armed over.
+    transport_range: (chrono::NaiveDateTime, chrono::NaiveDateTime),
+    /// The window the satellite layer was listed over — `None` if it was never
+    /// armed at all, which is the shape of the defect `5ef52be5` fixed.
+    satellite_range: Option<(chrono::NaiveDateTime, chrono::NaiveDateTime)>,
+    /// **The transport's own frame list**: the instants the pane's clock stops
+    /// on, oldest first. Its length is the sweep.
+    rail: Vec<chrono::NaiveDateTime>,
+    /// How many frames the satellite layer's own timeline holds.
+    satellite_frames: usize,
+    /// How many distinct satellite instants the production renderer produced a
+    /// raster for.
+    rasters: usize,
+    /// The satellite picture on the glass at each step, hashed — `None` where
+    /// nothing painted at all.
+    drawn: Vec<Option<u64>>,
+    /// The instant the satellite playhead claimed at each step.
+    instants: Vec<Option<chrono::NaiveDateTime>>,
+    /// The transport's own handle at each step, which is the control.
+    mosaic_handles: Vec<Option<egui::TextureId>>,
+    /// How many satellite granules were asked for on the wire across the run.
+    satellite_gets: usize,
+}
+
+/// Enable a twelve-hour loop on a pane drawing the satellite layer under
+/// another layer's transport, fill it through the real supply, then play it
+/// and read — every tick — what `overlay_texture_on_screen` hands the painter
+/// for the satellite layer and which raster that handle is.
 ///
-/// 1. **every step of the sweep draws a different satellite picture**, counted
-///    as distinct rasters out of the production renderer rather than as
-///    distinct handles;
-/// 2. the depicted instant really moves — the satellite playhead visits a
-///    different stamp on every tick and covers the whole list;
-/// 3. the transport is still doing its own job, so a green here is not a pane
-///    where nothing is animating at all.
-///
-/// **Floor A — the ask must not become a storm.** Arming a second layer puts a
-/// second set of 7.5 MB GETs on the wire. Every satellite granule may be asked
-/// for a small number of times across the whole run, not once per frame of the
-/// pump; the in-flight mark in `refetch_owed_loop_frames` is what holds it,
-/// and this counts the asks off the wire to say so.
-///
-/// **Floor B — one window for the whole pane**, so a layer cannot hold frames
-/// at instants the pane's clock never names. **What it can fail on here is
-/// narrow, and saying so is the point**: both layers on this fixture reach
-/// backward from the same wall clock, so a layer left to derive its own window
-/// would derive the same one. It reds on the defect (an unarmed satellite
-/// layer has no window at all) and it records the contract; the *contract*
-/// itself is floored where it can actually be broken —
-/// `a_layer_handed_a_window_is_listed_over_that_window` in `loop_pane_tests`,
-/// against radar, whose own arm ends at the pane's scan rather than at now.
-///
-/// **Observed red at HEAD behaviour** (`no_second_layer`: drop the
-/// `layers.extend(...)` in `begin_loop_for_pane` so only the transport is
-/// armed) — **1 of 11 distinct pictures**, and the one is `None`: the
-/// satellite layer holds no frames and its playhead names no instant for the
-/// whole sweep.
-///
-/// **Observed red under a partial under-reach** (`half_a_window`: hand every
-/// layer after the transport `window.map(|(s, e)| (s + (e - s) / 2, e))`, so
-/// the satellite is armed but over the newer half of the pane's window) —
-/// **6 of 11 distinct pictures**: five real rasters over the half it holds,
-/// nothing over the half it does not.
-#[test]
-fn every_step_of_a_loop_draws_its_own_satellite_picture() {
+/// Everything asserted here is a **premise**: a fixture that fails one of them
+/// has no sweep to read, so a red below would be about the fixture rather than
+/// about the defect. The claims themselves are in the two tests.
+fn sweep_a_satellite_loop() -> Sweep {
     let ctx = egui::Context::default();
     let mut app = a_pane_drawing_satellite_under_a_mosaic();
 
@@ -544,8 +563,7 @@ fn every_step_of_a_loop_draws_its_own_satellite_picture() {
         hours.len(),
     );
 
-    // Floor B's reading, taken at the moment both timelines were armed. It is
-    // asserted at the end so the headline count is what a red reports first.
+    // Floor B's reading, taken at the moment both timelines were armed.
     let satellite_range = app
         .gui
         .pane(0)
@@ -621,13 +639,18 @@ fn every_step_of_a_loop_draws_its_own_satellite_picture() {
         );
     }
 
-    let (sweep, satellite_frames) = {
+    let (rail, satellite_frames) = {
         let pane = app.gui.pane(0).expect("pane 0");
         (
-            pane.time_state(&known::MRMS).frames.len(),
+            pane.time_state(&known::MRMS)
+                .frames
+                .iter()
+                .map(|f| f.timestamp)
+                .collect::<Vec<_>>(),
             pane.time_state(&known::GMGSI).frames.len(),
         )
     };
+    let sweep = rail.len();
     assert!(
         transport_filled,
         "the fixture's own transport never finished loading: it holds {sweep} \
@@ -688,7 +711,85 @@ fn every_step_of_a_loop_draws_its_own_satellite_picture() {
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
 
-    let mut distinct: Vec<Option<u64>> = drawn.clone();
+    Sweep {
+        transport_range,
+        satellite_range,
+        rail,
+        satellite_frames,
+        rasters: rasters.len(),
+        drawn,
+        instants,
+        mosaic_handles,
+        satellite_gets: wire.satellite_gets.len(),
+    }
+}
+
+/// **The acceptance for `5ef52be5`.** Every step of the sweep draws a
+/// different satellite picture.
+///
+/// Three things, and the first is the user's sentence:
+///
+/// 1. **every step of the sweep draws a different satellite picture**, counted
+///    as distinct rasters out of the production renderer rather than as
+///    distinct handles;
+/// 2. the depicted instant really moves — the satellite playhead visits a
+///    different stamp on every tick and covers the whole list;
+/// 3. the transport is still doing its own job, so a green here is not a pane
+///    where nothing is animating at all.
+///
+/// **Counted over the steps that painted, and only those.** A blank step is
+/// not a picture. Deduping `Option<u64>` counted `None` as one more distinct
+/// entry beside the real rasters, which is how this suite read green across
+/// the whole of the blank leading frame — see
+/// `a_satellite_loop_paints_from_the_first_step_of_the_sweep`, which is the
+/// test for that defect and the reason the two are separate.
+///
+/// **Floor A — the ask must not become a storm.** Arming a second layer puts a
+/// second set of 7.5 MB GETs on the wire. Every satellite granule may be asked
+/// for a small number of times across the whole run, not once per frame of the
+/// pump; the in-flight mark in `refetch_owed_loop_frames` is what holds it,
+/// and this counts the asks off the wire to say so.
+///
+/// **Floor B — one window for the whole pane**, so a layer cannot hold frames
+/// at instants the pane's clock never names. **What it can fail on here is
+/// narrow, and saying so is the point**: both layers on this fixture reach
+/// backward from the same wall clock, so a layer left to derive its own window
+/// would derive the same one. It reds on the defect (an unarmed satellite
+/// layer has no window at all) and it records the contract; the *contract*
+/// itself is floored where it can actually be broken —
+/// `a_layer_handed_a_window_is_listed_over_that_window` in `loop_pane_tests`,
+/// against radar, whose own arm ends at the pane's scan rather than at now.
+///
+/// **Observed red at HEAD behaviour** (`no_second_layer`: drop the
+/// `layers.extend(...)` in `begin_loop_for_pane` so only the transport is
+/// armed) — **0 of 13 distinct pictures**: the satellite layer holds no
+/// frames, its playhead names no instant, and nothing paints for the whole
+/// sweep.
+///
+/// **Observed red under a partial under-reach** (`half_a_window`: hand every
+/// layer after the transport `window.map(|(s, e)| (s + (e - s) / 2, e))`, so
+/// the satellite is armed but over the newer half of the pane's window) —
+/// **7 of 13 distinct pictures**: seven real rasters over the half it holds,
+/// nothing over the half it does not.
+#[test]
+fn every_step_of_a_loop_draws_its_own_satellite_picture() {
+    let run = sweep_a_satellite_loop();
+    let Sweep {
+        transport_range,
+        satellite_range,
+        satellite_frames,
+        rasters,
+        ref drawn,
+        ref instants,
+        ref mosaic_handles,
+        satellite_gets,
+        ..
+    } = run;
+    let sweep = run.rail.len();
+
+    // **Distinct over the steps that painted.** `None` is the absence of a
+    // picture, not one more of them.
+    let mut distinct: Vec<u64> = drawn.iter().flatten().copied().collect();
     distinct.sort_unstable();
     distinct.dedup();
 
@@ -699,19 +800,19 @@ fn every_step_of_a_loop_draws_its_own_satellite_picture() {
         "satellite view still doesn't loop either, I did a 600 min loop and \
          the GMGSI never changes during it — {} of {sweep} distinct pictures \
          reached the glass across a full sweep. The satellite layer holds \
-         {satellite_frames} frames and {} of them carry a raster; what each \
-         step of the sweep drew was {drawn:?}, and the instant it claimed to \
-         depict was {instants:?}.",
+         {satellite_frames} frames and {rasters} of them carry a raster; what \
+         each step of the sweep drew was {drawn:?}, and the instant it claimed \
+         to depict was {instants:?}.",
         distinct.len(),
-        rasters.len(),
     );
     assert!(
         drawn.iter().all(Option::is_some),
         "a step of the sweep painted nothing at all: {drawn:?}",
     );
 
-    // 2. The depicted instant really moves, across the whole list.
-    let mut visited: Vec<Option<chrono::NaiveDateTime>> = instants.clone();
+    // 2. The depicted instant really moves, across the whole list — and, as
+    //    above, an unnamed instant is not one of them.
+    let mut visited: Vec<chrono::NaiveDateTime> = instants.iter().flatten().copied().collect();
     visited.sort_unstable();
     visited.dedup();
     assert_eq!(
@@ -751,12 +852,89 @@ fn every_step_of_a_loop_draws_its_own_satellite_picture() {
     // Floor A: the ask is bounded, not one storm per pump frame.
     let ceiling = satellite_frames * 3;
     assert!(
-        wire.satellite_gets.len() <= ceiling,
-        "the satellite layer was asked for {} granules over a run holding \
-         {satellite_frames} frames (ceiling {ceiling}). Arming a second layer \
-         must not put a 7.5 MB GET per frame on the wire per frame of the \
-         pump; the in-flight mark in `refetch_owed_loop_frames` is what holds \
-         that, and this is the count that says so.",
-        wire.satellite_gets.len(),
+        satellite_gets <= ceiling,
+        "the satellite layer was asked for {satellite_gets} granules over a \
+         run holding {satellite_frames} frames (ceiling {ceiling}). Arming a \
+         second layer must not put a 7.5 MB GET per frame on the wire per \
+         frame of the pump; the in-flight mark in `refetch_owed_loop_frames` \
+         is what holds that, and this is the count that says so.",
+    );
+}
+
+/// **The acceptance for the blank leading frame** — the user's third report of
+/// the same area.
+///
+/// *"it does update, but some of the frames have no data at all" / "er the
+/// first frame doesn't have data it seems like"*
+///
+/// A loop enabled at `HH:MM` arms every layer over `HH:MM - 12h ..= HH:MM`.
+/// The transport lists objects from the window's start, so the pane's clock
+/// stops inside the window's first partial hour — before any whole hour in it.
+/// The satellite's oldest granule is the hour that window *starts inside*, and
+/// every one of those early stops is drawn by carrying it forward. Listing
+/// from `ceil(range.0)` instead left them with nothing at all: `60 - MM`
+/// minutes of blank rail at the head of every loop, escaped only by enabling
+/// one exactly on the hour.
+///
+/// **Floors.**
+///
+/// (a) **The first step's satellite stamp is strictly earlier than the rail's
+/// own start.** Carrying forward is what has to have happened; a fixture whose
+/// rail happened to begin on a whole hour would paint from the first step
+/// without ever exercising it. The rail is nudged off the hour for exactly
+/// this reason (`mosaic_stamps`), and the premise below says so rather than
+/// trusting it.
+///
+/// (b) The two assertions in
+/// `every_step_of_a_loop_draws_its_own_satellite_picture` that a blank step
+/// used to slip past — the all-`Some` one and the visited-instants one — are
+/// kept there and now reachable.
+///
+/// (c) **The transport's own rail is untouched, stamp for stamp.** Making the
+/// satellite paint everywhere by trimming the pane's clock down to the
+/// satellite's coarser grid would satisfy every other assertion here and lose
+/// the user the loop they asked for.
+#[test]
+fn a_satellite_loop_paints_from_the_first_step_of_the_sweep() {
+    let run = sweep_a_satellite_loop();
+
+    let first_stop = *run.rail.first().expect("the sweep has a first step");
+    assert!(
+        top_of_hour(first_stop) < first_stop,
+        "premise: the rail's first stop must sit strictly inside an hour, or \
+         nothing below is about carrying a granule forward. It is {first_stop}.",
+    );
+
+    // Floor (c): the transport's own rail, stamp for stamp.
+    assert_eq!(
+        run.rail,
+        mosaic_stamps(run.transport_range),
+        "the transport's own frame list must be exactly what its listing \
+         named. Trimming the pane's clock down to the satellite's hourly grid \
+         would paint every step and take the loop away.",
+    );
+
+    // Floor (a) and the claim itself, in one reading: the first step painted,
+    // and what it painted is the granule of the hour the window opened inside.
+    assert_eq!(
+        run.instants.first().copied().flatten(),
+        Some(top_of_hour(first_stop)),
+        "the first step of the sweep stops at {first_stop}, inside hour {}. \
+         The satellite granule for that hour is the only picture it can be \
+         drawn from, and the playhead named {:?} instead. The satellite layer \
+         holds {} frames over {:?}; what each step drew was {:?}.",
+        top_of_hour(first_stop),
+        run.instants.first().copied().flatten(),
+        run.satellite_frames,
+        run.satellite_range,
+        run.drawn,
+    );
+    assert!(
+        run.drawn.first().copied().flatten().is_some(),
+        "er the first frame doesn't have data it seems like — the first step \
+         of the sweep painted no satellite picture at all. Across the whole \
+         sweep the steps drew {:?} at {:?}.",
+        run.drawn,
+        run.instants,
     );
 }
