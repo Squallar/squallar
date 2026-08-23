@@ -51,6 +51,42 @@
 //! transport with it. The `alerts` and `discussions` kinds also moved, and
 //! nothing here claims those: their time is dominated by network fetch.
 //!
+//! **What the shared loan bought, measured (WS3c).** The reply used to be
+//! copied TWICE — once out of the worker's linear memory by
+//! `Uint8Array::from`, once into the page's by `to_vec` — with the transfer
+//! list moving the middle buffer between them. When the browser is
+//! cross-origin isolated the worker now posts VIEWS onto its own
+//! `SharedArrayBuffer` instead ([`shared_loan`]), so the first copy is gone and
+//! the page's is the only one left. Same in the request direction.
+//!
+//! The figure is BYTES, not milliseconds, because bytes are what the change
+//! moves and the page counts them first-hand (`worker_port::account`, reported
+//! by the rig as `transport_bytes`). One Tier-2 pass per browser, `--skip-build`
+//! on this box, one KTLX pane, the rig's default 10 s data window — a whole-run
+//! total over the replies that arrived in it, NOT a per-frame figure and not a
+//! median of anything:
+//!
+//! ```text
+//!                       replies   B out       copied out of the worker
+//!   isolated  Firefox     6       106798231            0
+//!             Chromium    6       104125591            0
+//!   not       Firefox     6       106798231    106798231
+//!   isolated  Chromium    8       148243981    148243981
+//! ```
+//!
+//! Firefox's two arms carried the SAME payload to the byte over the same reply
+//! count, which is what makes its row a like-for-like reading of exactly what
+//! was removed: ~17.8 MB per reply. Chromium's arms answered 6 and 8 replies,
+//! so its totals are not comparable across rows and only the zero is.
+//!
+//! The "not isolated" rows are the same build served without COOP/COEP — the
+//! GitHub Pages posture, still supported and still correct, just copying. They
+//! are also the Tier-2 negative control: `drive.py --expect-zero-copy-replies`
+//! passes on the rows above and fails on the rows below, while
+//! `--expect-worker-round-trip` passes on all four. Nothing here claims a job
+//! latency: the copy is a fraction of a job that also fetches, decodes and
+//! rasterizes, and the rig's per-kind medians on a single pass are n=1..2.
+//!
 //! **There is no Firefox/Chromium gap on `radar-render`.** A separate and
 //! narrower instrument, kept because the table above does not answer the same
 //! question: against the same archived sweep, Chromium (headless, SwiftShader)
@@ -90,6 +126,14 @@ mod worker_port;
 /// before it will accept a job.
 #[cfg(target_arch = "wasm32")]
 pub mod rayon_pool;
+
+/// Lending the peer a view onto this instance's memory instead of a copy of it.
+///
+/// Not wasm32-gated, and deliberately: the ownership protocol — which region
+/// may be freed, and when — is plain bookkeeping, and it is the half a bug
+/// would put a recycled raster on the screen through. It is tested on the host.
+/// Only the part that builds `Uint8Array` views is gated.
+pub mod shared_loan;
 
 /// `initThreadPool`, the JS half of `wasm-bindgen-rayon`'s pool. Re-exported
 /// because wasm-bindgen only emits a binding for an export this crate names:

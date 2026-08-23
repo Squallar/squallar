@@ -619,6 +619,12 @@ fn the_worker_reply_writes_every_field_on_every_arm() {
         "proto::OUT,",
         "proto::OUT_KIND,",
         "proto::TAILS,",
+        // The loan is defaulted the same way and for a sharper reason: absent
+        // and `NO_LOAN` must read alike, and a reply that reached the copying
+        // fallback never writes the field again. A `LOAN` left over from an
+        // arm that did not run would have the page release a loan the worker
+        // never made — and then read a region the worker had re-lent.
+        "proto::set_loan(",
     ] {
         assert!(
             defaults.contains(field),
@@ -629,10 +635,21 @@ fn the_worker_reply_writes_every_field_on_every_arm() {
     }
 }
 
-/// The frame reply rides the `OUT`/`OUT_KIND`/`TAILS` trio and **every** reply
-/// buffer is **transferred** — the head once, each nominated tail inside the
-/// tails loop — which is why exactly two literal `transfer.push(` sites are
-/// expected. A lost push would structured-clone up to ~16 MiB per image tail.
+/// The frame reply rides the `OUT`/`OUT_KIND`/`TAILS` trio, and neither of its
+/// two wires copies a buffer it does not have to.
+///
+/// The **lending** wire (cross-origin isolated) posts views onto the worker's
+/// own `SharedArrayBuffer` and copies nothing at all, so it must contain no
+/// `Uint8Array::from` — that constructor is the copy — and nothing to transfer.
+/// The **copying** fallback pays one `Uint8Array::from` per buffer and must
+/// then transfer every one of them, which is why exactly ONE literal
+/// `transfer.push(` site is expected and why it has to sit inside the loop over
+/// all buffers: a buffer left off the list is structured-cloned, up to ~16 MiB
+/// per image tail on top of the copy already paid.
+///
+/// Before WS3c both wires were one wire and the count here was 2 (a head push
+/// and a per-tail push). The head is now the first element of the same
+/// head-first list the loop walks, which is what collapsed it to 1.
 #[test]
 fn the_frame_reply_rides_the_out_pair_and_transfers_its_buffer() {
     let body = without_line_comments(RASTER_WORKER_RS);
@@ -644,12 +661,33 @@ fn the_frame_reply_rides_the_out_pair_and_transfers_its_buffer() {
         .expect("post_result no longer ends by posting the message it built")
         .0;
 
+    let (lending, copying) = answering_arm
+        .split_once("Err(buffers) =>")
+        .expect("post_result's answering arm no longer has a copying fallback");
+    assert!(
+        lending.contains("shared_loan::lend("),
+        "the answering arm no longer offers the reply to `shared_loan::lend`, \
+         so every reply is copied out of the worker's memory again",
+    );
+    for copying_spelling in ["Uint8Array::from(", "transfer.push("] {
+        assert!(
+            !lending.contains(copying_spelling),
+            "the LENDING arm names {copying_spelling}, so it is copying after \
+             all — the whole claim of WS3c is that this arm copies nothing",
+        );
+    }
+
     assert_eq!(
-        answering_arm.matches("transfer.push(").count(),
-        2,
-        "the answering arm must transfer through exactly two literal push \
-         sites — the `OUT` head and the per-tail loop push; every reply \
-         buffer is moved rather than copied",
+        copying.matches("transfer.push(").count(),
+        1,
+        "the copying fallback must transfer through exactly one literal push \
+         site, inside the loop over every buffer, so no head or tail can be \
+         left behind to be structured-cloned",
+    );
+    assert!(
+        copying.contains("for buffer in &buffers"),
+        "the copying fallback's transfer push must sit inside the loop over \
+         ALL buffers; a push outside it would move one and clone the rest",
     );
     for needle in ["proto::OUT,", "proto::OUT_KIND,", "proto::TAILS,"] {
         assert!(
@@ -733,17 +771,26 @@ fn post_result_arms() -> Vec<(&'static str, String)> {
 /// The key argument of every `set_field(&message, <KEY>, ..)` in one slice, in
 /// source order. Reads the *argument*, not every `proto::` token.
 fn message_field_idents(arm: &str) -> Vec<String> {
-    arm.split("&message,")
-        .skip(1)
-        .filter_map(|chunk| {
-            let rest = chunk.trim_start().strip_prefix("proto::")?;
-            Some(
+    let pieces: Vec<&str> = arm.split("&message,").collect();
+    let mut out = Vec::new();
+    for window in pieces.windows(2) {
+        let (before, after) = (window[0], window[1]);
+        // `set_loan` names its field in the SETTER rather than in an argument —
+        // there is only one loan field, so it takes the id and nothing else.
+        // Read from the call site behind the split, because reading only what
+        // follows `&message,` would make every `LOAN` write invisible to the
+        // shape pin below, and a pin with a hole reads green over the hole.
+        if before.trim_end().ends_with("proto::set_loan(") {
+            out.push(String::from("LOAN"));
+        } else if let Some(rest) = after.trim_start().strip_prefix("proto::") {
+            out.push(
                 rest.chars()
                     .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
                     .collect(),
-            )
-        })
-        .collect()
+            );
+        }
+    }
+    out
 }
 
 /// The shape of a `done` reply, whole, pinned against the build that ships it.
@@ -773,25 +820,32 @@ fn the_worker_reply_shape_is_the_one_this_build_ships() {
 
     // An unrecognised `set_field` would be silently skipped, and a guard with a
     // hole in it reads green over the hole.
-    let call_sites = post_result_body().matches("proto::set_field(").count();
+    let body = post_result_body();
+    let call_sites =
+        body.matches("proto::set_field(").count() + body.matches("proto::set_loan(").count();
     assert_eq!(
         call_sites,
         written.len(),
-        "post_result makes {call_sites} set_field calls but only {} of them \
-         were recognised as `set_field(&message, proto::NAME, ..)`. The \
-         unrecognised ones are invisible to the shape below, so fix the \
-         extraction (or the call) before reading its verdict.",
+        "post_result makes {call_sites} field-setting calls but only {} of them \
+         were recognised as `set_field(&message, proto::NAME, ..)` or \
+         `set_loan(&message, ..)`. The unrecognised ones are invisible to the \
+         shape below, so fix the extraction (or the call) before reading its \
+         verdict.",
         written.len()
     );
 
     assert_eq!(
         written,
         [
+            // The answering arm's `LOAN` is written only where the reply was
+            // LENT; the copying arm leaves the `NO_LOAN` the head wrote.
+            "answer | LOAN | loan",
             "answer | OUT | out",
             "answer | OUT_KIND | outkind",
             "answer | TAILS | tails",
             "head | ID | id",
             "head | KIND | kind",
+            "head | LOAN | loan",
             "head | OUT | out",
             "head | OUT_KIND | outkind",
             "head | TAILS | tails",
