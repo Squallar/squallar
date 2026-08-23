@@ -187,6 +187,15 @@ pub struct App {
     /// restore cannot run at the moment the state is built.
     restore_pending: bool,
     cached_dark_theme: Option<bool>,
+    /// Whether this install says the raster running totals out loud — see
+    /// [`render::raster_telemetry_is_loud`]. Read once, at
+    /// construction, because a per-frame reporter must not touch the config
+    /// store.
+    raster_telemetry_loud: bool,
+    /// When [`App::report_raster_telemetry`] last wrote a line, or `None`
+    /// before the first one. The running totals are a periodic readout and
+    /// this is its clock; see that function.
+    raster_telemetry_said: Option<web_time::Instant>,
     /// The last predictive-back claim pushed to the platform, so the push is
     /// edge-triggered. `false` at construction because nothing is open on the
     /// first frame — which is also what the platform assumes until told
@@ -430,6 +439,10 @@ impl App {
             );
         }
 
+        // Read here and not at the report, because the report runs once a
+        // frame and a config read is not a per-frame cost.
+        let raster_telemetry_loud = render::raster_telemetry_is_loud(platform.kv().as_deref());
+
         let loop_pool_limits = crate::loop_pool::LoopPoolLimits::from_budgets(&budgets);
         let loop_pool_memo =
             crate::loop_pool::remembered(platform.kv().as_deref(), loop_pool_limits);
@@ -471,6 +484,8 @@ impl App {
             texture_counter: 0,
             restore_pending: false,
             cached_dark_theme: None,
+            raster_telemetry_loud,
+            raster_telemetry_said: None,
             back_claimed: false,
             exit_requested: false,
             autosave: AutosaveState {

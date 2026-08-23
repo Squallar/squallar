@@ -152,3 +152,109 @@ fn a_line_that_drifted_by_one_space_is_not_accepted() {
          test above cannot fail",
     );
 }
+
+/// The rig driver's launcher, read at compile time for the same reason
+/// [`DRIVE_PY`] is.
+const RUN_TIER2: &str = include_str!("../../../.github/browser-rig/run_tier2.sh");
+
+/// **The rig can still hear the lines it scrapes.**
+///
+/// The two sentences are `debug` on an ordinary install, and the browser boots
+/// `console_log` at `Level::Info`, so on the web target they exist only where
+/// this key is seeded. That makes `run_tier2.sh`'s `SEED_LS` load-bearing for
+/// `--expect-overlay-rasters` in exactly the way the format string is
+/// load-bearing for the regex: rename either side and the rig reports the
+/// overlay reading as `null`, which is what it also reports when the overlay
+/// path never ran.
+///
+/// The `localStorage` name is checked and not just the logical key, because
+/// the seed is written in `localStorage`'s vocabulary and the app reads in the
+/// config store's; `rustdar_web::kv::storage_key` is the prefix between them
+/// and its own test pins that.
+#[test]
+fn the_rig_seeds_the_key_that_makes_the_lines_loud() {
+    let seeded = format!("\"rustdar.{}\": \"1\"", super::RASTER_TELEMETRY_KEY);
+    assert!(
+        RUN_TIER2.contains(&seeded),
+        "run_tier2.sh no longer seeds {seeded}, so the app writes both \
+         running-total lines at `debug`, `console_log` drops them before the \
+         console ring, and `--expect-overlay-rasters` reads the overlay path \
+         as null -- which is what it reports when that path never ran at all",
+    );
+}
+
+/// The floor under the test above: the app really does read that key, and
+/// really does refuse anything else.
+///
+/// Without this, renaming the key on BOTH sides at once would keep the seam
+/// test green while the switch pointed at a key nothing sets.
+#[test]
+fn only_the_seeded_value_makes_the_lines_loud() {
+    use rustdar_kv::{KvStore, MemoryKvStore};
+
+    assert!(
+        !super::raster_telemetry_is_loud(None),
+        "an install with nowhere to persist must not be loud",
+    );
+
+    let store = MemoryKvStore::default();
+    assert!(
+        !super::raster_telemetry_is_loud(Some(&store)),
+        "an install that never set the key must not be loud -- this is the \
+         default a user is in, and it is the whole point of the switch",
+    );
+
+    store
+        .store(super::RASTER_TELEMETRY_KEY, "0")
+        .expect("the memory store always accepts a write");
+    assert!(
+        !super::raster_telemetry_is_loud(Some(&store)),
+        "an explicit `0` turned the lines on",
+    );
+
+    store
+        .store(super::RASTER_TELEMETRY_KEY, "1")
+        .expect("the memory store always accepts a write");
+    assert!(
+        super::raster_telemetry_is_loud(Some(&store)),
+        "the value the rig seeds did not turn the lines on, so Tier-2 hears \
+         nothing",
+    );
+}
+
+/// **The reading is periodic, and the period is asked rather than waited on.**
+///
+/// A wall-clock test here would red-gate this file under load for a reason
+/// that has nothing to do with the property; `telemetry_is_due` takes both
+/// instants so the question can be put directly.
+#[test]
+fn a_reading_is_due_once_a_period_and_not_once_a_frame() {
+    let t0 = web_time::Instant::now();
+    assert!(
+        super::telemetry_is_due(None, t0),
+        "the first reading must go out at once, or a short rig leg hears \
+         nothing at all",
+    );
+
+    let frame = std::time::Duration::from_micros(16_667);
+    let mut n = 0u32;
+    let mut at = t0;
+    // A whole period of 60 Hz frames, every one of them after a reading taken
+    // at `t0`. Under the per-frame reporter this counts 120.
+    while at.duration_since(t0) < super::RASTER_TELEMETRY_PERIOD {
+        if super::telemetry_is_due(Some(t0), at) {
+            n += 1;
+        }
+        at += frame;
+    }
+    assert_eq!(
+        n, 0,
+        "{n} of the frames inside one period would have written a line; the \
+         running totals are back to being a per-frame event",
+    );
+    assert!(
+        super::telemetry_is_due(Some(t0), t0 + super::RASTER_TELEMETRY_PERIOD),
+        "the frame exactly one period later was still not due, so the last \
+         reading of a run can be withheld for ever",
+    );
+}

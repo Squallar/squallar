@@ -165,7 +165,22 @@ PY=python3
 # round-trip, rayon pool and zero-copy replies stayed OK on every one of them.
 # That is the property -- this assertion can go red, it goes red for the reason
 # it names, and it disturbs nothing else.
-SEED_LS='{"rustdar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"enabled_overlays\":{\"RadarSites\":true}}]}"}'
+# ---------------------------------------------------------------------------
+# WHY `rustdar.raster_telemetry` IS SEEDED
+#
+# The two running-total sentences this rig scrapes -- `overlay rasters:` and
+# `texture uploads:` -- are `debug` on an ordinary install, because a
+# monotonically growing total is not something a user who never asked for it
+# should read. `console_log` boots at `Level::Info` on this target, so a
+# `debug!` line does not reach the console ring this rig reads at all. This key
+# is the app's own switch for that (`App::raster_telemetry_is_loud`), and
+# seeding it is what keeps `--expect-overlay-rasters` able to see anything.
+#
+# Pinned from the Rust side by
+# `raster_telemetry_line_tests::the_rig_seeds_the_key_that_makes_the_lines_loud`,
+# which reads this file: a renamed key on either side is a build failure rather
+# than a rig leg that reports the overlay path as `null`.
+SEED_LS='{"rustdar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"enabled_overlays\":{\"RadarSites\":true}}]}", "rustdar.raster_telemetry": "1"}'
 
 # Set to 0 to report the overlay raster totals without gating on them -- for a
 # measurement round, never as a way past a red leg.

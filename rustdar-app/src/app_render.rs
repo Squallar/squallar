@@ -159,6 +159,53 @@ impl PlanViewUploads {
     }
 }
 
+/// How often the two running-total lines are said, at most.
+///
+/// **Chosen against the instrument that has to hear them, not against taste.**
+/// `.github/browser-rig/drive.py`'s `wait_overlay_rasters` polls the console
+/// ring every 2 s for up to `--expect-timeout` (180 s in `run_tier2.sh`) and
+/// takes the newest reading, so anything well under that window costs the rig
+/// nothing. Two seconds also keeps a native log to 30 readings a minute —
+/// a reading being the pair — where a per-frame report writes 7200.
+const RASTER_TELEMETRY_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The config key an install sets to hear the running totals at `info`.
+///
+/// On the browser this is the `localStorage` entry `rustdar.raster_telemetry`
+/// — see `rustdar_web::kv::storage_key` for the prefix — which is how the
+/// Tier-2 rig turns them on: it seeds the key beside the layer seed in
+/// `run_tier2.sh`, and `the_rig_seeds_the_key_that_makes_the_lines_loud` is
+/// what stops the two drifting apart.
+pub(crate) const RASTER_TELEMETRY_KEY: &str = "raster_telemetry";
+
+/// Whether this install says the raster running totals at `info` rather than
+/// `debug`.
+///
+/// Anything other than a stored `"1"` — including no store at all — is `false`.
+/// A truthier parse would make the absent case and the "someone typed
+/// something" case behave differently for no benefit; there is one value that
+/// turns it on.
+pub(crate) fn raster_telemetry_is_loud(store: Option<&dyn rustdar_kv::KvStore>) -> bool {
+    store.is_some_and(|kv| kv.load(RASTER_TELEMETRY_KEY).as_deref() == Some("1"))
+}
+
+/// Whether a reading is due, given when the last one was said.
+///
+/// A separate function because the alternative is a test that waits on a wall
+/// clock: this takes both instants and is asked, not timed.
+fn telemetry_is_due(said: Option<web_time::Instant>, now: web_time::Instant) -> bool {
+    said.is_none_or(|last| now.duration_since(last) >= RASTER_TELEMETRY_PERIOD)
+}
+
+/// Write one running-total line at the level this install asked for.
+fn say_raster_telemetry(loud: bool, line: &str) {
+    if loud {
+        log::info!("{line}");
+    } else {
+        log::debug!("{line}");
+    }
+}
+
 /// The `overlay rasters:` running-total line.
 ///
 /// **A free function, and built as a `String`, so that a test can read it.**
@@ -170,7 +217,7 @@ impl PlanViewUploads {
 /// is what stops that, and it can only exist because this is a value rather
 /// than an argument to `log::info!`.
 ///
-/// Never called on a frame that moved nothing; see
+/// Never called on a tick that moved nothing since the last one; see
 /// [`super::App::report_raster_telemetry`].
 fn overlay_raster_line(t: &rustdar_egui::overlay_cache::ledger::Totals) -> String {
     format!(
@@ -661,8 +708,8 @@ impl super::App {
             .promote_held_rasters(|id| renderer.is_delivered(id));
     }
 
-    /// **Say what the raster pipeline has spent, on a frame where it spent
-    /// something.**
+    /// **Say what the raster pipeline has spent, periodically, on a tick where
+    /// it spent something since the last one.**
     ///
     /// Two lines, never one, because they have two different denominators and
     /// adding them would describe neither:
@@ -681,28 +728,63 @@ impl super::App {
     /// that had to sum it would be summing whatever survived. That is the same
     /// reason `rustdar_web`'s `worker_port` reports the transport this way.
     ///
-    /// `info` and not `debug` is load-bearing on the browser target, where
+    /// # A running total is a periodic readout, never a per-frame event
+    ///
+    /// Two things bound it, and they answer two different questions.
+    ///
+    /// **How often**: at most one pair of lines per
+    /// [`RASTER_TELEMETRY_PERIOD`], however busy the pipeline is. The
+    /// alternative — a line on every frame the pipeline moved — is 120 INFO
+    /// lines a second under any activity at all, saying a number that has
+    /// grown by one. The trailing edge is free rather than tracked: the
+    /// ledgers' own `*_if_moved` compare against the last **reported**
+    /// figure, not the last frame's, so the tick after the pipeline stops
+    /// still carries everything the suppressed frames added.
+    ///
+    /// **How loud**: `debug` on an ordinary install, and `info` only where
+    /// [`raster_telemetry_is_loud`] says this install asked for them. A user
+    /// who never asked for the pipeline's accounts never reads one.
+    ///
+    /// `info` for the instrument is load-bearing on the browser target, where
     /// `console_log` is initialised at `Level::Info` and a `debug!` line is
-    /// invisible to the Tier-2 rig.
+    /// invisible to the Tier-2 rig. That is why the switch moves the *level*
+    /// and not the sentence: `.github/browser-rig/drive.py` scrapes these two
+    /// lines out of the console ring, and `raster_telemetry_line_tests` pins
+    /// both the sentence and the key the rig has to seed to hear it.
     ///
     /// # What this costs the frame
     ///
-    /// On a frame that moved nothing: eight relaxed loads and a failed
-    /// compare-exchange for the first ledger, one `u64` add and one compare for
-    /// the second, and no formatting at all — both `*_if_moved` calls answer
-    /// `None` and the `format_args!` is never built. Nothing here allocates or
-    /// takes a lock. The increments themselves are one `fetch_add` each, at
-    /// sites that run per dispatched raster, per arriving raster and per moved
-    /// band — never in the per-pane-per-layer walks, which are the hot ones.
+    /// One monotonic clock read, and on all but one frame in
+    /// [`RASTER_TELEMETRY_PERIOD`] nothing else — the ledgers are not even
+    /// loaded. On the frame that is due and moved nothing: eight relaxed loads
+    /// and a failed compare-exchange for the first ledger, one `u64` add and
+    /// one compare for the second, and no formatting, because both
+    /// `*_if_moved` calls answer `None`. Nothing here takes a lock. The
+    /// increments themselves are one `fetch_add` each, at sites that run per
+    /// dispatched raster, per arriving raster and per moved band — never in
+    /// the per-pane-per-layer walks, which are the hot ones.
     fn report_raster_telemetry(&mut self) {
-        if let Some(t) = rustdar_egui::overlay_cache::ledger::totals_if_moved() {
-            log::info!("{}", overlay_raster_line(&t));
-        }
-        let Some(state) = self.state.as_mut() else {
+        let now = web_time::Instant::now();
+        if !telemetry_is_due(self.raster_telemetry_said, now) {
             return;
-        };
-        if let Some(u) = state.egui_renderer.upload_totals_if_moved() {
-            log::info!("{}", texture_upload_line(&u));
+        }
+        let rasters = rustdar_egui::overlay_cache::ledger::totals_if_moved();
+        let uploads = self
+            .state
+            .as_mut()
+            .and_then(|state| state.egui_renderer.upload_totals_if_moved());
+        if rasters.is_none() && uploads.is_none() {
+            return;
+        }
+        // Stamped only where a line really went out, so a quiet pipeline does
+        // not push the next reading a period further away every frame.
+        self.raster_telemetry_said = Some(now);
+        let loud = self.raster_telemetry_loud;
+        if let Some(t) = rasters {
+            say_raster_telemetry(loud, &overlay_raster_line(&t));
+        }
+        if let Some(u) = uploads {
+            say_raster_telemetry(loud, &texture_upload_line(&u));
         }
     }
 
@@ -4803,3 +4885,9 @@ pub(super) fn pump_dispatch_overlay_loop_renders(
 ) {
     app.dispatch_overlay_loop_renders();
 }
+
+/// **Idle means idle**: a pane whose texture layers each hold a picture asks
+/// for no further rasters, driven end to end through the production doors.
+#[path = "app_render/idle_raster_tests.rs"]
+#[cfg(test)]
+mod idle_raster_tests;
