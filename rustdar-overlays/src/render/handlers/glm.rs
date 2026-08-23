@@ -628,6 +628,61 @@ impl GlmHandler {
         let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         *guard = GlmCache::default();
     }
+    /// **Every instant this pane's clock can stop on**, ascending and never
+    /// empty — what [`Self::residency_for`] is asked about.
+    ///
+    /// Two postures, and both end in the same method, which is what makes the
+    /// layer's window subtracted exactly once:
+    ///
+    /// * **A named set.** `FetchConfig::depicted_frames` is the transport's
+    ///   own frames, and a loop only ever draws those; `as_of` joins them
+    ///   because a parked scrub can sit *between* two frames and the instant
+    ///   on the pane's clock is depicted whether or not a frame is stamped at
+    ///   it. Thirteen hourly stops of a five-minute layer are 65 minutes of
+    ///   archive, against the twelve hours their extent spans.
+    /// * **A span with no frames yet** — the window between
+    ///   `handle_enable_loop` and the transport's listing landing, and any
+    ///   parked pane with no loop. The clock can then be *anywhere* in
+    ///   `as_of ± span`, so the stops are that interval sampled at this
+    ///   layer's own window: consecutive asks then touch, `Residency::over`
+    ///   coalesces them, and the answer is the one unbroken range the span
+    ///   really is. Sampling coarser than the window would leave holes the
+    ///   layer itself says it does not need.
+    ///
+    /// A live pane is `span == 0` and no frames: one stop, one window, and
+    /// every bound downstream is byte-for-byte what it always was.
+    fn depicted_stops(&self, pane: &PaneRef<'_>, ctx: &FetchConfig) -> Vec<chrono::NaiveDateTime> {
+        if !ctx.depicted_frames.is_empty() {
+            let mut stops = ctx.depicted_frames.clone();
+            stops.push(ctx.as_of);
+            stops.sort_unstable();
+            stops.dedup();
+            return stops;
+        }
+        let span = chrono::TimeDelta::seconds(ctx.depicted_span_secs.unwrap_or(0) as i64);
+        if span <= chrono::TimeDelta::zero() {
+            return vec![ctx.as_of];
+        }
+        // Floored at `GLM_MIN_TIME_WINDOW_SECS` so a control writing a smaller
+        // window cannot turn a twelve-hour span into an unbounded walk; the
+        // fetch `debug_assert!`s the same floor.
+        let step = chrono::TimeDelta::milliseconds(
+            (self
+                .view(pane)
+                .time_window_secs
+                .max(crate::glm::GLM_MIN_TIME_WINDOW_SECS)
+                * 1000.0) as i64,
+        );
+        let end = ctx.as_of + span;
+        let mut stops = Vec::new();
+        let mut at = ctx.as_of - span;
+        while at < end {
+            stops.push(at);
+            at += step;
+        }
+        stops.push(end);
+        stops
+    }
 }
 
 impl OverlayHandler for GlmHandler {
@@ -876,27 +931,20 @@ impl OverlayHandler for GlmHandler {
         let sources = ctx.sources.clone();
         let view = self.view(pane);
         let satellites = view.satellite.to_satellites();
-        let time_window_secs = view.time_window_secs;
         let levels = view.active_levels();
         let cache = Arc::clone(&self.cache);
         // **The instant the pane depicts**, which is what picks the archive
         // hour: GLM's S3 listing is addressed by `{year}/{doy}/{hour}`, so a
         // scrubbed pane reaches years back for free. On a live pane this is
         // the wall clock and the request is unchanged.
-        //
-        // And with it, how far the pane's timeline reaches around it — a
-        // loop's clock sweeps the whole span between polls, so the fetch
-        // covers the span, not the sample. `None` on a live pane: nothing
-        // widens.
-        let depicted = crate::glm::fetch::DepictedWindow {
-            as_of: ctx.as_of,
-            span_secs: ctx.depicted_span_secs,
-            // And *where* inside that span the pane can stop. A loop whose
-            // frames are further apart than this layer's window depicts a
-            // handful of slices of a wide extent, and the span alone cannot
-            // say which — see `DepictedWindow::frames`.
-            frames: ctx.depicted_frames.clone(),
-        };
+        let as_of = ctx.as_of;
+        // **And what this layer says it must hold to draw where that clock
+        // can stop** — its own `residency_for`, over its own stops. The fetch
+        // used to be handed `(as_of, span, frames)` and derive a
+        // start/cutoff/horizon triple itself, subtracting `time_window_secs`
+        // down there while the app measured the span up here: two authorities
+        // on one loop, which is the shape three consecutive GLM bugs lived in.
+        let depicted = self.residency_for(pane, &self.depicted_stops(pane, ctx));
         vec![FetchTask {
             kind: known::LIGHTNING,
             future: Box::pin(async move {
@@ -909,9 +957,9 @@ impl OverlayHandler for GlmHandler {
                     &client,
                     &sources,
                     &satellites,
-                    time_window_secs,
                     &levels,
                     &mut local_cache,
+                    as_of,
                     depicted,
                 )
                 .await;
