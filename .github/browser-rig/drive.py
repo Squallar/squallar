@@ -1097,8 +1097,13 @@ WORKER_SIGNAL_PROBE = r"""
 var C = window.__rig_console || [];
 var attached = [], different = [], off_frame = [], rayon = [];
 var by_kind = {};
+var transport = null;
 var off_re = /([A-Za-z0-9_-]+) took (\d+) ms off the frame/;
 var rayon_re = /rayon: (\d+) threads/;
+// The LAST match wins, not the first: `worker_port::account` logs RUNNING
+// TOTALS, so the newest line is the whole answer and an older one is a prefix
+// of it. Scanning forward and overwriting is what makes that true.
+var transport_re = /transport: (\d+) replies, (\d+) B out with (\d+) B copied out of the worker, (\d+) B in with (\d+) B copied out of this page/;
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
   if (m.indexOf("rasterization worker attached") !== -1) attached.push(C[i].t);
@@ -1117,10 +1122,16 @@ for (var i = 0; i < C.length; i++) {
   }
   var rm = rayon_re.exec(m);
   if (rm) rayon.push(parseInt(rm[1], 10));
+  var tm = transport_re.exec(m);
+  if (tm) transport = { replies: parseInt(tm[1], 10),
+                        out_moved: parseInt(tm[2], 10),
+                        out_copied: parseInt(tm[3], 10),
+                        in_moved: parseInt(tm[4], 10),
+                        in_copied: parseInt(tm[5], 10) };
 }
 return { attached: attached, different: different, off_frame: off_frame,
          off_frame_by_kind: by_kind, rayon_threads: rayon,
-         console_total: C.length };
+         transport: transport, console_total: C.length };
 """
 
 # Which backend the APP settled on, read out of its own startup log.
@@ -1316,6 +1327,61 @@ def wait_rayon_pool(session, minimum, timeout=180.0, interval=2.0):
                      ">=%d within %.0fs (a worker that fell back to the "
                      "one-thread pool looks identical to every other Tier-2 "
                      "assertion)" % (best, minimum, timeout)}
+
+
+def wait_zero_copy_replies(session, timeout=180.0, interval=2.0):
+    """WS3c: replies reach the page WITHOUT being copied out of the worker.
+
+    Two conditions, and the second is what stops this passing vacuously:
+
+      * `out_copied == 0` -- no reply byte arrived in a buffer the worker had
+        copied out of its own linear memory.
+      * `out_moved > 0`  -- and some reply bytes actually arrived. A page that
+        never got an answer trivially never got a copied one, so without this
+        the assertion would go green on a transport that had stopped working
+        entirely.
+
+    Both numbers are the PAGE's own observation, not the worker's report. The
+    page classifies each arriving buffer with `shared_loan::is_foreign_shared`:
+    a lent reply is a view whose backing object is a SharedArrayBuffer that is
+    NOT this page's memory, and a copied one is a transferred plain
+    ArrayBuffer. So a transport that quietly reverted to copying cannot satisfy
+    it, and neither can one that forged a view out of the page's own heap.
+
+    The negative control is a real production configuration rather than a
+    tamper: served without COOP/COEP the agent cluster is not cross-origin
+    isolated, `shared_loan::can_lend` is false, every message takes the copying
+    wire and `out_copied` climbs with `out_moved`. Run `serve.py` without
+    `--coep` and this must go red. That is the same deployment GitHub Pages
+    gets, so the arm is one the app has to keep working -- it is asserted to be
+    SLOWER here, never broken.
+
+    Accumulates across polls the way `wait_rayon_pool` does: the page-side
+    console ring evicts, and the totals are cumulative, so the newest line seen
+    at any poll is the best answer and a later poll can only improve it."""
+    t0 = time.monotonic()
+    best = None
+    while time.monotonic() - t0 < timeout:
+        sig = session.execute(WORKER_SIGNAL_PROBE) or {}
+        seen = sig.get("transport")
+        if isinstance(seen, dict) and isinstance(seen.get("out_moved"), int):
+            if best is None or seen["out_moved"] >= best["out_moved"]:
+                best = seen
+        if best is not None and best["out_moved"] > 0 and best["out_copied"] == 0:
+            out = dict(best)
+            out.update({"ok": True, "waited_s": round(time.monotonic() - t0, 2)})
+            return out
+        time.sleep(interval)
+    out = dict(best or {})
+    out.update({
+        "ok": False,
+        "waited_s": round(time.monotonic() - t0, 2),
+        "error": "replies did not arrive zero-copy within %.0fs: %s (wanted "
+                 "out_moved>0 and out_copied==0; a transport that reverted to "
+                 "copying still attaches, still answers jobs and still passes "
+                 "every other Tier-2 assertion)" % (timeout, best),
+    })
+    return out
 
 
 def wait_doctored_respawn(session, timeout=180.0, respawn_grace=30.0,
@@ -1760,6 +1826,11 @@ def run_smoke(args):
             result["rayon_pool"] = wait_rayon_pool(
                 session, args.expect_rayon_threads, timeout=args.expect_timeout)
             stage("rayon-pool-done", **result["rayon_pool"])
+        if args.expect_zero_copy_replies:
+            stage("zero-copy-wait", timeout=args.expect_timeout)
+            result["zero_copy"] = wait_zero_copy_replies(
+                session, timeout=args.expect_timeout)
+            stage("zero-copy-done", **result["zero_copy"])
 
         stage("settle", seconds=args.settle)
         time.sleep(args.settle)
@@ -1805,6 +1876,15 @@ def run_smoke(args):
               rayon_threads=result["rasterization_ms"]["rayon_threads"],
               **{k: "n=%d med=%d" % (v["n"], v["median"])
                  for k, v in _kinds.items()})
+
+        # What the worker wire actually moved and what it actually copied, in
+        # bytes, as the page's own running totals (worker_port::account).
+        # Reported unconditionally for the same reason `rasterization_ms` is:
+        # a measurement round wants the number when nothing is gating on it,
+        # and `null` says the line was never seen rather than "zero bytes".
+        result["transport_bytes"] = _sig.get("transport")
+        if result["transport_bytes"]:
+            stage("transport", **result["transport_bytes"])
 
         # Late on purpose: registration, install and activation all have to
         # finish first, and the data window has just paid for that time.
@@ -1878,9 +1958,11 @@ def run_smoke(args):
         wrt = result.get("worker_round_trip")
         dr = result.get("doctored_respawn")
         rp = result.get("rayon_pool")
+        zc = result.get("zero_copy")
         worker_ok = ((wrt is None or bool(wrt.get("ok")))
                      and (dr is None or bool(dr.get("ok")))
-                     and (rp is None or bool(rp.get("ok"))))
+                     and (rp is None or bool(rp.get("ok")))
+                     and (zc is None or bool(zc.get("ok"))))
 
         # Isolation assertions (opt-in). Both are written so that they FAIL
         # when the thing they name is absent -- an isolation proof that cannot
@@ -1945,6 +2027,10 @@ def run_smoke(args):
             "doctored_respawn_ok": (None if dr is None
                                     else bool(dr.get("ok"))),
             "rayon_pool_ok": (None if rp is None else bool(rp.get("ok"))),
+            "zero_copy_replies_ok": (None if zc is None else bool(zc.get("ok"))),
+            # Same rule as `rayon_threads` below: reported whether or not
+            # anything gated on it, because this IS the WS3c measurement.
+            "transport_bytes": result.get("transport_bytes"),
             # Reported unconditionally, not only under --expect-rayon-threads:
             # a measurement run wants the number even when nothing is gating
             # on it, and `null` distinguishes "never observed" from "one".
@@ -2104,6 +2190,19 @@ def run_smoke(args):
         print("[%s] SUMMARY rayon pool: %s (%s threads, wanted >=%s)"
               % (tag, "OK" if rp.get("ok") else "FAILED",
                  rp.get("threads"), rp.get("minimum")))
+    zc = result.get("zero_copy")
+    if zc is not None:
+        print("[%s] SUMMARY zero-copy replies: %s%s"
+              % (tag, "OK" if zc.get("ok") else "FAILED",
+                 "" if zc.get("ok") else "; " + str(zc.get("error"))))
+    # The WS3c measurement, printed whether or not it was gated -- and never
+    # pooled across browsers, for the same reason the per-kind medians are not.
+    tb = result.get("transport_bytes")
+    if tb:
+        print("[%s] SUMMARY transport: %s replies, %s B out with %s B copied "
+              "out of the worker, %s B in with %s B copied out of the page"
+              % (tag, tb.get("replies"), tb.get("out_moved"),
+                 tb.get("out_copied"), tb.get("in_moved"), tb.get("in_copied")))
     rm = result.get("rasterization_ms")
     if rm and rm.get("by_kind"):
         # One line per KIND, never a pooled figure: see the probe.
@@ -2154,6 +2253,16 @@ def main(argv=None):
                          "isolation there is no SharedArrayBuffer, the pool "
                          "falls back to one thread, and every other Tier-2 "
                          "assertion still passes")
+    ap.add_argument("--expect-zero-copy-replies", action="store_true",
+                    help="fail unless the page observes reply bytes arriving "
+                         "without having been copied out of the worker's "
+                         "memory (WS3c): out_moved>0 and out_copied==0 within "
+                         "--expect-timeout. The page classifies each arriving "
+                         "buffer itself, so a transport that reverted to "
+                         "copying cannot pass. NEGATIVE CONTROL: run serve.py "
+                         "WITHOUT --coep -- with no cross-origin isolation "
+                         "every message takes the copying wire and this must "
+                         "go red")
     ap.add_argument("--expect-doctored-respawn", action="store_true",
                     help="fail unless the console shows the doctored-token "
                          "refusal and then, >=1000 ms later, a clean attach "
