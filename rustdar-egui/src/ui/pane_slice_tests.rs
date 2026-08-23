@@ -1021,6 +1021,139 @@ fn clearing_graphics_state_reaches_panes_of_every_kind() {
     }
 }
 
+/// A 1x1 overlay raster — the picture every non-radar animating layer holds in
+/// its frames, wrapping a `TextureHandle` minted by `ctx`, which is the device
+/// that goes away below.
+fn device_raster(ctx: &egui::Context, name: &str) -> crate::overlay_cache::OverlayTextureData {
+    crate::overlay_cache::OverlayTextureData {
+        texture: ctx.load_texture(
+            name.to_owned(),
+            egui::ColorImage::filled([1, 1], egui::Color32::RED),
+            egui::TextureOptions::default(),
+        ),
+        placed: rustdar_geo::PlacedRaster::of(rustdar_geo::GeoBounds {
+            min_lat: 34.0,
+            max_lat: 36.0,
+            min_lon: -98.0,
+            max_lon: -96.0,
+        }),
+        data_generation: 0,
+        render_zoom: 0,
+        width: 1,
+        height: 1,
+        radar_meta: None,
+        hit_map: None,
+    }
+}
+
+/// Radar's own frame picture, a plan-view render — the one the reset already
+/// reached before WO-T3.5, and the floor it must not trade away.
+fn device_plan_view(ctx: &egui::Context) -> crate::pane::RadarImageData {
+    crate::pane::RadarImageData {
+        texture: ctx.load_texture(
+            "radar".to_owned(),
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::NEAREST,
+        ),
+        lat: 35.0,
+        lon: -97.0,
+        max_range_km: 100.0,
+        placed: rustdar_radar::types::ImageBounds::from_radar_site(35.0, -97.0, 100.0).into(),
+        nyquist_ms: None,
+        melting_layer_source: None,
+        storm_motion: None,
+        hover: std::sync::Arc::new(rustdar_radar::hover::HoverSource::empty()),
+    }
+}
+
+/// Arm `id` on `pane` with one frame carrying `image` and one the renderer is
+/// still filling.
+fn arm_with_picture(
+    pane: &mut crate::pane::PaneState,
+    id: &rustdar_source::id::LayerId,
+    image: crate::pane::LoopFrameImage,
+) {
+    let ls = pane.time_state_mut(id);
+    ls.phase = crate::pane::LoopPhase::Playing;
+    ls.frames = vec![
+        crate::pane::LoopFrame {
+            timestamp: loop_ts(0),
+            image: Some(image),
+            render_in_flight: false,
+            render_failed: false,
+        },
+        crate::pane::LoopFrame {
+            timestamp: loop_ts(5),
+            image: None,
+            render_in_flight: true,
+            render_failed: false,
+        },
+    ];
+}
+
+/// **WO-T3.5 — a device loss drops every animating layer's frame textures.**
+///
+/// The reset walked `loop_state_mut()`, which is radar's slot by name, so a
+/// satellite or model loop on the same pane came out of a surface loss still
+/// holding `LoopFrameImage::Overlay` handles minted by the dead device — while
+/// the three lines below it already released the *live* cache of those very
+/// same layers generically.
+///
+/// **Floor** — radar's frames are asserted dropped in the same pass, so
+/// widening the walk cannot be paid for by narrowing it.
+#[test]
+fn a_device_loss_drops_every_animating_layers_frame_textures() {
+    use rustdar_source::id::known;
+
+    let ctx = egui::Context::default();
+    let mut gui = Gui::new();
+    gui.set_pane_count_for_test(1);
+
+    let pane = gui.pane_mut(0).unwrap();
+    arm_with_picture(
+        pane,
+        &known::RADAR,
+        crate::pane::LoopFrameImage::PlanView(device_plan_view(&ctx)),
+    );
+    for (id, name) in [(known::GMGSI, "gmgsi"), (known::MODEL_DATA, "model")] {
+        arm_with_picture(
+            pane,
+            &id,
+            crate::pane::LoopFrameImage::Overlay(device_raster(&ctx, name)),
+        );
+    }
+
+    let armed = [known::RADAR, known::GMGSI, known::MODEL_DATA];
+    for id in &armed {
+        let ls = gui.pane(0).unwrap().time_state(id);
+        assert!(
+            ls.is_active() && ls.frames.iter().any(|f| f.image.is_some()),
+            "precondition: {id:?} holds a picture minted by the device that is \
+             about to go away",
+        );
+        assert!(
+            ls.frames.iter().any(|f| f.render_in_flight),
+            "precondition: {id:?} has a render in flight to abandon",
+        );
+    }
+
+    gui.clear_graphics_state();
+
+    for id in &armed {
+        let ls = gui.pane(0).unwrap().time_state(id);
+        assert!(
+            ls.frames.iter().all(|f| f.image.is_none()),
+            "{id:?} came out of a graphics-device loss still holding a texture \
+             handle the dead device minted",
+        );
+        assert!(
+            ls.frames.iter().all(|f| !f.render_in_flight),
+            "{id:?} came out of a graphics-device loss still expecting a render \
+             the dead device will never deliver",
+        );
+    }
+}
+
 /// A timestamp `n` minutes past a fixed instant, for the loop frames below.
 fn loop_ts(minute: i64) -> chrono::NaiveDateTime {
     chrono::DateTime::from_timestamp(1_700_000_000 + minute * 60, 0)
