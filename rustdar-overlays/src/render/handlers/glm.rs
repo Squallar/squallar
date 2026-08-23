@@ -655,6 +655,48 @@ impl OverlayHandler for GlmHandler {
         TimeAxis::EventLifetime
     }
 
+    /// **The flashes these stops draw, and none of the archive between
+    /// them** — one `time_window_secs` behind every stop, coalesced.
+    ///
+    /// **This is the layer the whole contract was written for.** A pane's
+    /// loop is armed over `max(slider, transport.min_loop_span_secs())` —
+    /// 43 200 s for a satellite transport — while the poll was handed the
+    /// bare Lookback slider, 3 600 s. Two authorities on one question, and
+    /// GLM retained ±1 h of a 12 h loop: frames 0 and 1 lit, the rest blank,
+    /// reported three times. There is one authority now and it is this
+    /// method: the layer says what it needs, in its own vocabulary, for the
+    /// instants it is told the clock can stop on.
+    ///
+    /// **The arithmetic is [`DepictedWindow`]'s** (`4dc162f7`), which
+    /// computed it by hand inside the fetch: thirteen hourly stops of a
+    /// five-minute window are **thirteen windows, 65 minutes**, against a
+    /// twelve-hour extent that would list ~8 600 objects per satellite for
+    /// thirteen pictures.
+    ///
+    /// **What is deliberately *not* here: the [`GRANULE_SPAN`] widening.**
+    /// The fetch reaches 40 s further back than each window because a granule
+    /// straddling the window's opening carries flashes inside it — that is a
+    /// statement about which S3 *objects* must be asked for, not about which
+    /// *flashes* must be held. A caller turning this answer into a listing
+    /// range applies the widening itself, as the fetch does today; a caller
+    /// turning it into an eviction cutoff must not, or it retains 40 s of
+    /// archive nothing depicts on every window.
+    ///
+    /// [`DepictedWindow`]: crate::glm::fetch::DepictedWindow
+    /// [`GRANULE_SPAN`]: crate::glm::fetch
+    fn residency_for(
+        &self,
+        pane: &PaneRef<'_>,
+        stops: &[chrono::NaiveDateTime],
+    ) -> rustdar_source::time::Residency {
+        // Milliseconds, not seconds: `time_window_secs` is an `f64` the
+        // control writes in fractions, and truncating it to whole seconds
+        // here would answer a window the fetch does not use.
+        let window =
+            chrono::TimeDelta::milliseconds((self.view(pane).time_window_secs * 1000.0) as i64);
+        rustdar_source::time::Residency::over(stops.iter().map(|&stop| (stop - window, stop)))
+    }
+
     /// **One second, not the trait's minute.** The fade ramp is computed
     /// against a 60-1800 s window, so a whole-minute quantum would step the
     /// ramp visibly; a flash's age is the finest-grained as-of dependence any

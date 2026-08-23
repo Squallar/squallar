@@ -79,6 +79,22 @@ pub fn report_instant(hhmm: &str, anchor: chrono::NaiveDateTime) -> Option<chron
     date.and_hms_opt(hour, minute, 0)
 }
 
+/// **12Z on the day the convective day containing `at` opened** — the earliest
+/// instant a row of that day's `today_*.csv` can carry.
+///
+/// The same 12Z-to-12Z window [`report_instant`] dates its rows against, read
+/// the other way: given an instant, which window is it inside. `None` only if
+/// the derived date has no 12:00, which no real calendar date lacks.
+///
+/// Used by the handler's residency answer: the picture at `at` is every report
+/// of the day that has **already happened**, so the slice that feeds it opens
+/// here and not at `at`.
+pub fn convective_day_start(at: chrono::NaiveDateTime) -> Option<chrono::NaiveDateTime> {
+    (at - chrono::Duration::hours(12))
+        .date()
+        .and_hms_opt(12, 0, 0)
+}
+
 /// Origin must come from
 /// [`DataSources::spc_base`](rustdar_source::origins::DataSources::spc_base),
 /// never a literal, or these three escape the origin table.

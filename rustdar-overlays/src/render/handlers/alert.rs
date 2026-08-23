@@ -377,6 +377,28 @@ impl OverlayHandler for NwsAlertHandler {
         TimeAxis::EventLifetime
     }
 
+    /// **One instant per stop, and that is the whole ask.**
+    ///
+    /// This layer's items carry their own validity windows, and the picture
+    /// at a stop is which of them are in force *then*. Nothing about a stop
+    /// obliges the layer to hold a *stretch* of source time the way
+    /// lightning's fade ramp does — an alert issued yesterday and an alert
+    /// issued a minute ago are both drawn at a stop inside their windows, and
+    /// neither is found by reaching further back from it.
+    ///
+    /// So a caller turning this into a retention rule keeps every alert whose
+    /// window **overlaps** a range here, which for `RETAINED_HOURS` of
+    /// departed alerts is exactly the set [`AlertItem::departed`] already
+    /// preserves. A zero-width range is a real ask, not an empty one:
+    /// `Residency::is_empty` is false and `covers(stop)` is true.
+    fn residency_for(
+        &self,
+        _pane: &PaneRef<'_>,
+        stops: &[chrono::NaiveDateTime],
+    ) -> rustdar_source::time::Residency {
+        rustdar_source::time::Residency::over(stops.iter().map(|&stop| (stop, stop)))
+    }
+
     fn default_enabled(&self) -> bool {
         true
     }
@@ -813,6 +835,48 @@ mod tests {
 
     fn with_zones(alerts: Vec<NwsAlert>, zones: ZoneResolution) -> FetchPayload {
         Box::new(NwsAlertFetchResult(Ok(ActiveAlerts { alerts, zones })))
+    }
+
+    /// **Asking for no *time* is not asking for nothing**, and this is the
+    /// shape three of the five `EventLifetime` layers answer in.
+    ///
+    /// An alert carries its own validity window, so the picture at a stop is
+    /// a function of the stop and of nothing behind it. The ask is one
+    /// zero-width range per stop: `is_empty` false, `total` zero, and every
+    /// stop covered. A conformance walk reading "non-empty" as "asks for some
+    /// duration" would call this layer silent when it is not.
+    #[test]
+    fn an_alert_stop_asks_for_the_instant_and_no_stretch_behind_it() {
+        use rustdar_source::handler::SourceHandler;
+
+        let handler = NwsAlertHandler::new();
+        let pane = PaneRef::bare(0);
+        let at = |h: u32| {
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 22)
+                .expect("a real date")
+                .and_hms_opt(h, 0, 0)
+                .expect("a real time")
+        };
+        let stops: Vec<chrono::NaiveDateTime> = (0..13).map(at).collect();
+
+        let residency = handler.residency_for(&pane, &stops);
+        assert!(
+            !residency.is_empty(),
+            "a layer that reads the clock asks for something at every stop",
+        );
+        assert_eq!(
+            residency.total(),
+            chrono::Duration::zero(),
+            "and none of that something is a stretch of archive",
+        );
+        assert_eq!(residency.ranges().len(), 13);
+        for stop in &stops {
+            assert!(residency.covers(*stop), "the stop at {stop}");
+        }
+        assert!(
+            !residency.covers(at(3) + chrono::Duration::minutes(30)),
+            "an instant the pane cannot stop on is not asked for",
+        );
     }
 
     fn handler_with(alerts: Vec<NwsAlert>) -> NwsAlertHandler {

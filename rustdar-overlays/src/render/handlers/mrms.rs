@@ -797,6 +797,26 @@ impl OverlayHandler for MrmsHandler {
         }
     }
 
+    /// **The mosaics these stops draw from, and none of the minutes between
+    /// them.**
+    ///
+    /// At a ~2-minute cadence a stop is rarely more than a step from the
+    /// mosaic that draws it, so the answer here is a dense set of narrow
+    /// ranges rather than the sparse one a satellite loop produces — the same
+    /// derivation, [`rustdar_source::time::frame_residency`], routed through
+    /// [`Self::latest_at`] and never re-deriving `FrameSeries`'s rule.
+    ///
+    /// The **coalescing matters most here**: stops closer together than the
+    /// gap between two mosaics collapse into one unbroken range, so a scrub
+    /// asking about a hundred instants does not answer a hundred ranges.
+    fn residency_for(
+        &self,
+        pane: &PaneRef<'_>,
+        stops: &[chrono::NaiveDateTime],
+    ) -> rustdar_source::time::Residency {
+        rustdar_source::time::frame_residency(self, pane, stops)
+    }
+
     /// This layer comes in stamped frames, and answers every one of
     /// [`FrameSource`]'s methods below.
     fn frames(&self) -> Option<&dyn FrameSource> {

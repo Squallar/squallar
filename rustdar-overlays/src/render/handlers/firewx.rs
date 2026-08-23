@@ -580,6 +580,24 @@ impl OverlayHandler for SpcFireOutlookHandler {
         TimeAxis::EventLifetime
     }
 
+    /// **One instant per stop**, for the reason the convective handler gives:
+    /// the picture at a stop is which held issuances are in force then, and
+    /// no stretch of source time behind the stop feeds it.
+    ///
+    /// Only the current issuance is ever held, and SPC publishes **no
+    /// fire-weather GeoJSON archive** to widen that (probed 2026-08-22, see
+    /// [`Self::time_axis`]). A stop outside the held windows still asks for
+    /// itself: what the layer needs to draw an instant does not shrink
+    /// because nothing can supply it, and an ask no supply answers is a
+    /// reviewable fact rather than a silence.
+    fn residency_for(
+        &self,
+        _pane: &PaneRef<'_>,
+        stops: &[chrono::NaiveDateTime],
+    ) -> rustdar_source::time::Residency {
+        rustdar_source::time::Residency::over(stops.iter().map(|&stop| (stop, stop)))
+    }
+
     /// **False, and it is a fact rather than an omission.** The only
     /// theme-dependent term in `OutlooksInput` is the hatch colour, and no
     /// fire feature is ever hatched — see `paint_input`.
