@@ -133,7 +133,7 @@ impl Areas {
 /// A display convenience and nothing else — the name carries the caveat so a
 /// reader cannot mistake the figure for a measured area.
 pub fn sq_deg_to_sq_km(sq_deg: f64, lat: f64) -> f64 {
-    const DEG_KM: f64 = 111.32;
+    use rustdar_geo::KM_PER_DEGREE_LAT as DEG_KM;
     sq_deg * DEG_KM * DEG_KM * lat.to_radians().cos()
 }
 
