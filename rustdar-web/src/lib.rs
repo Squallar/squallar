@@ -14,21 +14,53 @@
 //! SwiftShader. The startup log names the backend that answered.
 //!
 //! ```text
-//! cd rustdar-web
-//! wasm-pack build --target web --release      # writes ./pkg
-//! python3 -m http.server 8731                 # or any static server
-//! # then open http://127.0.0.1:8731/index.html
+//! .github/scripts/wasm-threads.sh \
+//!   wasm-pack build rustdar-web --target web --release   # writes ./pkg
+//! .github/browser-rig/serve.py --dir rustdar-web --coep  # NOT http.server
 //! ```
+//!
+//! Both halves of that are load-bearing since WS3b. The build must go through
+//! `wasm-threads.sh`: this crate needs `+atomics`, a std rebuilt against it,
+//! and a shared imported memory, and a bare `wasm-pack build` fails to compile
+//! rather than quietly producing a single-threaded bundle. The server must
+//! send COOP/COEP: without cross-origin isolation there is no
+//! `SharedArrayBuffer`, so `rustdar_web::rayon_pool` falls back to one thread
+//! and the app runs — just at the speed the table below calls "before".
+//! `python3 -m http.server` sends no such headers. Production does (CloudFront
+//! Response Headers Policy on rustdar.mcswain.dev).
 //!
 //! Measure in `--release`: workspace code is `opt-level = 0` in dev and radar
 //! rasterization is ~2.5x slower there.
 //!
-//! **There is no Firefox/Chromium gap on `radar-render`.** Against the same
-//! archived sweep, Chromium (headless, SwiftShader) medians 191 ms and Firefox
-//! (headed, NVIDIA) 188 ms; the 12 interleaved pairs give a median
-//! Firefox/Chromium ratio of **0.88**. The GPUs are deliberately unmatched,
-//! which does not touch this — `radar-render` is the CPU-side rasterizer with
-//! no GPU call in the timed region.
+//! **What the rayon pool bought, measured.** Tier-2 rig, this box, arms
+//! INTERLEAVED (before, after, before, after) rather than run as two
+//! campaigns, reading `deliver_job_reply`'s own "<kind> took <N> ms off the
+//! frame". Medians, n=4 per cell, per browser and never pooled across them —
+//! Chromium is on SwiftShader and Firefox on Xvfb/llvmpipe here:
+//!
+//! ```text
+//!            before (1 thread)   after (8 threads)
+//!   decode   Firefox   476 ms    126 ms     3.78x
+//!            Chromium  474 ms    125 ms     3.78x
+//!   radar    Firefox   136 ms     47 ms     2.92x
+//!            Chromium  178 ms     74 ms     2.41x
+//! ```
+//!
+//! The figure is END-TO-END job latency, not rasterizer CPU alone: it is
+//! `job.started.elapsed()`, so it carries queueing and the postMessage
+//! transport with it. The `alerts` and `discussions` kinds also moved, and
+//! nothing here claims those: their time is dominated by network fetch.
+//!
+//! **There is no Firefox/Chromium gap on `radar-render`.** A separate and
+//! narrower instrument, kept because the table above does not answer the same
+//! question: against the same archived sweep, Chromium (headless, SwiftShader)
+//! medians 191 ms and Firefox (headed, NVIDIA) 188 ms, and the 12 interleaved
+//! pairs give a median Firefox/Chromium ratio of **0.88**. The GPUs are
+//! deliberately unmatched, which does not touch it — `radar-render` is the
+//! CPU-side rasterizer with no GPU call in the timed region. Predates WS3b and
+//! so describes the single-threaded arm; the per-browser split in the table
+//! above is over end-to-end job latency on unmatched software renderers and is
+//! not a restatement of it.
 //!
 //! [`PlatformBridge`]: rustdar_app::platform::PlatformBridge
 

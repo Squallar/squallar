@@ -206,9 +206,20 @@ fn handle_message(generation: u64, worker: &web_sys::Worker, data: &JsValue) {
 /// Hand a `done` message to the job that asked for it.
 ///
 /// The reply is the `OUT`/`OUT_KIND`/`TAILS` trio, or explicit nulls for a job
-/// that produced nothing. Reading each buffer is ONE copy into linear memory,
-/// unavoidable without a `SharedArrayBuffer`, which needs COOP/COEP headers
-/// GitHub Pages does not let this deployment set.
+/// that produced nothing. Reading each buffer is ONE copy into this page's
+/// linear memory.
+///
+/// That copy did NOT retire when WS3b turned cross-origin isolation on, and
+/// the reason is worth stating so nobody re-derives the wrong expectation from
+/// "we have `SharedArrayBuffer` now". Both memories are shared buffers today,
+/// but they are two DIFFERENT ones: `worker.js` instantiates the module a
+/// second time, and `wasm-bindgen-rayon` shares the worker's memory with the
+/// worker's own rayon threads, not with this page. A raster written in the
+/// worker's heap is not addressable from this one. What isolation newly makes
+/// *possible* is for the page to build a view straight onto the worker's
+/// buffer and skip the copy OUT of it — but that needs an ownership protocol
+/// the wire does not have, because the worker must not reuse the region until
+/// this page is done reading it. A follow-up, not a consequence.
 fn deliver(data: &JsValue) {
     let Some(id) = proto::field(data, proto::ID).and_then(|v| v.as_f64()) else {
         log::error!("worker answered with no job id");
