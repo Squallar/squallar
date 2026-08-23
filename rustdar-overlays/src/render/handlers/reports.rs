@@ -213,6 +213,35 @@ impl OverlayHandler for StormReportsHandler {
         TimeAxis::EventLifetime
     }
 
+    /// **The convective day behind each stop, not the stop alone** — the one
+    /// `EventLifetime` layer here whose picture is *cumulative*.
+    ///
+    /// A report is a point event, and the picture at a stop is every report
+    /// of the day that has **already happened** — so the slice feeding a stop
+    /// opens at 12Z when that convective day opened
+    /// ([`crate::spc::reports::convective_day_start`]) and closes at the stop.
+    /// Answering the instant alone, the way the alert and outlook handlers
+    /// do, would be an under-reach a retention rule reads as permission to
+    /// drop every report before the playhead, emptying the map behind a
+    /// scrub.
+    ///
+    /// Thirteen hourly stops therefore **coalesce into one range** — each
+    /// stop's slice contains its predecessor's — and that is honest: this
+    /// layer holds one CSV per kind for the whole day and there is nothing
+    /// finer to ask for. A stop whose derived day start does not name a real
+    /// clock reading contributes nothing rather than a fabricated window.
+    fn residency_for(
+        &self,
+        _pane: &PaneRef<'_>,
+        stops: &[chrono::NaiveDateTime],
+    ) -> rustdar_source::time::Residency {
+        rustdar_source::time::Residency::over(
+            stops
+                .iter()
+                .filter_map(|&stop| Some((crate::spc::reports::convective_day_start(stop)?, stop))),
+        )
+    }
+
     /// `is_dark` rides into the described job (`StormReportsInput`) and picks
     /// the marker outline, so a cached raster is a raster in one theme.
     fn theme_sensitive(&self) -> bool {
@@ -756,6 +785,98 @@ mod round_tests {
         assert!(
             !line.contains("incomplete"),
             "nothing arrived to be incomplete about: {line}",
+        );
+    }
+}
+
+/// **The one `EventLifetime` layer whose ask is a stretch and not an
+/// instant.** The picture at a stop is every report of the convective day
+/// that has already happened, so the slice feeding it opens at 12Z and closes
+/// at the stop.
+///
+/// Thirteen hourly stops therefore coalesce into **one** range — each stop's
+/// slice contains its predecessor's. That is the honest answer for a layer
+/// holding one CSV per kind for the whole day, and it is the opposite of the
+/// lightning layer's thirteen: the difference is in what the pictures are
+/// functions of, and the type carries both.
+#[cfg(test)]
+mod residency_tests {
+    use super::*;
+    use rustdar_source::handler::SourceHandler;
+
+    fn at(h: u32, m: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 8, 22)
+            .expect("a real date")
+            .and_hms_opt(h, m, 0)
+            .expect("a real time")
+    }
+
+    #[test]
+    fn a_report_stop_asks_for_the_convective_day_behind_it() {
+        let handler = StormReportsHandler::new();
+        let pane = PaneRef::bare(0);
+
+        let one = handler.residency_for(&pane, &[at(20, 0)]);
+        assert_eq!(
+            one.ranges().len(),
+            1,
+            "one stop, one slice: {:?}",
+            one.ranges(),
+        );
+        assert_eq!(
+            one.total(),
+            chrono::Duration::hours(8),
+            "20Z is eight hours into a convective day that opened at 12Z",
+        );
+        assert!(
+            one.covers(at(12, 0)),
+            "the day's first report is inside the ask; an instant-only answer \
+             would let a retention rule drop every report behind the playhead",
+        );
+        assert!(
+            !one.covers(at(11, 59)),
+            "and the previous convective day is not this layer's to hold",
+        );
+
+        let looped: Vec<chrono::NaiveDateTime> = (13..=23).map(|h| at(h, 0)).collect();
+        let many = handler.residency_for(&pane, &looped);
+        assert_eq!(
+            many.ranges().len(),
+            1,
+            "every stop's slice contains its predecessor's, so eleven stops \
+             coalesce to one: {:?}",
+            many.ranges(),
+        );
+        assert_eq!(
+            many.total(),
+            chrono::Duration::hours(11),
+            "12Z to the newest stop, counted once",
+        );
+        for stop in &looped {
+            assert!(many.covers(*stop), "the stop at {stop} is inside the ask");
+        }
+    }
+
+    /// A stop **before** 12Z belongs to the convective day that opened at 12Z
+    /// the previous calendar day — the rollover `report_instant` dates its
+    /// rows by, read the other way.
+    #[test]
+    fn a_small_hours_stop_belongs_to_yesterdays_convective_day() {
+        let handler = StormReportsHandler::new();
+        let pane = PaneRef::bare(0);
+
+        let residency = handler.residency_for(&pane, &[at(2, 30)]);
+        assert_eq!(
+            residency.extent(),
+            Some((
+                chrono::NaiveDate::from_ymd_opt(2026, 8, 21)
+                    .expect("a real date")
+                    .and_hms_opt(12, 0, 0)
+                    .expect("a real time"),
+                at(2, 30),
+            )),
+            "02:30 is 14.5 h into the day that opened at 12Z yesterday, not \
+             half an hour into one that opens at midnight",
         );
     }
 }

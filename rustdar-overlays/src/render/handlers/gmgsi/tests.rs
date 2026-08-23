@@ -1595,3 +1595,113 @@ fn latest_at_is_scoped_to_the_panes_own_channel() {
          on an unlisted channel has nothing to answer with",
     );
 }
+
+/// **A framed layer asks for its granules, not for the loop's extent.**
+///
+/// Thirteen hourly stops over thirteen hourly granules: thirteen ranges, and
+/// **zero seconds** of source time between them. The twelve hours the loop
+/// spans is archive this layer draws nothing from — the same claim the
+/// lightning layer makes with 65 minutes instead of zero, because its picture
+/// reaches behind its stop and a granule's does not.
+///
+/// `residency_for` is `frame_residency` over `latest_at`, so this is also the
+/// pin that the framed layers reuse `FrameSeries`'s one rule rather than
+/// re-deriving it: move `latest_at` and this moves with it.
+#[test]
+fn a_satellite_loop_asks_for_its_granules_not_the_hours_between_them() {
+    let channel = GmgsiChannel::LongwaveIr;
+    let mut h = GmgsiHandler::new();
+    h.defaults.enabled = true;
+    h.defaults.selected_channel = channel;
+    let pane = PaneRef::across(&[]);
+    file_listing(&mut h, channel, 13, true);
+
+    let stops: Vec<chrono::NaiveDateTime> = (0..13).map(hour).collect();
+    let residency = h.residency_for(&pane, &stops);
+
+    assert_eq!(
+        residency.ranges().len(),
+        13,
+        "one granule per stop, and no two of them adjacent: {:?}",
+        residency.ranges(),
+    );
+    assert_eq!(
+        residency.total(),
+        chrono::Duration::zero(),
+        "a stop standing exactly on its own granule needs that granule and \
+         none of the hour around it",
+    );
+    assert_eq!(
+        residency.extent(),
+        Some((hour(0), hour(12))),
+        "the twelve-hour extent is still readable off the same answer, which \
+         is what keeps it from becoming a second authority",
+    );
+    for stop in &stops {
+        assert!(
+            residency.covers(*stop),
+            "the stop at {stop} draws a granule and must be inside the ask",
+        );
+    }
+    assert!(
+        !residency.covers(hour(3) + chrono::Duration::minutes(30)),
+        "03:30 is drawn by carrying hour 3 forward, and asking to hold the \
+         half hour in between is asking for the extent",
+    );
+}
+
+/// A stop **between** granules reaches back to the one it draws — which is
+/// why the range is not the stamp alone.
+///
+/// **The floor**: a pane's clock parks wherever the user leaves it. A
+/// residency of `[07:00, 07:00]` would not cover 07:59, and the law WO-T2.3
+/// states over every stop a pane can make would fail on the first scrub off
+/// the hour.
+#[test]
+fn a_scrub_between_granules_is_inside_what_the_layer_asked_for() {
+    let channel = GmgsiChannel::LongwaveIr;
+    let mut h = GmgsiHandler::new();
+    h.defaults.enabled = true;
+    h.defaults.selected_channel = channel;
+    let pane = PaneRef::across(&[]);
+    file_listing(&mut h, channel, 13, true);
+
+    let parked = hour(7) + chrono::Duration::minutes(59);
+    let residency = h.residency_for(&pane, &[parked]);
+
+    assert_eq!(residency.ranges().len(), 1);
+    assert!(residency.covers(parked), "the parked instant itself");
+    assert!(
+        residency.covers(hour(7)),
+        "and the granule it is drawn from",
+    );
+    assert!(
+        !residency.covers(hour(8)),
+        "hour 8's granule depicts an instant this pane has not reached",
+    );
+    assert_eq!(residency.total(), chrono::Duration::minutes(59));
+}
+
+/// **Before any listing lands the answer is empty, and that is a state.**
+///
+/// A satellite pane spends its first seconds here — knowing of no granule, so
+/// there is none it can ask to keep. It is not the inherited default: the
+/// same handler with a listing answers thirteen ranges, asserted above.
+#[test]
+fn a_satellite_pane_with_no_listing_asks_for_nothing_yet() {
+    let mut h = GmgsiHandler::new();
+    h.defaults.enabled = true;
+    h.defaults.selected_channel = GmgsiChannel::LongwaveIr;
+    let pane = PaneRef::across(&[]);
+
+    let stops: Vec<chrono::NaiveDateTime> = (0..13).map(hour).collect();
+    assert!(
+        h.residency_for(&pane, &stops).is_empty(),
+        "no granule is known, so none is asked for",
+    );
+
+    // Premise: the listing is what changes the answer, so the empty above is
+    // about the state and not about the stops.
+    file_listing(&mut h, GmgsiChannel::LongwaveIr, 13, true);
+    assert_eq!(h.residency_for(&pane, &stops).ranges().len(), 13);
+}

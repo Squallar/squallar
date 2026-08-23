@@ -20,7 +20,7 @@ use crate::fetch_policy::{
 use crate::id::LayerId;
 use crate::job::{DescribedJob, JobCodec};
 use crate::product::{FieldId, ProductSpec};
-use crate::time::{FrameListing, FrameSource, FrameStamp, TimeAxis};
+use crate::time::{FrameListing, FrameSource, FrameStamp, Residency, TimeAxis};
 
 /// Not `rustdar_radar::LegendScale`: duplicated here to avoid the dependency.
 pub struct OverlayLegend {
@@ -879,6 +879,40 @@ pub trait SourceHandler: Send {
     /// here does not re-raster a live layer every second.
     fn as_of_quantum(&self) -> std::time::Duration {
         std::time::Duration::from_secs(60)
+    }
+
+    /// **What this layer would have to hold to draw `stops`** — the
+    /// [`Residency`] it is asking for, coalesced.
+    ///
+    /// `stops` are every instant the pane's clock can come to rest on: a
+    /// loop's frames, a parked scrub's one instant, or a live pane's wall
+    /// clock. The layer answers in its own vocabulary — a
+    /// [`TimeAxis::FrameSeries`] layer through
+    /// [`crate::time::frame_residency`], a [`TimeAxis::EventLifetime`] layer
+    /// with whatever slice of archive its picture at a stop is a function of.
+    ///
+    /// **This is the one time method that is not frame supply**, which is why
+    /// it sits here rather than on [`FrameSource`]: the layer this method was
+    /// written for is `EventLifetime` and has no frames at all. Lightning's
+    /// picture at an instant is the flashes of the preceding window, and a
+    /// caller reconstructing that from a *span* is what lit a twelve-hour
+    /// loop on one frame — two authorities on one question, the loop armed
+    /// over 43 200 s and the poll told 3 600 s.
+    ///
+    /// **The empty default is a real answer, not a degradation.** A
+    /// [`TimeAxis::Live`] layer ignores the depicted instant entirely, so no
+    /// set of stops obliges it to hold anything, and
+    /// [`Residency::none`] says exactly that. It is wrong for every other
+    /// arm, and a conformance walk asserts that every non-`Live` layer
+    /// answers non-empty so it cannot be inherited where it matters.
+    ///
+    /// **A requirement, not a report.** Nothing here claims the layer *is*
+    /// holding this; [`FrameSource::frames_resident`] is that question. A
+    /// layer whose storage lives above its handler can still answer this one
+    /// honestly, because what it would need is knowable without holding it.
+    fn residency_for(&self, pane: &PaneRef<'_>, stops: &[chrono::NaiveDateTime]) -> Residency {
+        let _ = (pane, stops);
+        Residency::none()
     }
 
     /// **This layer's frame supply, if it has one.**

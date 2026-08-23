@@ -906,6 +906,27 @@ impl OverlayHandler for GmgsiHandler {
         13
     }
 
+    /// **The granules these stops draw from, and none of the hours between
+    /// them.**
+    ///
+    /// A twelve-hour loop of thirteen hourly stops needs thirteen mosaics;
+    /// the twelve hours they are spread across is archive nothing in this
+    /// pane depicts. [`rustdar_source::time::frame_residency`] is that
+    /// derivation, shared by all four framed layers and routed through
+    /// [`Self::latest_at`], so this is not a second reading of
+    /// `FrameSeries`'s rule.
+    ///
+    /// Empty before a listing lands — this layer knows of no granule then, so
+    /// there is none it can ask to keep. That is a state and not a silence:
+    /// the same call after `apply_frame_listing` answers thirteen ranges.
+    fn residency_for(
+        &self,
+        pane: &PaneRef<'_>,
+        stops: &[chrono::NaiveDateTime],
+    ) -> rustdar_source::time::Residency {
+        rustdar_source::time::frame_residency(self, pane, stops)
+    }
+
     /// This layer comes in stamped frames, and answers every one of
     /// [`FrameSource`]'s methods below.
     fn frames(&self) -> Option<&dyn FrameSource> {

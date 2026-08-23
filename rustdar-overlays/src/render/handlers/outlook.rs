@@ -524,6 +524,25 @@ impl OverlayHandler for SpcOutlookHandler {
         TimeAxis::EventLifetime
     }
 
+    /// **One instant per stop.** An outlook is an issuance with a
+    /// `valid`/`expire` window, and the picture at a stop is which held
+    /// issuances are in force then — a question about the stop itself, with
+    /// no stretch of source time behind it.
+    ///
+    /// **This does not become wider when the archive is wired.** SPC's
+    /// convective GeoJSON archive is real and a fetch-follows-clock supply in
+    /// the GLM shape is possible; what such a supply would fetch is still the
+    /// issuances covering each stop, so the ask stays the stops and the
+    /// number of round trips stays the number of distinct issuances, not the
+    /// hours between them.
+    fn residency_for(
+        &self,
+        _pane: &PaneRef<'_>,
+        stops: &[chrono::NaiveDateTime],
+    ) -> rustdar_source::time::Residency {
+        rustdar_source::time::Residency::over(stops.iter().map(|&stop| (stop, stop)))
+    }
+
     fn theme_sensitive(&self) -> bool {
         true
     }

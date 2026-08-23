@@ -569,6 +569,44 @@ impl SourceHandler for RadarSource {
             extends_future: false,
         }
     }
+    /// **The volumes these stops draw from — and this layer can answer it
+    /// even though it can answer [`FrameSource::frames_resident`] with
+    /// nothing.**
+    ///
+    /// The two are different questions and radar is the layer that proves it.
+    /// `frames_resident` reports *what is in hand*, and radar's decoded
+    /// volumes are in hand somewhere this handler cannot see: the app layer
+    /// holds them (WO-M12d), so an answer here would be an undetectable lie.
+    /// `residency_for` asks *what would have to be held*, which is knowable
+    /// from the listings alone — the same set [`Self::latest_at`] and
+    /// [`Self::list_frames`] already answer from. Nothing is faked, and
+    /// nothing is withheld either.
+    ///
+    /// So this takes the shared derivation
+    /// ([`rustdar_source::time::frame_residency`]) the other three framed
+    /// layers take, unchanged, and is scoped to the pane's site by
+    /// `latest_at` for the reason a [`FrameStamp`] carries none: two sites
+    /// routinely share a timestamp.
+    ///
+    /// **Empty until a listing lands, and that is a state rather than a
+    /// silence.** A pane whose site has not listed yet knows of no volume, so
+    /// there is none it can ask to keep; the same call after
+    /// `apply_frame_listing` answers one range per stop. A conformance walk
+    /// asserting non-`Live` layers answer non-empty must give this layer a
+    /// listing first, exactly as it must for the other three.
+    ///
+    /// **The eviction door this would feed is still above.**
+    /// `App::evict_unneeded_loop_scans` retains radar's caches by its own
+    /// hand-derived window; wiring it to this answer is a separate item, as
+    /// is [`FrameSource::retain_frames`]'s missing caller.
+    fn residency_for(
+        &self,
+        pane: &PaneRef<'_>,
+        stops: &[chrono::NaiveDateTime],
+    ) -> rustdar_source::time::Residency {
+        rustdar_source::time::frame_residency(self, pane, stops)
+    }
+
     fn default_enabled(&self) -> bool {
         true
     }
@@ -867,6 +905,88 @@ mod tests {
             depicted_span_secs: None,
             depicted_frames: Vec::new(),
         }
+    }
+
+    /// **Radar answers the residency question even though it answers
+    /// `frames_resident` with nothing** — the two are different questions and
+    /// this layer is where the difference is visible.
+    ///
+    /// `frames_resident` reports what is in hand and radar's decoded volumes
+    /// are held above this crate (WO-M12d), so the honest report is empty.
+    /// `residency_for` asks what *would have to be* held, which the listings
+    /// answer, so the honest ask is one range per stop. Faking the first from
+    /// the second would claim a volume is ready to draw when it has not been
+    /// downloaded.
+    #[test]
+    fn the_residency_a_site_asks_for_is_not_the_residency_it_reports() {
+        let mut source = RadarSource::new();
+        let ktlx = on_site("KTLX");
+        let (l, scope) = listing("KTLX", &[0, 5, 10], true);
+        source.apply_frame_listing(l, scope, &pane(&ktlx));
+        let p = pane(&ktlx);
+
+        assert!(
+            source.frames_resident(&p).is_empty(),
+            "this layer holds archive identifiers, not frames — and says so",
+        );
+
+        let residency =
+            rustdar_source::handler::SourceHandler::residency_for(&source, &p, &[ts(5), ts(10)]);
+        assert_eq!(
+            residency.ranges().len(),
+            2,
+            "two stops standing on two volumes: {:?}",
+            residency.ranges(),
+        );
+        assert_eq!(
+            residency.total(),
+            chrono::Duration::zero(),
+            "and neither of them needs any of the five minutes between",
+        );
+        assert!(residency.covers(ts(5)) && residency.covers(ts(10)));
+        assert!(
+            !residency.covers(ts(7)),
+            "the instants between two volumes are drawn by carrying the \
+             earlier one forward, not by holding the gap",
+        );
+    }
+
+    /// **Scoped by site, like every other answer this layer gives.** Two
+    /// radars routinely share a timestamp, and an unscoped residency would
+    /// have one site's pane ask to hold another's volumes.
+    ///
+    /// **Empty before a listing lands, and that is a state, not a silence.** A
+    /// pane whose site has listed nothing knows of no volume to keep; the same
+    /// call after `apply_frame_listing` answers above.
+    #[test]
+    fn a_site_with_no_listing_asks_for_nothing_yet() {
+        let mut source = RadarSource::new();
+        let ktlx = on_site("KTLX");
+        let (l, scope) = listing("KTLX", &[0, 5, 10], true);
+        source.apply_frame_listing(l, scope, &pane(&ktlx));
+
+        let koun = on_site("KOUN");
+        assert!(
+            rustdar_source::handler::SourceHandler::residency_for(
+                &source,
+                &pane(&koun),
+                &[ts(5), ts(10)],
+            )
+            .is_empty(),
+            "KOUN has listed nothing, so it asks for nothing — KTLX's volumes \
+             at the same instants are not its to hold",
+        );
+
+        // Premise: the listed site does answer, so the empty above is about
+        // the site and not about the fixture.
+        assert!(
+            !rustdar_source::handler::SourceHandler::residency_for(
+                &source,
+                &pane(&ktlx),
+                &[ts(5)],
+            )
+            .is_empty(),
+        );
     }
 
     /// **Two sites' listings do not collide, and the volume one site holds at

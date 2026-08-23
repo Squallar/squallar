@@ -1600,3 +1600,126 @@ fn the_glm_job_ages_flashes_from_the_depicted_instant_not_the_wall_clock() {
          fade every flash by the distance between the two",
     );
 }
+
+/// **The layer this whole contract was written for, answering for itself.**
+///
+/// Thirteen hourly stops — a twelve-hour satellite loop's frames — against
+/// the default five-minute window. The ask is **65 minutes**: thirteen
+/// windows, one behind each stop. The extent they are scattered across is
+/// twelve hours and five minutes, and it is that extent the poll was
+/// reconstructing when GLM lit two frames of thirteen.
+///
+/// The figure is `DepictedWindow`'s own (`4dc162f7`), computed here by the
+/// layer instead of by hand inside the fetch.
+#[test]
+fn a_lightning_loop_asks_for_thirteen_windows_not_twelve_hours() {
+    let handler = GlmHandler::new();
+    let pane = PaneRef::bare(0);
+    assert_eq!(
+        handler.defaults.time_window_secs, 300.0,
+        "premise: the 65 minutes below is thirteen of THIS window, so a moved \
+         default moves the figure",
+    );
+
+    let stops: Vec<chrono::NaiveDateTime> = (0..13).map(loop_hour).collect();
+    let residency = handler.residency_for(&pane, &stops);
+
+    assert_eq!(
+        residency.total(),
+        chrono::Duration::minutes(65),
+        "thirteen five-minute windows are 65 minutes of archive: {:?}",
+        residency.ranges(),
+    );
+    assert_eq!(
+        residency.ranges().len(),
+        13,
+        "the stops are an hour apart and the windows five minutes wide, so \
+         nothing merges",
+    );
+
+    let (from, to) = residency.extent().expect("thirteen ranges have an extent");
+    assert_eq!(
+        to - from,
+        chrono::Duration::hours(12) + chrono::Duration::minutes(5),
+        "the extent is the quantity a caller reading the loop's span asked \
+         the archive for — 12 h 05 min, against 65 min of it depicted",
+    );
+
+    // Every window opens exactly one `time_window_secs` behind its own stop,
+    // and closes ON it. The stop being inside its own window is the law the
+    // GLM bug becomes.
+    for (k, stop) in stops.iter().enumerate() {
+        assert!(
+            residency.covers(*stop),
+            "stop {k} at {stop} is not inside what the layer asked to hold",
+        );
+        assert!(
+            residency.covers(*stop - chrono::Duration::seconds(300)),
+            "and neither is the far edge of its window",
+        );
+        assert!(
+            !residency.covers(*stop - chrono::Duration::seconds(301)),
+            "one second past the window is archive this layer draws nothing \
+             from",
+        );
+    }
+}
+
+/// The window follows the **control**, not a constant: widen
+/// `time_window_secs` and the ask widens with it.
+///
+/// The floor for the acceptance above — without it, a `residency_for` that
+/// hardcoded 300 s would pass every assertion there.
+#[test]
+fn the_lightning_window_is_the_one_the_pane_is_set_to() {
+    let mut handler = GlmHandler::new();
+    handler.defaults.time_window_secs = 1800.0;
+    let pane = PaneRef::bare(0);
+
+    let residency = handler.residency_for(&pane, &[loop_hour(0), loop_hour(1)]);
+    assert_eq!(
+        residency.total(),
+        chrono::Duration::minutes(60),
+        "two half-hour windows, because the control says half an hour",
+    );
+    assert_eq!(residency.ranges().len(), 2);
+}
+
+/// **A parked scrub asks for one window, and a loop for one per stop.** The
+/// coalescing is doing the work rather than the fixture being degenerate.
+#[test]
+fn one_stop_asks_for_one_lightning_window() {
+    let handler = GlmHandler::new();
+    let pane = PaneRef::bare(0);
+
+    let one = handler.residency_for(&pane, &[loop_hour(6)]);
+    assert_eq!(one.ranges().len(), 1);
+    assert_eq!(one.total(), chrono::Duration::minutes(5));
+
+    // Stops closer together than the window are ONE range, not two: a
+    // scrubbed pane sampling every minute does not ask for a range a minute.
+    let dense: Vec<chrono::NaiveDateTime> = (0..6)
+        .map(|k| loop_hour(6) + chrono::Duration::minutes(k))
+        .collect();
+    let merged = handler.residency_for(&pane, &dense);
+    assert_eq!(
+        merged.ranges().len(),
+        1,
+        "six overlapping windows are one stretch: {:?}",
+        merged.ranges(),
+    );
+    assert_eq!(
+        merged.total(),
+        chrono::Duration::minutes(10),
+        "5 min behind the first stop plus the 5 min the stops span, counted \
+         once",
+    );
+}
+
+fn loop_hour(k: i64) -> chrono::NaiveDateTime {
+    chrono::NaiveDate::from_ymd_opt(2026, 8, 22)
+        .expect("a real date")
+        .and_hms_opt(0, 0, 0)
+        .expect("a real time")
+        + chrono::Duration::hours(k)
+}

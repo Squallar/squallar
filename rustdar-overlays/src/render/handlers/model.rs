@@ -1217,6 +1217,26 @@ impl OverlayHandler for ModelDataHandler {
         13
     }
 
+    /// **The grids these stops draw from, and none of the hours between
+    /// them.**
+    ///
+    /// [`rustdar_source::time::frame_residency`], routed through
+    /// [`Self::latest_at`] like the other three framed layers.
+    ///
+    /// **The one layer whose stops can be ahead of the wall clock**, and this
+    /// needs no arm for it: a forecast grid's [`FrameStamp::valid`] is the
+    /// instant it depicts, so a stop two hours into the future is answered by
+    /// the same `valid <= t` rule as a stop two hours behind. `run` is
+    /// carried on the stamp and never compared here — which of two cycles a
+    /// grid came from does not change *when* it must be held.
+    fn residency_for(
+        &self,
+        pane: &PaneRef<'_>,
+        stops: &[chrono::NaiveDateTime],
+    ) -> rustdar_source::time::Residency {
+        rustdar_source::time::frame_residency(self, pane, stops)
+    }
+
     /// This layer comes in stamped frames, and answers every one of
     /// [`FrameSource`]'s methods below.
     fn frames(&self) -> Option<&dyn FrameSource> {
