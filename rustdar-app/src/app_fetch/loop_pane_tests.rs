@@ -44,23 +44,39 @@ fn pane_showing(site: RadarSite, timestamp: NaiveDateTime) -> PaneState {
     pane
 }
 
+/// **The fixture builds its frames through the production walk**, one polled
+/// scan at a time — not by writing a frame list into the timeline. A fixture
+/// that assembled the list itself could not tell a walk that appends from one
+/// that does not.
 fn pane_looping_on(site: RadarSite, lookback_secs: u64, frames: &[u32]) -> PaneState {
-    let mut pane = PaneState::with_site(site.name.to_string());
-    *pane.loop_state_mut() = rustdar_egui::radar_layer::begin_loop(
+    let mut panes = [PaneState::with_site(site.name.to_string())];
+    *panes[0].loop_state_mut() = rustdar_egui::radar_layer::begin_loop(
         lookback_secs,
         &site,
         rustdar_radar::types::RenderView::PlanView,
     );
     for &minute in frames {
-        let held = crate::app::render::loop_frames_held(
-            crate::app::render::test_loop_allocation(),
-            pane.loop_state(),
-            &crate::app::render::test_budgets(),
+        append_polled_frame_to_loops(
+            &mut panes,
+            &no_handlers(),
+            site.name,
+            ts(minute),
+            allocation(),
+            &budgets(),
         );
-        let clock = pane.time.mode;
-        append_polled_frame(pane.loop_state_mut(), site.name, ts(minute), held, clock);
     }
+    let [pane] = panes;
     pane
+}
+
+/// **A registry that registers nothing.** Radar's own frame supply answers an
+/// empty `frames_resident` by contract — its decoded volumes live above its
+/// handler — so an unregistered radar id and the real one give this walk the
+/// same answer, and every radar assertion below is about the polled stamp
+/// alone. The layer that DOES answer is exercised in
+/// `app_fetch/satellite_loop_append_tests.rs`.
+fn no_handlers() -> rustdar_overlays::render::overlay_state::OverlayRegistry {
+    rustdar_overlays::render::overlay_state::OverlayRegistry::with_handlers(Vec::new())
 }
 
 /// The live registry, so the axis `begin_loop_for_pane` branches on is the one
@@ -312,7 +328,14 @@ fn a_polled_scan_only_reaches_loops_on_its_own_site() {
         pane_looping_on(koun, 3600, &[0, 5]),
     ];
 
-    append_polled_frame_to_loops(&mut panes, "KTLX", ts(10), allocation(), &budgets());
+    append_polled_frame_to_loops(
+        &mut panes,
+        &no_handlers(),
+        "KTLX",
+        ts(10),
+        allocation(),
+        &budgets(),
+    );
 
     assert_eq!(frame_times(&panes[0]), vec![ts(0), ts(5), ts(10)]);
     assert_eq!(
@@ -328,14 +351,28 @@ fn the_loops_site_decides_not_the_panes_live_site() {
     let mut panes = [pane_looping_on(koun, 3600, &[0])];
     panes[0].set_site("KTLX".to_string());
 
-    append_polled_frame_to_loops(&mut panes, "KTLX", ts(10), allocation(), &budgets());
+    append_polled_frame_to_loops(
+        &mut panes,
+        &no_handlers(),
+        "KTLX",
+        ts(10),
+        allocation(),
+        &budgets(),
+    );
     assert_eq!(
         frame_times(&panes[0]),
         vec![ts(0)],
         "the loop is still a KOUN loop"
     );
 
-    append_polled_frame_to_loops(&mut panes, "KOUN", ts(10), allocation(), &budgets());
+    append_polled_frame_to_loops(
+        &mut panes,
+        &no_handlers(),
+        "KOUN",
+        ts(10),
+        allocation(),
+        &budgets(),
+    );
     assert_eq!(frame_times(&panes[0]), vec![ts(0), ts(10)]);
 }
 
@@ -348,8 +385,22 @@ fn an_inactive_loop_takes_no_frames() {
         "precondition: placeholder site"
     );
 
-    append_polled_frame_to_loops(&mut panes, "KTLX", ts(10), allocation(), &budgets());
-    append_polled_frame_to_loops(&mut panes, "", ts(11), allocation(), &budgets());
+    append_polled_frame_to_loops(
+        &mut panes,
+        &no_handlers(),
+        "KTLX",
+        ts(10),
+        allocation(),
+        &budgets(),
+    );
+    append_polled_frame_to_loops(
+        &mut panes,
+        &no_handlers(),
+        "",
+        ts(11),
+        allocation(),
+        &budgets(),
+    );
 
     assert!(panes[0].loop_state().frames.is_empty());
 }
@@ -359,10 +410,24 @@ fn a_polled_frame_is_inserted_in_time_order_and_never_twice() {
     let ktlx = site("KTLX", 35.33, -97.27);
     let mut panes = [pane_looping_on(ktlx, 3600, &[0, 10])];
 
-    append_polled_frame_to_loops(&mut panes, "KTLX", ts(5), allocation(), &budgets());
+    append_polled_frame_to_loops(
+        &mut panes,
+        &no_handlers(),
+        "KTLX",
+        ts(5),
+        allocation(),
+        &budgets(),
+    );
     assert_eq!(frame_times(&panes[0]), vec![ts(0), ts(5), ts(10)]);
 
-    append_polled_frame_to_loops(&mut panes, "KTLX", ts(5), allocation(), &budgets());
+    append_polled_frame_to_loops(
+        &mut panes,
+        &no_handlers(),
+        "KTLX",
+        ts(5),
+        allocation(),
+        &budgets(),
+    );
     assert_eq!(
         frame_times(&panes[0]),
         vec![ts(0), ts(5), ts(10)],
@@ -375,7 +440,14 @@ fn appending_evicts_past_the_lookback_window() {
     let ktlx = site("KTLX", 35.33, -97.27);
     let mut panes = [pane_looping_on(ktlx, 600, &[0, 5, 10])];
 
-    append_polled_frame_to_loops(&mut panes, "KTLX", ts(15), allocation(), &budgets());
+    append_polled_frame_to_loops(
+        &mut panes,
+        &no_handlers(),
+        "KTLX",
+        ts(15),
+        allocation(),
+        &budgets(),
+    );
 
     assert_eq!(
         frame_times(&panes[0]),
@@ -401,7 +473,14 @@ fn eviction_pulls_the_playhead_back_inside_the_list() {
         "precondition: the playhead is past where the window will leave it"
     );
 
-    append_polled_frame_to_loops(&mut panes, "KTLX", ts(25), allocation(), &budgets());
+    append_polled_frame_to_loops(
+        &mut panes,
+        &no_handlers(),
+        "KTLX",
+        ts(25),
+        allocation(),
+        &budgets(),
+    );
 
     assert_eq!(
         frame_times(&panes[0]),
@@ -443,7 +522,14 @@ fn a_scrubbed_panes_window_follows_its_clock_not_the_newest_frame() {
         "precondition: the pane is parked five minutes back"
     );
 
-    append_polled_frame_to_loops(&mut panes, "KTLX", ts(25), allocation(), &budgets());
+    append_polled_frame_to_loops(
+        &mut panes,
+        &no_handlers(),
+        "KTLX",
+        ts(25),
+        allocation(),
+        &budgets(),
+    );
 
     assert_eq!(
         frame_times(&panes[0]),
@@ -467,7 +553,14 @@ fn a_scrubbed_panes_window_follows_its_clock_not_the_newest_frame() {
         Some(ts(25)),
         "precondition: the clock moved forward onto the arrival"
     );
-    append_polled_frame_to_loops(&mut panes, "KTLX", ts(30), allocation(), &budgets());
+    append_polled_frame_to_loops(
+        &mut panes,
+        &no_handlers(),
+        "KTLX",
+        ts(30),
+        allocation(),
+        &budgets(),
+    );
     assert_eq!(
         frame_times(&panes[0]),
         vec![ts(25), ts(30)],
@@ -488,7 +581,14 @@ fn a_live_panes_window_is_still_anchored_on_its_newest_frame() {
         "precondition: a pane is live until something parks it"
     );
 
-    append_polled_frame_to_loops(&mut panes, "KTLX", ts(25), allocation(), &budgets());
+    append_polled_frame_to_loops(
+        &mut panes,
+        &no_handlers(),
+        "KTLX",
+        ts(25),
+        allocation(),
+        &budgets(),
+    );
 
     assert_eq!(
         frame_times(&panes[0]),
@@ -514,6 +614,7 @@ fn live_appends_do_not_take_a_loop_past_its_frame_cap() {
     for i in 1..=held as u32 {
         append_polled_frame_to_loops(
             &mut panes,
+            &no_handlers(),
             "KTLX",
             ts(newest + i * 4),
             allocation(),
@@ -544,7 +645,14 @@ fn capping_an_appended_loop_keeps_its_whole_window() {
 
     let newest = *sampled.last().expect("the cap is not zero");
     let appended = ts(newest + 4);
-    append_polled_frame_to_loops(&mut panes, "KTLX", appended, allocation(), &budgets());
+    append_polled_frame_to_loops(
+        &mut panes,
+        &no_handlers(),
+        "KTLX",
+        appended,
+        allocation(),
+        &budgets(),
+    );
 
     let times = frame_times(&panes[0]);
     assert_eq!(times.len(), held, "back inside the cap");
@@ -569,7 +677,14 @@ fn a_loop_holding_every_scan_re_measures_the_cadence_as_it_follows_the_site() {
     for (sampled, expected) in [(Some(false), Some(540)), (Some(true), Some(259))] {
         panes[0].loop_state_mut().sampled = sampled;
         panes[0].loop_state_mut().cadence_secs = Some(259);
-        append_polled_frame_to_loops(&mut panes, "KTLX", ts(36), allocation(), &budgets());
+        append_polled_frame_to_loops(
+            &mut panes,
+            &no_handlers(),
+            "KTLX",
+            ts(36),
+            allocation(),
+            &budgets(),
+        );
 
         assert_eq!(
             panes[0].loop_state().cadence_secs,

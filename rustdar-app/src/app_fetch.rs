@@ -2026,7 +2026,11 @@ impl super::App {
 
         let allocation = self.loop_allocation();
         let budgets = self.budgets;
-        append_polled_frame_to_loops(self.gui.panes_mut(), site, timestamp, allocation, &budgets);
+        // The registry travels with the panes: a poll is where every animating
+        // layer is asked what it has come to hold, and only radar's own stamp
+        // arrives as an argument.
+        let (panes, overlays) = self.gui.panes_and_overlays_mut();
+        append_polled_frame_to_loops(panes, overlays, site, timestamp, allocation, &budgets);
     }
 
     /// Re-initialize radar loops on all panes that have an active loop.
@@ -2560,46 +2564,209 @@ fn arm_layer_loop(
 }
 
 /// Append a frame for a scan polled from `site` at `timestamp` to every active
-/// loop that is on that site.
+/// loop that is on that site — **and every other animating layer's own newly
+/// published stamps at the same time.**
+///
+/// **A poll is the tick, not the payload.** All four reads here used to be
+/// `pane.loop_state()`, radar's slot, and the append itself was gated on
+/// `radar_layer::site(ls) != site`. A non-radar timeline's anchor is
+/// `Box::new(())`, so `radar_layer::site` answers `""` and that guard rejected
+/// unconditionally: **a satellite, MRMS or model loop never gained a frame
+/// after it was armed**, frozen for its whole life to the window captured at
+/// `handle_enable_loop`. It is the walk over `animating_layers` that fixes it,
+/// each layer answering [`FrameSource::frames_resident`] for itself — the
+/// stamps it is holding data for — while radar goes on taking the polled
+/// stamp, which is the one thing no handler can answer for it (its decoded
+/// volumes live above its handler, so its own `frames_resident` is empty and
+/// says so).
+///
+/// [`FrameSource::frames_resident`]: rustdar_source::time::FrameSource::frames_resident
 fn append_polled_frame_to_loops(
     panes: &mut [rustdar_egui::pane::PaneState],
+    overlays: &rustdar_overlays::render::overlay_state::OverlayRegistry,
     site: &str,
     timestamp: chrono::NaiveDateTime,
     allocation: crate::loop_pool::LoopAllocation,
     budgets: &rustdar_device_profile::budget::Budgets,
 ) {
     for (pane_idx, pane) in panes.iter_mut().enumerate() {
-        // The pane's whole-loop cap, divided across the layers it is
-        // animating — the budget is a texture-memory allowance and a pane
-        // animating two things spends it twice.
-        let held = super::render::layer_share(
-            allocation,
-            Some(super::render::loop_frames_held(
-                allocation,
-                pane.loop_state(),
-                budgets,
-            )),
-            crate::loop_pool::LoopFrameModel::from_budgets(budgets)
-                .bytes_for(pane.loop_state().view),
-            pane.animating_layers().count(),
-        );
-        // Read before the timeline is borrowed mutably: the window this
-        // append evicts against is the pane's clock, not the layer's.
+        let layers: Vec<rustdar_source::id::LayerId> = pane
+            .animating_layers()
+            .map(|slot| slot.id.clone())
+            .collect();
+        if layers.is_empty() {
+            continue;
+        }
+        // Hydrated once for the pane before any handler is asked about it, as
+        // everywhere else — and only for a pane that is animating something.
+        pane.hydrate_layer_states(overlays, pane_idx);
+        // Read before any timeline is borrowed mutably: the window this append
+        // evicts against is the pane's clock, not the layer's.
         let clock = pane.time.mode;
-        if append_polled_frame(pane.loop_state_mut(), site, timestamp, held, clock) {
-            // The frame list moved under the playhead — evicted at the front,
-            // possibly re-sampled — so the pane's clock names a different
-            // index now. It names the same INSTANT, which is the point.
-            pane.settle_playheads();
-            log::info!(
-                "Appended {} scan {} to loop on pane {} ({} frames)",
-                site,
-                timestamp,
-                pane_idx,
-                pane.loop_state().frames.len()
-            );
+        for layer in &layers {
+            let plan = {
+                let view = pane.view(pane_idx);
+                plan_loop_append(
+                    pane.time_state(layer),
+                    overlays,
+                    layer,
+                    &view.layer(layer),
+                    site,
+                    timestamp,
+                    clock,
+                    allocation,
+                    budgets,
+                    layers.len(),
+                )
+            };
+            let Some(plan) = plan else {
+                continue;
+            };
+            if append_polled_frame(
+                pane.time_state_mut(layer),
+                &plan.stamps,
+                plan.held,
+                plan.cutoff,
+            ) {
+                // The frame list moved under the playhead — evicted at the
+                // front, possibly re-sampled — so the pane's clock names a
+                // different index now. It names the same INSTANT, which is the
+                // point.
+                pane.settle_playheads();
+                log::info!(
+                    "Appended {} stamp(s) to the {} loop on pane {} ({} frames)",
+                    plan.stamps.len(),
+                    layer.as_str(),
+                    pane_idx,
+                    pane.time_state(layer).frames.len()
+                );
+            }
         }
     }
+}
+
+/// **What one animating layer takes from one poll**, decided entirely off
+/// immutable reads so the timeline is borrowed mutably exactly once.
+struct LoopAppend {
+    /// The stamps this timeline should gain, ascending. Never empty — a plan
+    /// with nothing to add is `None`, which is what keeps a layer whose loop
+    /// is on another site from evicting or re-sampling anything.
+    stamps: Vec<chrono::NaiveDateTime>,
+    /// This layer's share of the pane's frame cap.
+    held: usize,
+    /// The oldest instant to keep, or `None` for a timeline with no anchor to
+    /// measure a window from.
+    cutoff: Option<chrono::NaiveDateTime>,
+}
+
+/// [`LoopAppend`] for one layer, or `None` when this poll gives it nothing.
+///
+/// **Two sources of stamps, and they are clipped differently.** The polled
+/// stamp is an *event* — "this volume just published" — and is taken whole,
+/// exactly as it always was, gated on the loop's own geometry site.
+/// [`FrameSource::frames_resident`] is a *snapshot* of everything the handler
+/// holds for this pane, so it is clipped to the window this timeline can stop
+/// on: closed at both ends for a scrubbed pane, open at the newest edge for a
+/// live one, which is the whole of what "gains frames as the hours publish"
+/// means.
+///
+/// **The cutoff is the layer's own answer.** `residency_for` is asked over the
+/// stops this timeline will hold, and the retention reaches back to the
+/// earliest instant it names — never later than the span-derived edge, so a
+/// layer that answers nothing keeps exactly the window it always kept.
+///
+/// [`FrameSource::frames_resident`]: rustdar_source::time::FrameSource::frames_resident
+#[allow(clippy::too_many_arguments)]
+fn plan_loop_append(
+    ls: &rustdar_egui::pane::LayerTimeState,
+    overlays: &rustdar_overlays::render::overlay_state::OverlayRegistry,
+    layer: &rustdar_source::id::LayerId,
+    pane_ref: &rustdar_source::handler::PaneRef<'_>,
+    site: &str,
+    timestamp: chrono::NaiveDateTime,
+    clock: rustdar_egui::pane::TimeMode,
+    allocation: crate::loop_pool::LoopAllocation,
+    budgets: &rustdar_device_profile::budget::Budgets,
+    animating: usize,
+) -> Option<LoopAppend> {
+    if !ls.is_active() {
+        return None;
+    }
+
+    // The oldest instant this timeline's window reaches, on the span alone.
+    let lookback = chrono::Duration::seconds(ls.span_secs as i64);
+    // A scrubbed pane's window is closed at the instant it is parked on; a
+    // live pane's newest edge is wherever the source has got to.
+    let parked = clock.as_of();
+
+    let mut stamps: Vec<chrono::NaiveDateTime> = overlays
+        .frames_resident(layer, pane_ref)
+        .into_iter()
+        .map(|stamp| stamp.valid)
+        .filter(|valid| parked.is_none_or(|instant| *valid <= instant))
+        .collect();
+    // `LayerTimeState::site` is the loop's *geometry* site, captured when the
+    // loop was built — not the pane's live `site` field. A layer with no
+    // geometry reads `""` back, which no polled scan's site ever equals.
+    if rustdar_egui::radar_layer::site(ls) == site {
+        stamps.push(timestamp);
+    }
+    stamps.retain(|valid| !ls.frames.iter().any(|f| f.timestamp == *valid));
+    stamps.sort_unstable();
+    stamps.dedup();
+    if stamps.is_empty() {
+        return None;
+    }
+
+    // **The window is anchored on the pane's CLOCK** (WO-M12f), resolved
+    // through this layer's own axis: a live pane's clock is the newest frame
+    // it will hold once this append lands — which is what `TimeMode::Live`
+    // means to a frame series — and a scrubbed pane's is the instant it is
+    // parked on. Anchored on the newest frame unconditionally, as it was, one
+    // arriving live frame evicted the frames a scrubbed pane was looking at.
+    let anchor = parked.or_else(|| {
+        ls.frames
+            .last()
+            .map(|f| f.timestamp)
+            .into_iter()
+            .chain(stamps.last().copied())
+            .max()
+    });
+    let cutoff = anchor.map(|anchor| {
+        let edge = anchor - lookback;
+        // The stops this timeline will be able to make once the append lands,
+        // offered to the layer so the frame each is DRAWN from is retained
+        // even where its stamp precedes the window — the leading partial step
+        // a window-edge cutoff drops.
+        let stops: Vec<chrono::NaiveDateTime> = ls
+            .frames
+            .iter()
+            .map(|f| f.timestamp)
+            .chain(stamps.iter().copied())
+            .filter(|valid| *valid >= edge)
+            .chain(std::iter::once(anchor))
+            .collect();
+        overlays
+            .residency_for(layer, pane_ref, &stops)
+            .extent()
+            .map_or(edge, |(start, _)| start.min(edge))
+    });
+
+    Some(LoopAppend {
+        // The pane's whole-loop cap, divided across the layers it is
+        // animating — the budget is a texture-memory allowance and a pane
+        // animating two things spends it twice. Read off THIS layer's
+        // timeline, not radar's slot: the two have different views and
+        // therefore different prices per frame.
+        held: super::render::layer_share(
+            allocation,
+            Some(super::render::loop_frames_held(allocation, ls, budgets)),
+            crate::loop_pool::LoopFrameModel::from_budgets(budgets).bytes_for(ls.view),
+            animating,
+        ),
+        cutoff,
+        stamps,
+    })
 }
 
 /// **The instant a layer's raster should depict, for the pane it is dispatched
@@ -2739,57 +2906,45 @@ fn depicted_frames_for_layer(
         .collect()
 }
 
-/// Add a frame at `timestamp` to `ls` if the loop is active, is on `site`, and does
-/// not already have that frame. Returns whether a frame was added.
+/// Add `stamps` to `ls`, evict past `cutoff`, and re-measure. Returns whether
+/// anything was added.
+///
+/// **The decisions are all upstream, in [`plan_loop_append`]**: which stamps
+/// this timeline is owed, what its share of the frame cap is and how far back
+/// it retains. `stamps` is already ascending, already free of duplicates and
+/// already free of instants `ls` holds, so an empty list never reaches here —
+/// which is what keeps a poll for another site from evicting or re-sampling a
+/// timeline it has nothing to give.
 fn append_polled_frame(
     ls: &mut rustdar_egui::pane::LayerTimeState,
-    site: &str,
-    timestamp: chrono::NaiveDateTime,
+    stamps: &[chrono::NaiveDateTime],
     held: usize,
-    clock: rustdar_egui::pane::TimeMode,
+    cutoff: Option<chrono::NaiveDateTime>,
 ) -> bool {
     use rustdar_egui::pane::LoopFrame;
 
-    if !ls.is_active() {
-        return false;
-    }
-    // `LayerTimeState::site` is the loop's *geometry* site, captured when the loop
-    // was built — not the pane's live `site` field.
-    if radar_layer::site(ls) != site {
-        return false;
-    }
-    if ls.frames.iter().any(|f| f.timestamp == timestamp) {
+    if stamps.is_empty() {
         return false;
     }
 
-    let insert_pos = ls.frames.partition_point(|f| f.timestamp < timestamp);
-    ls.frames.insert(
-        insert_pos,
-        LoopFrame {
-            timestamp,
-            image: None,
-            render_in_flight: false,
-            render_failed: false,
-        },
-    );
+    for &timestamp in stamps {
+        let insert_pos = ls.frames.partition_point(|f| f.timestamp < timestamp);
+        ls.frames.insert(
+            insert_pos,
+            LoopFrame {
+                timestamp,
+                image: None,
+                render_in_flight: false,
+                render_failed: false,
+            },
+        );
+    }
 
-    // **The window is anchored on the pane's CLOCK** (WO-M12f), resolved
-    // through this layer's own axis: a live pane's clock is the newest frame
-    // it holds — which is what `TimeMode::Live` means to a frame series — and
-    // a scrubbed pane's is the instant it is parked on. Anchored on the newest
-    // frame unconditionally, as it was, one arriving live frame evicted the
-    // frames a scrubbed pane was actually looking at.
-    let lookback = chrono::Duration::seconds(ls.span_secs as i64);
-    let anchor = match clock {
-        rustdar_egui::pane::TimeMode::AsOf(instant) => Some(instant),
-        rustdar_egui::pane::TimeMode::Live => ls.frames.last().map(|f| f.timestamp),
-    };
-    if let Some(anchor) = anchor {
-        let cutoff = anchor - lookback;
+    if let Some(cutoff) = cutoff {
         ls.frames.retain(|f| f.timestamp >= cutoff);
     }
 
-    // Re-measure the site's cadence, while it is still measurable.
+    // Re-measure the cadence, while it is still measurable.
     if ls.sampled != Some(true) {
         let times: Vec<_> = ls.frames.iter().map(|f| f.timestamp).collect();
         if let Some(step) = super::render::median_step_secs(&times) {
@@ -2800,7 +2955,7 @@ fn append_polled_frame(
     // And back inside the frame cap. Last, so the cadence above is read off the
     // full scan list on the append that first overruns the cap.
     if ls.cap_frames(held) {
-        log::info!("Loop: live appends took the frame list past {held}; re-sampled for {site}");
+        log::info!("Loop: live appends took the frame list past {held}; re-sampled");
     }
 
     true
@@ -2881,3 +3036,9 @@ mod site_switch_tests;
 #[cfg(test)]
 #[path = "app_fetch/overlay_arrival_tests.rs"]
 mod overlay_arrival_tests;
+
+/// A non-radar loop gains a frame when its own source publishes one — the
+/// append walk read radar's slot and rejected every other layer's timeline.
+#[cfg(test)]
+#[path = "app_fetch/satellite_loop_append_tests.rs"]
+mod satellite_loop_append_tests;

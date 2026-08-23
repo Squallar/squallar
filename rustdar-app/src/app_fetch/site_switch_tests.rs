@@ -352,13 +352,14 @@ fn a_pane_that_did_not_change_radar_keeps_its_loop() {
         rustdar_radar::types::RenderView::PlanView,
     );
     for minute in [0, 4, 8] {
-        let held = crate::app::render::loop_frames_held(
+        super::append_polled_frame_to_loops(
+            std::slice::from_mut(pane),
+            &rustdar_overlays::render::overlay_state::OverlayRegistry::with_handlers(Vec::new()),
+            BYSTANDER,
+            at(minute),
             crate::app::render::test_loop_allocation(),
-            pane.loop_state(),
             &crate::app::render::test_budgets(),
         );
-        let clock = pane.time.mode;
-        super::append_polled_frame(pane.loop_state_mut(), BYSTANDER, at(minute), held, clock);
     }
     let frames_before: Vec<NaiveDateTime> = pane
         .loop_state()
@@ -470,13 +471,14 @@ fn re_picking_the_site_a_pane_is_on_keeps_its_loop() {
         rustdar_radar::types::RenderView::PlanView,
     );
     for minute in [0, 4, 8] {
-        let held = crate::app::render::loop_frames_held(
+        super::append_polled_frame_to_loops(
+            std::slice::from_mut(pane),
+            &rustdar_overlays::render::overlay_state::OverlayRegistry::with_handlers(Vec::new()),
+            WSR88D,
+            at(minute),
             crate::app::render::test_loop_allocation(),
-            pane.loop_state(),
             &crate::app::render::test_budgets(),
         );
-        let clock = pane.time.mode;
-        super::append_polled_frame(pane.loop_state_mut(), WSR88D, at(minute), held, clock);
     }
     let frames_before: Vec<NaiveDateTime> = pane
         .loop_state()
