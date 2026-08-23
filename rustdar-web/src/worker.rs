@@ -87,9 +87,12 @@ fn handle_message(scope: &web_sys::DedicatedWorkerGlobalScope, data: &JsValue) {
 /// The reply is the `OUT`/`OUT_KIND`/`TAILS` trio: `OUT` carries the row's
 /// `encode_out` HEAD as one transferred `Uint8Array`, `TAILS` the row's
 /// nominated large flat buffers as per-tail `Uint8Array`s, each transferred.
-/// Every buffer is one copy out of this instance's linear memory (unavoidable
-/// without a `SharedArrayBuffer`) and is then transferred: 26.08 MiB per
-/// widest 2048² still frame, where the one-buffer shape paid 68.16.
+/// Every buffer is one copy out of this instance's linear memory and is then
+/// transferred: 26.08 MiB per widest 2048² still frame, where the one-buffer
+/// shape paid 68.16. The copy survived WS3b — this instance's memory is a
+/// `SharedArrayBuffer` now, but it is not the PAGE's, and skipping the copy
+/// would mean handing the page a view into a region this worker must then not
+/// reuse until told. See `worker_port::deliver`.
 ///
 /// `None` writes explicit nulls rather than posting nothing: the page holds a
 /// render slot against every id, and silence wedges it.
