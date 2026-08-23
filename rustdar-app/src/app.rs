@@ -1,5 +1,6 @@
 use egui_wgpu::wgpu;
 use rustdar_egui::radar_layer;
+use rustdar_source::id::known;
 use std::collections::HashMap;
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
@@ -1756,17 +1757,29 @@ impl App {
         // One instant for the whole sweep, so two panes fetching the same listing cannot be
         // judged against two different clocks.
         let now = web_time::Instant::now();
-        for idx in 0..self.gui.pane_count() {
-            let Some(pane) = self.gui.pane(idx) else {
-                continue;
-            };
+        // **The visible slice, walked once rather than indexed.** `panes()`
+        // yields `..min(pane_count, panes.len())` and the index loop this
+        // replaced visited `0..pane_count` and found `None` past the end, so
+        // the set is identical — WI-0's proof, applied again. The index was
+        // never read inside the body. One reach where there were two, and the
+        // walk exists to read loop state, which is what makes it WO-T3.7's to
+        // shed.
+        for pane in self.gui.panes() {
             if let Some(info) = pane.scan_info.as_ref() {
                 needed
                     .entry(info.site.name)
                     .or_default()
                     .insert(info.timestamp);
             }
-            let ls = &pane.loop_state();
+            // **Radar-addressed, and it stays that way** (WO-T3.7).
+            // Everything this walk retains is radar's: `retain_plan_frames`,
+            // `retain_scans`, `retain_l3` and `retain_l3_keys` are keyed by
+            // NEXRAD site, and the site comes from `radar_layer::site(ls)` —
+            // the geometry anchor only a radar timeline carries. A satellite or
+            // model timeline answers `""` there, so a transport-addressed read
+            // would file every loop's frames under the empty site and evict the
+            // real one's volumes on the next sweep.
+            let ls = &pane.time_state(&known::RADAR);
             if !ls.is_active() {
                 continue;
             }

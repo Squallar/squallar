@@ -346,7 +346,7 @@ fn a_pane_that_did_not_change_radar_keeps_its_loop() {
         .expect("KTLX is in the resolved site table")
         .clone();
     let pane = app.gui.pane_mut(1).expect("the fixture built two panes");
-    *pane.loop_state_mut() = rustdar_egui::radar_layer::begin_loop(
+    *pane.time_state_mut(&known::RADAR) = rustdar_egui::radar_layer::begin_loop(
         3600,
         &bystander_site,
         rustdar_radar::types::RenderView::PlanView,
@@ -362,7 +362,7 @@ fn a_pane_that_did_not_change_radar_keeps_its_loop() {
         );
     }
     let frames_before: Vec<NaiveDateTime> = pane
-        .loop_state()
+        .time_state(&known::RADAR)
         .frames
         .iter()
         .map(|frame| frame.timestamp)
@@ -405,7 +405,7 @@ fn a_pane_that_did_not_change_radar_keeps_its_loop() {
         .gui
         .pane(1)
         .expect("the fixture built two panes")
-        .loop_state();
+        .time_state(&known::RADAR);
     assert!(
         loop_state.is_active(),
         "another pane's site switch switched this pane's loop off",
@@ -465,7 +465,7 @@ fn re_picking_the_site_a_pane_is_on_keeps_its_loop() {
         .expect("KPBZ is in the resolved site table")
         .clone();
     let pane = app.gui.pane_mut(0).expect("a fresh Gui has one pane");
-    *pane.loop_state_mut() = rustdar_egui::radar_layer::begin_loop(
+    *pane.time_state_mut(&known::RADAR) = rustdar_egui::radar_layer::begin_loop(
         3600,
         &radar_site,
         rustdar_radar::types::RenderView::PlanView,
@@ -481,7 +481,7 @@ fn re_picking_the_site_a_pane_is_on_keeps_its_loop() {
         );
     }
     let frames_before: Vec<NaiveDateTime> = pane
-        .loop_state()
+        .time_state(&known::RADAR)
         .frames
         .iter()
         .map(|frame| frame.timestamp)
@@ -508,7 +508,7 @@ fn re_picking_the_site_a_pane_is_on_keeps_its_loop() {
         .gui
         .pane(0)
         .expect("a fresh Gui has one pane")
-        .loop_state();
+        .time_state(&known::RADAR);
     assert!(
         loop_state.is_active(),
         "a no-op pick switched the pane's loop off; nothing rebuilds it, so the \

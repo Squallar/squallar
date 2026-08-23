@@ -5,6 +5,7 @@ use crate::platform_double::TestBridge;
 use crate::render_dispatch::CachedRenderOutput;
 use rustdar_radar::chunks::{ClosedVolume, PollOutcome, VolumeIndex, VolumeProgress};
 use rustdar_radar::types::RadarProduct;
+use rustdar_source::id::known;
 use std::sync::Arc;
 
 fn vol(index: u16) -> VolumeIndex {
@@ -185,7 +186,12 @@ fn a_completed_volume_re_renders_every_whole_volume_pane() {
 #[test]
 fn a_completed_volume_reaches_the_scan_info_and_the_loop_cache() {
     let mut app = app_showing_a_drawn_volume(RadarProduct::EchoTopsInterpolated);
-    app.gui.pane_mut(0).unwrap().loop_state_mut().frames.clear();
+    app.gui
+        .pane_mut(0)
+        .unwrap()
+        .time_state_mut(&known::RADAR)
+        .frames
+        .clear();
 
     app.apply_chunk_outcome("KTLX", &closing_round(5));
 

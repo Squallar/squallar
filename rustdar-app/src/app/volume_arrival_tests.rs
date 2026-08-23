@@ -618,7 +618,7 @@ fn an_arrival_is_refused_by_a_pane_playing_a_3d_loop() {
         render_in_flight: false,
         render_failed: false,
     }];
-    *pane.loop_state_mut() = playing;
+    *pane.time_state_mut(&known::RADAR) = playing;
     assert!(
         pane.active_volume_frame().is_some(),
         "fixture precondition: the playhead really is on a resident grid",

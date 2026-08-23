@@ -160,14 +160,14 @@ pub(super) fn render_pane_map_content(
             match id {
                 id if *id == known::RADAR => {
                     // **Radar-addressed, and it stays that way** (WI-1 left
-                    // this site for WI-6 to judge). `loop_state()` IS
-                    // `time_state(&RADAR)`, and everything under it reads
+                    // this site for WI-6 to judge). It is spelled
+                    // `time_state(&known::RADAR)`, and everything under it reads
                     // radar's own picture: retargeting it at the transport
                     // would ask a model timeline whether to paint radar's
                     // texture. The generic arm below asks the same question of
                     // its own layer, which is the same rule, not a different
                     // one.
-                    if ctx.pane.loop_state().is_active() {
+                    if ctx.pane.time_state(&known::RADAR).is_active() {
                         if let Some(img) = ctx.pane.active_image().cloned() {
                             render_radar_overlay(
                                 ui,

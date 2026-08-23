@@ -4,6 +4,7 @@ use crate::pane::PaneState;
 use rustdar_radar::beam;
 use rustdar_radar::sampler::SampleStatus;
 use rustdar_radar::xsect::{CrossSection, SECTION_HEIGHT, SECTION_WIDTH, SectionAxes};
+use rustdar_source::id::known;
 use rustdar_source::product::FieldId;
 use rustdar_units::UserPreferences;
 
@@ -54,7 +55,7 @@ pub(super) fn render_cross_section(
     // to judge). A section pane draws radar's cross-section and nothing else —
     // `LoopFrameImage` has no non-radar section shape — so the loop this pane
     // animates is radar's by construction.
-    let looping = pane.loop_state().is_active();
+    let looping = pane.time_state(&known::RADAR).is_active();
     let (state, line) = {
         let Some(state) = pane.cross_section() else {
             return;

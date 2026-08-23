@@ -138,7 +138,7 @@ fn textured_frames(ctx: &egui::Context, stamps: &[chrono::NaiveDateTime]) -> Vec
 /// Four assertions, in the order the frame makes them:
 ///
 /// 1. **the gate** — the transport reaches `LoopPhase::Playing`. Before WI-1
-///    the readiness walk read `loop_state()`, radar's slot by definition, so a
+///    the readiness walk read radar's slot by definition, so a
 ///    model loop that reached `Ready` was never started and the ∞ toggle did
 ///    nothing at all on a radar-off pane;
 /// 2. **the clock** — the presented stamp is the frame at or before now, not
@@ -150,8 +150,9 @@ fn textured_frames(ctx: &egui::Context, stamps: &[chrono::NaiveDateTime]) -> Vec
 ///    instant instead of following the model 48 h forward;
 /// 4. **the tick walks that layer's own frames**, forward and wrapping.
 ///
-/// **Floor A — `radar_addressed_start`:** put `loop_state()`/`loop_state_mut()`
-/// back in `sync_loop_playback_start`. Assertion 1 fails: the phase stays
+/// **Floor A — `radar_addressed_start`:** put
+/// `time_state(&known::RADAR)`/`time_state_mut(&known::RADAR)` back in
+/// `sync_loop_playback_start`. Assertion 1 fails: the phase stays
 /// `Ready` for ever. This is the defect the item exists for.
 ///
 /// **Floor B — `live_start`:** restore `pane.set_time_mode(TimeMode::Live)` as

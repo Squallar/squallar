@@ -809,7 +809,7 @@ fn a_pane_animating_two_layers_divides_its_bytes_and_not_its_frame_count() {
     *app.gui
         .pane_mut(0)
         .expect("the fixture built a pane")
-        .loop_state_mut() = rustdar_egui::radar_layer::begin_loop(
+        .time_state_mut(&known::RADAR) = rustdar_egui::radar_layer::begin_loop(
         24 * 3600,
         &radar_site(),
         rustdar_radar::types::RenderView::PlanView,
@@ -862,12 +862,12 @@ fn a_pane_animating_two_layers_divides_its_bytes_and_not_its_frame_count() {
     crate::app::render::accept_scan_listing_for_test(
         allocation,
         &budgets,
-        pane.loop_state_mut(),
+        pane.time_state_mut(&known::RADAR),
         "KTLX",
         scans.clone(),
         animating,
     );
-    let radar_held = pane.loop_state().frames.len();
+    let radar_held = pane.time_state(&known::RADAR).frames.len();
 
     assert!(
         radar_held < scans.len() && overlay_held < listed.len(),
@@ -929,7 +929,7 @@ fn a_radar_off_pane_looping_a_model_layer_is_a_share_of_the_pool() {
 
     let pane = app.gui.pane(0).expect("pane 0");
     assert!(
-        !pane.loop_state().is_active(),
+        !pane.time_state(&known::RADAR).is_active(),
         "premise: radar is NOT looping on this pane — that is the whole case",
     );
     assert_eq!(

@@ -3495,20 +3495,20 @@ fn a_listing_that_arrives_on_the_source_path_builds_the_loop_waiting_for_it() {
     let range = (at(0) - chrono::Duration::seconds(span_secs as i64), at(0));
     let pane = app.gui.pane_mut(0).expect("the fixture built one pane");
     pane.scan_info = Some(scan_info_for("KTLX"));
-    *pane.loop_state_mut() = rustdar_egui::radar_layer::begin_loop(
+    *pane.time_state_mut(&known::RADAR) = rustdar_egui::radar_layer::begin_loop(
         span_secs,
         &SITE,
         rustdar_radar::types::RenderView::PlanView,
     );
-    pane.loop_state_mut().asked_range = Some(range);
+    pane.time_state_mut(&known::RADAR).asked_range = Some(range);
     assert_eq!(
-        pane.loop_state().phase,
+        pane.time_state(&known::RADAR).phase,
         rustdar_egui::pane::LoopPhase::FetchingScanList,
         "precondition: the pane must be waiting on a listing, or the arrival \
          has nothing to answer",
     );
     assert!(
-        pane.loop_state().frames.is_empty(),
+        pane.time_state(&known::RADAR).frames.is_empty(),
         "precondition: the loop has no frames yet",
     );
 
@@ -3553,7 +3553,7 @@ fn a_listing_that_arrives_on_the_source_path_builds_the_loop_waiting_for_it() {
         .gui
         .pane(0)
         .expect("the fixture built one pane")
-        .loop_state();
+        .time_state(&known::RADAR);
     assert_eq!(
         loop_state
             .frames
@@ -3679,14 +3679,14 @@ fn a_hidden_panes_loop_is_still_built_from_the_site_it_is_on_now() {
     let pane = app.gui.pane_mut(1).expect("the fixture built two panes");
     pane.set_site("KOUN".to_string());
     pane.scan_info = Some(scan_info_for("KOUN"));
-    *pane.loop_state_mut() = rustdar_egui::radar_layer::begin_loop(
+    *pane.time_state_mut(&known::RADAR) = rustdar_egui::radar_layer::begin_loop(
         span_secs,
         &KOUN,
         rustdar_radar::types::RenderView::PlanView,
     );
-    pane.loop_state_mut().asked_range = Some(range);
+    pane.time_state_mut(&known::RADAR).asked_range = Some(range);
     assert_eq!(
-        pane.loop_state().phase,
+        pane.time_state(&known::RADAR).phase,
         rustdar_egui::pane::LoopPhase::FetchingScanList,
         "precondition: the hidden pane must be waiting on a listing",
     );
@@ -3722,7 +3722,7 @@ fn a_hidden_panes_loop_is_still_built_from_the_site_it_is_on_now() {
         .gui
         .pane(1)
         .expect("the fixture built two panes")
-        .loop_state();
+        .time_state(&known::RADAR);
     assert_eq!(
         loop_state
             .frames
@@ -3762,14 +3762,14 @@ fn a_listing_for_one_site_leaves_another_sites_pane_waiting() {
     let range = (at(0) - chrono::Duration::seconds(span_secs as i64), at(0));
     let pane = app.gui.pane_mut(0).expect("the fixture built one pane");
     pane.scan_info = Some(scan_info_for("KOUN"));
-    *pane.loop_state_mut() = rustdar_egui::radar_layer::begin_loop(
+    *pane.time_state_mut(&known::RADAR) = rustdar_egui::radar_layer::begin_loop(
         span_secs,
         &KOUN,
         rustdar_radar::types::RenderView::PlanView,
     );
     // The very window the listing below covers, so the refusal observed is
     // the SITE guard's and not the window match's.
-    pane.loop_state_mut().asked_range = Some(range);
+    pane.time_state_mut(&known::RADAR).asked_range = Some(range);
 
     // KTLX's listing, arriving while the only pane is on KOUN.
     let scans = vec![(
@@ -3803,7 +3803,7 @@ fn a_listing_for_one_site_leaves_another_sites_pane_waiting() {
         .gui
         .pane(0)
         .expect("the fixture built one pane")
-        .loop_state();
+        .time_state(&known::RADAR);
     assert!(
         loop_state.frames.is_empty(),
         "another site's listing was poured into this pane's frame list",
@@ -3850,12 +3850,13 @@ fn a_listing_over_one_window_does_not_build_a_loop_asking_about_another() {
             .pane_mut(pane_idx)
             .expect("the fixture built two panes");
         pane.scan_info = Some(scan_info_for("KTLX"));
-        *pane.loop_state_mut() = rustdar_egui::radar_layer::begin_loop(
+        *pane.time_state_mut(&known::RADAR) = rustdar_egui::radar_layer::begin_loop(
             span_secs,
             &SITE,
             rustdar_radar::types::RenderView::PlanView,
         );
-        pane.loop_state_mut().asked_range = Some((at(-((span_secs / 60) as i64)), at(0)));
+        pane.time_state_mut(&known::RADAR).asked_range =
+            Some((at(-((span_secs / 60) as i64)), at(0)));
     }
 
     let range = (at(-10), at(0));
@@ -3898,7 +3899,7 @@ fn a_listing_over_one_window_does_not_build_a_loop_asking_about_another() {
         app.gui
             .pane(0)
             .expect("the fixture built two panes")
-            .loop_state()
+            .time_state(&known::RADAR)
             .frames
             .len(),
         scans.len(),
@@ -3908,7 +3909,7 @@ fn a_listing_over_one_window_does_not_build_a_loop_asking_about_another() {
         app.gui
             .pane(1)
             .expect("the fixture built two panes")
-            .loop_state()
+            .time_state(&known::RADAR)
             .frames
             .is_empty(),
         "a ten-minute listing was poured into a loop asking about half an hour",
@@ -3917,7 +3918,7 @@ fn a_listing_over_one_window_does_not_build_a_loop_asking_about_another() {
         app.gui
             .pane(1)
             .expect("the fixture built two panes")
-            .loop_state()
+            .time_state(&known::RADAR)
             .phase,
         rustdar_egui::pane::LoopPhase::FetchingScanList,
         "the half-hour loop was retired by a listing that never answered it",

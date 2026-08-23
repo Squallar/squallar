@@ -50,7 +50,7 @@ fn pane_showing(site: RadarSite, timestamp: NaiveDateTime) -> PaneState {
 /// that does not.
 fn pane_looping_on(site: RadarSite, lookback_secs: u64, frames: &[u32]) -> PaneState {
     let mut panes = [PaneState::with_site(site.name.to_string())];
-    *panes[0].loop_state_mut() = rustdar_egui::radar_layer::begin_loop(
+    *panes[0].time_state_mut(&known::RADAR) = rustdar_egui::radar_layer::begin_loop(
         lookback_secs,
         &site,
         rustdar_radar::types::RenderView::PlanView,
@@ -113,11 +113,11 @@ fn budgets() -> rustdar_device_profile::budget::Budgets {
 }
 
 fn held_for(pane: &PaneState) -> usize {
-    crate::app::render::loop_frames_held(allocation(), pane.loop_state(), &budgets())
+    crate::app::render::loop_frames_held(allocation(), pane.time_state(&known::RADAR), &budgets())
 }
 
 fn frame_times(pane: &PaneState) -> Vec<NaiveDateTime> {
-    pane.loop_state()
+    pane.time_state(&known::RADAR)
         .frames
         .iter()
         .map(|f| f.timestamp)
@@ -153,13 +153,13 @@ fn a_loop_is_built_from_its_own_panes_scan_not_the_active_panes() {
     );
     assert_eq!(req.start, ts(15), "walked back by the lookback");
 
-    let ls = panes[1].loop_state();
+    let ls = panes[1].time_state(&known::RADAR);
     assert_eq!(rustdar_egui::radar_layer::site(ls), "KOUN");
     assert_eq!(rustdar_egui::radar_layer::coords(ls).0, 35.23);
     assert_eq!(rustdar_egui::radar_layer::coords(ls).1, -97.46);
     assert!(ls.is_fetching(), "and it is waiting for that listing");
 
-    assert!(!panes[0].loop_state().is_active());
+    assert!(!panes[0].time_state(&known::RADAR).is_active());
 
     let req = arm_layer_loop(&mut panes, &mut reg, 0, ts(0), 600, &known::RADAR, None)
         .expect("pane 0 has a scan");
@@ -177,7 +177,10 @@ fn a_pane_with_no_scan_yields_no_loop() {
     let mut reg = registry();
 
     assert!(arm_layer_loop(&mut panes, &mut reg, 1, ts(0), 600, &known::RADAR, None).is_none());
-    assert!(!panes[1].loop_state().is_active(), "no loop was started");
+    assert!(
+        !panes[1].time_state(&known::RADAR).is_active(),
+        "no loop was started"
+    );
     assert!(
         arm_layer_loop(&mut panes, &mut reg, 7, ts(0), 600, &known::RADAR, None).is_none(),
         "and neither does a pane that does not exist"
@@ -227,13 +230,13 @@ fn a_layer_handed_a_window_is_listed_over_that_window() {
          holds frames at instants the pane's clock can never stop on",
     );
     assert_eq!(
-        panes[0].loop_state().span_secs,
+        panes[0].time_state(&known::RADAR).span_secs,
         (ts(160) - ts(100)).num_seconds() as u64,
         "and the span it records is the handed window's, which is what the \
          arrival path matches a landing listing against",
     );
     assert_eq!(
-        panes[0].loop_state().asked_range,
+        panes[0].time_state(&known::RADAR).asked_range,
         Some((ts(100), ts(160))),
         "as is the ask it recorded",
     );
@@ -380,7 +383,7 @@ fn the_loops_site_decides_not_the_panes_live_site() {
 fn an_inactive_loop_takes_no_frames() {
     let mut panes = [PaneState::with_site("KTLX".to_string())];
     assert_eq!(
-        rustdar_egui::radar_layer::site(panes[0].loop_state()),
+        rustdar_egui::radar_layer::site(panes[0].time_state(&known::RADAR)),
         "",
         "precondition: placeholder site"
     );
@@ -402,7 +405,7 @@ fn an_inactive_loop_takes_no_frames() {
         &budgets(),
     );
 
-    assert!(panes[0].loop_state().frames.is_empty());
+    assert!(panes[0].time_state(&known::RADAR).frames.is_empty());
 }
 
 #[test]
@@ -465,10 +468,10 @@ fn eviction_pulls_the_playhead_back_inside_the_list() {
     // straight after — and after WO-M12f that posture is what decides the
     // window: a live pane's is anchored on its newest frame, exactly as every
     // pane's was before. The scrubbed pane's is pinned next door.
-    panes[0].park_on_loop_frame(2);
+    panes[0].park_on_frame(&known::RADAR, 2);
     panes[0].set_time_mode(rustdar_egui::pane::TimeMode::Live);
     assert_eq!(
-        panes[0].loop_state().current_frame(),
+        panes[0].time_state(&known::RADAR).current_frame(),
         2,
         "precondition: the playhead is past where the window will leave it"
     );
@@ -488,15 +491,15 @@ fn eviction_pulls_the_playhead_back_inside_the_list() {
         "precondition: only the new frame survives"
     );
     assert_eq!(
-        panes[0].loop_state().current_frame(),
+        panes[0].time_state(&known::RADAR).current_frame(),
         0,
         "the playhead must land on a frame that exists"
     );
     assert!(
         panes[0]
-            .loop_state()
+            .time_state(&known::RADAR)
             .frames
-            .get(panes[0].loop_state().current_frame())
+            .get(panes[0].time_state(&known::RADAR).current_frame())
             .is_some(),
         "and resolve to one, which is what the pane renders through"
     );
@@ -515,9 +518,9 @@ fn eviction_pulls_the_playhead_back_inside_the_list() {
 fn a_scrubbed_panes_window_follows_its_clock_not_the_newest_frame() {
     let ktlx = site("KTLX", 35.33, -97.27);
     let mut panes = [pane_looping_on(ktlx, 600, &[0, 5, 10])];
-    panes[0].park_on_loop_frame(1);
+    panes[0].park_on_frame(&known::RADAR, 1);
     assert_eq!(
-        panes[0].loop_state().playhead_stamp(),
+        panes[0].time_state(&known::RADAR).playhead_stamp(),
         Some(ts(5)),
         "precondition: the pane is parked five minutes back"
     );
@@ -538,7 +541,7 @@ fn a_scrubbed_panes_window_follows_its_clock_not_the_newest_frame() {
          arrival — the window followed the newest frame instead of the clock"
     );
     assert_eq!(
-        panes[0].loop_state().playhead_stamp(),
+        panes[0].time_state(&known::RADAR).playhead_stamp(),
         Some(ts(5)),
         "and the playhead still names the instant it was parked on"
     );
@@ -547,9 +550,9 @@ fn a_scrubbed_panes_window_follows_its_clock_not_the_newest_frame() {
     // the clock onto the new frame and the same window now bites, dropping
     // everything more than the lookback behind it. Without this the test
     // above could not tell a clock-anchored cutoff from no cutoff at all.
-    panes[0].park_on_loop_frame(3);
+    panes[0].park_on_frame(&known::RADAR, 3);
     assert_eq!(
-        panes[0].loop_state().playhead_stamp(),
+        panes[0].time_state(&known::RADAR).playhead_stamp(),
         Some(ts(25)),
         "precondition: the clock moved forward onto the arrival"
     );
@@ -603,9 +606,9 @@ fn live_appends_do_not_take_a_loop_past_its_frame_cap() {
     let held = held_for(&pane_looping_on(ktlx.clone(), 72 * 3600, &[]));
     let sampled: Vec<u32> = (0..held as u32).map(|i| i * 26).collect();
     let mut panes = [pane_looping_on(ktlx, 72 * 3600, &sampled)];
-    panes[0].loop_state_mut().sampled = Some(true);
+    panes[0].time_state_mut(&known::RADAR).sampled = Some(true);
     assert_eq!(
-        panes[0].loop_state().frames.len(),
+        panes[0].time_state(&known::RADAR).frames.len(),
         held,
         "precondition: the loop starts full",
     );
@@ -623,13 +626,14 @@ fn live_appends_do_not_take_a_loop_past_its_frame_cap() {
     }
 
     assert_eq!(
-        panes[0].loop_state().frames.len(),
+        panes[0].time_state(&known::RADAR).frames.len(),
         held,
         "{held} appends took the loop to {} frames against a cap of {held}",
-        panes[0].loop_state().frames.len(),
+        panes[0].time_state(&known::RADAR).frames.len(),
     );
     assert!(
-        panes[0].loop_state().current_frame() < panes[0].loop_state().frames.len(),
+        panes[0].time_state(&known::RADAR).current_frame()
+            < panes[0].time_state(&known::RADAR).frames.len(),
         "the playhead must land on a frame that exists",
     );
 }
@@ -640,7 +644,7 @@ fn capping_an_appended_loop_keeps_its_whole_window() {
     let held = held_for(&pane_looping_on(ktlx.clone(), 72 * 3600, &[]));
     let sampled: Vec<u32> = (0..held as u32).map(|i| i * 26).collect();
     let mut panes = [pane_looping_on(ktlx, 72 * 3600, &sampled)];
-    panes[0].loop_state_mut().sampled = Some(true);
+    panes[0].time_state_mut(&known::RADAR).sampled = Some(true);
     let oldest = ts(sampled[0]);
 
     let newest = *sampled.last().expect("the cap is not zero");
@@ -675,8 +679,8 @@ fn a_loop_holding_every_scan_re_measures_the_cadence_as_it_follows_the_site() {
     let mut panes = [pane_looping_on(ktlx, 72 * 3600, &[0, 9, 18, 27])];
 
     for (sampled, expected) in [(Some(false), Some(540)), (Some(true), Some(259))] {
-        panes[0].loop_state_mut().sampled = sampled;
-        panes[0].loop_state_mut().cadence_secs = Some(259);
+        panes[0].time_state_mut(&known::RADAR).sampled = sampled;
+        panes[0].time_state_mut(&known::RADAR).cadence_secs = Some(259);
         append_polled_frame_to_loops(
             &mut panes,
             &no_handlers(),
@@ -687,10 +691,10 @@ fn a_loop_holding_every_scan_re_measures_the_cadence_as_it_follows_the_site() {
         );
 
         assert_eq!(
-            panes[0].loop_state().cadence_secs,
+            panes[0].time_state(&known::RADAR).cadence_secs,
             expected,
             "listing_sampled = {sampled:?}",
         );
-        panes[0].loop_state_mut().frames.pop();
+        panes[0].time_state_mut(&known::RADAR).frames.pop();
     }
 }

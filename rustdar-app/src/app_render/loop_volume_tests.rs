@@ -12,6 +12,7 @@ use rustdar_geo::GeoPoint;
 use rustdar_radar::loop_downloads::LoopDownloadManager;
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::RenderView;
+use rustdar_source::id::known;
 use rustdar_volumetric::bridge::VolumeEntry;
 
 const SITE: &str = "KTLX";
@@ -69,7 +70,7 @@ fn app_with_volume_loop(minutes: &[u32]) -> crate::app::App {
             render_failed: false,
         })
         .collect();
-    *pane.loop_state_mut() = ls;
+    *pane.time_state_mut(&known::RADAR) = ls;
     app
 }
 
@@ -141,7 +142,12 @@ fn the_resident_set_is_the_whole_frame_list() {
 
     // And the frames name them, which is what makes the playhead able to march one: a store
     // entry nothing points at is memory, not a loop.
-    let frames = &app.gui.pane(0).expect("pane 0").loop_state().frames;
+    let frames = &app
+        .gui
+        .pane(0)
+        .expect("pane 0")
+        .time_state(&known::RADAR)
+        .frames;
     for (idx, frame) in frames.iter().enumerate() {
         assert!(
             frame.render_failed || frame.image.is_some(),
@@ -256,7 +262,10 @@ fn switching_the_loop_off_gives_the_resident_set_back() {
         "precondition: a full set must be resident to be given back",
     );
 
-    *app.gui.pane_mut(0).expect("pane 0").loop_state_mut() = LayerTimeState::new();
+    *app.gui
+        .pane_mut(0)
+        .expect("pane 0")
+        .time_state_mut(&known::RADAR) = LayerTimeState::new();
     app.dispatch_loop_renders();
 
     assert_eq!(
@@ -283,7 +292,10 @@ fn switching_the_loop_off_lets_the_pane_ask_for_a_live_volume_again() {
         .expect("a 3D pane")
         .rendered_for = Some(frame_target(MINUTES[0], None));
 
-    *app.gui.pane_mut(0).expect("pane 0").loop_state_mut() = LayerTimeState::new();
+    *app.gui
+        .pane_mut(0)
+        .expect("pane 0")
+        .time_state_mut(&known::RADAR) = LayerTimeState::new();
     app.dispatch_loop_renders();
 
     assert!(
@@ -327,7 +339,12 @@ fn a_volume_with_nothing_to_resample_retires_its_frame() {
     let mut app = app_with_volume_loop(&MINUTES);
     dispatch_until_settled(&mut app, MINUTES.len());
 
-    let frames = &app.gui.pane(0).expect("pane 0").loop_state().frames;
+    let frames = &app
+        .gui
+        .pane(0)
+        .expect("pane 0")
+        .time_state(&known::RADAR)
+        .frames;
     assert!(
         frames.iter().all(|f| f.render_failed),
         "an empty volume left its frame un-retired, so readiness waits on a \
@@ -410,9 +427,9 @@ fn the_playing_frame_is_a_grid_and_no_raster_consumer_takes_it() {
     // A resident grid named on the playhead's frame, planted directly: what is under test
     // is which accessor answers, not how the frame was filled.
     let pane = app.gui.pane_mut(0).expect("pane 0");
-    pane.loop_state_mut().phase = LoopPhase::Playing;
-    pane.park_on_loop_frame(1);
-    pane.loop_state_mut().frames[1].image = Some(LoopFrameImage::Volume(
+    pane.time_state_mut(&known::RADAR).phase = LoopPhase::Playing;
+    pane.park_on_frame(&known::RADAR, 1);
+    pane.time_state_mut(&known::RADAR).frames[1].image = Some(LoopFrameImage::Volume(
         rustdar_egui::pane::VolumeFrameGrid {
             id: 42,
             target: frame_target(MINUTES[1], None),
@@ -590,7 +607,12 @@ fn the_resident_set_survives_its_own_frames_landing() {
 
     let live = app.volume_store.live_ids();
     let resident = resident_times(&app);
-    let frames = &app.gui.pane(0).expect("pane 0").loop_state().frames;
+    let frames = &app
+        .gui
+        .pane(0)
+        .expect("pane 0")
+        .time_state(&known::RADAR)
+        .frames;
     assert_eq!(
         frames.len(),
         MINUTES.len(),

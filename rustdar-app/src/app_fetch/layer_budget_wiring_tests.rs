@@ -38,7 +38,7 @@ fn site() -> rustdar_radar::sites::RadarSite {
 /// reads.
 fn pane_animating(extra: &[rustdar_source::id::LayerId]) -> PaneState {
     let mut pane = PaneState::with_site("KTLX".to_string());
-    *pane.loop_state_mut() = rustdar_egui::radar_layer::begin_loop(
+    *pane.time_state_mut(&known::RADAR) = rustdar_egui::radar_layer::begin_loop(
         24 * 3600,
         &site(),
         rustdar_radar::types::RenderView::PlanView,
@@ -106,7 +106,7 @@ fn a_pane_animating_two_layers_splits_the_frame_cap_between_them() {
         "precondition: one animating layer",
     );
     assert_eq!(
-        alone.loop_state().frames.len(),
+        alone.time_state(&known::RADAR).frames.len(),
         whole,
         "a pane animating one layer fills to the whole cap",
     );
@@ -119,7 +119,7 @@ fn a_pane_animating_two_layers_splits_the_frame_cap_between_them() {
         "precondition: two animating layers",
     );
     assert_eq!(
-        shared.loop_state().frames.len(),
+        shared.time_state(&known::RADAR).frames.len(),
         halved,
         "and a pane animating two fills to what its byte slice buys - the \
          append path reads the divided share, not the whole cap",
@@ -151,12 +151,12 @@ fn a_listing_is_sampled_down_to_the_share_not_to_the_whole_cap() {
         crate::app::render::accept_scan_listing_for_test(
             allocation,
             &budgets,
-            pane.loop_state_mut(),
+            pane.time_state_mut(&known::RADAR),
             "KTLX",
             scans.clone(),
             animating,
         );
-        pane.loop_state().frames.len()
+        pane.time_state(&known::RADAR).frames.len()
     };
 
     assert_eq!(build(1), whole, "one animating layer takes the whole cap");

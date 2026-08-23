@@ -1,6 +1,6 @@
 //! **A non-radar loop gains frames as its source publishes them.**
 //!
-//! `append_polled_frame_to_loops` read `pane.loop_state()` — radar's slot —
+//! `append_polled_frame_to_loops` read radar's slot by name —
 //! and gated the append on `radar_layer::site(ls) != site`. A non-radar
 //! timeline's anchor is `Box::new(())`, so `radar_layer::site` answers `""` and
 //! the guard rejected unconditionally: a satellite, MRMS or model loop was
@@ -342,7 +342,7 @@ fn a_radar_loop_appends_exactly_the_polled_stamp_and_nothing_else() {
         heights: None,
     };
     let mut pane = rustdar_egui::pane::PaneState::with_site("KTLX".to_string());
-    *pane.loop_state_mut() = rustdar_egui::radar_layer::begin_loop(
+    *pane.time_state_mut(&known::RADAR) = rustdar_egui::radar_layer::begin_loop(
         3600,
         &site,
         rustdar_radar::types::RenderView::PlanView,
