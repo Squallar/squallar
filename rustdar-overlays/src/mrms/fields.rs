@@ -16,7 +16,8 @@
 //! the two crates may not reach each other; it never said the value had to be
 //! written twice.
 //!
-//! The stops are [`rustdar_source::product::REFLECTIVITY_STOPS`] from 5 dBZ up,
+//! The stops are [`rustdar_source::product::REFLECTIVITY_OVERLAY_STOPS`], the
+//! shared ladder from 5 dBZ up with the overlay layers' own 75 dBZ cap on top,
 //! in **5 dBZ bands**. `is_gradient: false` because reflectivity is read as
 //! bands here and not as a continuous ramp — the number a reader takes off the
 //! bar is the band's floor. **That flag stays this crate's own decision**: the
@@ -36,8 +37,17 @@ use super::MrmsProduct;
 pub const GROUP: &str = "MRMS national mosaic";
 
 /// Reflectivity in dBZ, in 5 dBZ bands from 5 up:
-/// [`rustdar_source::product::REFLECTIVITY_STOPS`] sliced at
-/// [`rustdar_source::product::REFLECTIVITY_OVERLAY_FLOOR`].
+/// [`rustdar_source::product::REFLECTIVITY_OVERLAY_STOPS`], whole.
+///
+/// **The bar ends at 75 dBZ where a radar tilt's runs to 95, and that is
+/// deliberate.** The two share
+/// [`rustdar_source::product::REFLECTIVITY_SHARED_STOPS`] through 70; above it
+/// radar draws a hail band and this bar does not, because a mosaic is a column
+/// maximum blended across sites and does not produce values up there. A bar
+/// advertising a range its own raster cannot reach is the lie that divergence
+/// avoids. 75 dBZ is therefore white here and sky-blue on a tilt — the one dBZ
+/// in the tree with two colours, named by
+/// [`rustdar_source::product::REFLECTIVITY_DIVERGENCE_DBZ`].
 ///
 /// **The first stop is load-bearing beyond ergonomics.**
 /// [`crate::render::gridded::color_for`] paints nothing below it, so clear air,
@@ -53,8 +63,7 @@ pub const GROUP: &str = "MRMS national mosaic";
 /// asserts the floor still names 5 dBZ. Say so here, where they will be
 /// looking.
 static REFLECTIVITY: LazyLock<LegendScale> = LazyLock::new(|| {
-    use rustdar_source::product::{REFLECTIVITY_OVERLAY_FLOOR, REFLECTIVITY_STOPS};
-    let thresholds = REFLECTIVITY_STOPS[REFLECTIVITY_OVERLAY_FLOOR..].to_vec();
+    let thresholds = rustdar_source::product::REFLECTIVITY_OVERLAY_STOPS.to_vec();
     let min_value = thresholds.first().map_or(0.0, |e| e.0);
     let max_value = thresholds.last().map_or(1.0, |e| e.0);
     LegendScale {

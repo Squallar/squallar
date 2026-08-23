@@ -2270,15 +2270,17 @@ fn the_half_edge_costs_of_both_encodings_are_measured_per_moment() {
     assert_eq!(
         rows,
         vec![
-            // `ref`'s out-of-band figure read 32.352 until the three dBZ
-            // ladders were unified on `rustdar_source::product::
-            // REFLECTIVITY_STOPS`, which caps reflectivity's legend at 75 dBZ
-            // where radar's own table used to run to 95. The rejected
-            // encoding's ramp is the *legend's* range, so a shorter legend
-            // moves this column and nothing else: the shipped column, which
-            // reads `value_range_for`'s data levels, did not move for any
-            // moment.
-            ("ref", 16.25, 32.333),
+            // `ref`'s out-of-band figure is **the legend's ceiling, not a
+            // datum**, and it has moved twice for that reason. It read 32.352
+            // until `e6091e47` unified the three dBZ ladders at a 75 dBZ cap,
+            // then 32.333; restoring radar's hail band put the ceiling back at
+            // 95 and this figure back to 32.352, the same number it carried
+            // before either change. The rejected encoding's ramp is the
+            // *legend's* range, so a legend that grows or shrinks moves this
+            // column and nothing else: the shipped column, which reads
+            // `value_range_for`'s data levels, has not moved for any moment
+            // through either change.
+            ("ref", 16.25, 32.352),
             ("vel", -17.0, -3.119),
             ("sw", 1.875, 1.985),
             ("zdr", -3.219, -0.258),
@@ -2598,9 +2600,21 @@ fn the_default_transparency_profile_is_measured_per_product() {
         }
     }
 
-    // Every palette's plan-view maximum alpha is 180 — the radar layer's own
-    // translucency convention — and ΦDP's 63 is that ceiling times its flat
-    // 0.35, which puts its whole 255-entry ramp under the see-through bar.
+    // A volume's maximum alpha is its palette's plan-view alpha, and this is
+    // the column that says so. Eight of the nine read 180, the radar layer's
+    // own translucency convention: ΦDP's 63 is that ceiling times its flat
+    // 0.35, which puts its whole 255-entry ramp under the see-through bar, and
+    // **`ref`'s 160 is `rustdar_source::product::REFLECTIVITY_ALPHA`** — dBZ is
+    // drawn by three layers and they paint it at one opacity, which is the
+    // overlays' 160 rather than this crate's 180. It read 180 here until that
+    // unification. Only the ceiling moved: the see-through count is unchanged
+    // for every moment, because reflectivity's own alpha ramp reaches zero well
+    // below the bar and scaling it by 160/180 does not carry another entry
+    // under.
+    //
+    // A pin over `RadarProduct::all()` rather than over reflectivity alone, so
+    // an alpha change that leaked out of the dBZ field into the other fifteen
+    // scales reddens here rather than passing as "the constant moved".
     let scan = six_moment_scan();
     let mut measured = Vec::new();
     for product in VOLUME_PRODUCTS {
@@ -2621,7 +2635,7 @@ fn the_default_transparency_profile_is_measured_per_product() {
     assert_eq!(
         measured,
         vec![
-            ("ref", 64, 180),
+            ("ref", 64, 160),
             ("vel", 41, 180),
             ("sw", 18, 180),
             ("zdr", 42, 180),

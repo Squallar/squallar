@@ -50,7 +50,12 @@ pub fn get_color_for_value(product: RadarProduct, value: f32) -> (u8, u8, u8, u8
                 return (0, 0, 0, 0);
             }
             let (r, g, b) = scale_color(REFLECTIVITY, value);
-            (r, g, b, TRANSPARENCY)
+            // Not `TRANSPARENCY`: dBZ is drawn by three layers and they now
+            // paint it at one opacity. See
+            // `rustdar_source::product::REFLECTIVITY_ALPHA` for why the number
+            // is the overlays' 160 and not this crate's 180, and for why the
+            // other fifteen scales below keep `TRANSPARENCY`.
+            (r, g, b, rustdar_source::product::REFLECTIVITY_ALPHA)
         }
         RadarProduct::Velocity | RadarProduct::StormRelativeVelocity => velocity_lookup(value),
         RadarProduct::SpectrumWidth => {
@@ -163,8 +168,8 @@ fn nrot_lookup(nrot: f32) -> (u8, u8, u8, u8) {
 /// The stop list of this file's tables, in the substrate's `[u8; 3]` spelling.
 ///
 /// `const fn` rather than a second hand-written copy: the whole point of
-/// [`rustdar_source::product::REFLECTIVITY_STOPS`] is that no layer keeps its
-/// own transcription of it, and a runtime conversion would put the ladder
+/// [`rustdar_source::product::REFLECTIVITY_RADAR_STOPS`] is that no layer keeps
+/// its own transcription of it, and a runtime conversion would put the ladder
 /// behind a `LazyLock` that `scale_color` would have to look through on every
 /// gate.
 const fn as_rgb_tuples<const N: usize>(stops: [(f32, [u8; 3]); N]) -> [(f32, (u8, u8, u8)); N] {
@@ -179,13 +184,20 @@ const fn as_rgb_tuples<const N: usize>(stops: [(f32, [u8; 3]); N]) -> [(f32, (u8
 }
 
 /// [`REFLECTIVITY`]'s stops, which are the substrate's and not this file's.
-static REFLECTIVITY_STOPS: [(f32, (u8, u8, u8)); 17] =
-    as_rgb_tuples(rustdar_source::product::REFLECTIVITY_STOPS);
+static REFLECTIVITY_STOPS: [(f32, (u8, u8, u8)); 21] =
+    as_rgb_tuples(rustdar_source::product::REFLECTIVITY_RADAR_STOPS);
 
-/// Reflectivity (dBZ), **0 to 75, from
-/// [`rustdar_source::product::REFLECTIVITY_STOPS`]** — the one ladder radar,
-/// MRMS and HRRR all paint dBZ through. Radar takes the whole table; the two
-/// overlay layers take it from 5 dBZ up.
+/// Reflectivity (dBZ), **0 to 95, from
+/// [`rustdar_source::product::REFLECTIVITY_RADAR_STOPS`]** — the shared ladder
+/// radar, MRMS and HRRR all paint dBZ through, plus the hail band that is
+/// radar's alone.
+///
+/// **The three layers agree from 0 through 70 and diverge above it on
+/// purpose.** 75 dBZ is sky-blue here, the bottom of
+/// `rustdar_source::product::REFLECTIVITY_HAIL_TAIL`, and white on the two
+/// overlay bars, which stop there because their grids do not produce values up
+/// here. That is the one dBZ with two colours in the tree, and the substrate's
+/// `REFLECTIVITY_DIVERGENCE_DBZ` names it.
 ///
 /// **The stops are no longer this crate's to choose, but the banding still is,
 /// and it stays a gradient here.** A tilt is a continuous field read as a wash,
@@ -193,10 +205,10 @@ static REFLECTIVITY_STOPS: [(f32, (u8, u8, u8)); 17] =
 /// volume wire payload, so flipping it is a `FORMAT_VERSION` change. See
 /// `voxel::tests::the_table_filter_is_nearest_only_for_a_non_gradient_scale`.
 ///
-/// The low end is still a grey ramp discretised into steps; what changed is
-/// that 5 dBZ onward is now the overlays' ladder rather than a second one
-/// offset from it by roughly a band. Pinned against the substrate by
-/// [`tests::the_reflectivity_ladder_is_the_substrates`].
+/// The low end is still a grey ramp discretised into steps; what changed in
+/// `e6091e47` is that 5 dBZ onward is now the overlays' ladder rather than a
+/// second one offset from it by roughly a band. Pinned against the substrate by
+/// [`tests::the_reflectivity_ladder_is_the_substrates_radar_one`].
 static REFLECTIVITY: ColorScale = &(&REFLECTIVITY_STOPS, true);
 
 /// Velocity outbound / positive (mph thresholds).
@@ -508,9 +520,16 @@ static NROT_ANTICYCLONIC: ColorScale = &(
 /// seventeen scales in this file and false of one. Reflectivity is drawn by
 /// three layers at once, and while each kept its own table they drifted: radar's
 /// sat roughly one 5 dBZ band off the mosaic's through the green-to-red region.
-/// Its stops now come from `rustdar_source::product::REFLECTIVITY_STOPS` (see
-/// [`REFLECTIVITY`]). Everything else here is still this crate's — a moment no
+/// Its stops now come from `rustdar_source::product::REFLECTIVITY_RADAR_STOPS`
+/// (see [`REFLECTIVITY`]), and so does the alpha it paints at,
+/// `REFLECTIVITY_ALPHA` — the only field in this file that does not use
+/// `TRANSPARENCY`. Everything else here is still this crate's: a moment no
 /// other layer publishes has no second table to agree with.
+///
+/// **What came down is the agreement, not the whole ladder.** Radar's bar keeps
+/// a tail the two overlay bars do not have — 75 dBZ sky-blue through 95 white,
+/// the hail band — because a tilt reaches up there and a mosaic does not. The
+/// substrate holds both halves and names where they part.
 pub use rustdar_source::product::LegendScale;
 
 fn extract_scale(scale: ColorScale) -> LegendScale {
@@ -1049,32 +1068,100 @@ mod tests {
         }
     }
 
-    /// Radar's dBZ ladder is the substrate's, whole, and still a gradient.
+    /// Radar's dBZ ladder is the substrate's **radar** ladder, whole, and still
+    /// a gradient.
     ///
-    /// The stops are `rustdar_source::product::REFLECTIVITY_STOPS` verbatim —
-    /// that is the point of the move — so what this can say is that the slice
-    /// is the *whole* table and that nothing re-spelled a stop on the way
-    /// through [`as_rgb_tuples`]. The `is_gradient` half is the one that must
-    /// not drift: it derives the `LutFilter` baked into the volume wire
+    /// The stops are `rustdar_source::product::REFLECTIVITY_RADAR_STOPS`
+    /// verbatim — that is the point of the move — so what this can say is that
+    /// the ladder is the *whole* one and that nothing re-spelled a stop on the
+    /// way through [`as_rgb_tuples`]. The `is_gradient` half is the one that
+    /// must not drift: it derives the `LutFilter` baked into the volume wire
     /// payload, so a flip here is a `FORMAT_VERSION` change and not a palette
     /// edit.
+    ///
+    /// **The top is 95 dBZ and not 75.** `e6091e47` capped it at 75 and painted
+    /// everything at or above that white on a tilt; the hail band above the
+    /// shared core is back, and the max here is what the legend advertises.
     #[test]
-    fn the_reflectivity_ladder_is_the_substrates() {
+    fn the_reflectivity_ladder_is_the_substrates_radar_one() {
         let scale = get_legend_scale(RadarProduct::Reflectivity);
         assert_eq!(
             scale.thresholds,
-            rustdar_source::product::REFLECTIVITY_STOPS.to_vec(),
-            "radar's dBZ ladder is no longer the substrate's table",
+            rustdar_source::product::REFLECTIVITY_RADAR_STOPS.to_vec(),
+            "radar's dBZ ladder is no longer the substrate's radar table",
         );
         assert_eq!(
             scale.min_value, 0.0,
             "radar takes the ladder from 0 dBZ, not from the overlays' floor",
         );
-        assert_eq!(scale.max_value, 75.0);
+        assert_eq!(
+            scale.max_value, 95.0,
+            "radar's bar runs to the top of the hail band; a 75 here means the \
+             tail was dropped again and every hail core paints one flat colour",
+        );
         assert!(
             scale.is_gradient,
             "a tilt is drawn as a wash, and the flag is baked into the volume \
              wire payload's LutFilter — flipping it is a FORMAT_VERSION change",
+        );
+    }
+
+    /// **The hail band is drawn, not merely declared.** Five dBZ that used to
+    /// come back as five distinguishable colours all painted white after
+    /// `e6091e47`; this reads them back out of [`get_color_for_value`].
+    ///
+    /// A ladder pin alone would not catch a `scale_color` that stopped walking
+    /// past some index, and the legend-scale pin above reads
+    /// [`extract_scale`] rather than the function a raster is painted with.
+    /// This one asks the painter.
+    #[test]
+    fn a_tilt_paints_the_hail_band_above_the_shared_ladder() {
+        let colour = |dbz: f32| {
+            let (r, g, b, _) = get_color_for_value(RadarProduct::Reflectivity, dbz);
+            (r, g, b)
+        };
+        assert_eq!(
+            [
+                colour(75.0),
+                colour(80.0),
+                colour(85.0),
+                colour(90.0),
+                colour(95.0),
+                // Above the last stop the scale clamps, as it always has.
+                colour(120.0),
+            ],
+            [
+                (135, 206, 235),
+                (173, 216, 230),
+                (255, 140, 0),
+                (255, 69, 0),
+                (255, 255, 255),
+                (255, 255, 255),
+            ],
+            "the hail band is not being painted. Between `e6091e47` and its \
+             repair every one of these read white, because the ladder stopped \
+             at a 75 dBZ white stop and `scale_color` clamps above its last \
+             entry.",
+        );
+        // The non-triviality floor: white at the top is the *end* of a climb,
+        // not the whole tail. Four of the five are distinct from each other and
+        // from the 70 dBZ violet below them.
+        let band = [
+            colour(70.0),
+            colour(75.0),
+            colour(80.0),
+            colour(85.0),
+            colour(90.0),
+            colour(95.0),
+        ];
+        let mut seen: Vec<(u8, u8, u8)> = band.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            band.len(),
+            "70 dBZ and the hail band must be six different colours; got \
+             {band:?}",
         );
     }
 
@@ -1089,34 +1176,76 @@ mod tests {
     /// probes: 200 000 steps across a 5 dBZ segment move the fastest channel by
     /// about 0.0013 of a level, which cannot skip a colour.
     ///
+    /// **The comparison is on RGB alone, deliberately.** Reflectivity paints at
+    /// `rustdar_source::product::REFLECTIVITY_ALPHA` (160) and `RANGE_FOLDED`
+    /// carries this crate's `TRANSPARENCY` (180), so a whole-tuple `assert_ne!`
+    /// would now pass on the alpha byte no matter what the ramp did — a
+    /// vacuous check that reads exactly like a green one. The question is
+    /// whether a reader can confuse the two colours, and that is an RGB
+    /// question.
+    ///
     /// **Measured margin, so a future stop edit knows how much room it has.**
-    /// Exactly one segment of the unified ladder has all three of its channel
-    /// intervals bracketing (178, 102, 204) at all — 70 to 75 dBZ, the violet
-    /// (153, 85, 201) climbing to white — and the closest any blend on it comes
-    /// is (166, 106, 207), a squared distance of 169. Every other segment is
-    /// ruled out by a single channel never passing through the target's value,
-    /// so no convex blend of its ends can equal it.
+    /// Restoring the hail tail took the ladder *further* from the target, not
+    /// closer: 70 → 75 dBZ used to climb from the violet (153, 85, 201) to
+    /// white and was the one segment whose three channel intervals all
+    /// bracketed (178, 102, 204), coming within a squared distance of 169. It
+    /// now climbs to sky-blue (135, 206, 235), whose red never reaches 178, and
+    /// **no segment of the restored ladder brackets the target on all three
+    /// channels at all.** The closest approach over the whole sweep is recorded
+    /// below as a squared distance, and the sweep is where it is measured.
     #[test]
     fn no_blend_between_two_reflectivity_stops_lands_on_the_range_folded_purple() {
+        let target = (RANGE_FOLDED.0, RANGE_FOLDED.1, RANGE_FOLDED.2);
         let mut probes = 0usize;
+        let mut closest = (u32::MAX, f32::NAN, (0u8, 0u8, 0u8));
         for segment in REFLECTIVITY_STOPS.windows(2) {
             let (lo, _) = segment[0];
             let (hi, _) = segment[1];
             let steps = 200_000i32;
             for step in 0..=steps {
                 let value = lo + (hi - lo) * (step as f32 / steps as f32);
+                let (r, g, b, _) = get_color_for_value(RadarProduct::Reflectivity, value);
                 assert_ne!(
-                    get_color_for_value(RadarProduct::Reflectivity, value),
-                    RANGE_FOLDED,
+                    (r, g, b),
+                    target,
                     "reflectivity blends into the range-folded purple at {value} \
                      dBZ, between the {lo} and {hi} stops",
                 );
+                let d = |a: u8, b: u8| {
+                    let d = i32::from(a) - i32::from(b);
+                    (d * d) as u32
+                };
+                let dist = d(r, target.0) + d(g, target.1) + d(b, target.2);
+                if dist < closest.0 {
+                    closest = (dist, value, (r, g, b));
+                }
                 probes += 1;
             }
         }
         // precondition: every segment of the ladder really was walked.
         assert_eq!(probes, (REFLECTIVITY_STOPS.len() - 1) * 200_001);
+        assert_eq!(
+            (closest.0, closest.2),
+            (CLOSEST_SQ, CLOSEST_RGB),
+            "the ladder's closest approach to the range-folded purple moved, \
+             at {} dBZ. That is not a failure by itself — it is the margin \
+             this test exists to report — but re-record it deliberately and \
+             say in the commit how much room is left.",
+            closest.1,
+        );
     }
+
+    /// The nearest any blend on radar's dBZ ladder comes to `RANGE_FOLDED`'s
+    /// RGB (178, 102, 204), as a squared channel distance, and the colour that
+    /// gets there. **Measured by the sweep that asserts them, not derived.**
+    ///
+    /// 745 at 70.5372 dBZ, on the 70 → 75 segment: (151, 98, 204), which is the
+    /// blue channel exactly on the target and 27 levels of red short of it.
+    /// Under `e6091e47`'s capped ladder the same segment climbed to white and
+    /// came within 169 — restoring the hail band moved the ramp **away** from
+    /// the folded purple, by more than a factor of four in squared distance.
+    const CLOSEST_SQ: u32 = 745;
+    const CLOSEST_RGB: (u8, u8, u8) = (151, 98, 204);
 
     #[test]
     fn the_range_folded_colour_is_unreachable_through_any_products_scale() {
