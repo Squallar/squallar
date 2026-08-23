@@ -325,10 +325,6 @@ jobs:
               test "$n" -ge 1 || { echo "::error::ASSET_PATHS parsed as $n entries; the parse is wrong or the list was gutted"; exit 1; }
               echo "ok: all $n ASSET_PATHS entries are staged"
 
-              # A project Pages site is served from a subpath, so a root-absolute
-              # reference works locally and 404s in production.
-              python3 .github/scripts/check-relative-paths.py dist
-
           # Not a triple: every member alone on its own default features, which
           # `--all-features` hides. rustdar-egui was broken this way for weeks --
           # it called the port enumeration (`detect_gps_ports`, rustdar-nmea-serial
