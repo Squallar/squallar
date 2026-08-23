@@ -1459,6 +1459,26 @@ impl LayerTimeState {
     }
 }
 
+/// Whether `id`'s handler **declares** that its data arrives as stamped
+/// frames — the one reading of "this layer can loop", asked of the registry
+/// rather than spelled as a match on the id.
+///
+/// One function so [`PaneState::topmost_frame_series_layer`] and
+/// [`PaneState::frame_series_layers`] cannot drift: the topmost is the last
+/// member of the set, and two predicates would let it stop being one.
+fn comes_in_stamped_frames(
+    overlays: &rustdar_overlays::render::overlay_state::OverlayRegistry,
+    id: &LayerId,
+) -> bool {
+    overlays.handlers().any(|handler| {
+        handler.id() == *id
+            && matches!(
+                handler.time_axis(),
+                rustdar_source::time::TimeAxis::FrameSeries { .. }
+            )
+    })
+}
+
 impl PaneState {
     /// The NEXRAD site this pane is viewing.
     ///
@@ -2184,15 +2204,47 @@ impl PaneState {
             .rev()
             .filter(|slot| slot.enabled)
             .map(|slot| &slot.id)
-            .find(|id| {
-                overlays.handlers().any(|handler| {
-                    handler.id() == **id
-                        && matches!(
-                            handler.time_axis(),
-                            rustdar_source::time::TimeAxis::FrameSeries { .. }
-                        )
-                })
-            })
+            .find(|id| comes_in_stamped_frames(overlays, id))
+    }
+
+    /// **Every enabled layer on this pane that comes in stamped frames**,
+    /// bottom to top — the set a loop has to arm, of which
+    /// [`Self::topmost_frame_series_layer`] is only the last.
+    ///
+    /// The transport is one member, not the whole answer. A pane draws radar
+    /// *and* a satellite mosaic *and* a model field; each of those is its own
+    /// timeline with its own cadence, and each has to be listed and filled for
+    /// its picture to move when the pane's clock does. A layer that is not
+    /// armed has no frames, so [`Self::overlay_texture_on_screen`] falls
+    /// through to its live raster and paints one instant for the whole
+    /// playback — the picture is *there*, it simply never changes.
+    ///
+    /// Owned ids rather than borrows: the caller arms the pane while it walks
+    /// this, and the two cannot be borrowed at once.
+    pub fn frame_series_layers(
+        &self,
+        overlays: &rustdar_overlays::render::overlay_state::OverlayRegistry,
+    ) -> Vec<LayerId> {
+        self.layers
+            .iter()
+            .filter(|slot| slot.enabled)
+            .map(|slot| &slot.id)
+            .filter(|id| comes_in_stamped_frames(overlays, id))
+            .cloned()
+            .collect()
+    }
+
+    /// **Stop every timeline this pane is animating**, whichever layers those
+    /// are — what turning the loop off means once a pane arms more than the
+    /// transport.
+    ///
+    /// Clearing the transport's slot alone would leave the other layers'
+    /// frames in place and their playheads settling off a clock nothing moves
+    /// any more, which is a frozen frame presented as the live picture.
+    pub fn stop_every_layer_loop(&mut self) {
+        for slot in self.animating_layers_mut() {
+            slot.time = LayerTimeState::new();
+        }
     }
 
     /// **Re-derive which layer the transport addresses.** Called wherever the

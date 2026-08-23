@@ -496,21 +496,32 @@ fn a_radar_pane_with_no_scan_still_arms_nothing() {
 
 // ── 3. Disable is the mirror of enable ────────────────────────────────────
 
-/// **Turning a loop off addresses the layer turning it on addressed.**
+/// **Turning a loop off stops every timeline turning it on armed.**
 ///
 /// `handle_disable_loop` used to reset `loop_state_mut()` by name. On a pane
 /// whose transport had moved that cleared a timeline nobody had armed and left
 /// the running one running — and the ∞ button reads
 /// `transport_state().is_active()`, so it stayed lit and re-emitted this same
-/// action on every further click.
+/// action on every further click. That half is what the first assertion below
+/// still holds, and it is still the one the ∞ button reads.
 ///
-/// The radar slot is armed here as well, so the test can tell "disabled the
-/// right one" from "disabled everything".
+/// **The second assertion was inverted deliberately.** It used to require that
+/// radar's slot survive a disable "that was not about it", on the reading that
+/// a pane's loop is one layer's. It is not: `handle_enable_loop` arms every
+/// enabled frame-series layer on the pane, because a satellite layer that is
+/// not armed paints one instant for the whole playback (the reported *"the
+/// GMGSI never changes"*). One ∞ button, one clock, one loop — so turning it
+/// off has to take down everything it turned on. A timeline left running under
+/// a stopped transport settles its playhead off a clock nothing moves, which
+/// is a frozen frame presented as the live picture.
+///
+/// The radar slot is armed here as well, so the test can tell "cleared the
+/// transport" from "cleared nothing but the slot it was named after".
 ///
 /// **Floor, run and observed:** put `loop_state_mut()` back in
 /// `handle_disable_loop` and the transport layer is still active.
 #[test]
-fn disabling_a_loop_stops_the_layer_the_transport_addresses() {
+fn disabling_a_loop_stops_every_timeline_the_pane_armed() {
     let now = chrono::Utc::now().naive_utc();
     let listed: Vec<_> = (1..=4)
         .map(|i| now - chrono::Duration::minutes(i * 30))
@@ -559,12 +570,16 @@ fn disabling_a_loop_stops_the_layer_the_transport_addresses() {
         "the ∞ button reads this, so the loop the user turned off is still on",
     );
     assert!(
-        pane.loop_state().is_active(),
-        "radar's own loop was torn down by a disable that was not about it",
+        !pane.loop_state().is_active(),
+        "radar's timeline is still running under a stopped transport: its \
+         playhead now settles off a clock nothing moves, so the pane paints \
+         one frozen radar frame with no loop to explain it",
     );
-    assert_eq!(
-        rustdar_egui::radar_layer::site(pane.loop_state()),
-        "KOUN",
-        "and it is the same radar loop it was",
+    assert!(
+        pane.animating_layers().next().is_none(),
+        "the pane is still animating {:?} after the ∞ button was turned off",
+        pane.animating_layers()
+            .map(|s| s.id.clone())
+            .collect::<Vec<_>>(),
     );
 }
