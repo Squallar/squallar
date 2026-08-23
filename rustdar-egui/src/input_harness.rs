@@ -2359,3 +2359,8 @@ mod loop_loading_tests;
 /// floor the addressed layer declares, read off the action the ∞ button emits.
 #[cfg(test)]
 mod loop_span_floor_tests;
+
+/// Which timeline the two radar **draw** arms address (WO-T3.8) — the map's
+/// radar arm and the section pane's `looping`, read off the painted glass.
+#[cfg(test)]
+mod radar_draw_addressing_tests;

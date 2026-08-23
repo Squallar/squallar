@@ -4785,6 +4785,13 @@ mod loop_level3_tests;
 #[cfg(test)]
 mod loop_scan_cache_tests;
 
+/// Which timeline the render funnel addresses (WO-T3.8): the arrival path, the
+/// broadcast and the dispatch pass all file radar's payloads in radar's own
+/// frame list, and go on doing so while another layer holds the transport.
+#[path = "app_render/radar_timeline_addressing_tests.rs"]
+#[cfg(test)]
+mod radar_timeline_addressing_tests;
+
 /// The plan-view render pipeline against a pane that has no plan view.
 #[path = "app_render/pane_kind_render_filter_tests.rs"]
 #[cfg(test)]
