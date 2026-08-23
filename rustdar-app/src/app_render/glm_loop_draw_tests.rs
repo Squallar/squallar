@@ -387,7 +387,7 @@ fn overlay_pass(
     let stale = {
         let pane = app.gui.pane_mut(0).expect("pane 0");
         let cache = pane.overlay_cache_mut(&known::LIGHTNING);
-        cache.needs_rerender(token, 5.0, now, &bounds(), &plan()) && !cache.render_in_flight
+        cache.needs_rerender(token, 5.0, now, &bounds(), &plan()) && cache.renders.is_empty()
     };
     if !stale {
         return None;
