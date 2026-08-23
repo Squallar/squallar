@@ -54,10 +54,15 @@ fn worker_scope() -> Result<web_sys::DedicatedWorkerGlobalScope, JsValue> {
 /// read is answered with a failed job rather than dropped: the page holds a
 /// render slot and a pane's in-flight mark against every id it posted.
 fn handle_message(scope: &web_sys::DedicatedWorkerGlobalScope, data: &JsValue) {
-    if proto::string_field(data, proto::KIND).as_deref() != Some(proto::JOB) {
-        log::warn!("worker ignoring a message that is not a job");
-        return;
+    match proto::string_field(data, proto::KIND).as_deref() {
+        Some(proto::JOB) => handle_job(scope, data),
+        // The page has finished copying a reply out of this worker's memory.
+        Some(proto::RELEASE) => crate::shared_loan::release(proto::loan_field(data)),
+        _ => log::warn!("worker ignoring a message that is not a job"),
     }
+}
+
+fn handle_job(scope: &web_sys::DedicatedWorkerGlobalScope, data: &JsValue) {
     let Some(id) = proto::field(data, proto::ID).and_then(|v| v.as_f64()) else {
         log::error!("worker got a job with no id; nothing to answer");
         return;
@@ -73,6 +78,12 @@ fn handle_message(scope: &web_sys::DedicatedWorkerGlobalScope, data: &JsValue) {
         .map(|v| v.to_vec())
         .unwrap_or_default();
 
+    // `to_vec` above IS the copy the borrower owes, and it has happened, so the
+    // page may free the request now — **before** the job runs, not after.
+    // A decode request is the archive, up to ~47-69 MiB; holding it for the
+    // length of the rasterization would double the peak for the whole job.
+    release_to_page(scope, proto::loan_field(data));
+
     let result = rustdar_worker::offload::execute_encoded(&request);
     if result.is_none() {
         log::debug!("worker job {id} produced no frame");
@@ -82,17 +93,43 @@ fn handle_message(scope: &web_sys::DedicatedWorkerGlobalScope, data: &JsValue) {
     }
 }
 
-/// Post the answer, moving the buffers rather than copying them.
+/// Tell the page it may free the request it lent, if it lent one.
+///
+/// Best-effort by design: a failed post here costs the page one buffer held
+/// until the worker is retired, which `abandon_worker` sweeps. It must not
+/// abandon the job.
+fn release_to_page(scope: &web_sys::DedicatedWorkerGlobalScope, loan: crate::shared_loan::LoanId) {
+    if loan == crate::shared_loan::NO_LOAN {
+        return;
+    }
+    let message = js_sys::Object::new();
+    proto::set_field(&message, proto::KIND, &JsValue::from_str(proto::RELEASE));
+    proto::set_loan(&message, loan);
+    if let Err(e) = scope.post_message(&message) {
+        log::warn!("worker could not release the page's loan {loan}: {e:?}");
+    }
+}
+
+/// Post the answer without copying it out of this instance's memory.
 ///
 /// The reply is the `OUT`/`OUT_KIND`/`TAILS` trio: `OUT` carries the row's
-/// `encode_out` HEAD as one transferred `Uint8Array`, `TAILS` the row's
-/// nominated large flat buffers as per-tail `Uint8Array`s, each transferred.
-/// Every buffer is one copy out of this instance's linear memory and is then
-/// transferred: 26.08 MiB per widest 2048² still frame, where the one-buffer
-/// shape paid 68.16. The copy survived WS3b — this instance's memory is a
-/// `SharedArrayBuffer` now, but it is not the PAGE's, and skipping the copy
-/// would mean handing the page a view into a region this worker must then not
-/// reuse until told. See `worker_port::deliver`.
+/// `encode_out` HEAD and `TAILS` the row's nominated large flat buffers, as
+/// per-tail `Uint8Array`s.
+///
+/// **Two wires, chosen by what the browser can carry** — see
+/// [`crate::shared_loan`]:
+///
+/// * Cross-origin isolated: each array is a VIEW onto this worker's own
+///   `SharedArrayBuffer` memory, posted with no transfer list. Nothing is
+///   copied here at all. The `LOAN` names the buffers this worker is now
+///   holding until the page sends `RELEASE`, and `post_result` must not drop
+///   `result` before that — which is why the loan book takes it by value.
+/// * Otherwise: the old wire. `Uint8Array::from` copies each buffer out of
+///   linear memory and the transfer list moves the copy. 26.08 MiB per widest
+///   2048² still frame, where the one-buffer shape paid 68.16.
+///
+/// The page copies once either way; what the first arm removes is THIS side's
+/// copy, so the reply costs one memcpy instead of two.
 ///
 /// `None` writes explicit nulls rather than posting nothing: the page holds a
 /// render slot against every id, and silence wedges it.
@@ -111,24 +148,43 @@ fn post_result(
     proto::set_field(&message, proto::OUT, &JsValue::NULL);
     proto::set_field(&message, proto::OUT_KIND, &JsValue::NULL);
     proto::set_field(&message, proto::TAILS, &JsValue::NULL);
+    proto::set_loan(&message, crate::shared_loan::NO_LOAN);
 
     if let Some((kind, head, tails)) = result {
-        let out = js_sys::Uint8Array::from(head.as_slice());
-        transfer.push(&out.buffer());
-        proto::set_field(&message, proto::OUT, &out);
         proto::set_field(
             &message,
             proto::OUT_KIND,
             &JsValue::from_f64(f64::from(kind)),
         );
-        // Each tail rides the transfer list; nothing multi-MiB is cloned.
-        let tails_array = js_sys::Array::new();
-        for tail in tails {
-            let t = js_sys::Uint8Array::from(tail.as_slice());
-            transfer.push(&t.buffer());
-            tails_array.push(&t);
-        }
-        proto::set_field(&message, proto::TAILS, &tails_array);
+        // The head first and the tails in the row's own order, as ONE list, so
+        // both wires build the same sequence and the split back into `OUT` and
+        // `TAILS` below is one statement written once rather than one per arm.
+        let mut buffers = Vec::with_capacity(1 + tails.len());
+        buffers.push(head);
+        buffers.extend(tails);
+
+        let views = match crate::shared_loan::lend(buffers) {
+            Ok((loan, views)) => {
+                proto::set_loan(&message, loan);
+                views
+            }
+            Err(buffers) => {
+                // The one `transfer.push` on this wire, and it is inside the
+                // loop over EVERY buffer: a head or a tail left off the
+                // transfer list would be structured-cloned, which is up to
+                // ~16 MiB of JS→JS copy per image tail on top of the copy
+                // `Uint8Array::from` just paid.
+                let copies = js_sys::Array::new();
+                for buffer in &buffers {
+                    let copy = js_sys::Uint8Array::from(buffer.as_slice());
+                    transfer.push(&copy.buffer());
+                    copies.push(&copy);
+                }
+                copies
+            }
+        };
+        proto::set_field(&message, proto::OUT, &views.get(0));
+        proto::set_field(&message, proto::TAILS, &views.slice(1, views.length()));
     }
     scope.post_message_with_transfer(&message, &transfer)
 }

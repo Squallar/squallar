@@ -12,6 +12,14 @@ pub const HELLO: &str = "hello";
 pub const FATAL: &str = "fatal";
 pub const JOB: &str = "job";
 pub const DONE: &str = "done";
+/// **Either direction**: the sender has finished copying the buffers of the
+/// [`LOAN`] it names, and the lender may free them. See [`crate::shared_loan`]
+/// for why a view onto the peer's memory needs one and what happens without it.
+///
+/// Symmetric on purpose. A `JOB` lends the page's request to the worker and a
+/// `DONE` lends the worker's answer to the page, so both sides both lend and
+/// borrow, and one kind serves both rather than two that could drift.
+pub const RELEASE: &str = "release";
 
 pub const ID: &str = "id";
 /// Page → worker: the framed job, as `rustdar_worker`'s `JobRequest::to_bytes`
@@ -21,6 +29,15 @@ pub const ID: &str = "id";
 pub const REQUEST: &str = "req";
 pub const TOKEN: &str = "token";
 pub const ERROR: &str = "error";
+/// The [`crate::shared_loan::LoanId`] a `JOB`, a `DONE` or a `RELEASE` names.
+///
+/// On a `JOB`/`DONE` it says "the typed arrays on this message are VIEWS into
+/// my memory, and I am holding them until you send `RELEASE` with this number".
+/// [`crate::shared_loan::NO_LOAN`] — or an absent field, which reads the same —
+/// says the arrays are transferred copies the receiver already owns and there
+/// is nothing to release. A build serving without COOP/COEP writes 0 on every
+/// message, which is the fallback wire and also the Tier-2 negative control.
+pub const LOAN: &str = "loan";
 /// Worker → page, on `HELLO`: how many threads rayon's global pool ACTUALLY
 /// has in the worker, read back out of rayon rather than echoing the number
 /// `worker.js` asked `initThreadPool` for.
@@ -80,6 +97,29 @@ pub fn field(object: &JsValue, key: &str) -> Option<JsValue> {
 
 pub fn string_field(object: &JsValue, key: &str) -> Option<String> {
     field(object, key)?.as_string()
+}
+
+/// The [`LOAN`] on a message, with absent, null and unreadable all reading as
+/// [`NO_LOAN`].
+///
+/// Folded together deliberately: every one of them means "nothing on this
+/// message is a view into the sender's memory", which is the safe reading. A
+/// build from before this wire existed sets no field at all and must be
+/// understood as carrying copies, not as lending loan 0.
+pub fn loan_field(object: &JsValue) -> crate::shared_loan::LoanId {
+    field(object, LOAN)
+        .and_then(|v| v.as_f64())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map_or(crate::shared_loan::NO_LOAN, |v| {
+            v as crate::shared_loan::LoanId
+        })
+}
+
+/// Write a [`LOAN`] onto a message. [`NO_LOAN`](crate::shared_loan::NO_LOAN) is
+/// written explicitly rather than omitted, so every message says which wire it
+/// is on and a reader never has to distinguish absent from zero.
+pub fn set_loan(object: &js_sys::Object, loan: crate::shared_loan::LoanId) {
+    set_field(object, LOAN, &JsValue::from_f64(f64::from(loan)));
 }
 
 /// Set `key` on `object`, or log why it could not be: `Reflect::set` fails only
