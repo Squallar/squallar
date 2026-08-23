@@ -30,6 +30,14 @@ pub fn start() -> Result<(), JsValue> {
     // instance. `rustdar_app::app_state` logs the answer.
     log::info!("rustdar starting (wasm32; WebGPU or WebGL2, decided at adapter request)");
 
+    // `rustdar_radar::par` is rayon on this target too now, and rayon panics on
+    // a global pool nobody built. The page takes the one-thread,
+    // spawns-nothing pool: the only rayon it reaches is `offload_job`'s inline
+    // fallback, and a main thread spinning against a pool of Workers would be
+    // interaction latency paid for data latency. The real pool lives in the
+    // rasterization worker -- see `crate::rayon_pool`.
+    crate::rayon_pool::install_serial_pool();
+
     // Before the app, because the first alerts round is what consumes it. Not
     // fatal and not awaited: the asset is fetched later, on the fetch task, and
     // a browser that will not name its own location simply resolves zones the

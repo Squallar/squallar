@@ -21,6 +21,21 @@ pub const ID: &str = "id";
 pub const REQUEST: &str = "req";
 pub const TOKEN: &str = "token";
 pub const ERROR: &str = "error";
+/// Worker → page, on `HELLO`: how many threads rayon's global pool ACTUALLY
+/// has in the worker, read back out of rayon rather than echoing the number
+/// `worker.js` asked `initThreadPool` for.
+///
+/// It rides the handshake because the page's console is the only one the
+/// browser rig scans, and the worker's is not: `window.__rig_console` is a
+/// page-side ring. Without this the fallback in `worker.js` — the arm a
+/// browser takes when it has no `SharedArrayBuffer`, no nested Workers, or
+/// was served without COOP/COEP — is invisible from outside, and every Tier-2
+/// assertion passes on a single-threaded worker exactly as it does on a
+/// pooled one. A gate that cannot tell those apart is not gating WS3b.
+///
+/// Absent reads as unknown, not as 1: a worker from a build before WS3b never
+/// sets it, and reporting that as "1 thread" would be inventing a measurement.
+pub const THREADS: &str = "threads";
 
 /// Worker → page: **the answer's HEAD** — scalars and framing in the dispatched
 /// codec row's own `encode_out` form, as one transferred `Uint8Array`; null

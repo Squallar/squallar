@@ -33,9 +33,14 @@ pub fn rustdar_worker_main() -> Result<(), JsValue> {
         proto::TOKEN,
         &JsValue::from_str(&proto::build_token()),
     );
+    // Asked of rayon, not of `worker.js`. `current_num_threads` reports the
+    // pool that actually got built, so the fallback arm reports 1 by telling
+    // the truth rather than by anyone remembering to say so.
+    let threads = rayon::current_num_threads();
+    proto::set_field(&hello, proto::THREADS, &JsValue::from_f64(threads as f64));
     scope.post_message(&hello)?;
 
-    log::info!("rustdar rasterization worker ready");
+    log::info!("rustdar rasterization worker ready (rayon: {threads} threads)");
     Ok(())
 }
 

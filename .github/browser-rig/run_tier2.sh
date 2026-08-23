@@ -50,16 +50,26 @@
 # reports `webgpu=object-but-no-adapter` and `app selected backend=Gl`.
 #   RIG_DRIVE_EXTRA   extra args appended to every drive.py call
 #   RIG_SERVE_EXTRA   extra args appended to every serve.py launch
+#   RIG_EXPECT_RAYON_THREADS  minimum worker rayon threads (default 2; 0 to
+#                     report without gating)
 #
-# The cross-origin-isolation proof (WS3a) is these two together -- serve the
-# isolation headers AND let the real service worker through, then assert both
-# sides rather than trusting the header was honoured:
+# WS3b made cross-origin isolation part of the DEFAULT posture: serve.py is
+# launched with --coep on every pass, because the shipped app needs a
+# SharedArrayBuffer to put rayon's pool on and production serves the headers
+# (CloudFront Response Headers Policy on rustdar.mcswain.dev). The gate then
+# asserts the pool exists -- `--expect-rayon-threads 2` -- which is what keeps
+# the header honest: the app degrades to a one-thread pool silently, and every
+# other assertion here passes in that state.
 #
-#   RIG_SERVE_EXTRA="--coep --no-block-sw" \
+# The fuller cross-origin-isolation proof (WS3a) adds the service-worker half
+# -- serve the headers AND let the real SW through, then assert both sides
+# rather than trusting the header was honoured:
+#
+#   RIG_SERVE_EXTRA="--no-block-sw" \
 #   RIG_DRIVE_EXTRA="--expect-cross-origin-isolated --expect-service-worker" \
 #     run_tier2.sh --skip-build
 #
-# Without --expect-cross-origin-isolated the run proves nothing: a browser
+# Without --expect-cross-origin-isolated that run proves nothing: a browser
 # that ignored the headers looks exactly like one that honoured them.
 #
 # ADAPTER: this gate is the rig's SOFTWARE arm, deliberately and permanently.
@@ -80,6 +90,9 @@ CHROMEDRIVER="${RIG_CHROMEDRIVER:-$(command -v chromedriver || echo /usr/bin/chr
 FRAMES="${RIG_FRAMES:-120}"
 BROWSERS="${RIG_BROWSERS:-chromium firefox}"
 EXPECT_TIMEOUT="${RIG_EXPECT_TIMEOUT:-180}"
+# Set to 0 to report the pool without gating on it -- for bisecting a browser
+# that will not build one, never as a way past a red leg.
+EXPECT_RAYON_THREADS="${RIG_EXPECT_RAYON_THREADS:-2}"
 PY=python3
 
 # UiConfig is #[serde(default)], so a config this partial parses; the key is
@@ -109,7 +122,16 @@ if [ -z "${RIG_GECKODRIVER:-}" ]; then
 fi
 GECKODRIVER="$RIG_GECKODRIVER"
 
-SERVE_EXTRA=()
+# `--coep` is a DEFAULT as of WS3b, not an opt-in. The shipped app needs
+# cross-origin isolation to have a `SharedArrayBuffer` to build rayon's pool
+# on, and production supplies it (CloudFront Response Headers Policy on
+# rustdar.mcswain.dev, COOP `same-origin` + COEP `require-corp`). A rig that
+# served the bundle WITHOUT the headers would be gating a configuration this
+# app is never deployed in, and -- worse -- one it degrades into silently:
+# every other Tier-2 assertion passes against the one-thread fallback. Paired
+# with `--expect-rayon-threads` below, which is what makes the header's effect
+# observable rather than assumed.
+SERVE_EXTRA=(--coep)
 if [ -n "${RIG_SERVE_EXTRA:-}" ]; then
   # shellcheck disable=SC2206
   SERVE_EXTRA+=($RIG_SERVE_EXTRA)
@@ -120,8 +142,15 @@ mkdir -p "$OUT_DIR"
 # ---------------------------------------------------------------- build ----
 if [ "$SKIP_BUILD" -eq 0 ]; then
   echo "building rustdar-web (wasm-pack; --skip-build to serve as-is)"
+  # Through wasm-threads.sh, which is the ONLY supported way to build this
+  # bundle since WS3b: it pins the nightly, rebuilds std against `+atomics`
+  # and passes the `--shared-memory`/`--import-memory` link args wasm-bindgen
+  # keys its thread glue off. A plain `wasm-pack build` does not fall back to
+  # a slower module, it fails to compile -- wasm-bindgen-rayon carries a
+  # `compile_error!` for a wasm32 target without atomics.
   (cd "$REPO_ROOT" &&
-    wasm-pack build rustdar-web --target web --release --no-typescript --no-pack) || {
+    .github/scripts/wasm-threads.sh \
+      wasm-pack build rustdar-web --target web --release --no-typescript --no-pack) || {
     echo "FATAL: wasm-pack build failed" >&2
     exit 1
   }
@@ -226,6 +255,11 @@ run_pass() {
     *) echo "unknown browser: $browser" >&2; return 1 ;;
   esac
   drive_args+=(--expect-worker-round-trip --expect-timeout "$EXPECT_TIMEOUT")
+  # WS3b: the worker's rayon pool really came up. 2 and not the requested
+  # count -- see wait_rayon_pool in drive.py; the request is
+  # hardwareConcurrency-derived and so is a property of the box, while 2 is
+  # the smallest number that cannot be the fallback.
+  drive_args+=(--expect-rayon-threads "$EXPECT_RAYON_THREADS")
   if [ "$doctored" -eq 1 ]; then
     server_args+=(--doctor-first-worker)
     drive_args+=(--expect-doctored-respawn)

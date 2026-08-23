@@ -135,7 +135,10 @@ mkdir -p "$OUT_DIR"
 # ---------------------------------------------------------------- build ----
 if [ "$SKIP_BUILD" -eq 0 ]; then
   echo "building rustdar-web (wasm-pack, CARGO_BUILD_JOBS=4)"
+  # Through wasm-threads.sh since WS3b -- the nightly/atomics/build-std/
+  # shared-memory configuration is the only one this bundle compiles in.
   (cd "$REPO_ROOT" && CARGO_BUILD_JOBS=4 \
+    .github/scripts/wasm-threads.sh \
     wasm-pack build rustdar-web --target web --release --no-typescript --no-pack) || {
     echo "FATAL: wasm-pack build failed" >&2
     exit 1
@@ -185,9 +188,13 @@ trap cleanup EXIT INT TERM
 start_server() {
   local ready_file="$OUT_DIR/serve.ready"
   : > "$ready_file"
+  # --coep since WS3b: without cross-origin isolation there is no
+  # SharedArrayBuffer, the rasterization worker falls back to a one-thread
+  # rayon pool, and this arm would report a rasterization time for a
+  # configuration the app is never deployed in. Production serves the headers.
   "$PY" "$RIG_DIR/serve.py" --dir "$WEB_DIR" --port 0 \
       --log "$OUT_DIR/serve.log" \
-      --seed-local-storage "$SEED_LS" \
+      --seed-local-storage "$SEED_LS" --coep \
       > "$ready_file" 2>> "$OUT_DIR/serve.stderr" &
   SERVER_PID=$!
   PORT=""

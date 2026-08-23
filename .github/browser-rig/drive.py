@@ -1088,19 +1088,27 @@ return {
 #                token-mismatch branch that terminates and respawns)
 #   off_frame -- offload::deliver_job_reply's "<kind> took <N> ms off the
 #                frame" (log::info!): a reply actually crossed the wire.
+#   rayon     -- the thread count carried on the SAME attach line, out of the
+#                worker's HELLO (worker_protocol::THREADS, which the worker
+#                fills from rayon::current_num_threads()). The worker's own
+#                console is not scanned here and cannot be: `__rig_console` is
+#                a page-side ring.
 WORKER_SIGNAL_PROBE = r"""
 var C = window.__rig_console || [];
-var attached = [], different = [], off_frame = [];
+var attached = [], different = [], off_frame = [], rayon = [];
 var off_re = /took \d+ ms off the frame/;
+var rayon_re = /rayon: (\d+) threads/;
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
   if (m.indexOf("rasterization worker attached") !== -1) attached.push(C[i].t);
   if (m.indexOf("rasterization worker is a different build") !== -1)
     different.push(C[i].t);
   if (off_re.test(m)) off_frame.push(C[i].t);
+  var rm = rayon_re.exec(m);
+  if (rm) rayon.push(parseInt(rm[1], 10));
 }
 return { attached: attached, different: different, off_frame: off_frame,
-         console_total: C.length };
+         rayon_threads: rayon, console_total: C.length };
 """
 
 # Which backend the APP settled on, read out of its own startup log.
@@ -1258,6 +1266,44 @@ def wait_worker_round_trip(session, timeout=180.0, interval=2.0):
                      "(attached=%s, off_frame=%s)"
                      % (timeout, first_attached is not None,
                         first_off_frame is not None)}
+
+
+def wait_rayon_pool(session, minimum, timeout=180.0, interval=2.0):
+    """WS3b: the rasterization worker's rayon pool has at least `minimum`
+    threads.
+
+    The count rides the worker's HELLO and is printed on the attach line, so
+    this reads the pool rayon BUILT, not the one `worker.js` asked for. It
+    exists because every other Tier-2 assertion is blind to the difference: a
+    worker that fell back to `rustdarRayonSerialPool` still attaches, still
+    answers jobs and still logs "took N ms off the frame". Without this check
+    a browser served without COOP/COEP, or one that refused nested Workers,
+    goes green while rasterizing on one thread -- the gate would be asserting
+    that WS3b's machinery is *reachable*, never that it *ran*.
+
+    `minimum` is 2 rather than the requested count on purpose: the requested
+    count is `navigator.hardwareConcurrency` clamped to the budget, which is a
+    property of whatever box the rig runs on. Two threads is the smallest
+    observation that distinguishes a real pool from the fallback, and it is
+    the only threshold that means the same thing on a 4-core CI runner and a
+    32-core desktop."""
+    t0 = time.monotonic()
+    best = None
+    while time.monotonic() - t0 < timeout:
+        sig = session.execute(WORKER_SIGNAL_PROBE) or {}
+        seen = [n for n in (sig.get("rayon_threads") or []) if isinstance(n, int)]
+        if seen:
+            best = max(seen) if best is None else max(best, max(seen))
+        if best is not None and best >= minimum:
+            return {"ok": True, "threads": best, "minimum": minimum,
+                    "waited_s": round(time.monotonic() - t0, 2)}
+        time.sleep(interval)
+    return {"ok": False, "threads": best, "minimum": minimum,
+            "waited_s": round(time.monotonic() - t0, 2),
+            "error": "rasterization worker reported %s rayon threads, wanted "
+                     ">=%d within %.0fs (a worker that fell back to the "
+                     "one-thread pool looks identical to every other Tier-2 "
+                     "assertion)" % (best, minimum, timeout)}
 
 
 def wait_doctored_respawn(session, timeout=180.0, respawn_grace=30.0,
@@ -1696,6 +1742,12 @@ def run_smoke(args):
             result["worker_round_trip"] = wait_worker_round_trip(
                 session, timeout=args.expect_timeout)
             stage("worker-round-trip-done", **result["worker_round_trip"])
+        if args.expect_rayon_threads:
+            stage("rayon-pool-wait", minimum=args.expect_rayon_threads,
+                  timeout=args.expect_timeout)
+            result["rayon_pool"] = wait_rayon_pool(
+                session, args.expect_rayon_threads, timeout=args.expect_timeout)
+            stage("rayon-pool-done", **result["rayon_pool"])
 
         stage("settle", seconds=args.settle)
         time.sleep(args.settle)
@@ -1786,8 +1838,10 @@ def run_smoke(args):
         # booted page with a dead wire passes every weaker check.
         wrt = result.get("worker_round_trip")
         dr = result.get("doctored_respawn")
+        rp = result.get("rayon_pool")
         worker_ok = ((wrt is None or bool(wrt.get("ok")))
-                     and (dr is None or bool(dr.get("ok"))))
+                     and (dr is None or bool(dr.get("ok")))
+                     and (rp is None or bool(rp.get("ok"))))
 
         # Isolation assertions (opt-in). Both are written so that they FAIL
         # when the thing they name is absent -- an isolation proof that cannot
@@ -1851,6 +1905,11 @@ def run_smoke(args):
                                      else bool(wrt.get("ok"))),
             "doctored_respawn_ok": (None if dr is None
                                     else bool(dr.get("ok"))),
+            "rayon_pool_ok": (None if rp is None else bool(rp.get("ok"))),
+            # Reported unconditionally, not only under --expect-rayon-threads:
+            # a measurement run wants the number even when nothing is gating
+            # on it, and `null` distinguishes "never observed" from "one".
+            "rayon_threads": (None if rp is None else rp.get("threads")),
         }
         exit_code = 0 if result["pass"] else 2
 
@@ -2001,6 +2060,11 @@ def run_smoke(args):
               % (tag, "OK" if dr.get("ok") else "FAILED",
                  (" (attach %.0f ms after the refusal)" % dr["delta_ms"])
                  if dr.get("ok") else "; " + str(dr.get("error"))))
+    rp = result.get("rayon_pool")
+    if rp is not None:
+        print("[%s] SUMMARY rayon pool: %s (%s threads, wanted >=%s)"
+              % (tag, "OK" if rp.get("ok") else "FAILED",
+                 rp.get("threads"), rp.get("minimum")))
     return exit_code
 
 
@@ -2034,6 +2098,14 @@ def main(argv=None):
                     help="fail unless the console shows a worker attach AND a "
                          "'took N ms off the frame' job reply within "
                          "--expect-timeout (Tier-2 m4)")
+    ap.add_argument("--expect-rayon-threads", type=int, default=0,
+                    metavar="N",
+                    help="fail unless the rasterization worker's HELLO reports "
+                         ">=N rayon threads within --expect-timeout (WS3b). "
+                         "Pair with serve.py --coep: without cross-origin "
+                         "isolation there is no SharedArrayBuffer, the pool "
+                         "falls back to one thread, and every other Tier-2 "
+                         "assertion still passes")
     ap.add_argument("--expect-doctored-respawn", action="store_true",
                     help="fail unless the console shows the doctored-token "
                          "refusal and then, >=1000 ms later, a clean attach "

@@ -264,7 +264,15 @@ jobs:
             cmd: |
               apt-get update -qq
               apt-get install -y -qq --no-install-recommends python3
-              wasm-pack build rustdar-web --target web --release --no-typescript --no-pack
+              # THE nightly carve-out, and its whole extent in this workflow:
+              # one wrapped command in one row. wasm-threads.sh overrides
+              # RUSTUP_TOOLCHAIN for this process tree only, rebuilds std
+              # against `+atomics` and passes the shared-memory link args.
+              # Every other row in this matrix -- Android, iOS, macOS, the
+              # native Linux and Windows builds -- is untouched and stays on
+              # the `rust-toolchain.toml` stable pin.
+              .github/scripts/wasm-threads.sh \
+                wasm-pack build rustdar-web --target web --release --no-typescript --no-pack
 
               # Opt-in list. The old extension allowlist shipped `tests/*.mjs`
               # and carried `*.json` -- what a leaked service-account key wears.
