@@ -2100,6 +2100,54 @@ fn a_theme_change_invalidates_the_site_labels_exactly_once() {
     );
 }
 
+/// **A cut sealing is not a reason to re-rasterize every site marker**, and
+/// only a spinner that was really up may be.
+///
+/// `Gui::clear_loading_site_for_site` is called on every sealed cut of the
+/// live chunk feed — `App::apply_chunk_outcome` calls it in both arms — and on
+/// every scan result and failed fetch besides. The site layer's whole cache
+/// token is `radar_sites_render_gen`, so a bump there is a full-size raster
+/// spent for a picture nothing changed. Measured on the Tier-2 rig before the
+/// guard: `overlay/sites` ran 13-16 times in a ~40 s leg on a scene where the
+/// site table never moved, against `overlay/alerts`' 2-3.
+///
+/// Counted, not timed: twelve calls, zero bumps.
+#[test]
+fn a_cut_sealing_does_not_re_rasterize_the_site_markers() {
+    let mut app = headless(TestBridge::desktop());
+    let site = app.gui.pane(0).unwrap().site().to_string();
+    app.gui.pane_mut(0).unwrap().loading_site = Some(site.clone());
+    let before = app.gui.pane(0).unwrap().radar_sites_render_gen;
+
+    // The switch completing, which is the one transition that really changes
+    // the picture: the spinner comes down.
+    app.gui.clear_loading_site_for_site(&site);
+    let settled = app.gui.pane(0).unwrap().radar_sites_render_gen;
+    assert_eq!(
+        settled,
+        before.wrapping_add(1),
+        "the spinner came down and the markers were not redrawn, so the pane \
+         keeps painting a spinner that is over",
+    );
+    assert_eq!(
+        app.gui.pane(0).unwrap().loading_site,
+        None,
+        "precondition for the loop below: the spinner must really be down, or \
+         every call there is the transition above repeated",
+    );
+
+    for seal in 1..=12 {
+        app.gui.clear_loading_site_for_site(&site);
+        assert_eq!(
+            app.gui.pane(0).unwrap().radar_sites_render_gen,
+            settled,
+            "sealed cut {seal} re-keyed the site raster with nothing to \
+             redraw: a whole picture rasterized, uploaded and promoted, once \
+             per cut, for as long as the feed runs",
+        );
+    }
+}
+
 /// Every scan response queued for a frame is spent in it.
 #[test]
 fn every_queued_scan_response_is_spent_in_the_frame_it_arrives_in() {
