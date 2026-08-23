@@ -709,6 +709,30 @@ impl Gui {
                     pane.viewing_live = live;
                 }
             }
+            GuiEvent::PaneTimeSelected {
+                pane_idx,
+                instant,
+                live,
+            } => {
+                if let Some(pane) = self.panes.get_mut(pane_idx) {
+                    pane.viewing_live = live;
+                    // **The half the step buttons never had.** `set_time_mode`
+                    // settles every layer's playhead onto the new clock, which
+                    // is the whole of what makes a pane holding no radar scan
+                    // move at all.
+                    pane.set_time_mode(if live {
+                        crate::pane::TimeMode::Live
+                    } else {
+                        crate::pane::TimeMode::AsOf(instant)
+                    });
+                }
+                // The dialog is app-wide and shows local time; `instant` is
+                // UTC. One conversion, here, so the clock and the strings
+                // cannot name different moments.
+                self.time_dialog.select(
+                    chrono::TimeZone::from_utc_datetime(&chrono::Local, &instant).naive_local(),
+                );
+            }
             GuiEvent::VolumePainter(painter) => {
                 self.volume_painter = painter;
             }

@@ -120,6 +120,31 @@ pub enum GuiEvent {
     SelectedTime(chrono::NaiveDateTime),
     /// Live/historic viewing mode for one pane.
     ViewingLiveForPane { pane_idx: usize, live: bool },
+    /// **One pane's time selection moved to `instant`** — the whole gesture,
+    /// as one event.
+    ///
+    /// Three things move together whenever a user names a moment on a pane:
+    /// the pane's `viewing_live` posture, the pane's **clock**
+    /// ([`crate::pane::PaneState::set_time_mode`], which settles every layer's
+    /// playhead onto it), and the Set Time dialog's displayed selection.
+    ///
+    /// They were three separate pushes and one of them was simply missing from
+    /// the step buttons: `handle_navigate_time` sent
+    /// [`Self::ViewingLiveForPane`] and [`Self::SelectedTime`] and no clock
+    /// move at all, while the scrubber wrote the clock itself in the UI before
+    /// emitting the same action. So a step on a pane with no radar scan moved
+    /// nothing a layer could read, which is WO-T3.10's defect. Making it one
+    /// event is what stops a fourth caller omitting a half.
+    ///
+    /// `instant` is **UTC**; the dialog's own strings are local, and the
+    /// conversion is this event's to make so the two cannot drift. Under
+    /// `live` the clock goes back to [`crate::pane::TimeMode::Live`] and
+    /// `instant` is only what the dialog shows.
+    PaneTimeSelected {
+        pane_idx: usize,
+        instant: chrono::NaiveDateTime,
+        live: bool,
+    },
     /// Install what can draw 3D panes, or take it away.
     VolumePainter(Option<std::sync::Arc<dyn crate::volume_view::VolumePainter>>),
 }

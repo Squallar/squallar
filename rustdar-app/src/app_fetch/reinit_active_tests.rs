@@ -30,19 +30,24 @@ use rustdar_overlays::render::overlay_state::{
 
 /// One entry per `create_frame_list_task` call, captured **inside it** — before
 /// the future is spawned, so nothing here waits on an executor.
-type Asked = Arc<Mutex<Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime)>>>;
+pub(super) type Asked = Arc<Mutex<Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime)>>>;
 
 /// A past-only frame-series layer that records what window it is listed over,
-/// and declares a loop-width floor of its own.
+/// declares a loop-width floor of its own, and holds a resident set the test
+/// stages.
 ///
 /// `min_frames` is the whole reason this is not a copy of `PastLayer` next
 /// door: it is what makes the Lookback slider and the window a loop is really
-/// listed over two different numbers, which is where the second half of the
-/// defect lives.
-struct CoarseLayer {
-    id: LayerId,
-    min_frames: usize,
-    asked: Asked,
+/// listed over two different numbers, which is where the second half of
+/// WO-T3.9's defect lives. `resident` is what `step_button_tests` next door
+/// needs, and every fixture in *this* file leaves it empty on purpose — see
+/// [`CoarseLayer::latest_at`].
+pub(super) struct CoarseLayer {
+    pub(super) id: LayerId,
+    pub(super) min_frames: usize,
+    /// Ascending, as [`FrameSource::frames_resident`]'s contract requires.
+    pub(super) resident: Vec<chrono::NaiveDateTime>,
+    pub(super) asked: Asked,
 }
 
 impl OverlayHandler for CoarseLayer {
@@ -112,12 +117,25 @@ impl OverlayHandler for CoarseLayer {
     }
 }
 
+impl CoarseLayer {
+    fn stamps(&self) -> Vec<FrameStamp> {
+        self.resident
+            .iter()
+            .map(|valid| FrameStamp {
+                valid: *valid,
+                run: None,
+            })
+            .collect()
+    }
+}
+
 impl FrameSource for CoarseLayer {
-    /// Nothing is staged, so nothing qualifies — which keeps `armed_start`
-    /// from widening any window below and leaves the arithmetic under test
-    /// exactly the lookback.
-    fn latest_at(&self, _pane: &PaneRef<'_>, _t: chrono::NaiveDateTime) -> Option<FrameStamp> {
-        None
+    /// The frame-series rule, through the one `<=` in the workspace. **Every
+    /// fixture in this file stages nothing**, so nothing qualifies and
+    /// `armed_start` widens no window — which is what leaves the arithmetic
+    /// WO-T3.9 is about exactly the lookback.
+    fn latest_at(&self, _pane: &PaneRef<'_>, t: chrono::NaiveDateTime) -> Option<FrameStamp> {
+        rustdar_source::time::newest_at_or_before(&self.stamps(), t)
     }
 
     fn list_frames(
@@ -159,7 +177,7 @@ impl FrameSource for CoarseLayer {
     }
 
     fn frames_resident(&self, _pane: &PaneRef<'_>) -> Vec<FrameStamp> {
-        Vec::new()
+        self.stamps()
     }
 
     fn retain_frames(&mut self, _pane: &PaneRef<'_>, _keep: &[FrameStamp]) {}
@@ -209,6 +227,8 @@ fn app_with(layers: Vec<(LayerId, usize)>) -> (App, Asked) {
                 Box::new(CoarseLayer {
                     id,
                     min_frames,
+                    // Deliberately empty here: see `CoarseLayer::latest_at`.
+                    resident: Vec::new(),
                     asked: Arc::clone(&asked),
                 }) as Box<dyn OverlayHandler>
             })

@@ -273,7 +273,17 @@ const INVENTORY_FIELD: &str = concat!("volumes: ", "crate::volume_inventory::");
 /// `Gui::visible_panes_and_overlays_mut` for the slice they actually walk (-2).
 /// Net -1 here and **-2 on the collapsed per-file scrape**, which is the figure
 /// that describes the coupling: `app_fetch.rs` 40 -> 38.
-const SELF_GUI_MAX: usize = 167;
+///
+/// # 167 -> 164 at WO-T3.10
+///
+/// Three navigation pushes became one event. `handle_navigate_time`,
+/// `handle_navigate_one_scan` and `handle_jump_to_live` each spelled a time
+/// selection as a `ViewingLiveForPane` push beside a `SelectedTime` push —
+/// with the pane's own clock missing from all three, which is the WO-T3.10
+/// defect. `GuiEvent::PaneTimeSelected` carries the whole gesture, reached
+/// through one `App::select_instant`, so the sites lose their pushes and the
+/// door is written once.
+const SELF_GUI_MAX: usize = 164;
 /// Row 1b — the same needle outside test-named paths.
 ///
 /// Everything on [`SELF_GUI_MAX`] applies here: permanent, falls only, sits on
@@ -290,7 +300,9 @@ const SELF_GUI_MAX: usize = 167;
 ///
 /// 163 -> 162 at WO-T3.9, and again by exactly what [`SELF_GUI_MAX`] moved:
 /// every site in that land is a production file.
-const SELF_GUI_NON_TEST_MAX: usize = 162;
+///
+/// 162 -> 159 at WO-T3.10, again by exactly what [`SELF_GUI_MAX`] moved.
+const SELF_GUI_NON_TEST_MAX: usize = 159;
 /// Row 2a — **`ui.rs`'s own `impl Gui` block, and only that file**.
 ///
 /// **0 since WO-E8b**, which is where the plan said it would land. The last

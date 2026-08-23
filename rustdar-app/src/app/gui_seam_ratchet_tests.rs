@@ -139,6 +139,16 @@ fn no_production_file_pushes_through_a_gui_setter() {
 /// where the raw walk could not see it and this scrape could. WO-T3.9 put that
 /// reach back on one line, so the raw row paid +1 for no change in coupling
 /// while this scrape — the one that describes the coupling — fell by two.
+///
+/// # WO-T3.10 — `app_fetch.rs` 38 -> 35, and the shed is the fix
+///
+/// A time selection was two `Gui::apply` pushes at three sites — and the
+/// pane's own clock was missing from all three, which is why the step buttons
+/// moved nothing on a pane holding no radar scan. `GuiEvent::PaneTimeSelected`
+/// carries the whole gesture and `App::select_instant` is its one door, so
+/// `handle_navigate_time` and `handle_jump_to_live` each shed two pushes and
+/// the door spends one. The crate-wide walk moved by the same three, since
+/// every site is a production file.
 #[test]
 fn the_gui_coupling_only_ever_shrinks() {
     // Presence control: the scrape reads real, current source. Without it every
@@ -150,7 +160,7 @@ fn the_gui_coupling_only_ever_shrinks() {
     );
     for (name, source, ceiling) in [
         ("app.rs", APP, 36),
-        ("app_fetch.rs", APP_FETCH, 38),
+        ("app_fetch.rs", APP_FETCH, 35),
         ("app_render.rs", APP_RENDER, 101),
         ("app_chunks.rs", APP_CHUNKS, 13),
     ] {
