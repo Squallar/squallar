@@ -107,7 +107,27 @@ pub fn raster_side_from_rgba_len(rgba_len: usize) -> Option<usize> {
 /// arm is a *worker* cap, not a memory one: the browser has one rasterization
 /// worker, so anything past the first only queues behind it. Raise it in step
 /// with the worker pool, not alone.
+///
+/// **Still 1 after WS3b, and that is the correct reading of the rule above.**
+/// WS3b put threads *inside* the one rasterization worker
+/// ([`WASM_MAX_RAYON_THREADS`]); it did not make a second one. A render past
+/// the first would still queue behind the first, and admitting two would only
+/// have them contend for the same rayon pool. The pool this cap is tied to is a
+/// pool of *workers*, and it is still a pool of one.
 pub const WASM_MAX_CONCURRENT_RENDERS: usize = 1;
+/// Ceiling on rayon threads inside the browser's rasterization worker.
+///
+/// A *memory* cap, unlike [`WASM_MAX_CONCURRENT_RENDERS`] above: every rayon
+/// thread is a nested Web Worker with a stack inside the single shared linear
+/// memory the raster worker owns, and wasm32 linear memory is a hard 4 GiB with
+/// no swap under it. `navigator.hardwareConcurrency` is clamped to this by
+/// `rustdar_web::rayon_pool::threads`.
+///
+/// Native has no equivalent because rayon sizes itself there: it defaults to
+/// the core count and its stacks come out of an OS address space that can
+/// overcommit.
+pub const WASM_MAX_RAYON_THREADS: usize = 8;
+
 pub const MOBILE_MAX_CONCURRENT_RENDERS: usize = 3;
 pub const DESKTOP_MAX_CONCURRENT_RENDERS: usize = 6;
 

@@ -113,12 +113,25 @@ egui-wgpu = { workspace = true, features = ["macos-window-resize-jitter-fix"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 egui-winit = { workspace = true, features = ["links"] }
-# `fragile-send-sync-non-atomic-wasm` makes egui-wgpu's `CallbackResources` the
-# concurrent `TypeMap` and wgpu's handles `Send + Sync` on a target that has no
-# threads to be unsound about. Without it the browser build stops compiling.
+# `fragile-send-sync-non-atomic-wasm` is OFF here, and the browser build needs
+# it off — the reverse of what this line said until WS3b, for the reason that
+# line gave. It made egui-wgpu's `CallbackResources` the concurrent `TypeMap`
+# and wgpu's handles `Send + Sync` "on a target that has no threads to be
+# unsound about". This target has threads now.
+#
+# The two halves of that feature stop agreeing the moment it does. wgpu grants
+# `Send + Sync` under `all(feature, not(target_feature = "atomics"))`
+# (wgpu-core's build.rs `send_sync` alias); egui-wgpu picks the concurrent map
+# on the feature ALONE. Build with `+atomics` and the map demands a bound wgpu
+# has stopped supplying: 47 errors, all of them `App::install_volume_resources`
+# inserting `VolumeResources` at rustdar-app/src/app.rs. With the feature off
+# egui-wgpu selects `type_map::TypeMap`, which asks for no bound at all — the
+# correct map for a `CallbackResources` only ever touched on the thread that
+# owns the WebGL context.
+#
 # (The browser wgpu backend itself — `webgl`, never `webgpu` — is chosen by
 # rustdar-gpu's manifest since WO-RV land 3.)
-egui-wgpu = { workspace = true, features = ["fragile-send-sync-non-atomic-wasm"] }
+egui-wgpu = { workspace = true }
 # Pinned to what the egui/wgpu stack already resolves (wasm-bindgen 0.2.126).
 # A newer wasm-bindgen-futures wants a newer wasm-bindgen and the resolver
 # rejects the pair outright, so this version moves when that stack moves.

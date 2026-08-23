@@ -172,7 +172,14 @@ fn handle_message(generation: u64, worker: &web_sys::Worker, data: &JsValue) {
                 lose(generation, "build token mismatch");
                 return;
             }
-            log::info!("rasterization worker attached ({ours})");
+            // The thread count is reported as the worker stated it, or as
+            // `?` when the worker did not state one at all — a pre-WS3b
+            // build. Printing `1` for an absent field would read as a
+            // measured single-threaded pool.
+            let threads = proto::field(data, proto::THREADS)
+                .and_then(|v| v.as_f64())
+                .map_or_else(|| "?".to_string(), |n| (n as usize).to_string());
+            log::info!("rasterization worker attached ({ours}, rayon: {threads} threads)");
             // The ladder resets **here**, on a worker that has proved itself.
             BACKOFF.with(|backoff| {
                 let mut ladder = backoff.get();

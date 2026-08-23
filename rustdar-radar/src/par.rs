@@ -1,80 +1,25 @@
-//! The crate's parallel-iteration prelude: rayon everywhere it has threads,
-//! sequential stand-ins where it does not.
+//! The crate's parallel-iteration prelude: rayon, on every target.
+//!
+//! The web arm used to be a `mod seq` of sequential stand-ins, because
+//! wasm32-unknown-unknown had no threads to give rayon. It has them as of WS3b:
+//! the browser bundle builds under `-Ctarget-feature=+atomics,+bulk-memory,
+//! +mutable-globals` with `-Zbuild-std`, and `rustdar-web` fills the pool with
+//! Web Workers over one shared linear memory (`wasm-bindgen-rayon`). Both arms
+//! now compile from identical source.
+//!
+//! The stand-ins are gone rather than kept as a degradation path, because the
+//! degradation now lives where it belongs — in the *pool*, not in the iterator.
+//! A browser that cannot give rayon its threads (no `SharedArrayBuffer`, no
+//! nested Workers, or a deployment served without COOP/COEP) still reaches this
+//! same `par_iter`: `rustdar_web::rayon_pool::install_serial_pool` hands it a
+//! global pool of one thread — the caller's — so the work runs inline at
+//! exactly the speed `seq` ran it. Nothing here reads a `cfg`.
+//!
+//! **Every caller of this module owes rayon a built global pool.** rayon panics
+//! rather than falling back when `build_global` never ran and cannot run, and
+//! on wasm32-unknown-unknown it cannot: `std::thread::spawn` is `Unsupported`
+//! there. Native gets its pool from rayon's own lazy default; the two browser
+//! threads that reach this — the page and the rasterization worker — get theirs
+//! from `rustdar_web::rayon_pool`.
 
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) use rayon::prelude::*;
-#[cfg(target_arch = "wasm32")]
-pub(crate) use seq::*;
-
-/// Sequential stand-ins for the rayon entry points this crate uses.
-#[cfg(target_arch = "wasm32")]
-mod seq {
-    /// Stands in for `rayon::prelude::ParallelSlice::par_iter`. Implemented on
-    /// `[T]` only; `Vec<T>` reaches it through deref.
-    pub trait ParIterFallback<T> {
-        fn par_iter<'a>(&'a self) -> impl Iterator<Item = &'a T>
-        where
-            T: 'a;
-    }
-
-    impl<T> ParIterFallback<T> for [T] {
-        fn par_iter<'a>(&'a self) -> impl Iterator<Item = &'a T>
-        where
-            T: 'a,
-        {
-            self.iter()
-        }
-    }
-
-    /// Stands in for `rayon::iter::IntoParallelIterator::into_par_iter`.
-    pub trait IntoParIterFallback {
-        type Item;
-        fn into_par_iter(self) -> impl Iterator<Item = Self::Item>;
-    }
-
-    impl IntoParIterFallback for std::ops::Range<usize> {
-        type Item = usize;
-        fn into_par_iter(self) -> impl Iterator<Item = usize> {
-            self
-        }
-    }
-
-    impl<T> IntoParIterFallback for Vec<T> {
-        type Item = T;
-        fn into_par_iter(self) -> impl Iterator<Item = T> {
-            self.into_iter()
-        }
-    }
-
-    /// Stands in for `rayon::slice::ParallelSliceMut::par_chunks_mut`.
-    pub trait ParChunksMutFallback<T> {
-        fn par_chunks_mut<'a>(&'a mut self, n: usize) -> impl Iterator<Item = &'a mut [T]>
-        where
-            T: 'a;
-    }
-
-    impl<T> ParChunksMutFallback<T> for [T] {
-        fn par_chunks_mut<'a>(&'a mut self, n: usize) -> impl Iterator<Item = &'a mut [T]>
-        where
-            T: 'a,
-        {
-            self.chunks_mut(n)
-        }
-    }
-
-    /// Stands in for `rayon::iter::ParallelIterator::for_each_init`.
-    pub trait ForEachInitFallback: Iterator + Sized {
-        fn for_each_init<T, INIT, OP>(self, init: INIT, op: OP)
-        where
-            INIT: Fn() -> T,
-            OP: Fn(&mut T, Self::Item),
-        {
-            let mut state = init();
-            for item in self {
-                op(&mut state, item);
-            }
-        }
-    }
-
-    impl<I: Iterator> ForEachInitFallback for I {}
-}

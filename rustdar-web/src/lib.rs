@@ -53,6 +53,18 @@ mod entry;
 mod worker;
 #[cfg(target_arch = "wasm32")]
 mod worker_port;
+
+/// Where rayon gets its threads. Public because `worker.js` calls into it
+/// before it will accept a job.
+#[cfg(target_arch = "wasm32")]
+pub mod rayon_pool;
+
+/// `initThreadPool`, the JS half of `wasm-bindgen-rayon`'s pool. Re-exported
+/// because wasm-bindgen only emits a binding for an export this crate names:
+/// the symbol is defined in the dependency, and without this line `worker.js`
+/// would import a function `pkg/rustdar_web.js` does not have.
+#[cfg(target_arch = "wasm32")]
+pub use wasm_bindgen_rayon::init_thread_pool;
 /// Public for the Tier-1 browser gate (`tests/tier1_wasm.rs`).
 #[cfg(target_arch = "wasm32")]
 pub mod worker_protocol;

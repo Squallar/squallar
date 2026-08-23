@@ -3,12 +3,24 @@ name: Web
 # THE [WEB] GATE RULE (campaign-binding). Every [WEB]-marked plan step requires
 # the LOCAL invocations of both tiers green BEFORE landing on local main:
 #
-#   Tier 1: wasm-pack test --headless --firefox --geckodriver \
-#             "$(bash .github/browser-rig/ensure-geckodriver.sh)" \
+#   Tier 1: .github/scripts/wasm-threads.sh wasm-pack test --headless --firefox \
+#             --geckodriver "$(bash .github/browser-rig/ensure-geckodriver.sh)" \
 #             rustdar-web --test tier1_wasm          # test result: ok. 4 passed
-#           wasm-pack test --headless --chrome rustdar-web --test tier1_wasm
-#   Tier 2: wasm-pack build rustdar-web --target web --release --no-typescript --no-pack
+#           .github/scripts/wasm-threads.sh wasm-pack test --headless --chrome \
+#             rustdar-web --test tier1_wasm
+#   Tier 2: .github/scripts/wasm-threads.sh wasm-pack build rustdar-web \
+#             --target web --release --no-typescript --no-pack
 #           bash .github/browser-rig/run_tier2.sh --skip-build
+#
+# EVERY wasm command goes through `.github/scripts/wasm-threads.sh` as of
+# WS3b. That script is the nightly carve-out in full: it overrides
+# RUSTUP_TOOLCHAIN for one process tree, rebuilds std against
+# `+atomics,+bulk-memory,+mutable-globals`, and passes the
+# `--shared-memory`/`--import-memory` link args that make wasm-bindgen emit
+# thread glue. `rust-toolchain.toml` still pins stable and every non-wasm row
+# in every workflow still uses it. A bare `wasm-pack build` does not silently
+# produce a slower bundle -- it fails to compile, because wasm-bindgen-rayon
+# carries a `compile_error!` for wasm32 without atomics.
 #           # both browsers, both passes: worker attach + "took N ms off the
 #           # frame" reply, and the doctored-token -> respawn leg
 #
@@ -87,10 +99,12 @@ jobs:
         # `--` they would go to the test harness instead.)
         run: |
           if [ "${{ matrix.browser }}" = firefox ]; then
-            wasm-pack test --headless --firefox --geckodriver "$RIG_GECKODRIVER" \
+            .github/scripts/wasm-threads.sh \
+              wasm-pack test --headless --firefox --geckodriver "$RIG_GECKODRIVER" \
               rustdar-web --test tier1_wasm | tee "$RUNNER_TEMP/tier1.log"
           else
-            wasm-pack test --headless --chrome \
+            .github/scripts/wasm-threads.sh \
+              wasm-pack test --headless --chrome \
               rustdar-web --test tier1_wasm | tee "$RUNNER_TEMP/tier1.log"
           fi
           grep -q 'test result: ok\. 4 passed' "$RUNNER_TEMP/tier1.log"
@@ -127,8 +141,10 @@ jobs:
             cargo install wasm-pack --version 0.15.0 --locked
           fi
           wasm-pack --version
-      - name: Build the web bundle
-        run: wasm-pack build rustdar-web --target web --release --no-typescript --no-pack
+      - name: Build the web bundle (threaded)
+        run: |
+          .github/scripts/wasm-threads.sh \
+            wasm-pack build rustdar-web --target web --release --no-typescript --no-pack
       - name: Run the Tier-2 gate (${{ matrix.browser }})
         # run_tier2.sh asserts its own outcomes per pass (worker round-trip,
         # doctored respawn) and exits non-zero on any leg failing twice.

@@ -135,11 +135,18 @@ egui-winit = { workspace = true, features = ["links"] }
 # bindings rather than web-sys's, so the binding duplication that once broke
 # `wasm-bindgen` outright does not recur -- `cargo tree -d` is the check.
 #
-# `fragile-send-sync-non-atomic-wasm` makes egui-wgpu's `CallbackResources` the
-# concurrent `TypeMap` and wgpu's handles `Send + Sync` on a target that has no
-# threads to be unsound about. Without it the browser build stops compiling.
+# `fragile-send-sync-non-atomic-wasm` is OFF as of WS3b, and must stay off: it
+# grants `Send + Sync` only under `not(target_feature = "atomics")`, while
+# egui-wgpu reads the same feature to pick a `CallbackResources` map that
+# *requires* those bounds. The browser build carries `+atomics` now, so the two
+# disagree and the concurrent map stops compiling. See rustdar-app's manifest,
+# which states it in full.
+#
+# `webgpu` rides alongside `webgl` (WS4): the backend is chosen at runtime by
+# `new_instance_with_webgpu_detection`, and `rustdar-gpu`'s own tripwire fails
+# the build if either browser backend goes missing.
 wgpu = { workspace = true, features = ["webgl", "webgpu"] }
-egui-wgpu = { workspace = true, features = ["fragile-send-sync-non-atomic-wasm"] }
+egui-wgpu = { workspace = true }
 
 [dev-dependencies]
 # The charter test parses `cargo metadata`.

@@ -25,7 +25,12 @@
  * root-absolute URL resolves under a local server and 404s in production;
  * `.github/scripts/check-relative-paths.py` fails the build over one.
  */
-import init, { rustdar_worker_main } from "./pkg/rustdar_web.js";
+import init, {
+  initThreadPool,
+  rustdarRayonThreads,
+  rustdarRayonSerialPool,
+  rustdar_worker_main,
+} from "./pkg/rustdar_web.js";
 
 /*
  * No top-level await: a rejected TLA leaves the worker alive but inert, and the
@@ -33,6 +38,30 @@ import init, { rustdar_worker_main } from "./pkg/rustdar_web.js";
  * failure lets it give up and rasterize on the main thread immediately.
  */
 init()
+  .then(function () {
+    /*
+     * Rayon's threads (WS3b). `initThreadPool` spawns `rustdarRayonThreads()`
+     * NESTED Workers over this worker's own shared linear memory, which needs
+     * cross-origin isolation -- the CloudFront Response Headers Policy on
+     * rustdar.mcswain.dev emits COOP `same-origin` + COEP `require-corp`.
+     *
+     * The failure arm is a fallback and not a `fatal`. `rustdar_radar::par` is
+     * rayon on every target now, so a worker with NO global pool panics on the
+     * first job rather than serving it slowly; `rustdarRayonSerialPool` makes
+     * the calling thread its own one-thread pool, which is exactly the speed
+     * this worker ran at before WS3b. A browser without `SharedArrayBuffer`,
+     * without nested Workers, or served without the isolation headers keeps
+     * rasterizing off the main thread -- it just stops going faster.
+     */
+    return initThreadPool(rustdarRayonThreads()).catch(function (e) {
+      console.warn(
+        "rustdar: no rayon thread pool (" +
+          String(e) +
+          "); rasterizing on one thread",
+      );
+      rustdarRayonSerialPool();
+    });
+  })
   .then(function () {
     rustdar_worker_main();
   })
