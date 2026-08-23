@@ -188,13 +188,23 @@ pub(crate) const MAX_FRAME_LIST_REQUESTS: usize = 26;
 /// object, so this bounds sockets rather than bytes.
 const FRAME_LIST_CONCURRENCY: usize = 6;
 
-/// The top-of-hour instants inside `range`, at most
+/// The top-of-hour instants `range` **reaches into**, at most
 /// [`MAX_FRAME_LIST_REQUESTS`] of them, **endpoint-anchored** when there are
 /// more hours than that.
 ///
-/// An hour `H`'s granule depicts `H`, so an hour belongs to the window exactly
-/// when `H` itself does — the partial hours at either end name granules whose
-/// stamps sit outside it and would be clipped away by the caller anyway.
+/// **The two edges round the same way — down — and for opposite reasons.**
+///
+/// An hour `H`'s granule depicts `H`, and nothing depicts the minutes after
+/// it: every instant in `H..H+1h` is drawn by carrying `H`'s granule forward.
+/// So the hour a window *starts inside* is the newest granule at or before
+/// `range.0` — the only picture the window's first partial hour can be drawn
+/// from, and exactly what "the latest data at `range.0`" means. Rounding the
+/// leading edge **up** left that hour unnamed, and a loop enabled at `HH:MM`
+/// had `60 - MM` minutes of rail with no satellite granule behind it at all.
+///
+/// The trailing edge rounds **down** because the hour after `range.1` depicts
+/// an instant later than anything in the window: no clock inside `range` can
+/// ever stop on it, so listing it would buy a granule nothing can draw.
 pub(crate) fn hours_in_range(range: (NaiveDateTime, NaiveDateTime)) -> Vec<NaiveDateTime> {
     let top = |t: NaiveDateTime| {
         t.with_minute(0)
@@ -203,10 +213,7 @@ pub(crate) fn hours_in_range(range: (NaiveDateTime, NaiveDateTime)) -> Vec<Naive
             .unwrap_or(t)
     };
     let last = top(range.1);
-    let mut first = top(range.0);
-    if first < range.0 {
-        first += chrono::Duration::hours(1);
-    }
+    let first = top(range.0);
     if last < first {
         return Vec::new();
     }

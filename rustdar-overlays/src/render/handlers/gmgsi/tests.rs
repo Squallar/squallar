@@ -955,13 +955,116 @@ fn a_frame_listing_costs_one_request_per_hour_and_is_bounded() {
         "the sampled hours must stay in order and hold no duplicate"
     );
 
-    // Partial hours at either end name granules outside the window.
+    // The hour a window starts inside is the granule its first minutes are
+    // drawn from; the hour after it ends depicts an instant it cannot reach.
     assert_eq!(
         hours_in_range((hour(0) + chrono::Duration::minutes(1), hour(2))),
-        vec![hour(1), hour(2)],
-        "an hour whose granule is stamped before the window's start is not in it"
+        vec![hour(0), hour(1), hour(2)],
+        "the hour a window starts inside supplies its first minutes"
     );
     assert!(hours_in_range((hour(5), hour(4))).is_empty());
+}
+
+/// **The blank leading frame.** A loop enabled at `HH:MM` asks for a window
+/// starting at `HH:MM`, and every instant from there to `HH+1:00` has to be
+/// drawn by carrying hour `HH`'s granule forward — there is nothing else. The
+/// leading edge used to round **up**, so hour `HH` was never listed, never
+/// fetched and never filed, and `60 - MM` minutes of every loop's rail had no
+/// satellite picture behind it.
+///
+/// *"er the first frame doesn't have data it seems like"*
+///
+/// **Floor** — the trailing edge is unchanged and still rounds **down**. A
+/// window ending at `hour(2) + 1min` must not name `hour(3)`: that granule
+/// depicts an instant later than anything in the window, so no clock inside it
+/// can stop there. Without this the tamper that deletes *both* round-ups reads
+/// green.
+#[test]
+fn a_window_starting_off_the_hour_still_lists_the_hour_it_is_inside() {
+    use crate::gmgsi::fetch::hours_in_range;
+
+    for minute in [1_i64, 17, 30, 59] {
+        let start = hour(0) + chrono::Duration::minutes(minute);
+        let listed = hours_in_range((start, start + chrono::Duration::hours(12)));
+        assert_eq!(
+            listed.first(),
+            Some(&hour(0)),
+            "a window opened at 00:{minute:02} is drawn from hour 0's granule \
+             for its first {} minutes, and listed {listed:?}",
+            60 - minute,
+        );
+    }
+
+    // Floor: the trailing edge still rounds down.
+    let over_the_end = hours_in_range((hour(0), hour(2) + chrono::Duration::minutes(1)));
+    assert_eq!(
+        over_the_end,
+        vec![hour(0), hour(1), hour(2)],
+        "the hour after a window's end depicts an instant no clock inside the \
+         window can stop on, so it is not listed"
+    );
+}
+
+/// **The blank leading frame, at the door the pane reads through.**
+/// `hours_in_range` listing the hour a window opens inside buys nothing if the
+/// answer then clips it away — and it did. The satellite layer came back one
+/// frame short of its own listing, and the stops in front of the window's
+/// first whole hour had nothing to carry forward.
+///
+/// **Floors.** (a) A window that opens exactly on the hour reaches nothing
+/// extra — it is the newest earlier granule, not a blanket hour of slack.
+/// (b) Only *one* earlier granule comes in, never the tail behind it.
+/// (c) The trailing edge is untouched: a window ending mid-hour still stops at
+/// the last granule inside it.
+#[test]
+fn a_listing_carries_the_granule_the_window_opened_inside() {
+    let channel = GmgsiChannel::LongwaveIr;
+    let mut h = GmgsiHandler::new();
+    h.defaults.enabled = true;
+    h.defaults.selected_channel = channel;
+    let pane = PaneRef::across(&[]);
+    let ctx = fetch_config();
+    file_listing(&mut h, channel, 13, true);
+
+    let valid = |range| {
+        h.list_frames(&ctx, &pane, range)
+            .frames
+            .into_iter()
+            .map(|f| f.valid)
+            .collect::<Vec<_>>()
+    };
+
+    let mid_hour = chrono::Duration::minutes(17);
+    assert_eq!(
+        valid((hour(3) + mid_hour, hour(5))),
+        vec![hour(3), hour(4), hour(5)],
+        "a window opened at 03:17 is drawn from hour 3's granule until 04:00, \
+         so hour 3 is the oldest frame it can be answered with"
+    );
+
+    // Floor (a): opened on the hour, nothing extra.
+    assert_eq!(
+        valid((hour(3), hour(5))),
+        vec![hour(3), hour(4), hour(5)],
+        "a window opened exactly on the hour already holds its own oldest \
+         granule and must not reach behind it"
+    );
+
+    // Floor (b): one granule earlier, not the tail.
+    assert_eq!(
+        valid((hour(11) + mid_hour, hour(12))),
+        vec![hour(11), hour(12)],
+        "the newest earlier granule comes in, not every granule before the \
+         window"
+    );
+
+    // Floor (c): the trailing edge is unchanged.
+    assert_eq!(
+        valid((hour(3), hour(5) + mid_hour)),
+        vec![hour(3), hour(4), hour(5)],
+        "hour 6's granule depicts an instant later than anything the window \
+         reaches, so it is not one of its frames"
+    );
 }
 
 /// `list_frames` says `complete` only where a listing that really covered the
