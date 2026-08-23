@@ -600,156 +600,6 @@ mod registry_identity_tests {
             );
         }
     }
-
-    /// **Every framed layer answers through `FrameSource`, and no other layer
-    /// pretends to.**
-    ///
-    /// The frame supply moved off `SourceHandler` and behind
-    /// `SourceHandler::frames`, where its nine methods have no default bodies.
-    /// Before that move a layer could declare `TimeAxis::FrameSeries` and
-    /// inherit a silent, empty supply for all nine — which is how a listing
-    /// could be fetched and paid for by a layer that never filed it. The
-    /// declaration and the supply are two halves of one statement now, and
-    /// this walks both directions of it over the composed fifteen.
-    ///
-    /// The framed set is deliberately the same four
-    /// `radar_takes_the_clock_wherever_it_is_drawn` already rules on, read the
-    /// same way — a fifth joining is that pin's ruling to make, and this must
-    /// not become a second authority on the same fact.
-    ///
-    /// **Floors.** (a) At least one registered layer answers `frames() ==
-    /// None`, named, so "every layer has frames" cannot pass this. (b) The
-    /// walk covers all fifteen registrations, so a layer dropping out of
-    /// `all()` cannot make the pairing hold vacuously. (c) `frames_mut` agrees
-    /// with `frames` on every layer — they are two borrows of one object, not
-    /// two opinions about whether this layer comes in frames.
-    #[test]
-    fn every_framed_layer_answers_through_the_frame_source() {
-        use rustdar_source::time::TimeAxis;
-
-        let mut handlers = all();
-
-        // Floor (b): the walk is over the whole registry.
-        assert_eq!(
-            handlers.len(),
-            super::REGISTERED_LAYER_COUNT,
-            "the pairing below is only a claim about this build if it walks \
-             every layer this build registers",
-        );
-
-        let mut supplying: Vec<String> = Vec::new();
-        let mut silent: Vec<String> = Vec::new();
-        for handler in &mut handlers {
-            let id = handler.id().as_str().to_owned();
-            let declared = matches!(handler.time_axis(), TimeAxis::FrameSeries { .. });
-            let supplies = handler.frames().is_some();
-
-            assert_eq!(
-                declared,
-                supplies,
-                "{id} declares its axis as {} and {} a frame supply. The two \
-                 are one statement: a `FrameSeries` layer with no supply can \
-                 name no frame it draws, and a supply on a layer that never \
-                 declared the axis is nine methods nothing will ever call.",
-                if declared {
-                    "FrameSeries"
-                } else {
-                    "not FrameSeries"
-                },
-                if supplies {
-                    "offers one"
-                } else {
-                    "offers none"
-                },
-            );
-
-            // Floor (c): the two accessors cannot disagree.
-            assert_eq!(
-                handler.frames_mut().is_some(),
-                supplies,
-                "{id}'s `frames_mut` disagrees with its `frames`; they are two \
-                 borrows of one object, and an arrival taking the mutable \
-                 route would be silently dropped",
-            );
-
-            if supplies {
-                &mut supplying
-            } else {
-                &mut silent
-            }
-            .push(id);
-        }
-
-        supplying.sort();
-        assert_eq!(
-            supplying,
-            ["Gmgsi", "ModelData", "Mrms", "Radar"],
-            "exactly the four layers `radar_takes_the_clock_wherever_it_is_drawn` \
-             rules on supply frames. A fifth is that pin's ruling to make — \
-             extend it there rather than adding a second authority here.",
-        );
-
-        // Floor (a): a non-framed layer is named, so the pairing above is a
-        // distinguishable claim rather than a tautology over a uniform set.
-        assert!(
-            silent.iter().any(|id| id == "CityLabels"),
-            "the city labels layer draws whatever it last fetched and has no \
-             frames; without a named layer on this side, \"every layer \
-             supplies frames\" would satisfy the walk. Registered but not \
-             supplying: {silent:?}",
-        );
-    }
-
-    /// **`latest_at` never answers ahead of the instant it was asked about**,
-    /// for every layer that supplies frames.
-    ///
-    /// The rule `TimeAxis::FrameSeries` states, asserted where every framed
-    /// layer can be asked at once rather than in each layer's own suite. A
-    /// fresh registry has listed nothing, so every answer here is `None` —
-    /// which is why this pin is the *law* and each layer's own
-    /// `latest_at_answers_the_frame_series_rule` is the behaviour: a filed
-    /// listing lives in the layer's suite, and the walk cannot build one for
-    /// four different layers without inventing four different scopes.
-    ///
-    /// **Floor** — the sweep is asserted to have reached every framed layer at
-    /// every instant, so a walk that silently skipped one cannot read as
-    /// agreement.
-    #[test]
-    fn latest_at_never_answers_ahead_of_the_instant() {
-        let handlers = all();
-        let base = chrono::NaiveDate::from_ymd_opt(2026, 8, 22)
-            .expect("a real date")
-            .and_hms_opt(12, 0, 0)
-            .expect("a real time");
-
-        let mut asked = 0usize;
-        for handler in &handlers {
-            let Some(frames) = handler.frames() else {
-                continue;
-            };
-            let pane = rustdar_source::handler::PaneRef::across(&[]);
-            for step in -6i64..=6 {
-                let t = base + chrono::Duration::hours(step);
-                asked += 1;
-                if let Some(stamp) = frames.latest_at(&pane, t) {
-                    assert!(
-                        stamp.valid <= t,
-                        "{} answered {t} with a frame valid at {}, which \
-                         depicts an instant the clock has not reached",
-                        handler.id().as_str(),
-                        stamp.valid,
-                    );
-                }
-            }
-        }
-
-        assert_eq!(
-            asked,
-            4 * 13,
-            "the sweep must reach all four framed layers at all thirteen \
-             instants; a skipped layer reads as agreement",
-        );
-    }
 }
 
 /// The composed registry's **field** contract, which only exists once radar and
@@ -898,3 +748,10 @@ mod field_registry_tests {
         assert_eq!(counts.len(), 4, "an unexpected group appeared: {counts:?}",);
     }
 }
+
+/// **The time contract as a conformance walk** — the four laws a new
+/// datasource has to satisfy before it can join, rather than four bugs it gets
+/// to repeat. Its own module because it needs a hydrated registry the pins
+/// above have no use for.
+#[cfg(test)]
+mod time_contract_tests;
