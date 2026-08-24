@@ -65,6 +65,14 @@ struct FrameProvenance {
     storm_motion: Option<squallar_radar::srv::SrvMotion>,
 }
 
+/// Whether a seek has to move the pane's clock, or is catching up the data for
+/// a clock that is already where it should be.
+#[derive(Clone, Copy)]
+enum MoveClock {
+    Yes,
+    No,
+}
+
 impl super::App {
     /// Spawn a detached future on whatever executor this target provides.
     #[cfg(not(target_arch = "wasm32"))]
@@ -499,9 +507,14 @@ impl super::App {
             log::debug!("{site} has no RPG, so no Level III objects are fetched for it");
             return;
         }
+        // The volume this site currently has loaded, asked once and used by all
+        // three fetches below. Two separate calls is two reaches across the GUI
+        // seam for one answer, and the ceiling in this file has no slack.
+        let loaded_volume = latest_scan_time_for_site(self.gui.panes(), site);
+
         // The RPG's own Melting Layer object (Level III 166, AWIPS `N0M`) for the
         // volume this site currently has loaded.
-        if let Some(volume_start) = latest_scan_time_for_site(self.gui.panes(), site) {
+        if let Some(volume_start) = loaded_volume {
             // Already in hand for this volume: the poll would re-download an object we
             // are already classifying against.
             if self.render.melting_layer_volume(site) != Some(volume_start) {
@@ -602,19 +615,49 @@ impl super::App {
             }
         }
         // One request per distinct object, not per (product, object).
+        //
+        // PAIRED TO THE VOLUME ON SCREEN, NOT TO THE WALL CLOCK. `get_level3_product`
+        // asks for the newest object this site has published, which is right only
+        // when the pane is following live data. On a pane parked in the archive it
+        // dragged today's products onto a decade-old volume: the Moore scan loaded
+        // correctly and was then re-labelled with `TBW_EET_2026_08_24_...`, which is
+        // what put "(17 products)" from this afternoon in the status bar of a 2013
+        // screenshot and moved the pane off its instant.
+        //
+        // `fetch_product_for_volume` is the pairing the melting-layer and
+        // storm-motion fetches above already use: it ranks candidates around the
+        // volume start and takes the one whose PDB names that volume. Falling back
+        // to the latest object when no volume is loaded keeps the cold-start path
+        // exactly as it was.
+        let paired_to = loaded_volume;
         for code in RadarProduct::level3_codes_for(RadarProduct::all()) {
             let site = site.to_string();
             let code = code.to_string();
             self.spawn_async_task(self.channels.level3_sender.clone(), async move {
                 log::info!("Fetching Level III {} for {}", code, site);
-                let result = match scan::get_level3_product(&site, &code).await {
+                let sources = squallar_radar::sources::DataSources::production();
+                let fetched = match paired_to {
+                    Some(volume_start) => squallar_radar::level3::fetch_product_for_volume(
+                        &sources,
+                        &site,
+                        &code,
+                        volume_start,
+                        squallar_radar::level3::VolumePick::NEAREST,
+                    )
+                    .await
+                    .ok_or_else(|| format!("no {code} paired to the volume at {volume_start}")),
+                    None => scan::get_level3_product(&site, &code)
+                        .await
+                        .map_err(|e| format!("{e}")),
+                };
+                let result = match fetched {
                     Ok(msg) => {
                         log::info!("Fetched Level III {} for {}", code, site);
                         Ok(msg)
                     }
                     Err(e) => {
                         log::warn!("Level III {} fetch failed: {}", code, e);
-                        Err(format!("{e}"))
+                        Err(e)
                     }
                 };
                 Level3Response {
@@ -1637,6 +1680,57 @@ impl super::App {
     /// they used to be two `Gui::apply` pushes here with the clock missing
     /// entirely, which is why a step on a pane holding no radar scan moved
     /// nothing (WO-T3.10). See [`GuiEvent::PaneTimeSelected`].
+    /// **Ask for the data a restored pane is already parked on.** Drained once,
+    /// on the first redraw, and a no-op on every frame after.
+    ///
+    /// This is the reload half of a scrub. `handle_navigate_time` moves the
+    /// clock and then fetches; restoring `as_of` from the config did only the
+    /// first of those, so a pane reopened on the 2013 Moore volume showed its
+    /// playhead in 2013 and the live sweep on the map. The two calls below are
+    /// the same pair that a scrub makes, in the same order.
+    pub fn hydrate_parked_panes(&mut self) {
+        for (pane_idx, site, instant) in std::mem::take(&mut self.parked_fetch_pending) {
+            // MARK THE NAVIGATION EVEN THOUGH THE CLOCK DOES NOT MOVE. A
+            // restored park is a navigation the user made in a previous
+            // session, and the live auto-poll must not drag the pane off it.
+            // `select_instant` used to set this as a side effect; dropping that
+            // call to kill the overlay-refetch toast dropped the protection
+            // with it, and the pane came back on live data whenever the poll
+            // beat the first redraw -- which it reliably did on the phone
+            // capture, where a 3x 1206x2622 frame takes long enough to matter.
+            self.manual_nav_pending = true;
+            self.seek_pane_to(pane_idx, site, instant, false, MoveClock::No);
+        }
+    }
+
+    /// **Move one pane's clock and fetch the volume it now depicts.**
+    ///
+    /// The pair, in one place, because two callers need exactly it: a scrub
+    /// (`handle_navigate_time`) and a reload (`hydrate_parked_panes`). Keeping
+    /// them spelled out twice was also a second reach across the GUI seam, in a
+    /// file whose ceiling is a permanent contract sitting on its measured value.
+    /// (The ratchet scrapes text, so naming the seam literally in a comment
+    /// counts against it -- which is worth knowing before writing one.)
+    fn seek_pane_to(
+        &mut self,
+        pane_idx: usize,
+        site: String,
+        instant: NaiveDateTime,
+        live: bool,
+        move_clock: MoveClock,
+    ) {
+        // A reload must NOT re-select: the clock is already parked, so the only
+        // thing a second selection adds is an overlay refetch for every layer
+        // -- Radar included, which fetches out of band and answers "no fetch
+        // task could be built". That surfaced as an error toast on a pane whose
+        // volume had loaded fine.
+        if matches!(move_clock, MoveClock::Yes) {
+            self.select_instant(pane_idx, instant, live);
+        }
+        self.gui.apply(GuiEvent::Fetching(true));
+        self.spawn_fetch(site, instant, FetchRequester::Pane(pane_idx));
+    }
+
     fn select_instant(&mut self, pane_idx: usize, instant: NaiveDateTime, live: bool) {
         self.manual_nav_pending = true;
         self.gui.apply(GuiEvent::PaneTimeSelected {
@@ -1697,11 +1791,10 @@ impl super::App {
             (target, false)
         };
 
-        self.select_instant(pane_idx, target, is_live);
-
         if fetch_radar {
-            self.gui.apply(GuiEvent::Fetching(true));
-            self.spawn_fetch(site, target, FetchRequester::Pane(pane_idx));
+            self.seek_pane_to(pane_idx, site, target, is_live, MoveClock::Yes);
+        } else {
+            self.select_instant(pane_idx, target, is_live);
         }
     }
 
