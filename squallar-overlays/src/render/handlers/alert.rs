@@ -20,6 +20,16 @@ use squallar_source::time::TimeAxis;
 
 /// `pub`, not `pub(crate)`: `squallar-app`'s described-job dispatch tests
 /// construct this type directly.
+/// How far behind the wall clock a pane's instant must be before its warnings
+/// are fetched from the archive rather than the live feed.
+///
+/// Generous on purpose. A live pane's `as_of` is the frame's clock and lags by
+/// seconds to minutes; a pane genuinely parked in the past is parked by hours at
+/// least. Anything in between is served by the live feed, which is the safer
+/// wrong answer of the two -- it carries watches and advisories that the
+/// storm-based-warning archive does not.
+pub(crate) const ARCHIVE_CUTOFF_MINUTES: i64 = 30;
+
 pub struct NwsAlertFetchResult(
     pub Result<crate::nws::fetch::ActiveAlerts, crate::fetch_policy::FetchError>,
 );
@@ -639,10 +649,38 @@ impl OverlayHandler for NwsAlertHandler {
     }
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig, _pane: &PaneRef<'_>) -> Vec<FetchTask> {
-        log::info!("Fetching NWS active alerts");
         let client = ctx.client.clone();
         let sources = ctx.sources.clone();
         let zone_cache = ctx.zone_cache_dir.clone();
+
+        // THE ARCHIVE, FOR A PANE THAT IS NOT LOOKING AT NOW.
+        //
+        // `/alerts/active` answers with what is in force at the moment it is
+        // asked and has no archive at all, so a pane scrubbed to a storm years
+        // gone fetched today's polygons and the as-of filter dropped every one:
+        // the layer reported hundreds shown and drew nothing over the volume it
+        // was pinned to. `ctx.as_of` is documented for exactly this choice —
+        // "a source whose archive is addressable by time reads this to choose
+        // *which* archive objects to ask for".
+        //
+        // The threshold is a tolerance, not a policy: a live pane's `as_of` is
+        // the wall clock and arrives a little stale, so anything inside the last
+        // few minutes is still "now" and takes the live feed, which is the one
+        // that carries watches and advisories as well as polygons.
+        let archived_before = ctx.as_of
+            < chrono::Utc::now().naive_utc() - chrono::Duration::minutes(ARCHIVE_CUTOFF_MINUTES);
+        if archived_before {
+            let at = ctx.as_of;
+            return vec![FetchTask {
+                kind: known::NWS_ALERTS,
+                future: Box::pin(async move {
+                    let result = crate::nws::archive::fetch_archived_alerts(&sources, at).await;
+                    Box::new(NwsAlertFetchResult(result)) as FetchPayload
+                }),
+            }];
+        }
+
+        log::info!("Fetching NWS active alerts");
         vec![FetchTask {
             kind: known::NWS_ALERTS,
             future: Box::pin(async move {

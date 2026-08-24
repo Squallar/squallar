@@ -150,6 +150,19 @@ impl DataSources {
         crate::tls::client_for(self.metar_sends_user_agent, timeout)
     }
 
+    /// For every read from the Iowa Environmental Mesonet.
+    ///
+    /// Same rule as [`Self::metar_client`], and deliberately the same field:
+    /// [`metar_sends_user_agent`](Self::metar_sends_user_agent) describes the
+    /// ORIGIN, not the product. METAR was simply the first thing read from IEM;
+    /// the archived NWS warnings and mesoscale discussions are read from the
+    /// same host and are preflighted out of existence by a `User-Agent` in
+    /// exactly the same way, and only in the browser. Reaching for the
+    /// application-wide client here is the mistake this name exists to prevent.
+    pub fn iem_client(&self, timeout: std::time::Duration) -> reqwest::ClientBuilder {
+        crate::tls::client_for(self.metar_sends_user_agent, timeout)
+    }
+
     /// For SPC outlooks, mesoscale discussions and storm reports.
     pub fn spc_client(&self, timeout: std::time::Duration) -> reqwest::ClientBuilder {
         crate::tls::client_for(self.spc_sends_user_agent, timeout)
@@ -268,6 +281,57 @@ impl DataSources {
     /// Active NWS alerts, as GeoJSON.
     pub fn nws_alerts_url(&self) -> String {
         format!("{}/alerts/active?status=actual", self.nws_api_base)
+    }
+
+    /// **NWS warnings that were valid at one past instant**, as GeoJSON.
+    ///
+    /// A different origin from [`Self::nws_alerts_url`] because the NWS API has
+    /// no archive: `/alerts/active` answers with what is in force now and
+    /// nothing else, so a pane scrubbed to a storm ten years gone got today's
+    /// polygons filtered to nothing. The Iowa State Mesonet keeps the
+    /// storm-based-warning archive and addresses it by timestamp, which is
+    /// exactly the shape [`FetchConfig::as_of`] was written for.
+    ///
+    /// Storm-based warnings only — the polygon products. Zone-based watches and
+    /// advisories are a separate IEM service and are not fetched here, so a
+    /// scrubbed pane draws the warnings and not the watches.
+    pub fn nws_alerts_archive_url(&self, at: chrono::NaiveDateTime) -> String {
+        format!(
+            "{}/geojson/sbw.geojson?ts={}Z",
+            self.iem_base,
+            at.format("%Y-%m-%dT%H:%M:%S")
+        )
+    }
+
+    /// **The SPC mesoscale discussions that were valid at one past instant**,
+    /// as GeoJSON.
+    ///
+    /// `spcmdrss.xml` is a standing feed of what is active *now* and keeps no
+    /// history, so a pane scrubbed to a past storm saw today's discussions or,
+    /// once they were suppressed, none at all. IEM archives the MCDs and
+    /// addresses them by validity — "issued before this instant and expiring
+    /// after it", which is the same window the live layer draws.
+    ///
+    /// The answer carries geometry and a `product_id` but no product text, so
+    /// each discussion's body is a second request through
+    /// [`Self::nws_text_product_url`].
+    pub fn spc_discussions_archive_url(&self, at: chrono::NaiveDateTime) -> String {
+        format!(
+            "{}/api/1/nws/spc_mcd.geojson?valid={}Z",
+            self.iem_base,
+            at.format("%Y-%m-%dT%H:%M:%S")
+        )
+    }
+
+    /// One archived NWS text product, verbatim, by its IEM product id.
+    ///
+    /// The body is the same plain text the live RSS feed carries in its
+    /// `<description>`, `LAT...LON` block included, which is why the archived
+    /// discussion path can hand it to the same parser rather than deriving the
+    /// polygon from the GeoJSON geometry alongside it. One derivation, one set
+    /// of colours.
+    pub fn nws_text_product_url(&self, product_id: &str) -> String {
+        format!("{}/api/1/nwstext/{product_id}", self.iem_base)
     }
 
     /// Environmental sounding heights near one radar site, as JSON (~900 B).
