@@ -62,17 +62,17 @@ jobs:
           # `--all-features` added was feature surface on packages already
           # present, not new dependencies.
           #
-          # `rustdar/jni-typecheck` is the one thing these rows want that the
+          # `squallar/jni-typecheck` is the one thing these rows want that the
           # manifests do not already give them. It widens the
           # `cfg(target_os = "android")` module gate so the JNI bodies
           # type-check on the host, and forwards to
-          # rustdar-location/jni-typecheck.
+          # squallar-location/jni-typecheck.
           #
-          # The serial/IOKit half needs no flag and never did: rustdar's own
+          # The serial/IOKit half needs no flag and never did: squallar's own
           # `[target.'cfg(not(any(android, ios)))'.dependencies]` block turns on
-          # rustdar-nmea-serial/serial, rustdar-egui/gps-serial and
-          # rustdar-location/serial for exactly these targets. Measured --
-          # `cargo tree -p rustdar --target aarch64-apple-darwin -i io-kit-sys`
+          # squallar-nmea-serial/serial, squallar-egui/gps-serial and
+          # squallar-location/serial for exactly these targets. Measured --
+          # `cargo tree -p squallar --target aarch64-apple-darwin -i io-kit-sys`
           # prints serialport with no feature flag at all, and prints nothing at
           # all for aarch64-apple-ios. The comment this replaces credited
           # `--all-features` for the IOKit link; measuring it is what showed the
@@ -89,7 +89,7 @@ jobs:
           # runs `--all-features` on the host, so what is given up is
           # cross-target compile coverage of those arms, not coverage.
           #
-          # `rustdar/src/release_artifact_features.rs` holds this as a test: it
+          # `squallar/src/release_artifact_features.rs` holds this as a test: it
           # parses this matrix and, for every row carrying an `artifact:` key,
           # asserts that the feature SET the row's command requests contains no
           # test-only feature. `--all-features` fails it because it expands to
@@ -100,7 +100,7 @@ jobs:
           # into the command that already provides the compile coverage rather
           # than added as a second one. Not for wall clock -- that comes out even,
           # measured: folding it in is 6:30 cold and 3:25 warm against 6:25 and
-          # 3:27 for a debug coverage pass plus a release `-p rustdar`.
+          # 3:27 for a debug coverage pass plus a release `-p squallar`.
           # One fat-LTO link is nearly serial, while the 21 here run in parallel.
           # What folding buys is the other two axes: one profile instead of two
           # means the dependency graph is compiled once, `target/` is 1.8 GB
@@ -113,13 +113,13 @@ jobs:
           # Until this said `--release`, every desktop download was workspace
           # code at `opt-level = 0` with debug assertions on.
           # `[profile.dev.package."*"]` optimizes the dependencies, so the whole
-          # penalty landed on rustdar's own crates -- which is where the
-          # rasterizer is. rustdar-web/src/lib.rs prices unoptimized workspace
+          # penalty landed on squallar's own crates -- which is where the
+          # rasterizer is. squallar-web/src/lib.rs prices unoptimized workspace
           # code at 2349 ms per Level II frame against 160-190 ms.
           - name: linux-x86_64
             target: x86_64-unknown-linux-gnu
-            cmd: cargo build --release --workspace --all-targets --features rustdar/jni-typecheck --target x86_64-unknown-linux-gnu
-            artifact: target/x86_64-unknown-linux-gnu/release/rustdar
+            cmd: cargo build --release --workspace --all-targets --features squallar/jni-typecheck --target x86_64-unknown-linux-gnu
+            artifact: target/x86_64-unknown-linux-gnu/release/squallar
           # The artifact is a signed .app in a zip, not the bare executable.
           # Three reasons, and none of them is polish: arm64 macOS refuses to
           # execute an unsigned Mach-O at all, so the old `macos-aarch64`
@@ -131,21 +131,21 @@ jobs:
             target: aarch64-apple-darwin
             package: macos
             macos_arch: aarch64
-            cmd: cargo build --release --workspace --all-targets --features rustdar/jni-typecheck --target aarch64-apple-darwin
-            artifact: packaging/macos/build/aarch64-apple-darwin/rustdar.app.zip
+            cmd: cargo build --release --workspace --all-targets --features squallar/jni-typecheck --target aarch64-apple-darwin
+            artifact: packaging/macos/build/aarch64-apple-darwin/squallar.app.zip
           - name: macos-x86_64
             target: x86_64-apple-darwin
             package: macos
             macos_arch: x86_64
-            cmd: cargo build --release --workspace --all-targets --features rustdar/jni-typecheck --target x86_64-apple-darwin
-            artifact: packaging/macos/build/x86_64-apple-darwin/rustdar.app.zip
+            cmd: cargo build --release --workspace --all-targets --features squallar/jni-typecheck --target x86_64-apple-darwin
+            artifact: packaging/macos/build/x86_64-apple-darwin/squallar.app.zip
           # gnullvm, not MSVC: MSVC is the one family the image does not carry.
           - name: windows-x86_64
             target: x86_64-pc-windows-gnullvm
-            cmd: cargo build --release --workspace --all-targets --features rustdar/jni-typecheck --target x86_64-pc-windows-gnullvm
-            artifact: target/x86_64-pc-windows-gnullvm/release/rustdar.exe
+            cmd: cargo build --release --workspace --all-targets --features squallar/jni-typecheck --target x86_64-pc-windows-gnullvm
+            artifact: target/x86_64-pc-windows-gnullvm/release/squallar.exe
 
-          # A real link, not a `check`. `rustdar --lib` as a staticlib
+          # A real link, not a `check`. `squallar --lib` as a staticlib
           # codegens the whole graph, and the link is where the failures that
           # only iOS has actually appear: a missing `-framework`, or a
           # dependency that reaches for IOKit. `IN_CONTAINER=1` because this job
@@ -154,12 +154,12 @@ jobs:
           - name: ios-aarch64
             target: aarch64-apple-ios
             workspaces: ". -> target-ios"
-            artifact: packaging/ios/build/linux/iphoneos/rustdar.ipa
+            artifact: packaging/ios/build/linux/iphoneos/squallar.ipa
             cmd: |
               apt-get update -qq
               apt-get install -y -qq --no-install-recommends zip
               make -C packaging/ios IN_CONTAINER=1
-              test -f packaging/ios/build/linux/iphoneos/rustdar.ipa \
+              test -f packaging/ios/build/linux/iphoneos/squallar.ipa \
                 || { echo "::error::no .ipa was packaged"; exit 1; }
           # Same link against the simulator SDK. Not redundant: it is a
           # different target triple with its own std, its own clang wrapper and
@@ -168,7 +168,7 @@ jobs:
           - name: ios-aarch64-sim
             target: aarch64-apple-ios-sim
             workspaces: ". -> target-ios"
-            artifact: packaging/ios/build/linux/iphonesimulator/rustdar.app
+            artifact: packaging/ios/build/linux/iphonesimulator/squallar.app
             cmd: make -C packaging/ios IN_CONTAINER=1 SIMULATOR=1
 
           # `./gradlew assembleRelease`, not a bare `cargo ndk`. These were the
@@ -181,7 +181,7 @@ jobs:
           # This is still one compile of one triple, and the coverage the old
           # `cargo ndk` line gave is unchanged, because Gradle *is* that line:
           # `buildRustLibRelease` runs `cargo ndk -t <abi> -P <minSdk> build -p
-          # rustdar --lib --release`. `ring`'s build script still gets
+          # squallar --lib --release`. `ring`'s build script still gets
           # the cross clang/sysroot cargo-ndk exports. What changes is that the
           # two constants are read from the Gradle build instead of repeated
           # here: the old comment warned that `-P 28` "must track minSdk there",
@@ -246,7 +246,7 @@ jobs:
             artifact: packaging/android/app/build/outputs/apk/release/app-x86_64-release.apk
 
           # The only wasm build, and deliberately so. The deleted `wasm32
-          # libraries` row named members as roots, so the gps crate (rustdar-nmea-serial
+          # libraries` row named members as roots, so the gps crate (squallar-nmea-serial
           # today) took its own
           # defaults and serialport -- the crate the `serial`/`gps-serial` gates
           # exist to keep off web and iOS -- got compiled for wasm32. Nothing
@@ -272,30 +272,30 @@ jobs:
               # native Linux and Windows builds -- is untouched and stays on
               # the `rust-toolchain.toml` stable pin.
               .github/scripts/wasm-threads.sh \
-                wasm-pack build rustdar-web --target web --release --no-typescript --no-pack
+                wasm-pack build squallar-web --target web --release --no-typescript --no-pack
 
               # Opt-in list. The old extension allowlist shipped `tests/*.mjs`
               # and carried `*.json` -- what a leaked service-account key wears.
               rm -rf dist && mkdir -p dist/pkg
-              cp rustdar-web/index.html rustdar-web/manifest.webmanifest rustdar-web/sw.js rustdar-web/worker.js dist/
-              cp -R rustdar-web/icons dist/icons
-              cp rustdar-web/pkg/rustdar_web.js rustdar-web/pkg/rustdar_web_bg.wasm dist/pkg/
+              cp squallar-web/index.html squallar-web/manifest.webmanifest squallar-web/sw.js squallar-web/worker.js dist/
+              cp -R squallar-web/icons dist/icons
+              cp squallar-web/pkg/squallar_web.js squallar-web/pkg/squallar_web_bg.wasm dist/pkg/
               # wasm-bindgen emits this only for crates using JS snippets.
-              if [ -d rustdar-web/pkg/snippets ]; then cp -R rustdar-web/pkg/snippets dist/pkg/snippets; fi
+              if [ -d squallar-web/pkg/snippets ]; then cp -R squallar-web/pkg/snippets dist/pkg/snippets; fi
               # The committed NWS zone-geometry pack, checked into the tree and
               # refreshed by `zone-pack.yaml`. Not built here: producing it needs
               # six shapefile zips off weather.gov and a minute of RDP, and this
               # row builds the wasm. Staging it is the whole reason it is
               # committed -- the CloudFront deploy is an `s3 sync --delete`, so a
               # copy uploaded out of band is deleted on the next push.
-              cp rustdar-web/zones.pack dist/
+              cp squallar-web/zones.pack dist/
               echo "Staged:"; find dist -type f | sort | sed 's/^/  /'
 
               # `cache.addAll` is all-or-nothing: one unstaged shell path and the
               # worker never installs, silently un-PWA-ing the site.
               # `pwa_assets.rs` checks the source tree; this checks what ships.
               n=0
-              for q in $(tr '\n' ' ' <rustdar-web/sw.js | grep -oE 'SHELL_PATHS = \[[^]]*\]' | grep -oE '"[^"]*"'); do
+              for q in $(tr '\n' ' ' <squallar-web/sw.js | grep -oE 'SHELL_PATHS = \[[^]]*\]' | grep -oE '"[^"]*"'); do
                 p=$(printf %s "$q" | tr -d '"')
                 test -f "dist/${p:-index.html}" || { echo "::error::sw.js precaches '$p', which is not staged"; exit 1; }
                 n=$((n + 1))
@@ -317,7 +317,7 @@ jobs:
               # in Rust, `ASSET_PATHS` in JS, pinned to each other by
               # `pwa_assets.rs`) and this file does not get to hold a third copy.
               n=0
-              for q in $(tr '\n' ' ' <rustdar-web/sw.js | grep -oE 'ASSET_PATHS = \[[^]]*\]' | grep -oE '"[^"]*"'); do
+              for q in $(tr '\n' ' ' <squallar-web/sw.js | grep -oE 'ASSET_PATHS = \[[^]]*\]' | grep -oE '"[^"]*"'); do
                 p=$(printf %s "$q" | tr -d '"')
                 test -f "dist/$p" || { echo "::error::sw.js caches '$p' as a same-origin asset, which is not staged"; exit 1; }
                 n=$((n + 1))
@@ -326,8 +326,8 @@ jobs:
               echo "ok: all $n ASSET_PATHS entries are staged"
 
           # Not a triple: every member alone on its own default features, which
-          # `--all-features` hides. rustdar-egui was broken this way for weeks --
-          # it called the port enumeration (`detect_gps_ports`, rustdar-nmea-serial
+          # `--all-features` hides. squallar-egui was broken this way for weeks --
+          # it called the port enumeration (`detect_gps_ports`, squallar-nmea-serial
           # today) while that sat behind
           # its `serial` feature, which every desktop row turns on.
           - name: standalone
@@ -345,7 +345,7 @@ jobs:
           # One crate resolved to two versions -- invisible to every compiler.
           # Bumping `jni` or `rustls-platform-verifier` alone still builds, and
           # Android TLS goes silently no-op. A second `wgpu` copy once left
-          # rustdar-app's backend selection applying to an inert one; its
+          # squallar-app's backend selection applying to an inert one; its
           # `const _` guard is per-crate, so this is the only graph-wide check.
           # Per-target, because resolution is, and `-p`-scoped to the crate that
           # actually ships that target: an unscoped `cargo tree -i` answers for
@@ -381,9 +381,9 @@ jobs:
                   fi
                 done
               }
-              check jni                      rustdar:aarch64-linux-android rustdar:x86_64-linux-android
-              check rustls-platform-verifier rustdar:aarch64-linux-android rustdar:x86_64-linux-android
-              check wgpu                     rustdar:x86_64-unknown-linux-gnu rustdar:aarch64-apple-ios rustdar-web:wasm32-unknown-unknown rustdar:aarch64-linux-android
+              check jni                      squallar:aarch64-linux-android squallar:x86_64-linux-android
+              check rustls-platform-verifier squallar:aarch64-linux-android squallar:x86_64-linux-android
+              check wgpu                     squallar:x86_64-unknown-linux-gnu squallar:aarch64-apple-ios squallar-web:wasm32-unknown-unknown squallar:aarch64-linux-android
               exit "$fail"
 
     steps:
@@ -550,7 +550,7 @@ jobs:
         # So this identity changes per run, and the consequence is worth naming
         # rather than hiding: installing one run's APK over another's fails with
         # INSTALL_FAILED_UPDATE_INCOMPATIBLE, and the fix is to
-        # `adb uninstall dev.mcswain.rustdar` first. The assertion step below
+        # `adb uninstall app.squallar` first. The assertion step below
         # puts that in the run's own log as a `::notice::`. It is emitted from
         # there and not from here so that it is only ever attached to a run
         # that produced an APK -- said at this point, a row that failed to
@@ -595,13 +595,13 @@ jobs:
           "$JAVA_HOME/bin/keytool" -genkeypair -v \
             -keystore ci-signing.jks -storetype PKCS12 \
             -alias ci -keyalg RSA -keysize 2048 -validity 10950 \
-            -storepass rustdar-ci-throwaway -keypass rustdar-ci-throwaway \
-            -dname "CN=rustdar CI, OU=throwaway signing key, O=rustdar, C=US"
+            -storepass squallar-ci-throwaway -keypass squallar-ci-throwaway \
+            -dname "CN=squallar CI, OU=throwaway signing key, O=squallar, C=US"
           {
             echo "storeFile=ci-signing.jks"
-            echo "storePassword=rustdar-ci-throwaway"
+            echo "storePassword=squallar-ci-throwaway"
             echo "keyAlias=ci"
-            echo "keyPassword=rustdar-ci-throwaway"
+            echo "keyPassword=squallar-ci-throwaway"
           } > keystore.properties
 
       - name: ${{ matrix.name }}
@@ -616,8 +616,8 @@ jobs:
         # *a* valid signature, which any stray keystore.properties would
         # satisfy just as well as the one the step above wrote. The DN grep is
         # what makes it *this* key: apksigner prints
-        # `V2 Signer: certificate DN: CN=rustdar CI, OU=throwaway signing key,
-        # O=rustdar, C=US` on stdout, so an APK signed by something unexpected
+        # `V2 Signer: certificate DN: CN=squallar CI, OU=throwaway signing key,
+        # O=squallar, C=US` on stdout, so an APK signed by something unexpected
         # reddens the row instead of going out as though this workflow had
         # minted it. `OU=` rather than the whole DN, because the OU is the part
         # that says what the key is *for*.
@@ -669,7 +669,7 @@ jobs:
             exit 1
           fi
           echo "ok: signed by the throwaway key, not debuggable, $got"
-          echo "::notice::${{ matrix.name }} is signed with a throwaway key that differs every run. Installing it over an earlier CI build fails with INSTALL_FAILED_UPDATE_INCOMPATIBLE; run 'adb uninstall dev.mcswain.rustdar' first."
+          echo "::notice::${{ matrix.name }} is signed with a throwaway key that differs every run. Installing it over an earlier CI build fails with INSTALL_FAILED_UPDATE_INCOMPATIBLE; run 'adb uninstall app.squallar' first."
 
       # Neither `curl` nor `zip` is in the image — every layer that installed
       # curl purged it in the same `RUN` — and `rcodesign` never was. The
@@ -706,9 +706,9 @@ jobs:
       # Generate them once, on any machine with rcodesign:
       #
       #   rcodesign generate-self-signed-certificate \
-      #     --person-name rustdar --validity-days 3650 \
-      #     --p12-file rustdar-signing.p12 --p12-password "$PW"
-      #   base64 -w0 rustdar-signing.p12   # -> MACOS_SIGNING_P12
+      #     --person-name squallar --validity-days 3650 \
+      #     --p12-file squallar-signing.p12 --p12-password "$PW"
+      #   base64 -w0 squallar-signing.p12   # -> MACOS_SIGNING_P12
       #
       # **The same certificate must be reused for every run, forever.** macOS
       # remembers a location grant against the app's *designated requirement*,
@@ -727,7 +727,7 @@ jobs:
       # designated requirement is the code hash, so it re-prompts on each
       # rebuild. The Makefile says so in the log; it is a labelled fallback,
       # not a silent one.
-      - name: Package rustdar.app
+      - name: Package squallar.app
         if: matrix.package == 'macos'
         env:
           MACOS_SIGNING_P12: ${{ secrets.MACOS_SIGNING_P12 }}
@@ -735,7 +735,7 @@ jobs:
         run: |
           make -C packaging/macos IN_CONTAINER=1 ARCHIVE=1 \
             ARCH=${{ matrix.macos_arch }} \
-            BIN=target/${{ matrix.target }}/release/rustdar
+            BIN=target/${{ matrix.target }}/release/squallar
 
       - name: Upload native build
         if: matrix.artifact
@@ -815,7 +815,7 @@ jobs:
       - name: Refuse to sync an empty tree
         run: |
           test -f dist/index.html || { echo "::error::dist/index.html is missing; the artifact did not unpack"; exit 1; }
-          test -f dist/pkg/rustdar_web_bg.wasm || { echo "::error::dist/pkg/rustdar_web_bg.wasm is missing; the artifact is not a web build"; exit 1; }
+          test -f dist/pkg/squallar_web_bg.wasm || { echo "::error::dist/pkg/squallar_web_bg.wasm is missing; the artifact is not a web build"; exit 1; }
           n=$(find dist -type f | wc -l)
           test "$n" -ge 8 || { echo "::error::dist holds $n file(s); the shell alone is ten"; exit 1; }
           echo "ok: $n file(s) staged"
@@ -824,7 +824,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
-          role-to-assume: arn:aws:iam::803205869942:role/github-actions-rustdar
+          role-to-assume: arn:aws:iam::803205869942:role/github-actions-squallar
           aws-region: us-east-1
 
       # No second pass to fix up `Content-Type`. The AWS CLI takes it from
@@ -844,7 +844,7 @@ jobs:
       # covered, so `sync` alone is still correct.
       #
       # `--delete` prunes what a previous deploy left. It never deletes a file
-      # the new deploy replaces: `rustdar_web.js` and `rustdar_web_bg.wasm` keep
+      # the new deploy replaces: `squallar_web.js` and `squallar_web_bg.wasm` keep
       # their names across builds, so those are overwrites, not delete-then-add.
       - name: Sync to S3
         run: aws s3 sync --delete dist/ s3://rustdar.mcswain.dev/
@@ -875,7 +875,7 @@ jobs:
 
       # The only gate the tombstone gets. It is not the `web-wasm32` row's
       # SHELL_PATHS check, and not skipping it is not a convenience: that check
-      # reads `rustdar-web/sw.js` and asserts every path the real worker
+      # reads `squallar-web/sw.js` and asserts every path the real worker
       # precaches was staged. The tombstone worker precaches nothing, so against
       # this tree it has no subject and would pass on an empty file. The inverse
       # is the invariant here, and these three greps assert it instead.

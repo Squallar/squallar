@@ -1,4 +1,4 @@
-# rustdar
+# squallar
 
 **`ARCHITECTURE.md` is the authority on how this workspace is shaped.** Read §1 (crate
 graph), §4 (adding a source) and §6 (ratchets) before changing structure. This file is the
@@ -6,8 +6,8 @@ short list of things that will bite you.
 
 ## Adding a data source
 
-Mostly one crate's work: implement `SourceHandler` in `rustdar-overlays` (or
-`rustdar-radar` for a radar network) and register it. `ARCHITECTURE.md` §5 is the
+Mostly one crate's work: implement `SourceHandler` in `squallar-overlays` (or
+`squallar-radar` for a radar network) and register it. `ARCHITECTURE.md` §5 is the
 checklist.
 
 **No test proves this any more.** The `fake-source` acceptance suite that asserted "zero
@@ -18,7 +18,7 @@ keeping its behaviour inside its own crate. Evidence, not a gate.
 
 And the claim was always narrower than it read: every texture layer that renders through
 the job funnel needs one arm in `App::spawn_overlay_render`
-(`rustdar-app/src/app_fetch.rs`), and all three real sources added a line to it. The fake
+(`squallar-app/src/app_fetch.rs`), and all three real sources added a line to it. The fake
 was exempt only because it fell into that match's fallback branch and was never dispatched
 through it. Budget for the registration tax plus that one row; a *new kind* of arm is what
 means the architecture regressed.
@@ -27,7 +27,7 @@ means the architecture regressed.
 
 - **`fmt` and `clippy` are PACKAGE-SCOPED. Never `--all`, never `--workspace` for a write.**
   A workspace-wide format pulls another worktree's in-flight files into your tree.
-- **Coupling ceilings (`rustdar-app/tests/arch_ratchets.rs`) are permanent and may only
+- **Coupling ceilings (`squallar-app/tests/arch_ratchets.rs`) are permanent and may only
   FALL.** Growing the app layer's reach into the UI layer is a build failure, not a review
   comment. Shed first, then land. Re-spelling a counted reach through a local binding
   (`let gui = &mut self.gui;`) is **forbidden by name** — it makes the walker read zero while
@@ -37,15 +37,15 @@ means the architecture regressed.
 - **The radar digest suites pass UNEDITED.** A moved digest is a bug in the encoder, not a
   pin to re-record.
 - **Two different sets of ten pinned suites exist** and a report naming only "ten" is
-  ambiguous: the ten *loop* suites in `rustdar-app`, and the ten *digest-carrying* suites in
-  `rustdar-radar`. Mechanical re-points are fine; a moved assertion value is not.
+  ambiguous: the ten *loop* suites in `squallar-app`, and the ten *digest-carrying* suites in
+  `squallar-radar`. Mechanical re-points are fine; a moved assertion value is not.
 
 ## Product rules
 
 - Interaction is realtime; data may lag. Map movement, controls and UI never trade latency
   for data latency.
 - Heavy work never lands on the frame thread. "It runs rarely" is not an exception.
-- Reopen is exactly 1:1 — every piece of UI state persists. Units go through `rustdar-units`.
+- Reopen is exactly 1:1 — every piece of UI state persists. Units go through `squallar-units`.
 - A `cfg(target_arch = "wasm32")` may select a value, a dependency or a type alias. It may
   never fork behaviour inside a function body.
 
@@ -60,14 +60,14 @@ Every leg also prints two raster figures, and **they have different denominators
 never added**: `overlay rasters` is the overlay texture dispatch alone (radar's own
 pipeline and the loop frames are not in it), `texture uploads` is every egui texture the
 renderer was shown. Both are running totals off the app's own always-on counters
-(`rustdar_egui::overlay_cache::ledger`, `rustdar_gpu`'s `UploadTotals`), reported whether
+(`squallar_egui::overlay_cache::ledger`, `squallar_gpu`'s `UploadTotals`), reported whether
 or not anything gates on them.
 
 ## Instrument gotchas that read as green
 
-- `cargo test -p rustdar-app arch_ratchets` selects **zero tests**. Spell it
+- `cargo test -p squallar-app arch_ratchets` selects **zero tests**. Spell it
   `--test arch_ratchets`.
-- The loop pin-list roster is `cargo test -p rustdar-app --lib -- --list | grep -E "loop_|frame_build_order"`.
+- The loop pin-list roster is `cargo test -p squallar-app --lib -- --list | grep -E "loop_|frame_build_order"`.
   **The `--lib` is load-bearing** (207 rows with it, 208 without, measured 2026-08-22).
   The roster grows as loop tests land; what is pinned is the *gap*, not the count.
 - A filtered test run is not self-contained: some tests share process-global state. Run a

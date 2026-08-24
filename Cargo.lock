@@ -4181,319 +4181,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustdar"
-version = "0.1.0"
-dependencies = [
- "android_logger",
- "dark-light",
- "env_logger",
- "iana-time-zone",
- "jni",
- "log",
- "pollster",
- "rustdar-app",
- "rustdar-egui",
- "rustdar-geo",
- "rustdar-kv",
- "rustdar-location",
- "rustdar-nmea-serial",
- "rustdar-source",
- "rustls-platform-verifier",
- "walkers",
- "winit",
-]
-
-[[package]]
-name = "rustdar-app"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "egui",
- "egui-wgpu",
- "egui-winit",
- "log",
- "nexrad-level3",
- "nexrad-model",
- "pollster",
- "reqwest 0.13.4",
- "rustdar-device-profile",
- "rustdar-egui",
- "rustdar-geo",
- "rustdar-gpu",
- "rustdar-kv",
- "rustdar-location",
- "rustdar-nmea-serial",
- "rustdar-overlays",
- "rustdar-radar",
- "rustdar-source",
- "rustdar-volumetric",
- "rustdar-worker",
- "serde",
- "serde_json",
- "tokio",
- "wasm-bindgen-futures",
- "web-time",
- "winit",
-]
-
-[[package]]
-name = "rustdar-device-profile"
-version = "0.1.0"
-dependencies = [
- "log",
- "rustdar-radar",
- "serde_json",
-]
-
-[[package]]
-name = "rustdar-egui"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "egui",
- "futures",
- "image",
- "log",
- "lru",
- "reqwest 0.13.4",
- "rustdar-device-profile",
- "rustdar-geo",
- "rustdar-kv",
- "rustdar-location",
- "rustdar-nmea-serial",
- "rustdar-overlays",
- "rustdar-radar",
- "rustdar-source",
- "rustdar-units",
- "serde",
- "serde_json",
- "tokio",
- "walkers",
- "wasm-bindgen-futures",
- "web-time",
-]
-
-[[package]]
-name = "rustdar-geo"
-version = "0.1.0"
-dependencies = [
- "serde_json",
-]
-
-[[package]]
-name = "rustdar-gpu"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "egui",
- "egui-wgpu",
- "egui-winit",
- "naga",
- "nexrad-model",
- "pollster",
- "rustdar-device-profile",
- "rustdar-egui",
- "rustdar-geo",
- "rustdar-radar",
- "rustdar-volumetric",
- "serde_json",
- "syn 3.0.3",
- "wgpu",
- "winit",
-]
-
-[[package]]
-name = "rustdar-kv"
-version = "0.1.0"
-dependencies = [
- "serde_json",
-]
-
-[[package]]
-name = "rustdar-location"
-version = "0.1.0"
-dependencies = [
- "ashpd",
- "chrono",
- "futures-channel",
- "futures-lite",
- "jni",
- "js-sys",
- "log",
- "objc2 0.6.4",
- "objc2-core-location 0.3.2",
- "objc2-foundation 0.3.2",
- "rustdar-geo",
- "rustdar-kv",
- "rustdar-nmea-serial",
- "serde",
- "serde_json",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
- "web-time",
- "windows",
-]
-
-[[package]]
-name = "rustdar-netcdf"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "hdf5-pure",
- "log",
- "serde_json",
-]
-
-[[package]]
-name = "rustdar-nmea-serial"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "log",
- "nmea",
- "serde",
- "serde_json",
- "serialport",
-]
-
-[[package]]
-name = "rustdar-overlays"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "flate2",
- "futures",
- "grib",
- "hdf5-pure",
- "log",
- "reqwest 0.13.4",
- "roxmltree 0.21.1",
- "rustdar-geo",
- "rustdar-netcdf",
- "rustdar-source",
- "rustdar-units",
- "serde",
- "serde_json",
- "tiny-skia 0.12.0",
- "tokio",
- "web-time",
-]
-
-[[package]]
-name = "rustdar-radar"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "ewebsock",
- "flate2",
- "log",
- "nexrad-data",
- "nexrad-decode",
- "nexrad-level3",
- "nexrad-model",
- "rayon",
- "reqwest 0.13.4",
- "rustdar-geo",
- "rustdar-source",
- "rustdar-units",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "web-time",
- "xml",
-]
-
-[[package]]
-name = "rustdar-source"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "reqwest 0.13.4",
- "rustdar-geo",
- "rustdar-units",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "web-time",
-]
-
-[[package]]
-name = "rustdar-units"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "serde",
-]
-
-[[package]]
-name = "rustdar-volumetric"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "egui",
- "egui-wgpu",
- "half",
- "log",
- "nexrad-model",
- "pollster",
- "rustdar-device-profile",
- "rustdar-egui",
- "rustdar-geo",
- "rustdar-gpu",
- "rustdar-radar",
- "serde_json",
-]
-
-[[package]]
-name = "rustdar-web"
-version = "0.1.0"
-dependencies = [
- "console_error_panic_hook",
- "console_log",
- "egui",
- "js-sys",
- "log",
- "rayon",
- "rustdar-app",
- "rustdar-device-profile",
- "rustdar-egui",
- "rustdar-geo",
- "rustdar-kv",
- "rustdar-location",
- "rustdar-overlays",
- "rustdar-radar",
- "rustdar-source",
- "rustdar-worker",
- "serde_json",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-bindgen-rayon",
- "wasm-bindgen-test",
- "web-sys",
- "winit",
-]
-
-[[package]]
-name = "rustdar-worker"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "egui",
- "log",
- "nexrad-model",
- "rustdar-device-profile",
- "rustdar-geo",
- "rustdar-overlays",
- "rustdar-radar",
- "rustdar-source",
- "serde_json",
- "web-time",
-]
-
-[[package]]
 name = "rustix"
 version = "0.38.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4997,6 +4684,319 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9571ea910ebd84c86af4b3ed27f9dbdc6ad06f17c5f96146b2b671e2976744f"
 dependencies = [
  "bitflags 2.13.1",
+]
+
+[[package]]
+name = "squallar"
+version = "0.1.0"
+dependencies = [
+ "android_logger",
+ "dark-light",
+ "env_logger",
+ "iana-time-zone",
+ "jni",
+ "log",
+ "pollster",
+ "rustls-platform-verifier",
+ "squallar-app",
+ "squallar-egui",
+ "squallar-geo",
+ "squallar-kv",
+ "squallar-location",
+ "squallar-nmea-serial",
+ "squallar-source",
+ "walkers",
+ "winit",
+]
+
+[[package]]
+name = "squallar-app"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "egui",
+ "egui-wgpu",
+ "egui-winit",
+ "log",
+ "nexrad-level3",
+ "nexrad-model",
+ "pollster",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "squallar-device-profile",
+ "squallar-egui",
+ "squallar-geo",
+ "squallar-gpu",
+ "squallar-kv",
+ "squallar-location",
+ "squallar-nmea-serial",
+ "squallar-overlays",
+ "squallar-radar",
+ "squallar-source",
+ "squallar-volumetric",
+ "squallar-worker",
+ "tokio",
+ "wasm-bindgen-futures",
+ "web-time",
+ "winit",
+]
+
+[[package]]
+name = "squallar-device-profile"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "serde_json",
+ "squallar-radar",
+]
+
+[[package]]
+name = "squallar-egui"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "egui",
+ "futures",
+ "image",
+ "log",
+ "lru",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "squallar-device-profile",
+ "squallar-geo",
+ "squallar-kv",
+ "squallar-location",
+ "squallar-nmea-serial",
+ "squallar-overlays",
+ "squallar-radar",
+ "squallar-source",
+ "squallar-units",
+ "tokio",
+ "walkers",
+ "wasm-bindgen-futures",
+ "web-time",
+]
+
+[[package]]
+name = "squallar-geo"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "squallar-gpu"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "egui",
+ "egui-wgpu",
+ "egui-winit",
+ "naga",
+ "nexrad-model",
+ "pollster",
+ "serde_json",
+ "squallar-device-profile",
+ "squallar-egui",
+ "squallar-geo",
+ "squallar-radar",
+ "squallar-volumetric",
+ "syn 3.0.3",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
+name = "squallar-kv"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "squallar-location"
+version = "0.1.0"
+dependencies = [
+ "ashpd",
+ "chrono",
+ "futures-channel",
+ "futures-lite",
+ "jni",
+ "js-sys",
+ "log",
+ "objc2 0.6.4",
+ "objc2-core-location 0.3.2",
+ "objc2-foundation 0.3.2",
+ "serde",
+ "serde_json",
+ "squallar-geo",
+ "squallar-kv",
+ "squallar-nmea-serial",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
+ "windows",
+]
+
+[[package]]
+name = "squallar-netcdf"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hdf5-pure",
+ "log",
+ "serde_json",
+]
+
+[[package]]
+name = "squallar-nmea-serial"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "log",
+ "nmea",
+ "serde",
+ "serde_json",
+ "serialport",
+]
+
+[[package]]
+name = "squallar-overlays"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "flate2",
+ "futures",
+ "grib",
+ "hdf5-pure",
+ "log",
+ "reqwest 0.13.4",
+ "roxmltree 0.21.1",
+ "serde",
+ "serde_json",
+ "squallar-geo",
+ "squallar-netcdf",
+ "squallar-source",
+ "squallar-units",
+ "tiny-skia 0.12.0",
+ "tokio",
+ "web-time",
+]
+
+[[package]]
+name = "squallar-radar"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "ewebsock",
+ "flate2",
+ "log",
+ "nexrad-data",
+ "nexrad-decode",
+ "nexrad-level3",
+ "nexrad-model",
+ "rayon",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "squallar-geo",
+ "squallar-source",
+ "squallar-units",
+ "thiserror 2.0.20",
+ "tokio",
+ "web-time",
+ "xml",
+]
+
+[[package]]
+name = "squallar-source"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "reqwest 0.13.4",
+ "rustls",
+ "serde",
+ "serde_json",
+ "squallar-geo",
+ "squallar-units",
+ "tokio",
+ "web-time",
+]
+
+[[package]]
+name = "squallar-units"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+]
+
+[[package]]
+name = "squallar-volumetric"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "egui",
+ "egui-wgpu",
+ "half",
+ "log",
+ "nexrad-model",
+ "pollster",
+ "serde_json",
+ "squallar-device-profile",
+ "squallar-egui",
+ "squallar-geo",
+ "squallar-gpu",
+ "squallar-radar",
+]
+
+[[package]]
+name = "squallar-web"
+version = "0.1.0"
+dependencies = [
+ "console_error_panic_hook",
+ "console_log",
+ "egui",
+ "js-sys",
+ "log",
+ "rayon",
+ "serde_json",
+ "squallar-app",
+ "squallar-device-profile",
+ "squallar-egui",
+ "squallar-geo",
+ "squallar-kv",
+ "squallar-location",
+ "squallar-overlays",
+ "squallar-radar",
+ "squallar-source",
+ "squallar-worker",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-rayon",
+ "wasm-bindgen-test",
+ "web-sys",
+ "winit",
+]
+
+[[package]]
+name = "squallar-worker"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "egui",
+ "log",
+ "nexrad-model",
+ "serde_json",
+ "squallar-device-profile",
+ "squallar-geo",
+ "squallar-overlays",
+ "squallar-radar",
+ "squallar-source",
+ "web-time",
 ]
 
 [[package]]

@@ -2,7 +2,7 @@
 # pre-push -- the wasm32 check, once per push batch.
 #
 # Why this check and not clippy or the tests: nothing else a developer runs
-# locally type-checks `rustdar-web`. Its dependencies are declared under
+# locally type-checks `squallar-web`. Its dependencies are declared under
 # [target.'cfg(target_arch = "wasm32")'.dependencies] and its code sits behind
 # `#[cfg(target_arch = "wasm32")]`, so a host, Android or iOS build compiles
 # the crate as an empty shell and reports success. Only a wasm32 build reads

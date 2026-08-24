@@ -10,7 +10,7 @@
 //! **negative** signed area. That sign convention is stated once, here, and
 //! every decision below reads it from [`signed_area`].
 
-use rustdar_geo::{GeoPolygon, GeoPolygonRing};
+use squallar_geo::{GeoPolygon, GeoPolygonRing};
 
 /// Twice the signed shoelace area of a ring in `(x, y)` order. Positive is
 /// counter-clockwise, so under the ESRI convention positive means *hole*.

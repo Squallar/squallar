@@ -4,7 +4,7 @@
 //! report and in `main.rs`'s header, but the short version: the polygon record
 //! is a length-prefixed array of `f64` pairs behind two big-endian integers,
 //! the workspace already owns the bounds-checked cursor this needs
-//! ([`rustdar_source::wire::Reader`]), and the result is checked feature-for-
+//! ([`squallar_source::wire::Reader`]), and the result is checked feature-for-
 //! feature and vertex-for-vertex against GDAL's own reader, which is a
 //! genuinely independent implementation in another language.
 //!
@@ -13,7 +13,7 @@
 //! itself is little-endian. `Reader` is little-endian by policy, so the four
 //! big-endian fields are spelled out by hand.
 
-use rustdar_source::wire::Reader;
+use squallar_source::wire::Reader;
 
 /// A shapefile's own record count comes from the `.shx` index, whose size is
 /// `100 + 8 * records`. That is an independent count of the same thing the

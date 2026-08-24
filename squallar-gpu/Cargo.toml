@@ -1,0 +1,189 @@
+# The wgpu boundary: the one egui/wgpu renderer every target draws through —
+# frame prepare/submit, texture upload, the pane mirror, the staging ring, and
+# the device-request policy.
+[package]
+name = "squallar-gpu"
+version.workspace = true
+edition.workspace = true
+
+# Since WO-RV land 3 this manifest is the ONE wgpu feature-chooser for the
+# whole graph (squallar-app dropped its duplicate copies), and src/lib.rs
+# carries the single-copy and backend-features guards that hold it.
+
+[dependencies]
+egui = { workspace = true }
+# Defaults are off at the workspace level, because egui-wgpu's `default` set
+# contains `wgpu/default` -- and that would put `webgpu` on every target, where
+# this build wants it on wasm32 alone (see the wasm32 section below). Its other
+# two default entries are genuinely wanted, but both are dead outside one
+# target, so they are requested from the target sections below rather than
+# everywhere:
+# `macos-window-resize-jitter-fix` is read only under
+# `cfg(all(target_os = "macos", feature = ...))`, and
+# `fragile-send-sync-non-atomic-wasm` only under `cfg(target_arch = "wasm32")`.
+egui-wgpu = { workspace = true, features = ["winit"] }
+winit = { workspace = true }
+# Forced by real imports, not doc refs: `begin_frame` rewrites egui's raw input
+# through squallar_egui::normalize_touch_devices / normalize_wheel_units, and
+# the mirror's tests read the tile-cache arithmetic.
+squallar-egui = { workspace = true }
+# The device-class policy floor: MIRROR_MAX_SIDE and the mirror byte cascade
+# live there; `device_class_of` returns its DeviceClass.
+squallar-device-profile = { workspace = true }
+# Every `wgpu::` value in this crate comes through `egui_wgpu::wgpu`, the
+# re-export. This entry is not there to be imported from; it exists to *choose
+# wgpu's features*, which egui-wgpu cannot express (it offers only the blanket
+# `wgpu/default`, and that turns every backend on everywhere).
+#
+# `std` and `wgsl` are the target-independent half and are what egui-wgpu itself
+# asks for. The backends are per target, below; `webgpu` appears in the wasm32
+# section and nowhere else, because no native target has a browser API to
+# compile.
+wgpu = { workspace = true, features = ["std", "wgsl"] }
+
+# `parking_lot` swaps wgpu's internal locks for parking_lot's. It only buys
+# anything where there are threads to contend, so the browser does not take it.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wgpu = { workspace = true, features = ["parking_lot"] }
+
+# `clipboard` pulls `arboard`, which has no wasm backend at all -- it fails to
+# compile rather than degrading. `wayland`/`x11` are likewise meaningless in a
+# browser. The web build keeps only `links`; the clipboard there is the
+# browser's own, reached through egui-winit's web path.
+# Android is deliberately grouped with native here, preserving exactly the
+# feature set it had before this split.
+#
+# iOS is NOT: arboard has no iOS arm, and its cfg is
+# `unix, not(macos|android|emscripten)`, so iOS silently selects the X11/Wayland
+# backend. That compiles and even links (x11rb is pure Rust), then fails to
+# connect to a display at startup. UIPasteboard would be the real thing;
+# nothing in squallar copies text, so the feature is simply dropped there.
+[target.'cfg(not(any(target_arch = "wasm32", target_os = "ios")))'.dependencies]
+egui-winit = { workspace = true, features = ["clipboard", "links", "wayland", "x11"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+egui-winit = { workspace = true, features = ["links"] }
+
+# The native backend set, split the way wgpu's own build.rs splits it.
+#
+# Each of these features is a no-op on targets the corresponding backend does not
+# support -- wgpu-hal gates the actual implementations by target -- so listing
+# them per platform is documentation as much as it is resolution. It does keep
+# wgpu-core from enabling backends that could never run, which is what the old
+# blanket `wgpu/default` did.
+#
+# `vulkan` and `gles` are the pair wgpu itself calls the "native Vulkan"/"native
+# OpenGL" platforms. Note `gles` deliberately does NOT cover the browser: WebGL
+# is a separate `webgl` feature, requested in the wasm32 section below.
+[target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "android", target_os = "freebsd"))'.dependencies]
+wgpu = { workspace = true, features = ["vulkan", "gles"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wgpu = { workspace = true, features = ["dx12"] }
+
+# Metal is the only backend wgpu will use on Apple targets without an explicit
+# MoltenVK/ANGLE opt-in (`vulkan-portability` / `angle`), neither of which this
+# project wants. `macos-window-resize-jitter-fix` is scoped here for the same
+# reason -- egui-wgpu reads it only under `cfg(target_os = "macos")`.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+egui-wgpu = { workspace = true, features = ["macos-window-resize-jitter-fix"] }
+wgpu = { workspace = true, features = ["metal"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+egui-winit = { workspace = true, features = ["links"] }
+# The whole browser backend set: WebGPU and WebGL2, both compiled in.
+#
+# `webgl` is what `Backends::GL` resolves to on wasm32; the native `gles` feature
+# explicitly excludes the browser, so this is not a duplicate of the section
+# above. `webgpu` is the WebGPU backend, and it is here for ADAPTER COVERAGE
+# rather than for throughput: it recovers nothing on the one measured platform
+# loss (WebGL2 has no `MAPPABLE_PRIMARY_BUFFERS`, so uploads run at 2.1 GB/s
+# against 24.7 native, and that mechanism is native-only in wgpu by
+# construction). What it reaches is a browser that has NO WebGL2 to give.
+#
+# Measured 2026-08-22 on this box, one browser, one configuration, with
+# `run_gpu_arm.sh`: Chromium 151 under `--use-angle=vulkan --enable-unsafe-webgpu`
+# has no WebGL context at all, and its WebGPU adapter is the NVIDIA one. Before
+# this feature the app booted there and painted nothing -- canvas buffer 300x150,
+# one distinct pixel, 2 rig errors. With it the app selects `BrowserWebGpu`,
+# configures 1248x714 and paints 2020 distinct pixels with no rig errors. That is
+# the whole of the claim; the rig's SOFTWARE arm, where Chromium runs headless on
+# SwiftShader at MAX_TEXTURE_SIZE 8192, is a different reading and is NOT
+# evidence for it.
+#
+# Both are compiled because asking for both is not the same as getting the
+# better one: wgpu binds a browser API when the INSTANCE is built, not when an
+# adapter is found, and a browser that merely exposes `navigator.gpu` can still
+# answer `requestAdapter()` with null. `App::create_instance` is what settles it
+# -- through wgpu's detecting constructor, which runs that adapter request first
+# and falls back to the WebGL2 half of the mask when it comes back empty.
+#
+# Firefox governs here and ships stable WebGPU on Windows (141, 2025-07-22) and
+# macOS (145 on Apple Silicon, 147 elsewhere); Linux and Android are still
+# unshipped, with Mozilla expecting Linux during 2026 (W3C gpuweb Implementation
+# Status). So on the platform this is developed and gated on, this feature does
+# nothing at all today -- Firefox/Linux exposes no `navigator.gpu` for the
+# detection to find, and every rig leg measured selects `Gl`. Keeping that true
+# is the fallback's whole job. With the pref forced on
+# (`--ff-pref dom.webgpu.enabled=true`) the same build selects `BrowserWebGpu`
+# and reaches 32767 px 2D textures against WebGL2's 32768, which is what says
+# the second path works rather than merely compiles.
+#
+# `squallar-gpu/src/lib.rs` asserts at COMPILE TIME that both backends really are
+# in the build; the workspace pin resolves one `wasm-bindgen` (0.2.126) and one
+# `web-sys` (0.3.103), and wgpu's WebGPU backend carries its own `webgpu_sys`
+# bindings rather than web-sys's, so the binding duplication that once broke
+# `wasm-bindgen` outright does not recur -- `cargo tree -d` is the check.
+#
+# `fragile-send-sync-non-atomic-wasm` is OFF as of WS3b, and must stay off: it
+# grants `Send + Sync` only under `not(target_feature = "atomics")`, while
+# egui-wgpu reads the same feature to pick a `CallbackResources` map that
+# *requires* those bounds. The browser build carries `+atomics` now, so the two
+# disagree and the concurrent map stops compiling. See squallar-app's manifest,
+# which states it in full.
+#
+# `webgpu` rides alongside `webgl` (WS4): the backend is chosen at runtime by
+# `new_instance_with_webgpu_detection`, and `squallar-gpu`'s own tripwire fails
+# the build if either browser backend goes missing.
+wgpu = { workspace = true, features = ["webgl", "webgpu"] }
+egui-wgpu = { workspace = true }
+
+[dev-dependencies]
+# The charter test parses `cargo metadata`.
+serde_json = { workspace = true }
+# `a_paint_callbacks_own_command_buffer_reaches_the_queue` blocks on a real
+# adapter request; the test is `#[ignore]`d by default and CI's gpu job opts in.
+# gpu_harness blocks on adapter/device requests the same way.
+pollster = { workspace = true }
+# The ENTIRE GPU-bound integration suite lives in this crate's tests/ (WO-RV
+# land 3, the hardware quarantine): one wgpu_guard, one CI job, and
+# squallar-volumetric's default test run stays CPU-only. The dev-dep back onto
+# squallar-volumetric is LEGAL: dev-deps never enter the normal graph, so the
+# normal edge volumetric -> gpu stands unopposed.
+squallar-volumetric = { workspace = true }
+# The voxel vocabulary and product names the suites drive the stack with.
+squallar-radar = { workspace = true }
+# live_volume decodes real Level II archives into nexrad-model scans;
+# volume_stand_in stamps one with chrono; floor_alignment's differential
+# fixtures read squallar-geo directly.
+nexrad-model = { workspace = true }
+chrono = { workspace = true }
+squallar-geo = { workspace = true }
+
+# Target-gated for the reason squallar-web's dev-dependencies are: a plain
+# `[dev-dependencies]` entry is built for every target under `--all-targets`.
+#
+# `syn` parses `src/lib.rs` in `tests/wgpu_guard.rs`. Same 3.0.3 the proc-macro
+# crates already resolve, so this adds no package -- and being a dev-dependency
+# it reaches no shipped artifact.
+#
+# `naga` translates squallar-volumetric's `src/volume.wgsl` (reached as
+# `squallar_volumetric::raymarch::VOLUME_SHADER_WGSL`, a dev-dep of this crate)
+# to GLSL ES 300 in `tests/volume_shader.rs` -- the one check that says what a
+# WebGL2 browser will actually be handed. See the workspace manifest for why it
+# is a direct dependency rather than reached through wgpu. The gate here is the
+# wasm32 clippy row: the test file is `#![cfg(not(target_arch = "wasm32"))]`,
+# so on that target the dependency would be built and then used by nothing.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+naga = { workspace = true }
+syn = { version = "=3.0.3", default-features = false, features = ["full", "parsing", "visit"] }

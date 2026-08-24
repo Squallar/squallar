@@ -1,5 +1,5 @@
 # An offline measurement instrument, and deliberately NOT a member of the
-# rustdar workspace.
+# squallar workspace.
 #
 # `[workspace]` below makes this directory its own workspace root. That is the
 # whole point: `cargo build/test/clippy --workspace` at the repo root does not
@@ -22,16 +22,16 @@ publish = false
 # The geo vocabulary: `GeoPolygon = Vec<GeoPolygonRing>`, `GeoPolygonRing =
 # Vec<(f64, f64)>`, ring 0 exterior and the rest holes. Zero dependencies of
 # its own.
-rustdar-geo = { path = "../../rustdar-geo" }
+squallar-geo = { path = "../../squallar-geo" }
 # `render::geo::simplify_ring` and `types::SIMPLIFY_EPSILON`. The app applies
 # exactly this to every zone on ingest, including the area-preserving epsilon
 # halving that keeps a sub-tolerance atoll on the map; measuring anything else
 # would be measuring a different pipeline.
-rustdar-overlays = { path = "../../rustdar-overlays" }
+squallar-overlays = { path = "../../squallar-overlays" }
 # `wire::Reader`, the workspace's bounds-checked, `Option`-returning cursor.
 # The pack reader is built on it so the format is readable through the
 # vocabulary the app already speaks.
-rustdar-source = { path = "../../rustdar-source" }
+squallar-source = { path = "../../squallar-source" }
 # Gzip, for the "on the wire" column of the size table. Same pin as the
 # workspace uses.
 flate2 = "=1.1.9"

@@ -63,7 +63,7 @@
 //! operands together, so the comparison stays like-for-like. It reports
 //! whether it fired, so the caller can say so rather than assume.
 
-use rustdar_geo::GeoPolygon;
+use squallar_geo::GeoPolygon;
 
 /// One directed edge, `x1 < x2` never assumed. Vertical edges are dropped
 /// before an [`Edge`] is ever built: they span no slab and so bound no
@@ -133,7 +133,7 @@ impl Areas {
 /// A display convenience and nothing else — the name carries the caveat so a
 /// reader cannot mistake the figure for a measured area.
 pub fn sq_deg_to_sq_km(sq_deg: f64, lat: f64) -> f64 {
-    use rustdar_geo::KM_PER_DEGREE_LAT as DEG_KM;
+    use squallar_geo::KM_PER_DEGREE_LAT as DEG_KM;
     sq_deg * DEG_KM * DEG_KM * lat.to_radians().cos()
 }
 

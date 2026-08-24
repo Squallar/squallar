@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Squallar
+GenericName=Weather Radar
+Comment=NEXRAD weather radar viewer
+Exec=squallar
+Icon=app.squallar
+Terminal=false
+Categories=Science;Geoscience;
+Keywords=weather;radar;NEXRAD;storm;precipitation;
+StartupNotify=true
+StartupWMClass=squallar

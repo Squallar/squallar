@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+    <title>Squallar</title>
+    <meta
+      name="description"
+      content="Live NEXRAD Level II and Level III radar, NWS alerts, storm reports and surface observations."
+    />
+
+    <!--
+      Every URL here is relative: deployed at https://<user>.github.io/squallar/,
+      developed at the root of `python3 -m http.server`, so a root-relative
+      `/manifest.webmanifest` would work locally and 404 in production.
+      `tests/pwa_assets.rs` fails the build if one appears.
+    -->
+    <link rel="manifest" href="manifest.webmanifest" />
+    <meta name="theme-color" content="#101014" />
+    <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png" />
+    <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
+    <!-- iOS honours only the `apple-` prefixed spelling, so both are here. -->
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Squallar" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #101014;
+      }
+
+      /*
+       * Sized here, not in Rust: winit reads the CSS box and multiplies by
+       * devicePixelRatio. `display: block` is load-bearing — an inline canvas
+       * gets a baseline gap under it and the page scrolls by those pixels
+       * forever.
+       */
+      #squallar-canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+        outline: none;
+        /*
+         * The app owns every gesture, pinch included. winit sets no
+         * `touch-action` and only calls `preventDefault()`, which for pointer
+         * events does not stop the browser claiming two fingers as page zoom.
+         */
+        touch-action: none;
+      }
+
+      #squallar-status {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font: 14px/1.5 system-ui, sans-serif;
+        color: #9aa0aa;
+        text-align: center;
+        padding: 2rem;
+        pointer-events: none;
+      }
+
+      /*
+       * Offline banner. Weather data is never cached, so losing the network
+       * produces no new radar rather than a stale one — and "no new one" is
+       * invisible: the basemap still draws and an empty map reads as clear skies
+       * rather than a dead feed. Not dismissible while offline.
+       */
+      #squallar-offline {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        z-index: 20;
+        padding: calc(0.5rem + env(safe-area-inset-top)) 1rem 0.5rem;
+        background: #92400e;
+        color: #fff8ec;
+        font: 600 13px/1.35 system-ui, sans-serif;
+        text-align: center;
+        box-shadow: 0 1px 6px rgb(0 0 0 / 45%);
+        /* Never swallow a drag on the map underneath. */
+        pointer-events: none;
+      }
+
+      #squallar-offline[hidden] {
+        display: none;
+      }
+
+      #squallar-update {
+        position: fixed;
+        z-index: 20;
+        right: 0.75rem;
+        bottom: calc(0.75rem + env(safe-area-inset-bottom));
+        max-width: min(22rem, calc(100vw - 1.5rem));
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.625rem 0.75rem;
+        border: 1px solid #2e3a4b;
+        border-radius: 0.5rem;
+        background: #171b22;
+        color: #dfe4ec;
+        font: 13px/1.35 system-ui, sans-serif;
+        box-shadow: 0 4px 16px rgb(0 0 0 / 55%);
+      }
+
+      #squallar-update[hidden] {
+        display: none;
+      }
+
+      #squallar-update button {
+        font: inherit;
+        cursor: pointer;
+        border-radius: 0.3rem;
+        border: 1px solid #33507a;
+        background: #1d3557;
+        color: #eaf2ff;
+        padding: 0.3rem 0.65rem;
+        white-space: nowrap;
+      }
+
+      #squallar-update button.secondary {
+        border-color: #2e3a4b;
+        background: transparent;
+        color: #9aa0aa;
+        padding: 0.3rem 0.5rem;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      Without `tabindex` the canvas is not focusable and every key event goes to
+      the document: the app renders but never sees a keystroke.
+    -->
+    <canvas id="squallar-canvas" tabindex="0"></canvas>
+    <div id="squallar-status">Loading Squallar…</div>
+
+    <div id="squallar-offline" role="status" aria-live="assertive" hidden>
+      Offline — radar, alerts and observations have stopped updating. Anything on
+      screen is from before the connection dropped.
+    </div>
+
+    <div id="squallar-update" role="status" aria-live="polite" hidden>
+      <span>A new version of Squallar is ready.</span>
+      <button type="button" id="squallar-update-reload">Reload</button>
+      <button type="button" class="secondary" id="squallar-update-dismiss" aria-label="Dismiss">
+        ✕
+      </button>
+    </div>
+
+    <!--
+      A classic script, not a module, and ahead of the bootstrap below: if
+      `./pkg/squallar_web.js` is missing or fails to parse the module script never
+      runs a statement, and the offline banner and service worker must not be
+      collateral damage of that.
+    -->
+    <script>
+      (function () {
+        "use strict";
+
+        var offlineBanner = document.getElementById("squallar-offline");
+        var updateBanner = document.getElementById("squallar-update");
+
+        // `onLine === false` is definitive; `true` is optimistic and cannot see
+        // a captive portal or a black-holed uplink. A fetch that fails while it
+        // is true still surfaces through the application's own error handling.
+        function paintConnectivity() {
+          offlineBanner.hidden = navigator.onLine !== false;
+        }
+
+        window.addEventListener("online", paintConnectivity);
+        window.addEventListener("offline", paintConnectivity);
+        paintConnectivity();
+
+        document
+          .getElementById("squallar-update-dismiss")
+          .addEventListener("click", function () {
+            updateBanner.hidden = true;
+          });
+
+        if (!("serviceWorker" in navigator)) return;
+
+        var reloading = false;
+        var registration = null;
+        // Set only when the user has accepted the update prompt and a waiting
+        // worker has been told to take over.
+        var takeoverRequested = false;
+
+        // `controllerchange` fires both for the worker's own `clients.claim()`
+        // on a first visit — routine, nothing changed — and for a waiting worker
+        // taking over after Reload. Only the second is worth acting on;
+        // reloading on the first makes every first visit fetch, discard and
+        // refetch the ~10 MB module.
+        navigator.serviceWorker.addEventListener("controllerchange", function () {
+          if (!takeoverRequested || reloading) return;
+          reloading = true;
+          window.location.reload();
+        });
+
+        document
+          .getElementById("squallar-update-reload")
+          .addEventListener("click", function () {
+            updateBanner.hidden = true;
+            if (registration && registration.waiting) {
+              // A new *worker* is parked. Let it through, then reload on
+              // `controllerchange`.
+              takeoverRequested = true;
+              registration.waiting.postMessage({ type: "squallar:skip-waiting" });
+              return;
+            }
+            // A new *shell* is already cached by the current worker; a plain
+            // reload picks it up.
+            reloading = true;
+            window.location.reload();
+          });
+
+        function showUpdate() {
+          updateBanner.hidden = false;
+        }
+
+        navigator.serviceWorker.addEventListener("message", function (event) {
+          if (event.data && event.data.type === "squallar:shell-updated") {
+            showUpdate();
+          }
+        });
+
+        function watchForWaitingWorker(reg) {
+          // A worker parked in `waiting` means this page is controlled by an
+          // older one. On the very first visit there is no controller and
+          // nothing to update to.
+          if (reg.waiting && navigator.serviceWorker.controller) showUpdate();
+          reg.addEventListener("updatefound", function () {
+            var incoming = reg.installing;
+            if (!incoming) return;
+            incoming.addEventListener("statechange", function () {
+              if (incoming.state === "installed" && navigator.serviceWorker.controller) {
+                showUpdate();
+              }
+            });
+          });
+        }
+
+        // Waiting for `load` is not politeness. The worker's first act is to
+        // precache the shell, including the ~10 MB wasm module this page is
+        // already downloading; registering earlier races the two, registering
+        // after means the module is in the HTTP cache and the worker's
+        // revalidation comes back 304.
+        window.addEventListener("load", function () {
+          // `./sw.js` resolves against the document, so the registration lands
+          // on `/squallar/sw.js` with scope `/squallar/` when deployed and on
+          // `/sw.js` with scope `/` locally. Neither is spelled out anywhere.
+          navigator.serviceWorker
+            .register("./sw.js")
+            .then(function (reg) {
+              registration = reg;
+              watchForWaitingWorker(reg);
+            })
+            .catch(function (err) {
+              // An insecure origin, a blocked worker, or a 404 on sw.js. The
+              // application works without it; only offline support is lost.
+              console.warn("squallar: service worker registration failed:", err);
+            });
+        });
+
+        // Escape hatch for a version probe that has stopped working: a server
+        // answering HEAD with 405, or sending neither ETag nor Last-Modified,
+        // leaves the worker correctly concluding "nothing changed" forever.
+        //
+        // A console entry point rather than a button, deliberately: it costs a
+        // ~10 MB download, and the worker already warns to the console when the
+        // probe has been failing.
+        window.squallarForceUpdate = function () {
+          var worker = navigator.serviceWorker.controller;
+          if (!worker) {
+            console.warn("squallar: no service worker is controlling this page");
+            return false;
+          }
+          worker.postMessage({ type: "squallar:force-update" });
+          console.info("squallar: forced shell reinstall requested");
+          return true;
+        };
+
+        // A tab left open on a radar loop never navigates, so returning to the
+        // foreground is its only reliable chance to notice a deploy. Throttled
+        // so that flipping between tabs is not a poll.
+        var lastCheck = 0;
+        document.addEventListener("visibilitychange", function () {
+          if (document.visibilityState !== "visible") return;
+          var now = Date.now();
+          if (now - lastCheck < 15 * 60 * 1000) return;
+          lastCheck = now;
+          if (registration) registration.update().catch(function () {});
+          if (navigator.serviceWorker.controller) {
+            navigator.serviceWorker.controller.postMessage({
+              type: "squallar:check-update",
+            });
+          }
+        });
+      })();
+    </script>
+
+    <script type="module">
+      import init, { start } from "./pkg/squallar_web.js";
+
+      const status = document.getElementById("squallar-status");
+
+      try {
+        await init();
+        start();
+        // Removing it means a later failure shows a blank page rather than a
+        // stale "Loading" message.
+        status.remove();
+      } catch (e) {
+        // `start` throws through wasm-bindgen as a JsValue; stringify whatever
+        // arrives rather than assuming an Error with a .message.
+        status.textContent = "Squallar failed to start: " + e;
+        console.error(e);
+      }
+    </script>
+  </body>
+</html>

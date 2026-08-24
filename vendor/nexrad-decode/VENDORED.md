@@ -204,7 +204,7 @@ it.
 Every addition saturates. A 0xFFFF-sentinel header carries a 32-bit byte count
 of up to `0xFFFF_FFFF`, which overflows a 32-bit `usize` — a panic on wasm32 in
 dev and a silent wrap into mis-framing in release. `tests/malformed_input.rs`'s
-`test_all_ones` constructs exactly that header, and rustdar-web is a shipped
+`test_all_ones` constructs exactly that header, and squallar-web is a shipped
 wasm32 target. A saturated target is simply past the end of any input, which
 `try_skip_to` rejects.
 

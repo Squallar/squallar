@@ -105,33 +105,33 @@ jobs:
       - name: Verify the autofixed tree still builds (host)
         run: cargo build --workspace --all-targets --all-features
       # Every workspace member, every target. `--all-targets` only expands the
-      # *selected* packages, so this was `-p rustdar-web -p rustdar-app`
+      # *selected* packages, so this was `-p squallar-web -p squallar-app`
       # until the three crates below stopped blocking `--workspace`.
       #
-      # What it took: tokio is a target-gated dev-dependency in rustdar-radar,
-      # rustdar-overlays and rustdar-egui (`rt-multi-thread` is not a feature
+      # What it took: tokio is a target-gated dev-dependency in squallar-radar,
+      # squallar-overlays and squallar-egui (`rt-multi-thread` is not a feature
       # tokio accepts on wasm), which leaves `#[tokio::test]` unresolvable
       # there; and those crates' test modules also call reqwest APIs wasm does
       # not have (`ClientBuilder::timeout`, `Error::is_connect`) plus
-      # `rustdar_radar::tls::default_is_ring`, itself `cfg(not(wasm32))`. Both
+      # `squallar_radar::tls::default_is_ring`, itself `cfg(not(wasm32))`. Both
       # are handled by gating the modules on
       # `cfg(all(test, not(target_arch = "wasm32")))` -- the pattern
-      # rustdar-radar/src/tls.rs already uses -- in 7 files across 3 crates:
-      # archive.rs, level3.rs and srm.rs in rustdar-radar; hrrr/fetch.rs,
-      # metar/fetch.rs and glm/fetch.rs in rustdar-overlays; tile_source.rs in
-      # rustdar-egui. A new `#[tokio::test]` or reqwest-native call in an
+      # squallar-radar/src/tls.rs already uses -- in 7 files across 3 crates:
+      # archive.rs, level3.rs and srm.rs in squallar-radar; hrrr/fetch.rs,
+      # metar/fetch.rs and glm/fetch.rs in squallar-overlays; tile_source.rs in
+      # squallar-egui. A new `#[tokio::test]` or reqwest-native call in an
       # ungated test module of those crates fails this row; put it behind the
       # same cfg.
       #
-      # No `--all-features` here: that enables rustdar-nmea-serial/serial, which links
+      # No `--all-features` here: that enables squallar-nmea-serial/serial, which links
       # IOKit.
       #
-      # Note `--all-targets` also compiles rustdar-web/tests/{pwa_assets,
-      # sw_behaviour}.rs and rustdar-gpu/tests/wgpu_guard.rs here, so a
+      # Note `--all-targets` also compiles squallar-web/tests/{pwa_assets,
+      # sw_behaviour}.rs and squallar-gpu/tests/wgpu_guard.rs here, so a
       # future host-only integration test in either crate would fail this row
       # spuriously -- gate any such test on `cfg(not(target_arch = "wasm32"))`.
       # Through wasm-threads.sh since WS3b. The workspace's wasm32 arm is the
-      # THREADED one now -- rustdar-web pulls wasm-bindgen-rayon, which carries
+      # THREADED one now -- squallar-web pulls wasm-bindgen-rayon, which carries
       # a `compile_error!` on a wasm32 target built without `+atomics` -- so a
       # plain `cargo check --target wasm32-unknown-unknown` no longer describes
       # a configuration that ships. The wrapper is a per-command
@@ -169,7 +169,7 @@ jobs:
             echo "::error::could not read minSdk out of $gradle_kts. Refusing to guess the NDK platform level."
             exit 1
           fi
-          cargo ndk -t arm64-v8a -P "$min_sdk" check -p rustdar --lib
+          cargo ndk -t arm64-v8a -P "$min_sdk" check -p squallar --lib
 
       # Not on pull_request: that event checks out the detached PR merge ref,
       # so there is no branch here to commit to — the push either fails or
@@ -187,11 +187,11 @@ jobs:
       # the bot still autofixes what it can and the build fails only on the rest.
       #
       # This is what makes `unexpected_cfgs` load-bearing: a
-      # `rustdar-device-profile` build script that stopped emitting the
+      # `squallar-device-profile` build script that stopped emitting the
       # `mobile` cfg produced warnings nobody failed on, and Android and iOS
       # silently took desktop memory budgets.
       #
-      # `--all-features` enables `rustdar/jni-typecheck`, so this lints
+      # `--all-features` enables `squallar/jni-typecheck`, so this lints
       # the JNI layer -- invisible to Clippy until that feature existed.
       #
       # Remaining gap: this is the *host* cfg of that code. The Android target

@@ -2,7 +2,7 @@
 """Answer one question: has the NWS published a zone edition newer than the one
 `tools/nws-zone-pack/src/main.rs` pins?
 
-The pack in `rustdar-web/zones.pack` is built from six AWIPS shapefile datasets,
+The pack in `squallar-web/zones.pack` is built from six AWIPS shapefile datasets,
 each named `<prefix><DDMMMYY>` for the day its zone changes take effect. The
 `DATASETS` table in the converter names those six, and pins a `published_records`
 count for each that the converter asserts three independent ways. Both halves are
@@ -114,7 +114,7 @@ def pinned_datasets(repo_root: Path):
 
 
 def fetch(url: str) -> str:
-    request = urllib.request.Request(url, headers={"User-Agent": "rustdar-zone-pack-ci"})
+    request = urllib.request.Request(url, headers={"User-Agent": "squallar-zone-pack-ci"})
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
             return response.read().decode("utf-8", "replace")

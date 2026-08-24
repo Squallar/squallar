@@ -4,13 +4,13 @@
 #   make -C packaging/macos ARCH=x86_64        Intel  (x86_64-apple-darwin),  release
 #   make -C packaging/macos DEBUG=1            debug profile
 #   make -C packaging/macos BIN=path/to/exe    package a binary that already exists
-#   make -C packaging/macos ARCHIVE=1          also produce rustdar.app.zip
+#   make -C packaging/macos ARCHIVE=1          also produce squallar.app.zip
 #
 # `ARCHIVE` and not the obvious `ZIP`: a variable set on make's command line is
 # exported into the recipe's environment, and Info-ZIP's `zip` reads `ZIP` (and
 # `ZIPOPT`) as a list of default options to prepend to its own argv. `ZIP=1`
-# therefore turns `zip -qry rustdar.app.zip rustdar.app` into
-# `zip 1 -qry rustdar.app.zip rustdar.app`, which succeeds, and writes the
+# therefore turns `zip -qry squallar.app.zip squallar.app` into
+# `zip 1 -qry squallar.app.zip squallar.app`, which succeeds, and writes the
 # archive to `1.zip`. Found by running it.
 #
 # No Apple tools and no macOS host are involved: the .app is assembled with
@@ -22,10 +22,10 @@
 # This mirrors packaging/ios/Makefile, with three differences that are not stylistic:
 #
 #   * The layout is not flat. A macOS bundle is
-#     Contents/{Info.plist, MacOS/rustdar, Resources/, PkgInfo}; an iOS one puts
+#     Contents/{Info.plist, MacOS/squallar, Resources/, PkgInfo}; an iOS one puts
 #     all of that at the top level.
 #   * There is no ObjC shell. winit's AppKit backend brings up NSApplication
-#     itself, so `rustdar`'s own `main` is the executable and there is
+#     itself, so `squallar`'s own `main` is the executable and there is
 #     nothing to compile or link by hand.
 #   * Signing is not optional. arm64 macOS refuses to execute an unsigned
 #     Mach-O at all, and — the reason this file exists — `locationd` keys its
@@ -43,14 +43,14 @@
 # Make one certificate, once, and keep using it:
 #
 #   rcodesign generate-self-signed-certificate \
-#       --person-name rustdar --validity-days 3650 \
-#       --p12-file rustdar-signing.p12 --p12-password "$$PW"
+#       --person-name squallar --validity-days 3650 \
+#       --p12-file squallar-signing.p12 --p12-password "$$PW"
 #
 # Then either point this Makefile at it —
 #
-#   make -C packaging/macos P12_FILE=../rustdar-signing.p12 P12_PASSWORD="$$PW"
+#   make -C packaging/macos P12_FILE=../squallar-signing.p12 P12_PASSWORD="$$PW"
 #
-# — or, for CI, put `base64 -w0 rustdar-signing.p12` in the repository secret
+# — or, for CI, put `base64 -w0 squallar-signing.p12` in the repository secret
 # `MACOS_SIGNING_P12` and the password in `MACOS_SIGNING_P12_PASSWORD`; this
 # recipe reads both from the environment. Those secrets do not exist until
 # somebody creates them, and no workflow can create them.
@@ -70,7 +70,7 @@ ROOT := $(realpath $(CURDIR)/../..)
 # Digest-pinned to the same image the CI matrix uses.
 IMAGE ?= ghcr.io/usa-reddragon/rust-cross:1.97.1@sha256:433d3e61c46c6dea2e0bb0bc450fe34415d9769f6d801ab1f2e2ebbdbcf50c28
 # Named volume for the crate cache, so a rebuild does not re-download the index.
-CARGO_VOL ?= rustdar-xcross-cargo
+CARGO_VOL ?= squallar-xcross-cargo
 # arm64 by default: it is what every Mac sold since 2020 is, and the one arch
 # where an unsigned build will not even launch.
 ARCH ?= aarch64
@@ -115,7 +115,7 @@ build:
 	      ;;
 	  esac
 	else
-	  EXE="$(TARGET_DIR)/$$RUST_TARGET/$$PROFILE_DIR/rustdar"
+	  EXE="$(TARGET_DIR)/$$RUST_TARGET/$$PROFILE_DIR/squallar"
 	  # RUSTUP_TOOLCHAIN from the image's own RUST_VERSION: rust-toolchain.toml
 	  # says `stable`, and obeying it here fetches a toolchain that has none of
 	  # the image's 23 preinstalled targets.
@@ -128,16 +128,16 @@ build:
 	  INCMD="set -e
 	      export RUSTUP_TOOLCHAIN=\"\$${RUST_VERSION:?the rust-cross image must set RUST_VERSION}\"
 	      export CARGO_TARGET_DIR=$(TARGET_DIR)
-	      cargo build $$CARGO_PROFILE --target $$RUST_TARGET -p rustdar --bin rustdar"
+	      cargo build $$CARGO_PROFILE --target $$RUST_TARGET -p squallar --bin squallar"
 	  if [ -n "$(IN_CONTAINER)" ]; then
 	    echo "==> cargo build ($$RUST_TARGET, $$PROFILE_DIR)"
 	    sh -c "$$INCMD"
 	  else
-	    ENGINE="$${RUSTDAR_CONTAINER_ENGINE:-}"
+	    ENGINE="$${SQUALLAR_CONTAINER_ENGINE:-}"
 	    if [ -z "$$ENGINE" ]; then
 	      if command -v podman >/dev/null 2>&1; then ENGINE=podman
 	      elif command -v docker >/dev/null 2>&1; then ENGINE=docker
-	      else echo "ERROR: need podman or docker (set RUSTDAR_CONTAINER_ENGINE, or IN_CONTAINER=1 if already inside the image)."; exit 1; fi
+	      else echo "ERROR: need podman or docker (set SQUALLAR_CONTAINER_ENGINE, or IN_CONTAINER=1 if already inside the image)."; exit 1; fi
 	    fi
 	    echo "==> [$$ENGINE] cargo build ($$RUST_TARGET, $$PROFILE_DIR)"
 	    # Rootless podman already maps container root to the invoking user, so
@@ -178,14 +178,14 @@ build:
 	}
 
 	# ---- assemble the .app (plain file ops, no Apple tools) ----
-	echo "==> assemble rustdar.app"
-	OUT="packaging/macos/build/$$RUST_TARGET"; APP="$$OUT/rustdar.app"
+	echo "==> assemble squallar.app"
+	OUT="packaging/macos/build/$$RUST_TARGET"; APP="$$OUT/squallar.app"
 	rm -rf "$$OUT"; mkdir -p "$$APP/Contents/MacOS" "$$APP/Contents/Resources"
-	cp "$$EXE" "$$APP/Contents/MacOS/rustdar"; chmod +x "$$APP/Contents/MacOS/rustdar"
+	cp "$$EXE" "$$APP/Contents/MacOS/squallar"; chmod +x "$$APP/Contents/MacOS/squallar"
 	# Four bytes of type and creator. Vestigial, and every real .app has it.
 	printf 'APPL????' > "$$APP/Contents/PkgInfo"
 	# Resolve the Xcode build-setting variables xcodebuild would have expanded.
-	sed -e "s|\$$(EXECUTABLE_NAME)|rustdar|g" \
+	sed -e "s|\$$(EXECUTABLE_NAME)|squallar|g" \
 	    -e "s|\$$(PRODUCT_BUNDLE_IDENTIFIER)|$$BUNDLE_ID|g" \
 	    -e "s|\$$(MARKETING_VERSION)|$$MARKETING_VERSION|g" \
 	    -e "s|\$$(CURRENT_PROJECT_VERSION)|$$CURRENT_PROJECT_VERSION|g" \
@@ -202,7 +202,7 @@ build:
 	OTOOL="$$(command -v otool 2>/dev/null || true)"
 	if [ -z "$$OTOOL" ]; then OTOOL="$$(ls /opt/osxcross/bin/*-apple-darwin*-otool 2>/dev/null | head -1 || true)"; fi
 	if [ -n "$$OTOOL" ]; then
-	  MINOS="$$("$$OTOOL" -l "$$APP/Contents/MacOS/rustdar" \
+	  MINOS="$$("$$OTOOL" -l "$$APP/Contents/MacOS/squallar" \
 	    | grep -A6 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX' \
 	    | grep -oE '^ *(minos|version) [0-9.]+' | head -1 | awk '{print $$2}' || true)"
 	  : "$${MINOS:?could not read a deployment target out of the linked binary}"
@@ -214,7 +214,7 @@ build:
 	    exit 1
 	  }
 	  echo "    binary deployment target: macOS $$MINOS (matches the bundle)"
-	  "$$OTOOL" -L "$$APP/Contents/MacOS/rustdar" | grep -q CoreLocation || {
+	  "$$OTOOL" -L "$$APP/Contents/MacOS/squallar" | grep -q CoreLocation || {
 	    echo "ERROR: CoreLocation.framework is not linked into the binary."; exit 1; }
 	  echo "    CoreLocation.framework: linked"
 	else
@@ -226,7 +226,7 @@ build:
 	# locationd from treating every build as a different application.
 	if ! command -v $(RCODESIGN) >/dev/null 2>&1; then
 	  echo ""
-	  echo "WARNING: $(RCODESIGN) is not on PATH, so rustdar.app is UNSIGNED."
+	  echo "WARNING: $(RCODESIGN) is not on PATH, so squallar.app is UNSIGNED."
 	  echo "         An arm64 Mac will refuse to execute it at all, and on any Mac"
 	  echo "         macOS will treat each rebuild as a new app and re-ask for"
 	  echo "         location permission. Install it with:"
@@ -260,8 +260,8 @@ build:
 	  # actions/upload-artifact drops the executable bit, which turns a .app
 	  # into a directory macOS declines to launch. A zip carries the mode.
 	  command -v zip >/dev/null 2>&1 || { echo "ERROR: ARCHIVE=1 but no zip on PATH"; exit 1; }
-	  ( cd "$$OUT" && rm -f rustdar.app.zip && zip -qry rustdar.app.zip rustdar.app )
-	  echo "Zip: $(ROOT)/$$OUT/rustdar.app.zip"
+	  ( cd "$$OUT" && rm -f squallar.app.zip && zip -qry squallar.app.zip squallar.app )
+	  echo "Zip: $(ROOT)/$$OUT/squallar.app.zip"
 	fi
 	echo ""
 	echo "App: $(ROOT)/$$APP"

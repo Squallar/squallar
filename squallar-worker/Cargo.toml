@@ -1,0 +1,37 @@
+# The job engine: the offload funnel, the wire identity, the composed codec
+# registry, the native pool — job VOCABULARY stays in squallar-source, codec
+# rows beside their pipelines in squallar-radar / squallar-overlays; this crate
+# composes and runs them.
+[package]
+name = "squallar-worker"
+version.workspace = true
+edition.workspace = true
+
+# Deliberately these and NOTHING else normal: `tests/charter.rs` holds the
+# ceiling. The engine composes the source crates' codec registries
+# (squallar-radar, squallar-overlays, over squallar-source's vocabulary), reads
+# its thread and raster budgets from the device floor
+# (squallar-device-profile), and speaks geometry in squallar-geo's types. A
+# dependency lands here only after the charter test and the plan change
+# first, in writing.
+[dependencies]
+squallar-source = { workspace = true }
+squallar-radar = { workspace = true }
+squallar-overlays = { workspace = true }
+squallar-device-profile = { workspace = true }
+squallar-geo = { workspace = true }
+# The premultiply exception, recorded: `offload::premultiply_raster` IS
+# `egui::Color32::from_rgba_unmultiplied` applied in place, and it stays with
+# the funnel (ruled 2026-08-19) — the one UI type this crate names.
+egui = { workspace = true }
+log = { workspace = true }
+web-time = { workspace = true }
+
+[dev-dependencies]
+# `offload/tests.rs` stamps synthetic archives with chrono and builds its
+# sample `Scan` fixture out of nexrad-model's data types.
+chrono = { workspace = true }
+nexrad-model = { workspace = true }
+# `tests/charter.rs` parses `cargo metadata` output to pin this crate's
+# dependency ceiling and its position above the vocabulary crates.
+serde_json = { workspace = true }

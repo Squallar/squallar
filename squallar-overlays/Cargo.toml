@@ -1,0 +1,69 @@
+[package]
+name = "squallar-overlays"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+web-time = { workspace = true }
+chrono = { workspace = true }
+flate2 = { workspace = true }
+# Keep this pin local: Cargo ignores a member's `default-features = false` when
+# the workspace entry leaves defaults on.
+# grib defaults pull `openjpeg-sys`, `libaec-sys`, `proj` (-> `proj-sys` ->
+# `libsqlite3-sys`, `link-cplusplus`); none cross-compile to wasm32 or iOS.
+# Dropped features are unused by HRRR except `gridpoints-proj`: HRRR is grid
+# template 3.30 (Lambert conformal), reimplemented in `hrrr::lambert`.
+# HRRR section 5 is DRT 5.3 (pure Rust in grib), not 5.40/5.42.
+# `time-calculation` backs `temporal_raw_info()`.
+grib = { version = "=0.17.1", default-features = false, features = [
+    "png-unpack-with-png-crate",
+    "time-calculation",
+] }
+squallar-units = { workspace = true }
+futures = "=0.3.34"
+# NetCDF4 reading and CF unpacking for the GLM and GMGSI granules, both of
+# which are NetCDF4. A Band 0 leaf with no first-party dependencies of its own.
+squallar-netcdf = { workspace = true }
+log = { workspace = true }
+# `json` only, NOT `default`: reqwest's `default-tls` aliases `rustls` with
+# aws-lc-rs, pulling `aws-lc-sys` in. TLS backend comes from the workspace pin.
+reqwest = { workspace = true, features = ["json"] }
+roxmltree = "=0.21.1"
+# For `origins::DataSources`, `tls` (incl. the no-User-Agent client METAR/SPC
+# need -- see `metar::fetch`), and the feature vocabulary this crate
+# re-exports from `types`. The substrate under this crate AND `squallar-radar`;
+# `tests/charter.rs` there pins that this crate depends on no radar code.
+squallar-source = { workspace = true }
+# The geo vocabulary (GeoBounds, GeoPolygon, GeoPolygonRing) and the Mercator
+# helpers, named directly since WO-G4 killed the `types` re-export shim.
+squallar-geo = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tiny-skia = "=0.12.0"
+
+[dev-dependencies]
+# Test fixtures only: `glm::tests` and `gmgsi::decode::tests` write HDF5 files
+# with `FileBuilder` to feed the decoders. Shipped code in this crate reaches
+# HDF5 exclusively through `squallar-netcdf`, which owns the pin and the
+# feature rationale -- keep the two versions equal.
+hdf5-pure = "=0.39.0"
+
+# Must stay target-gated: tokio rejects `fs` on wasm ("Only features
+# sync,macros,io-util,rt,time are supported on wasm") -- a hard build failure.
+# Backs the native-only zone disk cache in `nws::zones`.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["fs"] }
+
+# Target-gated for the same reason as the entry above: `rt-multi-thread` is not
+# one of the features tokio accepts on wasm, and an ungated dev-dependency still
+# breaks `cargo check --all-targets --target wasm32-unknown-unknown`.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# Drives the `#[ignore]`d live-network checks (IEM and the S3 buckets).
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# Deliberately empty. `libsqlite3-sys` was pinned here with `features =
+# ["bundled"]` because proj-sys (grib -> proj) needs SQLite3 headers the NDK
+# sysroot does not ship; re-enabling grib's `gridpoints-proj` brings that back
+# and breaks the Android build. `openssl-sys` was pinned with `features =
+# ["vendored"]`; nothing links OpenSSL any more.

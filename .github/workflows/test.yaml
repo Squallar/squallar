@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install system deps
         # libudev-dev for the same reason the `test` job needs it:
-        # the rustdar crate enables rustdar-nmea-serial/serial unconditionally off
+        # the squallar crate enables squallar-nmea-serial/serial unconditionally off
         # Android and iOS. mesa-vulkan-drivers is what carries lavapipe.
         run: |
           sudo apt-get update
@@ -74,7 +74,7 @@ jobs:
         with:
           key: gpu
       # No `--all-features` on either step below, and not an oversight: the only
-      # feature it adds on Linux is rustdar's `jni-typecheck`, which is
+      # feature it adds on Linux is squallar's `jni-typecheck`, which is
       # the `test` job's reason for the flag and builds nothing this job runs.
       #
       # `--nocapture` is load-bearing. Each test binary prints the adapter it
@@ -94,15 +94,15 @@ jobs:
       # above take there. A mutant is one shader compile and one small render,
       # and neither is what a software rasteriser is slow at.
       - name: Run the adapter-only integration tests
-        # `-p rustdar-gpu` since WO-RV land 3: the ENTIRE GPU-bound suite lives
-        # in rustdar-gpu/tests (the hardware quarantine — this job is the ONE
+        # `-p squallar-gpu` since WO-RV land 3: the ENTIRE GPU-bound suite lives
+        # in squallar-gpu/tests (the hardware quarantine — this job is the ONE
         # owner of every `--ignored` adapter invocation; `cargo test` on any
         # other package needs no adapter).
         run: |
-          cargo test -p rustdar-gpu \
+          cargo test -p squallar-gpu \
             --test volume_gpu --test volume_silhouette --test volume_shader_mutants \
             -- --ignored --nocapture
-      # The other three `#[ignore]`d files in rustdar-gpu/tests --
+      # The other three `#[ignore]`d files in squallar-gpu/tests --
       # volume_real_mask, volume_march_cost and floor_alignment -- are
       # deliberately not here. Each reads a Level II volume from a path given in
       # the environment, no such file exists in this repository, and radar data
@@ -114,17 +114,17 @@ jobs:
         # counts are asserted rather than assumed.
         #
         # Two invocations since WO-RG: the renderer's sentinel test moved to
-        # rustdar-gpu with the renderer; the volume trio moved to
-        # rustdar-volumetric with the 3D stack at WO-RV (the `volume::` module
+        # squallar-gpu with the renderer; the volume trio moved to
+        # squallar-volumetric with the 3D stack at WO-RV (the `volume::` module
         # segment became the crate root, so the paths lost that prefix).
         run: |
-          cargo test -p rustdar-volumetric --lib -- --ignored --nocapture --exact \
+          cargo test -p squallar-volumetric --lib -- --ignored --nocapture --exact \
             tests::a_real_adapter_supports_the_volume_format \
             raymarch::staging::tests::the_two_routes_write_the_same_plane \
             raymarch::staging::tests::the_worst_case_residency_is_the_ring_and_the_widening_together \
             | tee "$RUNNER_TEMP/lib-gpu.log"
           grep -q '^test result: ok\. 3 passed' "$RUNNER_TEMP/lib-gpu.log"
-          cargo test -p rustdar-gpu --lib -- --ignored --nocapture --exact \
+          cargo test -p squallar-gpu --lib -- --ignored --nocapture --exact \
             egui_renderer::tests::a_paint_callbacks_own_command_buffer_reaches_the_queue \
             | tee "$RUNNER_TEMP/lib-gpu-renderer.log"
           grep -q '^test result: ok\. 1 passed' "$RUNNER_TEMP/lib-gpu-renderer.log"
@@ -177,7 +177,7 @@ jobs:
           rustup default stable
           rustup component add llvm-tools-preview
           cargo install cargo-llvm-cov --locked --version ^0.8
-      # `--all-features` is the only reason the `rustdar` package's android
+      # `--all-features` is the only reason the `squallar` package's android
       # module tests exist here. That module tree is mounted `#[cfg(any(
       # target_os = "android", feature = "jni-typecheck"))]`, so without the
       # flag none of it compiles on a host -- a green row that covered nothing,
@@ -190,8 +190,8 @@ jobs:
       #
       # Cheap here in a way it is not on the cross rows in build.yaml:
       # `jni-typecheck` is the only feature this actually adds on Linux. The
-      # workspace's other two, rustdar-nmea-serial/serial and rustdar-egui/gps-serial,
-      # the rustdar crate already enables unconditionally for
+      # workspace's other two, squallar-nmea-serial/serial and squallar-egui/gps-serial,
+      # the squallar crate already enables unconditionally for
       # `cfg(not(any(target_os = "android", target_os = "ios")))` -- which is
       # what the libudev-dev above is for, with or without this flag.
       - name: Run tests
@@ -203,7 +203,7 @@ jobs:
       # Adding it to match the step above fails this job on the first run. It
       # needs none of them: it re-reads the .profraw and the object files that
       # step left in target/llvm-cov-target, so it already reports exactly what
-      # ran -- rustdar/src/android/ included.
+      # ran -- squallar/src/android/ included.
       - name: Generate coverage reports
         if: always()
         run: |

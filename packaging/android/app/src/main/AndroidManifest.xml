@@ -5,7 +5,7 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- LocationHelper's requestLocationUpdates() subscription, and the
-         getLastKnownLocation() poll on the GPS thread in rustdar's android
+         getLastKnownLocation() poll on the GPS thread in squallar's android
          location module that it feeds. Both are requested at runtime together;
          COARSE alone (the "approximate only" dialog answer) still serves the
          network provider. -->
@@ -23,7 +23,7 @@
     -->
 
     <application
-        android:label="Rustdar"
+        android:label="Squallar"
         android:icon="@android:drawable/sym_def_app_icon"
         android:allowBackup="false"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
@@ -36,7 +36,7 @@
         <!--
           android:enableOnBackInvokedCallback="true" opts this app into the
           predictive-back dispatcher on API 33+, which is what lets
-          com.rustdar.BackHandler decline a press and lets the platform draw
+          app.squallar.BackHandler decline a press and lets the platform draw
           its own back-to-home preview.
 
           It was struck once, at WO-RP-3, because opting in made the app
@@ -54,13 +54,13 @@
           "Activity destroy timeout" ten seconds later. The next Activity was
           started behind a deadlocked main thread. Measured on the emulator,
           2026-08-21: one launch, one unclaimed back press, one relaunch, and
-          "Starting Rustdar Platform" stayed at a count of 1.
+          "Starting Squallar Platform" stayed at a count of 1.
 
           The app now ends its own loop instead. winit delivers Suspended
           before onDestroy runs, and Activity.isFinishing() tells a finish from
           a backgrounding, so App::suspended exits the event loop on a finish
           and leaves it running on a backgrounding. See
-          rustdar/src/android/lifecycle.rs.
+          squallar/src/android/lifecycle.rs.
 
           This is also the prerequisite for the targetSdk bump: from
           targetSdk 36 the dispatcher is not opt-in and this attribute stops
@@ -101,7 +101,7 @@
           "false" would read like a guarantee the platform is not honouring. The
           config file is the single source of truth: cleartext permitted in
           base-config so the platform's own revocation fetches succeed, and denied
-          per-domain for every host rustdar itself talks to.
+          per-domain for every host squallar itself talks to.
         -->
 
         <activity
@@ -117,14 +117,14 @@
               tears down and recreates the Activity underneath a running native
               event loop, which deadlocks and ANRs instead of relaunching cleanly.
               The Rust side handles all of these in-app: theme via the polling
-              thread in the rustdar crate, size via the normal resize path.
+              thread in the squallar crate, size via the normal resize path.
             -->
 
             <!-- NativeActivity dlsym()s android_main out of this .so. The name is
-                 the rustdar crate's [lib] name, i.e. librustdar_native.so. -->
+                 the squallar crate's [lib] name, i.e. libsquallar_native.so. -->
             <meta-data
                 android:name="android.app.lib_name"
-                android:value="rustdar_native" />
+                android:value="squallar_native" />
 
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

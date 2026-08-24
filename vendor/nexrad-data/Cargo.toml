@@ -86,8 +86,8 @@ aws-polling = [
 # wasm backend and elides its rustls features there. It is dropped because
 # vendoring is supposed to change nothing, and this is the one line that keeps
 # the resolved feature set identical to what it was as a plain dependency. The
-# `aws` surface is also the one part of this crate rustdar does not use:
-# `rustdar-radar/src/archive.rs` and `src/chunks.rs` reimplement it, and say so.
+# `aws` surface is also the one part of this crate squallar does not use:
+# `squallar-radar/src/archive.rs` and `src/chunks.rs` reimplement it, and say so.
 #
 # A manifest edit precisely so that it need not be a source edit.
 default = ["nexrad-model"]
@@ -219,7 +219,7 @@ optional = true
 # It reaches nothing that ships. Cargo resolves dev-dependencies only for test,
 # bench and example targets, so `bzip2` and `libbz2-rs-sys` are absent from
 # every `cargo build` and `cargo build --release` of every binary here,
-# `rustdar-web`'s wasm bundle included. Checked with
+# `squallar-web`'s wasm bundle included. Checked with
 # `cargo tree -p nexrad-data -e normal -i bzip2`, which answers "did not match
 # any packages", against `-e normal,dev`, which names it. Under `--all-targets`
 # they do compile, wasm32 included, exactly as they did before -- 0.6.1's

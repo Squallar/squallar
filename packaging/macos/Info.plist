@@ -11,9 +11,9 @@
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>rustdar</string>
+    <string>Squallar</string>
     <key>CFBundleDisplayName</key>
-    <string>Rustdar</string>
+    <string>Squallar</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -47,9 +47,9 @@
          "the dialog never appears". Shipping both costs one string and is
          correct on every OS version either key has ever been read by. -->
     <key>NSLocationUsageDescription</key>
-    <string>Rustdar shows your position on the radar map and picks the radar site nearest you.</string>
+    <string>Squallar shows your position on the radar map and picks the radar site nearest you.</string>
     <key>NSLocationWhenInUseUsageDescription</key>
-    <string>Rustdar shows your position on the radar map and picks the radar site nearest you.</string>
+    <string>Squallar shows your position on the radar map and picks the radar site nearest you.</string>
     <!-- Deliberately absent, and each for a reason:
 
          * `LSRequiresIPhoneOS`, `UIDeviceFamily`, `UILaunchScreen`,
@@ -61,6 +61,6 @@
            and writing down an SDK name this build never used would be a
            fiction that only drifts.
          * `CFBundleIconFile` — there is no `.icns` in the tree, and inventing
-           one from rustdar-web/icons is its own change. -->
+           one from squallar-web/icons is its own change. -->
 </dict>
 </plist>

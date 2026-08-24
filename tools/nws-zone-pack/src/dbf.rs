@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use rustdar_source::wire::Reader;
+use squallar_source::wire::Reader;
 
 #[derive(Debug)]
 pub struct Dbf {

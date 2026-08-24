@@ -26,13 +26,13 @@
 # chromium half without a session -- the display requirement is firefox's.
 #
 # Usage: run_gpu_arm.sh [--skip-build] [--also-software]
-#   --skip-build      serve rustdar-web as-is (default: wasm-pack build first)
+#   --skip-build      serve squallar-web as-is (default: wasm-pack build first)
 #   --also-software   run the software arm too, into *.sw.json, so the
 #                     software-vs-hardware delta comes out of ONE invocation
 #                     on ONE build rather than out of two reports
 #
 # Environment knobs (all optional):
-#   RUSTDAR_WEB_DIR   dir to serve   (default <repo>/rustdar-web)
+#   SQUALLAR_WEB_DIR   dir to serve   (default <repo>/squallar-web)
 #   RIG_OUT_DIR       output dir     (default <rig>/out-gpu)
 #   RIG_CHROMEDRIVER  chromedriver   (default: chromedriver on PATH)
 #   RIG_GECKODRIVER   geckodriver    (default: $(ensure-geckodriver.sh))
@@ -76,7 +76,7 @@ set -u -o pipefail   # not -e: attempt every leg and still summarise
 
 RIG_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$RIG_DIR/../.." && pwd)"
-WEB_DIR="${RUSTDAR_WEB_DIR:-$REPO_ROOT/rustdar-web}"
+WEB_DIR="${SQUALLAR_WEB_DIR:-$REPO_ROOT/squallar-web}"
 OUT_DIR="${RIG_OUT_DIR:-$RIG_DIR/out-gpu}"
 CHROMEDRIVER="${RIG_CHROMEDRIVER:-$(command -v chromedriver || echo /usr/bin/chromedriver)}"
 FRAMES="${RIG_FRAMES:-240}"
@@ -87,7 +87,7 @@ PY=python3
 
 # Identical to run_tier2.sh's seed: a figure from here and a verdict from
 # there must describe the same scene, or the delta is a scene delta.
-SEED_LS='{"rustdar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\"}]}"}'
+SEED_LS='{"squallar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\"}]}"}'
 
 SKIP_BUILD=0
 ALSO_SOFTWARE=0
@@ -134,18 +134,18 @@ mkdir -p "$OUT_DIR"
 
 # ---------------------------------------------------------------- build ----
 if [ "$SKIP_BUILD" -eq 0 ]; then
-  echo "building rustdar-web (wasm-pack, CARGO_BUILD_JOBS=4)"
+  echo "building squallar-web (wasm-pack, CARGO_BUILD_JOBS=4)"
   # Through wasm-threads.sh since WS3b -- the nightly/atomics/build-std/
   # shared-memory configuration is the only one this bundle compiles in.
   (cd "$REPO_ROOT" && CARGO_BUILD_JOBS=4 \
     .github/scripts/wasm-threads.sh \
-    wasm-pack build rustdar-web --target web --release --no-typescript --no-pack) || {
+    wasm-pack build squallar-web --target web --release --no-typescript --no-pack) || {
     echo "FATAL: wasm-pack build failed" >&2
     exit 1
   }
 fi
-if [ ! -f "$WEB_DIR/pkg/rustdar_web_bg.wasm" ]; then
-  echo "FATAL: $WEB_DIR/pkg/rustdar_web_bg.wasm missing -- build first" >&2
+if [ ! -f "$WEB_DIR/pkg/squallar_web_bg.wasm" ]; then
+  echo "FATAL: $WEB_DIR/pkg/squallar_web_bg.wasm missing -- build first" >&2
   exit 1
 fi
 

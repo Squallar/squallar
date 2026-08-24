@@ -5,10 +5,10 @@ name: Web
 #
 #   Tier 1: .github/scripts/wasm-threads.sh wasm-pack test --headless --firefox \
 #             --geckodriver "$(bash .github/browser-rig/ensure-geckodriver.sh)" \
-#             rustdar-web --test tier1_wasm          # test result: ok. 4 passed
+#             squallar-web --test tier1_wasm          # test result: ok. 4 passed
 #           .github/scripts/wasm-threads.sh wasm-pack test --headless --chrome \
-#             rustdar-web --test tier1_wasm
-#   Tier 2: .github/scripts/wasm-threads.sh wasm-pack build rustdar-web \
+#             squallar-web --test tier1_wasm
+#   Tier 2: .github/scripts/wasm-threads.sh wasm-pack build squallar-web \
 #             --target web --release --no-typescript --no-pack
 #           bash .github/browser-rig/run_tier2.sh --skip-build
 #
@@ -25,9 +25,9 @@ name: Web
 #           # frame" reply, and the doctored-token -> respawn leg
 #
 # CI enforces the same on every push to main and every PR. Required-green
-# scope: any change under rustdar-worker/src/offload* or pump surfaces,
-# rustdar-gpu (the renderer the PWA paints with, since WO-RG),
-# rustdar-web/src/worker_*, or rustdar-web at all.
+# scope: any change under squallar-worker/src/offload* or pump surfaces,
+# squallar-gpu (the renderer the PWA paints with, since WO-RG),
+# squallar-web/src/worker_*, or squallar-web at all.
 #
 # Tier 2 runs against LIVE network (campaign-resolved posture): 180 s poll for
 # the first job reply, one auto-retry per pass as the flake-quarantine policy
@@ -66,7 +66,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install system deps
         # libudev-dev for the same reason the test workflow needs it:
-        # the rustdar crate enables rustdar-nmea-serial/serial unconditionally off
+        # the squallar crate enables squallar-nmea-serial/serial unconditionally off
         # Android and iOS, and host-side builds of the workspace graph want it.
         run: |
           sudo apt-get update
@@ -101,11 +101,11 @@ jobs:
           if [ "${{ matrix.browser }}" = firefox ]; then
             .github/scripts/wasm-threads.sh \
               wasm-pack test --headless --firefox --geckodriver "$RIG_GECKODRIVER" \
-              rustdar-web --test tier1_wasm | tee "$RUNNER_TEMP/tier1.log"
+              squallar-web --test tier1_wasm | tee "$RUNNER_TEMP/tier1.log"
           else
             .github/scripts/wasm-threads.sh \
               wasm-pack test --headless --chrome \
-              rustdar-web --test tier1_wasm | tee "$RUNNER_TEMP/tier1.log"
+              squallar-web --test tier1_wasm | tee "$RUNNER_TEMP/tier1.log"
           fi
           grep -q 'test result: ok\. 4 passed' "$RUNNER_TEMP/tier1.log"
 
@@ -144,7 +144,7 @@ jobs:
       - name: Build the web bundle (threaded)
         run: |
           .github/scripts/wasm-threads.sh \
-            wasm-pack build rustdar-web --target web --release --no-typescript --no-pack
+            wasm-pack build squallar-web --target web --release --no-typescript --no-pack
       - name: Run the Tier-2 gate (${{ matrix.browser }})
         # run_tier2.sh asserts its own outcomes per pass (worker round-trip,
         # doctored respawn) and exits non-zero on any leg failing twice.

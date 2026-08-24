@@ -1,0 +1,139 @@
+# Real NWS alert `event` values -- checked-in sample used by the colors.rs tests.
+#
+# Source 1: https://api.weather.gov/alerts/types  (the API's own enumeration of
+#           every valid alert product name)
+# Source 2: distinct `properties.event` values observed in a snapshot of
+#           https://api.weather.gov/alerts/active
+# Captured: 2026-07-25
+#
+# Why this file exists
+# --------------------
+# ALERT_COLORS is a keyword table. When NWS renames a product (as it did when
+# hazard simplification replaced "Excessive Heat Warning" with "Extreme Heat
+# Warning", and "Wind Chill Warning" with "Extreme Cold Warning"), the old
+# keywords stop matching anything and the affected alerts silently fall through
+# to the generic suffix entries -- which used to paint them tornado red. Nothing
+# failed; the map just started lying.
+#
+# `every_live_entry_matches_a_real_event` asserts that every non-legacy row in
+# ALERT_COLORS still matches at least one name below, so the next rename fails a
+# test instead of silently recolouring the map.
+#
+# To refresh (requires a non-empty User-Agent; an empty one gets a 403):
+#   curl -H 'User-Agent: squallar (you@example.com)' \
+#        https://api.weather.gov/alerts/types | jq -r '.eventTypes[]' | sort
+#
+# Lines starting with `#` and blank lines are ignored. One event name per line.
+
+911 Telephone Outage
+Administrative Message
+Air Quality Alert
+Air Stagnation Advisory
+Ashfall Advisory
+Ashfall Warning
+Avalanche Advisory
+Avalanche Warning
+Avalanche Watch
+Beach Hazards Statement
+Blizzard Warning
+Blowing Dust Advisory
+Blowing Dust Warning
+Blue Alert
+Brisk Wind Advisory
+Child Abduction Emergency
+Civil Danger Warning
+Civil Emergency Message
+Coastal Flood Advisory
+Coastal Flood Statement
+Coastal Flood Warning
+Coastal Flood Watch
+Cold Weather Advisory
+Dense Fog Advisory
+Dense Smoke Advisory
+Dust Advisory
+Dust Storm Warning
+Earthquake Warning
+Evacuation Immediate
+Extreme Cold Warning
+Extreme Cold Watch
+Extreme Fire Danger
+Extreme Heat Warning
+Extreme Heat Watch
+Extreme Wind Warning
+Fire Warning
+Fire Weather Watch
+Flash Flood Statement
+Flash Flood Warning
+Flash Flood Watch
+Flood Advisory
+Flood Statement
+Flood Warning
+Flood Watch
+Freeze Warning
+Freeze Watch
+Freezing Fog Advisory
+Freezing Spray Advisory
+Frost Advisory
+Gale Warning
+Gale Watch
+Hazardous Materials Warning
+Hazardous Seas Warning
+Hazardous Seas Watch
+Hazardous Weather Outlook
+Heat Advisory
+Heavy Freezing Spray Warning
+Heavy Freezing Spray Watch
+High Surf Advisory
+High Surf Warning
+High Wind Warning
+High Wind Watch
+Hurricane Force Wind Warning
+Hurricane Force Wind Watch
+Hurricane Warning
+Hurricane Watch
+Hydrologic Outlook
+Ice Storm Warning
+Lake Effect Snow Warning
+Lake Wind Advisory
+Lakeshore Flood Advisory
+Lakeshore Flood Statement
+Lakeshore Flood Warning
+Lakeshore Flood Watch
+Law Enforcement Warning
+Local Area Emergency
+Low Water Advisory
+Marine Weather Statement
+Nuclear Power Plant Warning
+Radiological Hazard Warning
+Red Flag Warning
+Rip Current Statement
+Severe Thunderstorm Warning
+Severe Thunderstorm Watch
+Severe Weather Statement
+Shelter In Place Warning
+Short Term Forecast
+Small Craft Advisory
+Snow Squall Warning
+Special Marine Warning
+Special Weather Statement
+Storm Surge Warning
+Storm Surge Watch
+Storm Warning
+Storm Watch
+Test
+Test Message
+Tornado Warning
+Tornado Watch
+Tropical Cyclone Local Statement
+Tropical Storm Warning
+Tropical Storm Watch
+Tsunami Advisory
+Tsunami Warning
+Tsunami Watch
+Typhoon Warning
+Typhoon Watch
+Volcano Warning
+Wind Advisory
+Winter Storm Warning
+Winter Storm Watch
+Winter Weather Advisory

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Android Network Security Config for rustdar.
+  Android Network Security Config for squallar.
 
   Referenced by android:networkSecurityConfig on <application> in
   AndroidManifest.xml, and compiled into resources.arsc by aapt2 as part of the
@@ -20,7 +20,7 @@
       file does. Adding it to the ZIP would have achieved nothing.
 
   ===========================================================================
-  Why the base config permits cleartext while every rustdar domain forbids it
+  Why the base config permits cleartext while every squallar domain forbids it
 
   rustls-platform-verifier issue #221: on Android, certificates whose revocation
   data is published over plain HTTP fail to verify when the app forbids cleartext
@@ -39,10 +39,10 @@
   revocation source, so blocking cleartext app-wide breaks HTTPS to weather.gov.
 
   Hence: `cleartextTrafficPermitted="true"` in base-config, so the platform's own
-  revocation fetches succeed, and `false` per-domain for every host rustdar
-  actually talks to, so none of rustdar's own traffic can travel in the clear.
+  revocation fetches succeed, and `false` per-domain for every host squallar
+  actually talks to, so none of squallar's own traffic can travel in the clear.
   Application code is not trusted to get this right on its own (every client is
-  additionally built with `.https_only(true)`, see rustdar_radar::tls::client),
+  additionally built with `.https_only(true)`, see squallar_radar::tls::client),
   but this file is what makes it the OS's decision rather than ours.
 
   NB: an XML comment may not contain a double hyphen, and aapt2 parses this file
@@ -71,9 +71,9 @@
   origin missing from this file was silently falling through to base-config,
   where cleartext is permitted.
 
-  `rustdar/src/network_security_config.rs` parses this file at test
+  `squallar/src/network_security_config.rs` parses this file at test
   time and asserts, both ways, that it covers exactly the origins
-  `rustdar_radar::sources::DataSources::production()` and the tile sources
+  `squallar_radar::sources::DataSources::production()` and the tile sources
   declare. Adding an origin there and not here now fails `cargo test`.
 
   Generating the file outright was considered and rejected: the attribute on
@@ -84,7 +84,7 @@
 -->
 <network-security-config>
     <!-- Permits the platform's own cleartext CRL/AIA fetches. Does NOT permit
-         rustdar's traffic: every domain below overrides it back to false. -->
+         squallar's traffic: every domain below overrides it back to false. -->
     <base-config cleartextTrafficPermitted="true">
         <trust-anchors>
             <!-- System store only, and explicitly no bundled roots: trust must
