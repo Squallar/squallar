@@ -16,6 +16,7 @@ use crate::spc::discussion::SpcDiscussion;
 use crate::types::OverlayLabel;
 use squallar_source::id::{LayerId, known};
 use squallar_source::job::{DescribedJob, JobCodec};
+use squallar_source::time::TimeAxis;
 
 pub struct SpcDiscussionFetchResult(pub Result<Vec<SpcDiscussion>, FetchError>);
 impl crate::fetch_policy::FetchRound for SpcDiscussionFetchResult {
@@ -114,6 +115,16 @@ impl SpcDiscussionHandler {
                 .state
                 .data
                 .iter()
+                // **The as-of filter**: two `Option` comparisons against the
+                // window parsed once at fetch time from the product's own
+                // `VALID` line. A discussion unbounded on a side passes on that
+                // side. On a live pane `as_of` is the wall clock and the feed
+                // only carries discussions that are in force, so the rows are
+                // exactly what they were before this filter existed.
+                .filter(|i| {
+                    i.md.valid_from.is_none_or(|from| from <= ctx.as_of)
+                        && i.md.valid_until.is_none_or(|until| ctx.as_of < until)
+                })
                 .map(|i| rasterize::DiscussionPaint {
                     md_type: i.md.md_type,
                     polygon: i.md.polygon.clone(),
@@ -156,6 +167,18 @@ impl OverlayHandler for SpcDiscussionHandler {
 
     fn render_mode(&self) -> RenderMode {
         RenderMode::Texture
+    }
+
+    /// Every discussion carries a validity window — its `VALID DDHHMM - DDHHMM`
+    /// line — and the picture is which of them are in force at the depicted
+    /// instant. That is the definition of [`TimeAxis::EventLifetime`], and
+    /// declaring it is what makes a scrubbed pane's `as_of` reach this layer at
+    /// all: the caller hands a `Live` layer the wall clock by contract, so
+    /// while this said `Live` the archive branch in `create_fetch_tasks` below
+    /// was unreachable and a pane parked on a 2013 storm drew today's
+    /// discussions over it.
+    fn time_axis(&self) -> TimeAxis {
+        TimeAxis::EventLifetime
     }
 
     fn default_enabled(&self) -> bool {
@@ -298,6 +321,32 @@ impl OverlayHandler for SpcDiscussionHandler {
     }
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig, _pane: &PaneRef<'_>) -> Vec<FetchTask> {
+        // THE ARCHIVE, FOR A PANE THAT IS NOT LOOKING AT NOW.
+        //
+        // `spcmdrss.xml` is a standing feed of what is active at the moment it
+        // is asked and holds no history, so a pane scrubbed to a past storm drew
+        // today's discussions over it. Same shape, same threshold and same
+        // reason as the NWS warnings above it in the stack — see
+        // `alert.rs`'s `ARCHIVE_CUTOFF_MINUTES`, which this shares so the two
+        // layers can never disagree about which side of "now" a pane is on.
+        let archived_before = ctx.as_of
+            < chrono::Utc::now().naive_utc()
+                - chrono::Duration::minutes(super::alert::ARCHIVE_CUTOFF_MINUTES);
+        if archived_before {
+            let sources = ctx.sources.clone();
+            let at = ctx.as_of;
+            return vec![FetchTask {
+                kind: known::SPC_DISCUSSIONS,
+                future: Box::pin(async move {
+                    let result = crate::spc::discussion_archive::fetch_archived_discussions(
+                        &sources, at,
+                    )
+                    .await;
+                    Box::new(SpcDiscussionFetchResult(result)) as FetchPayload
+                }),
+            }];
+        }
+
         log::info!("Fetching SPC Mesoscale Discussions");
         // NOT `ctx.client`: SPC answers OPTIONS with 403, so a `User-Agent`
         // makes this fail in the browser. See `spc::fetch`.
@@ -431,6 +480,11 @@ mod tests {
             polygon,
             feature,
             concerning: None,
+            // Unbounded: these fixtures are about the drawn set, not the
+            // window, and an unbounded discussion passes the as-of filter at
+            // every instant.
+            valid_from: None,
+            valid_until: None,
         }
     }
 

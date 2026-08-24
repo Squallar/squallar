@@ -179,6 +179,10 @@ fn discussion_fixture() -> crate::spc::discussion::SpcDiscussion {
         polygon: vec![ring()],
         feature: feature(),
         concerning: None,
+        // Unbounded: this fixture is about the texture, not the window, and an
+        // unbounded discussion passes the as-of filter at every instant.
+        valid_from: None,
+        valid_until: None,
     }
 }
 
