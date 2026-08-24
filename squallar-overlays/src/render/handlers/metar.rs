@@ -17,6 +17,7 @@ use crate::render::overlay_state::{
 };
 use crate::render::station_model;
 use squallar_source::id::{LayerId, known};
+use squallar_source::time::TimeAxis;
 
 pub(crate) struct MetarFetchResult(
     pub Result<crate::metar::fetch::MetarRound, crate::fetch_policy::FetchError>,
@@ -226,6 +227,15 @@ impl MetarHandler {
 impl OverlayHandler for MetarHandler {
     fn id(&self) -> LayerId {
         known::METAR
+    }
+
+    /// **Current observations only.** IEM's `currents.json` answers with the
+    /// latest report per station and this layer keeps no archive of its own, so
+    /// its honest answer at a past instant is the same one it gives now. That
+    /// is a real limit rather than a property of the weather — an observation
+    /// archive exists and is not read here — and `Live` is what says so.
+    fn time_axis(&self) -> TimeAxis {
+        TimeAxis::Live
     }
     fn surface(&self) -> Surface {
         Surface::Ground

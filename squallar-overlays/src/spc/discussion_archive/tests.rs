@@ -30,7 +30,10 @@ fn the_captured_index_yields_both_discussions() {
     assert_eq!(entries.len(), 2, "got {entries:?}");
 
     let numbers: Vec<u32> = entries.iter().map(|(_, _, n)| *n).collect();
-    assert!(numbers.contains(&727) && numbers.contains(&728), "{numbers:?}");
+    assert!(
+        numbers.contains(&727) && numbers.contains(&728),
+        "{numbers:?}"
+    );
 
     for (product_id, year, _) in &entries {
         assert_eq!(*year, 2013);
@@ -125,7 +128,10 @@ fn the_valid_line_becomes_the_window() {
 
     let valid_at = |t| from.is_none_or(|f| f <= t) && until.is_none_or(|u| t < u);
     assert!(valid_at(moore_instant()), "in force at the pinned volume");
-    assert!(!valid_at(at(20, 19, 0)), "not in force before it was issued");
+    assert!(
+        !valid_at(at(20, 19, 0)),
+        "not in force before it was issued"
+    );
     assert!(!valid_at(at(20, 22, 0)), "not in force after it expired");
 }
 
@@ -148,7 +154,11 @@ fn a_bare_day_of_month_resolves_against_the_instant_being_asked_about() {
 
     // Issued 23:40Z on 31 July, read at 00:10Z on 1 August.
     let (from, _) = parse_valid_window("VALID 312340Z - 010200Z", dt(2024, 8, 1, 0, 10));
-    assert_eq!(from, Some(dt(2024, 7, 31, 23, 40)), "the reference month is not the issue month");
+    assert_eq!(
+        from,
+        Some(dt(2024, 7, 31, 23, 40)),
+        "the reference month is not the issue month"
+    );
 
     // And the reverse: issued 00:10Z on the 1st, read at 01:00Z on the 1st,
     // where the naive "same month" answer happens to be right.
@@ -171,7 +181,10 @@ fn an_unparseable_window_leaves_the_discussion_unbounded() {
     use crate::spc::discussion::parse_valid_window;
     let now = moore_instant();
     assert_eq!(parse_valid_window("no such line here", now), (None, None));
-    assert_eq!(parse_valid_window("VALID whenever - later", now), (None, None));
+    assert_eq!(
+        parse_valid_window("VALID whenever - later", now),
+        (None, None)
+    );
     // A parseable start with a junk end keeps the start.
     let (from, until) = parse_valid_window("VALID 201931Z - junk", now);
     assert!(from.is_some() && until.is_none(), "{from:?} {until:?}");
@@ -295,7 +308,10 @@ mod routing {
             .downcast::<SpcDiscussionFetchResult>()
             .expect("a discussion round");
         match result.0 {
-            Ok(v) => panic!("a fetch from nowhere succeeded with {} discussions", v.len()),
+            Ok(v) => panic!(
+                "a fetch from nowhere succeeded with {} discussions",
+                v.len()
+            ),
             Err(e) => format!("{e:?}"),
         }
     }

@@ -1464,6 +1464,11 @@ impl squallar_overlays::render::overlay_state::OverlayHandler for RefusingVolume
     fn id(&self) -> squallar_source::id::LayerId {
         REFUSING_LAYER
     }
+    /// It holds neither frames nor items with windows — it exists to refuse a
+    /// job — so `Live` is the true answer and not merely the inherited one.
+    fn time_axis(&self) -> squallar_source::time::TimeAxis {
+        squallar_source::time::TimeAxis::Live
+    }
     fn surface(&self) -> squallar_source::handler::Surface {
         squallar_source::handler::Surface::Ground
     }

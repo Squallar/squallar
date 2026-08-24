@@ -141,6 +141,24 @@ fn parked_panes(gui: &Gui) -> Vec<(usize, String, chrono::NaiveDateTime)> {
         .collect()
 }
 
+/// **Every pane restored wanting a loop**, as `(index, request)`.
+///
+/// The sibling of [`parked_panes`], and collected the same way: read off the
+/// panes once at startup, acted on when the reload is hydrated. The request is
+/// taken from the pane here rather than left on it, so nothing can act on it
+/// twice.
+/// The lookback is read here, beside the panes, because it is the same
+/// persisted setting the timeline's own Enable-loop action carries — a restored
+/// loop must span what the user left the slider on, not a fresh default.
+fn looping_panes(gui: &mut Gui) -> Vec<(usize, squallar_egui::pane::LoopArm, u64)> {
+    let lookback = gui.loop_lookback_secs;
+    gui.panes_mut()
+        .iter_mut()
+        .enumerate()
+        .filter_map(|(idx, pane)| pane.loop_arm_pending.take().map(|arm| (idx, arm, lookback)))
+        .collect()
+}
+
 pub struct App {
     state: Option<app_state::AppState>,
     window: Option<WindowRef>,
@@ -269,6 +287,8 @@ pub struct App {
     /// Collected at construction rather than dispatched there because
     /// `spawn_fetch` needs the built `App`.
     parked_fetch_pending: Vec<(usize, String, chrono::NaiveDateTime)>,
+    /// Panes restored with a loop armed, drained by `hydrate_parked_panes`.
+    loop_arm_pending: Vec<(usize, squallar_egui::pane::LoopArm, u64)>,
     /// The map extent most recently asked for on screen.
     last_viewport: Option<squallar_geo::GeoBounds>,
     autosave: AutosaveState,
@@ -461,6 +481,7 @@ impl App {
         let site_is_provisional = !restored && apply_location_hint(&mut gui, platform.as_ref());
         // Before `gui` moves into the struct literal below.
         let parked_fetch_pending = parked_panes(&gui);
+        let loop_arm_pending = looping_panes(&mut gui);
         let site_positions = crate::site_positions::SitePositions::load(platform.kv().as_deref());
         let site_catalogue = crate::site_catalogue::load(platform.kv().as_deref());
         let table =
@@ -549,6 +570,7 @@ impl App {
             latest_cached_scans: HashMap::new(),
             manual_nav_pending: false,
             parked_fetch_pending,
+            loop_arm_pending,
             last_viewport: None,
             redraw_waker: RedrawWaker::new(),
             // The gate inside is inert until the first `poll_platform_state`, which is

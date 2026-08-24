@@ -59,6 +59,12 @@ impl OverlayHandler for StubLayer {
     fn id(&self) -> LayerId {
         self.id.clone()
     }
+    /// The walk this fixture exercises never reads the clock, and the stub
+    /// holds neither frames nor windowed items — so `Live` is the true answer
+    /// rather than the one it used to inherit in silence.
+    fn time_axis(&self) -> squallar_source::time::TimeAxis {
+        squallar_source::time::TimeAxis::Live
+    }
     fn surface(&self) -> Surface {
         Surface::Ground
     }

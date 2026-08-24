@@ -118,7 +118,10 @@ pub async fn fetch_archived_discussions(
         }
     }
 
-    log::info!("{} archived mesoscale discussion(s) valid at {at}", discussions.len());
+    log::info!(
+        "{} archived mesoscale discussion(s) valid at {at}",
+        discussions.len()
+    );
     Ok(discussions)
 }
 

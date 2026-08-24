@@ -483,7 +483,7 @@ impl Gui {
             section_handles: Vec::new(),
             pending_section_edit: None,
             loop_lookback_secs: 3600, // default 1 hour
-            loop_speed_fps: 5.0,      // default 5 fps
+            loop_speed_fps: crate::pane::DEFAULT_LOOP_SPEED_FPS,
             drawer_open: false,
             stack_open: None,
             insp_open: false,

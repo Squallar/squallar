@@ -960,10 +960,14 @@ impl OverlayHandler for MrmsHandler {
         let client = ctx.client.clone();
         let sources = ctx.sources.clone();
         let product = self.view(pane).selected_product;
+        // The instant this pane depicts, not the wall clock. On a live pane the
+        // two are equal and nothing moves; on a parked one this is what stopped
+        // the mosaic being this evening's over an afternoon scan.
+        let at = ctx.as_of;
         vec![FetchTask {
             kind: known::MRMS,
             future: Box::pin(async move {
-                let result = crate::mrms::fetch::fetch_latest(&client, &sources, product).await;
+                let result = crate::mrms::fetch::fetch_latest(&client, &sources, product, at).await;
                 Box::new(result) as FetchPayload
             }),
         }]

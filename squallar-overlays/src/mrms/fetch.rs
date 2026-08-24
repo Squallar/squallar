@@ -22,7 +22,7 @@
 //! follows `glm::fetch`'s in-crate `roxmltree` shape instead, which is the same
 //! decision taken for the same reason.
 
-use chrono::{Duration, NaiveDate, NaiveDateTime, Utc};
+use chrono::{Duration, NaiveDate, NaiveDateTime};
 use squallar_source::origins::DataSources;
 
 use super::{MrmsFetchResult, MrmsGrid, MrmsProduct};
@@ -183,15 +183,29 @@ pub async fn latest_key(
     client: &reqwest::Client,
     sources: &DataSources,
     product: MrmsProduct,
+    at: NaiveDateTime,
 ) -> Result<String, FetchError> {
     let mut last_error: Option<FetchError> = None;
-    for (date, start_after) in listing_attempts(Utc::now().naive_utc()) {
+    for (date, start_after) in listing_attempts(at) {
         match list_day(client, sources, product, date, start_after).await {
             // `max()`, not `last()`: S3 answers in lexicographic key order
             // today, and these keys sort by their own timestamp, but the
             // ordering of a listing is the server's promise rather than ours.
+            //
+            // FILTERED TO `at` FIRST, and the filter is load-bearing whenever
+            // `at` is not now. `listing_attempts` bounds where the listing
+            // STARTS, never where it ends: asked about 15:00Z it still lists
+            // that whole UTC day, so the unfiltered `max()` would answer with
+            // the newest granule of the day — this evening's mosaic drawn over
+            // a mid-afternoon instant. A key with no decodable stamp is
+            // dropped rather than kept, because an undatable key cannot be
+            // shown to be at or before anything.
             Ok(keys) => {
-                if let Some(newest) = keys.into_iter().max() {
+                let newest = keys
+                    .into_iter()
+                    .filter(|key| key_valid_time(key).is_some_and(|valid| valid <= at))
+                    .max();
+                if let Some(newest) = newest {
                     return Ok(newest);
                 }
             }
@@ -199,31 +213,38 @@ pub async fn latest_key(
         }
     }
     Err(last_error.unwrap_or_else(|| {
-        // `absent`, not `transient`: an empty listing across today and
-        // yesterday is "the feed has published nothing for over a day", which
-        // is a real answer and must not read as a broken request.
+        // `absent`, not `transient`: an empty listing across the day of `at`
+        // and the one before it is "the feed published nothing for over a day
+        // up to that instant", which is a real answer and must not read as a
+        // broken request.
         FetchError::absent(format!(
-            "MRMS: no {} granule in the last two UTC days",
+            "MRMS: no {} granule in the two UTC days up to {at}",
             product.prefix_name(),
         ))
     }))
 }
 
-/// Download and decode the newest granule for `product`.
+/// Download and decode the newest granule for `product` at or before `at`.
+///
+/// `at` is the instant the pane depicts, which on a live pane is the wall clock
+/// — so a live pane's request is byte-for-byte the one this made before it took
+/// the argument.
 pub async fn fetch_latest(
     client: &reqwest::Client,
     sources: &DataSources,
     product: MrmsProduct,
+    at: NaiveDateTime,
 ) -> MrmsFetchResult {
-    MrmsFetchResult(fetch_latest_inner(client, sources, product).await)
+    MrmsFetchResult(fetch_latest_inner(client, sources, product, at).await)
 }
 
 async fn fetch_latest_inner(
     client: &reqwest::Client,
     sources: &DataSources,
     product: MrmsProduct,
+    at: NaiveDateTime,
 ) -> Result<MrmsGrid, FetchError> {
-    let key = latest_key(client, sources, product).await?;
+    let key = latest_key(client, sources, product, at).await?;
     log::info!("Fetching MRMS {} key {key}", product.as_str());
     fetch_key(client, sources, product, &key).await
 }
@@ -388,6 +409,103 @@ pub async fn fetch_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the live-network check reads the wall clock now: the fetch path
+    // takes the instant it is asked about.
+    use chrono::Utc;
+
+    fn instant(h: u32, m: u32) -> NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 8, 24)
+            .expect("a real date")
+            .and_hms_opt(h, m, 0)
+            .expect("a real time")
+    }
+
+    fn key_at(h: u32, m: u32) -> String {
+        format!(
+            "CONUS/MergedReflectivityQCComposite_00.50/20260824/\
+             MRMS_MergedReflectivityQCComposite_00.50_20260824-{h:02}{m:02}40.grib2.gz"
+        )
+        .replace(' ', "")
+    }
+
+    /// **The granule chosen for a past instant is the newest at or before it**,
+    /// not the newest that exists.
+    ///
+    /// This is the whole of the depicted-instant contract for this layer, and
+    /// the filter it tests is the one `listing_attempts` cannot supply: that
+    /// function bounds where a listing STARTS, and asked about 15:00Z it still
+    /// lists the rest of the UTC day. Before the filter, a pane parked at 15:00Z
+    /// was handed the 21:56Z mosaic — measured, and drawn over an afternoon scan.
+    #[test]
+    fn a_past_instant_takes_the_newest_granule_at_or_before_it() {
+        let keys = [
+            key_at(14, 50),
+            key_at(14, 58),
+            key_at(15, 4),
+            key_at(21, 56),
+        ];
+
+        let chosen = |t: NaiveDateTime| {
+            keys.iter()
+                .filter(|k| key_valid_time(k).is_some_and(|v| v <= t))
+                .max()
+                .cloned()
+        };
+
+        assert_eq!(
+            chosen(instant(15, 0)),
+            Some(key_at(14, 58)),
+            "the newest granule at or before 15:00Z is the 14:58Z one",
+        );
+        assert_eq!(
+            chosen(instant(23, 0)),
+            Some(key_at(21, 56)),
+            "asked about now, the answer is still the newest — a live pane's \
+             request must not move because this filter exists",
+        );
+        assert_eq!(
+            chosen(instant(14, 0)),
+            None,
+            "an instant before every granule takes none of them rather than \
+             the oldest",
+        );
+    }
+
+    /// A key whose stamp does not decode is dropped, never kept.
+    ///
+    /// An undatable key cannot be shown to be at or before anything, and
+    /// keeping it would let one malformed object win a `max()` over correctly
+    /// stamped ones — it sorts by bytes, not by time.
+    #[test]
+    fn an_undatable_key_is_not_eligible() {
+        assert_eq!(key_valid_time("CONUS/x/20260824/nonsense.grib2.gz"), None);
+        let keys = [
+            "CONUS/x/20260824/zzz_nonsense.grib2.gz".to_string(),
+            key_at(14, 58),
+        ];
+        let chosen = keys
+            .iter()
+            .filter(|k| key_valid_time(k).is_some_and(|v| v <= instant(15, 0)))
+            .max()
+            .cloned();
+        assert_eq!(chosen, Some(key_at(14, 58)));
+    }
+
+    /// The listing walks back from the instant it was asked about, not from now.
+    #[test]
+    fn the_listing_walks_back_from_the_instant_it_was_asked_about() {
+        let attempts = listing_attempts(instant(15, 0));
+        for (date, _) in &attempts {
+            assert!(
+                *date <= instant(15, 0).date(),
+                "{date} is after the instant asked about",
+            );
+        }
+        assert!(
+            attempts.iter().any(|(d, _)| *d == instant(15, 0).date()),
+            "the day of the instant must be listed: {attempts:?}",
+        );
+    }
 
     fn at(y: i32, m: u32, d: u32, h: u32, min: u32) -> NaiveDateTime {
         NaiveDate::from_ymd_opt(y, m, d)
@@ -550,7 +668,7 @@ mod tests {
         let sources = DataSources::production();
 
         for &product in MrmsProduct::all() {
-            let key = latest_key(&client, &sources, product)
+            let key = latest_key(&client, &sources, product, Utc::now().naive_utc())
                 .await
                 .unwrap_or_else(|e| panic!("{}: no key: {e}", product.as_str()));
             assert!(
@@ -559,7 +677,10 @@ mod tests {
             );
             assert!(!key.contains("5KM"), "{key} addresses the dead prefix");
 
-            let grid = match fetch_latest(&client, &sources, product).await.0 {
+            let grid = match fetch_latest(&client, &sources, product, Utc::now().naive_utc())
+                .await
+                .0
+            {
                 Ok(grid) => grid,
                 Err(e) => panic!("{}: {e}", product.as_str()),
             };

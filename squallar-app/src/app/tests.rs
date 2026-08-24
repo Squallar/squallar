@@ -1929,7 +1929,8 @@ fn learning_where_config_lives_loads_it() {
 
     let mut app = headless(bridge);
     assert_eq!(
-        app.gui.loop_speed_fps, 5.0,
+        app.gui.loop_speed_fps,
+        squallar_egui::pane::DEFAULT_LOOP_SPEED_FPS,
         "precondition: nowhere to load from yet",
     );
 
@@ -3232,6 +3233,16 @@ struct FrameRecorder {
 impl squallar_overlays::render::overlay_state::OverlayHandler for FrameRecorder {
     fn id(&self) -> LayerId {
         self.id.clone()
+    }
+    /// It implements `FrameSource` and records the frames it is asked for, so
+    /// this is what it is. It used to inherit `Live` from the trait's default
+    /// body while doing that — a frame source declaring it had no frames —
+    /// which is the class of silence removing that default exists to end.
+    fn time_axis(&self) -> squallar_source::time::TimeAxis {
+        squallar_source::time::TimeAxis::FrameSeries {
+            typical_step: std::time::Duration::from_secs(300),
+            extends_future: false,
+        }
     }
     fn surface(&self) -> squallar_overlays::render::overlay_state::Surface {
         squallar_overlays::render::overlay_state::Surface::Ground

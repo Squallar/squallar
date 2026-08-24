@@ -11,6 +11,7 @@ use crate::render::overlay_state::{
 };
 use crate::render::rasterize;
 use squallar_source::id::{LayerId, known};
+use squallar_source::time::TimeAxis;
 
 /// **One radar site, as this crate is allowed to know it.** Name and position
 /// and nothing else: the site table lives in `squallar-radar`, which this crate
@@ -53,6 +54,12 @@ impl RadarSitesHandler {
 impl OverlayHandler for RadarSitesHandler {
     fn id(&self) -> LayerId {
         known::RADAR_SITES
+    }
+
+    /// The radar network's sites are fixed installations. The list changes on
+    /// the scale of decommissionings, not of anything a pane's timeline reaches.
+    fn time_axis(&self) -> TimeAxis {
+        TimeAxis::Live
     }
     fn surface(&self) -> Surface {
         Surface::Ground

@@ -1098,9 +1098,13 @@ impl OverlayHandler for GmgsiHandler {
         let client = ctx.client.clone();
         let sources = ctx.sources.clone();
         let channel = self.view(pane).selected_channel;
+        // THE INSTANT THIS PANE DEPICTS, not the wall clock. `fetch_latest`
+        // already walks hourly prefixes backwards from whatever it is given, so
+        // handing it the depicted instant is the whole of this layer's answer
+        // to "what do you show at T" — it was simply being handed `now`.
         // Captured here rather than inside the future so the instant the
         // listing walks back from is the instant the round was asked for.
-        let now = chrono::Utc::now().naive_utc();
+        let now = ctx.as_of;
         vec![FetchTask {
             kind: known::GMGSI,
             future: Box::pin(async move {

@@ -246,7 +246,10 @@ pub fn parse_valid_window(
     let Some(pos) = text.find("VALID ") else {
         return (None, None);
     };
-    let line = text[pos + "VALID ".len()..].lines().next().unwrap_or_default();
+    let line = text[pos + "VALID ".len()..]
+        .lines()
+        .next()
+        .unwrap_or_default();
     let mut halves = line.split('-').map(str::trim);
     let from = halves.next().and_then(|h| resolve_ddhhmm(h, reference));
     let until = halves.next().and_then(|h| resolve_ddhhmm(h, reference));

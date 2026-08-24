@@ -181,6 +181,25 @@ impl OverlayHandler for SpcDiscussionHandler {
         TimeAxis::EventLifetime
     }
 
+    /// **One instant per stop, and that is the whole ask.**
+    ///
+    /// Same shape and same reason as the NWS alerts layer: a discussion carries
+    /// its own `VALID` window, and the picture at a stop is which discussions
+    /// are in force *then*. Nothing about a stop obliges this layer to hold a
+    /// *stretch* of source time the way lightning's fade ramp does — a
+    /// discussion issued two hours before a stop and one issued a minute before
+    /// it are both drawn at that stop if the stop is inside their windows, and
+    /// neither is found by reaching further back from it.
+    ///
+    /// A zero-width range is a real ask, not an empty one.
+    fn residency_for(
+        &self,
+        _pane: &PaneRef<'_>,
+        stops: &[chrono::NaiveDateTime],
+    ) -> squallar_source::time::Residency {
+        squallar_source::time::Residency::over(stops.iter().map(|&stop| (stop, stop)))
+    }
+
     fn default_enabled(&self) -> bool {
         true
     }
@@ -338,10 +357,9 @@ impl OverlayHandler for SpcDiscussionHandler {
             return vec![FetchTask {
                 kind: known::SPC_DISCUSSIONS,
                 future: Box::pin(async move {
-                    let result = crate::spc::discussion_archive::fetch_archived_discussions(
-                        &sources, at,
-                    )
-                    .await;
+                    let result =
+                        crate::spc::discussion_archive::fetch_archived_discussions(&sources, at)
+                            .await;
                     Box::new(SpcDiscussionFetchResult(result)) as FetchPayload
                 }),
             }];
