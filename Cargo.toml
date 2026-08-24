@@ -72,7 +72,7 @@ walkers = "=0.56.0"
 
 ewebsock = { version = "=0.8.0", default-features = false, features = ["tls"] }
 web-time = "=1.1.0"
-wgpu = { version = "=29.0.4", default-features = false }
+wgpu = { version = "=30.0.1", default-features = false }
 winit = "=0.30.13"
 
 # IEEE 754 binary16, for the volume grid's texel encoder.
@@ -103,7 +103,7 @@ half = { version = "=2.7.1", default-features = false }
 # Adds no package: naga is already in the graph via wgpu-core. Under
 # `resolver = "2"` the extra features do not reach a plain `cargo build`,
 # because dev-dependencies are not resolved for one.
-naga = { version = "=29.0.4", default-features = false, features = [
+naga = { version = "=30.0.1", default-features = false, features = [
     "wgsl-in",
     "glsl-out",
 ] }
