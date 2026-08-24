@@ -43,8 +43,8 @@ itself — see `data.md`, which records the measurements and the probe recipe.
 | Storm-relative velocity                       | ✅       | ✅          | ✅       |
 | 3D volumetric rendering                       | ✅       | ❌          | Partial |
 | Vertical cross-sections                       | ✅       | ❌          | ✅       |
-| MRMS national mosaic (CREF, precip rate)      | ✅       | ✅          | ❌       |
-| Global satellite mosaic (GMGSI, 4 channels)   | ✅       | ❌          | ❌       |
+| MRMS national mosaic (CREF, precip rate)      | ✅       | ✅          | ✅       |
+| Global satellite mosaic (GMGSI, 4 channels)   | ✅       | ❌          | ✅       |
 | Satellite QPE (precip beyond radar range)     | ❌       | ❓          | ❌       |
 | Third-party tile ingest (Rain Viewer et al.)  | ❌       | ❓          | ❌       |
 | VAD wind profiles                             | ✅       | ❓          | ❌       |
@@ -275,13 +275,16 @@ scale the hail products, and never draws them — that is not a sounding tool.
 | Animated loops            | ✅     | ✅   | ✅          | ❌       |
 | Multi-satellite (global)  | ✅     | ❌   | ❌          | ❌       |
 | CIRA GeoColor (day/night) | ❓     | ❌   | ❓          | ❌       |
-| Global IR mosaic (GMGSI)  | ❓     | ❌   | ❓          | ❌       |
+| Global IR mosaic (GMGSI)  | ❓     | ❌   | ❓          | ✅       |
 | Meteosat MTG / MSG-IODC   | ❓     | ❌   | ❓          | ❌       |
 | Himawari (W Pacific)      | ❓     | ❌   | ❓          | ❌       |
 
 Squallar reads the `noaa-goes19` and `noaa-goes18` buckets, but only for GLM
-lightning — no imagery product is decoded. GOES-19 replaced GOES-16 in the
-GOES-East slot in April 2025, which is why the row is no longer "GOES-16/18".
+lightning — no *GOES* imagery product is decoded. Global imagery does ship, from
+a different bucket: the GMGSI row above is the `noaa-gmgsi-pds` mosaic, which is
+blended from MSG, GOES and Himawari rather than read from a GOES bucket
+directly. GOES-19 replaced GOES-16 in the GOES-East slot in April 2025, which is
+why the row is no longer "GOES-16/18".
 
 Every ❌ above is reachable two different ways, and the choice is the whole
 design decision:
