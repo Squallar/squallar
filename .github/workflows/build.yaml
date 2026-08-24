@@ -821,10 +821,21 @@ jobs:
           echo "ok: $n file(s) staged"
           find dist -type f | sort | sed 's/^/  /'
 
+      # STILL THE RUSTDAR ROLE, DELIBERATELY. This job deploys the rustdar
+      # stack -- the bucket and distribution below are that stack's -- and these
+      # four literals are one set that moves together at cutover, not
+      # individually. The product rename left this one behind by accident and it
+      # was put back: a role named for the new product that does not exist yet
+      # fails the deploy at `configure-aws-credentials`, before anything
+      # downstream gets a chance to be wrong in a more informative way.
+      #
+      # At cutover, all four change at once: this ARN to
+      # github-actions-squallar, the sync target to s3://squallar-app-origin/,
+      # the distribution id to squallar.app's, and the region only if it moves.
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
-          role-to-assume: arn:aws:iam::803205869942:role/github-actions-squallar
+          role-to-assume: arn:aws:iam::803205869942:role/github-actions-rustdar
           aws-region: us-east-1
 
       # No second pass to fix up `Content-Type`. The AWS CLI takes it from
@@ -855,6 +866,72 @@ jobs:
       # a month and `/*` counts as one.
       - name: Invalidate the CloudFront cache
         run: aws cloudfront create-invalidation --distribution-id E2GQ1TB8D9TCQB --paths "/*"
+
+  # The marketing site at squallar.com. Nothing is built: `www/` is hand-written
+  # HTML, one stylesheet and the screenshots, so this job stages a directory and
+  # syncs it. It does not depend on `build-success` -- a Rust test failure has no
+  # bearing on whether a static page is publishable, and coupling them would mean
+  # a red radar test blocks a typo fix on a landing page.
+  #
+  # The bucket, distribution and role are applied and verified: squallar.com
+  # answers on a valid certificate, its apex CNAME is flattened by Cloudflare to
+  # the distribution, and it correctly does NOT carry the isolation headers the
+  # app's origin sends. The deploy role trusts this repository during the org
+  # move, so this runs before the rename as well as after.
+  deploy-www:
+    name: Deploy marketing site to CloudFront
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: cloudfront-www
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Same reasoning as the app's guard: `s3 sync --delete` against a tree that
+      # is missing would empty the bucket rather than fail, so prove the tree is
+      # there before credentials exist.
+      - name: Refuse to sync an empty tree
+        run: |
+          test -f www/index.html || { echo "::error::www/index.html is missing"; exit 1; }
+          test -f www/style.css  || { echo "::error::www/style.css is missing"; exit 1; }
+          n=$(find www -type f | wc -l)
+          test "$n" -ge 2 || { echo "::error::www holds $n file(s)"; exit 1; }
+          echo "ok: $n file(s)"
+          find www -type f | sort | sed 's/^/  /'
+
+      # The page references screenshots by name. A missing one is a broken image
+      # on the landing page rather than a build failure, which is exactly the
+      # kind of thing nobody notices until someone else does -- so name them.
+      - name: Warn on screenshots the page references but the tree lacks
+        run: |
+          missing=0
+          for ref in $(grep -oE 'screenshots/[A-Za-z0-9._-]+\.png' www/index.html | sort -u); do
+            if [ ! -f "www/$ref" ]; then
+              echo "::warning::www/index.html references $ref, which is not in the tree"
+              missing=$((missing + 1))
+            fi
+          done
+          echo "$missing referenced screenshot(s) missing"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::803205869942:role/github-actions-squallar
+          aws-region: us-east-1
+
+      - name: Sync to S3
+        run: aws s3 sync --delete www/ s3://squallar-com-origin/
+
+      # Same whole-distribution reasoning as the app: nothing here is
+      # content-hashed either, so a targeted list would have to name every file.
+      # `terraform output www_distribution_id` in infra/squallar is where this
+      # came from and where it goes to be checked.
+      - name: Invalidate the CloudFront cache
+        run: aws cloudfront create-invalidation --distribution-id E1D9T0MUVYI8FD --paths "/*"
 
   # The Pages tree is no longer a build output. `.github/pages-tombstone/` is two
   # hand-written files that send the old origin's visitors to the new one and

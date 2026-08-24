@@ -14,7 +14,7 @@
 //! client construction calls it first.
 
 /// `api.weather.gov` rejects requests without a contact-bearing User-Agent.
-pub const USER_AGENT: &str = "squallar/1.0 (https://github.com/USA-RedDragon/rustdar)";
+pub const USER_AGENT: &str = "squallar/1.0 (https://github.com/Squallar/squallar)";
 
 /// Install *ring* as the process-wide default rustls [`CryptoProvider`].
 ///

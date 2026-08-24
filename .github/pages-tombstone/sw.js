@@ -1,5 +1,5 @@
 /*
- * The tombstone service worker for https://usa-reddragon.github.io/rustdar/.
+ * The tombstone service worker for https://squallar.github.io/squallar/.
  *
  * squallar now lives at https://rustdar.mcswain.dev/. A redirecting index.html on
  * the old origin, on its own, reaches almost nobody who ever used the site:
