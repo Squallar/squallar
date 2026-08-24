@@ -1,4 +1,5 @@
 pub mod alert;
+pub mod archive;
 pub mod colors;
 pub mod fetch;
 pub mod zone_pack;

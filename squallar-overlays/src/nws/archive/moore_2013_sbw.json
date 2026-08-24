@@ -1,0 +1,217 @@
+{
+ "type": "FeatureCollection",
+ "features": [
+  {
+   "type": "Feature",
+   "id": "OUN.SV.W.0318.2013-05-20T19:38:00Z",
+   "properties": {
+    "status": "CON",
+    "phenomena": "SV",
+    "significance": "W",
+    "ps": "Severe Thunderstorm Warning",
+    "wfo": "OUN",
+    "eventid": 318,
+    "polygon_begin": "2013-05-20T19:38:00Z",
+    "polygon_end": "2013-05-20T20:15:00Z",
+    "expire": "2013-05-20T20:15:00Z",
+    "hvtec_nwsli": null,
+    "year": 2013,
+    "product_id": "201305201938-KOUN-WWUS54-SVSOUN",
+    "issue": "2013-05-20T19:22:00Z",
+    "expire_utc": "2013-05-20T20:15:00Z",
+    "href": "https://mesonet.agron.iastate.edu/vtec/?year=2013&wfo=KOUN&phenomena=SV&significance=W&eventid=0318",
+    "link": "<a href='https://mesonet.agron.iastate.edu/vtec/?year=2013&wfo=KOUN&phenomena=SV&significance=W&eventid=0318'>Severe Thunderstorm Warning 318</a> &nbsp; ",
+    "windtag": null,
+    "hailtag": null,
+    "tornadotag": null,
+    "damagetag": null,
+    "waterspouttag": null,
+    "is_emergency": false,
+    "is_pds": false,
+    "windthreat": null,
+    "hailthreat": null,
+    "product_signature": null,
+    "floodtag_damage": null,
+    "squalltag": null,
+    "max_windtag": null,
+    "max_hailtag": null,
+    "max_is_pds": false,
+    "max_is_emergency": false,
+    "max_floodtag_damage": null
+   },
+   "geometry": {
+    "type": "MultiPolygon",
+    "coordinates": [
+     [
+      [
+       [
+        -98.55,
+        34.09
+       ],
+       [
+        -98.34,
+        34.32
+       ],
+       [
+        -98.12,
+        34.12
+       ],
+       [
+        -98.49,
+        33.92
+       ],
+       [
+        -98.55,
+        34.09
+       ]
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "OUN.TO.W.0025.2013-05-20T19:56:00Z",
+   "properties": {
+    "status": "CON",
+    "phenomena": "TO",
+    "significance": "W",
+    "ps": "Tornado Warning",
+    "wfo": "OUN",
+    "eventid": 25,
+    "polygon_begin": "2013-05-20T19:56:00Z",
+    "polygon_end": "2013-05-20T20:15:00Z",
+    "expire": "2013-05-20T20:15:00Z",
+    "hvtec_nwsli": null,
+    "year": 2013,
+    "product_id": "201305201956-KOUN-WWUS54-SVSOUN",
+    "issue": "2013-05-20T19:42:00Z",
+    "expire_utc": "2013-05-20T20:15:00Z",
+    "href": "https://mesonet.agron.iastate.edu/vtec/?year=2013&wfo=KOUN&phenomena=TO&significance=W&eventid=0025",
+    "link": "<a href='https://mesonet.agron.iastate.edu/vtec/?year=2013&wfo=KOUN&phenomena=TO&significance=W&eventid=0025'>Tornado Warning 25</a> &nbsp; ",
+    "windtag": null,
+    "hailtag": null,
+    "tornadotag": null,
+    "damagetag": null,
+    "waterspouttag": null,
+    "is_emergency": false,
+    "is_pds": false,
+    "windthreat": null,
+    "hailthreat": null,
+    "product_signature": null,
+    "floodtag_damage": null,
+    "squalltag": null,
+    "max_windtag": null,
+    "max_hailtag": null,
+    "max_is_pds": false,
+    "max_is_emergency": false,
+    "max_floodtag_damage": null
+   },
+   "geometry": {
+    "type": "MultiPolygon",
+    "coordinates": [
+     [
+      [
+       [
+        -97.99,
+        34.49
+       ],
+       [
+        -97.97,
+        34.65
+       ],
+       [
+        -97.49,
+        34.8
+       ],
+       [
+        -97.44,
+        34.49
+       ],
+       [
+        -97.99,
+        34.49
+       ]
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "OUN.SV.W.0319.2013-05-20T19:39:00Z",
+   "properties": {
+    "status": "NEW",
+    "phenomena": "SV",
+    "significance": "W",
+    "ps": "Severe Thunderstorm Warning",
+    "wfo": "OUN",
+    "eventid": 319,
+    "polygon_begin": "2013-05-20T19:39:00Z",
+    "polygon_end": "2013-05-20T20:25:00Z",
+    "expire": "2013-05-20T20:45:00Z",
+    "hvtec_nwsli": null,
+    "year": 2013,
+    "product_id": "201305201939-KOUN-WUUS54-SVROUN",
+    "issue": "2013-05-20T19:39:00Z",
+    "expire_utc": "2013-05-20T20:45:00Z",
+    "href": "https://mesonet.agron.iastate.edu/vtec/?year=2013&wfo=KOUN&phenomena=SV&significance=W&eventid=0319",
+    "link": "<a href='https://mesonet.agron.iastate.edu/vtec/?year=2013&wfo=KOUN&phenomena=SV&significance=W&eventid=0319'>Severe Thunderstorm Warning 319</a> &nbsp; ",
+    "windtag": null,
+    "hailtag": null,
+    "tornadotag": null,
+    "damagetag": null,
+    "waterspouttag": null,
+    "is_emergency": false,
+    "is_pds": false,
+    "windthreat": null,
+    "hailthreat": null,
+    "product_signature": null,
+    "floodtag_damage": null,
+    "squalltag": null,
+    "max_windtag": null,
+    "max_hailtag": null,
+    "max_is_pds": false,
+    "max_is_emergency": false,
+    "max_floodtag_damage": null
+   },
+   "geometry": {
+    "type": "MultiPolygon",
+    "coordinates": [
+     [
+      [
+       [
+        -98.33,
+        34.31
+       ],
+       [
+        -97.97,
+        34.65
+       ],
+       [
+        -97.64,
+        34.45
+       ],
+       [
+        -98.1,
+        34.14
+       ],
+       [
+        -98.13,
+        34.15
+       ],
+       [
+        -98.15,
+        34.13
+       ],
+       [
+        -98.33,
+        34.31
+       ]
+      ]
+     ]
+    ]
+   }
+  }
+ ]
+}
