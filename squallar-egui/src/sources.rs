@@ -458,7 +458,7 @@ mod registry_identity_tests {
             ("SpcOutlook", TimeAxis::EventLifetime),
             ("SpcFireOutlook", TimeAxis::EventLifetime),
             ("Radar", volume_cadence),
-            ("SpcDiscussions", TimeAxis::Live),
+            ("SpcDiscussions", TimeAxis::EventLifetime),
             ("NwsAlerts", TimeAxis::EventLifetime),
             ("StormReports", TimeAxis::EventLifetime),
             ("Lightning", TimeAxis::EventLifetime),

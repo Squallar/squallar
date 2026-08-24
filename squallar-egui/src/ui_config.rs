@@ -107,6 +107,27 @@ struct PaneConfig {
     /// exists to forbid.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     viewing_live: bool,
+    /// **Whether this pane had a loop armed**, and whether it was playing.
+    ///
+    /// `"playing"`, `"paused"`, or absent for a pane with no loop. A loop is UI
+    /// state a user set up deliberately — a span, a transport layer, a rate —
+    /// and "reopen is exactly 1:1" does not carve out the expensive parts.
+    /// Before this, closing the app on a playing loop reopened on a still
+    /// picture with no sign that anything had been lost.
+    ///
+    /// **What is restored is the ARM, not the frames.** Frames are textures and
+    /// were never persisted; a restored loop re-lists and re-fetches exactly as
+    /// arming it by hand does, and converges on the same picture. That is the
+    /// same bargain a restored parked scan already makes — [`Self::as_of`]
+    /// names an instant whose volume is refetched on open — and it is why this
+    /// is three states rather than a frame index: an index into a frame list
+    /// that does not exist yet would name nothing.
+    ///
+    /// A string rather than a bool pair because the three states are exclusive
+    /// and a `(armed, playing)` pair can spell a fourth that means nothing.
+    /// Read tolerantly: an unrecognised value reads as no loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    loop_playback: Option<String>,
     /// **Which link group this pane belongs to**, as the group's index;
     /// `null` for a pane in no group at all.
     ///
@@ -355,6 +376,43 @@ impl<'de> Deserialize<'de> for SlotList {
 /// The spelling [`PaneConfig::as_of`] is written and read in.
 const AS_OF_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
 
+/// The three states [`PaneConfig::loop_playback`] can hold.
+const LOOP_PLAYING: &str = "playing";
+const LOOP_PAUSED: &str = "paused";
+
+/// **What this pane's loop was doing**, from its transport layer's phase, or
+/// `None` for a pane with no loop.
+///
+/// The transport is the timeline playback walks, so its phase is the pane's
+/// loop state; the other armed layers follow it. The transient phases —
+/// listing, rendering — collapse to `paused`, because what they have in common
+/// with a paused loop is "armed, not advancing", and a config written mid-fetch
+/// must not reopen into a state that claims frames it never had.
+fn loop_playback_of(pane: &PaneState) -> Option<String> {
+    match pane.transport_state().phase {
+        crate::pane::LoopPhase::Inactive => None,
+        crate::pane::LoopPhase::Playing => Some(LOOP_PLAYING.to_string()),
+        crate::pane::LoopPhase::FetchingScanList
+        | crate::pane::LoopPhase::Rendering
+        | crate::pane::LoopPhase::Ready
+        | crate::pane::LoopPhase::Paused => Some(LOOP_PAUSED.to_string()),
+    }
+}
+
+/// **Whether a restored pane wants a loop armed, and whether it should play.**
+///
+/// `None` for no loop. Read tolerantly, like every other field in this file: a
+/// value that is neither spelling reads as no loop rather than as an error,
+/// because a config that has been hand-edited or written by a future build must
+/// still open.
+pub fn loop_arm_from_config(value: Option<&str>) -> Option<crate::pane::LoopArm> {
+    match value {
+        Some(v) if v == LOOP_PLAYING => Some(crate::pane::LoopArm { playing: true }),
+        Some(v) if v == LOOP_PAUSED => Some(crate::pane::LoopArm { playing: false }),
+        _ => None,
+    }
+}
+
 /// A parked instant, or `None` for anything this build cannot read as one.
 fn parse_as_of(text: &str) -> Option<chrono::NaiveDateTime> {
     chrono::NaiveDateTime::parse_from_str(text, AS_OF_FORMAT).ok()
@@ -587,6 +645,7 @@ impl Default for PaneConfig {
             time_step_secs: 600,
             as_of: None,
             viewing_live: true,
+            loop_playback: None,
             group: default_group(),
             time_link: true,
             viewport_link: true,
@@ -1070,7 +1129,7 @@ impl Default for UiConfig {
             viewport_sync: true,
             sync_layers: true,
             loop_lookback_secs: 3600,
-            loop_speed_fps: 5.0,
+            loop_speed_fps: crate::pane::DEFAULT_LOOP_SPEED_FPS,
             time_step_secs: 600,
             panes: vec![PaneConfig::default()],
             preferences: UserPreferences::default(),
@@ -1131,6 +1190,7 @@ impl super::Gui {
                     spc_day: OutlookDay::Day1,
                     time_step_secs: pane.time.step.as_secs(),
                     viewing_live: pane.viewing_live,
+                    loop_playback: loop_playback_of(pane),
                     as_of: match pane.time.mode {
                         crate::pane::TimeMode::Live => None,
                         crate::pane::TimeMode::AsOf(at) => {
@@ -1452,6 +1512,9 @@ impl super::Gui {
             }
             pane.time.step = crate::pane::TimeStep::from_secs(pc.time_step_secs);
             pane.viewing_live = pc.viewing_live;
+            // A request for the app to act on, not a state to assume: arming a
+            // loop needs a listing dispatch this crate cannot make.
+            pane.loop_arm_pending = loop_arm_from_config(pc.loop_playback.as_deref());
             // `set_time_mode`, not a bare field write: it settles every layer's
             // playhead onto the restored clock. Assigning the field left the
             // playheads where `Gui::new` put them, so the reload path had to
@@ -1814,6 +1877,10 @@ fn sanitize_config_tree(value: &mut serde_json::Value) {
         root.remove("overlay_states");
     }
 }
+
+#[path = "ui_config/loop_persistence_tests.rs"]
+#[cfg(test)]
+mod loop_persistence_tests;
 
 #[path = "ui_config/live_chunks_config_tests.rs"]
 #[cfg(test)]

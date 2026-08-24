@@ -151,6 +151,8 @@ fn seed(app: &mut crate::app::App, id: &LayerId) {
                 ]],
                 feature: a_feature(),
                 concerning: None,
+                valid_from: None,
+                valid_until: None,
             };
             Box::new(discussion::SpcDiscussionFetchResult(Ok(vec![md])))
         }

@@ -5,6 +5,7 @@ use crate::render::controls::{ControlEffect, ControlItem, ControlUpdate};
 use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{FetchPayload, OverlayHandler, OverlayItem, RenderMode};
 use squallar_source::id::{LayerId, known};
+use squallar_source::time::TimeAxis;
 
 /// Toggle state only: the legend is a screen-space HUD element, not
 /// geo-projected, so the draw loop renders it directly.
@@ -21,6 +22,12 @@ impl ColorScaleHandler {
 impl OverlayHandler for ColorScaleHandler {
     fn id(&self) -> LayerId {
         known::COLOR_SCALE
+    }
+
+    /// The colour ramp is a legend, not an observation: it depicts the product
+    /// and the scale, and nothing about it is a function of any instant.
+    fn time_axis(&self) -> TimeAxis {
+        TimeAxis::Live
     }
     fn surface(&self) -> Surface {
         Surface::Glass

@@ -4078,7 +4078,14 @@ fn settle_loop_phase(
         return false;
     }
     if ls.frames.iter().any(|f| f.image.is_some()) {
-        ls.phase = squallar_egui::pane::LoopPhase::Ready;
+        // A restored loop that was playing when its config was written starts
+        // playing here, at the first moment "play" means anything, and the
+        // request is spent as it fires — a pause afterwards stays paused.
+        ls.phase = if std::mem::take(&mut ls.autoplay_on_ready) {
+            squallar_egui::pane::LoopPhase::Playing
+        } else {
+            squallar_egui::pane::LoopPhase::Ready
+        };
         return false;
     }
     if still_arriving(ls) {

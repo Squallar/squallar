@@ -1,6 +1,6 @@
 use super::*;
 use crate::Gui;
-use squallar_kv::{KvStore, MemoryKvStore};
+use squallar_kv::MemoryKvStore;
 
 /// The instant a pane is parked on survives a save/load cycle.
 ///

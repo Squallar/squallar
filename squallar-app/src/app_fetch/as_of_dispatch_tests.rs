@@ -19,6 +19,20 @@ fn ts(minute: u32) -> chrono::NaiveDateTime {
 }
 
 /// Every registered layer, with the arm it declares.
+/// **Whether a layer's answer to "what do you show at `T`" depends on `T`.**
+///
+/// Both arms that have a past: an `EventLifetime` layer's picture is which of
+/// its items are valid then, a `FrameSeries` layer's is the newest frame at or
+/// before then. `Live` is the arm that declares no history, so its answer is
+/// the same at every instant and it keeps the wall clock.
+///
+/// One predicate for both laws below, and it reads the DECLARED arm rather than
+/// naming layers — so a layer that changes arm changes what these assert
+/// instead of drifting from it.
+fn has_a_past(axis: &TimeAxis) -> bool {
+    matches!(axis, TimeAxis::EventLifetime | TimeAxis::FrameSeries { .. })
+}
+
 fn declared(gui: &Gui) -> Vec<(LayerId, TimeAxis)> {
     gui.overlays
         .handlers()
@@ -61,27 +75,24 @@ fn a_scrubbed_pane_moves_the_clock_for_the_as_of_dependent_layers_only() {
         .set_time_mode(TimeMode::AsOf(scrub));
 
     let layers = declared(&gui);
-    let event: Vec<&LayerId> = layers
+    let moved: Vec<&LayerId> = layers
         .iter()
-        .filter(|(_, axis)| matches!(axis, TimeAxis::EventLifetime))
+        .filter(|(_, axis)| has_a_past(axis))
         .map(|(id, _)| id)
         .collect();
     assert!(
-        event.len() >= 2,
-        "non-triviality floor: alerts and lightning both declare EventLifetime",
+        moved.len() >= 2,
+        "non-triviality floor: alerts, lightning and the three frame layers \
+         all have a past",
     );
     assert!(
-        event.len() < layers.len(),
+        moved.len() < layers.len(),
         "non-triviality floor: and not every layer does, so \"only\" is a \
          distinguishable claim",
     );
 
     for (id, axis) in &layers {
-        let want = if matches!(axis, TimeAxis::EventLifetime) {
-            scrub
-        } else {
-            clock
-        };
+        let want = if has_a_past(axis) { scrub } else { clock };
         assert_eq!(
             as_of_for_layer(&gui, 0, id, clock),
             want,
@@ -120,20 +131,14 @@ fn a_scrubbed_panes_fetch_is_built_for_the_instant_it_depicts() {
         .set_time_mode(TimeMode::AsOf(scrub));
 
     let layers = declared(&gui);
-    let (event, rest): (Vec<_>, Vec<_>) = layers
-        .iter()
-        .partition(|(_, axis)| matches!(axis, TimeAxis::EventLifetime));
+    let (moved, rest): (Vec<_>, Vec<_>) = layers.iter().partition(|(_, axis)| has_a_past(axis));
     assert!(
-        !event.is_empty() && !rest.is_empty(),
+        !moved.is_empty() && !rest.is_empty(),
         "non-triviality floor: both sides of the distinction must be occupied",
     );
 
     for (id, axis) in &layers {
-        let want = if matches!(axis, TimeAxis::EventLifetime) {
-            scrub
-        } else {
-            clock
-        };
+        let want = if has_a_past(axis) { scrub } else { clock };
         let config = fetch_config_for_layer(&gui, 0, id, base_config(clock));
         assert_eq!(
             config.as_of,

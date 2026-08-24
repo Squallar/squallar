@@ -517,7 +517,7 @@ fn decode_run_choice(text: &str, now: chrono::NaiveDateTime) -> Option<chrono::N
     // keeps "which run did I ask for" answerable from the config alone.
     let text = text.strip_prefix(ABSOLUTE_RUN_PREFIX)?;
     let at = chrono::NaiveDateTime::parse_from_str(text, ABSOLUTE_RUN_FORMAT).ok()?;
-    Some(at.with_minute(0)?.with_second(0)?.with_nanosecond(0)?)
+    at.with_minute(0)?.with_second(0)?.with_nanosecond(0)
 }
 
 /// **What a resident grid is, in one phrase**: its valid time and forecast

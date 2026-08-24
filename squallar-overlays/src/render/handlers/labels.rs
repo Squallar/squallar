@@ -5,6 +5,7 @@ use crate::render::controls::{ControlEffect, ControlItem, ControlUpdate};
 use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{FetchPayload, OverlayHandler, OverlayItem, RenderMode};
 use squallar_source::id::{LayerId, known};
+use squallar_source::time::TimeAxis;
 
 /// Toggle state only: the tiles are rendered by the walkers integration in
 /// `squallar-egui`.
@@ -21,6 +22,12 @@ impl CityLabelsHandler {
 impl OverlayHandler for CityLabelsHandler {
     fn id(&self) -> LayerId {
         known::CITY_LABELS
+    }
+
+    /// Place names do not move with the clock. A city is where it is at every
+    /// instant a pane can depict.
+    fn time_axis(&self) -> TimeAxis {
+        TimeAxis::Live
     }
     fn surface(&self) -> Surface {
         Surface::Ground

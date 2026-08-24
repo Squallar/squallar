@@ -5,6 +5,7 @@ use crate::render::controls::{ControlEffect, ControlItem, ControlUpdate};
 use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{FetchPayload, OverlayHandler, OverlayItem, RenderMode};
 use squallar_source::id::{LayerId, known};
+use squallar_source::time::TimeAxis;
 
 /// Toggle state only: the draw loop renders the marker per frame.
 pub(crate) struct UserLocationHandler {
@@ -20,6 +21,15 @@ impl UserLocationHandler {
 impl OverlayHandler for UserLocationHandler {
     fn id(&self) -> LayerId {
         known::USER_LOCATION
+    }
+
+    /// **Where the operator is standing now**, which is the only thing this
+    /// layer can honestly draw. It holds no track and no history: scrubbing a
+    /// pane to last Tuesday cannot say where the device was then, and drawing
+    /// today's position over last Tuesday's storm would be a claim it never
+    /// made. `Live` is the true answer, not the convenient one.
+    fn time_axis(&self) -> TimeAxis {
+        TimeAxis::Live
     }
     fn surface(&self) -> Surface {
         Surface::Ground

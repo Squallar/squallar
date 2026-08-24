@@ -382,6 +382,8 @@ fn a_discussion() -> squallar_overlays::spc::discussion::SpcDiscussion {
             HatchPattern::None,
         ),
         concerning: None,
+        valid_from: None,
+        valid_until: None,
     }
 }
 

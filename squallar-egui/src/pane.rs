@@ -491,8 +491,29 @@ pub enum LoopLoading {
 /// the owning layer's own code names ([`squallar_radar::loop_geometry::LoopGeometry`]),
 /// so a second frame-series layer inherits a timeline rather than three
 /// NEXRAD fields.
+/// **A restored pane's loop request**: arm it, and whether to start it playing.
+///
+/// Lives here rather than with the config format because it describes pane
+/// state; the file format's job is only to spell it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopArm {
+    pub playing: bool,
+}
+
 pub struct LayerTimeState {
     pub phase: LoopPhase,
+    /// **Start playing the moment this loop is first ready**, then clear.
+    ///
+    /// Set only by a restored loop that was playing when the config was
+    /// written. A loop reaches [`LoopPhase::Ready`] some seconds after it is
+    /// armed — a listing, then enough frames rendered to be worth playing —
+    /// and there is no earlier moment at which "play" is a meaningful
+    /// instruction, so the request has to wait here rather than be issued at
+    /// arming time.
+    ///
+    /// Cleared when it fires, so a loop the user pauses afterwards stays
+    /// paused: this restores a session, it does not keep re-asserting it.
+    pub autoplay_on_ready: bool,
     /// **Which frame this layer is showing, as an index into [`Self::frames`]
     /// — a cache, not a decision.** The decision is the pane's
     /// [`PaneTimePosture::mode`]: the frame shown is the latest whose stamp is
@@ -706,6 +727,20 @@ pub struct PaneTimePosture {
     pub step: TimeStep,
 }
 
+/// **The loop playback rate a pane is born with**, frames per second — the one
+/// definition of it.
+///
+/// Three places need this number: the posture below, `UiConfig`'s own default,
+/// and the `Gui` field the timeline's Speed slider reads. They were three
+/// separate literals, which is three chances for a change to move two of them;
+/// the doc on [`PaneTimePosture::default`] already promised they agreed without
+/// anything making them.
+///
+/// It is a starting value, not a policy: the slider in the timeline writes it
+/// per session and the config file persists whatever the user left it at, so
+/// changing this moves only panes that have never been configured.
+pub const DEFAULT_LOOP_SPEED_FPS: f32 = 10.0;
+
 /// The posture a pane is born with: the same numbers the config file's own
 /// defaults carry, so a pane that has never been configured and a pane loaded
 /// from a default file are the same pane.
@@ -714,7 +749,7 @@ impl Default for PaneTimePosture {
         Self {
             mode: TimeMode::Live,
             span_secs: 3600,
-            speed_fps: 5.0,
+            speed_fps: DEFAULT_LOOP_SPEED_FPS,
             step: TimeStep::Secs(600),
         }
     }
@@ -953,6 +988,16 @@ pub struct PaneState {
     /// [`PaneConfigBaggage`]. Written by `load_ui_config`, read only by
     /// `ui_config_json`, and never acted on in between.
     pub config_baggage: PaneConfigBaggage,
+    /// **A loop this pane was restored wanting**, consumed once by the app when
+    /// it hydrates the reload — `None` on a pane that had no loop, and `None`
+    /// again the moment it has been acted on.
+    ///
+    /// A request rather than a state, because arming a loop needs a fetch
+    /// config, a listing dispatch and a download manager, none of which this
+    /// crate has. The alternative — restoring a phase directly — would put the
+    /// pane in `Playing` with an empty frame list, which is a picture of
+    /// nothing that claims to be a loop.
+    pub loop_arm_pending: Option<LoopArm>,
     /// **Where this pane sits on the clock, and how it moves along it.** The
     /// pane's own posture, shared by every layer it draws — the layers keep
     /// their own [`LayerTimeState`] on their slots.
@@ -995,6 +1040,7 @@ impl LayerTimeState {
     pub fn new() -> Self {
         Self {
             phase: LoopPhase::Inactive,
+            autoplay_on_ready: false,
             current_frame: 0,
             playhead_qualifies: true,
             frames: Vec::new(),
@@ -1593,6 +1639,7 @@ impl PaneState {
             // that seeding and now the order comes with them.
             layers: LayerStack::default(),
             config_baggage: PaneConfigBaggage::default(),
+            loop_arm_pending: None,
             time: PaneTimePosture::default(),
             transport: known::RADAR,
             orphan_time: LayerTimeState::new(),

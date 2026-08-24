@@ -12931,6 +12931,8 @@ fn an_md_still_labels_itself_on_a_frame_with_no_click() {
             squallar_overlays::types::HatchPattern::None,
         ),
         concerning: None,
+        valid_from: None,
+        valid_until: None,
     };
     h.gui_mut().overlays.apply_fetch_result(
         OverlayFetchResult {

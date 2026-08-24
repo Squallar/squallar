@@ -713,7 +713,7 @@ impl super::App {
                 pane_idx,
                 lookback_secs,
             } => {
-                self.handle_enable_loop(pane_idx, lookback_secs);
+                self.handle_enable_loop(pane_idx, lookback_secs, false);
             }
             GuiAction::DisableLoop { pane_idx } => {
                 self.handle_disable_loop(pane_idx);
@@ -1493,7 +1493,12 @@ impl super::App {
     /// losing it means the pane has no loop; losing a second layer means that
     /// layer goes back to drawing live, which is what it did before it was
     /// armed.
-    fn handle_enable_loop(&mut self, pane_idx: usize, lookback_secs: u64) {
+    /// `autoplay` starts the loop the moment it becomes playable, for a loop
+    /// restored from a config that was written while it played. It rides in
+    /// here rather than in a method of its own because this already holds the
+    /// pane borrow it needs, and a second door into `Gui` for one boolean is a
+    /// coupling this crate's ceiling does not have room for.
+    fn handle_enable_loop(&mut self, pane_idx: usize, lookback_secs: u64, autoplay: bool) {
         // One clock reading for both halves of the range, so a forward-reaching
         // rail's past and future cannot be anchored a tick apart.
         let now = chrono::Utc::now().naive_utc();
@@ -1501,6 +1506,9 @@ impl super::App {
         // layer's listing task inside it — see `begin_loop_for_pane`.
         let config = self.fetch_config();
         let (panes, overlays) = self.gui.panes_and_overlays_mut();
+        if let Some(pane) = panes.get_mut(pane_idx).filter(|_| autoplay) {
+            pane.transport_state_mut().autoplay_on_ready = true;
+        }
         let dispatch = begin_loop_for_pane(
             panes,
             overlays,
@@ -1700,6 +1708,21 @@ impl super::App {
             // capture, where a 3x 1206x2622 frame takes long enough to matter.
             self.manual_nav_pending = true;
             self.seek_pane_to(pane_idx, site, instant, false, MoveClock::No);
+        }
+
+        // RE-ARM THE LOOPS THIS SESSION WAS RESTORED WITH.
+        //
+        // The frames were never persisted -- they are textures -- so what is
+        // restored is the ask, and the listing and downloads run exactly as they
+        // do when the loop is armed by hand. That is the same bargain the parked
+        // scan above makes: the config names an instant, and the volume for it
+        // is fetched on open.
+        //
+        // After the parked seek, not before: a loop is built around the instant
+        // its pane depicts, and arming one against a clock that is about to move
+        // would list the wrong window.
+        for (pane_idx, arm, lookback) in std::mem::take(&mut self.loop_arm_pending) {
+            self.handle_enable_loop(pane_idx, lookback, arm.playing);
         }
     }
 
@@ -2266,7 +2289,9 @@ impl super::App {
             .map(|(pane_idx, pane)| (pane_idx, pane.loop_span_secs(overlays)))
             .collect();
         for (pane_idx, lookback_secs) in to_reinit {
-            self.handle_enable_loop(pane_idx, lookback_secs);
+            // Not a restore: a re-init keeps whatever the loop was already
+            // doing, and asserting "play" here would restart a paused one.
+            self.handle_enable_loop(pane_idx, lookback_secs, false);
         }
     }
 }
@@ -3140,11 +3165,24 @@ fn plan_loop_append(
 /// **The instant a layer's raster should depict, for the pane it is dispatched
 /// from.**
 ///
-/// Only a [`TimeAxis::EventLifetime`] layer reads it: its picture is *which of
-/// its items are valid then*, so a scrub has to move it. A `Live` layer draws
-/// whatever it last fetched and ignores the field by contract, and a
-/// `FrameSeries` layer's picture is one named frame rather than a function of
-/// an instant — both keep the wall clock, so neither's bytes move.
+/// Every layer that has a past gets it. An [`TimeAxis::EventLifetime`] layer's
+/// picture is *which of its items are valid then*; a [`TimeAxis::FrameSeries`]
+/// layer's is *the newest frame at or before then*. Different questions, one
+/// input, and both are answers to "what do you show at `T`".
+///
+/// **`FrameSeries` used to be excluded here, and that was the uneven surface.**
+/// The argument was that a frame layer's picture is one *named* frame rather
+/// than a function of an instant — true of the drawing, false of the fetching.
+/// Left on the wall clock, a pane parked at 15:00Z fetched the 21:56Z mosaic
+/// and drew it over a scan six hours older, and the only way to reach the past
+/// at all was to arm a loop by hand. Naming the frame is
+/// [`FrameSource::latest_at`]'s job; choosing which instant to name it at is
+/// this one's.
+///
+/// A `Live` layer keeps the wall clock, because that is its honest answer:
+/// `Live` is the arm that means "I hold no history", so the newest thing it has
+/// is what it shows at every instant. That is a declaration each layer now
+/// makes in its own body — [`SourceHandler::time_axis`] has no default.
 ///
 /// `fallback` is the page's own clock, captured once by the caller and handed
 /// to `now` as well, so a live pane's two fields cannot drift apart.
@@ -3160,14 +3198,15 @@ fn as_of_for_layer(
     let Some(instant) = pane.time.mode.as_of() else {
         return fallback;
     };
-    let event_lifetime = gui.overlays.handlers().any(|handler| {
+    let has_a_past = gui.overlays.handlers().any(|handler| {
         handler.id() == *id
             && matches!(
                 handler.time_axis(),
                 squallar_source::time::TimeAxis::EventLifetime
+                    | squallar_source::time::TimeAxis::FrameSeries { .. }
             )
     });
-    if event_lifetime { instant } else { fallback }
+    if has_a_past { instant } else { fallback }
 }
 
 /// [`App::fetch_config`]'s context, with `as_of` narrowed to what this pane

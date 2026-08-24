@@ -827,9 +827,25 @@ pub trait SourceHandler: Send {
 
     /// This layer's relationship to the clock — see [`TimeAxis`] for the
     /// rules each arm derives.
-    fn time_axis(&self) -> TimeAxis {
-        TimeAxis::Live
-    }
+    ///
+    /// **Required, and it used to default to [`TimeAxis::Live`].** That default
+    /// was not a neutral one: `Live` is the arm that says "I have no history",
+    /// and it is the arm under which `FetchConfig::as_of` is left at the wall
+    /// clock by contract. So a source that simply never mentioned the clock was
+    /// silently declared historyless, and every mechanism that depends on the
+    /// declaration — the depicted instant reaching the fetch at all, the
+    /// residency law, the loop — skipped it without anything saying so.
+    ///
+    /// That is not hypothetical. The SPC mesoscale-discussion layer inherited
+    /// this default while every one of its items carried a `VALID` window, so a
+    /// pane scrubbed to a storm ten years gone drew *today's* discussions over
+    /// it; the archive branch written to fix that was unreachable, because the
+    /// caller had already decided this layer did not want the instant. Removing
+    /// the body is what makes the next such layer a compile error instead.
+    ///
+    /// A `Live` layer answers `TimeAxis::Live` in its own body. That is one
+    /// line, and it is a claim someone made rather than one nobody noticed.
+    fn time_axis(&self) -> TimeAxis;
 
     /// **The fewest frames a loop of this layer is worth building.**
     ///
