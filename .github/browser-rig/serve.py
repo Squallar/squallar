@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-serve.py -- static file server for the rustdar web bundle (rig edition).
+serve.py -- static file server for the squallar web bundle (rig edition).
 
-Serves /home/reddragon/projects/rustdar/rustdar-web (or --dir) with correct
+Serves /home/reddragon/projects/squallar/squallar-web (or --dir) with correct
 MIME types (.wasm -> application/wasm, .js -> text/javascript; module scripts
 and instantiateStreaming both care). Never modifies the repo: all
 instrumentation happens at response time.
@@ -25,14 +25,14 @@ Rig endpoints (byte transforms of repo files, applied per-response):
                       * with --seed-local-storage '<json>', writes the given
                         localStorage keys BEFORE any app script runs -- the
                         Tier-2 gate pins its scene with
-                        {"rustdar.ui": "{\"site\":\"KTLX\"}"} so both browsers
+                        {"squallar.ui": "{\"site\":\"KTLX\"}"} so both browsers
                         boot the same site instead of their own defaults.
   /worker.js        (only when instrumenting, default on) the rasterization
                     worker with a prelude that relays self errors,
                     unhandledrejections and console.error/warn over
                     BroadcastChannel "__rig" to the page. NOTE: static
                     `import` declarations hoist above the prelude, so module
-                    evaluation of pkg/rustdar_web.js is NOT covered; init()
+                    evaluation of pkg/squallar_web.js is NOT covered; init()
                     and everything later is. Disable with --no-instrument-worker.
 
                     With --doctor-first-worker, the FIRST /worker.js request
@@ -51,14 +51,14 @@ Rig endpoints (byte transforms of repo files, applied per-response):
 
 Programmatic use:
     import serve
-    httpd, thread = serve.start_server("/path/to/rustdar-web", port=0)
+    httpd, thread = serve.start_server("/path/to/squallar-web", port=0)
     url = "http://127.0.0.1:%d/index-rig.html" % httpd.server_address[1]
     ...
     serve.stop_server(httpd, thread)
 
 CLI use (prints exactly one stdout line when ready, then serves until
 SIGTERM/SIGINT):
-    python3 serve.py --dir /home/reddragon/projects/rustdar/rustdar-web \
+    python3 serve.py --dir /home/reddragon/projects/squallar/squallar-web \
         --port 0 --log out/serve.log
     # stdout: RIG-SERVE-READY <port> http://127.0.0.1:<port>/
 """
@@ -72,7 +72,7 @@ import signal
 import sys
 import threading
 
-DEFAULT_DIR = "/home/reddragon/projects/rustdar/rustdar-web"
+DEFAULT_DIR = "/home/reddragon/projects/squallar/squallar-web"
 
 MIME = {
     ".html": "text/html; charset=utf-8",
@@ -96,7 +96,7 @@ MIME = {
 # happens here, in the first script, which is what guarantees "before any app
 # script": the app reads its config during boot, so a seed written any later
 # would race it.
-PAGE_PRELUDE = b"""<script>/* rustdar rig prelude (injected by serve.py, repo untouched) */
+PAGE_PRELUDE = b"""<script>/* squallar rig prelude (injected by serve.py, repo untouched) */
 (function () {
   "use strict";
   var E = (window.__rig_errors = []);
@@ -169,9 +169,9 @@ PAGE_PRELUDE = b"""<script>/* rustdar rig prelude (injected by serve.py, repo un
 """
 
 # Prepended to worker.js. Static imports in the module hoist above this code,
-# so it runs after pkg/rustdar_web.js module evaluation but before init()
+# so it runs after pkg/squallar_web.js module evaluation but before init()
 # resolves -- runtime errors and console.error/warn in the worker are covered.
-WORKER_PRELUDE = b"""/* rustdar rig worker prelude (injected by serve.py, repo untouched).
+WORKER_PRELUDE = b"""/* squallar rig worker prelude (injected by serve.py, repo untouched).
    Static `import` declarations below are hoisted and evaluate BEFORE this
    code; everything from init() onward is covered. */
 try {
@@ -233,7 +233,7 @@ def transform_worker(raw):
 # and respawn after the first backoff rung (1000 ms) -- the respawn's refetch
 # of /worker.js gets the real file (and Cache-Control: no-store on every
 # response means it can never be cache-served this stub again).
-DOCTORED_WORKER_STUB = b"""/* rustdar rig doctored worker stub \
+DOCTORED_WORKER_STUB = b"""/* squallar rig doctored worker stub \
 (served once by serve.py --doctor-first-worker) */
 self.postMessage({ kind: "hello", token: "doctored/0/deadbeef" });
 """
@@ -241,7 +241,7 @@ self.postMessage({ kind: "hello", token: "doctored/0/deadbeef" });
 
 class RigHandler(http.server.SimpleHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "rustdar-rig/1"
+    server_version = "squallar-rig/1"
 
     def guess_type(self, path):
         _, ext = os.path.splitext(path)
@@ -368,7 +368,7 @@ def main(argv=None):
                     help="JSON object of localStorage key -> string value, "
                          "written by the page prelude BEFORE any app script "
                          "runs (the Tier-2 gate pins its scene with "
-                         "'{\"rustdar.ui\": \"{\\\"site\\\":\\\"KTLX\\\"}\"}')")
+                         "'{\"squallar.ui\": \"{\\\"site\\\":\\\"KTLX\\\"}\"}')")
     ap.add_argument("--doctor-first-worker", action="store_true",
                     help="answer the FIRST /worker.js request with a stub that "
                          "posts a doctored build token; later requests get the "

@@ -1,4 +1,4 @@
-# XcodeGen spec for the rustdar macOS app — kept for local Xcode development
+# XcodeGen spec for the squallar macOS app — kept for local Xcode development
 # (`xcodegen generate` opens the app in Xcode). `make -C macos` does NOT use
 # Xcode: it cross-compiles in the rust-cross container (see macos/Makefile) and
 # reads only the bundle metadata below (MARKETING_VERSION,
@@ -12,9 +12,9 @@
 # the four keys.
 #
 # Unlike iOS there is no ObjC shell here: winit's AppKit backend calls
-# `NSApplicationMain` itself, so `rustdar`'s own `main` is the
+# `NSApplicationMain` itself, so `squallar`'s own `main` is the
 # executable and the bundle is only metadata around it.
-name: rustdar
+name: squallar
 options:
   bundleIdPrefix: dev.mcswain
   deploymentTarget:
@@ -33,23 +33,23 @@ settings:
     MACOSX_DEPLOYMENT_TARGET: "11.0"
     ONLY_ACTIVE_ARCH: "NO"
 targets:
-  rustdar:
+  squallar:
     type: application
     platform: macOS
     deploymentTarget: "11.0"
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: dev.mcswain.rustdar
+        PRODUCT_BUNDLE_IDENTIFIER: app.squallar
         INFOPLIST_FILE: Info.plist
     dependencies:
       # CLLocationManager: position. Everything else the binary needs is
       # linked by cargo already.
       - sdk: CoreLocation.framework
 schemes:
-  rustdar:
+  squallar:
     build:
       targets:
-        rustdar: all
+        squallar: all
     run:
       config: Release
     archive:

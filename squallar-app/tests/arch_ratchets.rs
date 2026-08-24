@@ -1,0 +1,1084 @@
+//! Architectural ratchets: ceilings on coupling metrics, enforced as tests.
+//!
+//! Every ceiling may only move DOWN — the land that earns a lower count lowers
+//! the MAX const with it. Each ceiling sits beside a positive check on the same
+//! haystack, so a moved or renamed haystack fails loudly instead of counting
+//! zero and going silently green.
+//!
+//! Needle hygiene: every counted pattern here is built from split literals
+//! (`concat!("self.", "gui.")` style) and the walker skips this file, so the
+//! file never contains a counted pattern contiguously.
+//!
+//! Counting semantics: the asserted metrics count OCCURRENCES (`rg -o … | wc -l`
+//! on the command side, summed `str::matches` here). The wasm-cfg rows count
+//! matching LINES per crate (`rg -c` summed). Commands run from the workspace
+//! root; the walker skips dirs named `target`/`pkg` and never leaves the
+//! workspace.
+//!
+//! # The rule, and the last snapshot that satisfied it
+//!
+//! **The rule**: a ceiling equals the count it measures, and the land that
+//! sheds an occurrence lowers the constant with it. A ceiling is not a budget
+//! a migration spends down — it is the line the architecture sits on, so the
+//! response to needing one more occurrence is to shed one first, or to stop
+//! and report. **The rule is what binds; a value below is only the last
+//! measurement that satisfied it.**
+//!
+//! A land that sheds and does not lower leaves **arrears**: slack a later land
+//! can spend with nothing going red. WO-E10.4 set every value to its
+//! measurement; `1e94ce59` then shed three and left them, which is the defect
+//! this note now exists to make visible rather than to absorb.
+//!
+//! Rows 1a/1b moved DOWN one at WO-SYNCGROUP (2026-08-21, base `510e8690`),
+//! which replaced the loop-start barrier's two unary time-link reads with one
+//! pair-wise read. **The shed is discharged, not the arrears**: that land
+//! measured 178/173 against ceilings of 181/176, so two occurrences of slack
+//! from earlier lands are still there and still spendable. Re-measure before
+//! trusting the gap.
+//!
+//! **Snapshot: re-measured at WO-ARREARS, 2026-08-21, base `178ab361`**, by
+//! the walker below (not by the `rg` column, which is documentation — see the
+//! note after the table). The `was` column is the previous literal, kept so it
+//! stays visible that every move was DOWN.
+//!
+//! ```text
+//!  #   metric                                        value  was  command (run from the workspace root)
+//!  1a  App-pokes-Gui occurrences, squallar-app          180  181  rg -o 'self\.''gui\.' squallar-app --glob '*.rs' | wc -l
+//!  1b  ... excluding test-named paths                  175  176  rg -o 'self\.''gui\.' squallar-app --glob '*.rs' -g '!*tests*' | wc -l
+//!  1c  ... that are setter pushes  [TARGET 0, HELD]      0    -  rg -o 'self\.''gui\.''set_' squallar-app --glob '*.rs' | wc -l
+//!  2a  Gui setter fns in squallar-egui/src/ui.rs          0    0  rg -o 'pub fn ''set_' squallar-egui/src/ui.rs | wc -l
+//!  2b  ... over every inherent `impl Gui` block          1    1  see GUI_IMPL_SETTER_MAX — the walk, not a one-file grep
+//!  3   wasm-cfg lines per crate  [NOT ASSERTED]          -    -  recorded in ARCHITECTURE.md §6.5, by user ruling
+//!  4a  product-enum occurrences in squallar-egui          0    0  rg -o 'Radar''Product' squallar-egui --glob '*.rs' | wc -l
+//!  4b  ... files containing it (info)                    0    -  rg -l 'Radar''Product' squallar-egui --glob '*.rs' | wc -l
+//!  6   ChannelHub receiver fields                       17   17  rg -o '_receiver: ''Receiver<' squallar-app/src/channels.rs | wc -l
+//!  7a  overlays-crate path occurrences in offload.rs     0    0  rg -o 'squallar_''overlays::' squallar-worker/src/offload.rs | wc -l
+//!  7b  radar-crate path occurrences in offload.rs        0    0  rg -o 'squallar_''radar::' squallar-worker/src/offload.rs | wc -l
+//!  8   config-swap occurrences, six crates               0    0  rg -o 'load_pane''_configs|save_pane''_configs|loaded_''configs' squallar-{overlays,egui,app,radar,source,worker} --glob '*.rs' | wc -l
+//!  9a  radar-geometry definitions in squallar-radar       1    1  rg -o 'struct Loop''Geometry' squallar-radar --glob '*.rs' | wc -l
+//!  9b  ... in squallar-egui                               0    0  rg -o 'struct Loop''Geometry' squallar-egui --glob '*.rs' | wc -l
+//! 10a  loop-frame-arm occurrences, squallar-app           8    8  rg -o 'Loop''FrameData|L3Frame''Key|Cached''Volume' squallar-app --glob '*.rs' | wc -l
+//! 10b  ... excluding test-named paths                    2    2  rg -o 'Loop''FrameData|L3Frame''Key|Cached''Volume' squallar-app --glob '*.rs' -g '!*tests*' | wc -l
+//! 11   Ingest-phase callers outside test paths           1    -  rg -o 'self\.poll_data''_channels(' squallar-app --glob '*.rs' -g '!*tests*' | wc -l
+//! ```
+//!
+//! **Read the commands as documentation, not as the gate.** The gate is the
+//! test below it in every case, because a command in a comment cannot fail. The
+//! two differ in one way worth knowing: this file is excluded from its own walk,
+//! so the ripgrep figures include occurrences here that the tests do not count.
+//!
+//! Rows 1a/1b and the four per-file ceilings in
+//! `squallar-app/src/app/gui_seam_ratchet_tests.rs` are a **standing contract by
+//! user ruling** and survive the campaign — see [`SELF_GUI_MAX`].
+//!
+//! Row 3 is recorded, not asserted, by user ruling: no count ratchets on style
+//! metrics. The qualitative rule — a cfg may select a value, a dependency or a
+//! type alias, and may never fork behaviour inside a function body — lives in
+//! ARCHITECTURE.md and in review. Row 5 (the overlay-kind enum) is retired: the
+//! enum is gone, and
+//! `squallar_overlays::render::overlay_state::overlay_kind_stays_deleted_tests`
+//! holds its absence.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+/// Workspace root: this integration test's manifest dir is `squallar-app/`.
+const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+
+// ---------------------------------------------------------------------------
+// Needles — split literals so this file never contains what it counts.
+
+const SELF_GUI: &str = concat!("self.", "gui.");
+/// Row 1c — the setter push through that coupling. Target 0, held as a test.
+const SELF_GUI_SET: &str = concat!("self.", "gui.", "set_");
+const PUB_FN_SET: &str = concat!("pub fn ", "set_");
+const PRODUCT_ENUM: &str = concat!("Radar", "Product");
+const RECEIVER_FIELD: &str = concat!("_receiver: ", "Receiver<");
+const OVERLAYS_PATH: &str = concat!("squallar_", "overlays::");
+const RADAR_PATH: &str = concat!("squallar_", "radar::");
+
+// Presence anchors (the positive half of each check; definition anchors are
+// split so a future absence-grep for a deleted definition stays clean).
+const APP_ANCHOR: &str = concat!("pub struct ", "App");
+const GUI_IMPL_ANCHOR: &str = concat!("impl ", "Gui");
+/// Row 2's widened half: an inherent `impl` block on the `Gui` type, in either
+/// spelling this crate uses — `impl Gui {` inside the `ui` module and
+/// `impl super::Gui {` in the files hung off it. A trait impl
+/// (`impl Default for Gui {`) is deliberately not one: it can carry no
+/// inherent setter, so counting it would inflate the ceiling with rows the
+/// property is not about.
+const IMPL_KW: &str = concat!("impl", " ");
+const GUI_IMPL_TAIL: &str = concat!("Gui", " {");
+const TRAIT_IMPL_INFIX: &str = concat!(" ", "for", " ");
+/// Row 2's replacement: the one generic write door the deleted setters became.
+const GENERIC_CONTROL_DOOR: &str = concat!("pub fn apply_layer", "_control");
+const UI_MOD_ANCHOR: &str = concat!("mod ", "ui;");
+const HUB_ANCHOR: &str = concat!("struct ", "ChannelHub");
+const OFFLOAD_ANCHOR: &str = concat!("pub fn ", "offload_job(");
+const PRODUCT_DEF_ANCHOR: &str = concat!("enum Radar", "Product");
+
+// Row 8 — the config swap, deleted at WO-M10c. Split so this file never holds
+// a needle contiguously, and so a future grep for the deleted names stays
+// clean here too.
+const SWAP_LOAD: &str = concat!("load_pane", "_configs");
+const SWAP_SAVE: &str = concat!("save_pane", "_configs");
+const SWAP_MEMO: &str = concat!("loaded_", "configs");
+/// The presence control for row 8: the pane-state hook that REPLACED the swap.
+/// If the walk stops seeing this, it is reading the wrong tree and the three
+/// zeroes below mean nothing.
+const SWAP_REPLACEMENT: &str = concat!("serialize_pane", "_state");
+
+/// Row 9 — the radar geometry type's DEFINITION, wherever it lives. Split so
+/// neither half can be satisfied by a haystack the walk never reached: the
+/// definition must be found in `squallar-radar` and must not be found in
+/// `squallar-egui`.
+const GEOMETRY_DEF: &str = concat!("struct Loop", "Geometry");
+
+/// Row 10 — the closed arms a loop frame's data comes in, and the two aliases
+/// that key their caches. Split so this file never holds one contiguously.
+const LOOP_FRAME_ARMS: [&str; 3] = [
+    concat!("Loop", "FrameData"),
+    concat!("L3Frame", "Key"),
+    concat!("Cached", "Volume"),
+];
+/// The presence control for row 10: the manager whose caches those three name.
+/// If the walk stops seeing this in `squallar-radar`, the needles have rotted
+/// and both counts below mean nothing.
+const LOOP_MANAGER_DEF: &str = concat!("struct LoopDownload", "Manager");
+
+/// Row 12 — the two site-keyed decoded-volume stores WO-VOLINV moved off the
+/// `App` and behind one owner. Split, per this file's needle hygiene.
+const STILL_STORE: &str = concat!("scan", "_data");
+const BASE_STORE: &str = concat!("base", "_scans");
+/// The third decoded-volume store, deliberately LEFT on the `App` — row 12's
+/// presence control. It is out of that order's scope on purpose.
+const KEPT_STORE: &str = concat!("latest_cached", "_scans");
+/// The owner the first two moved behind — row 12's second presence control.
+const INVENTORY_FIELD: &str = concat!("volumes: ", "crate::volume_inventory::");
+
+// --------------------------------------------------------------------------- Ceilings
+// — at-land measurements (see the table above).
+
+/// Row 1a — the App-pokes-Gui coupling, crate-wide.
+///
+/// # This ceiling is PERMANENT. It is not migration scaffolding.
+///
+/// It was written as scaffolding and this doc used to read that way. **User
+/// ruling, 2026-08-21: "Keep them, I want loud failures if that contract is
+/// broken."** It is not deleted at campaign close, or at any milestone. A
+/// permanent gate whose own documentation calls itself temporary is a defect
+/// inside the gate, which is why these words replaced the old ones.
+///
+/// **The contract**: the app layer does not grow its reach into the UI layer.
+/// An attempt to is a **build failure**, not a review comment.
+///
+/// **It may only ever FALL.** Lower it in the land that earns it; never raise
+/// it without a written plan amendment. WO-E10.4 lowered it to the measured
+/// value, so there is **no headroom**: the correct response to needing a new
+/// reach is **shed first, then land** — never "ask whether the ceiling should
+/// move". If no shed is reachable inside a change's charter, **stop and
+/// report**.
+///
+/// **The two honest sheds**, named so nobody has to rediscover them:
+///
+/// * **loop-state addressing** — the vocabulary by which the app reaches loop
+///   state held on the `Gui`; and
+/// * **the all-panes-versus-visible-panes distinction**, which has already
+///   produced one bug.
+///
+/// **Forbidden by name, because it works and it is a lie**: re-spelling the
+/// reads through one `let gui = &mut self` + `.gui;` binding. The walker then
+/// counts zero while the coupling is identical. It is the same move refused as
+/// a glob re-export and as a re-export route earlier in this campaign; under a
+/// **permanent** ceiling it is worse than dishonest bookkeeping, because it is
+/// the mechanism by which a permanent contract silently stops binding.
+///
+/// # The tree contains that construct TWICE, and the debt is recorded here
+///
+/// A gate whose doc forbids a construct the tree contains twice is a
+/// prose-is-not-evidence defect sitting inside the gate. So, stated rather
+/// than implied — **WO-ARREARS measured both, and neither is borrow-forced**:
+///
+/// * `App::poll_overlay_fetch_results` in `app.rs` binds once before the drain
+///   and hides **4** reaches (`deliver_overlay_fetch`, `deliver_frame_listing`,
+///   `deliver_frame` twice).
+/// * `App::poll_overlay_render_results` in `app_render.rs` binds once inside
+///   the drain and hides **1** (`pane_mut`, inside the `retain` closure).
+///
+/// **Proven by compiling, not by reading.** Replacing each binding with a
+/// direct `self.``gui.` reach and building the crate's lib test target
+/// succeeds with **no diagnostic at all** — exit 0, no error, no warning, in
+/// both cases separately. The `app.rs` drain's other borrow is `self.channels`
+/// in the `while let` head, which is a disjoint field and released before the
+/// body runs; the `app_render.rs` closure's other borrow is `resp`, a local
+/// moved out of the channel. Neither binding splits a borrow. **They are
+/// evasion, and this doc says so.**
+///
+/// # Why they are still here, and what it costs
+///
+/// Shedding both makes this walk read **178** (measured: the walker's own
+/// failure message with both shed), against the 173 it reads with them in
+/// place. That is five above this ceiling, and above every value it has
+/// carried since WO-E9e. It is *not* above every value in this
+/// constant's history: the pin has read 204, 192, 191 and 188 earlier in the
+/// campaign, and 178 would have fitted under any of those. That headroom was
+/// spent down deliberately and is not available to reclaim, which is the whole
+/// point of a ratchet. So the shed cannot be landed together with the honest
+/// number — it would need a **raise**, which requires a written plan amendment
+/// and which WO-ARREARS refused to take on its own authority. The per-file scrape moves the same
+/// way: `app.rs` 36 -> 40 and `app_render.rs` 101 -> 102.
+///
+/// So the debt is **recorded, not absorbed**: the coupling this crate really
+/// has is five above whatever this walk sees, and the difference is those five
+/// reaches. The land that sheds them is the land that must also shed five real
+/// reaches — or carry the amendment that says otherwise. **A third such binding
+/// has no standing at all**: it would be new evasion, and this doc is the
+/// record that the two here were found, measured and left deliberately rather
+/// than overlooked.
+///
+/// # 173 -> 168 at WO-T3.7, and only three of the five are that land's
+///
+/// The loop-state shed took `App::evict_unneeded_loop_scans`' index walk down
+/// to a `panes()` slice walk (-1) and collapsed play/pause, step and seek into
+/// one `PaneState::drive_transport` door (-2). The other **two** were
+/// **arrears**: `9c120fc2` already measured 171 total and 166 non-test against
+/// 173 and 168 before this land touched anything, so earlier work had shed
+/// without lowering — the failure WO-ARREARS recorded, recurring. Sitting the
+/// constant back on its measurement is what a ratchet is for, so both are
+/// absorbed here rather than left standing.
+///
+/// **One near-miss worth naming, because it would have banked a fake unit.**
+/// Re-spelling `loop_state()` as `time_state(&known::RADAR)` is longer, and
+/// rustfmt wrapped one `self.``gui.pane(sibling_idx)` in `app_render.rs` across
+/// three lines — which **this raw walk cannot see** and the collapsed per-file
+/// scrape can. The figure below fell by one for no change in coupling at all.
+/// The site was restructured to keep the reach on one line; what is pinned here
+/// is measured after that. **A ceiling lowered onto a line wrap is a ceiling
+/// that has stopped binding**, and `app/gui_seam_ratchet_tests.rs` is what
+/// caught it.
+///
+/// # 168 -> 167 at WO-T3.9, and the shed is bigger than the number
+///
+/// `reinit_active_loops` moved from `self.``gui.panes()` to
+/// `self.``gui.panes_and_overlays_mut()` — one reach either way, but the old
+/// spelling was **wrapped across three lines** by WO-T3.7's own re-spelling and
+/// so was invisible to this raw walk while the collapsed scrape counted it.
+/// Unhiding it costs this row +1 for no change in coupling at all, which is the
+/// same measurement artefact the paragraph above names, running the other way.
+///
+/// Paid for, and over-paid, by the **second** honest shed: `arrived_volume_asks`
+/// and the loop-raster dispatch each read the layout's denominator with
+/// `panes()` and then took the wider `panes_and_overlays_mut` door, spelling
+/// the all-panes-versus-visible-panes distinction out by hand. Both now ask
+/// `Gui::visible_panes_and_overlays_mut` for the slice they actually walk (-2).
+/// Net -1 here and **-2 on the collapsed per-file scrape**, which is the figure
+/// that describes the coupling: `app_fetch.rs` 40 -> 38.
+///
+/// # 167 -> 164 at WO-T3.10
+///
+/// Three navigation pushes became one event. `handle_navigate_time`,
+/// `handle_navigate_one_scan` and `handle_jump_to_live` each spelled a time
+/// selection as a `ViewingLiveForPane` push beside a `SelectedTime` push —
+/// with the pane's own clock missing from all three, which is the WO-T3.10
+/// defect. `GuiEvent::PaneTimeSelected` carries the whole gesture, reached
+/// through one `App::select_instant`, so the sites lose their pushes and the
+/// door is written once.
+const SELF_GUI_MAX: usize = 164;
+/// Row 1b — the same needle outside test-named paths.
+///
+/// Everything on [`SELF_GUI_MAX`] applies here: permanent, falls only, sits on
+/// its measurement, same two sheds, same forbidden re-spelling — and the same
+/// recorded debt, because **both hidden bindings are in production files**, so
+/// all five of them are missing from this count too (163 seen, 168 real). This
+/// row is the one that matters for behaviour — the other counts the suites
+/// that exercise the coupling as well, and a suite is allowed to name what it
+/// tests.
+///
+/// 168 -> 163 at WO-T3.7 alongside its twin: all three sheds and both arrears
+/// were in production files, so this row moved by exactly what
+/// [`SELF_GUI_MAX`] did.
+///
+/// 163 -> 162 at WO-T3.9, and again by exactly what [`SELF_GUI_MAX`] moved:
+/// every site in that land is a production file.
+///
+/// 162 -> 159 at WO-T3.10, again by exactly what [`SELF_GUI_MAX`] moved.
+const SELF_GUI_NON_TEST_MAX: usize = 159;
+/// Row 2a — **`ui.rs`'s own `impl Gui` block, and only that file**.
+///
+/// **0 since WO-E8b**, which is where the plan said it would land. The last
+/// three were `set_live_chunks`, `set_chunk_notifications` and
+/// `set_notifier_endpoint`; their fields are now `RadarSource`'s and the one
+/// write door is `Gui::apply_layer_control(kind, update)`, which names a
+/// layer and a control update rather than a field.
+///
+/// **This ceiling is only worth 0 if the needle was not moved instead of the
+/// coupling.** The setters were not renamed or relocated out of the walk: the
+/// shell's own call — `squallar-app`'s `app.gui.set_live_chunks(false)` — is
+/// gone rather than re-spelled, and what replaced it is generic.
+///
+/// **What this figure is NOT** is the whole `Gui`. It counts one file, and
+/// until WO-E8d it claimed to count "the `Gui` impl, wherever spelled" — a
+/// claim [`GUI_IMPL_SETTER_MAX`] measured and found false. The doc now says
+/// what the walk does; the wider claim is the constant below, which makes it
+/// and pays for it.
+const UI_SETTER_MAX: usize = 0;
+/// Row 2b — **every inherent `impl Gui` block in `squallar-egui`, wherever
+/// spelled**: the claim [`UI_SETTER_MAX`]'s doc used to make about itself.
+///
+/// **1, measured, not chosen.** `Gui::set_initial_site` lives on the
+/// `impl super::Gui` block in `ui_config.rs` and is called from
+/// `squallar-app/src/app.rs` on a first run with no stored config — it points
+/// every pane at the site nearest the host's timezone. It was never inside
+/// the walked file: it is absent from `ui.rs` at WO-E8a's SHA and at WO-E8c's,
+/// so nothing was relocated to reach a zero, and this is not needle-hiding.
+/// **The gate was over-claiming; the code was not lying.**
+///
+/// **This is the floor, not a raise.** WO-E8b's 0 is untouched above, over
+/// the same file it always covered; this row is a *second, wider* measurement
+/// whose denominator is 22 impl blocks across 21 files rather than one. The
+/// two figures are not the same figure and must never be compared as one.
+///
+/// The remainder is named because a ceiling may under-claim and may never
+/// over-claim: driving this to 0 means the first-run site reaching the panes
+/// without a `Gui` setter, which is a boot-path question this order had no
+/// mandate to open. Lower it in the land that earns it; never raise it
+/// without a written plan amendment.
+const GUI_IMPL_SETTER_MAX: usize = 1;
+/// Row 4a.
+///
+/// **440, not 438: WO-E6a's accessors add exactly two occurrences** — the
+/// return type of `PaneState::selected_product` and the parameter of
+/// `PaneState::set_selected_product`. There is no spelling of an accessor for
+/// a `RadarProduct`-typed field that does not name the type. The amendment
+/// ratified +2 against the pre-pass 444, i.e. 446; the comment pass then took
+/// the row down to 438, so the amendment lands at 440 and spends 6 less than
+/// it was granted. Anything beyond +2 from WO-E6a is not this amendment.
+///
+/// **439 since WO-E7e**: its two new pins name the enum twice, and hoisting the
+/// repeated product bindings in `target_matching_tolerates_elevation_jitter_only`
+/// gave back three — lowered in the land that earned it, never raised.
+///
+/// **405 since WO-E9d, and the lowering was WO-E9c's to take.** E9c deleted
+/// `slider_range` and `slider_labels` and re-keyed both 3D editor stores,
+/// which moved the haystack per file against `80a964a3`: `volume_iso.rs`
+/// 38 -> 16, `volume_alpha.rs` 16 -> 5, `ui_volume_alpha.rs` 10 -> 0,
+/// `ui_config.rs` 13 -> 9, while the corpus fixture and config suites that
+/// prove the on-disk spelling did not move gave 9 and 4 back:
+/// `439 - 22 - 11 - 10 - 4 + 9 + 4 = 405`, re-measured per file rather than
+/// inferred. **E9c earned that and did not take it**, leaving the pin 34
+/// above its own haystack -- slack a later land could have spent with nothing
+/// going red. The rule is "lower it in the land that earns it"; this note
+/// exists so the arrears stay on the record instead of being absorbed.
+///
+/// **386 since WO-E9d land 2, lowered in the land that earned it.** The
+/// catalogue's three inventory groups collapsed into one registry-derived loop
+/// and `PresetPane.product` became a `FieldId`: `ui_catalog.rs` 15 -> 1,
+/// `presets_config_tests.rs` 4 -> 0, `parity_walk.rs` 2 -> 1 (its inventory
+/// stopped enumerating the enum). **405 - 14 - 4 - 1 = 386**, measured per file
+/// against `096ca4c3`. The single survivor in `ui_catalog.rs` is the typed
+/// `product_for`/`spec` round trip the pane still forces, and WO-E9e removes it
+/// with the pane's own type.
+///
+/// # 0 since WO-E9e land 2 — and this constant records what 0 means
+///
+/// **0 means the enum's NAME is gone from `squallar-egui`. It does NOT mean no
+/// field-identity comparison remains there.** A ceiling counts the spelling it
+/// was built to count, and this one was built to count `RadarProduct`. Reaching
+/// 0 while comparisons survive under another spelling is honest only if the
+/// ceiling says so on itself — the WO-M12d precedent, where a ceiling recorded
+/// its own remainder rather than pretending it was gone. So, stated:
+///
+/// * **Three annotation guards in `pane.rs`** — `displayed_nyquist_ms` on
+///   Velocity, `displayed_melting_layer_source` on hydrometeor classification,
+///   `displayed_storm_motion` on SRV — are now `FieldId` comparisons against
+///   `squallar_radar::fields::known::` consts. They ask "does this readout belong
+///   to the picture on the glass", not "which catalogue row is this". Whether
+///   they deserve declared registry facts is **WO-M14's** question.
+/// * **`ui_map_pane::format_legend_value` keeps six identity arms** — the class
+///   table, the whole-number speeds and heights, precipitation rate, hail size,
+///   the correlation coefficient and the two 1-decimal fields — and
+///   `range_folded_is_painted` keeps one. These are legend *layout* policy (how
+///   many decimals survive a 20 px bar), which is the UI's own fact and not the
+///   registry's; the unit *conversion* under them does come from the field's
+///   registered `Quantity`.
+/// * **The radar layer's enum values still flow through egui inside
+///   `squallar_radar::types::ScanInfo`** (`available_products`,
+///   `product_elevations`). Egui declares no field of that type and never names
+///   it: it projects at the boundary through `fields::spec` / `fields::product_for`.
+///   Re-typing radar's own scan metadata is not this order's — radar keeping its
+///   enum inside the crate that owns it is the point.
+///
+/// **What 0 does buy, and it is the campaign's oldest acceptance criterion:** no
+/// type, field, signature, pattern or import in `squallar-egui` names
+/// `RadarProduct`. The pane's selection, `RenderTarget`, `SectionTarget`,
+/// `VolumeTarget`, `RadarTextureMeta` and (per amendment M8) the app's
+/// `SelectKey` all hold a `FieldId`.
+const PRODUCT_IN_EGUI_MAX: usize = 0;
+/// Row 6.
+///
+/// **17 since WO-M12b**: the loop scan-list channel is gone — a radar frame
+/// listing arrives on the one source path now — so the hub holds one pair
+/// fewer. Lowered in the land that earned it, never raised.
+const HUB_RECEIVER_MAX: usize = 17;
+
+/// Row 11 — the frame pump's `Ingest` phase has exactly ONE production caller.
+///
+/// WO-M13b measured this and deliberately did **not** pin it, registering the
+/// gap instead: `poll_data_channels` runs the pump's `Ingest` phase and
+/// `handle_redraw` is its only production caller, so every hub receiver is
+/// drained once per frame. `the_chunk_drain_runs_before_the_frame_is_laid_out`
+/// holds *where* in the frame it sits; nothing held *how many times*.
+///
+/// A second production caller would drain each receiver twice per frame. That
+/// is not a crash — it is arrivals landing in a half-built frame, which is the
+/// shape of defect that reads green everywhere and shows up as a stale pane.
+///
+/// **1, measured, and the needle is proven live** by the two suites that scrape
+/// the same string for the ordering pin. Test-side calls are excluded: a suite
+/// driving the phase directly is exactly how the arrival paths are tested.
+const INGEST_CALLERS_NON_TEST: usize = 1;
+/// The presence control for row 11: the phase function itself must still be
+/// defined in the walked crate, or the count above is counting nothing.
+const INGEST_DEF: &str = concat!("fn poll_data", "_channels(");
+/// Row 11's needle — the call, not the definition.
+const INGEST_CALL: &str = concat!("self.poll_data", "_channels(");
+
+/// Row 10a — **8 since WO-M12d, down from 17, and this ceiling records a real
+/// remainder rather than pretending it is gone.**
+///
+/// All eight are test-side reads of radar's own frame payload; the remainder is
+/// what could not be shed without moving an assertion value, which ruling
+/// (23)(b) forbids: three pin suites match the arms directly
+/// (`loop_dispatch_tests` twice, `loop_level3_tests`, `loop_scan_cache_tests`)
+/// and two build a cached volume through its alias. Re-pointing those to an
+/// accessor would change what they assert, not how it is spelled.
+///
+/// **What the number does NOT include, because it is 0**: any production
+/// occurrence — see [`LOOP_FRAME_ARMS_NON_TEST_MAX`]. The remaining reachable
+/// step is the decoded-volume cache move (`frames_resident`/`retain_frames`),
+/// blocked with M12c's Level III collapse; ruling (25) named both as parts of
+/// radar's bespoke half.
+const LOOP_FRAME_ARMS_MAX: usize = 8;
+/// Row 10b — the same needles outside test-named paths.
+///
+/// **2, and both are `#[cfg(test)]` items sitting in a production FILE**: the
+/// `use` at the top of `app_render.rs` and the return type of the `frame_data`
+/// wrapper below it, kept there so the three suites that reach them through
+/// `use super::*` need no edit at all. **Production loop dispatch names neither
+/// arm**: it asks the layer for the described render job a frame's data makes
+/// (`LoopDownloadManager::frame_render_job`) and hands it to the funnel with
+/// its input type erased, which is what WO-M12d's ratchet was for.
+///
+/// This may only reach 0 by those two items moving to a test-named module —
+/// worth doing in a land that has a reason to open the file, and NOT worth a
+/// glob re-export whose only effect is to hide a needle from this walk.
+const LOOP_FRAME_ARMS_NON_TEST_MAX: usize = 2;
+
+// --------------------------------------------------------------------------- Walker +
+// counters (std-only, pure file reads).
+
+fn read(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!(
+            "presence control: cannot read {} ({e}) — the haystack moved; a ceiling \
+             that counts zero on a missing haystack is a dead guard. Re-anchor this \
+             ratchet in the land that moves the file.",
+            path.display()
+        )
+    })
+}
+
+/// Every `.rs` file under `dir`, recursively, skipping dirs named `target` or `pkg`
+/// (build output — the same set ripgrep ignores here).
+fn rs_files_under(dir: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let entries = fs::read_dir(dir).unwrap_or_else(|e| {
+            panic!(
+                "presence control: haystack dir {} is unreadable ({e}) — the tree \
+                 moved; re-anchor this ratchet in the land that moves it.",
+                dir.display()
+            )
+        });
+        for entry in entries {
+            let entry = entry.expect("readable directory entry");
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if path.is_dir() {
+                if name == "target" || name == "pkg" {
+                    continue;
+                }
+                walk(&path, out);
+            } else if name.ends_with(".rs") && name != "arch_ratchets.rs" {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(dir, &mut files);
+    assert!(
+        !files.is_empty(),
+        "presence control: haystack {} holds no .rs files — a ceiling over an empty \
+         haystack is a dead guard; re-anchor this ratchet in the land that emptied it.",
+        dir.display()
+    );
+    files
+}
+
+fn load_tree(dir: &Path) -> Vec<(PathBuf, String)> {
+    rs_files_under(dir)
+        .into_iter()
+        .map(|p| {
+            let text = read(&p);
+            (p, text)
+        })
+        .collect()
+}
+
+fn count(files: &[(PathBuf, String)], needle: &str) -> usize {
+    files.iter().map(|(_, t)| t.matches(needle).count()).sum()
+}
+
+/// The positive half of a walked-haystack check: the anchor file must be in the WALKED
+/// set, so a broken walker fails here.
+fn assert_anchored(files: &[(PathBuf, String)], suffix: &str, anchor: &str) {
+    let (path, text) = files
+        .iter()
+        .find(|(p, _)| p.ends_with(suffix))
+        .unwrap_or_else(|| {
+            panic!(
+                "presence control: no walked file ends with {suffix} — the anchor \
+                 file moved or the walker broke; re-anchor this ratchet in the land \
+                 that moved it."
+            )
+        });
+    assert!(
+        text.contains(anchor),
+        "presence control: {} no longer contains the anchor {anchor:?} — re-anchor \
+         this ratchet in the land that changed it.",
+        path.display()
+    );
+}
+
+/// Single-file haystack: read (loud on a moved file) + anchor check.
+fn anchored_file(path: &Path, anchor: &str) -> String {
+    let text = read(path);
+    assert!(
+        text.contains(anchor),
+        "presence control: {} no longer contains the anchor {anchor:?} — re-anchor \
+         this ratchet in the land that changed it.",
+        path.display()
+    );
+    text
+}
+
+/// The header line of an inherent `impl` block on `Gui` — see [`IMPL_KW`].
+fn is_gui_impl_header(line: &str) -> bool {
+    let line = line.trim_end();
+    line.starts_with(IMPL_KW) && line.ends_with(GUI_IMPL_TAIL) && !line.contains(TRAIT_IMPL_INFIX)
+}
+
+/// Every inherent `impl Gui` block in the walked tree, as (file, body) pairs.
+///
+/// **Why lines and not a parser.** These blocks are top-level items in a
+/// `rustfmt`-shaped tree, so each opens at column 0 and closes at the next
+/// `}` at column 0. That assumption is not taken on trust: the caller asserts
+/// no extracted body contains another header, which is exactly what an extent
+/// that overran its own closing brace would produce.
+fn gui_impl_blocks(files: &[(PathBuf, String)]) -> Vec<(PathBuf, String)> {
+    let mut blocks = Vec::new();
+    for (path, text) in files {
+        let lines: Vec<&str> = text.lines().collect();
+        for (start, line) in lines.iter().enumerate() {
+            if !is_gui_impl_header(line) {
+                continue;
+            }
+            let body = &lines[start + 1..];
+            let end = body
+                .iter()
+                .position(|l| *l == "}")
+                .map_or(lines.len(), |offset| start + 1 + offset);
+            blocks.push((path.clone(), lines[start + 1..end].join("\n")));
+        }
+    }
+    blocks
+}
+
+/// The field list of `pub struct App`, from its header to the `}` that closes
+/// it at column 0.
+///
+/// Lines, not a parser, on the same rustfmt assumption [`gui_impl_blocks`]
+/// takes: the struct is a top-level item, so it opens at column 0 and closes at
+/// the next line that is exactly `}`. An extent that over- or under-ran would
+/// be caught by row 12's two presence controls, which are read from this same
+/// returned block rather than from the whole file.
+fn struct_app_block(text: &str) -> String {
+    let start = text
+        .find(APP_ANCHOR)
+        .expect("the App struct header is gone from app.rs");
+    let lines: Vec<&str> = text[start..].lines().skip(1).collect();
+    let end = lines
+        .iter()
+        .position(|l| *l == "}")
+        .expect("the App struct block never closes at column 0");
+    lines[..end].join("\n")
+}
+
+/// Mirrors ripgrep's `-g '!*tests*'`: a path is test-side when any component
+/// under the crate root has a name containing "tests".
+fn in_test_path(path: &Path, crate_root: &Path) -> bool {
+    path.strip_prefix(crate_root)
+        .expect("walked file lies under its crate root")
+        .components()
+        .any(|c| c.as_os_str().to_string_lossy().contains("tests"))
+}
+
+// ---------------------------------------------------------------------------
+// The ratchets.
+
+/// Row 1 — the App-pokes-Gui coupling (occurrences of the split needle in squallar-app).
+#[test]
+fn the_app_pokes_gui_coupling_never_grows() {
+    let crate_root = Path::new(ROOT).join("squallar-app");
+    let files = load_tree(&crate_root);
+    assert_anchored(&files, "src/app.rs", APP_ANCHOR);
+
+    let total = count(&files, SELF_GUI);
+    let non_test: usize = files
+        .iter()
+        .filter(|(p, _)| !in_test_path(p, &crate_root))
+        .map(|(_, t)| t.matches(SELF_GUI).count())
+        .sum();
+
+    assert!(
+        total <= SELF_GUI_MAX,
+        "the App-pokes-Gui coupling grew: {total} occurrences > ceiling {SELF_GUI_MAX}. \
+         This is a PERMANENT contract sitting on its measured value, not \
+         migration scaffolding: shed first, then land. The two honest sheds are loop-state addressing and \
+         the all-panes-versus-visible-panes distinction; if neither is reachable \
+         inside your charter, stop and report. Never raise this without a written \
+         plan amendment, and never re-spell the reads through a local binding - \
+         that makes this walk read zero while the coupling is identical."
+    );
+    assert!(
+        non_test <= SELF_GUI_NON_TEST_MAX,
+        "the App-pokes-Gui coupling grew outside tests: {non_test} occurrences > \
+         ceiling {SELF_GUI_NON_TEST_MAX}. Same permanent contract, same two sheds, \
+         same refusal to raise or re-spell - see the constant's own doc, which \
+         also records the five reaches two local bindings currently hide."
+    );
+
+    // The target-zero half, held as a TEST rather than as a grep in a log: the
+    // app never pushes UI state through a setter, ANYWHERE in the crate. The
+    // per-file scrape in `app/gui_seam_ratchet_tests.rs` covers four files
+    // whitespace-collapsed; this covers all of them, plainly.
+    let setters = count(&files, SELF_GUI_SET);
+    assert_eq!(
+        setters, 0,
+        "squallar-app pushes UI state through {setters} Gui setter call(s). \
+         WO-E2 replaced the setter push with Gui::apply for event-shaped state \
+         and Gui::apply_frame_inputs for frame-composed state, and WO-E8b took \
+         the last one; route the new push through the seam. This is a 0 and \
+         stays a 0.",
+    );
+}
+
+/// Row 8 — **the config swap stays deleted**, everywhere.
+///
+/// The swap installed one pane's saved state into the shared handler before
+/// each call and took it out again. It was a CORRECTNESS mechanism, not
+/// plumbing: any method it covered that stayed global answered for one pane
+/// and acted for every pane the moment it died. WO-M10c moved all twelve
+/// handlers' per-pane state into the pane, so the mechanism has nothing left
+/// to do — and a single call site coming back is a handler reading a global
+/// again.
+///
+/// The zero is checked against a **positive control on the same walk**: the
+/// hook that replaced the swap must be found, and found many times, or the
+/// three absence checks are reading an empty or wrong haystack and pass for
+/// the wrong reason.
+#[test]
+fn the_config_swap_stays_deleted() {
+    let crates = [
+        "squallar-overlays",
+        "squallar-egui",
+        "squallar-app",
+        "squallar-radar",
+        "squallar-source",
+        "squallar-worker",
+    ];
+    let mut swap = 0usize;
+    let mut replacement = 0usize;
+    let mut walked = 0usize;
+    for name in crates {
+        let files = load_tree(&Path::new(ROOT).join(name));
+        walked += files.len();
+        swap += count(&files, SWAP_LOAD) + count(&files, SWAP_SAVE) + count(&files, SWAP_MEMO);
+        replacement += count(&files, SWAP_REPLACEMENT);
+    }
+    // Two controls, because a zero is only as good as the haystack under it.
+    assert!(
+        walked > 200,
+        "presence control: only {walked} .rs files were walked across {} \
+         crates — the walk is not reaching the tree, so the zero below would \
+         be a zero about nothing",
+        crates.len(),
+    );
+    assert!(
+        replacement >= 12,
+        "presence control: the walk found {SWAP_REPLACEMENT:?} only \
+         {replacement} times. Every handler that keeps per-pane state defines \
+         it, so a count this low means the walk is reading the wrong files \
+         and the absence check below proves nothing.",
+    );
+    assert_eq!(
+        swap, 0,
+        "the config swap is back ({swap} occurrence(s) of {SWAP_LOAD:?}, \
+         {SWAP_SAVE:?} or {SWAP_MEMO:?}). It installed one pane's state into \
+         the shared handler before each call, which is how two panes came to \
+         share one answer; a handler's per-pane state belongs in the pane, \
+         reached through `PaneRef`/`PaneMut`. See WO-M10b/WO-M10c.",
+    );
+}
+
+/// Row 2 — setter fns on the Gui shell.
+#[test]
+fn the_gui_setter_surface_never_grows() {
+    let ui_rs = Path::new(ROOT).join("squallar-egui/src/ui.rs");
+    let text = anchored_file(&ui_rs, GUI_IMPL_ANCHOR);
+    // **Neither half passes on an empty haystack.** `anchored_file` proves
+    // the walked file is still the Gui's; this proves the door the message
+    // sends the reader to is real. A zero here has to mean "the setters are
+    // gone and the generic write exists", never "the walk read a file that
+    // was not there".
+    let glue = read(&Path::new(ROOT).join("squallar-egui/src/gui/layer_glue.rs"));
+    assert!(
+        glue.contains(GENERIC_CONTROL_DOOR),
+        "presence control: {GENERIC_CONTROL_DOOR:?} is gone from the layer          glue, so a setter-free `Gui` would mean the write door was deleted          rather than replaced.",
+    );
+    let n = text.matches(PUB_FN_SET).count();
+    // `assert_eq!` rather than `<=`, because the ceiling is 0: a `<=` against
+    // the minimum of the type is a comparison that cannot fail, which is the
+    // vacuity this suite exists to refuse.
+    assert_eq!(
+        n, UI_SETTER_MAX,
+        "the Gui setter surface in `ui.rs` is {n}, not {UI_SETTER_MAX}. WO-E2 \
+         Land 2 left 3; WO-E8b reached 0, and 0 is where it stays. A switch a \
+         layer owns is written through `Gui::apply_layer_control`, not through \
+         a setter beside it. Never raise it without a written plan amendment."
+    );
+
+    // ----------------------------------------------------------------- 2b:
+    // the same needle over EVERY `impl Gui` block, which is the claim the
+    // constant above used to make about itself and could not keep. A setter
+    // moved from `ui.rs` into any sibling file passes 2a and fails here.
+    let files = load_tree(&Path::new(ROOT).join("squallar-egui"));
+    assert_anchored(&files, "squallar-egui/src/ui.rs", GUI_IMPL_ANCHOR);
+    let blocks = gui_impl_blocks(&files);
+
+    // Extent control: a body that swallowed its own closing brace would run
+    // on into the next block's header. None may.
+    for (path, body) in &blocks {
+        assert!(
+            !body.lines().any(is_gui_impl_header),
+            "extent control: an `impl Gui` body in {} ran past its closing \
+             brace and swallowed the next block's header, so this walk's \
+             count covers text it does not mean to. Re-anchor it in the land \
+             that reshaped the file.",
+            path.display(),
+        );
+    }
+
+    // Widening control: the whole point of 2b is that it reads more than the
+    // one file 2a reads. A walk that collapsed back onto `ui.rs` would count
+    // 0 and read green while proving nothing 2a had not already proved.
+    let walked: std::collections::BTreeSet<&PathBuf> = blocks.iter().map(|(p, _)| p).collect();
+    assert!(
+        walked.len() > 1,
+        "widening control: the `impl Gui` walk found blocks in {} file(s). It \
+         exists to cover every file that carries one; a single-file answer is \
+         the narrow walk this row was added to replace.",
+        walked.len(),
+    );
+
+    // Presence control: the extractor must really yield `pub fn` bodies, and
+    // from a file that is NOT `ui.rs`. The generic write door is one, and it
+    // lives in the layer glue. Without this, a `gui_impl_blocks` that
+    // returned empty bodies would count 0 and pass.
+    let bodies: String = blocks
+        .iter()
+        .map(|(_, body)| body.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        bodies.contains(GENERIC_CONTROL_DOOR),
+        "presence control: {GENERIC_CONTROL_DOOR:?} is not inside any walked \
+         `impl Gui` body, so this walk is reading empty or wrong extents and \
+         its zero would mean nothing.",
+    );
+
+    let wide = bodies.matches(PUB_FN_SET).count();
+    // `assert_eq!` again, and for a second reason beyond vacuity: this row's
+    // value is a measured floor with a named remainder, so a DROP is news the
+    // constant must be lowered to record, not silently absorbed.
+    assert_eq!(
+        wide, GUI_IMPL_SETTER_MAX,
+        "the Gui setter surface across every `impl Gui` block is {wide}, not \
+         {GUI_IMPL_SETTER_MAX}. The named remainder is `set_initial_site` in \
+         `ui_config.rs`; anything above that is a new setter on the shell, \
+         which is what WO-E8b removed the last of. If the count FELL, lower \
+         the constant in this land and strike the remainder from its doc."
+    );
+}
+
+/// Row 4 — occurrences of the product enum's name inside squallar-egui.
+#[test]
+fn the_product_enum_never_spreads_further_into_egui() {
+    let root = Path::new(ROOT);
+    // Needle-definition control: the counted name must still be the live enum.
+    let types_rs = root.join("squallar-radar/src/types.rs");
+    anchored_file(&types_rs, PRODUCT_DEF_ANCHOR);
+
+    let files = load_tree(&root.join("squallar-egui"));
+    assert_anchored(&files, "squallar-egui/src/lib.rs", UI_MOD_ANCHOR);
+    let n = count(&files, PRODUCT_ENUM);
+    // `assert_eq!` rather than `<=`: at 0 the two are the same test, and the
+    // equality says what the constant's doc says — this is a value that records
+    // a finished state, not a budget with room left in it.
+    assert_eq!(
+        n, PRODUCT_IN_EGUI_MAX,
+        "the product enum spread back into squallar-egui: {n} occurrences, \
+         ceiling {PRODUCT_IN_EGUI_MAX}. WO-E9e drove this to 0 and the UI names \
+         fields by `FieldId` now — see `squallar_radar::fields::known` for the \
+         spellings. Never raise this without a written plan amendment."
+    );
+}
+
+// Row 5 — retired; the enum it counted is gone.
+
+/// Row 6 — ChannelHub receiver-field count, ceiling [`HUB_RECEIVER_MAX`].
+///
+/// The ceiling has been **17 since WO-M12b**; the function name records the 18
+/// it was written against at WO-E0c and is left alone because the plan's own
+/// tamper record cites it by that name.
+#[test]
+fn the_channel_hub_never_grows_past_eighteen_receiver_pairs() {
+    let channels_rs = Path::new(ROOT).join("squallar-app/src/channels.rs");
+    let text = anchored_file(&channels_rs, HUB_ANCHOR);
+    let n = text.matches(RECEIVER_FIELD).count();
+    assert!(
+        n <= HUB_RECEIVER_MAX,
+        "ChannelHub grew: {n} receiver fields > ceiling {HUB_RECEIVER_MAX}. New \
+         channels ride existing rows or stay local to their orchestrator (the \
+         WO-E4.9 precedent); the field-list pin lands at WO-E3, verified at \
+         WO-M13b. Never raise this without a written plan amendment."
+    );
+}
+
+/// Row 7 — offload.rs names ZERO source-crate types, in EITHER direction.
+#[test]
+fn offload_names_zero_source_crate_types() {
+    let offload_rs = Path::new(ROOT).join("squallar-worker/src/offload.rs");
+    let text = anchored_file(&offload_rs, OFFLOAD_ANCHOR);
+
+    for (needle, crate_name) in [(OVERLAYS_PATH, "overlays"), (RADAR_PATH, "radar")] {
+        let n = text.matches(needle).count();
+        assert_eq!(
+            n, 0,
+            "offload.rs speaks {n} {crate_name}-crate path(s) where the pin is \
+             ZERO, in either direction, prose included (WO-M7c closed the \
+             reply direction; the request direction closed at WO-M7.2). A job \
+             kind's types belong beside its pipeline, reached through the \
+             composed registry (`job_registry.rs`) — never named in the \
+             funnel. Never raise this without a written plan amendment."
+        );
+    }
+
+    // Presence control: the needles are alive — the composition module names both
+    // crates by construction.
+    let registry_rs = Path::new(ROOT).join("squallar-worker/src/job_registry.rs");
+    let registry = read(&registry_rs);
+    for (needle, what) in [(OVERLAYS_PATH, "overlays"), (RADAR_PATH, "radar")] {
+        assert!(
+            registry.matches(needle).count() > 0,
+            "the {what} needle no longer matches job_registry.rs, which \
+             composes both source-crate registries by name. Either the \
+             composition moved (re-point this control) or the needle rotted \
+             (fix it) — a dead needle would leave the zero pin above green \
+             over anything."
+        );
+    }
+}
+
+/// Row 9 — **a radar type is not defined in the presentation crate.**
+///
+/// `LoopGeometry` is the site code and the coordinates a radar loop's frames
+/// are projected about. It was parked in `squallar-egui/src/radar_layer.rs`
+/// because WO-E7a's fence forbade touching `squallar-radar`; WO-M12e moved it
+/// to `squallar_radar::loop_geometry`, where the type's own crate owns it and
+/// the presentation crate only reads it back out of a timeline's anchor.
+///
+/// The zero is checked against the definition being found in radar on the
+/// SAME needle — a definition that moved back, or a needle that rotted, fails
+/// one half or the other rather than passing both for the wrong reason.
+#[test]
+fn the_radar_geometry_type_is_defined_in_radar_and_not_in_egui() {
+    let radar = load_tree(&Path::new(ROOT).join("squallar-radar"));
+    let egui = load_tree(&Path::new(ROOT).join("squallar-egui"));
+    assert!(
+        radar.len() > 20 && egui.len() > 20,
+        "presence control: the walk reached {} radar and {} egui .rs files, \
+         which is too few to be the real trees — both counts below would be \
+         about nothing",
+        radar.len(),
+        egui.len(),
+    );
+    assert_eq!(
+        count(&radar, GEOMETRY_DEF),
+        1,
+        "the radar geometry type is not defined in squallar-radar. Either it \
+         moved back out of its own crate, or the needle {GEOMETRY_DEF:?} \
+         rotted — a dead needle would leave the zero below green over \
+         anything. See WO-M12e.",
+    );
+    assert_eq!(
+        count(&egui, GEOMETRY_DEF),
+        0,
+        "a radar type is defined in the presentation crate again \
+         ({GEOMETRY_DEF:?}). Radar's own types belong in squallar-radar; \
+         squallar-egui reads this one back out of `LayerTimeState::anchor` and \
+         never declares it. See WO-M12e, and ruling (15) as amended by (23).",
+    );
+}
+
+/// Row 10 — the closed arms a loop frame's data comes in stay radar's.
+///
+/// Split so neither half can pass on a haystack the walk never reached: the
+/// needles must be ALIVE in `squallar-radar` (they are radar's own vocabulary
+/// and are not going away), and the counts in `squallar-app` are what may only
+/// fall. See WO-M12d and ruling (25).
+#[test]
+fn the_loop_frame_arms_stay_radars_own_vocabulary() {
+    let crate_root = Path::new(ROOT).join("squallar-app");
+    let app = load_tree(&crate_root);
+    let radar = load_tree(&Path::new(ROOT).join("squallar-radar"));
+    assert_anchored(&app, "src/app_render.rs", concat!("fn frame_", "sweep("));
+    assert_eq!(
+        count(&radar, LOOP_MANAGER_DEF),
+        1,
+        "presence control: the loop download manager is not defined in \
+         squallar-radar. Either it moved, or the needle {LOOP_MANAGER_DEF:?} \
+         rotted — and a rotted needle would leave both counts below green over \
+         anything.",
+    );
+    for needle in LOOP_FRAME_ARMS {
+        assert!(
+            count(&radar, needle) > 0,
+            "presence control: {needle:?} is not named anywhere in \
+             squallar-radar, so counting it in squallar-app is counting a dead \
+             needle. Re-anchor this ratchet in the land that renamed it.",
+        );
+    }
+
+    let total: usize = LOOP_FRAME_ARMS.iter().map(|n| count(&app, n)).sum();
+    let non_test: usize = app
+        .iter()
+        .filter(|(p, _)| !in_test_path(p, &crate_root))
+        .map(|(_, t)| {
+            LOOP_FRAME_ARMS
+                .iter()
+                .map(|n| t.matches(*n).count())
+                .sum::<usize>()
+        })
+        .sum();
+
+    assert!(
+        non_test <= LOOP_FRAME_ARMS_NON_TEST_MAX,
+        "a production file in squallar-app names a loop frame's closed arms \
+         again: {non_test} occurrences > ceiling \
+         {LOOP_FRAME_ARMS_NON_TEST_MAX}. The dispatch path asks the layer for \
+         the described job a frame's data makes and never holds the arms — see \
+         WO-M12d.",
+    );
+    assert!(
+        total <= LOOP_FRAME_ARMS_MAX,
+        "the loop-frame vocabulary shared with squallar-app grew: {total} \
+         occurrences > ceiling {LOOP_FRAME_ARMS_MAX}. Lower this in the land \
+         that sheds one; never raise it.",
+    );
+}
+
+/// Row 11 — the `Ingest` phase runs once a frame because one place calls it.
+#[test]
+fn the_ingest_phase_has_exactly_one_production_caller() {
+    let crate_root = Path::new(ROOT).join("squallar-app");
+    let files = load_tree(&crate_root);
+
+    // Presence control: the phase function is still here, in the walked set.
+    assert_anchored(&files, "src/app.rs", INGEST_DEF);
+
+    let non_test: usize = files
+        .iter()
+        .filter(|(p, _)| !in_test_path(p, &crate_root))
+        .map(|(_, t)| t.matches(INGEST_CALL).count())
+        .sum();
+
+    assert_eq!(
+        non_test, INGEST_CALLERS_NON_TEST,
+        "the pump's Ingest phase has {non_test} production caller(s), not \
+         {INGEST_CALLERS_NON_TEST}. Two callers drain every hub receiver twice \
+         per frame, so an arrival lands in a half-built frame - a defect that \
+         reads green everywhere and shows as a stale pane. If a second call \
+         site is genuinely wanted, it is a frame-pump change and this pin is \
+         where it gets argued.",
+    );
+}
+
+/// Row 12 — **the site-keyed decoded volumes have exactly one owner.**
+///
+/// Two raw maps used to sit on the `App`, indexed at every call site. WO-VOLINV
+/// put both behind `VolumeInventory`, which answers named questions instead, so
+/// a caller asks what a site's still render draws or what its merge base is
+/// rather than reaching into a map. The pin is that neither name comes back as
+/// a field: a store re-added beside the inventory is two owners again, and the
+/// defect that shape produces is a write that lands in one of them and a read
+/// that goes to the other.
+///
+/// **What is deliberately not pinned here.** The loop cache is keyed
+/// `(site, timestamp)` rather than by site alone and is blocked on a separate
+/// seam question; the third site-keyed store stayed on the `App` with it. That
+/// store is therefore the presence control — it must still be declared, or the
+/// block extractor is reading an empty extent and every zero below is vacuous.
+#[test]
+fn the_site_keyed_volume_stores_have_one_owner() {
+    let app_rs = Path::new(ROOT).join("squallar-app/src/app.rs");
+    let text = anchored_file(&app_rs, APP_ANCHOR);
+    let block = struct_app_block(&text);
+
+    // Both controls read the SAME extracted block the zeros below are read
+    // from, so an extent that came back empty fails here rather than passing
+    // two zeros over nothing.
+    assert!(
+        block.contains(KEPT_STORE),
+        "presence control: the `App` field list no longer declares the third \
+         decoded-volume store, so the extractor is reading the wrong extent \
+         and the zeros below hold over nothing."
+    );
+    assert!(
+        block.contains(INVENTORY_FIELD),
+        "presence control: the `App` field list no longer declares the volume \
+         inventory, so the two stores below have no owner to have moved to — \
+         re-anchor this ratchet in the land that changed it."
+    );
+
+    for needle in [STILL_STORE, BASE_STORE] {
+        let n = block.matches(needle).count();
+        assert_eq!(
+            n, 0,
+            "the `App` declares `{needle}` again ({n} occurrence(s)) where the \
+             pin is ZERO. The site-keyed decoded volumes have one owner, asked \
+             by name; a raw map beside it is a second owner, and the shape's \
+             own defect is a write that lands in one store while the read goes \
+             to the other. Never raise this without a written plan amendment."
+        );
+    }
+}

@@ -1,8 +1,0 @@
-[package]
-name = "rustdar-units"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-chrono = { workspace = true }
-serde = { workspace = true }

@@ -2,8 +2,8 @@
 #
 # Run one command against the browser's THREADED wasm configuration.
 #
-#   .github/scripts/wasm-threads.sh cargo check -p rustdar-web --target wasm32-unknown-unknown
-#   .github/scripts/wasm-threads.sh wasm-pack build rustdar-web --target web --release
+#   .github/scripts/wasm-threads.sh cargo check -p squallar-web --target wasm32-unknown-unknown
+#   .github/scripts/wasm-threads.sh wasm-pack build squallar-web --target web --release
 #
 # ---------------------------------------------------------------------------
 # THE NIGHTLY CARVE-OUT, AND EXACTLY HOW FAR IT REACHES
@@ -64,7 +64,7 @@ fi
 # input to the web build that changes without a commit -- and it is also a
 # known-good marker. `-Zbuild-std` on wasm32-unknown-unknown was broken on
 # older nightlies: rebuilding std left libm undefined, and the link died on
-# `undefined symbol: acosh` / `asinh` out of naga, walkers and rustdar-geo.
+# `undefined symbol: acosh` / `asinh` out of naga, walkers and squallar-geo.
 # Measured on this box at WS3b, on a three-arm probe over a two-line crate
 # calling `f64::asinh`:
 #
@@ -75,8 +75,8 @@ fi
 # The failure did NOT depend on `+atomics`; plain `-Zbuild-std` was enough to
 # trigger it, which is why the arm above is worth keeping in the record. Moving
 # this pin means re-running that probe, not assuming forward progress.
-: "${RUSTDAR_WASM_TOOLCHAIN:=nightly-2026-08-15}"
-export RUSTUP_TOOLCHAIN="$RUSTDAR_WASM_TOOLCHAIN"
+: "${SQUALLAR_WASM_TOOLCHAIN:=nightly-2026-08-15}"
+export RUSTUP_TOOLCHAIN="$SQUALLAR_WASM_TOOLCHAIN"
 
 # Additive, and required by `-Zbuild-std`: the toolchain has to carry the wasm
 # target's own std even though std is about to be rebuilt from source, because

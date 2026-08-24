@@ -17,10 +17,10 @@ plugins {
 // three directories up from here (two up from the Gradle root project at
 // `packaging/android/`, which is what the paths below hang off).
 // `rustCrateManifest` is the manifest of the crate that actually depends on
-// `rustls-platform-verifier` — the `rustdar` app crate — because that is what
+// `rustls-platform-verifier` — the `squallar` app crate — because that is what
 // the Maven lookup below has to be pointed at, not the workspace root.
 val rustWorkspaceRoot = rootProject.layout.projectDirectory.dir("../..")
-val rustCrateManifest = rootProject.layout.projectDirectory.file("../../rustdar/Cargo.toml")
+val rustCrateManifest = rootProject.layout.projectDirectory.file("../../squallar/Cargo.toml")
 
 // ---------------------------------------------------------------------------
 // Native-library staging
@@ -160,7 +160,7 @@ repositories {
 // at the end of the build it actually applies to instead of on every
 // invocation, including `assembleDebug`.
 //
-// The old cargo-apk keystore (`../rustdar.jks`, password in cleartext in
+// The old cargo-apk keystore (`../squallar.jks`, password in cleartext in
 // Cargo.toml) was never committed, but that password is in git history and must
 // be treated as burned.
 val keystoreProps: Properties? = run {
@@ -209,12 +209,12 @@ val selectedAbis: List<String> = (project.findProperty("abiFilter") as String?)
     ?: allAbis
 
 android {
-    namespace = "dev.mcswain.rustdar"
+    namespace = "app.squallar"
     compileSdk = 36
     ndkVersion = ndkVersionPin
 
     defaultConfig {
-        applicationId = "dev.mcswain.rustdar"
+        applicationId = "app.squallar"
         minSdk = 28
         // Deliberately held at 34, the value the cargo-apk build shipped.
         //
@@ -334,10 +334,10 @@ android {
 // two must not be allowed to drift apart: one directory shared between profiles
 // is exactly the bug described at `jniLibsDirFor` above.
 //
-// NOTE the package is `rustdar` — since the android fold there is no separate
-// entry crate. `android_main` lives in rustdar's cfg(target_os = "android")
+// NOTE the package is `squallar` — since the android fold there is no separate
+// entry crate. `android_main` lives in squallar's cfg(target_os = "android")
 // android::entry module, and `android.app.lib_name` names its [lib],
-// `rustdar_native` -> librustdar_native.so.
+// `squallar_native` -> libsquallar_native.so.
 fun cargoNdkTask(name: String, buildType: String): TaskProvider<Exec> = tasks.register<Exec>(name) {
     workingDir = rustWorkspaceRoot.asFile
 
@@ -354,7 +354,7 @@ fun cargoNdkTask(name: String, buildType: String): TaskProvider<Exec> = tasks.re
         "-P", ndkPlatform,
         "-o", stagingDir.asFile.absolutePath,
         "build",
-        "-p", "rustdar",
+        "-p", "squallar",
         "--lib",
     )
     if (buildType == "release") args += "--release"
@@ -373,32 +373,32 @@ fun cargoNdkTask(name: String, buildType: String): TaskProvider<Exec> = tasks.re
     }
     environment("ANDROID_NDK_HOME", ndkDir.absolutePath)
 
-    // Full in-repo crate closure of `rustdar` on aarch64-linux-android
+    // Full in-repo crate closure of `squallar` on aarch64-linux-android
     // (regenerate with `cargo metadata --filter-platform aarch64-linux-android`
-    // and list every workspace-path package in rustdar's dependency closure --
+    // and list every workspace-path package in squallar's dependency closure --
     // vendor/ members included). A crate missing from this list leaves the task
     // UP-TO-DATE after edits to it, and Gradle then packages a stale .so — the
     // failure mode is a build that "succeeds" while shipping last hour's Rust;
-    // the pre-fold list had exactly that bug (rustdar-source, rustdar-geo and
+    // the pre-fold list had exactly that bug (squallar-source, squallar-geo and
     // the three vendor crates were missing). build.rs goes through files() so
     // crates without one are tolerated, and picked up if one is added later.
     listOf(
         "nexrad-level3",
-        "rustdar",
-        "rustdar-app",
-        "rustdar-device-profile",
-        "rustdar-egui",
-        "rustdar-geo",
-        "rustdar-gpu",
-        "rustdar-kv",
-        "rustdar-location",
-        "rustdar-nmea-serial",
-        "rustdar-overlays",
-        "rustdar-radar",
-        "rustdar-source",
-        "rustdar-units",
-        "rustdar-volumetric",
-        "rustdar-worker",
+        "squallar",
+        "squallar-app",
+        "squallar-device-profile",
+        "squallar-egui",
+        "squallar-geo",
+        "squallar-gpu",
+        "squallar-kv",
+        "squallar-location",
+        "squallar-nmea-serial",
+        "squallar-overlays",
+        "squallar-radar",
+        "squallar-source",
+        "squallar-units",
+        "squallar-volumetric",
+        "squallar-worker",
         "vendor/bzip2-rs",
         "vendor/nexrad-data",
         "vendor/nexrad-decode",
@@ -456,7 +456,7 @@ androidComponents.onVariants { variant ->
         tasks.matching { it.name == "assemble$cap" || it.name == "bundle$cap" }.configureEach {
             doLast {
                 logger.warn(
-                    "\n[rustdar] $name: NO SIGNING KEY -- this artifact is UNSIGNED and " +
+                    "\n[squallar] $name: NO SIGNING KEY -- this artifact is UNSIGNED and " +
                         "Android will refuse to install it.\n" +
                         "  Do not sideload the debug APK instead: it is debuggable and signed with " +
                         "the stock 'CN=Android Debug' key.\n" +

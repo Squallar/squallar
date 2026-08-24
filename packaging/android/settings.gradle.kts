@@ -22,5 +22,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "rustdar"
+rootProject.name = "squallar"
 include(":app")

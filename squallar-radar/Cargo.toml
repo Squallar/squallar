@@ -1,0 +1,94 @@
+[package]
+name = "squallar-radar"
+version.workspace = true
+edition.workspace = true
+
+[features]
+# Compiles the handful of state-forcing test hooks on `ChunkFeedManager` and
+# `ChunkNotifier` (`force_retire_at`, `force_serving`, `backdate_handshake`)
+# for a dependent crate's tests. `#[cfg(test)]` is crate-local and invisible
+# downstream, so the app crate's drain-precedence suites — which retire a feed
+# or age a handshake without waiting out the real clocks — need this feature on
+# their dev-dependency. Never enabled by a normal dependency.
+test-support = []
+
+[dependencies]
+chrono = { workspace = true }
+# The chunk-notification WebSocket in `chunk_notify` (WO-RF1; the dep moved
+# here with the module from the frontend). Plain rather than target-gated:
+# ewebsock's reader lives on its own thread natively and on the browser's
+# event loop on wasm, which is exactly why the notifier drains without an
+# executor on both targets.
+ewebsock = { workspace = true }
+log = { workspace = true }
+# `par.rs` is the crate's one parallel-iteration prelude, and it is now rayon on
+# BOTH arms. wasm32-unknown-unknown grew a pool at WS3b: the browser build runs
+# under `-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals` with
+# `-Zbuild-std`, and `squallar-web` hands rayon its threads through
+# `wasm-bindgen-rayon` (Web Workers over one shared linear memory). Plain rather
+# than target-gated, which is the whole point: both arms compile from identical
+# source, so every closure already satisfies `Fn + Send + Sync`.
+rayon = "=1.12.0"
+squallar-source = { workspace = true }
+squallar-geo = { workspace = true }
+squallar-units = { workspace = true }
+serde = { workspace = true }
+# Open-Meteo sounding responses in `sounding`.
+serde_json = { workspace = true }
+# `parallel` fans `volume::File::scan()`'s per-LDM-record decompress-and-decode
+# across the pool (upstream's `volume/file.rs`: `into_par_iter` with the
+# feature, plain `into_iter` without). A super-res volume is 50-130
+# independently compressed records, so the granularity is nearly perfect, and
+# the feature changes only *where* the records are decoded: the map is
+# order-preserving and the results are recombined in record order either way, so
+# a successful decode yields an identical `Scan`.
+#
+# One asymmetry, stated because "identical" would otherwise overclaim it:
+# upstream collects into a `Result` under rayon, and rayon keeps whichever error
+# a worker reaches first rather than the first in record order. A volume with
+# more than one malformed record can therefore surface a different error variant
+# than a serial decode would. Immaterial while this path is tests-only on
+# single-record fixtures. `scan::decoded` fans out the same way and does *not*
+# inherit it: it collects a `Vec<Result<_>>` and folds it in record order, so
+# the error it reports is the first in the file. See
+# `scan::fold_contributions`.
+#
+# **This is not the application's decode path**, and the entry is worth no more
+# than it says. `scan::decoded` walks the records itself in one pass, because it
+# has to read each Message 31's declared Nyquist velocity before `into_radial`
+# throws it away; that walk is where a downloaded volume actually goes, and it
+# fans out over `crate::par` rather than over this. What this reaches is
+# `File::scan()` -- the upstream oracle `scan::tests` pins that one-pass walk
+# against, and anything outside this crate that decodes a volume the ordinary
+# way.
+#
+# Ungated at WS3b. It was target-gated off wasm for rayon's reason and not its
+# own, and rayon now builds a pool on both arms.
+nexrad-data = { workspace = true, features = ["parallel"] }
+nexrad-model = { workspace = true }
+nexrad-decode = { workspace = true }
+nexrad-level3 = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+# `Instant` for the feed/notifier clocks in `chunk_feed`/`chunk_notify`
+# (WO-RF1): std's on native, `performance.now()` on wasm.
+web-time = { workspace = true }
+# ListObjectsV2 response parsing in `archive`. Pure Rust (xml-rs).
+xml = "=1.4.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# rayon's locks spin where waiting is forbidden. `Atomics.wait` traps on a
+# browser's main thread, so the pool cannot block there the way it does on a
+# native thread. Additive on top of the plain `rayon` entry above -- Cargo
+# unifies features across target sections -- so this selects the browser's lock
+# strategy without giving the native arm a second rayon.
+rayon = { version = "=1.12.0", features = ["web_spin_lock"] }
+
+# Gated, not plain `[dev-dependencies]`: `rt-multi-thread` is not one of the
+# features tokio accepts on wasm, and `--all-targets` builds dev-deps too, so an
+# ungated entry breaks `cargo check --target wasm32-unknown-unknown`.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# The hail sanity harness re-runs `nexrad-level3`'s whole-file zlib strip on
+# raw NHI objects to reach their Tabular Alphanumeric Block.
+flate2 = { workspace = true }

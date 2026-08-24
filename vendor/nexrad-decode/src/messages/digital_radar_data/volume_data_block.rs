@@ -255,7 +255,7 @@ impl<'a> VolumeDataBlock<'a> {
     /// range, and a thousandth of it is a place. Neither is a question this
     /// block can answer about itself, and both are refused a rung up, where a
     /// position can be held against a source outside the volume. See
-    /// `rustdar_radar::types::ScanInfo::from_scan`.
+    /// `squallar_radar::types::ScanInfo::from_scan`.
     fn states_thousandths(&self) -> bool {
         let (lat, lon) = self.stated_position();
         self.is_legacy()

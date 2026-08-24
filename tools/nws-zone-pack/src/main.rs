@@ -19,12 +19,12 @@
 //! # Where the output goes
 //!
 //! `<output.pack>` is what the app consumes, under the one name
-//! `rustdar_overlays::nws::zone_pack::PACK_FILE_NAME` declares:
+//! `squallar_overlays::nws::zone_pack::PACK_FILE_NAME` declares:
 //!
 //! - **Web**: next to `index.html` in the deploy. `sw.js` routes it by that
 //!   name into a cache of its own, outside the all-or-nothing shell install.
 //! - **Native, iOS, Android**: beside the zone cache directory —
-//!   `~/.cache/rustdar/zones.pack` for a cache at `~/.cache/rustdar/zones`.
+//!   `~/.cache/squallar/zones.pack` for a cache at `~/.cache/squallar/zones`.
 //!
 //! Nowhere is also fine. A pack that is absent, stale or unreadable is a
 //! supported state: `zone_pack::installed()` answers `None` and every zone
@@ -42,9 +42,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use pack::{Coding, Kind};
-use rustdar_geo::GeoPolygon;
-use rustdar_overlays::render::geo::simplify_ring;
-use rustdar_overlays::types::SIMPLIFY_EPSILON;
+use squallar_geo::GeoPolygon;
+use squallar_overlays::render::geo::simplify_ring;
+use squallar_overlays::types::SIMPLIFY_EPSILON;
 
 /// The corpus at one fidelity: every zone, keyed and sorted, ready to encode.
 type Zones = Vec<pack::PackedZone>;

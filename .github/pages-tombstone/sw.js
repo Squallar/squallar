@@ -1,9 +1,9 @@
 /*
  * The tombstone service worker for https://usa-reddragon.github.io/rustdar/.
  *
- * rustdar now lives at https://rustdar.mcswain.dev/. A redirecting index.html on
+ * squallar now lives at https://rustdar.mcswain.dev/. A redirecting index.html on
  * the old origin, on its own, reaches almost nobody who ever used the site:
- * `rustdar-web/sw.js` answers a top-level navigation out of the cache before any
+ * `squallar-web/sw.js` answers a top-level navigation out of the cache before any
  * network traffic happens. A returning visitor is handed the frozen shell, it
  * works, it works offline, and nothing in it can ever mention that the site
  * moved. Left alone that lasts until the browser evicts the origin's storage --
@@ -38,7 +38,7 @@ self.addEventListener("install", () => {
 self.addEventListener("activate", (event) => {
   event.waitUntil(
     (async () => {
-      // Every cache, not just the `rustdar-` generations. The point is that
+      // Every cache, not just the `squallar-` generations. The point is that
       // nothing on this origin is servable from disk any more, so a later bug
       // here cannot resurrect a shell.
       for (const name of await caches.keys()) {

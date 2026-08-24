@@ -1,0 +1,49 @@
+[package]
+name = "squallar-source"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+reqwest = { workspace = true }
+# The geodesy floor (the WO-G1-era `geo` re-export module died at WO-G4;
+# consumers spell `squallar_geo::` directly). Charter: `tests/charter.rs`.
+squallar-geo = { workspace = true }
+# `handler::SourceHandler`'s presentation hooks speak user units:
+# `OverlayItem::popup_content` and `draw::HoverContext` both take
+# `&UserPreferences` (WO-M9). Charter-listed since WO-G1.
+squallar-units = { workspace = true }
+# `id::LayerId` is serde-transparent: the open-string layer identity must
+# serialize as the bare string already sitting in every user's config file.
+# Charter-listed ("serde arrives with later steps" — WO-M8a is that step).
+serde = { workspace = true }
+# The trait's four config-persistence hooks (`serialize_state`,
+# `deserialize_state`, `serialize_pane_state`, `deserialize_pane_state`) are
+# typed on `serde_json::Value` — the shape a layer's saved state has had in
+# every user's config file since long before this crate existed. Moving the
+# trait down here (WO-M9) therefore moves that vocabulary with it; it was
+# already the crate's dev dependency for `tests/charter.rs`. This is the
+# written charter amendment the ceiling test's failure message demands.
+serde_json = { workspace = true }
+# `SourceHandler::fetch_time`/`OverlayState::fetch_time` are `web_time::Instant`
+# — std's clock natively, `performance.now()` on wasm. Charter-listed.
+web-time = { workspace = true }
+
+# `tls` installs the process-wide *ring* provider here: this is the lowest crate
+# in the graph that reaches a TLS handshake.
+#
+# Off on wasm32: reqwest goes through the browser's `fetch()` there, so pulling
+# rustls in would add `ring` -- the workspace's one C dependency -- for nothing.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rustls = { workspace = true }
+
+# Gated, not plain `[dev-dependencies]`: `rt-multi-thread` is not one of the
+# features tokio accepts on wasm, and `--all-targets` builds dev-deps too, so an
+# ungated entry breaks `cargo check --target wasm32-unknown-unknown`.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+# `tests/charter.rs` parses `cargo metadata` output to pin this crate's
+# dependency ceiling and the overlays->radar edge cut.
+serde_json = { workspace = true }

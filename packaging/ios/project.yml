@@ -1,4 +1,4 @@
-# XcodeGen spec for the rustdar iOS app — kept for local Xcode development
+# XcodeGen spec for the squallar iOS app — kept for local Xcode development
 # (`xcodegen generate` opens the app in Xcode). `make -C ios` does NOT use Xcode:
 # it cross-compiles and links inside the rust-cross container (see ios/Makefile)
 # and reads only the bundle metadata below (MARKETING_VERSION,
@@ -6,13 +6,13 @@
 # the single source of that metadata.
 #
 # The app is a thin UIKit shell (Sources/main.m) linking the Rust staticlib
-# (librustdar_native.a, built by cargo for aarch64-apple-ios) and calling
-# `rustdar_ios_main`; winit's UIKit backend drives everything from there.
+# (libsquallar_native.a, built by cargo for aarch64-apple-ios) and calling
+# `squallar_ios_main`; winit's UIKit backend drives everything from there.
 #
 # Keep the framework list here in lockstep with the `-framework` flags in
 # ios/Makefile — they are the same list expressed twice, and only the Makefile's
 # copy is exercised on Linux.
-name: rustdar
+name: squallar
 options:
   bundleIdPrefix: dev.mcswain
   deploymentTarget:
@@ -25,7 +25,7 @@ settings:
     ARCHS: arm64
     ONLY_ACTIVE_ARCH: "NO"
 targets:
-  rustdar:
+  squallar:
     type: application
     platform: iOS
     deploymentTarget: "14.0"
@@ -33,11 +33,11 @@ targets:
       - path: Sources
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: dev.mcswain.rustdar
+        PRODUCT_BUNDLE_IDENTIFIER: app.squallar
         INFOPLIST_FILE: Info.plist
         ENABLE_BITCODE: "NO"
         LIBRARY_SEARCH_PATHS: "$(inherited) $(RUST_LIB_DIR)"
-        OTHER_LDFLAGS: "$(inherited) $(RUST_LIB_DIR)/librustdar_native.a -lobjc"
+        OTHER_LDFLAGS: "$(inherited) $(RUST_LIB_DIR)/libsquallar_native.a -lobjc"
     dependencies:
       - sdk: UIKit.framework
       # CAMetalLayer lives in QuartzCore; wgpu's Metal backend needs both.
@@ -49,13 +49,13 @@ targets:
       # rustls-platform-verifier's Apple path (SecTrustEvaluateWithError).
       - sdk: Security.framework
       # CLLocationManager: position, via
-      # rustdar-location/src/os_location/apple.rs.
+      # squallar-location/src/os_location/apple.rs.
       - sdk: CoreLocation.framework
 schemes:
-  rustdar:
+  squallar:
     build:
       targets:
-        rustdar: all
+        squallar: all
     run:
       config: Release
     archive:

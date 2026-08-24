@@ -1,0 +1,89 @@
+[package]
+name = "squallar-egui"
+version.workspace = true
+edition.workspace = true
+
+[features]
+# Serial-port GPS controls in the settings pane.
+#
+# The port dropdown calls squallar_nmea_serial::detect_gps_ports, which is itself
+# behind squallar-nmea-serial's `serial` feature. Until this existed, the call site was gated on
+# `not(target_os = "android")` while the callee was gated on a *feature* — and an
+# OS cfg cannot satisfy a feature cfg, so every non-Android target compiled the
+# block and then demanded `serial` from whoever was building. That is why this
+# crate never built on its own; only a consumer that happened to enable `serial`
+# could build it at all.
+#
+# Off by default: a target without serial ports (web) simply leaves it off, and
+# the two gates now agree because they are the same kind of gate.
+gps-serial = ["squallar-nmea-serial/serial"]
+
+[dependencies]
+web-time = { workspace = true }
+squallar-geo = { workspace = true }
+squallar-kv = { workspace = true }
+# The pane caps (MAX_PANES_DESKTOP/MOBILE) live in the device-class policy
+# floor since WO-RD -- the UI narrows at runtime by width class and reads the
+# caps from below rather than defining them.
+squallar-device-profile = { workspace = true }
+squallar-radar = { workspace = true }
+squallar-overlays = { workspace = true }
+squallar-source = { workspace = true }
+squallar-units = { workspace = true }
+# Vocabulary only (default-features = false, re-declared deliberately): the
+# facade's provider arms (`os-providers`, `serial`) and their OS dependencies
+# must never enter the UI crate's graph — the shell turns them on per target.
+squallar-location = { workspace = true, default-features = false }
+squallar-nmea-serial = { workspace = true }
+chrono = { workspace = true }
+egui = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+walkers = { workspace = true }
+# Channels and the concurrency-bounded tile fetch loop in `tile_source`. Same
+# pin as squallar-overlays; walkers uses this version too, so it is already in the
+# graph either way.
+futures = "=0.3.34"
+# Bounded tile cache with LRU eviction. Pinned to the version walkers already
+# resolves, so this adds no new node to the dependency graph.
+lru = "=0.18.2"
+# Basemap tiles go through the workspace TLS pin like every other squallar
+# request. No extra features: `tile_source` needs neither `json` nor `default`,
+# and `default` would re-enable `default-tls` (= platform verifier + aws-lc-rs)
+# and drag `aws-lc-sys` back in.
+#
+# This dependency is the entire point of `tile_source`: `walkers::HttpTiles`
+# builds its own reqwest 0.12 client with `rustls-tls`, i.e. bundled
+# `webpki-roots`, and offers no way to replace it.
+reqwest = { workspace = true }
+
+# The tile IO runtime. Native only, and *not* in the shared `[dependencies]`
+# table: tokio rejects most of its feature set on wasm outright
+# (`compile_error!("Only features sync,macros,io-util,rt,time are supported on
+# wasm.")`), so a target-gated entry is the only way to depend on it without
+# making this crate the reason wasm32 stops building. wasm gets `spawn_local`
+# below instead.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["rt", "sync", "net", "time"] }
+
+# The wasm half of the same split: no threads, no tokio: the fetch loop runs on
+# the browser's event loop and `reqwest` becomes `fetch()`, which also means the
+# browser's trust store rather than anything shipped in the artifact.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "=0.4.76"
+
+[dev-dependencies]
+# Test-only. `image` encodes the PNG fixtures the loopback tile server serves, so
+# the decode path is exercised on a real image whose exact pixels are known
+# rather than on a checked-in blob. Same version walkers already resolves;
+# `png` only, since that is the one format the fixtures use.
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
+
+# Same split as `[dependencies]` above, for the same reason: `rt-multi-thread` is
+# rejected on wasm, and `--all-targets` compiles dev-deps, so leaving this ungated
+# breaks `cargo check --target wasm32-unknown-unknown`.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# Drives the async tile tests and the `#[ignore]`d live CartoDB fetch. Not linked
+# into any shipped binary.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

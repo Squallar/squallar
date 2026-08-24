@@ -19,7 +19,7 @@ set -u -o pipefail
 GECKODRIVER_VERSION="0.37.1"
 GECKODRIVER_SHA256="e815130ea95983e162ae91843b48d3a3ce991735635fce83a647afde21e09f7e"
 
-BIN="${GECKODRIVER_BIN:-$HOME/.cache/rustdar-ci/geckodriver-$GECKODRIVER_VERSION/geckodriver}"
+BIN="${GECKODRIVER_BIN:-$HOME/.cache/squallar-ci/geckodriver-$GECKODRIVER_VERSION/geckodriver}"
 
 version_ok() {
   [ -x "$1" ] &&

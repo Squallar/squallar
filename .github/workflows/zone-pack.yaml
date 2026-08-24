@@ -1,6 +1,6 @@
 name: Zone Pack
 
-# `rustdar-web/zones.pack` is committed, not built on every deploy: producing it
+# `squallar-web/zones.pack` is committed, not built on every deploy: producing it
 # costs ~100 MB of shapefile downloads off weather.gov and a minute of RDP, and
 # it changes three or four times a year. This workflow is what keeps the
 # committed copy honest.
@@ -173,16 +173,16 @@ jobs:
             fi
             exit 1
           fi
-          if cmp -s "$RUNNER_TEMP/zones.pack" rustdar-web/zones.pack; then
+          if cmp -s "$RUNNER_TEMP/zones.pack" squallar-web/zones.pack; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "ok: the regenerated pack is byte-identical to the committed one"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            cp "$RUNNER_TEMP/zones.pack" rustdar-web/zones.pack
+            cp "$RUNNER_TEMP/zones.pack" squallar-web/zones.pack
           fi
           {
-            echo "sha256=$(sha256sum rustdar-web/zones.pack | cut -d' ' -f1)"
-            echo "bytes=$(stat -c%s rustdar-web/zones.pack)"
+            echo "sha256=$(sha256sum squallar-web/zones.pack | cut -d' ' -f1)"
+            echo "bytes=$(stat -c%s squallar-web/zones.pack)"
           } >> "$GITHUB_OUTPUT"
 
       # The converter's own tables -- fidelity ladder, size ladder, anomalies --
@@ -223,7 +223,7 @@ jobs:
           SHA256: ${{ steps.regen.outputs.sha256 }}
         run: |
           echo "::error::The pack rebuilt from the same six pinned editions does not match"
-          echo "::error::rustdar-web/zones.pack (new sha256 $SHA256)."
+          echo "::error::squallar-web/zones.pack (new sha256 $SHA256)."
           echo "::error::Nothing upstream moved, so the converter or one of its path"
           echo "::error::dependencies did. Run this workflow manually to land the new bytes."
           exit 1
@@ -234,7 +234,7 @@ jobs:
         with:
           # Named, not the default `.`: the run leaves nothing else behind in the
           # checkout today, and this makes sure that stays true if it ever does.
-          file_pattern: rustdar-web/zones.pack
+          file_pattern: squallar-web/zones.pack
           commit_message: 'chore(overlays): refresh the committed NWS zone pack'
           # The identity `.github/renovate.json` lists under `gitIgnoredAuthors`,
           # so a commit pushed onto a Renovate branch does not make Renovate treat
@@ -255,7 +255,7 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo "Rebuilt \`rustdar-web/zones.pack\` from the six editions this branch pins."
+            echo "Rebuilt \`squallar-web/zones.pack\` from the six editions this branch pins."
             echo
             echo "| | |"
             echo "|---|---|"

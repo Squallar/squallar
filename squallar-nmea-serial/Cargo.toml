@@ -1,0 +1,22 @@
+# NMEA parsing and the serial-port transport, in its own parsed vocabulary —
+# a parser that does not know the app's fix model. squallar-location's `serial`
+# module is the translation (the edge flipped at WO-RL-3: the facade depends
+# on this provider, never the reverse). Ceiling held by tests/charter.rs.
+[package]
+name = "squallar-nmea-serial"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["serial"]
+serial = ["dep:serialport"]
+
+[dependencies]
+chrono = { workspace = true }
+log = { workspace = true }
+nmea = "=0.8.0"
+serde = { workspace = true }
+serialport = { version = "=4.9.0", optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

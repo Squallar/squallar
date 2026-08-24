@@ -1,6 +1,6 @@
-# Rustdar — architecture
+# Squallar — architecture
 
-Rustdar is a cross-platform NEXRAD weather radar viewer. It fetches Level II
+Squallar is a cross-platform NEXRAD weather radar viewer. It fetches Level II
 and Level III volumes and a dozen weather overlays, rasterises them, and draws
 them on a map on desktop (Linux/macOS/Windows), Android, iOS and in the browser
 as a wasm32 PWA (WebGPU, falling back to WebGL2). The GUI is **egui**; the
@@ -18,7 +18,7 @@ architecture or features change.
 
 Cargo workspace, `resolver = "2"`, edition 2024, toolchain `stable`
 (`rust-toolchain.toml`; edition 2024 needs 1.85+). Twenty-one members:
-seventeen first-party `rustdar-*` crates, the `nexrad-level3` decoder, and three
+seventeen first-party `squallar-*` crates, the `nexrad-level3` decoder, and three
 vendored crates.io crates.
 
 Read the graph bottom-up. Nothing in a lower band may depend on a higher one.
@@ -27,15 +27,15 @@ Read the graph bottom-up. Nothing in a lower band may depend on a higher one.
 
 | Crate | Role |
 |---|---|
-| `rustdar-geo` | Geographic primitives: `GeoPoint`, `GeoBounds`, `PlacedRaster`, Web Mercator, `MERCATOR_LAT_LIMIT_DEG`. |
-| `rustdar-units` | Unit conversion and timezone formatting. `UserPreferences`, persisted in `ui.json`. Conversions happen at display boundaries only; internal data stays in original units. |
-| `rustdar-kv` | Small named blobs across sessions. `KvStore` is `load`, `store`, `store_now` and deliberately nothing more. |
-| `rustdar-nmea-serial` | NMEA parser and serial-port reader behind the `serial` feature (off on wasm and iOS). |
+| `squallar-geo` | Geographic primitives: `GeoPoint`, `GeoBounds`, `PlacedRaster`, Web Mercator, `MERCATOR_LAT_LIMIT_DEG`. |
+| `squallar-units` | Unit conversion and timezone formatting. `UserPreferences`, persisted in `ui.json`. Conversions happen at display boundaries only; internal data stays in original units. |
+| `squallar-kv` | Small named blobs across sessions. `KvStore` is `load`, `store`, `store_now` and deliberately nothing more. |
+| `squallar-nmea-serial` | NMEA parser and serial-port reader behind the `serial` feature (off on wasm and iOS). |
 | `nexrad-level3` | Level III product decoder — WMO headers, zlib/BZ2, radial packets. Byte slices in, model types out; no network, no filesystem. |
-| `rustdar-netcdf` | NetCDF4-over-HDF5 reading and CF-convention unpacking (`_Unsigned`, `_FillValue`, `valid_range`, `scale_factor`, CF time units). Knows the format; knows nothing about satellites or lightning. Two shapes for a decoded variable — `Vec<Option<f64>>` for records, `Vec<f32>`/NaN for rasters — plus row-windowed reads. |
+| `squallar-netcdf` | NetCDF4-over-HDF5 reading and CF-convention unpacking (`_Unsigned`, `_FillValue`, `valid_range`, `scale_factor`, CF time units). Knows the format; knows nothing about satellites or lightning. Two shapes for a decoded variable — `Vec<Option<f64>>` for records, `Vec<f32>`/NaN for rasters — plus row-windowed reads. |
 
-**Band 1 — the substrate.** `rustdar-source` stands on `rustdar-geo` and
-`rustdar-units` and nothing else. It holds contract and vocabulary only: the
+**Band 1 — the substrate.** `squallar-source` stands on `squallar-geo` and
+`squallar-units` and nothing else. It holds contract and vocabulary only: the
 `SourceHandler` trait and its `PaneRef`/`PaneMut` views, `LayerId` and the
 `known::` const table, `FieldId`, `RenderMode`, `Surface`, `SourceEvent`,
 `SourceLiveness`, `TimeAxis`, the `JobInput`/`JobOut`/`JobCodec` job vocabulary,
@@ -46,7 +46,7 @@ Read the graph bottom-up. Nothing in a lower band may depend on a higher one.
 `REFLECTIVITY_SHARED_STOPS` (`product.rs`) is the first of those and the rule it
 sets is narrow. Until 2026-08-23 a colour ramp was held to belong to the crate that
 published the field, and reflectivity was drawn through three separate tables:
-`rustdar-radar`'s, MRMS's and HRRR's. The two overlay tables were pinned equal
+`squallar-radar`'s, MRMS's and HRRR's. The two overlay tables were pinned equal
 to each other; the radar one was pinned to nothing, and it had drifted about one
 5 dBZ band through the green-to-red region — the same storm read 45 dBZ red on a
 tilt and orange on the mosaic beside it, in the same pane, with every gate
@@ -74,24 +74,24 @@ gets written down.** `REFLECTIVITY_ALPHA` is a second such value — one opacity
 for the same quantity on every layer that draws it, scoped to that field and not
 to either crate's own translucency constant.
 
-**Band 2 — the data crates.** `rustdar-radar` and `rustdar-overlays` each stand
+**Band 2 — the data crates.** `squallar-radar` and `squallar-overlays` each stand
 on the substrate. **They do not know about each other**: the
 overlays→radar edge is cut, and anything both sides need lives in
-`rustdar-source` instead.
+`squallar-source` instead.
 
-**Band 3 and up — engine, renderer and shell.** `rustdar-device-profile`
-(budgets and constants) sits above `rustdar-radar`; `rustdar-worker` (the job
-funnel, the pool, the wire) above the two data crates; `rustdar-egui` (pure UI)
-above the data crates and the device profile; `rustdar-gpu` (wgpu renderer,
-upload path, mirror, staging ring) and `rustdar-volumetric` (the 3D stack) above
-that; `rustdar-location` — the location facade, standing only on
-`rustdar-geo`, `rustdar-kv` and `rustdar-nmea-serial`, and wrapping every OS's
+**Band 3 and up — engine, renderer and shell.** `squallar-device-profile`
+(budgets and constants) sits above `squallar-radar`; `squallar-worker` (the job
+funnel, the pool, the wire) above the two data crates; `squallar-egui` (pure UI)
+above the data crates and the device profile; `squallar-gpu` (wgpu renderer,
+upload path, mirror, staging ring) and `squallar-volumetric` (the 3D stack) above
+that; `squallar-location` — the location facade, standing only on
+`squallar-geo`, `squallar-kv` and `squallar-nmea-serial`, and wrapping every OS's
 location quirks behind one Rust surface (`linux`, `windows`, `apple`,
 `android`, `web`, plus the NMEA serial provider) — off to one side of them;
-`rustdar-app` (the portable application: winit handler, fetch and render
+`squallar-app` (the portable application: winit handler, fetch and render
 dispatch, app state) above all of them; and the two entry crates on top —
-`rustdar` (desktop/Android/iOS binary and `rustdar_native` lib) and
-`rustdar-web` (browser).
+`squallar` (desktop/Android/iOS binary and `squallar_native` lib) and
+`squallar-web` (browser).
 
 **The direction is enforced, not merely intended.** Ten crates carry a
 `tests/charter.rs` that reads `cargo metadata --no-deps --format-version 1` and
@@ -102,19 +102,19 @@ and most add a direction test:
 
 | Charter | Direction test |
 |---|---|
-| `rustdar-source/tests/charter.rs` | `the_overlays_to_radar_edge_stays_cut` |
-| `rustdar-geo/tests/charter.rs` | `the_floor_sits_under_the_substrate` |
-| `rustdar-device-profile/tests/charter.rs` | `the_floor_sits_under_the_app_side` |
-| `rustdar-gpu/tests/charter.rs` | `the_boundary_sits_under_the_app` |
-| `rustdar-volumetric/tests/charter.rs` | `the_stack_sits_under_the_app` |
-| `rustdar-worker/tests/charter.rs` | `the_engine_sits_above_the_vocabulary` |
-| `rustdar-kv/tests/charter.rs` | `the_contract_is_three_methods_and_nothing_more` |
-| `rustdar-location/tests/charter.rs` | `the_feature_fences_map_the_arms`, `the_facade_stands_on_the_provider_and_not_the_reverse` |
-| `rustdar-nmea-serial/tests/charter.rs` | ceiling only |
-| `rustdar-netcdf/tests/charter.rs` | `the_crate_is_a_band_zero_leaf`, `the_format_layer_sits_under_the_data_crate` |
+| `squallar-source/tests/charter.rs` | `the_overlays_to_radar_edge_stays_cut` |
+| `squallar-geo/tests/charter.rs` | `the_floor_sits_under_the_substrate` |
+| `squallar-device-profile/tests/charter.rs` | `the_floor_sits_under_the_app_side` |
+| `squallar-gpu/tests/charter.rs` | `the_boundary_sits_under_the_app` |
+| `squallar-volumetric/tests/charter.rs` | `the_stack_sits_under_the_app` |
+| `squallar-worker/tests/charter.rs` | `the_engine_sits_above_the_vocabulary` |
+| `squallar-kv/tests/charter.rs` | `the_contract_is_three_methods_and_nothing_more` |
+| `squallar-location/tests/charter.rs` | `the_feature_fences_map_the_arms`, `the_facade_stands_on_the_provider_and_not_the_reverse` |
+| `squallar-nmea-serial/tests/charter.rs` | ceiling only |
+| `squallar-netcdf/tests/charter.rs` | `the_crate_is_a_band_zero_leaf`, `the_format_layer_sits_under_the_data_crate` |
 
-**One cycle looks like a cycle and is not.** `rustdar-volumetric` declares a
-normal dependency on `rustdar-gpu`; `rustdar-gpu` declares `rustdar-volumetric`
+**One cycle looks like a cycle and is not.** `squallar-volumetric` declares a
+normal dependency on `squallar-gpu`; `squallar-gpu` declares `squallar-volumetric`
 as a **dev**-dependency only, for its own test targets. Cargo's normal-dep graph
 is acyclic. Read dependency questions off `cargo metadata`, per kind, the way
 the charters do.
@@ -141,21 +141,21 @@ file replaced (`.github/copilot-instructions.md`, deleted once this file and
 `CLAUDE.md` took over). Both were re-verified against the tree at the time of
 writing.
 
-> **UI ↔ Platform boundary:** `rustdar-egui` must not depend on wgpu/winit.
+> **UI ↔ Platform boundary:** `squallar-egui` must not depend on wgpu/winit.
 > Communicates via `GuiAction` (out) and setter methods (in). Entry point:
 > `Gui::ui(&mut self, &egui::Context) -> Vec<GuiAction>`.
 
-Still true of the dependency half — `rustdar-egui`'s manifest names neither
-wgpu nor winit, and `rustdar-gpu` exists precisely so the renderer can sit
+Still true of the dependency half — `squallar-egui`'s manifest names neither
+wgpu nor winit, and `squallar-gpu` exists precisely so the renderer can sit
 *above* the UI crate rather than inside it. The "setter methods (in)" half has
 since been replaced: the in-direction is now the typed seam of §3, and the
 setter surface is ratcheted at 0 in `ui.rs`.
 
-> **No portable code** [in `rustdar`] **— that lives in `rustdar-app`, which
+> **No portable code** [in `squallar`] **— that lives in `squallar-app`, which
 > this crate depends on (never the other way round).**
 
-Still true: `rustdar` declares `rustdar-app`, and `rustdar-app` declares no
-dependency on `rustdar` of any kind.
+Still true: `squallar` declares `squallar-app`, and `squallar-app` declares no
+dependency on `squallar` of any kind.
 
 ---
 
@@ -167,24 +167,24 @@ pins it.
 
 ### 3.1 `FrameInputs` — App → Gui, snapshot-shaped
 
-* **Owner**: `rustdar-egui/src/shell_api.rs`.
+* **Owner**: `squallar-egui/src/shell_api.rs`.
 * **Shape**: one frame's facts, composed by the App from state it already owns,
   applied by `Gui::apply_frame_inputs` once per frame immediately before
   `Gui::ui`. Insets, exit support, loop frame budget, location permission and
   fix, heading, catalogue pending, the opaque `liveness` slice, floor tile zoom
   bias.
-* **Contract test (Gui half)**: `rustdar-egui/src/shell_api/tests.rs` —
+* **Contract test (Gui half)**: `squallar-egui/src/shell_api/tests.rs` —
   a sentinel-expression walk asserting every field surfaces through the `Gui`'s
   own read side **and persists** across frames with no re-application, so a
   missed compose is a stale value rather than a reverted one.
-* **Contract test (App half)**: `rustdar-app/src/app/chunk_feed_precedence_tests.rs`,
+* **Contract test (App half)**: `squallar-app/src/app/chunk_feed_precedence_tests.rs`,
   `the_chunk_feeds_status_reaches_the_seam_that_publishes_it`. It exists because
   the Gui-half test alone was green while the App computed a status and dropped
   it on the floor.
 
 ### 3.2 `GuiEvent` — App → Gui, event-shaped
 
-* **Owner**: `rustdar-egui/src/shell_api.rs`; applied by `Gui::apply` at the
+* **Owner**: `squallar-egui/src/shell_api.rs`; applied by `Gui::apply` at the
   call site's existing control-flow position, so drain timing does not move.
 * **Nine variants**, each named after the behaviour it replaced: scan info for a
   site / for a pane, merge-semantics chunk scan info, fetching, error, radar
@@ -192,16 +192,16 @@ pins it.
 
 ### 3.3 `GuiAction` — Gui → App
 
-* **Owner**: `rustdar-egui/src/actions.rs`. `Gui::ui` returns `Vec<GuiAction>`;
+* **Owner**: `squallar-egui/src/actions.rs`. `Gui::ui` returns `Vec<GuiAction>`;
   `App::process_gui_actions` dispatches them.
-* **Contract test**: `rustdar-app/src/app/gui_action_replay_tests.rs`,
+* **Contract test**: `squallar-app/src/app/gui_action_replay_tests.rs`,
   `a_scripted_action_batch_lands_through_the_seam` — a scripted batch driven
   through both directions of the seam.
 
 ### 3.4 `SourceHandler` — the layer contract
 
-* **Owner**: `rustdar-source/src/handler.rs`. Fifty-eight methods; most
-  defaulted. `RadarSource` (`rustdar-radar/src/source.rs`) overrides
+* **Owner**: `squallar-source/src/handler.rs`. Fifty-eight methods; most
+  defaulted. `RadarSource` (`squallar-radar/src/source.rs`) overrides
   thirty-four of them.
 * **The scope line, as ruled**:
 
@@ -217,9 +217,9 @@ pins it.
   overlay fetch door; radar arrives instead through `create_frame_list_task`,
   `list_frames`, `fetch_frame`, `apply_frame_listing` and its own bespoke
   multi-stage ingest.
-* **Composition**: `rustdar-egui/src/sources.rs::all()` chains
-  `rustdar_overlays::render::handlers::sources()` with
-  `rustdar_radar::source::sources()`. That is the only composition.
+* **Composition**: `squallar-egui/src/sources.rs::all()` chains
+  `squallar_overlays::render::handlers::sources()` with
+  `squallar_radar::source::sources()`. That is the only composition.
 
 #### 3.4.1 When a fact becomes a contract method, and when it stays an id check
 
@@ -231,7 +231,7 @@ answered. Cite this section instead of re-deriving it.
 **A fact becomes a contract method** when it is a *declaration about the layer's
 own data* that the shell would otherwise re-spell. The re-spelling is the harm:
 it creates a second authority to keep in step. `loop_start_frame`
-(`rustdar-app/src/app_render.rs`) states it plainly — *"Whether stamps later
+(`squallar-app/src/app_render.rs`) states it plainly — *"Whether stamps later
 than the wall clock are expected is the layer's own answer… A `match` on the
 layer id here would be a second authority to keep in step."* The same sentence
 appears at `arm_layer_loop`, `rail_regions` (`ui_timeline.rs`),
@@ -284,19 +284,19 @@ That is a different question from this one.
 
 ### 3.5 `JobCodec` / the job funnel
 
-* **Owner**: `rustdar-source/src/job.rs` (`JobInput`, `JobOut`, `DescribedJob`,
+* **Owner**: `squallar-source/src/job.rs` (`JobInput`, `JobOut`, `DescribedJob`,
   `DescribedOut`, `JobGeometry`, `JobCost`, `JobCodec`, `JobSpec`,
-  `JobOutCodec`); funnel in `rustdar-worker/src/offload.rs`; composition in
-  `rustdar-worker/src/job_registry.rs`.
-* **The pin**: `rustdar-app/tests/arch_ratchets.rs::offload_names_zero_source_crate_types`
-  — `offload.rs` names **zero** `rustdar_overlays::` or `rustdar_radar::` paths,
+  `JobOutCodec`); funnel in `squallar-worker/src/offload.rs`; composition in
+  `squallar-worker/src/job_registry.rs`.
+* **The pin**: `squallar-app/tests/arch_ratchets.rs::offload_names_zero_source_crate_types`
+  — `offload.rs` names **zero** `squallar_overlays::` or `squallar_radar::` paths,
   in either direction, prose included, with a presence control on
   `job_registry.rs` so a rotted needle cannot leave the zero green over
   anything.
 
 ### 3.6 `KvStore` — configuration persistence
 
-* **Owner**: `rustdar-kv/src/lib.rs`. String keys, string blobs, never
+* **Owner**: `squallar-kv/src/lib.rs`. String keys, string blobs, never
   load-bearing: a backend that cannot tell "absent" from "unreadable" answers
   `None` for both and the caller falls back to defaults.
 * Keys are logical names, not paths — a filesystem backend maps a key onto a
@@ -304,22 +304,22 @@ That is a different question from this one.
   in memory. **The key strings are on-disk compatibility**: a changed string
   silently orphans every config an existing install has saved. Each constant
   lives beside its owner.
-* **Pin**: `rustdar-kv/tests/charter.rs::the_contract_is_three_methods_and_nothing_more`.
+* **Pin**: `squallar-kv/tests/charter.rs::the_contract_is_three_methods_and_nothing_more`.
 
 ### 3.7 `VolumePainter` → `VolumeCapable`
 
-* **`VolumePainter`** (`rustdar-egui/src/volume_view.rs`) is what the UI is
+* **`VolumePainter`** (`squallar-egui/src/volume_view.rs`) is what the UI is
   handed so a 3D pane can draw; it is installed through
   `GuiEvent::VolumePainter` and can be taken away again.
-* **`VolumeCapable`** (`rustdar-source/src/volume.rs`) is the layer-side half: a
+* **`VolumeCapable`** (`squallar-source/src/volume.rs`) is the layer-side half: a
   handler that can build a volume answers `SourceHandler::volume()` with one,
   and shapes its own job through the required, undefaulted `volume_job`.
-* **Pin**: `rustdar-app/tests/arch_ratchets.rs::the_radar_geometry_type_is_defined_in_radar_and_not_in_egui`
+* **Pin**: `squallar-app/tests/arch_ratchets.rs::the_radar_geometry_type_is_defined_in_radar_and_not_in_egui`
   keeps the radar-shaped half of this out of the presentation crate.
 
 ### 3.8 `AsyncTileSource` — map tiles
 
-* **Owner**: `rustdar-egui/src/tile_source.rs`. A blanket-implemented marker
+* **Owner**: `squallar-egui/src/tile_source.rs`. A blanket-implemented marker
   splitting the `Send + Sync` host bound from the single-threaded wasm one, so
   the same tile machinery compiles on both.
 * CartoDB no-labels base plus a labels-only overlay drawn *above* radar and
@@ -330,7 +330,7 @@ That is a different question from this one.
 ## 4. Binding runtime rules
 
 **The frame thread does no heavy work.** Long-running, CPU-bound work goes
-through `rustdar_worker::offload::offload_job`, which posts to a worker if this
+through `squallar_worker::offload::offload_job`, which posts to a worker if this
 thread has a sink and otherwise runs it here. "It runs rarely" is not an
 exception. Freeing large payloads goes through `offload::discard` from the frame
 thread, because the deferred queue is thread-local.
@@ -341,11 +341,11 @@ stay realtime. Never trade interaction latency for data latency.
 
 **Reopen is 1:1.** UI state persists so that reopening the app is visually
 identical to closing it. "That's session posture" is not a reason not to
-persist. Units and formatting go through `rustdar-units`.
+persist. Units and formatting go through `squallar-units`.
 
 **Every option is expressed.** Every option any model offers must be reachable
 and *drawn* through the real chrome on every width class. Enforced by
-`rustdar-egui/src/parity_walk.rs` —
+`squallar-egui/src/parity_walk.rs` —
 `every_option_is_reachable_on_a_compact_screen`,
 `..._on_a_medium_screen`, `..._on_an_expanded_screen` — which drives the real
 input harness and records an item as reachable only when its centre lands
@@ -354,7 +354,7 @@ may not be absent. The walk derives its layer and field inventories from the
 live registry, so a registered layer is walked by construction:
 
 ```bash
-cargo test -p rustdar-egui parity_walk                    # 3/3, fifteen layers
+cargo test -p squallar-egui parity_walk                    # 3/3, fifteen layers
 ```
 
 **The web target is measured, never inferred.** A scaled or extrapolated figure
@@ -365,7 +365,7 @@ browser gate proves:
 > `wasm-bindgen-test` in this workspace; the CI wasm rows are build and check.
 > Two gaps were measured at WO-M13a and both still hold: the stock Tier-2 scene
 > **enables no texture overlay**, so those legs prove boot, render and the
-> worker wire and nothing about the overlay arrival path; and `rustdar-web`
+> worker wire and nothing about the overlay arrival path; and `squallar-web`
 > initialises `console_log` at `Level::Info`, so a `debug!` line can **never**
 > appear in a browser. **A green Tier-2 is evidence about the scene Tier-2
 > runs.** A change whose subject that scene does not exercise must say so and
@@ -374,8 +374,8 @@ browser gate proves:
 **"Web" is two targets.** Firefox is first-class and governs over Chrome.
 Measure both separately and never merge the figures.
 
-**WebGPU, falling back to WebGL2.** `rustdar_app::app` asks for
-`Backends::BROWSER_WEBGPU | GL` on wasm32; `rustdar-gpu/Cargo.toml` compiles
+**WebGPU, falling back to WebGL2.** `squallar_app::app` asks for
+`Backends::BROWSER_WEBGPU | GL` on wasm32; `squallar-gpu/Cargo.toml` compiles
 both browser backends, and neither is optional. This is about **adapter
 coverage, not throughput** — WebGPU recovers nothing on the one measured
 platform loss (WebGL2 has no `MAPPABLE_PRIMARY_BUFFERS`, so uploads run at
@@ -410,7 +410,7 @@ without its arm and its renderer.
 
 **Limits are requested, not accepted.** A WebGPU device gets
 `max_texture_dimension_2d` 8192 unless it asks for more, which is *below*
-Firefox's WebGL2 32768. `rustdar_gpu::device::device_limits` starts from the
+Firefox's WebGL2 32768. `squallar_gpu::device::device_limits` starts from the
 WebGL2 downlevel floor and lifts the resolution to the adapter's own report on
 both browser APIs, so enabling WebGPU cannot lower the ceiling.
 
@@ -426,12 +426,12 @@ forced on (`--ff-pref dom.webgpu.enabled=true`) the same build selects
 `BrowserWebGpu` and reaches 32767 px 2D textures against WebGL2's 32768 — a
 one-texel difference, and the evidence that the second path runs rather than
 merely compiles. It does double the paths under test:
-`rustdar-gpu/Cargo.toml` is the one feature-chooser for the whole graph, and
-`rustdar-gpu/src/lib.rs` fails the build if either browser backend goes missing.
+`squallar-gpu/Cargo.toml` is the one feature-chooser for the whole graph, and
+`squallar-gpu/src/lib.rs` fails the build if either browser backend goes missing.
 Read those comments before touching wgpu features anywhere.
 
 **Generation counters guard against stale results.** `RenderDispatch`
-(`rustdar-app/src/render_dispatch.rs`) keeps a per-site `fetch_generations` map
+(`squallar-app/src/render_dispatch.rs`) keeps a per-site `fetch_generations` map
 and one `render_generation`; take the next generation before spawning
 (`next_fetch_generation`), and discard a result whose generation is below the
 current one (`is_fetch_stale`, `is_render_stale`).
@@ -441,19 +441,19 @@ current one (`is_fetch_stale`, `is_render_stale`).
 ## 5. Adding a source
 
 A source is a layer. Adding one is **one handler file plus three registration
-lines**, and nothing outside `rustdar-overlays` (or `rustdar-radar`, for a
+lines**, and nothing outside `squallar-overlays` (or `squallar-radar`, for a
 radar-shaped source).
 
-1. **The handler file** — `rustdar-overlays/src/render/handlers/<name>.rs`,
+1. **The handler file** — `squallar-overlays/src/render/handlers/<name>.rs`,
    implementing `SourceHandler`. Follow `outlook.rs` or `alert.rs` for a
    polygon/texture layer, `metar.rs` for a per-frame point layer,
    `location.rs`/`colorscale.rs` for a per-frame direct layer.
-2. **`rustdar-source/src/id.rs`** — a `known::` const.
-3. **`rustdar-source/src/id.rs`** — the matching `LAYER_ID_LEDGER` entry.
-4. **`rustdar-overlays/src/render/handlers/mod.rs`** — one row in `sources()`,
+2. **`squallar-source/src/id.rs`** — a `known::` const.
+3. **`squallar-source/src/id.rs`** — the matching `LAYER_ID_LEDGER` entry.
+4. **`squallar-overlays/src/render/handlers/mod.rs`** — one row in `sources()`,
    which is the only place these registrations are named.
 
-Then bump the two hand-kept second spellings in `rustdar-egui/src/sources.rs`:
+Then bump the two hand-kept second spellings in `squallar-egui/src/sources.rs`:
 `REGISTERED_LAYER_COUNT` and, if the source registers fields,
 `REGISTERED_FIELD_COUNT`. **Never derive either from `all()`, `sources()` or
 `LAYER_ID_LEDGER::len()`** — a floor computed from the thing it floors compares
@@ -461,9 +461,9 @@ the registry against itself and cannot fail.
 
 **Nothing proves this checklist by construction.** Until 2026-08-22 a
 test-only `fake-source` layer carried an acceptance suite
-(`rustdar-app/tests/fake_source_acceptance.rs` and the UI half in
-`rustdar-egui`) whose footprint pins asserted, file by file, that a new source
-cost no edit outside `rustdar-overlays`. The layer and the suite were deleted
+(`squallar-app/tests/fake_source_acceptance.rs` and the UI half in
+`squallar-egui`) whose footprint pins asserted, file by file, that a new source
+cost no edit outside `squallar-overlays`. The layer and the suite were deleted
 together and **no gate replaced them**. The checklist above is now design
 intent held by review.
 
@@ -471,12 +471,12 @@ What is left is evidence rather than a gate, and it is weaker than the deleted
 suite claimed. Three real sources landed in August 2026 — SPC Fire Weather
 Outlooks (`23df4d92`), the MRMS national mosaic (`4cf3dd7f`) and the GMGSI
 global mosaic (`93e8606d`). Each kept all of its *behaviour* inside
-`rustdar-overlays`, added no channel, and — because both gridded layers ride
+`squallar-overlays`, added no channel, and — because both gridded layers ride
 `GriddedInput` — added no codec row. That is real evidence the seams hold.
 
 **Be precise about what the fake ever proved.** A texture layer that renders
 through the job funnel needs one arm outside its own crate: the described-kinds
-match in `App::spawn_overlay_render` (`rustdar-app/src/app_fetch.rs`), which
+match in `App::spawn_overlay_render` (`squallar-app/src/app_fetch.rs`), which
 names every such layer by `known::` const. All three real sources above added a
 line to it. The fake escaped that arm only because it fell into the match's
 fallback branch — a build that registered it logged
@@ -487,8 +487,8 @@ for the fake and has never held for a real texture source. Treat a *new kind*
 of arm as the signal that a seam is incomplete; the registration tax and the
 `spawn_overlay_render` row are the known, expected cost.
 
-Radar registers itself: `rustdar_radar::source::sources()`, chained by
-`rustdar_egui::sources::all()`. A new source **never adds a channel** — the
+Radar registers itself: `squallar_radar::source::sources()`, chained by
+`squallar_egui::sources::all()`. A new source **never adds a channel** — the
 `ChannelHub`'s generic seams (`overlay_render`, `voxel`) already carry it.
 
 ---
@@ -509,19 +509,19 @@ its own instrument (the crate-wide walk in `arch_ratchets.rs`; the
 whitespace-collapsed per-file scrape in `gui_seam_ratchet_tests.rs` — they are
 different instruments and one's number is never the other's).
 
-### 6.1 `rustdar-app/tests/arch_ratchets.rs` — 10 tests
+### 6.1 `squallar-app/tests/arch_ratchets.rs` — 10 tests
 
 | Test | Constant | Ceiling | What it counts |
 |---|---|---|---|
-| `the_app_pokes_gui_coupling_never_grows` | `SELF_GUI_MAX` | 181 | `self.gui.` anywhere in `rustdar-app` |
+| `the_app_pokes_gui_coupling_never_grows` | `SELF_GUI_MAX` | 181 | `self.gui.` anywhere in `squallar-app` |
 | | `SELF_GUI_NON_TEST_MAX` | 176 | the same, outside test-named paths |
-| | — | 0 | `self.gui.set_` anywhere in `rustdar-app` — the target zero, held as a test rather than as a grep |
+| | — | 0 | `self.gui.set_` anywhere in `squallar-app` — the target zero, held as a test rather than as a grep |
 | `the_config_swap_stays_deleted` | — | 0 | `load_pane_configs` / `save_pane_configs` / `loaded_configs`, with `serialize_pane_state` as the presence control |
-| `the_gui_setter_surface_never_grows` | `UI_SETTER_MAX` | 0 | `pub fn set_` in `rustdar-egui/src/ui.rs` |
-| | `GUI_IMPL_SETTER_MAX` | 1 | the same needle over **every** inherent `impl Gui` block in `rustdar-egui` |
-| `the_product_enum_never_spreads_further_into_egui` | `PRODUCT_IN_EGUI_MAX` | 0 | `RadarProduct` anywhere under `rustdar-egui`, **comments included** |
+| `the_gui_setter_surface_never_grows` | `UI_SETTER_MAX` | 0 | `pub fn set_` in `squallar-egui/src/ui.rs` |
+| | `GUI_IMPL_SETTER_MAX` | 1 | the same needle over **every** inherent `impl Gui` block in `squallar-egui` |
+| `the_product_enum_never_spreads_further_into_egui` | `PRODUCT_IN_EGUI_MAX` | 0 | `RadarProduct` anywhere under `squallar-egui`, **comments included** |
 | `the_channel_hub_never_grows_past_eighteen_receiver_pairs` | `HUB_RECEIVER_MAX` | 17 | `_receiver: Receiver<` fields on `ChannelHub` |
-| `offload_names_zero_source_crate_types` | — | 0 | `rustdar_overlays::` / `rustdar_radar::` in `rustdar-worker/src/offload.rs` |
+| `offload_names_zero_source_crate_types` | — | 0 | `squallar_overlays::` / `squallar_radar::` in `squallar-worker/src/offload.rs` |
 | `the_radar_geometry_type_is_defined_in_radar_and_not_in_egui` | — | 1 / 0 | `struct LoopGeometry` in radar / in egui |
 | `the_loop_frame_arms_stay_radars_own_vocabulary` | `LOOP_FRAME_ARMS_MAX` | 8 | the loop frame's closed arms and their two cache aliases |
 | | `LOOP_FRAME_ARMS_NON_TEST_MAX` | 2 | the same, outside tests |
@@ -532,10 +532,10 @@ Run it by target name — a filter matching zero tests is a failed run, not a
 pass:
 
 ```bash
-cargo test -p rustdar-app --test arch_ratchets   # 10/10
+cargo test -p squallar-app --test arch_ratchets   # 10/10
 ```
 
-### 6.2 `rustdar-app/src/app/gui_seam_ratchet_tests.rs` — the per-file coupling ceilings
+### 6.2 `squallar-app/src/app/gui_seam_ratchet_tests.rs` — the per-file coupling ceilings
 
 | Test | File | Ceiling |
 |---|---|---|
@@ -603,16 +603,16 @@ measured, not because the construct is allowed.
 ### 6.4 Other standing pins
 
 * **Dependency ceilings** — the nine `tests/charter.rs` files of §1.
-* **Cited-test resolution** — `rustdar-radar/tests/doc_citations_resolve.rs`
+* **Cited-test resolution** — `squallar-radar/tests/doc_citations_resolve.rs`
   scans **every `//`, `///` and `//!` comment in the workspace** and requires
   any backticked name whose final `::` segment is snake_case with **five or
   more** underscore-separated segments to resolve to a real `fn` or `mod`, and
   requires a citation to an `#[ignore]`d test to say that it is ignored.
   **Do not name a test in a comment unless it exists.** Genuine non-defects go
   in that file's `ALLOWED` table *with the reason*.
-* **One geodesy definition** — `rustdar-radar/tests/geodesy_one_definition.rs`.
+* **One geodesy definition** — `squallar-radar/tests/geodesy_one_definition.rs`.
 * **No release-artifact row asks for a test-only feature** —
-  `rustdar/src/release_artifact_features.rs` parses `.github/workflows/build.yaml`'s
+  `squallar/src/release_artifact_features.rs` parses `.github/workflows/build.yaml`'s
   build matrix and, for every row carrying an `artifact:` key, asserts that the
   feature **set** that row's cargo command requests contains no test-only
   feature. `--all-features` fails it because it expands to every feature the
@@ -620,14 +620,14 @@ measured, not because the construct is allowed.
   presence controls (the four desktop rows are found by name with a `cmd:`
   each; every needle names a feature some manifest declares). Its module docs
   record the one residual it deliberately does **not** assert: `--all-targets`
-  unifies `rustdar-radar/test-support` into the shipped lib unit, measured, and
+  unifies `squallar-radar/test-support` into the shipped lib unit, measured, and
   unfolding the artifact build from the coverage build is not a change a gate
   should force.
 * **On-screen strings are ASCII unless the glyph is registered** —
-  `rustdar-egui/src/ui_glyphs.rs` holds the one inventory of icon and text
+  `squallar-egui/src/ui_glyphs.rs` holds the one inventory of icon and text
   glyphs, verified against the fonts egui actually bundles, and
   `ui_string_literals_use_only_registered_glyphs` scans every string literal in
-  `rustdar-egui`, `rustdar-overlays`, `rustdar-app` and `rustdar-volumetric`
+  `squallar-egui`, `squallar-overlays`, `squallar-app` and `squallar-volumetric`
   (non-test sources) for unregistered non-ASCII characters. Check it whenever a
   user-visible string changes: either spell it in ASCII or register the glyph.
 
@@ -649,13 +649,13 @@ Measured at WO-E10.4 (matching lines, per crate, `target`/`pkg` excluded):
 
 | crate | lines | | crate | lines |
 |---|---:|---|---|---:|
-| `rustdar-device-profile` | 70 | | `rustdar-overlays` | 21 |
-| `rustdar-radar` | 44 | | `rustdar-gpu` | 18 |
-| `rustdar-app` | 41 | | `rustdar-location` | 17 |
-| `rustdar-egui` | 39 | | `rustdar-source` | 17 |
-| `rustdar-worker` | 26 | | `rustdar-web` | 14 |
-| | | | `rustdar-volumetric` | 12 |
-| | | | `rustdar-geo`, `rustdar-kv`, `rustdar-nmea-serial` | 1 each |
+| `squallar-device-profile` | 70 | | `squallar-overlays` | 21 |
+| `squallar-radar` | 44 | | `squallar-gpu` | 18 |
+| `squallar-app` | 41 | | `squallar-location` | 17 |
+| `squallar-egui` | 39 | | `squallar-source` | 17 |
+| `squallar-worker` | 26 | | `squallar-web` | 14 |
+| | | | `squallar-volumetric` | 12 |
+| | | | `squallar-geo`, `squallar-kv`, `squallar-nmea-serial` | 1 each |
 
 **Total 322 across 14 crates.** The plan's older baseline (`165/54/40/30/25,
 Σ314`) is **not comparable** and should not be read as a rise of 8: it was taken
@@ -683,8 +683,8 @@ cargo clippy --all-targets --all-features -- -D warnings               # Clippy 
 ```
 
 - **`-D warnings` is the gate.** A bare `cargo clippy --all-targets --all-features` is the autofix step that runs *before* it and fails on nothing, so it is not the CI-matching command.
-- **The wasm32 row goes before clippy**, as it does in CI: it sits several steps ahead of `Run Clippy` in the same job, so a break there aborts the job and hides every lint finding behind it. It is also the only build that type-checks `rustdar-web` — the crate's deps are under `[target.'cfg(target_arch = "wasm32")'.dependencies]`, so every other target compiles it as an empty shell and reports success.
-- **The other two gates are not cheap**, and CI is the right place for them: the host build (`cargo build --workspace --all-targets --all-features`) and the Android arm (`cargo ndk -t arm64-v8a -P <minSdk> check -p rustdar --lib`). Test runs `cargo llvm-cov --no-report --all-features` in its own workflow.
+- **The wasm32 row goes before clippy**, as it does in CI: it sits several steps ahead of `Run Clippy` in the same job, so a break there aborts the job and hides every lint finding behind it. It is also the only build that type-checks `squallar-web` — the crate's deps are under `[target.'cfg(target_arch = "wasm32")'.dependencies]`, so every other target compiles it as an empty shell and reports success.
+- **The other two gates are not cheap**, and CI is the right place for them: the host build (`cargo build --workspace --all-targets --all-features`) and the Android arm (`cargo ndk -t arm64-v8a -P <minSdk> check -p squallar --lib`). Test runs `cargo llvm-cov --no-report --all-features` in its own workflow.
 - **Check `--all`, fix `-p`.** Any formatter or lint-fixer that *writes* stays package-scoped (`cargo fmt -p <package>`); only checks go workspace-wide. An `--all` write reformats files the branch does not own, and a package-scoped *check* hides breakage elsewhere.
 
 Two optional hooks in `.githooks/` run a subset of this locally. They are inert

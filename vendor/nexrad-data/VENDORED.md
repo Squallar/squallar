@@ -126,7 +126,7 @@ everything else in this file, one instrument source built twice, release +
 
 The 98–99% above is those first two rows divided: decompression alone on the
 dense volume is 7,806,188,828 of the 7,883,148,609 its whole end-to-end decode
-retires, so **99.0%** before and 98.5% after. `rustdar-radar`'s `scan::decoded`
+retires, so **99.0%** before and 98.5% after. `squallar-radar`'s `scan::decoded`
 used to say 92%, from `perf record` sample shares — cycles, not instructions,
 and decompression retires its instructions at a lower IPC than the Message 31
 parse does. Both are true of different quantities and that comment now says
@@ -255,7 +255,7 @@ edit to somebody reading the test file.
   surgical call already made one test at a time in `aws_realtime_types.rs`. A
   comment where they stood says so.
 - `src/aws/` in full, and the `aws` and `aws-polling` features. Nothing in this
-  workspace calls them — `rustdar-radar/src/archive.rs` and `src/chunks.rs`
+  workspace calls them — `squallar-radar/src/archive.rs` and `src/chunks.rs`
   reimplement that surface and say so — but deleting a quarter of a crate to
   save a feature nobody enables would make the upstream diff unreadable for no
   gain. Only the `default` line moves; see below.
@@ -446,7 +446,7 @@ measured size is accepted.
 **The hole this does not close.** `File::decompress`
 (`src/volume/file.rs:46`) has the identical unbounded `read_to_end`, on a
 `GzDecoder`, for the gzip-wrapped volume files that pre-~2016 archives use —
-same network provenance, and a path rustdar takes for legacy `.gz` volumes.
+same network provenance, and a path squallar takes for legacy `.gz` volumes.
 DEFLATE reaches roughly 1032:1, so 16 MB of download expands to ~16 GB. It is
 one `.take()` away from being fixed and it is deliberately not fixed here:
 its bound is a different number needing its own corpus (whole volumes, not
@@ -653,14 +653,14 @@ enable, in a directory whose value depends on its diff staying readable.
    has exactly this shape of API (`Decompress::reset`). That is an upstream
    issue against `bzip2`, and this section is the evidence for it.
 
-2. *A caching global allocator, in rustdar rather than here.* The 3.6 MB block
+2. *A caching global allocator, in squallar rather than here.* The 3.6 MB block
    is freed and requested again in the identical size, per record, per worker.
    That is the access pattern a large-block-caching allocator — mimalloc,
    jemalloc — exists to serve: the free returns the block to a thread-local
    cache and the next request takes it back without touching the kernel. It
    recovers most of the same win with **no change to this directory and no
    fork of `bzip2`**, because it never needs the decompressor to be reused —
-   only the memory. It is a rustdar-level decision with effects far beyond this
+   only the memory. It is a squallar-level decision with effects far beyond this
    function, so it is named here rather than made here, and it should be
    measured the way everything else in this file was.
 

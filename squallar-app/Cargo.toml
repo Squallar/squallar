@@ -1,0 +1,146 @@
+[package]
+name = "squallar-app"
+version.workspace = true
+edition.workspace = true
+
+# The portable half of the application: windowing, rendering, fetching and app
+# state. "Portable" here means winit-portable, not windowing-free — this crate
+# owns the single renderer that desktop, web (wasm32 + WebGL2), Android and iOS
+# all share, so depending on winit/wgpu/egui is expected.
+#
+# What it deliberately does NOT contain is any per-OS code: no entry point, no
+# concrete PlatformBridge. Those live in the squallar crate, which depends on
+# this crate. Adding a dependency back on it would be a cycle.
+
+[dependencies]
+web-time = { workspace = true }
+squallar-egui = { workspace = true }
+# The device-class policy floor: budget cascades + the profile->budgets
+# resolver moved down at WO-RD; this crate reads its budgets from below.
+squallar-device-profile = { workspace = true }
+# The wgpu boundary: the egui renderer, texture upload, pane mirror, staging
+# ring and device-request policy moved down at WO-RG; the wgpu feature-chooser,
+# per-target backend blocks and the single-wgpu guard followed at WO-RV land 3.
+# This crate deliberately has NO direct `wgpu` dependency — every `wgpu::`
+# value rides `egui_wgpu::wgpu`, and squallar-gpu's manifest is the one
+# feature-chooser for the whole graph.
+squallar-gpu = { workspace = true }
+# The 3D volume stack: probe/latch, raymarch, staging, uniforms, blue noise,
+# degrade policy and the bridge moved down at WO-RV.
+squallar-volumetric = { workspace = true }
+# The chunk-feed and chunk-notification machinery live in radar's
+# `chunk_feed`/`chunk_notify` since WO-RF1; this crate keeps the drains and
+# the `App` fields that own the managers.
+squallar-radar = { workspace = true }
+squallar-overlays = { workspace = true }
+# The job-boundary vocabulary (DescribedJob, JobCodec, JobGeometry) and the
+# substrate wire Reader the codec rows decode with. The overlay wire flip
+# (WO-M6.3) is what forced the edge: `JobRequest::Overlay` carries the
+# substrate's own envelope types, and the frontend frames codec rows whose
+# signatures speak them.
+squallar-source = { workspace = true }
+# The job engine: the offload funnel this crate's dispatch sites feed, the
+# composed codec registry and the wire identity — moved down at WO-RW so the
+# engine sits below the app side.
+squallar-worker = { workspace = true }
+squallar-geo = { workspace = true }
+squallar-kv = { workspace = true }
+# SerialConfig only — the reader stays behind nmea-serial's `serial` feature,
+# which squallar-egui/gps-serial turns on. The settings pane that does use the
+# reader is where the gate belongs; this crate stays free of it.
+# Vocabulary only (default-features = false, re-declared deliberately): the
+# portable app speaks Fix/permission/gate and must compile for targets that
+# have never heard of any provider — the shell turns the arms on per target.
+squallar-location = { workspace = true, default-features = false }
+squallar-nmea-serial = { workspace = true }
+# `json` only -- see the note in squallar-overlays: `default` would re-enable
+# `default-tls` (= platform verifier + aws-lc-rs) and undo the aws-lc-sys removal.
+reqwest = { workspace = true, features = ["json"] }
+chrono = { workspace = true }
+# The volume grid's texel encoder writes `Rg16Float`; see the workspace note.
+egui = { workspace = true }
+# Defaults are off at the workspace level, because egui-wgpu's `default` set
+# contains `wgpu/default` -- and that contains `webgpu`, which this build must
+# never enable (see the workspace `wgpu` pin). Its other two default entries are
+# genuinely wanted, but both are dead outside one target, so they are requested
+# from the target sections below rather than everywhere:
+# `macos-window-resize-jitter-fix` is read only under
+# `cfg(all(target_os = "macos", feature = ...))`, and
+# `fragile-send-sync-non-atomic-wasm` only under `cfg(target_arch = "wasm32")`.
+egui-wgpu = { workspace = true, features = ["winit"] }
+log = { workspace = true }
+# No `nexrad-data` here: the only thing this crate ever used from it was
+# `aws::archive::Identifier`, which now lives in `squallar_radar::archive`
+# alongside the S3 access that produces it.
+nexrad-model = { workspace = true }
+nexrad-level3 = { workspace = true }
+pollster = { workspace = true }
+winit = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# tokio's multi-threaded runtime is native-only -- wasm rejects
+# `rt-multi-thread` outright ("Only features sync,macros,io-util,rt,time are
+# supported on wasm"). The browser gives us one thread and its own event loop,
+# so the web build spawns onto that instead. See `App::spawn_detached`.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
+
+# `clipboard` pulls `arboard`, which has no wasm backend at all -- it fails to
+# compile rather than degrading. `wayland`/`x11` are likewise meaningless in a
+# browser. The web build keeps only `links`; the clipboard there is the
+# browser's own, reached through egui-winit's web path.
+# Android is deliberately grouped with native here, preserving exactly the
+# feature set it had before this split.
+#
+# iOS is NOT: arboard has no iOS arm, and its cfg is
+# `unix, not(macos|android|emscripten)`, so iOS silently selects the X11/Wayland
+# backend. That compiles and even links (x11rb is pure Rust), then fails to
+# connect to a display at startup. UIPasteboard would be the real thing;
+# nothing in squallar copies text, so the feature is simply dropped there.
+[target.'cfg(not(any(target_arch = "wasm32", target_os = "ios")))'.dependencies]
+egui-winit = { workspace = true, features = ["clipboard", "links", "wayland", "x11"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+egui-winit = { workspace = true, features = ["links"] }
+
+# `macos-window-resize-jitter-fix` is scoped here because egui-wgpu reads it
+# only under `cfg(target_os = "macos")`. The per-target wgpu BACKEND blocks
+# that used to sit here moved to squallar-gpu at WO-RV land 3 — that manifest
+# is the one feature-chooser for the whole graph.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+egui-wgpu = { workspace = true, features = ["macos-window-resize-jitter-fix"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+egui-winit = { workspace = true, features = ["links"] }
+# `fragile-send-sync-non-atomic-wasm` is OFF here, and the browser build needs
+# it off — the reverse of what this line said until WS3b, for the reason that
+# line gave. It made egui-wgpu's `CallbackResources` the concurrent `TypeMap`
+# and wgpu's handles `Send + Sync` "on a target that has no threads to be
+# unsound about". This target has threads now.
+#
+# The two halves of that feature stop agreeing the moment it does. wgpu grants
+# `Send + Sync` under `all(feature, not(target_feature = "atomics"))`
+# (wgpu-core's build.rs `send_sync` alias); egui-wgpu picks the concurrent map
+# on the feature ALONE. Build with `+atomics` and the map demands a bound wgpu
+# has stopped supplying: 47 errors, all of them `App::install_volume_resources`
+# inserting `VolumeResources` at squallar-app/src/app.rs. With the feature off
+# egui-wgpu selects `type_map::TypeMap`, which asks for no bound at all — the
+# correct map for a `CallbackResources` only ever touched on the thread that
+# owns the WebGL context.
+#
+# (The browser wgpu backend itself — `webgl`, never `webgpu` — is chosen by
+# squallar-gpu's manifest since WO-RV land 3.)
+egui-wgpu = { workspace = true }
+# Pinned to what the egui/wgpu stack already resolves (wasm-bindgen 0.2.126).
+# A newer wasm-bindgen-futures wants a newer wasm-bindgen and the resolver
+# rejects the pair outright, so this version moves when that stack moves.
+wasm-bindgen-futures = "=0.4.76"
+
+[dev-dependencies]
+# The state-forcing test hooks on radar's `ChunkFeedManager`/`ChunkNotifier`
+# (`force_retire_at`, `force_serving`, `backdate_handshake`), which this
+# crate's drain-precedence and re-arm suites drive. A `#[cfg(test)]` in a
+# dependency is invisible to this crate's tests, so the hooks ride a feature —
+# enabled here, on the dev-dependency only, never on the normal edge above.
+squallar-radar = { workspace = true, features = ["test-support"] }

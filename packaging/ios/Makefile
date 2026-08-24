@@ -12,7 +12,7 @@
 # recipe executes directly instead of nesting a second container.
 #
 # The app is a thin UIKit shell (packaging/ios/Sources/main.m) linking the Rust staticlib
-# and calling `rustdar_ios_main`. Bundle metadata is read out of packaging/ios/project.yml
+# and calling `squallar_ios_main`. Bundle metadata is read out of packaging/ios/project.yml
 # so Xcode and this Makefile cannot disagree about it.
 SHELL := bash
 .SHELLFLAGS := -euo pipefail -c
@@ -22,7 +22,7 @@ ROOT := $(realpath $(CURDIR)/../..)
 # Digest-pinned to the same image the CI matrix uses.
 IMAGE ?= ghcr.io/usa-reddragon/rust-cross:1.97.1@sha256:433d3e61c46c6dea2e0bb0bc450fe34415d9769f6d801ab1f2e2ebbdbcf50c28
 # Named volume for the crate cache, so a rebuild does not re-download the index.
-CARGO_VOL ?= rustdar-xcross-cargo
+CARGO_VOL ?= squallar-xcross-cargo
 # Must match MinimumOSVersion in packaging/ios/Info.plist; it is what drives the clang
 # wrapper's -target/-mios-version-min and so the binary's LC_BUILD_VERSION.
 IOS_MIN ?= 14.0
@@ -49,28 +49,28 @@ build:
 	# the image's 23 preinstalled targets.
 	#
 	# `cargo rustc --crate-type staticlib` rather than a manifest crate-type:
-	# putting `staticlib` in rustdar's [lib] would archive the whole
+	# putting `staticlib` in squallar's [lib] would archive the whole
 	# graph on every desktop build and every --all-targets clippy run too.
 	#
 	# The framework list mirrors packaging/ios/project.yml. Nothing here is auto-linked:
 	# a link without `-framework Security` fails on SecTrustEvaluateWithError,
 	# which is rustls-platform-verifier's Apple trust path, and one without
 	# `-framework CoreLocation` fails on the CLLocationManager class reference
-	# that rustdar's os_location/apple.rs emits.
+	# that squallar's os_location/apple.rs emits.
 	INCMD="set -e
 	    export RUSTUP_TOOLCHAIN=\"\$${RUST_VERSION:?the rust-cross image must set RUST_VERSION}\"
 	    export IPHONEOS_DEPLOYMENT_TARGET=$(IOS_MIN)
 	    export CARGO_TARGET_DIR=$(TARGET_DIR)
-	    cargo rustc $$CARGO_PROFILE --target $$RUST_TARGET -p rustdar --lib --crate-type staticlib
-	    test -f $$LIBDIR/librustdar_native.a || { echo 'staticlib missing'; exit 1; }
-	    $$IOS_CC -c packaging/ios/Sources/main.m -o $$LIBDIR/rustdar_main.o
-	    $$IOS_CC $$LIBDIR/rustdar_main.o $$LIBDIR/librustdar_native.a \
+	    cargo rustc $$CARGO_PROFILE --target $$RUST_TARGET -p squallar --lib --crate-type staticlib
+	    test -f $$LIBDIR/libsquallar_native.a || { echo 'staticlib missing'; exit 1; }
+	    $$IOS_CC -c packaging/ios/Sources/main.m -o $$LIBDIR/squallar_main.o
+	    $$IOS_CC $$LIBDIR/squallar_main.o $$LIBDIR/libsquallar_native.a \
 	        -lobjc \
 	        -framework UIKit -framework QuartzCore -framework Metal \
 	        -framework CoreGraphics \
 	        -framework Foundation -framework CoreFoundation \
 	        -framework Security -framework CoreLocation \
-	        -o $$LIBDIR/rustdar
+	        -o $$LIBDIR/squallar
 	    tr -d '\"' < $$SDKROOT_REF/SDKSettings.json | tr ',' '\n' \
 	        | sed -n 's/^CanonicalName://p' | head -1 > $$LIBDIR/sdk-name"
 
@@ -78,11 +78,11 @@ build:
 	  echo "==> cargo + link ($$RUST_TARGET, $$PROFILE_DIR)"
 	  sh -c "$$INCMD"
 	else
-	  ENGINE="$${RUSTDAR_CONTAINER_ENGINE:-}"
+	  ENGINE="$${SQUALLAR_CONTAINER_ENGINE:-}"
 	  if [ -z "$$ENGINE" ]; then
 	    if command -v podman >/dev/null 2>&1; then ENGINE=podman
 	    elif command -v docker >/dev/null 2>&1; then ENGINE=docker
-	    else echo "ERROR: need podman or docker (set RUSTDAR_CONTAINER_ENGINE, or IN_CONTAINER=1 if already inside the image)."; exit 1; fi
+	    else echo "ERROR: need podman or docker (set SQUALLAR_CONTAINER_ENGINE, or IN_CONTAINER=1 if already inside the image)."; exit 1; fi
 	  fi
 	  echo "==> [$$ENGINE] cargo + link ($$RUST_TARGET, $$PROFILE_DIR)"
 	  # Rootless podman already maps container root to the invoking user, so
@@ -94,10 +94,10 @@ build:
 	      -v "$(CARGO_VOL)":/usr/local/cargo/registry \
 	      "$(IMAGE)" sh -c "$$INCMD"
 	fi
-	[ -f "$$LIBDIR/rustdar" ] || { echo "ERROR: link produced no executable at $$LIBDIR/rustdar"; exit 1; }
+	[ -f "$$LIBDIR/squallar" ] || { echo "ERROR: link produced no executable at $$LIBDIR/squallar"; exit 1; }
 
 	# ---- assemble the .app (plain file ops, no Apple tools) ----
-	echo "==> assemble rustdar.app"
+	echo "==> assemble squallar.app"
 	# Single source of bundle metadata: packaging/ios/project.yml.
 	yaml_val() { sed -n "s/.*$$1: *\"\{0,1\}\([^\"]*\)\"\{0,1\}.*/\1/p" packaging/ios/project.yml | head -1; }
 	BUNDLE_ID="$$(yaml_val PRODUCT_BUNDLE_IDENTIFIER)"
@@ -109,11 +109,11 @@ build:
 	SDK_NAME="$$(cat "$$LIBDIR/sdk-name")"
 	: "$${SDK_NAME:?no CanonicalName in the SDKSettings.json of the linked SDK}"
 
-	OUT="packaging/ios/build/linux/$$SDK"; APP="$$OUT/rustdar.app"
+	OUT="packaging/ios/build/linux/$$SDK"; APP="$$OUT/squallar.app"
 	rm -rf "$$OUT"; mkdir -p "$$APP"
-	cp "$$LIBDIR/rustdar" "$$APP/rustdar"; chmod +x "$$APP/rustdar"
+	cp "$$LIBDIR/squallar" "$$APP/squallar"; chmod +x "$$APP/squallar"
 	# Resolve the Xcode build-setting variables xcodebuild would have expanded.
-	sed -e "s|\$$(EXECUTABLE_NAME)|rustdar|g" \
+	sed -e "s|\$$(EXECUTABLE_NAME)|squallar|g" \
 	    -e "s|\$$(PRODUCT_BUNDLE_IDENTIFIER)|$$BUNDLE_ID|g" \
 	    -e "s|\$$(MARKETING_VERSION)|$$MARKETING_VERSION|g" \
 	    -e "s|\$$(CURRENT_PROJECT_VERSION)|$$CURRENT_PROJECT_VERSION|g" \
@@ -131,12 +131,12 @@ build:
 	  echo "  xcrun simctl install booted '$$APP'"
 	  echo "  xcrun simctl launch --console booted $$BUNDLE_ID"
 	elif command -v zip >/dev/null 2>&1; then
-	  # (Unsigned) .ipa: Payload/rustdar.app zipped at the archive root.
+	  # (Unsigned) .ipa: Payload/squallar.app zipped at the archive root.
 	  rm -rf "$$OUT/Payload"; mkdir -p "$$OUT/Payload"
 	  cp -R "$$APP" "$$OUT/Payload/"
-	  ( cd "$$OUT" && zip -qr rustdar.ipa Payload && rm -rf Payload )
+	  ( cd "$$OUT" && zip -qr squallar.ipa Payload && rm -rf Payload )
 	  echo "App: $(ROOT)/$$APP  (UNSIGNED)"
-	  echo "IPA: $(ROOT)/$$OUT/rustdar.ipa  (UNSIGNED)"
+	  echo "IPA: $(ROOT)/$$OUT/squallar.ipa  (UNSIGNED)"
 	  echo "Sign for a device with rcodesign, e.g.:"
 	  echo "  rcodesign sign --p12-file dev.p12 --code-signature-flags runtime \\"
 	  echo "    --entitlements-xml-path ent.plist $$APP"

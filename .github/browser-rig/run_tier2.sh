@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# run_tier2.sh -- the Tier-2 browser gate: serve the built rustdar-web bundle
+# run_tier2.sh -- the Tier-2 browser gate: serve the built squallar-web bundle
 # on a fresh port and drive the full PWA in Chromium and Firefox. Two passes
 # per browser:
 #
@@ -28,11 +28,11 @@
 # .github/browser-rig/ inside the repo), never from any scratchpad.
 #
 # Usage: run_tier2.sh [--skip-build]
-#   --skip-build      serve rustdar-web as-is (CI builds in its own step; the
+#   --skip-build      serve squallar-web as-is (CI builds in its own step; the
 #                     default is a fresh `wasm-pack build` first)
 #
 # Environment knobs (all optional):
-#   RUSTDAR_WEB_DIR   dir to serve   (default <repo>/rustdar-web)
+#   SQUALLAR_WEB_DIR   dir to serve   (default <repo>/squallar-web)
 #   RIG_OUT_DIR       output dir     (default <rig>/out)
 #   RIG_CHROMEDRIVER  chromedriver   (default: chromedriver on PATH, else
 #                                     /usr/bin/chromedriver)
@@ -98,7 +98,7 @@ set -u -o pipefail   # not -e: attempt every leg and still summarise
 
 RIG_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$RIG_DIR/../.." && pwd)"
-WEB_DIR="${RUSTDAR_WEB_DIR:-$REPO_ROOT/rustdar-web}"
+WEB_DIR="${SQUALLAR_WEB_DIR:-$REPO_ROOT/squallar-web}"
 OUT_DIR="${RIG_OUT_DIR:-$RIG_DIR/out}"
 CHROMEDRIVER="${RIG_CHROMEDRIVER:-$(command -v chromedriver || echo /usr/bin/chromedriver)}"
 FRAMES="${RIG_FRAMES:-120}"
@@ -140,7 +140,7 @@ PY=python3
 # one, which is not a gate.
 #
 # `RadarSites` is what makes it deterministic. It is the one texture layer
-# that needs NO network: the site table is compiled into rustdar-radar and
+# that needs NO network: the site table is compiled into squallar-radar and
 # `publish_radar_sites` pushes it through the ordinary arrival door at boot, so
 # `has_data` is true on the first frame on a CI box with no weather at all.
 # It also ships `default_enabled() == false`, so seeding it is a real choice
@@ -166,7 +166,7 @@ PY=python3
 # That is the property -- this assertion can go red, it goes red for the reason
 # it names, and it disturbs nothing else.
 # ---------------------------------------------------------------------------
-# WHY `rustdar.raster_telemetry` IS SEEDED
+# WHY `squallar.raster_telemetry` IS SEEDED
 #
 # The two running-total sentences this rig scrapes -- `overlay rasters:` and
 # `texture uploads:` -- are `debug` on an ordinary install, because a
@@ -180,7 +180,7 @@ PY=python3
 # `raster_telemetry_line_tests::the_rig_seeds_the_key_that_makes_the_lines_loud`,
 # which reads this file: a renamed key on either side is a build failure rather
 # than a rig leg that reports the overlay path as `null`.
-SEED_LS='{"rustdar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"enabled_overlays\":{\"RadarSites\":true}}]}", "rustdar.raster_telemetry": "1"}'
+SEED_LS='{"squallar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"enabled_overlays\":{\"RadarSites\":true}}]}", "squallar.raster_telemetry": "1"}'
 
 # Set to 0 to report the overlay raster totals without gating on them -- for a
 # measurement round, never as a way past a red leg.
@@ -221,7 +221,7 @@ mkdir -p "$OUT_DIR"
 
 # ---------------------------------------------------------------- build ----
 if [ "$SKIP_BUILD" -eq 0 ]; then
-  echo "building rustdar-web (wasm-pack; --skip-build to serve as-is)"
+  echo "building squallar-web (wasm-pack; --skip-build to serve as-is)"
   # Through wasm-threads.sh, which is the ONLY supported way to build this
   # bundle since WS3b: it pins the nightly, rebuilds std against `+atomics`
   # and passes the `--shared-memory`/`--import-memory` link args wasm-bindgen
@@ -230,13 +230,13 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
   # `compile_error!` for a wasm32 target without atomics.
   (cd "$REPO_ROOT" &&
     .github/scripts/wasm-threads.sh \
-      wasm-pack build rustdar-web --target web --release --no-typescript --no-pack) || {
+      wasm-pack build squallar-web --target web --release --no-typescript --no-pack) || {
     echo "FATAL: wasm-pack build failed" >&2
     exit 1
   }
 fi
-if [ ! -f "$WEB_DIR/pkg/rustdar_web_bg.wasm" ]; then
-  echo "FATAL: $WEB_DIR/pkg/rustdar_web_bg.wasm missing -- build first" >&2
+if [ ! -f "$WEB_DIR/pkg/squallar_web_bg.wasm" ]; then
+  echo "FATAL: $WEB_DIR/pkg/squallar_web_bg.wasm missing -- build first" >&2
   exit 1
 fi
 

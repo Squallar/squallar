@@ -63,7 +63,7 @@ splitting all cancel:
 The share those first two rows imply is worth stating on its own, because it is
 larger than the number this workspace had been quoting. Decompression alone,
 for the dense volume, is 7,806,188,828 of the 7,883,148,609 its whole
-end-to-end decode retires — **99.0%** before, 98.5% after. `rustdar-radar`'s
+end-to-end decode retires — **99.0%** before, 98.5% after. `squallar-radar`'s
 `scan::decoded` used to say 92%; that figure came from `perf record` sample
 shares, which are cycles and not instructions, and decompression retires its
 instructions at a lower IPC than the Message 31 parse does. Both numbers are
@@ -207,7 +207,7 @@ package is absent from the lockfile entirely, and `bzip2` is still in it. The
 distinction matters if anyone scripts this check: assert on the *output*, not
 on the exit status.)
 
-`rustdar-radar/tests/bzip2_backend.rs` pins the arrangement, because losing it
+`squallar-radar/tests/bzip2_backend.rs` pins the arrangement, because losing it
 is invisible: moving that one line back up to `[dependencies]` compiles, passes
 every other test, and quietly puts `libbz2-rs-sys` back into the wasm bundle
 and back onto the decode path.
@@ -234,7 +234,7 @@ a C archive.
 Before this change, that would have switched the Level II decode path. It no
 longer can: `bzip2-rs` has no backend feature and cannot participate. What is
 still exposed is `nexrad-level3`, which keeps `bzip2 = "=0.6.1"` — see the next
-section. `rustdar-radar/tests/bzip2_backend.rs` fails loudly if `bzip2-sys` or
+section. `squallar-radar/tests/bzip2_backend.rs` fails loudly if `bzip2-sys` or
 `libbz2-sys` ever appears in `Cargo.lock`, which is the exact fingerprint of
 the feature having been enabled, and it fails on a developer machine before the
 wasm CI row gets to.
@@ -674,7 +674,7 @@ error: package ID specification `bzip2-sys` did not match any packages    # main
 ```
 
 `cc` **is** in the graph, and was before this change — `ring`'s build script,
-via rustls, which `rustdar-radar/Cargo.toml` already names as "the workspace's
+via rustls, which `squallar-radar/Cargo.toml` already names as "the workspace's
 one C dependency". Identical package (`cc v1.4.0`) and identical path on both
 sides, so it is not a difference. Stated rather than omitted, because an
 earlier draft of this section claimed `cc` did not resolve at all, checked
@@ -682,7 +682,7 @@ that claim, and found it false.
 
 ### What is still on the wasm bundle, and what it costs
 
-`cargo tree -p rustdar-web -e normal --target wasm32-unknown-unknown` now
+`cargo tree -p squallar-web -e normal --target wasm32-unknown-unknown` now
 resolves **both** decoders:
 
 | | |
@@ -692,7 +692,7 @@ resolves **both** decoders:
 
 That is the price of leaving `nexrad-level3` alone, and it is a real one: the
 web bundle carries two bzip2 decoders where it used to carry one. Measured,
-`cargo build --release -p rustdar-web --target wasm32-unknown-unknown`, before
+`cargo build --release -p squallar-web --target wasm32-unknown-unknown`, before
 `wasm-opt`:
 
 | | bytes |
@@ -721,7 +721,7 @@ pinned commit's decoder:
 2. Delete `vendor/bzip2-rs/`.
 3. Delete `"vendor/bzip2-rs"` from `[workspace.members]` and
    `[profile.dev.package.bzip2-rs]` in the root `Cargo.toml`.
-4. Relax `rustdar-radar/tests/bzip2_backend.rs`'s manifest assertions to match —
+4. Relax `squallar-radar/tests/bzip2_backend.rs`'s manifest assertions to match —
    the lockfile assertion in the same file is about `bzip2-sys` and stays
    regardless.
 5. `cargo tree --workspace -i bzip2-rs` should show one registry node.

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-drive.py -- dependency-free W3C WebDriver client for driving the rustdar web
+drive.py -- dependency-free W3C WebDriver client for driving the squallar web
 app headless. Python 3 stdlib only (urllib; selenium is NOT installed).
 
 Starts the driver binary itself (chromedriver / geckodriver), creates a
 headless session, navigates to the served app, waits for boot (the app removes
-#rustdar-status on a successful start() and writes "rustdar failed to start:"
+#squallar-status on a successful start() and writes "squallar failed to start:"
 into it on failure), then measures and records:
 
-  * canvas #rustdar-canvas presence + client/buffer size + dpr
+  * canvas #squallar-canvas presence + client/buffer size + dpr
   * WebGL renderer probe (software vs hardware) and the caps the wasm budget
     cascade is allowed to promote against: MAX_TEXTURE_SIZE,
     MAX_3D_TEXTURE_SIZE, MAX_RENDERBUFFER_SIZE, hardwareConcurrency,
@@ -90,7 +90,7 @@ DEFAULT_CHROMEDRIVER = "/usr/bin/chromedriver"
 # on this default (run_tier2.sh always passes --driver), but a default that
 # pointed anywhere ephemeral would rot silently.
 DEFAULT_GECKODRIVER = os.path.expanduser(
-    "~/.cache/rustdar-ci/geckodriver-0.37.1/geckodriver")
+    "~/.cache/squallar-ci/geckodriver-0.37.1/geckodriver")
 DEFAULT_FIREFOX = "/usr/bin/firefox"
 
 
@@ -848,8 +848,8 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
 # --------------------------------------------------------------------------
 
 BOOT_PROBE = """
-var s = document.getElementById('rustdar-status');
-var c = document.getElementById('rustdar-canvas');
+var s = document.getElementById('squallar-status');
+var c = document.getElementById('squallar-canvas');
 return {
   readyState: document.readyState,
   hasCanvas: !!c,
@@ -1173,7 +1173,7 @@ return { attached: attached, different: different, off_frame: off_frame,
 # draw the same picture at different ceilings. A run that quotes a cap without
 # naming the API that produced it is quoting an adapter it did not identify.
 #
-# Two lines, both `log::info!` from `rustdar_app::app_state`:
+# Two lines, both `log::info!` from `squallar_app::app_state`:
 #   backend  -- "wgpu selected the <Backend> backend: <name> (<DeviceType>), ..."
 #   ceiling  -- "plan views may reach <N> px: this device reports <M> px 2D
 #               textures (the <A> px adapter offered), ..."
@@ -1278,7 +1278,7 @@ def poll_global_json(session, path, timeout=120.0, interval=0.5,
 
 
 def wait_boot(session, timeout=90.0, interval=0.4):
-    """Poll until #rustdar-status is removed (booted) or reports failure.
+    """Poll until #squallar-status is removed (booted) or reports failure.
     Returns (final_probe, seconds_waited, timed_out)."""
     t0 = time.monotonic()
     probe = None
@@ -1328,7 +1328,7 @@ def wait_rayon_pool(session, minimum, timeout=180.0, interval=2.0):
     The count rides the worker's HELLO and is printed on the attach line, so
     this reads the pool rayon BUILT, not the one `worker.js` asked for. It
     exists because every other Tier-2 assertion is blind to the difference: a
-    worker that fell back to `rustdarRayonSerialPool` still attaches, still
+    worker that fell back to `squallarRayonSerialPool` still attaches, still
     answers jobs and still logs "took N ms off the frame". Without this check
     a browser served without COOP/COEP, or one that refused nested Workers,
     goes green while rasterizing on one thread -- the gate would be asserting
@@ -1766,7 +1766,7 @@ def selftest():
     if st.get("blank") is not False or st.get("near_blank") is not False:
         failures.append("gradient image classified blank: %s" % st)
     # 3. real-world PNGs from an external encoder (repo icons), if readable
-    icons_dir = "/home/reddragon/projects/rustdar/rustdar-web/icons"
+    icons_dir = "/home/reddragon/projects/squallar/squallar-web/icons"
     if os.path.isdir(icons_dir):
         for name in sorted(os.listdir(icons_dir)):
             if not name.endswith(".png"):
@@ -2055,7 +2055,7 @@ def run_smoke(args):
         data = save_screenshot(session.screenshot_b64(), page_png)
         shots["page"] = png_stats(data)
         shots["page"]["path"] = page_png
-        canvas_el = session.find_element("#rustdar-canvas")
+        canvas_el = session.find_element("#squallar-canvas")
         if canvas_el:
             canvas_png = os.path.join(out_dir, "%s.canvas.png" % tag)
             data = save_screenshot(
@@ -2063,7 +2063,7 @@ def run_smoke(args):
             shots["canvas"] = png_stats(data)
             shots["canvas"]["path"] = canvas_png
         else:
-            shots["canvas"] = {"error": "element #rustdar-canvas not found"}
+            shots["canvas"] = {"error": "element #squallar-canvas not found"}
         result["screenshots"] = shots
         stage("screenshots-done",
               page_blank=shots["page"].get("blank"),
@@ -2389,7 +2389,7 @@ def run_smoke(args):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="headless WebDriver smoke/measurement rig for rustdar-web")
+        description="headless WebDriver smoke/measurement rig for squallar-web")
     ap.add_argument("--browser", choices=("chromium", "firefox"))
     ap.add_argument("--url")
     ap.add_argument("--out-dir", default="out")

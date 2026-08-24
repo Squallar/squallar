@@ -11,9 +11,9 @@
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>rustdar</string>
+    <string>Squallar</string>
     <key>CFBundleDisplayName</key>
-    <string>Rustdar</string>
+    <string>Squallar</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -77,8 +77,8 @@
          stops delivering while the app is backgrounded and the map keeps its
          last dot until the app returns; with it, the app would be asking for a
          capability it has no use for and would have to justify. See the module
-         note in rustdar/src/os_location/apple.rs. -->
+         note in squallar/src/os_location/apple.rs. -->
     <key>NSLocationWhenInUseUsageDescription</key>
-    <string>Rustdar shows your position and heading on the radar map.</string>
+    <string>Squallar shows your position and heading on the radar map.</string>
 </dict>
 </plist>

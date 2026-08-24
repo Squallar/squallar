@@ -1,0 +1,29 @@
+[package]
+name = "squallar-netcdf"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# CF time coordinates: `parse_time_units` and `parse_cf_epoch` return a
+# `chrono::NaiveDateTime`, because "seconds since 2026-07-24 12:00:00" is a CF
+# convention and not a caller's domain choice.
+chrono = { workspace = true }
+# NetCDF4 *is* HDF5: every netCDF variable is an HDF5 dataset in the root group
+# and every attribute an HDF5 attribute, so this crate reads NetCDF4 without a
+# netCDF layer. Pure Rust; no `-sys` crate, unlike `netcdf` and
+# `hdf5-metno-sys`, which is what lets every consumer build for wasm32 and iOS.
+#
+# Defaults are deliberately ON here (`std`, `checksum`, `deflate`) and must not
+# be hoisted into `[workspace.dependencies]`: Cargo silently ignores a member's
+# `default-features = false` when the workspace entry leaves defaults on. Real
+# granules are deflate-compressed, so dropping `deflate` takes every consumer
+# dark. Do NOT enable `fast-deflate` either: it selects `flate2/zlib-ng`, which
+# is C and breaks wasm32/iOS cross-compilation.
+hdf5-pure = "=0.39.0"
+# A malformed `valid_range` is warned about and ignored rather than being made
+# fatal; see `cf::unpack`.
+log = { workspace = true }
+
+[dev-dependencies]
+# `tests/charter.rs` only: parsing `cargo metadata`.
+serde_json = { workspace = true }

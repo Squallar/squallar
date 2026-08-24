@@ -338,7 +338,7 @@ fn a_modern_block_is_never_rescaled() {
 /// really does state one height twice, and the pair really does divide into a
 /// place. So each forgery still becomes a coordinate here, and each is refused
 /// one rung up, where a position can be held against a source outside the
-/// volume it came from: `rustdar_radar::types::ScanInfo::from_scan`, pinned by
+/// volume it came from: `squallar_radar::types::ScanInfo::from_scan`, pinned by
 /// `a_volume_that_disagrees_with_the_catalogue_does_not_displace_it`.
 ///
 /// A future reading that closes this door will fail here, and that is the

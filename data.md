@@ -22,14 +22,14 @@ This document details which data sources are needed for this project. Not all ar
 
 **Every CORS value in this file was probed on 2026-08-21** — `GET` and `OPTIONS`
 preflight, with an `Origin:` header, against the exact endpoint named in the
-row. Nothing here is inferred. `rustdar-source/src/origins.rs` remains the
+row. Nothing here is inferred. `squallar-source/src/origins.rs` remains the
 authority for the origins the app actually uses; this file covers those plus
 every candidate. To re-probe a row:
 
 ```sh
-curl -sS -o /dev/null -D - -H 'Origin: https://rustdar.example' "$URL"
+curl -sS -o /dev/null -D - -H 'Origin: https://squallar.example' "$URL"
 curl -sS -o /dev/null -D - -X OPTIONS \
-     -H 'Origin: https://rustdar.example' \
+     -H 'Origin: https://squallar.example' \
      -H 'Access-Control-Request-Method: GET' "$URL"
 ```
 
@@ -106,7 +106,7 @@ Read off the bucket on 2026-08-21, not from documentation:
   rule fixes the rate and breaks the composite, which carries 8 045 genuine
   returns below 0 dBZ — 347 of them at exactly −3.0. The table lives in
   `MrmsProduct::missing_codes`; both granules are committed to
-  `rustdar-overlays/testdata/` because a suite built on one of them declared
+  `squallar-overlays/testdata/` because a suite built on one of them declared
   the other correct.
 - **Timestamps are not clock-aligned** — `000039`, `000242`, `000442`, `000641`
   across one observed hour — so a key is never constructed from a rounded wall
@@ -130,7 +130,7 @@ the map by the client. A national mosaic is a different data model.
   reflectivity — a different quantity with its own colour table, not a drop-in.
   Verified from a granule: 18000 × 6501 `short` values, `scale_factor` 0.1,
   units `mm/h`, on a plain 0.02° lat/lon grid running exactly 70°N to 60°S.
-  Delivered as **NetCDF4, which is HDF5** — the same container `rustdar-netcdf`
+  Delivered as **NetCDF4, which is HDF5** — the same container `squallar-netcdf`
   already reads with `hdf5-pure`. Sub-prefixes are `BLEND/` plus per-satellite
   `G16/`, `G18/`, `G19/`, `Himawari-9/`; `BLEND` is the global one. New
   granules every 10 minutes.
@@ -360,7 +360,7 @@ Until mid-2025 each hour also carried a legacy McIDAS-derived granule named
 `GLOBCOMP{LIR,SIR,VIS,WV}_nc.YYYYMMDDHH`: 4999 columns, `units = "none"`, no
 `geospatial_*`, no `quality_information`, no `dqf`. **It is no longer
 produced** — listing `GMGSI_LW/2026/08/20/12/` returns the `v3r0_blend` object
-alone. Rustdar reads the `v3r0_blend` product and skips the legacy name when a
+alone. Squallar reads the `v3r0_blend` product and skips the legacy name when a
 historical hour offers both.
 
 ### GMGSI_SSR is discontinued — do not plan on it
@@ -401,7 +401,7 @@ them.
 
 ### The ABI decoder is closer than the ❌ suggests
 
-GLM L2 LCFA is NetCDF4, which is HDF5, and `rustdar-netcdf` already reads it with
+GLM L2 LCFA is NetCDF4, which is HDF5, and `squallar-netcdf` already reads it with
 `hdf5-pure`. ABI L2 CMI is NetCDF4 too, and so — verified above — are GMGSI and
 RRQPE. The container is solved for all four. What ABI alone still needs is the
 GOES fixed-grid (geostationary perspective) → Mercator reprojection. GMGSI and
@@ -433,7 +433,7 @@ replaced by the rows under it.
 | Data Source                   | Status  | Domain | CORS    | Public Access                                                                                                                  |
 | ----------------------------- | ------- | ------ | ------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | Basemap tiles (raster slippy) | ✅       | global | open    | ✅ Free — CartoDB light/dark, labels and no-labels, over OpenStreetMap data                                                     |
-| NEXRAD site list              | ✅       | US     | n/a     | ✅ Compiled in — `rustdar-radar/src/sites.rs`, no network                                                                       |
+| NEXRAD site list              | ✅       | US     | n/a     | ✅ Compiled in — `squallar-radar/src/sites.rs`, no network                                                                       |
 | County/state/CWA boundaries   | Partial | US     | open    | ✅ Free — NWS alert zone geometry is fetched per alert from api.weather.gov and cached for a year; no standalone boundary layer |
 | Roads / terrain / topo        | ❌       | global | open    | ✅ Free — OpenStreetMap / USGS (roads arrive as part of the basemap tiles, not as data)                                         |
 | Elevation / DEM               | ❌       | global | open    | ✅ Free — USGS `elevation.nationalmap.gov` (`ACAO: *`, preflight OK) / SRTM                                                     |
@@ -454,13 +454,13 @@ endpoint is trivial.
 | NEXRAD Level II (LDM records, Msg 31)                | `vendor/nexrad-decode`, `vendor/nexrad-data`, `vendor/bzip2-rs` |
 | NEXRAD Level III (WMO, zlib/BZ2, radial packets)     | `nexrad-level3`                                                 |
 | GRIB2 — DRT 5.3 (complex + spatial diff), 5.41 (PNG) | `grib` 0.17.1, `default-features = false`                       |
-| HDF5 / NetCDF4                                       | `hdf5-pure` (`rustdar-netcdf`)                                         |
+| HDF5 / NetCDF4                                       | `hdf5-pure` (`squallar-netcdf`)                                         |
 | GeoJSON / JSON                                       | `serde_json`                                                    |
 | XML (S3 `ListObjectsV2`)                             | `xml` crate (`archive.rs`); `roxmltree` in `glm::fetch`, `mrms::fetch` |
 | XML / RSS (SPC mesoscale discussions)                | `roxmltree`                                                     |
 | CSV (SPC storm reports)                              | hand-parsed, `spc::reports::fetch_csv`                          |
 | zlib / deflate / gzip                                | `flate2`                                                        |
-| Raster slippy tiles (basemap only)                   | `walkers`, in `rustdar-egui`                                    |
+| Raster slippy tiles (basemap only)                   | `walkers`, in `squallar-egui`                                    |
 
 **What each ❌ row actually needs.** Verification shrank this list considerably —
 three of the four biggest new sources need **nothing new at all**:
@@ -480,6 +480,6 @@ three of the four biggest new sources need **nothing new at all**:
 Two standing constraints. **No C dependency may become unconditional**:
 `openjpeg-sys`, `libaec-sys`, `proj-sys` and `libsqlite3-sys` were all
 deliberately dropped from the `grib` pin because they do not cross-compile to
-wasm32 or iOS, and the Android arm of `rustdar-overlays/Cargo.toml` records what
+wasm32 or iOS, and the Android arm of `squallar-overlays/Cargo.toml` records what
 re-enabling them costs. And a `cfg(target_arch = "wasm32")` may select a value, a
 dependency or a type alias — never fork behaviour inside a function body.

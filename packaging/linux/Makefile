@@ -3,7 +3,7 @@
 # This is a menu entry, an icon and an application id -- and it used to be a
 # permission too. GeoClue2 refused `Client.Start()` without a `DesktopId` a
 # registered agent could resolve, so the app could not ask for a location until
-# this file was installed. That is over: rustdar asks
+# this file was installed. That is over: squallar asks
 # `org.freedesktop.portal.Location` instead, and the portal grants an
 # unsandboxed caller with no app id at all. Location now works with none of
 # this installed. See README.md.
@@ -22,7 +22,7 @@ DESTDIR ?=
 DATADIR ?= $(DESTDIR)$(PREFIX)/share
 BINDIR  ?= $(DESTDIR)$(PREFIX)/bin
 
-APPID   := dev.mcswain.rustdar
+APPID   := app.squallar
 DESKTOP := $(APPID).desktop
 
 # The name winit reports as the X11 `WM_CLASS`. winit sets none of its own: the
@@ -30,13 +30,13 @@ DESKTOP := $(APPID).desktop
 # `app_id` at all unless one is asked for. `StartupWMClass` in the desktop entry
 # must equal that basename or the window will not group under this launcher, so
 # renaming the installed binary means editing the entry too.
-BIN     ?= rustdar
+BIN     ?= squallar
 BINSRC  ?= ../../target/release/$(BIN)
 
 # The repo's only raster art, and the reason there is no `icons/` directory
 # here: the web build's PWA icons are already the right picture at three sizes
 # hicolor defines, and a second copy would be a second thing to keep in step.
-ICONSRC := ../../rustdar-web/icons
+ICONSRC := ../../squallar-web/icons
 ICONS   := 32:favicon-32.png 192:icon-192.png 512:icon-512.png
 
 INSTALL ?= install

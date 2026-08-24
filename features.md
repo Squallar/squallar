@@ -1,4 +1,4 @@
-# Rustdar Feature Matrix
+# Squallar Feature Matrix
 
 Feature comparison across weather platforms.
 
@@ -10,7 +10,7 @@ Feature comparison across weather platforms.
 | ❌       | Not implemented                                                              |
 | ❓       | Not verified — the competitor's own documentation was ambiguous or unchecked |
 
-Rustdar's column is checked against this repository. Competitor columns are not,
+Squallar's column is checked against this repository. Competitor columns are not,
 and the paid tiers move: RadarScope's entries below reflect its **Pro** tiers
 (Tier One adds real-time lightning and extended loops; Tier Two adds the
 archive, MRMS, satellite and soundings), not the free app.
@@ -19,7 +19,7 @@ archive, MRMS, satellite and soundings), not the free app.
 competitor cells — vendor feature pages are marketing, paid tiers sit behind
 logins, and two of these products are Windows desktop applications. One
 exception was checked on 2026-08-21 and is noted where it applies: the College
-of DuPage satellite column. Everything in Rustdar's column, and every source
+of DuPage satellite column. Everything in Squallar's column, and every source
 fact quoted in the notes, was verified against the tree, the origin, or the file
 itself — see `data.md`, which records the measurements and the probe recipe.
 
@@ -27,7 +27,7 @@ itself — see `data.md`, which records the measurements and the probe recipe.
 
 ## 📡 Radar
 
-| Feature                                       | GR2A    | RadarScope | Rustdar |
+| Feature                                       | GR2A    | RadarScope | Squallar |
 | --------------------------------------------- | ------- | ---------- | ------- |
 | NEXRAD Level 2 (super-res)                    | ✅       | ✅          | ✅       |
 | Level 2 real-time chunks (sub-volume latency) | ✅       | ❓          | ✅       |
@@ -53,12 +53,12 @@ itself — see `data.md`, which records the measurements and the probe recipe.
 | Archive radar playback                        | ✅       | ✅          | ✅       |
 | Custom color tables                           | ✅       | ✅          | ❌       |
 
-Notes on the Rustdar column:
+Notes on the Squallar column:
 
-- **Level 2 real-time chunks** — `rustdar-radar/src/chunks.rs` reads the
+- **Level 2 real-time chunks** — `squallar-radar/src/chunks.rs` reads the
   `unidata-nexrad-level2-chunks` bucket, so the 0.5° tilt arrives seconds after
   the radar collects it rather than at end-of-volume. A WebSocket push feed
-  (`rustdar-radar/src/chunk_notify.rs`) drives the fetch.
+  (`squallar-radar/src/chunk_notify.rs`) drives the fetch.
 - **HHC, POSH, MEHS, NROT** are derived locally from the Level 2 volume;
   **KDP, EET, VIL, VILD and DPR** come from the Level III bucket
   (`RadarProduct::is_level3`).
@@ -74,8 +74,8 @@ Notes on the Rustdar column:
   2026-08-11 against `PIT`, `OKC`, `MIA` and `DCA`.
 - **3D volumetric rendering** — a pane can be switched to a 3D view
   (View → 3D volume view), which resamples the volume onto a Cartesian voxel
-  grid (`rustdar-radar/src/voxel.rs`) and raymarches it
-  (`rustdar-volumetric/src/volume.wgsl`, `volume_raymarch.rs`, wired by
+  grid (`squallar-radar/src/voxel.rs`) and raymarches it
+  (`squallar-volumetric/src/volume.wgsl`, `volume_raymarch.rs`, wired by
   `volume_bridge.rs`). Drag to orbit, scroll or pinch to zoom. **Reflectivity
   only**: the other five samplable moments have colour tables that are opaque at
   the bottom of their scale, and a volume drawn through one of those saturates
@@ -89,17 +89,17 @@ Notes on the Rustdar column:
 - **Vertical cross-sections** — arm "Draw cross-section" from the toolbar or
   the View menu and drag a line across a map pane; the line and its endpoint
   grab zones stay drawn on the map and the cut appears in a section pane
-  (`rustdar-egui/src/ui_section_pane.rs`). The volume sampler
-  (`rustdar-radar/src/sampler.rs`) and the section rasterizer
-  (`rustdar-radar/src/xsect.rs`) are behind it, and the cut is a job kind
+  (`squallar-egui/src/ui_section_pane.rs`). The volume sampler
+  (`squallar-radar/src/sampler.rs`) and the section rasterizer
+  (`squallar-radar/src/xsect.rs`) are behind it, and the cut is a job kind
   (`offload::JobRequest::Section`) so it is rasterized off the frame thread on
   both targets. Loops cut a section per frame.
 - **VAD wind profiles** — a VAD fit *is* computed
   (`nrot::WindProfileBuilder`), but only as an input to storm-relative velocity
   and NROT. It is never displayed as a wind profile, so this is ❌ as a feature.
 - **Radar loop animation** — frame ceiling is per device class: 60 desktop, 20
-  mobile, 12 web (`rustdar-device-profile/src/constants.rs`).
-- **Archive radar playback** — `rustdar-radar/src/archive.rs`, over the full
+  mobile, 12 web (`squallar-device-profile/src/constants.rs`).
+- **Archive radar playback** — `squallar-radar/src/archive.rs`, over the full
   public NEXRAD Level 2 archive rather than a rolling window.
 - **MRMS national mosaic** ships: the `Mrms` layer draws
   `MergedReflectivityQCComposite_00.50` and `PrecipRate_00.00` from
@@ -108,7 +108,7 @@ Notes on the Rustdar column:
   inspection predicted: gzipped GRIB2 on grid template 3.0 (plain lat/lon,
   7000 × 3500 at 0.01°) with data representation template **5.41 — PNG**, which
   `flate2` and the already-enabled `png-unpack-with-png-crate` decode. The
-  layer's own colour bars are in `rustdar-overlays/src/mrms/fields.rs` rather
+  layer's own colour bars are in `squallar-overlays/src/mrms/fields.rs` rather
   than borrowed from the radar palette — that edge is cut and enforced.
   **CONUS only**; the bucket also carries Alaska, Hawaii, Guam and the
   Caribbean, each of which is a variant and a longitude envelope away.
@@ -122,7 +122,7 @@ Notes on the Rustdar column:
   dimension, because the grid is uniform in Mercator y rather than in latitude
   and its declared resolution attribute is wrong by 9.7 degrees mid-grid.
   **The values are 0-255 counts, not Kelvin**, despite what `units` says; the
-  colour bars in `rustdar-overlays/src/gmgsi/fields.rs` are stated in counts,
+  colour bars in `squallar-overlays/src/gmgsi/fields.rs` are stated in counts,
   and a test pins that a Kelvin-scaled ramp would paint nothing at all.
 - **Multi-radar compositing**, **satellite QPE** and **third-party tile ingest**
   remain three ❌ rows and three different projects, not one feature spelled
@@ -135,12 +135,12 @@ Notes on the Rustdar column:
   reflectivity, a different quantity with its own colour table, not a drop-in.
   It is NetCDF4/HDF5, so it too needs no new decoder. See `data.md` § Radar Data.
 - **Custom color tables** is ❌ and is worth separating from the rows above: the
-  palettes are compiled in (`rustdar-radar/src/palette.rs`) and there is no
+  palettes are compiled in (`squallar-radar/src/palette.rs`) and there is no
   import path for a user-supplied table.
 
 ## 🌀 Model Data
 
-| Feature                            | Pivotal | WeatherBell | Windy | Rustdar |
+| Feature                            | Pivotal | WeatherBell | Windy | Squallar |
 | ---------------------------------- | ------- | ----------- | ----- | ------- |
 | HRRR                               | ✅       | ✅           | ✅     | Partial |
 | NAM / NAM Nest                     | ✅       | ✅           | ❌     | ❌       |
@@ -159,8 +159,8 @@ Notes on the Rustdar column:
 | Wind vectors (barbs / streamlines) | ❓       | ❓           | ❓     | ❌       |
 | Coverage beyond CONUS              | ✅       | ✅           | ✅     | ❌       |
 
-Rustdar's HRRR support is **Partial**: sixteen fields
-(`rustdar-overlays/src/hrrr/mod.rs`, `ModelParameter::all()`) at the analysis
+Squallar's HRRR support is **Partial**: sixteen fields
+(`squallar-overlays/src/hrrr/mod.rs`, `ModelParameter::all()`) at the analysis
 hour only — f00, or f01 for the two windowed updraft-helicity maxima. There is
 no forecast-hour selector and so no model loop. The fields are SBCAPE, MLCAPE,
 MUCAPE, SBCIN, MLCIN, lifted index, 0–1 km and 0–3 km SRH, 0–2 km and 2–5 km
@@ -171,7 +171,7 @@ panes can show different parameters at once.
 
 Three things stand between that column and the rest of the table:
 
-- **HRRR is CONUS-only**, so every ✅ in Rustdar's model coverage stops at the
+- **HRRR is CONUS-only**, so every ✅ in Squallar's model coverage stops at the
   US border. Every other model row is either wider coverage (GFS, GEFS, ECMWF
   IFS are global) or more members. Nothing implements a fallback chain —
   regional model where one exists, global model elsewhere.
@@ -190,13 +190,13 @@ Three things stand between that column and the rest of the table:
   wasm/iOS cross-compile problem.
 
 **Wind vectors** is ❌ rather than Partial on purpose: the surface wind field
-Rustdar decodes is HRRR *gust magnitude*, a scalar. Barbs, streamlines and
+Squallar decodes is HRRR *gust magnitude*, a scalar. Barbs, streamlines and
 particle animation all need the `UGRD`/`VGRD` component pair, which nothing
 fetches.
 
 ## ⚠️ SPC & Severe Weather
 
-| Feature                           | GR2A    | RadarScope | Pivotal | Rustdar |
+| Feature                           | GR2A    | RadarScope | Pivotal | Squallar |
 | --------------------------------- | ------- | ---------- | ------- | ------- |
 | Convective outlooks (Day 1–8)     | Overlay | ❓          | ✅       | ✅       |
 | Mesoscale discussions             | Overlay | ❓          | ❌       | ✅       |
@@ -207,7 +207,7 @@ fetches.
 | Significant hail/tornado probs    | ❌       | ❌          | ✅       | ✅       |
 | Fire weather outlooks (Day 1–8)   | ❌       | ❌          | ❌       | ✅       |
 
-Rustdar's watch and warning geometry comes from the NWS Alerts API, which is
+Squallar's watch and warning geometry comes from the NWS Alerts API, which is
 county/zone-shaped; the SPC watch parallelograms themselves are not fetched.
 
 ## 🌀 Tropical & Surface Analysis
@@ -216,7 +216,7 @@ Neither category exists in the tree. They are listed as one section because they
 share a shape: both are **analysed products** — a human or a model has already
 turned observations into geometry — rather than fields we rasterize ourselves.
 
-| Feature                           | Windy | RadarScope | Rustdar |
+| Feature                           | Windy | RadarScope | Squallar |
 | --------------------------------- | ----- | ---------- | ------- |
 | Active tropical cyclone positions | ✅     | ❓          | ❌       |
 | Forecast cone / track             | ✅     | ❓          | ❌       |
@@ -226,7 +226,7 @@ turned observations into geometry — rather than fields we rasterize ourselves.
 | Pressure centres (H / L)          | ✅     | ❌          | ❌       |
 
 Competitor columns in this section are unchecked, per the note at the top of the
-file. What the Rustdar column costs:
+file. What the Squallar column costs:
 
 - **Tropical** is `nhc.noaa.gov/CurrentStorms.json` for the index, then a KMZ
   per storm for the cone and track. The JSON is trivial; **KMZ is zip + KML and
@@ -246,7 +246,7 @@ file. What the Rustdar column costs:
 
 ## 📊 Analysis Tools
 
-| Feature                       | GR2A | RadarScope | Pivotal | SHARPpy | Rustdar |
+| Feature                       | GR2A | RadarScope | Pivotal | SHARPpy | Squallar |
 | ----------------------------- | ---- | ---------- | ------- | ------- | ------- |
 | Skew-T / Log-P diagrams       | ❌    | ✅          | ✅       | ✅       | ❌       |
 | Hodographs                    | ❌    | ❓          | Partial | ✅       | ❌       |
@@ -258,13 +258,13 @@ file. What the Rustdar column costs:
 | Multi-model comparison panels | ❌    | ❌          | Partial | ❌       | ❌       |
 
 RadarScope's Pro Tier Two forecast soundings are what puts a ✅ on the Skew-T
-row. Rustdar reads environmental heights from Open-Meteo
-(`rustdar-radar/src/sounding.rs`) but only the 0 °C and −20 °C levels, only to
+row. Squallar reads environmental heights from Open-Meteo
+(`squallar-radar/src/sounding.rs`) but only the 0 °C and −20 °C levels, only to
 scale the hail products, and never draws them — that is not a sounding tool.
 
 ## 🛰️ Satellite
 
-| Feature                   | Windy | COD | RadarScope | Rustdar |
+| Feature                   | Windy | COD | RadarScope | Squallar |
 | ------------------------- | ----- | --- | ---------- | ------- |
 | GOES-19/18 visible        | ✅     | ✅   | ✅          | ❌       |
 | GOES IR / Water vapor     | ✅     | ✅   | ✅          | ❌       |
@@ -279,7 +279,7 @@ scale the hail products, and never draws them — that is not a sounding tool.
 | Meteosat MTG / MSG-IODC   | ❓     | ❌   | ❓          | ❌       |
 | Himawari (W Pacific)      | ❓     | ❌   | ❓          | ❌       |
 
-Rustdar reads the `noaa-goes19` and `noaa-goes18` buckets, but only for GLM
+Squallar reads the `noaa-goes19` and `noaa-goes18` buckets, but only for GLM
 lightning — no imagery product is decoded. GOES-19 replaced GOES-16 in the
 GOES-East slot in April 2025, which is why the row is no longer "GOES-16/18".
 
@@ -330,7 +330,7 @@ use. CIRA SLIDER publishes no licence at all and is CORS-blocked, so the
 
 ## ⚡ Lightning
 
-| Feature                            | RadarScope | Baron | Rustdar |
+| Feature                            | RadarScope | Baron | Squallar |
 | ---------------------------------- | ---------- | ----- | ------- |
 | Real-time strikes (ground network) | ✅ (Pro)    | ✅     | ❌       |
 | GLM (satellite-based)              | ❌          | ✅     | ✅       |
@@ -343,7 +343,7 @@ network: the ✅ and the ❌ on the first two rows measure different things.
 
 ## 📍 Surface Observations
 
-| Feature                        | GR2A    | RadarScope | Rustdar |
+| Feature                        | GR2A    | RadarScope | Squallar |
 | ------------------------------ | ------- | ---------- | ------- |
 | METAR/ASOS station plots       | Overlay | ❌          | ✅       |
 | Personal weather stations      | ❌       | ❌          | ❌       |
@@ -352,13 +352,13 @@ network: the ✅ and the ❌ on the first two rows measure different things.
 | mPING spotter reports          | ❌       | ❌          | ❌       |
 | Station model plots (standard) | ❌       | ❌          | Partial |
 
-Rustdar draws a station model (`rustdar-overlays/src/render/station_model.rs`)
+Squallar draws a station model (`squallar-overlays/src/render/station_model.rs`)
 from the Iowa Environmental Mesonet's METAR feed. It is a reduced plot, not the
 full WMO station model, hence Partial.
 
 ## 🔔 Alerting & Notifications
 
-| Feature                             | Baron | DTN | RadarScope | Rustdar |
+| Feature                             | Baron | DTN | RadarScope | Squallar |
 | ----------------------------------- | ----- | --- | ---------- | ------- |
 | Custom geo-fenced alerts            | ✅     | ✅   | Partial    | ❌       |
 | Threshold-based (wind >60mph, etc.) | ✅     | ✅   | ❌          | ❌       |
@@ -366,12 +366,12 @@ full WMO station model, hence Partial.
 | Multi-hazard dashboard              | ✅     | ✅   | ❌          | ❌       |
 | Email/SMS/webhook alerts            | ✅     | ✅   | ❌          | ❌       |
 
-Rustdar has a push feed, but it notifies the *app* that a new Level 2 chunk
+Squallar has a push feed, but it notifies the *app* that a new Level 2 chunk
 exists so the fetch can start immediately. Nothing notifies the user of weather.
 
 ## 💻 Platform & UX
 
-| Feature                     | GR2A       | RadarScope  | Windy | Rustdar           |
+| Feature                     | GR2A       | RadarScope  | Windy | Squallar           |
 | --------------------------- | ---------- | ----------- | ----- | ----------------- |
 | Desktop app                 | ✅ (Win)    | ✅ (Win/Mac) | ❌     | ✅ (Linux/Mac/Win) |
 | Web app                     | ❌          | ❌           | ✅     | ✅                 |
@@ -384,11 +384,11 @@ exists so the fetch can start immediately. Nothing notifies the user of weather.
 | Open API for developers     | ❌          | ❌           | Paid  | ❌                 |
 | GR2Analyst placefile compat | ✅          | ❌           | ❌     | ❌                 |
 
-- **Mobile** is Partial: Android ships (the `rustdar` crate's android arm), and iOS builds an
+- **Mobile** is Partial: Android ships (the `squallar` crate's android arm), and iOS builds an
   `.ipa` in CI (`packaging/ios/Makefile`, the `ios-aarch64` row of `build.yaml`), but it
   is unsigned and undistributed.
 - **Multi-pane** is up to six panes on desktop and four on mobile
-  (`MAX_PANES_DESKTOP` / `MAX_PANES_MOBILE` in `rustdar-egui/src/pane.rs`).
+  (`MAX_PANES_DESKTOP` / `MAX_PANES_MOBILE` in `squallar-egui/src/pane.rs`).
 - **Dark mode** follows the OS and only the OS — `dark_light::detect` on
   desktop, a JNI read of `Configuration.uiMode` on Android — with light and dark
   basemap label tiles behind it. There is no in-app override and no theme
