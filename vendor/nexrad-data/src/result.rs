@@ -78,6 +78,19 @@ pub enum Error {
         /// The record's compressed size in bytes, excluding the size prefix.
         compressed: usize,
     },
+    /// The gzip-wrapped volume decompresses past its ceiling.
+    ///
+    /// Same shape and same reason as [`Error::RecordTooLarge`], one level up:
+    /// DEFLATE declares no decompressed size either, so an over-large volume is
+    /// only detectable at the ceiling, and the stream is abandoned there rather
+    /// than expanded to find out how big it really is.
+    #[error("volume decompresses past the {limit} byte ceiling (compressed size {compressed})")]
+    VolumeTooLarge {
+        /// The ceiling that was exceeded, in bytes.
+        limit: usize,
+        /// The volume's gzip-compressed size in bytes.
+        compressed: usize,
+    },
     /// LDM record size is invalid at the given file offset.
     #[error("invalid record size {size} at offset {offset}")]
     InvalidRecordSize {
