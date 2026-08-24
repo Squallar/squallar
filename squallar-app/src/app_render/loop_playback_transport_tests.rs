@@ -481,3 +481,56 @@ fn the_tick_sequence_of_a_radar_only_pane_is_unchanged() {
          the one loop this application ships.",
     );
 }
+
+/// **A parked pane keeps its instant when its loop arms.**
+///
+/// `loop_start_frame` returns `None` for every transport that does not extend
+/// into the future — which is every radar pane — so the `Live` alignment arm is
+/// the common path, not an edge. Applied to a pane the user scrubbed to a
+/// moment, it threw that moment away the instant the loop armed: a pane pinned
+/// to the 2013 Moore volume came back showing the current afternoon.
+///
+/// **Non-vacuity floor**: the live pane in the same table must still be aligned
+/// to `Live`, so "never touch the clock" does not pass either.
+///
+/// **WHAT THIS DOES NOT PIN.** It replicates the match rather than driving
+/// `start_ready_loops`, which needs an `App` with render-ready loop state. So it
+/// pins the intended semantics, not the call site: edit the real arm and this
+/// still passes. Reaching the real path needs the loop harness, and this is
+/// named honestly rather than left to read as a gate it is not.
+#[test]
+fn arming_a_loop_leaves_a_parked_pane_on_its_instant() {
+    let parked = chrono::NaiveDate::from_ymd_opt(2013, 5, 20)
+        .unwrap()
+        .and_hms_opt(19, 59, 0)
+        .unwrap();
+
+    for (start_mode, expected) in [
+        (
+            squallar_egui::pane::TimeMode::AsOf(parked),
+            squallar_egui::pane::TimeMode::AsOf(parked),
+        ),
+        (
+            squallar_egui::pane::TimeMode::Live,
+            squallar_egui::pane::TimeMode::Live,
+        ),
+    ] {
+        let mut gui = squallar_egui::Gui::new();
+        gui.pane_mut(0).expect("pane 0").time.mode = start_mode;
+
+        // The arm the fix guards: `park` is `None` for a radar transport.
+        let pane = gui.pane_mut(0).expect("pane 0");
+        match None::<usize> {
+            Some(index) => {
+                pane.park_on_transport_frame(index);
+            }
+            None if pane.time.mode.as_of().is_some() => pane.settle_playheads(),
+            None => pane.set_time_mode(squallar_egui::pane::TimeMode::Live),
+        }
+
+        assert_eq!(
+            pane.time.mode, expected,
+            "starting from {start_mode:?} the loop-arm must leave the clock at {expected:?}"
+        );
+    }
+}

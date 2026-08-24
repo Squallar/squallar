@@ -58,6 +58,55 @@ struct PaneConfig {
     /// Time step size in seconds (0 = single scan mode).
     #[serde(default = "default_time_step")]
     time_step_secs: i64,
+    /// **The instant this pane is parked on**, UTC, or absent for a pane that
+    /// is following live data.
+    ///
+    /// AN ABSOLUTE INSTANT, NOT A RELATIVE OFFSET, and that is a deliberate
+    /// split from how the HRRR layer stores its run. That one encodes a
+    /// relative token so a config closed on Friday with 18Z picked does not
+    /// reopen on Monday three days in the past. The argument is sound for a
+    /// forecast run, whose whole meaning is "the latest one"; it is wrong for
+    /// a scrubbed radar timeline, where the instant IS the thing the user
+    /// chose. A pane parked on the 2013-05-20 Moore volume that reopened on
+    /// live data would have discarded the only state that mattered, which is
+    /// what "reopen is exactly 1:1" exists to forbid.
+    ///
+    /// The pane makes it visible rather than silent: a parked pane says so in
+    /// its transport and its status bar, so reopening into the past is
+    /// legible, unlike the reopened-forecast case that argument was written
+    /// about.
+    /// Written as `YYYY-MM-DDTHH:MM:SS`, UTC and naive. A string rather than a
+    /// `NaiveDateTime` because chrono's `serde` feature is not enabled anywhere
+    /// in this workspace and turning it on for one optional field would widen a
+    /// workspace-wide dependency; the model layer already encodes its run as a
+    /// string for its own reasons. It also makes the field hand-writable, which
+    /// is the whole point for a seeded scene.
+    ///
+    /// Read tolerantly: an unparseable value reads as live, exactly as a
+    /// malformed product or site does elsewhere in this file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    as_of: Option<String>,
+    /// **Whether this pane's selection follows live data.**
+    ///
+    /// Persisted separately from [`Self::as_of`] and NOT derived from it,
+    /// because `PaneState::viewing_live` documents the two as different
+    /// questions: a pane playing a loop depicts an older instant every frame
+    /// while still following the live site. Deriving this from a parked clock
+    /// would stop the chunk feed the moment a loop played.
+    ///
+    /// It is load-bearing beyond the Live button: it is what gates the archive
+    /// auto-poll. A pane restored parked but still flagged live had the poll
+    /// fetch the current volume and install it straight over the archived one
+    /// the pane had just asked for -- which is why a screenshot pinned to
+    /// Hurricane Ian came back showing this afternoon's Florida convection.
+    ///
+    /// `skip_serializing_if` for the same reason [`Self::as_of`] has one: a live
+    /// pane is the overwhelming default, and writing the key into every pane of
+    /// every config would change the bytes of files that say nothing about it --
+    /// which `a_config_naming_an_unregistered_layer_is_written_back_byte_preserved`
+    /// exists to forbid.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    viewing_live: bool,
     /// **Which link group this pane belongs to**, as the group's index;
     /// `null` for a pane in no group at all.
     ///
@@ -303,6 +352,14 @@ impl<'de> Deserialize<'de> for SlotList {
     }
 }
 
+/// The spelling [`PaneConfig::as_of`] is written and read in.
+const AS_OF_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
+
+/// A parked instant, or `None` for anything this build cannot read as one.
+fn parse_as_of(text: &str) -> Option<chrono::NaiveDateTime> {
+    chrono::NaiveDateTime::parse_from_str(text, AS_OF_FORMAT).ok()
+}
+
 impl PaneConfig {
     /// This pane's radar slot, the one that carries its selection.
     fn radar_slot(&self) -> Option<&SlotConfig> {
@@ -494,6 +551,11 @@ fn default_time_step() -> i64 {
     600
 }
 
+/// Whether a `bool` field is at its `true` default, for `skip_serializing_if`.
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 fn default_true() -> bool {
     true
 }
@@ -523,6 +585,8 @@ impl Default for PaneConfig {
             layers: BTreeMap::new(),
             spc_day: OutlookDay::Day1,
             time_step_secs: 600,
+            as_of: None,
+            viewing_live: true,
             group: default_group(),
             time_link: true,
             viewport_link: true,
@@ -1066,6 +1130,13 @@ impl super::Gui {
                     layers: BTreeMap::new(),
                     spc_day: OutlookDay::Day1,
                     time_step_secs: pane.time.step.as_secs(),
+                    viewing_live: pane.viewing_live,
+                    as_of: match pane.time.mode {
+                        crate::pane::TimeMode::Live => None,
+                        crate::pane::TimeMode::AsOf(at) => {
+                            Some(at.format(AS_OF_FORMAT).to_string())
+                        }
+                    },
                     group: pane.group.map(crate::pane::GroupId::index),
                     time_link: pane.time_link,
                     viewport_link: pane.viewport_link,
@@ -1380,6 +1451,21 @@ impl super::Gui {
                 pane.set_site(pane_site);
             }
             pane.time.step = crate::pane::TimeStep::from_secs(pc.time_step_secs);
+            pane.viewing_live = pc.viewing_live;
+            // `set_time_mode`, not a bare field write: it settles every layer's
+            // playhead onto the restored clock. Assigning the field left the
+            // playheads where `Gui::new` put them, so the reload path had to
+            // re-select the instant later purely to settle them -- and that
+            // re-selection dispatched an overlay refetch for every layer,
+            // including Radar, which fetches out of band and can only answer
+            // "no fetch task could be built". The user saw that as an error
+            // toast on a pane whose volume had loaded perfectly.
+            pane.set_time_mode(
+                pc.as_of
+                    .as_deref()
+                    .and_then(parse_as_of)
+                    .map_or(crate::pane::TimeMode::Live, crate::pane::TimeMode::AsOf),
+            );
             // **Downstream of the legacy fold, not a replacement for it.** The
             // retired globals still seed the flags below; the group only says
             // which panes those flags are scoped to, and a file that names no
@@ -1740,6 +1826,10 @@ mod notifier_config_tests;
 #[path = "ui_config/storm_motion_config_tests.rs"]
 #[cfg(test)]
 mod storm_motion_config_tests;
+
+#[path = "ui_config/as_of_config_tests.rs"]
+#[cfg(test)]
+mod as_of_config_tests;
 
 /// The split preference and the dragged dividers, across a restart.
 #[path = "ui_config/pane_layout_config_tests.rs"]

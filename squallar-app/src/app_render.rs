@@ -2810,6 +2810,20 @@ impl super::App {
                 // Align all panes to the last frame so they start from the same
                 // position — said as a clock rather than as an index: `Live` is
                 // "the newest there is", which is the same frame on every pane.
+                //
+                // A PARKED PANE IS EXEMPT, and this is not a special case so
+                // much as the same sentence read properly: the alignment exists
+                // so panes start together, and a pane the user scrubbed to an
+                // instant is already where it is supposed to start. Applied to
+                // it, `Live` silently threw that instant away.
+                //
+                // `loop_start_frame` returns `None` for every transport that
+                // does not extend into the future, which is every radar pane,
+                // so this arm is the common path rather than an edge: any
+                // parked radar pane whose loop armed was dragged to live data
+                // the moment it armed. That is how a screenshot pinned to the
+                // 2013 Moore volume came back showing this afternoon's weather.
+                None if pane.time.mode.as_of().is_some() => pane.settle_playheads(),
                 None => pane.set_time_mode(squallar_egui::pane::TimeMode::Live),
             }
         }

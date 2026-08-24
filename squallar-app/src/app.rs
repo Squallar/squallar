@@ -121,6 +121,26 @@ enum BackPress {
     Ignored,
 }
 
+/// **Every pane restored parked on an instant**, as `(index, site, instant)`.
+///
+/// Radar's predicate matches the one a manual step uses: a pane that draws no
+/// radar is not asking for a volume, and fetching one it would not paint is
+/// speculation.
+fn parked_panes(gui: &Gui) -> Vec<(usize, String, chrono::NaiveDateTime)> {
+    gui.panes()
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, pane)| {
+            let instant = pane.time.mode.as_of()?;
+            if !pane.is_overlay_enabled(&squallar_source::id::known::RADAR) {
+                return None;
+            }
+            let site = pane.site().to_string();
+            (!site.is_empty()).then_some((idx, site, instant))
+        })
+        .collect()
+}
+
 pub struct App {
     state: Option<app_state::AppState>,
     window: Option<WindowRef>,
@@ -237,6 +257,18 @@ pub struct App {
         ),
     >,
     manual_nav_pending: bool,
+    /// **Panes restored parked on an instant, whose data has not been asked
+    /// for yet.** Drained once, on the first redraw.
+    ///
+    /// Persisting the clock is not persisting the picture. A pane reloaded with
+    /// `as_of` set has its playhead in 2013 and its map painted with whatever
+    /// the live poll just delivered, because the archive fetch is driven by a
+    /// scrub and a reload is not one. Reopening parked-but-live is worse than
+    /// reopening live: the transport says one thing and the map shows another.
+    ///
+    /// Collected at construction rather than dispatched there because
+    /// `spawn_fetch` needs the built `App`.
+    parked_fetch_pending: Vec<(usize, String, chrono::NaiveDateTime)>,
     /// The map extent most recently asked for on screen.
     last_viewport: Option<squallar_geo::GeoBounds>,
     autosave: AutosaveState,
@@ -427,6 +459,8 @@ impl App {
             .kv()
             .is_some_and(|store| gui.load_ui_config(store.as_ref()));
         let site_is_provisional = !restored && apply_location_hint(&mut gui, platform.as_ref());
+        // Before `gui` moves into the struct literal below.
+        let parked_fetch_pending = parked_panes(&gui);
         let site_positions = crate::site_positions::SitePositions::load(platform.kv().as_deref());
         let site_catalogue = crate::site_catalogue::load(platform.kv().as_deref());
         let table =
@@ -514,6 +548,7 @@ impl App {
             chunk_notify: squallar_radar::chunk_notify::ChunkNotifier::new(),
             latest_cached_scans: HashMap::new(),
             manual_nav_pending: false,
+            parked_fetch_pending,
             last_viewport: None,
             redraw_waker: RedrawWaker::new(),
             // The gate inside is inert until the first `poll_platform_state`, which is
@@ -2317,6 +2352,7 @@ impl ApplicationHandler for App {
                 self.request_exit(Some(event_loop));
             }
             WindowEvent::RedrawRequested => {
+                self.hydrate_parked_panes();
                 self.handle_redraw();
                 if std::mem::take(&mut self.exit_requested) {
                     self.exit_now(event_loop);
