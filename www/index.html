@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Squallar — NEXRAD weather radar</title>
+    <meta
+      name="description"
+      content="Level 2 super-resolution NEXRAD radar with sub-volume latency, full dual-pol, cross-sections and the whole public archive. Native on Linux, macOS and Windows, in the browser, and on Android."
+    />
+    <meta name="theme-color" content="#101014" />
+    <link rel="canonical" href="https://squallar.com/" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Squallar — NEXRAD weather radar" />
+    <meta
+      property="og:description"
+      content="Level 2 super-resolution NEXRAD radar with sub-volume latency, full dual-pol, cross-sections and the whole public archive."
+    />
+    <meta property="og:url" content="https://squallar.com/" />
+    <meta property="og:image" content="https://squallar.com/screenshots/hero.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+
+    <!-- Icons are the app's, served from this origin so the page has no cross-origin
+         dependency at all. Everything here is first-party: no fonts, no analytics,
+         no CDN. -->
+    <link rel="icon" href="icons/favicon-32.png" sizes="32x32" />
+    <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+
+  <body>
+    <header class="topbar">
+      <a class="wordmark" href="/" aria-label="Squallar home"
+        >SQUALL<span class="accent">AR</span></a
+      >
+      <nav>
+        <a href="#features">Features</a>
+        <a href="#compare">Compare</a>
+        <a href="https://github.com/Squallar/squallar">Source</a>
+        <a class="cta" href="https://squallar.app">Launch</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero">
+        <h1>The radar sees it first.<br />So should you.</h1>
+        <p class="lede">
+          Level&nbsp;2 super-resolution NEXRAD with <strong>sub-volume latency</strong> —
+          the 0.5° tilt reaches you seconds after the radar collects it, not at the end
+          of the volume scan. Full dual-pol, vertical cross-sections, and the entire
+          public archive.
+        </p>
+        <p class="actions">
+          <a class="btn primary" href="https://squallar.app">Open in your browser</a>
+          <a class="btn" href="#features">See what it does</a>
+        </p>
+        <p class="fineprint">
+          Runs natively on Linux, macOS and Windows, in any modern browser, and on
+          Android. No account. Free and open source.
+        </p>
+
+        <figure class="shot">
+          <img
+            src="screenshots/hero.png"
+            alt="Squallar showing base reflectivity over Oklahoma, with the layer panel, dBZ colour ramp and timeline transport"
+            width="1280"
+            height="757"
+            fetchpriority="high"
+          />
+        </figure>
+      </section>
+
+      <section id="features">
+        <h2>What it does</h2>
+
+        <div class="grid">
+          <article>
+            <h3>Sub-volume latency</h3>
+            <p>
+              Reads the real-time Level&nbsp;2 chunk feed rather than waiting for a
+              completed volume, so the lowest tilt lands seconds after collection. A
+              WebSocket push feed drives it — no polling delay on top.
+            </p>
+          </article>
+
+          <article>
+            <h3>Every moment, and what's derived from them</h3>
+            <p>
+              Reflectivity, velocity and spectrum width, plus the full dual-pol set
+              (CC,&nbsp;ZDR,&nbsp;PHI,&nbsp;KDP). Derived products are computed here, not
+              just displayed: normalized rotation, VIL and VIL density, echo tops, hail
+              POSH/MEHS, precipitation rate, storm-relative velocity and hydrometeor
+              classification.
+            </p>
+          </article>
+
+          <article>
+            <h3>Cut through the storm</h3>
+            <p>
+              Vertical cross-sections along any line you draw, and volumetric rendering
+              of the whole scan — the parts of a supercell that a plan view flattens
+              away.
+            </p>
+          </article>
+
+          <article>
+            <h3>Six panes, linked or not</h3>
+            <p>
+              Up to six panes on desktop, four on mobile. Link them by time, viewport or
+              layer set, or leave each independent to compare products, tilts or sites
+              side by side.
+            </p>
+          </article>
+
+          <article>
+            <h3>Everything loops</h3>
+            <p>
+              Not just radar. Every time-varying layer animates on a shared timeline, so
+              satellite, mosaic and lightning move together with the tilt you're watching.
+            </p>
+          </article>
+
+          <article>
+            <h3>The whole archive</h3>
+            <p>
+              Scrub the complete public NEXRAD Level&nbsp;2 archive, not a rolling
+              window. Any storm, any date the network recorded it.
+            </p>
+          </article>
+
+          <article>
+            <h3>Beyond the radar network</h3>
+            <p>
+              MRMS national mosaic (composite reflectivity and precipitation rate), NOAA's
+              global geostationary satellite mosaic across four channels, and GOES GLM
+              lightning.
+            </p>
+          </article>
+
+          <article>
+            <h3>Watches, warnings, and the discussion behind them</h3>
+            <p>
+              NWS alert polygons, SPC convective and fire-weather outlooks, mesoscale
+              discussions, storm reports and METAR surface observations.
+            </p>
+          </article>
+
+          <article>
+            <h3>Actually cross-platform</h3>
+            <p>
+              One codebase, GPU-rendered everywhere. A native desktop binary on Linux,
+              macOS and Windows; a real app in the browser with wasm threads; and Android.
+              Your layout is restored exactly as you left it.
+            </p>
+          </article>
+        </div>
+      </section>
+
+      <section id="compare">
+        <h2>How it compares</h2>
+        <p class="section-lede">
+          The honest version. Squallar's column is checked against the source tree;
+          competitor columns are read from vendor documentation and paid tiers we
+          haven't verified, so they carry a question mark where we don't actually know.
+          RadarScope's column reflects its Pro tiers, not the free app.
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Feature</th>
+                <th scope="col">GR2Analyst</th>
+                <th scope="col">RadarScope</th>
+                <th scope="col">Squallar</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <th scope="row">Level 2 real-time chunks</th>
+                <td class="y">Yes</td>
+                <td class="u">Unverified</td>
+                <td class="y">Yes</td>
+              </tr>
+              <tr>
+                <th scope="row">Normalized rotation</th>
+                <td class="y">Yes</td>
+                <td class="n">No</td>
+                <td class="y">Yes</td>
+              </tr>
+              <tr>
+                <th scope="row">Vertical cross-sections</th>
+                <td class="y">Yes</td>
+                <td class="n">No</td>
+                <td class="y">Yes</td>
+              </tr>
+              <tr>
+                <th scope="row">Volumetric rendering</th>
+                <td class="y">Yes</td>
+                <td class="n">No</td>
+                <td class="p">Partial</td>
+              </tr>
+              <tr>
+                <th scope="row">Archive playback</th>
+                <td class="y">Yes</td>
+                <td class="y">Yes</td>
+                <td class="y">Yes</td>
+              </tr>
+              <tr>
+                <th scope="row">Desktop app</th>
+                <td class="p">Windows only</td>
+                <td class="p">Win / Mac</td>
+                <td class="y">Linux / Mac / Win</td>
+              </tr>
+              <tr>
+                <th scope="row">Web app</th>
+                <td class="n">No</td>
+                <td class="n">No</td>
+                <td class="y">Yes</td>
+              </tr>
+              <tr>
+                <th scope="row">Mobile</th>
+                <td class="n">No</td>
+                <td class="y">Yes</td>
+                <td class="p">Android</td>
+              </tr>
+              <tr>
+                <th scope="row">TDWR terminal radars</th>
+                <td class="u">Unverified</td>
+                <td class="y">Yes</td>
+                <td class="n">Not yet</td>
+              </tr>
+              <tr>
+                <th scope="row">Custom colour tables</th>
+                <td class="y">Yes</td>
+                <td class="y">Yes</td>
+                <td class="n">Not yet</td>
+              </tr>
+              <tr>
+                <th scope="row">Placefile support</th>
+                <td class="y">Yes</td>
+                <td class="n">No</td>
+                <td class="n">Not yet</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p class="fineprint">
+          The full matrix — every row, every caveat, and the file that proves each
+          claim — lives in
+          <a href="https://github.com/Squallar/squallar/blob/main/features.md"
+            >features.md</a
+          >.
+        </p>
+      </section>
+
+      <section class="closing">
+        <h2>Open it and see.</h2>
+        <p>
+          Nothing to install, no account, no trial. The browser build is the whole
+          application.
+        </p>
+        <p class="actions">
+          <a class="btn primary" href="https://squallar.app">Launch Squallar</a>
+        </p>
+      </section>
+    </main>
+
+    <footer>
+      <p class="wordmark small">SQUALL<span class="accent">AR</span></p>
+      <p>
+        Weather data from NOAA/NWS public sources. Squallar is not affiliated with
+        NOAA, the National Weather Service, or any product it is compared against
+        above.
+      </p>
+      <p class="fineprint">
+        Not for the protection of life or property. Use official National Weather
+        Service warnings for safety decisions.
+      </p>
+    </footer>
+  </body>
+</html>
