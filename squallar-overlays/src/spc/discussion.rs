@@ -29,6 +29,14 @@ pub struct SpcDiscussion {
     pub polygon: GeoPolygon,
     pub feature: OverlayFeature,
     pub concerning: Option<String>,
+    /// **When this discussion is in force**, UTC, from its own `VALID` line.
+    ///
+    /// An MD is an item with a validity window — `TimeAxis::EventLifetime` —
+    /// and this is the window. `None` on either side where the product did not
+    /// say, which passes the filter on that side rather than hiding a
+    /// discussion for being badly formed.
+    pub valid_from: Option<chrono::NaiveDateTime>,
+    pub valid_until: Option<chrono::NaiveDateTime>,
 }
 
 pub fn classify_md_type(text: &str) -> MdType {
@@ -182,6 +190,15 @@ fn extract_md_number(title: &str) -> Option<u32> {
 /// `spcmdrss.xml` items carry `<title>`, `<link>` and a `<description>` holding
 /// the whole product body, `LAT...LON` block included.
 pub fn parse_md_rss(xml: &str) -> Result<Vec<SpcDiscussion>, String> {
+    parse_md_rss_at(xml, chrono::Utc::now().naive_utc())
+}
+
+/// [`parse_md_rss`] with the instant the day-of-month fields resolve against
+/// supplied, so the tests are not a function of the day they run on.
+pub fn parse_md_rss_at(
+    xml: &str,
+    reference: chrono::NaiveDateTime,
+) -> Result<Vec<SpcDiscussion>, String> {
     let doc = roxmltree::Document::parse(xml).map_err(|e| format!("RSS parse error: {e}"))?;
     let mut discussions = Vec::new();
 
@@ -199,40 +216,125 @@ pub fn parse_md_rss(xml: &str) -> Result<Vec<SpcDiscussion>, String> {
         let description = child_text("description");
 
         let text = strip_html_tags(&decode_html_entities(&description));
-
         let number = extract_md_number(&title).unwrap_or(0);
-        let md_type = classify_md_type(&text);
-        let concerning = extract_concerning(&text);
-        let polygon = parse_lat_lon_polygon(&text)
-            .map(|ring| vec![ring])
-            .unwrap_or_default();
 
-        if number == 0 && polygon.is_empty() {
-            continue; // Nothing displayable.
+        // The live feed's items are in force now, so now resolves their
+        // day-of-month fields.
+        if let Some(md) = discussion_from_text(number, title, link, text, reference) {
+            discussions.push(md);
         }
-
-        let feature = OverlayFeature::new(
-            vec![polygon.clone()],
-            md_fill_color(&md_type),
-            md_stroke_color(&md_type),
-            format!("MD {number}"),
-            String::new(),
-            HatchPattern::None,
-        );
-
-        discussions.push(SpcDiscussion {
-            number,
-            title,
-            text,
-            link,
-            md_type,
-            polygon,
-            feature,
-            concerning,
-        });
     }
 
     Ok(discussions)
+}
+
+/// `VALID 201819Z - 202015Z` → the two instants it names.
+///
+/// The field is `DDHHMM`: day of month, hour, minute, UTC, with no month and no
+/// year — NWSI 10-517 §6.3. `reference` supplies the missing two: the candidate
+/// month is whichever puts the named day nearest the reference instant, which is
+/// the fetch's own `as_of`. That resolves the month boundary in both directions
+/// (a product issued on the 31st and read on the 1st, and the reverse) without
+/// the caller knowing which case it is in.
+///
+/// A side that does not parse comes back `None` and passes the as-of filter on
+/// that side: an MD with a malformed expiry should be drawn, not hidden.
+pub fn parse_valid_window(
+    text: &str,
+    reference: chrono::NaiveDateTime,
+) -> (Option<chrono::NaiveDateTime>, Option<chrono::NaiveDateTime>) {
+    let Some(pos) = text.find("VALID ") else {
+        return (None, None);
+    };
+    let line = text[pos + "VALID ".len()..].lines().next().unwrap_or_default();
+    let mut halves = line.split('-').map(str::trim);
+    let from = halves.next().and_then(|h| resolve_ddhhmm(h, reference));
+    let until = halves.next().and_then(|h| resolve_ddhhmm(h, reference));
+    (from, until)
+}
+
+/// `"201819Z"` → the instant, resolved against `reference`.
+fn resolve_ddhhmm(token: &str, reference: chrono::NaiveDateTime) -> Option<chrono::NaiveDateTime> {
+    let digits = token.trim().trim_end_matches('Z');
+    if digits.len() != 6 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let day: u32 = digits[0..2].parse().ok()?;
+    let hour: u32 = digits[2..4].parse().ok()?;
+    let minute: u32 = digits[4..6].parse().ok()?;
+    let time = chrono::NaiveTime::from_hms_opt(hour, minute, 0)?;
+
+    // The reference month and its two neighbours cover every case: the named
+    // day is at most ~31 days from the reference in either direction.
+    use chrono::Datelike;
+    let mut best: Option<chrono::NaiveDateTime> = None;
+    for offset in [-1i32, 0, 1] {
+        let months = reference.year() * 12 + reference.month0() as i32 + offset;
+        let (year, month0) = (months.div_euclid(12), months.rem_euclid(12) as u32);
+        let Some(date) = chrono::NaiveDate::from_ymd_opt(year, month0 + 1, day) else {
+            continue; // e.g. the 31st of a 30-day month.
+        };
+        let candidate = date.and_time(time);
+        let nearer = best.is_none_or(|b| {
+            (candidate - reference).num_seconds().abs() < (b - reference).num_seconds().abs()
+        });
+        if nearer {
+            best = Some(candidate);
+        }
+    }
+    best
+}
+
+/// One discussion, from its product body.
+///
+/// Shared by the live RSS feed and the archive: both end up holding the same
+/// plain-text product, and everything displayable — the type, the "concerning"
+/// line, the polygon and its colours — is derived from that text rather than
+/// from whichever service delivered it. A second copy of this derivation is how
+/// an archived MD would end up drawn in a different colour from the identical
+/// live one.
+///
+/// `None` when nothing is displayable: no number and no polygon.
+pub fn discussion_from_text(
+    number: u32,
+    title: String,
+    link: String,
+    text: String,
+    reference: chrono::NaiveDateTime,
+) -> Option<SpcDiscussion> {
+    let md_type = classify_md_type(&text);
+    let concerning = extract_concerning(&text);
+    let polygon = parse_lat_lon_polygon(&text)
+        .map(|ring| vec![ring])
+        .unwrap_or_default();
+
+    if number == 0 && polygon.is_empty() {
+        return None;
+    }
+
+    let feature = OverlayFeature::new(
+        vec![polygon.clone()],
+        md_fill_color(&md_type),
+        md_stroke_color(&md_type),
+        format!("MD {number}"),
+        String::new(),
+        HatchPattern::None,
+    );
+
+    let (valid_from, valid_until) = parse_valid_window(&text, reference);
+
+    Some(SpcDiscussion {
+        number,
+        title,
+        text,
+        link,
+        md_type,
+        polygon,
+        feature,
+        concerning,
+        valid_from,
+        valid_until,
+    })
 }
 
 fn decode_html_entities(s: &str) -> String {

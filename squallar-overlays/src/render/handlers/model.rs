@@ -428,6 +428,19 @@ const RUN_LATEST: &str = "";
 /// offset is in hours, because hours are what the HRRR cycle is.
 const RUN_STEM: &str = "latest";
 
+/// The spelling an absolute run is accepted in, and the prefix that makes it
+/// distinguishable from the one older builds wrote.
+///
+/// THE PREFIX IS THE WHOLE POINT. Builds before the relative encoding saved a
+/// bare `"2026-07-25T03:00:00"`, and those must still resolve to nothing —
+/// reopening a Friday forecast on Monday is the failure that encoding exists to
+/// prevent, and it is pinned by `a_stale_absolute_run_does_not_survive_a_restart`.
+/// A bare instant is therefore indistinguishable from a stale one and stays
+/// refused; `at:` cannot appear in any config an older build produced, so it can
+/// only mean a human wrote it on purpose.
+const ABSOLUTE_RUN_PREFIX: &str = "at:";
+const ABSOLUTE_RUN_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
+
 /// [`crate::hrrr::fetch::run_for`] as an instant. `run_for` answers
 /// `(date, hour)` because that is what a bucket key is spelled from; a
 /// selection is an instant.
@@ -468,19 +481,43 @@ fn encode_run_choice(run: chrono::NaiveDateTime, now: chrono::NaiveDateTime) -> 
     (back <= MAX_RUN_OFFSET).then(|| run_token(back))
 }
 
-/// **A relative choice as a run**, against the clock that is reading it.
+/// **A choice as a run**, against the clock that is reading it.
 ///
-/// `None` for `Latest`, for a token this build does not spell, and — the
-/// point of the whole encoding — for an **absolute** instant, which is what
-/// the build before this one saved. A config closed on Friday with 18Z picked
-/// would otherwise reopen on Monday three days into the past, with nothing but
-/// a small label to say so. It reopens on `Latest` instead.
+/// Two spellings, and the asymmetry between them is the design.
+///
+/// A RELATIVE token (`latest`, `latest-6`) is what [`encode_run_choice`] still
+/// writes, and it carries the original reason: a config closed on Friday with
+/// 18Z picked must not reopen on Monday three days in the past with nothing but
+/// a small label to say so. Every save this build makes is relative, so nothing
+/// about an ordinary session changed.
+///
+/// An ABSOLUTE instant, written `at:2020-08-10T17:00:00`, is accepted on read
+/// and never produced on write. The `at:` prefix is load-bearing: a *bare*
+/// instant is what older builds saved and stays refused, so this cannot
+/// resurrect a stale one. That combination is deliberate. Only a hand-authored
+/// config can contain one, which is exactly the case the relative encoding was
+/// never protecting: a scene that names the 10 August 2020 derecho means that
+/// run and no other, and resolving it to "six hours before now" would silently
+/// show the wrong weather. A file this build wrote cannot drift into the past,
+/// because it never writes this form.
+///
+/// `None` for a token this build does not spell, and for an offset past
+/// [`MAX_RUN_OFFSET`].
 fn decode_run_choice(text: &str, now: chrono::NaiveDateTime) -> Option<chrono::NaiveDateTime> {
-    let back: u8 = match text.strip_prefix(RUN_STEM)? {
-        "" => 0,
-        rest => rest.strip_prefix('-')?.parse().ok()?,
-    };
-    (back <= MAX_RUN_OFFSET).then(|| latest_run_at(now) - chrono::Duration::hours(i64::from(back)))
+    if let Some(rest) = text.strip_prefix(RUN_STEM) {
+        let back: u8 = match rest {
+            "" => 0,
+            rest => rest.strip_prefix('-')?.parse().ok()?,
+        };
+        return (back <= MAX_RUN_OFFSET)
+            .then(|| latest_run_at(now) - chrono::Duration::hours(i64::from(back)));
+    }
+    // Absolute, and snapped to the hour a run actually exists on: an instant
+    // between runs names no grid, and rounding it here rather than at the fetch
+    // keeps "which run did I ask for" answerable from the config alone.
+    let text = text.strip_prefix(ABSOLUTE_RUN_PREFIX)?;
+    let at = chrono::NaiveDateTime::parse_from_str(text, ABSOLUTE_RUN_FORMAT).ok()?;
+    Some(at.with_minute(0)?.with_second(0)?.with_nanosecond(0)?)
 }
 
 /// **What a resident grid is, in one phrase**: its valid time and forecast
@@ -1851,6 +1888,80 @@ mod tests {
     use squallar_geo::GeoBounds;
 
     const RUN_HOUR: u32 = 3;
+
+    fn at(y: i32, m: u32, d: u32, h: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(h, 0, 0)
+            .unwrap()
+    }
+
+    /// An absolute run resolves to itself, whatever the clock reading it says.
+    ///
+    /// This is the whole point of accepting the spelling: a scene naming the
+    /// 10 August 2020 derecho means that run. Read on two clocks a year apart
+    /// to prove it is not being resolved against `now`.
+    #[test]
+    fn an_absolute_run_ignores_the_clock() {
+        let derecho = at(2020, 8, 10, 17);
+        for now in [at(2020, 8, 10, 18), at(2021, 8, 10, 18), at(2026, 1, 1, 0)] {
+            assert_eq!(
+                decode_run_choice("at:2020-08-10T17:00:00", now),
+                Some(derecho),
+                "an absolute run must resolve to itself, not to an offset from {now}"
+            );
+        }
+    }
+
+    /// The relative vocabulary still resolves against the clock, unchanged.
+    #[test]
+    fn a_relative_run_still_tracks_the_clock() {
+        let now = at(2026, 8, 24, 18);
+        let latest = latest_run_at(now);
+        assert_eq!(decode_run_choice("latest", now), Some(latest));
+        assert_eq!(
+            decode_run_choice("latest-6", now),
+            Some(latest - chrono::Duration::hours(6))
+        );
+        assert_eq!(
+            decode_run_choice(&format!("latest-{}", MAX_RUN_OFFSET as u16 + 1), now),
+            None,
+            "past the vocabulary is still nothing"
+        );
+    }
+
+    /// Writing never produces the absolute form, so a config this build saves
+    /// cannot drift into the past on reopen.
+    #[test]
+    fn saving_never_writes_an_absolute_run() {
+        let now = at(2026, 8, 24, 18);
+        let token = encode_run_choice(latest_run_at(now) - chrono::Duration::hours(6), now)
+            .expect("six hours back is inside the vocabulary");
+        assert_eq!(token, "latest-6");
+        assert!(
+            token.starts_with(RUN_STEM),
+            "every written token must be relative, got {token}"
+        );
+    }
+
+    /// A BARE instant stays refused, because that is what older builds wrote and
+    /// resurrecting one is the exact failure the relative encoding prevents.
+    #[test]
+    fn a_bare_instant_is_still_refused() {
+        let now = at(2026, 8, 24, 18);
+        assert_eq!(decode_run_choice("2020-08-10T17:00:00", now), None);
+    }
+
+    /// An instant between runs snaps to the run hour rather than naming a grid
+    /// that does not exist.
+    #[test]
+    fn an_absolute_run_snaps_to_the_hour() {
+        let now = at(2026, 8, 24, 18);
+        assert_eq!(
+            decode_run_choice("at:2020-08-10T17:43:21", now),
+            Some(at(2020, 8, 10, 17))
+        );
+    }
 
     fn grid(parameter: ModelParameter, values: Vec<f32>) -> HrrrGridData {
         let n = values.len();
