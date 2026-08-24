@@ -12,6 +12,23 @@ const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct File(Vec<u8>);
 
+/// The ceiling a gzip-wrapped volume may decompress to, in bytes.
+///
+/// Sized from what the format actually produces, not from a round number. The
+/// gzip wrapper sits over LDM records that are already bzip2-compressed, so it
+/// buys very little: an 8.5 MB `.gz` from the 2013 archive expands to roughly
+/// its own size, and the largest Archive II volumes are tens of megabytes. 128
+/// MiB is several times the worst real case and still bounds a DEFLATE bomb --
+/// at ~1032:1 an 8.5 MB download would otherwise reach ~8.7 GB resident.
+///
+/// Deliberately larger than [`crate::volume::record::MAX_DECOMPRESSED_RECORD_BYTES`]:
+/// that bounds one record, this bounds every record plus the volume header.
+pub const MAX_DECOMPRESSED_VOLUME_BYTES: usize = 128 * 1024 * 1024;
+
+/// The floor the decompressed buffer starts at, for a file too small for the
+/// compressed-size estimate to be meaningful.
+const INITIAL_DECOMPRESSED_VOLUME_CAPACITY: usize = 256 * 1024;
+
 impl File {
     /// Creates a new Archive II volume file with the provided data.
     ///
@@ -42,9 +59,36 @@ impl File {
             return Ok(self);
         }
 
-        let mut decoder = GzDecoder::new(self.0.as_slice());
-        let mut decompressed = Vec::new();
-        decoder.read_to_end(&mut decompressed)?;
+        // BOUNDED, for the reason VENDORED.md names: this had an unbounded
+        // `read_to_end` on a `GzDecoder`, and DEFLATE reaches roughly 1032:1, so
+        // 16 MB of download expands to ~16 GB of resident memory. `Take` bounds
+        // how much is read and kept; it reserves nothing, so an ordinary volume
+        // pays nothing for the ceiling.
+        //
+        // Reading one byte past the limit is what makes the check decidable: at
+        // exactly the limit the volume still decompresses, and anything beyond
+        // is detected without being expanded any further.
+        let compressed = self.0.len();
+        // Whole-volume gzip over already-bzip2'd LDM records barely compresses,
+        // so the decompressed size is near the compressed one. Starting there
+        // rather than at zero avoids the doubling walk from 8 KB to ~10 MB --
+        // about eleven reallocations and a copy of everything each time -- while
+        // still never reserving the ceiling.
+        let initial = compressed.saturating_mul(2).clamp(
+            INITIAL_DECOMPRESSED_VOLUME_CAPACITY,
+            MAX_DECOMPRESSED_VOLUME_BYTES,
+        );
+        let mut decompressed = Vec::with_capacity(initial);
+        GzDecoder::new(self.0.as_slice())
+            .take(MAX_DECOMPRESSED_VOLUME_BYTES as u64 + 1)
+            .read_to_end(&mut decompressed)?;
+
+        if decompressed.len() > MAX_DECOMPRESSED_VOLUME_BYTES {
+            return Err(crate::result::Error::VolumeTooLarge {
+                limit: MAX_DECOMPRESSED_VOLUME_BYTES,
+                compressed,
+            });
+        }
 
         Ok(File(decompressed))
     }
