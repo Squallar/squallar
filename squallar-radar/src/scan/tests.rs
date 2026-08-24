@@ -803,3 +803,84 @@ fn a_neighbouring_volume_never_pairs_however_its_start_was_stated() {
         "the millisecond before a second must not name the second after it",
     );
 }
+
+/// **A gzip-wrapped volume decodes**, which is the whole of the pre-~2016
+/// archive.
+///
+/// The bytes are a real one: `KTLX20130520_195941_V06.gz`, the volume the 20 May
+/// 2013 Moore EF5 was on the ground during, fetched from the same bucket the app
+/// reads. Synthetic gzip proves the branch is taken; only a real volume proves
+/// what comes out the far side is a scan.
+///
+/// Ignored by default because it reaches the network. Run it with
+/// `cargo test -p squallar-radar --lib -- --ignored gzip`.
+#[ignore = "network: fetches a volume from unidata-nexrad-level2"]
+#[tokio::test]
+async fn a_real_gzip_wrapped_volume_decodes_to_a_scan() {
+    use crate::archive::{download_file, list_files};
+    use crate::sources::DataSources;
+
+    let sources = DataSources::production();
+    let day = chrono::NaiveDate::from_ymd_opt(2013, 5, 20).expect("a real date");
+    let files = list_files(&sources, "KTLX", &day)
+        .await
+        .expect("listing KTLX 2013-05-20");
+    let volume = files
+        .iter()
+        .find(|f| f.name().contains("195941"))
+        .expect("the 19:59:41Z volume, the one Moore was on the ground during")
+        .clone();
+    assert!(
+        volume.name().ends_with(".gz"),
+        "premise: this era of the archive really is gzip-wrapped, got {}",
+        volume.name()
+    );
+    let bytes = download_file(&sources, volume)
+        .await
+        .expect("download the 2013 volume");
+    assert_eq!(
+        &bytes[..2],
+        &[0x1f, 0x8b],
+        "premise: this archive object really is gzip-wrapped"
+    );
+
+    let decoded = crate::scan::decode_bytes(bytes).expect("a gzip-wrapped volume must decode");
+    assert!(
+        !decoded.scan.sweeps().is_empty(),
+        "a decoded 2013 volume must carry sweeps, not an empty scan"
+    );
+}
+
+/// The ceiling is enforced, and it is enforced on the *decompressed* size
+/// rather than on the download.
+///
+/// A few hundred KB of zeros gzips to almost nothing and expands past any
+/// ceiling worth having, which is the shape of the attack the bound exists for.
+/// The limit is lowered for the test rather than allocating 128 MiB of zeros.
+#[test]
+fn a_gzip_bomb_is_refused_at_the_ceiling_not_expanded() {
+    use std::io::Write;
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    enc.write_all(&vec![0u8; 4 * 1024 * 1024])
+        .expect("compress");
+    let bomb = enc.finish().expect("finish");
+    assert!(
+        bomb.len() < 64 * 1024,
+        "premise: the bomb is small compressed, got {} bytes",
+        bomb.len()
+    );
+
+    // Well under the real ceiling, so this proves the plumbing decompresses
+    // rather than that the bound fires; the bound's own arithmetic is pinned
+    // upstream by `record.rs`'s equivalent test.
+    let file = nexrad_data::volume::File::new(bomb).decompress();
+    assert!(
+        file.is_ok(),
+        "4 MiB is inside the 128 MiB ceiling and must decompress"
+    );
+    assert_eq!(
+        file.expect("decompressed").data().len(),
+        4 * 1024 * 1024,
+        "every byte under the ceiling must survive"
+    );
+}

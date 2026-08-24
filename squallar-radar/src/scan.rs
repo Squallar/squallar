@@ -268,7 +268,20 @@ fn fold_contributions(
 /// left open rather than answered with a log-capture harness built for one
 /// `debug!` line.
 pub fn decode_bytes(bytes: Vec<u8>) -> Result<DecodedScan> {
-    let file = nexrad_data::volume::File::new(bytes);
+    // GUNZIP FIRST, AND BEFORE THE HEADER READ RATHER THAN AFTER.
+    //
+    // Archives before ~2016 store volumes gzip-wrapped, and every step below
+    // fails on one in a way that does not name the cause: `header()` cannot
+    // parse compressed bytes so it returns `None`, the ICAO comes back empty,
+    // the network match falls to the WSR-88D arm, and `records()` finally
+    // refuses with `CompressedFile`. What the user saw was "Could not decode
+    // the volume" for a file that had downloaded perfectly.
+    //
+    // `decompress` returns `self` unchanged when the magic bytes are absent, so
+    // a modern `_V06` volume pays one two-byte comparison. It takes `self` by
+    // value, so the compressed buffer is freed as the decompressed one is
+    // built rather than both being held.
+    let file = nexrad_data::volume::File::new(bytes).decompress()?;
     let icao = file.header().and_then(|h| h.icao_of_radar());
     match RadarNetwork::of_id(icao.as_deref().unwrap_or("")) {
         RadarNetwork::Wsr88d => decoded(&file),
