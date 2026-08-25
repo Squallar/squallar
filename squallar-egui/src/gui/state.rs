@@ -114,6 +114,12 @@ pub struct Gui {
     pub loop_lookback_secs: u64,
     /// Animation speed in frames per second.
     pub loop_speed_fps: f32,
+    /// **Which theme the map is drawn in**, or `System` to follow the desktop.
+    ///
+    /// The chrome is dark whatever this says; what it moves is the basemap and
+    /// every theme-sensitive raster keyed on it. `System` is the default and is
+    /// what everyone gets until they choose otherwise.
+    pub theme: crate::pane::ThemeChoice,
     /// Whether the slide-out layers drawer is open. Only consulted when the
     /// layout has no persistent sidebar.
     pub(super) drawer_open: bool,
@@ -484,6 +490,7 @@ impl Gui {
             pending_section_edit: None,
             loop_lookback_secs: 3600, // default 1 hour
             loop_speed_fps: crate::pane::DEFAULT_LOOP_SPEED_FPS,
+            theme: crate::pane::ThemeChoice::System,
             drawer_open: false,
             stack_open: None,
             insp_open: false,

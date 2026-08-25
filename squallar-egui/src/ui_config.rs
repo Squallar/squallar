@@ -695,6 +695,17 @@ struct UiConfig {
     // through; nothing reads them here any more.
     loop_lookback_secs: u64,
     loop_speed_fps: f32,
+    /// **The theme the map draws in**: `"system"`, `"light"` or `"dark"`.
+    ///
+    /// Absent means system, which is what every config written before this
+    /// existed means and what the application did unconditionally. Skipped on
+    /// save while it is the default for the same reason `as_of` and
+    /// `viewing_live` are: writing it into every file would move the bytes of
+    /// configs that express no opinion, which
+    /// `a_config_naming_an_unregistered_layer_is_written_back_byte_preserved`
+    /// forbids.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    theme: String,
     time_step_secs: i64,
     /// Per-pane persistent state (product, elevation, layers).
     panes: Vec<PaneConfig>,
@@ -1130,6 +1141,7 @@ impl Default for UiConfig {
             sync_layers: true,
             loop_lookback_secs: 3600,
             loop_speed_fps: crate::pane::DEFAULT_LOOP_SPEED_FPS,
+            theme: String::new(),
             time_step_secs: 600,
             panes: vec![PaneConfig::default()],
             preferences: UserPreferences::default(),
@@ -1226,6 +1238,10 @@ impl super::Gui {
             sync_layers: true,
             loop_lookback_secs: self.loop_lookback_secs,
             loop_speed_fps: fps,
+            theme: match self.theme {
+                crate::pane::ThemeChoice::System => String::new(),
+                other => other.as_str().to_owned(),
+            },
             time_step_secs: self.panes.first().map_or(600, |p| p.time.step.as_secs()),
             panes: pane_configs,
             preferences: self.preferences.clone(),
@@ -1418,6 +1434,7 @@ impl super::Gui {
         // pane's own reads and the global cannot answer differently.
         self.set_loop_span_secs(config.loop_lookback_secs);
         self.set_loop_speed_fps(config.loop_speed_fps);
+        self.theme = crate::pane::ThemeChoice::parse(&config.theme);
         self.preferences = config.preferences;
         self.serial_config = config.serial_config;
         self.heading_source = config.heading_source;
@@ -1877,6 +1894,10 @@ fn sanitize_config_tree(value: &mut serde_json::Value) {
         root.remove("overlay_states");
     }
 }
+
+#[path = "ui_config/theme_config_tests.rs"]
+#[cfg(test)]
+mod theme_config_tests;
 
 #[path = "ui_config/loop_persistence_tests.rs"]
 #[cfg(test)]
