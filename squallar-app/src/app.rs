@@ -725,12 +725,27 @@ impl App {
     }
 
     /// What this frame draws in, adopted into the cache on the way past.
+    ///
+    /// **An explicit choice outranks the window and the platform both.** A user
+    /// who picked Light or Dark picked it for this application; letting the
+    /// compositor's `ThemeChanged` overrule that would make the setting look
+    /// broken every time their desktop switched. `System` is the default and
+    /// keeps the behaviour this had before the setting existed.
     fn resolve_theme(&mut self) -> bool {
-        let dark = match self.window.as_ref().and_then(|w| w.theme()) {
-            Some(theme) => matches!(theme, winit::window::Theme::Dark),
-            None => match self.cached_dark_theme {
-                Some(cached) => cached,
-                None => self.platform.detect_dark_theme(),
+        // ONE EXPRESSION, NO EARLY RETURN. Every arm falls through to the
+        // `adopt_theme` below, which is what keeps the resolved theme and the
+        // cache the site labels re-rasterise from in step;
+        // `the_desktop_theme_routes_record_what_they_read` pins that shape by
+        // reading this body, and an arm that answered on its own would satisfy
+        // the invariant here while quietly inviting the next one not to.
+        let dark = match self.gui.theme.is_dark() {
+            Some(chosen) => chosen,
+            None => match self.window.as_ref().and_then(|w| w.theme()) {
+                Some(theme) => matches!(theme, winit::window::Theme::Dark),
+                None => match self.cached_dark_theme {
+                    Some(cached) => cached,
+                    None => self.platform.detect_dark_theme(),
+                },
             },
         };
         self.adopt_theme(dark);
@@ -1430,8 +1445,7 @@ impl App {
                     scan_resp.site,
                     scan_resp.generation
                 );
-                self.gui.apply(GuiEvent::Fetching(false));
-                self.gui.clear_loading_site_for_site(&scan_resp.site);
+                self.gui.finish_loading(&scan_resp.site);
             } else {
                 let requester = scan_resp.requester;
                 match scan_resp.result {
@@ -1500,8 +1514,7 @@ impl App {
                                 scan_arc,
                                 declared_nyquist,
                             );
-                            self.gui.apply(GuiEvent::Fetching(false));
-                            self.gui.clear_loading_site_for_site(&site);
+                            self.gui.finish_loading(&site);
                         } else {
                             log::info!("Received scan data from background thread");
                             // Keyed by the volume's own collected-at, which is

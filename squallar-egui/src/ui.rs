@@ -1959,6 +1959,19 @@ impl Gui {
         }
     }
 
+    /// **A fetch for `site` is over**: stop the global spinner and clear that
+    /// site's per-pane loading mark.
+    ///
+    /// The two always happen together and always in this order — a round that
+    /// cleared one without the other left either a spinner nothing was feeding
+    /// or a pane still marked loading after its scan had landed. Expressed once
+    /// so a caller cannot do half of it, which also spends one reach across the
+    /// app/UI seam where it used to spend two.
+    pub fn finish_loading(&mut self, site: &str) {
+        self.apply(crate::shell_api::GuiEvent::Fetching(false));
+        self.clear_loading_site_for_site(site);
+    }
+
     pub fn bump_all_radar_sites_gen(&mut self) {
         for pane in &mut self.panes {
             pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);

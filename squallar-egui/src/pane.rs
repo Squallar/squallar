@@ -491,6 +491,56 @@ pub enum LoopLoading {
 /// the owning layer's own code names ([`squallar_radar::loop_geometry::LoopGeometry`]),
 /// so a second frame-series layer inherits a timeline rather than three
 /// NEXRAD fields.
+/// **Which theme the map draws in.**
+///
+/// `System` follows the desktop, which is what the app did unconditionally
+/// before this existed. The other two are a user's explicit answer and are not
+/// overridden by anything the platform reports — a person who has said "dark"
+/// has said it about this application, not about their session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemeChoice {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemeChoice {
+    /// The config file's spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThemeChoice::System => "system",
+            ThemeChoice::Light => "light",
+            ThemeChoice::Dark => "dark",
+        }
+    }
+
+    /// Read tolerantly, like every other field in the config: an unknown
+    /// spelling follows the system rather than refusing to open.
+    ///
+    /// Not `FromStr`: that trait is fallible by design and this reading is
+    /// deliberately not — every input is an answer, and an unparseable one
+    /// means "follow the system". Implementing `FromStr` with an `Err` that can
+    /// never be produced would be a lie in the signature.
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "light" => ThemeChoice::Light,
+            "dark" => ThemeChoice::Dark,
+            _ => ThemeChoice::System,
+        }
+    }
+
+    /// This choice as "is it dark", or `None` for [`Self::System`] — which is
+    /// the arm that has no opinion and defers to what the platform reports.
+    pub fn is_dark(self) -> Option<bool> {
+        match self {
+            ThemeChoice::System => None,
+            ThemeChoice::Light => Some(false),
+            ThemeChoice::Dark => Some(true),
+        }
+    }
+}
+
 /// **A restored pane's loop request**: arm it, and whether to start it playing.
 ///
 /// Lives here rather than with the config format because it describes pane

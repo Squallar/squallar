@@ -99,8 +99,49 @@ impl PlatformBridge for DesktopPlatform {
         }
     }
 
+    /// **The desktop theme, at startup, with the portal's timeout allowed for.**
+    ///
+    /// `dark_light` gives the XDG desktop portal **25 ms** to answer a D-Bus
+    /// round trip and returns `Err(Timeout)` otherwise. This used to be a bare
+    /// `matches!(.., Ok(Dark))`, so a missed 25 ms window read as "light" —
+    /// and on desktop this runs exactly once, because [`Self::poll_theme`]
+    /// answers `None` on the grounds that `WindowEvent::ThemeChanged` covers
+    /// changes. A change is not what is being missed: the FIRST answer is, and
+    /// nothing asks again. The result is Squallar opening light on a dark
+    /// desktop and staying that way until the user changes their theme.
+    ///
+    /// Found while shooting marketing captures ten at a time, where the loaded
+    /// machine lost the 25 ms race on 15 of 105 launches and rendered the
+    /// basemap in light mode under dark chrome. The load made it frequent; it
+    /// was never impossible on one launch, and a cold portal at login is the
+    /// same race.
+    ///
+    /// Three attempts, so the budget is ~75 ms of startup in the bad case and
+    /// unchanged in the good one — the first call returns immediately when the
+    /// portal is up. Not spawned in the background, because the theme is read
+    /// before the first frame is drawn and an answer that arrives later would
+    /// repaint the whole map in front of the user.
+    ///
+    /// **"Could not tell" resolves to DARK, and that is a change.** It used to
+    /// resolve to light. The chrome is dark whatever this returns, so a light
+    /// basemap under it was the app disagreeing with itself; `NoPreference`
+    /// gets the same treatment for the same reason.
     fn detect_dark_theme(&self) -> bool {
-        matches!(dark_light::detect(), Ok(dark_light::Mode::Dark))
+        const ATTEMPTS: usize = 3;
+        for attempt in 0..ATTEMPTS {
+            match dark_light::detect() {
+                Ok(dark_light::Mode::Dark) => return true,
+                Ok(dark_light::Mode::Light) => return false,
+                // The portal answered and said "no preference": no retry will
+                // turn that into an opinion.
+                Ok(dark_light::Mode::Unspecified) => break,
+                Err(e) => {
+                    log::debug!("theme probe {}/{ATTEMPTS} did not answer: {e}", attempt + 1);
+                }
+            }
+        }
+        log::debug!("no theme preference could be read; using dark");
+        true
     }
 
     fn set_back_handler(&mut self, handler: fn()) {
