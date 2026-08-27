@@ -425,6 +425,29 @@ After the third commit the count waiting on `mvt` is **24**: those 22 plus the
 two new `style::tests` fns, which are mvt-gated for the same reason — `mod
 style` is behind the feature.
 
+### The guard is now armed — fourth commit
+
+Nothing above this line waits any more. `squallar-egui` enables `mvt`
+unconditionally, so a plain `cargo test --workspace` selects all 24:
+
+| | count |
+| --- | --- |
+| walkers unit tests selected, before | 15 |
+| walkers unit tests selected, now | **39** — the 15, plus 22 in `expression.rs`, plus 2 in `style.rs` |
+| workspace total, after commit 2 | 4,537 passed, 91 suites, exit 0 |
+| workspace total, after commit 4 | **4,561 passed, 91 suites, exit 0** |
+
+The +24 is exactly the 22 plus the 2, and **all 22 expression tests pass
+unmodified** — the evaluator needed nothing. That matters more than the count:
+those 22 are the behaviour pin on the expression evaluator, and any later
+fidelity work on `expression.rs` or `style.rs` now has a real gate under it
+rather than a dormant one. Suite count is unchanged at 91; no new target
+appeared, an existing one grew.
+
+The sentence "Do not quote 38 as a figure this workspace measures today" still
+holds, for a new reason: the figure this workspace measures today is **39**, and
+it is not upstream's 38 — it is 37 of upstream's plus 2 of ours.
+
 ## rustfmt
 
 `cargo fmt -p walkers -- --check` is clean over this directory as vendored,
@@ -477,7 +500,9 @@ points:
 | before vendoring (`bf7afc62`) | 664 | 468 |
 | after commit 1 (vendored as published) | 712 | 469 |
 | after commit 2 (HTTP stack deleted) | **649** | **420** |
-| net vs. before vendoring | **−15** | **−48** |
+| after commit 3 (the patch set) | 649 | 420 |
+| after commit 4 (`mvt` enabled) | **649** | **443** |
+| net vs. before vendoring | **−15** | **−25** |
 
 The first row pair is the one that surprises. Commit 1 adds 48 lockfile blocks
 while adding **one** compiled package. That is not the mvt feature being
@@ -493,6 +518,47 @@ Commit 2 then takes 63 blocks and 49 compiled packages back out, and the net
 across both commits is a graph that is 48 packages *smaller* than before walkers
 was vendored at all. That reduction is the concrete thing this pair of commits
 buys, ahead of any patch.
+
+### Turning `mvt` on, and why the lockfile does not move
+
+The fourth commit sets `walkers = { workspace = true, features = ["mvt"] }` in
+`squallar-egui/Cargo.toml`. The natural expectation is that `geo`, `lyon_path`,
+`lyon_tessellation` and `mvt-reader` now "enter the lockfile". **They do not,
+and `Cargo.lock` does not change at all** — 649 blocks before and after, a
+zero-line `git diff`.
+
+That is the first row-pair's surprise collected: those packages were locked the
+moment walkers became a *member*, because Cargo resolves a member's optional
+dependencies whether or not a feature selects them. Enabling the feature
+activates them for compilation; it locks nothing new. **Lockfile blocks are the
+wrong instrument for this change** — the one that moves is the compiled set.
+
+`cargo tree --workspace` goes **420 → 443, +23 packages, none removed.** Of the
+seven optional dependencies `mvt` activates, only four are actually new work:
+
+| | |
+| --- | --- |
+| new, named by the feature | `geo`, `lyon_path`, `lyon_tessellation`, `mvt-reader` |
+| already compiled | `color` (via `epaint` → `peniko`), `serde_json` and `serde` (workspace pins) |
+
+and the other 19 are transitives those four drag in: `anyhow`, `float_next_after`
+(**twice**, `1.0.0` and `2.0.0`), `geographiclib-rs`, `heapless`, `i_float`,
+`i_key_sort`, `i_overlay`, `i_shape`, `i_tree`, `lyon_geom`, `prost`,
+`prost-derive`, `rand`, `rand_core`, `rand_pcg`, `robust`, `rstar`, `sif-itree`.
+
+Two of those are worth flagging rather than listing. `float_next_after` arrives
+at two incompatible majors at once, so the graph compiles both. And `prost`
+means `mvt-reader` brings a protobuf runtime — expected for a format that *is*
+protobuf, but it is the largest single item in the 23 and the one most likely to
+matter to a target that has to build it.
+
+Which is the open question this row does not answer: **whether these 23 build on
+`wasm32-unknown-unknown`, Android and iOS is not measured here.** Nothing in the
+list is obviously host-only — there are no `[target.…]` tables left in this
+manifest and none of the four named crates declares one — but "no obvious
+blocker" is not a measurement, and this workspace's rule is to measure the real
+platform rather than infer. Treat the figure above as host-only until somebody
+runs the other three.
 
 The pin the other three vendored directories use holds here too:
 

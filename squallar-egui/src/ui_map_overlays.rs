@@ -189,9 +189,43 @@ pub(super) fn draw_tile_layer(
                     (se_lat, se_lon),
                 );
 
-                let Tile::Raster(ref tex) = twuv.tile;
-                ui.painter()
-                    .image(tex.id(), rect, twuv.uv, egui::Color32::WHITE);
+                match twuv.tile {
+                    Tile::Raster(ref tex) => {
+                        ui.painter()
+                            .image(tex.id(), rect, twuv.uv, egui::Color32::WHITE);
+                    }
+                    // Unreachable today. `tile_source` fetches PNGs, so every
+                    // tile it yields decodes as a raster; this arm exists only
+                    // because enabling `walkers/mvt` put `Tile::Vector` on the
+                    // enum.
+                    //
+                    // It is deliberately not `=> {}`. An empty arm here is the
+                    // silent-partial-success shape: the pane would under-draw
+                    // with nothing in the log and nothing on the glass, and a
+                    // green board would keep hiding it for as long as it took
+                    // somebody to notice a missing tile by eye. So this is loud
+                    // three ways -- a marker the eye cannot miss, an error in
+                    // the log, and a tripped assertion in tests and dev builds.
+                    //
+                    // `debug_assert!` and not `assert!`, because "loud" must
+                    // stop short of panicking in front of a user: in release
+                    // the marker and the log carry it. Magenta because that is
+                    // already this stack's did-not-render colour -- walkers
+                    // paints it from `style::Color::evaluate` when a colour
+                    // expression fails.
+                    Tile::Vector(_) => {
+                        debug_assert!(
+                            false,
+                            "overlay tile source produced a vector tile at {tile_id:?}; \
+                             this pane draws rasters only"
+                        );
+                        log::error!(
+                            "overlay tile source produced a vector tile at {tile_id:?}; \
+                             this pane draws rasters only, so that tile is not drawn"
+                        );
+                        ui.painter().rect_filled(rect, 0.0, egui::Color32::MAGENTA);
+                    }
+                }
             }
         }
     }
