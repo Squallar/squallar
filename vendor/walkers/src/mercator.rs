@@ -21,8 +21,12 @@ pub(crate) fn total_pixels(zoom: f64) -> f64 {
     2f64.powf(zoom) * (TILE_SIZE as f64)
 }
 
-pub(crate) fn total_tiles(zoom: u8) -> u32 {
-    2u32.pow(zoom as u32)
+/// Number of tiles along one axis of the grid at `zoom`.
+///
+/// `None` above zoom 31: the grid is counted in `u32` but [`TileId::zoom`] is a
+/// `u8`, so a tile id can name a zoom that has no answer here.
+pub fn total_tiles(zoom: u8) -> Option<u32> {
+    2u32.checked_pow(zoom as u32)
 }
 
 /// Size of a single tile in pixels. Walkers uses 256px tiles as most of the tile sources do.
@@ -125,6 +129,19 @@ mod tests {
         let citadel_proj = Pixels::new(585455. * 256. + 184., 345104. * 256. + 116.5);
         approx::assert_relative_eq!(calculated.x(), citadel_proj.x(), max_relative = 0.5);
         approx::assert_relative_eq!(calculated.y(), citadel_proj.y(), max_relative = 0.5);
+    }
+
+    /// Zoom is a `u8` but the tile grid is counted in `u32`, so zoom 32 and above
+    /// have no answer. `2u32.pow` panics there rather than saying so.
+    #[test]
+    fn total_tiles_has_no_answer_past_the_u32_grid() {
+        for zoom in 0..=31u8 {
+            assert_eq!(Some(2u32.pow(zoom as u32)), total_tiles(zoom));
+        }
+
+        for zoom in 32..=255u8 {
+            assert_eq!(None, total_tiles(zoom));
+        }
     }
 
     #[test]

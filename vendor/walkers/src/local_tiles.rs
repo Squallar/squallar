@@ -53,7 +53,7 @@ impl LocalTiles {
 impl Tiles for LocalTiles {
     fn at(&mut self, tile_id: TileId) -> Option<TilePiece> {
         (0..=tile_id.zoom).rev().find_map(|zoom_candidate| {
-            let (donor_tile_id, uv) = interpolate_from_lower_zoom(tile_id, zoom_candidate);
+            let (donor_tile_id, uv) = interpolate_from_lower_zoom(tile_id, zoom_candidate)?;
             match self.load_and_cache(donor_tile_id) {
                 CachedTexture::Valid(texture) => Some(TilePiece::new(texture.clone(), uv)),
                 CachedTexture::Invalid => None,
