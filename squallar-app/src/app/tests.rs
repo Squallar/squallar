@@ -844,6 +844,25 @@ pub(super) fn headless(mut platform: TestBridge) -> App {
     App::new(Box::new(platform), location)
 }
 
+/// An HTTP client no dispatch below can complete through, for the fixtures that
+/// drive a render path whose *failure* branch is the one under test.
+///
+/// What makes it unreachable is the address the caller points it at — `127.0.0.1:1`
+/// refuses — and the millisecond timeouts are the backstop for a machine that answers
+/// on it. The browser's `ClientBuilder` carries neither knob, because a `fetch` is
+/// governed by the page and not by the client, so the `cfg` selects the builder value
+/// and the single body below builds whichever one it was handed.
+pub(super) fn unreachable_http_client() -> reqwest::Client {
+    let builder = reqwest::Client::builder();
+    #[cfg(not(target_arch = "wasm32"))]
+    let builder = builder
+        .timeout(std::time::Duration::from_millis(1))
+        .connect_timeout(std::time::Duration::from_millis(1));
+    builder
+        .build()
+        .expect("a client with no connection to make")
+}
+
 /// A loop speed no default produces, so finding it can only mean the stored config was
 /// read.
 const STORED_FPS: f32 = 9.25;

@@ -814,6 +814,7 @@ fn a_neighbouring_volume_never_pairs_however_its_start_was_stated() {
 ///
 /// Ignored by default because it reaches the network. Run it with
 /// `cargo test -p squallar-radar --lib -- --ignored gzip`.
+#[cfg(not(target_arch = "wasm32"))]
 #[ignore = "network: fetches a volume from unidata-nexrad-level2"]
 #[tokio::test]
 async fn a_real_gzip_wrapped_volume_decodes_to_a_scan() {
@@ -857,6 +858,7 @@ async fn a_real_gzip_wrapped_volume_decodes_to_a_scan() {
 /// A few hundred KB of zeros gzips to almost nothing and expands past any
 /// ceiling worth having, which is the shape of the attack the bound exists for.
 /// The limit is lowered for the test rather than allocating 128 MiB of zeros.
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn a_gzip_bomb_is_refused_at_the_ceiling_not_expanded() {
     use std::io::Write;

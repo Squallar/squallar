@@ -143,11 +143,7 @@ fn a_render_request() -> crate::app::fetch::OverlayRenderRequest {
 /// client stubbed so no dispatch below can reach a network.
 fn mosaic_app() -> crate::app::App {
     let mut app = crate::app::tests::headless(crate::platform_double::TestBridge::desktop());
-    app.http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(1))
-        .connect_timeout(std::time::Duration::from_millis(1))
-        .build()
-        .expect("a client with no connection to make");
+    app.http_client = crate::app::tests::unreachable_http_client();
 
     draw(&mut app, &known::MRMS, true);
     draw(&mut app, &known::RADAR, false);

@@ -155,7 +155,7 @@ fn note_url_examination() {
     URL_EXAMINATIONS.with(|n| n.set(n.get() + 1));
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 fn take_url_examinations() -> u64 {
     URL_EXAMINATIONS.with(|n| n.replace(0))
 }

@@ -410,7 +410,8 @@ pub async fn fetch_key(
 mod tests {
     use super::*;
     // Only the live-network check reads the wall clock now: the fetch path
-    // takes the instant it is asked about.
+    // takes the instant it is asked about, and that check is native-only.
+    #[cfg(not(target_arch = "wasm32"))]
     use chrono::Utc;
 
     fn instant(h: u32, m: u32) -> NaiveDateTime {

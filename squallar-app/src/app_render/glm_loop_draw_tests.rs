@@ -181,11 +181,7 @@ fn draw(app: &mut crate::app::App, id: &squallar_source::id::LayerId, on: bool) 
 /// the user's pane. Its HTTP client cannot reach a network.
 fn satellite_loop_with_lightning() -> crate::app::App {
     let mut app = crate::app::tests::headless(crate::platform_double::TestBridge::desktop());
-    app.http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(1))
-        .connect_timeout(std::time::Duration::from_millis(1))
-        .build()
-        .expect("a client with no connection to make");
+    app.http_client = crate::app::tests::unreachable_http_client();
 
     draw(&mut app, &known::GMGSI, true);
     draw(&mut app, &known::LIGHTNING, true);
