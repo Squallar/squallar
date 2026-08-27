@@ -1261,6 +1261,130 @@ itself when the named property is missing, so `["!in", "absent", "x"]` compares
 `"absent"` against `"x"`. That is pre-existing behaviour shared with `==` and
 `in`, and changing it belongs to its own commit with its own measurement.
 
+### Changed — source, seventeenth commit: the property bag stops being rebuilt per feature
+
+`get_layer_features` built a whole `HashMap<String, serde_json::Value>` for
+every feature it touched, by `mvt_properties_to_json_properties`, purely so
+that `expression::Context` had something to hold. That is one `HashMap`
+allocation plus one `String` clone per string-valued property, per feature,
+**per style layer that names the source layer** — paid before the filter has
+decided whether the feature draws at all, and for a bag that most expressions
+read one key out of or none.
+
+`Context` now holds an `expression::Properties`, which is either the `Json`
+map a caller supplied or the `Mvt` map exactly as `mvt-reader` produced it,
+**moved** into the context rather than converted into a new one.
+`mvt_value_to_json_value` runs on the way *out* of a lookup instead of on the
+way in, and is `pub(crate)` for that.
+
+**The public shape does not change.** `Properties` and
+`Context::with_properties` are both `pub(crate)`; `mod expression` is private
+and `lib.rs` re-exports only `Context`. `Context::new` keeps its exact
+signature — `(String, HashMap<String, serde_json::Value>, u8)` — which is what
+`tools/basemap-style/tests/converted_styles.rs` calls and what the 22 inline
+expression tests call. None of them were edited.
+
+#### A second cost, found on the way, and larger than the first
+
+```rust
+Value::String(key) if self.properties.contains_key(key) => Ok(self
+    .properties
+    .get(key)
+    .ok_or(Error::PropertyMissing(key.clone(), self.properties.clone()))?
+    .clone()),
+```
+
+`ok_or` takes its argument **by value**, so that `Error::PropertyMissing` was
+constructed on every *successful* property read — a `key.clone()` and a deep
+clone of the entire property map — to serve an error the `contains_key` guard
+immediately above it had already made unreachable. It is now one `get` whose
+`None` falls through to the literal arm, exactly as the failed guard used to.
+`Error::PropertyMissing` had no other constructor and is removed with it.
+
+#### Measured, not reasoned
+
+A counting `GlobalAlloc` behind a thread-local counter, wrapped around one
+`render` of `mvt::tests::fixture` after three warm-up rounds. The instrument
+is **not committed** — the figures are:
+
+| tree | allocations per `render` |
+| --- | --- |
+| before | 489 |
+| the `ok_or` fix alone | 431 |
+| both (this commit) | 391 |
+
+Deterministic to the unit across repeated runs. **98 allocations removed,
+20.0% of the round** — 58 from the eagerly-constructed error, 40 from the
+per-feature map.
+
+The denominator is one `render` of that fixture: 7 features in 3 source
+layers, visited **18 times** between them, because the style's 8 layers name
+`roads` four times, `landuse` twice and `places` once. The 40 is exactly what
+the source predicts for those 18 visits — one `HashMap` for each of the 14
+visits to a feature that has properties, plus 26 `String` clones for the
+string-valued ones. The four visits to the property-less `roads/r3` cost
+nothing, which confirms that collecting an empty iterator into a `HashMap`
+does not allocate.
+
+This path is not on the app's frame path today — no vector tile source is
+wired — so the figure is a property of `render`, not a frame-time claim.
+
+#### Not done here
+
+`Context` still takes `geometry_type: String` and `get_layer_features` still
+spells it `geometry_type_to_str(…).to_string()`, so 18 more `String`s are
+allocated per render of this fixture from a function that returns
+`&'static str`. Narrowing that field changes `Context::new`'s public
+signature and so reaches `tools/basemap-style`, in a different workspace. It
+belongs to its own commit.
+
+#### Evidence
+
+`mvt::tests` is new in the commit before this one and passes **unedited**
+across the change — it was written and landed against the tree as it stood,
+which is what makes it a before/after and not a rationalisation. It encodes a
+vector tile by hand (`mvt-reader` only decodes, its protobuf module is
+private, and no `.pbf` is checked in anywhere in this workspace) and compares
+the `Debug` rendering of all twelve resulting shapes, every mesh vertex,
+stroke and label, against the recording taken from the old code.
+
+Two tampers, each checked to have actually applied rather than silently
+matching nothing:
+
+- Lazy conversion broken — `Properties::Mvt::get` returns `Null` for a key it
+  holds. 12 shapes become 3.
+
+  ```text
+  ---- mvt::tests::rendering_the_fixture_reproduces_the_recorded_shapes_exactly stdout ----
+  thread '…' panicked at vendor/walkers/src/mvt.rs:899:9:
+  assertion `left == right` failed: the fixture draws a background, two fills,
+  four strokes and five labels
+    left: 3
+   right: 12
+  ```
+
+- The fourteenth commit's defect reintroduced — `==` resolves its right
+  operand through `property_or_expression`. Four tests red: both new ones and
+  the two upstream pins, `test_eq_filter_when_the_value_collides_with_a_property_key`
+  and `test_not_eq_resolves_only_its_left_operand`. The fixture loses
+  **exactly one** shape, `roads/r1`'s stroke, which is what it carries
+  `kind = "primary"` alongside `primary = "yes"` to catch:
+
+  ```text
+  ---- mvt::tests::rendering_the_fixture_reproduces_the_recorded_shapes_exactly stdout ----
+  thread '…' panicked at vendor/walkers/src/mvt.rs:899:9:
+  assertion `left == right` failed: the fixture draws a background, two fills,
+  four strokes and five labels
+    left: 11
+   right: 12
+  ```
+
+The `--features mvt` test count goes 85 -> 87, against **48** without it.
+(85 is measured on `ec75a18d`; the figure of 83 circulating today is stale.)
+`--features mvt` is not optional when running this crate's tests: without it `expression`,
+`mvt`, `style` and `text` do not compile in, and a filter naming any of them
+selects zero tests and still exits `0`.
+
 ## What the pin actually selects
 
 "Upstream's 38 inline tests are the behaviour pin" is the reason this crate is
@@ -1368,6 +1492,11 @@ Measured with `cargo test -p walkers --all-features`, exit 0 at each point: the
 fifth and sixth commits take it to **45**, and the seventh takes it to **52**.
 So the row reading "now | 39" means "after commit 4", not "now" — treat every
 figure in that table as stamped with the commit that produced it.
+
+Stamped again: on `ec75a18d`, `cargo test -p walkers --lib --features mvt --
+--list` reports **85**, and the seventeenth commit's fixture takes it to
+**87**. A figure of 83 was in circulation on 2026-08-27 and does not match this
+tree.
 
 The seventh's **+7** is `text::tests`, and they are the first tests this
 directory has ever had over label collision: upstream ships no `mod tests` in

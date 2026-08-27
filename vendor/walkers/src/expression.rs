@@ -25,8 +25,6 @@ pub enum Error {
     TwoElementsExpected(Vec<Value>),
     #[error("At least two elemented expected, got: {0:?}")]
     AtLeastTwoElementsExpected(Vec<Value>),
-    #[error("Property '{0}' missing in {1:?}")]
-    PropertyMissing(String, HashMap<String, Value>),
     #[error("Value must be a number, got: {0}")]
     ExpectedNumber(Value),
     #[error("Value must be a string, got: {0}")]
@@ -41,15 +39,56 @@ pub enum Error {
     UnmatchedCaseOrMatch(Value),
 }
 
+/// The property bag a feature's expressions resolve against.
+///
+/// A vector tile hands its properties over in `mvt_reader`'s own value type,
+/// and the whole bag used to be converted to JSON before a single expression
+/// ran: one `HashMap` allocation and one `String` clone per string-valued
+/// property, per feature, per style layer that visits the source layer. A
+/// style reads one or two keys out of that bag, or none at all -- filters
+/// reject most features before any paint expression looks at them.
+///
+/// So `Mvt` keeps mvt-reader's map exactly as it arrives, moved rather than
+/// rebuilt, and converts a value only when a lookup asks for it. `Json` is the
+/// bag a caller supplies directly, which is what [`Context::new`] still takes.
+pub(crate) enum Properties {
+    Json(HashMap<String, Value>),
+    Mvt(HashMap<String, mvt_reader::feature::Value>),
+}
+
+impl Properties {
+    /// The value behind `key`, converted on the way out, or `None` if the
+    /// feature does not carry it.
+    fn get(&self, key: &str) -> Option<Value> {
+        match self {
+            Properties::Json(properties) => properties.get(key).cloned(),
+            Properties::Mvt(properties) => {
+                properties.get(key).map(crate::mvt::mvt_value_to_json_value)
+            }
+        }
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        match self {
+            Properties::Json(properties) => properties.contains_key(key),
+            Properties::Mvt(properties) => properties.contains_key(key),
+        }
+    }
+}
+
 /// Context in which style expressions are evaluated.
 pub struct Context {
     geometry_type: String,
-    properties: HashMap<String, Value>,
+    properties: Properties,
     zoom: u8,
 }
 
 impl Context {
     pub fn new(geometry_type: String, properties: HashMap<String, Value>, zoom: u8) -> Self {
+        Self::with_properties(geometry_type, Properties::Json(properties), zoom)
+    }
+
+    pub(crate) fn with_properties(geometry_type: String, properties: Properties, zoom: u8) -> Self {
         Self {
             geometry_type,
             properties,
@@ -76,7 +115,7 @@ impl Context {
                     },
                     "get" => {
                         let key = single_string(arguments)?;
-                        Ok(self.properties.get(key).cloned().unwrap_or(Value::Null))
+                        Ok(self.properties.get(key).unwrap_or(Value::Null))
                     }
                     "has" => Ok(Value::Bool(
                         self.properties.contains_key(single_string(arguments)?),
@@ -253,11 +292,12 @@ impl Context {
             Value::String(key) if key == "geometry-type" => {
                 Ok(Value::String(self.geometry_type.clone()))
             }
-            Value::String(key) if self.properties.contains_key(key) => Ok(self
-                .properties
-                .get(key)
-                .ok_or(Error::PropertyMissing(key.clone(), self.properties.clone()))?
-                .clone()),
+            // One lookup, where this was a `contains_key` followed by a `get`.
+            // The `get` could not fail once the guard had passed, and the error
+            // it raised when it "did" carried a clone of the entire property
+            // bag. A key the feature does not carry falls through to the
+            // literal arm below, exactly as the failed guard used to.
+            Value::String(key) => Ok(self.properties.get(key).unwrap_or_else(|| value.clone())),
             Value::Array(_) => self.evaluate(value),
             literal => Ok(literal.clone()),
         }
