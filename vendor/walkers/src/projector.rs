@@ -2,38 +2,43 @@ use egui::{Rect, Vec2};
 
 use crate::{
     MapMemory, Position,
-    mercator::{project, unproject},
+    mercator::{project_at_scale, total_pixels, unproject_at_scale},
     position::{Pixels, PixelsExt as _},
 };
 
 /// Projects geographical position into pixels on the viewport, suitable for [`egui::Painter`].
+///
+/// A projector is built for one frame from a snapshot of [`MapMemory`], and every method
+/// takes `&self`, so the map's centre and the zoom cannot move underneath it. Both are
+/// therefore resolved once, at construction, rather than per call: the centre costs a
+/// project-and-unproject round trip and the zoom a `powf`.
 #[derive(Clone)]
 pub struct Projector {
     clip_rect: Rect,
-    memory: MapMemory,
-    my_position: Position,
-    map_center_projected_position: Position,
+    /// The map's centre, already projected. This is pixel space, not lat/lon.
+    map_center_projected_position: Pixels,
+    /// Width of the whole world in pixels at this projector's zoom.
+    world_pixels: f64,
 }
 
 impl Projector {
     pub fn new(clip_rect: Rect, map_memory: &MapMemory, my_position: Position) -> Self {
-        let map_center_projected_position = project(
-            map_memory.center_mode.position(my_position),
-            map_memory.zoom(),
-        );
+        let world_pixels = total_pixels(map_memory.zoom());
 
         Self {
             clip_rect,
-            memory: map_memory.to_owned(),
-            my_position,
-            map_center_projected_position,
+            map_center_projected_position: project_at_scale(
+                map_memory.center_mode.position(my_position),
+                world_pixels,
+            ),
+            world_pixels,
         }
     }
 
     /// Project `position` into pixels on the viewport.
     pub fn project(&self, position: Position) -> Vec2 {
         // Turn that into a flat, mercator projection.
-        let projected_position = project(position, self.memory.zoom());
+        let projected_position = project_at_scale(position, self.world_pixels);
 
         // From the two points above we can calculate the actual point on the screen.
         self.clip_rect.center().to_vec2()
@@ -42,35 +47,29 @@ impl Projector {
 
     /// Get coordinates from viewport's pixels position
     pub fn unproject(&self, position: Vec2) -> Position {
-        let zoom: f64 = self.memory.zoom();
-        let center = self.memory.center_mode.position(self.my_position);
-
         // Despite being in pixel space `map_center_projected_position` is sufficiently large
         // that we must do the arithmetic in f64 to avoid imprecision.
-        let map_center_projected_position = project(center, zoom);
         let clip_center = self.clip_rect.center();
-        let x = map_center_projected_position.x() + (position.x as f64) - (clip_center.x as f64);
-        let y = map_center_projected_position.y() + (position.y as f64) - (clip_center.y as f64);
+        let x =
+            self.map_center_projected_position.x() + (position.x as f64) - (clip_center.x as f64);
+        let y =
+            self.map_center_projected_position.y() + (position.y as f64) - (clip_center.y as f64);
 
-        unproject(Pixels::new(x, y), zoom)
+        unproject_at_scale(Pixels::new(x, y), self.world_pixels)
     }
 
     /// What is the local scale of the map at the provided position and given the current zoom
     /// level?
     pub fn scale_pixel_per_meter(&self, position: Position) -> f32 {
-        let zoom = self.memory.zoom();
-
         // return f32 for ergonomics, as the result is typically used for egui code
-        calculate_meters_per_pixel(position.y(), zoom) as f32
+        calculate_meters_per_pixel(position.y(), self.world_pixels) as f32
     }
 }
 
-/// Implementation of the scale computation.
-fn calculate_meters_per_pixel(latitude: f64, zoom: f64) -> f64 {
+/// Implementation of the scale computation, given the number of pixels for the width of the
+/// world at the zoom in question ([`crate::mercator::total_pixels`]).
+fn calculate_meters_per_pixel(latitude: f64, total_pixels: f64) -> f64 {
     const EARTH_CIRCUMFERENCE: f64 = 40_075_016.686;
-
-    // Number of pixels for width of world at this zoom level
-    let total_pixels = crate::mercator::total_pixels(zoom);
 
     let pixel_per_meter_equator = total_pixels / EARTH_CIRCUMFERENCE;
     let latitude_rad = latitude.abs().to_radians();
@@ -80,7 +79,10 @@ fn calculate_meters_per_pixel(latitude: f64, zoom: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lon_lat;
+    use crate::{
+        lon_lat,
+        mercator::{project, unproject},
+    };
     use egui::Pos2;
 
     fn assert_approx_eq(a: f64, b: f64) {
@@ -122,14 +124,14 @@ mod tests {
     #[test]
     fn test_equator_zoom_0() {
         // At zoom 0 (whole world), equator should be about 156.5km per pixel
-        let scale = calculate_meters_per_pixel(0.0, 0.);
+        let scale = calculate_meters_per_pixel(0.0, total_pixels(0.));
         assert_approx_eq(scale, 1. / 156_543.03);
     }
 
     #[test]
     fn test_equator_zoom_19() {
         // At max zoom (19), equator should be about 0.3m per pixel
-        let scale = calculate_meters_per_pixel(0.0, 19.);
+        let scale = calculate_meters_per_pixel(0.0, total_pixels(19.));
         assert_approx_eq(scale, 1. / 0.298);
     }
 
@@ -151,5 +153,118 @@ mod tests {
 
         assert_approx_eq(original.x(), unprojected.x());
         assert_approx_eq(original.y(), unprojected.y());
+    }
+
+    /// A guard, not a negative control. `Projector::unproject` used to resolve the map's
+    /// centre for itself on every call instead of reading the copy the constructor already
+    /// took, and the two expressions are identical — so this passes both before and after
+    /// the caching. It exists to keep them identical: it fails if a future change lets the
+    /// cached centre and the live one drift, which is the only way this refactor can be
+    /// wrong. Detaching the map away from `my_position` is what makes the two spellings
+    /// distinguishable at all; against the default `Center::MyPosition` they read the same
+    /// field.
+    #[test]
+    fn unproject_is_inverse_of_project_when_the_map_is_detached() {
+        let my_position = lon_lat(21., 52.);
+        let map_center = lon_lat(-122.4194, 37.7749);
+
+        let mut map_memory = MapMemory::default();
+        map_memory.set_zoom(10.).unwrap();
+        map_memory.center_at(map_center);
+
+        let projector = Projector::new(
+            Rect::from_min_size(Pos2::new(4., 7.), Vec2::new(640., 480.)),
+            &map_memory,
+            my_position,
+        );
+
+        for original in [my_position, map_center, lon_lat(-122.5, 37.8)] {
+            let unprojected = projector.unproject(projector.project(original));
+            assert_approx_eq(original.x(), unprojected.x());
+            assert_approx_eq(original.y(), unprojected.y());
+        }
+    }
+
+    /// Resolving the centre and the world scale once, at construction, must give the very
+    /// same `f64`s as recomputing them per call did — not merely close ones. The operations
+    /// and their order are meant to be unchanged, so every comparison here is `assert_eq!`
+    /// on the bits.
+    #[test]
+    fn the_cached_projection_state_is_bit_identical_to_recomputing_it() {
+        let clip_rect = Rect::from_min_size(Pos2::new(4., 7.), Vec2::new(640., 480.));
+        let clip_center = clip_rect.center();
+
+        for half_zoom in 0..=38u32 {
+            let zoom = (half_zoom as f64 * 0.5).clamp(0., 19.);
+
+            for (lon, lat) in [
+                (17.03664, 51.09916),
+                (-122.4194, 37.7749),
+                (151.2093, -33.87),
+            ] {
+                let my_position = lon_lat(lon, lat);
+
+                for detached_at in [None, Some(lon_lat(lon + 3.5, lat / 2.))] {
+                    let mut memory = MapMemory::default();
+                    memory.set_zoom(zoom).unwrap();
+                    if let Some(position) = detached_at {
+                        memory.center_at(position);
+                    }
+
+                    let projector = Projector::new(clip_rect, &memory, my_position);
+
+                    // The expressions the constructor and `unproject` each evaluated for
+                    // themselves, before either was cached.
+                    let live_zoom = memory.zoom();
+                    let live_center = project(memory.center_mode.position(my_position), live_zoom);
+
+                    assert_eq!(
+                        live_center.x().to_bits(),
+                        projector.map_center_projected_position.x().to_bits()
+                    );
+                    assert_eq!(
+                        live_center.y().to_bits(),
+                        projector.map_center_projected_position.y().to_bits()
+                    );
+                    assert_eq!(
+                        total_pixels(live_zoom).to_bits(),
+                        projector.world_pixels.to_bits()
+                    );
+
+                    for probe in [my_position, lon_lat(lon + 1., lat - 1.)] {
+                        // `project`, as it was spelled before the scale was hoisted.
+                        let expected = clip_center.to_vec2()
+                            + (project(probe, live_zoom) - live_center).to_vec2();
+                        let actual = projector.project(probe);
+                        assert_eq!(expected.x.to_bits(), actual.x.to_bits());
+                        assert_eq!(expected.y.to_bits(), actual.y.to_bits());
+
+                        // `scale_pixel_per_meter`, likewise.
+                        let expected =
+                            calculate_meters_per_pixel(probe.y(), total_pixels(live_zoom)) as f32;
+                        assert_eq!(
+                            expected.to_bits(),
+                            projector.scale_pixel_per_meter(probe).to_bits()
+                        );
+                    }
+
+                    for viewport in [
+                        Vec2::new(0., 0.),
+                        Vec2::new(320., 240.),
+                        Vec2::new(639.5, 479.25),
+                        Vec2::new(-11., 1234.),
+                    ] {
+                        // `unproject`, as it was spelled before the centre was cached.
+                        let x = live_center.x() + (viewport.x as f64) - (clip_center.x as f64);
+                        let y = live_center.y() + (viewport.y as f64) - (clip_center.y as f64);
+                        let expected = unproject(Pixels::new(x, y), live_zoom);
+
+                        let actual = projector.unproject(viewport);
+                        assert_eq!(expected.x().to_bits(), actual.x().to_bits());
+                        assert_eq!(expected.y().to_bits(), actual.y().to_bits());
+                    }
+                }
+            }
+        }
     }
 }

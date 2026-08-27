@@ -514,6 +514,94 @@ Every other file under `src/` — `center`, `map`, `memory`, `mvt`, `options`,
 `plugin`, `position`, `projector`, `zoom`, and the rest of `sources/` — is
 byte-for-byte upstream's.
 
+That last sentence was true when the sixth commit was written and is not true
+now: the subsection below takes `projector.rs` and `mercator.rs`, and the one
+after it takes `map.rs` and `center.rs`.
+
+### Changed — source, seventh commit: `Projector` stops recomputing what it holds
+
+A pure refactor. No behaviour changes and no public signature changes — the
+evidence for both is below.
+
+A `Projector` is built once per frame from a snapshot of `MapMemory`, every one
+of its methods takes `&self`, and all its fields are private and never mutated.
+So the map's centre and the zoom are fixed for its whole life. It was resolving
+both per call anyway:
+
+- `unproject` recomputed the projected map centre from scratch on every call,
+  even though the constructor had already computed and stored exactly that.
+  `Center::position` → `detached` → `adjusted_position` → `AdjustedPosition::position`
+  is `unproject(project(..))`, so each call cost a `powf`, a `tan`, an `asinh`,
+  a `sinh` and an `atan`, plus a `project` on top of the result, before doing
+  any of the work it was asked for. It now reads the stored field.
+- `project` called `mercator::project`, which computes `total_pixels(zoom)` =
+  `2f64.powf(zoom) * 256` **per point**. The projector now holds that scale as
+  `world_pixels` and passes it to a new `mercator::project_at_scale`. Callers
+  project many points per frame — `overlay_cache`, `ui_map`, `ui_map_pane` and
+  `tiles` all do — and every one of them paid a `powf` per point.
+- `calculate_meters_per_pixel` recomputed the same `total_pixels(zoom)` per
+  call; it now takes the scale instead of the zoom.
+- `mercator::unproject` carried its own copy of the
+  `2f64.powf(zoom) * (TILE_SIZE as f64)` expression rather than calling
+  `total_pixels`. It is now `unproject_at_scale(pixels, total_pixels(zoom))`,
+  and `Projector::unproject` calls `unproject_at_scale` with its cached scale.
+
+`mercator::project` and `mercator::unproject` keep their signatures and now
+delegate to the `_at_scale` pair, so no caller outside the projector changed.
+
+**A type bug fixed on the way through.** The field was declared
+`map_center_projected_position: Position` but assigned the result of `project`,
+which is `Pixels`. Both are aliases of `geo_types::Point`, so it compiled; it
+was a projected pixel coordinate labelled as a lat/lon, and it made
+`unproject`'s own comment ("Despite being in pixel space…") read as false. The
+field is now `Pixels`.
+
+**Two fields are gone.** With the centre and the scale resolved at construction,
+nothing read `memory: MapMemory` or `my_position: Position` any more, and
+`deny(warnings)` does not permit dead fields. Both are private, so this is not
+an API change; `Projector::new` still takes `&MapMemory` and `my_position` and
+still has the signature every one of its 11 call sites uses. Dropping the
+`MapMemory` clone the constructor was taking is a small extra saving per frame.
+
+**Evidence that nothing moved.** A throwaway harness dumped the raw IEEE-754
+bits of `mercator::project`, `total_pixels`, `Projector::project`,
+`Projector::unproject` (at four viewport points) and
+`Projector::scale_pixel_per_meter` over a grid of 39 zooms × 9 latitudes × 9
+longitudes, with the map detached away from `my_position` so the cached and
+recomputed centres are distinguishable. 25272 lines, run against the tree
+before and after the refactor:
+`ee5230b024fd6958598c88479d06cbc210c649ee8a6874c9a8bfc613a14f8dbe` both times.
+Not close — identical.
+
+That harness is not in the tree. What is, standing in its place:
+
+- `mercator::tests::a_precomputed_scale_projects_to_the_same_bits` and
+  `…_unprojects_to_the_same_bits` spell out the pre-refactor bodies literally
+  and `assert_eq!` on `f64::to_bits`, over 39 zooms × 49 positions.
+- `projector::tests::the_cached_projection_state_is_bit_identical_to_recomputing_it`
+  does the same for the cached centre, the cached scale, and the outputs of all
+  three public methods, against the expressions each of them used to evaluate
+  for itself.
+- `projector::tests::unproject_is_inverse_of_project_when_the_map_is_detached`
+  builds a projector whose `my_position` and whose `MapMemory` centre are on
+  different continents, which is the only arrangement in which the cached and
+  the recomputed centre could differ. **It is a guard, not a negative control:**
+  the two expressions are identical today, so it passes before and after the
+  change. It is there to keep them identical.
+
+The two bit tests are not vacuous. Rewriting `total_pixels` as
+`2f64.powi(zoom as i32) * (TILE_SIZE as f64)` — the plausible "optimisation" —
+reds both of them and nothing else in the crate. Caching `my_position` in place
+of `center_mode.position(my_position)` reds
+`the_cached_projection_state_is_bit_identical_to_recomputing_it`; note that it
+does **not** red the detached round-trip guard, because a consistently wrong
+centre still inverts, which is exactly why that one is labelled a guard.
+
+`projector::tests::test_equator_zoom_0` and `…_19` are mechanically re-pointed
+from `calculate_meters_per_pixel(0.0, 0.)` to
+`calculate_meters_per_pixel(0.0, total_pixels(0.))` to match the changed
+parameter. Their asserted values are untouched.
+
 ## What the pin actually selects
 
 "Upstream's 38 inline tests are the behaviour pin" is the reason this crate is
