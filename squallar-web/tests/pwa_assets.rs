@@ -469,12 +469,12 @@ fn the_zone_pack_is_a_routed_asset_and_never_part_of_the_all_or_nothing_shell() 
 
     let pack = zone_pack_file_name();
     assert!(
-        assets.iter().any(|path| *path == pack),
+        assets.contains(&pack),
         "sw.js does not route {pack:?}, so every session would re-download it \
          and no offline session would have it at all",
     );
     assert!(
-        !shell.iter().any(|path| *path == pack),
+        !shell.contains(&pack),
         "sw.js precaches {pack:?} in the all-or-nothing shell install. A pack \
          that does not fetch is a supported state for the app, and must never \
          be able to cost it offline support.",
