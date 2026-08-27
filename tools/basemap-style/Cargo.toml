@@ -19,10 +19,11 @@
 #
 #   - `cargo build/test/clippy --workspace` and root `cargo fmt --all` all walk
 #     straight past it. `tools/squallar-tiler` closed that gap with a dedicated
-#     `--manifest-path`-scoped workflow. **This crate has no such workflow
-#     yet**; adding one is a `.github/workflows/**` edit, which the work order
-#     that created this directory explicitly withheld. Until it exists, the
-#     gate is manual -- see DECISIONS.md, "No CI gate reaches this directory".
+#     `--manifest-path`-scoped workflow, and this crate now has the equivalent:
+#     `.github/workflows/basemap-style.yaml`. It triggers on
+#     `tools/basemap-style/**`, on `www/styles/**` -- the files
+#     `tests/converted_styles.rs` reads -- and on `vendor/walkers/**`, since the
+#     suite parses those files through the dev-dependency below.
 #   - Nothing inherits. `version`, `edition` and every dependency are spelled
 #     literally; `workspace = true` cannot resolve from a workspace root to
 #     itself.
