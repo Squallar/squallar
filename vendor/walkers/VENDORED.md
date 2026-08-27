@@ -1016,6 +1016,7 @@ which is why the sweep is shaped as it is: with the sign flipped **and** the
 sweep restricted to whole zooms at `tile_zoom == round(zoom)`, 29,106 tiles
 over 896 viewports pass at a worst disagreement of **exactly 0**. A parity test
 that never leaves that row cannot fail for the mistake this arithmetic invites.
+
 ### Changed — source, fourteenth commit: only the first operand of a comparison is a property key
 
 This one **corrects the fifth commit above**, which got `!=` half right and
@@ -1102,7 +1103,7 @@ opposite shape from the one fixed here (under-resolving, not over-resolving),
 it changes behaviour for array right-hand sides, and it wants its own test, so
 it is left for its own commit. Neither committed style has an array on the
 right of an ordered comparison (checked: 0 of 318), so nothing draws wrong
-today.
+today. **Fixed by the fifteenth commit below.**
 
 **Audited, clean.** `has`, `!has` and `get` take their argument as a key via
 `single_string` and never resolve it, which is right. `in` resolves its first
@@ -1116,6 +1117,83 @@ operand.
 operators are not implemented at all and fall to
 `Error::InvalidExpression`. Neither appears in either committed style, so
 this is latent; adding an operator is not the shape of this commit.
+**Implemented by the sixteenth commit below.**
+
+### Changed — source, fifteenth commit: the ordered comparisons resolve their right operand
+
+The other half of the fourteenth commit, and the **opposite** shape of defect.
+That one over-resolved the right operand of `==`/`!=`; these four
+under-resolve it and never resolve it at all.
+
+`<`, `>`, `<=` and `>=` resolved their left operand through
+`property_or_expression` and then handed `lt`/`lte` the **raw `&Value`** for
+the right. `lt`/`lte` match on `(Number, Number)` and `(String, String)` and
+have a `_ => false` arm, so a right operand that is a JSON array — i.e. an
+expression nobody evaluated — does not error. It compares unequal and the whole
+filter is **silently false**, whatever the operands actually say.
+`[">=", ["get", "a"], ["get", "b"]]` never draws.
+
+The fix is one line per arm: the right operand goes through `evaluate`, the
+same resolver `==`, `!=` and `in`'s list items already use. The two-resolver
+table from the fourteenth commit now covers all six comparisons rather than
+two.
+
+**This changes behaviour for array right operands and nothing else.**
+`evaluate` returns `primitive.clone()` for anything that is not an array, so
+for a number, a string, a bool or null it is the identity and the comparison is
+bit-for-bit what it was. The one further consequence is that a right operand
+which is an array but *not* a valid expression now returns
+`Error::InvalidExpression` instead of comparing false — which is what `==`,
+`!=` and `in` already do with the same input, so the six arms agree rather than
+four of them failing quietly.
+
+**Measured blast radius in this workspace's own styles — zero.** Counted
+directly over `www/styles/dark.json` and `www/styles/light.json`, walking every
+nested array:
+
+| | dark | light | both |
+| --- | --- | --- | --- |
+| ordered comparisons (`<`, `>`, `<=`, `>=`) | 159 | 159 | **318** |
+| …with an **array** right operand | 0 | 0 | **0** |
+| …with a bare-string right operand | 0 | 0 | **0** |
+| …with an array *left* operand (e.g. `[">=", ["zoom"], 9]`) | 148 | 148 | 296 |
+
+Every one of the 318 is three elements long, and every right operand is a
+number. So this commit changes the outcome of **no layer either committed style
+expresses**; it is a latent defect fixed before it was reachable, not a
+rendering change. The 296 array *left* operands are the reason the left side
+was resolved and the right side's omission went unnoticed.
+
+Pinned by `expression::tests::test_ordered_comparisons_resolve_their_right_operand`,
+written first and run against the unfixed evaluator:
+
+```text
+---- expression::tests::test_ordered_comparisons_resolve_their_right_operand stdout ----
+thread '…' panicked at vendor/walkers/src/expression.rs:930:9:
+assertion `left == right` failed
+  left: Bool(false)
+ right: Bool(true)
+```
+
+The test has two blocks and **only the first is that negative control.** Each
+of the four arms gets an array-right-operand assertion that the unfixed code
+cannot satisfy, plus the opposite direction so that "resolve the right operand"
+cannot be mistaken for "make every ordered comparison true". The second block
+asserts that a bare string on the right stays a **literal** — `class` is
+`"minor"` and a `minor` property holds `"trunk"`, so resolving the right
+operand as a property key would invert both assertions. That block passes
+before *and* after this commit, by construction: it is the regression guard
+against reintroducing the fourteenth commit's defect in four more arms, not
+evidence of this one.
+
+**The 22 upstream expression tests did not move.** None of them exercises the
+`<`, `>`, `<=` or `>=` arms at all — the only upstream reads of `lt`/`lte` are
+through `interpolate`, which calls them directly on already-evaluated stops and
+is untouched here.
+
+Also corrected: the comment above the `==` arm pointed at "VENDORED.md,
+thirteenth commit" for the ordered-comparison defect. The thirteenth commit is
+the affine tile rect on `Projector`; the comparison work is the fourteenth.
 
 ## What the pin actually selects
 
@@ -1128,6 +1206,25 @@ enough that stating the number alone would mislead.
 `#[cfg(feature = "mvt")]` in `src/lib.rs`, and nothing here enables `mvt` —
 `walkers = { workspace = true }` in `squallar/Cargo.toml` and
 `squallar-egui/Cargo.toml` names no features, and `default = []`.
+
+> **Stale as of the fifteenth commit — this paragraph is no longer true.**
+> `squallar-egui/Cargo.toml` now reads
+> `walkers = { workspace = true, features = ["mvt"] }`, and cargo unifies that
+> across the workspace build, so `cargo test --workspace` **does** select the
+> `mvt`-gated tests. Verified by listing rather than inferred: `cargo test
+> --workspace -- --list` names all 27 `expression::tests::*` rows present at
+> that commit, out of 4,715 selected. The counts in the table below are from
+> before that feature was requested and have not been re-measured; read them as
+> that commit's figures, not as today's. Anything reading this to decide
+> whether a new expression test is gated: it is.
+>
+> Note the denominators differ. `cargo test -p walkers --lib` alone still
+> selects 48 tests and **zero** expression tests, because `default = []` and
+> `-p` does not pull `squallar-egui`'s feature request in. Working on this file
+> directly, the spelling is `cargo test -p walkers --lib --features mvt`
+> (84 tests), and a filter must use the full path
+> `expression::tests::<name>` — a bare test name with `--exact` selects
+> nothing and exits **0**.
 
 Measured, `cargo test --workspace`, exit 0 at every point:
 

@@ -145,9 +145,8 @@ impl Context {
                     // side goes through `property_or_expression` and the right
                     // through `evaluate`, which resolves an array as an
                     // expression but leaves a bare string as the literal it is.
-                    // The four ordered comparisons below resolve their left
-                    // operand the same way, but do not resolve their right at
-                    // all — see VENDORED.md, thirteenth commit.
+                    // All six comparisons below resolve their operands this
+                    // way — see VENDORED.md, fourteenth and fifteenth commits.
                     "==" => {
                         let (left, right) = two_elements(arguments)?;
                         Ok(Value::Bool(
@@ -163,22 +162,26 @@ impl Context {
                     "<" => {
                         let (left, right) = two_elements(arguments)?;
                         let left = self.property_or_expression(left)?;
-                        Ok(Value::Bool(lt(&left, right)))
+                        let right = self.evaluate(right)?;
+                        Ok(Value::Bool(lt(&left, &right)))
                     }
                     ">" => {
                         let (left, right) = two_elements(arguments)?;
                         let left = self.property_or_expression(left)?;
-                        Ok(Value::Bool(lt(right, &left)))
+                        let right = self.evaluate(right)?;
+                        Ok(Value::Bool(lt(&right, &left)))
                     }
                     "<=" => {
                         let (left, right) = two_elements(arguments)?;
                         let left = self.property_or_expression(left)?;
-                        Ok(Value::Bool(lte(&left, right)))
+                        let right = self.evaluate(right)?;
+                        Ok(Value::Bool(lte(&left, &right)))
                     }
                     ">=" => {
                         let (left, right) = two_elements(arguments)?;
                         let left = self.property_or_expression(left)?;
-                        Ok(Value::Bool(lte(right, &left)))
+                        let right = self.evaluate(right)?;
+                        Ok(Value::Bool(lte(&right, &left)))
                     }
                     "any" => Ok(arguments
                         .iter()
@@ -898,6 +901,86 @@ mod tests {
                 .evaluate(&json!(["format", "Hello", {}, "World", {}]))
                 .unwrap(),
             json!("HelloWorld")
+        );
+    }
+
+    /// The two operands of an ordered comparison are resolved by *different*
+    /// rules, and this pins both halves.
+    ///
+    /// An array on the right is an expression and has to be evaluated. Passing
+    /// it to `lt` / `lte` raw reaches their `_ => false` arm, so the comparison
+    /// is silently false whatever the operands actually are — the mirror of the
+    /// over-resolving defect the fourteenth commit fixed in `==` and `!=`.
+    ///
+    /// A bare string on the right is the literal it is, *not* a property key.
+    /// That is the half the fourteenth commit had to fix, and the second block
+    /// below is the guard against reintroducing it in these four arms.
+    #[test]
+    fn test_ordered_comparisons_resolve_their_right_operand() {
+        // `minor` is both a comparison value and a property key on the same
+        // feature, and the two disagree: "minor" sorts before "trunk".
+        let properties = HashMap::from([
+            ("rank".to_string(), json!(5)),
+            ("limit".to_string(), json!(9)),
+            ("class".to_string(), json!("minor")),
+            ("minor".to_string(), json!("trunk")),
+        ]);
+        let context = Context::new("LineString".to_string(), properties, 1);
+
+        // An array on the right is an expression, and is evaluated as one.
+        // Each of the four arms gets an assertion that a raw `&Value` right
+        // operand cannot satisfy.
+        assert_eq!(
+            context
+                .evaluate(&json!(["<", "rank", ["get", "limit"]]))
+                .unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            context
+                .evaluate(&json!(["<=", "rank", ["get", "limit"]]))
+                .unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            context
+                .evaluate(&json!([">", "limit", ["get", "rank"]]))
+                .unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            context
+                .evaluate(&json!([">=", "limit", ["get", "rank"]]))
+                .unwrap(),
+            json!(true)
+        );
+
+        // The other direction, so that resolving the right operand cannot be
+        // mistaken for making every ordered comparison true.
+        assert_eq!(
+            context
+                .evaluate(&json!([">", "rank", ["get", "limit"]]))
+                .unwrap(),
+            json!(false)
+        );
+        assert_eq!(
+            context
+                .evaluate(&json!(["<", "limit", ["get", "rank"]]))
+                .unwrap(),
+            json!(false)
+        );
+
+        // A bare string on the right stays the literal string. `class` is
+        // "minor", so comparing it against the literal "minor" is an equality:
+        // `<` is false and `>=` is true. Were the right operand resolved as a
+        // property key it would be "trunk", and both would invert.
+        assert_eq!(
+            context.evaluate(&json!(["<", "class", "minor"])).unwrap(),
+            json!(false)
+        );
+        assert_eq!(
+            context.evaluate(&json!([">=", "class", "minor"])).unwrap(),
+            json!(true)
         );
     }
 }
