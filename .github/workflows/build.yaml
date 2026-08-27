@@ -325,6 +325,98 @@ jobs:
               test "$n" -ge 1 || { echo "::error::ASSET_PATHS parsed as $n entries; the parse is wrong or the list was gutted"; exit 1; }
               echo "ok: all $n ASSET_PATHS entries are staged"
 
+          # ── The two `squallar-egui/basemap-vector` rows ──
+          #
+          # That feature is off by default and, before these two rows, no row in
+          # this matrix compiled it. Measured: `--all-features` appears eleven
+          # times in this file and every one of them is comment prose -- no
+          # row's `cmd:` passes it. The desktop rows pass an explicit list (the
+          # block at the top of this matrix says why), the web row is
+          # `wasm-pack … --release` on default features, and Gradle and the iOS
+          # Makefile name no feature at all.
+          #
+          # What coverage the feature did have, stated exactly rather than
+          # rounded down, because "it is covered nowhere" would be false: four
+          # commands compile it, and all four are the HOST triple --
+          # `clippy.yaml`'s `--fix`, its `cargo build --workspace --all-targets
+          # --all-features` and its `cargo clippy --all-targets --all-features`,
+          # plus `test.yaml`'s `cargo llvm-cov --no-report --all-features`. What
+          # none of them is, is wasm32: `clippy.yaml`'s wasm step deliberately
+          # omits `--all-features` (its own comment explains that the flag would
+          # drag `squallar-nmea-serial/serial` onto a target with no serial
+          # ports). So the wasm arm of this feature had no compile coverage
+          # anywhere, and the native arm had it only incidentally, as a
+          # by-product of workspace-wide runs on one triple.
+          #
+          # TWO rows, not one, for two independent reasons.
+          #
+          # First: no choice of triple can imply a feature. That is
+          # `gps-serial`'s recorded lesson, in `squallar-egui/Cargo.toml` -- a
+          # call site gated on `not(target_os = "android")` called a body gated
+          # on a *feature*, an OS cfg cannot satisfy a feature cfg, and the
+          # crate stopped building standalone for weeks. Both halves have to be
+          # the same kind of gate, so both rows name the feature.
+          #
+          # Second: the dependency is itself target-split, so one row could not
+          # cover the other even in principle. Measured, `cargo tree -e features
+          # -p squallar-egui --features squallar-egui/basemap-vector`: on wasm32
+          # `pmtiles` arrives with `__async` alone, on a native triple with
+          # `__async` *and* `http-async`. Those are different code paths -- the
+          # manifest records two E0277s ("future returned by `read` is not
+          # `Send`") from compiling the native backend for wasm32 -- so a native
+          # row would never compile the wasm arm and vice versa.
+          #
+          # Rooted at `-p squallar-egui`, not at the shipping crate, and that is
+          # measured rather than stylistic: `cargo check -p squallar-web
+          # --target wasm32-unknown-unknown --features
+          # squallar-egui/basemap-vector` fails with wasm-bindgen-rayon's
+          # `compile_error!("Did you forget to enable `atomics` and
+          # `bulk-memory`…")`, because squallar-web is reachable only through
+          # the nightly `+atomics` carve-out the `web-wasm32` row above wraps.
+          # That carve-out is deliberately one wrapped command in one row, and
+          # these rows do not become a second and a third. `squallar-egui` is
+          # also the crate that declares the feature and owns the target split,
+          # so it is the right root for the question being asked.
+          #
+          # NON-ARTIFACT, deliberately: neither row carries an `artifact:` key,
+          # so the upload step below skips both. On an artifact row this would
+          # ship `pmtiles` -- and, on wasm32, the `tokio` its `__async` pulls in
+          # unconditionally -- inside a file a person downloads, for a feature
+          # that draws nothing today.
+          #
+          # The `cargo tree` line after each check is a non-vacuity floor. Cargo
+          # already errors on a feature name that does not exist, so neither row
+          # can go silently green on a rename; what one *could* do is stay green
+          # after `basemap-vector` stopped meaning `dep:pmtiles`, checking a
+          # graph identical to the default one. A herestring and not a pipe into
+          # `grep -q`: these steps run under `bash -eo pipefail`, where a
+          # `grep -q` that exits on its first match leaves the producer holding
+          # a SIGPIPE and the pipeline reporting 141.
+          - name: basemap-vector-wasm32
+            target: wasm32-unknown-unknown
+            cmd: |
+              cargo check -p squallar-egui --all-targets \
+                --target wasm32-unknown-unknown \
+                --features squallar-egui/basemap-vector
+              out=$(cargo tree -i pmtiles -p squallar-egui \
+                --target wasm32-unknown-unknown -e normal --prefix none \
+                --features squallar-egui/basemap-vector)
+              grep -qE '^pmtiles v' <<<"$out" \
+                || { echo "::error::squallar-egui/basemap-vector no longer puts pmtiles in the wasm32 graph; this row now checks nothing"; exit 1; }
+              echo "ok, wasm32 graph carries $(grep -E '^pmtiles v' <<<"$out" | head -1)"
+          - name: basemap-vector-linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            cmd: |
+              cargo check -p squallar-egui --all-targets \
+                --target x86_64-unknown-linux-gnu \
+                --features squallar-egui/basemap-vector
+              out=$(cargo tree -i pmtiles -p squallar-egui \
+                --target x86_64-unknown-linux-gnu -e normal --prefix none \
+                --features squallar-egui/basemap-vector)
+              grep -qE '^pmtiles v' <<<"$out" \
+                || { echo "::error::squallar-egui/basemap-vector no longer puts pmtiles in the x86_64-unknown-linux-gnu graph; this row now checks nothing"; exit 1; }
+              echo "ok, native graph carries $(grep -E '^pmtiles v' <<<"$out" | head -1)"
+
           # Not a triple: every member alone on its own default features, which
           # `--all-features` hides. squallar-egui was broken this way for weeks --
           # it called the port enumeration (`detect_gps_ports`, squallar-nmea-serial
