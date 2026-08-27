@@ -476,6 +476,25 @@ jobs:
               check jni                      squallar:aarch64-linux-android squallar:x86_64-linux-android
               check rustls-platform-verifier squallar:aarch64-linux-android squallar:x86_64-linux-android
               check wgpu                     squallar:x86_64-unknown-linux-gnu squallar:aarch64-apple-ios squallar-web:wasm32-unknown-unknown squallar:aarch64-linux-android
+              # Same four graphs as wgpu, because reqwest is in all of them and
+              # resolution differs per target: on wasm32 it is a fetch() shim
+              # with no TLS stack, elsewhere it carries rustls. Two copies would
+              # mean half the app's HTTP going through a client whose TLS
+              # configuration nothing in this tree set.
+              check reqwest                  squallar:x86_64-unknown-linux-gnu squallar:aarch64-apple-ios squallar-web:wasm32-unknown-unknown squallar:aarch64-linux-android
+              # NOT `check webpki-roots`, and this is a measured refusal rather
+              # than an omission. There really are two copies in Cargo.lock,
+              # 0.26.11 and 1.0.9, so the check would be meaningful -- and it
+              # would be RED today, in every one of these graphs. `cargo tree -i
+              # webpki-roots@0.26.11 -p squallar --target
+              # x86_64-unknown-linux-gnu` prints
+              # `webpki-roots 0.26.11 <- tungstenite 0.24.0 <- ewebsock 0.8.0 <-
+              # squallar-radar`, i.e. the old copy arrives through the websocket
+              # client's pinned tungstenite and cannot be dislodged by anything
+              # in this file. Unpinned, the spec is not even answerable: cargo
+              # exits non-zero with "specification `webpki-roots` is ambiguous",
+              # which `check()` above correctly reports as a failure. Add the
+              # line when ewebsock's tungstenite moves, not before.
               exit "$fail"
 
     steps:
