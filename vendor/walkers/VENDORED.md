@@ -672,6 +672,88 @@ because nothing in `walkers` exercises `Map::show`: handing
 `a_dialog_over_a_site_icon_suppresses_its_hover_readout`,
 `a_qualifying_tap_fades_the_chrome_and_the_second_restores_it`) out of 1118.
 
+### Changed — source, tenth commit: a drag whose release is never seen
+
+`Center::Moving` had no termination condition. `update_movement`'s `Moving` arm
+re-shifts the map by the *stored* `direction` and returns `true`
+unconditionally, and `map.rs` turns that `true` into `ui.request_repaint()`.
+The only exit was `handle_gestures`' middle arm, which needs
+`response.drag_stopped()` — an edge egui offers to one widget on one frame. A
+pane hidden mid-drag, a section or tab switch, a pan suppressed mid-drag by
+`drag_pan_buttons(empty())`, or a pointer released off-canvas on the web all
+lose it, and the map then pans at constant velocity **and repaints at full
+rate, forever**. `Center::animating` deliberately excludes `Moving` and
+`center_mode` is `pub(crate)`, so a caller could neither see the stuck state
+nor clear it.
+
+**Classification split from application.** `Center::classify` reads a
+`Response` into a new `pub(crate) enum Gesture`
+(`Dragging(Vec2)` / `Released` / `Vanished` / `Idle`); `Center::apply` drives
+the state machine from one. `handle_gestures` is now the composition of the
+two, so the whole state machine is reachable without an `egui::Response`.
+
+The ordering inside `classify` is load-bearing and is the old `if`/`else if`
+chain unchanged: `dragged_by` first, then `drag_stopped`, and only then the
+state. `drag_stopped()` is button-agnostic while `dragged_by` is not, so a drag
+on a non-panning button that ends still takes the `Released` arm exactly as it
+did before. `Gesture::Vanished` is what is left — and it is reachable only from
+`Moving`, which is the gate `Gesture::quiet` holds.
+
+**`Vanished` settles to `Exact`, not `Inertia`.** `direction` is the last
+`drag_delta` anyone observed and in this case nobody knows how old it is; a
+pane hidden for a minute would come back and lurch. `drag_stopped` takes an
+explicit `Coast::{Yes,No}` so the two endings are separately pinnable rather
+than distinguished by a comment. The `PulledToMyPosition` branch is unchanged
+and taken by both endings — it is the accidental-small-drag recovery, not a
+coast, and it terminates.
+
+**Observability.** `MapMemory::dragging()` — a pan drag is in progress,
+awaiting its release. `MapMemory::settle()` — end any gesture or animation,
+leave the map where it is; idempotent. `animating()` is deliberately
+**untouched**: it is upstream's documented predicate with an explicitly stated
+exclusion, and redefining it would silently change meaning for every reader.
+
+**Tests.** Six in `center.rs`, four of them new here:
+
+- `a_drag_that_is_never_released_stops_moving`. **Negative control, run against
+  the unmodified tree** with the state built directly as `Center::Moving`
+  (which is what `Gesture::Dragging` produces) and `update_movement` looped:
+  `update_movement still demanded a repaint on frame Some(599) of 600; the
+  centre has travelled -0.12874603271484375 deg of longitude with no input at
+  all`. After the change it stops after 1 frame and does not move again over
+  the next 600.
+- `a_drag_that_is_released_still_coasts`. **Positive control**, green before
+  and after — before the change, written against the private `drag_stopped`:
+  `coasted 0.0027626240288967097 deg over 59 frames`. It is what stops the
+  test above from being satisfied by deleting inertia.
+- `a_vanished_drag_does_not_coast` — pins the `Exact`-not-`Inertia` choice, and
+  that `Gesture::quiet` really does answer `Vanished` in that state.
+- `settle_clears_every_state` — all five variants through `every_variant()`:
+  after `settle()`, `update_movement` is `false`, neither `dragging` nor
+  `animating`, `position()` unchanged, and the same again on a second call.
+- `dragging_is_true_for_moving_alone` — the predicate is not a constant.
+
+The one thing `walkers` cannot test is `Map::show`, so the whole path is gated
+outside this crate by
+`squallar_egui::ui::map::tests::a_drag_whose_release_is_never_seen_stops_the_pane`:
+press, drag 60 px, turn the pane 3D, release the button while its map is not
+drawn, ten frames, turn it back, 120 frames at 1/60. **Measured on the
+unmodified tree, same sequence: 632.8 deg of longitude — 7,200 tile-pixels —
+of drift, and `repaint_delay` 0 ns.** After the change: zero drift and
+`Duration::MAX`.
+
+That test uses the 3D pane as the way to hide the map because the hiding is
+total: `Gui::draw_floor_strip` builds its `Map` on an **owned copy**
+(`FloorStripCtx::map_memory`, and `floor_frame_for` hands it either
+`pane_memory.clone()` or a fresh viewport), so nothing on a `Volume` frame can
+see or clear the pane's own `center_mode`.
+
+**Not fixed here, and a different bug.** `InputHarness::cursor_left` is not a
+reproduction of this: egui keeps `primary_down` latched across `PointerGone`,
+so `dragged()` stays true, `classify` answers `Dragging(Vec2::ZERO)` and the
+map holds still while repainting at full rate. That is a latched-pointer defect
+above walkers, not a lost release edge.
+
 ## What the pin actually selects
 
 "Upstream's 38 inline tests are the behaviour pin" is the reason this crate is

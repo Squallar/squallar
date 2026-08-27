@@ -385,3 +385,83 @@ fn the_hover_readouts_digits_do_not_move() {
         assert_eq!(got, expected, "{label}");
     }
 }
+
+/// A pan drag whose release lands on a frame the pane's map is not drawn —
+/// the tab was switched, the pane turned 3D, a section pane took over.
+///
+/// walkers only ever offers `drag_stopped()` to the widget it happened on, on
+/// the frame it happened, so a hidden pane loses the release edge outright.
+/// Before `Gesture::Vanished` existed the pane went on being shifted by the
+/// stored delta every frame and went on demanding a repaint: measured on this
+/// exact sequence, **7,200 tile-pixels** of drift over the 120 frames below
+/// (632.8 deg of longitude) with a `repaint_delay` of 0 ns.
+///
+/// The 3D pane is what hides the map here, and it hides it completely: the
+/// floor strip builds its own `Map` on an **owned copy** of the memory
+/// (`FloorStripCtx::map_memory`), so nothing on a `Volume` frame can see, let
+/// alone clear, the pane's own `center_mode`.
+#[test]
+fn a_drag_whose_release_is_never_seen_stops_the_pane() {
+    use crate::input_harness::InputHarness;
+    const DT: f64 = 1.0 / 60.0;
+
+    let memory_of = |h: &InputHarness| h.gui().pane(0).expect("pane 0").map_memory.clone();
+    let centre = |h: &InputHarness| memory_of(h).detached().expect("a dragged pane is detached");
+
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.warm_up();
+    let start = h.pane_rects()[0].center();
+
+    h.mouse_press(start);
+    h.frame();
+    h.mouse_move(start + egui::vec2(60.0, 0.0));
+    h.frame();
+    assert!(
+        memory_of(&h).dragging(),
+        "precondition: 60 px of primary drag did not start a pan"
+    );
+    let dragged_to = centre(&h);
+
+    // The pane stops drawing its map, and the button comes up while it is not
+    // there to see it.
+    h.make_pane_volume(0);
+    h.mouse_release(start + egui::vec2(60.0, 0.0));
+    h.frames_for(10, DT);
+    assert!(
+        memory_of(&h).dragging(),
+        "precondition: the hidden pane saw the release after all, so this \
+         test is not about a lost release edge"
+    );
+    assert_eq!(
+        dragged_to,
+        centre(&h),
+        "a pane that is not drawn moved anyway"
+    );
+
+    // And back. Two seconds of frames with the pointer up and still.
+    h.make_pane_map(0);
+    h.frames_for(120, DT);
+
+    let memory = memory_of(&h);
+    let now = centre(&h);
+    // One tile-pixel of longitude. A pixel of latitude spans *fewer* degrees
+    // than this -- by Mercator's local scale factor, 1/cos(35.3 deg) = 1.22 --
+    // so the same bound on `dlat` is the looser of the two, at 1.22 px.
+    let deg_per_tile_px = 360.0 / (256.0 * 2f64.powf(memory.zoom()));
+    let (dlon, dlat) = (now.x() - dragged_to.x(), now.y() - dragged_to.y());
+    assert!(
+        dlon.abs() < deg_per_tile_px && dlat.abs() < deg_per_tile_px,
+        "the restored pane drifted ({}, {}) tile-pixels with no input",
+        dlon / deg_per_tile_px,
+        dlat / deg_per_tile_px
+    );
+    assert!(
+        !memory.dragging(),
+        "the pane still believes a drag is in progress"
+    );
+    assert_eq!(
+        h.repaint_delay(),
+        std::time::Duration::MAX,
+        "something is still demanding repaints two seconds after the last input"
+    );
+}
