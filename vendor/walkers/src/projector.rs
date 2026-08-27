@@ -23,14 +23,27 @@ pub struct Projector {
 
 impl Projector {
     pub fn new(clip_rect: Rect, map_memory: &MapMemory, my_position: Position) -> Self {
+        Self::with_map_center(
+            clip_rect,
+            map_memory,
+            map_memory.center_mode.position(my_position),
+        )
+    }
+
+    /// [`Projector::new`], for a caller that has already resolved the map's centre this
+    /// frame. `Map::show` computes it to draw the tile layers with, a dozen lines before it
+    /// builds the projector, and the two were each resolving it — an `unproject(project(..))`
+    /// round trip — separately.
+    pub(crate) fn with_map_center(
+        clip_rect: Rect,
+        map_memory: &MapMemory,
+        map_center: Position,
+    ) -> Self {
         let world_pixels = total_pixels(map_memory.zoom());
 
         Self {
             clip_rect,
-            map_center_projected_position: project_at_scale(
-                map_memory.center_mode.position(my_position),
-                world_pixels,
-            ),
+            map_center_projected_position: project_at_scale(map_center, world_pixels),
             world_pixels,
         }
     }
@@ -264,6 +277,62 @@ mod tests {
                         assert_eq!(expected.y().to_bits(), actual.y().to_bits());
                     }
                 }
+            }
+        }
+    }
+
+    /// `Map::show` resolves the map's centre to draw the tile layers with and then handed
+    /// `Projector::new` the ingredients to resolve it again. Handing the projector the
+    /// centre it already has must build the same projector, to the bit.
+    #[test]
+    fn a_hoisted_map_centre_builds_the_same_projector() {
+        let clip_rect = Rect::from_min_size(Pos2::new(4., 7.), Vec2::new(640., 480.));
+        let my_position = lon_lat(21., 52.);
+
+        for zoom in [0., 3.5, 10., 19.] {
+            for detached_at in [None, Some(lon_lat(-122.4194, 37.7749))] {
+                let mut memory = MapMemory::default();
+                memory.set_zoom(zoom).unwrap();
+                if let Some(position) = detached_at {
+                    memory.center_at(position);
+                }
+
+                let built = Projector::new(clip_rect, &memory, my_position);
+                let hoisted = Projector::with_map_center(
+                    clip_rect,
+                    &memory,
+                    // What `Map::position` hands over, and what `Map` computed for the
+                    // tile layers a dozen lines earlier.
+                    memory.center_mode.position(my_position),
+                );
+
+                assert_eq!(
+                    built.map_center_projected_position.x().to_bits(),
+                    hoisted.map_center_projected_position.x().to_bits()
+                );
+                assert_eq!(
+                    built.map_center_projected_position.y().to_bits(),
+                    hoisted.map_center_projected_position.y().to_bits()
+                );
+                assert_eq!(built.world_pixels.to_bits(), hoisted.world_pixels.to_bits());
+
+                let probe = lon_lat(20., 51.);
+                assert_eq!(
+                    built.project(probe).x.to_bits(),
+                    hoisted.project(probe).x.to_bits()
+                );
+                assert_eq!(
+                    built.unproject(Vec2::new(11., 13.)).y().to_bits(),
+                    hoisted.unproject(Vec2::new(11., 13.)).y().to_bits()
+                );
+
+                // The agreement is about the centre, not about the constructor ignoring
+                // it: a different centre must build a different projector.
+                let wrong = Projector::with_map_center(clip_rect, &memory, lon_lat(0., 0.));
+                assert_ne!(
+                    built.map_center_projected_position.x().to_bits(),
+                    wrong.map_center_projected_position.x().to_bits()
+                );
             }
         }
     }

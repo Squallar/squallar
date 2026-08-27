@@ -518,7 +518,7 @@ That last sentence was true when the sixth commit was written and is not true
 now: the subsection below takes `projector.rs` and `mercator.rs`, and the one
 after it takes `map.rs` and `center.rs`.
 
-### Changed — source, seventh commit: `Projector` stops recomputing what it holds
+### Changed — source, eighth commit: `Projector` stops recomputing what it holds
 
 A pure refactor. No behaviour changes and no public signature changes — the
 evidence for both is below.
@@ -601,6 +601,76 @@ centre still inverts, which is exactly why that one is labelled a guard.
 from `calculate_meters_per_pixel(0.0, 0.)` to
 `calculate_meters_per_pixel(0.0, total_pixels(0.))` to match the changed
 parameter. Their asserted values are untouched.
+
+### Changed — source, ninth commit: the frame stops paying for what it does not need
+
+Three changes to `map.rs`, one supporting addition to `center.rs`, one to
+`projector.rs`. Also a pure refactor.
+
+**A short-circuit in the wrong order.** `handle_gestures` ended with
+`if ui.ui_contains_pointer() && panning_enabled`. `ui_contains_pointer` is a
+`Context::rect_contains_pointer` that ends in `Areas::layer_id_at` — an
+O(layers) reverse scan of the area order taken under egui's memory lock
+(`egui-0.35.0/src/memory/mod.rs:1224`). `panning_enabled` is two field reads.
+The operands are swapped so the cheap one decides first. Both are
+side-effect-free — the whole path from `Ui::ui_contains_pointer` down is `&self`
+and takes the *read* lock (`Context::memory`, not `memory_mut`) — so the frame's
+outcome is unchanged by construction; this is the one change in the commit with
+no test of its own, and that is why.
+
+The saving is not hypothetical: both `walkers::Map` construction sites in this
+workspace (`squallar-egui/src/ui_map.rs:238` and `:1236`) call `.panning(false)`
+on the next line, so `panning_enabled` is `false` for every pane on every frame
+and that scan was being paid to reach a branch that can never be taken.
+
+**`Center::is_detached`.** `map.rs` tested `self.memory.detached().is_some()`.
+`detached` clones an `AdjustedPosition` and resolves its position through
+`unproject(project(..))`, and the result was dropped unread — the very next line
+called `self.position()`, which resolves it again. `Center::is_detached` is
+`!matches!(self, Center::MyPosition)` and answers the question without building
+anything. Note the old spelling was only wasteful when the map *was* detached:
+against `Center::MyPosition`, `adjusted_position` returns `None` and the `map`
+never runs.
+
+**The frame's centre, resolved once.** `Map::show` computes `map_center` to draw
+the tile layers with, and a dozen lines later handed `Projector::new` the
+ingredients to compute the same thing again — another round trip. `Projector`
+gains a `pub(crate) with_map_center` that takes the centre; `Projector::new`
+keeps its signature and delegates to it. Nothing between the two points touches
+`self.memory`.
+
+**Tests.** `map.rs` and `center.rs` held **zero tests between them** before this
+commit — the crate's suite is all in `mercator`, `position`, `projector`,
+`tiles`, `zoom`, `style` and `expression` and touches none of this code. So
+"the existing tests stayed green" would have been evidence of nothing here, and
+each claim gets its own:
+
+- `center::tests::is_detached_agrees_with_detached_on_every_variant` — the new
+  `mod tests` in `center.rs`. All five variants, built through a helper whose
+  companion `variant_name` is an exhaustive `match`, so adding a variant to
+  `Center` stops the file compiling rather than quietly leaving the new one
+  uncovered. It also asserts the answer is not constant (one `false`, four
+  `true`), because agreement on a constant is agreement about nothing.
+  **Negative control run:** inverting the `matches!` to
+  `matches!(self, Center::MyPosition)` reds it —
+  `assertion 'left == right' failed: MyPosition / left: false / right: true` —
+  and reds `is_detached_does_not_resolve_the_position` alongside it. Nothing
+  else in the crate moves.
+- `projector::tests::a_hoisted_map_centre_builds_the_same_projector` — `new` and
+  `with_map_center` build bit-identical projectors across four zooms, attached
+  and detached, and a deliberately wrong centre must build a different one.
+- `map::tests::the_maps_centre_is_the_one_the_projector_would_have_resolved` and
+  `a_detached_map_is_not_centred_on_my_position` — `map.rs`'s first tests, pinning
+  the premise the hoist rests on.
+
+The hoist is additionally gated outside this crate, which is worth recording
+because nothing in `walkers` exercises `Map::show`: handing
+`with_map_center` `self.my_position` instead of `map_center` reds five
+`squallar-egui` tests (`input_harness::tests::a_click_outside_the_pane_does_not_reach_a_site_icon_straddling_its_edge`,
+`a_consumed_click_while_faded_unfades`,
+`a_consumed_map_click_reports_itself_and_a_bare_one_does_not`,
+`a_dialog_over_a_site_icon_suppresses_its_hover_readout`,
+`a_qualifying_tap_fades_the_chrome_and_the_second_restores_it`) out of 1118.
 
 ## What the pin actually selects
 
