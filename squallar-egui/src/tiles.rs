@@ -121,9 +121,45 @@ impl Default for MapTileState {
 }
 
 impl MapTileState {
+    /// Adopt `is_dark` as the theme, releasing the other one's tile caches.
+    ///
+    /// Both `ensure_` methods open with this, so the release does not depend on
+    /// which of them happens to see the flip first — city labels can be off in
+    /// the very frame the theme changes, and the old theme's label cache has to
+    /// go anyway.
+    ///
+    /// **Nothing on the glass is blanked.** The tiles dropped belong to the
+    /// theme that is no longer drawn; the pane is repainting from the other
+    /// theme's sources this frame regardless. The accepted cost is a re-download
+    /// if the user flips back.
+    ///
+    /// Without it a single flip took residency from two live sources to four and
+    /// held it for the session, because the `ensure_` methods only ever fill and
+    /// [`Self::clear`] runs only on suspend and graphics reset. At
+    /// [`crate::tile_source::WASM_TILE_CACHE_ENTRIES`] — 96 since `6345952f` —
+    /// and 256 KiB a tile, one source's worst case is 24 MiB, so four of them is
+    /// 96 MiB against the 288 MiB `squallar-device-profile` allows the whole
+    /// application on wasm32.
+    fn adopt_theme(&mut self, is_dark: bool) {
+        if is_dark == self.current_theme_is_dark {
+            return;
+        }
+        self.current_theme_is_dark = is_dark;
+
+        // The theme that just stopped being drawn. Base and labels together:
+        // they are the same theme's tiles and nothing draws either of them now.
+        if is_dark {
+            self.tiles_light = None;
+            self.label_tiles_light = None;
+        } else {
+            self.tiles_dark = None;
+            self.label_tiles_dark = None;
+        }
+    }
+
     /// Ensure the base-map tiles for the current theme are initialized.
     pub fn ensure_base_tiles(&mut self, is_dark: bool, ctx: &egui::Context) {
-        self.current_theme_is_dark = is_dark;
+        self.adopt_theme(is_dark);
         if is_dark {
             if self.tiles_dark.is_none() {
                 self.tiles_dark = Some(HttpsTiles::new(CartoDb::dark(), ctx.to_owned()));
@@ -135,6 +171,7 @@ impl MapTileState {
 
     /// Ensure label-only tiles are initialized for the current theme.
     pub fn ensure_label_tiles(&mut self, is_dark: bool, ctx: &egui::Context) {
+        self.adopt_theme(is_dark);
         if is_dark && self.label_tiles_dark.is_none() {
             self.label_tiles_dark = Some(HttpsTiles::new(CartoDb::dark_labels(), ctx.to_owned()));
         } else if !is_dark && self.label_tiles_light.is_none() {
