@@ -63,22 +63,32 @@ pub(crate) fn tile_id(position: Position, mut zoom: u8, source_tile_size: u32) -
 
 /// Project geographical position into a 2D plane using Mercator.
 pub fn project(position: Position, zoom: f64) -> Pixels {
-    let total_pixels = total_pixels(zoom);
+    project_at_scale(position, total_pixels(zoom))
+}
+
+/// [`project`], for a caller that already holds [`total_pixels`] for its zoom.
+///
+/// `2f64.powf(zoom)` is not free and zoom is fixed for a whole frame, so a caller
+/// projecting many points pays it once instead of once per point.
+pub(crate) fn project_at_scale(position: Position, total_pixels: f64) -> Pixels {
     let (x, y) = mercator_normalized(position);
     Pixels::new(x * total_pixels, y * total_pixels)
 }
 
 /// Transforms screen pixels into a geographical position.
 pub(crate) fn unproject(pixels: Pixels, zoom: f64) -> Position {
-    let number_of_pixels: f64 = 2f64.powf(zoom) * (TILE_SIZE as f64);
+    unproject_at_scale(pixels, total_pixels(zoom))
+}
 
+/// [`unproject`], for a caller that already holds [`total_pixels`] for its zoom.
+pub(crate) fn unproject_at_scale(pixels: Pixels, total_pixels: f64) -> Position {
     let lon = pixels.x();
-    let lon = lon / number_of_pixels;
+    let lon = lon / total_pixels;
     let lon = (lon * 2. - 1.) * PI;
     let lon = lon.to_degrees();
 
     let lat = pixels.y();
-    let lat = lat / number_of_pixels;
+    let lat = lat / total_pixels;
     let lat = (-lat * 2. + 1.) * PI;
     let lat = lat.sinh().atan().to_degrees();
 
@@ -141,6 +151,80 @@ mod tests {
 
         for zoom in 32..=255u8 {
             assert_eq!(None, total_tiles(zoom));
+        }
+    }
+
+    /// A spread wide enough that a changed operation order shows up somewhere.
+    fn probes() -> impl Iterator<Item = (Position, f64)> {
+        const LATS: [f64; 7] = [-85.0, -33.87, 0.0, 0.5, 51.09916, 71.0, 85.0];
+        const LONS: [f64; 7] = [-179.9, -122.4194, -0.1276, 0.0, 17.03664, 151.2093, 179.9];
+
+        (0..=38u32).flat_map(|half_zoom| {
+            let zoom = half_zoom as f64 * 0.5;
+            LATS.iter()
+                .flat_map(move |&lat| LONS.iter().map(move |&lon| (lon_lat(lon, lat), zoom)))
+        })
+    }
+
+    /// Handing [`project_at_scale`] a precomputed [`total_pixels`] must produce the
+    /// very same `f64`s as recomputing the scale from the zoom did, not merely a
+    /// close one — the operations and their order are meant to be unchanged, so
+    /// this is `assert_eq!` on the bits and not an approximate comparison.
+    #[test]
+    fn a_precomputed_scale_projects_to_the_same_bits() {
+        for (position, zoom) in probes() {
+            // The expression `project` carried before the scale was hoisted out.
+            let scale = 2f64.powf(zoom) * (TILE_SIZE as f64);
+            let (x, y) = mercator_normalized(position);
+            let expected = Pixels::new(x * scale, y * scale);
+
+            let actual = project_at_scale(position, total_pixels(zoom));
+
+            assert_eq!(expected.x().to_bits(), actual.x().to_bits(), "{position:?}");
+            assert_eq!(expected.y().to_bits(), actual.y().to_bits(), "{position:?}");
+            assert_eq!(
+                expected.x().to_bits(),
+                project(position, zoom).x().to_bits()
+            );
+            assert_eq!(
+                expected.y().to_bits(),
+                project(position, zoom).y().to_bits()
+            );
+        }
+    }
+
+    /// The same, for [`unproject_at_scale`], which had its own copy of the
+    /// `2f64.powf(zoom) * TILE_SIZE` expression rather than calling
+    /// [`total_pixels`].
+    #[test]
+    fn a_precomputed_scale_unprojects_to_the_same_bits() {
+        for (position, zoom) in probes() {
+            let pixels = project(position, zoom);
+
+            // The expression `unproject` carried before the scale was hoisted out.
+            let number_of_pixels: f64 = 2f64.powf(zoom) * (TILE_SIZE as f64);
+            let lon = pixels.x();
+            let lon = lon / number_of_pixels;
+            let lon = (lon * 2. - 1.) * PI;
+            let lon = lon.to_degrees();
+            let lat = pixels.y();
+            let lat = lat / number_of_pixels;
+            let lat = (-lat * 2. + 1.) * PI;
+            let lat = lat.sinh().atan().to_degrees();
+            let expected = lon_lat(lon, lat);
+
+            let actual = unproject_at_scale(pixels, total_pixels(zoom));
+
+            assert_eq!(expected.x().to_bits(), actual.x().to_bits(), "{position:?}");
+            assert_eq!(expected.y().to_bits(), actual.y().to_bits(), "{position:?}");
+            assert_eq!(
+                expected.x().to_bits(),
+                unproject(pixels, zoom).x().to_bits()
+            );
+            assert_eq!(
+                expected.y().to_bits(),
+                unproject(pixels, zoom).y().to_bits()
+            );
         }
     }
 
