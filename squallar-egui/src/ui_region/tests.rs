@@ -4,50 +4,20 @@
 use super::{
     COVERAGE_MARGIN, COVERAGE_TARGET, MAX_FRAMING_PASSES, MAX_ZOOM_LEVEL, MIN_ZOOM_LEVEL,
     RegionDrag, corners_for, dolly_for_step, ground_half_extent, solve_viewport,
-    viewport_for_region, wheel_rate_correction, zoom_step,
+    viewport_for_region, zoom_step,
 };
 
-/// A frame whose timing is unusable leaves walkers exactly as it found it.
-#[test]
-fn a_frame_with_unusable_timing_leaves_walkers_alone() {
-    let with = |stable_dt: f32, predicted_dt: f32| {
-        let mut input = egui::InputState::default();
-        input.stable_dt = stable_dt;
-        input.predicted_dt = predicted_dt;
-        wheel_rate_correction(&input)
-    };
-    assert_eq!(
-        with(f32::NAN, 1.0 / 60.0),
-        1.0,
-        "a NaN frame time survives the clamp, so it has to be caught here",
-    );
-    assert_eq!(
-        with(1.0 / 60.0, 0.0),
-        1.0,
-        "a zero predicted_dt clamps the multiplier to zero, which would divide by it",
-    );
-    // The other side of the same guard: an infinity *is* bounded by the clamp,
-    // so it must come out as a real correction rather than be refused with it.
-    assert!(
-        (with(f32::INFINITY, 1.0 / 60.0) - 0.5).abs() < 1e-6,
-        "an infinite frame time clamps to predicted_dt * 2, a real correction",
-    );
-    // The control: an ordinary 60 Hz frame is corrected by exactly nothing,
-    // because 1/60 is the rate the constant is calibrated at.
-    assert!(
-        (with(1.0 / 60.0, 1.0 / 60.0) - 1.0).abs() < 1e-6,
-        "a 60Hz frame must need no correction at all",
-    );
-}
-
-/// Opening a second [`super::steady_wheel`] inside the first is refused.
-#[cfg(debug_assertions)]
-#[test]
-#[should_panic(expected = "nesting squares the correction")]
-fn nesting_the_wheel_guard_is_refused() {
-    let ctx = egui::Context::default();
-    super::steady_wheel(&ctx, || super::steady_wheel(&ctx, || ()));
-}
+// Two tests stood here, both gating `steady_wheel` — the correction that
+// cancelled walkers' frame-time multiplier by mutating egui's `InputState`
+// around the widget. One pinned its arithmetic on a frame whose timing was
+// unusable; the other refused a nested scope, which would have squared the
+// correction. Both went with `steady_wheel` itself: walkers now takes
+// `.wheel_zoom_scales_with_frame_time(false)`, so there is no `InputState`
+// write left to re-enter, and the unusable-timing case is upstream's own clamp
+// rather than a division this crate performs. The behaviour they were really
+// protecting is unchanged and still gated below, by
+// `a_notch_moves_the_plan_view_the_same_distance_at_every_frame_rate`, which
+// drives the real `walkers::Map` at six frame rates.
 
 /// An input frame carrying `scroll` points of wheel and nothing else, at
 /// egui's own default 60 Hz timing.

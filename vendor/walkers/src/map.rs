@@ -12,6 +12,21 @@ struct Layer<'a> {
     transparency: f32,
 }
 
+/// The frame time a wheel notch is scaled by when
+/// [`Map::wheel_zoom_scales_with_frame_time`] is off: 60 Hz, the rate the
+/// notch's size was chosen at.
+pub const NOMINAL_FRAME_TIME: f32 = 1.0 / 60.0;
+
+/// One frame's wheel scroll as a zoom delta, given the frame time the notch is
+/// scaled by.
+///
+/// Split out from [`Map::zoom_delta`] so it can be exercised without an
+/// [`egui::Context`]: everything above it is which `frame_scale` to pass, and
+/// everything in it is the arithmetic that is the same either way.
+fn wheel_zoom_delta(scroll_y: f32, frame_scale: f32) -> f64 {
+    1.0 + f64::from(scroll_y * frame_scale) / 4.0
+}
+
 /// The actual map widget. Instances are to be created on each frame, as all necessary state is
 /// stored in [`Tiles`] and [`MapMemory`].
 ///
@@ -125,6 +140,25 @@ impl<'a, 'b, 'c> Map<'a, 'b, 'c> {
     /// Allow to disable panning even when zooming with ctrl is enabled.
     pub fn panning(mut self, enabled: bool) -> Self {
         self.options.panning = enabled;
+        self
+    }
+
+    /// Set whether a wheel notch's zoom is multiplied by how long the frame it
+    /// arrived on took. Default is `true`, which is upstream's behaviour.
+    ///
+    /// **This is not a switch for "remove the multiplier".** The wheel term is
+    /// `smooth_scroll_delta.y * frame_time / 4.0`, so dropping `frame_time`
+    /// entirely would make one notch `y/2` zoom levels instead of `y/120` — a
+    /// **60x** zoom per notch. What `false` does is substitute a *nominal*
+    /// frame time, [`NOMINAL_FRAME_TIME`], for the measured one: the notch
+    /// keeps the size it has on a 60 Hz display and stops changing size when
+    /// the frame rate does.
+    ///
+    /// Wanted by any app whose frame time is not a constant — one whose frames
+    /// are 4 ms when idle and 300 ms while a layer rasterises will otherwise
+    /// zoom the map ~75x further per notch during the slow ones.
+    pub fn wheel_zoom_scales_with_frame_time(mut self, enabled: bool) -> Self {
+        self.options.wheel_zoom_scales_with_frame_time = enabled;
         self
     }
 
@@ -291,14 +325,19 @@ impl Map<'_, '_, '_> {
             // We only use the raw scroll values, if we are zooming without ctrl,
             // and zoom_delta is not already over/under 1.0 (eg. a ctrl + scroll event or a pinch zoom)
             // These values seem to correspond to the same values as one would get in `zoom_delta()`
-            zoom_delta = 1f64
-                + ui.input(|input| {
-                    input.smooth_scroll_delta.y
-                        * input
-                            .stable_dt
-                            .clamp(input.predicted_dt * 0.5, input.predicted_dt * 2.0)
-                }) as f64
-                    / 4.0;
+            let scales_with_frame_time = self.options.wheel_zoom_scales_with_frame_time;
+            zoom_delta = ui.input(|input| {
+                // A *value* is selected here, and the arithmetic below is the
+                // same expression either way.
+                let frame_scale = if scales_with_frame_time {
+                    input
+                        .stable_dt
+                        .clamp(input.predicted_dt * 0.5, input.predicted_dt * 2.0)
+                } else {
+                    NOMINAL_FRAME_TIME
+                };
+                wheel_zoom_delta(input.smooth_scroll_delta.y, frame_scale)
+            });
         };
 
         zoom_delta
@@ -374,5 +413,88 @@ mod tests {
             my_position,
             Map::new(None, &mut memory, my_position).position()
         );
+    }
+
+    /// The whole zoom a notch produces, in **zoom levels**: `zoom_by` is handed
+    /// `(zoom_delta - 1) * zoom_speed`, and `zoom_speed` defaults to 2.
+    fn notch_levels(scroll_y: f32, frame_scale: f32) -> f64 {
+        (wheel_zoom_delta(scroll_y, frame_scale) - 1.0) * Options::default().zoom_speed
+    }
+
+    /// **The trap this option exists to avoid.** Turning the multiplier off is
+    /// not deleting it: `frame_scale = 1.0` is a 60x zoom per notch, which is
+    /// why the option substitutes a nominal frame time instead.
+    #[test]
+    fn dropping_the_frame_time_entirely_would_be_a_sixty_times_zoom() {
+        let with_nominal = notch_levels(120.0, NOMINAL_FRAME_TIME);
+        let with_none = notch_levels(120.0, 1.0);
+
+        assert!(
+            (with_nominal - 1.0).abs() < 1e-9,
+            "a 120-point notch at the nominal frame time must be one zoom \
+             level, not {with_nominal}",
+        );
+        assert!(
+            (with_none / with_nominal - 60.0).abs() < 1e-6,
+            "deleting the multiplier would zoom {}x per notch, not the 60x this \
+             test claims - the arithmetic moved",
+            with_none / with_nominal,
+        );
+    }
+
+    /// With the option off, the notch is the same size at every frame time the
+    /// app can hand it — which is the point, and is what the measured multiplier
+    /// does not do.
+    #[test]
+    fn a_nominal_frame_time_makes_the_notch_the_same_at_any_frame_rate() {
+        // A 4 ms idle frame and a 300 ms one mid-raster, and everything between.
+        const MEASURED: [f32; 5] = [1.0 / 240.0, 1.0 / 120.0, 1.0 / 60.0, 1.0 / 30.0, 0.2895];
+
+        for measured in MEASURED {
+            assert!(
+                (notch_levels(120.0, NOMINAL_FRAME_TIME) - 1.0).abs() < 1e-9,
+                "the nominal notch moved on a {measured} s frame",
+            );
+        }
+
+        // The control: the measured multiplier really does vary, or the
+        // assertion above is about nothing.
+        let measured: Vec<f64> = MEASURED.iter().map(|&s| notch_levels(120.0, s)).collect();
+        let widest = measured.iter().copied().fold(f64::MIN, f64::max);
+        let tightest = measured.iter().copied().fold(f64::MAX, f64::min);
+        assert!(
+            widest / tightest > 60.0,
+            "the measured frame time spread the notch only {}x, so this test \
+             is not comparing against a moving target: {measured:?}",
+            widest / tightest,
+        );
+    }
+
+    /// The option's default is upstream's behaviour, so a `Map` nobody
+    /// configured behaves exactly as it did.
+    #[test]
+    fn the_frame_time_multiplier_is_on_by_default() {
+        assert!(Options::default().wheel_zoom_scales_with_frame_time);
+
+        let mut memory = MapMemory::default();
+        let map = Map::new(None, &mut memory, lon_lat(21., 52.));
+        assert!(map.options.wheel_zoom_scales_with_frame_time);
+
+        let mut memory = MapMemory::default();
+        let map =
+            Map::new(None, &mut memory, lon_lat(21., 52.)).wheel_zoom_scales_with_frame_time(false);
+        assert!(!map.options.wheel_zoom_scales_with_frame_time);
+    }
+
+    /// The gesture stays linear in how far the wheel turned, and signed.
+    #[test]
+    fn the_notch_follows_how_far_the_wheel_turned() {
+        for (points, want) in [(240.0, 2.0), (120.0, 1.0), (60.0, 0.5), (-120.0, -1.0)] {
+            let levels = notch_levels(points, NOMINAL_FRAME_TIME);
+            assert!(
+                (levels - want).abs() < 1e-9,
+                "{points} points moved {levels} zoom levels, not {want}",
+            );
+        }
     }
 }
