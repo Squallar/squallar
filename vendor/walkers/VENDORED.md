@@ -199,6 +199,12 @@ parsing that lands next; that work is not in either of these commits.
 Beyond the dev-dependency removals already listed: a vendoring note under the
 generated header, and two lint tables.
 
+The seventh commit removes `[dependencies.geo]` **and** `dep:geo` from the `mvt`
+feature list. Both are required: deleting the table alone is a resolver error,
+and deleting the feature entry alone leaves `geo` activated with nothing
+importing it. `[dev-dependencies.approx]` stays — `mercator.rs`, `position.rs`
+and `projector.rs` use it and are untouched.
+
 `package.version` stays **exactly** `0.56.0`, with no `+local` metadata. A
 `[patch]` is only accepted for a version satisfying the requirement it
 replaces, and the root `[workspace.dependencies]` pin is `walkers = "=0.56.0"`.
@@ -244,13 +250,14 @@ commit changes the count in either direction.
 
 ### Changed — source
 
-Nine files. Six of them arrived in three groups — still six there, because the
+Ten files. Six of them arrived in three groups — still six there, because the
 third group touches only `src/lib.rs` and `src/style.rs`, which the first two
-had already changed. The other three arrive with the fifth and sixth commits
-described at the end of this section: `src/expression.rs`, then
+had already changed. The other four arrive with the fifth, sixth and seventh
+commits described at the end of this section: `src/expression.rs`, then
 `src/mercator.rs` and `src/local_tiles.rs` (the sixth also touches `src/tiles.rs`
-and `src/lib.rs`, which were already on the list). Nothing in the first three
-groups changes how a tile that this workspace actually renders is drawn.
+and `src/lib.rs`, which were already on the list), then `src/text.rs`. Nothing
+in the first three groups changes how a tile that this workspace actually
+renders is drawn.
 
 The first commit changed two files, and both changes were forced by the
 packaging rather than chosen:
@@ -444,6 +451,41 @@ skipped, which is what the loop already did with every other miss.
 Deleting the `squallar-egui` copies is deliberately **not** part of this commit;
 this one is additive to `vendor/walkers` and changes nothing outside it.
 
+### Changed — source, seventh commit: label collision without `geo`
+
+One file and one dependency. `src/text.rs` was the crate's **only** `geo::`
+importer.
+
+`OrientedRect` held a `geo::Polygon<f32>` built from a five-point `LineString`
+and a `vec![]` of interiors, allocated once per label, and `intersects`
+answered through `geo`'s polygon `Intersects` behind a bounding-box reject. It
+now holds `[Pos2; 4]` and a plain `egui::Rect`, and answers with a
+separating-axis test over the four candidate edge normals — two per rect, since
+a rectangle's opposite edges are parallel. No allocation, no dependency.
+
+The bounding-box reject stays exactly where it was, and the axis test is
+deliberately **non-strict**: touching projections are not a separation. That is
+what makes it agree with the reject rather than merely defer to it, so an
+axis-aligned pair — which is every label but a line label, the only rotated
+ones — gets the answer the bounding box already gave, touching cases included.
+
+**Checked against the code it replaces, not against a belief about it.** Every
+expected value in the new `text::tests` was read off the `geo` predicate on
+those exact inputs, by running it, before it was deleted — including the two
+rotated pairs whose bounding boxes overlap while the rects are apart, where
+`geo` reports `bbox=true poly=false` and so does the axis test. All four axis
+slots were then shown to be load-bearing by duplicating each one over its
+neighbour in turn: each of the four turns a test red, and an AABB-only
+regressor turns exactly the rotated cases red and nothing else.
+
+Seven tests, `text::tests::*`. They are the first this directory has ever had
+over label collision — upstream ships no `mod tests` in `text.rs` at all, which
+is why the old predicate had to be run rather than trusted.
+
+`geo-types` is **not** affected and stays. It is a separate, non-optional crate
+that `src/mvt.rs` and `src/position.rs` genuinely use, and the name similarity
+is the whole trap.
+
 `diff -rq` against the unpacked tarball, in full, is exactly:
 
 ```text
@@ -455,6 +497,7 @@ Files <tarball>/src/local_tiles.rs and …/src/local_tiles.rs differ
 Files <tarball>/src/mercator.rs and …/src/mercator.rs differ
 Files <tarball>/src/sources/mapbox.rs and …/src/sources/mapbox.rs differ
 Files <tarball>/src/style.rs and vendor/walkers/src/style.rs differ
+Files <tarball>/src/text.rs  and vendor/walkers/src/text.rs  differ
 Files <tarball>/src/tiles.rs and vendor/walkers/src/tiles.rs differ
 Only in <tarball>: assets
 Only in <tarball>: Cargo.lock
@@ -468,8 +511,8 @@ Only in vendor/walkers: VENDORED.md
 ```
 
 Every other file under `src/` — `center`, `map`, `memory`, `mvt`, `options`,
-`plugin`, `position`, `projector`, `text`, `zoom`, and the rest of `sources/` —
-is byte-for-byte upstream's.
+`plugin`, `position`, `projector`, `zoom`, and the rest of `sources/` — is
+byte-for-byte upstream's.
 
 ## What the pin actually selects
 
@@ -553,6 +596,17 @@ appeared, an existing one grew.
 The sentence "Do not quote 38 as a figure this workspace measures today" still
 holds, for a new reason: the figure this workspace measures today is **39**, and
 it is not upstream's 38 — it is 37 of upstream's plus 2 of ours.
+
+**The 39 above went stale twice, and the table was not updated either time.**
+Measured with `cargo test -p walkers --all-features`, exit 0 at each point: the
+fifth and sixth commits take it to **45**, and the seventh takes it to **52**.
+So the row reading "now | 39" means "after commit 4", not "now" — treat every
+figure in that table as stamped with the commit that produced it.
+
+The seventh's **+7** is `text::tests`, and they are the first tests this
+directory has ever had over label collision: upstream ships no `mod tests` in
+`text.rs` at all. That absence is why replacing its predicate had to be checked
+by *running* the old one, rather than by watching a suite stay green.
 
 ## rustfmt
 
@@ -665,6 +719,50 @@ manifest and none of the four named crates declares one — but "no obvious
 blocker" is not a measurement, and this workspace's rule is to measure the real
 platform rather than infer. Treat the figure above as host-only until somebody
 runs the other three.
+
+### Taking `geo` back out — seventh commit
+
+Two counts again, and again **different denominators that are never added**.
+Both are distinct `name version` rows from `cargo tree --prefix none`, `(*)`
+back-references stripped, sorted unique; both measured against `6a2b507a`:
+
+| | before | after | delta |
+| --- | --- | --- | --- |
+| `cargo tree -p walkers --all-features` | 110 | 92 | **−18** |
+| `cargo tree -p squallar-web --target wasm32-unknown-unknown` | 279 | 263 | **−16** |
+
+Nothing is added in either. The second row is the one that matters — it is the
+shipped wasm bundle, and it is also the first entry in this section measured on
+a target other than the host, which answers for `geo` the question the row above
+leaves open for the whole 23.
+
+The 16 that leave the wasm bundle: `geo` itself, then `approx`,
+`float_next_after`, `geographiclib-rs`, `heapless`, `i_float`, `i_key_sort`,
+`i_overlay`, `i_shape`, `i_tree`, `rand`, `rand_core`, `rand_pcg`, `robust`,
+`rstar`, `sif-itree`.
+
+**The rows differ by 18 − 16 = 3 − 1, and neither number is an error.**
+`approx` is in the 16 but not the 18: it is walkers' own dev-dependency, so it
+survives in walkers' tree and is still compiled for its tests. `byteorder`,
+`hash32` and `stable_deref_trait` are in the 18 but not the 16: they leave
+*walkers'* tree behind `heapless` and `rstar`, and stay in the bundle because
+other members reach them independently. This is the reason the two rows are
+never added.
+
+`Cargo.lock` loses 13 `[[package]]` blocks — `geo`, `float_next_after 2.0.0`,
+`geographiclib-rs`, the five `i_*`, the three `rand*`, `robust`, `sif-itree`.
+
+Thirteen and not 16, and the missing three are the section above's point made
+again. `approx` stays because it is still walkers' dev-dependency, and it is
+still *compiled*. `rstar 0.12.2` and `heapless 0.8.0` stay **locked but no
+longer compiled**: `geo-types` declares all five `rstar` majors as optional
+deps behind its `rstar_*` features, so Cargo locks every one of them whether or
+not a feature selects any, and `rstar` in turn locks `heapless`. Checked, not
+assumed — after this commit `cargo tree -i rstar@0.12.2` and
+`cargo tree -i heapless@0.8.0` print `nothing to print` at
+`--workspace --all-features --target all`, and fail to match a package at all
+without those flags. `cargo tree -i geo` does not match a package under any of
+those spellings: it is gone from the workspace, not merely deactivated.
 
 The pin the other three vendored directories use holds here too:
 

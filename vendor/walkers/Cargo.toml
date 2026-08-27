@@ -25,6 +25,10 @@
 # egui_extras is on that list only because it was there to rasterise the two
 # bundled Mapbox logo SVGs, which are third-party trademarked assets and are
 # also gone.
+#
+# `geo` is an eleventh, removed separately: `src/text.rs` was its only importer
+# and its label collision is a separating-axis test now. See the note by
+# `[dependencies.geo-types]` below.
 # ---------------------------------------------------------------------------
 
 [package]
@@ -57,7 +61,6 @@ resolver = "2"
 default = []
 mvt = [
     "dep:color",
-    "dep:geo",
     "dep:lyon_path",
     "dep:lyon_tessellation",
     "dep:mvt-reader",
@@ -82,11 +85,11 @@ optional = true
 [dependencies.egui]
 version = "0.35.0"
 
-[dependencies.geo]
-version = "0.33.1"
-optional = true
-default-features = false
-
+# No `[dependencies.geo]`. `src/text.rs` was its only importer, and its label
+# collision now runs a separating-axis test over `[Pos2; 4]` instead of a
+# `geo::Polygon`. `geo-types` below is a *different* crate and stays --
+# `src/mvt.rs` and `src/position.rs` genuinely use it. See VENDORED.md,
+# *Changed -- source*, seventh commit.
 [dependencies.geo-types]
 version = "0.7"
 
