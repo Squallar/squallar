@@ -43,6 +43,24 @@ impl MapMemory {
         self.center_mode.animating()
     }
 
+    /// Whether a pan drag is in progress, awaiting its release.
+    ///
+    /// [`MapMemory::animating`] excludes dragging by documented intent, so
+    /// without this a caller cannot see the one state the map stays in only
+    /// because a release edge is still expected.
+    pub fn dragging(&self) -> bool {
+        self.center_mode.dragging()
+    }
+
+    /// End any gesture or animation, leaving the map where it is. Idempotent.
+    ///
+    /// The escape hatch for a caller that knows the release edge will never
+    /// arrive — the widget is about to stop being shown, or already was while
+    /// the button came up.
+    pub fn settle(&mut self) {
+        self.center_mode.settle();
+    }
+
     /// Point the map exactly at the given geographical position.
     pub fn center_at(&mut self, position: Position) {
         self.center_mode = Center::Exact(AdjustedPosition::new(position));
