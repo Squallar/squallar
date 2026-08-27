@@ -179,6 +179,11 @@ parsing that lands next; that work is not in either of these commits.
   The 9 deleted in the first commit are a disjoint set, and the attribute is
   what separates them: the 38 are `#[test]`; the 9 were `#[tokio::test]`, all in
   `http_tiles.rs`, all `hypermocker`-driven.
+
+  **Two were added by the third commit**, both in a fresh `style::tests` — the
+  module the deletion above had emptied. They are ours, not upstream's, and they
+  are the pin on the two `style.rs` changes that commit makes. Measured:
+  `cargo test -p walkers --all-features` reports **39**.
 - `README.md` — required, not decoration: `src/lib.rs` opens with
   `#![doc = include_str!("../README.md")]`, so deleting it is a compile error.
 
@@ -210,12 +215,39 @@ groups rather than `warnings`, and what a source-level `#![deny(…)]` outranks.
 One difference from `vendor/nexrad-decode` worth stating because its absence
 could look like an omission: **no lint scoping was needed in source.**
 `src/lib.rs`'s `#![deny(clippy::unwrap_used, rustdoc::broken_intra_doc_links)]`
-is upstream's, outranks the tables, and is already clean on this tree. It stays.
+is upstream's and outranks the tables. It stays.
+
+**Correction, measured on the third commit: it is *not* "already clean on this
+tree", which is what this paragraph used to claim.** `cargo clippy -p walkers
+--all-targets` exits **101 with 6 `clippy::unwrap_used` errors**, and
+`--all-features` gives the same 6. They are all in upstream's own
+`#[cfg(test)]` code — `src/projector.rs:100` and `:141`, `src/zoom.rs:66`,
+`:67`, `:72`, `:80` — reached because `--all-targets` builds the test targets,
+which a plain `cargo clippy` does not. The `[lints.clippy] all = "allow"` table
+cannot suppress them: a source-level `deny` outranks a command-line allow, which
+is the very mechanic the paragraph above describes.
+
+This is **pre-existing and not caused by the third commit**. Verified by
+stashing that commit's changes and running the same command on `a152805c`: 6
+errors, byte-identical list, exit 101 both times. It is recorded here rather
+than fixed because fixing it means editing upstream test bodies — a much larger
+delta than anything else in this file, for lint compliance rather than
+behaviour.
+
+What it means for CI is worth stating plainly, because it is the reason this
+matters at all: `.github/workflows/clippy.yaml` runs `--all-targets
+--all-features` over every member and gates on it, so that job is red on this
+directory independently of any patch here. Whoever owns that gate has to
+choose — scope the lint in source (the `vendor/nexrad-decode` remedy this
+paragraph says was not needed), or exclude the member. Nothing in the third
+commit changes the count in either direction.
 
 ### Changed — source
 
-Six files, in two groups. Nothing in either group changes how a tile that this
-workspace actually renders is drawn.
+Six files, in three groups — still six, because the third group touches only
+`src/lib.rs` and `src/style.rs`, which the first two had already changed.
+Nothing in any group changes how a tile that this workspace actually renders is
+drawn.
 
 The first commit changed two files, and both changes were forced by the
 packaging rather than chosen:
@@ -251,6 +283,63 @@ modules and assets and nothing else:
   that called them.
 - **`src/sources/mapbox.rs`** — two `Attribution` fields go from
   `Some(egui::include_image!(…))` to `None`.
+
+The third commit is the first that is chosen rather than forced, and it is the
+first that adds code here instead of removing it. Three changes, two files:
+
+1. **`src/style.rs`, one attribute — the `Circle` serde defect.**
+   `Layer::Circle` was the only variant carrying a `source_layer` field without
+   the `#[serde(rename_all = "kebab-case")]` its `Fill`, `Line` and `Symbol`
+   siblings all have. The enum-level `rename_all` renames *variants*, not
+   fields, so `Circle` alone expected a literal `source_layer` where MapLibre
+   writes `source-layer`.
+
+   The blast radius is larger than one variant, and that is the reason to fix
+   it rather than route around it: `source_layer` is `String` and not
+   `Option<String>`, so the miss is a hard `missing field` error, not a
+   dropped value — and `Style` is a single `Vec<Layer>` of an internally-tagged
+   enum, so serde fails the *whole* style. One `circle` layer anywhere in a
+   MapLibre style takes the entire parse down with it.
+
+   Verified before it was changed, not after. Against upstream's code the new
+   test fails with
+   ``Error("missing field `source_layer`", line: 5, column: 13)`` on a style
+   whose other layer is a perfectly good `background`.
+
+   The fix is the missing attribute and nothing else — `Circle` now matches its
+   three siblings exactly, `source_layer` deliberately stays a non-optional
+   `String` as theirs are. `style::tests::circle_layer_with_kebab_case_source_layer_parses`
+   pins it.
+
+2. **`src/style.rs`, `Style::from_json`.** A `pub fn from_json(&str) ->
+   Result<Self, serde_json::Error>`, added because the *Removed — the four
+   bundled-style constructors* entry above left `Style` with no way to be built
+   from JSON at all. Those four were also the crate's only `.expect("failed to
+   parse style JSON")` sites, so this is the fallible replacement that entry
+   anticipated: this workspace loads its own styles and must be able to report a
+   bad one rather than abort. Kept to one function on purpose — it is a thin
+   wrapper over `serde_json::from_str`, not a new style-loading API.
+   `style::tests::from_json_reports_a_parse_failure_instead_of_panicking` pins
+   that it returns `Err` rather than panicking.
+
+3. **`src/lib.rs`, visibility — the one structural change.** `mod style`, `mod
+   text` and `mod mvt` become `pub mod`, and `Layout`, `Text`, `OccupiedAreas`,
+   `render` and `transformed` join the existing re-exports.
+
+   This is the change the other two are in service of. Until it, the only way
+   into the vector pipeline from outside was `Tile::new`, which hands back an
+   opaque `Tile` and keeps style loading, text layout and label collision
+   sealed inside this directory — so every later fidelity fix to any of them
+   would have had to land *here*, growing the delta this file exists to keep
+   short. With `mvt::render` reachable, a dependent crate can hold the returned
+   `Vec<ShapeOrText>` itself and do that work in its own tree; for this
+   workspace that means `squallar-egui`.
+
+   The `#[cfg(not(feature = "mvt"))]` dummy `mod style` is made `pub` too, so
+   that `walkers::style::Style` resolves under either feature selection rather
+   than only one. Nothing in this change alters behaviour: no function body
+   moved and no item's contents changed, only which of them a dependent crate
+   can name.
 
 `diff -rq` against the unpacked tarball, in full, is exactly:
 
@@ -314,6 +403,27 @@ rows compile the mvt modules and run the inline tests in them.
 tarball's 38 — the one absent is `style::tests::test_style_parsing`. The 15
 above is the figure for a default-feature run, and the two are not
 interchangeable.
+
+### A correction to the paragraph above, from the third commit
+
+The sentence "the other 23 arrive the day `mvt` is enabled" was **wrong by one
+when it was written**, and the error is worth keeping visible rather than
+silently patching, because the figure was quoted forward.
+
+There were 23 mvt-gated tests *in the tarball*. But the second commit deleted
+`style::tests::test_style_parsing` — which was one of those 23 — leaving
+`src/style.rs` with no `mod tests` at all. So the number waiting on `mvt` was
+already **22**, all of them in `src/expression.rs`, from the moment that commit
+landed. The `37 = 15 + 22` in the paragraph above is self-consistent with that
+and is the arithmetic that gives it away; only the prose said 23.
+
+Measured on this tree, `cargo test -p walkers --features mvt` before the
+`style.rs` changes: `1 passed; 1 failed; 37 filtered out` — the 37 filtered are
+the whole pre-existing suite, and 37 − 15 = 22.
+
+After the third commit the count waiting on `mvt` is **24**: those 22 plus the
+two new `style::tests` fns, which are mvt-gated for the same reason — `mod
+style` is behind the feature.
 
 ## rustfmt
 
