@@ -45,14 +45,21 @@ members = [
     # on the map widget this copy exists to change, and they only run if
     # `cargo test --workspace` selects them.
     #
-    # Read the size of that pin honestly, because it is smaller than it looks.
-    # walkers ships 38 inline `#[test]` fns, but 23 of them -- the 22 in
-    # `src/expression.rs` and the 1 in `src/style.rs` -- are behind
-    # `#[cfg(feature = "mvt")]`, and nothing here enables `mvt`. A default-feature
-    # `cargo test --workspace` therefore selects 15, in mercator/position/
-    # projector/tiles/zoom. The other 23 arrive the moment `mvt` is on, which is
-    # exactly when the style and expression patches land. See
-    # vendor/walkers/VENDORED.md and `[patch.crates-io]` below.
+    # This pin used to be much smaller than it looked, and is no longer. The
+    # note here previously read: 23 of walkers' 38 inline `#[test]` fns are
+    # behind `#[cfg(feature = "mvt")]`, nothing enables `mvt`, so
+    # `cargo test --workspace` selects 15.
+    #
+    # Two things have changed. The 23 was off by one even then -- the commit
+    # that trimmed the HTTP stack also deleted the single mvt-gated test in
+    # `src/style.rs`, leaving 22, all of them in `src/expression.rs`. And
+    # `squallar-egui` now enables `mvt` unconditionally, so those 22 are armed:
+    # they are the behaviour pin on the expression evaluator that the style and
+    # layer-fidelity patches will touch, and arming them is the point.
+    #
+    # Measured, `cargo test --workspace`: walkers contributes 39 unit tests
+    # (15 + 22 + 2 added with the Circle serde fix) plus 1 doctest and 1
+    # ignored. See vendor/walkers/VENDORED.md and `[patch.crates-io]` below.
     "vendor/walkers",
 ]
 

@@ -40,7 +40,15 @@ egui = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-walkers = { workspace = true }
+# `mvt` is enabled UNCONDITIONALLY, and that is a rule rather than a default.
+# The feature changes the shape of `walkers::Tile`: without it the enum has one
+# variant, with it `Tile::Vector` also exists. Gating it would mean a
+# `#[cfg(feature = ...)]` match arm over that enum, which is behaviour forked
+# inside a function body -- what ARCHITECTURE.md forbids of a `cfg` ("may select
+# a value, a dependency or a type alias; may never fork behaviour inside a
+# function body"). On unconditionally, the enum always has both variants and
+# every match over it is plain code.
+walkers = { workspace = true, features = ["mvt"] }
 # Channels and the concurrency-bounded tile fetch loop in `tile_source`. Same
 # pin as squallar-overlays; walkers uses this version too, so it is already in the
 # graph either way.

@@ -604,7 +604,9 @@ fn a_fetched_tile_reaches_an_egui_texture_with_the_pixels_that_were_served() {
         "a tile fetched at its own zoom is drawn whole, not as a piece of an ancestor"
     );
 
-    let Tile::Raster(texture) = piece.tile;
+    let Tile::Raster(texture) = piece.tile else {
+        panic!("the tile source fetches PNGs; it never produces a vector tile");
+    };
     assert_eq!(
         texture.size(),
         [FIXTURE_SIDE as usize; 2],
@@ -795,7 +797,9 @@ fn a_cached_ancestor_is_stretched_over_a_tile_that_has_not_arrived() {
     let mut tiles = loopback_tiles(&server, &ctx);
 
     let ancestor = tile_eventually(&mut tiles, ancestor_id);
-    let Tile::Raster(ancestor_texture) = ancestor.tile;
+    let Tile::Raster(ancestor_texture) = ancestor.tile else {
+        panic!("the tile source fetches PNGs; it never produces a vector tile");
+    };
 
     // Two levels deeper, inside that ancestor: x = 1 -> offset 1 of 4,
     // y = 1 -> offset 1 of 4.
@@ -807,7 +811,9 @@ fn a_cached_ancestor_is_stretched_over_a_tile_that_has_not_arrived() {
     let piece = pump_until(DEFAULT_TIMEOUT, || tiles.at(descendant_id))
         .expect("the ancestor should have stood in for the missing tile");
 
-    let Tile::Raster(texture) = piece.tile;
+    let Tile::Raster(texture) = piece.tile else {
+        panic!("the tile source fetches PNGs; it never produces a vector tile");
+    };
     assert_eq!(
         texture.id(),
         ancestor_texture.id(),
@@ -1249,7 +1255,9 @@ fn live_cartodb_tile_decodes_and_reaches_a_texture() {
     let piece = pump_until(LIVE_TIMEOUT, || tiles.at(tile_id))
         .expect("the world tile should download from CartoDB");
 
-    let Tile::Raster(texture) = piece.tile;
+    let Tile::Raster(texture) = piece.tile else {
+        panic!("the tile source fetches PNGs; it never produces a vector tile");
+    };
     assert_eq!(
         texture.size(),
         [256, 256],
