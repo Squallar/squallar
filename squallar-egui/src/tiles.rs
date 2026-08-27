@@ -4,6 +4,20 @@ use walkers::{
     sources::{Attribution, TileSource},
 };
 
+/// The basemap credit, drawn once per map panel.
+///
+/// A const rather than only a [`TileSource::attribution`] field because the
+/// painter needs it and that trait hands back `&'static str`: routing the
+/// drawn string through the trait would mean leaking one or holding a `Lazy`.
+/// The trait impl below reads these, so the two cannot drift.
+///
+/// `\u{a9}` is U+00A9, registered in `ui_glyphs` as the basemap attribution
+/// copyright -- never spelled `(c)`.
+pub const ATTRIBUTION_TEXT: &str = "\u{a9} OpenStreetMap \u{a9} CartoDB";
+
+/// Where the credit links. ODbL wants the notice reachable, not just shown.
+pub const ATTRIBUTION_URL: &str = "https://www.openstreetmap.org/copyright";
+
 /// CartoDB tile source variants.
 #[derive(Clone)]
 pub enum CartoDbStyle {
@@ -68,8 +82,8 @@ impl TileSource for CartoDb {
 
     fn attribution(&self) -> Attribution {
         Attribution {
-            text: "© OpenStreetMap © CartoDB",
-            url: "https://www.openstreetmap.org/copyright",
+            text: ATTRIBUTION_TEXT,
+            url: ATTRIBUTION_URL,
             logo_light: None,
             logo_dark: None,
         }

@@ -1617,6 +1617,13 @@ impl Gui {
         self.probes.last_map_panel_rect
     }
 
+    /// Every basemap credit the last frame drew. One per *panel* is correct;
+    /// more than one means it slipped into the pane loop.
+    #[cfg(test)]
+    pub(crate) fn attribution_rects_for_test(&self) -> &[egui::Rect] {
+        &self.probes.last_attribution
+    }
+
     #[cfg(test)]
     pub(crate) fn widget_id_probes(&self) -> &[(&'static str, egui::Id)] {
         &self.probes.widget_id_probes

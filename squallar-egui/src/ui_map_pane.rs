@@ -1151,6 +1151,31 @@ pub(super) fn color_scale_free_rect(
     free
 }
 
+/// The strip **under** a horizontal colour scale: between the bar's bottom
+/// edge and the pane's own, which is the [`SCALE_MARGIN`] the bar is inset by.
+///
+/// The counterpart to [`color_scale_free_rect`], which answers for the space
+/// *above* the bar. A portrait pane's basemap credit is placed here, so the
+/// margin's arithmetic stays in the module that paints the bar rather than
+/// being spelled a second time at the call site — the same reason the credit
+/// asks [`color_scale_free_rect`] instead of re-deriving the gutter.
+///
+/// `None` when the scale is vertical — there is no strip under a bar that runs
+/// down the right edge — or when the pane is too short for the margin to be a
+/// strip at all.
+pub(super) fn color_scale_under_rect(
+    pane_rect: egui::Rect,
+    horizontal: bool,
+) -> Option<egui::Rect> {
+    if !horizontal || pane_rect.height() <= SCALE_MARGIN {
+        return None;
+    }
+    Some(egui::Rect::from_min_max(
+        egui::pos2(pane_rect.left(), pane_rect.bottom() - SCALE_MARGIN),
+        pane_rect.max,
+    ))
+}
+
 /// The generic tick form: whole numbers bare, one decimal otherwise. Short is
 /// the point — a tick label sits in the margin beside a 20px bar.
 fn short_tick(value: f32) -> String {

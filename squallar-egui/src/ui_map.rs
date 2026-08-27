@@ -95,8 +95,6 @@ impl super::Gui {
 
                 let horizontal_color_scale = self.color_scale_orientation.resolve(panel_rect);
 
-                let color_scale_floor = panel_rect.bottom() - self.phone_bar_height;
-
                 self.detect_active_pane_click(ui.ctx(), panel_rect);
 
                 let (pre_zooms, pre_positions): (Vec<f64>, Vec<Option<Position>>) =
@@ -135,6 +133,13 @@ impl super::Gui {
                 for pane_idx in 0..pane_count {
                     let pane_rect = self.pane_layout.pane_rect(pane_idx, panel_rect);
                     let is_active = pane_idx == self.active_pane;
+                    let color_scale_floor = self.color_scale_floor(
+                        ui,
+                        panel_rect,
+                        pane_rect,
+                        pane_idx,
+                        horizontal_color_scale,
+                    );
 
                     let mut pane = std::mem::take(&mut self.panes[pane_idx]);
 
@@ -484,6 +489,18 @@ impl super::Gui {
                         .handle_dividers(&mut divider_ui, panel_rect);
                 }
 
+                // The basemap credit, drawn once per *panel* and deliberately
+                // outside the pane loop above: four panes must not produce four
+                // copies. Two independent obligations want it on the map --
+                // ODbL for the OpenStreetMap data, and OpenMapTiles' CC-BY,
+                // which asks for visible credit in the corner of the map.
+                //
+                // An `Area` rather than a bare painter call because
+                // `detect_active_pane_click` already ignores a press landing on
+                // any layer above `Order::Background`, so the link becomes
+                // click-safe without pushing a rect into `excluded_rects`.
+                self.draw_basemap_attribution(ui, panel_rect, horizontal_color_scale, pane_count);
+
                 self.sync_viewports(&pre_zooms, &pre_positions);
             });
 
@@ -493,6 +510,248 @@ impl super::Gui {
         }
 
         actions
+    }
+
+    /// The lowest `y` this pane's colour scale may draw to.
+    ///
+    /// Two things push it up, and they are different in kind. The phone
+    /// shell's bottom bar is **docked**: it is panel-wide, its height is known
+    /// before the panes lay out, and a pane whose bottom is nowhere near it is
+    /// unaffected because [`pane_render::clear_of_bottom_chrome`] no-ops when
+    /// the floor is already below the pane. The **floating** chrome — the
+    /// status bar and the timeline — is the part this function adds, and it is
+    /// a bug fix: without it the scale draws *under* those surfaces and is
+    /// simply not on screen. Measured at 402x874 the expanded transport spans
+    /// `[0,772]-[402,825]` and swallowed the bar at `[16,789]-[386,809]`, its
+    /// tick labels and its `dBZ` title whole; at 1400x900 the vertical scale's
+    /// bottom labels sat inside the status bar at `[8,860]-[1394,892]`.
+    ///
+    /// **Only chrome that overlaps the columns this pane's scale occupies
+    /// counts**, and the two orientations occupy different ones:
+    ///
+    /// * A **horizontal** scale is a band across the pane's whole width, so
+    ///   any overlap at all hides part of it.
+    /// * A **vertical** scale stands in the gutter along the pane's right
+    ///   edge, so the span is [`pane_render::color_scale_gutter`] wide — the
+    ///   painter's own answer, tick labels and unit title included, not the
+    ///   bar alone. Testing the pane's literal right edge instead does not
+    ///   work: the status bar is inset 6pt from the panel, so it would read as
+    ///   missing a scale it covers outright. That was the first cut here, and
+    ///   it left the desktop defect entirely unfixed.
+    ///
+    /// Either way a chip over one end of the bar takes that end's tick labels
+    /// with it, so the whole scale lifts rather than being cropped.
+    ///
+    /// The gutter is measured against the **unclipped** pane rect, which is
+    /// not circular: of everything `color_scale_gutter` reads, only its
+    /// "pane too small for a bar" bail looks at the rect at all, and a pane
+    /// that draws no bar has nothing for this floor to protect.
+    ///
+    /// The timeline form is chosen by `timeline_collapsed` rather than by
+    /// probing both ids: egui keeps an `Area`'s last rect in memory after it
+    /// stops being shown, so the form that is *not* up would answer with a
+    /// stale rect and the scale would dodge a bar that is not there.
+    ///
+    /// There is no layout loop in reading the timeline's rect back: neither it
+    /// nor the status bar positions itself off any colour-scale rect.
+    fn color_scale_floor(
+        &self,
+        ui: &egui::Ui,
+        panel_rect: egui::Rect,
+        pane_rect: egui::Rect,
+        pane_idx: usize,
+        horizontal_color_scale: bool,
+    ) -> f32 {
+        let scale_left = if horizontal_color_scale {
+            pane_rect.left()
+        } else {
+            pane_rect.right()
+                - pane_render::color_scale_gutter(
+                    ui.painter(),
+                    pane_rect,
+                    horizontal_color_scale,
+                    pane_idx,
+                    &self.panes[pane_idx],
+                    &self.overlays,
+                    &self.preferences,
+                )
+        };
+        let timeline = egui::Id::new(if self.timeline_collapsed {
+            "timeline_chip"
+        } else {
+            "timeline"
+        });
+        self.statusbar_rect
+            .into_iter()
+            .chain(ui.ctx().memory(|memory| memory.area_rect(timeline)))
+            // `Rect::NOTHING` is inverted, so a surface that did not draw
+            // fails this test rather than needing a case of its own.
+            .filter(|bar| bar.max.x > scale_left && bar.min.x < pane_rect.right())
+            .map(|bar| bar.top())
+            .fold(panel_rect.bottom() - self.phone_bar_height, f32::min)
+    }
+
+    /// Paint the basemap credit in the map panel's bottom-right corner.
+    ///
+    /// Called once per panel. The corner is contested three ways and the credit
+    /// gives way to all three, because it is the one surface there that may not
+    /// be covered — an obscured notice satisfies neither ODbL nor CC-BY:
+    ///
+    /// * **The colour scale.** Its gutter owns the right edge of a landscape
+    ///   pane and the bottom strip of a portrait one, tick labels included.
+    ///   [`pane_render::color_scale_free_rect`] is the same answer every other
+    ///   floating chrome positions against, so the credit asks it rather than
+    ///   re-deriving the bar's arithmetic. It is a *per-pane* rect, so the
+    ///   question is put to the pane holding the panel's bottom-right corner —
+    ///   only that pane's legend can reach the credit.
+    /// * **The floating status bar,** which spans nearly the panel's whole
+    ///   width. It is drawn in `render_shell`, before the pane loop, so
+    ///   `statusbar_rect` is this frame's.
+    /// * **The timeline** — expanded transport, or the collapsed chip, which
+    ///   anchors to this very corner. Both draw *after* the pane loop, so their
+    ///   rects come from the layout memory the last frame left, exactly as
+    ///   `pill_row_clearance` and `render_timeline_chip` read theirs.
+    ///
+    /// The lift test is whether a bar's span overlaps the credit's **own
+    /// span**, `[left, right]`. It was the credit's right edge alone until the
+    /// 2026-08-27 sweep, and that is precisely the defect that sweep found:
+    /// the expanded transport is a fixed ~880pt-wide *centred* area, so on a
+    /// panel wide enough to leave the corner free but not wide enough to clear
+    /// the whole notice, the transport's right edge lands **inside** the
+    /// credit's box. An edge test sees no collision there and does not lift,
+    /// and the notice prints on the transport. Measured at 1200x874 the credit
+    /// spanned `[994,1137]` against a transport ending at `1040` — 46pt of
+    /// overlap the edge test could not see; at 800x874 with two panes it
+    /// missed by 4pt. The whole 600-1000 medium band failed this way, in every
+    /// pane count, whenever the transport was expanded.
+    ///
+    /// The span costs nothing in exactness: [`attribution_span`] lays the text
+    /// out from the font rather than reading the last frame's rect, so it is
+    /// as true on the first frame as the edge test was.
+    ///
+    /// A bar that stops short of the notice still does not lift it, which is
+    /// what keeps the M8.1 behaviour the chip wants — a status bar collapsed to
+    /// its restore button leaves the corner open map.
+    ///
+    /// **A portrait pane places the credit the other way up.** There the
+    /// colour scale is a horizontal bar along the pane's bottom, and giving
+    /// way to it upwards puts the notice *over* the bar, in the middle of the
+    /// map. The user asked for it under the bar instead, so the horizontal arm
+    /// hangs the credit off the top of
+    /// [`pane_render::color_scale_under_rect`] — the bar's own pane-edge
+    /// margin — with an `Align2::RIGHT_TOP` pivot, which puts it below the bar
+    /// whatever height the notice lays out at rather than by arithmetic that
+    /// would have to guess.
+    ///
+    /// That arm does **not** lift over bottom chrome, and it cannot: lifting
+    /// is exactly what put the notice over the bar. Measured at 402x874 the
+    /// cost is real and is not this function's to fix — the expanded transport
+    /// spans `[0,772]-[402,825]` and so already covers the whole colour-scale
+    /// strip, the bar at `[16,789]-[386,809]` and its `dBZ` title included.
+    /// Anything under that bar is under the transport too. The credit is
+    /// visible there only once the scale itself is, which is a question about
+    /// `color_scale_floor`, not about where the credit hangs.
+    fn draw_basemap_attribution(
+        &mut self,
+        ui: &egui::Ui,
+        panel_rect: egui::Rect,
+        horizontal_color_scale: bool,
+        pane_count: usize,
+    ) {
+        let ctx = ui.ctx();
+
+        let corner = panel_rect.max - egui::vec2(1.0, 1.0);
+        let corner_idx = (0..pane_count)
+            .find(|&idx| self.pane_layout.pane_rect(idx, panel_rect).contains(corner))
+            .unwrap_or(0);
+        let corner_rect = self.pane_layout.pane_rect(corner_idx, panel_rect);
+        let chrome = pane_render::clear_of_bottom_chrome(
+            corner_rect,
+            self.color_scale_floor(
+                ui,
+                panel_rect,
+                corner_rect,
+                corner_idx,
+                horizontal_color_scale,
+            ),
+        );
+        let free = pane_render::color_scale_free_rect(
+            ui.painter(),
+            chrome,
+            horizontal_color_scale,
+            corner_idx,
+            &self.panes[corner_idx],
+            &self.overlays,
+            &self.preferences,
+        );
+
+        let right = free.right() - ATTRIBUTION_INSET;
+        let left = right - attribution_span(ui.painter());
+        let (pivot, y) = match pane_render::color_scale_under_rect(chrome, horizontal_color_scale) {
+            // Portrait: under the bar, hung off the top of the bar's own
+            // margin so the notice's laid-out height cannot push it back over
+            // the bar.
+            Some(under) => (egui::Align2::RIGHT_TOP, under.top()),
+            None => {
+                // Which timeline form to ask about, by the flag rather than by
+                // probing both ids: egui keeps an `Area`'s last rect in memory
+                // after it stops being shown, so the form that is *not* up
+                // would answer with a stale rect and the credit would dodge a
+                // bar that is not there.
+                let timeline = egui::Id::new(if self.timeline_collapsed {
+                    "timeline_chip"
+                } else {
+                    "timeline"
+                });
+                let bottom = self
+                    .statusbar_rect
+                    .into_iter()
+                    .chain(ctx.memory(|memory| memory.area_rect(timeline)))
+                    .filter(|bar| bar.min.x <= right && left <= bar.max.x)
+                    .map(|bar| bar.top() - ATTRIBUTION_INSET)
+                    .fold(free.bottom() - ATTRIBUTION_INSET, f32::min)
+                    // A panel whose whole bottom is chrome still keeps the
+                    // notice on screen rather than lifting it off the top edge.
+                    .max(free.top() + ATTRIBUTION_INSET + ATTRIBUTION_TEXT_SIZE);
+                (egui::Align2::RIGHT_BOTTOM, bottom)
+            }
+        };
+
+        let area = egui::Area::new(egui::Id::new("basemap_attribution"))
+            .order(egui::Order::Middle)
+            .pivot(pivot)
+            .fixed_pos(egui::pos2(right, y))
+            .show(ctx, |ui| {
+                // A backdrop rather than a bare link: the notice is painted
+                // straight onto radar over basemap, and a hyperlink-blue line
+                // on a bright cell is not a legible notice. See
+                // `super::shell::notice_frame` for why this one frame is not
+                // `chrome_frame`.
+                //
+                // The words are `text_color`, not the stock `hyperlink_color`
+                // a `Link` would paint itself in, and that is the *backdrop's*
+                // doing: measured against `window_fill`, the link blue reads
+                // 7.08:1 in dark but 2.77:1 in light, under the 4.5:1 a body
+                // line needs. `text_color` is 5.12:1 and 7.59:1. Putting an
+                // opaque surface behind the notice is what fixes the colour it
+                // had to be legible against, so the colour moves with it. It
+                // is still a link: pointer cursor, and a hover underline in
+                // `hyperlink_color`.
+                let words = ui.visuals().text_color();
+                super::shell::notice_frame(ui.visuals()).show(ui, |ui| {
+                    ui.hyperlink_to(
+                        egui::RichText::new(crate::tiles::ATTRIBUTION_TEXT)
+                            .size(ATTRIBUTION_TEXT_SIZE)
+                            .color(words),
+                        crate::tiles::ATTRIBUTION_URL,
+                    );
+                });
+            });
+
+        #[cfg(test)]
+        self.probes.last_attribution.push(area.response.rect);
+        #[cfg(not(test))]
+        let _ = area;
     }
 
     /// Advance the armed cross-section draw by one frame's gesture.
@@ -1729,6 +1988,38 @@ fn axes(east: f64, north: f64, decimals: usize) -> String {
 
 /// Inset of the caption from the pane's top-left corner, points.
 const CAPTION_MARGIN: f32 = 8.0;
+
+/// The basemap credit's gap from whatever bounds it: the colour scale's free
+/// rect on both axes, and the top edge of any bottom chrome it had to lift
+/// over. The status bar's own `BAR_INSET` is the same 8pt, so a credit resting
+/// on the bar reads as one gap rather than two different ones.
+const ATTRIBUTION_INSET: f32 = 8.0;
+
+/// Point size for the credit. Small on purpose: it is a legal notice that has
+/// to be legible, not a label competing with the map.
+const ATTRIBUTION_TEXT_SIZE: f32 = 10.0;
+
+/// How wide the credit will lay out, `notice_frame`'s side margins included.
+///
+/// Measured from the font here rather than read back off the last frame's
+/// `Area` response, because the placement that needs it runs *before* the area
+/// is shown: on the first frame the response rect is still `Rect::NOTHING`,
+/// and a lift test reading it would put the notice on the very chrome it is
+/// supposed to clear, then correct itself a frame later as a visible jump.
+///
+/// The frame's own padding comes from [`super::shell::NOTICE_MARGIN_X`], not a
+/// second spelling of it, so the two cannot drift.
+fn attribution_span(measure: &egui::Painter) -> f32 {
+    let text = measure
+        .layout_no_wrap(
+            crate::tiles::ATTRIBUTION_TEXT.to_owned(),
+            egui::FontId::proportional(ATTRIBUTION_TEXT_SIZE),
+            egui::Color32::WHITE,
+        )
+        .rect
+        .width();
+    text + 2.0 * f32::from(super::shell::NOTICE_MARGIN_X)
+}
 
 /// Draw the caption in the pane's top-left corner, over the volume.
 fn paint_volume_caption(

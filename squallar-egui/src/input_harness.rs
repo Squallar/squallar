@@ -1729,6 +1729,11 @@ impl InputHarness {
         self.gui.map_panel_rect_for_test()
     }
 
+    /// Every basemap credit the last frame drew.
+    pub(crate) fn attribution_rects(&self) -> &[egui::Rect] {
+        self.gui.attribution_rects_for_test()
+    }
+
     /// Pan pane `idx` until `site`'s icon is drawn at `target`, as dragging the
     /// map there does.
     pub(crate) fn place_site_at(&mut self, idx: usize, site: &str, target: egui::Pos2) {
