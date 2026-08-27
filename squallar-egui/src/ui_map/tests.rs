@@ -438,9 +438,11 @@ fn a_drag_whose_release_is_never_seen_stops_the_pane() {
         "a pane that is not drawn moved anyway"
     );
 
-    // And back. Two seconds of frames with the pointer up and still.
+    // And back. Two seconds of frames with the pointer up and still: one for
+    // walkers to settle, one in which it must ask for nothing.
     h.make_pane_map(0);
-    h.frames_for(120, DT);
+    map_repaint_requests(&mut h, 60, DT);
+    let asked = map_repaint_requests(&mut h, 60, DT);
 
     let memory = memory_of(&h);
     let now = centre(&h);
@@ -460,8 +462,113 @@ fn a_drag_whose_release_is_never_seen_stops_the_pane() {
         "the pane still believes a drag is in progress"
     );
     assert_eq!(
-        h.repaint_delay(),
-        std::time::Duration::MAX,
-        "something is still demanding repaints two seconds after the last input"
+        0, asked,
+        "the map asked for {asked} repaints over the second after it settled, \
+         two seconds after the last input"
     );
+}
+
+/// The other way a pan drag loses its release: the pointer **leaves the
+/// window** while the button is still down. Distinct from
+/// [`a_drag_whose_release_is_never_seen_stops_the_pane`] in both cause and
+/// symptom — there the widget was not drawn and the map panned at constant
+/// velocity forever; here the widget is drawn every frame, egui's latched
+/// `primary_down()` survives the `PointerGone`, and `Center::classify` reads
+/// the still-latched `dragged()` as `Gesture::Dragging(Vec2::ZERO)`: a live
+/// drag with a zero delta. The map does not move an inch and asks for a
+/// repaint every frame, forever.
+///
+/// `egui-winit` maps `WindowEvent::CursorLeft` to a bare
+/// `egui::Event::PointerGone` and forgets the pointer position, so the real
+/// button-up out there is dropped on the floor (`egui-winit-0.35.0`,
+/// `lib.rs:796`) — there is no later event that unwinds this by itself. egui
+/// clears neither `pointer.down` nor `dragged` on that event, by documented
+/// intent: a slider drag is meant to survive leaving the viewport
+/// (`egui-0.35.0` `input_state/mod.rs:1199`, `interaction.rs:134`).
+///
+/// Measured on this exact sequence with the fix reverted: the map asked for a
+/// repaint on **60 of 60** frames of the second below, with a drift of
+/// (0, 0) tile-pixels and `repaint_delay` 0 ns. Invisible on a desktop; on a
+/// phone it is the screen never going idle.
+#[test]
+fn a_drag_released_outside_the_window_stops_the_pane() {
+    use crate::input_harness::InputHarness;
+    const DT: f64 = 1.0 / 60.0;
+
+    let memory_of = |h: &InputHarness| h.gui().pane(0).expect("pane 0").map_memory.clone();
+    let centre = |h: &InputHarness| memory_of(h).detached().expect("a dragged pane is detached");
+
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.warm_up();
+    let start = h.pane_rects()[0].center();
+
+    h.mouse_press(start);
+    h.frame();
+    h.mouse_move(start + egui::vec2(60.0, 0.0));
+    h.frame();
+    assert!(
+        memory_of(&h).dragging(),
+        "precondition: 60 px of primary drag did not start a pan"
+    );
+    let dragged_to = centre(&h);
+
+    // The cursor leaves the window, button still down. No release is reported,
+    // now or ever.
+    h.cursor_left();
+    // One second for walkers to notice and settle, then a second in which it
+    // must not ask for anything at all.
+    map_repaint_requests(&mut h, 60, DT);
+    let asked = map_repaint_requests(&mut h, 60, DT);
+
+    let memory = memory_of(&h);
+    let now = centre(&h);
+    let deg_per_tile_px = 360.0 / (256.0 * 2f64.powf(memory.zoom()));
+    let (dlon, dlat) = (now.x() - dragged_to.x(), now.y() - dragged_to.y());
+    // The symptom first: a full-rate repaint demand with the map standing
+    // still. The two below say the map is where it was and knows the drag is
+    // over, which is the state that produced it.
+    assert_eq!(
+        0, asked,
+        "the map asked for {asked} repaints over the second after the pointer \
+         left the window, with nothing moving"
+    );
+    assert!(
+        dlon.abs() < deg_per_tile_px && dlat.abs() < deg_per_tile_px,
+        "the pane drifted ({}, {}) tile-pixels after the pointer left",
+        dlon / deg_per_tile_px,
+        dlat / deg_per_tile_px
+    );
+    assert!(
+        !memory.dragging(),
+        "the pane still believes a drag is in progress two seconds after the \
+         pointer left the window"
+    );
+}
+
+/// How many times `Map::show` asked for another frame over the last `frames`.
+///
+/// `InputHarness::repaint_delay` cannot answer this: it is a `min` over
+/// everything the whole app asked for, and two of the app's other askers are
+/// **wall-clock driven**, so under a loaded parallel test run they land inside
+/// any window a map test picks. Measured over one 120-frame window with the
+/// map provably settled: `tile_source.rs:844` (a tile completion arriving on a
+/// background thread) 56 times, egui's own `area.rs:640` 60 times, against
+/// `map.rs:159` twice — the settle. Reading the cause instead of the delay is
+/// what makes the assertion about the map.
+fn map_repaint_requests(
+    h: &mut crate::input_harness::InputHarness,
+    frames: usize,
+    dt: f64,
+) -> usize {
+    let mut asked = 0;
+    for _ in 0..frames {
+        h.frame_after(dt);
+        asked += h
+            .ctx()
+            .repaint_causes()
+            .iter()
+            .filter(|cause| cause.file.ends_with("walkers/src/map.rs"))
+            .count();
+    }
+    asked
 }

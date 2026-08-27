@@ -451,6 +451,7 @@ fn frame(pressed: bool, released: bool, down: bool, x: f32) -> PointerFrame {
         down,
         pos: egui::pos2(x, 100.0),
         time: 0.0,
+        stale_down: false,
     }
 }
 
@@ -555,5 +556,202 @@ fn every_armed_frame_suppresses_panning_and_fires_no_overlay_click() {
             "{gesture:?} fired an overlay click from a press that starts a line"
         );
         assert_eq!(armed.pointer().long_press_pos, None, "{gesture:?}");
+    }
+}
+
+// --- the phantom latched button --------------------------------------------
+//
+// Two different ways a pan drag loses its ending, and they are not the same
+// bug. `a_drag_whose_release_is_never_seen_stops_the_pane` (`ui_map/tests.rs`)
+// is the one where the *widget* stops being shown: the release edge is offered
+// and nobody is there to take it, and the map then panned at constant velocity
+// forever. These are the other one: the *pointer* goes away while the widget
+// is drawn every frame, egui goes on latching `primary_down()`, and the map
+// repaints at full rate without moving at all.
+
+/// The cursor leaves the window mid-drag. `down` goes false and `stale_down`
+/// goes true on the same frame, and stays true — egui has no later event that
+/// would unwind it, because a release out there is dropped.
+#[test]
+fn a_pointer_that_left_the_window_reads_as_a_stale_down() {
+    let mut d = TrackerDriver::new();
+    let pos = egui::pos2(100.0, 100.0);
+
+    let pressed = d.frame(vec![button(egui::PointerButton::Primary, true, pos)]);
+    assert!(pressed.down, "precondition: the press did not take");
+    assert!(
+        !pressed.stale_down,
+        "a believed down must never also be a stale one"
+    );
+
+    let gone = d.frame(vec![egui::Event::PointerGone]);
+    assert!(!gone.down, "the pointer is gone; nothing is held");
+    assert!(
+        gone.stale_down,
+        "egui still latches the button down, and nothing said so"
+    );
+
+    // Ten seconds of the silence that follows a cursor that left.
+    for frame in 0..600 {
+        let quiet = d.frame(vec![]);
+        assert!(!quiet.down, "frame {frame}");
+        assert!(
+            quiet.stale_down,
+            "frame {frame}: the phantom stopped being reported while it is \
+             still there"
+        );
+    }
+
+    // A real press is the one thing that clears it.
+    let repressed = d.frame(vec![button(egui::PointerButton::Primary, true, pos)]);
+    assert!(repressed.down);
+    assert!(!repressed.stale_down);
+}
+
+/// The control: an ordinary press-drag-release never reports a stale down, so
+/// the test above is not agreeing with a constant.
+#[test]
+fn an_ordinary_drag_never_reads_as_a_stale_down() {
+    let mut d = TrackerDriver::new();
+    let pos = egui::pos2(100.0, 100.0);
+
+    for events in [
+        vec![button(egui::PointerButton::Primary, true, pos)],
+        vec![egui::Event::PointerMoved(pos + egui::vec2(30.0, 0.0))],
+        vec![egui::Event::PointerMoved(pos + egui::vec2(60.0, 0.0))],
+        vec![button(
+            egui::PointerButton::Primary,
+            false,
+            pos + egui::vec2(60.0, 0.0),
+        )],
+        vec![],
+    ] {
+        assert!(
+            !d.frame(events).stale_down,
+            "an ordinary drag reported a phantom"
+        );
+    }
+}
+
+/// A hand-built [`PointerFrame`] whose latched button is a phantom.
+fn stale_frame() -> PointerFrame {
+    PointerFrame {
+        pressed: false,
+        released: false,
+        down: false,
+        pos: egui::pos2(10.0, 10.0),
+        time: 0.0,
+        stale_down: true,
+    }
+}
+
+/// A hand-built [`PointerFrame`] with no pointer activity at all.
+fn quiet_frame() -> PointerFrame {
+    PointerFrame {
+        stale_down: false,
+        ..stale_frame()
+    }
+}
+
+/// A pan the map is in the middle of when the pointer goes away is suppressed,
+/// and **stays** suppressed after walkers has settled the map — the phantom
+/// outlives the settle, so a suppression that lasted one frame would let the
+/// map back into `Center::Moving` on the next.
+#[test]
+fn a_stranded_pan_stays_suppressed_until_the_pointer_comes_back() {
+    let mut gestures = TouchGestures::default();
+    let mut memory = walkers::MapMemory::default();
+
+    // Nothing is stranded while the pointer is real.
+    memory.center_at(walkers::lon_lat(17.0, 51.0));
+    assert!(!gestures.pan_stranded(quiet_frame(), &memory));
+
+    // Mid-pan, the pointer goes away.
+    let mut dragging = walkers::MapMemory::default();
+    dragging.center_at(walkers::lon_lat(17.0, 51.0));
+    drive_into_moving(&mut dragging);
+    assert!(
+        dragging.dragging(),
+        "precondition: the fixture map is not mid-pan"
+    );
+    assert!(gestures.pan_stranded(stale_frame(), &dragging));
+
+    // walkers settles it on that frame; the pointer is still gone, so the
+    // suppression has to hold.
+    dragging.settle();
+    assert!(!dragging.dragging(), "precondition: settle did not settle");
+    for frame in 0..600 {
+        assert!(
+            gestures.pan_stranded(stale_frame(), &dragging),
+            "frame {frame}: the suppression lapsed while the phantom is still there"
+        );
+    }
+
+    // And it ends the moment the pointer is believable again.
+    assert!(!gestures.pan_stranded(quiet_frame(), &dragging));
+}
+
+/// A phantom with no pan behind it suppresses nothing: a cancelled touch that
+/// was not panning the map leaves the map pannable, which is what
+/// `touch_cancelled_mid_drag_releases_the_map` pins at the harness level.
+#[test]
+fn a_phantom_with_no_pan_behind_it_suppresses_nothing() {
+    let mut gestures = TouchGestures::default();
+    let mut memory = walkers::MapMemory::default();
+    memory.center_at(walkers::lon_lat(17.0, 51.0));
+
+    for frame in 0..600 {
+        assert!(
+            !gestures.pan_stranded(stale_frame(), &memory),
+            "frame {frame}: a map that is not panning had its pan suppressed"
+        );
+    }
+}
+
+/// Put a [`walkers::MapMemory`] into `Center::Moving` the only way a caller
+/// can: through the widget's own gesture handling. Rather than asserting on a
+/// state this crate cannot name, the loop below stops as soon as walkers says
+/// `dragging()`.
+fn drive_into_moving(memory: &mut walkers::MapMemory) {
+    let ctx = egui::Context::default();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+    let mut pos = egui::pos2(400.0, 300.0);
+    // The first frame only registers the widget — egui resolves a press
+    // against the *previous* frame's rects, so a press on frame zero hits
+    // nothing at all.
+    let mut events = Vec::new();
+    let mut time = 1.0;
+
+    for frame in 0..20 {
+        let raw_input = egui::RawInput {
+            screen_rect: Some(screen),
+            time: Some(time),
+            events: std::mem::take(&mut events),
+            ..Default::default()
+        };
+        ctx.begin_pass(raw_input);
+        let mut ui = egui::Ui::new(
+            ctx.clone(),
+            egui::Id::new("stranded_pan_map"),
+            egui::UiBuilder::new().max_rect(screen),
+        );
+        ui.add(walkers::Map::new(
+            None,
+            memory,
+            walkers::lon_lat(17.0, 51.0),
+        ));
+        let _ = ctx.end_pass();
+        if memory.dragging() {
+            return;
+        }
+
+        time += 1.0 / 60.0;
+        if frame == 0 {
+            events.push(egui::Event::PointerMoved(pos));
+            events.push(button(egui::PointerButton::Primary, true, pos));
+        } else {
+            pos += egui::vec2(20.0, 0.0);
+            events.push(egui::Event::PointerMoved(pos));
+        }
     }
 }
