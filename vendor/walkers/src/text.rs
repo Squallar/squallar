@@ -1,5 +1,4 @@
-use egui::{Color32, Pos2, Vec2, vec2};
-use geo::{BoundingRect, Coord, Intersects, LineString, Polygon};
+use egui::{Color32, Pos2, Rect, Vec2, vec2};
 
 #[derive(Debug, Clone)]
 pub struct Text {
@@ -32,8 +31,8 @@ impl Text {
 }
 
 pub struct OrientedRect {
-    polygon: Polygon<f32>,
-    bbox: geo::Rect<f32>,
+    corners: [Pos2; 4],
+    bbox: Rect,
 }
 
 impl OrientedRect {
@@ -44,45 +43,68 @@ impl OrientedRect {
         let ux = vec2(half.x * c, half.x * s);
         let uy = vec2(-half.y * s, half.y * c);
 
-        let p0 = center - ux - uy; // top-left
-        let p1 = center + ux - uy; // top-right
-        let p2 = center + ux + uy; // bottom-right
-        let p3 = center - ux + uy; // bottom-left
-
-        let polygon = Polygon::new(
-            LineString::from(vec![
-                Coord { x: p0.x, y: p0.y },
-                Coord { x: p1.x, y: p1.y },
-                Coord { x: p2.x, y: p2.y },
-                Coord { x: p3.x, y: p3.y },
-                Coord { x: p0.x, y: p0.y }, // Close the polygon
-            ]),
-            vec![],
-        );
-
-        let bounding_rect = polygon
-            .bounding_rect()
-            .expect("can not happen because polygon always has some points");
+        let corners = [
+            center - ux - uy, // top-left
+            center + ux - uy, // top-right
+            center + ux + uy, // bottom-right
+            center - ux + uy, // bottom-left
+        ];
 
         Self {
-            polygon,
-            bbox: bounding_rect,
+            corners,
+            bbox: Rect::from_points(&corners),
         }
     }
 
     pub fn top_left(&self) -> Pos2 {
-        self.polygon
-            .exterior()
-            .points()
-            .nth(0)
-            .map(|p| Pos2 { x: p.x(), y: p.y() })
-            .expect("can not happen because polygon always has some points")
+        self.corners[0]
     }
 
     pub fn intersects(&self, other: &OrientedRect) -> bool {
         // Checking bbox first gives huge performance boost.
-        self.bbox.intersects(&other.bbox) && self.polygon.intersects(&other.polygon)
+        self.bbox.intersects(other.bbox) && !separated(&self.corners, &other.corners)
     }
+}
+
+/// The separating-axis test: two convex polygons are disjoint exactly when some
+/// axis perpendicular to an edge of one of them separates their projections.
+/// Opposite edges of a rectangle are parallel, so two of each rectangle's four
+/// edge normals are redundant and four candidate axes decide a pair.
+///
+/// Projections that merely touch are *not* a separation. That is deliberate: it
+/// is what the bounding-box test above reports for touching boxes, so an
+/// axis-aligned pair gets the same answer from both.
+fn separated(a: &[Pos2; 4], b: &[Pos2; 4]) -> bool {
+    let axes = [a[1] - a[0], a[3] - a[0], b[1] - b[0], b[3] - b[0]];
+
+    axes.into_iter().any(|edge| {
+        let axis = edge.rot90();
+        let (a_min, a_max) = project(a, axis);
+        let (b_min, b_max) = project(b, axis);
+        a_max < b_min || b_max < a_min
+    })
+}
+
+/// Extent of a rectangle's corners along `axis`, in units of `axis`'s own
+/// length.
+///
+/// The axis is deliberately left un-normalised. A degenerate rectangle -- zero
+/// width or zero height, which a zero-size galley produces -- contributes a
+/// zero-length edge, and normalising it would divide by zero. Un-normalised it
+/// collapses every projection to the same value, so that axis reports "not
+/// separating" and carries no weight, which is the correct answer rather than a
+/// special case.
+fn project(rect: &[Pos2; 4], axis: Vec2) -> (f32, f32) {
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+
+    for corner in rect {
+        let d = corner.to_vec2().dot(axis);
+        min = min.min(d);
+        max = max.max(d);
+    }
+
+    (min, max)
 }
 
 // Tracks areas occupied by texts to avoid overlapping them.
@@ -102,5 +124,140 @@ impl OccupiedAreas {
         } else {
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::pos2;
+    use std::f32::consts::FRAC_PI_4;
+
+    fn rect(cx: f32, cy: f32, angle: f32, w: f32, h: f32) -> OrientedRect {
+        OrientedRect::new(pos2(cx, cy), angle, vec2(w, h))
+    }
+
+    /// Every expected value below was read off the `geo::Polygon`-based
+    /// predicate this test module replaced, on these exact inputs, before it
+    /// was deleted.
+    ///
+    /// For an axis-aligned pair the bounding-box test is already exact, so the
+    /// separating-axis test has to agree with it case for case -- including the
+    /// two touching cases, where both say "overlapping".
+    #[test]
+    fn axis_aligned_answers_match_the_bounding_box_exactly() {
+        let a = || rect(5., 5., 0., 10., 10.);
+
+        let cases = [
+            ("disjoint", rect(25., 5., 0., 10., 10.), false),
+            ("touching along an edge", rect(15., 5., 0., 10., 10.), true),
+            ("touching at a corner", rect(15., 15., 0., 10., 10.), true),
+            ("overlapping", rect(8., 8., 0., 10., 10.), true),
+            ("one contains the other", rect(5., 5., 0., 2., 2.), true),
+            ("identical", rect(5., 5., 0., 10., 10.), true),
+        ];
+
+        for (name, b, expected) in cases {
+            let a = a();
+            assert_eq!(a.intersects(&b), expected, "{name}");
+            assert_eq!(b.intersects(&a), expected, "{name}, reversed");
+            assert_eq!(
+                a.intersects(&b),
+                a.bbox.intersects(b.bbox),
+                "{name}: axis-aligned, so the bounding box is already the exact answer"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rotated_rect_overlapping_an_axis_aligned_one_is_detected() {
+        let square = rect(0., 0., 0., 4., 4.);
+        let bar = rect(2.5, 0., FRAC_PI_4, 4., 1.);
+
+        assert!(square.intersects(&bar));
+        assert!(bar.intersects(&square));
+    }
+
+    /// The case that proves the axis test is doing real work: two thin bars
+    /// crossed at right angles, far enough apart to be plainly disjoint, whose
+    /// bounding boxes nonetheless overlap. Anything that answered from the
+    /// bounding box alone would report these as colliding and suppress a label
+    /// that has room to draw.
+    #[test]
+    fn a_rotated_pair_the_bounding_box_calls_overlapping_is_separated() {
+        let a = rect(0., 0., FRAC_PI_4, 10., 1.);
+        let b = rect(6., -6., -FRAC_PI_4, 10., 1.);
+
+        assert!(
+            a.bbox.intersects(b.bbox),
+            "the premise: an AABB-only test would call these overlapping"
+        );
+        assert!(!a.intersects(&b));
+        assert!(!b.intersects(&a));
+    }
+
+    /// The reason all four axes are candidates rather than two. A rectangle's
+    /// two distinct edge normals point along its own length and its own width,
+    /// and a rotated rect can be cleared of a neighbour along either -- past its
+    /// end, or off its side. Neither case is decided by the other's axis, nor by
+    /// either axis of the axis-aligned square, whose two are just `x` and `y`
+    /// and are already spent by the bounding-box check.
+    ///
+    /// Asserted both ways round. Between the four assertions here, every one of
+    /// the four slots in `separated`'s axis list is load-bearing: replacing any
+    /// single one with a duplicate of its neighbour turns one of them red.
+    #[test]
+    fn a_rotated_rect_is_separated_along_either_of_its_own_axes() {
+        let bar = || rect(0., 0., FRAC_PI_4, 10., 6.);
+
+        for (name, square) in [
+            ("past the bar's end", rect(6.5, 6.5, 0., 4., 4.)),
+            ("off the bar's side", rect(-6., 6., 0., 4., 4.)),
+        ] {
+            let bar = bar();
+
+            assert!(
+                bar.bbox.intersects(square.bbox),
+                "{name}: the premise -- an AABB-only test would call these overlapping"
+            );
+            assert!(!bar.intersects(&square), "{name}");
+            assert!(!square.intersects(&bar), "{name}, reversed");
+        }
+    }
+
+    #[test]
+    fn degenerate_rects_do_not_panic() {
+        let area = rect(5., 5., 0., 10., 10.);
+
+        let point_inside = rect(5., 5., 0., 0., 0.);
+        let point_outside = rect(50., 50., 0., 0., 0.);
+        let segment_inside = rect(5., 5., 0., 10., 0.);
+        let segment_touching = rect(15., 5., 0., 10., 0.);
+        let rotated_segment = rect(5., 5., FRAC_PI_4, 10., 0.);
+
+        assert!(area.intersects(&point_inside));
+        assert!(point_inside.intersects(&area));
+        assert!(!area.intersects(&point_outside));
+        assert!(!point_outside.intersects(&area));
+        assert!(area.intersects(&segment_inside));
+        assert!(area.intersects(&segment_touching));
+        assert!(area.intersects(&rotated_segment));
+        assert!(point_inside.intersects(&point_inside));
+        assert!(!point_inside.intersects(&point_outside));
+    }
+
+    #[test]
+    fn occupied_areas_refuses_the_second_of_two_overlapping_labels() {
+        let mut occupied = OccupiedAreas::new();
+
+        assert!(occupied.try_occupy(rect(5., 5., 0., 10., 10.)));
+        assert!(!occupied.try_occupy(rect(8., 8., 0., 10., 10.)));
+        assert!(occupied.try_occupy(rect(25., 5., 0., 10., 10.)));
+    }
+
+    #[test]
+    fn top_left_is_the_corner_the_galley_is_drawn_from() {
+        let unrotated = rect(5., 5., 0., 10., 4.);
+        assert_eq!(unrotated.top_left(), pos2(0., 3.));
     }
 }
