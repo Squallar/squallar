@@ -388,3 +388,282 @@ fn the_clamp_latitude_is_the_one_whose_mercator_y_is_pi() {
         "the truncation was measured at 125.51 m of meridian, got {short_m}"
     );
 }
+
+// ── The tile span: what the viewport needs, and nothing else. ──
+
+/// The canvas the cache tiers in `tile_source` are sized against.
+const CANVAS: egui::Vec2 = egui::vec2(1920.0, 1080.0);
+
+/// Half a point. A gap this sweep is hunting is a whole tile column — 256
+/// points at a whole zoom and 181 at the worst half-step — so the bar is
+/// ~360x smaller than the smallest defect it must catch, and only wide enough
+/// to absorb `Projector`'s `f32` return.
+const TOL_POINTS: f32 = 0.5;
+
+/// Where each sweep case centres the viewport. Mid-latitude, the far north
+/// where Mercator's `y` bends hardest, the origin, the south, and hard against
+/// each of the four grid edges where `tile_index`'s clamp bites.
+const SPAN_ANCHORS: &[(f64, f64)] = &[
+    (35.3331, -97.2778),  // KTLX Oklahoma City OK
+    (65.0351, -147.5014), // PAPD Fairbanks AK — highest-latitude WSR-88D
+    (0.0, 0.0),
+    (-44.0, 170.0),
+    (84.9, 0.0),   // hard against the north Mercator limit
+    (-84.9, 0.0),  // and the south
+    (0.0, 179.9),  // hard against the antimeridian, east
+    (0.0, -179.9), // and west
+];
+
+/// Whole zooms and fractional ones on both sides of every `round()` step,
+/// including the half where a tile is at its smallest on the glass.
+const SPAN_ZOOMS: &[f64] = &[
+    0.0, 1.5, 3.0, 3.25, 4.499, 4.5, 4.75, 5.0, 6.5, 8.0, 10.33, 12.0, 14.5, 16.0, 18.0,
+];
+
+/// How far into a tile the viewport's centre is placed, in tiles, on each axis.
+const SUB_TILE_OFFSETS: &[f64] = &[0.0, 0.25, 0.5, 0.75];
+
+/// The fractional tile coordinate of a position — `lon_to_tile_x` and
+/// `lat_to_tile_y` before they floor.
+fn fractional_tile(lat: f64, lon: f64, zoom: u8) -> (f64, f64) {
+    let n = 2f64.powi(i32::from(zoom));
+    let x = (lon + 180.0) / 360.0 * n;
+    let y = (1.0 - lat.to_radians().tan().asinh() / std::f64::consts::PI) / 2.0 * n;
+    (x, y)
+}
+
+/// A projector over `CANVAS` at `zoom`, centred in `anchor`'s tile cell but
+/// `offset` of a tile in from that cell's north-west corner.
+fn projector_for(
+    zoom: f64,
+    anchor: (f64, f64),
+    offset: (f64, f64),
+) -> Option<(walkers::Projector, u8)> {
+    let tile_zoom = zoom.round() as u8;
+    let n = 2f64.powi(i32::from(tile_zoom));
+    let (fx, fy) = fractional_tile(anchor.0, anchor.1, tile_zoom);
+    let (cx, cy) = (fx.floor() + offset.0, fy.floor() + offset.1);
+
+    let lon = cx / n * 360.0 - 180.0;
+    let lat = squallar_geo::mercator_y_to_lat_rad(std::f64::consts::PI * (1.0 - 2.0 * cy / n))
+        .to_degrees();
+
+    let mut memory = walkers::MapMemory::default();
+    memory.set_zoom(zoom).ok()?;
+    Some((
+        walkers::Projector::new(canvas(), &memory, walkers::lat_lon(lat, lon)),
+        tile_zoom,
+    ))
+}
+
+/// The viewport every sweep case draws into.
+fn canvas() -> egui::Rect {
+    egui::Rect::from_min_size(egui::Pos2::ZERO, CANVAS)
+}
+
+/// The screen rect one tile is painted into — the same two corners
+/// `draw_tile_layer` hands `geo_corner_rect`.
+fn tile_rect(projector: &walkers::Projector, x: u32, y: u32, zoom: u8) -> egui::Rect {
+    crate::overlay_cache::geo_corner_rect(
+        projector,
+        (tile_to_lat(y, zoom), tile_to_lon(x, zoom)),
+        (tile_to_lat(y + 1, zoom), tile_to_lon(x + 1, zoom)),
+    )
+}
+
+/// The screen rect the whole span covers — the grid is regular, so the union
+/// of its tiles is a rect.
+fn span_rect(projector: &walkers::Projector, span: TileSpan, zoom: u8) -> egui::Rect {
+    tile_rect(projector, span.west, span.north, zoom)
+        .union(tile_rect(projector, span.east, span.south, zoom))
+}
+
+/// The screen rect the whole slippy grid covers. Past its edges there is no
+/// tile to draw, so this is what bounds what coverage can even mean.
+fn world_rect(projector: &walkers::Projector) -> egui::Rect {
+    crate::overlay_cache::geo_corner_rect(
+        projector,
+        (MERCATOR_LAT_LIMIT_DEG, -180.0),
+        (-MERCATOR_LAT_LIMIT_DEG, 180.0),
+    )
+}
+
+/// Every `(zoom, anchor, offset)` the three span sweeps visit.
+fn span_sweep() -> impl Iterator<Item = (f64, (f64, f64), (f64, f64))> {
+    SPAN_ZOOMS.iter().flat_map(|&zoom| {
+        SPAN_ANCHORS.iter().flat_map(move |&anchor| {
+            SUB_TILE_OFFSETS.iter().flat_map(move |&ox| {
+                SUB_TILE_OFFSETS
+                    .iter()
+                    .map(move |&oy| (zoom, anchor, (ox, oy)))
+            })
+        })
+    })
+}
+
+/// **No gap at any edge.** The tiles the span names cover every point of the
+/// viewport that the slippy grid has a tile for.
+#[test]
+fn the_span_covers_the_whole_viewport() {
+    let mut cases = 0usize;
+    let mut short = Vec::new();
+
+    for (zoom, anchor, offset) in span_sweep() {
+        let Some((projector, tile_zoom)) = projector_for(zoom, anchor, offset) else {
+            continue;
+        };
+        cases += 1;
+
+        let clip = canvas();
+        let span = tile_span(&projector, clip, tile_zoom);
+        let drawn = span_rect(&projector, span, tile_zoom);
+        // Off the grid's own edges there is nothing to cover.
+        let need = clip.intersect(world_rect(&projector));
+        if need.width() <= 0.0 || need.height() <= 0.0 {
+            continue;
+        }
+
+        for (side, missing) in [
+            ("west", drawn.left() - need.left()),
+            ("north", drawn.top() - need.top()),
+            ("east", need.right() - drawn.right()),
+            ("south", need.bottom() - drawn.bottom()),
+        ] {
+            if missing > TOL_POINTS {
+                short.push(format!(
+                    "  z{zoom} anchor {anchor:?} offset {offset:?}: {missing} points of \
+                     the viewport uncovered on the {side} (span {span:?})"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        cases >= 1000,
+        "the sweep must not go vacuous: only {cases} cases ran"
+    );
+    assert!(
+        short.is_empty(),
+        "{} of {cases} sweep cases leave a gap at the viewport edge:\n{}",
+        short.len(),
+        short.join("\n")
+    );
+}
+
+/// **And nothing beyond it.** No tile in the span lies wholly off the
+/// viewport. This is the assertion a `+ 1` on the far end fails: it appends a
+/// full column east of the clip rect and a full row south of it, each tile of
+/// which is fetched, cached and painted for nothing.
+#[test]
+fn the_span_names_no_tile_that_is_wholly_off_the_viewport() {
+    let mut cases = 0usize;
+    let mut wasted = Vec::new();
+    let mut worst = 0.0f32;
+
+    for (zoom, anchor, offset) in span_sweep() {
+        let Some((projector, tile_zoom)) = projector_for(zoom, anchor, offset) else {
+            continue;
+        };
+        cases += 1;
+
+        let clip = canvas();
+        let span = tile_span(&projector, clip, tile_zoom);
+
+        for y in span.north..=span.south {
+            for x in span.west..=span.east {
+                let rect = tile_rect(&projector, x, y, tile_zoom);
+                let overlap_x = rect.right().min(clip.right()) - rect.left().max(clip.left());
+                let overlap_y = rect.bottom().min(clip.bottom()) - rect.top().max(clip.top());
+                let off = (-overlap_x).max(-overlap_y);
+                if off > TOL_POINTS {
+                    worst = worst.max(off);
+                    wasted.push(format!(
+                        "  z{zoom} anchor {anchor:?} offset {offset:?}: tile \
+                         ({x},{y},z{tile_zoom}) is {off} points clear of the viewport"
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        cases >= 1000,
+        "the sweep must not go vacuous: only {cases} cases ran"
+    );
+    assert!(
+        wasted.is_empty(),
+        "{} tiles across {cases} sweep cases are drawn wholly off the viewport \
+         (worst is {worst} points clear); first 12:\n{}",
+        wasted.len(),
+        wasted
+            .iter()
+            .take(12)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// The most tiles the span ever names over this sweep, at a whole zoom.
+/// `tile_source`'s cache-sizing docs quote this figure.
+const WHOLE_ZOOM_WORST: usize = 54;
+/// And between two whole zooms, where a tile is drawn smaller than
+/// `TILE_SIDE_POINTS` and more of them fit. See the test below.
+const BETWEEN_ZOOMS_WORST: usize = 84;
+
+/// What the loop asks for and what the cache is sized to hold are the same
+/// number — at a whole zoom, which is the only claim
+/// [`crate::tile_source::TILE_CACHE_ENTRIES`]'s docs make.
+#[test]
+fn the_span_and_the_cache_sizing_agree_at_a_whole_zoom() {
+    let budget = tiles_resident_for(canvas(), 0, 1);
+
+    let mut whole = 0usize;
+    let mut between = (0usize, String::new());
+
+    for (zoom, anchor, offset) in span_sweep() {
+        let Some((projector, tile_zoom)) = projector_for(zoom, anchor, offset) else {
+            continue;
+        };
+        let drawn = tile_span(&projector, canvas(), tile_zoom).tiles();
+        if (zoom - f64::from(tile_zoom)).abs() < 1e-9 {
+            whole = whole.max(drawn);
+        } else if drawn > between.0 {
+            between = (
+                drawn,
+                format!("z{zoom} anchor {anchor:?} offset {offset:?}"),
+            );
+        }
+    }
+
+    assert_eq!(
+        whole, budget,
+        "at a whole zoom the loop's worst case and `tiles_resident_for` must be \
+         the same number, not merely close"
+    );
+    assert_eq!(
+        whole, WHOLE_ZOOM_WORST,
+        "the whole-zoom worst case over this sweep is a measured figure, and \
+         `tile_source`'s cache-sizing docs quote it"
+    );
+
+    // A record of a gap `tiles_resident_for` has, not a gate on the span:
+    // it measures a tile as TILE_SIDE_POINTS, but between two whole zooms a
+    // tile is drawn `256 * 2^(zoom - round(zoom))` points across — 181 at the
+    // half step — so more of them fit the same window and the figure
+    // understates. The wasm arm is sized against the whole-zoom number only.
+    assert_eq!(
+        between.0, BETWEEN_ZOOMS_WORST,
+        "the between-zooms worst case is a measured figure and moved; the worst \
+         case this sweep found is at {}",
+        between.1
+    );
+    assert!(
+        between.0 > crate::tile_source::WASM_TILE_CACHE_ENTRIES.get(),
+        "between-zooms worst case is {} tiles at {}, which no longer overruns \
+         the {} the wasm arm allows",
+        between.0,
+        between.1,
+        crate::tile_source::WASM_TILE_CACHE_ENTRIES.get()
+    );
+}

@@ -59,9 +59,19 @@ pub const MAX_PARALLEL_DOWNLOADS: usize = 6;
 /// allows the whole application. The tiers follow that crate's budget cascade,
 /// spelled rather than imported.
 ///
-/// What the wasm arm accepts: the working set at native zoom is the window's own
-/// tile count (`tiles::tiles_resident_for`), so a 1920x1080-point canvas keeps
-/// ~54 tiles per source and fits, while 2560x1440 keeps ~77 and overruns.
+/// What the wasm arm accepts: at a whole zoom the working set is *exactly* the
+/// window's own tile count (`tiles::tiles_resident_for`, held equal to what
+/// `tiles::tile_span` asks for by
+/// `the_span_and_the_cache_sizing_agree_at_a_whole_zoom`), so a 1920x1080-point
+/// canvas keeps 54 tiles per source and fits, while 2560x1440 keeps 77 and
+/// overruns.
+///
+/// **Between two whole zooms it is larger, and this arm does not cover that.**
+/// A tile is drawn `256 · 2^(zoom − round(zoom))` points across, down to 181 at
+/// the half step, so more of them fit the same window: 84 at 1920x1080,
+/// measured by the same test, against the 64 here. `tiles_resident_for`
+/// measures a tile as `tiles::TILE_SIDE_POINTS` and carries no scale term, so
+/// it does not report that.
 #[cfg(target_arch = "wasm32")]
 pub const TILE_CACHE_ENTRIES: NonZeroUsize = WASM_TILE_CACHE_ENTRIES;
 /// See the wasm32 arm above.
