@@ -67,6 +67,17 @@ pub(crate) struct PointerFrame {
     /// frame where `down` is true — see [`PointerTracker::read`].
     pub pos: egui::Pos2,
     pub time: f64,
+    /// egui still latches its primary button down, but this tracker does not
+    /// believe it: `raw_down && lost.is_some()`, the exact complement of
+    /// [`PointerFrame::down`] over a latched button.
+    ///
+    /// Every egui read that is derived from that latched button is a phantom
+    /// while this is true — `Response::dragged()` and `dragged_by()` among
+    /// them, neither of which egui clears on an `Event::PointerGone`
+    /// (`egui-0.35.0` `input_state/mod.rs:1199`, `interaction.rs:134`: only a
+    /// `PointerEvent::Released` clears `dragged`). Anything that hands a
+    /// `Response` to a widget that pans on it has to know.
+    pub stale_down: bool,
 }
 
 /// Decides whether egui's latched `pointer.primary_down()` can still be
@@ -200,6 +211,7 @@ impl PointerTracker {
             }
 
             let down = raw_down && self.lost.is_none();
+            let stale_down = raw_down && self.lost.is_some();
 
             // egui only lacks a position between a `PointerGone` and the next
             // positional event (`egui-0.34.1/src/input_state/mod.rs:1111`,
@@ -218,6 +230,7 @@ impl PointerTracker {
                 down,
                 pos: pos.unwrap_or_default(),
                 time: i.time,
+                stale_down,
             }
         })
     }
@@ -536,8 +549,9 @@ pub(crate) struct MapPointerFrame {
     /// [`filter_dialog_blocked`], or `None` if nothing was clicked this frame.
     pub overlay_click_pos: Option<egui::Pos2>,
     pub long_press_pos: Option<egui::Pos2>,
-    /// Whether map panning must be suppressed this frame (a zoom-drag or a
-    /// long press owns the pointer).
+    /// Whether map panning must be suppressed this frame: a zoom-drag or a
+    /// long press owns the pointer, or — see [`TouchGestures::pan_stranded`] —
+    /// there is no pointer left to own it and only egui still thinks there is.
     pub suppress_pan: bool,
 }
 
@@ -589,9 +603,49 @@ pub(crate) struct TouchGestures {
     /// their [`PointerTracker`] — exactly one of the two pipelines runs per
     /// frame for the active pane, so the tracker is read once either way.
     pub armed_drag: ArmedDragDetector,
+    /// Whether the map's pan is stranded on a pointer that is gone. Beside the
+    /// tracker for the same reason `armed_drag` is: both pipelines answer it,
+    /// and it is the tracker's verdict that arms it.
+    stranded_pan: bool,
 }
 
 impl TouchGestures {
+    /// Whether this frame's map pan belongs to a pointer that is gone, and so
+    /// must not reach the map.
+    ///
+    /// walkers pans on `Response::dragged_by()`, and egui clears neither
+    /// `dragged` nor `pointer.down` on an `Event::PointerGone`. So once the
+    /// pointer leaves mid-drag, `Center::classify` reads a live drag with a
+    /// **zero** delta on every frame that follows, and `Map::show` turns the
+    /// resulting `true` into a `request_repaint` forever, with the map
+    /// stationary. That is the opposite symptom to the drag whose release edge
+    /// was never seen, which moved the map without stopping.
+    ///
+    /// Suppressing the pan is what actually ends it: with no pan button
+    /// enabled, walkers takes its own `Gesture::Vanished` arm and settles to
+    /// `Center::Exact` where the drag left it. [`walkers::MapMemory::settle`]
+    /// alone cannot, and was measured not to — `Map::show` runs *after* this
+    /// and puts the map straight back into `Center::Moving` from the same
+    /// latched `dragged()`, on the same frame.
+    ///
+    /// That is also why the answer latches: the phantom outlives any settle,
+    /// so anything that stopped suppressing after one frame would let walkers
+    /// re-enter `Moving` on the next and oscillate, still repainting at full
+    /// rate. Only a real press clears the tracker's verdict — and until one
+    /// arrives there is no pointer to pan with, so nothing is being denied.
+    fn pan_stranded(&mut self, input: PointerFrame, map_memory: &walkers::MapMemory) -> bool {
+        if !input.stale_down {
+            self.stranded_pan = false;
+        } else if map_memory.dragging() {
+            // Asked every frame the phantom lasts, not only the first: a press
+            // that egui decides *is* a drag on the very frame the pointer goes
+            // away reaches `Center::Moving` after this has run, and is caught
+            // on the frame after.
+            self.stranded_pan = true;
+        }
+        self.stranded_pan
+    }
+
     /// Run the touch gesture pipeline for the active pane and resolve this
     /// frame's pointer state.
     pub(crate) fn update(
@@ -621,7 +675,9 @@ impl TouchGestures {
         MapPointerFrame {
             overlay_click_pos,
             long_press_pos,
-            suppress_pan: is_zoom_dragging || long_press_pos.is_some(),
+            suppress_pan: is_zoom_dragging
+                || long_press_pos.is_some()
+                || self.pan_stranded(input, map_memory),
         }
     }
 }
@@ -653,15 +709,21 @@ impl InteractionState {
             PointerModality::Touch => self.gestures.update(ctx, map_memory, pane_rect),
             PointerModality::Mouse => {
                 let mut frame = MapPointerFrame::from_mouse(ctx);
+                // Unconditional, as [`PointerTracker::read`]'s own contract
+                // asks: a frame skipped here is a cancellation missed. Until
+                // this was hoisted out of the `compact` arm, every wide-window
+                // mouse frame skipped it, which is how a pointer that left the
+                // window was never noticed on the desktop at all.
+                let input = self.gestures.tracker.read(ctx);
                 if compact {
                     // The same detector, the same chrome filter, the same
                     // pan suppression the touch pipeline applies — a hold
                     // is a hold whichever pointer spells it.
-                    let input = self.gestures.tracker.read(ctx);
                     let held = filter_dialog_blocked(ctx, self.gestures.long_press.update(input));
                     frame.suppress_pan |= held.is_some();
                     frame.long_press_pos = held;
                 }
+                frame.suppress_pan |= self.gestures.pan_stranded(input, map_memory);
                 frame
             }
         }
