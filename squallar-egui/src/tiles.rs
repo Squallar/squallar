@@ -188,13 +188,58 @@ impl MapTileState {
     }
 }
 
-/// The side of one slippy tile in **points**, at zoom bias 0.
+/// The side of one slippy tile in **points**, at zoom bias 0 and a whole zoom.
 pub const TILE_SIDE_POINTS: f32 = 256.0;
 
+/// The smallest a tile is ever drawn, as a fraction of [`TILE_SIDE_POINTS`].
+///
+/// walkers paints a tile `TILE_SIDE_POINTS · 2^(zoom − tile_zoom)` points
+/// across, and `ui_map_overlays::draw_tile_layer` picks
+/// `tile_zoom = zoom.round() + bias`, so the exponent is
+/// `zoom − round(zoom) − bias`. `zoom − round(zoom)` runs over `[−0.5, 0.5)`
+/// and **attains** `−0.5`, because Rust rounds a half away from zero: a tile is
+/// at its smallest exactly at the half step, `2^−0.5` of a side — 181.02 points
+/// at bias 0 — and more of them fit the same window.
+pub const MIN_TILE_SCALE: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
 /// How many tiles a rect keeps resident, at a zoom bias, across `layers` raster
-/// layers.
+/// layers — **worst case over the whole zoom range**.
+///
+/// This is the sizing answer, and the only one a cache may be built on: the LRU
+/// has to hold what the viewport asks for at every zoom the user can be at, not
+/// only at the whole ones. Between two whole steps a tile shrinks to
+/// [`MIN_TILE_SCALE`] of its side and more of them fit, so this is the larger
+/// figure — 84 against 54 for a 1920x1080-point canvas at bias 0, one layer.
+///
+/// [`tiles_resident_at_whole_zoom`] answers the narrower question, and is only
+/// ever the right one for a claim that is *about* a whole zoom.
 pub fn tiles_resident_for(rect: egui::Rect, zoom_bias: u8, layers: usize) -> usize {
-    let side = TILE_SIDE_POINTS / 2f32.powi(i32::from(zoom_bias));
+    tiles_resident_at_tile_scale(rect, zoom_bias, layers, MIN_TILE_SCALE)
+}
+
+/// How many tiles a rect keeps resident at a **whole** zoom, where a tile is
+/// drawn exactly [`TILE_SIDE_POINTS`] across. Never larger than
+/// [`tiles_resident_for`], and not a cache size.
+pub fn tiles_resident_at_whole_zoom(rect: egui::Rect, zoom_bias: u8, layers: usize) -> usize {
+    tiles_resident_at_tile_scale(rect, zoom_bias, layers, 1.0)
+}
+
+/// The count for a tile drawn `scale · TILE_SIDE_POINTS / 2^zoom_bias` points
+/// across.
+///
+/// `ceil(w / side) + 1`, not `ceil` alone: the grid's phase inside the viewport
+/// is free, so a window `w / side` tiles wide reaches one column further than
+/// its own width. That is tight rather than generous — as the phase approaches
+/// a tile boundary a window of `w / side = 7.5` covers nine columns, and
+/// `ceil(7.5) + 1` is nine. `tiles/tests.rs` holds both 54 and 84 against the
+/// sweep that measures `tile_span` directly rather than deriving it.
+fn tiles_resident_at_tile_scale(
+    rect: egui::Rect,
+    zoom_bias: u8,
+    layers: usize,
+    scale: f32,
+) -> usize {
+    let side = TILE_SIDE_POINTS * scale / 2f32.powi(i32::from(zoom_bias));
     if side <= 0.0 || !rect.width().is_finite() || !rect.height().is_finite() {
         return 0;
     }

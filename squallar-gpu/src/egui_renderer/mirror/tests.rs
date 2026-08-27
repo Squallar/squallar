@@ -69,8 +69,12 @@ fn the_rung_above_the_cap_could_never_fit_the_tile_cache() {
         "bias {cap_bias} does not fit even a 900-point pane, so the cap admits \
          a rung that could never be taken",
     );
-    // Bias 0 must be far inside it, or the LRU was already too small.
-    assert!(squallar_egui::tiles::tiles_resident_for(pane, 0, layers) * 4 <= entries);
+    // Bias 0 must be far inside it, or the LRU was already too small. Three
+    // times over rather than four: `tiles_resident_for` reports the worst
+    // case over the whole zoom range, and a tile drawn `2^-0.5` of a side at
+    // the half step puts 72 tiles here where the old whole-zoom-only measure
+    // saw 50. The working set never moved; what it is measured with did.
+    assert!(squallar_egui::tiles::tiles_resident_for(pane, 0, layers) * 3 <= entries);
 }
 
 /// A frame that cannot afford the rung says so, and the tile bias follows what
