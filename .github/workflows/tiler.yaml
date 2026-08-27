@@ -1,0 +1,88 @@
+name: Tiler
+
+# The gate for `tools/squallar-tiler`, which no other workflow can see.
+#
+# That crate is its own workspace root (its `Cargo.toml` explains why: Cargo
+# resolves a *member's* optional and dev dependencies into the lockfile
+# whether activated or not -- `vendor/walkers/VENDORED.md:667` measures 48
+# lockfile blocks for one compiled package -- and this is build-time tooling
+# that never ships in the app). The price of standing outside is that every
+# root job walks straight past it:
+#
+#   - `clippy.yaml` runs `cargo fmt --all -- --check` and
+#     `cargo clippy --all-targets --all-features`. Both are workspace-scoped,
+#     and `--all` means "every member", not "every directory".
+#   - `build.yaml`'s rows are `--workspace`, and its `standalone` row iterates
+#     `cargo tree --workspace --depth 0`, so both enumerate members.
+#   - `test.yaml` drives one `cargo llvm-cov --no-report --all-features` off the
+#     root manifest, which likewise sees members and nothing else.
+#
+# So without this file, `tools/` is compiled by nothing, formatted by nothing
+# and linted by nothing. That is a real gap and not a hypothetical one: the
+# `tools/nws-zone-pack` precedent left it open, and its own workflow builds the
+# converter only as a step on the way to regenerating an artifact -- there is
+# no fmt or clippy row anywhere for it. This workflow closes the gap for the
+# tiler by naming the manifest explicitly on all four commands.
+#
+# It only gates. Nothing here commits, uploads or publishes, which is why the
+# permissions below are read-only and why there is no app-token step.
+
+on:
+  workflow_dispatch:
+  # Only when something that can change the answer moves. The tiler depends on
+  # no workspace crate by path -- nothing in the app may depend on it, and it
+  # depends on nothing in the app -- so a change anywhere else cannot break it.
+  pull_request:
+    paths:
+      - 'tools/squallar-tiler/**'
+      - '.github/workflows/tiler.yaml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.ref }}'
+  # Nothing is written anywhere, so an obsolete run is only burnt minutes.
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Build, format, lint and test the tiler
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # `rustup show` installs exactly the toolchain rust-toolchain.toml pins,
+      # rather than whatever the runner image ships.
+      - name: Install Rust
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: tiler
+          # Required, not an optimisation. rust-cache defaults to the workspace
+          # at the checkout root, and the tiler is not in it, so without this
+          # line nothing about this job is cached at all. It has no committed
+          # Cargo.lock -- see its `.gitignore` -- so no `--locked` below.
+          workspaces: 'tools/squallar-tiler'
+
+      # Release, because `[profile.release]` is where this crate's opt-level
+      # lives and the archive phase is a throughput tool; a debug-only gate
+      # would never compile the profile it actually runs under.
+      - name: Build
+        run: cargo build --release --manifest-path tools/squallar-tiler/Cargo.toml
+
+      # Check, never write. A formatting *write* in this repo has to be
+      # package-scoped for a different reason -- a workspace-wide one pulls
+      # another worktree's in-flight files in -- but CI never writes anything
+      # back, so this is just an assertion.
+      - name: Check formatting
+        run: cargo fmt --manifest-path tools/squallar-tiler/Cargo.toml -- --check
+
+      # `--all-targets` so the tests and any future benches are linted too, not
+      # only the binary.
+      - name: Run Clippy
+        run: cargo clippy --all-targets --manifest-path tools/squallar-tiler/Cargo.toml -- -D warnings
+
+      - name: Run tests
+        run: cargo test --manifest-path tools/squallar-tiler/Cargo.toml
