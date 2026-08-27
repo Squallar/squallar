@@ -7,13 +7,19 @@ mod map;
 mod memory;
 mod options;
 mod plugin;
+// `style`, `text` and `mvt` are public so that a dependent crate can drive the
+// vector pipeline itself -- call `mvt::render`, hold the returned
+// `Vec<ShapeOrText>`, and do its own text layout and label collision -- rather
+// than only being able to hand bytes to `Tile::new` and take back an opaque
+// tile. That is what lets this workspace keep style loading and label placement
+// in `squallar-egui` instead of growing them as a delta inside this directory.
 #[cfg(feature = "mvt")]
-mod style;
+pub mod style;
 #[cfg(feature = "mvt")]
-mod text;
+pub mod text;
 
 #[cfg(not(feature = "mvt"))]
-mod style {
+pub mod style {
     /// Dummy style, used when `mtv` feature is not enabled.
     #[derive(Default)]
     pub struct Style;
@@ -25,7 +31,7 @@ pub mod mercator;
 #[cfg(feature = "mvt")]
 mod expression;
 #[cfg(feature = "mvt")]
-mod mvt;
+pub mod mvt;
 mod position;
 mod projector;
 pub mod sources;
@@ -41,7 +47,9 @@ pub use position::{Position, lat_lon, lon_lat};
 pub use projector::Projector;
 pub use style::Style;
 #[cfg(feature = "mvt")]
-pub use style::{Color, Filter, Float, Layer, Paint, Value, json};
+pub use style::{Color, Filter, Float, Layer, Layout, Paint, Value, json};
+#[cfg(feature = "mvt")]
+pub use text::{OccupiedAreas, Text};
 pub use tiles::{Tile, TileId, TilePiece, Tiles};
 pub use zoom::InvalidZoom;
 

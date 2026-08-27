@@ -20,6 +20,18 @@ pub struct Style {
     pub layers: Vec<Layer>,
 }
 
+impl Style {
+    /// Parse a style from MapLibre style JSON.
+    ///
+    /// This is the only constructor that reads JSON. The four bundled-style
+    /// constructors it replaces each ended in `.expect("failed to parse style
+    /// JSON")`, so a malformed style aborted the process; this reports the
+    /// failure instead.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum Layer {
@@ -45,6 +57,7 @@ pub enum Layer {
         layout: Layout,
         paint: Option<Paint>,
     },
+    #[serde(rename_all = "kebab-case")]
     Circle {
         source_layer: String,
         filter: Option<Filter>,
@@ -160,5 +173,36 @@ impl Layout {
                 Ok(Value::String(s)) => Some(s),
                 _ => None,
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MapLibre emits `source-layer`; every other variant renames it, so a
+    /// `circle` layer used to fail -- and, because `layers` is one `Vec<Layer>`
+    /// of an internally-tagged enum, took the whole style parse down with it.
+    #[test]
+    fn circle_layer_with_kebab_case_source_layer_parses() {
+        let json = r#"{
+            "layers": [
+                { "type": "background", "paint": {} },
+                { "type": "circle", "source-layer": "poi", "filter": ["==", "k", "v"] }
+            ]
+        }"#;
+
+        let style = Style::from_json(json).expect("style with a circle layer parses");
+        assert_eq!(style.layers.len(), 2);
+
+        let Some(Layer::Circle { source_layer, .. }) = style.layers.get(1) else {
+            panic!("expected the second layer to be a Circle");
+        };
+        assert_eq!(source_layer, "poi");
+    }
+
+    #[test]
+    fn from_json_reports_a_parse_failure_instead_of_panicking() {
+        assert!(Style::from_json("{ \"layers\": [ { \"type\": \"nope\" } ] }").is_err());
     }
 }
