@@ -396,9 +396,20 @@ see at all.
    `Bool(false)` is correct — a silently wrong answer, which is why this one
    had no chance of being noticed as a crash.
 
-Pinned by `expression::tests::test_interpolate_with_an_odd_stop_list_is_an_error`,
-`…::test_interpolate_with_no_stops_is_an_error` and
-`…::test_not_eq_operator_evaluates_both_sides`. Each was written first and run
+   **Half wrong, and corrected by the thirteenth commit.** The objection above
+   is sound — an array on the right *is* an expression and must be evaluated —
+   but "the exact mirror of `==`" was the wrong remedy, because `==` was
+   itself wrong. `property_or_expression` on the right turns any filter
+   *value* that collides with a property key into that property's value. It
+   made twelve of this workspace's own style layers draw nothing. Only the
+   first operand of a comparison is a property key; see
+   [the thirteenth commit](#changed--source-thirteenth-commit-only-the-first-operand-of-a-comparison-is-a-property-key).
+
+Pinned by `expression::tests::test_interpolate_with_an_odd_stop_list_is_an_error`
+and `…::test_interpolate_with_no_stops_is_an_error`. The third pin,
+`…::test_not_eq_operator_evaluates_both_sides`, asserted the wrong semantics and
+was inverted by the thirteenth commit into
+`…::test_not_eq_resolves_only_its_left_operand`. Each was written first and run
 against the unmodified file; the failure text above is what it actually printed.
 The 22 upstream expression tests are unchanged and still pass, so the evaluator's
 existing behaviour is pinned across the change.
@@ -1005,6 +1016,106 @@ which is why the sweep is shaped as it is: with the sign flipped **and** the
 sweep restricted to whole zooms at `tile_zoom == round(zoom)`, 29,106 tiles
 over 896 viewports pass at a worst disagreement of **exactly 0**. A parity test
 that never leaves that row cannot fail for the mistake this arithmetic invites.
+### Changed — source, fourteenth commit: only the first operand of a comparison is a property key
+
+This one **corrects the fifth commit above**, which got `!=` half right and
+half wrong. Read item 3 of that section first; the correction note under it
+points here.
+
+In MapLibre's legacy filter syntax only the **first** operand of a comparison
+names a property. Everything after it is the value being compared against.
+`property_or_expression` implements the first half of that — a `String` that
+happens to be a key in `properties` resolves to that property's value — and it
+is correct on the left operand and wrong on every other one.
+
+`==` resolved **both** operands through it (upstream's own code), and the fifth
+commit made `!=` match, so both did. The consequence is silent: a filter whose
+*value* collides with a property key on the same feature stops comparing a
+property to a value and starts comparing two properties to each other.
+
+**Measured blast radius in this workspace's own styles.** OpenMapTiles'
+`transportation` layer carries a `service` field, and twelve committed layers
+filter on `["==", "class", "service"]` — `{tunnel,road,bridge}_service_{case,fill}`
+across `www/styles/dark.json` and `www/styles/light.json`. On a driveway
+(`class = "service"`, `service = "driveway"`) the evaluator compared
+`"service" == "driveway"` and returned false, so **all twelve drew nothing**,
+with no error and no fallback.
+
+`service` is the **only** such collision: of the 214 `==`/`!=` filters in the
+two styles with a bare-string right operand, it is the one whose value matches
+an OpenMapTiles field name. So this change alters the outcome of exactly those
+twelve layers and nothing else those styles express.
+
+**The fix is not "stop resolving the right operand at all."** That was
+upstream's original `!=` and it is what the fifth commit correctly objected
+to: an *array* on the right is an expression and must be evaluated, or
+`["!=", "class", ["get", "x"]]` compares a resolved property against the
+literal JSON array `["get", "x"]` and is unconditionally true. Both halves are
+needed, and they are different functions:
+
+| operand | resolver | a bare `String` | an `Array` |
+| --- | --- | --- | --- |
+| left | `property_or_expression` | property key | expression |
+| right | `evaluate` | string literal | expression |
+
+That is also exactly what the `in` arm already did with its list items, so
+`==`/`!=` now read the same way `in` does.
+
+Pinned by `expression::tests::test_not_eq_resolves_only_its_left_operand`,
+which replaces the fifth commit's `test_not_eq_operator_evaluates_both_sides`
+— that test asserted the wrong semantics, so it was inverted rather than kept
+— and by
+`expression::tests::test_eq_filter_when_the_value_collides_with_a_property_key`,
+which drives a `Filter` over the real `class`/`service` shape. Both were
+written first and run against the unfixed evaluator. The line numbers below are
+that pre-fix file's and are not where the tests sit now; the assertion text is
+the part to match on:
+
+```text
+---- expression::tests::test_eq_filter_when_the_value_collides_with_a_property_key stdout ----
+thread '…' panicked at vendor/walkers/src/expression.rs:881:9:
+assertion failed: filter.matches(&driveway_context)
+
+---- expression::tests::test_not_eq_resolves_only_its_left_operand stdout ----
+thread '…' panicked at vendor/walkers/src/expression.rs:836:9:
+assertion `left == right` failed
+  left: Bool(true)
+ right: Bool(false)
+```
+
+The new test carries a comment naming `db99c617` and saying why the obvious
+symmetry with the right-hand side is wrong, because that symmetry is what
+produced the defect the first time.
+
+**The 22 upstream expression tests did not move.** That is load-bearing here:
+`test_eq_operator` asserts `["==", "Polska", ["get", "name"]]` is true, which
+is only reachable if the right operand is evaluated as an expression. Upstream's
+own pin is what rules out the simpler "leave the right operand raw" fix, and it
+is why the table above has two different resolvers rather than one.
+
+**Audited, not fixed — the four ordered comparisons never resolve their right
+operand at all.** `<`, `>`, `<=` and `>=` pass the raw `&Value` to `lt`/`lte`,
+whose `_ => false` arm swallows the type mismatch. So
+`[">=", ["get", "a"], ["get", "b"]]` is silently false. This is the *same*
+defect the fifth commit found in `!=`, still present in four arms; it is the
+opposite shape from the one fixed here (under-resolving, not over-resolving),
+it changes behaviour for array right-hand sides, and it wants its own test, so
+it is left for its own commit. Neither committed style has an array on the
+right of an ordered comparison (checked: 0 of 318), so nothing draws wrong
+today.
+
+**Audited, clean.** `has`, `!has` and `get` take their argument as a key via
+`single_string` and never resolve it, which is right. `in` resolves its first
+operand and `evaluate`s the list items, which is right. `any`, `all`, `case`,
+`coalesce`, `!`, `match`, `format` and `interpolate` evaluate sub-expressions
+and touch no property keys. After this commit `property_or_expression` is
+called in exactly seven places and every one of them is a first-or-left
+operand.
+
+**Also audited, and absent rather than wrong:** the legacy `none` and `!in`
+operators are not implemented at all and fall to
+`Error::InvalidExpression`. Neither appears in either committed style, so
+this is latent; adding an operator is not the shape of this commit.
 
 ## What the pin actually selects
 
