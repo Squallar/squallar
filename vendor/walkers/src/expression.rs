@@ -140,18 +140,24 @@ impl Context {
 
                         Ok(Value::Bool(false))
                     }
+                    // Only the FIRST operand of a comparison names a property;
+                    // the rest are the values compared against. So the left
+                    // side goes through `property_or_expression` and the right
+                    // through `evaluate`, which resolves an array as an
+                    // expression but leaves a bare string as the literal it is.
+                    // The four ordered comparisons below resolve their left
+                    // operand the same way, but do not resolve their right at
+                    // all — see VENDORED.md, thirteenth commit.
                     "==" => {
                         let (left, right) = two_elements(arguments)?;
                         Ok(Value::Bool(
-                            self.property_or_expression(left)?
-                                == self.property_or_expression(right)?,
+                            self.property_or_expression(left)? == self.evaluate(right)?,
                         ))
                     }
                     "!=" => {
                         let (left, right) = two_elements(arguments)?;
                         Ok(Value::Bool(
-                            self.property_or_expression(left)?
-                                != self.property_or_expression(right)?,
+                            self.property_or_expression(left)? != self.evaluate(right)?,
                         ))
                     }
                     "<" => {
@@ -805,30 +811,81 @@ mod tests {
         ));
     }
 
-    /// `!=` resolves both of its operands, exactly as `==` does.
+    /// `==` and `!=` resolve their LEFT operand as a property key; the right
+    /// operand is a value.
+    ///
+    /// The symmetry with `==` is real, but it is not a symmetry between the two
+    /// *operands*. In MapLibre's legacy filter syntax only the first operand of
+    /// a comparison names a property; everything after it is the value compared
+    /// against. Sending the right-hand side through `property_or_expression`
+    /// too — which `db99c617` did here, believing it was making `!=` match `==`
+    /// — turns any filter value that happens to collide with a property key
+    /// into that property's value, so the filter silently compares two
+    /// properties to each other and matches nothing.
+    ///
+    /// An *array* on the right is still an expression and is still evaluated.
+    /// That half of `db99c617` was correct, and the second half of this test
+    /// pins it so the fix does not regress to comparing against a raw JSON
+    /// array.
     #[test]
-    fn test_not_eq_operator_evaluates_both_sides() {
+    fn test_not_eq_resolves_only_its_left_operand() {
+        // `park` is both a filter value and a property key on the same feature.
         let properties = HashMap::from([
             ("class".to_string(), json!("park")),
-            ("x".to_string(), json!("park")),
+            ("park".to_string(), json!("municipal")),
         ]);
         let context = Context::new("Point".to_string(), properties, 1);
 
-        // Both sides resolve to "park", so they are equal and `!=` is false.
+        // "park" on the right is the literal string, not a lookup of the `park`
+        // property (which holds "municipal"). `class` is "park", so the two are
+        // equal and `!=` is false.
         assert_eq!(
-            context
-                .evaluate(&json!(["!=", "class", ["get", "x"]]))
-                .unwrap(),
+            context.evaluate(&json!(["!=", "class", "park"])).unwrap(),
             json!(false)
         );
+        assert_eq!(
+            context.evaluate(&json!(["==", "class", "park"])).unwrap(),
+            json!(true)
+        );
 
-        // And the negation of `==` on the very same expression.
+        // An array on the right is an expression, and is evaluated as one.
         assert_eq!(
             context
-                .evaluate(&json!(["==", "class", ["get", "x"]]))
+                .evaluate(&json!(["!=", "class", ["get", "park"]]))
                 .unwrap(),
             json!(true)
         );
+        assert_eq!(
+            context
+                .evaluate(&json!(["==", "class", ["get", "park"]]))
+                .unwrap(),
+            json!(false)
+        );
+    }
+
+    /// The shape that made this reachable: OpenMapTiles' `transportation` layer
+    /// carries a `service` key, and twelve committed style layers filter on
+    /// `["==", "class", "service"]`.
+    #[test]
+    fn test_eq_filter_when_the_value_collides_with_a_property_key() {
+        // A driveway: `class` is "service", and `service` says which kind.
+        let driveway = HashMap::from([
+            ("class".to_string(), json!("service")),
+            ("service".to_string(), json!("driveway")),
+        ]);
+        let driveway_context = Context::new("LineString".to_string(), driveway, 1);
+
+        // A primary road carrying the same `service` key.
+        let primary = HashMap::from([
+            ("class".to_string(), json!("primary")),
+            ("service".to_string(), json!("driveway")),
+        ]);
+        let primary_context = Context::new("LineString".to_string(), primary, 1);
+
+        let filter = Filter(json!(["==", "class", "service"]));
+
+        assert!(filter.matches(&driveway_context));
+        assert!(!filter.matches(&primary_context));
     }
 
     #[test]
