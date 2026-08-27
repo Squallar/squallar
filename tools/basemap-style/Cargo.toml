@@ -1,0 +1,71 @@
+# The one-shot converter that seeded `www/styles/`, and deliberately NOT a
+# member of the squallar workspace.
+#
+# `[workspace]` below is the entire exclusion mechanism, exactly as
+# `tools/squallar-tiler/Cargo.toml` and `tools/nws-zone-pack/Cargo.toml`
+# describe it: the root `Cargo.toml` has no `exclude` key and must not gain
+# one, and this package must not be added to its `members`.
+#
+# The reason to stand outside is sharper here than for either precedent. This
+# crate takes `vendor/walkers` as a *dev*-dependency with its `mvt` feature on,
+# so that the verification suite parses the committed styles through the very
+# type the app deserialises them with. Cargo resolves a member's dev and
+# optional dependencies into the lockfile whether or not anything activates
+# them -- `vendor/walkers/VENDORED.md:667` measures 48 lockfile blocks for that
+# one package -- so making this a member would drag lyon, mvt-reader, color and
+# their trees into the app's lockfile to serve a test that never ships.
+#
+# Consequences of standing outside, which this crate pays for itself:
+#
+#   - `cargo build/test/clippy --workspace` and root `cargo fmt --all` all walk
+#     straight past it. `tools/squallar-tiler` closed that gap with a dedicated
+#     `--manifest-path`-scoped workflow. **This crate has no such workflow
+#     yet**; adding one is a `.github/workflows/**` edit, which the work order
+#     that created this directory explicitly withheld. Until it exists, the
+#     gate is manual -- see DECISIONS.md, "No CI gate reaches this directory".
+#   - Nothing inherits. `version`, `edition` and every dependency are spelled
+#     literally; `workspace = true` cannot resolve from a workspace root to
+#     itself.
+#   - Third-party dependencies are hand-pinned `=x.y.z` to the exact version
+#     the root's `[workspace.dependencies]` pins, so the two graphs cannot
+#     silently diverge on a shared crate.
+#
+# This tool is a SEED, not a pipeline. It ran once, on 2026-08-27, against the
+# CARTO inputs named in DECISIONS.md. `www/styles/*.json` is owned source from
+# that moment on and is edited directly. There is deliberately no workflow, no
+# scheduled regeneration and no `cmp` gate that would re-assert upstream's
+# authorship over files we now own.
+[workspace]
+
+[package]
+name = "basemap-style"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "basemap_style"
+path = "src/lib.rs"
+
+[[bin]]
+name = "basemap-style"
+path = "src/main.rs"
+
+[dependencies]
+# The only runtime dependency. Same pin as the root's
+# `[workspace.dependencies]` (`serde_json = "=1.0.151"`), per the rule above.
+serde_json = "=1.0.151"
+
+[dev-dependencies]
+# The whole point of the verification suite: parse the committed output with
+# the app's own deserialiser rather than a reimplementation of it.
+# `walkers::style` sits behind the `mvt` feature, so the feature is named here
+# even though `squallar-egui` turns it on unconditionally in the root graph --
+# this workspace resolves independently and inherits none of that.
+#
+# A dev-dependency, not a dependency: the converter itself never links walkers.
+walkers = { path = "../../vendor/walkers", features = ["mvt"] }
+
+[profile.release]
+opt-level = 3
+debug = false
