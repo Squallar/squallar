@@ -263,28 +263,41 @@ draw nothing while logging a warning nobody reads.
 
 ---
 
-## No CI gate reaches this directory
+## Only one CI gate reaches this directory
 
 `tools/basemap-style` is its own workspace root, so root `cargo
 build/test/clippy --workspace` and `cargo fmt --all` all walk straight past it —
 the mechanism `.github/workflows/tiler.yaml` documents at length.
 `tools/squallar-tiler` closed that gap with a dedicated `--manifest-path`-scoped
-workflow; **this crate has no equivalent**, because adding one is a
-`.github/workflows/**` edit that the work order creating this directory
-explicitly withheld.
-
-Until such a workflow exists, nothing automatic runs the 29 tests that guard
-`www/styles/`, and a hand-edit to either style file is ungated. The commands are:
+workflow, and **`.github/workflows/basemap-style.yaml` now does the same here**.
+It runs on `ubuntu-24.04` with no container, caches with
+`Swatinem/rust-cache`'s `workspaces: 'tools/basemap-style'` (root caching cannot
+see a non-member), and gates build, fmt, clippy and test — the same four
+commands listed below, which remain what to run by hand:
 
 ```sh
+cargo build --release --manifest-path tools/basemap-style/Cargo.toml
 cargo fmt   --manifest-path tools/basemap-style/Cargo.toml -- --check
 cargo clippy --all-targets --manifest-path tools/basemap-style/Cargo.toml -- -D warnings
 cargo test  --manifest-path tools/basemap-style/Cargo.toml
 ```
 
-Recommendation: copy `tiler.yaml` to `basemap-style.yaml`, changing the two
-paths and adding `www/styles/**` to the `paths:` trigger, since the suite reads
-those files and a style edit must re-run it.
+Its `paths:` trigger is `tools/basemap-style/**`, `www/styles/**` and
+`vendor/walkers/**`. The second is the point of the file: those 29 tests are the
+only automated check anywhere that the committed styles still deserialise, so a
+gate that did not re-run on a style edit would be decorative. The third has no
+counterpart in `tiler.yaml` and is not decoration either — the tiler depends on
+no workspace crate by path, while this crate's dev-dependency is
+`walkers = { path = "../../vendor/walkers", features = ["mvt"] }`, and a change
+to that deserialiser can redden these tests without touching either directory
+above.
+
+Two things it still does not do, named so they are not mistaken for covered.
+It is a `pull_request` gate (plus `workflow_dispatch`), matching `tiler.yaml`
+and unlike `build.yaml`, which also runs on `push` — so a commit that reaches
+`main` without a pull request is not gated by it. And nothing anywhere re-runs
+the converter or compares its output to `www/styles/`; see "Reproducing the
+seed" below for why that is deliberate.
 
 ---
 
