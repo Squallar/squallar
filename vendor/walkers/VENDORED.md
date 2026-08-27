@@ -50,8 +50,8 @@ named defect. It exists because this workspace draws every basemap through
 fidelity, `serde` on `Circle`, visibility — none of which has a seam to work
 around from outside the crate.
 
-The first thing it buys, and the one this commit and the next one are about, is
-a graph trim. walkers reaches the network through its own
+The first thing it buys, and the one the two commits that created this directory
+are about, is a graph trim. walkers reaches the network through its own
 `HttpTiles` / `io` / `pmtiles` stack. **Nothing in this workspace calls it.**
 Both `Map::new` sites (`squallar-egui/src/ui_map.rs:238` and `:1236`) pass
 `None` for tiles, and `squallar-egui/src/tile_source.rs` is this workspace's own
@@ -98,8 +98,8 @@ own published crate. Making walkers a workspace member is what makes that
 visible, because a member's test targets are actually built.
 
 Deleting it is a straight loss of 9 tests and worth naming as one. It is a
-smaller loss than it reads: those tests drive `HttpTiles`, which the next commit
-deletes outright as unused.
+smaller loss than it reads: those tests drive `HttpTiles`, which the second
+commit deletes outright as unused.
 
 ### Removed — dev-dependencies
 
@@ -111,21 +111,74 @@ deletes outright as unused.
 `approx` stays — `src/mercator.rs`, `src/position.rs` and `src/projector.rs`
 all use it, and those tests do run here.
 
+### Removed — the HTTP stack
+
+`src/http_tiles.rs`, `src/io/` (5 files) and `src/pmtiles.rs` are deleted
+outright, together with `EguiTileFactory` in `src/tiles.rs` — the one item
+outside those files that implemented an `io` trait — and their `mod`/`pub use`
+lines in `src/lib.rs`.
+
+The claim that nothing here uses them was checked, not assumed. Both `Map::new`
+call sites in this workspace (`squallar-egui/src/ui_map.rs:238` and `:1236`)
+pass `None` for tiles; `squallar-egui/src/tile_source.rs` is a full local
+reimplementation of the `Tiles` trait, written precisely because `HttpTiles`
+"bypassed" the shared HTTP client; and `grep -rn HttpTiles` over the workspace
+outside this directory returns three hits, all of them doc comments in that
+file.
+
+The public API this removes is `HttpTiles`, `Stats`, `HttpOptions`,
+`HeaderValue`, `MaxParallelDownloads` and (under its feature) `PmTiles`. The
+`pmtiles` feature is deleted with the module it gated. `LocalTiles` is
+untouched — it never used `io`.
+
+Ten dependencies leave with it: `reqwest`, `reqwest-middleware`,
+`http-cache-reqwest`, `tokio`, `futures`, `bytes`, `getrandom`,
+`wasm-bindgen-futures`, the optional `pmtiles`, and `egui_extras`. All four
+`[target.'cfg(…)']` tables go with them, so what remains is
+platform-independent. See [The dependency graph](#the-dependency-graph).
+
+`egui_extras` is on that list for the next reason rather than this one.
+
+### Removed — the bundled assets
+
+All of `assets/` (7 files, 456 KB), and it splits into three groups:
+
+| Files | Why |
+| --- | --- |
+| `mapbox-logo-black.svg`, `mapbox-logo-white.svg` | Third-party **trademarked** assets. They were reached only by two `egui::include_image!` calls in `src/sources/mapbox.rs`'s `Attribution`, now `None`. `egui_extras`, whose `svg` feature existed to rasterise them, is unused once they are gone. |
+| `protomaps-{dark,dark-vis,light}.json`, `openfreemap-bright.json` | 449 KB of third-party basemap style JSON, compiled into every binary by `include_str!`. This workspace ships its own styles. |
+| `blank-255-tile.png` | Referenced by nothing. It was test-fixture data for the `hypermocker` module already deleted in the previous commit. |
+
+### Removed — the four bundled-style constructors
+
+`Style::protomaps_dark()`, `protomaps_dark_vis()`, `protomaps_light()` and
+`openfreemap_bright()` in `src/style.rs` go with the JSON they `include_str!`.
+
+They are worth naming separately from the bytes they carried, because they are
+also **the reason style loading is infallible today**. Each is
+`serde_json::from_str(…).expect("failed to parse style JSON")` returning a bare
+`Self`, so the only constructors `Style` had could not report a parse failure —
+they could only panic. Deleting them is the prerequisite for the fallible
+parsing that lands next; that work is not in either of these commits.
+
 ### Kept deliberately
 
-- `assets/` — as published, in this commit. The next commit deletes all of it
-  but `blank-255-tile.png`, for reasons that are its own; keeping it here means
-  this commit is a vendoring and nothing else.
-- **All 38 in-source `#[test]` fns**, untouched. They are the behaviour pin on
+- **All but one of the 38 in-source `#[test]` fns.** They are the behaviour pin on
   the code the later patches change, and the bar for any change to this
   directory is that they stay green. See
   [What the pin actually selects](#what-the-pin-actually-selects) for the part
   of that sentence that is smaller than it looks.
 
-  The 38 and the 9 deleted above are disjoint sets, and the two attributes are
-  what separates them: the 38 are `#[test]`, spread over seven modules; the 9
-  were `#[tokio::test]`, all in `http_tiles.rs`, all `hypermocker`-driven. No
-  `#[test]` fn was removed by this commit.
+  **Exactly one was deleted**, and only by the second commit:
+  `style::tests::test_style_parsing`, which called two of the four bundled-style
+  constructors removed above and had nothing left to call. Measured:
+  `cargo test -p walkers --all-features` reports 37, where the tarball has 38.
+  Nothing in `src/expression.rs` was touched — all 22 of its tests are still
+  there and still pass.
+
+  The 9 deleted in the first commit are a disjoint set, and the attribute is
+  what separates them: the 38 are `#[test]`; the 9 were `#[tokio::test]`, all in
+  `http_tiles.rs`, all `hypermocker`-driven.
 - `README.md` — required, not decoration: `src/lib.rs` opens with
   `#![doc = include_str!("../README.md")]`, so deleting it is a compile error.
 
@@ -161,7 +214,11 @@ is upstream's, outranks the tables, and is already clean on this tree. It stays.
 
 ### Changed — source
 
-Two changes, neither of which moves a rendered pixel.
+Six files, in two groups. Nothing in either group changes how a tile that this
+workspace actually renders is drawn.
+
+The first commit changed two files, and both changes were forced by the
+packaging rather than chosen:
 
 1. **`src/http_tiles.rs`** — the `hypermocker` test module deleted, as above.
    Nothing outside `#[cfg(test)]` is touched; the file is upstream's through
@@ -175,11 +232,49 @@ Two changes, neither of which moves a rendered pixel.
    `ignore` and not `no_run`, deliberately: `no_run` still compiles the snippet
    and so still needs the dependency.
 
-   It is also the change that makes this fence survive the next commit, which
-   deletes the `HttpTiles` the snippet is built around.
+   It is also the change that makes this fence survive the second commit, which
+   deletes the `HttpTiles` the snippet is built around. The snippet still names
+   `HttpTiles` and is now wrong as documentation; it is left that way
+   deliberately, so that the delta stays a deletion list rather than a rewrite
+   of upstream's prose.
 
-No file under `src/` other than `http_tiles.rs` differs from the tarball by a
-byte.
+Then, in the second commit, four files lose the code that reached the deleted
+modules and assets and nothing else:
+
+- **`src/lib.rs`** — the `mod` and `pub use` lines for `http_tiles`, `io` and
+  `pmtiles`.
+- **`src/tiles.rs`** — `use crate::io::TileFactory;` and the `EguiTileFactory`
+  struct and its two impls. Everything else in the file, including all of
+  `Tile`, `TileId`, `TilePiece` and the `Tiles` trait this workspace
+  implements, is upstream's.
+- **`src/style.rs`** — the four bundled-style constructors and the one test
+  that called them.
+- **`src/sources/mapbox.rs`** — two `Attribution` fields go from
+  `Some(egui::include_image!(…))` to `None`.
+
+`diff -rq` against the unpacked tarball, in full, is exactly:
+
+```text
+Files <tarball>/Cargo.toml   and vendor/walkers/Cargo.toml   differ
+Files <tarball>/README.md    and vendor/walkers/README.md    differ
+Files <tarball>/src/lib.rs   and vendor/walkers/src/lib.rs   differ
+Files <tarball>/src/sources/mapbox.rs and …/src/sources/mapbox.rs differ
+Files <tarball>/src/style.rs and vendor/walkers/src/style.rs differ
+Files <tarball>/src/tiles.rs and vendor/walkers/src/tiles.rs differ
+Only in <tarball>: assets
+Only in <tarball>: Cargo.lock
+Only in <tarball>: Cargo.toml.orig
+Only in <tarball>: .cargo_vcs_info.json
+Only in <tarball>/src: http_tiles.rs
+Only in <tarball>/src: io
+Only in <tarball>/src: pmtiles.rs
+Only in vendor/walkers: LICENSE
+Only in vendor/walkers: VENDORED.md
+```
+
+Every other file under `src/` — `center`, `expression`, `local_tiles`, `map`,
+`memory`, `mercator`, `mvt`, `options`, `plugin`, `position`, `projector`,
+`text`, `zoom`, and the rest of `sources/` — is byte-for-byte upstream's.
 
 ## What the pin actually selects
 
@@ -193,82 +288,32 @@ enough that stating the number alone would mislead.
 `walkers = { workspace = true }` in `squallar/Cargo.toml` and
 `squallar-egui/Cargo.toml` names no features, and `default = []`.
 
-Measured on this commit, `cargo test --workspace`:
+Measured, `cargo test --workspace`, exit 0 at every point:
 
 | | count |
 | --- | --- |
 | walkers unit tests selected | **15** — mercator 2, position 4, projector 4, tiles 2, zoom 3 |
 | walkers doctests selected | 1 (`src/map.rs`) + 1 ignored (the README fence above) |
-| workspace total, before this commit | 4,521 passed |
-| workspace total, after this commit | 4,537 passed |
+| workspace total, before vendoring | 4,521 passed |
+| workspace total, after commit 1 | 4,537 passed |
+| workspace total, after commit 2 | 4,537 passed |
 
-The +16 is exactly those 15 plus the one doctest. The other 23 arrive the day
-`mvt` is enabled, which is the same day the style and expression patches land —
-so the pin is real for the work it is meant to guard, and the guard is simply
-not armed yet. Do not quote "38" as a figure this workspace measures today.
+The +16 is exactly those 15 plus the one doctest. Commit 2 moves the total by
+**nothing**: the single `#[test]` it deletes is the mvt-gated one in
+`style.rs`, which was never in a default-feature run to begin with. The other 23
+arrive the day `mvt` is enabled, which is the same day the style and expression
+patches land — so the pin is real for the work it is meant to guard, and the
+guard is simply not armed yet. Do not quote "38" as a figure this workspace
+measures today.
 
 `--all-features` is the other half of that sentence: it *does* enable `mvt`, and
 `cargo llvm-cov --all-features` in `.github/workflows/test.yaml` and
 `cargo clippy --all-targets --all-features` in `clippy.yaml` both pass it. Those
-rows compile the mvt modules and run all 38. The 15 above is the figure for a
-default-feature run, and the two are not interchangeable.
-
-## The dependency graph
-
-Making walkers a member has a cost in the lockfile that is worth stating up
-front because it is larger than a reader would guess and it is **not** a cost in
-the build.
-
-`Cargo.lock` gains 48 `[[package]]` blocks on this commit. That is not the mvt
-feature being switched on — it is that Cargo resolves a *workspace member's*
-optional and dev dependencies into the lockfile whether or not they are
-activated, where for a plain registry dependency it drops the ones no feature
-selects. So `geo`, `lyon_path`, `lyon_tessellation`, `mvt-reader`, `color`,
-`pmtiles`, `serde_json` and `approx` join the walkers entry's dependency list
-and drag their own trees in with them.
-
-Nothing in that set is *built* by a default-feature `cargo build --workspace`:
-`cargo tree` still does not resolve them, because features still gate them.
-They are locked, not compiled. What it does mean is that a `--all-features` row
-now compiles them, and that the lockfile diff for this commit is long.
-
-The pin the other three vendored directories use holds here too:
-
-```console
-$ cargo tree -i walkers
-walkers v0.56.0 (…/vendor/walkers)
-└── squallar-egui v0.1.0 (…/squallar-egui)
-    ├── squallar v0.1.0 (…/squallar)
-    ├── squallar-app v0.1.0 (…/squallar-app)
-    …
-```
-
-Exactly one node, and it names the path. In `Cargo.lock` the walkers entry has
-lost its `source` and `checksum` lines, which is the visible form of the
-`[patch.crates-io]` redirect.
-
-### The two reqwests
-
-`walkers` depends on `reqwest "0.12"`; this workspace pins `reqwest =0.13.4`.
-Those do not unify, so the graph carries both — verified on the commit before
-this one at `Cargo.lock:4019` (`reqwest 0.12.28`) and `:4057`
-(`reqwest 0.13.4`).
-
-`reqwest 0.12.28` is reached from exactly three places, and all three are
-walkers': `walkers` itself, `http-cache-reqwest` (walkers' non-wasm
-dependency) and `reqwest-middleware` (walkers' dependency). Deleting the HTTP
-stack in the next commit removes all three. That is recorded in the next
-commit's section of this file rather than asserted here.
-
-**A correction worth carrying**, because it was believed before it was checked:
-the graph also holds two `webpki-roots` (`0.26.11` at `Cargo.lock:6064` and
-`1.0.9` at `:6073`), and the older one is **not** walkers'. `reqwest 0.12.28`
-depends on `webpki-roots 1.0.9`, the same one everything else uses. The single
-dependant of `webpki-roots 0.26.11` in the whole lockfile is `tungstenite
-0.24.0`, which is reached from `ewebsock 0.8.0` — a direct
-`[workspace.dependencies]` pin of this workspace's own, nothing to do with this
-directory. Removing walkers' HTTP stack will not remove it, and no work in this
-directory can.
+rows compile the mvt modules and run the inline tests in them.
+`cargo test -p walkers --all-features` reports **37 passed**, against the
+tarball's 38 — the one absent is `style::tests::test_style_parsing`. The 15
+above is the figure for a default-feature run, and the two are not
+interchangeable.
 
 ## rustfmt
 
@@ -290,23 +335,109 @@ happens to be clean under them already.
 
 ## Two other bots that can reach this directory
 
-- **Renovate** — already handled, and not by this commit.
+- **Renovate** — already handled, and not by these commits.
   `.github/renovate.json` lists `vendor/**` in `"ignorePaths"` because of the
   first sibling directory, and that glob covers this one too. It matters here
   for the same reason it mattered there: this manifest's `egui`, `image`,
-  `lru`, `reqwest` and `thiserror` declarations are upstream's, not ours to
-  move, and a bump merged here would rewrite the vendored crate and quietly
-  make the *Local changes* list above untrue. Nothing to do; recorded so the
-  next person does not go looking.
+  `lru` and `thiserror` declarations are upstream's, not ours to move, and a
+  bump merged here would rewrite the vendored crate and quietly make the
+  *Local changes* list above untrue. Nothing to do; recorded so the next person
+  does not go looking.
 - **Coverage** — not handled, named so it is not a surprise.
   `cargo llvm-cov --all-features` in `test.yaml` now measures this crate too,
   and the badge and `.github/coverage-baseline.tsv` it auto-commits move
-  accordingly — roughly 4,300 lines of widget joined the denominator, covered
-  only to the extent upstream's own inline tests cover them. Note that the
-  `--all-features` there means the mvt modules are in that denominator *and*
-  their 23 tests are in the numerator, unlike a default-feature run. The number
-  changing is expected and is not a regression in this workspace's code.
-  Nothing gates on a threshold, so nothing fails.
+  accordingly — 3,464 lines of widget joined the denominator (4,333 as
+  vendored, before the HTTP stack came out), covered only to the extent
+  upstream's own inline tests cover them. Note that the `--all-features` there
+  means the mvt modules are in that denominator *and* their 22 remaining tests
+  are in the numerator, unlike a default-feature run. The number changing is
+  expected and is not a regression in this workspace's code. Nothing gates on a
+  threshold, so nothing fails.
+
+## The dependency graph
+
+Two counts, and they have **different denominators and are never added**.
+`[[package]]` blocks in `Cargo.lock` is everything the resolver locked, whether
+or not a feature selects it. Distinct packages in `cargo tree --workspace` is
+what a default-feature host build actually compiles. Measured at all three
+points:
+
+| | `Cargo.lock` blocks | `cargo tree --workspace` |
+| --- | --- | --- |
+| before vendoring (`bf7afc62`) | 664 | 468 |
+| after commit 1 (vendored as published) | 712 | 469 |
+| after commit 2 (HTTP stack deleted) | **649** | **420** |
+| net vs. before vendoring | **−15** | **−48** |
+
+The first row pair is the one that surprises. Commit 1 adds 48 lockfile blocks
+while adding **one** compiled package. That is not the mvt feature being
+switched on — it is that Cargo resolves a *workspace member's* optional and dev
+dependencies into the lockfile whether or not they are activated, where for a
+plain registry dependency it drops the ones no feature selects. So `geo`,
+`lyon_path`, `lyon_tessellation`, `mvt-reader`, `color`, `pmtiles`, `serde_json`
+and `approx` join the walkers entry and drag their own trees in. Only `approx`,
+a dev-dependency, is compiled; the rest are locked, not built. The
+`--all-features` CI rows are where the rest of them do get compiled.
+
+Commit 2 then takes 63 blocks and 49 compiled packages back out, and the net
+across both commits is a graph that is 48 packages *smaller* than before walkers
+was vendored at all. That reduction is the concrete thing this pair of commits
+buys, ahead of any patch.
+
+The pin the other three vendored directories use holds here too:
+
+```console
+$ cargo tree -i walkers
+walkers v0.56.0 (…/vendor/walkers)
+└── squallar-egui v0.1.0 (…/squallar-egui)
+    ├── squallar v0.1.0 (…/squallar)
+    ├── squallar-app v0.1.0 (…/squallar-app)
+    …
+```
+
+Exactly one node, and it names the path. In `Cargo.lock` the walkers entry has
+lost its `source` and `checksum` lines, which is the visible form of the
+`[patch.crates-io]` redirect.
+
+### The second reqwest, which is gone
+
+`walkers` depended on `reqwest "0.12"` while this workspace pins
+`reqwest =0.13.4`. Those do not unify, so the graph carried both — verified
+before this work at `Cargo.lock:4019` (`reqwest 0.12.28`) and `:4057`
+(`reqwest 0.13.4`).
+
+`reqwest 0.12.28` was reached from exactly three packages, and all three were
+walkers': `walkers` itself, `http-cache-reqwest` and `reqwest-middleware`.
+Deleting the HTTP stack removes all three, and with them `quinn` and the rest of
+0.12's HTTP/3 tail.
+
+After commit 2, `grep '^name = "reqwest"' -A1 Cargo.lock` reports **one**
+version, `0.13.4`. `http-cache-reqwest`, `reqwest-middleware`, `pmtiles`,
+`quinn` and `egui_extras` are absent from the lockfile entirely.
+
+### The second webpki-roots, which is not
+
+**A correction worth carrying, because it was believed before it was checked.**
+The graph also held two `webpki-roots` — `0.26.11` at `Cargo.lock:6064` and
+`1.0.9` at `:6073` — and it is natural to read that as the same problem and
+expect this work to fix it. It is not, and it does not.
+
+`reqwest 0.12.28` depended on `webpki-roots 1.0.9`, the same one everything else
+uses. The **only** dependant of `webpki-roots 0.26.11` in the whole lockfile is
+`tungstenite 0.24.0`:
+
+```console
+$ cargo tree -i webpki-roots@0.26.11
+webpki-roots v0.26.11
+└── tungstenite v0.24.0
+    └── ewebsock v0.8.0
+        └── squallar-radar v0.1.0 (…/squallar-radar)
+```
+
+`ewebsock` is a direct `[workspace.dependencies]` pin of this workspace's own
+(`=0.8.0`, `features = ["tls"]`), nothing to do with this directory.
+`webpki-roots 0.26.11` is still in the lockfile after commit 2 and will stay
+there. No work in this directory can remove it; the lever is `ewebsock`.
 
 ## Removing this directory
 

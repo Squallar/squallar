@@ -15,6 +15,16 @@
 # exactly `0.56.0` -- no `+local` metadata -- because the root
 # `[patch.crates-io]` entry is only accepted for a version that satisfies the
 # `=0.56.0` requirement it replaces.
+#
+# The dependency list below is much shorter than upstream's because the HTTP
+# tile stack (`src/http_tiles.rs`, `src/io/`, `src/pmtiles.rs`) is deleted --
+# nothing here ever called it, and it carried a second `reqwest` at 0.12
+# against this workspace's `=0.13.4` pin. Ten dependencies went with it:
+# reqwest, reqwest-middleware, http-cache-reqwest, tokio, futures, bytes,
+# getrandom, wasm-bindgen-futures, egui_extras and the optional pmtiles.
+# egui_extras is on that list only because it was there to rasterise the two
+# bundled Mapbox logo SVGs, which are third-party trademarked assets and are
+# also gone.
 # ---------------------------------------------------------------------------
 
 [package]
@@ -54,7 +64,6 @@ mvt = [
     "dep:serde",
     "dep:serde_json",
 ]
-pmtiles = ["dep:pmtiles"]
 serde = [
     "dep:serde",
     "egui/serde",
@@ -65,9 +74,6 @@ serde = [
 name = "walkers"
 path = "src/lib.rs"
 
-[dependencies.bytes]
-version = "1"
-
 [dependencies.color]
 version = "0.3.2"
 features = ["serde"]
@@ -75,13 +81,6 @@ optional = true
 
 [dependencies.egui]
 version = "0.35.0"
-
-[dependencies.egui_extras]
-version = "0.35.0"
-features = ["svg"]
-
-[dependencies.futures]
-version = "0.3.32"
 
 [dependencies.geo]
 version = "0.33.1"
@@ -117,20 +116,6 @@ optional = true
 version = "2.1.0"
 optional = true
 
-[dependencies.pmtiles]
-version = "0.23.0"
-features = ["mmap-async-tokio"]
-optional = true
-default-features = false
-
-[dependencies.reqwest]
-version = "0.12"
-features = ["rustls-tls"]
-default-features = false
-
-[dependencies.reqwest-middleware]
-version = "0.4.2"
-
 [dependencies.serde]
 version = "1"
 features = ["derive"]
@@ -157,18 +142,11 @@ version = "2"
 [dev-dependencies.approx]
 version = "0.5"
 
-[target.'cfg(not(target_family = "wasm"))'.dependencies.http-cache-reqwest]
-version = "0.16.0"
-
-[target.'cfg(not(target_family = "wasm"))'.dependencies.tokio]
-version = "1"
-
-[target.'cfg(target_family = "wasm")'.dependencies.getrandom]
-version = "0.2"
-features = ["js"]
-
-[target.'cfg(target_family = "wasm")'.dependencies.wasm-bindgen-futures]
-version = "0.4"
+# No `[target.…]` tables at all any more, and their absence is the point. Every
+# one of them belonged to the deleted HTTP stack: `http-cache-reqwest` and
+# `tokio` on non-wasm, `getrandom`/`js` and `wasm-bindgen-futures` on wasm. What
+# is left is platform-independent -- projection arithmetic, an LRU of decoded
+# textures, and egui drawing.
 
 # ---------------------------------------------------------------------------
 # Lint tables: this is not our code, and CI must stop treating it as ours.

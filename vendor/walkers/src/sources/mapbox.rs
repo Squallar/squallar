@@ -62,8 +62,8 @@ impl TileSource for Mapbox {
         Attribution {
             text: "© Mapbox, © OpenStreetMap",
             url: "https://www.mapbox.com/about/maps/",
-            logo_light: Some(egui::include_image!("../../assets/mapbox-logo-white.svg")),
-            logo_dark: Some(egui::include_image!("../../assets/mapbox-logo-black.svg")),
+            logo_light: None,
+            logo_dark: None,
         }
     }
 

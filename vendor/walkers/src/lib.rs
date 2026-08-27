@@ -2,8 +2,6 @@
 #![deny(clippy::unwrap_used, rustdoc::broken_intra_doc_links)]
 
 mod center;
-mod http_tiles;
-mod io;
 mod local_tiles;
 mod map;
 mod memory;
@@ -28,24 +26,17 @@ pub mod mercator;
 mod expression;
 #[cfg(feature = "mvt")]
 mod mvt;
-#[cfg(feature = "pmtiles")]
-mod pmtiles;
 mod position;
 mod projector;
 pub mod sources;
 mod tiles;
 mod zoom;
 
-pub use http_tiles::HttpTiles;
-pub use io::tiles_io::Stats;
-pub use io::{HeaderValue, MaxParallelDownloads, http::HttpOptions};
 pub use local_tiles::LocalTiles;
 pub use map::Map;
 pub use memory::MapMemory;
 pub use options::Options;
 pub use plugin::Plugin;
-#[cfg(feature = "pmtiles")]
-pub use pmtiles::PmTiles;
 pub use position::{Position, lat_lon, lon_lat};
 pub use projector::Projector;
 pub use style::Style;
