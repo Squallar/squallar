@@ -256,10 +256,21 @@ variants, genuinely localised rather than copied.
 ### Legacy filter operators
 
 `["!in", …]` becomes `["!", ["in", …]]` and `["none", …]` becomes `["!",
-["any", …]]` (one `!in` per theme; no `none`). Both legacy forms reach
-`walkers::expression::Context::evaluate`'s fallback arm, which errors;
-`walkers::style::Filter::matches` turns that into `false`, so the layer would
-draw nothing while logging a warning nobody reads.
+["any", …]]` (one `!in` per theme; no `none`).
+
+**The reason this was written is no longer true, and the rewrite is kept
+anyway.** It was a workaround: both legacy forms reached
+`walkers::expression::Context::evaluate`'s fallback arm, which errored, and
+`walkers::style::Filter::matches` turned that into `false` — so the layer drew
+nothing while logging a warning nobody reads. walkers implemented both
+operators on 2026-08-27, so that failure mode is gone and a style carrying the
+legacy spelling now evaluates correctly.
+
+It stays as **normalisation**, which was always the better justification: this
+tool's output is committed source that a human edits by hand, and one spelling
+per predicate is worth more than preserving whichever spelling the input
+happened to use. Same reasoning as rewriting legacy `{"stops": […]}` to a
+modern expression rather than passing it through.
 
 ---
 
