@@ -122,58 +122,6 @@ fn zoom_step(input: &egui::InputState) -> f64 {
     (delta - 1.0) * ZOOM_SPEED
 }
 
-/// What walkers' own frame-time multiplier has to be divided by for a
-/// `walkers::Map` to zoom the way [`zoom_step`] does.
-fn wheel_rate_correction(input: &egui::InputState) -> f32 {
-    let applied = input
-        .stable_dt
-        .clamp(input.predicted_dt * 0.5, input.predicted_dt * 2.0);
-    const NOMINAL_FRAME_S: f32 = 1.0 / 60.0;
-    if applied.is_finite() && applied > 0.0 {
-        NOMINAL_FRAME_S / applied
-    } else {
-        1.0
-    }
-}
-
-/// Show a `walkers::Map` with the wheel held steady against the frame rate,
-/// then hand egui its own scroll back.
-pub(crate) fn steady_wheel<R>(ctx: &egui::Context, map: impl FnOnce() -> R) -> R {
-    /// Puts egui's own scroll back, panic or not.
-    struct Restore {
-        ctx: egui::Context,
-        y: f32,
-    }
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            let y = self.y;
-            self.ctx.input_mut(|input| input.smooth_scroll_delta.y = y);
-            HELD.with(|held| held.set(false));
-        }
-    }
-
-    debug_assert!(
-        !HELD.with(std::cell::Cell::get),
-        "steady_wheel is already open on this thread; nesting squares the correction",
-    );
-    HELD.with(|held| held.set(true));
-
-    let _restore = Restore {
-        ctx: ctx.clone(),
-        y: ctx.input_mut(|input| {
-            let before = input.smooth_scroll_delta.y;
-            input.smooth_scroll_delta.y = before * wheel_rate_correction(input);
-            before
-        }),
-    };
-    map()
-}
-
-thread_local! {
-    /// Whether a [`steady_wheel`] scope is already open on this thread.
-    static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// This frame's scroll or pinch as a multiplicative dolly for
 /// [`OrbitDelta::zoom_factor`](crate::pane::OrbitDelta::zoom_factor), or `1.0`
 /// — "the eye did not move" — for a frame with no gesture for this pane.

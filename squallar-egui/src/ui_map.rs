@@ -233,92 +233,92 @@ impl super::Gui {
                             let tile_zoom_bias =
                                 tile_zoom_biases.get(pane_idx).copied().unwrap_or(0);
                             if let Some(tiles) = tiles_owned.as_mut() {
-                                let ctx = child_ui.ctx().clone();
-                                crate::ui_region::steady_wheel(&ctx, || {
-                                    Map::new(None, &mut map_memory, center)
-                                        .zoom_with_ctrl(false)
-                                        .panning(false)
-                                        .drag_pan_buttons(if suppress_pan {
-                                            egui::DragPanButtons::empty()
-                                        } else {
-                                            egui::DragPanButtons::PRIMARY
-                                        })
-                                        .show(&mut child_ui, |ui, _response, projector, memory| {
-                                            let zoom = memory.zoom();
+                                Map::new(None, &mut map_memory, center)
+                                    .zoom_with_ctrl(false)
+                                    .panning(false)
+                                    // This app's frames are 4 ms idle and
+                                    // hundreds of ms mid-raster, so walkers'
+                                    // frame-time multiplier would make a
+                                    // notch zoom ~75x further during a slow
+                                    // one. Asking walkers for a nominal
+                                    // frame time replaces a correction this
+                                    // crate used to apply by mutating
+                                    // egui's `InputState` around the widget.
+                                    .wheel_zoom_scales_with_frame_time(false)
+                                    .drag_pan_buttons(if suppress_pan {
+                                        egui::DragPanButtons::empty()
+                                    } else {
+                                        egui::DragPanButtons::PRIMARY
+                                    })
+                                    .show(&mut child_ui, |ui, _response, projector, memory| {
+                                        let zoom = memory.zoom();
 
-                                            draw_tile_layer(
-                                                ui,
-                                                projector,
-                                                zoom,
-                                                tiles,
-                                                tile_zoom_bias,
-                                            );
+                                        draw_tile_layer(ui, projector, zoom, tiles, tile_zoom_bias);
 
-                                            if let Some(gesture) = gesture {
-                                                if self.section_draw_armed() {
-                                                    self.track_section_draw(
-                                                        pane_idx, gesture, projector,
-                                                    );
-                                                } else if self.region_pick_armed() {
-                                                    self.track_region_pick(
-                                                        pane_idx, gesture, projector,
-                                                    );
-                                                }
+                                        if let Some(gesture) = gesture {
+                                            if self.section_draw_armed() {
+                                                self.track_section_draw(
+                                                    pane_idx, gesture, projector,
+                                                );
+                                            } else if self.region_pick_armed() {
+                                                self.track_region_pick(
+                                                    pane_idx, gesture, projector,
+                                                );
                                             }
+                                        }
 
-                                            let mut render_ctx = pane_render::PaneRenderCtx {
-                                                pane_idx,
-                                                pane: &mut pane,
-                                                overlays: &mut self.overlays,
-                                                user_location,
-                                                user_heading,
-                                                user_fix: user_fix.clone(),
-                                                label_tiles: &mut label_tiles,
-                                                tile_zoom_bias,
-                                                overlay_render_limit,
-                                                actions: &mut actions,
-                                                pane_rect,
-                                                surfaces: pane_render::PaneSurfaces::GroundAndGlass,
-                                                horizontal_color_scale,
-                                                color_scale_floor,
-                                                pointer_available,
-                                                excluded_rects: excluded_rects.to_vec(),
-                                                long_press_pos: pointer.long_press_pos,
-                                                overlay_click_pos,
-                                                click_consumed: &mut click_consumed,
-                                                preferences: &self.preferences,
-                                                #[cfg(test)]
-                                                paint_order: Vec::new(),
-                                            };
-
-                                            pane_render::render_pane_map_content(
-                                                ui,
-                                                projector,
-                                                zoom,
-                                                &mut render_ctx,
-                                            );
-
+                                        let mut render_ctx = pane_render::PaneRenderCtx {
+                                            pane_idx,
+                                            pane: &mut pane,
+                                            overlays: &mut self.overlays,
+                                            user_location,
+                                            user_heading,
+                                            user_fix: user_fix.clone(),
+                                            label_tiles: &mut label_tiles,
+                                            tile_zoom_bias,
+                                            overlay_render_limit,
+                                            actions: &mut actions,
+                                            pane_rect,
+                                            surfaces: pane_render::PaneSurfaces::GroundAndGlass,
+                                            horizontal_color_scale,
+                                            color_scale_floor,
+                                            pointer_available,
+                                            excluded_rects: excluded_rects.to_vec(),
+                                            long_press_pos: pointer.long_press_pos,
+                                            overlay_click_pos,
+                                            click_consumed: &mut click_consumed,
+                                            preferences: &self.preferences,
                                             #[cfg(test)]
-                                            self.probes.last_paint_order.push((
-                                                pane_idx,
-                                                std::mem::take(&mut render_ctx.paint_order),
-                                            ));
+                                            paint_order: Vec::new(),
+                                        };
 
-                                            self.track_section_edit(
-                                                ui,
-                                                projector,
-                                                pane_idx,
-                                                pane_rect,
-                                                excluded_rects,
-                                            );
+                                        pane_render::render_pane_map_content(
+                                            ui,
+                                            projector,
+                                            zoom,
+                                            &mut render_ctx,
+                                        );
 
-                                            self.draw_section_tracks(
-                                                ui, projector, pane_idx, pane_rect,
-                                            );
+                                        #[cfg(test)]
+                                        self.probes.last_paint_order.push((
+                                            pane_idx,
+                                            std::mem::take(&mut render_ctx.paint_order),
+                                        ));
 
-                                            self.draw_region_boxes(ui, projector, pane_idx);
-                                        });
-                                });
+                                        self.track_section_edit(
+                                            ui,
+                                            projector,
+                                            pane_idx,
+                                            pane_rect,
+                                            excluded_rects,
+                                        );
+
+                                        self.draw_section_tracks(
+                                            ui, projector, pane_idx, pane_rect,
+                                        );
+
+                                        self.draw_region_boxes(ui, projector, pane_idx);
+                                    });
                             }
                         }
                         RenderView::CrossSection => {
@@ -1236,6 +1236,13 @@ impl super::Gui {
         Map::new(None, map_memory, center)
             .zoom_with_ctrl(false)
             .panning(false)
+            // The strip is a pure projector, not a second thing to zoom. Its
+            // `MapMemory` is an owned copy (`FloorStripCtx::map_memory`) that is
+            // dropped at the end of this function, so a zoom gesture here writes
+            // to a throwaway — and it would read the same wheel the plan view
+            // does, at a different rate, because only the plan view asks for a
+            // nominal frame time.
+            .zoom_gesture(false)
             .drag_pan_buttons(egui::DragPanButtons::empty())
             .show(&mut strip_ui, |ui, _response, projector, memory| {
                 let zoom = memory.zoom();

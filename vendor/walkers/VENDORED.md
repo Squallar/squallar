@@ -868,6 +868,64 @@ criteria:
 - `a_release_with_no_pointer_velocity_falls_back_to_the_drag` — both arms of
   the fallback.
 
+### Changed — source, twelfth commit: an opt-out from the wheel-zoom frame-time multiplier
+
+`Map::zoom_delta` multiplies `smooth_scroll_delta.y` by `stable_dt` (clamped to
+`predicted_dt * 0.5 ..= predicted_dt * 2.0`) before dividing by 4. On an app
+whose frame time is a constant that is a smoothing; on this one, whose frames
+are 4 ms idle and hundreds of ms while a layer rasterises, it means a wheel
+notch zooms a different distance depending on how busy the frame it landed on
+was.
+
+**The option is not "remove the multiplier".** The term is
+`y * frame_time / 4.0`, so deleting `frame_time` makes one notch `y/2` zoom
+levels instead of `y/120` — a **60x** zoom, pinned by
+`map::tests::dropping_the_frame_time_entirely_would_be_a_sixty_times_zoom`.
+What is wanted is a *nominal* frame time substituted for the measured one, and
+that is what `Options::wheel_zoom_scales_with_frame_time` (default `true`,
+upstream's behaviour) and `Map::wheel_zoom_scales_with_frame_time` do, against
+`NOMINAL_FRAME_TIME = 1.0 / 60.0`.
+
+The arithmetic moves into a free `wheel_zoom_delta(scroll_y, frame_scale)`, so
+it is testable without an `egui::Context`; the `if` selects the **value** of
+`frame_scale` and both arms then run the same expression.
+
+**Four tests in `map::tests`**: the 60x trap above; that a nominal frame time
+holds the notch at 1.0 levels across 240 Hz → a 0.2895 s web frame while the
+measured multiplier spreads it by more than 60x over the same frames (the
+control, so the first assertion is not comparing against a constant); that the
+default is upstream's behaviour on both `Options` and a built `Map`; and that
+the gesture stays linear and signed in how far the wheel turned.
+
+**What this deletes above walkers.** `squallar-egui`'s `ui_region.rs` carried
+`steady_wheel`, `wheel_rate_correction`, a `Restore` drop guard and a
+thread-local re-entrancy flag — ~60 lines that cancelled the multiplier by
+**mutating `egui::InputState` around the widget**, at two `input_mut` write
+locks per pane per frame. All of it goes; the plan view calls the builder
+method at its `Map::new` site instead. `zoom_step`, `POINTS_PER_ZOOM_LEVEL` and
+`ZOOM_SPEED` stay — they serve the 3D camera, not walkers.
+
+**The gate did not move and was not weakened.**
+`squallar_egui::ui_region::tests::a_notch_moves_the_plan_view_the_same_distance_at_every_frame_rate`
+drives the real `walkers::Map` through `InputHarness` at 240/120/60/30/10 Hz
+and a 3.5 Hz web p50, asserting `|levels - 1.0| < 0.02` on every row and a
+`widest / tightest < 1.02` spread. It is green with `steady_wheel` deleted.
+**Non-vacuity control**: with `.wheel_zoom_scales_with_frame_time(false)`
+removed and nothing else changed, it fails — `[240Hz 0.4830, 120Hz 0.4934,
+60Hz 1.0000, 30Hz 2.0000, 10Hz 2.0000, 3.5Hz 2.0000]`, a **4.14x** spread. So
+the option really is carrying what `steady_wheel` carried.
+
+**A related defect, folded in.** `Gui::draw_floor_strip`'s `Map` — the second
+`Map::new` site — was never wrapped in `steady_wheel`, so it zoomed at
+walkers' rate while the plan view zoomed at the corrected one. It now takes
+`.zoom_gesture(false)` rather than the opt-out, because its `MapMemory` is an
+**owned copy** (`FloorStripCtx::map_memory`, documented `owned` at its
+declaration, moved out of the struct and dropped at the end of the function —
+verified, and the same fact the tenth commit's note above relies on). A zoom
+gesture there writes to a throwaway, so the strip should be a pure projector.
+**UNMEASURED**: the mechanism is in the code and the ownership is confirmed,
+but nobody has watched the two panes disagree.
+
 ## What the pin actually selects
 
 "Upstream's 38 inline tests are the behaviour pin" is the reason this crate is
