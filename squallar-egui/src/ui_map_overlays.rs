@@ -1,6 +1,6 @@
 use crate::overlay_cache::{OverlayTextureData, draw_overlay_texture, geo_point_in_feature};
 use crate::tile_source::HttpsTiles;
-use squallar_geo::{lat_to_tile_y, lon_to_tile_x, tile_to_lat, tile_to_lon};
+use squallar_geo::{tile_to_lat, tile_to_lon};
 use squallar_overlays::render::overlay_state::{ClickableItem, OverlayItem};
 use squallar_overlays::types::OverlayLabel;
 use std::sync::Arc;
@@ -148,29 +148,11 @@ pub(super) fn draw_tile_layer(
     let tile_zoom = (zoom.round() as u8)
         .saturating_add(zoom_bias)
         .min(tiles.source_max_zoom());
-    let n = 2u32.pow(tile_zoom as u32);
-    if n == 0 {
-        return;
-    }
 
-    let screen_rect = ui.max_rect();
+    let span = crate::tiles::tile_span(projector, ui.max_rect(), tile_zoom);
 
-    let nw = projector.unproject(egui::vec2(screen_rect.left(), screen_rect.top()));
-    let se = projector.unproject(egui::vec2(screen_rect.right(), screen_rect.bottom()));
-
-    // walkers Position: x = longitude, y = latitude
-    let min_lon = nw.x().min(se.x());
-    let max_lon = nw.x().max(se.x());
-    let max_lat = nw.y().max(se.y());
-    let min_lat = nw.y().min(se.y());
-
-    let min_tx = lon_to_tile_x(min_lon, tile_zoom);
-    let max_tx = (lon_to_tile_x(max_lon, tile_zoom) + 1).min(n - 1);
-    let min_ty = lat_to_tile_y(max_lat, tile_zoom); // higher lat → smaller tile y
-    let max_ty = (lat_to_tile_y(min_lat, tile_zoom) + 1).min(n - 1);
-
-    for ty in min_ty..=max_ty {
-        for tx in min_tx..=max_tx {
+    for ty in span.north..=span.south {
+        for tx in span.west..=span.east {
             let tile_id = TileId {
                 x: tx,
                 y: ty,

@@ -1,4 +1,5 @@
 use crate::tile_source::HttpsTiles;
+use squallar_geo::{lat_to_tile_y, lon_to_tile_x};
 use walkers::{
     TileId,
     sources::{Attribution, TileSource},
@@ -200,6 +201,56 @@ pub fn tiles_resident_for(rect: egui::Rect, zoom_bias: u8, layers: usize) -> usi
     let across = (rect.width().max(0.0) / side).ceil() as usize + 1;
     let down = (rect.height().max(0.0) / side).ceil() as usize + 1;
     across.saturating_mul(down).saturating_mul(layers)
+}
+
+/// The tile indices one viewport covers at one tile zoom, both ends inclusive.
+///
+/// `north` is the *smaller* row index: tile `y` grows southward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileSpan {
+    pub west: u32,
+    pub east: u32,
+    pub north: u32,
+    pub south: u32,
+}
+
+impl TileSpan {
+    /// How many tiles the span names.
+    pub fn tiles(self) -> usize {
+        let across = (self.east.saturating_sub(self.west) as usize) + 1;
+        let down = (self.south.saturating_sub(self.north) as usize) + 1;
+        across.saturating_mul(down)
+    }
+}
+
+/// The tiles that cover `rect` on the glass at `tile_zoom`.
+///
+/// **Neither end is widened, and widening one would be a bug.**
+/// [`lon_to_tile_x`] and [`lat_to_tile_y`] *floor*: the index each returns is
+/// the tile the coordinate falls inside, so the inclusive span already carries
+/// the two part-covered edge tiles. A `+ 1` on the far end appends a column
+/// wholly east of `rect` and a row wholly south of it — at 1920x1080 that is
+/// 10x7 tiles where 9x6 are seen — and each of the extra 16 costs a
+/// `Tiles::at` call, an HTTP request through `request_once`, an LRU probe, a
+/// `TextureHandle` clone and drop (a write lock on the texture manager each),
+/// and a fully clipped `Painter::image`.
+///
+/// Both transforms also clamp rather than wrap, so a viewport reaching past the
+/// antimeridian or the Mercator limit gets the edge tile and not the far side.
+pub fn tile_span(projector: &walkers::Projector, rect: egui::Rect, tile_zoom: u8) -> TileSpan {
+    let nw = projector.unproject(egui::vec2(rect.left(), rect.top()));
+    let se = projector.unproject(egui::vec2(rect.right(), rect.bottom()));
+
+    // walkers Position: x = longitude, y = latitude.
+    let (min_lon, max_lon) = (nw.x().min(se.x()), nw.x().max(se.x()));
+    let (min_lat, max_lat) = (nw.y().min(se.y()), nw.y().max(se.y()));
+
+    TileSpan {
+        west: lon_to_tile_x(min_lon, tile_zoom),
+        east: lon_to_tile_x(max_lon, tile_zoom),
+        north: lat_to_tile_y(max_lat, tile_zoom),
+        south: lat_to_tile_y(min_lat, tile_zoom),
+    }
 }
 
 #[path = "tiles/tests.rs"]
