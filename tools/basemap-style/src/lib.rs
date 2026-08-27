@@ -450,13 +450,25 @@ fn fold_zoom_range(layer: &mut Map<String, Value>, report: &mut Report) {
     report.zoom_ranges_folded += 1;
 }
 
-/// Rewrite legacy filter operators the expression evaluator does not implement.
+/// Normalise legacy filter operators to one modern spelling.
 ///
 /// `["!in", k, a, b]` becomes `["!", ["in", k, a, b]]` and `["none", a, b]`
-/// becomes `["!", ["any", a, b]]`. Both legacy forms reach
-/// `walkers::expression::Context::evaluate`'s fallback arm, which returns an
-/// error; `walkers::style::Filter::matches` turns that into `false`, so the
-/// layer draws nothing and logs a warning nobody reads.
+/// becomes `["!", ["any", a, b]]`. One `!in` per theme in the CARTO input; no
+/// `none`.
+///
+/// THE ORIGINAL REASON HERE IS DEAD, AND THE REWRITE IS KEPT ANYWAY. It used to
+/// say both forms reached `walkers::expression::Context::evaluate`'s fallback
+/// arm, which errored, which `walkers::style::Filter::matches` turned into
+/// `false` -- so the layer drew nothing while logging a warning nobody reads.
+/// That was true until walkers implemented both operators on 2026-08-27; a
+/// style carrying the legacy spelling now evaluates correctly, and this
+/// function is no longer compensating for anything.
+///
+/// It stays because normalisation was always the better justification: the
+/// output is committed source that a human edits by hand, and one spelling per
+/// predicate is worth more than preserving whichever the input happened to use.
+/// That is the same reason legacy `{"stops": [...]}` is rewritten to a modern
+/// expression here rather than passed through.
 fn rewrite_filter(filter: &Value, report: &mut Report) -> Value {
     let Value::Array(items) = filter else {
         return filter.clone();
