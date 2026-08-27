@@ -1195,6 +1195,71 @@ Also corrected: the comment above the `==` arm pointed at "VENDORED.md,
 thirteenth commit" for the ordered-comparison defect. The thirteenth commit is
 the affine tile rect on `Projector`; the comparison work is the fourteenth.
 
+### Changed — source, sixteenth commit: the legacy `none` and `!in` operators
+
+Both fell through to `Error::InvalidExpression`. `style::Filter::matches`
+turns an `Err` into `false`, so a layer filtered on either drew **nothing** —
+and these two are the worst pair for that failure mode, because both are
+*negative* filters, true of most features. Failing them closed suppresses a
+layer broadly rather than narrowly, with one `warn!` nobody reads.
+
+**Why implement rather than document the gap.** The obvious argument against
+is that neither appears in either committed style, so this is an unused spec
+corner. That argument does not survive looking at *why* they are absent:
+
+- `tools/basemap-style` **already rewrites them away**, in `rewrite_filter` —
+  `["!in", k, …]` becomes `["!", ["in", k, …]]` and `["none", …]` becomes
+  `["!", ["any", …]]`. Its doc comment and `DECISIONS.md` § "Legacy filter
+  operators" both name this evaluator's fallback arm as the reason. They are
+  absent by construction, not by luck.
+- And they are **present in the real input**: `DECISIONS.md` records "one
+  `!in` per theme; no `none`". So `!in` is a live construct in the upstream
+  CARTO styles that something has to handle. The only question is where.
+- Handling it in the converter puts a correctness requirement of the evaluator
+  in a **different workspace**. `tools/basemap-style` is its own workspace
+  root, so root `cargo test --workspace` walks straight past it; only
+  `.github/workflows/basemap-style.yaml` runs it. Any style that reaches
+  `Context::evaluate` without going through that converter — a hand-written
+  one, a future source, a style fetched rather than generated — loses a whole
+  layer silently.
+- The cost of closing it is four lines of dispatch and two extracted helpers,
+  and the semantics are not a judgement call: the legacy filter spec defines
+  `none` as the negation of `any` and `!in` as the negation of `in`, both of
+  which were already implemented and already tested.
+
+So the gap is closed here, at the layer the symptom lives in. `in` and `any`
+move into `is_in` and `any_of` so that `!in` and `none` are literally the
+negation of the same code and cannot drift from it; neither existing arm
+changes behaviour.
+
+**The converter's rewrite is deliberately left in place.** It is in another
+crate and another workspace, it is still correct, and it now belongs to
+whoever owns that directory to decide whether to drop it. Nothing here depends
+on it either way.
+
+Pinned by `expression::tests::test_none_and_not_in_operators`, written first
+and run against the unfixed evaluator:
+
+```text
+---- expression::tests::test_none_and_not_in_operators stdout ----
+thread '…' panicked at vendor/walkers/src/expression.rs:1009:18:
+called `Result::unwrap()` on an `Err` value: InvalidExpression(Array
+[String("none"), Array [String("=="), String("class"), String("path")],
+Array [String("=="), String("rank"), Number(9)]])
+```
+
+Each operator is asserted against the one it negates, on identical arguments
+and in both directions, so the pair pins the *complement* rather than a value
+that a constant would also satisfy. The `any` and `in` halves of those pairs
+pass before and after — they are the reference, not the control. The test ends
+by driving a `Filter` over each, because "the evaluator returns a bool" is one
+layer below the symptom, which is a layer that does not draw.
+
+Inherited and not changed: `property_or_expression` returns the key string
+itself when the named property is missing, so `["!in", "absent", "x"]` compares
+`"absent"` against `"x"`. That is pre-existing behaviour shared with `==` and
+`in`, and changing it belongs to its own commit with its own measurement.
+
 ## What the pin actually selects
 
 "Upstream's 38 inline tests are the behaviour pin" is the reason this crate is

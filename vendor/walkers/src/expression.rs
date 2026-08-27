@@ -128,18 +128,8 @@ impl Context {
                         }
                         Ok(Value::Null)
                     }
-                    "in" => {
-                        let (value, list) = first_and_rest(arguments)?;
-                        let value = self.property_or_expression(value)?;
-
-                        for item in list {
-                            if value == self.evaluate(item)? {
-                                return Ok(Value::Bool(true));
-                            }
-                        }
-
-                        Ok(Value::Bool(false))
-                    }
+                    "in" => Ok(Value::Bool(self.is_in(arguments)?)),
+                    "!in" => Ok(Value::Bool(!self.is_in(arguments)?)),
                     // Only the FIRST operand of a comparison names a property;
                     // the rest are the values compared against. So the left
                     // side goes through `property_or_expression` and the right
@@ -183,12 +173,8 @@ impl Context {
                         let right = self.evaluate(right)?;
                         Ok(Value::Bool(lte(&right, &left)))
                     }
-                    "any" => Ok(arguments
-                        .iter()
-                        .try_fold(false, |acc, value| {
-                            Ok(acc || self.evaluate(value)? == Value::Bool(true))
-                        })?
-                        .into()),
+                    "any" => Ok(Value::Bool(self.any_of(arguments)?)),
+                    "none" => Ok(Value::Bool(!self.any_of(arguments)?)),
                     "all" => Ok(arguments
                         .iter()
                         .try_fold(true, |acc, value| {
@@ -275,6 +261,32 @@ impl Context {
             Value::Array(_) => self.evaluate(value),
             literal => Ok(literal.clone()),
         }
+    }
+
+    /// `["in", key, v0, …, vn]`: does the first operand equal any of the rest?
+    ///
+    /// Only the first operand names a property; the list items are values and
+    /// go through `evaluate`, the same split the comparisons use. Shared with
+    /// `!in`, so the two cannot drift apart.
+    fn is_in(&self, arguments: &[Value]) -> Result<bool, Error> {
+        let (value, list) = first_and_rest(arguments)?;
+        let value = self.property_or_expression(value)?;
+
+        for item in list {
+            if value == self.evaluate(item)? {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// `["any", f0, …, fn]`: is any argument true? Shared with `none`, which
+    /// the legacy filter spec defines as exactly its negation.
+    fn any_of(&self, arguments: &[Value]) -> Result<bool, Error> {
+        arguments.iter().try_fold(false, |acc, value| {
+            Ok(acc || self.evaluate(value)? == Value::Bool(true))
+        })
     }
 }
 
@@ -982,5 +994,77 @@ mod tests {
             context.evaluate(&json!([">=", "class", "minor"])).unwrap(),
             json!(true)
         );
+    }
+
+    /// The legacy `none` and `!in` filter operators.
+    ///
+    /// Each is asserted against the operator it negates, on identical
+    /// arguments, so the pair pins the complement and not merely the value.
+    #[test]
+    fn test_none_and_not_in_operators() {
+        let properties = HashMap::from([
+            ("class".to_string(), json!("service")),
+            ("rank".to_string(), json!(3)),
+        ]);
+        let context = Context::new("LineString".to_string(), properties, 1);
+
+        // `none` is `!any`: every argument must be false.
+        assert_eq!(
+            context
+                .evaluate(&json!(["any", ["==", "class", "path"], ["==", "rank", 9]]))
+                .unwrap(),
+            json!(false)
+        );
+        assert_eq!(
+            context
+                .evaluate(&json!(["none", ["==", "class", "path"], ["==", "rank", 9]]))
+                .unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            context
+                .evaluate(&json!(["any", ["==", "class", "path"], ["==", "rank", 3]]))
+                .unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            context
+                .evaluate(&json!(["none", ["==", "class", "path"], ["==", "rank", 3]]))
+                .unwrap(),
+            json!(false)
+        );
+
+        // `!in` is `!in`.
+        assert_eq!(
+            context
+                .evaluate(&json!(["in", "class", "path", "track"]))
+                .unwrap(),
+            json!(false)
+        );
+        assert_eq!(
+            context
+                .evaluate(&json!(["!in", "class", "path", "track"]))
+                .unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            context
+                .evaluate(&json!(["in", "class", "path", "service"]))
+                .unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            context
+                .evaluate(&json!(["!in", "class", "path", "service"]))
+                .unwrap(),
+            json!(false)
+        );
+
+        // The symptom is a whole layer that draws nothing: `Filter::matches`
+        // turns the evaluator's error into `false`, and both of these are
+        // negative filters that should be true for this feature. Gate where
+        // the symptom lives, not only on `evaluate`.
+        assert!(Filter(json!(["none", ["==", "class", "path"]])).matches(&context));
+        assert!(Filter(json!(["!in", "class", "path", "track"])).matches(&context));
     }
 }
