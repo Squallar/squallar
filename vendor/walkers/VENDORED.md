@@ -1217,8 +1217,9 @@ corner. That argument does not survive looking at *why* they are absent:
   CARTO styles that something has to handle. The only question is where.
 - Handling it in the converter puts a correctness requirement of the evaluator
   in a **different workspace**. `tools/basemap-style` is its own workspace
-  root, so root `cargo test --workspace` walks straight past it; only
-  `.github/workflows/basemap-style.yaml` runs it. Any style that reaches
+  root, so root `cargo test --workspace` walks straight past it, and **nothing
+  in CI runs it at all** — the workflow that briefly did was deleted as a
+  recurring gate on a one-time job. Any style that reaches
   `Context::evaluate` without going through that converter — a hand-written
   one, a future source, a style fetched rather than generated — loses a whole
   layer silently.

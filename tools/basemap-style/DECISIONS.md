@@ -274,17 +274,20 @@ modern expression rather than passing it through.
 
 ---
 
-## Only one CI gate reaches this directory
+## No CI gate reaches this directory, deliberately
 
 `tools/basemap-style` is its own workspace root, so root `cargo
-build/test/clippy --workspace` and `cargo fmt --all` all walk straight past it —
-the mechanism `.github/workflows/tiler.yaml` documents at length.
-`tools/squallar-tiler` closed that gap with a dedicated `--manifest-path`-scoped
-workflow, and **`.github/workflows/basemap-style.yaml` now does the same here**.
-It runs on `ubuntu-24.04` with no container, caches with
-`Swatinem/rust-cache`'s `workspaces: 'tools/basemap-style'` (root caching cannot
-see a non-member), and gates build, fmt, clippy and test — the same four
-commands listed below, which remain what to run by hand:
+build/test/clippy --workspace` and `cargo fmt --all` all walk straight past it.
+**That is not a gap to close.** This tool is run **once, by a human**, and its
+output — `www/styles/{dark,light}.json` — is committed as owned source that is
+edited by hand from then on. There is no upstream to track and nothing
+recurring to re-validate, so a workflow here would be a recurring gate on a
+one-time job: cost with no subject.
+
+A `basemap-style.yaml` was written and then deleted for exactly that reason. If
+you are about to add one back, the question to answer first is *what changes
+that this would catch* — and if the answer is "the converter's own tests", run
+them by hand, which is what these four commands are for:
 
 ```sh
 cargo build --release --manifest-path tools/basemap-style/Cargo.toml
@@ -293,22 +296,13 @@ cargo clippy --all-targets --manifest-path tools/basemap-style/Cargo.toml -- -D 
 cargo test  --manifest-path tools/basemap-style/Cargo.toml
 ```
 
-Its `paths:` trigger is `tools/basemap-style/**`, `www/styles/**` and
-`vendor/walkers/**`. The second is the point of the file: those 29 tests are the
-only automated check anywhere that the committed styles still deserialise, so a
-gate that did not re-run on a style edit would be decorative. The third has no
-counterpart in `tiler.yaml` and is not decoration either — the tiler depends on
-no workspace crate by path, while this crate's dev-dependency is
-`walkers = { path = "../../vendor/walkers", features = ["mvt"] }`, and a change
-to that deserialiser can redden these tests without touching either directory
-above.
-
-Two things it still does not do, named so they are not mistaken for covered.
-It is a `pull_request` gate (plus `workflow_dispatch`), matching `tiler.yaml`
-and unlike `build.yaml`, which also runs on `push` — so a commit that reaches
-`main` without a pull request is not gated by it. And nothing anywhere re-runs
-the converter or compares its output to `www/styles/`; see "Reproducing the
-seed" below for why that is deliberate.
+**One thing the deletion does cost, and it is worth knowing.** Those 29 tests
+were the only automated check anywhere that the committed `www/styles/*.json`
+still deserialise. Nothing replaces that today. If it is wanted, it belongs in
+`squallar-egui` — the crate that actually loads them — and not here, on the
+principle that a gate belongs at the layer the symptom lives in. A converter's
+CI could only ever prove the converter still works, which is not the thing
+users would notice breaking.
 
 ---
 
