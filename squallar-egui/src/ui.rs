@@ -1185,7 +1185,9 @@ impl Gui {
     }
 
     /// How many tiles every floor strip together would keep resident at `bias`,
-    /// across the raster layers each of them draws.
+    /// across the raster layers each of them draws — worst case over the whole
+    /// zoom range, because a bias the frame can only afford at a whole zoom is
+    /// one it cannot afford.
     fn floor_tile_working_set(&self, bias: u8) -> usize {
         self.panes()
             .iter()

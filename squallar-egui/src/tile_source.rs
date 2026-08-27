@@ -50,7 +50,7 @@ pub const MAX_PARALLEL_DOWNLOADS: usize = 6;
 /// |---------|--------:|-------------------------------:|
 /// | desktop |     256 |                        ~64 MiB |
 /// | mobile  |     128 |                        ~32 MiB |
-/// | wasm32  |      64 |                        ~16 MiB |
+/// | wasm32  |      96 |                        ~24 MiB |
 ///
 /// The desktop arm is walkers' own figure. "Per source" is the multiplier: each
 /// map source owns one of these caches — base and labels, light and dark — so
@@ -59,19 +59,36 @@ pub const MAX_PARALLEL_DOWNLOADS: usize = 6;
 /// allows the whole application. The tiers follow that crate's budget cascade,
 /// spelled rather than imported.
 ///
-/// What the wasm arm accepts: at a whole zoom the working set is *exactly* the
-/// window's own tile count (`tiles::tiles_resident_for`, held equal to what
-/// `tiles::tile_span` asks for by
-/// `the_span_and_the_cache_sizing_agree_at_a_whole_zoom`), so a 1920x1080-point
-/// canvas keeps 54 tiles per source and fits, while 2560x1440 keeps 77 and
-/// overruns.
+/// **Every arm is sized against the worst case over the whole zoom range**, not
+/// against a whole zoom. A tile is drawn `256 · 2^(zoom − round(zoom))` points
+/// across, down to 181 at the half step, so between two whole zooms more tiles
+/// fit the same window than at either end of it: 84 per source over a
+/// 1920x1080-point canvas at one layer, against 54 at a whole zoom.
+/// [`crate::tiles::tiles_resident_for`] reports that larger figure and
+/// `tiles::tests` holds it equal to what the `tile_span` sweep measures.
 ///
-/// **Between two whole zooms it is larger, and this arm does not cover that.**
-/// A tile is drawn `256 · 2^(zoom − round(zoom))` points across, down to 181 at
-/// the half step, so more of them fit the same window: 84 at 1920x1080,
-/// measured by the same test, against the 64 here. `tiles_resident_for`
-/// measures a tile as `tiles::TILE_SIDE_POINTS` and carries no scale term, so
-/// it does not report that.
+/// What each arm covers, at one layer, in **points** — a 4K panel at the 2x
+/// scaling it is nearly always run at presents 1920x1080 points, not 3840x2160:
+///
+/// | canvas    | tiles | wasm 96 | mobile 128 | desktop 256 |
+/// |-----------|------:|---------|------------|-------------|
+/// | 1920x1080 |    84 | fits    | fits       | fits        |
+/// | 1920x1200 |    96 | fits    | fits       | fits        |
+/// | 2560x1440 |   144 | overruns| overruns   | fits        |
+/// | 3840x2160 |   299 | overruns| overruns   | overruns    |
+///
+/// The wasm arm is 96 because that is 1920x1200 — the tallest panel in common
+/// use at 1920 wide — and it carries 1080p's 84 with room rather than sitting
+/// exactly on it. It costs 24 MiB per source, and the app can hold four live
+/// sources at once (base and labels, light and dark; a theme flip retains
+/// both), so 96 MiB against the 288 MiB budget: a third of it.
+///
+/// An LRU below the working set is not a slower cache, it is a broken one. It
+/// evicts a tile that is still on the glass, the next frame re-enters
+/// `request_once` for it, and that tile is fetched over the network again and
+/// re-decoded against [`WASM_TILE_DECODES_PER_PUMP`] — for something the user
+/// never stopped looking at. `tiles::tests`'
+/// `the_cache_holds_the_working_set_at_every_zoom` is the gate.
 #[cfg(target_arch = "wasm32")]
 pub const TILE_CACHE_ENTRIES: NonZeroUsize = WASM_TILE_CACHE_ENTRIES;
 /// See the wasm32 arm above.
@@ -90,7 +107,7 @@ pub const TILE_CACHE_ENTRIES: NonZeroUsize = DESKTOP_TILE_CACHE_ENTRIES;
 /// The wasm32 arm of [`TILE_CACHE_ENTRIES`]. All three arms are named outside
 /// the cascade because this workspace runs `cargo test` on one arm, so the other
 /// two are only reachable from a test if they have names.
-pub const WASM_TILE_CACHE_ENTRIES: NonZeroUsize = NonZeroUsize::new(64).expect("64 is not zero");
+pub const WASM_TILE_CACHE_ENTRIES: NonZeroUsize = NonZeroUsize::new(96).expect("96 is not zero");
 /// The mobile arm. See [`WASM_TILE_CACHE_ENTRIES`].
 pub const MOBILE_TILE_CACHE_ENTRIES: NonZeroUsize =
     NonZeroUsize::new(128).expect("128 is not zero");

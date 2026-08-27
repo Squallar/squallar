@@ -57,7 +57,9 @@ fn whole_tile_uv() -> egui::Rect {
 /// The tuning values, restated as literals.
 const EXPECTED_CACHE_ENTRIES: usize = 256;
 const EXPECTED_MOBILE_CACHE_ENTRIES: usize = 128;
-const EXPECTED_WASM_CACHE_ENTRIES: usize = 64;
+/// Not a fraction of the desktop figure: the worst-case working set of a
+/// 1920x1200-point canvas, which `tiles::tests` measures at exactly this.
+const EXPECTED_WASM_CACHE_ENTRIES: usize = 96;
 const EXPECTED_PARALLEL_DOWNLOADS: usize = 6;
 const EXPECTED_WASM_DECODES_PER_PUMP: usize = 2;
 
@@ -957,7 +959,23 @@ fn the_tuning_constants_are_the_written_figures_on_every_tier() {
     assert_eq!(
         WASM_TILE_CACHE_ENTRIES.get(),
         EXPECTED_WASM_CACHE_ENTRIES,
-        "the wasm arm is a quarter of the desktop figure"
+        "the wasm arm is the worst-case working set of a 1920x1200-point \
+         canvas, not a fraction of the desktop figure"
+    );
+    assert_eq!(
+        WASM_TILE_CACHE_ENTRIES.get(),
+        crate::tiles::tiles_resident_for(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1200.0)),
+            0,
+            1,
+        ),
+        "the wasm arm must stay derived from what a viewport actually keeps \
+         resident, worst case over the whole zoom range"
+    );
+    assert!(
+        WASM_TILE_CACHE_ENTRIES.get() <= MOBILE_TILE_CACHE_ENTRIES.get()
+            && MOBILE_TILE_CACHE_ENTRIES.get() <= DESKTOP_TILE_CACHE_ENTRIES.get(),
+        "the tiers must stay ordered by how much memory the class has"
     );
     assert_eq!(
         WASM_TILE_DECODES_PER_PUMP, EXPECTED_WASM_DECODES_PER_PUMP,

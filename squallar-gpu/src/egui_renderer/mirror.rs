@@ -24,11 +24,18 @@ use squallar_device_profile::constants::MIRROR_MAX_SIDE;
 /// The highest rung the mirror is ever asked for, as a multiple of the frame's
 /// own texel density.
 ///
-/// Two independent things stop at 2. The tile cache: bias `log2(rung)` is four
-/// times the tiles per level against one shared `TILE_CACHE_ENTRIES` LRU (256 on
-/// desktop) — a 900-point floor strip needs ~32 tiles at bias 0, 162 at 1, 594
-/// at 2. Memory: 4× the frame's texels is 16× its bytes, 126 MiB for a 1080p
-/// frame, which no arm of `VOLUME_MIRROR_BYTES_MAX` admits.
+/// Two independent things stop at 2. The tile cache: bias `log2(rung)` roughly
+/// quadruples the tiles per level against one shared `TILE_CACHE_ENTRIES` LRU
+/// (256 on desktop) — a 900-point floor strip drawing base and labels needs 72
+/// tiles at bias 0, 242 at 1 and 882 at 2, so bias 2 could not be held whatever
+/// the camera asked for. Those are the figures
+/// `squallar_egui::tiles::tiles_resident_for` reports, which are the worst case
+/// over the whole zoom range rather than at a whole zoom: between two zoom
+/// steps a tile is drawn smaller and more of them fit, so a cache sized on the
+/// whole-zoom count evicts tiles that are still on the glass.
+///
+/// Memory: 4× the frame's texels is 16× its bytes, 126 MiB for a 1080p frame,
+/// which no arm of `VOLUME_MIRROR_BYTES_MAX` admits.
 ///
 /// The mirror covers the frame plus the off-screen floor strips, which one
 /// uniform translation keeps under twice the frame — at most one extra halving

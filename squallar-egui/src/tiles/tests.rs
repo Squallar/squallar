@@ -616,7 +616,7 @@ const BETWEEN_ZOOMS_WORST: usize = 84;
 /// [`crate::tile_source::TILE_CACHE_ENTRIES`]'s docs make.
 #[test]
 fn the_span_and_the_cache_sizing_agree_at_a_whole_zoom() {
-    let budget = tiles_resident_for(canvas(), 0, 1);
+    let budget = tiles_resident_at_whole_zoom(canvas(), 0, 1);
 
     let mut whole = 0usize;
     let mut between = (0usize, String::new());
@@ -647,23 +647,221 @@ fn the_span_and_the_cache_sizing_agree_at_a_whole_zoom() {
          `tile_source`'s cache-sizing docs quote it"
     );
 
-    // A record of a gap `tiles_resident_for` has, not a gate on the span:
-    // it measures a tile as TILE_SIDE_POINTS, but between two whole zooms a
-    // tile is drawn `256 * 2^(zoom - round(zoom))` points across — 181 at the
-    // half step — so more of them fit the same window and the figure
-    // understates. The wasm arm is sized against the whole-zoom number only.
+    // Between two whole zooms a tile is drawn `256 * 2^(zoom - round(zoom))`
+    // points across — 181 at the half step — so more of them fit the same
+    // window. That is the larger figure, it is the one a cache must be sized
+    // against, and it is the one `tiles_resident_for` reports; the whole-zoom
+    // number above is never a cache size.
     assert_eq!(
         between.0, BETWEEN_ZOOMS_WORST,
         "the between-zooms worst case is a measured figure and moved; the worst \
          case this sweep found is at {}",
         between.1
     );
-    assert!(
-        between.0 > crate::tile_source::WASM_TILE_CACHE_ENTRIES.get(),
-        "between-zooms worst case is {} tiles at {}, which no longer overruns \
-         the {} the wasm arm allows",
+    assert_eq!(
+        tiles_resident_for(canvas(), 0, 1),
         between.0,
-        between.1,
+        "`tiles_resident_for` must carry the between-zooms worst case the sweep \
+         measures at {}, and `tiles_resident_at_whole_zoom` the {budget} at a \
+         whole zoom — one function per question",
+        between.1
+    );
+    assert!(
+        between.0 > budget,
+        "the between-zooms case must be the larger of the two, or the scale \
+         term points the wrong way"
+    );
+}
+
+/// **The cache holds the working set at every zoom, not only the whole ones.**
+///
+/// The wasm arm is the tight one, so it is the arm this gates. An LRU smaller
+/// than the sweep's worst case evicts a tile that is still on the glass, and
+/// the next frame re-enters `request_once` for it: a network fetch and a
+/// decode against the per-source, per-pass wasm decode budget, for a tile the
+/// user never stopped looking at.
+#[test]
+fn the_cache_holds_the_working_set_at_every_zoom() {
+    let mut cases = 0usize;
+    let mut worst = (0usize, String::new());
+
+    for (zoom, anchor, offset) in span_sweep() {
+        let Some((projector, tile_zoom)) = projector_for(zoom, anchor, offset) else {
+            continue;
+        };
+        cases += 1;
+        let drawn = tile_span(&projector, canvas(), tile_zoom).tiles();
+        if drawn > worst.0 {
+            worst = (
+                drawn,
+                format!("z{zoom} anchor {anchor:?} offset {offset:?}"),
+            );
+        }
+    }
+
+    assert!(
+        cases >= 1000,
+        "the sweep must not go vacuous: only {cases} cases ran"
+    );
+    assert_eq!(
+        worst.0, BETWEEN_ZOOMS_WORST,
+        "the worst case over the whole zoom range is a measured figure and \
+         moved; the worst this sweep found is at {}",
+        worst.1
+    );
+    assert!(
+        worst.0 <= crate::tile_source::WASM_TILE_CACHE_ENTRIES.get(),
+        "a {CANVAS:?}-point canvas keeps {} tiles resident per source at {}, \
+         against the {} the wasm arm allows: the LRU evicts tiles that are \
+         still on the glass",
+        worst.0,
+        worst.1,
         crate::tile_source::WASM_TILE_CACHE_ENTRIES.get()
     );
+}
+
+/// `tiles_resident_for` reports the worst case over the **whole** zoom range,
+/// which is the question every caller sizing a cache against it is asking.
+///
+/// It is an upper bound on every case the sweep measures, and it is attained —
+/// a bound nothing reaches would size the cache for a viewport that does not
+/// exist.
+#[test]
+fn tiles_resident_for_reports_the_worst_case_over_the_zoom_range() {
+    let budget = tiles_resident_for(canvas(), 0, 1);
+    let mut cases = 0usize;
+    let mut over = Vec::new();
+    let mut worst = 0usize;
+
+    for (zoom, anchor, offset) in span_sweep() {
+        let Some((projector, tile_zoom)) = projector_for(zoom, anchor, offset) else {
+            continue;
+        };
+        cases += 1;
+        let drawn = tile_span(&projector, canvas(), tile_zoom).tiles();
+        worst = worst.max(drawn);
+        if drawn > budget {
+            over.push(format!(
+                "  z{zoom} anchor {anchor:?} offset {offset:?}: {drawn} tiles \
+                 against a reported {budget}"
+            ));
+        }
+    }
+
+    assert!(
+        cases >= 1000,
+        "the sweep must not go vacuous: only {cases} cases ran"
+    );
+    assert!(
+        over.is_empty(),
+        "{} of {cases} sweep cases ask for more tiles than `tiles_resident_for` \
+         reports, so anything sized against it is undersized; first 12:\n{}",
+        over.len(),
+        over.iter().take(12).cloned().collect::<Vec<_>>().join("\n")
+    );
+    assert_eq!(
+        budget, worst,
+        "`tiles_resident_for` must report the worst case the sweep measures, \
+         not merely bound it"
+    );
+}
+
+/// The two counts at real canvases, pinned. The tier table in
+/// [`crate::tile_source::TILE_CACHE_ENTRIES`]'s docs quotes every figure here.
+///
+/// Sizes are in **points**: a 4K panel at the 2x scaling it is nearly always
+/// run at presents the 1920x1080 row, not the 3840x2160 one.
+#[test]
+fn the_resident_counts_are_the_ones_the_tier_table_quotes() {
+    let canvas = |w: f32, h: f32| egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h));
+
+    for (w, h, whole, worst) in [
+        (1920.0, 1080.0, 54usize, 84usize),
+        (1920.0, 1200.0, 54, 96),
+        (2560.0, 1440.0, 77, 144),
+        (3840.0, 2160.0, 160, 299),
+    ] {
+        assert_eq!(
+            tiles_resident_at_whole_zoom(canvas(w, h), 0, 1),
+            whole,
+            "the whole-zoom count for {w}x{h} points moved"
+        );
+        assert_eq!(
+            tiles_resident_for(canvas(w, h), 0, 1),
+            worst,
+            "the worst-case count for {w}x{h} points moved"
+        );
+        assert!(worst > whole, "the scale term must only ever add tiles");
+    }
+
+    // One zoom of bias halves the tile on both axes, so it costs exactly what
+    // doubling the canvas on both axes costs.
+    assert_eq!(
+        tiles_resident_for(canvas(1920.0, 1080.0), 1, 1),
+        tiles_resident_for(canvas(3840.0, 2160.0), 0, 1),
+    );
+    assert_eq!(tiles_resident_for(canvas(1920.0, 1080.0), 1, 1), 299);
+    // And `layers` is a flat multiplier: one cache per layer's own source.
+    assert_eq!(tiles_resident_for(canvas(1920.0, 1080.0), 0, 2), 168);
+
+    // The degenerate inputs still answer zero rather than panicking.
+    assert_eq!(tiles_resident_for(canvas(f32::NAN, 1080.0), 0, 1), 0);
+    assert_eq!(tiles_resident_for(canvas(1920.0, f32::INFINITY), 0, 1), 0);
+    assert_eq!(tiles_resident_for(canvas(1920.0, 1080.0), 255, 1), 0);
+}
+
+/// Every tier holds the worst case for the canvas its docs claim it holds, and
+/// the canvas its docs say it stops at really is past it.
+#[test]
+fn each_tier_holds_the_canvas_its_docs_claim() {
+    use crate::tile_source::{
+        DESKTOP_TILE_CACHE_ENTRIES, MOBILE_TILE_CACHE_ENTRIES, WASM_TILE_CACHE_ENTRIES,
+    };
+    let canvas = |w: f32, h: f32| egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h));
+
+    for (tier, entries, holds, overruns_at) in [
+        (
+            "wasm32",
+            WASM_TILE_CACHE_ENTRIES.get(),
+            canvas(1920.0, 1200.0),
+            canvas(2560.0, 1440.0),
+        ),
+        (
+            "mobile",
+            MOBILE_TILE_CACHE_ENTRIES.get(),
+            canvas(1920.0, 1200.0),
+            canvas(2560.0, 1440.0),
+        ),
+        (
+            "desktop",
+            DESKTOP_TILE_CACHE_ENTRIES.get(),
+            canvas(2560.0, 1440.0),
+            canvas(3840.0, 2160.0),
+        ),
+    ] {
+        let need = tiles_resident_for(holds, 0, 1);
+        assert!(
+            need <= entries,
+            "the {tier} arm holds {entries} tiles, but a {holds:?}-point canvas \
+             keeps {need} resident per source"
+        );
+        let past = tiles_resident_for(overruns_at, 0, 1);
+        assert!(
+            past > entries,
+            "the {tier} arm is documented as stopping at {overruns_at:?}, but \
+             that canvas's {past} tiles fit inside its {entries}"
+        );
+    }
+
+    // The wasm arm is the one whole-zoom-only sizing under-served: 84 tiles for
+    // the 1920x1080 canvas every tier is quoted against, which the 64 it used
+    // to hold could not carry at any fractional zoom.
+    let reference = tiles_resident_for(canvas(1920.0, 1080.0), 0, 1);
+    assert!(
+        reference > 64,
+        "the 64-entry arm was undersized, and by {reference} to 64"
+    );
+    assert!(reference <= WASM_TILE_CACHE_ENTRIES.get());
+    assert!(reference <= MOBILE_TILE_CACHE_ENTRIES.get());
+    assert!(reference <= DESKTOP_TILE_CACHE_ENTRIES.get());
 }
