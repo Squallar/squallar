@@ -346,18 +346,28 @@ fn pump_until<T>(timeout: Duration, mut step: impl FnMut() -> Option<T>) -> Opti
     }
 }
 
+/// One layer's worth of drawing, for a single-tile layer: the pump
+/// `ui_map_overlays::draw_tile_layer` runs once before its grid loop, then the
+/// one cell's `at`. [`HttpsTiles::at`] does not drain, so every loop below that
+/// waits for a tile to *arrive* has to go through the pump the drawing code
+/// goes through.
+fn draw_one(tiles: &mut HttpsTiles, tile_id: TileId) -> Option<TilePiece> {
+    tiles.pump();
+    tiles.at(tile_id)
+}
+
 /// Drive `tiles` until `tile_id` is drawable.
 fn tile_eventually(tiles: &mut HttpsTiles, tile_id: TileId) -> TilePiece {
-    pump_until(DEFAULT_TIMEOUT, || tiles.at(tile_id))
+    pump_until(DEFAULT_TIMEOUT, || draw_one(tiles, tile_id))
         .unwrap_or_else(|| panic!("{tile_id:?} never became available"))
 }
 
-/// Keep calling `at` for [`SETTLE`], asserting it never yields.
+/// Keep drawing for [`SETTLE`], asserting the tile never yields.
 fn stays_unavailable(tiles: &mut HttpsTiles, tile_id: TileId) {
     let deadline = Instant::now() + SETTLE;
     while Instant::now() < deadline {
         assert!(
-            tiles.at(tile_id).is_none(),
+            draw_one(tiles, tile_id).is_none(),
             "{tile_id:?} became available when it should not have"
         );
         std::thread::sleep(Duration::from_millis(2));
@@ -810,7 +820,7 @@ fn a_cached_ancestor_is_stretched_over_a_tile_that_has_not_arrived() {
         y: 1,
         zoom: 4,
     };
-    let piece = pump_until(DEFAULT_TIMEOUT, || tiles.at(descendant_id))
+    let piece = pump_until(DEFAULT_TIMEOUT, || draw_one(&mut tiles, descendant_id))
         .expect("the ancestor should have stood in for the missing tile");
 
     let Tile::Raster(texture) = piece.tile else {
@@ -915,6 +925,7 @@ fn no_more_than_the_concurrency_limit_is_downloaded_at_once() {
 
     let wanted = (EXPECTED_PARALLEL_DOWNLOADS * 12) as u32;
     let mut ask = || {
+        tiles.pump();
         for x in 0..wanted {
             tiles.at(TileId { x, y: 0, zoom: 8 });
         }
@@ -1016,6 +1027,7 @@ fn the_tile_cache_is_bounded() {
     let attempts = capacity as u32 + 64;
 
     let reached = pump_until(DEFAULT_TIMEOUT, || {
+        tiles.pump();
         for x in 0..attempts {
             tiles.at(TileId { x, y: 0, zoom: 10 });
         }
@@ -1045,6 +1057,7 @@ fn eviction_holds_at_every_tier_cap_and_takes_the_least_recent() {
         // The counter moves before any bound is near: three ids are three
         // entries, exactly.
         let reached = pump_until(DEFAULT_TIMEOUT, || {
+            tiles.pump();
             for x in 0..3 {
                 tiles.at(id(x));
             }
@@ -1059,6 +1072,7 @@ fn eviction_holds_at_every_tier_cap_and_takes_the_least_recent() {
         // Fill to exactly the cap. Below-or-at the bound nothing may be
         // evicted, so the exact count doubles as total membership.
         let reached = pump_until(DEFAULT_TIMEOUT, || {
+            tiles.pump();
             for x in 0..capacity as u32 {
                 tiles.at(id(x));
             }
@@ -1082,6 +1096,7 @@ fn eviction_holds_at_every_tier_cap_and_takes_the_least_recent() {
         // One insert at the cap: admitted, and paid for by exactly the LRU id.
         let new = id(capacity as u32);
         let admitted = pump_until(DEFAULT_TIMEOUT, || {
+            tiles.pump();
             tiles.at(new);
             tiles.tile_is_cached(new).then_some(())
         });
@@ -1270,7 +1285,7 @@ fn live_cartodb_tile_decodes_and_reaches_a_texture() {
     };
     println!("fetching {}", CartoDb::light().tile_url(tile_id));
 
-    let piece = pump_until(LIVE_TIMEOUT, || tiles.at(tile_id))
+    let piece = pump_until(LIVE_TIMEOUT, || draw_one(&mut tiles, tile_id))
         .expect("the world tile should download from CartoDB");
 
     let Tile::Raster(texture) = piece.tile else {
