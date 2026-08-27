@@ -145,6 +145,11 @@ pub(super) fn draw_tile_layer(
     tiles: &mut HttpsTiles,
     zoom_bias: u8,
 ) {
+    // Once for the layer, before the grid loop. `HttpsTiles::at` does not drain,
+    // so this is the only thing that moves finished fetches into the cache --
+    // and doing it per cell would repeat it once per tile in the span below.
+    tiles.pump();
+
     let tile_zoom = (zoom.round() as u8)
         .saturating_add(zoom_bias)
         .min(tiles.source_max_zoom());
@@ -244,6 +249,94 @@ mod tests {
             let _ = ctx.end_pass();
         }
         ctx
+    }
+
+    /// A source whose tiles can never arrive: a port nothing listens on, so a
+    /// request fails at connect. This test counts drains, and a fetch that could
+    /// succeed would only add a network to it.
+    #[derive(Clone)]
+    struct DeadSource;
+
+    impl walkers::sources::TileSource for DeadSource {
+        fn tile_url(&self, tile_id: TileId) -> String {
+            format!(
+                "http://127.0.0.1:1/{}/{}/{}.png",
+                tile_id.zoom, tile_id.x, tile_id.y
+            )
+        }
+
+        fn attribution(&self) -> walkers::sources::Attribution {
+            walkers::sources::Attribution {
+                text: "test",
+                url: "http://127.0.0.1:1/",
+                logo_light: None,
+                logo_dark: None,
+            }
+        }
+    }
+
+    /// **The drain is per layer, not per tile.**
+    ///
+    /// `HttpsTiles::pump` is what moves finished fetches into the cache, and
+    /// `draw_tile_layer` is its only caller. One layer must pump once, whatever
+    /// number of grid cells the span turns out to hold — the defect this pins
+    /// was one drain per cell, which at this canvas is a two-orders-of-magnitude
+    /// difference on wasm32, where each drain reads `cumulative_pass_nr` under
+    /// two `RwLock`s of the whole `Context`.
+    ///
+    /// The cell count is measured from the same `tile_span` the loop itself
+    /// calls, never written down here: a literal would only hold the arithmetic
+    /// this test did against itself.
+    #[test]
+    fn a_layer_drains_once_however_many_tiles_it_draws() {
+        squallar_radar::tls::init();
+
+        let ctx = egui::Context::default();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let zoom = 6.0;
+
+        let mut memory = walkers::MapMemory::default();
+        memory.set_zoom(zoom).expect("zoom 6 is in walkers' range");
+        let projector = walkers::Projector::new(canvas, &memory, walkers::lat_lon(35.33, -97.28));
+
+        let mut tiles = crate::tile_source::HttpsTiles::with_client(
+            DeadSource,
+            ctx.clone(),
+            reqwest::Client::builder()
+                .build()
+                .expect("the test client should build"),
+        );
+
+        let tile_zoom = zoom.round() as u8;
+        let cells = crate::tiles::tile_span(&projector, canvas, tile_zoom).tiles();
+        assert!(
+            cells > 1,
+            "fixture: the span must name more than one cell, or per-cell and \
+             per-layer are the same number"
+        );
+
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(canvas),
+            ..Default::default()
+        });
+        let ui = egui::Ui::new(
+            ctx.clone(),
+            egui::Id::new("draw_tile_layer_pump_count"),
+            egui::UiBuilder::new()
+                .layer_id(egui::LayerId::background())
+                .max_rect(canvas),
+        );
+
+        let before = tiles.pumps();
+        draw_tile_layer(&ui, &projector, zoom, &mut tiles, 0);
+        let drains = tiles.pumps() - before;
+        let _ = ctx.end_pass();
+
+        assert_eq!(
+            drains, 1,
+            "a layer of {cells} cells drained {drains} times; one layer is one \
+             drain, and {cells} is what a per-cell drain would have cost"
+        );
     }
 
     /// Each of the three conditions must block **on its own**.

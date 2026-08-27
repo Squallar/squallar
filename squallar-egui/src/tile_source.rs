@@ -23,8 +23,12 @@
 //! The IO runtime splits per target as walkers splits it: a thread with a
 //! current-thread tokio runtime on native, `spawn_local` on wasm. On wasm the
 //! IO task shares the page thread, so a completed fetch hands over **compressed
-//! bytes** and the decode + upload runs in the frame pump under
+//! bytes** and the decode + upload runs in [`HttpsTiles::pump`] under
 //! [`WASM_TILE_DECODES_PER_PUMP`] — see [`FetchPayload`].
+//!
+//! The pump is called **once per layer**, by `ui_map_overlays::draw_tile_layer`
+//! before its grid loop, and never from [`Tiles::at`] — see
+//! [`HttpsTiles::pump`] for why, and for the one thing that would break.
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
@@ -134,13 +138,34 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// rounds, not 2; a second pass doubles it again, since the budget keys on
 /// `Context::cumulative_pass_nr`. Against the pre-fix 12 across base + labels
 /// that is still a 3× cut, and it keeps each source filling at ~120 tiles a
-/// second at 60 fps. The pump requests a repaint whenever it uses its whole
-/// allowance, so a backlog drains over idle frames.
+/// second at 60 fps. [`HttpsTiles::pump`] requests a repaint whenever it uses
+/// its whole allowance, so a backlog drains over idle frames.
 ///
 /// Deliberately **capped inline, not offloaded**: tile PNGs behind the overlay
 /// worker's job round-trip would trade a bounded per-pass cost for seconds of
 /// blank basemap.
 pub const WASM_TILE_DECODES_PER_PUMP: usize = 2;
+
+/// Completed fetches one [`HttpsTiles::pump`] moves into the cache, native
+/// only.
+///
+/// Not a throttle, and not the counterpart of [`WASM_TILE_DECODES_PER_PUMP`]:
+/// on native [`fetch_one`] already decoded and uploaded on the IO thread, so a
+/// take here is a `LruCache::put` and nothing more. `tile_tx`/`tile_rx` is
+/// `channel(MAX_PARALLEL_DOWNLOADS)` with a single sender, so the queue cannot
+/// hold more than this, and the bound is only ever reached with an empty queue
+/// behind it.
+///
+/// It is spelled rather than left as "drain until empty" so the loop is bounded
+/// by a named figure and cannot spin against an IO thread refilling as fast as
+/// it is drained. The figure is what the old shape already moved per pass:
+/// [`Tiles::at`] took one tile per call and ran once per grid cell, and a layer
+/// has tens of cells — 54 over a 1920x1080-**point** canvas at a whole zoom and
+/// bias 0, by [`crate::tiles::tiles_resident_at_whole_zoom`] — so a pass already
+/// emptied the queue. Pumping once per layer keeps that only by taking the whole
+/// queue rather than one tile.
+#[cfg(not(target_arch = "wasm32"))]
+const NATIVE_TILE_UPLOADS_PER_PUMP: usize = MAX_PARALLEL_DOWNLOADS + 1;
 
 // ---------------------------------------------------------------------------
 // Target-dependent bounds
@@ -165,7 +190,7 @@ impl<T: TileSource + 'static> AsyncTileSource for T {}
 /// Native: the decoded [`Tile`] — [`fetch_one`] decodes and uploads on the IO
 /// thread. wasm32: the compressed PNG bytes, decoded by the frame pump at most
 /// [`WASM_TILE_DECODES_PER_PUMP`] per source per pass — see
-/// [`HttpsTiles::receive_fetched_tiles`].
+/// [`HttpsTiles::pump`].
 #[cfg(not(target_arch = "wasm32"))]
 type FetchPayload = Tile;
 #[cfg(target_arch = "wasm32")]
@@ -356,6 +381,11 @@ pub struct HttpsTiles {
     #[cfg(target_arch = "wasm32")]
     decode_budget: DecodeBudget,
 
+    /// [`Self::pump`] calls since this source was built — see [`Self::pumps`].
+    /// Always on, like the app's other ledgers: one `u64` add per layer per
+    /// pass, against the tens of [`Tiles::at`] calls the same layer makes.
+    pumps: u64,
+
     /// Declared last so it drops last: the channels above must close first, which
     /// is what tells the fetch loop to exit.
     #[expect(dead_code, reason = "owned for its Drop; shuts the IO task down")]
@@ -364,10 +394,12 @@ pub struct HttpsTiles {
 
 /// One source's per-pass decode allowance, wasm32 only.
 ///
-/// [`Tiles::at`] runs once per visible tile per pass and the pump runs at the
-/// top of every call, so a per-*call* bound would be no bound on the pass. The
-/// pass number is what turns it per-pass: the first call of a new pass restores
-/// the full allowance. Per *source* because each [`HttpsTiles`] owns one.
+/// [`HttpsTiles::pump`] runs once per layer, and one source is drawn as a layer
+/// in every pane that shows it plus the volume floor strip, so a per-*call*
+/// bound would still let a multi-pane layout bill one pass several times over.
+/// The pass number is what turns it per-pass: the first call of a new pass
+/// restores the full allowance. Per *source* because each [`HttpsTiles`] owns
+/// one.
 ///
 /// Compiled on native for the tests (`any(test, target_arch = "wasm32")`).
 #[cfg(any(test, target_arch = "wasm32"))]
@@ -405,10 +437,12 @@ impl DecodeBudget {
 
 /// Move at most `budget` completed fetches out of `rx`, handing each to `take`.
 /// Returns how many were taken. Stops early when the channel is empty; a closed
-/// channel is the IO task gone, logged as
-/// [`HttpsTiles::receive_one_fetched_tile`] logs it. Compiled on native for the
-/// tests, like [`DecodeBudget`].
-#[cfg(any(test, target_arch = "wasm32"))]
+/// channel is the IO task gone, and is logged rather than panicked on, as
+/// everywhere else in this module.
+///
+/// Both arms of [`HttpsTiles::drain_completed_fetches`] are this loop over a
+/// different `take` and a different budget — which is the whole platform
+/// difference behind [`HttpsTiles::pump`].
 fn drain_up_to<T>(rx: &mut Receiver<T>, budget: usize, mut take: impl FnMut(T)) -> usize {
     let mut taken = 0;
     while taken < budget {
@@ -436,7 +470,7 @@ impl HttpsTiles {
     /// [`Self::new`], with the HTTP client supplied. Crate-private, for the
     /// tests, which need to talk cleartext to a loopback server — [`tile_client`]
     /// refuses `http://` by design.
-    fn with_client<S: AsyncTileSource>(
+    pub(crate) fn with_client<S: AsyncTileSource>(
         source: S,
         egui_ctx: Context,
         client: reqwest::Client,
@@ -482,36 +516,76 @@ impl HttpsTiles {
             egui_ctx: frame_ctx,
             #[cfg(target_arch = "wasm32")]
             decode_budget: DecodeBudget::new(),
+            pumps: 0,
             runtime,
         }
     }
 
-    /// Move one fetched tile from the IO task into the cache.
+    /// Move what the IO task has finished into the cache.
     ///
-    /// One per call, as walkers does: this runs every frame for every visible
-    /// tile, and draining the whole channel here would put an unbounded number of
-    /// texture uploads in one frame.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn receive_one_fetched_tile(&mut self) {
-        match self.tile_rx.try_recv() {
-            Ok((tile_id, tile)) => {
-                self.cache.put(tile_id, Some(tile));
-            }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Closed) => log::error!("the tile IO task is gone"),
-        }
+    /// Call this **once per layer, before the layer's tile loop**;
+    /// `ui_map_overlays::draw_tile_layer` is the only caller. It is deliberately
+    /// not called from [`Tiles::at`], which runs once per grid cell: over a
+    /// 1920x1080-**point** canvas at a whole zoom and bias 0 that billed one
+    /// drain per cell — 45 measured at zoom 6 over Oklahoma, and up to 54 as the
+    /// grid's phase moves — for the one that had anything to move. On wasm32
+    /// each of them opened by reading `Context::cumulative_pass_nr`, two
+    /// `RwLock` acquisitions over the whole egui `Context`, only to learn the
+    /// pass had not changed.
+    ///
+    /// The platform difference lives in [`Self::drain_completed_fetches`], not
+    /// at the call site: on native the IO thread has already decoded and
+    /// uploaded, so a take is a cache put; on wasm32 the IO task shares the page
+    /// thread, so the PNG decode and the texture upload happen here, under
+    /// [`WASM_TILE_DECODES_PER_PUMP`].
+    ///
+    /// **The one thing this shape forbids:** handing an [`HttpsTiles`] to
+    /// `walkers::Map` as `dyn Tiles`. walkers' `draw_tiles`/`flood_fill_tiles`
+    /// call `at` and know nothing about this method, so tiles would be requested
+    /// and never arrive. Nothing does today — both `Map::new` sites in `ui_map`
+    /// pass `None` for tiles and the app draws its own tile layers — and nothing
+    /// plans to.
+    pub fn pump(&mut self) {
+        self.pumps += 1;
+        self.drain_completed_fetches();
     }
 
-    /// Decode, upload and cache at most this pass's remaining allowance of
-    /// fetched tiles. The wasm32 counterpart of
-    /// [`Self::receive_one_fetched_tile`].
+    /// [`Self::pump`] calls since this source was built.
+    ///
+    /// An always-on ledger, for the same reason the overlay and upload ledgers
+    /// are: the cost this method's granularity controls is invisible from the
+    /// outside otherwise, and `ui_map_overlays`' tests read it to hold the drain
+    /// at one per layer rather than one per tile.
+    pub fn pumps(&self) -> u64 {
+        self.pumps
+    }
+
+    /// Native: move at most [`NATIVE_TILE_UPLOADS_PER_PUMP`] already-decoded
+    /// tiles into the cache. [`fetch_one`] did the decode and the upload on the
+    /// IO thread, so this is a queue move and nothing more.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn drain_completed_fetches(&mut self) {
+        // Split borrow: the closure needs the cache while the receiver is
+        // borrowed.
+        let Self { cache, tile_rx, .. } = self;
+        drain_up_to(
+            tile_rx,
+            NATIVE_TILE_UPLOADS_PER_PUMP,
+            |(tile_id, tile): (TileId, Tile)| {
+                cache.put(tile_id, Some(tile));
+            },
+        );
+    }
+
+    /// wasm32: decode, upload and cache at most this pass's remaining allowance
+    /// of fetched tiles.
     ///
     /// [`DecodeBudget`] keeps a burst of completed fetches from billing one pass
     /// for this source's whole backlog. The put is unconditional, exactly as a
     /// native tile arriving is: a `None` marker still means failed, do not ask
     /// again.
     #[cfg(target_arch = "wasm32")]
-    fn receive_fetched_tiles(&mut self) {
+    fn drain_completed_fetches(&mut self) {
         let Self {
             cache,
             tile_rx,
@@ -624,14 +698,13 @@ impl Tiles for HttpsTiles {
 
     /// Return the tile if it is available, and start a download if it is not.
     ///
-    /// Called once per visible tile per frame by walkers' flood fill, so
-    /// everything here is cheap and non-blocking.
+    /// Called once per grid cell of the layer being drawn, by
+    /// `ui_map_overlays::draw_tile_layer` — **not** by walkers' flood fill,
+    /// which is unreachable here because both `Map::new` sites in `ui_map` pass
+    /// `None` for tiles. Everything here is cheap and non-blocking, and what the
+    /// IO task has finished arrives through [`Self::pump`], once for the whole
+    /// layer.
     fn at(&mut self, tile_id: TileId) -> Option<TilePiece> {
-        #[cfg(not(target_arch = "wasm32"))]
-        self.receive_one_fetched_tile();
-        #[cfg(target_arch = "wasm32")]
-        self.receive_fetched_tiles();
-
         if !tile_id_is_valid(tile_id) {
             return None;
         }
