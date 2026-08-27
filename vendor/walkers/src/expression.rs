@@ -149,8 +149,10 @@ impl Context {
                     }
                     "!=" => {
                         let (left, right) = two_elements(arguments)?;
-                        let left = self.property_or_expression(left)?;
-                        Ok(Value::Bool(left != *right))
+                        Ok(Value::Bool(
+                            self.property_or_expression(left)?
+                                != self.property_or_expression(right)?,
+                        ))
                     }
                     "<" => {
                         let (left, right) = two_elements(arguments)?;
@@ -189,11 +191,15 @@ impl Context {
                         let (input, stops) = first_and_rest(args)?;
                         let input = self.evaluate(input)?;
 
-                        // Stops are pairs of [input, output].
+                        // Stops are pairs of [input, output]. An odd-length stop
+                        // list is a malformed style, not a panic.
                         let stops = stops
                             .chunks(2)
-                            .map(|chunk| (chunk[0].clone(), chunk[1].clone()))
-                            .collect::<Vec<_>>();
+                            .map(|chunk| {
+                                let (stop_input, stop_output) = two_elements(chunk)?;
+                                Ok((stop_input.clone(), stop_output.clone()))
+                            })
+                            .collect::<Result<Vec<_>, Error>>()?;
 
                         // Find the two stops surrounding the input value.
                         let stop_pair = stops.windows(2).find(|pair| {
@@ -215,11 +221,18 @@ impl Context {
                                 input_position,
                             )?;
                             Ok(result)
-                        } else if lt(&input, &stops[0].0) {
-                            Ok(stops[0].1.clone())
-                        } else if lt(&stops[stops.len() - 1].0, &input) {
-                            Ok(stops[stops.len() - 1].1.clone())
+                        } else if let (Some(first), Some(last)) = (stops.first(), stops.last()) {
+                            // Before the first stop, or past the last one, clamp to it.
+                            if lt(&input, &first.0) {
+                                Ok(first.1.clone())
+                            } else if lt(&last.0, &input) {
+                                Ok(last.1.clone())
+                            } else {
+                                Err(Error::InterpolateStopNotFound(input, value.clone()))
+                            }
                         } else {
+                            // No stops at all: `first_and_rest` guarantees the input
+                            // value, never a stop to interpolate between.
                             Err(Error::InterpolateStopNotFound(input, value.clone()))
                         }
                     }
@@ -763,6 +776,59 @@ mod tests {
         let context = Context::new("Point".to_string(), properties, 1);
 
         assert_eq!(context.evaluate(&json!(["!", false])).unwrap(), json!(true));
+    }
+
+    /// An `interpolate` whose stop list has an odd number of elements is a style
+    /// error, not a panic.
+    #[test]
+    fn test_interpolate_with_an_odd_stop_list_is_an_error() {
+        let properties = HashMap::new();
+        let context = Context::new("Point".to_string(), properties, 1);
+
+        // Four stop elements would be two [input, output] pairs; five is a
+        // trailing input with no output.
+        assert!(matches!(
+            context.evaluate(&json!(["interpolate", ["linear"], 5, 0, 0, 10, 100, 20])),
+            Err(Error::TwoElementsExpected(_))
+        ));
+    }
+
+    /// An `interpolate` with no stops at all is a style error, not a panic.
+    #[test]
+    fn test_interpolate_with_no_stops_is_an_error() {
+        let properties = HashMap::new();
+        let context = Context::new("Point".to_string(), properties, 1);
+
+        assert!(matches!(
+            context.evaluate(&json!(["interpolate", ["linear"], 5])),
+            Err(Error::InterpolateStopNotFound(_, _))
+        ));
+    }
+
+    /// `!=` resolves both of its operands, exactly as `==` does.
+    #[test]
+    fn test_not_eq_operator_evaluates_both_sides() {
+        let properties = HashMap::from([
+            ("class".to_string(), json!("park")),
+            ("x".to_string(), json!("park")),
+        ]);
+        let context = Context::new("Point".to_string(), properties, 1);
+
+        // Both sides resolve to "park", so they are equal and `!=` is false.
+        assert_eq!(
+            context
+                .evaluate(&json!(["!=", "class", ["get", "x"]]))
+                .unwrap(),
+            json!(false)
+        );
+
+        // And the negation of `==` on the very same expression.
+        assert_eq!(
+            context
+                .evaluate(&json!(["==", "class", ["get", "x"]]))
+                .unwrap(),
+            json!(true)
+        );
     }
 
     #[test]
