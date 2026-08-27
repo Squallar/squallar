@@ -57,10 +57,15 @@ impl AdjustedPosition {
         self.offset.to_vec2().length()
     }
 
-    pub fn half_offset(self) -> Self {
+    /// Scale the pixel offset, leaving the base position and zoom alone.
+    ///
+    /// Replaces a fixed halving, so that the pull back to `my_position` can
+    /// decay by however much the frame that just elapsed is worth rather than
+    /// by however much one frame used to be worth.
+    pub fn scale_offset(self, factor: f64) -> Self {
         Self {
             position: self.position,
-            offset: self.offset / 2.0,
+            offset: self.offset * factor,
             zoom: self.zoom,
         }
     }
