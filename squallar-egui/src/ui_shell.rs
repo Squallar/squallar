@@ -12,6 +12,39 @@ pub(crate) fn chrome_frame(style: &egui::Style) -> egui::Frame {
     egui::Frame::window(style).shadow(egui::Shadow::NONE)
 }
 
+/// [`chrome_frame`]'s vocabulary at a padding a one-line notice can afford:
+/// the same theme tokens, a thinner margin.
+///
+/// The **only** frame in shipping code that is not [`chrome_frame`], and the
+/// reason is a measurement rather than taste. The stock window margin is 6pt a
+/// side, which takes the basemap credit's 11pt line to 25pt tall. In a
+/// portrait pane that credit is placed under the horizontal colour bar, and
+/// the strip there is the bar's own 16pt pane-edge margin
+/// (`pane_render::color_scale_under_rect`) — a 25pt surface does not fit it,
+/// and would hang into the phone shell's bottom bar.
+///
+/// Fill, stroke and rounding are still read straight off `visuals`, so the
+/// notice follows a theme change for the same reason [`chrome_frame`] does:
+/// nothing here is a colour anybody picked.
+pub(crate) fn notice_frame(visuals: &egui::Visuals) -> egui::Frame {
+    egui::Frame::new()
+        .fill(visuals.window_fill)
+        .stroke(visuals.window_stroke)
+        .corner_radius(visuals.window_corner_radius)
+        .inner_margin(egui::Margin::symmetric(NOTICE_MARGIN_X, NOTICE_MARGIN_Y))
+}
+
+/// [`notice_frame`]'s horizontal padding, a side.
+///
+/// A named const because the basemap credit has to know how wide it will lay
+/// out *before* it lays out — `ui_map::attribution_span` adds this to the
+/// measured text — and a second spelling of `4` at that call site would drift
+/// silently the first time this margin changed.
+pub(crate) const NOTICE_MARGIN_X: i8 = 4;
+
+/// [`notice_frame`]'s vertical padding, a side.
+pub(crate) const NOTICE_MARGIN_Y: i8 = 1;
+
 /// The scroll sources every panel `ScrollArea` accepts: the stock set plus
 /// **mouse** drag-to-scroll.
 pub(crate) fn panel_scroll_source() -> egui::scroll_area::ScrollSource {

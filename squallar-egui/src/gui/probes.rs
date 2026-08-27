@@ -69,6 +69,13 @@ pub(in crate::ui) struct FrameProbes {
     pub last_bottom_bar: BottomBarProbe,
     pub last_sheet: SheetProbe,
     pub last_error_toast: Option<ErrorToastProbe>,
+    /// Every basemap attribution the last frame drew, in draw order.
+    ///
+    /// A `Vec` rather than an `Option` because the defect this guards against
+    /// is *more than one*: a credit moved inside the pane loop would draw once
+    /// per pane, and an `Option` keeping only the last would read exactly like
+    /// the correct case.
+    pub last_attribution: Vec<egui::Rect>,
 }
 
 #[cfg(test)]
@@ -106,6 +113,7 @@ impl Default for FrameProbes {
             last_bottom_bar: BottomBarProbe::default(),
             last_sheet: SheetProbe::default(),
             last_error_toast: None,
+            last_attribution: Vec::new(),
         }
     }
 }

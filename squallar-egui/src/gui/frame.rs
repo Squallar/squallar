@@ -39,6 +39,7 @@ impl Gui {
             self.probes.last_settings_rows.clear();
             self.probes.last_popup_triggered.clear();
             self.probes.last_popup_handled.clear();
+            self.probes.last_attribution.clear();
             self.probes.last_stack = StackProbe::default();
             self.probes.last_inspector = InspectorProbe::default();
             self.probes.last_catalog = CatalogProbe::default();

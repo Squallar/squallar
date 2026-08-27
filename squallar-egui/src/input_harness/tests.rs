@@ -15001,3 +15001,491 @@ fn a_seek_on_a_forecast_transport_does_not_reach_a_linked_radar_pane() {
          on whichever scan sits at a forecast index: {seeks:?}"
     );
 }
+
+/// 66. **The basemap credit is drawn exactly once per panel, whatever the pane
+///     count, and the words really land on screen.**
+///
+/// Two obligations put it there — ODbL for the OpenStreetMap data and
+/// OpenMapTiles' CC-BY, which asks for visible credit in the corner of the map
+/// — and both are satisfied by one credit, not by one per pane. The failure
+/// this pins is a credit that slipped inside `render_panes`' pane loop: four
+/// panes, four copies, stacked in one corner and illegible.
+///
+/// The count alone would pass against a zero-sized area, so the rect has to
+/// have area and the text has to be found by the painted-text scan.
+///
+/// **And a drawn credit is not a readable one.** The corner it wants is
+/// already spoken for three ways — the colour scale's bar and tick labels, the
+/// floating status bar, and the timeline — and the first cut of this placement
+/// landed on all of them at once: measured at 1920x1080, the credit sat wholly
+/// inside the status bar's rect, took the scale's bottom tick label across its
+/// own last word, and clipped 3px of the bar. So the corner assertion is
+/// joined by two collision assertions, and they are what the landscape arm of
+/// the placement in `draw_basemap_attribution` is for.
+///
+/// **A portrait pane is placed the other way up, and this pins that too.**
+/// There the colour scale is a horizontal bar across the pane's bottom, and
+/// giving way to it upwards is what puts the credit *over* the bar, out in the
+/// map. The user asked for it under the bar, so the second leg below asserts
+/// the relationship by name: the credit's top edge is at or below the bar's
+/// bottom edge. The bar is found by its painted geometry — a wide, 20pt-tall
+/// quad — rather than by asking the placement code where it put it, which
+/// would only ask the belief under test to confirm itself.
+///
+/// It is joined by a floor: the credit must stay off the phone shell's bottom
+/// bar. That pair is what makes "under the bar" a placement rather than a
+/// slide off the bottom of the screen — the strip between the two is 16pt, the
+/// bar's own pane-edge margin, and the notice has to land inside it.
+///
+/// **What this test deliberately does not assert on the portrait leg is that
+/// the credit is unoccluded**, because at 402x874 it is not: the expanded
+/// transport spans `[0,772]-[402,825]` and already covers the whole
+/// colour-scale strip — the bar at `[16,789]-[386,809]` and its `dBZ` title
+/// with it. Anything under that bar is under the transport. Asserting
+/// visibility here would pin a property the requested placement cannot have
+/// while the scale itself is invisible, and the fix for both is one level down
+/// in `color_scale_floor`, not in where the credit hangs.
+#[test]
+fn the_basemap_credit_is_drawn_once_per_panel_not_once_per_pane() {
+    /// Everything true of the credit whichever way up the pane is.
+    fn shared(h: &InputHarness, label: &str) -> egui::Rect {
+        let panel = h.map_panel_rect();
+        let rects = h.attribution_rects().to_vec();
+
+        assert_eq!(
+            rects.len(),
+            1,
+            "{label} drew {} credits; one per panel is the contract",
+            rects.len(),
+        );
+
+        let rect = rects[0];
+        assert!(
+            rect.width() > 0.0 && rect.height() > 0.0,
+            "non-vacuity: {label} reported a credit occupying no area \
+             ({rect:?}) — the count above would pass against nothing drawn",
+        );
+        assert!(
+            panel.contains_rect(rect),
+            "{label}: the credit at {rect:?} left the map panel {panel:?}",
+        );
+        assert!(
+            rect.center().x > panel.center().x && rect.center().y > panel.center().y,
+            "{label}: the credit landed at {rect:?}, not in the panel's \
+             bottom-right corner of {panel:?}",
+        );
+        assert!(
+            h.text_painted_in(panel, "OpenStreetMap"),
+            "{label}: the credit reported a rect but no painted text naming \
+             OpenStreetMap — a rect is not a notice",
+        );
+
+        // Nothing else's words inside the credit's box. The colour scale's
+        // bottom tick label is the one that used to be there, but the scan is
+        // deliberately every text run rather than that label by name.
+        let trespass: Vec<_> = h
+            .painted_text_rects()
+            .into_iter()
+            .filter(|(other, text)| other.intersects(rect) && !text.contains("OpenStreetMap"))
+            .collect();
+        assert!(
+            trespass.is_empty(),
+            "{label}: the credit at {rect:?} has other painted text inside \
+             it: {trespass:?}",
+        );
+
+        rect
+    }
+
+    // --- Landscape: the scale is a vertical bar on the right, and the credit
+    //     lifts over the bottom chrome rather than printing on it.
+    for count in [1usize, 2, 4] {
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.set_pane_count(count);
+        h.frame();
+
+        let label = format!("landscape, {count} pane(s)");
+        let rect = shared(&h, &label);
+
+        // Not on the floating status bar, which spans nearly the panel's
+        // whole width along the bottom edge the credit wants.
+        let bar = h.status_bar().rect;
+        assert!(
+            bar.is_finite(),
+            "non-vacuity: {label} drew no status bar, so the collision \
+             assertion below could not have failed",
+        );
+        assert!(
+            !rect.intersects(bar),
+            "{label}: the credit at {rect:?} is drawn on the status bar at \
+             {bar:?}",
+        );
+    }
+
+    // --- Portrait: the scale is a horizontal bar along the bottom, and the
+    //     credit goes *under* it.
+    {
+        let mut h = InputHarness::with_screen(egui::vec2(402.0, 874.0));
+        h.set_pane_count(1);
+        h.frame();
+
+        let label = "portrait, 1 pane";
+        let rect = shared(&h, label);
+
+        let panel = h.map_panel_rect();
+        let bar = h
+            .painted_images_in(panel)
+            .into_iter()
+            .map(|image| image.rect)
+            .find(|r| (r.height() - 20.0).abs() < 0.5 && r.width() > 100.0)
+            .expect(
+                "non-vacuity: no horizontal colour-scale bar was painted, so \
+                 there was nothing for the credit to be under",
+            );
+        assert!(
+            bar.width() > bar.height(),
+            "non-vacuity: the quad found at {bar:?} is not a horizontal bar, \
+             so this leg is measuring the wrong thing",
+        );
+
+        assert!(
+            rect.top() >= bar.bottom(),
+            "the credit at {rect:?} is not under the colour bar at {bar:?} — \
+             its top edge {} is above the bar's bottom edge {}",
+            rect.top(),
+            bar.bottom(),
+        );
+
+        // And it stays out of the phone shell's bottom bar: "under the bar"
+        // has to mean the strip below it, not off the bottom of the map.
+        let shell = h.bottom_bar().rect;
+        assert!(
+            shell.is_finite(),
+            "non-vacuity: no phone bottom bar was drawn at 402x874, so the \
+             floor below could not have failed",
+        );
+        assert!(
+            rect.bottom() <= shell.top(),
+            "the credit at {rect:?} hangs into the phone shell's bottom bar \
+             at {shell:?}",
+        );
+    }
+}
+
+/// 67. **The colour scale is not drawn underneath the floating chrome.**
+///
+/// The bar, every tick label read against it and the unit title are one
+/// picture: a legend whose bottom labels are behind the status bar is a legend
+/// that cannot be read, and the failure is silent — the scale reports a rect,
+/// the painter paints it, and the pixels land under another surface.
+///
+/// Both targets had it, measured before the fix:
+///
+/// * **402x874** — the expanded transport spans `[0,772]-[402,825]` and the
+///   bar sat at `[16,789]-[386,809]`, wholly inside it, with its ticks and its
+///   `dBZ` title. The portrait colour scale was not on screen at all.
+/// * **1400x900** — the vertical bar ran to `[1364,72]-[1384,884]` and its
+///   bottom labels (`"0"` at `[1354.8,877.5]-[1361,890.5]`) sat inside the
+///   status bar at `[8,860]-[1394,892]`.
+///
+/// `Gui::color_scale_floor` is what fixes both, and this is its gate. It is a
+/// separate test from the basemap credit's (66) on purpose: this property is
+/// worth holding whether or not anything is placed under the bar.
+///
+/// **Touching is not overlapping here, deliberately.** The floor *is* the
+/// chrome's top edge, so a scale that fills the space exactly meets it — at
+/// 402x874 the `dBZ` title's bottom edge lands on `772.0`, the transport's
+/// top, to the pixel. That is the fix working, not a violation, so the test
+/// asks for positive-area overlap rather than `Rect::intersects`.
+#[test]
+fn the_colour_scale_is_not_drawn_under_the_floating_chrome() {
+    /// Overlap with area. `Rect::intersects` counts a shared edge, which is
+    /// the exact case this fix produces.
+    fn overlaps(a: egui::Rect, b: egui::Rect) -> bool {
+        let hit = a.intersect(b);
+        hit.width() > 0.0 && hit.height() > 0.0
+    }
+
+    for (label, w, ht) in [
+        ("landscape", 1400.0f32, 900.0f32),
+        ("portrait", 402.0f32, 874.0f32),
+    ] {
+        for collapsed in [false, true] {
+            let mut h = InputHarness::with_screen(egui::vec2(w, ht));
+            h.set_pane_count(1);
+            h.frame();
+            if collapsed {
+                let transport = h.timeline();
+                assert!(
+                    !transport.collapsed,
+                    "{label}: the transport was already collapsed, so the \
+                     click below is not what put it there",
+                );
+                h.mouse_click(transport.collapse.center());
+                h.warm_up();
+            }
+            h.frame();
+
+            let case = format!(
+                "{label}, transport {}",
+                if collapsed { "collapsed" } else { "expanded" }
+            );
+            let panel = h.map_panel_rect();
+
+            // The bar by its painted geometry — a SCALE_BAR_WIDTH-thick quad,
+            // long on the other axis — rather than by asking the placement
+            // code where it put it.
+            let bar = h
+                .painted_images_in(panel)
+                .into_iter()
+                .map(|image| image.rect)
+                .find(|r| {
+                    (r.height() - 20.0).abs() < 0.5 && r.width() > 100.0
+                        || (r.width() - 20.0).abs() < 0.5 && r.height() > 100.0
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "non-vacuity: {case} painted no colour-scale bar, so \
+                         there was nothing for this test to find covered",
+                    )
+                });
+
+            // Its tick labels and unit title: the text painted in the gutter
+            // around the bar. Numeric runs only, plus the unit — the `...`
+            // the transport draws is not a tick.
+            let zone = bar.expand(60.0);
+            let legend: Vec<(egui::Rect, String)> = h
+                .painted_text_rects()
+                .into_iter()
+                .filter(|(r, text)| {
+                    zone.contains(r.center())
+                        && (text == "dBZ"
+                            || (text.chars().any(|c| c.is_ascii_digit())
+                                && text.chars().all(|c| c.is_ascii_digit() || c == '.')))
+                })
+                .collect();
+            assert!(
+                legend.len() >= 5,
+                "non-vacuity: {case} found only {} legend labels around the \
+                 bar at {bar:?}; the scale draws a tick per threshold, so the \
+                 collision scan below would have had almost nothing to check: \
+                 {legend:?}",
+                legend.len(),
+            );
+
+            // Every floating surface that actually drew this frame.
+            let transport = h.timeline();
+            let chrome: Vec<(&str, egui::Rect)> = [
+                ("status bar", h.status_bar().rect),
+                ("transport", transport.rect),
+                ("timeline chip", transport.chip),
+                ("phone bottom bar", h.bottom_bar().rect),
+            ]
+            .into_iter()
+            .filter(|(_, r)| r.is_finite())
+            .collect();
+            assert!(
+                !chrome.is_empty(),
+                "non-vacuity: {case} drew no bottom chrome at all, so nothing \
+                 below could have failed",
+            );
+
+            for (name, rect) in &chrome {
+                assert!(
+                    !overlaps(bar, *rect),
+                    "{case}: the colour bar at {bar:?} is drawn under the \
+                     {name} at {rect:?}",
+                );
+                let buried: Vec<_> = legend.iter().filter(|(r, _)| overlaps(*r, *rect)).collect();
+                assert!(
+                    buried.is_empty(),
+                    "{case}: the {name} at {rect:?} is drawn over the colour \
+                     scale's own labels: {buried:?}",
+                );
+            }
+        }
+    }
+}
+
+/// 66b. **The basemap credit clears the bottom chrome at every width class,
+///      every pane count and both transport forms.**
+///
+/// Test 66 above pins the credit at two geometries — 1400x900 and 402x874 —
+/// and both were green while the notice was invisible across the whole
+/// 600-1000 medium band. This is the sweep that found that, kept as the gate.
+///
+/// **The defect it pins is a lift test that could not see the collision.** The
+/// expanded transport is a fixed ~880pt-wide *centred* area, so how much of
+/// the bottom-right corner it leaves free is not monotonic in the panel's
+/// width. `draw_basemap_attribution` asked whether a bar's span covered the
+/// credit's right **edge**; on a panel wide enough to leave that edge clear but
+/// too narrow to clear the whole notice, the transport's right edge lands
+/// *inside* the credit's box and the edge test reports no collision. Measured
+/// before the fix: at 1200x874 the credit spanned `[994,1137]` against a
+/// transport ending at `1040`, 46pt of overlap; at 800x874 with two panes it
+/// missed by 4pt. 33 of the 198 cases below failed, every one of them with the
+/// transport expanded.
+///
+/// So the widths are chosen, not round: `WidthClass::from_width` splits at 600
+/// and 1000, and each boundary is walked from both sides, because a shell that
+/// changes at a threshold is exactly where a placement stops being tested by
+/// the geometries either side of it. 1200 is here because it failed and 1400 —
+/// test 66's own width — did not, which is the non-monotonicity in one pair.
+///
+/// **The short height is deliberate.** 560pt leaves a four-pane grid's corner
+/// pane barely taller than the chrome under it, which is where a credit gets
+/// clamped off the top edge instead of merely covered. That the clamp in
+/// `draw_basemap_attribution` never fires into a collision is asserted here by
+/// the same on-screen test as everything else, rather than by naming it.
+///
+/// Three failures are possible and they are not the same bug, so the
+/// assertions separate them: *not drawn at all* (the count), *drawn off
+/// screen* (the containment), and *drawn but covered* (the overlap scan). The
+/// defect this found was the third.
+#[test]
+fn the_basemap_credit_clears_the_bottom_chrome_at_every_width() {
+    /// Overlap with area. `Rect::intersects` counts a shared edge, and a
+    /// credit resting exactly on a bar's top edge is the placement working.
+    fn overlaps(a: egui::Rect, b: egui::Rect) -> bool {
+        let hit = a.intersect(b);
+        hit.width() > 0.0 && hit.height() > 0.0
+    }
+
+    // Compact | the phone 66 pins | both sides of 600 | the medium band |
+    // both sides of 1000 | the width that failed | 66's own | desktop.
+    let widths = [
+        360.0f32, 402.0, 599.0, 600.0, 700.0, 900.0, 999.0, 1000.0, 1200.0, 1400.0, 1920.0,
+    ];
+    // Short enough to squeeze a 4-pane grid, the phone's own, and desktop.
+    let heights = [560.0f32, 874.0, 1080.0];
+
+    let mut widths_seen = 0;
+    let mut credit_widths: Vec<f32> = Vec::new();
+
+    for w in widths {
+        widths_seen += 1;
+        for ht in heights {
+            for panes in [1usize, 2, 4] {
+                for collapsed in [false, true] {
+                    let mut h = InputHarness::with_screen(egui::vec2(w, ht));
+                    h.set_pane_count(panes);
+                    h.frame();
+                    if collapsed {
+                        let transport = h.timeline();
+                        assert!(
+                            !transport.collapsed,
+                            "{w}x{ht}: the transport was already collapsed, so \
+                             the click below is not what put it there",
+                        );
+                        h.mouse_click(transport.collapse.center());
+                        h.warm_up();
+                    }
+                    h.frame();
+
+                    let case = format!(
+                        "{w}x{ht}, {panes} pane(s), transport {}",
+                        if collapsed { "collapsed" } else { "expanded" }
+                    );
+
+                    // --- Failure 1: not drawn at all.
+                    let rects = h.attribution_rects().to_vec();
+                    assert_eq!(
+                        rects.len(),
+                        1,
+                        "{case}: drew {} credits; one per panel is the contract",
+                        rects.len(),
+                    );
+                    let rect = rects[0];
+                    assert!(
+                        rect.width() > 0.0 && rect.height() > 0.0,
+                        "non-vacuity: {case} reported a credit occupying no \
+                         area ({rect:?}) — every test below would pass against \
+                         nothing drawn",
+                    );
+                    let panel = h.map_panel_rect();
+                    assert!(
+                        h.text_painted_in(panel, "OpenStreetMap"),
+                        "{case}: a credit rect at {rect:?} but no painted text \
+                         naming OpenStreetMap — a rect is not a notice",
+                    );
+                    credit_widths.push(rect.width());
+
+                    // --- Failure 2: drawn off screen. The window, not the
+                    //     panel: a notice clamped above the panel's top edge is
+                    //     still lost, and the panel test alone would miss a
+                    //     credit pushed under the top bar.
+                    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, ht));
+                    assert!(
+                        screen.contains_rect(rect),
+                        "{case}: the credit at {rect:?} is not wholly on the \
+                         {w}x{ht} screen",
+                    );
+                    assert!(
+                        panel.contains_rect(rect),
+                        "{case}: the credit at {rect:?} left the map panel \
+                         {panel:?}",
+                    );
+
+                    // --- Failure 3: drawn, on screen, and covered.
+                    let transport = h.timeline();
+                    let chrome: Vec<(&str, egui::Rect)> = [
+                        ("status bar", h.status_bar().rect),
+                        ("transport", transport.rect),
+                        ("timeline chip", transport.chip),
+                        ("phone bottom bar", h.bottom_bar().rect),
+                    ]
+                    .into_iter()
+                    .filter(|(_, r)| r.is_finite())
+                    .collect();
+                    assert!(
+                        !chrome.is_empty(),
+                        "non-vacuity: {case} drew no bottom chrome at all, so \
+                         the overlap scan below could not have failed",
+                    );
+                    for (name, bar) in &chrome {
+                        assert!(
+                            !overlaps(rect, *bar),
+                            "{case}: the credit at {rect:?} is covered by the \
+                             {name} at {bar:?}",
+                        );
+                    }
+
+                    // Nothing else's words inside the credit's box either —
+                    // the colour scale's tick labels reach into this corner.
+                    let trespass: Vec<_> = h
+                        .painted_text_rects()
+                        .into_iter()
+                        .filter(|(other, text)| {
+                            overlaps(*other, rect) && !text.contains("OpenStreetMap")
+                        })
+                        .collect();
+                    assert!(
+                        trespass.is_empty(),
+                        "{case}: the credit at {rect:?} has other painted text \
+                         inside it: {trespass:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        widths_seen, 11,
+        "non-vacuity: the sweep walked {widths_seen} widths, not the 11 the \
+         doc above claims — a trimmed list would still pass every assertion",
+    );
+
+    // The notice is one fixed string at one fixed size, so it lays out to one
+    // width everywhere. A width that varies means it wrapped or was elided,
+    // and it is also what `attribution_span` predicts in order to place the
+    // notice: if that prediction drifts from the drawn box, the lift test goes
+    // back to missing collisions by a few points, silently.
+    let (min, max) = credit_widths
+        .iter()
+        .fold((f32::MAX, f32::MIN), |(lo, hi), &w| (lo.min(w), hi.max(w)));
+    assert!(
+        (max - min).abs() < 0.5,
+        "the credit laid out between {min} and {max} wide across the sweep; \
+         one fixed string at one fixed size must not vary",
+    );
+}
