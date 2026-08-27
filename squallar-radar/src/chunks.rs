@@ -926,7 +926,7 @@ impl VolumeAssembler {
     }
 
     /// Whether [`Self::snapshot`] would return without building.
-    #[cfg(test)]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) fn snapshot_is_warm(&self) -> bool {
         self.cached.is_some()
     }

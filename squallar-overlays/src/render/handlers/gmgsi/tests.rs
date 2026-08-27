@@ -1196,6 +1196,7 @@ fn retain_frames_drops_this_channels_unkept_granules_and_no_others() {
 /// **Floor — `no_gate`:** `let _one_at_a_time = gate.lock().await;` ->
 /// `let _one_at_a_time = ();`. Observed red at step 2: both request lines
 /// recorded while hour 0 was still held open.
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn two_frame_fetches_share_one_gate_and_the_second_waits_for_the_first() {
     use std::io::{Read, Write};

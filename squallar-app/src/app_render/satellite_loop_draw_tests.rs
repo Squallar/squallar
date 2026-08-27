@@ -461,11 +461,7 @@ fn pump(app: &mut crate::app::App, ctx: &egui::Context) {
 /// drawn under it, radar off, and an HTTP client that cannot reach a network.
 fn a_pane_drawing_satellite_under_a_mosaic() -> crate::app::App {
     let mut app = crate::app::tests::headless(crate::platform_double::TestBridge::desktop());
-    app.http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(1))
-        .connect_timeout(std::time::Duration::from_millis(1))
-        .build()
-        .expect("a client with no connection to make");
+    app.http_client = crate::app::tests::unreachable_http_client();
 
     draw(&mut app, &known::GMGSI, true);
     draw(&mut app, &known::MRMS, true);
