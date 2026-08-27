@@ -754,6 +754,120 @@ so `dragged()` stays true, `classify` answers `Dragging(Vec2::ZERO)` and the
 map holds still while repainting at full rate. That is a latched-pointer defect
 above walkers, not a lost release edge.
 
+### Changed — source, eleventh commit: inertia is measured in seconds, not frames
+
+`Center::Inertia` carried `amount`, a **per-frame** shift in points, and decayed
+it by `lp_factor = INERTIA_TAU / (delta_time + INERTIA_TAU)` — a factor computed
+from a *duration*. The shift ran once per frame while the decay ran per second,
+so the two disagreed about what a second was and the total distance a flick
+travelled depended on the display's refresh rate. `PulledToMyPosition` had the
+same defect in its purest form: `AdjustedPosition::half_offset` halved the
+offset once per frame and consulted `delta_time` not at all.
+
+**Measured, on `41bf44c2`, coasting a fixed release velocity at 30/60/120/240 Hz
+and reading the total travel off `AdjustedPosition::offset_length`:**
+
+| release velocity | 30 Hz | 60 Hz | 120 Hz | 240 Hz | spread |
+| --- | --- | --- | --- | --- | --- |
+| 500 pt/s | 116.05 pt | 107.11 | 101.73 | 97.26 | **1.193x** |
+| 1000 pt/s | 232.67 pt | 215.38 | 205.90 | 199.28 | **1.168x** |
+| 2000 pt/s | 466.05 pt | 432.08 | 414.23 | 403.48 | **1.155x** |
+
+After: **1.0004x, 1.0001x, 1.0000x**.
+
+**16–19%, not the ~2x a per-frame reading suggests.** Comparing `13·amount₀` at
+60 Hz with `25·amount₀` at 120 Hz holds *points per frame* fixed, but a real
+flick holds *points per second* fixed and hands a 120 Hz display half the
+per-frame delta it hands a 60 Hz one. That cancels most of the error — the
+surviving `v·(dt + τ)` is the whole of the 16–19%. The `PulledToMyPosition`
+defect was the larger one by far: 9 halvings to get a 256-point offset under a
+point at **every** rate, so 0.300 s at 30 Hz against 0.0375 s at 240 Hz — an
+**8x** spread.
+
+**The fix is exact integration, not a smaller Euler step.** `Inertia` now holds
+`velocity: Vec2` in points per second, and each frame shifts by
+
+```text
+  ∫₀^dt v·e^(-t/τ) dt = v·τ·(1 - e^(-dt/τ))
+```
+
+which is exactly `τ·(vₙ - vₙ₊₁)`, so the sum telescopes to `τ·(v_start - v_end)`
+for *any* sequence of steps whatsoever. That is why the residual spread is 1e-4
+and not merely small: nothing about the total refers to the frame rate. A plain
+`velocity * dt` step would have left 8% at 60 Hz and 58% at 5 Hz.
+`PulledToMyPosition` gets the same treatment, with `PULL_TAU = 1/(60·ln 2)`
+chosen so a 60 Hz frame still halves the offset exactly as before;
+`half_offset` becomes `AdjustedPosition::scale_offset(f64)`.
+
+**The clamp is load-bearing.** `animation_dt` bounds `delta_time` into
+`MIN_ANIMATION_DT = 1/1000 ..= MAX_ANIMATION_DT = 1/10`. The lower bound is the
+termination condition: egui hands the first frame `stable_dt == 0.0`, which
+under the old spelling made `lp_factor` exactly `1.0` and the coast immortal.
+The upper bound stops a 250 ms hitch spending the entire remaining coast in one
+step; it costs no distance, because the telescoping identity above holds for a
+clamped step too. `f32::clamp` propagates a `NaN` rather than bounding it, so a
+`NaN` frame time is caught separately and given the shortest step.
+
+**The stop threshold is a position error, and is now stated as one.** The coast
+stops when `velocity * INERTIA_TAU` — everything it still has to travel — falls
+under `INERTIA_STOP_POINTS = 1.0`. That truncates the trajectory by up to one
+point of unspent coast. It is not a saving; it is invisible only because nothing
+draws the un-truncated curve beside it. Stating it in remaining *distance* is
+what makes the truncation the same size at every rate — the per-frame spelling
+it replaced cut 1.2 points at 60 Hz and 4.9 at 240 Hz.
+
+**Feel at 60 Hz.** The old sum was `v·dt/(1 - lp) = v·(dt + τ)` = 0.2167·v,
+against 0.2·v now: **7.7% shorter** by derivation, **7.6%** measured
+(215.38 → 199.03 points at 1000 pt/s). All of it is the old Euler step
+overshooting.
+
+**Frames per flick, measured — and there is no percentage to quote.** At
+1000 pt/s, before → after: 30 Hz **39 → 33**, 60 Hz **65 → 65**, 120 Hz
+**110 → 129**, 240 Hz **182 → 256**. The count fell at 30 Hz, held at 60 and
+*rose* at the high rates, because the coast is now a length of time (1.07–1.10 s
+at every rate) rather than a count of frames. Two conflicting figures — 36% and
+26% — have been quoted for this; both are unmeasured, and both are quoting one
+row of that table under a different stop criterion.
+
+**Plumbing.** `Gesture::Released` becomes `Released(Vec2)` and `Coast::Yes`
+becomes `Coast::Yes(Vec2)`, both carrying points per second (the tenth commit's
+description of `Gesture` above was accurate when written). The velocity comes
+from `ui.input(|i| i.pointer.velocity())`, which is already smoothed and already
+in the right units; egui documents it as possibly zero when the frame rate is
+bad, so `Center::release_velocity` falls back to the drag's own stored per-frame
+`direction` over `animation_dt(delta_time)` — the same quantity measured worse,
+and the only source the old coast ever had. That is why `Map::show` now reads
+`delta_time` **above** `handle_gestures` rather than below it, and passes it
+down in a new `center::InputFrame`.
+
+**Tests.** Nine new in `center.rs`, plus two existing ones re-pointed
+(`a_drag_that_is_released_still_coasts` now names a velocity;
+`every_variant`'s `Inertia` gains one). The first three are the acceptance
+criteria:
+
+- `a_flick_coasts_the_same_distance_at_every_frame_rate` — **(A)**, the gate,
+  with the 1.193x/1.168x/1.155x negative control above recorded in its doc.
+- `the_coast_travels_the_whole_of_what_the_velocity_is_worth` — the
+  non-triviality floor for (A), which a coast that went nowhere would otherwise
+  satisfy: travel must be `v·τ` less at most the one point the stop threshold
+  can account for.
+- `sixty_hertz_still_feels_like_it_did` — **(B)**, with the `v·(dt + τ)`
+  derivation written into it and pinned to 0.923 ± 0.01, not merely to the 15%
+  band.
+- `a_coast_lasts_the_same_time_rather_than_the_same_frames` — **(C)**, which
+  asserts the duration is flat and that the frame counts genuinely differ, so it
+  cannot be read as a frames-saved claim.
+- `a_frame_with_no_elapsed_time_still_ends_the_coast` — `0.0`, negative, `NaN`
+  and both infinities all terminate.
+- `a_hitch_does_not_teleport_the_coast` — one 250 ms frame spends under 75% of
+  the coast, and the remainder still arrives to within a point.
+- `the_pull_home_takes_the_same_time_at_every_frame_rate` — the 8x control
+  above; compared in frames-worth rather than seconds, because at 30 Hz one
+  frame *is* 0.033 s and a tighter tolerance would be measuring the
+  quantisation. Also pins the 60 Hz halving directly (256 → 128).
+- `a_release_with_no_pointer_velocity_falls_back_to_the_drag` — both arms of
+  the fallback.
+
 ## What the pin actually selects
 
 "Upstream's 38 inline tests are the behaviour pin" is the reason this crate is

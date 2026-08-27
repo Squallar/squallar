@@ -146,8 +146,12 @@ impl<'a, 'b, 'c> Map<'a, 'b, 'c> {
         let (rect, mut response) =
             ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
 
-        let mut changed = self.handle_gestures(ui, &response);
+        // Read above `handle_gestures`, which needs it: a release that egui has
+        // no smoothed pointer velocity for falls back to this frame's own drag
+        // delta over the time this frame took.
         let delta_time = ui.input(|reader| reader.stable_dt);
+
+        let mut changed = self.handle_gestures(ui, &response, delta_time);
         let zoom = self.memory.zoom;
         changed |= self
             .memory
@@ -188,7 +192,7 @@ impl<'a, 'b, 'c> Map<'a, 'b, 'c> {
 
 impl Map<'_, '_, '_> {
     /// Handle user inputs and recalculate everything accordingly. Returns whether something changed.
-    fn handle_gestures(&mut self, ui: &mut Ui, response: &Response) -> bool {
+    fn handle_gestures(&mut self, ui: &mut Ui, response: &Response, delta_time: f32) -> bool {
         let zoom_delta = self.zoom_delta(ui, response);
 
         // Zooming and dragging need to be exclusive, otherwise the map will get dragged when
@@ -238,6 +242,10 @@ impl Map<'_, '_, '_> {
                 self.my_position,
                 self.options.pull_to_my_position_threshold,
                 self.options.drag_pan_buttons,
+                crate::center::InputFrame {
+                    pointer_velocity: ui.input(|input| input.pointer.velocity()),
+                    delta_time,
+                },
             )
         };
 
