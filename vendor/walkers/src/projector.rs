@@ -4,6 +4,7 @@ use crate::{
     MapMemory, Position,
     mercator::{project_at_scale, total_pixels, unproject_at_scale},
     position::{Pixels, PixelsExt as _},
+    tiles::TileId,
 };
 
 /// Projects geographical position into pixels on the viewport, suitable for [`egui::Painter`].
@@ -69,6 +70,47 @@ impl Projector {
             self.map_center_projected_position.y() + (position.y as f64) - (clip_center.y as f64);
 
         unproject_at_scale(Pixels::new(x, y), self.world_pixels)
+    }
+
+    /// The screen rect that `tile_id` covers, by affine arithmetic alone.
+    ///
+    /// A tile's corners are rational fractions of the world bitmap — tile `x` at zoom `z`
+    /// starts exactly `x / 2^z` of the way across it — so placing one needs no projection at
+    /// all. Going through geography instead costs a `sinh`/`atan` to turn the tile index into
+    /// a latitude and then the `tan`/`asinh` inside [`Projector::project`] to turn it straight
+    /// back: the two halves are exact inverses.
+    ///
+    /// **There is deliberately no `tile_size` parameter.** The base is walkers' own 256 px
+    /// tile and never the source's: [`crate::mercator::tile_id`] has already folded a larger
+    /// source tile into the zoom, reducing it by `log2(source_tile_size / 256)`. A 512 px
+    /// source therefore arrives here as a tile one zoom shallower, and
+    /// `256 · 2^(map_zoom − tile_zoom)` reproduces its doubled side on its own. Taking the
+    /// size as a parameter as well would double-count it, by exactly 2x.
+    ///
+    /// The exponent is the map's zoom **minus** the tile's, so a tile from a shallower level
+    /// than `round(zoom)` — a deliberately coarser layer, or an ancestor stretched over a
+    /// gap — is drawn larger, and one from a deeper level smaller.
+    pub fn tile_rect(&self, tile_id: TileId) -> Rect {
+        // `world_pixels` is `256 · 2^map_zoom` and the grid is `2^tile_zoom` tiles across.
+        // Both are exact powers of two, so the quotient is `256 · 2^(map_zoom − tile_zoom)`
+        // with no rounding of its own.
+        let side = self.world_pixels / 2f64.powi(i32::from(tile_id.zoom));
+
+        // The same two lines as `project`, with the tile's own projected corner in place of
+        // a projected position.
+        let offset = tile_id.project(side) - self.map_center_projected_position;
+        let north_west = self.clip_rect.center().to_vec2() + offset.to_vec2();
+
+        Rect::from_min_size(north_west.to_pos2(), Vec2::splat(side as f32))
+    }
+
+    /// The viewport this projector places into.
+    ///
+    /// [`crate::tiles::draw_tiles`] culls against an [`egui::Painter`]'s clip rect and places
+    /// through this projector, and those two are only the same map while they are the same
+    /// rect. It asserts that; this is what it reads.
+    pub(crate) fn clip_rect(&self) -> Rect {
+        self.clip_rect
     }
 
     /// What is the local scale of the map at the provided position and given the current zoom

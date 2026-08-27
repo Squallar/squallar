@@ -51,7 +51,13 @@ pub(crate) fn tile_id(position: Position, mut zoom: u8, source_tile_size: u32) -
 
     // Some sources provide larger tiles, effectively bundling e.g. 4 256px tiles in one
     // 512px one. Walkers uses 256px internally, so we need to adjust the zoom level.
-    zoom -= (source_tile_size as f64 / TILE_SIZE as f64).log2() as u8;
+    //
+    // Saturating, because there is no shallower level to reduce to at the top of the grid
+    // and a plain `-=` is a debug-build panic there: a 512px source at map zoom 0 asked for
+    // `0 - 1`. Zoom 0 is the right answer anyway — the source's own zoom-0 tile is the whole
+    // world, which is what the one tile of the zoom-0 grid is, just drawn at half the
+    // texture's size.
+    zoom = zoom.saturating_sub((source_tile_size as f64 / TILE_SIZE as f64).log2() as u8);
 
     // Map that into a big bitmap made out of web tiles.
     let number_of_tiles = 2u32.pow(zoom as u32) as f64;
@@ -139,6 +145,32 @@ mod tests {
         let citadel_proj = Pixels::new(585455. * 256. + 184., 345104. * 256. + 116.5);
         approx::assert_relative_eq!(calculated.x(), citadel_proj.x(), max_relative = 0.5);
         approx::assert_relative_eq!(calculated.y(), citadel_proj.y(), max_relative = 0.5);
+    }
+
+    /// A source with tiles larger than 256 px is served a shallower zoom, and at
+    /// the top of the grid there is no shallower zoom to serve. The reduction
+    /// used to be a plain `-=` on a `u8`, so this was a debug-build panic —
+    /// reachable from `draw_tiles` with any 512 px source and the map zoomed all
+    /// the way out.
+    #[test]
+    fn a_large_source_tile_at_the_top_of_the_grid_does_not_underflow() {
+        let citadel = lon_lat(21.00027, 52.26470);
+
+        for source_tile_size in [512u32, 1024] {
+            assert_eq!(
+                TileId {
+                    x: 0,
+                    y: 0,
+                    zoom: 0
+                },
+                tile_id(citadel, 0, source_tile_size)
+            );
+        }
+
+        // The control: away from the top of the grid the reduction still bites,
+        // so the saturation is not simply swallowing it everywhere.
+        assert_eq!(3, tile_id(citadel, 4, 512).zoom);
+        assert_eq!(2, tile_id(citadel, 4, 1024).zoom);
     }
 
     /// Zoom is a `u8` but the tile grid is counted in `u32`, so zoom 32 and above

@@ -926,6 +926,86 @@ gesture there writes to a throwaway, so the strip should be a pure projector.
 **UNMEASURED**: the mechanism is in the code and the ownership is confirmed,
 but nobody has watched the two panes disagree.
 
+### Changed — source, thirteenth commit: an affine tile rect on `Projector`
+
+Four files: `src/projector.rs`, `src/tiles.rs`, `src/map.rs`, `src/mercator.rs`.
+
+**`Projector::tile_rect(TileId) -> Rect`, new and public.** A tile's corners are
+rational fractions of the world bitmap — tile `x` at zoom `z` begins exactly
+`x / 2^z` across it — so placing one is two multiplies and an add against the
+projected centre the projector already caches. It was being done through
+geography instead, in both of this workspace's tile paths.
+
+```rust
+let side = self.world_pixels / 2f64.powi(i32::from(tile_id.zoom));
+let offset = tile_id.project(side) - self.map_center_projected_position;
+Rect::from_min_size(
+    (self.clip_rect.center().to_vec2() + offset.to_vec2()).to_pos2(),
+    Vec2::splat(side as f32),
+)
+```
+
+**No `tile_size` parameter, deliberately.** `mercator::tile_id` has already
+folded a larger source tile into the zoom, reducing it by
+`log2(source_tile_size / 256)`, so a 512 px source arrives as a tile one zoom
+shallower and `256 · 2^(map_zoom − tile_zoom)` reproduces its doubled side by
+itself. A parameter would double-count it, by exactly 2x, in the one case
+nothing else here covers — `map::tests::a_larger_source_tile_arrives_as_a_shallower_zoom_and_a_doubled_side`
+is what covers it.
+
+**`flood_fill_tiles` no longer places tiles itself**, and this is a behaviour
+change as well as a simplification. It used to offset every tile from
+`painter.clip_rect().center()`. `egui::Painter::with_clip_rect` **intersects**
+rather than sets (egui 0.35, `painter.rs:73`), so a parent `Ui` narrower than
+the map leaves the painter clipped tighter than the widget it belongs to — and
+under that narrowing the tiles slid away from the markers and overlays the
+plugins drew through the projector, by half the difference of the two centres.
+Placement now follows the projector's viewport, culling still follows the
+painter's true clip, and `draw_tiles` asserts the containment that actually
+holds between them rather than an equality that does not.
+`map::tests::a_narrowed_parent_clip_culls_more_tiles_without_moving_them` pins
+it.
+
+`Map::show` builds its projector from the allocated `rect` rather than
+`response.rect` so the tiles and the plugins place against the same viewport.
+`allocate_exact_size` returns `align_size_within_rect(desired, response.rect)`
+for a `desired` that is that rect's own size, so the two are the same rect;
+that is egui's arithmetic and not ours, so it is a `debug_assert_eq!` rather
+than an assumption.
+
+**A `u8` underflow fixed on the way through.** `mercator::tile_id` reduced the
+zoom for a large source tile with a plain `-=`, so a 512 px source with the map
+zoomed all the way out evaluated `0u8 - 1` — a debug-build panic, reachable
+from `draw_tiles`, found by the test above rather than by reading. It is
+`saturating_sub` now, and zoom 0 is the right answer there: the source's own
+zoom-0 tile is the whole world, which is what the one tile of the zoom-0 grid
+is. `mercator::tests::a_large_source_tile_at_the_top_of_the_grid_does_not_underflow`,
+with a control at zoom 4 showing the reduction still bites away from the edge.
+
+`tiles::rect` is deleted with its only caller.
+
+**This path has no runtime coverage in this workspace.** Both `Map::new` sites
+in `squallar-egui::ui_map` pass `None` for tiles and neither adds a layer, so
+nothing in the application reaches `draw_tiles` — a green board says nothing
+about it. The three new `map.rs` tests are the only things that execute it, and
+they are the first to do so: they drive a real `Map::show` with a tile source
+that answers every id, and read the meshes back off `Context::end_pass`.
+
+**Evidence that the arithmetic is the geographic answer.** The consumer that is
+actually reachable is `squallar-egui`'s own `draw_tile_layer`, and
+`squallar_egui::tiles::tests::the_affine_tile_rect_agrees_with_the_geographic_round_trip`
+measures `tile_rect` against the `tile_to_lat`/`tile_to_lon` →
+`geo_corner_rect` round trip it replaces: **1,242,989 tiles over 9,344
+viewports, worst corner disagreement 0.000244 points** — one `f32` ulp, against
+a tile that is 181 points across at its smallest.
+
+**Two negative controls, both red.** Flipping the exponent's sign fails by
+1.0e9 points; using 512 as the tile-size base fails by 6.7e7. And a third,
+which is why the sweep is shaped as it is: with the sign flipped **and** the
+sweep restricted to whole zooms at `tile_zoom == round(zoom)`, 29,106 tiles
+over 896 viewports pass at a worst disagreement of **exactly 0**. A parity test
+that never leaves that row cannot fail for the mistake this arithmetic invites.
+
 ## What the pin actually selects
 
 "Upstream's 38 inline tests are the behaviour pin" is the reason this crate is
