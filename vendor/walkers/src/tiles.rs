@@ -14,7 +14,6 @@ use std::collections::HashSet;
 use thiserror::Error;
 
 use crate::Position;
-use crate::io::TileFactory;
 use crate::mercator::{project, tile_id, total_tiles};
 use crate::position::{Pixels, PixelsExt};
 use crate::sources::Attribution;
@@ -357,23 +356,6 @@ fn full_rect_of_clipped_tile(rect: Rect, uv: Rect) -> Rect {
 
 pub(crate) fn rect(screen_position: Vec2, tile_size: f64) -> Rect {
     Rect::from_min_size(screen_position.to_pos2(), Vec2::splat(tile_size as f32))
-}
-
-pub struct EguiTileFactory {
-    egui_ctx: Context,
-    style: Style,
-}
-
-impl EguiTileFactory {
-    pub fn new(egui_ctx: Context, style: Style) -> Self {
-        Self { egui_ctx, style }
-    }
-}
-
-impl TileFactory for EguiTileFactory {
-    fn create_tile(&self, data: &bytes::Bytes, zoom: u8) -> Result<Tile, TileError> {
-        Tile::new(data, &self.style, zoom, &self.egui_ctx)
-    }
 }
 
 #[cfg(test)]
