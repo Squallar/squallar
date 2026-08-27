@@ -21,7 +21,7 @@ use mvt_reader::{Reader, feature::Value};
 use serde_json::{Number, Value as JsonValue};
 
 use crate::{
-    expression::Context,
+    expression::{Context, Properties},
     style::{Filter, Layer, Layout, Paint, Style},
     text::Text,
 };
@@ -188,11 +188,15 @@ fn get_layer_features(
     }
     .into_iter()
     .filter_map(move |feature| {
-        let context = Context::new(
+        // The property bag is *moved* into the context, not rebuilt in it.
+        // Converting it to JSON up front cost a `HashMap` allocation and a
+        // `String` clone per string-valued property for every feature the
+        // source layer holds -- including the ones the filter is about to
+        // reject, which read no property at all. `Properties::Mvt` converts a
+        // value when a lookup asks for it instead.
+        let context = Context::with_properties(
             geometry_type_to_str(&feature.geometry).to_string(),
-            feature
-                .properties
-                .map_or(Default::default(), mvt_properties_to_json_properties),
+            Properties::Mvt(feature.properties.unwrap_or_default()),
             zoom,
         );
 
@@ -204,16 +208,7 @@ fn get_layer_features(
     Ok(features)
 }
 
-fn mvt_properties_to_json_properties(
-    properties: HashMap<String, mvt_reader::feature::Value>,
-) -> HashMap<String, serde_json::Value> {
-    properties
-        .into_iter()
-        .map(|(k, v)| (k, mvt_value_to_json_value(&v)))
-        .collect()
-}
-
-fn mvt_value_to_json_value(value: &Value) -> JsonValue {
+pub(crate) fn mvt_value_to_json_value(value: &Value) -> JsonValue {
     match value {
         Value::String(s) => JsonValue::String(s.clone()),
         Value::Int(x) | Value::SInt(x) => JsonValue::Number((*x).into()),
