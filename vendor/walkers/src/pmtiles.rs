@@ -1,0 +1,143 @@
+use crate::{
+    TileId, TilePiece, Tiles,
+    io::{Fetch, tiles_io::TilesIo},
+    sources::Attribution,
+    style::Style,
+    tiles::{EguiTileFactory, interpolate_from_lower_zoom},
+};
+use bytes::Bytes;
+use egui::Context;
+use pmtiles::{AsyncPmTilesReader, TileCoord};
+use std::{
+    io::{self},
+    path::{Path, PathBuf},
+};
+use thiserror::Error;
+
+/// Provides tiles from a local PMTiles file.
+///
+/// <https://docs.protomaps.com/guide/getting-started>
+pub struct PmTiles {
+    tiles_io: TilesIo,
+    tile_size: u32,
+}
+
+impl PmTiles {
+    pub fn new(path: impl AsRef<Path>, egui_ctx: Context) -> Self {
+        Self::with_style(path, Style::default(), egui_ctx)
+    }
+
+    /// Construct new [`PmTiles`] with [`Style`]. Style is relevant only for vector tile
+    /// sources.
+    pub fn with_style(path: impl AsRef<Path>, style: Style, egui_ctx: Context) -> Self {
+        Self {
+            tiles_io: TilesIo::new(
+                PmTilesFetch::new(path.as_ref()),
+                EguiTileFactory::new(egui_ctx.clone(), style),
+                egui_ctx,
+            ),
+            tile_size: 1024,
+        }
+    }
+
+    pub fn with_tile_size(mut self, tile_size: u32) -> Self {
+        self.tile_size = tile_size;
+        self
+    }
+
+    /// Get at tile, or interpolate it from lower zoom levels. This function does not start any
+    /// downloads.
+    fn get_from_cache_or_interpolate(&mut self, tile_id: TileId) -> Option<TilePiece> {
+        let mut zoom_candidate = tile_id.zoom;
+
+        loop {
+            let (zoomed_tile_id, uv) = interpolate_from_lower_zoom(tile_id, zoom_candidate);
+
+            if let Some(Some(tile)) = self.tiles_io.cache.get(&zoomed_tile_id) {
+                break Some(TilePiece {
+                    tile: tile.clone(),
+                    uv,
+                });
+            }
+
+            // Keep zooming out until we find a donor or there is no more zoom levels.
+            zoom_candidate = zoom_candidate.checked_sub(1)?;
+        }
+    }
+}
+
+impl Tiles for PmTiles {
+    fn at(&mut self, tile_id: TileId) -> Option<TilePiece> {
+        self.tiles_io.put_single_fetched_tile_in_cache();
+
+        if !tile_id.valid() {
+            return None;
+        }
+
+        // TODO: This is aligned with Protomaps, but it should be configurable.
+        let tile_id_to_download = if tile_id.zoom > 15 {
+            interpolate_from_lower_zoom(tile_id, 15).0
+        } else {
+            tile_id
+        };
+
+        self.tiles_io.make_sure_is_fetched(tile_id_to_download);
+        self.get_from_cache_or_interpolate(tile_id)
+    }
+
+    fn attribution(&self) -> Attribution {
+        Attribution {
+            text: "PMTiles",
+            url: "",
+            logo_light: None,
+            logo_dark: None,
+        }
+    }
+
+    fn tile_size(&self) -> u32 {
+        self.tile_size
+    }
+}
+
+#[derive(Debug, Error)]
+enum PmTilesError {
+    #[error("Tile {0:?} not found in pmtiles file.")]
+    TileNotFound(TileId),
+    #[error(transparent)]
+    Decompression(#[from] io::Error),
+    #[error(transparent)]
+    Other(#[from] pmtiles::PmtError),
+}
+
+struct PmTilesFetch {
+    path: PathBuf,
+}
+
+impl PmTilesFetch {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_owned(),
+        }
+    }
+}
+
+impl Fetch for PmTilesFetch {
+    type Error = PmTilesError;
+
+    async fn fetch(&self, tile_id: TileId) -> Result<Bytes, Self::Error> {
+        // TODO: Avoid reopening the file every time.
+        let reader = AsyncPmTilesReader::new_with_path(self.path.to_owned()).await?;
+
+        reader
+            .get_tile_decompressed(TileCoord::new(tile_id.zoom, tile_id.x, tile_id.y)?)
+            .await?
+            .ok_or(PmTilesError::TileNotFound(tile_id))
+    }
+
+    fn max_concurrency(&self) -> usize {
+        // Just an arbitrary value. Probably should be aligned to the number of CPU cores as most
+        // of the vector tile loading work is CPU-bound. Number of threads for Tokio runtime should
+        // follow this value as well.
+        6
+    }
+}

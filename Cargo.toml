@@ -40,6 +40,20 @@ members = [
     # now runs, and they only run if `cargo test --workspace` selects them.
     # See vendor/bzip2-rs/VENDORED.md.
     "vendor/bzip2-rs",
+    # The fourth vendored crates.io crate, a member for the same reason as the
+    # first three: upstream's own inline `#[test]` modules are the behaviour pin
+    # on the map widget this copy exists to change, and they only run if
+    # `cargo test --workspace` selects them.
+    #
+    # Read the size of that pin honestly, because it is smaller than it looks.
+    # walkers ships 38 inline `#[test]` fns, but 23 of them -- the 22 in
+    # `src/expression.rs` and the 1 in `src/style.rs` -- are behind
+    # `#[cfg(feature = "mvt")]`, and nothing here enables `mvt`. A default-feature
+    # `cargo test --workspace` therefore selects 15, in mercator/position/
+    # projector/tiles/zoom. The other 23 arrive the moment `mvt` is on, which is
+    # exactly when the style and expression patches land. See
+    # vendor/walkers/VENDORED.md and `[patch.crates-io]` below.
+    "vendor/walkers",
 ]
 
 [workspace.package]
@@ -213,9 +227,27 @@ rustls = { version = "=0.23.43", default-features = false, features = ["ring", "
 # nexrad-decode and there is still exactly one of each. `cargo tree -i
 # nexrad-decode` and `cargo tree -i nexrad-data` must each keep printing one
 # node, and both nodes must name a path.
+#
+# walkers is vendored for a different reason from the two above: not one defect,
+# but a standing need to change the widget this workspace draws every basemap
+# through. The first thing that buys is a graph trim -- walkers reaches the
+# network through its own `HttpTiles`/`io`/`pmtiles` stack, which nothing here
+# calls (both `Map::new` sites pass `None` for tiles, and
+# `squallar-egui/src/tile_source.rs` is our own reimplementation of `Tiles`),
+# and which drags in a second `reqwest` at 0.12 against this workspace's pinned
+# `=0.13.4`.
+#
+# `[patch]` and not a direct path dependency, for the same reason as the two
+# above: `[workspace.dependencies]` keeps its exact `=0.56.0` pin and the
+# vendored `package.version` stays exactly `0.56.0` (no `+local` metadata),
+# because a patch is only accepted for a version that satisfies the requirement
+# it replaces. Visible in Cargo.lock as the walkers entry losing its `source`
+# and `checksum` lines. `cargo tree -i walkers` must keep printing exactly one
+# node, and that node must name the path.
 [patch.crates-io]
 nexrad-decode = { path = "vendor/nexrad-decode" }
 nexrad-data = { path = "vendor/nexrad-data" }
+walkers = { path = "vendor/walkers" }
 
 # File and line in every frame, and nothing beyond it. A backtrace, a panic
 # location and a `#[track_caller]` frame are all line-table lookups, so each
@@ -284,6 +316,17 @@ opt-level = 2
 #
 # Delete this together with `vendor/bzip2-rs/`.
 [profile.dev.package.bzip2-rs]
+opt-level = 2
+
+# Same story again, and the same mechanism: `"*"` above means "every package
+# that is not a workspace member", so the moment walkers became a member it fell
+# out of that override and back to opt-level 0. It is on the frame path -- every
+# basemap tile, every projection, and once `mvt` is on, per-tile polygon
+# tessellation through lyon. At opt-level 0 that is not a hot loop, it is a
+# dropped frame. Naming it here puts it back where it was as a plain dependency.
+#
+# Delete this together with the `[patch.crates-io]` entry above.
+[profile.dev.package.walkers]
 opt-level = 2
 
 [profile.release]

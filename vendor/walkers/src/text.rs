@@ -1,0 +1,106 @@
+use egui::{Color32, Pos2, Vec2, vec2};
+use geo::{BoundingRect, Coord, Intersects, LineString, Polygon};
+
+#[derive(Debug, Clone)]
+pub struct Text {
+    pub text: String,
+    pub position: Pos2,
+    pub font_size: f32,
+    pub text_color: Color32,
+    pub background_color: Color32,
+    pub angle: f32,
+}
+
+impl Text {
+    pub fn new(
+        position: Pos2,
+        text: String,
+        font_size: f32,
+        text_color: Color32,
+        background_color: Color32,
+        angle: f32,
+    ) -> Self {
+        Self {
+            position,
+            text,
+            font_size,
+            text_color,
+            background_color,
+            angle,
+        }
+    }
+}
+
+pub struct OrientedRect {
+    polygon: Polygon<f32>,
+    bbox: geo::Rect<f32>,
+}
+
+impl OrientedRect {
+    pub fn new(center: Pos2, angle: f32, size: Vec2) -> Self {
+        let (s, c) = angle.sin_cos();
+        let half = size * 0.5;
+
+        let ux = vec2(half.x * c, half.x * s);
+        let uy = vec2(-half.y * s, half.y * c);
+
+        let p0 = center - ux - uy; // top-left
+        let p1 = center + ux - uy; // top-right
+        let p2 = center + ux + uy; // bottom-right
+        let p3 = center - ux + uy; // bottom-left
+
+        let polygon = Polygon::new(
+            LineString::from(vec![
+                Coord { x: p0.x, y: p0.y },
+                Coord { x: p1.x, y: p1.y },
+                Coord { x: p2.x, y: p2.y },
+                Coord { x: p3.x, y: p3.y },
+                Coord { x: p0.x, y: p0.y }, // Close the polygon
+            ]),
+            vec![],
+        );
+
+        let bounding_rect = polygon
+            .bounding_rect()
+            .expect("can not happen because polygon always has some points");
+
+        Self {
+            polygon,
+            bbox: bounding_rect,
+        }
+    }
+
+    pub fn top_left(&self) -> Pos2 {
+        self.polygon
+            .exterior()
+            .points()
+            .nth(0)
+            .map(|p| Pos2 { x: p.x(), y: p.y() })
+            .expect("can not happen because polygon always has some points")
+    }
+
+    pub fn intersects(&self, other: &OrientedRect) -> bool {
+        // Checking bbox first gives huge performance boost.
+        self.bbox.intersects(&other.bbox) && self.polygon.intersects(&other.polygon)
+    }
+}
+
+// Tracks areas occupied by texts to avoid overlapping them.
+pub struct OccupiedAreas {
+    areas: Vec<OrientedRect>,
+}
+
+impl OccupiedAreas {
+    pub fn new() -> Self {
+        Self { areas: Vec::new() }
+    }
+
+    pub fn try_occupy(&mut self, rect: OrientedRect) -> bool {
+        if !self.areas.iter().any(|existing| existing.intersects(&rect)) {
+            self.areas.push(rect);
+            true
+        } else {
+            false
+        }
+    }
+}
