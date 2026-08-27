@@ -200,18 +200,38 @@ impl<'a, 'b, 'c> Map<'a, 'b, 'c> {
         let map_center = self.position();
         let painter = ui.painter().with_clip_rect(rect);
 
+        // `map_center` is the centre resolved above; nothing between here and there touches
+        // `self.memory`, so the projector reuses it rather than resolving it a second time.
+        //
+        // Spelled `rect` rather than `response.rect` because `draw_tiles` below now places
+        // through this projector, and the rect it must place against is the widget's own —
+        // the one `painter` is clipped *to*, not the possibly narrower one the clip came out
+        // as. `allocate_exact_size` returns `align_size_within_rect(desired, response.rect)`
+        // for a `desired` that is `response.rect`'s own size, so the two are the same rect
+        // and every existing consumer of this projector is unaffected. Asserted rather than
+        // assumed, because it is egui's arithmetic and not ours.
+        debug_assert_eq!(
+            rect, response.rect,
+            "the allocated rect and the response's rect have stopped agreeing, so the tiles \
+             and the plugins would now be placed against different viewports"
+        );
+        let projector = Projector::with_map_center(rect, self.memory, map_center);
+
         if let Some(tiles) = self.tiles {
-            draw_tiles(&painter, map_center, zoom, tiles, 1.0);
+            draw_tiles(&painter, &projector, map_center, zoom, tiles, 1.0);
         }
 
         for layer in self.layers {
-            draw_tiles(&painter, map_center, zoom, layer.tiles, layer.transparency);
+            draw_tiles(
+                &painter,
+                &projector,
+                map_center,
+                zoom,
+                layer.tiles,
+                layer.transparency,
+            );
         }
 
-        // Run plugins. `map_center` is the centre resolved above; nothing between here and
-        // there touches `self.memory`, so the projector reuses it rather than resolving it
-        // a second time.
-        let projector = Projector::with_map_center(response.rect, self.memory, map_center);
         for (idx, plugin) in self.plugins.into_iter().enumerate() {
             let mut child_ui = ui.new_child(UiBuilder::new().max_rect(rect).id_salt(idx));
             plugin.run(&mut child_ui, &response, &projector, self.memory);
@@ -372,6 +392,256 @@ fn input_offset(ui: &mut Ui, response: &Response) -> Option<Vec2> {
 mod tests {
     use super::*;
     use crate::lon_lat;
+    use crate::tiles::{Tile, TileId, TilePiece, Tiles};
+    use egui::Rect;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// A tile source that hands back the same 1x1 texture for every id and
+    /// records which ids the flood fill asked it for.
+    ///
+    /// Every real source in this workspace is asynchronous and answers `None`
+    /// until a download lands, which is why this path has never been executed
+    /// by a test before: with `None` the flood fill visits tiles but draws
+    /// nothing.
+    struct RecordingTiles {
+        texture: egui::TextureHandle,
+        tile_size: u32,
+        asked: Rc<RefCell<Vec<TileId>>>,
+    }
+
+    impl Tiles for RecordingTiles {
+        fn at(&mut self, tile_id: TileId) -> Option<TilePiece> {
+            self.asked.borrow_mut().push(tile_id);
+            Some(TilePiece::new(
+                Tile::Raster(self.texture.clone()),
+                Rect::from_min_max(egui::pos2(0., 0.), egui::pos2(1., 1.)),
+            ))
+        }
+
+        fn attribution(&self) -> crate::sources::Attribution {
+            crate::sources::Attribution {
+                text: "",
+                url: "",
+                logo_light: None,
+                logo_dark: None,
+            }
+        }
+
+        fn tile_size(&self) -> u32 {
+            self.tile_size
+        }
+    }
+
+    /// Show a one-layer map over `viewport` and report what it drew: the tile
+    /// ids the source was asked for, the bounding rect of every mesh that
+    /// reached the paint list, and a clone of the projector the map handed its
+    /// contents.
+    ///
+    /// `parent_clip` is the clip rect of the `Ui` the map is placed in —
+    /// `Painter::with_clip_rect` *intersects*, so a parent narrower than the
+    /// map is what makes the painter's clip and the widget's rect differ.
+    fn show_one_tile_layer(
+        viewport: egui::Vec2,
+        parent_clip: Rect,
+        zoom: f64,
+        tile_size: u32,
+    ) -> (Vec<TileId>, Vec<Rect>, Projector) {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, viewport);
+
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        });
+
+        let texture = ctx.load_texture(
+            "one pixel",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            Default::default(),
+        );
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        let mut tiles = RecordingTiles {
+            texture,
+            tile_size,
+            asked: asked.clone(),
+        };
+
+        let mut memory = MapMemory::default();
+        memory
+            .set_zoom(zoom)
+            .expect("the zoom is in walkers' range");
+
+        let mut ui = Ui::new(
+            ctx.clone(),
+            egui::Id::new("map under test"),
+            UiBuilder::new()
+                .layer_id(egui::LayerId::background())
+                .max_rect(screen),
+        );
+        ui.set_clip_rect(parent_clip);
+
+        let mut seen: Option<Projector> = None;
+        Map::new(Some(&mut tiles), &mut memory, lon_lat(21., 52.))
+            .show(&mut ui, |_, _, projector, _| seen = Some(projector.clone()));
+
+        let output = ctx.end_pass();
+        let drawn = output
+            .shapes
+            .into_iter()
+            .filter_map(|clipped| match clipped.shape {
+                egui::Shape::Mesh(mesh) => Some(mesh.calc_bounds()),
+                _ => None,
+            })
+            .collect();
+
+        let asked = asked.borrow().clone();
+        (asked, drawn, seen.expect("`show` runs `add_contents`"))
+    }
+
+    /// **The internal tile path, executed.** Both `Map::new` sites in
+    /// `squallar-egui::ui_map` pass `None` for tiles and neither adds a layer,
+    /// so nothing in the application reaches `draw_tiles` — a green board says
+    /// nothing about it, and this is the only thing that does.
+    ///
+    /// What it pins: every tile the flood fill drew landed on exactly the rect
+    /// `Projector::tile_rect` names for it, and only tiles the painter's clip
+    /// can see were drawn.
+    #[test]
+    fn a_tile_layer_is_placed_by_the_projector_and_culled_by_the_painter() {
+        let viewport = egui::vec2(800., 600.);
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, viewport);
+
+        for zoom in [0., 3.5, 6., 10.25, 15.5] {
+            for tile_size in [256u32, 512] {
+                let (asked, drawn, projector) =
+                    show_one_tile_layer(viewport, screen, zoom, tile_size);
+
+                assert!(
+                    !asked.is_empty(),
+                    "the flood fill asked for no tiles at zoom {zoom}, size {tile_size}"
+                );
+                assert_eq!(
+                    asked.len(),
+                    drawn.len(),
+                    "every tile the source answered should have been drawn"
+                );
+
+                let mut want: Vec<Rect> = asked.iter().map(|&id| projector.tile_rect(id)).collect();
+                let mut got = drawn;
+                let key = |r: &Rect| (r.min.x.to_bits(), r.min.y.to_bits());
+                want.sort_by_key(key);
+                got.sort_by_key(key);
+
+                for (want, got) in want.iter().zip(got.iter()) {
+                    assert!(
+                        (want.min.x - got.min.x).abs() < 1e-3
+                            && (want.min.y - got.min.y).abs() < 1e-3
+                            && (want.max.x - got.max.x).abs() < 1e-3
+                            && (want.max.y - got.max.y).abs() < 1e-3,
+                        "at zoom {zoom}, tile size {tile_size}: drawn {got:?} is not the \
+                         projector's {want:?}"
+                    );
+                    assert!(
+                        want.intersects(screen),
+                        "a tile outside the viewport was drawn at zoom {zoom}: {want:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **A 512-px source is a tile one zoom shallower, and is drawn twice the
+    /// size.** This is the case `Projector::tile_rect` takes no `tile_size`
+    /// parameter for: `mercator::tile_id` has already folded the source's tile
+    /// size into the zoom, so folding it in a second time would be off by
+    /// exactly 2x — and nothing else in this workspace uses a 512-px source, so
+    /// nothing else would catch it.
+    #[test]
+    fn a_larger_source_tile_arrives_as_a_shallower_zoom_and_a_doubled_side() {
+        let viewport = egui::vec2(800., 600.);
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, viewport);
+
+        let (small, _, projector) = show_one_tile_layer(viewport, screen, 6., 256);
+        let (large, _, _) = show_one_tile_layer(viewport, screen, 6., 512);
+
+        let small_zoom = small.first().expect("some tile is drawn").zoom;
+        let large_zoom = large.first().expect("some tile is drawn").zoom;
+        assert_eq!(
+            small_zoom - 1,
+            large_zoom,
+            "a 512-px source should arrive one zoom shallower"
+        );
+
+        let side = |zoom: u8| projector.tile_rect(TileId { x: 0, y: 0, zoom }).width();
+        assert!(
+            (side(large_zoom) - 2. * side(small_zoom)).abs() < 1e-3,
+            "a tile a zoom shallower should be drawn twice as wide, not {} against {}",
+            side(large_zoom),
+            side(small_zoom)
+        );
+    }
+
+    /// **The painter's clip and the projector's viewport are not the same
+    /// rect**, and the flood fill has to use each for its own job.
+    /// `Painter::with_clip_rect` intersects, so a parent `Ui` narrower than the
+    /// map leaves the painter clipped tighter than the widget it belongs to.
+    /// Culling follows the painter — fewer tiles are drawn — while placement
+    /// follows the projector, so what is drawn stays registered with the
+    /// markers and overlays the plugins draw.
+    ///
+    /// Before `Projector::tile_rect`, the flood fill offset every tile from
+    /// `painter.clip_rect().center()`, and under this narrowing the tiles slid
+    /// away from everything else on the map by half the difference of the two
+    /// centres.
+    #[test]
+    fn a_narrowed_parent_clip_culls_more_tiles_without_moving_them() {
+        let viewport = egui::vec2(800., 600.);
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, viewport);
+        // Off-centre as well as smaller, so the two rects differ in their
+        // centres and not only in their size.
+        let narrow = Rect::from_min_max(egui::pos2(0., 0.), egui::pos2(300., 200.));
+
+        let (wide_ids, _, wide_projector) = show_one_tile_layer(viewport, screen, 6., 256);
+        let (narrow_ids, narrow_drawn, narrow_projector) =
+            show_one_tile_layer(viewport, narrow, 6., 256);
+
+        assert_ne!(
+            screen.center(),
+            narrow.center(),
+            "fixture: the two clips must have different centres, or this test cannot tell \
+             the old placement from the new one"
+        );
+        assert!(
+            narrow_ids.len() < wide_ids.len(),
+            "the narrower clip culled nothing: {} tiles against {}",
+            narrow_ids.len(),
+            wide_ids.len()
+        );
+
+        // Same viewport, same zoom, same centre mode: the projector is the same
+        // one either way, so a tile that survives both clips is placed
+        // identically.
+        for id in &narrow_ids {
+            assert_eq!(
+                wide_projector.tile_rect(*id).min.x.to_bits(),
+                narrow_projector.tile_rect(*id).min.x.to_bits(),
+                "the narrowing moved the projector"
+            );
+        }
+
+        // And what was drawn under the narrow clip is at the unnarrowed
+        // placement, not offset by the difference of the two centres.
+        let shift = narrow.center() - screen.center();
+        assert!(shift.length() > 1.0, "fixture: the centres barely differ");
+        for (id, got) in narrow_ids.iter().zip(narrow_drawn.iter()) {
+            let want = wide_projector.tile_rect(*id);
+            assert!(
+                (want.min.x - got.min.x).abs() < 1e-3 && (want.min.y - got.min.y).abs() < 1e-3,
+                "tile {id:?} was drawn at {got:?}, not at the projector's {want:?}"
+            );
+        }
+    }
 
     /// `Map::show` resolves the centre once, for the tile layers, and now hands the same
     /// value to the projector instead of letting it resolve its own. That is only sound

@@ -13,12 +13,13 @@ use image::{ImageError, ImageReader};
 use std::collections::HashSet;
 use thiserror::Error;
 
-use crate::Position;
-use crate::mercator::{project, tile_id, total_tiles};
-use crate::position::{Pixels, PixelsExt};
+use crate::mercator::{tile_id, total_tiles};
+use crate::position::Pixels;
+use crate::projector::Projector;
 use crate::sources::Attribution;
 use crate::style::Style;
 use crate::zoom::Zoom;
+use crate::{Position, position::PixelsExt as _};
 
 #[derive(Error, Debug)]
 pub enum TileError {
@@ -249,19 +250,47 @@ impl TilePiece {
     }
 }
 
+/// Draw every tile of one layer that the painter's clip rect can see.
+///
+/// **`projector` places, `painter` culls, and the two rects are not the same rect.**
+/// `Map::show` builds the projector from the widget rect it allocated and clips the painter
+/// to that same rect — but [`egui::Painter::with_clip_rect`] *intersects* rather than sets,
+/// so a parent that clips the widget (a scroll area, a panel smaller than the map) leaves the
+/// painter with a strictly narrower rect. Placement must follow the widget rect, which is
+/// what every other consumer of the projector places against; culling must follow the true
+/// clip, which is what will actually be shown. So the invariant here is containment, not
+/// equality, and it holds by construction from `intersect`.
+///
+/// This is a behaviour change in the narrowed case, and a fix: the flood fill used to offset
+/// tiles from `painter.clip_rect().center()`, so under a narrowing parent the tiles slid away
+/// from the markers and overlays the plugins drew through the projector.
+///
+/// **This whole path is unreachable in this application** — both `Map::new` sites in
+/// `squallar-egui::ui_map` pass `None` for tiles and neither adds a layer, so a green board
+/// says nothing about it. `map::tests::a_tile_layer_is_placed_by_the_projector_and_culled_by_the_painter`
+/// is the only thing that executes it.
 pub(crate) fn draw_tiles(
     painter: &egui::Painter,
+    projector: &Projector,
     map_center: Position,
     zoom: Zoom,
     tiles: &mut dyn Tiles,
     transparency: f32,
 ) {
+    debug_assert!(
+        projector.clip_rect().contains_rect(painter.clip_rect())
+            || !painter.clip_rect().is_positive(),
+        "the painter's clip {:?} is not inside the projector's viewport {:?}, so a tile could \
+         be culled against one map and drawn onto another",
+        painter.clip_rect(),
+        projector.clip_rect(),
+    );
+
     let mut meshes = Default::default();
     flood_fill_tiles(
         painter,
+        projector,
         tile_id(map_center, zoom.round(), tiles.tile_size()),
-        project(map_center, zoom.into()),
-        zoom.into(),
         tiles,
         transparency,
         &mut meshes,
@@ -271,31 +300,20 @@ pub(crate) fn draw_tiles(
 /// Use simple [flood fill algorithm](https://en.wikipedia.org/wiki/Flood_fill) to draw tiles on the map.
 fn flood_fill_tiles(
     painter: &egui::Painter,
+    projector: &Projector,
     tile_id: TileId,
-    map_center_projected_position: Pixels,
-    zoom: f64,
     tiles: &mut dyn Tiles,
     transparency: f32,
     meshes: &mut HashSet<TileId>,
 ) {
-    // We need to make up the difference between integer and floating point zoom levels.
-    let corrected_tile_size = tiles.tile_size() as f64 * 2f64.powf(zoom - zoom.round());
-    let tile_projected = tile_id.project(corrected_tile_size);
-    let tile_screen_position = painter.clip_rect().center().to_vec2()
-        + (tile_projected - map_center_projected_position).to_vec2();
+    // `Projector::tile_rect` already carries both corrections this used to spell out here:
+    // the difference between integer and floating point zoom levels, and the source's tile
+    // size, which `mercator::tile_id` folded into `tile_id.zoom` on the way in.
+    let tile_rect = projector.tile_rect(tile_id);
 
-    if painter
-        .clip_rect()
-        .intersects(rect(tile_screen_position, corrected_tile_size))
-        && meshes.insert(tile_id)
-    {
+    if painter.clip_rect().intersects(tile_rect) && meshes.insert(tile_id) {
         if let Some(tile) = tiles.at(tile_id) {
-            tile.tile.draw(
-                painter,
-                rect(tile_screen_position, corrected_tile_size),
-                tile.uv,
-                transparency,
-            )
+            tile.tile.draw(painter, tile_rect, tile.uv, transparency)
         }
 
         for next_tile_id in [
@@ -309,9 +327,8 @@ fn flood_fill_tiles(
         {
             flood_fill_tiles(
                 painter,
+                projector,
                 *next_tile_id,
-                map_center_projected_position,
-                zoom,
                 tiles,
                 transparency,
                 meshes,
@@ -364,10 +381,6 @@ fn full_rect_of_clipped_tile(rect: Rect, uv: Rect) -> Rect {
         pos2(full_min_x, full_min_y),
         pos2(full_min_x + full_width, full_min_y + full_height),
     )
-}
-
-pub(crate) fn rect(screen_position: Vec2, tile_size: f64) -> Rect {
-    Rect::from_min_size(screen_position.to_pos2(), Vec2::splat(tile_size as f32))
 }
 
 #[cfg(test)]

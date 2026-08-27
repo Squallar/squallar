@@ -1,6 +1,5 @@
 use crate::overlay_cache::{OverlayTextureData, draw_overlay_texture, geo_point_in_feature};
 use crate::tile_source::HttpsTiles;
-use squallar_geo::{tile_to_lat, tile_to_lon};
 use squallar_overlays::render::overlay_state::{ClickableItem, OverlayItem};
 use squallar_overlays::types::OverlayLabel;
 use std::sync::Arc;
@@ -165,16 +164,14 @@ pub(super) fn draw_tile_layer(
             };
 
             if let Some(twuv) = tiles.at(tile_id) {
-                let nw_lon = tile_to_lon(tx, tile_zoom);
-                let nw_lat = tile_to_lat(ty, tile_zoom);
-                let se_lon = tile_to_lon(tx + 1, tile_zoom);
-                let se_lat = tile_to_lat(ty + 1, tile_zoom);
-
-                let rect = crate::overlay_cache::geo_corner_rect(
-                    projector,
-                    (nw_lat, nw_lon),
-                    (se_lat, se_lon),
-                );
+                // Affine, not geographic. This used to spell the tile's two corners as
+                // latitudes and longitudes and hand them to `geo_corner_rect`, which
+                // projected them straight back: `tile_to_lat` is `sinh`/`atan` and
+                // `Projector::project` is `tan`/`asinh`, exact inverses, four transcendental
+                // pairs per tile to arrive at a rect that is a linear function of
+                // `(x, y, zoom)`. `tests::the_affine_tile_rect_agrees_with_the_geographic_round_trip`
+                // holds the two answers together.
+                let rect = projector.tile_rect(tile_id);
 
                 match twuv.tile {
                     Tile::Raster(ref tex) => {

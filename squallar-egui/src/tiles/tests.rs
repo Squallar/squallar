@@ -461,9 +461,14 @@ fn canvas() -> egui::Rect {
     egui::Rect::from_min_size(egui::Pos2::ZERO, CANVAS)
 }
 
-/// The screen rect one tile is painted into — the same two corners
-/// `draw_tile_layer` hands `geo_corner_rect`.
-fn tile_rect(projector: &walkers::Projector, x: u32, y: u32, zoom: u8) -> egui::Rect {
+/// The screen rect one tile is painted into, the long way round: the tile's two
+/// corners as geography, projected back.
+///
+/// This is what `draw_tile_layer` used to hand `geo_corner_rect`, and it is the
+/// reference `the_affine_tile_rect_agrees_with_the_geographic_round_trip`
+/// measures [`walkers::Projector::tile_rect`] against. Every other test in this
+/// file keeps using it, so the reference is not the thing under test.
+fn geographic_tile_rect(projector: &walkers::Projector, x: u32, y: u32, zoom: u8) -> egui::Rect {
     crate::overlay_cache::geo_corner_rect(
         projector,
         (tile_to_lat(y, zoom), tile_to_lon(x, zoom)),
@@ -474,8 +479,8 @@ fn tile_rect(projector: &walkers::Projector, x: u32, y: u32, zoom: u8) -> egui::
 /// The screen rect the whole span covers — the grid is regular, so the union
 /// of its tiles is a rect.
 fn span_rect(projector: &walkers::Projector, span: TileSpan, zoom: u8) -> egui::Rect {
-    tile_rect(projector, span.west, span.north, zoom)
-        .union(tile_rect(projector, span.east, span.south, zoom))
+    geographic_tile_rect(projector, span.west, span.north, zoom)
+        .union(geographic_tile_rect(projector, span.east, span.south, zoom))
 }
 
 /// The screen rect the whole slippy grid covers. Past its edges there is no
@@ -486,6 +491,121 @@ fn world_rect(projector: &walkers::Projector) -> egui::Rect {
         (MERCATOR_LAT_LIMIT_DEG, -180.0),
         (-MERCATOR_LAT_LIMIT_DEG, 180.0),
     )
+}
+
+/// The tile zoom offsets the parity sweep visits, relative to `round(zoom)`.
+///
+/// **Zero on its own would prove nothing.** At `tile_zoom == round(zoom)` and a
+/// whole map zoom, a wrong-sign exponent gives the same 256-point side as the
+/// right one, so a sweep that never leaves that row cannot fail for the one
+/// mistake this arithmetic invites. Every other entry here separates them, and
+/// each is a real configuration: `draw_tile_layer` picks
+/// `tile_zoom = round(zoom) + zoom_bias`, and walkers' own
+/// `interpolate_from_lower_zoom` stretches an ancestor from a shallower level
+/// over a gap.
+const TILE_ZOOM_BIASES: &[i32] = &[-2, -1, 0, 1, 2];
+
+/// **The affine tile rect is the geographic round trip, to within `f32`.**
+///
+/// `Projector::tile_rect` replaces four `sinh`/`atan` → `tan`/`asinh` corner
+/// pairs per tile with two multiplies and an add. The two must place and size
+/// every tile alike; this measures the worst disagreement over the sweep rather
+/// than asserting a belief about it, and prints it whether it passes or fails.
+///
+/// **Denominators.** The sweep is `SPAN_ZOOMS` (15) x `SPAN_ANCHORS` (8) x
+/// `SUB_TILE_OFFSETS` squared (16) x `TILE_ZOOM_BIASES` (5) = 9,600 viewports,
+/// minus the ones whose zoom or tile zoom is out of range, and every tile of
+/// `tile_span` inside each. The tile total is the figure that matters and is
+/// counted, not derived. Ranges: zoom 0 to 18 including four fractional steps
+/// and both sides of a `round()` boundary; tile zoom `round(zoom) - 2` to
+/// `+ 2`; the viewport centred at each of four sub-tile phases on each axis;
+/// anchors at mid-latitude, at 65 N, at the origin, in the southern
+/// hemisphere, and hard against all four grid edges, where `tile_index`'s clamp
+/// bites and the span degenerates to a single column or row.
+#[test]
+fn the_affine_tile_rect_agrees_with_the_geographic_round_trip() {
+    /// Two hundredths of a point, against a tile that is 181 points across at
+    /// its smallest. The disagreement is the `f64` round trip through four
+    /// transcendentals plus `Projector`'s `f32` return, and the measured worst
+    /// is printed below — if it ever approaches this, the arithmetic moved.
+    const TOL: f32 = 0.02;
+
+    let mut viewports = 0usize;
+    let mut tiles = 0usize;
+    let mut worst = (0.0f32, String::new());
+
+    for (zoom, anchor, offset) in span_sweep() {
+        let Some((projector, round_zoom)) = projector_for(zoom, anchor, offset) else {
+            continue;
+        };
+
+        for &bias in TILE_ZOOM_BIASES {
+            let Ok(tile_zoom) = u8::try_from(i32::from(round_zoom) + bias) else {
+                continue;
+            };
+            if tile_zoom > 20 {
+                continue;
+            }
+            viewports += 1;
+
+            let span = tile_span(&projector, canvas(), tile_zoom);
+            for y in span.north..=span.south {
+                for x in span.west..=span.east {
+                    tiles += 1;
+
+                    let want = geographic_tile_rect(&projector, x, y, tile_zoom);
+                    let got = projector.tile_rect(walkers::TileId {
+                        x,
+                        y,
+                        zoom: tile_zoom,
+                    });
+
+                    for (corner, err) in [
+                        ("min.x", (got.min.x - want.min.x).abs()),
+                        ("min.y", (got.min.y - want.min.y).abs()),
+                        ("max.x", (got.max.x - want.max.x).abs()),
+                        ("max.y", (got.max.y - want.max.y).abs()),
+                    ] {
+                        if err > worst.0 {
+                            worst = (
+                                err,
+                                format!(
+                                    "{corner} of tile ({x},{y},z{tile_zoom}) at map zoom \
+                                     {zoom} (bias {bias}), anchor {anchor:?} offset \
+                                     {offset:?}: affine {got:?} vs geographic {want:?}"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Non-vacuity. The floors are a little under what the sweep above actually
+    // reaches, so a narrowed `SPAN_*` list or a `tile_span` that stopped
+    // naming tiles reddens here instead of passing on an empty sweep.
+    assert!(
+        viewports >= 6_000,
+        "the sweep only built {viewports} viewports; it is not sweeping what this test claims"
+    );
+    assert!(
+        tiles >= 500_000,
+        "the sweep only compared {tiles} tiles; it is not sweeping what this test claims"
+    );
+
+    assert!(
+        worst.0 <= TOL,
+        "the affine tile rect and the geographic round trip disagree by {} points \
+         over {tiles} tiles in {viewports} viewports: {}",
+        worst.0,
+        worst.1
+    );
+
+    println!(
+        "tile_rect parity: {tiles} tiles, {viewports} viewports, worst {} pt",
+        worst.0
+    );
 }
 
 /// Every `(zoom, anchor, offset)` the three span sweeps visit.
@@ -571,7 +691,7 @@ fn the_span_names_no_tile_that_is_wholly_off_the_viewport() {
 
         for y in span.north..=span.south {
             for x in span.west..=span.east {
-                let rect = tile_rect(&projector, x, y, tile_zoom);
+                let rect = geographic_tile_rect(&projector, x, y, tile_zoom);
                 let overlap_x = rect.right().min(clip.right()) - rect.left().max(clip.left());
                 let overlap_y = rect.bottom().min(clip.bottom()) - rect.top().max(clip.top());
                 let off = (-overlap_x).max(-overlap_y);
