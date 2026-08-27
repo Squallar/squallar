@@ -145,6 +145,16 @@ impl Center {
         self.adjusted_position().map(|p| p.position())
     }
 
+    /// Whether the map is detached, i.e. not following `my_position`.
+    ///
+    /// [`Center::detached`] answers the same question, but producing the position it
+    /// returns costs a clone of the [`AdjustedPosition`] and an `unproject(project(..))`
+    /// round trip through [`AdjustedPosition::position`]. A caller that only wants the
+    /// yes/no should not pay for a position it is about to drop.
+    pub(crate) fn is_detached(&self) -> bool {
+        !matches!(self, Center::MyPosition)
+    }
+
     pub fn animating(&self) -> bool {
         matches!(self, Center::Inertia { .. } | Center::PulledToMyPosition(_))
     }
@@ -203,4 +213,89 @@ fn dragged_by(response: &Response, buttons: DragPanButtons) -> bool {
         DragPanButtons::EXTRA_2 => response.dragged_by(PointerButton::Extra2),
         _ => false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lon_lat;
+
+    fn adjusted() -> AdjustedPosition {
+        AdjustedPosition::new(lon_lat(17.03664, 51.09916)).shift(Vec2::new(10., -20.), 10.)
+    }
+
+    /// Naming every variant in an exhaustive `match` is what keeps [`every_variant`]
+    /// honest: adding a variant to [`Center`] stops this compiling, rather than quietly
+    /// leaving the new one untested.
+    fn variant_name(center: &Center) -> &'static str {
+        match center {
+            Center::MyPosition => "MyPosition",
+            Center::Exact(_) => "Exact",
+            Center::Moving { .. } => "Moving",
+            Center::Inertia { .. } => "Inertia",
+            Center::PulledToMyPosition(_) => "PulledToMyPosition",
+        }
+    }
+
+    fn every_variant() -> [Center; 5] {
+        [
+            Center::MyPosition,
+            Center::Exact(adjusted()),
+            Center::Moving {
+                position: adjusted(),
+                direction: Vec2::new(1., 2.),
+                from_detached: true,
+            },
+            Center::Inertia {
+                position: adjusted(),
+                direction: Vec2::new(1., 0.),
+                amount: 5.,
+            },
+            Center::PulledToMyPosition(adjusted()),
+        ]
+    }
+
+    /// `is_detached` exists so callers can skip the position `detached` builds. The two
+    /// must give the same answer on every variant of the enum, or the substitution at
+    /// its call site is a behaviour change rather than a saving.
+    #[test]
+    fn is_detached_agrees_with_detached_on_every_variant() {
+        let variants = every_variant();
+
+        let mut names: Vec<_> = variants.iter().map(variant_name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            variants.len(),
+            names.len(),
+            "every Center variant must appear exactly once: {names:?}"
+        );
+
+        for center in &variants {
+            assert_eq!(
+                center.detached().is_some(),
+                center.is_detached(),
+                "{}",
+                variant_name(center)
+            );
+        }
+
+        // Agreement on a constant would be agreement about nothing.
+        assert!(!Center::MyPosition.is_detached());
+        assert_eq!(4, variants.iter().filter(|c| c.is_detached()).count());
+    }
+
+    /// The whole point of the cheaper spelling: it must not go through
+    /// `AdjustedPosition::position`, which is where the round trip is.
+    #[test]
+    fn is_detached_does_not_resolve_the_position() {
+        // An offset large enough that the round trip moves the position a long way, so a
+        // `detached()`-shaped implementation could not agree with this by accident.
+        let far = Center::Exact(
+            AdjustedPosition::new(lon_lat(0., 0.)).shift(Vec2::new(1_000_000., 1_000_000.), 1.),
+        );
+
+        assert!(far.is_detached());
+        assert_ne!(lon_lat(0., 0.), far.detached().expect("detached"));
+    }
 }

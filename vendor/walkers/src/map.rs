@@ -170,8 +170,10 @@ impl<'a, 'b, 'c> Map<'a, 'b, 'c> {
             draw_tiles(&painter, map_center, zoom, layer.tiles, layer.transparency);
         }
 
-        // Run plugins.
-        let projector = Projector::new(response.rect, self.memory, self.my_position);
+        // Run plugins. `map_center` is the centre resolved above; nothing between here and
+        // there touches `self.memory`, so the projector reuses it rather than resolving it
+        // a second time.
+        let projector = Projector::with_map_center(response.rect, self.memory, map_center);
         for (idx, plugin) in self.plugins.into_iter().enumerate() {
             let mut child_ui = ui.new_child(UiBuilder::new().max_rect(rect).id_salt(idx));
             plugin.run(&mut child_ui, &response, &projector, self.memory);
@@ -204,7 +206,9 @@ impl Map<'_, '_, '_> {
             // position.
             if let Some(offset) = offset {
                 // If map is tracking `my_position` and the input offset is close, just let it be.
-                if self.memory.detached().is_some()
+                // Only the yes/no is wanted here; `detached()` would build a position, and
+                // `self.position()` below builds the one that is actually used.
+                if self.memory.center_mode.is_detached()
                     || offset.length() > self.options.pull_to_my_position_threshold
                 {
                     self.memory.center_mode = Center::Exact(
@@ -241,7 +245,10 @@ impl Map<'_, '_, '_> {
         let panning_enabled =
             self.options.panning && (ui.input(|i| i.any_touches()) || self.options.zoom_with_ctrl);
 
-        if ui.ui_contains_pointer() && panning_enabled {
+        // `panning_enabled` is a field read; `ui_contains_pointer` is an O(layers) reverse
+        // scan of the area order under egui's memory lock. Ask the cheap one first — it is
+        // `false` for every `Map` this workspace builds, both of which set `.panning(false)`.
+        if panning_enabled && ui.ui_contains_pointer() {
             // Panning by scrolling, e.g. two-finger drag on a touchpad:
             let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
             if scroll_delta != Vec2::ZERO {
@@ -312,4 +319,52 @@ fn input_offset(ui: &mut Ui, response: &Response) -> Option<Vec2> {
     touch_offset
         .or(mouse_offset)
         .map(|pos| pos - response.rect.center())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lon_lat;
+
+    /// `Map::show` resolves the centre once, for the tile layers, and now hands the same
+    /// value to the projector instead of letting it resolve its own. That is only sound
+    /// while `Map::position` is exactly what `Projector::new` would have computed from
+    /// `my_position` — this pins the two expressions together.
+    #[test]
+    fn the_maps_centre_is_the_one_the_projector_would_have_resolved() {
+        let my_position = lon_lat(21., 52.);
+
+        for detached_at in [None, Some(lon_lat(-122.4194, 37.7749))] {
+            let mut memory = MapMemory::default();
+            memory.set_zoom(10.).unwrap();
+            if let Some(position) = detached_at {
+                memory.center_at(position);
+            }
+
+            let expected = memory.center_mode.position(my_position);
+            let map = Map::new(None, &mut memory, my_position);
+
+            assert_eq!(expected, map.position());
+        }
+    }
+
+    /// Following `my_position` and detached are genuinely different centres here, so the
+    /// test above is not comparing a constant with itself.
+    #[test]
+    fn a_detached_map_is_not_centred_on_my_position() {
+        let my_position = lon_lat(21., 52.);
+
+        let mut memory = MapMemory::default();
+        memory.set_zoom(10.).unwrap();
+        assert_eq!(
+            my_position,
+            Map::new(None, &mut memory, my_position).position()
+        );
+
+        memory.center_at(lon_lat(-122.4194, 37.7749));
+        assert_ne!(
+            my_position,
+            Map::new(None, &mut memory, my_position).position()
+        );
+    }
 }
