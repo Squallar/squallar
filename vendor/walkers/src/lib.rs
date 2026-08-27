@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
-#![deny(clippy::unwrap_used, rustdoc::broken_intra_doc_links)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![deny(rustdoc::broken_intra_doc_links)]
 
 mod center;
 mod local_tiles;
