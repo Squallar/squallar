@@ -60,8 +60,10 @@ impl TileId {
         Pixels::new(self.x as f64 * tile_size, self.y as f64 * tile_size)
     }
 
+    /// The tile to the east, or `None` at the eastern edge of the grid -- or at a
+    /// zoom the grid cannot be counted at, see [`total_tiles`].
     pub fn east(&self) -> Option<TileId> {
-        (self.x < total_tiles(self.zoom) - 1).then_some(TileId {
+        (self.x < total_tiles(self.zoom)? - 1).then_some(TileId {
             x: self.x + 1,
             y: self.y,
             zoom: self.zoom,
@@ -84,16 +86,23 @@ impl TileId {
         })
     }
 
+    /// The tile to the south, or `None` at the southern edge of the grid -- or at a
+    /// zoom the grid cannot be counted at, see [`total_tiles`].
     pub fn south(&self) -> Option<TileId> {
-        (self.y < total_tiles(self.zoom) - 1).then_some(TileId {
+        (self.y < total_tiles(self.zoom)? - 1).then_some(TileId {
             x: self.x,
             y: self.y + 1,
             zoom: self.zoom,
         })
     }
 
-    pub(crate) fn valid(&self) -> bool {
-        self.x < total_tiles(self.zoom) && self.y < total_tiles(self.zoom)
+    /// Is this tile inside the grid for its own zoom level? False at a zoom the
+    /// grid cannot be counted at, see [`total_tiles`].
+    pub fn valid(&self) -> bool {
+        match total_tiles(self.zoom) {
+            Some(side) => self.x < side && self.y < side,
+            None => false,
+        }
     }
 }
 
@@ -312,10 +321,13 @@ fn flood_fill_tiles(
 }
 
 /// Take a piece of a tile with lower zoom level and use it as a required tile.
-pub(crate) fn interpolate_from_lower_zoom(tile_id: TileId, available_zoom: u8) -> (TileId, Rect) {
-    assert!(tile_id.zoom >= available_zoom);
-
-    let dzoom = 2u32.pow((tile_id.zoom - available_zoom) as u32);
+///
+/// Returns the ancestor at `available_zoom` and the sub-rectangle of it that
+/// `tile_id` covers, in texture (`uv`) coordinates. `None` if `available_zoom` is
+/// deeper than the tile's own zoom -- there is no such ancestor -- or if the two
+/// are far enough apart that the ratio does not fit a `u32`.
+pub fn interpolate_from_lower_zoom(tile_id: TileId, available_zoom: u8) -> Option<(TileId, Rect)> {
+    let dzoom = 2u32.checked_pow(tile_id.zoom.checked_sub(available_zoom)? as u32)?;
 
     let x = (tile_id.x / dzoom, tile_id.x % dzoom);
     let y = (tile_id.y / dzoom, tile_id.y % dzoom);
@@ -333,7 +345,7 @@ pub(crate) fn interpolate_from_lower_zoom(tile_id: TileId, available_zoom: u8) -
         pos2(x.1 as f32 * z + z, y.1 as f32 * z + z),
     );
 
-    (zoomed_tile_id, uv)
+    Some((zoomed_tile_id, uv))
 }
 
 #[cfg(any(feature = "mvt", test))]
@@ -371,6 +383,38 @@ mod tests {
 
         assert_eq!(full_rect.min, pos2(0.0, 0.0));
         assert_eq!(full_rect.max, pos2(100.0, 100.0));
+    }
+
+    /// `TileId::zoom` is a `u8`, so a tile id can name a zoom the `u32` tile grid
+    /// cannot count. The public neighbour accessors reach that arithmetic.
+    #[test]
+    fn tile_id_past_the_u32_grid_is_not_valid() {
+        let tile_id = TileId {
+            x: 0,
+            y: 0,
+            zoom: 32,
+        };
+
+        assert!(!tile_id.valid());
+        assert_eq!(tile_id.east(), None);
+        assert_eq!(tile_id.south(), None);
+    }
+
+    /// A tile cannot be cut out of an ancestor that is deeper than it is.
+    #[test]
+    fn interpolating_from_a_deeper_zoom_is_none() {
+        let tile_id = TileId {
+            x: 1,
+            y: 1,
+            zoom: 2,
+        };
+
+        assert_eq!(interpolate_from_lower_zoom(tile_id, 3), None);
+
+        // Its own zoom is the whole tile.
+        let (ancestor, uv) = interpolate_from_lower_zoom(tile_id, 2).expect("same zoom resolves");
+        assert_eq!(ancestor, tile_id);
+        assert_eq!(uv, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)));
     }
 
     #[test]

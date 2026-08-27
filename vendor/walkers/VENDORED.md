@@ -244,11 +244,13 @@ commit changes the count in either direction.
 
 ### Changed — source
 
-Seven files. Six of them arrived in three groups — still six there, because the
+Nine files. Six of them arrived in three groups — still six there, because the
 third group touches only `src/lib.rs` and `src/style.rs`, which the first two
-had already changed; the seventh, `src/expression.rs`, arrives with the fifth
-commit described at the end of this section. Nothing in the first three groups
-changes how a tile that this workspace actually renders is drawn.
+had already changed. The other three arrive with the fifth and sixth commits
+described at the end of this section: `src/expression.rs`, then
+`src/mercator.rs` and `src/local_tiles.rs` (the sixth also touches `src/tiles.rs`
+and `src/lib.rs`, which were already on the list). Nothing in the first three
+groups changes how a tile that this workspace actually renders is drawn.
 
 The first commit changed two files, and both changes were forced by the
 packaging rather than chosen:
@@ -394,6 +396,54 @@ against the unmodified file; the failure text above is what it actually printed.
 The 22 upstream expression tests are unchanged and still pass, so the evaluator's
 existing behaviour is pinned across the change.
 
+### Changed — source, sixth commit: the tile grid past zoom 31, and three exports
+
+Two changes, related only because the same three helpers are involved in both.
+
+**A public-API panic.** `mercator::total_tiles` was `2u32.pow(zoom as u32)` over
+a `u8` zoom, so every zoom from 32 up overflowed — panic in debug, wrap in
+release. That is reachable from outside the crate, not just internally:
+`TileId::east` and `TileId::south` are `pub` and both compute
+`total_tiles(self.zoom) - 1`, and `TileId` is a `pub` struct with a `pub zoom:
+u8` field, so any caller can construct one. `total_tiles` now returns
+`Option<u32>` — `None` above zoom 31, the last the `u32` grid holds — and the
+three callers thread it through: `east` and `south` return `None`, `valid()`
+returns false.
+
+Verified against the unmodified file, on probes shaped to compile against the
+old signatures. `total_tiles(32)`, `TileId { zoom: 32, .. }.east()`, `.south()`
+and `.valid()` each panicked with `attempt to multiply with overflow` (raised
+inside `core`'s `pow`); `interpolate_from_lower_zoom(TileId { zoom: 2, .. }, 3)`
+panicked with `assertion failed: tile_id.zoom >= available_zoom` at
+`src/tiles.rs:316`.
+
+Pinned by `mercator::tests::total_tiles_has_no_answer_past_the_u32_grid`
+(`Some` for every zoom 0..=31, `None` for every zoom 32..=255),
+`tiles::tests::tile_id_past_the_u32_grid_is_not_valid` and
+`tiles::tests::interpolating_from_a_deeper_zoom_is_none`. Upstream's
+`tiles::tests::tile_id_cannot_go_beyond_limits` is untouched and still passes,
+so the ordinary edge-of-grid behaviour is pinned across the change.
+
+**Three helpers become public.** `mercator::total_tiles`, `TileId::valid` and
+`tiles::interpolate_from_lower_zoom` were `pub(crate)` or `pub(crate)`-by-module,
+and `squallar-egui/src/tile_source.rs` reimplements all three verbatim — its own
+doc comments say so, naming the visibility as the reason. That is exactly the
+kind of duplicate this directory is supposed to make unnecessary. All three are
+now `pub`; `tiles` is a private module, so `interpolate_from_lower_zoom` is
+re-exported from `src/lib.rs` alongside `Tile`, `TileId`, `TilePiece` and
+`Tiles`. `mercator` is already `pub mod`.
+
+`interpolate_from_lower_zoom` also stops asserting. It `assert!`ed
+`tile_id.zoom >= available_zoom` and then subtracted; it now returns
+`Option<(TileId, Rect)>`, `None` for a deeper ancestor (`checked_sub`) or a
+ratio that does not fit a `u32` (`checked_pow`). `src/local_tiles.rs` is the one
+in-crate caller and takes the `Option` with a `?` inside a `find_map` closure
+that already returns `Option<TilePiece>` — a zoom candidate with no ancestor is
+skipped, which is what the loop already did with every other miss.
+
+Deleting the `squallar-egui` copies is deliberately **not** part of this commit;
+this one is additive to `vendor/walkers` and changes nothing outside it.
+
 `diff -rq` against the unpacked tarball, in full, is exactly:
 
 ```text
@@ -401,6 +451,8 @@ Files <tarball>/Cargo.toml   and vendor/walkers/Cargo.toml   differ
 Files <tarball>/README.md    and vendor/walkers/README.md    differ
 Files <tarball>/src/expression.rs and …/src/expression.rs differ
 Files <tarball>/src/lib.rs   and vendor/walkers/src/lib.rs   differ
+Files <tarball>/src/local_tiles.rs and …/src/local_tiles.rs differ
+Files <tarball>/src/mercator.rs and …/src/mercator.rs differ
 Files <tarball>/src/sources/mapbox.rs and …/src/sources/mapbox.rs differ
 Files <tarball>/src/style.rs and vendor/walkers/src/style.rs differ
 Files <tarball>/src/tiles.rs and vendor/walkers/src/tiles.rs differ
@@ -415,9 +467,9 @@ Only in vendor/walkers: LICENSE
 Only in vendor/walkers: VENDORED.md
 ```
 
-Every other file under `src/` — `center`, `local_tiles`, `map`, `memory`,
-`mercator`, `mvt`, `options`, `plugin`, `position`, `projector`, `text`, `zoom`,
-and the rest of `sources/` — is byte-for-byte upstream's.
+Every other file under `src/` — `center`, `map`, `memory`, `mvt`, `options`,
+`plugin`, `position`, `projector`, `text`, `zoom`, and the rest of `sources/` —
+is byte-for-byte upstream's.
 
 ## What the pin actually selects
 
