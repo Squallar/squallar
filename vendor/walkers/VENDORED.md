@@ -244,10 +244,11 @@ commit changes the count in either direction.
 
 ### Changed — source
 
-Six files, in three groups — still six, because the third group touches only
-`src/lib.rs` and `src/style.rs`, which the first two had already changed.
-Nothing in any group changes how a tile that this workspace actually renders is
-drawn.
+Seven files. Six of them arrived in three groups — still six there, because the
+third group touches only `src/lib.rs` and `src/style.rs`, which the first two
+had already changed; the seventh, `src/expression.rs`, arrives with the fifth
+commit described at the end of this section. Nothing in the first three groups
+changes how a tile that this workspace actually renders is drawn.
 
 The first commit changed two files, and both changes were forced by the
 packaging rather than chosen:
@@ -341,11 +342,64 @@ first that adds code here instead of removing it. Three changes, two files:
    moved and no item's contents changed, only which of them a dependent crate
    can name.
 
+### Changed — source, fifth commit: three defects in the expression evaluator
+
+`Style::from_json` (above) is what makes these live. Before it, a `Style` could
+only be `Default`, so no attacker-shaped or merely sloppy expression ever
+reached the evaluator; now this workspace hands it JSON it did not author.
+
+All three are reachable from style JSON alone, and none of them is caught by
+`deny(clippy::unwrap_used)` — two are slice indexing, which that lint does not
+see at all.
+
+1. **`interpolate` with an odd-length stop list panicked.** Stops were paired
+   with `.chunks(2).map(|chunk| (chunk[0].clone(), chunk[1].clone()))`; a
+   trailing unpaired stop gives a one-element final chunk and `chunk[1]`
+   panics. Now each chunk goes through the existing `two_elements` helper, so
+   the odd list is `Error::TwoElementsExpected`.
+
+   Verified against the unmodified file:
+   `index out of bounds: the len is 1 but the index is 1`, at
+   `src/expression.rs:195`.
+
+2. **`interpolate` with no stops at all panicked.** When no surrounding stop
+   pair is found the code clamped with `stops[0]` and `stops[stops.len() - 1]`.
+   `stops` can legitimately be empty: it comes from `first_and_rest`, whose
+   name promises two but whose body is `split_first`, guaranteeing one. So
+   `["interpolate", ["linear"], 5]` — a valid-looking expression with the
+   interpolation type and the input and nothing else — indexed an empty vector.
+   Now the clamp goes through `first()`/`last()` and an empty list is
+   `Error::InterpolateStopNotFound`, the same error the no-match arm already
+   returned.
+
+   Verified against the unmodified file:
+   `index out of bounds: the len is 0 but the index is 0`, at
+   `src/expression.rs:218`.
+
+3. **`!=` resolved only its left operand.** `==` calls
+   `property_or_expression` on both sides; `!=` called it on the left and
+   compared against the raw right-hand `Value`. So `["!=", "class", ["get",
+   "x"]]` compared a resolved property against the literal JSON array
+   `["get", "x"]` — never equal, so `!=` was unconditionally true whenever its
+   right side was an expression. `!=` is now the exact mirror of `==`.
+
+   Verified against the unmodified file: the new test read `Bool(true)` where
+   `Bool(false)` is correct — a silently wrong answer, which is why this one
+   had no chance of being noticed as a crash.
+
+Pinned by `expression::tests::test_interpolate_with_an_odd_stop_list_is_an_error`,
+`…::test_interpolate_with_no_stops_is_an_error` and
+`…::test_not_eq_operator_evaluates_both_sides`. Each was written first and run
+against the unmodified file; the failure text above is what it actually printed.
+The 22 upstream expression tests are unchanged and still pass, so the evaluator's
+existing behaviour is pinned across the change.
+
 `diff -rq` against the unpacked tarball, in full, is exactly:
 
 ```text
 Files <tarball>/Cargo.toml   and vendor/walkers/Cargo.toml   differ
 Files <tarball>/README.md    and vendor/walkers/README.md    differ
+Files <tarball>/src/expression.rs and …/src/expression.rs differ
 Files <tarball>/src/lib.rs   and vendor/walkers/src/lib.rs   differ
 Files <tarball>/src/sources/mapbox.rs and …/src/sources/mapbox.rs differ
 Files <tarball>/src/style.rs and vendor/walkers/src/style.rs differ
@@ -361,9 +415,9 @@ Only in vendor/walkers: LICENSE
 Only in vendor/walkers: VENDORED.md
 ```
 
-Every other file under `src/` — `center`, `expression`, `local_tiles`, `map`,
-`memory`, `mercator`, `mvt`, `options`, `plugin`, `position`, `projector`,
-`text`, `zoom`, and the rest of `sources/` — is byte-for-byte upstream's.
+Every other file under `src/` — `center`, `local_tiles`, `map`, `memory`,
+`mercator`, `mvt`, `options`, `plugin`, `position`, `projector`, `text`, `zoom`,
+and the rest of `sources/` — is byte-for-byte upstream's.
 
 ## What the pin actually selects
 
