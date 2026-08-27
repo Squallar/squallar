@@ -142,6 +142,38 @@ flate2 = "=1.1.9"
 jni = "=0.22.4"
 log = "=0.4.34"
 
+# PMTiles v3 archives: one range-addressable file holding a whole tileset,
+# which is how a client-rasterised vector basemap is fetched without a tile
+# server. Nothing calls it yet; it is here so its reach across the target
+# triples is a measured fact before code is written against it.
+#
+# Taken DIRECTLY, never through a `walkers/pmtiles` feature -- and in this tree
+# that feature does not exist to enable, because `vendor/walkers` deleted
+# `src/pmtiles.rs` and the feature with it (VENDORED.md, "The public API this
+# removes"). Upstream is why it stays deleted: walkers 0.56.0 as published
+# declares `[dependencies.pmtiles] features = ["mmap-async-tokio"]`, read out of
+# the registry tarball at
+# `~/.cargo/registry/src/*/walkers-0.56.0/Cargo.toml:112`. That feature is
+# `dep:fmmap`, and fmmap is memmap2, which has no meaning on wasm32.
+#
+# `default-features = false` is load-bearing for the same reason and not
+# tidiness: pmtiles' `default` is `__all_non_conflicting`, and that list names
+# `mmap-async-tokio` among eleven others.
+#
+# `__async` is the crate's own name for the async core every backend feature
+# turns on -- double-underscored as "not a backend you pick", not as unstable.
+# It is exactly `dep:tokio` plus `async-compression/tokio`, and the tokio it
+# names is `default-features = false, features = ["io-util"]`, which is inside
+# the `sync,macros,io-util,rt,time` set tokio permits on wasm.
+#
+# The one backend that reaches the network, `http-async`, is added per target in
+# `squallar-egui` instead of here. It is `dep:reqwest` at `0.13.1`, satisfied by
+# this workspace's `=0.13.4` pin above, so it adds features to a reqwest already
+# in the graph rather than a second copy of it.
+pmtiles = { version = "=0.23.0", default-features = false, features = [
+    "__async",
+] }
+
 pollster = "=1.0.1"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"

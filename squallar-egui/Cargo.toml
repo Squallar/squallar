@@ -18,6 +18,27 @@ edition.workspace = true
 # the two gates now agree because they are the same kind of gate.
 gps-serial = ["squallar-nmea-serial/serial"]
 
+# The basemap drawn from vector tiles this client rasterises, rather than from
+# a server's pre-rendered raster tiles. Turning it on adds the PMTiles v3
+# archive reader; the tessellation half is `walkers/mvt`, which is on
+# unconditionally and is not part of this gate.
+#
+# Nothing reads `pmtiles` yet. The feature exists ahead of its code because the
+# question it answers -- whether this dependency compiles for all eleven CI
+# target triples, wasm32 and the two Apple mobile ones especially -- is worth
+# settling before any code depends on the answer.
+#
+# A feature and not a `cfg(target_arch)`, and `gps-serial` above is the recorded
+# reason to be careful which kind of gate this is: there, a call site gated on
+# `not(target_os = "android")` called a body gated on a *feature*, and an OS cfg
+# cannot satisfy a feature cfg. Both halves of this one are features. The
+# per-target split inside it is only over `pmtiles`' own backend features, which
+# is a dependency selection -- what ARCHITECTURE.md permits a `cfg` to do.
+#
+# Off by default: it draws nothing today, and a default-on feature would put
+# `pmtiles` and its `tokio` into every shipped artifact for no rendered pixel.
+basemap-vector = ["dep:pmtiles"]
+
 [dependencies]
 web-time = { workspace = true }
 squallar-geo = { workspace = true }
@@ -66,6 +87,25 @@ lru = "=0.18.2"
 # `webpki-roots`, and offers no way to replace it.
 reqwest = { workspace = true }
 
+# The PMTiles v3 archive reader, behind `basemap-vector`. Portable half only:
+# the workspace pin is `default-features = false, features = ["__async"]`, so
+# what arrives here is the reader, its async core and nothing that touches a
+# filesystem or a socket. The `http-async` backend is added for non-wasm
+# targets in the table below -- the same optional dependency named twice, which
+# is why `[features]` has one `dep:pmtiles` and not two entries.
+#
+# One consequence worth naming because it cuts against the `tokio` comment
+# below: `__async` is `dep:tokio`, unconditionally, so with `basemap-vector` on
+# **tokio enters the wasm32 graph** -- measured, `cargo tree -p squallar-egui
+# --target wasm32-unknown-unknown -e normal`, 281 nodes off and 289 on, with
+# `tokio v1.53.1` among the eight. That is survivable and not a contradiction of
+# the rule below, which is about tokio's *feature set*: pmtiles asks for
+# `default-features = false, features = ["io-util"]`, and `io-util` is one of
+# the five tokio permits on wasm. It does mean the wasm artifact grows a runtime
+# crate it did not carry before, which is a cost to weigh when this feature
+# stops being off-by-default.
+pmtiles = { workspace = true, optional = true }
+
 # The tile IO runtime. Native only, and *not* in the shared `[dependencies]`
 # table: tokio rejects most of its feature set on wasm outright
 # (`compile_error!("Only features sync,macros,io-util,rt,time are supported on
@@ -74,6 +114,27 @@ reqwest = { workspace = true }
 # below instead.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = ["rt", "sync", "net", "time"] }
+# `http-async` is pmtiles' range-request backend over `reqwest`. It enables
+# `dep:reqwest` at `0.13.1`, which resolves to the `=0.13.4` this crate already
+# depends on unconditionally, so it adds no node to the graph.
+#
+# The target gate is REQUIRED, not house style. `AsyncBackend::read` returns
+# `impl Future<Output = ...> + Send` (`pmtiles-0.23.0/src/async_reader.rs:424`)
+# and on wasm32 `reqwest::Response` is not `Send`, so `HttpBackend` fails to
+# satisfy its own trait. Measured in the CI image, `cargo check -p squallar-egui
+# --target wasm32-unknown-unknown --features basemap-vector,pmtiles/http-async`:
+# two E0277s, "future returned by `read` is not `Send`", at
+# `src/backends/http.rs:67`.
+#
+# The consequence reaches past this manifest, so it is written here rather than
+# discovered later: **none of pmtiles' four shipped backends works on wasm32**
+# -- `mmap` is memmap2, `http` is the above, and `s3`/`object_store` are heavier
+# forms of the same native shape. The web target needs its own `AsyncBackend`
+# impl, and that impl has to yield a `Send` future on a target where `JsValue`
+# is not `Send`, i.e. the JS work goes in `spawn_local` and the bytes come back
+# over a channel. Nothing here does that yet; this line only keeps the
+# non-portable backend off the target that cannot compile it.
+pmtiles = { workspace = true, optional = true, features = ["http-async"] }
 
 # The wasm half of the same split: no threads, no tokio: the fetch loop runs on
 # the browser's event loop and `reqwest` becomes `fetch()`, which also means the
