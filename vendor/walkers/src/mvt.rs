@@ -1,0 +1,516 @@
+//! Renderer for Mapbox Vector Tiles.
+
+use std::collections::HashMap;
+
+use egui::{
+    Color32, Mesh, Rect, Shape, Stroke,
+    emath::TSTransform,
+    epaint::{Vertex, WHITE_UV},
+    pos2, vec2,
+};
+pub use geo_types::{Coord, Geometry, Line};
+use log::warn;
+use lyon_path::{
+    Path, Polygon,
+    geom::{Point, point},
+};
+use lyon_tessellation::{
+    BuffersBuilder, FillOptions, FillTessellator, FillVertex, TessellationError, VertexBuffers,
+};
+use mvt_reader::{Reader, feature::Value};
+use serde_json::{Number, Value as JsonValue};
+
+use crate::{
+    expression::Context,
+    style::{Filter, Layer, Layout, Paint, Style},
+    text::Text,
+};
+
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    #[error("Decoding MVT failed: {0}.")]
+    Mvt(String),
+    #[error("Layer not found: {0}. Available layers: {1:?}")]
+    LayerNotFound(String, Vec<String>),
+    #[error("Unsupported layer extent: {0}")]
+    UnsupportedLayerExtent(String),
+    #[error("Unsupported kind: {0:?}")]
+    UnsupportedFeatureKind(HashMap<String, Value>),
+    #[error("Missing kind in properties: {0:?}")]
+    FeatureWithoutKind(HashMap<String, Value>),
+    #[error("Missing properties in feature")]
+    FeatureWithoutProperties,
+    #[error(transparent)]
+    Tessellation(#[from] TessellationError),
+}
+
+/// Custom conversion because mvt_reader::error::Error is not Send.
+impl From<mvt_reader::error::ParserError> for Error {
+    fn from(err: mvt_reader::error::ParserError) -> Self {
+        Error::Mvt(err.to_string())
+    }
+}
+
+/// Currently this is the only supported extent.
+const ONLY_SUPPORTED_EXTENT: u32 = 4096;
+
+#[derive(Debug, Clone)]
+pub enum ShapeOrText {
+    Shape(Shape),
+    Text(Text),
+}
+
+impl From<Shape> for ShapeOrText {
+    fn from(shape: Shape) -> Self {
+        ShapeOrText::Shape(shape)
+    }
+}
+
+impl From<Mesh> for ShapeOrText {
+    fn from(mesh: Mesh) -> Self {
+        ShapeOrText::Shape(Shape::Mesh(mesh.into()))
+    }
+}
+
+impl ShapeOrText {
+    pub fn transform(&mut self, transform: TSTransform) {
+        match self {
+            ShapeOrText::Shape(shape) => {
+                shape.transform(transform);
+            }
+            ShapeOrText::Text(Text { position, .. }) => {
+                *position *= transform.scaling;
+                *position += transform.translation;
+            }
+        }
+    }
+}
+
+/// Render MVT data into a list of [`epaint::Shape`]s.
+pub fn render(data: &[u8], style: &Style, zoom: u8) -> Result<Vec<ShapeOrText>, Error> {
+    let data = mvt_reader::Reader::new(data.to_vec())?;
+    let mut shapes = Vec::new();
+
+    for layer in &style.layers {
+        match layer {
+            Layer::Background { paint } => {
+                let context = Context::new("None".to_string(), HashMap::new(), zoom);
+
+                let bg_color = if let Some(color) = &paint.background_color {
+                    color.evaluate(&context)
+                } else {
+                    Color32::WHITE
+                };
+
+                let rect = Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    vec2(ONLY_SUPPORTED_EXTENT as f32, ONLY_SUPPORTED_EXTENT as f32),
+                );
+                shapes.push(Shape::rect_filled(rect, 0.0, bg_color).into());
+            }
+            Layer::Fill {
+                source_layer,
+                filter,
+                paint,
+            } => {
+                for (geometry, context) in
+                    get_layer_features(&data, zoom, source_layer, filter.as_ref())?
+                {
+                    if let Err(err) = render_polygon(&geometry, &context, &mut shapes, paint) {
+                        warn!("{err}");
+                    }
+                }
+            }
+            Layer::Line {
+                source_layer,
+                filter,
+                paint,
+            } => {
+                for (geometry, context) in
+                    get_layer_features(&data, zoom, source_layer, filter.as_ref())?
+                {
+                    if let Err(err) = render_line(&geometry, &context, &mut shapes, paint) {
+                        warn!("{err}");
+                    }
+                }
+            }
+            Layer::Symbol {
+                source_layer,
+                filter,
+                layout,
+                paint,
+            } => {
+                for (geometry, context) in
+                    get_layer_features(&data, zoom, source_layer, filter.as_ref())?
+                {
+                    if let Err(err) = render_symbol(&geometry, &context, &mut shapes, layout, paint)
+                    {
+                        warn!("{err}");
+                    }
+                }
+            }
+            layer => {
+                log::warn!("Unsupported layer type in style: {layer:?}");
+                continue;
+            }
+        }
+    }
+
+    log::trace!("Rendered {} shapes", shapes.len());
+    Ok(shapes)
+}
+
+/// Transform shapes from MVT space to screen space.
+pub fn transformed(shapes: &[ShapeOrText], rect: egui::Rect) -> Vec<ShapeOrText> {
+    let transform = TSTransform {
+        scaling: rect.width() / ONLY_SUPPORTED_EXTENT as f32,
+        translation: rect.min.to_vec2(),
+    };
+
+    let mut result = shapes.to_vec();
+    for shape in result.iter_mut() {
+        shape.transform(transform);
+    }
+    result
+}
+
+fn get_layer_features(
+    reader: &Reader,
+    zoom: u8,
+    name: &str,
+    filter: Option<&Filter>,
+) -> Result<impl Iterator<Item = (Geometry<f32>, Context)>, Error> {
+    let features = if let Ok(layer_index) = find_layer(reader, name) {
+        reader.get_features(layer_index)?
+    } else {
+        warn!("Source layer '{name}' not found. Skipping.");
+        Vec::new()
+    }
+    .into_iter()
+    .filter_map(move |feature| {
+        let context = Context::new(
+            geometry_type_to_str(&feature.geometry).to_string(),
+            feature
+                .properties
+                .map_or(Default::default(), mvt_properties_to_json_properties),
+            zoom,
+        );
+
+        filter
+            .is_none_or(|filter| filter.matches(&context))
+            .then_some((feature.geometry, context))
+    });
+
+    Ok(features)
+}
+
+fn mvt_properties_to_json_properties(
+    properties: HashMap<String, mvt_reader::feature::Value>,
+) -> HashMap<String, serde_json::Value> {
+    properties
+        .into_iter()
+        .map(|(k, v)| (k, mvt_value_to_json_value(&v)))
+        .collect()
+}
+
+fn mvt_value_to_json_value(value: &Value) -> JsonValue {
+    match value {
+        Value::String(s) => JsonValue::String(s.clone()),
+        Value::Int(x) | Value::SInt(x) => JsonValue::Number((*x).into()),
+        Value::Double(x) => Number::from_f64(*x)
+            .map(JsonValue::Number)
+            .unwrap_or_else(|| {
+                warn!("Invalid f64 value: {x}");
+                JsonValue::Null
+            }),
+        Value::Bool(b) => JsonValue::Bool(*b),
+        Value::Null => JsonValue::Null,
+        _ => {
+            warn!("Unsupported MVT value type: {value:?}");
+            JsonValue::Null
+        }
+    }
+}
+
+fn geometry_type_to_str(geometry: &Geometry<f32>) -> &'static str {
+    match geometry {
+        Geometry::Point(_) | Geometry::MultiPoint(_) => "Point",
+        Geometry::Line(_) => "Line",
+        Geometry::LineString(_) | Geometry::MultiLineString(_) => "LineString",
+        Geometry::Polygon(_) | Geometry::MultiPolygon(_) => "Polygon",
+        Geometry::GeometryCollection(_) => "GeometryCollection",
+        Geometry::Rect(_) => "Rect",
+        Geometry::Triangle(_) => "Triangle",
+    }
+}
+
+pub fn render_line(
+    geometry: &Geometry<f32>,
+    context: &Context,
+    shapes: &mut Vec<ShapeOrText>,
+    paint: &Paint,
+) -> Result<(), Error> {
+    let width = if let Some(width) = &paint.line_width {
+        // Align to the proportion of MVT extent and tile size.
+        width.evaluate(context) * 4.0
+    } else {
+        2.0
+    };
+
+    let opacity = if let Some(opacity) = &paint.line_opacity {
+        opacity.evaluate(context)
+    } else {
+        1.0
+    };
+
+    let color = if let Some(color) = &paint.line_color {
+        color.evaluate(context).gamma_multiply(opacity)
+    } else {
+        Color32::WHITE
+    };
+
+    match geometry {
+        Geometry::LineString(line_string) => {
+            let stroke = Stroke::new(width, color);
+            let points = line_string
+                .0
+                .iter()
+                .map(|p| pos2(p.x, p.y))
+                .collect::<Vec<_>>();
+            shapes.push(Shape::line(points, stroke).into());
+        }
+        Geometry::MultiLineString(multi_line_string) => {
+            let stroke = Stroke::new(width, color);
+            for line_string in multi_line_string {
+                let points = line_string
+                    .0
+                    .iter()
+                    .map(|p| pos2(p.x, p.y))
+                    .collect::<Vec<_>>();
+                shapes.push(Shape::line(points, stroke).into());
+            }
+        }
+        _ => (),
+    }
+    Ok(())
+}
+
+fn render_polygon(
+    geometry: &Geometry<f32>,
+    context: &Context,
+    shapes: &mut Vec<ShapeOrText>,
+    paint: &Paint,
+) -> Result<(), Error> {
+    if let Geometry::MultiPolygon(multi_polygon) = geometry {
+        let Some(fill_color) = &paint.fill_color else {
+            warn!("Fill layer without fill color. Skipping.");
+            return Ok(());
+        };
+
+        let fill_color = fill_color.evaluate(context);
+
+        let fill_color = if let Some(fill_opacity) = &paint.fill_opacity {
+            let fill_opacity = fill_opacity.evaluate(context);
+            fill_color.gamma_multiply(fill_opacity)
+        } else {
+            fill_color
+        };
+
+        for polygon in multi_polygon.iter() {
+            let exterior = lyon_points(&polygon.exterior().0);
+            let interiors = polygon
+                .interiors()
+                .iter()
+                .map(|hole| lyon_points(&hole.0))
+                .collect::<Vec<_>>();
+            shapes.push(tessellate_polygon(&exterior, &interiors, fill_color)?.into());
+        }
+    }
+    Ok(())
+}
+
+fn render_symbol(
+    geometry: &Geometry<f32>,
+    context: &Context,
+    shapes: &mut Vec<ShapeOrText>,
+    layout: &Layout,
+    paint: &Option<Paint>,
+) -> Result<(), Error> {
+    match geometry {
+        Geometry::MultiPoint(multi_point) => {
+            let text_size = layout
+                .text_size
+                .as_ref()
+                .and_then(|text_size| {
+                    let size = text_size.evaluate(context);
+
+                    if size > 3.0 {
+                        Some(size)
+                    } else {
+                        warn!(
+                            "{} evaluated into {size}, which is too small for text size.",
+                            text_size.0
+                        );
+                        None
+                    }
+                })
+                .unwrap_or(12.0);
+
+            let text_color = if let Some(paint) = paint
+                && let Some(color) = &paint.text_color
+            {
+                color.evaluate(context)
+            } else {
+                // Default from MapLibre spec.
+                Color32::BLACK
+            };
+
+            if let Some(text) = &layout.text(context) {
+                shapes.extend(multi_point.0.iter().map(|p| {
+                    ShapeOrText::Text(Text::new(
+                        pos2(p.x(), p.y()),
+                        text.clone(),
+                        text_size,
+                        text_color,
+                        Color32::TRANSPARENT,
+                        0.0,
+                    ))
+                }))
+            }
+        }
+        Geometry::MultiLineString(multi_line_string) => {
+            let text_size = layout
+                .text_size
+                .as_ref()
+                .and_then(|text_size| {
+                    let size = text_size.evaluate(context);
+
+                    if size > 3.0 {
+                        Some(size)
+                    } else {
+                        warn!(
+                            "{} evaluated into {size}, which is too small for text size.",
+                            text_size.0
+                        );
+                        None
+                    }
+                })
+                .unwrap_or(12.0);
+
+            let text_color = if let Some(paint) = paint
+                && let Some(color) = &paint.text_color
+            {
+                color.evaluate(context)
+            } else {
+                Color32::BLACK
+            };
+
+            let text_halo_color = if let Some(paint) = paint
+                && let Some(color) = &paint.text_halo_color
+            {
+                color.evaluate(context)
+            } else {
+                Color32::TRANSPARENT
+            };
+
+            for line_string in multi_line_string {
+                let lines: Vec<_> = line_string.lines().collect();
+
+                if let Some(text) = &layout.text(context)
+                // Use the longest line to fit the label.
+                && let Some(line) = lines.into_iter().max_by_key(|line| length(line) as u32)
+                {
+                    let mid_point = midpoint(&line.start_point(), &line.end_point());
+                    let angle = line.slope().atan();
+
+                    shapes.push(ShapeOrText::Text(Text::new(
+                        pos2(mid_point.x(), mid_point.y()),
+                        text.clone(),
+                        text_size,
+                        text_color,
+                        // TODO: Implement real halo rendering.
+                        text_halo_color.gamma_multiply(0.5),
+                        angle,
+                    )));
+                }
+            }
+        }
+        _ => (),
+    }
+    Ok(())
+}
+
+fn length(line: &Line<f32>) -> f32 {
+    (line.dx() * line.dx() + line.dy() * line.dy()).sqrt()
+}
+
+fn midpoint(p1: &geo_types::Point<f32>, p2: &geo_types::Point<f32>) -> geo_types::Point<f32> {
+    geo_types::Point::new((p1.x() + p2.x()) / 2.0, (p1.y() + p2.y()) / 2.0)
+}
+
+fn find_layer(data: &Reader, name: &str) -> Result<usize, Error> {
+    let layer = data
+        .get_layer_metadata()?
+        .into_iter()
+        .find(|layer| layer.name == name);
+
+    let Some(layer) = layer else {
+        return Err(Error::LayerNotFound(
+            name.to_string(),
+            data.get_layer_names()?,
+        ));
+    };
+
+    if layer.extent != ONLY_SUPPORTED_EXTENT {
+        return Err(Error::UnsupportedLayerExtent(name.to_string()));
+    }
+
+    Ok(layer.layer_index)
+}
+
+/// Egui cannot tessellate complex polygons, so we use lyon for that.
+pub fn tessellate_polygon(
+    exterior: &[Point<f32>],
+    interiors: &[Vec<Point<f32>>],
+    fill_color: Color32,
+) -> Result<Mesh, TessellationError> {
+    let mut builder = Path::builder();
+
+    builder.add_polygon(Polygon {
+        points: exterior,
+        closed: true,
+    });
+
+    for interior in interiors {
+        builder.add_polygon(Polygon {
+            points: interior,
+            closed: true,
+        });
+    }
+
+    let mut buffers: VertexBuffers<Vertex, u32> = VertexBuffers::new();
+
+    FillTessellator::new().tessellate_path(
+        &builder.build(),
+        &FillOptions::default(),
+        &mut BuffersBuilder::new(&mut buffers, |vertex: FillVertex| {
+            let pos = vertex.position();
+            Vertex {
+                pos: pos2(pos.x, pos.y),
+                uv: WHITE_UV,
+                color: fill_color,
+            }
+        }),
+    )?;
+
+    Ok(Mesh {
+        indices: buffers.indices,
+        vertices: buffers.vertices,
+        ..Default::default()
+    })
+}
+
+/// Convert list of `geo_types::Coord` to Lyon's `Point`s.
+fn lyon_points(points: &[Coord<f32>]) -> Vec<Point<f32>> {
+    points.iter().map(|p| point(p.x, p.y)).collect()
+}
