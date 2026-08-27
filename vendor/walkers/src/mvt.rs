@@ -514,3 +514,435 @@ pub fn tessellate_polygon(
 fn lyon_points(points: &[Coord<f32>]) -> Vec<Point<f32>> {
     points.iter().map(|p| point(p.x, p.y)).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::style::Style;
+
+    // ---------------------------------------------------------------------
+    // A vector tile, encoded by hand.
+    //
+    // `mvt-reader` only decodes, its protobuf module is private, and no `.pbf`
+    // is checked in anywhere in this workspace -- so the only way to drive
+    // `render` end to end is to write the wire format here. Field numbers are
+    // the vector tile spec's:
+    //
+    //   Tile    { layers = 3 }
+    //   Layer   { name = 1, features = 2, keys = 3, values = 4, extent = 5,
+    //             version = 15 }
+    //   Feature { id = 1, tags = 2, type = 3, geometry = 4 }
+    //   Value   { string = 1, float = 2, double = 3, int = 4, uint = 5,
+    //             sint = 6, bool = 7 }
+    // ---------------------------------------------------------------------
+
+    fn varint(mut value: u64, out: &mut Vec<u8>) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                break;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    fn tag(field: u32, wire_type: u32, out: &mut Vec<u8>) {
+        varint(u64::from((field << 3) | wire_type), out);
+    }
+
+    fn varint_field(field: u32, value: u64, out: &mut Vec<u8>) {
+        tag(field, 0, out);
+        varint(value, out);
+    }
+
+    fn bytes_field(field: u32, payload: &[u8], out: &mut Vec<u8>) {
+        tag(field, 2, out);
+        varint(payload.len() as u64, out);
+        out.extend_from_slice(payload);
+    }
+
+    fn packed_u32_field(field: u32, values: &[u32], out: &mut Vec<u8>) {
+        let mut payload = Vec::new();
+        for value in values {
+            varint(u64::from(*value), &mut payload);
+        }
+        bytes_field(field, &payload, out);
+    }
+
+    /// Every `mvt_reader::feature::Value` arm, including the two that
+    /// `mvt_value_to_json_value` does not support and the empty message that
+    /// decodes as `Null`.
+    enum Prop {
+        Str(&'static str),
+        Float(f32),
+        Double(f64),
+        Int(i64),
+        UInt(u64),
+        SInt(i64),
+        Bool(bool),
+        Null,
+    }
+
+    fn encode_value(prop: &Prop) -> Vec<u8> {
+        let mut out = Vec::new();
+        match prop {
+            Prop::Str(s) => bytes_field(1, s.as_bytes(), &mut out),
+            Prop::Float(f) => {
+                tag(2, 5, &mut out);
+                out.extend_from_slice(&f.to_le_bytes());
+            }
+            Prop::Double(d) => {
+                tag(3, 1, &mut out);
+                out.extend_from_slice(&d.to_le_bytes());
+            }
+            Prop::Int(i) => varint_field(4, *i as u64, &mut out),
+            Prop::UInt(u) => varint_field(5, *u, &mut out),
+            Prop::SInt(s) => varint_field(6, ((s << 1) ^ (s >> 63)) as u64, &mut out),
+            Prop::Bool(b) => varint_field(7, u64::from(*b), &mut out),
+            // No field set at all is how the spec spells a null value.
+            Prop::Null => (),
+        }
+        out
+    }
+
+    /// `CommandInteger`: the command id in the low three bits, the repeat
+    /// count above them.
+    fn command(id: u32, count: u32) -> u32 {
+        (id & 0x7) | (count << 3)
+    }
+
+    /// `ParameterInteger`: zig-zag encoded, and relative to the cursor.
+    fn param(value: i32) -> u32 {
+        ((value << 1) ^ (value >> 31)) as u32
+    }
+
+    const GEOM_POINT: u32 = 1;
+    const GEOM_LINESTRING: u32 = 2;
+    const GEOM_POLYGON: u32 = 3;
+
+    struct FeatureSpec {
+        geom_type: u32,
+        properties: Vec<(&'static str, Prop)>,
+        geometry: Vec<u32>,
+    }
+
+    fn encode_layer(name: &str, features: &[FeatureSpec]) -> Vec<u8> {
+        let mut keys: Vec<&str> = Vec::new();
+        let mut values: Vec<Vec<u8>> = Vec::new();
+        let mut feature_blobs: Vec<Vec<u8>> = Vec::new();
+
+        for (index, feature) in features.iter().enumerate() {
+            let mut tags = Vec::new();
+            for (key, value) in &feature.properties {
+                let key_index = match keys.iter().position(|k| k == key) {
+                    Some(index) => index,
+                    None => {
+                        keys.push(key);
+                        keys.len() - 1
+                    }
+                };
+                let encoded = encode_value(value);
+                let value_index = match values.iter().position(|v| *v == encoded) {
+                    Some(index) => index,
+                    None => {
+                        values.push(encoded);
+                        values.len() - 1
+                    }
+                };
+                tags.push(key_index as u32);
+                tags.push(value_index as u32);
+            }
+
+            let mut blob = Vec::new();
+            varint_field(1, index as u64 + 1, &mut blob);
+            packed_u32_field(2, &tags, &mut blob);
+            varint_field(3, u64::from(feature.geom_type), &mut blob);
+            packed_u32_field(4, &feature.geometry, &mut blob);
+            feature_blobs.push(blob);
+        }
+
+        let mut out = Vec::new();
+        bytes_field(1, name.as_bytes(), &mut out);
+        for blob in &feature_blobs {
+            bytes_field(2, blob, &mut out);
+        }
+        for key in &keys {
+            bytes_field(3, key.as_bytes(), &mut out);
+        }
+        for value in &values {
+            bytes_field(4, value, &mut out);
+        }
+        varint_field(5, u64::from(ONLY_SUPPORTED_EXTENT), &mut out);
+        varint_field(15, 2, &mut out);
+        out
+    }
+
+    fn encode_tile(layers: &[(&str, Vec<FeatureSpec>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (name, features) in layers {
+            bytes_field(3, &encode_layer(name, features), &mut out);
+        }
+        out
+    }
+
+    /// One tile, three source layers, seven features between them.
+    ///
+    /// `roads/r1` carries both `kind = "primary"` and `primary = "yes"`. That
+    /// pair is the load-bearing part of the fixture: a filter of
+    /// `["==", "kind", "primary"]` matches only if the right operand stays the
+    /// literal it is. Resolve it as a property and it becomes `"yes"`, the
+    /// filter stops matching, and `r1`'s stroke disappears from the output.
+    fn fixture() -> Vec<u8> {
+        encode_tile(&[
+            (
+                "roads",
+                vec![
+                    // r1: one LineString.
+                    FeatureSpec {
+                        geom_type: GEOM_LINESTRING,
+                        properties: vec![
+                            ("kind", Prop::Str("primary")),
+                            ("primary", Prop::Str("yes")),
+                            ("width", Prop::Int(4)),
+                            ("name", Prop::Str("Main Street")),
+                        ],
+                        geometry: vec![
+                            command(1, 1),
+                            param(10),
+                            param(20),
+                            command(2, 2),
+                            param(90),
+                            param(0),
+                            param(0),
+                            param(80),
+                        ],
+                    },
+                    // r2: two MoveTo runs, so a MultiLineString.
+                    FeatureSpec {
+                        geom_type: GEOM_LINESTRING,
+                        properties: vec![
+                            ("kind", Prop::Str("driveway")),
+                            ("width", Prop::Int(2)),
+                            ("elevation", Prop::SInt(-2)),
+                            ("lit", Prop::Bool(true)),
+                            ("name", Prop::Str("Back Alley")),
+                        ],
+                        geometry: vec![
+                            command(1, 1),
+                            param(10),
+                            param(10),
+                            command(2, 1),
+                            param(50),
+                            param(0),
+                            command(1, 1),
+                            param(0),
+                            param(50),
+                            command(2, 1),
+                            param(-50),
+                            param(0),
+                        ],
+                    },
+                    // r3: no properties at all.
+                    FeatureSpec {
+                        geom_type: GEOM_LINESTRING,
+                        properties: vec![],
+                        geometry: vec![
+                            command(1, 1),
+                            param(200),
+                            param(200),
+                            command(2, 1),
+                            param(100),
+                            param(100),
+                        ],
+                    },
+                ],
+            ),
+            (
+                "landuse",
+                vec![
+                    FeatureSpec {
+                        geom_type: GEOM_POLYGON,
+                        properties: vec![
+                            ("class", Prop::Str("park")),
+                            ("opacity", Prop::Double(0.5)),
+                        ],
+                        geometry: vec![
+                            command(1, 1),
+                            param(0),
+                            param(0),
+                            command(2, 3),
+                            param(100),
+                            param(0),
+                            param(0),
+                            param(100),
+                            param(-100),
+                            param(0),
+                            command(7, 1),
+                        ],
+                    },
+                    FeatureSpec {
+                        geom_type: GEOM_POLYGON,
+                        properties: vec![
+                            ("class", Prop::Str("forest")),
+                            // Neither `Float` nor `UInt` is a supported MVT
+                            // value here; both must arrive as JSON `null`.
+                            ("ratio", Prop::Float(0.25)),
+                            ("count", Prop::UInt(7)),
+                            ("note", Prop::Null),
+                        ],
+                        geometry: vec![
+                            command(1, 1),
+                            param(200),
+                            param(200),
+                            command(2, 3),
+                            param(150),
+                            param(0),
+                            param(0),
+                            param(150),
+                            param(-150),
+                            param(0),
+                            command(7, 1),
+                        ],
+                    },
+                ],
+            ),
+            (
+                "places",
+                vec![
+                    FeatureSpec {
+                        geom_type: GEOM_POINT,
+                        properties: vec![
+                            ("name", Prop::Str("Warsaw")),
+                            ("capital", Prop::Bool(true)),
+                            ("rank", Prop::Int(1)),
+                        ],
+                        geometry: vec![
+                            command(1, 2),
+                            param(500),
+                            param(600),
+                            param(30),
+                            param(-40),
+                        ],
+                    },
+                    FeatureSpec {
+                        geom_type: GEOM_POINT,
+                        properties: vec![("name", Prop::Str("Krakow")), ("rank", Prop::Int(2))],
+                        geometry: vec![command(1, 1), param(1200), param(1300)],
+                    },
+                ],
+            ),
+        ])
+    }
+
+    /// Reads every property arm the fixture carries, through both operand
+    /// resolvers, in filters and in paint and layout expressions.
+    const STYLE: &str = r##"{
+      "layers": [
+        { "type": "background",
+          "paint": { "background-color": "#102030" } },
+
+        { "type": "fill", "source-layer": "landuse",
+          "filter": ["==", "class", "park"],
+          "paint": { "fill-color": "#00ff00", "fill-opacity": ["get", "opacity"] } },
+
+        { "type": "fill", "source-layer": "landuse",
+          "filter": ["all", ["!in", "class", "park"], ["has", "note"], ["==", "count", null]],
+          "paint": { "fill-color": "#008000" } },
+
+        { "type": "line", "source-layer": "roads",
+          "filter": ["==", "kind", "primary"],
+          "paint": { "line-color": "#ff0000", "line-width": ["get", "width"], "line-opacity": 0.8 } },
+
+        { "type": "line", "source-layer": "roads",
+          "filter": ["!has", "kind"],
+          "paint": { "line-color": "#0000ff" } },
+
+        { "type": "line", "source-layer": "roads",
+          "filter": ["all", ["has", "lit"], ["<", "elevation", 0], ["==", "$type", "LineString"]],
+          "paint": { "line-color": "#ffff00", "line-width": ["get", "width"] } },
+
+        { "type": "symbol", "source-layer": "places",
+          "filter": ["has", "name"],
+          "layout": { "text-field": ["get", "name"],
+                      "text-size": ["interpolate", ["linear"], ["zoom"], 0, 8, 10, 16] },
+          "paint": { "text-color": "#ffffff" } },
+
+        { "type": "symbol", "source-layer": "roads",
+          "filter": ["has", "name"],
+          "layout": { "text-field": ["get", "name"], "text-size": 14 },
+          "paint": { "text-color": "#cccccc", "text-halo-color": "#000000" } }
+      ]
+    }"##;
+
+    const ZOOM: u8 = 5;
+
+    fn rendered() -> Vec<ShapeOrText> {
+        let style = Style::from_json(STYLE).expect("fixture style parses");
+        render(&fixture(), &style, ZOOM).expect("fixture tile renders")
+    }
+
+    /// What `render` produced for [`fixture`] before the property bag stopped
+    /// being rebuilt per feature, recorded verbatim.
+    ///
+    /// `ShapeOrText` is not `PartialEq` -- `Text` does not derive it -- so this
+    /// compares the `Debug` rendering, which for `f32` is the shortest string
+    /// that round-trips and so is exact. Every field of every mesh vertex,
+    /// stroke and label is in here. This is a pin on the *values expressions
+    /// evaluate to*, not on tessellation: if a lookup starts returning
+    /// something other than what the eager conversion returned, a colour, a
+    /// width or a label moves and this goes red.
+    const GOLDEN: &str = r##"[Shape(Rect(RectShape { rect: [[0.0 0.0] - [4096.0 4096.0]], corner_radius: CornerRadius { nw: 0, ne: 0, sw: 0, se: 0 }, fill: #10_20_30_FF, stroke: Stroke { width: 0.0, color: #00_00_00_00 }, stroke_kind: Outside, round_to_pixels: None, blur_width: 0.0, brush: None, angle: 0.0 })), Shape(Mesh(Mesh { indices: [1, 0, 2, 1, 2, 3], vertices: [Vertex { pos: [0.0 0.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [100.0 0.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [0.0 100.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [100.0 100.0], uv: [0.0 0.0], color: #00_80_00_80 }], texture_id: Managed(0) })), Shape(Mesh(Mesh { indices: [1, 0, 2, 1, 2, 3], vertices: [Vertex { pos: [200.0 200.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [350.0 200.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [200.0 350.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [350.0 350.0], uv: [0.0 0.0], color: #00_80_00_FF }], texture_id: Managed(0) })), Shape(Path(PathShape { points: [[10.0 20.0], [100.0 20.0], [100.0 100.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 16.0, color: Solid(#CC_00_00_CC), kind: Middle } })), Shape(Path(PathShape { points: [[200.0 200.0], [300.0 300.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 2.0, color: Solid(#00_00_FF_FF), kind: Middle } })), Shape(Path(PathShape { points: [[10.0 10.0], [60.0 10.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 8.0, color: Solid(#FF_FF_00_FF), kind: Middle } })), Shape(Path(PathShape { points: [[60.0 60.0], [10.0 60.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 8.0, color: Solid(#FF_FF_00_FF), kind: Middle } })), Text(Text { text: "Warsaw", position: [500.0 600.0], font_size: 12.0, text_color: #FF_FF_FF_FF, background_color: #00_00_00_00, angle: 0.0 }), Text(Text { text: "Warsaw", position: [530.0 560.0], font_size: 12.0, text_color: #FF_FF_FF_FF, background_color: #00_00_00_00, angle: 0.0 }), Text(Text { text: "Krakow", position: [1200.0 1300.0], font_size: 12.0, text_color: #FF_FF_FF_FF, background_color: #00_00_00_00, angle: 0.0 }), Text(Text { text: "Back Alley", position: [35.0 10.0], font_size: 14.0, text_color: #CC_CC_CC_FF, background_color: #00_00_00_80, angle: 0.0 }), Text(Text { text: "Back Alley", position: [35.0 60.0], font_size: 14.0, text_color: #CC_CC_CC_FF, background_color: #00_00_00_80, angle: -0.0 })]"##;
+
+    #[test]
+    fn rendering_the_fixture_reproduces_the_recorded_shapes_exactly() {
+        let shapes = rendered();
+
+        // A non-triviality floor: an empty or short render must not be able to
+        // pass by matching a golden nobody looked at.
+        assert_eq!(
+            shapes.len(),
+            12,
+            "the fixture draws a background, two fills, four strokes and five labels"
+        );
+
+        assert_eq!(format!("{shapes:?}"), GOLDEN);
+    }
+
+    fn roads_line_style(filter: &str) -> String {
+        format!(
+            r##"{{ "layers": [ {{ "type": "line", "source-layer": "roads",
+                   "filter": {filter},
+                   "paint": {{ "line-color": "#ff0000" }} }} ] }}"##
+        )
+    }
+
+    fn roads_lines(filter: &str) -> usize {
+        let style = Style::from_json(&roads_line_style(filter)).expect("style parses");
+        render(&fixture(), &style, ZOOM)
+            .expect("fixture tile renders")
+            .len()
+    }
+
+    /// The two-resolver split, pinned through `render` rather than through
+    /// `Context` directly.
+    ///
+    /// `roads/r1` has `kind = "primary"` *and* `primary = "yes"`. The left
+    /// operand of a comparison names a property; the right one is the value
+    /// compared against and stays the literal it is. Resolve the right side as
+    /// a property too and both assertions below invert.
+    #[test]
+    fn the_right_operand_of_a_comparison_stays_a_literal() {
+        assert_eq!(
+            roads_lines(r#"["==", "kind", "primary"]"#),
+            1,
+            "'primary' on the right is the literal, and it equals r1's kind"
+        );
+        assert_eq!(
+            roads_lines(r#"["==", "kind", "yes"]"#),
+            0,
+            "'yes' is r1's *primary* property, and must not be reachable from the right"
+        );
+    }
+}
