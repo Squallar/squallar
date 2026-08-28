@@ -56,10 +56,17 @@ EOF
 }
 
 log "installing GDAL and build tools"
+# NO `curl` IN THIS LIST. AL2023 ships `curl-minimal`, which provides
+# /usr/bin/curl and speaks HTTPS -- the three fetches below are proof. Asking
+# for the full `curl` package makes dnf refuse the whole transaction with a
+# conflict against every curl-minimal build in the repo, and the error runs to
+# hundreds of lines that name curl-minimal rather than the request that caused
+# it. Use `--allowerasing` only if something here ever genuinely needs a
+# protocol curl-minimal lacks.
 sudo dnf install -y \
   gdal310 sqlite \
   gcc-c++ make git zlib-devel sqlite-devel libzstd-devel \
-  tar gzip curl
+  tar gzip
 log "GDAL: $(gdalinfo --version)"
 
 # tippecanoe: built from a tag, not from HEAD, so a rebuild in two years
