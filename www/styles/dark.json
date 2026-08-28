@@ -6984,7 +6984,7 @@
       }
     ],
     "squallar:dropped-layers": [],
-    "squallar:note": "Converted once from a CARTO style DOCUMENT (BSD-3-Clause code, CC-BY-4.0 design); no CARTO tile was fetched and none is redistributed. Owned source from 2026-08-27 -- edit this file directly. See tools/basemap-style/DECISIONS.md.",
+    "squallar:note": "Converted once from a CARTO style DOCUMENT (BSD-3-Clause code, CC-BY-4.0 design); no CARTO tile was fetched and none is redistributed. Owned source from 2026-08-27 -- edit this file directly. The converter was deleted on 2026-08-28; its decision record, and the gate that checks this file, are squallar-egui/tests/style_gate/mod.rs.",
     "squallar:restored-layers": [
       {
         "id": "housenumber",

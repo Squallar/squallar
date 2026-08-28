@@ -1,9 +1,9 @@
 # The terrain builder, and deliberately NOT a member of the squallar workspace.
 #
 # `[workspace]` below is the entire exclusion mechanism, exactly as
-# `tools/nws-zone-pack/Cargo.toml` and `tools/basemap-style/Cargo.toml` describe
-# it: the root `Cargo.toml` has no `exclude` key and must not gain one, and this
-# package must not be added to its `members`. It builds an offline data
+# `tools/nws-zone-pack/Cargo.toml` describes it: the root `Cargo.toml` has no
+# `exclude` key and must not gain one, and this package must not be added to its
+# `members`. It builds an offline data
 # artifact; nothing it produces links into a shipped binary, and CI never
 # compiles it.
 #

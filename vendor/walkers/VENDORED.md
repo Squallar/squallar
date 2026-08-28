@@ -1207,22 +1207,23 @@ layer broadly rather than narrowly, with one `warn!` nobody reads.
 is that neither appears in either committed style, so this is an unused spec
 corner. That argument does not survive looking at *why* they are absent:
 
-- `tools/basemap-style` **already rewrites them away**, in `rewrite_filter` —
-  `["!in", k, …]` becomes `["!", ["in", k, …]]` and `["none", …]` becomes
+- `tools/basemap-style` **already rewrote them away**, in `rewrite_filter` —
+  `["!in", k, …]` became `["!", ["in", k, …]]` and `["none", …]` became
   `["!", ["any", …]]`. Its doc comment and `DECISIONS.md` § "Legacy filter
-  operators" both name this evaluator's fallback arm as the reason. They are
-  absent by construction, not by luck.
-- And they are **present in the real input**: `DECISIONS.md` records "one
+  operators" both named this evaluator's fallback arm as the reason. They are
+  absent from the committed styles by construction, not by luck.
+- And they were **present in the real input**: `DECISIONS.md` recorded "one
   `!in` per theme; no `none`". So `!in` is a live construct in the upstream
   CARTO styles that something has to handle. The only question is where.
 - Handling it in the converter puts a correctness requirement of the evaluator
-  in a **different workspace**. `tools/basemap-style` is its own workspace
-  root, so root `cargo test --workspace` walks straight past its manifest, and
-  **nothing in CI runs the converter** — the workflow that briefly did was
-  deleted as a recurring gate on a one-time job. (Since 2026-08-28 the root
-  workspace does compile that crate's `src/lib.rs`, via a `#[path]` include in
-  `squallar-egui/tests/committed_styles_parse.rs`; what stays unreached is
-  `convert` and the four tests that exercise it.) Any style that reaches
+  in a **different workspace**. `tools/basemap-style` was its own workspace
+  root, so root `cargo test --workspace` walked straight past its manifest, and
+  **nothing in CI ran the converter** — the workflow that briefly did was
+  deleted as a recurring gate on a one-time job. (For one day, 2026-08-28, the
+  root workspace did compile that crate's `src/lib.rs`, via a `#[path]` include
+  in `squallar-egui/tests/committed_styles_parse.rs`. The crate was deleted the
+  same day: `convert` and its four tests went to git history, and the checker
+  half moved to `squallar-egui/tests/style_gate/mod.rs`.) Any style that reaches
   `Context::evaluate` without going through that converter — a hand-written
   one, a future source, a style fetched rather than generated — loses a whole
   layer silently.
@@ -1236,10 +1237,11 @@ move into `is_in` and `any_of` so that `!in` and `none` are literally the
 negation of the same code and cannot drift from it; neither existing arm
 changes behaviour.
 
-**The converter's rewrite is deliberately left in place.** It is in another
-crate and another workspace, it is still correct, and it now belongs to
-whoever owns that directory to decide whether to drop it. Nothing here depends
-on it either way.
+**The converter's rewrite was deliberately left in place**, in another crate
+and another workspace; it went with that crate on 2026-08-28. Nothing here
+depended on it either way, and the committed styles still carry the modern
+spelling, which `no_legacy_stops_tokens_or_not_in_filters_survive` holds them
+to.
 
 Pinned by `expression::tests::test_none_and_not_in_operators`, written first
 and run against the unfixed evaluator:
@@ -1287,7 +1289,8 @@ signature — `(String, HashMap<String, serde_json::Value>, u8)` — which is wh
 `squallar-egui/tests/committed_styles_parse.rs` calls and what the 22 inline
 expression tests call. None of them were edited. (That caller was
 `tools/basemap-style/tests/converted_styles.rs` until 2026-08-28, when the
-committed-style gate moved into the workspace; the call site is unchanged.)
+committed-style gate moved into the workspace and that crate was deleted; the
+call site is unchanged.)
 
 #### A second cost, found on the way, and larger than the first
 

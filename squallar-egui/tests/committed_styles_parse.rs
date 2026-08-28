@@ -2,19 +2,20 @@
 //! about them.
 //!
 //! `www/styles/{dark,light}.json` are shipped to users and edited by hand. They
-//! were produced once by `tools/basemap-style`, which is its own workspace root
-//! and so is reached by no root gate -- and the workflow that used to run its
-//! tests was deleted in `d1517cb2` as a recurring gate on a one-time job. That
-//! deletion was right, and it left these two files checked by nothing that
-//! `cargo test --workspace` selects.
+//! were produced once, on 2026-08-27, by a converter that stood outside this
+//! workspace and so was reached by no root gate -- and the workflow that used to
+//! run its tests was deleted in `d1517cb2` as a recurring gate on a one-time
+//! job. That deletion was right, and it left these two files checked by nothing
+//! that `cargo test --workspace` selects.
 //!
-//! **The gate belongs here, not there.** A converter's CI could only ever prove
-//! the converter still works; what users would notice is a style that stops
-//! parsing, and the crate that loads styles is this one. Every check that reads
-//! `www/styles/*.json` off disk therefore lives here, and
-//! `tools/basemap-style/tests/converted_styles.rs` retains only the four tests
-//! that call `convert()` -- the historical record of how the styles were
-//! produced.
+//! **The gate belongs here.** A converter's CI could only ever prove the
+//! converter still works; what users would notice is a style that stops parsing,
+//! and the crate that loads styles is this one. Every check that reads
+//! `www/styles/*.json` off disk lives here, and on 2026-08-28 the checker they
+//! run came with them: the converter was deleted (its output is owned source now,
+//! so re-running it would overwrite work rather than reproduce anything) and the
+//! half of it that was never one-shot moved into [`style_gate`], which also
+//! carries the conversion's decision record.
 //!
 //! The failure being guarded is quiet by construction. `Style` is one
 //! `Vec<Layer>` deserialised as an internally-tagged enum, so **a single
@@ -30,41 +31,26 @@
 //! reject it. A check appearing only in the first half is a check nobody has
 //! shown to work.
 
-// The converter's checker, compiled straight into this test binary rather than
-// depended on.
+// The checker and the vocabulary it judges with, an ordinary sibling module of
+// this test binary.
 //
-// A `[dev-dependencies]` entry cannot express this: `tools/basemap-style`
-// declares its own `[workspace]`, and a path dependency on it makes cargo
-// refuse the root manifest outright with "multiple workspace roots found in the
-// same workspace". The alternatives were to make it a workspace member -- which
-// its manifest argues against at length -- or to copy `check` and its
-// vocabulary in here, which puts two checkers in the tree that can silently
-// disagree. Including the source keeps **one** definition: the historical
-// record stays whole and executable, and this suite runs the very function the
-// converter ran.
-//
-// `dead_code` is allowed because this binary uses `check` and the constants and
-// not `convert`, `Report` or `Error`; those are exercised by the four tests
-// `tools/basemap-style` retains.
-//
-// **One consequence to know before you run a formatter.** rustfmt follows `mod`
-// declarations, `#[path]` included, so `cargo fmt -p squallar-egui` now reaches
-// `tools/basemap-style/src/lib.rs` and will rewrite it. Verified by planting a
-// misformatted line there and watching `cargo fmt -p squallar-egui -- --check`
-// report it. Both trees are edition 2024 and both are rustfmt-clean, so the
-// reach is stable rather than a fight between two styles -- but a
-// package-scoped format of this crate is no longer confined to this crate.
-#[path = "../../tools/basemap-style/src/lib.rs"]
-#[allow(dead_code)]
-mod basemap_style;
+// It reached here through `#[path = "../../tools/basemap-style/src/lib.rs"]`
+// for one day, so that there was exactly one `check` while the converter still
+// existed. That include had a cost worth remembering: rustfmt follows `mod`
+// declarations, `#[path]` included, so `cargo fmt -p squallar-egui` reached out
+// of this package and rewrote a file in `tools/` -- a package-scoped format that
+// was no longer package-confined. Deleting the converter removed the dead code
+// and that reach together.
+mod style_gate;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use basemap_style::{
-    ABSENT_FROM_OMT, DELIBERATE_DROPS, Expectation, OMT_SOURCE_LAYERS, PHASE_KEY, check,
-};
 use serde_json::{Value, json};
+use style_gate::{
+    ABSENT_FROM_OMT, DELIBERATE_DROPS, Expectation, OMT_SOURCE_LAYERS, PHASE_KEY, check,
+    walk_for_legacy,
+};
 use walkers::style::{Layer, Style};
 use walkers::{Context, Filter};
 
@@ -167,9 +153,9 @@ fn source_layer(layer: &Layer) -> Option<&str> {
 /// [`one_unparseable_layer_fails_the_entire_style_parse`].
 ///
 /// This absorbed `both_committed_styles_parse_as_walkers_styles`, which was the
-/// same parse under a different name in `tools/basemap-style`. Both assertions
-/// survive: the exact count that test carried, and the floor this one was
-/// written with.
+/// same parse under a different name in the converter's own suite. Both
+/// assertions survive: the exact count that test carried, and the floor this one
+/// was written with.
 #[test]
 fn both_committed_styles_deserialise() {
     for theme in themes() {
@@ -285,7 +271,7 @@ fn every_layer_is_accounted_for_as_upstream_minus_dropped_plus_added() {
 /// [`an_unrenamed_mapbox_streets_source_layer_is_rejected`].
 ///
 /// This absorbed `every_source_layer_is_one_of_the_sixteen_openmaptiles_names`
-/// from `tools/basemap-style`, which asserted the same membership by a
+/// from the converter's own suite, which asserted the same membership by a
 /// per-layer loop. Both non-vacuity floors survive: that test's exact count of
 /// layers carrying a source layer, and this one's floor on how many distinct
 /// source layers are drawn.
@@ -617,50 +603,16 @@ fn no_legacy_stops_tokens_or_not_in_filters_survive() {
     }
 }
 
-/// Legacy constructs anywhere in a document.
-///
-/// Structural rather than a substring scan, and it has to be: `text-transform`
-/// takes the perfectly legal *value* `"none"`, which a scan for the string
-/// `"none"` reports as a legacy `none` filter. Only the first element of an
-/// array is an operator.
-fn walk_for_legacy(value: &Value, found: &mut Vec<String>) {
-    match value {
-        Value::Object(object) => {
-            if object.contains_key("stops") {
-                found.push("a legacy `stops` function".to_owned());
-            }
-            for nested in object.values() {
-                walk_for_legacy(nested, found);
-            }
-        }
-        Value::Array(items) => {
-            match items.first().and_then(Value::as_str) {
-                Some("!in") => found.push("a legacy `!in` filter".to_owned()),
-                Some("none") => found.push("a legacy `none` filter".to_owned()),
-                _ => {}
-            }
-            for item in items {
-                walk_for_legacy(item, found);
-            }
-        }
-        Value::String(text) => {
-            let bare_token = text.starts_with('{')
-                && text.ends_with('}')
-                && text.len() > 2
-                && !text[1..text.len() - 1].contains(['{', '}']);
-            if bare_token {
-                found.push(format!("an unexpanded `{text}` token"));
-            }
-        }
-        _ => {}
-    }
-}
-
 /// The legacy scan rejects each construct it claims to catch.
 ///
 /// Non-vacuity for [`no_legacy_stops_tokens_or_not_in_filters_survive`], and
 /// the regression pin for the substring scan it replaced: a legal
 /// `"text-transform": "none"` must NOT be reported.
+///
+/// It exercises [`style_gate::walk_for_legacy`], which is also the scan `check`
+/// runs per layer. This file carried a textually equivalent copy while the
+/// checker lived in another crate; the copy went when the crate did, so this
+/// non-vacuity floor now sits under both callers instead of one.
 #[test]
 fn the_legacy_scan_catches_each_construct_and_no_legal_value() {
     for (planted, expected) in [
