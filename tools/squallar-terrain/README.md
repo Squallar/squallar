@@ -1,0 +1,494 @@
+# squallar-terrain
+
+A one-shot builder that turns the Copernicus GLO-30 DEM into **two** PMTiles v3
+archives:
+
+| archive | tiles | default | what it is |
+|---|---|---|---|
+| `squallar-contours.pmtiles` | MVT (vector) | always | elevation contour lines, layer `contour`, attribute `elev` |
+| `squallar-terrain-hillshade.pmtiles` | PNG (raster) | `RASTER_ENCODING=hillshade` | shaded relief |
+| `squallar-terrain-terrain-rgb.pmtiles` | PNG (raster) | `RASTER_ENCODING=terrain-rgb` | Mapbox Terrain-RGB v1 encoded elevation |
+
+**One job**, because both artifacts derive from the same ~1.5 TB of COGs and the
+download is the slow part. **Two archives**, because PMTiles v3 stores a single
+`tile_type` byte for the whole file — MVT and PNG cannot share a container. That
+is a format constraint, not a packaging preference.
+
+**Global, not CONUS.** The basemap is global; terrain that vanishes when you pan
+to the Alps is the basemap contradicting itself.
+
+**One-shot.** The DEM does not change. This runs once, is pinned, and never
+joins the 35-day OSM cycle.
+
+## There is no Rust crate here
+
+This is shell, GDAL's C binaries, `awk` and tippecanoe. An earlier design called
+for a Rust crate; that was wrong. tippecanoe already does tiling and PMTiles
+writing, GDAL already does contouring, warping and hillshading, and the only
+remaining arithmetic (Terrain-RGB encoding) turned out to be expressible as a
+GDAL VRT expression. Nothing was left for a crate to do.
+
+There is also **no Python**. See "Terrain-RGB without Python" below.
+
+```
+build.sh                 one-shot orchestrator: fetch the pin, run both passes
+build-contours.sh        the vector archive
+build-raster.sh          the raster archive
+bootstrap-al2023.sh      toolchain for Amazon Linux 2023
+selftest.sh              end-to-end proof on ONE degree tile; launches nothing
+lib/common.sh            pins, schedule, guards
+lib/encode.sh            Terrain-RGB encoder (pure GDAL) + the GDAL version gate
+lib/mercator.awk         WebMercatorQuad grid arithmetic
+```
+
+---
+
+## Pinning the DEM
+
+Source is `s3://copernicus-dem-30m/` (region `eu-central-1`, anonymously
+readable). Key layout, confirmed live:
+
+```
+Copernicus_DSM_COG_10_N39_00_W106_00_DEM/Copernicus_DSM_COG_10_N39_00_W106_00_DEM.tif
+```
+
+The doubled directory/file name is real, and the `_10_` is **resolution in arc
+seconds, not metres** — `10` is GLO-30, `30` is GLO-90.
+
+**The bucket cannot be pinned the way `planetiler_version` is pinned, and
+pretending otherwise would be the lie.** Specifically:
+
+* There is no release identifier anywhere in the bucket — not in the name, not
+  in any key, not in `tileList.txt`, not in the per-tile ISO 19115 XML (which
+  carries only acquisition dates). The AWS Open Data registry entry is the only
+  place the release appears at all, and it says the data "comes from Copernicus
+  DEM 2021 release".
+* **S3 versioning is off.** Every object answers `x-amz-version-id: null`, so
+  there is no version id to pin to.
+* The registry's `UpdateFrequency` reads *"None, except GLO-30 Public can be
+  updated if the public tile list changes"* — the tile list is explicitly
+  declared mutable, as countries release previously withheld tiles.
+
+So the elevation values are fixed and the only thing that can move under a
+rerun is the **set of tiles**. That makes `tileList.txt` the pin, and it is
+pinned by content in `lib/common.sh`:
+
+```sh
+DEM_RELEASE="COP-DEM_GLO-30 Public, 2021 release"
+DEM_TILELIST_MD5="637fe75ddf7615ba853dd83caf05cd82"   # observed 2026-08-27
+DEM_TILELIST_COUNT="26450"
+DEM_TILELIST_BYTES="1110900"
+```
+
+`verify_tilelist` fails the build if any of those move. That detects drift; it
+cannot prevent it. **If byte-identical reproducibility ever actually matters,
+the only real fix is to copy the tiles into our own versioned bucket** — the
+alternative sources (ESA PRISM, which does have explicit `2019_1`…`2024_1`
+release directories, and Google Earth Engine) are slower, need registration,
+and are a different product: AWS re-processed the ESA originals, stripping the
+shared edge row/column and re-encoding as COG, so a byte comparison against ESA
+fails by construction.
+
+Note also that the AWS bucket is the **2021** release while ESA is at 2023_1 /
+2024_1. "Pin the AWS bucket" and "pin a current release" are different goals.
+
+### tileList.txt is CRLF
+
+All 26,450 lines end `\r\n`. Verified, not assumed. Every key built by pasting a
+raw line into a URL carries a trailing `\r` and 404s, and
+`grep -qxF "$name" tileList.txt` matches **nothing**. `verify_tilelist` hashes
+the raw CRLF bytes (that is what the bucket serves) and then writes a
+LF-normalised `tileList.txt.lf` that everything else reads.
+
+### Attribution
+
+The **modified-work** form applies, because tiling and encoding make these
+archives a derivative:
+
+> produced using Copernicus WorldDEM-30 © DLR e.V. 2010-2014 and © Airbus
+> Defence and Space GmbH 2014-2018 provided under COPERNICUS by the European
+> Union and ESA; all rights reserved
+
+It is written into both archives' metadata so it travels with the artifact.
+
+---
+
+## Contour interval schedule
+
+Schedule **A**, and it is **harmonic**:
+
+| zooms | interval |
+|---|---|
+| z10 | 1000 m |
+| z11–z12 | 200 m |
+| z13–z14 | 100 m |
+
+**Each interval must divide the coarser one exactly** (1000/200 = 5,
+200/100 = 2). This is not stylistic.
+
+If the schedule is not harmonic, contours **vanish as you zoom in**. A 500 m
+schedule stepping to 200 m loses the 500 m line at z11, because 500 is not a
+multiple of 200 — the line has no counterpart in the finer band, so crossing
+that zoom makes an existing line disappear. That reads as a rendering bug.
+
+`verify_schedule` enforces divisibility on **every build**, not just when the
+schedule is edited, so an edit cannot land without tripping it. `selftest.sh`
+asserts both that schedule A is accepted and that a non-harmonic one is
+rejected — a guard nobody has watched fail is not a guard.
+
+Schedule A is also *smaller* than uniform 100 m at identical z13–z14 detail,
+because the low zooms stop carrying unreadable lines. Measured, not assumed —
+see below.
+
+---
+
+## Measured, on one real degree tile
+
+Run: `./selftest.sh`. Everything here is from `N39_00_W106_00` (Colorado,
+2,794 m relief) unless noted, on GDAL 3.13.3 / tippecanoe 2.79.0.
+
+### Contours
+
+| band | interval | bytes | time |
+|---|---|---|---|
+| z10 | 1000 m | 42,028 | 0.50 s |
+| z11–z12 | 200 m | 907,750 | 1.47 s |
+| z13–z14 | 100 m | 3,890,114 | 2.78 s |
+| **joined archive** | | **4,838,653  (4.84 MB)** | |
+| uniform 100 m z10–z14, same z13–14 detail | | 6,140,629  (6.14 MB) | |
+
+Schedule A costs **79%** of uniform 100 m at identical fine detail.
+
+### Raster, z12, same tile
+
+| artifact | bytes |
+|---|---|
+| hillshade PMTiles (PNG) | 6,104,843 |
+| hillshade MBTiles (WebP q85) | 1,728,512 |
+| terrain-RGB PMTiles (PNG) | 14,190,386 |
+| terrain-RGB round-trip error | max 0.050 m, mean 0.020 m |
+
+Round-trip error is exactly half the 0.1 m encoding quantum, which is the best
+achievable.
+
+### The flat/steep bracket
+
+Two tiles, because one tile is not a range:
+
+| tile | relief | contours A | hillshade PNG | hillshade WebP q85 | terrain-RGB PNG |
+|---|---|---|---|---|---|
+| N39 W106 (Colorado) | 2,794 m | 4,838,650 | 6,258,688 | 1,728,512 | 14,385,152 |
+| N35 W098 (Oklahoma) | 201 m | 1,277,821 | 4,636,672 | 946,176 | 9,785,344 |
+
+The Oklahoma tile has **no 1000 m contour at all** — its highest ground is
+201 m. `build-contours.sh` treats an empty band as data rather than failure;
+this is common, since most of the planet's land is roughly flat.
+
+### Extrapolating to the globe
+
+**Denominator, stated:** 9,117,681 z12 tiles cover land (counted from the pinned
+tile list, deduplicated), and a z0–z12 pyramid is 4/3 of its base, so
+≈ 12.16 M raster tiles. These are **extrapolations from two US tiles**, not
+measurements of the globe:
+
+| archive | per-tile | global estimate |
+|---|---|---|
+| contours (26,450 degree tiles) | 1.28–4.84 MB | **34–128 GB** |
+| hillshade PNG | 23.8–30.1 kB | **289–366 GB** |
+| hillshade WebP q85 | 4.85–8.31 kB | **59–101 GB** |
+| terrain-RGB PNG | 50.2–69.2 kB | **610–841 GB** |
+
+The low end is the more representative one: much of the world's land is
+flat, desert or ice-sheet, all of which compress far better than either US
+sample. Treat the high end as a headroom figure.
+
+**The contour archive is big** — plausibly 50–70 GB — and the z13–z14 100 m band
+is 80% of it. If that turns out to be too large to serve, the lever is dropping
+z14 or coarsening the finest band, not changing the harmonic structure.
+
+---
+
+## Peak disk
+
+The launch template stripes all instance-store volumes: 2,850 GB on
+m6id.12xlarge, 5,700 GB on c6id.24xlarge. It does not all fit at once, so both
+passes chunk, and delete intermediates as soon as the chunk that owns them is
+tiled.
+
+**The DEM is never held whole.** Contours fetch a degree tile, use it, and drop
+it. The raster pass never downloads at all — it reads COGs through `/vsis3/`.
+
+### Contours, per chunk (`CHUNK_DEG=5`, so ≤ 25 degree tiles)
+
+| item | worst case |
+|---|---|
+| staged DEM GeoTIFFs | 25 × 39 MB = 975 MB |
+| tippecanoe temp (`-t`) | ~1 GB |
+| chunk output archive | ~121 MB |
+| **per chunk in flight** | **~2.1 GB** |
+
+× `JOBS` (48 on m6id.12xlarge) ≈ **100 GB**, plus the accumulating chunk parts
+(up to the full archive) and one join generation, which transiently doubles
+them: **≈ 260 GB peak** for the contour pass.
+
+**No GeoJSON ever touches disk.** `gdal_contour -f GeoJSONSeq … /vsistdout/`
+pipes straight into tippecanoe. This is the single biggest departure from the
+obvious pipeline: the two-step `gdal_contour` → GPKG → `ogr2ogr` → GeoJSON route
+costs **66.7 MB per degree tile** at 100 m (19.7 MB GPKG + 47.0 MB GeoJSON),
+which globally is the 0.28–1.24 TB of intermediates the naive design has to find
+room for. Streaming makes that number **zero**. Even writing GeoJSONSeq to a
+file instead of GPKG+GeoJSON is 29.7 MB, a 2.2× saving, so the one-step format
+is worth it on its own.
+
+### Raster
+
+| item | worst case |
+|---|---|
+| global z8 elevation raster | 65,536² Float32 = 17.2 GB (≈ 5 GB on disk, DEFLATE + predictor 3) |
+| per super-cell (64×64 tiles = 16,384² px) | 1.07 GB Float32 + 0.8 GB encoded ≈ **2.5 GB** |
+| × `SC_JOBS` = `JOBS/4` = 12 | ≈ 30 GB |
+| accumulating per-zoom MBTiles | full archive |
+| final merge + `pmtiles convert` | **2 × full archive** (both files exist at once) |
+
+So raster peak ≈ **2 × archive + ~50 GB**:
+
+* hillshade WebP: ≈ **250 GB**
+* hillshade PNG: ≈ **780 GB**
+* terrain-RGB PNG: ≈ **1.75 TB** — fits m6id.12xlarge's 2,850 GB, but without
+  much room; prefer c6id.24xlarge.
+
+`pmtiles convert` also needs its own temp space for deduplication; point
+`--tmpdir` at the stripe if the default `/tmp` is small.
+
+`CHUNK_DEG` and `SUPERCELL` are the two dials. Contour peak scales with
+`CHUNK_DEG²`; raster peak scales with `SUPERCELL²`.
+
+---
+
+## Why raster chunks count tiles, not degrees
+
+Degree cells are right for the contour pass, which works in the DEM's own
+EPSG:4326 grid. They are **wrong** for the raster pass, because Mercator
+stretches vertically by sec(lat). A 5°×5° cell at 80°N is ~5.7× taller in pixels
+than the same cell at the equator: 14,564 × 83,000 px at z12, which is **4.8 TB
+as Float32 for one chunk**. Counting tiles instead makes every super-cell
+identical in size everywhere on the globe by construction.
+
+---
+
+## The overview trap
+
+**This is the most important correctness property in the build.**
+
+`gdaladdo -r average` over a Terrain-RGB image averages R, G and B
+**independently**. The encoding is a base-256 positional number, so averaging
+the digits ignores every carry between them. Measured on the probe tile at a
+single 2× reduction:
+
+```
+downsample elevation, then encode : max err     0.050 m   mean  0.025 m
+average R,G,B (what gdaladdo does): max err  3289.691 m   mean 14.604 m
+                                    14.5% of pixels wrong by more than 10 m
+```
+
+`selftest.sh` reproduces this independently through pure GDAL (max 3289.700 m,
+mean 13.009 m on the Mercator-warped grid). It looks plausible and is garbage.
+
+`-r nearest` is exactly correct — it copies one source triple verbatim — but
+aliases badly on shaded relief.
+
+The same argument applies to hillshade: a hillshade of a downsampled DEM is not
+a downsampled hillshade, because the 3×3 slope window is just as non-linear.
+
+**So every zoom is generated from elevation resampled to that zoom's resolution
+and then encoded. Zooms are never derived from each other's pixels.** The cost
+is a 1/(1−¼) = 1.33× multiplier over building only the deepest zoom.
+
+---
+
+## The raster path to PMTiles
+
+Verified against GDAL 3.13.3 on this workstation, not assumed:
+
+* **GDAL cannot write raster PMTiles at any released version.** Its PMTiles
+  driver registers as `-vector-`; `gdalinfo --formats` confirms
+  `PMTiles -vector- (rw+v)`. Every PMTiles entry in GDAL's NEWS through 3.13.3
+  is MVT.
+* **`gdal raster tile`** (GDAL 3.11+) writes a *directory tree* of tiles. No
+  container output; it cannot emit PMTiles or MBTiles.
+* **`gdal_translate -of MBTILES`** works and is the workhorse. It writes only
+  the base zoom — but that is fine here, because the overview trap means each
+  zoom is built separately anyway.
+* **`pmtiles convert`** (go-pmtiles, pinned 1.31.2) does the MBTiles → PMTiles
+  step, and does handle raster. It picks `tile_type` from the MBTiles
+  `metadata` row named `format`; GDAL writes exactly `png`/`jpg`/`webp` there,
+  which are exactly the strings go-pmtiles matches.
+
+There is no raster equivalent of `tile-join`, so super-cells are merged at the
+**MBTiles** level: MBTiles is SQLite, so `ATTACH` + `INSERT OR REPLACE` is the
+whole operation.
+
+`-co ZOOM_LEVEL` is advertised by the driver but **rejected by its CreateCopy
+path** ("driver MBTiles does not support creation option ZOOM_LEVEL"). It is
+unnecessary — the source is warped onto the target zoom's exact grid, so the
+driver derives the zoom from the resolution. `build-raster.sh` **asserts** the
+resulting zoom rather than assuming it, because a silently misplaced zoom would
+put real tiles at wrong addresses and still look like a successful build.
+
+### tippecanoe picks its container from the file extension
+
+`tile-join -o "$out.part"` writes an **MBTiles** file. tippecanoe and `tile-join`
+choose PMTiles vs MBTiles from the output *extension*, so the conventional
+write-to-temp-then-rename idiom produces a SQLite database with a `.pmtiles`
+name: right name, plausible size, zero exit status, wrong format. Nothing
+downstream complains until a viewer gets it.
+
+This was caught by running `build-contours.sh` for real rather than by reading
+it — the archive was 6,402,048 bytes instead of 4,838,849, and `pmtiles show`
+printed nothing. Temp names now keep the `.pmtiles` suffix, and `assert_pmtiles`
+checks the 7-byte `PMTiles` magic on every archive the build emits.
+
+---
+
+## Terrain-RGB without Python
+
+`gdal_translate -of MBTILES -co ELEVATION_TYPE=terrain-rgb` **does not encode
+anything.** It writes `elevation_type=terrain-rgb` into the MBTiles metadata
+table and nothing else. Measured on GDAL 3.13.3, from both a native EPSG:4326
+Float32 DEM *and* a reprojected EPSG:3857 one: the tiles come back **2-band
+grey+alpha Byte, 700 bytes each, values 0–255**. `gdal_translate` rescaled
+Float32 into Byte on the way in and the option never got a chance to act — and
+it exits 0. Feed the same driver an already-encoded 3-band RGB and it passes it
+through correctly (97 KB, 3 bands). **The option is a label for pre-encoded
+input, not an encoder.** The `Create()` path is at least honest:
+`gdalwarp -of MBTILES` on Float32 fails with `ERROR 6: Only Byte supported`.
+
+`rio rgbify` is the usual answer and is **not** taken: PyPI 0.4.0 dates from
+April 2022 and the repository's recent traffic is dependency bots. That is not a
+dependency to put under a shipped artifact.
+
+So the encoding is done with a **VRT expression pixel function** — pure GDAL
+C++. muparser has no `floor()`, but floor is exactly recoverable:
+
+```
+fl(x) = rint(x) - (rint(x) > x)
+```
+
+since the comparison yields 1.0 or 0.0. With `v` the packed 24-bit integer:
+
+```
+v = min(max(rint((B1 + 10000) * 10), 0), 16777215)
+R = fl(v/65536)      G = fl(v/256) - 256*fl(v/65536)      B = v - 256*fl(v/256)
+```
+
+Verified against a numpy reference over all 12,960,000 pixels of the probe tile:
+identical except on **2,893 pixels (0.022%)** whose exact packed value is a
+half-integer, where numpy's banker's rounding and muparser's `rint` break the
+tie in opposite directions. Both sit exactly half a quantum (0.05 m) from the
+true value, so the two encoders are equally correct.
+
+One XML detail that costs an afternoon: `>` must **not** be escaped as `&gt;` in
+the `expression` attribute. GDAL's CPL XML reader hands the attribute to
+muparser without expanding entities, so `&gt;` arrives as literal text and
+muparser fails with `Unexpected token "gt"`. Every floor contains a `>`.
+
+### Version gate
+
+Expression pixel functions landed in **GDAL 3.11.0**. Amazon Linux 2023 ships
+`gdal310` = **GDAL 3.10.3**, where this is unavailable at any spelling.
+`require_terrain_rgb_support` refuses the build with that explanation rather
+than silently falling back. To build terrain-RGB, run inside
+`ghcr.io/osgeo/gdal:ubuntu-small-3.13.2`.
+
+### Why hillshade is the default
+
+`gdaldem hillshade` is GDAL's own C, present in every GDAL including AL2023's
+3.10.3, and has no encode step to get wrong. If the requirement is "the map
+shows terrain", that is the entire job — and it is 2.3× smaller than terrain-RGB
+as PNG, or 8.2× smaller as WebP q85, which a hillshade may safely use and
+terrain-RGB may not.
+
+Terrain-RGB is what you want when the **client** needs the elevation:
+relighting at an arbitrary azimuth, exaggeration, elevation readout, or draping
+the 3D volumetric view. That work is long-tail and unscheduled, so it does not
+set the v1 dependency budget. The mode is implemented and verified, so switching
+costs a rebuild, not a redesign.
+
+**Terrain-RGB must be stored losslessly.** One count of error in the R channel
+is 6,553.6 m, so lossy WebP or JPEG does not make it soft, it destroys it.
+`verify_raster_settings` enforces PNG.
+
+### Hillshade's one approximation
+
+EPSG:3857 "metres" are not ground metres — they are inflated by 1/cos(lat), so a
+slope computed against raw Mercator pixel spacing is too shallow by cos(lat), a
+factor of 2 at 60°N. `gdaldem -s` takes one scalar, so the build passes each
+super-cell's **centre latitude**. A super-cell spans little latitude at the
+zooms where relief is legible, so the residual is small, but it is an
+approximation and terrain-RGB does not have it (encoding is per-pixel).
+
+`-compute_edges` is passed to stop a one-pixel dark frame at every super-cell
+edge, which would otherwise draw a grid over the planet.
+
+---
+
+## Toolchain on Amazon Linux 2023
+
+`./bootstrap-al2023.sh`. Three facts, verified against AL2023 repo metadata:
+
+* **The package is `gdal310`, not `gdal`.** No `gdal310*` package Provides a
+  bare `gdal`, so `dnf install gdal` fails outright. It is in the **core** repo.
+  `gdal310` carries `gdal_contour`, `gdaldem`, `gdal_translate`, `gdalwarp`,
+  `gdalbuildvrt`, `ogr2ogr`. The binaries are unversioned
+  (`/usr/bin/gdal_contour`); only the package name carries the suffix.
+* **EPEL is not binary compatible with AL2023** and is not needed. AWS's SPAL
+  repo does **not** carry GDAL, despite AWS's own SPAL documentation naming
+  GDAL as an example of what SPAL unlocks.
+* **`gdal310` only appeared around AL2023 release 2023.8.** AL2023 pins repos
+  per release, so an older AMI sees zero `gdal*` packages. The bootstrap guards
+  on this and tells you to `dnf upgrade --releasever=latest`.
+
+`gdal310-python-tools` and `python3-gdal310` are deliberately **not**
+dependencies.
+
+tippecanoe is not packaged on any RHEL-family distro and is built from a tag
+(`TIPPECANOE_REF`, default 2.79.0) so a rebuild produces the same tiler.
+go-pmtiles is fetched as a static binary at a pinned version; note its Linux
+release assets use an underscore (`go-pmtiles_1.31.2_Linux_x86_64.tar.gz`) while
+macOS uses a hyphen.
+
+---
+
+## Running it
+
+```sh
+./bootstrap-al2023.sh
+WORK=/mnt/terrain-work ./build.sh              # both archives
+WORK=/mnt/terrain-work ./build.sh contours     # just the vector one
+RASTER_ENCODING=terrain-rgb ./build.sh raster  # needs GDAL >= 3.11
+```
+
+Knobs (all in `lib/common.sh`, all overridable by environment):
+`WORK` `OUT` `TMP` `JOBS` `CHUNK_DEG` `SUPERCELL` `RASTER_ENCODING`
+`RASTER_MINZOOM` `RASTER_MAXZOOM` `RASTER_GLOBAL_MAXZOOM` `RASTER_TILE_FORMAT`.
+
+Both passes **resume**: a chunk whose output archive already exists is skipped,
+and a super-cell drops a `.done` marker. Killing and restarting the build is
+safe.
+
+### Exact commands, if you want them without the wrapper
+
+```sh
+# contours, one degree tile, one band -- no GeoJSON on disk
+gdal_contour -q -a elev -i 100 -f GeoJSONSeq in.tif /vsistdout/ \
+  | tippecanoe -q --force -Z13 -z14 -l contour -y elev \
+      --no-feature-limit --no-tile-size-limit -o band.pmtiles
+tile-join -q --force -o contours.pmtiles band_z10.pmtiles band_z11_12.pmtiles band_z13_14.pmtiles
+
+# raster, one super-cell at one zoom
+gdalwarp -t_srs EPSG:3857 -te $XMIN $YMIN $XMAX $YMAX -ts $NX $NY \
+  -r average -ot Float32 -dstnodata 0 src.vrt elev.tif
+gdaldem hillshade -alg Horn -z 1 -s $(cos lat) -az 315 -alt 45 -compute_edges elev.tif hs.tif
+gdal_translate -of MBTILES -co TILE_FORMAT=PNG hs.tif cell.mbtiles
+pmtiles convert all.mbtiles terrain.pmtiles
+```
