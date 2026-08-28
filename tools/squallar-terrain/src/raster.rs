@@ -421,6 +421,14 @@ fn encode_and_tile(
         "-co".into(),
         format!("TILE_FORMAT={}", cfg.tile_format),
     ];
+    // GDAL's WEBP_LEVEL defaults to 75; every WebP figure this tool documents
+    // was measured at 85. Without this the README describes a configuration the
+    // code cannot produce, and a hillshade is smooth grey gradient -- precisely
+    // where lossy banding shows.
+    if cfg.tile_format.eq_ignore_ascii_case("WEBP") {
+        args.push("-co".into());
+        args.push("WEBP_LEVEL=85".into());
+    }
     args.extend(elev_type_co.iter().cloned());
     args.push(encoded.to_string_lossy().into_owned());
     args.push(part.to_string_lossy().into_owned());
