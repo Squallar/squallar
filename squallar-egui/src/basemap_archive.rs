@@ -522,6 +522,18 @@ impl TileBytes {
         }
     }
 
+    /// The bytes, if the tile is present, **moved out**.
+    ///
+    /// The rendering side hands them to a blocking task, which has to own them;
+    /// `bytes().to_vec()` would copy a body that is already on the heap and
+    /// about to be dropped.
+    pub fn into_bytes(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Present(bytes) => Some(bytes),
+            Self::Absent => None,
+        }
+    }
+
     /// Whether the archive holds this tile.
     pub fn is_present(&self) -> bool {
         matches!(self, Self::Present(_))

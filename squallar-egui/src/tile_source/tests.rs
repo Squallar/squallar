@@ -56,7 +56,7 @@ fn whole_tile_uv() -> egui::Rect {
 
 /// The tuning values, restated as literals.
 const EXPECTED_CACHE_ENTRIES: usize = 256;
-const EXPECTED_MOBILE_CACHE_ENTRIES: usize = 128;
+const EXPECTED_MOBILE_CACHE_ENTRIES: usize = 96;
 /// Not a fraction of the desktop figure: the worst-case working set of a
 /// 1920x1200-point canvas, which `tiles::tests` measures at exactly this.
 const EXPECTED_WASM_CACHE_ENTRIES: usize = 96;
@@ -947,12 +947,14 @@ fn the_tuning_constants_are_the_written_figures_on_every_tier() {
     assert_eq!(
         DESKTOP_TILE_CACHE_ENTRIES.get(),
         EXPECTED_CACHE_ENTRIES,
-        "the desktop arm is walkers' own figure"
+        "the desktop arm is pinned from below by squallar_gpu's \
+         MIRROR_SCALE_MAX, not by the byte budget"
     );
     assert_eq!(
         MOBILE_TILE_CACHE_ENTRIES.get(),
         EXPECTED_MOBILE_CACHE_ENTRIES,
-        "the mobile arm is half the desktop figure"
+        "the mobile arm is the largest handheld working set, not a fraction \
+         of the desktop figure"
     );
     assert_eq!(
         WASM_TILE_CACHE_ENTRIES.get(),
@@ -980,6 +982,34 @@ fn the_tuning_constants_are_the_written_figures_on_every_tier() {
         "the decode allowance is two tiles per source per pass"
     );
 
+    // The two arms that can hold a vector entry must be derived against the
+    // vector entry, which is what the doc comment claims and what stopped being
+    // true when the entry stopped being a 256 KiB texture. A ceiling rather than
+    // an equality: the number is also floored by the working set, so it is not a
+    // pure function of the byte budget.
+    for (entries, ceiling_mib, tier) in [
+        (DESKTOP_TILE_CACHE_ENTRIES.get(), 160, "desktop"),
+        (MOBILE_TILE_CACHE_ENTRIES.get(), 64, "mobile"),
+        (WASM_TILE_CACHE_ENTRIES.get(), 64, "wasm32"),
+    ] {
+        let worst = entries * super::MEASURED_VECTOR_TILE_BYTES;
+        assert!(
+            worst <= ceiling_mib * 1024 * 1024,
+            "the {tier} arm holds {entries} entries, which is {:.1} MiB of \
+             vector tiles per source against a {ceiling_mib} MiB ceiling",
+            worst as f64 / (1024.0 * 1024.0)
+        );
+    }
+
+    // The wasm arm holds vector entries as of `feat(web): the vector basemap
+    // draws on wasm32`, so it is in the loop above rather than exempt from it.
+    // Its raster derivation is still pinned, because a build without
+    // `basemap-vector` is still a build the arm has to be right for.
+    assert_eq!(
+        WASM_TILE_CACHE_ENTRIES.get() * super::RASTER_TILE_BYTES,
+        24 * 1024 * 1024,
+        "the wasm arm's derivation is against the raster entry and moved"
+    );
     #[cfg(all(
         not(target_arch = "wasm32"),
         not(any(target_os = "android", target_os = "ios"))
@@ -1000,6 +1030,105 @@ fn the_tuning_constants_are_the_written_figures_on_every_tier() {
     assert_eq!(
         TILE_CACHE_ENTRIES, WASM_TILE_CACHE_ENTRIES,
         "wasm32 must carry the wasm arm"
+    );
+}
+
+/// The measured vector-entry cost is a real measurement of a real tile, not a
+/// number that drifted into a doc comment.
+///
+/// **Skips rather than reddens without the fixture**, like every other test
+/// here that reads it. What it cannot do is pass vacuously: a rendered tile
+/// that is trivially small would fail the floor below.
+#[cfg(feature = "basemap-vector")]
+#[test]
+fn the_vector_entry_cost_is_what_the_fixture_actually_renders() {
+    use std::path::PathBuf;
+
+    use crate::basemap_archive::FileRangeSource;
+
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/monaco.pmtiles");
+    if FileRangeSource::open(&path).is_err() {
+        eprintln!(
+            "SKIPPED the_vector_entry_cost_is_what_the_fixture_actually_renders: \
+             {} would not open. It is committed; `git status` on it.",
+            path.display()
+        );
+        return;
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+
+    let shapes = runtime.block_on(async {
+        let archive = crate::basemap_archive::BasemapArchive::open(
+            FileRangeSource::open(&path).expect("the fixture opens"),
+        )
+        .await
+        .expect("the fixture is a PMTiles archive");
+
+        // Monaco's own z14 tile: the densest the fixture holds, and the tail
+        // the cache has to be sized for. Not the header's declared centre,
+        // which is open Mediterranean -- see `archive::MONACO_LON`.
+        let bytes = archive
+            .tile(14, 8529, 5974)
+            .await
+            .expect("the tile reads")
+            .into_bytes()
+            .expect("the fixture holds Monaco's own z14 tile");
+
+        match Tile::from_mvt(&bytes, &crate::basemap_style::committed(true), 14)
+            .expect("the tile renders")
+        {
+            Tile::Vector(shapes) => shapes,
+            Tile::Raster(_) => panic!("an MVT body rendered as a raster"),
+        }
+    });
+
+    // A non-triviality floor: a tile that rendered nothing would sail through
+    // the bound below and prove nothing about the cost of a real one.
+    assert!(
+        shapes.len() > 500,
+        "the fixture's densest tile rendered only {} shapes, so this is not \
+         measuring a city core any more",
+        shapes.len()
+    );
+
+    let heap: usize = std::mem::size_of_val(&shapes[..])
+        + shapes
+            .iter()
+            .map(|shape| match shape {
+                walkers::ShapeOrText::Shape(egui::Shape::Mesh(mesh)) => {
+                    std::mem::size_of::<egui::Mesh>()
+                        + mesh.vertices.capacity() * std::mem::size_of::<egui::epaint::Vertex>()
+                        + mesh.indices.capacity() * 4
+                }
+                walkers::ShapeOrText::Shape(egui::Shape::Path(path)) => {
+                    std::mem::size_of::<egui::epaint::PathShape>()
+                        + path.points.capacity() * std::mem::size_of::<egui::Pos2>()
+                }
+                walkers::ShapeOrText::Text(text) => text.text.capacity(),
+                walkers::ShapeOrText::Shape(_) => 0,
+            })
+            .sum::<usize>();
+
+    // Not an equality: `size_of` and allocator rounding are toolchain
+    // properties, and pinning them would red-gate a compiler bump. The claim
+    // that matters is that the constant the cache is sized against is not an
+    // *under*-estimate, and is still the right order.
+    assert!(
+        heap <= super::MEASURED_VECTOR_TILE_BYTES,
+        "one cached vector entry measures {heap} bytes, over the \
+         {} the cache sizing is derived from",
+        super::MEASURED_VECTOR_TILE_BYTES
+    );
+    assert!(
+        heap * 2 >= super::MEASURED_VECTOR_TILE_BYTES,
+        "one cached vector entry measures {heap} bytes, less than half the \
+         {} the cache sizing is derived from: the derivation has gone stale in \
+         the safe direction, which still means it is not measuring this",
+        super::MEASURED_VECTOR_TILE_BYTES
     );
 }
 
@@ -1404,17 +1533,18 @@ mod archive {
             return;
         };
 
-        // The header is read by the IO task, so the depth is not known yet.
+        // The header is read by the IO task, so the depth is not known yet --
+        // and "not known" is `None`, not a number. See
+        // `tile_source::MAX_ZOOM_UNKNOWN` for what a stand-in zero drew.
         assert_eq!(
             tiles.source_max_zoom(),
-            0,
+            None,
             "before the header lands the source must claim nothing it cannot serve"
         );
 
         let max_zoom = pump_until(DEFAULT_TIMEOUT, || {
             tiles.pump();
-            let z = tiles.source_max_zoom();
-            (z > 0).then_some(z)
+            tiles.source_max_zoom()
         })
         .expect("the archive header never arrived");
 
@@ -1491,8 +1621,7 @@ mod archive {
 
             let max_zoom = pump_until(DEFAULT_TIMEOUT, || {
                 tiles.pump();
-                let z = tiles.source_max_zoom();
-                (z > 0).then_some(z)
+                tiles.source_max_zoom()
             })
             .expect("the archive header never arrived");
 
@@ -1536,8 +1665,7 @@ mod archive {
 
         let max_zoom = pump_until(DEFAULT_TIMEOUT, || {
             tiles.pump();
-            let z = tiles.source_max_zoom();
-            (z > 0).then_some(z)
+            tiles.source_max_zoom()
         })
         .expect("the archive header never arrived");
 
@@ -1561,6 +1689,97 @@ mod archive {
             tiles.tile_is_cached(tile_id),
             "an absent tile must keep its cache slot, or it is asked for again \
              on every frame for as long as it is on screen"
+        );
+    }
+
+    /// A range source that cannot answer at all: the shape of DNS failure, a
+    /// 404, a host that is down, or a stale `omt-YYYYMMDD` generation.
+    struct DeadRangeSource;
+
+    impl crate::basemap_archive::RangeSource for DeadRangeSource {
+        async fn read_range(
+            &self,
+            _offset: u64,
+            _length: usize,
+        ) -> Result<Vec<u8>, crate::basemap_archive::RangeError> {
+            Err(crate::basemap_archive::RangeError::Transport(
+                "the host is not there".to_owned(),
+            ))
+        }
+    }
+
+    /// **An archive that will not open is reported, bounded, and not blank
+    /// forever.**
+    ///
+    /// Three separate defects met here, and each assertion below is one of
+    /// them:
+    ///
+    /// 1. The failure was logged inside the IO task and *nowhere else*, so the
+    ///    frame side could not tell "still loading" from "will never load".
+    /// 2. Returning from that task drops the `Receiver`, and a disconnected
+    ///    `TrySendError` reports `is_full() == false` -- so `request_once` fell
+    ///    past its retry arm into `log::error!`, and because the closure had
+    ///    errored, `LruCache::try_get_or_insert` inserted nothing, so the same
+    ///    tile was asked for again on the very next frame. ~54 error lines per
+    ///    frame, forever.
+    /// 3. Nothing was ever drawn.
+    #[test]
+    fn an_archive_that_will_not_open_reports_itself_and_stops_asking() {
+        let ctx = Context::default();
+        let mut tiles = HttpsTiles::from_range_source(
+            DeadRangeSource,
+            crate::basemap_style::committed(true),
+            Attribution {
+                text: "test",
+                url: "https://example.invalid/",
+                logo_light: None,
+                logo_dark: None,
+            },
+            ctx.clone(),
+            NonZeroUsize::new(64).expect("64 is not zero"),
+        );
+
+        let fault = pump_until(DEFAULT_TIMEOUT, || {
+            tiles.pump();
+            tiles.fault().map(str::to_owned)
+        })
+        .expect("the source never reported why it serves nothing");
+
+        assert!(
+            !fault.is_empty(),
+            "the fault must carry the transport's own words, or it cannot be acted on"
+        );
+
+        // The depth is never learnt, so the source must keep claiming nothing
+        // rather than falling back to a zero that seeds `0/0/0`.
+        assert_eq!(
+            tiles.source_max_zoom(),
+            None,
+            "a source that never read a header must not claim a depth"
+        );
+
+        // The flood: every one of these would have been an `error!` line, and
+        // the run is what proves the latch holds across frames rather than
+        // suppressing only a repeat within one.
+        let before = tiles.cached_entries();
+        for _ in 0..10 {
+            tiles.pump();
+            for x in 0..54u32 {
+                assert!(
+                    tiles.at(TileId { x, y: 0, zoom: 14 }).is_none(),
+                    "a source with no archive behind it cannot answer with a tile"
+                );
+            }
+        }
+
+        assert!(
+            tiles.requests_closed || tiles.source_max_zoom().is_none(),
+            "540 requests against a dead source must have latched something"
+        );
+        assert_eq!(
+            tiles.cached_entries(),
+            before,
+            "a dead source must not burn cache slots on tiles it will never fetch"
         );
     }
 }

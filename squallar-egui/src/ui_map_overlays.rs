@@ -156,9 +156,19 @@ pub(super) fn draw_tile_layer(
     // and doing it per cell would repeat it once per tile in the span below.
     tiles.pump();
 
+    // An archive source has not read its header yet on the first frames, so it
+    // cannot say how deep it goes. Clamping to a stand-in number is what used to
+    // seed `0/0/0` into the LRU and leave it there as the session's fallback
+    // ancestor -- see `tile_source::MAX_ZOOM_UNKNOWN`. Drawing nothing for a
+    // frame is the whole cost of not doing that; the IO task repaints when the
+    // header lands.
+    let Some(source_max_zoom) = tiles.source_max_zoom() else {
+        return Vec::new();
+    };
+
     let tile_zoom = (zoom.round() as u8)
         .saturating_add(zoom_bias)
-        .min(tiles.source_max_zoom());
+        .min(source_max_zoom);
 
     let span = crate::tiles::tile_span(projector, ui.max_rect(), tile_zoom);
 
@@ -260,7 +270,27 @@ fn lay_out_label(
 ///
 /// `shapes` are in MVT extent units over the whole tile and are shared by every
 /// pane that draws this tile, so nothing here mutates them:
-/// [`walkers::mvt::transformed`] returns a placed copy.
+/// [`walkers::ShapeOrText::placed`] returns a placed copy of the one shape it
+/// is given.
+///
+/// **One copy of a shape is made, and only for the shapes the clip can show.**
+/// This used to be `mvt::transformed`, which materialised a whole second
+/// `Vec<ShapeOrText>` and then walked it in place — and the in-place walk hit
+/// `Arc::make_mut` on every tessellated fill, which copied again because the
+/// tile cache still held the original. Two deep copies of every shape in every
+/// visible tile, every frame. Measured on the committed Monaco fixture's z14
+/// tile, release build: 22.9 us to clone the cached `Tile` plus 135.2 us to
+/// transform it — 158.1 us per tile per frame, against a viewport that holds up
+/// to 84 tiles.
+///
+/// **Nothing is culled here, and that was measured rather than assumed.** A
+/// per-shape bounding-rect test against the clip looks like the obvious
+/// companion to this, and it was tried: on the quarter-piece ancestor case it
+/// dropped 738 shapes to 75 and still ran *slower* (35.9 us against 32.1 us),
+/// because `mvt::render` folds a tile's fills into a couple of large meshes and
+/// a large mesh both dominates the bounds pass and always intersects. epaint's
+/// own `visual_bounding_rect` cull against the clip is what does this job, and
+/// it does it after the tessellator rather than before this loop.
 ///
 /// The placement is against the whole tile
 /// ([`full_rect_of_clipped_tile`]) and the clip is against the piece, so an
@@ -286,19 +316,20 @@ fn paint_vector_tile(
 ) {
     let painter = painter.with_clip_rect(rect);
 
-    let placed: Vec<egui::Shape> =
-        walkers::mvt::transformed(shapes, full_rect_of_clipped_tile(rect, uv))
-            .into_iter()
-            .filter_map(|shape_or_text| match shape_or_text {
-                walkers::ShapeOrText::Shape(shape) => Some(shape),
-                walkers::ShapeOrText::Text(text) => {
-                    if rect.contains(text.position) {
-                        labels.push(text);
-                    }
-                    None
+    let placement = walkers::mvt::placement(full_rect_of_clipped_tile(rect, uv));
+
+    let placed: Vec<egui::Shape> = shapes
+        .iter()
+        .filter_map(|shape| match shape.placed(placement) {
+            walkers::ShapeOrText::Shape(shape) => Some(shape),
+            walkers::ShapeOrText::Text(text) => {
+                if rect.contains(text.position) {
+                    labels.push(text);
                 }
-            })
-            .collect();
+                None
+            }
+        })
+        .collect();
 
     painter.extend(placed);
 }
@@ -473,7 +504,7 @@ mod tests {
     const EXTENT: f32 = 4096.0;
 
     fn extent_spanning_tile() -> Tile {
-        Tile::Vector(vec![
+        Tile::Vector(std::sync::Arc::new(vec![
             // Corner to corner: after placement this is the tile's own rect.
             ShapeOrText::Shape(egui::Shape::rect_filled(
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(EXTENT, EXTENT)),
@@ -489,7 +520,7 @@ mod tests {
                 egui::Color32::TRANSPARENT,
                 0.0,
             )),
-        ])
+        ]))
     }
 
     /// Every shape one pass emitted, with its clip rect.

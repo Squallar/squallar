@@ -30,8 +30,8 @@
 //! before its grid loop, and never from [`Tiles::at`] — see
 //! [`HttpsTiles::pump`] for why, and for the one thing that would break.
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use egui::Context;
@@ -49,21 +49,80 @@ pub const MAX_PARALLEL_DOWNLOADS: usize = 6;
 
 /// Tiles retained in one source's in-memory cache before LRU eviction starts.
 ///
-/// Per device tier, because a tile texture costs the same 256 KiB (256x256
-/// RGBA) everywhere while the memory it comes out of does not:
+/// **Two kinds of entry, and they do not cost the same.** This bound is a
+/// *count*, so what it is worth in bytes depends on what the arm can hold:
 ///
-/// | tier    | entries | texture worst case, per source |
-/// |---------|--------:|-------------------------------:|
-/// | desktop |     256 |                        ~64 MiB |
-/// | mobile  |     128 |                        ~32 MiB |
-/// | wasm32  |      96 |                        ~24 MiB |
+/// | entry            | cost               | which arms hold it |
+/// |------------------|-------------------:|--------------------|
+/// | raster texture   | 256 KiB (256x256 RGBA) | all |
+/// | vector tile      | **646,264 B** worst case | all |
 ///
-/// The desktop arm is walkers' own figure. "Per source" is the multiplier: each
-/// map source owns one of these caches — base and labels, light and dark — so
-/// the desktop figure on wasm32 could put 256 MiB of basemap texture against the
-/// 288 MiB `squallar-device-profile`'s `constants::WASM_APP_TEXTURE_BUDGET_BYTES`
+/// The vector figure is measured, not derived: the committed Monaco fixture's
+/// z14 city-core tile (185,182 MVT bytes) renders to 738 shapes — 708 paths of
+/// 4,390 points, two coalesced meshes of 18,018 vertices and 40,812 indices,
+/// and 27 labels — held as host allocations, not GPU textures. Over all 246
+/// tiles the fixture holds the *mean* is 13,461 bytes and the median 456, so
+/// this is a tail figure and the tail is what a cache must be sized for: a
+/// viewport over a city is a viewport of city-core tiles.
+///
+/// **wasm32 holds vector entries too**, since `feat(web): the vector basemap
+/// draws on wasm32` ungated the archive reader; the arm used to be derived
+/// against the raster cost alone because there was nothing else it could hold.
+/// The 646,264 B figure carries to it unmeasured but not unfounded: `mvt::render`
+/// is the same code over the same fixture, and a `Tile` is host allocations on
+/// every target. It is a native measurement applied to wasm32, and it is
+/// recorded that way rather than restated as a wasm one.
+///
+/// | tier    | entries | worst case, per source        |
+/// |---------|--------:|------------------------------:|
+/// | desktop |     256 | ~158 MiB vector, 64 MiB raster |
+/// | mobile  |      96 | ~59 MiB vector, 24 MiB raster |
+/// | wasm32  |      96 | ~59 MiB vector, 24 MiB raster |
+///
+/// The wasm32 arm is the one where that promotion has a budget to answer to:
+/// `squallar-device-profile`'s `constants::WASM_APP_TEXTURE_BUDGET_BYTES` is
+/// 288 MiB for the whole application, and `MapTileState::adopt_theme` keeps one
+/// theme's sources live, so base plus labels is ~118 MiB of it worst case where
+/// the raster derivation said 48. It fits, with less room than the old figure
+/// implied. The count did not move, because 96 is also the working-set floor
+/// below.
+///
+/// **Against the meshes this workspace shipped until 2026-08-28 those figures
+/// were 8.0 GiB and 4.0 GiB.** `VertexBuffers::new()` is
+/// `with_capacity(512, 1024)` and the tile held 2,257 of them, so one entry was
+/// 32.77 MB rather than 0.65 MB. Neither number was ever reached, because a
+/// machine would have died first; they are quoted because they are what this
+/// comment's old derivation — "a tile texture costs the same 256 KiB" — was
+/// silently claiming, 50x under the truth on a cost it was not measuring at all.
+///
+/// **The mobile arm fell from 128 to 96.** The desktop arm did *not* fall, and
+/// what stopped it is worth naming rather than leaving as an unexplained round
+/// number: it is pinned from below by
+/// `squallar_gpu::egui_renderer::mirror`'s `MIRROR_SCALE_MAX`. That cap is only
+/// legitimate if a floor strip could actually take the rung, and
+/// `mirror::tests::the_rung_above_the_cap_could_never_fit_the_tile_cache`
+/// holds it so: a 900-point pane at two layers keeps 242 tiles resident at
+/// `tile_zoom_bias = 1`, and 72 at bias 0 against a "three times over" margin.
+/// So this arm may not go below 242 without moving the mirror's deepest rung,
+/// which is a different subsystem's decision. What actually fixed desktop
+/// residency was the 50.7x per-*entry* reduction, not the count.
+///
+/// **The honest remaining gap**: this is still a count, and a count cannot
+/// express "158 MiB" as a limit when entries range from 456 bytes to 646,264.
+/// A byte-budgeted LRU is the answer that would; it is not this change.
+///
+/// "Per source" is the multiplier: each map source owns one of these caches —
+/// base and labels, light and dark — so the old desktop figure on wasm32 could
+/// put 256 MiB of basemap texture against the 288 MiB
+/// `squallar-device-profile`'s `constants::WASM_APP_TEXTURE_BUDGET_BYTES`
 /// allows the whole application. The tiers follow that crate's budget cascade,
 /// spelled rather than imported.
+///
+/// **Every arm is still above its working set, which is the floor no budget may
+/// cross.** See below, and `tiles::tests`'
+/// `the_cache_holds_the_working_set_at_every_zoom`. Mobile's 96 covers the 63 a
+/// 1024x1366-point tablet keeps resident — the largest handheld canvas in
+/// common use — where 128 covered nothing extra that a handheld can present.
 ///
 /// **Every arm is sized against the worst case over the whole zoom range**, not
 /// against a whole zoom. A tile is drawn `256 · 2^(zoom − round(zoom))` points
@@ -76,12 +135,13 @@ pub const MAX_PARALLEL_DOWNLOADS: usize = 6;
 /// What each arm covers, at one layer, in **points** — a 4K panel at the 2x
 /// scaling it is nearly always run at presents 1920x1080 points, not 3840x2160:
 ///
-/// | canvas    | tiles | wasm 96 | mobile 128 | desktop 256 |
-/// |-----------|------:|---------|------------|-------------|
-/// | 1920x1080 |    84 | fits    | fits       | fits        |
-/// | 1920x1200 |    96 | fits    | fits       | fits        |
-/// | 2560x1440 |   144 | overruns| overruns   | fits        |
-/// | 3840x2160 |   299 | overruns| overruns   | overruns    |
+/// | canvas    | tiles | wasm 96 | mobile 96 | desktop 256 |
+/// |-----------|------:|---------|-----------|-------------|
+/// | 1024x1366 |    63 | fits    | fits      | fits        |
+/// | 1920x1080 |    84 | fits    | fits      | fits        |
+/// | 1920x1200 |    96 | fits    | fits      | fits        |
+/// | 2560x1440 |   144 | overruns| overruns  | fits        |
+/// | 3840x2160 |   299 | overruns| overruns  | overruns    |
 ///
 /// The wasm arm is 96 because that is 1920x1200 — the tallest panel in common
 /// use at 1920 wide — and it carries 1080p's 84 with room rather than sitting
@@ -114,12 +174,49 @@ pub const TILE_CACHE_ENTRIES: NonZeroUsize = DESKTOP_TILE_CACHE_ENTRIES;
 /// the cascade because this workspace runs `cargo test` on one arm, so the other
 /// two are only reachable from a test if they have names.
 pub const WASM_TILE_CACHE_ENTRIES: NonZeroUsize = NonZeroUsize::new(96).expect("96 is not zero");
-/// The mobile arm. See [`WASM_TILE_CACHE_ENTRIES`].
-pub const MOBILE_TILE_CACHE_ENTRIES: NonZeroUsize =
-    NonZeroUsize::new(128).expect("128 is not zero");
-/// The desktop arm — walkers' own figure. See [`WASM_TILE_CACHE_ENTRIES`].
+/// The mobile arm — the largest handheld working set, not a fraction of the
+/// desktop figure. See [`WASM_TILE_CACHE_ENTRIES`].
+pub const MOBILE_TILE_CACHE_ENTRIES: NonZeroUsize = NonZeroUsize::new(96).expect("96 is not zero");
+/// The desktop arm — pinned from below at 242 by `squallar_gpu`'s
+/// `MIRROR_SCALE_MAX`, not by the byte budget. See [`WASM_TILE_CACHE_ENTRIES`].
 pub const DESKTOP_TILE_CACHE_ENTRIES: NonZeroUsize =
     NonZeroUsize::new(256).expect("256 is not zero");
+
+/// The measured worst-case heap of one cached vector tile, in bytes.
+///
+/// The committed Monaco fixture's z14 city-core tile, 2026-08-28: shape spine,
+/// path points, mesh vertices and indices and label strings, counted at
+/// **capacity** rather than length because capacity is what is resident. The
+/// derivation of [`TILE_CACHE_ENTRIES`] is against this figure; it is named so
+/// a test can hold the two together instead of the number living only in prose.
+pub const MEASURED_VECTOR_TILE_BYTES: usize = 646_264;
+
+/// What one cached raster tile costs: 256x256 RGBA.
+pub const RASTER_TILE_BYTES: usize = 256 * 256 * 4;
+
+/// The `max_zoom` value that means "not read yet", not "zero".
+///
+/// An archive source does not learn its own depth until the IO task has read
+/// the PMTiles header, and the two states have to be *different* values because
+/// they mean opposite things to [`Tiles::at`]. Zero was used for both, and what
+/// zero draws is why that was a defect rather than a nicety:
+///
+/// `ui_map_overlays::draw_tile_layer` clamps the tile zoom to
+/// [`HttpsTiles::source_max_zoom`], so every pane's first frames asked for
+/// `0/0/0` — and that tile then stayed in the LRU, where
+/// [`HttpsTiles::cached_or_interpolated`] walked to it as the fallback ancestor
+/// for any deep tile still in flight, for the rest of the session.
+/// `full_rect_of_clipped_tile` places an ancestor against a rect of
+/// `256 · 2^zoom` points, so the fixture's z0 tile — 7,889 bytes, six shapes —
+/// was drawn 16,384 points across at app zoom 6 and 4,194,304 at zoom 14. Its
+/// widest stroke measured 16 extent units, and `Shape::transform` scaled
+/// `stroke.width` with the geometry, so a "blurry ancestor" painted as a
+/// 64-point, 1,024-point and 16,384-point slab of solid colour.
+///
+/// 255 is safe as the sentinel because it is not a zoom: `tile_id_is_valid`
+/// rejects every zoom at or past 32, since [`walkers::mercator::total_tiles`]
+/// cannot count the grid there.
+const MAX_ZOOM_UNKNOWN: u8 = u8::MAX;
 
 /// Per-tile request timeout.
 ///
@@ -367,8 +464,28 @@ pub struct HttpsTiles {
     /// Shared and atomic rather than a plain `u8` because an archive source
     /// does not know it at construction: the number is in the PMTiles header,
     /// which is read by the IO task. See [`HttpsTiles::from_archive_url`] for
-    /// what it holds before the header arrives.
+    /// what it holds before the header arrives, and [`MAX_ZOOM_UNKNOWN`].
     max_zoom: Arc<AtomicU8>,
+
+    /// Why this source will never serve a tile, once that is known.
+    ///
+    /// Written once by the IO task and read every frame, so a
+    /// [`std::sync::OnceLock`] rather than a lock the frame has to take. Only
+    /// the archive path ever sets it: a raster source's failures are per-tile
+    /// and per-request, and a 404 on one tile says nothing about the next.
+    fault: Arc<OnceLock<String>>,
+
+    /// Set when the request channel has been found disconnected.
+    ///
+    /// **This is a latch, and it exists to bound a log flood.** A disconnected
+    /// `Sender` reports `TrySendError::is_full() == false`, so the disconnect
+    /// falls past the retry arm into an `error!`; and because the closure
+    /// failed, `LruCache::try_get_or_insert` inserts nothing, so the very same
+    /// tile is asked for again on the next frame. Measured against a viewport
+    /// of 54 tiles that is 54 error lines per frame for as long as the app is
+    /// open. The IO task being gone is a permanent condition, so it is worth
+    /// exactly one line.
+    requests_closed: bool,
 
     /// Tiles by id. A `None` value means "asked for, not here yet" *and*
     /// "asked for, and it failed" — the two are deliberately indistinguishable,
@@ -506,6 +623,24 @@ impl HttpsTiles {
         Self::with_client(source, egui_ctx, tile_client())
     }
 
+    /// [`Self::new`], crediting `attribution` rather than what `source` claims.
+    ///
+    /// One caller: `tiles::MapTileState::ensure_base_tiles`, falling back to the
+    /// rasters after the vector archive reported itself unusable. The provider
+    /// is the same and its credit is still owed, but the panel's corner is the
+    /// only place a user is told which basemap they are looking at, so a
+    /// fallback that credited CartoDB *plainly* would be indistinguishable from
+    /// a build configured for CartoDB on purpose.
+    pub fn with_attribution<S: AsyncTileSource>(
+        source: S,
+        egui_ctx: Context,
+        attribution: Attribution,
+    ) -> Self {
+        let mut tiles = Self::with_client(source, egui_ctx, tile_client());
+        tiles.attribution = attribution;
+        tiles
+    }
+
     /// [`Self::new`], with the HTTP client supplied. Crate-private, for the
     /// tests, which need to talk cleartext to a loopback server — [`tile_client`]
     /// refuses `http://` by design.
@@ -548,6 +683,10 @@ impl HttpsTiles {
             attribution,
             tile_size,
             max_zoom,
+            // A raster source has no single failure that ends it: each tile is
+            // its own request, and a 404 on one says nothing about the next.
+            fault: Arc::new(OnceLock::new()),
+            requests_closed: false,
             cache: LruCache::new(cache_entries),
             request_tx,
             tile_rx,
@@ -681,6 +820,10 @@ impl HttpsTiles {
     /// and the tile is retried on a later frame — dropping the request while
     /// marking the tile as requested would strand it forever.
     fn request_once(&mut self, tile_id: TileId) {
+        if self.requests_closed {
+            return;
+        }
+
         // Split borrow: the closure needs the sender while the cache is borrowed.
         let Self {
             cache, request_tx, ..
@@ -699,8 +842,16 @@ impl HttpsTiles {
                 log::trace!("tile request queue is full, retrying {tile_id:?} next frame");
             }
             // walkers panics here. The IO task being gone is not worth taking the
-            // UI thread down for; the map simply stops fetching.
-            Err(error) => log::error!("cannot request tile {tile_id:?}: {error}"),
+            // UI thread down for; the map simply stops fetching -- once, and
+            // saying so once. See [`Self::requests_closed`] for why the latch is
+            // not optional.
+            Err(error) => {
+                log::error!(
+                    "the tile IO task is gone, so this source stops fetching \
+                     (asking for {tile_id:?}: {error})"
+                );
+                self.requests_closed = true;
+            }
         }
     }
 
@@ -727,8 +878,26 @@ impl HttpsTiles {
     /// The source's deepest zoom, so a consumer picking its own zoom level
     /// (`ui_map_overlays`' tile pass, when a zoom bias asks for a level deeper
     /// than the pane's own) can clamp to what this source can serve.
-    pub fn source_max_zoom(&self) -> u8 {
-        self.max_zoom.load(Ordering::Relaxed)
+    ///
+    /// `None` while an archive source is still waiting on its header — see
+    /// [`MAX_ZOOM_UNKNOWN`]. A caller that clamps to this must draw and request
+    /// **nothing** in that state rather than substituting a number, which is
+    /// what makes the difference between waiting a frame and seeding a z0 tile
+    /// that becomes the session's fallback ancestor.
+    pub fn source_max_zoom(&self) -> Option<u8> {
+        match self.max_zoom.load(Ordering::Relaxed) {
+            MAX_ZOOM_UNKNOWN => None,
+            zoom => Some(zoom),
+        }
+    }
+
+    /// Why this source will never serve a tile, if that is settled.
+    ///
+    /// `Some` only after the IO task has failed in a way no later frame can
+    /// undo — today, an archive that will not open. A source that is merely
+    /// slow, or that answered `404` for one tile, is `None`.
+    pub fn fault(&self) -> Option<&str> {
+        self.fault.get().map(String::as_str)
     }
 
     /// Tiles currently held, including pending and failed markers. Exposed for
@@ -779,9 +948,14 @@ impl Tiles for HttpsTiles {
             return None;
         }
 
+        // An archive source that has not read its header yet does not know what
+        // it can serve. Asking anyway means asking for `0/0/0`, which is a real
+        // tile that then never leaves the cache; see [`MAX_ZOOM_UNKNOWN`]. The
+        // IO task repaints when the header lands, so this waits one frame.
+        let max_zoom = self.source_max_zoom()?;
+
         // Above the source's deepest zoom there is nothing to download; the
         // ancestor at `max_zoom` is what gets stretched over the gap.
-        let max_zoom = self.source_max_zoom();
         let to_fetch = if tile_id.zoom > max_zoom {
             interpolate_from_lower_zoom(tile_id, max_zoom).0
         } else {
@@ -935,21 +1109,25 @@ impl HttpsTiles {
     /// and the root directory is two range requests over the network, and this
     /// is called from a frame.
     ///
-    /// So [`Self::source_max_zoom`] starts at **0** and is replaced by the
-    /// archive's own `max_zoom` the moment the header lands. Zero is the honest
-    /// initial value -- the archive's depth is unknown until it is read -- and
-    /// it is also the safe one: [`Tiles::at`] clamps a deeper request down to
-    /// it, so the first frames ask for `0/0/0`, a real tile that is drawn
-    /// stretched over the viewport, and the frame after the header arrives asks
-    /// for the right level. Nothing is stranded: a tile the cache holds under a
-    /// shallower id is exactly what [`Self::cached_or_interpolated`] walks to.
+    /// So [`Self::source_max_zoom`] answers `None` until the header lands, and
+    /// [`Tiles::at`] draws and requests nothing while it does — see
+    /// [`MAX_ZOOM_UNKNOWN`]. **It used to answer `0`, and that was a defect
+    /// dressed as caution**: `at` clamps a deeper request down to the maximum,
+    /// so every pane's first frames asked for `0/0/0`, that tile stayed in the
+    /// LRU, and from then on it was the fallback ancestor
+    /// [`Self::cached_or_interpolated`] walked to for any deep tile in flight —
+    /// drawn stretched over the whole viewport. The doc that argued for it
+    /// reasoned about rasters ("a real tile drawn stretched"), and a stretched
+    /// raster is blurry while a stretched vector tile has its stroke widths
+    /// stretched too. `MAX_ZOOM_UNKNOWN` records the header's absence for what
+    /// it is; the IO task repaints the moment it lands, so this costs a frame.
     ///
     /// # Errors
     ///
     /// [`crate::basemap_archive::RangeError`] if `url` will not parse. A URL
-    /// that parses but does not answer is a *runtime* failure of the IO task,
-    /// logged there; it cannot be reported here, because nothing has been asked
-    /// for yet.
+    /// that parses but does not answer is a *runtime* failure of the IO task;
+    /// it cannot be reported here, because nothing has been asked for yet, so
+    /// it is recorded on [`Self::fault`] instead of only in the log.
     pub fn from_archive_url(
         url: &str,
         style: Arc<Style>,
@@ -984,7 +1162,8 @@ impl HttpsTiles {
         let (request_tx, request_rx) = channel(MAX_PARALLEL_DOWNLOADS);
         let (tile_tx, tile_rx) = channel(MAX_PARALLEL_DOWNLOADS);
 
-        let max_zoom = Arc::new(AtomicU8::new(0));
+        let max_zoom = Arc::new(AtomicU8::new(MAX_ZOOM_UNKNOWN));
+        let fault: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
 
         // Both clones exist for the reason `with_client_and_cache` clones the
         // context: on wasm32 the frame pump is the tessellating side, so it
@@ -1000,6 +1179,7 @@ impl HttpsTiles {
             source,
             style,
             Arc::clone(&max_zoom),
+            Arc::clone(&fault),
             request_rx,
             tile_tx,
             egui_ctx,
@@ -1014,6 +1194,8 @@ impl HttpsTiles {
             // shallower than the one being drawn.
             tile_size: crate::tiles::TILE_SIDE_POINTS as u32,
             max_zoom,
+            fault,
+            requests_closed: false,
             cache: LruCache::new(cache_entries),
             request_tx,
             tile_rx,
@@ -1041,19 +1223,28 @@ impl HttpsTiles {
 /// bounded number of reads in flight is what keeps a pan from opening one range
 /// request per visible tile at once.
 ///
-/// **Where the tessellation happens is the target's, not this loop's.**
-/// `Tile::new` falls through to `mvt::render` for a body no image decoder
-/// recognises, and that is the whole per-tile cost of a vector basemap. On
-/// native [`read_one`] pays it here on the IO thread and the frame side only
-/// moves a finished `Tile` into the cache; on wasm32 there is no other thread
-/// to pay it on, so the body crosses undecoded and
-/// [`HttpsTiles::drain_completed_fetches`] pays it under
+/// **Where the tessellation happens is the target's, not this loop's**, and on
+/// neither target is it this task. `Tile::new` falls through to `mvt::render`
+/// for a body no image decoder recognises, and that is the whole per-tile cost
+/// of a vector basemap. On native [`read_one`] hands it to the runtime's
+/// blocking pool and the frame side only moves a finished `Tile` into the
+/// cache; on wasm32 there is no other thread to pay it on, so the body crosses
+/// undecoded and [`HttpsTiles::drain_completed_fetches`] pays it under
 /// [`WASM_TILE_DECODES_PER_PUMP`]. See [`FetchPayload`].
+///
+/// The native render used to run inline here, and "on the IO thread" undersold
+/// what that cost: this task is a *current-thread* runtime on one `std::thread`
+/// ([`runtime::spawn`]), so a 24.8 ms `mvt::render` was 24.8 ms in which no
+/// range request could progress either. `MAX_PARALLEL_DOWNLOADS` bounds the
+/// reads and bounded nothing about the tessellations, so filling a fresh
+/// 54-tile viewport was ~1.34 s of CPU serialized behind itself while the
+/// fetches and the tessellations starved each other.
 #[cfg(feature = "basemap-vector")]
 async fn serve_archive_continuously<S>(
     source: S,
     style: Arc<Style>,
     max_zoom: Arc<AtomicU8>,
+    fault: Arc<OnceLock<String>>,
     mut request_rx: Receiver<TileId>,
     mut tile_tx: Sender<(TileId, FetchPayload)>,
     egui_ctx: Context,
@@ -1065,7 +1256,18 @@ async fn serve_archive_continuously<S>(
     let archive = match BasemapArchive::open(source).await {
         Ok(archive) => archive,
         Err(error) => {
-            log::error!("the basemap archive will not open, so it serves no tiles: {error}");
+            // **Recorded, not only logged.** Returning here drops `request_rx`,
+            // and a dropped receiver is what the frame side sees as a
+            // *disconnected* sender -- which reports `is_full() == false` and so
+            // used to fall through to one `error!` per visible tile per frame,
+            // for as long as the app was open, over a map that stayed blank with
+            // nothing on the glass to say why. `HttpsTiles::requests_closed`
+            // bounds the flood; this is what lets the UI act on it.
+            let reason = error.to_string();
+            log::error!("the basemap archive will not open, so it serves no tiles: {reason}");
+            let _ = fault.set(reason);
+            // Nothing else would wake the UI to notice.
+            egui_ctx.request_repaint();
             return;
         }
     };
@@ -1136,12 +1338,39 @@ async fn serve_archive_continuously<S>(
 /// [`crate::basemap_archive::TileBytes`] is a type rather than an empty `Vec`.
 ///
 /// The payload split is [`fetch_one`]'s, for [`FetchPayload`]'s reason and not
-/// a second one: on native the IO thread owns the tessellation, on wasm32 the
-/// IO task *is* the page thread, so the MVT body crosses the channel undecoded
-/// and [`HttpsTiles::drain_completed_fetches`] renders it under
+/// a second one: on native the tessellation happens here, on wasm32 the IO task
+/// *is* the page thread, so the MVT body crosses the channel undecoded and
+/// [`HttpsTiles::drain_completed_fetches`] renders it under
 /// [`WASM_TILE_DECODES_PER_PUMP`]. Doing it here on wasm32 would put an
 /// unbounded tessellation on the frame thread; doing it there puts a bounded
 /// one.
+///
+/// **On native the render runs on the runtime's blocking pool, not on the
+/// calling task**, measured at **24.8 ms** for the committed Monaco fixture's
+/// z14 city-core tile against the 95-layer committed style, release build,
+/// 2026-08-28. There is no await point across it, so before this
+/// [`MAX_PARALLEL_DOWNLOADS`] bounded the range requests and bounded nothing
+/// about the tessellations: they ran one after another on [`runtime::spawn`]'s
+/// single current-thread runtime, and during each 24.8 ms slice no range
+/// request progressed either. A fresh 54-tile viewport of tiles this dense was
+/// ~1.34 s of CPU serialized behind itself. `spawn_blocking` puts each render
+/// on its own pool thread; `outstanding` still holds the concurrency at
+/// [`MAX_PARALLEL_DOWNLOADS`], so this is bounded parallelism rather than an
+/// unbounded fan-out, and the reads and the renders stop starving each other.
+///
+/// This is **not** the shape the plan asks for. The plan splits the
+/// zoom-independent MVT parse from the zoom-dependent tessellation and
+/// dispatches the second keyed `(TileId, zoom)`; this moves the whole of
+/// `Tile::new` off the task as one unit. What it fixes is the serialization.
+///
+/// **Unverified, and stated so it is not a surprise later**: `Runtime::drop`
+/// joins the IO thread, whose `tokio::runtime::Runtime` drop is documented to
+/// wait for blocking tasks that have already started. If that holds, dropping a
+/// source mid-tessellation blocks the *frame* thread for up to one render --
+/// ~25 ms -- and `tiles::MapTileState::adopt_theme` drops a source on every
+/// theme flip. The inline spelling had a wait of the same order for the same
+/// reason, so this is not believed to be a regression; neither figure has been
+/// measured. The wasm32 arm never reaches `spawn_blocking` at all.
 #[cfg(feature = "basemap-vector")]
 async fn read_one<S>(
     archive: &crate::basemap_archive::BasemapArchive<S>,
@@ -1152,7 +1381,7 @@ async fn read_one<S>(
             reason = "on wasm the frame pump tessellates; see FetchPayload"
         )
     )]
-    style: &Style,
+    style: &Arc<Style>,
     #[cfg_attr(
         target_arch = "wasm32",
         expect(
@@ -1171,18 +1400,25 @@ where
         .await
         .map_err(|error| format!("reading {tile_id:?} from the basemap archive: {error}"))?;
 
-    let Some(bytes) = bytes.bytes() else {
+    let Some(bytes) = bytes.into_bytes() else {
         log::trace!("the basemap archive holds no tile at {tile_id:?}");
         return Ok(None);
     };
 
     #[cfg(not(target_arch = "wasm32"))]
-    let payload = Tile::new(bytes, style, tile_id.zoom, egui_ctx)
-        .map_err(|error| format!("rendering {tile_id:?} from the basemap archive: {error}"))?;
+    let payload = {
+        let style = Arc::clone(style);
+        let egui_ctx = egui_ctx.clone();
+
+        tokio::task::spawn_blocking(move || Tile::new(&bytes, &style, tile_id.zoom, &egui_ctx))
+            .await
+            .map_err(|error| format!("rendering {tile_id:?} from the basemap archive: {error}"))?
+            .map_err(|error| format!("rendering {tile_id:?} from the basemap archive: {error}"))?
+    };
 
     // On wasm the tessellation belongs to the frame pump, under its budget.
     #[cfg(target_arch = "wasm32")]
-    let payload = bytes.to_vec();
+    let payload = bytes;
 
     Ok(Some((tile_id, payload)))
 }

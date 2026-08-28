@@ -54,10 +54,6 @@ impl From<mvt_reader::error::ParserError> for Error {
 /// Currently this is the only supported extent.
 const ONLY_SUPPORTED_EXTENT: u32 = 4096;
 
-/// `ONLY_SUPPORTED_EXTENT / TILE_SIDE_POINTS`, i.e. 4096/256. See
-/// [`render_line`] for why this is the number and what upstream's 4.0 was.
-const LINE_WIDTH_TO_EXTENT: f32 = 16.0;
-
 #[derive(Debug, Clone)]
 pub enum ShapeOrText {
     Shape(Shape),
@@ -77,14 +73,64 @@ impl From<Mesh> for ShapeOrText {
 }
 
 impl ShapeOrText {
-    pub fn transform(&mut self, transform: TSTransform) {
+    /// This shape placed on screen by `transform`, as a new value.
+    ///
+    /// **Geometry is transformed; stroke widths and font sizes are not.** A
+    /// style's `line-width` and `text-size` are in *screen points* — MapLibre
+    /// defines them that way, and a style's own zoom stops are what scale them
+    /// — while the geometry these shapes carry is in MVT extent units. So the
+    /// placement is an affine map on positions only, and a road is the width
+    /// the style asked for whatever side the tile is drawn at. See
+    /// [`render_line`].
+    ///
+    /// `Text` already worked this way upstream, which is where the rule comes
+    /// from: it scaled `position` and left `font_size` alone.
+    ///
+    /// **This replaces an in-place `transform(&mut self)`.** That spelling
+    /// forced the caller to own a copy first, and for a `Shape::Mesh` — which
+    /// holds an `Arc<Mesh>` the tile cache is still referencing — the mutation
+    /// then went through `Arc::make_mut` and copied the mesh a second time.
+    /// Building the placed value directly is one pass over the points instead
+    /// of a copy followed by a walk.
+    pub fn placed(&self, transform: TSTransform) -> ShapeOrText {
+        let place = |p: egui::Pos2| transform.scaling * p + transform.translation;
+
         match self {
-            ShapeOrText::Shape(shape) => {
-                shape.transform(transform);
+            // The hot arm: a dense city tile is mostly tessellated fills.
+            ShapeOrText::Shape(Shape::Mesh(mesh)) => ShapeOrText::Shape(Shape::Mesh(
+                Mesh {
+                    indices: mesh.indices.clone(),
+                    vertices: mesh
+                        .vertices
+                        .iter()
+                        .map(|vertex| Vertex {
+                            pos: place(vertex.pos),
+                            ..*vertex
+                        })
+                        .collect(),
+                    texture_id: mesh.texture_id,
+                }
+                .into(),
+            )),
+            ShapeOrText::Shape(Shape::Path(path)) => {
+                let mut placed = path.clone();
+                for point in &mut placed.points {
+                    *point = place(*point);
+                }
+                ShapeOrText::Shape(Shape::Path(placed))
             }
-            ShapeOrText::Text(Text { position, .. }) => {
-                *position *= transform.scaling;
-                *position += transform.translation;
+            // `render` emits only `Mesh`, `Path`, `Rect` and `Text`, so this is
+            // the background rectangle and nothing else. `Shape::transform`
+            // would scale a stroke width, and the background carries none.
+            ShapeOrText::Shape(shape) => {
+                let mut placed = shape.clone();
+                placed.transform(transform);
+                ShapeOrText::Shape(placed)
+            }
+            ShapeOrText::Text(text) => {
+                let mut placed = text.clone();
+                placed.position = place(placed.position);
+                ShapeOrText::Text(placed)
             }
         }
     }
@@ -160,22 +206,78 @@ pub fn render(data: &[u8], style: &Style, zoom: u8) -> Result<Vec<ShapeOrText>, 
         }
     }
 
+    let shapes = coalesce_adjacent_meshes(shapes);
+
     log::trace!("Rendered {} shapes", shapes.len());
     Ok(shapes)
 }
 
-/// Transform shapes from MVT space to screen space.
-pub fn transformed(shapes: &[ShapeOrText], rect: egui::Rect) -> Vec<ShapeOrText> {
-    let transform = TSTransform {
+/// Fold each run of neighbouring [`Shape::Mesh`]es into one mesh.
+///
+/// **Order-preserving, and that is the whole of the safety argument.** Only
+/// *adjacent* meshes are folded, so every shape still draws in the position the
+/// style put it in: a fill layer's polygons are consecutive, a line layer
+/// between two fill layers breaks the run, and the triangles, their order and
+/// their colours are untouched. `Mesh::append` is `egui`'s own concatenation
+/// and takes the index rebasing with it; every mesh here carries
+/// `TextureId::default()`, which is what makes them appendable at all.
+///
+/// It is worth doing because a tile is *thousands* of tiny fills. Measured on
+/// the committed Monaco fixture's z14 tile: 2,257 meshes holding 18,018
+/// vertices — eight vertices each. Every one of them was a separate `Arc<Mesh>`
+/// with two heap allocations behind it, held for as long as the tile is cached
+/// and rebuilt by the consumer on every frame it is drawn.
+fn coalesce_adjacent_meshes(shapes: Vec<ShapeOrText>) -> Vec<ShapeOrText> {
+    let mut folded: Vec<ShapeOrText> = Vec::with_capacity(shapes.len());
+
+    for shape in shapes {
+        let ShapeOrText::Shape(Shape::Mesh(mesh)) = shape else {
+            folded.push(shape);
+            continue;
+        };
+
+        if let Some(ShapeOrText::Shape(Shape::Mesh(previous))) = folded.last_mut()
+            && previous.texture_id == mesh.texture_id
+        {
+            // `previous` is the only owner: nothing has been handed out yet.
+            std::sync::Arc::make_mut(previous).append_ref(&mesh);
+            continue;
+        }
+
+        folded.push(ShapeOrText::Shape(Shape::Mesh(mesh)));
+    }
+
+    // The appends above grow by doubling, so the folded meshes carry slack of
+    // their own. A tile is cached, not transient, so it is worth one pass to
+    // give it back.
+    for shape in &mut folded {
+        if let ShapeOrText::Shape(Shape::Mesh(mesh)) = shape {
+            let mesh = std::sync::Arc::make_mut(mesh);
+            mesh.vertices.shrink_to_fit();
+            mesh.indices.shrink_to_fit();
+        }
+    }
+
+    folded.shrink_to_fit();
+    folded
+}
+
+/// The transform that puts a tile's shapes on `rect`.
+///
+/// Exposed so a consumer can place shape by shape — culling, or building its
+/// own output vector — rather than materialising a second `Vec<ShapeOrText>`
+/// first. See [`ShapeOrText::placed`] and [`ShapeOrText::placed_bounds`].
+pub fn placement(rect: egui::Rect) -> TSTransform {
+    TSTransform {
         scaling: rect.width() / ONLY_SUPPORTED_EXTENT as f32,
         translation: rect.min.to_vec2(),
-    };
-
-    let mut result = shapes.to_vec();
-    for shape in result.iter_mut() {
-        shape.transform(transform);
     }
-    result
+}
+
+/// Transform shapes from MVT space to screen space.
+pub fn transformed(shapes: &[ShapeOrText], rect: egui::Rect) -> Vec<ShapeOrText> {
+    let transform = placement(rect);
+    shapes.iter().map(|shape| shape.placed(transform)).collect()
 }
 
 fn get_layer_features(
@@ -250,33 +352,37 @@ pub fn render_line(
     paint: &Paint,
 ) -> Result<(), Error> {
     let width = if let Some(width) = &paint.line_width {
-        // A style's `line-width` is in screen points; these shapes are in MVT
-        // extent units and `transformed` later scales them by
-        // `rect.width() / ONLY_SUPPORTED_EXTENT`. So the pre-multiplier that
-        // makes a styled width arrive on screen at that width is
-        // `ONLY_SUPPORTED_EXTENT / rect.width()`, and `rect.width()` is the
-        // side this consumer draws a tile at.
+        // **In screen points, and carried through placement untouched.** A
+        // style's `line-width` is a screen quantity by MapLibre's definition;
+        // the geometry beside it is in MVT extent units.
+        // [`ShapeOrText::placed`] transforms positions only, so this number
+        // arrives on screen as itself and no pre-multiplier is correct here.
         //
-        // squallar draws a tile `TILE_SIDE_POINTS` = 256 points across at a
-        // whole zoom and bias 0 (`squallar-egui/src/tiles.rs`), so the factor is
-        // 4096/256 = 16. Upstream's 4.0 is 4096/1024, which matches no source
-        // this crate ships -- `TileSource::tile_size` defaults to 256 and
-        // `OpenFreeMap` declares 512 -- so upstream drew every line at a
-        // quarter of its styled width here and an eighth on its own vector
-        // source.
+        // A pre-multiplier is what upstream had (`4.0`), and it can only ever
+        // be right at one tile side: the placement scales by
+        // `rect.width() / ONLY_SUPPORTED_EXTENT`, and `rect.width()` is not a
+        // constant. squallar draws a tile 256 points across at a whole zoom and
+        // zoom bias 0, 181 at the half step, 362 at the other half, and 128
+        // when `MirrorPlan::tile_zoom_bias` asks a 3D pane's floor strip for one
+        // level deeper. Measured against the committed styles, whose 56 `line`
+        // layers all ask for width 8, the factor `4096/256 = 16` delivered
+        // 8.00 / 5.66 / 11.31 / 4.00 at those four sides -- a road breathing
+        // +-41% through a continuous zoom sweep and drawn quarter-width on
+        // every floor strip.
         //
-        // Off a whole zoom the tile is drawn `256 * 2^(zoom - tile_zoom)`
-        // points across and lines scale with it, which is what a vector tile
-        // stretched between zoom steps is expected to do.
-        width.evaluate(context) * LINE_WIDTH_TO_EXTENT
+        // An ancestor stretched over a gap is the same rule and reads better
+        // for it: its roads are the width the style asked for rather than
+        // `2^(zoom - tile_zoom)` times it, so a loading tile is a coarse map
+        // and not a slab.
+        width.evaluate(context)
     } else {
         // Untouched, and inconsistent with the line above: the MapLibre default
-        // for `line-width` is 1, so this branch should be
-        // `1.0 * LINE_WIDTH_TO_EXTENT`. It is left as upstream wrote it because
-        // no layer of either committed style reaches it -- all 56 `line` layers
-        // in `www/styles/{dark,light}.json` set `line-width` (counted
-        // 2026-08-28) -- and changing a branch nothing exercises would be an
-        // unverifiable edit inside a vendored file.
+        // for `line-width` is 1. It is left as upstream wrote it because no
+        // layer of either committed style reaches it -- all 56 `line` layers in
+        // `www/styles/{dark,light}.json` set `line-width` (counted 2026-08-28)
+        // -- and changing a branch nothing exercises would be an unverifiable
+        // edit inside a vendored file. Its *unit* moved with the line above:
+        // this is now 2 screen points rather than 2 extent units.
         2.0
     };
 
@@ -525,6 +631,23 @@ pub fn tessellate_polygon(
             }
         }),
     )?;
+
+    // **`VertexBuffers::new()` is `with_capacity(512, 1024)`**
+    // (`lyon_tessellation-1.0.20/src/geometry_builder.rs`), and those two
+    // allocations are 10,240 + 4,096 bytes whatever the polygon turns out to
+    // need. A vector tile is *thousands* of small polygons, each one a mesh
+    // that then lives in the tile cache for as long as the tile does, so the
+    // slack is not transient: measured on the committed Monaco fixture's z14
+    // tile, 2,257 meshes held 18,018 vertices and 40,812 indices inside
+    // 1,155,584 vertex slots and 2,311,168 index slots -- 32.35 MB of capacity
+    // for 0.52 MB of content, and the whole tile resident at 32.77 MB instead
+    // of 0.77 MB.
+    //
+    // Sizing the buffers up front is not available: the tessellator's output
+    // count is not a function of the input the caller has. Shrinking after is,
+    // and it costs one reallocation and one copy of the content per polygon.
+    buffers.vertices.shrink_to_fit();
+    buffers.indices.shrink_to_fit();
 
     Ok(Mesh {
         indices: buffers.indices,
@@ -916,7 +1039,7 @@ mod tests {
     /// evaluate to*, not on tessellation: if a lookup starts returning
     /// something other than what the eager conversion returned, a colour, a
     /// width or a label moves and this goes red.
-    const GOLDEN: &str = r##"[Shape(Rect(RectShape { rect: [[0.0 0.0] - [4096.0 4096.0]], corner_radius: CornerRadius { nw: 0, ne: 0, sw: 0, se: 0 }, fill: #10_20_30_FF, stroke: Stroke { width: 0.0, color: #00_00_00_00 }, stroke_kind: Outside, round_to_pixels: None, blur_width: 0.0, brush: None, angle: 0.0 })), Shape(Mesh(Mesh { indices: [1, 0, 2, 1, 2, 3], vertices: [Vertex { pos: [0.0 0.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [100.0 0.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [0.0 100.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [100.0 100.0], uv: [0.0 0.0], color: #00_80_00_80 }], texture_id: Managed(0) })), Shape(Mesh(Mesh { indices: [1, 0, 2, 1, 2, 3], vertices: [Vertex { pos: [200.0 200.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [350.0 200.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [200.0 350.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [350.0 350.0], uv: [0.0 0.0], color: #00_80_00_FF }], texture_id: Managed(0) })), Shape(Path(PathShape { points: [[10.0 20.0], [100.0 20.0], [100.0 100.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 64.0, color: Solid(#CC_00_00_CC), kind: Middle } })), Shape(Path(PathShape { points: [[200.0 200.0], [300.0 300.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 2.0, color: Solid(#00_00_FF_FF), kind: Middle } })), Shape(Path(PathShape { points: [[10.0 10.0], [60.0 10.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 32.0, color: Solid(#FF_FF_00_FF), kind: Middle } })), Shape(Path(PathShape { points: [[60.0 60.0], [10.0 60.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 32.0, color: Solid(#FF_FF_00_FF), kind: Middle } })), Text(Text { text: "Warsaw", position: [500.0 600.0], font_size: 12.0, text_color: #FF_FF_FF_FF, background_color: #00_00_00_00, angle: 0.0 }), Text(Text { text: "Warsaw", position: [530.0 560.0], font_size: 12.0, text_color: #FF_FF_FF_FF, background_color: #00_00_00_00, angle: 0.0 }), Text(Text { text: "Krakow", position: [1200.0 1300.0], font_size: 12.0, text_color: #FF_FF_FF_FF, background_color: #00_00_00_00, angle: 0.0 }), Text(Text { text: "Back Alley", position: [35.0 10.0], font_size: 14.0, text_color: #CC_CC_CC_FF, background_color: #00_00_00_80, angle: 0.0 }), Text(Text { text: "Back Alley", position: [35.0 60.0], font_size: 14.0, text_color: #CC_CC_CC_FF, background_color: #00_00_00_80, angle: -0.0 })]"##;
+    const GOLDEN: &str = r##"[Shape(Rect(RectShape { rect: [[0.0 0.0] - [4096.0 4096.0]], corner_radius: CornerRadius { nw: 0, ne: 0, sw: 0, se: 0 }, fill: #10_20_30_FF, stroke: Stroke { width: 0.0, color: #00_00_00_00 }, stroke_kind: Outside, round_to_pixels: None, blur_width: 0.0, brush: None, angle: 0.0 })), Shape(Mesh(Mesh { indices: [1, 0, 2, 1, 2, 3, 5, 4, 6, 5, 6, 7], vertices: [Vertex { pos: [0.0 0.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [100.0 0.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [0.0 100.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [100.0 100.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [200.0 200.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [350.0 200.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [200.0 350.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [350.0 350.0], uv: [0.0 0.0], color: #00_80_00_FF }], texture_id: Managed(0) })), Shape(Path(PathShape { points: [[10.0 20.0], [100.0 20.0], [100.0 100.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 4.0, color: Solid(#CC_00_00_CC), kind: Middle } })), Shape(Path(PathShape { points: [[200.0 200.0], [300.0 300.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 2.0, color: Solid(#00_00_FF_FF), kind: Middle } })), Shape(Path(PathShape { points: [[10.0 10.0], [60.0 10.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 2.0, color: Solid(#FF_FF_00_FF), kind: Middle } })), Shape(Path(PathShape { points: [[60.0 60.0], [10.0 60.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 2.0, color: Solid(#FF_FF_00_FF), kind: Middle } })), Text(Text { text: "Warsaw", position: [500.0 600.0], font_size: 12.0, text_color: #FF_FF_FF_FF, background_color: #00_00_00_00, angle: 0.0 }), Text(Text { text: "Warsaw", position: [530.0 560.0], font_size: 12.0, text_color: #FF_FF_FF_FF, background_color: #00_00_00_00, angle: 0.0 }), Text(Text { text: "Krakow", position: [1200.0 1300.0], font_size: 12.0, text_color: #FF_FF_FF_FF, background_color: #00_00_00_00, angle: 0.0 }), Text(Text { text: "Back Alley", position: [35.0 10.0], font_size: 14.0, text_color: #CC_CC_CC_FF, background_color: #00_00_00_80, angle: 0.0 }), Text(Text { text: "Back Alley", position: [35.0 60.0], font_size: 14.0, text_color: #CC_CC_CC_FF, background_color: #00_00_00_80, angle: -0.0 })]"##;
 
     #[test]
     fn rendering_the_fixture_reproduces_the_recorded_shapes_exactly() {
@@ -926,11 +1049,75 @@ mod tests {
         // pass by matching a golden nobody looked at.
         assert_eq!(
             shapes.len(),
-            12,
-            "the fixture draws a background, two fills, four strokes and five labels"
+            11,
+            "the fixture draws a background, one coalesced fill mesh, four \
+             strokes and five labels"
         );
 
         assert_eq!(format!("{shapes:?}"), GOLDEN);
+    }
+
+    /// **The stroke width the style asked for arrives, at every tile side.**
+    ///
+    /// The blind spot this closes: every other test here places on a
+    /// 256-point rect or does not place at all, and 256 is exactly the side at
+    /// which the old `LINE_WIDTH_TO_EXTENT = 4096/256` pre-multiplier was
+    /// right. A consumer drawing a tile at any other side -- 181 at the half
+    /// step, 362 at the other, 128 when a zoom bias asks for one level deeper,
+    /// or `256 * 2^n` for an ancestor stretched over a gap -- got the styled
+    /// width times `rect.width() / 256`.
+    #[test]
+    fn a_styled_line_width_survives_every_tile_side() {
+        let shapes = rendered();
+
+        let widths = |rect: egui::Rect| -> Vec<f32> {
+            transformed(&shapes, rect)
+                .into_iter()
+                .filter_map(|shape| match shape {
+                    ShapeOrText::Shape(Shape::Path(path)) => Some(path.stroke.width),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let at_256 = widths(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(256.0, 256.0),
+        ));
+
+        // The floor: a run over an empty shape list would agree with itself at
+        // every side and prove nothing.
+        assert_eq!(
+            at_256,
+            vec![4.0, 2.0, 2.0, 2.0],
+            "the fixture's four strokes are the styled widths, in screen points"
+        );
+
+        for side in [1.0f32, 128.0, 181.019_34, 362.038_67, 4096.0, 65536.0] {
+            let rect = egui::Rect::from_min_size(egui::pos2(7.0, 11.0), egui::vec2(side, side));
+            assert_eq!(
+                widths(rect),
+                at_256,
+                "a tile drawn {side} points across delivered different stroke \
+                 widths than one drawn 256 across; `line-width` is a screen \
+                 quantity and must not scale with the placement"
+            );
+
+            // The geometry, unlike the width, *must* scale -- otherwise this
+            // would pass by transforming nothing at all.
+            let placed = transformed(&shapes, rect);
+            // [0] background, [1] the coalesced fill mesh, [2] the first stroke.
+            let ShapeOrText::Shape(Shape::Path(path)) = &placed[2] else {
+                panic!("the third shape is the first stroke");
+            };
+            let expected = 7.0 + 10.0 * side / ONLY_SUPPORTED_EXTENT as f32;
+            assert!(
+                (path.points[0].x - expected).abs() < 1e-3,
+                "at side {side} the first stroke point landed at {} rather \
+                 than {expected}: the placement did not scale the geometry",
+                path.points[0].x
+            );
+        }
     }
 
     fn roads_line_style(filter: &str) -> String {

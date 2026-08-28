@@ -1427,6 +1427,112 @@ the evaluation. Three of its four stroke widths scale by 4 — `16.0 -> 64.0` an
 `8.0 -> 32.0` twice. The fourth, `2.0`, does **not** move, which is what shows
 the `else` branch was left alone.
 
+**Superseded by the nineteenth commit below**, which removes the pre-multiplier
+rather than correcting it. The entry is kept because the reasoning above is
+still how the number got to 16, and because the table's third row — 8 for
+`OpenFreeMap`'s 512-point tiles — is the evidence that no single constant could
+have been right.
+
+### Changed — source, nineteenth commit: `line-width` stops being a constant that is right at one tile side
+
+`src/mvt.rs`. `LINE_WIDTH_TO_EXTENT` is **deleted**; `render_line` writes the
+styled width through unchanged, and the placement no longer scales stroke
+widths.
+
+The eighteenth commit above fixed the constant and left the shape of the defect
+in place: `transformed` scales by `rect.width() / ONLY_SUPPORTED_EXTENT`, so
+*any* pre-multiplier baked at render time is correct at exactly one
+`rect.width()`. Measured against the committed styles, whose 56 `line` layers
+all ask for width `8`:
+
+| tile drawn at | 16.0 delivered | now |
+| --- | ---: | ---: |
+| 128 pt (`tile_zoom_bias = 1`, a 3D pane's floor strip) | 4.00 | 8.00 |
+| 181 pt (the half step) | 5.66 | 8.00 |
+| 256 pt (whole zoom, bias 0) | 8.00 | 8.00 |
+| 362 pt (the other half step) | 11.31 | 8.00 |
+| 512 pt | 16.00 | 8.00 |
+
+The rule, and it is MapLibre's: `line-width` and `text-size` are in **screen
+points**, the geometry beside them is in MVT extent units, and a style's own
+zoom stops are what scale a road with the map. `Text` already worked this way
+upstream — `ShapeOrText::transform` scaled `position` and left `font_size`
+alone — so the change makes strokes agree with labels rather than inventing a
+convention.
+
+`ShapeOrText::transform(&mut self)` is replaced by
+`ShapeOrText::placed(&self, TSTransform) -> ShapeOrText`, and `mvt::placement`
+is added so a consumer can place shape by shape. Three reasons, one of them not
+about line width at all:
+
+1. Only `placed` can leave a stroke width alone; `Shape::transform` scales it.
+2. The in-place spelling forced the caller to own a copy first, and for a
+   `Shape::Mesh` — an `Arc<Mesh>` the tile cache is still referencing — the
+   mutation then went through `Arc::make_mut` and copied the mesh **again**.
+   Measured on `squallar-egui/testdata/monaco.pmtiles`' z14 city tile, release
+   build: `transformed` 135.2 us before, 24.8 us after.
+3. `transformed` is kept, in terms of `placed`, so `Tile::draw` and the inline
+   tests are unchanged.
+
+`mvt::tests::rendering_the_fixture_reproduces_the_recorded_shapes_exactly` moves
+again, in the same legitimate class: three of its four stroke widths lose the
+factor of 16 — `64.0 -> 4.0` and `32.0 -> 2.0` twice — and the fourth, `2.0`,
+does not move because it is the untouched `else` branch. That branch's *unit*
+moved with the change: it is now 2 screen points rather than 2 extent units.
+Nothing in this workspace reaches it, for the reason recorded above.
+
+`a_styled_line_width_survives_every_tile_side` is added. It exists because the
+blind spot was uniform: every pre-existing test placed on a 256-point rect or
+did not place at all, and 256 is exactly the side at which `4096/256` is right.
+
+### Changed — source, nineteenth commit: a tile's fills are one mesh, and the tessellator's slack is given back
+
+`src/mvt.rs`, `tessellate_polygon` and a new `coalesce_adjacent_meshes` pass at
+the end of `render`. Both are about what a *cached* tile costs, and both were
+found by measuring the committed Monaco fixture's z14 city tile.
+
+`VertexBuffers::new()` is `with_capacity(512, 1024)`
+(`lyon_tessellation-1.0.20/src/geometry_builder.rs:269`), so every polygon's
+mesh carried 10,240 + 4,096 bytes of allocation whatever it needed. The tile has
+2,257 of them holding eight vertices each: **1,155,584 vertex slots and
+2,311,168 index slots for 18,018 and 40,812** — 32.35 MB of capacity for 0.52 MB
+of content. `shrink_to_fit` on both, after tessellation, because the output count
+is not a function of any input the caller has.
+
+`coalesce_adjacent_meshes` folds each **run** of neighbouring `Shape::Mesh`es
+into one with `Mesh::append_ref`. Order-preserving is the whole safety argument:
+only adjacent meshes fold, so a line layer between two fill layers breaks the
+run and every shape still draws where the style put it. Every mesh carries
+`TextureId::default()`, which is what makes them appendable; colour is
+per-vertex, so meshes of different colours fold correctly.
+
+| | before | after |
+| --- | ---: | ---: |
+| shapes | 2,993 | 738 |
+| meshes | 2,257 | 2 |
+| resident heap | 32,767,648 B | 646,264 B |
+| consumer's per-frame placement | 135.2 us | 24.8 us |
+| `Tile::from_mvt` | 23.72 ms | 24.80 ms |
+
+The last row is the cost: coalescing and shrinking add ~1.1 ms (4.4%) to
+tessellation, which runs off the frame thread, to take 50.7x off what the cache
+holds and 5.5x off what the frame thread pays.
+
+`rendering_the_fixture_reproduces_the_recorded_shapes_exactly` moves for this
+too — 12 shapes to 11, its two adjacent fills becoming one mesh with rebased
+indices — and the non-triviality floor beside it moves with it.
+
+### Changed — source, nineteenth commit: `Tile::Vector` is shared, not owned
+
+`src/tiles.rs`. `Vector(Vec<ShapeOrText>)` becomes
+`Vector(std::sync::Arc<Vec<ShapeOrText>>)`.
+
+`Tiles::at` hands back a `TilePiece` **by value**, once per visible grid cell
+per frame. The raster arm costs nothing to hand over because a `TextureHandle`
+is a refcount; the vector arm deep-copied every shape in the tile. Measured on
+the same z14 tile: **22.9 us per tile per frame, against a viewport that holds
+up to 84 tiles**. An `Arc` clone measures 0.01 us.
+
 ## What the pin actually selects
 
 "Upstream's 38 inline tests are the behaviour pin" is the reason this crate is
