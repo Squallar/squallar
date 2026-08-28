@@ -1,11 +1,21 @@
 pub mod actions;
 /// The PMTiles v3 basemap archive reader.
 ///
-/// Behind `basemap-vector` and, as of this commit, called by nothing but its
-/// own tests — the draw seam is a later step. The feature gate is where the
-/// dependency lives, so the module is where the code that names it lives.
+/// Behind `basemap-vector`, because that is where the `pmtiles` dependency
+/// lives. Read by [`tile_source::HttpsTiles::from_archive_url`], which is the
+/// base map source on native when the feature is on.
 #[cfg(feature = "basemap-vector")]
 pub mod basemap_archive;
+/// The two committed basemap styles, compiled in.
+///
+/// **`any(feature, test)`, and both halves are load-bearing.** The `include_str!`
+/// pair is 241 KB of JSON that a build with the feature off would carry for
+/// nothing — the wasm artifact especially — so the feature keeps it out. The
+/// `test` keeps the tests *in*: with the feature alone they would be invisible
+/// to `cargo test --workspace`, which is precisely how the archive reader
+/// landed with 13 tests and moved the workspace total by zero.
+#[cfg(any(feature = "basemap-vector", test))]
+pub mod basemap_style;
 pub(crate) mod field_facts;
 pub(crate) mod legend_ramp;
 pub mod overlay_cache;

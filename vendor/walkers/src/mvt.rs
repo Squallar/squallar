@@ -54,6 +54,10 @@ impl From<mvt_reader::error::ParserError> for Error {
 /// Currently this is the only supported extent.
 const ONLY_SUPPORTED_EXTENT: u32 = 4096;
 
+/// `ONLY_SUPPORTED_EXTENT / TILE_SIDE_POINTS`, i.e. 4096/256. See
+/// [`render_line`] for why this is the number and what upstream's 4.0 was.
+const LINE_WIDTH_TO_EXTENT: f32 = 16.0;
+
 #[derive(Debug, Clone)]
 pub enum ShapeOrText {
     Shape(Shape),
@@ -246,9 +250,33 @@ pub fn render_line(
     paint: &Paint,
 ) -> Result<(), Error> {
     let width = if let Some(width) = &paint.line_width {
-        // Align to the proportion of MVT extent and tile size.
-        width.evaluate(context) * 4.0
+        // A style's `line-width` is in screen points; these shapes are in MVT
+        // extent units and `transformed` later scales them by
+        // `rect.width() / ONLY_SUPPORTED_EXTENT`. So the pre-multiplier that
+        // makes a styled width arrive on screen at that width is
+        // `ONLY_SUPPORTED_EXTENT / rect.width()`, and `rect.width()` is the
+        // side this consumer draws a tile at.
+        //
+        // squallar draws a tile `TILE_SIDE_POINTS` = 256 points across at a
+        // whole zoom and bias 0 (`squallar-egui/src/tiles.rs`), so the factor is
+        // 4096/256 = 16. Upstream's 4.0 is 4096/1024, which matches no source
+        // this crate ships -- `TileSource::tile_size` defaults to 256 and
+        // `OpenFreeMap` declares 512 -- so upstream drew every line at a
+        // quarter of its styled width here and an eighth on its own vector
+        // source.
+        //
+        // Off a whole zoom the tile is drawn `256 * 2^(zoom - tile_zoom)`
+        // points across and lines scale with it, which is what a vector tile
+        // stretched between zoom steps is expected to do.
+        width.evaluate(context) * LINE_WIDTH_TO_EXTENT
     } else {
+        // Untouched, and inconsistent with the line above: the MapLibre default
+        // for `line-width` is 1, so this branch should be
+        // `1.0 * LINE_WIDTH_TO_EXTENT`. It is left as upstream wrote it because
+        // no layer of either committed style reaches it -- all 56 `line` layers
+        // in `www/styles/{dark,light}.json` set `line-width` (counted
+        // 2026-08-28) -- and changing a branch nothing exercises would be an
+        // unverifiable edit inside a vendored file.
         2.0
     };
 
@@ -888,7 +916,7 @@ mod tests {
     /// evaluate to*, not on tessellation: if a lookup starts returning
     /// something other than what the eager conversion returned, a colour, a
     /// width or a label moves and this goes red.
-    const GOLDEN: &str = r##"[Shape(Rect(RectShape { rect: [[0.0 0.0] - [4096.0 4096.0]], corner_radius: CornerRadius { nw: 0, ne: 0, sw: 0, se: 0 }, fill: #10_20_30_FF, stroke: Stroke { width: 0.0, color: #00_00_00_00 }, stroke_kind: Outside, round_to_pixels: None, blur_width: 0.0, brush: None, angle: 0.0 })), Shape(Mesh(Mesh { indices: [1, 0, 2, 1, 2, 3], vertices: [Vertex { pos: [0.0 0.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [100.0 0.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [0.0 100.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [100.0 100.0], uv: [0.0 0.0], color: #00_80_00_80 }], texture_id: Managed(0) })), Shape(Mesh(Mesh { indices: [1, 0, 2, 1, 2, 3], vertices: [Vertex { pos: [200.0 200.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [350.0 200.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [200.0 350.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [350.0 350.0], uv: [0.0 0.0], color: #00_80_00_FF }], texture_id: Managed(0) })), Shape(Path(PathShape { points: [[10.0 20.0], [100.0 20.0], [100.0 100.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 16.0, color: Solid(#CC_00_00_CC), kind: Middle } })), Shape(Path(PathShape { points: [[200.0 200.0], [300.0 300.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 2.0, color: Solid(#00_00_FF_FF), kind: Middle } })), Shape(Path(PathShape { points: [[10.0 10.0], [60.0 10.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 8.0, color: Solid(#FF_FF_00_FF), kind: Middle } })), Shape(Path(PathShape { points: [[60.0 60.0], [10.0 60.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 8.0, color: Solid(#FF_FF_00_FF), kind: Middle } })), Text(Text { text: "Warsaw", position: [500.0 600.0], font_size: 12.0, text_color: #FF_FF_FF_FF, background_color: #00_00_00_00, angle: 0.0 }), Text(Text { text: "Warsaw", position: [530.0 560.0], font_size: 12.0, text_color: #FF_FF_FF_FF, background_color: #00_00_00_00, angle: 0.0 }), Text(Text { text: "Krakow", position: [1200.0 1300.0], font_size: 12.0, text_color: #FF_FF_FF_FF, background_color: #00_00_00_00, angle: 0.0 }), Text(Text { text: "Back Alley", position: [35.0 10.0], font_size: 14.0, text_color: #CC_CC_CC_FF, background_color: #00_00_00_80, angle: 0.0 }), Text(Text { text: "Back Alley", position: [35.0 60.0], font_size: 14.0, text_color: #CC_CC_CC_FF, background_color: #00_00_00_80, angle: -0.0 })]"##;
+    const GOLDEN: &str = r##"[Shape(Rect(RectShape { rect: [[0.0 0.0] - [4096.0 4096.0]], corner_radius: CornerRadius { nw: 0, ne: 0, sw: 0, se: 0 }, fill: #10_20_30_FF, stroke: Stroke { width: 0.0, color: #00_00_00_00 }, stroke_kind: Outside, round_to_pixels: None, blur_width: 0.0, brush: None, angle: 0.0 })), Shape(Mesh(Mesh { indices: [1, 0, 2, 1, 2, 3], vertices: [Vertex { pos: [0.0 0.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [100.0 0.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [0.0 100.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [100.0 100.0], uv: [0.0 0.0], color: #00_80_00_80 }], texture_id: Managed(0) })), Shape(Mesh(Mesh { indices: [1, 0, 2, 1, 2, 3], vertices: [Vertex { pos: [200.0 200.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [350.0 200.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [200.0 350.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [350.0 350.0], uv: [0.0 0.0], color: #00_80_00_FF }], texture_id: Managed(0) })), Shape(Path(PathShape { points: [[10.0 20.0], [100.0 20.0], [100.0 100.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 64.0, color: Solid(#CC_00_00_CC), kind: Middle } })), Shape(Path(PathShape { points: [[200.0 200.0], [300.0 300.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 2.0, color: Solid(#00_00_FF_FF), kind: Middle } })), Shape(Path(PathShape { points: [[10.0 10.0], [60.0 10.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 32.0, color: Solid(#FF_FF_00_FF), kind: Middle } })), Shape(Path(PathShape { points: [[60.0 60.0], [10.0 60.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 32.0, color: Solid(#FF_FF_00_FF), kind: Middle } })), Text(Text { text: "Warsaw", position: [500.0 600.0], font_size: 12.0, text_color: #FF_FF_FF_FF, background_color: #00_00_00_00, angle: 0.0 }), Text(Text { text: "Warsaw", position: [530.0 560.0], font_size: 12.0, text_color: #FF_FF_FF_FF, background_color: #00_00_00_00, angle: 0.0 }), Text(Text { text: "Krakow", position: [1200.0 1300.0], font_size: 12.0, text_color: #FF_FF_FF_FF, background_color: #00_00_00_00, angle: 0.0 }), Text(Text { text: "Back Alley", position: [35.0 10.0], font_size: 14.0, text_color: #CC_CC_CC_FF, background_color: #00_00_00_80, angle: 0.0 }), Text(Text { text: "Back Alley", position: [35.0 60.0], font_size: 14.0, text_color: #CC_CC_CC_FF, background_color: #00_00_00_80, angle: -0.0 })]"##;
 
     #[test]
     fn rendering_the_fixture_reproduces_the_recorded_shapes_exactly() {

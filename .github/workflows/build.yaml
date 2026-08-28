@@ -410,11 +410,18 @@ jobs:
               cargo check -p squallar-egui --all-targets \
                 --target x86_64-unknown-linux-gnu \
                 --features squallar-egui/basemap-vector
-              # And RUN them. The feature gates 13 tests that the default
-              # workspace suite cannot see -- `cargo test --workspace -- --list`
-              # selects 0 of them -- so without this line the archive reader
-              # ships with a green board and zero executed assertions. That is
-              # the same shape as a `running 0 tests` pass, one layer up.
+              # And RUN them. The feature gates tests the default workspace
+              # suite cannot see -- `cargo test --workspace -- --list` selects
+              # 0 of them -- so without this line the archive path ships with a
+              # green board and zero executed assertions. That is the same
+              # shape as a `running 0 tests` pass, one layer up.
+              #
+              # The gap, measured 2026-08-28 on the draw-seam commit, as
+              # `cargo test -p squallar-egui -- --list | wc -l`: 1148 without
+              # the feature, 1164 with it. Those 16 run in no other row.
+              # **Anything added behind that feature must live in
+              # `squallar-egui`, or this row's `-p` has to grow in the same
+              # commit.**
               # The wasm row above stays check-only because its tests cannot be
               # executed on the host.
               cargo test -p squallar-egui \

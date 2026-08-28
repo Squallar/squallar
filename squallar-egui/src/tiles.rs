@@ -98,6 +98,86 @@ impl TileSource for CartoDb {
 // The mercantile reference vectors in `tiles/tests.rs` pin their exact bits.
 
 // ---------------------------------------------------------------------------
+// Which source the base map is drawn from
+// ---------------------------------------------------------------------------
+
+/// The self-hosted PMTiles v3 basemap archive.
+///
+/// The generation is compiled in. `https://tiles.squallar.app/status/latest.json`
+/// is the stable pointer at the same host and is what a client should resolve
+/// once it can afford an extra round trip before the first tile; nothing does
+/// yet, and a pointer nobody reads would be a claim rather than a mechanism.
+#[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
+pub const BASEMAP_ARCHIVE_URL: &str = "https://tiles.squallar.app/basemap/omt-20260828.pmtiles";
+
+/// An archive URL that replaces [`BASEMAP_ARCHIVE_URL`] when it is set.
+///
+/// Native only, and read once per source construction. It exists because the
+/// published archive is the *only* other way to exercise this path, and a
+/// change to the draw seam that can only be checked against 83 GB over a
+/// network is a change that will stop being checked. `file://` is not a scheme
+/// [`crate::basemap_archive::HttpRangeSource`] serves, so a local archive is
+/// pointed at through a plain HTTP file server.
+#[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
+pub const BASEMAP_ARCHIVE_URL_ENV: &str = "SQUALLAR_BASEMAP_ARCHIVE";
+
+/// The credit the vector basemap carries.
+///
+/// [`ATTRIBUTION_TEXT`] is still CartoDB's and is what the map panel *draws*;
+/// the two disagree while `basemap-vector` is off by default, and reconciling
+/// them is the flip, which deletes `CartoDb` outright. This is the honest
+/// string for the source that is actually being read.
+#[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
+pub const ARCHIVE_ATTRIBUTION_TEXT: &str = "\u{a9} OpenStreetMap contributors \u{a9} OpenMapTiles";
+
+/// The base-map tile source for `is_dark`: CartoDB's pre-rendered rasters.
+#[cfg(not(all(feature = "basemap-vector", not(target_arch = "wasm32"))))]
+fn base_source(is_dark: bool, ctx: &egui::Context) -> HttpsTiles {
+    let source = if is_dark {
+        CartoDb::dark()
+    } else {
+        CartoDb::light()
+    };
+    HttpsTiles::new(source, ctx.to_owned())
+}
+
+/// The base-map tile source for `is_dark`: our own archive, rendered here.
+///
+/// Falls back to CartoDB if the archive URL will not parse, which is the only
+/// failure visible at construction. Everything else — the host being down, the
+/// archive not being PMTiles — happens inside the IO task and is logged there;
+/// there is nothing to fall back *to* by then, because the frame has already
+/// been handed a source.
+#[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
+fn base_source(is_dark: bool, ctx: &egui::Context) -> HttpsTiles {
+    let url =
+        std::env::var(BASEMAP_ARCHIVE_URL_ENV).unwrap_or_else(|_| BASEMAP_ARCHIVE_URL.to_owned());
+
+    let attribution = Attribution {
+        text: ARCHIVE_ATTRIBUTION_TEXT,
+        url: ATTRIBUTION_URL,
+        logo_light: None,
+        logo_dark: None,
+    };
+
+    match HttpsTiles::from_archive_url(
+        &url,
+        crate::basemap_style::committed(is_dark),
+        attribution,
+        ctx.to_owned(),
+    ) {
+        Ok(tiles) => tiles,
+        Err(error) => {
+            log::error!("{url} is not a usable basemap archive URL: {error}");
+            let source = if is_dark {
+                CartoDb::dark()
+            } else {
+                CartoDb::light()
+            };
+            HttpsTiles::new(source, ctx.to_owned())
+        }
+    }
+}
 
 /// Shared map tile state across all panes.
 pub struct MapTileState {
@@ -162,10 +242,10 @@ impl MapTileState {
         self.adopt_theme(is_dark);
         if is_dark {
             if self.tiles_dark.is_none() {
-                self.tiles_dark = Some(HttpsTiles::new(CartoDb::dark(), ctx.to_owned()));
+                self.tiles_dark = Some(base_source(true, ctx));
             }
         } else if self.tiles_light.is_none() {
-            self.tiles_light = Some(HttpsTiles::new(CartoDb::light(), ctx.to_owned()));
+            self.tiles_light = Some(base_source(false, ctx));
         }
     }
 
