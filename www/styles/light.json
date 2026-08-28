@@ -6821,17 +6821,228 @@
       "source": "openmaptiles",
       "source-layer": "transportation_name",
       "type": "symbol"
+    },
+    {
+      "filter": [
+        "all",
+        [
+          ">=",
+          [
+            "zoom"
+          ],
+          17
+        ],
+        [
+          "has",
+          "housenumber"
+        ]
+      ],
+      "id": "housenumber",
+      "layout": {
+        "text-field": [
+          "get",
+          "housenumber"
+        ],
+        "text-font": [
+          "Montserrat Regular",
+          "Open Sans Regular",
+          "Noto Sans Regular",
+          "HanWangHeiLight Regular",
+          "NanumBarunGothic Regular"
+        ],
+        "text-size": [
+          "interpolate",
+          [
+            "linear"
+          ],
+          [
+            "zoom"
+          ],
+          17,
+          9,
+          18,
+          10,
+          20,
+          11
+        ]
+      },
+      "metadata": {
+        "squallar:origin": "squallar",
+        "squallar:phase": "label"
+      },
+      "minzoom": 17,
+      "paint": {
+        "text-color": "#838383",
+        "text-halo-color": "#fff",
+        "text-halo-width": 1
+      },
+      "source": "openmaptiles",
+      "source-layer": "housenumber",
+      "type": "symbol"
+    },
+    {
+      "filter": [
+        "all",
+        [
+          ">=",
+          [
+            "zoom"
+          ],
+          12
+        ],
+        [
+          "in",
+          "class",
+          "peak",
+          "volcano"
+        ],
+        [
+          "has",
+          "name"
+        ]
+      ],
+      "id": "mountain_peak",
+      "layout": {
+        "text-field": [
+          "coalesce",
+          [
+            "get",
+            "name_en"
+          ],
+          [
+            "get",
+            "name"
+          ]
+        ],
+        "text-font": [
+          "Montserrat Regular",
+          "Open Sans Regular",
+          "Noto Sans Regular",
+          "HanWangHeiLight Regular",
+          "NanumBarunGothic Regular"
+        ],
+        "text-size": [
+          "interpolate",
+          [
+            "linear"
+          ],
+          [
+            "zoom"
+          ],
+          12,
+          9,
+          14,
+          10,
+          16,
+          11,
+          18,
+          12
+        ]
+      },
+      "metadata": {
+        "squallar:origin": "squallar",
+        "squallar:phase": "label"
+      },
+      "minzoom": 12,
+      "paint": {
+        "text-color": "#7a96a0",
+        "text-halo-color": "#f5f5f3",
+        "text-halo-width": 1
+      },
+      "source": "openmaptiles",
+      "source-layer": "mountain_peak",
+      "type": "symbol"
+    },
+    {
+      "filter": [
+        "all",
+        [
+          ">=",
+          [
+            "zoom"
+          ],
+          11
+        ],
+        [
+          "has",
+          "name"
+        ]
+      ],
+      "id": "aerodrome_label",
+      "layout": {
+        "text-field": [
+          "coalesce",
+          [
+            "get",
+            "name_en"
+          ],
+          [
+            "get",
+            "name"
+          ]
+        ],
+        "text-font": [
+          "Montserrat Medium",
+          "Open Sans Bold",
+          "Noto Sans Regular",
+          "HanWangHeiLight Regular",
+          "NanumBarunGothic Regular"
+        ],
+        "text-size": [
+          "interpolate",
+          [
+            "linear"
+          ],
+          [
+            "zoom"
+          ],
+          11,
+          10,
+          13,
+          11,
+          15,
+          12,
+          18,
+          13
+        ]
+      },
+      "metadata": {
+        "squallar:origin": "squallar",
+        "squallar:phase": "label"
+      },
+      "minzoom": 11,
+      "paint": {
+        "text-color": "#697b89",
+        "text-halo-color": "rgba(255,255,255,0.5)",
+        "text-halo-width": 1
+      },
+      "source": "openmaptiles",
+      "source-layer": "aerodrome_label",
+      "type": "symbol"
     }
   ],
   "metadata": {
-    "squallar:dropped-layers": [
+    "squallar:added-layers": [
+      {
+        "id": "aerodrome_label",
+        "reason": "METARs and TAFs are issued per aerodrome. CARTO never styled it.",
+        "source-layer": "aerodrome_label"
+      },
+      {
+        "id": "mountain_peak",
+        "reason": "The only elevation values in the OpenMapTiles schema (`ele`, `ele_ft`, `customary_ft`). CARTO never styled it.",
+        "source-layer": "mountain_peak"
+      }
+    ],
+    "squallar:dropped-layers": [],
+    "squallar:note": "Converted once from a CARTO style DOCUMENT (BSD-3-Clause code, CC-BY-4.0 design); no CARTO tile was fetched and none is redistributed. Owned source from 2026-08-27 -- edit this file directly. See tools/basemap-style/DECISIONS.md.",
+    "squallar:restored-layers": [
       {
         "id": "housenumber",
-        "reason": "text-color and text-halo-color are both \"transparent\" in both themes, so the layer renders nothing",
+        "reason": "CARTO painted text-color and text-halo-color `transparent`, so the converter dropped its layer. That was CARTO's minimal-backdrop aesthetic, inherited rather than chosen; the styles are ours from 2026-08-27. This layer fills the upstream slot, restyled.",
         "source-layer": "housenumber"
       }
     ],
-    "squallar:note": "Converted once from a CARTO style DOCUMENT (BSD-3-Clause code, CC-BY-4.0 design); no CARTO tile was fetched and none is redistributed. Owned source from 2026-08-27 -- edit this file directly. See tools/basemap-style/DECISIONS.md.",
     "squallar:theme": "light",
     "squallar:upstream": "https://github.com/CartoDB/basemap-styles/blob/master/mapboxgl/positron.json",
     "squallar:upstream-commit": "64d082a6bc6039b1a0a0a9fb5312330fedd0bba9",

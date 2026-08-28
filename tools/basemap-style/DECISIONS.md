@@ -135,6 +135,28 @@ The drop is recorded in each style's own `metadata."squallar:dropped-layers"`,
 and the verification suite reads the expected output count back off that rather
 than being told it.
 
+> **Amended 2026-08-28 — the drop is retired and the styles are 95 layers.**
+>
+> Everything above is the record of the one-time conversion and stays true of
+> it. It is no longer true of the committed styles.
+>
+> `housenumber` came off `DELIBERATE_DROPS`: the styles carry their own
+> housenumber layer, at z17+, in a visible colour. CARTO's `transparent` was a
+> minimal-backdrop aesthetic we inherited rather than chose, and these styles
+> have been owned source since 2026-08-27. Two layers CARTO never styled were
+> added at the same time — `mountain_peak` (the only elevation values in the
+> schema) and `aerodrome_label` (METARs and TAFs are issued per aerodrome).
+>
+> **93 in, 95 out.** The accounting is now `upstream - dropped + added`:
+> 93 − 0 + 2 = 95. `housenumber` is not one of the two — CARTO's 93 already
+> contained a housenumber layer, so ours fills that slot restyled, recorded
+> under `metadata."squallar:restored-layers"`. Phase split is **66 ground and
+> 29 label**.
+>
+> The invariant that replaced "93 in, 92 out" is stronger than it: additions are
+> read from the document, so a hand edit that enlarges a style without declaring
+> itself fails the check, and so does a declaration with no layer behind it.
+
 ### Layers OpenMapTiles cannot satisfy — none were present
 
 The four names the brief flagged as genuinely absent from OpenMapTiles —

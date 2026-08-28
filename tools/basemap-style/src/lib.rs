@@ -75,15 +75,19 @@ pub const ABSENT_FROM_OMT: [&str; 4] = [
 
 /// Source layers dropped on purpose, each with the reason.
 ///
-/// `housenumber` paints `"text-color": "transparent"` and
-/// `"text-halo-color": "transparent"` in both Dark Matter and Positron, so it
-/// costs a full symbol pass over the densest layer in the tile to render
-/// nothing at all.
-pub const DELIBERATE_DROPS: [(&str, &str); 1] = [(
-    "housenumber",
-    "text-color and text-halo-color are both \"transparent\" in both themes, \
-     so the layer renders nothing",
-)];
+/// Empty since 2026-08-28. It held one entry, `housenumber`, because CARTO
+/// painted its `text-color` and `text-halo-color` `transparent` in both Dark
+/// Matter and Positron, so the layer cost a full symbol pass over the densest
+/// layer in the tile to render nothing. That was CARTO's minimal-backdrop
+/// aesthetic, inherited rather than chosen, and these styles have been owned
+/// source since 2026-08-27: `www/styles/*.json` now carry their own
+/// `housenumber` layer with a visible colour, recorded in each style's
+/// `metadata."squallar:restored-layers"`.
+///
+/// The array stays, rather than the concept being deleted, because the drop
+/// mechanism is still the thing that would account for a future decision not
+/// to carry some upstream layer. Nothing is dropped today.
+pub const DELIBERATE_DROPS: [(&str, &str); 0] = [];
 
 /// The key each output layer carries its render phase under.
 ///
@@ -738,24 +742,48 @@ pub fn check(style: &Value, expectation: &Expectation) -> Vec<Finding> {
         return findings;
     };
 
-    // 1. Layer count is preserved, minus the drops, each named.
+    // 1. Every layer is accounted for: `upstream - dropped + added`.
+    //
+    //    The original form was `upstream - dropped`, which assumed our styles
+    //    are a strict subset of CARTO's. They stopped being one when the first
+    //    layer CARTO never styled was written by hand. The intent -- nothing is
+    //    silently lost, and now nothing is silently gained either -- survives
+    //    the change, and this form is strictly stronger: an addition that does
+    //    not declare itself in `squallar:added-layers` makes the count
+    //    disagree, so a hand edit cannot quietly enlarge the style.
+    //
+    //    A layer that fills an upstream slot with our own styling is neither a
+    //    drop nor an addition -- it is recorded in `squallar:restored-layers`
+    //    and does not move this count.
     let dropped_layers = layers_drawing_from(style, &expectation.deliberate_drops);
-    let expected = expectation.input_layers - dropped_layers;
+    let added_layers = declared_additions(style);
+    let expected = expectation.input_layers - dropped_layers + added_layers;
     if layers.len() != expected {
-        findings.push(Finding(format!(
-            "layer count is {}, expected {} ({} upstream minus {} deliberately dropped: {})",
-            layers.len(),
-            expected,
-            expectation.input_layers,
-            dropped_layers,
+        let dropped_detail = if expectation.deliberate_drops.is_empty() {
+            "none".to_owned()
+        } else {
             expectation
                 .deliberate_drops
                 .iter()
                 .map(|(sl, why)| format!("`{sl}` ({why})"))
                 .collect::<Vec<_>>()
-                .join(", "),
+                .join(", ")
+        };
+        findings.push(Finding(format!(
+            "layer count is {}, expected {} ({} upstream minus {} deliberately dropped ({}) \
+             plus {} declared in `squallar:added-layers`). An addition that is not declared \
+             there, or a declaration with no layer behind it, lands here.",
+            layers.len(),
+            expected,
+            expectation.input_layers,
+            dropped_layers,
+            dropped_detail,
+            added_layers,
         )));
     }
+
+    // 1b. And each of those declarations points at a real layer, with a reason.
+    findings.extend(declaration_findings(style, layers));
 
     for (index, layer) in layers.iter().enumerate() {
         let id = layer
@@ -819,6 +847,71 @@ pub fn check(style: &Value, expectation: &Expectation) -> Vec<Finding> {
         }
     }
 
+    findings
+}
+
+/// The metadata key each hand-written addition declares itself under.
+pub const ADDED_KEY: &str = "squallar:added-layers";
+
+/// The metadata key a layer filling an upstream slot with our own styling uses.
+pub const RESTORED_KEY: &str = "squallar:restored-layers";
+
+/// How many layers the style declares it added beyond the upstream document.
+///
+/// Read off the document, like every other input to [`check`], so the expected
+/// count is derived from what the style says about itself rather than from a
+/// number kept somewhere else that can drift away from it.
+fn declared_additions(style: &Value) -> usize {
+    style
+        .get("metadata")
+        .and_then(|m| m.get(ADDED_KEY))
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len)
+}
+
+/// Every declared addition and restoration names a layer that exists and says
+/// why it is there.
+///
+/// Without this the count in [`check`] is gameable from the wrong side: a bare
+/// `squallar:added-layers` entry raises the expected total by one, so an
+/// undeclared layer could be "declared" by an entry naming nothing at all. Each
+/// declaration has to point at a real layer and carry a reason.
+fn declaration_findings(style: &Value, layers: &[Value]) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let ids: Vec<&str> = layers
+        .iter()
+        .filter_map(|l| l.get("id").and_then(Value::as_str))
+        .collect();
+
+    for key in [ADDED_KEY, RESTORED_KEY] {
+        let Some(entries) = style
+            .get("metadata")
+            .and_then(|m| m.get(key))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for entry in entries {
+            let id = entry.get("id").and_then(Value::as_str);
+            match id {
+                None => findings.push(Finding(format!("an entry in `{key}` names no `id`"))),
+                Some(id) if !ids.contains(&id) => findings.push(Finding(format!(
+                    "`{key}` declares `{id}`, but no layer by that id exists"
+                ))),
+                Some(_) => {}
+            }
+            if !entry
+                .get("reason")
+                .and_then(Value::as_str)
+                .is_some_and(|r| !r.trim().is_empty())
+            {
+                findings.push(Finding(format!(
+                    "`{key}` entry `{}` carries no reason",
+                    id.unwrap_or("<no id>")
+                )));
+            }
+        }
+    }
     findings
 }
 

@@ -22,15 +22,19 @@ use walkers::{Context, Filter, Layer, Style};
 
 /// How many layers each committed style carries.
 ///
-/// 93 upstream minus the one `housenumber` layer named in `DELIBERATE_DROPS`.
-const EXPECTED_LAYERS: usize = 92;
+/// 93 upstream, nothing dropped, plus the two layers CARTO never styled that
+/// `metadata."squallar:added-layers"` declares (`aerodrome_label`,
+/// `mountain_peak`). `housenumber` is not among them: CARTO's 93 already
+/// contained a housenumber layer and ours fills that slot restyled, which
+/// `metadata."squallar:restored-layers"` records.
+const EXPECTED_LAYERS: usize = 95;
 
 /// The upstream layer count both CARTO inputs had.
 const UPSTREAM_LAYERS: usize = 93;
 
 /// Ground and label layers, which must together account for every layer.
 const EXPECTED_GROUND: usize = 66;
-const EXPECTED_LABEL: usize = 26;
+const EXPECTED_LABEL: usize = 29;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -86,7 +90,7 @@ fn source_layer_of(layer: &Layer) -> Option<&str> {
 /// The parse is the strongest single signal available, because
 /// `walkers::style::Style` is a `Vec` of an internally-tagged enum: one layer
 /// with an unknown `type`, or a `fill` missing its `paint`, takes the whole
-/// document down. "It parsed" therefore means all 92 layers are shaped the way
+/// document down. "It parsed" therefore means all 95 layers are shaped the way
 /// the renderer requires.
 ///
 /// That the failure mode is real rather than assumed is pinned by
@@ -103,36 +107,84 @@ fn both_committed_styles_parse_as_walkers_styles() {
     }
 }
 
-/// The layer count is preserved across the transform, minus drops named by
-/// source layer in `DELIBERATE_DROPS` and recorded in each style's own
-/// `metadata`.
+/// Every layer is accounted for: `upstream - dropped + added`.
+///
+/// This replaced `upstream - dropped` on 2026-08-28. That form encoded an
+/// assumption that stopped being true the moment a layer CARTO never styled was
+/// written by hand: that our styles are a strict subset of CARTO's. The
+/// *intent* was "nothing is silently lost", and it survives intact -- what the
+/// new term adds is that nothing is silently gained either.
+///
+/// It is strictly stronger than the count it replaces, because the additions
+/// are read from the document rather than from a constant here: a hand edit
+/// that adds a layer without declaring it in `squallar:added-layers` makes the
+/// two sides disagree, and so does a declaration with no layer behind it.
+///
+/// A layer filling an upstream slot with our own styling is neither dropped nor
+/// added and does not move this count; `squallar:restored-layers` records it,
+/// and every entry there still has to name a real layer and carry a reason.
 #[test]
-fn the_layer_count_is_preserved_minus_the_named_drops() {
+fn every_layer_is_accounted_for_as_upstream_minus_dropped_plus_added() {
     for theme in themes() {
         let style = style_json(theme);
-        let upstream = style["metadata"]["squallar:upstream-layers"]
+        let metadata = &style["metadata"];
+        let upstream = metadata["squallar:upstream-layers"]
             .as_u64()
-            .expect("the style records its upstream layer count");
-        let dropped = style["metadata"]["squallar:dropped-layers"]
+            .expect("the style records its upstream layer count") as usize;
+        let dropped = metadata["squallar:dropped-layers"]
             .as_array()
             .expect("the style records what it dropped");
+        let added = metadata["squallar:added-layers"]
+            .as_array()
+            .expect("the style records what it added");
+        let restored = metadata["squallar:restored-layers"]
+            .as_array()
+            .expect("the style records what it restored");
         let layers = style["layers"].as_array().expect("layers is an array");
 
-        assert_eq!(upstream as usize, UPSTREAM_LAYERS, "{theme}");
-        assert_eq!(dropped.len(), 1, "{theme}: exactly one deliberate drop");
-        assert_eq!(
-            dropped[0]["source-layer"], "housenumber",
-            "{theme}: the drop is named"
-        );
-        assert!(
-            dropped[0]["reason"].as_str().is_some_and(|r| !r.is_empty()),
-            "{theme}: the drop carries its reason"
-        );
+        assert_eq!(upstream, UPSTREAM_LAYERS, "{theme}");
         assert_eq!(
             layers.len(),
-            upstream as usize - dropped.len(),
-            "{theme}: layers lost that nothing accounts for"
+            upstream - dropped.len() + added.len(),
+            "{theme}: layers that nothing accounts for"
         );
+
+        // Every declaration names a real layer and says why. Without this the
+        // arithmetic above is gameable from the other side: a bare entry
+        // raises the expected total, so an undeclared layer could be
+        // "declared" by an entry that names nothing at all.
+        let ids: Vec<&str> = layers.iter().filter_map(|l| l["id"].as_str()).collect();
+        for (key, entries) in [
+            ("squallar:dropped-layers", dropped),
+            ("squallar:added-layers", added),
+            ("squallar:restored-layers", restored),
+        ] {
+            for entry in entries {
+                let id = entry["id"].as_str().unwrap_or_else(|| {
+                    panic!("{theme}: an entry in `{key}` names no id");
+                });
+                // A drop names a layer that is gone; the other two name layers
+                // that are present.
+                if key != "squallar:dropped-layers" {
+                    assert!(
+                        ids.contains(&id),
+                        "{theme}: `{key}` declares `{id}`, which no layer provides"
+                    );
+                }
+                assert!(
+                    entry["source-layer"]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty()),
+                    "{theme}: `{key}` entry `{id}` names no source layer"
+                );
+                assert!(
+                    entry["reason"]
+                        .as_str()
+                        .is_some_and(|r| !r.trim().is_empty()),
+                    "{theme}: `{key}` entry `{id}` carries no reason"
+                );
+            }
+        }
     }
 }
 
@@ -269,6 +321,19 @@ fn every_filter_key_exists_in_the_openmaptiles_data() {
         ("water_name", &["class", "intermittent", "name"][..]),
         ("waterway", &["class", "name"][..]),
         ("building", &[][..]),
+        // The three layers the styles gained on 2026-08-28. Same 42-tile
+        // corpus, same `u5corpus-keys.tsv`, name-translation variants
+        // (`name:xx`, `name_de`, `name_en`, `name_int`) excluded exactly as
+        // the rows above exclude them.
+        ("housenumber", &["housenumber"][..]),
+        (
+            "mountain_peak",
+            &["class", "customary_ft", "ele", "ele_ft", "name", "rank"][..],
+        ),
+        (
+            "aerodrome_label",
+            &["class", "ele", "ele_ft", "iata", "icao", "name"][..],
+        ),
     ]);
 
     for theme in themes() {
@@ -393,7 +458,7 @@ fn a_folded_zoom_range_gates_the_layer_through_the_real_evaluator() {
 ///
 /// The structural companion to
 /// [`a_folded_zoom_range_gates_the_layer_through_the_real_evaluator`], which
-/// proves one layer gates. This one proves none of the other 83 were missed.
+/// proves one layer gates. This one proves none of the other 86 were missed.
 #[test]
 fn every_layer_with_a_zoom_range_folded_it_into_its_filter() {
     for theme in themes() {
@@ -423,7 +488,7 @@ fn every_layer_with_a_zoom_range_folded_it_into_its_filter() {
                 );
             }
         }
-        assert_eq!(folded, 84, "{theme}: layers carrying a minzoom");
+        assert_eq!(folded, 87, "{theme}: layers carrying a minzoom");
     }
 }
 
@@ -630,32 +695,55 @@ fn a_silently_dropped_layer_is_rejected() {
     );
 }
 
-/// A layer smuggled in beyond the upstream count is rejected too.
+/// A declaration naming no layer is rejected.
 ///
-/// The count check has to fail in both directions or it only catches half of
-/// what it looks like it catches.
+/// This is the half the `+ added` term introduced: the declaration cannot be a
+/// bare number that buys a layer nobody has to justify. Without it the count is
+/// gameable from the wrong side -- an entry raises the expected total, so an
+/// undeclared layer could be "declared" by an entry naming nothing at all.
+///
+/// It took the slot of the test that pinned `housenumber` against the
+/// deliberate-drop list, which lost its subject when `housenumber` came off
+/// `DELIBERATE_DROPS` on 2026-08-28. That mechanism is still checked: rule 3 of
+/// `check` still rejects any source layer on the drop list, and
+/// [`a_silently_dropped_layer_is_rejected`] still pins the count direction.
 #[test]
-fn a_layer_added_beyond_the_upstream_count_is_rejected() {
+fn a_declared_addition_naming_no_layer_is_rejected() {
+    let mut broken = style_json("dark");
+    broken["metadata"]["squallar:added-layers"]
+        .as_array_mut()
+        .expect("added-layers")
+        .push(json!({
+            "id": "a_layer_that_does_not_exist",
+            "source-layer": "poi",
+            "reason": "a declaration with nothing behind it",
+        }));
+    let findings = check(&broken, &expectation());
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.0.contains("no layer by that id exists")),
+        "a declaration naming no layer was accepted: {findings:?}"
+    );
+}
+
+/// An addition that does not declare itself is rejected.
+///
+/// The direction that matters most for hand-edited source: a layer appended to
+/// `layers` with no matching `squallar:added-layers` entry makes the count
+/// disagree, so the style cannot quietly grow. Together with
+/// [`a_silently_dropped_layer_is_rejected`] this is the count check failing in
+/// both directions, which it has to do or it catches half of what it looks
+/// like it catches.
+#[test]
+fn an_undeclared_addition_is_rejected() {
     let mut broken = style_json("dark");
     let extra = broken["layers"][5].clone();
     broken["layers"].as_array_mut().expect("layers").push(extra);
     let findings = check(&broken, &expectation());
     assert!(
         findings.iter().any(|f| f.0.contains("layer count")),
-        "an extra layer was accepted: {findings:?}"
-    );
-}
-
-/// A deliberately dropped source layer coming back is rejected.
-#[test]
-fn a_resurrected_housenumber_layer_is_rejected() {
-    let broken = dark_with_layer_field("building", "source-layer", json!("housenumber"));
-    let findings = check(&broken, &expectation());
-    assert!(
-        findings
-            .iter()
-            .any(|f| f.0.contains("deliberate-drop list")),
-        "a resurrected `housenumber` layer was accepted: {findings:?}"
+        "an undeclared addition was accepted: {findings:?}"
     );
 }
 
@@ -739,7 +827,7 @@ fn a_surviving_text_field_token_is_rejected() {
 ///
 /// This is what makes [`both_committed_styles_parse_as_walkers_styles`] worth
 /// running: `Style` is a `Vec` of an internally-tagged enum, so the parse is
-/// all-or-nothing across all 92 layers rather than a per-layer best effort.
+/// all-or-nothing across all 95 layers rather than a per-layer best effort.
 #[test]
 fn one_unparseable_layer_fails_the_entire_style_parse() {
     let mut broken = style_json("dark");
