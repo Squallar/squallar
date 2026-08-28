@@ -6,19 +6,26 @@
 //! disk. It is where retry-on-200 and the absence/failure distinction are
 //! gated, so those never depend on a fixture being present.
 //!
-//! The **archive** half runs against a real 151 MB Oklahoma build at
-//! [`DEFAULT_ARCHIVE`], which is deliberately *not* in the repository. A
-//! checked-in toy archive would be the wrong instrument for the questions here
-//! — that build has `n_addressed_tiles` 65,953, `n_tile_entries` 65,913 and
-//! `n_tile_contents` 65,768, three different numbers, which is what makes it
+//! The **archive** half runs against the Monaco build committed at
+//! [`DEFAULT_ARCHIVE`], so it runs everywhere rather than only on a workstation
+//! that happens to hold a regional build. Small is not the same as toy: that
+//! archive has `n_addressed_tiles` 246, `n_tile_entries` 157 and
+//! `n_tile_contents` 108, three different numbers, which is what makes it
 //! exercise both of PMTiles' dedup mechanisms rather than neither.
 //!
-//! **When the archive is missing those tests skip rather than fail, and the
-//! skip is shouted.** A green run that tested nothing is the failure mode being
-//! designed out here, so [`skip_banner`] writes straight to the process's
-//! stderr handle rather than through `eprintln!`: libtest captures the macro
-//! and hides it behind `--nocapture`, and a skip notice nobody sees is not a
-//! notice.
+//! What it cannot exercise is the leaf-directory path. All 246 tiles fit in a
+//! 511-byte root directory, so the archive has no leaves, and a test about what
+//! reading one costs has no second read to count. Pointing [`ARCHIVE_ENV`] at a
+//! larger build runs [`directory_cache_is_load_bearing`] for real; the
+//! coordinate-driven tests read their seed point out of whatever archive they
+//! were handed, so they follow the override rather than breaking under it.
+//!
+//! **When a test cannot assert the thing it exists to assert it skips rather
+//! than passing quietly, and the skip is shouted.** A green run that tested
+//! nothing is the failure mode being designed out here, so [`skip_banner`]
+//! writes straight to the process's stderr handle rather than through
+//! `eprintln!`: libtest captures the macro and hides it behind `--nocapture`,
+//! and a skip notice nobody sees is not a notice.
 
 use std::io::Write as _;
 use std::net::{TcpListener, TcpStream};
@@ -37,28 +44,35 @@ use super::{
 // The real archive, and the loud skip
 // ---------------------------------------------------------------------------
 
-/// Where the Oklahoma build lands by default. Overridable so this is not
-/// wired to one workstation's home directory.
-const DEFAULT_ARCHIVE: &str = "/home/reddragon/basemap-build/oklahoma.pmtiles";
+/// The committed Monaco fixture, resolved through `CARGO_MANIFEST_DIR` so the
+/// suite finds it whatever directory it was invoked from. `testdata/README.md`
+/// records how it was built and why it never needs rebuilding.
+const DEFAULT_ARCHIVE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/monaco.pmtiles");
 
-/// Environment variable naming a different archive.
+/// Environment variable naming a different archive, so the same suite can be
+/// pointed at a full regional build.
 const ARCHIVE_ENV: &str = "SQUALLAR_PMTILES_ARCHIVE";
 
-/// Byte length of the Oklahoma build, as measured at 5a.
-const OKLAHOMA_BYTES: u64 = 151_260_004;
+/// Byte length of the committed fixture.
+const MONACO_BYTES: u64 = 419_355;
 
-/// The three dedup counters of the Oklahoma build. All three differ, which is
-/// the property that makes it a non-trivial input.
-const OKLAHOMA_ADDRESSED_TILES: u64 = 65_953;
-/// See [`OKLAHOMA_ADDRESSED_TILES`].
-const OKLAHOMA_TILE_ENTRIES: u64 = 65_913;
-/// See [`OKLAHOMA_ADDRESSED_TILES`].
-const OKLAHOMA_TILE_CONTENTS: u64 = 65_768;
+/// The three dedup counters of the fixture. All three differ, which is the
+/// property that makes it a non-trivial input: `run_length` collapsing
+/// consecutive ids is the first gap and content-hashing collapsing non-adjacent
+/// ones is the second, so an input where the three agreed would exercise
+/// neither dedup mechanism and the header pins would prove much less than they
+/// look like they do.
+const MONACO_ADDRESSED_TILES: u64 = 246;
+/// See [`MONACO_ADDRESSED_TILES`].
+const MONACO_TILE_ENTRIES: u64 = 157;
+/// See [`MONACO_ADDRESSED_TILES`].
+const MONACO_TILE_CONTENTS: u64 = 108;
 
-/// Oklahoma City, near the centre of the archive's coverage.
-const OKC_LON: f64 = -97.5164;
-/// See [`OKC_LON`].
-const OKC_LAT: f64 = 35.4676;
+/// The centre point the fixture's header declares, inside a bounding box of
+/// lon 7.408583..7.595671 and lat 43.483817..43.752930.
+const MONACO_LON: f64 = 7.502_127;
+/// See [`MONACO_LON`].
+const MONACO_LAT: f64 = 43.618_373_5;
 
 /// The path to test against, if there is one.
 fn archive_path() -> PathBuf {
@@ -70,18 +84,32 @@ fn archive_path() -> PathBuf {
 /// Straight at the stderr handle: `eprintln!` goes through libtest's output
 /// capture and would be swallowed on a passing test, which is precisely the
 /// "green run that tested nothing" this exists to prevent.
-fn skip_banner(test: &str, path: &Path) {
+///
+/// `reason` and `remedy` are arguments rather than one fixed message because
+/// there is more than one way for a test here to have nothing to run against —
+/// no archive at all, or an archive that cannot exercise this particular test —
+/// and the two call for different fixes. A reader who cannot tell them apart
+/// will apply neither.
+fn skip_banner(test: &str, reason: &str, remedy: &str) {
     let mut stderr = std::io::stderr().lock();
     let _ = writeln!(
         stderr,
         "\n\
          ###########################################################################\n\
          ## SKIPPED, NOT PASSED: {test}\n\
-         ##   no PMTiles archive at {}\n\
-         ##   this test asserted NOTHING. Build the archive, or point {ARCHIVE_ENV}\n\
-         ##   at one, before reading this suite as covering the reader.\n\
-         ###########################################################################",
-        path.display()
+         ##   {reason}\n\
+         ##   this test asserted NOTHING. {remedy}\n\
+         ##   before reading this suite as covering the reader.\n\
+         ###########################################################################"
+    );
+}
+
+/// The "there is nothing on disk" skip, phrased once.
+fn no_archive_banner(test: &str, path: &Path) {
+    skip_banner(
+        test,
+        &format!("no PMTiles archive at {}", path.display()),
+        &format!("Restore the committed fixture, or point {ARCHIVE_ENV} at an archive,"),
     );
 }
 
@@ -89,11 +117,41 @@ fn skip_banner(test: &str, path: &Path) {
 fn open_archive_file(test: &str) -> Option<FileRangeSource> {
     let path = archive_path();
     if !path.is_file() {
-        skip_banner(test, &path);
+        no_archive_banner(test, &path);
         return None;
     }
 
     Some(FileRangeSource::open(&path).expect("an existing archive file should open"))
+}
+
+/// Byte length of the archive's leaf directories, read straight out of the
+/// PMTiles v3 header: bytes 48..56, a little-endian `u64`.
+///
+/// By hand because `pmtiles::Header` does not expose it, and
+/// [`directory_cache_is_load_bearing`] cannot tell whether it has been handed a
+/// usable input without it. Zero means every tile is addressed from the root
+/// directory, so there is no second read for the cache to save.
+fn leaf_directory_len(path: &Path) -> u64 {
+    let mut file = std::fs::File::open(path).expect("an existing archive file should open");
+    let mut header = [0_u8; 56];
+    std::io::Read::read_exact(&mut file, &mut header)
+        .expect("a PMTiles archive is at least a 127-byte header");
+    u64::from_le_bytes(
+        header[48..56]
+            .try_into()
+            .expect("a fixed eight-byte slice is a [u8; 8]"),
+    )
+}
+
+/// The centre point the archive itself declares.
+///
+/// From the header rather than hardcoded so the coordinate tests survive
+/// [`ARCHIVE_ENV`]: a constant over Monaco is not in an Oklahoma build, and a
+/// test that reddened on that would be reddening for a reason with nothing to
+/// do with the reader under test.
+fn archive_centre<S: super::ArchiveRangeSource>(archive: &BasemapArchive<S>) -> (f64, f64) {
+    let header = archive.header();
+    (header.center_longitude, header.center_latitude)
 }
 
 /// A client that can reach the cleartext loopback server.
@@ -416,11 +474,18 @@ fn the_header_matches_the_built_archive() {
     let Some(source) = open_archive_file("the_header_matches_the_built_archive") else {
         return;
     };
-    assert_eq!(
-        source.len(),
-        OKLAHOMA_BYTES,
-        "the archive on disk is not the 5a build; the pins below describe that one"
-    );
+    // Every pin below describes the committed fixture specifically, so an
+    // overridden archive is not a failure here -- it is a different archive,
+    // and asserting Monaco's counters against it would say nothing about the
+    // reader.
+    if source.len() != MONACO_BYTES {
+        skip_banner(
+            "the_header_matches_the_built_archive",
+            "the archive under test is not the committed Monaco fixture",
+            &format!("Unset {ARCHIVE_ENV} to pin the fixture these constants describe,"),
+        );
+        return;
+    }
 
     let archive = block_on(BasemapArchive::open(source)).expect("the archive should open");
     let header = archive.header();
@@ -430,7 +495,7 @@ fn the_header_matches_the_built_archive() {
     assert_eq!(archive.max_zoom(), 14);
     assert_eq!(archive.tile_type(), TileType::Mvt);
     assert_eq!(archive.tile_compression(), Compression::Gzip);
-    assert!(header.clustered(), "the 5a build is clustered");
+    assert!(header.clustered(), "the fixture is clustered");
 
     let counters = (
         header.n_addressed_tiles().map(std::num::NonZeroU64::get),
@@ -440,10 +505,25 @@ fn the_header_matches_the_built_archive() {
     assert_eq!(
         counters,
         (
-            Some(OKLAHOMA_ADDRESSED_TILES),
-            Some(OKLAHOMA_TILE_ENTRIES),
-            Some(OKLAHOMA_TILE_CONTENTS),
+            Some(MONACO_ADDRESSED_TILES),
+            Some(MONACO_TILE_ENTRIES),
+            Some(MONACO_TILE_CONTENTS),
         ),
+    );
+
+    assert_eq!(
+        (header.center_longitude, header.center_latitude),
+        (MONACO_LON, MONACO_LAT),
+        "the seed point the coordinate tests read out of the header"
+    );
+
+    // Pinned rather than described in a comment, because it is the fact
+    // `directory_cache_is_load_bearing` skips on and prose is not evidence.
+    assert_eq!(
+        leaf_directory_len(&archive_path()),
+        0,
+        "the fixture's 246 tiles all fit in its 511-byte root directory, so it has no leaf \
+         directories at all"
     );
 }
 
@@ -454,8 +534,8 @@ fn the_header_matches_the_built_archive() {
 /// the three counters were equal would exercise neither dedup mechanism and the
 /// header pins above would prove much less than they look like they do.
 const _: () = {
-    assert!(OKLAHOMA_ADDRESSED_TILES > OKLAHOMA_TILE_ENTRIES);
-    assert!(OKLAHOMA_TILE_ENTRIES > OKLAHOMA_TILE_CONTENTS);
+    assert!(MONACO_ADDRESSED_TILES > MONACO_TILE_ENTRIES);
+    assert!(MONACO_TILE_ENTRIES > MONACO_TILE_CONTENTS);
 };
 
 /// A tile the archive holds comes back present, decompressed, and non-empty.
@@ -467,14 +547,15 @@ fn a_tile_the_archive_holds_comes_back_decompressed() {
 
     let archive = block_on(BasemapArchive::open(source)).expect("the archive should open");
     let z = archive.max_zoom();
-    let x = squallar_geo::lon_to_tile_x(OKC_LON, z);
-    let y = squallar_geo::lat_to_tile_y(OKC_LAT, z);
+    let (lon, lat) = archive_centre(&archive);
+    let x = squallar_geo::lon_to_tile_x(lon, z);
+    let y = squallar_geo::lat_to_tile_y(lat, z);
 
     let tile = block_on(archive.tile(z, x, y)).expect("reading a covered tile should succeed");
 
-    let bytes = tile
-        .bytes()
-        .unwrap_or_else(|| panic!("{z}/{x}/{y} is over Oklahoma City and must be in the archive"));
+    let bytes = tile.bytes().unwrap_or_else(|| {
+        panic!("{z}/{x}/{y} is the archive's own declared centre and must be in it")
+    });
     assert!(!bytes.is_empty(), "an MVT tile is not zero bytes");
     assert_ne!(
         &bytes[..2],
@@ -495,7 +576,7 @@ fn a_tile_outside_the_coverage_is_absent_rather_than_an_error() {
 
     let archive = block_on(BasemapArchive::open(source)).expect("the archive should open");
     let z = archive.max_zoom();
-    // Mid-Atlantic, thousands of kilometres from Oklahoma.
+    // Mid-Atlantic: outside any regional build this suite is pointed at.
     let x = squallar_geo::lon_to_tile_x(-30.0, z);
     let y = squallar_geo::lat_to_tile_y(25.0, z);
 
@@ -504,7 +585,7 @@ fn a_tile_outside_the_coverage_is_absent_rather_than_an_error() {
     assert_eq!(
         tile,
         TileBytes::Absent,
-        "{z}/{x}/{y} is in the Atlantic and a regional archive should simply not hold it"
+        "{z}/{x}/{y} is open ocean and a regional archive should simply not hold it"
     );
 }
 
@@ -530,8 +611,9 @@ fn a_failing_source_errors_and_is_never_reported_as_absence() {
         .expect("the opening read is served, so the archive should open");
 
     let z = archive.max_zoom();
-    let x = squallar_geo::lon_to_tile_x(OKC_LON, z);
-    let y = squallar_geo::lat_to_tile_y(OKC_LAT, z);
+    let (lon, lat) = archive_centre(&archive);
+    let x = squallar_geo::lon_to_tile_x(lon, z);
+    let y = squallar_geo::lat_to_tile_y(lat, z);
     assert_eq!(
         healthy.load(Ordering::Relaxed),
         0,
@@ -568,17 +650,35 @@ fn directory_cache_is_load_bearing() {
         return;
     };
 
+    // The committed fixture cannot run this one, and weakening the assertion so
+    // that it could would be worse than not running it: a test that passes on
+    // an input which cannot exercise it is a green light for nothing. So this
+    // skips as loudly as a missing archive does, and says which of the two it
+    // is.
+    if leaf_directory_len(&archive_path()) == 0 {
+        skip_banner(
+            "directory_cache_is_load_bearing",
+            "THIS ARCHIVE HAS NO LEAF DIRECTORIES: every tile is addressed from the root",
+            &format!(
+                "There is no second read to save, so point {ARCHIVE_ENV} at a build large \
+                 enough to have leaves,"
+            ),
+        );
+        return;
+    }
+
     let (source, reads) = CountingSource::new(inner);
     let archive = block_on(BasemapArchive::open(source)).expect("the archive should open");
 
     let z = archive.max_zoom();
-    let x = squallar_geo::lon_to_tile_x(OKC_LON, z);
-    let y = squallar_geo::lat_to_tile_y(OKC_LAT, z);
+    let (lon, lat) = archive_centre(&archive);
+    let x = squallar_geo::lon_to_tile_x(lon, z);
+    let y = squallar_geo::lat_to_tile_y(lat, z);
 
-    // First fetch: leaf directory plus tile body. This is what establishes the
-    // archive is deep enough to have leaves at all -- on a directory-free
-    // archive it would cost one read and the second half of this test would be
-    // vacuous.
+    // First fetch: leaf directory plus tile body. The skip above establishes
+    // the archive has leaves at all; this establishes that the seed tile
+    // actually sits behind one, rather than in the part of the tree the root
+    // directory still addresses directly.
     let before_first = reads.load(Ordering::SeqCst);
     let first = block_on(archive.tile(z, x, y)).expect("the first tile should read");
     assert!(first.is_present(), "the seed tile must be in the archive");
@@ -586,8 +686,8 @@ fn directory_cache_is_load_bearing() {
     assert!(
         first_cost >= 2,
         "the first fetch should pay for a leaf directory as well as the tile; it cost \
-         {first_cost} reads, so this archive has no leaf directories and the assertion below \
-         would prove nothing"
+         {first_cost} reads, so this seed tile is addressed from the root and the assertion \
+         below would prove nothing"
     );
 
     // Second fetch, a neighbour in the same leaf: the tile body only.
@@ -610,7 +710,7 @@ fn directory_cache_is_load_bearing() {
 fn the_same_reader_opens_over_http_and_over_a_file() {
     let path = archive_path();
     if !path.is_file() {
-        skip_banner("the_same_reader_opens_over_http_and_over_a_file", &path);
+        no_archive_banner("the_same_reader_opens_over_http_and_over_a_file", &path);
         return;
     }
 
@@ -620,9 +720,11 @@ fn the_same_reader_opens_over_http_and_over_a_file() {
     .expect("the file-backed archive should open");
 
     // The loopback server serves the archive's opening bytes: enough for the
-    // header and root directory, which is what `open` reads.
+    // header and root directory, which is what `open` reads. Clamped, because
+    // the committed fixture is smaller than this ceiling and a bare slice would
+    // panic on it rather than test anything.
     let head = std::fs::read(&path)
-        .map(|whole| whole[..1 << 20].to_vec())
+        .map(|whole| whole[..whole.len().min(1 << 20)].to_vec())
         .expect("the archive should be readable");
     let server = RangeServer::start(head, 0, Answer::Range);
     let from_http = block_on(BasemapArchive::open(
