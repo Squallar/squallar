@@ -410,6 +410,16 @@ jobs:
               cargo check -p squallar-egui --all-targets \
                 --target x86_64-unknown-linux-gnu \
                 --features squallar-egui/basemap-vector
+              # And RUN them. The feature gates 13 tests that the default
+              # workspace suite cannot see -- `cargo test --workspace -- --list`
+              # selects 0 of them -- so without this line the archive reader
+              # ships with a green board and zero executed assertions. That is
+              # the same shape as a `running 0 tests` pass, one layer up.
+              # The wasm row above stays check-only because its tests cannot be
+              # executed on the host.
+              cargo test -p squallar-egui \
+                --target x86_64-unknown-linux-gnu \
+                --features squallar-egui/basemap-vector
               out=$(cargo tree -i pmtiles -p squallar-egui \
                 --target x86_64-unknown-linux-gnu -e normal --prefix none \
                 --features squallar-egui/basemap-vector)
