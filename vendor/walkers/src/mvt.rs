@@ -501,37 +501,18 @@ fn symbol_text_size(context: &Context, layout: &Layout) -> f32 {
         .unwrap_or(12.0)
 }
 
-/// A symbol layer's glyph colour, halo colour and halo width.
+/// A symbol layer's glyph colour.
 ///
-/// The halo half is what the `MultiPoint` arm never had: it passed
-/// `Color32::TRANSPARENT` unconditionally, so a *point* label -- which is every
-/// place name on the map -- drew with no halo at all however loudly the style
-/// asked for one, while only line labels got the half-alpha box. Both arms read
-/// the same three properties now.
-fn symbol_colors(context: &Context, paint: &Option<Paint>) -> (Color32, Color32, f32) {
-    let Some(paint) = paint else {
-        // Defaults from the MapLibre spec: black text, and a halo that is
-        // transparent and zero-width, i.e. none.
-        return (Color32::BLACK, Color32::TRANSPARENT, 0.0);
-    };
-
-    let text_color = paint
-        .text_color
+/// `text-halo-color` and `text-halo-width` are deliberately not read here.
+/// Nothing draws a halo -- see [`crate::text::Text::shape`] for why -- and
+/// carrying them onto every [`Text`] so that no consumer could use them was
+/// paying for the field on every label to no effect.
+fn symbol_text_color(context: &Context, paint: &Option<Paint>) -> Color32 {
+    // Default from the MapLibre spec.
+    paint
         .as_ref()
-        .map_or(Color32::BLACK, |color| color.evaluate(context));
-
-    let halo_color = paint
-        .text_halo_color
-        .as_ref()
-        .map_or(Color32::TRANSPARENT, |color| color.evaluate(context));
-
-    // MapLibre's default is 0 -- no halo unless one is asked for.
-    let halo_width = paint
-        .text_halo_width
-        .as_ref()
-        .map_or(0.0, |width| width.evaluate(context));
-
-    (text_color, halo_color, halo_width)
+        .and_then(|paint| paint.text_color.as_ref())
+        .map_or(Color32::BLACK, |color| color.evaluate(context))
 }
 
 /// A symbol layer's wrapping, in ems: `(text-max-width, text-line-height)`.
@@ -577,21 +558,13 @@ fn render_symbol(
     };
 
     let text_size = symbol_text_size(context, layout);
-    let (text_color, halo_color, halo_width) = symbol_colors(context, paint);
+    let text_color = symbol_text_color(context, paint);
     let (max_width_ems, line_height_ems) = symbol_wrapping(context, layout);
 
     let label = |position, angle, wrap: bool| {
         ShapeOrText::Text(
-            Text::new(
-                position,
-                text.clone(),
-                text_size,
-                text_color,
-                halo_color,
-                angle,
-            )
-            .with_halo_width(halo_width)
-            .with_wrapping(wrap.then_some(max_width_ems).flatten(), line_height_ems),
+            Text::new(position, text.clone(), text_size, text_color, angle)
+                .with_wrapping(wrap.then_some(max_width_ems).flatten(), line_height_ems),
         )
     };
 
@@ -1182,30 +1155,28 @@ mod tests {
     /// something other than what the eager conversion returned, a colour, a
     /// width or a label moves and this goes red.
     ///
-    /// **Re-recorded once, on 2026-08-28, for the label-fidelity changes.**
-    /// Every difference from the previous recording was attributed before it
-    /// was accepted, and they are these six and nothing else:
+    /// **Re-recorded twice on 2026-08-28**, and the second recording undid part
+    /// of the first. Against the recording that predates both, every surviving
+    /// difference is one of these three and nothing else:
     ///
-    /// 1. `background_color` is spelled `halo_color`. A rename; see
-    ///    [`crate::text::Text`].
-    /// 2. `halo_width: 0.0` is new, and `0.0` is right for this fixture: its
-    ///    style sets `text-halo-color` and no `text-halo-width`, and MapLibre's
-    ///    default for that property is 0. A style asking for a halo colour
-    ///    without a width gets no halo, here as there.
-    /// 3. `max_width_ems: Some(10.0)` is new on the three *point* labels, and
-    ///    10 is MapLibre's default `text-max-width`. This is the behaviour
-    ///    change: point labels wrap now.
-    /// 4. `max_width_ems: None` on the two *line* labels, for the same reason
+    /// 1. `background_color` is gone, along with the halo fields that briefly
+    ///    replaced it. Nothing draws a halo; see [`crate::text::Text::shape`]
+    ///    for the two approximations that were tried and rejected on the glass.
+    /// 2. `max_width_ems: Some(10.0)` on the three *point* labels, 10 being
+    ///    MapLibre's default `text-max-width`. This is the behaviour change:
+    ///    point labels wrap now.
+    /// 3. `max_width_ems: None` on the two *line* labels, for the same reason
     ///    from the other side: MapLibre wraps point placements only, and a
     ///    label laid along a river has no column to break into. That the same
     ///    recording carries both values is what makes it a pin on the
     ///    distinction rather than on wrapping being on or off everywhere.
-    /// 5. `line_height_ems: None` is new; the fixture sets no
-    ///    `text-line-height`.
-    /// 6. The two `Back Alley` halo colours went `#00_00_00_80` to
-    ///    `#00_00_00_FF`. The old value was the halo colour through
-    ///    `gamma_multiply(0.5)`, which existed only to make the fake background
-    ///    box less obtrusive; with a real halo there is nothing to soften.
+    ///    (`line_height_ems: None` throughout; the fixture sets no
+    ///    `text-line-height`.)
+    ///
+    /// The second recording removed ` halo_color: …, halo_width: …` from the
+    /// five label entries **and changed nothing else** -- 215 characters, all of
+    /// them inside those two fields. That is the whole diff, which is why
+    /// removing the halo needed no judgement about whether anything moved.
     ///
     /// **No label position moved, and that is the load-bearing part.** The
     /// fixture's two roads are straight two-point lines, on which the arc-length
@@ -1215,7 +1186,7 @@ mod tests {
     /// `-0.0` to `0.0` on the westward road, is the same number: `slope().atan()`
     /// gave negative zero for a westward run and the `atan2` fold gives
     /// positive zero.
-    const GOLDEN: &str = r##"[Shape(Rect(RectShape { rect: [[0.0 0.0] - [4096.0 4096.0]], corner_radius: CornerRadius { nw: 0, ne: 0, sw: 0, se: 0 }, fill: #10_20_30_FF, stroke: Stroke { width: 0.0, color: #00_00_00_00 }, stroke_kind: Outside, round_to_pixels: None, blur_width: 0.0, brush: None, angle: 0.0 })), Shape(Mesh(Mesh { indices: [1, 0, 2, 1, 2, 3, 5, 4, 6, 5, 6, 7], vertices: [Vertex { pos: [0.0 0.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [100.0 0.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [0.0 100.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [100.0 100.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [200.0 200.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [350.0 200.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [200.0 350.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [350.0 350.0], uv: [0.0 0.0], color: #00_80_00_FF }], texture_id: Managed(0) })), Shape(Path(PathShape { points: [[10.0 20.0], [100.0 20.0], [100.0 100.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 4.0, color: Solid(#CC_00_00_CC), kind: Middle } })), Shape(Path(PathShape { points: [[200.0 200.0], [300.0 300.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 2.0, color: Solid(#00_00_FF_FF), kind: Middle } })), Shape(Path(PathShape { points: [[10.0 10.0], [60.0 10.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 2.0, color: Solid(#FF_FF_00_FF), kind: Middle } })), Shape(Path(PathShape { points: [[60.0 60.0], [10.0 60.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 2.0, color: Solid(#FF_FF_00_FF), kind: Middle } })), Text(Text { text: "Warsaw", position: [500.0 600.0], font_size: 12.0, text_color: #FF_FF_FF_FF, halo_color: #00_00_00_00, halo_width: 0.0, angle: 0.0, max_width_ems: Some(10.0), line_height_ems: None }), Text(Text { text: "Warsaw", position: [530.0 560.0], font_size: 12.0, text_color: #FF_FF_FF_FF, halo_color: #00_00_00_00, halo_width: 0.0, angle: 0.0, max_width_ems: Some(10.0), line_height_ems: None }), Text(Text { text: "Krakow", position: [1200.0 1300.0], font_size: 12.0, text_color: #FF_FF_FF_FF, halo_color: #00_00_00_00, halo_width: 0.0, angle: 0.0, max_width_ems: Some(10.0), line_height_ems: None }), Text(Text { text: "Back Alley", position: [35.0 10.0], font_size: 14.0, text_color: #CC_CC_CC_FF, halo_color: #00_00_00_FF, halo_width: 0.0, angle: 0.0, max_width_ems: None, line_height_ems: None }), Text(Text { text: "Back Alley", position: [35.0 60.0], font_size: 14.0, text_color: #CC_CC_CC_FF, halo_color: #00_00_00_FF, halo_width: 0.0, angle: 0.0, max_width_ems: None, line_height_ems: None })]"##;
+    const GOLDEN: &str = r##"[Shape(Rect(RectShape { rect: [[0.0 0.0] - [4096.0 4096.0]], corner_radius: CornerRadius { nw: 0, ne: 0, sw: 0, se: 0 }, fill: #10_20_30_FF, stroke: Stroke { width: 0.0, color: #00_00_00_00 }, stroke_kind: Outside, round_to_pixels: None, blur_width: 0.0, brush: None, angle: 0.0 })), Shape(Mesh(Mesh { indices: [1, 0, 2, 1, 2, 3, 5, 4, 6, 5, 6, 7], vertices: [Vertex { pos: [0.0 0.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [100.0 0.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [0.0 100.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [100.0 100.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [200.0 200.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [350.0 200.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [200.0 350.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [350.0 350.0], uv: [0.0 0.0], color: #00_80_00_FF }], texture_id: Managed(0) })), Shape(Path(PathShape { points: [[10.0 20.0], [100.0 20.0], [100.0 100.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 4.0, color: Solid(#CC_00_00_CC), kind: Middle } })), Shape(Path(PathShape { points: [[200.0 200.0], [300.0 300.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 2.0, color: Solid(#00_00_FF_FF), kind: Middle } })), Shape(Path(PathShape { points: [[10.0 10.0], [60.0 10.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 2.0, color: Solid(#FF_FF_00_FF), kind: Middle } })), Shape(Path(PathShape { points: [[60.0 60.0], [10.0 60.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 2.0, color: Solid(#FF_FF_00_FF), kind: Middle } })), Text(Text { text: "Warsaw", position: [500.0 600.0], font_size: 12.0, text_color: #FF_FF_FF_FF, angle: 0.0, max_width_ems: Some(10.0), line_height_ems: None }), Text(Text { text: "Warsaw", position: [530.0 560.0], font_size: 12.0, text_color: #FF_FF_FF_FF, angle: 0.0, max_width_ems: Some(10.0), line_height_ems: None }), Text(Text { text: "Krakow", position: [1200.0 1300.0], font_size: 12.0, text_color: #FF_FF_FF_FF, angle: 0.0, max_width_ems: Some(10.0), line_height_ems: None }), Text(Text { text: "Back Alley", position: [35.0 10.0], font_size: 14.0, text_color: #CC_CC_CC_FF, angle: 0.0, max_width_ems: None, line_height_ems: None }), Text(Text { text: "Back Alley", position: [35.0 60.0], font_size: 14.0, text_color: #CC_CC_CC_FF, angle: 0.0, max_width_ems: None, line_height_ems: None })]"##;
 
     #[test]
     fn rendering_the_fixture_reproduces_the_recorded_shapes_exactly() {
@@ -1508,9 +1479,17 @@ mod tests {
         }
     }
 
-    /// `text-max-width` and `text-halo-width` reach the emitted label.
+    /// `text-max-width` and `text-line-height` reach the emitted label, and the
+    /// halo properties beside them reach nothing.
+    ///
+    /// The halo half is a *negative* pin and is the point of the test: the style
+    /// asks loudly for `text-halo-color` and `text-halo-width: 2`, and the label
+    /// carries neither, because nothing draws a halo. Two approximations were
+    /// tried on the glass and both looked worse than plain glyphs; see
+    /// [`crate::text::Text::shape`]. If a real one is ever built, this is the
+    /// test that should go red.
     #[test]
-    fn a_symbol_layer_carries_its_wrapping_and_halo_to_the_label() {
+    fn a_symbol_layer_carries_its_wrapping_and_no_halo_to_the_label() {
         let style = Style::from_json(
             r##"{"layers":[{"type":"symbol","source-layer":"places",
                  "layout":{"text-field":["get","name"],"text-size":12,
@@ -1519,6 +1498,19 @@ mod tests {
                           "text-halo-width":2}}]}"##,
         )
         .expect("the fixture style parses");
+
+        // The style DOES parse them -- `style` models the MapLibre spec, not
+        // this renderer's subset -- which is what makes the absence below a
+        // rendering decision rather than a parser gap.
+        let Layer::Symbol { paint, .. } = &style.layers[0] else {
+            panic!("fixture: the layer is a symbol layer");
+        };
+        let paint = paint.as_ref().expect("fixture: the layer has paint");
+        assert!(
+            paint.text_halo_color.is_some(),
+            "fixture: halo colour asked"
+        );
+        assert!(paint.text_halo_width.is_some(), "fixture: halo width asked");
 
         let labels: Vec<Text> = render(&fixture(), &style, ZOOM)
             .expect("renders")
@@ -1533,23 +1525,17 @@ mod tests {
         for label in &labels {
             assert_eq!(label.max_width_ems, Some(6.0));
             assert_eq!(label.line_height_ems, Some(1.4));
-            assert_eq!(label.halo_width, 2.0);
-            assert_eq!(label.halo_color, Color32::BLACK);
         }
     }
 
     /// A style that says nothing about wrapping still wraps, at MapLibre's
-    /// default of 10 ems -- and a style that says nothing about a halo width
-    /// gets no halo, at MapLibre's default of 0.
-    ///
-    /// The two defaults pull in opposite directions on purpose, so this cannot
-    /// pass by defaulting everything to "on" or everything to "off".
+    /// default of 10 ems.
     #[test]
     fn the_maplibre_defaults_are_what_an_unspecified_layer_gets() {
         let style = Style::from_json(
             r##"{"layers":[{"type":"symbol","source-layer":"places",
                  "layout":{"text-field":["get","name"],"text-size":12},
-                 "paint":{"text-color":"#ffffff","text-halo-color":"#ff0000"}}]}"##,
+                 "paint":{"text-color":"#ffffff"}}]}"##,
         )
         .expect("the fixture style parses");
 
@@ -1563,7 +1549,27 @@ mod tests {
             .expect("a place label");
 
         assert_eq!(label.max_width_ems, Some(10.0), "text-max-width default");
-        assert_eq!(label.halo_width, 0.0, "text-halo-width default");
+        // The control: a style that says nothing gets the default, and a style
+        // that says `0` gets no wrapping at all, so the line above is reading
+        // the property rather than reporting a constant.
+        let off = Style::from_json(
+            r##"{"layers":[{"type":"symbol","source-layer":"places",
+                 "layout":{"text-field":["get","name"],"text-size":12,"text-max-width":0},
+                 "paint":{"text-color":"#ffffff"}}]}"##,
+        )
+        .expect("the fixture style parses");
+        let unwrapped = render(&fixture(), &off, ZOOM)
+            .expect("renders")
+            .into_iter()
+            .find_map(|s| match s {
+                ShapeOrText::Text(text) => Some(text),
+                ShapeOrText::Shape(_) => None,
+            })
+            .expect("a place label");
+        assert_eq!(
+            unwrapped.max_width_ems, None,
+            "text-max-width: 0 is 'never wrap'"
+        );
     }
 
     /// **A line label does not wrap, however narrow `text-max-width` is.**

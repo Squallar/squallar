@@ -190,20 +190,30 @@ pub const DESKTOP_TILE_CACHE_ENTRIES: NonZeroUsize =
 /// derivation of [`TILE_CACHE_ENTRIES`] is against this figure; it is named so
 /// a test can hold the two together instead of the number living only in prose.
 ///
-/// **Re-measured the same day, 646_264 to 652_112 — +5,848 bytes, +0.9%.** The
-/// cause is `walkers::Text` gaining the four fields that carry a label's
-/// wrapping and its halo (`halo_width`, `max_width_ems`, `line_height_ems`,
-/// beside the renamed `halo_color`). `ShapeOrText` is an enum sized by its
-/// widest variant and grew 8 bytes, which the shape spine pays once per shape;
-/// this tile holds 731 of them.
-///
-/// It is a re-measurement and not a relaxation: the figure is what the fixture
-/// actually costs, and
+/// **Re-measured the same day, 646_264 to 652_112 — +5,848 bytes, +0.9%**, when
+/// `walkers::Text` grew the fields carrying a label's wrapping. It is a
+/// re-measurement and not a relaxation:
 /// `tile_source::tests::the_vector_entry_cost_is_what_the_fixture_actually_renders`
 /// re-derives it rather than trusting this line. The budget it feeds is
 /// unchanged in shape — 96 entries is 62.6 MB where it was 62.0 MB, and the
 /// desktop arm is pinned from below by `MIRROR_SCALE_MAX` rather than by bytes,
 /// so no arm's entry count moves.
+///
+/// **Removing the halo later the same day did NOT move it back, and an earlier
+/// version of this comment predicted that it would.** That prediction came from
+/// attributing the growth to `ShapeOrText` widening by 8 bytes per shape over
+/// 731 shapes, which is arithmetic that lands on 5,848 exactly and is still
+/// wrong: measured, `size_of::<ShapeOrText>()` is **72 both with and without the
+/// halo fields**, because `Text` is 72 with them and 64 without, and the other
+/// variant (`egui::Shape`) is 64 either way. The enum never changed size, so the
+/// halo was never costing the spine anything. The figure below was re-derived
+/// after the removal, with a forced rebuild, and is unchanged.
+///
+/// The lesson worth keeping is about the test rather than the number: it asserts
+/// a *band* (`heap <= CONST <= 2 * heap`) and deliberately not equality, because
+/// `size_of` and allocator rounding are toolchain properties. So it cannot catch
+/// this constant drifting upward into a safe over-estimate. Re-derive it by
+/// forcing the assertion to fail; do not infer it from a type's field list.
 pub const MEASURED_VECTOR_TILE_BYTES: usize = 652_112;
 
 /// What one cached raster tile costs: 256x256 RGBA.
