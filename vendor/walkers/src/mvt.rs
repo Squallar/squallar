@@ -9,7 +9,7 @@ use egui::{
     pos2, vec2,
 };
 pub use geo_types::{Coord, Geometry, Line};
-use log::warn;
+use log::{trace, warn};
 use lyon_path::{
     Path, Polygon,
     geom::{Point, point},
@@ -289,7 +289,26 @@ fn get_layer_features(
     let features = if let Ok(layer_index) = find_layer(reader, name) {
         reader.get_features(layer_index)?
     } else {
-        warn!("Source layer '{name}' not found. Skipping.");
+        // **`trace!`, not `warn!`, because a tile without a source layer is
+        // ordinary data.** A style names 94 source layers and no tile carries
+        // all of them -- open country has no `building`, most tiles have no
+        // `poi` -- so at `warn` this fired once per style layer per tile,
+        // constantly, for nothing the reader could act on. Measured over a
+        // 45-tile Oklahoma viewport at zooms 6/7/8: 903 warn lines, **every
+        // single warn line the renderer emitted**, `transportation` alone 245.
+        //
+        // The case that really is broken -- a style naming a source layer no
+        // tile anywhere carries -- is caught before it ships, by
+        // `squallar-egui/tests/committed_styles_parse.rs`'s check that every
+        // `source-layer` is one of the sixteen OpenMapTiles names. That test
+        // fails the build; this line could only ever have whispered about it
+        // underneath thousands of false ones.
+        //
+        // Kept rather than deleted because it is genuinely the answer to "why
+        // is this one layer not drawing on this one tile", which is a real
+        // question with no other instrument. At `trace` it costs nothing until
+        // somebody asks.
+        trace!("Source layer '{name}' not found. Skipping.");
         Vec::new()
     }
     .into_iter()
@@ -458,6 +477,92 @@ fn render_polygon(
     Ok(())
 }
 
+/// A symbol layer's text size, in screen points.
+///
+/// Hoisted out of the two `render_symbol` arms, which carried it letter for
+/// letter twice.
+fn symbol_text_size(context: &Context, layout: &Layout) -> f32 {
+    layout
+        .text_size
+        .as_ref()
+        .and_then(|text_size| {
+            let size = text_size.evaluate(context);
+
+            if size > 3.0 {
+                Some(size)
+            } else {
+                warn!(
+                    "{} evaluated into {size}, which is too small for text size.",
+                    text_size.0
+                );
+                None
+            }
+        })
+        .unwrap_or(12.0)
+}
+
+/// A symbol layer's glyph colour, halo colour and halo width.
+///
+/// The halo half is what the `MultiPoint` arm never had: it passed
+/// `Color32::TRANSPARENT` unconditionally, so a *point* label -- which is every
+/// place name on the map -- drew with no halo at all however loudly the style
+/// asked for one, while only line labels got the half-alpha box. Both arms read
+/// the same three properties now.
+fn symbol_colors(context: &Context, paint: &Option<Paint>) -> (Color32, Color32, f32) {
+    let Some(paint) = paint else {
+        // Defaults from the MapLibre spec: black text, and a halo that is
+        // transparent and zero-width, i.e. none.
+        return (Color32::BLACK, Color32::TRANSPARENT, 0.0);
+    };
+
+    let text_color = paint
+        .text_color
+        .as_ref()
+        .map_or(Color32::BLACK, |color| color.evaluate(context));
+
+    let halo_color = paint
+        .text_halo_color
+        .as_ref()
+        .map_or(Color32::TRANSPARENT, |color| color.evaluate(context));
+
+    // MapLibre's default is 0 -- no halo unless one is asked for.
+    let halo_width = paint
+        .text_halo_width
+        .as_ref()
+        .map_or(0.0, |width| width.evaluate(context));
+
+    (text_color, halo_color, halo_width)
+}
+
+/// A symbol layer's wrapping, in ems: `(text-max-width, text-line-height)`.
+///
+/// `text-max-width` defaults to **10**, which is MapLibre's default and is
+/// applied here rather than left to the text layer, because "the style said
+/// nothing" and "the style said do not wrap" are different instructions and
+/// only the second one should produce an unwrapped run. Every symbol layer in
+/// the committed styles that carries a long name sets it explicitly anyway; the
+/// default is what protects the ones that do not.
+fn symbol_wrapping(context: &Context, layout: &Layout) -> (Option<f32>, Option<f32>) {
+    const DEFAULT_TEXT_MAX_WIDTH_EMS: f32 = 10.0;
+
+    let max_width = layout
+        .text_max_width
+        .as_ref()
+        .map_or(DEFAULT_TEXT_MAX_WIDTH_EMS, |value| value.evaluate(context));
+
+    // A non-positive width is not a wrap instruction, and dividing a label into
+    // one word per row is worse than not wrapping it.
+    let max_width = (max_width > 0.0).then_some(max_width);
+
+    let line_height = layout
+        .text_line_height
+        .as_ref()
+        .map(|value| value.evaluate(context))
+        .filter(|height| *height > 0.0);
+
+    (max_width, line_height)
+}
+
 fn render_symbol(
     geometry: &Geometry<f32>,
     context: &Context,
@@ -465,102 +570,52 @@ fn render_symbol(
     layout: &Layout,
     paint: &Option<Paint>,
 ) -> Result<(), Error> {
+    // Read once per feature rather than once per arm. `layout.text` in
+    // particular evaluates an expression and allocates a `String`.
+    let Some(text) = layout.text(context) else {
+        return Ok(());
+    };
+
+    let text_size = symbol_text_size(context, layout);
+    let (text_color, halo_color, halo_width) = symbol_colors(context, paint);
+    let (max_width_ems, line_height_ems) = symbol_wrapping(context, layout);
+
+    let label = |position, angle, wrap: bool| {
+        ShapeOrText::Text(
+            Text::new(
+                position,
+                text.clone(),
+                text_size,
+                text_color,
+                halo_color,
+                angle,
+            )
+            .with_halo_width(halo_width)
+            .with_wrapping(wrap.then_some(max_width_ems).flatten(), line_height_ems),
+        )
+    };
+
     match geometry {
+        // Point placement wraps.
         Geometry::MultiPoint(multi_point) => {
-            let text_size = layout
-                .text_size
-                .as_ref()
-                .and_then(|text_size| {
-                    let size = text_size.evaluate(context);
-
-                    if size > 3.0 {
-                        Some(size)
-                    } else {
-                        warn!(
-                            "{} evaluated into {size}, which is too small for text size.",
-                            text_size.0
-                        );
-                        None
-                    }
-                })
-                .unwrap_or(12.0);
-
-            let text_color = if let Some(paint) = paint
-                && let Some(color) = &paint.text_color
-            {
-                color.evaluate(context)
-            } else {
-                // Default from MapLibre spec.
-                Color32::BLACK
-            };
-
-            if let Some(text) = &layout.text(context) {
-                shapes.extend(multi_point.0.iter().map(|p| {
-                    ShapeOrText::Text(Text::new(
-                        pos2(p.x(), p.y()),
-                        text.clone(),
-                        text_size,
-                        text_color,
-                        Color32::TRANSPARENT,
-                        0.0,
-                    ))
-                }))
-            }
+            shapes.extend(
+                multi_point
+                    .0
+                    .iter()
+                    .map(|p| label(pos2(p.x(), p.y()), 0.0, true)),
+            );
         }
+        // **Line placement does not wrap, and that is MapLibre's rule rather
+        // than a simplification.** A label following a watercourse is laid out
+        // along the line, so there is no column to break into; MapLibre spells
+        // this as `placement === 'point' ? text-max-width * ONE_EM : 0` when it
+        // shapes a symbol. Wrapping here would stack "North Canadian River"
+        // into three short rows sitting across the river rather than along it,
+        // which is worse than the run it replaced.
         Geometry::MultiLineString(multi_line_string) => {
-            let text_size = layout
-                .text_size
-                .as_ref()
-                .and_then(|text_size| {
-                    let size = text_size.evaluate(context);
-
-                    if size > 3.0 {
-                        Some(size)
-                    } else {
-                        warn!(
-                            "{} evaluated into {size}, which is too small for text size.",
-                            text_size.0
-                        );
-                        None
-                    }
-                })
-                .unwrap_or(12.0);
-
-            let text_color = if let Some(paint) = paint
-                && let Some(color) = &paint.text_color
-            {
-                color.evaluate(context)
-            } else {
-                Color32::BLACK
-            };
-
-            let text_halo_color = if let Some(paint) = paint
-                && let Some(color) = &paint.text_halo_color
-            {
-                color.evaluate(context)
-            } else {
-                Color32::TRANSPARENT
-            };
-
             for line_string in multi_line_string {
-                let lines: Vec<_> = line_string.lines().collect();
-
-                if let Some(text) = &layout.text(context)
-                // Use the longest line to fit the label.
-                && let Some(line) = lines.into_iter().max_by_key(|line| length(line) as u32)
-                {
-                    let mid_point = midpoint(&line.start_point(), &line.end_point());
-                    let angle = line.slope().atan();
-
-                    shapes.push(ShapeOrText::Text(Text::new(
-                        pos2(mid_point.x(), mid_point.y()),
-                        text.clone(),
-                        text_size,
-                        text_color,
-                        // TODO: Implement real halo rendering.
-                        text_halo_color.gamma_multiply(0.5),
-                        angle,
-                    )));
+                if let Some((position, angle)) = anchor_along(line_string) {
+                    shapes.push(label(position, angle, false));
                 }
             }
         }
@@ -569,12 +624,99 @@ fn render_symbol(
     Ok(())
 }
 
-fn length(line: &Line<f32>) -> f32 {
-    (line.dx() * line.dx() + line.dy() * line.dy()).sqrt()
+/// Where a line label goes on `line_string`, and which way it points.
+///
+/// **A point on the line and the local tangent, replacing the chord midpoint
+/// and the chord slope.** The old spelling took the single longest *segment* of
+/// the geometry and used the midpoint of its two endpoints with
+/// `slope().atan()`. Both halves are wrong on a watercourse: the anchor is the
+/// midpoint of a straight line between two points on a meander, which is off
+/// the water, and the angle is that same straight line's bearing, which on
+/// adjacent OSM fragments of one river differs by tens of degrees even where
+/// the river itself is smooth. That is what put "Rio Grande" on screen six
+/// times at six different rotations.
+///
+/// The anchor is the point half way along by **arc length**, so it is on the
+/// geometry by construction. The angle is measured over a short window centred
+/// on it -- a local chord rather than the whole fragment's -- which follows a
+/// curve while staying immune to a single tiny segment's noise. `atan2` is
+/// folded back into a half turn so the text never draws upside down, which is
+/// what `slope().atan()` did for free and what `text-keep-upright: true` in the
+/// committed styles asks for.
+fn anchor_along(line_string: &geo_types::LineString<f32>) -> Option<(egui::Pos2, f32)> {
+    /// The tangent window, as a fraction of the fragment's length either side
+    /// of the anchor. Small enough to track a bend, wide enough that a
+    /// millimetre-long segment does not set the angle by itself.
+    const TANGENT_WINDOW: f32 = 0.05;
+
+    let lines: Vec<Line<f32>> = line_string.lines().collect();
+    let total: f32 = lines.iter().map(length).sum();
+
+    if lines.is_empty() || !total.is_finite() || total <= 0.0 {
+        return None;
+    }
+
+    let middle = total / 2.0;
+    let window = total * TANGENT_WINDOW;
+
+    let position = point_at(&lines, middle)?;
+    let before = point_at(&lines, middle - window)?;
+    let after = point_at(&lines, middle + window)?;
+
+    Some((position, upright_angle(after - before)))
 }
 
-fn midpoint(p1: &geo_types::Point<f32>, p2: &geo_types::Point<f32>) -> geo_types::Point<f32> {
-    geo_types::Point::new((p1.x() + p2.x()) / 2.0, (p1.y() + p2.y()) / 2.0)
+/// The point `distance` along the polyline `lines`, clamped to its ends.
+///
+/// Clamping rather than returning `None` past the end is what lets
+/// [`anchor_along`] ask for the anchor plus and minus a window without checking
+/// first: on a fragment shorter than the window the two probes collapse towards
+/// the endpoints, which still gives the fragment's own direction.
+fn point_at(lines: &[Line<f32>], distance: f32) -> Option<egui::Pos2> {
+    let last = lines.len().checked_sub(1)?;
+    let mut remaining = distance.max(0.0);
+
+    for (index, line) in lines.iter().enumerate() {
+        let len = length(line);
+
+        if remaining <= len || index == last {
+            // `len` is zero for a repeated coordinate, and then the fraction
+            // along it is meaningless -- both endpoints are the same point.
+            let t = if len > 0.0 {
+                (remaining / len).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            return Some(pos2(
+                line.start.x + line.dx() * t,
+                line.start.y + line.dy() * t,
+            ));
+        }
+
+        remaining -= len;
+    }
+
+    None
+}
+
+/// The direction of `delta`, folded into `[-pi/2, pi/2]` so text drawn at this
+/// angle is never upside down.
+fn upright_angle(delta: egui::Vec2) -> f32 {
+    use std::f32::consts::{FRAC_PI_2, PI};
+
+    let angle = delta.y.atan2(delta.x);
+
+    if angle > FRAC_PI_2 {
+        angle - PI
+    } else if angle < -FRAC_PI_2 {
+        angle + PI
+    } else {
+        angle
+    }
+}
+
+fn length(line: &Line<f32>) -> f32 {
+    (line.dx() * line.dx() + line.dy() * line.dy()).sqrt()
 }
 
 fn find_layer(data: &Reader, name: &str) -> Result<usize, Error> {
@@ -1039,7 +1181,41 @@ mod tests {
     /// evaluate to*, not on tessellation: if a lookup starts returning
     /// something other than what the eager conversion returned, a colour, a
     /// width or a label moves and this goes red.
-    const GOLDEN: &str = r##"[Shape(Rect(RectShape { rect: [[0.0 0.0] - [4096.0 4096.0]], corner_radius: CornerRadius { nw: 0, ne: 0, sw: 0, se: 0 }, fill: #10_20_30_FF, stroke: Stroke { width: 0.0, color: #00_00_00_00 }, stroke_kind: Outside, round_to_pixels: None, blur_width: 0.0, brush: None, angle: 0.0 })), Shape(Mesh(Mesh { indices: [1, 0, 2, 1, 2, 3, 5, 4, 6, 5, 6, 7], vertices: [Vertex { pos: [0.0 0.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [100.0 0.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [0.0 100.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [100.0 100.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [200.0 200.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [350.0 200.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [200.0 350.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [350.0 350.0], uv: [0.0 0.0], color: #00_80_00_FF }], texture_id: Managed(0) })), Shape(Path(PathShape { points: [[10.0 20.0], [100.0 20.0], [100.0 100.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 4.0, color: Solid(#CC_00_00_CC), kind: Middle } })), Shape(Path(PathShape { points: [[200.0 200.0], [300.0 300.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 2.0, color: Solid(#00_00_FF_FF), kind: Middle } })), Shape(Path(PathShape { points: [[10.0 10.0], [60.0 10.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 2.0, color: Solid(#FF_FF_00_FF), kind: Middle } })), Shape(Path(PathShape { points: [[60.0 60.0], [10.0 60.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 2.0, color: Solid(#FF_FF_00_FF), kind: Middle } })), Text(Text { text: "Warsaw", position: [500.0 600.0], font_size: 12.0, text_color: #FF_FF_FF_FF, background_color: #00_00_00_00, angle: 0.0 }), Text(Text { text: "Warsaw", position: [530.0 560.0], font_size: 12.0, text_color: #FF_FF_FF_FF, background_color: #00_00_00_00, angle: 0.0 }), Text(Text { text: "Krakow", position: [1200.0 1300.0], font_size: 12.0, text_color: #FF_FF_FF_FF, background_color: #00_00_00_00, angle: 0.0 }), Text(Text { text: "Back Alley", position: [35.0 10.0], font_size: 14.0, text_color: #CC_CC_CC_FF, background_color: #00_00_00_80, angle: 0.0 }), Text(Text { text: "Back Alley", position: [35.0 60.0], font_size: 14.0, text_color: #CC_CC_CC_FF, background_color: #00_00_00_80, angle: -0.0 })]"##;
+    ///
+    /// **Re-recorded once, on 2026-08-28, for the label-fidelity changes.**
+    /// Every difference from the previous recording was attributed before it
+    /// was accepted, and they are these six and nothing else:
+    ///
+    /// 1. `background_color` is spelled `halo_color`. A rename; see
+    ///    [`crate::text::Text`].
+    /// 2. `halo_width: 0.0` is new, and `0.0` is right for this fixture: its
+    ///    style sets `text-halo-color` and no `text-halo-width`, and MapLibre's
+    ///    default for that property is 0. A style asking for a halo colour
+    ///    without a width gets no halo, here as there.
+    /// 3. `max_width_ems: Some(10.0)` is new on the three *point* labels, and
+    ///    10 is MapLibre's default `text-max-width`. This is the behaviour
+    ///    change: point labels wrap now.
+    /// 4. `max_width_ems: None` on the two *line* labels, for the same reason
+    ///    from the other side: MapLibre wraps point placements only, and a
+    ///    label laid along a river has no column to break into. That the same
+    ///    recording carries both values is what makes it a pin on the
+    ///    distinction rather than on wrapping being on or off everywhere.
+    /// 5. `line_height_ems: None` is new; the fixture sets no
+    ///    `text-line-height`.
+    /// 6. The two `Back Alley` halo colours went `#00_00_00_80` to
+    ///    `#00_00_00_FF`. The old value was the halo colour through
+    ///    `gamma_multiply(0.5)`, which existed only to make the fake background
+    ///    box less obtrusive; with a real halo there is nothing to soften.
+    ///
+    /// **No label position moved, and that is the load-bearing part.** The
+    /// fixture's two roads are straight two-point lines, on which the arc-length
+    /// anchor and the old chord midpoint agree exactly -- so this recording
+    /// pins that [`anchor_along`] is a no-op on straight geometry and only
+    /// changes what it was written to change. The one angle that moved,
+    /// `-0.0` to `0.0` on the westward road, is the same number: `slope().atan()`
+    /// gave negative zero for a westward run and the `atan2` fold gives
+    /// positive zero.
+    const GOLDEN: &str = r##"[Shape(Rect(RectShape { rect: [[0.0 0.0] - [4096.0 4096.0]], corner_radius: CornerRadius { nw: 0, ne: 0, sw: 0, se: 0 }, fill: #10_20_30_FF, stroke: Stroke { width: 0.0, color: #00_00_00_00 }, stroke_kind: Outside, round_to_pixels: None, blur_width: 0.0, brush: None, angle: 0.0 })), Shape(Mesh(Mesh { indices: [1, 0, 2, 1, 2, 3, 5, 4, 6, 5, 6, 7], vertices: [Vertex { pos: [0.0 0.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [100.0 0.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [0.0 100.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [100.0 100.0], uv: [0.0 0.0], color: #00_80_00_80 }, Vertex { pos: [200.0 200.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [350.0 200.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [200.0 350.0], uv: [0.0 0.0], color: #00_80_00_FF }, Vertex { pos: [350.0 350.0], uv: [0.0 0.0], color: #00_80_00_FF }], texture_id: Managed(0) })), Shape(Path(PathShape { points: [[10.0 20.0], [100.0 20.0], [100.0 100.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 4.0, color: Solid(#CC_00_00_CC), kind: Middle } })), Shape(Path(PathShape { points: [[200.0 200.0], [300.0 300.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 2.0, color: Solid(#00_00_FF_FF), kind: Middle } })), Shape(Path(PathShape { points: [[10.0 10.0], [60.0 10.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 2.0, color: Solid(#FF_FF_00_FF), kind: Middle } })), Shape(Path(PathShape { points: [[60.0 60.0], [10.0 60.0]], closed: false, fill: #00_00_00_00, stroke: PathStroke { width: 2.0, color: Solid(#FF_FF_00_FF), kind: Middle } })), Text(Text { text: "Warsaw", position: [500.0 600.0], font_size: 12.0, text_color: #FF_FF_FF_FF, halo_color: #00_00_00_00, halo_width: 0.0, angle: 0.0, max_width_ems: Some(10.0), line_height_ems: None }), Text(Text { text: "Warsaw", position: [530.0 560.0], font_size: 12.0, text_color: #FF_FF_FF_FF, halo_color: #00_00_00_00, halo_width: 0.0, angle: 0.0, max_width_ems: Some(10.0), line_height_ems: None }), Text(Text { text: "Krakow", position: [1200.0 1300.0], font_size: 12.0, text_color: #FF_FF_FF_FF, halo_color: #00_00_00_00, halo_width: 0.0, angle: 0.0, max_width_ems: Some(10.0), line_height_ems: None }), Text(Text { text: "Back Alley", position: [35.0 10.0], font_size: 14.0, text_color: #CC_CC_CC_FF, halo_color: #00_00_00_FF, halo_width: 0.0, angle: 0.0, max_width_ems: None, line_height_ems: None }), Text(Text { text: "Back Alley", position: [35.0 60.0], font_size: 14.0, text_color: #CC_CC_CC_FF, halo_color: #00_00_00_FF, halo_width: 0.0, angle: 0.0, max_width_ems: None, line_height_ems: None })]"##;
 
     #[test]
     fn rendering_the_fixture_reproduces_the_recorded_shapes_exactly() {
@@ -1154,5 +1330,297 @@ mod tests {
             0,
             "'yes' is r1's *primary* property, and must not be reachable from the right"
         );
+    }
+
+    // ── Line-label placement ────────────────────────────────────────────────
+
+    fn line_string(points: &[(f32, f32)]) -> geo_types::LineString<f32> {
+        points.iter().copied().collect::<Vec<(f32, f32)>>().into()
+    }
+
+    /// The rule [`anchor_along`] replaced: the midpoint and slope of whichever
+    /// single segment happens to be longest.
+    ///
+    /// Spelled out here rather than described, so the comparisons below are
+    /// against the code that actually shipped.
+    fn longest_segment_anchor(ls: &geo_types::LineString<f32>) -> (egui::Pos2, f32) {
+        let line = ls
+            .lines()
+            .max_by_key(|line| length(line) as u32)
+            .expect("a line string with at least one segment");
+        (
+            pos2(
+                (line.start.x + line.end.x) / 2.0,
+                (line.start.y + line.end.y) / 2.0,
+            ),
+            line.slope().atan(),
+        )
+    }
+
+    /// Distance from `point` to the nearest point of the polyline.
+    fn distance_to(ls: &geo_types::LineString<f32>, point: egui::Pos2) -> f32 {
+        ls.lines()
+            .map(|line| {
+                let start = pos2(line.start.x, line.start.y);
+                let seg = egui::vec2(line.dx(), line.dy());
+                let len2 = seg.length_sq();
+                let t = if len2 > 0.0 {
+                    ((point - start).dot(seg) / len2).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                (point - (start + seg * t)).length()
+            })
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    /// The anchor is half way along by arc length, and on the geometry.
+    #[test]
+    fn a_line_label_sits_half_way_along_the_line() {
+        // An L: two 100-unit legs, so the halfway point is exactly the corner.
+        let ls = line_string(&[(0.0, 0.0), (100.0, 0.0), (100.0, 100.0)]);
+        let (position, _) = anchor_along(&ls).expect("the L has an anchor");
+
+        assert!(
+            (position - pos2(100.0, 0.0)).length() < 0.01,
+            "the halfway point of two equal legs is the corner, got {position:?}"
+        );
+        assert!(
+            distance_to(&ls, position) < 0.01,
+            "the anchor left the line"
+        );
+    }
+
+    /// **The angle is the tangent where the label sits, not some other
+    /// segment's.**
+    ///
+    /// A `V` whose two legs are the same length: the old rule took the longest
+    /// segment, which for a tie is the last one, and reported its 45-degree
+    /// descent. The label is drawn at the apex, where the line is turning
+    /// through horizontal, so the direction across it is flat.
+    #[test]
+    fn a_line_label_takes_the_tangent_at_its_own_anchor() {
+        let ls = line_string(&[(0.0, 0.0), (100.0, 100.0), (200.0, 0.0)]);
+
+        let (position, angle) = anchor_along(&ls).expect("the V has an anchor");
+        assert!(
+            (position - pos2(100.0, 100.0)).length() < 0.01,
+            "the anchor is the apex, got {position:?}"
+        );
+        assert!(
+            angle.abs() < 0.05,
+            "the tangent across the apex is flat, got {angle} rad"
+        );
+
+        // NON-VACUITY: the rule this replaced answers a quarter turn away on
+        // the very same geometry, so the assertion above is not something any
+        // placement would satisfy.
+        let (_, was) = longest_segment_anchor(&ls);
+        assert!(
+            (was.abs() - std::f32::consts::FRAC_PI_4).abs() < 0.01,
+            "the old rule is supposed to read 45 degrees here, got {was}"
+        );
+    }
+
+    /// **The anchor barely moves when the same river is simplified, and that is
+    /// the fix for labels that jump while zooming.**
+    ///
+    /// A vector tile carries a river generalised differently at every zoom.
+    /// "The midpoint of the longest segment" is decided by which segment
+    /// survives simplification, so it can leap from one end of a fragment to
+    /// the other between two zoom levels -- the label pops out here and back in
+    /// over there, at a new rotation. "Half way along" is a property of the
+    /// river, not of the sampling, so it stays put.
+    #[test]
+    fn simplifying_a_river_barely_moves_its_label() {
+        // One S-bend, sampled finely and coarsely. Same watercourse.
+        let dense = line_string(&[
+            (0.0, 0.0),
+            (10.0, 6.0),
+            (20.0, 13.0),
+            (30.0, 15.0),
+            (40.0, 11.0),
+            (50.0, 0.0),
+            (60.0, -11.0),
+            (70.0, -15.0),
+            (80.0, -13.0),
+            (90.0, -6.0),
+            (100.0, 0.0),
+        ]);
+        let coarse = line_string(&[
+            (0.0, 0.0),
+            (30.0, 15.0),
+            (50.0, 0.0),
+            (70.0, -15.0),
+            (100.0, 0.0),
+        ]);
+
+        let (now_dense, _) = anchor_along(&dense).expect("dense anchor");
+        let (now_coarse, _) = anchor_along(&coarse).expect("coarse anchor");
+        let moved = (now_dense - now_coarse).length();
+
+        let (was_dense, _) = longest_segment_anchor(&dense);
+        let (was_coarse, _) = longest_segment_anchor(&coarse);
+        let moved_before = (was_dense - was_coarse).length();
+
+        assert!(
+            moved < 5.0,
+            "the anchor moved {moved} units between two samplings of one river"
+        );
+
+        // NON-VACUITY, and the size of the defect: the rule this replaced moves
+        // an order of magnitude further on the same pair. Without this the
+        // assertion above would also pass on a placement that ignored the
+        // geometry entirely.
+        assert!(
+            moved_before > 4.0 * moved,
+            "the old rule moved {moved_before} and the new one {moved}; this test \
+             is only evidence if the two genuinely differ"
+        );
+    }
+
+    /// Degenerate geometry has no anchor rather than a panicking one.
+    #[test]
+    fn a_degenerate_line_has_no_anchor() {
+        assert!(anchor_along(&line_string(&[])).is_none());
+        assert!(anchor_along(&line_string(&[(5.0, 5.0)])).is_none());
+        // Every coordinate identical: zero total length, so no direction.
+        assert!(anchor_along(&line_string(&[(5.0, 5.0), (5.0, 5.0), (5.0, 5.0)])).is_none());
+    }
+
+    /// A label never draws upside down, whichever way the line runs.
+    #[test]
+    fn a_westward_line_label_is_still_upright() {
+        use std::f32::consts::FRAC_PI_2;
+
+        for points in [
+            [(0.0, 0.0), (100.0, 0.0)],   // east
+            [(100.0, 0.0), (0.0, 0.0)],   // west
+            [(0.0, 0.0), (0.0, 100.0)],   // south
+            [(0.0, 100.0), (0.0, 0.0)],   // north
+            [(0.0, 0.0), (-100.0, 50.0)], // north-west
+        ] {
+            let (_, angle) = anchor_along(&line_string(&points)).expect("an anchor");
+            assert!(
+                angle.abs() <= FRAC_PI_2 + 0.001,
+                "{points:?} gave {angle} rad, which reads upside down"
+            );
+        }
+    }
+
+    /// `text-max-width` and `text-halo-width` reach the emitted label.
+    #[test]
+    fn a_symbol_layer_carries_its_wrapping_and_halo_to_the_label() {
+        let style = Style::from_json(
+            r##"{"layers":[{"type":"symbol","source-layer":"places",
+                 "layout":{"text-field":["get","name"],"text-size":12,
+                           "text-max-width":6,"text-line-height":1.4},
+                 "paint":{"text-color":"#ffffff","text-halo-color":"#000000",
+                          "text-halo-width":2}}]}"##,
+        )
+        .expect("the fixture style parses");
+
+        let labels: Vec<Text> = render(&fixture(), &style, ZOOM)
+            .expect("renders")
+            .into_iter()
+            .filter_map(|s| match s {
+                ShapeOrText::Text(text) => Some(text),
+                ShapeOrText::Shape(_) => None,
+            })
+            .collect();
+
+        assert!(!labels.is_empty(), "the fixture has place labels to carry");
+        for label in &labels {
+            assert_eq!(label.max_width_ems, Some(6.0));
+            assert_eq!(label.line_height_ems, Some(1.4));
+            assert_eq!(label.halo_width, 2.0);
+            assert_eq!(label.halo_color, Color32::BLACK);
+        }
+    }
+
+    /// A style that says nothing about wrapping still wraps, at MapLibre's
+    /// default of 10 ems -- and a style that says nothing about a halo width
+    /// gets no halo, at MapLibre's default of 0.
+    ///
+    /// The two defaults pull in opposite directions on purpose, so this cannot
+    /// pass by defaulting everything to "on" or everything to "off".
+    #[test]
+    fn the_maplibre_defaults_are_what_an_unspecified_layer_gets() {
+        let style = Style::from_json(
+            r##"{"layers":[{"type":"symbol","source-layer":"places",
+                 "layout":{"text-field":["get","name"],"text-size":12},
+                 "paint":{"text-color":"#ffffff","text-halo-color":"#ff0000"}}]}"##,
+        )
+        .expect("the fixture style parses");
+
+        let label = render(&fixture(), &style, ZOOM)
+            .expect("renders")
+            .into_iter()
+            .find_map(|s| match s {
+                ShapeOrText::Text(text) => Some(text),
+                ShapeOrText::Shape(_) => None,
+            })
+            .expect("a place label");
+
+        assert_eq!(label.max_width_ems, Some(10.0), "text-max-width default");
+        assert_eq!(label.halo_width, 0.0, "text-halo-width default");
+    }
+
+    /// **A line label does not wrap, however narrow `text-max-width` is.**
+    ///
+    /// MapLibre shapes a symbol with
+    /// `placement === 'point' ? text-max-width * ONE_EM : 0`, so wrapping is a
+    /// point-placement rule. A label following a river is laid out along the
+    /// line and has no column to break into; wrapping it would stack short rows
+    /// across the water instead of along it.
+    #[test]
+    fn a_line_label_is_never_wrapped() {
+        // The same absurdly narrow cap applied to both layers, so the only
+        // thing separating the two answers is the geometry.
+        let style = Style::from_json(
+            r##"{"layers":[
+                 {"type":"symbol","source-layer":"places",
+                  "layout":{"text-field":["get","name"],"text-size":12,"text-max-width":2},
+                  "paint":{"text-color":"#ffffff"}},
+                 {"type":"symbol","source-layer":"roads",
+                  "layout":{"text-field":["get","name"],"text-size":12,"text-max-width":2},
+                  "paint":{"text-color":"#cccccc"}}]}"##,
+        )
+        .expect("the fixture style parses");
+
+        let labels: Vec<Text> = render(&fixture(), &style, ZOOM)
+            .expect("renders")
+            .into_iter()
+            .filter_map(|s| match s {
+                ShapeOrText::Text(text) => Some(text),
+                ShapeOrText::Shape(_) => None,
+            })
+            .collect();
+
+        // `places` is points, `roads` is lines; the fixture carries both.
+        let (points, lines): (Vec<&Text>, Vec<&Text>) = labels
+            .iter()
+            .partition(|t| t.angle == 0.0 && t.font_size == 12.0 && t.text != "Back Alley");
+
+        assert!(!points.is_empty(), "fixture: the tile has point labels");
+        assert!(!lines.is_empty(), "fixture: the tile has line labels");
+
+        for label in &lines {
+            assert_eq!(
+                label.max_width_ems, None,
+                "the line label {:?} carries a wrap width",
+                label.text
+            );
+        }
+        // The control: the very same cap does reach a point label, so `None`
+        // above is the placement rule and not the property being dropped.
+        for label in &points {
+            assert_eq!(
+                label.max_width_ems,
+                Some(2.0),
+                "the point label {:?} lost its wrap width",
+                label.text
+            );
+        }
     }
 }

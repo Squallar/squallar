@@ -229,6 +229,25 @@ fn full_rect_of_clipped_tile(rect: egui::Rect, uv: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_size(min, full)
 }
 
+/// How far apart two labels reading the same name have to be before both draw.
+///
+/// **This is what stops a river being named six times in one viewport.** OSM
+/// splits a way at every tag change, county line and confluence, so one
+/// watercourse arrives as a dozen `LineString`s and each one asks for its own
+/// label. Deduplicating by name outright would be wrong in the other
+/// direction -- MapLibre repeats a line label every `symbol-spacing` points
+/// precisely so a river crossing the whole screen is readable at both ends --
+/// so the rule is a *distance*, and a name may repeat once it is far enough
+/// away to be a second reading rather than a duplicate.
+///
+/// 300 points because that is what the committed styles ask for:
+/// `waterway_label` sets `symbol-spacing: 300` and `watername_lake_line` sets
+/// 350, against MapLibre's default of 250. A per-layer value would have to be
+/// carried on every [`walkers::Text`] to reach here; the styles use two values
+/// eleven points apart in effect, so one constant is the honest simplification
+/// and this comment is the record of what it stands in for.
+const MIN_REPEAT_DISTANCE: f32 = 300.0;
+
 /// Lay one label out, and claim the area it needs.
 ///
 /// Returns [`egui::Shape::Noop`] when the area is already taken, which is the
@@ -236,31 +255,20 @@ fn full_rect_of_clipped_tile(rect: egui::Rect, uv: egui::Rect) -> egui::Rect {
 ///
 /// The caller owns `occupied`, and [`paint_labels`] owns the only one there is
 /// per pane.
+///
+/// The wrapping and the halo are [`walkers::Text`]'s own, so this phase and
+/// walkers' per-tile draw cannot drift apart.
 fn lay_out_label(
     ctx: &egui::Context,
-    text: walkers::Text,
+    text: &walkers::Text,
     occupied: &mut walkers::OccupiedAreas,
 ) -> egui::Shape {
-    let mut job = egui::text::LayoutJob::default();
-    job.append(
-        &text.text,
-        0.0,
-        egui::TextFormat {
-            font_id: egui::FontId::proportional(text.font_size),
-            color: text.text_color,
-            background: text.background_color,
-            ..Default::default()
-        },
-    );
-
-    let galley = ctx.fonts_mut(|fonts| fonts.layout_job(job));
+    let galley = text.galley(ctx);
     let area = walkers::text::OrientedRect::new(text.position, text.angle, galley.size());
     let top_left = area.top_left();
 
     if occupied.try_occupy(area) {
-        egui::epaint::TextShape::new(top_left, galley, text.text_color)
-            .with_angle(text.angle)
-            .into()
+        text.shape(galley, top_left)
     } else {
         egui::Shape::Noop
     }
@@ -354,10 +362,38 @@ pub(super) fn paint_labels(painter: &egui::Painter, labels: Vec<walkers::Text>) 
     }
 
     let mut occupied = walkers::OccupiedAreas::new();
-    let placed: Vec<egui::Shape> = labels
-        .into_iter()
-        .map(|text| lay_out_label(painter.ctx(), text, &mut occupied))
-        .collect();
+    // Where each name has already been drawn, so a fragmented river is named
+    // once per stretch of screen rather than once per OSM way. See
+    // [`MIN_REPEAT_DISTANCE`].
+    let mut placed_names: std::collections::HashMap<String, Vec<egui::Pos2>> =
+        std::collections::HashMap::new();
+
+    let mut placed: Vec<egui::Shape> = Vec::with_capacity(labels.len());
+
+    for text in labels {
+        let position = text.position;
+
+        // Borrowed, never cloned: this runs per label per frame, and the name
+        // is only ever moved into the map by a label that actually drew.
+        if placed_names.get(&text.text).is_some_and(|anchors| {
+            anchors
+                .iter()
+                .any(|at| at.distance(position) < MIN_REPEAT_DISTANCE)
+        }) {
+            continue;
+        }
+
+        let shape = lay_out_label(painter.ctx(), &text, &mut occupied);
+
+        // Only a label that actually drew claims the spot. A name suppressed by
+        // the collision test must not stop the same name drawing further along,
+        // or one river losing a contest at a crowded confluence would be
+        // silenced across the whole viewport.
+        if !matches!(shape, egui::Shape::Noop) {
+            placed_names.entry(text.text).or_default().push(position);
+            placed.push(shape);
+        }
+    }
 
     painter.extend(placed);
 }
@@ -631,7 +667,15 @@ mod tests {
         // The label sat at the centre of the extent, so it must sit at the
         // centre of the tile -- `OrientedRect::top_left` offsets it by half the
         // galley, so the comparison is against the galley's centre.
-        let placed_centre = label.pos + label.galley.size() / 2.0;
+        //
+        // `galley.rect.center()` and not `size() / 2.0`: labels are laid out
+        // with `halign: Center` so that a wrapped name's rows are centred on
+        // its anchor, which puts the galley's own origin on its centre line
+        // rather than at its top-left corner. The two spellings agree only for
+        // a left-aligned galley. **The asserted position did not move** -- this
+        // is the same "at the tile centre" check, measured correctly for a
+        // centred galley.
+        let placed_centre = label.pos + label.galley.rect.center().to_vec2();
         assert!(
             (placed_centre - rect.center()).length() < 0.01,
             "the label landed at {placed_centre:?}, not the tile centre {:?}",
@@ -927,6 +971,290 @@ mod tests {
             crate::tiles::TILE_SIDE_POINTS
         );
     }
+    // -----------------------------------------------------------------------
+    // The label phase: wrapping, repetition and haloes
+    // -----------------------------------------------------------------------
+
+    /// The 77-character name that spanned the user's whole viewport as one
+    /// line. Every one of its five OpenMapTiles name fields carries this exact
+    /// string, so there is no shorter variant to select and wrapping is the
+    /// only way it fits.
+    const LONG_NAME: &str =
+        "Kiowa Indian Tribe, Comanche Nation, Apache Tribe, and Fort Sill Apache Tribe";
+
+    fn label(name: &str, at: egui::Pos2) -> Text {
+        Text::new(
+            at,
+            name.to_owned(),
+            12.0,
+            egui::Color32::WHITE,
+            egui::Color32::TRANSPARENT,
+            0.0,
+        )
+    }
+
+    /// Every `TextShape` a pass emitted, reaching inside a haloed label's
+    /// `Shape::Vec`.
+    fn text_shapes(shapes: &[egui::epaint::ClippedShape]) -> Vec<&egui::epaint::TextShape> {
+        fn walk<'a>(shape: &'a egui::Shape, into: &mut Vec<&'a egui::epaint::TextShape>) {
+            match shape {
+                egui::Shape::Text(text) => into.push(text),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, into)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut found);
+        }
+        found
+    }
+
+    /// **`text-max-width` wraps, and the collision box covers the block.**
+    ///
+    /// The defect: no wrapping existed anywhere in walkers, so a style's
+    /// `text-max-width` was parsed by nothing and every label drew as one run.
+    #[test]
+    fn a_long_name_wraps_to_its_styled_width() {
+        let ctx = egui::Context::default();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(canvas),
+            ..Default::default()
+        });
+
+        // NON-VACUITY / the control: unwrapped, this is the viewport-spanning
+        // run the user is looking at.
+        let unwrapped = label(LONG_NAME, egui::pos2(400.0, 300.0)).galley(&ctx);
+        assert_eq!(unwrapped.rows.len(), 1, "the control must be a single run");
+        assert!(
+            unwrapped.size().x > 400.0,
+            "the control is {} pt wide; it is supposed to be wider than the pane",
+            unwrapped.size().x
+        );
+
+        // `place_city_dot_z7`, which is the layer this name actually draws
+        // through, asks for `text-max-width: 8`.
+        let wrapped = label(LONG_NAME, egui::pos2(400.0, 300.0))
+            .with_wrapping(Some(8.0), None)
+            .galley(&ctx);
+
+        assert!(
+            wrapped.rows.len() > 1,
+            "an 8-em cap left the name on one row"
+        );
+        assert!(
+            wrapped.size().x <= 8.0 * 12.0,
+            "the wrapped block is {} pt wide, over the 96 pt the style asked for",
+            wrapped.size().x
+        );
+        // The block is taller because it is narrower: nothing was dropped.
+        assert!(
+            wrapped.size().y > unwrapped.size().y,
+            "the wrapped block is no taller than one row, so text went missing"
+        );
+        assert_eq!(
+            wrapped.job.text, unwrapped.job.text,
+            "wrapping must not change the text itself"
+        );
+
+        let _ = ctx.end_pass();
+    }
+
+    /// A short name is not padded out to the wrap width, so wrapping cannot
+    /// silently inflate every collision box on the map.
+    #[test]
+    fn a_short_name_is_not_widened_by_its_wrap_limit() {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        });
+
+        let galley = label("Enid", egui::pos2(100.0, 100.0))
+            .with_wrapping(Some(10.0), None)
+            .galley(&ctx);
+
+        assert_eq!(galley.rows.len(), 1);
+        assert!(
+            galley.size().x < 10.0 * 12.0 * 0.5,
+            "a four-letter name measured {} pt against a 120 pt cap",
+            galley.size().x
+        );
+        let _ = ctx.end_pass();
+    }
+
+    /// **One river, one label per stretch of screen.**
+    ///
+    /// OSM splits a way at every tag change and confluence, so a watercourse
+    /// arrives as many `LineString`s and each asks for its own label -- the
+    /// user counted "Rio Grande" six times in one viewport. The rule is a
+    /// distance and not a set, so a river crossing the whole pane is still
+    /// named at both ends.
+    #[test]
+    fn a_river_split_into_fragments_is_named_once_per_stretch() {
+        let ctx = egui::Context::default();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 600.0));
+
+        // Four fragments of one river. The spacing is chosen so the ordinary
+        // overlap test cannot decide this: at 12 pt "Rio Grande" is about 63 pt
+        // wide, so 80 pt apart the boxes do not touch, and the whole run is
+        // 240 pt end to end, inside `MIN_REPEAT_DISTANCE`.
+        let anchors: Vec<egui::Pos2> = (0..4)
+            .map(|i| egui::pos2(100.0 + 80.0 * i as f32, 300.0))
+            .collect();
+
+        // THE CONTROL FIRST, because it establishes that these four positions
+        // are ones the collision test lets through. Without it "one label"
+        // below would also be what a plain overlap would have produced, and
+        // this test would be evidence of nothing.
+        let distinct: Vec<Text> = anchors
+            .iter()
+            .enumerate()
+            .map(|(i, at)| label(&format!("River {i}"), *at))
+            .collect();
+        let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
+            paint_labels(ui.painter(), distinct);
+        });
+        assert_eq!(
+            text_shapes(&shapes).len(),
+            4,
+            "fixture: these four anchors must not collide, or the assertion \
+             below is about the overlap rule instead of the repeat rule"
+        );
+
+        let crowded: Vec<Text> = anchors.iter().map(|at| label("Rio Grande", *at)).collect();
+        let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
+            paint_labels(ui.painter(), crowded);
+        });
+        assert_eq!(
+            text_shapes(&shapes).len(),
+            1,
+            "four fragments of one river put four labels on the glass"
+        );
+
+        // THE CONTROL, in two directions at once. A name far enough away is a
+        // second reading and must still draw, and two *different* names in the
+        // same place must not be collapsed into one.
+        let spread = vec![
+            label("Rio Grande", egui::pos2(100.0, 300.0)),
+            label(
+                "Rio Grande",
+                egui::pos2(100.0 + MIN_REPEAT_DISTANCE + 50.0, 300.0),
+            ),
+            // On its own row: near enough that a name-only rule would be
+            // tempted by it, far enough that the ordinary overlap test -- which
+            // is a different rule and is not what this control is about --
+            // leaves it alone.
+            label("Rio Salado", egui::pos2(140.0, 400.0)),
+        ];
+        let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
+            paint_labels(ui.painter(), spread);
+        });
+        let drawn: Vec<&str> = text_shapes(&shapes)
+            .iter()
+            .map(|t| t.galley.job.text.as_str())
+            .collect();
+        assert_eq!(
+            drawn.iter().filter(|t| **t == "Rio Grande").count(),
+            2,
+            "a river spanning the pane must be readable at both ends, got {drawn:?}"
+        );
+        assert!(
+            drawn.contains(&"Rio Salado"),
+            "a different river was eaten by the repeat rule, got {drawn:?}"
+        );
+    }
+
+    /// **The halo is the glyphs redrawn around themselves, not a filled box.**
+    ///
+    /// What shipped before was the halo colour at half alpha in
+    /// `TextFormat::background`, which egui paints across the galley's whole
+    /// bounding rectangle -- the grey slab behind every river name.
+    #[test]
+    fn a_haloed_label_draws_glyphs_around_itself_and_no_box() {
+        let ctx = egui::Context::default();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+
+        let haloed = Text::new(
+            egui::pos2(400.0, 300.0),
+            "Washita River".to_owned(),
+            12.0,
+            egui::Color32::WHITE,
+            egui::Color32::BLACK,
+            0.0,
+        )
+        .with_halo_width(1.0);
+
+        let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
+            paint_labels(ui.painter(), vec![haloed]);
+        });
+
+        let texts = text_shapes(&shapes);
+        assert_eq!(
+            texts.len(),
+            9,
+            "a haloed label is eight offset draws plus the glyphs themselves"
+        );
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|t| t.fallback_color == egui::Color32::WHITE)
+                .count(),
+            1,
+            "exactly one draw is the text; the rest are halo"
+        );
+
+        // The halo draws are displaced from the text and by the styled width.
+        let centre = texts
+            .iter()
+            .find(|t| t.fallback_color == egui::Color32::WHITE)
+            .expect("the glyph draw")
+            .pos;
+        for halo in texts
+            .iter()
+            .filter(|t| t.fallback_color == egui::Color32::BLACK)
+        {
+            let offset = (halo.pos - centre).length();
+            assert!(
+                (offset - 1.0).abs() < 0.01,
+                "a halo draw sits {offset} pt out, not the 1 pt the style asked for"
+            );
+        }
+
+        // NO BOX. The old spelling put the halo colour in `TextFormat`, which
+        // shows up as a filled rect behind the galley.
+        assert!(
+            !shapes
+                .iter()
+                .any(|c| matches!(&c.shape, egui::Shape::Rect(_))),
+            "a background rectangle is still being painted behind the label"
+        );
+
+        // The control: with no halo width, one draw and nothing else -- so the
+        // count above is a property of the halo and not of the painter.
+        let bare = Text::new(
+            egui::pos2(400.0, 300.0),
+            "Washita River".to_owned(),
+            12.0,
+            egui::Color32::WHITE,
+            egui::Color32::BLACK,
+            0.0,
+        );
+        let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
+            paint_labels(ui.painter(), vec![bare]);
+        });
+        assert_eq!(
+            text_shapes(&shapes).len(),
+            1,
+            "a label whose style asks for no halo width still drew one"
+        );
+    }
+
     /// Each of the three conditions must block **on its own**.
     #[test]
     fn each_condition_blocks_a_position_on_its_own() {
