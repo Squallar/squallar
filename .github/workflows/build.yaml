@@ -335,6 +335,15 @@ jobs:
           # `wasm-pack … --release` on default features, and Gradle and the iOS
           # Makefile name no feature at all.
           #
+          # SINCE THE WEB DRAW SEAM LANDED (2026-08-28) THE `web-wasm32` ROW
+          # COMPILES IT TOO, and that is a change to what the rows below are for
+          # rather than a reason to drop them. `squallar-web/Cargo.toml` now
+          # requests `basemap-vector`, so `wasm-pack build squallar-web` carries
+          # it on default features. What that row does NOT do is compile
+          # `squallar-egui` alone -- the `gps-serial` lesson below is exactly
+          # about a crate that only ever built as somebody's dependency -- and it
+          # does not run a single test. Both rows stay.
+          #
           # What coverage the feature did have, stated exactly rather than
           # rounded down, because "it is covered nowhere" would be false: four
           # commands compile it, and all four are the HOST triple --
@@ -410,18 +419,28 @@ jobs:
               cargo check -p squallar-egui --all-targets \
                 --target x86_64-unknown-linux-gnu \
                 --features squallar-egui/basemap-vector
-              # And RUN them. The feature gates tests the default workspace
-              # suite cannot see -- `cargo test --workspace -- --list` selects
-              # 0 of them -- so without this line the archive path ships with a
-              # green board and zero executed assertions. That is the same
-              # shape as a `running 0 tests` pass, one layer up.
+              # And RUN them.
               #
-              # The gap, measured 2026-08-28 on the draw-seam commit, as
-              # `cargo test -p squallar-egui -- --list | wc -l`: 1148 without
-              # the feature, 1164 with it. Those 16 run in no other row.
-              # **Anything added behind that feature must live in
-              # `squallar-egui`, or this row's `-p` has to grow in the same
-              # commit.**
+              # THE CLAIM THIS LINE USED TO CARRY HAS CHANGED and the line is
+              # still needed. It read "`cargo test --workspace -- --list`
+              # selects 0 of them"; that was true on the draw-seam commit and is
+              # false now. `squallar-web` requests `basemap-vector`, and a
+              # workspace build unifies the feature onto `squallar-egui`, so the
+              # workspace suite selects all 16 -- measured 2026-08-28,
+              # `cargo test --workspace -- --list | grep -c "archive::"` over
+              # this crate's gated modules: 16, against 0 before.
+              #
+              # What this row still buys, now that it is no longer the only
+              # place they run: it runs them with `squallar-egui` as the ROOT
+              # package, so they survive `squallar-web` ever dropping the
+              # feature -- the `gps-serial` failure was precisely a crate that
+              # only ever built as somebody else's dependency.
+              #
+              # The gap this feature opens in the crate's own suite, measured
+              # 2026-08-28 as `cargo test -p squallar-egui -- --list | wc -l`:
+              # 1151 without the feature, 1167 with it. **Anything added behind
+              # that feature must live in `squallar-egui`, or this row's `-p`
+              # has to grow in the same commit.**
               # The wasm row above stays check-only because its tests cannot be
               # executed on the host.
               cargo test -p squallar-egui \

@@ -1136,22 +1136,32 @@ fn a_pump_decodes_at_most_the_budget_and_the_rest_wait_their_turn() {
     // The sink is the decode path: an item only counts once its bytes have
     // been decoded, so the counts cannot be satisfied by mere dequeueing.
     let mut decoded: Vec<TileId> = Vec::new();
+    // The "IO task is gone" latch. This test never closes the channel, so it is
+    // only here to satisfy the signature; `drain_up_to`'s own doc says why the
+    // latch exists.
+    let mut io_task_gone_reported = false;
     let pump = |rx: &mut futures::channel::mpsc::Receiver<(TileId, Vec<u8>)>,
-                decoded: &mut Vec<TileId>| {
-        drain_up_to(rx, WASM_TILE_DECODES_PER_PUMP, |(tile_id, bytes)| {
-            // `Style::default()` for the reason `fetch_one` gives.
-            #[allow(
-                clippy::default_constructed_unit_structs,
-                reason = "keeps compiling if walkers/mvt is ever enabled"
-            )]
-            let tile = Tile::new(&bytes, &Style::default(), tile_id.zoom, &ctx)
-                .expect("the fixture PNG should decode");
-            drop(tile);
-            decoded.push(tile_id);
-        })
+                decoded: &mut Vec<TileId>,
+                reported: &mut bool| {
+        drain_up_to(
+            rx,
+            WASM_TILE_DECODES_PER_PUMP,
+            reported,
+            |(tile_id, bytes)| {
+                // `Style::default()` for the reason `fetch_one` gives.
+                #[allow(
+                    clippy::default_constructed_unit_structs,
+                    reason = "keeps compiling if walkers/mvt is ever enabled"
+                )]
+                let tile = Tile::new(&bytes, &Style::default(), tile_id.zoom, &ctx)
+                    .expect("the fixture PNG should decode");
+                drop(tile);
+                decoded.push(tile_id);
+            },
+        )
     };
 
-    let first = pump(&mut rx, &mut decoded);
+    let first = pump(&mut rx, &mut decoded, &mut io_task_gone_reported);
     assert_eq!(
         first,
         decoded.len(),
@@ -1163,7 +1173,7 @@ fn a_pump_decodes_at_most_the_budget_and_the_rest_wait_their_turn() {
         "one pump decodes exactly the budget, in arrival order"
     );
 
-    let second = pump(&mut rx, &mut decoded);
+    let second = pump(&mut rx, &mut decoded, &mut io_task_gone_reported);
     assert_eq!(second, 2, "a second pump takes the next two");
     assert_eq!(
         decoded,
@@ -1171,9 +1181,9 @@ fn a_pump_decodes_at_most_the_budget_and_the_rest_wait_their_turn() {
         "the first pump left N - 2 queued, and nothing was lost or reordered"
     );
 
-    let third = pump(&mut rx, &mut decoded);
+    let third = pump(&mut rx, &mut decoded, &mut io_task_gone_reported);
     assert_eq!(third, 1, "the tail is one tile, not a refilled budget");
-    let fourth = pump(&mut rx, &mut decoded);
+    let fourth = pump(&mut rx, &mut decoded, &mut io_task_gone_reported);
     assert_eq!(fourth, 0, "an empty queue yields nothing");
     assert_eq!(
         decoded,
@@ -1295,11 +1305,19 @@ fn live_cartodb_tile_decodes_and_reaches_a_texture() {
 // ---------------------------------------------------------------------------
 // The archive source
 //
-// COVERAGE: these are behind `basemap-vector`, which is OFF BY DEFAULT, so
-// `cargo test --workspace` does not select them. What runs them is the native
-// `basemap-vector` row in `.github/workflows/build.yaml`, which names
-// `-p squallar-egui`. Anything added here that lives in another crate needs
-// that row's `-p` scope to grow in the same commit.
+// COVERAGE: these are behind `basemap-vector`, and **`cargo test --workspace`
+// now selects them**, which it did not before the web draw seam landed. The
+// feature is still off by default; what changed is that `squallar-web` asks for
+// it, and `squallar-web` is a workspace member, so a workspace build unifies the
+// feature onto `squallar-egui`. Measured 2026-08-28,
+// `cargo test --workspace -- --list | grep -c "archive::"` over this crate's
+// two gated modules: 16, where it selected 0 before.
+//
+// That is a second, wider source of coverage, not a replacement for the first.
+// The native `basemap-vector` row in `.github/workflows/build.yaml` still names
+// `-p squallar-egui` and still runs them, and it is the one that survives
+// `squallar-web` ever dropping the feature. Anything added here that lives in
+// another crate needs that row's `-p` scope to grow in the same commit.
 //
 // The seam these exercise -- `Tile::Vector` reaching the painter -- is also
 // covered un-gated, in `ui_map_overlays::tests`, because `walkers/mvt` is on

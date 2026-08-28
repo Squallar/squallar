@@ -189,10 +189,11 @@ impl<T: TileSource + 'static> AsyncTileSource for T {}
 
 /// What one completed fetch hands the frame side.
 ///
-/// Native: the decoded [`Tile`] — [`fetch_one`] decodes and uploads on the IO
-/// thread. wasm32: the compressed PNG bytes, decoded by the frame pump at most
-/// [`WASM_TILE_DECODES_PER_PUMP`] per source per pass — see
-/// [`HttpsTiles::pump`].
+/// Native: the decoded [`Tile`] — [`fetch_one`] and [`read_one`] decode and
+/// upload on the IO thread. wasm32: the tile body undecoded — a compressed PNG
+/// from a raster source, an MVT body from the archive — turned into a [`Tile`]
+/// by the frame pump at most [`WASM_TILE_DECODES_PER_PUMP`] per source per pass
+/// — see [`HttpsTiles::pump`].
 #[cfg(not(target_arch = "wasm32"))]
 type FetchPayload = Tile;
 #[cfg(target_arch = "wasm32")]
@@ -391,10 +392,16 @@ pub struct HttpsTiles {
     decode_budget: DecodeBudget,
 
     /// wasm32 only: the style [`Tile::new`] renders a vector tile against.
-    /// Empty for a raster source, which never reads it. On native the IO task
-    /// owns its own clone -- see [`fetch_one`].
+    /// Empty for a raster source, which never reads it; the committed style for
+    /// an archive source, where it is the whole appearance of the map. On
+    /// native the IO task owns its own clone -- see [`fetch_one`], [`read_one`].
     #[cfg(target_arch = "wasm32")]
     style: Arc<Style>,
+
+    /// Whether "the tile IO task is gone" has already been said for this
+    /// source. See [`drain_up_to`]: the condition is permanent, so the line is
+    /// not.
+    io_task_gone_reported: bool,
 
     /// [`Self::pump`] calls since this source was built — see [`Self::pumps`].
     /// Always on, like the app's other ledgers: one `u64` add per layer per
@@ -458,7 +465,21 @@ impl DecodeBudget {
 /// Both arms of [`HttpsTiles::drain_completed_fetches`] are this loop over a
 /// different `take` and a different budget — which is the whole platform
 /// difference behind [`HttpsTiles::pump`].
-fn drain_up_to<T>(rx: &mut Receiver<T>, budget: usize, mut take: impl FnMut(T)) -> usize {
+///
+/// `reported` is the source's own latch and the reason it exists is measured,
+/// not defensive. The IO task ends for good when the archive will not open —
+/// [`serve_archive_continuously`] logs why and returns — and after that the
+/// channel is closed on every subsequent drain. [`HttpsTiles::pump`] runs once
+/// per layer per frame, so the unlatched version emitted this line at frame
+/// rate: **120 `console.error`s in one 40 s Firefox run against a host that
+/// answers `200` to a range request**, measured 2026-08-28. The condition is
+/// permanent and the user can do nothing about it, so it is said once.
+fn drain_up_to<T>(
+    rx: &mut Receiver<T>,
+    budget: usize,
+    reported: &mut bool,
+    mut take: impl FnMut(T),
+) -> usize {
     let mut taken = 0;
     while taken < budget {
         match rx.try_recv() {
@@ -468,7 +489,10 @@ fn drain_up_to<T>(rx: &mut Receiver<T>, budget: usize, mut take: impl FnMut(T)) 
             }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Closed) => {
-                log::error!("the tile IO task is gone");
+                if !*reported {
+                    *reported = true;
+                    log::error!("the tile IO task is gone; this source will serve no more tiles");
+                }
                 break;
             }
         }
@@ -535,6 +559,7 @@ impl HttpsTiles {
             // which only reads a style for a tile that is not an image.
             #[cfg(target_arch = "wasm32")]
             style: Arc::new(Style::default()),
+            io_task_gone_reported: false,
             pumps: 0,
             runtime,
         }
@@ -586,10 +611,16 @@ impl HttpsTiles {
     fn drain_completed_fetches(&mut self) {
         // Split borrow: the closure needs the cache while the receiver is
         // borrowed.
-        let Self { cache, tile_rx, .. } = self;
+        let Self {
+            cache,
+            tile_rx,
+            io_task_gone_reported,
+            ..
+        } = self;
         drain_up_to(
             tile_rx,
             NATIVE_TILE_UPLOADS_PER_PUMP,
+            io_task_gone_reported,
             |(tile_id, tile): (TileId, Tile)| {
                 cache.put(tile_id, Some(tile));
             },
@@ -611,27 +642,28 @@ impl HttpsTiles {
             egui_ctx,
             decode_budget,
             style,
+            io_task_gone_reported,
             ..
         } = self;
         let style: &Style = style;
 
         let budget = decode_budget.remaining(egui_ctx.cumulative_pass_nr());
-        let taken =
-            drain_up_to(
-                tile_rx,
-                budget,
-                |(tile_id, bytes): (TileId, Vec<u8>)| match Tile::new(
-                    &bytes,
-                    style,
-                    tile_id.zoom,
-                    egui_ctx,
-                ) {
-                    Ok(tile) => {
-                        cache.put(tile_id, Some(tile));
-                    }
-                    Err(error) => log::warn!("decoding tile {tile_id:?}: {error}"),
-                },
-            );
+        let taken = drain_up_to(
+            tile_rx,
+            budget,
+            io_task_gone_reported,
+            |(tile_id, bytes): (TileId, Vec<u8>)| match Tile::new(
+                &bytes,
+                style,
+                tile_id.zoom,
+                egui_ctx,
+            ) {
+                Ok(tile) => {
+                    cache.put(tile_id, Some(tile));
+                }
+                Err(error) => log::warn!("decoding tile {tile_id:?}: {error}"),
+            },
+        );
         decode_budget.record(taken);
 
         if budget > 0 && taken == budget {
@@ -895,7 +927,7 @@ async fn fetch_continuously<S: TileSource>(
 /// LRU, the same de-duplication, the same interpolation from a shallower
 /// ancestor, the same [`HttpsTiles::pump`] contract. Only where the bytes come
 /// from, and what they decode into, differ.
-#[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
+#[cfg(feature = "basemap-vector")]
 impl HttpsTiles {
     /// Serve tiles from the PMTiles archive at `url`, rendered against `style`.
     ///
@@ -954,6 +986,16 @@ impl HttpsTiles {
 
         let max_zoom = Arc::new(AtomicU8::new(0));
 
+        // Both clones exist for the reason `with_client_and_cache` clones the
+        // context: on wasm32 the frame pump is the tessellating side, so it
+        // needs the context to upload through and the style to render against.
+        // The IO task is handed its own pair either way -- `read_one` takes
+        // both and ignores them on the target that does not decode there.
+        #[cfg(target_arch = "wasm32")]
+        let frame_ctx = egui_ctx.clone();
+        #[cfg(target_arch = "wasm32")]
+        let frame_style = Arc::clone(&style);
+
         let runtime = runtime::spawn(serve_archive_continuously(
             source,
             style,
@@ -975,6 +1017,17 @@ impl HttpsTiles {
             cache: LruCache::new(cache_entries),
             request_tx,
             tile_rx,
+            #[cfg(target_arch = "wasm32")]
+            egui_ctx: frame_ctx,
+            #[cfg(target_arch = "wasm32")]
+            decode_budget: DecodeBudget::new(),
+            // NOT the raster path's `Style::default()`: this is the committed
+            // style, and it is what `Tile::new` renders the MVT body against.
+            // An empty one would hand back a blank tile for every road and
+            // every label.
+            #[cfg(target_arch = "wasm32")]
+            style: frame_style,
+            io_task_gone_reported: false,
             pumps: 0,
             runtime,
         }
@@ -988,11 +1041,15 @@ impl HttpsTiles {
 /// bounded number of reads in flight is what keeps a pan from opening one range
 /// request per visible tile at once.
 ///
-/// **The tessellation happens here, on the IO thread.** `Tile::new` falls
-/// through to `mvt::render` for a body no image decoder recognises, and that is
-/// the whole per-tile cost of a vector basemap -- the frame side only ever
-/// moves a finished `Tile` into the cache.
-#[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
+/// **Where the tessellation happens is the target's, not this loop's.**
+/// `Tile::new` falls through to `mvt::render` for a body no image decoder
+/// recognises, and that is the whole per-tile cost of a vector basemap. On
+/// native [`read_one`] pays it here on the IO thread and the frame side only
+/// moves a finished `Tile` into the cache; on wasm32 there is no other thread
+/// to pay it on, so the body crosses undecoded and
+/// [`HttpsTiles::drain_completed_fetches`] pays it under
+/// [`WASM_TILE_DECODES_PER_PUMP`]. See [`FetchPayload`].
+#[cfg(feature = "basemap-vector")]
 async fn serve_archive_continuously<S>(
     source: S,
     style: Arc<Style>,
@@ -1071,15 +1128,38 @@ async fn serve_archive_continuously<S>(
     log::debug!("archive tile loop finished");
 }
 
-/// Read one tile out of the archive and render it.
+/// Read one tile out of the archive -- and on native, tessellate and upload it
+/// too.
 ///
 /// `Ok(None)` is the archive positively holding nothing at that coordinate --
 /// an ocean tile at zoom 14 -- which is why
 /// [`crate::basemap_archive::TileBytes`] is a type rather than an empty `Vec`.
-#[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
+///
+/// The payload split is [`fetch_one`]'s, for [`FetchPayload`]'s reason and not
+/// a second one: on native the IO thread owns the tessellation, on wasm32 the
+/// IO task *is* the page thread, so the MVT body crosses the channel undecoded
+/// and [`HttpsTiles::drain_completed_fetches`] renders it under
+/// [`WASM_TILE_DECODES_PER_PUMP`]. Doing it here on wasm32 would put an
+/// unbounded tessellation on the frame thread; doing it there puts a bounded
+/// one.
+#[cfg(feature = "basemap-vector")]
 async fn read_one<S>(
     archive: &crate::basemap_archive::BasemapArchive<S>,
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(
+            unused_variables,
+            reason = "on wasm the frame pump tessellates; see FetchPayload"
+        )
+    )]
     style: &Style,
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(
+            unused_variables,
+            reason = "on wasm the frame pump tessellates; see FetchPayload"
+        )
+    )]
     egui_ctx: &Context,
     tile_id: TileId,
 ) -> Result<Option<(TileId, FetchPayload)>, String>
@@ -1096,10 +1176,15 @@ where
         return Ok(None);
     };
 
-    let tile = Tile::new(bytes, style, tile_id.zoom, egui_ctx)
+    #[cfg(not(target_arch = "wasm32"))]
+    let payload = Tile::new(bytes, style, tile_id.zoom, egui_ctx)
         .map_err(|error| format!("rendering {tile_id:?} from the basemap archive: {error}"))?;
 
-    Ok(Some((tile_id, tile)))
+    // On wasm the tessellation belongs to the frame pump, under its budget.
+    #[cfg(target_arch = "wasm32")]
+    let payload = bytes.to_vec();
+
+    Ok(Some((tile_id, payload)))
 }
 
 // Native-only: `#[tokio::test]` (the dev-dependency is target-gated),
