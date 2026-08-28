@@ -248,22 +248,53 @@ fn full_rect_of_clipped_tile(rect: egui::Rect, uv: egui::Rect) -> egui::Rect {
 /// and this comment is the record of what it stands in for.
 const MIN_REPEAT_DISTANCE: f32 = 300.0;
 
+/// How many rows a wrapped label may occupy before it is not worth placing.
+///
+/// **A name that needs a third row is not a label, it is a paragraph.** OSM
+/// carries the legal names of jointly-held areas, and at least one of them --
+/// "Kiowa Indian Tribe, Comanche Nation, Apache Tribe, and Fort Sill Apache
+/// Tribe", 77 characters -- has every one of its five OpenMapTiles name fields
+/// set to that same string, so there is no shorter variant to select. Wrapping
+/// it to its layer's `text-max-width` gives a 92x70 pt block that dominates the
+/// view; unwrapped it measures 414.7 pt and spans the pane. Neither is a label.
+///
+/// Two rows and not one, because the ordinary long-ish names are two rows and
+/// read fine: "Iowa Tribe of Oklahoma", "Seneca-Cayuga Nation". Those are the
+/// cases this must not touch, and they are what sets the threshold.
+///
+/// This is a *length* rule and not a list. Any name anywhere in the world that
+/// cannot be set in two rows is dropped, which is the behaviour of most maps --
+/// they simply do not label that area at this zoom -- rather than a special case
+/// for one feature that would leave the next one to be found by a user.
+const MAX_LABEL_ROWS: usize = 2;
+
 /// Lay one label out, and claim the area it needs.
 ///
-/// Returns [`egui::Shape::Noop`] when the area is already taken, which is the
-/// collision rule: first label to ask for a piece of screen keeps it.
+/// Returns [`egui::Shape::Noop`] when the label is unplaceable, which happens
+/// two ways: the area is already taken -- the collision rule, first label to ask
+/// for a piece of screen keeps it -- or the name is too long to set in
+/// [`MAX_LABEL_ROWS`].
 ///
 /// The caller owns `occupied`, and [`paint_labels`] owns the only one there is
 /// per pane.
 ///
-/// The wrapping and the halo are [`walkers::Text`]'s own, so this phase and
-/// walkers' per-tile draw cannot drift apart.
+/// The layout is [`walkers::Text`]'s own, so this phase and walkers' per-tile
+/// draw cannot drift apart. The row cap is *not* pushed down there: it is our
+/// cartographic policy about what is worth drawing, not a property of laying
+/// text out, and walkers has no opinion about it.
 fn lay_out_label(
     ctx: &egui::Context,
     text: &walkers::Text,
     occupied: &mut walkers::OccupiedAreas,
 ) -> egui::Shape {
     let galley = text.galley(ctx);
+
+    // Before `try_occupy`, so an unplaceable name does not first claim the
+    // screen it was never going to be drawn on and evict a label that fits.
+    if galley.rows.len() > MAX_LABEL_ROWS {
+        return egui::Shape::Noop;
+    }
+
     let area = walkers::text::OrientedRect::new(text.position, text.angle, galley.size());
     let top_left = area.top_left();
 
@@ -553,7 +584,6 @@ mod tests {
                 "Monaco".to_owned(),
                 12.0,
                 egui::Color32::WHITE,
-                egui::Color32::TRANSPARENT,
                 0.0,
             )),
         ]))
@@ -777,7 +807,6 @@ mod tests {
             name.to_owned(),
             12.0,
             egui::Color32::WHITE,
-            egui::Color32::TRANSPARENT,
             0.0,
         ))
     }
@@ -983,14 +1012,7 @@ mod tests {
         "Kiowa Indian Tribe, Comanche Nation, Apache Tribe, and Fort Sill Apache Tribe";
 
     fn label(name: &str, at: egui::Pos2) -> Text {
-        Text::new(
-            at,
-            name.to_owned(),
-            12.0,
-            egui::Color32::WHITE,
-            egui::Color32::TRANSPARENT,
-            0.0,
-        )
+        Text::new(at, name.to_owned(), 12.0, egui::Color32::WHITE, 0.0)
     }
 
     /// Every `TextShape` a pass emitted, reaching inside a haloed label's
@@ -1170,89 +1192,99 @@ mod tests {
         );
     }
 
-    /// **The halo is the glyphs redrawn around themselves, not a filled box.**
+    /// **A label is exactly one text draw and no box.**
     ///
-    /// What shipped before was the halo colour at half alpha in
-    /// `TextFormat::background`, which egui paints across the galley's whole
-    /// bounding rectangle -- the grey slab behind every river name.
+    /// Two halo approximations have shipped here and both were withdrawn after
+    /// looking at them. `TextFormat::background` fills the galley's bounding
+    /// rectangle, so a style's `text-halo-color` painted a translucent slab
+    /// behind the whole label. Redrawing the glyphs at eight offsets around a
+    /// circle -- the standard approximation short of a glyph atlas -- read as
+    /// fuzzy and unevenly weighted, because each copy is alpha-blended
+    /// anti-aliased text and the coverage stacks differently around different
+    /// letter edges.
+    ///
+    /// This pins the withdrawal in both directions at once: not more than one
+    /// draw, and not a rectangle either. A real SDF halo would make it go red,
+    /// which is correct -- that would be a deliberate change, not a regression.
     #[test]
-    fn a_haloed_label_draws_glyphs_around_itself_and_no_box() {
+    fn a_label_is_one_draw_and_no_background_box() {
         let ctx = egui::Context::default();
         let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
 
-        let haloed = Text::new(
-            egui::pos2(400.0, 300.0),
-            "Washita River".to_owned(),
-            12.0,
-            egui::Color32::WHITE,
-            egui::Color32::BLACK,
-            0.0,
-        )
-        .with_halo_width(1.0);
-
         let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
-            paint_labels(ui.painter(), vec![haloed]);
+            paint_labels(
+                ui.painter(),
+                vec![label("Washita River", egui::pos2(400.0, 300.0))],
+            );
         });
 
         let texts = text_shapes(&shapes);
         assert_eq!(
             texts.len(),
-            9,
-            "a haloed label is eight offset draws plus the glyphs themselves"
+            1,
+            "a label drew {} times, not once",
+            texts.len()
         );
         assert_eq!(
-            texts
-                .iter()
-                .filter(|t| t.fallback_color == egui::Color32::WHITE)
-                .count(),
-            1,
-            "exactly one draw is the text; the rest are halo"
+            texts[0].fallback_color,
+            egui::Color32::WHITE,
+            "the one draw is the text itself"
         );
-
-        // The halo draws are displaced from the text and by the styled width.
-        let centre = texts
-            .iter()
-            .find(|t| t.fallback_color == egui::Color32::WHITE)
-            .expect("the glyph draw")
-            .pos;
-        for halo in texts
-            .iter()
-            .filter(|t| t.fallback_color == egui::Color32::BLACK)
-        {
-            let offset = (halo.pos - centre).length();
-            assert!(
-                (offset - 1.0).abs() < 0.01,
-                "a halo draw sits {offset} pt out, not the 1 pt the style asked for"
-            );
-        }
-
-        // NO BOX. The old spelling put the halo colour in `TextFormat`, which
-        // shows up as a filled rect behind the galley.
         assert!(
             !shapes
                 .iter()
                 .any(|c| matches!(&c.shape, egui::Shape::Rect(_))),
-            "a background rectangle is still being painted behind the label"
+            "a background rectangle is being painted behind the label"
+        );
+    }
+
+    /// **A name too long to set in [`MAX_LABEL_ROWS`] is not drawn at all.**
+    ///
+    /// Wrapping it was tried and rejected on the glass: at its layer's
+    /// `text-max-width` the tribal-nation name becomes a 92x70 pt block that
+    /// dominates the view, and unwrapped it spans the pane. Most maps simply do
+    /// not label that area at this zoom.
+    #[test]
+    fn a_name_too_long_to_set_in_two_rows_is_not_drawn() {
+        let ctx = egui::Context::default();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+
+        // `place_city_dot_z7`, the layer this name actually draws through, asks
+        // for `text-max-width: 8`.
+        let long = label(LONG_NAME, egui::pos2(400.0, 300.0)).with_wrapping(Some(8.0), None);
+        let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
+            paint_labels(ui.painter(), vec![long]);
+        });
+        assert!(
+            text_shapes(&shapes).is_empty(),
+            "the 77-character name was drawn anyway"
         );
 
-        // The control: with no halo width, one draw and nothing else -- so the
-        // count above is a property of the halo and not of the painter.
-        let bare = Text::new(
-            egui::pos2(400.0, 300.0),
-            "Washita River".to_owned(),
-            12.0,
-            egui::Color32::WHITE,
-            egui::Color32::BLACK,
-            0.0,
-        );
-        let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
-            paint_labels(ui.painter(), vec![bare]);
-        });
-        assert_eq!(
-            text_shapes(&shapes).len(),
-            1,
-            "a label whose style asks for no halo width still drew one"
-        );
+        // THE CONTROLS, and they are what make the rule a length rule rather
+        // than a ban on wrapping. Both of these genuinely wrap -- they are the
+        // two-row tribal names sitting beside the long one in the same view --
+        // and both must survive.
+        for name in ["Iowa Tribe of Oklahoma", "Seneca-Cayuga Nation"] {
+            let text = label(name, egui::pos2(400.0, 300.0)).with_wrapping(Some(8.0), None);
+            let rows = text.galley(&ctx).rows.len();
+            assert!(
+                rows > 1,
+                "fixture: {name:?} is supposed to wrap, and took {rows} row"
+            );
+            assert!(
+                rows <= MAX_LABEL_ROWS,
+                "fixture: {name:?} took {rows} rows, over the cap"
+            );
+
+            let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
+                paint_labels(ui.painter(), vec![text]);
+            });
+            assert_eq!(
+                text_shapes(&shapes).len(),
+                1,
+                "{name:?} wraps to two rows and must still be drawn"
+            );
+        }
     }
 
     /// Each of the three conditions must block **on its own**.

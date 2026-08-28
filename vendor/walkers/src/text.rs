@@ -6,25 +6,6 @@ pub struct Text {
     pub position: Pos2,
     pub font_size: f32,
     pub text_color: Color32,
-    /// The colour of the outline drawn *behind* the glyphs.
-    ///
-    /// **This field used to be `background_color`, and the rename is the
-    /// change.** Nothing ever drew a background with it: its only producer set
-    /// it to a style's `text-halo-color` at half alpha, and its only consumer
-    /// put it in `egui::TextFormat::background`, which fills the galley's
-    /// bounding rectangle. So a style asking for a halo got a translucent box
-    /// behind the whole label instead of an outline around the letters, which
-    /// is what the `// TODO: Implement real halo rendering.` beside the
-    /// producer was about. The field now says what it is; see
-    /// [`halo_width`](Self::halo_width) for what a consumer is expected to do
-    /// with it.
-    pub halo_color: Color32,
-    /// How far the halo extends from the glyphs, in screen points.
-    ///
-    /// Zero means no halo, which is a value the committed styles actually use
-    /// (`watername_ocean` asks for `text-halo-width: 0`), so it is a real case
-    /// and not merely the default.
-    pub halo_width: f32,
     pub angle: f32,
     /// Wrap width in ems of [`font_size`](Self::font_size), from
     /// `text-max-width`.
@@ -44,7 +25,6 @@ impl Text {
         text: String,
         font_size: f32,
         text_color: Color32,
-        halo_color: Color32,
         angle: f32,
     ) -> Self {
         Self {
@@ -52,19 +32,10 @@ impl Text {
             text,
             font_size,
             text_color,
-            halo_color,
-            halo_width: 0.0,
             angle,
             max_width_ems: None,
             line_height_ems: None,
         }
-    }
-
-    /// This text with a halo `width` points wide.
-    #[must_use]
-    pub fn with_halo_width(mut self, width: f32) -> Self {
-        self.halo_width = width;
-        self
     }
 
     /// This text wrapped at `max_width_ems`, with rows `line_height_ems` apart.
@@ -118,52 +89,33 @@ impl Text {
     }
 
     /// The shape drawing `galley` with its block's top-left corner at
-    /// `top_left`, haloed if this label asked for one.
+    /// `top_left`.
     ///
-    /// **The halo is the glyphs redrawn around themselves, not a filled box.**
-    /// This used to be `egui::TextFormat::background` set to the halo colour at
-    /// half alpha, which fills the galley's bounding rectangle -- a translucent
-    /// slab behind the whole label rather than an outline following the
-    /// letters. Eight offsets on a circle rather than four on the axes: at the
-    /// one-point width the styles ask for, four leaves gaps on diagonal
-    /// strokes. All nine draws share one `Arc<Galley>`, so the text is shaped
-    /// once.
+    /// **No halo, and that is a decision made on the glass rather than a gap.**
+    /// Two approximations have now been tried and both looked worse than plain
+    /// glyphs. `egui::TextFormat::background` fills the galley's bounding
+    /// rectangle, so a style's `text-halo-color` came out as a translucent slab
+    /// behind the whole label. Redrawing the glyphs at eight offsets around a
+    /// circle -- the standard approximation short of an atlas -- reads as fuzzy
+    /// and uneven, because each offset copy is alpha-blended anti-aliased text
+    /// and the coverage stacks differently around different letter edges.
     ///
-    /// An SDF or a blurred mask is what MapLibre does and would be better; it
-    /// needs a glyph atlas this crate does not build, and offset draws are the
-    /// standard approximation short of one.
+    /// A real halo is an SDF or a blurred mask over a glyph atlas, which this
+    /// crate does not build. Until there is one, the honest option is the one
+    /// that looks best: draw the text.
+    ///
+    /// The style properties are still parsed (`Paint::text_halo_color`,
+    /// `Paint::text_halo_width`) because [`crate::style`] models the MapLibre
+    /// spec rather than this renderer's subset; they simply reach nothing.
     pub fn shape(&self, galley: std::sync::Arc<egui::Galley>, top_left: Pos2) -> egui::Shape {
-        use egui::epaint::TextShape;
-
         // Rows carry negative offsets under `Align::Center`, so the galley's
         // own origin is not its top-left corner. Subtracting it puts the block
         // exactly where the collision box claimed it.
         let origin = top_left - galley.rect.min.to_vec2();
 
-        let glyphs = |at: Pos2, color: Color32| -> egui::Shape {
-            TextShape::new(at, galley.clone(), color)
-                .with_angle(self.angle)
-                .into()
-        };
-
-        if self.halo_width <= 0.0 || self.halo_color.a() == 0 {
-            return glyphs(origin, self.text_color);
-        }
-
-        let mut shapes = Vec::with_capacity(9);
-        let (sin, cos) = self.angle.sin_cos();
-
-        for step in 0..8 {
-            let theta = std::f32::consts::TAU * (step as f32) / 8.0;
-            let (dx, dy) = (theta.cos() * self.halo_width, theta.sin() * self.halo_width);
-            // Rotated with the label, so a line label's halo stays a ring
-            // around the glyphs instead of being sheared off them.
-            let offset = vec2(dx * cos - dy * sin, dx * sin + dy * cos);
-            shapes.push(glyphs(origin + offset, self.halo_color));
-        }
-
-        shapes.push(glyphs(origin, self.text_color));
-        egui::Shape::Vec(shapes)
+        egui::epaint::TextShape::new(origin, galley, self.text_color)
+            .with_angle(self.angle)
+            .into()
     }
 }
 
