@@ -393,6 +393,61 @@ fn the_worker_deny_list_names_nothing_that_is_not_a_data_origin() {
     );
 }
 
+/// The archive host in `sw.js` is the archive host in Rust, or the route is a
+/// comment.
+///
+/// The only assertion in this file that can fail on a change nobody was
+/// thinking about, which is the point: `BASEMAP_ARCHIVE_URL` moves when the
+/// planet archive is regenerated, and `routeFor` is default-deny, so a moved
+/// host would leave `isBasemapArchive` matching nothing and every routing test
+/// still green. The pin is what makes the JS rule track the Rust const rather
+/// than a memory of it.
+///
+/// Direction matters here and it is deliberately the *tight* one: the JS
+/// constant must equal the const's host exactly, not contain it and not be
+/// contained by it.
+#[test]
+fn the_worker_names_the_same_basemap_archive_host_the_client_reads() {
+    let declared = literal_after(SERVICE_WORKER, "sw.js", "const BASEMAP_ARCHIVE_HOST = \"");
+
+    let expected = host_of(squallar_egui::tiles::BASEMAP_ARCHIVE_URL);
+
+    assert_eq!(
+        declared, expected,
+        "sw.js routes {declared:?} as the PMTiles archive, but \
+         squallar_egui::tiles::BASEMAP_ARCHIVE_URL is served from {expected:?}. \
+         The worker must not cache a range response; a stale host means the \
+         rule matches nothing and only default-deny is holding the line."
+    );
+
+    // Non-triviality: `host_of` returning an empty string, or the literal
+    // parse landing on an empty one, would make the equality above vacuous.
+    assert!(
+        expected.contains('.') && !expected.contains('/'),
+        "the archive host parsed as {expected:?}, which is not a hostname"
+    );
+}
+
+/// The archive is a `Range` read, so it must not be in the shell or asset
+/// lists — either would make the worker try to `Cache.put()` a 206.
+#[test]
+fn the_worker_never_lists_the_basemap_archive_as_a_cached_asset() {
+    let host = host_of(squallar_egui::tiles::BASEMAP_ARCHIVE_URL);
+
+    for (what, marker) in [
+        ("SHELL_PATHS", "const SHELL_PATHS = ["),
+        ("ASSET_PATHS", "const ASSET_PATHS = ["),
+    ] {
+        for entry in js_string_list(SERVICE_WORKER, marker) {
+            assert!(
+                !entry.contains(&host) && !entry.ends_with(".pmtiles"),
+                "{what} in squallar-web/sw.js names {entry:?}, which is the PMTiles \
+                 archive; a 206 cannot be stored in a Cache"
+            );
+        }
+    }
+}
+
 #[test]
 fn the_worker_shell_list_cannot_name_a_cross_origin_asset() {
     // `routeFor` builds shell URLs against the worker's own directory, so a

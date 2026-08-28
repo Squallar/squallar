@@ -11,6 +11,10 @@
  * CartoDB serves them `Cache-Control: public, max-age=15552000` (180 days) and
  * `tileFreshFor` honours that number rather than inventing one.
  *
+ * The PMTiles basemap archive is NOT that exception, despite being the same
+ * pixels: it is read by `Range`, and the Cache API can neither store a 206 nor
+ * match on a range. `isBasemapArchive` routes it "network" explicitly.
+ *
  * Every URL resolves against `ROOT`, so the same bytes work at `/squallar/`
  * (Pages) and at `/` (http.server).
  *
@@ -168,6 +172,13 @@ const NEVER_CACHE_HOSTS = new Set([
 /* CartoDB's four tile subdomains, as `squallar_egui::tiles::CartoDb` builds them. */
 const BASEMAP_HOST = /^cartodb-basemaps-[a-d]\.global\.ssl\.fastly\.net$/;
 
+/*
+ * The host serving the self-hosted PMTiles v3 basemap archive, as
+ * `squallar_egui::tiles::BASEMAP_ARCHIVE_URL` names it. `tests/pwa_assets.rs`
+ * pins this string against that const, so the two cannot drift.
+ */
+const BASEMAP_ARCHIVE_HOST = "tiles.squallar.app";
+
 /* ~15-25 KB per 256px PNG, so roughly 12-20 MB. */
 const TILE_CACHE_MAX = 700;
 
@@ -212,6 +223,25 @@ function isBasemapTile(url) {
   return BASEMAP_HOST.test(normalizeHost(url.hostname)) && /\.png$/i.test(url.pathname);
 }
 
+/**
+ * The PMTiles archive, which must reach the network untouched.
+ *
+ * Not a policy preference — the Cache API cannot hold this thing. Every request
+ * the reader issues carries a `Range`, so every response is a `206`, and
+ * `Cache.put()` is specified to reject a `Response` whose status is not 200-299
+ * *and* explicitly throws a `TypeError` on 206. Even if it stored, `Cache.match()`
+ * ignores `Range` entirely: the first stored range would be handed back for every
+ * subsequent offset, which is a corrupt archive rather than a slow one.
+ *
+ * Host-and-extension shaped like `isBasemapTile` above, and the extension is
+ * load-bearing here rather than cosmetic: the same host serves
+ * `/status/latest.json`, and a rule matching the bare host would also refuse a
+ * navigation if squallar were ever served from it.
+ */
+function isBasemapArchive(url) {
+  return normalizeHost(url.hostname) === BASEMAP_ARCHIVE_HOST && /\.pmtiles$/i.test(url.pathname);
+}
+
 function isShellAsset(url) {
   // Query and fragment dropped so a cache-busted `?v=2` still resolves.
   return SHELL_URL_SET.has(url.origin + url.pathname);
@@ -230,6 +260,19 @@ function isDataAsset(url) {
  *   "shell"    - a named app-shell asset.
  *   "asset"    - a named same-origin data asset, cached outside the shell.
  *   "tile"     - a CartoDB basemap tile.
+ *
+ * The PMTiles basemap archive routes "network" and has **no cache of its own**.
+ * That is deliberate, and `cachesToKeep` is why it has to stay that way: every
+ * `squallar-`-prefixed cache it does not name is deleted by `purgeCaches`, so
+ * adding a cache without adding it there would be a cache emptied before it was
+ * ever hit.
+ *
+ * The trigger is a DEPLOY, not an activate, and the difference is worth having
+ * written down because the obvious test gets it wrong. `checkForUpdate` returns
+ * early when the validator token has not moved, so an activate that finds the
+ * same deploy never reaches `purgeCaches` at all — seeding a stray cache and
+ * re-activating leaves it untouched. `sw_routing.test.mjs` publishes a real
+ * deploy for exactly this reason.
  *
  * Takes a plain `{url, method, mode}` rather than a `Request` so it is callable
  * from a test harness that has no `Request` constructor.
@@ -261,6 +304,13 @@ function routeFor({ url, method = "GET", mode = "no-cors" }) {
   // weather origin if squallar is ever served from one, behind a proxy or on a
   // shared host.
   if (isWeatherDataHost(u.hostname)) return "network";
+
+  // Before the two rules that say yes, for the same reason the deny list is:
+  // a range response cannot be cached, so nothing downstream may try. Written
+  // down rather than left to default-deny because "the default happened to
+  // refuse it" and "we decided it must never be cached" look identical from
+  // outside and only the second survives someone adding a rule above.
+  if (isBasemapArchive(u)) return "network";
 
   if (isBasemapTile(u)) return "tile";
 
@@ -893,6 +943,8 @@ self.__squallarSwInternals = {
   routeFor,
   isWeatherDataHost,
   isBasemapTile,
+  BASEMAP_ARCHIVE_HOST,
+  isBasemapArchive,
   isShellAsset,
   normalizeHost,
   validatorToken,

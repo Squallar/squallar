@@ -92,7 +92,7 @@ impl TileSource for CartoDb {
 /// is the stable pointer at the same host and is what a client should resolve
 /// once it can afford an extra round trip before the first tile; nothing does
 /// yet, and a pointer nobody reads would be a claim rather than a mechanism.
-#[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
+#[cfg(feature = "basemap-vector")]
 pub const BASEMAP_ARCHIVE_URL: &str = "https://tiles.squallar.app/basemap/omt-20260828.pmtiles";
 
 /// An archive URL that replaces [`BASEMAP_ARCHIVE_URL`] when it is set.
@@ -106,16 +106,36 @@ pub const BASEMAP_ARCHIVE_URL: &str = "https://tiles.squallar.app/basemap/omt-20
 #[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
 pub const BASEMAP_ARCHIVE_URL_ENV: &str = "SQUALLAR_BASEMAP_ARCHIVE";
 
+/// Which archive [`base_source`] opens.
+///
+/// A per-target **selection of a value**, which is what keeps [`base_source`]
+/// itself one body rather than two: the override is a developer affordance for
+/// a machine with a shell, and a browser has neither an environment nor a way
+/// for the user to set one. `std::env::var` does compile on
+/// wasm32-unknown-unknown and would simply always answer `NotPresent`, so this
+/// split buys honesty rather than compilation -- a const documented "native
+/// only" that the web arm still read would be prose that is not evidence.
+#[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
+fn archive_url() -> String {
+    std::env::var(BASEMAP_ARCHIVE_URL_ENV).unwrap_or_else(|_| BASEMAP_ARCHIVE_URL.to_owned())
+}
+
+/// The wasm32 arm of [`archive_url`]: the compiled-in archive, always.
+#[cfg(all(feature = "basemap-vector", target_arch = "wasm32"))]
+fn archive_url() -> String {
+    BASEMAP_ARCHIVE_URL.to_owned()
+}
+
 /// The credit the vector basemap carries, in the generator's own words.
 ///
 /// Planetiler prints this pair as the required credit for what it built, so it
 /// is sourced rather than composed. The panel draws it because the archive
 /// source reports it, not because anything here selects between two consts.
-#[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
+#[cfg(feature = "basemap-vector")]
 pub const ARCHIVE_ATTRIBUTION_TEXT: &str = "\u{a9} OpenStreetMap contributors \u{a9} OpenMapTiles";
 
 /// The base-map tile source for `is_dark`: CartoDB's pre-rendered rasters.
-#[cfg(not(all(feature = "basemap-vector", not(target_arch = "wasm32"))))]
+#[cfg(not(feature = "basemap-vector"))]
 fn base_source(is_dark: bool, ctx: &egui::Context) -> HttpsTiles {
     let source = if is_dark {
         CartoDb::dark()
@@ -132,10 +152,9 @@ fn base_source(is_dark: bool, ctx: &egui::Context) -> HttpsTiles {
 /// archive not being PMTiles — happens inside the IO task and is logged there;
 /// there is nothing to fall back *to* by then, because the frame has already
 /// been handed a source.
-#[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
+#[cfg(feature = "basemap-vector")]
 fn base_source(is_dark: bool, ctx: &egui::Context) -> HttpsTiles {
-    let url =
-        std::env::var(BASEMAP_ARCHIVE_URL_ENV).unwrap_or_else(|_| BASEMAP_ARCHIVE_URL.to_owned());
+    let url = archive_url();
 
     let attribution = Attribution {
         text: ARCHIVE_ATTRIBUTION_TEXT,

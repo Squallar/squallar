@@ -23,11 +23,6 @@ gps-serial = ["squallar-nmea-serial/serial"]
 # archive reader; the tessellation half is `walkers/mvt`, which is on
 # unconditionally and is not part of this gate.
 #
-# Nothing reads `pmtiles` yet. The feature exists ahead of its code because the
-# question it answers -- whether this dependency compiles for all eleven CI
-# target triples, wasm32 and the two Apple mobile ones especially -- is worth
-# settling before any code depends on the answer.
-#
 # A feature and not a `cfg(target_arch)`, and `gps-serial` above is the recorded
 # reason to be careful which kind of gate this is: there, a call site gated on
 # `not(target_os = "android")` called a body gated on a *feature*, and an OS cfg
@@ -35,28 +30,40 @@ gps-serial = ["squallar-nmea-serial/serial"]
 # per-target split inside it is only over `pmtiles`' own backend features, which
 # is a dependency selection -- what ARCHITECTURE.md permits a `cfg` to do.
 #
-# **Not in a `default` list, and requested by the native shipping crate
-# instead** -- `squallar/Cargo.toml` turns it on, `squallar-web` does not.
+# **Not in a `default` list, and requested by each shipping crate instead** --
+# `squallar/Cargo.toml` turns it on and, since the web draw seam landed, so does
+# `squallar-web/Cargo.toml`. It draws on BOTH targets now: the raster path it
+# replaces is watermarked at source, so the dependency buys a map that works,
+# and the eight crates below are paid for a rendered pixel rather than for a
+# reader nothing calls.
 #
-# The old note here read "off by default: it draws nothing today, and a
-# default-on feature would put `pmtiles` and its `tokio` into every shipped
-# artifact for no rendered pixel". Half of that is now false and half of it is
-# still exactly right, which is why this is a per-consumer request and not a
-# `default` row:
+# Still not a `default` row, and the reason survives both consumers turning it
+# on: a `default` would put `pmtiles` and the `tokio` its `__async` pulls in
+# into the graph of every OTHER consumer too -- `squallar-app`'s own tests, the
+# tools -- which is the cost the original note warned against, just relocated.
 #
-# - On a **native** target it draws. The raster path it replaces is watermarked
-#   at source, so the dependency buys a map that works.
-# - On **wasm32 it still draws nothing.** The archive reader is gated
-#   `not(target_arch = "wasm32")` because none of pmtiles' backends compiles
-#   there (the `http-async` note below records the two E0277s). A `default` row
-#   would have put `pmtiles` and the `tokio` its `__async` pulls in
-#   unconditionally inside the file a person downloads, for no rendered pixel
-#   -- the precise thing the old note warned against.
+# The wasm32 arm is NOT `pmtiles`' own backend. None of its four compiles there
+# (the `http-async` note below records the two E0277s); `src/basemap_archive.rs`
+# implements `AsyncBackend` over a `RangeSource` instead, and its wasm arm runs
+# the `!Send` `reqwest` work inside `spawn_local` and returns the bytes over a
+# `oneshot`, whose receiver IS `Send`.
 #
 # Measured, `cargo tree -p squallar-egui --target wasm32-unknown-unknown
-# -e normal --prefix none | sort -u`: 262 crates without it, 270 with. The
-# eight are `pmtiles`, `tokio`, `async-compression`, `compression-codecs`,
-# `compression-core`, `fast_hilbert` and `varint-rs`.
+# -e normal --prefix none | sort -u`: 262 lines without it, 270 with. **The
+# crates are SEVEN, not the eight that line count reports**, and the difference
+# is the measuring command rather than the graph: `cargo tree` prints a
+# repeated subtree a second time as `tokio v1.53.1 (*)`, which `sort -u` keeps
+# as a distinct line. The seven are `pmtiles`, `tokio`, `async-compression`,
+# `compression-codecs`, `compression-core`, `fast_hilbert` and `varint-rs` --
+# which is what the list here always said, against a count that disagreed with
+# it. Re-measured 2026-08-28 by diffing the two sorted trees rather than
+# subtracting their lengths.
+#
+# Shipped cost, measured the same day on the artifact a person actually
+# downloads: `wasm-pack build squallar-web --target web --release` through
+# `.github/scripts/wasm-threads.sh` gives 13,272,118 B of `.wasm` with the
+# feature off and 13,664,560 B with it on -- **+392,442 B, +2.96%** -- and the
+# wasm-bindgen glue is byte-identical at 187,506 B either way.
 basemap-vector = ["dep:pmtiles"]
 
 [dependencies]
@@ -152,8 +159,18 @@ tokio = { workspace = true, features = ["rt", "sync", "net", "time"] }
 # forms of the same native shape. The web target needs its own `AsyncBackend`
 # impl, and that impl has to yield a `Send` future on a target where `JsValue`
 # is not `Send`, i.e. the JS work goes in `spawn_local` and the bytes come back
-# over a channel. Nothing here does that yet; this line only keeps the
-# non-portable backend off the target that cannot compile it.
+# over a channel. `basemap_archive.rs` DOES that -- `RangeSource` /
+# `HttpRangeSource` / `ArchiveRangeSource`, with the wasm arm running the fetch
+# in `spawn_local` and returning bytes over a oneshot, and `RANGE_ATTEMPTS`
+# retrying a `200` (measured: 2 of 11 range requests against a real host came
+# back 200 with the full body). Web draws vector tiles.
+#
+# This line's job is therefore narrower than the paragraph above implies: it
+# keeps pmtiles' own non-portable backend off the target that cannot compile
+# it. The reader reaches the archive through OUR range source on both targets.
+#
+# The sentence this replaces read "Nothing here does that yet" long after it
+# stopped being true, and cost an agent a full pass rebuilding what existed.
 pmtiles = { workspace = true, optional = true, features = ["http-async"] }
 
 # The wasm half of the same split: no threads, no tokio: the fetch loop runs on

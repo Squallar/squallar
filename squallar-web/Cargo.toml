@@ -43,7 +43,19 @@ wasm-opt = [
 # geolocation reading -> Fix) compile and are tested on the host; there is no
 # wasm test runner here, so gating the crate would make those tests never run.
 [dependencies]
-squallar-egui = { workspace = true }
+# `basemap-vector` here for the reason `squallar/Cargo.toml` turns it on there:
+# the feature is off by default and each shipping crate asks for it, rather than
+# a `default` row putting `pmtiles` into every consumer. This is the web
+# shipping crate, and with it the browser draws the self-hosted PMTiles archive
+# instead of CartoDB's watermarked rasters.
+#
+# NOT target-gated, and that is deliberate twice over. The feature also gates
+# `squallar_egui::tiles::BASEMAP_ARCHIVE_URL`, which `tests/pwa_assets.rs` reads
+# on the HOST to pin `sw.js`'s archive host against the Rust declaration; and a
+# target-gated feature on an untargeted dependency line is exactly the
+# "an OS cfg cannot satisfy a feature cfg" shape `squallar-egui`'s manifest
+# records as having broken that crate for weeks.
+squallar-egui = { workspace = true, features = ["basemap-vector"] }
 squallar-kv = { workspace = true }
 # Types only (Fix). The browser's Geolocation replaces the serial reader, so
 # the `serial` feature stays off, as in squallar-app.

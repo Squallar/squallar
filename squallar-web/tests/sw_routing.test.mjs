@@ -283,6 +283,148 @@ describe("routing: the basemap tile rule is confined to CartoDB", () => {
 });
 
 // ===========================================================================
+describe("routing: the PMTiles basemap archive is never cached", () => {
+  // =========================================================================
+  //
+  // WHY THIS IS ITS OWN BLOCK, AND WHERE ITS NON-VACUITY COMES FROM.
+  //
+  // `routeFor` is default-deny, so on squallar's real deploy `isBasemapArchive`
+  // is unobservable through `routeFor` alone: deleting the rule changes no
+  // answer, because nothing reaches it that the default would not also refuse.
+  // That is the shape the `isWeatherDataHost` block above already names — the
+  // default would mask a regression — so the assertions that can actually fail
+  // are the ones on `isBasemapArchive` itself, plus the served-from-the-archive-
+  // host boot, where the same-origin shell and navigate rules ARE reachable and
+  // the rule is the only thing standing in front of them.
+  //
+  // The archive cannot be cached even in principle: every read carries a
+  // `Range`, `Cache.put()` throws a TypeError on the resulting 206, and
+  // `Cache.match()` is range-blind, so a stored range would be handed back for
+  // every other offset.
+
+  it("recognises the archive by host and extension, not by either alone", async () => {
+    const worker = await bootWorker();
+    const { isBasemapArchive } = worker.internals;
+    const u = (s) => new URL(s);
+
+    for (const url of [
+      "https://tiles.squallar.app/basemap/omt-20260828.pmtiles",
+      // Case, and a fully-qualified host: `normalizeHost` is what both go
+      // through, and this is the layer that has to be sound on its own.
+      "https://TILES.SQUALLAR.APP/basemap/omt-20260828.PMTILES",
+      "https://tiles.squallar.app./basemap/omt-20260828.pmtiles",
+    ]) {
+      assert.equal(isBasemapArchive(u(url)), true, `${url} is the basemap archive`);
+    }
+
+    for (const url of [
+      // Suffix confusion in both directions — the whole reason this is an
+      // equality against a normalised host rather than an `endsWith`.
+      "https://tiles.squallar.app.evil.example/basemap/omt.pmtiles",
+      "https://evil.example/tiles.squallar.app/basemap/omt.pmtiles",
+      "https://nottiles.squallar.app/basemap/omt.pmtiles",
+      // The same host's OTHER content. The extension is load-bearing: without
+      // it this rule would also refuse a navigation, were squallar ever served
+      // from here.
+      "https://tiles.squallar.app/status/latest.json",
+      "https://tiles.squallar.app/",
+      // The extension somewhere that is not the path's end.
+      "https://tiles.squallar.app/basemap/omt.pmtiles/tile",
+    ]) {
+      assert.equal(isBasemapArchive(u(url)), false, `${url} is not the basemap archive`);
+    }
+  });
+
+  it("routes the archive to the network even when squallar is served from its host", async () => {
+    // The non-vacuous half. Booting the worker at the archive's own origin, at
+    // the site root, puts the archive under `ROOT.pathname` — so the
+    // same-origin branch of `routeFor` is reached and `isBasemapArchive` is the
+    // only rule in front of it. Delete the rule and this test still passes on
+    // `isShellAsset`/`isDataAsset` missing; what it pins is that no future
+    // caching rule can be added above without this one refusing first, and the
+    // navigation below is what proves the refusal is scoped rather than total.
+    const worker = await bootWorker({
+      swUrl: "https://tiles.squallar.app/sw.js",
+      origin: "https://tiles.squallar.app/",
+    });
+    const { routeFor } = worker.internals;
+
+    assert.equal(
+      routeFor({ url: "https://tiles.squallar.app/basemap/omt-20260828.pmtiles" }),
+      "network",
+      "the archive must reach the network untouched: a 206 cannot be put in a Cache",
+    );
+    assert.equal(
+      routeFor({ url: "https://tiles.squallar.app/basemap/omt-20260828.pmtiles", mode: "navigate" }),
+      "network",
+      "not cacheable even when the browser calls the request a navigation",
+    );
+    // Scoped, not total: the rule must not swallow the deploy it shares a host
+    // with. This is what the `.pmtiles` half of the predicate buys.
+    assert.equal(
+      routeFor({ url: "https://tiles.squallar.app/", mode: "navigate" }),
+      "navigate",
+      "a navigation on the archive host is still a navigation",
+    );
+  });
+
+  it("keeps the worker out of the archive's request path entirely", async () => {
+    // Stronger than "routes to the network": there must be no code path that
+    // could hand a 206 to `Cache.put()`, so the worker must not call
+    // respondWith at all.
+    const worker = await bootWorker();
+    const event = await worker.fetch(
+      new Request("https://tiles.squallar.app/basemap/omt-20260828.pmtiles"),
+    );
+    assert.equal(
+      event.handled,
+      false,
+      "the worker called respondWith for the archive; it must stay out of the request path",
+    );
+  });
+
+  it("cannot be given a cache without `cachesToKeep` also naming it", async () => {
+    // The hazard, demonstrated rather than asserted in prose: a future author
+    // who adds an archive cache and stops there gets a cache that is emptied on
+    // the next deploy, and the symptom is a slow map rather than an error.
+    //
+    // NOTE THE TRIGGER, because it is not "every activate" and the difference
+    // is what makes the test honest. `checkForUpdate` returns early when the
+    // validator token has not moved (`if (meta && meta.token === token)
+    // return;`), so `purgeCaches` never runs on an activate that finds the same
+    // deploy — seeding a cache and re-activating leaves it alone. The purge is
+    // per DEPLOY. That is why this publishes one.
+    let worker = await bootWorker({ tag: "A" });
+    const speculative = "squallar-basemap-archive-v1";
+    const cache = await worker.caches.open(speculative);
+    await cache.put(
+      new Request("https://tiles.squallar.app/basemap/omt-20260828.pmtiles"),
+      new Response("PMTiles"),
+    );
+    assert.ok(
+      (await worker.cacheNames()).includes(speculative),
+      "the harness did not create the cache; the rest of this test would be vacuous",
+    );
+
+    publishDeploy(worker.network, ORIGIN, "B");
+    await worker.message({ type: "squallar:check-update" });
+    worker = await restartWorker(worker);
+
+    assert.ok(
+      !(await worker.cacheNames()).includes(speculative),
+      `${speculative} survived a deploy, so purgeCaches is no longer exhaustive; \
+an archive cache added without a cachesToKeep entry would look like it worked`,
+    );
+    // The control: the caches that ARE named survive the same deploy, so the
+    // assertion above is about the keep set and not about the purge running.
+    assert.ok(
+      (await worker.cacheNames()).includes(worker.internals.TILE_CACHE),
+      "the deploy purged a cache cachesToKeep names; this test is measuring the wrong thing",
+    );
+  });
+});
+
+// ===========================================================================
 describe("routing: the shell rule is confined to the deploy directory", () => {
   // =========================================================================
 
