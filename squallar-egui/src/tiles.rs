@@ -5,12 +5,13 @@ use walkers::{
     sources::{Attribution, TileSource},
 };
 
-/// The basemap credit, drawn once per map panel.
+/// CartoDB's credit: the raster basemap's, and nothing else's.
 ///
-/// A const rather than only a [`TileSource::attribution`] field because the
-/// painter needs it and that trait hands back `&'static str`: routing the
-/// drawn string through the trait would mean leaking one or holding a `Lazy`.
-/// The trait impl below reads these, so the two cannot drift.
+/// **This is not "the" attribution any more.** The map panel draws whatever
+/// [`walkers::Tiles::attribution`] answers for the source it is actually
+/// fetching from, so a build reading our own archive credits OpenMapTiles
+/// without this const being involved. It is the [`CartoDb`] impl's string, and
+/// the panel's fallback for a frame with no source at all.
 ///
 /// `\u{a9}` is U+00A9, registered in `ui_glyphs` as the basemap attribution
 /// copyright -- never spelled `(c)`.
@@ -24,8 +25,6 @@ pub const ATTRIBUTION_URL: &str = "https://www.openstreetmap.org/copyright";
 pub enum CartoDbStyle {
     LightNoLabels,
     DarkNoLabels,
-    LightLabelsOnly,
-    DarkLabelsOnly,
 }
 
 #[derive(Clone)]
@@ -45,18 +44,6 @@ impl CartoDb {
             style: CartoDbStyle::DarkNoLabels,
         }
     }
-
-    pub fn light_labels() -> Self {
-        Self {
-            style: CartoDbStyle::LightLabelsOnly,
-        }
-    }
-
-    pub fn dark_labels() -> Self {
-        Self {
-            style: CartoDbStyle::DarkLabelsOnly,
-        }
-    }
 }
 
 impl TileSource for CartoDb {
@@ -64,8 +51,6 @@ impl TileSource for CartoDb {
         let style_name = match self.style {
             CartoDbStyle::LightNoLabels => "light_nolabels",
             CartoDbStyle::DarkNoLabels => "dark_nolabels",
-            CartoDbStyle::LightLabelsOnly => "light_only_labels",
-            CartoDbStyle::DarkLabelsOnly => "dark_only_labels",
         };
 
         let subdomain = match tile_id.x % 4 {
@@ -121,12 +106,11 @@ pub const BASEMAP_ARCHIVE_URL: &str = "https://tiles.squallar.app/basemap/omt-20
 #[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
 pub const BASEMAP_ARCHIVE_URL_ENV: &str = "SQUALLAR_BASEMAP_ARCHIVE";
 
-/// The credit the vector basemap carries.
+/// The credit the vector basemap carries, in the generator's own words.
 ///
-/// [`ATTRIBUTION_TEXT`] is still CartoDB's and is what the map panel *draws*;
-/// the two disagree while `basemap-vector` is off by default, and reconciling
-/// them is the flip, which deletes `CartoDb` outright. This is the honest
-/// string for the source that is actually being read.
+/// Planetiler prints this pair as the required credit for what it built, so it
+/// is sourced rather than composed. The panel draws it because the archive
+/// source reports it, not because anything here selects between two consts.
 #[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
 pub const ARCHIVE_ATTRIBUTION_TEXT: &str = "\u{a9} OpenStreetMap contributors \u{a9} OpenMapTiles";
 
@@ -181,126 +165,69 @@ fn base_source(is_dark: bool, ctx: &egui::Context) -> HttpsTiles {
 
 /// Shared map tile state across all panes.
 pub struct MapTileState {
-    pub tiles_light: Option<HttpsTiles>,
-    pub tiles_dark: Option<HttpsTiles>,
-    pub label_tiles_light: Option<HttpsTiles>,
-    pub label_tiles_dark: Option<HttpsTiles>,
+    /// The tile source for the theme currently on the glass.
+    ///
+    /// **One slot, not one per theme and not one per surface.**
+    /// [`Self::adopt_theme`] releases the source the instant its theme stops
+    /// being drawn, so a second theme slot could only ever hold `None`; and
+    /// labels are no longer a source of their own, because the vector basemap
+    /// draws them out of the same tile it draws the ground from.
+    pub tiles: Option<HttpsTiles>,
     pub current_theme_is_dark: bool,
 }
 
 impl Default for MapTileState {
     fn default() -> Self {
         Self {
-            tiles_light: None,
-            tiles_dark: None,
-            label_tiles_light: None,
-            label_tiles_dark: None,
+            tiles: None,
             current_theme_is_dark: true,
         }
     }
 }
 
 impl MapTileState {
-    /// Adopt `is_dark` as the theme, releasing the other one's tile caches.
+    /// Adopt `is_dark` as the theme, releasing the one no longer drawn.
     ///
-    /// Both `ensure_` methods open with this, so the release does not depend on
-    /// which of them happens to see the flip first — city labels can be off in
-    /// the very frame the theme changes, and the old theme's label cache has to
-    /// go anyway.
-    ///
-    /// **Nothing on the glass is blanked.** The tiles dropped belong to the
+    /// **Nothing on the glass is blanked.** The source dropped belongs to the
     /// theme that is no longer drawn; the pane is repainting from the other
-    /// theme's sources this frame regardless. The accepted cost is a re-download
+    /// theme's source this frame regardless. The accepted cost is a re-download
     /// if the user flips back.
     ///
-    /// Without it a single flip took residency from two live sources to four and
-    /// held it for the session, because the `ensure_` methods only ever fill and
-    /// [`Self::clear`] runs only on suspend and graphics reset. At
-    /// [`crate::tile_source::WASM_TILE_CACHE_ENTRIES`] — 96 since `6345952f` —
-    /// and 256 KiB a tile, one source's worst case is 24 MiB, so four of them is
-    /// 96 MiB against the 288 MiB `squallar-device-profile` allows the whole
-    /// application on wasm32.
+    /// Without it a single flip took residency from one live source to two and
+    /// held it for the session, because [`Self::ensure_base_tiles`] only ever
+    /// fills and [`Self::clear`] runs only on suspend and graphics reset. At
+    /// [`crate::tile_source::WASM_TILE_CACHE_ENTRIES`] and 256 KiB a tile, one
+    /// source's worst case is 24 MiB against the 288 MiB
+    /// `squallar-device-profile` allows the whole application on wasm32.
     fn adopt_theme(&mut self, is_dark: bool) {
         if is_dark == self.current_theme_is_dark {
             return;
         }
         self.current_theme_is_dark = is_dark;
-
-        // The theme that just stopped being drawn. Base and labels together:
-        // they are the same theme's tiles and nothing draws either of them now.
-        if is_dark {
-            self.tiles_light = None;
-            self.label_tiles_light = None;
-        } else {
-            self.tiles_dark = None;
-            self.label_tiles_dark = None;
-        }
+        self.tiles = None;
     }
 
     /// Ensure the base-map tiles for the current theme are initialized.
     pub fn ensure_base_tiles(&mut self, is_dark: bool, ctx: &egui::Context) {
         self.adopt_theme(is_dark);
-        if is_dark {
-            if self.tiles_dark.is_none() {
-                self.tiles_dark = Some(base_source(true, ctx));
-            }
-        } else if self.tiles_light.is_none() {
-            self.tiles_light = Some(base_source(false, ctx));
-        }
-    }
-
-    /// Ensure label-only tiles are initialized for the current theme.
-    pub fn ensure_label_tiles(&mut self, is_dark: bool, ctx: &egui::Context) {
-        self.adopt_theme(is_dark);
-        if is_dark && self.label_tiles_dark.is_none() {
-            self.label_tiles_dark = Some(HttpsTiles::new(CartoDb::dark_labels(), ctx.to_owned()));
-        } else if !is_dark && self.label_tiles_light.is_none() {
-            self.label_tiles_light = Some(HttpsTiles::new(CartoDb::light_labels(), ctx.to_owned()));
+        if self.tiles.is_none() {
+            self.tiles = Some(base_source(is_dark, ctx));
         }
     }
 
     /// Temporarily take the base tiles out of self for per-pane rendering.
     pub fn take_base_tiles(&mut self) -> Option<HttpsTiles> {
-        if self.current_theme_is_dark {
-            self.tiles_dark.take()
-        } else {
-            self.tiles_light.take()
-        }
+        self.tiles.take()
     }
 
     /// Restore the base tiles after per-pane rendering.
     pub fn restore_base_tiles(&mut self, tiles: Option<HttpsTiles>) {
-        if self.current_theme_is_dark {
-            self.tiles_dark = tiles;
-        } else {
-            self.tiles_light = tiles;
-        }
-    }
-
-    /// Temporarily take the label tiles out of self for per-pane rendering.
-    pub fn take_label_tiles(&mut self) -> Option<HttpsTiles> {
-        if self.current_theme_is_dark {
-            self.label_tiles_dark.take()
-        } else {
-            self.label_tiles_light.take()
-        }
-    }
-
-    /// Restore label tiles after per-pane rendering.
-    pub fn restore_label_tiles(&mut self, tiles: Option<HttpsTiles>) {
-        if self.current_theme_is_dark {
-            self.label_tiles_dark = tiles;
-        } else {
-            self.label_tiles_light = tiles;
-        }
+        self.tiles = tiles;
     }
 
     /// Clear all tile state (called on suspend/graphics reset).
     pub fn clear(&mut self) {
-        self.tiles_light = None;
-        self.tiles_dark = None;
-        self.label_tiles_light = None;
-        self.label_tiles_dark = None;
+        self.tiles = None;
         self.current_theme_is_dark = !self.current_theme_is_dark;
     }
 }

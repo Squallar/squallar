@@ -60,20 +60,7 @@ impl super::Gui {
         let is_dark_theme = ctx.global_style().visuals.dark_mode;
 
         self.map_tiles.ensure_base_tiles(is_dark_theme, &ctx);
-        let any_city_labels = self
-            .panes()
-            .iter()
-            .any(|p| p.draws_ground() && p.is_overlay_enabled(&known::CITY_LABELS));
-        if any_city_labels {
-            self.map_tiles.ensure_label_tiles(is_dark_theme, &ctx);
-        }
-
         let mut tiles_owned = self.map_tiles.take_base_tiles();
-        let mut label_tiles = if any_city_labels {
-            self.map_tiles.take_label_tiles()
-        } else {
-            None
-        };
 
         let pane_count = self.visible_pane_count();
         let modality = self.layout.modality;
@@ -253,7 +240,13 @@ impl super::Gui {
                                     .show(&mut child_ui, |ui, _response, projector, memory| {
                                         let zoom = memory.zoom();
 
-                                        draw_tile_layer(ui, projector, zoom, tiles, tile_zoom_bias);
+                                        let basemap_labels = draw_tile_layer(
+                                            ui,
+                                            projector,
+                                            zoom,
+                                            tiles,
+                                            tile_zoom_bias,
+                                        );
 
                                         if let Some(gesture) = gesture {
                                             if self.section_draw_armed() {
@@ -274,8 +267,7 @@ impl super::Gui {
                                             user_location,
                                             user_heading,
                                             user_fix: user_fix.clone(),
-                                            label_tiles: &mut label_tiles,
-                                            tile_zoom_bias,
+                                            basemap_labels,
                                             overlay_render_limit,
                                             actions: &mut actions,
                                             pane_rect,
@@ -375,7 +367,6 @@ impl super::Gui {
                                     map_memory: floor_frame.memory,
                                     center: floor_frame.centre,
                                     tiles: tiles_owned.as_mut(),
-                                    label_tiles: &mut label_tiles,
                                     tile_zoom_bias: tile_zoom_biases
                                         .get(pane_idx)
                                         .copied()
@@ -499,15 +490,32 @@ impl super::Gui {
                 // `detect_active_pane_click` already ignores a press landing on
                 // any layer above `Order::Background`, so the link becomes
                 // click-safe without pushing a rect into `excluded_rects`.
-                self.draw_basemap_attribution(ui, panel_rect, horizontal_color_scale, pane_count);
+                // **The credit is the drawn source's own**, read off
+                // `Tiles::attribution` rather than a second const beside it.
+                // Which basemap a build fetches from is a `cfg` and a feature,
+                // and a hardcoded string here is how the painted credit comes
+                // to name a provider the client never contacts.
+                let credit = tiles_owned.as_ref().map_or(
+                    walkers::sources::Attribution {
+                        text: crate::tiles::ATTRIBUTION_TEXT,
+                        url: crate::tiles::ATTRIBUTION_URL,
+                        logo_light: None,
+                        logo_dark: None,
+                    },
+                    walkers::Tiles::attribution,
+                );
+                self.draw_basemap_attribution(
+                    ui,
+                    panel_rect,
+                    horizontal_color_scale,
+                    pane_count,
+                    credit,
+                );
 
                 self.sync_viewports(&pre_zooms, &pre_positions);
             });
 
         self.map_tiles.restore_base_tiles(tiles_owned);
-        if any_city_labels {
-            self.map_tiles.restore_label_tiles(label_tiles);
-        }
 
         actions
     }
@@ -657,6 +665,7 @@ impl super::Gui {
         panel_rect: egui::Rect,
         horizontal_color_scale: bool,
         pane_count: usize,
+        credit: walkers::sources::Attribution,
     ) {
         let ctx = ui.ctx();
 
@@ -686,7 +695,7 @@ impl super::Gui {
         );
 
         let right = free.right() - ATTRIBUTION_INSET;
-        let left = right - attribution_span(ui.painter());
+        let left = right - attribution_span(ui.painter(), credit.text);
         let (pivot, y) = match pane_render::color_scale_under_rect(chrome, horizontal_color_scale) {
             // Portrait: under the bar, hung off the top of the bar's own
             // margin so the notice's laid-out height cannot push it back over
@@ -740,10 +749,10 @@ impl super::Gui {
                 let words = ui.visuals().text_color();
                 super::shell::notice_frame(ui.visuals()).show(ui, |ui| {
                     ui.hyperlink_to(
-                        egui::RichText::new(crate::tiles::ATTRIBUTION_TEXT)
+                        egui::RichText::new(credit.text)
                             .size(ATTRIBUTION_TEXT_SIZE)
                             .color(words),
-                        crate::tiles::ATTRIBUTION_URL,
+                        credit.url,
                     );
                 });
             });
@@ -1203,7 +1212,6 @@ impl super::Gui {
             map_memory,
             center,
             tiles,
-            label_tiles,
             tile_zoom_bias,
             horizontal_color_scale,
             color_scale_floor,
@@ -1246,7 +1254,7 @@ impl super::Gui {
             .drag_pan_buttons(egui::DragPanButtons::empty())
             .show(&mut strip_ui, |ui, _response, projector, memory| {
                 let zoom = memory.zoom();
-                draw_tile_layer(ui, projector, zoom, tiles, tile_zoom_bias);
+                let basemap_labels = draw_tile_layer(ui, projector, zoom, tiles, tile_zoom_bias);
 
                 self.map_pane_geo
                     .insert(pane_idx, map_pane_geo_from(projector, strip));
@@ -1258,8 +1266,7 @@ impl super::Gui {
                     user_location,
                     user_heading,
                     user_fix,
-                    label_tiles,
-                    tile_zoom_bias,
+                    basemap_labels,
                     overlay_render_limit,
                     actions,
                     pane_rect: strip,
@@ -1330,7 +1337,6 @@ struct FloorStripCtx<'a> {
     /// `None` when the frame has no tile source at all, which is the one way
     /// the floor can be missing that is not about the pane.
     tiles: Option<&'a mut crate::tile_source::HttpsTiles>,
-    label_tiles: &'a mut Option<crate::tile_source::HttpsTiles>,
     tile_zoom_bias: u8,
     horizontal_color_scale: bool,
     /// See [`pane_render::PaneRenderCtx::color_scale_floor`]. Carried through
@@ -2016,10 +2022,10 @@ const ATTRIBUTION_TEXT_SIZE: f32 = 10.0;
 ///
 /// The frame's own padding comes from [`super::shell::NOTICE_MARGIN_X`], not a
 /// second spelling of it, so the two cannot drift.
-fn attribution_span(measure: &egui::Painter) -> f32 {
+fn attribution_span(measure: &egui::Painter, credit: &str) -> f32 {
     let text = measure
         .layout_no_wrap(
-            crate::tiles::ATTRIBUTION_TEXT.to_owned(),
+            credit.to_owned(),
             egui::FontId::proportional(ATTRIBUTION_TEXT_SIZE),
             egui::Color32::WHITE,
         )

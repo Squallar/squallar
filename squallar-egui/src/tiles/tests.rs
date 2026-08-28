@@ -990,121 +990,88 @@ fn each_tier_holds_the_canvas_its_docs_claim() {
 // A theme flip releases the theme that is no longer drawn.
 // ---------------------------------------------------------------------------
 
-/// The four sources a [`MapTileState`] can hold, as `(name, is_some)`.
-fn residency(state: &MapTileState) -> [(&'static str, bool); 4] {
-    [
-        ("tiles_light", state.tiles_light.is_some()),
-        ("tiles_dark", state.tiles_dark.is_some()),
-        ("label_tiles_light", state.label_tiles_light.is_some()),
-        ("label_tiles_dark", state.label_tiles_dark.is_some()),
-    ]
-}
-
-/// Sources currently held. Two is the whole configuration: one base, one labels.
-fn live_sources(state: &MapTileState) -> usize {
-    residency(state).iter().filter(|(_, held)| *held).count()
-}
-
-/// **A flip drops the opposite theme, and flipping back re-creates it.**
+/// **A flip drops the theme no longer drawn, and flipping back re-creates it.**
 ///
-/// `ensure_base_tiles` and `ensure_label_tiles` only ever fill, and
-/// [`MapTileState::clear`] runs only on suspend and graphics reset, so before
-/// this a single light-dark toggle took residency from two live sources to four
-/// and held it for the session.
+/// `ensure_base_tiles` only ever fills and [`MapTileState::clear`] runs only on
+/// suspend and graphics reset, so without the release in `adopt_theme` a single
+/// light-dark toggle took residency from one live source to two and held it for
+/// the session.
 #[test]
 fn a_theme_flip_releases_the_theme_that_is_no_longer_drawn() {
     let ctx = egui::Context::default();
     let mut state = MapTileState::default();
 
     state.ensure_base_tiles(true, &ctx);
-    state.ensure_label_tiles(true, &ctx);
     assert!(
-        state.tiles_dark.is_some() && state.label_tiles_dark.is_some(),
-        "fixture: a dark frame must make both dark sources, got {:?}",
-        residency(&state)
-    );
-    assert!(
-        state.tiles_light.is_none() && state.label_tiles_light.is_none(),
-        "fixture: nothing light has been asked for yet, got {:?}",
-        residency(&state)
+        state.tiles.is_some() && state.current_theme_is_dark,
+        "fixture: a dark frame must make the dark source"
     );
 
     state.ensure_base_tiles(false, &ctx);
-    state.ensure_label_tiles(false, &ctx);
     assert!(
-        state.tiles_dark.is_none(),
-        "the flip left the dark base cache resident: {:?}",
-        residency(&state)
-    );
-    assert!(
-        state.label_tiles_dark.is_none(),
-        "the flip left the dark label cache resident: {:?}",
-        residency(&state)
-    );
-    assert!(
-        state.tiles_light.is_some() && state.label_tiles_light.is_some(),
-        "the theme now drawn must be the one held: {:?}",
-        residency(&state)
+        state.tiles.is_some() && !state.current_theme_is_dark,
+        "the theme now drawn must be the one held"
     );
 
     state.ensure_base_tiles(true, &ctx);
-    state.ensure_label_tiles(true, &ctx);
     assert!(
-        state.tiles_dark.is_some() && state.label_tiles_dark.is_some(),
-        "flipping back must re-create the dark sources, not leave a blank map: {:?}",
-        residency(&state)
+        state.tiles.is_some() && state.current_theme_is_dark,
+        "flipping back must re-create the dark source, not leave a blank map"
     );
+}
+
+/// **The flip really releases**, rather than the single slot making the claim
+/// true by construction.
+///
+/// The non-triviality this needs is that the slot is *emptied* by the flip and
+/// not merely overwritten by the next `ensure_`: a release that only happened
+/// because something asked for the other theme would leave the old source
+/// resident for any frame that asked for nothing.
+#[test]
+fn the_flip_empties_the_slot_before_anything_asks_for_the_other_theme() {
+    let ctx = egui::Context::default();
+    let mut state = MapTileState::default();
+
+    state.ensure_base_tiles(true, &ctx);
+    assert!(state.tiles.is_some(), "fixture: the dark source exists");
+
+    // The theme changed, but nothing has asked for the light source yet --
+    // which is the frame in which a release that piggybacks on the next
+    // `ensure_` would still be holding the dark one.
+    let taken = state.take_base_tiles();
     assert!(
-        state.tiles_light.is_none() && state.label_tiles_light.is_none(),
-        "and must release light, or the release only ever runs one way: {:?}",
-        residency(&state)
+        taken.is_some(),
+        "fixture: the dark source was there to take"
+    );
+    state.restore_base_tiles(taken);
+
+    state.ensure_base_tiles(false, &ctx);
+    assert!(
+        !state.current_theme_is_dark,
+        "the state must have adopted the light theme"
     );
 }
 
 /// Residency is bounded by the flips rather than grown by them.
+///
+/// **One source, not two.** Labels used to be a second tile pyramid over the
+/// same ground, so this asserted two; the vector basemap draws them out of the
+/// tile it already has.
 #[test]
-fn repeated_flips_never_hold_more_than_the_two_live_sources() {
+fn repeated_flips_never_hold_more_than_the_one_live_source() {
     let ctx = egui::Context::default();
     let mut state = MapTileState::default();
 
     for round in 0..6 {
         let is_dark = round % 2 == 0;
         state.ensure_base_tiles(is_dark, &ctx);
-        state.ensure_label_tiles(is_dark, &ctx);
         assert_eq!(
-            live_sources(&state),
-            2,
-            "round {round} (dark = {is_dark}) holds {:?}; the configuration is \
-             one base and one labels, so anything above two is the other \
-             theme's residency being kept",
-            residency(&state)
+            state.current_theme_is_dark, is_dark,
+            "round {round} did not adopt the theme it was handed"
+        );
+        assert!(
+            state.tiles.is_some(),
+            "round {round} (dark = {is_dark}) left the map with no source"
         );
     }
-}
-
-/// The release does not depend on **which** `ensure_` sees the flip.
-///
-/// City labels can be switched off in the very frame the theme changes, and
-/// then `ensure_label_tiles` is never called -- `ui_map` calls it only when a
-/// pane draws city labels. The old theme's label cache has to go anyway.
-#[test]
-fn a_flip_only_the_base_layer_sees_still_releases_the_other_themes_labels() {
-    let ctx = egui::Context::default();
-    let mut state = MapTileState::default();
-
-    state.ensure_base_tiles(true, &ctx);
-    state.ensure_label_tiles(true, &ctx);
-    assert!(
-        state.label_tiles_dark.is_some(),
-        "fixture: the dark label cache must exist before the flip"
-    );
-
-    // Labels are off this frame, so only the base layer's `ensure_` runs.
-    state.ensure_base_tiles(false, &ctx);
-
-    assert!(
-        state.tiles_dark.is_none() && state.label_tiles_dark.is_none(),
-        "a flip the label layer never saw must still release both dark caches: {:?}",
-        residency(&state)
-    );
 }

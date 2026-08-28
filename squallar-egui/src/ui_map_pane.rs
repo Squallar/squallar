@@ -13,7 +13,6 @@ use squallar_overlays::render::overlay_state::{
 use squallar_units::{HailSizeUnit, UserPreferences};
 use std::sync::Arc;
 
-use crate::tile_source::HttpsTiles;
 use squallar_geo::KM_PER_DEGREE_LAT;
 use squallar_radar::get_color_for_value;
 use squallar_radar::hca::MeltingLayerSource;
@@ -23,7 +22,7 @@ use squallar_source::id::{LayerId, known};
 use squallar_source::product::FieldId;
 use squallar_source::time::TimeAxis;
 
-use super::super::map_overlays::{OverlayDrawContext, draw_tile_layer, is_pos_blocked};
+use super::super::map_overlays::{OverlayDrawContext, is_pos_blocked, paint_labels};
 use squallar_radar::fields as radar_fields;
 
 /// Which of a pane's surfaces one call to [`render_pane_map_content`] paints.
@@ -53,11 +52,15 @@ pub(super) struct PaneRenderCtx<'a> {
     pub user_location: Option<(f64, f64)>,
     pub user_heading: Option<f32>,
     pub user_fix: Option<squallar_location::Fix>,
-    pub label_tiles: &'a mut Option<HttpsTiles>,
-    /// How many slippy zoom levels deeper than this pane's own zoom its raster
-    /// tile layers should fetch — see
-    /// [`draw_tile_layer`](super::super::map_overlays::draw_tile_layer).
-    pub tile_zoom_bias: u8,
+    /// The basemap's place names, laid out by the `CityLabels` arm below.
+    ///
+    /// Filled by
+    /// [`draw_tile_layer`](super::super::map_overlays::draw_tile_layer) in the
+    /// ground phase and taken here, so the names draw at this layer's position
+    /// in the pane's order -- above the weather -- rather than under it with
+    /// the ground they arrived on. A pane with the layer off never takes them
+    /// and they are dropped with the context.
+    pub basemap_labels: Vec<walkers::Text>,
     /// How many overlay rasters this pane and layer may have crossing at once —
     /// the device's `Budgets::concurrent_renders`. See
     /// [`crate::overlay_cache::RendersInFlight::admits`].
@@ -226,9 +229,9 @@ pub(super) fn render_pane_map_content(
                         .filter(|source| !source.is_measured());
                 }
                 id if *id == known::CITY_LABELS => {
-                    if let Some(ltiles) = ctx.label_tiles.as_mut() {
-                        draw_tile_layer(ui, projector, zoom, ltiles, ctx.tile_zoom_bias);
-                    }
+                    // One `OccupiedAreas` for the whole pane, which is what
+                    // stops a name being drawn once per tile that carries it.
+                    paint_labels(ui.painter(), std::mem::take(&mut ctx.basemap_labels));
                 }
                 id if *id == known::RADAR_SITES => {
                     if let Some(tex) = ctx.pane.overlay_cache(id).and_then(|c| c.current()) {

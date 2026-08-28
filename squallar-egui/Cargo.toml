@@ -35,8 +35,28 @@ gps-serial = ["squallar-nmea-serial/serial"]
 # per-target split inside it is only over `pmtiles`' own backend features, which
 # is a dependency selection -- what ARCHITECTURE.md permits a `cfg` to do.
 #
-# Off by default: it draws nothing today, and a default-on feature would put
-# `pmtiles` and its `tokio` into every shipped artifact for no rendered pixel.
+# **Not in a `default` list, and requested by the native shipping crate
+# instead** -- `squallar/Cargo.toml` turns it on, `squallar-web` does not.
+#
+# The old note here read "off by default: it draws nothing today, and a
+# default-on feature would put `pmtiles` and its `tokio` into every shipped
+# artifact for no rendered pixel". Half of that is now false and half of it is
+# still exactly right, which is why this is a per-consumer request and not a
+# `default` row:
+#
+# - On a **native** target it draws. The raster path it replaces is watermarked
+#   at source, so the dependency buys a map that works.
+# - On **wasm32 it still draws nothing.** The archive reader is gated
+#   `not(target_arch = "wasm32")` because none of pmtiles' backends compiles
+#   there (the `http-async` note below records the two E0277s). A `default` row
+#   would have put `pmtiles` and the `tokio` its `__async` pulls in
+#   unconditionally inside the file a person downloads, for no rendered pixel
+#   -- the precise thing the old note warned against.
+#
+# Measured, `cargo tree -p squallar-egui --target wasm32-unknown-unknown
+# -e normal --prefix none | sort -u`: 262 crates without it, 270 with. The
+# eight are `pmtiles`, `tokio`, `async-compression`, `compression-codecs`,
+# `compression-core`, `fast_hilbert` and `varint-rs`.
 basemap-vector = ["dep:pmtiles"]
 
 [dependencies]

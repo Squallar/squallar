@@ -112,8 +112,6 @@ mod tests {
         for style in [
             squallar_egui::tiles::CartoDb::light(),
             squallar_egui::tiles::CartoDb::dark(),
-            squallar_egui::tiles::CartoDb::light_labels(),
-            squallar_egui::tiles::CartoDb::dark_labels(),
         ] {
             for x in 0..4u32 {
                 let id = walkers::TileId { x, y: 0, zoom: 4 };
