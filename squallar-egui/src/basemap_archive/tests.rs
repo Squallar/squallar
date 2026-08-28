@@ -36,8 +36,8 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use pmtiles::{Compression, TileType};
 
 use super::{
-    ArchiveError, BasemapArchive, FileRangeSource, HttpRangeSource, RANGE_ATTEMPTS, RangeError,
-    RangeSource, TileBytes,
+    ArchiveError, BasemapArchive, FileRangeSource, HttpRangeSource, PartSpan, RANGE_ATTEMPTS,
+    RangeError, RangeSource, TileBytes, part_spans,
 };
 
 // ---------------------------------------------------------------------------
@@ -210,6 +210,46 @@ impl<S: RangeSource + Send + Sync> RangeSource for CountingSource<S> {
     }
 }
 
+/// Wraps a source and records every `(offset, length)` asked of it.
+///
+/// What lets a test *discover* a tile's byte range honestly: on an archive
+/// with no leaf directories, one `tile()` call after open is exactly one
+/// range read — the tile body itself.
+struct RecordingSource<S> {
+    inner: S,
+    log: ReadLog,
+}
+
+/// The `(offset, length)` of every read a [`RecordingSource`] has seen.
+type ReadLog = Arc<std::sync::Mutex<Vec<(u64, usize)>>>;
+
+impl<S> RecordingSource<S> {
+    fn new(inner: S) -> (Self, ReadLog) {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Self {
+                inner,
+                log: Arc::clone(&log),
+            },
+            log,
+        )
+    }
+}
+
+impl<S: RangeSource + Send + Sync> RangeSource for RecordingSource<S> {
+    fn read_range(
+        &self,
+        offset: u64,
+        length: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, RangeError>> + Send {
+        self.log
+            .lock()
+            .expect("the read log is not poisoned")
+            .push((offset, length));
+        self.inner.read_range(offset, length)
+    }
+}
+
 /// Serves the archive's opening bytes and then fails every later range.
 ///
 /// The point is that it opens *successfully* — the header and root directory
@@ -246,7 +286,7 @@ impl RangeSource for FailsAfterOpenSource {
 // A loopback server that can be told how to answer a range request
 // ---------------------------------------------------------------------------
 
-/// How the loopback server answers.
+/// How the loopback server answers a known path.
 #[derive(Clone, Copy)]
 enum Answer {
     /// `200` with a body, i.e. the whole resource — what a host that ignores
@@ -258,10 +298,47 @@ enum Answer {
     ServerError,
 }
 
-/// A loopback HTTP server answering range requests over a fixed body.
+/// One path's serving plan: `whole_body_first` requests answered `200`, then
+/// `then`.
+struct PathPlan {
+    body: Vec<u8>,
+    whole_body_first: usize,
+    then: Answer,
+}
+
+impl PathPlan {
+    /// A well-behaved ranged path.
+    fn ranged(body: Vec<u8>) -> Self {
+        Self {
+            body,
+            whole_body_first: 0,
+            then: Answer::Range,
+        }
+    }
+}
+
+/// One request the server saw: the path, and the raw `Range` bounds it asked
+/// for — start and *inclusive* end, unclamped, exactly as the client spelled
+/// them. Raw because the boundary tests assert on what was *asked* (a span
+/// ending at a part's last byte), not on what a clamping server chose to
+/// serve.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SeenRequest {
+    path: String,
+    start: usize,
+    end: usize,
+}
+
+/// A loopback HTTP server holding a set of paths, each with its own plan.
+///
+/// Path-aware because the source under test now speaks to more than one URL:
+/// the probe asks for `<path>.part000`, a parted archive is `.part000`,
+/// `.part001`, …, and the monolith is the bare path. A path with no plan
+/// answers a clean `404`, which is itself load-bearing: it is what tells the
+/// probe an archive has no parts.
 struct RangeServer {
     port: u16,
-    requests: Arc<AtomicUsize>,
+    seen: Arc<std::sync::Mutex<Vec<SeenRequest>>>,
     #[expect(
         dead_code,
         reason = "held to keep the server thread alive for the test"
@@ -269,51 +346,103 @@ struct RangeServer {
     thread: std::thread::JoinHandle<()>,
 }
 
+/// The bare archive path every test serves under.
+const ARCHIVE_PATH: &str = "/archive.pmtiles";
+
+/// The path of part `index` under [`ARCHIVE_PATH`], per the publish contract.
+fn part_path(index: usize) -> String {
+    format!("{ARCHIVE_PATH}.part{index:03}")
+}
+
+/// `body` split at `part_bytes`, the way the publish side slices an archive:
+/// every part exactly `part_bytes` long except the last.
+fn split_into_parts(body: &[u8], part_bytes: usize) -> Vec<Vec<u8>> {
+    assert!(part_bytes > 0);
+    body.chunks(part_bytes).map(<[u8]>::to_vec).collect()
+}
+
 impl RangeServer {
-    /// Answer `whole_body_first` requests with a `200`, then follow `then`.
-    fn start(body: Vec<u8>, whole_body_first: usize, then: Answer) -> Self {
+    /// A server answering exactly `paths`, and `404` elsewhere.
+    fn start(paths: std::collections::HashMap<String, PathPlan>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port should bind");
         let port = listener
             .local_addr()
             .expect("a bound listener has an address")
             .port();
-        let requests = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&requests);
+        let seen: Arc<std::sync::Mutex<Vec<SeenRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
 
         let thread = std::thread::spawn(move || {
+            let mut served: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
-                let seen = counter.fetch_add(1, Ordering::SeqCst);
-                let answer = if seen < whole_body_first {
-                    Answer::WholeBody
-                } else {
-                    then
-                };
-
-                if serve_one(stream, &body, answer).is_err() {
+                if serve_one(stream, &paths, &mut served, &log).is_err() {
                     break;
                 }
             }
         });
 
-        Self {
-            port,
-            requests,
-            thread,
-        }
+        Self { port, seen, thread }
+    }
+
+    /// The pre-split shape: one file at the bare path, no parts anywhere, so
+    /// the probe's `404` selects monolith mode.
+    fn monolith(body: Vec<u8>, whole_body_first: usize, then: Answer) -> Self {
+        Self::start(std::collections::HashMap::from([(
+            ARCHIVE_PATH.to_owned(),
+            PathPlan {
+                body,
+                whole_body_first,
+                then,
+            },
+        )]))
+    }
+
+    /// The publish format: `body` sliced at `part_bytes` into `.partNNN`
+    /// paths, and **nothing at the bare path** — a request there answers
+    /// `404`, so a reader that fell back to the monolith would fail loudly
+    /// rather than pass by accident.
+    fn parted(body: &[u8], part_bytes: usize) -> Self {
+        Self::start(
+            split_into_parts(body, part_bytes)
+                .into_iter()
+                .enumerate()
+                .map(|(index, part)| (part_path(index), PathPlan::ranged(part)))
+                .collect(),
+        )
     }
 
     fn url(&self) -> String {
-        format!("http://127.0.0.1:{}/archive.pmtiles", self.port)
+        format!("http://127.0.0.1:{}{ARCHIVE_PATH}", self.port)
     }
 
-    fn requests(&self) -> usize {
-        self.requests.load(Ordering::SeqCst)
+    /// Every request seen so far, in arrival order.
+    fn seen(&self) -> Vec<SeenRequest> {
+        self.seen
+            .lock()
+            .expect("the request log is not poisoned")
+            .clone()
+    }
+
+    /// How many requests `path` has received.
+    fn requests_to(&self, path: &str) -> usize {
+        self.seen()
+            .iter()
+            .filter(|request| request.path == path)
+            .count()
     }
 }
 
-/// Read one request, answer it, close.
-fn serve_one(mut stream: TcpStream, body: &[u8], answer: Answer) -> std::io::Result<()> {
+/// Read one request, record it, answer it, close.
+fn serve_one(
+    mut stream: TcpStream,
+    paths: &std::collections::HashMap<String, PathPlan>,
+    served: &mut std::collections::HashMap<String, usize>,
+    log: &std::sync::Mutex<Vec<SeenRequest>>,
+) -> std::io::Result<()> {
     use std::io::Read as _;
 
     let mut request = Vec::new();
@@ -330,8 +459,44 @@ fn serve_one(mut stream: TcpStream, body: &[u8], answer: Answer) -> std::io::Res
     }
 
     let request = String::from_utf8_lossy(&request).to_string();
-    let (start, end) = parse_range(&request, body.len());
+    let path = request
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
 
+    let Some(plan) = paths.get(&path) else {
+        log.lock()
+            .expect("the request log is not poisoned")
+            .push(SeenRequest {
+                path,
+                start: 0,
+                end: 0,
+            });
+        stream.write_all(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+        return stream.flush();
+    };
+
+    let (start, end) = parse_range(&request, plan.body.len());
+    log.lock()
+        .expect("the request log is not poisoned")
+        .push(SeenRequest {
+            path: path.clone(),
+            start,
+            end,
+        });
+
+    let times_before = served.entry(path).or_insert(0);
+    let answer = if *times_before < plan.whole_body_first {
+        Answer::WholeBody
+    } else {
+        plan.then
+    };
+    *times_before += 1;
+
+    let body = &plan.body;
     match answer {
         Answer::WholeBody => {
             let head = format!(
@@ -342,12 +507,16 @@ fn serve_one(mut stream: TcpStream, body: &[u8], answer: Answer) -> std::io::Res
             stream.write_all(body)?;
         }
         Answer::Range => {
-            let slice = &body[start..end];
+            // Clamped the way a real host clamps: a range running past the
+            // end serves what exists. The log above keeps the raw request.
+            let from = start.min(body.len());
+            let to = end.saturating_add(1).min(body.len());
+            let slice = &body[from..to];
             let head = format!(
                 "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: \
                  {}\r\nConnection: close\r\n\r\n",
-                start,
-                end.saturating_sub(1),
+                from,
+                to.saturating_sub(1),
                 body.len(),
                 slice.len()
             );
@@ -362,21 +531,25 @@ fn serve_one(mut stream: TcpStream, body: &[u8], answer: Answer) -> std::io::Res
     stream.flush()
 }
 
-/// `bytes=N-M` out of a request head, clamped to `len`.
+/// `bytes=N-M` out of a request head: raw start and *inclusive* end, no
+/// clamping — serving clamps, the log does not.
 fn parse_range(request: &str, len: usize) -> (usize, usize) {
     let Some(spec) = request.lines().find_map(|line| {
         line.strip_prefix("Range: bytes=")
             .or_else(|| line.strip_prefix("range: bytes="))
     }) else {
-        return (0, len);
+        return (0, len.saturating_sub(1));
     };
 
     let spec = spec.trim();
     let mut halves = spec.split('-');
     let start: usize = halves.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let end: usize = halves.next().and_then(|v| v.parse().ok()).unwrap_or(len);
+    let end: usize = halves
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(len.saturating_sub(1));
 
-    (start.min(len), end.saturating_add(1).min(len))
+    (start, end)
 }
 
 // ---------------------------------------------------------------------------
@@ -389,7 +562,7 @@ fn parse_range(request: &str, len: usize) -> (usize, usize) {
 #[test]
 fn a_two_hundred_is_retried_rather_than_failing_the_read() {
     let body: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
-    let server = RangeServer::start(body.clone(), 1, Answer::Range);
+    let server = RangeServer::monolith(body.clone(), 1, Answer::Range);
     let source = HttpRangeSource::new(loopback_client(), &server.url())
         .expect("the loopback URL should parse");
 
@@ -401,9 +574,14 @@ fn a_two_hundred_is_retried_rather_than_failing_the_read() {
         "the retried attempt should return the range that was asked for"
     );
     assert_eq!(
-        server.requests(),
+        server.requests_to(ARCHIVE_PATH),
         2,
         "one attempt should have been spent on the 200 and one on the 206"
+    );
+    assert_eq!(
+        server.requests_to(&part_path(0)),
+        1,
+        "the first read probes for part000 exactly once; its 404 is what selected monolith mode"
     );
 }
 
@@ -414,7 +592,7 @@ fn a_two_hundred_is_retried_rather_than_failing_the_read() {
 #[test]
 fn retries_are_bounded_and_the_error_says_what_happened() {
     let body: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
-    let server = RangeServer::start(body, usize::MAX, Answer::WholeBody);
+    let server = RangeServer::monolith(body, usize::MAX, Answer::WholeBody);
     let source = HttpRangeSource::new(loopback_client(), &server.url())
         .expect("the loopback URL should parse");
 
@@ -429,7 +607,7 @@ fn retries_are_bounded_and_the_error_says_what_happened() {
         "the failure should carry the status and the attempt count"
     );
     assert_eq!(
-        server.requests(),
+        server.requests_to(ARCHIVE_PATH),
         RANGE_ATTEMPTS as usize,
         "the retry loop should be bounded at RANGE_ATTEMPTS"
     );
@@ -444,7 +622,7 @@ fn retries_are_bounded_and_the_error_says_what_happened() {
 /// A failure status is not a range problem and must not be retried into one.
 #[test]
 fn a_failure_status_is_reported_rather_than_retried() {
-    let server = RangeServer::start(Vec::new(), 0, Answer::ServerError);
+    let server = RangeServer::monolith(Vec::new(), 0, Answer::ServerError);
     let source = HttpRangeSource::new(loopback_client(), &server.url())
         .expect("the loopback URL should parse");
 
@@ -455,9 +633,461 @@ fn a_failure_status_is_reported_rather_than_retried() {
         "a 500 should be a transport error, not a range-support verdict: {error}"
     );
     assert_eq!(
-        server.requests(),
+        server.requests_to(ARCHIVE_PATH),
         1,
         "a failure status should not be retried"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Parts: the probe, the arithmetic, the stitch
+// ---------------------------------------------------------------------------
+
+/// A byte pattern with no short period, so a stitch that dropped, duplicated
+/// or reordered a chunk cannot alias back to the expected bytes: 251 is prime
+/// and shares no factor with any part stride these tests use.
+fn pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| ((i * 131) % 251) as u8).collect()
+}
+
+/// A parts-mode source over `server` with the stride under test.
+fn parted_source(server: &RangeServer, part_bytes: u64) -> HttpRangeSource {
+    HttpRangeSource::with_small_parts(loopback_client(), &server.url(), part_bytes)
+        .expect("the loopback URL should parse")
+}
+
+/// The part index a request path names, if it names one.
+fn seen_part_index(path: &str) -> Option<u64> {
+    path.rsplit(".part")
+        .next()
+        .and_then(|digits| digits.parse().ok())
+}
+
+/// The one function both transports share is pinned directly: part `k` holds
+/// global bytes `[k*stride, (k+1)*stride)`, spans arrive in archive order,
+/// and a span never crosses or even touches a part it takes no bytes from.
+#[test]
+fn part_spans_cut_exactly_at_the_publish_stride() {
+    let span = |part, offset, length| PartSpan {
+        part,
+        offset,
+        length,
+    };
+
+    // Inside one part: untouched arithmetic, one request.
+    assert_eq!(part_spans(10, 100, 1000), vec![span(0, 10, 100)]);
+    // Straddling one boundary: two requests whose lengths sum to the read's.
+    assert_eq!(
+        part_spans(950, 100, 1000),
+        vec![span(0, 950, 50), span(1, 0, 50)]
+    );
+    // Spanning a whole middle part.
+    assert_eq!(
+        part_spans(500, 2000, 1000),
+        vec![span(0, 500, 500), span(1, 0, 1000), span(2, 0, 500)]
+    );
+    // Ending exactly on a boundary: the next part is NEVER in the plan. On
+    // the archive's last boundary that part does not exist, and requesting
+    // zero bytes of it would turn a correct read into a 404.
+    assert_eq!(part_spans(900, 100, 1000), vec![span(0, 900, 100)]);
+    // Starting exactly on a boundary.
+    assert_eq!(part_spans(1000, 10, 1000), vec![span(1, 0, 10)]);
+    // A zero-length read maps to no requests at all.
+    assert_eq!(part_spans(123, 0, 1000), vec![]);
+}
+
+/// A read across a boundary is two ranged requests stitched in order, and the
+/// server's own log is the witness: the first request drains part000 to its
+/// last byte, the next one opens part001 at zero.
+#[test]
+fn a_read_across_a_part_boundary_stitches_bytes_in_order() {
+    let body = pattern(2500);
+    let server = RangeServer::parted(&body, 1000);
+    let source = parted_source(&server, 1000);
+
+    let bytes = block_on(source.read_range(950, 100)).expect("a straddling read should succeed");
+    assert_eq!(
+        bytes,
+        &body[950..1050],
+        "the stitched read must be byte-identical to the same range of the unsplit body"
+    );
+
+    let seen = server.seen();
+    let tail = seen
+        .iter()
+        .position(|request| {
+            request.path == part_path(0) && request.start == 950 && request.end == 999
+        })
+        .expect("part000 should have been asked for its tail, up to its very last byte");
+    assert_eq!(
+        seen.get(tail + 1),
+        Some(&SeenRequest {
+            path: part_path(1),
+            start: 0,
+            end: 49,
+        }),
+        "part001 should have been asked for the remainder, immediately after and from byte zero"
+    );
+
+    // A read spanning three parts stitches the middle part whole.
+    let bytes = block_on(source.read_range(500, 2000)).expect("a three-part read should succeed");
+    assert_eq!(bytes, &body[500..2500]);
+}
+
+/// The boundary edges: a read ending exactly on a part boundary, and the
+/// final short part — into it, and past the archive's end.
+#[test]
+fn part_boundary_edges_hold_at_the_last_part_and_at_an_exact_boundary_end() {
+    // Parts of 1000, 1000, 500: the last part is short, as the real last
+    // part almost always is.
+    let body = pattern(2500);
+    let server = RangeServer::parted(&body, 1000);
+    let source = parted_source(&server, 1000);
+
+    // Ends exactly on the part000/part001 boundary.
+    let bytes = block_on(source.read_range(900, 100)).expect("a boundary-ending read succeeds");
+    assert_eq!(bytes, &body[900..1000]);
+    assert_eq!(
+        server.requests_to(&part_path(1)),
+        0,
+        "a read ending on the boundary must not touch the next part at all"
+    );
+
+    // Entirely inside the final short part.
+    let bytes = block_on(source.read_range(2100, 100)).expect("the short part serves reads");
+    assert_eq!(bytes, &body[2100..2200]);
+
+    // Straddling into the final short part.
+    let bytes = block_on(source.read_range(1990, 30)).expect("a straddle into the last part");
+    assert_eq!(bytes, &body[1990..2020]);
+
+    // Running past the archive's end: up to `length`, exactly as
+    // `FileRangeSource` clamps, because `read_range`'s contract is the same
+    // for every source.
+    let bytes = block_on(source.read_range(2400, 500)).expect("a read past the end clamps");
+    assert_eq!(bytes, &body[2400..2500]);
+}
+
+/// **The differential, over the whole fixture.** Every coordinate the
+/// fixture's bounding box holds, at every zoom it declares, read from the
+/// monolith and from a 7-part split of the same bytes — and the present
+/// count is pinned to the header's own `n_addressed_tiles`, so this cannot
+/// quietly become a sample.
+#[test]
+fn every_fixture_tile_is_byte_identical_from_parts_and_from_the_monolith() {
+    const TEST: &str = "every_fixture_tile_is_byte_identical_from_parts_and_from_the_monolith";
+    let path = archive_path();
+    if !path.is_file() {
+        no_archive_banner(TEST, &path);
+        return;
+    }
+    let bytes = std::fs::read(&path).expect("the archive should be readable");
+    if bytes.len() as u64 != MONACO_BYTES {
+        skip_banner(
+            TEST,
+            "the archive under test is not the committed Monaco fixture",
+            &format!(
+                "The exhaustive walk and its addressed-tiles pin are sized for the fixture, so \
+                 unset {ARCHIVE_ENV},"
+            ),
+        );
+        return;
+    }
+
+    let monolith = block_on(BasemapArchive::open(
+        FileRangeSource::open(&path).expect("the archive should open"),
+    ))
+    .expect("the monolith archive should open");
+
+    // 65,536-byte parts cut the 419,355-byte fixture into 7, the last one
+    // short — six boundaries scattered through the directory and tile data.
+    const PART: u64 = 65_536;
+    let server = RangeServer::parted(&bytes, PART as usize);
+    let parted = block_on(BasemapArchive::open(parted_source(&server, PART)))
+        .expect("the parted archive should open");
+
+    let header = monolith.header();
+    let (min_lon, max_lon) = (header.min_longitude, header.max_longitude);
+    let (min_lat, max_lat) = (header.min_latitude, header.max_latitude);
+    let mut present = 0_u64;
+    let mut compared = 0_u64;
+
+    for z in monolith.min_zoom()..=monolith.max_zoom() {
+        let x_range =
+            squallar_geo::lon_to_tile_x(min_lon, z)..=squallar_geo::lon_to_tile_x(max_lon, z);
+        // Tile rows grow southward, so the *maximum* latitude is the first row.
+        let y_range =
+            squallar_geo::lat_to_tile_y(max_lat, z)..=squallar_geo::lat_to_tile_y(min_lat, z);
+
+        for x in x_range {
+            for y in y_range.clone() {
+                let from_monolith =
+                    block_on(monolith.tile(z, x, y)).expect("the monolith read should succeed");
+                let from_parts =
+                    block_on(parted.tile(z, x, y)).expect("the parts read should succeed");
+
+                assert_eq!(
+                    from_parts, from_monolith,
+                    "{z}/{x}/{y} must be byte-identical from the parts and from the monolith"
+                );
+                compared += 1;
+                if from_monolith.is_present() {
+                    present += 1;
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        present, MONACO_ADDRESSED_TILES,
+        "the bounding-box walk found {present} of the header's {MONACO_ADDRESSED_TILES} \
+         addressed tiles over {compared} coordinates; a shortfall means this differential ran \
+         over a subset while reading as \"every tile\""
+    );
+
+    // And the walk exercised the stitch, not just the arithmetic: some read
+    // drained a part to its last byte and continued into the next from zero.
+    let seen = server.seen();
+    let stitched = seen.windows(2).any(|pair| {
+        match (
+            seen_part_index(&pair[0].path),
+            seen_part_index(&pair[1].path),
+        ) {
+            (Some(first), Some(second)) => {
+                second == first + 1 && pair[0].end as u64 == PART - 1 && pair[1].start == 0
+            }
+            _ => false,
+        }
+    });
+    assert!(
+        stitched,
+        "no read straddled any of the six part boundaries, so the differential never exercised \
+         the stitch; choose a part size that lands a boundary inside a tile"
+    );
+}
+
+/// The brief's deliberately hostile construction: a part stride chosen so the
+/// boundary **bisects one known tile's byte range**, discovered honestly by
+/// recording the one range read that tile costs on a leafless archive. The
+/// tile must come back byte-identical from its two stitched halves.
+#[test]
+fn a_part_boundary_bisecting_a_tile_reproduces_it_byte_for_byte() {
+    const TEST: &str = "a_part_boundary_bisecting_a_tile_reproduces_it_byte_for_byte";
+    let path = archive_path();
+    if !path.is_file() {
+        no_archive_banner(TEST, &path);
+        return;
+    }
+
+    // Discover the tile's byte range: after open, one `tile()` call's LAST
+    // read is the tile body itself (its only read, on an archive with no
+    // leaf directories).
+    let (recording, log) = RecordingSource::new(
+        FileRangeSource::open(&path).expect("an existing archive file should open"),
+    );
+    let reference =
+        block_on(BasemapArchive::open(recording)).expect("the recording archive should open");
+    let z = reference.max_zoom();
+    let (lon, lat) = archive_centre(&reference);
+    let x = squallar_geo::lon_to_tile_x(lon, z);
+    let y = squallar_geo::lat_to_tile_y(lat, z);
+
+    log.lock().expect("the read log is not poisoned").clear();
+    let expected = block_on(reference.tile(z, x, y)).expect("the centre tile should read");
+    assert!(
+        expected.is_present(),
+        "the archive's centre tile must be in it"
+    );
+    let (tile_offset, tile_len) = *log
+        .lock()
+        .expect("the read log is not poisoned")
+        .last()
+        .expect("reading a tile reads at least the tile body");
+    assert!(tile_len >= 2, "a {tile_len}-byte tile cannot be bisected");
+
+    // A stride that puts the part000/part001 boundary in the middle of that
+    // tile's bytes.
+    let stride = tile_offset + tile_len as u64 / 2;
+    let bytes = std::fs::read(&path).expect("the archive should be readable");
+    let server = RangeServer::parted(&bytes, stride as usize);
+    let parted = block_on(BasemapArchive::open(parted_source(&server, stride)))
+        .expect("the bisected archive should open");
+
+    let actual = block_on(parted.tile(z, x, y)).expect("the bisected tile should read");
+    assert_eq!(
+        actual, expected,
+        "{z}/{x}/{y} is bisected by the part boundary and must decode byte-identically from \
+         the stitched halves"
+    );
+
+    // The two halves really were fetched as halves, adjacent and in order.
+    let first_half = SeenRequest {
+        path: part_path(0),
+        start: usize::try_from(tile_offset).expect("the fixture is far smaller than usize"),
+        end: usize::try_from(stride - 1).expect("the fixture is far smaller than usize"),
+    };
+    let second_half = SeenRequest {
+        path: part_path(1),
+        start: 0,
+        end: usize::try_from(tile_offset + tile_len as u64 - 1 - stride)
+            .expect("the fixture is far smaller than usize"),
+    };
+    let seen = server.seen();
+    let halves = seen
+        .windows(2)
+        .any(|pair| pair[0] == first_half && pair[1] == second_half);
+    assert!(
+        halves,
+        "the tile's two halves should appear as adjacent requests {first_half:?} then \
+         {second_half:?}; the log saw {seen:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Parts: the probe
+// ---------------------------------------------------------------------------
+
+/// `part000` present selects part mode — and part mode never touches the bare
+/// URL, because new generations publish **no monolith** there.
+#[test]
+fn a_present_part000_selects_part_mode_and_never_touches_the_bare_url() {
+    const TEST: &str = "a_present_part000_selects_part_mode_and_never_touches_the_bare_url";
+    let path = archive_path();
+    if !path.is_file() {
+        no_archive_banner(TEST, &path);
+        return;
+    }
+    let bytes = std::fs::read(&path).expect("the archive should be readable");
+
+    let server = RangeServer::parted(&bytes, 65_536);
+    let archive = block_on(BasemapArchive::open(parted_source(&server, 65_536)))
+        .expect("the parts alone must be enough to open the archive");
+
+    let z = archive.max_zoom();
+    let (lon, lat) = archive_centre(&archive);
+    let tile = block_on(archive.tile(
+        z,
+        squallar_geo::lon_to_tile_x(lon, z),
+        squallar_geo::lat_to_tile_y(lat, z),
+    ))
+    .expect("the centre tile should read from the parts");
+    assert!(tile.is_present(), "the archive's centre tile must be in it");
+
+    assert_eq!(
+        server.requests_to(ARCHIVE_PATH),
+        0,
+        "part mode must never request the bare URL: a parts-only generation serves nothing there"
+    );
+    let probes = server
+        .seen()
+        .iter()
+        .filter(|request| request.path == part_path(0) && (request.start, request.end) == (0, 15))
+        .count();
+    assert_eq!(
+        probes, 1,
+        "one probe, at open, held for the source's lifetime"
+    );
+}
+
+/// A *clean* 404 for `part000` selects monolith mode — the compatibility path
+/// for generations published before the split, for exactly one probe's cost.
+#[test]
+fn an_absent_part000_selects_monolith_mode_after_one_probe() {
+    const TEST: &str = "an_absent_part000_selects_monolith_mode_after_one_probe";
+    let path = archive_path();
+    if !path.is_file() {
+        no_archive_banner(TEST, &path);
+        return;
+    }
+    let bytes = std::fs::read(&path).expect("the archive should be readable");
+
+    let server = RangeServer::monolith(bytes, 0, Answer::Range);
+    let source = HttpRangeSource::new(loopback_client(), &server.url())
+        .expect("the loopback URL should parse");
+    let archive = block_on(BasemapArchive::open(source)).expect("the monolith archive should open");
+
+    let z = archive.max_zoom();
+    let (lon, lat) = archive_centre(&archive);
+    let tile = block_on(archive.tile(
+        z,
+        squallar_geo::lon_to_tile_x(lon, z),
+        squallar_geo::lat_to_tile_y(lat, z),
+    ))
+    .expect("the centre tile should read from the monolith");
+    assert!(tile.is_present(), "the archive's centre tile must be in it");
+
+    assert_eq!(
+        server.requests_to(&part_path(0)),
+        1,
+        "exactly one probe; its clean 404 selects monolith mode for the source's lifetime"
+    );
+    assert!(
+        server.requests_to(ARCHIVE_PATH) >= 2,
+        "the header and the tile should both have been read from the bare URL"
+    );
+}
+
+/// **A probe failure is a fault, not an absence.** The bare URL here holds a
+/// perfectly good archive, so a reader that shrugged the 500 off as "no
+/// parts" would open successfully — this test failing on `expect_err` is that
+/// silent fallback happening.
+#[test]
+fn a_probe_5xx_fails_the_open_rather_than_silently_selecting_monolith() {
+    const TEST: &str = "a_probe_5xx_fails_the_open_rather_than_silently_selecting_monolith";
+    let path = archive_path();
+    if !path.is_file() {
+        no_archive_banner(TEST, &path);
+        return;
+    }
+    let bytes = std::fs::read(&path).expect("the archive should be readable");
+
+    let server = RangeServer::start(std::collections::HashMap::from([
+        (
+            ARCHIVE_PATH.to_owned(),
+            PathPlan {
+                body: bytes,
+                whole_body_first: 0,
+                then: Answer::Range,
+            },
+        ),
+        (
+            part_path(0),
+            PathPlan {
+                body: Vec::new(),
+                whole_body_first: 0,
+                then: Answer::ServerError,
+            },
+        ),
+    ]));
+
+    let source = HttpRangeSource::new(loopback_client(), &server.url())
+        .expect("the loopback URL should parse");
+    let error = match block_on(BasemapArchive::open(source)) {
+        Ok(_) => panic!(
+            "the open succeeded, which means the 5xx probe was shrugged off as \"no parts\" and \
+             monolith mode was silently selected"
+        ),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(error, ArchiveError::Open(_)),
+        "the fault surfaces through the same path a failed open uses: {error}"
+    );
+    assert!(
+        error.to_string().contains("probe"),
+        "the error should say the probe is what failed: {error}"
+    );
+    assert_eq!(
+        server.requests_to(&part_path(0)),
+        RANGE_ATTEMPTS as usize,
+        "the probe retries per the range discipline before surfacing the fault"
+    );
+    assert_eq!(
+        server.requests_to(ARCHIVE_PATH),
+        0,
+        "the bare URL held a working archive, and reaching for it is exactly the silent \
+         fallback this test forbids"
     );
 }
 
@@ -726,7 +1356,7 @@ fn the_same_reader_opens_over_http_and_over_a_file() {
     let head = std::fs::read(&path)
         .map(|whole| whole[..whole.len().min(1 << 20)].to_vec())
         .expect("the archive should be readable");
-    let server = RangeServer::start(head, 0, Answer::Range);
+    let server = RangeServer::monolith(head, 0, Answer::Range);
     let from_http = block_on(BasemapArchive::open(
         HttpRangeSource::new(loopback_client(), &server.url())
             .expect("the loopback URL should parse"),
