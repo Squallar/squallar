@@ -49,6 +49,13 @@
 //!   The body of a non-`206` is **deliberately never read**: a `200` carries
 //!   the whole archive, and buffering 151 MB — a planet archive, ~125 GB — to
 //!   reach a 16 KiB directory is a worse outcome than the error.
+//! * **A published archive may be split into parts.** The publish side slices
+//!   anything the edge cannot cache whole into [`PART_BYTES`]-byte files at
+//!   `<url>.partNNN`, and [`HttpRangeSource`] probes for `part000` at open to
+//!   decide which shape it is reading — see its docs for the contract. The
+//!   split lives entirely inside that source: [`part_spans`] cuts a global
+//!   range into per-part reads and nothing above the [`RangeSource`] seam
+//!   knows parts exist.
 //! * **The directory cache is mandatory.** With `NoCache` every tile costs two
 //!   range requests on an archive deep enough to have leaf directories: one for
 //!   the leaf, one for the tile. [`BasemapArchive`] holds a
@@ -57,6 +64,7 @@
 
 use std::fmt;
 use std::future::Future;
+use std::sync::Arc;
 
 use pmtiles::{
     AsyncBackend, AsyncPmTilesReader, BackendResponse, Compression, HashMapCache, Header, PmtError,
@@ -75,6 +83,26 @@ pub const RANGE_ATTEMPTS: u32 = 3;
 
 /// HTTP status a range request is asking for.
 const STATUS_PARTIAL_CONTENT: u16 = 206;
+
+/// Bytes in every published part except the last.
+///
+/// **A publish-side contract, not a tuning dial.** The publisher slices the
+/// archive at exactly this stride, so the reader's `offset / PART_BYTES`
+/// arithmetic in [`part_spans`] is only correct while the two agree. It is
+/// under Cloudflare's 512 MB cacheable-object ceiling (measured: a 3.34 GB
+/// object BYPASSes the cache), which is the entire point of the parts.
+pub const PART_BYTES: u64 = 500_000_000;
+
+/// Whether `status` is a host cleanly saying "no such object".
+///
+/// The probe's monolith verdict hangs on this being *clean* absence: a `404`
+/// (or a `410`, absence with a tombstone) from a healthy host. A `5xx` or a
+/// timeout is a host failing to answer, and reading that as "no parts" would
+/// silently select monolith mode during an origin outage — the wrong archive
+/// shape held for the source's whole lifetime.
+fn is_clean_absence(status: u16) -> bool {
+    status == 404 || status == 410
+}
 
 // ---------------------------------------------------------------------------
 // The abstraction
@@ -192,14 +220,55 @@ impl<S: ArchiveRangeSource> AsyncBackend for RangeBackend<S> {
 // The HTTP source
 // ---------------------------------------------------------------------------
 
-/// Byte ranges over HTTP.
+/// Byte ranges over HTTP, over an archive published either as one file or as
+/// byte-slice parts.
 ///
 /// The client is handed in rather than built here, so archive requests go
 /// through the same platform-verified TLS as every other squallar request —
 /// see [`crate::tile_source`] for why that matters.
+///
+/// # Parts
+///
+/// A published archive can exceed what an edge cache will hold as one object —
+/// the planet build is ~84 GB against Cloudflare's 512 MB cacheable-object
+/// ceiling, so every range request against the monolith crosses to origin
+/// storage and bills there. The publish side therefore slices the archive into
+/// [`PART_BYTES`]-byte files named `<archive-url>.part000`, `.part001`, …
+/// (three digits, zero-padded), each small enough for the edge to absorb.
+/// Parts are the publish format; the bare un-suffixed URL is the
+/// compatibility path for generations published before the split.
+///
+/// Which of the two this source is reading is a **probe, not configuration**:
+/// the first read asks for the opening bytes of `<url>.part000`, and its
+/// answer — present, or cleanly absent — is held for the source's lifetime.
+/// See [`HttpRangeSource::layout`].
 pub struct HttpRangeSource {
     client: Client,
     url: Url,
+    /// Every part except the last is exactly this long. [`PART_BYTES`] outside
+    /// the tests; a parameter so a 419 KB fixture can exercise the boundary
+    /// arithmetic without a 500 MB fixture.
+    part_bytes: u64,
+    /// The probe's verdict, taken once and held for the source's lifetime.
+    ///
+    /// In an `Arc` because [`RangeSource::read_range`] returns a `'static`
+    /// future — everything it touches is cloned in — and the verdict must be
+    /// shared across those clones rather than re-probed per read.
+    layout: Arc<std::sync::OnceLock<ArchiveLayout>>,
+}
+
+/// How the archive is published at [`HttpRangeSource::url`].
+///
+/// Decided by the probe in [`HttpRangeSource::layout_for`], never by
+/// configuration, so a generation can change shape without any client
+/// setting changing with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveLayout {
+    /// One file at the bare URL. The compatibility and local-mirror shape;
+    /// new generations are published as parts.
+    Monolith,
+    /// [`PART_BYTES`]-byte slices at `<url>.partNNN`.
+    Parts,
 }
 
 /// See [`assert_source_bounds`]. Checked on every target, wasm32 included.
@@ -234,16 +303,55 @@ pub fn archive_client() -> Client {
 }
 
 impl HttpRangeSource {
-    /// A source reading `url` through `client`.
+    /// A source reading `url` through `client`, with parts of [`PART_BYTES`].
     ///
     /// # Errors
     ///
     /// Returns the string that would not parse as a URL.
     pub fn new(client: Client, url: &str) -> Result<Self, RangeError> {
+        Self::with_part_bytes(client, url, PART_BYTES)
+    }
+
+    /// [`Self::new`] with the part stride overridden.
+    ///
+    /// `#[cfg(test)]` rather than `pub`: the stride is the publish side's
+    /// contract, and a call site that could pick its own would be a client
+    /// quietly disagreeing with the publisher about where every part
+    /// boundary is. The tests need it so the 419 KB fixture can have
+    /// boundaries at all.
+    #[cfg(test)]
+    pub(crate) fn with_small_parts(
+        client: Client,
+        url: &str,
+        part_bytes: u64,
+    ) -> Result<Self, RangeError> {
+        Self::with_part_bytes(client, url, part_bytes)
+    }
+
+    fn with_part_bytes(client: Client, url: &str, part_bytes: u64) -> Result<Self, RangeError> {
+        assert!(part_bytes > 0, "a zero part stride divides by zero");
         let url = Url::parse(url)
             .map_err(|error| RangeError::Transport(format!("{url} is not a URL: {error}")))?;
 
-        Ok(Self { client, url })
+        Ok(Self {
+            client,
+            url,
+            part_bytes,
+            layout: Arc::new(std::sync::OnceLock::new()),
+        })
+    }
+
+    /// The URL of part `index`: the archive URL with `.partNNN` appended to
+    /// its path — `NNN` three digits, zero-padded, growing past three only if
+    /// an archive ever exceeds 500 GB.
+    ///
+    /// Appended to the *path* rather than to the serialized URL, so a query
+    /// string, if one ever appears, stays behind the part suffix rather than
+    /// in the middle of it.
+    fn part_url(base: &Url, index: u64) -> Url {
+        let mut url = base.clone();
+        url.set_path(&format!("{}.part{index:03}", base.path()));
+        url
     }
 }
 
@@ -253,39 +361,224 @@ impl RangeSource for HttpRangeSource {
         offset: u64,
         length: usize,
     ) -> impl Future<Output = Result<Vec<u8>, RangeError>> + Send {
-        // `bytes=N-M`, inclusive at both ends, which is the one form the CORS
-        // safelist covers — so no preflight, which is what makes reading the
-        // archive straight off object storage viable at all.
-        let end = offset.saturating_add(length as u64).saturating_sub(1);
-        let range = format!("bytes={offset}-{end}");
         let client = self.client.clone();
         let url = self.url.clone();
+        let part_bytes = self.part_bytes;
+        let layout = Arc::clone(&self.layout);
 
         async move {
-            let mut last_status = 0;
+            match Self::layout_for(&layout, &client, &url).await? {
+                ArchiveLayout::Monolith => read_ranged(&client, &url, offset, length).await,
+                ArchiveLayout::Parts => {
+                    let mut bytes = Vec::with_capacity(length);
 
-            for attempt in 1..=RANGE_ATTEMPTS {
-                match transport::fetch(client.clone(), url.clone(), range.clone()).await? {
-                    RangeReply::Range { bytes } => return Ok(bytes),
-                    RangeReply::NotRanged { status } => {
-                        log::debug!(
-                            "{url} answered {status} rather than {STATUS_PARTIAL_CONTENT} for \
-                             {range} (attempt {attempt} of {RANGE_ATTEMPTS})"
-                        );
-                        last_status = status;
+                    for span in part_spans(offset, length, part_bytes) {
+                        let part = Self::part_url(&url, span.part);
+                        let chunk = read_ranged(&client, &part, span.offset, span.length).await?;
+                        // A part can only run short of the span if it is the
+                        // archive's final, short part — every other part is
+                        // exactly `part_bytes` long by contract. So a short
+                        // chunk is the archive ending, matching `read_range`'s
+                        // own "up to `length`" contract, and asking the next
+                        // part for the remainder would be asking a file that
+                        // does not exist. An over-long chunk (a server
+                        // answering more than the range asked) is clamped so
+                        // the next span still lands at its right global
+                        // offset.
+                        let got = chunk.len().min(span.length);
+                        bytes.extend_from_slice(&chunk[..got]);
+                        if got < span.length {
+                            break;
+                        }
                     }
+
+                    Ok(bytes)
                 }
             }
-
-            Err(RangeError::NotRanged {
-                status: last_status,
-                attempts: RANGE_ATTEMPTS,
-            })
         }
     }
 }
 
+/// One part-local read of a global range, produced by [`part_spans`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PartSpan {
+    /// Which part, counting from `part000`.
+    part: u64,
+    /// Offset within that part.
+    offset: u64,
+    /// Bytes to read from that offset. Never zero, and never crosses the
+    /// part's end.
+    length: usize,
+}
+
+/// Map a global `(offset, length)` onto per-part reads, in archive order.
+///
+/// **The whole of the parts arithmetic, in one place.** Both transports reach
+/// it through the one [`RangeSource::read_range`] above — the `cfg` split in
+/// [`transport`] selects where a request is driven, never how a range is cut.
+/// Part `k` holds global bytes `[k * part_bytes, (k + 1) * part_bytes)`, so a
+/// read spanning a boundary becomes two (rarely more) spans whose
+/// concatenation, in order, is exactly the global range.
+///
+/// A `length` of zero maps to no spans, and a span never has length zero: a
+/// read ending exactly on a part boundary ends with the earlier part's last
+/// byte and must not touch the next part — requesting zero bytes of `partN+1`
+/// would 404 on the archive's last boundary and turn a correct read into a
+/// fault.
+fn part_spans(offset: u64, length: usize, part_bytes: u64) -> Vec<PartSpan> {
+    let mut spans = Vec::new();
+    let mut at = offset;
+    let mut remaining = length as u64;
+
+    while remaining > 0 {
+        let part = at / part_bytes;
+        let local = at % part_bytes;
+        let take = remaining.min(part_bytes - local);
+        spans.push(PartSpan {
+            part,
+            offset: local,
+            length: take as usize,
+        });
+        at += take;
+        remaining -= take;
+    }
+
+    spans
+}
+
+impl HttpRangeSource {
+    /// The archive's published shape, probed once and then held.
+    ///
+    /// The probe asks for the first bytes of `<url>.part000`. Any success —
+    /// a `206`, or a `200` from a host ignoring the `Range` header — proves
+    /// the part exists and selects [`ArchiveLayout::Parts`]; a *clean*
+    /// absence ([`is_clean_absence`]) selects [`ArchiveLayout::Monolith`].
+    /// Anything else — a timeout, a `5xx`, a `403` — is a fault: it is
+    /// retried up to [`RANGE_ATTEMPTS`] times and then **returned as the
+    /// error it is**, never read as "no parts". A source whose first read is
+    /// this probe failing therefore fails [`BasemapArchive::open`], which is
+    /// the path that reaches the app's archive fault latch; the alternative
+    /// is silently holding monolith mode for the source's lifetime because
+    /// the origin had a bad second at open.
+    ///
+    /// The verdict is logged once, at the `OnceLock` set. The first read an
+    /// archive open performs is what drives this, so in practice the probe
+    /// runs before any read concurrency exists; if two reads ever race it,
+    /// the second `set` loses and the extra probe cost one request.
+    async fn layout_for(
+        layout: &std::sync::OnceLock<ArchiveLayout>,
+        client: &Client,
+        url: &Url,
+    ) -> Result<ArchiveLayout, RangeError> {
+        if let Some(&decided) = layout.get() {
+            return Ok(decided);
+        }
+
+        let verdict = Self::probe(client, url).await?;
+        if layout.set(verdict).is_ok() {
+            match verdict {
+                ArchiveLayout::Parts => log::info!("basemap archive: part mode at {url}"),
+                ArchiveLayout::Monolith => log::info!("basemap archive: monolith mode at {url}"),
+            }
+        }
+        Ok(verdict)
+    }
+
+    /// One probe of `<url>.part000`, with the retry bounded like every other
+    /// range request. See [`Self::layout_for`] for what each answer means.
+    async fn probe(client: &Client, url: &Url) -> Result<ArchiveLayout, RangeError> {
+        let part0 = Self::part_url(url, 0);
+        // First bytes only. On a `200` the body — up to 500 MB of part — is
+        // dropped unread, exactly as `execute` does for every range request.
+        let range = "bytes=0-15".to_owned();
+        let mut last_error = None;
+
+        for attempt in 1..=RANGE_ATTEMPTS {
+            match transport::fetch(client.clone(), part0.clone(), range.clone()).await {
+                Ok(RangeReply::Range { .. } | RangeReply::NotRanged { .. }) => {
+                    return Ok(ArchiveLayout::Parts);
+                }
+                Ok(RangeReply::Failed { status }) if is_clean_absence(status) => {
+                    return Ok(ArchiveLayout::Monolith);
+                }
+                Ok(RangeReply::Failed { status }) => {
+                    log::debug!(
+                        "{part0} answered {status} to the part probe (attempt {attempt} of \
+                         {RANGE_ATTEMPTS})"
+                    );
+                    last_error = Some(RangeError::Transport(format!(
+                        "{part0} answered {status} to the part probe; neither part nor a clean \
+                         absence, after {attempt} attempts"
+                    )));
+                }
+                Err(error @ RangeError::Cancelled) => return Err(error),
+                Err(error) => {
+                    log::debug!(
+                        "{part0} probe failed (attempt {attempt} of {RANGE_ATTEMPTS}): {error}"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            RangeError::Transport(format!("{part0}: the part probe made no attempt"))
+        }))
+    }
+}
+
+/// One ranged read of `url`, retried per [`RANGE_ATTEMPTS`] when the host
+/// answers success-but-not-`206`.
+///
+/// The retry loop [`HttpRangeSource`] has always had, hoisted out of
+/// `read_range` so the monolith read and every per-part read of a stitched
+/// span go through the identical discipline.
+async fn read_ranged(
+    client: &Client,
+    url: &Url,
+    offset: u64,
+    length: usize,
+) -> Result<Vec<u8>, RangeError> {
+    // `bytes=N-M`, inclusive at both ends, which is the one form the CORS
+    // safelist covers — so no preflight, which is what makes reading the
+    // archive straight off object storage viable at all.
+    let end = offset.saturating_add(length as u64).saturating_sub(1);
+    let range = format!("bytes={offset}-{end}");
+    let mut last_status = 0;
+
+    for attempt in 1..=RANGE_ATTEMPTS {
+        match transport::fetch(client.clone(), url.clone(), range.clone()).await? {
+            RangeReply::Range { bytes } => return Ok(bytes),
+            RangeReply::NotRanged { status } => {
+                log::debug!(
+                    "{url} answered {status} rather than {STATUS_PARTIAL_CONTENT} for {range} \
+                     (attempt {attempt} of {RANGE_ATTEMPTS})"
+                );
+                last_status = status;
+            }
+            // A failure status is not a range problem and is not retried —
+            // pinned by `a_failure_status_is_reported_rather_than_retried`.
+            RangeReply::Failed { status } => {
+                return Err(RangeError::Transport(format!(
+                    "{url} answered {status} for {range}"
+                )));
+            }
+        }
+    }
+
+    Err(RangeError::NotRanged {
+        status: last_status,
+        attempts: RANGE_ATTEMPTS,
+    })
+}
+
 /// What one HTTP attempt came back with.
+///
+/// A failure *status* is a reply, not an `Err`: the caller decides what it
+/// means. To [`read_ranged`] any failure is a transport error; to
+/// [`HttpRangeSource::probe`] a `404` is the answer "this archive has no
+/// parts", and flattening it into an error string is what made that
+/// distinction impossible to draw.
 enum RangeReply {
     /// A `206` and its bytes.
     Range {
@@ -294,6 +587,11 @@ enum RangeReply {
     },
     /// A success that was not a `206`. The body was not read.
     NotRanged {
+        /// The status that came back.
+        status: u16,
+    },
+    /// A failure status. The body was not read.
+    Failed {
         /// The status that came back.
         status: u16,
     },
@@ -316,9 +614,12 @@ async fn execute(client: Client, url: Url, range: String) -> Result<RangeReply, 
 
     let status = response.status();
     if !status.is_success() {
-        return Err(RangeError::Transport(format!(
-            "{url} answered {status} for {range}"
-        )));
+        // A reply, not an error: the probe reads a `404` here as "no parts",
+        // which an error string cannot carry. The body is dropped unread.
+        drop(response);
+        return Ok(RangeReply::Failed {
+            status: status.as_u16(),
+        });
     }
 
     if status.as_u16() != STATUS_PARTIAL_CONTENT {
