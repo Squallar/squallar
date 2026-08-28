@@ -1305,3 +1305,257 @@ fn live_cartodb_tile_decodes_and_reaches_a_texture() {
         "the decoded tile is a single flat colour, which is not a basemap"
     );
 }
+// ---------------------------------------------------------------------------
+// The archive source
+//
+// COVERAGE: these are behind `basemap-vector`, which is OFF BY DEFAULT, so
+// `cargo test --workspace` does not select them. What runs them is the native
+// `basemap-vector` row in `.github/workflows/build.yaml`, which names
+// `-p squallar-egui`. Anything added here that lives in another crate needs
+// that row's `-p` scope to grow in the same commit.
+//
+// The seam these exercise -- `Tile::Vector` reaching the painter -- is also
+// covered un-gated, in `ui_map_overlays::tests`, because `walkers/mvt` is on
+// unconditionally. What is gated is only the half that needs an archive.
+// ---------------------------------------------------------------------------
+
+/// The committed fixture, 419,355 bytes of Monaco.
+///
+/// A test that reaches the network is not a test. The published planet archive
+/// is 83.88 GB and lives behind a CDN; this is 419 KB and lives in the tree.
+#[cfg(feature = "basemap-vector")]
+mod archive {
+    use std::num::NonZeroUsize;
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::basemap_archive::FileRangeSource;
+
+    fn fixture_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/monaco.pmtiles")
+    }
+
+    /// The archive-backed source, over the committed fixture.
+    ///
+    /// Returns `None`, with a banner, when the fixture is not there — the same
+    /// shape `basemap_archive::tests` uses, so a checkout without the fixture
+    /// skips rather than reddening on something that is not a defect.
+    fn fixture_tiles(test: &str, ctx: &Context, is_dark: bool) -> Option<HttpsTiles> {
+        let path = fixture_path();
+        let source = match FileRangeSource::open(&path) {
+            Ok(source) => source,
+            Err(error) => {
+                eprintln!(
+                    "SKIPPED {test}: {} would not open ({error}). It is committed; \
+                     `git status` on it.",
+                    path.display()
+                );
+                return None;
+            }
+        };
+
+        Some(HttpsTiles::from_range_source(
+            source,
+            crate::basemap_style::committed(is_dark),
+            Attribution {
+                text: "test",
+                url: "https://example.invalid/",
+                logo_light: None,
+                logo_dark: None,
+            },
+            ctx.clone(),
+            NonZeroUsize::new(64).expect("64 is not zero"),
+        ))
+    }
+
+    /// Monaco itself.
+    ///
+    /// **Not the centre the archive's header declares.** That is the centroid
+    /// of the extract's bounding box (lon 7.408583..7.595671, lat
+    /// 43.483817..43.752930), which is 7.502127/43.618374 -- open Mediterranean,
+    /// 13 km south-east of the city. Measured 2026-08-28: at zoom 14 that
+    /// coordinate's tile is 164 bytes and renders **3** shapes, all of them the
+    /// style's background rectangle and two coastline strokes, while Monaco's
+    /// own is 185,182 bytes and renders **2,992**. A test anchored on the
+    /// header centre would pass every "a tile came back" assertion on an
+    /// essentially empty tile.
+    const MONACO_LON: f64 = 7.424_6;
+    const MONACO_LAT: f64 = 43.738_4;
+
+    /// **First light, as a test.** A real tile out of a real PMTiles archive,
+    /// rendered against a real committed style, arriving as drawable geometry.
+    ///
+    /// This is the whole seam in one: range reads, gunzip, MVT parse, style
+    /// evaluation, tessellation, the LRU, and `Tiles::at`. Before it, nothing
+    /// in this workspace had ever turned an archive byte into a shape.
+    #[test]
+    fn a_tile_from_the_archive_arrives_as_drawable_geometry() {
+        let ctx = Context::default();
+        let Some(mut tiles) = fixture_tiles(
+            "a_tile_from_the_archive_arrives_as_drawable_geometry",
+            &ctx,
+            true,
+        ) else {
+            return;
+        };
+
+        // The header is read by the IO task, so the depth is not known yet.
+        assert_eq!(
+            tiles.source_max_zoom(),
+            0,
+            "before the header lands the source must claim nothing it cannot serve"
+        );
+
+        let max_zoom = pump_until(DEFAULT_TIMEOUT, || {
+            tiles.pump();
+            let z = tiles.source_max_zoom();
+            (z > 0).then_some(z)
+        })
+        .expect("the archive header never arrived");
+
+        let tile_id = TileId {
+            x: squallar_geo::lon_to_tile_x(MONACO_LON, max_zoom),
+            y: squallar_geo::lat_to_tile_y(MONACO_LAT, max_zoom),
+            zoom: max_zoom,
+        };
+
+        let piece = pump_until(DEFAULT_TIMEOUT, || {
+            let piece = draw_one(&mut tiles, tile_id)?;
+            // `at` answers with an ancestor while the real tile is in flight.
+            // Only the tile itself proves the archive read worked.
+            (piece.uv == whole_tile_uv()).then_some(piece)
+        })
+        .expect("the archive never yielded Monaco's own tile");
+
+        let Tile::Vector(shapes) = piece.tile else {
+            panic!(
+                "the archive holds gzipped MVT; a raster here means `Tile::new` \
+                 guessed an image format for it"
+            );
+        };
+
+        // NON-VACUITY. `mvt::render` returns `Ok(vec![])` for a style whose
+        // layers match nothing, and an empty tile draws a blank pane while
+        // every assertion above still passes. 92 style layers over an OMT tile
+        // of a city centre is hundreds of shapes; the floor is far below that
+        // and far above zero.
+        // 2,992 measured 2026-08-28 on this fixture at this coordinate. The
+        // floor is far below that -- a style edit must not redden this -- and
+        // far above the 3 that the archive's *declared* centre renders, which
+        // is the number a wrongly-anchored version of this test would sit on.
+        assert!(
+            shapes.len() > 200,
+            "the archive tile rendered {} shapes. A tile that decodes and draws \
+             nothing is the failure this asserts against, not a pass.",
+            shapes.len()
+        );
+
+        // And it is geometry, not only the style's background rectangle — which
+        // `render` emits for *any* tile, including one whose every source layer
+        // was missing.
+        let non_background = shapes
+            .iter()
+            .filter(|s| !matches!(s, walkers::ShapeOrText::Shape(egui::Shape::Rect(_))))
+            .count();
+        assert!(
+            non_background > 100,
+            "{non_background} of {} shapes were not the style's background \
+             rectangle; a tile whose source layers all missed renders exactly \
+             the background and nothing else",
+            shapes.len()
+        );
+    }
+
+    /// The two themes render the same tile to different pictures.
+    ///
+    /// The control for "a style was applied at all": if the style were ignored,
+    /// or if the same one were used for both, these would be identical.
+    #[test]
+    fn the_theme_chooses_the_style_the_tile_is_rendered_against() {
+        let ctx = Context::default();
+
+        let mut drawn = Vec::new();
+        for is_dark in [true, false] {
+            let Some(mut tiles) = fixture_tiles(
+                "the_theme_chooses_the_style_the_tile_is_rendered_against",
+                &ctx,
+                is_dark,
+            ) else {
+                return;
+            };
+
+            let max_zoom = pump_until(DEFAULT_TIMEOUT, || {
+                tiles.pump();
+                let z = tiles.source_max_zoom();
+                (z > 0).then_some(z)
+            })
+            .expect("the archive header never arrived");
+
+            let tile_id = TileId {
+                x: squallar_geo::lon_to_tile_x(MONACO_LON, max_zoom),
+                y: squallar_geo::lat_to_tile_y(MONACO_LAT, max_zoom),
+                zoom: max_zoom,
+            };
+
+            let piece = pump_until(DEFAULT_TIMEOUT, || {
+                let piece = draw_one(&mut tiles, tile_id)?;
+                (piece.uv == whole_tile_uv()).then_some(piece)
+            })
+            .expect("the archive never yielded Monaco's own tile");
+
+            let Tile::Vector(shapes) = piece.tile else {
+                panic!("the archive yielded a raster");
+            };
+            drawn.push(format!("{shapes:?}"));
+        }
+
+        assert_ne!(
+            drawn[0], drawn[1],
+            "the dark and light styles rendered the same tile identically, so \
+             the style is not reaching the renderer"
+        );
+    }
+
+    /// A coordinate the archive does not hold is not a retry and not a hole in
+    /// the log: the cache keeps its `None` and the source stays quiet.
+    #[test]
+    fn a_tile_the_archive_does_not_hold_settles_rather_than_retrying() {
+        let ctx = Context::default();
+        let Some(mut tiles) = fixture_tiles(
+            "a_tile_the_archive_does_not_hold_settles_rather_than_retrying",
+            &ctx,
+            true,
+        ) else {
+            return;
+        };
+
+        let max_zoom = pump_until(DEFAULT_TIMEOUT, || {
+            tiles.pump();
+            let z = tiles.source_max_zoom();
+            (z > 0).then_some(z)
+        })
+        .expect("the archive header never arrived");
+
+        // Mid-Atlantic, which a Monaco archive certainly does not hold.
+        let tile_id = TileId {
+            x: squallar_geo::lon_to_tile_x(-30.0, max_zoom),
+            y: squallar_geo::lat_to_tile_y(25.0, max_zoom),
+            zoom: max_zoom,
+        };
+
+        let deadline = Instant::now() + SETTLE;
+        while Instant::now() < deadline {
+            assert!(
+                draw_one(&mut tiles, tile_id).is_none(),
+                "{tile_id:?} is not in a Monaco archive and nothing may be drawn for it"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert!(
+            tiles.tile_is_cached(tile_id),
+            "an absent tile must keep its cache slot, or it is asked for again \
+             on every frame for as long as it is on screen"
+        );
+    }
+}

@@ -30,6 +30,8 @@
 //! before its grid loop, and never from [`Tiles::at`] — see
 //! [`HttpsTiles::pump`] for why, and for the one thing that would break.
 use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use egui::Context;
@@ -358,7 +360,14 @@ fn tile_client() -> reqwest::Client {
 pub struct HttpsTiles {
     attribution: Attribution,
     tile_size: u32,
-    max_zoom: u8,
+
+    /// The source's deepest zoom.
+    ///
+    /// Shared and atomic rather than a plain `u8` because an archive source
+    /// does not know it at construction: the number is in the PMTiles header,
+    /// which is read by the IO task. See [`HttpsTiles::from_archive_url`] for
+    /// what it holds before the header arrives.
+    max_zoom: Arc<AtomicU8>,
 
     /// Tiles by id. A `None` value means "asked for, not here yet" *and*
     /// "asked for, and it failed" — the two are deliberately indistinguishable,
@@ -380,6 +389,12 @@ pub struct HttpsTiles {
     /// wasm32 only: what is left of [`WASM_TILE_DECODES_PER_PUMP`] this pass.
     #[cfg(target_arch = "wasm32")]
     decode_budget: DecodeBudget,
+
+    /// wasm32 only: the style [`Tile::new`] renders a vector tile against.
+    /// Empty for a raster source, which never reads it. On native the IO task
+    /// owns its own clone -- see [`fetch_one`].
+    #[cfg(target_arch = "wasm32")]
+    style: Arc<Style>,
 
     /// [`Self::pump`] calls since this source was built — see [`Self::pumps`].
     /// Always on, like the app's other ledgers: one `u64` add per layer per
@@ -489,7 +504,7 @@ impl HttpsTiles {
     ) -> Self {
         let attribution = source.attribution();
         let tile_size = source.tile_size();
-        let max_zoom = source.max_zoom();
+        let max_zoom = Arc::new(AtomicU8::new(source.max_zoom()));
 
         // Sized to the concurrency limit, as walkers sizes them: a full request
         // channel is the backpressure that makes `request_once` retry later.
@@ -516,6 +531,10 @@ impl HttpsTiles {
             egui_ctx: frame_ctx,
             #[cfg(target_arch = "wasm32")]
             decode_budget: DecodeBudget::new(),
+            // A raster source. The wasm decode path passes this to `Tile::new`,
+            // which only reads a style for a tile that is not an image.
+            #[cfg(target_arch = "wasm32")]
+            style: Arc::new(Style::default()),
             pumps: 0,
             runtime,
         }
@@ -591,23 +610,28 @@ impl HttpsTiles {
             tile_rx,
             egui_ctx,
             decode_budget,
+            style,
             ..
         } = self;
+        let style: &Style = style;
 
         let budget = decode_budget.remaining(egui_ctx.cumulative_pass_nr());
-        let taken = drain_up_to(tile_rx, budget, |(tile_id, bytes): (TileId, Vec<u8>)| {
-            // `Style::default()` for the reason `fetch_one` gives on native.
-            #[allow(
-                clippy::default_constructed_unit_structs,
-                reason = "keeps compiling if walkers/mvt is ever enabled"
-            )]
-            match Tile::new(&bytes, &Style::default(), tile_id.zoom, egui_ctx) {
-                Ok(tile) => {
-                    cache.put(tile_id, Some(tile));
-                }
-                Err(error) => log::warn!("decoding tile {tile_id:?}: {error}"),
-            }
-        });
+        let taken =
+            drain_up_to(
+                tile_rx,
+                budget,
+                |(tile_id, bytes): (TileId, Vec<u8>)| match Tile::new(
+                    &bytes,
+                    style,
+                    tile_id.zoom,
+                    egui_ctx,
+                ) {
+                    Ok(tile) => {
+                        cache.put(tile_id, Some(tile));
+                    }
+                    Err(error) => log::warn!("decoding tile {tile_id:?}: {error}"),
+                },
+            );
         decode_budget.record(taken);
 
         if budget > 0 && taken == budget {
@@ -672,7 +696,7 @@ impl HttpsTiles {
     /// (`ui_map_overlays`' tile pass, when a zoom bias asks for a level deeper
     /// than the pane's own) can clamp to what this source can serve.
     pub fn source_max_zoom(&self) -> u8 {
-        self.max_zoom
+        self.max_zoom.load(Ordering::Relaxed)
     }
 
     /// Tiles currently held, including pending and failed markers. Exposed for
@@ -688,6 +712,20 @@ impl HttpsTiles {
     #[cfg(all(test, not(target_arch = "wasm32")))]
     fn tile_is_cached(&self, tile_id: TileId) -> bool {
         self.cache.contains(&tile_id)
+    }
+
+    /// Put `tile` in the cache under `tile_id`, as an arrived fetch would.
+    ///
+    /// Test-only, and the reason it exists is coverage rather than convenience:
+    /// the vector draw seam has to be reachable from a test that runs in a
+    /// **default** `cargo test --workspace`. `walkers/mvt` is on
+    /// unconditionally, so `Tile::Vector` exists on every build, but the only
+    /// thing that *produces* one is the archive, and the archive is behind
+    /// `basemap-vector`. Without this the seam's dispatch would be tested only
+    /// by a CI row that has to be remembered.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn put_for_test(&mut self, tile_id: TileId, tile: Tile) {
+        self.cache.put(tile_id, Some(tile));
     }
 }
 
@@ -711,8 +749,9 @@ impl Tiles for HttpsTiles {
 
         // Above the source's deepest zoom there is nothing to download; the
         // ancestor at `max_zoom` is what gets stretched over the gap.
-        let to_fetch = if tile_id.zoom > self.max_zoom {
-            interpolate_from_lower_zoom(tile_id, self.max_zoom).0
+        let max_zoom = self.source_max_zoom();
+        let to_fetch = if tile_id.zoom > max_zoom {
+            interpolate_from_lower_zoom(tile_id, max_zoom).0
         } else {
             tile_id
         };
@@ -768,14 +807,9 @@ async fn fetch_one<S: TileSource>(
         .await
         .map_err(|error| format!("reading '{url}': {error}"))?;
 
-    // `Style::default()` rather than clippy's suggested `&Style`: walkers only
-    // defines `Style` as a unit struct when its `mvt` feature is off, and with
-    // `mvt` on `&Style` stops compiling.
+    // An empty style. This function serves a raster source, and `Tile::new`
+    // only consults a style for a body that is not a recognised image.
     #[cfg(not(target_arch = "wasm32"))]
-    #[allow(
-        clippy::default_constructed_unit_structs,
-        reason = "keeps compiling if walkers/mvt is ever enabled"
-    )]
     let payload = Tile::new(&body, &Style::default(), tile_id.zoom, egui_ctx)
         .map_err(|error| format!("decoding '{url}': {error}"))?;
 
@@ -848,6 +882,224 @@ async fn fetch_continuously<S: TileSource>(
     }
 
     log::debug!("tile fetch loop finished");
+}
+
+// ---------------------------------------------------------------------------
+// The archive source
+// ---------------------------------------------------------------------------
+
+/// Tiles served out of a self-hosted PMTiles v3 archive rather than one HTTP
+/// GET per tile.
+///
+/// Everything downstream of the fetch is the raster path unchanged: the same
+/// LRU, the same de-duplication, the same interpolation from a shallower
+/// ancestor, the same [`HttpsTiles::pump`] contract. Only where the bytes come
+/// from, and what they decode into, differ.
+#[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
+impl HttpsTiles {
+    /// Serve tiles from the PMTiles archive at `url`, rendered against `style`.
+    ///
+    /// **The archive is opened by the IO task, not here.** Reading the header
+    /// and the root directory is two range requests over the network, and this
+    /// is called from a frame.
+    ///
+    /// So [`Self::source_max_zoom`] starts at **0** and is replaced by the
+    /// archive's own `max_zoom` the moment the header lands. Zero is the honest
+    /// initial value -- the archive's depth is unknown until it is read -- and
+    /// it is also the safe one: [`Tiles::at`] clamps a deeper request down to
+    /// it, so the first frames ask for `0/0/0`, a real tile that is drawn
+    /// stretched over the viewport, and the frame after the header arrives asks
+    /// for the right level. Nothing is stranded: a tile the cache holds under a
+    /// shallower id is exactly what [`Self::cached_or_interpolated`] walks to.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::basemap_archive::RangeError`] if `url` will not parse. A URL
+    /// that parses but does not answer is a *runtime* failure of the IO task,
+    /// logged there; it cannot be reported here, because nothing has been asked
+    /// for yet.
+    pub fn from_archive_url(
+        url: &str,
+        style: Arc<Style>,
+        attribution: Attribution,
+        egui_ctx: Context,
+    ) -> Result<Self, crate::basemap_archive::RangeError> {
+        use crate::basemap_archive::{HttpRangeSource, archive_client};
+
+        let source = HttpRangeSource::new(archive_client(), url)?;
+        Ok(Self::from_range_source(
+            source,
+            style,
+            attribution,
+            egui_ctx,
+            TILE_CACHE_ENTRIES,
+        ))
+    }
+
+    /// [`Self::from_archive_url`] with the range source and the cache bound
+    /// supplied. Crate-private, for the tests, which read the committed Monaco
+    /// fixture off disk rather than over a network.
+    pub(crate) fn from_range_source<S>(
+        source: S,
+        style: Arc<Style>,
+        attribution: Attribution,
+        egui_ctx: Context,
+        cache_entries: NonZeroUsize,
+    ) -> Self
+    where
+        S: crate::basemap_archive::ArchiveRangeSource + 'static,
+    {
+        let (request_tx, request_rx) = channel(MAX_PARALLEL_DOWNLOADS);
+        let (tile_tx, tile_rx) = channel(MAX_PARALLEL_DOWNLOADS);
+
+        let max_zoom = Arc::new(AtomicU8::new(0));
+
+        let runtime = runtime::spawn(serve_archive_continuously(
+            source,
+            style,
+            Arc::clone(&max_zoom),
+            request_rx,
+            tile_tx,
+            egui_ctx,
+        ));
+
+        Self {
+            attribution,
+            // The side a vector tile's extent is mapped onto. 256 is what
+            // `crate::tiles::TILE_SIDE_POINTS` places a tile at, and the two
+            // must agree: `walkers::mercator::tile_id` folds a larger declared
+            // size into the zoom, which would ask the archive for a level
+            // shallower than the one being drawn.
+            tile_size: crate::tiles::TILE_SIDE_POINTS as u32,
+            max_zoom,
+            cache: LruCache::new(cache_entries),
+            request_tx,
+            tile_rx,
+            pumps: 0,
+            runtime,
+        }
+    }
+}
+
+/// Open the archive, then answer tile requests out of it until [`HttpsTiles`]
+/// is dropped.
+///
+/// The same three-state loop as [`fetch_continuously`], for the same reason: a
+/// bounded number of reads in flight is what keeps a pan from opening one range
+/// request per visible tile at once.
+///
+/// **The tessellation happens here, on the IO thread.** `Tile::new` falls
+/// through to `mvt::render` for a body no image decoder recognises, and that is
+/// the whole per-tile cost of a vector basemap -- the frame side only ever
+/// moves a finished `Tile` into the cache.
+#[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
+async fn serve_archive_continuously<S>(
+    source: S,
+    style: Arc<Style>,
+    max_zoom: Arc<AtomicU8>,
+    mut request_rx: Receiver<TileId>,
+    mut tile_tx: Sender<(TileId, FetchPayload)>,
+    egui_ctx: Context,
+) where
+    S: crate::basemap_archive::ArchiveRangeSource,
+{
+    use crate::basemap_archive::BasemapArchive;
+
+    let archive = match BasemapArchive::open(source).await {
+        Ok(archive) => archive,
+        Err(error) => {
+            log::error!("the basemap archive will not open, so it serves no tiles: {error}");
+            return;
+        }
+    };
+
+    max_zoom.store(archive.max_zoom(), Ordering::Relaxed);
+    log::info!(
+        "basemap archive open: zooms {}-{}, tiles {:?}, compression {:?}",
+        archive.min_zoom(),
+        archive.max_zoom(),
+        archive.tile_type(),
+        archive.tile_compression()
+    );
+    // The header changed what `at` may ask for, and nothing else would wake the
+    // UI to ask for it.
+    egui_ctx.request_repaint();
+
+    let mut outstanding = FuturesUnordered::new();
+
+    loop {
+        let completed = if outstanding.is_empty() {
+            match request_rx.next().await {
+                Some(tile_id) => {
+                    outstanding.push(read_one(&archive, &style, &egui_ctx, tile_id));
+                    continue;
+                }
+                None => break,
+            }
+        } else if outstanding.len() < MAX_PARALLEL_DOWNLOADS {
+            match select(request_rx.next(), outstanding.next()).await {
+                Either::Left((Some(tile_id), pending)) => {
+                    // Release the borrow of `outstanding` before pushing.
+                    drop(pending);
+                    outstanding.push(read_one(&archive, &style, &egui_ctx, tile_id));
+                    continue;
+                }
+                Either::Left((None, _)) => break,
+                Either::Right((completed, _)) => completed,
+            }
+        } else {
+            outstanding.next().await
+        };
+
+        let Some(result) = completed else { continue };
+
+        match result {
+            // The archive positively holds no tile there. Not an error and not
+            // a retry: the `None` the cache already carries under this id is
+            // the right answer forever.
+            Ok(None) => {}
+            Ok(Some(fetched)) => {
+                if tile_tx.send(fetched).await.is_err() {
+                    break;
+                }
+                egui_ctx.request_repaint();
+            }
+            Err(error) => log::warn!("{error}"),
+        }
+    }
+
+    log::debug!("archive tile loop finished");
+}
+
+/// Read one tile out of the archive and render it.
+///
+/// `Ok(None)` is the archive positively holding nothing at that coordinate --
+/// an ocean tile at zoom 14 -- which is why
+/// [`crate::basemap_archive::TileBytes`] is a type rather than an empty `Vec`.
+#[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
+async fn read_one<S>(
+    archive: &crate::basemap_archive::BasemapArchive<S>,
+    style: &Style,
+    egui_ctx: &Context,
+    tile_id: TileId,
+) -> Result<Option<(TileId, FetchPayload)>, String>
+where
+    S: crate::basemap_archive::ArchiveRangeSource,
+{
+    let bytes = archive
+        .tile(tile_id.zoom, tile_id.x, tile_id.y)
+        .await
+        .map_err(|error| format!("reading {tile_id:?} from the basemap archive: {error}"))?;
+
+    let Some(bytes) = bytes.bytes() else {
+        log::trace!("the basemap archive holds no tile at {tile_id:?}");
+        return Ok(None);
+    };
+
+    let tile = Tile::new(bytes, style, tile_id.zoom, egui_ctx)
+        .map_err(|error| format!("rendering {tile_id:?} from the basemap archive: {error}"))?;
+
+    Ok(Some((tile_id, tile)))
 }
 
 // Native-only: `#[tokio::test]` (the dev-dependency is target-gated),

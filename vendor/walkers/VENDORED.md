@@ -1385,6 +1385,42 @@ The `--features mvt` test count goes 85 -> 87, against **48** without it.
 `mvt`, `style` and `text` do not compile in, and a filter naming any of them
 selects zero tests and still exits `0`.
 
+### Changed — source, eighteenth commit: `line-width` arrives at the width the style asked for
+
+`src/mvt.rs`, `render_line`. One factor, `4.0` -> `16.0`, now the named constant
+`LINE_WIDTH_TO_EXTENT`.
+
+A style's `line-width` is in screen points. `render` emits shapes in MVT extent
+units, and `transformed` later scales the whole tile by
+`rect.width() / ONLY_SUPPORTED_EXTENT`. So the pre-multiplier that makes a
+styled width land on screen at that width is `ONLY_SUPPORTED_EXTENT /
+rect.width()`, where `rect.width()` is the side the consumer draws a tile at.
+
+| consumer | tile side, points | correct factor | upstream's 4.0 draws |
+| --- | ---: | ---: | --- |
+| squallar (`TILE_SIDE_POINTS`, `squallar-egui/src/tiles.rs`) | 256 | **16** | a quarter width |
+| `TileSource::tile_size` default (`src/sources/mod.rs`) | 256 | 16 | a quarter width |
+| `OpenFreeMap` (`src/sources/openfreemap.rs`) | 512 | 8 | half width |
+
+**`4.0` is `4096/1024`, and this crate ships no 1024-point source** — so the
+constant matched nothing upstream either. It is a defect, not a preference we
+are overriding.
+
+The `else` branch — `2.0` when a layer sets no `line-width` — is **left as
+upstream wrote it**, and it is inconsistent with the line above it: MapLibre's
+default is 1, so it should be `1.0 * LINE_WIDTH_TO_EXTENT`. Nothing in this
+workspace reaches it. All 56 `line` layers of both committed styles
+(`www/styles/{dark,light}.json`) set `line-width`, counted 2026-08-28, and all
+56 set it to the scalar `8`. Changing a branch no committed style exercises
+would be an unverifiable edit inside a vendored file.
+
+`mvt::tests::rendering_the_fixture_reproduces_the_recorded_shapes_exactly` moves
+with the factor, and this is the one class of golden edit that is legitimate:
+the pin is on *what expressions evaluate to*, and the factor is downstream of
+the evaluation. Three of its four stroke widths scale by 4 — `16.0 -> 64.0` and
+`8.0 -> 32.0` twice. The fourth, `2.0`, does **not** move, which is what shows
+the `else` branch was left alone.
+
 ## What the pin actually selects
 
 "Upstream's 38 inline tests are the behaviour pin" is the reason this crate is
