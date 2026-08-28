@@ -6,8 +6,36 @@ pub struct Text {
     pub position: Pos2,
     pub font_size: f32,
     pub text_color: Color32,
-    pub background_color: Color32,
+    /// The colour of the outline drawn *behind* the glyphs.
+    ///
+    /// **This field used to be `background_color`, and the rename is the
+    /// change.** Nothing ever drew a background with it: its only producer set
+    /// it to a style's `text-halo-color` at half alpha, and its only consumer
+    /// put it in `egui::TextFormat::background`, which fills the galley's
+    /// bounding rectangle. So a style asking for a halo got a translucent box
+    /// behind the whole label instead of an outline around the letters, which
+    /// is what the `// TODO: Implement real halo rendering.` beside the
+    /// producer was about. The field now says what it is; see
+    /// [`halo_width`](Self::halo_width) for what a consumer is expected to do
+    /// with it.
+    pub halo_color: Color32,
+    /// How far the halo extends from the glyphs, in screen points.
+    ///
+    /// Zero means no halo, which is a value the committed styles actually use
+    /// (`watername_ocean` asks for `text-halo-width: 0`), so it is a real case
+    /// and not merely the default.
+    pub halo_width: f32,
     pub angle: f32,
+    /// Wrap width in ems of [`font_size`](Self::font_size), from
+    /// `text-max-width`.
+    ///
+    /// Ems rather than points because that is the unit MapLibre defines it in,
+    /// and because the conversion needs the font the text layer will actually
+    /// use. `None` means "do not wrap".
+    pub max_width_ems: Option<f32>,
+    /// Row height in ems, from `text-line-height`. `None` leaves the text
+    /// layer's own row height alone.
+    pub line_height_ems: Option<f32>,
 }
 
 impl Text {
@@ -16,7 +44,7 @@ impl Text {
         text: String,
         font_size: f32,
         text_color: Color32,
-        background_color: Color32,
+        halo_color: Color32,
         angle: f32,
     ) -> Self {
         Self {
@@ -24,9 +52,118 @@ impl Text {
             text,
             font_size,
             text_color,
-            background_color,
+            halo_color,
+            halo_width: 0.0,
             angle,
+            max_width_ems: None,
+            line_height_ems: None,
         }
+    }
+
+    /// This text with a halo `width` points wide.
+    #[must_use]
+    pub fn with_halo_width(mut self, width: f32) -> Self {
+        self.halo_width = width;
+        self
+    }
+
+    /// This text wrapped at `max_width_ems`, with rows `line_height_ems` apart.
+    #[must_use]
+    pub fn with_wrapping(
+        mut self,
+        max_width_ems: Option<f32>,
+        line_height_ems: Option<f32>,
+    ) -> Self {
+        self.max_width_ems = max_width_ems;
+        self.line_height_ems = line_height_ems;
+        self
+    }
+
+    /// This label laid out: wrapped at `text-max-width`, rows spaced by
+    /// `text-line-height`, and centred on its anchor.
+    ///
+    /// **The wrap width becomes points here and nowhere earlier.**
+    /// `text-max-width` is defined in ems of the label's own size, and an em is
+    /// only a number of points once the font that will lay the text out is
+    /// known -- which is here and not in [`crate::mvt`].
+    ///
+    /// `halign` is [`egui::Align::Center`], matching MapLibre's default
+    /// `text-justify`. The consequence a caller must handle is that the galley
+    /// is measured about its own centre line, so `galley.rect.min.x` is
+    /// negative; [`Self::shape`] takes the block's top-left corner and undoes
+    /// that, and callers should place through it rather than passing a galley
+    /// origin straight to [`egui::epaint::TextShape`].
+    pub fn galley(&self, ctx: &egui::Context) -> std::sync::Arc<egui::Galley> {
+        let mut job = egui::text::LayoutJob {
+            halign: egui::Align::Center,
+            ..Default::default()
+        };
+
+        if let Some(ems) = self.max_width_ems {
+            job.wrap.max_width = ems * self.font_size;
+        }
+
+        job.append(
+            &self.text,
+            0.0,
+            egui::TextFormat {
+                font_id: egui::FontId::proportional(self.font_size),
+                color: self.text_color,
+                line_height: self.line_height_ems.map(|ems| ems * self.font_size),
+                ..Default::default()
+            },
+        );
+
+        ctx.fonts_mut(|fonts| fonts.layout_job(job))
+    }
+
+    /// The shape drawing `galley` with its block's top-left corner at
+    /// `top_left`, haloed if this label asked for one.
+    ///
+    /// **The halo is the glyphs redrawn around themselves, not a filled box.**
+    /// This used to be `egui::TextFormat::background` set to the halo colour at
+    /// half alpha, which fills the galley's bounding rectangle -- a translucent
+    /// slab behind the whole label rather than an outline following the
+    /// letters. Eight offsets on a circle rather than four on the axes: at the
+    /// one-point width the styles ask for, four leaves gaps on diagonal
+    /// strokes. All nine draws share one `Arc<Galley>`, so the text is shaped
+    /// once.
+    ///
+    /// An SDF or a blurred mask is what MapLibre does and would be better; it
+    /// needs a glyph atlas this crate does not build, and offset draws are the
+    /// standard approximation short of one.
+    pub fn shape(&self, galley: std::sync::Arc<egui::Galley>, top_left: Pos2) -> egui::Shape {
+        use egui::epaint::TextShape;
+
+        // Rows carry negative offsets under `Align::Center`, so the galley's
+        // own origin is not its top-left corner. Subtracting it puts the block
+        // exactly where the collision box claimed it.
+        let origin = top_left - galley.rect.min.to_vec2();
+
+        let glyphs = |at: Pos2, color: Color32| -> egui::Shape {
+            TextShape::new(at, galley.clone(), color)
+                .with_angle(self.angle)
+                .into()
+        };
+
+        if self.halo_width <= 0.0 || self.halo_color.a() == 0 {
+            return glyphs(origin, self.text_color);
+        }
+
+        let mut shapes = Vec::with_capacity(9);
+        let (sin, cos) = self.angle.sin_cos();
+
+        for step in 0..8 {
+            let theta = std::f32::consts::TAU * (step as f32) / 8.0;
+            let (dx, dy) = (theta.cos() * self.halo_width, theta.sin() * self.halo_width);
+            // Rotated with the label, so a line label's halo stays a ring
+            // around the glyphs instead of being sheared off them.
+            let offset = vec2(dx * cos - dy * sin, dx * sin + dy * cos);
+            shapes.push(glyphs(origin + offset, self.halo_color));
+        }
+
+        shapes.push(glyphs(origin, self.text_color));
+        egui::Shape::Vec(shapes)
     }
 }
 

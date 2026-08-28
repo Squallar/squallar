@@ -82,6 +82,13 @@ pub struct Paint {
     pub text_color: Option<Color>,
     /// <https://maplibre.org/maplibre-style-spec/layers/>#text-halo-color
     pub text_halo_color: Option<Color>,
+    /// <https://maplibre.org/maplibre-style-spec/layers/>#text-halo-width
+    ///
+    /// In screen points, like `line-width` beside it. Read because it is not a
+    /// constant across the committed styles: 28 symbol layers ask for `1` and
+    /// `watername_ocean` asks for `0`, so a renderer that assumed a width would
+    /// draw a halo the style explicitly declined.
+    pub text_halo_width: Option<Float>,
 }
 
 #[derive(Debug, Error)]
@@ -163,6 +170,18 @@ impl Filter {
 pub struct Layout {
     text_field: Option<Value>,
     pub text_size: Option<Float>,
+    /// <https://maplibre.org/maplibre-style-spec/layers/>#text-max-width
+    ///
+    /// The width a symbol label wraps at, **in ems of its own `text-size`**.
+    /// MapLibre's default is 10; `None` here means the style said nothing and
+    /// the renderer applies that default.
+    pub text_max_width: Option<Float>,
+    /// <https://maplibre.org/maplibre-style-spec/layers/>#text-line-height
+    ///
+    /// Also in ems. MapLibre's default is 1.2, which is close enough to egui's
+    /// own row height that `None` is left to the text layer rather than
+    /// substituted here.
+    pub text_line_height: Option<Float>,
 }
 
 impl Layout {

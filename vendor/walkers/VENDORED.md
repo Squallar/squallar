@@ -1536,6 +1536,143 @@ is a refcount; the vector arm deep-copied every shape in the tile. Measured on
 the same z14 tile: **22.9 us per tile per frame, against a viewport that holds
 up to 84 tiles**. An `Arc` clone measures 0.01 us.
 
+### Changed — source, twentieth commit: labels wrap, rivers stop repeating, and the halo is real
+
+Four files: `src/mvt.rs`, `src/style.rs`, `src/text.rs`, `src/tiles.rs`. All
+four are already on the changed list above. **`src/mvt.rs` is not**, and its
+absence there is a pre-existing gap in that list rather than something this
+commit introduces: the seventeenth, eighteenth and nineteenth commits all
+changed it. The `diff -rq` block above is from the seventh commit and has not
+been re-run since; treat it as that commit's snapshot. What is true now is that
+`src/mvt.rs` differs too.
+
+Four defects, reported from a live map.
+
+**1. A warn per style layer per tile, for ordinary data.**
+`get_layer_features` warned "Source layer '…' not found. Skipping." whenever a
+tile did not carry a source layer the style names. A style names 94 source
+layers and no tile carries all of them, so this fired constantly and said
+nothing anyone could act on — this workspace's standing rule is that a notice
+the reader cannot act on is a defect in the code. **Measured over a 45-tile
+Oklahoma viewport at zooms 6, 7 and 8: 903 warn lines, which was 100% of the
+warn output `mvt::render` produced; `transportation` alone 245. After: 0.**
+
+It is `trace!` and not deleted, because "why is this one layer not drawing on
+this one tile" is a real question with no other instrument. The case that is
+genuinely broken — a style naming a source layer no tile anywhere carries — is
+caught before shipping by `squallar-egui/tests/committed_styles_parse.rs`, which
+fails the build.
+
+**2. `text-max-width` was implemented by nothing.** No wrapping code existed
+anywhere in the crate. The committed styles set the property on 16 layers and
+every one was ignored, so a 77-character tribal-nation name drew as a single
+run **414.7 points wide**, across the user's whole viewport. `Layout` gains
+`text_max_width` and `text_line_height`; `Text` gains `max_width_ems` and
+`line_height_ems`, and the ems become points in `Text::galley`, which is the
+first place the font is known. At the `text-max-width: 8` its layer asks for,
+that name is 91.8 x 70 points.
+
+The default when a style is silent is MapLibre's **10 ems**, applied in
+`symbol_wrapping` rather than left to the text layer: "the style said nothing"
+and "the style said do not wrap" are different instructions.
+
+**Wrapping is a point-placement rule, and getting that wrong was caught before
+it shipped.** MapLibre shapes a symbol with
+`placement === 'point' ? text-max-width * ONE_EM : 0`, so a line-placed label is
+never wrapped — it is laid out along the line and has no column to break into.
+The first version of this change applied the 10-em default to both arms, which
+would have stacked `waterway_label`'s "North Canadian River" into short rows
+lying across the river instead of along it: a *worse* result than the
+unwrapped run it replaced, on the one layer whose placement was reported as
+already legible. `mvt::tests::a_line_label_is_never_wrapped` pins the
+distinction, with a point label under the same absurd 2-em cap as the control,
+and the golden recording carries both values for the same reason.
+
+**3. A river was named once per OSM way.** `render_symbol` emitted one label per
+`LineString`, anchored at the midpoint of whichever single *segment* was
+longest, at that segment's slope.
+
+*A correction to how this was first described to me, worth recording because it
+changes what the fix is for:* the old anchor was **not** off the line. The
+midpoint of a straight segment lies on that segment. The real defect is that
+"the longest segment" is decided by how the tile was generalised, so it moves
+between zooms — which is the reported symptom of labels that "jump around and
+rotate differently at different zoom levels", and it is a *stability* defect
+rather than a *correctness* one. `anchor_along` replaces it with the point half
+way along by arc length and the tangent over a window centred there.
+`mvt::tests::simplifying_a_river_barely_moves_its_label` is the pin, with the
+rule it replaced spelled out beside it as the control.
+
+Deduplication is **not** here, because a river crosses tiles and this crate
+renders one. It is in the consumer's label phase, keyed on name and a minimum
+screen distance, so a river spanning the pane is still readable at both ends —
+which is what MapLibre's `symbol-spacing` buys. **Measured on the same
+viewport, z8: "Beaver River" 6 labels to 2, "Cimarron River" 4 to 2, "Washita
+River" 4 to 2, "Verdigris River" and "North Canadian River" 3 each to 1. At z6
+and z7 every river repeat is gone.**
+
+**4. The halo was a background rectangle.** `Text::background_color` carried the
+style's `text-halo-color` at half alpha and the consumer put it in
+`egui::TextFormat::background`, which fills the galley's bounding box — a
+translucent slab behind the label, not an outline around the letters. The field
+is now `halo_color`, `Paint` gains `text_halo_width`, and `Text::shape` draws
+the glyphs eight times on a circle beneath themselves.
+
+`text-halo-width` is read rather than assumed because it is not constant: 28
+symbol layers in each committed style ask for `1` and `watername_ocean` asks
+for `0`. MapLibre's default is 0, so a style naming a halo colour and no width
+gets no halo, here as there.
+
+**The `MultiPoint` arm never had a halo at all** — it passed
+`Color32::TRANSPARENT` unconditionally, so every place name on the map drew
+unhaloed however loudly the style asked. Both arms read the same three paint
+properties now, through `symbol_colors`.
+
+**What it costs the frame, measured rather than waved at.** Eight offsets is
+nine draws where there was one. Tessellating 96 labels — what a z8 pane
+actually puts on glass — release build, best of 20: **10.5 us without the halo,
+94.0 us with it**. So +83.5 us per pane per frame, 0.5% of a 60 Hz budget. All
+nine draws share one `Arc<Galley>`, so the text is shaped once and only the
+tessellation repeats. An SDF or a blurred mask is what MapLibre does and would
+be cheaper as well as better; it needs a glyph atlas this crate does not build.
+
+**`Text::galley` and `Text::shape` are new public methods, and they exist to
+stop a second copy of this logic appearing.** `src/tiles.rs`'s own `draw_text`
+and the consumer's label phase both lay a label out; putting the wrapping and
+the halo on `Text` means the two cannot drift. `draw_text` shrank to four lines
+as a result.
+
+One consequence a caller must know: `galley` lays out with
+`halign: Align::Center`, so rows are centred on the anchor as MapLibre's default
+`text-justify` has them, and the galley is measured about its own centre line —
+`galley.rect.min.x` is negative. `Text::shape` takes the block's top-left corner
+and undoes that. A caller that passes a galley origin straight to `TextShape`
+will draw half a label-width to the left.
+
+**Tests: seven new in `mvt::tests`, and `rendering_the_fixture_…` re-recorded
+once.** Every difference in that recording was attributed before it was
+accepted, and they are listed in the constant's own doc: the rename, two new
+fields at MapLibre's defaults, `line_height_ems: None`, and the two `Back Alley`
+halo colours losing the `gamma_multiply(0.5)` that softened the fake box. **No
+label position moved** — the fixture's roads are straight, and the arc-length
+anchor agrees with the old chord midpoint on straight geometry, which is what
+makes that recording a pin on `anchor_along` being a no-op where it should be.
+
+**Negative control, run.** Reverting `anchor_along` to the longest-segment rule
+and leaving everything else alone turns four of the new tests red
+(`a_line_label_sits_half_way_along_the_line`,
+`a_line_label_takes_the_tangent_at_its_own_anchor`,
+`simplifying_a_river_barely_moves_its_label`, `a_degenerate_line_has_no_anchor`)
+plus the golden, and nothing else in the crate.
+`a_westward_line_label_is_still_upright` stays green under both, and is labelled
+a guard rather than a control for that reason: `slope().atan()` was upright too,
+and the test is there to keep the `atan2` fold from losing the property.
+
+**Test count: `cargo test -p walkers --features mvt` reports 95**, from 88
+before. A spelling gotcha worth carrying: plain `cargo test -p walkers` selects
+**48** and cannot see any of this — `mvt::tests` is gated, and the golden test
+is in it.
+
 ## What the pin actually selects
 
 "Upstream's 38 inline tests are the behaviour pin" is the reason this crate is

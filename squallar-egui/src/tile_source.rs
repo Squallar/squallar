@@ -189,7 +189,22 @@ pub const DESKTOP_TILE_CACHE_ENTRIES: NonZeroUsize =
 /// **capacity** rather than length because capacity is what is resident. The
 /// derivation of [`TILE_CACHE_ENTRIES`] is against this figure; it is named so
 /// a test can hold the two together instead of the number living only in prose.
-pub const MEASURED_VECTOR_TILE_BYTES: usize = 646_264;
+///
+/// **Re-measured the same day, 646_264 to 652_112 — +5,848 bytes, +0.9%.** The
+/// cause is `walkers::Text` gaining the four fields that carry a label's
+/// wrapping and its halo (`halo_width`, `max_width_ems`, `line_height_ems`,
+/// beside the renamed `halo_color`). `ShapeOrText` is an enum sized by its
+/// widest variant and grew 8 bytes, which the shape spine pays once per shape;
+/// this tile holds 731 of them.
+///
+/// It is a re-measurement and not a relaxation: the figure is what the fixture
+/// actually costs, and
+/// `tile_source::tests::the_vector_entry_cost_is_what_the_fixture_actually_renders`
+/// re-derives it rather than trusting this line. The budget it feeds is
+/// unchanged in shape — 96 entries is 62.6 MB where it was 62.0 MB, and the
+/// desktop arm is pinned from below by `MIRROR_SCALE_MAX` rather than by bytes,
+/// so no arm's entry count moves.
+pub const MEASURED_VECTOR_TILE_BYTES: usize = 652_112;
 
 /// What one cached raster tile costs: 256x256 RGBA.
 pub const RASTER_TILE_BYTES: usize = 256 * 256 * 4;
