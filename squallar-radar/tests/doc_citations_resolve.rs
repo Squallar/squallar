@@ -140,8 +140,9 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     (
         "squallar-egui/tests/committed_styles_parse.rs",
         "both_committed_styles_parse_as_walkers_styles",
-        "Names the `tools/basemap-style` test this one absorbed when the \
-         committed-style gate moved into the workspace on 2026-08-28. The two \
+        "Names the test this one absorbed from the one-shot style converter \
+         when the committed-style gate moved into the workspace on 2026-08-28; \
+         the converter and its suite were deleted the same day. The two \
          were the same parse; the note records that the absorbed test's exact \
          layer count survived the merge alongside this one's floor, which is \
          the fact a reader needs and only the name identifies.",
