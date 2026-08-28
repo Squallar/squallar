@@ -13,7 +13,9 @@
 
 use std::f64::consts::PI;
 
-use squallar_geo::{lat_to_tile_y, lon_to_tile_x, tile_to_lat, tile_to_lon};
+use squallar_geo::{
+    MERCATOR_LAT_LIMIT_DEG, lat_to_tile_y, lon_to_tile_x, tile_to_lat, tile_to_lon,
+};
 
 /// EPSG:3857's sphere radius, in metres.
 ///
@@ -224,7 +226,7 @@ mod tests {
     #[test]
     fn a_box_ending_on_a_tile_boundary_stops_one_tile_short() {
         // At z1 the world is 2x2 tiles; lon 0 is exactly the tx=1 boundary.
-        let r = tile_range(1, -180.0, 0.0, 0.0, 85.0511287798066);
+        let r = tile_range(1, -180.0, 0.0, 0.0, MERCATOR_LAT_LIMIT_DEG);
         assert_eq!(
             r,
             TileRange {
@@ -254,7 +256,13 @@ mod tests {
     /// build ever materialises.
     #[test]
     fn the_global_z8_grid_is_square_and_whole() {
-        let e = extent(8, -180.0, -85.0511287798066, 180.0, 85.0511287798066);
+        let e = extent(
+            8,
+            -180.0,
+            -MERCATOR_LAT_LIMIT_DEG,
+            180.0,
+            MERCATOR_LAT_LIMIT_DEG,
+        );
         assert_eq!((e.nx, e.ny), (65536, 65536));
         assert!((e.xmin + ORIGIN).abs() < 1e-6, "{}", e.xmin);
         assert!((e.xmax - ORIGIN).abs() < 1e-6, "{}", e.xmax);
