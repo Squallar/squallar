@@ -30,6 +30,19 @@ pub fn cmd<S: AsRef<OsStr>>(program: &str, args: &[S]) -> Command {
     // -- the shape where adding it to the two that were missed just leaves the
     // fourth for later. It is inert for tippecanoe and pmtiles.
     c.env("AWS_NO_SIGN_REQUEST", "YES");
+    // The DEM bucket is eu-central-1 and the build box is not. Without this,
+    // every /vsis3/ open hits the wrong regional endpoint and pays a redirect:
+    // MEASURED at 3 HTTP requests per COG open (2 of them directory LISTs)
+    // against 2 with it set. gdalbuildvrt opens all 26,450 COGs serially, so
+    // that third request is ~26,450 extra cross-Atlantic round trips.
+    //
+    // NOT setting GDAL_DISABLE_READDIR_ON_OPEN, and the omission is deliberate.
+    // The usual advice is that it speeds up /vsis3/; MEASURED HERE IT IS WORSE
+    // -- 4 requests instead of 3. Each Copernicus tile is alone in its own
+    // prefix, so the single LIST is cheap and tells GDAL no sidecars exist,
+    // where EMPTY_DIR forces separate probes for .aux.xml and .ovr. The advice
+    // holds for prefixes with many files. This is not one.
+    c.env("AWS_REGION", crate::config::DEM_BUCKET_REGION);
     c
 }
 
