@@ -13,9 +13,7 @@
 
 use std::f64::consts::PI;
 
-use squallar_geo::{
-    MERCATOR_LAT_LIMIT_DEG, lat_to_tile_y, lon_to_tile_x, tile_to_lat, tile_to_lon,
-};
+use squallar_geo::{lat_to_tile_y, lon_to_tile_x, tile_to_lat, tile_to_lon};
 
 /// EPSG:3857's sphere radius, in metres.
 ///
@@ -189,6 +187,9 @@ impl Bbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests pin the Mercator limit; the module itself works in tile
+    // coordinates and never names it.
+    use squallar_geo::MERCATOR_LAT_LIMIT_DEG;
 
     /// The tie between this module's fractional row and the library's integer
     /// one. If squallar-geo re-spells its projection, or this module drifts to

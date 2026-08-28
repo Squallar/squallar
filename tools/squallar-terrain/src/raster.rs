@@ -182,6 +182,124 @@ fn elevation_type_option(cfg: &Config) -> Res<Vec<String>> {
     })
 }
 
+/// The VRT naming every COG, built by `jobs` shards in parallel.
+///
+/// **This phase is pure network latency and it must be parallel.** Building it
+/// as one `gdalbuildvrt` over the whole list was MEASURED on the build box at a
+/// dead-flat 14,667 B/s and 0.13% of 48 vCPUs for 91 minutes: the process is
+/// asleep on cross-Atlantic round trips, because the DEM bucket is
+/// `eu-central-1`, the build box is not, and `gdalbuildvrt` opens its sources
+/// strictly one at a time. Each open reads one 16,384-byte range, so the whole
+/// list is on the order of eight hours of doing nothing. It is the only phase
+/// here that gets slower the more of the planet you ask for while using none of
+/// the machine. Sharding is not a tuning knob; it is the difference between
+/// minutes and a third of the dead-man window.
+///
+/// The shards are combined by a second `gdalbuildvrt` over the part VRTs, which
+/// opens `jobs` local files and no COGs at all.
+///
+/// **`-resolution highest`, and it is load-bearing twice over.** The default is
+/// `average`, which is not shard-invariant: the average of per-shard averages is
+/// not the global average, so sharding alone would silently move the mosaic's
+/// pixel size. `highest` is a minimum, and a minimum of minima is the global
+/// minimum, so the sharded VRT and the single-pass one describe the same raster.
+/// It is also the better value on its own merits here: GLO-30 is 1 arcsec at the
+/// equator, about 1,296,000 px around, against a z12 target grid of 1,048,576 --
+/// so under `average` the mosaic was coarser than the grid it feeds and the warp
+/// was upsampling. The output geometry is set by [`crate::grid::extent`] either
+/// way; this only decides what the warp gets to read.
+/// How many COGs go in one VRT shard, so that `len` items make at most `jobs`
+/// shards and every item lands in exactly one.
+///
+/// Ceiling division, so the remainder rides in the existing shards rather than
+/// forming a `jobs + 1`th one. Never zero: `chunks(0)` panics, and a zero here
+/// would come from an empty list, which the caller refuses separately.
+fn shard_size(len: usize, jobs: usize) -> usize {
+    len.div_ceil(jobs.max(1)).max(1)
+}
+
+fn build_global_vrt(cfg: &Config, list: &TileList) -> Res<PathBuf> {
+    let vrt = cfg.work.join("global.vrt");
+    if vrt.exists() {
+        log!("global VRT present");
+        return Ok(vrt);
+    }
+
+    let tiles = list.sorted();
+    let jobs = cfg.jobs.max(1);
+    if tiles.is_empty() {
+        return Err("refusing to build a VRT over zero COGs".into());
+    }
+    let shards: Vec<(usize, &[Cell])> = tiles
+        .chunks(shard_size(tiles.len(), jobs))
+        .enumerate()
+        .collect();
+
+    log!(
+        "building global VRT over {} COGs (/vsis3/) in {} shards, {jobs} jobs",
+        tiles.len(),
+        shards.len()
+    );
+
+    let stage = cfg.work.join("vrt-shards");
+    std::fs::create_dir_all(&stage)?;
+
+    let shard_vrt = |i: usize| stage.join(format!("shard-{i:04}.vrt"));
+
+    let failed = parallel(&shards, jobs, |(i, cells)| {
+        let paths: String = cells
+            .iter()
+            .map(|c| format!("{}\n", cfg.tile_vsis3(&tile_name(*c))))
+            .collect();
+        let list_file = stage.join(format!("shard-{i:04}.txt"));
+        std::fs::write(&list_file, paths)?;
+        run(cmd(
+            "gdalbuildvrt",
+            &[
+                "-q",
+                "-resolution",
+                "highest",
+                "-input_file_list",
+                list_file.to_string_lossy().as_ref(),
+                shard_vrt(*i).to_string_lossy().as_ref(),
+            ],
+        ))
+    });
+    if failed > 0 {
+        return Err(format!("{failed} of {} VRT shards failed", shards.len()).into());
+    }
+
+    // Every shard must have produced a file. A missing one here would otherwise
+    // become a hole in the mosaic that reads as ocean -- silent, and invisible
+    // until somebody looks at the terrain for that part of the world.
+    let parts: Vec<String> = (0..shards.len())
+        .map(|i| {
+            let p = shard_vrt(i);
+            if p.is_file() {
+                Ok(p.to_string_lossy().into_owned())
+            } else {
+                Err(format!("VRT shard {i} reported success but wrote no file"))
+            }
+        })
+        .collect::<Result<_, _>>()?;
+
+    let combined_list = stage.join("shards.txt");
+    std::fs::write(&combined_list, parts.join("\n") + "\n")?;
+    run(cmd(
+        "gdalbuildvrt",
+        &[
+            "-q",
+            "-resolution",
+            "highest",
+            "-input_file_list",
+            combined_list.to_string_lossy().as_ref(),
+            vrt.to_string_lossy().as_ref(),
+        ],
+    ))?;
+
+    Ok(vrt)
+}
+
 /// One global elevation raster, built ONCE from the COGs.
 ///
 /// GDAL serves low-resolution reads out of each COG's own internal overviews,
@@ -191,24 +309,7 @@ fn build_global_elev(cfg: &Config, list: &TileList, out: &Path) -> Res<()> {
         log!("global elevation raster present");
         return Ok(());
     }
-    log!("building global VRT over {} COGs (/vsis3/)", list.len());
-    let paths: String = list
-        .sorted()
-        .into_iter()
-        .map(|c| format!("{}\n", cfg.tile_vsis3(&tile_name(c))))
-        .collect();
-    let list_file = cfg.work.join("vsis3-tiles.txt");
-    std::fs::write(&list_file, paths)?;
-    let vrt = cfg.work.join("global.vrt");
-    run(cmd(
-        "gdalbuildvrt",
-        &[
-            "-q",
-            "-input_file_list",
-            list_file.to_string_lossy().as_ref(),
-            vrt.to_string_lossy().as_ref(),
-        ],
-    ))?;
+    let vrt = build_global_vrt(cfg, list)?;
 
     let e = crate::grid::extent(
         cfg.raster_global_maxzoom,
@@ -514,4 +615,58 @@ pub fn pack_terrain_rgb(e: &Extent, elev: &Path) -> Res<PathBuf> {
     xml.push_str("</VRTDataset>\n");
     std::fs::write(&vrt, xml)?;
     Ok(vrt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Every COG lands in exactly one shard, and there are never more shards
+    /// than jobs.** A tile silently dropped here is not a crash: it is a hole in
+    /// the global mosaic that resamples as ocean, which nobody sees until they
+    /// look at the terrain for that part of the world.
+    #[test]
+    fn sharding_covers_every_cog_exactly_once() {
+        for len in [1_usize, 2, 47, 48, 49, 1_000, 26_450] {
+            for jobs in [1_usize, 4, 48, 64] {
+                let size = shard_size(len, jobs);
+                let items: Vec<usize> = (0..len).collect();
+                let shards: Vec<&[usize]> = items.chunks(size).collect();
+
+                assert!(
+                    shards.len() <= jobs,
+                    "{len} COGs over {jobs} jobs made {} shards",
+                    shards.len()
+                );
+                let flat: Vec<usize> = shards.concat();
+                assert_eq!(
+                    flat, items,
+                    "{len} COGs over {jobs} jobs did not reassemble in order"
+                );
+            }
+        }
+    }
+
+    /// The real call: 26,450 COGs across the build box's 48 vCPUs.
+    ///
+    /// Pinned as a number because the whole point of the change is the ratio.
+    /// One shard would be the eight-hour serial build this replaced, so a
+    /// regression that quietly stopped sharding would otherwise only show up as
+    /// a slow run nobody attributes.
+    #[test]
+    fn the_planet_shards_across_every_core() {
+        let size = shard_size(26_450, 48);
+        assert_eq!(size, 552);
+        assert_eq!(26_450_usize.div_ceil(size), 48, "shards");
+        // NON-VACUITY: the unsharded build is what this must not collapse back
+        // to, and it is a different number.
+        assert_ne!(size, 26_450);
+    }
+
+    /// `chunks(0)` panics, so the floor is not cosmetic.
+    #[test]
+    fn a_shard_is_never_empty() {
+        assert_eq!(shard_size(0, 48), 1);
+        assert_eq!(shard_size(10, 0), 10);
+    }
 }
