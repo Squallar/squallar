@@ -1217,9 +1217,12 @@ corner. That argument does not survive looking at *why* they are absent:
   CARTO styles that something has to handle. The only question is where.
 - Handling it in the converter puts a correctness requirement of the evaluator
   in a **different workspace**. `tools/basemap-style` is its own workspace
-  root, so root `cargo test --workspace` walks straight past it, and **nothing
-  in CI runs it at all** — the workflow that briefly did was deleted as a
-  recurring gate on a one-time job. Any style that reaches
+  root, so root `cargo test --workspace` walks straight past its manifest, and
+  **nothing in CI runs the converter** — the workflow that briefly did was
+  deleted as a recurring gate on a one-time job. (Since 2026-08-28 the root
+  workspace does compile that crate's `src/lib.rs`, via a `#[path]` include in
+  `squallar-egui/tests/committed_styles_parse.rs`; what stays unreached is
+  `convert` and the four tests that exercise it.) Any style that reaches
   `Context::evaluate` without going through that converter — a hand-written
   one, a future source, a style fetched rather than generated — loses a whole
   layer silently.
@@ -1281,8 +1284,10 @@ way in, and is `pub(crate)` for that.
 `Context::with_properties` are both `pub(crate)`; `mod expression` is private
 and `lib.rs` re-exports only `Context`. `Context::new` keeps its exact
 signature — `(String, HashMap<String, serde_json::Value>, u8)` — which is what
-`tools/basemap-style/tests/converted_styles.rs` calls and what the 22 inline
-expression tests call. None of them were edited.
+`squallar-egui/tests/committed_styles_parse.rs` calls and what the 22 inline
+expression tests call. None of them were edited. (That caller was
+`tools/basemap-style/tests/converted_styles.rs` until 2026-08-28, when the
+committed-style gate moved into the workspace; the call site is unchanged.)
 
 #### A second cost, found on the way, and larger than the first
 
@@ -1335,8 +1340,9 @@ wired — so the figure is a property of `render`, not a frame-time claim.
 spells it `geometry_type_to_str(…).to_string()`, so 18 more `String`s are
 allocated per render of this fixture from a function that returns
 `&'static str`. Narrowing that field changes `Context::new`'s public
-signature and so reaches `tools/basemap-style`, in a different workspace. It
-belongs to its own commit.
+signature and so reaches its callers — which since 2026-08-28 are all inside
+this workspace, `squallar-egui/tests/committed_styles_parse.rs` among them, so
+the change is at least gated where it lands. It belongs to its own commit.
 
 #### Evidence
 

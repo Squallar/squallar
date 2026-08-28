@@ -138,6 +138,23 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
     // ── Prose that narrates a deletion ──────────────────────────────────
     (
+        "squallar-egui/tests/committed_styles_parse.rs",
+        "both_committed_styles_parse_as_walkers_styles",
+        "Names the `tools/basemap-style` test this one absorbed when the \
+         committed-style gate moved into the workspace on 2026-08-28. The two \
+         were the same parse; the note records that the absorbed test's exact \
+         layer count survived the merge alongside this one's floor, which is \
+         the fact a reader needs and only the name identifies.",
+    ),
+    (
+        "squallar-egui/tests/committed_styles_parse.rs",
+        "every_source_layer_is_one_of_the_sixteen_openmaptiles_names",
+        "As above, for the source-layer membership check. Both non-vacuity \
+         floors survived the merge -- the absorbed test's count of layers \
+         carrying a source layer, and this one's floor on distinct source \
+         layers -- and the paragraph says so by name.",
+    ),
+    (
         "squallar-volumetric/src/volume_bridge/tests.rs",
         "only_reflectivity_clears_the_fade_bar",
         "The successor's doc calls itself \"the deliberate flip of the \

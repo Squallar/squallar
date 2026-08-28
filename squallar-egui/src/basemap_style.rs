@@ -6,7 +6,7 @@
 //! `tests/committed_styles_parse.rs` gates the files themselves.
 //!
 //! Parsing is done **once per theme, at construction**, not per tile.
-//! `Style::from_json` walks 92 internally-tagged layers and every expression
+//! `Style::from_json` walks 95 internally-tagged layers and every expression
 //! inside them; a tile fetch that repeated it would put that on the IO path for
 //! every one of the tens of tiles a pane asks for.
 
@@ -77,9 +77,10 @@ mod tests {
     /// Both themes parse to a real style, through the accessor the app calls.
     ///
     /// Non-vacuity: `{"layers":[]}` deserialises perfectly and draws nothing,
-    /// so "it parsed" is not the assertion. 92 layers per theme as of
-    /// 2026-08-28; the floor is far below that and far above zero, so a
-    /// legitimate style edit does not redden it.
+    /// so "it parsed" is not the assertion. 95 layers per theme as of
+    /// 2026-08-28, counted off the committed files; the floor is far below that
+    /// and far above zero, so a legitimate style edit does not redden it.
+    /// `tests/committed_styles_parse.rs` pins the exact count.
     #[test]
     fn both_themes_yield_a_style_with_layers() {
         for is_dark in [true, false] {
