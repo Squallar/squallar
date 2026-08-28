@@ -68,6 +68,28 @@ pub const BANDS: [Band; 3] = [
 pub const CONTOUR_LAYER: &str = "contour";
 pub const CONTOUR_ATTR: &str = "elev";
 
+/// The tile format each encoding gets when `RASTER_TILE_FORMAT` is unset.
+///
+/// Hillshade is an ordinary grey image and WebP is 3.6-4.9x smaller on it --
+/// 59-101 GB globally against 289-366 GB. Terrain-RGB carries packed elevation
+/// in the colour channels and must stay lossless.
+pub fn default_tile_format(encoding: Encoding) -> &'static str {
+    match encoding {
+        Encoding::Hillshade => "WEBP",
+        Encoding::TerrainRgb => "PNG",
+    }
+}
+
+/// Why a lossy format is refused on terrain-RGB, as an error.
+pub fn lossy_terrain_rgb_error(fmt: &str) -> Box<dyn std::error::Error + Send + Sync> {
+    format!(
+        "terrain-rgb must be stored losslessly; RASTER_TILE_FORMAT={fmt} would \
+         quantise the packed elevation bytes. One count of error in the R \
+         channel is 6553.6 m."
+    )
+    .into()
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Encoding {
     /// 1-band grey, `gdaldem hillshade`. The default.
@@ -147,7 +169,14 @@ impl Config {
             encoding,
             raster_minzoom: env_parse("RASTER_MINZOOM", 0u8)?,
             raster_maxzoom: env_parse("RASTER_MAXZOOM", 12u8)?,
-            tile_format: env("RASTER_TILE_FORMAT").unwrap_or_else(|| "PNG".into()),
+            // Default by ENCODING, not one global default. Hillshade is an
+            // ordinary grey image and WebP is 3.6-4.9x smaller on it -- 59-101
+            // GB globally against 289-366 GB, which is real egress and real
+            // storage every month forever. Terrain-RGB must stay PNG; see
+            // verify(), which refuses a lossy override rather than trusting
+            // this default to be the only guard.
+            tile_format: env("RASTER_TILE_FORMAT")
+                .unwrap_or_else(|| default_tile_format(encoding).to_string()),
             raster_global_maxzoom: env_parse("RASTER_GLOBAL_MAXZOOM", 8u8)?,
             chunk_deg: env_parse("CHUNK_DEG", 5i32)?,
             supercell: env_parse("SUPERCELL", 64u32)?,
@@ -174,13 +203,7 @@ impl Config {
         // "slightly soft", it is destroyed. A hillshade is an ordinary grey
         // image with no such constraint, which is most of why it is smaller.
         if self.encoding == Encoding::TerrainRgb && self.tile_format != "PNG" {
-            return Err(format!(
-                "terrain-rgb must be stored losslessly; RASTER_TILE_FORMAT={} would \
-                 quantise the packed elevation bytes. One count of error in the R \
-                 channel is 6553.6 m.",
-                self.tile_format
-            )
-            .into());
+            return Err(lossy_terrain_rgb_error(&self.tile_format));
         }
         Ok(())
     }
@@ -253,6 +276,28 @@ pub fn verify_schedule(bands: &[Band]) -> Res<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tile-format default is worth about $20 of egress and $3.50/month of
+    /// storage, so it is pinned rather than left to a reading of the code.
+    /// Asserted on BOTH arms: a single-arm test would pass against the old
+    /// unconditional "PNG" and prove nothing.
+    #[test]
+    fn hillshade_defaults_to_webp_and_terrain_rgb_does_not() {
+        assert_eq!(default_tile_format(Encoding::Hillshade), "WEBP");
+        assert_eq!(default_tile_format(Encoding::TerrainRgb), "PNG");
+    }
+
+    /// The default is not the only thing keeping terrain-RGB lossless; an
+    /// explicit override has to be refused too. One count of error in R is
+    /// 6553.6 m.
+    #[test]
+    fn a_lossy_override_on_terrain_rgb_is_refused() {
+        let msg = format!("{}", lossy_terrain_rgb_error("WEBP"));
+        assert!(
+            msg.contains("losslessly") && msg.contains("6553.6"),
+            "the refusal must say what breaks and by how much, got: {msg}"
+        );
+    }
 
     #[test]
     fn the_shipped_schedule_is_harmonic() {
