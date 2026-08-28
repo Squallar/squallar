@@ -211,15 +211,21 @@ tile_url() { printf 'https://%s.s3.amazonaws.com/%s\n' "$DEM_BUCKET" "$(tile_key
 # Copernicus tile name -> integer SW corner, e.g.
 #   Copernicus_DSM_COG_10_N39_00_W106_00_DEM -> "39 -106"
 tile_corner() {
-  local n="$1"
-  python3 - "$n" <<'PY'
-import re, sys
-m = re.search(r'_([NS])(\d+)_00_([EW])(\d+)_00_DEM$', sys.argv[1])
-if not m:
-    sys.exit("unparseable tile name: " + sys.argv[1])
-ns, lat, ew, lon = m.groups()
-lat = int(lat) * (1 if ns == 'N' else -1)
-lon = int(lon) * (1 if ew == 'E' else -1)
-print(lat, lon)
-PY
+  # Pure bash: no python3, for two reasons. The stated one is that this pipeline
+  # takes no Python dependency at all. The one that costs money is that this is
+  # called ONCE PER TILE across 26,450 tiles -- forking an interpreter that many
+  # times is minutes of pure process-spawn overhead for a regex and two sign
+  # flips.
+  #
+  # `10#` on both numbers is load-bearing: the names carry zero-padded fields
+  # (N08, W006) and bash reads a leading zero as octal, so $((08)) is a syntax
+  # error rather than 8. Python's int() hid that; bash does not.
+  local n="$1" ns lat ew lon
+  [[ "$n" =~ _([NS])([0-9]+)_00_([EW])([0-9]+)_00_DEM$ ]] || die "unparseable tile name: $n"
+  ns="${BASH_REMATCH[1]}"; lat="${BASH_REMATCH[2]}"
+  ew="${BASH_REMATCH[3]}"; lon="${BASH_REMATCH[4]}"
+  lat=$((10#$lat)); lon=$((10#$lon))
+  [ "$ns" = "S" ] && lat=$(( -lat ))
+  [ "$ew" = "W" ] && lon=$(( -lon ))
+  printf '%d %d\n' "$lat" "$lon"
 }
