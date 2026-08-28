@@ -6,24 +6,36 @@
 # describe it: the root `Cargo.toml` has no `exclude` key and must not gain
 # one, and this package must not be added to its `members`.
 #
-# The reason to stand outside is sharper here than for either precedent. This
-# crate takes `vendor/walkers` as a *dev*-dependency with its `mvt` feature on,
-# so that the verification suite parses the committed styles through the very
-# type the app deserialises them with. Cargo resolves a member's dev and
-# optional dependencies into the lockfile whether or not anything activates
-# them -- `vendor/walkers/VENDORED.md:667` measures 48 lockfile blocks for that
-# one package -- so making this a member would drag lyon, mvt-reader, color and
-# their trees into the app's lockfile to serve a test that never ships.
+# The reason this crate once gave for standing outside is now stale, and is
+# recorded here rather than deleted because it is the sort of claim that gets
+# re-asserted. It read: this crate takes `vendor/walkers` as a dev-dependency
+# with `mvt` on, cargo resolves a member's dev-dependencies into the lockfile
+# whether or not anything activates them, so membership would drag lyon,
+# mvt-reader, color and their trees into the app's lockfile for a test that
+# never ships. **That cost is already paid.** `vendor/walkers` became a root
+# workspace member and `squallar-egui` enables `mvt` unconditionally, so all of
+# those packages are in the root lockfile today. What is left is the plainer
+# reason: this is a one-time converter, it is not part of the application, and
+# nothing in the app's build should depend on it.
+#
+# It no longer needs walkers at all. The tests that parsed committed styles
+# through `walkers::style::Style` moved to
+# `squallar-egui/tests/committed_styles_parse.rs` on 2026-08-28; what stays here
+# are the four `convert()` tests, which need `serde_json` and nothing else.
 #
 # Consequences of standing outside, which this crate pays for itself:
 #
 #   - `cargo build/test/clippy --workspace` and root `cargo fmt --all` all walk
-#     straight past it. `tools/squallar-tiler` closed that gap with a dedicated
-#     `--manifest-path`-scoped workflow, and this crate now has the equivalent:
-#     `.github/workflows/basemap-style.yaml`. It triggers on
-#     `tools/basemap-style/**`, on `www/styles/**` -- the files
-#     `tests/converted_styles.rs` reads -- and on `vendor/walkers/**`, since the
-#     suite parses those files through the dev-dependency below.
+#     straight past it, so the four tests below run only under a
+#     `--manifest-path`-scoped invocation (DECISIONS.md spells the four).
+#     `src/lib.rs` is not unreached, though: the moved suite compiles it
+#     directly with `#[path]`, so `check` and the constants are exercised by
+#     `cargo test --workspace` even though this manifest is not.
+#   - **A `[dev-dependencies]` edge from the root workspace to this crate is
+#     impossible**, and that is why the moved suite uses `#[path]` rather than a
+#     path dependency. `[workspace]` below makes this directory a workspace
+#     root; a path dependency on it makes cargo refuse the root manifest with
+#     "multiple workspace roots found in the same workspace".
 #   - Nothing inherits. `version`, `edition` and every dependency are spelled
 #     literally; `workspace = true` cannot resolve from a workspace root to
 #     itself.
@@ -57,15 +69,11 @@ path = "src/main.rs"
 # `[workspace.dependencies]` (`serde_json = "=1.0.151"`), per the rule above.
 serde_json = "=1.0.151"
 
-[dev-dependencies]
-# The whole point of the verification suite: parse the committed output with
-# the app's own deserialiser rather than a reimplementation of it.
-# `walkers::style` sits behind the `mvt` feature, so the feature is named here
-# even though `squallar-egui` turns it on unconditionally in the root graph --
-# this workspace resolves independently and inherits none of that.
-#
-# A dev-dependency, not a dependency: the converter itself never links walkers.
-walkers = { path = "../../vendor/walkers", features = ["mvt"] }
+# No `[dev-dependencies]`. This crate used to take `vendor/walkers` with `mvt`
+# on, so the verification suite could parse the committed output with the app's
+# own deserialiser. That suite is now `squallar-egui`'s, where walkers is a
+# first-class dependency rather than a reach across a workspace boundary, and
+# the four `convert()` tests that remain here parse nothing.
 
 [profile.release]
 opt-level = 3

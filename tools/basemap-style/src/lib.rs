@@ -10,9 +10,13 @@
 //! The split is the point. A checker that shares the converter's beliefs
 //! cannot catch the converter being wrong, so [`check`] re-derives every
 //! conclusion from the output document alone -- it never sees the input, the
-//! rename table's hit count, or the converter's own `Report`. The suite in
-//! `tests/converted_styles.rs` then feeds it deliberately broken documents and
-//! requires each to be rejected.
+//! rename table's hit count, or the converter's own `Report`.
+//!
+//! [`check`] is still fed deliberately broken documents and required to reject
+//! each one, but that suite is no longer here: it is
+//! `squallar-egui/tests/committed_styles_parse.rs`, which compiles this file in
+//! with `#[path]` so there is exactly one `check`. `tests/converted_styles.rs`
+//! retains only the four tests that call [`convert`].
 
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;

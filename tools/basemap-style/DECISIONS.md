@@ -318,13 +318,34 @@ cargo clippy --all-targets --manifest-path tools/basemap-style/Cargo.toml -- -D 
 cargo test  --manifest-path tools/basemap-style/Cargo.toml
 ```
 
-**One thing the deletion does cost, and it is worth knowing.** Those 29 tests
-were the only automated check anywhere that the committed `www/styles/*.json`
-still deserialise. Nothing replaces that today. If it is wanted, it belongs in
-`squallar-egui` — the crate that actually loads them — and not here, on the
-principle that a gate belongs at the layer the symptom lives in. A converter's
-CI could only ever prove the converter still works, which is not the thing
-users would notice breaking.
+Those now cover the four `convert()` tests and nothing else; everything this
+crate used to gate about the committed styles runs under
+`cargo test --workspace`.
+
+**The cost the deletion carried has since been paid off.** Those 29 tests were
+the only automated check anywhere that the committed `www/styles/*.json` still
+deserialise, and for a while nothing replaced it. The paragraph here used to
+say where the gate belonged if it were ever wanted — `squallar-egui`, the crate
+that actually loads them, on the principle that a gate belongs at the layer the
+symptom lives in — and on 2026-08-28 it moved there.
+
+Of the 29, **25** moved to `squallar-egui/tests/committed_styles_parse.rs`,
+which `cargo test --workspace` selects: the 23 that read a committed style off
+disk, plus the 2 unit tests of the scanners those 23 use, which follow the
+scanners. Two of the 23 duplicated checks that crate already had and were
+folded into them rather than added beside them, so the workspace test count
+rose by 23 while that suite runs 25 tests. The **4** that call `convert()`
+stayed in `tests/converted_styles.rs` — they are the historical record of a
+conversion that ran once and will not run again, and no recurring gate is
+wanted for them.
+
+`src/lib.rs` is not stranded by that split. The moved suite compiles this file
+in directly with `#[path]`, so `check` and its constants have exactly one
+definition and are exercised by the root workspace even though this manifest is
+not. A `[dev-dependencies]` edge could not have done it: `[workspace]` in
+`Cargo.toml` makes this a workspace root, and a path dependency on it makes
+cargo refuse the root manifest with "multiple workspace roots found in the same
+workspace".
 
 ---
 
