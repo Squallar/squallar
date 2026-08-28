@@ -37,7 +37,13 @@ path = "src/lib.rs"
 
 [dependencies]
 squallar-app = { workspace = true }
-squallar-egui = { workspace = true }
+# `basemap-vector` here rather than in `squallar-egui`'s own `default` list:
+# this crate is every NATIVE target (desktop, android, ios) and the archive
+# reader exists on all of them. `squallar-web` deliberately does not ask for
+# it -- on wasm32 the reader is `cfg`'d out entirely, so a default row would
+# ship `pmtiles` and `tokio` in the web bundle for nothing. Features are
+# additive across the graph, so asking here is what makes the flip native-only.
+squallar-egui = { workspace = true, features = ["basemap-vector"] }
 squallar-kv = { workspace = true }
 # The domain vocabulary (Fix, LocationPermission). `serial` is requested per target below.
 squallar-location = { workspace = true }

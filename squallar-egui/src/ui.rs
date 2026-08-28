@@ -1184,22 +1184,27 @@ impl Gui {
             .is_some_and(|volume| !volume.hide_floor)
     }
 
-    /// How many tiles every floor strip together would keep resident at `bias`,
-    /// across the raster layers each of them draws — worst case over the whole
-    /// zoom range, because a bias the frame can only afford at a whole zoom is
-    /// one it cannot afford.
+    /// How many tiles every floor strip together would keep resident at `bias`
+    /// — worst case over the whole zoom range, because a bias the frame can
+    /// only afford at a whole zoom is one it cannot afford.
+    ///
+    /// **One tile pyramid per strip, and no longer a per-pane count.** The
+    /// figure used to be `1 + city labels are on`, because the label raster was
+    /// a second source fetching a second pyramid over the same ground. The
+    /// vector basemap draws its labels out of the tile it already has, so there
+    /// is one pyramid whatever the pane has switched on, and this term stopped
+    /// depending on any layer's state.
     fn floor_tile_working_set(&self, bias: u8) -> usize {
         self.panes()
             .iter()
             .enumerate()
             .filter(|(idx, _)| self.is_floor_source(*idx))
-            .map(|(idx, pane)| {
-                let layers = 1 + usize::from(pane.is_overlay_enabled(&known::CITY_LABELS));
+            .map(|(idx, _)| {
                 let rect = self
                     .map_pane_geo
                     .get(&idx)
                     .map_or(egui::Rect::ZERO, |geo| geo.rect);
-                crate::tiles::tiles_resident_for(rect, bias, layers)
+                crate::tiles::tiles_resident_for(rect, bias, 1)
             })
             .sum()
     }
@@ -1644,11 +1649,6 @@ impl Gui {
     #[cfg(test)]
     pub(crate) fn pane_content_for_test(&self) -> &[PaneContentProbe] {
         &self.probes.last_pane_content
-    }
-
-    #[cfg(test)]
-    pub(crate) fn label_tiles_made_for_test(&self) -> bool {
-        self.map_tiles.label_tiles_light.is_some() || self.map_tiles.label_tiles_dark.is_some()
     }
 
     #[inline]

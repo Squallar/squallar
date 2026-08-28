@@ -419,14 +419,6 @@ fn cartodb_urls_match_the_published_tile_scheme() {
         CartoDb::dark().tile_url(tile_id),
         "https://cartodb-basemaps-b.global.ssl.fastly.net/dark_nolabels/4/5/12.png"
     );
-    assert_eq!(
-        CartoDb::light_labels().tile_url(tile_id),
-        "https://cartodb-basemaps-b.global.ssl.fastly.net/light_only_labels/4/5/12.png"
-    );
-    assert_eq!(
-        CartoDb::dark_labels().tile_url(tile_id),
-        "https://cartodb-basemaps-b.global.ssl.fastly.net/dark_only_labels/4/5/12.png"
-    );
 }
 
 /// Requests are spread over the provider's four subdomains, cycling on `x`.
@@ -453,12 +445,7 @@ fn cartodb_spreads_tiles_over_all_four_subdomains() {
 /// Attribution is a licensing obligation, not decoration.
 #[test]
 fn cartodb_attribution_names_openstreetmap_and_cartodb() {
-    for source in [
-        CartoDb::light(),
-        CartoDb::dark(),
-        CartoDb::light_labels(),
-        CartoDb::dark_labels(),
-    ] {
+    for source in [CartoDb::light(), CartoDb::dark()] {
         let attribution = source.attribution();
         assert_eq!(attribution.text, "\u{a9} OpenStreetMap \u{a9} CartoDB");
         assert_eq!(attribution.url, "https://www.openstreetmap.org/copyright");

@@ -136,14 +136,21 @@ impl<'a> OverlayDrawContext<'a> {
     }
 }
 
-/// Draw one slippy-map tile layer through the pane's own projector.
+/// Draw one slippy-map tile layer through the pane's own projector, and hand
+/// back the labels it deferred.
+///
+/// **The ground is painted here; the labels are not.** A vector tile carries
+/// both, but they belong at different heights in the pane: the ground is the
+/// bottom of the stack and the place names draw at the `CityLabels` layer's
+/// position, above the weather. The caller paints them with [`paint_labels`]
+/// when that layer's turn comes, and drops them when it is switched off.
 pub(super) fn draw_tile_layer(
     ui: &egui::Ui,
     projector: &walkers::Projector,
     zoom: f64,
     tiles: &mut HttpsTiles,
     zoom_bias: u8,
-) {
+) -> Vec<walkers::Text> {
     // Once for the layer, before the grid loop. `HttpsTiles::at` does not drain,
     // so this is the only thing that moves finished fetches into the cache --
     // and doing it per cell would repeat it once per tile in the span below.
@@ -154,6 +161,10 @@ pub(super) fn draw_tile_layer(
         .min(tiles.source_max_zoom());
 
     let span = crate::tiles::tile_span(projector, ui.max_rect(), tile_zoom);
+
+    // Accumulated across every cell below, so the collision test the caller
+    // makes is one test against the whole pane; see [`paint_labels`].
+    let mut labels: Vec<walkers::Text> = Vec::new();
 
     for ty in span.north..=span.south {
         for tx in span.west..=span.east {
@@ -179,12 +190,14 @@ pub(super) fn draw_tile_layer(
                             .image(tex.id(), rect, twuv.uv, egui::Color32::WHITE);
                     }
                     Tile::Vector(ref shapes) => {
-                        paint_vector_tile(ui.painter(), shapes, rect, twuv.uv);
+                        paint_vector_tile(ui.painter(), shapes, rect, twuv.uv, &mut labels);
                     }
                 }
             }
         }
     }
+
+    labels
 }
 
 /// The rect the *whole* tile would occupy, given the rect a `uv` sub-rectangle
@@ -211,9 +224,8 @@ fn full_rect_of_clipped_tile(rect: egui::Rect, uv: egui::Rect) -> egui::Rect {
 /// Returns [`egui::Shape::Noop`] when the area is already taken, which is the
 /// collision rule: first label to ask for a piece of screen keeps it.
 ///
-/// **`occupied` is per tile here, not per pane.** Labels therefore still
-/// collide across a tile seam; fixing that is the label phase split, which is
-/// its own change.
+/// The caller owns `occupied`, and [`paint_labels`] owns the only one there is
+/// per pane.
 fn lay_out_label(
     ctx: &egui::Context,
     text: walkers::Text,
@@ -255,28 +267,66 @@ fn lay_out_label(
 /// ancestor stretched over a gap draws only the part that belongs to the tile
 /// that was asked for.
 ///
-/// The shapes are collected before `extend` because laying a label out takes
-/// `Context::fonts_mut` while `Painter::extend` holds the graphics lock;
-/// interleaving them deadlocks.
+/// **This is the ground phase: it paints geometry and defers every label.**
+/// Text is pushed onto `labels` for [`paint_labels`] to lay out once the whole
+/// grid has been walked, and is *not* painted through this function's clip —
+/// a name whose glyphs straddle a tile boundary has to draw whole.
+///
+/// A label is taken from the tile whose piece its **anchor** falls in, and from
+/// that tile only. Vector tiles carry a buffer, so the same place is present in
+/// its neighbours' data too; without the anchor test each copy would be drawn,
+/// and copies generalised at different zooms do not land close enough to be
+/// collided away.
 fn paint_vector_tile(
     painter: &egui::Painter,
     shapes: &[walkers::ShapeOrText],
     rect: egui::Rect,
     uv: egui::Rect,
+    labels: &mut Vec<walkers::Text>,
 ) {
     let painter = painter.with_clip_rect(rect);
-    let mut occupied = walkers::OccupiedAreas::new();
 
     let placed: Vec<egui::Shape> =
         walkers::mvt::transformed(shapes, full_rect_of_clipped_tile(rect, uv))
             .into_iter()
-            .map(|shape_or_text| match shape_or_text {
-                walkers::ShapeOrText::Shape(shape) => shape,
+            .filter_map(|shape_or_text| match shape_or_text {
+                walkers::ShapeOrText::Shape(shape) => Some(shape),
                 walkers::ShapeOrText::Text(text) => {
-                    lay_out_label(painter.ctx(), text, &mut occupied)
+                    if rect.contains(text.position) {
+                        labels.push(text);
+                    }
+                    None
                 }
             })
             .collect();
+
+    painter.extend(placed);
+}
+
+/// Lay every label this pane collected out against **one** [`OccupiedAreas`].
+///
+/// walkers constructs its own inside the per-tile draw, so its collision test
+/// cannot see across a tile seam and it draws a name once per tile that carries
+/// it. One set of claimed areas for the whole pane is the fix, and it is why
+/// the labels are a phase rather than part of the grid loop.
+///
+/// Called from the `CityLabels` arm of the pane's layer walk, so the names land
+/// above the weather rather than under it, and the layer's toggle governs them
+/// by simply not calling this.
+///
+/// The layout is finished before `extend` because laying a label out takes
+/// `Context::fonts_mut` while `Painter::extend` holds the graphics lock;
+/// interleaving them deadlocks.
+pub(super) fn paint_labels(painter: &egui::Painter, labels: Vec<walkers::Text>) {
+    if labels.is_empty() {
+        return;
+    }
+
+    let mut occupied = walkers::OccupiedAreas::new();
+    let placed: Vec<egui::Shape> = labels
+        .into_iter()
+        .map(|text| lay_out_label(painter.ctx(), text, &mut occupied))
+        .collect();
 
     painter.extend(placed);
 }
@@ -502,7 +552,10 @@ mod tests {
         let rect = projector.tile_rect(tile_id);
 
         let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
-            draw_tile_layer(ui, &projector, zoom, &mut tiles, 0);
+            let labels = draw_tile_layer(ui, &projector, zoom, &mut tiles, 0);
+            // The pane's `CityLabels` arm, which is where the deferred labels
+            // are painted; without it this pass draws ground and no names.
+            paint_labels(ui.painter(), labels);
         });
 
         // NON-VACUITY, and the specific thing that would have passed before:
@@ -606,6 +659,7 @@ mod tests {
                 ))],
                 rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                &mut Vec::new(),
             );
         });
 
@@ -622,6 +676,37 @@ mod tests {
         );
     }
 
+    /// Draw `tiles` as `(shapes, rect)` pieces through the ground phase, then
+    /// run the one label phase over everything they deferred -- which is what
+    /// `draw_tile_layer` does across a span, in miniature.
+    fn ground_then_labels(ui: &egui::Ui, tiles: &[(Vec<ShapeOrText>, egui::Rect)]) {
+        let whole = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        let mut labels = Vec::new();
+        for (shapes, rect) in tiles {
+            paint_vector_tile(ui.painter(), shapes, *rect, whole, &mut labels);
+        }
+        paint_labels(ui.painter(), labels);
+    }
+
+    fn text_count(shapes: &[egui::epaint::ClippedShape]) -> usize {
+        shapes
+            .iter()
+            .filter(|c| matches!(&c.shape, egui::Shape::Text(_)))
+            .count()
+    }
+
+    /// A label `x` across the extent, on the extent's horizontal midline.
+    fn label_at(x: f32, name: &str) -> ShapeOrText {
+        ShapeOrText::Text(Text::new(
+            egui::pos2(x, EXTENT / 2.0),
+            name.to_owned(),
+            12.0,
+            egui::Color32::WHITE,
+            egui::Color32::TRANSPARENT,
+            0.0,
+        ))
+    }
+
     /// **Two labels claiming the same screen: one wins.** The collision is what
     /// `OccupiedAreas` is for, and a seam that dropped it would draw legible
     /// text on top of legible text and still look plausible in a screenshot.
@@ -630,52 +715,128 @@ mod tests {
         let ctx = egui::Context::default();
         let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(256.0, 256.0));
-        let whole = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-
-        let at = |x: f32, name: &str| {
-            ShapeOrText::Text(Text::new(
-                egui::pos2(x, EXTENT / 2.0),
-                name.to_owned(),
-                12.0,
-                egui::Color32::WHITE,
-                egui::Color32::TRANSPARENT,
-                0.0,
-            ))
-        };
 
         // Same point, twice.
         let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
-            paint_vector_tile(
-                ui.painter(),
-                &[at(EXTENT / 2.0, "Monaco"), at(EXTENT / 2.0, "Monte-Carlo")],
-                rect,
-                whole,
+            ground_then_labels(
+                ui,
+                &[(
+                    vec![
+                        label_at(EXTENT / 2.0, "Monaco"),
+                        label_at(EXTENT / 2.0, "Monte-Carlo"),
+                    ],
+                    rect,
+                )],
             );
         });
-        let drawn = shapes
-            .iter()
-            .filter(|c| matches!(&c.shape, egui::Shape::Text(_)))
-            .count();
-        assert_eq!(drawn, 1, "two labels at one point must collide to one");
+        assert_eq!(
+            text_count(&shapes),
+            1,
+            "two labels at one point must collide to one"
+        );
 
         // Far apart, and both survive -- the control that stops the assertion
         // above from passing because labels are simply never drawn.
         let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
-            paint_vector_tile(
-                ui.painter(),
-                &[
-                    at(EXTENT / 8.0, "Monaco"),
-                    at(EXTENT * 7.0 / 8.0, "Monte-Carlo"),
-                ],
-                rect,
-                whole,
+            ground_then_labels(
+                ui,
+                &[(
+                    vec![
+                        label_at(EXTENT / 8.0, "Monaco"),
+                        label_at(EXTENT * 7.0 / 8.0, "Monte-Carlo"),
+                    ],
+                    rect,
+                )],
             );
         });
-        let drawn = shapes
+        assert_eq!(text_count(&shapes), 2, "labels a tile apart do not collide");
+    }
+
+    /// **The seam duplicate is gone: one `OccupiedAreas` spans the pane.**
+    ///
+    /// Two adjoining tiles that both carry the same place -- which is what a
+    /// vector tile's buffer guarantees -- must put one name on the glass, not
+    /// two. walkers builds its `OccupiedAreas` inside the per-tile draw, so its
+    /// collision test cannot see the neighbour, and this is exactly the case it
+    /// gets wrong.
+    #[test]
+    fn a_place_carried_by_two_adjoining_tiles_is_drawn_once() {
+        let ctx = egui::Context::default();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+
+        let west = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(256.0, 256.0));
+        let east = egui::Rect::from_min_size(egui::pos2(256.0, 0.0), egui::vec2(256.0, 256.0));
+
+        // The place sits just inside the WEST tile's eastern edge, so the west
+        // tile owns the anchor and the east tile carries it only in its buffer
+        // -- a negative extent coordinate, west of its own origin, which lands
+        // on the same screen point.
+        let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
+            ground_then_labels(
+                ui,
+                &[
+                    (vec![label_at(EXTENT * 0.99, "Topeka")], west),
+                    (vec![label_at(-EXTENT * 0.01, "Topeka")], east),
+                ],
+            );
+        });
+
+        assert_eq!(
+            text_count(&shapes),
+            1,
+            "the same place carried by two tiles reached the glass twice"
+        );
+    }
+
+    /// The control for the test above: **the ownership rule is not simply
+    /// eating every label the second tile has.** A place genuinely inside the
+    /// east tile still draws, so "one label" above is a rule about anchors and
+    /// not a renderer that stopped drawing past the first tile.
+    #[test]
+    fn a_place_of_its_own_in_the_second_tile_still_draws() {
+        let ctx = egui::Context::default();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+
+        let west = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(256.0, 256.0));
+        let east = egui::Rect::from_min_size(egui::pos2(256.0, 0.0), egui::vec2(256.0, 256.0));
+
+        let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
+            ground_then_labels(
+                ui,
+                &[
+                    (vec![label_at(EXTENT / 2.0, "Topeka")], west),
+                    (vec![label_at(EXTENT / 2.0, "Lawrence")], east),
+                ],
+            );
+        });
+
+        assert_eq!(text_count(&shapes), 2, "each tile's own place must draw");
+    }
+
+    /// **A label is not clipped to the tile that carried it.** Its glyphs are
+    /// laid out in the label phase, whose painter is the pane's, so a name
+    /// wider than its distance to the seam draws whole instead of being cut in
+    /// half -- which is the other half of what the per-tile draw got wrong.
+    #[test]
+    fn a_label_is_clipped_to_the_pane_and_not_to_its_tile() {
+        let ctx = egui::Context::default();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let tile = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(256.0, 256.0));
+
+        let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
+            ground_then_labels(ui, &[(vec![label_at(EXTENT * 0.99, "Topeka")], tile)]);
+        });
+
+        let label = shapes
             .iter()
-            .filter(|c| matches!(&c.shape, egui::Shape::Text(_)))
-            .count();
-        assert_eq!(drawn, 2, "labels a tile apart do not collide");
+            .find(|c| matches!(&c.shape, egui::Shape::Text(_)))
+            .expect("the label reached the painter");
+        assert!(
+            label.clip_rect.max.x > tile.max.x,
+            "the label was clipped to its own tile ({:?} against {tile:?}), so a \
+             name at the seam is still being cut in half",
+            label.clip_rect
+        );
     }
 
     /// **A styled `line-width` arrives on screen at that width.**

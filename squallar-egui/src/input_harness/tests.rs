@@ -6345,53 +6345,35 @@ fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
     }
 }
 
-/// 45. **A pane with no ground does not keep the label-tile pyramid downloading —
-///     and a 3D pane's floor is ground.**
+/// 45. **A 3D pane's floor is ground, and a hidden floor is not.**
+///
+/// The claim used to ride on a test over the city-label tile pyramid, which was
+/// conditional on a pane drawing ground. That pyramid is gone -- the vector
+/// basemap draws labels out of the tile it already has -- so the claim is
+/// asserted where it lives. `draws_ground` is what decides whether a pane is
+/// handed a map to draw on at all.
 #[test]
-fn only_a_pane_with_ground_keeps_the_label_tiles_downloading() {
-    fn tiles_remade_after_a_reset(h: &mut InputHarness) -> bool {
-        h.gui_mut().clear_graphics_state();
-        assert!(
-            !h.gui.label_tiles_made_for_test(),
-            "precondition: the reset must really have dropped the tile sources"
-        );
-        h.frames_for(2, FRAME_DT);
-        h.gui.label_tiles_made_for_test()
+fn a_3d_panes_floor_is_ground_and_a_hidden_floor_is_not() {
+    fn draws_ground(h: &InputHarness) -> bool {
+        h.gui.pane(0).expect("pane 0").draws_ground()
     }
 
-    fn lone_pane_wanting_labels() -> InputHarness {
-        let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
-        h.set_overlay_on_pane(0, &known::CITY_LABELS, true);
-        h
-    }
+    let plan = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
+    assert!(draws_ground(&plan), "a plan-view pane is ground");
 
-    let mut on_a_map = lone_pane_wanting_labels();
-    assert!(
-        tiles_remade_after_a_reset(&mut on_a_map),
-        "precondition: a map pane with city labels on must fetch label tiles"
-    );
-
-    let mut on_a_floor = lone_pane_wanting_labels();
+    let mut on_a_floor = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
     on_a_floor.make_pane_volume(0);
-    assert!(
-        on_a_floor.overlay_enabled(&known::CITY_LABELS),
-        "precondition: the pane still *remembers* wanting labels, which is what \
-             makes this a filter rather than a cleared flag"
-    );
     assert_eq!(
         on_a_floor.gui_mut().mirror_source_rects().len(),
         1,
-        "precondition: the pane is not even asking for a floor strip, so the \
-             labels below would have nowhere to land whatever this decides",
+        "precondition: a shown floor asks for a strip to draw into"
     );
     assert!(
-        tiles_remade_after_a_reset(&mut on_a_floor),
-        "a lone 3D pane's floor draws the city-label layer and nothing fetched \
-             the tiles for it: `draw_floor_strip` was handed `label_tiles: \
-             None`, so the floor came up with no city names on it",
+        draws_ground(&on_a_floor),
+        "a 3D pane's floor is a map on a surface, so it is ground"
     );
 
-    let mut floor_hidden = lone_pane_wanting_labels();
+    let mut floor_hidden = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
     floor_hidden.make_pane_volume(0);
     floor_hidden
         .gui_mut()
@@ -6405,17 +6387,15 @@ fn only_a_pane_with_ground_keeps_the_label_tiles_downloading() {
         "precondition: a hidden floor must not be asking for a strip",
     );
     assert!(
-        !tiles_remade_after_a_reset(&mut floor_hidden),
-        "a 3D pane with its floor switched off kept the label-tile pyramid \
-             downloading for a surface that is not drawn",
+        !draws_ground(&floor_hidden),
+        "a 3D pane with its floor switched off draws no ground"
     );
 
-    let mut section = lone_pane_wanting_labels();
+    let mut section = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
     section.make_pane_unaimed_cross_section(0);
     assert!(
-        !tiles_remade_after_a_reset(&mut section),
-        "a pane with no map to draw labels on kept the label-tile pyramid \
-             downloading"
+        !draws_ground(&section),
+        "a cross-section pane has no map to draw on"
     );
 }
 
