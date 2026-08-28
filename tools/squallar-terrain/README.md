@@ -20,28 +20,69 @@ to the Alps is the basemap contradicting itself.
 **One-shot.** The DEM does not change. This runs once, is pinned, and never
 joins the 35-day OSM cycle.
 
-## There is no Rust crate here
+## What this is
 
-This is shell, GDAL's C binaries, `awk` and tippecanoe. An earlier design called
-for a Rust crate; that was wrong. tippecanoe already does tiling and PMTiles
-writing, GDAL already does contouring, warping and hillshading, and the only
-remaining arithmetic (Terrain-RGB encoding) turned out to be expressible as a
-GDAL VRT expression. Nothing was left for a crate to do.
-
-There is also **no Python**. See "Terrain-RGB without Python" below.
+One Rust binary plus one shell script. The binary orchestrates; GDAL's C
+binaries, tippecanoe and go-pmtiles do the heavy lifting and are shelled out to.
+There is **no Python**, and the only Rust dependency is `squallar-geo` — the
+app's own Web Mercator, so a tile this build writes carries the address the app
+asks for.
 
 ```
-build.sh                 one-shot orchestrator: fetch the pin, run both passes
-build-contours.sh        the vector archive
-build-raster.sh          the raster archive
-bootstrap-al2023.sh      toolchain for Amazon Linux 2023
-selftest.sh              end-to-end proof on ONE degree tile; launches nothing
-lib/common.sh            pins, schedule, guards
-lib/encode.sh            Terrain-RGB encoder (pure GDAL) + the GDAL version gate
-lib/mercator.awk         WebMercatorQuad grid arithmetic
+Cargo.toml               its own workspace; NOT a member of the app's
+src/main.rs              CLI: `build`, plus the grid arithmetic for inspection
+src/config.rs            pins, contour schedule, layout, the harmonic guard
+src/grid.rs              WebMercatorQuad arithmetic over squallar-geo
+src/tiles.rs             Copernicus tile names, the pinned list, chunking
+src/trgb.rs              Mapbox Terrain-RGB v1 packing
+src/raster.rs            the raster archive
+src/contours.rs          the vector archive
+src/run.rs               subprocess pipelines with per-member exit status
+src/mbtiles.rs           MBTiles merge and metadata, via sqlite3
+src/pmtiles.rs           the magic-bytes assertion
+src/md5.rs               RFC 1321, for the tileList pin
+tests/pipeline.rs        end-to-end against GDAL and a real tile (#[ignore]d)
+bootstrap-al2023.sh      toolchain + EC2 user-data; the only shell left
 ```
+
+An earlier design was all shell, awk and a GDAL VRT expression. Three things
+moved it:
+
+* **The tile-name parser was written twice and wrong twice.** In bash, `N08` and
+  `W006` are invalid octal without `10#`. In awk, the fields were read at fixed
+  character offsets counted from the end of the string, so any name of the right
+  length parsed to *something* rather than being rejected.
+* **The Terrain-RGB encoder needed GDAL ≥ 3.11 for VRT expression pixel
+  functions, and the version assertion could not see the real requirement**:
+  `vrtexpression_muparser.cpp` compiles only under `GDAL_USE_MUPARSER`, so a
+  GDAL reporting 3.13.3 passes the check and the expression still fails at
+  runtime. Packing in-process removes the gate rather than tightening it, and
+  the build runs on AL2023's stock GDAL 3.10.3 again.
+* **A shell pipeline reports one status for the whole pipe.** A flat chunk has
+  no 1000 m contour and tippecanoe exits non-zero saying so — that is data, not
+  failure. But if `gdal_contour` dies instead, tippecanoe reads nothing and
+  prints the *same* message, and the shell recorded the chunk as flat.
+  `src/run.rs` waits on each producer separately, so that branch is only taken
+  once every producer is known to have exited 0.
+
+What did **not** move: `gdal_contour … /vsistdout/ | tippecanoe` is still one
+stream with nothing on disk. `Pipeline::feed` hands the producer's stdout the
+consumer's stdin file descriptor, so it is the same zero-copy pipe a shell
+makes.
+
+The one thing the awk got right and this does not do differently: its Web
+Mercator was `ln(tan(π/4 + φ/2))`, which is the well-conditioned form, not the
+`ln(tan φ + sec φ)` that cancels south of the equator. Over this build's domain
+the two forms agree to 3.7 nanometres, and the `chunks` and `supercells`
+enumerations were byte-identical when compared before the awk was deleted.
+`bbox` was not: where a tile edge falls on a whole degree, a float round trip
+through metres made the awk's margin one degree wider than intended — 15 of 140
+integer fields over 35 real z12 super-cells, always in the conservative
+direction, so it cost work rather than data.
 
 ---
+
+## Pinning the DEM---
 
 ## Pinning the DEM
 
@@ -71,7 +112,7 @@ pretending otherwise would be the lie.** Specifically:
 
 So the elevation values are fixed and the only thing that can move under a
 rerun is the **set of tiles**. That makes `tileList.txt` the pin, and it is
-pinned by content in `lib/common.sh`:
+pinned by content in `src/config.rs`:
 
 ```sh
 DEM_RELEASE="COP-DEM_GLO-30 Public, 2021 release"
@@ -132,9 +173,9 @@ multiple of 200 — the line has no counterpart in the finer band, so crossing
 that zoom makes an existing line disappear. That reads as a rendering bug.
 
 `verify_schedule` enforces divisibility on **every build**, not just when the
-schedule is edited, so an edit cannot land without tripping it. `selftest.sh`
-asserts both that schedule A is accepted and that a non-harmonic one is
-rejected — a guard nobody has watched fail is not a guard.
+schedule is edited, so an edit cannot land without tripping it.
+`config::tests` asserts both that schedule A is accepted and that
+1000/500/200 is rejected — a guard nobody has watched fail is not a guard.
 
 Schedule A is also *smaller* than uniform 100 m at identical z13–z14 detail,
 because the low zooms stop carrying unreadable lines. Measured, not assumed —
@@ -144,8 +185,8 @@ see below.
 
 ## Measured, on one real degree tile
 
-Run: `./selftest.sh`. Everything here is from `N39_00_W106_00` (Colorado,
-2,794 m relief) unless noted, on GDAL 3.13.3 / tippecanoe 2.79.0.
+Run: `cargo test -- --ignored`. Everything here is from `N39_00_W106_00`
+(Colorado, 2,794 m relief) unless noted, on GDAL 3.13.3 / tippecanoe 2.79.0.
 
 ### Contours
 
@@ -181,8 +222,8 @@ Two tiles, because one tile is not a range:
 | N35 W098 (Oklahoma) | 201 m | 1,277,821 | 4,636,672 | 946,176 | 9,785,344 |
 
 The Oklahoma tile has **no 1000 m contour at all** — its highest ground is
-201 m. `build-contours.sh` treats an empty band as data rather than failure;
-this is common, since most of the planet's land is roughly flat.
+201 m. An empty band is treated as data rather than failure; this is common,
+since most of the planet's land is roughly flat.
 
 ### Extrapolating to the globe
 
@@ -245,8 +286,9 @@ is worth it on its own.
 | item | worst case |
 |---|---|
 | global z8 elevation raster | 65,536² Float32 = 17.2 GB (≈ 5 GB on disk, DEFLATE + predictor 3) |
-| per super-cell (64×64 tiles = 16,384² px) | 1.07 GB Float32 + 0.8 GB encoded ≈ **2.5 GB** |
-| × `SC_JOBS` = `JOBS/4` = 12 | ≈ 30 GB |
+| per super-cell (64×64 tiles = 16,384² px), hillshade | 1.07 GB Float32 (DEFLATE, ≈ 0.4 GB on disk) + encoded ≈ **0.7 GB** |
+| per super-cell, terrain-RGB | 1.07 GB raw Float32 + 0.80 GB raw RGB = **1.87 GB** |
+| × `SC_JOBS` = `JOBS/4` = 12 | ≈ 8 GB hillshade, ≈ 23 GB terrain-RGB |
 | accumulating per-zoom MBTiles | full archive |
 | final merge + `pmtiles convert` | **2 × full archive** (both files exist at once) |
 
@@ -291,8 +333,8 @@ average R,G,B (what gdaladdo does): max err  3289.691 m   mean 14.604 m
                                     14.5% of pixels wrong by more than 10 m
 ```
 
-`selftest.sh` reproduces this independently through pure GDAL (max 3289.700 m,
-mean 13.009 m on the Mercator-warped grid). It looks plausible and is garbage.
+Reproduced independently through pure GDAL (max 3289.700 m, mean 13.009 m on
+the Mercator-warped grid). It looks plausible and is garbage.
 
 `-r nearest` is exactly correct — it copies one source triple verbatim — but
 aliases badly on shaded relief.
@@ -331,9 +373,9 @@ whole operation.
 `-co ZOOM_LEVEL` is advertised by the driver but **rejected by its CreateCopy
 path** ("driver MBTiles does not support creation option ZOOM_LEVEL"). It is
 unnecessary — the source is warped onto the target zoom's exact grid, so the
-driver derives the zoom from the resolution. `build-raster.sh` **asserts** the
-resulting zoom rather than assuming it, because a silently misplaced zoom would
-put real tiles at wrong addresses and still look like a successful build.
+driver derives the zoom from the resolution. The build **asserts** the resulting
+zoom rather than assuming it, because a silently misplaced zoom would put real
+tiles at wrong addresses and still look like a successful build.
 
 ### tippecanoe picks its container from the file extension
 
@@ -343,10 +385,11 @@ write-to-temp-then-rename idiom produces a SQLite database with a `.pmtiles`
 name: right name, plausible size, zero exit status, wrong format. Nothing
 downstream complains until a viewer gets it.
 
-This was caught by running `build-contours.sh` for real rather than by reading
-it — the archive was 6,402,048 bytes instead of 4,838,849, and `pmtiles show`
-printed nothing. Temp names now keep the `.pmtiles` suffix, and `assert_pmtiles`
-checks the 7-byte `PMTiles` magic on every archive the build emits.
+This was caught by running the contour pass for real rather than by reading it
+— the archive was 6,402,048 bytes instead of 4,838,849, and `pmtiles show`
+printed nothing. Temp names keep the `.pmtiles` suffix, and
+`pmtiles::assert_archive` checks the 7-byte `PMTiles` magic on every archive
+the build emits, including each `tile-join` generation.
 
 ---
 
@@ -367,38 +410,52 @@ input, not an encoder.** The `Create()` path is at least honest:
 April 2022 and the repository's recent traffic is dependency bots. That is not a
 dependency to put under a shipped artifact.
 
-So the encoding is done with a **VRT expression pixel function** — pure GDAL
-C++. muparser has no `floor()`, but floor is exactly recoverable:
+So the encoding is done **in this binary**, over a raw pipe of GDAL's own
+making. `gdalwarp -of ENVI` writes a flat little-endian Float32 plane — header
+offset 0, `data type = 4`, `byte order = 0`, exactly `nx·ny·4` bytes — the
+packer reads it, writes interleaved RGB, and a `VRTRawRasterBand` VRT hands the
+result back to `gdal_translate -of MBTILES`.
+
+**It is a file, not a pipe, and that is not a preference.** Every GDAL raw
+driver is `Create()`-based and needs a seekable output. Measured on GDAL 3.13.3:
+`-of ENVI /vsistdout/` fails with `ERROR 6: Read or update mode not supported on
+/vsistdout`, `/vsistdout_redirect/` fails with `ERROR 4: Attempt to create file
+… failed`, and a FIFO hangs on the reopen. There is no `CreateCopy` raw Float32
+driver to fall back to — `SRTMHGT` and `DTED` are Int16, `AAIGrid` and `GSAG`
+are ASCII. `GTiff` with `-co STREAMABLE_OUTPUT=YES` *does* write to
+`/vsistdout/`, but reading it means parsing TIFF IFDs.
+
+One VRT detail that is easy to miss: `VRTRawRasterBand` refuses an **absolute**
+`SourceFilename` unless `GDAL_VRT_RAWRASTERBAND_ALLOWED_SOURCE` is set, and
+errors with *"is invalid because the relativeToVRT flag is not set"*. The VRT is
+therefore written beside the raw file and names it by basename with
+`relativeToVRT="1"`.
+
+The packing itself:
 
 ```
-fl(x) = rint(x) - (rint(x) > x)
+v = round((h + 10000) * 10)   clamped to 0 ..= 16777215
+R = v >> 16      G = (v >> 8) & 255      B = v & 255
 ```
 
-since the comparison yields 1.0 or 0.0. With `v` the packed 24-bit integer:
+`* 10`, not `/ 0.1`. The two are the same function in exact arithmetic and
+different ones in binary — over 2,261,416 `f32` heights strided across −500 m to
+9000 m they disagree on 98,304, i.e. **4.35%**.
 
-```
-v = min(max(rint((B1 + 10000) * 10), 0), 16777215)
-R = fl(v/65536)      G = fl(v/256) - 256*fl(v/65536)      B = v - 256*fl(v/256)
-```
+**Differential against the encoder this replaced**, over all 12,960,000 pixels
+of the probe tile, run before the muparser path was deleted:
 
-Verified against a numpy reference over all 12,960,000 pixels of the probe tile:
-identical except on **2,893 pixels (0.022%)** whose exact packed value is a
-half-integer, where numpy's banker's rounding and muparser's `rint` break the
-tie in opposite directions. Both sit exactly half a quantum (0.05 m) from the
-true value, so the two encoders are equally correct.
+| encoder | pixels differing from muparser |
+|---|---|
+| this binary | **0** |
+| a half-to-even (numpy-style) control | 2,893 (0.0223%) |
 
-One XML detail that costs an afternoon: `>` must **not** be escaped as `&gt;` in
-the `expression` attribute. GDAL's CPL XML reader hands the attribute to
-muparser without expanding entities, so `&gt;` arrives as literal text and
-muparser fails with `Unexpected token "gt"`. Every floor contains a `>`.
-
-### Version gate
-
-Expression pixel functions landed in **GDAL 3.11.0**. Amazon Linux 2023 ships
-`gdal310` = **GDAL 3.10.3**, where this is unavailable at any spelling.
-`require_terrain_rgb_support` refuses the build with that explanation rather
-than silently falling back. To build terrain-RGB, run inside
-`ghcr.io/osgeo/gdal:ubuntu-small-3.13.2`.
+5,908 pixels (0.046%) of the tile have an exactly-half-integer packed value, so
+the tie rule is genuinely exercised — the zero is not vacuous, and the control
+reproduces the 2,893 recorded when the muparser encoder was first checked
+against numpy. Both tie rules land exactly half a quantum (0.05 m) from truth,
+so neither is more correct; what matters is that the replacement is
+byte-identical to what shipped.
 
 ### Why hillshade is the default
 
@@ -434,13 +491,21 @@ edge, which would otherwise draw a grid over the planet.
 
 ## Toolchain on Amazon Linux 2023
 
-`./bootstrap-al2023.sh`. Three facts, verified against AL2023 repo metadata:
+`bootstrap-al2023.sh` is both the toolchain installer and the **EC2 user-data**.
+Its size is load-bearing: user-data is capped at 16,384 bytes after base64, and
+the shell build this replaced was 23,964 — 1.46× over, which is what forced a
+fetch-a-tarball design. The bootstrap alone is now 2,916 base64 characters
+gzipped (6,168 plain), so it fits as the whole payload.
+
+Facts, verified against AL2023 repo metadata:
 
 * **The package is `gdal310`, not `gdal`.** No `gdal310*` package Provides a
   bare `gdal`, so `dnf install gdal` fails outright. It is in the **core** repo.
   `gdal310` carries `gdal_contour`, `gdaldem`, `gdal_translate`, `gdalwarp`,
-  `gdalbuildvrt`, `ogr2ogr`. The binaries are unversioned
-  (`/usr/bin/gdal_contour`); only the package name carries the suffix.
+  `gdalbuildvrt`. The binaries are unversioned (`/usr/bin/gdal_contour`); only
+  the package name carries the suffix.
+* **GDAL 3.10.3 is enough.** Nothing needs 3.11 any more; the Terrain-RGB
+  encoding no longer goes through a VRT expression pixel function.
 * **EPEL is not binary compatible with AL2023** and is not needed. AWS's SPAL
   repo does **not** carry GDAL, despite AWS's own SPAL documentation naming
   GDAL as an example of what SPAL unlocks.
@@ -449,7 +514,7 @@ edge, which would otherwise draw a grid over the planet.
   on this and tells you to `dnf upgrade --releasever=latest`.
 
 `gdal310-python-tools` and `python3-gdal310` are deliberately **not**
-dependencies.
+dependencies, and neither is a Rust toolchain.
 
 tippecanoe is not packaged on any RHEL-family distro and is built from a tag
 (`TIPPECANOE_REF`, default 2.79.0) so a rebuild produces the same tiler.
@@ -457,26 +522,79 @@ go-pmtiles is fetched as a static binary at a pinned version; note its Linux
 release assets use an underscore (`go-pmtiles_1.31.2_Linux_x86_64.tar.gz`) while
 macOS uses a hyphen.
 
+### Deploying the binary
+
+The bootstrap fetches `squallar-terrain` from `TERRAIN_BIN_URL` rather than
+building it, which is what keeps Rust off the instance. **Build it against musl,
+not glibc.** AL2023 ships glibc 2.34; a binary linked against a newer glibc will
+not start there, and the failure is a loader error with no hint about versions.
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
+# upload target/x86_64-unknown-linux-musl/release/squallar-terrain somewhere
+# the instance can reach, and pass its URL as TERRAIN_BIN_URL
+```
+
+Building in an `amazonlinux:2023` container against the stock toolchain is the
+alternative if a static build is inconvenient. Neither has been executed on this
+workstation: the musl target is not installed here.
+
 ---
 
 ## Running it
 
+As user-data, the bootstrap runs the build itself:
+
 ```sh
-./bootstrap-al2023.sh
-WORK=/mnt/terrain-work ./build.sh              # both archives
-WORK=/mnt/terrain-work ./build.sh contours     # just the vector one
-RASTER_ENCODING=terrain-rgb ./build.sh raster  # needs GDAL >= 3.11
+TERRAIN_BIN_URL=https://…/squallar-terrain ./bootstrap-al2023.sh
 ```
 
-Knobs (all in `lib/common.sh`, all overridable by environment):
-`WORK` `OUT` `TMP` `JOBS` `CHUNK_DEG` `SUPERCELL` `RASTER_ENCODING`
-`RASTER_MINZOOM` `RASTER_MAXZOOM` `RASTER_GLOBAL_MAXZOOM` `RASTER_TILE_FORMAT`.
+By hand:
+
+```sh
+TERRAIN_NO_RUN=1 TERRAIN_BIN_URL=… ./bootstrap-al2023.sh
+WORK=/mnt/terrain-work squallar-terrain build              # both archives
+WORK=/mnt/terrain-work squallar-terrain build contours     # just the vector one
+RASTER_ENCODING=terrain-rgb squallar-terrain build raster
+```
+
+Knobs (all environment, all listed by `squallar-terrain --help`):
+`WORK` `OUT` `TMP` `JOBS` `DEM_BUCKET` `CHUNK_DEG` `SUPERCELL`
+`RASTER_ENCODING` `RASTER_MINZOOM` `RASTER_MAXZOOM` `RASTER_GLOBAL_MAXZOOM`
+`RASTER_TILE_FORMAT`. `ONLY_CHUNK` and `ONLY_SUPERCELL` are substring filters on
+the cell name, for smoke-testing one region or re-running one that failed.
 
 Both passes **resume**: a chunk whose output archive already exists is skipped,
-and a super-cell drops a `.done` marker. Killing and restarting the build is
-safe.
+and a super-cell drops a `.done` marker. Killing and restarting is safe. A pass
+that lost chunks reports how many and exits non-zero rather than joining a
+partial archive and exiting 0.
+
+The grid arithmetic is inspectable without running a build:
+
+```sh
+squallar-terrain extent 12 -106 39 -105 40      # EPSG:3857 metres + pixels
+squallar-terrain bbox 12 848 1584 911 1647      # whole-degree box + centre lat
+squallar-terrain chunks 5 < tileList.txt
+squallar-terrain supercells 12 64 < tileList.txt
+```
+
+### Tests
+
+```sh
+cargo test                 # arithmetic, parsing, packing, the pins
+cargo test -- --ignored    # the above plus GDAL end-to-end on a real tile
+```
+
+The GDAL suite is `#[ignore]`d rather than skipped-when-absent: a test that
+quietly passes without its prerequisites is a gate that cannot fail. It needs
+`gdalwarp`, `gdal_translate`, `gdal_contour`, `tippecanoe`, `sqlite3` and a
+Copernicus tile at `TERRAIN_PROBE`.
 
 ### Exact commands, if you want them without the wrapper
+
+These are what the binary spawns; running them by hand is how each was
+verified.
 
 ```sh
 # contours, one degree tile, one band -- no GeoJSON on disk
@@ -491,4 +609,9 @@ gdalwarp -t_srs EPSG:3857 -te $XMIN $YMIN $XMAX $YMAX -ts $NX $NY \
 gdaldem hillshade -alg Horn -z 1 -s $(cos lat) -az 315 -alt 45 -compute_edges elev.tif hs.tif
 gdal_translate -of MBTILES -co TILE_FORMAT=PNG hs.tif cell.mbtiles
 pmtiles convert all.mbtiles terrain.pmtiles
+
+# terrain-RGB: the elevation comes out raw, the packer puts it back as a VRT
+gdalwarp -of ENVI -t_srs EPSG:3857 -te $XMIN $YMIN $XMAX $YMAX -ts $NX $NY \
+  -r average -ot Float32 -dstnodata 0 src.vrt elev.img
+gdal_translate -of MBTILES -co TILE_FORMAT=PNG elev.rgb.vrt cell.mbtiles
 ```

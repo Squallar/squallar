@@ -1,0 +1,41 @@
+# The terrain builder, and deliberately NOT a member of the squallar workspace.
+#
+# `[workspace]` below is the entire exclusion mechanism, exactly as
+# `tools/nws-zone-pack/Cargo.toml` and `tools/basemap-style/Cargo.toml` describe
+# it: the root `Cargo.toml` has no `exclude` key and must not gain one, and this
+# package must not be added to its `members`. It builds an offline data
+# artifact; nothing it produces links into a shipped binary, and CI never
+# compiles it.
+#
+# Consequences of standing outside, which this crate pays for itself:
+#
+#   - `cargo build/test/clippy --workspace` and root `cargo fmt --all` walk
+#     straight past it. Its gate is `cargo test` run from this directory.
+#   - Nothing inherits. `version`, `edition` and every dependency are spelled
+#     literally; `workspace = true` cannot resolve from a workspace root to
+#     itself.
+[workspace]
+
+[package]
+name = "squallar-terrain"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "squallar_terrain"
+path = "src/lib.rs"
+
+[[bin]]
+name = "squallar-terrain"
+path = "src/main.rs"
+
+[dependencies]
+# The only dependency, and the reason this is Rust rather than awk: the tile
+# addresses this build writes come from the same Web Mercator the app reads
+# them with. `lon_to_tile_x`, `lat_to_tile_y`, `tile_to_lon`, `tile_to_lat`.
+squallar-geo = { path = "../../squallar-geo" }
+
+[profile.release]
+opt-level = 3
+debug = false
