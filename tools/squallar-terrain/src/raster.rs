@@ -144,10 +144,16 @@ pub fn build(cfg: &Config, list: &TileList) -> Res<()> {
     );
     let out = cfg.raster_pmtiles();
     let _ = std::fs::remove_file(&out);
+    // `--tmpdir` explicitly: go-pmtiles deduplicates through a temp file, and
+    // without this it lands in /tmp -- the AL2023 ROOT EBS VOLUME -- while
+    // converting a hundreds-of-GB archive. `cfg.tmp` is on the instance-store
+    // stripe, which is the only volume sized for it.
     run(cmd(
         "pmtiles",
         &[
             "convert",
+            "--tmpdir",
+            cfg.tmp.to_string_lossy().as_ref(),
             combined.to_string_lossy().as_ref(),
             out.to_string_lossy().as_ref(),
         ],
@@ -229,8 +235,7 @@ fn build_global_elev(cfg: &Config, list: &TileList, out: &Path) -> Res<()> {
 /// header.
 fn warp(src: &Path, dst: &Path, e: &Extent, extra: &[&str]) -> std::process::Command {
     let mut c = cmd::<&str>("gdalwarp", &[]);
-    c.env("AWS_NO_SIGN_REQUEST", "YES")
-        .args(["-q", "-overwrite", "-t_srs", "EPSG:3857", "-te"])
+    c.args(["-q", "-overwrite", "-t_srs", "EPSG:3857", "-te"])
         .args([
             format!("{:.10}", e.xmin),
             format!("{:.10}", e.ymin),

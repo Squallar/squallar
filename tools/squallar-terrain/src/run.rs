@@ -20,6 +20,16 @@ use crate::log;
 pub fn cmd<S: AsRef<OsStr>>(program: &str, args: &[S]) -> Command {
     let mut c = Command::new(program);
     c.args(args.iter().map(AsRef::as_ref));
+    // Set HERE, on every child, not on the calls that happen to read S3.
+    //
+    // Copernicus GLO-30 is a world-readable Open Data bucket, but on an EC2
+    // instance GDAL finds credentials on IMDS and SIGNS the request with them.
+    // The build role holds no `s3:GetObject` at all, so a signed read of a
+    // public object is a 403. This was set on `warp()` alone while
+    // `gdalbuildvrt` opens every COG through `/vsis3/` at three separate sites
+    // -- the shape where adding it to the two that were missed just leaves the
+    // fourth for later. It is inert for tippecanoe and pmtiles.
+    c.env("AWS_NO_SIGN_REQUEST", "YES");
     c
 }
 
