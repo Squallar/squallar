@@ -1673,6 +1673,61 @@ before. A spelling gotcha worth carrying: plain `cargo test -p walkers` selects
 **48** and cannot see any of this — `mvt::tests` is gated, and the golden test
 is in it.
 
+### Changed — source, twenty-first commit: the parse is split from the styling
+
+Two files: `src/mvt.rs` and `src/expression.rs`. The consumer motive lives in
+`squallar-egui`: `HttpsTiles` caches the parsed tile per `TileId`, so a theme
+flip or a map-detail toggle re-styles from cache with zero fetches and zero
+re-parses, where it used to rebuild the source and refetch the viewport.
+
+`render(bytes, style, zoom)` used to decode and style in one pass — and
+re-decode per style layer: `get_layer_features` called
+`reader.get_features(layer_index)` once **per style layer**, so the committed
+styles' 95 layers over 16 source layers decoded the same protobuf features
+several times per tile. It is now exactly `styled(&parse(bytes)?, style, zoom)`:
+
+- **`parse(bytes) -> ParsedTile`** — the zoom- and style-independent half:
+  every source layer's features, geometry in extent units, property bags as
+  mvt-reader hands them over, each behind an `Arc`. Each source layer decodes
+  **once**. `ParsedTile::heap_bytes()` reports resident cost at capacity, for
+  consumers sizing a cache.
+- **`styled(&ParsedTile, &Style, zoom) -> Vec<ShapeOrText>`** — filter
+  evaluation, paint/layout expressions, tessellation. Infallible: everything
+  fallible happened in `parse`.
+- `Properties::Mvt` (`src/expression.rs`) holds `Arc<HashMap<..>>` instead of
+  the map by value, so one parse serves every styling without copying a bag.
+  Lookup behaviour is untouched.
+
+**`parse` also shrinks every ring's coordinate vector**, and the number is the
+reason: mvt-reader 2.4.0 grows each ring with
+`Vec::with_capacity(geometry_data.len())` — the whole feature's command count,
+per ring (`mvt-reader-2.4.0/src/lib.rs:361,379,414`). Measured on the Monaco
+fixture's z14 city tile, geometry capacity was **28,128,896 bytes for 317,736
+of content**; the transient `render` path never noticed because the value was
+dropped per tile, but a *cached* parse would have been 29.9 MB per entry
+instead of 2.09 MB. Same trade `tessellate_polygon` already makes.
+
+**The golden did not move, and no recording was touched**: `render` routes
+through the split, so `rendering_the_fixture_reproduces_the_recorded_shapes_exactly`
+now pins parse-then-style against the fused recording. Two new tests:
+`one_parse_styled_under_two_styles_matches_the_fused_path_for_both` (equality
+with `render` per style, plus the two stylings differing from each other as
+the non-vacuity floor) and `a_parsed_tiles_heap_grows_with_its_content`.
+
+One behavioural edge, stated rather than hidden: `parse` decodes **every**
+layer the tile carries, so a layer whose features will not decode now fails
+the whole tile even when no style layer names it, where the fused path only
+reached it on a style's request. A tile like that is a broken tile; failing
+it loudly is the honest arm. `Error::LayerNotFound` and
+`Error::UnsupportedLayerExtent` are no longer constructed (the lookup falls to
+the same `trace!` skip both cases always fell to); the variants stay on the
+public enum.
+
+New public surface: `ParsedTile` (opaque; `heap_bytes()`), `parse`, `styled`.
+
+**Test count: `cargo test -p walkers --features mvt` reports 98**, from 95.
+Plain `cargo test -p walkers` still selects 48 — the flag gotcha above stands.
+
 ## What the pin actually selects
 
 "Upstream's 38 inline tests are the behaviour pin" is the reason this crate is

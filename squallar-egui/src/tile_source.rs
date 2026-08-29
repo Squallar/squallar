@@ -23,7 +23,8 @@
 //! The IO runtime splits per target as walkers splits it: a thread with a
 //! current-thread tokio runtime on native, `spawn_local` on wasm. On wasm the
 //! IO task shares the page thread, so a completed fetch hands over **compressed
-//! bytes** and the decode + upload runs in [`HttpsTiles::pump`] under
+//! bytes** — or, for a restyle served out of the parsed cache, the parse
+//! itself — and the decode/styling + upload runs in [`HttpsTiles::pump`] under
 //! [`WASM_TILE_DECODES_PER_PUMP`] — see [`FetchPayload`].
 //!
 //! The pump is called **once per layer**, by `ui_map_overlays::draw_tile_layer`
@@ -31,11 +32,11 @@
 //! [`HttpsTiles::pump`] for why, and for the one thing that would break.
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use egui::Context;
-use futures::channel::mpsc::{Receiver, Sender, TryRecvError, TrySendError, channel};
+use futures::channel::mpsc::{Receiver, Sender, TryRecvError, channel};
 use futures::stream::FuturesUnordered;
 use futures::{SinkExt, StreamExt, future::Either, future::select};
 use lru::LruCache;
@@ -81,11 +82,13 @@ pub const MAX_PARALLEL_DOWNLOADS: usize = 6;
 ///
 /// The wasm32 arm is the one where that promotion has a budget to answer to:
 /// `squallar-device-profile`'s `constants::WASM_APP_TEXTURE_BUDGET_BYTES` is
-/// 288 MiB for the whole application, and `MapTileState::adopt_theme` keeps one
-/// theme's sources live, so base plus labels is ~118 MiB of it worst case where
-/// the raster derivation said 48. It fits, with less room than the old figure
+/// 288 MiB for the whole application, and `MapTileState::ensure_base_tiles`
+/// keeps one base source live across theme flips (re-styled in place, never
+/// duplicated), so base plus labels is ~118 MiB of it worst case where the
+/// raster derivation said 48. It fits, with less room than the old figure
 /// implied. The count did not move, because 96 is also the working-set floor
-/// below.
+/// below. The parsed-geometry population is priced separately —
+/// [`MEASURED_PARSED_TILE_BYTES`] and [`PARSED_TILE_CACHE_ENTRIES`].
 ///
 /// **Against the meshes this workspace shipped until 2026-08-28 those figures
 /// were 8.0 GiB and 4.0 GiB.** `VertexBuffers::new()` is
@@ -219,6 +222,160 @@ pub const MEASURED_VECTOR_TILE_BYTES: usize = 652_112;
 /// What one cached raster tile costs: 256x256 RGBA.
 pub const RASTER_TILE_BYTES: usize = 256 * 256 * 4;
 
+/// The measured worst-case heap of one **parsed** vector tile, in bytes —
+/// the second resident population the styled-entry figure above does not
+/// cover.
+///
+/// Same tile, same method as [`MEASURED_VECTOR_TILE_BYTES`]: the committed
+/// Monaco fixture's z14 city-core tile (185,182 MVT bytes), counted at
+/// **capacity** by `walkers::mvt::ParsedTile::heap_bytes` — decoded geometry,
+/// per-feature property bags, key and value strings. Measured 2026-08-29 by
+/// forcing
+/// `tile_source::tests::the_parsed_entry_cost_is_what_the_fixture_actually_parses`
+/// to fail; the band there is the derivation, this line is only its record.
+/// **3.2× the styled entry**, which is why the parsed cache gets its own,
+/// smaller entry count rather than inheriting [`TILE_CACHE_ENTRIES`].
+///
+/// The composition matters, because the first measurement was **29,903,162 B**
+/// and the difference is a fixed defect, not a re-count: `mvt-reader` grows
+/// every ring at `Vec::with_capacity(<whole feature's command count>)`, so
+/// geometry capacity was 28.1 MB for 318 KB of shrunk content.
+/// `walkers::mvt::parse` now shrinks per feature (see `shrink_geometry`
+/// there); what remains is 1,400,495 B of per-feature property bags — 2,913
+/// features, 14,303 properties, a `HashMap` apiece — 317,736 B of geometry,
+/// and the spine.
+///
+/// Like its styled sibling: re-derive it by forcing the test's band to fail,
+/// never by inference from a type's field list — the band cannot catch this
+/// constant drifting upward into a safe over-estimate.
+pub const MEASURED_PARSED_TILE_BYTES: usize = 2_092_002;
+
+/// Parsed-geometry entries retained per **archive** source before LRU
+/// eviction — the bound on the second population [`MEASURED_PARSED_TILE_BYTES`]
+/// prices.
+///
+/// **What this cache buys and what falling short costs.** It exists so a
+/// style change — a theme flip, a map-detail toggle — re-styles from the
+/// cached parse with **zero fetches and zero re-parses**
+/// ([`HttpsTiles::set_style`]). An entry that was evicted before the restyle
+/// costs one refetch for that tile, exactly the pre-split behaviour; it never
+/// costs a frame. So unlike [`TILE_CACHE_ENTRIES`], the working set is a
+/// *target*, not a floor a bound below which is broken — which is what lets
+/// the wasm arm sit below it where the byte budget leaves no other choice.
+///
+/// The arithmetic, against the measured 2,092,002 B tail
+/// ([`MEASURED_PARSED_TILE_BYTES`]) and alongside the styled population it
+/// joins (per archive source; the terrain source is raster and holds zero
+/// parsed entries):
+///
+/// | tier    | parsed entries | parsed worst | styled worst | total     |
+/// |---------|---------------:|-------------:|-------------:|----------:|
+/// | desktop |             96 |    191.5 MiB |    159.2 MiB | 350.7 MiB |
+/// | mobile  |             24 |     47.9 MiB |     59.7 MiB | 107.6 MiB |
+/// | wasm32  |             24 |     47.9 MiB |     59.7 MiB | 107.6 MiB |
+///
+/// Desktop's 96 is the 1920x1200 worst-case working set
+/// (`tiles::tiles_resident_for`, the figure the wasm styled arm is derived
+/// from), so the common canvas restyles wholly from cache; the deeper
+/// floor-strip working sets a zoom bias creates (242 at bias 1) are *not*
+/// covered, and `ui.rs`'s `tile_zoom_bias_for_pane` gate deliberately does
+/// not consult this cache — a bias overrunning it degrades restyle economy,
+/// never the frame, so gating on it would trade a real frame guarantee
+/// against an economy one.
+///
+/// The mobile/wasm 24 is a budget answer, not a working-set one:
+/// `squallar-device-profile` allows the whole wasm application 288 MiB, the
+/// styled population already prices at ~59.7 MiB worst case, and 96 parsed
+/// entries would put 191.5 MiB more against it — two thirds of the budget for
+/// an economy cache. 24 holds the most recently *decoded* two dozen tiles — a
+/// phone-sized viewport is 20–35 tiles — so a flip restyles most or all of
+/// the glass from cache and refetches only what had already scrolled away.
+///
+/// These are tail figures over every entry at once, as the styled table's
+/// are: the styled population's fixture-wide mean is 48× below its tail, and
+/// a parse of an ordinary tile is small for the same reason a styling of one
+/// is (no per-tile mean has been measured for the parse; the tail is what
+/// sizing uses). All three arms are held against their ceilings in
+/// `tile_source::tests::the_tuning_constants_are_the_written_figures_on_every_tier`.
+#[cfg(target_arch = "wasm32")]
+pub const PARSED_TILE_CACHE_ENTRIES: NonZeroUsize = WASM_PARSED_TILE_CACHE_ENTRIES;
+/// See the wasm32 arm above.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(target_os = "android", target_os = "ios")
+))]
+pub const PARSED_TILE_CACHE_ENTRIES: NonZeroUsize = MOBILE_PARSED_TILE_CACHE_ENTRIES;
+/// See the wasm32 arm above.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(any(target_os = "android", target_os = "ios"))
+))]
+pub const PARSED_TILE_CACHE_ENTRIES: NonZeroUsize = DESKTOP_PARSED_TILE_CACHE_ENTRIES;
+
+/// The wasm32 arm of [`PARSED_TILE_CACHE_ENTRIES`] — named outside the
+/// cascade for the reason [`WASM_TILE_CACHE_ENTRIES`] is: `cargo test` runs
+/// one arm, and the others are only reachable from a test if they have names.
+pub const WASM_PARSED_TILE_CACHE_ENTRIES: NonZeroUsize =
+    NonZeroUsize::new(24).expect("24 is not zero");
+/// The mobile arm — the same budget arithmetic as wasm's, see
+/// [`PARSED_TILE_CACHE_ENTRIES`].
+pub const MOBILE_PARSED_TILE_CACHE_ENTRIES: NonZeroUsize =
+    NonZeroUsize::new(24).expect("24 is not zero");
+/// The desktop arm — the 1920x1200 worst-case working set, so the common
+/// canvas restyles with zero fetches. See [`PARSED_TILE_CACHE_ENTRIES`].
+pub const DESKTOP_PARSED_TILE_CACHE_ENTRIES: NonZeroUsize =
+    NonZeroUsize::new(96).expect("96 is not zero");
+
+/// The parsed-geometry cache one archive source's IO task and frame side
+/// share: the style-independent half of every vector tile the source has
+/// decoded, keyed by [`TileId`].
+///
+/// A `Mutex` because on native the IO runtime's blocking pool writes it while
+/// the frame side owns the handle; on wasm every party is the page thread and
+/// the lock is never contended.
+type SharedParsedTiles = Arc<Mutex<LruCache<TileId, Arc<walkers::mvt::ParsedTile>>>>;
+
+/// What the archive IO task styles a tile against, and which restyle
+/// generation that styling belongs to. Written by [`HttpsTiles::set_style`],
+/// read by [`read_one`] once per tile — together under one lock, because a
+/// style observed with another generation's number would let a stale styling
+/// be cached as current. Native only: on wasm32 the frame pump is the styling
+/// side and owns the live style directly.
+#[cfg(not(target_arch = "wasm32"))]
+struct StyleSlot {
+    style: Arc<Style>,
+    epoch: u64,
+}
+
+/// What the archive IO task carries to style against — the slot on native,
+/// nothing on wasm32, where styling happens in the frame pump. A type alias
+/// so [`serve_archive_continuously`] and [`read_one`] keep one body each.
+#[cfg(not(target_arch = "wasm32"))]
+type IoStyleSlot = Arc<std::sync::RwLock<StyleSlot>>;
+/// See the native arm above.
+#[cfg(target_arch = "wasm32")]
+type IoStyleSlot = ();
+
+/// The style generation raster payloads carry: raster sources never restyle,
+/// so their frame-side epoch stays at this value and every payload matches.
+const RASTER_STYLE_EPOCH: u64 = 0;
+
+/// One slot of [`HttpsTiles`]' tile cache: the styled tile — or the
+/// pending/failed `None` marker — and the style generation it belongs to.
+///
+/// The epoch is what makes a restyle seamless: [`HttpsTiles::set_style`] bumps
+/// the source's generation without clearing anything, a slot from an older
+/// generation keeps **drawing** (a stale-styled tile beats a blank one) while
+/// [`HttpsTiles::request_once`] re-asks for it, and the restyled arrival
+/// overwrites it. A `None` marker from an older generation is re-asked too —
+/// "failed, do not ask again" is a per-style verdict only as far as the next
+/// restyle, which for an archive source re-asks the parsed cache, not the
+/// network.
+struct CachedTile {
+    epoch: u64,
+    tile: Option<Tile>,
+}
+
 /// The terrain hillshade source's cache bound.
 ///
 /// Its own name, derived the way [`TILE_CACHE_ENTRIES`]' arms derive theirs —
@@ -300,6 +457,40 @@ pub(crate) fn decode_archive_tile(
         ArchiveTileKind::Undeclared => {
             Tile::new(bytes, style, zoom, ctx).map_err(|error| error.to_string())
         }
+    }
+}
+
+/// Style a parsed tile into the value the tile cache holds.
+fn styled_tile(parsed: &walkers::mvt::ParsedTile, style: &Style, zoom: u8) -> Tile {
+    Tile::Vector(Arc::new(walkers::mvt::styled(parsed, style, zoom)))
+}
+
+/// [`decode_archive_tile`], with the parse half **remembered**: a vector
+/// body's zoom- and style-independent decode lands in `parsed_tiles` before
+/// the styling, so a later restyle of this tile ([`HttpsTiles::set_style`])
+/// touches neither the network nor the bytes. The raster arms delegate
+/// unchanged — there is nothing style-independent to keep for a pixel body.
+///
+/// Runs where [`decode_archive_tile`] runs: the IO runtime's blocking pool on
+/// native, the frame pump's [`WASM_TILE_DECODES_PER_PUMP`] budget on wasm32.
+fn decode_archive_tile_remembering(
+    bytes: &[u8],
+    kind: ArchiveTileKind,
+    style: &Style,
+    tile_id: TileId,
+    ctx: &Context,
+    parsed_tiles: &SharedParsedTiles,
+) -> Result<Tile, String> {
+    match kind {
+        ArchiveTileKind::Vector => {
+            let parsed = Arc::new(walkers::mvt::parse(bytes).map_err(|error| error.to_string())?);
+            parsed_tiles
+                .lock()
+                .expect("the parsed-tile cache is not poisoned")
+                .put(tile_id, Arc::clone(&parsed));
+            Ok(styled_tile(&parsed, style, tile_id.zoom))
+        }
+        raster => decode_archive_tile(bytes, raster, style, tile_id.zoom, ctx),
     }
 }
 
@@ -396,14 +587,24 @@ impl<T: TileSource + 'static> AsyncTileSource for T {}
 /// What one completed fetch hands the frame side.
 ///
 /// Native: the decoded [`Tile`] — [`fetch_one`] and [`read_one`] decode and
-/// upload on the IO thread. wasm32: the tile body undecoded — a compressed PNG
-/// from a raster source, an MVT body from the archive — turned into a [`Tile`]
-/// by the frame pump at most [`WASM_TILE_DECODES_PER_PUMP`] per source per pass
-/// — see [`HttpsTiles::pump`].
+/// upload on the IO thread — paired with the style generation it was styled
+/// under, so the frame side can drop a tile styled by a style a restyle has
+/// already replaced ([`CachedTile`]). wasm32: the work still owed, under the
+/// frame pump's [`WASM_TILE_DECODES_PER_PUMP`] budget — see
+/// [`HttpsTiles::pump`]; no generation travels with it, because the pump
+/// styles against the frame's current style by construction.
 #[cfg(not(target_arch = "wasm32"))]
-type FetchPayload = Tile;
+type FetchPayload = (Tile, u64);
 #[cfg(target_arch = "wasm32")]
-type FetchPayload = Vec<u8>;
+enum FetchPayload {
+    /// A tile body the pump must decode — a compressed PNG from a raster
+    /// source, an MVT body from the archive (parsed, remembered, styled).
+    Bytes(Vec<u8>),
+    /// A parse the IO task found in [`SharedParsedTiles`]: the fetch was
+    /// skipped entirely; only the styling remains, and it still bills the
+    /// pump budget — tessellation is the heavy half.
+    Parsed(Arc<walkers::mvt::ParsedTile>),
+}
 
 /// Managed IO runtime for the tile fetch task.
 mod runtime {
@@ -612,10 +813,34 @@ pub struct HttpsTiles {
     /// exactly one line.
     requests_closed: bool,
 
-    /// Tiles by id. A `None` value means "asked for, not here yet" *and*
-    /// "asked for, and it failed" — the two are deliberately indistinguishable,
-    /// because both mean "do not ask again". See [`Self::request_once`].
-    cache: LruCache<TileId, Option<Tile>>,
+    /// Tiles by id. A slot with `tile: None` means "asked for, not here yet"
+    /// *and* "asked for, and it failed" — the two are deliberately
+    /// indistinguishable, because both mean "do not ask again" — for as long
+    /// as the slot's style generation is current. See [`Self::request_once`]
+    /// and [`CachedTile`] for what a stale generation re-opens.
+    cache: LruCache<TileId, CachedTile>,
+
+    /// The style generation the frame side currently wants — bumped by
+    /// [`Self::set_style`], stamped on every slot, compared against arriving
+    /// payloads on native. Stays [`RASTER_STYLE_EPOCH`] for a source that
+    /// never restyles.
+    style_epoch: u64,
+
+    /// Where a restyle lands for the IO task — the slot [`read_one`] reads a
+    /// (style, generation) pair from, once per tile. `None` for a raster HTTP
+    /// source, which has no style to swap. On wasm32 the frame pump is the
+    /// styling side, so the slot exists only inside the task's ignored
+    /// parameter and the live style is [`Self::style`].
+    #[cfg(not(target_arch = "wasm32"))]
+    style_slot: Option<Arc<std::sync::RwLock<StyleSlot>>>,
+
+    /// The parsed-geometry cache shared with this source's IO task — `Some`
+    /// for an archive source, `None` for a raster HTTP source. wasm32 only,
+    /// because there the pump is the side that parses and remembers; on
+    /// native the IO task owns the only handle, and its clone is what keeps
+    /// the cache alive.
+    #[cfg(target_arch = "wasm32")]
+    parsed: Option<SharedParsedTiles>,
 
     /// Tiles the IO task should fetch.
     request_tx: Sender<TileId>,
@@ -803,6 +1028,12 @@ impl HttpsTiles {
             fault: Arc::new(OnceLock::new()),
             requests_closed: false,
             cache: LruCache::new(cache_entries),
+            style_epoch: RASTER_STYLE_EPOCH,
+            // A raster source has no style to swap and no parse to keep.
+            #[cfg(not(target_arch = "wasm32"))]
+            style_slot: None,
+            #[cfg(target_arch = "wasm32")]
+            parsed: None,
             request_tx,
             tile_rx,
             #[cfg(target_arch = "wasm32")]
@@ -820,6 +1051,47 @@ impl HttpsTiles {
             pumps: 0,
             runtime,
         }
+    }
+
+    /// Adopt `style` for every tile this source serves from now on — the
+    /// restyle seam a theme flip and a map-detail toggle ride
+    /// (`MapTileState::ensure_base_tiles`), replacing the source rebuild that
+    /// refetched every visible tile.
+    ///
+    /// **Nothing is cleared and nothing is blanked.** The generation
+    /// ([`CachedTile`]) is bumped instead: every cached tile keeps drawing in
+    /// its old style while [`Self::request_once`] re-asks for it, the IO side
+    /// answers out of the parsed cache with **zero fetches and zero
+    /// re-parses**, and arrivals replace the stale slots one by one. The heavy
+    /// half — styling is mostly lyon tessellation — runs where a decode runs:
+    /// the IO runtime's blocking pool on native, the frame pump's
+    /// [`WASM_TILE_DECODES_PER_PUMP`] budget on wasm32. The frame thread pays
+    /// for nothing here but the lock write.
+    ///
+    /// Meaningful only for an archive source; a raster source has no style
+    /// slot and ignores the swap beyond the (harmless) generation bump.
+    pub(crate) fn set_style(&mut self, style: Arc<Style>) {
+        self.style_epoch += 1;
+        self.install_style(style);
+    }
+
+    /// The native arm of the [`Self::set_style`] split: publish the pair to
+    /// the IO task's slot.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn install_style(&mut self, style: Arc<Style>) {
+        if let Some(slot) = &self.style_slot {
+            *slot.write().expect("the style slot is not poisoned") = StyleSlot {
+                style,
+                epoch: self.style_epoch,
+            };
+        }
+    }
+
+    /// The wasm32 arm: the frame pump is the styling side, so the live style
+    /// is this field.
+    #[cfg(target_arch = "wasm32")]
+    fn install_style(&mut self, style: Arc<Style>) {
+        self.style = style;
     }
 
     /// Move what the IO task has finished into the cache.
@@ -872,14 +1144,28 @@ impl HttpsTiles {
             cache,
             tile_rx,
             io_task_gone_reported,
+            style_epoch,
             ..
         } = self;
+        let current = *style_epoch;
         drain_up_to(
             tile_rx,
             NATIVE_TILE_UPLOADS_PER_PUMP,
             io_task_gone_reported,
-            |(tile_id, tile): (TileId, Tile)| {
-                cache.put(tile_id, Some(tile));
+            |(tile_id, (tile, epoch)): (TileId, FetchPayload)| {
+                // A tile styled under a generation a restyle has replaced is
+                // dropped, not drawn: its slot keeps showing the old style and
+                // [`Self::request_once`] re-asks under the current one, which
+                // the IO side answers from the parsed cache.
+                if epoch == current {
+                    cache.put(
+                        tile_id,
+                        CachedTile {
+                            epoch,
+                            tile: Some(tile),
+                        },
+                    );
+                }
             },
         );
     }
@@ -900,39 +1186,61 @@ impl HttpsTiles {
             decode_budget,
             style,
             archive_kind,
+            parsed,
             io_task_gone_reported,
+            style_epoch,
             ..
         } = self;
         let style: &Style = style;
         let archive_kind = archive_kind.as_ref();
+        let parsed = parsed.as_ref();
+        // The pump styles against the frame's current style, so what it puts
+        // is current by construction.
+        let epoch = *style_epoch;
 
         let budget = decode_budget.remaining(egui_ctx.cumulative_pass_nr());
         let taken = drain_up_to(
             tile_rx,
             budget,
             io_task_gone_reported,
-            |(tile_id, bytes): (TileId, Vec<u8>)| {
-                let decoded = match archive_kind {
-                    // A raster HTTP source: the body is whatever image the
-                    // provider serves, sniffed as it always was.
-                    None => Tile::new(&bytes, style, tile_id.zoom, egui_ctx)
-                        .map_err(|error| error.to_string()),
-                    // An archive source: the header's word decides. The IO
-                    // task writes the slot at open, before any tile is
-                    // served, so an empty slot cannot be reached through the
-                    // normal order of events; if it ever is, sniffing is the
-                    // pre-seam behaviour rather than a guess of this code's.
-                    Some(kind) => decode_archive_tile(
-                        &bytes,
-                        kind.get().copied().unwrap_or(ArchiveTileKind::Undeclared),
-                        style,
-                        tile_id.zoom,
-                        egui_ctx,
-                    ),
+            |(tile_id, payload): (TileId, FetchPayload)| {
+                let decoded = match payload {
+                    // A restyle served from the parsed cache: no bytes were
+                    // fetched, only the styling is owed — still under this
+                    // budget, because it is the tessellation half.
+                    FetchPayload::Parsed(parse) => Ok(styled_tile(&parse, style, tile_id.zoom)),
+                    FetchPayload::Bytes(bytes) => match archive_kind {
+                        // A raster HTTP source: the body is whatever image the
+                        // provider serves, sniffed as it always was.
+                        None => Tile::new(&bytes, style, tile_id.zoom, egui_ctx)
+                            .map_err(|error| error.to_string()),
+                        // An archive source: the header's word decides. The IO
+                        // task writes the slot at open, before any tile is
+                        // served, so an empty slot cannot be reached through the
+                        // normal order of events; if it ever is, sniffing is the
+                        // pre-seam behaviour rather than a guess of this code's.
+                        Some(kind) => {
+                            let kind = kind.get().copied().unwrap_or(ArchiveTileKind::Undeclared);
+                            match parsed {
+                                Some(parsed) => decode_archive_tile_remembering(
+                                    &bytes, kind, style, tile_id, egui_ctx, parsed,
+                                ),
+                                None => {
+                                    decode_archive_tile(&bytes, kind, style, tile_id.zoom, egui_ctx)
+                                }
+                            }
+                        }
+                    },
                 };
                 match decoded {
                     Ok(tile) => {
-                        cache.put(tile_id, Some(tile));
+                        cache.put(
+                            tile_id,
+                            CachedTile {
+                                epoch,
+                                tile: Some(tile),
+                            },
+                        );
                     }
                     Err(error) => log::warn!("decoding tile {tile_id:?}: {error}"),
                 }
@@ -947,32 +1255,53 @@ impl HttpsTiles {
         }
     }
 
-    /// Ask for `tile_id` unless it has already been asked for.
+    /// Ask for `tile_id` unless it has already been asked for **under the
+    /// current style generation**.
     ///
-    /// The de-duplication and the cache are the same structure: inserting `None`
-    /// under the tile's id records "a request is out" and reserves the slot.
-    /// When the request channel is full the closure fails, *nothing is inserted*,
-    /// and the tile is retried on a later frame — dropping the request while
-    /// marking the tile as requested would strand it forever.
+    /// The de-duplication and the cache are the same structure: a slot under
+    /// the tile's id stamped with the current generation records "a request is
+    /// out" (or "it is here", or "it failed") and reserves the slot. When the
+    /// request channel is full nothing is recorded and the tile is retried on
+    /// a later frame — recording the ask while dropping the request would
+    /// strand it forever.
+    ///
+    /// A slot from an **older** generation is a tile styled by a style
+    /// [`Self::set_style`] has replaced: it keeps drawing (see
+    /// [`Self::cached_or_interpolated`]) while this re-asks for it, and the
+    /// re-stamp to the current generation is the same "a request is out"
+    /// record as a fresh insert.
     fn request_once(&mut self, tile_id: TileId) {
         if self.requests_closed {
             return;
         }
+        let epoch = self.style_epoch;
 
-        // Split borrow: the closure needs the sender while the cache is borrowed.
+        // Split borrow: the sender is needed while the cache is borrowed.
         let Self {
             cache, request_tx, ..
         } = self;
 
-        let outcome =
-            cache.try_get_or_insert(tile_id, || -> Result<Option<Tile>, TrySendError<TileId>> {
-                request_tx.try_send(tile_id)?;
-                log::trace!("requested tile {tile_id:?}");
-                Ok(None)
-            });
+        // `get`, not `peek`: a hit refreshes recency exactly as the old
+        // `try_get_or_insert` did.
+        let known = cache.get(&tile_id).map(|slot| slot.epoch);
+        if known == Some(epoch) {
+            return;
+        }
+
+        let outcome = request_tx.try_send(tile_id).map(|()| {
+            if known.is_some() {
+                // The stale slot keeps its tile; the re-stamp is the "a
+                // request is out" record.
+                if let Some(slot) = cache.get_mut(&tile_id) {
+                    slot.epoch = epoch;
+                }
+            } else {
+                cache.put(tile_id, CachedTile { epoch, tile: None });
+            }
+        });
 
         match outcome {
-            Ok(_) => {}
+            Ok(()) => log::trace!("requested tile {tile_id:?}"),
             Err(error) if error.is_full() => {
                 log::trace!("tile request queue is full, retrying {tile_id:?} next frame");
             }
@@ -995,13 +1324,21 @@ impl HttpsTiles {
     /// Starts at the requested zoom and walks outwards until something is cached,
     /// so a zoomed-in view shows a blurry ancestor rather than a hole. Starts no
     /// download of its own.
+    ///
+    /// **The style generation is deliberately not consulted**: mid-restyle, a
+    /// tile styled by the outgoing style is what stands between the user and a
+    /// blank beat, and its slot is already re-stamped for replacement by
+    /// [`Self::request_once`].
     fn cached_or_interpolated(&mut self, tile_id: TileId) -> Option<TilePiece> {
         let mut zoom_candidate = tile_id.zoom;
 
         loop {
             let (ancestor, uv) = interpolate_from_lower_zoom(tile_id, zoom_candidate);
 
-            if let Some(Some(cached)) = self.cache.get(&ancestor) {
+            if let Some(CachedTile {
+                tile: Some(cached), ..
+            }) = self.cache.get(&ancestor)
+            {
                 break Some(TilePiece::new(cached.clone(), uv));
             }
 
@@ -1063,7 +1400,14 @@ impl HttpsTiles {
     /// wasm32-unknown-unknown`, found when the flip made that a default row.
     #[cfg(test)]
     pub(crate) fn put_for_test(&mut self, tile_id: TileId, tile: Tile) {
-        self.cache.put(tile_id, Some(tile));
+        let epoch = self.style_epoch;
+        self.cache.put(
+            tile_id,
+            CachedTile {
+                epoch,
+                tile: Some(tile),
+            },
+        );
     }
 }
 
@@ -1151,14 +1495,18 @@ async fn fetch_one<S: TileSource>(
         .map_err(|error| format!("reading '{url}': {error}"))?;
 
     // An empty style. This function serves a raster source, and `Tile::new`
-    // only consults a style for a body that is not a recognised image.
+    // only consults a style for a body that is not a recognised image. The
+    // epoch is likewise the raster constant: this source never restyles.
     #[cfg(not(target_arch = "wasm32"))]
-    let payload = Tile::new(&body, &Style::default(), tile_id.zoom, egui_ctx)
-        .map_err(|error| format!("decoding '{url}': {error}"))?;
+    let payload = (
+        Tile::new(&body, &Style::default(), tile_id.zoom, egui_ctx)
+            .map_err(|error| format!("decoding '{url}': {error}"))?,
+        RASTER_STYLE_EPOCH,
+    );
 
     // On wasm the decode belongs to the frame pump, under its budget.
     #[cfg(target_arch = "wasm32")]
-    let payload = body.to_vec();
+    let payload = FetchPayload::Bytes(body.to_vec());
 
     Ok((tile_id, payload))
 }
@@ -1355,6 +1703,19 @@ impl HttpsTiles {
         // the header, at open, before it serves a tile. See [`ArchiveTileKind`].
         let archive_kind: Arc<OnceLock<ArchiveTileKind>> = Arc::new(OnceLock::new());
 
+        // The parsed-geometry cache the IO task and the frame side share, and
+        // the slot a restyle publishes the new style through. See
+        // [`SharedParsedTiles`] and [`HttpsTiles::set_style`].
+        let parsed: SharedParsedTiles =
+            Arc::new(Mutex::new(LruCache::new(PARSED_TILE_CACHE_ENTRIES)));
+        #[cfg(not(target_arch = "wasm32"))]
+        let style_slot: IoStyleSlot = Arc::new(std::sync::RwLock::new(StyleSlot {
+            style: Arc::clone(&style),
+            epoch: RASTER_STYLE_EPOCH,
+        }));
+        #[cfg(target_arch = "wasm32")]
+        let style_slot: IoStyleSlot = ();
+
         // Both clones exist for the reason `with_client_and_cache` clones the
         // context: on wasm32 the frame pump is the tessellating side, so it
         // needs the context to upload through and the style to render against.
@@ -1366,10 +1727,17 @@ impl HttpsTiles {
         let frame_style = Arc::clone(&style);
         #[cfg(target_arch = "wasm32")]
         let frame_archive_kind = Arc::clone(&archive_kind);
+        #[cfg(target_arch = "wasm32")]
+        let frame_parsed = Arc::clone(&parsed);
+        #[cfg(not(target_arch = "wasm32"))]
+        let frame_style_slot = Arc::clone(&style_slot);
 
         let runtime = runtime::spawn(serve_archive_continuously(
             source,
-            style,
+            ArchiveStyling {
+                style: style_slot,
+                parsed_tiles: parsed,
+            },
             ArchiveHeaderSlots {
                 max_zoom: Arc::clone(&max_zoom),
                 fault: Arc::clone(&fault),
@@ -1393,6 +1761,11 @@ impl HttpsTiles {
             fault,
             requests_closed: false,
             cache: LruCache::new(cache_entries),
+            style_epoch: RASTER_STYLE_EPOCH,
+            #[cfg(not(target_arch = "wasm32"))]
+            style_slot: Some(frame_style_slot),
+            #[cfg(target_arch = "wasm32")]
+            parsed: Some(frame_parsed),
             request_tx,
             tile_rx,
             #[cfg(target_arch = "wasm32")]
@@ -1440,6 +1813,14 @@ impl HttpsTiles {
             fault: Arc::new(OnceLock::new()),
             requests_closed: false,
             cache: LruCache::new(TILE_CACHE_ENTRIES),
+            // An inert source never restyles and never parses -- the same
+            // never-restyles spelling as a raster source, which is what the
+            // epoch constant's doc names for this case.
+            style_epoch: RASTER_STYLE_EPOCH,
+            #[cfg(not(target_arch = "wasm32"))]
+            style_slot: None,
+            #[cfg(target_arch = "wasm32")]
+            parsed: None,
             request_tx,
             tile_rx,
             #[cfg(target_arch = "wasm32")]
@@ -1455,6 +1836,22 @@ impl HttpsTiles {
             runtime: runtime::inert(),
         }
     }
+}
+
+/// The two halves of the restyle seam, as the archive IO task carries them:
+/// what a tile is styled against ([`IoStyleSlot`]; nothing on wasm32) and
+/// where its parse is remembered. One parameter because every [`read_one`]
+/// needs both together.
+struct ArchiveStyling {
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(
+            dead_code,
+            reason = "the wasm arm of IoStyleSlot is (); the frame pump owns the style"
+        )
+    )]
+    style: IoStyleSlot,
+    parsed_tiles: SharedParsedTiles,
 }
 
 /// The slots the IO task fills for the frame side once the archive header
@@ -1489,9 +1886,10 @@ impl ArchiveTileKind {
 /// request per visible tile at once.
 ///
 /// **Where the tessellation happens is the target's, not this loop's**, and on
-/// neither target is it this task. `Tile::new` falls through to `mvt::render`
-/// for a body no image decoder recognises, and that is the whole per-tile cost
-/// of a vector basemap. On native [`read_one`] hands it to the runtime's
+/// neither target is it this task. A vector body's per-tile cost is
+/// `mvt::parse` plus `mvt::styled` ([`decode_archive_tile_remembering`]), the
+/// parse remembered in [`SharedParsedTiles`] so a restyle re-runs only the
+/// second half. On native [`read_one`] hands the work to the runtime's
 /// blocking pool and the frame side only moves a finished `Tile` into the
 /// cache; on wasm32 there is no other thread to pay it on, so the body crosses
 /// undecoded and [`HttpsTiles::drain_completed_fetches`] pays it under
@@ -1506,7 +1904,7 @@ impl ArchiveTileKind {
 /// fetches and the tessellations starved each other.
 async fn serve_archive_continuously<S>(
     source: S,
-    style: Arc<Style>,
+    styling: ArchiveStyling,
     slots: ArchiveHeaderSlots,
     mut request_rx: Receiver<TileId>,
     mut tile_tx: Sender<(TileId, FetchPayload)>,
@@ -1570,7 +1968,7 @@ async fn serve_archive_continuously<S>(
         let completed = if outstanding.is_empty() {
             match request_rx.next().await {
                 Some(tile_id) => {
-                    outstanding.push(read_one(&archive, &style, &egui_ctx, tile_id));
+                    outstanding.push(read_one(&archive, &styling, &egui_ctx, tile_id));
                     continue;
                 }
                 None => break,
@@ -1580,7 +1978,7 @@ async fn serve_archive_continuously<S>(
                 Either::Left((Some(tile_id), pending)) => {
                     // Release the borrow of `outstanding` before pushing.
                     drop(pending);
-                    outstanding.push(read_one(&archive, &style, &egui_ctx, tile_id));
+                    outstanding.push(read_one(&archive, &styling, &egui_ctx, tile_id));
                     continue;
                 }
                 Either::Left((None, _)) => break,
@@ -1611,7 +2009,9 @@ async fn serve_archive_continuously<S>(
 }
 
 /// Read one tile out of the archive -- and on native, tessellate and upload it
-/// too.
+/// too. Or skip the archive entirely: a tile whose parse is already in
+/// [`SharedParsedTiles`] is re-styled from it, which is the whole of what a
+/// theme flip or a detail toggle costs since [`HttpsTiles::set_style`].
 ///
 /// `Ok(None)` is the archive positively holding nothing at that coordinate --
 /// an ocean tile at zoom 14 -- which is why
@@ -1619,16 +2019,17 @@ async fn serve_archive_continuously<S>(
 ///
 /// The payload split is [`fetch_one`]'s, for [`FetchPayload`]'s reason and not
 /// a second one: on native the tessellation happens here, on wasm32 the IO task
-/// *is* the page thread, so the MVT body crosses the channel undecoded and
-/// [`HttpsTiles::drain_completed_fetches`] renders it under
-/// [`WASM_TILE_DECODES_PER_PUMP`]. Doing it here on wasm32 would put an
+/// *is* the page thread, so the MVT body (or the remembered parse) crosses the
+/// channel unstyled and [`HttpsTiles::drain_completed_fetches`] renders it
+/// under [`WASM_TILE_DECODES_PER_PUMP`]. Doing it here on wasm32 would put an
 /// unbounded tessellation on the frame thread; doing it there puts a bounded
 /// one.
 ///
 /// **On native the render runs on the runtime's blocking pool, not on the
 /// calling task**, measured at **24.8 ms** for the committed Monaco fixture's
 /// z14 city-core tile against the 95-layer committed style, release build,
-/// 2026-08-28. There is no await point across it, so before this
+/// 2026-08-28 (parse and styling fused; the split does the same work in two
+/// named halves). There is no await point across it, so before this
 /// [`MAX_PARALLEL_DOWNLOADS`] bounded the range requests and bounded nothing
 /// about the tessellations: they ran one after another on [`runtime::spawn`]'s
 /// single current-thread runtime, and during each 24.8 ms slice no range
@@ -1638,29 +2039,18 @@ async fn serve_archive_continuously<S>(
 /// [`MAX_PARALLEL_DOWNLOADS`], so this is bounded parallelism rather than an
 /// unbounded fan-out, and the reads and the renders stop starving each other.
 ///
-/// This is **not** the shape the plan asks for. The plan splits the
-/// zoom-independent MVT parse from the zoom-dependent tessellation and
-/// dispatches the second keyed `(TileId, zoom)`; this moves the whole of
-/// `Tile::new` off the task as one unit. What it fixes is the serialization.
-///
 /// **Unverified, and stated so it is not a surprise later**: `Runtime::drop`
 /// joins the IO thread, whose `tokio::runtime::Runtime` drop is documented to
 /// wait for blocking tasks that have already started. If that holds, dropping a
 /// source mid-tessellation blocks the *frame* thread for up to one render --
-/// ~25 ms -- and `tiles::MapTileState::adopt_theme` drops a source on every
-/// theme flip. The inline spelling had a wait of the same order for the same
-/// reason, so this is not believed to be a regression; neither figure has been
-/// measured. The wasm32 arm never reaches `spawn_blocking` at all.
+/// ~25 ms. A theme flip no longer drops a source (`set_style` re-styles it in
+/// place), so the moments left that do are a layer release, a suspend and a
+/// graphics reset. The inline spelling had a wait of the same order for the
+/// same reason, so this is not believed to be a regression; neither figure has
+/// been measured. The wasm32 arm never reaches `spawn_blocking` at all.
 async fn read_one<S>(
     archive: &crate::basemap_archive::BasemapArchive<S>,
-    #[cfg_attr(
-        target_arch = "wasm32",
-        expect(
-            unused_variables,
-            reason = "on wasm the frame pump tessellates; see FetchPayload"
-        )
-    )]
-    style: &Arc<Style>,
+    styling: &ArchiveStyling,
     #[cfg_attr(
         target_arch = "wasm32",
         expect(
@@ -1674,6 +2064,42 @@ async fn read_one<S>(
 where
     S: crate::basemap_archive::ArchiveRangeSource,
 {
+    // The header's word, not the body's shape -- see [`ArchiveTileKind`].
+    let kind = ArchiveTileKind::from_tile_type(archive.tile_type());
+
+    // The restyle path: parsed geometry already held means the archive — and
+    // the network and disk behind it — is not consulted at all. This is what
+    // `HttpsTiles::set_style` turns a theme flip and a detail toggle into.
+    let remembered = if kind == ArchiveTileKind::Vector {
+        styling
+            .parsed_tiles
+            .lock()
+            .expect("the parsed-tile cache is not poisoned")
+            .get(&tile_id)
+            .cloned()
+    } else {
+        None
+    };
+    if let Some(parsed) = remembered {
+        #[cfg(not(target_arch = "wasm32"))]
+        let payload = {
+            let (style, epoch) = current_style(&styling.style);
+            let tile =
+                tokio::task::spawn_blocking(move || styled_tile(&parsed, &style, tile_id.zoom))
+                    .await
+                    .map_err(|error| {
+                        format!("re-styling {tile_id:?} from the parsed cache: {error}")
+                    })?;
+            (tile, epoch)
+        };
+
+        // On wasm the styling belongs to the frame pump, under its budget.
+        #[cfg(target_arch = "wasm32")]
+        let payload = FetchPayload::Parsed(parsed);
+
+        return Ok(Some((tile_id, payload)));
+    }
+
     let bytes = archive
         .tile(tile_id.zoom, tile_id.x, tile_id.y)
         .await
@@ -1686,24 +2112,33 @@ where
 
     #[cfg(not(target_arch = "wasm32"))]
     let payload = {
-        let style = Arc::clone(style);
+        let (style, epoch) = current_style(&styling.style);
         let egui_ctx = egui_ctx.clone();
-        // The header's word, not the body's shape -- see [`ArchiveTileKind`].
-        let kind = ArchiveTileKind::from_tile_type(archive.tile_type());
+        let parsed_tiles = Arc::clone(&styling.parsed_tiles);
 
-        tokio::task::spawn_blocking(move || {
-            decode_archive_tile(&bytes, kind, &style, tile_id.zoom, &egui_ctx)
+        let tile = tokio::task::spawn_blocking(move || {
+            decode_archive_tile_remembering(&bytes, kind, &style, tile_id, &egui_ctx, &parsed_tiles)
         })
         .await
         .map_err(|error| format!("rendering {tile_id:?} from the basemap archive: {error}"))?
-        .map_err(|error| format!("rendering {tile_id:?} from the basemap archive: {error}"))?
+        .map_err(|error| format!("rendering {tile_id:?} from the basemap archive: {error}"))?;
+        (tile, epoch)
     };
 
     // On wasm the tessellation belongs to the frame pump, under its budget.
     #[cfg(target_arch = "wasm32")]
-    let payload = bytes;
+    let payload = FetchPayload::Bytes(bytes);
 
     Ok(Some((tile_id, payload)))
+}
+
+/// The style the IO task must render against right now, with the restyle
+/// generation it belongs to — read together under one lock so a styling can
+/// never be stamped with another generation's number.
+#[cfg(not(target_arch = "wasm32"))]
+fn current_style(slot: &std::sync::RwLock<StyleSlot>) -> (Arc<Style>, u64) {
+    let slot = slot.read().expect("the style slot is not poisoned");
+    (Arc::clone(&slot.style), slot.epoch)
 }
 
 // Native-only: `#[tokio::test]` (the dev-dependency is target-gated),

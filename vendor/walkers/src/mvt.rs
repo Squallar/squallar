@@ -1,6 +1,15 @@
 //! Renderer for Mapbox Vector Tiles.
+//!
+//! The pipeline is two halves with a cacheable value between them:
+//! [`parse`] decodes the MVT bytes into a [`ParsedTile`] — zoom- and
+//! style-independent — and [`styled`] evaluates a [`Style`] over it at a zoom,
+//! producing the [`ShapeOrText`]s a tile draws as. [`render`] is the two run
+//! back to back. A consumer that keeps the `ParsedTile` (in an `Arc`; both
+//! halves of it are shared, not copied) can re-style a tile on a theme flip or
+//! a layer toggle without touching the bytes again.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use egui::{
     Color32, Mesh, Rect, Shape, Stroke,
@@ -136,9 +145,235 @@ impl ShapeOrText {
     }
 }
 
-/// Render MVT data into a list of [`epaint::Shape`]s.
+/// The zoom- and style-independent decode of one MVT tile: every source
+/// layer's features, geometry in extent units, property bags as they arrive
+/// from `mvt-reader`.
+///
+/// This is the value worth caching. [`styled`] evaluates any [`Style`] at any
+/// zoom over it without re-reading the bytes, and the per-feature property
+/// bags are `Arc`-shared into every [`Context`] built over them, so styling a
+/// parsed tile allocates contexts and shapes but never a second copy of the
+/// decode.
+pub struct ParsedTile {
+    layers: Vec<ParsedLayer>,
+}
+
+struct ParsedLayer {
+    name: String,
+    /// Whether the layer's extent is [`ONLY_SUPPORTED_EXTENT`]. A layer at any
+    /// other extent decodes no features and is skipped by [`styled`], which is
+    /// what the reader-backed path did: `find_layer` refused it and the
+    /// caller's `if let Ok` fell through to the same trace as a missing layer.
+    extent_supported: bool,
+    features: Vec<ParsedFeature>,
+}
+
+struct ParsedFeature {
+    geometry: Geometry<f32>,
+    /// Shared, not owned: one bag is read by every style layer that visits the
+    /// source layer, across every styling of this tile.
+    properties: Arc<HashMap<String, Value>>,
+}
+
+impl ParsedTile {
+    /// The heap this tile holds, counted at **capacity**, because capacity is
+    /// what is resident while the tile is cached.
+    ///
+    /// Exact on the `Vec`, `String` and geometry terms. The `HashMap` term is
+    /// an estimate from below: hashbrown keeps one `(K, V)` slot and one
+    /// control byte per bucket, and this counts `capacity()` of each — the
+    /// usable seven-eighths of the buckets — because the bucket count itself
+    /// is not observable. Consumers sizing a cache against this should treat
+    /// it the way `MEASURED_VECTOR_TILE_BYTES`' derivation treats its figure:
+    /// re-measure by forcing the deriving test to fail, never infer.
+    pub fn heap_bytes(&self) -> usize {
+        self.layers.capacity() * std::mem::size_of::<ParsedLayer>()
+            + self
+                .layers
+                .iter()
+                .map(|layer| {
+                    layer.name.capacity()
+                        + layer.features.capacity() * std::mem::size_of::<ParsedFeature>()
+                        + layer
+                            .features
+                            .iter()
+                            .map(|feature| {
+                                geometry_heap_bytes(&feature.geometry)
+                                    // The Arc allocation: two refcounts and the
+                                    // map header itself.
+                                    + 2 * std::mem::size_of::<usize>()
+                                    + std::mem::size_of::<HashMap<String, Value>>()
+                                    + properties_heap_bytes(&feature.properties)
+                            })
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
+    }
+}
+
+/// The heap behind one property bag: the table, the key strings, and the
+/// string values — the only `mvt_reader::feature::Value` arm that owns heap.
+fn properties_heap_bytes(properties: &HashMap<String, Value>) -> usize {
+    properties.capacity() * (std::mem::size_of::<(String, Value)>() + 1)
+        + properties
+            .iter()
+            .map(|(key, value)| {
+                key.capacity()
+                    + match value {
+                        Value::String(string) => string.capacity(),
+                        _ => 0,
+                    }
+            })
+            .sum::<usize>()
+}
+
+/// The heap behind one geometry, at capacity. A `Coord<f32>` is inline; every
+/// heap byte is a `Vec` somewhere in the variant.
+fn geometry_heap_bytes(geometry: &Geometry<f32>) -> usize {
+    const COORD: usize = std::mem::size_of::<Coord<f32>>();
+
+    fn line_string(ls: &geo_types::LineString<f32>) -> usize {
+        ls.0.capacity() * COORD
+    }
+
+    fn polygon(polygon: &geo_types::Polygon<f32>) -> usize {
+        line_string(polygon.exterior())
+            + polygon
+                .interiors()
+                .iter()
+                .map(|interior| {
+                    std::mem::size_of::<geo_types::LineString<f32>>() + line_string(interior)
+                })
+                .sum::<usize>()
+    }
+
+    match geometry {
+        Geometry::Point(_) | Geometry::Line(_) | Geometry::Rect(_) | Geometry::Triangle(_) => 0,
+        Geometry::MultiPoint(points) => points.0.capacity() * COORD,
+        Geometry::LineString(ls) => line_string(ls),
+        Geometry::MultiLineString(mls) => {
+            mls.0.capacity() * std::mem::size_of::<geo_types::LineString<f32>>()
+                + mls.0.iter().map(line_string).sum::<usize>()
+        }
+        Geometry::Polygon(p) => polygon(p),
+        Geometry::MultiPolygon(mp) => {
+            mp.0.capacity() * std::mem::size_of::<geo_types::Polygon<f32>>()
+                + mp.0.iter().map(polygon).sum::<usize>()
+        }
+        Geometry::GeometryCollection(gc) => {
+            gc.0.capacity() * std::mem::size_of::<Geometry<f32>>()
+                + gc.0.iter().map(geometry_heap_bytes).sum::<usize>()
+        }
+    }
+}
+
+/// Give back the decode's slack, ring by ring.
+///
+/// `mvt-reader` grows every ring's coordinate vector with
+/// `Vec::with_capacity(geometry_data.len())` — the **whole feature's**
+/// command-integer count, re-allocated at full size for every ring
+/// (`mvt-reader-2.4.0/src/lib.rs:361,379,414`). Measured on the committed
+/// Monaco fixture's z14 city-core tile, 2026-08-29: 28,128,896 bytes of
+/// geometry capacity where the shrunk content is 1,113,224 — a 25× slack. A
+/// parsed tile is cached, not transient, so one shrink pass per feature is
+/// the same trade [`tessellate_polygon`] makes for the same reason.
+///
+/// The `interiors` and `MultiLineString` outer vectors grow by ordinary
+/// doubling (at most 2×) and `interiors_mut` exposes only a slice, so the
+/// rings' coordinate vectors — where the measured slack lives — are what is
+/// shrunk.
+fn shrink_geometry(geometry: &mut Geometry<f32>) {
+    fn shrink_ls(ls: &mut geo_types::LineString<f32>) {
+        ls.0.shrink_to_fit();
+    }
+    fn shrink_poly(polygon: &mut geo_types::Polygon<f32>) {
+        polygon.exterior_mut(|exterior| exterior.0.shrink_to_fit());
+        polygon.interiors_mut(|interiors| {
+            for interior in interiors {
+                shrink_ls(interior);
+            }
+        });
+    }
+    match geometry {
+        Geometry::Point(_) | Geometry::Line(_) | Geometry::Rect(_) | Geometry::Triangle(_) => {}
+        Geometry::MultiPoint(points) => points.0.shrink_to_fit(),
+        Geometry::LineString(ls) => shrink_ls(ls),
+        Geometry::MultiLineString(mls) => {
+            mls.0.shrink_to_fit();
+            for ls in &mut mls.0 {
+                shrink_ls(ls);
+            }
+        }
+        Geometry::Polygon(polygon) => shrink_poly(polygon),
+        Geometry::MultiPolygon(mp) => {
+            mp.0.shrink_to_fit();
+            for polygon in &mut mp.0 {
+                shrink_poly(polygon);
+            }
+        }
+        Geometry::GeometryCollection(gc) => {
+            gc.0.shrink_to_fit();
+            for geometry in &mut gc.0 {
+                shrink_geometry(geometry);
+            }
+        }
+    }
+}
+
+/// Decode MVT bytes into a [`ParsedTile`].
+///
+/// Every layer the tile carries is decoded, whether or not any style will
+/// visit it — the parse cannot know the styles it will serve. The one
+/// behavioural consequence against the fused path: a layer whose features will
+/// not decode fails the whole parse even if no style layer names it, where
+/// `render` only reached it on a style's request. A tile like that is a broken
+/// tile; failing it loudly is the honest arm.
+pub fn parse(data: &[u8]) -> Result<ParsedTile, Error> {
+    let reader = Reader::new(data.to_vec())?;
+    let metadata = reader.get_layer_metadata()?;
+
+    let mut layers = Vec::with_capacity(metadata.len());
+    for layer in metadata {
+        let extent_supported = layer.extent == ONLY_SUPPORTED_EXTENT;
+        let features = if extent_supported {
+            reader
+                .get_features(layer.layer_index)?
+                .into_iter()
+                .map(|mut feature| {
+                    shrink_geometry(&mut feature.geometry);
+                    ParsedFeature {
+                        geometry: feature.geometry,
+                        properties: Arc::new(feature.properties.unwrap_or_default()),
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        layers.push(ParsedLayer {
+            name: layer.name,
+            extent_supported,
+            features,
+        });
+    }
+
+    Ok(ParsedTile { layers })
+}
+
+/// Render MVT data into a list of [`epaint::Shape`]s: [`parse`] then
+/// [`styled`], for a caller with nothing to keep between them.
 pub fn render(data: &[u8], style: &Style, zoom: u8) -> Result<Vec<ShapeOrText>, Error> {
-    let data = mvt_reader::Reader::new(data.to_vec())?;
+    Ok(styled(&parse(data)?, style, zoom))
+}
+
+/// Evaluate `style` at `zoom` over a parsed tile.
+///
+/// The style half of [`render`]: filter evaluation, paint and layout
+/// expressions, and tessellation. Infallible where `render` is not, because
+/// everything that can fail — the byte decode — happened in [`parse`];
+/// a polygon the tessellator rejects is logged and skipped, exactly as the
+/// fused path logged and skipped it.
+pub fn styled(tile: &ParsedTile, style: &Style, zoom: u8) -> Vec<ShapeOrText> {
     let mut shapes = Vec::new();
 
     for layer in &style.layers {
@@ -163,10 +398,9 @@ pub fn render(data: &[u8], style: &Style, zoom: u8) -> Result<Vec<ShapeOrText>, 
                 filter,
                 paint,
             } => {
-                for (geometry, context) in
-                    get_layer_features(&data, zoom, source_layer, filter.as_ref())?
+                for (geometry, context) in layer_features(tile, zoom, source_layer, filter.as_ref())
                 {
-                    if let Err(err) = render_polygon(&geometry, &context, &mut shapes, paint) {
+                    if let Err(err) = render_polygon(geometry, &context, &mut shapes, paint) {
                         warn!("{err}");
                     }
                 }
@@ -176,10 +410,9 @@ pub fn render(data: &[u8], style: &Style, zoom: u8) -> Result<Vec<ShapeOrText>, 
                 filter,
                 paint,
             } => {
-                for (geometry, context) in
-                    get_layer_features(&data, zoom, source_layer, filter.as_ref())?
+                for (geometry, context) in layer_features(tile, zoom, source_layer, filter.as_ref())
                 {
-                    if let Err(err) = render_line(&geometry, &context, &mut shapes, paint) {
+                    if let Err(err) = render_line(geometry, &context, &mut shapes, paint) {
                         warn!("{err}");
                     }
                 }
@@ -190,10 +423,9 @@ pub fn render(data: &[u8], style: &Style, zoom: u8) -> Result<Vec<ShapeOrText>, 
                 layout,
                 paint,
             } => {
-                for (geometry, context) in
-                    get_layer_features(&data, zoom, source_layer, filter.as_ref())?
+                for (geometry, context) in layer_features(tile, zoom, source_layer, filter.as_ref())
                 {
-                    if let Err(err) = render_symbol(&geometry, &context, &mut shapes, layout, paint)
+                    if let Err(err) = render_symbol(geometry, &context, &mut shapes, layout, paint)
                     {
                         warn!("{err}");
                     }
@@ -209,7 +441,7 @@ pub fn render(data: &[u8], style: &Style, zoom: u8) -> Result<Vec<ShapeOrText>, 
     let shapes = coalesce_adjacent_meshes(shapes);
 
     log::trace!("Rendered {} shapes", shapes.len());
-    Ok(shapes)
+    shapes
 }
 
 /// Fold each run of neighbouring [`Shape::Mesh`]es into one mesh.
@@ -280,57 +512,60 @@ pub fn transformed(shapes: &[ShapeOrText], rect: egui::Rect) -> Vec<ShapeOrText>
     shapes.iter().map(|shape| shape.placed(transform)).collect()
 }
 
-fn get_layer_features(
-    reader: &Reader,
+fn layer_features<'a>(
+    tile: &'a ParsedTile,
     zoom: u8,
     name: &str,
-    filter: Option<&Filter>,
-) -> Result<impl Iterator<Item = (Geometry<f32>, Context)>, Error> {
-    let features = if let Ok(layer_index) = find_layer(reader, name) {
-        reader.get_features(layer_index)?
-    } else {
-        // **`trace!`, not `warn!`, because a tile without a source layer is
-        // ordinary data.** A style names 94 source layers and no tile carries
-        // all of them -- open country has no `building`, most tiles have no
-        // `poi` -- so at `warn` this fired once per style layer per tile,
-        // constantly, for nothing the reader could act on. Measured over a
-        // 45-tile Oklahoma viewport at zooms 6/7/8: 903 warn lines, **every
-        // single warn line the renderer emitted**, `transportation` alone 245.
-        //
-        // The case that really is broken -- a style naming a source layer no
-        // tile anywhere carries -- is caught before it ships, by
-        // `squallar-egui/tests/committed_styles_parse.rs`'s check that every
-        // `source-layer` is one of the sixteen OpenMapTiles names. That test
-        // fails the build; this line could only ever have whispered about it
-        // underneath thousands of false ones.
-        //
-        // Kept rather than deleted because it is genuinely the answer to "why
-        // is this one layer not drawing on this one tile", which is a real
-        // question with no other instrument. At `trace` it costs nothing until
-        // somebody asks.
-        trace!("Source layer '{name}' not found. Skipping.");
-        Vec::new()
-    }
-    .into_iter()
-    .filter_map(move |feature| {
-        // The property bag is *moved* into the context, not rebuilt in it.
+    filter: Option<&'a Filter>,
+) -> impl Iterator<Item = (&'a Geometry<f32>, Context)> + 'a {
+    let features = match tile.layers.iter().find(|layer| layer.name == name) {
+        Some(layer) if layer.extent_supported => layer.features.as_slice(),
+        _ => {
+            // **`trace!`, not `warn!`, because a tile without a source layer is
+            // ordinary data.** A style names 94 source layers and no tile carries
+            // all of them -- open country has no `building`, most tiles have no
+            // `poi` -- so at `warn` this fired once per style layer per tile,
+            // constantly, for nothing the reader could act on. Measured over a
+            // 45-tile Oklahoma viewport at zooms 6/7/8: 903 warn lines, **every
+            // single warn line the renderer emitted**, `transportation` alone 245.
+            //
+            // The case that really is broken -- a style naming a source layer no
+            // tile anywhere carries -- is caught before it ships, by
+            // `squallar-egui/tests/committed_styles_parse.rs`'s check that every
+            // `source-layer` is one of the sixteen OpenMapTiles names. That test
+            // fails the build; this line could only ever have whispered about it
+            // underneath thousands of false ones.
+            //
+            // Kept rather than deleted because it is genuinely the answer to "why
+            // is this one layer not drawing on this one tile", which is a real
+            // question with no other instrument. At `trace` it costs nothing until
+            // somebody asks.
+            //
+            // An unsupported extent lands here too, exactly as it did when
+            // `find_layer` refused it into the same fallback.
+            trace!("Source layer '{name}' not found. Skipping.");
+            &[]
+        }
+    };
+
+    features.iter().filter_map(move |feature| {
+        // The property bag is *shared* into the context, not rebuilt in it.
         // Converting it to JSON up front cost a `HashMap` allocation and a
         // `String` clone per string-valued property for every feature the
         // source layer holds -- including the ones the filter is about to
         // reject, which read no property at all. `Properties::Mvt` converts a
-        // value when a lookup asks for it instead.
+        // value when a lookup asks for it instead, and the `Arc` is what lets
+        // one parse serve every styling without copying a bag.
         let context = Context::with_properties(
             geometry_type_to_str(&feature.geometry).to_string(),
-            Properties::Mvt(feature.properties.unwrap_or_default()),
+            Properties::Mvt(Arc::clone(&feature.properties)),
             zoom,
         );
 
         filter
             .is_none_or(|filter| filter.matches(&context))
-            .then_some((feature.geometry, context))
-    });
-
-    Ok(features)
+            .then_some((&feature.geometry, context))
+    })
 }
 
 pub(crate) fn mvt_value_to_json_value(value: &Value) -> JsonValue {
@@ -690,26 +925,6 @@ fn upright_angle(delta: egui::Vec2) -> f32 {
 
 fn length(line: &Line<f32>) -> f32 {
     (line.dx() * line.dx() + line.dy() * line.dy()).sqrt()
-}
-
-fn find_layer(data: &Reader, name: &str) -> Result<usize, Error> {
-    let layer = data
-        .get_layer_metadata()?
-        .into_iter()
-        .find(|layer| layer.name == name);
-
-    let Some(layer) = layer else {
-        return Err(Error::LayerNotFound(
-            name.to_string(),
-            data.get_layer_names()?,
-        ));
-    };
-
-    if layer.extent != ONLY_SUPPORTED_EXTENT {
-        return Err(Error::UnsupportedLayerExtent(name.to_string()));
-    }
-
-    Ok(layer.layer_index)
 }
 
 /// Egui cannot tessellate complex polygons, so we use lyon for that.
@@ -1280,6 +1495,68 @@ mod tests {
         render(&fixture(), &style, ZOOM)
             .expect("fixture tile renders")
             .len()
+    }
+
+    /// **One parse serves every styling, and each styling equals the fused
+    /// path exactly.**
+    ///
+    /// The split this pins: [`parse`] is the zoom- and style-independent
+    /// half, [`styled`] the style half, and a consumer caching the
+    /// `ParsedTile` re-styles without re-decoding. Equality is against
+    /// [`render`]'s own output *per style*, compared as `Debug` (exact for
+    /// `f32`, as [`GOLDEN`] argues), and the two styles' outputs must differ
+    /// from each other or the sharing was never exercised on anything a style
+    /// could disagree about.
+    #[test]
+    fn one_parse_styled_under_two_styles_matches_the_fused_path_for_both() {
+        let bytes = fixture();
+        let parsed = parse(&bytes).expect("the fixture parses");
+
+        let full = Style::from_json(STYLE).expect("fixture style parses");
+        let lines_only = Style::from_json(&roads_line_style(r#"["==", "kind", "primary"]"#))
+            .expect("style parses");
+
+        let from_parse_full = format!("{:?}", styled(&parsed, &full, ZOOM));
+        let from_parse_lines = format!("{:?}", styled(&parsed, &lines_only, ZOOM));
+
+        assert_eq!(
+            from_parse_full,
+            format!("{:?}", render(&bytes, &full, ZOOM).expect("renders")),
+            "styling a cached parse diverged from parse-and-style in one pass"
+        );
+        assert_eq!(
+            from_parse_lines,
+            format!("{:?}", render(&bytes, &lines_only, ZOOM).expect("renders")),
+            "the second styling of the same parse diverged from the fused path"
+        );
+        assert_ne!(
+            from_parse_full, from_parse_lines,
+            "non-vacuity: the two styles must render differently, or the \
+             equalities above would hold for a styling that ignored the style"
+        );
+    }
+
+    /// The parsed representation is measurable, and the measure follows the
+    /// content — the property a consumer sizes its cache with.
+    #[test]
+    fn a_parsed_tiles_heap_grows_with_its_content() {
+        let empty = parse(&encode_tile(&[])).expect("an empty tile parses");
+        let full = parse(&fixture()).expect("the fixture parses");
+
+        assert!(
+            full.heap_bytes() > empty.heap_bytes(),
+            "the fixture's parse ({} B) must out-weigh an empty tile's ({} B)",
+            full.heap_bytes(),
+            empty.heap_bytes()
+        );
+        // The floor: seven features across three layers carry geometry and
+        // property strings; a heap count that misses them would sit near zero.
+        assert!(
+            full.heap_bytes() > 500,
+            "the fixture's parse measured only {} B, so the count is not \
+             reaching the geometry and property heap",
+            full.heap_bytes()
+        );
     }
 
     /// The two-resolver split, pinned through `render` rather than through
