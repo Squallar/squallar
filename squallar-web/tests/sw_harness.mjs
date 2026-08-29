@@ -29,16 +29,15 @@
  *
  *   * `Cache.addAll` is all-or-nothing and rejects on any non-2xx, writing
  *     nothing. The shell's atomicity claim rests entirely on this.
- *   * `Cache.keys()` yields insertion order, which is what `trimTiles` calls
- *     FIFO eviction.
+ *   * `Cache.keys()` yields insertion order.
  *   * `Cache.match(request, {ignoreSearch})` strips the query string.
  *   * `caches.open` creates on demand; `caches.keys()` lists what exists.
  *   * A `FetchEvent` is answered by `respondWith` or not at all, and the
  *     difference is observable — `handled` below is how a test proves the
  *     worker stayed out of the request path.
  *   * The worker can be torn down and restarted with its caches intact, which
- *     is what makes module-level state (`tilePutsSinceTrim`, the memoised
- *     shell cache) testable rather than theoretical.
+ *     is what makes module-level state (the memoised shell cache, the client
+ *     pins) testable rather than theoretical.
  *
  * Not modelled, deliberately:
  *

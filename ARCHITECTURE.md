@@ -322,8 +322,11 @@ That is a different question from this one.
 * **Owner**: `squallar-egui/src/tile_source.rs`. A blanket-implemented marker
   splitting the `Send + Sync` host bound from the single-threaded wasm one, so
   the same tile machinery compiles on both.
-* CartoDB no-labels base plus a labels-only overlay drawn *above* radar and
-  overlays, so text is not obscured.
+* The base map is the self-hosted PMTiles vector archive
+  (`squallar_egui::tiles::BASEMAP_ARCHIVE_URL`), rasterised client-side against
+  the committed styles; labels come out of the same tile as the ground. There
+  is no raster tile provider — an unreachable archive draws nothing and says so
+  in the credit corner.
 
 ---
 

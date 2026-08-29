@@ -523,13 +523,20 @@ impl super::Gui {
                 // any layer above `Order::Background`, so the link becomes
                 // click-safe without pushing a rect into `excluded_rects`.
                 // **The credit is the drawn source's own**, read off
-                // `Tiles::attribution` rather than a second const beside it.
-                // Which basemap a build fetches from is a `cfg` and a feature,
-                // and a hardcoded string here is how the painted credit comes
-                // to name a provider the client never contacts.
+                // `Tiles::attribution` rather than a second const beside it —
+                // a hardcoded string here is how the painted credit comes to
+                // name a provider the client never contacts. A frame with no
+                // base source falls back to the archive's credit, or — when
+                // the archive has been found unreachable this session — to the
+                // line that says so: the honest degraded state has to be on
+                // the glass, not only in the log.
                 let credit = tiles_owned.as_ref().map_or(
                     walkers::sources::Attribution {
-                        text: crate::tiles::ATTRIBUTION_TEXT,
+                        text: if self.map_tiles.base_archive_is_unreachable() {
+                            crate::tiles::UNREACHABLE_ATTRIBUTION_TEXT
+                        } else {
+                            crate::tiles::ARCHIVE_ATTRIBUTION_TEXT
+                        },
                         url: crate::tiles::ATTRIBUTION_URL,
                         logo_light: None,
                         logo_dark: None,

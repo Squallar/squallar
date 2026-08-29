@@ -129,10 +129,11 @@
         <domain includeSubdomains="true">s3.amazonaws.com</domain>
     </domain-config>
 
-    <!-- Basemap and label tiles (walkers to CartoDB via Fastly), plus the
-         attribution link the map footer opens. -->
+    <!-- The self-hosted PMTiles archives: the vector basemap and the terrain
+         hillshade (squallar_egui::tiles::{BASEMAP,TERRAIN}_ARCHIVE_URL), plus
+         the attribution link the map footer opens. -->
     <domain-config cleartextTrafficPermitted="false">
-        <domain includeSubdomains="true">global.ssl.fastly.net</domain>
+        <domain includeSubdomains="true">tiles.squallar.app</domain>
         <domain includeSubdomains="true">openstreetmap.org</domain>
     </domain-config>
 </network-security-config>

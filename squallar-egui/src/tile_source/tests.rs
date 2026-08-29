@@ -16,7 +16,6 @@ use super::{
     WASM_TILE_DECODES_PER_PUMP, drain_up_to, interpolate_from_lower_zoom, tile_client,
     tile_id_is_valid,
 };
-use crate::tiles::CartoDb;
 
 // ---------------------------------------------------------------------------
 
@@ -297,8 +296,6 @@ impl TileSource for LoopbackSource {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
-/// The live CDN gets longer than loopback does.
-const LIVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long "and it stays that way" observations watch for.
 const SETTLE: Duration = Duration::from_millis(300);
 
@@ -400,66 +397,19 @@ fn uploaded_pixels(ctx: &Context, texture: &egui::TextureHandle) -> egui::ColorI
 
 // ---------------------------------------------------------------------------
 
-/// The URL scheme is the contract with the provider; a typo here is a map that
-/// silently shows nothing.
-#[test]
-fn cartodb_urls_match_the_published_tile_scheme() {
-    // x % 4 == 1, so the subdomain is `b`.
-    let tile_id = TileId {
-        x: 5,
-        y: 12,
-        zoom: 4,
-    };
-
-    assert_eq!(
-        CartoDb::light().tile_url(tile_id),
-        "https://cartodb-basemaps-b.global.ssl.fastly.net/light_nolabels/4/5/12.png"
-    );
-    assert_eq!(
-        CartoDb::dark().tile_url(tile_id),
-        "https://cartodb-basemaps-b.global.ssl.fastly.net/dark_nolabels/4/5/12.png"
-    );
-}
-
-/// Requests are spread over the provider's four subdomains, cycling on `x`.
-#[test]
-fn cartodb_spreads_tiles_over_all_four_subdomains() {
-    let hosts: Vec<String> = (0..8)
-        .map(|x| {
-            let url = CartoDb::light().tile_url(TileId { x, y: 0, zoom: 3 });
-            url.split('/')
-                .nth(2)
-                .expect("the URL should have a host")
-                .to_owned()
-        })
-        .collect();
-
-    let expected: Vec<String> = ["a", "b", "c", "d", "a", "b", "c", "d"]
-        .iter()
-        .map(|s| format!("cartodb-basemaps-{s}.global.ssl.fastly.net"))
-        .collect();
-
-    assert_eq!(hosts, expected);
-}
-
-/// Attribution is a licensing obligation, not decoration.
-#[test]
-fn cartodb_attribution_names_openstreetmap_and_cartodb() {
-    for source in [CartoDb::light(), CartoDb::dark()] {
-        let attribution = source.attribution();
-        assert_eq!(attribution.text, "\u{a9} OpenStreetMap \u{a9} CartoDB");
-        assert_eq!(attribution.url, "https://www.openstreetmap.org/copyright");
-    }
-}
-
 /// The attribution the map displays is the source's, not a placeholder.
 #[test]
 fn attribution_reaches_the_tiles_trait() {
-    let tiles = HttpsTiles::new(CartoDb::dark(), Context::default());
+    let server = TileServer::start(Behaviour::Hang);
+    let tiles = HttpsTiles::with_client(
+        LoopbackSource::new(&server.base_url),
+        Context::default(),
+        loopback_client(),
+    );
 
     let attribution = Tiles::attribution(&tiles);
-    assert_eq!(attribution.text, "\u{a9} OpenStreetMap \u{a9} CartoDB");
-    assert_eq!(attribution.url, "https://www.openstreetmap.org/copyright");
+    assert_eq!(attribution.text, "loopback");
+    assert_eq!(attribution.url, "http://127.0.0.1/");
 }
 
 // ---------------------------------------------------------------------------
@@ -838,11 +788,15 @@ fn tile_size_comes_from_the_source() {
     );
     assert_eq!(Tiles::tile_size(&unusual), 512);
 
-    let cartodb = HttpsTiles::new(CartoDb::light(), ctx);
+    let ordinary = HttpsTiles::with_client(
+        LoopbackSource::new(&server.base_url),
+        ctx,
+        loopback_client(),
+    );
     assert_eq!(
-        Tiles::tile_size(&cartodb),
+        Tiles::tile_size(&ordinary),
         256,
-        "CartoDB serves 256px tiles"
+        "the slippy-map default is 256px tiles"
     );
 }
 
@@ -1003,8 +957,8 @@ fn the_tuning_constants_are_the_written_figures_on_every_tier() {
 
     // The wasm arm holds vector entries as of `feat(web): the vector basemap
     // draws on wasm32`, so it is in the loop above rather than exempt from it.
-    // Its raster derivation is still pinned, because a build without
-    // `basemap-vector` is still a build the arm has to be right for.
+    // Its raster derivation is still pinned, because the terrain slot holds
+    // raster entries and the arm has to be right for it too.
     assert_eq!(
         WASM_TILE_CACHE_ENTRIES.get() * super::RASTER_TILE_BYTES,
         24 * 1024 * 1024,
@@ -1039,7 +993,6 @@ fn the_tuning_constants_are_the_written_figures_on_every_tier() {
 /// **Skips rather than reddens without the fixture**, like every other test
 /// here that reads it. What it cannot do is pass vacuously: a rendered tile
 /// that is trivially small would fail the floor below.
-#[cfg(feature = "basemap-vector")]
 #[test]
 fn the_vector_entry_cost_is_what_the_fixture_actually_renders() {
     use std::path::PathBuf;
@@ -1389,75 +1342,19 @@ async fn the_tile_client_accepts_https() {
 
 // ---------------------------------------------------------------------------
 
-/// End-to-end against the real CDN over real TLS.
-#[ignore = "hits the live CartoDB basemap CDN over HTTPS"]
-#[test]
-fn live_cartodb_tile_decodes_and_reaches_a_texture() {
-    let ctx = Context::default();
-    let mut tiles = HttpsTiles::new(CartoDb::light(), ctx.clone());
-
-    // Pins down *which* provider carried the handshake. aws-lc-rs is still in the
-    // graph via nexrad-data, so without this the test would pass just as happily
-    // on the fallback provider.
-    assert!(
-        squallar_radar::tls::default_is_ring(),
-        "the handshake would not be carried by ring"
-    );
-
-    let tile_id = TileId {
-        x: 0,
-        y: 0,
-        zoom: 0,
-    };
-    println!("fetching {}", CartoDb::light().tile_url(tile_id));
-
-    let piece = pump_until(LIVE_TIMEOUT, || draw_one(&mut tiles, tile_id))
-        .expect("the world tile should download from CartoDB");
-
-    let Tile::Raster(texture) = piece.tile else {
-        panic!("the tile source fetches PNGs; it never produces a vector tile");
-    };
-    assert_eq!(
-        texture.size(),
-        [256, 256],
-        "CartoDB serves 256px tiles; got {:?}",
-        texture.size()
-    );
-
-    let image = uploaded_pixels(&ctx, &texture);
-    println!("decoded {:?} pixels", image.size);
-    assert!(
-        image.pixels.iter().any(|pixel| *pixel != image.pixels[0]),
-        "the decoded tile is a single flat colour, which is not a basemap"
-    );
-}
 // ---------------------------------------------------------------------------
 // The archive source
 //
-// COVERAGE: these are behind `basemap-vector`, and **`cargo test --workspace`
-// now selects them**, which it did not before the web draw seam landed. The
-// feature is still off by default; what changed is that `squallar-web` asks for
-// it, and `squallar-web` is a workspace member, so a workspace build unifies the
-// feature onto `squallar-egui`. Measured 2026-08-28,
-// `cargo test --workspace -- --list | grep -c "archive::"` over this crate's
-// two gated modules: 16, where it selected 0 before.
-//
-// That is a second, wider source of coverage, not a replacement for the first.
-// The native `basemap-vector` row in `.github/workflows/build.yaml` still names
-// `-p squallar-egui` and still runs them, and it is the one that survives
-// `squallar-web` ever dropping the feature. Anything added here that lives in
-// another crate needs that row's `-p` scope to grow in the same commit.
-//
-// The seam these exercise -- `Tile::Vector` reaching the painter -- is also
-// covered un-gated, in `ui_map_overlays::tests`, because `walkers/mvt` is on
-// unconditionally. What is gated is only the half that needs an archive.
+// Unconditional since the flip: the archive is THE basemap, so these run in
+// every `cargo test -p squallar-egui` and every workspace suite. The seam
+// they exercise -- `Tile::Vector` reaching the painter -- is also covered
+// from the other side in `ui_map_overlays::tests`, without an archive.
 // ---------------------------------------------------------------------------
 
 /// The committed fixture, 419,355 bytes of Monaco.
 ///
 /// A test that reaches the network is not a test. The published planet archive
 /// is 83.88 GB and lives behind a CDN; this is 419 KB and lives in the tree.
-#[cfg(feature = "basemap-vector")]
 mod archive {
     use std::num::NonZeroUsize;
     use std::path::PathBuf;
@@ -1788,7 +1685,6 @@ mod archive {
 /// decides how a body becomes a [`Tile`]. Two committed fixtures carry the
 /// two real archives' shapes — Monaco (`tile_type = 1`, MVT) and the
 /// single-tile terrain wrap (`tile_type = 4`, the real Kansas WebP inside).
-#[cfg(feature = "basemap-vector")]
 mod archive_decode {
     use std::path::PathBuf;
 

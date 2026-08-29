@@ -76,7 +76,6 @@ mod tests {
     use super::*;
     use squallar_source::origins::DataSources;
     use std::collections::BTreeSet;
-    use walkers::sources::TileSource;
 
     fn config_xml() -> String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(CONFIG_PATH);
@@ -105,20 +104,15 @@ mod tests {
             hosts.insert(host_of(&url));
         }
 
-        // Tiles are this walker's own addition: they are not data origins, and
-        // `sw.js` handles them by regex and caches them on purpose.
+        // The basemap and terrain archives are this walker's own addition:
+        // they are not data origins, and `sw.js` routes them "network" by its
+        // own explicit rule. Read from the client's consts, so a regenerated
+        // archive that moves hosts fails here rather than in the field.
+        hosts.insert(host_of(squallar_egui::tiles::BASEMAP_ARCHIVE_URL));
+        hosts.insert(host_of(squallar_egui::tiles::TERRAIN_ARCHIVE_URL));
 
-        // `tile_url` picks a subdomain from `x % 4`, so walk all four.
-        for style in [
-            squallar_egui::tiles::CartoDb::light(),
-            squallar_egui::tiles::CartoDb::dark(),
-        ] {
-            for x in 0..4u32 {
-                let id = walkers::TileId { x, y: 0, zoom: 4 };
-                hosts.insert(host_of(&style.tile_url(id)));
-            }
-            hosts.insert(host_of(style.attribution().url));
-        }
+        // The attribution link the map footer opens.
+        hosts.insert(host_of(squallar_egui::tiles::ATTRIBUTION_URL));
 
         hosts
     }

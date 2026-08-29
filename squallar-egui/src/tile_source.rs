@@ -252,10 +252,6 @@ pub const TERRAIN_TILE_CACHE_ENTRIES: NonZeroUsize = TILE_CACHE_ENTRIES;
 /// sniffed rather than reported. The header names what the archive holds;
 /// [`decode_archive_tile`] obeys it.
 ///
-/// Compiled where a caller exists: the wasm32 pump and the archive
-/// feature's IO task; the tests that drive it are behind the same feature
-/// (the [`DecodeBudget`] gating precedent).
-#[cfg(any(target_arch = "wasm32", feature = "basemap-vector"))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ArchiveTileKind {
     /// `tile_type = 1` (MVT): tessellated against the committed style via
@@ -282,9 +278,6 @@ pub(crate) enum ArchiveTileKind {
 /// Costs where it runs: on native this is called on the IO runtime's blocking
 /// pool ([`read_one`]), on wasm32 under the frame pump's
 /// [`WASM_TILE_DECODES_PER_PUMP`] budget — never freely on the frame thread.
-///
-/// Compiled where a caller exists, like [`ArchiveTileKind`].
-#[cfg(any(target_arch = "wasm32", feature = "basemap-vector"))]
 pub(crate) fn decode_archive_tile(
     bytes: &[u8],
     kind: ArchiveTileKind,
@@ -747,24 +740,6 @@ impl HttpsTiles {
         Self::with_client(source, egui_ctx, tile_client())
     }
 
-    /// [`Self::new`], crediting `attribution` rather than what `source` claims.
-    ///
-    /// One caller: `tiles::MapTileState::ensure_base_tiles`, falling back to the
-    /// rasters after the vector archive reported itself unusable. The provider
-    /// is the same and its credit is still owed, but the panel's corner is the
-    /// only place a user is told which basemap they are looking at, so a
-    /// fallback that credited CartoDB *plainly* would be indistinguishable from
-    /// a build configured for CartoDB on purpose.
-    pub fn with_attribution<S: AsyncTileSource>(
-        source: S,
-        egui_ctx: Context,
-        attribution: Attribution,
-    ) -> Self {
-        let mut tiles = Self::with_client(source, egui_ctx, tile_client());
-        tiles.attribution = attribution;
-        tiles
-    }
-
     /// [`Self::new`], with the HTTP client supplied. Crate-private, for the
     /// tests, which need to talk cleartext to a loopback server — [`tile_client`]
     /// refuses `http://` by design.
@@ -1061,14 +1036,16 @@ impl HttpsTiles {
 
     /// Put `tile` in the cache under `tile_id`, as an arrived fetch would.
     ///
-    /// Test-only, and the reason it exists is coverage rather than convenience:
-    /// the vector draw seam has to be reachable from a test that runs in a
-    /// **default** `cargo test --workspace`. `walkers/mvt` is on
-    /// unconditionally, so `Tile::Vector` exists on every build, but the only
-    /// thing that *produces* one is the archive, and the archive is behind
-    /// `basemap-vector`. Without this the seam's dispatch would be tested only
-    /// by a CI row that has to be remembered.
-    #[cfg(all(test, not(target_arch = "wasm32")))]
+    /// Test-only, and the reason it exists is isolation rather than
+    /// convenience: the seam's dispatch — `Tile::Vector` reaching the painter
+    /// — stays testable without an archive open or an IO task running.
+    ///
+    /// `cfg(test)` alone, NOT the `all(test, not(wasm32))` its neighbours
+    /// carry: its caller (`ui_map_overlays`' seam tests) compiles on the
+    /// wasm32 test target too, and the body is portable. The narrower gate
+    /// was an E0599 on `cargo check -p squallar-egui --all-targets --target
+    /// wasm32-unknown-unknown`, found when the flip made that a default row.
+    #[cfg(test)]
     pub(crate) fn put_for_test(&mut self, tile_id: TileId, tile: Tile) {
         self.cache.put(tile_id, Some(tile));
     }
@@ -1245,7 +1222,6 @@ async fn fetch_continuously<S: TileSource>(
 /// LRU, the same de-duplication, the same interpolation from a shallower
 /// ancestor, the same [`HttpsTiles::pump`] contract. Only where the bytes come
 /// from, and what they decode into, differ.
-#[cfg(feature = "basemap-vector")]
 impl HttpsTiles {
     /// Serve tiles from the PMTiles archive at `url`, rendered against `style`.
     ///
@@ -1404,14 +1380,12 @@ impl HttpsTiles {
 /// is read — created by [`HttpsTiles::from_range_source`], written exactly
 /// once by [`serve_archive_continuously`] at open. One parameter rather than
 /// three, because they travel together and mean the same moment.
-#[cfg(feature = "basemap-vector")]
 struct ArchiveHeaderSlots {
     max_zoom: Arc<AtomicU8>,
     fault: Arc<OnceLock<String>>,
     kind: Arc<OnceLock<ArchiveTileKind>>,
 }
 
-#[cfg(feature = "basemap-vector")]
 impl ArchiveTileKind {
     /// The header's `tile_type`, as a decode decision. See the enum's own
     /// docs for the arms; the mapping is total so a new pmtiles `TileType`
@@ -1449,7 +1423,6 @@ impl ArchiveTileKind {
 /// reads and bounded nothing about the tessellations, so filling a fresh
 /// 54-tile viewport was ~1.34 s of CPU serialized behind itself while the
 /// fetches and the tessellations starved each other.
-#[cfg(feature = "basemap-vector")]
 async fn serve_archive_continuously<S>(
     source: S,
     style: Arc<Style>,
@@ -1586,7 +1559,6 @@ async fn serve_archive_continuously<S>(
 /// theme flip. The inline spelling had a wait of the same order for the same
 /// reason, so this is not believed to be a regression; neither figure has been
 /// measured. The wasm32 arm never reaches `spawn_blocking` at all.
-#[cfg(feature = "basemap-vector")]
 async fn read_one<S>(
     archive: &crate::basemap_archive::BasemapArchive<S>,
     #[cfg_attr(

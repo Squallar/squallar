@@ -432,7 +432,7 @@ replaced by the rows under it.
 
 | Data Source                   | Status  | Domain | CORS    | Public Access                                                                                                                  |
 | ----------------------------- | ------- | ------ | ------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| Basemap tiles (raster slippy) | ✅       | global | open    | ✅ Free — CartoDB light/dark, labels and no-labels, over OpenStreetMap data                                                     |
+| Basemap (PMTiles vector archive) | ✅    | global | open    | ✅ Self-hosted — tiles.squallar.app, OpenMapTiles schema over OpenStreetMap data, rendered client-side                          |
 | NEXRAD site list              | ✅       | US     | n/a     | ✅ Compiled in — `squallar-radar/src/sites.rs`, no network                                                                       |
 | County/state/CWA boundaries   | Partial | US     | open    | ✅ Free — NWS alert zone geometry is fetched per alert from api.weather.gov and cached for a year; no standalone boundary layer |
 | Roads / terrain / topo        | ❌       | global | open    | ✅ Free — OpenStreetMap / USGS (roads arrive as part of the basemap tiles, not as data)                                         |

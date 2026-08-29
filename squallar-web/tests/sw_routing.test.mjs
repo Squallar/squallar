@@ -61,7 +61,6 @@ const PRODUCTION_DATA_URLS = [
   "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=OKC",
 ];
 
-const TILE_URL = "https://cartodb-basemaps-a.global.ssl.fastly.net/dark_nolabels/7/29/52.png";
 
 function shellUrl(asset) {
   return new URL(asset, ORIGIN).href;
@@ -142,10 +141,6 @@ describe("routing: weather data is default-deny", () => {
       "https://www.spc.noaa.gov/outlook/day1.PNG",
       // Credentials in the URL.
       "https://user:secret@api.weather.gov/alerts/active",
-      // A basemap-shaped path on a host that only looks like CartoDB.
-      "https://cartodb-basemaps-a.global.ssl.fastly.net.evil.example/dark/7/29/52.png",
-      "https://cartodb-basemaps-e.global.ssl.fastly.net/dark/7/29/52.png",
-      "https://evil.example/cartodb-basemaps-a.global.ssl.fastly.net/7/29/52.png",
       // Schemes the Cache API would reject anyway.
       "data:image/png;base64,iVBORw0KGgo=",
       "blob:https://squallar.example/9f0b",
@@ -228,57 +223,6 @@ it is same-origin with the worker`,
         `the worker called respondWith for ${url}; it must stay out of the request path`,
       );
     }
-  });
-});
-
-// ===========================================================================
-describe("routing: the basemap tile rule is confined to CartoDB", () => {
-  // =========================================================================
-
-  it("caches CartoDB's four subdomains and nothing else", async () => {
-    const worker = await bootWorker();
-    const { routeFor } = worker.internals;
-
-    for (const sub of ["a", "b", "c", "d"]) {
-      const url = `https://cartodb-basemaps-${sub}.global.ssl.fastly.net/dark_nolabels/7/29/52.png`;
-      assert.equal(routeFor({ url }), "tile", `${url} is a basemap tile`);
-    }
-
-    // The rule must be the host, not the extension. A `.png` anywhere else is
-    // not a tile, and treating it as one puts a fetched image into a cache that
-    // is served stale for six months — which, on a weather origin, is the
-    // precise harm this worker exists to prevent.
-    for (const url of [
-      "https://api.weather.gov/radar/ktlx/reflectivity.png",
-      "https://tiles.example/dark_nolabels/7/29/52.png",
-      "https://squallar.example/squallar/screenshot.png",
-      "https://cartodb-basemaps-a.global.ssl.fastly.net.evil.example/7/29/52.png",
-      "https://cartodb-basemaps-aa.global.ssl.fastly.net/7/29/52.png",
-      "https://cartodb-basemaps-a.global.ssl.fastly.net.co/7/29/52.png",
-    ]) {
-      assert.notEqual(routeFor({ url }), "tile", `${url} must not be treated as a basemap tile`);
-    }
-  });
-
-  it("refuses a tile URL carrying credentials", async () => {
-    const worker = await bootWorker();
-    assert.equal(
-      worker.internals.routeFor({
-        url: "https://user:secret@cartodb-basemaps-a.global.ssl.fastly.net/dark/7/29/52.png",
-      }),
-      "network",
-      "a cache entry keyed by a URL containing a password must not be created",
-    );
-  });
-
-  it("treats the extension case-insensitively on a host that is genuinely CartoDB", async () => {
-    const worker = await bootWorker();
-    assert.equal(
-      worker.internals.routeFor({
-        url: "https://cartodb-basemaps-b.global.ssl.fastly.net/dark_nolabels/7/29/52.PNG",
-      }),
-      "tile",
-    );
   });
 });
 
@@ -415,10 +359,11 @@ describe("routing: the PMTiles basemap archive is never cached", () => {
       `${speculative} survived a deploy, so purgeCaches is no longer exhaustive; \
 an archive cache added without a cachesToKeep entry would look like it worked`,
     );
-    // The control: the caches that ARE named survive the same deploy, so the
-    // assertion above is about the keep set and not about the purge running.
+    // The control: a cache `cachesToKeep` DOES name survives the same deploy,
+    // so the assertion above is about the keep set and not about the purge
+    // running. The meta cache is the one such cache every boot creates.
     assert.ok(
-      (await worker.cacheNames()).includes(worker.internals.TILE_CACHE),
+      (await worker.cacheNames()).includes(worker.internals.META_CACHE),
       "the deploy purged a cache cachesToKeep names; this test is measuring the wrong thing",
     );
   });
@@ -469,7 +414,7 @@ describe("routing: the shell rule is confined to the deploy directory", () => {
     const { routeFor } = worker.internals;
     for (const method of ["POST", "PUT", "DELETE", "HEAD", "OPTIONS"]) {
       assert.equal(routeFor({ url: ORIGIN, method, mode: "navigate" }), "network");
-      assert.equal(routeFor({ url: TILE_URL, method }), "network");
+      assert.equal(routeFor({ url: shellUrl("zones.pack"), method }), "network");
       assert.equal(routeFor({ url: shellUrl("pkg/squallar_web.js"), method }), "network");
     }
   });
@@ -1094,121 +1039,6 @@ describe("assets: the zone pack is cached, and never at the shell's expense", ()
     // And the app recovers on the next session, because nothing was stored.
     const found = await fetchPack(worker);
     assert.equal(await (await found.response).text(), "NWSZPK...");
-  });
-});
-
-// ===========================================================================
-describe("tiles: the basemap cache stays bounded", () => {
-  // =========================================================================
-
-  /** Fetch `count` distinct tiles through the worker. */
-  async function fetchTiles(worker, count, offset = 0) {
-    for (let i = 0; i < count; i += 1) {
-      const url = `https://cartodb-basemaps-a.global.ssl.fastly.net/dark_nolabels/7/${offset + i}/52.png`;
-      worker.network.serve(
-        url,
-        () =>
-          new Response(`tile ${offset + i}`, {
-            status: 200,
-            headers: { date: new Date().toUTCString(), "cache-control": "public, max-age=15552000" },
-          }),
-      );
-      await worker.fetch(new Request(url));
-    }
-  }
-
-  it("caches a tile and serves it back without touching the network", async () => {
-    const worker = await bootWorker();
-    await fetchTiles(worker, 1);
-    const before = worker.network.log.length;
-    const event = await worker.fetch(
-      new Request("https://cartodb-basemaps-a.global.ssl.fastly.net/dark_nolabels/7/0/52.png"),
-    );
-    assert.equal(event.handled, true);
-    assert.equal(await (await event.response).text(), "tile 0");
-    assert.equal(worker.network.log.length, before, "a cached tile was refetched");
-  });
-
-  it("enforces the bound across worker restarts, not just within one lifetime", async () => {
-    // A service worker is killed after roughly thirty seconds idle. A user
-    // panning slowly adds a handful of tiles per lifetime, so a bound that only
-    // triggers after a fixed number of writes *within* a lifetime is never
-    // reached, and the cache grows without limit until it takes the quota with
-    // it — which is what makes the shell's all-or-nothing install fail.
-    let worker = await bootWorker();
-    const { TILE_CACHE_MAX, TILE_TRIM_BATCH } = worker.internals;
-
-    const perLifetime = 10;
-    assert.ok(perLifetime < TILE_TRIM_BATCH, "this test must stay under the batch threshold");
-
-    const lifetimes = Math.ceil((TILE_CACHE_MAX + 200) / perLifetime);
-    for (let i = 0; i < lifetimes; i += 1) {
-      await fetchTiles(worker, perLifetime, i * perLifetime);
-      worker = await restartWorker(worker);
-    }
-
-    const tiles = worker.caches.countEntries((n) => n.startsWith("squallar-basemap-"));
-    assert.ok(
-      tiles <= TILE_CACHE_MAX + TILE_TRIM_BATCH,
-      `the basemap cache holds ${tiles} tiles; the bound is ${TILE_CACHE_MAX} \
-(+ at most one ${TILE_TRIM_BATCH}-entry batch of overshoot)`,
-    );
-  });
-
-  it("evicts oldest-first so the tiles just fetched survive", async () => {
-    let worker = await bootWorker();
-    const { TILE_CACHE_MAX } = worker.internals;
-    await fetchTiles(worker, TILE_CACHE_MAX + 100);
-    worker = await restartWorker(worker);
-    await fetchTiles(worker, 1, 10_000);
-
-    const urls = worker.cachedUrls().filter((u) => u.includes("cartodb-basemaps"));
-    assert.equal(
-      urls.some((u) => u.endsWith("/7/10000/52.png")),
-      true,
-      "the most recently fetched tile was evicted",
-    );
-    assert.equal(
-      urls.some((u) => u.endsWith("/7/0/52.png")),
-      false,
-      "the oldest tile survived while newer ones were evicted",
-    );
-  });
-
-  it("revalidates a cached tile that carries no usable Date", async () => {
-    const worker = await bootWorker();
-    const { tileIsStale } = worker.internals;
-
-    assert.equal(
-      tileIsStale(new Response("t", { status: 200 })),
-      true,
-      "a readable response with no Date cannot be shown to be fresh, so it must revalidate",
-    );
-    assert.equal(
-      tileIsStale(new Response("t", { status: 200, headers: { date: "not a date" } })),
-      true,
-    );
-    assert.equal(
-      tileIsStale(
-        new Response("t", {
-          status: 200,
-          headers: { date: new Date().toUTCString(), "cache-control": "max-age=15552000" },
-        }),
-      ),
-      false,
-    );
-    // An opaque response exposes no headers at all. There is nothing to reason
-    // about and a coastline does not go dangerously wrong with age.
-    assert.equal(tileIsStale(opaqueResponse()), false);
-  });
-
-  it("honours the origin's own max-age rather than inventing one", async () => {
-    const worker = await bootWorker();
-    const { tileFreshFor } = worker.internals;
-    assert.equal(
-      tileFreshFor(new Response("t", { headers: { "cache-control": "public, max-age=15552000" } })),
-      15552000 * 1000,
-    );
   });
 });
 
