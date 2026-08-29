@@ -10,9 +10,11 @@
 //! inside them; a tile fetch that repeated it would put that on the IO path for
 //! every one of the tens of tiles a pane asks for.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use walkers::Style;
+use walkers::style::Layer;
 
 /// The dark basemap style, verbatim.
 const DARK_JSON: &str = include_str!("../../www/styles/dark.json");
@@ -46,6 +48,49 @@ pub fn committed(is_dark: bool) -> Arc<Style> {
     }))
 }
 
+/// The source-layer a style layer draws from, or `None` for the variants that
+/// have no source-layer (`background`, `raster`, `fill-extrusion`) — those are
+/// kept by every filter.
+pub fn source_layer_of(layer: &Layer) -> Option<&str> {
+    match layer {
+        Layer::Fill { source_layer, .. }
+        | Layer::Line { source_layer, .. }
+        | Layer::Symbol { source_layer, .. }
+        | Layer::Circle { source_layer, .. } => Some(source_layer),
+        Layer::Background { .. } | Layer::Raster | Layer::FillExtrusion => None,
+    }
+}
+
+/// The committed style for a theme with every style layer whose source-layer
+/// is in `disabled` removed — what the tile source is built with, so a
+/// disabled source-layer costs no decode and no paint at all rather than being
+/// skipped per frame.
+///
+/// Re-parses the JSON when the filter is non-empty; that runs once per
+/// **source construction** (a toggle flip or a theme flip), never per tile or
+/// per frame, so the ~95-layer walk is the accepted cost — the same shape as
+/// the theme flip's re-download.
+pub fn committed_filtered(is_dark: bool, disabled: &BTreeSet<String>) -> Arc<Style> {
+    if disabled.is_empty() {
+        return committed(is_dark);
+    }
+    let (name, json) = if is_dark {
+        ("dark", DARK_JSON)
+    } else {
+        ("light", LIGHT_JSON)
+    };
+    let mut style = Style::from_json(json).unwrap_or_else(|error| {
+        panic!(
+            "the compiled-in {name} basemap style does not deserialise: {error}\n\
+             `tests/committed_styles_parse.rs` gates this and would have gone red first."
+        )
+    });
+    style
+        .layers
+        .retain(|layer| source_layer_of(layer).is_none_or(|sl| !disabled.contains(sl)));
+    Arc::new(style)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,6 +116,70 @@ mod tests {
                 compiled, on_disk,
                 "the compiled-in {name} style is not the committed file"
             );
+        }
+    }
+
+    /// Disabling a source-layer removes exactly its style layers and nothing
+    /// else, in both themes; an empty filter is the unfiltered style; and the
+    /// control — a source-layer NOT in the set — keeps its count untouched.
+    #[test]
+    fn the_filter_removes_exactly_the_disabled_source_layers_style_layers() {
+        let count_of = |style: &Style, sl: &str| {
+            style
+                .layers
+                .iter()
+                .filter(|layer| source_layer_of(layer) == Some(sl))
+                .count()
+        };
+
+        for is_dark in [true, false] {
+            let full = committed(is_dark);
+            let water_layers = count_of(&full, "water");
+            let road_layers = count_of(&full, "transportation");
+            assert!(
+                water_layers > 0 && road_layers > 0,
+                "non-vacuity: the committed styles reference both subjects"
+            );
+
+            let disabled: BTreeSet<String> = ["water".to_owned()].into();
+            let filtered = committed_filtered(is_dark, &disabled);
+            assert_eq!(
+                filtered.layers.len(),
+                full.layers.len() - water_layers,
+                "exactly the water layers left, nothing else"
+            );
+            assert_eq!(count_of(&filtered, "water"), 0);
+            assert_eq!(
+                count_of(&filtered, "transportation"),
+                road_layers,
+                "an untouched source-layer keeps every style layer"
+            );
+
+            // Enabling restores: the empty set is the unfiltered style.
+            let restored = committed_filtered(is_dark, &BTreeSet::new());
+            assert_eq!(restored.layers.len(), full.layers.len());
+        }
+    }
+
+    /// Every toggle in the shipped table names a source-layer the committed
+    /// styles actually reference — a toggle that filters nothing is a control
+    /// that visibly does nothing. (The other direction — every referenced
+    /// source-layer has a toggle — lives in `tests/committed_styles_parse.rs`
+    /// beside the styles' own gate.)
+    #[test]
+    fn every_shipped_toggle_filters_at_least_one_style_layer() {
+        for is_dark in [true, false] {
+            let full = committed(is_dark);
+            for toggle in crate::basemap_layer::SOURCE_LAYER_TOGGLES {
+                let disabled: BTreeSet<String> = [toggle.source_layer.to_owned()].into();
+                let filtered = committed_filtered(is_dark, &disabled);
+                assert!(
+                    filtered.layers.len() < full.layers.len(),
+                    "the {} toggle removed no style layer from the {} theme",
+                    toggle.source_layer,
+                    if is_dark { "dark" } else { "light" },
+                );
+            }
         }
     }
 

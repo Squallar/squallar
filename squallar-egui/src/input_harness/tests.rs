@@ -15469,3 +15469,51 @@ fn the_basemap_credit_clears_the_bottom_chrome_at_every_width() {
          one fixed string at one fixed size must not vary",
     );
 }
+
+/// **The base map is a layer-walk citizen: dispatched at the bottom of the
+/// pane's paint order while on, absent from it while off.**
+///
+/// The special-case call site that used to paint the ground before the walk
+/// is deleted; this is the pin that the walk's own `BasemapTiles` arm is what
+/// draws it now — read off the existing `last_paint_order` probe, the same
+/// dispatch record every other layer-order pin uses. Non-vacuity: the
+/// layer-off frame still dispatches *other* layers, so "absent" is a
+/// statement about this layer and not about an empty record.
+#[test]
+fn the_basemap_is_dispatched_at_the_bottom_while_on_and_not_at_all_while_off() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.warm_up();
+
+    let order = h.paint_order(0);
+    assert!(!order.is_empty(), "the map pane recorded no paint order");
+    assert_eq!(
+        order[0].0,
+        known::BASEMAP_TILES,
+        "the ground ships ON at the lowest weight, so it is the first thing \
+         the pane dispatches: {order:?}",
+    );
+
+    h.gui_mut()
+        .set_overlay_on_pane_for_test(0, &known::BASEMAP_TILES, false);
+    h.warm_up();
+    let order = h.paint_order(0);
+    assert!(
+        !order.iter().any(|(id, _)| *id == known::BASEMAP_TILES),
+        "the layer is off and the pane still dispatched it — a second draw \
+         path survived the move into the walk",
+    );
+    assert!(
+        !order.is_empty(),
+        "non-vacuity: the layer-off frame dispatched nothing at all, so the \
+         absence above says nothing",
+    );
+
+    h.gui_mut()
+        .set_overlay_on_pane_for_test(0, &known::BASEMAP_TILES, true);
+    h.warm_up();
+    assert_eq!(
+        h.paint_order(0).first().map(|(id, _)| id.clone()),
+        Some(known::BASEMAP_TILES),
+        "switching the layer back on restores the ground at the bottom",
+    );
+}

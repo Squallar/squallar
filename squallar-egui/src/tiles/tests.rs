@@ -1001,19 +1001,19 @@ fn a_theme_flip_releases_the_theme_that_is_no_longer_drawn() {
     let ctx = egui::Context::default();
     let mut state = MapTileState::default();
 
-    state.ensure_base_tiles(true, &ctx);
+    state.ensure_base_tiles(true, &Default::default(), &ctx);
     assert!(
         state.tiles.is_some() && state.current_theme_is_dark,
         "fixture: a dark frame must make the dark source"
     );
 
-    state.ensure_base_tiles(false, &ctx);
+    state.ensure_base_tiles(false, &Default::default(), &ctx);
     assert!(
         state.tiles.is_some() && !state.current_theme_is_dark,
         "the theme now drawn must be the one held"
     );
 
-    state.ensure_base_tiles(true, &ctx);
+    state.ensure_base_tiles(true, &Default::default(), &ctx);
     assert!(
         state.tiles.is_some() && state.current_theme_is_dark,
         "flipping back must re-create the dark source, not leave a blank map"
@@ -1032,7 +1032,7 @@ fn the_flip_empties_the_slot_before_anything_asks_for_the_other_theme() {
     let ctx = egui::Context::default();
     let mut state = MapTileState::default();
 
-    state.ensure_base_tiles(true, &ctx);
+    state.ensure_base_tiles(true, &Default::default(), &ctx);
     assert!(state.tiles.is_some(), "fixture: the dark source exists");
 
     // The theme changed, but nothing has asked for the light source yet --
@@ -1045,11 +1045,52 @@ fn the_flip_empties_the_slot_before_anything_asks_for_the_other_theme() {
     );
     state.restore_base_tiles(taken);
 
-    state.ensure_base_tiles(false, &ctx);
+    state.ensure_base_tiles(false, &Default::default(), &ctx);
     assert!(
         !state.current_theme_is_dark,
         "the state must have adopted the light theme"
     );
+}
+
+/// **A changed source-layer set rebuilds the base source; an unchanged one
+/// does not churn it; and the release keeps no source resident.** The rebuild
+/// is the whole mechanism a toggle flip rides — nothing signals it — so an
+/// `ensure_` that stopped comparing would leave every flip invisible until
+/// the next theme change.
+#[test]
+fn a_changed_source_layer_set_rebuilds_the_base_source() {
+    let ctx = egui::Context::default();
+    let mut state = MapTileState::default();
+    let empty = std::collections::BTreeSet::new();
+
+    state.ensure_base_tiles(true, &empty, &ctx);
+    assert_eq!(state.base_builds, 1, "fixture: the first frame builds");
+
+    state.ensure_base_tiles(true, &empty, &ctx);
+    assert_eq!(
+        state.base_builds, 1,
+        "an unchanged set must not rebuild the source every frame"
+    );
+
+    let disabled: std::collections::BTreeSet<String> = ["water".to_owned()].into();
+    state.ensure_base_tiles(true, &disabled, &ctx);
+    assert_eq!(
+        state.base_builds, 2,
+        "a changed set is the toggle flip, and it must rebuild"
+    );
+    assert!(
+        state.tiles.is_some(),
+        "the rebuild left a source in the slot"
+    );
+
+    state.ensure_base_tiles(true, &disabled, &ctx);
+    assert_eq!(state.base_builds, 2, "the new set is now the built set");
+
+    // The release drops the source; the next ensure builds fresh.
+    state.release_base_tiles();
+    assert!(state.tiles.is_none(), "the release must empty the slot");
+    state.ensure_base_tiles(true, &disabled, &ctx);
+    assert_eq!(state.base_builds, 3, "coming back is a fresh build");
 }
 
 /// Residency is bounded by the flips rather than grown by them.
@@ -1064,7 +1105,7 @@ fn repeated_flips_never_hold_more_than_the_one_live_source() {
 
     for round in 0..6 {
         let is_dark = round % 2 == 0;
-        state.ensure_base_tiles(is_dark, &ctx);
+        state.ensure_base_tiles(is_dark, &Default::default(), &ctx);
         assert_eq!(
             state.current_theme_is_dark, is_dark,
             "round {round} did not adopt the theme it was handed"

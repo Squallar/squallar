@@ -41,7 +41,7 @@ fn declared(gui: &Gui) -> Vec<(LayerId, TimeAxis)> {
 }
 
 /// **A live pane hands every layer the wall clock**, so `as_of == now` for all
-/// sixteen and nothing rasterizes differently because the field exists.
+/// seventeen and nothing rasterizes differently because the field exists.
 #[test]
 fn a_live_pane_tells_every_layer_the_picture_depicts_now() {
     let mut gui = Gui::new();
@@ -51,7 +51,7 @@ fn a_live_pane_tells_every_layer_the_picture_depicts_now() {
     let clock = ts(30);
 
     let layers = declared(&gui);
-    assert_eq!(layers.len(), 16, "the walk below must cover every layer",);
+    assert_eq!(layers.len(), 17, "the walk below must cover every layer",);
     for (id, _) in &layers {
         assert_eq!(
             as_of_for_layer(&gui, 0, id, clock),
@@ -248,7 +248,7 @@ fn a_live_panes_fetch_carries_no_span_for_any_layer() {
     let clock = ts(30);
 
     let layers = declared(&gui);
-    assert_eq!(layers.len(), 16, "the walk below must cover every layer");
+    assert_eq!(layers.len(), 17, "the walk below must cover every layer");
     for (id, _) in &layers {
         assert_eq!(
             fetch_config_for_layer(&gui, 0, id, base_config(clock)).depicted_span_secs,

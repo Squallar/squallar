@@ -977,3 +977,85 @@ fn water_polygons_draw_beneath_the_waterway_centreline() {
         );
     }
 }
+
+/// **The BasemapTiles inspector's toggle roster is the committed styles' own
+/// source-layer census, in both directions.**
+///
+/// One toggle per source-layer some style layer actually references, so a
+/// toggle cannot be a control that filters nothing; and every referenced
+/// source-layer is either toggled or in the named exclusion list, so a style
+/// edit that starts referencing a new source-layer cannot ship without the
+/// inspector saying what the user may do about it. The exclusion —
+/// [`squallar_egui::basemap_layer::UNTOGGLED_SOURCE_LAYERS`], `place` — is
+/// itself pinned to be *referenced*: excluding a name the styles no longer
+/// use would be a stale carve-out.
+#[test]
+fn the_source_layer_toggle_roster_matches_what_the_styles_reference() {
+    use squallar_egui::basemap_layer::{
+        SOURCE_LAYER_CONTROL_PREFIX, SOURCE_LAYER_TOGGLES, UNTOGGLED_SOURCE_LAYERS,
+    };
+
+    for theme in themes() {
+        let style = style_json(theme);
+        let referenced: BTreeSet<&str> = style["layers"]
+            .as_array()
+            .expect("layers is an array")
+            .iter()
+            .filter_map(|l| l["source-layer"].as_str())
+            .collect();
+        assert!(
+            referenced.len() >= 10,
+            "{theme}: non-triviality floor — the census found only {} \
+             source-layers",
+            referenced.len()
+        );
+
+        let toggled: BTreeSet<&str> = SOURCE_LAYER_TOGGLES
+            .iter()
+            .map(|t| t.source_layer)
+            .collect();
+        assert_eq!(
+            toggled.len(),
+            SOURCE_LAYER_TOGGLES.len(),
+            "the toggle table names a source-layer twice"
+        );
+
+        // Direction one: every toggle filters something the styles draw.
+        for toggle in &SOURCE_LAYER_TOGGLES {
+            assert!(
+                referenced.contains(toggle.source_layer),
+                "{theme}: the {} toggle names a source-layer no style layer \
+                 references — a control that visibly does nothing",
+                toggle.source_layer
+            );
+            assert_eq!(
+                toggle.control_id,
+                format!("{SOURCE_LAYER_CONTROL_PREFIX}{}", toggle.source_layer),
+                "the control id must be recoverable to the source-layer name"
+            );
+        }
+
+        // Direction two: every referenced source-layer is toggled or
+        // deliberately excluded, never silently absent.
+        for source_layer in &referenced {
+            assert!(
+                toggled.contains(source_layer) || UNTOGGLED_SOURCE_LAYERS.contains(source_layer),
+                "{theme}: the styles reference `{source_layer}` and the \
+                 inspector neither toggles it nor names its exclusion"
+            );
+        }
+
+        // The exclusion list is real and disjoint from the toggles.
+        for excluded in UNTOGGLED_SOURCE_LAYERS {
+            assert!(
+                referenced.contains(excluded),
+                "{theme}: `{excluded}` is excluded but no style layer \
+                 references it — a stale carve-out"
+            );
+            assert!(
+                !toggled.contains(excluded),
+                "`{excluded}` is both toggled and excluded"
+            );
+        }
+    }
+}

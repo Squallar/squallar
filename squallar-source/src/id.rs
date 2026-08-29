@@ -1,7 +1,7 @@
 //! Layer identity as an open string: [`LayerId`]. The shipped values below are
-//! the **exact bytes sitting in every user's config file today**. Fifteen of
-//! the sixteen are registered by this build; the sixteenth, `"FakeSource"`, is
-//! a **retired reservation** that nothing registers — see [`known::FAKE_SOURCE`].
+//! the **exact bytes sitting in every user's config file today**. All but one
+//! are registered by this build; the exception, `"FakeSource"`, is a **retired
+//! reservation** that nothing registers — see [`known::FAKE_SOURCE`].
 
 use std::borrow::Cow;
 
@@ -78,6 +78,10 @@ pub mod known {
     /// `squallar-egui`'s tile machinery -- a streaming-tile layer like
     /// `CITY_LABELS`, not a fetch-round overlay.
     pub const TERRAIN: LayerId = LayerId::from_static("Terrain");
+    /// The base map tiles themselves, drawn by `squallar-egui`'s tile
+    /// machinery -- the ground every other layer paints over, registered so
+    /// the Layers panel can see, reorder and remove it like the rest.
+    pub const BASEMAP_TILES: LayerId = LayerId::from_static("BasemapTiles");
 }
 
 /// Every layer id ever registered.
@@ -95,7 +99,7 @@ pub mod known {
 /// third from the bottom (weight 25), `Mrms` second (weight 15) and `Gmgsi`
 /// **first** (weight 5, under every other layer); all three are appended here
 /// regardless, because append-only wins.
-pub const LAYER_ID_LEDGER: [&str; 17] = [
+pub const LAYER_ID_LEDGER: [&str; 18] = [
     "ModelData",
     "SpcOutlook",
     "Radar",
@@ -118,6 +122,7 @@ pub const LAYER_ID_LEDGER: [&str; 17] = [
     // config file.
     "FakeSource",
     "Terrain",
+    "BasemapTiles",
 ];
 
 #[cfg(test)]
@@ -145,6 +150,7 @@ mod tests {
             known::GMGSI,
             known::FAKE_SOURCE,
             known::TERRAIN,
+            known::BASEMAP_TILES,
         ];
         assert_eq!(known_ids.len(), LAYER_ID_LEDGER.len());
         for id in &known_ids {

@@ -56,13 +56,21 @@ pub(super) struct PaneRenderCtx<'a> {
     pub user_fix: Option<squallar_location::Fix>,
     /// The basemap's place names, laid out by the `CityLabels` arm below.
     ///
-    /// Filled by
-    /// [`draw_tile_layer`](super::super::map_overlays::draw_tile_layer) in the
-    /// ground phase and taken here, so the names draw at this layer's position
-    /// in the pane's order -- above the weather -- rather than under it with
-    /// the ground they arrived on. A pane with the layer off never takes them
-    /// and they are dropped with the context.
+    /// Starts empty and is filled by the `BasemapTiles` arm's
+    /// [`draw_tile_layer`](super::super::map_overlays::draw_tile_layer) call
+    /// in the ground phase, then taken by the `CityLabels` arm, so the names
+    /// draw at that layer's position in the pane's order -- above the weather
+    /// -- rather than under it with the ground they arrived on. A pane with
+    /// CityLabels off never takes them and they are dropped with the context;
+    /// a pane with **BasemapTiles** off never fills them, because the one
+    /// tile draw is where the names come from.
     pub basemap_labels: Vec<walkers::Text>,
+    /// The base tile source, taken out of `tiles::MapTileState` for the
+    /// frame. `None` while the BasemapTiles layer is off in every visible
+    /// pane (the slot is then released — a disabled layer costs zero
+    /// network). Drawn by the `BasemapTiles` arm below, at the layer's own
+    /// position in the pane's order: the bottom of the stack.
+    pub basemap_tiles: Option<&'a mut crate::tile_source::HttpsTiles>,
     /// The terrain hillshade source, taken out of `tiles::MapTileState` for
     /// the frame the way the base tiles are. `None` while the Terrain layer
     /// is off in every visible pane (the slot is then released — a disabled
@@ -240,6 +248,16 @@ pub(super) fn render_pane_map_content(
                         .pane
                         .displayed_melting_layer_source()
                         .filter(|source| !source.is_measured());
+                }
+                id if *id == known::BASEMAP_TILES => {
+                    // The ground phase: paints the tile geometry and defers
+                    // every label the tiles carry into `ctx.basemap_labels`
+                    // for the `CityLabels` arm — this arm runs first because
+                    // the layer's weight (1) is the lowest in the registry.
+                    if let Some(tiles) = ctx.basemap_tiles.as_deref_mut() {
+                        ctx.basemap_labels =
+                            draw_tile_layer(ui, projector, zoom, tiles, ctx.tile_zoom_bias);
+                    }
                 }
                 id if *id == known::TERRAIN => {
                     // A raster layer defers no labels: only a vector tile

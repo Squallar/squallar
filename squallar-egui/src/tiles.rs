@@ -262,7 +262,13 @@ fn cartodb_source(is_dark: bool, ctx: &egui::Context, credit: &'static str) -> H
 
 /// The base-map tile source for `is_dark`: CartoDB's pre-rendered rasters.
 #[cfg(not(feature = "basemap-vector"))]
-fn base_source(is_dark: bool, ctx: &egui::Context) -> HttpsTiles {
+fn base_source(
+    is_dark: bool,
+    _disabled_source_layers: &std::collections::BTreeSet<String>,
+    ctx: &egui::Context,
+) -> HttpsTiles {
+    // The rasters are pre-rendered; there is no style to filter, so the
+    // disabled set has nothing to act on in this arm.
     cartodb_source(is_dark, ctx, ATTRIBUTION_TEXT)
 }
 
@@ -274,7 +280,11 @@ fn base_source(is_dark: bool, ctx: &egui::Context) -> HttpsTiles {
 /// inside the IO task, which records them on `HttpsTiles::fault`;
 /// [`MapTileState::ensure_base_tiles`] is where a frame acts on that.
 #[cfg(feature = "basemap-vector")]
-fn base_source(is_dark: bool, ctx: &egui::Context) -> HttpsTiles {
+fn base_source(
+    is_dark: bool,
+    disabled_source_layers: &std::collections::BTreeSet<String>,
+    ctx: &egui::Context,
+) -> HttpsTiles {
     let url = archive_url();
 
     let attribution = Attribution {
@@ -286,7 +296,7 @@ fn base_source(is_dark: bool, ctx: &egui::Context) -> HttpsTiles {
 
     match HttpsTiles::from_archive_url(
         &url,
-        crate::basemap_style::committed(is_dark),
+        crate::basemap_style::committed_filtered(is_dark, disabled_source_layers),
         attribution,
         ctx.to_owned(),
     ) {
@@ -341,6 +351,18 @@ pub struct MapTileState {
     /// source on every target.
     fell_back_to_raster: bool,
 
+    /// Which source-layers were disabled in the style [`Self::tiles`] was
+    /// built with — the comparison [`Self::ensure_base_tiles`] makes to
+    /// notice a toggle flip. Meaningful only while the slot holds the vector
+    /// source; the raster fallback has no style to filter.
+    base_disabled_source_layers: std::collections::BTreeSet<String>,
+
+    /// How many times a base source has been constructed — the probe the
+    /// rebuild-on-toggle-flip pin reads, because two `HttpsTiles` cannot be
+    /// compared for identity once moved.
+    #[cfg(test)]
+    pub(crate) base_builds: usize,
+
     /// [`Self::fell_back_to_raster`]'s twin for the terrain slot, latched for
     /// the same reason — without it a frame after a failed open would build
     /// the source again, fail again, and keep a dead retry loop warm. There
@@ -357,6 +379,9 @@ impl Default for MapTileState {
             terrain: None,
             current_theme_is_dark: true,
             fell_back_to_raster: false,
+            base_disabled_source_layers: std::collections::BTreeSet::new(),
+            #[cfg(test)]
+            base_builds: 0,
             terrain_failed: false,
         }
     }
@@ -404,7 +429,18 @@ impl MapTileState {
     /// the transport's own words, and the credit the panel paints changes to
     /// [`FALLBACK_ATTRIBUTION_TEXT`], because the panel reads the credit off
     /// whichever source is actually being drawn.
-    pub fn ensure_base_tiles(&mut self, is_dark: bool, ctx: &egui::Context) {
+    /// `disabled_source_layers` is the BasemapTiles layer's per-source-layer
+    /// choice set; a source built with a different set is **rebuilt**, which
+    /// re-downloads the visible tiles exactly as a theme flip does — the
+    /// accepted cost of a toggle flip, cheap because the CDN serves the same
+    /// ranges again. Caching parsed tile geometry so a flip could re-style
+    /// without refetching is real future work, recorded here and not begun.
+    pub fn ensure_base_tiles(
+        &mut self,
+        is_dark: bool,
+        disabled_source_layers: &std::collections::BTreeSet<String>,
+        ctx: &egui::Context,
+    ) {
         self.adopt_theme(is_dark);
 
         if let Some(fault) = self.tiles.as_ref().and_then(HttpsTiles::fault) {
@@ -416,13 +452,36 @@ impl MapTileState {
             self.tiles = None;
         }
 
+        // A toggle flip on the raster fallback rebuilds nothing: there is no
+        // style in the rasters for the set to act on.
+        if self.tiles.is_some()
+            && !self.fell_back_to_raster
+            && self.base_disabled_source_layers != *disabled_source_layers
+        {
+            self.tiles = None;
+        }
+
         if self.tiles.is_none() {
+            self.base_disabled_source_layers = disabled_source_layers.clone();
+            #[cfg(test)]
+            {
+                self.base_builds += 1;
+            }
             self.tiles = Some(if self.fell_back_to_raster {
                 cartodb_source(is_dark, ctx, FALLBACK_CREDIT)
             } else {
-                base_source(is_dark, ctx)
+                base_source(is_dark, disabled_source_layers, ctx)
             });
         }
+    }
+
+    /// Drop the base source: the last visible pane switched the BasemapTiles
+    /// layer off. Symmetric with [`Self::release_terrain_tiles`] — a disabled
+    /// layer costs zero network, and the accepted cost is a re-download if it
+    /// comes back. The raster-fallback latch survives, exactly as the terrain
+    /// failure latch does: a release is not a network recovery.
+    pub fn release_base_tiles(&mut self) {
+        self.tiles = None;
     }
 
     /// Temporarily take the base tiles out of self for per-pane rendering.
