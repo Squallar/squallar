@@ -100,6 +100,60 @@ fn terrain_archive_url() -> String {
     TERRAIN_ARCHIVE_URL.to_owned()
 }
 
+/// Where the persistent archive block cache lives, installed once by the
+/// application at construction from `PlatformBridge::basemap_cache_dir` —
+/// the same platform fact `zone_cache_dir` is, reaching its consumer the way
+/// that one does: decided by the platform, handed over once, never poked
+/// through a UI setter.
+///
+/// A process-wide `OnceLock` rather than a `Gui` field because it is process
+/// configuration, not UI state: [`base_source`] and the terrain source are
+/// free functions rebuilding sources across theme flips and layer toggles,
+/// and every rebuild must see the same answer. Ungated and target-shared: a
+/// build without the archive reader, or a platform with no filesystem,
+/// simply never reads it.
+static BASEMAP_CACHE_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Install the archive block cache directory. First installation wins;
+/// installing nothing leaves every archive read uncached, which is the
+/// degraded mode the cache is documented to fall back to.
+pub fn install_basemap_cache_dir(dir: std::path::PathBuf) {
+    let _ = BASEMAP_CACHE_DIR.set(dir);
+}
+
+/// The block cache configuration for the archive at `url`, or `None` when no
+/// cache directory was installed.
+///
+/// **The one place the GC's live-generation set is derived**, and it is
+/// derived from *both* archive URLs no matter which source is being built:
+/// basemap and terrain have different generations both alive at once, the
+/// terrain source is built lazily, and a live set that only knew the opening
+/// source would cost the other its cache every launch.
+#[cfg(not(target_arch = "wasm32"))]
+fn archive_block_cache(url: &str) -> Option<crate::basemap_archive::block_cache::BlockCacheConfig> {
+    use crate::basemap_archive::block_cache;
+
+    let root = BASEMAP_CACHE_DIR.get()?.clone();
+    Some(block_cache::BlockCacheConfig {
+        root,
+        generation: block_cache::generation_for_url(url),
+        live_generations: vec![
+            block_cache::generation_for_url(&archive_url()),
+            block_cache::generation_for_url(&terrain_archive_url()),
+        ],
+        cap_bytes: block_cache::BLOCK_CACHE_BYTES,
+    })
+}
+
+/// The wasm32 arm of [`archive_block_cache`]: no filesystem, no cache — the
+/// same selection-of-a-body split as [`archive_url`].
+#[cfg(target_arch = "wasm32")]
+fn archive_block_cache(
+    _url: &str,
+) -> Option<crate::basemap_archive::block_cache::BlockCacheConfig> {
+    None
+}
+
 /// The credit the hillshade's elevation data requires.
 ///
 /// The DEM is `COP-DEM_GLO-30 Public, 2021 release` — see
@@ -121,7 +175,12 @@ fn terrain_source(ctx: &egui::Context) -> Option<HttpsTiles> {
         logo_dark: None,
     };
 
-    match HttpsTiles::from_terrain_archive_url(&url, attribution, ctx.to_owned()) {
+    match HttpsTiles::from_terrain_archive_url(
+        &url,
+        attribution,
+        ctx.to_owned(),
+        archive_block_cache(&url),
+    ) {
         Ok(tiles) => Some(tiles),
         Err(error) => {
             log::error!("{url} is not a usable terrain archive URL: {error}");
@@ -163,6 +222,7 @@ fn base_source(
         crate::basemap_style::committed_filtered(is_dark, disabled_source_layers),
         attribution,
         ctx.to_owned(),
+        archive_block_cache(&url),
     ) {
         Ok(tiles) => Some(tiles),
         Err(error) => {

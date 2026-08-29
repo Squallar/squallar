@@ -125,6 +125,13 @@ fn android_main(app: AndroidApp) {
         .internal_data_path()
         .and_then(|p| p.parent().map(|root| root.join("cache").join("zones")));
 
+    // The archive block cache, beside the zone cache under getCacheDir() —
+    // clearable "Cache" storage, which is exactly what a refetchable tile
+    // cache should be to the OS.
+    let android_basemap_cache = app
+        .internal_data_path()
+        .and_then(|p| p.parent().map(|root| root.join("cache").join("basemap")));
+
     let android_config_dir = app.internal_data_path().map(|p| p.join("config"));
 
     // winit permits **one `EventLoop` per process** and answers
@@ -184,6 +191,10 @@ fn android_main(app: AndroidApp) {
 
     if let Some(cache_path) = android_zone_cache {
         platform_app.set_zone_cache_dir(cache_path);
+    }
+
+    if let Some(cache_path) = android_basemap_cache {
+        platform_app.set_basemap_cache_dir(cache_path);
     }
 
     if let Some(config_path) = android_config_dir {

@@ -1396,6 +1396,7 @@ mod archive {
             },
             ctx.clone(),
             NonZeroUsize::new(64).expect("64 is not zero"),
+            None,
         ))
     }
 
@@ -1634,6 +1635,7 @@ mod archive {
             },
             ctx.clone(),
             NonZeroUsize::new(64).expect("64 is not zero"),
+            None,
         );
 
         let fault = pump_until(DEFAULT_TIMEOUT, || {

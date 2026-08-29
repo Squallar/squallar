@@ -946,6 +946,25 @@ impl<S: ArchiveRangeSource> BasemapArchive<S> {
     /// not be decompressed. **A tile the archive does not hold is
     /// [`TileBytes::Absent`], not an error** — and, equally, a failure is never
     /// reported as absence.
+    /// Read one tile's stored bytes and drop them, answering whether the
+    /// archive held the tile.
+    ///
+    /// The seed's verb ([`block_cache::seed_shallow`]): it pulls the tile's
+    /// range through the source — which is the point, the source is the
+    /// caching wrapper — without paying [`Self::tile`]'s decompression for
+    /// bytes nobody will look at.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn warm_tile(&self, z: u8, x: u32, y: u32) -> Result<bool, ArchiveError> {
+        let coord = TileCoord::new(z, x, y).map_err(|_| ArchiveError::Coordinate { z, x, y })?;
+
+        Ok(self
+            .reader
+            .get_tile(coord)
+            .await
+            .map_err(ArchiveError::Tile)?
+            .is_some())
+    }
+
     pub async fn tile(&self, z: u8, x: u32, y: u32) -> Result<TileBytes, ArchiveError> {
         let coord = TileCoord::new(z, x, y).map_err(|_| ArchiveError::Coordinate { z, x, y })?;
 
@@ -960,6 +979,11 @@ impl<S: ArchiveRangeSource> BasemapArchive<S> {
         }
     }
 }
+
+/// The persistent block cache over [`RangeSource`], and the background seed
+/// that warms it. A submodule of the archive reader, beside the seam
+/// gate rather than carrying one of its own.
+pub mod block_cache;
 
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]

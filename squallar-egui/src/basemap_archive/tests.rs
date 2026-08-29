@@ -75,7 +75,7 @@ const MONACO_LON: f64 = 7.502_127;
 const MONACO_LAT: f64 = 43.618_373_5;
 
 /// The path to test against, if there is one.
-fn archive_path() -> PathBuf {
+pub(super) fn archive_path() -> PathBuf {
     std::env::var_os(ARCHIVE_ENV).map_or_else(|| PathBuf::from(DEFAULT_ARCHIVE), PathBuf::from)
 }
 
@@ -105,7 +105,7 @@ fn skip_banner(test: &str, reason: &str, remedy: &str) {
 }
 
 /// The "there is nothing on disk" skip, phrased once.
-fn no_archive_banner(test: &str, path: &Path) {
+pub(super) fn no_archive_banner(test: &str, path: &Path) {
     skip_banner(
         test,
         &format!("no PMTiles archive at {}", path.display()),
@@ -159,7 +159,7 @@ fn archive_centre<S: super::ArchiveRangeSource>(archive: &BasemapArchive<S>) -> 
 /// [`super::archive_client`] cannot: it sets `https_only`, which is pinned by
 /// `the_archive_client_refuses_cleartext` below. Same split, and for the same
 /// reason, as `tile_source::tests::loopback_client`.
-fn loopback_client() -> reqwest::Client {
+pub(super) fn loopback_client() -> reqwest::Client {
     squallar_radar::tls::init();
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -168,7 +168,7 @@ fn loopback_client() -> reqwest::Client {
 }
 
 /// Run `future` on a current-thread runtime.
-fn block_on<F: Future>(future: F) -> F::Output {
+pub(super) fn block_on<F: Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -288,7 +288,7 @@ impl RangeSource for FailsAfterOpenSource {
 
 /// How the loopback server answers a known path.
 #[derive(Clone, Copy)]
-enum Answer {
+pub(super) enum Answer {
     /// `200` with a body, i.e. the whole resource — what a host that ignores
     /// `Range` does, and what 2 of 11 real requests did.
     WholeBody,
@@ -300,7 +300,7 @@ enum Answer {
 
 /// One path's serving plan: `whole_body_first` requests answered `200`, then
 /// `then`.
-struct PathPlan {
+pub(super) struct PathPlan {
     body: Vec<u8>,
     whole_body_first: usize,
     then: Answer,
@@ -308,7 +308,7 @@ struct PathPlan {
 
 impl PathPlan {
     /// A well-behaved ranged path.
-    fn ranged(body: Vec<u8>) -> Self {
+    pub(super) fn ranged(body: Vec<u8>) -> Self {
         Self {
             body,
             whole_body_first: 0,
@@ -323,10 +323,10 @@ impl PathPlan {
 /// ending at a part's last byte), not on what a clamping server chose to
 /// serve.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct SeenRequest {
-    path: String,
-    start: usize,
-    end: usize,
+pub(super) struct SeenRequest {
+    pub(super) path: String,
+    pub(super) start: usize,
+    pub(super) end: usize,
 }
 
 /// A loopback HTTP server holding a set of paths, each with its own plan.
@@ -336,7 +336,7 @@ struct SeenRequest {
 /// `.part001`, …, and the monolith is the bare path. A path with no plan
 /// answers a clean `404`, which is itself load-bearing: it is what tells the
 /// probe an archive has no parts.
-struct RangeServer {
+pub(super) struct RangeServer {
     port: u16,
     seen: Arc<std::sync::Mutex<Vec<SeenRequest>>>,
     #[expect(
@@ -347,7 +347,7 @@ struct RangeServer {
 }
 
 /// The bare archive path every test serves under.
-const ARCHIVE_PATH: &str = "/archive.pmtiles";
+pub(super) const ARCHIVE_PATH: &str = "/archive.pmtiles";
 
 /// The path of part `index` under [`ARCHIVE_PATH`], per the publish contract.
 fn part_path(index: usize) -> String {
@@ -363,7 +363,7 @@ fn split_into_parts(body: &[u8], part_bytes: usize) -> Vec<Vec<u8>> {
 
 impl RangeServer {
     /// A server answering exactly `paths`, and `404` elsewhere.
-    fn start(paths: std::collections::HashMap<String, PathPlan>) -> Self {
+    pub(super) fn start(paths: std::collections::HashMap<String, PathPlan>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port should bind");
         let port = listener
             .local_addr()
@@ -390,7 +390,7 @@ impl RangeServer {
 
     /// The pre-split shape: one file at the bare path, no parts anywhere, so
     /// the probe's `404` selects monolith mode.
-    fn monolith(body: Vec<u8>, whole_body_first: usize, then: Answer) -> Self {
+    pub(super) fn monolith(body: Vec<u8>, whole_body_first: usize, then: Answer) -> Self {
         Self::start(std::collections::HashMap::from([(
             ARCHIVE_PATH.to_owned(),
             PathPlan {
@@ -415,12 +415,12 @@ impl RangeServer {
         )
     }
 
-    fn url(&self) -> String {
+    pub(super) fn url(&self) -> String {
         format!("http://127.0.0.1:{}{ARCHIVE_PATH}", self.port)
     }
 
     /// Every request seen so far, in arrival order.
-    fn seen(&self) -> Vec<SeenRequest> {
+    pub(super) fn seen(&self) -> Vec<SeenRequest> {
         self.seen
             .lock()
             .expect("the request log is not poisoned")
@@ -428,7 +428,7 @@ impl RangeServer {
     }
 
     /// How many requests `path` has received.
-    fn requests_to(&self, path: &str) -> usize {
+    pub(super) fn requests_to(&self, path: &str) -> usize {
         self.seen()
             .iter()
             .filter(|request| request.path == path)
