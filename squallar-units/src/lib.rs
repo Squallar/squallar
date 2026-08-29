@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+mod data_size;
 mod distance;
 mod hail_size;
 mod height;
@@ -9,6 +10,7 @@ mod speed;
 mod temperature;
 mod timezone;
 
+pub use data_size::DataSize;
 pub use distance::DistanceUnit;
 pub use hail_size::HailSizeUnit;
 pub use height::HeightUnit;
