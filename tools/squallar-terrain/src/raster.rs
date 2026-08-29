@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::config::{ATTRIBUTION, Config, Encoding, TILELIST};
-use crate::grid::{Extent, tile_bbox, tile_extent};
+use crate::grid::{Extent, frac_tile_x, frac_tile_y, tile_bbox, tile_extent};
 use crate::run::{capture, cmd, need, parallel, run};
 use crate::tiles::{Cell, SuperCell, TileList, supercells, tile_name};
 use crate::{Res, log, mbtiles, pmtiles, trgb};
@@ -60,6 +60,7 @@ pub fn build(cfg: &Config, list: &TileList) -> Res<()> {
     // which is what makes a one-cell smoke test cheap enough to run.
     if cfg.raster_minzoom <= cfg.raster_global_maxzoom {
         build_global_elev(cfg, list, &global)?;
+        assert_no_dead_land_rows(list, &global)?;
     } else {
         log!(
             "min zoom {} > {}: skipping global raster",
@@ -210,6 +211,53 @@ fn shard_size(len: usize, jobs: usize) -> usize {
     len.div_ceil(jobs.max(1)).max(1)
 }
 
+/// The latitude-sorted COG list cut into at most `jobs` shards whose cuts land
+/// only BETWEEN 1-degree rows, never inside one.
+///
+/// **A mid-row cut destroys the row it splits.** The list sorts by
+/// `(lat, lon)`, so a plain `chunks()` boundary usually leaves one row's low
+/// longitudes in shard `k` and the rest in shard `k + 1` — and then both shard
+/// VRTs' bounding boxes cover that whole row. The COGs declare no NODATA
+/// (checked on the N62 W110 header, 2026-08-29), so wherever a shard's bbox is
+/// not covered by one of its own sources the shard VRT reads a VALID elevation
+/// of zero. The combining `gdalbuildvrt` paints sources in list order, later
+/// over earlier, each as one whole rectangle: shard `k + 1`'s implicit zeros
+/// land on top of shard `k`'s real pixels across every part of the split row
+/// that shard `k + 1` does not itself hold.
+///
+/// The published archive carried exactly that: whole 1-degree rows of dead
+/// hillshade at N41/N43/N46/N51/N53/N58/N60/N62/N64 — precisely the split rows
+/// of the 48-shard build over the 26,450-COG list, minus the two (N49 at W126,
+/// N56 at W161) whose destroyed western segment is open ocean. Reproduced
+/// locally 2026-08-29 with 8 COGs around a mimicked N62 boundary: the sharded
+/// mosaic's boundary row reads a constant zero where the flat single-VRT
+/// control reads 155–464 m.
+///
+/// Row-aligned cuts make consecutive shards' extents DISJOINT latitude bands,
+/// so no shard's rectangle can reach a row another shard owns. Pinned by
+/// `no_latitude_row_is_ever_split_across_shards` and
+/// `row_aligned_shards_cover_every_cog_exactly_once`.
+///
+/// Each shard extends FORWARD to the end of the row it would have cut, so
+/// every shard except the last holds at least the ceiling-division target and
+/// the shard count never exceeds `jobs`. The worst extension is one row minus
+/// one COG (359) against a 552-COG target on the real list — bounded, and the
+/// phase it feeds is network-latency-bound, not size-bound.
+fn shard_rows(tiles: &[Cell], jobs: usize) -> Vec<&[Cell]> {
+    let target = shard_size(tiles.len(), jobs);
+    let mut shards = Vec::new();
+    let mut start = 0;
+    while start < tiles.len() {
+        let mut end = (start + target).min(tiles.len());
+        while end < tiles.len() && tiles[end].lat == tiles[end - 1].lat {
+            end += 1;
+        }
+        shards.push(&tiles[start..end]);
+        start = end;
+    }
+    shards
+}
+
 /// GLO-30's pixels per degree at full resolution, from the COG headers.
 ///
 /// Every tile is 3600 rows to the degree. Columns thin towards the poles --
@@ -298,10 +346,9 @@ fn build_global_vrt(cfg: &Config, list: &TileList) -> Res<PathBuf> {
     if tiles.is_empty() {
         return Err("refusing to build a VRT over zero COGs".into());
     }
-    let shards: Vec<(usize, &[Cell])> = tiles
-        .chunks(shard_size(tiles.len(), jobs))
-        .enumerate()
-        .collect();
+    // Row-aligned, never plain `chunks()`: a cut inside a 1-degree row is what
+    // destroyed nine whole rows of the published archive. See [`shard_rows`].
+    let shards: Vec<(usize, &[Cell])> = shard_rows(&tiles, jobs).into_iter().enumerate().collect();
 
     // The grid this mosaic exists to feed. The overview level is only correct
     // relative to it, so it is read from the same place the warp reads it.
@@ -421,6 +468,172 @@ fn build_global_elev(cfg: &Config, list: &TileList, out: &Path) -> Res<()> {
     run(c)
 }
 
+/// The decimated scan grid [`assert_no_dead_land_rows`] reads: whole-mercator,
+/// square like the mosaic, ~5.7 samples per degree each way at the equator
+/// (rows grow poleward). At 1024 columns a 1-degree cell kept only 1-2 interior
+/// columns and the ceil/floor window starved — half the cells could never read
+/// dead. 2048 keeps at least a 4x4 interior everywhere between the polar
+/// clamps, and the scan text stays a few tens of megabytes.
+const STRIPE_SCAN_COLS: usize = 2048;
+const STRIPE_SCAN_ROWS: usize = 2048;
+
+/// How many consecutive dead land cells along one row trip the build.
+///
+/// The hazard this must not false-positive on is a run of listed cells whose
+/// land the decimated scan can miss entirely: low atolls. Measured against the
+/// pinned tile list, the longest adjacent run of pure-atoll cells in any row is
+/// 7 (Tuamotus, S17–S19); the destroyed rows the tripwire exists for ran to
+/// hundreds of cells. Twelve sits above the one with margin and far below the
+/// other.
+const STRIPE_RUN_CELLS: usize = 12;
+
+/// FAIL the build if the global mosaic carries a dead row across land.
+///
+/// The symptom this pins down shipped once: whole 1-degree rows of the mosaic
+/// zeroed by overlapping VRT shards (see [`shard_rows`]), which survived to the
+/// published archive because nothing between `gdalwarp` and `pmtiles` ever
+/// looked. This reads the mosaic back decimated — one `gdal_translate` to an
+/// ASCII grid on stdout, no temp file — and refuses to continue when a long
+/// run of consecutive land cells in one 1-degree row contains nothing but
+/// (near-)zero samples. Costs one decompression pass over the mosaic, threaded
+/// by the open option.
+fn assert_no_dead_land_rows(list: &TileList, global: &Path) -> Res<()> {
+    log!("scanning the global mosaic for dead land rows");
+    let text = capture(cmd(
+        "gdal_translate",
+        &[
+            "-q",
+            "-of",
+            "AAIGrid",
+            "-outsize",
+            &STRIPE_SCAN_COLS.to_string(),
+            &STRIPE_SCAN_ROWS.to_string(),
+            "-co",
+            "DECIMAL_PRECISION=3",
+            "-oo",
+            "NUM_THREADS=ALL_CPUS",
+            global.to_string_lossy().as_ref(),
+            "/vsistdout/",
+        ],
+    ))?;
+    let values = parse_aaigrid(&text, STRIPE_SCAN_COLS, STRIPE_SCAN_ROWS)?;
+    let runs = dead_land_runs(list, STRIPE_SCAN_COLS, STRIPE_SCAN_ROWS, &values);
+    if runs.is_empty() {
+        log!("no dead land rows");
+        return Ok(());
+    }
+    let shown: Vec<String> = runs
+        .iter()
+        .take(10)
+        .map(|(lat, w, e)| format!("lat {lat}..{}, lon {w}..{}", lat + 1, e + 1))
+        .collect();
+    Err(format!(
+        "the global mosaic holds {} dead land row segment(s) — real terrain \
+         resampled to nothing. First {}:\n     {}\n     \
+         This is the shard-clobber symptom; see shard_rows in raster.rs.",
+        runs.len(),
+        shown.len(),
+        shown.join("\n     ")
+    )
+    .into())
+}
+
+/// Read exactly `ncols * nrows` values out of an Arc/Info ASCII grid.
+///
+/// Written against GDAL 3.13.3's actual `/vsistdout/` behaviour, which APPENDS
+/// the `.prj` sidecar to the same stream after the data — so this stops after
+/// the last value instead of reading to the end, and skips every line that
+/// opens with a letter (the header rows, and that trailing `PROJCS[...]`).
+fn parse_aaigrid(text: &str, ncols: usize, nrows: usize) -> Res<Vec<f32>> {
+    let want = ncols * nrows;
+    let mut values = Vec::with_capacity(want);
+    let mut header_cols = None;
+    let mut header_rows = None;
+    for line in text.lines() {
+        let mut fields = line.split_ascii_whitespace().peekable();
+        let Some(first) = fields.peek() else { continue };
+        if first.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            let key = fields.next().unwrap_or_default().to_ascii_lowercase();
+            let value = fields.next().and_then(|v| v.parse::<usize>().ok());
+            match key.as_str() {
+                "ncols" => header_cols = value,
+                "nrows" => header_rows = value,
+                _ => {}
+            }
+            continue;
+        }
+        for field in fields {
+            let v: f32 = field
+                .parse()
+                .map_err(|e| format!("mosaic scan value {field:?}: {e}"))?;
+            values.push(v);
+            if values.len() == want {
+                break;
+            }
+        }
+        if values.len() == want {
+            break;
+        }
+    }
+    if header_cols != Some(ncols) || header_rows != Some(nrows) {
+        return Err(format!(
+            "mosaic scan grid is {header_cols:?}x{header_rows:?}, not {ncols}x{nrows}"
+        )
+        .into());
+    }
+    if values.len() != want {
+        return Err(format!("mosaic scan yielded {} of {want} values", values.len()).into());
+    }
+    Ok(values)
+}
+
+/// Every run of at least [`STRIPE_RUN_CELLS`] consecutive listed cells in one
+/// 1-degree row whose every interior sample is (near-)zero, as
+/// `(lat, west_lon, east_lon)` inclusive.
+///
+/// A cell too close to the mercator clamp to keep a 2x2 interior sample window
+/// counts as alive, never dead: the scan cannot see it, and "cannot see" must
+/// not trip a build. Pinned by `a_destroyed_row_trips_the_mosaic_scan` and
+/// `a_short_dead_segment_stays_below_the_tripwire`.
+fn dead_land_runs(
+    list: &TileList,
+    ncols: usize,
+    nrows: usize,
+    values: &[f32],
+) -> Vec<(i32, i32, i32)> {
+    let dead_cell = |lat: i32, lon: i32| -> bool {
+        let c0 = (frac_tile_x(f64::from(lon), 0) * ncols as f64).ceil() as isize;
+        let c1 = (frac_tile_x(f64::from(lon + 1), 0) * ncols as f64).floor() as isize;
+        let r0 = (frac_tile_y(f64::from(lat + 1), 0) * nrows as f64).ceil() as isize;
+        let r1 = (frac_tile_y(f64::from(lat), 0) * nrows as f64).floor() as isize;
+        let (c0, r0) = (c0.max(0), r0.max(0));
+        let (c1, r1) = (c1.min(ncols as isize), r1.min(nrows as isize));
+        if c1 - c0 < 2 || r1 - r0 < 2 {
+            return false;
+        }
+        (r0..r1).all(|r| (c0..c1).all(|c| values[r as usize * ncols + c as usize].abs() < 1e-3))
+    };
+
+    let mut runs = Vec::new();
+    for lat in -90..90 {
+        let mut start: Option<i32> = None;
+        for lon in -180..=180 {
+            let in_run = lon < 180 && list.contains(Cell { lat, lon }) && dead_cell(lat, lon);
+            match (start, in_run) {
+                (None, true) => start = Some(lon),
+                (Some(w), false) => {
+                    if (lon - w) as usize >= STRIPE_RUN_CELLS {
+                        runs.push((lat, w, lon - 1));
+                    }
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+    }
+    runs
+}
+
 /// `gdalwarp` onto one zoom's exact grid.
 ///
 /// `-r average` on the ELEVATION, never on the encoded pixels; see the module
@@ -436,7 +649,19 @@ fn warp(src: &Path, dst: &Path, e: &Extent, extra: &[&str]) -> std::process::Com
         ])
         .arg("-ts")
         .args([e.nx.to_string(), e.ny.to_string()])
-        .args(["-r", "average", "-ot", "Float32", "-dstnodata", "0"]);
+        // `-srcnodata 0 -dstnodata 0`: zero means "no data" from end to end.
+        // The COGs declare no NODATA, so without `-srcnodata` a source zero is
+        // a VALID pixel, and what becomes of it depends on the GDAL release:
+        // 3.10.3 (the build box) writes it through as 0, which the declared
+        // dstnodata makes invisible downstream — the shipped ocean behaviour —
+        // while 3.13.3 (measured locally, 2026-08-29) nudges every valid
+        // source zero to 1.4e-45 "to avoid being treated as NoData", which
+        // hillshades the oceans opaque grey 181 instead of transparent 0.
+        // Declaring source zeros AS nodata makes every release produce the
+        // shipped behaviour, and keeps ocean zeros out of `-r average` at
+        // coastlines instead of dragging shore pixels toward sea level.
+        .args(["-r", "average", "-ot", "Float32"])
+        .args(["-srcnodata", "0", "-dstnodata", "0"]);
     if dst.extension().is_some_and(|x| x == "tif") {
         c.args([
             "-co",
@@ -729,27 +954,83 @@ pub fn pack_terrain_rgb(e: &Extent, elev: &Path) -> Res<PathBuf> {
 mod tests {
     use super::*;
 
+    /// A believable latitude-sorted planet: rows of varying width, some short
+    /// (islands), some wide (continents), in exactly the order
+    /// `TileList::sorted` produces.
+    fn synthetic_planet() -> Vec<Cell> {
+        let mut cells = Vec::new();
+        for lat in -85..85 {
+            // Deterministically varied widths, 3..=180 cells per row.
+            let width = 3 + (i64::from(lat) * 37).rem_euclid(178) as i32;
+            let start = -90 + (i64::from(lat) * 13).rem_euclid(60) as i32;
+            for lon in start..start + width {
+                cells.push(Cell { lat, lon });
+            }
+        }
+        cells
+    }
+
     /// **Every COG lands in exactly one shard, and there are never more shards
     /// than jobs.** A tile silently dropped here is not a crash: it is a hole in
     /// the global mosaic that resamples as ocean, which nobody sees until they
     /// look at the terrain for that part of the world.
     #[test]
-    fn sharding_covers_every_cog_exactly_once() {
-        for len in [1_usize, 2, 47, 48, 49, 1_000, 26_450] {
+    fn row_aligned_shards_cover_every_cog_exactly_once() {
+        let planet = synthetic_planet();
+        let one_row: Vec<Cell> = (-180..180).map(|lon| Cell { lat: 7, lon }).collect();
+        let tiny = vec![Cell { lat: 0, lon: 0 }];
+        for tiles in [&planet, &one_row, &tiny] {
             for jobs in [1_usize, 4, 48, 64] {
-                let size = shard_size(len, jobs);
-                let items: Vec<usize> = (0..len).collect();
-                let shards: Vec<&[usize]> = items.chunks(size).collect();
-
+                let shards = shard_rows(tiles, jobs);
                 assert!(
                     shards.len() <= jobs,
-                    "{len} COGs over {jobs} jobs made {} shards",
+                    "{} COGs over {jobs} jobs made {} shards",
+                    tiles.len(),
                     shards.len()
                 );
-                let flat: Vec<usize> = shards.concat();
+                let flat: Vec<Cell> = shards.concat();
                 assert_eq!(
-                    flat, items,
-                    "{len} COGs over {jobs} jobs did not reassemble in order"
+                    &flat,
+                    tiles,
+                    "{} COGs over {jobs} jobs did not reassemble in order",
+                    tiles.len()
+                );
+            }
+        }
+    }
+
+    /// **The invariant the stripe fix rests on: consecutive shards' extents are
+    /// disjoint latitude bands.** A split row is the one shape whose bounding
+    /// boxes overlap, and an overlap is where a later shard's implicit zeros
+    /// clobber an earlier shard's real terrain — see [`shard_rows`].
+    #[test]
+    fn no_latitude_row_is_ever_split_across_shards() {
+        let planet = synthetic_planet();
+        for jobs in [2_usize, 4, 48, 64] {
+            let shards = shard_rows(&planet, jobs);
+            for pair in shards.windows(2) {
+                let last = pair[0].last().unwrap();
+                let first = pair[1].first().unwrap();
+                assert!(
+                    last.lat < first.lat,
+                    "{jobs} jobs: a shard ends at {last:?} and the next starts \
+                     at {first:?} — the same row, in two shards"
+                );
+            }
+            // NON-VACUITY: plain ceiling-division chunking of this same input
+            // WOULD split a row at some boundary, so the assertion above can
+            // fail on the code this replaced.
+            if jobs > 1 {
+                let size = shard_size(planet.len(), jobs);
+                let naive_splits = planet
+                    .chunks(size)
+                    .zip(planet.chunks(size).skip(1))
+                    .filter(|(a, b)| a.last().unwrap().lat == b.first().unwrap().lat)
+                    .count();
+                assert!(
+                    naive_splits > 0,
+                    "{jobs} jobs: the naive chunking splits no row, so this \
+                     input cannot distinguish the fix from the defect"
                 );
             }
         }
@@ -842,5 +1123,95 @@ mod tests {
     fn a_shard_is_never_empty() {
         assert_eq!(shard_size(0, 48), 1);
         assert_eq!(shard_size(10, 0), 10);
+    }
+
+    /// A tile list of exactly the cells `lats x lons`, via the same parser the
+    /// real list goes through.
+    fn scan_list(lats: std::ops::Range<i32>, lons: std::ops::Range<i32>) -> TileList {
+        let mut text = String::new();
+        for lat in lats {
+            for lon in lons.clone() {
+                text.push_str(&tile_name(Cell { lat, lon }));
+                text.push_str("\r\n");
+            }
+        }
+        TileList::parse(text.as_bytes()).expect("synthetic tile list parses")
+    }
+
+    /// Zero every scan pixel of the 1-degree band `lat..lat+1` across
+    /// `lons`, bounds widened outward so no interior sample survives.
+    fn kill_band(values: &mut [f32], lat: i32, lons: std::ops::Range<i32>) {
+        let ncols = STRIPE_SCAN_COLS;
+        let c0 = (frac_tile_x(f64::from(lons.start), 0) * ncols as f64).floor() as usize;
+        let c1 = (frac_tile_x(f64::from(lons.end), 0) * ncols as f64).ceil() as usize;
+        let r0 = (frac_tile_y(f64::from(lat + 1), 0) * STRIPE_SCAN_ROWS as f64).floor() as usize;
+        let r1 = (frac_tile_y(f64::from(lat), 0) * STRIPE_SCAN_ROWS as f64).ceil() as usize;
+        for r in r0..r1 {
+            for value in &mut values[r * ncols + c0..r * ncols + c1] {
+                *value = 0.0;
+            }
+        }
+    }
+
+    /// **A destroyed row across land fails the build; a clean mosaic passes.**
+    /// The shape is the shipped defect exactly: one 1-degree band of a listed
+    /// land row reading zero while its neighbours hold terrain.
+    #[test]
+    fn a_destroyed_row_trips_the_mosaic_scan() {
+        let list = scan_list(40..45, -20..30);
+        let live = vec![100.0_f32; STRIPE_SCAN_COLS * STRIPE_SCAN_ROWS];
+
+        // NON-VACUITY: the clean mosaic reports nothing.
+        assert_eq!(
+            dead_land_runs(&list, STRIPE_SCAN_COLS, STRIPE_SCAN_ROWS, &live),
+            []
+        );
+
+        let mut destroyed = live.clone();
+        kill_band(&mut destroyed, 41, -20..11);
+        let runs = dead_land_runs(&list, STRIPE_SCAN_COLS, STRIPE_SCAN_ROWS, &destroyed);
+        assert_eq!(runs, [(41, -20, 10)], "31 dead cells at N41 must trip");
+    }
+
+    /// Below [`STRIPE_RUN_CELLS`] the scan stays quiet — that headroom is what
+    /// keeps a run of low atolls the decimated scan cannot see (measured
+    /// longest: 7, Tuamotus) from failing a healthy build. At the threshold it
+    /// trips, so the boundary is pinned from both sides.
+    #[test]
+    fn a_short_dead_segment_stays_below_the_tripwire() {
+        let list = scan_list(40..45, -20..30);
+        let live = vec![100.0_f32; STRIPE_SCAN_COLS * STRIPE_SCAN_ROWS];
+
+        let mut short = live.clone();
+        kill_band(&mut short, 41, -20..-20 + STRIPE_RUN_CELLS as i32 - 1);
+        assert_eq!(
+            dead_land_runs(&list, STRIPE_SCAN_COLS, STRIPE_SCAN_ROWS, &short),
+            [],
+            "one below the threshold must not trip"
+        );
+
+        let mut exact = live;
+        kill_band(&mut exact, 41, -20..-20 + STRIPE_RUN_CELLS as i32);
+        assert_eq!(
+            dead_land_runs(&list, STRIPE_SCAN_COLS, STRIPE_SCAN_ROWS, &exact),
+            [(41, -20, -20 + STRIPE_RUN_CELLS as i32 - 1)],
+            "exactly the threshold must trip"
+        );
+    }
+
+    /// The parse reads exactly `ncols x nrows` values and no further. GDAL
+    /// 3.13.3 appends the `.prj` sidecar to the same `/vsistdout/` stream, so
+    /// reading to the end would choke on `PROJCS[...]`.
+    #[test]
+    fn the_aaigrid_parse_stops_before_the_appended_prj() {
+        let text = "ncols        3\nnrows        2\nxllcorner    -1.0\nyllcorner    -2.0\n\
+                    dx           1.0\ndy           2.0\nNODATA_value 0.000\n\
+                    1.5 0.000 -430.0 \n2.5 3.5 4.5 \n\
+                    PROJCS[\"WGS_1984_Web_Mercator_Auxiliary_Sphere\"]\n";
+        let values = parse_aaigrid(text, 3, 2).expect("parses");
+        assert_eq!(values, [1.5, 0.0, -430.0, 2.5, 3.5, 4.5]);
+
+        // A grid of the wrong shape is an error, not a truncation.
+        assert!(parse_aaigrid(text, 4, 2).is_err());
     }
 }
