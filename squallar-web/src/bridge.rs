@@ -67,6 +67,14 @@ impl PlatformBridge for WebPlatform {
         None
     }
 
+    /// No filesystem for the archive block cache either: it stays disabled,
+    /// and the browser's HTTP cache is this target's persistence story.
+    fn set_basemap_cache_dir(&mut self, _dir: std::path::PathBuf) {}
+
+    fn basemap_cache_dir(&self) -> Option<&std::path::Path> {
+        None
+    }
+
     /// Inert, not an oversight: `localStorage` is available from the first frame.
     fn set_config_dir(&mut self, _dir: std::path::PathBuf) {}
 

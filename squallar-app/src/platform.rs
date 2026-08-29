@@ -251,6 +251,14 @@ pub trait PlatformBridge {
 
     fn zone_cache_dir(&self) -> Option<&std::path::Path>;
 
+    /// Where the archive block cache (basemap and terrain tile bytes)
+    /// persists, or `None` on a platform with no filesystem for it — the
+    /// cache then simply stays disabled. `zone_cache_dir`'s twin, platform
+    /// for platform.
+    fn set_basemap_cache_dir(&mut self, dir: std::path::PathBuf);
+
+    fn basemap_cache_dir(&self) -> Option<&std::path::Path>;
+
     fn set_config_dir(&mut self, dir: std::path::PathBuf);
 
     /// Where this platform persists small blobs, or `None` if the platform has not

@@ -471,6 +471,14 @@ impl App {
         .build()
         .expect("Failed to build HTTP client");
 
+        // The archive block cache learns its home the way squallar-egui
+        // learns everything platform-shaped: once, at construction, never
+        // through a Gui setter. Android answers `None` here and installs via
+        // `Self::set_basemap_cache_dir` when `android_main` learns the path.
+        if let Some(dir) = platform.basemap_cache_dir() {
+            squallar_egui::tiles::install_basemap_cache_dir(dir.to_path_buf());
+        }
+
         let mut gui = Gui::new();
         let supports_exit = platform.supports_exit();
         let loop_frame_budget = budgets.loop_frames_held;
@@ -2094,6 +2102,14 @@ impl App {
     /// Override the zone geometry cache directory.
     pub fn set_zone_cache_dir(&mut self, dir: std::path::PathBuf) {
         self.platform.set_zone_cache_dir(dir);
+    }
+
+    /// Override the archive block cache directory. The Android path: the
+    /// platform learns its cache home only after startup, so the install
+    /// that desktop and iOS perform inside `App::new` happens here instead.
+    pub fn set_basemap_cache_dir(&mut self, dir: std::path::PathBuf) {
+        squallar_egui::tiles::install_basemap_cache_dir(dir.clone());
+        self.platform.set_basemap_cache_dir(dir);
     }
 
     /// Override the UI config directory and load config from it.

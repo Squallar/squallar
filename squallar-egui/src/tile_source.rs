@@ -1248,21 +1248,31 @@ impl HttpsTiles {
     /// that parses but does not answer is a *runtime* failure of the IO task;
     /// it cannot be reported here, because nothing has been asked for yet, so
     /// it is recorded on [`Self::fault`] instead of only in the log.
+    /// `cache` is the persistent block cache's configuration, decided by the
+    /// caller because deriving it takes both archive URLs (the GC's live-
+    /// generation set) — `None` reads uncached, exactly as before the cache
+    /// existed. The basemap source is also the one that seeds: the z0–z5
+    /// warm-up runs through this source's cache, once per generation.
     pub fn from_archive_url(
         url: &str,
         style: Arc<Style>,
         attribution: Attribution,
         egui_ctx: Context,
+        cache: Option<crate::basemap_archive::block_cache::BlockCacheConfig>,
     ) -> Result<Self, crate::basemap_archive::RangeError> {
-        use crate::basemap_archive::{HttpRangeSource, archive_client};
+        use crate::basemap_archive::{HttpRangeSource, archive_client, block_cache};
 
-        let source = HttpRangeSource::new(archive_client(), url)?;
+        let source = block_cache::BlockCachedSource::new(
+            HttpRangeSource::new(archive_client(), url)?,
+            cache.clone(),
+        );
         Ok(Self::from_range_source(
             source,
             style,
             attribution,
             egui_ctx,
             TILE_CACHE_ENTRIES,
+            cache,
         ))
     }
 
@@ -1279,20 +1289,30 @@ impl HttpsTiles {
     ///
     /// As [`Self::from_archive_url`]: only a URL that will not parse fails at
     /// construction; everything later lands on [`Self::fault`].
+    /// `cache` as on [`Self::from_archive_url`]. The terrain source shares
+    /// the cache root (its generation directory sits beside the basemap's)
+    /// but never seeds: the seed is the basemap's z0–z5, by design.
     pub fn from_terrain_archive_url(
         url: &str,
         attribution: Attribution,
         egui_ctx: Context,
+        cache: Option<crate::basemap_archive::block_cache::BlockCacheConfig>,
     ) -> Result<Self, crate::basemap_archive::RangeError> {
-        use crate::basemap_archive::{HttpRangeSource, archive_client};
+        use crate::basemap_archive::{HttpRangeSource, archive_client, block_cache};
 
-        let source = HttpRangeSource::new(archive_client(), url)?;
+        let source = block_cache::BlockCachedSource::new(
+            HttpRangeSource::new(archive_client(), url)?,
+            cache,
+        );
         Ok(Self::from_range_source(
             source,
             Arc::new(Style::default()),
             attribution,
             egui_ctx,
             TERRAIN_TILE_CACHE_ENTRIES,
+            // No seed: the warm-up is the basemap's shallow zooms, not the
+            // hillshade's.
+            None,
         ))
     }
 
@@ -1305,6 +1325,7 @@ impl HttpsTiles {
         attribution: Attribution,
         egui_ctx: Context,
         cache_entries: NonZeroUsize,
+        seed: Option<crate::basemap_archive::block_cache::BlockCacheConfig>,
     ) -> Self
     where
         S: crate::basemap_archive::ArchiveRangeSource + 'static,
@@ -1341,6 +1362,7 @@ impl HttpsTiles {
             request_rx,
             tile_tx,
             egui_ctx,
+            seed,
         ));
 
         Self {
@@ -1430,6 +1452,7 @@ async fn serve_archive_continuously<S>(
     mut request_rx: Receiver<TileId>,
     mut tile_tx: Sender<(TileId, FetchPayload)>,
     egui_ctx: Context,
+    seed: Option<crate::basemap_archive::block_cache::BlockCacheConfig>,
 ) where
     S: crate::basemap_archive::ArchiveRangeSource,
 {
@@ -1471,6 +1494,16 @@ async fn serve_archive_continuously<S>(
     // The header changed what `at` may ask for, and nothing else would wake the
     // UI to ask for it.
     egui_ctx.request_repaint();
+
+    // In an `Arc` so the seed below can hold the archive while this loop
+    // serves from it; costs nothing when there is no seed.
+    let archive = Arc::new(archive);
+
+    // Warm the block cache with the shallow zooms, in the background on this
+    // same runtime — after the header is published and the repaint is asked
+    // for, so the seed can never delay first paint. A no-op when `seed` is
+    // `None` (terrain, no cache dir) and on wasm32 (a cfg-selected body).
+    crate::basemap_archive::block_cache::maybe_seed(&archive, seed);
 
     let mut outstanding = FuturesUnordered::new();
 

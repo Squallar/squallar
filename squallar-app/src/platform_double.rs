@@ -97,6 +97,7 @@ pub(crate) struct TestBridge {
     /// after startup; desktop and iOS derive one at construction.
     config_dir: Option<PathBuf>,
     zone_cache_dir: Option<PathBuf>,
+    basemap_cache_dir: Option<PathBuf>,
     store: Rc<MemoryKvStore>,
     /// Installed by `set_back_handler`.
     back_handler: Option<fn()>,
@@ -138,6 +139,7 @@ impl TestBridge {
             needs_process_exit: false,
             config_dir: None,
             zone_cache_dir: None,
+            basemap_cache_dir: None,
             store: Rc::new(MemoryKvStore::default()),
             back_handler: None,
             exits_on_unhandled_back: false,
@@ -164,6 +166,7 @@ impl TestBridge {
         Self {
             config_dir: Some(PathBuf::from("/desktop/config")),
             zone_cache_dir: Some(PathBuf::from("/desktop/zones")),
+            basemap_cache_dir: Some(PathBuf::from("/desktop/basemap")),
             ..Self::bare()
         }
     }
@@ -185,6 +188,7 @@ impl TestBridge {
             supports_exit: false,
             config_dir: Some(PathBuf::from("/ios/config")),
             zone_cache_dir: Some(PathBuf::from("/ios/zones")),
+            basemap_cache_dir: Some(PathBuf::from("/ios/basemap")),
             ..Self::bare()
         }
     }
@@ -355,6 +359,14 @@ impl PlatformBridge for TestBridge {
 
     fn zone_cache_dir(&self) -> Option<&Path> {
         self.zone_cache_dir.as_deref()
+    }
+
+    fn set_basemap_cache_dir(&mut self, dir: PathBuf) {
+        self.basemap_cache_dir = Some(dir);
+    }
+
+    fn basemap_cache_dir(&self) -> Option<&Path> {
+        self.basemap_cache_dir.as_deref()
     }
 
     fn set_config_dir(&mut self, dir: PathBuf) {

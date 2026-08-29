@@ -31,6 +31,7 @@ fn system_timezone() -> Option<String> {
 pub struct DesktopPlatform {
     back_handler: Option<fn()>,
     zone_cache_dir: Option<std::path::PathBuf>,
+    basemap_cache_dir: Option<std::path::PathBuf>,
     config_dir: Option<std::path::PathBuf>,
     /// Handed to the theme/back producers this bridge starts.
     redraw_waker: RedrawWaker,
@@ -49,6 +50,7 @@ impl DesktopPlatform {
         Self {
             back_handler: None,
             zone_cache_dir: Self::default_zone_cache_dir(),
+            basemap_cache_dir: Self::default_basemap_cache_dir(),
             config_dir: Self::default_config_dir(),
             redraw_waker: RedrawWaker::new(),
         }
@@ -71,6 +73,20 @@ impl DesktopPlatform {
             std::path::PathBuf::from(base)
                 .join("squallar")
                 .join("zones"),
+        )
+    }
+
+    /// `default_zone_cache_dir`'s twin: the archive block cache, a sibling
+    /// directory so both live under one clearable `squallar` cache root.
+    fn default_basemap_cache_dir() -> Option<std::path::PathBuf> {
+        let base = std::env::var("XDG_CACHE_HOME")
+            .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.cache", h)))
+            .or_else(|_| std::env::var("LOCALAPPDATA"))
+            .ok()?;
+        Some(
+            std::path::PathBuf::from(base)
+                .join("squallar")
+                .join("basemap"),
         )
     }
 }
@@ -156,6 +172,14 @@ impl PlatformBridge for DesktopPlatform {
         self.zone_cache_dir.as_deref()
     }
 
+    fn set_basemap_cache_dir(&mut self, dir: std::path::PathBuf) {
+        self.basemap_cache_dir = Some(dir);
+    }
+
+    fn basemap_cache_dir(&self) -> Option<&std::path::Path> {
+        self.basemap_cache_dir.as_deref()
+    }
+
     fn set_config_dir(&mut self, dir: std::path::PathBuf) {
         self.config_dir = Some(dir);
     }
@@ -203,6 +227,7 @@ pub struct AndroidPlatform {
     /// app's claim on the next press to `BackHandler.setClaimed`.
     back_claim_reporter: Option<fn(bool)>,
     zone_cache_dir: Option<std::path::PathBuf>,
+    basemap_cache_dir: Option<std::path::PathBuf>,
     config_dir: Option<std::path::PathBuf>,
     /// Handed to the theme poller below, so a light/dark switch noticed on that
     /// thread gets a frame to be applied on.
@@ -229,6 +254,7 @@ impl AndroidPlatform {
             terminal_suspend_probe: None,
             back_claim_reporter: None,
             zone_cache_dir: None,
+            basemap_cache_dir: None,
             config_dir: None,
             redraw_waker: RedrawWaker::new(),
         }
@@ -318,6 +344,14 @@ impl PlatformBridge for AndroidPlatform {
         self.zone_cache_dir.as_deref()
     }
 
+    fn set_basemap_cache_dir(&mut self, dir: std::path::PathBuf) {
+        self.basemap_cache_dir = Some(dir);
+    }
+
+    fn basemap_cache_dir(&self) -> Option<&std::path::Path> {
+        self.basemap_cache_dir.as_deref()
+    }
+
     fn set_config_dir(&mut self, dir: std::path::PathBuf) {
         self.config_dir = Some(dir);
     }
@@ -389,6 +423,7 @@ impl PlatformBridge for AndroidPlatform {
 pub struct IosPlatform {
     back_handler: Option<fn()>,
     zone_cache_dir: Option<std::path::PathBuf>,
+    basemap_cache_dir: Option<std::path::PathBuf>,
     config_dir: Option<std::path::PathBuf>,
     redraw_waker: RedrawWaker,
 }
@@ -406,6 +441,7 @@ impl IosPlatform {
         Self {
             back_handler: None,
             zone_cache_dir: Self::sandbox_subdir("Library/Caches/squallar/zones"),
+            basemap_cache_dir: Self::sandbox_subdir("Library/Caches/squallar/basemap"),
             config_dir: Self::sandbox_subdir("Library/Application Support/squallar"),
             redraw_waker: RedrawWaker::new(),
         }
@@ -457,6 +493,14 @@ impl PlatformBridge for IosPlatform {
 
     fn zone_cache_dir(&self) -> Option<&std::path::Path> {
         self.zone_cache_dir.as_deref()
+    }
+
+    fn set_basemap_cache_dir(&mut self, dir: std::path::PathBuf) {
+        self.basemap_cache_dir = Some(dir);
+    }
+
+    fn basemap_cache_dir(&self) -> Option<&std::path::Path> {
+        self.basemap_cache_dir.as_deref()
     }
 
     fn set_config_dir(&mut self, dir: std::path::PathBuf) {
