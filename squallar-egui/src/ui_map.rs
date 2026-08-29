@@ -914,7 +914,8 @@ impl super::Gui {
         match gesture {
             ArmedDragGesture::Idle => {}
             ArmedDragGesture::Anchored(pos) => {
-                self.region_drag = crate::ui_region::RegionDrag::begin(pane_idx, ground(pos));
+                self.region_drag =
+                    crate::ui_region::RegionDrag::begin(pane_idx, ground(pos), voxel_pick_bounds());
             }
             ArmedDragGesture::Dragging(pos) => {
                 if let Some(drag) = self
@@ -933,7 +934,15 @@ impl super::Gui {
                     return;
                 }
                 drag.extend_to(ground(pos));
-                match drag.commit() {
+                // The drag answers with a raw centre and half-width; making a
+                // *resampler region* of it is this arm's business, with the
+                // voxel bounds this arm owns.
+                match drag.commit().and_then(|(centre, half_width_km)| {
+                    crate::pane::VolumeRegion::new(
+                        centre,
+                        squallar_radar::voxel::HalfExtentKm::square(half_width_km),
+                    )
+                }) {
                     Some(region) => {
                         self.pending_region = Some((pane_idx, region));
                         self.set_region_pick_armed(false);
@@ -1396,6 +1405,16 @@ impl super::Gui {
                 elevation,
             );
         }
+    }
+}
+
+/// The 3D pick's drag bounds: what the voxel resampler will build. The drag
+/// gesture no longer knows them — this arm owns them, which is what lets a
+/// different arm hand the same gesture different bounds.
+fn voxel_pick_bounds() -> crate::ui_region::DragBoundsKm {
+    crate::ui_region::DragBoundsKm {
+        min_half_width_km: squallar_radar::voxel::MIN_HALF_WIDTH_KM,
+        max_half_width_km: squallar_radar::voxel::MAX_HALF_WIDTH_KM,
     }
 }
 

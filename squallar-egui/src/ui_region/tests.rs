@@ -2,10 +2,31 @@
 //! nothing else.
 
 use super::{
-    COVERAGE_MARGIN, COVERAGE_TARGET, MAX_FRAMING_PASSES, MAX_ZOOM_LEVEL, MIN_ZOOM_LEVEL,
-    RegionDrag, corners_for, dolly_for_step, ground_half_extent, solve_viewport,
+    COVERAGE_MARGIN, COVERAGE_TARGET, DragBoundsKm, MAX_FRAMING_PASSES, MAX_ZOOM_LEVEL,
+    MIN_ZOOM_LEVEL, RegionDrag, corners_for, dolly_for_step, ground_half_extent, solve_viewport,
     viewport_for_region, zoom_step,
 };
+
+/// The bounds the 3D pick's arm hands the drag: the voxel resampler's own,
+/// spelled from the resampler's constants so these tests keep asserting the
+/// clamps the shipped arm asks for.
+fn resampler_bounds() -> DragBoundsKm {
+    DragBoundsKm {
+        min_half_width_km: squallar_radar::voxel::MIN_HALF_WIDTH_KM,
+        max_half_width_km: squallar_radar::voxel::MAX_HALF_WIDTH_KM,
+    }
+}
+
+/// The resampler region the 3D pick's arm builds from a committed drag — the
+/// same construction `ui_map`'s `track_region_pick` performs on release.
+fn commit_region(drag: RegionDrag) -> Option<crate::pane::VolumeRegion> {
+    drag.commit().and_then(|(centre, half_width_km)| {
+        crate::pane::VolumeRegion::new(
+            centre,
+            squallar_radar::voxel::HalfExtentKm::square(half_width_km),
+        )
+    })
+}
 
 // Two tests stood here, both gating `steady_wheel` — the correction that
 // cancelled walkers' frame-time multiplier by mutating egui's `InputState`
@@ -908,7 +929,7 @@ fn the_squares_edge_follows_the_pointer_rather_than_its_corner() {
         (40.0, 100.0, 100.0),
         (100.0, 100.0, 100.0),
     ] {
-        let mut drag = RegionDrag::begin(0, ktlx()).expect("KTLX is on Earth");
+        let mut drag = RegionDrag::begin(0, ktlx(), resampler_bounds()).expect("KTLX is on Earth");
         drag.extend_to(offset(ktlx(), east_km, north_km));
         assert!(
             (drag.half_width_km() - want).abs() < OFFSET_TOLERANCE_KM,
@@ -925,7 +946,7 @@ fn the_squares_edge_follows_the_pointer_rather_than_its_corner() {
 fn a_drag_under_the_resamplers_minimum_commits_nothing() {
     let min = squallar_radar::voxel::MIN_HALF_WIDTH_KM;
     for east_km in [0.0, 0.5, min * 0.5, min - 0.5] {
-        let mut drag = RegionDrag::begin(0, ktlx()).expect("on Earth");
+        let mut drag = RegionDrag::begin(0, ktlx(), resampler_bounds()).expect("on Earth");
         drag.extend_to(offset(ktlx(), east_km, 0.0));
         assert_eq!(
             drag.commit(),
@@ -937,7 +958,7 @@ fn a_drag_under_the_resamplers_minimum_commits_nothing() {
         );
     }
 
-    let mut drag = RegionDrag::begin(0, ktlx()).expect("on Earth");
+    let mut drag = RegionDrag::begin(0, ktlx(), resampler_bounds()).expect("on Earth");
     // Clear of the bar by more than `OFFSET_TOLERANCE_KM`, so this precondition
     // is about the bar rather than about which approximation built the fixture.
     drag.extend_to(offset(ktlx(), min + 2.0 * OFFSET_TOLERANCE_KM, 0.0));
@@ -952,7 +973,7 @@ fn a_drag_under_the_resamplers_minimum_commits_nothing() {
 #[test]
 fn a_long_drag_stops_at_the_widest_box_the_resampler_will_build() {
     let max = squallar_radar::voxel::MAX_HALF_WIDTH_KM;
-    let mut drag = RegionDrag::begin(0, ktlx()).expect("on Earth");
+    let mut drag = RegionDrag::begin(0, ktlx(), resampler_bounds()).expect("on Earth");
     drag.extend_to(offset(ktlx(), 3.0 * max, 0.0));
     assert!(
         (drag.half_width_km() - max).abs() < 1e-9,
@@ -960,7 +981,7 @@ fn a_long_drag_stops_at_the_widest_box_the_resampler_will_build() {
          ceiling - the preview is drawing a box that cannot be resampled",
         drag.half_width_km(),
     );
-    let region = drag.commit().expect("a maximal box is a legal box");
+    let region = commit_region(drag).expect("a maximal box is a legal box");
     assert!(
         (region.half_east_km() - max).abs() < 1e-6 && (region.half_north_km() - max).abs() < 1e-6,
         "the committed box is {:.2} x {:.2} km of half-extent where the preview \
@@ -975,9 +996,9 @@ fn a_long_drag_stops_at_the_widest_box_the_resampler_will_build() {
 #[test]
 fn a_committed_region_is_square_whatever_shape_the_pull_was() {
     for (east_km, north_km) in [(120.0, 20.0), (20.0, 120.0), (200.0, 199.0), (60.0, 60.0)] {
-        let mut drag = RegionDrag::begin(0, ktlx()).expect("on Earth");
+        let mut drag = RegionDrag::begin(0, ktlx(), resampler_bounds()).expect("on Earth");
         drag.extend_to(offset(ktlx(), east_km, north_km));
-        let region = drag.commit().expect("a box well over the minimum");
+        let region = commit_region(drag).expect("a box well over the minimum");
         assert_eq!(
             region.half_east_km(),
             region.half_north_km(),
@@ -990,7 +1011,7 @@ fn a_committed_region_is_square_whatever_shape_the_pull_was() {
 /// A corner the projector could not place leaves the drag **exactly** as it was.
 #[test]
 fn a_corner_off_earth_leaves_the_drag_where_it_was() {
-    let mut drag = RegionDrag::begin(0, ktlx()).expect("on Earth");
+    let mut drag = RegionDrag::begin(0, ktlx(), resampler_bounds()).expect("on Earth");
     drag.extend_to(offset(ktlx(), 80.0, 0.0));
     let settled = drag;
     for bad in [
@@ -1034,7 +1055,7 @@ fn a_press_off_earth_starts_no_drag() {
         },
     ] {
         assert_eq!(
-            RegionDrag::begin(0, bad),
+            RegionDrag::begin(0, bad, resampler_bounds()),
             None,
             "a press at {bad:?} began a drag",
         );
