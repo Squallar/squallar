@@ -613,13 +613,30 @@ fn encode_and_tile(
         "-co".into(),
         format!("TILE_FORMAT={}", cfg.tile_format),
     ];
-    // GDAL's WEBP_LEVEL defaults to 75; every WebP figure this tool documents
-    // was measured at 85. Without this the README describes a configuration the
-    // code cannot produce, and a hillshade is smooth grey gradient -- precisely
-    // where lossy banding shows.
+    // `QUALITY`, and it was `WEBP_LEVEL` until a real build printed
+    //
+    //   Warning 6: driver MBTiles does not support creation option WEBP_LEVEL
+    //
+    // once per super-cell for two hours. **`WEBP_LEVEL` is a GTiff option; the
+    // MBTiles driver's is `QUALITY`** ("Quality for JPEG and WEBP tiles",
+    // default 75), so the setting was being dropped and every tile written at
+    // the default -- while the comment here claimed 85 and the size figures
+    // elsewhere were quoted as measured at 85.
+    //
+    // The old comment is worth keeping as evidence rather than deleting: it
+    // asserted a configuration the code could not produce, and nothing caught
+    // that except a warning nobody was reading. GDAL does not fail on an
+    // unknown creation option, so there is no gate here to add -- only the
+    // habit of reading what the tool prints.
+    //
+    // 85 rather than the default because a hillshade is smooth grey gradient,
+    // which is where lossy banding shows. Worth knowing before treating that as
+    // urgent: the archive built at the dropped default was inspected and does
+    // NOT visibly band -- 185 distinct grey levels in a 256x256 z12 tile over
+    // Colorado -- so this is fidelity we intended, not damage we shipped.
     if cfg.tile_format.eq_ignore_ascii_case("WEBP") {
         args.push("-co".into());
-        args.push("WEBP_LEVEL=85".into());
+        args.push("QUALITY=85".into());
     }
     args.extend(elev_type_co.iter().cloned());
     args.push(encoded.to_string_lossy().into_owned());

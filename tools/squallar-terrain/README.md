@@ -205,7 +205,7 @@ Schedule A costs **79%** of uniform 100 m at identical fine detail.
 | artifact | bytes |
 |---|---|
 | hillshade PMTiles (PNG) | 6,104,843 |
-| hillshade MBTiles (WebP q85) | 1,728,512 |
+| hillshade MBTiles (WebP q75) | 1,728,512 |
 | terrain-RGB PMTiles (PNG) | 14,190,386 |
 | terrain-RGB round-trip error | max 0.050 m, mean 0.020 m |
 
@@ -216,7 +216,7 @@ achievable.
 
 Two tiles, because one tile is not a range:
 
-| tile | relief | contours A | hillshade PNG | hillshade WebP q85 | terrain-RGB PNG |
+| tile | relief | contours A | hillshade PNG | hillshade WebP q75 | terrain-RGB PNG |
 |---|---|---|---|---|---|
 | N39 W106 (Colorado) | 2,794 m | 4,838,650 | 6,258,688 | 1,728,512 | 14,385,152 |
 | N35 W098 (Oklahoma) | 201 m | 1,277,821 | 4,636,672 | 946,176 | 9,785,344 |
@@ -236,8 +236,19 @@ measurements of the globe:
 |---|---|---|
 | contours (26,450 degree tiles) | 1.28–4.84 MB | **34–128 GB** |
 | hillshade PNG | 23.8–30.1 kB | **289–366 GB** |
-| hillshade WebP q85 | 4.85–8.31 kB | **59–101 GB** |
+| hillshade WebP q75 | 4.85–8.31 kB | **59–101 GB** |
 | terrain-RGB PNG | 50.2–69.2 kB | **610–841 GB** |
+
+> **The WebP figures on this page are q75, and were labelled q85 until
+> 2026-08-29.** The code asked for quality 85 with `-co WEBP_LEVEL=85`, but
+> `WEBP_LEVEL` is a GTiff creation option — the MBTiles driver's is `QUALITY` —
+> so GDAL dropped it and wrote every tile at its default of 75. It said so, once
+> per super-cell: `Warning 6: driver MBTiles does not support creation option
+> WEBP_LEVEL`. The option is now `QUALITY=85`, so **a future build will produce
+> larger tiles than every WebP number here.** They are kept as measured rather
+> than re-labelled with a setting that never applied. The q75 output was
+> inspected and does not visibly band: 185 distinct grey levels in a 256×256 z12
+> tile over Colorado.
 
 The low end is the more representative one: much of the world's land is
 flat, desert or ice-sheet, all of which compress far better than either US
@@ -462,7 +473,7 @@ byte-identical to what shipped.
 `gdaldem hillshade` is GDAL's own C, present in every GDAL including AL2023's
 3.10.3, and has no encode step to get wrong. If the requirement is "the map
 shows terrain", that is the entire job — and it is 2.3× smaller than terrain-RGB
-as PNG, or 8.2× smaller as WebP q85, which a hillshade may safely use and
+as PNG, or 8.2× smaller as WebP q75, which a hillshade may safely use and
 terrain-RGB may not.
 
 Terrain-RGB is what you want when the **client** needs the elevation:
