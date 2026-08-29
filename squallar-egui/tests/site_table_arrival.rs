@@ -119,6 +119,11 @@ fn the_site_layer_ends_up_with_the_table_however_late_it_lands() {
     let ctx = egui::Context::default();
     // Exactly what `App::new` does at line one of the pair.
     let mut gui = Gui::new();
+    // The frames below must not build a live tile source: its IO thread
+    // fetches the production archive, and what its tiles paint depends on
+    // how much wall-clock time this test takes. See
+    // `MapTileState::go_offline_for_tests`.
+    gui.go_offline_for_tests();
 
     assert!(
         !has_data(&gui),

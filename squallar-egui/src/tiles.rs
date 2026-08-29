@@ -278,6 +278,13 @@ pub struct MapTileState {
     /// plausible moment for a network to have come back.
     base_unreachable: bool,
 
+    /// Never build a tile source: the test harnesses' switch, set through
+    /// [`Self::go_offline_for_tests`]. Distinct from
+    /// [`Self::base_unreachable`], which is a *found* degraded state and
+    /// changes the painted credit; offline is the normal state's geometry
+    /// with the network left out.
+    offline: bool,
+
     /// Which source-layers were disabled in the style [`Self::tiles`] was
     /// built with — the comparison [`Self::ensure_base_tiles`] makes to
     /// notice a toggle flip. Meaningful only while the slot holds the vector
@@ -304,6 +311,7 @@ impl Default for MapTileState {
             terrain: None,
             current_theme_is_dark: true,
             base_unreachable: false,
+            offline: false,
             base_disabled_source_layers: std::collections::BTreeSet::new(),
             #[cfg(test)]
             base_builds: 0,
@@ -385,7 +393,19 @@ impl MapTileState {
             {
                 self.base_builds += 1;
             }
-            self.tiles = base_source(is_dark, disabled_source_layers, ctx);
+            self.tiles = if self.offline {
+                Some(HttpsTiles::inert(
+                    Attribution {
+                        text: ARCHIVE_ATTRIBUTION_TEXT,
+                        url: ATTRIBUTION_URL,
+                        logo_light: None,
+                        logo_dark: None,
+                    },
+                    ctx.to_owned(),
+                ))
+            } else {
+                base_source(is_dark, disabled_source_layers, ctx)
+            };
             // A URL that will not parse yields no source and never will this
             // session: latch, exactly as the terrain slot does, so the
             // per-frame cost of an unbuildable source is one bool read.
@@ -410,6 +430,31 @@ impl MapTileState {
     pub(crate) fn latch_base_unreachable_for_test(&mut self) {
         self.base_unreachable = true;
         self.tiles = None;
+    }
+
+    /// Build only inert tile sources for the rest of this instance's life.
+    ///
+    /// **For test harnesses that drive `Gui::ui`, and nothing else.** A live
+    /// source is an IO thread making range requests against the production
+    /// archive, and what it delivers races the frames of whatever built it,
+    /// with two arms: tiles that arrive paint label `TextShape`s at
+    /// arbitrary map positions (measured 2026-08-29: a harness frame held
+    /// open for 400 ms painted 80+ live city labels, several straddling
+    /// pill-row rects), and a transport fault latches
+    /// [`UNREACHABLE_ATTRIBUTION_TEXT`] over the provider credit. Either way
+    /// a unit test's glass changed with how much wall-clock time the test
+    /// took — the under-load flakes this switch removes.
+    ///
+    /// The slots still fill, with [`HttpsTiles::inert`]: every ensure/release
+    /// path and the credit composition run exactly as shipped, against a
+    /// source whose header never arrives and whose fault can never be set —
+    /// the fast-test glass, on every run. Unreachable is NOT latched; a test
+    /// that wants the degraded credit raises the latch itself through
+    /// [`Self::latch_base_unreachable_for_test`].
+    pub fn go_offline_for_tests(&mut self) {
+        self.offline = true;
+        self.tiles = None;
+        self.terrain = None;
     }
 
     /// Drop the base source: the last visible pane switched the BasemapTiles
@@ -450,7 +495,19 @@ impl MapTileState {
         }
 
         if self.terrain.is_none() && !self.terrain_failed {
-            self.terrain = terrain_source(ctx);
+            self.terrain = if self.offline {
+                Some(HttpsTiles::inert(
+                    Attribution {
+                        text: TERRAIN_ATTRIBUTION_TEXT,
+                        url: "https://spacedata.copernicus.eu/collections/copernicus-digital-elevation-model",
+                        logo_light: None,
+                        logo_dark: None,
+                    },
+                    ctx.to_owned(),
+                ))
+            } else {
+                terrain_source(ctx)
+            };
             // A build with no archive reader, or a URL that will not parse,
             // yields no source and never will this session: latch, so the
             // per-frame cost of an unbuildable source is one bool read.

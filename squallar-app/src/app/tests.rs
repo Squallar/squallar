@@ -841,7 +841,13 @@ fn a_platform_that_asks_to_quit_on_back_still_does() {
 pub(super) fn headless(mut platform: TestBridge) -> App {
     crate::test_sites::install();
     let location = squallar_location::LocationFacade::new(Box::new(platform.location_provider()));
-    App::new(Box::new(platform), location)
+    let mut app = App::new(Box::new(platform), location);
+    // No frame under a test builds a live tile source: a built source is an
+    // IO thread fetching the production archive, whose tiles change what a
+    // frame paints and uploads if enough wall-clock time passes while the
+    // test runs. See `MapTileState::go_offline_for_tests`.
+    app.gui.go_offline_for_tests();
+    app
 }
 
 /// An HTTP client no dispatch below can complete through, for the fixtures that
