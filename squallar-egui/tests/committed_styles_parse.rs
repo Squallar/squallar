@@ -927,3 +927,53 @@ fn a_filter_on_a_key_the_tiles_lack_is_caught() {
         "the key check would have accepted an unknown key"
     );
 }
+
+/// **A fill never draws over the line that shares its feature.**
+///
+/// `waterway` sat at index 6 and `water` at 9, so the water POLYGONS painted
+/// over the river CENTRELINE. In dark the fill is `#2C353C` against a
+/// `#3F5A6D` line on a `#0e0e0e` ground, so a reach wide enough to be a polygon
+/// lost its bright centreline and read as a hole in the river. It got worse
+/// with zoom because that is when the polygons arrive: measured over one
+/// Oklahoma view, water polygons go 51 at z10 to 3,286 at z12, 26 to 45 km².
+///
+/// **Nothing here pinned draw order before this, which is why it shipped.**
+/// Both committed styles parsed, every layer was accounted for, every filter key
+/// existed -- and the map still drew a broken river, because order is not a
+/// property any of those checks look at.
+#[test]
+fn water_polygons_draw_beneath_the_waterway_centreline() {
+    for theme in ["dark", "light"] {
+        let style = style_json(theme);
+        let ids: Vec<&str> = style["layers"]
+            .as_array()
+            .expect("layers is an array")
+            .iter()
+            .map(|l| l["id"].as_str().expect("every layer has an id"))
+            .collect();
+
+        let at = |id: &str| {
+            ids.iter()
+                .position(|l| *l == id)
+                .unwrap_or_else(|| panic!("{theme}: no layer {id}"))
+        };
+
+        for fill in ["water", "water_shadow"] {
+            assert!(
+                at(fill) < at("waterway"),
+                "{theme}: {fill} is at {} and waterway at {}, so the fill paints \
+                 over the centreline",
+                at(fill),
+                at("waterway")
+            );
+        }
+
+        // NON-VACUITY: waterway must still be under its own label and under the
+        // things that legitimately cover it, so this is an ordering constraint
+        // rather than "push waterway to the end".
+        assert!(
+            at("waterway") < at("waterway_label"),
+            "{theme}: the river label must draw over the river"
+        );
+    }
+}
