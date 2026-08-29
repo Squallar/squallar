@@ -7,6 +7,25 @@
 /// colour — so the chip advertises exactly the box the drag will draw.
 pub(crate) const REGION_ARM_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 220, 120);
 
+/// The half-width bounds a drag is measured against, kilometres, fixed at
+/// [`RegionDrag::begin`] by whoever armed the gesture.
+///
+/// The drag has no opinion of its own about what a legal box is: the 3D pick's
+/// arm hands in the voxel resampler's bounds, and a different arm — a download
+/// area, say — hands in its own. That is what keeps this module out of the
+/// business of knowing why anyone wants a box.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DragBoundsKm {
+    /// Narrowest half-width [`RegionDrag::commit`] will answer. A drag under
+    /// it is refused whole at commit rather than resized — see
+    /// [`RegionDrag::half_width_km`]'s note.
+    pub min_half_width_km: f64,
+    /// Widest half-width the preview will grow to. The pointer past it is
+    /// capped on the way in, so the box drawn is always one the arm's consumer
+    /// can honour.
+    pub max_half_width_km: f64,
+}
+
 /// A region drag in flight.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RegionDrag {
@@ -16,23 +35,27 @@ pub(crate) struct RegionDrag {
     pane_idx: crate::pane::PaneId,
     /// The box's centre, fixed on the press frame and never revised.
     centre: squallar_geo::GeoPoint,
-    /// Half-width in kilometres as the pointer currently stands. Capped at the
-    /// resampler's maximum on the way in — see [`Self::extend_to`] — but *not*
-    /// held up to its minimum: a too-small drag is refused whole at commit
-    /// rather than resized. Zero until the pointer moves.
+    /// Half-width in kilometres as the pointer currently stands. Capped at
+    /// [`Self::bounds`]' maximum on the way in — see [`Self::extend_to`] — but
+    /// *not* held up to its minimum: a too-small drag is refused whole at
+    /// commit rather than resized. Zero until the pointer moves.
     half_width_km: f64,
+    /// The bounds the arm that began this drag asked for, held for its life.
+    bounds: DragBoundsKm,
 }
 
 impl RegionDrag {
-    /// Start a drag centred on `centre`.
+    /// Start a drag centred on `centre`, measured against `bounds`.
     pub(crate) fn begin(
         pane_idx: crate::pane::PaneId,
         centre: squallar_geo::GeoPoint,
+        bounds: DragBoundsKm,
     ) -> Option<Self> {
         centre.is_on_earth().then_some(Self {
             pane_idx,
             centre,
             half_width_km: 0.0,
+            bounds,
         })
     }
 
@@ -67,20 +90,17 @@ impl RegionDrag {
         let north = (range_km * bearing.cos()).abs();
         let half = east.max(north);
         if half.is_finite() {
-            self.half_width_km = half.min(squallar_radar::voxel::MAX_HALF_WIDTH_KM);
+            self.half_width_km = half.min(self.bounds.max_half_width_km);
         }
     }
 
-    /// The region this drag would commit, or `None` if it is too small to be one.
-    pub(crate) fn commit(self) -> Option<crate::pane::VolumeRegion> {
-        (self.half_width_km >= squallar_radar::voxel::MIN_HALF_WIDTH_KM)
-            .then(|| {
-                crate::pane::VolumeRegion::new(
-                    self.centre,
-                    squallar_radar::voxel::HalfExtentKm::square(self.half_width_km),
-                )
-            })
-            .flatten()
+    /// The centre and half-width this drag would commit, or `None` if the box
+    /// is too small to be one. What a committed box *becomes* — a resampler
+    /// region, a download area — is the caller's to build, with whatever type
+    /// its own consumer speaks.
+    pub(crate) fn commit(self) -> Option<(squallar_geo::GeoPoint, f64)> {
+        (self.half_width_km >= self.bounds.min_half_width_km)
+            .then_some((self.centre, self.half_width_km))
     }
 }
 
