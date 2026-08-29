@@ -68,9 +68,27 @@ pub fn build(cfg: &Config, list: &TileList) -> Res<()> {
         );
     }
 
-    // Fewer jobs than cores: each warp is already multi-threaded internally and
-    // each holds ~1 GB of Float32 plus its encoded copy.
-    let sc_jobs = (cfg.jobs / 4).max(1);
+    // Fewer jobs than cores, because each holds ~1 GB of Float32 plus its
+    // encoded copy. MEMORY is the binding constraint here, not CPU.
+    //
+    // **This was `jobs / 4`, on the reasoning that "each warp is already
+    // multi-threaded internally". MEASURED on the build box, that is false.** A
+    // single z12 super-cell -- Colorado, all land, high relief, running with
+    // nothing else on a 48-vCPU box -- held 1.2-2.2% CPU for its whole 2m46s.
+    // That is about ONE core, not four, and its network was bursty (2 to 555
+    // MB/min): the cell is latency-bound on scattered COG reads, not compute-
+    // bound. Concurrency therefore scales until memory binds, and quartering it
+    // was leaving the machine idle.
+    //
+    // Halving rather than removing the divisor, because the constraint that IS
+    // real is unmeasured: ~3 GB per cell is read off the sentence above, not off
+    // a profile, and CloudWatch reports no memory without an agent. `jobs / 2`
+    // is ~72 GB at 48 jobs, a 2x margin against even the 128 GB members of the
+    // fleet. Do not raise it further without measuring resident memory first.
+    //
+    // Worth what it costs: at `jobs / 4` a global hillshade run extrapolates to
+    // 15.9 h; at `jobs / 2`, 9.0 h.
+    let sc_jobs = (cfg.jobs / 2).max(1);
     let elev_type_co = elevation_type_option(cfg)?;
 
     for z in cfg.raster_minzoom..=cfg.raster_maxzoom {
