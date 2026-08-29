@@ -11,10 +11,11 @@ use walkers::sources::{Attribution, TileSource};
 use walkers::{Style, Tile, TileId, TilePiece, Tiles};
 
 use super::{
-    DESKTOP_TILE_CACHE_ENTRIES, DecodeBudget, HttpsTiles, MAX_PARALLEL_DOWNLOADS,
-    MOBILE_TILE_CACHE_ENTRIES, TILE_CACHE_ENTRIES, WASM_TILE_CACHE_ENTRIES,
-    WASM_TILE_DECODES_PER_PUMP, drain_up_to, interpolate_from_lower_zoom, tile_client,
-    tile_id_is_valid,
+    DESKTOP_PARSED_TILE_CACHE_ENTRIES, DESKTOP_TILE_CACHE_ENTRIES, DecodeBudget, HttpsTiles,
+    MAX_PARALLEL_DOWNLOADS, MOBILE_PARSED_TILE_CACHE_ENTRIES, MOBILE_TILE_CACHE_ENTRIES,
+    PARSED_TILE_CACHE_ENTRIES, TILE_CACHE_ENTRIES, WASM_PARSED_TILE_CACHE_ENTRIES,
+    WASM_TILE_CACHE_ENTRIES, WASM_TILE_DECODES_PER_PUMP, drain_up_to, interpolate_from_lower_zoom,
+    tile_client, tile_id_is_valid,
 };
 
 // ---------------------------------------------------------------------------
@@ -61,6 +62,12 @@ const EXPECTED_MOBILE_CACHE_ENTRIES: usize = 96;
 const EXPECTED_WASM_CACHE_ENTRIES: usize = 96;
 const EXPECTED_PARALLEL_DOWNLOADS: usize = 6;
 const EXPECTED_WASM_DECODES_PER_PUMP: usize = 2;
+/// The 1920x1200 worst-case working set, the same derivation as the wasm
+/// styled arm's: the common canvas restyles wholly from the parsed cache.
+const EXPECTED_DESKTOP_PARSED_ENTRIES: usize = 96;
+/// A byte-budget answer, below the working set on purpose: an evicted parse
+/// costs one refetch on the next restyle, never a frame.
+const EXPECTED_HANDHELD_PARSED_ENTRIES: usize = 24;
 
 // ---------------------------------------------------------------------------
 
@@ -955,6 +962,100 @@ fn the_tuning_constants_are_the_written_figures_on_every_tier() {
         );
     }
 
+    // The parsed-geometry population: the second resident cost a style
+    // change rides. The desktop arm is the same working-set derivation the
+    // wasm styled arm carries; the handheld arms are deliberately below the
+    // working set (an evicted parse is one refetch on the next restyle, not a
+    // frame), so they are pinned as written figures plus a byte ceiling.
+    assert_eq!(
+        DESKTOP_PARSED_TILE_CACHE_ENTRIES.get(),
+        EXPECTED_DESKTOP_PARSED_ENTRIES,
+        "the desktop parsed arm is the 1920x1200 working set"
+    );
+    assert_eq!(
+        DESKTOP_PARSED_TILE_CACHE_ENTRIES.get(),
+        crate::tiles::tiles_resident_for(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1200.0)),
+            0,
+            1,
+        ),
+        "the desktop parsed arm must stay derived from what a viewport keeps \
+         resident, worst case over the whole zoom range"
+    );
+    assert_eq!(
+        MOBILE_PARSED_TILE_CACHE_ENTRIES.get(),
+        EXPECTED_HANDHELD_PARSED_ENTRIES,
+        "the mobile parsed arm is a byte-budget figure"
+    );
+    assert_eq!(
+        WASM_PARSED_TILE_CACHE_ENTRIES.get(),
+        EXPECTED_HANDHELD_PARSED_ENTRIES,
+        "the wasm parsed arm is a byte-budget figure"
+    );
+    for (entries, ceiling_mib, tier) in [
+        (DESKTOP_PARSED_TILE_CACHE_ENTRIES.get(), 192, "desktop"),
+        (MOBILE_PARSED_TILE_CACHE_ENTRIES.get(), 48, "mobile"),
+        (WASM_PARSED_TILE_CACHE_ENTRIES.get(), 48, "wasm32"),
+    ] {
+        let worst = entries * super::MEASURED_PARSED_TILE_BYTES;
+        assert!(
+            worst <= ceiling_mib * 1024 * 1024,
+            "the {tier} parsed arm holds {entries} entries, which is {:.1} MiB \
+             of parsed tiles per source against a {ceiling_mib} MiB ceiling",
+            worst as f64 / (1024.0 * 1024.0)
+        );
+    }
+    for (parsed, styled, tier) in [
+        (
+            DESKTOP_PARSED_TILE_CACHE_ENTRIES,
+            DESKTOP_TILE_CACHE_ENTRIES,
+            "desktop",
+        ),
+        (
+            MOBILE_PARSED_TILE_CACHE_ENTRIES,
+            MOBILE_TILE_CACHE_ENTRIES,
+            "mobile",
+        ),
+        (
+            WASM_PARSED_TILE_CACHE_ENTRIES,
+            WASM_TILE_CACHE_ENTRIES,
+            "wasm32",
+        ),
+    ] {
+        assert!(
+            parsed.get() <= styled.get(),
+            "the {tier} parsed arm outgrew the styled arm: an economy cache \
+             holding parses for tiles the styled cache cannot keep is residency \
+             with no consumer"
+        );
+    }
+    assert!(
+        WASM_PARSED_TILE_CACHE_ENTRIES.get() <= MOBILE_PARSED_TILE_CACHE_ENTRIES.get()
+            && MOBILE_PARSED_TILE_CACHE_ENTRIES.get() <= DESKTOP_PARSED_TILE_CACHE_ENTRIES.get(),
+        "the parsed tiers must stay ordered by how much memory the class has"
+    );
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        not(any(target_os = "android", target_os = "ios"))
+    ))]
+    assert_eq!(
+        PARSED_TILE_CACHE_ENTRIES, DESKTOP_PARSED_TILE_CACHE_ENTRIES,
+        "a desktop target must carry the desktop parsed arm"
+    );
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(target_os = "android", target_os = "ios")
+    ))]
+    assert_eq!(
+        PARSED_TILE_CACHE_ENTRIES, MOBILE_PARSED_TILE_CACHE_ENTRIES,
+        "a handheld target must carry the mobile parsed arm"
+    );
+    #[cfg(target_arch = "wasm32")]
+    assert_eq!(
+        PARSED_TILE_CACHE_ENTRIES, WASM_PARSED_TILE_CACHE_ENTRIES,
+        "wasm32 must carry the wasm parsed arm"
+    );
+
     // The wasm arm holds vector entries as of `feat(web): the vector basemap
     // draws on wasm32`, so it is in the loop above rather than exempt from it.
     // Its raster derivation is still pinned, because the terrain slot holds
@@ -1082,6 +1183,79 @@ fn the_vector_entry_cost_is_what_the_fixture_actually_renders() {
          {} the cache sizing is derived from: the derivation has gone stale in \
          the safe direction, which still means it is not measuring this",
         super::MEASURED_VECTOR_TILE_BYTES
+    );
+}
+
+/// The measured parsed-entry cost is a real measurement of a real tile — the
+/// styled test's twin for the second resident population.
+///
+/// Skips without the fixture, like its twin, and cannot pass vacuously: the
+/// floor below rejects a parse that decoded nothing. The band is the
+/// derivation of [`super::MEASURED_PARSED_TILE_BYTES`]; re-derive the constant
+/// by forcing it to fail, never by inference — the band cannot catch the
+/// constant drifting upward into a safe over-estimate.
+#[test]
+fn the_parsed_entry_cost_is_what_the_fixture_actually_parses() {
+    use std::path::PathBuf;
+
+    use crate::basemap_archive::FileRangeSource;
+
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/monaco.pmtiles");
+    if FileRangeSource::open(&path).is_err() {
+        eprintln!(
+            "SKIPPED the_parsed_entry_cost_is_what_the_fixture_actually_parses: \
+             {} would not open. It is committed; `git status` on it.",
+            path.display()
+        );
+        return;
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+
+    let bytes = runtime.block_on(async {
+        let archive = crate::basemap_archive::BasemapArchive::open(
+            FileRangeSource::open(&path).expect("the fixture opens"),
+        )
+        .await
+        .expect("the fixture is a PMTiles archive");
+
+        // The same tile the styled figure is measured on: Monaco's own z14
+        // city core, the tail the cache is sized for.
+        archive
+            .tile(14, 8529, 5974)
+            .await
+            .expect("the tile reads")
+            .into_bytes()
+            .expect("the fixture holds Monaco's own z14 tile")
+    });
+
+    let parsed = walkers::mvt::parse(&bytes).expect("the tile parses");
+
+    // A non-triviality floor, against the same fixture facts the styled test
+    // uses: a city-core tile is thousands of features, and a parse whose heap
+    // sits below the styled entry is not holding them.
+    let heap = parsed.heap_bytes();
+    assert!(
+        heap > super::MEASURED_VECTOR_TILE_BYTES / 2,
+        "the parse of the fixture's densest tile measures {heap} bytes, which \
+         is too small to be the decode of a city core"
+    );
+
+    assert!(
+        heap <= super::MEASURED_PARSED_TILE_BYTES,
+        "one parsed entry measures {heap} bytes, over the \
+         {} the parsed-cache sizing is derived from",
+        super::MEASURED_PARSED_TILE_BYTES
+    );
+    assert!(
+        heap * 2 >= super::MEASURED_PARSED_TILE_BYTES,
+        "one parsed entry measures {heap} bytes, less than half the \
+         {} the parsed-cache sizing is derived from: the derivation has gone \
+         stale in the safe direction, which still means it is not measuring this",
+        super::MEASURED_PARSED_TILE_BYTES
     );
 }
 
@@ -1587,6 +1761,225 @@ mod archive {
             tiles.tile_is_cached(tile_id),
             "an absent tile must keep its cache slot, or it is asked for again \
              on every frame for as long as it is on screen"
+        );
+    }
+
+    /// The committed fixture behind a counted, killable seam — the archive
+    /// path's loopback server. Every byte the source ever serves passes
+    /// `read_range`, so `reads` is the complete fetch ledger, and `dead`
+    /// turns the "it would have refetched" control into a hard failure: once
+    /// stored, any fetch attempt errors and the tile it was for never
+    /// arrives.
+    struct CountingRangeSource {
+        inner: FileRangeSource,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+        dead: Arc<AtomicBool>,
+    }
+
+    impl crate::basemap_archive::RangeSource for CountingRangeSource {
+        async fn read_range(
+            &self,
+            offset: u64,
+            length: usize,
+        ) -> Result<Vec<u8>, crate::basemap_archive::RangeError> {
+            if self.dead.load(Ordering::SeqCst) {
+                return Err(crate::basemap_archive::RangeError::Transport(
+                    "the loopback source was killed after the first fill".to_owned(),
+                ));
+            }
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.read_range(offset, length).await
+        }
+    }
+
+    /// [`fixture_tiles`] over a [`CountingRangeSource`], answering the ledger
+    /// and the kill switch beside the source.
+    fn counted_fixture_tiles(
+        test: &str,
+        ctx: &Context,
+        style: std::sync::Arc<walkers::Style>,
+    ) -> Option<(
+        HttpsTiles,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<AtomicBool>,
+    )> {
+        let path = fixture_path();
+        let inner = match FileRangeSource::open(&path) {
+            Ok(inner) => inner,
+            Err(error) => {
+                eprintln!(
+                    "SKIPPED {test}: {} would not open ({error}). It is committed; \
+                     `git status` on it.",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dead = Arc::new(AtomicBool::new(false));
+        let tiles = HttpsTiles::from_range_source(
+            CountingRangeSource {
+                inner,
+                reads: Arc::clone(&reads),
+                dead: Arc::clone(&dead),
+            },
+            style,
+            Attribution {
+                text: "test",
+                url: "https://example.invalid/",
+                logo_light: None,
+                logo_dark: None,
+            },
+            ctx.clone(),
+            NonZeroUsize::new(64).expect("64 is not zero"),
+            None,
+        );
+        Some((tiles, reads, dead))
+    }
+
+    /// Monaco's own z14 tile id.
+    fn monaco_tile(max_zoom: u8) -> TileId {
+        TileId {
+            x: squallar_geo::lon_to_tile_x(MONACO_LON, max_zoom),
+            y: squallar_geo::lat_to_tile_y(MONACO_LAT, max_zoom),
+            zoom: max_zoom,
+        }
+    }
+
+    /// Drive `tiles` until Monaco's own tile arrives whole, as a `Debug`
+    /// rendering — exact for every `f32` in every vertex, as the walkers
+    /// golden argues.
+    fn monaco_drawn(tiles: &mut HttpsTiles, tile_id: TileId) -> Option<String> {
+        let piece = draw_one(tiles, tile_id)?;
+        (piece.uv == whole_tile_uv()).then(|| match piece.tile {
+            Tile::Vector(shapes) => format!("{shapes:?}"),
+            Tile::Raster(_) => panic!("the archive holds MVT; a raster cannot arrive"),
+        })
+    }
+
+    /// What `mvt::parse` + `mvt::styled` produce for Monaco's z14 bytes under
+    /// `style` — the from-scratch oracle the restyled output must equal.
+    fn monaco_rendered_fresh(style: &walkers::Style) -> String {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let bytes = runtime.block_on(async {
+            let archive = crate::basemap_archive::BasemapArchive::open(
+                FileRangeSource::open(&fixture_path()).expect("the fixture opens"),
+            )
+            .await
+            .expect("the fixture is a PMTiles archive");
+            archive
+                .tile(14, 8529, 5974)
+                .await
+                .expect("the tile reads")
+                .into_bytes()
+                .expect("the fixture holds Monaco's own z14 tile")
+        });
+        match Tile::from_mvt(&bytes, style, 14).expect("the tile renders") {
+            Tile::Vector(shapes) => format!("{shapes:?}"),
+            Tile::Raster(_) => panic!("an MVT body rendered as a raster"),
+        }
+    }
+
+    /// Fill once, kill the source, change the style, and demand the correct
+    /// new output with **zero fetches** — the shared body of the two restyle
+    /// pins below.
+    ///
+    /// The control that the old path would have refetched is structural, not
+    /// asserted: before `HttpsTiles::set_style`, a style change rebuilt the
+    /// source (`MapTileState::ensure_base_tiles`'s v1 behaviour, recorded at
+    /// its old rebuild site), and a rebuilt source re-opens the archive and
+    /// re-reads every visible tile — reads which, with `dead` stored, error.
+    /// So a regression to any refetching shape cannot produce the new output
+    /// at all; it times out below instead of passing quietly. The ledger
+    /// assertion is the belt to those braces.
+    fn restyle_after_the_source_dies(
+        test: &str,
+        before_style: std::sync::Arc<walkers::Style>,
+        after_style: std::sync::Arc<walkers::Style>,
+    ) {
+        let ctx = Context::default();
+        let Some((mut tiles, reads, dead)) = counted_fixture_tiles(test, &ctx, before_style) else {
+            return;
+        };
+
+        let max_zoom = pump_until(DEFAULT_TIMEOUT, || {
+            tiles.pump();
+            tiles.source_max_zoom()
+        })
+        .expect("the archive header never arrived");
+        let tile_id = monaco_tile(max_zoom);
+
+        let before = pump_until(DEFAULT_TIMEOUT, || monaco_drawn(&mut tiles, tile_id))
+            .expect("the archive never yielded Monaco's own tile");
+
+        // The kill: from here, a single fetch attempt is a hard error and the
+        // tile it was for never arrives.
+        dead.store(true, Ordering::SeqCst);
+        let reads_at_kill = reads.load(Ordering::SeqCst);
+        assert!(
+            reads_at_kill > 0,
+            "fixture: the first fill read the archive"
+        );
+
+        tiles.set_style(after_style.clone());
+
+        // Immediately after the swap the stale tile still draws — that is the
+        // no-blank-beat half of the contract.
+        assert_eq!(
+            monaco_drawn(&mut tiles, tile_id).as_ref(),
+            Some(&before),
+            "the outgoing style must keep drawing until the restyle lands"
+        );
+
+        let after = pump_until(DEFAULT_TIMEOUT, || {
+            let drawn = monaco_drawn(&mut tiles, tile_id)?;
+            (drawn != before).then_some(drawn)
+        })
+        .expect(
+            "the restyled tile never arrived; with the source dead this means \
+             the restyle tried to refetch instead of using the parsed cache",
+        );
+
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            reads_at_kill,
+            "the restyle read the archive: the parsed cache did not serve it"
+        );
+
+        // Correct, not merely different: byte-for-byte what a from-scratch
+        // render of the new style produces.
+        assert_eq!(
+            after,
+            monaco_rendered_fresh(&after_style),
+            "the restyled output is not what the new style renders from scratch"
+        );
+    }
+
+    /// **A map-detail toggle re-renders with zero fetches.** The style pair is
+    /// the toggle's own: the committed dark style with and without the
+    /// `water` source-layer.
+    #[test]
+    fn a_detail_toggle_restyles_with_zero_fetches_after_the_source_dies() {
+        let disabled: std::collections::BTreeSet<String> = ["water".to_owned()].into();
+        restyle_after_the_source_dies(
+            "a_detail_toggle_restyles_with_zero_fetches_after_the_source_dies",
+            crate::basemap_style::committed(true),
+            crate::basemap_style::committed_filtered(true, &disabled),
+        );
+    }
+
+    /// **A theme flip re-styles from the parsed cache.** Dark to light over
+    /// one live source, zero fetches — the flip that used to drop the source
+    /// and refetch the viewport.
+    #[test]
+    fn a_theme_flip_restyles_from_the_parsed_cache_without_refetching() {
+        restyle_after_the_source_dies(
+            "a_theme_flip_restyles_from_the_parsed_cache_without_refetching",
+            crate::basemap_style::committed(true),
+            crate::basemap_style::committed(false),
         );
     }
 

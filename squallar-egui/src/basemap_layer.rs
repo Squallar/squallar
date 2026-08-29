@@ -301,9 +301,10 @@ impl SourceHandler for BasemapTilesHandler {
                 self.enabled = val;
             }
         } else if let Some(source_layer) = update.id.strip_prefix(SOURCE_LAYER_CONTROL_PREFIX) {
-            // The frame loop notices the set changed and rebuilds the tile
-            // source (`MapTileState::ensure_base_tiles`); nothing to signal
-            // here.
+            // The frame loop notices the set changed and re-styles the live
+            // tile source from its parsed-geometry cache
+            // (`MapTileState::ensure_base_tiles` -> `HttpsTiles::set_style`)
+            // — zero fetches, zero re-parses; nothing to signal here.
             if val {
                 self.disabled_source_layers.remove(source_layer);
             } else {

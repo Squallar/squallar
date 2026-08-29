@@ -1163,6 +1163,12 @@ impl Gui {
 
     /// The tile zoom bias for one pane: the frame's bias if this pane is
     /// drawing a floor strip, zero otherwise.
+    ///
+    /// Gated on the **styled** cache bound only, deliberately: the
+    /// parsed-geometry cache (`tile_source::PARSED_TILE_CACHE_ENTRIES`) is an
+    /// economy cache — a bias whose working set overruns it costs a refetch
+    /// on the next restyle, never a frame — so admitting it here would trade
+    /// a frame guarantee against an economy one. See that constant's docs.
     pub(crate) fn tile_zoom_bias_for_pane(&self, pane_idx: usize) -> u8 {
         if self.floor_tile_zoom_bias == 0 || !self.is_floor_source(pane_idx) {
             return 0;

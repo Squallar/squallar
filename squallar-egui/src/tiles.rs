@@ -236,13 +236,16 @@ fn base_source(
 
 /// Shared map tile state across all panes.
 pub struct MapTileState {
-    /// The tile source for the theme currently on the glass.
+    /// The tile source, styled for the theme currently on the glass.
     ///
-    /// **One slot, not one per theme and not one per surface.**
-    /// [`Self::adopt_theme`] releases the source the instant its theme stops
-    /// being drawn, so a second theme slot could only ever hold `None`; and
-    /// labels are no longer a source of their own, because the vector basemap
-    /// draws them out of the same tile it draws the ground from.
+    /// **One slot, not one per theme and not one per surface.** A theme flip
+    /// does not replace the source: [`Self::ensure_base_tiles`] re-styles it
+    /// in place ([`HttpsTiles::set_style`]), so its parsed-geometry cache
+    /// survives the flip and the new theme is derived from it without a
+    /// fetch. A second theme slot would hold nothing but a duplicate of this
+    /// one's caches; and labels are no longer a source of their own, because
+    /// the vector basemap draws them out of the same tile it draws the ground
+    /// from.
     pub tiles: Option<HttpsTiles>,
     pub current_theme_is_dark: bool,
 
@@ -256,12 +259,12 @@ pub struct MapTileState {
     /// for a theme flip on the base slot, is a re-download if it comes back),
     /// and by [`Self::clear`] with everything else.
     ///
-    /// **A theme flip does NOT touch it.** [`Self::adopt_theme`] drops the
-    /// base slot because the committed style baked into its tiles is the
+    /// **A theme flip does NOT touch it.** The base slot is re-styled on a
+    /// flip because the committed style its tiles are styled with is the
     /// theme; the hillshade remap (black shadows, white highlights, alpha
     /// from relief — `terrain::remap_hillshade`) is theme-independent by
-    /// design, so its pixels are right under both themes and rebuilding the
-    /// source on a flip would re-download 24-64 MiB for nothing.
+    /// design, so its pixels are right under both themes and there is nothing
+    /// for a flip to re-style or re-download.
     pub terrain: Option<HttpsTiles>,
 
     /// Whether the basemap archive has already been found unreachable this
@@ -285,17 +288,25 @@ pub struct MapTileState {
     /// with the network left out.
     offline: bool,
 
-    /// Which source-layers were disabled in the style [`Self::tiles`] was
-    /// built with — the comparison [`Self::ensure_base_tiles`] makes to
-    /// notice a toggle flip. Meaningful only while the slot holds the vector
-    /// source; the raster fallback has no style to filter.
+    /// Which source-layers were disabled in the style [`Self::tiles`] is
+    /// currently styled with — half of the comparison
+    /// [`Self::ensure_base_tiles`] makes to notice a toggle flip (the other
+    /// half is [`Self::current_theme_is_dark`]). Meaningful only while the
+    /// slot holds the vector source; the raster fallback has no style to
+    /// filter.
     base_disabled_source_layers: std::collections::BTreeSet<String>,
 
     /// How many times a base source has been constructed — the probe the
-    /// rebuild-on-toggle-flip pin reads, because two `HttpsTiles` cannot be
+    /// restyle-not-rebuild pin reads, because two `HttpsTiles` cannot be
     /// compared for identity once moved.
     #[cfg(test)]
     pub(crate) base_builds: usize,
+
+    /// How many times the live base source has been re-styled in place — the
+    /// other half of that pin: a theme flip or a toggle flip must move this,
+    /// not [`Self::base_builds`].
+    #[cfg(test)]
+    pub(crate) base_restyles: usize,
 
     /// [`Self::base_unreachable`]'s twin for the terrain slot, latched for
     /// the same reason. A failed terrain archive means the layer draws
@@ -315,39 +326,16 @@ impl Default for MapTileState {
             base_disabled_source_layers: std::collections::BTreeSet::new(),
             #[cfg(test)]
             base_builds: 0,
+            #[cfg(test)]
+            base_restyles: 0,
             terrain_failed: false,
         }
     }
 }
 
 impl MapTileState {
-    /// Adopt `is_dark` as the theme, releasing the one no longer drawn.
-    ///
-    /// **Nothing on the glass is blanked.** The source dropped belongs to the
-    /// theme that is no longer drawn; the pane is repainting from the other
-    /// theme's source this frame regardless. The accepted cost is a re-download
-    /// if the user flips back.
-    ///
-    /// Without it a single flip took residency from one live source to two and
-    /// held it for the session, because [`Self::ensure_base_tiles`] only ever
-    /// fills and [`Self::clear`] runs only on suspend and graphics reset. At
-    /// [`crate::tile_source::WASM_TILE_CACHE_ENTRIES`] one source's worst case
-    /// is 24 MiB of raster tiles, or ~59 MiB now that wasm32 draws the vector
-    /// basemap too, against the 288 MiB `squallar-device-profile` allows the
-    /// whole application on wasm32.
-    fn adopt_theme(&mut self, is_dark: bool) {
-        if is_dark == self.current_theme_is_dark {
-            return;
-        }
-        self.current_theme_is_dark = is_dark;
-        self.tiles = None;
-        // Deliberately NOT `self.terrain = None`: the hillshade remap is
-        // theme-independent (see the `terrain` field's docs), so a flip
-        // invalidates nothing of it.
-    }
-
-    /// Ensure the base-map tiles for the current theme are initialized, and
-    /// retire a source that has reported itself unusable.
+    /// Ensure the base-map tiles for the current theme and detail set are
+    /// initialized, and retire a source that has reported itself unusable.
     ///
     /// The archive is opened by the IO task, two range requests after the
     /// frame has already been handed a source, so a DNS failure, a 404, a host
@@ -360,20 +348,23 @@ impl MapTileState {
     /// logs at `error!` with the transport's own words, and the panel paints
     /// [`UNREACHABLE_ATTRIBUTION_TEXT`] in the credit corner for as long as
     /// the latch holds.
-    /// `disabled_source_layers` is the BasemapTiles layer's per-source-layer
-    /// choice set; a source built with a different set is **rebuilt**, which
-    /// re-downloads the visible tiles exactly as a theme flip does — the
-    /// accepted cost of a toggle flip, cheap because the CDN serves the same
-    /// ranges again. Caching parsed tile geometry so a flip could re-style
-    /// without refetching is real future work, recorded here and not begun.
+    ///
+    /// **A style change — a theme flip, or a flip of the BasemapTiles layer's
+    /// per-source-layer detail set — re-styles the live source in place**
+    /// ([`HttpsTiles::set_style`]): the source's parsed-geometry cache serves
+    /// the new style with zero fetches and zero re-parses, the tiles on the
+    /// glass keep drawing in the outgoing style until each restyled one
+    /// arrives, and nothing blanks. This replaces the v1 rebuild, which
+    /// dropped the source and re-downloaded every visible tile — the cost the
+    /// old note here recorded as accepted with the parsed cache as future
+    /// work. The terrain slot is untouched by any of it: the hillshade remap
+    /// is theme-independent by design (see the `terrain` field's docs).
     pub fn ensure_base_tiles(
         &mut self,
         is_dark: bool,
         disabled_source_layers: &std::collections::BTreeSet<String>,
         ctx: &egui::Context,
     ) {
-        self.adopt_theme(is_dark);
-
         if let Some(fault) = self.tiles.as_ref().and_then(HttpsTiles::fault) {
             log::error!(
                 "the basemap archive is unusable, so the basemap draws nothing \
@@ -383,11 +374,25 @@ impl MapTileState {
             self.tiles = None;
         }
 
-        if self.tiles.is_some() && self.base_disabled_source_layers != *disabled_source_layers {
-            self.tiles = None;
+        let style_changed = self.current_theme_is_dark != is_dark
+            || self.base_disabled_source_layers != *disabled_source_layers;
+        if style_changed {
+            self.current_theme_is_dark = is_dark;
+            self.base_disabled_source_layers = disabled_source_layers.clone();
+            if let Some(tiles) = self.tiles.as_mut() {
+                tiles.set_style(crate::basemap_style::committed_filtered(
+                    is_dark,
+                    disabled_source_layers,
+                ));
+                #[cfg(test)]
+                {
+                    self.base_restyles += 1;
+                }
+            }
         }
 
         if self.tiles.is_none() && !self.base_unreachable {
+            self.current_theme_is_dark = is_dark;
             self.base_disabled_source_layers = disabled_source_layers.clone();
             #[cfg(test)]
             {
@@ -516,8 +521,8 @@ impl MapTileState {
     }
 
     /// Drop the terrain source: the last pane showing the layer switched it
-    /// off. Symmetric with [`Self::adopt_theme`]'s handling of the base slot:
-    /// the accepted cost is a re-download if the user switches it back on.
+    /// off. Symmetric with [`Self::release_base_tiles`]: the accepted cost is
+    /// a re-download if the user switches it back on.
     pub fn release_terrain_tiles(&mut self) {
         self.terrain = None;
     }
@@ -542,7 +547,9 @@ impl MapTileState {
         self.tiles = None;
         self.terrain = None;
         self.terrain_failed = false;
-        self.current_theme_is_dark = !self.current_theme_is_dark;
+        // `current_theme_is_dark` and the disabled set stay: they describe the
+        // style last asked for, and the next `ensure_base_tiles` builds fresh
+        // on the empty slot whatever they say.
     }
 }
 

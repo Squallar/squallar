@@ -4,6 +4,7 @@
 use color::{AlphaColor, HueDirection, Srgb};
 use serde_json::{Number, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -51,9 +52,15 @@ pub enum Error {
 /// So `Mvt` keeps mvt-reader's map exactly as it arrives, moved rather than
 /// rebuilt, and converts a value only when a lookup asks for it. `Json` is the
 /// bag a caller supplies directly, which is what [`Context::new`] still takes.
+///
+/// `Mvt` is behind an `Arc` because one parsed tile ([`crate::mvt::ParsedTile`])
+/// is styled many times — every style layer visiting the source layer builds a
+/// `Context` per feature, and a consumer re-styling a cached parse does it all
+/// again — so the bag is shared rather than cloned per `Context`. The lookups
+/// read through the `Arc` unchanged.
 pub(crate) enum Properties {
     Json(HashMap<String, Value>),
-    Mvt(HashMap<String, mvt_reader::feature::Value>),
+    Mvt(Arc<HashMap<String, mvt_reader::feature::Value>>),
 }
 
 impl Properties {

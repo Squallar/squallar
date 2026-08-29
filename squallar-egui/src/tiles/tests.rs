@@ -987,17 +987,18 @@ fn each_tier_holds_the_canvas_its_docs_claim() {
 }
 
 // ---------------------------------------------------------------------------
-// A theme flip releases the theme that is no longer drawn.
+// A style change re-styles the live source in place.
 // ---------------------------------------------------------------------------
 
-/// **A flip drops the theme no longer drawn, and flipping back re-creates it.**
+/// **A theme flip re-styles the live source; it does not rebuild it.**
 ///
-/// `ensure_base_tiles` only ever fills and [`MapTileState::clear`] runs only on
-/// suspend and graphics reset, so without the release in `adopt_theme` a single
-/// light-dark toggle took residency from one live source to two and held it for
-/// the session.
+/// The rebuild was the v1 shape, and it refetched every visible tile; since
+/// `HttpsTiles::set_style` the flip is served out of the source's parsed
+/// cache with zero fetches (`tile_source::tests::archive` pins the zero).
+/// What this pins is the state machine: the slot survives, `base_builds`
+/// stays where the first frame put it, and `base_restyles` is what moves.
 #[test]
-fn a_theme_flip_releases_the_theme_that_is_no_longer_drawn() {
+fn a_theme_flip_restyles_the_live_source_instead_of_rebuilding() {
     let ctx = egui::Context::default();
     let mut state = MapTileState::default();
 
@@ -1006,59 +1007,73 @@ fn a_theme_flip_releases_the_theme_that_is_no_longer_drawn() {
         state.tiles.is_some() && state.current_theme_is_dark,
         "fixture: a dark frame must make the dark source"
     );
+    assert_eq!(state.base_builds, 1, "fixture: the first frame builds");
+    assert_eq!(state.base_restyles, 0, "fixture: nothing has flipped yet");
 
     state.ensure_base_tiles(false, &Default::default(), &ctx);
     assert!(
         state.tiles.is_some() && !state.current_theme_is_dark,
-        "the theme now drawn must be the one held"
+        "the flip must keep a live source in the slot"
+    );
+    assert_eq!(
+        (state.base_builds, state.base_restyles),
+        (1, 1),
+        "a theme flip is a restyle of the live source, not a rebuild"
+    );
+
+    state.ensure_base_tiles(false, &Default::default(), &ctx);
+    assert_eq!(
+        (state.base_builds, state.base_restyles),
+        (1, 1),
+        "an unchanged frame must neither rebuild nor restyle"
     );
 
     state.ensure_base_tiles(true, &Default::default(), &ctx);
-    assert!(
-        state.tiles.is_some() && state.current_theme_is_dark,
-        "flipping back must re-create the dark source, not leave a blank map"
+    assert_eq!(
+        (state.base_builds, state.base_restyles),
+        (1, 2),
+        "flipping back is another restyle of the same source"
     );
 }
 
-/// **The flip really releases**, rather than the single slot making the claim
-/// true by construction.
-///
-/// The non-triviality this needs is that the slot is *emptied* by the flip and
-/// not merely overwritten by the next `ensure_`: a release that only happened
-/// because something asked for the other theme would leave the old source
-/// resident for any frame that asked for nothing.
+/// **The flip keeps the source**, rather than the single slot making the
+/// claim true by construction: the frame after the flip, before anything is
+/// drawn, the slot still holds the very source whose parsed cache the
+/// restyle is draining into -- emptying it here would forfeit the cache the
+/// zero-fetch contract stands on.
 #[test]
-fn the_flip_empties_the_slot_before_anything_asks_for_the_other_theme() {
+fn the_flip_keeps_the_source_whose_caches_serve_the_restyle() {
     let ctx = egui::Context::default();
     let mut state = MapTileState::default();
 
     state.ensure_base_tiles(true, &Default::default(), &ctx);
     assert!(state.tiles.is_some(), "fixture: the dark source exists");
 
-    // The theme changed, but nothing has asked for the light source yet --
-    // which is the frame in which a release that piggybacks on the next
-    // `ensure_` would still be holding the dark one.
-    let taken = state.take_base_tiles();
-    assert!(
-        taken.is_some(),
-        "fixture: the dark source was there to take"
-    );
-    state.restore_base_tiles(taken);
-
     state.ensure_base_tiles(false, &Default::default(), &ctx);
     assert!(
         !state.current_theme_is_dark,
         "the state must have adopted the light theme"
     );
+
+    // The take/restore round-trip the per-pane draw makes must find the
+    // restyled source there, not a hole.
+    let taken = state.take_base_tiles();
+    assert!(
+        taken.is_some(),
+        "the flip emptied the slot: the parsed cache went with it and the \
+         restyle has nothing to draw from"
+    );
+    state.restore_base_tiles(taken);
+    assert_eq!(state.base_builds, 1, "no rebuild happened across the flip");
 }
 
-/// **A changed source-layer set rebuilds the base source; an unchanged one
-/// does not churn it; and the release keeps no source resident.** The rebuild
-/// is the whole mechanism a toggle flip rides — nothing signals it — so an
-/// `ensure_` that stopped comparing would leave every flip invisible until
-/// the next theme change.
+/// **A changed source-layer set re-styles the base source; an unchanged one
+/// does not churn it; and the release still keeps no source resident.** The
+/// comparison in `ensure_base_tiles` is the whole mechanism a toggle flip
+/// rides -- nothing signals it -- so an `ensure_` that stopped comparing
+/// would leave every flip invisible until the next theme change.
 #[test]
-fn a_changed_source_layer_set_rebuilds_the_base_source() {
+fn a_changed_source_layer_set_restyles_the_base_source() {
     let ctx = egui::Context::default();
     let mut state = MapTileState::default();
     let empty = std::collections::BTreeSet::new();
@@ -1068,36 +1083,44 @@ fn a_changed_source_layer_set_rebuilds_the_base_source() {
 
     state.ensure_base_tiles(true, &empty, &ctx);
     assert_eq!(
-        state.base_builds, 1,
-        "an unchanged set must not rebuild the source every frame"
+        (state.base_builds, state.base_restyles),
+        (1, 0),
+        "an unchanged set must not churn the source"
     );
 
     let disabled: std::collections::BTreeSet<String> = ["water".to_owned()].into();
     state.ensure_base_tiles(true, &disabled, &ctx);
     assert_eq!(
-        state.base_builds, 2,
-        "a changed set is the toggle flip, and it must rebuild"
+        (state.base_builds, state.base_restyles),
+        (1, 1),
+        "a changed set is the toggle flip, and it must restyle in place"
     );
     assert!(
         state.tiles.is_some(),
-        "the rebuild left a source in the slot"
+        "the restyle left a source in the slot"
     );
 
     state.ensure_base_tiles(true, &disabled, &ctx);
-    assert_eq!(state.base_builds, 2, "the new set is now the built set");
+    assert_eq!(
+        (state.base_builds, state.base_restyles),
+        (1, 1),
+        "the new set is now the styled set"
+    );
 
-    // The release drops the source; the next ensure builds fresh.
+    // The release drops the source -- and its parsed cache with it; the next
+    // ensure builds fresh, which is the layer-off contract unchanged.
     state.release_base_tiles();
     assert!(state.tiles.is_none(), "the release must empty the slot");
     state.ensure_base_tiles(true, &disabled, &ctx);
-    assert_eq!(state.base_builds, 3, "coming back is a fresh build");
+    assert_eq!(state.base_builds, 2, "coming back is a fresh build");
 }
 
 /// Residency is bounded by the flips rather than grown by them.
 ///
-/// **One source, not two.** Labels used to be a second tile pyramid over the
-/// same ground, so this asserted two; the vector basemap draws them out of the
-/// tile it already has.
+/// **One source, not two -- and now also not a churn of ones.** Labels used
+/// to be a second tile pyramid over the same ground, so this asserted two;
+/// the vector basemap draws them out of the tile it already has, and a flip
+/// re-styles that one source rather than replacing it.
 #[test]
 fn repeated_flips_never_hold_more_than_the_one_live_source() {
     let ctx = egui::Context::default();
@@ -1115,4 +1138,9 @@ fn repeated_flips_never_hold_more_than_the_one_live_source() {
             "round {round} (dark = {is_dark}) left the map with no source"
         );
     }
+
+    assert_eq!(
+        state.base_builds, 1,
+        "six flips over one session must reuse the one source they started with"
+    );
 }
