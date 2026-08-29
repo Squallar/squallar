@@ -338,10 +338,22 @@ impl super::Gui {
         );
 
         // -- Overlays --
+        //
+        // A layer surfaced through another layer's controls (Terrain, whose
+        // one switch is the Base Map inspector's "Terrain shading" toggle)
+        // gets no tile: offering it here would be a second door to the same
+        // switch. The parity walk's catalog floor excludes it by the same
+        // declaration (`sources::SURFACED_LAYER_COUNT`).
         let overlays: Vec<LayerId> = self
             .overlays
             .default_draw_order()
             .into_iter()
+            .filter(|kind| {
+                self.overlays
+                    .handler_by_id(kind)
+                    .and_then(|h| h.surfaced_through())
+                    .is_none()
+            })
             .filter(|kind| matches_query(&query, self.overlays.display_name(kind)))
             .collect();
         if !overlays.is_empty() {

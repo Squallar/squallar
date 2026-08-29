@@ -240,12 +240,28 @@ fn every_arrival_is_either_a_picture_or_a_drop() {
         "a stale raster was thrown away before the upload and the ledger \
          recorded no drop, so its rasterized bytes are invisible",
     );
+    // The balance is a process-wide identity, but it is only an identity *at
+    // rest*: a concurrent test that has counted an arrival and not yet
+    // counted its picture or drop is mid-path, and a snapshot taken inside
+    // that window reads unbalanced without any arrival having leaked (seen
+    // in the wild: 32 against 29+2, once, not reproducible). So the read is
+    // retried briefly. This spends none of the assertion's power — an
+    // arrival that truly left by a third exit stays unbalanced forever, and
+    // the bounded wait still fails on it.
+    let mut latest = after_drop;
+    for _ in 0..50 {
+        if latest.arrivals_balance() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        latest = ledger::totals();
+    }
     assert!(
-        after_drop.arrivals_balance(),
+        latest.arrivals_balance(),
         "{} arrivals against {} pictures and {} drops: an arrival left the \
          path by an exit neither counter names",
-        after_drop.arrived,
-        after_drop.pictures,
-        after_drop.dropped,
+        latest.arrived,
+        latest.pictures,
+        latest.dropped,
     );
 }

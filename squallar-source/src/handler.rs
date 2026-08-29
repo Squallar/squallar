@@ -482,6 +482,19 @@ impl PaneToggle {
     }
 }
 
+/// Where a layer that is not presented as a peer layer keeps its one
+/// user-facing switch — see [`SourceHandler::surfaced_through`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SurfacedControl {
+    /// The layer whose inspector hosts the toggle. The host's absence is the
+    /// declared edge: with the host removed from a pane's stack, the toggle
+    /// is unreachable there, and the surfaced layer simply follows its own
+    /// persisted per-pane state.
+    pub host: LayerId,
+    /// The toggle's label in the host's inspector.
+    pub label: &'static str,
+}
+
 /// Adding a layer means: implement this, give it a [`known`](crate::id::known)
 /// const, append that spelling to
 /// [`LAYER_ID_LEDGER`](crate::id::LAYER_ID_LEDGER), and register it in the
@@ -504,6 +517,25 @@ pub trait SourceHandler: Send {
 
     fn default_enabled(&self) -> bool {
         false
+    }
+
+    /// **Surfaced through another layer's controls instead of a stack row and
+    /// catalog tile of its own.**
+    ///
+    /// `None` — the answer for almost every layer — means the layer is a
+    /// Layers-panel citizen: a row in the stack, a tile in the catalog, its
+    /// own inspector body. `Some` means the ONE user-facing switch is a
+    /// toggle rendered inside the `host` layer's inspector under `label`;
+    /// the stack and the catalog then present no row and no tile for it.
+    ///
+    /// Presentation only: a surfaced layer still registers, still occupies
+    /// its draw-order weight, still draws its own pixels when its per-pane
+    /// enabled state says so, and its saved state keeps its own slot — a
+    /// config that enabled it through the old row reopens 1:1 with no
+    /// migration. The toggle is the SAME per-pane enabled state relocated,
+    /// not a second source of truth.
+    fn surfaced_through(&self) -> Option<SurfacedControl> {
+        None
     }
 
     /// Bumped on every data replacement; drives texture cache invalidation.
