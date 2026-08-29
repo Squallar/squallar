@@ -48,6 +48,11 @@ squallar-location = { workspace = true }
 # feature plumbing. (Import-forced; the fold order's dep list predates
 # WO-RL-1's `point: squallar_geo::GeoPoint` re-type.)
 squallar-geo = { workspace = true }
+# `zone_pack_source::use_download_url`: the native entry points name where the
+# deployed NWS zone pack is served, the way `squallar-web`'s entry names its
+# same-origin copy. Already in every one of this package's graphs via
+# squallar-app.
+squallar-overlays = { workspace = true }
 iana-time-zone = { workspace = true }
 log = { workspace = true }
 pollster = { workspace = true }

@@ -35,6 +35,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     log::info!("Starting squallar (native)");
 
+    // Before the app, because the first alerts round is what consumes it.
+    // Only names the URL; nothing is fetched here.
+    crate::platform::name_the_zone_pack();
+
     let event_loop = create_event_loop();
     let mut app = squallar_app::app::App::new(
         Box::new(crate::platform::create_platform()),

@@ -6,10 +6,23 @@
 use super::*;
 use crate::nws::zone_pack::{Coding, Kind, PackedZone, ZonePack};
 
-/// A UGC no other test in this binary uses. The installed pack is
-/// process-wide, so an id shared with another test's fixture would let this one
-/// answer a lookup that test arranged to have fail.
-fn drawable_pack_bytes() -> Vec<u8> {
+/// Held by every test that calls [`zone_pack::install`] (directly or through
+/// the loader) from install to last assertion. The installed pack is one
+/// process-wide slot and `install` *replaces* it, so two installer tests
+/// running on different threads would otherwise race each other's lookups.
+static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn hold_install_slot() -> std::sync::MutexGuard<'static, ()> {
+    // A poisoned lock means another installer test failed, not that this one
+    // cannot run.
+    INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// A pack holding one county square under `ugc` — a UGC no other test in this
+/// binary uses. The installed pack is process-wide, so an id shared with
+/// another test's fixture would let this one answer a lookup that test
+/// arranged to have fail.
+fn drawable_pack_bytes_for(ugc: &str) -> Vec<u8> {
     let square = vec![vec![vec![
         (35.0, -97.0),
         (35.0, -96.0),
@@ -17,9 +30,54 @@ fn drawable_pack_bytes() -> Vec<u8> {
         (36.0, -97.0),
         (35.0, -97.0),
     ]]];
-    let entries: Vec<PackedZone> =
-        vec![(zone_pack::key(Kind::County, "ZZC999").expect("key"), square)];
+    let entries: Vec<PackedZone> = vec![(zone_pack::key(Kind::County, ugc).expect("key"), square)];
     zone_pack::write(&entries, Coding::Varint, 5, 0.005)
+}
+
+fn drawable_pack_bytes() -> Vec<u8> {
+    drawable_pack_bytes_for("ZZC999")
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a tokio runtime")
+}
+
+/// `tls::init()` even for cleartext URLs: with `rustls-no-provider` and
+/// aws-lc-rs out of the graph, `Client::new()` panics without a provider.
+fn loopback_client() -> reqwest::Client {
+    squallar_source::tls::init();
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .expect("client")
+}
+
+/// Serve one canned response — status and raw byte body — to every request,
+/// forever. Byte-bodied where `zones.rs`'s stub is string-bodied, because a
+/// pack is not UTF-8.
+fn serve_bytes(status: u16, body: Vec<u8>) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("local addr").port();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut scratch = [0u8; 4096];
+            let _ = stream.read(&mut scratch);
+            let header = format!(
+                "HTTP/1.1 {status} .\r\nContent-Type: binary/octet-stream\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len(),
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(&body);
+            let _ = stream.flush();
+        }
+    });
+    format!("http://127.0.0.1:{port}/{PACK_FILE_NAME}")
 }
 
 /// The deploy is served from `/squallar/` on Pages and from `/` elsewhere, and
@@ -83,19 +141,14 @@ fn the_pack_sits_beside_the_zone_cache_and_not_inside_it() {
 /// worst kind of green. Both directions, with the same call.
 #[test]
 fn a_file_source_installs_a_real_pack_and_a_missing_one_is_not_an_error() {
+    let _slot = hold_install_slot();
     let dir = std::env::temp_dir().join(format!("squallar-a243-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let path = dir.join(PACK_FILE_NAME);
     let _ = std::fs::remove_file(&path);
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("a tokio runtime");
-    // Required even though nothing here is https: with `rustls-no-provider`
-    // and aws-lc-rs out of the graph, `Client::new()` panics without a provider.
-    squallar_source::tls::init();
-    let client = reqwest::Client::new();
+    let runtime = runtime();
+    let client = loopback_client();
 
     let absent = runtime.block_on(load(&client, &PackSource::File(path.clone())));
     assert!(
@@ -126,6 +179,177 @@ fn a_file_source_installs_a_real_pack_and_a_missing_one_is_not_an_error() {
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir(&dir);
+}
+
+/// The native gap, closed and pinned: a pack sitting at `pack_beside_cache`
+/// installs through the **real** source resolution — nothing here names a
+/// `PackSource`, only a cache directory, exactly what the alerts round passes
+/// — and zone resolution then answers from it without a request.
+#[test]
+fn a_pack_beside_the_cache_installs_through_the_real_source_resolution() {
+    use crate::nws::alert::{AlertCategory, NwsAlert};
+    use std::sync::Arc;
+
+    let _slot = hold_install_slot();
+    let dir = std::env::temp_dir().join(format!("squallar-zps0-{}", std::process::id()));
+    let cache_dir = dir.join("zones");
+    std::fs::create_dir_all(&cache_dir).expect("temp dirs");
+    std::fs::write(
+        pack_beside_cache(&cache_dir),
+        drawable_pack_bytes_for("ZZC998"),
+    )
+    .expect("write pack");
+
+    let runtime = runtime();
+    let client = loopback_client();
+
+    let zones = runtime
+        .block_on(install_from(&client, Some(&cache_dir), None))
+        .expect("a pack beside the cache must install with no source configured");
+    assert_eq!(zones, 1);
+    assert!(
+        zone_pack::installed()
+            .expect("installed")
+            .get(Kind::County, "ZZC998")
+            .is_some(),
+        "the file beside the cache must be the pack lookups now go through",
+    );
+
+    // And the layer above: an alert referencing that zone resolves from the
+    // pack. The client points at a port nothing listens on, so a resolver
+    // that reached for HTTP instead would fail this, not quietly pass it.
+    let mut alerts = [NwsAlert {
+        id: "urn:squallar:test:zps0".to_string(),
+        event: "Tornado Warning".to_string(),
+        category: AlertCategory::Warning,
+        severity: "Severe".parse().unwrap(),
+        urgency: "Immediate".parse().unwrap(),
+        certainty: "Observed".parse().unwrap(),
+        headline: None,
+        description: String::new(),
+        instruction: None,
+        area_desc: String::new(),
+        sender_name: String::new(),
+        effective: String::new(),
+        expires: String::new(),
+        onset: None,
+        ends: None,
+        valid_from: None,
+        valid_until: None,
+        affected_zones: vec!["http://127.0.0.1:9/zones/county/ZZC998".to_string()],
+        features: Arc::new(Vec::new()),
+    }];
+    let resolution = runtime.block_on(crate::nws::zones::resolve_zone_geometries(
+        &client,
+        &mut alerts,
+        None,
+    ));
+    assert_eq!(resolution.zones_resolved, 1, "{resolution:?}");
+    assert!(
+        !alerts[0].features.is_empty(),
+        "the resolved geometry must reach the alert itself",
+    );
+
+    let _ = std::fs::remove_file(pack_beside_cache(&cache_dir));
+    let _ = std::fs::remove_dir(&cache_dir);
+    let _ = std::fs::remove_dir(&dir);
+}
+
+/// The download fallback: no file, a named URL — the pack installs for this
+/// session AND lands beside the cache, published by rename, so the next
+/// session (connected or not) is the file case above.
+#[test]
+fn a_missing_file_downloads_installs_and_keeps_the_pack_beside_the_cache() {
+    let _slot = hold_install_slot();
+    let dir = std::env::temp_dir().join(format!("squallar-zps1-{}", std::process::id()));
+    let cache_dir = dir.join("zones");
+    let pack_path = pack_beside_cache(&cache_dir);
+    let _ = std::fs::remove_file(&pack_path);
+
+    let runtime = runtime();
+    let client = loopback_client();
+    let url = serve_bytes(200, drawable_pack_bytes_for("ZZC997"));
+
+    let zones = runtime
+        .block_on(install_from(&client, Some(&cache_dir), Some(&url)))
+        .expect("an absent file with a named download must install");
+    assert_eq!(zones, 1);
+    assert!(
+        zone_pack::installed()
+            .expect("installed")
+            .get(Kind::County, "ZZC997")
+            .is_some(),
+        "the downloaded pack must be the one lookups now go through",
+    );
+
+    let kept = std::fs::read(&pack_path)
+        .expect("the downloaded pack must have been kept beside the cache");
+    assert_eq!(
+        ZonePack::open(kept)
+            .expect("the kept file must open")
+            .zone_count(),
+        1,
+        "what is on disk must be the pack that was served",
+    );
+    assert!(
+        !pack_path.with_extension("pack.part").exists(),
+        "the temp file must not survive the rename that published it",
+    );
+
+    // Next session, no network named: the kept file is the source.
+    let offline = runtime
+        .block_on(install_from(&client, Some(&cache_dir), None))
+        .expect("the kept file must install with no download at all");
+    assert_eq!(offline, 1);
+
+    let _ = std::fs::remove_file(&pack_path);
+    let _ = std::fs::remove_dir(&cache_dir);
+    let _ = std::fs::remove_dir(&dir);
+}
+
+/// Failure changes nothing: a 404 degrades exactly as an absent pack always
+/// has, and rubbish bytes are refused *before* anything touches the disk — a
+/// bad response must not leave a file every later session refuses.
+#[test]
+fn a_failed_download_leaves_no_file_and_no_pack() {
+    let dir = std::env::temp_dir().join(format!("squallar-zps2-{}", std::process::id()));
+    let cache_dir = dir.join("zones");
+    let pack_path = pack_beside_cache(&cache_dir);
+    let _ = std::fs::remove_file(&pack_path);
+
+    let runtime = runtime();
+    let client = loopback_client();
+
+    let missing = serve_bytes(404, b"no such pack".to_vec());
+    let http = runtime.block_on(install_from(&client, Some(&cache_dir), Some(&missing)));
+    assert!(matches!(http, Err(LoadError::Http(404))), "{http:?}");
+
+    let rubbish = serve_bytes(200, b"not a pack at all".to_vec());
+    let rejected = runtime.block_on(install_from(&client, Some(&cache_dir), Some(&rubbish)));
+    assert!(
+        matches!(rejected, Err(LoadError::Rejected(_))),
+        "{rejected:?}"
+    );
+
+    assert!(
+        !pack_path.exists(),
+        "no failure mode may leave a pack file behind",
+    );
+    assert!(
+        !pack_path.with_extension("pack.part").exists(),
+        "no failure mode may leave a temp file behind",
+    );
+}
+
+/// The one line the native entry points call, wired to the slot
+/// `ensure_installed` reads.
+#[test]
+fn naming_a_download_url_reaches_the_loader() {
+    use_download_url("https://host.example/zones.pack".to_string());
+    assert_eq!(
+        download_url().as_deref(),
+        Some("https://host.example/zones.pack"),
+    );
 }
 
 /// The bytes a real converter run produced, read back through the loader.

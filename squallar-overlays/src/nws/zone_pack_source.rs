@@ -14,7 +14,10 @@
 //! - **Native.** A pack is a snapshot of a published edition that the NWS
 //!   supersedes on its own schedule; an embedded one can only be replaced by
 //!   shipping a new binary. A file beside the zone cache can be replaced by
-//!   re-running the converter.
+//!   re-running the converter — or, since the native entry points name the
+//!   deployed copy via [`use_download_url`], by deleting it: the next
+//!   connected session downloads the pack the web build serves and keeps it
+//!   at the same path.
 //!
 //! And a third reason that applies to both: `include_bytes!` of a path that is
 //! not in the tree does not compile. Making the app's build depend on a
@@ -80,6 +83,12 @@ impl std::fmt::Display for LoadError {
 /// browser knows the origin the app was served from.
 static CONFIGURED: RwLock<Option<PackSource>> = RwLock::new(None);
 
+/// Where a native host downloads the pack when the file beside its zone cache
+/// is absent or refused. Named by the entry point, like [`use_source`],
+/// because the deploy that serves the pack is the host's to know, not this
+/// crate's. Web names no download URL: its source already *is* the download.
+static DOWNLOAD_URL: RwLock<Option<String>> = RwLock::new(None);
+
 /// Whether a load has been attempted this session.
 ///
 /// One attempt, not one per round: a 404 does not become a 200 between two
@@ -93,6 +102,24 @@ pub fn use_source(source: PackSource) {
     if let Ok(mut slot) = CONFIGURED.write() {
         *slot = Some(source);
     }
+}
+
+/// Name the URL to download the pack from when the file beside the zone cache
+/// does not produce one. Called once at boot by the native entry points.
+///
+/// What the download produces is installed for this session *and kept at the
+/// file path*, so the next session — connected or not — reads the file and
+/// spends no request. Failure changes nothing: absence stays a supported
+/// state, and the round degrades to resolving zones over HTTP exactly as it
+/// did before the pack existed.
+pub fn use_download_url(url: String) {
+    if let Ok(mut slot) = DOWNLOAD_URL.write() {
+        *slot = Some(url);
+    }
+}
+
+fn download_url() -> Option<String> {
+    DOWNLOAD_URL.read().ok().and_then(|slot| slot.clone())
 }
 
 /// Resolve `file` against the URL of a page, the way a relative `<link href>`
@@ -183,6 +210,110 @@ pub async fn load(client: &reqwest::Client, source: &PackSource) -> Result<usize
     Ok(pack.zone_count())
 }
 
+/// Fetch the pack from `url`, install it, and keep the bytes at `path` so the
+/// next session reads the file with no request.
+///
+/// Install first, persist second: the file only ever holds bytes that
+/// [`zone_pack::ZonePack::open`] accepted, so a rubbish response cannot leave
+/// a pack on disk for every later session to refuse.
+async fn download_to_file(
+    client: &reqwest::Client,
+    url: &str,
+    path: &Path,
+) -> Result<usize, LoadError> {
+    let bytes = read_url(client, url).await?;
+    let pack = zone_pack::install(bytes.clone()).map_err(LoadError::Rejected)?;
+    keep_at(path, &bytes).await;
+    Ok(pack.zone_count())
+}
+
+/// Best-effort: the session already holds the pack, so a failed write costs
+/// only next session's re-download, and is logged rather than surfaced.
+#[cfg(not(target_arch = "wasm32"))]
+async fn keep_at(path: &Path, bytes: &[u8]) {
+    let write = async {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        // Temp-then-rename: the rename is what publishes the file, so a
+        // session killed mid-write leaves no truncated pack for the next boot
+        // to refuse.
+        let temp = path.with_extension("pack.part");
+        tokio::fs::write(&temp, bytes).await?;
+        tokio::fs::rename(&temp, path).await
+    };
+    match write.await {
+        Ok(()) => log::info!("Kept the NWS zone pack at {}", path.display()),
+        Err(e) => log::info!(
+            "Could not keep the NWS zone pack at {}: {e}; this session has it, the next downloads again",
+            path.display(),
+        ),
+    }
+}
+
+// Web never reaches this -- its source is a URL, not a file -- but the loader
+// has one body on every target, so the signature exists on both.
+#[cfg(target_arch = "wasm32")]
+async fn keep_at(path: &Path, _bytes: &[u8]) {
+    log::info!(
+        "{}: no filesystem to keep the pack on this target",
+        path.display()
+    );
+}
+
+/// The body of [`ensure_installed`], without its once-per-session gate:
+/// resolve the source, load it, and fall back to a named download when a
+/// *file* source did not produce a pack. Separate so a test can drive the real
+/// source resolution and the download path repeatedly, with the gate untouched.
+async fn install_from(
+    client: &reqwest::Client,
+    cache_dir: Option<&Path>,
+    download: Option<&str>,
+) -> Result<usize, LoadError> {
+    let Some(source) = source_for(cache_dir) else {
+        log::info!("No NWS zone pack source on this target; zones resolve over HTTP");
+        return Err(LoadError::Unavailable(
+            "no pack source on this target".to_string(),
+        ));
+    };
+    match load(client, &source).await {
+        Ok(zones) => {
+            log::info!("Installed the NWS zone pack: {zones} zones from {source:?}");
+            Ok(zones)
+        }
+        Err(why) => match (&source, download) {
+            // The file is absent or was refused; the deploy's copy is the
+            // second chance, and it writes through to the same path. Only for
+            // a file source: a host whose source is already a URL has named
+            // the only download it has.
+            (PackSource::File(path), Some(url)) => {
+                match download_to_file(client, url, path).await {
+                    Ok(zones) => {
+                        log::info!(
+                            "Installed the NWS zone pack: {zones} zones downloaded from {url} ({source:?}: {why})",
+                        );
+                        Ok(zones)
+                    }
+                    Err(dl) => {
+                        log::info!(
+                            "No NWS zone pack ({source:?}: {why}; {url}: {dl}); zones resolve over HTTP",
+                        );
+                        Err(dl)
+                    }
+                }
+            }
+            // INFO, not WARN: on a machine that has never run the converter
+            // and named no download there is no pack, and a notice the reader
+            // cannot act on is noise. What the reader *can* act on -- the
+            // request count -- is already logged by the round itself.
+            _ => {
+                log::info!("No NWS zone pack ({source:?}: {why}); zones resolve over HTTP");
+                Err(why)
+            }
+        },
+    }
+}
+
 /// Install the pack if there is one to install, once per session.
 ///
 /// Never fails a round: the answer to every failure is the behaviour that
@@ -192,18 +323,7 @@ pub async fn ensure_installed(client: &reqwest::Client, cache_dir: Option<&Path>
     if zone_pack::installed().is_some() || ATTEMPTED.swap(true, Ordering::SeqCst) {
         return;
     }
-    let Some(source) = source_for(cache_dir) else {
-        log::info!("No NWS zone pack source on this target; zones resolve over HTTP");
-        return;
-    };
-    match load(client, &source).await {
-        Ok(zones) => log::info!("Installed the NWS zone pack: {zones} zones from {source:?}"),
-        // INFO, not WARN: on a machine that has never run the converter there
-        // is no pack, and a notice the reader cannot act on is noise. What the
-        // reader *can* act on -- the request count -- is already logged by the
-        // round itself.
-        Err(why) => log::info!("No NWS zone pack ({source:?}: {why}); zones resolve over HTTP"),
-    }
+    let _ = install_from(client, cache_dir, download_url().as_deref()).await;
 }
 
 #[cfg(test)]

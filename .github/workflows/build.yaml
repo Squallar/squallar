@@ -912,6 +912,8 @@ jobs:
       # At cutover, all four change at once: this ARN to
       # github-actions-squallar, the sync target to s3://squallar-app-origin/,
       # the distribution id to squallar.app's, and the region only if it moves.
+      # A fifth literal moves with them: squallar::platform::ZONE_PACK_URL,
+      # which is where native builds download the zones.pack this job stages.
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
