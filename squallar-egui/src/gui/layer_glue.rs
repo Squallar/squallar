@@ -42,6 +42,41 @@ impl Gui {
             render_control_item(ui, kind, item, &mut updates, &mut probe);
         }
 
+        // **The switches of the layers surfaced through THIS layer's
+        // controls** — Terrain's "Terrain shading" in the Base Map body. Each
+        // toggle IS the guest layer's per-pane enabled state, the very state
+        // its old stack row's eye flipped, read and written through the same
+        // doors (`is_overlay_enabled`, `set_pane_overlay_with_fetch`) — one
+        // switch relocated, never a second source of truth. A pane that never
+        // held the guest (it ships OFF, so a fresh stack has no slot) gains
+        // its slot on the toggle's on-edge, exactly as the catalog tile added
+        // it. With this host layer removed from a pane's stack the toggle is
+        // unreachable there and the guest simply follows its own persisted
+        // state — see `TerrainHandler::surfaced_through` for the ruling.
+        let guests: Vec<(LayerId, &'static str)> = self
+            .overlays
+            .handlers()
+            .filter_map(|h| {
+                h.surfaced_through()
+                    .filter(|s| s.host == *kind)
+                    .map(|s| (h.id(), s.label))
+            })
+            .collect();
+        for (guest, label) in guests {
+            ui.add_space(4.0);
+            let mut on = pane.is_overlay_enabled(&guest);
+            let response = ui.checkbox(&mut on, label);
+            #[cfg(test)]
+            probe.record_item(&guest, DrawnControlKind::Checkbox, label, response.rect);
+            if response.changed() {
+                if on && pane.slot(&guest).is_none() {
+                    pane.add_layer(&self.overlays, &guest);
+                }
+                let idx = self.active_pane;
+                self.set_pane_overlay_with_fetch(pane, idx, &guest, on, actions);
+            }
+        }
+
         #[cfg(test)]
         {
             self.probes

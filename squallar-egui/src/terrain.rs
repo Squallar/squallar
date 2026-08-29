@@ -18,6 +18,7 @@ use std::sync::Arc;
 use squallar_source::controls::{ControlEffect, ControlItem, ControlUpdate, ControlValue};
 use squallar_source::handler::{
     FetchPayload, OverlayItem, PaneMut, PaneRef, PaneToggle, RenderMode, SourceHandler, Surface,
+    SurfacedControl,
 };
 use squallar_source::id::{LayerId, known};
 use squallar_source::time::TimeAxis;
@@ -189,6 +190,26 @@ impl SourceHandler for TerrainHandler {
     }
     fn default_enabled(&self) -> bool {
         false
+    }
+    /// **The one switch lives in the Base Map inspector, as "Terrain
+    /// shading"** — the hillshade is presented as a property of the ground,
+    /// not as a peer layer, so the stack shows no Terrain row and the catalog
+    /// no Terrain tile. Same per-pane enabled state the old row's eye
+    /// toggled; a config that enabled Terrain through that row reopens
+    /// shading with no migration.
+    ///
+    /// The declared edge: hiding the Base Map layer with its eye does NOT
+    /// hide the shading — terrain draws its own pixels and follows its own
+    /// state — and a pane whose Base Map row was trashed has no reachable
+    /// terrain switch until the catalog re-adds Base Map; the shading again
+    /// just follows its own persisted state meanwhile. Chosen over coupling
+    /// terrain to the host's visibility because the coupling would make the
+    /// host's eye a second, implicit terrain switch.
+    fn surfaced_through(&self) -> Option<SurfacedControl> {
+        Some(SurfacedControl {
+            host: known::BASEMAP_TILES,
+            label: "Terrain shading",
+        })
     }
     fn is_enabled(&self, pane: &PaneRef<'_>) -> bool {
         PaneToggle::is_on(pane, self.enabled)
@@ -434,5 +455,10 @@ mod tests {
         assert!(!handler.default_enabled(), "OFF for existing users' maps");
         assert!(!handler.is_enabled(&PaneRef::bare(0)));
         assert_eq!(handler.time_axis(), TimeAxis::Live);
+        let surfaced = handler
+            .surfaced_through()
+            .expect("Terrain's one switch lives in the Base Map inspector");
+        assert_eq!(surfaced.host, known::BASEMAP_TILES);
+        assert_eq!(surfaced.label, "Terrain shading");
     }
 }

@@ -230,13 +230,19 @@ fn the_radar_layers_can_is_drawn_disabled_with_a_reason() {
     );
 }
 
-/// **Every registered layer reaches the catalog, curation or not.**
+/// **Every registered layer reaches the catalog, curation or not** — except
+/// the ones whose declaration says their switch lives elsewhere.
 ///
 /// The other half of the new-source rule: whether a layer joins a pane's stack
 /// is a product decision (`default_enabled`), but *appearing in the catalog* is
 /// unconditional — that is what "adding a source is one crate's work" rests on,
 /// and a curated stack must not be able to hide a layer from the one surface
-/// that lists what the build can draw.
+/// that lists what the build can draw. The one sanctioned exception is a
+/// layer surfaced through another layer's controls
+/// (`SourceHandler::surfaced_through` — Terrain, through the Base Map
+/// inspector): a *declaration*, not a curation, and the flip side is asserted
+/// too — such a layer must NOT be offered, or the catalog is a second door to
+/// its one switch.
 #[test]
 fn every_registered_layer_is_offered_by_the_catalog_even_after_a_removal() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -245,6 +251,21 @@ fn every_registered_layer_is_offered_by_the_catalog_even_after_a_removal() {
         registered.len() >= 10,
         "non-triviality floor: this build registers {} layers",
         registered.len(),
+    );
+    let surfaced: Vec<bool> = registered
+        .iter()
+        .map(|id| {
+            h.gui()
+                .overlays
+                .handler_by_id(id)
+                .and_then(|handler| handler.surfaced_through())
+                .is_some()
+        })
+        .collect();
+    assert_eq!(
+        surfaced.iter().filter(|&&s| s).count(),
+        crate::sources::SURFACED_LAYER_COUNT,
+        "the surfaced set moved without the hand-kept count moving with it",
     );
 
     // Curate the pane down as far as it will go, so the catalog is being asked
@@ -255,14 +276,24 @@ fn every_registered_layer_is_offered_by_the_catalog_even_after_a_removal() {
     h.warm_up();
 
     h.open_catalog();
-    for id in &registered {
+    for (id, is_surfaced) in registered.iter().zip(&surfaced) {
         let name = h.overlay_display_name(id).to_owned();
-        assert!(
-            h.catalog_tile(crate::ui::CatalogGroup::Layers, &name)
-                .is_some(),
-            "{id:?} ({name:?}) is registered but the catalog offers no tile \
-             for it - a curated pane can hide a layer from the inventory",
-        );
+        let tile = h.catalog_tile(crate::ui::CatalogGroup::Layers, &name);
+        if *is_surfaced {
+            assert!(
+                tile.is_none(),
+                "{id:?} ({name:?}) is surfaced through another layer's \
+                 controls and the catalog offers a tile anyway - a second \
+                 door to its one switch",
+            );
+        } else {
+            assert!(
+                tile.is_some(),
+                "{id:?} ({name:?}) is registered but the catalog offers no \
+                 tile for it - a curated pane can hide a layer from the \
+                 inventory",
+            );
+        }
     }
 }
 
@@ -368,10 +399,15 @@ fn a_config_written_before_curation_loads_to_the_stack_it_names() {
 /// **A config written before the Terrain layer existed still serves it** —
 /// additively, with no migration and no CONFIG_VERSION bump. Terrain ships
 /// OFF, so for a default-off layer "served" means what the tree means by it:
-/// the old user's stack is untouched (nothing new is drawn on their map), the
-/// catalog offers the layer, adding it lands at its registry position — the
+/// the old user's stack is untouched (nothing new is drawn on their map),
+/// the Base Map inspector offers the "Terrain shading" toggle (the layer is
+/// surfaced through the Base Map's controls — no catalog tile, no stack
+/// row), switching it on lands the slot at its registry position — the
 /// bottom, weight 2 — and the addition reopens 1:1. The fixture JSON is the
-/// pre-Terrain shape (`root_site_v4.json`'s pane, abbreviated).
+/// pre-Terrain shape (`root_site_v4.json`'s pane, abbreviated). The add
+/// below goes through `add_layer_on_pane_for_test`, which is the same
+/// `PaneState::add_layer` the inspector toggle's on-edge calls; the chrome
+/// route itself is driven in `terrain_draws_without_a_row_or_a_tile`.
 #[test]
 fn terrain_appears_for_a_config_written_before_it_existed() {
     let json = r#"{
@@ -403,7 +439,8 @@ fn terrain_appears_for_a_config_written_before_it_existed() {
         "non-triviality: the file's own slots came through",
     );
 
-    // The catalog's add — the door an old user reaches the new layer through.
+    // The add the Base Map inspector toggle's on-edge performs — the door an
+    // old user reaches the new layer through.
     assert!(
         gui.add_layer_on_pane_for_test(0, &known::TERRAIN),
         "a config that never heard of Terrain must not block adding it",
@@ -652,5 +689,111 @@ fn the_basemap_source_layer_choices_reopen_one_to_one() {
         toggle_state(&reopened, "sl:transportation"),
         Some(true),
         "an untouched toggle drifted through the round trip",
+    );
+}
+
+/// **The Terrain layer is surfaced through the Base Map's controls: the
+/// stack draws no row for it and the catalog offers no tile — and switching
+/// it on through the one switch it does have still puts its pixels in the
+/// pane's dispatch.** Hidden-from-the-panel must never mean
+/// hidden-from-the-glass: the layer registers, occupies weight 2 and draws
+/// by its own per-pane state; only its presentation moved into the Base Map
+/// inspector.
+#[test]
+fn terrain_draws_without_a_row_or_a_tile() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+
+    // No tile: the catalog's Overlays group skips a surfaced layer.
+    h.open_catalog();
+    let tiles = h.catalog().tiles;
+    assert!(
+        tiles
+            .iter()
+            .any(|tile| tile.group == crate::ui::CatalogGroup::Layers),
+        "non-vacuity: the catalog drew no layer tiles at all",
+    );
+    assert!(
+        !tiles
+            .iter()
+            .any(|tile| tile.group == crate::ui::CatalogGroup::Layers && tile.label == "Terrain"),
+        "the catalog offers a Terrain tile — a second door to the Base Map \
+         inspector's one switch",
+    );
+    assert!(
+        h.gui_mut().dismiss_top_layer(),
+        "the catalog was open, so a back press must close it"
+    );
+    h.warm_up();
+
+    // The one switch, on — and the layer draws.
+    h.set_terrain_from_basemap_inspector(true);
+    h.warm_up();
+    let order = h.paint_order(0);
+    assert!(
+        order.iter().any(|(id, _)| *id == known::TERRAIN),
+        "Terrain is enabled and the pane never dispatched it — hiding the \
+         row hid the layer: {order:?}",
+    );
+
+    // And still no row while it draws.
+    h.open_layers();
+    assert!(
+        h.stack_row(&known::TERRAIN).is_none(),
+        "the stack drew a Terrain row — the layer is surfaced through the \
+         Base Map inspector and must not be presented as a peer layer",
+    );
+    assert!(
+        h.stack_row(&known::BASEMAP_TILES).is_some(),
+        "non-vacuity: the stack draws rows (the Base Map's own is missing)",
+    );
+}
+
+/// **A config from the row era with Terrain enabled reopens shading, now
+/// controlled from the Base Map inspector — migration-free.** The slot list
+/// names Terrain exactly as the old stack row's eye left it; loading it must
+/// draw the shading (the pane dispatches the layer) and the relocated toggle
+/// must read ON — proven by clicking it once and watching the state land
+/// OFF, which a toggle rendering anything but the live state cannot do.
+#[test]
+fn a_terrain_enabled_config_reopens_shading_under_the_new_toggle() {
+    let json = r#"{
+        "config_version": 4,
+        "pane_count": 1,
+        "active_pane": 0,
+        "site": "KTLX",
+        "panes": [{
+            "layer_slots": [
+                {"id": "BasemapTiles", "enabled": true},
+                {"id": "Terrain", "enabled": true},
+                {"id": "Radar", "enabled": true}
+            ]
+        }]
+    }"#;
+
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    assert!(
+        h.gui_mut().load_ui_config(&store_with(json)),
+        "the row-era config must load",
+    );
+    h.warm_up();
+
+    assert!(
+        h.overlay_enabled_on(0, &known::TERRAIN),
+        "the slot said enabled and the pane does not draw it — reopen is \
+         not 1:1 for the user who toggled Terrain last week",
+    );
+    let order = h.paint_order(0);
+    assert!(
+        order.iter().any(|(id, _)| *id == known::TERRAIN),
+        "the enabled slot never reached the pane's dispatch: {order:?}",
+    );
+
+    // The relocated toggle reads the same state: clicking it once lands OFF.
+    // (The helper asserts the landing, which is what pins the read.)
+    h.set_terrain_from_basemap_inspector(false);
+    h.warm_up();
+    assert!(
+        !h.paint_order(0).iter().any(|(id, _)| *id == known::TERRAIN),
+        "the toggle's off did not stop the dispatch — two sources of truth",
     );
 }

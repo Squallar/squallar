@@ -15487,7 +15487,9 @@ fn the_basemap_credit_clears_the_bottom_chrome_at_every_width() {
 /// The unreachable rows drive the latch through the test door
 /// (`latch_base_unreachable`) rather than a real dead transport, so what
 /// they prove is the composition *given* the latch; the terrain dimension is
-/// driven through the real catalogue toggle in every row that needs it.
+/// driven through the layer's real switch in every row that needs it — the
+/// Base Map inspector's "Terrain shading" toggle, the one control the layer
+/// has now that it is surfaced through the Base Map's own body.
 #[test]
 fn the_credit_corner_names_every_source_actually_painting() {
     use crate::tiles::{
@@ -15498,8 +15500,7 @@ fn the_credit_corner_names_every_source_actually_painting() {
         let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
         h.frame();
         if terrain_on {
-            h.add_layer_from_catalog(&known::TERRAIN);
-            h.close_layers();
+            h.set_terrain_from_basemap_inspector(true);
         }
         if unreachable {
             h.latch_base_unreachable();
@@ -15554,13 +15555,15 @@ fn the_credit_corner_names_every_source_actually_painting() {
     }
 }
 
-/// 66d. **The Copernicus credit follows the Terrain layer's own controls —
-///      on through the catalogue's tile, off through the row's eye — and the
-///      wider composed notice still clears the bottom chrome.**
+/// 66d. **The Copernicus credit follows the Terrain layer's own switch —
+///      on and off through the Base Map inspector's "Terrain shading"
+///      toggle — and the wider composed notice still clears the bottom
+///      chrome.**
 ///
 /// The toggle legs drive the credit through the chrome the user has, not a
-/// state poke: the catalogue tile is what turns the layer on, the stack
-/// row's eye is the layer's one visibility switch.
+/// state poke: since the layer became surfaced through the Base Map's
+/// controls, that inspector toggle is the layer's one visibility switch —
+/// the stack shows no Terrain row and the catalog no Terrain tile.
 ///
 /// The geometry legs re-run 66b's collision scan with the composed, wider
 /// line up: 1200x874 with the transport expanded is the width 66b records as
@@ -15589,9 +15592,8 @@ fn the_copernicus_credit_follows_the_terrain_toggle() {
              no Copernicus credit",
         );
 
-        // --- ON, through the catalogue's own tile.
-        h.add_layer_from_catalog(&known::TERRAIN);
-        h.close_layers();
+        // --- ON, through the Base Map inspector's own toggle.
+        h.set_terrain_from_basemap_inspector(true);
         h.frame();
         let panel = h.map_panel_rect();
         assert!(
@@ -15637,27 +15639,10 @@ fn the_copernicus_credit_follows_the_terrain_toggle() {
             );
         }
 
-        // --- OFF, through the row's eye — the layer's one visibility switch.
-        h.open_layers();
-        let scroll_pos = h
-            .layers_panel_rect()
-            .expect("the layers panel was just opened")
-            .center();
-        let found = h.scroll_until(scroll_pos, egui::vec2(0.0, -120.0), 60, |h| {
-            h.stack_row(&known::TERRAIN)
-                .is_some_and(|row| h.screen_rect().contains(row.rect.center()))
-        });
-        assert!(
-            found,
-            "{case}: the stack never drew a Terrain row on screen"
-        );
-        let row = h
-            .stack_row(&known::TERRAIN)
-            .expect("the row was just found");
-        assert!(row.eye_on, "{case}: the eye must draw the live (on) state");
-        h.mouse_click(row.eye.center());
-        h.warm_up();
-        h.close_layers();
+        // --- OFF, through the same toggle — the layer's one visibility
+        // switch (the helper asserts the click landed the off state, which
+        // is also the pin that the checkbox rendered the live on state).
+        h.set_terrain_from_basemap_inspector(false);
         h.frame();
         let panel = h.map_panel_rect();
         assert!(

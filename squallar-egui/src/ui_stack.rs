@@ -383,7 +383,26 @@ impl super::Gui {
         }
 
         // Top row = drawn last: display row `i` is `draw_order[len - 1 - i]`.
-        let order: Vec<LayerId> = pane.draw_order().rev().cloned().collect();
+        //
+        // A layer surfaced through another layer's controls (Terrain, whose
+        // one switch is the Base Map inspector's "Terrain shading" toggle)
+        // gets no row: it is presented as a property of its host, not as a
+        // peer layer. Its slot stays in the pane — it draws by its own state
+        // — and `resolve_stack_drag` splices it back before any reorder
+        // lands, so a drag cannot move or drop what was never displayed. An
+        // id no handler serves keeps its row: a newer build's layer is the
+        // user's to see and curate.
+        let order: Vec<LayerId> = pane
+            .draw_order()
+            .rev()
+            .filter(|kind| {
+                self.overlays
+                    .handler_by_id(kind)
+                    .and_then(|h| h.surfaced_through())
+                    .is_none()
+            })
+            .cloned()
+            .collect();
         let mut row_rects: Vec<egui::Rect> = Vec::with_capacity(order.len());
         let mut drag_released = false;
         // Deferred to after the walk, and it has to be: the rows the loop
@@ -762,7 +781,18 @@ impl super::Gui {
             display.remove(from);
             let insert_at = if slot > from { slot - 1 } else { slot }.min(display.len());
             display.insert(insert_at, dragged);
-            let reordered: Vec<LayerId> = display.into_iter().rev().collect();
+            let mut reordered: Vec<LayerId> = display.into_iter().rev().collect();
+            // The rows the user dragged among are only the DISPLAYED layers;
+            // a layer surfaced through another layer's controls has no row
+            // and was filtered out of `order`. Splice each one back at the
+            // bottom-first index it held, so landing a drag neither drops it
+            // (`set_draw_order` appends unnamed slots on top) nor moves it.
+            let full: Vec<LayerId> = pane.draw_order().cloned().collect();
+            for (idx, kind) in full.iter().enumerate() {
+                if !reordered.contains(kind) {
+                    reordered.insert(idx.min(reordered.len()), kind.clone());
+                }
+            }
             pane.set_draw_order(&reordered);
             return;
         }

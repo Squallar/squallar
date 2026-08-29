@@ -48,7 +48,7 @@ use crate::ui_input::{MapPointerFrame, TouchGestures};
 use crate::ui_layout::PointerModality;
 use squallar_geo::GeoPoint;
 use squallar_radar::fields as radar_fields;
-use squallar_source::id::LayerId;
+use squallar_source::id::{LayerId, known};
 
 /// The radar layer's own field value for an id.
 ///
@@ -906,6 +906,50 @@ impl InputHarness {
             "the catalog's {name:?} tile did not put {kind:?} in the active \
              pane's stack",
         );
+    }
+
+    /// Flip the active pane's terrain shading the user's way: the Base Map
+    /// layer's inspector body, whose "Terrain shading" toggle is the Terrain
+    /// layer's one switch — the stack shows no Terrain row and the catalog no
+    /// Terrain tile (`TerrainHandler::surfaced_through`). Scrolls the toggle
+    /// on screen, clicks it, and asserts the state landed, which is also the
+    /// pin that the checkbox was RENDERING the state it now flipped. Leaves
+    /// the inspector and the layers panel closed.
+    pub(crate) fn set_terrain_from_basemap_inspector(&mut self, on: bool) {
+        assert_ne!(
+            self.overlay_enabled_on(self.active_pane_index(), &known::TERRAIN),
+            on,
+            "precondition: the toggle click below must be a real change",
+        );
+        self.open_layer_in_inspector(&known::BASEMAP_TILES);
+        let pos = self
+            .inspector_rect()
+            .expect("the Base Map body was just opened")
+            .center();
+        let toggle = |h: &Self| {
+            h.control_items().into_iter().find(|item| {
+                item.handler.as_ref() == Some(&known::TERRAIN)
+                    && item.kind == crate::ui::DrawnControlKind::Checkbox
+            })
+        };
+        let found = self.scroll_until(pos, egui::vec2(0.0, -120.0), 60, |h| {
+            toggle(h).is_some_and(|item| h.screen_rect().contains(item.rect.center()))
+        });
+        assert!(
+            found,
+            "the Base Map inspector never drew the Terrain shading toggle on \
+             screen",
+        );
+        let item = toggle(self).expect("the toggle was just found");
+        self.mouse_click(item.rect.center());
+        self.warm_up();
+        assert_eq!(
+            self.overlay_enabled_on(self.active_pane_index(), &known::TERRAIN),
+            on,
+            "clicking the Terrain shading toggle did not land the state",
+        );
+        self.close_inspector();
+        self.close_layers();
     }
 
     /// Put `kind` in pane `idx`'s stack without going through the chrome — for

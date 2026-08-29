@@ -59,6 +59,21 @@ pub(crate) const REGISTERED_LAYER_COUNT: usize = 17;
 #[cfg(test)]
 pub(crate) const REGISTERED_FIELD_COUNT: usize = 17 + 23 + 2 + 4;
 
+/// **How many registered layers are surfaced through another layer's controls
+/// — a hand-kept number, like [`REGISTERED_LAYER_COUNT`].**
+///
+/// Today: Terrain alone, whose one switch is the Base Map inspector's
+/// "Terrain shading" toggle. Such a layer registers, draws and persists like
+/// any other but presents no stack row and no catalog tile, so the parity
+/// walk's catalog floor is `REGISTERED_LAYER_COUNT` minus this.
+///
+/// **Never derive this from `all()`** — the same discipline as the two
+/// constants above: a floor computed from the registry compares the registry
+/// against itself and cannot fail. `the_surfaced_layers_are_exactly_terrain`
+/// is the cross-check that keeps this literal honest.
+#[cfg(test)]
+pub(crate) const SURFACED_LAYER_COUNT: usize = 1;
+
 /// The default draw order, bottom to top — every registered layer's id sorted
 /// by `SourceHandler::draw_order_weight`.
 pub fn default_draw_order() -> Vec<LayerId> {
@@ -362,6 +377,65 @@ mod registry_identity_tests {
                 "{}'s id is missing from LAYER_ID_LEDGER — ledger rows are \
                  append-only and this one was never appended",
                 h.display_name(),
+            );
+        }
+    }
+
+    /// **Which layers are surfaced through another layer's controls, pinned
+    /// by name** — and the cross-check that keeps the hand-kept
+    /// [`super::SURFACED_LAYER_COUNT`] honest. Terrain alone, through the
+    /// Base Map inspector, as "Terrain shading": the layer registers and
+    /// draws like any other (every other pin in this module covers it), it is
+    /// only *presented* inside its host's inspector. A second surfaced layer
+    /// joins this list and bumps the literal deliberately, or fails here.
+    #[test]
+    fn the_surfaced_layers_are_exactly_terrain() {
+        let surfaced: Vec<(String, String, &'static str)> = all()
+            .iter()
+            .filter_map(|h| {
+                h.surfaced_through().map(|s| {
+                    (
+                        h.id().as_str().to_owned(),
+                        s.host.as_str().to_owned(),
+                        s.label,
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            surfaced,
+            vec![(
+                "Terrain".to_owned(),
+                "BasemapTiles".to_owned(),
+                "Terrain shading",
+            )],
+            "the set of layers surfaced through another layer's controls \
+             moved — the stack, the catalog and the parity walk's floors all \
+             read this declaration",
+        );
+        assert_eq!(
+            surfaced.len(),
+            super::SURFACED_LAYER_COUNT,
+            "the hand-kept count and the live declarations disagree",
+        );
+        // A host that is itself surfaced would chain the one reachable
+        // switch behind another hidden layer's inspector — refuse the shape
+        // before anyone builds it.
+        let handlers = all();
+        for (id, host, _) in &surfaced {
+            let host_handler = handlers
+                .iter()
+                .find(|h| h.id().as_str() == host)
+                .unwrap_or_else(|| panic!("{id}'s host {host} is not registered"));
+            assert!(
+                host_handler.surfaced_through().is_none(),
+                "{id} is surfaced through {host}, which is itself surfaced — \
+                 the switch would be unreachable",
+            );
+            assert!(
+                host_handler.default_enabled(),
+                "{id} is surfaced through {host}, which ships OFF — a fresh \
+                 install could never reach the switch",
             );
         }
     }

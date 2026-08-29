@@ -201,6 +201,29 @@ fn walk_layer_controls(h: &mut InputHarness, width: WidthClass) {
     h.add_layer_to_pane(0, &HIDDEN_WALK_HANDLER);
     h.set_overlay_on_pane(0, &HIDDEN_WALK_HANDLER, false);
     for handler in &registered {
+        // A layer surfaced through another layer's controls has no stack row
+        // and no catalog tile; its whole declared surface is the one toggle
+        // its host's inspector renders under the declared label. Walk THAT:
+        // open the host's body and assert the toggle drawn — the same
+        // "reachable through the chrome" the row route proves for everyone
+        // else. Its own control tree is the master toggle alone, which the
+        // walk excludes for every layer.
+        if let Some(surfaced) = h
+            .gui()
+            .overlays
+            .handler_by_id(handler)
+            .and_then(|hd| hd.surfaced_through())
+        {
+            h.open_layer_in_inspector(&surfaced.host);
+            assert_control_reachable(
+                h,
+                width,
+                handler,
+                DrawnControlKind::Checkbox,
+                surfaced.label,
+            );
+            continue;
+        }
         if *handler == HIDDEN_WALK_HANDLER {
             assert!(
                 !h.overlay_enabled_on(0, handler),
@@ -328,6 +351,17 @@ fn walk_catalog(h: &mut InputHarness, width: WidthClass) {
         inventory.push((CatalogGroup::Presets, preset.name));
     }
     for kind in crate::sources::default_draw_order() {
+        // A layer surfaced through another layer's controls has no catalog
+        // tile by declaration — its switch is walked by the layer-controls
+        // leg, through its host's inspector.
+        if h.gui()
+            .overlays
+            .handler_by_id(&kind)
+            .and_then(|handler| handler.surfaced_through())
+            .is_some()
+        {
+            continue;
+        }
         inventory.push((
             CatalogGroup::Layers,
             h.overlay_display_name(&kind).to_owned(),
@@ -356,11 +390,13 @@ fn walk_catalog(h: &mut InputHarness, width: WidthClass) {
         .count();
     assert_eq!(
         layers_in_inventory,
-        crate::sources::REGISTERED_LAYER_COUNT,
+        crate::sources::REGISTERED_LAYER_COUNT - crate::sources::SURFACED_LAYER_COUNT,
         "the catalog leg's layer inventory is {layers_in_inventory} on \
-         {width:?} but this build registers {} layers — the walk would check \
-         that many fewer tiles and still pass",
+         {width:?} but this build registers {} layers and surfaces {} of them \
+         through another layer's controls — the walk would check the wrong \
+         number of tiles and still pass",
         crate::sources::REGISTERED_LAYER_COUNT,
+        crate::sources::SURFACED_LAYER_COUNT,
     );
 
     // **The field floor, and it is new at WO-E9d land 2 because the exposure is
