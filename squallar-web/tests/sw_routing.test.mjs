@@ -1258,3 +1258,507 @@ describe("lifecycle", () => {
     await assert.rejects(async () => (await event.response).text());
   });
 });
+
+// ===========================================================================
+describe("archive blocks: ranged reads survive in a persistent block cache", () => {
+  // =========================================================================
+  //
+  // The PMTiles archives are read by `Range`, `Cache.put()` throws on the 206
+  // those reads produce, and browsers do not reliably cache partial responses
+  // — so before this cache, browsed areas survived nothing. The worker now
+  // quantizes each single-range read to 64 KiB blocks, stores each block as a
+  // synthetic-URL 200 (the 206 prohibition is about what is STORED, not what
+  // is SERVED), and reassembles an exact 206. Exactness is load-bearing: the
+  // wasm reader errors `RangeRequestsUnsupported` on any status but 206 and
+  // `ResponseBodyTooLong` on an over-long body.
+  //
+  // The negatives here follow the suite's own rule: `routeFor` is default-deny,
+  // so a deleted predicate can hide behind the default. The assertions that can
+  // actually fail are on the predicates themselves plus the behavioural runs.
+
+  /** A deterministic archive body: byte i is (i * 31 + seed) % 256. */
+  function archiveBytes(length, seed = 7) {
+    const bytes = new Uint8Array(length);
+    for (let i = 0; i < length; i += 1) bytes[i] = (i * 31 + seed) % 256;
+    return bytes;
+  }
+
+  /** The Range header of a request, whichever shape the harness's fetch saw. */
+  function rangeHeaderOf(input, init) {
+    if (typeof input !== "string" && input && input.headers && typeof input.headers.get === "function") {
+      return input.headers.get("range");
+    }
+    const headers = init && init.headers;
+    if (!headers) return null;
+    if (typeof headers.get === "function") return headers.get("range");
+    return headers.range ?? headers.Range ?? null;
+  }
+
+  /** Serve `bytes` at `url` as an origin that honours single `bytes=N-M` ranges. */
+  function publishArchive(network, url, bytes, { ignoreRange = false } = {}) {
+    network.serve(url, (input, init) => {
+      const range = ignoreRange ? null : rangeHeaderOf(input, init);
+      const match = range === null ? null : /^bytes=(\d+)-(\d+)$/.exec(range);
+      if (!match) return new Response(bytes, { status: 200 });
+      const start = Number(match[1]);
+      if (start >= bytes.length) {
+        return new Response("unsatisfiable", {
+          status: 416,
+          headers: { "content-range": `bytes */${bytes.length}` },
+        });
+      }
+      const end = Math.min(Number(match[2]), bytes.length - 1);
+      return new Response(bytes.slice(start, end + 1), {
+        status: 206,
+        headers: {
+          "content-range": `bytes ${start}-${end}/${bytes.length}`,
+          "content-type": "application/octet-stream",
+        },
+      });
+    });
+  }
+
+  function fetchRange(worker, url, start, end) {
+    return worker.fetch(new Request(url, { headers: { range: `bytes=${start}-${end}` } }));
+  }
+
+  async function bodyOf(event) {
+    return Buffer.from(await (await event.response).arrayBuffer());
+  }
+
+  function blockCacheOf(worker, url) {
+    const { archiveGeneration, blockCacheName } = worker.internals;
+    return blockCacheName(archiveGeneration(new URL(url).pathname));
+  }
+
+  function archiveRequests(network, url) {
+    return network.log.filter((e) => e.url === url).length;
+  }
+
+  /** Test-only reach into the harness's storage: the entries of one cache. */
+  function blockEntries(worker, name) {
+    const cache = worker.caches.caches.get(name);
+    return cache ? [...cache.entries.entries()] : [];
+  }
+
+  it("quantizes a span to 64 KiB blocks, inclusive at both edges", async () => {
+    const worker = await bootWorker();
+    const { blockSpan, BLOCK_BYTES } = worker.internals;
+    const B = BLOCK_BYTES;
+    assert.equal(B, 64 * 1024, "the block quantum moved; every pin below assumed 64 KiB");
+
+    assert.deepEqual(blockSpan({ start: 0, end: B - 1 }), { first: 0, last: 0 });
+    assert.deepEqual(blockSpan({ start: 0, end: B }), { first: 0, last: 1 });
+    assert.deepEqual(blockSpan({ start: B - 1, end: B }), { first: 0, last: 1 });
+    assert.deepEqual(blockSpan({ start: B, end: 2 * B - 1 }), { first: 1, last: 1 });
+    assert.deepEqual(blockSpan({ start: 2 * B, end: 2 * B }), { first: 2, last: 2 });
+  });
+
+  it("accepts exactly the single-range form the reader emits, nothing else", async () => {
+    const worker = await bootWorker();
+    const { parseSingleRange } = worker.internals;
+
+    assert.deepEqual(parseSingleRange("bytes=0-15"), { start: 0, end: 15 });
+    assert.deepEqual(parseSingleRange("bytes=127-16383"), { start: 127, end: 16383 });
+
+    for (const value of [
+      null,
+      "",
+      "bytes=0-", // open-ended
+      "bytes=-500", // suffix
+      "bytes=0-1,5-9", // multi-range: reassembly would need a multipart body
+      "octets=0-1",
+      "bytes=5-2", // inverted
+      "bytes = 0-1",
+      "Bytes=0-1", // not the reader's spelling; passes through, which is safe
+    ]) {
+      assert.equal(parseSingleRange(value), null, `${JSON.stringify(value)} must not be owned`);
+    }
+  });
+
+  it("derives one generation per publish, shared by a part and its monolith", async () => {
+    const worker = await bootWorker();
+    const { archiveGeneration, blockCacheName, BLOCK_CACHE_PREFIX } = worker.internals;
+
+    const monolith = "/terrain/4ca64469750e-20260829/squallar-terrain-hillshade.pmtiles";
+    assert.equal(archiveGeneration(monolith), monolith);
+    assert.equal(archiveGeneration(`${monolith}.part000`), monolith);
+    assert.equal(archiveGeneration(`${monolith}.part123`), monolith);
+
+    // A regenerated archive is a NEW generation: this is the assertion that a
+    // wrong key would silently serve one publish's bytes as another's.
+    assert.notEqual(
+      blockCacheName(archiveGeneration("/basemap/omt-20260828.pmtiles")),
+      blockCacheName(archiveGeneration("/basemap/omt-20260901.pmtiles")),
+    );
+
+    // The purge machinery only sees `squallar-` caches; a name outside that
+    // prefix would be invisible to it and grow forever.
+    const name = blockCacheName(archiveGeneration(monolith));
+    assert.ok(name.startsWith(BLOCK_CACHE_PREFIX) && name.startsWith("squallar-"), name);
+  });
+
+  it("routes exactly the reader's ranged archive reads to the block cache", async () => {
+    const worker = await bootWorker();
+    const { routeFor, isArchivePart, isArchiveBlockSource, ARCHIVE_URLS } = worker.internals;
+    const [basemap, terrain] = ARCHIVE_URLS;
+    const range = "bytes=127-16383";
+
+    assert.equal(routeFor({ url: basemap, range }), "archive-block");
+    assert.equal(routeFor({ url: terrain, range }), "archive-block");
+    // The terrain archive is PUBLISHED as parts; the reader fetches them
+    // directly, and a part does not end in `.pmtiles`.
+    assert.equal(routeFor({ url: `${terrain}.part000`, range }), "archive-block");
+
+    // Not owned: everything that is not a single-range GET of an archive file.
+    assert.equal(routeFor({ url: basemap }), "network");
+    assert.equal(routeFor({ url: basemap, range: "bytes=0-1,5-9" }), "network");
+    assert.equal(routeFor({ url: basemap, range: "bytes=-500" }), "network");
+    assert.equal(routeFor({ url: basemap, method: "POST", range }), "network");
+    assert.equal(routeFor({ url: "https://example.test/data.bin", range }), "network");
+
+    // The predicates themselves, because default-deny masks their deletion.
+    const u = (s) => new URL(s);
+    assert.equal(isArchivePart(u(`${terrain}.part000`)), true);
+    assert.equal(isArchiveBlockSource(u(basemap)), true);
+    for (const url of [
+      "https://tiles.squallar.app.evil.example/x.pmtiles.part000",
+      "https://tiles.squallar.app/status/latest.json",
+      "https://tiles.squallar.app/basemap/omt.pmtiles.part", // no digits
+      "https://tiles.squallar.app/basemap/omt.pmtiles.part00", // part_url pads to 3
+      "https://tiles.squallar.app/basemap/omt.pmtiles/tile",
+    ]) {
+      assert.equal(isArchiveBlockSource(u(url)), false, `${url} is not an archive file`);
+    }
+  });
+
+  it("stays out of the request path for archive requests it does not own", async () => {
+    const worker = await bootWorker();
+    for (const request of [
+      new Request(worker.internals.ARCHIVE_URLS[0]),
+      new Request(worker.internals.ARCHIVE_URLS[0], { headers: { range: "bytes=0-1,5-9" } }),
+      new Request("https://example.test/data.bin", { headers: { range: "bytes=0-99" } }),
+    ]) {
+      const event = await worker.fetch(request);
+      assert.equal(event.handled, false, `the worker called respondWith for ${request.url}`);
+    }
+  });
+
+  it("reassembles the exact span with an exact Content-Range", async () => {
+    const worker = await bootWorker();
+    const url = worker.internals.ARCHIVE_URLS[0];
+    const B = worker.internals.BLOCK_BYTES;
+    const bytes = archiveBytes(3 * B + 4928);
+    publishArchive(worker.network, url, bytes);
+
+    // Unaligned at both edges, spanning three blocks.
+    const event = await fetchRange(worker, url, 100, 2 * B + 99);
+    assert.equal(event.handled, true, "the worker must own the read");
+    const response = await event.response;
+    assert.equal(response.status, 206, "the reader errors RangeRequestsUnsupported on anything else");
+    assert.equal(
+      response.headers.get("content-range"),
+      `bytes 100-${2 * B + 99}/${bytes.length}`,
+      "the Content-Range must describe exactly the bytes returned",
+    );
+    const body = Buffer.from(await response.arrayBuffer());
+    assert.equal(body.length, 2 * B, "the reader errors ResponseBodyTooLong on an over-long body");
+    assert.ok(body.equals(Buffer.from(bytes.slice(100, 2 * B + 100))), "the bytes are wrong");
+
+    // A span inside one block, and one aligned to both block edges.
+    for (const [start, end] of [
+      [B + 4464, B + 4564],
+      [B, 2 * B - 1],
+    ]) {
+      const inner = await fetchRange(worker, url, start, end);
+      const innerBody = await bodyOf(inner);
+      assert.equal(innerBody.length, end - start + 1);
+      assert.ok(innerBody.equals(Buffer.from(bytes.slice(start, end + 1))), `bytes=${start}-${end}`);
+      assert.equal(
+        (await inner.response).headers.get("content-range"),
+        `bytes ${start}-${end}/${bytes.length}`,
+      );
+    }
+  });
+
+  it("stores blocks only as synthetic 200s under app-origin keys", async () => {
+    const worker = await bootWorker();
+    const url = worker.internals.ARCHIVE_URLS[0];
+    const bytes = archiveBytes(3 * worker.internals.BLOCK_BYTES);
+    publishArchive(worker.network, url, bytes);
+
+    await fetchRange(worker, url, 100, worker.internals.BLOCK_BYTES + 100);
+
+    const name = blockCacheOf(worker, url);
+    const entries = blockEntries(worker, name);
+    assert.ok(entries.length > 0, "nothing was stored; the rest of this test would be vacuous");
+    for (const [key, { response }] of entries) {
+      // The harness's Cache.put throws on a 206, as the spec requires, so the
+      // fetch above completing already proves no 206 reached a put. This pins
+      // the stronger property: what is stored is a plain synthetic 200.
+      assert.equal(response.status, 200, `${key} is stored as ${response.status}`);
+      assert.ok(
+        key.startsWith(`${ORIGIN}__squallar_blk__/`),
+        `${key} is not a synthetic app-origin key`,
+      );
+    }
+    for (const { url: stored } of worker.cachedEntries()) {
+      assert.ok(
+        !stored.includes("tiles.squallar.app"),
+        `${stored}: the archive's own URL must never be a cache key — Cache.match is range-blind`,
+      );
+    }
+  });
+
+  it("serves a browsed span again without touching the network", async () => {
+    const worker = await bootWorker();
+    const url = worker.internals.ARCHIVE_URLS[0];
+    const B = worker.internals.BLOCK_BYTES;
+    const bytes = archiveBytes(3 * B);
+    publishArchive(worker.network, url, bytes);
+
+    await fetchRange(worker, url, 0, B + 5000);
+    const before = archiveRequests(worker.network, url);
+
+    // A different span over the same blocks: served from block blobs alone.
+    const again = await fetchRange(worker, url, 50, B - 1);
+    assert.ok((await bodyOf(again)).equals(Buffer.from(bytes.slice(50, B))));
+    assert.equal(
+      archiveRequests(worker.network, url),
+      before,
+      "a span already held in blocks was re-fetched",
+    );
+  });
+
+  it("keeps generations apart: each archive answers with its own bytes", async () => {
+    const worker = await bootWorker();
+    const [basemap, terrain] = worker.internals.ARCHIVE_URLS;
+    const basemapBytes = archiveBytes(200_000, 7);
+    const terrainBytes = archiveBytes(200_000, 3);
+    publishArchive(worker.network, basemap, basemapBytes);
+    publishArchive(worker.network, terrain, terrainBytes);
+
+    const one = await fetchRange(worker, basemap, 0, 100);
+    const two = await fetchRange(worker, terrain, 0, 100);
+    assert.ok((await bodyOf(one)).equals(Buffer.from(basemapBytes.slice(0, 101))));
+    assert.ok((await bodyOf(two)).equals(Buffer.from(terrainBytes.slice(0, 101))));
+
+    const names = (await worker.cacheNames()).filter((n) =>
+      n.startsWith(worker.internals.BLOCK_CACHE_PREFIX),
+    );
+    assert.equal(new Set(names).size, 2, `two archives, ${names.length} block caches: ${names}`);
+  });
+
+  it("keys a part and its monolith apart inside one generation", async () => {
+    const worker = await bootWorker();
+    const terrain = worker.internals.ARCHIVE_URLS[1];
+    publishArchive(worker.network, terrain, archiveBytes(100_000, 1));
+    publishArchive(worker.network, `${terrain}.part000`, archiveBytes(100_000, 2));
+
+    await fetchRange(worker, terrain, 0, 15);
+    await fetchRange(worker, `${terrain}.part000`, 0, 15);
+
+    const entries = blockEntries(worker, blockCacheOf(worker, terrain));
+    assert.equal(entries.length, 2, "the part overwrote the monolith's block, or vice versa");
+    const keys = entries.map(([key]) => key);
+    assert.ok(
+      keys.some((k) => k.includes("part000")) && keys.some((k) => !k.includes("part000")),
+      `block 0 of .part000 is not block 0 of the monolith: ${keys}`,
+    );
+  });
+
+  it("survives a deploy: cachesToKeep names the current generations", async () => {
+    // THE hazard this feature lives or dies on: every `squallar-` cache
+    // `cachesToKeep` does not name is purged on every deploy, and the symptom
+    // of forgetting the entry is a slow map, never an error. Same trigger
+    // discipline as the speculative-cache test above: the purge runs on a
+    // DEPLOY, so one is published.
+    let worker = await bootWorker({ tag: "A" });
+    const url = worker.internals.ARCHIVE_URLS[0];
+    const B = worker.internals.BLOCK_BYTES;
+    const bytes = archiveBytes(3 * B);
+    publishArchive(worker.network, url, bytes);
+    await fetchRange(worker, url, 0, B + 100);
+
+    const name = blockCacheOf(worker, url);
+    assert.ok((await worker.cacheNames()).includes(name), "no block cache before the deploy");
+
+    // A stale generation, seeded exactly as a previous publish would leave it.
+    const stale = worker.internals.blockCacheName("/basemap/omt-19990101.pmtiles");
+    await (await worker.caches.open(stale)).put(
+      new Request(`${ORIGIN}__squallar_blk__/old/x/0`),
+      new Response("old"),
+    );
+
+    publishDeploy(worker.network, ORIGIN, "B");
+    await worker.message({ type: "squallar:check-update" });
+    worker = await restartWorker(worker);
+
+    const names = await worker.cacheNames();
+    assert.ok(
+      names.includes(name),
+      `the deploy purged ${name}; browsed areas surviving a redeploy is the point of the block cache`,
+    );
+    assert.ok(
+      !names.includes(stale),
+      `${stale} survived the deploy; stale generations must be retired by the same purge`,
+    );
+
+    // And the blocks still serve, without one archive request.
+    const before = archiveRequests(worker.network, url);
+    const event = await fetchRange(worker, url, 0, B - 1);
+    assert.ok((await bodyOf(event)).equals(Buffer.from(bytes.slice(0, B))));
+    assert.equal(archiveRequests(worker.network, url), before, "the blocks were re-downloaded");
+  });
+
+  it("retires a stale generation on activate, without waiting for a deploy", async () => {
+    // A deploy that changes ARCHIVE_URLS changes this worker's bytes, so the
+    // browser reinstalls and ACTIVATES it — but the validator token may not
+    // have moved when the purge matters. Unlike the deploy purge above,
+    // `purgeStaleBlockCaches` runs on every activate.
+    let worker = await bootWorker({ tag: "A" });
+    const url = worker.internals.ARCHIVE_URLS[0];
+    publishArchive(worker.network, url, archiveBytes(100_000));
+    await fetchRange(worker, url, 0, 100);
+    const current = blockCacheOf(worker, url);
+
+    const stale = worker.internals.blockCacheName("/terrain/00000000-20250101/old.pmtiles");
+    await (await worker.caches.open(stale)).put(
+      new Request(`${ORIGIN}__squallar_blk__/old/y/0`),
+      new Response("old"),
+    );
+
+    worker = await restartWorker(worker);
+    await worker.activate();
+
+    const names = await worker.cacheNames();
+    assert.ok(!names.includes(stale), `${stale} survived an activate`);
+    assert.ok(names.includes(current), "the activate purged a CURRENT generation");
+    assert.ok(blockEntries(worker, current).length > 0, "the current generation's blocks were emptied");
+  });
+
+  it("falls through to the network when the cache itself breaks", async () => {
+    // The outermost layer of the block path is the fallback: a broken cache
+    // must never break the map. The origin's own 206 is the control that the
+    // response the page sees is the network's, not a half-assembled one.
+    const worker = await bootWorker();
+    const url = worker.internals.ARCHIVE_URLS[0];
+    const bytes = archiveBytes(100_000);
+    publishArchive(worker.network, url, bytes);
+
+    const realOpen = worker.caches.open.bind(worker.caches);
+    worker.caches.open = async (name) => {
+      if (name.startsWith(worker.internals.BLOCK_CACHE_PREFIX)) {
+        throw new Error("cache storage exploded");
+      }
+      return realOpen(name);
+    };
+
+    const event = await fetchRange(worker, url, 100, 300);
+    assert.equal(event.handled, true);
+    const response = await event.response;
+    assert.equal(response.status, 206, "the fallback must yield the network's own 206");
+    assert.equal(response.headers.get("content-range"), `bytes 100-300/${bytes.length}`);
+    assert.ok(Buffer.from(await response.arrayBuffer()).equals(Buffer.from(bytes.slice(100, 301))));
+  });
+
+  it("passes an origin that ignores Range through, buffering and storing nothing", async () => {
+    // A `200` here carries the WHOLE archive — the planet basemap is ~125 GB —
+    // so the worker must hand the origin's answer over untouched and let the
+    // reader run its own not-ranged retry discipline.
+    const worker = await bootWorker();
+    const url = worker.internals.ARCHIVE_URLS[0];
+    const bytes = archiveBytes(50_000);
+    publishArchive(worker.network, url, bytes, { ignoreRange: true });
+
+    const event = await fetchRange(worker, url, 0, 15);
+    const response = await event.response;
+    assert.equal(response.status, 200, "the origin's non-ranged answer must arrive unmodified");
+    assert.equal((await response.arrayBuffer()).byteLength, bytes.length);
+    assert.equal(
+      worker.caches.countEntries((n) => n.startsWith(worker.internals.BLOCK_CACHE_PREFIX)),
+      0,
+      "something from a non-206 answer was stored",
+    );
+  });
+
+  it("clamps a span past the end of the file exactly as an origin would", async () => {
+    const worker = await bootWorker();
+    const url = worker.internals.ARCHIVE_URLS[0];
+    const size = 100_000; // one full block, one short final block
+    const bytes = archiveBytes(size);
+    publishArchive(worker.network, url, bytes);
+
+    const event = await fetchRange(worker, url, size - 10, size + 65_000);
+    const response = await event.response;
+    assert.equal(response.status, 206);
+    assert.equal(
+      response.headers.get("content-range"),
+      `bytes ${size - 10}-${size - 1}/${size}`,
+      "the Content-Range must describe the clamped bytes actually returned",
+    );
+    assert.ok(Buffer.from(await response.arrayBuffer()).equals(Buffer.from(bytes.slice(size - 10))));
+
+    // Entirely past EOF: the fallback lets the origin answer 416 itself.
+    const B = worker.internals.BLOCK_BYTES;
+    const past = await fetchRange(worker, url, 4 * B, 4 * B + 100);
+    assert.equal((await past.response).status, 416);
+  });
+
+  it("degrades to pass-through when storage is tight, and still serves the tile", async () => {
+    const worker = await bootWorker();
+    const url = worker.internals.ARCHIVE_URLS[0];
+    const bytes = archiveBytes(200_000);
+    publishArchive(worker.network, url, bytes);
+
+    worker.scope.navigator = {
+      storage: { estimate: async () => ({ usage: 0, quota: worker.internals.BLOCK_BYTES }) },
+    };
+    const tight = await fetchRange(worker, url, 0, 99);
+    assert.ok((await bodyOf(tight)).equals(Buffer.from(bytes.slice(0, 100))), "the tile must never fail");
+    assert.equal(
+      worker.caches.countEntries((n) => n.startsWith(worker.internals.BLOCK_CACHE_PREFIX)),
+      0,
+      "a block was written into a nearly-full origin",
+    );
+
+    // The control that the guard reads the estimate rather than never storing.
+    worker.scope.navigator = {
+      storage: { estimate: async () => ({ usage: 0, quota: 8 * 1024 * 1024 * 1024 }) },
+    };
+    await fetchRange(worker, url, 0, 99);
+    assert.ok(
+      worker.caches.countEntries((n) => n.startsWith(worker.internals.BLOCK_CACHE_PREFIX)) > 0,
+      "a roomy origin stored nothing; the tight case above is measuring the wrong thing",
+    );
+  });
+
+  it("evicts oldest-touched blocks over the budget, and only those", async () => {
+    const worker = await bootWorker();
+    const url = worker.internals.ARCHIVE_URLS[0];
+    const B = worker.internals.BLOCK_BYTES;
+    const bytes = archiveBytes(10 * B);
+    publishArchive(worker.network, url, bytes);
+
+    // Six blocks written in order 0..5, then block 0 touched again by a read.
+    for (let i = 0; i < 6; i += 1) await fetchRange(worker, url, i * B, i * B + 9);
+    await fetchRange(worker, url, 0, 9);
+
+    await worker.internals.enforceBlockBudget(3 * B);
+
+    // Blocks 1, 2, 3 are the three oldest-touched; a re-read of one pays the
+    // network again, while the freshly-touched block 0 does not.
+    let before = archiveRequests(worker.network, url);
+    await fetchRange(worker, url, 0, 9);
+    assert.equal(archiveRequests(worker.network, url), before, "the freshly-touched block was evicted");
+
+    before = archiveRequests(worker.network, url);
+    const refetched = await fetchRange(worker, url, B, B + 9);
+    assert.ok((await bodyOf(refetched)).equals(Buffer.from(bytes.slice(B, B + 10))));
+    assert.equal(
+      archiveRequests(worker.network, url),
+      before + 1,
+      "the oldest-touched block survived while the budget was exceeded",
+    );
+  });
+});

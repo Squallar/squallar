@@ -11,9 +11,14 @@
  * CartoDB serves them `Cache-Control: public, max-age=15552000` (180 days) and
  * `tileFreshFor` honours that number rather than inventing one.
  *
- * The PMTiles basemap archive is NOT that exception, despite being the same
- * pixels: it is read by `Range`, and the Cache API can neither store a 206 nor
- * match on a range. `isBasemapArchive` routes it "network" explicitly.
+ * The PMTiles archives (basemap + terrain) are read by `Range`, and the Cache
+ * API can neither store a 206 nor match on a range. So their ranged reads are
+ * served from a BLOCK cache instead: fixed 64 KiB blocks, each stored as a
+ * synthetic-URL 200 — the 206 prohibition applies to what is STORED, never to
+ * what is SERVED — and the requested span is reassembled as an exact 206. Any
+ * archive request that is not a single `bytes=N-M` range still routes
+ * "network" untouched, and any error anywhere in the block path falls through
+ * to a plain network fetch: a broken cache must never break the map.
  *
  * Every URL resolves against `ROOT`, so the same bytes work at `/squallar/`
  * (Pages) and at `/` (http.server).
@@ -179,6 +184,43 @@ const BASEMAP_HOST = /^cartodb-basemaps-[a-d]\.global\.ssl\.fastly\.net$/;
  */
 const BASEMAP_ARCHIVE_HOST = "tiles.squallar.app";
 
+/*
+ * The archives whose ranged reads the block cache serves, exactly as the Rust
+ * consts name them: `squallar_egui::tiles::BASEMAP_ARCHIVE_URL` and
+ * `::TERRAIN_ARCHIVE_URL`. `tests/pwa_assets.rs` pins this list against both
+ * consts in BOTH directions, so a regenerated archive cannot ship without this
+ * file moving with it — which is what lets `cachesToKeep` below treat these
+ * two generations as current and purge every other one.
+ */
+const ARCHIVE_URLS = [
+  "https://tiles.squallar.app/basemap/omt-20260828.pmtiles",
+  "https://tiles.squallar.app/terrain/4ca64469750e-20260829/squallar-terrain-hillshade.pmtiles",
+];
+
+/*
+ * The block cache. Deliberately NOT versioned by SW_VERSION: the whole point
+ * is that browsed areas survive redeploys, and the generation in the name —
+ * derived from the archive's own URL path, which moves whenever an archive is
+ * regenerated — is the only invalidation an immutable archive needs.
+ */
+const BLOCK_CACHE_PREFIX = "squallar-blk-";
+
+/* Fixed quantum for archive reads. A tile read is typically 1-3 blocks. */
+const BLOCK_BYTES = 64 * 1024;
+
+/* Total block-cache budget across both archives; oldest-touched evict first. */
+const BLOCK_CACHE_MAX_BYTES = 256 * 1024 * 1024;
+
+/*
+ * Headroom `navigator.storage.estimate()` must show before a block is written.
+ * Under this, writes degrade to pass-through — the tile still serves from the
+ * bytes in hand, nothing is stored, and nothing can fail for lack of quota.
+ */
+const BLOCK_STORAGE_FLOOR_BYTES = 64 * 1024 * 1024;
+
+/* The block manifest's synthetic key, the `PINS_KEY` way. */
+const BLOCK_MANIFEST_KEY = new URL("__squallar_blk_manifest__", ROOT).href;
+
 /* ~15-25 KB per 256px PNG, so roughly 12-20 MB. */
 const TILE_CACHE_MAX = 700;
 
@@ -224,22 +266,90 @@ function isBasemapTile(url) {
 }
 
 /**
- * The PMTiles archive, which must reach the network untouched.
+ * A PMTiles archive file (monolith form). Every request the reader issues
+ * carries a `Range`, so every raw response is a `206`, and `Cache.put()` is
+ * specified to reject a `Response` whose status is not 200-299 *and* explicitly
+ * throws a `TypeError` on 206 — which is why the block cache stores aligned
+ * blocks as synthetic 200s and never the archive response itself. Even if a 206
+ * stored, `Cache.match()` ignores `Range` entirely: the first stored range
+ * would be handed back for every subsequent offset, a corrupt archive rather
+ * than a slow one.
  *
- * Not a policy preference — the Cache API cannot hold this thing. Every request
- * the reader issues carries a `Range`, so every response is a `206`, and
- * `Cache.put()` is specified to reject a `Response` whose status is not 200-299
- * *and* explicitly throws a `TypeError` on 206. Even if it stored, `Cache.match()`
- * ignores `Range` entirely: the first stored range would be handed back for every
- * subsequent offset, which is a corrupt archive rather than a slow one.
- *
- * Host-and-extension shaped like `isBasemapTile` above, and the extension is
- * load-bearing here rather than cosmetic: the same host serves
+ * The extension is load-bearing rather than cosmetic: the same host serves
  * `/status/latest.json`, and a rule matching the bare host would also refuse a
  * navigation if squallar were ever served from it.
  */
 function isBasemapArchive(url) {
   return normalizeHost(url.hostname) === BASEMAP_ARCHIVE_HOST && /\.pmtiles$/i.test(url.pathname);
+}
+
+/**
+ * A published part of an archive: `<archive>.pmtiles.partNNN`, as
+ * `squallar_egui::basemap_archive::HttpRangeSource::part_url` spells it. A
+ * distinct predicate because a part does NOT end in `.pmtiles`, so
+ * `isBasemapArchive` never matches one.
+ */
+function isArchivePart(url) {
+  return (
+    normalizeHost(url.hostname) === BASEMAP_ARCHIVE_HOST &&
+    /\.pmtiles\.part\d{3,}$/i.test(url.pathname)
+  );
+}
+
+/** Any file the archive reader range-reads: the monolith, or one of its parts. */
+function isArchiveBlockSource(url) {
+  return isBasemapArchive(url) || isArchivePart(url);
+}
+
+/**
+ * Parse a `Range` header that is a single `bytes=N-M` — the one form the
+ * reader emits (`basemap_archive.rs`: inclusive both ends, chosen because it
+ * is the CORS-safelisted shape). Anything else — absent, multi-range, suffix
+ * (`bytes=-500`), open-ended (`bytes=0-`), inverted — answers `null`, and the
+ * request passes to the network untouched.
+ */
+function parseSingleRange(value) {
+  if (typeof value !== "string") return null;
+  const match = /^bytes=(\d+)-(\d+)$/.exec(value);
+  if (!match) return null;
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end) return null;
+  return { start, end };
+}
+
+/**
+ * The generation one archive file belongs to: its URL path with any `.partNNN`
+ * suffix stripped, so a part and its monolith share a generation. The path
+ * carries the publish date (`omt-20260828`, `4ca64469750e-20260829`), so a
+ * regenerated archive IS a new generation — a wrong key here would silently
+ * serve one generation's bytes as another's.
+ */
+function archiveGeneration(pathname) {
+  return pathname.replace(/\.part\d{3,}$/i, "");
+}
+
+/** The Cache Storage name holding `generation`'s blocks. */
+function blockCacheName(generation) {
+  return BLOCK_CACHE_PREFIX + encodeURIComponent(generation);
+}
+
+/** The block caches for the archives this deploy reads — the ones kept. */
+function currentBlockCacheNames() {
+  return ARCHIVE_URLS.map((url) => blockCacheName(archiveGeneration(new URL(url).pathname)));
+}
+
+/**
+ * The synthetic key one stored block is put under — the `PINS_KEY` precedent:
+ * a URL under the app origin that nothing ever navigates to. Keyed by
+ * generation AND file basename because parts are byte-addressed per file: block
+ * 0 of `.part001` is not block 0 of `.part000`.
+ */
+function blockKey(generation, basename, index) {
+  return new URL(
+    `__squallar_blk__/${encodeURIComponent(generation)}/${encodeURIComponent(basename)}/${index}`,
+    ROOT,
+  ).href;
 }
 
 function isShellAsset(url) {
@@ -255,29 +365,32 @@ function isDataAsset(url) {
  * Classify one request. The whole caching policy is this function.
  *
  * Returns one of:
- *   "network"  - the worker must not touch it. No `respondWith`, no cache.
- *   "navigate" - a top-level navigation; answer from the cached shell index.
- *   "shell"    - a named app-shell asset.
- *   "asset"    - a named same-origin data asset, cached outside the shell.
- *   "tile"     - a CartoDB basemap tile.
+ *   "network"       - the worker must not touch it. No `respondWith`, no cache.
+ *   "navigate"      - a top-level navigation; answer from the cached shell index.
+ *   "shell"         - a named app-shell asset.
+ *   "asset"         - a named same-origin data asset, cached outside the shell.
+ *   "tile"          - a CartoDB basemap tile.
+ *   "archive-block" - a single-range read of a PMTiles archive, served
+ *                     block-wise from the block cache.
  *
- * The PMTiles basemap archive routes "network" and has **no cache of its own**.
- * That is deliberate, and `cachesToKeep` is why it has to stay that way: every
- * `squallar-`-prefixed cache it does not name is deleted by `purgeCaches`, so
- * adding a cache without adding it there would be a cache emptied before it was
- * ever hit.
+ * The block caches are the reason `cachesToKeep` names every current
+ * generation: every `squallar-`-prefixed cache it does not name is deleted by
+ * `purgeCaches`, so a cache added without a keep entry is a cache emptied on
+ * every deploy — browsed areas surviving a redeploy is the entire point.
  *
- * The trigger is a DEPLOY, not an activate, and the difference is worth having
- * written down because the obvious test gets it wrong. `checkForUpdate` returns
- * early when the validator token has not moved, so an activate that finds the
- * same deploy never reaches `purgeCaches` at all — seeding a stray cache and
- * re-activating leaves it untouched. `sw_routing.test.mjs` publishes a real
- * deploy for exactly this reason.
+ * The purge trigger is a DEPLOY, not an activate, and the difference is worth
+ * having written down because the obvious test gets it wrong. `checkForUpdate`
+ * returns early when the validator token has not moved, so an activate that
+ * finds the same deploy never reaches `purgeCaches` at all — seeding a stray
+ * cache and re-activating leaves it untouched. `sw_routing.test.mjs` publishes
+ * a real deploy for exactly this reason. (Stale block GENERATIONS are the
+ * exception: `purgeStaleBlockCaches` runs on every activate as well.)
  *
- * Takes a plain `{url, method, mode}` rather than a `Request` so it is callable
- * from a test harness that has no `Request` constructor.
+ * Takes a plain `{url, method, mode, range}` rather than a `Request` so it is
+ * callable from a test harness that has no `Request` constructor. `range` is
+ * the request's `Range` header value, or null/undefined without one.
  */
-function routeFor({ url, method = "GET", mode = "no-cors" }) {
+function routeFor({ url, method = "GET", mode = "no-cors", range = null }) {
   // Only GET is ever cacheable, and squallar issues nothing else.
   if (method !== "GET") return "network";
 
@@ -305,12 +418,17 @@ function routeFor({ url, method = "GET", mode = "no-cors" }) {
   // shared host.
   if (isWeatherDataHost(u.hostname)) return "network";
 
-  // Before the two rules that say yes, for the same reason the deny list is:
-  // a range response cannot be cached, so nothing downstream may try. Written
-  // down rather than left to default-deny because "the default happened to
-  // refuse it" and "we decided it must never be cached" look identical from
+  // Before the rules that say yes, for the same reason the deny list is: a raw
+  // range response cannot be cached, so nothing downstream may try. An archive
+  // read that is exactly the single-range form the reader emits is served
+  // block-wise; anything else touching an archive file — no `Range`, a
+  // multi-range, a navigation — reaches the network untouched. Written down
+  // rather than left to default-deny because "the default happened to refuse
+  // it" and "we decided it must never be cached raw" look identical from
   // outside and only the second survives someone adding a rule above.
-  if (isBasemapArchive(u)) return "network";
+  if (isArchiveBlockSource(u)) {
+    return parseSingleRange(range) !== null ? "archive-block" : "network";
+  }
 
   if (isBasemapTile(u)) return "tile";
 
@@ -553,6 +671,12 @@ async function cachesToKeep(newShellName) {
   // zone pack on every deploy -- which is exactly the cost a cache outside the
   // shell was chosen to avoid.
   const keep = new Set([META_CACHE, TILE_CACHE, ASSET_CACHE, newShellName]);
+  // The current archive generations' block caches. Without these entries every
+  // deploy would silently empty the block cache — the symptom is a slow map,
+  // never an error — because `purgeCaches` deletes every `squallar-` cache not
+  // named here. Stale generations are exactly the ones NOT named, and the same
+  // purge is what retires them.
+  for (const name of currentBlockCacheNames()) keep.add(name);
   for (const name of clientShells.values()) keep.add(name);
   for (const name of Object.values(await readPins())) keep.add(name);
   return keep;
@@ -850,6 +974,307 @@ async function trimTiles() {
 }
 
 // ---------------------------------------------------------------------------
+// Archive block cache
+// ---------------------------------------------------------------------------
+
+/** The request's `Range` header, read defensively: a navigation `event.request`
+ * is a plain object with no `headers` at all. */
+function requestRange(request) {
+  const headers = request && request.headers;
+  if (!headers || typeof headers.get !== "function") return null;
+  return headers.get("range");
+}
+
+/** Which blocks a span touches: inclusive indexes, both edges. */
+function blockSpan(span) {
+  return {
+    first: Math.floor(span.start / BLOCK_BYTES),
+    last: Math.floor(span.end / BLOCK_BYTES),
+  };
+}
+
+/** The `total` of a `Content-Range: bytes N-M/total`, or null for `*`/absent. */
+function archiveTotalBytes(value) {
+  const match = typeof value === "string" && /^bytes \d+-\d+\/(\d+)$/.exec(value);
+  return match ? Number(match[1]) : null;
+}
+
+/*
+ * The manifest bounding the block caches: `{clock, blocks: {key: {cache,
+ * bytes, touched}}}`, stored the `readPins` way. `touched` is a tick of
+ * `clock`, not wall time, so eviction order cannot tie. Memoised like
+ * `metaPromise`; read-hit touches mutate the memo only and are persisted by
+ * the next block write — lost on a worker restart, which degrades
+ * oldest-touched toward oldest-written, a bounded approximation rather than a
+ * wrong answer.
+ */
+let blockManifestPromise = null;
+
+function blockManifest() {
+  if (!blockManifestPromise) blockManifestPromise = readBlockManifest();
+  return blockManifestPromise;
+}
+
+async function readBlockManifest() {
+  const cache = await caches.open(META_CACHE);
+  const stored = await cache.match(BLOCK_MANIFEST_KEY);
+  if (stored) {
+    try {
+      const manifest = await stored.json();
+      if (manifest && typeof manifest.blocks === "object" && manifest.blocks !== null) {
+        if (!Number.isSafeInteger(manifest.clock)) manifest.clock = 0;
+        return manifest;
+      }
+    } catch {
+      // Unreadable is the same as absent; rebuilt below if blocks exist.
+    }
+  }
+  return { clock: 0, blocks: {} };
+}
+
+async function writeBlockManifest(manifest) {
+  const cache = await caches.open(META_CACHE);
+  await cache.put(
+    BLOCK_MANIFEST_KEY,
+    new Response(JSON.stringify(manifest), {
+      headers: { "content-type": "application/json" },
+    }),
+  );
+}
+
+/** Mark a served block as freshly used. Memo-only; see `blockManifest`. */
+async function touchBlock(key) {
+  const manifest = await blockManifest();
+  const entry = manifest.blocks[key];
+  if (entry) entry.touched = ++manifest.clock;
+}
+
+/**
+ * Evict oldest-touched blocks until the manifest's total is within `cap`.
+ * Deletion failures are swallowed entry by entry: the budget is bookkeeping,
+ * and bookkeeping must never fail a tile.
+ */
+async function enforceBlockBudget(cap, manifest = null) {
+  const standalone = manifest === null;
+  if (standalone) manifest = await blockManifest();
+
+  let total = 0;
+  for (const entry of Object.values(manifest.blocks)) total += entry.bytes;
+  if (total <= cap) return;
+
+  const oldestFirst = Object.entries(manifest.blocks).sort(
+    (a, b) => a[1].touched - b[1].touched,
+  );
+  for (const [key, entry] of oldestFirst) {
+    if (total <= cap) break;
+    try {
+      // `caches.open` creates on demand; never manufacture a purged cache.
+      if (await caches.has(entry.cache)) await (await caches.open(entry.cache)).delete(key);
+    } catch {
+      // The entry still leaves the books; a re-fetch overwrites the orphan.
+    }
+    delete manifest.blocks[key];
+    total -= entry.bytes;
+  }
+  if (standalone) await writeBlockManifest(manifest);
+}
+
+/** Whether writing `bytes` more would crowd the origin's storage quota. */
+async function storageIsTight(bytes) {
+  const storage = self.navigator && self.navigator.storage;
+  if (!storage || typeof storage.estimate !== "function") return false;
+  try {
+    const { usage = 0, quota = 0 } = (await storage.estimate()) || {};
+    if (!quota) return false;
+    return quota - usage < bytes + BLOCK_STORAGE_FLOOR_BYTES;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Store one fetched block as a synthetic-URL 200 and put it on the books.
+ * Every failure is absorbed: the caller already holds the bytes it will serve,
+ * and a broken cache must never break the map.
+ */
+async function storeBlock(cache, cacheName, key, blob, total) {
+  try {
+    if (await storageIsTight(blob.size)) return;
+    const headers = {
+      "content-type": "application/octet-stream",
+      "x-squallar-block-bytes": String(blob.size),
+    };
+    if (total !== null) headers["x-squallar-archive-bytes"] = String(total);
+    await cache.put(key, new Response(blob, { status: 200, headers }));
+
+    const manifest = await blockManifest();
+    manifest.blocks[key] = { cache: cacheName, bytes: blob.size, touched: ++manifest.clock };
+    await enforceBlockBudget(BLOCK_CACHE_MAX_BYTES, manifest);
+    await writeBlockManifest(manifest);
+  } catch {
+    // Pass-through degradation, not failure.
+  }
+}
+
+/**
+ * One aligned block of `url`: Cache Storage hit, else a real ranged fetch of
+ * exactly that block. Only a `206` is ever stored — a `200` here carries the
+ * whole archive (the planet basemap is ~125 GB) and is thrown without reading
+ * its body so the outer fallback can hand the origin's own answer to the
+ * reader untouched; a 206 cannot be opaque (an opaque response reads status 0),
+ * so nothing CORS-unreadable can be stored either.
+ */
+async function archiveBlock(event, cache, cacheName, generation, basename, index) {
+  const key = blockKey(generation, basename, index);
+
+  const hit = await cache.match(key);
+  if (hit) {
+    event.waitUntil(touchBlock(key).catch(() => {}));
+    const declared = hit.headers.get("x-squallar-archive-bytes");
+    return { blob: await hit.blob(), total: declared === null ? null : Number(declared) };
+  }
+
+  const start = index * BLOCK_BYTES;
+  const response = await fetch(event.request.url, {
+    headers: { range: `bytes=${start}-${start + BLOCK_BYTES - 1}` },
+  });
+  if (response.status !== 206) {
+    // Fire-and-forget: releasing the connection is advisory, and nothing may
+    // wait on a body that could be the whole archive.
+    if (response.body && typeof response.body.cancel === "function") {
+      response.body.cancel().catch(() => {});
+    }
+    throw new Error(`${basename} block ${index}: HTTP ${response.status}, not 206`);
+  }
+
+  const total = archiveTotalBytes(response.headers.get("content-range"));
+  const blob = await response.blob();
+  event.waitUntil(storeBlock(cache, cacheName, key, blob, total));
+  return { blob, total };
+}
+
+/**
+ * Serve a single-range archive read from the block cache.
+ *
+ * The answer must be EXACT: the wasm reader errors `RangeRequestsUnsupported`
+ * on any status but 206 and `ResponseBodyTooLong` on a body longer than it
+ * asked for, so the status, the `Content-Range`, and the body length are all
+ * load-bearing. Blocks are walked in order and the walk stops at a short block
+ * — that is the file ending — so a span past EOF clamps exactly as an origin
+ * would clamp it. A span starting past EOF throws, and the fallback lets the
+ * origin answer it (a 416) itself.
+ */
+async function archiveBlockRange(event) {
+  const url = new URL(event.request.url);
+  const span = parseSingleRange(requestRange(event.request));
+  if (span === null) throw new Error("archive-block routed without a single range");
+
+  const generation = archiveGeneration(url.pathname);
+  const cacheName = blockCacheName(generation);
+  const basename = url.pathname.slice(url.pathname.lastIndexOf("/") + 1);
+  const cache = await caches.open(cacheName);
+
+  const { first, last } = blockSpan(span);
+  const pieces = [];
+  let total = null;
+  let size = 0;
+
+  for (let index = first; index <= last; index += 1) {
+    const block = await archiveBlock(event, cache, cacheName, generation, basename, index);
+    if (block.total !== null) total = block.total;
+
+    const blockStart = index * BLOCK_BYTES;
+    const from = Math.max(span.start - blockStart, 0);
+    const to = Math.min(span.end + 1 - blockStart, block.blob.size);
+    if (to > from) {
+      // `Blob.slice` is a lazy view, not a copy, in both Firefox and Chromium.
+      pieces.push(block.blob.slice(from, to));
+      size += to - from;
+    }
+    if (block.blob.size < BLOCK_BYTES) break;
+  }
+
+  if (size === 0) throw new Error(`bytes=${span.start}-${span.end} starts past the end of ${basename}`);
+
+  const end = span.start + size - 1;
+  return new Response(new Blob(pieces), {
+    status: 206,
+    headers: {
+      "content-type": "application/octet-stream",
+      "content-length": String(size),
+      "content-range": `bytes ${span.start}-${end}/${total === null ? "*" : total}`,
+    },
+  });
+}
+
+/**
+ * The outermost layer of the block path, and deliberately so: ANY error —
+ * a broken cache, a quota rejection, an origin refusing ranges — falls through
+ * to a plain network fetch of the original request, which is exactly what the
+ * worker not existing would have produced.
+ */
+async function serveArchiveBlock(event) {
+  try {
+    return await archiveBlockRange(event);
+  } catch {
+    return fetch(event.request);
+  }
+}
+
+/**
+ * Retire the block caches of generations this deploy no longer reads, and
+ * their manifest rows. Runs on EVERY activate — unlike `purgeCaches`, which
+ * only a deploy triggers — because a stale generation is dead weight the
+ * moment the worker's own bytes (which carry `ARCHIVE_URLS`) change.
+ *
+ * Also rebuilds an empty manifest from what the caches actually hold (an
+ * SW_VERSION bump renames META_CACHE and orphans the books): without this the
+ * budget would read zero over a full cache and never evict.
+ */
+async function purgeStaleBlockCaches() {
+  const keep = new Set(currentBlockCacheNames());
+  const names = await caches.keys();
+  await Promise.all(
+    names
+      .filter((n) => n.startsWith(BLOCK_CACHE_PREFIX) && !keep.has(n))
+      .map((n) => caches.delete(n)),
+  );
+
+  const manifest = await blockManifest();
+  let dirty = false;
+  for (const [key, entry] of Object.entries(manifest.blocks)) {
+    if (!keep.has(entry.cache)) {
+      delete manifest.blocks[key];
+      dirty = true;
+    }
+  }
+
+  if (Object.keys(manifest.blocks).length === 0) {
+    for (const name of keep) {
+      if (!(await caches.has(name))) continue;
+      const cache = await caches.open(name);
+      for (const request of await cache.keys()) {
+        const key = typeof request === "string" ? request : request.url;
+        const stored = await cache.match(key);
+        if (!stored) continue;
+        const bytes = Number(stored.headers.get("x-squallar-block-bytes"));
+        manifest.blocks[key] = {
+          cache: name,
+          bytes: Number.isSafeInteger(bytes) ? bytes : BLOCK_BYTES,
+          touched: ++manifest.clock,
+        };
+        dirty = true;
+      }
+    }
+  }
+
+  if (dirty) {
+    await enforceBlockBudget(BLOCK_CACHE_MAX_BYTES, manifest);
+    await writeBlockManifest(manifest);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
@@ -867,6 +1292,7 @@ self.addEventListener("activate", (event) => {
       // visit rather than only after a reload.
       await self.clients.claim();
       await trimTiles().catch(() => {});
+      await purgeStaleBlockCaches().catch(() => {});
       try {
         await checkForUpdate({ force: true });
       } catch {
@@ -881,6 +1307,7 @@ self.addEventListener("fetch", (event) => {
     url: event.request.url,
     method: event.request.method,
     mode: event.request.mode,
+    range: requestRange(event.request),
   });
 
   switch (route) {
@@ -899,6 +1326,9 @@ self.addEventListener("fetch", (event) => {
       return;
     case "tile":
       event.respondWith(serveTile(event));
+      return;
+    case "archive-block":
+      event.respondWith(serveArchiveBlock(event));
       return;
     default:
       // "network": no `respondWith`, so this worker is not in the request path
@@ -945,6 +1375,21 @@ self.__squallarSwInternals = {
   isBasemapTile,
   BASEMAP_ARCHIVE_HOST,
   isBasemapArchive,
+  ARCHIVE_URLS,
+  BLOCK_BYTES,
+  BLOCK_CACHE_PREFIX,
+  BLOCK_CACHE_MAX_BYTES,
+  isArchivePart,
+  isArchiveBlockSource,
+  parseSingleRange,
+  archiveGeneration,
+  blockCacheName,
+  currentBlockCacheNames,
+  blockKey,
+  blockSpan,
+  archiveTotalBytes,
+  enforceBlockBudget,
+  purgeStaleBlockCaches,
   isShellAsset,
   normalizeHost,
   validatorToken,

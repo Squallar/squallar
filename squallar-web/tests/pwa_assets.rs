@@ -63,6 +63,33 @@ fn js_string_list(src: &str, marker: &str) -> Vec<String> {
     out
 }
 
+/// [`js_string_list`] without the comment stripping, for a list whose entries
+/// themselves contain `//` — URLs. The cost is that a `//`-commented-out entry
+/// inside the brackets would still be read, so lists extracted this way must
+/// not carry line comments between the entries.
+fn js_url_list(src: &str, marker: &str) -> Vec<String> {
+    let start = src
+        .find(marker)
+        .unwrap_or_else(|| panic!("sw.js no longer contains {marker:?}"))
+        + marker.len();
+    let end = start
+        + src[start..]
+            .find(']')
+            .unwrap_or_else(|| panic!("unterminated list after {marker:?} in sw.js"));
+
+    let mut out = Vec::new();
+    let mut rest = &src[start..end];
+    while let Some(open) = rest.find('"') {
+        rest = &rest[open + 1..];
+        let close = rest
+            .find('"')
+            .expect("unterminated string literal in sw.js list");
+        out.push(rest[..close].to_string());
+        rest = &rest[close + 1..];
+    }
+    out
+}
+
 /// The literal that follows `marker`, read out of source rather than restated.
 fn literal_after(src: &str, what: &str, marker: &str) -> String {
     let start = src
@@ -426,6 +453,49 @@ fn the_worker_names_the_same_basemap_archive_host_the_client_reads() {
         expected.contains('.') && !expected.contains('/'),
         "the archive host parsed as {expected:?}, which is not a hostname"
     );
+}
+
+/// The block cache serves exactly the archives the client reads, in both
+/// directions: every Rust archive const appears in `ARCHIVE_URLS`, and every
+/// entry there is one of the consts.
+///
+/// This list is what `cachesToKeep` derives the CURRENT block-cache
+/// generations from, so each direction has its own failure mode. A Rust const
+/// missing from the list means that archive's blocks are purged on every
+/// deploy — the symptom is a slow map, never an error. A stale entry lingering
+/// after a regeneration means the retired generation's cache is kept forever
+/// and the budget evicts live blocks to make room for dead ones.
+#[test]
+fn the_worker_block_caches_exactly_the_archives_the_client_reads() {
+    let declared = js_url_list(SERVICE_WORKER, "const ARCHIVE_URLS = [");
+    let expected: BTreeSet<String> = [
+        squallar_egui::tiles::BASEMAP_ARCHIVE_URL.to_string(),
+        squallar_egui::tiles::TERRAIN_ARCHIVE_URL.to_string(),
+    ]
+    .into_iter()
+    .collect();
+
+    let found: BTreeSet<String> = declared.iter().cloned().collect();
+    assert_eq!(
+        found, expected,
+        "ARCHIVE_URLS in squallar-web/sw.js does not match the Rust archive \
+         consts (BASEMAP_ARCHIVE_URL, TERRAIN_ARCHIVE_URL). The block cache \
+         keeps exactly the generations this list names; a missing archive is \
+         wiped on every deploy, a stale one is retained forever."
+    );
+    assert_eq!(declared.len(), 2, "ARCHIVE_URLS carries a duplicate entry");
+
+    // Every listed archive is on the host the block route owns; an entry on
+    // any other host would name a cache no request can ever fill.
+    let route_host = literal_after(SERVICE_WORKER, "sw.js", "const BASEMAP_ARCHIVE_HOST = \"");
+    for url in &declared {
+        assert_eq!(
+            host_of(url),
+            route_host,
+            "{url} in ARCHIVE_URLS is not on the archive host the block route \
+             intercepts, so its blocks would never be cached"
+        );
+    }
 }
 
 /// The archive is a `Range` read, so it must not be in the shell or asset
