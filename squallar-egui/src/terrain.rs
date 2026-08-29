@@ -64,14 +64,40 @@ pub const HILLSHADE_FLAT_TOLERANCE: u8 = 2;
 #[cfg(any(test, target_arch = "wasm32", feature = "basemap-vector"))]
 pub const HILLSHADE_ALPHA_GAIN: u16 = 3;
 
+/// Grey levels at or below this are NODATA, not shadow, and draw nothing.
+///
+/// `gdaldem hillshade` reserves 0 for nodata and emits 1..=255 for real
+/// shading, so 0 is convention. The margin above it absorbs the archive's
+/// lossy VP8 ringing at nodata boundaries — an encoder smearing a 0-block
+/// against its neighbours produces a few near-zero levels that are just as
+/// much nodata as the block itself.
+///
+/// **Found on the glass, not in review.** The archive's z0-z6 tiles carry
+/// horizontal nodata stripes (a build defect in the global mosaic: the
+/// sharded VRT's latitude-band shards were combined without a shared target
+/// grid, leaving seam rows that widen as each lower zoom downsamples them —
+/// a z2 tile measures 72% zeros). Without this guard the remap painted every
+/// stripe as OPAQUE BLACK (0 is 181 levels of "relief"), which the user saw
+/// as black bars across the continent. The guard makes nodata transparent;
+/// what it cannot do is restore the shading the stripes destroyed — that
+/// needs the archive rebuilt on a fixed mosaic. The cost of the guard on real
+/// data is nil in practice: genuine v <= 5 shadow exists only in the deepest
+/// canyon tiles, a handful of already-saturated pixels.
+#[cfg(any(test, target_arch = "wasm32", feature = "basemap-vector"))]
+pub const HILLSHADE_NODATA_CEILING: u8 = 5;
+
 /// One hillshade grey level as an overlay pixel, **unmultiplied RGBA**.
 ///
-/// Shadow (v below flat) is black, lit slope (v above flat) is white, and the
-/// alpha is the relief itself: |v − 181| less the flat tolerance, scaled by
+/// Nodata ([`HILLSHADE_NODATA_CEILING`]) draws nothing. Shadow (v below flat)
+/// is black, lit slope (v above flat) is white, and the alpha is the relief
+/// itself: |v − 181| less the flat tolerance, scaled by
 /// [`HILLSHADE_ALPHA_GAIN`]. Flat ground is fully transparent — the layer
 /// spends pixels only where there is relief.
 #[cfg(any(test, target_arch = "wasm32", feature = "basemap-vector"))]
 const fn remap_hillshade_pixel(v: u8) -> [u8; 4] {
+    if v <= HILLSHADE_NODATA_CEILING {
+        return [0, 0, 0, 0];
+    }
     let relief = v as i16 - HILLSHADE_FLAT as i16;
     let past_flat = relief
         .unsigned_abs()
@@ -356,18 +382,34 @@ mod tests {
         );
     }
 
-    /// The whole transfer curve at its edges: the flat band is exactly
-    /// 181 ± tolerance, the first level past it inks at the gain, and the
-    /// extremes clamp — shadow saturates (0 → alpha 255), lit slope reaches
-    /// the gain's ceiling short of it (255 → alpha 216).
+    /// The whole transfer curve at its edges: nodata is transparent up to its
+    /// ceiling and saturated black one level past it, the flat band is exactly
+    /// 181 ± tolerance, the first level past the band inks at the gain, and
+    /// the lit extreme clamps short of the gain's ceiling (255 → alpha 216).
+    ///
+    /// The nodata pins replace an earlier `0 → alpha 255` pin: the archive's
+    /// low zooms carry nodata stripes that painted as opaque black bars on the
+    /// glass, and 0 was never shadow — gdaldem reserves it. Both sides of the
+    /// boundary are pinned so the ceiling can neither widen nor collapse
+    /// silently.
     #[test]
     fn the_transfer_curve_edges_are_exact() {
+        assert_eq!(remap_hillshade_pixel(0), [0, 0, 0, 0], "nodata");
+        assert_eq!(
+            remap_hillshade_pixel(HILLSHADE_NODATA_CEILING),
+            [0, 0, 0, 0],
+            "the ceiling itself is still nodata"
+        );
+        assert_eq!(
+            remap_hillshade_pixel(HILLSHADE_NODATA_CEILING + 1),
+            [0, 0, 0, 255],
+            "one past the ceiling is real, fully saturated shadow"
+        );
         assert_eq!(remap_hillshade_pixel(181), [0, 0, 0, 0]);
         assert_eq!(remap_hillshade_pixel(179), [0, 0, 0, 0]);
         assert_eq!(remap_hillshade_pixel(183), [0, 0, 0, 0]);
         assert_eq!(remap_hillshade_pixel(178), [0, 0, 0, 3]);
         assert_eq!(remap_hillshade_pixel(184), [255, 255, 255, 3]);
-        assert_eq!(remap_hillshade_pixel(0), [0, 0, 0, 255]);
         assert_eq!(remap_hillshade_pixel(255), [255, 255, 255, 216]);
     }
 
